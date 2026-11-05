@@ -1420,7 +1420,7 @@ pub mod fs_labels
     pub const FS_READ: u64 = 2;
     /// Close an open cap ([`FS_OPEN`]): the driver revokes that open's
     /// outstanding [`FS_READ_MEMORY`] pages, deletes its recorded release
-    /// SEND, revokes every copy of its liveness cap, and retires the open,
+    /// SEND, revokes the copies of its liveness cap, and retires the open,
     /// so the open cap answers `fs_errors::INVALID_BADGE` from then on.
     /// Other opens of the file are untouched. A node cap is answered
     /// `fs_errors::INVALID_BADGE`. The caller still cap-deletes the open cap
@@ -1580,8 +1580,10 @@ pub mod fs_labels
     /// cap, a zero-rights Notification cap: the open lives while a copy of
     /// it lives outside the driver, and once every copy is gone (deleted, or
     /// with its holder's `CSpace`) the driver may release the open as
-    /// [`FS_CLOSE`] would; closing the open revokes every copy. The holder
-    /// keeps it for the open's life and deletes it after [`FS_CLOSE`].
+    /// [`FS_CLOSE`] would; a release revokes the copies still in the
+    /// driver's derivation subtree, which a copy derived from a dead
+    /// client's copy has left. The holder keeps it for the open's life and
+    /// deletes it after [`FS_CLOSE`].
     /// [`FS_READ_MEMORY`], [`FS_RELEASE_MEMORY`], and [`FS_CLOSE`] go to the
     /// open cap; the stateless file labels accept either cap. Errors:
     /// `INVALID_BADGE` (no such node, a directory, or an open cap),

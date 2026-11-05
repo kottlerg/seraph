@@ -71,12 +71,13 @@ pub struct OpenFile
     /// `FS_RELEASE_MEMORY` requests for this open's pages to it. Zero when
     /// the open carried none; eviction then skips the cooperative
     /// round-trip and goes straight to the revoke. Deleted from the fs's
-    /// `CSpace` when the open is closed or its node freed.
+    /// `CSpace` when the open is released.
     pub release_endpoint_cap: u64,
     /// The driver's own cap on the open's liveness Notification, the parent
     /// of the zero-rights liveness cap the `FS_OPEN` reply handed the client
     /// (services/fs/docs/fs-driver-protocol.md § Label 18). Revoked, which
-    /// kills every client copy, and deleted when the open is released.
+    /// kills the client's copy and every copy still derived beneath it, and
+    /// deleted when the open is released.
     pub liveness_cap: u64,
 }
 

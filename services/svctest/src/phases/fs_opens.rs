@@ -642,11 +642,6 @@ fn sole(cap: u64) -> bool
 /// the open's node was removed.
 pub fn fs_reclaims_dead_opens_phase(_: &Caps)
 {
-    // A test wait bound: the opens svctest makes before the sweep must have
-    // come. fatfs sweeps within the larger of 64 and the live opens of its
-    // last sweep, far below this in a svctest boot.
-    const SWEEP_BOUND: usize = 1 << 14;
-
     let ipc_buf = current_ipc_buf();
     let (svctest, node) = scratch_file(RECLAIM_NAME, 1, ipc_buf);
 
@@ -654,47 +649,10 @@ pub fn fs_reclaims_dead_opens_phase(_: &Caps)
     let (dropped, dropped_liveness) =
         fs_open_live(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN dropped");
     syscall::cap_delete(dropped_liveness).expect("fs_reclaim: deleting a liveness cap");
-    let (closed, closed_liveness) =
-        fs_open_live(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN closed");
-    assert_eq!(fs_close(closed, ipc_buf), ipc::fs_errors::SUCCESS);
-    assert!(
-        !cap_live(closed_liveness),
-        "fs_reclaim: FS_CLOSE left the open's liveness cap live"
-    );
+    close_revokes_liveness(node, ipc_buf);
 
-    let release_ep =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .expect("fs_reclaim: release endpoint creation failed");
-    let release = syscall::cap_derive(release_ep, syscall::RIGHTS_EP_SEND)
-        .expect("fs_reclaim: release SEND derive");
-    let child_node = syscall::cap_derive(node, syscall::RIGHTS_EP_SEND_GRANT)
-        .expect("fs_reclaim: node cap copy");
-    let (mut child, orphan) = spawn_reclaim_child(child_node, release);
-    assert!(
-        open_live(orphan, ipc_buf),
-        "fs_reclaim: the live child's open does not read"
-    );
-    assert!(
-        !sole(release_ep),
-        "fs_reclaim: fatfs holds no release SEND for the live child's open"
-    );
-    child
-        .kill()
-        .expect("fs_reclaim: killing open-reclaim-child failed");
-    let _ = child.wait();
-
-    let opens = (1..=SWEEP_BOUND).find(|_| {
-        let (open, liveness) = fs_open_live(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN");
-        assert_eq!(fs_close(open, ipc_buf), ipc::fs_errors::SUCCESS);
-        let _ = syscall::cap_delete(open);
-        let _ = syscall::cap_delete(liveness);
-        !open_live(orphan, ipc_buf)
-    });
-    let opens = opens.unwrap_or_else(|| {
-        panic!("fs_reclaim: the dead child's open outlived {SWEEP_BOUND} opens")
-    });
+    let (orphan, release_ep) = killed_childs_open(node, ipc_buf);
+    let opens = open_until_released(node, orphan, ipc_buf);
     assert!(
         sole(release_ep),
         "fs_reclaim: the sweep released the dead child's open but kept its release SEND"
@@ -720,13 +678,77 @@ pub fn fs_reclaims_dead_opens_phase(_: &Caps)
     );
 
     assert_eq!(fs_close(kept, ipc_buf), ipc::fs_errors::SUCCESS);
-    for cap in [kept, dropped, closed, orphan, release_ep, node]
+    for cap in [kept, dropped, orphan, release_ep, node]
     {
         let _ = syscall::cap_delete(cap);
     }
     fs_remove(svctest, RECLAIM_NAME.as_bytes(), ipc_buf).expect("cleanup reclaim.bin");
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!("fs_reclaims_dead_opens phase passed (swept within {opens} opens)");
+}
+
+/// Open `node` and close the open: its `FS_CLOSE` must revoke the liveness
+/// cap the open's reply carried.
+fn close_revokes_liveness(node: u64, ipc_buf: *mut u64)
+{
+    let (closed, liveness) = fs_open_live(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN closed");
+    assert_eq!(fs_close(closed, ipc_buf), ipc::fs_errors::SUCCESS);
+    assert!(
+        !cap_live(liveness),
+        "fs_reclaim: FS_CLOSE left the open's liveness cap live"
+    );
+    let _ = syscall::cap_delete(closed);
+}
+
+/// Spawn an `open-reclaim-child` on `node` with a release SEND on a new
+/// svctest endpoint, check that its open reads and that fatfs holds its
+/// release SEND, and kill it. Returns the copy of the child's open cap and
+/// the release endpoint.
+fn killed_childs_open(node: u64, ipc_buf: *mut u64) -> (u64, u64)
+{
+    let release_ep =
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+            syscall::cap_create_endpoint(slab).ok()
+        })
+        .expect("fs_reclaim: release endpoint creation failed");
+    let release = syscall::cap_derive(release_ep, syscall::RIGHTS_EP_SEND)
+        .expect("fs_reclaim: release SEND derive");
+    let child_node = syscall::cap_derive(node, syscall::RIGHTS_EP_SEND_GRANT)
+        .expect("fs_reclaim: node cap copy");
+    let (mut child, orphan) = spawn_reclaim_child(child_node, release);
+    assert!(
+        open_live(orphan, ipc_buf),
+        "fs_reclaim: the live child's open does not read"
+    );
+    assert!(
+        !sole(release_ep),
+        "fs_reclaim: fatfs holds no release SEND for the live child's open"
+    );
+    child
+        .kill()
+        .expect("fs_reclaim: killing open-reclaim-child failed");
+    let _ = child.wait();
+    (orphan, release_ep)
+}
+
+/// Open and close `node` until `orphan` names no open, a sweep having
+/// released it, and return the opens it took.
+fn open_until_released(node: u64, orphan: u64, ipc_buf: *mut u64) -> usize
+{
+    // A test wait bound: the opens svctest makes before the sweep must have
+    // come. fatfs sweeps within the larger of 64 and the live opens of its
+    // last sweep, far below this in a svctest boot.
+    const SWEEP_BOUND: usize = 1 << 14;
+
+    let opens = (1..=SWEEP_BOUND).find(|_| {
+        let (open, liveness) = fs_open_live(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN");
+        assert_eq!(fs_close(open, ipc_buf), ipc::fs_errors::SUCCESS);
+        let _ = syscall::cap_delete(open);
+        let _ = syscall::cap_delete(liveness);
+        !open_live(orphan, ipc_buf)
+    });
+    opens
+        .unwrap_or_else(|| panic!("fs_reclaim: the dead child's open outlived {SWEEP_BOUND} opens"))
 }
 
 /// An `open-undeliverable-child`: exhaust this process's `CSpace`, its IPC

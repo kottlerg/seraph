@@ -207,8 +207,8 @@ impl<T> OpenSlab<T>
 /// is gone. It bounds no capacity: past it the interval follows the opens a
 /// sweep leaves live ([`SweepSchedule`]). Below that it sets what a small
 /// table holds dead before a sweep, at most twice it: 128 records, each with
-/// two `CSpace` slots and a Notification, about 40 KiB in fatfs, against one
-/// sweep's lock hold per 64 opens.
+/// up to two `CSpace` slots and a Notification, about 40 KiB in fatfs,
+/// against one sweep's lock hold per 64 opens.
 pub const SWEEP_FLOOR: usize = 64;
 
 /// When the next sweep of the open table falls due: once the opens made since
@@ -235,6 +235,8 @@ impl Default for SweepSchedule
 
 impl SweepSchedule
 {
+    /// A schedule with no open counted yet, whose first sweep falls due
+    /// after [`SWEEP_FLOOR`] opens.
     #[must_use]
     pub const fn new() -> Self
     {

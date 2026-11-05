@@ -165,12 +165,24 @@ neither signal nor wait. The open lives while any copy of the liveness cap
 lives outside the driver. The holder keeps it for the open's life and deletes
 it after the open's `FS_CLOSE`; a client that dies takes its copy with its
 `CSpace`. Releasing an open, by `FS_CLOSE`, by its node's removal, or by the
-sweep below, revokes every copy of the liveness cap and frees the object, so
-a copy dies exactly when the open does, and no copy keeps the driver's memory
-past it. A delegated open cap alone does not keep the open alive: a holder
-other than the client keeps it alive only by also holding a copy of the
-liveness cap, which the delegator hands over beside the open cap (a copy or
-an IPC transfer; each is a derivation the release revokes).
+sweep below, revokes every copy of the liveness cap still in the subtree of
+the driver's capability and frees the object once no copy is left. The
+client's own copy stays in that subtree wherever an IPC transfer or
+`SYS_CAP_MOVE` takes it, so it dies exactly when the open does. A copy derived
+from the client's copy stays there too while the client lives, since deleting
+a capability hands its derivations to its parent, but leaves it when the
+client's `CSpace` is torn down, which makes each derivation held in another
+`CSpace` a root of its own, as
+[core/kernel/docs/capability-internals.md](../../../core/kernel/docs/capability-internals.md#revocation-algorithm)
+§ Revocation Algorithm states. Such a copy still keeps the open alive while it is
+held, but no release reaches it: it outlives the open, keeping the
+Notification and the driver memory it occupies, until its holder deletes it.
+
+A delegated open cap alone does not keep the open alive: a holder other than
+the client keeps it alive only by also holding a copy of the liveness cap,
+which the delegator hands over beside the open cap. A delegator SHOULD move
+its own copy (an IPC transfer or `SYS_CAP_MOVE`) rather than derive one for
+the holder, so the copy stays one the release revokes.
 
 The driver finds the opens whose client is gone by asking the kernel whether
 its own capability is the only reference left to the open's Notification
@@ -488,7 +500,7 @@ reply, or after the window with none, per
 
 End the open the open cap names: the driver revokes that open's
 outstanding [`FS_READ_MEMORY`](#label-7-fs_read_memory) pages, deletes its
-recorded release endpoint, revokes every copy of its liveness cap
+recorded release endpoint, revokes the copies of its liveness cap
 ([§ Label 18](#label-18-fs_open)), and retires its id, so the open cap answers
 `INVALID_BADGE` from then on. Other opens of the file, by this client or
 another, keep their pages. The node itself is not freed: every holder of

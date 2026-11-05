@@ -41,9 +41,9 @@ see there for the authoritative statement.
 
 Three hidden tooling directories sit beside these. [`.cargo/`](.cargo/) holds the Cargo
 configuration: the `cargo xtask` alias, the custom-target search path, and the workspace
-rustflags. [`.github/`](.github/) holds the CI workflows, their scripts, and the Issue and PR
-templates (outside the documentation hierarchy). [`.claude/`](.claude/) holds the assistant
-operating instructions, agents, and workflows (outside the documentation hierarchy).
+rustflags. [`.github/`](.github/) holds the CI workflows, their composite actions, and the
+Issue and PR templates (outside the documentation hierarchy). [`.claude/`](.claude/) holds the
+assistant operating instructions, agents, and workflows (outside the documentation hierarchy).
 
 ## Usage
 

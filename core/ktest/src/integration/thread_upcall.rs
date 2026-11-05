@@ -32,6 +32,21 @@
 //!      (`InsufficientRights`), an `UPCALL`-only cap posts at the syscall point
 //!      but not with `UPCALL_ANY_INSTRUCTION`, and an undefined flag bit is
 //!      refused (`InvalidArgument`).
+//!   9. **Nesting and stop.** A post during a delivery is accepted and
+//!      delivered after the reply, at the same syscall return; a post to a
+//!      stopped thread is kept (a second is `QueueFull`) and delivered once
+//!      the thread is started.
+//!  10. **IPC arms.** A call queued on an endpoint no one receives on returns
+//!      `Interrupted` and takes the upcall. So does a call whose message the
+//!      controller received and has not replied to: the post claims the
+//!      pending reply, so the controller's reply then fails.
+//!  11. **Refused park.** A thread that a post reaches while it spins with no
+//!      syscall has its next blocking syscall, a notification wait, refused:
+//!      the wait returns `Interrupted` at once, and the upcall is delivered at
+//!      its return.
+//!
+//! `SYS_THREAD_SET_UPCALL_MASK`'s `InvalidArgument` is not exercised: the
+//! typed wrapper passes only 0 or 1.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -44,7 +59,7 @@ use syscall::{
 };
 use syscall_abi::{
     FAULT_CLASS_UPCALL, FAULT_CLASS_VM, FAULT_KIND_UPCALL, FAULT_KIND_VM, FAULT_LABEL,
-    FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_THREAD_CONTROL,
+    FAULT_REPLY_RESUME, RIGHTS_EP_SEND, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_THREAD_CONTROL,
     RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL, SyscallError, UPCALL_ANY_INSTRUCTION,
     UPCALL_POINT_INTERRUPT, UPCALL_POINT_SYSCALL,
 };
@@ -80,13 +95,22 @@ const LONG_SLEEP_MS: u64 = 600_000;
 const BUF: usize = 512;
 const _: () = assert!(BUF as u64 >= crate::arch::TRAP_FRAME_BYTES);
 
-/// Children: 0 yields (syscall delivery, rights), 1 spins with a pending
-/// syscall-point upcall, 2 spins for the any-instruction delivery, 3 masks,
-/// 4 waits on a notification, 5 sleeps, 6 faults (recursion), 7 is never
-/// started.
-const CHILDREN: usize = 8;
+/// Children: 0 yields (syscall delivery, nesting, stop, rights), 1 spins with
+/// a pending syscall-point upcall, 2 spins for the any-instruction delivery,
+/// 3 masks, 4 waits on a notification, 5 sleeps, 6 faults (recursion), 7 is
+/// never started, 8 and 9 call (queued, and awaiting a reply), and 10 spins
+/// and then waits (refused park).
+const CHILDREN: usize = 11;
 
 static mut STACKS: [ChildStack; CHILDREN] = [ChildStack::ZERO; CHILDREN];
+
+/// The IPC buffer pages of the calling children 8 and 9.
+static mut CALL_PAGES: [crate::IpcPage; 2] = [crate::IpcPage::ZERO, crate::IpcPage::ZERO];
+
+/// How long, in milliseconds, the controller lets a calling child reach its
+/// park before posting. A child slower than this has its park refused
+/// instead, with the same outcome.
+const SETTLE_MS: u64 = 20;
 
 /// Child-side progress words, one per child that reports through memory.
 static YIELDS: AtomicU64 = AtomicU64::new(0);
@@ -97,6 +121,16 @@ static WAIT_RESULT: AtomicU64 = AtomicU64::new(0);
 static SLEEP_STAGE: AtomicU64 = AtomicU64::new(0);
 static SLEEP_RESULT: AtomicU64 = AtomicU64::new(0);
 static FAULT_YIELDS: AtomicU64 = AtomicU64::new(0);
+static CALL_STAGE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static CALL_RESULT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static REFUSE_STAGE: AtomicU64 = AtomicU64::new(0);
+static REFUSE_GO: AtomicU64 = AtomicU64::new(0);
+static REFUSE_RESULT: AtomicU64 = AtomicU64::new(0);
+
+/// Child cap slots of the endpoints the calling children call, and of the
+/// notification the refused-park child waits on.
+static CALL_EP: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static REFUSE_NEVER: AtomicU64 = AtomicU64::new(0);
 
 /// Child cap slot of the report notification, read by [`recovery_entry`].
 static RECOVERY_SIG: AtomicU64 = AtomicU64::new(0);
@@ -112,6 +146,8 @@ struct Parts
 {
     ep_up: Option<u64>,
     ep_vm: Option<u64>,
+    ep_queued: Option<u64>,
+    ep_held: Option<u64>,
     sig: Option<u64>,
     never: Option<u64>,
     children: [Option<spawn::SpawnedChild>; CHILDREN],
@@ -127,9 +163,16 @@ pub fn run(ctx: &TestContext) -> TestResult
         ok &= child.delete_thread().is_ok();
         ok &= child.delete_cspace().is_ok();
     }
-    for cap in [parts.ep_up, parts.ep_vm, parts.sig, parts.never]
-        .into_iter()
-        .flatten()
+    for cap in [
+        parts.ep_up,
+        parts.ep_vm,
+        parts.ep_queued,
+        parts.ep_held,
+        parts.sig,
+        parts.never,
+    ]
+    .into_iter()
+    .flatten()
     {
         ok &= cap_delete(cap).is_ok();
     }
@@ -166,12 +209,111 @@ fn phases(ctx: &TestContext, parts: &mut Parts) -> TestResult
         .ok_or("integration::thread_upcall: no yielding child")?
         .th;
     syscall_delivery(ctx, yielder, ep_up)?;
+    nesting_and_stop(ctx, yielder, ep_up)?;
     pending(ctx, parts, ep_up)?;
     any_instruction(ctx, parts, ep_up, sig)?;
     mask(ctx, parts, ep_up)?;
     cancel_during_block(ctx, parts, ep_up, never)?;
     recursion(ctx, parts, ep_up, ep_vm)?;
+    let ep_queued = *parts
+        .ep_queued
+        .insert(cap_create_endpoint(ctx.memory_base).map_err(fail)?);
+    let ep_held = *parts
+        .ep_held
+        .insert(cap_create_endpoint(ctx.memory_base).map_err(fail)?);
+    ipc_arms(ctx, parts, ep_up, [ep_queued, ep_held])?;
+    refused_park(ctx, parts, ep_up, never)?;
     rights(ctx, yielder, ep_up)
+}
+
+/// Phase 9: a post during a delivery, and a post to a stopped thread.
+fn nesting_and_stop(ctx: &TestContext, th: u64, ep_up: u64) -> TestResult
+{
+    thread_post_upcall(th, 0x5150_0011, 0)
+        .map_err(|_| "integration::thread_upcall: post (first) failed")?;
+    expect_upcall(ctx, ep_up, 0x5150_0011, UPCALL_POINT_SYSCALL)?;
+    thread_post_upcall(th, 0x5150_0012, 0)
+        .map_err(|_| "integration::thread_upcall: a post during a delivery was refused")?;
+    reply_resume(ctx)?;
+    expect_upcall(ctx, ep_up, 0x5150_0012, UPCALL_POINT_SYSCALL)?;
+    reply_resume(ctx)?;
+
+    thread_stop(th).map_err(|_| "integration::thread_upcall: thread_stop (yielder) failed")?;
+    let posted = thread_post_upcall(th, 0x5150_0013, 0);
+    let second = thread_post_upcall(th, 0x5150_0014, 0);
+    thread_start(th).map_err(|_| "integration::thread_upcall: thread_start (yielder) failed")?;
+    if posted.is_err() || second != Err(SyscallError::QueueFull as i64)
+    {
+        return Err("integration::thread_upcall: a stopped thread did not keep its upcall");
+    }
+    expect_upcall(ctx, ep_up, 0x5150_0013, UPCALL_POINT_SYSCALL)?;
+    reply_resume(ctx)
+}
+
+/// Phase 10: a call queued on an endpoint (`eps[0]`), and a call awaiting its
+/// reply (`eps[1]`, whose message the controller receives).
+fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 2]) -> TestResult
+{
+    for (k, ep) in eps.into_iter().enumerate()
+    {
+        let index = 8 + k;
+        let cookie = 0x5150_0020 + k as u64;
+        let th = spawn_child(ctx, parts, index)?;
+        bind_upcall(th, ep_up)?;
+        let slot = cap_copy(ep, child_cs(parts, index)?, RIGHTS_EP_SEND)
+            .map_err(|_| "integration::thread_upcall: cap_copy endpoint failed")?;
+        CALL_EP[k].store(slot, Ordering::Release);
+        start_child(parts, index, call_entry, k as u64)?;
+        wait_for(&CALL_STAGE[k], 1)?;
+        if k == 1
+        {
+            // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+            unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+                .map_err(|_| "integration::thread_upcall: ipc_recv (call) failed")?;
+        }
+        else
+        {
+            let _ = thread_sleep(SETTLE_MS);
+        }
+        thread_post_upcall(th, cookie, 0)
+            .map_err(|_| "integration::thread_upcall: post (caller) failed")?;
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        if k == 1 && unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }.is_ok()
+        {
+            return Err("integration::thread_upcall: the post left the call's reply pending");
+        }
+        expect_upcall(ctx, ep_up, cookie, UPCALL_POINT_SYSCALL)?;
+        reply_resume(ctx)?;
+        wait_for(&CALL_STAGE[k], 2)?;
+        if CALL_RESULT[k].load(Ordering::Acquire) != RESULT_INTERRUPTED
+        {
+            return Err("integration::thread_upcall: an interrupted call did not fail Interrupted");
+        }
+    }
+    Ok(())
+}
+
+/// Phase 11: a post that finds the thread running refuses its next park.
+fn refused_park(ctx: &TestContext, parts: &mut Parts, ep_up: u64, never: u64) -> TestResult
+{
+    let th = spawn_child(ctx, parts, 10)?;
+    bind_upcall(th, ep_up)?;
+    let slot = cap_copy(never, child_cs(parts, 10)?, RIGHTS_NTF_WAIT)
+        .map_err(|_| "integration::thread_upcall: cap_copy notification failed")?;
+    REFUSE_NEVER.store(slot, Ordering::Release);
+    start_child(parts, 10, refuse_entry, 0)?;
+    wait_for(&REFUSE_STAGE, 1)?;
+    thread_post_upcall(th, 0x5150_0030, 0)
+        .map_err(|_| "integration::thread_upcall: post (spinning) failed")?;
+    REFUSE_GO.store(1, Ordering::Release);
+    expect_upcall(ctx, ep_up, 0x5150_0030, UPCALL_POINT_SYSCALL)?;
+    reply_resume(ctx)?;
+    wait_for(&REFUSE_STAGE, 2)?;
+    if REFUSE_RESULT.load(Ordering::Acquire) != RESULT_INTERRUPTED
+    {
+        return Err("integration::thread_upcall: a refused park did not fail Interrupted");
+    }
+    Ok(())
 }
 
 /// Phase 1: no handler bound, or a thread not yet started.
@@ -502,6 +644,53 @@ extern "C" fn yield_entry(_arg: u64) -> !
     {
         YIELDS.fetch_add(1, Ordering::Release);
         let _ = thread_yield();
+    }
+}
+
+/// Child entry: register IPC page `k` and call the endpoint published for
+/// child `8 + k`, recording the result.
+extern "C" fn call_entry(k: u64) -> !
+{
+    // cast_possible_truncation: k is 0 or 1, the index start_child passed.
+    #[allow(clippy::cast_possible_truncation)]
+    let k = k as usize;
+    // SAFETY: page `k` belongs to this child alone (one calling child per
+    // page, each run once), and no reference to it is formed.
+    let buf = unsafe { core::ptr::addr_of_mut!(CALL_PAGES[k]) }.cast::<u64>();
+    // SAFETY: `buf` is this thread's own page-aligned IPC page, registered by
+    // one thread at a time; no Rust object lives in it, and the thread
+    // reaches it only through the raw `buf` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf as u64) }.is_err()
+    {
+        syscall::thread_exit()
+    }
+    CALL_STAGE[k].store(1, Ordering::Release);
+    let ep = CALL_EP[k].load(Ordering::Acquire);
+    // SAFETY: `buf` was registered as this thread's IPC buffer above.
+    let called = unsafe { ipc::ipc_call(ep, &IpcMessage::new(0), buf) };
+    CALL_RESULT[k].store(result_word(called.map(|_| 0)), Ordering::Release);
+    CALL_STAGE[k].store(2, Ordering::Release);
+    loop
+    {
+        core::hint::spin_loop();
+    }
+}
+
+/// Child entry: spin with no syscall until released, then wait on the
+/// notification that nothing signals.
+extern "C" fn refuse_entry(_arg: u64) -> !
+{
+    REFUSE_STAGE.store(1, Ordering::Release);
+    while REFUSE_GO.load(Ordering::Acquire) == 0
+    {
+        core::hint::spin_loop();
+    }
+    let waited = result_word(notification_wait(REFUSE_NEVER.load(Ordering::Acquire)));
+    REFUSE_RESULT.store(waited, Ordering::Release);
+    REFUSE_STAGE.store(2, Ordering::Release);
+    loop
+    {
+        core::hint::spin_loop();
     }
 }
 

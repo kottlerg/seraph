@@ -88,16 +88,30 @@ pub unsafe fn post(
         return Ok(());
     }
 
-    // SAFETY: target valid and pinned; no lock held. A won cancel owes the
-    // wake, which wake_in_flight (set inside the claim) keeps for this call.
-    if unsafe { crate::syscall::thread::cancel_for_upcall(target) }
+    // Cancel the target's block. A pass whose claim is lost to a rebind of the
+    // park (a server's receive moves a queued caller to reply-wait under a new
+    // park_seq) leaves the thread blocked with the upcall pending, so the pass
+    // is repeated while the park it found changed and the upcall may still
+    // cancel it; a park the thread commits itself is refused while the upcall
+    // is pending, so only such rebinds repeat it.
+    // SAFETY: target valid and pinned; no lock held.
+    let mut seen = unsafe { cancellable_park(target) };
+    while let Some(park_seq) = seen
     {
-        // SAFETY: target valid; its park was claimed by the cancel above.
-        unsafe {
-            let cpu = crate::sched::select_target_cpu(target);
-            crate::sched::enqueue_and_wake(target, cpu);
+        // SAFETY: target valid and pinned; no lock held. A won cancel owes
+        // the wake, which wake_in_flight (set inside the claim) keeps for this
+        // call.
+        if unsafe { crate::syscall::thread::cancel_for_upcall(target) }
+        {
+            // SAFETY: target valid; its park was claimed by the cancel above.
+            unsafe {
+                let cpu = crate::sched::select_target_cpu(target);
+                crate::sched::enqueue_and_wake(target, cpu);
+            }
+            return Ok(());
         }
-        return Ok(());
+        // SAFETY: as above.
+        seen = unsafe { cancellable_park(target) }.filter(|&now| now != park_seq);
     }
 
     if any_instruction
@@ -115,6 +129,27 @@ pub unsafe fn post(
         }
     }
     Ok(())
+}
+
+/// The `park_seq` of `tcb`'s park when it is `Blocked` and a pending upcall may
+/// cancel the block (`syscall::thread::upcall_may_cancel`), read under its
+/// `sched_lock`; `None` otherwise.
+///
+/// # Safety
+/// `tcb` must be a valid TCB; no lock is held.
+#[cfg(not(test))]
+unsafe fn cancellable_park(tcb: *mut ThreadControlBlock) -> Option<u32>
+{
+    // SAFETY: tcb valid; state, park_seq, and the upcall fields are read under
+    // its sched_lock.
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let park = ((*tcb).state == ThreadState::Blocked
+            && crate::syscall::thread::upcall_may_cancel(tcb))
+        .then(|| (*tcb).park_seq.load(Ordering::Relaxed));
+        (*tcb).sched_lock.unlock_raw(saved);
+        park
+    }
 }
 
 /// The CPU `tcb` is `current` on at the scan, if any. A snapshot: the thread
@@ -157,8 +192,11 @@ pub unsafe fn set_mask(tcb: *mut ThreadControlBlock, masked: bool) -> bool
 }
 
 /// Take the pending upcall of `tcb` for a delivery at `point`, clearing it:
-/// its cookie, or `None` when none is pending, the thread masks upcalls, or
-/// the upcall waits for a syscall's return and `point` is an interrupt's.
+/// its cookie, or `None` when none is pending, the thread masks upcalls, the
+/// upcall waits for a syscall's return and `point` is an interrupt's, or the
+/// thread is no longer `Running` (a stop has committed and the thread has not
+/// yet left its CPU), which keeps the upcall pending for a delivery point
+/// after the thread is started.
 ///
 /// # Safety
 /// `tcb` must be the calling CPU's running thread; no lock is held.
@@ -174,7 +212,8 @@ unsafe fn take(tcb: *mut ThreadControlBlock, point: u64) -> Option<u64>
             return None;
         }
         let saved = (*tcb).sched_lock.lock_raw();
-        let taken = ((*tcb).upcall_pending.load(Ordering::Relaxed)
+        let taken = ((*tcb).state == ThreadState::Running
+            && (*tcb).upcall_pending.load(Ordering::Relaxed)
             && !(*tcb).upcall_masked.load(Ordering::Relaxed)
             && (point == syscall::UPCALL_POINT_SYSCALL
                 || (*tcb).upcall_any_instruction.load(Ordering::Relaxed)))

@@ -394,9 +394,14 @@ unsafe fn finish_syscall(exit: SyscallExit) -> SyscallExit
             crate::arch::current::cpu::halt_loop();
         }
         // The syscall delivery point of a pending upcall
-        // (docs/fault-handling.md § Asynchronous Upcalls): the frame holds what
-        // the thread returns with, and the thread is live.
-        crate::ipc::upcall::deliver_at_syscall();
+        // (docs/fault-handling.md § Asynchronous Upcalls): the frame holds the
+        // syscall's result, and the thread is live. A restarted syscall is not
+        // a delivery point: its frame holds its arguments for the
+        // re-execution, whose own return delivers.
+        if exit == SyscallExit::Complete
+        {
+            crate::ipc::upcall::deliver_at_syscall();
+        }
         let tcb = current_tcb();
         if !tcb.is_null()
         {
@@ -668,10 +673,12 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
         }
         crate::sched::ParkCommit::RefusedStop =>
         {
-            // A stop won against the park. Deschedule in place (the requeue
-            // denylist drops a Stopped thread); on restart the continuation
-            // completes and nothing rewrites the trap frame afterwards, so
-            // the direct error return survives to userspace.
+            // A stop won against the park, or a pending upcall refused it.
+            // Deschedule in place (the requeue denylist drops a Stopped
+            // thread; a thread the upcall left Running is requeued); on
+            // restart the continuation completes and nothing rewrites the trap
+            // frame afterwards, so the direct error return survives to
+            // userspace, and the upcall is delivered at that return.
             // SAFETY: tcb valid; no sleep-list entry was added. schedule is
             // called from syscall context on a valid kernel stack.
             unsafe {

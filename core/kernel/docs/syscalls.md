@@ -265,15 +265,15 @@ pub enum SyscallError
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`, or a wait set
     /// another thread already waits on).
     InvalidState = -15,
-    /// A blocking operation was cancelled: the thread was stopped, the object
-    /// it was blocked on was destroyed, or, for a call, the server received
-    /// again, or was destroyed, before replying. The thread sees this as the
-    /// return value of its blocked syscall. `SYS_THREAD_START` also returns it
-    /// when its caller is stopped while the start waits for the target to
-    /// settle (nothing is started). Batched capability operations (revoke,
-    /// delete, move, a range split) also return it at their liveness backstop;
-    /// each syscall's entry in core/kernel/docs/syscalls.md gives the state the
-    /// backstop leaves.
+    /// A blocking operation was cancelled: the thread was stopped or
+    /// interrupted by an upcall, the object it was blocked on was destroyed,
+    /// or, for a call, the server received again, or was destroyed, before
+    /// replying. The thread sees this as the return value of its blocked
+    /// syscall. `SYS_THREAD_START` also returns it when its caller is stopped
+    /// while the start waits for the target to settle (nothing is started).
+    /// Batched capability operations (revoke, delete, move, a range split)
+    /// also return it at their liveness backstop; each syscall's entry in
+    /// core/kernel/docs/syscalls.md gives the state the backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full, or the object a new capability or a retype would

@@ -867,6 +867,26 @@ pub(crate) unsafe fn cancel_for_upcall(tcb: *mut crate::sched::thread::ThreadCon
     unsafe { cancel_park(tcb, true) }
 }
 
+/// Whether a posted upcall may cancel `tcb`'s block now: one is pending, the
+/// thread does not mask upcalls, and it is in no fault or upcall delivery.
+///
+/// # Safety
+/// `tcb` must be a valid TCB whose `sched_lock` the caller holds.
+#[cfg(not(test))]
+pub(crate) unsafe fn upcall_may_cancel(tcb: *mut crate::sched::thread::ThreadControlBlock) -> bool
+{
+    // SAFETY: caller holds tcb.sched_lock, under which these are written.
+    unsafe {
+        !(*tcb).in_fault_delivery
+            && (*tcb)
+                .upcall_pending
+                .load(core::sync::atomic::Ordering::Relaxed)
+            && !(*tcb)
+                .upcall_masked
+                .load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Keep the wake a won cancel claim owes when the cancel is an upcall's: set
 /// `wake_in_flight` inside the claim's `sched_lock` hold, as every waker's
 /// claim does, so a restart waits for the wake ([`cancel_for_upcall`]'s
@@ -946,14 +966,7 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
             (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed),
         );
         let blocked = (*tcb).state == crate::sched::thread::ThreadState::Blocked;
-        let refused = for_upcall
-            && ((*tcb).in_fault_delivery
-                || (*tcb)
-                    .upcall_masked
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                || !(*tcb)
-                    .upcall_pending
-                    .load(core::sync::atomic::Ordering::Relaxed));
+        let refused = for_upcall && !upcall_may_cancel(tcb);
         if blocked
             && !refused
             && snap.0 == IpcThreadState::None
@@ -1106,9 +1119,17 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                 // the CAS by the CLOSURE LEMMA.
                 unsafe {
                     let saved = (*tcb).sched_lock.lock_raw();
+                    // An upcall's cancel claims only the snapshotted park, and
+                    // only while the upcall may still cancel it: the thread
+                    // may since have run, taken the upcall, masked, and called
+                    // the same server again, a park this cancel must leave.
                     if (*tcb).state == crate::sched::thread::ThreadState::Blocked
                         && (*tcb).ipc_state == IpcThreadState::BlockedOnReply
                         && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
+                        && (!for_upcall
+                            || ((*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed)
+                                == park_seq
+                                && upcall_may_cancel(tcb)))
                     {
                         let cancelled = (*server)
                             .reply_tcb

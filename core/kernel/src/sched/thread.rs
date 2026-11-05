@@ -1015,8 +1015,10 @@ pub struct ThreadControlBlock
     /// endpoint, event queue, or wait set) under that object's lock; by the
     /// sleep timer when it pops a plain sleeper, under `SLEEP_LIST_LOCK`; by
     /// `endpoint_call` / `endpoint_recv` before they publish a reply binding
-    /// to it; and by a server's `dealloc_object(Thread)` when it claims a
-    /// reply-bound or fault-bound client.
+    /// to it; by a server's `dealloc_object(Thread)` when it claims a
+    /// reply-bound or fault-bound client; and by an upcall's cancel
+    /// (`syscall::thread::cancel_for_upcall`) inside the `sched_lock` hold of
+    /// the claim it won, for the wake its poster makes.
     ///
     /// Cleared by `enqueue_and_wake` when the owed wake lands: before it
     /// releases `sched_lock`, except on a thread already `Exited`, where the

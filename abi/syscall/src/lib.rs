@@ -553,14 +553,14 @@ pub enum SyscallError
     /// another thread already waits on).
     InvalidState = -15,
     /// A blocking operation was cancelled: the thread was stopped or
-    /// interrupted by an upcall, the object it was blocked on was destroyed, or, for a call, the
-    /// server received again, or was destroyed, before replying. The thread
-    /// sees this as the return value of its blocked syscall. `SYS_THREAD_START` also returns it
-    /// when its caller is stopped while the start waits for the target to
-    /// settle (nothing is started). Batched capability operations (revoke,
-    /// delete, move, a range split) also return it at their liveness backstop;
-    /// each syscall's entry in core/kernel/docs/syscalls.md gives the state the
-    /// backstop leaves.
+    /// interrupted by an upcall, the object it was blocked on was destroyed,
+    /// or, for a call, the server received again, or was destroyed, before
+    /// replying. The thread sees this as the return value of its blocked
+    /// syscall. `SYS_THREAD_START` also returns it when its caller is stopped
+    /// while the start waits for the target to settle (nothing is started).
+    /// Batched capability operations (revoke, delete, move, a range split)
+    /// also return it at their liveness backstop; each syscall's entry in
+    /// core/kernel/docs/syscalls.md gives the state the backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full, or the object a new capability or a retype would
@@ -1106,7 +1106,9 @@ pub const FAULT_KIND_UPCALL: u64 = 2;
 
 /// Upcall delivery point (`FAULT_KIND_UPCALL` data word 2): the return of a
 /// syscall of the thread, a blocking syscall that the post interrupted among
-/// them. The thread's registers hold that syscall's result.
+/// them. The thread's registers hold that syscall's result; a restartable
+/// syscall that re-executes is a delivery point only at its re-execution's
+/// return.
 pub const UPCALL_POINT_SYSCALL: u64 = 0;
 
 /// Upcall delivery point (`FAULT_KIND_UPCALL` data word 2): the return to user

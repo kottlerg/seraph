@@ -294,8 +294,8 @@ pub fn raw_ipc_call(
 /// Endpoint cap), `InsufficientRights` (`ep` lacks Receive), `QuotaExceeded`
 /// (this thread's `CSpace` directory is structurally full for an incoming
 /// cap transfer), `OutOfMemory` (the `CSpace` slot-page pool is exhausted),
-/// or `Interrupted` (this thread was stopped, or the endpoint destroyed,
-/// while the receive was blocked). The first four refuse the receive before
+/// or `Interrupted` (this thread was stopped or interrupted by an upcall, or
+/// the endpoint destroyed, while the receive was blocked). The first four refuse the receive before
 /// any pending reply is released.
 #[doc(hidden)]
 #[inline]
@@ -384,8 +384,9 @@ pub fn notification_send(sig: u64, bits: u64) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid or
-/// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped while
-/// waiting or the notification is destroyed under it.
+/// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped or
+/// interrupted by an upcall while waiting or the notification is destroyed
+/// under it.
 #[inline]
 pub fn notification_wait(sig: u64) -> Result<u64, i64>
 {
@@ -408,8 +409,9 @@ pub fn notification_wait(sig: u64) -> Result<u64, i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid or
-/// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped while
-/// waiting or the notification is destroyed under it.
+/// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped or
+/// interrupted by an upcall while waiting or the notification is destroyed
+/// under it.
 #[inline]
 pub fn notification_wait_timeout(sig: u64, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1861,9 +1863,9 @@ pub fn event_post_entry(queue_cap: u64, entry: EventEntry) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`
-/// (`Interrupted`) if the caller is stopped while waiting or the queue is
-/// destroyed under it; or another negative `i64` error code if the queue cap
-/// is invalid or lacks Recv rights.
+/// (`Interrupted`) if the caller is stopped or interrupted by an upcall while
+/// waiting or the queue is destroyed under it; or another negative `i64` error
+/// code if the queue cap is invalid or lacks Recv rights.
 #[inline]
 pub fn event_recv_entry(queue_cap: u64, timeout_ms: u64) -> Result<EventEntry, i64>
 {
@@ -1887,8 +1889,8 @@ pub fn event_recv_entry(queue_cap: u64, timeout_ms: u64) -> Result<EventEntry, i
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the queue cap is invalid or lacks
-/// Recv rights; `-16` (`Interrupted`) if the caller is stopped while waiting
-/// or the queue is destroyed under it.
+/// Recv rights; `-16` (`Interrupted`) if the caller is stopped or interrupted
+/// by an upcall while waiting or the queue is destroyed under it.
 #[inline]
 pub fn event_recv(queue_cap: u64) -> Result<u64, i64>
 {
@@ -1925,9 +1927,9 @@ pub fn event_try_recv_death(queue_cap: u64) -> Result<DeathEvent, i64>
 ///
 /// # Errors
 /// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`
-/// (`Interrupted`) if the caller is stopped while waiting or the queue is
-/// destroyed under it; or another negative `i64` error code if the queue cap
-/// is invalid or lacks Recv rights.
+/// (`Interrupted`) if the caller is stopped or interrupted by an upcall while
+/// waiting or the queue is destroyed under it; or another negative `i64` error
+/// code if the queue cap is invalid or lacks Recv rights.
 #[inline]
 pub fn event_recv_timeout(queue_cap: u64, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -2010,7 +2012,8 @@ pub fn wait_set_remove(ws_cap: u64, source_cap: u64) -> Result<(), i64>
 /// Returns a negative `i64` error code if the wait set cap is invalid or lacks
 /// Wait rights; `-15` (`InvalidState`) if another thread already waits on the
 /// set (a wait set takes one waiter); `-16` (`Interrupted`) if the caller is
-/// stopped while waiting or the wait set is destroyed under it.
+/// stopped or interrupted by an upcall while waiting or the wait set is
+/// destroyed under it.
 #[inline]
 pub fn wait_set_wait(ws_cap: u64) -> Result<u64, i64>
 {
@@ -2375,7 +2378,8 @@ pub fn thread_post_upcall(thread: u64, cookie: u64, flags: u64) -> Result<(), i6
 pub fn thread_set_upcall_mask(masked: bool) -> Result<bool, i64>
 {
     // SAFETY: syscall2 issues a raw syscall; the argument is a scalar the
-    // kernel validates.
+    // kernel validates. The crate has no one-argument entry, so the second
+    // argument register carries an unused 0, as for `thread_yield`.
     let ret = unsafe { syscall2(SYS_THREAD_SET_UPCALL_MASK, u64::from(masked), 0) };
     if ret < 0 { Err(ret) } else { Ok(ret != 0) }
 }
@@ -2639,8 +2643,8 @@ pub fn sbi_call(
 /// § `SYS_THREAD_SLEEP`).
 ///
 /// # Errors
-/// Returns `-16` (`Interrupted`) if the thread is stopped before or during
-/// the sleep (and restarted), unless the timer had already claimed the
+/// Returns `-16` (`Interrupted`) if the thread is stopped (and restarted), or
+/// interrupted by an upcall, before or during the sleep, unless the timer had already claimed the
 /// elapsed deadline (the sleep returns `Ok`), or another negative `i64` error
 /// code on failure.
 #[inline]

@@ -443,7 +443,9 @@ action, and no ambient authority. A thread whose upcall class is unbound cannot 
 A pending upcall is delivered at the first delivery point the thread reaches after the post:
 
 - **Syscall point** (`UPCALL_POINT_SYSCALL`): the return of any syscall of the thread, with the
-  syscall's result already in its registers.
+  syscall's result already in its registers. A restartable syscall that re-executes after a fault
+  of its user copy ([Kernel Copies](#kernel-copies)) has no return to deliver at until its
+  re-execution returns.
 - **Interrupt point** (`UPCALL_POINT_INTERRUPT`): only for an `UPCALL_ANY_INSTRUCTION` post. This
   is the return to user mode of an interrupt that preempted the thread, so it reaches a thread
   that makes no syscall. The post prods a CPU running the thread, so the thread takes an
@@ -484,7 +486,9 @@ wakes the thread. Those syscalls are listed in
 The syscall returns `Interrupted`, unless a genuine wake or a sleep's elapsed deadline claimed it
 first, and the upcall is delivered at that return. A blocking syscall that the thread enters with an
 upcall pending returns `Interrupted` at once instead of blocking. The kernel restarts nothing;
-whether to retry is the program's choice.
+whether to retry is the program's choice. For `SYS_IPC_CALL`, `Interrupted` does not mean that the
+request went undelivered: a server that already received the message finds no reply pending, so a
+program that retries a call may repeat its request, as after a stop.
 
 A fault-blocked thread's fault, or an upcall delivery in progress, is never cancelled for an upcall:
 the upcall waits for it to resolve. The protocol that keeps a post from missing a thread that is
@@ -509,13 +513,16 @@ without disturbing other threads.
 - **Upcall during a fault.** An upcall posted to a fault-blocked thread stays pending and is
   delivered at the first delivery point after the fault resolves.
 - **Upcall during an upcall.** Delivery takes the pending upcall, so a post during a delivery is
-  accepted. It is delivered after the current one resolves, at the same delivery point.
+  accepted. It is delivered after the current one resolves, at the same delivery point when that
+  point delivers it: a post without `UPCALL_ANY_INSTRUCTION` made during a delivery at the
+  interrupt point waits for the thread's next syscall return.
 - **The handler's own upcalls.** These go to the handler thread's own upcall binding, and its faults
   to its own fault handlers: per-thread chaining, as for faults
   ([Recursion and Escalation](#recursion-and-escalation)). A thread MUST NOT bind its upcall class
   to an endpoint that only it receives on.
 - **A stopped thread** keeps a pending upcall, which is delivered at a delivery point after the
-  thread is started.
+  thread is started. That includes one whose stop has committed while it still runs: it takes no
+  upcall at the delivery points it passes before it leaves its CPU.
 - **After a resume**, a fault the thread then takes (at an instruction pointer the handler wrote,
   for example) is an ordinary fault of its own class.
 

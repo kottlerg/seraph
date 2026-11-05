@@ -109,8 +109,8 @@ pub fn growth_zones_phase(_: &Caps)
 /// One allocation far larger than the free heap tail plus any single grow
 /// increment succeeds, and the kernel can write into fresh heap pages: a
 /// `SYS_GETRANDOM` into a fresh allocation's spare capacity fills it, whether
-/// the allocator backed the page before handing it out or the pager backs it
-/// on the copy's fault and the call re-executes (docs/fault-handling.md
+/// a grow mapped the page eagerly or it is a demand-floor page the pager backs
+/// on the copy's fault, the call then re-executing (docs/fault-handling.md
 /// § Kernel Copies).
 pub fn large_single_allocation_phase(_: &Caps)
 {

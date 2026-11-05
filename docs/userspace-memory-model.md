@@ -115,12 +115,12 @@ communicates them via `ProcessInfo` / `InitInfo`.
   from the heap zone's window via one raw non-allocating `SYS_GETRANDOM`
   call (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)). In a
   demand-paged process the floor is a demand region registered with the
-  pager (`REGISTER_REGION`), so it costs VA and the frames the allocator
-  hands out; the allocator touches each floor page before handing it out,
-  since a spawned thread's IPC buffer is a heap page and the kernel's
-  IPC-buffer copies fail on an unbacked page instead of faulting to the
-  pager (a restartable syscall's copy faults to it;
-  [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)).
+  pager (`REGISTER_REGION`), so it costs VA and the frames its first
+  touches back. A spawned thread's IPC buffer is a heap page, and the
+  kernel's IPC-buffer copies fail on an unbacked page instead of faulting
+  to the pager (a restartable syscall's copy faults to it;
+  [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)), so
+  `Thread::new` touches that page before the thread registers it.
   A process with no pager maps the floor eagerly through
   `REQUEST_MEMORY_CAPS`. The floor's size is a `std::sys::seraph`
   implementation detail.

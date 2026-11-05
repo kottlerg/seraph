@@ -128,8 +128,9 @@ impl<T> SpinMutex<T> {
         {
             match backoff.next_step() {
                 spin_wait::Step::Spin => core::hint::spin_loop(),
-                // An error (`Interrupted` when this thread is stopped) only
-                // ends the sleep early; the next attempt follows either way.
+                // An error (`Interrupted` when this thread is stopped or is
+                // posted an upcall it does not mask) only ends the sleep
+                // early; the next attempt follows either way.
                 spin_wait::Step::Sleep(ms) => {
                     let _ = syscall::thread_sleep(ms);
                 }

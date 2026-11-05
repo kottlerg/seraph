@@ -205,9 +205,12 @@ pub mod procmgr_labels
     /// their [`ArgvEnvHeader`] in four data words (from word 0 for
     /// `CREATE_PROCESS`, from word 1, after `file_size`, for
     /// `CREATE_FROM_FILE`). The cap is the last cap before the death relay,
-    /// or the last cap without one. procmgr maps it read-only, copies the
-    /// blobs into the child's argv/env region, and deletes its copy before
-    /// it replies; the caller then returns the cap's run to memmgr.
+    /// or the last cap without one. procmgr copies the blobs into the child's
+    /// argv/env region through fixed windows and deletes its copy of the cap
+    /// before it replies; the caller then returns the cap's run to memmgr.
+    /// Neither side returns pages a failed unmap may leave mapped: a spawner
+    /// that cannot unmap its write window withholds its run, and procmgr,
+    /// failing to unmap a copy window, withholds the child's memmgr record.
     /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
     /// `CREATE_PROCESS` (**argv and env**).
     pub const CREATE_ARGV_ENV: u64 = 1 << 29;

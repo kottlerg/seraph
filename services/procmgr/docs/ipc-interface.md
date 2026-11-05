@@ -117,16 +117,20 @@ cap or together exceed `process_abi::ARGV_ENV_MAX_BYTES`. Otherwise, once it has
 child with memmgr and before it creates anything else, procmgr copies the blobs into fresh pages on
 the child's account, through two windows of `ARGV_ENV_COPY_WINDOW_PAGES` (64) pages re-mapped for
 each chunk, so its own page-table cost per create stays that of two 256 KiB spans whatever the
-blobs' size. It checks the strings on that copy: a blob whose NULs disagree with its count, or a
-nonempty blob that does not end in a NUL, also refuses the create with `INVALID_ARGUMENT`, and a
-caller that rewrites its pages meanwhile changes only the copy that is checked. A shortfall of
-procmgr's or the child's memory replies `OUT_OF_MEMORY`. procmgr maps the copy read-only directly
-after the child's `ProcessInfo` page, where `ProcessInfo`'s `args_offset` and `env_offset` locate it
-([abi/process-abi/README.md](../../../abi/process-abi/README.md) § argv / env region), funding the
-child's page tables for a region past one last-level table's span (512 pages) from the child's
-account. procmgr deletes its copy of the cap before it replies, so the caller can return the run to
-memmgr as soon as the call returns. `std::os::seraph::process::ArgvEnvCap` builds the cap and the
-header for a std-built sender.
+blobs' size. That copy also refuses the create with `INVALID_ARGUMENT` when the caller's cap cannot
+be mapped (it lacks the map right, or the kernel refuses its pages for a reason other than procmgr's
+memory), and when, on the copy, a blob's NULs disagree with its count or a nonempty blob does not
+end in a NUL; a caller that rewrites its pages meanwhile changes only the copy that is checked. A
+shortfall of procmgr's or the child's memory replies `OUT_OF_MEMORY`. Should procmgr fail to unmap a
+copy window, it also replies `OUT_OF_MEMORY`, keeps the window's VA reserved, and withholds the
+child's memmgr record (sends no `PROCESS_DIED` for it), so memmgr keeps the child's frames out of
+its pool rather than re-granting pages procmgr may still map. procmgr maps the copy read-only
+directly after the child's `ProcessInfo` page, where `ProcessInfo`'s `args_offset` and `env_offset`
+locate it ([abi/process-abi/README.md](../../../abi/process-abi/README.md) § argv / env region),
+funding the child's page tables for a region past one last-level table's span (512 pages) from the
+child's account. procmgr deletes its copy of the cap before it replies, so the caller can return the
+run to memmgr as soon as the call returns. `std::os::seraph::process::ArgvEnvCap` builds the cap and
+the header for a std-built sender.
 
 **Pinned flag.** Demand paging is the default: at finalize procmgr binds every
 child's main thread fault handler to memmgr (the system pager) via

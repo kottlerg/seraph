@@ -29,7 +29,7 @@ pub enum ArgvEnvRefusal
 {
     /// Fewer data words arrived than the header occupies.
     MissingHeader,
-    /// The argv/env cap is not a Memory cap procmgr can size and map.
+    /// The argv/env cap is not a Memory cap procmgr can size.
     NotMemory,
     /// The argv and env lengths sum past a `u64`.
     LengthOverflow,

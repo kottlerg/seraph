@@ -47,7 +47,17 @@ impl ScratchMapping
         // never reaches past the reservation.
         if unsafe { syscall::mem_map(memory_cap, self_aspace, va, 0, pages, prot) }.is_err()
         {
-            unreserve_pages(range);
+            // The kernel maps page by page and stops at the first failure, so
+            // pages before it may be mapped: unmap the whole span (unmapping a
+            // page that was never mapped is harmless) before the VA is
+            // released, and keep it reserved if that unmap fails, so no later
+            // reservation lands on a still-mapped page.
+            // SAFETY: the span is the reservation just taken above, which no
+            // Rust object references.
+            if unsafe { syscall::mem_unmap(self_aspace, va, pages) }.is_ok()
+            {
+                unreserve_pages(range);
+            }
             return None;
         }
         Some(Self {

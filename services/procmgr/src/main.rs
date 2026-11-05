@@ -1157,8 +1157,7 @@ fn handle_create(
 
     // The child's checked copy of the argv and env, on its account. The
     // caller's cap is no longer needed once it is taken (or refused), so it
-    // is deleted before any reply; a refusal retires the memmgr record
-    // through `mms`'s drop.
+    // is deleted before any reply.
     let argv_env = match argv_env
     {
         Some(request) => process::copy_argv_env(ctx.self_aspace, mms.cap(), ipc_buf, &request),
@@ -1168,11 +1167,11 @@ fn handle_create(
     let argv_env = match argv_env
     {
         Ok(argv_env) => argv_env,
-        Err(code) =>
+        Err(e) =>
         {
-            drop(mms);
+            process::settle_failed_argv_env(mms, e);
             release_caps(&[module_cap, creator_ep]);
-            reply_empty(ipc_buf, code);
+            reply_empty(ipc_buf, e.code());
             return;
         }
     };

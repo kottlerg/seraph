@@ -1504,7 +1504,10 @@ pub mod process {
     /// procmgr, which deletes its copy before it replies. Dropping the value,
     /// once the create call has returned, deletes the derivation if the call
     /// did not move it, deletes this process's cap on the run, and returns the
-    /// run to memmgr (`RELEASE_MEMORY_CAPS`).
+    /// run to memmgr (`RELEASE_MEMORY_CAPS`). A [`Self::new`] whose write
+    /// window it cannot unmap withholds the run instead: it stays charged to
+    /// this process until it exits, rather than going back to memmgr's pool
+    /// while pages of it may still be mapped here.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub struct ArgvEnvCap {
         original: u64,
@@ -1536,33 +1539,22 @@ pub mod process {
             if total == 0 {
                 return Ok(None);
             }
+            let too_long = |why| crate::io::Error::new(crate::io::ErrorKind::ArgumentListTooLong, why);
             if total > process_abi::ARGV_ENV_MAX_BYTES {
-                return Err(crate::io::Error::new(
-                    crate::io::ErrorKind::ArgumentListTooLong,
-                    "argv and env exceed the process ABI's argv/env region",
-                ));
+                return Err(too_long("argv and env exceed the process ABI's argv/env region"));
             }
             let (memmgr_ep, aspace) = spawner_memmgr()?;
             let pages = total.div_ceil(syscall_abi::PAGE_SIZE);
-            let Some((original, _, phys)) =
+            let (original, _, phys) =
                 crate::sys::alloc::seraph::slab_request_pages(memmgr_ep, pages)
-            else {
-                return Err(crate::io::Error::new(
-                    crate::io::ErrorKind::ArgumentListTooLong,
-                    "argv and env exceed what the spawner can fund",
-                ));
+                    .ok_or_else(|| too_long("argv and env exceed what the spawner can fund"))?;
+            let header = ipc::procmgr_labels::ArgvEnvHeader {
+                args_bytes: args.len() as u64,
+                args_count,
+                env_bytes: env.len() as u64,
+                env_count,
             };
-            let mut this = Self {
-                original,
-                transfer: 0,
-                phys,
-                header: ipc::procmgr_labels::ArgvEnvHeader {
-                    args_bytes: args.len() as u64,
-                    args_count,
-                    env_bytes: env.len() as u64,
-                    env_count,
-                },
-            };
+            let mut this = Self { original, transfer: 0, phys, header };
             if let Err(still_mapped) = write_argv_env(aspace, original, pages, args, env) {
                 if still_mapped {
                     // A run this process may still have mapped stays charged
@@ -1636,9 +1628,10 @@ pub mod process {
 
     /// Write `args` then `env` from byte 0 of `memory`'s first `pages` pages,
     /// and zero the tail, through one [`ARGV_ENV_WRITE_WINDOW_PAGES`]-page
-    /// window of `aspace` re-mapped per chunk. `Err(still_mapped)` when the
-    /// reservation, the derivation or a map fails (`false`), or an unmap does
-    /// (`true`: a chunk may still be mapped here).
+    /// window of `aspace` re-mapped per chunk (`argv_env::fill_window` fills
+    /// each). `Err(still_mapped)` when the reservation, the derivation or a
+    /// map fails (`false`), or an unmap does (`true`: a chunk may still be
+    /// mapped here, so the caller withholds the run from memmgr).
     fn write_argv_env(
         aspace: u64,
         memory: u64,
@@ -1665,6 +1658,18 @@ pub mod process {
             if unsafe { syscall::mem_map(rw, aspace, va, offset, chunk, syscall::MAP_WRITABLE) }
                 .is_err()
             {
+                // The kernel maps page by page and stops at the first
+                // failure, so pages before it may be mapped: unmap the whole
+                // chunk (unmapping a page that was never mapped is harmless).
+                // When that unmap fails too, the run is withheld from memmgr
+                // (`Err(true)`) and the window stays reserved, rather than
+                // returning a run still partly mapped here.
+                // SAFETY: the span is this call's own window; nothing
+                // references it.
+                if unsafe { syscall::mem_unmap(aspace, va, chunk) }.is_err() {
+                    let _ = syscall::cap_delete(rw);
+                    return Err(true);
+                }
                 result = Err(false);
                 break;
             }
@@ -1674,7 +1679,7 @@ pub mod process {
             // for this process alone (no other mapping of the fresh run exists),
             // and stay mapped until the unmap below, after the slice's last use.
             let dst = unsafe { crate::slice::from_raw_parts_mut(va as *mut u8, len) };
-            fill_window(dst, base, args, env);
+            argv_env::fill_window(dst, base, args, env);
             // SAFETY: the span is this call's own window, mapped above; no slice
             // over it outlives the fill.
             if unsafe { syscall::mem_unmap(aspace, va, chunk) }.is_err() {
@@ -1688,20 +1693,5 @@ pub mod process {
         let _ = syscall::cap_delete(rw);
         unreserve_pages(window);
         result
-    }
-
-    /// Fill `dst`, the window over bytes `base..base + dst.len()` of the
-    /// concatenated blobs, with those bytes of `args` then `env`, and zeros
-    /// past them.
-    fn fill_window(dst: &mut [u8], base: usize, args: &[u8], env: &[u8]) {
-        let end = base + dst.len();
-        let args_part = &args[base.min(args.len())..end.min(args.len())];
-        let env_part = &env[base.saturating_sub(args.len()).min(env.len())
-            ..end.saturating_sub(args.len()).min(env.len())];
-        let (dst_args, rest) = dst.split_at_mut(args_part.len());
-        dst_args.copy_from_slice(args_part);
-        let (dst_env, tail) = rest.split_at_mut(env_part.len());
-        dst_env.copy_from_slice(env_part);
-        tail.fill(0);
     }
 }

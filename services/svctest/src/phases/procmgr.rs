@@ -486,9 +486,11 @@ const BLOB_FIXTURE: &str = "/tests/svctest";
 /// argv[1] of the large-blob cell's child; dispatches to
 /// `blobs_large_child_main`.
 const BLOBS_LARGE_ROLE: &str = "blobs-large-child";
-/// Bytes of the one long argv token: past a page, and far past the 256 B a
-/// whole argv blob once had.
-const BLOBS_FILLER_BYTES: usize = 9000;
+/// Bytes of the one long argv token, 3 MiB: past the 512 pages a child's
+/// seed page-table pool covers (so procmgr funds the child's page tables for
+/// the region), across many of procmgr's and the spawner's 64-page copy
+/// windows, and far past the 256 B a whole argv blob once had.
+const BLOBS_FILLER_BYTES: usize = 3 << 20;
 /// Short argv tokens after the long one, past the 255 an 8-bit count field
 /// once held.
 const BLOBS_EXTRA_ARGS: usize = 300;
@@ -501,7 +503,7 @@ const BLOBS_CHILD_BAD_ARGV: i32 = 6;
 /// Exit code of the large-blob child when env is not what the parent packed.
 const BLOBS_CHILD_BAD_ENV: i32 = 7;
 
-/// The argv the large-blob child must see, argv[0] first: about 10 KiB in
+/// The argv the large-blob child must see, argv[0] first: about 3 MiB in
 /// 303 strings.
 fn blobs_large_args() -> Vec<String>
 {
@@ -871,14 +873,17 @@ pub fn procmgr_refusals_phase(_: &Caps)
     std::os::seraph::log!("procmgr_refusals phase passed");
 }
 
-/// procmgr refuses, with `INVALID_ARGUMENT` and before it creates anything,
-/// a `CREATE_FROM_FILE` whose argv and env it cannot deliver intact (see
+/// procmgr refuses, with `INVALID_ARGUMENT`, a `CREATE_FROM_FILE` whose argv
+/// and env it cannot deliver intact (see
 /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`,
-/// **argv and env**): a header longer than its cap, a blob whose NULs
-/// disagree with its count or that lacks its final NUL, the flag without the
-/// cap, and a label still carrying the former inline argv fields in bits
-/// `[32..64]`. A spawn afterwards in [`procmgr_refusals_phase`] shows
-/// procmgr still serves.
+/// **argv and env**). Before it acquires anything for the child: a header
+/// longer than its cap, an argv/env cap that is not a Memory cap, the flag
+/// without the cap, and a label still carrying the former inline argv fields
+/// in bits `[32..64]`. On the child's copy, after it registers the child with
+/// memmgr: a blob whose NULs disagree with its count or that lacks its final
+/// NUL. [`create_process_argv_env_refusals`] covers the `CREATE_PROCESS`
+/// side. A spawn afterwards in [`procmgr_refusals_phase`] shows procmgr still
+/// serves.
 fn argv_env_refusals()
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -923,6 +928,19 @@ fn argv_env_refusals()
             .build(),
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_ARGV_ENV with only the file cap",
+    );
+
+    let (file, size) = hello_file();
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(label)
+            .word(0, size)
+            .words(1, &[len, 1, 0, 0])
+            .cap(file)
+            .cap(spare_cap())
+            .build(),
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_ARGV_ENV with an endpoint cap as the argv/env cap",
     );
 
     let (file, size) = hello_file();

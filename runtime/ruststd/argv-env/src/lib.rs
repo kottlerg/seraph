@@ -9,8 +9,10 @@
 //! region, the pages after its `ProcessInfo` page, at spawn time: each is a
 //! concatenation of NUL-terminated UTF-8 strings (env entries are
 //! additionally `KEY=VALUE`). `std::sys::{args,env}::seraph` walk those
-//! blobs. This crate owns the pure byte-slice work they use —
+//! blobs, and `std::os::seraph::process::ArgvEnvCap` packs them on the
+//! spawner's side. This crate owns the pure byte-slice work they use —
 //! [`blob_span`] (where a blob lies, from its `ProcessInfo` fields),
+//! [`fill_window`] (one chunk of the packed run),
 //! [`next_field`] and [`prev_field`] (one NUL-terminated field, from the
 //! front or the back), [`bounded_fields`] (the span of a declared field
 //! count), and [`split_key_value`] (a `KEY=VALUE` split on the first `=`) —
@@ -59,6 +61,26 @@ pub fn blob_span(
         return None;
     }
     Some((usize::try_from(offset).ok()?, usize::try_from(bytes).ok()?))
+}
+
+/// Fill `dst`, the window over bytes `base..base + dst.len()` of the
+/// concatenated argv and env blobs a spawner packs into its argv/env cap,
+/// with those bytes of `args` then `env`, and zeros past them.
+///
+/// The spawner writes its run through a window re-mapped per chunk, so each
+/// call covers one chunk; a window that straddles the argv/env boundary, or
+/// lies past both blobs, is filled across it.
+pub fn fill_window(dst: &mut [u8], base: usize, args: &[u8], env: &[u8])
+{
+    let end = base + dst.len();
+    let args_part = &args[base.min(args.len())..end.min(args.len())];
+    let env_part = &env[base.saturating_sub(args.len()).min(env.len())
+        ..end.saturating_sub(args.len()).min(env.len())];
+    let (dst_args, rest) = dst.split_at_mut(args_part.len());
+    dst_args.copy_from_slice(args_part);
+    let (dst_env, tail) = rest.split_at_mut(env_part.len());
+    dst_env.copy_from_slice(env_part);
+    tail.fill(0);
 }
 
 /// Walk one NUL-terminated field of a blob starting at `cursor`. Returns the
@@ -171,6 +193,28 @@ mod tests
         assert_eq!(blob_span(REGION, 8, 0, REGION, REGION_END), None);
         assert_eq!(blob_span(REGION, 0, 1, REGION, REGION_END), None);
         assert_eq!(blob_span(0, 8, 1, REGION, REGION_END), None);
+    }
+
+    // Defect guarded: a window fill that drops or repeats the bytes at the
+    // argv/env boundary or a chunk edge, or leaves a stale tail, so the run
+    // procmgr copies differs from the blobs the spawner packed.
+    #[test]
+    fn windows_of_any_size_reassemble_the_blobs_and_zero_the_tail()
+    {
+        let args = b"one\0two\0";
+        let env = b"K=v\0";
+        let mut want = [0u8; 20];
+        want[..8].copy_from_slice(args);
+        want[8..12].copy_from_slice(env);
+        for window in 1..=want.len()
+        {
+            let mut run = [0xAAu8; 20];
+            for (i, chunk) in run.chunks_mut(window).enumerate()
+            {
+                fill_window(chunk, i * window, args, env);
+            }
+            assert_eq!(run, want, "window {window}");
+        }
     }
 
     #[test]

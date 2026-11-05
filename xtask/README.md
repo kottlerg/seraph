@@ -659,7 +659,7 @@ cargo xtask lint-docs
 Each violation prints as `<level> <rule>: <path>:<line>: <message>`; any
 error-level diagnostic fails the command. The rules check what a script can
 decide, including that every name the surface list of docs/testing.md
-§ Coverage tiers states still names code or a file in the tree; whether a
+§ Coverage tiers states still names code, a file, or a directory in the tree; whether a
 passage is a summary, or any other statement matches the code, is the
 pre-merge review's.
 
@@ -670,7 +670,7 @@ pre-merge review's.
 | `md-summarized-by` | error | Every authoritative document ends with `---` and a `## Summarized By` section holding `None` or a non-empty list of links, each resolving to a path inside the repository (no external URL, in-page-only anchor, or `..` past the root), per [docs/documentation-standards.md](../docs/documentation-standards.md) § Backlinks and Change Propagation. |
 | `md-backlink-forward` | error | Every `## Summarized By` entry names a tracked document that links this one. |
 | `md-reachable` | error | Every authoritative document is reachable by links from the root `README.md`; the root README links every `docs/*.md` and every other README links each document in its own `docs/`, per [docs/documentation-standards.md](../docs/documentation-standards.md) § Discoverability and Linking. |
-| `md-coverage-symbols` | error | Every name the surface list of [docs/testing.md](../docs/testing.md) § Coverage tiers states resolves: from the paragraph starting `**Boundary surface.**` up to the one starting `**Repeat count.**`, each code span naming an item, field path, or `_*` family, and each alternative of the `S` and `M` screen variables (groups expanded, character classes kept), matches as a whole word in the code of a tracked Rust source outside `xtask/` with `//` comments stripped, and each listed `.rs` path (`*` within one component; a bare file name in any directory) names a tracked file. |
+| `md-coverage-symbols` | error | Every name the surface list of [docs/testing.md](../docs/testing.md) § Coverage tiers states resolves: from the paragraph starting `**Boundary surface.**` up to the one starting `**Repeat count.**`, each code span naming an item, field path, or `_*` family, and each alternative of the `S`, `M`, and `D` screen variables (groups expanded, character classes kept), matches as a whole word in the code of a tracked Rust source outside `xtask/` with `//` comments stripped, or, from the paragraph starting `**Device surfaces.**` on, in that of one inside `xtask/` other than the rule's own `lint_docs.rs`; each listed `.rs` path (`*` within one component; a bare file name in any directory) names a tracked file; and each listed directory, written with a trailing `/` (`*` within one component), has a tracked file beneath it. |
 | `md-bare-cite` | warning | A `(see <name>.md)` citation outside link syntax. |
 
 The lint treats as authoritative every tracked `.md` except the root `README.md`, `.claude/`,

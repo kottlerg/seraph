@@ -11,23 +11,43 @@
 //! `DMA_MAP`. memmgr registers devmgr phys-class, so devmgr's own grants keep
 //! the right, and the kernel answers the base of any Memory cap devmgr holds
 //! when it presents one of them (core/kernel/docs/cross-boundary-disclosure.md
-//! § Physical-address surfaces). The page is taken once, at first use, and
-//! held for devmgr's life; nothing maps it.
+//! § Physical-address surfaces). The page is taken at the first read that needs
+//! it and held for devmgr's life; nothing maps it. A refused request is not
+//! remembered: the next read asks memmgr again.
 
 use std::os::seraph::{current_ipc_buf, startup_info};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 
-/// The credential page's cap, or `0` when memmgr refused it.
-static CREDENTIAL: OnceLock<u64> = OnceLock::new();
+/// The credential page's cap, or `0` before memmgr has granted one.
+static CREDENTIAL: AtomicU64 = AtomicU64::new(0);
 
-/// The credential cap, taking it from memmgr on first use. `0` when memmgr
-/// refused the page, which makes every read that needs it fail with
-/// `InsufficientRights`.
+/// The credential cap, taking it from memmgr when none is held yet. `0` when
+/// memmgr refuses the page this time, which fails the read that needs it
+/// with `InsufficientRights`; a later call asks again. No lock is held across
+/// the request: a caller that loses a race to publish its page deletes it.
 pub fn credential() -> u64
 {
-    *CREDENTIAL.get_or_init(request_page)
+    let held = CREDENTIAL.load(Ordering::Acquire);
+    if held != 0
+    {
+        return held;
+    }
+    let page = request_page();
+    if page == 0
+    {
+        return 0;
+    }
+    match CREDENTIAL.compare_exchange(0, page, Ordering::AcqRel, Ordering::Acquire)
+    {
+        Ok(_) => page,
+        Err(winner) =>
+        {
+            let _ = syscall::cap_delete(page);
+            winner
+        }
+    }
 }
 
 /// One-page grant from memmgr, or `0`. A reply of any other shape is

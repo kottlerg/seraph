@@ -29,9 +29,10 @@ family's driver is its `main` and its `Backend`; VT-d's is
   device blocked. A driver that dies after a unit's translation is on leaves that unit blocking.
 
 The receive loop and the poll loop reach the one service through a lock the driver supplies, held
-for one request or one poll. A request that needs table pages the store lacks takes them from memmgr
-under it, and a failure path may log under it; the poll waits those calls out, and no call into
-devmgr is made under the lock. Everything but the two loops is host-tested over a fake backend.
+for one request or one poll. Under it a request that needs table pages the store lacks takes them
+from memmgr, a heap allocation may grow the heap (a memmgr call too), and a failure path may log;
+the poll waits those calls out, and no call into devmgr is made under the lock. Everything but the
+two loops is host-tested over a fake backend.
 
 ---
 

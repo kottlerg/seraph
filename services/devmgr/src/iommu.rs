@@ -238,9 +238,9 @@ impl IommuClient
 
     /// The driver has died: refuse every later call, log it once when the
     /// driver had reported ready (when the ready report is recorded after
-    /// this, [`Self::mark_ready`] logs it instead), and answer every call still queued on its
-    /// endpoint with an error from a thread of devmgr's own, so no devmgr
-    /// thread waits on a driver that will never receive. Called by the death
+    /// this, [`Self::mark_ready`] logs it instead), and answer every call
+    /// still queued on its endpoint with an error from a thread of devmgr's
+    /// own, so no devmgr thread waits on a driver that will never receive. Called by the death
     /// watch ([`start_death_watch`]) as soon as the death posts, and again,
     /// to no effect, by the registry loop when it takes the death; returns
     /// whether this call was the first.

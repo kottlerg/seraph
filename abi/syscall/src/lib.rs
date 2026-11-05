@@ -570,9 +570,10 @@ pub enum SyscallError
 pub const PRIORITY_MIN: u8 = 1;
 /// Maximum priority available to userspace threads.
 ///
-/// The span is an ABI width: the kernel's run-queue bitmask is a `u32`
-/// (`NUM_PRIORITY_LEVELS` = 32), whose level 0 is the idle band and whose
-/// level 31 is reserved above this one.
+/// The span is an ABI width: the kernel has 32 levels
+/// (`NUM_PRIORITY_LEVELS`), whose level 0 is the idle band and whose level 31
+/// is reserved above this one. How the kernel schedules each settable level is
+/// specified in `core/kernel/docs/scheduler.md` § Scheduling Classes.
 pub const PRIORITY_MAX: u8 = 30;
 
 // ── Thread start flags (SYS_THREAD_START arg1) ────────────────────────────────

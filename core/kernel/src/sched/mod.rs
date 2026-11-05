@@ -34,16 +34,54 @@ use crate::mm::{BuddyAllocator, PAGE_SIZE};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Number of priority levels. Matches the `non_empty: u32` bitmask width.
+/// Number of priority levels: 0 for the idle threads, the settable levels
+/// `[PRIORITY_MIN, PRIORITY_MAX]` (1 to 30), and the reserved level 31 (the
+/// ABI's `PRIORITY_MAX` span sits inside it).
 pub const NUM_PRIORITY_LEVELS: usize = 32;
 
 /// Priority assigned to idle threads.
 pub const IDLE_PRIORITY: u8 = 0;
 
-/// Default time-slice length in preemption-timer ticks. Decremented by
-/// `timer_tick` on every tick; a thread is preempted when its counter
-/// reaches zero. A tuning value; it bounds no capacity.
+/// Time-slice length of a strict-priority (RT) thread, in preemption-timer
+/// ticks. Decremented by `timer_tick` on every tick; a thread is preempted when
+/// its counter reaches zero. A fair thread's slice is its level instead
+/// ([`quantum_ticks`]). A tuning value; it bounds no capacity.
 pub const TIME_SLICE_TICKS: u32 = 10;
+
+/// Lowest level of the strict-priority (RT) class. Levels from it to
+/// `PRIORITY_MAX` are scheduled by strict fixed priority; the settable levels
+/// below it (`PRIORITY_MIN` to 20) by the fair class, whose weight is the level
+/// (core/kernel/docs/scheduler.md § Scheduling Classes).
+///
+/// A discipline boundary: it decides how a level is scheduled once a thread is
+/// there, not who may place a thread there, which `SchedControl` bands alone
+/// govern. Chosen to match the userspace level map (`shared/ipc`'s
+/// `sched_policy`, core services in the RT class, applications in the fair
+/// one); it bounds no capacity.
+pub const RT_PRIORITY_MIN: u8 = 21;
+
+/// Whether threads at `level` are scheduled by the fair class: a settable
+/// level below [`RT_PRIORITY_MIN`]. The idle level and the RT levels are not.
+pub const fn is_fair_level(level: u8) -> bool
+{
+    level >= syscall::PRIORITY_MIN && level < RT_PRIORITY_MIN
+}
+
+/// Ticks a thread at `level` runs before its slice expires: its level for a
+/// fair thread, the weight that gives CPU-bound fair threads on one CPU shares
+/// in proportion to their levels, and [`TIME_SLICE_TICKS`] for every other
+/// level.
+pub fn quantum_ticks(level: u8) -> u32
+{
+    if is_fair_level(level)
+    {
+        u32::from(level)
+    }
+    else
+    {
+        TIME_SLICE_TICKS
+    }
+}
 
 /// Number of 4 KiB pages in each idle and thread kernel stack (16 KiB total),
 /// each above one guard page the direct map leaves unmapped, so a path past
@@ -3064,8 +3102,9 @@ pub enum StartCommit
 /// stop can cycle the thread through a run, a park and a claim between a pass
 /// and the commit. A CPU still running the target is prodded
 /// ([`prod_remote_cpu`]); it drops the `Stopped` target at its next
-/// slice-expiry `schedule(Requeue::Always)` or the target's own park or yield, where the
-/// requeue denylist leaves it unlinked.
+/// `timer_tick` reschedule (a slice expiry, or a fair-dispatched target's
+/// preemption for RT) or the target's own park or yield, where the requeue
+/// denylist leaves it unlinked.
 ///
 /// The loop ends without writing when the target is no longer `Created` or
 /// `Stopped` ([`StartCommit::Refused`]: a concurrent start resumed it, or it
@@ -4339,8 +4378,9 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// `Stopped` or `Exited`, and `sys_thread_set_affinity` on a CPU running a
 /// target whose affinity it changed. The IPI's handler does no work: the trap
 /// it forces snapshots the target's user registers and returns to user mode,
-/// and the CPU acts on the target at its next slice-expiry `schedule(Requeue::Always)` (or
-/// the target's own park or yield), where the requeue denylist drops a
+/// and the CPU acts on the target at its next `timer_tick` reschedule (a slice
+/// expiry, or a fair-dispatched target's preemption for RT) or the target's
+/// own park or yield, where the requeue denylist drops a
 /// `Stopped` or `Exited` target and the affinity check relocates a moved one.
 /// The callers' drains wait for that; the prod itself only exits a `hlt` on an
 /// idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod
@@ -5739,6 +5779,9 @@ pub unsafe fn schedule(requeue: Requeue)
                 // (the re-mark, like the local requeue above, must not leave it
                 // stale — core/kernel/docs/sched-ipc-redesign.md § 3).
                 (*current).preferred_cpu = cpu as u32;
+                // The level its next slice is measured by, read under its held
+                // sched_lock (a priority change since its dispatch lands here).
+                sched.set_current_level((*current).priority);
                 // A running thread carries no pending park-wake (see the
                 // dispatch flip below).
                 let was_pending = (*current).wake_pending;
@@ -5882,7 +5925,7 @@ pub unsafe fn schedule(requeue: Requeue)
         let dispatchable = ready && !deferred;
         if deferred
         {
-            // Re-link `next` here, still `Ready`, at the head of its level so
+            // Re-link `next` here, still `Ready`, at the head of its run queue so
             // it keeps its turn, and claim idle. Lock order: `next.sched_lock`
             // (held) → this CPU's run-queue lock. IRQs stay disabled across the
             // relock/release.
@@ -5913,6 +5956,9 @@ pub unsafe fn schedule(requeue: Requeue)
             let (cleared_live_wake, tid) = unsafe {
                 (*next).state = ThreadState::Running;
                 (*next).preferred_cpu = cpu as u32;
+                // The level its slice is measured by (`timer_tick` may not read
+                // `priority` without this sched_lock).
+                sched.set_current_level((*next).priority);
                 // A running thread has no outstanding park-wake to honour; clear
                 // wake_pending so a stale flag can never survive into a later,
                 // unrelated commit_blocked (defensive — the `Running` coalesce
@@ -5965,7 +6011,11 @@ pub unsafe fn schedule(requeue: Requeue)
     }
 
     // Watchdog: mark this CPU as having dispatched a non-idle thread.
-    if !core::ptr::eq(next, sched.idle())
+    if core::ptr::eq(next, sched.idle())
+    {
+        sched.set_current_level(IDLE_PRIORITY);
+    }
+    else
     {
         watchdog_mark_non_idle(cpu);
     }
@@ -6358,7 +6408,9 @@ pub unsafe fn post_aspace_death_notification(
 
 /// Timer interrupt handler: decrement current thread's time slice.
 ///
-/// When the slice expires, call `schedule(Requeue::Always)` unless preemption is disabled.
+/// When the slice expires, or a fair thread runs while an RT thread is queued
+/// on this CPU ([`run_queue::PerCpuScheduler::tick_outcome`]), call
+/// `schedule(Requeue::Always)` unless preemption is disabled.
 /// Also runs the BSP sleep-list and watchdog checks and the per-CPU load
 /// balancer. This function is called from the timer interrupt handler on each
 /// CPU independently.
@@ -6449,9 +6501,10 @@ pub unsafe fn timer_tick()
 
     // SAFETY: current validated non-null above; slice_remaining is always valid.
     let remaining = unsafe { (*current).slice_remaining };
-    if remaining == 0
+    let Some((slice, reschedule)) = sched.tick_outcome(remaining).slice_and_reschedule()
+    else
     {
-        // Idle threads have slice_remaining = 0 and should not be preempted.
+        // Idle threads have slice_remaining = 0 and are not preempted.
         // Still run the load balancer so idle CPUs can pull work from busy
         // ones (the whole point of pull-based balancing).
         // SAFETY: Paired with lock_raw above.
@@ -6459,54 +6512,41 @@ pub unsafe fn timer_tick()
         // SAFETY: cpu validated against cpu_count above; no lock held.
         unsafe { try_pull_balance(cpu) };
         return;
-    }
+    };
+    // SAFETY: current is a valid TCB; slice_remaining is written by this CPU's
+    // timer_tick under this CPU's scheduler lock, held here.
+    unsafe { (*current).slice_remaining = slice };
 
-    let new_remaining = remaining - 1;
-    // SAFETY: current is a valid TCB; slice_remaining field is always valid
-    unsafe { (*current).slice_remaining = new_remaining };
+    // SAFETY: Unlock before calling schedule(), which will re-acquire.
+    unsafe { sched.lock.unlock_raw(saved) };
 
-    if new_remaining == 0
+    // Run the cross-CPU load balancer with no scheduler lock held, on every
+    // tick: cheap on the steady-state hot path (a few Relaxed atomic loads),
+    // and pulling work into an underloaded CPU does not require the local
+    // thread to yield.
+    // SAFETY: cpu validated against cpu_count above; no lock held.
+    unsafe { try_pull_balance(cpu) };
+
+    if !reschedule
     {
-        // Slice expired - reset counter and reschedule
-        // SAFETY: TIME_SLICE_TICKS is a valid u32 constant
-        unsafe { (*current).slice_remaining = TIME_SLICE_TICKS };
-
-        // SAFETY: Unlock before calling schedule(), which will re-acquire
-        unsafe { sched.lock.unlock_raw(saved) };
-
-        // Run the cross-CPU load balancer with no scheduler lock held.
-        // Cheap on the steady-state hot path (a few Relaxed atomic loads).
-        // SAFETY: cpu validated against cpu_count above; no lock held.
-        unsafe { try_pull_balance(cpu) };
-
-        // If preemption is disabled (e.g., during TLB shootdown spin-wait
-        // with interrupts temporarily enabled), skip the context switch.
-        // The thread will be rescheduled normally on its next timer expiry.
-        if crate::percpu::preemption_disabled()
-        {
-            // A live, preemption-disabled `current` still counts as non-idle
-            // (core/kernel/docs/scheduling-internals.md § Softlockup Watchdog).
-            watchdog_mark_non_idle(cpu);
-        }
-        else
-        {
-            // SAFETY: schedule() re-acquires the lock and performs a context switch.
-            // Requeue::Always: thread was preempted and should go back in queue.
-            unsafe { schedule(Requeue::Always) };
-        }
+        return;
+    }
+    // If preemption is disabled (e.g., during TLB shootdown spin-wait with
+    // interrupts temporarily enabled), skip the context switch. The thread will
+    // be rescheduled at a later tick that decides a reschedule (its next slice
+    // expiry, or, for a fair thread with an RT thread queued, the next tick).
+    if crate::percpu::preemption_disabled()
+    {
+        // A live, preemption-disabled `current` still counts as non-idle
+        // (core/kernel/docs/scheduling-internals.md § Softlockup Watchdog).
+        watchdog_mark_non_idle(cpu);
     }
     else
     {
-        // Still has time remaining - just unlock and return
-        // SAFETY: Paired with lock_raw above
-        unsafe { sched.lock.unlock_raw(saved) };
-
-        // Run the load balancer on every tick (cheap on the steady-state
-        // hot path). Pulling work into an underloaded CPU does not require
-        // the local thread to yield, so we run this even when the slice
-        // has not expired.
-        // SAFETY: cpu validated; no scheduler lock held.
-        unsafe { try_pull_balance(cpu) };
+        // SAFETY: schedule() re-acquires the lock and performs a context switch.
+        // Requeue::Always: thread was preempted and should go back in queue
+        // (a fair thread preempted for an RT one keeps the rest of its slice).
+        unsafe { schedule(Requeue::Always) };
     }
 }
 
@@ -6591,6 +6631,7 @@ pub unsafe fn enter() -> !
         // Mark as the currently running thread so syscall handlers that call
         // current_tcb() find the correct TCB while init is executing.
         sched.set_current(tcb);
+        sched.set_current_level((*tcb).priority);
         (*tcb).state = thread::ThreadState::Running;
         &mut *tcb
     };
@@ -6699,6 +6740,25 @@ pub unsafe fn enter() -> !
     // tf_ptr points to a valid, initialized TrapFrame on init's kernel stack.
     unsafe {
         crate::arch::current::context::first_entry_to_user(init_tcb.address_space, tf_ptr);
+    }
+}
+
+#[cfg(test)]
+mod class_tests
+{
+    use super::{RT_PRIORITY_MIN, TIME_SLICE_TICKS, quantum_ticks};
+
+    // The defect caught: a boundary off by one, so level 20 runs as RT or level
+    // 21 as fair, or a fair quantum that is not the level (losing the weight),
+    // or an idle level given a fair quantum.
+    #[test]
+    fn a_fair_levels_quantum_is_its_level_and_every_other_levels_is_the_rt_slice()
+    {
+        assert_eq!(quantum_ticks(syscall::PRIORITY_MIN), 1);
+        assert_eq!(quantum_ticks(RT_PRIORITY_MIN - 1), 20);
+        assert_eq!(quantum_ticks(RT_PRIORITY_MIN), TIME_SLICE_TICKS);
+        assert_eq!(quantum_ticks(syscall::PRIORITY_MAX), TIME_SLICE_TICKS);
+        assert_eq!(quantum_ticks(0), TIME_SLICE_TICKS);
     }
 }
 

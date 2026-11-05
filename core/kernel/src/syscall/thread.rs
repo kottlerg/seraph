@@ -275,8 +275,8 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
             crate::sched::StartCommit::CallerStopped =>
             {
                 // Deschedule now, as a self-stop does: the settle loop's
-                // preempt-disabled window made the timer skip its slice-expiry
-                // switch, and the syscall epilogue reschedules only an Exited
+                // preempt-disabled window made the timer skip its reschedule,
+                // and the syscall epilogue reschedules only an Exited
                 // thread. The restart resumes here. The target pin goes first
                 // (the pin-before-park rule of `PinnedCap`): a caller killed
                 // while stopped would otherwise hold it for good.
@@ -452,7 +452,7 @@ pub fn sys_thread_stop(tf: UserFrame) -> Result<u64, SyscallError>
         // Cancel any park (the stopped thread's blocked syscall returns
         // Interrupted on restart) and commit Stopped over it; a Ready target
         // is unlinked by the all-locks write, and a remote Running target by
-        // the drain below (its CPU's next slice-expiry schedule(Requeue::Always)). See
+        // the drain below (its CPU's next timer_tick reschedule). See
         // core/kernel/docs/thread-lifecycle-and-sleep.md § `sys_thread_stop`
         // Cross-CPU Stop Protocol; an `Exited` target is refused (terminal).
         let running_on = commit_stopped(target_tcb)?;
@@ -565,9 +565,10 @@ unsafe fn drain_remote_stopped(
         return;
     }
     // The IPI's trap snapshots the target's user registers; the remote CPU
-    // drops the Stopped target at its next slice-expiry schedule(Requeue::Always), whose
-    // trap leaves the snapshot sys_thread_read_regs reads once this drain
-    // completes.
+    // drops the Stopped target at its next timer_tick reschedule (a slice
+    // expiry, or a fair-dispatched target's preemption for RT) or its own
+    // park or yield, whose trap leaves the snapshot sys_thread_read_regs
+    // reads once this drain completes.
     // SAFETY: run_cpu < CPU_COUNT per contract.
     unsafe { crate::sched::prod_remote_cpu(run_cpu) };
     // SAFETY: run_cpu < CPU_COUNT; the scheduler slab is initialised.
@@ -619,7 +620,7 @@ unsafe fn drain_remote_stopped(
         // SAFETY: caller_tcb is the running thread.
         if unsafe { stopper_stopped(caller_tcb) }
         {
-            // This preempt-disabled window suppresses the slice-expiry switch
+            // This preempt-disabled window suppresses the timer's reschedule
             // that would deschedule a stopped stopper: deschedule in place,
             // and resume the drain once restarted. Two threads stopping each
             // other thus both end Stopped instead of both spinning.
@@ -1566,7 +1567,8 @@ pub fn sys_thread_inherit_fault_handler(tf: UserFrame) -> Result<u64, SyscallErr
 /// priority. There is no ambient priority authority.
 ///
 /// The change takes effect at the next scheduler invocation. If the thread is
-/// currently in the Ready state, it is moved to the new priority queue immediately.
+/// currently in the Ready state, it is re-linked on the new level's run queue
+/// immediately (at its tail, even when both levels share the fair queue).
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -1816,7 +1818,8 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
 ///   source CPU and a wakeup IPI is delivered there. The wakeup IPI
 ///   handler does not itself call `schedule()`; the running thread
 ///   observes the new affinity at its next `schedule()` entry
-///   (slice-expiry preemption, voluntary yield, or IPC block). The
+///   (slice-expiry preemption, a fair-dispatched thread's preemption for
+///   RT, voluntary yield, or IPC block). The
 ///   affinity-vs-current-CPU check in `schedule()` then routes the
 ///   re-enqueue cross-CPU to the new target. Worst-case latency is
 ///   one time slice.

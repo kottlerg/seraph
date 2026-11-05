@@ -602,7 +602,8 @@ unsafe fn kernel_entry_post_rebase(
     }
     kprintln!("syscall ok");
     // Enable preemption timer at 1 ms period (both architectures).
-    // With TIME_SLICE_TICKS=10, this gives a 10 ms scheduling quantum.
+    // The slice lengths it times are in core/kernel/docs/scheduler.md
+    // § Time Slice Policy.
     // The period is a tuning value; it bounds no capacity.
     // timer::init() enables interrupts as its final step.
     // SAFETY: IDT/GDT/interrupts initialized above; percpu initialized;
@@ -1371,7 +1372,7 @@ unsafe fn kernel_entry_post_rebase(
                     sched::thread::ThreadControlBlock {
                         state: sched::thread::ThreadState::Ready,
                         priority: sched::INIT_PRIORITY,
-                        slice_remaining: sched::TIME_SLICE_TICKS,
+                        slice_remaining: sched::quantum_ticks(sched::INIT_PRIORITY),
                         cpu_affinity: sched::AFFINITY_ANY,
                         preferred_cpu: 0,
                         run_queue_next: None,

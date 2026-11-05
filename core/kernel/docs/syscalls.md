@@ -1497,8 +1497,9 @@ notification, an event queue, or a wait set whose last capability is deleted con
 claimed either by the stop or by the object's teardown, and both stamp the same cancellation: on
 restart its syscall returns `Interrupted`, or a queued fault sender is killed. A thread running on
 another CPU is marked `Stopped` under every CPU's scheduler lock, and the call returns once that
-CPU has descheduled it and published its register save, at its next slice expiry
-or the thread's own park or yield, or once an object teardown has committed `Exited` over it; the
+CPU has descheduled it and published its register save, at its next slice expiry, at a tick
+that preempts it for an RT thread (a target dispatched at a fair level), or at the thread's own
+park or yield, or once an object teardown has committed `Exited` over it; the
 inter-processor interrupt sent to that CPU only forces a trap. A thread left `current` on a CPU that
 `fatal` halted is never descheduled: a stop of it does not return through the drain until a
 teardown commits `Exited` over it, and that teardown never completes (see
@@ -1512,15 +1513,21 @@ its CPU with its save published (see [thread-lifecycle-and-sleep.md](thread-life
 § `sys_thread_stop` Cross-CPU Stop Protocol).
 
 **Latency contract:** a stop of a thread running on another CPU completes at the target's next
-slice-expiry `schedule()` or its own park or yield, not within the inter-processor-interrupt
+slice-expiry `schedule()`, a tick that preempts it for an RT thread queued on its CPU (a target
+dispatched at a fair level), or its own park or yield, not within the inter-processor-interrupt
 latency: no interrupt-return path deschedules a `Stopped` current thread. That is within the
-target's remaining time slice (at most `TIME_SLICE_TICKS`, 10 timer ticks), except when the
+target's remaining time slice (at most the longest slice, 20 timer ticks, that of fair level 20;
+`TIME_SLICE_TICKS`, 10, for a target dispatched at an RT level; see
+[scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts
 enabled (a TLB-shootdown or drain spin, or a page-pool seeding or teardown window between
 batches, `interrupt_window`): `timer_tick` then refills the slice without rescheduling,
-and `preempt_enable` does not reschedule, so the stop completes at the first slice
-expiry that finds preemption enabled, a further slice later at the least. Callers that need a
-bounded stop latency MUST budget a slice for each expiry the target can spend in such a section.
+and `preempt_enable` does not reschedule, so the stop completes at the first later tick that
+decides a reschedule with preemption enabled: a slice expiry, a further slice later at the least,
+or, for a target dispatched at a fair level, a tick that finds an RT thread queued, which can be
+the next tick. Callers that need a bounded stop latency MUST budget a slice for each slice expiry
+the target can spend in such a section; a tick that decides a preemption for RT and finds
+preemption disabled leaves the slice running and adds nothing to that budget.
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
@@ -1613,8 +1620,13 @@ is no free "normal" range. The kernel defines no normal/elevated boundary; that
 partition is userspace policy expressed through `SchedControl` band distribution
 (see [scheduler.md § Priority Authority](scheduler.md#priority-authority)).
 
-Priority 0 (idle) and priority 31 (reserved) cannot be requested. The change takes
-effect at the next scheduler invocation.
+Priority 0 (idle) and priority 31 (reserved) cannot be requested. Levels 21–`PRIORITY_MAX`
+are scheduled by strict priority and levels 1–20 fairly, at a weight of the level
+([scheduler.md § Scheduling Classes](scheduler.md#scheduling-classes)); that split is the
+kernel's scheduling discipline, not an authority boundary. The change takes effect at the next
+scheduler invocation: a `Ready` thread is re-linked at the new level at once, and a running
+thread's class follows the new level from its next dispatch and its slice length from the first
+timer tick after it ([scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)).
 
 **Capability requirements:** `thread_cap` (Control rights); `sched_cap` (a
 `SchedControl` whose band covers `priority`).
@@ -1683,8 +1695,9 @@ takes effect immediately:
 - A **Running** thread on a different CPU is notified via a reschedule IPI
   and routed cross-CPU on its next `schedule()` entry. The IPI does not
   itself call `schedule()`; the running thread observes the new affinity
-  at its next slice-expiry, voluntary yield, or IPC block. Worst-case
-  latency is one time slice (see
+  at its next slice-expiry, voluntary yield, or IPC block (or, for a fair
+  thread, at the next tick that finds an RT thread queued on its CPU).
+  Worst-case latency is one time slice of the thread (see
   [scheduler.md](scheduler.md) § Active migration on affinity change).
 - A **Blocked / Stopped / Created** thread observes the new affinity on
   its next enqueue (a wake, or `SYS_THREAD_START` on start or resume).

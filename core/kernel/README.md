@@ -205,7 +205,8 @@ See [`docs/ipc-internals.md`](docs/ipc-internals.md).
 
 ### `sched/`
 
-The preemptive, priority-based, SMP-aware scheduler. Per-CPU run queues, thread
+The preemptive, priority-based, SMP-aware scheduler, with a strict-priority (RT) class
+over the top levels and a weighted fair class below it. Per-CPU run queues, thread
 control blocks, and context switch coordination live here. See
 [`docs/scheduler.md`](docs/scheduler.md) for the scheduling algorithm,
 [`docs/scheduling-internals.md`](docs/scheduling-internals.md) for the SMP

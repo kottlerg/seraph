@@ -799,13 +799,9 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         }
         else
         {
-            // In-kernel user-copy fault recovery: an S-mode page fault (load=13,
-            // store=15, instruction=12) whose sepc lies in the `copy_user` faultable
-            // region is an unmapped or read-only user buffer. Redirect to the fixup
-            // — which clears SUM and returns an error sentinel — instead of
-            // panicking. An S-mode trap is taken by the kernel thread itself, so
-            // no other path reaches this frame; the reference lives for the
-            // trap's remaining, non-blocking work.
+            // An S-mode trap is taken by the kernel thread itself, so no other
+            // path reaches this frame; the reference lives for the trap's
+            // remaining, non-blocking work.
             // SAFETY: frame is the live frame (see the top); nothing below
             // blocks before `fatal` or the return.
             let live = unsafe { &mut *frame };
@@ -832,6 +828,11 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 }
             }
 
+            // In-kernel user-copy fault recovery: an S-mode page fault (load=13,
+            // store=15, instruction=12) whose sepc lies in the `copy_user` faultable
+            // region is an unmapped or read-only user buffer. Redirect to the fixup
+            // — which clears SUM and returns an error sentinel — instead of
+            // panicking.
             if matches!(cause_code, 12 | 13 | 15)
                 && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
             {

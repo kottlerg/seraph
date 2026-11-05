@@ -165,7 +165,7 @@ pub(super) fn is_fp_or_v_opcode(insn: u64) -> bool
     matches!(insn & 0x3, 0b00 | 0b10) && matches!((insn >> 13) & 0x7, 0b001 | 0b101)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── Kernel spurious-fault permission test ────────────────────────────────────
 
 /// Sv39/Sv48/Sv57 PTE bit V: the entry is valid.
 pub(super) const PTE_VALID: u64 = 1 << 0;
@@ -198,6 +198,8 @@ pub(super) fn kernel_leaf_permits(pte: u64, access: KernelAccess) -> bool
     };
     pte & PTE_VALID != 0 && permits
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests
@@ -328,17 +330,19 @@ mod tests
         assert!(!is_fp_or_v_opcode(0x4002)); // C2 funct3=010 (c.lwsp)
     }
 
-    // Defect caught: a test that swapped R and W, or ignored V, would retry a
-    // genuine kernel store to a read-only page forever, or retry a fault on an
-    // invalid entry, instead of reporting the kernel exception.
+    // Defect caught: a predicate that swapped R and W, or ignored them, would
+    // retry a genuine kernel load or store the leaf forbids forever instead of
+    // reporting the kernel exception.
     #[test]
     fn a_kernel_leaf_permits_a_load_when_readable_and_a_store_when_writable()
     {
         let ro = PTE_VALID | PTE_READ;
         let rw = PTE_VALID | PTE_READ | PTE_WRITE;
+        let x_only = PTE_VALID | (1 << 3);
         assert!(kernel_leaf_permits(ro, KernelAccess::Load));
         assert!(!kernel_leaf_permits(ro, KernelAccess::Store));
         assert!(kernel_leaf_permits(rw, KernelAccess::Store));
+        assert!(!kernel_leaf_permits(x_only, KernelAccess::Load));
     }
 
     // Defect caught: a retry of a fault on an invalid leaf loops forever.

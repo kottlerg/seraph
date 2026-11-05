@@ -98,7 +98,7 @@ mirroring the kernel's own source layout.
 |---|---|
 | `cap.rs` | `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (incl. the `cap_insert` explicit-slot form), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, and the bounds of handle resolution (`lookup_bounds`) |
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, type-specific fields); the `InitInfo` RAM Memory descriptors against their caps |
-| `retype.rs` | Retype primitive: augmentation and donation spill, PT walk budget, kernel PT pool |
+| `retype.rs` | Retype primitive: augmentation and donation spill, PT walk budget, kernel PT pool, and the page-pool latency cases: a TLB shootdown of a CPU deleting a pool of ten thousand donations, or seeding one large donation, is acknowledged within a bound while the call runs |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_ASPACE_QUERY` |
 | `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` and an over-maximum length refused with `InvalidArgument` |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
@@ -254,7 +254,10 @@ event and memory polls of `integration::fault_kills_thread`,
 `integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
 `integration::mmio_revoke_unmaps`, `integration::ioport_revoke`,
 `integration::umip_descriptor_reads_fault`, `cap::cspace_self_delete_stops_caller` and
-`retype::aspace_self_delete_stops_caller`; the phase polls, the child's spin bound and the cleanup
+`retype::aspace_self_delete_stops_caller`; the probe-wait bound and the worker's readiness, call
+and exit bounds of `retype::pool_seeding_takes_interrupts`,
+`retype::cspace_teardown_takes_interrupts` and `retype::aspace_teardown_takes_interrupts`; the
+phase polls, the child's spin bound and the cleanup
 exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
 `cap_delete` does not race a still-running pinned child); the migration polls of
 `thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued`, the

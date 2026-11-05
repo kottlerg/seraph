@@ -46,9 +46,9 @@ alignment, divide, …), and the [resume and kill](#delivery-resume-and-kill) st
 including register inspection and modification of a fault-blocked thread via
 [`SYS_THREAD_READ_REGS`/`SYS_THREAD_WRITE_REGS`](capability-model.md#thread) — and the
 restart of a syscall whose copy of a user buffer faults ([Kernel Copies](#kernel-copies)). A
-thread with no handler bound is still terminated, the behavior for all faults absent this
-mechanism. One
-x86-64 kernel check is terminal even with a handler bound: a syscall return RIP that is not
+thread with no handler bound is still terminated on a fault of its own access, the behavior for
+all faults absent this mechanism (a kernel copy's fault fails its syscall instead). One x86-64
+kernel check is terminal even with a handler bound: a syscall return RIP that is not
 canonical, which no user action can produce (the top user page is unmappable) and which the
 exit path kills as a user `#GP` without delivery, since no handler edit could make that return
 valid (see
@@ -111,13 +111,13 @@ own (e.g. an access to an unmapped page that is not a stale-TLB artifact), the k
 If the thread has **no** fault handler bound, the fault is terminal: the thread is killed with exit
 reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this mechanism. A fault
 of a restartable syscall's copy of a user buffer is the exception: it fails that syscall with
-`InvalidAddress` instead (see [Kernel Copies](#kernel-copies)). On
-x86-64, `#DF`, `#MC`, and a hardware NMI that finds no watchdog backtrace request pending are not
-the thread's faults: they are never delivered to a handler, record no exit reason, and halt the CPU
-they arrive on whatever ring they interrupt, leaving the interrupted thread `current` there with no
-death event posted. Voluntary exit codes occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it
-(see [Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a voluntary exit
-code can never alias; `ExitStatus::success()`/`code()` distinguish them without ambiguity.
+`InvalidAddress` instead (see [Kernel Copies](#kernel-copies)). On x86-64, `#DF`, `#MC`, and a
+hardware NMI that finds no watchdog backtrace request pending are not the thread's faults: they
+are never delivered to a handler, record no exit reason, and halt the CPU they arrive on whatever
+ring they interrupt, leaving the interrupted thread `current` there with no death event posted.
+Voluntary exit codes occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it (see
+[Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a voluntary exit code
+can never alias; `ExitStatus::success()`/`code()` distinguish them without ambiguity.
 
 Fault delivery reuses the synchronous IPC machinery of [IPC Design](ipc-design.md): the
 suspended thread occupies the same role as a caller blocked awaiting a reply, and the
@@ -238,7 +238,9 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   unhandled. A stop after the handler's reply claimed the fault leaves that reply's disposition:
   when next started, the thread resumes on a `FAULT_REPLY_RESUME` reply, and the fault is unhandled
   on a `FAULT_REPLY_KILL` reply. Destroying it while stopped ends it as for any stopped
-  thread. A cancelled fault-blocked thread is never resumed.
+  thread. A cancelled fault-blocked thread is never resumed at its faulting instruction: a thread
+  whose own access faulted is killed when next started, and one whose kernel copy faulted has
+  that syscall fail.
 
 ### Modifying the faulting thread
 
@@ -319,8 +321,9 @@ the handler.
    [Fault-Handler Binding](#fault-handler-binding)), so a release that drops the endpoint's
    last reference while a fault is queued on it destroys the endpoint under rule 3.
 2. Destruction of the handler thread (deletion of the last capability to its Thread object)
-   releases any fault-blocked thread awaiting that handler, killing it (the
-   [Kill](#delivery-resume-and-kill) path), as does a later receive on the handler thread while
+   releases any fault-blocked thread awaiting that handler, leaving its fault unhandled (the
+   [Kill](#delivery-resume-and-kill) path: the thread is killed, or its kernel copy's syscall
+   fails), as does a later receive on the handler thread while
    the fault-blocked thread's reply is still pending (a receive that passes its capability and
    headroom checks; see [IPC Design](ipc-design.md#the-callreply-model)). A handler thread that
    only exits, or is stopped `Exited` by an object teardown, keeps its pending fault reply until
@@ -337,7 +340,8 @@ the handler.
 
 Fault delivery for a thread is itself an operation that may fault — a handler thread can
 take a fault while servicing one. Resolution is per-thread chaining: a handler's own faults
-go to *its* handler, and a thread with no handler is killed, terminating the chain. A
+go to *its* handler, and a fault of a thread with no handler is unhandled ([Reply](#reply)), which
+terminates the chain. A
 handler-bearing subsystem (e.g. a pager) MUST be reachable without itself depending on the
 fault path — its own threads have no handler bound, or are eager-mapped — so the chain is
 finite.

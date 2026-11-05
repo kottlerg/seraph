@@ -1938,7 +1938,7 @@ pub fn wait_set_remove(ws_cap: u64, source_cap: u64) -> Result<(), i64>
 /// Block until any registered source in `ws_cap` becomes ready.
 ///
 /// Returns the opaque badge chosen at `wait_set_add` time for a source that
-/// was ready when the call returned. The badge is delivered in the secondary
+/// was ready when the call returned, or when its readiness woke the caller. The badge is delivered in the secondary
 /// return register (rdx / a1). If multiple sources are ready, each call returns
 /// one badge without re-blocking. The source's readiness can lapse before the
 /// caller receives on it (a queued sender stopped or destroyed), so that
@@ -2230,23 +2230,39 @@ pub fn thread_set_fault_handler(
 /// or a fault on it is unhandled: the call is restartable, and with a fault
 /// handler bound a fault on `buf` is delivered to it and the call re-executes
 /// on resume, `core/kernel/docs/syscalls.md` § Restartable Syscalls).
-// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
-#[allow(clippy::cast_sign_loss)]
 #[inline]
 pub fn thread_read_regs(thread_cap: u64, buf: &mut [u8]) -> Result<u64, i64>
 {
-    // SAFETY: syscall3 issues the raw syscall; `buf` is a live, exclusively
-    // borrowed slice, so the kernel's writes of at most `buf.len()` bytes land
-    // in memory no other Rust reference names, and any byte value is a valid
-    // `u8`; the call changes no mapping, IPC page, or thread entry state.
-    let ret = unsafe {
-        syscall3(
-            SYS_THREAD_READ_REGS,
-            thread_cap,
-            buf.as_mut_ptr() as u64,
-            buf.len() as u64,
-        )
-    };
+    // SAFETY: `buf` is a live, exclusively borrowed slice, so the kernel's
+    // writes of at most `buf.len()` bytes land in memory no other Rust
+    // reference names, and any byte value is a valid `u8`.
+    unsafe { thread_read_regs_raw(thread_cap, buf.as_mut_ptr(), buf.len()) }
+}
+
+/// Raw `SYS_THREAD_READ_REGS`: the kernel writes the thread's register frame,
+/// at most `len` bytes, through `buf`.
+///
+/// The call is restartable: a fault on the span is delivered to the calling
+/// thread's fault handler, when one is bound, and the call re-executes on its
+/// resume (`core/kernel/docs/syscalls.md` § Restartable Syscalls).
+///
+/// # Safety
+/// The span at `buf` holds no Rust object the kernel's writes could disturb,
+/// and any byte value is valid wherever the caller later reads it. It need not
+/// be mapped: an unmapped span is backed by the caller's fault handler or
+/// refused.
+///
+/// # Errors
+/// As [`thread_read_regs`].
+// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub unsafe fn thread_read_regs_raw(thread_cap: u64, buf: *mut u8, len: usize) -> Result<u64, i64>
+{
+    // SAFETY: syscall3 issues the raw syscall; the caller's contract makes the
+    // span one the kernel's writes cannot disturb; the call changes no mapping,
+    // IPC page, or thread entry state.
+    let ret = unsafe { syscall3(SYS_THREAD_READ_REGS, thread_cap, buf as u64, len as u64) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 

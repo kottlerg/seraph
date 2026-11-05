@@ -99,8 +99,8 @@ Notes on the non-obvious entries:
   syscall's user copy (`syscall::deliver_copy_fault`) carries the same words: the user
   faulting address, the access of the copy, the bit from a walk of the caller's own
   tables (`copy_fault_present`, x86-64 only), and the syscall instruction as `ip`. No
-  other word carries a kernel
-  VA or a value derived from one. The forwarded/readable `TrapFrame` holds only user-mode
+  other word carries a kernel VA or a value derived from one. The forwarded/readable
+  `TrapFrame` holds only user-mode
   register state (no kernel stack pointer, kernel return address, or `CR3`/`satp`); the
   write path re-validates through `sanitize_for_user_resume`. `sys_thread_read_regs`
   pins the Thread it resolves through `lookup_cap` for the call, so a sibling's concurrent

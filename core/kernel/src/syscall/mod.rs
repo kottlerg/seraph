@@ -147,6 +147,32 @@ impl UserFrame
         unsafe { (*self.0.as_ptr()).set_return(val) };
     }
 
+    /// Point the frame at the syscall instruction, so the return re-executes
+    /// it, and return that instruction's address
+    /// ([`TrapFrame::rewind_syscall`]).
+    fn rewind_syscall(self) -> u64
+    {
+        // SAFETY: as for `set_return`.
+        unsafe { (*self.0.as_ptr()).rewind_syscall() }
+    }
+
+    /// Undo [`rewind_syscall`](Self::rewind_syscall), whose result was `at`,
+    /// unless the instruction pointer was rewritten since
+    /// ([`TrapFrame::complete_rewound_syscall`]).
+    fn complete_rewound_syscall(self, at: u64)
+    {
+        // SAFETY: as for `set_return`; the frame is read again after the
+        // block that may have rewritten it, by this access alone.
+        unsafe { (*self.0.as_ptr()).complete_rewound_syscall(at) };
+    }
+
+    /// The frame's address, to publish as the thread's `trap_frame`. Forms no
+    /// reference to the frame.
+    fn as_ptr(self) -> *mut TrapFrame
+    {
+        self.0.as_ptr()
+    }
+
     /// Write the two-register IPC return (primary, secondary).
     pub fn set_ipc_return(self, primary: u64, label: u64)
     {
@@ -250,9 +276,9 @@ pub unsafe fn dispatch(tf: *mut TrapFrame) -> SyscallExit
     {
         Ok(v) => Ok(v),
         Err(RestartableError::Failed(e)) => Err(e),
-        // SAFETY: `frame` is the running thread's live frame, and no lock is
+        // SAFETY: `tf` wraps the running thread's live frame, and no lock is
         // held: every handler has returned.
-        Err(RestartableError::Faulted(fault)) => match unsafe { deliver_copy_fault(frame, fault) }
+        Err(RestartableError::Faulted(fault)) => match unsafe { deliver_copy_fault(tf, fault) }
         {
             // SAFETY: syscall context on the caller's kernel stack with
             // interrupts disabled; the frame is left to re-execute.
@@ -286,9 +312,9 @@ pub unsafe fn dispatch(tf: *mut TrapFrame) -> SyscallExit
 /// the copy has with no handler bound.
 ///
 /// # Safety
-/// `frame` is the running thread's live syscall frame; no lock is held.
+/// `tf` wraps the running thread's live syscall frame; no lock is held.
 #[cfg(not(test))]
-unsafe fn deliver_copy_fault(frame: *mut TrapFrame, fault: UserCopyFault) -> SyscallExit
+unsafe fn deliver_copy_fault(tf: UserFrame, fault: UserCopyFault) -> SyscallExit
 {
     // SAFETY: syscall context; current_tcb reads this CPU's running thread.
     let tcb = unsafe { current_tcb() };
@@ -298,8 +324,7 @@ unsafe fn deliver_copy_fault(frame: *mut TrapFrame, fault: UserCopyFault) -> Sys
     {
         return SyscallExit::Complete;
     }
-    // SAFETY: the reference lives for this call, which cannot block.
-    let syscall_ip = unsafe { (*frame).rewind_syscall() };
+    let syscall_ip = tf.rewind_syscall();
     let mut access = if fault.write
     {
         syscall::FAULT_ACCESS_WRITE
@@ -325,7 +350,7 @@ unsafe fn deliver_copy_fault(frame: *mut TrapFrame, fault: UserCopyFault) -> Sys
     unsafe {
         (*tcb)
             .trap_frame
-            .store(frame, core::sync::atomic::Ordering::Relaxed);
+            .store(tf.as_ptr(), core::sync::atomic::Ordering::Relaxed);
     }
     // SAFETY: a handler is bound (checked; a binding cleared since is the
     // dispatcher's own unhandled outcome), the published frame is live, and no
@@ -335,8 +360,7 @@ unsafe fn deliver_copy_fault(frame: *mut TrapFrame, fault: UserCopyFault) -> Sys
     {
         return SyscallExit::Restart;
     }
-    // SAFETY: the reference lives for this call, which cannot block.
-    unsafe { (*frame).complete_rewound_syscall(syscall_ip) };
+    tf.complete_rewound_syscall(syscall_ip);
     SyscallExit::Complete
 }
 

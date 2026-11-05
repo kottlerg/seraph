@@ -210,8 +210,7 @@ unsafe extern "C" {
     static __copy_user_fault_start: u8;
     /// First byte past the faultable copy instruction.
     static __copy_user_fault_end: u8;
-    /// Recovery landing pad: closes the SMAP window and returns the bytes not
-    /// copied.
+    /// Recovery landing pad: closes the SMAP window, returns the bytes left.
     static __copy_user_fixup: u8;
 }
 

@@ -169,10 +169,11 @@ cause correctness problems.
 
 A **wait set** aggregates any combination of endpoints, notifications, and event queues, up to the
 member capacity its creator chose and paid for. A thread waits on the set and is woken when any
-member becomes ready; the result identifies a source that was ready when the wait returned. That
-readiness can lapse before the thread's receive on the source (a queued sender stopped, say), so the
-receive can find nothing. A wait set takes one waiting thread at a time: a second thread's wait on
-the same set is refused with `InvalidState`. Destroying the set wakes its waiter with `Interrupted`.
+member becomes ready; the result identifies a source that was ready when the wait returned, or
+when its readiness woke the waiter. That readiness can lapse before the thread's receive on the
+source (a queued sender stopped, say), so the receive can find nothing. A wait set takes one
+waiting thread at a time: a second thread's wait on the same set is refused with `InvalidState`.
+Destroying the set wakes its waiter with `Interrupted`.
 See [syscalls.md § `SYS_WAIT_SET_WAIT`](../core/kernel/docs/syscalls.md#sys_wait_set_wait-28).
 
 ---
@@ -195,11 +196,11 @@ kernel-originated synchronous message, suspending the thread until the handler r
 it, or, on `FAULT_REPLY_KILL`, killing it (failing the syscall with `InvalidAddress` when a
 restartable syscall's user copy faulted) — or the binding is severed and the fault is unhandled in
 the same way (severing by clearing the binding mid-fault: design intent; not yet implemented,
-#242). A stop of
-the thread before any reply claims the fault cancels the episode, and a stop after a reply claims
-it leaves that reply's disposition; in both cases the thread is resumed or killed only if it is
-started again. This reuses the call/reply machinery above — the suspended thread occupies the
-caller's role and the handler services it with the ordinary receive/reply cycle. See
+#242). A stop of the thread before any reply claims the fault cancels the episode, and a stop
+after a reply claims it leaves that reply's disposition; in both cases the thread is resumed, or
+its fault left unhandled, only if it is started again. This reuses the call/reply machinery
+above — the suspended thread occupies the caller's role and the handler services it with the
+ordinary receive/reply cycle. See
 [Fault Handling](fault-handling.md).
 
 ---

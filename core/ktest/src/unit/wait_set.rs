@@ -541,6 +541,32 @@ fn stale_collect(done: u64, mut acc: u64, mask: u64) -> Result<u64, &'static str
     Ok(acc)
 }
 
+/// `stale_endpoint_entry_skipped`'s caller: register its IPC page, announce
+/// the call, then call the endpoint, which no thread receives on; report
+/// whether the call returned `Interrupted`.
+extern "C" fn stale_caller(arg: u64) -> !
+{
+    // SAFETY: `arg` is the `STALE_ARGS` entry `stale_run` published.
+    let (ep, done): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
+    let buf = core::ptr::addr_of_mut!(STALE_IPC_PAGE).cast::<u64>();
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static
+    // above), registered by one thread at a time; no Rust object lives in it,
+    // and the thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    {
+        thread_exit()
+    }
+    notification_send(done, STALE_READY).ok();
+    // SAFETY: `buf` was registered as this thread's IPC buffer above.
+    let bit = match unsafe { ipc::ipc_call(ep, &ipc::IpcMessage::new(0), buf) }
+    {
+        Err(e) if e == SyscallError::Interrupted as i64 => STALE_OK,
+        _ => STALE_BAD,
+    };
+    notification_send(done, bit).ok();
+    thread_exit()
+}
+
 // ── SYS_WAIT_SET_REMOVE ───────────────────────────────────────────────────────
 
 /// After `wait_set_remove`, the removed source no longer wakes the wait set.
@@ -693,29 +719,4 @@ extern "C" fn occupied_waiter_0(arg: u64) -> !
 extern "C" fn occupied_waiter_1(arg: u64) -> !
 {
     occupied_waiter(arg, 1)
-}
-/// `stale_endpoint_entry_skipped`'s caller: register its IPC page, announce
-/// the call, then call the endpoint, which no thread receives on; report
-/// whether the call returned `Interrupted`.
-extern "C" fn stale_caller(arg: u64) -> !
-{
-    // SAFETY: `arg` is the `STALE_ARGS` entry `stale_run` published.
-    let (ep, done): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
-    let buf = core::ptr::addr_of_mut!(STALE_IPC_PAGE).cast::<u64>();
-    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static
-    // above), registered by one thread at a time; no Rust object lives in it,
-    // and the thread reaches it only through the raw `buf` pointer.
-    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
-    {
-        thread_exit()
-    }
-    notification_send(done, STALE_READY).ok();
-    // SAFETY: `buf` was registered as this thread's IPC buffer above.
-    let bit = match unsafe { ipc::ipc_call(ep, &ipc::IpcMessage::new(0), buf) }
-    {
-        Err(e) if e == SyscallError::Interrupted as i64 => STALE_OK,
-        _ => STALE_BAD,
-    };
-    notification_send(done, bit).ok();
-    thread_exit()
 }

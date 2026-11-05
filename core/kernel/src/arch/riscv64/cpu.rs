@@ -321,8 +321,7 @@ unsafe extern "C" {
     static __copy_user_fault_start: u8;
     /// First byte past the faultable copy region.
     static __copy_user_fault_end: u8;
-    /// Recovery landing pad: closes the SUM window and returns the bytes not
-    /// copied.
+    /// Recovery landing pad: closes the SUM window, returns the bytes left.
     static __copy_user_fixup: u8;
 }
 

@@ -1263,13 +1263,6 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// The address-space pool spills its donation records the same way. Pages
-/// described by spilled records serve as page tables: the free list is
-/// LIFO, so fresh mappings draw first on the newest donations (described by
-/// the second record page) and, once the pages it describes are used up, on
-/// donations the first record page describes. Every table a reclaiming
-/// unmap frees must be credited back, so the budget returns exactly to its
-/// post-donation value, and the delete returns every donation.
 /// Map `frame` once at each of `regions` scratch VAs `stride` apart from
 /// `TEST_VA_BASE` in `aspace`; returns how many maps failed.
 fn map_regions(frame: u64, aspace: u64, regions: u64, stride: u64) -> u32
@@ -1305,6 +1298,14 @@ fn reclaim_regions(aspace: u64, regions: u64, stride: u64) -> u32
     failures
 }
 
+/// The address-space pool spills its donation records as the `CSpace` pool
+/// does ([`cspace_augment_many`]). Pages described by spilled records serve
+/// as page tables: the free list is LIFO, so fresh mappings draw first on the
+/// newest donations (described by the second record page) and, once the
+/// pages it describes are used up, on donations the first record page
+/// describes. Every table a reclaiming unmap frees must be credited back, so
+/// the budget returns exactly to its post-donation value, and the delete
+/// returns every donation.
 pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
 {
     const PAGE: u64 = syscall_abi::PAGE_SIZE;

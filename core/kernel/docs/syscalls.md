@@ -1780,7 +1780,8 @@ after the binding is published. The endpoint and its badge are published as one 
 target thread's `sched_lock`; fault delivery reads them once under the same lock and pins the
 endpoint until the faulting thread parks, so a concurrent rebind or unbind neither pairs one
 binding's endpoint with another's badge nor frees the endpoint mid-delivery, and a delivery that
-finds the binding cleared kills the thread as an unhandled fault
+finds the binding cleared leaves the fault unhandled (the thread is killed, or a restartable
+syscall's copy fault fails the syscall with `InvalidAddress`; § Restartable Syscalls)
 ([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
 Object Reference Counting). Binding requires only a valid `Endpoint` cap — `Control` on the
 thread is the authority; the endpoint cap names where the thread's faults are delivered and, by

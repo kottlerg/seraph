@@ -3,8 +3,9 @@
 
 // services/memmgr/free-pool/src/ledger.rs
 
-//! memmgr's whole bookkeeping state: the arena, the free pool over it, and
-//! the process index, with the per-process frame and region list operations.
+//! memmgr's whole bookkeeping state: the arena, the free pool over it, the
+//! deferred list beside it, and the process index, with the per-process frame
+//! and region list operations.
 //!
 //! A [`Ledger`] owns no global state and is mutated only through `&mut`, so
 //! the service holds one instance today and a sharded pager can hold one per
@@ -12,8 +13,15 @@
 //! § Concurrency). Operations that need a fresh slot report a full arena
 //! instead of growing it: growth takes a pool frame and maps it, which is the
 //! service's syscall surface.
+//!
+//! Every path that takes frames back from a process passes each one through a
+//! caller-supplied quiescence check (a kernel query in memmgr): a frame it
+//! accepts joins the free pool, and one it refuses is parked on the
+//! [`DeferredList`] until a later [`Ledger::recheck_deferred`] accepts it
+//! (`services/memmgr/docs/memory-pool.md` § Reclamation).
 
 use crate::arena::{Arena, FrameDesc, NODE_NULL, Node, NodeIdx, ProcessRecord, Slot, SlotStore};
+use crate::deferred::{DeferredList, RecheckBudget};
 use crate::index::{ProcessIndex, WordStore};
 use crate::pool::FreePool;
 use crate::{DemandRegion, FreeRun, region_contains, regions_overlap};
@@ -47,6 +55,9 @@ pub struct Ledger<S, W>
 {
     pub arena: Arena<S>,
     pub pool: FreePool,
+    /// Runs taken back from a process but held out of `pool` until the
+    /// caller's quiescence check accepts them.
+    pub deferred: DeferredList,
     pub index: ProcessIndex<W>,
 }
 
@@ -57,6 +68,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         Self {
             arena: Arena::new(slots),
             pool: FreePool::new(),
+            deferred: DeferredList::new(),
             index: ProcessIndex::new(words),
         }
     }
@@ -106,13 +118,17 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         Some(rec)
     }
 
-    /// Unindex and free the record keyed by `badge` after returning every
-    /// frame to the pool and freeing every region ([`Ledger::reclaim_all`]).
-    /// Returns the record as it stood, or `None` for an unknown badge.
-    pub fn remove_process(&mut self, badge: u64) -> Option<ProcessRecord>
+    /// Unindex and free the record keyed by `badge` after taking back every
+    /// frame and freeing every region ([`Ledger::reclaim_all`]). Returns the
+    /// record as it stood, or `None` for an unknown badge.
+    pub fn remove_process(
+        &mut self,
+        badge: u64,
+        quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> Option<ProcessRecord>
     {
         let rec = self.index.remove(&mut self.arena, badge)?;
-        self.reclaim_all(rec);
+        self.reclaim_all(rec, quiescent);
         let r = self.record(rec);
         self.arena.free(rec);
         r
@@ -264,14 +280,17 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         None
     }
 
-    /// Move every frame of `rec` that `pick` selects back to the free pool,
+    /// Take every frame of `rec` that `pick` selects off the record,
     /// rewriting each frame slot into a run slot in place, so the move needs
-    /// no fresh slot and cannot fail. Returns how many frames moved.
+    /// no fresh slot and cannot fail: into the free pool when `quiescent`
+    /// accepts the run, else onto the deferred list. Returns how many frames
+    /// moved.
     fn return_frames_where(
         &mut self,
         rec: NodeIdx,
         pick: impl Fn(&FrameDesc) -> bool,
         take: Take,
+        mut quiescent: impl FnMut(&FreeRun) -> bool,
     ) -> u64
     {
         let Some(mut r) = self.record(rec)
@@ -299,18 +318,26 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             {
                 self.arena.set_next(prev, next);
             }
+            let run = FreeRun {
+                cap_slot: f.cap_slot,
+                page_count: u64::from(f.page_count),
+                phys_base: f.phys_base,
+            };
             self.arena.set(
                 cur,
                 Slot {
-                    node: Node::Run(FreeRun {
-                        cap_slot: f.cap_slot,
-                        page_count: u64::from(f.page_count),
-                        phys_base: f.phys_base,
-                    }),
+                    node: Node::Run(run),
                     next: NODE_NULL,
                 },
             );
-            self.pool.push_node(&mut self.arena, cur);
+            if quiescent(&run)
+            {
+                self.pool.push_node(&mut self.arena, cur);
+            }
+            else
+            {
+                self.deferred.park(&mut self.arena, cur);
+            }
             moved += 1;
             if take == Take::First
             {
@@ -322,33 +349,49 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         moved
     }
 
-    /// Return the caller-owned grant of `rec` (a frame with `va ==
-    /// unmapped`) based at `phys` to the pool. Returns whether one matched.
-    pub fn release_frame_by_phys(&mut self, rec: NodeIdx, phys: u64, unmapped: u64) -> bool
+    /// Take back the caller-owned grant of `rec` (a frame with `va ==
+    /// unmapped`) based at `phys`, pooled or deferred as `quiescent` decides.
+    /// Returns whether one matched.
+    pub fn release_frame_by_phys(
+        &mut self,
+        rec: NodeIdx,
+        phys: u64,
+        unmapped: u64,
+        quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> bool
     {
         self.return_frames_where(
             rec,
             |f| f.va == unmapped && f.phys_base == phys,
             Take::First,
+            quiescent,
         ) == 1
     }
 
-    /// Return every frame of `rec` memmgr mapped at a page base in `[base,
-    /// end)` to the pool.
-    pub fn return_frames_in(&mut self, rec: NodeIdx, base: u64, end: u64, unmapped: u64)
+    /// Take back every frame of `rec` memmgr mapped at a page base in `[base,
+    /// end)`, pooled or deferred as `quiescent` decides.
+    pub fn return_frames_in(
+        &mut self,
+        rec: NodeIdx,
+        base: u64,
+        end: u64,
+        unmapped: u64,
+        quiescent: impl FnMut(&FreeRun) -> bool,
+    )
     {
         self.return_frames_where(
             rec,
             |f| f.va != unmapped && f.va >= base && f.va < end,
             Take::Every,
+            quiescent,
         );
     }
 
-    /// Return every frame of `rec` to the pool and free every region slot,
-    /// leaving both lists empty.
-    pub fn reclaim_all(&mut self, rec: NodeIdx)
+    /// Take back every frame of `rec`, pooled or deferred as `quiescent`
+    /// decides, and free every region slot, leaving both lists empty.
+    pub fn reclaim_all(&mut self, rec: NodeIdx, quiescent: impl FnMut(&FreeRun) -> bool)
     {
-        self.return_frames_where(rec, |_| true, Take::Every);
+        self.return_frames_where(rec, |_| true, Take::Every, quiescent);
         let Some(mut r) = self.record(rec)
         else
         {
@@ -364,6 +407,20 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         r.region_head = NODE_NULL;
         self.set_record(rec, r);
     }
+
+    /// Check deferred runs within `budget`, charging each `cost`, and move
+    /// each `quiescent` accepts to the free pool ([`DeferredList::recheck`]).
+    /// Returns the pages moved.
+    pub fn recheck_deferred(
+        &mut self,
+        budget: RecheckBudget,
+        cost: impl Fn(&FreeRun) -> u64,
+        quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> u64
+    {
+        self.deferred
+            .recheck(&mut self.arena, &mut self.pool, budget, cost, quiescent)
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +430,12 @@ mod tests
     use crate::arena::test_store::VecStore;
 
     const UNMAPPED: u64 = u64::MAX;
+
+    /// A quiescence check that accepts every run.
+    fn pool_all(_: &FreeRun) -> bool
+    {
+        true
+    }
 
     #[derive(Default)]
     struct VecWords(Vec<u64>);
@@ -448,7 +511,7 @@ mod tests
         assert!(l.push_frame(rec, frame(2, 16, 0x10000, 0x40_0000)));
         l.add_region(rec, region(0x40_0000, 0x10_0000)).unwrap();
         l.set_aspace_cap(rec, 9);
-        let gone = l.remove_process(42).unwrap();
+        let gone = l.remove_process(42, pool_all).unwrap();
         assert_eq!(gone.aspace_cap, 9);
         assert!(l.find(42).is_none());
         assert_eq!((l.pool.free_pages(), l.pool.run_count()), (18, 2));
@@ -458,10 +521,38 @@ mod tests
     }
 
     #[test]
+    fn a_reclaimed_frame_the_check_refuses_waits_on_the_deferred_list()
+    {
+        let mut l = ledger();
+        let free = l.arena.free_count();
+        let rec = l.insert_process(7).unwrap();
+        assert!(l.push_frame(rec, frame(1, 2, 0x1000, UNMAPPED)));
+        assert!(l.push_frame(rec, frame(2, 3, 0x8000, UNMAPPED)));
+        assert!(l.push_frame(rec, frame(3, 4, 0x20000, UNMAPPED)));
+        // A live process's release of a frame the check refuses leaves the
+        // record and parks the frame, out of the pool.
+        assert!(l.release_frame_by_phys(rec, 0x20000, UNMAPPED, |_| false));
+        assert!(!l.release_frame_by_phys(rec, 0x20000, UNMAPPED, pool_all));
+        // At death, the frame the check refuses joins it there.
+        l.remove_process(7, |r| r.cap_slot != 2).unwrap();
+        assert_eq!((l.pool.free_pages(), l.pool.run_count()), (2, 1));
+        assert_eq!((l.deferred.pages(), l.deferred.run_count()), (7, 2));
+        // Every frame slot became a run slot, pooled or parked; only the
+        // record's slot was freed.
+        assert_eq!(l.arena.free_count(), free - 3);
+        assert_eq!(
+            l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all),
+            7
+        );
+        assert_eq!((l.pool.free_pages(), l.pool.run_count()), (9, 3));
+        assert_eq!(l.deferred.run_count(), 0);
+    }
+
+    #[test]
     fn remove_process_of_an_unknown_badge_changes_nothing()
     {
         let mut l = ledger();
-        assert!(l.remove_process(5).is_none());
+        assert!(l.remove_process(5, pool_all).is_none());
         assert_eq!(l.pool.free_pages(), 0);
     }
 
@@ -473,7 +564,7 @@ mod tests
         assert!(l.push_frame(rec, frame(1, 1, 0x1000, UNMAPPED)));
         assert!(l.push_frame(rec, frame(2, 1, 0x2000, UNMAPPED)));
         assert_eq!(l.pop_frame(rec).map(|f| f.cap_slot), Some(2));
-        assert!(l.release_frame_by_phys(rec, 0x1000, UNMAPPED));
+        assert!(l.release_frame_by_phys(rec, 0x1000, UNMAPPED, pool_all));
         assert!(l.pop_frame(rec).is_none());
     }
 
@@ -485,10 +576,10 @@ mod tests
         assert!(l.push_frame(rec, frame(1, 4, 0x8000, UNMAPPED)));
         assert!(l.push_frame(rec, frame(2, 16, 0x9000, 0x50_0000)));
         // A demand chunk is never released by phys base.
-        assert!(!l.release_frame_by_phys(rec, 0x9000, UNMAPPED));
-        assert!(!l.release_frame_by_phys(rec, 0x1234, UNMAPPED));
-        assert!(l.release_frame_by_phys(rec, 0x8000, UNMAPPED));
-        assert!(!l.release_frame_by_phys(rec, 0x8000, UNMAPPED));
+        assert!(!l.release_frame_by_phys(rec, 0x9000, UNMAPPED, pool_all));
+        assert!(!l.release_frame_by_phys(rec, 0x1234, UNMAPPED, pool_all));
+        assert!(l.release_frame_by_phys(rec, 0x8000, UNMAPPED, pool_all));
+        assert!(!l.release_frame_by_phys(rec, 0x8000, UNMAPPED, pool_all));
         assert_eq!(l.pool.free_pages(), 4);
     }
 
@@ -501,7 +592,7 @@ mod tests
         assert!(l.push_frame(rec, frame(2, 16, 0x20000, 0x41_0000)));
         assert!(l.push_frame(rec, frame(3, 16, 0x30000, 0x80_0000)));
         assert!(l.push_frame(rec, frame(4, 1, 0x40000, UNMAPPED)));
-        l.return_frames_in(rec, 0x40_0000, 0x42_0000, UNMAPPED);
+        l.return_frames_in(rec, 0x40_0000, 0x42_0000, UNMAPPED, pool_all);
         assert_eq!(l.pool.free_pages(), 32);
         assert!(l.frame_covering(rec, 0x80_0000, UNMAPPED));
         assert!(!l.frame_covering(rec, 0x40_0000, UNMAPPED));

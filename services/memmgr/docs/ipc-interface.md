@@ -193,13 +193,16 @@ as the per-process tracking anchor and uses `phys_base` to find it.
 | 4 | `INVALID_ARGUMENT` | caller's badge is unknown |
 
 For each `phys_base`, memmgr finds the matching caller-owned grant
-(`FRAME_VA_UNMAPPED`) in the per-process tracking entry, returns its run to
-the free pool (coalescing where possible), and frees the tracking node.
-Bases that match no outstanding grant are ignored — release is idempotent,
-so a racing double-release (join plus reaper) is harmless. The caller MUST
-have already deleted every kernel object retyped from the region; releasing
-a region with a live retype is correctness-safe (the kernel refuses to
-re-hand-out live bytes) but strands the run until that retype is freed. See
+(`FRAME_VA_UNMAPPED`) in the per-process tracking entry, takes it off the
+entry, and returns its run to the free pool (coalescing where possible), the
+tracking node becoming the run's node. Bases that match no outstanding grant
+are ignored — release is idempotent, so a racing double-release (join plus
+reaper) is harmless. The caller MUST have already deleted every kernel object
+retyped from the region and unmapped it from every address space. A region
+released with a live retype or a mapping is held on memmgr's deferred list,
+granted to no one, until both are gone; the release still succeeds and the
+region is no longer the caller's. Every release first rechecks the deferred
+list, so a release naming no grant (`count` 0) only rechecks. See
 [`memory-pool.md`](memory-pool.md) §"Reclamation".
 
 ### Label 3: `REGISTER_PROCESS`
@@ -250,8 +253,11 @@ the eventual `PROCESS_DIED`.
 ### Label 4: `PROCESS_DIED`
 
 Procmgr signals process death. memmgr looks up the per-process tracking
-entry by badge, reclaims every Memory cap memmgr has issued to that
+entry by badge, takes back every Memory cap memmgr has issued to that
 process, and runs coalescing (see [`memory-pool.md`](memory-pool.md) §"Reclamation").
+A frame another process can still reach, through a kernel object retyped
+from it or a user mapping of it, waits on memmgr's deferred list rather
+than joining the free pool, until a later recheck finds it unreachable.
 Privilege: procmgr-only.
 
 **Request:**
@@ -378,16 +384,22 @@ state change.
 | data[1] | `kernel_reserved_bytes` — the fixed kernel reserve |
 | data[2] | `pool_total_bytes` — every page memmgr owns (free runs, in-use arenas, reap donations); monotonic |
 | data[3] | `free_bytes` — subset of `pool_total_bytes` in free runs, lent to no process |
+| data[4] | `deferred_bytes` — subset of `pool_total_bytes` reclaimed but held out of the free runs while another process can still reach it |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
 RAM and is invariant across a process's lifetime, so it cannot witness
-reclamation. `free_bytes` (`data[3]`) is the page count currently in free
+reclamation. `free_bytes` (`data[3]`) is the byte count currently in free
 runs: it falls as `REQUEST_MEMORY_CAPS` lends pages and rises as
 `PROCESS_DIED`, `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` return them.
-A caller asserting that a dead process's pages were reclaimed polls `data[3]`
-back to its pre-spawn baseline. `data[3]` is appended after the identity
-terms; readers needing only the identity may ignore it.
+`deferred_bytes` (`data[4]`) is the byte count those three took back but
+hold on the deferred list, because another process can still reach the
+frames (see [`memory-pool.md`](memory-pool.md) §"Reclamation"); it falls as
+a later recheck moves them to the free runs. A caller asserting that a dead
+process's pages were reclaimed polls `data[3]` back to its pre-spawn
+baseline, and `data[4]` shows what is held instead. `data[3]` and `data[4]`
+are appended after the identity terms; readers needing only the identity may
+ignore them.
 
 ### Label 7: `REGISTER_REGION`
 

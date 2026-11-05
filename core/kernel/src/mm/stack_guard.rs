@@ -13,14 +13,15 @@
 //! idle stack's guard in Phase 4 ([`hole_on_boot_cpu`]) and each Thread slot's
 //! guard page while the thread exists ([`hole`], [`close`]).
 //!
-//! A Thread guard's hole sends no shootdown. [`hole`] advances the guard
-//! epoch and returns it for the new thread's TCB; every switch-in compares
-//! the incoming thread's stamp with the epoch the CPU last flushed at and
-//! flushes the CPU's whole TLB first when the stamp is newer
+//! Neither a Thread guard's hole nor its fill sends a shootdown. [`hole`]
+//! advances the guard epoch and returns it for the new thread's TCB; every
+//! switch-in compares the incoming thread's stamp with the epoch the CPU last
+//! flushed at and flushes the CPU's whole TLB first when the stamp is newer
 //! ([`flush_before_run`]). A stale translation of a thread's guard lets an
 //! overflow through only while that thread runs on that CPU, and every run
 //! starts with a switch-in, or, for init's first, with `sched::enter`, which
-//! makes the same check.
+//! makes the same check. A fill ([`close`]) flushes only its own CPU; see its
+//! documentation for why the others need no flush.
 //!
 //! A hole in a 2 MiB chunk mapped by one large leaf splits the chunk into a
 //! leaf table first. The leaf tables come from a reserve seeded in Phase 4
@@ -216,30 +217,6 @@ mod live
         })
     }
 
-    /// Drop every other online CPU's cached translation of the kernel address
-    /// `virt`, with a single-VA shootdown on the kernel root, which each
-    /// target serves in every address space (`flush_kernel_page`).
-    ///
-    /// # Safety
-    /// After SMP bringup, with no lock held and preemption disabled.
-    unsafe fn shoot_down_kernel_page(virt: u64)
-    {
-        let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
-        let remote = crate::cpu_mask::MaskSource::Below(cpu_count);
-        // SAFETY: the kernel root is the shared kernel half of every address
-        // space; `remote` names only online CPUs (the shootdown leaves this
-        // one out, and returns at once when it is the only one); preemption
-        // is disabled (caller contract).
-        unsafe {
-            crate::mm::tlb_shootdown::shootdown(
-                crate::mm::paging::kernel_root_table_pa(),
-                &remote,
-                virt,
-                0,
-            );
-        }
-    }
-
     /// Unmap the RAM page at `phys` from the direct map while only the boot
     /// CPU runs, flushing this CPU's TLB.
     ///
@@ -323,10 +300,15 @@ mod live
     }
 
     /// Map the page at `phys`, holed by [`hole`], into the direct map again,
-    /// so the page can hold anything once more, and drop every CPU's cached
+    /// so the page can hold anything once more, and drop this CPU's cached
     /// not-present entry for it where the architecture caches one
-    /// (`CACHES_NOT_PRESENT_ENTRIES`: riscv64, whose harts may hold the
-    /// invalid entry; x86-64 caches none).
+    /// (`CACHES_NOT_PRESENT_ENTRIES`: riscv64; x86-64 caches none). No other
+    /// CPU is flushed: one that kept the invalid entry flushes before it runs
+    /// a thread whose kernel stack the page becomes (that thread's creation
+    /// advances the guard epoch after this fill; [`flush_before_run`]), and
+    /// any other use of the page faults on a different stack, where the
+    /// kernel's spurious-fault retry flushes the entry and re-executes
+    /// (`core/kernel/docs/memory-internals.md` § Kernel Stack Guards).
     ///
     /// # Safety
     /// After SMP bringup, with no lock held. `phys` was holed by [`hole`] and
@@ -342,12 +324,9 @@ mod live
         });
         if crate::arch::current::paging::CACHES_NOT_PRESENT_ENTRIES
         {
-            // SAFETY: ring 0 / S-mode; after SMP bringup with no lock held and
-            // preemption disabled (above).
-            unsafe {
-                crate::arch::current::paging::flush_kernel_page(virt);
-                shoot_down_kernel_page(virt);
-            }
+            // SAFETY: ring 0 / S-mode; dropping this CPU's cached entry for
+            // `virt` is always safe.
+            unsafe { crate::arch::current::paging::flush_kernel_page(virt) };
         }
         crate::percpu::preempt_enable();
     }

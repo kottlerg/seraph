@@ -390,9 +390,9 @@ the direct-map holes under the kernel stacks and their leaf-table reserve
 thread creation, the Thread slab's reclaim, and the boot take it with no other lock held and
 acquire nothing under it. Its hold is one direct-map walk of the paging depth's levels plus, at
 a chunk's first hole, the 512 entries of the leaf table that splits it, a bounded walk the
-no-page-table-walk rule above excepts for this lock alone. The TLB shootdown a fill needs where
-`CACHES_NOT_PRESENT_ENTRIES` holds (riscv64) runs after its release; a hole sends none
-([memory-internals.md](memory-internals.md) § Kernel Stack Guards).
+no-page-table-walk rule above excepts for this lock alone. Neither a hole nor a fill sends a TLB
+shootdown; a fill's local flush where `CACHES_NOT_PRESENT_ENTRIES` holds (riscv64) runs after its
+release ([memory-internals.md](memory-internals.md) § Kernel Stack Guards).
 
 **Bare spin locks (MUST).** The derivation tree lock
 (`cap::derivation::DERIVATION_LOCK`), the per-`MemoryObject` reader-writer

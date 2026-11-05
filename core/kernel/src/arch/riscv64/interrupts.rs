@@ -815,6 +815,27 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 return;
             }
 
+            // Spurious stale-TLB retry for the kernel: a load or store fault
+            // the kernel's tables already satisfy is an invalid entry this hart
+            // cached before a closed direct-map hole (`mm::stack_guard`).
+            // Flush it locally and re-execute.
+            let access = match cause_code
+            {
+                13 => Some(super::paging::KernelAccess::Load),
+                15 => Some(super::paging::KernelAccess::Store),
+                _ => None,
+            };
+            if let Some(access) = access
+            {
+                // SAFETY: S-mode.
+                if unsafe { super::paging::kernel_fault_is_spurious(live.stval, access) }
+                {
+                    // SAFETY: S-mode; drops the stale entry for the retry.
+                    unsafe { super::paging::flush_page(live.stval) };
+                    return;
+                }
+            }
+
             crate::kprintln!(
                 "KERNEL EXCEPTION: cpu={} cause={} (scause={:#x})",
                 cpu,

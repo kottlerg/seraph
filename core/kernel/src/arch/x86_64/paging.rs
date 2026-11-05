@@ -1359,7 +1359,8 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
 }
 
 /// Whether a CPU may cache a not-present entry, so that a page made present
-/// again needs a flush on every CPU: never on x86-64.
+/// again can fault on a CPU that kept it until that CPU flushes: never on
+/// x86-64.
 pub const CACHES_NOT_PRESENT_ENTRIES: bool = false;
 
 /// Invalidate every translation this CPU caches, in every address space:

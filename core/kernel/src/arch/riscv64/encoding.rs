@@ -206,6 +206,9 @@ mod tests
 {
     use super::*;
 
+    /// PTE bit X: execute permission, for an execute-only leaf.
+    const PTE_EXECUTE: u64 = 1 << 3;
+
     #[test]
     fn plic_context_registers_follow_the_hart_id()
     {
@@ -338,7 +341,7 @@ mod tests
     {
         let ro = PTE_VALID | PTE_READ;
         let rw = PTE_VALID | PTE_READ | PTE_WRITE;
-        let x_only = PTE_VALID | (1 << 3);
+        let x_only = PTE_VALID | PTE_EXECUTE;
         assert!(kernel_leaf_permits(ro, KernelAccess::Load));
         assert!(!kernel_leaf_permits(ro, KernelAccess::Store));
         assert!(kernel_leaf_permits(rw, KernelAccess::Store));

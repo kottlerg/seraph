@@ -10,7 +10,9 @@ docs/conventions.md), the Issue numbers, the branch name, any batch-specific rul
 whether you are **orchestrated** (a parent session coordinates several workers) or
 **standalone** (the session you run in is the maintainer's). Everything else is in this file
 and in the project's documents. You never merge. Your lifetime is the one PR, or the one
-defined set of related PRs, that the prompt names: you retire when it stands at its gate.
+defined set of related PRs, that the prompt names: you retire when it stands at its gate,
+apart from the work its gate still owes it (a fix round the maintainer picks there, a sync
+when `master` moves).
 
 ## Authorities
 
@@ -130,7 +132,10 @@ before it lands.
 - Every item you fix: tick it on its Issue in the Issue's own style with `(fixed by PR #<M>)`
   (`gh issue edit`), copy the ticked items into the PR body's `## Acceptance`, and carry
   `Refs #N`. `Fixes #N` only when no item of that Issue stays open once your last run's
-  findings are recorded. An Issue the PR closes carries the current milestone. A PR carries no
+  findings are recorded, except for a rolling `<scope>: defects found by review` Issue, which
+  takes `Refs` only and is never closed by a PR, even when every item is ticked (an
+  earlier-pattern `<scope>: defects found by PR #N's review` Issue closes under that
+  condition). An Issue the PR closes carries the current milestone. A PR carries no
   milestone (`gh pr create` and `gh pr edit` never take `--milestone`); milestones are set on
   Issues with `gh issue edit` (docs/conventions.md § Milestones).
 - Edit an Issue body only from a freshly fetched file: fetch it
@@ -158,18 +163,24 @@ before it lands.
 ## Host runs
 
 Local validation uses one shared host. Immediately before each launch, as a separate step that
-stops on failure, run the launch check its kind sets, and state the check's result per row in
-the PR body's run table:
+stops on failure, run the launch check its kind sets, and state the check's result for each run
+the PR body's `## Validation` section reports:
 
 - A build (`cargo xtask build`, `cargo xtask clean`): the 1-minute load average
   (`cat /proc/loadavg`) under 32. It needs no grant.
-- A boot of 4 vCPUs or fewer: fewer than 2 QEMUs running (`pgrep -c qemu-system`) and the load
+- A boot of 4 vCPUs or fewer: fewer than 2 QEMUs running (`pgrep -c qemu-system`), none of
+  them with more than 4 vCPUs (`pgrep -af qemu-system` shows no `-smp` above 4), and the load
   under 16. It needs no grant.
-- A boot of 16 vCPUs or more, and any timing-sensitive measurement: the exclusive grant
+- A boot of more than 4 vCPUs, and any timing-sensitive measurement: the exclusive grant
   (orchestrated) and, under it, no QEMU running and the load under 10.
+- A run docs/testing.md § Coverage tiers owes: no other QEMU running, whatever its vCPU count,
+  since its HANG or failure blocks as that section says.
 
-A refused check is re-run until it passes, for up to 30 minutes (§ Reporting). One QEMU of yours
-at a time. A timeout or a timing failure of a boot that ran beside another QEMU is re-run once
+While the orchestrator holds the host for another worker's exclusive grant, you launch no boot,
+and during a timing-sensitive measurement no build either, until it tells you the grant ended,
+whatever your launch check shows. A refused check is re-run until it passes, for up to 30
+minutes (§ Reporting). One QEMU of yours at a time. A timeout or a timing failure of a boot that
+ran beside another QEMU, and that docs/testing.md § Coverage tiers does not owe, is re-run once
 alone (no other QEMU running) before it counts. All commands through `cargo xtask`; boots
 through `cargo xtask run-parallel --arch <a> --parallel 1 --runs 1 --timeout <s>`, which boots
 the same sysroot as the `cargo xtask run` that `.claude/CLAUDE.md` § Validation names and judges
@@ -212,7 +223,8 @@ the PR number, the open Issue list, and for a delta run the `since` head, both m
 the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the PR as soon as
 `cargo xtask test` and `lint-docs` pass, so CI and the first review run before the host runs.
 When the prompt names the ledger of a previous PR on the same surface, your first review run
-passes it as the ledger.
+passes it to the reviewer as that PR's settled findings, for context and not as this PR's
+ledger: a finding it lists that stands on this PR's surface is still reported and counted.
 Before every review run, refresh the PR body to the head the run reviews: the validated head,
 the Validation report, the Acceptance ticks, and every claim the body makes.
 
@@ -254,8 +266,9 @@ the Validation report, the Acceptance ticks, and every claim the body makes.
   finding it sends to a fix round is recorded first and ticked when the round fixes it.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `gh issue edit`, or a commit) and re-run the audit.
   A re-audit is its own record, `audit-<head>.md` and `audit-<head>.json` in the shape above,
-  so the ledger command reads it; a second audit at a head that already has one is saved as
-  `audit-<head>-2.md` and `audit-<head>-2.json`, so a failed-then-passed audit keeps both.
+  so the ledger command reads it; each further audit at a head that already has one is saved
+  as `audit-<head>-<n>.md` and `audit-<head>-<n>.json`, `<n>` counting up from 2, so a
+  failed-then-passed audit keeps both.
 - A contested finding is put to the maintainer (through the orchestrator when orchestrated); on
   the surface it resolves in this PR as that section says. A correctness, soundness, safety or
   contract defect in a file you touch is on the surface unless an open Issue names that work;

@@ -37,14 +37,14 @@ Until an answer arrives, each case below is a prompt to the maintainer when it c
    rolling follow-up Issue when a scope has none and for a standalone Issue for a defect found
    off a PR's surface.
 
-Three rules the maintainer has stated stand without a question: an Issue moves to a later
-milestone only on a clear and hard dependency on another Issue; a deferral that needs real
-hardware is filed as an Issue without a milestone; and a PR references a rolling
-`<scope>: defects found by review` Issue with `Refs`, never a closing keyword, and you keep the
-rolling Issue open as the scope's recording sink even when every item is ticked, which
-docs/conventions.md § Branch and PR Workflow allows (it conditions closing, it does not require
-it). An earlier-pattern `<scope>: defects found by PR #N's review` Issue closes under that
-section's condition.
+Three rules the maintainer has stated stand without a question. Outside the milestone moves of
+docs/conventions.md § Release Production step 7, you move an Issue to a later milestone only on
+a clear and hard dependency on another Issue. A deferral that needs real hardware is work no
+release has scheduled, filed as an Issue without a milestone, as § Milestones allows for such
+work. And you keep a rolling `<scope>: defects found by review` Issue open as the scope's
+recording sink even when every item is ticked (PRs reference it with `Refs` only, as
+`.claude/agents/worker.md` § Commits and the PR body says), which § Branch and PR Workflow
+allows: it conditions closing, it does not require it.
 
 ## Plan
 
@@ -89,12 +89,13 @@ prompt of this shape; nothing in it repeats the agent file:
 > You are orchestrated. Scope `<scope>`; Issues #N, #M (one line each: title and the items in
 > play); branch `<prefix>/<slug>`; report to `main`; review records go to `<path of your
 > checkout>` (the destination of the worker's copy, `.claude/agents/worker.md` § Review);
-> ledger `<path of the previous PR's ledger on the same surface, when one exists>`. Batch
+> previous ledger `<path of the previous PR's ledger on the same surface, when one exists>`
+> (context for the first review run, not this PR's ledger). Batch
 > rulings: <the rulings below that the maintainer changed for this batch, and any
 > Issue-specific decision already made>.
 
-A worker is spawned for one PR, or one defined set of related PRs that its prompt names, and
-retires when that set is at its gate; it is not re-tasked onto another PR, whether or not the
+Spawn a worker for one PR, or one defined set of related PRs that its prompt names (its
+lifetime, `.claude/agents/worker.md`), and never re-task it onto another PR, whether or not the
 surface is shared. No token ceiling applies to a worker: one that has to compact, compacts.
 
 Choose the model and effort per spawn, within three tiers:
@@ -105,7 +106,7 @@ Choose the model and effort per spawn, within three tiers:
 - `model: opus`, effort `high`: design-laden or multi-component PRs (kernel, ABI, drivers,
   protocol changes).
 
-Fable is never a worker. Record the agent id with its model and effort, the
+`model: fable` is never a worker's model. Record the agent id with its model and effort, the
 scope, the branch, the worktree path and, once opened, the PR number in the record file; the
 id is the address for every later message, and the record lists it as active until the worker's
 last PR merges or a respawn replaces it.
@@ -125,7 +126,7 @@ The host is one machine. A boundary-set boot (the 16- and 128-CPU boots docs/tes
 classifying; two canonical (4-CPU) boots side by side do not (the maintainer's ruling of
 2026-10-31). Builds and canonical boots therefore take no token: each worker launches them on
 the launch checks of `.claude/agents/worker.md` § Host runs. The token is the exclusive grant,
-which a boot of 16 vCPUs or more and any timing-sensitive measurement take:
+which a boot of more than 4 vCPUs and any timing-sensitive measurement take:
 
 - A worker sends the exact command list of its exclusive runs and its estimate and ends its
   turn. You answer `host free` when no other grant is outstanding and the host is quiet
@@ -163,8 +164,8 @@ or ask the worker for the copy, before merging rather than merging on the report
   | grep -cE 'claude[.]ai|Claude-Session'` and `git log origin/master..<head> --format=%B
   | grep -cE 'claude[.]ai|Claude-Session'` both print `0`). Strip a surviving one from the body
   with `gh pr edit` before the merge; one in a commit message is a history rewrite (§ Rulings).
-- A closing keyword appears only as `Fixes #N` in the body, for an Issue the PR closes, and in
-  no commit body.
+- A closing keyword appears only as `Fixes #N` (or the template's `Closes #N`) in the body,
+  for an Issue the PR closes, and in no commit body.
 - Every commit subject is at most 72 columns, and no non-merge subject carries an Issue
   reference (`git log origin/master..<head> --format=%s`).
 - Every commit is signed (`git log origin/master..<head> --format='%G? %h'` shows no `N`).

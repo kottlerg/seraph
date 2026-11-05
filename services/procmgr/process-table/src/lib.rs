@@ -11,10 +11,10 @@
 //! time-bounded ring of recently reaped or destroyed processes
 //! ([`RecentExits`]), the memory reclaims held back for the children created
 //! with `CREATE_DMA_HOLD` ([`DmaHolds`]), the pure badge-acceptance predicate
-//! ([`badge_is_acceptable`]), the argv/env blob decoder for create requests
-//! ([`CreateBlobs`]), which parses client-controlled label fields and data
-//! words, the `CREATE_FROM_FILE` cap-layout split
-//! ([`split_create_from_file_caps`]), the bounds procmgr applies to fs-driver
+//! ([`badge_is_acceptable`]), the argv/env header decoder and checks for
+//! create requests ([`create_blobs`]), which bound client-controlled data
+//! words and blob bytes, the create-request cap-layout split
+//! ([`split_create_caps`]), the bounds procmgr applies to fs-driver
 //! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), the
 //! init-reap handoff state machine ([`InitReap`]), and the size of procmgr's
 //! first death queue ([`death_queues::FIRST_POOL_OBSERVERS`]). None of these
@@ -39,10 +39,10 @@ pub mod fs_reads;
 pub mod init_reap;
 pub mod request_caps;
 
-pub use create_blobs::{ChildArgs, ChildEnv, CreateBlobs};
+pub use create_blobs::{ArgvEnvRefusal, ArgvEnvTally, checked_total, decode_header};
 pub use dma_holds::{DmaHolds, HeldReclaim};
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
-pub use request_caps::{FileCreateCaps, split_create_from_file_caps};
+pub use request_caps::{CreateCaps, CreateTailCaps, split_create_caps};
 
 extern crate alloc;
 
@@ -82,6 +82,10 @@ pub struct ProcessEntry
     pub thread_cap: u64,
     pub pi_memory_cap: u64,
     pub tls_memory_cap: u64,
+    /// Slot in procmgr's `CSpace` of the Memory cap behind the child's
+    /// argv/env region, the pages mapped after its `ProcessInfo` page. Zero
+    /// when the child was created without argv and env.
+    pub argv_env_memory_cap: u64,
     /// Slot in procmgr's `CSpace` of the badged SEND cap on memmgr's
     /// endpoint that procmgr minted via `REGISTER_PROCESS` for this child.
     /// Held until `PROCESS_DIED`. Zero when memmgr was unwired at create
@@ -515,6 +519,7 @@ mod tests
             thread_cap: 0,
             pi_memory_cap: 0,
             tls_memory_cap: 0,
+            argv_env_memory_cap: 0,
             memmgr_send_cap: 0,
             memmgr_badge: 0,
             namespace_override: 0,

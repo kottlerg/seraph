@@ -27,7 +27,8 @@ rather than `restricted_std`-gated. Downstream seraph bins therefore consume
 ruststd/
 ├── README.md
 ├── argv-env/                   # `ruststd-argv-env` crate: pure, host-tested argv/env
-│   └── src/lib.rs              #   blob parsers; also a rustc-dep-of-std dep of overlaid std
+│   └── src/lib.rs              #   blob parsers and the spawner's window fill; also a
+│                               #   rustc-dep-of-std dep of overlaid std
 ├── death-queues/               # `ruststd-death-queues` crate: pure, host-tested death-queue
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
 │                               #   rustc-dep-of-std dep of overlaid std (not re-exported),
@@ -313,6 +314,23 @@ listing's names through the extension (svcmgr's recipe scan does).
 procmgr process-handle cap as the full `u64` capability handle, for the procmgr
 labels that take one. `Child::id` returns only the handle's slot index, since
 upstream fixes its width at `u32` and the handle's generation sits above that.
+
+---
+
+## argv and env
+
+`Command::spawn` packs the child's argv and env into a Memory cap the spawner funds and
+`CREATE_FROM_FILE` transfers with `CREATE_ARGV_ENV`
+([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#label-1-create_process)
+§ Label 1, **argv and env**). `std::os::seraph::process::ArgvEnvCap` builds that cap and its
+header for any sender of a raw create request (svcmgr's launch and restart, svctest). After the
+call the sender passes the reply label to `ArgvEnvCap::settle`, which withholds the run (it stays
+charged to the sender) on `ARGV_ENV_STILL_MAPPED`, when procmgr may still map its pages, and
+otherwise returns it to memmgr. `spawn` refuses with `ArgumentListTooLong` only when argv
+and env together exceed `process_abi::ARGV_ENV_MAX_BYTES` or memmgr refuses the spawner the run
+they fill. In the child, `_start` reads both blobs from the argv/env region after the
+`ProcessInfo` page ([abi/process-abi/README.md](../../abi/process-abi/README.md) § argv / env
+region), confined to that region by `argv_env::blob_span`.
 
 ---
 

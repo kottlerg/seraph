@@ -6,16 +6,14 @@
 //! procmgr / `std::process::Command` surface.
 //!
 //! Hosts the child-mode entries `cwd_child_main` (spawned by
-//! `command_cwd_inherit_phase`), `blobs_fill_child_main` (spawned by
-//! `command_blobs_fill_message_phase`), `park_child_main` (spawned by
+//! `command_cwd_inherit_phase`), `blobs_large_child_main` (spawned by
+//! `command_blobs_large_phase`), `park_child_main` (spawned by
 //! `command_from_spawned_thread_phase`), `undeliverable_reply_child_main`
 //! (spawned by `procmgr_refusals_phase`), and `logd_reclaim_child_main`
 //! (spawned by `logd_death_forward_phase`).
 
 use std::os::seraph::process::ChildExt;
 use std::os::seraph::startup_info;
-
-use syscall_abi::MSG_DATA_WORDS_MAX;
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -159,12 +157,8 @@ pub fn command_phases() -> &'static [Phase]
             run: command_invalid_elf_loop_phase,
         },
         Phase {
-            name: "command_blobs_over_message",
-            run: command_blobs_over_message_phase,
-        },
-        Phase {
-            name: "command_blobs_fill_message",
-            run: command_blobs_fill_message_phase,
+            name: "command_blobs_large",
+            run: command_blobs_large_phase,
         },
         Phase {
             name: "command_non_utf8_refused",
@@ -203,9 +197,9 @@ pub fn reentry_main(role: &str)
     {
         cwd_child_main();
     }
-    if role == BLOBS_FILL_ROLE
+    if role == BLOBS_LARGE_ROLE
     {
-        blobs_fill_child_main();
+        blobs_large_child_main();
     }
     if role == PARK_ROLE
     {
@@ -485,105 +479,104 @@ pub fn command_invalid_elf_loop_phase(_: &Caps)
     std::os::seraph::log!("command_invalid_elf_loop phase passed");
 }
 
-/// Fixture the blob-size cells spawn: svctest itself, re-entered through
-/// [`reentry_main`] as [`BLOBS_FILL_ROLE`] so the child can check what
+/// Fixture the blob cells spawn: svctest itself, re-entered through
+/// [`reentry_main`] as [`BLOBS_LARGE_ROLE`] so the child can check what
 /// reached it. Its path is argv[0] on the wire.
 const BLOB_FIXTURE: &str = "/tests/svctest";
-/// argv[1] of the blob-size cells' child; dispatches to
-/// `blobs_fill_child_main`.
-const BLOBS_FILL_ROLE: &str = "blobs-fill-child";
-/// Key of the single env entry the blob-size cells deliver.
-const BLOBS_ENV_KEY: &str = "K";
-/// Exit code of the blob-fill child when argv is not what the parent packed.
+/// argv[1] of the large-blob cell's child; dispatches to
+/// `blobs_large_child_main`.
+const BLOBS_LARGE_ROLE: &str = "blobs-large-child";
+/// Bytes of the one long argv token, 3 MiB: past the 512 pages a child's
+/// seed page-table pool covers (so procmgr funds the child's page tables for
+/// the region), across many of procmgr's and the spawner's 64-page copy
+/// windows, and far past the 256 B a whole argv blob once had.
+const BLOBS_FILLER_BYTES: usize = 3 << 20;
+/// Short argv tokens after the long one, past the 255 an 8-bit count field
+/// once held.
+const BLOBS_EXTRA_ARGS: usize = 300;
+/// Bytes of the value of the long env entry, `K`.
+const BLOBS_ENV_VALUE_BYTES: usize = 5000;
+/// Short env entries beside `K`, past the 255 an 8-bit count field once held.
+const BLOBS_EXTRA_ENVS: usize = 260;
+/// Exit code of the large-blob child when argv is not what the parent packed.
 const BLOBS_CHILD_BAD_ARGV: i32 = 6;
-/// Exit code of the blob-fill child when env is not what the parent packed.
+/// Exit code of the large-blob child when env is not what the parent packed.
 const BLOBS_CHILD_BAD_ENV: i32 = 7;
 
-/// Length of the filler token that brings the packed argv blob (argv[0],
-/// the role, and the filler, each NUL-terminated) to exactly
-/// `ipc::ARGS_BLOB_MAX` bytes.
-fn blobs_filler_len() -> usize
+/// The argv the large-blob child must see, argv[0] first: about 3 MiB in
+/// 303 strings.
+fn blobs_large_args() -> Vec<String>
 {
-    ipc::ARGS_BLOB_MAX - (BLOB_FIXTURE.len() + 1) - (BLOBS_FILL_ROLE.len() + 1) - 1
+    let mut args = vec![
+        String::from(BLOB_FIXTURE),
+        String::from(BLOBS_LARGE_ROLE),
+        "a".repeat(BLOBS_FILLER_BYTES),
+    ];
+    args.extend((0..BLOBS_EXTRA_ARGS).map(|i| format!("t{i}")));
+    args
 }
 
-/// Length of the value whose `K=<v...>` entry packs to `env_bytes` bytes
-/// including the `=` and the NUL.
-fn blobs_env_value_len(env_bytes: usize) -> usize
+/// The env the large-blob child must see, sorted by key: about 7 KiB in 261
+/// entries.
+fn blobs_large_env() -> Vec<(String, String)>
 {
-    env_bytes - BLOBS_ENV_KEY.len() - 2
+    let mut env: Vec<(String, String)> = (0..BLOBS_EXTRA_ENVS)
+        .map(|i| (format!("E{i:03}"), i.to_string()))
+        .collect();
+    env.push((String::from("K"), "v".repeat(BLOBS_ENV_VALUE_BYTES)));
+    env.sort();
+    env
 }
 
-/// Env blob size that fills the `CREATE_FROM_FILE` data area exactly behind
-/// a full argv blob: the file-size word, the argv words, the env header,
-/// and the env words sum to `MSG_DATA_WORDS_MAX`. Packed with `div_ceil`,
-/// as std packs the blobs.
-fn blobs_fill_env_bytes() -> usize
-{
-    (MSG_DATA_WORDS_MAX - 2 - ipc::ARGS_BLOB_MAX.div_ceil(8)) * 8
-}
-
-/// A `Command` for [`BLOB_FIXTURE`] whose packed argv blob is exactly
-/// `ipc::ARGS_BLOB_MAX` bytes (argv[0], the role, and one filler token,
-/// each NUL-terminated) and whose packed env blob is one `K=<v...>` entry
-/// of `env_bytes` bytes including its NUL. `env_clear` keeps svctest's own
-/// `SERAPH_*` entries out of the count.
-fn command_with_packed_blobs(env_bytes: usize) -> std::process::Command
-{
-    let filler = "a".repeat(blobs_filler_len());
-    let value = "v".repeat(blobs_env_value_len(env_bytes));
-    let mut cmd = std::process::Command::new(BLOB_FIXTURE);
-    cmd.arg(BLOBS_FILL_ROLE)
-        .arg(filler)
-        .env_clear()
-        .env(BLOBS_ENV_KEY, value);
-    cmd
-}
-
-/// Child main of the blob-fill cell. Exits `0` only when argv and env
-/// reproduce the lengths and content [`command_with_packed_blobs`] packed
-/// for [`blobs_fill_env_bytes`]; a blob procmgr silently degraded to empty
-/// would otherwise still look like a clean exit to the parent.
-fn blobs_fill_child_main() -> !
+/// Child main of the large-blob cell. Exits `0` only when argv and env
+/// reproduce, entry for entry, what [`command_blobs_large_phase`] packed; a
+/// blob procmgr truncated or degraded would otherwise still look like a
+/// clean exit to the parent.
+fn blobs_large_child_main() -> !
 {
     let args: Vec<String> = std::env::args().collect();
-    let filler = "a".repeat(blobs_filler_len());
-    let argv_intact = args.len() == 3
-        && args[0] == BLOB_FIXTURE
-        && args[1] == BLOBS_FILL_ROLE
-        && args[2] == filler;
-    if !argv_intact
+    if args != blobs_large_args()
     {
-        let lens: Vec<usize> = args.iter().map(String::len).collect();
-        std::os::seraph::log!("blobs-fill-child: argv mismatch, token lengths {lens:?}");
+        let lens: Vec<usize> = args.iter().map(String::len).take(4).collect();
+        std::os::seraph::log!(
+            "blobs-large-child: argv mismatch, {} tokens, first lengths {lens:?}",
+            args.len()
+        );
         std::process::exit(BLOBS_CHILD_BAD_ARGV);
     }
-    let vars: Vec<(String, String)> = std::env::vars().collect();
-    let value = "v".repeat(blobs_env_value_len(blobs_fill_env_bytes()));
-    let env_intact = vars.len() == 1 && vars[0].0 == BLOBS_ENV_KEY && vars[0].1 == value;
-    if !env_intact
+    let mut vars: Vec<(String, String)> = std::env::vars().collect();
+    vars.sort();
+    if vars != blobs_large_env()
     {
-        let lens: Vec<(usize, usize)> = vars.iter().map(|(k, v)| (k.len(), v.len())).collect();
-        std::os::seraph::log!("blobs-fill-child: env mismatch, entry lengths {lens:?}");
+        std::os::seraph::log!("blobs-large-child: env mismatch, {} entries", vars.len());
         std::process::exit(BLOBS_CHILD_BAD_ENV);
     }
     std::process::exit(0);
 }
 
-/// argv and env each at `ARGS_BLOB_MAX` pack to 1 + 32 + 1 + 32 words, two
-/// past the data area: std must refuse with `ArgumentListTooLong` before
-/// the binary is looked up or any cap is minted.
-pub fn command_blobs_over_message_phase(_: &Caps)
+/// argv and env far past the 256 B per blob and 255 strings per count that
+/// once rode inline in the create message: `Command::spawn` packs them into a
+/// Memory cap, procmgr copies them into the child's argv/env region, and the
+/// child (`blobs_large_child_main`) must see both intact — it exits
+/// [`BLOBS_CHILD_BAD_ARGV`] or [`BLOBS_CHILD_BAD_ENV`] when either was
+/// degraded or truncated on the way. `env_clear` keeps svctest's own
+/// `SERAPH_*` entries out of the comparison.
+pub fn command_blobs_large_phase(_: &Caps)
 {
-    let err = command_with_packed_blobs(ipc::ARGS_BLOB_MAX)
+    let mut child = std::process::Command::new(BLOB_FIXTURE)
+        .args(&blobs_large_args()[1..])
+        .env_clear()
+        .envs(blobs_large_env())
         .spawn()
-        .expect_err("argv and env jointly over the message must not spawn");
+        .expect("argv and env past the former inline limits must spawn");
+    let status = child.wait().expect("wait on the large-blob child failed");
     assert_eq!(
-        err.kind(),
-        std::io::ErrorKind::ArgumentListTooLong,
-        "joint blob overflow must surface as ArgumentListTooLong, got {err:?}"
+        status.code(),
+        Some(0),
+        "large-blob child exit {status}: {BLOBS_CHILD_BAD_ARGV}=argv mismatch, \
+         {BLOBS_CHILD_BAD_ENV}=env mismatch (see blobs_large_child_main)"
     );
-    std::os::seraph::log!("command_blobs_over_message phase passed");
+    std::os::seraph::log!("command_blobs_large phase passed");
 }
 
 /// The process ABI defines argv and env as UTF-8 strings, so std refuses a
@@ -710,26 +703,6 @@ fn process_state_and_reason(handle: u64) -> (u64, u64)
         "QUERY_PROCESS refused the child's process handle"
     );
     (reply.word(0), reply.word(1))
-}
-
-/// `file_size` word + 32 argv words + env header + 30 env words = 64: the
-/// data area exactly full, which must still spawn, and the child
-/// (`blobs_fill_child_main`) must see both blobs intact — it exits
-/// [`BLOBS_CHILD_BAD_ARGV`] or [`BLOBS_CHILD_BAD_ENV`] when either was
-/// degraded or truncated on the way.
-pub fn command_blobs_fill_message_phase(_: &Caps)
-{
-    let mut child = command_with_packed_blobs(blobs_fill_env_bytes())
-        .spawn()
-        .expect("argv and env filling the message exactly must spawn");
-    let status = child.wait().expect("wait on blob-fill child failed");
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "blob-fill child exit {status}: {BLOBS_CHILD_BAD_ARGV}=argv mismatch, \
-         {BLOBS_CHILD_BAD_ENV}=env mismatch (see blobs_fill_child_main)"
-    );
-    std::os::seraph::log!("command_blobs_fill_message phase passed");
 }
 
 pub fn stdio_file_unsupported_phase(_: &Caps)
@@ -873,6 +846,7 @@ pub fn procmgr_refusals_phase(_: &Caps)
     }
 
     configure_pipe_refusals();
+    argv_env_refusals();
 
     let status = std::process::Command::new("/programs/hello")
         .status()
@@ -897,6 +871,164 @@ pub fn procmgr_refusals_phase(_: &Caps)
          {UNDELIVERABLE_GRANT_FAILED}=a reserve-spending grant failed"
     );
     std::os::seraph::log!("procmgr_refusals phase passed");
+}
+
+/// procmgr refuses, with `INVALID_ARGUMENT`, a `CREATE_FROM_FILE` whose argv
+/// and env it cannot deliver intact (see
+/// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`,
+/// **argv and env**). Before it acquires anything for the child: a header
+/// longer than its cap, an argv/env cap that is not a Memory cap, the flag
+/// without the cap, and a label still carrying the former inline argv fields
+/// in bits `[32..64]`. During the copy, after it registers the child with
+/// memmgr: a Memory cap the kernel will not map for it, and, on the child's
+/// copy, a blob whose NULs disagree with its count or that lacks its final
+/// NUL. [`create_process_argv_env_refusals`] covers the `CREATE_PROCESS`
+/// side. A spawn afterwards in [`procmgr_refusals_phase`] shows procmgr still
+/// serves.
+fn argv_env_refusals()
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use std::os::seraph::process::ArgvEnvCap;
+
+    let procmgr = startup_info().procmgr_endpoint;
+    let label = procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_ARGV_ENV;
+    let blob = b"/programs/hello\0";
+    let len = blob.len() as u64;
+    let page = syscall_abi::PAGE_SIZE;
+    let cells: [(&str, [u64; 4]); 3] = [
+        ("a header longer than its one-page cap", [page + 1, 1, 0, 0]),
+        ("an argv count its NULs disagree with", [len, 2, 0, 0]),
+        ("an argv blob without its final NUL", [len - 1, 1, 0, 0]),
+    ];
+    for (what, header) in cells
+    {
+        let argv_env = ArgvEnvCap::new(blob, 1, b"", 0)
+            .expect("building the argv/env cap failed")
+            .expect("a nonempty argv builds a cap");
+        let (file, size) = hello_file();
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(label)
+                .word(0, size)
+                .words(1, &header)
+                .cap(file)
+                .cap(argv_env.cap())
+                .build(),
+            procmgr_errors::INVALID_ARGUMENT,
+            what,
+        );
+    }
+
+    let (file, size) = hello_file();
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(label)
+            .word(0, size)
+            .words(1, &[len, 1, 0, 0])
+            .cap(file)
+            .build(),
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_ARGV_ENV with only the file cap",
+    );
+
+    let (file, size) = hello_file();
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(label)
+            .word(0, size)
+            .words(1, &[len, 1, 0, 0])
+            .cap(file)
+            .cap(spare_cap())
+            .build(),
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_ARGV_ENV with an endpoint cap as the argv/env cap",
+    );
+
+    // A Memory cap with no rights passes the size check (`cap_info` needs
+    // none), and the kernel then refuses procmgr's map of it.
+    let argv_env = ArgvEnvCap::new(blob, 1, b"", 0)
+        .expect("building the argv/env cap failed")
+        .expect("a nonempty argv builds a cap");
+    let no_rights =
+        syscall::cap_derive(argv_env.cap(), 0).expect("deriving a rights-free argv/env cap failed");
+    let (file, size) = hello_file();
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(label)
+            .word(0, size)
+            .words(1, &[len, 1, 0, 0])
+            .cap(file)
+            .cap(no_rights)
+            .build(),
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_ARGV_ENV with a Memory cap that has no map right",
+    );
+
+    let (file, size) = hello_file();
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | (len << 32) | (1 << 48))
+            .word(0, size)
+            .bytes(1, blob)
+            .cap(file)
+            .build(),
+        procmgr_errors::INVALID_ARGUMENT,
+        "a create label with the former inline argv fields",
+    );
+
+    create_process_argv_env_refusals();
+}
+
+/// The `CREATE_PROCESS` side of [`argv_env_refusals`]: the same split and
+/// header checks, with the header at data word 0. Each refusal comes before
+/// procmgr maps the module, so a spare cap stands in for it; svctest holds no
+/// boot-module Memory cap, so no cell here spawns a child through
+/// `CREATE_PROCESS`.
+fn create_process_argv_env_refusals()
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use std::os::seraph::process::ArgvEnvCap;
+
+    let procmgr = startup_info().procmgr_endpoint;
+    let label = procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_ARGV_ENV;
+    let blob = b"/programs/hello\0";
+    let len = blob.len() as u64;
+    let page = syscall_abi::PAGE_SIZE;
+    let cells: [(&str, [u64; 4]); 2] = [
+        (
+            "CREATE_PROCESS with a header longer than its cap",
+            [page + 1, 1, 0, 0],
+        ),
+        (
+            "CREATE_PROCESS with an argv count its NULs disagree with",
+            [len, 2, 0, 0],
+        ),
+    ];
+    for (what, header) in cells
+    {
+        let argv_env = ArgvEnvCap::new(blob, 1, b"", 0)
+            .expect("building the argv/env cap failed")
+            .expect("a nonempty argv builds a cap");
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(label)
+                .words(0, &header)
+                .cap(spare_cap())
+                .cap(argv_env.cap())
+                .build(),
+            procmgr_errors::INVALID_ARGUMENT,
+            what,
+        );
+    }
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(label)
+            .words(0, &[len, 1, 0, 0])
+            .cap(spare_cap())
+            .build(),
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_PROCESS with CREATE_ARGV_ENV and only the module cap",
+    );
 }
 
 /// Sample windows [`procmgr_dma_hold_phase`] retries: memmgr's free-pool size

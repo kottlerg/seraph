@@ -80,12 +80,22 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 6;
+pub const PROCMGR_LABELS_VERSION: u32 = 7;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
+    // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
+    // defines a type and functions, imports the prelude the crate root
+    // imports.
+    #[cfg(feature = "rustc-dep-of-std")]
+    #[allow(unused_imports)]
+    use core::prelude::rust_2024::*;
+
     /// Create a new process from a boot module Memory cap. Caps: `[module,
-    /// creator_endpoint?]`. Stdio pipes (stdin/stdout/stderr) are
+    /// creator_endpoint?, argv_env?]`, the last present iff
+    /// [`CREATE_ARGV_ENV`] is set, with its [`ArgvEnvHeader`] in data words
+    /// `0..4`. Label layout as for [`CREATE_FROM_FILE`] (bit 17 is ignored).
+    /// Stdio pipes (stdin/stdout/stderr) are
     /// configured through one or more [`CONFIGURE_PIPE`] calls against
     /// the returned badged `process_handle` — procmgr's CREATE path
     /// carries no stdio caps so stdout and stderr can be piped
@@ -107,18 +117,16 @@ pub mod procmgr_labels
     /// * bits `[18..23]` — `CREATE_PRIORITY` (see [`CREATE_PRIORITY_SHIFT`])
     /// * bits `[23..28]` — `CREATE_BAND_MAX` (see [`CREATE_BAND_MAX_SHIFT`])
     /// * bit `28` — [`CREATE_DMA_HOLD`]
-    /// * bits `[29..32]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
-    /// * bits `[32..48]` — `args_bytes` (total byte length of the argv blob; u16)
-    /// * bits `[48..56]` — `args_count` (number of NUL-terminated argv strings; u8)
-    /// * bits `[56..64]` — `env_count` (number of NUL-terminated `KEY=VALUE` strings; u8)
+    /// * bit `29` — [`CREATE_ARGV_ENV`]
+    /// * bits `[30..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
     ///
     /// IPC data words:
     /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
-    /// * `word 1..1+argv_words` — argv blob, `args_bytes.div_ceil(8)` words
-    /// * `word 1+argv_words` — `env_bytes` (low 16 bits; only when `env_count > 0`)
-    /// * words after the env header — env blob, `env_bytes.div_ceil(8)` words
+    /// * `words 1..5` — the [`ArgvEnvHeader`] (only when [`CREATE_ARGV_ENV`] is set)
     ///
-    /// Caps: `[file_cap, creator_endpoint?, death_relay?]`. `file_cap`
+    /// Caps: `[file_cap, creator_endpoint?, argv_env?, death_relay?]`. The
+    /// `argv_env` Memory cap is present iff [`CREATE_ARGV_ENV`] is set, and
+    /// sits directly before the relay, or last without one. `file_cap`
     /// ownership transfers to procmgr: procmgr opens it (`FS_OPEN`) and
     /// `cap_delete`s it, then `FS_CLOSE`s and deletes its open after the load
     /// (success or failure); a request refused before the open deletes
@@ -142,7 +150,7 @@ pub mod procmgr_labels
     /// inherits it onto spawned threads. Set this flag only for a process
     /// that cannot depend on the fault path — a driver doing DMA, whose
     /// memory a device may write before a demand fault could back it.
-    /// Occupies bit 16 of the reserved `[16..32]` label window. init,
+    /// Occupies bit 16 of the `[16..30]` label window. init,
     /// memmgr, and procmgr are pre-pager and never routed through this
     /// binding path, so they are pinned by construction regardless.
     pub const CREATE_PINNED: u64 = 1 << 16;
@@ -154,8 +162,8 @@ pub mod procmgr_labels
     /// of the child's threads posts the fault class straight to the
     /// spawner's own death queue, letting `Child::wait()` return. procmgr
     /// `cap_delete`s its copy after the bind (the kernel captured the
-    /// `EventQueue` state at bind time). Occupies bit 17 of the reserved
-    /// `[16..32]` label window.
+    /// `EventQueue` state at bind time). Occupies bit 17 of the
+    /// `[16..30]` label window.
     pub const CREATE_DEATH_RELAY: u64 = 1 << 17;
     /// Bit offset of the `CREATE_PRIORITY` field (bits `[18..23]`) in a
     /// [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`] label: the priority level
@@ -164,8 +172,8 @@ pub mod procmgr_labels
     /// [`crate::sched_policy::DEFAULT_SPAWN_PRIORITY`] clamped to the
     /// child's band. A nonzero value must satisfy
     /// `1 <= priority <= band_max <= creator's band ceiling`; violations
-    /// reply `INVALID_ARGUMENT`. Occupies bits 18–22 of the reserved
-    /// `[16..32]` label window.
+    /// reply `INVALID_ARGUMENT`. Occupies bits 18–22 of the
+    /// `[16..30]` label window.
     pub const CREATE_PRIORITY_SHIFT: u32 = 18;
     /// Bit offset of the `CREATE_BAND_MAX` field (bits `[23..28]`): the
     /// upper bound of the baseline `SchedControl` band procmgr mints into
@@ -173,7 +181,7 @@ pub mod procmgr_labels
     /// `ProcessInfo.sched_control_cap`). `0` = unspecified — the child
     /// receives a copy of its creator's band. A nonzero value must not
     /// exceed the creator's band ceiling. Occupies bits 23–27 of the
-    /// reserved `[16..32]` label window.
+    /// `[16..30]` label window.
     pub const CREATE_BAND_MAX_SHIFT: u32 = 23;
     /// Width mask of each 5-bit scheduling field in the create label. Five
     /// bits hold every level of the kernel's 32-level priority space
@@ -190,13 +198,88 @@ pub mod procmgr_labels
     /// and never when it cannot. A child destroyed before
     /// [`START_PROCESS`] never ran and is reclaimed at once. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
-    /// (**DMA hold flag**). Occupies bit 28 of the `[16..32]` label window.
+    /// (**DMA hold flag**). Occupies bit 28 of the `[16..30]` label window.
     pub const CREATE_DMA_HOLD: u64 = 1 << 28;
-    /// Still-reserved bits `[29..32]` of the create-label window. Procmgr
-    /// rejects labels with any of these set (`INVALID_ARGUMENT`), so a
-    /// future field addition is provably additive: existing senders are
-    /// known to send zeros.
-    pub const CREATE_RESERVED_MASK: u64 = 0x7 << 29;
+    /// Label flag (bit 29) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
+    /// request carries the child's argv and env in a Memory cap the caller
+    /// sizes, the argv blob at byte 0 and the env blob directly after it, and
+    /// their [`ArgvEnvHeader`] in four data words (from word 0 for
+    /// `CREATE_PROCESS`, from word 1, after `file_size`, for
+    /// `CREATE_FROM_FILE`). The cap is the last cap before the death relay,
+    /// or the last cap without one. procmgr copies the blobs into the child's
+    /// argv/env region through fixed windows and deletes its copy of the cap
+    /// before it replies; the caller then returns the cap's run to memmgr,
+    /// unless the reply is `procmgr_errors::ARGV_ENV_STILL_MAPPED`. procmgr
+    /// replies that when it cannot unmap a copy window, which may then still
+    /// map the caller's pages read-only and the child's writable: it keeps
+    /// the window's VA reserved and withholds the child's memmgr record, and
+    /// the caller withholds its run, so memmgr re-grants no frame procmgr may
+    /// still map. A spawner that cannot unmap its own write window withholds
+    /// its run the same way.
+    /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
+    /// `CREATE_PROCESS` (**argv and env**).
+    pub const CREATE_ARGV_ENV: u64 = 1 << 29;
+    /// Still-reserved bits `[30..64]` of a create label. Procmgr rejects
+    /// labels with any of these set (`INVALID_ARGUMENT`), so a future field
+    /// addition is provably additive: existing senders are known to send
+    /// zeros.
+    pub const CREATE_RESERVED_MASK: u64 = !((1 << 30) - 1);
+    /// Data words an [`ArgvEnvHeader`] takes in a create request.
+    pub const ARGV_ENV_HEADER_WORDS: usize = 4;
+
+    /// The byte lengths and string counts of a create request's argv and env
+    /// blobs, carried in [`ARGV_ENV_HEADER_WORDS`] data words when the label
+    /// sets [`CREATE_ARGV_ENV`]. Each field is a full `u64`: a count cannot
+    /// exceed its blob's byte length (every string ends in its NUL), and the
+    /// lengths are bounded by the cap that carries them, so no blob outgrows
+    /// the fields.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ArgvEnvHeader
+    {
+        /// Byte length of the argv blob, at byte 0 of the cap.
+        pub args_bytes: u64,
+        /// NUL-terminated strings in the argv blob.
+        pub args_count: u64,
+        /// Byte length of the env blob, at byte `args_bytes` of the cap.
+        pub env_bytes: u64,
+        /// NUL-terminated `KEY=VALUE` strings in the env blob.
+        pub env_count: u64,
+    }
+
+    impl ArgvEnvHeader
+    {
+        /// The header's data words, in wire order.
+        #[must_use]
+        pub const fn to_words(self) -> [u64; ARGV_ENV_HEADER_WORDS]
+        {
+            [
+                self.args_bytes,
+                self.args_count,
+                self.env_bytes,
+                self.env_count,
+            ]
+        }
+
+        /// The header the data words `words` carry, in wire order.
+        #[must_use]
+        pub const fn from_words(words: [u64; ARGV_ENV_HEADER_WORDS]) -> Self
+        {
+            Self {
+                args_bytes: words[0],
+                args_count: words[1],
+                env_bytes: words[2],
+                env_count: words[3],
+            }
+        }
+
+        /// Both blobs' combined byte length, or `None` when the sum
+        /// overflows a `u64`.
+        #[must_use]
+        pub const fn total_bytes(self) -> Option<u64>
+        {
+            self.args_bytes.checked_add(self.env_bytes)
+        }
+    }
 
     /// Pack the scheduling fields of a [`CREATE_PROCESS`] /
     /// [`CREATE_FROM_FILE`] label. `0` in either field means
@@ -2741,6 +2824,14 @@ pub mod procmgr_errors
     /// Caller's cap lacks the required authority badge for a gated
     /// label (e.g. `REGISTER_DEATH_EQ` requires `DEATH_EQ_AUTHORITY`).
     pub const UNAUTHORIZED: u64 = 13;
+    /// A create with `procmgr_labels::CREATE_ARGV_ENV` failed because procmgr
+    /// could not unmap a window it copied the argv and env through, so it may
+    /// still map pages of the caller's argv/env run. The caller MUST NOT
+    /// return that run to memmgr (`RELEASE_MEMORY_CAPS`); it stays charged to
+    /// the caller until it exits. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
+    /// (**argv and env**).
+    pub const ARGV_ENV_STILL_MAPPED: u64 = 14;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }
@@ -2962,14 +3053,6 @@ pub mod blk_errors
 /// `PATH_MAX`) only refuses a recipe whose path is longer than any recipe
 /// written for this tree, whose paths are tens of bytes.
 pub const MAX_PATH_LEN: usize = 4096;
-
-/// Maximum argv blob size in bytes across an IPC. Constrained by
-/// `MSG_DATA_WORDS_MAX * 8 = 512` (full data area). 256 comfortably fits
-/// typical service-argv cases and leaves slack for any other words a
-/// message body may carry. The `ProcessInfo` page can hold more, but
-/// expanding this also requires extending the label encoding
-/// (currently 16 bits).
-pub const ARGS_BLOB_MAX: usize = 256;
 
 // ── IpcMessage ──────────────────────────────────────────────────────────────
 

@@ -14,6 +14,7 @@ use death_set::DeathSet;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
+use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use syscall_abi::{EXIT_KILLED, FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
@@ -176,17 +177,16 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
     }
 }
 
-// Pure process-table, badge, recent-exit, and create-request blob logic
-// (`ChildArgs`, `ChildEnv`, `CreateBlobs`) lives in the host-testable
-// `procmgr-process-table` crate; the syscall/IPC-bearing operations below
-// stay in the service and drive its lookups. Re-exported so the
-// `process::{ProcessTable, ProcessEntry, RecentExits}` paths
-// `main.rs` uses, and its `process::CreateBlobs::extract` and
-// `process::split_create_from_file_caps` call sites in the create handlers,
-// resolve through this module.
+// Pure process-table, badge, recent-exit, and create-request argv/env logic
+// (`decode_header`, `checked_total`, `ArgvEnvTally`) lives in the
+// host-testable `procmgr-process-table` crate; the syscall/IPC-bearing
+// operations below stay in the service and drive its lookups. Re-exported so
+// the `process::{ProcessTable, ProcessEntry, RecentExits}` paths `main.rs`
+// uses, and its `process::split_create_caps` call sites in the create
+// handlers, resolve through this module.
 pub use process_table::{
-    ChildArgs, ChildEnv, CreateBlobs, DmaHolds, ProcessEntry, ProcessTable, RecentExits,
-    badge_is_acceptable, resolve_spawn_sched, split_create_from_file_caps,
+    ArgvEnvRefusal, CreateTailCaps, DmaHolds, ProcessEntry, ProcessTable, RecentExits,
+    badge_is_acceptable, resolve_spawn_sched, split_create_caps,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -558,7 +558,512 @@ pub struct MainTls
     pub base_va: u64,
 }
 
-/// Populate a `ProcessInfo` page for a child process and map it read-only.
+/// Pages procmgr maps at once while it copies a create request's argv and
+/// env: the caller's pages and the child's each pass through one window of
+/// this many pages, re-mapped for every chunk.
+///
+/// The window bounds procmgr's own page-table cost per create, which no
+/// spawner funds, to the tables two 256 KiB spans need, whatever the blobs'
+/// size; a larger window only saves map calls. The blobs themselves are
+/// bounded by `process_abi::ARGV_ENV_MAX_PAGES` alone.
+const ARGV_ENV_COPY_WINDOW_PAGES: u64 = 64;
+
+/// The argv and env a create request carries: the caller's Memory cap and
+/// its header, bounded by the cap and the argv/env region
+/// ([`check_argv_env`]). The cap stays the handler's to delete.
+pub struct ArgvEnvRequest
+{
+    cap: u64,
+    header: ipc::procmgr_labels::ArgvEnvHeader,
+    total: u64,
+}
+
+/// Check the argv and env of a create request that sets `CREATE_ARGV_ENV`:
+/// decode the header at data word `first_word` and bound the blobs by
+/// `argv_env_cap`'s size and by `process_abi::ARGV_ENV_MAX_BYTES`. Maps and
+/// acquires nothing, so the handler calls it before any resource and replies
+/// `INVALID_ARGUMENT` on `Err`; the strings are checked on the child's copy
+/// ([`copy_argv_env`]).
+///
+/// # Errors
+/// The [`ArgvEnvRefusal`] the header earns, and [`ArgvEnvRefusal::NotMemory`]
+/// when `argv_env_cap` is not a Memory cap.
+pub fn check_argv_env(
+    req: &IpcMessage,
+    first_word: usize,
+    argv_env_cap: u64,
+) -> Result<ArgvEnvRequest, ArgvEnvRefusal>
+{
+    let header = process_table::decode_header(req, first_word)?;
+    let cap_bytes = syscall::cap_info(argv_env_cap, syscall_abi::CAP_INFO_MEMORY_SIZE)
+        .map_err(|_| ArgvEnvRefusal::NotMemory)?;
+    let total = process_table::checked_total(header, cap_bytes, process_abi::ARGV_ENV_MAX_BYTES)?;
+    Ok(ArgvEnvRequest {
+        cap: argv_env_cap,
+        header,
+        total,
+    })
+}
+
+/// A child's argv/env region before it is mapped: the checked copy of the
+/// blobs in pages on the child's memmgr account, and the header that locates
+/// them. `memory` is zero, and nothing is mapped, for a child without argv
+/// or env.
+pub struct ChildArgvEnv
+{
+    memory: CapGuard,
+    pages: u64,
+    header: ipc::procmgr_labels::ArgvEnvHeader,
+}
+
+impl ChildArgvEnv
+{
+    /// The region of a child created without argv and env.
+    pub fn empty() -> Self
+    {
+        Self {
+            memory: CapGuard::new(0),
+            pages: 0,
+            header: ipc::procmgr_labels::ArgvEnvHeader::default(),
+        }
+    }
+}
+
+/// Why [`copy_argv_env`] took no copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgvEnvCopyError
+{
+    /// The create fails with this `procmgr_errors` code; everything
+    /// [`copy_argv_env`] acquired is released.
+    Reply(u64),
+    /// A copy window's unmap failed, so pages of the child's run (writable)
+    /// and of the caller's (read-only) may still be mapped in procmgr. The
+    /// window's VA stays reserved; the handler withholds the child's memmgr
+    /// record (it sends no `PROCESS_DIED`) and replies
+    /// `ARGV_ENV_STILL_MAPPED`, on which the caller withholds its run, so
+    /// memmgr re-grants no frame procmgr may still map.
+    StillMapped,
+}
+
+impl ArgvEnvCopyError
+{
+    /// The `procmgr_errors` code the create replies.
+    pub fn code(self) -> u64
+    {
+        match self
+        {
+            Self::Reply(code) => code,
+            Self::StillMapped => procmgr_errors::ARGV_ENV_STILL_MAPPED,
+        }
+    }
+}
+
+/// Release the child's memmgr registration `mms` after [`copy_argv_env`]
+/// failed with `e`: retire the record (`PROCESS_DIED`, which returns every
+/// page billed to the child) for a [`ArgvEnvCopyError::Reply`], and withhold
+/// it, slot and record kept, for [`ArgvEnvCopyError::StillMapped`], so
+/// memmgr keeps out of its pool the frames procmgr may still map.
+pub fn settle_failed_argv_env(mms: MemmgrSendGuard, e: ArgvEnvCopyError)
+{
+    if e == ArgvEnvCopyError::StillMapped
+    {
+        std::os::seraph::log!(
+            "argv/env copy left pages mapped; the child's memmgr record is withheld"
+        );
+        let _ = mms.disarm();
+    }
+}
+
+/// A failed map of [`CopyWindows::map`]: which window, and the kernel's
+/// error.
+enum WindowMapError
+{
+    /// The caller's pages (`src`): the error says whose fault it is.
+    Src(i64),
+    /// The child's pages (`dst`), which procmgr allocated: procmgr's
+    /// resources ran out.
+    Dst,
+}
+
+/// Two VA windows of [`ARGV_ENV_COPY_WINDOW_PAGES`] pages in procmgr's own
+/// address space, the caller's and the child's pages mapped through them a
+/// chunk at a time. Dropping it unmaps whatever is mapped and releases the
+/// VA, unless an unmap failed (`stuck`): the VA then stays reserved, so no
+/// later reservation lands on pages still mapped there.
+struct CopyWindows
+{
+    self_aspace: u64,
+    src: Option<ReservedRange>,
+    dst: Option<ReservedRange>,
+    mapped: u64,
+    stuck: bool,
+}
+
+impl CopyWindows
+{
+    fn reserve(self_aspace: u64) -> Result<Self, ArgvEnvCopyError>
+    {
+        let oom = ArgvEnvCopyError::Reply(procmgr_errors::OUT_OF_MEMORY);
+        let src = reserve_pages(ARGV_ENV_COPY_WINDOW_PAGES).map_err(|_| oom)?;
+        let Ok(dst) = reserve_pages(ARGV_ENV_COPY_WINDOW_PAGES)
+        else
+        {
+            unreserve_pages(src);
+            return Err(oom);
+        };
+        Ok(Self {
+            self_aspace,
+            src: Some(src),
+            dst: Some(dst),
+            mapped: 0,
+            stuck: false,
+        })
+    }
+
+    fn src_va(&self) -> u64
+    {
+        self.src.as_ref().map_or(0, ReservedRange::va_start)
+    }
+
+    fn dst_va(&self) -> u64
+    {
+        self.dst.as_ref().map_or(0, ReservedRange::va_start)
+    }
+
+    /// Map `pages` pages, from page `offset` of each cap, at the two windows:
+    /// `src` read-only, `dst` writable. The kernel maps page by page and stops
+    /// at the first failure, so a failed map unmaps both windows' whole
+    /// `pages`-page spans (unmapping a page that was never mapped is
+    /// harmless) before it returns; an unmap that fails leaves `stuck` set.
+    fn map(&mut self, src: u64, dst: u64, offset: u64, pages: u64) -> Result<(), WindowMapError>
+    {
+        self.unmap();
+        let (aspace, src_va, dst_va) = (self.self_aspace, self.src_va(), self.dst_va());
+        self.mapped = pages;
+        // SAFETY: the window is a reservation from procmgr's arena that this
+        // value owns, `pages` is at most its size, and no Rust object or IPC
+        // page lies in it; the only accesses to it are the raw-pointer reads
+        // of `copy_argv_chunk`, while it is mapped.
+        let src_mapped =
+            unsafe { syscall::mem_map(src, aspace, src_va, offset, pages, syscall::MAP_FROM_CAP) };
+        let mapped = if let Err(code) = src_mapped
+        {
+            Err(WindowMapError::Src(code))
+        }
+        else
+        {
+            // SAFETY: as for the source window, with the raw-pointer writes
+            // of `copy_argv_chunk`.
+            let dst_mapped = unsafe {
+                syscall::mem_map(dst, aspace, dst_va, offset, pages, syscall::MAP_WRITABLE)
+            };
+            dst_mapped.map_err(|_| WindowMapError::Dst)
+        };
+        if mapped.is_err()
+        {
+            self.unmap();
+        }
+        mapped
+    }
+
+    /// Unmap both windows' last-mapped spans, setting `stuck` when an unmap
+    /// fails.
+    fn unmap(&mut self)
+    {
+        if self.mapped == 0
+        {
+            return;
+        }
+        // SAFETY: the windows are this value's own reservations, each mapped
+        // at most `mapped` pages by `map`; nothing references them.
+        let (src, dst) = unsafe {
+            (
+                syscall::mem_unmap(self.self_aspace, self.src_va(), self.mapped),
+                syscall::mem_unmap(self.self_aspace, self.dst_va(), self.mapped),
+            )
+        };
+        self.stuck |= src.is_err() || dst.is_err();
+        self.mapped = 0;
+    }
+}
+
+impl Drop for CopyWindows
+{
+    fn drop(&mut self)
+    {
+        self.unmap();
+        if self.stuck
+        {
+            std::os::seraph::log!("argv/env copy window unmap failed; its VA stays reserved");
+            return;
+        }
+        if let Some(src) = self.src.take()
+        {
+            unreserve_pages(src);
+        }
+        if let Some(dst) = self.dst.take()
+        {
+            unreserve_pages(dst);
+        }
+    }
+}
+
+/// Copy the blobs `request` describes into fresh pages on the child's memmgr
+/// account (`child_memmgr_send`), through [`CopyWindows`], and check their
+/// strings on the copy ([`process_table::ArgvEnvTally`]).
+///
+/// The caller's pages are read only by raw-pointer copies into the child's
+/// pages, which no one else maps yet, so a caller that rewrites its pages
+/// meanwhile changes only what the child receives, and the check covers
+/// exactly that.
+///
+/// # Errors
+/// [`ArgvEnvCopyError::Reply`] with `INVALID_ARGUMENT` when the copy fails
+/// its string check or the kernel refuses the caller's pages for a reason
+/// other than procmgr's memory (no map right, retyped bytes in the range),
+/// and with `OUT_OF_MEMORY` when memmgr cannot supply the pages or procmgr
+/// cannot derive its caps or reserve or map its windows;
+/// [`ArgvEnvCopyError::StillMapped`] when a window's unmap failed.
+pub fn copy_argv_env(
+    self_aspace: u64,
+    child_memmgr_send: u64,
+    ipc_buf: *mut u64,
+    request: &ArgvEnvRequest,
+) -> Result<ChildArgvEnv, ArgvEnvCopyError>
+{
+    use ArgvEnvCopyError::Reply;
+
+    if request.total == 0
+    {
+        return Ok(ChildArgvEnv::empty());
+    }
+    let pages = request.total.div_ceil(PAGE_SIZE);
+    let (memory, src, dst) = copy_caps(child_memmgr_send, ipc_buf, request.cap, pages)?;
+    let mut windows = CopyWindows::reserve(self_aspace)?;
+    let mut tally = process_table::ArgvEnvTally::new(request.header);
+    let mut offset = 0;
+    let mut copied = Ok(());
+    while offset < pages && copied.is_ok()
+    {
+        let chunk_pages = (pages - offset).min(ARGV_ENV_COPY_WINDOW_PAGES);
+        copied = copy_argv_chunk(
+            &mut windows,
+            &src,
+            &dst,
+            offset,
+            chunk_pages,
+            request,
+            &mut tally,
+        );
+        offset += chunk_pages;
+    }
+    let stuck = windows.stuck;
+    drop(windows);
+    if stuck
+    {
+        return Err(ArgvEnvCopyError::StillMapped);
+    }
+    copied?;
+    tally.finish().map_err(|refusal| {
+        std::os::seraph::log!("create argv/env refused: {refusal:?}");
+        Reply(procmgr_errors::INVALID_ARGUMENT)
+    })?;
+    Ok(ChildArgvEnv {
+        memory,
+        pages,
+        header: request.header,
+    })
+}
+
+/// The caps [`copy_argv_env`] copies through: the child's fresh run of
+/// `pages` pages on its memmgr account, a map-only derivation of the
+/// caller's `request_cap`, and a writable derivation of the child's run.
+///
+/// # Errors
+/// [`ArgvEnvCopyError::Reply`] with `OUT_OF_MEMORY` when memmgr cannot
+/// supply the run or a derivation fails. A derivation masks rights the
+/// source lacks rather than refusing them, so its failure is procmgr's own
+/// slot shortfall; a caller's cap without the map right is refused when its
+/// window is mapped.
+fn copy_caps(
+    child_memmgr_send: u64,
+    ipc_buf: *mut u64,
+    request_cap: u64,
+    pages: u64,
+) -> Result<(CapGuard, CapGuard, CapGuard), ArgvEnvCopyError>
+{
+    let oom = ArgvEnvCopyError::Reply(procmgr_errors::OUT_OF_MEMORY);
+    let memory = CapGuard::new(
+        crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf).ok_or(oom)?,
+    );
+    let src =
+        CapGuard::new(syscall::cap_derive(request_cap, syscall::RIGHTS_MEM_MAP).map_err(|_| oom)?);
+    let dst = CapGuard::new(
+        syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW).map_err(|_| oom)?,
+    );
+    Ok((memory, src, dst))
+}
+
+/// Copy the `chunk_pages` pages of the blobs from page `offset` through
+/// `windows`, zero the child's page tail past the blobs, and feed the copy to
+/// `tally`.
+///
+/// # Errors
+/// [`ArgvEnvCopyError::Reply`] with `OUT_OF_MEMORY` when a window map fails
+/// for want of procmgr's resources, and with `INVALID_ARGUMENT` when the
+/// kernel refuses the caller's pages for any other reason.
+fn copy_argv_chunk(
+    windows: &mut CopyWindows,
+    src: &CapGuard,
+    dst: &CapGuard,
+    offset: u64,
+    chunk_pages: u64,
+    request: &ArgvEnvRequest,
+    tally: &mut process_table::ArgvEnvTally,
+) -> Result<(), ArgvEnvCopyError>
+{
+    windows
+        .map(src.cap(), dst.cap(), offset, chunk_pages)
+        .map_err(|e| match e
+        {
+            WindowMapError::Src(code) if code != SyscallError::OutOfMemory as i64 =>
+            {
+                ArgvEnvCopyError::Reply(procmgr_errors::INVALID_ARGUMENT)
+            }
+            WindowMapError::Src(_) | WindowMapError::Dst =>
+            {
+                ArgvEnvCopyError::Reply(procmgr_errors::OUT_OF_MEMORY)
+            }
+        })?;
+    let chunk_bytes = (chunk_pages * PAGE_SIZE) as usize;
+    let blob_bytes = (request.total - offset * PAGE_SIZE).min(chunk_bytes as u64) as usize;
+    // SAFETY: both windows map `chunk_pages` pages just above, `src`
+    // read-only and `dst` writable for procmgr alone (the child is not
+    // running and maps no page of the child's run yet), and they do not
+    // overlap. The caller's bytes are read only by this raw copy, never
+    // through a reference, since the caller may write them concurrently; the
+    // slice covers only the child's window, which nothing else writes while
+    // it lives, until the next `map`.
+    let dst_bytes = unsafe {
+        core::ptr::copy_nonoverlapping(
+            windows.src_va() as *const u8,
+            windows.dst_va() as *mut u8,
+            blob_bytes,
+        );
+        core::slice::from_raw_parts_mut(windows.dst_va() as *mut u8, chunk_bytes)
+    };
+    // The page tail past the blobs carries no earlier owner's bytes.
+    dst_bytes[blob_bytes..].fill(0);
+    tally.feed(&dst_bytes[..blob_bytes]);
+    Ok(())
+}
+
+/// Pages of argv/env region a child's seed page-table pool covers without
+/// funding: one last-level table's span. The region starts on the page after
+/// the `ProcessInfo` page, so a region this size needs at most one
+/// last-level table beyond the page's own, plus one table for each upper
+/// level whose boundary it crosses, which the spare pages of the child's
+/// seed pool (`ASPACE_RETYPE_PAGES`) hold; a larger region is funded in full
+/// by [`fund_child_page_tables`].
+const ARGV_ENV_SEED_COVERED_PAGES: u64 = 512;
+
+/// Add to `child_aspace`'s page-table pool, from pages on the child's memmgr
+/// account, the tables a `pages`-page argv/env region needs: one last-level
+/// table per 512 pages plus the region's boundary and upper-level tables.
+/// The whole need is added, so the region leaves the pool's existing budget
+/// to the child's other surfaces. A region of at most
+/// [`ARGV_ENV_SEED_COVERED_PAGES`] adds nothing.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when memmgr cannot supply the pages or the augment fails.
+fn fund_child_page_tables(
+    child_aspace: u64,
+    child_memmgr_send: u64,
+    pages: u64,
+    ipc_buf: *mut u64,
+) -> Result<(), u64>
+{
+    if pages <= ARGV_ENV_SEED_COVERED_PAGES
+    {
+        return Ok(());
+    }
+    let table_pages = pages.div_ceil(512) + 4;
+    let frame = CapGuard::new(
+        crate::memmgr_alloc_pages_contig(child_memmgr_send, table_pages, ipc_buf)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?,
+    );
+    // The address space's donation record holds its own reference on the
+    // frames, so procmgr's slot is deleted when `frame` drops.
+    syscall::cap_create_aspace(frame.cap(), child_aspace, table_pages)
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    Ok(())
+}
+
+/// Map `argv_env`'s pages read-only into `child_aspace` directly after the
+/// `ProcessInfo` page (`process_abi::ARGV_ENV_REGION_OFFSET`), funding the
+/// child's page tables for them first.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when the funding, the derivation, or the map fails.
+///
+/// # Safety
+/// `child_aspace` must name a child's address space, never procmgr's own:
+/// the function maps pages into it, at the VA the child's layout leaves after
+/// its `ProcessInfo` page, without checking what procmgr holds there.
+unsafe fn map_child_argv_env(
+    child_aspace: u64,
+    child_memmgr_send: u64,
+    ipc_buf: *mut u64,
+    argv_env: &ChildArgvEnv,
+    layout: &ProcessLayout,
+) -> Result<(), u64>
+{
+    fund_child_page_tables(child_aspace, child_memmgr_send, argv_env.pages, ipc_buf)?;
+    let ro = CapGuard::new(
+        syscall::cap_derive(argv_env.memory.cap(), syscall::RIGHTS_MEM_MAP)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
+    );
+    // SAFETY: the caller's contract: `child_aspace` is a child's address
+    // space, never procmgr's own, so the map changes nothing procmgr runs on.
+    // The region lies inside the tail every layout leaves after the
+    // `ProcessInfo` page (`process-layout` pins `1 + ARGV_ENV_MAX_PAGES` to it,
+    // and `check_argv_env` bounded the pages by `ARGV_ENV_MAX_BYTES`). A
+    // partial map is torn down with the child's address space when the
+    // create fails.
+    unsafe {
+        syscall::mem_map(
+            ro.cap(),
+            child_aspace,
+            layout.process_info_va + process_abi::ARGV_ENV_REGION_OFFSET,
+            0,
+            argv_env.pages,
+            syscall::MAP_FROM_CAP,
+        )
+    }
+    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)
+}
+
+/// The Memory caps [`populate_child_info`] leaves the child's table entry:
+/// the `ProcessInfo` page's and the argv/env region's (zero without one).
+/// Both guarded, so a later failure of the create releases them.
+struct ChildInfoCaps
+{
+    pi_memory: CapGuard,
+    argv_env_memory: CapGuard,
+}
+
+impl ChildInfoCaps
+{
+    /// Hand both caps to the child's table entry, which now owns them.
+    fn disarm(self)
+    {
+        let _ = self.pi_memory.disarm();
+        let _ = self.argv_env_memory.disarm();
+    }
+}
+
+/// Populate a `ProcessInfo` page for a child process and map it read-only,
+/// with the argv/env region after it when `argv_env` carries any bytes.
 ///
 /// Installs the creator endpoint cap (if any) and the procmgr service
 /// endpoint into the child `CSpace` and records their slots in the child's
@@ -594,14 +1099,13 @@ unsafe fn populate_child_info(
     creator_endpoint: u64,
     universals: &UniversalCaps,
     tls: &ChildTlsTemplate,
-    args: &ChildArgs<'_>,
-    env: &ChildEnv<'_>,
+    argv_env: ChildArgvEnv,
     ipc_buf: *mut u64,
     stack_pages: u32,
     process_badge: u64,
     sched: ChildSched,
     layout: &ProcessLayout,
-) -> Option<u64>
+) -> Option<ChildInfoCaps>
 {
     // Guarded from allocation: every early `None` below deletes the slot.
     let pi_memory = CapGuard::new(crate::memmgr_alloc_page(
@@ -822,66 +1326,49 @@ unsafe fn populate_child_info(
     // The pager fields stay zero here: `finalize_creation` writes them only
     // once the pager binding has taken effect (`advertise_pager`).
 
-    // Write the argv blob, then the env blob, into the page region
-    // following the struct. Each blob begins at a u64-aligned offset so
-    // std can read whole words safely; both must fit inside the remaining
-    // page bytes — caller validates size before reaching here.
-    let pi_size = core::mem::size_of::<process_abi::ProcessInfo>() as u64;
-    let args_offset = (pi_size + 7) & !7;
-    let args_end = if args.count > 0 && !args.blob.is_empty()
+    // The argv blob, then the env blob, live in the argv/env region directly
+    // after this page; the offsets locate them from the page base. An empty
+    // blob is recorded as absent (offset, length and count zero).
+    if argv_env.pages != 0
     {
-        let blob_len = args.blob.len() as u64;
-        if args_offset + blob_len > PAGE_SIZE
-        {
-            return None;
-        }
-        // SAFETY: range within the mapped page; source is plain bytes.
+        // SAFETY: the caller's contract: `child_aspace` is a child's address
+        // space, never procmgr's own.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                args.blob.as_ptr(),
-                (scratch_va + args_offset) as *mut u8,
-                args.blob.len(),
-            );
+            map_child_argv_env(
+                child_aspace,
+                universals.memmgr_endpoint,
+                ipc_buf,
+                &argv_env,
+                layout,
+            )
         }
-        pi.args_offset = args_offset as u32;
-        pi.args_bytes = args.blob.len() as u32;
-        pi.args_count = args.count;
-        args_offset + blob_len
+        .ok()?;
+    }
+    let h = argv_env.header;
+    (pi.args_offset, pi.args_bytes, pi.args_count) = if h.args_bytes == 0
+    {
+        (0, 0, 0)
     }
     else
     {
-        pi.args_offset = 0;
-        pi.args_bytes = 0;
-        pi.args_count = 0;
-        args_offset
+        (
+            process_abi::ARGV_ENV_REGION_OFFSET,
+            h.args_bytes,
+            h.args_count,
+        )
     };
-
-    let env_offset = (args_end + 7) & !7;
-    if env.count > 0 && !env.blob.is_empty()
+    (pi.env_offset, pi.env_bytes, pi.env_count) = if h.env_bytes == 0
     {
-        let blob_len = env.blob.len() as u64;
-        if env_offset + blob_len > PAGE_SIZE
-        {
-            return None;
-        }
-        // SAFETY: range within the mapped page; source is plain bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                env.blob.as_ptr(),
-                (scratch_va + env_offset) as *mut u8,
-                env.blob.len(),
-            );
-        }
-        pi.env_offset = env_offset as u32;
-        pi.env_bytes = env.blob.len() as u32;
-        pi.env_count = env.count;
+        (0, 0, 0)
     }
     else
     {
-        pi.env_offset = 0;
-        pi.env_bytes = 0;
-        pi.env_count = 0;
-    }
+        (
+            process_abi::ARGV_ENV_REGION_OFFSET + h.args_bytes,
+            h.env_bytes,
+            h.env_count,
+        )
+    };
 
     drop(scratch);
 
@@ -899,10 +1386,14 @@ unsafe fn populate_child_info(
         )
     }
     .ok()?;
-    // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
-    // cascades to any descendants); the mapping doesn't need pi_ro to
-    // outlive this call, so its guard deletes it on return.
-    Some(pi_memory.disarm())
+    // pi_memory and argv_env_memory stay in procmgr's CSpace as the teardown
+    // handles (revoke cascades to any descendants); the mappings don't need
+    // the map-only derivations to outlive this call, so their guards delete
+    // them on return.
+    Some(ChildInfoCaps {
+        pi_memory,
+        argv_env_memory: argv_env.memory,
+    })
 }
 
 /// Intermediate state returned by [`alloc_main_tls_memory`] — a memory cap
@@ -1308,7 +1799,7 @@ fn finalize_creation(
     child_aspace: u64,
     child_cspace: u64,
     child_thread: u64,
-    pi_memory_cap: u64,
+    info_caps: &ChildInfoCaps,
     entry_point: u64,
     main_tls: MainTls,
     table: &mut ProcessTable,
@@ -1327,6 +1818,7 @@ fn finalize_creation(
 ) -> Option<CreateResult>
 {
     let badge = process_badge;
+    let pi_memory_cap = info_caps.pi_memory.cap();
 
     // Bind a death observer from procmgr's death queues on the child's main
     // thread. Correlator = the table badge; on death, dispatch_death recovers
@@ -1372,6 +1864,7 @@ fn finalize_creation(
             thread_cap: child_thread,
             pi_memory_cap,
             tls_memory_cap: main_tls.memory_cap,
+            argv_env_memory_cap: info_caps.argv_env_memory.cap(),
             memmgr_send_cap,
             memmgr_badge,
             namespace_override: 0,
@@ -1531,8 +2024,7 @@ fn create_process_from_bytes(
     self_endpoint: u64,
     creator_endpoint: u64,
     universals: &UniversalCaps,
-    args: &ChildArgs<'_>,
-    env: &ChildEnv<'_>,
+    argv_env: ChildArgvEnv,
     deaths: &DeathSet,
     sched: ChildSched,
     ipc_buf: *mut u64,
@@ -1724,7 +2216,7 @@ fn create_process_from_bytes(
     let process_badge = next_process_badge(table)?;
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
-    let pi_memory = CapGuard::new(unsafe {
+    let info_caps = unsafe {
         populate_child_info(
             self_aspace,
             child_aspace,
@@ -1733,15 +2225,14 @@ fn create_process_from_bytes(
             creator_endpoint,
             universals,
             &tls_template,
-            args,
-            env,
+            argv_env,
             ipc_buf,
             stack_pages,
             process_badge,
             sched,
             &layout,
         )
-    }?);
+    }?;
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     unsafe {
@@ -1760,7 +2251,7 @@ fn create_process_from_bytes(
         child_aspace,
         child_cspace,
         child_thread,
-        pi_memory.cap(),
+        &info_caps,
         entry,
         main_tls,
         table,
@@ -1780,7 +2271,7 @@ fn create_process_from_bytes(
         self_aspace,
     )?;
     let _ = child_objs.disarm();
-    let _ = pi_memory.disarm();
+    info_caps.disarm();
     let _ = main_tls_memory.disarm();
     Some(result)
 }
@@ -1798,8 +2289,7 @@ pub fn create_process(
     self_endpoint: u64,
     creator_endpoint: u64,
     universals: &UniversalCaps,
-    args: &ChildArgs<'_>,
-    env: &ChildEnv<'_>,
+    argv_env: ChildArgvEnv,
     deaths: &DeathSet,
     sched: ChildSched,
 ) -> Option<CreateResult>
@@ -1821,8 +2311,7 @@ pub fn create_process(
         self_endpoint,
         creator_endpoint,
         universals,
-        args,
-        env,
+        argv_env,
         deaths,
         sched,
         ipc_buf,
@@ -2315,14 +2804,21 @@ fn stream_segment_bytes(
         };
         let chunk_len = range.len().min(total - copied);
 
+        let dst = &mut buf[dest_offset + copied..dest_offset + copied + chunk_len];
         // SAFETY: `mapping.va()` covers PAGE_SIZE bytes mapped read-only;
         // `cache_page_range` checked `range.start + range.len() <= PAGE_SIZE`,
-        // and `chunk_len <= range.len()`. `src` is last used in the copy below,
-        // before `mapping` is dropped.
-        let src = unsafe {
-            core::slice::from_raw_parts((mapping.va() as *const u8).add(range.start), chunk_len)
-        };
-        buf[dest_offset + copied..dest_offset + copied + chunk_len].copy_from_slice(src);
+        // and `chunk_len <= range.len()`, so the source span lies in the
+        // mapping, which is dropped only after the copy. The page is the fs
+        // driver's cache page, which the driver may write while procmgr reads
+        // it, so no Rust reference is formed over it: the bytes are copied by
+        // raw pointer into procmgr's own `dst`, which does not overlap it.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (mapping.va() as *const u8).add(range.start),
+                dst.as_mut_ptr(),
+                chunk_len,
+            );
+        }
         drop(mapping);
         vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
         copied += chunk_len;
@@ -2374,8 +2870,7 @@ pub fn create_process_from_file(
     table: &mut ProcessTable,
     ipc_buf: *mut u64,
     creator_endpoint: u64,
-    args: &ChildArgs<'_>,
-    env: &ChildEnv<'_>,
+    argv_env: Option<&ArgvEnvRequest>,
     deaths: &DeathSet,
     demand_paged: bool,
     parent_relay_cap: u64,
@@ -2409,6 +2904,22 @@ pub fn create_process_from_file(
     {
         return Err(procmgr_errors::OUT_OF_MEMORY);
     }
+
+    // The child's checked copy of the request's argv and env, on its account;
+    // a malformed blob refuses the create here, before any other resource.
+    let argv_env = match argv_env
+    {
+        Some(request) => match copy_argv_env(self_aspace, mms.cap(), ipc_buf, request)
+        {
+            Ok(argv_env) => argv_env,
+            Err(e) =>
+            {
+                settle_failed_argv_env(mms, e);
+                return Err(e.code());
+            }
+        },
+        None => ChildArgvEnv::empty(),
+    };
 
     // Allocate one memory cap for the ELF header page. `ScratchMapping::map`
     // takes ownership of the memory cap via `set_owns_cap` so the mapping's
@@ -2679,7 +3190,7 @@ pub fn create_process_from_file(
     let process_badge = next_process_badge(table).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     // SAFETY: `child_objs.aspace()` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
-    let pi_memory_cap = unsafe {
+    let info_caps = unsafe {
         populate_child_info(
             self_aspace,
             child_objs.aspace(),
@@ -2688,8 +3199,7 @@ pub fn create_process_from_file(
             creator_endpoint,
             &universals,
             &tls_template,
-            args,
-            env,
+            argv_env,
             ipc_buf,
             stack_pages,
             process_badge,
@@ -2698,7 +3208,6 @@ pub fn create_process_from_file(
         )
     }
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
-    let pi_memory_guard = CapGuard::new(pi_memory_cap);
 
     // SAFETY: `child_objs.aspace()` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
@@ -2728,7 +3237,7 @@ pub fn create_process_from_file(
         child_objs.aspace(),
         child_objs.cspace(),
         child_objs.thread(),
-        pi_memory_guard.cap(),
+        &info_caps,
         entry,
         main_tls_for_finalize,
         table,
@@ -2750,7 +3259,7 @@ pub fn create_process_from_file(
     {
         let _ = child_objs.disarm();
         let _ = mms.disarm();
-        let _ = pi_memory_guard.disarm();
+        info_caps.disarm();
         let _ = main_tls_memory_guard.disarm();
     }
     result
@@ -2870,8 +3379,8 @@ pub fn teardown_entry(
     // Order: thread first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables. Then cspace (which
     // owns every cap the child held) before aspace (whose dealloc walks the
-    // page tables). pi_memory last — it was a leaf resource the child used
-    // read-only; no other object references it.
+    // page tables). pi_memory and the argv/env region last — leaf resources
+    // the child used read-only; no other object references them.
     let _ = syscall::cap_revoke_all(entry.thread_cap);
     let _ = syscall::cap_delete(entry.thread_cap);
     let _ = syscall::cap_revoke_all(entry.cspace_cap);
@@ -2880,6 +3389,11 @@ pub fn teardown_entry(
     let _ = syscall::cap_delete(entry.aspace_cap);
     let _ = syscall::cap_revoke_all(entry.pi_memory_cap);
     let _ = syscall::cap_delete(entry.pi_memory_cap);
+    if entry.argv_env_memory_cap != 0
+    {
+        let _ = syscall::cap_revoke_all(entry.argv_env_memory_cap);
+        let _ = syscall::cap_delete(entry.argv_env_memory_cap);
+    }
     if entry.tls_memory_cap != 0
     {
         let _ = syscall::cap_revoke_all(entry.tls_memory_cap);

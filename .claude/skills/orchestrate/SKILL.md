@@ -279,7 +279,8 @@ evidence in the closing comment).
 A worker's worktree carries a built `target/` (several GiB), and the harness removes only an
 unchanged worktree (`.claude/agents/worker.md` § Reporting), so every other worktree persists
 until you remove it. Removal is the orchestrator's mechanic, in two places, and only for
-worktrees this batch spawned: the ones the record file lists, under `.claude/worktrees/`.
+worktrees this batch spawned: the ones the record file lists, under `.claude/worktrees/` (an
+unlisted one is removed only on the maintainer's word, below).
 
 - **At a worker's retirement:** after its last PR merges (or its gate report, when it has no
   PR left to merge) and nothing is left for it (§ Merge order and the gate), remove its
@@ -295,7 +296,8 @@ maintainer any worktree that fails one:
 - The records precondition: `target/xtask/review/pr<N>/` exists in your checkout for each of
   the worker's PRs and holds the records of every run the worker reported, since those records
   exist nowhere else once the worktree is gone (§ Failure modes). Copy any that are missing
-  from the worktree, or ask the worker to, and then remove.
+  from the worktree, or ask the worker to; the worktree fails the condition, and is skipped and
+  reported, only when they cannot be obtained.
 - Nothing unsaved or unpushed: `git -C <path> status --porcelain` prints nothing (it lists
   uncommitted tracked changes and untracked files that are not ignored, and not `target/`),
   and, after `git fetch origin`, `git -C <path> rev-list HEAD --not --remotes=origin` prints

@@ -37,10 +37,13 @@ removes by itself, since the harness removes only an unchanged worktree
 `target/xtask/review/pr<N>/` in the checkout the session works in, which is the only copy.
 After the merge, and not before, the session copies the records into the main checkout at the
 same path (a later PR on the same surface takes them as its ledger context); when its sandbox
-refuses that write, the gate report names the worktree's path and the maintainer copies. Once
-the copy exists, the maintainer removes the worktree (`git worktree remove --force --force
-<path>` from the main checkout, the doubled flag because the harness locks the worktree, then
-`git worktree prune`), or the session does so when the maintainer asks it to.
+refuses that write, the session tells the maintainer, who copies from the worktree path the
+gate report already names. Once the copy exists, and only when the worktree holds nothing
+unsaved or unpushed (the second check of `.claude/skills/orchestrate/SKILL.md` § Worktree
+removal, whose failure is reported to the maintainer and not forced), the maintainer removes
+the worktree (`git worktree remove --force --force <path>` from the main checkout, the doubled
+flag because the harness locks the worktree, then `git worktree prune`), or the session does
+so when the maintainer asks it to.
 
 At the gate, surface both verdict lines verbatim and prompt for the merge decision per
 `.claude/CLAUDE.md` § PR workflow operations; merge only on the maintainer's instruction.

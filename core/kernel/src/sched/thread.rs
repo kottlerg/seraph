@@ -594,7 +594,10 @@ pub struct ThreadControlBlock
     pub run_queue_next: Option<*mut ThreadControlBlock>,
 
     /// Global single-link tag: the priority level this TCB is currently linked
-    /// at, or `-1` when not on any run queue. Written only under the owning
+    /// at, or `-1` when not on any run queue. The level is the one its linker
+    /// passed, which names the run queue it is on: a fair thread the load
+    /// balancer pulled is tagged with the lowest fair level, which names the
+    /// same fair queue as its own. Written only under the owning
     /// `PerCpuScheduler.lock` (set in `PerCpuScheduler::enqueue`, cleared in
     /// `dequeue_highest` / `remove_from_queue`). The enqueue chokepoint rejects a
     /// TCB whose tag is already `>= 0`, enforcing "Ready ⇒ linked on exactly one

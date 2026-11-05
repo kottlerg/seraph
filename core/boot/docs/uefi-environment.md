@@ -222,8 +222,8 @@ The bootloader performs no allocation-dependent operations after `ExitBootServic
 Every `BootError` that reaches `efi_main` is fatal. Three sites consume a `BootError` instead of
 returning it: a failed open of `\EFI\seraph\nokaslr` reads as an absent knob
 ([boot-flow.md § Step 5d](boot-flow.md#step-5d-apply-the-kaslr-slide)), as does a failed open of
-`\EFI\seraph\mapredo` ([memory-map.md](memory-map.md#sizing-the-entry-array) § Sizing the Entry
-Array), and a failed
+`\EFI\seraph\mapredo`
+([memory-map.md § Sizing the Entry Array](memory-map.md#sizing-the-entry-array)), and a failed
 AP-trampoline allocation is logged as a warning and records zero
 ([boot-flow.md § Step 5b](boot-flow.md#step-5b-allocate-the-ap-trampoline-page)). Optional
 resources degrade instead of failing: an absent GOP leaves the system headless, and an absent or

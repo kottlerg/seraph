@@ -188,7 +188,7 @@ prune the hand-added recipe). The mirror rules are owned by
 fails if the bundle is missing. The bundle is composed by
 `cargo xtask build` (default-init) or by
 [`cargo xtask compose-bundle`](#cargo-xtask-compose-bundle) (any
-harness). It always removes the `\EFI\seraph\mapredo` test knob, which
+harness). `mkdisk` always removes the `\EFI\seraph\mapredo` test knob, which
 only [`test-map-redo`](#cargo-xtask-test-map-redo) stages, for its own boot.
 
 `disk.img` carries three GPT partitions: the EFI System Partition

@@ -25,12 +25,13 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
+use regex::Regex;
 
 use crate::cli::{
     DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, RunParallelArgs,
     TestMapRedoArgs,
 };
-use crate::commands::mkdisk::stage_map_redo_knob;
+use crate::commands::mkdisk::{Knob, remove_knob, stage_knob};
 use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
 use crate::context::Context;
 use crate::util::step;
@@ -58,7 +59,8 @@ fn check_log(log: &str) -> Result<Verdict>
     {
         return Ok(Verdict::Skipped(outcome.to_string()));
     }
-    if !log.lines().any(|l| l.contains(DEFAULT_PASS_REGEX))
+    let pass = Regex::new(DEFAULT_PASS_REGEX).context("compiling the default pass marker")?;
+    if !log.lines().any(|l| pass.is_match(l))
     {
         bail!("the log has no pass marker ({DEFAULT_PASS_REGEX:?}): the boot did not complete");
     }
@@ -85,13 +87,13 @@ pub fn run(ctx: &Context, args: &TestMapRedoArgs) -> Result<()>
         {}
         Err(e) => return Err(e).with_context(|| format!("removing {}", log.display())),
     }
-    stage_map_redo_knob(ctx, true).context("staging the mapredo knob")?;
+    stage_knob(ctx, Knob::MapRedo).context("staging the mapredo knob")?;
     let booted = crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
         .context("repacking disk.img with the mapredo knob")
         .and_then(|()| boot(ctx, args, &dir));
     // Restore first, and surface its failure ahead of the boot's: a knob left
     // staged would redo steps 6 and 7 on every later boot of this sysroot.
-    stage_map_redo_knob(ctx, false)
+    remove_knob(ctx, Knob::MapRedo)
         .and_then(|()| {
             crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
         })

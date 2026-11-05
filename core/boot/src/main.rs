@@ -427,8 +427,9 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // live and identity-mapped; virtual addresses are still unbiased link VAs;
     // ctx.esp_root is valid until ExitBootServices.
     let mut kaslr = unsafe { step5d_apply_kaslr_slide(&ctx, &mut kernel.info, &boot_entropy)? };
-    // SAFETY: all prior unsafe outputs remain valid; steps 6 and 7 allocate
-    // via bs, and step 7 is the last pre-exit allocation.
+    // SAFETY: all prior unsafe outputs remain valid; ctx.esp_root is valid
+    // until ExitBootServices; steps 6 and 7 allocate via bs, and step 7 is the
+    // last pre-exit allocation.
     let (allocs, mut page_table, mut uefi_map) = unsafe {
         steps6_and_7_sized_to_the_map(
             &ctx,
@@ -1521,8 +1522,9 @@ fn map_buffer_fits(buffer_bytes: usize, pages: usize) -> bool
 /// reaches past its array, and any error of steps 6 and 7 or of the frees.
 ///
 /// # Safety
-/// As [`step6_allocate_and_build_page_tables`]; nothing between the returned
-/// map and `ExitBootServices` may allocate.
+/// As [`step6_allocate_and_build_page_tables`], and `ctx.esp_root` must be a
+/// valid ESP root directory handle; nothing between the returned map and
+/// `ExitBootServices` may allocate.
 unsafe fn steps6_and_7_sized_to_the_map(
     ctx: &UefiContext,
     bundle: &BundleLoad,
@@ -1582,7 +1584,7 @@ unsafe fn steps6_and_7_sized_to_the_map(
         {
             return Err(BootError::MemoryMapKeptGrowing(reach));
         }
-        if fits
+        if knob == MapRedo::ForcedByKnob && attempt == 1
         {
             bprintln!("[--------] boot: memory map: mapredo knob present; redoing steps 6 and 7");
         }

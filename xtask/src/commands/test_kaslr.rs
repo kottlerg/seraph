@@ -33,7 +33,7 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::TestKaslrArgs;
-use crate::commands::mkdisk::stage_nokaslr_knob;
+use crate::commands::mkdisk::{Knob, remove_knob, stage_knob};
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
@@ -244,14 +244,14 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
 
     // ── Knob: deterministic layout ──────────────────────────────────────────
     // Stage the knob, always restore it, even on failure.
-    stage_nokaslr_knob(ctx, true).context("staging nokaslr knob")?;
+    stage_knob(ctx, Knob::NoKaslr).context("staging nokaslr knob")?;
     crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
         .context("repacking disk with knob")?;
     let knob_result = scrape("boot C (--no-kaslr)");
     // Always restore first and surface its failure ahead of the boot-C result:
     // leaving the knob staged would silently disable KASLR for later runs, so a
     // failed restore is the more urgent error to report.
-    stage_nokaslr_knob(ctx, false)
+    remove_knob(ctx, Knob::NoKaslr)
         .and_then(|()| {
             crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
         })

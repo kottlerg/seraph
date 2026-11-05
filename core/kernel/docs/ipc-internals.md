@@ -415,8 +415,9 @@ between deliveries.
    Invariants, invariant 4)
 7. Release sig.lock
 8. Block current thread; return when woken
-9. On wakeup: if the park is INTERRUPTED (a stop, an upcall, or the notification
-   destroyed under the waiter), return Interrupted. Otherwise the sender has
+9. On wakeup: if the park is INTERRUPTED (a stop, an upcall, or the
+   notification destroyed under the waiter), return Interrupted. Otherwise the
+   sender has
    already performed bits.swap(0) and stored the result in
    current_tcb.wakeup_value (0 for a timer wake);
    tf.set_ipc_return(primary = 0, secondary = wakeup_value); return Ok(0)
@@ -560,8 +561,8 @@ level-readiness witness.
       deadline): set sleep_deadline and sleep_list_add, still under eq.lock
    d. Release eq.lock
 5. schedule(); on resume:
-   if the park is INTERRUPTED -> return Interrupted (a stop, or the queue
-                                 destroyed under the waiter),
+   if the park is INTERRUPTED -> return Interrupted (a stop, an upcall, or
+                                 the queue destroyed under the waiter),
    else if tcb.timed_out      -> return WouldBlock,
    else                       -> return the entry from wakeup_value and
                                  wakeup_tag
@@ -700,8 +701,8 @@ waitset_notify(wait_set, member_idx):
    c. Release lock
    d. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then return
-      Interrupted if the park is INTERRUPTED (a stop, an upcall, or the wait set
-      destroyed under the waiter), else return wakeup_value
+      Interrupted if the park is INTERRUPTED (a stop, an upcall, or the wait
+      set destroyed under the waiter), else return wakeup_value
 ```
 
 **What a returned badge means.** A ring entry is a hint that the member became

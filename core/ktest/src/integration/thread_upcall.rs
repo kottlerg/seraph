@@ -406,7 +406,7 @@ fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> Te
     thread_read_regs(th, &mut regs[..BUF])
         .map_err(|_| "integration::thread_upcall: thread_read_regs (fault) failed")?;
     spawn::redirect_to_entry(&mut regs[..], fault_yield_entry as *const () as u64);
-    // SAFETY: as in phase 4; `fault_yield_entry` never returns.
+    // SAFETY: as in phase 5; `fault_yield_entry` never returns.
     unsafe { thread_write_regs(th, &regs[..BUF]) }
         .map_err(|_| "integration::thread_upcall: thread_write_regs (fault) failed")?;
     reply_resume(ctx)?;
@@ -498,7 +498,8 @@ fn refused_park(ctx: &TestContext, parts: &mut Parts, ep_up: u64, never: u64) ->
     Ok(())
 }
 
-/// Phase 11: the rights a post needs, and its flag check.
+/// Phase 11: the rights a post needs, its flag check, and the mask's argument
+/// check.
 fn rights(ctx: &TestContext, th: u64, ep_up: u64) -> TestResult
 {
     let observe = cap_derive(th, RIGHTS_THREAD_OBSERVE | RIGHTS_THREAD_CONTROL)

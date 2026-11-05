@@ -1063,9 +1063,9 @@ impl Process {
         } else {
             // Non-piped: `wait` consumes the kernel's death post on
             // `death_eq` directly. No bridge thread allocated. `Interrupted`
-            // (this thread was stopped and restarted, or `death_eq` was
-            // destroyed under the wait) waits again; a destroyed queue then
-            // fails the next receive.
+            // (this thread was stopped and restarted or interrupted by an
+            // upcall, or `death_eq` was destroyed under the wait) waits again;
+            // a destroyed queue then fails the next receive.
             loop {
                 match syscall::event_recv(self.death_eq) {
                     Ok(reason) => break reason,
@@ -1204,8 +1204,9 @@ fn bridge_main(h: BridgeHandles) {
     let payload = loop {
         match syscall::event_recv(h.death_eq) {
             Ok(p) => break p,
-            // A stop and restart of this thread, or `death_eq` destroyed
-            // under the wait; a destroyed queue fails the next receive.
+            // A stop and restart of this thread, an upcall to it, or
+            // `death_eq` destroyed under the wait; a destroyed queue fails
+            // the next receive.
             Err(e) if e == SyscallError::Interrupted as i64 => {}
             // `death_eq` invalid — nothing to do, exit without firing any
             // wakes.
@@ -1251,8 +1252,9 @@ fn bridge_main(h: BridgeHandles) {
     let _ = syscall::notification_send(h.completion_notification, 1);
 }
 
-/// Send `DESTROY_PROCESS` on `process_handle`, retrying a call this thread's
-/// stop and restart interrupted, and report whether procmgr replied.
+/// Send `DESTROY_PROCESS` on `process_handle`, retrying a call that a stop and
+/// restart of this thread, or an upcall to it, interrupted, and report whether
+/// procmgr replied.
 fn destroy_child(process_handle: u64) -> bool {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null() {

@@ -276,21 +276,22 @@ skipping levels, risks deadlock.
    calling thread (`notification_wait`, `event_queue_recv`, `endpoint_call`, `endpoint_recv`,
    `waitset_wait`, `sys_thread_sleep`) MUST commit the `Running → Blocked` transition via
    `crate::sched::commit_blocked_under_local_lock(tcb, ipc_state, blocked_on)`. The helper acquires
-   `(*tcb).sched_lock` (NOT the CPU lock), reads `state`, and writes `Blocked` only if `state ∈
-   {Running, Ready}` AND `wake_pending` is clear, returning `ParkCommit::Committed`. It refuses to
-   park in two cases: `ParkCommit::RefusedStop`, when a concurrent all-locks `Stopped`/`Exited`
-   commit already won (then `schedule()` drains the thread), or when an upcall is pending that the
-   thread does not mask outside a fault or upcall delivery (the thread stays `Running`, and
-   `schedule()` requeues it; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall
-   Cancel-and-Wake Protocol), and `ParkCommit::RefusedWake`, when `wake_pending` is set (a waker
-   raced ahead, found the thread still live, coalesced its link, and recorded the wake under
-   `sched_lock`; the helper consumes the flag and leaves the thread `Running`, and `schedule()`
-   requeues the runnable thread so it resumes and consumes the
-   already-deposited payload). On either refusal the caller MUST roll back the source-side waiter
-   registration. A `RefusedStop` rollback stamps the park episode cancelled (no waker saw the
-   registration, so the rollback owns the episode); a `RefusedWake` rollback MUST NOT clobber the
-   deposited `wakeup_value`/`ipc_msg`. `endpoint_call` treats both refusals as a cancelled call and
-   stamps the episode either way (see [sched-ipc-redesign.md](sched-ipc-redesign.md) §2.1).
+   `(*tcb).sched_lock` (NOT the CPU lock), reads `state`, and writes `Blocked` only if
+   `state ∈ {Running, Ready}` AND `wake_pending` is clear, returning `ParkCommit::Committed`. It
+   refuses to park in two cases: `ParkCommit::RefusedStop`, when a concurrent all-locks
+   `Stopped`/`Exited` commit already won (then `schedule()` drains the thread), or when an upcall is
+   pending that the thread does not mask outside a fault or upcall delivery (the thread stays
+   `Running`, and `schedule()` requeues it;
+   [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall Cancel-and-Wake
+   Protocol), and `ParkCommit::RefusedWake`, when `wake_pending` is set (a waker raced ahead, found
+   the thread still live, coalesced its link, and recorded the wake under `sched_lock`; the helper
+   consumes the flag and leaves the thread `Running`, and `schedule()` requeues the runnable thread
+   so it resumes and consumes the already-deposited payload). On either refusal the caller MUST roll
+   back the source-side waiter registration. A `RefusedStop` rollback stamps the park episode
+   cancelled (no waker saw the registration, so the rollback owns the episode); a `RefusedWake`
+   rollback MUST NOT clobber the deposited `wakeup_value`/`ipc_msg`. `endpoint_call` treats both
+   refusals as a cancelled call and stamps the episode either way (see
+   [sched-ipc-redesign.md](sched-ipc-redesign.md) §2.1).
    `sys_thread_sleep` returns `Ok(0)` on `RefusedWake` without calling `schedule()`, and on
    `RefusedStop` deschedules and returns `Interrupted` directly without stamping. A committed park
    advances `park_seq`, so a stop or teardown that read the thread before the park

@@ -259,24 +259,23 @@ riscv64 boot targets hands the bootloader ACPI only, so no Device Tree `iommu-ma
 RIMT describes no reserved memory region.
 
 The IOMMU's arch-specific logic (its registers, translation tables, cache invalidation, and fault
-reporting) runs in a separate IOMMU driver process, one per IOMMU family, not in devmgr: VT-d's
-is `iommu-vtd` ([services/drivers/iommu/vtd/README.md](../services/drivers/iommu/vtd/README.md))
-and the RISC-V IOMMU's is `iommu-riscv`
-([services/drivers/iommu/riscv/README.md](../services/drivers/iommu/riscv/README.md)), both over
-the family-independent `iommu-core`
+reporting) runs in a separate IOMMU driver process, one per IOMMU family, not in devmgr: VT-d's is
+`iommu-vtd` ([services/drivers/iommu/vtd/README.md](../services/drivers/iommu/vtd/README.md)) and
+the RISC-V IOMMU's is `iommu-riscv`
+([services/drivers/iommu/riscv/README.md](../services/drivers/iommu/riscv/README.md)), both over the
+family-independent `iommu-core`
 ([services/drivers/iommu/core/README.md](../services/drivers/iommu/core/README.md)) and the shared
 table-page store `iommu-store`
-([services/drivers/iommu/store/README.md](../services/drivers/iommu/store/README.md)). For each
-unit it discovers, devmgr carves an `Mmio` cap for the unit's register range through the same
+([services/drivers/iommu/store/README.md](../services/drivers/iommu/store/README.md)). For each unit
+it discovers, devmgr carves an `Mmio` cap for the unit's register range through the same
 aperture-carving flow as any other device (for a RISC-V IOMMU, after turning on the function's
-memory decode and bus mastering through its configuration page) and moves it to that family's
-IOMMU driver, keeping no copy, with the unit's PCI segment and its scope resolved against the PCI
-topology. devmgr keeps the DMA endpoint, its
-`devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver over
-`ipc::iommu_labels` to attach a device to a domain of its own, install and withdraw mappings,
-block a device, and take the faults the units recorded, so drivers see the same protocol whichever
-IOMMU, or none, sits behind it. The kernel does not read or write IOMMU registers and holds no
-per-IOMMU state.
+memory decode and bus mastering through its configuration page) and moves it to that family's IOMMU
+driver, keeping no copy, with the unit's PCI segment and its scope resolved against the PCI
+topology. devmgr keeps the DMA endpoint, its `devmgr_dma_labels` contract, and per-device policy,
+and reaches the IOMMU driver over `ipc::iommu_labels` to attach a device to a domain of its own,
+install and withdraw mappings, block a device, and take the faults the units recorded, so drivers
+see the same protocol whichever IOMMU, or none, sits behind it. The kernel does not read or write
+IOMMU registers and holds no per-IOMMU state.
 
 At boot devmgr spawns the IOMMU driver from its boot module before any DMA-capable driver, in a
 settle batch of its own (`CREATE_PROCESS` with `CREATE_PINNED`, since the units walk its table
@@ -284,10 +283,10 @@ pages, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS`, since the units are programm
 addresses (§ Physical Addresses), at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it on
 every mapping). The driver programs each unit with empty tables and turns translation on, so from
 its ready report every function a unit translates reaches nothing until devmgr attaches it, the
-functions no driver binds included. devmgr never releases the driver's hold, and deletes its
-release token at the spawn: a unit may walk any of its table pages while translation is on, so
-they stay quarantined for the boot. For each
-DMA-capable device devmgr then decides, before it grants the device DMA:
+functions no driver binds included. devmgr never releases the driver's hold, and deletes its release
+token at the spawn: a unit may walk any of its table pages while translation is on, so they stay
+quarantined for the boot. For each DMA-capable device devmgr then decides, before it grants the
+device DMA:
 
 - **Confined.** A unit translates the device: devmgr attaches it (`ATTACH`) and grants it DMA in
   that domain.

@@ -254,7 +254,8 @@ event and memory polls of `integration::fault_kills_thread`,
 `integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
 `integration::mmio_revoke_unmaps`, `integration::ioport_revoke`,
 `integration::umip_descriptor_reads_fault`, `cap::cspace_self_delete_stops_caller` and
-`retype::aspace_self_delete_stops_caller`; the probe-wait bound and the worker's readiness, call
+`retype::aspace_self_delete_stops_caller`; the teardown polls of
+`mm::memory_split_after_cspace_teardown`; the probe-wait bound and the worker's readiness, call
 and exit bounds of `retype::pool_seeding_takes_interrupts`,
 `retype::cspace_teardown_takes_interrupts` and `retype::aspace_teardown_takes_interrupts`; the
 phase polls, the child's spin bound and the cleanup

@@ -168,16 +168,16 @@ pub fn memory_split_shared_object_refused(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Split attempts, a yield apart, that wait for a dead `CSpace`'s deferred
-/// teardown to release its slots; stretched past [`crate::UNSCALED_CPUS`] CPUs
-/// through [`crate::scaled_polls`].
-const CSPACE_RELEASE_POLLS: u32 = 1000;
+/// 1 ms polls, about 2 s, that wait for a dead `CSpace`'s deferred teardown to
+/// release its slots; stretched past [`crate::UNSCALED_CPUS`] CPUs through
+/// [`crate::scaled_polls`].
+const CSPACE_RELEASE_POLLS: u32 = 2000;
 
 /// A `CSpace`'s teardown stops counting the slots it held: a piece copied into
 /// a fresh `CSpace` is refused a split while the copy lives, and splits again
 /// once the last capability to that `CSpace` is deleted and its teardown has
 /// released the copy (core/kernel/docs/syscalls.md § `SYS_MEMORY_SPLIT`). The
-/// teardown is deferred, so the split is retried, a yield apart, within
+/// teardown is deferred, so the split is retried, a 1 ms sleep apart, within
 /// [`CSPACE_RELEASE_POLLS`].
 pub fn memory_split_after_cspace_teardown(ctx: &TestContext) -> TestResult
 {
@@ -196,25 +196,25 @@ pub fn memory_split_after_cspace_teardown(ctx: &TestContext) -> TestResult
             tail = Some(t);
             break;
         }
-        syscall::thread_yield().ok();
+        let _ = syscall::thread_sleep(1);
     }
-    if let Some(t) = tail
+    // A slot the teardown left counted also refuses the merges below, so the
+    // stuck split is reported before them, and the piece is left unmerged.
+    let Some(tail) = tail
+    else
     {
-        syscall::memory_merge(piece, t).map_err(|_| CASE)?;
-    }
+        return Err(
+            "mm::memory_split_after_cspace_teardown: the split stayed refused after the copy's \
+             CSpace was torn down",
+        );
+    };
+    syscall::memory_merge(piece, tail).map_err(|_| CASE)?;
     syscall::memory_merge(ctx.memory_base, piece).map_err(|_| CASE)?;
 
     copied.map_err(|_| CASE)?;
     if shared
     {
         return Err("mm::memory_split_after_cspace_teardown: a piece with a live copy was split");
-    }
-    if tail.is_none()
-    {
-        return Err(
-            "mm::memory_split_after_cspace_teardown: the split stayed refused after the copy's \
-             CSpace was torn down",
-        );
     }
     Ok(())
 }

@@ -999,8 +999,8 @@ fn forward_arena(arena_cap: u64, mm_cspace: u64, kind: u64) -> Option<InUseArena
 /// Forward a single Memory cap into memmgr's `CSpace` as a free run: move it
 /// into `mm_cspace`, so that once any derivation init took from it is gone
 /// memmgr's slot is the only one naming the run and memmgr can split and
-/// merge it, and count it (advancing `count`, recording `base` on the first
-/// run). Used for the
+/// merge it. Count the run in `count`, recording `base` on the first. Used
+/// for the
 /// `MemoryAlloc` tail and the transient phys-table page — both `memory_split`
 /// products with no `InitInfo` descriptor, which the reap donation walk does
 /// not reach, so unforwarded they would stay in init's `CSpace` until the reap

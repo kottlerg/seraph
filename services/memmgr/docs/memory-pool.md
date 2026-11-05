@@ -312,10 +312,9 @@ Memory object of every derivation it granted. The frame is **quiescent** when al
    add a reference or a mapping, so the reads after it cannot be raced.
 2. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. The
    kernel refuses a grantee's split or merge of its grant, since memmgr's intermediary names the
-   same object
-   ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_split-33)
-   §"`SYS_MEMORY_SPLIT`"), so the size cannot change while memmgr holds the intermediary; memmgr
-   reads it as a backstop.
+   same object ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md)
+   §"`SYS_MEMORY_SPLIT`" and §"`SYS_MEMORY_MERGE`"), so the size cannot change while memmgr holds
+   the intermediary; memmgr reads it as a backstop.
 3. Its available bytes (`CAP_INFO_MEMORY_AVAILABLE`) equal its size: no byte of the region is
    retyped into a live kernel object, donated to a page pool, or held by a kept body-arena page
    (the kernel credits the last such byte back and resets the region's retype allocator to virgin

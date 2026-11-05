@@ -1584,7 +1584,7 @@ unsafe fn steps6_and_7_sized_to_the_map(
         {
             return Err(BootError::MemoryMapKeptGrowing(reach));
         }
-        if knob == MapRedo::ForcedByKnob && attempt == 1
+        if knob_redoes(attempt, knob)
         {
             bprintln!("[--------] boot: memory map: mapredo knob present; redoing steps 6 and 7");
         }
@@ -1609,7 +1609,15 @@ unsafe fn steps6_and_7_sized_to_the_map(
 /// is redone so the boot runs the redo path.
 fn attempt_stands(fits: bool, attempt: usize, knob: MapRedo) -> bool
 {
-    fits && !(knob == MapRedo::ForcedByKnob && attempt == 1)
+    fits && !knob_redoes(attempt, knob)
+}
+
+/// Whether the `mapredo` knob ([`MapRedo`]) redoes attempt `attempt` (from 1)
+/// of steps 6 and 7 whatever its map's size: the first attempt alone, while
+/// the knob is present.
+fn knob_redoes(attempt: usize, knob: MapRedo) -> bool
+{
+    knob == MapRedo::ForcedByKnob && attempt == 1
 }
 
 /// The `(physical base, page count)` spans of every allocation steps 6 and 7
@@ -2151,8 +2159,8 @@ mod tests
         BootAllocations, BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES,
         KERNEL_STACK_PAGES, KaslrOverride, MEM_MAP_ATTEMPTS, MapRedo, ReclaimRange,
         allocation_regions, aperture_array_capacity, attempt_stands, choose_kaslr_layout,
-        entry_array_pages, handoff_stack_span, map_buffer_fits, memory_map, push_reclaim_range,
-        scrub, step6_and_7_spans, uefi,
+        entry_array_pages, handoff_stack_span, knob_redoes, map_buffer_fits, memory_map,
+        push_reclaim_range, scrub, step6_and_7_spans, uefi,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -2307,17 +2315,21 @@ mod tests
     // Defect caught: a mapredo knob that is ignored (the first attempt stands
     // although the knob is present), that redoes a later attempt too (the boot
     // would end in MemoryMapKeptGrowing), or that makes an attempt whose map
-    // does not fit stand.
+    // does not fit stand; or a knob line logged for an attempt the knob does
+    // not redo, or missing from the one it does.
     #[test]
     fn the_mapredo_knob_redoes_the_first_attempt_alone()
     {
         assert!(!attempt_stands(true, 1, MapRedo::ForcedByKnob));
+        assert!(knob_redoes(1, MapRedo::ForcedByKnob));
         for attempt in 2..=MEM_MAP_ATTEMPTS
         {
             assert!(attempt_stands(true, attempt, MapRedo::ForcedByKnob));
+            assert!(!knob_redoes(attempt, MapRedo::ForcedByKnob));
         }
         for attempt in 1..=MEM_MAP_ATTEMPTS
         {
+            assert!(!knob_redoes(attempt, MapRedo::Absent));
             assert!(attempt_stands(true, attempt, MapRedo::Absent));
             assert!(!attempt_stands(false, attempt, MapRedo::Absent));
             assert!(!attempt_stands(false, attempt, MapRedo::ForcedByKnob));

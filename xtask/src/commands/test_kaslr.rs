@@ -245,9 +245,10 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
     // ── Knob: deterministic layout ──────────────────────────────────────────
     // Stage the knob, always restore it, even on failure.
     stage_knob(ctx, Knob::NoKaslr).context("staging nokaslr knob")?;
-    crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
-        .context("repacking disk with knob")?;
-    let knob_result = scrape("boot C (--no-kaslr)");
+    let knob_result =
+        crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
+            .context("repacking disk with knob")
+            .and_then(|()| scrape("boot C (--no-kaslr)"));
     // Always restore first and surface its failure ahead of the boot-C result:
     // leaving the knob staged would silently disable KASLR for later runs, so a
     // failed restore is the more urgent error to report.

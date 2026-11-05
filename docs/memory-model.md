@@ -298,9 +298,9 @@ kernel concern: DMA placement and isolation belong to devmgr and the memory auth
 userspace (see [architecture.md](architecture.md)). Physical-range (DMA-reachable)
 placement by the userspace memory authority is design intent; not yet implemented:
 memmgr's only allocation flag is `REQUIRE_CONTIGUOUS`. IOMMU-based DMA isolation is
-directed by devmgr and programmed by an IOMMU driver: on x86-64 VT-d confines each
-DMA-capable device, and on RISC-V it is design intent; not yet implemented, so DMA runs
-unconfined there (see [device-management.md](device-management.md) § DMA Safety Model).
+directed by devmgr and programmed by an IOMMU driver: VT-d on x86-64 and the RISC-V IOMMU
+on riscv64 confine each DMA-capable device a unit translates (see
+[device-management.md](device-management.md) § DMA Safety Model).
 
 Userspace reads physical addresses only through the Memory `Phys` right, which the kernel
 mints on every boot RAM cap and memmgr strips from every grant except to devmgr and the IOMMU

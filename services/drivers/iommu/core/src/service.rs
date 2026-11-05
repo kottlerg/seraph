@@ -1052,13 +1052,14 @@ mod tests
         s.backend.pending.push(Fault {
             unit: 0,
             bdf: 0x0018,
-            reason: 6,
+            // A RISC-V IOMMU cause wider than 8 bits keeps all its bits.
+            reason: 259,
             iova: 0x10_0000,
         });
         let take = req(iommu_labels::TAKE_FAULTS, &[], &[]);
         let r = s.handle(&take);
         assert_eq!(r.label, iommu_errors::SUCCESS);
-        assert_eq!(r.words(), [1, 0x0018 | (6 << 32), 0x10_0000]);
+        assert_eq!(r.words(), [1, 0x0018 | (259 << 32), 0x10_0000]);
         assert_eq!(s.handle(&take).words(), [0]);
     }
 

@@ -17,8 +17,10 @@
 //! derivation, tracks which spawned drivers reported their device ready, and
 //! keeps each class's served drivers by instance ordinal, a withdrawn one's
 //! ordinal held by a tombstone, keeps each DMA-capable device's DMA
-//! mappings (`dma`), and walks the DMA Remapping table for the VT-d units and
-//! the functions each translates (`dmar`).
+//! mappings (`dma`), walks the DMA Remapping table for the VT-d units and
+//! the functions each translates (`dmar`), and walks the RISC-V IO Mapping
+//! Table for the RISC-V IOMMUs that are PCI functions and the functions each
+//! translates (`rimt`).
 //! The functions read caller-mapped byte slices or values, or reach the
 //! platform only through a caller-supplied accessor or split operation, and
 //! touch no syscall, IPC, or `std::os::seraph` surface, so the crate is
@@ -37,6 +39,7 @@ pub mod dtb;
 pub mod lines;
 pub mod pci;
 pub mod resource;
+pub mod rimt;
 pub mod roster;
 pub mod scan;
 pub mod served;

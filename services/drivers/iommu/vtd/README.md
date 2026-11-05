@@ -30,7 +30,9 @@ The driver runs the units in legacy translation mode:
   ([#325](https://github.com/kottlerg/seraph/issues/325)).
 
 The translation structures live in pages the driver takes from memmgr in physically contiguous
-chunks (`REQUIRE_CONTIGUOUS`) and maps into itself. It reads their physical bases, and those of
+chunks (`REQUIRE_CONTIGUOUS`) and maps into itself, through the page store it shares with the
+RISC-V IOMMU driver ([`iommu-store`](../store/README.md)), which writes each table store back from
+the caches when a unit does not snoop them. It reads their physical bases, and those of
 the frames each `MAP` installs, with `CAP_INFO_MEMORY_PHYS_BASE`: the units are programmed with
 physical addresses, which makes the IOMMU driver the one driver class that reads them. devmgr
 spawns it phys-class, so its grants carry the Memory `Phys` right, and it reads a driver's frames,
@@ -41,7 +43,7 @@ ever returned, and devmgr spawns the driver `CREATE_DMA_HOLD` and never releases
 may walk any of them while translation stays on.
 
 The library (`iommu_vtd`) holds the register fields, the translation-structure encodings, and the
-page-table walk. They are host-tested, the walk over a heap-backed page store.
+page-table walk. They are host-tested, the walk over a heap-backed `iommu_core::TableStore`.
 
 ---
 
@@ -58,7 +60,6 @@ iommu/vtd/
     ├── tables.rs        # Root and context entries; second-level page tables over a page store
     ├── main.rs          # Driver binary: bootstrap, register mapping, setup, the two loops
     ├── backend.rs       # The VT-d Backend: unit setup, attach, map, unmap, block, fault poll
-    ├── store.rs         # Table pages from memmgr, mapped, with their physical addresses
     └── arch/            # Cache-line flushing for a unit that does not snoop (x86_64; a
                          #   documented no-op on riscv64, which builds no VT-d driver)
 ```
@@ -70,7 +71,7 @@ iommu/vtd/
 | Document | Content |
 |---|---|
 | [docs/device-management.md](../../../../docs/device-management.md) | DMA safety model, DMA authorisation, IOMMU discovery and programming |
-| [docs/limits.md](../../../../docs/limits.md) | The invalidation bound and the page store's chunk |
+| [docs/limits.md](../../../../docs/limits.md) | The invalidation bound |
 
 ---
 

@@ -1,6 +1,6 @@
 # test-dma
 
-Test-only driver for QEMU's `edu` device (PCI `1234:11e8`), which xtask attaches to every x86-64
+Test-only driver for QEMU's `edu` device (PCI `1234:11e8`), which xtask attaches to every
 launch, behind the IOMMU when one is attached. devmgr binds it on demand through its
 `TEST_SPAWN_DMA_DRIVER` shim, gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only
 `devmgr.test` cap carries, so a boot without svctest never spawns it. devmgr gives the device its

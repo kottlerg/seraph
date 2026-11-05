@@ -21,7 +21,7 @@ use iommu_vtd::tables::{
     root_entry,
 };
 
-use crate::store::Store;
+use iommu_store::Store;
 
 /// How long a unit may take to complete one command (a root-pointer set,
 /// a translation enable or disable, a write-buffer flush, or a context-cache
@@ -436,7 +436,7 @@ impl Backend for Vtd
                     record(Fault {
                         unit: index,
                         bdf: f.source_id,
-                        reason: f.reason,
+                        reason: u16::from(f.reason),
                         iova: f.address,
                     });
                     u.write64(off + 8, regs::FAULT_CLEAR);

@@ -56,12 +56,18 @@ devmgr's responsibilities are:
   devmgr returns from `DMA_MAP` on the driver's DMA capability, never with a
   physical address (below, and
   [docs/device-management.md § DMA Authorisation](../../../docs/device-management.md#dma-authorisation)).
-  On x86-64 devmgr confines each DMA-capable device with the VT-d IOMMU
-  driver, `iommu-vtd`, which it spawns from its boot module before the boot
-  batch, in a settle batch of its own, with each remapping unit's register
-  `Mmio` cap carved from the apertures and moved to it (devmgr keeps no copy),
-  the unit's segment, and its DMAR scope resolved against the PCI scan's
-  bridges. The driver is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and
+  devmgr confines each DMA-capable device with the IOMMU driver of its
+  architecture's family, `iommu-vtd` (VT-d) on x86-64 and `iommu-riscv` (the
+  RISC-V IOMMU) on riscv64, which it spawns from its boot module before the
+  boot batch, in a settle batch of its own, with each unit's register `Mmio`
+  cap moved to it (devmgr keeps no copy), the unit's segment, and its scope
+  resolved against the PCI scan. A VT-d unit's cap is carved from the
+  apertures and its scope is the DMAR's, resolved against the scan's bridges;
+  a RISC-V IOMMU is a PCI function the ACPI RIMT names, whose cap is the first
+  page of its BAR 0, carved once devmgr has turned on the function's memory
+  decode and bus mastering, and whose scope is the RIMT's ID mappings: each
+  bus they cover whole and each scanned function on a bus they cover in part.
+  The driver is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and
   `CREATE_PHYS_ACCESS` at `BOOT_DRIVER_PRIORITY`, and its hold is never
   released, so its table pages stay quarantined for the boot; devmgr and it
   are the processes that read physical addresses
@@ -69,14 +75,14 @@ devmgr's responsibilities are:
   § Physical Addresses). Once it is ready devmgr attaches every
   DMA-capable device it binds to a domain of its own (`iommu_labels::ATTACH`)
   before the device's DMA grant, refusing, with a log line, a device an RMRR
-  names ([#773](https://github.com/kottlerg/seraph/issues/773)), one whose unit
-  it could not hand over, and one whose `ATTACH` fails; a device no unit
-  translates runs DMA-unsafe. With no DMAR, no driver module, or a driver not
+  names ([#773](https://github.com/kottlerg/seraph/issues/773)), one the RIMT
+  gives an IOMMU device ID other than its requester ID, one whose unit it could
+  not hand over, and one whose `ATTACH` fails; a device no unit translates
+  runs DMA-unsafe. With no DMAR or RIMT, no driver module, or a driver not
   ready within the settle bound, devmgr logs once that DMA runs unconfined and
   every DMA-capable driver runs DMA-unsafe (a driver that died or hung after
   it turned a unit's translation on leaves that unit blocking the devices
-  behind it, which the log line states), as on RISC-V, where no IOMMU is
-  programmed yet (design intent; not yet implemented). A thread of devmgr's
+  behind it, which the log line states). A thread of devmgr's
   takes the driver's recorded faults every second (`TAKE_FAULTS`) and logs
   each against its device. If the driver dies after it reported ready, a death
   watch thread of devmgr's own, which no registry call can delay, fails the
@@ -262,7 +268,7 @@ devmgr's responsibilities are:
   A fourth, test-only batch (TODO(#165)) runs only on
   `devmgr_labels::TEST_SPAWN_DMA_DRIVER`, under the same gate, at most once per
   boot: devmgr binds QEMU's `edu` device (PCI `1234:11e8`, which xtask attaches
-  on x86-64 only) to the [`test-dma`](../../drivers/test-dma/README.md)
+  on both architectures) to the [`test-dma`](../../drivers/test-dma/README.md)
   fixture. It carves the first page of the device's BAR 0 and its
   configuration page, gives the device its DMA grant, attaching it to its IOMMU
   domain where a unit translates it, turns its memory decode and bus mastering
@@ -311,7 +317,7 @@ devmgr's responsibilities are:
   Driver binaries are sourced from one of two places:
 
   - **Boot bundle** — bootstrap-essentials (virtio-blk, serial, framebuffer, and
-    on x86-64 the IOMMU driver `iommu-vtd`) arrive as
+    the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) arrive as
     `procmgr_labels::CREATE_PROCESS`-ready Memory caps in devmgr's MODULE
     bootstrap round. devmgr spawns these during initial enumeration, before the
     registry loop opens.
@@ -400,12 +406,12 @@ how devmgr uses them.
 | Capability | Rights | Purpose |
 |---|---|---|
 | Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_*_DEVICE`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and the test-only `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` / `TEST_QUERY_DENY_DEVICE` / `TEST_SPAWN_FAULT_DRIVERS` / `TEST_QUERY_FAULT_DEVICE` / `TEST_SPAWN_DMA_DRIVER` / `TEST_QUERY_DMA_DEVICE` / `TEST_DMA_FAULTS` labels the enumeration redesign removes (#165) on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). The test labels are gated on `TEST_LABEL_AUTHORITY`, which only the `devmgr.test` cap carries: a seed-only name svctest alone seeds. `TEST_QUERY_DENY_DEVICE` mints a SEND on the serial, input, or framebuffer driver's endpoint badged `TEST_DENY_BADGE`, which carries none of the driver's verb bits, so svctest can assert each driver's `UNAUTHORIZED` reply; every other SEND devmgr mints on those endpoints carries the bits |
-| Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and on x86-64 into each VT-d unit's register cap, which devmgr moves to the IOMMU driver; the ECAM windows carved from them stay devmgr's, split into the configuration page of each `VirtIO` function, which devmgr keeps to clear its Bus Master Enable (above) |
+| Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr moves to the IOMMU driver; the ECAM windows carved from them stay devmgr's, split into the configuration page of each `VirtIO` function, which devmgr keeps to clear its Bus Master Enable (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps delegated to drivers |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
-| Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE`; read the DMAR's VT-d units, scopes, and RMRRs on x86-64. Parsing the RISC-V IOMMU's topology (`iommu` / `iommu-map`) is design intent; not yet implemented |
-| Memory (driver modules, MODULE round) | As held by init | Boot-bundle driver images (virtio-blk, serial, framebuffer, and on x86-64 the IOMMU driver `iommu-vtd`), one per `module_kind`, spawned via `procmgr_labels::CREATE_PROCESS`; a module of an unknown kind or a second of one kind is logged and released |
+| Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE`; read the DMAR's VT-d units, scopes, and RMRRs on x86-64, and the RIMT's PCI IOMMUs and ID mappings on riscv64 |
+| Memory (driver modules, MODULE round) | As held by init | Boot-bundle driver images (virtio-blk, serial, framebuffer, and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64), one per `module_kind`, spawned via `procmgr_labels::CREATE_PROCESS`; a module of an unknown kind or a second of one kind is logged and released |
 | svcmgr publish authority (Endpoint, SVCMGR_BUNDLE round) | Send, Grant (`PUBLISH_AUTHORITY` badge) | Register service caps in svcmgr's registry; held but unused today, reserved for future devmgr publications |
 | SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (serial/virtio-blk/the IOMMU driver at 26, framebuffer/RTC/virtio-input at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities (the DMA thread at 26, the IOMMU fault-log thread at 24, through `std::os::seraph::thread::BuilderExt::spawn_at_priority`). Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
 
@@ -413,8 +419,10 @@ IOMMU register regions are not pre-minted as distinct capabilities.
 `devmgr` discovers VT-d units from the DMAR, carves an `Mmio` cap for each
 unit's register range through the same aperture-carving flow as any other
 device (the bootloader seeds an aperture over each, since no other table
-names those pages), and moves each to the VT-d IOMMU driver; discovering the
-RISC-V IOMMU from the DTB is design intent; not yet implemented (see
+names those pages), and moves each to the VT-d IOMMU driver. It discovers
+the RISC-V IOMMUs from the RIMT, carves the first page of each one's BAR 0,
+which lies in a PCI window the bootloader seeds already, and moves each to the
+RISC-V IOMMU driver (see
 [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
 
 ---

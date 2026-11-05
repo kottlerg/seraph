@@ -2,9 +2,11 @@
 
 The family-independent half of every IOMMU driver (`iommu-core`), a library each family's
 driver binary links: the bootstrap devmgr serves it, the `ipc::iommu_labels` service with its
-per-domain checks, the polled fault queue, and the `Backend` trait the family implements. A
-family's driver is its `main` and its `Backend`; VT-d's is
-[`iommu-vtd`](../vtd/README.md). The split, and devmgr's side of it, are specified in
+per-domain checks, the polled fault queue, the `TableStore` the family's translation structures
+are built in, and the `Backend` trait the family implements. A family's driver is its `main` and
+its `Backend`: VT-d's is [`iommu-vtd`](../vtd/README.md) and the RISC-V IOMMU's is
+[`iommu-riscv`](../riscv/README.md), both building their tables in the pages of
+[`iommu-store`](../store/README.md). The split, and devmgr's side of it, are specified in
 [docs/device-management.md](../../../../docs/device-management.md#iommu-discovery-and-programming)
 § IOMMU Discovery and Programming.
 
@@ -23,10 +25,22 @@ family's driver is its `main` and its `Backend`; VT-d's is
   function attached twice keeps its first domain; domain ID 0 is never given. A unit whose
   backend times out is treated as failed and refuses every later request.
 - **Faults.** A thread of the driver's own polls the units' fault records every `FAULT_POLL_MS`
-  into a bounded queue, and `TAKE_FAULTS` polls once more and hands devmgr the oldest.
+  into a bounded queue, and `TAKE_FAULTS` polls once more and hands devmgr the oldest, each with
+  the unit's reason code in 16 bits (VT-d's 8-bit fault reason, the RISC-V IOMMU's 12-bit
+  `CAUSE`).
+- **Table pages.** Every family's tables are 4 KiB pages of 64-bit words a unit reads by physical
+  address. The family's walks run over a `TableStore`: the driver's is `iommu-store`, the host
+  tests' a heap store.
+- **Physical bases.** A `MAP` request carries a driver's frames, whose caps lack the Memory `Phys`
+  right, so `KernelCaps` reads their physical bases presenting a credential: a page the driver
+  takes from memmgr at startup (`KernelCaps::new`), which keeps the right because devmgr spawns
+  the driver phys-class
+  ([docs/device-management.md](../../../../docs/device-management.md#physical-addresses)
+  § Physical Addresses).
 - **Setup.** The driver programs every unit empty and turns translation on before it reports
-  ready; a unit that fails turns every unit off again, so a driver whose setup fails leaves no
-  device blocked. A driver that dies after a unit's translation is on leaves that unit blocking.
+  ready; a unit that fails turns every unit's translation off again (VT-d's translation enable
+  cleared, a RISC-V IOMMU returned to Bare), so a driver whose setup fails leaves no device
+  blocked. A driver that dies after a unit's translation is on leaves that unit blocking.
 
 The receive loop and the poll loop reach the one service through a lock the driver supplies, held
 for one request or one poll. Under it a request that needs table pages the store lacks takes them
@@ -46,7 +60,8 @@ iommu/core/
     ├── lib.rs           # Crate root: the Backend trait, its errors, a unit's limits
     ├── bootstrap.rs     # Unit and endpoint rounds, scope words, the unit lookup
     ├── faults.rs        # The bounded queue of polled faults
-    └── service.rs       # iommu_labels handling, domain records, the receive and poll loops
+    ├── service.rs       # iommu_labels handling, domain records, the receive and poll loops
+    └── table.rs         # The TableStore every family's tables are built in
 ```
 
 ---

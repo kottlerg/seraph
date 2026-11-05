@@ -2314,7 +2314,7 @@ pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Res
 
 /// Wire-protocol version of [`iommu_labels`]; bumped as the block comment
 /// above the label modules describes, which also lists its runtime check.
-pub const IOMMU_LABELS_VERSION: u32 = 1;
+pub const IOMMU_LABELS_VERSION: u32 = 2;
 /// IPC labels for an IOMMU driver's service endpoint, on which devmgr directs
 /// the IOMMU of one family (VT-d, the RISC-V IOMMU).
 ///
@@ -2377,8 +2377,9 @@ pub mod iommu_labels
     /// Request: no further words. Reply: label `SUCCESS` with `data[0]` =
     /// the number of faults that follow, at most [`MAX_FAULTS_PER_REPLY`],
     /// then two words per fault: the requester ID in the low 32 bits and
-    /// the unit's fault reason in bits 32..40, and the faulting IOVA. A
-    /// fault past the bound stays for the next call.
+    /// the unit's fault reason in bits 32..48 (VT-d's 8-bit fault reason,
+    /// the RISC-V IOMMU's 12-bit `CAUSE`), and the faulting IOVA. A fault
+    /// past the bound stays for the next call.
     pub const TAKE_FAULTS: u64 = 6;
 
     /// Faults one [`TAKE_FAULTS`] reply carries: two words each after the

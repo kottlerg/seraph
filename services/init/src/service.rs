@@ -303,8 +303,8 @@ mod kind
 ///
 /// Only bootstrap-essential drivers ship as bundle modules, the IOMMU
 /// driver of the architecture's IOMMU family among them (`iommu-vtd` on
-/// x86-64; none on riscv64 yet). The per-arch RTC binary lives on the rootfs
-/// disk and is loaded lazily by devmgr after init delivers a
+/// x86-64, `iommu-riscv` on riscv64). The per-arch RTC binary lives on the
+/// rootfs disk and is loaded lazily by devmgr after init delivers a
 /// `/services/drivers/` subtree cap via `devmgr_labels::SET_DRIVERS_DIR`; no
 /// RTC `module_kind` is delivered.
 mod module_kind
@@ -577,7 +577,9 @@ pub fn create_devmgr_with_caps(
     // `SET_DRIVERS_DIR` handshake (Phase 3, below).
     let serial_module = crate::find_module_by_name(info, b"serial");
     let framebuffer_module = crate::find_module_by_name(info, b"framebuffer");
-    let iommu_module = crate::find_module_by_name(info, b"iommu-vtd");
+    // The bundle carries the IOMMU driver of its architecture's family only.
+    let iommu_module = crate::find_module_by_name(info, b"iommu-vtd")
+        .or_else(|| crate::find_module_by_name(info, b"iommu-riscv"));
     {
         let mut module_caps = [0u64; module_kind::COUNT];
         let mut module_data = [0u64; 2 + module_kind::COUNT];

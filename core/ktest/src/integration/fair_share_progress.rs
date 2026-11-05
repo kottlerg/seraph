@@ -42,9 +42,9 @@ const HOG_PRIORITY: u8 = 20;
 /// Level of the low child: the lowest settable level.
 const LOW_PRIORITY: u8 = syscall_abi::PRIORITY_MIN;
 
-/// Wall-time budget the low child has to run (µs): the hog's remaining
-/// quantum (at most 20 ticks of 1 ms) plus the dispatch, with room for a slow
-/// emulated host. Applied through [`crate::scaled_bound`].
+/// Wall-time budget the low child has to run (µs): the hog's remaining slice
+/// (core/kernel/docs/scheduler.md § Time Slice Policy) plus the dispatch, with
+/// room for a slow emulated host. Applied through [`crate::scaled_bound`].
 const PROGRESS_BUDGET_US: u64 = 200_000;
 
 /// 5 s windows the test waits, at most, for the hog to see [`STOP`] and post

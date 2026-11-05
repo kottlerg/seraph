@@ -420,7 +420,8 @@ thread's deferred reclaim (`drain_deferred_reclaim` from
 is sound only because the idle thread's time slice is permanently zero, so
 `timer_tick` returns before `schedule()` for it. Kernel-mode preemption
 exists only at a tick that decides a reschedule (a slice expiry, or a fair
-thread's preemption for RT; scheduler.md § Kernel-Mode Preemption Points)
+thread's preemption for RT;
+[scheduler.md § Kernel-Mode Preemption Points](scheduler.md#kernel-mode-preemption-points))
 with preemption enabled, and every kernel
 window that enables interrupts — shootdown ack-waits, the teardown gates,
 the timer-batch quiesce (`sleep_wakeups_quiesce`), the contended `pt_lock`
@@ -1447,7 +1448,8 @@ kernel mode" — the failure class userspace cannot observe, because no
 userspace runs when every CPU is wedged. `schedule()` stamps this CPU's
 last-non-idle-tick slot (`watchdog_mark_non_idle`; the per-CPU slab
 `LAST_NON_IDLE_TICK_PTR` names) whenever it dispatches a non-idle thread; `timer_tick`
-additionally stamps it when a slice expiry finds preemption disabled and
+additionally stamps it when a tick that decides a reschedule (a slice
+expiry, or a fair thread's preemption for RT) finds preemption disabled and
 must suppress the dispatch — a non-idle `current` taking timer ticks inside
 a shootdown ack-wait is live, and without this stamp a map/unmap storm
 whose ack-waits cover every CPU's slice expiries starves all stamps and

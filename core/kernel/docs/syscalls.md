@@ -1494,8 +1494,8 @@ claimed either by the stop or by the object's teardown, and both stamp the same 
 restart its syscall returns `Interrupted`, or a queued fault sender is killed. A thread running on
 another CPU is marked `Stopped` under every CPU's scheduler lock, and the call returns once that
 CPU has descheduled it and published its register save, at its next slice expiry, at a tick
-that preempts it for an RT thread (one dispatched at a fair level), or at the thread's own park or
-yield, or once an object teardown has committed `Exited` over it; the
+that preempts it for an RT thread (a target dispatched at a fair level), or at the thread's own
+park or yield, or once an object teardown has committed `Exited` over it; the
 inter-processor interrupt sent to that CPU only forces a trap. A thread left `current` on a CPU that
 `fatal` halted is never descheduled: a stop of it does not return through the drain until a
 teardown commits `Exited` over it, and that teardown never completes (see
@@ -1518,8 +1518,9 @@ target's remaining time slice (at most the longest slice, 20 timer ticks, that o
 slice expires while the target runs a preemption-disabled kernel section with interrupts
 enabled (a TLB-shootdown or drain spin, or a page-pool seeding or teardown window between
 batches, `interrupt_window`): `timer_tick` then refills the slice without rescheduling,
-and `preempt_enable` does not reschedule, so the stop completes at the first slice
-expiry that finds preemption enabled, a further slice later at the least. Callers that need a
+and `preempt_enable` does not reschedule, so the stop completes at the first tick that decides a
+reschedule with preemption enabled (a slice expiry, or, for a target dispatched at a fair level,
+a tick that finds an RT thread queued), a further slice later at the least. Callers that need a
 bounded stop latency MUST budget a slice for each expiry the target can spend in such a section.
 
 **Capability requirement:** `thread_cap` must have Control rights.

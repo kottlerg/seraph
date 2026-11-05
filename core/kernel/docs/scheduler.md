@@ -726,6 +726,7 @@ optimisation.
 ## Summarized By
 
 [core/kernel/README.md](../README.md), [Kernel Initialization Sequence](initialization.md),
+[IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
 [Architecture Overview](../../../docs/architecture.md)

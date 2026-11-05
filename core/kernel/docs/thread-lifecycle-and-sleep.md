@@ -785,8 +785,8 @@ The handler then drains the target.
    - Each pass that must wait also reads the stopper's own `state` under its `sched_lock`, which
      every `Stopped`/`Exited` commit holds. A stopper that has itself been stopped (a peer holding
      its Control cap stopping it back, or an object teardown) leaves the spin envelope and calls
-     `schedule(Requeue::IfRunnable)`: this preempt-disabled window suppresses the slice-expiry
-     switch that would otherwise deschedule it, and the syscall epilogue reschedules only an
+     `schedule(Requeue::IfRunnable)`: this preempt-disabled window suppresses the timer's
+     reschedule that would otherwise deschedule it, and the syscall epilogue reschedules only an
      `Exited` thread. When it is restarted it re-resolves its target through its own capability slot
      (nothing pins the slot across the park) and re-enters the drain only if the slot still names
      the target with Control rights, returning once the target has left its CPU; otherwise the

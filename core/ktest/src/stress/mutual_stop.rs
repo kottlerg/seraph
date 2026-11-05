@@ -13,7 +13,8 @@
 //! A stop of a thread running on another CPU commits `Stopped` under every
 //! CPU's scheduler lock and then drains it: the stopper spins, preemption
 //! disabled, until the target's CPU has descheduled it (at its next slice
-//! expiry, or its own park or yield). Two threads stopping each other
+//! expiry, a tick that preempts a fair-dispatched target for RT, or its own
+//! park or yield). Two threads stopping each other
 //! concurrently both commit, each while the other still runs its own stop,
 //! and each then drains the other. The drain used to watch the target alone,
 //! so each stopper, marked `Stopped` by the other, kept spinning for a target

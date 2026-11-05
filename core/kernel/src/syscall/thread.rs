@@ -275,8 +275,8 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
             crate::sched::StartCommit::CallerStopped =>
             {
                 // Deschedule now, as a self-stop does: the settle loop's
-                // preempt-disabled window made the timer skip its slice-expiry
-                // switch, and the syscall epilogue reschedules only an Exited
+                // preempt-disabled window made the timer skip its reschedule,
+                // and the syscall epilogue reschedules only an Exited
                 // thread. The restart resumes here. The target pin goes first
                 // (the pin-before-park rule of `PinnedCap`): a caller killed
                 // while stopped would otherwise hold it for good.
@@ -620,7 +620,7 @@ unsafe fn drain_remote_stopped(
         // SAFETY: caller_tcb is the running thread.
         if unsafe { stopper_stopped(caller_tcb) }
         {
-            // This preempt-disabled window suppresses the slice-expiry switch
+            // This preempt-disabled window suppresses the timer's reschedule
             // that would deschedule a stopped stopper: deschedule in place,
             // and resume the drain once restarted. Two threads stopping each
             // other thus both end Stopped instead of both spinning.

@@ -16,9 +16,11 @@
 //!     it, and print `PASS`. Exercises the real `Thread::new`/`join` demand
 //!     path and join-time `UNREGISTER_REGION` reclamation. Exits `SUCCESS`.
 //!   * `nested-grow` — as `grow`, but the recursing thread is spawned by a
-//!     spawned thread, so its pager binding reaches it through two runtime
-//!     copies of the spawning thread's bindings, not from the main thread.
-//!     Exits `SUCCESS`.
+//!     spawned thread, so its spawn runs the runtime's copy of the spawning
+//!     thread's bindings from a spawned thread. The middle and main threads
+//!     carry the same pager binding, so a pass shows the grandchild's demand
+//!     stack is served, not which thread's binding was copied. Exits
+//!     `SUCCESS`.
 //!   * `guard` — spawn a worker that recurses unbounded, past the usable
 //!     region into the guard page. The pager declines the unregistered fault,
 //!     the kernel kills the worker, and (via the address-space death-observer)
@@ -51,7 +53,7 @@ use std::process::ExitCode;
 /// depth.
 const FRAME_BYTES: usize = 4096;
 
-/// `grow` and `main-grow` recursion depth. 200 frames ≈ 820 KiB — many demand
+/// `grow`, `nested-grow`, and `main-grow` recursion depth. 200 frames ≈ 820 KiB — many demand
 /// faults, well inside the default 2 MiB usable demand stack, and 25 times the
 /// main thread's default 8 committed pages.
 const GROW_DEPTH: u64 = 200;
@@ -103,8 +105,8 @@ fn touch(buf: &[u8; FRAME_BYTES]) -> u64
 #[derive(Clone, Copy)]
 enum Direction
 {
-    /// Count `depth` down to the real base case at 0 (bounded, used by `grow`
-    /// and `main-grow`).
+    /// Count `depth` down to the real base case at 0 (bounded, used by `grow`,
+    /// `nested-grow`, and `main-grow`).
     Down,
     /// Count `depth` up, never reaching the base case at runtime (used by
     /// `guard` and `main-guard` to overflow into the guard page).

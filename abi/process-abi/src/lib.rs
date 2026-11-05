@@ -576,8 +576,8 @@ pub struct ProcessInfo
     /// creation; the runtime copies the spawning thread's bindings onto every
     /// thread it spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`), so demand paging
     /// covers the whole process and not just the main thread, and reads this
-    /// slot to tell that the process is demand-paged. The kernel stamps each fault with this cap's
-    /// derivation badge. Consumers must tolerate zero.
+    /// slot to tell that the process is demand-paged. The kernel stamps each
+    /// fault with this cap's derivation badge. Consumers must tolerate zero.
     pub pager_endpoint_cap: u64,
 
     /// The derivation badge of [`Self::pager_endpoint_cap`], identifying this

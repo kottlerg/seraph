@@ -1482,12 +1482,12 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, pro
 ///
 /// `req.badge` is the derivation badge of the Endpoint cap bound by
 /// `SYS_THREAD_SET_FAULT_HANDLER` (procmgr binds the process's own badged
-/// memmgr cap on its main thread, and the runtime copies that binding onto
-/// each thread it spawns with `SYS_THREAD_INHERIT_FAULT_HANDLER`), so
-/// attribution rests on the derivation-locked badge
+/// memmgr cap on its main thread, and the runtime copies that binding onto each
+/// thread it spawns with `SYS_THREAD_INHERIT_FAULT_HANDLER`), so attribution
+/// rests on the derivation-locked badge
 /// (`services/memmgr/docs/ipc-interface.md` § Badge Discipline). Words are
-/// `[kind, faulting_va, access, ip]`
-/// (same document, § Kernel-origin fault message (`FAULT_LABEL`)). On a VM
+/// `[kind, faulting_va, access, ip]` (same document, § Kernel-origin fault
+/// message (`FAULT_LABEL`)). On a VM
 /// fault whose address lies in a registered region of a process with a
 /// delegated address space, memmgr backs the [`chunk_for`] chunk containing
 /// the faulting page — one contiguous Memory cap mapped across up to

@@ -195,8 +195,9 @@ kernel cannot resolve is delivered to the thread's bound fault-handler endpoint 
 kernel-originated synchronous message, suspending the thread until the handler replies — resuming
 it, or, on `FAULT_REPLY_KILL`, killing it (failing the syscall with `InvalidAddress` when a
 restartable syscall's user copy faulted) — or the binding is severed and the fault is unhandled in
-the same way. A change of the binding before a reply claims the fault cancels the delivery, and the
-fault is delivered again under the binding current then, unhandled when none is bound. A stop of
+the same way. A change of the binding of the fault's class before a reply claims the fault
+cancels the delivery, and the fault is delivered again under the binding current then, unhandled
+when none is bound. A stop of
 the thread before any reply claims the fault cancels the episode, and a stop after a reply claims
 it leaves that reply's disposition; in both cases the thread is resumed, or its fault left
 unhandled, only if it is started again. This reuses the call/reply machinery

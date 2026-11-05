@@ -2563,10 +2563,11 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// (`cap::transfer::release_moved_object`), of the slot references a range
 /// split's consumed original and a memory merge's consumed tail held, of a
 /// copy's or derive's unpublished new-slot reference, of the address-space
-/// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`),
-/// of the fault-handler binding a rebind or unbind replaces
-/// (`sys_thread_set_fault_handler`), and of the endpoint pin a fault delivery
-/// holds until before its park (`ipc::fault::fault_dispatch`).
+/// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`), of
+/// the fault-handler binding a rebind or unbind replaces
+/// (`sys_thread_set_fault_handler` and `sys_thread_inherit_fault_handler`,
+/// through `ipc::fault::release_endpoints`), and of the endpoint pin a fault
+/// delivery holds until before its park (`ipc::fault::fault_dispatch`).
 /// Pins, moves, and mapping records may name an object bound to the running
 /// thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last reference
 /// goes here is queued for this CPU's deferred reclaim (drained at the next

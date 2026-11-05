@@ -1546,6 +1546,7 @@ mod tests
             owns_memory: core::sync::atomic::AtomicBool::new(false),
             allocator: RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
+            slot_count: core::sync::atomic::AtomicU32::new(0),
         };
         (buf, memory)
     }

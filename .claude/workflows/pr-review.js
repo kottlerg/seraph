@@ -133,7 +133,8 @@ const AUDIT_SECTION_NAMES = [
 ]
 // Read-only agent type for scope, verify, and synthesize. Its brief pins the
 // model: these stages answer bounded questions, so they run on a cheaper tier
-// than the shard reviewers and lenses, which inherit the session model.
+// than the shard reviewers and lenses, which run on the model pr-reviewer.md
+// pins.
 const INVESTIGATOR = 'pr-verifier'
 
 // ─── Schemas ───

@@ -35,7 +35,7 @@ Authority over memory is partitioned across four layers:
   the page-granular reservation allocator for foreign Memory mappings.
 
 The kernel hands the initial RAM memory caps to init at boot. Init
-transfers them to memmgr (derive-twice; see
+moves them to memmgr, which holds each one alone (see
 [Process Lifecycle](process-lifecycle.md) § Init → memmgr and
 [Capability Model](capability-model.md)). From that point on, memmgr is
 the sole userspace authority over RAM frame allocation; the kernel does

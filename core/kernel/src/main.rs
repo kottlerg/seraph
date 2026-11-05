@@ -950,6 +950,7 @@ unsafe fn kernel_entry_post_rebase(
                     owns_memory: core::sync::atomic::AtomicBool::new(true),
                     allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                     lock: core::sync::atomic::AtomicU32::new(0),
+                    slot_count: core::sync::atomic::AtomicU32::new(0),
                 });
                 let slot = cs
                     .insert_cap_typed(rights, fo_nn)
@@ -1118,6 +1119,7 @@ unsafe fn kernel_entry_post_rebase(
                     owns_memory: core::sync::atomic::AtomicBool::new(true),
                     allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                     lock: core::sync::atomic::AtomicU32::new(0),
+                    slot_count: core::sync::atomic::AtomicU32::new(0),
                 });
                 // Full rights, matching the segment caps above. This cap is
                 // held only to donate the page into memmgr's pool at init's
@@ -1226,6 +1228,7 @@ unsafe fn kernel_entry_post_rebase(
                     owns_memory: core::sync::atomic::AtomicBool::new(true),
                     allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                     lock: core::sync::atomic::AtomicU32::new(0),
+                    slot_count: core::sync::atomic::AtomicU32::new(0),
                 });
                 // Full rights, matching the segment and InitInfo caps. This cap
                 // is held only to donate the page into memmgr's pool at init's

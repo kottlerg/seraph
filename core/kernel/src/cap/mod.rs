@@ -310,11 +310,12 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 
 /// Slots of the root `CSpace`'s initial slot-page pool beyond the boot mint:
 /// what userspace init mints, copies, and derives into it during memmgr /
-/// procmgr bootstrap (kernel-object inserts and the per-RAM-Memory
-/// derive/copy chains in `finalize_memmgr`), about 700 caps observed. Set
-/// at about 1.8× that, per the seeding policy in docs/capability-model.md
-/// (growth budgets), so realistic growth of init's own use (more services,
-/// more derivations per RAM extent) does not revisit it.
+/// procmgr bootstrap (kernel-object inserts and derivations; the RAM caps
+/// `finalize_memmgr` moves to memmgr take none), at most about 700 caps
+/// observed. Set at about 1.8× that, per the seeding policy in
+/// docs/capability-model.md (growth budgets), so realistic growth of init's
+/// own use (more services, more derivations per RAM extent) does not revisit
+/// it.
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_HEADROOM_SLOTS: u64 = 1280;
 
@@ -339,10 +340,9 @@ const ROOT_CSPACE_BOOT_EXTRA_SLOTS: u64 = 4;
 /// SEED pages (~257 MiB: 65,664 leaves plus 128 directory pages) for a
 /// `CSpace` whose occupancy peaks at boot and is bounded in steady state.
 /// Growth past the seeded pool returns the refillable `OutOfMemory`. init
-/// never augments this `CSpace`; it budgets its own use inside the pool: it
-/// stops its forward of RAM caps to memmgr at `INIT_FORWARD_HEADROOM` general
-/// slots, a reserve sized for what it mints after the forward
-/// (services/init/src/bootstrap.rs), and hands the rest over at its reap.
+/// never augments this `CSpace`; its own use fits inside the pool, since its
+/// forward of RAM caps to memmgr moves them out and takes none of its slots
+/// (services/init/src/bootstrap.rs).
 #[cfg(not(test))]
 fn root_cspace_init_slot_capacity() -> u64
 {
@@ -607,6 +607,7 @@ static mut SEED_MEMORY: object::MemoryObject = object::MemoryObject {
     owns_memory: core::sync::atomic::AtomicBool::new(true),
     allocator: crate::cap::retype::RetypeAllocator::new_inline(),
     lock: AtomicU32::new(0),
+    slot_count: AtomicU32::new(0),
 };
 
 /// Borrow the seed `MemoryObject` shared.
@@ -1657,6 +1658,7 @@ fn firmware_table_memory(base: u64, size: u64) -> MemoryObject
         owns_memory: core::sync::atomic::AtomicBool::new(false),
         allocator: crate::cap::retype::RetypeAllocator::new_inline(),
         lock: AtomicU32::new(0),
+        slot_count: AtomicU32::new(0),
     }
 }
 
@@ -1769,6 +1771,7 @@ fn populate_cspace(
                 owns_memory: core::sync::atomic::AtomicBool::new(true),
                 allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                 lock: core::sync::atomic::AtomicU32::new(0),
+                slot_count: core::sync::atomic::AtomicU32::new(0),
             });
             let slot = insert_or_fatal(
                 cspace,
@@ -1825,6 +1828,7 @@ fn populate_cspace(
             owns_memory: core::sync::atomic::AtomicBool::new(false),
             allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
+            slot_count: core::sync::atomic::AtomicU32::new(0),
         });
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
@@ -2200,6 +2204,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
             owns_memory: core::sync::atomic::AtomicBool::new(true),
             allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
+            slot_count: core::sync::atomic::AtomicU32::new(0),
         });
         // Full rights so the cap can flow through the donation chain into
         // memmgr's pool (memmgr-issued reply caps must carry RETYPE for
@@ -2449,6 +2454,7 @@ fn mint_reclaim_pass(
             owns_memory: core::sync::atomic::AtomicBool::new(true),
             allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
+            slot_count: core::sync::atomic::AtomicU32::new(0),
         });
         let slot = insert_or_fatal(
             cspace,

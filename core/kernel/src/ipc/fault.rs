@@ -18,11 +18,12 @@
 //! syscall) or to take the unhandled outcome: a kill for a trap, the
 //! syscall's `InvalidAddress` for a copy.
 //!
-//! A change of the binding while a delivery is in flight
-//! ([`redeliver_in_flight`], run by `SYS_THREAD_SET_FAULT_HANDLER`) cancels
-//! that delivery, and [`fault_dispatch`] makes it again under the binding
-//! current when the faulting thread next runs; with none bound then, the fault
-//! takes the unhandled outcome.
+//! A change of the binding of an in-flight delivery's class
+//! ([`publish_bindings`], then [`redeliver_in_flight`], run by
+//! `SYS_THREAD_SET_FAULT_HANDLER` and `SYS_THREAD_INHERIT_FAULT_HANDLER`)
+//! cancels that delivery, and [`fault_dispatch`] makes it again under the
+//! binding current when the faulting thread next runs; with none bound then,
+//! the fault takes the unhandled outcome.
 //!
 //! Delivery reuses the synchronous-IPC machinery: the faulting thread takes the
 //! caller role (parked in [`IpcThreadState::BlockedOnFault`] rather than
@@ -60,6 +61,67 @@ pub const FAULT_OUTCOME_DECLINED: u8 = 4;
 /// `fault_outcome` value, it reports [`KillCause::BindingCleared`].
 const DELIVERY_UNBOUND: u8 = u8::MAX;
 
+/// Number of fault classes a thread binds separately
+/// (docs/fault-handling.md § Fault-Handler Binding), and the length of the
+/// per-class binding arrays of [`ThreadControlBlock`].
+pub const FAULT_CLASSES: usize = 2;
+
+/// Class index of virtual-memory faults ([`syscall::FAULT_CLASS_VM`]).
+pub const CLASS_VM: usize = 0;
+
+/// Class index of every other user exception
+/// ([`syscall::FAULT_CLASS_EXCEPTION`]).
+pub const CLASS_EXCEPTION: usize = 1;
+
+/// The ABI class bit of each class index.
+const CLASS_BITS: [u64; FAULT_CLASSES] = [syscall::FAULT_CLASS_VM, syscall::FAULT_CLASS_EXCEPTION];
+
+/// The class index a fault of `kind` is delivered through: `FAULT_KIND_VM`
+/// through [`CLASS_VM`], every other kind through [`CLASS_EXCEPTION`].
+#[must_use]
+pub fn class_of_kind(kind: u64) -> usize
+{
+    if kind == syscall::FAULT_KIND_VM
+    {
+        CLASS_VM
+    }
+    else
+    {
+        CLASS_EXCEPTION
+    }
+}
+
+/// The classes a `fault_class_mask` selects, by class index: every class for
+/// [`syscall::FAULT_CLASS_ALL`], else each class whose bit the mask sets.
+/// `None` for a mask the ABI refuses: zero, or one with a bit no class
+/// defines.
+#[must_use]
+pub fn classes_of_mask(mask: u64) -> Option<[bool; FAULT_CLASSES]>
+{
+    if mask == syscall::FAULT_CLASS_ALL
+    {
+        return Some([true; FAULT_CLASSES]);
+    }
+    let defined = CLASS_BITS.iter().fold(0, |acc, bit| acc | bit);
+    if mask == 0 || mask & !defined != 0
+    {
+        return None;
+    }
+    Some(CLASS_BITS.map(|bit| mask & bit != 0))
+}
+
+/// The class index a mask of exactly one class bit names; `None` for any
+/// other mask (zero, several bits, an undefined bit, or `FAULT_CLASS_ALL`).
+#[must_use]
+pub fn class_of_bit(mask: u64) -> Option<usize>
+{
+    CLASS_BITS.iter().position(|&bit| bit == mask)
+}
+
+/// One class's binding as published: the endpoint (null for none) and the
+/// badge bound with it.
+pub type Binding = (*mut EndpointObject, u64);
+
 /// Architecture-neutral description of a fault, marshalled into the fault
 /// message's data words `[kind, d1, d2, ip]`.
 #[derive(Clone, Copy)]
@@ -94,7 +156,8 @@ pub enum FaultOutcome
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum KillCause
 {
-    /// The binding was found cleared when the delivery read it.
+    /// The binding of the fault's class was found cleared when the delivery
+    /// read it.
     BindingCleared,
     /// The delivery was cancelled before any reply claimed it (handler thread
     /// destroyed, handler endpoint destroyed, a later receive on the handler
@@ -116,7 +179,9 @@ pub fn report_user_kill(tid: u32, cause: KillCause)
     {
         KillCause::BindingCleared =>
         {
-            crate::kprintln_serial!("fault unhandled: tid={tid} binding cleared before delivery");
+            crate::kprintln_serial!(
+                "fault unhandled: tid={tid} class binding cleared before delivery"
+            );
         }
         KillCause::Cancelled =>
         {
@@ -135,7 +200,8 @@ pub fn report_user_kill(tid: u32, cause: KillCause)
     }
 }
 
-/// True iff `tcb` has a fault handler bound at the moment of the load.
+/// True iff `tcb` has a fault handler bound for the class of a fault of
+/// `kind` at the moment of the load.
 ///
 /// A lock-free pre-check for the architecture handlers and the syscall
 /// dispatcher: a concurrent unbind may clear the binding before
@@ -145,19 +211,19 @@ pub fn report_user_kill(tid: u32, cause: KillCause)
 /// # Safety
 /// `tcb` must be a valid TCB pointer.
 #[cfg(not(test))]
-pub unsafe fn has_handler(tcb: *mut ThreadControlBlock) -> bool
+pub unsafe fn has_handler(tcb: *mut ThreadControlBlock, kind: u64) -> bool
 {
-    // SAFETY: tcb validated by caller; fault_handler field always valid.
-    !unsafe { (*tcb).fault_handler.load(Ordering::Acquire) }.is_null()
+    // SAFETY: tcb validated by caller; the binding fields are atomics.
+    !unsafe { (*tcb).fault_handlers[class_of_kind(kind)].load(Ordering::Acquire) }.is_null()
 }
 
-/// Read `tcb`'s fault-handler binding once, pin its endpoint, and open a
-/// delivery through it.
+/// Read `tcb`'s fault-handler binding for `class` once, pin its endpoint, and
+/// open a delivery through it.
 ///
 /// Returns the bound `EndpointObject`, with a reference the caller owns and
 /// MUST release, and the badge bound with it; `None` when no handler is bound.
-/// The pair is read under `tcb`'s `sched_lock`, the lock
-/// `sys_thread_set_fault_handler` publishes it under, so the badge is the one
+/// The pair is read under `tcb`'s `sched_lock`, the lock [`publish_bindings`]
+/// publishes it under for both binders, so the badge is the one
 /// bound with this endpoint, and the reference is taken while the binding's
 /// own reference still holds the object: the binder releases the old binding's
 /// reference only after it unlocks.
@@ -166,26 +232,30 @@ pub unsafe fn has_handler(tcb: *mut ThreadControlBlock) -> bool
 /// `fault_outcome = Pending`, so a stale prior disposition cannot be mistaken
 /// for this fault's (the single wake-claim winner overwrites it), and
 /// `in_fault_delivery`, so a dequeuing `endpoint_recv` parks the thread
-/// `BlockedOnFault` (not `BlockedOnReply`). Both are written under the lock
-/// the binding is, so a binder finds in its own hold whether a delivery
-/// through the binding it replaces is in flight ([`delivery_in_flight`]).
+/// `BlockedOnFault` (not `BlockedOnReply`), with `fault_delivery_class`
+/// naming the class. All are written under the lock the binding is, so a
+/// binder finds in its own hold whether a delivery through the binding it
+/// replaces is in flight ([`delivery_in_flight`]).
 ///
 /// # Safety
-/// `tcb` must be the current CPU's running thread, with no lock held.
+/// `tcb` must be the current CPU's running thread, with no lock held;
+/// `class < FAULT_CLASSES`.
 #[cfg(not(test))]
 unsafe fn pin_binding(
     tcb: *mut ThreadControlBlock,
+    class: usize,
 ) -> Option<(core::ptr::NonNull<EndpointObject>, u64)>
 {
     // SAFETY: tcb is the running thread (contract); lock_raw is paired with
-    // the unlock_raw below. A non-null fault_handler read under sched_lock
-    // names an endpoint the binding references, so it is live for inc_ref.
+    // the unlock_raw below. A non-null fault_handlers entry read under
+    // sched_lock names an endpoint the binding references, so it is live for
+    // inc_ref.
     // The markers are this thread's own until its delivery makes it
     // wakeable.
     unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
-        let ep = core::ptr::NonNull::new((*tcb).fault_handler.load(Ordering::Acquire));
-        let badge = (*tcb).fault_badge.load(Ordering::Relaxed);
+        let ep = core::ptr::NonNull::new((*tcb).fault_handlers[class].load(Ordering::Acquire));
+        let badge = (*tcb).fault_badges[class].load(Ordering::Relaxed);
         if let Some(ep) = ep
         {
             ep.as_ref().header.inc_ref();
@@ -193,25 +263,134 @@ unsafe fn pin_binding(
                 .fault_outcome
                 .store(FAULT_OUTCOME_PENDING, Ordering::Release);
             (*tcb).in_fault_delivery = true;
+            // cast_possible_truncation: class < FAULT_CLASSES (2).
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                (*tcb).fault_delivery_class = class as u8;
+            }
         }
         (*tcb).sched_lock.unlock_raw(saved);
         ep.map(|ep| (ep, badge))
     }
 }
 
-/// Whether a fault delivery through `tcb`'s binding is in flight: opened by
-/// [`pin_binding`] and given no disposition yet by a wake claim.
+/// Whether a fault delivery through `tcb`'s binding for `class` is in
+/// flight: opened by [`pin_binding`] and given no disposition yet by a wake
+/// claim.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB whose `sched_lock` the caller holds.
 #[cfg(not(test))]
-pub unsafe fn delivery_in_flight(tcb: *mut ThreadControlBlock) -> bool
+pub unsafe fn delivery_in_flight(tcb: *mut ThreadControlBlock, class: usize) -> bool
 {
     // SAFETY: the caller holds tcb.sched_lock, under which in_fault_delivery
-    // is written; fault_outcome is atomic.
+    // and fault_delivery_class are written; fault_outcome is atomic.
     unsafe {
         (*tcb).in_fault_delivery
+            && usize::from((*tcb).fault_delivery_class) == class
             && (*tcb).fault_outcome.load(Ordering::Acquire) == FAULT_OUTCOME_PENDING
+    }
+}
+
+/// Read `tcb`'s bindings for the `selected` classes once, under its
+/// `sched_lock`, each endpoint with a reference the caller owns and MUST
+/// release (or hand to [`publish_bindings`]); an unselected or unbound
+/// class reads `(null, 0)`. The reference is taken while the binding's own
+/// still holds the object, as [`pin_binding`] takes its own.
+///
+/// # Safety
+/// `tcb` must be a valid TCB the caller pins; the caller holds no lock.
+#[cfg(not(test))]
+pub unsafe fn pin_bindings(
+    tcb: *mut ThreadControlBlock,
+    selected: [bool; FAULT_CLASSES],
+) -> [Binding; FAULT_CLASSES]
+{
+    let mut out: [Binding; FAULT_CLASSES] = [(core::ptr::null_mut(), 0); FAULT_CLASSES];
+    // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw. A
+    // non-null endpoint read under sched_lock is held by the binding's
+    // reference, so it is live for inc_ref.
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        for (class, slot) in out.iter_mut().enumerate()
+        {
+            if !selected[class]
+            {
+                continue;
+            }
+            let ep = (*tcb).fault_handlers[class].load(Ordering::Acquire);
+            if !ep.is_null()
+            {
+                (*ep).header.inc_ref();
+                *slot = (ep, (*tcb).fault_badges[class].load(Ordering::Relaxed));
+            }
+        }
+        (*tcb).sched_lock.unlock_raw(saved);
+    }
+    out
+}
+
+/// Publish `new[class]` as `tcb`'s binding for each `selected` class, in one
+/// hold of its `sched_lock`, the lock [`pin_binding`] reads a binding under.
+/// Each published endpoint's reference passes from the caller to the
+/// binding. Returns the replaced endpoints, whose references pass to the
+/// caller to release outside every lock (null for an unselected or unbound
+/// class), and the class of a delivery in flight under a replaced binding
+/// that changed (another endpoint or badge), for which the caller then runs
+/// [`redeliver_in_flight`]. A thread has at most one delivery in flight, so
+/// at most one class is returned.
+///
+/// # Safety
+/// `tcb` must be a valid TCB the caller pins; the caller holds no lock.
+#[cfg(not(test))]
+pub unsafe fn publish_bindings(
+    tcb: *mut ThreadControlBlock,
+    selected: [bool; FAULT_CLASSES],
+    new: [Binding; FAULT_CLASSES],
+) -> ([*mut EndpointObject; FAULT_CLASSES], Option<usize>)
+{
+    let mut old = [core::ptr::null_mut(); FAULT_CLASSES];
+    let mut redeliver = None;
+    // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw; the
+    // binding pairs are written under this lock.
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        for (class, &(ep, badge)) in new.iter().enumerate()
+        {
+            if !selected[class]
+            {
+                continue;
+            }
+            let old_badge = (*tcb).fault_badges[class].swap(badge, Ordering::Relaxed);
+            old[class] = (*tcb).fault_handlers[class].swap(ep, Ordering::AcqRel);
+            let changed = !core::ptr::eq(old[class], ep) || old_badge != badge;
+            if changed && delivery_in_flight(tcb, class)
+            {
+                redeliver = Some(class);
+            }
+        }
+        (*tcb).sched_lock.unlock_raw(saved);
+    }
+    (old, redeliver)
+}
+
+/// Release the endpoint references `eps` holds (null entries skipped),
+/// freeing an endpoint whose last reference this is.
+///
+/// # Safety
+/// Each non-null entry is a live `EndpointObject` whose reference the caller
+/// owns; syscall context with interrupts disabled and no lock held
+/// (`release_ref`'s precondition).
+#[cfg(not(test))]
+pub unsafe fn release_endpoints(eps: [*mut EndpointObject; FAULT_CLASSES])
+{
+    for ep in eps
+    {
+        if let Some(ep) = core::ptr::NonNull::new(ep)
+        {
+            // SAFETY: caller contract; the header is at offset 0.
+            unsafe { crate::cap::object::release_ref(ep.cast::<KernelObjectHeader>()) };
+        }
     }
 }
 
@@ -286,8 +465,9 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
 #[cfg(not(test))]
 unsafe fn deliver_once(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> u8
 {
-    // SAFETY: tcb is the current CPU's running thread; no lock is held.
-    let Some((ep_obj, badge)) = (unsafe { pin_binding(tcb) })
+    // SAFETY: tcb is the current CPU's running thread; no lock is held; the
+    // class index is below FAULT_CLASSES.
+    let Some((ep_obj, badge)) = (unsafe { pin_binding(tcb, class_of_kind(info.kind)) })
     else
     {
         return DELIVERY_UNBOUND;
@@ -384,11 +564,13 @@ unsafe fn deliver_once(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> u8
     outcome
 }
 
-/// Cancel the fault delivery in flight on `tcb` for a binding change, so the
-/// faulting thread delivers it again under the binding current when it next
-/// runs ([`FAULT_OUTCOME_REDELIVER`]); `SYS_THREAD_SET_FAULT_HANDLER` calls it
-/// after a change whose own hold found a delivery in flight
-/// ([`delivery_in_flight`]).
+/// Cancel the fault delivery of `class` in flight on `tcb` for a change of
+/// that class's binding, so the faulting thread delivers it again under the
+/// binding current when it next runs ([`FAULT_OUTCOME_REDELIVER`]). Both
+/// binders (`SYS_THREAD_SET_FAULT_HANDLER` and
+/// `SYS_THREAD_INHERIT_FAULT_HANDLER`, through `apply_bindings`) call it after
+/// a change whose own [`publish_bindings`] hold found a delivery of that class
+/// in flight ([`delivery_in_flight`]).
 ///
 /// Each pass re-reads the delivery under `tcb`'s `sched_lock` and ends when
 /// none is in flight: a wake claim gave it a disposition first (a handler's
@@ -408,15 +590,15 @@ unsafe fn deliver_once(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> u8
 ///
 /// # Safety
 /// `tcb` must be a valid TCB the caller pins, other than the calling
-/// thread's; the caller holds no lock.
+/// thread's; the caller holds no lock; `class < FAULT_CLASSES`.
 #[cfg(not(test))]
-pub unsafe fn redeliver_in_flight(tcb: *mut ThreadControlBlock)
+pub unsafe fn redeliver_in_flight(tcb: *mut ThreadControlBlock, class: usize)
 {
     let mut spinning: Option<u64> = None;
     loop
     {
         // SAFETY: tcb valid per contract; no lock held.
-        let done = match unsafe { in_flight_park(tcb) }
+        let done = match unsafe { in_flight_park(tcb, class) }
         {
             Some((ThreadState::Blocked, ipc_state, blocked_on, park_seq)) =>
             {
@@ -453,7 +635,7 @@ pub unsafe fn redeliver_in_flight(tcb: *mut ThreadControlBlock)
 }
 
 /// Snapshot `tcb`'s `(state, ipc_state, blocked_on_object, park_seq)` under
-/// its `sched_lock` while a fault delivery is in flight on it
+/// its `sched_lock` while a fault delivery of `class` is in flight on it
 /// ([`delivery_in_flight`]); `None` when none is.
 ///
 /// # Safety
@@ -461,13 +643,14 @@ pub unsafe fn redeliver_in_flight(tcb: *mut ThreadControlBlock)
 #[cfg(not(test))]
 unsafe fn in_flight_park(
     tcb: *mut ThreadControlBlock,
+    class: usize,
 ) -> Option<(ThreadState, IpcThreadState, *mut u8, u32)>
 {
     // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw; the
     // Scheduling fields are read under sched_lock, their owner.
     unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
-        let snap = delivery_in_flight(tcb).then(|| {
+        let snap = delivery_in_flight(tcb, class).then(|| {
             (
                 (*tcb).state,
                 (*tcb).ipc_state,
@@ -644,5 +827,71 @@ unsafe fn stamp_redeliver(tcb: *mut ThreadControlBlock)
         crate::sched::thread::stamp_deposit_episode(tcb);
         (*tcb).ipc_state = IpcThreadState::None;
         (*tcb).blocked_on_object = core::ptr::null_mut();
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn all_classes_mask_selects_every_class()
+    {
+        assert_eq!(
+            classes_of_mask(syscall::FAULT_CLASS_ALL),
+            Some([true; FAULT_CLASSES])
+        );
+    }
+
+    #[test]
+    fn class_bits_select_their_classes_alone_or_together()
+    {
+        assert_eq!(
+            classes_of_mask(syscall::FAULT_CLASS_VM),
+            Some([true, false])
+        );
+        assert_eq!(
+            classes_of_mask(syscall::FAULT_CLASS_EXCEPTION),
+            Some([false, true])
+        );
+        assert_eq!(
+            classes_of_mask(syscall::FAULT_CLASS_VM | syscall::FAULT_CLASS_EXCEPTION),
+            Some([true, true])
+        );
+    }
+
+    #[test]
+    fn empty_and_undefined_masks_are_refused()
+    {
+        assert_eq!(classes_of_mask(0), None);
+        assert_eq!(classes_of_mask(1 << 2), None);
+        assert_eq!(classes_of_mask(syscall::FAULT_CLASS_VM | (1 << 63)), None);
+    }
+
+    #[test]
+    fn a_single_class_bit_names_its_class_and_nothing_else_does()
+    {
+        assert_eq!(class_of_bit(syscall::FAULT_CLASS_VM), Some(CLASS_VM));
+        assert_eq!(
+            class_of_bit(syscall::FAULT_CLASS_EXCEPTION),
+            Some(CLASS_EXCEPTION)
+        );
+        assert_eq!(class_of_bit(0), None);
+        assert_eq!(
+            class_of_bit(syscall::FAULT_CLASS_VM | syscall::FAULT_CLASS_EXCEPTION),
+            None
+        );
+        assert_eq!(class_of_bit(syscall::FAULT_CLASS_ALL), None);
+    }
+
+    #[test]
+    fn vm_faults_use_the_vm_class_and_other_kinds_the_exception_class()
+    {
+        assert_eq!(class_of_kind(syscall::FAULT_KIND_VM), CLASS_VM);
+        assert_eq!(
+            class_of_kind(syscall::FAULT_KIND_EXCEPTION),
+            CLASS_EXCEPTION
+        );
     }
 }

@@ -144,17 +144,19 @@ pub mod procmgr_labels
     pub const CREATE_FROM_FILE: u64 = 13;
     /// Label flag (bit 16) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
     /// create the new process *pinned* — eager-mapped, with no system pager.
-    /// Demand paging is the default: when this flag is clear, procmgr binds
-    /// the child's main thread fault handler to memmgr (the system pager),
+    /// Demand paging is the default: when this flag is clear, procmgr binds the
+    /// child's main thread fault handler to memmgr (the system pager),
     /// delegates the child `AddressSpace` cap to memmgr via
     /// `memmgr_labels::DELEGATE_ASPACE`, and advertises the pager in
-    /// `ProcessInfo` (`pager_endpoint_cap` / `pager_badge`) so the runtime
-    /// inherits it onto spawned threads. Set this flag only for a process
-    /// that cannot depend on the fault path — a driver doing DMA, whose
-    /// memory a device may write before a demand fault could back it.
-    /// Occupies bit 16 of the `[16..31]` label window. init,
-    /// memmgr, and procmgr are pre-pager and never routed through this
-    /// binding path, so they are pinned by construction regardless.
+    /// `ProcessInfo` (`pager_endpoint_cap` / `pager_badge`), which tells the
+    /// runtime the process is demand-paged; the runtime copies the spawning
+    /// thread's bindings, the pager among them, onto each thread it spawns
+    /// (`SYS_THREAD_INHERIT_FAULT_HANDLER`). Set this flag only for a process
+    /// that cannot depend on the fault path — a driver doing DMA, whose memory
+    /// a device may write before a demand fault could back it. Occupies bit 16
+    /// of the `[16..31]` label window. init, memmgr, and procmgr are pre-pager
+    /// and never routed through this binding path, so they are pinned by
+    /// construction regardless.
     pub const CREATE_PINNED: u64 = 1 << 16;
     /// Label flag (bit 17) for [`CREATE_FROM_FILE`]: the message carries a
     /// trailing death-relay POST-only `EventQueue` cap (the LAST cap in the

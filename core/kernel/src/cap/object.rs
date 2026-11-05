@@ -2563,10 +2563,11 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// (`cap::transfer::release_moved_object`), of the slot references a range
 /// split's consumed original and a memory merge's consumed tail held, of a
 /// copy's or derive's unpublished new-slot reference, of the address-space
-/// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`),
-/// of the fault-handler binding a rebind or unbind replaces
-/// (`sys_thread_set_fault_handler`), and of the endpoint pin a fault delivery
-/// holds until before its park (`ipc::fault::fault_dispatch`).
+/// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`), of
+/// the fault-handler binding a rebind or unbind replaces
+/// (`sys_thread_set_fault_handler` and `sys_thread_inherit_fault_handler`,
+/// through `ipc::fault::release_endpoints`), and of the endpoint pin a fault
+/// delivery holds until before its park (`ipc::fault::fault_dispatch`).
 /// Pins, moves, and mapping records may name an object bound to the running
 /// thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last reference
 /// goes here is queued for this CPU's deferred reclaim (drained at the next
@@ -4047,27 +4048,29 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     }
                 }
 
-                // Release this thread's fault-handler binding, if any. The
-                // binding held an inc_ref on the endpoint object for its lifetime
-                // (see ThreadControlBlock::fault_handler); drop it, and if this
-                // was its last reference enqueue the orphaned endpoint on the
-                // cascade stack (rather than recursing into `dealloc_object`,
-                // which the cascade exists to avoid). Done
+                // Release this thread's fault-handler bindings, one per class.
+                // Each binding held an inc_ref on its endpoint object for its
+                // lifetime (see ThreadControlBlock::fault_handlers); drop it, and
+                // if this was its last reference enqueue the orphaned endpoint
+                // on the cascade stack (rather than recursing into
+                // `dealloc_object`, which the cascade exists to avoid). Done
                 // after the unlink above (which removed this thread from the
                 // endpoint's send queue if it was a queued faulter) so the
                 // endpoint dealloc cannot observe this thread still on its queue.
-                // SAFETY: tcb valid (not yet freed); fault_handler is atomic; no
-                // lock is held here; a binding's reference that was the
+                // SAFETY: tcb valid (not yet freed); the bindings are atomics;
+                // no lock is held here; a binding's reference that was the
                 // endpoint's last leaves it unreferenced for the push.
                 unsafe {
-                    let ep = (*tcb)
-                        .fault_handler
-                        .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
-                    if !ep.is_null() && (*ep).header.dec_ref() == 0
+                    for slot in &(*tcb).fault_handlers
                     {
-                        stack.push(core::ptr::NonNull::new_unchecked(
-                            ep.cast::<KernelObjectHeader>(),
-                        ));
+                        let ep =
+                            slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+                        if !ep.is_null() && (*ep).header.dec_ref() == 0
+                        {
+                            stack.push(core::ptr::NonNull::new_unchecked(
+                                ep.cast::<KernelObjectHeader>(),
+                            ));
+                        }
                     }
                 }
 

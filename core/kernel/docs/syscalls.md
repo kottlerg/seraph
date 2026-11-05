@@ -196,9 +196,11 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  53  SYS_ASPACE_BIND_NOTIFICATION
                                  54  SYS_PROCESS_EXIT
                                  55  SYS_GETRANDOM
+                                 56  SYS_THREAD_GET_FAULT_HANDLER
+                                 57  SYS_THREAD_INHERIT_FAULT_HANDLER
 ```
 
-**Implementation status.** Every number 0–55 has a handler; unallocated numbers
+**Implementation status.** Every number 0–57 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -1807,10 +1809,10 @@ the user half, or a fault on it that is unhandled; restartable, § Restartable S
 
 ### `SYS_THREAD_SET_FAULT_HANDLER` (32)
 
-Bind (or clear) the per-thread fault-handler endpoint. A kernel-unresolvable fault
-on the target thread is delivered as a synchronous, kernel-originated IPC to this
-endpoint's receiver, suspending the thread until the handler replies; with no
-handler bound the fault is terminal. See
+Bind (or clear) the per-thread fault-handler endpoint for the fault classes a mask selects. A
+kernel-unresolvable fault on the target thread is delivered as a synchronous, kernel-originated
+IPC to the receiver of its class's endpoint, suspending the thread until the handler replies; with
+no handler bound for its class the fault is terminal. See
 [`docs/fault-handling.md`](../../../docs/fault-handling.md).
 
 **Arguments:**
@@ -1820,24 +1822,26 @@ handler bound the fault is terminal. See
 | 0 | `thread_cap` | Thread capability (Control rights) — the thread whose handler is set |
 | 1 | `endpoint_cap` | `Endpoint` capability, or `0` to unbind |
 | 2 | `reserved` | MUST be `0` |
-| 3 | `fault_class_mask` | Fault classes covered; only `FAULT_CLASS_ALL` is accepted |
+| 3 | `fault_class_mask` | Fault classes bound or unbound: `FAULT_CLASS_ALL`, or a nonzero combination of `FAULT_CLASS_VM` and `FAULT_CLASS_EXCEPTION`; the classes left out keep their bindings |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-Binding takes a reference on the endpoint object for the binding's lifetime; rebinding, unbinding,
-or thread destruction releases it (see [fault-handling.md](../../../docs/fault-handling.md) §
-Liveness). The target Thread and the endpoint are pinned for the call
-([capability-internals.md](capability-internals.md#storage-hybrid-radix-directory) § Storage:
-Hybrid Radix Directory), so a concurrent delete of either one's last capability frees it only
-after the binding is published. The endpoint and its badge are published as one unit under the
-target thread's `sched_lock`; fault delivery reads them once under the same lock and pins the
-endpoint until the faulting thread parks, so a concurrent rebind or unbind neither pairs one
-binding's endpoint with another's badge nor frees the endpoint mid-delivery, and a delivery that
-finds the binding cleared leaves the fault unhandled (the thread is killed, or a restartable
-syscall's copy fault fails the syscall with `InvalidAddress`; § Restartable Syscalls)
-([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
-Object Reference Counting). A change of the binding (an unbind, or a bind to another endpoint or
-with another badge) cancels the fault delivery in flight through the binding it replaces, unless a
+Each selected class's binding takes its own reference on the endpoint object for the binding's
+lifetime; that class's rebinding or unbinding, or thread destruction, releases it (see
+[fault-handling.md](../../../docs/fault-handling.md) § Liveness). The target Thread and the endpoint
+are pinned for the call
+([capability-internals.md](capability-internals.md#storage-hybrid-radix-directory) § Storage: Hybrid
+Radix Directory), so a concurrent delete of either one's last capability frees it only after the
+binding is published. A class's endpoint and badge are published as one unit under the target
+thread's `sched_lock`; fault delivery reads them once under the same lock and pins the endpoint
+until the faulting thread parks, so a concurrent rebind or unbind neither pairs one binding's
+endpoint with another's badge nor frees the endpoint mid-delivery, and a delivery that finds the
+binding cleared leaves the fault unhandled (the thread is killed, or a restartable syscall's copy
+fault fails the syscall with `InvalidAddress`; § Restartable Syscalls)
+([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel Object
+Reference Counting). A change of a class's binding (an unbind, or a bind to another
+endpoint or with another badge) cancels the fault delivery of that class in flight through the
+binding it replaces, unless a
 reply or another cancellation claimed it first: a queued fault message is withdrawn, a handler that
 received it finds no pending reply (`SYS_IPC_REPLY` fails with `InvalidCapability`), and the
 faulting thread delivers the fault again under the binding current when it next runs, the fault
@@ -1854,19 +1858,78 @@ also serves clients on that
 endpoint attributes the message by badge, with the guarantees of an ordinary send's badge (see
 [fault-handling.md](../../../docs/fault-handling.md) § Security).
 
-Both page faults (`FAULT_KIND_VM`), the faults of a restartable syscall's user copy among them
-(§ Restartable Syscalls), and other kernel-unresolvable ring-3 exceptions
-(`FAULT_KIND_EXCEPTION`) are routed to the bound handler; the handler dispatches on
-the fault kind and replies `FAULT_REPLY_KILL` for kinds it does not handle (see
+Page faults (`FAULT_KIND_VM`), the faults of a restartable syscall's user copy among them
+(§ Restartable Syscalls), are routed to the handler of `FAULT_CLASS_VM`, and other
+kernel-unresolvable ring-3 exceptions (`FAULT_KIND_EXCEPTION`) to the handler of
+`FAULT_CLASS_EXCEPTION`; a handler bound for both classes dispatches on the fault kind and replies
+`FAULT_REPLY_KILL` for kinds it does not handle (see
 [fault-handling.md](../../../docs/fault-handling.md) § Fault-Handler Binding and
 § Implementation Status).
 
 **Capability requirement:** `thread_cap` MUST have Control rights; `endpoint_cap`
 (when non-zero) MUST refer to an `Endpoint`.
 
-**Errors:** `InvalidCapability` (bad thread or endpoint cap), `InsufficientRights`
-(thread lacks Control), `InvalidArgument` (`reserved` nonzero, or `fault_class_mask` other
-than `FAULT_CLASS_ALL`).
+**Errors:** `InvalidArgument` (`reserved` nonzero, or `fault_class_mask` zero or with a bit no
+class defines; checked first), `InvalidCapability` (bad thread or endpoint cap),
+`InsufficientRights` (thread lacks Control).
+
+---
+
+### `SYS_THREAD_GET_FAULT_HANDLER` (56)
+
+Read a thread's fault-handler binding for one fault class (see
+[fault-handling.md](../../../docs/fault-handling.md) § Fault-Handler Binding).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `thread_cap` | Thread capability (Control rights) |
+| 1 | `class` | Exactly one class bit: `FAULT_CLASS_VM` or `FAULT_CLASS_EXCEPTION` |
+
+**Return:** `rax`/`a0`: `1` when the class is bound, `0` when it is not, or a `SyscallError`;
+on success `rdx`/`a1` carries the bound badge (`0` when unbound).
+
+The class's endpoint and badge are read once under the target thread's `sched_lock`, where the
+binders publish them, so the badge is the one bound with the endpoint the flag reports. The call
+creates no capability and returns no endpoint or kernel address; the badge is the derivation badge
+of the cap a binder bound or the copy of one (see
+[cross-boundary-disclosure.md](cross-boundary-disclosure.md)).
+
+**Capability requirement:** `thread_cap` MUST have Control rights.
+
+**Errors:** `InvalidArgument` (`class` is not exactly one class bit; checked first),
+`InvalidCapability` (bad thread cap), `InsufficientRights` (the cap lacks Control).
+
+---
+
+### `SYS_THREAD_INHERIT_FAULT_HANDLER` (57)
+
+Copy one thread's fault-handler bindings, per class, onto another (see
+[fault-handling.md](../../../docs/fault-handling.md) § Fault-Handler Binding and § Inheritance is
+userspace policy).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `dst_thread_cap` | Thread capability (Control rights), the thread bound |
+| 1 | `src_thread_cap` | Thread capability (Control rights), the thread whose bindings are copied |
+| 2 | `fault_class_mask` | Classes copied, as for `SYS_THREAD_SET_FAULT_HANDLER` |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+For each selected class the destination is bound to the source's endpoint with the source's badge,
+or unbound where the source has none. The source's bindings are read once under its `sched_lock`,
+each endpoint pinned there by a reference that becomes the destination binding's own, and the
+destination's are published under its `sched_lock` as `SYS_THREAD_SET_FAULT_HANDLER` publishes
+them, with the same cancellation of a delivery in flight under a changed binding. A copy from a
+thread onto itself changes nothing. The binder needs no capability to the endpoint.
+
+**Capability requirement:** both thread caps MUST have Control rights.
+
+**Errors:** `InvalidArgument` (refused `fault_class_mask`; checked first), `InvalidCapability`
+(a bad thread cap), `InsufficientRights` (a thread cap lacks Control).
 
 ---
 

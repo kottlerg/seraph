@@ -1524,18 +1524,19 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// Service a kernel-synthesized page fault for a demand-paged process.
 ///
 /// `req.badge` is the derivation badge of the Endpoint cap bound by
-/// `SYS_THREAD_SET_FAULT_HANDLER` (procmgr and the runtime bind the process's
-/// own badged memmgr cap), so attribution rests on the derivation-locked badge
+/// `SYS_THREAD_SET_FAULT_HANDLER` (procmgr binds the process's own badged
+/// memmgr cap on its main thread, and the runtime copies that binding onto each
+/// thread it spawns with `SYS_THREAD_INHERIT_FAULT_HANDLER`), so attribution
+/// rests on the derivation-locked badge
 /// (`services/memmgr/docs/ipc-interface.md` § Badge Discipline). Words are
-/// `[kind, faulting_va, access, ip]`
-/// (same document, § Kernel-origin fault message (`FAULT_LABEL`)). On a VM
-/// fault whose address lies in a registered region of a process with a
-/// delegated address space, memmgr backs the [`chunk_for`] chunk containing
-/// the faulting page — one contiguous Memory cap mapped across up to
-/// `DEMAND_CHUNK_PAGES` pages — and replies
+/// `[kind, faulting_va, access, ip]` (same document, § Kernel-origin fault
+/// message (`FAULT_LABEL`)). On a VM fault whose address lies in a registered
+/// region of a process with a delegated address space, memmgr backs the
+/// [`chunk_for`] chunk containing the faulting page — one contiguous Memory cap
+/// mapped across up to `DEMAND_CHUNK_PAGES` pages — and replies
 /// [`syscall_abi::FAULT_REPLY_RESUME`]; a fault on a page an earlier chunk
-/// backed is resumed without backing. Backing a chunk rather than a single
-/// page bounds cap-slot consumption (one cap per chunk). Every other case —
+/// backed is resumed without backing. Backing a chunk rather than a single page
+/// bounds cap-slot consumption (one cap per chunk). Every other case —
 /// non-VM fault, unknown process, address outside every region, an access
 /// the region's protection does not grant ([`region_grants`]), no delegated
 /// AS, or any allocation/map failure — replies

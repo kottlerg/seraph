@@ -503,7 +503,13 @@ The death-notification flow:
    [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md#label-3-release_hold)
    § Label 3).
 3. **Memmgr reclaims.** Memmgr walks the per-process frame list and
-   inserts each Memory cap back into its free pool.
+   inserts each Memory cap back into its free pool, except a frame another
+   process can still reach (a kernel object retyped from it that another
+   process still references, or another address space's mapping of it),
+   which waits on memmgr's deferred list until a later recheck finds it
+   unreachable (see
+   [`memmgr/docs/memory-pool.md`](../services/memmgr/docs/memory-pool.md#reclamation)
+   § Reclamation).
 4. **Memmgr coalesces.** Reverse-`memory_split` merges adjacent free
    runs to sustain `REQUIRE_CONTIGUOUS` success rates. See
    [`memmgr/docs/memory-pool.md`](../services/memmgr/docs/memory-pool.md)
@@ -519,7 +525,8 @@ The death-notification flow:
    § `REGISTER_DEATH_EQ`).
 
 Memory caps the dead process held in its CSpace become unreachable when
-procmgr's teardown revokes and deletes the child's `CSpace`. Memmgr's
+procmgr's teardown revokes and deletes the child's `CSpace`; a copy the
+process moved or derived into another `CSpace` outlives it. Memmgr's
 intermediary derivations (retained at allocation time
 per the derive-twice pattern) are unaffected and are what the
 reclamation step inserts back into the free pool.

@@ -76,8 +76,9 @@ SENDs they hold, of `File`s the process never drops
 § Label 18). A crash or a kill runs neither, and sends no `FS_CLOSE`: the driver keeps such an
 open until its node is freed (reclaim tracked in
 [#742](https://github.com/kottlerg/seraph/issues/742)), and the endpoint its release SEND names
-outlives the process, a hazard to the frame it lives in tracked in
-[#750](https://github.com/kottlerg/seraph/issues/750).
+outlives the process, so memmgr holds the frame it lives in out of its pool until that SEND goes
+([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md#reclamation)
+§ Reclamation).
 
 `std::os::seraph::StartupInfo` is std's own type, not a re-export of `process_abi::StartupInfo`
 (which only memmgr's bespoke runtime constructs); a binary reads it through

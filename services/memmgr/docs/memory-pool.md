@@ -121,6 +121,10 @@ unable to grow.
    three diagnostic data words (total free pages, free-run count, and the
    largest run in pages); a failure to derive the caller's copy carries none.
 
+A selection that fails, contiguous or best-effort, first rechecks the deferred
+list (see [Reclamation](#reclamation)) and, when a run moved to the pool,
+selects once more before memmgr returns the out-of-memory code.
+
 Each Memory cap returned to the caller is a derive-twice copy: memmgr
 retains an intermediary in its own CSpace and hands the second derivation
 to the caller. The intermediary lets memmgr reclaim the cap on
@@ -168,11 +172,11 @@ RAM is exhausted.
 
 ## Metadata Arena
 
-All of memmgr's bookkeeping — free runs, process records, and per-process
-frame and region descriptors — is nodes drawn from a self-hosted arena rather
-than fixed `.bss` arrays. memmgr is `no_std` and cannot bootstrap a general
-heap against itself, but it *can* host fixed-size nodes in pages carved from
-its own pool:
+All of memmgr's bookkeeping — free runs, deferred runs, process records, and
+per-process frame and region descriptors — is nodes drawn from a self-hosted
+arena rather than fixed `.bss` arrays. memmgr is `no_std` and cannot bootstrap
+a general heap against itself, but it *can* host fixed-size nodes in pages
+carved from its own pool:
 
 - Nodes are fixed-size `Slot`s (a tagged run/process/region/frame/free payload
   plus a `next` index) reached by a `u64` index, so the index never bounds the
@@ -214,8 +218,10 @@ This preserves the all-RAM-accounted identity: the page was counted in
 arena. Growth stops at the peak concurrent node count — freed nodes return to
 the arena's own free list and are reused — so spawn/grow/die churn leaks no
 pages. Refilling the free list can draw a pool frame and map it from inside a
-fault handler; this is bounded (one frame, plus its page-table funding, with no
-recursion into per-process accounting) and never breaks the identity.
+fault handler; this is bounded (one frame, plus its page-table funding, plus at
+most one deferred recheck per turn of the receive loop when a selection fails;
+see [Reclamation](#reclamation)), with no recursion into per-process
+accounting, and never breaks the identity.
 
 ---
 
@@ -227,9 +233,10 @@ bookkeeping is shaped so the SMP pager
 buffers ([#254](https://github.com/kottlerg/seraph/issues/254)), is a
 service-internal change rather than a rewrite of this layer:
 
-- The arena, the free pool, and the process index are plain values with no
-  global state, mutated only through exclusive references, and held together
-  in one ledger; every growth path that needs a syscall sits outside them.
+- The arena, the free pool, the deferred list, and the process index are
+  plain values with no global state, mutated only through exclusive
+  references, and held together in one ledger; every growth path that needs a
+  syscall sits outside them.
 - Several ledgers can coexist, each with its own arena and free pool, so a
   pool shard per CPU or NUMA node is one ledger per shard.
 
@@ -270,28 +277,88 @@ memmgr-owned metadata, so the all-RAM-accounted identity is unaffected.
 
 ## Reclamation
 
+Reclamation takes frames back from a process and returns each one to the free pool only when no
+other process can still reach it. A frame reclaimed from one process can still be reachable from
+another in two ways:
+
+- **A kernel object retyped from it is alive.** An object's bytes return to its source Memory
+  object only when the object's last reference goes
+  ([`docs/capability-model.md`](../../../docs/capability-model.md#auto-reclaim) §"Auto-reclaim"),
+  and a capability another process holds is such a reference: an endpoint a dead process created
+  lives on while a server keeps a SEND to it. The live object sits below the region's retype bump
+  cursor, so a pooled run would be grantable only whole and unmappable below the cursor.
+- **Another address space maps it.** A user mapping outlives the revocation of the capability it
+  was made through ([`docs/capability-model.md`](../../../docs/capability-model.md#memory)
+  §"Memory"), so a process that still maps a frame keeps reading and writing it whoever owns it
+  next.
+
+memmgr therefore checks each reclaimed frame through its retained intermediary, which shares the
+Memory object of every derivation it granted. The frame is **quiescent** when all three hold:
+
+1. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. A
+   grantee that split its grant shrank the object the intermediary names, so the record no longer
+   describes it.
+2. Its available bytes (`CAP_INFO_MEMORY_AVAILABLE`) equal its size: no byte of the region is
+   retyped into a live kernel object, donated to a page pool, or held by a kept body-arena page
+   (the kernel credits the last such byte back and resets the region's retype allocator to virgin
+   at the same point).
+3. No address space maps any page of it (`CAP_INFO_MEMORY_MAPPINGS`, read window by window).
+
+A query that fails answers no. A quiescent frame joins the free pool. Any other frame joins the
+**deferred list**: its descriptor node is rewritten into a run node in place, as a pooled frame's
+is, so reclamation still never allocates and cannot fail. A deferred run is owned by memmgr and
+counted in `pool_total`, lent to no process, and never granted. Before every `PROCESS_DIED`,
+`RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before any selection from the free pool
+fails (a `REQUEST_MEMORY_CAPS` grant, a demand fault's chunk, or memmgr's own arena, index,
+page-table, or `CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run
+that has become quiescent joins the free pool (and the failed selection runs once more), and
+each that has not goes to the back of the list, so successive rechecks visit every run. Only
+the first of these in a turn of the receive loop rechecks; later ones in the same turn find the
+recheck done. A turn starts when a receive returns, with a message or with an error: it is the
+message's handling, if any, then the `CSpace` top-up before the next receive. A handler's
+recheck at entry therefore always runs, and so does the top-up's before a failed receive's retry,
+which is what refills a spent receive reserve. One recheck checks at most
+`DEFERRED_RECHECK_BATCH` (64) runs and spends at most `DEFERRED_RECHECK_WINDOWS` (256)
+mapping-count queries of up to 512 pages each, plus the rest of the run that crosses that
+budget, after which it stops and leaves the runs behind at the head for the next recheck. A
+turn's deferred kernel queries are therefore bounded by two per run checked plus 256, plus the
+windows of the largest deferred run. No timer drives it; a run that becomes quiescent while no
+message arrives waits for the next one, or for the next retry of a failed receive. A run whose
+reaching object or mapping never goes, held by a process that never drops it, stays deferred for
+the rest of the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
+[`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
+
+The check does not see a capability: a process that holds an unmapped Memory capability to a
+reclaimed frame (one the frame's grantee moved or derived to it) is not detected, and can map the
+frame after memmgr grants it again. memmgr does not revoke its intermediary's derivations before
+pooling either: a revoke reaches neither a derivation the grantee made and handed out, which its
+`CSpace`'s teardown leaves a derivation root, nor any mapping already made.
+
 On `PROCESS_DIED(badge)` from procmgr, which procmgr holds back for a started
 `CREATE_DMA_HOLD` process until its creator releases it, the frames staying on
 the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process_died)
 § Label 4):
 
-1. Remove the per-process record from the index. If absent (untracked
-   badge), return silently — the death notification is idempotent.
-2. For each frame node in the record's frame list, rewrite the node into a
-   free run of the retained Memory cap and insert it into the free pool at
-   its sorted position (no fresh node, so the step cannot fail).
-3. Return every region node and the record's own node to the arena free
+1. Recheck the deferred list.
+2. Remove the per-process record from the index. If absent (untracked
+   badge), skip to step 5 — the death notification is idempotent.
+3. For each frame node in the record's frame list, rewrite the node into a
+   run of the retained Memory cap and insert it into the free pool at its
+   sorted position when the frame is quiescent, else onto the deferred list
+   (no fresh node, so the step cannot fail).
+4. Return every region node and the record's own node to the arena free
    list.
-4. Run coalescing across the newly-freed runs and their adjacent
+5. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
 
 No unmap is performed: the dead process's CSpace is torn down by procmgr
 (which revokes the AddressSpace cap; see
 [`docs/capability-model.md`](../../../docs/capability-model.md) §"Kill
 process pattern"), which already tore down the child's mappings. The
-caller-side derivation copies of the Memory caps become unreachable as part
-of that teardown; memmgr's intermediary copies remain valid and are what the
-free-pool insertion uses.
+caller-side derivation copies of the Memory caps that stayed in the dead
+process's CSpace are freed with it; a copy the process moved or derived into
+another CSpace outlives it, unseen by the check above. memmgr's intermediary
+copies remain valid and are what the free-pool insertion uses.
 
 `RELEASE_MEMORY_CAPS` from a live process is the mid-life counterpart for a
 caller-owned grant. The caller usually cannot transfer the cap back — having
@@ -299,29 +366,27 @@ retyped the region (e.g. into a Thread) and dropped its inner copy, it no
 longer holds one — so it names each region by the `phys_base` memmgr reported
 at grant. memmgr matches that base against the entry's frame list
 (`FRAME_VA_UNMAPPED` grants only; demand-mapped chunks are reclaimed by
-`UNREGISTER_REGION`), inserts the retained intermediary cap back into the pool,
-frees the node, and coalesces the freed runs with their physical neighbours,
-leaving the entry's other records untouched. Unmatched bases are ignored, so
-release is idempotent (a racing join-plus-reaper double-release is harmless).
-The caller must have deleted every object retyped from the region first;
-releasing a still-retyped region is correctness-safe (the kernel refuses to
-re-hand-out live bytes) but the run is only re-grantable whole — its retype
-bump pointer blocks `memory_split`, per
-[`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_split-33)
-§"`SYS_MEMORY_SPLIT`" — until the retype is freed, and its next grantee cannot `mem_map` it
-below that pointer either (`InvalidArgument`; see
-[`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_mem_map-16)
-§"`SYS_MEM_MAP`"), so a mapping grant of such a run fails until the retype is freed.
+`UNREGISTER_REGION`), takes the frame off the record, returns it to the pool
+when it is quiescent and to the deferred list otherwise (the node becomes
+the run's node in either case), and coalesces the freed runs with their
+physical neighbours, leaving the entry's other records untouched. Unmatched
+bases are ignored, so release is idempotent (a racing join-plus-reaper
+double-release is harmless). The caller must have
+deleted every object retyped from the region and unmapped it first; a region
+released with a live retype or a mapping waits on the deferred list until both
+are gone, so the next grantee of a pooled run can always split it, map it
+whole, and retype it.
 
 `UNREGISTER_REGION` from a live process is the mid-life counterpart for a
 demand-paged region: memmgr removes the region node and **actively unmaps** the
 whole region span from the delegated child `AddressSpace` in one
 `mem_unmap_reclaim` call, which also returns the emptied page tables to that
 address space's page-table budget (the process is still alive, so the mappings
-must be removed before the frames return to the pool). It then inserts each
-backing frame's cap back into the pool, frees the frame nodes, and coalesces
-the freed runs with their physical neighbours. Frames the caller mapped itself
-are left untouched. This is the reclamation path the ruststd guarded-stack
+must be removed before the frames return to the pool). It then returns each
+backing frame's cap to the pool, or to the deferred list when the frame is not
+quiescent (each frame node becoming its run's node), and coalesces the freed
+runs with their physical neighbours. Frames the caller mapped itself are left
+untouched. This is the reclamation path the ruststd guarded-stack
 consumer uses on `join()`.
 
 ---
@@ -349,11 +414,12 @@ memmgr holds in its own CSpace: best-fit keeps a fixed-size churn cycling one
 run, and the explicit merge keeps residual fragmentation from drifting the run
 (and anchor) count up over time. Left un-coalesced, reclaimed runs stay
 discrete and their anchors persist, slowly consuming memmgr's CSpace and arena
-even while its RAM footprint stays bounded. A "dirty" released run — one whose
-source `MemoryObject` kept its retype bump pointer advanced — declines
-`memory_merge` (the kernel requires a virgin tail; see
+even while its RAM footprint stays bounded. A reclaimed run whose source
+`MemoryObject` still holds a live retype would decline `memory_merge` (the
+kernel requires a virgin tail; see
 [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
-§"`SYS_MEMORY_MERGE`") and stays a discrete, re-grantable-whole run.
+§"`SYS_MEMORY_MERGE`"), but such a run waits on the deferred list, not in the
+pool (see [Reclamation](#reclamation)), so every pooled run is virgin.
 Coalescing cost scales with the live run count, which best-fit and this pass
 jointly keep small, so the per-reclamation merge is negligible.
 
@@ -412,8 +478,11 @@ terminal fault tears down the whole process (see
 ## Summarized By
 
 [abi/process-abi/README.md](../../../abi/process-abi/README.md),
+[Capability Model](../../../docs/capability-model.md),
 [Memory Model](../../../docs/memory-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[FS Driver Protocol](../../fs/docs/fs-driver-protocol.md),
 [services/memmgr/README.md](../README.md),
 [memmgr IPC Interface](ipc-interface.md)

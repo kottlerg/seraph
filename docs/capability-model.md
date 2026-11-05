@@ -676,10 +676,18 @@ Memory capability the object was retyped from. If the source Memory cap's
 own reference count then reaches zero, the reclamation cascades upward
 through the derivation chain. Process death is an instance of this
 cascade: revoking a child's CSpace destroys all caps the child held,
-which deallocates every kernel object the child created, which credits
-each object's bytes back to the Memory cap it was retyped from; memmgr
-returns the child's frames to its pool when procmgr sends `PROCESS_DIED`
-(see [userspace-memory-model.md](userspace-memory-model.md)).
+which deallocates every kernel object only the child referenced, which
+credits each object's bytes back to the Memory cap it was retyped from.
+An object the child created that another process still references (a
+capability to it, or a kernel-internal reference such as a wait-set
+membership) is not destroyed: it lives on until its last reference goes,
+its bytes stay debited from its source Memory object, and a capability to
+it keeps working as before. memmgr returns the child's frames to its pool
+when procmgr sends `PROCESS_DIED`, except a frame such an object still
+occupies or another address space still maps, which memmgr holds out of
+the pool until neither holds (see
+[services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#reclamation)
+§ Reclamation and [userspace-memory-model.md](userspace-memory-model.md)).
 
 ### Address-space and CSpace growth budgets
 

@@ -11,17 +11,18 @@
 //! `/programs`-subtree attenuation, cwd-cap delivery, argv/env blob packing,
 //! exit-code propagation, per-process randomness and ASLR divergence,
 //! `Child` kill and drop teardown, procmgr's teardown of a child whose create
-//! reply it cannot deliver, procmgr's death forward to logd, and the fs
-//! release handler's cookie matching.
+//! reply it cannot deliver, procmgr's death forward to logd, the fs release
+//! handler's cookie matching, and memmgr's hold on a dead child's frame that
+//! a live kernel object still occupies.
 //! The child-mode function for each role lives in the phase module that
 //! spawns it; `dispatch` consults each module's `reentry_main(role)` so a
 //! new role is registered alongside its phase, not in a central switch.
 //!
 //! A module's `reentry_main` diverges on a matching role, by exiting
-//! (`std::process::exit`) or, for `park-child`, by parking until its
-//! spawner tears it down, and returns on a miss; `dispatch` cascades through
-//! the modules and returns to its caller only when no module took
-//! control.
+//! (`std::process::exit`) or, for `park-child` and `reclaim-child`, by
+//! parking until its spawner tears it down, and returns on a miss;
+//! `dispatch` cascades through the modules and returns to its caller only
+//! when no module took control.
 
 use crate::phases;
 
@@ -36,4 +37,5 @@ pub fn dispatch(role: &str)
     phases::fs_std::reentry_main(role);
     phases::exit_code::reentry_main(role);
     phases::random::reentry_main(role);
+    phases::memmgr::reentry_main(role);
 }

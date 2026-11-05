@@ -48,7 +48,29 @@ pub fn phases() -> &'static [Phase]
             name: "object_slab_release",
             run: object_slab_release_phase,
         },
+        Phase {
+            name: "frame_reclaim_live_object",
+            run: frame_reclaim_live_object_phase,
+        },
+        Phase {
+            name: "frame_reclaim_mapped_release",
+            run: frame_reclaim_mapped_release_phase,
+        },
     ]
+}
+
+/// Role token for [`reclaim_child_main`].
+const RECLAIM_CHILD_ROLE: &str = "reclaim-child";
+
+/// Child-mode dispatch for argv tokens this module owns. The matching arm
+/// parks until its spawner kills it, or exits through `std::process::exit`
+/// on a setup failure; on a miss control returns to the caller.
+pub fn reentry_main(role: &str)
+{
+    if role == RECLAIM_CHILD_ROLE
+    {
+        reclaim_child_main();
+    }
 }
 
 /// All-RAM-accounted identity check. Registered last (see [`super::all`]) so
@@ -598,5 +620,358 @@ pub fn ram_accounted_identity_phase(_: &Caps)
     let residual = system_ram.abs_diff(kernel_reserved.saturating_add(pool_total));
     panic!(
         "ram_accounted_identity FAILED: system_ram={system_ram} != kernel_reserved={kernel_reserved} + pool_total={pool_total} (residual={residual} bytes; leaked or double-counted)"
+    );
+}
+
+/// Label of the call a `reclaim-child` makes on its namespace cap, which
+/// carries SEND only (procmgr installs it so), to fetch a SEND that may carry
+/// a cap.
+const FETCH_GRANT_LABEL: u64 = 0x6665_7463;
+
+/// Label of the call a `reclaim-child` makes on that fetched SEND to hand
+/// its spawner a SEND of its own.
+const HAND_SEND_LABEL: u64 = 0x7265_636c;
+
+/// Badge of the fetched SEND (with GRANT) a `reclaim-child` hands its SEND on.
+const RECLAIM_HAND_BADGE: u64 = 0x5702;
+
+/// Badge of the SEND [`frame_reclaim_live_object_phase`] stops its own
+/// receiving thread with.
+const RECLAIM_STOP_BADGE: u64 = 0x5701;
+
+/// memmgr's deferred total (`QUERY_POOL_STATUS` `data[4]`), in bytes.
+fn deferred_bytes() -> u64
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+    let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "QUERY_POOL_STATUS status"
+    );
+    reply.word(4)
+}
+
+/// Make memmgr recheck its deferred list: a `RELEASE_MEMORY_CAPS` naming no
+/// grant releases nothing and only rechecks.
+fn recheck_deferred()
+{
+    let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
+        .word(0, 0)
+        .build();
+    let reply = memmgr_call(&release, "RELEASE_MEMORY_CAPS (recheck)");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "RELEASE_MEMORY_CAPS (recheck) status"
+    );
+}
+
+/// memmgr's deferred total once rechecks stop lowering it: a run already
+/// deferred that has become quiescent is pooled now, not by a recheck inside
+/// the phase's own later messages, which would lower the total the phase
+/// compares against its baseline. One recheck checks only the oldest runs
+/// within its budget (services/memmgr/docs/memory-pool.md § Reclamation), so
+/// the total counts as settled only after [`SETTLE_QUIET`] rechecks in a row
+/// leave it unlowered: enough to cycle a list of `SETTLE_QUIET` batches of
+/// runs, far past what a svctest boot defers.
+fn settled_deferred_bytes() -> u64
+{
+    // A test wait bound: it limits only how many rechecks the settle takes.
+    const MAX_SETTLE: u32 = 256;
+    let mut last = deferred_bytes();
+    let mut quiet = 0;
+    for _ in 0..MAX_SETTLE
+    {
+        recheck_deferred();
+        let now = deferred_bytes();
+        quiet = if now < last { 0 } else { quiet + 1 };
+        last = now;
+        if quiet == SETTLE_QUIET
+        {
+            break;
+        }
+    }
+    last
+}
+
+/// Rechecks in a row that must leave memmgr's deferred total unlowered before
+/// [`settled_deferred_bytes`] takes it as settled.
+const SETTLE_QUIET: u32 = 8;
+
+/// Trigger rechecks until memmgr's deferred total falls to `target` bytes or
+/// below; panics with `what` when it does not within the poll bound.
+fn await_deferred_at_most(target: u64, what: &str)
+{
+    // A test wait bound: it limits only how long the phase polls before it
+    // fails. One recheck examines every run of a short deferred list.
+    const MAX_POLL: u32 = 64;
+    let mut last = 0;
+    for _ in 0..MAX_POLL
+    {
+        recheck_deferred();
+        last = deferred_bytes();
+        if last <= target
+        {
+            return;
+        }
+        let _ = syscall::thread_yield();
+    }
+    panic!("{what}: memmgr's deferred total stayed at {last} bytes, above {target}");
+}
+
+/// A `reclaim-child`: retype an endpoint from a one-page grant of its own,
+/// hand a SEND on it to the spawner (whose endpoint arrives as this
+/// process's namespace cap), and park until killed. Exit codes: 2 = the
+/// endpoint retype failed, 3 = the SEND derive failed, 4 = fetching the
+/// hand-off SEND failed, 5 = the hand-off call failed.
+fn reclaim_child_main() -> !
+{
+    let ipc_buf = current_ipc_buf();
+    let (grant, _) = request_one_page();
+    let Ok(ep) = syscall::cap_create_endpoint(grant)
+    else
+    {
+        std::process::exit(2)
+    };
+    let Ok(send) = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND)
+    else
+    {
+        std::process::exit(3)
+    };
+    let fetch = ipc::IpcMessage::new(FETCH_GRANT_LABEL);
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    let fetched = unsafe { ipc::ipc_call(std::os::seraph::root_dir_cap(), &fetch, ipc_buf) };
+    let Some(&hand_ep) = fetched.as_ref().ok().and_then(|reply| reply.caps().first())
+    else
+    {
+        std::process::exit(4)
+    };
+    let hand = ipc::IpcMessage::builder(HAND_SEND_LABEL).cap(send).build();
+    // SAFETY: as above.
+    if unsafe { ipc::ipc_call(hand_ep, &hand, ipc_buf) }.is_err()
+    {
+        std::process::exit(5);
+    }
+    loop
+    {
+        std::thread::park();
+    }
+}
+
+/// Serve `ep` until a `reclaim-child` hands over a SEND, returning it, or
+/// until the stop badge arrives, returning `None`. A fetch is answered with
+/// a SEND (with GRANT) badged [`RECLAIM_HAND_BADGE`]; any other call is
+/// refused and its caps deleted.
+fn receive_handed_send(ep: u64) -> Option<u64>
+{
+    let ipc_buf = current_ipc_buf();
+    loop
+    {
+        // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+        let msg = unsafe { ipc::ipc_recv(ep, ipc_buf) }.expect("reclaim server: ipc_recv failed");
+        let stop = msg.badge == RECLAIM_STOP_BADGE;
+        let handed = if msg.badge == RECLAIM_HAND_BADGE && msg.label == HAND_SEND_LABEL
+        {
+            msg.caps().first().copied()
+        }
+        else
+        {
+            None
+        };
+        for &cap in msg.caps().iter().skip(usize::from(handed.is_some()))
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        let done = stop || handed.is_some();
+        let reply = if done
+        {
+            ipc::IpcMessage::new(0)
+        }
+        else if msg.label == FETCH_GRANT_LABEL
+        {
+            let hand_ep =
+                syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND_GRANT, RECLAIM_HAND_BADGE)
+                    .expect("reclaim server: hand-off SEND derive failed");
+            ipc::IpcMessage::builder(0).cap(hand_ep).build()
+        }
+        else
+        {
+            ipc::IpcMessage::new(u64::MAX)
+        };
+        // SAFETY: as above.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        if done
+        {
+            return handed;
+        }
+    }
+}
+
+/// A frame holding a live kernel object stays out of memmgr's free pool
+/// after its process dies, and joins it once the object dies
+/// (services/memmgr/docs/memory-pool.md § Reclamation). A `reclaim-child`
+/// retypes an endpoint from a one-page grant and hands svctest a SEND on it;
+/// svctest kills the child. The page must then be on memmgr's deferred list,
+/// spawns after the death must succeed, and the SEND must still name the
+/// live endpoint. Once svctest deletes the SEND, the endpoint dies and the
+/// page must leave the deferred list at memmgr's next recheck.
+pub fn frame_reclaim_live_object_phase(_: &Caps)
+{
+    use std::os::seraph::process::CommandExt;
+
+    /// Spawns after the death, each drawing frames from the pool.
+    const SPAWNS: u32 = 4;
+
+    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+        syscall::cap_create_endpoint(slab).ok()
+    })
+    .expect("frame_reclaim_live_object: endpoint creation failed");
+    let root = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND)
+        .expect("frame_reclaim_live_object: root SEND derive failed");
+    let stop = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, RECLAIM_STOP_BADGE)
+        .expect("frame_reclaim_live_object: stop SEND derive failed");
+    let server = std::thread::Builder::new()
+        .name("reclaim_server".into())
+        .spawn(move || receive_handed_send(ep))
+        .expect("frame_reclaim_live_object: server thread spawn failed");
+
+    let baseline = settled_deferred_bytes();
+    let mut child = std::process::Command::new("/tests/svctest")
+        .arg(RECLAIM_CHILD_ROLE)
+        .namespace_cap(root)
+        .spawn()
+        .expect("frame_reclaim_live_object: spawning reclaim-child failed");
+    while !server.is_finished()
+    {
+        if let Some(status) = child
+            .try_wait()
+            .expect("frame_reclaim_live_object: try_wait failed")
+        {
+            // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer.
+            let _ = unsafe { ipc::ipc_call(stop, &ipc::IpcMessage::new(0), current_ipc_buf()) };
+            let _ = server.join();
+            panic!(
+                "frame_reclaim_live_object: reclaim-child exited {status} before handing its \
+                 SEND (2 = retype, 3 = derive, 4 = fetch, 5 = hand-off failed)"
+            );
+        }
+        let _ = syscall::thread_yield();
+    }
+    let send = server
+        .join()
+        .expect("frame_reclaim_live_object: server thread panicked")
+        .expect("frame_reclaim_live_object: no SEND handed over");
+    let _ = syscall::cap_delete(stop);
+    let _ = syscall::cap_delete(ep);
+
+    child
+        .kill()
+        .expect("frame_reclaim_live_object: killing reclaim-child failed");
+    let _ = child.wait();
+    let after_kill = deferred_bytes();
+    assert!(
+        after_kill >= baseline + syscall_abi::PAGE_SIZE,
+        "frame_reclaim_live_object: the dead child's endpoint page was pooled \
+         (deferred {baseline} -> {after_kill} bytes)"
+    );
+
+    for i in 0..SPAWNS
+    {
+        let status = std::process::Command::new("/programs/hello")
+            .status()
+            .unwrap_or_else(|e| panic!("frame_reclaim_live_object: spawn {i} failed: {e}"));
+        assert!(
+            status.success(),
+            "frame_reclaim_live_object: spawn {i} exited {status}"
+        );
+    }
+
+    let tag_rights = syscall::cap_info(send, syscall::CAP_INFO_TAG_RIGHTS)
+        .expect("frame_reclaim_live_object: the held SEND no longer resolves");
+    assert_eq!(
+        tag_rights & 0xFFFF_FFFF,
+        syscall::RIGHTS_EP_SEND,
+        "frame_reclaim_live_object: the held SEND changed rights"
+    );
+
+    syscall::cap_delete(send).expect("frame_reclaim_live_object: deleting the SEND failed");
+    await_deferred_at_most(
+        after_kill - syscall_abi::PAGE_SIZE,
+        "frame_reclaim_live_object: endpoint page after its last SEND went",
+    );
+    std::os::seraph::log!(
+        "frame_reclaim_live_object: dead child's endpoint page held ({baseline} -> {after_kill} \
+         deferred bytes), then pooled once the SEND went"
+    );
+}
+
+/// A released frame that its releaser still maps stays out of memmgr's free
+/// pool, and joins it once the mapping goes
+/// (services/memmgr/docs/memory-pool.md § Reclamation). svctest maps a
+/// one-page grant and releases it while mapped: the page must be on memmgr's
+/// deferred list, none of the next one-page grants may be that page, and the
+/// page must leave the deferred list at the first recheck after svctest
+/// unmaps it and deletes its cap.
+pub fn frame_reclaim_mapped_release_phase(_: &Caps)
+{
+    use syscall::{MAP_READ, MAP_WRITABLE};
+
+    /// One-page grants drawn while the released page is held.
+    const DRAWS: usize = 4;
+
+    let info = startup_info();
+    let (grant, phys_base) = request_one_page();
+    let range = std::os::seraph::reserve_pages(1).expect("frame_reclaim_mapped_release: reserve");
+    let va = range.va_start();
+    // SAFETY: `range` is a fresh page reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    unsafe { syscall::mem_map(grant, info.self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE) }
+        .expect("frame_reclaim_mapped_release: mem_map of the grant failed");
+
+    let baseline = settled_deferred_bytes();
+    let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
+        .word(0, 1)
+        .word(1, phys_base)
+        .build();
+    let reply = memmgr_call(&release, "RELEASE_MEMORY_CAPS (mapped)");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "RELEASE_MEMORY_CAPS (mapped) status"
+    );
+    let held = deferred_bytes();
+    assert!(
+        held >= baseline + syscall_abi::PAGE_SIZE,
+        "frame_reclaim_mapped_release: a still-mapped released page was pooled \
+         (deferred {baseline} -> {held} bytes)"
+    );
+
+    let draws: Vec<(u64, u64)> = (0..DRAWS).map(|_| request_one_page()).collect();
+    for &(_, phys) in &draws
+    {
+        assert_ne!(
+            phys, phys_base,
+            "frame_reclaim_mapped_release: memmgr granted a released page its releaser still maps"
+        );
+    }
+    for (cap, phys) in draws
+    {
+        release_one_page(cap, phys);
+    }
+
+    // SAFETY: `va` is the page mapped above, in this process's own address
+    // space, and no Rust reference points into it.
+    unsafe { syscall::mem_unmap(info.self_aspace, va, 1) }
+        .expect("frame_reclaim_mapped_release: mem_unmap failed");
+    std::os::seraph::unreserve_pages(range);
+    syscall::cap_delete(grant).expect("frame_reclaim_mapped_release: cap_delete of grant");
+    await_deferred_at_most(
+        held - syscall_abi::PAGE_SIZE,
+        "frame_reclaim_mapped_release: released page after its mapping went",
+    );
+    std::os::seraph::log!(
+        "frame_reclaim_mapped_release: mapped released page held ({baseline} -> {held} deferred \
+         bytes), then pooled once unmapped"
     );
 }

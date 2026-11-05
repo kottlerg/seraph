@@ -1030,9 +1030,10 @@ fn resolve_create_sched(
 /// Returns `false` when [`process::ProcessTable::arm_dma_hold`] refuses: with
 /// `ArmError::OutOfMemory` when the heap cannot reserve the room, or with
 /// `ArmError::NotFound`, which the child's insertion just before rules out
-/// unless the table lost it. Either way the child, which has not run, is
-/// destroyed with both reply caps deleted, and the create is answered
-/// `OUT_OF_MEMORY`.
+/// unless the table lost it. Either way both reply caps are deleted and the
+/// create is answered `OUT_OF_MEMORY`; on `OutOfMemory` the child, which has
+/// not run, is also destroyed, while on `NotFound` the table holds no entry
+/// for the teardown to take, so nothing more is released.
 fn arm_held_reclaim_or_refuse(
     result: &process::CreateResult,
     ipc_buf: *mut u64,
@@ -1222,7 +1223,7 @@ fn handle_create(
     // PROCESS_DIED and deletes the slot; create_process has already
     // released the child's kernel objects, so memmgr reclaims pages no
     // kernel object still uses.
-    if result.is_some()
+    if result.is_ok()
     {
         let _ = mms.disarm();
     }
@@ -1247,7 +1248,7 @@ fn handle_create(
 
     match result
     {
-        Some(result) =>
+        Ok(result) =>
         {
             log_spawn_sched(sched);
             if label & procmgr_labels::CREATE_DMA_HOLD == 0
@@ -1256,7 +1257,9 @@ fn handle_create(
                 reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
             }
         }
-        None =>
+        // § Label 1 names `OUT_OF_MEMORY` for every creation failure past the
+        // request's own checks, whatever the cause `create_process` reports.
+        Err(_) =>
         {
             reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
         }

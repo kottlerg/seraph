@@ -217,8 +217,8 @@ Tracked by [#760](https://github.com/kottlerg/seraph/issues/760); the Phase 7 bo
 | `ROOT_SHARE` (`RangeLineage.live`) | `core/kernel/src/cap/object.rs` | `1 << 31` in `u32` | encoding artefact | embedded | correct as is | None |
 | `MMIO_INLINE_MAPPINGS` (`MmioObject.mappings`, `MmioSpill`) | `core/kernel/src/cap/object.rs` | 4 inline, then chained chunks of 7 | encoding artefact (`MmioObject` fits the 128 B class; each spill chunk is funded by the mapper's `CSpace`) | 64 B per Mmio object | correct as is | None |
 | `INLINE_RECORDS` (`PagePool.inline`) | `core/kernel/src/cap/object.rs` | 16 | encoding artefact (spills to record pages beyond) | 512 B per pool | correct as is | Unbounded through record pages |
-| `SEED_BATCH_PAGES` | `core/kernel/src/cap/object.rs` | 64 | batch size (lock-hold bound) | none | correct as is | The total window is #434 |
-| `RECORDS_PER_PAGE` | `core/kernel/src/cap/object.rs` | 127 | encoding artefact | none | correct as is | None |
+| `SEED_BATCH_PAGES` | `core/kernel/src/cap/object.rs` | 64 | batch size (bounds each pool-lock hold and each interrupts-off stretch of a seeding syscall, which takes interrupts between batches) | none | correct as is | None |
+| `RECORDS_PER_PAGE` | `core/kernel/src/cap/object.rs` | 127 | encoding artefact (record pages chain, so it bounds no record count; it bounds the group a teardown returns between two interrupt windows, one walk of one Memory object's page free list) | none | correct as is | None |
 | `CascadeStack` (`dealloc_object` cascade) | `core/kernel/src/cap/object.rs` | none: a LIFO linked through the queued objects' headers | provable unreachability (no storage outside the refcount-0 objects it holds) | 8 B stack | correct as is | None |
 | `MAX_DRAIN_EDITS` | `core/kernel/src/cap/object.rs` | 256 | batch size | none | correct as is | None |
 | `FRAME_WRITE_LOCKED` reader count | `core/kernel/src/cap/object.rs` | `u32` | provably unreachable (readers at most CPUs) | embedded | correct as is | None |

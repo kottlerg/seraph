@@ -1415,8 +1415,9 @@ slice-expiry `schedule()` or its own park or yield, not within the inter-process
 latency: no interrupt-return path deschedules a `Stopped` current thread. That is within the
 target's remaining time slice (at most `TIME_SLICE_TICKS`, 10 timer ticks), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts
-enabled (a TLB-shootdown or drain spin): `timer_tick` then refills the slice without
-rescheduling, and `preempt_enable` does not reschedule, so the stop completes at the first slice
+enabled (a TLB-shootdown or drain spin, or a page-pool seeding or teardown window between
+batches, `interrupt_window`): `timer_tick` then refills the slice without rescheduling,
+and `preempt_enable` does not reschedule, so the stop completes at the first slice
 expiry that finds preemption enabled, a further slice later at the least. Callers that need a
 bounded stop latency MUST budget a slice for each expiry the target can spend in such a section.
 

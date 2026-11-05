@@ -1045,7 +1045,7 @@ const INLINE_RECORDS: usize = 16;
 /// pool.
 ///
 /// At dealloc, every non-vacant record is fed back to its `ancestor`
-/// `MemoryObject` via `retype_free`, then the ancestor is `dec_ref`'d.
+/// `MemoryObject` (`retype::retype_free_runs`), then the ancestor is `dec_ref`'d.
 /// The type builds in every configuration because the wrapper structs
 /// embed it; only the non-test pool code reads it.
 #[repr(C)]
@@ -1124,15 +1124,46 @@ impl DonationRecord
 #[cfg(not(test))]
 type HolesCell = *mut *mut ArenaPage;
 
-/// Pages `PagePool::seed_pages` pushes per pool-lock hold. The pool lock is a
-/// bare spin lock (scheduling-internals.md § Lock Hierarchy, "Bare spin
-/// locks"), and a hold
+/// Pages `PagePool::seed_pages` pushes per pool-lock hold, and per stretch
+/// with interrupts masked. The pool lock is a bare spin lock
+/// (scheduling-internals.md § Lock Hierarchy, "Bare spin locks"), and a hold
 /// proportional to a caller-chosen donation size would be unbounded; batching
-/// keeps every hold to this many pushes. The interrupts-off window of the
-/// syscall that seeds a donation is the sum of its batches, `init_pages`
-/// pushes chosen by the caller, and is not bounded here (#434).
+/// keeps every hold to this many pushes, and an [`interrupt_window`] between
+/// batches keeps the syscall's interrupts-off stretches to one batch each,
+/// whatever `init_pages` the caller chose.
 #[cfg(not(test))]
 const SEED_BATCH_PAGES: u64 = 64;
+
+/// Let this CPU take the interrupts pending on it, then return to the
+/// caller's interrupt state, with preemption disabled throughout so that an
+/// interrupt taken here cannot switch the thread out. The page-pool seeding
+/// and reclaim walks call it between their batches, whose number a caller
+/// chooses, so that a syscall running one masks interrupts for one batch at a
+/// time: shootdown and wakeup IPIs are acknowledged, and the timer and the
+/// heartbeat tick, meanwhile (core/kernel/docs/capability-internals.md
+/// § Donation Records and § Teardown).
+///
+/// No lock may be held across it. Every pool is created after the timer is
+/// initialised, which enables interrupts with the trap vector in place, so
+/// every caller runs where interrupts may be taken; the idle drain, which
+/// runs with them enabled, keeps them enabled.
+#[cfg(not(test))]
+fn interrupt_window()
+{
+    crate::percpu::preempt_disable();
+    // SAFETY: kernel mode; the state is restored below.
+    let saved = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: the trap vector is installed before any pool exists (above);
+    // preemption is disabled and no lock is held, so an interrupt taken here
+    // cannot switch this thread out or deadlock against it.
+    unsafe { crate::arch::current::interrupts::enable() };
+    // x86-64 defers interrupt recognition past the instruction after `sti`,
+    // so one instruction separates the enable from the restore.
+    core::hint::spin_loop();
+    // SAFETY: `saved` came from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved) };
+    crate::percpu::preempt_enable();
+}
 
 /// Bytes of `RecordPage` ahead of its records: `next_phys` and `used`.
 #[cfg(not(test))]
@@ -1281,7 +1312,8 @@ impl PagePool
     /// `ancestor` must be a live `MemoryObject`'s header on which the
     /// caller holds a reference for the pool's lifetime; `base_offset` and
     /// `total_pages` must come from a successful `retype_allocate` against
-    /// it, with `ancestor_memory_base` that object's `base`.
+    /// it, with `ancestor_memory_base` that object's `base`. No lock may be
+    /// held: the seeding takes interrupts between batches (`seed_pages`).
     #[cfg(not(test))]
     #[track_caller]
     unsafe fn add_donation(
@@ -1353,13 +1385,15 @@ impl PagePool
 
     /// Push pages `first..total` of the donation at `donation_phys` onto the free
     /// list, highest first so the lowest ends up at the head, in batches of
-    /// `SEED_BATCH_PAGES` under separate lock holds; credit `budget` with
-    /// each batch as it lands, so a concurrent pop never debits a budget
-    /// the pages have not yet been credited to.
+    /// `SEED_BATCH_PAGES` under separate lock holds with an
+    /// [`interrupt_window`] between batches; credit `budget` with each batch
+    /// as it lands, so a concurrent pop never debits a budget the pages have
+    /// not yet been credited to.
     ///
     /// # Safety
     /// The pages must belong to a donation already recorded in this pool,
-    /// be freshly retyped, and be unaliased. The pool lock must not be held.
+    /// be freshly retyped, and be unaliased. No lock may be held, the pool
+    /// lock included.
     #[cfg(not(test))]
     #[track_caller]
     unsafe fn seed_pages(
@@ -1386,6 +1420,10 @@ impl PagePool
             budget.fetch_add((end - start) * p, Ordering::AcqRel);
             pool_unlock(&self.lock);
             end = start;
+            if end > first
+            {
+                interrupt_window();
+            }
         }
     }
 
@@ -1448,15 +1486,22 @@ impl PagePool
         cell
     }
 
-    /// Hand every recorded donation to `free` as `(ancestor, base_offset,
-    /// page_count, holes)`, `holes` being the record's list of kept arena
-    /// pages (null for an `AddressSpace` pool, or a record with none), in an
-    /// order that keeps each record readable until it is used: spilled
-    /// records newest page first and, within a page, last to
-    /// first so record 0 (whose donation holds the page) goes last; then the
-    /// inline records, snapshotted up front, with record 0 (the create-time
-    /// slab that holds the owner and this pool) last. The walk is linear in the
-    /// donation count; its context and cost are in
+    /// Hand every recorded donation to `free`, in groups of records that
+    /// share a Memory object, each group sorted by offset, in an order that
+    /// keeps each record readable until it is used: the spilled records
+    /// newest page first, a page's other records before its record 0 (whose
+    /// donation holds the page), then the inline records, snapshotted up
+    /// front, with record 0 (the create-time slab that holds the owner and
+    /// this pool) last. A record's `holes` is its list of kept arena pages
+    /// (null for an `AddressSpace` pool, or a record with none); `free` may
+    /// rewrite it.
+    ///
+    /// The other records of a page, or of the inline set, are sorted in
+    /// place by Memory object and offset, so a group is one run of them; a
+    /// record 0 is a group of its own. An [`interrupt_window`] follows every
+    /// group but the create-time slab's, so the walk masks interrupts for at
+    /// most one group, of at most `RECORDS_PER_PAGE` records, at a time,
+    /// whatever the donation count; its context and cost are in
     /// core/kernel/docs/capability-internals.md § Teardown.
     ///
     /// # Safety
@@ -1468,7 +1513,7 @@ impl PagePool
     #[cfg(not(test))]
     unsafe fn reclaim_donations<F>(&self, mut free: F)
     where
-        F: FnMut(*mut KernelObjectHeader, u64, u64, *mut ArenaPage),
+        F: FnMut(&mut [DonationRecord]),
     {
         let mut inline_snapshot = [DonationRecord::VACANT; INLINE_RECORDS];
         let mut count = 0;
@@ -1481,40 +1526,66 @@ impl PagePool
         let mut page_phys = self.record_head_phys.load(Ordering::Acquire);
         while page_phys != 0
         {
-            let page = crate::mm::paging::phys_to_virt(page_phys) as *const RecordPage;
+            let page = crate::mm::paging::phys_to_virt(page_phys) as *mut RecordPage;
             // SAFETY: caller's contract; the page stays intact until its
             // record 0 is freed below, after every read of it.
             let (next, used) = unsafe { ((*page).next_phys, (*page).used) };
             debug_assert!((1..=RECORDS_PER_PAGE).contains(&used));
             // The page is trusted kernel state and a corrupt record is not
-            // survivable; the clamp only keeps the read inside the page.
+            // survivable; the clamp only keeps the access inside the page.
             let used = used.min(RECORDS_PER_PAGE);
-            for i in (0..used).rev()
+            // SAFETY: as above, and the dead pool's page is this walk's alone
+            // to reorder; `used` is within it.
+            let records = unsafe { &mut (&mut (*page).records)[..used] };
+            if let Some((own, others)) = records.split_first_mut()
             {
-                // SAFETY: as above; `i < used`, and record 0 — whose donation
-                // holds the page — is read last, after which the page is
-                // not read again.
-                let record = unsafe { (*page).records[i] };
-                free(
-                    record.ancestor,
-                    record.base_offset,
-                    record.page_count,
-                    record.holes,
-                );
+                // Record 0 is copied out first: its return releases the page.
+                let mut own = *own;
+                free_in_groups(others, &mut free);
+                free(core::slice::from_mut(&mut own));
+                interrupt_window();
             }
             page_phys = next;
         }
 
-        for record in inline_snapshot[..count].iter().rev()
+        if let Some((slab, others)) = inline_snapshot[..count].split_first_mut()
         {
-            free(
-                record.ancestor,
-                record.base_offset,
-                record.page_count,
-                record.holes,
-            );
+            free_in_groups(others, &mut free);
+            free(core::slice::from_mut(slab));
         }
     }
+}
+
+/// Sort `records` in place by `key`, a record's `(ancestor, offset)`, and hand
+/// `group` each maximal run of the records that share an ancestor, lowest
+/// ancestor first, each run in ascending offset order.
+fn for_each_ancestor_group<T>(
+    records: &mut [T],
+    key: impl Fn(&T) -> (usize, u64),
+    mut group: impl FnMut(&mut [T]),
+)
+{
+    records.sort_unstable_by_key(&key);
+    for run in records.chunk_by_mut(|a, b| key(a).0 == key(b).0)
+    {
+        group(run);
+    }
+}
+
+/// Hand `free` the donation records `records` in groups that share a Memory
+/// object ([`for_each_ancestor_group`]), each followed by an
+/// [`interrupt_window`].
+#[cfg(not(test))]
+fn free_in_groups(records: &mut [DonationRecord], free: &mut impl FnMut(&mut [DonationRecord]))
+{
+    for_each_ancestor_group(
+        records,
+        |record| (record.ancestor.addr(), record.base_offset),
+        |group| {
+            free(group);
+            interrupt_window();
+        },
+    );
 }
 
 impl Default for PagePool
@@ -3222,88 +3293,57 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
     });
 }
 
-/// Return one donation to its ancestor Memory object and drop the reference the
-/// donation held on it, pushing the ancestor onto `stack` if that was its last
-/// reference.
+/// Return a group of a dead pool's donations that share one Memory object,
+/// sorted by offset, to that object through one walk of its page free list
+/// (`retype::retype_free_runs`), but for the arena pages on each record's
+/// `holes` list, which a `CSpace`'s teardown keeps (an `AddressSpace` pool's
+/// records have none): each such page takes a lease of its own on the Memory
+/// object and records it as its ancestor, and returns there with its last
+/// chunk. Then drop the reference each donation held, pushing the Memory
+/// object onto `stack` if that was its last.
+///
+/// Each record's kept pages are sorted once (the sorted list replaces its
+/// `holes`) and its span walked with them in order, so a group of `g` records
+/// with `k` kept pages costs one walk of the Memory object's page free list,
+/// at most `g + k` insertions, and the sorts, `O(k log k)`.
 ///
 /// # Safety
-/// `(anc_ptr, off, pages)` must be a donation record handed out by
-/// `PagePool::reclaim_donations` under that function's contract.
-#[cfg(not(test))]
-unsafe fn free_donation(
-    anc_ptr: *mut KernelObjectHeader,
-    off: u64,
-    pages: u64,
-    stack: &mut CascadeStack,
-)
-{
-    // SAFETY: anc_ptr was set at donation recording from a live
-    // MemoryObject's header; the inc_ref then is matched by the
-    // dec_ref here.
-    let anc_hdr = unsafe { &*anc_ptr };
-    // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
-    #[allow(clippy::cast_ptr_alignment)]
-    // SAFETY: as above; the ancestor stays live until the dec_ref below.
-    let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
-    // SAFETY: the record names a page-class retype of this Memory object, which
-    // the dead pool no longer uses (caller contract).
-    unsafe {
-        crate::cap::retype::retype_free(anc_memory, off, pages * crate::mm::PAGE_SIZE as u64);
-    }
-    if anc_hdr.dec_ref() == 0
-    {
-        // SAFETY: refcount reached 0; no live cap holds it, and the
-        // donation's bytes have been returned to it above.
-        unsafe { stack.push(NonNull::new_unchecked(anc_ptr)) };
-    }
-}
-
-/// Return the donation `(anc_ptr, off, pages)` of a dead `CSpace`'s pool to
-/// its Memory object but for the arena pages on its record's `holes` list,
-/// which the teardown keeps: each such page takes a lease of its own on the
-/// Memory object and records it as its ancestor, and returns there with its
-/// last chunk. Then drop the donation's reference, pushing the Memory object
-/// onto `stack` if that was its last.
-///
-/// The record's kept pages are sorted once and the span walked with them in
-/// order, its runs returned through one walk of the Memory object's page free
-/// list (`retype::retype_free_runs`): a donation with `k` kept pages costs
-/// `O(k log k)` plus that walk, and a teardown with `r` records and `h` kept
-/// pages `O(r + h log h)` plus one walk per record, as a wholesale return of
-/// each record costs.
-///
-/// # Safety
-/// The record is one `PagePool::reclaim_donations` hands out, `holes` its
-/// list of kept pages (linked through [`ArenaPage::next`] by
-/// `CSpaceKernelObject::orphan_arena_pages`), every page on it held; no lock
+/// `group` is one group `PagePool::reclaim_donations` hands out, under that
+/// function's contract; each record's `holes` is its list of kept pages
+/// (linked through [`ArenaPage::next`] by
+/// `CSpaceKernelObject::orphan_arena_pages`), every page on it held. No lock
 /// is held.
 #[cfg(not(test))]
-unsafe fn free_donation_around(
-    anc_ptr: *mut KernelObjectHeader,
-    off: u64,
-    pages: u64,
-    holes: *mut ArenaPage,
-    stack: &mut CascadeStack,
-)
+unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeStack)
 {
     use crate::mm::paging::virt_to_phys;
+    let Some(first) = group.first()
+    else
+    {
+        return;
+    };
+    let anc_ptr = first.ancestor;
+    debug_assert!(group.iter().all(|record| record.ancestor == anc_ptr));
     // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
     #[allow(clippy::cast_ptr_alignment)]
-    // SAFETY: the record's reference keeps its Memory object live until the
-    // release at the end.
+    // SAFETY: the records' references keep their Memory object live until the
+    // releases at the end.
     let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
     let offset_of = |page: *mut ArenaPage| virt_to_phys(page as u64) - anc_memory.base;
-    // SAFETY: every page on the list is held (contract) and lies in this
-    // donation's span (its record cell named this record).
-    let sorted = unsafe {
-        crate::cap::arena::sort_list(
-            holes,
-            &|page: *mut ArenaPage| (*page).next.load(Ordering::Relaxed),
-            &|page: *mut ArenaPage, to| (*page).next.store(to, Ordering::Relaxed),
-            &offset_of,
-        )
-    };
-    let kept = || {
+    for record in group.iter_mut()
+    {
+        // SAFETY: every page on the list is held (contract) and lies in this
+        // donation's span (its record cell named this record).
+        record.holes = unsafe {
+            crate::cap::arena::sort_list(
+                record.holes,
+                &|page: *mut ArenaPage| (*page).next.load(Ordering::Relaxed),
+                &|page: *mut ArenaPage, to| (*page).next.store(to, Ordering::Relaxed),
+                &offset_of,
+            )
+        };
+    }
+    let kept = |sorted: *mut ArenaPage| {
         let mut cur = sorted;
         core::iter::from_fn(move || {
             // SAFETY: every page on the list is held (contract).
@@ -3317,21 +3357,30 @@ unsafe fn free_donation_around(
         })
     };
     let p = crate::mm::PAGE_SIZE as u64;
-    // SAFETY: the runs are the parts of the record's page-class retype that
-    // no kept page covers, in ascending order; the dead pool uses none of them.
+    // SAFETY: the runs are the parts of the records' page-class retypes that
+    // no kept page covers, in ascending order (the records are sorted by
+    // offset and their spans disjoint); the dead pool uses none of them.
     unsafe {
         crate::cap::retype::retype_free_runs(anc_memory, |free_run| {
-            crate::cap::arena::for_each_run(off, off + pages * p, kept(), |from, to| {
-                free_run(from, to - from);
-            });
+            for record in &*group
+            {
+                let start = record.base_offset;
+                let end = start + record.page_count * p;
+                crate::cap::arena::for_each_run(start, end, kept(record.holes), |from, to| {
+                    free_run(from, to - from);
+                });
+            }
         });
     }
-    // SAFETY: the record's reference, released once, after every run.
-    if unsafe { &*anc_ptr }.dec_ref() == 0
+    for _ in 0..group.len()
     {
-        // SAFETY: refcount reached 0; no live cap holds it, and the
-        // donation's bytes have been returned to it above.
-        unsafe { stack.push(NonNull::new_unchecked(anc_ptr)) };
+        // SAFETY: one record's reference, released once, after every run.
+        if unsafe { &*anc_ptr }.dec_ref() == 0
+        {
+            // SAFETY: refcount reached 0; no live cap holds it, and the
+            // donations' bytes have been returned to it above.
+            unsafe { stack.push(NonNull::new_unchecked(anc_ptr)) };
+        }
     }
 }
 
@@ -3339,12 +3388,12 @@ unsafe fn free_donation_around(
 /// (holding the wrapper and the pool) last, but for the arena pages the
 /// teardown keeps, on its records' lists; `obj` is dangling afterwards. Then
 /// release the teardown's hold on each kept page, through `kept`, pushing one
-/// whose last chunk has gone meanwhile onto `stack`. Unlike a `CSpace`'s
-/// derivation drain, this walk is not batched: no lock is held across it
-/// (each return takes only its ancestor's cap lock), so nothing else waits on
-/// it; its length is the number of donations the owner paid for plus the
-/// sort of the kept pages, and each donation's return one walk of its
-/// Memory object's page free list ([`free_donation_around`]).
+/// whose last chunk has gone meanwhile onto `stack`. No lock is held across
+/// the walk (each return takes only its ancestor's cap lock), so nothing else
+/// waits on it; it returns the donations in groups that share a Memory object
+/// ([`free_donation_group`]), with interrupts taken between groups, and its
+/// length is the number of donations the owner paid for plus the sort of the
+/// kept pages.
 ///
 /// # Safety
 /// `obj`'s reference count is zero, its derivation drain has run and its
@@ -3357,10 +3406,10 @@ unsafe fn reclaim_cspace_donations(
     stack: &mut CascadeStack,
 )
 {
-    let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64, holes: *mut ArenaPage| {
-        // SAFETY: a record handed out by reclaim_donations under its
+    let free = |group: &mut [DonationRecord]| {
+        // SAFETY: a group handed out by reclaim_donations under its
         // contract, with its kept pages; no lock held.
-        unsafe { free_donation_around(anc, off, pages, holes, stack) }
+        unsafe { free_donation_group(group, stack) }
     };
     // SAFETY: caller contract.
     unsafe { obj.cs_pool.reclaim_donations(free) };
@@ -3505,7 +3554,7 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
         {
             // Its last chunk has gone, and its CSpace with it: the page returns
             // to the Memory object its donation came from, releasing the lease
-            // the CSpace's teardown gave it (free_donation_around).
+            // the CSpace's teardown gave it (free_donation_group).
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
             let Some(ancestor) = NonNull::new(ancestor_ptr)
             else
@@ -4241,10 +4290,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // wrapper and this pool) last; `obj` is dangling afterwards.
             // An address space's pool carves no arena page, so no record has
             // a kept page.
-            let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64, _: *mut ArenaPage| {
-                // SAFETY: a record handed out by reclaim_donations under
-                // its contract; no lock held.
-                unsafe { free_donation(anc, off, pages, stack) }
+            let free = |group: &mut [DonationRecord]| {
+                // SAFETY: a group handed out by reclaim_donations under its
+                // contract, whose records list no kept page; no lock held.
+                unsafe { free_donation_group(group, stack) }
             };
             // SAFETY: refcount 0, no slot references the object, the
             // in-place AddressSpace (if any) has been dropped, and no lock
@@ -5067,6 +5116,41 @@ mod tests
         assert_eq!(offset_of!(InterruptObject, header), 0);
         assert_eq!(offset_of!(IoPortObject, header), 0);
         assert_eq!(offset_of!(SchedControlObject, header), 0);
+    }
+
+    // The defect caught: a teardown group that mixes Memory objects (its runs
+    // returned to the wrong one), splits one Memory object's records across
+    // groups out of order, or drops or repeats a record, so a donation goes
+    // back twice, to the wrong object, or not at all, or the runs a group
+    // hands `retype_free_runs` do not ascend.
+    #[test]
+    fn donation_records_group_by_memory_object_in_ascending_offset_order()
+    {
+        // (ancestor, offset) pairs, three ancestors interleaved out of order.
+        let mut records = [
+            (0x3000, 7),
+            (0x1000, 5),
+            (0x2000, 2),
+            (0x1000, 1),
+            (0x3000, 0),
+            (0x1000, 9),
+            (0x2000, 4),
+        ];
+        let mut groups: Vec<Vec<(usize, u64)>> = Vec::new();
+        for_each_ancestor_group(&mut records, |&r| r, |group| groups.push(group.to_vec()));
+        assert_eq!(
+            groups,
+            [
+                vec![(0x1000, 1), (0x1000, 5), (0x1000, 9)],
+                vec![(0x2000, 2), (0x2000, 4)],
+                vec![(0x3000, 0), (0x3000, 7)],
+            ]
+        );
+
+        let mut none: [(usize, u64); 0] = [];
+        let mut calls = 0;
+        for_each_ancestor_group(&mut none, |&r| r, |_| calls += 1);
+        assert_eq!(calls, 0, "no records, no group");
     }
 
     // The defect caught: a copy count that runs into the root's share (the

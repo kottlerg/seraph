@@ -1557,6 +1557,16 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
     })
 }
 
+/// The result of the worker's call, when it made the call: its return value,
+/// or `u64::MAX` on an error. `None` when the worker never finished it, so the
+/// call's object was neither consumed (a delete) nor created (a create). Read
+/// once [`measure_call`] has returned, whatever its outcome: the worker is
+/// reaped by then, so the words no longer change.
+fn worker_result() -> Option<u64>
+{
+    (LAT_END.load(Ordering::Acquire) != 0).then(|| LAT_RESULT.load(Ordering::Relaxed))
+}
+
 /// Log `m`, the measure of `call` (a log line naming it), and check it against
 /// the bounds.
 fn check_measured(call: &'static str, m: &Measured) -> TestResult
@@ -1717,14 +1727,19 @@ fn teardown_case(ctx: &TestContext, aspace: bool, call: &'static str) -> TestRes
             target: 0,
         };
         build_teardown_fixture(ctx, source, aspace, &mut fixture)?;
-        let target = core::mem::take(&mut fixture.target);
-        let measured = measure_call(ctx, frame.0, LAT_OP_DELETE, target, 0);
-        if measured.as_ref().is_ok_and(|m| m.result != 0)
+        let measured = measure_call(ctx, frame.0, LAT_OP_DELETE, fixture.target, 0);
+        // The fixture's drop deletes the target unless the worker's delete
+        // consumed it, whether or not the measure itself succeeded.
+        if worker_result() == Some(0)
         {
-            fixture.target = target;
+            fixture.target = 0;
+        }
+        let measured = measured?;
+        if measured.result != 0
+        {
             return Err("retype::pool_latency: the worker's delete of the target failed");
         }
-        measured
+        Ok(measured)
     });
     if let Ok(frame) = scratch
     {
@@ -1774,13 +1789,19 @@ pub fn pool_seeding_takes_interrupts(ctx: &TestContext) -> TestResult
         let mut all = [const { None }; CALLS.len()];
         for (slot, &(op, _)) in all.iter_mut().zip(&CALLS)
         {
-            let m = measure_call(ctx, frame.0, op, source, LAT_SOURCE_PAGES)?;
+            let measured = measure_call(ctx, frame.0, op, source, LAT_SOURCE_PAGES);
+            // Delete the pool the worker created, whether or not the measure
+            // itself succeeded, so the source can merge back.
+            if let Some(created) = worker_result().filter(|&r| r != u64::MAX)
+            {
+                cap_delete(created)
+                    .map_err(|_| "retype::pool_latency: delete the seeded pool failed")?;
+            }
+            let m = measured?;
             if m.result == u64::MAX
             {
                 return Err("retype::pool_latency: the worker's create failed");
             }
-            cap_delete(m.result)
-                .map_err(|_| "retype::pool_latency: delete the seeded pool failed")?;
             *slot = Some(m);
         }
         Ok(all)

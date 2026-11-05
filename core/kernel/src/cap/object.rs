@@ -3554,7 +3554,7 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
         {
             // Its last chunk has gone, and its CSpace with it: the page returns
             // to the Memory object its donation came from, releasing the lease
-            // the CSpace's teardown gave it (free_donation_around).
+            // the CSpace's teardown gave it (free_donation_group).
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
             let Some(ancestor) = NonNull::new(ancestor_ptr)
             else

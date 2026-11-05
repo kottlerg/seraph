@@ -382,19 +382,18 @@ an insertion per run, and the sort of the group and of its records' kept arena p
 pages are a dimension of their own, bounded by the bodies that outlive the `CSpace`, one page per
 body at most. Neither the donation count nor any `init_pages` lengthens the window; the walk's
 total length still grows with the donation count. It runs to completion in whichever context drops
-the last reference: the deleting syscall, with interrupts masked on that CPU but in the windows; or,
-when the owner is handed to the per-CPU
-deferred-reclaim stack (a thread deleting an object it is itself bound to, a syscall pin or a
-batched capability move dropping the last reference, or an Mmio object's mapping record releasing
-the address space at that object's teardown; the producer list is
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Self-teardown) — the next syscall
-epilogue on that CPU, with interrupts masked but in the windows, or the idle thread's drain, with
-interrupts enabled ([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin
-locks"). So an owner's teardown time scales with how finely it donated, and can land on an
-unrelated thread's syscall, which is not preempted during it: the same memory donated as single
-pages costs one record per page. The standard runtime's map retry donates one page per page-table
-shortfall (its budget top-up donates the shortfall in one call), so a process's count is of the
-order of its page-table page count, one per 2 MiB of mapped span.
+the last reference: the deleting syscall, with interrupts masked on that CPU except in the windows;
+or, when the owner is handed to the per-CPU deferred-reclaim stack (a thread deleting an object it
+is itself bound to, a syscall pin or a batched capability move dropping the last reference, or an
+Mmio object's mapping record releasing the address space at that object's teardown; the producer
+list is [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Self-teardown) — the next
+syscall epilogue on that CPU, with interrupts masked except in the windows, or the idle thread's
+drain, with interrupts enabled ([scheduling-internals.md](scheduling-internals.md) § Lock
+Hierarchy, "Bare spin locks"). So an owner's teardown time scales with how finely it donated, and
+can land on an unrelated thread's syscall, which is not preempted during it: the same memory
+donated as single pages costs one record per page. The standard runtime's map retry donates one
+page per page-table shortfall (its budget top-up donates the shortfall in one call), so a
+process's count is of the order of its page-table page count, one per 2 MiB of mapped span.
 
 ### Body Arena
 

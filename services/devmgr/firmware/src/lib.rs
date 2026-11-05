@@ -16,7 +16,8 @@
 //! interrupt lines it has carved so every device on a line gets its own
 //! derivation, tracks which spawned drivers reported their device ready, and
 //! keeps each class's served drivers by instance ordinal, a withdrawn one's
-//! ordinal held by a tombstone.
+//! ordinal held by a tombstone, and keeps each DMA-capable device's DMA
+//! mappings (`dma`).
 //! The functions read caller-mapped byte slices or values, or reach the
 //! platform only through a caller-supplied accessor or split operation, and
 //! touch no syscall, IPC, or `std::os::seraph` surface, so the crate is

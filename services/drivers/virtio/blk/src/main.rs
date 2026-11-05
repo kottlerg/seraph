@@ -239,7 +239,7 @@ fn report_ready(devmgr_ep: u64, ipc_buf: *mut u64)
 
 /// Request a single contiguous Memory cap covering `page_count` pages from
 /// memmgr. Returns the cap's slot on success. The device reaches the pages
-/// only once they are mapped for it ([`map_for_device`]).
+/// only once they are mapped for it ([`virtio_core::dma::map_or_exit`]).
 fn request_memory_caps(memmgr_ep: u64, page_count: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let arg = page_count | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
@@ -263,30 +263,6 @@ fn request_memory_caps(memmgr_ep: u64, page_count: u64, ipc_buf: *mut u64) -> Op
         return None;
     }
     reply.caps().first().copied()
-}
-
-/// Map the frames of `memory_cap` for the device ([`virtio_core::dma::map`]),
-/// which reads and writes them, and return their device address; exits when
-/// devmgr refuses, since the device cannot be driven without them.
-fn map_for_device(caps: &DriverCaps, memory_cap: u64, what: &str, ipc_buf: *mut u64) -> u64
-{
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    match unsafe {
-        virtio_core::dma::map(
-            caps.dma_ep,
-            memory_cap,
-            virtio_core::dma::DEVICE_READS_WRITES,
-            ipc_buf,
-        )
-    }
-    {
-        Ok(device_addr) => device_addr,
-        Err(e) =>
-        {
-            std::os::seraph::log!("{what} not mapped for the device ({e:?})");
-            syscall::thread_exit();
-        }
-    }
 }
 
 // ── Device initialisation ──────────────────────────────────────────────────
@@ -403,7 +379,12 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     unsafe {
         core::ptr::write_bytes(ring_va as *mut u8, 0, (ring_pages * PAGE_SIZE) as usize);
     }
-    let ring_addr = map_for_device(caps, ring_memory, "ring memory", ipc_buf);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let ring_addr = unsafe {
+        virtio_core::dma::map_or_exit(caps.dma_ep, ring_memory, ipc_buf, |e| {
+            std::os::seraph::log!("ring memory not mapped for the device ({e:?})");
+        })
+    };
     (ring_addr, ring_pages, ring_va)
 }
 
@@ -523,7 +504,12 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     // SAFETY: data_va is mapped writable, one page.
     unsafe { core::ptr::write_bytes(data_va as *mut u8, 0xAA, PAGE_SIZE as usize) };
 
-    let data_addr = map_for_device(caps, data_memory, "data page", ipc_buf);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let data_addr = unsafe {
+        virtio_core::dma::map_or_exit(caps.dma_ep, data_memory, ipc_buf, |e| {
+            std::os::seraph::log!("data page not mapped for the device ({e:?})");
+        })
+    };
     IoLayout { data_va, data_addr }
 }
 

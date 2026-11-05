@@ -147,7 +147,12 @@ For each matched device, devmgr:
    Enable through it before it takes the BAR caps (see
    [responsibilities.md](responsibilities.md#responsibilities)
    § Responsibilities). A function no kept window decodes, or whose carve
-   fails, refuses the device, logged, with its BAR caps released.
+   fails, refuses the device, logged, with its BAR caps released. devmgr
+   then gives the device DMA: it registers the device in its DMA table and
+   derives the device's DMA capability, a SEND badged with the device badge
+   on its DMA endpoint ([responsibilities.md](responsibilities.md)
+   § Responsibilities). A device that cannot be given DMA is refused, logged,
+   with its BAR and configuration-page caps released.
 4. Gives the device its own single-line `Interrupt` cap for its GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback). The first
    time any device asks for a GSI, devmgr splits the line's cap off its
@@ -172,11 +177,7 @@ For each matched device, devmgr:
    before it, logged once (`firmware::acpi::madt_well_formed`), and a line a
    later override would have named takes the default. On riscv64 every line
    takes level-triggered, active-high, which the kernel validates and
-   programs nothing from. devmgr then gives the device DMA: it registers the
-   device in its DMA table and derives the device's DMA capability, a SEND
-   badged with the device badge on its DMA endpoint
-   ([responsibilities.md](responsibilities.md) § Responsibilities). A device
-   that cannot be given DMA is refused, logged, with its caps released.
+   programs nothing from.
 5. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
    boot-module driver (virtio-blk, at enumeration, from a derived copy of the
    module cap per device; the original is released once every device is

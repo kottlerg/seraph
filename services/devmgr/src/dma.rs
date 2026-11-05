@@ -130,7 +130,13 @@ impl DmaGrant
     /// frame it was given.
     pub fn withdraw(&self) -> bool
     {
-        let _ = syscall::cap_revoke(self.cap);
+        if syscall::cap_revoke_all(self.cap).is_err()
+        {
+            std::os::seraph::log!(
+                "DMA capability of device {} not fully revoked",
+                self.device_badge
+            );
+        }
         let held = lock(&self.table).withdraw(self.device_badge);
         release_mappings(held.into_iter().flatten());
         false
@@ -219,7 +225,9 @@ fn handle_map(msg: &IpcMessage, table: &Mutex<DmaTable>, ipc_buf: *mut u64)
     // SAFETY: ipc_buf is this thread's registered IPC buffer.
     if unsafe { ipc::ipc_reply(&reply_msg, ipc_buf) }.is_err()
     {
-        release_mappings(lock(table).unmap(msg.badge, device_addr).ok());
+        // Bound first, so the guard is dropped before the cap is deleted.
+        let undone = lock(table).unmap(msg.badge, device_addr).ok();
+        release_mappings(undone);
     }
 }
 

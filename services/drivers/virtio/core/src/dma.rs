@@ -20,8 +20,9 @@ pub const DEVICE_READS_WRITES: u64 = ACCESS_DEVICE_READ | ACCESS_DEVICE_WRITE;
 /// Map the frames of `memory_cap` for the device whose DMA capability
 /// `dma_ep` is, with `access` ([`DEVICE_READS`] or [`DEVICE_READS_WRITES`]),
 /// and return the device address of their first byte. The driver keeps
-/// `memory_cap`: devmgr is sent a derivation of it, which it keeps while the
-/// mapping stands.
+/// `memory_cap`: devmgr is sent a derivation of it carrying only the rights
+/// the access needs (`MAP`, and `WRITE` for a device that writes), which it
+/// keeps while the mapping stands.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
@@ -36,7 +37,15 @@ pub unsafe fn map(
     ipc_buf: *mut u64,
 ) -> Result<u64, ipc::DmaError>
 {
-    let copy = syscall::cap_derive(memory_cap, syscall::RIGHTS_ALL).map_err(ipc::DmaError::Call)?;
+    let rights = if access & ACCESS_DEVICE_WRITE != 0
+    {
+        syscall::RIGHTS_MEM_MAP | syscall::RIGHTS_MEM_WRITE
+    }
+    else
+    {
+        syscall::RIGHTS_MEM_MAP
+    };
+    let copy = syscall::cap_derive(memory_cap, rights).map_err(ipc::DmaError::Call)?;
     // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
     let mapped = unsafe { ipc::dma_map(dma_ep, copy, access, ipc_buf) };
     if let Err(ipc::DmaError::Call(_)) = mapped
@@ -45,6 +54,33 @@ pub unsafe fn map(
         let _ = syscall::cap_delete(copy);
     }
     mapped
+}
+
+/// Map the frames of `memory_cap` for the device to read and write
+/// ([`map`] with [`DEVICE_READS_WRITES`]), as a driver maps its rings and
+/// fixed buffers at setup, and return their device address. A device cannot
+/// be driven without them, so when devmgr refuses, `on_refusal` is called
+/// with the error (to log it) and the calling thread exits.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+pub unsafe fn map_or_exit(
+    dma_ep: u64,
+    memory_cap: u64,
+    ipc_buf: *mut u64,
+    on_refusal: impl FnOnce(ipc::DmaError),
+) -> u64
+{
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    match unsafe { map(dma_ep, memory_cap, DEVICE_READS_WRITES, ipc_buf) }
+    {
+        Ok(device_addr) => device_addr,
+        Err(e) =>
+        {
+            on_refusal(e);
+            syscall::thread_exit();
+        }
+    }
 }
 
 /// Withdraw the mapping at `device_addr` that [`map`] made for the device

@@ -49,7 +49,10 @@ pub struct Mapping
     pub cap: u64,
     /// The device address of the first byte, the one `DMA_MAP` returned.
     pub device_addr: u64,
-    /// The physical address of the first byte.
+    /// The physical address of the first byte. Equal to `device_addr` while
+    /// no IOMMU is programmed, and read by nothing until one is: it is what
+    /// an IOMMU backend writes into the device's translation tables for
+    /// `device_addr`.
     pub phys: u64,
     /// Bytes mapped; nonzero.
     pub len: u64,

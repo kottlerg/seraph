@@ -240,7 +240,7 @@ capability (§ DMA Authorisation). With no IOMMU programmed the physical
 isolation is absent, and devmgr runs the device unconfined (§ DMA Safety
 Model); the kernel is agnostic to both outcomes.
 
-No driver reads a physical address: every address it programs comes from `DMA_MAP`
+No DMA-capable driver reads a physical address: every address it programs comes from `DMA_MAP`
 (§ DMA Authorisation). Two surfaces still hand any process physical addresses, and devmgr
 reads the second to map a driver's cap: memmgr's `REQUEST_MEMORY_CAPS` reply carries each
 granted cap's physical base (see

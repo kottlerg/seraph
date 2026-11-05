@@ -1983,8 +1983,10 @@ pub mod devmgr_dma_labels
     /// its frames through it.
     ///
     /// Request: `data[1]` = the device address a `DMA_MAP` of this device
-    /// returned. Reply: empty body, label `SUCCESS` or
-    /// `devmgr_dma_errors::NO_MAPPING`.
+    /// returned. Reply: empty body, label `SUCCESS`,
+    /// `devmgr_dma_errors::NO_MAPPING` (no mapping of the device at that
+    /// address), `devmgr_dma_errors::UNAUTHORIZED` (the device is withdrawn
+    /// or was never given DMA), or `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
     pub const DMA_UNMAP: u64 = 2;
     /// [`DMA_MAP`] access bit: the device reads the frames.
     pub const ACCESS_DEVICE_READ: u64 = 1 << 0;
@@ -2077,7 +2079,10 @@ pub unsafe fn dma_map(
 ///
 /// # Errors
 /// [`DmaError::Call`] when the call fails, and [`DmaError::Refused`] with
-/// devmgr's reply label when it names no mapping of the device.
+/// devmgr's reply label when devmgr refuses: `NO_MAPPING` when `device_addr`
+/// names no mapping of the device, `UNAUTHORIZED` when the device is
+/// withdrawn or was never given DMA, or `LABEL_VERSION_MISMATCH`
+/// ([`devmgr_dma_labels::DMA_UNMAP`]).
 pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Result<(), DmaError>
 {
     let request = IpcMessage::builder(devmgr_dma_labels::DMA_UNMAP)

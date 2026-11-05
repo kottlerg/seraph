@@ -1775,7 +1775,7 @@ fn populate_cspace(
             });
             let slot = insert_or_fatal(
                 cspace,
-                MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
+                MemRights::BOOT_RAM,
                 ptr,
                 "Phase 7: cannot allocate Memory capability for usable memory",
             );
@@ -1833,7 +1833,7 @@ fn populate_cspace(
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
+            MemRights::BOOT_RAM,
             ptr,
             "Phase 7: cannot allocate Memory capability for usable memory",
         );
@@ -2216,7 +2216,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         // lacks WRITE and EXECUTE.
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
+            MemRights::BOOT_RAM,
             ptr,
             "Phase 7: cannot allocate Memory capability for boot module",
         );
@@ -2458,7 +2458,7 @@ fn mint_reclaim_pass(
         });
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
+            MemRights::BOOT_RAM,
             ptr,
             if late
             {

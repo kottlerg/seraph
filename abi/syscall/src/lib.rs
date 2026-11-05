@@ -781,6 +781,16 @@ pub const RIGHTS_MEM_EXECUTE: u64 = 1 << 2;
 /// consuming syscall.
 pub const RIGHTS_MEM_RETYPE: u64 = 1 << 3;
 
+/// Memory: authority to read this region's physical base
+/// (`CAP_INFO_MEMORY_PHYS_BASE`).
+///
+/// Held by every boot-minted RAM, boot-module, init-segment, `InitInfo`,
+/// init-stack, and reclaimed boot-scratch Memory cap, and so by memmgr's pool;
+/// never by firmware-table Memory caps, whose physical bases `InitInfo`'s
+/// descriptors already carry. memmgr strips it from every grant except to the
+/// processes docs/capability-model.md § Memory names.
+pub const RIGHTS_MEM_PHYS: u64 = 1 << 4;
+
 /// Memory: map read-write.
 pub const RIGHTS_MEM_MAP_RW: u64 = RIGHTS_MEM_MAP | RIGHTS_MEM_WRITE;
 
@@ -1298,6 +1308,7 @@ mod tests
                 RIGHTS_MEM_WRITE,
                 RIGHTS_MEM_EXECUTE,
                 RIGHTS_MEM_RETYPE,
+                RIGHTS_MEM_PHYS,
             ],
             // AddressSpace
             &[RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_AS_CONTROL],

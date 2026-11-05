@@ -134,7 +134,10 @@ communicates them via `ProcessInfo` / `InitInfo`.
   table and death queues). svcmgr observes the death via its event queue
   and applies restart policy. No kernel panic.
 - **Thread safety.** A spinlock guards the allocator. Multi-threaded
-  services share one allocator instance.
+  services share one allocator instance. A contended waiter sleeps once a
+  bounded spin is spent, so a lower-priority holder on its CPU still runs
+  ([runtime/ruststd/README.md](../runtime/ruststd/README.md) § Byte heap
+  (`System`)).
 - **`no_std` exceptions.** `init` and `memmgr` are `no_std` and have
   no byte heap (no `GlobalAlloc`). They allocate frames (where applicable)
   via direct kernel object handling at boot, not via `REQUEST_MEMORY_CAPS`.
@@ -166,7 +169,8 @@ the process via the page-reservation allocator inside `std::sys::seraph`.
   release always finds a slot and freed VA is never lost. A reservation
   that cannot grow the table fails with `OutOfSpace`.
 - **Concurrency.** Reservations are independent across threads; the
-  allocator serialises on a spinlock as needed.
+  allocator serialises as needed on the byte heap's spin-mutex type, whose
+  waiters sleep past a bounded spin ([Byte Heap](#byte-heap)).
 
 The page-reservation allocator is a `std::sys::seraph` concern and is
 not exposed to non-std runtimes. `init` and `memmgr` carry small

@@ -33,7 +33,7 @@ services/svctest/
         │                      # physical base withheld
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
-        │                      # spawn priority
+        │                      # spawn priority; heap lock under cross-class contention
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
         │                      # death queues; logd death forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults

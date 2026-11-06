@@ -49,11 +49,11 @@ use syscall_abi::{
     SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
     SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
     SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
-    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_REGS,
-    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
-    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT, SyscallError,
+    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_MEM,
+    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
+    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -2503,6 +2503,84 @@ pub unsafe fn thread_write_regs_raw(thread_cap: u64, buf: *const u8, len: usize)
     // and the caller's contract keeps the installed frame on code and a stack
     // dedicated to the thread, the raw-wrapper contract's thread-entry clause.
     let ret = unsafe { syscall3(SYS_THREAD_WRITE_REGS, thread_cap, buf as u64, len as u64) };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Copy `buf.len()` bytes at `va` in the address space `thread_cap`'s thread
+/// executes in into `buf` (`SYS_THREAD_READ_MEM`). `buf.len()` must be in
+/// `1..=MAX_THREAD_MEM_COPY`; every page of the range must be mapped (the
+/// kernel does not fault a page in for the read) and normal memory. The
+/// thread need not be stopped, but a debugger stops it for a coherent view
+/// (`docs/fault-handling.md` § Debugging). Returns the byte count.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` (the thread cap
+/// is invalid), `InsufficientRights` (it lacks Control), `InvalidState` (the
+/// thread has exited), `InvalidArgument` (a length of 0 or above
+/// `MAX_THREAD_MEM_COPY`), or `InvalidAddress` (either range is not wholly in
+/// the user half, a page of the target range is unmapped or device memory,
+/// or a fault on `buf` is unhandled: the call is restartable, as
+/// [`thread_read_regs`] states).
+// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub fn thread_read_mem(thread_cap: u64, va: u64, buf: &mut [u8]) -> Result<u64, i64>
+{
+    // SAFETY: syscall4 issues the raw syscall. `buf` is a live, exclusively
+    // borrowed slice, so the kernel's writes of `buf.len()` bytes land in
+    // memory no other Rust reference names, and any byte value is a valid
+    // `u8`; the call changes no mapping, IPC page, or thread entry state.
+    let ret = unsafe {
+        syscall4(
+            SYS_THREAD_READ_MEM,
+            thread_cap,
+            va,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// Copy `buf` to `va` in the address space `thread_cap`'s thread executes in
+/// (`SYS_THREAD_WRITE_MEM`), all or nothing. `buf.len()` must be in
+/// `1..=MAX_THREAD_MEM_COPY`, and every page of the range mapped and normal
+/// memory. A page the thread's mapping makes read-only, such as its text,
+/// takes the write only with `flags` = `THREAD_MEM_TEXT`, and only when its
+/// frame is mapped nowhere else. A write that reaches an executable page is
+/// visible to instruction fetch on every CPU when the call returns; another
+/// thread of the space that runs during the write may run old or new bytes,
+/// so a debugger stops the space's threads around it
+/// (`docs/fault-handling.md` § Debugging).
+///
+/// # Safety
+/// When the thread executes in the calling program's own address space, the
+/// write changes the program's memory under any Rust object there: the range
+/// must hold no object a store of these bytes would make invalid, and no
+/// reference may be live to it.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights`, `InvalidArgument` (also an undefined `flags` bit),
+/// and `InvalidAddress` as [`thread_read_mem`]; `InsufficientRights` also for
+/// a read-only page without `THREAD_MEM_TEXT`; `InvalidState` when the thread
+/// has exited, or a read-only page's frame is mapped more than once.
+#[inline]
+pub unsafe fn thread_write_mem(thread_cap: u64, va: u64, buf: &[u8], flags: u64)
+-> Result<(), i64>
+{
+    // SAFETY: syscall5 issues the raw syscall; the kernel only reads `buf`, a
+    // live slice; the caller's contract covers a write into its own space.
+    let ret = unsafe {
+        syscall5(
+            SYS_THREAD_WRITE_MEM,
+            thread_cap,
+            va,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            flags,
+        )
+    };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 

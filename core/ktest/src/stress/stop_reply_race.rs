@@ -43,9 +43,12 @@
 //!
 //! With four or more CPUs, the controller pins itself to CPU 0, the server, the
 //! client and a second stopper take three distinct other CPUs, and the second
-//! stopper stops the client too, released by the controller just before its own
-//! stop and delete and after a cycle-varying spin, so two cancels race one
-//! reply-blocked client while the server is freed. A cancel that wins the
+//! stopper stops the client too, so two cancels race one reply-blocked client
+//! while the server is freed. The controller releases the stopper just before
+//! its own stop and delete and waits, bounded, for the stopper's handshake
+//! ([`STOPPER_SEEN`]). Then the cycle's offset ([`offset_spins`]) delays one
+//! side or the other, sweeping from a stopper that leads the controller's stop
+//! to one that trails it. A cancel that wins the
 //! `reply_tcb` CAS leaves the server's slot null, so the server's dealloc no
 //! longer reaches the client; were the client's binding still naming the server
 //! once the winner dropped the client's `sched_lock`, the other cancel's
@@ -78,12 +81,30 @@
 //! there shows the second stopper's cancel reached a reply-blocked client,
 //! rather than always arriving late. In a delete-first (B-first) cycle an
 //! `Ok` can also stop a client the server's death already woke, so those are
-//! not counted. Userspace cannot observe that the two cancels overlapped
-//! inside one client's `sched_lock` window, so that interleaving is reached
-//! statistically across the cycles. Any use-after-free of the freed server TCB
-//! surfaces as a kernel magic-cookie debug-assert / `#PF` / double-enqueue
-//! panic that the harness reports as FAIL — it is raised by the kernel, not by
-//! this test.
+//! not counted. The check proves that the two-stop setup armed, not that the
+//! two cancels overlapped: userspace cannot observe that they did so inside
+//! one client's `sched_lock` window, so that interleaving is reached
+//! statistically across the cycles. Any use-after-free of the freed server
+//! TCB surfaces as a kernel magic-cookie debug-assert / `#PF` /
+//! double-enqueue panic that the harness reports as FAIL — it is raised by
+//! the kernel, not by this test.
+//!
+//! The offset sweep crosses zero offset on any host, so the check does not
+//! depend on the host's speed. The controller starts its stop only once it
+//! has seen the stopper's handshake, unless [`SEEN_PROBES`] runs out first.
+//! In a stop-first cycle where the controller saw the handshake, at an offset
+//! that does not delay the stopper, the stopper therefore enters
+//! `thread_stop` no later than the controller does.
+//! Both run the same path to `thread_stop`'s state precheck, and past that
+//! precheck the controller must still cancel the client's park and take every
+//! CPU's scheduler lock before it commits `Stopped`. So in those cycles the
+//! stopper's precheck reads the client still reply-blocked unless its CPU is
+//! descheduled in that span, and its stop returns `Ok`.
+//! The ordering is relative between the two threads, not a matter of
+//! absolute timing. A one-sided delay, by contrast, arms only when its range
+//! happens to fit inside that span on the host at hand. The delayed half
+//! moves the stopper later, through the controller's cancel and commit and,
+//! once [`OFFSET_SPAN`] spins outlast them, past the commit.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -138,18 +159,33 @@ const SERVER_SPIN: u32 = 200;
 /// The controller's CPU while a second stopper runs.
 const CONTROLLER_CPU: u32 = 0;
 
-/// Bound on the second stopper's cycle-varying spin between its release and
-/// its stop, so its cancel lands before, during, or after the controller's.
-const STOPPER_SPIN_MAX: u32 = 64;
+/// Bound on the cycle's offset between the two stops, in `spin_loop`
+/// iterations either way: the offset steps through
+/// `[-OFFSET_SPAN, OFFSET_SPAN)` ([`offset_spins`]), so the second stopper's
+/// cancel lands before, during, or after the controller's.
+const OFFSET_SPAN: u32 = 64;
+
+/// Bound on the controller's probes for the second stopper's handshake
+/// ([`STOPPER_SEEN`]) after its release. A stopper whose CPU did not run
+/// meanwhile leaves the cycle's offset unanchored, an interleaving the cell
+/// accepts.
+const SEEN_PROBES: u32 = 1 << 16;
 
 /// Controller → second stopper: the cycle, counted from 1, whose client it is
 /// to stop now. The stopper spins on it rather than blocking, so its release
 /// costs no wake latency.
 static STOPPER_GO: AtomicU32 = AtomicU32::new(0);
+/// Second stopper → controller: the cycle, counted from 1, whose release the
+/// stopper has seen. The controller spins on it, so the handshake costs no
+/// wake latency either.
+static STOPPER_SEEN: AtomicU32 = AtomicU32::new(0);
 /// Second stops that returned `Ok` in a stop-first cycle, where the client
 /// is reply-blocked until a stop cancels it (see the module's § Pass
 /// criterion).
 static SECOND_STOPS_OK: AtomicU32 = AtomicU32::new(0);
+/// The [`SECOND_STOPS_OK`] stops of cycles whose offset delayed the stopper;
+/// logged, not checked.
+static SECOND_STOPS_DELAYED_OK: AtomicU32 = AtomicU32::new(0);
 
 /// The second stopper's arguments, handed to `stopper_entry` by address.
 #[derive(Clone, Copy)]
@@ -281,7 +317,9 @@ enum Stops
 fn cycles(ctx: &TestContext, place: Placement, stops: Stops) -> TestResult
 {
     STOPPER_GO.store(0, Ordering::Release);
+    STOPPER_SEEN.store(0, Ordering::Release);
     SECOND_STOPS_OK.store(0, Ordering::Release);
+    SECOND_STOPS_DELAYED_OK.store(0, Ordering::Release);
 
     for cycle in 0..CYCLES
     {
@@ -403,7 +441,7 @@ fn arm_and_race(
         .server
         .as_mut()
         .ok_or("stress::stop_reply_race: the cycle holds no server")?;
-    race(cycle, client_th, server)?;
+    race(cycle, client_th, server, stops)?;
     if parts.stopper.is_some()
     {
         await_report(
@@ -506,6 +544,10 @@ fn check_second_stops() -> TestResult
         "ktest: stress::stop_reply_race stop-first second stops ok=",
         u64::from(committed),
     );
+    crate::log_u64(
+        "ktest: stress::stop_reply_race stop-first second stops ok, stopper delayed=",
+        u64::from(SECOND_STOPS_DELAYED_OK.load(Ordering::Acquire)),
+    );
     if committed == 0
     {
         return Err(
@@ -522,15 +564,20 @@ fn check_second_stops() -> TestResult
 /// claim-CAS → gates → deferred client wake → `retype_free` of the server
 /// TCB. Client and server are pinned to different CPUs, so A's CAS and B's
 /// free execute on different cores; the issue order alternates by cycle
-/// parity to cover both interleavings. A second stopper, if any, is released
-/// first and races A with a second cancel. B deletes the Thread cap through
+/// parity to cover both interleavings. With [`Stops::Double`], the second
+/// stopper is released first and races A with a second cancel at the cycle's
+/// offset ([`controller_lead_in`]). B deletes the Thread cap through
 /// `server`, its guard.
-fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild) -> TestResult
+fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild, stops: Stops) -> TestResult
 {
     STOPPER_GO.store(cycle + 1, Ordering::Release);
+    if stops == Stops::Double
+    {
+        controller_lead_in(cycle);
+    }
     // The stop's outcome depends on which teardown reached the client first
-    // (`Ok`, `InvalidState`, or an error for a client already exited); the
-    // race, not its return, is what the cell exercises.
+    // (`Ok`, or `InvalidState` once another stop committed or the client
+    // exited); the race, not its return, is what the cell exercises.
     if cycle.is_multiple_of(2)
     {
         let _ = thread_stop(client_th);
@@ -547,6 +594,44 @@ fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild) -> TestRes
         let _ = thread_stop(client_th);
     }
     Ok(())
+}
+
+/// The cycle's offset between the two stops, as the `(stopper, controller)`
+/// spins each side runs after the handshake. The offset `d` steps through
+/// `[-OFFSET_SPAN, OFFSET_SPAN)`, one step per pair of cycles, so the
+/// stop-first and the delete-first cycles each sweep it; `d >= 0` delays the
+/// stopper by `d` spins and `d < 0` the controller by `-d`.
+fn offset_spins(cycle: u32) -> (u32, u32)
+{
+    let step = (cycle / 2) % (2 * OFFSET_SPAN);
+    if step >= OFFSET_SPAN
+    {
+        (step - OFFSET_SPAN, 0)
+    }
+    else
+    {
+        (0, OFFSET_SPAN - step)
+    }
+}
+
+/// The controller's side of the handshake for `cycle`: probe, at most
+/// [`SEEN_PROBES`] times, for the second stopper's sight of its release, then
+/// spin the controller's share of the cycle's offset.
+fn controller_lead_in(cycle: u32)
+{
+    for _ in 0..SEEN_PROBES
+    {
+        if STOPPER_SEEN.load(Ordering::Acquire) == cycle + 1
+        {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let (_, controller_spin) = offset_spins(cycle);
+    for _ in 0..controller_spin
+    {
+        core::hint::spin_loop();
+    }
 }
 
 /// Spawn the cycle's client on `cpu`, holding SEND|GRANT on `ep` and a
@@ -724,9 +809,9 @@ extern "C" fn server_entry(arg: u64) -> !
     thread_exit()
 }
 
-/// Second stopper: spin until the controller releases this cycle, spin a
-/// cycle-varying delay, stop the client, record the stop's return, and
-/// report it on `done`.
+/// Second stopper: spin until the controller releases this cycle, raise the
+/// handshake, spin the stopper's share of the cycle's offset, stop the
+/// client, record the stop's return, and report it on `done`.
 extern "C" fn stopper_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `spawn_stopper` published for this stopper.
@@ -739,20 +824,29 @@ extern "C" fn stopper_entry(arg: u64) -> !
     {
         core::hint::spin_loop();
     }
-    for _ in 0..(round % STOPPER_SPIN_MAX)
+    STOPPER_SEEN.store(round, Ordering::Release);
+    // `round` counts the cycle from 1.
+    let (stopper_spin, _) = offset_spins(round - 1);
+    for _ in 0..stopper_spin
     {
         core::hint::spin_loop();
     }
-    // Ok: this stop reached the client first, or, in a delete-first cycle,
-    // stopped a client the server's death already woke and that has not yet
-    // exited. InvalidState: the controller's stop reached the client first.
-    // Another error: the client was already woken and exited. Only an Ok in a
-    // stop-first cycle (`race` stops before it deletes on even cycles, the
-    // odd rounds), where the client is reply-blocked until a stop cancels it,
-    // is tallied.
+    // Ok: this stop's unlocked state precheck read the client before any
+    // `Stopped` commit landed (two stops past that precheck both commit
+    // `Stopped` and both return Ok), or, in a delete-first cycle, read a
+    // client the server's death already woke and that did not exit before
+    // this stop's commit. InvalidState: a `Stopped` commit came before this
+    // stop's precheck, or the client exited before this stop's commit. Only
+    // an Ok in a stop-first cycle (`race` stops before it deletes on even
+    // cycles, the odd rounds), where the client is reply-blocked until a
+    // stop cancels it, is tallied.
     if thread_stop(target).is_ok() && round % 2 == 1
     {
         SECOND_STOPS_OK.fetch_add(1, Ordering::AcqRel);
+        if stopper_spin > 0
+        {
+            SECOND_STOPS_DELAYED_OK.fetch_add(1, Ordering::AcqRel);
+        }
     }
     notification_send(done, BIT_STOPPER_DONE).ok();
     thread_exit()

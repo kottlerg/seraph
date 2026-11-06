@@ -92,6 +92,15 @@ const CSPACE_FUND_ROUNDS: u32 = 2;
 /// reaper's slot table and death queues (`sys::thread`) use it rather than
 /// std's `Mutex`, which may park and allocate: the allocator runs beneath
 /// both, and the reaper runs inside a spawn.
+///
+/// A contended [`Self::lock`] does not spin without bound. It spins a
+/// bounded number of attempts and then sleeps between attempts, as the
+/// `ruststd-spin-wait` policy decides. A strict-priority waiter runs before
+/// every fair thread and every lower-level strict-priority thread on its CPU
+/// (core/kernel/docs/scheduler.md § Scheduling Classes). Such a waiter that
+/// only spun would never let a holder below it, queued on that CPU, run there,
+/// and, with no other CPU idle to pull the holder (that document's § Load
+/// Balancing), neither thread would progress.
 pub(crate) struct SpinMutex<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
@@ -107,14 +116,26 @@ impl<T> SpinMutex<T> {
         Self { locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
     }
 
-    /// Spin until the lock is free, then hold it until the guard drops.
+    /// Wait until the lock is free, then hold it until the guard drops.
+    /// Each failed attempt spins or sleeps as [`spin_wait::Backoff`] steps
+    /// it. The sleep blocks this thread, so the holder runs even when it is
+    /// queued below this thread's level on this thread's CPU.
     pub(crate) fn lock(&self) -> SpinGuard<'_, T> {
+        let mut backoff = spin_wait::Backoff::new();
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            match backoff.next_step() {
+                spin_wait::Step::Spin => core::hint::spin_loop(),
+                // An error (`Interrupted` when this thread is stopped or is
+                // posted an upcall it does not mask) only ends the sleep
+                // early; the next attempt follows either way.
+                spin_wait::Step::Sleep(ms) => {
+                    let _ = syscall::thread_sleep(ms);
+                }
+            }
         }
         SpinGuard { mutex: self, _exclusive: PhantomData }
     }

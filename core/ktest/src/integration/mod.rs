@@ -36,6 +36,7 @@ pub mod fault_pager_roundtrip;
 pub mod fault_resume_modifies_pc;
 pub mod fault_syscall_buffer;
 pub mod fpu_survives_ipc_call;
+pub mod idle_pull_starved_ready;
 pub mod ipc_call_interrupted_stop_start;
 pub mod irq_preserves_user_regs;
 pub mod irq_shared_line;
@@ -160,6 +161,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fair_share_progress",
         fair_share_progress::run(ctx)
+    );
+    run_integration_test!(
+        "integration::idle_pull_starved_ready",
+        idle_pull_starved_ready::run(ctx)
     );
     run_integration_test!(
         "integration::shared_memory_two_aspaces",

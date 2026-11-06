@@ -30,12 +30,14 @@
 use super::thread::ThreadControlBlock;
 use super::{IDLE_PRIORITY, NUM_PRIORITY_LEVELS, RT_PRIORITY_MIN};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // ── Queue map ─────────────────────────────────────────────────────────────────
 
-/// Run queue of the idle level (never linked in practice: `dequeue_highest`
-/// returns the idle TCB when every queue is empty).
+/// Run queue of the idle level. It links only the CPU's idle thread: the idle
+/// loop leaves the idle thread through `schedule(Requeue::Always)`, which links
+/// it here, and `dequeue_highest` takes it back when every other queue is empty
+/// (or returns the idle TCB unlinked, when it was never linked).
 const IDLE_QUEUE: usize = 0;
 
 /// Run queue every fair level shares, above the idle queue and below every RT
@@ -49,6 +51,10 @@ const NUM_RUN_QUEUES: usize = FAIR_QUEUE + 1 + (NUM_PRIORITY_LEVELS - RT_PRIORIT
 
 // `non_empty` holds one bit per run queue in a `u32`.
 const _: () = assert!(NUM_RUN_QUEUES <= u32::BITS as usize);
+
+/// The `idle_pull_candidate` value that names no CPU; no CPU index reaches it,
+/// since every index is below `MAX_CPUS`.
+const NO_IDLE_PULL_CANDIDATE: usize = usize::MAX;
 
 /// The run queue threads at `level` link on. Monotone in `level`, so the
 /// highest non-empty queue holds the highest-class ready thread.
@@ -398,12 +404,23 @@ pub struct PerCpuScheduler
     pub lock: crate::sync::Spinlock,
 
     /// Approximate load counter (number of threads linked on this CPU's run
-    /// queues; the running thread is not counted). Relaxed-updated; advisory
-    /// for load balancing. Lives in the
+    /// queues; the running thread is not counted, and the idle thread is
+    /// counted while [`IDLE_QUEUE`] links it, so a CPU that left its idle
+    /// thread for another reads one more than its queued threads). Relaxed-
+    /// updated; advisory for load balancing. Lives in the
     /// scheduler rather than a `MAX_CPUS`-wide global so it scales with the
     /// CPU count. A `u32` cannot overflow: each thread costs at least
     /// `KERNEL_STACK_PAGES + 2` pages, so 2^32 threads would need 96 TiB.
     load: AtomicU32,
+
+    /// The other CPU this CPU found with a queued thread other than its idle
+    /// thread at its previous idle balance tick, or [`NO_IDLE_PULL_CANDIDATE`]:
+    /// the confirmation sample of the idle pull
+    /// (core/kernel/docs/scheduler.md § Load Balancing), which pulls a backlog
+    /// below the imbalance threshold only once it has outlived one tick.
+    /// Written and read only by this CPU's `timer_tick`, so Relaxed suffices;
+    /// atomic only so a shared reference can reach it.
+    idle_pull_candidate: AtomicUsize,
 
     /// Interrupt-flag word saved by [`lock_saving_flags`](Self::lock_saving_flags)
     /// while this CPU's lock is held as part of an all-CPU-locks operation
@@ -450,6 +467,7 @@ impl PerCpuScheduler
             current_level: AtomicU8::new(IDLE_PRIORITY),
             lock: crate::sync::Spinlock::new(),
             load: AtomicU32::new(0),
+            idle_pull_candidate: AtomicUsize::new(NO_IDLE_PULL_CANDIDATE),
             saved_lock_flags: AtomicU64::new(0),
             deferred_reclaim_head: AtomicPtr::new(core::ptr::null_mut()),
         }
@@ -610,7 +628,9 @@ impl PerCpuScheduler
     /// queues are empty.
     ///
     /// Clears the `non_empty` bit if that queue becomes empty.
-    /// Decrements load counter when a non-idle thread is dequeued.
+    /// Decrements the load counter when it dequeues a linked TCB, the idle
+    /// thread included when [`IDLE_QUEUE`] links it; returning the unlinked idle
+    /// TCB leaves the counter as it is.
     ///
     /// Does not gate on `context_saved`, per
     /// `core/kernel/docs/scheduling-internals.md` § Cross-CPU TCB Ownership
@@ -788,6 +808,15 @@ impl PerCpuScheduler
         self.non_empty.load(Ordering::Relaxed)
     }
 
+    /// Whether a run queue other than [`IDLE_QUEUE`] links a thread: a thread
+    /// other than the idle thread is queued. Lockless and Relaxed, a snapshot
+    /// for the idle pull (`sched::try_pull_idle`), which decides only whether
+    /// to try a pull; the pull itself re-finds a thread under the lock.
+    pub fn has_queued_thread(&self) -> bool
+    {
+        self.non_empty.load(Ordering::Relaxed) & !(1 << IDLE_QUEUE) != 0
+    }
+
     /// Remove `tcb` from the run queue of level `priority`. No-op if not found.
     ///
     /// Used by `dealloc_object(Thread)`, `commit_state_under_all_locks`,
@@ -883,13 +912,44 @@ impl PerCpuScheduler
         self.load.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Get current load (number of runnable threads).
+    /// Get current load (number of threads linked on the run queues, the idle
+    /// thread included while linked; see the `load` field).
     ///
     /// Relaxed ordering is sufficient: load balancing reads are advisory only.
     #[cfg(not(test))]
     pub fn current_load(&self) -> u32
     {
         self.load.load(Ordering::Relaxed)
+    }
+
+    /// The CPU recorded at this CPU's previous idle balance tick, if any (see
+    /// the `idle_pull_candidate` field).
+    #[cfg(not(test))]
+    pub fn idle_pull_candidate(&self) -> Option<usize>
+    {
+        let cpu = self.idle_pull_candidate.load(Ordering::Relaxed);
+        (cpu != NO_IDLE_PULL_CANDIDATE).then_some(cpu)
+    }
+
+    /// Record `cpu` as this CPU's idle-pull candidate, or clear it (`None`).
+    /// Called only by this CPU's `timer_tick`.
+    #[cfg(not(test))]
+    pub fn set_idle_pull_candidate(&self, cpu: Option<usize>)
+    {
+        self.idle_pull_candidate
+            .store(cpu.unwrap_or(NO_IDLE_PULL_CANDIDATE), Ordering::Relaxed);
+    }
+
+    /// Clear this CPU's idle-pull candidate, storing only when one is set, so
+    /// the busy tick that calls it writes nothing in the steady state.
+    #[cfg(not(test))]
+    pub fn forget_idle_pull_candidate(&self)
+    {
+        if self.idle_pull_candidate.load(Ordering::Relaxed) != NO_IDLE_PULL_CANDIDATE
+        {
+            self.idle_pull_candidate
+                .store(NO_IDLE_PULL_CANDIDATE, Ordering::Relaxed);
+        }
     }
 
     // Test stubs for host-side unit tests
@@ -1281,6 +1341,26 @@ mod tests
         sched.set_idle(pa);
         deq(&sched);
         assert!(!sched.has_runnable());
+    }
+
+    // The defect caught: a queue that links only the idle thread read as a
+    // backlog (every busy CPU then draws idle CPUs' try-lock attempts for a
+    // pull that finds nothing), or a queued thread at the lowest fair level,
+    // whose queue sits just above the idle queue, read as none.
+    #[test]
+    fn only_a_thread_other_than_the_idle_one_counts_as_queued()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut idle = make_tcb();
+        let mut fair = make_tcb();
+        let p_idle = &mut *idle as *mut _;
+        let p_fair = &mut *fair as *mut _;
+
+        assert!(enq(&sched, p_idle, IDLE_PRIORITY));
+        assert!(sched.has_runnable());
+        assert!(!sched.has_queued_thread());
+        assert!(enq(&sched, p_fair, syscall::PRIORITY_MIN));
+        assert!(sched.has_queued_thread());
     }
 
     #[test]

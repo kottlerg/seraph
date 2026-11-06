@@ -171,6 +171,7 @@ concurrent notification and queue events.
 | `irq_shared_line.rs` | Two derivations of the UART's interrupt line (the stand-in device: setting its transmit-empty interrupt enable raises the line), bound to two notifications, are each signalled by one raise; the line stays masked until both acknowledge, an acknowledgement through an unbound derivation changes nothing, deleting an owing derivation unmasks the line for the other, and a rebind keeps one binding; the line holds 64 bindings and refuses a 65th with `QuotaExceeded`, and deleting the one notification all 64 name removes every binding: none having acknowledged, a binding left would keep the line masked, yet once a fresh copy binds and acknowledges, a raise signals it, and the 64 caps bind again; last, the line records the trigger and polarity mode of its first binding (level-triggered, active-high), refuses a binding or a rebind of another mode with `InvalidArgument` and binds nothing (with the first acknowledged, a raise signals it alone), takes a second binding of the same mode and signals both, on x86-64 signals both again at the unmask while the line is held asserted across their acknowledgements (which an edge-triggered entry would not; QEMU's PLIC re-pends no source held asserted across its completion), takes another mode once its bindings are gone, and refuses a mode with a bit outside `IRQ_MODE_MASK` ([core/kernel/docs/syscalls.md § `SYS_IRQ_REGISTER`](../kernel/docs/syscalls.md#sys_irq_register-30)) |
 | `priority_preemption.rs` | A runnable RT-class thread runs ahead of a CPU-bound spinner at the highest fair level on its CPU within a wall-clock budget, which does not resolve the one-tick preemption from a slice expiry (host-tested instead) ([core/kernel/docs/scheduler.md § Scheduling Classes](../kernel/docs/scheduler.md#scheduling-classes)) |
 | `fair_share_progress.rs` | A thread at the lowest fair level runs beside a CPU-bound one at the highest fair level on its CPU within a wall-clock budget, which strict priority across the fair levels would not let it ([core/kernel/docs/scheduler.md § Scheduling Classes](../kernel/docs/scheduler.md#scheduling-classes)) |
+| `idle_pull_starved_ready.rs` | An unpinned RT thread queued behind a higher-level thread spinning on the last CPU with no syscall runs within a wall-clock budget while the other CPUs idle, over 8 rounds of a fresh thread each: an idle CPU pulls it, though one queued thread is below the balancer's imbalance threshold ([core/kernel/docs/scheduler.md § Load Balancing](../kernel/docs/scheduler.md#load-balancing)) (≥ 2 CPUs) |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
 | `cross_cspace_revoke_no_alias.rs` | A cross-`CSpace` `cap_revoke` does not let a recipient's stale handle alias a recycled slot (#349) |
@@ -258,8 +259,8 @@ polls of `thread_cap_delete_under_use` and `copy_source_delete`; the pinned-CPU 
 `stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
 acknowledgement and exit bounds of `stop_source_delete`; the preemption budget of
 `integration::priority_preemption`; the progress budget of `integration::fair_share_progress`;
-the expiry and report bounds of `integration::queued_waiters_fifo`; the observation window and
-finish wait of
+the pull budget and the exit polls of `integration::idle_pull_starved_ready`; the expiry and
+report bounds of `integration::queued_waiters_fifo`; the observation window and finish wait of
 `integration::irq_preserves_user_regs`; the delivery waits of `integration::irq_shared_line`; the
 child waits of `integration::stop_read_regs_remote`; the
 probe and redirect polls of `integration::write_regs_blocked_syscall`; the report bounds of
@@ -285,9 +286,8 @@ exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and
 `thread::start_suspended_resume`, the exit and report waits of `integration::fault_handler_rebind`,
 the exit and recovery waits of `integration::fault_class_bindings`, the report wait of
 `integration::trap_redelivery`, the progress waits and report wait of `integration::thread_upcall`,
-the report waits of `integration::fault_debug` and `integration::single_step`, the convergence polls
-of
-`thread::load_balancer_redistributes_skewed`, the exit wait of
+the report waits of `integration::fault_debug` and `integration::single_step`, the convergence
+polls of `thread::load_balancer_redistributes_skewed`, the exit wait of
 `thread::bind_notification_nodes_come_from_the_queue`; the exit and come-up polls of
 `configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
 `stop_target_vanishes` and `split_delete_race`, the final-delivery polls of `stop_repark`, the

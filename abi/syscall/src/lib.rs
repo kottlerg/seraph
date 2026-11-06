@@ -1243,9 +1243,10 @@ pub const REGS_X86_64_FLAGS_OFFSET: usize = 128;
 /// by setting it with `SYS_THREAD_WRITE_REGS`: the thread takes `#DB` after
 /// each instruction, delivered to its exception handler as
 /// [`FAULT_EXC_DEBUG`]. The first `#DB` depends on the thread's return to user
-/// mode: through an interrupt or exception return (a resume from a fault, an
-/// exception, an interrupt-point upcall, or a stop of a preempted thread) it
-/// comes after one instruction; through a syscall return (an upcall at the
+/// mode: through an interrupt or exception return or a first entry (a resume
+/// from a user-mode fault or exception, an interrupt-point upcall, a stop of a
+/// preempted thread, or the first start of a thread created stopped) it comes
+/// after one instruction; through a syscall return (an upcall at the
 /// syscall point, a stop inside a syscall, or a syscall restarted after a
 /// fault of its user copy) it comes at once, before any instruction runs
 /// (`docs/fault-handling.md` § Debugging).

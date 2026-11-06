@@ -21,9 +21,14 @@
 # scan. To enable in a boot, copy this file into
 # /config/svcmgr/services/ between `cargo xtask build` and
 # `cargo xtask run`. See docs/testing.md.
+#
+# svctest runs at 10, in the fair class. Its band reaches 21, the floor of
+# the strict-priority class and svcmgr's own ceiling, so the
+# heap_lock_priority_contention phase can place one thread above the fair
+# class.
 binary    = /tests/svctest
 priority  = 10
-sched_max = 10
+sched_max = 21
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never

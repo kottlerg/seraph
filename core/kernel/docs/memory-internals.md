@@ -544,17 +544,17 @@ every store, for these reasons:
   another mapping no leaf of the target shows. A frame freed with stale instruction lines and
   reused for new code is reached only through a new executable mapping, so frame reuse needs no
   call of its own.
-- **A writable alias is the process's route to name.** W^X holds per mapping, not per frame: a
-  Memory capability may carry both `Write` and `Execute`, so one frame can be mapped writable at
-  one address and executable at another, in one space or two. A store through the writable alias
-  reaches executable bytes with no kernel call to hang a fence on, and userspace cannot issue a
-  remote `fence.i` itself (`SYS_SBI_CALL` does not forward RFENCE). The contract is that a process
-  that writes code through such an alias then issues `SYS_MEM_PROTECT` to executable over the
-  executable mapping; that call synchronises even when the mapping is executable already (see
-  [memory-model.md § Instruction-Fetch Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
-  Tracking a frame's executable mappings to fence on every store through any alias would need a
-  per-frame record and a fence on every write fault, a cost every process pays for a case only
-  code generators meet.
+- **Code written through a writable alias is the process's to synchronise.** W^X holds per mapping,
+  not per frame: a Memory capability may carry both `Write` and `Execute`, so one frame can be
+  mapped writable at one address and executable at another, in one space or two. A store through the
+  writable alias reaches executable bytes with no kernel call to hang a fence on, and userspace
+  cannot issue a remote `fence.i` itself (`SYS_SBI_CALL` does not forward RFENCE). The contract is
+  that a process that writes code through such an alias then issues `SYS_MEM_PROTECT` to executable
+  over the executable mapping; that call synchronises even when the mapping is executable already
+  (see [memory-model.md § Instruction-Fetch
+  Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)). Tracking a frame's
+  executable mappings to fence on every store through any alias would need a per-frame record and a
+  fence on every write fault, a cost every process pays for a case only code generators meet.
 - **Before the first leaf, not after the last.** Once a leaf is executable, a thread of the space
   may fetch through it, so the fence runs first. For `sys_mem_map` the bytes were written before
   the call through another mapping. For `sys_mem_protect` a store a thread of the same space makes

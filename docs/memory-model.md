@@ -212,13 +212,12 @@ RFENCE `remote_fence_i` on every hart) before code written through a data path c
 Synchronising at the mapping, rather than at each store, is what lets a loader write a segment and
 map it with no call of its own. W^X holds per mapping, not per frame: a Memory capability may carry
 both `Write` and `Execute`, so one frame can be mapped writable at one address and executable at
-another. A process that writes code through such a writable alias, or into a page it remaps
-executable, MUST then issue `SYS_MEM_PROTECT` to executable over the executable mapping; that call
-synchronises even when the mapping is executable already, and userspace has no other way to reach
-the other harts. Under emulation (QEMU TCG) a missing synchronisation does not fail, since the
-emulator invalidates its translations on any store; the `SYS_SYSTEM_INFO(InstructionCacheSyncs)`
-count records each, so a test can check that a path synchronised
-([core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SystemInfoType`).
+another. A process that writes code through such a writable alias MUST then issue `SYS_MEM_PROTECT`
+to executable over the executable mapping; that call synchronises even when the mapping is
+executable already. Userspace cannot issue a remote `fence.i` itself. Under emulation (QEMU TCG) a
+missing synchronisation does not fail, since the emulator invalidates its translations on any store;
+the `SYS_SYSTEM_INFO(InstructionCacheSyncs)` count records each, so a test can check that a path
+synchronised ([core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SystemInfoType`).
 
 ### TLB Management
 

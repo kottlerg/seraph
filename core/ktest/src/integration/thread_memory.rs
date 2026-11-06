@@ -27,8 +27,7 @@
 //!   executable elsewhere (the path-taken check: under QEMU a missing
 //!   synchronisation does not fail);
 //! - a device page (an `Mmio` page ktest maps into B) is refused
-//!   (`InvalidAddress`), when the boot hands ktest an `Mmio` of two pages or
-//!   more to carve one from;
+//!   (`InvalidAddress`), when the boot hands ktest an `Mmio`;
 //! - once B is deleted, its thread is `Exited` and both calls refuse it.
 //!
 //! A thread in ktest's own address space reads and writes a ktest static the
@@ -448,9 +447,10 @@ fn text_write(th: u64) -> TestResult
     Ok(())
 }
 
-/// A device page of B is refused. ktest carves one page off a copy of the
-/// first `Mmio` of two pages or more it holds (a copy, so no mapping of the
-/// original is withdrawn) and maps it into B; with none, the case is skipped.
+/// A device page of B is refused. ktest takes a copy of the first `Mmio` it
+/// holds (a copy, so no mapping of the original is withdrawn), carves one page
+/// off it, or uses it whole when it is one page, and maps the page into B;
+/// with no `Mmio`, the case is skipped.
 fn device_refused(ctx: &TestContext, b: u64, th: u64) -> TestResult
 {
     for slot in 1..=u64::from(crate::unit::hw::scan_bound(ctx))
@@ -460,13 +460,22 @@ fn device_refused(ctx: &TestContext, b: u64, th: u64) -> TestResult
         {
             continue;
         };
-        let Ok((lo, hi)) = mmio_split(copy, 0x1000)
-        else
+        // A one-page region cannot be split at its first page
+        // (`InvalidArgument`); any other refusal is a cap that is no `Mmio`.
+        let lo = match mmio_split(copy, 0x1000)
         {
-            cap_delete(copy).ok();
-            continue;
+            Ok((lo, hi)) =>
+            {
+                cap_delete(hi).ok();
+                lo
+            }
+            Err(e) if e == err(SyscallError::InvalidArgument) => copy,
+            Err(_) =>
+            {
+                cap_delete(copy).ok();
+                continue;
+            }
         };
-        cap_delete(hi).ok();
         // SAFETY: `b` is an address space this test created, not ktest's own.
         let mapped = unsafe { mmio_map(b, lo, B_DEVICE, 0) };
         let mut buf = [0u8; 8];
@@ -480,6 +489,6 @@ fn device_refused(ctx: &TestContext, b: u64, th: u64) -> TestResult
             Ok(_) => Err("integration::thread_memory: a device page was not refused"),
         };
     }
-    crate::log("ktest: integration::thread_memory device case SKIP (no Mmio >= 2 pages)");
+    crate::log("ktest: integration::thread_memory device case SKIP (no Mmio)");
     Ok(())
 }

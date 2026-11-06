@@ -612,8 +612,8 @@ copies, the kernel adds no debugging interface of its own. The pieces are:
   write when the page's frame is mapped more than once, since the frame would then be text or data
   of another mapping, possibly another process's; procmgr's loader gives each process its own image
   frames ([services/procmgr/README.md](../services/procmgr/README.md) § Responsibilities), so a
-  process's text takes it. A write that reaches an executable page synchronises instruction fetch
-  on every CPU before it returns
+  process's text takes it. Every write synchronises instruction fetch on every CPU before it
+  returns
   ([memory-model.md § Instruction-Fetch Coherence](memory-model.md#instruction-fetch-coherence)),
   so the thread's next fetch of the page sees the new bytes. A thread of the space running while the
   write lands can execute old or new bytes, or on x86-64 an instruction it fetched before; so the

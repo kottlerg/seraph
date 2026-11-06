@@ -201,20 +201,24 @@ So the kernel synchronises instruction fetch on every CPU (on RISC-V a local `fe
 RFENCE `remote_fence_i` on every hart) before code written through a data path can run:
 
 - when `SYS_MEM_MAP` or `SYS_MEM_PROTECT` makes a mapping executable, before the first executable
-  leaf is installed;
+  leaf is installed, and on every `SYS_MEM_PROTECT` to executable, even of pages executable
+  already;
 - when it maps init's segments at boot, before init runs;
-- when `SYS_THREAD_WRITE_MEM` has written an executable page, before the call returns.
+- when `SYS_THREAD_WRITE_MEM` has written, before the call returns.
 
 [core/kernel/docs/memory-internals.md](../core/kernel/docs/memory-internals.md)
 § Instruction-Fetch Synchronisation records these call sites and why the kernel synchronises there.
 
 Synchronising at the mapping, rather than at each store, is what lets a loader write a segment and
-map it with no call of its own. Code a process writes into a page that is already executable has no
-such route: W^X keeps a page from being writable and executable at once, so the process remaps the
-page, and the remap synchronises. Under emulation (QEMU TCG) a missing synchronisation does not
-fail, since the emulator invalidates its translations on any store; the
-`SYS_SYSTEM_INFO(InstructionCacheSyncs)` count records each, so a test can check that a path
-synchronised ([core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SystemInfoType`).
+map it with no call of its own. W^X holds per mapping, not per frame: a Memory capability may carry
+both `Write` and `Execute`, so one frame can be mapped writable at one address and executable at
+another. A process that writes code through such a writable alias, or into a page it remaps
+executable, MUST then issue `SYS_MEM_PROTECT` to executable over the executable mapping; that call
+synchronises even when the mapping is executable already, and userspace has no other way to reach
+the other harts. Under emulation (QEMU TCG) a missing synchronisation does not fail, since the
+emulator invalidates its translations on any store; the `SYS_SYSTEM_INFO(InstructionCacheSyncs)`
+count records each, so a test can check that a path synchronised
+([core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SystemInfoType`).
 
 ### TLB Management
 

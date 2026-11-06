@@ -2,7 +2,8 @@
 
 Test fixture for debugging through the fault and upcall handlers: a debugger thread takes a
 debuggee thread's breakpoint, inspects and modifies its memory, single-steps it on x86-64, and
-breaks into it while it runs.
+breaks into it while it runs; then it debugs a debuggee process, reading and writing its memory
+and planting a breakpoint in its text.
 
 ---
 
@@ -23,8 +24,9 @@ debugger/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   └── main.rs            # Debugger and debuggee threads; per-architecture breakpoint
-│                          #   and single-step (a no-op on riscv64)
+│   └── main.rs            # Debugger and debuggee threads, and the debuggee process
+│                          #   (`--debuggee`); per-architecture breakpoint and
+│                          #   single-step (a no-op on riscv64)
 └── tester/
     ├── Cargo.toml
     └── src/
@@ -51,7 +53,18 @@ endpoint of the debugger's
    `UPCALL_ANY_INSTRUCTION` upcall, checks that it does not run while broken in, sets the flag
    that ends its loop, and resumes it;
 4. checks that the breakpoint's reported pointer matches its address on the architecture (past
-   `int3`, at `ebreak`) and that the debuggee read back the rewritten word, and prints `PASS`.
+   `int3`, at `ebreak`) and that the debuggee read back the rewritten word;
+5. spawns itself with `--debuggee` as a debuggee process, which prints the addresses of a data
+   word, a go flag, and a function, and waits on the flag. Through the child's main-thread cap
+   (`std::os::seraph::process::ChildExt::main_thread_cap`) the debugger binds the child's exception
+   class, reads and rewrites the data word (`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`), writes
+   a breakpoint over the function's first instruction (`THREAD_MEM_TEXT`), and sets the flag. The
+   child calls the function and stops at the breakpoint; the debugger restores the instruction,
+   moves the pointer back to it, and resumes the child, which prints the rewritten word and exits.
+   The debugger then prints `PASS`.
+
+The text write succeeds only because procmgr's loader gives the child its own text frames: the
+kernel refuses a text write to a frame mapped more than once.
 
 The tester passes when the fixture prints `PASS` and exits cleanly; a failed step panics the
 fixture, a non-clean exit. riscv64 has no user-mode single-step, so step 2 runs on x86-64 alone.
@@ -64,7 +77,8 @@ fixture, a non-clean exit. riscv64 has no user-mode single-step, so step 2 runs 
 |---|---|
 | [docs/fault-handling.md](../../docs/fault-handling.md) | § Debugging, § Asynchronous Upcalls, § Fault Message |
 | [docs/capability-model.md](../../docs/capability-model.md) | § Thread: the Observe, Control, and Upcall rights |
-| [core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md) | `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_POST_UPCALL` |
+| [core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md) | `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_POST_UPCALL`, `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` |
+| [runtime/ruststd/README.md](../../runtime/ruststd/README.md) | § Child process handles: `ChildExt::main_thread_cap` |
 | [docs/testing.md](../../docs/testing.md) | § Per-program tester protocol |
 
 ---

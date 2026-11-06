@@ -96,9 +96,11 @@ const MAX_POLLS: u32 = 2000;
 ///
 /// The page is written through a temporary writable mapping in ktest's own
 /// address space and unmapped before the executable mapping is made (W^X).
-/// No instruction-cache maintenance follows the write: the kernel performs
-/// none for executable mappings, and the harness runs under QEMU, whose
-/// translation cache is coherent with stores.
+/// The executable `mem_map` synchronises instruction fetch with the write
+/// (docs/memory-model.md § Instruction-Fetch Coherence), and the stub's
+/// callers then run it. Under QEMU a missing synchronisation does not fail,
+/// so the `SYS_SYSTEM_INFO(InstructionCacheSyncs)` count must rise across
+/// the map: the check that the path was taken.
 fn install_stub(
     ctx: &TestContext,
     aspace: u64,
@@ -131,6 +133,8 @@ fn install_stub(
         // it unmapped, so it stays allocated rather than re-enter the pool.
         return Err("retype::stub: scratch mem_unmap failed");
     }
+    let syncs = || system_info(SystemInfoType::InstructionCacheSyncs as u64).ok();
+    let before = syncs();
     // SAFETY: `STUB_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
     if unsafe { mem_map(frame, aspace, STUB_VA, 0, 1, MAP_EXECUTABLE) }.is_err()
@@ -140,7 +144,13 @@ fn install_stub(
         unsafe { crate::frame_pool::free(frame) };
         return Err("retype::stub: executable mem_map failed");
     }
-    Ok(frame)
+    // The frame stays mapped in `aspace` on this failure, so it is not freed;
+    // the caller's teardown of `aspace` unmaps it.
+    match (before, syncs())
+    {
+        (Some(b), Some(a)) if a > b => Ok(frame),
+        _ => Err("retype::stub: the executable mem_map did not synchronise instruction fetch"),
+    }
 }
 
 /// Exit reason of an already-`Exited` thread, or an error naming `what`.

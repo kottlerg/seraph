@@ -61,6 +61,7 @@ use boot_protocol::{InitSegment, SegmentFlags};
 use crate::cpu_mask::{AtomicCpuMask, MaskSource};
 use crate::mm::PAGE_SIZE;
 use crate::mm::paging::phys_to_virt;
+use syscall::SyscallError;
 
 // Init stack page count is part of the init protocol ABI; the init VA layout
 // (info page + stack top) is the kernel's per-boot choice, not an ABI constant.
@@ -276,6 +277,110 @@ unsafe impl Send for AddressSpace {}
 // SAFETY: pt_lock serializes page table modifications; death_lock serializes the
 // death-observer set; active_cpus is atomic.
 unsafe impl Sync for AddressSpace {}
+
+/// Whether a `SYS_THREAD_WRITE_MEM` may write a page the thread's leaf makes
+/// read-only, such as its text: the call's `THREAD_MEM_TEXT` flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextWrite
+{
+    /// `THREAD_MEM_TEXT` set: a read-only page whose frame is mapped once
+    /// takes the write.
+    Permitted,
+    /// `THREAD_MEM_TEXT` clear: a read-only page refuses the write.
+    Refused,
+}
+
+/// The direction and buffer of an [`AddressSpace::copy_user_bytes`].
+pub enum UserCopy<'a>
+{
+    /// Read the range into the buffer.
+    Read(&'a mut [u8]),
+    /// Write the buffer into the range.
+    Write
+    {
+        /// The bytes to write.
+        src: &'a [u8],
+        /// Whether a read-only page may be written.
+        text: TextWrite,
+    },
+}
+
+/// One page's share of a byte range: the page's base VA, the byte offset in
+/// the page, the offset in the caller's buffer, and the byte count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageSpan
+{
+    /// Page-aligned VA of the page.
+    pub page: u64,
+    /// Offset of the first byte in the page.
+    pub in_page: usize,
+    /// Offset of the first byte in the buffer.
+    pub offset: usize,
+    /// Bytes in this page.
+    pub len: usize,
+}
+
+/// The pages `[va, va + len)` covers, in order, each with its share of the
+/// range. The caller has checked that the range does not wrap.
+pub fn page_spans(va: u64, len: usize) -> impl Iterator<Item = PageSpan>
+{
+    let page = PAGE_SIZE as u64;
+    let mut cursor = va;
+    let end = va + len as u64;
+    core::iter::from_fn(move || {
+        if cursor >= end
+        {
+            return None;
+        }
+        let base = cursor & !(page - 1);
+        let next = (base + page).min(end);
+        // cast_possible_truncation: each value is below PAGE_SIZE or len.
+        #[allow(clippy::cast_possible_truncation)]
+        let span = PageSpan {
+            page: base,
+            in_page: (cursor - base) as usize,
+            offset: (cursor - va) as usize,
+            len: (next - cursor) as usize,
+        };
+        cursor = next;
+        Some(span)
+    })
+}
+
+/// Whether `SYS_THREAD_WRITE_MEM` may write a page whose user leaf grants
+/// `leaf`, with `text` as the call's flag gives it; `mappings` counts the
+/// frame's user leaf mappings and is read only for a read-only leaf.
+///
+/// A writable leaf takes any write, as a store of the thread would. A
+/// read-only one, such as text, needs `text`, and its frame mapped exactly
+/// once: the frame of a read-only page mapped elsewhere too may be another
+/// process's text or data, which the write would change through this
+/// thread's capability.
+///
+/// # Errors
+/// - `InsufficientRights`: the leaf is read-only and `text` is
+///   [`TextWrite::Refused`].
+/// - `InvalidState`: the leaf is read-only and the frame has another mapping.
+pub fn thread_mem_write_check(
+    leaf: crate::mm::paging::PageFlags,
+    text: TextWrite,
+    mappings: impl FnOnce() -> u64,
+) -> Result<(), SyscallError>
+{
+    if leaf.writable
+    {
+        return Ok(());
+    }
+    if text == TextWrite::Refused
+    {
+        return Err(SyscallError::InsufficientRights);
+    }
+    if mappings() != 1
+    {
+        return Err(SyscallError::InvalidState);
+    }
+    Ok(())
+}
 
 impl AddressSpace
 {
@@ -1270,6 +1375,108 @@ impl AddressSpace
         unsafe { translate_user_page(self.root_virt, virt) }
     }
 
+    /// Copy between the user range `[va, va + len)` of this address space and
+    /// a kernel buffer through the kernel's direct map, for
+    /// `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`; `len` is the
+    /// buffer's. All or nothing: under `pt_lock` every page of the range is
+    /// checked first, then copied, so an unmap or remap, which takes the same
+    /// lock, cannot run between the check and the copy, and the frames stay
+    /// mapped (and so unfreed) until the copy ends.
+    ///
+    /// Each page must be mapped by a 4 KiB user leaf of normal memory; a
+    /// write needs the leaf writable, or [`TextWrite::Permitted`] with the
+    /// frame mapped once ([`thread_mem_write_check`]). The thread's own access
+    /// rights do not gate a read, so an execute-only page reads. A write's
+    /// caller synchronises instruction fetch afterwards, whatever the leaves
+    /// grant: a writable page's frame may be mapped executable elsewhere.
+    ///
+    /// # Errors
+    /// - `InvalidAddress`: a page is unmapped, mapped by no 4 KiB user leaf,
+    ///   or device memory (an uncacheable leaf; its frame need not be RAM the
+    ///   direct map covers).
+    /// - `InsufficientRights`, `InvalidState`: a write the leaf refuses
+    ///   ([`thread_mem_write_check`]).
+    ///
+    /// # Safety
+    /// The address space must stay allocated for the call (the caller holds
+    /// a reference on its object), and `[va, va + len)` must lie in the user
+    /// half. The caller holds no `pt_lock` and no lock a shootdown IPI's
+    /// handler takes.
+    #[cfg(not(test))]
+    pub unsafe fn copy_user_bytes(
+        &self,
+        va: u64,
+        mut copy: UserCopy<'_>,
+    ) -> Result<(), SyscallError>
+    {
+        use crate::arch::current::paging::{translate_user_page, user_leaf_flags};
+
+        let (len, write) = match &copy
+        {
+            UserCopy::Read(dst) => (dst.len(), None),
+            UserCopy::Write { src, text } => (src.len(), Some(*text)),
+        };
+        crate::percpu::preempt_disable();
+        self.pt_lock();
+        let checked = (|| {
+            for span in page_spans(va, len)
+            {
+                // SAFETY: root_virt is the valid root; pt_lock is held, so no
+                // concurrent walk edits the tables.
+                let (phys, pte) = unsafe { translate_user_page(self.root_virt, span.page) }
+                    .ok_or(SyscallError::InvalidAddress)?;
+                let flags = user_leaf_flags(pte).ok_or(SyscallError::InvalidAddress)?;
+                if flags.uncacheable
+                {
+                    return Err(SyscallError::InvalidAddress);
+                }
+                if let Some(text) = write
+                {
+                    thread_mem_write_check(flags, text, || {
+                        crate::mm::frame_map::mappings_in(phys, PAGE_SIZE as u64)
+                    })?;
+                }
+            }
+            Ok(())
+        })();
+        if checked.is_ok()
+        {
+            for span in page_spans(va, len)
+            {
+                // SAFETY: as above; the check pass found every page mapped
+                // under this hold, so the translation repeats.
+                let Some((phys, _)) = (unsafe { translate_user_page(self.root_virt, span.page) })
+                else
+                {
+                    continue;
+                };
+                let frame = phys_to_virt(phys) as *mut u8;
+                // SAFETY: frame is the direct-map alias of a RAM frame (normal
+                // memory, checked above) mapped in this space, which pt_lock
+                // keeps mapped and so unfreed; in_page + n <= PAGE_SIZE, and
+                // the buffer offset + n <= len, by page_spans.
+                unsafe {
+                    match &mut copy
+                    {
+                        UserCopy::Read(dst) => core::ptr::copy_nonoverlapping(
+                            frame.add(span.in_page).cast_const(),
+                            dst.as_mut_ptr().add(span.offset),
+                            span.len,
+                        ),
+                        UserCopy::Write { src, .. } => core::ptr::copy_nonoverlapping(
+                            src.as_ptr().add(span.offset),
+                            frame.add(span.in_page),
+                            span.len,
+                        ),
+                    }
+                }
+            }
+        }
+        self.pt_unlock();
+        crate::percpu::preempt_enable();
+        checked
+    }
+
     /// Activate this address space on the current CPU.
     ///
     /// With tagging disabled this writes the page-table root with a full TLB
@@ -1475,6 +1682,82 @@ mod active_cpu_words_tests
                 * core::mem::size_of::<AtomicU64>();
         assert!(used <= PAGE_SIZE, "{used} bytes of the wrapper page");
         assert!(ACTIVE_CPU_WORDS_FIT);
+    }
+}
+
+#[cfg(test)]
+mod thread_mem_tests
+{
+    use super::*;
+
+    // Defect caught: a split that loses a byte at a page boundary, gives a
+    // span past its page, or misplaces it in the buffer, so a copy reads or
+    // writes beyond a frame or leaves part of the range uncopied.
+    #[test]
+    fn page_spans_cover_the_range_once_and_stay_in_their_pages()
+    {
+        let page = PAGE_SIZE as u64;
+        let spans: Vec<PageSpan> = page_spans(page + 10, 20).collect();
+        assert_eq!(
+            spans,
+            [PageSpan {
+                page,
+                in_page: 10,
+                offset: 0,
+                len: 20
+            }]
+        );
+        let spans: Vec<PageSpan> = page_spans(2 * page - 3, PAGE_SIZE).collect();
+        assert_eq!(
+            spans,
+            [
+                PageSpan {
+                    page,
+                    in_page: PAGE_SIZE - 3,
+                    offset: 0,
+                    len: 3
+                },
+                PageSpan {
+                    page: 2 * page,
+                    in_page: 0,
+                    offset: 3,
+                    len: PAGE_SIZE - 3
+                },
+            ]
+        );
+        let spans: Vec<PageSpan> = page_spans(3 * page, PAGE_SIZE).collect();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].len, PAGE_SIZE);
+        assert_eq!(page_spans(page, 0).count(), 0);
+    }
+
+    // Defect caught: a text write that skips the flag or the shared-frame
+    // check would let a debugger change another process's text through a
+    // frame both map, and a check run on writable pages would refuse a
+    // write to shared memory the thread could make itself.
+    #[test]
+    fn a_read_only_page_takes_a_write_only_with_text_and_one_mapping()
+    {
+        let leaf = |writable| crate::mm::paging::PageFlags {
+            readable: true,
+            writable,
+            executable: !writable,
+            uncacheable: false,
+        };
+        assert!(thread_mem_write_check(leaf(true), TextWrite::Refused, || unreachable!()).is_ok());
+        assert_eq!(
+            thread_mem_write_check(leaf(false), TextWrite::Refused, || 1),
+            Err(SyscallError::InsufficientRights)
+        );
+        assert!(thread_mem_write_check(leaf(false), TextWrite::Permitted, || 1).is_ok());
+        assert_eq!(
+            thread_mem_write_check(leaf(false), TextWrite::Permitted, || 2),
+            Err(SyscallError::InvalidState)
+        );
+        assert_eq!(
+            thread_mem_write_check(leaf(false), TextWrite::Permitted, || 0),
+            Err(SyscallError::InvalidState)
+        );
     }
 }
 

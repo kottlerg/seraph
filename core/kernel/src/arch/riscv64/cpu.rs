@@ -102,9 +102,10 @@ pub fn current_stack_pointer() -> u64
 /// This runs in early boot, where supervisor-mode detection is limited (`misa`
 /// is not S-mode-readable and `satp` cannot be safely probed before the kernel
 /// page tables are active). It probes the SBI HSM extension, which is required to
-/// start secondary harts (`sbi_get_spec_version` is unsuitable as a presence
-/// check — a compliant SBI always returns success, and a truly absent SBI traps
-/// on the `ecall`). The remaining required features are asserted where each is
+/// start secondary harts, and the SBI RFENCE extension, whose `remote_fence_i`
+/// [`sync_instruction_fetch`] issues (`sbi_get_spec_version` is unsuitable as a
+/// presence check — a compliant SBI always returns success, and a truly absent
+/// SBI traps on the `ecall`). The remaining required features are asserted where each is
 /// safely detectable: the Vector extension at `fpu::cache_vlenb` (the boot
 /// hart) and `fpu::check_ap_vlenb` (each secondary hart), and the
 /// ASID-tagged TLB at `paging::enable_tagged_tlb`. See
@@ -128,7 +129,53 @@ pub unsafe fn verify_baseline()
     {
         crate::fatal("SBI HSM extension not present — required to start secondary harts");
     }
+    let probe = super::sbi::sbi_call(SBI_EXT_BASE, SBI_PROBE_EXTENSION, SBI_EXT_RFENCE, 0, 0);
+    if probe.error != 0 || probe.value == 0
+    {
+        crate::fatal("SBI RFENCE extension not present — required for remote fence.i");
+    }
 }
+
+/// SBI RFENCE extension ID — ASCII "RFNC".
+const SBI_EXT_RFENCE: u64 = 0x5246_4E43;
+
+/// Make instruction fetch on every hart see the stores made before the call
+/// (`mm::icache::sync_user_code`): a local `fence.i`, then SBI RFENCE
+/// `remote_fence_i` on every hart (`hart_mask_base` = -1), which returns once
+/// each has run one. RISC-V instruction fetch is not coherent with stores
+/// (the Zifencei rule), and `fence.i` orders only the hart that runs it.
+/// Halts on an SBI error: the call takes no argument a caller supplies, so an
+/// error is the firmware's, and code that might run stale must not.
+#[cfg(not(test))]
+pub fn sync_instruction_fetch()
+{
+    /// `sbi_remote_fence_i` function ID.
+    const SBI_RFENCE_REMOTE_FENCE_I: u64 = 0;
+
+    fence_i();
+    let ret = super::sbi::sbi_call(SBI_EXT_RFENCE, SBI_RFENCE_REMOTE_FENCE_I, 0, u64::MAX, 0);
+    if ret.error != 0
+    {
+        crate::fatal("sync_instruction_fetch: SBI remote_fence_i returned an error");
+    }
+}
+
+/// Order this hart's instruction fetch after its earlier stores (`fence.i`,
+/// Zifencei).
+#[cfg(not(test))]
+fn fence_i()
+{
+    // fence.i: invalidates this hart's instruction-fetch view so later fetches
+    // observe every store this hart made, or observed, before it. No operands,
+    // no register clobbers, no memory access, and no flags; it needs only
+    // S-mode, which the kernel runs in.
+    // SAFETY: the instruction changes no architectural state Rust tracks.
+    unsafe { core::arch::asm!("fence.i", options(nostack, preserves_flags)) };
+}
+
+/// Test-build stub: the sync is an instruction and a firmware call.
+#[cfg(test)]
+pub fn sync_instruction_fetch() {}
 
 /// Test-build stub: the baseline gate issues an SBI ecall and is a no-op in
 /// host unit tests.

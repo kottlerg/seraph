@@ -5,8 +5,10 @@
 
 //! Tier 1 tests for system info syscalls.
 //!
-//! Covers: `SYS_SYSTEM_INFO` (all `SystemInfoType` variants and unknown
-//! discriminant).
+//! Covers: `SYS_SYSTEM_INFO` (every `SystemInfoType` variant, and an unknown
+//! discriminant). `InstructionCacheSyncs` is read here for the boot's sync of
+//! ktest's own image; its rise across each runtime call site is checked by
+//! `integration::thread_memory` and `unit::retype`'s code stub.
 
 use syscall::{
     MAP_WRITABLE, cap_create_cspace, cap_create_thread, cap_delete, cap_info, mem_map, mem_unmap,
@@ -344,4 +346,19 @@ fn split_top(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
         .ok_or("sysinfo::thread_retype_bytes: memory_base too small")?;
     memory_split(ctx.memory_base, at)
         .map_err(|_| "sysinfo::thread_retype_bytes: memory_split(memory_base) failed")
+}
+
+/// The kernel synchronised instruction fetch for ktest's own image before
+/// ktest ran (Phase 9 maps init's segments, which the bootloader and the PIE
+/// rebase wrote through data stores; docs/memory-model.md § Instruction-Fetch
+/// Coherence). ktest's entry reads the count before it maps anything, so a
+/// boot that skips the Phase-9 sync reads zero; under QEMU the missing sync
+/// would not otherwise fail.
+pub fn boot_image_synchronised(_ctx: &TestContext) -> TestResult
+{
+    if crate::BOOT_ICACHE_SYNCS.load(core::sync::atomic::Ordering::Relaxed) == 0
+    {
+        return Err("sysinfo::boot_image_synchronised: no instruction-fetch sync before ktest ran");
+    }
+    Ok(())
 }

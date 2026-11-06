@@ -6,7 +6,7 @@ enforcement, TLB management) are specified in
 [docs/memory-model.md](../../../docs/memory-model.md). This document describes how
 those goals are realised in code.
 
-The memory subsystem comprises six components:
+The memory subsystem comprises seven components:
 
 1. **Buddy allocator** — boot-time physical frame allocation
 2. **Kernel object memory** — objects carved out of Memory capabilities by retype,
@@ -14,9 +14,11 @@ The memory subsystem comprises six components:
 3. **Address space management** — per-process virtual address space objects
 4. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context
    switch with a full-flush fallback, and SMP shootdown
-5. **Kernel stack allocation** — idle stacks from the buddy, every other stack from
+5. **Instruction-fetch synchronisation** — the fence that makes code written through a
+   data path visible to instruction fetch on every CPU
+6. **Kernel stack allocation** — idle stacks from the buddy, every other stack from
    the thread's own slab
-6. **Page table node ownership** — which page-table pages belong to an address
+7. **Page table node ownership** — which page-table pages belong to an address
    space's pool and which the kernel lends
 
 ---
@@ -211,6 +213,17 @@ issuer's later `CAP_INFO_MEMORY_MAPPINGS`, which fences before it reads the coun
 second lookup sees the cleared slot, or the issuer's count sees the pins and then every leaf
 the map installs. The query reads one count per page of the window it names, at most 512 pages
 of the region; a larger region is read window by window.
+
+**Text-write check.** `SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT` writes a page the thread's
+leaf makes read-only only when its frame's count is exactly 1, read under the target space's
+`pt_lock` with the leaf present (`mm::address_space::thread_mem_write_check`). By the invariant,
+a count of 1 means no other user leaf names the frame when the count is read. The count can exceed
+the leaves (a `SYS_MEM_MAP` pin, or a removal whose lowering waits for its invalidation), so such a
+write can be refused while the frame is, or is about to be, mapped once. The check sees the
+mappings that exist when it reads the count: the target's `pt_lock` does not serialise another
+space's `SYS_MEM_MAP`, so a mapping of the frame that another space makes while the write runs can
+observe the written bytes, as it would had it been made just after the write. An untracked frame
+counts zero and is refused.
 
 **Storage.** The table is two-level: a chunk table with one pointer per GiB below the top of DRAM,
 allocated from the buddy, each pointer naming a 1 MiB buddy block of 262144 counters. Phase 4 sizes
@@ -499,6 +512,75 @@ below the kernel image base ([initialization.md](initialization.md) § Phase 3: 
 Tables). These are the only valid paths for physical-to-virtual
 conversion. Arbitrary physical addresses must not be accessed by computing offsets from
 kernel image addresses.
+
+---
+
+## Instruction-Fetch Synchronisation (`mm/icache.rs`)
+
+[memory-model.md § Instruction-Fetch Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)
+states the rule; this section records where the kernel applies it and why there.
+`mm::icache::sync_user_code` counts the call and runs the arch hook
+`sync_instruction_fetch` ([arch-interface.md](arch-interface.md)): on RISC-V a local `fence.i`,
+then SBI RFENCE `remote_fence_i` with `hart_mask_base` = -1 (every hart), which returns once each
+hart has run one; on x86-64 nothing. The call sites are:
+
+- `sys_mem_map` asking for an executable mapping, once its permissions are decided and before it
+  takes the Memory object's read lock, so before its mapping loop installs the first leaf;
+- `sys_mem_protect` to executable, before its loop turns the first leaf executable, whether or
+  not the pages are executable already;
+- Phase 9 of initialization, after init's segments are mapped and the PIE rebase has relocated
+  them, before init runs;
+- `sys_thread_write_mem`, after every write, before the call returns.
+
+The fence is placed per call that makes a mapping executable or writes through a debugger, not at
+every store, for these reasons:
+
+- **Every kernel route to executing written bytes passes a call site.** Bytes stored through a
+  data path become executable through a new executable mapping or a protect to executable, and
+  both synchronise. The kernel's own stores to a user frame through the direct map are the zeroing
+  and filling of frames before they are mapped (the same case), the Phase-9 relocation, and
+  `sys_thread_write_mem`. That call synchronises after every write, not only one that reaches an
+  executable leaf of the target, since a writable page's frame may be mapped executable in
+  another mapping no leaf of the target shows. A frame freed with stale instruction lines and
+  reused for new code is reached only through a new executable mapping, so frame reuse needs no
+  call of its own.
+- **Code written through a writable alias is the process's to synchronise.** W^X holds per mapping,
+  not per frame: a Memory capability may carry both `Write` and `Execute`, so one frame can be
+  mapped writable at one address and executable at another, in one space or two. A store through the
+  writable alias reaches executable bytes with no kernel call to hang a fence on, and userspace
+  cannot issue a remote `fence.i` itself (`SYS_SBI_CALL` does not forward RFENCE). The contract is
+  that a process that writes code through such an alias then issues `SYS_MEM_PROTECT` to executable
+  over the executable mapping; that call synchronises even when the mapping is executable already
+  (see [memory-model.md § Instruction-Fetch
+  Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)). Tracking a frame's
+  executable mappings to fence on every store through any alias would need a per-frame record and a
+  fence on every write fault, a cost every process pays for a case only code generators meet.
+- **Before the first leaf, not after the last.** Once a leaf is executable, a thread of the space
+  may fetch through it, so the fence runs first. For `sys_mem_map` the bytes were written before
+  the call through another mapping. For `sys_mem_protect` a store a thread of the same space makes
+  to the page while the protect runs races the protect itself; the result of that race is the
+  process's to order, as it is on hardware with coherent fetch.
+- **Every hart, not the space's.** The fence is broadcast instead of sent to the CPUs in the
+  space's `active_cpus` set: a thread of the space may be dispatched on any hart after the call,
+  and a hart that ran the space earlier may hold stale lines for the frame from its previous use,
+  so a narrower set would need a per-hart record of what each has fetched. The broadcast is paid
+  once per call, not per page of the call. procmgr's loader maps each page of a segment with a
+  call of its own, so an image load pays one broadcast per executable page; executable mappings
+  are made at image load and by a debugger's writes, not on a hot path.
+- **The cost of the call.** The remote half is a firmware call that waits for every hart. It is
+  made in syscall context with interrupts disabled and no kernel lock held: `sys_mem_map` makes it
+  before it takes the Memory object's read lock, `sys_mem_protect` before it takes the target
+  space's `pt_lock`, and `sys_thread_write_mem` after it has dropped the target space's `pt_lock`
+  and its pin. So a hart spinning on a kernel lock never waits for the caller. The firmware
+  delivers the request to each hart in M-mode, whatever that hart's S-mode interrupt enable. An
+  SBI error halts the kernel: the call passes no argument a caller supplies, so an error is the
+  firmware's, and code that might run stale must not.
+
+`SYS_SYSTEM_INFO(InstructionCacheSyncs)` reports the count, since under QEMU TCG a missing fence
+does not fail: ktest checks that each call site is taken (`unit::sysinfo` for the Phase-9 site,
+from the count its entry reads before it maps anything; `integration::thread_memory` for the map,
+protect (an already-executable page included), and write sites; and `unit::retype`'s stub, which
+it then runs).
 
 ---
 

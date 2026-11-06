@@ -90,11 +90,13 @@ pub fn quantum_ticks(level: u8) -> u32
 ///
 /// Measured bound (the paint report, `crate::stack_depth`; ktest
 /// `stress::stack_depth` after Tier S), on both architectures: debug builds at
-/// 4, 16 and 128 CPUs peak at 3784 B on a thread stack and 1664 B on an idle
-/// stack (`riscv64`; 3296 B and 1328 B on `x86_64`), and release builds at 4, 16
-/// and 128 CPUs at 4304 B and 2080 B (`riscv64`; 3296 B and 1104 B on `x86_64`),
-/// so the deepest bounds leave margins of about 74% (thread) and 87% (idle). The
-/// report gives the depth, not the path that reached it.
+/// 4, 16 and 128 CPUs peak at 5504 B on a thread stack and 1752 B on an idle
+/// stack (`riscv64`; 4928 B and 1696 B on `x86_64`), and release builds at 4, 16
+/// and 128 CPUs at 5704 B and 1664 B (`riscv64`; 4728 B and 1472 B on `x86_64`),
+/// so the deepest bounds leave margins of about 65% (thread) and 89% (idle). The
+/// thread peak includes the 4 KiB buffer `SYS_THREAD_READ_MEM` and
+/// `SYS_THREAD_WRITE_MEM` stage their bytes in. The report gives the depth, not
+/// the path that reached it.
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's
@@ -3474,6 +3476,62 @@ pub unsafe fn with_held_frame<R>(
         crate::percpu::preempt_enable();
     }
     result
+}
+
+/// Take a reference on the `AddressSpace` object `tcb` executes in, for
+/// `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`; `None` when the thread
+/// is `Exited`, has no address space (a kernel thread), or its address
+/// space's last reference is gone.
+///
+/// A thread holds no reference on its address space: the space's teardown
+/// marks every bound thread `Exited` (`stop_threads_bound_to`), under its
+/// `sched_lock`, before it frees anything. So under that lock a thread not
+/// yet `Exited` names an object whose storage is live, and
+/// [`KernelObjectHeader::inc_ref_if_live`](crate::cap::object::KernelObjectHeader::inc_ref_if_live)
+/// takes the reference unless the count already reached zero, when the
+/// teardown has begun and the pin is refused. The caller releases the
+/// reference with `cap::object::release_ref`.
+///
+/// # Safety
+/// `tcb` must be valid (the caller pins its `Thread` object), and the caller
+/// must hold no scheduler lock and no `sched_lock`.
+#[cfg(not(test))]
+pub unsafe fn pin_thread_aspace(
+    tcb: *mut ThreadControlBlock,
+) -> Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>
+{
+    use crate::cap::object::AddressSpaceObject;
+
+    // SAFETY: tcb valid per contract; lock_raw paired with the unlock below.
+    let saved = unsafe { (*tcb).sched_lock.lock_raw() };
+    // SAFETY: state is written under the held sched_lock; address_space is
+    // read-only after creation.
+    let (state, aspace) = unsafe { ((*tcb).state, (*tcb).address_space) };
+    let pinned = if state == thread::ThreadState::Exited || aspace.is_null()
+    {
+        None
+    }
+    else
+    {
+        let aso = AddressSpaceObject::containing(aspace);
+        // SAFETY: the thread is not Exited under its sched_lock, so the
+        // space's teardown has not freed the wrapper page that holds both
+        // the space and its object (this function's rule).
+        unsafe {
+            debug_assert!(core::ptr::eq((*aso).address_space, aspace));
+            if (*aso).header.inc_ref_if_live()
+            {
+                Some(core::ptr::NonNull::new_unchecked(aso.cast()))
+            }
+            else
+            {
+                None
+            }
+        }
+    };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { (*tcb).sched_lock.unlock_raw(saved) };
+    pinned
 }
 
 /// Shared body of [`set_state_under_all_locks`], [`exit_under_all_locks`],

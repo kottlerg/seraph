@@ -257,11 +257,21 @@ wrappers stay safe functions ([shared/syscall/README.md](../shared/syscall/READM
 ### Thread
 
 A capability to a thread. Rights:
-- **Control** — may start, stop, and configure the thread
+- **Control** — may start, stop, and configure the thread, write its registers, and read and
+  write the memory of the address space it executes in (`SYS_THREAD_READ_MEM`,
+  `SYS_THREAD_WRITE_MEM`; [Fault Handling § Debugging](fault-handling.md#debugging))
 - **Observe** — may read the thread's register state (for debugging)
 - **Upcall** — may post an asynchronous upcall to the thread
   ([Fault Handling § Asynchronous Upcalls](fault-handling.md#asynchronous-upcalls)); a post that
   may be delivered at any instruction also needs Control
+
+The memory access sits under Control, not Observe: a thread's registers show what the thread is
+doing, but its address space holds whatever the process keeps, its secrets included, so reading
+it is as much authority over the process as rewriting its registers, which already lets the holder
+make the thread load and disclose any of that memory. The access reaches only the thread's own
+address space, and needs no `AddressSpace` capability. A write to a page the thread's mapping makes
+read-only (its text) is refused unless asked for, and refused outright on a frame mapped more than
+once, which could be another process's.
 
 ### CSpace
 

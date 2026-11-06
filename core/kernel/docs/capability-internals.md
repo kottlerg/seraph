@@ -767,6 +767,14 @@ The principal kernel-internal owners:
   [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)): a
   thread killed while parked never runs the destructor, and the park's binding, not the
   pin, keeps the parked thread reachable from the object's teardown.
+- **Thread address-space pins.** `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM` reach the
+  address space a thread executes in, which no reference of the thread holds: the space's
+  teardown instead marks every bound thread `Exited`, under the thread's `sched_lock`, before it
+  frees anything. `sched::pin_thread_aspace` reads the thread's state and space under that lock
+  and, while the thread is not `Exited`, takes a reference with
+  `KernelObjectHeader::inc_ref_if_live`, which refuses a count of zero rather than revive an
+  object whose teardown has begun. The reference is released through `release_ref` when the copy
+  ends, before the syscall returns, as a syscall pin's is.
 - **Wait-set membership.** `sys_wait_set_add` `inc_ref`s the source's header under the
   source's lock together with the back-pointer publication; `sys_wait_set_remove` and
   `wait_set_drop` perform the matching `dec_ref`. The source's state therefore outlives

@@ -1625,6 +1625,28 @@ fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
     }
 }
 
+/// The access a user leaf PTE (from [`translate_user_page`]) grants, or
+/// `None` when it is not present or not user-accessible. `readable` is always
+/// set, since x86-64 has no read-disable bit; `executable` is NX clear; and
+/// `uncacheable` is PCD or PWT set, a memory type other than write-back under
+/// the power-on PAT the kernel keeps.
+pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
+{
+    /// User/Supervisor bit — the page is reachable from ring 3.
+    const USER: u64 = 1 << 2;
+
+    if pte & PRESENT == 0 || pte & USER == 0
+    {
+        return None;
+    }
+    Some(PageFlags {
+        readable: true,
+        writable: pte & WRITABLE != 0,
+        executable: pte & NO_EXECUTE == 0,
+        uncacheable: pte & (PCD | PWT) != 0,
+    })
+}
+
 /// Classify a userspace page fault at `va` as a spurious stale-TLB fault.
 ///
 /// Walks the *current* (CR3) page tables for `va` and returns `true` iff `va`
@@ -1907,6 +1929,26 @@ mod tests
         // Not present: genuine fault regardless of other bits.
         let absent = USER_BIT | WRITABLE;
         assert!(!pte_permits_user_access(absent, false, false));
+    }
+
+    // Defect caught: a decoder that let a supervisor or absent leaf through
+    // would let SYS_THREAD_READ_MEM read a page the thread cannot reach, and one
+    // that misread NX, R/W or the cache bits would skip the instruction-cache
+    // sync, permit a text write without THREAD_MEM_TEXT, or read device memory
+    // through the direct map.
+    #[test]
+    fn a_user_leaf_decodes_to_its_access_and_memory_type()
+    {
+        assert!(user_leaf_flags(PRESENT | WRITABLE).is_none());
+        assert!(user_leaf_flags(USER_BIT | WRITABLE).is_none());
+        let rx = user_leaf_flags(PRESENT | USER_BIT).unwrap();
+        assert!(rx.readable && rx.executable && !rx.writable && !rx.uncacheable);
+        let rw = user_leaf_flags(PRESENT | USER_BIT | WRITABLE | NO_EXECUTE).unwrap();
+        assert!(rw.writable && !rw.executable);
+        let uc = user_leaf_flags(PRESENT | USER_BIT | NO_EXECUTE | PCD | PWT).unwrap();
+        assert!(uc.uncacheable);
+        let wt = user_leaf_flags(PRESENT | USER_BIT | NO_EXECUTE | PWT).unwrap();
+        assert!(wt.uncacheable);
     }
 
     #[test]

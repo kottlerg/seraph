@@ -543,8 +543,9 @@ changed line that names one of these items as a whole identifier or lies within 
   x2APIC primitives and the mode they set (`apic_send_icr`, `wait_icr_idle`,
   `enable_x2apic_this_cpu`, `X2APIC_ENABLED`, `x2apic_supported`, `x2apic_enabled`,
   and `x2apic_wrmsr_fence`), `ICR_IDLE_BUDGET_US`, the bounded-wait helpers the ack and ICR
-  waits run on (`WaitTimer`, `spin_until`, and `MAX_SPINS_PER_UNIT`), and the riscv64
-  `handle_software_interrupt`;
+  waits run on (`WaitTimer`, `spin_until`, and `MAX_SPINS_PER_UNIT`), the riscv64
+  `handle_software_interrupt`, and `sync_instruction_fetch`, which on riscv64 asks every hart for a
+  `fence.i` through SBI RFENCE;
 - the TLB-shootdown broadcast: `shootdown`, `shootdown_range`, `service_shootdowns`,
   `shootdown_remote`, and `needs_remote_shootdown`.
 
@@ -589,7 +590,7 @@ S="$S|send_sipi|send_nmi_to|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCt
 S="$S|IPI_VECTOR_[A-Z_]+|ipi_[a-z_]+_(stub|handler)|apic_send_icr|wait_icr_idle"
 S="$S|enable_x2apic_this_cpu|X2APIC_ENABLED|x2apic_supported|x2apic_enabled"
 S="$S|x2apic_wrmsr_fence|ICR_IDLE_BUDGET_US|WaitTimer|spin_until|MAX_SPINS_PER_UNIT"
-S="$S|handle_software_interrupt"
+S="$S|handle_software_interrupt|sync_instruction_fetch"
 S="$S|shootdown(_range|_remote)?|service_shootdowns|needs_remote_shootdown"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($S)\b"
 ```

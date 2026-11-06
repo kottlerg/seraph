@@ -46,7 +46,11 @@ procmgr/
 
 - **ELF loading** — parse ELF images from boot modules or filesystem,
   request memory caps from memmgr, map LOAD segments with correct
-  permissions.
+  permissions. Each segment's pages are fresh pages memmgr allocates to the
+  child, filled by copying the file's bytes in, so no frame of a child's image
+  is mapped by another process; a debugger's text write
+  (`SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT`) relies on it, since the
+  kernel refuses that write to a frame mapped more than once.
 - **Process creation** — create `AddressSpace`, `CSpace`, and `Thread`
   kernel objects; configure the thread's address space, CSpace, and
   IPC buffer bindings.

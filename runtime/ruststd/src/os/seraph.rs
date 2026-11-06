@@ -1611,12 +1611,26 @@ pub mod process {
         /// upstream's `u32` and so cannot carry the generation.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn process_handle(&self) -> u64;
+
+        /// The child's main-thread capability (with every Thread right,
+        /// `CONTROL` among them), the full handle in this process's
+        /// `CSpace`: what a debugger passes to the thread syscalls, the
+        /// register and memory access of `SYS_THREAD_READ_MEM` and
+        /// `SYS_THREAD_WRITE_MEM` among them (docs/fault-handling.md
+        /// § Debugging). Valid until the [`Child`] drops, or until procmgr
+        /// reaps the child, whose teardown revokes it.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn main_thread_cap(&self) -> u64;
     }
 
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     impl ChildExt for Child {
         fn process_handle(&self) -> u64 {
             self.as_inner().process_handle()
+        }
+
+        fn main_thread_cap(&self) -> u64 {
+            self.as_inner().main_thread_cap()
         }
     }
 

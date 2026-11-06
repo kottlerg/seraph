@@ -194,7 +194,9 @@ Each feature is classified per architecture as one of:
   is the RVA23 mandatory minimum and the refusal floor; Sv48 is the standing
   default in CI and development.
 - **UEFI firmware over an SBI (M-mode) implementation; a device tree or ACPI** — the boot and
-  discovery path. SBI HSM is required to start secondary harts.
+  discovery path. SBI HSM is required to start secondary harts, and SBI RFENCE for its
+  `remote_fence_i`, which makes instruction fetch on every hart see code written through a data
+  path ([memory-model.md](memory-model.md) § Instruction-Fetch Coherence).
 - **MMIO ns16550a UART** — the boot/console serial device (base discovered via firmware tables,
   with a platform fallback).
 
@@ -257,15 +259,15 @@ feature it halts with a message naming the specific feature, rather than failing
   kernel retains a full-flush fallback), invariant TSC (a frequency-stability guarantee; the kernel
   calibrates the TSC against the PIT), and the vendor-specific in-silicon mitigations.
 - **riscv64**: required features are asserted where each is safely detectable from supervisor mode —
-  the SBI HSM extension at the gate, and the Vector extension and the ASID-tagged TLB at their
-  initialization sites (every hart without V, a secondary hart with a `vlenb` other than the boot
-  hart's, and every hart without ASIDs; emulated RISC-V provides ASID, so unlike x86-64 PCID this is
-  gated). A hart without V, the boot hart or a secondary one, is stopped by the kernel's fatal
-  illegal-instruction trap at its `vlenb` read rather than by a message naming V; the boot hart's
-  named message covers a malformed `vlenb`. Extension requirements introduced by a subsystem (the
-  timer, the paging extensions) are asserted by that subsystem during boot — the timer, for example,
-  refuses to boot unless the bootloader confirmed Sstc (and a timebase frequency) for every hart
-  from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes).
+  the SBI HSM and RFENCE extensions at the gate, and the Vector extension and the ASID-tagged TLB at
+  their initialization sites (every hart without V, a secondary hart with a `vlenb` other than the
+  boot hart's, and every hart without ASIDs; emulated RISC-V provides ASID, so unlike x86-64 PCID
+  this is gated). A hart without V, the boot hart or a secondary one, is stopped by the kernel's
+  fatal illegal-instruction trap at its `vlenb` read rather than by a message naming V; the boot
+  hart's named message covers a malformed `vlenb`. Extension requirements introduced by a subsystem
+  (the timer, the paging extensions) are asserted by that subsystem during boot — the timer, for
+  example, refuses to boot unless the bootloader confirmed Sstc (and a timebase frequency) for every
+  hart from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes).
 
 Platform features that are not CPU-detectable (the PIT, UEFI, ACPI/DTB, the UART) are not probed by
 the gate; their absence manifests as a boot failure on the discovery path they feed. A missing or

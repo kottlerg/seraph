@@ -14,10 +14,12 @@ and `random_u64` draws through `getrandom` and returns `InvalidState` on a short
 untyped entries, `raw_syscall3` and `raw_syscall4`, pass three or four argument registers as
 given, for harness tests of the kernel's argument validation that need register values the
 typed wrappers cannot express;
-`getrandom_raw` likewise takes a raw buffer pointer for the kernel's buffer-validation tests.
+`getrandom_raw`, `thread_read_regs_raw`, `thread_write_regs_raw`, `thread_read_mem_raw`, and
+`thread_write_mem_raw` likewise take a raw buffer pointer for the kernel's buffer-validation tests.
 
 A wrapper is safe when nothing it can make the kernel do reaches memory a live Rust object
-occupies: buffers the kernel writes or reads are slices (`getrandom`, `thread_read_regs`). The
+occupies: buffers the kernel writes or reads are slices (`getrandom`, `thread_read_regs`,
+`thread_read_mem`). The
 `cap_create_*` retype wrappers are safe on that rule because the kernel never carves a page some
 address space maps, so a retype cannot overwrite bytes the caller reaches through a mapping; one
 that would fails with `OutOfMemory`, as § Capability Syscalls of
@@ -30,7 +32,9 @@ space, no live object or registered IPC page in the span; for `mmio_map`, also n
 into the mapping, which any ancestor holder can withdraw, so `cap_delete`, `cap_revoke` and
 `mmio_split` stay safe), and `thread_configure`,
 `thread_configure_with_tls` and `thread_write_regs` (a thread of the caller's address space
-starts or resumes only on code, a stack, and a TLS block dedicated to it).
+starts or resumes only on code, a stack, and a TLS block dedicated to it), and `thread_write_mem`
+(when the thread runs in the caller's address space, the range holds no object the written bytes
+invalidate, and no reference into it is live).
 
 No stability obligation. Not used by the kernel.
 

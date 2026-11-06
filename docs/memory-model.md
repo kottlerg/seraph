@@ -187,6 +187,38 @@ On x86-64, kernel-side W^X additionally depends on `CR0.WP` (supervisor write-pr
 without it a ring-0 write would bypass a read-only page permission. `CR0.WP` is required by
 the platform baseline ([platform-requirements.md](platform-requirements.md)) and set on every CPU.
 
+### Instruction-Fetch Coherence
+
+Code reaches a user page through data stores: a loader writes a segment through a writable mapping
+before it maps the frame executable, the kernel relocates init's image in place, and a debugger's
+`SYS_THREAD_WRITE_MEM` writes text through the kernel's own mapping. On x86-64 instruction fetch is
+coherent with stores, and code another CPU modified needs only a serializing event on the CPU that
+runs it, which every return to user mode through `iretq` and every context switch supplies. On
+RISC-V it is not: a hart may fetch stale instructions until it runs `fence.i`, which orders that
+hart alone.
+
+So the kernel synchronises instruction fetch on every CPU (on RISC-V a local `fence.i`, then SBI
+RFENCE `remote_fence_i` on every hart) before code written through a data path can run:
+
+- when `SYS_MEM_MAP` or `SYS_MEM_PROTECT` makes a mapping executable, before the first executable
+  leaf is installed, and on every `SYS_MEM_PROTECT` to executable, even of pages executable
+  already;
+- when it maps init's segments at boot, before init runs;
+- when `SYS_THREAD_WRITE_MEM` has written, before the call returns.
+
+[core/kernel/docs/memory-internals.md](../core/kernel/docs/memory-internals.md)
+§ Instruction-Fetch Synchronisation records these call sites and why the kernel synchronises there.
+
+Synchronising at the mapping, rather than at each store, is what lets a loader write a segment and
+map it with no call of its own. W^X holds per mapping, not per frame: a Memory capability may carry
+both `Write` and `Execute`, so one frame can be mapped writable at one address and executable at
+another. A process that writes code through such a writable alias MUST then issue `SYS_MEM_PROTECT`
+to executable over the executable mapping; that call synchronises even when the mapping is
+executable already. Userspace cannot issue a remote `fence.i` itself. Under emulation (QEMU TCG) a
+missing synchronisation does not fail, since the emulator invalidates its translations on any store;
+the `SYS_SYSTEM_INFO(InstructionCacheSyncs)` count records each, so a test can check that a path
+synchronised ([core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SystemInfoType`).
+
 ### TLB Management
 
 Address-space tags (x86-64 PCID, RISC-V ASID) are required by the platform baseline

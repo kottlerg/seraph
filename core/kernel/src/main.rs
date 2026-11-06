@@ -875,6 +875,10 @@ unsafe fn kernel_entry_post_rebase(
             unsafe { (*init_as_ptr).map_segment(seg) }
                 .unwrap_or_else(|()| fatal("Phase 9: failed to map init segment"));
         }
+        // The bootloader loaded init's segments, and the PIE rebase above
+        // relocated them, through data stores; instruction fetch on every hart
+        // must see them before init runs (mm::icache).
+        mm::icache::sync_user_code();
 
         // Insert an AddressSpace cap for init's own address space into the root
         // CSpace (so init can create threads bound to it), followed by a reclaimable

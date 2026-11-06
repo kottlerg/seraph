@@ -201,6 +201,29 @@ pub(super) fn kernel_leaf_permits(pte: u64, access: KernelAccess) -> bool
     pte & PTE_VALID != 0 && permits
 }
 
+/// PTE bit U: the page is reachable from U-mode.
+pub(super) const PTE_USER: u64 = 1 << 4;
+/// Svpbmt PBMT field, bits \[62:61\]: zero (PMA) is the platform's memory
+/// type, which every RAM mapping uses; NC and IO are the non-cacheable types.
+pub(super) const PTE_PBMT_MASK: u64 = 0b11 << 61;
+
+/// The access the user leaf PTE `pte` grants, or `None` when it is not valid
+/// or not user-accessible (`paging::user_leaf_flags`). `uncacheable` is set
+/// for any PBMT other than PMA.
+pub(super) fn user_leaf_flags(pte: u64) -> Option<crate::mm::paging::PageFlags>
+{
+    if pte & PTE_VALID == 0 || pte & PTE_USER == 0
+    {
+        return None;
+    }
+    Some(crate::mm::paging::PageFlags {
+        readable: pte & PTE_READ != 0,
+        writable: pte & PTE_WRITE != 0,
+        executable: pte & PTE_EXECUTE != 0,
+        uncacheable: pte & PTE_PBMT_MASK != 0,
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -354,5 +377,27 @@ mod tests
         let invalid = PTE_READ | PTE_WRITE;
         assert!(!kernel_leaf_permits(invalid, KernelAccess::Load));
         assert!(!kernel_leaf_permits(invalid, KernelAccess::Store));
+    }
+
+    // Defect caught: a decoder that let a supervisor or invalid leaf through
+    // would let SYS_THREAD_READ_MEM read a page the thread cannot reach, and one
+    // that dropped X, W or the memory type would skip the instruction-cache
+    // sync, permit a text write without THREAD_MEM_TEXT, or read device
+    // memory through the direct map.
+    #[test]
+    fn a_user_leaf_decodes_to_its_access_and_memory_type()
+    {
+        assert!(user_leaf_flags(PTE_VALID | PTE_READ | PTE_WRITE).is_none());
+        assert!(user_leaf_flags(PTE_USER | PTE_READ).is_none());
+        let rx = user_leaf_flags(PTE_VALID | PTE_USER | PTE_READ | PTE_EXECUTE).unwrap();
+        assert!(rx.readable && rx.executable && !rx.writable && !rx.uncacheable);
+        let x_only = user_leaf_flags(PTE_VALID | PTE_USER | PTE_EXECUTE).unwrap();
+        assert!(!x_only.readable && x_only.executable);
+        let rw = user_leaf_flags(PTE_VALID | PTE_USER | PTE_READ | PTE_WRITE).unwrap();
+        assert!(rw.writable && !rw.executable);
+        let io = user_leaf_flags(PTE_VALID | PTE_USER | PTE_READ | (0b10 << 61)).unwrap();
+        assert!(io.uncacheable);
+        let nc = user_leaf_flags(PTE_VALID | PTE_USER | PTE_READ | (0b01 << 61)).unwrap();
+        assert!(nc.uncacheable);
     }
 }

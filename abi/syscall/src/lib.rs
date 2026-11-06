@@ -493,11 +493,17 @@ pub const SYS_THREAD_POST_UPCALL: u64 = 58;
 /// delivery of a posted upcall. See `core/kernel/docs/syscalls.md`
 /// § `SYS_THREAD_SET_UPCALL_MASK` (59).
 pub const SYS_THREAD_SET_UPCALL_MASK: u64 = 59;
+/// Thread: copy bytes from the thread's address space into the caller's
+/// buffer. See `core/kernel/docs/syscalls.md` § `SYS_THREAD_READ_MEM` (60).
+pub const SYS_THREAD_READ_MEM: u64 = 60;
+/// Thread: copy bytes from the caller's buffer into the thread's address
+/// space. See `core/kernel/docs/syscalls.md` § `SYS_THREAD_WRITE_MEM` (61).
+pub const SYS_THREAD_WRITE_MEM: u64 = 61;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_SET_UPCALL_MASK + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_WRITE_MEM + 1;
 
 // ── getrandom constants ───────────────────────────────────────────────────────
 
@@ -910,7 +916,10 @@ pub const RIGHTS_MMIO_WRITE: u64 = 1 << 1;
 
 // Thread ──
 
-/// Thread: may start, stop, and configure the thread.
+/// Thread: may start, stop, and configure the thread, write its registers,
+/// and read and write the memory of the address space it executes in
+/// (`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`; docs/capability-model.md
+/// § Thread).
 pub const RIGHTS_THREAD_CONTROL: u64 = 1 << 0;
 
 /// Thread: may read thread register state.
@@ -920,7 +929,8 @@ pub const RIGHTS_THREAD_OBSERVE: u64 = 1 << 1;
 /// with [`UPCALL_ANY_INSTRUCTION`] also needs [`RIGHTS_THREAD_CONTROL`].
 pub const RIGHTS_THREAD_UPCALL: u64 = 1 << 2;
 
-/// Thread: full control (start, stop, configure, observe, post an upcall).
+/// Thread: full control (start, stop, configure, write registers, read and
+/// write the thread's address space, observe, post an upcall).
 pub const RIGHTS_THREAD: u64 = RIGHTS_THREAD_CONTROL | RIGHTS_THREAD_OBSERVE | RIGHTS_THREAD_UPCALL;
 
 // CSpace ──
@@ -1249,6 +1259,23 @@ pub const REGS_RISCV64_IP_OFFSET: usize = 248;
 /// Byte offset of the stack pointer (`sp`, `x2`) in the riscv64 register file.
 pub const REGS_RISCV64_SP_OFFSET: usize = 8;
 
+// ── Thread memory (SYS_THREAD_READ_MEM / SYS_THREAD_WRITE_MEM) ──────────────
+
+/// Most bytes one `SYS_THREAD_READ_MEM` or `SYS_THREAD_WRITE_MEM` call
+/// copies. The kernel stages the bytes in a buffer on its own stack, so the
+/// bound is that buffer's size; a debugger loops for a larger range
+/// (`docs/limits.md`).
+pub const MAX_THREAD_MEM_COPY: usize = 4096;
+
+/// `SYS_THREAD_WRITE_MEM` flag: permit the write to a page the thread's
+/// mapping does not make writable, such as its text, for a software
+/// breakpoint. The kernel writes through its own mapping of the frame and
+/// refuses a frame mapped more than once (another mapping could be another
+/// process's view of shared text). Every `SYS_THREAD_WRITE_MEM`, with the flag
+/// or without, then makes instruction fetch on every hart see the write
+/// (`docs/fault-handling.md` § Debugging).
+pub const THREAD_MEM_TEXT: u64 = 1 << 0;
+
 // ── System info ───────────────────────────────────────────────────────────────
 
 /// Pack a dotted `X.Y.Z` version string into the [`KERNEL_VERSION`] layout.
@@ -1355,6 +1382,19 @@ pub enum SystemInfoType
     /// with no capability; ktest reads it to check that a teardown returns its
     /// id (core/kernel/docs/syscalls.md § `SYS_SYSTEM_INFO`).
     LiveCSpaceCount = 11,
+    /// Number of instruction-fetch synchronisations the kernel has issued
+    /// since boot, one per call, not per page: one at boot for init's image,
+    /// one for each `SYS_MEM_MAP` that asks for an executable mapping and
+    /// each `SYS_MEM_PROTECT` to executable (counted once the call reaches
+    /// the synchronisation, before it maps or protects, so a call that then
+    /// fails is counted too), and one for each `SYS_THREAD_WRITE_MEM` that
+    /// writes. On RISC-V each is a local `fence.i` and then SBI
+    /// `remote_fence_i` on every hart; on x86-64, whose instruction fetch is
+    /// coherent with stores, each is counted and does nothing. A diagnostic
+    /// count, readable by any process with no capability; ktest reads it to
+    /// check that each such path synchronises (core/kernel/docs/syscalls.md
+    /// § `SYS_SYSTEM_INFO`).
+    InstructionCacheSyncs = 12,
 }
 
 /// `SystemInfoType::StackHighWater` class: the per-CPU idle stacks.

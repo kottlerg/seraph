@@ -343,6 +343,10 @@ listing's names through the extension (svcmgr's recipe scan does).
 procmgr process-handle cap as the full `u64` capability handle, for the procmgr
 labels that take one. `Child::id` returns only the handle's slot index, since
 upstream fixes its width at `u32` and the handle's generation sits above that.
+`ChildExt::main_thread_cap` returns the child's main-thread capability, which
+the spawner keeps from procmgr's create reply until the `Child` drops; a debugger
+passes it to the thread syscalls that inspect and modify the child
+([docs/fault-handling.md](../../docs/fault-handling.md) § Debugging).
 
 ---
 

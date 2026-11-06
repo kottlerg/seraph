@@ -405,12 +405,11 @@ range). See [entropy.md](entropy.md).
 
 **Failure mode:** Hardware initialisation failures halt with a descriptive
 message. The x86-64 required-feature baseline is checked in Phase 1. On RISC-V, Phase 1
-gates only the SBI HSM extension; the boot hart's Vector extension, the ASID-tagged TLB, Sstc
-and the timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here, at their
-initialization sites (each secondary hart's Vector extension, `vlenb` and ASID-tagged TLB in
-Phase 8). A boot
-hart without V halts through the fatal illegal-instruction trap at its `vlenb` read; the named
-message covers a `vlenb` of 0, above 8192, or not a power of two
+gates only the SBI HSM and RFENCE extensions; the boot hart's Vector extension, the ASID-tagged
+TLB, Sstc and the timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here,
+at their initialization sites (each secondary hart's Vector extension, `vlenb` and ASID-tagged
+TLB in Phase 8). A boot hart without V halts through the fatal illegal-instruction trap at its
+`vlenb` read; the named message covers a `vlenb` of 0, above 8192, or not a power of two
 ([platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate).
 
 **Completion criterion:** Interrupts are enabled, the preemption timer is running,
@@ -714,6 +713,11 @@ calls `sched::enter()`.
         adds it to the physical frame address at translation time
       - Apply permissions from segment.flags (Read → RO, ReadWrite → RW,
         ReadExecute → RX); W^X is enforced (ReadWrite cannot also be executable)
+      - Once every segment is mapped, synchronise instruction fetch on every CPU
+        (`mm::icache::sync_user_code`; on RISC-V a local `fence.i` and SBI RFENCE
+        `remote_fence_i`): the bootloader loaded the segments and step 1 relocated
+        them through data stores ([memory-internals.md](memory-internals.md)
+        § Instruction-Fetch Synchronisation)
    b. Mint the AddressSpace cap (MAP | READ) for init's address space into
       the root CSpace, then a reclaimable Memory cap per init segment
       (page-aligned base and size, full rights, `owns_memory = true`, the

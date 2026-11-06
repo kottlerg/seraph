@@ -16,11 +16,14 @@
 //!
 //!   - **Resume, copy to the buffer.** `SYS_GETRANDOM` on an unmapped page,
 //!     then on a span straddling a mapped and an unmapped page (the fault names
-//!     the second page), and `SYS_THREAD_READ_REGS` on an unmapped page: the
+//!     the second page), `SYS_THREAD_READ_REGS` on an unmapped page, and
+//!     `SYS_THREAD_READ_MEM` of a ktest static into an unmapped page: the
 //!     harness backs the page and resumes, and the re-executed call succeeds.
 //!   - **Resume, copy from the buffer.** `SYS_THREAD_WRITE_REGS` on a stopped
 //!     helper from an unmapped page: the harness backs it with the helper's own
-//!     registers and resumes.
+//!     registers and resumes. `SYS_THREAD_WRITE_MEM` into a ktest static from
+//!     an unmapped page: the harness backs it with a pattern and resumes, and
+//!     the static holds the pattern.
 //!   - **Decline.** `SYS_GETRANDOM` on an unmapped page, then on a read-only one
 //!     (a present page, which x86-64 reports): the harness declines, the call
 //!     fails with `InvalidAddress`, and the child lives to report it.
@@ -57,6 +60,20 @@ const FAULT_BADGE: u64 = 0xC0FF_EE05;
 
 /// Bytes the `SYS_GETRANDOM` cases ask for.
 const RANDOM_LEN: usize = 32;
+
+/// Bytes the thread-memory cases copy.
+const MEM_LEN: usize = 32;
+
+/// The byte the harness backs a `WriteMem` buffer with.
+const MEM_PATTERN: u8 = 0xA5;
+
+/// What the `ReadMem` case reads through the helper's thread cap (the helper
+/// runs in ktest's own address space): non-zero, so [`landed`] sees it.
+static MEM_SOURCE: [u8; MEM_LEN] = [0x3C; MEM_LEN];
+
+/// What the `WriteMem` case writes through the helper's thread cap; no Rust
+/// reference to it is formed, only raw-pointer reads after the write.
+static mut MEM_TARGET: [u8; MEM_LEN] = [0; MEM_LEN];
 
 /// Bytes of a register frame, the register syscalls' buffer length.
 // cast_possible_truncation: the frame is a few hundred bytes.
@@ -96,14 +113,21 @@ enum Call
     ReadRegs,
     /// `SYS_THREAD_WRITE_REGS` of the stopped helper from the buffer.
     WriteRegs,
+    /// `SYS_THREAD_READ_MEM` of [`MEM_SOURCE`], through the helper's cap,
+    /// into the buffer.
+    ReadMem,
+    /// `SYS_THREAD_WRITE_MEM` of the buffer, through the helper's cap, into
+    /// [`MEM_TARGET`].
+    WriteMem,
 }
 
 /// How the harness answers the fault.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Answer
 {
-    /// Back the faulting page (for `WriteRegs`, with the helper's registers)
-    /// and resume: the call re-executes and succeeds.
+    /// Back the faulting page (for `WriteRegs`, with the helper's registers;
+    /// for `WriteMem`, with [`MEM_PATTERN`]) and resume: the call re-executes
+    /// and succeeds.
     Resume,
     /// Decline: the call fails with `InvalidAddress`.
     Decline,
@@ -132,7 +156,7 @@ struct Spec
     premap: Option<u64>,
 }
 
-const CASES: [Spec; 8] = [
+const CASES: [Spec; 10] = [
     Spec {
         name: "fault_syscall_buffer: getrandom resumed",
         call: Call::Getrandom,
@@ -163,6 +187,22 @@ const CASES: [Spec; 8] = [
         answer: Answer::Resume,
         offset: 0,
         len: FRAME_BYTES,
+        premap: None,
+    },
+    Spec {
+        name: "fault_syscall_buffer: read_mem resumed",
+        call: Call::ReadMem,
+        answer: Answer::Resume,
+        offset: 0,
+        len: MEM_LEN,
+        premap: None,
+    },
+    Spec {
+        name: "fault_syscall_buffer: write_mem resumed",
+        call: Call::WriteMem,
+        answer: Answer::Resume,
+        offset: 0,
+        len: MEM_LEN,
         premap: None,
     },
     Spec {
@@ -467,7 +507,7 @@ fn check_fault(msg: &IpcMessage, spec: &Spec, fault_va: u64, regs: &[u8]) -> Tes
                     byte",
         );
     }
-    let access = if spec.call == Call::WriteRegs
+    let access = if matches!(spec.call, Call::WriteRegs | Call::WriteMem)
     {
         FAULT_ACCESS_READ
     }
@@ -510,6 +550,13 @@ fn answer_fault(
         Answer::Resume =>
         {
             case.map(1, fault_va & !(PAGE_SIZE - 1), MAP_WRITABLE)?;
+            if spec.call == Call::WriteMem
+            {
+                // SAFETY: the page at `fault_va` is mapped writable just above
+                // and holds no Rust object; the child is fault-blocked until
+                // the reply, so nothing else reads it during the write.
+                unsafe { core::ptr::write_bytes(fault_va as *mut u8, MEM_PATTERN, spec.len) };
+            }
             if let (Call::WriteRegs, Some(th)) = (spec.call, helper)
             {
                 // SAFETY: the page at `fault_va` is mapped writable just above
@@ -613,6 +660,36 @@ extern "C" fn caller_entry(arg: u64) -> !
             // stopped.
             let r = unsafe { syscall::thread_write_regs_raw(a.helper, a.buf as *const u8, a.len) };
             r.is_ok()
+        }
+        Call::ReadMem =>
+        {
+            // SAFETY: as for `Getrandom`; the helper's thread runs in ktest's
+            // own address space, where MEM_SOURCE lies.
+            let r = unsafe {
+                syscall::thread_read_mem_raw(
+                    a.helper,
+                    core::ptr::addr_of!(MEM_SOURCE) as u64,
+                    a.buf as *mut u8,
+                    a.len,
+                )
+            };
+            r == Ok(a.len as u64) && landed(a.buf, a.len)
+        }
+        Call::WriteMem =>
+        {
+            let target = core::ptr::addr_of_mut!(MEM_TARGET).cast::<u8>();
+            // SAFETY: the buffer is a scratch page the handler backs; the
+            // write lands in MEM_TARGET, a static of ktest's own address space
+            // (the helper's), to which no reference is live and for which any
+            // byte value is valid.
+            let r = unsafe {
+                syscall::thread_write_mem_raw(a.helper, target as u64, a.buf as *const u8, a.len, 0)
+            };
+            r.is_ok()
+                && (0..a.len).all(|i| {
+                    // SAFETY: MEM_TARGET is read through a raw pointer, i < its length.
+                    unsafe { target.add(i).read_volatile() == MEM_PATTERN }
+                })
         }
     };
     let ok = returned_ok && !a.redirected;

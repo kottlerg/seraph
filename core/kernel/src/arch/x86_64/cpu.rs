@@ -521,6 +521,13 @@ pub unsafe fn verify_baseline()
 #[cfg(test)]
 pub unsafe fn verify_baseline() {}
 
+/// Make instruction fetch on every CPU see the stores made before the call
+/// (`mm::icache::sync_user_code`). Nothing to do on x86-64: instruction fetch
+/// is coherent with stores on every CPU, and code another CPU modified needs
+/// only a serializing event on the CPU that runs it, which every return to
+/// user mode through `iretq` and every context switch supplies.
+pub fn sync_instruction_fetch() {}
+
 // ── Misc ──────────────────────────────────────────────────────────────────────
 
 /// Atomically enable interrupts and halt until an interrupt is recognised.

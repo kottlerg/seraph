@@ -4,11 +4,11 @@
 // programs/debugger/src/main.rs
 
 //! Debugger fixture: a debugger thread drives a debuggee thread of the same
-//! process through the fault and upcall handlers (docs/fault-handling.md
-//! § Debugging).
+//! process, then a debuggee process, through the fault and upcall handlers
+//! and the thread-memory syscalls (docs/fault-handling.md § Debugging).
 //!
-//! The debugger (the main thread) binds the debuggee's exception and upcall
-//! classes to an endpoint of its own, then:
+//! The debugger (the main thread) binds the debuggee thread's exception and
+//! upcall classes to an endpoint of its own, then:
 //!
 //! 1. receives the debuggee's software breakpoint (`int3` on x86-64, `ebreak`
 //!    on riscv64) as `FAULT_EXC_BREAKPOINT`, checks the reported instruction
@@ -19,24 +19,32 @@
 //!    trap flag, one `FAULT_EXC_DEBUG` each;
 //! 3. async-breaks the debuggee, now spinning in a loop that makes no syscall,
 //!    with an `UPCALL_ANY_INSTRUCTION` upcall, checks that it computes nothing
-//!    while stopped, writes the flag that ends its loop, and resumes it.
+//!    while stopped, writes the flag that ends its loop, and resumes it;
+//! 4. spawns itself with `--debuggee` as a debuggee process, and through the
+//!    child's main-thread cap reads and writes its data
+//!    (`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`), plants a software
+//!    breakpoint in its text (`THREAD_MEM_TEXT`), takes the breakpoint,
+//!    restores the text, and resumes the child at the restored instruction.
 //!
-//! The fixture prints `PASS` once the debuggee has seen the debugger's memory
-//! write and left its loop. Driven by its per-program tester (`tester/`),
-//! which `usertest` runs.
+//! The fixture prints `PASS` once both debuggees have seen the debugger's
+//! memory writes. Driven by its per-program tester (`tester/`), which
+//! `usertest` runs.
 
 // A test fixture, where unwrap and expect are permitted
 // (docs/coding-standards.md § Error Handling): a failed step must abort the
 // fixture, and the panic's non-zero exit is its FAIL verdict for the tester.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::io::{BufRead, BufReader};
+use std::os::seraph::process::ChildExt;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ipc::IpcMessage;
 use syscall_abi::{
     FAULT_CLASS_EXCEPTION, FAULT_CLASS_UPCALL, FAULT_EXC_BREAKPOINT, FAULT_KIND_EXCEPTION,
-    FAULT_KIND_UPCALL, FAULT_LABEL, FAULT_REPLY_RESUME, UPCALL_ANY_INSTRUCTION,
+    FAULT_KIND_UPCALL, FAULT_LABEL, FAULT_REPLY_RESUME, THREAD_MEM_TEXT, UPCALL_ANY_INSTRUCTION,
     UPCALL_POINT_INTERRUPT,
 };
 
@@ -69,6 +77,14 @@ static SEEN: AtomicU64 = AtomicU64::new(0);
 static LEAVE: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
 
+/// The debuggee process's data, which the debugger reads, then rewrites to
+/// [`POKED`]. A nonzero initial value keeps it in a loaded data segment, so
+/// its page is present.
+static CHILD_DATA: AtomicU64 = AtomicU64::new(0xC41D_DA7A);
+
+/// The debuggee process waits while this holds 1; the debugger writes 2.
+static CHILD_GO: AtomicU64 = AtomicU64::new(1);
+
 #[cfg(target_arch = "x86_64")]
 mod arch
 {
@@ -77,6 +93,10 @@ mod arch
     /// Bytes the debugger advances the pointer by to resume past the
     /// breakpoint: none, since `#BP` reports the next instruction.
     pub const RESUME_ADVANCE: u64 = 0;
+
+    /// The software breakpoint the debugger plants in a debuggee's text:
+    /// `int3`.
+    pub const BREAKPOINT: [u8; 1] = [0xCC];
 
     /// The pointer the breakpoint at `addr` reports.
     pub fn reported(addr: u64) -> u64
@@ -158,6 +178,10 @@ mod arch
     /// breakpoint: the 4-byte `ebreak`.
     pub const RESUME_ADVANCE: u64 = 4;
 
+    /// The software breakpoint the debugger plants in a debuggee's text: the
+    /// 4-byte `ebreak` (0x00100073), little-endian.
+    pub const BREAKPOINT: [u8; 4] = [0x73, 0x00, 0x10, 0x00];
+
     /// The pointer the breakpoint at `addr` reports.
     pub fn reported(addr: u64) -> u64
     {
@@ -196,6 +220,11 @@ mod arch
 
 fn main()
 {
+    if std::env::args().nth(1).as_deref() == Some("--debuggee")
+    {
+        debuggee_process();
+        return;
+    }
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
         syscall::cap_create_endpoint(slab).ok()
@@ -253,7 +282,114 @@ fn main()
         "the debugger's memory write was lost"
     );
     println!("debugger: async break after {stopped_at} spins");
+
+    // 4. The debuggee process.
+    cross_process(ep, ipc_buf);
     println!("PASS");
+}
+
+/// The debuggee process (`--debuggee`): report its addresses, wait for the
+/// debugger's go, call [`child_target`], in whose text the debugger has
+/// planted a breakpoint, and report what it read.
+fn debuggee_process()
+{
+    println!(
+        "ADDR {:x} {:x} {:x}",
+        core::ptr::addr_of!(CHILD_DATA) as u64,
+        core::ptr::addr_of!(CHILD_GO) as u64,
+        child_target as *const () as u64
+    );
+    while CHILD_GO.load(Ordering::Acquire) == 1
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    println!("SEEN {:x}", child_target());
+}
+
+/// The function whose first instruction the debugger replaces with a
+/// breakpoint; returns the data the debugger rewrote.
+#[inline(never)]
+fn child_target() -> u64
+{
+    CHILD_DATA.load(Ordering::Acquire)
+}
+
+/// Step 4: debug the debuggee process through its main-thread cap.
+fn cross_process(ep: u64, ipc_buf: *mut u64)
+{
+    let mut child = Command::new("/programs/debugger")
+        .arg("--debuggee")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the debuggee process");
+    let th = child.main_thread_cap();
+    let mut out = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line)
+        .expect("read the debuggee's addresses");
+    let addrs: Vec<u64> = line
+        .trim()
+        .strip_prefix("ADDR ")
+        .expect("an ADDR line")
+        .split(' ')
+        .map(|w| u64::from_str_radix(w, 16).expect("a hex address"))
+        .collect();
+    let [data, go, target] = addrs[..]
+    else
+    {
+        panic!("three addresses")
+    };
+
+    syscall::thread_set_fault_handler(th, ep, FAULT_CLASS_EXCEPTION)
+        .expect("bind the debuggee process's exception class");
+    let mut word = [0u8; 8];
+    syscall::thread_read_mem(th, data, &mut word).expect("read the child's data");
+    assert_eq!(
+        u64::from_le_bytes(word),
+        0xC41D_DA7A,
+        "the child's data read back wrong"
+    );
+    // SAFETY: the thread runs in the child's address space, not this one.
+    unsafe { syscall::thread_write_mem(th, data, &POKED.to_le_bytes(), 0) }
+        .expect("write the child's data");
+
+    let mut original = arch::BREAKPOINT;
+    syscall::thread_read_mem(th, target, &mut original).expect("read the child's text");
+    // SAFETY: as above. The child's loader gave its text frames to it alone,
+    // so the write needs only THREAD_MEM_TEXT.
+    unsafe { syscall::thread_write_mem(th, target, &arch::BREAKPOINT, THREAD_MEM_TEXT) }
+        .expect("plant the breakpoint in the child's text");
+    // SAFETY: as above.
+    unsafe { syscall::thread_write_mem(th, go, &2u64.to_le_bytes(), 0) }
+        .expect("release the child");
+
+    let reported = recv_exception(ep, ipc_buf, FAULT_EXC_BREAKPOINT);
+    assert_eq!(
+        reported,
+        arch::reported(target),
+        "the child's breakpoint reported the wrong pointer"
+    );
+    // SAFETY: as above.
+    unsafe { syscall::thread_write_mem(th, target, &original, THREAD_MEM_TEXT) }
+        .expect("restore the child's text");
+    let mut regs = [0u8; REGS_BYTES];
+    syscall::thread_read_regs(th, &mut regs).expect("read the child's registers");
+    write_word(&mut regs, arch::IP, target);
+    // SAFETY: the frame was read from the child's thread, fault-blocked at its
+    // breakpoint; only its pointer moves, back to the restored instruction.
+    unsafe { syscall::thread_write_regs(th, &regs) }.expect("write the child's registers");
+    reply(ipc_buf);
+
+    line.clear();
+    out.read_line(&mut line).expect("read the child's report");
+    assert_eq!(
+        line.trim(),
+        format!("SEEN {POKED:x}"),
+        "the child missed the debugger's write"
+    );
+    let status = child.wait().expect("wait for the debuggee process");
+    assert!(status.success(), "the debuggee process exited non-clean");
+    println!("debugger: debuggee process inspected, modified, and broken into at {target:#x}");
 }
 
 /// Step 3: async-break the spinning debuggee, check that it does not run

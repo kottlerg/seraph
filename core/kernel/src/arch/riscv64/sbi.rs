@@ -40,9 +40,10 @@ pub fn sbi_call(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> Sbi
     // write caller-pointed memory (RFENCE hart-mask pointer, HSM opaque
     // arg, Debug Console Buffer write, …). Claiming `nomem` would license
     // LLVM to reorder memory ops across the call and silently break any
-    // such caller. Today's callers (`cpu::verify_baseline`'s HSM probe, and
-    // `sbi_forward` behind `sys_sbi_call`) pass scalar arguments only, but the
-    // primitive must stay honest.
+    // such caller. Today's callers (`cpu::verify_baseline`'s HSM and RFENCE
+    // probes, `cpu::sync_instruction_fetch`'s `remote_fence_i`, and
+    // `sbi_forward` behind `sys_sbi_call`) pass scalar arguments only, but
+    // the primitive must stay honest.
     unsafe {
         core::arch::asm!(
             "ecall",

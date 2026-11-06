@@ -55,6 +55,7 @@ pub mod retype_reclaim;
 pub mod shared_memory_two_aspaces;
 pub mod stop_read_regs_remote;
 pub mod thread_lifecycle;
+pub mod thread_memory;
 pub mod thread_upcall;
 pub mod tlb_coherency;
 pub mod tlb_widen_retry;
@@ -223,6 +224,7 @@ pub fn run_all(ctx: &TestContext)
         fault_exception_redirect::run(ctx)
     );
     run_integration_test!("integration::fault_debug", fault_debug::run(ctx));
+    run_integration_test!("integration::thread_memory", thread_memory::run(ctx));
     run_integration_test!(
         "integration::fault_exception_no_handler_kills",
         fault_exception_no_handler_kills::run(ctx)

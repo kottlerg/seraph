@@ -283,9 +283,8 @@ exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and
 `thread::start_suspended_resume`, the exit and report waits of `integration::fault_handler_rebind`,
 the exit and recovery waits of `integration::fault_class_bindings`, the report wait of
 `integration::trap_redelivery`, the progress waits and report wait of `integration::thread_upcall`,
-the report waits of `integration::fault_debug` and `integration::single_step`, the convergence polls
-of
-`thread::load_balancer_redistributes_skewed`, the exit wait of
+the report waits of `integration::fault_debug` and `integration::single_step`, the convergence
+polls of `thread::load_balancer_redistributes_skewed`, the exit wait of
 `thread::bind_notification_nodes_come_from_the_queue`; the exit and come-up polls of
 `configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
 `stop_target_vanishes` and `split_delete_race`, the final-delivery polls of `stop_repark`, the

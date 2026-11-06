@@ -578,10 +578,12 @@ kernel adds no debugging interface of its own. The pieces are:
     - a stop while the thread was blocked in a syscall;
     - a syscall restarted after a fault of its user copy ([Kernel Copies](#kernel-copies)), whose
       `#DB` names the `syscall` instruction itself.
-  - **Through `iretq`** (the return from a user-mode fault or exception, or from an interrupt),
-    one instruction runs before the first `#DB`. That covers a resume from a fault, a breakpoint
-    or a step, from an upcall at the interrupt point, and from a stop of a thread an interrupt
-    preempted.
+  - **Through `iretq`** (the return from a user-mode fault or exception, or from an interrupt,
+    and a thread's first entry to user mode), one instruction runs before the first `#DB`. That
+    covers a resume from a fault, a breakpoint or a step, from an upcall at the interrupt point,
+    and from a stop of a thread an interrupt preempted; and the first start of a thread created
+    stopped (`THREAD_START_SUSPENDED`) whose trap flag was set before that start, where the entry
+    instruction runs first.
 - **No single-step on RISC-V.** RISC-V has no user-mode single-step without a debug trigger. The
   kernel programs none: an instruction-count trigger is not available through the SBI Debug
   Triggers extension on the reference platform.

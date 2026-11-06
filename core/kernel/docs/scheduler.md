@@ -161,8 +161,13 @@ pub struct PerCpuScheduler
     /// Lock protecting the run queues. Held briefly during enqueue/dequeue.
     pub lock: Spinlock,
 
-    /// Run-queue load counter; read via current_load() by the load balancer and select_target_cpu.
+    /// Run-queue load counter (the linked threads, the idle thread included while linked);
+    /// read via current_load() by the load balancer and select_target_cpu.
     load: AtomicU32,
+
+    /// The idle pull's confirmation sample: the CPU this CPU found backlogged at its
+    /// previous idle tick (§ Load Balancing).
+    idle_pull_candidate: AtomicUsize,
 }
 
 struct RunQueue
@@ -424,10 +429,18 @@ and used for subsequent wakeups.
 
 ### Load Balancing
 
-A pull-based balancer runs on every CPU's `timer_tick` (see
-`sched::try_pull_balance`). It consumes each CPU's run-queue load counter
+A pull-based balancer runs on every CPU's `timer_tick`: `sched::try_pull_idle` on a CPU
+running its idle thread, `sched::try_pull_balance` on any other. The timer keeps firing
+whatever the CPU runs, so a halted idle CPU keeps ticking: riscv64 re-arms `stimecmp` in its
+interrupt handler, and x86_64 re-arms the TSC deadline there or, in periodic APIC mode,
+reloads in hardware. The balancer consumes each CPU's run-queue load counter
 (`PerCpuScheduler::current_load()`, maintained by `enqueue` / `dequeue_highest` /
-`remove_from_queue`) and migrates at most one `Ready` thread per tick per CPU.
+`remove_from_queue`) and migrates at most one `Ready` thread per tick per CPU. The load is
+the number of threads linked on the CPU's run queues. The running thread is not counted,
+and the CPU's idle thread is counted while it is linked: the idle loop leaves the idle
+thread through `schedule(Requeue::Always)`, which links it on the idle queue, where it stays
+until the CPU next runs it. A CPU that left its idle thread for another so reads one more
+than the threads queued behind its running one.
 
 The balancer counts queued threads without weighing them by class or level (§ Scheduling
 Classes): it evens out the number of queued threads per CPU, and `find_runnable` scans the
@@ -435,16 +448,40 @@ victim's queues from the highest, so an RT thread is pulled before a fair one.
 
 Victim selection is mode-dependent:
 
-- **Loaded CPU (`my_load > 0`)** — pick a pseudo-random victim
+- **Busy CPU, `my_load > 0`** — pick a pseudo-random victim
   (splitmix-style hash of the global `LOAD_BALANCE_TICK` counter and the
   local CPU id). Skip if the victim is not significantly busier than us
   (`their_load <= my_load + LOAD_BALANCE_IMBALANCE_THRESHOLD`).
-- **Idle CPU (`my_load == 0`)** — scan all other CPUs and pull from the
-  heaviest. Scanning is cheap (one Relaxed atomic load per CPU) and
-  guarantees an idle CPU finds work on the first tick that sees an
-  imbalance. Pure random victim selection converges only
+- **Busy CPU, `my_load == 0`** — scan all other CPUs and pull from
+  the heaviest, when its load exceeds `LOAD_BALANCE_IMBALANCE_THRESHOLD`. Scanning is
+  cheap (one Relaxed atomic load per CPU) and guarantees the CPU finds work on the first
+  tick that sees an imbalance. Pure random victim selection converges only
   probabilistically and on small topologies sometimes wastes many ticks
   before picking the busy CPU.
+- **Idle CPU** (running its idle thread, its own queue empty) — the same scan, and a pull
+  whatever the victim's load. A load above `LOAD_BALANCE_IMBALANCE_THRESHOLD` is pulled
+  at once. A smaller backlog, a thread other than the idle thread queued on a CPU
+  (`PerCpuScheduler::has_queued_thread`, a bit of the run-queue mask above the idle
+  queue's), is pulled once it has outlived one tick: the idle CPU records the most-loaded
+  such CPU as its candidate (`PerCpuScheduler::idle_pull_candidate`) and, at its next
+  idle tick, pulls from that CPU if it still has one, else records afresh. A CPU whose
+  queue holds only its idle thread is no backlog. The candidate is cleared after every
+  attempt, when no CPU has a backlog, and on every tick the CPU runs another thread. The
+  scan is `sched::idle_scan` and the decision `sched::idle_pull_step`.
+
+The idle CPU's pull below the threshold is what keeps a thread from starving while a CPU
+idles. A thread queued behind a running thread that never blocks or yields to its level
+(an RT thread spinning on a lock the queued thread holds, under § Scheduling Classes'
+strict priority) stays queued for as long as that thread runs. The threshold does not see
+one queued thread as an imbalance (a load of 2 with the linked idle thread), and
+`select_target_cpu` keeps a woken thread on its preferred CPU at that load. An idle CPU
+therefore pulls it within about two ticks. The rule stays bounded: only an idle CPU pulls
+below the threshold, and a pull leaves it busy, so two busy CPUs never trade threads (the
+steady state the threshold protects); a busy CPU with nothing queued but its idle thread
+draws no attempt; a backlog that clears between two idle ticks stays with the CPU whose
+caches hold it; and a backlog of pinned threads, which no pull can take, draws at most one
+try-lock attempt per idle CPU every two ticks while its load is at or below the threshold
+(above it, one per idle CPU every tick).
 
 Migration goes through `pull_unpinned_ready(src_cpu, dst_cpu)`, which shares the
 validate-then-move core `relocate_ready_thread` with `migrate_ready_thread`:
@@ -495,10 +532,17 @@ deferred to a later tick. Pinned threads (`cpu_affinity != AFFINITY_ANY`)
 are invisible to the `find_runnable` predicate and are never migrated.
 
 Hot-path cost per CPU per tick:
-- Idle CPU: one Relaxed load per remote CPU to find the heaviest victim.
-- Loaded CPU: one Relaxed increment + one Relaxed load for the victim.
-- Scheduler locks are try-acquired, and only when an imbalance above
-  `LOAD_BALANCE_IMBALANCE_THRESHOLD` is observed.
+- Idle CPU: one Relaxed load of its own load, one Relaxed load of the load per remote CPU
+  to find the heaviest victim, one Relaxed load of the run-queue mask per remote CPU whose
+  load is non-zero, one Relaxed load of its own candidate and one of the candidate's
+  run-queue mask, and a Relaxed store of its own candidate, a field only this CPU writes.
+- Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick
+  after an idle one) and one of its own load, plus, with an empty queue, one Relaxed load
+  per remote CPU, or, with queued threads, one Relaxed increment + one Relaxed load for the
+  victim.
+- Scheduler locks are try-acquired: by a busy CPU only when an imbalance above
+  `LOAD_BALANCE_IMBALANCE_THRESHOLD` is observed, and by an idle CPU when the idle rule
+  above decides a pull.
 
 ---
 
@@ -509,8 +553,9 @@ multiple logical CPUs share physical execution resources on the same core.
 
 SMT topology awareness is design intent, not yet implemented
 ([#267](https://github.com/kottlerg/seraph/issues/267)). The kernel records no physical-core
-or sibling topology, and `try_pull_balance` and `select_target_cpu` place threads by per-CPU
-`current_load()` alone. The subsections below describe the intended design.
+or sibling topology, and `try_pull_balance`, `try_pull_idle` and `select_target_cpu` place
+threads by per-CPU `current_load()` and, for the idle pull, the run-queue mask alone. The
+subsections below describe the intended design.
 
 ### Topology Detection
 
@@ -562,7 +607,7 @@ timer_tick():
         sleep_check_wakeups(); watchdog_tick_and_check()
     match tick_outcome(current.slice_remaining):   // PerCpuScheduler::tick_outcome
         Idle:                                 // zero slice: the idle thread
-            try_pull_balance(cpu); return
+            try_pull_idle(cpu); return
         Continue(remaining):
             current.slice_remaining = remaining; reschedule = false
         PreemptForRt(remaining):              // fair current, RT thread queued here
@@ -710,8 +755,9 @@ warmth hint: it scans all CPUs for `min_load`, and if `preferred_cpu`'s
 load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of `min_load`, the
 thread is re-placed on its preferred CPU. Beyond that threshold the
 thread is migrated to the least-loaded CPU. The threshold is the same
-hysteresis the pull balancer uses to decide an imbalance is real, so
-soft affinity, wake placement, and pull balancing share one knob.
+hysteresis a busy CPU's pull uses to decide an imbalance is real, so
+soft affinity, wake placement, and the busy-CPU pull share one knob; an
+idle CPU pulls below it (§ Load Balancing).
 
 Hard affinity (`cpu_affinity != AFFINITY_ANY`) and save-window pinning
 (`context_saved == 0`) both short-circuit ahead of the soft-affinity

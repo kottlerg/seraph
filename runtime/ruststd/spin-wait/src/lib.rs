@@ -11,12 +11,13 @@
 //! A waiter in the strict-priority class runs before every fair thread, and
 //! before every lower-level strict-priority thread, on its CPU
 //! (core/kernel/docs/scheduler.md § Scheduling Classes). Such a waiter that
-//! only spun would never let a holder below it, queued on that CPU, run, and
-//! would wait forever. The sleep blocks the waiter, so the holder gets the
-//! CPU and releases the lock. The spins keep the common case cheap, a holder
-//! that is running on another CPU and releases within a short critical
-//! section. [`Backoff`] decides each step. The acquisition and the sleep
-//! syscall stay with the caller. See
+//! only spun would never let a holder below it, queued on that CPU, run there,
+//! and, with no other CPU idle to pull the holder (that document's § Load
+//! Balancing), would wait forever. The sleep blocks the waiter, so the holder
+//! gets the CPU and releases the lock. The spins keep the common case cheap,
+//! a holder that is running on another CPU and releases within a short
+//! critical section. [`Backoff`] decides each step. The acquisition and the
+//! sleep syscall stay with the caller. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]

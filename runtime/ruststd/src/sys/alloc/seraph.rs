@@ -98,8 +98,9 @@ const CSPACE_FUND_ROUNDS: u32 = 2;
 /// `ruststd-spin-wait` policy decides. A strict-priority waiter runs before
 /// every fair thread and every lower-level strict-priority thread on its CPU
 /// (core/kernel/docs/scheduler.md § Scheduling Classes). Such a waiter that
-/// only spun would never let a holder below it, queued on that CPU, run, and
-/// neither thread would progress.
+/// only spun would never let a holder below it, queued on that CPU, run there,
+/// and, with no other CPU idle to pull the holder (that document's § Load
+/// Balancing), neither thread would progress.
 pub(crate) struct SpinMutex<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,

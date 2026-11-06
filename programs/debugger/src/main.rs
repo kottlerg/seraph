@@ -15,8 +15,10 @@
 //!    pointer against the breakpoint's address, inspects and modifies the
 //!    debuggee's memory while it is stopped, and resumes it past the
 //!    breakpoint;
-//! 2. on x86-64, single-steps the debuggee through three instructions with the
-//!    trap flag, one `FAULT_EXC_DEBUG` each;
+//! 2. single-steps the debuggee through three instructions: on x86-64 with the
+//!    trap flag, one `FAULT_EXC_DEBUG` each; on riscv64 with a `c.ebreak` it
+//!    plants at each successor (`riscv_step`, `THREAD_MEM_TEXT`), one
+//!    `FAULT_EXC_BREAKPOINT` each;
 //! 3. async-breaks the debuggee, now spinning in a loop that makes no syscall,
 //!    with an `UPCALL_ANY_INSTRUCTION` upcall, checks that it computes nothing
 //!    while stopped, writes the flag that ends its loop, and resumes it;
@@ -128,8 +130,9 @@ mod arch
     }
 
     /// Arm a single-step in the breakpoint's register file: set the trap
-    /// flag, so the resumed debuggee traps after each instruction.
-    pub fn arm_step(regs: &mut [u8])
+    /// flag, so the resumed debuggee traps after each instruction. The
+    /// debuggee's memory is left as it is, so `_th` is unused.
+    pub fn arm_step(_th: u64, regs: &mut [u8])
     {
         let flags = super::read_word(regs, syscall_abi::REGS_X86_64_FLAGS_OFFSET);
         super::write_word(
@@ -172,6 +175,8 @@ mod arch
 #[cfg(target_arch = "riscv64")]
 mod arch
 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     pub const IP: usize = syscall_abi::REGS_RISCV64_IP_OFFSET;
 
     /// Bytes the debugger advances the pointer by to resume past the
@@ -182,24 +187,34 @@ mod arch
     /// 4-byte `ebreak` (0x00100073), little-endian.
     pub const BREAKPOINT: [u8; 4] = [0x73, 0x00, 0x10, 0x00];
 
+    /// Where the step's `c.ebreak` is planted, and the two bytes it displaced.
+    static PLANT_AT: AtomicU64 = AtomicU64::new(0);
+    static PLANT_SAVED: AtomicU64 = AtomicU64::new(0);
+
     /// The pointer the breakpoint at `addr` reports.
     pub fn reported(addr: u64) -> u64
     {
         addr
     }
 
-    /// Hit a 4-byte `ebreak`; returns its address.
+    /// Hit a 4-byte `ebreak` followed by three 4-byte `nop`s, the
+    /// instructions [`single_step`] steps; returns the breakpoint's address.
     pub fn breakpoint() -> u64
     {
         let at: u64;
-        // SAFETY: `lla` writes only `at`; the word is `ebreak`, spelled out so
-        // the assembler cannot compress it, and raises a breakpoint and does
-        // nothing else. A resuming debugger returns the thread past it with
-        // its registers as they were.
+        // SAFETY: `lla` writes only `at`; the first word is `ebreak` and the
+        // next three `addi x0, x0, 0` (`nop`), spelled out so the assembler
+        // cannot compress them. `ebreak` raises a breakpoint and the `nop`s do
+        // nothing. A resuming debugger returns the thread past the `ebreak`
+        // with its registers as they were, and restores every byte its steps
+        // planted before the thread runs it, so nothing is clobbered.
         unsafe {
             core::arch::asm!(
                 "lla {at}, 2f",
                 "2: .4byte 0x00100073",
+                ".4byte 0x00000013",
+                ".4byte 0x00000013",
+                ".4byte 0x00000013",
                 at = out(reg) at,
                 options(nostack),
             );
@@ -207,15 +222,89 @@ mod arch
         at
     }
 
-    /// Arm a single-step: nothing to arm. RISC-V has no user-mode single-step
-    /// without a debug trigger, which the kernel does not program
-    /// (docs/fault-handling.md § Debugging; #820), so the register file is
-    /// left as it is.
-    pub fn arm_step(_regs: &mut [u8]) {}
+    /// Plant `c.ebreak` at the successor of the instruction the fault-blocked
+    /// `th` will run next, its register file being `regs`
+    /// (docs/fault-handling.md § Debugging): the successor from
+    /// `riscv_step`, its two bytes saved, the breakpoint written through the
+    /// kernel's text route (`THREAD_MEM_TEXT`).
+    fn plant_successor(th: u64, regs: &[u8])
+    {
+        let pc = super::read_word(regs, IP);
+        let mut insn = [0u8; 4];
+        syscall::thread_read_mem(th, pc, &mut insn).expect("read the debuggee's instruction");
+        let next = riscv_step::successor(pc, u32::from_le_bytes(insn), |n| {
+            super::read_word(
+                regs,
+                syscall_abi::REGS_RISCV64_X1_OFFSET + (n as usize - 1) * 8,
+            )
+        })
+        .expect("the instruction has a successor");
+        let mut saved = [0u8; 2];
+        syscall::thread_read_mem(th, next, &mut saved).expect("save the successor's bytes");
+        // SAFETY: the debuggee shares this program's address space; the two
+        // bytes are instruction bytes of its code, which no Rust object
+        // occupies, and they are restored before the debuggee runs them.
+        unsafe {
+            syscall::thread_write_mem(
+                th,
+                next,
+                &riscv_step::C_EBREAK,
+                syscall_abi::THREAD_MEM_TEXT,
+            )
+        }
+        .expect("plant the step's breakpoint");
+        PLANT_AT.store(next, Ordering::Relaxed);
+        PLANT_SAVED.store(u64::from(u16::from_le_bytes(saved)), Ordering::Relaxed);
+    }
 
-    /// Step 2: no single-step on RISC-V (see [`arm_step`]); the debuggee runs
-    /// on from its breakpoint.
-    pub fn single_step(_ep: u64, _ipc_buf: *mut u64, _th: u64, _reported: u64) {}
+    /// Write back the bytes the planted `c.ebreak` displaced; returns where.
+    fn restore(th: u64) -> u64
+    {
+        let at = PLANT_AT.load(Ordering::Relaxed);
+        // cast_possible_truncation: PLANT_SAVED holds a u16.
+        #[allow(clippy::cast_possible_truncation)]
+        let saved = (PLANT_SAVED.load(Ordering::Relaxed) as u16).to_le_bytes();
+        // SAFETY: as in plant_successor; the bytes written are the original
+        // instruction bytes.
+        unsafe { syscall::thread_write_mem(th, at, &saved, syscall_abi::THREAD_MEM_TEXT) }
+            .expect("restore the debuggee's instruction");
+        at
+    }
+
+    /// Arm a single-step from the breakpoint's register file `regs`: plant
+    /// `c.ebreak` at the successor of the instruction the debuggee resumes
+    /// at. RISC-V has no user-mode single-step without a debug trigger, which
+    /// the kernel does not program, so the debugger steps with breakpoints.
+    pub fn arm_step(th: u64, regs: &mut [u8])
+    {
+        plant_successor(th, regs);
+    }
+
+    /// Step 2: take the planted breakpoint after each of the three `nop`s,
+    /// one `FAULT_EXC_BREAKPOINT` each at the instruction after the stepped
+    /// one, restoring the text and planting the next step's.
+    pub fn single_step(ep: u64, ipc_buf: *mut u64, th: u64, reported: u64)
+    {
+        for k in 1..=3
+        {
+            let ip = super::recv_exception(ep, ipc_buf, syscall_abi::FAULT_EXC_BREAKPOINT);
+            let at = restore(th);
+            assert_eq!(ip, at, "a step stopped away from its breakpoint");
+            assert_eq!(
+                ip,
+                reported + RESUME_ADVANCE + 4 * k,
+                "a step reported the wrong instruction"
+            );
+            if k < 3
+            {
+                let mut regs = [0u8; super::REGS_BYTES];
+                syscall::thread_read_regs(th, &mut regs).expect("read the stepped registers");
+                plant_successor(th, &regs);
+            }
+            super::reply(ipc_buf);
+        }
+        println!("debugger: single-stepped 3 instructions");
+    }
 }
 
 fn main()
@@ -257,15 +346,16 @@ fn main()
     );
     PEEK.store(POKED, Ordering::Release);
     write_word(&mut regs, arch::IP, reported + arch::RESUME_ADVANCE);
-    arch::arm_step(&mut regs);
+    arch::arm_step(th, &mut regs);
     // SAFETY: the frame was read from the debuggee, fault-blocked at its
     // breakpoint; only its instruction pointer (to the next instruction) and,
-    // on x86-64, its trap flag change.
+    // on x86-64, its trap flag change (riscv64 plants its step in the text).
     unsafe { syscall::thread_write_regs(th, &regs) }.expect("write the debuggee's registers");
     reply(ipc_buf);
     println!("debugger: breakpoint reported at {reported:#x}, memory inspected and modified");
 
-    // 2. Single-step (x86-64; nothing on RISC-V).
+    // 2. Single-step: the trap flag on x86-64, a `c.ebreak` at each successor
+    //    on riscv64.
     arch::single_step(ep, ipc_buf, th, reported);
 
     // 3. Async-break of the spinning debuggee.

@@ -50,7 +50,8 @@
 //!   routing assigned it.
 //! - To change IST assignments: change the `ist` argument of that vector's
 //!   `set(vector, stub, ist)` call in `init()` and ensure the matching IST stack
-//!   is configured in the TSS.
+//!   is configured in the TSS. Vector 3 (`#BP`) has no `set` call: `init()`
+//!   installs it directly, with DPL 3, so a user `int3` reaches it.
 
 // cast_possible_truncation: every narrowing cast here is bounded — the IDTR limit
 // (256 * 16 - 1 fits u16), the masked/shifted handler-offset splits in
@@ -547,8 +548,9 @@ pub(super) unsafe extern "C" fn common_exception_handler(
 ///
 /// A userspace exception whose thread has a bound fault handler is redirected to
 /// it ([`redirect_user_exception`]); on a resume reply this returns and the
-/// trampoline's `iretq` re-executes the faulting instruction (or continues from a
-/// handler-modified PC). Every other case — no/declined handler, the
+/// trampoline's `iretq` resumes at the reported pointer: it re-executes a
+/// faulting instruction, continues after a trapping one (`#BP`, `#DB`), or
+/// continues from a handler-modified PC. Every other case — no/declined handler, the
 /// non-restartable abort vectors, or any kernel exception — is handed to the
 /// diverging [`common_exception_handler`], so this returns only on a
 /// resolved-and-resumed userspace fault.
@@ -1756,7 +1758,7 @@ pub unsafe fn init()
     // NMI — IST2. Dedicated stub: distinguishes watchdog backtrace
     // requests from real hardware NMIs (see ipi_nmi_backtrace_handler).
     set(2, ipi_nmi_backtrace_stub, 2);
-    set(3, isr3, 0);
+    // Vector 3 (#BP) is installed below with DPL 3.
     set(4, isr4, 0);
     set(5, isr5, 0);
     set(6, isr6, 0);
@@ -1814,6 +1816,15 @@ pub unsafe fn init()
         let vector = usize::from(super::ioapic::DEVICE_VECTOR_BASE) + i;
         idt[vector] = IdtEntry::new((stubs + i * DEVICE_STUB_STRIDE) as u64, 0, 0);
     }
+
+    // #BP with DPL 3: `int3` checks the gate's DPL against the CPL and raises
+    // #GP(vector * 8 + 2) when it is lower (Intel SDM Vol. 3A § 6.12.1.1), so a
+    // DPL-0 gate would turn a user breakpoint into a protection fault. With DPL
+    // 3 a user `int3` raises #BP, which reaches a fault handler as
+    // `FAULT_EXC_BREAKPOINT` (docs/fault-handling.md § Fault Message). Every
+    // other exception gate keeps DPL 0: the CPU raises those itself, whatever
+    // the gate's DPL, and no user `int n` may reach them.
+    idt[3] = IdtEntry::new(isr3 as *const () as u64, 0, 3);
 
     // Load IDTR.
     let idtr = Idtr {

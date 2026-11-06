@@ -26,6 +26,7 @@ pub mod death_observer_outlives_queue_caps;
 pub mod destroyed_source_interrupts;
 pub mod fair_share_progress;
 pub mod fault_class_bindings;
+pub mod fault_debug;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
 pub mod fault_handler_declines_kills;
@@ -221,6 +222,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::fault_exception_redirect",
         fault_exception_redirect::run(ctx)
     );
+    run_integration_test!("integration::fault_debug", fault_debug::run(ctx));
     run_integration_test!(
         "integration::fault_exception_no_handler_kills",
         fault_exception_no_handler_kills::run(ctx)

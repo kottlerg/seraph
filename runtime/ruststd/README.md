@@ -33,6 +33,9 @@ ruststd/
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
 │                               #   rustc-dep-of-std dep of overlaid std (not re-exported),
 │                               #   and the policy shared/death-set follows for services
+├── spin-wait/                  # `ruststd-spin-wait` crate: pure, host-tested contended-wait
+│   └── src/lib.rs              #   policy of the overlay's spin mutex (spin, then sleep); a
+│                               #   rustc-dep-of-std dep of overlaid std
 ├── patches/                    # upstream library/std patches applied during overlay assembly
 └── src/                        # std PAL overlay, copied into vendored library/std at build time
     ├── os/
@@ -119,6 +122,15 @@ an eager mapping otherwise. On OOM,
 `GlobalAlloc::alloc` returns null and the `alloc` crate aborts through
 `handle_alloc_error`; nothing unwinds. See
 [§ Byte Heap](../../docs/userspace-memory-model.md#byte-heap).
+
+One spin mutex (`SpinMutex`, `src/sys/alloc/seraph.rs`) guards the byte heap.
+The same type guards the object slabs, the page-reservation arena, and the thread reaper's
+tables. A thread that finds it held spins through a bounded number of failed attempts, then
+sleeps between attempts (the `ruststd-spin-wait` crate's `SPIN_ATTEMPTS` and `SLEEP_MS`). The
+sleep lets a holder below the waiter run on the waiter's CPU. A waiter in the strict-priority
+class runs before every fair thread, and before every lower-level strict-priority thread, on its
+CPU ([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md) § Scheduling Classes).
+Such a waiter that only spun would starve a holder below it there and wait forever.
 
 ### Page reservations
 

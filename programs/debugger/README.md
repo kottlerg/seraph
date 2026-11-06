@@ -1,0 +1,74 @@
+# debugger
+
+Test fixture for debugging through the fault and upcall handlers: a debugger thread takes a
+debuggee thread's breakpoint, inspects and modifies its memory, single-steps it on x86-64, and
+breaks into it while it runs.
+
+---
+
+## Role
+
+The fixture's per-program tester, `debugger-tester`, runs it once, and the `usertest`
+orchestrator discovers and runs that tester. The fixture installs at `/programs/debugger` and the
+tester at `/tests/programs/debugger`, per
+[docs/testing.md § Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
+The fixture handles Seraph capabilities directly; the tester uses idiomatic `std` only.
+
+---
+
+## Source Layout
+
+```
+debugger/
+├── Cargo.toml
+├── README.md
+├── src/
+│   └── main.rs            # Debugger and debuggee threads; per-architecture breakpoint
+│                          #   and single-step (a no-op on riscv64)
+└── tester/
+    ├── Cargo.toml
+    └── src/
+        └── main.rs        # Spawns the fixture and checks stdout and exit status
+```
+
+---
+
+## Debugging Under Test
+
+The debuggee is a `std` thread that publishes its own Thread capability
+(`std::os::seraph::thread::current_thread_cap`) and waits until the debugger, the main thread, has
+bound its exception and upcall classes (`FAULT_CLASS_EXCEPTION | FAULT_CLASS_UPCALL`) to an
+endpoint of the debugger's
+([fault-handling.md § Debugging](../../docs/fault-handling.md#debugging)). The debugger then:
+
+1. receives the debuggee's software breakpoint (`int3` on x86-64, a 4-byte `ebreak` on riscv64)
+   as `FAULT_EXC_BREAKPOINT`; checks that the register file's instruction pointer is the one the
+   message reports; reads and rewrites a word of the debuggee's memory while it is stopped; and
+   resumes it past the breakpoint, setting the trap flag on x86-64;
+2. on x86-64, receives one `FAULT_EXC_DEBUG` for each of the three `nop`s after the breakpoint,
+   each reporting the next instruction, and clears the trap flag at the last;
+3. waits for the debuggee to spin in a loop that makes no syscall, async-breaks it with an
+   `UPCALL_ANY_INSTRUCTION` upcall, checks that it does not run while broken in, sets the flag
+   that ends its loop, and resumes it;
+4. checks that the breakpoint's reported pointer matches its address on the architecture (past
+   `int3`, at `ebreak`) and that the debuggee read back the rewritten word, and prints `PASS`.
+
+The tester passes when the fixture prints `PASS` and exits cleanly; a failed step panics the
+fixture, a non-clean exit. riscv64 has no user-mode single-step, so step 2 runs on x86-64 alone.
+
+---
+
+## Relevant Design Documents
+
+| Document | Covers |
+|---|---|
+| [docs/fault-handling.md](../../docs/fault-handling.md) | § Debugging, § Asynchronous Upcalls, § Fault Message |
+| [docs/capability-model.md](../../docs/capability-model.md) | § Thread: the Observe, Control, and Upcall rights |
+| [core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md) | `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_POST_UPCALL` |
+| [docs/testing.md](../../docs/testing.md) | § Per-program tester protocol |
+
+---
+
+## Summarized By
+
+None

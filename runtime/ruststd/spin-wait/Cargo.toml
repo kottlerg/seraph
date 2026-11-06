@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "ruststd-spin-wait"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Dual-mode: a host-tested workspace member AND a `rustc-dep-of-std`
+# dependency of the seraph std overlay. Holds the pure contended-wait policy
+# of the overlay's `SpinMutex` (`runtime/ruststd/src/sys/alloc/seraph.rs`):
+# how many failed acquisitions a waiter spins through before it sleeps, and
+# for how long. The sleep syscall stays with the caller, so the only dep is
+# the build-std core facade, activated under the `rustc-dep-of-std` feature.
+[lib]
+test = true
+doctest = false
+
+[dependencies]
+# When std lists this crate as a dep, build-std activates
+# `rustc-dep-of-std`, so `use core::…` resolves against the build-std
+# core facade. Same pattern as runtime/ruststd/argv-env.
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
+
+[features]
+rustc-dep-of-std = ["rustc-std-workspace-core"]
+
+[lints]
+workspace = true

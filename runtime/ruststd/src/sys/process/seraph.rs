@@ -512,23 +512,17 @@ impl Command {
             return Err(io::Error::other("thread_bind_notification for child failed"));
         }
 
-        // The death observer now lives on the child's Thread object (its TCB),
-        // not on the cap, so the parent's `thread_cap` is dead weight after the
-        // bind. Delete it now: this frees the slot promptly and unlinks this
-        // process's copy from procmgr's `child_thread` derivation subtree (procmgr
-        // `cap_derive`'d the cap then IPC-MOVED it here, preserving the derivation
-        // edge), so procmgr's reap-time `cap_revoke(child_thread)` need not reach
-        // across the CSpace boundary into this process. Retaining it would be safe
-        // regardless: were the reap-revoke to free this slot and a later spawn
+        // The parent keeps `thread_cap`, a derivation of procmgr's `child_thread`
+        // that procmgr IPC-moved here, for `ChildExt::main_thread_cap` (a
+        // debugger reaches the child's registers and memory through it,
+        // docs/fault-handling.md § Debugging). The death observer lives on the
+        // child's Thread object, not on the cap. procmgr's reap-time
+        // `cap_revoke(child_thread)` reaches this copy through the derivation
+        // edge, which keeps it load-bearing for the thread-before-aspace
+        // teardown order; were the revoke to free this slot and a later spawn
         // reuse the index, `Process::drop`'s `cap_delete(self.thread_cap)` would
-        // replay a stale handle, which per-slot generation handles (#349) reject
-        // with `InvalidCapability` instead of tearing down the unrelated new
-        // occupant (the #341 self-teardown / all-idle hang). The early delete is
-        // thus hygiene and defense-in-depth; procmgr's `cap_revoke` stays
-        // load-bearing for the thread-before-aspace teardown order, and the
-        // kernel-side refuse-self-delete guard remains as further defense.
-        let _ = syscall::cap_delete(thread_cap);
-        let thread_cap = 0u64;
+        // replay a stale handle, which per-slot generation handles (#349)
+        // reject with `InvalidCapability` instead of deleting the new occupant.
 
         // For each piped direction, allocate a parent-side `Pipe` end
         // (memory cap + 2 notification caps) and install the corresponding triple
@@ -1017,6 +1011,11 @@ impl Process {
     /// The full process-handle cap (`std::os::seraph::process::ChildExt`).
     pub fn process_handle(&self) -> u64 {
         self.process_handle
+    }
+
+    /// The child's main-thread cap (`std::os::seraph::process::ChildExt`).
+    pub fn main_thread_cap(&self) -> u64 {
+        self.thread_cap
     }
 
     pub fn kill(&mut self) -> io::Result<()> {

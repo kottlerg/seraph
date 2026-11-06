@@ -90,11 +90,13 @@ pub fn quantum_ticks(level: u8) -> u32
 ///
 /// Measured bound (the paint report, `crate::stack_depth`; ktest
 /// `stress::stack_depth` after Tier S), on both architectures: debug builds at
-/// 4, 16 and 128 CPUs peak at 3784 B on a thread stack and 1664 B on an idle
-/// stack (`riscv64`; 3296 B and 1328 B on `x86_64`), and release builds at 4, 16
-/// and 128 CPUs at 4304 B and 2080 B (`riscv64`; 3296 B and 1104 B on `x86_64`),
-/// so the deepest bounds leave margins of about 74% (thread) and 87% (idle). The
-/// report gives the depth, not the path that reached it.
+/// 4, 16 and 128 CPUs peak at 5504 B on a thread stack and 1752 B on an idle
+/// stack (`riscv64`; 4928 B and 1696 B on `x86_64`), and release builds at 4, 16
+/// and 128 CPUs at 5704 B and 1664 B (`riscv64`; 4728 B and 1472 B on `x86_64`),
+/// so the deepest bounds leave margins of about 65% (thread) and 89% (idle). The
+/// thread peak includes the 4 KiB buffer `SYS_THREAD_READ_MEM` and
+/// `SYS_THREAD_WRITE_MEM` stage their bytes in. The report gives the depth, not
+/// the path that reached it.
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's

@@ -101,6 +101,12 @@ the cancel of a blocking syscall, and `SYS_THREAD_SET_UPCALL_MASK`. Its end-to-e
 `deadline` fixture's supervisor, which cancels a spinning worker at a deadline
 ([programs/deadline/README.md](../programs/deadline/README.md)).
 
+A debugger's access to the memory of the address space a thread executes in
+(`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, [Debugging](#debugging)) is implemented on both
+architectures, the instruction-fetch synchronisation of a text write included. Its end-to-end
+consumer is the `debugger` fixture, which debugs a child process
+([programs/debugger/README.md](../programs/debugger/README.md)).
+
 ---
 
 ## Mechanism Overview
@@ -351,7 +357,8 @@ it is not delivered, so a declined upcall is dropped and the thread continues
 A syscall that copies to or from a caller-supplied user buffer can fault on that buffer inside the
 kernel: the buffer lies on a page the pager has not backed (a demand region no access has reached,
 or a page the pager has since reclaimed), or on a page whose mapping forbids the access. The
-restartable syscalls, `SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, and `SYS_THREAD_WRITE_REGS`
+restartable syscalls, `SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`,
+`SYS_THREAD_READ_MEM`, and `SYS_THREAD_WRITE_MEM`
 ([syscalls.md § Restartable Syscalls](../core/kernel/docs/syscalls.md#restartable-syscalls)), take
 the fault path for such a fault:
 
@@ -551,9 +558,10 @@ alone.
 ## Debugging
 
 A debugger is a userspace handler of a thread's exception class. It holds a Thread cap with
-`OBSERVE`, to read the thread's registers, and `CONTROL`, to write them and to bind its handlers.
-An asynchronous break also needs the upcall binding, and `UPCALL` beside `CONTROL` on the cap. The
-kernel adds no debugging interface of its own. The pieces are:
+`OBSERVE`, to read the thread's registers, and `CONTROL`, to write them, to read and write the
+memory of the address space the thread executes in, and to bind its handlers. An asynchronous
+break also needs the upcall binding, and `UPCALL` beside `CONTROL` on the cap. Beyond the memory
+copies, the kernel adds no debugging interface of its own. The pieces are:
 
 - **Breakpoints.** A software breakpoint is `int3` on x86-64 and `ebreak` on RISC-V. It reaches
   the exception handler as `FAULT_KIND_EXCEPTION` with `FAULT_EXC_BREAKPOINT`. The reported
@@ -585,11 +593,32 @@ kernel adds no debugging interface of its own. The pieces are:
 - **No single-step on RISC-V.** RISC-V has no user-mode single-step without a debug trigger. The
   kernel programs none: an instruction-count trigger is not available through the SBI Debug
   Triggers extension on the reference platform.
-- **Registers and memory.** A handler reads and writes a stopped thread's registers with
+- **Registers.** A handler reads and writes a stopped thread's registers with
   `SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` ([Modifying the faulting
-  thread](#modifying-the-faulting-thread)). A debugger thread of the debuggee's own process reaches
-  the debuggee's memory directly while it is stopped. No syscall reads or writes another address
-  space's memory.
+  thread](#modifying-the-faulting-thread)).
+- **Memory.** A debugger reads and writes the memory of the address space a thread executes in
+  with `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`, at most `MAX_THREAD_MEM_COPY` bytes a
+  call, all or nothing, under `CONTROL` on the thread's cap
+  ([syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_THREAD_READ_MEM` (60)). Only pages
+  present in the space are reached: the kernel does not fault a page in for the copy, so a
+  demand-paged page the debuggee has not touched is refused until it has. The calls do not need
+  the thread stopped, since they act on the space and not the thread, but the space's other
+  threads keep running and storing; a debugger stops every thread of the space for a coherent
+  view. A debugger thread of the debuggee's own process can also reach the memory directly.
+- **Text writes.** A software breakpoint is planted by writing `int3` or `ebreak` over an
+  instruction, and removed by writing the instruction back. Text is mapped read-only, so the write
+  takes `THREAD_MEM_TEXT`: the kernel writes the frame through its own mapping and leaves the
+  thread's mapping read-only and executable, so W^X holds for every user mapping. It refuses the
+  write when the page's frame is mapped more than once, since the frame would then be text or data
+  of another mapping, possibly another process's; procmgr's loader gives each process its own image
+  frames ([services/procmgr/README.md](../services/procmgr/README.md) § Responsibilities), so a
+  process's text takes it. A write that reaches an executable page synchronises instruction fetch
+  on every CPU before it returns
+  ([memory-model.md § Instruction-Fetch Coherence](memory-model.md#instruction-fetch-coherence)),
+  so the thread's next fetch of the page sees the new bytes. A thread of the space running while the
+  write lands can execute old or new bytes, or on x86-64 an instruction it fetched before; so the
+  debugger stops the space's other threads around a text write, and resumes the thread it stopped
+  at a breakpoint only after restoring the instruction and moving the pointer back to it.
 - **Asynchronous break.** A debugger stops a running thread with an `UPCALL_ANY_INSTRUCTION`
   upcall ([Asynchronous Upcalls](#asynchronous-upcalls)). The thread is then fault-blocked, with
   its registers readable, at the delivery point the message's data word 2 names: the instruction
@@ -599,10 +628,12 @@ kernel adds no debugging interface of its own. The pieces are:
   and resumes it.
 
 The `debugger` fixture drives the breakpoint, the x86-64 single-step, register and same-process
-memory access, and the asynchronous break end to end
+memory access, and the asynchronous break end to end, then reads and writes a debuggee process's
+memory and plants, takes, and removes a breakpoint in its text
 ([programs/debugger/README.md](../programs/debugger/README.md)). ktest
 `integration::fault_exception_redirect` drives a resume at a handler-written instruction pointer
-after an illegal instruction, and `integration::single_step` steps a `syscall`.
+after an illegal instruction, `integration::single_step` steps a `syscall`, and
+`integration::thread_memory` drives the memory calls' copies, text writes, and refusals.
 
 ---
 

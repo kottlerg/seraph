@@ -50,7 +50,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 mod arch;
 mod bench;
@@ -65,6 +65,12 @@ mod spawn;
 mod stress;
 mod tally;
 mod unit;
+
+/// `SYS_SYSTEM_INFO(InstructionCacheSyncs)` as ktest's entry reads it, before
+/// ktest maps anything: the kernel's instruction-fetch synchronisations of the
+/// boot, its Phase-9 one for ktest's own image among them
+/// (`unit::sysinfo::boot_image_synchronised`).
+pub(crate) static BOOT_ICACHE_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Base of the low scratch band (crate docs § Scratch VAs); ktest's fixed
 /// device mappings end below it.
@@ -420,6 +426,13 @@ extern "C" fn run(info_ptr: u64) -> !
         // Cannot log (serial not initialised yet). Halt immediately.
         halt();
     }
+
+    // Before any mapping of ktest's: the count holds only the boot's syncs.
+    BOOT_ICACHE_SYNCS.store(
+        syscall::system_info(syscall_abi::SystemInfoType::InstructionCacheSyncs as u64)
+            .unwrap_or(0),
+        Ordering::Relaxed,
+    );
 
     // Fund ktest's own CSpace's body arena before the first split or port
     // binding (the I/O-port subdivider and `serial::init` below), and before

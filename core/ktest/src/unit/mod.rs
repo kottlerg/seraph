@@ -669,6 +669,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!("sysinfo::elapsed_us", sysinfo::elapsed_us(ctx));
     run_test!("sysinfo::current_cpu", sysinfo::current_cpu(ctx));
     run_test!("sysinfo::cpu_count_smp", sysinfo::cpu_count_smp(ctx));
+    run_test!(
+        "sysinfo::boot_image_synchronised",
+        sysinfo::boot_image_synchronised(ctx)
+    );
     run_test!("sysinfo::user_va_top", sysinfo::user_va_top(ctx));
     run_test!(
         "sysinfo::stack_high_water_classes",

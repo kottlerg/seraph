@@ -21,9 +21,14 @@
 //!   without `THREAD_MEM_TEXT` and takes one with it, and a text page whose
 //!   frame ktest also maps refuses it;
 //! - `SYS_SYSTEM_INFO(InstructionCacheSyncs)` rises across an executable
-//!   `mem_map`, a `mem_protect` to executable, and the text write, and not
-//!   across a write to a data page (the path-taken check: under QEMU a missing
+//!   `mem_map`, a `mem_protect` to executable (of a read-only page, and of a
+//!   page already executable, the route for code written through a writable
+//!   alias), the text write, and a data write, whose frame could be mapped
+//!   executable elsewhere (the path-taken check: under QEMU a missing
 //!   synchronisation does not fail);
+//! - a device page (an `Mmio` page ktest maps into B) is refused
+//!   (`InvalidAddress`), when the boot hands ktest an `Mmio` of two pages or
+//!   more to carve one from;
 //! - once B is deleted, its thread is `Exited` and both calls refuse it.
 //!
 //! A thread in ktest's own address space reads and writes a ktest static the
@@ -31,11 +36,12 @@
 
 use syscall::{
     MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, cap_create_aspace, cap_create_cspace,
-    cap_create_thread, cap_delete, cap_derive, mem_map, mem_protect, mem_unmap, system_info,
-    thread_read_mem, thread_write_mem,
+    cap_create_thread, cap_delete, cap_derive, mem_map, mem_protect, mem_unmap, mmio_map,
+    mmio_split, system_info, thread_read_mem, thread_write_mem,
 };
 use syscall_abi::{
-    MAX_THREAD_MEM_COPY, RIGHTS_THREAD_OBSERVE, SyscallError, SystemInfoType, THREAD_MEM_TEXT,
+    MAX_THREAD_MEM_COPY, RIGHTS_ALL, RIGHTS_THREAD_OBSERVE, SyscallError, SystemInfoType,
+    THREAD_MEM_TEXT,
 };
 
 use crate::{TestContext, TestResult, spawn};
@@ -59,6 +65,8 @@ const B_SHARED: u64 = 0x4020_0000;
 const B_PROTECT: u64 = 0x4030_0000;
 /// An unmapped VA of B.
 const B_UNMAPPED: u64 = 0x4040_0000;
+/// B's VA of the device page.
+const B_DEVICE: u64 = 0x4050_0000;
 
 /// The bytes ktest stores in the text page, then the bytes the text write
 /// puts in their place; never executed.
@@ -197,7 +205,8 @@ fn other_space(ctx: &TestContext, frames: &mut Frames) -> TestResult
     let result = map_all(ctx, b, [d0, d1, text, shared, protect])
         .and_then(|()| data_copies(th))
         .and_then(|()| refusals(th))
-        .and_then(|()| text_write(th));
+        .and_then(|()| text_write(th))
+        .and_then(|()| device_refused(ctx, b, th));
     let deleted = cap_delete(b).is_ok();
     // B is gone: its thread is Exited and both calls refuse it.
     let mut buf = [0u8; 8];
@@ -291,6 +300,18 @@ fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect]: [u64; 5])
     {
         return Err("integration::thread_memory: a mem_protect to executable did not synchronise");
     }
+    // A protect to executable of a page already executable: the route for
+    // code written through a writable alias of an executable frame.
+    let before = syncs()?;
+    // SAFETY: `b` is an address space this test created, not ktest's own.
+    unsafe { mem_protect(text, b, B_TEXT, 1, MAP_EXECUTABLE) }
+        .map_err(|_| "integration::thread_memory: mem_protect of an executable page failed")?;
+    if syncs()? <= before
+    {
+        return Err(
+            "integration::thread_memory: a mem_protect of an executable page did not synchronise",
+        );
+    }
     Ok(())
 }
 
@@ -329,9 +350,9 @@ fn data_copies(th: u64) -> TestResult
             return Err("integration::thread_memory: straddling write did not land");
         }
     }
-    if syncs()? != before
+    if syncs()? <= before
     {
-        return Err("integration::thread_memory: a data-page write synchronised");
+        return Err("integration::thread_memory: a data-page write did not synchronise");
     }
     Ok(())
 }
@@ -424,5 +445,41 @@ fn text_write(th: u64) -> TestResult
     {
         return Err("integration::thread_memory: a text write to a shared frame was taken");
     }
+    Ok(())
+}
+
+/// A device page of B is refused. ktest carves one page off a copy of the
+/// first `Mmio` of two pages or more it holds (a copy, so no mapping of the
+/// original is withdrawn) and maps it into B; with none, the case is skipped.
+fn device_refused(ctx: &TestContext, b: u64, th: u64) -> TestResult
+{
+    for slot in 1..=u64::from(crate::unit::hw::scan_bound(ctx))
+    {
+        let Ok(copy) = cap_derive(slot, RIGHTS_ALL)
+        else
+        {
+            continue;
+        };
+        let Ok((lo, hi)) = mmio_split(copy, 0x1000)
+        else
+        {
+            cap_delete(copy).ok();
+            continue;
+        };
+        cap_delete(hi).ok();
+        // SAFETY: `b` is an address space this test created, not ktest's own.
+        let mapped = unsafe { mmio_map(b, lo, B_DEVICE, 0) };
+        let mut buf = [0u8; 8];
+        let read = mapped.map(|()| thread_read_mem(th, B_DEVICE, &mut buf));
+        // Deleting the page's cap withdraws its mapping from B.
+        cap_delete(lo).ok();
+        return match read
+        {
+            Err(_) => Err("integration::thread_memory: mmio_map of the device page failed"),
+            Ok(r) if r == Err(err(SyscallError::InvalidAddress)) => Ok(()),
+            Ok(_) => Err("integration::thread_memory: a device page was not refused"),
+        };
+    }
+    crate::log("ktest: integration::thread_memory device case SKIP (no Mmio >= 2 pages)");
     Ok(())
 }

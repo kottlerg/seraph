@@ -67,6 +67,8 @@ members = [
     "programs/fb-charset",
     "programs/deadline",
     "programs/deadline/tester",
+    "programs/debugger",
+    "programs/debugger/tester",
     "programs/fsbench",
     "programs/hello",
     "programs/hello/tester",

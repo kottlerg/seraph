@@ -1167,7 +1167,9 @@ pub const FAULT_EXC_BREAKPOINT: u64 = 2;
 /// (x86-64 `#DB`; a single-step reports the next instruction to execute, and
 /// [`X86_64_RFLAGS_TF`] requests one). No RISC-V mapping: RISC-V has no
 /// user-mode single-step without a debug trigger, which the kernel does not
-/// program.
+/// program; a debugger steps a riscv64 thread with a breakpoint planted at the
+/// successor instead, which arrives as [`FAULT_EXC_BREAKPOINT`]
+/// (`docs/fault-handling.md` § Debugging).
 pub const FAULT_EXC_DEBUG: u64 = 3;
 /// Normalized exception: integer divide error (x86-64 `#DE`). RISC-V has no
 /// hardware divide trap.
@@ -1258,6 +1260,12 @@ pub const REGS_RISCV64_SIZE: usize = 280;
 pub const REGS_RISCV64_IP_OFFSET: usize = 248;
 /// Byte offset of the stack pointer (`sp`, `x2`) in the riscv64 register file.
 pub const REGS_RISCV64_SP_OFFSET: usize = 8;
+/// Byte offset of `x1` (`ra`) in the riscv64 register file: integer register
+/// `xN`, `N` in `1..=31`, sits at this offset plus `(N - 1) * 8` (`x0` is not
+/// stored), so [`REGS_RISCV64_SP_OFFSET`] is that of `x2`. A debugger reads a
+/// branch's or jump's operands here to compute the successor it single-steps
+/// to (`docs/fault-handling.md` § Debugging).
+pub const REGS_RISCV64_X1_OFFSET: usize = 0;
 
 // ── Thread memory (SYS_THREAD_READ_MEM / SYS_THREAD_WRITE_MEM) ──────────────
 

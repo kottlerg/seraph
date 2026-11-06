@@ -2205,6 +2205,222 @@ unsafe fn set_affinity_locked(
     }
 }
 
+/// Whether `[base, base + len)` lies wholly in the user half: it neither wraps
+/// nor reaches `user_va_top`. A kernel-half address must never reach a copy:
+/// the direct-map copy of `AddressSpace::copy_user_bytes` walks only user
+/// tables, and SMAP and SUM gate only user pages for the caller's buffer.
+#[cfg(not(test))]
+fn user_range(base: u64, len: usize) -> bool
+{
+    base.checked_add(len as u64)
+        .is_some_and(|end| end <= crate::mm::user_va_top())
+}
+
+/// A reference on the `AddressSpace` object a thread executes in
+/// (`sched::pin_thread_aspace`), released on drop. Dropped in syscall context
+/// with no lock held, before any park, as a `PinnedCap` is.
+#[cfg(not(test))]
+struct AspacePin(core::ptr::NonNull<crate::cap::object::KernelObjectHeader>);
+
+#[cfg(not(test))]
+impl AspacePin
+{
+    /// Pin the address space of the thread `thread_idx` names in the caller's
+    /// `CSpace`, which must carry `CONTROL`.
+    ///
+    /// # Errors
+    /// - `InvalidCapability`: no current thread, or `thread_idx` names no
+    ///   Thread cap.
+    /// - `InsufficientRights`: the cap lacks `CONTROL`.
+    /// - `InvalidState`: the thread has exited, or has no address space.
+    fn of_thread(thread_idx: u64) -> Result<Self, SyscallError>
+    {
+        use crate::cap::object::ThreadObject;
+        use crate::cap::slot::ThreadRights;
+        use crate::syscall::current_tcb;
+
+        // SAFETY: current_tcb() returns the running thread, set in syscall context.
+        let caller_tcb = unsafe { current_tcb() };
+        if caller_tcb.is_null()
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+        // SAFETY: caller_tcb validated non-null; cspace set at thread creation.
+        let caller_cspace = unsafe { (*caller_tcb).cspace };
+        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+        let thread_slot =
+            unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
+        let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
+        // SAFETY: tag confirmed Thread; thread_slot pins the object.
+        #[allow(clippy::cast_ptr_alignment)]
+        let target_tcb = unsafe { (*obj.as_ptr().cast::<ThreadObject>()).tcb };
+        if target_tcb.is_null()
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+        // SAFETY: target_tcb is valid while thread_slot pins its object; no
+        // lock is held.
+        unsafe { crate::sched::pin_thread_aspace(target_tcb) }
+            .map(Self)
+            .ok_or(SyscallError::InvalidState)
+    }
+
+    /// The pinned address space.
+    fn aspace(&self) -> &crate::mm::address_space::AddressSpace
+    {
+        // cast_ptr_alignment: the header is at offset 0 of the page-aligned
+        // AddressSpaceObject.
+        // SAFETY: the reference self holds keeps the object, and the
+        // AddressSpace its wrapper page holds, allocated.
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            &*(*self
+                .0
+                .as_ptr()
+                .cast::<crate::cap::object::AddressSpaceObject>())
+            .address_space
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for AspacePin
+{
+    fn drop(&mut self)
+    {
+        // SAFETY: of_thread took this reference and nothing else releases
+        // it; the pin is dropped in syscall context with interrupts disabled
+        // and no lock held, release_ref's preconditions.
+        unsafe { crate::cap::object::release_ref(self.0) };
+    }
+}
+
+/// The validated `(target VA, caller buffer, length)` of a thread-memory call.
+///
+/// # Errors
+/// - `InvalidArgument`: `len` is 0 or above `MAX_THREAD_MEM_COPY`.
+/// - `InvalidAddress`: either range is not wholly in the user half, or the
+///   buffer is null.
+#[cfg(not(test))]
+fn thread_mem_args(tf: UserFrame) -> Result<(u64, u64, usize), SyscallError>
+{
+    let va = tf.arg(1);
+    let buf = tf.arg(2);
+    let Ok(len) = usize::try_from(tf.arg(3))
+    else
+    {
+        return Err(SyscallError::InvalidArgument);
+    };
+    if len == 0 || len > syscall::MAX_THREAD_MEM_COPY
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    if buf == 0 || !user_range(va, len) || !user_range(buf, len)
+    {
+        return Err(SyscallError::InvalidAddress);
+    }
+    Ok((va, buf, len))
+}
+
+/// `SYS_THREAD_READ_MEM` (60): copy bytes from a thread's address space into
+/// the caller's buffer.
+///
+/// arg0 = Thread cap index (must have CONTROL).
+/// arg1 = Source VA in the thread's address space.
+/// arg2 = Destination buffer (caller's user VA).
+/// arg3 = Byte count, `1..=MAX_THREAD_MEM_COPY`.
+///
+/// The thread need not be stopped. The bytes are staged in a kernel buffer
+/// under the target space's page-table lock, then copied out. Returns the
+/// count.
+///
+/// # Errors
+/// As in core/kernel/docs/syscalls.md § `SYS_THREAD_READ_MEM` (60), and a
+/// [`RestartableError::Faulted`] copy to the buffer, which re-executes the
+/// whole call on the caller's resume.
+#[cfg(not(test))]
+pub fn sys_thread_read_mem(tf: UserFrame) -> Result<u64, RestartableError>
+{
+    use crate::mm::address_space::UserCopy;
+
+    let (va, buf, len) = thread_mem_args(tf)?;
+    let mut bounce = [0u8; syscall::MAX_THREAD_MEM_COPY];
+    {
+        let pin = AspacePin::of_thread(tf.arg(0))?;
+        // SAFETY: pin keeps the space allocated; [va, va + len) is in the
+        // user half (thread_mem_args); no lock is held.
+        unsafe {
+            pin.aspace()
+                .copy_user_bytes(va, UserCopy::Read(&mut bounce[..len]))
+        }?;
+    }
+    // Nothing before this copy changed anything visible outside the call,
+    // so a fault re-executes it from the start.
+    // SAFETY: bounce holds len initialised bytes; buf is the validated user
+    // destination span.
+    unsafe { crate::uaccess::copy_to_user_restartable(buf, bounce.as_ptr(), len)? };
+    Ok(len as u64)
+}
+
+/// `SYS_THREAD_WRITE_MEM` (61): copy bytes from the caller's buffer into a
+/// thread's address space.
+///
+/// arg0 = Thread cap index (must have CONTROL).
+/// arg1 = Destination VA in the thread's address space.
+/// arg2 = Source buffer (caller's user VA).
+/// arg3 = Byte count, `1..=MAX_THREAD_MEM_COPY`.
+/// arg4 = Flags: `THREAD_MEM_TEXT` permits a page the thread's mapping makes
+///        read-only.
+///
+/// The bytes are copied in from the caller first, then written under the
+/// target space's page-table lock, all or nothing; a write that reached an
+/// executable page synchronises instruction fetch on every CPU before the
+/// call returns (`mm::icache`). Returns 0.
+///
+/// # Errors
+/// As in core/kernel/docs/syscalls.md § `SYS_THREAD_WRITE_MEM` (61), and a
+/// [`RestartableError::Faulted`] copy from the buffer, which re-executes the
+/// whole call on the caller's resume.
+#[cfg(not(test))]
+pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
+{
+    use crate::mm::address_space::UserCopy;
+
+    let (va, buf, len) = thread_mem_args(tf)?;
+    let flags = tf.arg(4);
+    if flags & !syscall::THREAD_MEM_TEXT != 0
+    {
+        return Err(SyscallError::InvalidArgument.into());
+    }
+    let text = flags & syscall::THREAD_MEM_TEXT != 0;
+    let mut bounce = [0u8; syscall::MAX_THREAD_MEM_COPY];
+    // Copy in before the target is touched, so a fault re-executes a call
+    // that has changed nothing.
+    // SAFETY: bounce is valid for len writes; buf is the validated user
+    // source span.
+    unsafe { crate::uaccess::copy_from_user_restartable(bounce.as_mut_ptr(), buf, len)? };
+    let executable = {
+        let pin = AspacePin::of_thread(tf.arg(0))?;
+        // SAFETY: pin keeps the space allocated; [va, va + len) is in the
+        // user half (thread_mem_args); no lock is held.
+        unsafe {
+            pin.aspace().copy_user_bytes(
+                va,
+                UserCopy::Write {
+                    src: &bounce[..len],
+                    text,
+                },
+            )
+        }?
+    };
+    if executable
+    {
+        crate::mm::icache::sync_user_code();
+    }
+    Ok(0)
+}
+
 /// `SYS_THREAD_READ_REGS` (39): read register state of a stopped or fault-blocked
 /// thread.
 ///
@@ -2528,6 +2744,18 @@ pub fn sys_thread_read_regs(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 #[cfg(test)]
 pub fn sys_thread_write_regs(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+#[cfg(test)]
+pub fn sys_thread_read_mem(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+#[cfg(test)]
+pub fn sys_thread_write_mem(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

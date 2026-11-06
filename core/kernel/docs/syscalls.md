@@ -138,7 +138,8 @@ On `ECALL` from U-mode:
 
 ### Restartable Syscalls
 
-`SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, and `SYS_THREAD_WRITE_REGS` are restartable: a fault
+`SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_READ_MEM`, and
+`SYS_THREAD_WRITE_MEM` are restartable: a fault
 of the kernel's copy to or from the caller's buffer is handled as
 [docs/fault-handling.md § Kernel Copies](../../../docs/fault-handling.md#kernel-copies)
 specifies. With a fault handler bound to the caller, the fault is delivered as `FAULT_KIND_VM`
@@ -200,9 +201,11 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  57  SYS_THREAD_INHERIT_FAULT_HANDLER
                                  58  SYS_THREAD_POST_UPCALL
                                  59  SYS_THREAD_SET_UPCALL_MASK
+                                 60  SYS_THREAD_READ_MEM
+                                 61  SYS_THREAD_WRITE_MEM
 ```
 
-**Implementation status.** Every number 0–59 has a handler; unallocated numbers
+**Implementation status.** Every number 0–61 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -1809,6 +1812,94 @@ the user half, or a fault on it that is unhandled; restartable, § Restartable S
 
 ---
 
+### `SYS_THREAD_READ_MEM` (60)
+
+Copy bytes from the address space a thread executes in into a caller-supplied buffer.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `thread_cap` | Thread capability (Control rights) |
+| 1 | `va` | Source address in the thread's address space |
+| 2 | `buf_ptr` | Destination buffer in the caller's address space |
+| 3 | `len` | Byte count, `1..=MAX_THREAD_MEM_COPY` (4096) |
+
+**Return:** `rax`/`a0`: `len` on success; `SyscallError` on failure.
+
+The thread need not be stopped: the copy reads the thread's address space, not the thread, so a
+debugger stops the thread (and the space's other threads) for a view no store of theirs changes
+mid-copy ([docs/fault-handling.md § Debugging](../../../docs/fault-handling.md#debugging)). The
+kernel pins the address space while the thread is not `Exited`, then, under the space's page-table
+lock, checks that every page of `[va, va + len)` is mapped by a 4 KiB user leaf of normal memory and
+copies the range into a buffer on its own stack, all of it or none; the lock keeps an unmap from
+running between the check and the copy. It then copies the buffer to `buf_ptr`. Pages are read
+through the kernel's mapping of their frames, so the thread's own read permission does not gate the
+read (an execute-only page reads). A page that is not present fails the call: the kernel does not
+fault a page in, and the target's pager is not asked. Device memory (an uncacheable mapping, such as
+an `SYS_MMIO_MAP` one) is refused, since its frame need not be RAM the kernel's mapping covers. On
+an error the buffer's contents are unspecified.
+
+**Capability requirement:** `thread_cap` MUST have Control rights. Read access needs `CONTROL`, not
+`OBSERVE`, because the space's memory holds whatever the process keeps, which register state does
+not ([docs/capability-model.md § Thread](../../../docs/capability-model.md#thread)).
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState` (the
+thread has exited, has no address space, or its address space's teardown has begun),
+`InvalidArgument` (`len` 0 or above `MAX_THREAD_MEM_COPY`), `InvalidAddress` (`[va, va + len)` or
+the buffer not wholly in the user half, a null buffer, a page of the range not present, mapped by
+no 4 KiB leaf, or device memory, or a fault on the buffer that is unhandled; restartable,
+§ Restartable Syscalls).
+
+---
+
+### `SYS_THREAD_WRITE_MEM` (61)
+
+Copy bytes from a caller-supplied buffer into the address space a thread executes in.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `thread_cap` | Thread capability (Control rights) |
+| 1 | `va` | Destination address in the thread's address space |
+| 2 | `buf_ptr` | Source buffer in the caller's address space |
+| 3 | `len` | Byte count, `1..=MAX_THREAD_MEM_COPY` (4096) |
+| 4 | `flags` | `THREAD_MEM_TEXT` (bit 0), or 0; every other bit is refused |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+The kernel copies the buffer onto its own stack first, then pins the address space as
+`SYS_THREAD_READ_MEM` does and, under the space's page-table lock, checks every page of
+`[va, va + len)` before it writes any: each MUST be mapped by a 4 KiB user leaf of normal memory,
+and either writable by the thread, or read-only with `THREAD_MEM_TEXT` set and the page's frame
+mapped exactly once across every address space. The write is all or nothing. A read-only page needs
+the flag so that a write to text, such as a software breakpoint, is asked for; and its frame mapped
+once, since a frame mapped elsewhere too may be another process's text or data, which the write
+would change through this thread's capability. procmgr's ELF loader gives each process its own image
+frames ([services/procmgr/README.md](../../../services/procmgr/README.md) § Responsibilities), so
+the text of a process it loads takes the write. The frame is written through the kernel's mapping of
+it; the thread's mapping is not changed, so W^X holds for every user mapping. A write that reached
+an executable page synchronises instruction fetch on every CPU before the call returns
+([memory-model.md § Instruction-Fetch
+Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
+
+A thread of the space that runs during the write may run or read old or new bytes, and on x86-64 a
+thread running on another CPU may run an instruction it had fetched before the write; a debugger
+stops the space's threads around a text write
+([docs/fault-handling.md § Debugging](../../../docs/fault-handling.md#debugging)).
+
+**Capability requirement:** `thread_cap` MUST have Control rights.
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control, or a page is read-only
+and `THREAD_MEM_TEXT` is clear), `InvalidState` (the thread has exited, has no address space, or
+its address space's teardown has begun, or a read-only page's frame is mapped more than once),
+`InvalidArgument` (`len` 0 or above `MAX_THREAD_MEM_COPY`, or an undefined `flags` bit),
+`InvalidAddress` (as for `SYS_THREAD_READ_MEM`; a fault on the buffer is restartable,
+§ Restartable Syscalls).
+
+---
+
 ### `SYS_THREAD_SET_FAULT_HANDLER` (32)
 
 Bind (or clear) the per-thread fault-handler endpoint for the fault classes a mask selects. A
@@ -2726,6 +2817,17 @@ pub enum SystemInfoType
     /// A diagnostic count, read by ktest to check that a teardown returns its
     /// id; it counts every process's `CSpace`s.
     LiveCSpaceCount     = 11,
+
+    /// Number of instruction-fetch synchronisations the kernel has issued
+    /// since boot: one for each `SYS_MEM_MAP` and `SYS_MEM_PROTECT` that makes
+    /// a mapping executable, one for init's segments at boot, and one for each
+    /// `SYS_THREAD_WRITE_MEM` that writes an executable page
+    /// ([docs/memory-model.md](../../../docs/memory-model.md) § Instruction-Fetch
+    /// Coherence). Each is a local `fence.i` and an SBI `remote_fence_i` on
+    /// RISC-V and is counted and does nothing on x86-64. A diagnostic count,
+    /// read by ktest to check that each such path synchronises, since emulation
+    /// does not fail when one does not.
+    InstructionCacheSyncs = 12,
 }
 ```
 
@@ -2885,6 +2987,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
+| `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM` or `SYS_THREAD_WRITE_MEM` copies |
 | `BOOT_PROTOCOL_VERSION` | 19 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and

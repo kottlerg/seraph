@@ -209,6 +209,15 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
     unsafe { (*aso_raw).require_create_donation() }?;
 
+    // An executable mapping may expose bytes stored through a data path
+    // (a loader's writable mapping); instruction fetch must see them before
+    // the first leaf below is installed, after which a thread of the space
+    // may run them (mm::icache).
+    if executable
+    {
+        crate::mm::icache::sync_user_code();
+    }
+
     // ── Mapping loop ──────────────────────────────────────────────────────────
 
     for i in 0..page_count
@@ -487,6 +496,14 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
         let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
         as_obj.address_space
     };
+
+    // Making a page executable may expose bytes stored through its earlier
+    // writable mapping; instruction fetch must see them before the first leaf
+    // below turns executable (mm::icache).
+    if executable
+    {
+        crate::mm::icache::sync_user_code();
+    }
 
     // ── Protect loop ──────────────────────────────────────────────────────────
 

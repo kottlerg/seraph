@@ -1692,6 +1692,15 @@ fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
     }
 }
 
+/// The access a user leaf PTE (from [`translate_user_page`]) grants, or
+/// `None` when it is not valid or not user-accessible: R, W and X as they are,
+/// and `uncacheable` for a PBMT other than PMA (the decoder is
+/// `encoding::user_leaf_flags`).
+pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
+{
+    super::encoding::user_leaf_flags(pte)
+}
+
 /// Classify a userspace page fault at `va` as a spurious stale-TLB fault.
 ///
 /// Walks the *current* (`satp`) page tables for `va` and returns `true` iff

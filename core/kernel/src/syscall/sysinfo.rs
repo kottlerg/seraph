@@ -95,6 +95,13 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         {
             Ok(u64::from(crate::cap::live_cspace_count()))
         }
+        12 =>
+        // InstructionCacheSyncs — instruction-fetch synchronisations since
+        // boot; a count the ABI fixes as a diagnostic
+        // (`SystemInfoType::InstructionCacheSyncs`).
+        {
+            Ok(crate::mm::icache::sync_count())
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }

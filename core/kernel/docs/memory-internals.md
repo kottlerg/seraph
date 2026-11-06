@@ -6,7 +6,7 @@ enforcement, TLB management) are specified in
 [docs/memory-model.md](../../../docs/memory-model.md). This document describes how
 those goals are realised in code.
 
-The memory subsystem comprises six components:
+The memory subsystem comprises seven components:
 
 1. **Buddy allocator** — boot-time physical frame allocation
 2. **Kernel object memory** — objects carved out of Memory capabilities by retype,
@@ -14,9 +14,11 @@ The memory subsystem comprises six components:
 3. **Address space management** — per-process virtual address space objects
 4. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context
    switch with a full-flush fallback, and SMP shootdown
-5. **Kernel stack allocation** — idle stacks from the buddy, every other stack from
+5. **Instruction-fetch synchronisation** — the fence that makes code written through a
+   data path visible to instruction fetch on every CPU
+6. **Kernel stack allocation** — idle stacks from the buddy, every other stack from
    the thread's own slab
-6. **Page table node ownership** — which page-table pages belong to an address
+7. **Page table node ownership** — which page-table pages belong to an address
    space's pool and which the kernel lends
 
 ---
@@ -211,6 +213,14 @@ issuer's later `CAP_INFO_MEMORY_MAPPINGS`, which fences before it reads the coun
 second lookup sees the cleared slot, or the issuer's count sees the pins and then every leaf
 the map installs. The query reads one count per page of the window it names, at most 512 pages
 of the region; a larger region is read window by window.
+
+**Text-write check.** `SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT` writes a page the thread's
+leaf makes read-only only when its frame's count is exactly 1, read under the target space's
+`pt_lock` with the leaf present (`mm::address_space::thread_mem_write_check`). By the invariant,
+a count of 1 means no other user leaf names the frame. The count can exceed the leaves (a
+`SYS_MEM_MAP` pin, or a removal whose lowering waits for its invalidation), so such a write can be
+refused while the frame is, or is about to be, mapped once; it is never taken while another
+mapping exists. An untracked frame counts zero and is refused.
 
 **Storage.** The table is two-level: a chunk table with one pointer per GiB below the top of DRAM,
 allocated from the buddy, each pointer naming a 1 MiB buddy block of 262144 counters. Phase 4 sizes
@@ -499,6 +509,55 @@ below the kernel image base ([initialization.md](initialization.md) § Phase 3: 
 Tables). These are the only valid paths for physical-to-virtual
 conversion. Arbitrary physical addresses must not be accessed by computing offsets from
 kernel image addresses.
+
+---
+
+## Instruction-Fetch Synchronisation (`mm/icache.rs`)
+
+[memory-model.md § Instruction-Fetch Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)
+states the rule; this section records where the kernel applies it and why there.
+`mm::icache::sync_user_code` counts the call and runs the arch hook
+`sync_instruction_fetch` ([arch-interface.md](arch-interface.md)): on RISC-V a local `fence.i`,
+then SBI RFENCE `remote_fence_i` with `hart_mask_base` = -1 (every hart), which returns once each
+hart has run one; on x86-64 nothing. The call sites are:
+
+- `sys_mem_map` with `MAP_EXECUTABLE`, before its mapping loop installs the first leaf;
+- `sys_mem_protect` to executable, before its loop turns the first leaf executable;
+- Phase 9 of initialization, after init's segments are mapped and the PIE rebase has relocated
+  them, before init runs;
+- `sys_thread_write_mem`, after a write that reached an executable page, before the call returns.
+
+The placement is per mapping change, not per store, for these reasons:
+
+- **Every route to executing written bytes passes a call site.** W^X refuses a user leaf that is
+  both writable and executable, so a store through a user mapping never reaches a page while it
+  is executable. Bytes stored through a data path become executable only through a new executable
+  mapping or a protect to executable, and both synchronise. The kernel's own stores to a user
+  frame through the direct map are the zeroing and filling of frames before they are mapped (the
+  same case), the Phase-9 relocation, and `sys_thread_write_mem`, which synchronises itself. A
+  frame freed with stale instruction lines and reused for new code is reached only through a new
+  executable mapping, so frame reuse needs no call of its own.
+- **Before the first leaf, not after the last.** Once a leaf is executable, a thread of the space
+  may fetch through it, so the fence runs first. For `sys_mem_map` the bytes were written before
+  the call through another mapping. For `sys_mem_protect` a store a thread of the same space makes
+  to the page while the protect runs races the protect itself; the result of that race is the
+  process's to order, as it is on hardware with coherent fetch.
+- **Every hart, not the space's.** The fence is broadcast instead of sent to the CPUs in the
+  space's `active_cpus` set: a thread of the space may be dispatched on any hart after the call,
+  and a hart that ran the space earlier may hold stale lines for the frame from its previous use,
+  so a narrower set would need a per-hart record of what each has fetched. The broadcast is paid
+  once per executable mapping call, not per page, and executable mappings are made at image load
+  and by a debugger's text write, not on a hot path.
+- **The cost of the call.** The remote half is a firmware call that waits for every hart. It is
+  made in syscall context with interrupts disabled and no kernel lock held (`sys_thread_write_mem`
+  drops the target space's `pt_lock` and its pin first), so a hart spinning on a kernel lock never
+  waits for the caller. The firmware delivers the request to each hart in M-mode, whatever that
+  hart's S-mode interrupt enable. An SBI error halts the kernel: the call passes no argument a
+  caller supplies, so an error is the firmware's, and code that might run stale must not.
+
+`SYS_SYSTEM_INFO(InstructionCacheSyncs)` reports the count, since under QEMU TCG a missing fence
+does not fail: ktest checks that each call site is taken (`integration::thread_memory` for the
+map, protect, and text-write sites, and `unit::retype`'s stub, which it then runs).
 
 ---
 

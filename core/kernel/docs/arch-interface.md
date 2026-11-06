@@ -353,6 +353,13 @@ pub const CACHES_NOT_PRESENT_ENTRIES: bool;
 /// Whether the kernel's tables map the direct-map address `virt`.
 pub unsafe fn direct_map_page_present(virt: u64) -> bool;
 
+/// The access a user leaf PTE (from `translate_user_page`) grants, as
+/// `PageFlags`, or `None` when it is not present or not user-accessible.
+/// `readable` is always set on x86-64; `uncacheable` is set for a non-default
+/// memory type (PCD or PWT on x86-64, a PBMT other than PMA on RISC-V). The
+/// thread-memory copies (`AddressSpace::copy_user_bytes`) gate on it.
+pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>;
+
 /// Drop this CPU's cached translations of the kernel address `virt` in every
 /// address space: RISC-V `sfence.vma virt, zero`; x86-64 `invlpg` without
 /// tagged TLBs and INVPCID's all-context form (the whole TLB) with them,
@@ -631,8 +638,16 @@ pub unsafe fn load_word_racy(p: *const u64) -> u64;
 /// Verify the platform hardware baseline and refuse unsupported hardware with a
 /// clear diagnostic. Run once in early boot after the console is live. x86-64
 /// checks the CPUID-detectable required features and sets `CR0.WP`; RISC-V probes
-/// for the SBI HSM extension.
+/// for the SBI HSM and RFENCE extensions.
 pub unsafe fn verify_baseline();
+
+/// Make instruction fetch on every CPU see the stores made before the call
+/// (`mm::icache::sync_user_code`, the placements of docs/memory-model.md
+/// § Instruction-Fetch Coherence). RISC-V runs a local `fence.i`, then SBI
+/// RFENCE `remote_fence_i` on every hart, which returns once each has run one,
+/// and halts on a firmware error; x86-64 does nothing, since its instruction
+/// fetch is coherent with stores.
+pub fn sync_instruction_fetch();
 
 /// Install the current CPU's per-CPU data block at `addr`. Call once per CPU
 /// before any per-CPU access.

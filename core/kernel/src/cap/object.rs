@@ -251,6 +251,38 @@ impl KernelObjectHeader
         }
     }
 
+    /// Increment the reference count unless it is zero, for a syscall pin on
+    /// an object reached through a pointer no reference backs: a thread's
+    /// address space, read under the thread's `sched_lock` while the thread
+    /// is not `Exited`, which keeps the object's storage from being freed
+    /// (`sched::pin_thread_aspace`). A count of zero means the object's last
+    /// reference is gone and its teardown has begun or is about to, so the pin
+    /// is refused rather than revive it. The pin is bounded like every syscall
+    /// pin (one per thread in a syscall), so no ceiling check is made.
+    ///
+    /// Returns whether the reference was taken.
+    pub fn inc_ref_if_live(&self) -> bool
+    {
+        let mut cur = self.ref_count.load(Ordering::Relaxed);
+        loop
+        {
+            if cur == 0
+            {
+                return false;
+            }
+            match self.ref_count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
     /// Whether the count has reached [`REF_COUNT_LIMIT`], so a new
     /// userspace-amplifiable reference must be refused.
     pub fn at_ref_limit(&self) -> bool
@@ -1680,6 +1712,24 @@ pub struct AddressSpaceObject
     /// batched capability move's freed source, or an Mmio object's mapping
     /// record), so the free completes off-CPU. Written only by the owning CPU.
     pub deferred_next: *mut KernelObjectHeader,
+}
+
+impl AddressSpaceObject
+{
+    /// The object whose wrapper page holds `aspace`: every `AddressSpace` is
+    /// constructed in place directly after its object, at offset
+    /// `size_of::<AddressSpaceObject>()` of the page (`sys_cap_create_aspace`,
+    /// `boot_retype_aspace`). Pointer arithmetic only; nothing is read.
+    // cast_ptr_alignment: the result is the page-aligned start of the wrapper
+    // page, which the object's alignment divides.
+    #[allow(clippy::cast_ptr_alignment)]
+    pub fn containing(aspace: *mut crate::mm::address_space::AddressSpace) -> *mut Self
+    {
+        aspace
+            .cast::<u8>()
+            .wrapping_sub(core::mem::size_of::<Self>())
+            .cast::<Self>()
+    }
 }
 
 // SAFETY: AddressSpaceObject is accessed only with proper locks.
@@ -5408,6 +5458,22 @@ mod tests
         // A release below the ceiling admits a new reference again.
         assert_eq!(h.dec_ref(), REF_COUNT_LIMIT - 1);
         assert!(h.try_inc_ref().is_ok());
+    }
+
+    // Defect guarded: a pin that revives an object whose last reference is
+    // gone lets SYS_THREAD_READ_MEM walk the page tables of an address space
+    // its teardown is freeing.
+    #[test]
+    fn a_live_pin_refuses_a_released_object_and_counts_a_live_one()
+    {
+        let h = KernelObjectHeader::new(ObjectType::AddressSpace);
+        h.ref_count.store(0, Ordering::Relaxed);
+        assert!(!h.inc_ref_if_live());
+        assert_eq!(h.ref_count.load(Ordering::Relaxed), 0);
+        h.ref_count.store(1, Ordering::Relaxed);
+        assert!(h.inc_ref_if_live());
+        assert_eq!(h.ref_count.load(Ordering::Relaxed), 2);
+        assert_eq!(h.dec_ref(), 1);
     }
 
     /// A model kernel object for the cascade tests: a real header followed by

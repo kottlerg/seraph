@@ -1144,6 +1144,10 @@ nonzero so the explicit path is taken instead of deriving from the cap's rights.
 If `prot_bits` is zero, permissions are derived from the memory cap's rights directly.
 This fails with `WxViolation` if the memory cap has both WRITE and EXECUTE rights.
 
+An executable mapping synchronises instruction fetch on every CPU before its first leaf is
+installed, so bytes written to its frames before the call run as written (see
+[docs/memory-model.md § Instruction-Fetch Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
+
 The mapping may not reach bytes the memory cap has retyped into kernel objects: the range must
 start at or above the cap's retype bump cursor rounded up to a page, the bound `SYS_MEMORY_SPLIT`
 applies to its split offset (see
@@ -1215,6 +1219,11 @@ physical addresses.
 
 W^X is enforced on the new flags. The requested permissions must be a subset of the
 `memory_cap`'s rights, which are re-checked here.
+
+A protect to executable synchronises instruction fetch on every CPU before the first leaf turns
+executable, also when the pages are executable already: a process that wrote code through a
+writable alias of an executable frame makes the code visible this way (see
+[docs/memory-model.md § Instruction-Fetch Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
 
 **Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
@@ -1879,10 +1888,10 @@ once, since a frame mapped elsewhere too may be another process's text or data, 
 would change through this thread's capability. procmgr's ELF loader gives each process its own image
 frames ([services/procmgr/README.md](../../../services/procmgr/README.md) § Responsibilities), so
 the text of a process it loads takes the write. The frame is written through the kernel's mapping of
-it; the thread's mapping is not changed, so W^X holds for every user mapping. A write that reached
-an executable page synchronises instruction fetch on every CPU before the call returns
-([memory-model.md § Instruction-Fetch
-Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
+it; the thread's mapping is not changed, so W^X holds for every user mapping. Every write
+synchronises instruction fetch on every CPU before the call returns, whatever the target's leaves
+grant, since a writable page's frame may be mapped executable elsewhere ([memory-model.md
+§ Instruction-Fetch Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
 
 A thread of the space that runs during the write may run or read old or new bytes, and on x86-64 a
 thread running on another CPU may run an instruction it had fetched before the write; a debugger
@@ -2819,14 +2828,16 @@ pub enum SystemInfoType
     LiveCSpaceCount     = 11,
 
     /// Number of instruction-fetch synchronisations the kernel has issued
-    /// since boot: one for each `SYS_MEM_MAP` and `SYS_MEM_PROTECT` that makes
-    /// a mapping executable, one for init's segments at boot, and one for each
-    /// `SYS_THREAD_WRITE_MEM` that writes an executable page
+    /// since boot, one per call, not per page: one at boot for init's image,
+    /// one for each `SYS_MEM_MAP` that asks for an executable mapping and each
+    /// `SYS_MEM_PROTECT` to executable (counted once the call reaches the
+    /// synchronisation, before it maps or protects, so a call that then fails
+    /// is counted too), and one for each `SYS_THREAD_WRITE_MEM` that writes
     /// ([docs/memory-model.md](../../../docs/memory-model.md) § Instruction-Fetch
-    /// Coherence). Each is a local `fence.i` and an SBI `remote_fence_i` on
-    /// RISC-V and is counted and does nothing on x86-64. A diagnostic count,
-    /// read by ktest to check that each such path synchronises, since emulation
-    /// does not fail when one does not.
+    /// Coherence). Each is a local `fence.i` and then an SBI `remote_fence_i`
+    /// on every hart on RISC-V, and is counted and does nothing on x86-64. A
+    /// diagnostic count, read by ktest to check that each such path
+    /// synchronises, since emulation does not fail when one does not.
     InstructionCacheSyncs = 12,
 }
 ```

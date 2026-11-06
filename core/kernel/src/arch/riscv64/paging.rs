@@ -162,7 +162,9 @@ const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
 const POOLED_TABLE: u64 = 1 << 8;
 /// Svpbmt PBMT field, bits \[62:61\]: 00=PMA (defer to platform memory
 /// attributes), 01=NC (non-cacheable idempotent main memory), 10=IO.
-const PBMT_MASK: u64 = 0b11 << 61;
+const PBMT_MASK: u64 = super::encoding::PTE_PBMT_MASK;
+/// U bit (bit 4): the page is reachable from U-mode.
+const USER: u64 = super::encoding::PTE_USER;
 /// PBMT=IO: non-cacheable, non-idempotent, strongly-ordered (channel 0) —
 /// the device-MMIO memory type, the analogue of x86-64 PCD|PWT (strong UC).
 /// NC (01) is deliberately unused: `PageFlags` carries a single
@@ -775,9 +777,6 @@ fn install_user_leaf(
     flags: crate::mm::paging::PageFlags,
 ) -> crate::mm::paging::MapOutcome
 {
-    // U bit (bit 4) allows user-mode access.
-    const USER: u64 = 1 << 4;
-
     if l0[vpn_index(0, virt)].0 & NAPOT != 0
     {
         demote_napot_64k(l0, virt);
@@ -1543,8 +1542,7 @@ pub unsafe fn protect_user_page(
 ) -> Result<crate::mm::paging::MapOutcome, crate::mm::paging::PagingError>
 {
     use crate::mm::paging::{PagingError, phys_to_virt};
-    // Set USER (U) bit (bit 4) to preserve user accessibility.
-    const USER: u64 = 1 << 4;
+    // USER (U) is set below to preserve user accessibility.
 
     let top = paging_mode().levels() - 1;
     // SAFETY: root_virt is direct-map VA of a valid user root PT (caller
@@ -1671,9 +1669,6 @@ fn map_rights_superset(new: u64, prior: u64) -> bool
 /// as the per-page leaf it stands for.
 fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
 {
-    /// U bit — the page is reachable from U-mode.
-    const USER: u64 = 1 << 4;
-
     if pte & VALID == 0 || pte & USER == 0
     {
         return false;

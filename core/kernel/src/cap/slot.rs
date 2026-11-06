@@ -464,7 +464,9 @@ define_typed_rights! {
     /// Rights-space marker for `Thread` capabilities.
     ThreadCap, ThreadRights, Thread
     {
-        /// May start, stop, and configure the thread.
+        /// May start, stop, and configure the thread, write its registers,
+        /// and read and write the memory of the address space it executes
+        /// in (docs/capability-model.md § Thread).
         CONTROL = syscall::RIGHTS_THREAD_CONTROL;
         /// May read thread register state.
         OBSERVE = syscall::RIGHTS_THREAD_OBSERVE;

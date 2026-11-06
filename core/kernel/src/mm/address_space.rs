@@ -278,18 +278,30 @@ unsafe impl Send for AddressSpace {}
 // death-observer set; active_cpus is atomic.
 unsafe impl Sync for AddressSpace {}
 
+/// Whether a `SYS_THREAD_WRITE_MEM` may write a page the thread's leaf makes
+/// read-only, such as its text: the call's `THREAD_MEM_TEXT` flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextWrite
+{
+    /// `THREAD_MEM_TEXT` set: a read-only page whose frame is mapped once
+    /// takes the write.
+    Permitted,
+    /// `THREAD_MEM_TEXT` clear: a read-only page refuses the write.
+    Refused,
+}
+
 /// The direction and buffer of an [`AddressSpace::copy_user_bytes`].
 pub enum UserCopy<'a>
 {
     /// Read the range into the buffer.
     Read(&'a mut [u8]),
-    /// Write the buffer into the range; `text` is `THREAD_MEM_TEXT`.
+    /// Write the buffer into the range.
     Write
     {
         /// The bytes to write.
         src: &'a [u8],
-        /// Whether a page the leaf makes read-only may be written.
-        text: bool,
+        /// Whether a read-only page may be written.
+        text: TextWrite,
     },
 }
 
@@ -335,8 +347,8 @@ pub fn page_spans(va: u64, len: usize) -> impl Iterator<Item = PageSpan>
     })
 }
 
-/// Whether `SYS_THREAD_WRITE_MEM` may write a page whose leaf is `writable`
-/// or not, with `text` (`THREAD_MEM_TEXT`) as given; `mappings` counts the
+/// Whether `SYS_THREAD_WRITE_MEM` may write a page whose user leaf grants
+/// `leaf`, with `text` as the call's flag gives it; `mappings` counts the
 /// frame's user leaf mappings and is read only for a read-only leaf.
 ///
 /// A writable leaf takes any write, as a store of the thread would. A
@@ -346,19 +358,20 @@ pub fn page_spans(va: u64, len: usize) -> impl Iterator<Item = PageSpan>
 /// thread's capability.
 ///
 /// # Errors
-/// - `InsufficientRights`: the leaf is read-only and `text` is clear.
+/// - `InsufficientRights`: the leaf is read-only and `text` is
+///   [`TextWrite::Refused`].
 /// - `InvalidState`: the leaf is read-only and the frame has another mapping.
 pub fn thread_mem_write_check(
-    writable: bool,
-    text: bool,
+    leaf: crate::mm::paging::PageFlags,
+    text: TextWrite,
     mappings: impl FnOnce() -> u64,
 ) -> Result<(), SyscallError>
 {
-    if writable
+    if leaf.writable
     {
         return Ok(());
     }
-    if !text
+    if text == TextWrite::Refused
     {
         return Err(SyscallError::InsufficientRights);
     }
@@ -1371,10 +1384,11 @@ impl AddressSpace
     /// mapped (and so unfreed) until the copy ends.
     ///
     /// Each page must be mapped by a 4 KiB user leaf of normal memory; a
-    /// write needs the leaf writable, or `text` with the frame mapped once
-    /// ([`thread_mem_write_check`]). The thread's own access rights do not
-    /// gate a read, so an execute-only page reads. Returns whether any page
-    /// is executable, so a write's caller synchronises instruction fetch.
+    /// write needs the leaf writable, or [`TextWrite::Permitted`] with the
+    /// frame mapped once ([`thread_mem_write_check`]). The thread's own access
+    /// rights do not gate a read, so an execute-only page reads. A write's
+    /// caller synchronises instruction fetch afterwards, whatever the leaves
+    /// grant: a writable page's frame may be mapped executable elsewhere.
     ///
     /// # Errors
     /// - `InvalidAddress`: a page is unmapped, mapped by no 4 KiB user leaf,
@@ -1393,19 +1407,18 @@ impl AddressSpace
         &self,
         va: u64,
         mut copy: UserCopy<'_>,
-    ) -> Result<bool, SyscallError>
+    ) -> Result<(), SyscallError>
     {
         use crate::arch::current::paging::{translate_user_page, user_leaf_flags};
 
-        let (len, write, text) = match &copy
+        let (len, write) = match &copy
         {
-            UserCopy::Read(dst) => (dst.len(), false, false),
-            UserCopy::Write { src, text } => (src.len(), true, *text),
+            UserCopy::Read(dst) => (dst.len(), None),
+            UserCopy::Write { src, text } => (src.len(), Some(*text)),
         };
         crate::percpu::preempt_disable();
         self.pt_lock();
         let checked = (|| {
-            let mut executable = false;
             for span in page_spans(va, len)
             {
                 // SAFETY: root_virt is the valid root; pt_lock is held, so no
@@ -1417,15 +1430,14 @@ impl AddressSpace
                 {
                     return Err(SyscallError::InvalidAddress);
                 }
-                if write
+                if let Some(text) = write
                 {
-                    thread_mem_write_check(flags.writable, text, || {
+                    thread_mem_write_check(flags, text, || {
                         crate::mm::frame_map::mappings_in(phys, PAGE_SIZE as u64)
                     })?;
                 }
-                executable |= flags.executable;
             }
-            Ok(executable)
+            Ok(())
         })();
         if checked.is_ok()
         {
@@ -1726,18 +1738,24 @@ mod thread_mem_tests
     #[test]
     fn a_read_only_page_takes_a_write_only_with_text_and_one_mapping()
     {
-        assert!(thread_mem_write_check(true, false, || unreachable!()).is_ok());
+        let leaf = |writable| crate::mm::paging::PageFlags {
+            readable: true,
+            writable,
+            executable: !writable,
+            uncacheable: false,
+        };
+        assert!(thread_mem_write_check(leaf(true), TextWrite::Refused, || unreachable!()).is_ok());
         assert_eq!(
-            thread_mem_write_check(false, false, || 1),
+            thread_mem_write_check(leaf(false), TextWrite::Refused, || 1),
             Err(SyscallError::InsufficientRights)
         );
-        assert!(thread_mem_write_check(false, true, || 1).is_ok());
+        assert!(thread_mem_write_check(leaf(false), TextWrite::Permitted, || 1).is_ok());
         assert_eq!(
-            thread_mem_write_check(false, true, || 2),
+            thread_mem_write_check(leaf(false), TextWrite::Permitted, || 2),
             Err(SyscallError::InvalidState)
         );
         assert_eq!(
-            thread_mem_write_check(false, true, || 0),
+            thread_mem_write_check(leaf(false), TextWrite::Permitted, || 0),
             Err(SyscallError::InvalidState)
         );
     }

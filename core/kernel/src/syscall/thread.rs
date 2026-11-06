@@ -2374,9 +2374,11 @@ pub fn sys_thread_read_mem(tf: UserFrame) -> Result<u64, RestartableError>
 ///        read-only.
 ///
 /// The bytes are copied in from the caller first, then written under the
-/// target space's page-table lock, all or nothing; a write that reached an
-/// executable page synchronises instruction fetch on every CPU before the
-/// call returns (`mm::icache`). Returns 0.
+/// target space's page-table lock, all or nothing. Every successful write
+/// then synchronises instruction fetch on every CPU before the call returns
+/// (`mm::icache`): a written page is executable in the target, or, when
+/// writable there, its frame may be mapped executable elsewhere, which no
+/// leaf of the target shows. Returns 0.
 ///
 /// # Errors
 /// As in core/kernel/docs/syscalls.md § `SYS_THREAD_WRITE_MEM` (61), and a
@@ -2385,7 +2387,7 @@ pub fn sys_thread_read_mem(tf: UserFrame) -> Result<u64, RestartableError>
 #[cfg(not(test))]
 pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
 {
-    use crate::mm::address_space::UserCopy;
+    use crate::mm::address_space::{TextWrite, UserCopy};
 
     let (va, buf, len) = thread_mem_args(tf)?;
     let flags = tf.arg(4);
@@ -2393,14 +2395,21 @@ pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
     {
         return Err(SyscallError::InvalidArgument.into());
     }
-    let text = flags & syscall::THREAD_MEM_TEXT != 0;
+    let text = if flags & syscall::THREAD_MEM_TEXT != 0
+    {
+        TextWrite::Permitted
+    }
+    else
+    {
+        TextWrite::Refused
+    };
     let mut bounce = [0u8; syscall::MAX_THREAD_MEM_COPY];
     // Copy in before the target is touched, so a fault re-executes a call
     // that has changed nothing.
     // SAFETY: bounce is valid for len writes; buf is the validated user
     // source span.
     unsafe { crate::uaccess::copy_from_user_restartable(bounce.as_mut_ptr(), buf, len)? };
-    let executable = {
+    {
         let pin = AspacePin::of_thread(tf.arg(0))?;
         // SAFETY: pin keeps the space allocated; [va, va + len) is in the
         // user half (thread_mem_args); no lock is held.
@@ -2412,12 +2421,10 @@ pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
                     text,
                 },
             )
-        }?
-    };
-    if executable
-    {
-        crate::mm::icache::sync_user_code();
+        }?;
     }
+    // The pin and pt_lock are released: the sync waits for every hart.
+    crate::mm::icache::sync_user_code();
     Ok(0)
 }
 

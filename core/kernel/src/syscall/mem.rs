@@ -101,6 +101,18 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     #[allow(clippy::cast_ptr_alignment)]
     let memory_ref = unsafe { &*(memory_obj_nn.as_ptr().cast::<MemoryObject>()) };
 
+    // The page permissions, decided now so that an executable mapping
+    // synchronises instruction fetch before the Memory object's read lock is
+    // taken (the sync is a firmware call that waits for every hart, made with
+    // no kernel lock held; mm::icache). The bytes it exposes were stored
+    // before this call. A refusal is reported where the checks stood, after
+    // the range checks below.
+    let permissions = map_permissions(prot_bits, memory_slot.rights);
+    if matches!(permissions, Ok((_, true)))
+    {
+        crate::mm::icache::sync_user_code();
+    }
+
     // Read-lock the cap across the validate-and-commit sequence: shrinks of
     // `memory.size` by a concurrent `sys_memory_split` would otherwise race
     // with the bound check below or the mapping loop. RAII guard releases on
@@ -109,7 +121,6 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
 
     let memory_phys = memory_ref.base;
     let memory_size = memory_ref.size;
-    let memory_rights = memory_slot.rights;
 
     // Validate that offset + page_count stays within the Memory cap region.
     let byte_offset = offset_pages
@@ -154,34 +165,7 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Determine page permissions per `core/kernel/docs/syscalls.md`
-    // § `SYS_MEM_MAP` (16), prot_bits.
-    let (writable, executable) = if prot_bits != 0
-    {
-        let w = (prot_bits & syscall::MAP_WRITABLE) != 0;
-        let x = (prot_bits & syscall::MAP_EXECUTABLE) != 0;
-        if w && !memory_rights.contains(MemRights::WRITE.erase())
-        {
-            return Err(SyscallError::InsufficientRights);
-        }
-        if x && !memory_rights.contains(MemRights::EXECUTE.erase())
-        {
-            return Err(SyscallError::InsufficientRights);
-        }
-        (w, x)
-    }
-    else
-    {
-        (
-            memory_rights.contains(MemRights::WRITE.erase()),
-            memory_rights.contains(MemRights::EXECUTE.erase()),
-        )
-    };
-    // W^X (docs/capability-model.md § Memory).
-    if writable && executable
-    {
-        return Err(SyscallError::WxViolation);
-    }
+    let (writable, executable) = permissions?;
     let page_flags = PageFlags {
         readable: true,
         writable,
@@ -209,15 +193,6 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
     unsafe { (*aso_raw).require_create_donation() }?;
 
-    // An executable mapping may expose bytes stored through a data path
-    // (a loader's writable mapping); instruction fetch must see them before
-    // the first leaf below is installed, after which a thread of the space
-    // may run them (mm::icache).
-    if executable
-    {
-        crate::mm::icache::sync_user_code();
-    }
-
     // ── Mapping loop ──────────────────────────────────────────────────────────
 
     for i in 0..page_count
@@ -234,6 +209,51 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
 
     drop(pins);
     Ok(0)
+}
+
+/// The `(writable, executable)` permissions of a `SYS_MEM_MAP` leaf, per
+/// `core/kernel/docs/syscalls.md` § `SYS_MEM_MAP` (16): `prot_bits` when
+/// non-zero, else the Memory cap's own `rights`.
+///
+/// # Errors
+/// - `InsufficientRights`: `prot_bits` asks for write or execute that
+///   `rights` lacks.
+/// - `WxViolation`: the result is both writable and executable
+///   (docs/capability-model.md § Memory).
+#[cfg(not(test))]
+fn map_permissions(
+    prot_bits: u64,
+    rights: crate::cap::slot::Rights,
+) -> Result<(bool, bool), SyscallError>
+{
+    use crate::cap::slot::MemRights;
+
+    let (writable, executable) = if prot_bits != 0
+    {
+        let w = (prot_bits & syscall::MAP_WRITABLE) != 0;
+        let x = (prot_bits & syscall::MAP_EXECUTABLE) != 0;
+        if w && !rights.contains(MemRights::WRITE.erase())
+        {
+            return Err(SyscallError::InsufficientRights);
+        }
+        if x && !rights.contains(MemRights::EXECUTE.erase())
+        {
+            return Err(SyscallError::InsufficientRights);
+        }
+        (w, x)
+    }
+    else
+    {
+        (
+            rights.contains(MemRights::WRITE.erase()),
+            rights.contains(MemRights::EXECUTE.erase()),
+        )
+    };
+    if writable && executable
+    {
+        return Err(SyscallError::WxViolation);
+    }
+    Ok((writable, executable))
 }
 
 /// Frame-map pins over a span of frames, held by `sys_mem_map` from before its
@@ -499,7 +519,10 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Making a page executable may expose bytes stored through its earlier
     // writable mapping; instruction fetch must see them before the first leaf
-    // below turns executable (mm::icache).
+    // below turns executable. A protect to executable synchronises even when
+    // the pages are executable already: it is the route by which a process
+    // that wrote code through a writable alias of an executable frame makes
+    // the code visible (mm::icache). No lock is held here.
     if executable
     {
         crate::mm::icache::sync_user_code();

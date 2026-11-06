@@ -2608,32 +2608,33 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// Release one reference on `obj` that the caller owns, and free the object
 /// if it was the last.
 ///
-/// The release half of a syscall's pin ([`crate::syscall::PinnedCap`]), of
-/// the reference a moved capability's freed source slot held
+/// The release half of a syscall's pin ([`crate::syscall::PinnedCap`]), of the
+/// reference a moved capability's freed source slot held
 /// (`cap::transfer::release_moved_object`), of the slot references a range
 /// split's consumed original and a memory merge's consumed tail held, of a
 /// copy's or derive's unpublished new-slot reference, of the address-space
 /// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`), of
 /// the fault-handler binding a rebind or unbind replaces
 /// (`sys_thread_set_fault_handler` and `sys_thread_inherit_fault_handler`,
-/// through `ipc::fault::release_endpoints`), and of the endpoint pin a fault
-/// delivery holds until before its park (`ipc::fault::fault_dispatch`).
-/// Pins, moves, and mapping records may name an object bound to the running
-/// thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last reference
-/// goes here is queued for this CPU's deferred reclaim (drained at the next
-/// syscall epilogue or idle loop) rather than torn down in place. Every other
-/// type frees in place through [`dealloc_object`], which may take
-/// `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
+/// through `ipc::fault::release_endpoints`), of the endpoint pin a fault
+/// delivery holds until before its park (`ipc::fault::fault_dispatch`), and of
+/// the address-space pin a thread-memory syscall takes on the space a thread
+/// executes in (`sched::pin_thread_aspace`, released when the syscall's
+/// `AspacePin` drops). Pins, moves, and mapping records may name an object
+/// bound to the running thread, so a `Thread`, `CSpace`, or `AddressSpace`
+/// whose last reference goes here is queued for this CPU's deferred reclaim
+/// (drained at the next syscall epilogue or idle loop) rather than torn down in
+/// place. Every other type frees in place through [`dealloc_object`], which may
+/// take `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
 /// `EventQueue`, or an Endpoint, wakes the waiters it drains (the running
 /// thread among them, when it is parked on the object it released), for a
 /// Notification first removes its IRQ bindings and waits out the device-IRQ
 /// deliveries in flight on their lines (`irq::unregister_notification`), for a
-/// Notification or
-/// `EventQueue` waits for the timer's in-flight wakeup batch
-/// (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object
-/// waits for the TLB shootdown or takes the thread registry lock its
-/// withdrawal needs — bounded waits that complete only when no IPC,
-/// scheduler, or sleep-list lock is held; hence the lock preconditions below.
+/// Notification or `EventQueue` waits for the timer's in-flight wakeup batch
+/// (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object waits
+/// for the TLB shootdown or takes the thread registry lock its withdrawal needs
+/// — bounded waits that complete only when no IPC, scheduler, or sleep-list
+/// lock is held; hence the lock preconditions below.
 ///
 /// # Safety
 ///

@@ -535,7 +535,7 @@ Hot-path cost per CPU per tick:
 - Idle CPU: one Relaxed load of the load per remote CPU to find the heaviest victim, one
   Relaxed load of the run-queue mask per remote CPU whose load is non-zero, one Relaxed
   load of its own candidate and one of the candidate's run-queue mask, and a Relaxed store
-  of the candidate when it changes.
+  of its own candidate, a field only this CPU writes.
 - Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick
   after an idle one), plus, with an empty queue, one Relaxed load per remote CPU, or, with
   queued threads, one Relaxed increment + one Relaxed load for the victim.

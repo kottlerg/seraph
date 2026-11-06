@@ -65,10 +65,9 @@
 //! The migration assertion applies only at `cpus <= MIGRATION_GUARD_MAX_CPUS`:
 //! above that the one-hot `u32` CPU witness aliases indices mod 32, and the
 //! oversubscription premise (`2 * NUM_PAIRS ≫ cpus`) is inverted — the threads
-//! spread thin, so a backlog seldom forms or lasts long enough for a pull (a
-//! busy CPU's needs a load past the balancer's imbalance threshold, an idle
-//! CPU's a backlog that outlives one tick), the steal path legitimately may
-//! never arm, and the guard becomes a coin flip. The kernel
+//! spread thin, so a backlog seldom forms or lasts long enough for a pull (the
+//! conditions core/kernel/docs/scheduler.md § Load Balancing sets), the steal
+//! path legitimately may never arm, and the guard becomes a coin flip. The kernel
 //! guards above remain the regression signal at every CPU count; the witness
 //! values are still logged.
 

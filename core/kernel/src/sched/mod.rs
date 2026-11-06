@@ -4799,10 +4799,9 @@ struct IdleScan
     /// one noted had a load of zero.
     heaviest: Option<(usize, u32)>,
     /// The most-loaded CPU noted with a queued thread other than its idle
-    /// thread, and its load, or `None` when none had one. A busy CPU's
-    /// `current_load` counts its idle thread too, which stays linked on its
-    /// idle queue while the CPU runs another thread, so the load alone does not
-    /// tell a backlog.
+    /// thread, and its load, or `None` when none had one: the load alone does
+    /// not tell a backlog, since it counts a linked idle thread
+    /// (core/kernel/docs/scheduler.md § Load Balancing).
     backlogged: Option<(usize, u32)>,
 }
 
@@ -4929,32 +4928,13 @@ unsafe fn idle_scan(this_cpu: usize, cpu_count: usize) -> IdleScan
 }
 
 /// Per-tick load-balance step of a CPU running a thread other than its idle
-/// thread. Runs on that CPU's `timer_tick`.
-///
-/// Hot path cost: 1 Relaxed atomic load (own `current_load`) and one of the
-/// own idle-pull candidate (stored only on the first busy tick after an idle
-/// one), plus either (empty queue) one Relaxed load per remote CPU to find the
-/// heaviest, or (queued threads) 1 Relaxed atomic increment (tick counter) + 1
-/// Relaxed load (random victim). Scheduler locks are attempted only when the
-/// observed imbalance exceeds `LOAD_BALANCE_IMBALANCE_THRESHOLD`, and only
-/// via try-lock — the pull path never queues on a contended lock (see
-/// `pull_unpinned_ready`, #375).
-///
-/// Pull-based, victim-selection mode depends on local load:
-/// - **Queued threads (`my_load > 0`)** sample a pseudo-random victim. This
-///   keeps the hot path cheap and avoids thundering-herd when many CPUs
-///   balance simultaneously.
-/// - **Empty queue (`my_load == 0`)** scan all other CPUs and pull from
-///   the heaviest. Scanning `cpu_count` Relaxed loads is cheap and
-///   guarantees the CPU finds work on the first tick that sees an
-///   imbalance — random sampling alone converges probabilistically and
-///   on small (`cpu_count ≤ 4`) topologies sometimes wastes many ticks
-///   before picking the busy CPU.
-///
-/// An idle CPU balances through [`try_pull_idle`] instead.
-///
-/// Pinned threads (`cpu_affinity != AFFINITY_ANY`) are invisible to the
-/// pull and remain on the pinned CPU.
+/// thread, run from that CPU's `timer_tick`; an idle CPU balances through
+/// [`try_pull_idle`] instead. It clears this CPU's idle-pull candidate, then
+/// picks a victim by its own load (a pseudo-random one when its load is
+/// non-zero, the most-loaded one otherwise) and pulls from it only past the
+/// imbalance threshold, through the try-lock-only `pull_unpinned_ready`
+/// (#375). The modes, their rationale, and their hot-path cost are
+/// core/kernel/docs/scheduler.md § Load Balancing's.
 ///
 /// # Safety
 /// Must be called with no scheduler lock held. Called from `timer_tick`
@@ -7083,7 +7063,13 @@ mod idle_pull_tests
         empty.note(1, 0, || panic!("the mask of an empty CPU is read"));
         assert_eq!(empty, IdleScan::EMPTY);
 
-        let scan = folded(&[(0, 2, true), (1, 3, false), (2, 3, true), (3, 2, true)]);
+        let scan = folded(&[
+            (0, 2, true),
+            (1, 3, false),
+            (2, 3, true),
+            (3, 2, true),
+            (4, 3, true),
+        ]);
         assert_eq!(scan.heaviest, Some((1, 3)));
         assert_eq!(scan.backlogged, Some((2, 3)));
     }

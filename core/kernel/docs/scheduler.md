@@ -532,13 +532,14 @@ deferred to a later tick. Pinned threads (`cpu_affinity != AFFINITY_ANY`)
 are invisible to the `find_runnable` predicate and are never migrated.
 
 Hot-path cost per CPU per tick:
-- Idle CPU: one Relaxed load of the load per remote CPU to find the heaviest victim, one
-  Relaxed load of the run-queue mask per remote CPU whose load is non-zero, one Relaxed
-  load of its own candidate and one of the candidate's run-queue mask, and a Relaxed store
-  of its own candidate, a field only this CPU writes.
+- Idle CPU: one Relaxed load of its own load, one Relaxed load of the load per remote CPU
+  to find the heaviest victim, one Relaxed load of the run-queue mask per remote CPU whose
+  load is non-zero, one Relaxed load of its own candidate and one of the candidate's
+  run-queue mask, and a Relaxed store of its own candidate, a field only this CPU writes.
 - Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick
-  after an idle one), plus, with an empty queue, one Relaxed load per remote CPU, or, with
-  queued threads, one Relaxed increment + one Relaxed load for the victim.
+  after an idle one) and one of its own load, plus, with an empty queue, one Relaxed load
+  per remote CPU, or, with queued threads, one Relaxed increment + one Relaxed load for the
+  victim.
 - Scheduler locks are try-acquired: by a busy CPU only when an imbalance above
   `LOAD_BALANCE_IMBALANCE_THRESHOLD` is observed, and by an idle CPU when the idle rule
   above decides a pull.

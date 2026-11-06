@@ -916,7 +916,10 @@ pub const RIGHTS_MMIO_WRITE: u64 = 1 << 1;
 
 // Thread ──
 
-/// Thread: may start, stop, and configure the thread.
+/// Thread: may start, stop, and configure the thread, write its registers,
+/// and read and write the memory of the address space it executes in
+/// (`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`; docs/capability-model.md
+/// § Thread).
 pub const RIGHTS_THREAD_CONTROL: u64 = 1 << 0;
 
 /// Thread: may read thread register state.
@@ -926,7 +929,8 @@ pub const RIGHTS_THREAD_OBSERVE: u64 = 1 << 1;
 /// with [`UPCALL_ANY_INSTRUCTION`] also needs [`RIGHTS_THREAD_CONTROL`].
 pub const RIGHTS_THREAD_UPCALL: u64 = 1 << 2;
 
-/// Thread: full control (start, stop, configure, observe, post an upcall).
+/// Thread: full control (start, stop, configure, write registers, read and
+/// write the thread's address space, observe, post an upcall).
 pub const RIGHTS_THREAD: u64 = RIGHTS_THREAD_CONTROL | RIGHTS_THREAD_OBSERVE | RIGHTS_THREAD_UPCALL;
 
 // CSpace ──
@@ -1266,8 +1270,9 @@ pub const MAX_THREAD_MEM_COPY: usize = 4096;
 /// mapping does not make writable, such as its text, for a software
 /// breakpoint. The kernel writes through its own mapping of the frame and
 /// refuses a frame mapped more than once (another mapping could be another
-/// process's view of shared text); on RISC-V it then makes instruction fetch
-/// on every hart see the write (`docs/fault-handling.md` § Debugging).
+/// process's view of shared text). Every `SYS_THREAD_WRITE_MEM`, with the flag
+/// or without, then makes instruction fetch on every hart see the write
+/// (`docs/fault-handling.md` § Debugging).
 pub const THREAD_MEM_TEXT: u64 = 1 << 0;
 
 // ── System info ───────────────────────────────────────────────────────────────
@@ -1376,15 +1381,18 @@ pub enum SystemInfoType
     /// with no capability; ktest reads it to check that a teardown returns its
     /// id (core/kernel/docs/syscalls.md § `SYS_SYSTEM_INFO`).
     LiveCSpaceCount = 11,
-    /// Number of instruction-cache synchronisations the kernel has issued
-    /// since boot: one for each executable user mapping `SYS_MEM_MAP` or
-    /// `SYS_MEM_PROTECT` establishes, and for each `SYS_THREAD_WRITE_MEM`
-    /// that writes an executable page. On RISC-V each is a local `fence.i`
-    /// and a remote one on every other hart; on x86-64, whose instruction
-    /// fetch is coherent with stores, each is counted and does nothing. A
-    /// diagnostic count, readable by any process with no capability; ktest
-    /// reads it to check that each such path synchronises
-    /// (core/kernel/docs/syscalls.md § `SYS_SYSTEM_INFO`).
+    /// Number of instruction-fetch synchronisations the kernel has issued
+    /// since boot, one per call, not per page: one at boot for init's image,
+    /// one for each `SYS_MEM_MAP` that asks for an executable mapping and
+    /// each `SYS_MEM_PROTECT` to executable (counted once the call reaches
+    /// the synchronisation, before it maps or protects, so a call that then
+    /// fails is counted too), and one for each `SYS_THREAD_WRITE_MEM` that
+    /// writes. On RISC-V each is a local `fence.i` and then SBI
+    /// `remote_fence_i` on every hart; on x86-64, whose instruction fetch is
+    /// coherent with stores, each is counted and does nothing. A diagnostic
+    /// count, readable by any process with no capability; ktest reads it to
+    /// check that each such path synchronises (core/kernel/docs/syscalls.md
+    /// § `SYS_SYSTEM_INFO`).
     InstructionCacheSyncs = 12,
 }
 

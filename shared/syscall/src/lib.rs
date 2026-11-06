@@ -2516,29 +2516,51 @@ pub unsafe fn thread_write_regs_raw(thread_cap: u64, buf: *const u8, len: usize)
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` (the thread cap
 /// is invalid), `InsufficientRights` (it lacks Control), `InvalidState` (the
-/// thread has exited), `InvalidArgument` (a length of 0 or above
+/// thread has exited, has no address space, or its address space's teardown
+/// has begun), `InvalidArgument` (a length of 0 or above
 /// `MAX_THREAD_MEM_COPY`), or `InvalidAddress` (either range is not wholly in
 /// the user half, a page of the target range is unmapped or device memory,
 /// or a fault on `buf` is unhandled: the call is restartable, as
 /// [`thread_read_regs`] states).
-// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
-#[allow(clippy::cast_sign_loss)]
 #[inline]
 pub fn thread_read_mem(thread_cap: u64, va: u64, buf: &mut [u8]) -> Result<u64, i64>
 {
-    // SAFETY: syscall4 issues the raw syscall. `buf` is a live, exclusively
-    // borrowed slice, so the kernel's writes of `buf.len()` bytes land in
-    // memory no other Rust reference names, and any byte value is a valid
-    // `u8`; the call changes no mapping, IPC page, or thread entry state.
-    let ret = unsafe {
-        syscall4(
-            SYS_THREAD_READ_MEM,
-            thread_cap,
-            va,
-            buf.as_mut_ptr() as u64,
-            buf.len() as u64,
-        )
-    };
+    // SAFETY: `buf` is a live, exclusively borrowed slice, so the kernel's
+    // writes of `buf.len()` bytes land in memory no other Rust reference
+    // names, and any byte value is a valid `u8`.
+    unsafe { thread_read_mem_raw(thread_cap, va, buf.as_mut_ptr(), buf.len()) }
+}
+
+/// Raw `SYS_THREAD_READ_MEM`: the kernel writes `len` bytes read at `va` in
+/// the thread's address space through `buf`.
+///
+/// The call is restartable: a fault on the span at `buf` is delivered to the
+/// calling thread's fault handler, when one is bound, and the call
+/// re-executes on its resume (`core/kernel/docs/syscalls.md` § Restartable
+/// Syscalls).
+///
+/// # Safety
+/// The span at `buf` holds no Rust object the kernel's writes could disturb,
+/// and any byte value is valid wherever the caller later reads it. It need not
+/// be mapped: an unmapped span is backed by the caller's fault handler or
+/// refused.
+///
+/// # Errors
+/// As [`thread_read_mem`].
+// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub unsafe fn thread_read_mem_raw(
+    thread_cap: u64,
+    va: u64,
+    buf: *mut u8,
+    len: usize,
+) -> Result<u64, i64>
+{
+    // SAFETY: syscall4 issues the raw syscall; the caller's contract covers
+    // the kernel's writes through `buf`. The call changes no mapping, IPC
+    // page, or thread entry state.
+    let ret = unsafe { syscall4(SYS_THREAD_READ_MEM, thread_cap, va, buf as u64, len as u64) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
@@ -2547,11 +2569,10 @@ pub fn thread_read_mem(thread_cap: u64, va: u64, buf: &mut [u8]) -> Result<u64, 
 /// `1..=MAX_THREAD_MEM_COPY`, and every page of the range mapped and normal
 /// memory. A page the thread's mapping makes read-only, such as its text,
 /// takes the write only with `flags` = `THREAD_MEM_TEXT`, and only when its
-/// frame is mapped nowhere else. A write that reaches an executable page is
-/// visible to instruction fetch on every CPU when the call returns; another
-/// thread of the space that runs during the write may run old or new bytes,
-/// so a debugger stops the space's threads around it
-/// (`docs/fault-handling.md` § Debugging).
+/// frame is mapped nowhere else. The written bytes are visible to instruction
+/// fetch on every CPU when the call returns; another thread of the space that
+/// runs during the write may run old or new bytes, so a debugger stops the
+/// space's threads around it (`docs/fault-handling.md` § Debugging).
 ///
 /// # Safety
 /// When the thread executes in the calling program's own address space, the
@@ -2562,22 +2583,52 @@ pub fn thread_read_mem(thread_cap: u64, va: u64, buf: &mut [u8]) -> Result<u64, 
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability`,
 /// `InsufficientRights`, `InvalidArgument` (also an undefined `flags` bit),
-/// and `InvalidAddress` as [`thread_read_mem`]; `InsufficientRights` also for
-/// a read-only page without `THREAD_MEM_TEXT`; `InvalidState` when the thread
-/// has exited, or a read-only page's frame is mapped more than once.
+/// `InvalidState`, and `InvalidAddress` as [`thread_read_mem`];
+/// `InsufficientRights` also for a read-only page without `THREAD_MEM_TEXT`;
+/// `InvalidState` also when a read-only page's frame is mapped more than
+/// once.
 #[inline]
 pub unsafe fn thread_write_mem(thread_cap: u64, va: u64, buf: &[u8], flags: u64)
 -> Result<(), i64>
 {
-    // SAFETY: syscall5 issues the raw syscall; the kernel only reads `buf`, a
-    // live slice; the caller's contract covers a write into its own space.
+    // SAFETY: the kernel only reads `buf`, a live slice; the caller's contract
+    // covers a write into its own space.
+    unsafe { thread_write_mem_raw(thread_cap, va, buf.as_ptr(), buf.len(), flags) }
+}
+
+/// Raw `SYS_THREAD_WRITE_MEM`: the kernel reads `len` bytes through `buf` and
+/// writes them at `va` in the thread's address space.
+///
+/// The call is restartable: a fault on the span at `buf` is delivered to the
+/// calling thread's fault handler, when one is bound, and the call
+/// re-executes on its resume (`core/kernel/docs/syscalls.md` § Restartable
+/// Syscalls).
+///
+/// # Safety
+/// The contract of [`thread_write_mem`]. The span at `buf` need not be
+/// mapped: an unmapped span is backed by the caller's fault handler or
+/// refused.
+///
+/// # Errors
+/// As [`thread_write_mem`].
+#[inline]
+pub unsafe fn thread_write_mem_raw(
+    thread_cap: u64,
+    va: u64,
+    buf: *const u8,
+    len: usize,
+    flags: u64,
+) -> Result<(), i64>
+{
+    // SAFETY: syscall5 issues the raw syscall; the kernel only reads through
+    // `buf`, and the caller's contract covers the write into the target.
     let ret = unsafe {
         syscall5(
             SYS_THREAD_WRITE_MEM,
             thread_cap,
             va,
-            buf.as_ptr() as u64,
-            buf.len() as u64,
+            buf as u64,
+            len as u64,
             flags,
         )
     };

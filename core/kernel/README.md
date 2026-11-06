@@ -75,6 +75,7 @@ core/kernel/
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)
 │   │   ├── frame_map.rs        # Per-frame user-mapping counts (the retype/map boundary)
+│   │   ├── icache.rs           # Instruction-fetch sync for user code written through data paths
 │   │   ├── paging.rs           # Phase 3 kernel page tables and the direct physical map
 │   │   ├── address_space.rs    # Virtual address space objects and lifecycle
 │   │   ├── init.rs             # Boot memory-map parsing; seeds the buddy allocator
@@ -167,7 +168,9 @@ kernel's fixed reserves and is drained into userspace Memory capabilities at the
 handoff, after which kernel objects are carved from those capabilities by retype
 (`cap/retype.rs`). The `address_space` module manages per-process virtual address space
 objects. The frame map table (`frame_map.rs`) counts the user mappings of every frame of RAM so
-a retype never carves a mapped page. See [`docs/memory-internals.md`](docs/memory-internals.md).
+a retype never carves a mapped page. `icache.rs` makes code written through a data path visible to
+instruction fetch on every CPU before it can run. See
+[`docs/memory-internals.md`](docs/memory-internals.md).
 
 ### `cap/`
 

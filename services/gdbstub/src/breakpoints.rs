@@ -35,7 +35,9 @@ pub fn instruction(arch: Arch, kind: u64) -> Option<&'static [u8]>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Breakpoint
 {
+    /// The address the breakpoint instruction is planted at.
     pub addr: u64,
+    /// The breakpoint instruction's length, and the count of saved bytes.
     pub len: usize,
     /// The bytes the breakpoint replaced.
     pub saved: [u8; MAX_BREAKPOINT_BYTES],

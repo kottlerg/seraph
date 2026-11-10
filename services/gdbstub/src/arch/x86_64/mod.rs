@@ -7,6 +7,8 @@
 //! thread then takes `#DB` after one instruction, delivered as
 //! `FAULT_EXC_DEBUG`.
 
+use gdbstub::StepError;
+
 /// What a step left in the stepped thread to undo when its stop arrives:
 /// the trap flag, cleared then.
 #[derive(Clone, Copy, Debug)]
@@ -14,6 +16,10 @@ pub struct StepUndo;
 
 /// The target description the stub serves.
 pub const ARCH: gdb_rsp::target::Arch = gdb_rsp::target::Arch::X86_64;
+
+/// How far past a software breakpoint the reported pointer lies: `#BP` is a
+/// trap, so the pointer is the instruction after the one-byte `int3`.
+pub const BREAKPOINT_PC_ADVANCE: u64 = 1;
 
 /// Prepare the stopped thread `thread`, whose register file is `regs`, to
 /// run one instruction: set the trap flag. The caller writes `regs` back.
@@ -23,7 +29,7 @@ pub const ARCH: gdb_rsp::target::Arch = gdb_rsp::target::Arch::X86_64;
 // unnecessary_wraps: the arch-dispatch signature is shared with riscv64,
 // whose decoder refuses some instructions.
 #[allow(clippy::unnecessary_wraps)]
-pub fn prepare_step(_thread: u64, regs: &mut [u8]) -> Result<StepUndo, ()>
+pub fn prepare_step(_thread: u64, regs: &mut [u8]) -> Result<StepUndo, StepError>
 {
     update_flags(regs, |f| f | syscall_abi::X86_64_RFLAGS_TF);
     Ok(StepUndo)

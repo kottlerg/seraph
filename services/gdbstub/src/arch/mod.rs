@@ -5,13 +5,18 @@
 
 //! Architecture dispatch: the target description and the single-step
 //! route of each architecture (docs/fault-handling.md § Debugging).
+//!
+//! One module per architecture, selected here by `target_arch` (the
+//! arch-module declaration site, per docs/coding-standards.md § C). Each
+//! exposes the same items: `ARCH`, `BREAKPOINT_PC_ADVANCE`, `StepUndo`,
+//! `prepare_step`, and `finish_step`.
+
+#[cfg(target_arch = "x86_64")]
+#[path = "x86_64/mod.rs"]
+mod current;
 
 #[cfg(target_arch = "riscv64")]
-pub mod riscv64;
-#[cfg(target_arch = "x86_64")]
-pub mod x86_64;
+#[path = "riscv64/mod.rs"]
+mod current;
 
-#[cfg(target_arch = "riscv64")]
-pub use riscv64 as current;
-#[cfg(target_arch = "x86_64")]
-pub use x86_64 as current;
+pub use current::{ARCH, BREAKPOINT_PC_ADVANCE, StepUndo, finish_step, prepare_step};

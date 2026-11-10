@@ -16,12 +16,13 @@ mod arch;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-use arch::current::{ARCH, StepUndo};
+use arch::{ARCH, BREAKPOINT_PC_ADVANCE, StepUndo};
 use gdb_rsp::PACKET_SIZE;
-use gdb_rsp::command::{BreakpointType, Command, Resume, ThreadId, ThreadOp, VContActions};
+use gdb_rsp::command::{BreakpointType, Command, ThreadId, ThreadOp, VContActions};
 use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
 use gdb_rsp::target::TARGET_XML_ANNEX;
 use gdbstub::breakpoints::{self, Breakpoints};
+use gdbstub::control::{self, Credit, Plan};
 use gdbstub::{regs, signal, stop_signal};
 use ipc::{
     IpcMessage, devmgr_errors, devmgr_labels, procmgr_errors, procmgr_labels, serial_errors,
@@ -38,13 +39,28 @@ const READY_MARKER: &str = "attached; serving the debug port";
 /// listed past it run unbound and unlisted.
 const MAX_THREADS: usize = 32;
 
-/// How long, and how often, the stub looks for its target in procmgr's
-/// process list before it serves the port detached.
+/// How long, and how often, the stub looks for the debug port, and for its
+/// target in procmgr's process list at startup before it serves the port
+/// detached.
 const FIND_ATTEMPTS: u32 = 600;
 const FIND_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How many times a `qSupported` that finds the stub detached looks for the
+/// target, [`FIND_INTERVAL`] apart: 5 s, well inside the 30 s remote timeout
+/// of the GDB command line xtask prints.
+const REATTACH_ATTEMPTS: u32 = 50;
+
 /// How long an all-stop waits for every thread's upcall to arrive.
 const STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a detach keeps answering stops that arrive after it, until no
+/// stop has come for [`DRAIN_QUIET`].
+const DRAIN_WAIT: Duration = Duration::from_millis(500);
+const DRAIN_QUIET: Duration = Duration::from_millis(50);
+
+/// How many times a thread-list refresh is tried when a thread of the old
+/// list exits during it.
+const REFRESH_TRIES: u32 = 3;
 
 /// How long the serve loop waits for the port between looks at the threads'
 /// events, in milliseconds.
@@ -52,12 +68,6 @@ const POLL_MS: u64 = 10;
 
 /// The most bytes one serial-protocol message carries.
 const MAX_MESSAGE_BYTES: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
-
-/// The badge a target thread's bindings carry: a verb bit (bit 62, which no
-/// process badge carries) with the thread's index plus one, and bit 63
-/// clear, so it is neither the target's process badge nor a crash badge, as
-/// procmgr requires of a debugger's binding (§ `REGISTER_THREAD`).
-const THREAD_BADGE_TAG: u64 = 1 << 62;
 
 fn main()
 {
@@ -123,6 +133,7 @@ fn main()
         debug,
         self_thread: info.self_thread,
         endpoint,
+        ipc_buf,
         events,
         events_tx,
         receivers: Vec::new(),
@@ -132,7 +143,7 @@ fn main()
         running: false,
         stepping: None,
     };
-    stub.attach(ipc_buf);
+    stub.attach(FIND_ATTEMPTS);
     stub.serve(ipc_buf);
 }
 
@@ -252,6 +263,8 @@ struct Stop
     kind: u64,
     /// Data word 1: the exception class, or the upcall's cookie.
     detail: u64,
+    /// Data word 3: the thread's instruction pointer.
+    ip: u64,
 }
 
 /// Start receiver `id` on `endpoint`: each message it takes goes to the
@@ -278,6 +291,7 @@ fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Send
                     badge: msg.badge,
                     kind: msg.word(0),
                     detail: msg.word(1),
+                    ip: msg.word(3),
                 };
                 if events.send(stop).is_err()
                 {
@@ -298,15 +312,32 @@ fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Send
 
 // ── The target ───────────────────────────────────────────────────────────────
 
-/// One thread of the target.
+/// One thread of the target, at the index of procmgr's thread list it was
+/// listed at.
 struct Thread
 {
     /// The attach's cap, with `OBSERVE`, `CONTROL`, and `UPCALL`.
     cap: u64,
+    /// The thread's classes are bound to the stub's endpoint under
+    /// `control::thread_badge` of its index; an unbound thread (its bind
+    /// failed) keeps its place, so later indices stay in step with
+    /// procmgr's list, and is not shown to GDB.
+    bound: bool,
     /// The receiver holding the thread's stop, while it is stopped.
     held: Option<Stop>,
+    /// An all-stop has posted the thread an upcall it has not taken yet.
+    posted: bool,
     /// The thread has exited.
     gone: bool,
+}
+
+impl Thread
+{
+    /// The thread is bound and has not exited: GDB sees it.
+    fn live(&self) -> bool
+    {
+        self.bound && !self.gone
+    }
 }
 
 /// The attached process.
@@ -315,6 +346,10 @@ struct Target
     badge: u64,
     bias: u64,
     threads: Vec<Thread>,
+    /// The table holds every thread procmgr listed, so a refresh can page on
+    /// from the count of threads still alive; `false` once [`MAX_THREADS`]
+    /// cut the list short.
+    complete: bool,
 }
 
 /// A step in flight: the stepped thread and what to undo at its stop.
@@ -338,6 +373,8 @@ struct Stub
     debug: u64,
     self_thread: u64,
     endpoint: u64,
+    /// The main thread's IPC buffer, on which every call of the stub is made.
+    ipc_buf: *mut u64,
     events: Receiver<Stop>,
     events_tx: Sender<Stop>,
     /// Each receiver's reply channel.
@@ -353,20 +390,26 @@ struct Stub
 
 impl Stub
 {
-    /// Find the target by name and attach to it, stopping every thread. With
-    /// no such process the stub serves the port detached, and attaches again
-    /// at GDB's next connection.
-    fn attach(&mut self, ipc_buf: *mut u64)
+    /// Find the target by name, looking `attempts` times, and attach to it,
+    /// stopping every thread. With no such process the stub serves the port
+    /// detached, and attaches again at GDB's next connection.
+    fn attach(&mut self, attempts: u32)
     {
+        // A stop left over from an earlier session is answered, not taken
+        // for one of this attach's.
+        self.drain_events(Duration::ZERO);
         let mut badge = None;
-        for _ in 0..FIND_ATTEMPTS
+        for i in 0..attempts
         {
-            badge = find_process(self.debug, self.name.as_bytes(), ipc_buf);
+            badge = find_process(self.debug, self.name.as_bytes(), self.ipc_buf);
             if badge.is_some()
             {
                 break;
             }
-            std::thread::sleep(FIND_INTERVAL);
+            if i + 1 < attempts
+            {
+                std::thread::sleep(FIND_INTERVAL);
+            }
         }
         let Some(badge) = badge
         else
@@ -374,34 +417,123 @@ impl Stub
             std::os::seraph::log!("no process named {} to attach to", self.name);
             return;
         };
-        let Some((bias, caps)) = attach_process(self.debug, badge, self.self_thread, ipc_buf)
+        let watch = Some(self.self_thread);
+        let Some(page) = attach_process(self.debug, badge, 0, watch, MAX_THREADS, self.ipc_buf)
         else
         {
             std::os::seraph::log!("attach to {} refused", self.name);
             return;
         };
-        let mut threads = Vec::new();
-        for (i, cap) in caps.into_iter().enumerate()
-        {
-            if !self.ensure_receiver(i) || !bind_thread(self.endpoint, cap, i)
-            {
-                let _ = syscall::cap_delete(cap);
-                continue;
-            }
-            threads.push(Thread {
-                cap,
-                held: None,
-                gone: false,
-            });
-        }
         self.target = Some(Target {
             badge,
-            bias,
-            threads,
+            bias: page.bias,
+            threads: Vec::new(),
+            complete: page.complete,
         });
+        for cap in page.caps
+        {
+            self.add_thread(cap);
+        }
         self.current = 0;
         self.stop_all();
         std::os::seraph::log!("{READY_MARKER} ({})", self.name);
+    }
+
+    /// Append `cap` to the thread table, binding it under the index it is
+    /// stored at.
+    fn add_thread(&mut self, cap: u64)
+    {
+        let Some(index) = self.target.as_ref().map(|t| t.threads.len())
+        else
+        {
+            let _ = syscall::cap_delete(cap);
+            return;
+        };
+        let bound = self.ensure_receiver(index) && bind_thread(self.endpoint, cap, index);
+        if let Some(target) = &mut self.target
+        {
+            target.threads.push(Thread {
+                cap,
+                bound,
+                held: None,
+                posted: false,
+                gone: !bound && !thread_alive(cap),
+            });
+        }
+    }
+
+    /// Take the threads the target registered since the attach from
+    /// procmgr's list and bind them, so their stops stop arriving under the
+    /// badge of the thread that spawned them: a bind made while such a
+    /// thread's stop is in flight cancels that delivery and delivers it
+    /// again under the new badge (docs/fault-handling.md § Delivery, Resume,
+    /// and Kill, Rebind). procmgr lists the threads still alive in the
+    /// order it listed them before, then the new ones, so the new ones start
+    /// at the count of the table's threads still alive. Returns whether a
+    /// thread was added.
+    fn refresh(&mut self) -> bool
+    {
+        let Some(target) = &mut self.target
+        else
+        {
+            return false;
+        };
+        if !target.complete
+        {
+            return false;
+        }
+        let badge = target.badge;
+        for _ in 0..REFRESH_TRIES
+        {
+            let alive = self.alive_count();
+            let room =
+                MAX_THREADS.saturating_sub(self.target.as_ref().map_or(0, |t| t.threads.len()));
+            let Some(page) =
+                attach_process(self.debug, badge, alive as u64, None, room, self.ipc_buf)
+            else
+            {
+                return false;
+            };
+            // A thread of the table that exited during the call shifted
+            // procmgr's list under the page: take it again.
+            if self.alive_count() != alive || page.count < alive as u64
+            {
+                for cap in page.caps
+                {
+                    let _ = syscall::cap_delete(cap);
+                }
+                continue;
+            }
+            let added = !page.caps.is_empty();
+            if let Some(target) = &mut self.target
+            {
+                target.complete = page.complete;
+            }
+            for cap in page.caps
+            {
+                self.add_thread(cap);
+            }
+            return added;
+        }
+        false
+    }
+
+    /// Mark the table's exited threads gone; returns how many are alive.
+    fn alive_count(&mut self) -> usize
+    {
+        let Some(target) = &mut self.target
+        else
+        {
+            return 0;
+        };
+        for t in &mut target.threads
+        {
+            if !t.gone && !thread_alive(t.cap)
+            {
+                t.gone = true;
+            }
+        }
+        target.threads.iter().filter(|t| !t.gone).count()
     }
 
     /// Start receiver `index` when it is not running yet.
@@ -419,66 +551,186 @@ impl Stub
     }
 
     /// Stop every running thread of the target with an upcall and wait,
-    /// bounded, for each stop to arrive.
+    /// bounded by [`STOP_WAIT`], for each stop to arrive; then finish a step
+    /// still in flight. A breakpoint another thread hits meanwhile is held
+    /// unreported and undone ([`Self::cancel_hit`]); a thread found by a
+    /// refresh meanwhile is stopped too.
     fn stop_all(&mut self)
     {
-        let Some(target) = &mut self.target
-        else
+        if self.target.is_none()
         {
             return;
-        };
-        let mut waiting = 0;
-        for t in target
-            .threads
-            .iter_mut()
-            .filter(|t| !t.gone && t.held.is_none())
-        {
-            match syscall::thread_post_upcall(t.cap, 0, syscall_abi::UPCALL_ANY_INSTRUCTION)
-            {
-                Ok(()) => waiting += 1,
-                Err(_) if !thread_alive(t.cap) => t.gone = true,
-                Err(_) =>
-                {}
-            }
         }
         let deadline = Instant::now() + STOP_WAIT;
-        while waiting > 0 && Instant::now() < deadline
+        loop
         {
+            self.post_upcalls();
+            let waiting = self.target.as_ref().is_some_and(|t| {
+                t.threads
+                    .iter()
+                    .any(|t| t.live() && t.held.is_none() && t.posted)
+            });
+            if !waiting || Instant::now() >= deadline
+            {
+                break;
+            }
             match self.events.try_recv()
             {
                 Ok(stop) =>
                 {
-                    if self.hold(stop).is_some()
+                    if let Some(index) = self.hold(stop)
                     {
-                        waiting -= 1;
+                        self.cancel_hit(index);
                     }
                 }
                 Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(1)),
                 Err(TryRecvError::Disconnected) => break,
             }
         }
+        if let Some(target) = &mut self.target
+        {
+            for t in &mut target.threads
+            {
+                t.posted = false;
+            }
+        }
+        self.finish_stepping();
         self.running = false;
     }
 
+    /// Post an `UPCALL_ANY_INSTRUCTION` upcall to every live thread not held
+    /// and not yet posted.
+    fn post_upcalls(&mut self)
+    {
+        let Some(target) = &mut self.target
+        else
+        {
+            return;
+        };
+        for t in target
+            .threads
+            .iter_mut()
+            .filter(|t| t.live() && t.held.is_none() && !t.posted)
+        {
+            let posted = syscall::thread_post_upcall(t.cap, 0, syscall_abi::UPCALL_ANY_INSTRUCTION);
+            // A refused post to a live thread finds an upcall already
+            // pending (an earlier post), which arrives as well.
+            if posted.is_err() && !thread_alive(t.cap)
+            {
+                t.gone = true;
+            }
+            else
+            {
+                t.posted = true;
+            }
+        }
+    }
+
     /// Record `stop` as its thread's held stop; returns the thread's index.
-    /// A stop whose thread already holds one (a thread spawned after the
-    /// attach, which copied its spawner's binding) is resumed at once.
+    /// A stop that is not the thread's own ([`control::credit`]) comes from
+    /// a thread spawned after the attach under its spawner's badge: the
+    /// stub refreshes its thread list, whose bind delivers that stop again
+    /// under the new thread's badge, and answers this delivery, which the
+    /// bind cancelled.
     fn hold(&mut self, stop: Stop) -> Option<usize>
     {
-        let index = thread_index(stop.badge);
-        let Some(thread) = index.and_then(|i| self.target.as_mut()?.threads.get_mut(i))
+        let index = control::thread_index(stop.badge);
+        let Some(thread) = index.and_then(|i| self.target.as_ref()?.threads.get(i))
         else
         {
             self.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
             return None;
         };
-        if thread.held.is_some()
+        let held = thread.held.is_some();
+        let regs_pc = if held { None } else { read_pc(thread.cap) };
+        match control::credit(held, regs_pc, stop.ip)
         {
-            self.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
-            return None;
+            Credit::Own =>
+            {
+                if let Some(t) = index.and_then(|i| self.target.as_mut()?.threads.get_mut(i))
+                {
+                    t.held = Some(stop);
+                    t.posted = false;
+                }
+                index
+            }
+            Credit::Unknown =>
+            {
+                self.refresh();
+                self.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
+                None
+            }
         }
-        thread.held = Some(stop);
-        index
+    }
+
+    /// Undo a breakpoint hit of held thread `index` that the stub does not
+    /// report: set its pointer back to the breakpoint where the architecture
+    /// reports it past it ([`control::rewound_pc`]), so its resume runs the
+    /// breakpoint again, and reports it then, rather than resuming inside
+    /// the replaced instruction (docs/fault-handling.md § Debugging).
+    fn cancel_hit(&mut self, index: usize)
+    {
+        let Some(t) = self.target.as_ref().and_then(|t| t.threads.get(index))
+        else
+        {
+            return;
+        };
+        let Some(stop) = t.held
+        else
+        {
+            return;
+        };
+        let mut file = [0u8; 512];
+        let size = regs::file_size(ARCH);
+        if syscall::thread_read_regs(t.cap, &mut file[..size]).is_err()
+        {
+            return;
+        }
+        let pc = regs::pc(ARCH, &file);
+        let planted = |a| self.breakpoints.contains(a);
+        if let Some(at) =
+            control::rewound_pc(BREAKPOINT_PC_ADVANCE, stop.kind, stop.detail, pc, planted)
+        {
+            regs::set_pc(ARCH, &mut file[..size], at);
+            // SAFETY: the register file was read from this held thread just
+            // above; only its pointer moved back to the breakpoint it took.
+            let _ = unsafe { syscall::thread_write_regs(t.cap, &file[..size]) };
+        }
+    }
+
+    /// Undo the step in flight, once its thread is held: its trap flag, or
+    /// its planted `c.ebreak`. A thread not held keeps the step pending,
+    /// for its next stop.
+    fn finish_stepping(&mut self)
+    {
+        let Some(step) = self.stepping
+        else
+        {
+            return;
+        };
+        let Some(t) = self
+            .target
+            .as_ref()
+            .and_then(|t| t.threads.get(step.thread))
+        else
+        {
+            self.stepping = None;
+            return;
+        };
+        if t.held.is_none() && !t.gone
+        {
+            return;
+        }
+        let mut file = [0u8; 512];
+        let size = regs::file_size(ARCH);
+        if syscall::thread_read_regs(t.cap, &mut file[..size]).is_ok()
+        {
+            arch::finish_step(t.cap, step.undo, &mut file[..size]);
+            // SAFETY: read from this held thread just above; only the step's
+            // trap flag changed.
+            let _ = unsafe { syscall::thread_write_regs(t.cap, &file[..size]) };
+        }
+        self.stepping = None;
     }
 
     fn reply(&self, receiver: usize, label: u64)
@@ -489,24 +741,54 @@ impl Stub
         }
     }
 
-    /// Resume every held thread: with `FAULT_REPLY_RESUME`, or, for the
-    /// thread the last stop named when GDB passes it a signal, with
-    /// `FAULT_REPLY_KILL`, so the fault takes the outcome it has with no
-    /// handler.
-    fn resume_all(&mut self, signal: Option<u8>)
+    /// Answer every stop the receivers hold or pass on within `wait`, until
+    /// none has come for [`DRAIN_QUIET`]: with `FAULT_REPLY_RESUME`, which
+    /// resumes a thread the stub no longer debugs and fails harmlessly for a
+    /// delivery a rebind cancelled. A zero `wait` answers what is queued.
+    fn drain_events(&mut self, wait: Duration)
     {
-        let current = self.current;
+        let deadline = Instant::now() + wait;
+        let mut quiet_from = Instant::now();
+        loop
+        {
+            match self.events.try_recv()
+            {
+                Ok(stop) =>
+                {
+                    self.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
+                    quiet_from = Instant::now();
+                }
+                Err(TryRecvError::Empty) =>
+                {
+                    let now = Instant::now();
+                    if now >= deadline || now >= quiet_from + DRAIN_QUIET
+                    {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// Resume every held thread: with `FAULT_REPLY_RESUME`, or, for thread
+    /// `signalled` when GDB passes it a nonzero `signal` and it is stopped
+    /// on a fault, with `FAULT_REPLY_KILL`, so the fault takes the outcome
+    /// it has with no handler. Returns how many threads it resumed.
+    fn resume_all(&mut self, signal: Option<u8>, signalled: usize) -> usize
+    {
         let Some(target) = &mut self.target
         else
         {
-            return;
+            return 0;
         };
         let mut replies = Vec::new();
         for (i, t) in target.threads.iter_mut().enumerate()
         {
             if let Some(stop) = t.held.take()
             {
-                let pass = i == current && signal.is_some_and(|s| s != 0);
+                let pass = i == signalled && signal.is_some_and(|s| s != 0);
                 let label = if pass && stop.kind != syscall_abi::FAULT_KIND_UPCALL
                 {
                     syscall_abi::FAULT_REPLY_KILL
@@ -518,11 +800,13 @@ impl Stub
                 replies.push((stop.receiver, label));
             }
         }
+        let resumed = replies.len();
         for (receiver, label) in replies
         {
             self.reply(receiver, label);
         }
         self.running = true;
+        resumed
     }
 
     /// Step thread `index` one instruction, the others held.
@@ -544,7 +828,7 @@ impl Stub
         {
             return false;
         }
-        let Ok(undo) = arch::current::prepare_step(t.cap, &mut file[..size])
+        let Ok(undo) = arch::prepare_step(t.cap, &mut file[..size])
         else
         {
             return false;
@@ -553,7 +837,7 @@ impl Stub
         // above; only the trap flag changed.
         if unsafe { syscall::thread_write_regs(t.cap, &file[..size]) }.is_err()
         {
-            arch::current::finish_step(t.cap, undo, &mut file[..size]);
+            arch::finish_step(t.cap, undo, &mut file[..size]);
             return false;
         }
         t.held = None;
@@ -564,6 +848,80 @@ impl Stub
         self.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
         self.running = true;
         true
+    }
+
+    /// Carry out a resume packet's `plan`, after moving the planned thread's
+    /// pointer to `addr` when the packet gives one.
+    fn resume(&mut self, plan: Plan, addr: Option<u64>, ipc_buf: *mut u64)
+    {
+        if self.target.is_none()
+        {
+            self.send(ipc_buf, |w| {
+                w.exited(0);
+            });
+            return;
+        }
+        let thread = match plan
+        {
+            Plan::Step { thread } | Plan::Continue { thread, .. } => thread,
+            Plan::Nothing =>
+            {
+                self.error(ipc_buf, 1);
+                return;
+            }
+        };
+        if let Some(addr) = addr
+            && !self.set_pc(thread, addr)
+        {
+            self.error(ipc_buf, 1);
+            return;
+        }
+        match plan
+        {
+            Plan::Step { thread } =>
+            {
+                self.current = thread;
+                if !self.step(thread)
+                {
+                    self.error(ipc_buf, 1);
+                }
+            }
+            Plan::Continue { thread, signal } =>
+            {
+                self.resume_all(signal, thread);
+                // Every thread exited: no stop will come, so the target is
+                // reported gone rather than left running.
+                if self.alive_count() == 0
+                {
+                    self.drop_target();
+                    self.send(ipc_buf, |w| {
+                        w.exited(0);
+                    });
+                }
+            }
+            Plan::Nothing =>
+            {}
+        }
+    }
+
+    /// Set held thread `index`'s pointer to `addr`.
+    fn set_pc(&self, index: usize, addr: u64) -> bool
+    {
+        let Some(t) = self.target.as_ref().and_then(|t| t.threads.get(index))
+        else
+        {
+            return false;
+        };
+        let mut file = [0u8; 512];
+        let size = regs::file_size(ARCH);
+        if syscall::thread_read_regs(t.cap, &mut file[..size]).is_err()
+        {
+            return false;
+        }
+        regs::set_pc(ARCH, &mut file[..size], addr);
+        // SAFETY: the register file was read from this held thread just
+        // above; only its pointer changed, to the address GDB resumes at.
+        unsafe { syscall::thread_write_regs(t.cap, &file[..size]) }.is_ok()
     }
 
     /// Take the stops that arrived while the target ran: the first stops
@@ -592,22 +950,8 @@ impl Stub
         {
             return;
         };
-        if let Some(step) = self.stepping.take()
-            && let Some(t) = self
-                .target
-                .as_ref()
-                .and_then(|t| t.threads.get(step.thread))
-        {
-            let mut file = [0u8; 512];
-            let size = regs::file_size(ARCH);
-            if syscall::thread_read_regs(t.cap, &mut file[..size]).is_ok()
-            {
-                arch::current::finish_step(t.cap, step.undo, &mut file[..size]);
-                // SAFETY: read from this held thread just above.
-                let _ = unsafe { syscall::thread_write_regs(t.cap, &file[..size]) };
-            }
-        }
-        // All-stop: hold every other thread too before GDB sees the stop.
+        // All-stop: hold every other thread too before GDB sees the stop;
+        // the stop_all finishes the step this stop may end.
         self.stop_all();
         self.current = index;
         let sig = stop_signal(stop.kind, stop.detail);
@@ -616,38 +960,27 @@ impl Stub
         });
     }
 
-    /// Detach: write every breakpoint's bytes back, resume every thread,
-    /// have procmgr bind the target back to its crash endpoint, and drop the
-    /// threads. Also run when the stub's session ends (`k`).
+    /// Detach: undo a step in flight, write every breakpoint's bytes back,
+    /// resume every thread, have procmgr bind the target back to its crash
+    /// endpoint, unbind the upcall class, drop the threads, and answer the
+    /// stops that arrive meanwhile. Also run when the stub's session ends
+    /// (`k`).
     fn detach(&mut self, ipc_buf: *mut u64)
     {
         let Some(cap) = self.any_thread()
         else
         {
-            self.target = None;
+            self.drop_target();
             return;
         };
+        self.finish_stepping();
+        self.stepping = None;
         for bp in self.breakpoints.take_all()
         {
             let _ = write_text(cap, bp.addr, bp.original());
         }
-        if let Some(step) = self.stepping.take()
-            && let Some(t) = self
-                .target
-                .as_ref()
-                .and_then(|t| t.threads.get(step.thread))
-        {
-            let mut file = [0u8; 512];
-            let size = regs::file_size(ARCH);
-            if syscall::thread_read_regs(t.cap, &mut file[..size]).is_ok()
-            {
-                arch::current::finish_step(t.cap, step.undo, &mut file[..size]);
-                // SAFETY: read from this thread just above; only the step's
-                // trap flag changed.
-                let _ = unsafe { syscall::thread_write_regs(t.cap, &file[..size]) };
-            }
-        }
-        self.resume_all(None);
+        let current = self.current;
+        self.resume_all(None, current);
         let Some(target) = self.target.take()
         else
         {
@@ -667,11 +1000,30 @@ impl Stub
             let _ = syscall::cap_delete(t.cap);
         }
         self.running = false;
+        // A fault or upcall delivered between the resume and the rebind is
+        // answered here, not left to a later attach.
+        self.drain_events(DRAIN_WAIT);
         std::os::seraph::log!(
             "detached from {} (crash bindings restored: {})",
             self.name,
             detached
         );
+    }
+
+    /// Forget a target whose every thread exited: delete the thread caps,
+    /// and the breakpoints, whose text went with it.
+    fn drop_target(&mut self)
+    {
+        if let Some(target) = self.target.take()
+        {
+            for t in &target.threads
+            {
+                let _ = syscall::cap_delete(t.cap);
+            }
+        }
+        let _ = self.breakpoints.take_all();
+        self.stepping = None;
+        self.running = false;
     }
 
     /// The cap of a live thread of the target, for memory access.
@@ -808,7 +1160,7 @@ impl Stub
         };
         if self.target.is_none() && matches!(command, Command::Supported(_))
         {
-            self.attach(ipc_buf);
+            self.attach(REATTACH_ATTEMPTS);
         }
         match command
         {
@@ -854,7 +1206,7 @@ impl Stub
             {
                 let ids: Vec<u64> = self.target.as_ref().map_or_else(Vec::new, |t| {
                     (0..t.threads.len())
-                        .filter(|&i| !t.threads[i].gone)
+                        .filter(|&i| t.threads[i].live())
                         .map(|i| i as u64 + 1)
                         .collect()
                 });
@@ -927,14 +1279,15 @@ impl Stub
                 let ok = self.remove_breakpoint(addr);
                 self.reply_ok(ok, ipc_buf);
             }
-            Command::Continue { signal, .. } => self.resume_all(signal),
-            Command::Step { .. } =>
+            Command::Continue { addr, signal } =>
             {
-                let current = self.current;
-                if !self.step(current)
-                {
-                    self.error(ipc_buf, 1);
-                }
+                let plan = control::plan_resume(false, signal, self.current);
+                self.resume(plan, addr, ipc_buf);
+            }
+            Command::Step { addr, signal } =>
+            {
+                let plan = control::plan_resume(true, signal, self.current);
+                self.resume(plan, addr, ipc_buf);
             }
             Command::VContQuery => self.send(ipc_buf, |w| {
                 w.vcont_actions();
@@ -975,32 +1328,19 @@ impl Stub
             ThreadId::Id(id) => usize::try_from(id).ok()?.checked_sub(1)?,
             ThreadId::Any | ThreadId::All => self.current,
         };
-        target.threads.get(index).filter(|t| !t.gone).map(|_| index)
+        target
+            .threads
+            .get(index)
+            .filter(|t| t.live())
+            .map(|_| index)
     }
 
-    /// `vCont`: a step action steps its thread, the others held; otherwise
-    /// a continue action resumes every thread, passing its signal to the
-    /// current one.
+    /// `vCont`: as [`control::plan_vcont`] plans it.
     fn vcont(&mut self, actions: VContActions<'_>, ipc_buf: *mut u64)
     {
-        let step = actions.iter().find(|a| a.resume == Resume::Step);
-        if let Some(action) = step
-        {
-            let index = action
-                .thread
-                .and_then(|t| self.select(t))
-                .unwrap_or(self.current);
-            self.current = index;
-            if !self.step(index)
-            {
-                self.error(ipc_buf, 1);
-            }
-            return;
-        }
-        if let Some(action) = actions.iter().find(|a| a.resume == Resume::Continue)
-        {
-            self.resume_all(action.signal);
-        }
+        let actions: Vec<_> = actions.iter().collect();
+        let plan = control::plan_vcont(actions.iter().copied(), self.current, |t| self.select(t));
+        self.resume(plan, None, ipc_buf);
     }
 
     /// The current thread's register file, read; `None` without a target or
@@ -1172,16 +1512,14 @@ fn write_text(cap: u64, addr: u64, bytes: &[u8]) -> bool
     unsafe { syscall::thread_write_mem(cap, addr, bytes, syscall_abi::THREAD_MEM_TEXT) }.is_ok()
 }
 
-/// The thread index a binding's badge names.
-fn thread_index(badge: u64) -> Option<usize>
+/// The pointer of a thread that is stopped or fault-blocked; `None` for one
+/// that runs, whose register file the kernel refuses to read.
+fn read_pc(cap: u64) -> Option<u64>
 {
-    if badge & THREAD_BADGE_TAG == 0
-    {
-        return None;
-    }
-    usize::try_from(badge & !THREAD_BADGE_TAG)
-        .ok()?
-        .checked_sub(1)
+    let mut file = [0u8; 512];
+    let size = regs::file_size(ARCH);
+    syscall::thread_read_regs(cap, &mut file[..size]).ok()?;
+    Some(regs::pc(ARCH, &file))
 }
 
 /// Whether `cap` names a thread that has not exited.
@@ -1191,11 +1529,11 @@ fn thread_alive(cap: u64) -> bool
         .is_ok_and(|packed| (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED)
 }
 
-/// Bind thread `index`'s exception and upcall classes to `endpoint` under
-/// its badge.
+/// Bind the exception and upcall classes of the thread stored at table
+/// index `index` to `endpoint` under that index's badge.
 fn bind_thread(endpoint: u64, cap: u64, index: usize) -> bool
 {
-    let badge = THREAD_BADGE_TAG | (index as u64 + 1);
+    let badge = control::thread_badge(index);
     let Ok(send) = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, badge)
     else
     {
@@ -1247,44 +1585,81 @@ fn find_process(debug: u64, name: &[u8], ipc_buf: *mut u64) -> Option<u64>
     }
 }
 
+/// What [`attach_process`] took from procmgr.
+struct AttachPage
+{
+    /// The image's load bias.
+    bias: u64,
+    /// The length of procmgr's thread list for the target.
+    count: u64,
+    /// The caps of the threads from the first index asked for, at most the
+    /// room given.
+    caps: Vec<u64>,
+    /// The caps reach the end of procmgr's list.
+    complete: bool,
+}
+
 /// Attach to the process `badge` names (`ATTACH_PROCESS`), paging its
-/// thread list, at most [`MAX_THREADS`] threads, with the stub's own main
-/// thread as procmgr's watch, so the target's crash bindings come back if
-/// the stub dies attached. Returns the image's load bias and the threads'
-/// caps.
+/// thread list from index `first`, at most `room` threads. With `watch`, the
+/// stub's own main thread goes to procmgr as the debugger watch, so the
+/// target's crash bindings come back if the stub dies attached. A refusal
+/// or a failed call on any page deletes the caps already taken, and, when
+/// the watch was given, has procmgr drop it again (`DETACH_PROCESS`).
 fn attach_process(
     debug: u64,
     badge: u64,
-    self_thread: u64,
+    first: u64,
+    watch: Option<u64>,
+    room: usize,
     ipc_buf: *mut u64,
-) -> Option<(u64, Vec<u64>)>
+) -> Option<AttachPage>
 {
     let mut caps = Vec::new();
-    let mut first = 0u64;
+    let mut next = first;
+    let mut watched = false;
+    let fail = |caps: &[u64], watched: bool| {
+        for &cap in caps
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        if watched
+        {
+            let req = IpcMessage::builder(procmgr_labels::DETACH_PROCESS)
+                .word(0, badge)
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            let _ = unsafe { ipc::ipc_call(debug, &req, ipc_buf) };
+        }
+    };
     loop
     {
         let mut req = IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
             .word(0, badge)
-            .word(1, first);
+            .word(1, next);
         // The watch carries `OBSERVE` alone: procmgr only reads the thread's
         // state, which takes no right.
-        if first == 0
-            && let Ok(watch) = syscall::cap_derive(self_thread, syscall_abi::RIGHTS_THREAD_OBSERVE)
+        if !watched
+            && let Some(thread) = watch
+            && let Ok(cap) = syscall::cap_derive(thread, syscall_abi::RIGHTS_THREAD_OBSERVE)
         {
-            req = req.cap(watch);
+            req = req.cap(cap);
         }
         // SAFETY: ipc_buf is the registered IPC buffer.
-        let reply = unsafe { ipc::ipc_call(debug, &req.build(), ipc_buf) }.ok()?;
-        if reply.label != procmgr_errors::SUCCESS
+        let reply = match unsafe { ipc::ipc_call(debug, &req.build(), ipc_buf) }
         {
-            return None;
-        }
+            Ok(reply) if reply.label == procmgr_errors::SUCCESS => reply,
+            _ =>
+            {
+                fail(&caps, watched);
+                return None;
+            }
+        };
+        watched |= watch.is_some();
         let count = reply.word(0);
-        let bias = reply.word(1);
         let page = reply.caps();
         for &cap in page
         {
-            if caps.len() < MAX_THREADS
+            if caps.len() < room
             {
                 caps.push(cap);
             }
@@ -1293,10 +1668,15 @@ fn attach_process(
                 let _ = syscall::cap_delete(cap);
             }
         }
-        first += page.len() as u64;
-        if page.is_empty() || first >= count || caps.len() >= MAX_THREADS
+        next += page.len() as u64;
+        if page.is_empty() || next >= count || caps.len() >= room
         {
-            return Some((bias, caps));
+            return Some(AttachPage {
+                bias: reply.word(1),
+                count,
+                complete: first + caps.len() as u64 >= count,
+                caps,
+            });
         }
     }
 }

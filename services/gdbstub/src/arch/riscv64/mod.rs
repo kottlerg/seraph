@@ -8,6 +8,8 @@
 //! other thread of the target is stopped, and writes the saved bytes back
 //! when the breakpoint is taken.
 
+use gdbstub::StepError;
+
 /// What a step left to undo when its stop arrives: the `c.ebreak` planted at
 /// `addr` over `saved`, written back then.
 #[derive(Clone, Copy, Debug)]
@@ -20,27 +22,33 @@ pub struct StepUndo
 /// The target description the stub serves.
 pub const ARCH: gdb_rsp::target::Arch = gdb_rsp::target::Arch::Riscv64;
 
+/// How far past a software breakpoint the reported pointer lies: none, since
+/// RISC-V reports the `ebreak` itself.
+pub const BREAKPOINT_PC_ADVANCE: u64 = 0;
+
 /// Read `buf.len()` bytes at `va` of `thread`'s address space.
-fn read(thread: u64, va: u64, buf: &mut [u8]) -> Result<(), ()>
+fn read(thread: u64, va: u64, buf: &mut [u8]) -> Result<(), StepError>
 {
     syscall::thread_read_mem(thread, va, buf)
         .map(|_| ())
-        .map_err(|_| ())
+        .map_err(|_| StepError::Unreadable)
 }
 
 /// Plant `c.ebreak` at the successor of the instruction the stopped thread
 /// `thread` (register file `regs`) runs next, saving the bytes it replaces.
 ///
 /// # Errors
-/// The instruction cannot be read, or the decoder gives no successor
-/// (`riscv_step::StepError`), or the plant fails.
-pub fn prepare_step(thread: u64, regs: &mut [u8]) -> Result<StepUndo, ()>
+/// [`StepError::Unreadable`] when the instruction or the successor's bytes
+/// cannot be read, [`StepError::Undecodable`] when the decoder gives no
+/// successor (`riscv_step::StepError`), [`StepError::Unwritable`] when the
+/// plant fails.
+pub fn prepare_step(thread: u64, regs: &mut [u8]) -> Result<StepUndo, StepError>
 {
     let pc = gdbstub::regs::pc(ARCH, regs);
     let mut first = [0u8; 2];
     read(thread, pc, &mut first)?;
     let parcel = u16::from_le_bytes(first);
-    let len = riscv_step::instruction_len(parcel).map_err(|_| ())?;
+    let len = riscv_step::instruction_len(parcel).map_err(|_| StepError::Undecodable)?;
     let mut insn = [0u8; 4];
     insn[..2].copy_from_slice(&first);
     if len == 4
@@ -53,7 +61,8 @@ pub fn prepare_step(thread: u64, regs: &mut [u8]) -> Result<StepUndo, ()>
             .and_then(|b| b.try_into().ok())
             .map_or(0, u64::from_le_bytes)
     };
-    let next = riscv_step::successor(pc, u32::from_le_bytes(insn), reg).map_err(|_| ())?;
+    let next = riscv_step::successor(pc, u32::from_le_bytes(insn), reg)
+        .map_err(|_| StepError::Undecodable)?;
     let mut saved = [0u8; 2];
     read(thread, next, &mut saved)?;
     // SAFETY: the write lands in the target's address space, not the stub's
@@ -67,7 +76,7 @@ pub fn prepare_step(thread: u64, regs: &mut [u8]) -> Result<StepUndo, ()>
             syscall_abi::THREAD_MEM_TEXT,
         )
     }
-    .map_err(|_| ())?;
+    .map_err(|_| StepError::Unwritable)?;
     Ok(StepUndo { addr: next, saved })
 }
 

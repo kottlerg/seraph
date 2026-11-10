@@ -5,14 +5,30 @@
 
 //! Host-testable logic of the GDB stub: the map between the kernel's
 //! register file and GDB's register block ([`regs`]), the inserted
-//! breakpoints ([`breakpoints`]), and the signal a stop reports
-//! ([`stop_signal`]). The service (`main.rs`) holds the target's threads,
-//! the debug port, and the fault receiver.
+//! breakpoints ([`breakpoints`]), the run-control decisions ([`control`]),
+//! and the signal a stop reports ([`stop_signal`]). The service (`main.rs`)
+//! holds the target's threads, the debug port, and the fault receivers, and
+//! carries the decisions out.
 
 #![no_std]
 
 pub mod breakpoints;
+pub mod control;
 pub mod regs;
+
+/// Why a single step could not be prepared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepError
+{
+    /// The stepped instruction, or the bytes at its successor, could not be
+    /// read from the target.
+    Unreadable,
+    /// The decoder gives the instruction no successor a breakpoint can be
+    /// planted at (`shared/riscv-step`).
+    Undecodable,
+    /// The step's breakpoint could not be planted.
+    Unwritable,
+}
 
 /// GDB's signal numbers a stop reply reports.
 pub mod signal

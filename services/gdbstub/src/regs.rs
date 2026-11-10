@@ -223,18 +223,35 @@ pub fn write_registers(arch: Arch, block: &[u8], file: &mut [u8]) -> Result<(), 
     Ok(())
 }
 
+/// The offset of the program counter in the register file.
+fn pc_offset(arch: Arch) -> usize
+{
+    match arch
+    {
+        Arch::X86_64 => x86_64::RIP,
+        Arch::Riscv64 => syscall_abi::REGS_RISCV64_IP_OFFSET,
+    }
+}
+
 /// The program counter's value in `file`.
 #[must_use]
 pub fn pc(arch: Arch, file: &[u8]) -> u64
 {
-    let offset = match arch
-    {
-        Arch::X86_64 => x86_64::RIP,
-        Arch::Riscv64 => syscall_abi::REGS_RISCV64_IP_OFFSET,
-    };
+    let offset = pc_offset(arch);
     file.get(offset..offset + 8)
         .and_then(|b| b.try_into().ok())
         .map_or(0, u64::from_le_bytes)
+}
+
+/// Set the program counter in `file` to `value`; a file too short for it
+/// is left as it is.
+pub fn set_pc(arch: Arch, file: &mut [u8], value: u64)
+{
+    let offset = pc_offset(arch);
+    if let Some(field) = file.get_mut(offset..offset + 8)
+    {
+        field.copy_from_slice(&value.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -366,5 +383,19 @@ mod tests
             write_registers(Arch::Riscv64, b"0011", &mut file),
             Err(WriteError::BadValue)
         );
+    }
+
+    #[test]
+    fn a_pc_written_reads_back_and_leaves_the_other_fields()
+    {
+        for arch in [Arch::X86_64, Arch::Riscv64]
+        {
+            let mut file = numbered_file(arch);
+            let before = file.clone();
+            set_pc(arch, &mut file, 0xdead_beef);
+            assert_eq!(pc(arch, &file), 0xdead_beef);
+            let changed = file.iter().zip(&before).filter(|(a, b)| a != b).count();
+            assert!(changed <= 8);
+        }
     }
 }

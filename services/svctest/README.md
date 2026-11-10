@@ -142,7 +142,16 @@ devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE
 `TEST_QUERY_DENY_DEVICE`, `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`,
 `TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS`, and the input-ordinal
 phase, which requires a cap from `QUERY_INPUT_DEVICE` at instance ordinal 0 (sent and absent) and
-`NO_DEVICE` past the one keyboard of every boot's device set. `caps[3]` exists for devmgr's test
+`NO_DEVICE` past the one keyboard of every boot's device set. The drivers stray-cap phase takes
+granted SENDs on the serial and input drivers' endpoints through `caps[2]` (`QUERY_SERIAL_DEVICE`
+and `QUERY_INPUT_DEVICE`) and floods each driver with calls carrying `MSG_CAP_SLOTS_MAX` caps:
+an unknown label, a zero-byte `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, a
+`SERIAL_REGISTER_RX_NOTIFY` whose stray notification `SYS_IRQ_REGISTER` rejects, and one whose
+fresh notification each call rebinds the UART line to. It requires each call's normal reply and
+each cap to leave svctest's `CSpace`. A driver that keeps a cap it should delete exhausts its
+`CSpace` within one case, and the stalled call ends the boot as a `HANG`. The read and accepted
+registration cases, and the input case, log a skip when `terminal.svc` is staged, since they
+would take the terminal's input. `caps[3]` exists for devmgr's test
 labels (TODO(#165): retire with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim, the
 driver-withdrawal phase's `TEST_SPAWN_FAULT_DRIVERS` and `TEST_QUERY_FAULT_DEVICE` shims, the DMA
 confinement phase's `TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS` shims,

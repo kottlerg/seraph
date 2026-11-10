@@ -22,9 +22,11 @@
 //!
 //! The stray-cap flood phase checks the serial and input drivers' cap
 //! hygiene: a cap a request carries that the driver does not keep is
-//! deleted, not left in the driver's `CSpace`. It takes granted SENDs from
-//! `devmgr.registry`, and its input case skips under a staged terminal, as
-//! the deny phase's does.
+//! deleted, not left in the driver's `CSpace`, and an accepted serial RX
+//! registration deletes the notification it replaces. It takes granted SENDs
+//! from `devmgr.registry`. Under a staged terminal its input case skips, as
+//! the deny phase's does, and so do its serial cases that read the UART or
+//! rebind its interrupt, which would take the terminal's input.
 
 use std::time::Duration;
 
@@ -58,6 +60,14 @@ pub(crate) const INPUT_ATTEMPTS: u32 = 500;
 /// The recipe that starts the terminal, the system's other input reader
 /// (programs/terminal/README.md), when it is staged for this boot.
 const TERMINAL_RECIPE: &str = "/config/svcmgr/services/terminal.svc";
+
+/// Whether the terminal is staged for this boot: it then reads the input
+/// driver and the UART, so a case that would wait behind its read, take its
+/// bytes, or rebind its UART notification skips.
+fn terminal_staged() -> bool
+{
+    std::fs::metadata(TERMINAL_RECIPE).is_ok()
+}
 
 /// A no-authority SEND on the driver `query_label` names, from devmgr's
 /// `TEST_QUERY_DENY_DEVICE`, or `None` when devmgr still reports
@@ -126,7 +136,7 @@ fn verb_bit_deny_phase(caps: &Caps)
     assert_denied(serial, &notify, unauth, "SERIAL_REGISTER_RX_NOTIFY");
     let _ = syscall::cap_delete(serial);
 
-    if std::fs::metadata(TERMINAL_RECIPE).is_ok()
+    if terminal_staged()
     {
         std::os::seraph::log!("drivers deny: input case skipped: terminal staged as a reader");
     }
@@ -171,18 +181,34 @@ fn verb_bit_deny_phase(caps: &Caps)
     let _ = syscall::cap_delete(fb);
 }
 
-/// Stray caps one flood case sends: more than a spawned driver's `CSpace`
-/// holds (procmgr seeds a child's with 335 usable slots,
+/// Calls of one flood case. Each call leaves at least one cap with a driver
+/// that keeps what it should delete, so the calls outnumber the slots of a
+/// spawned driver's `CSpace` (procmgr seeds a child's with 335 usable slots,
 /// `CSPACE_RETYPE_PAGES`, and a driver grows it only when it spawns a
 /// thread), with margin.
-const STRAY_CAP_BUDGET: usize = 1024;
+const FLOOD_CALLS: usize = 512;
 
-/// A request sent with `MSG_CAP_SLOTS_MAX` stray caps, and the low 16 bits
-/// of the reply label it must get (a read's byte count rides above them).
+/// The first cap of a flood call; the others are always stray SENDs.
+#[derive(Clone, Copy)]
+enum FirstCap
+{
+    /// A stray SEND on the driver's own endpoint.
+    Stray,
+    /// A fresh notification, which an accepted `SERIAL_REGISTER_RX_NOTIFY`
+    /// keeps in place of the one it bound before.
+    Notification,
+}
+
+/// A request sent with `MSG_CAP_SLOTS_MAX` caps, and the low 16 bits of the
+/// reply label it must get (a read's byte count rides above them).
 struct StrayCapCase
 {
     label: u64,
+    first: FirstCap,
     expected: u64,
+    /// Whether the case reads the UART or rebinds its interrupt, so it skips
+    /// under a staged terminal ([`terminal_staged`]).
+    uart: bool,
     what: &'static str,
 }
 
@@ -190,41 +216,60 @@ struct StrayCapCase
 const UNKNOWN_LABEL: u64 = 0x7FFF;
 
 /// The serial driver's cases. A granted label keeps no cap but the
-/// notification of an accepted `SERIAL_REGISTER_RX_NOTIFY`; the registration
-/// case carries a stray SEND as its notification, which `SYS_IRQ_REGISTER`
-/// rejects, so the UART line's binding stays as it was.
-const SERIAL_CASES: [StrayCapCase; 4] = [
+/// notification of an accepted `SERIAL_REGISTER_RX_NOTIFY`, which replaces
+/// (and deletes) the one bound before. The rejected registration carries a
+/// stray SEND as its notification, which `SYS_IRQ_REGISTER` refuses, so the
+/// line's binding stays as it was; the accepted one rebinds the line to a
+/// fresh notification on each call.
+const SERIAL_CASES: [StrayCapCase; 5] = [
     StrayCapCase {
         label: UNKNOWN_LABEL,
+        first: FirstCap::Stray,
         expected: ipc::serial_errors::UNKNOWN_OPCODE,
+        uart: false,
         what: "serial unknown label",
     },
     // A zero-byte write: it emits nothing.
     StrayCapCase {
         label: ipc::serial_labels::SERIAL_WRITE_BYTES,
+        first: FirstCap::Stray,
         expected: ipc::serial_errors::SUCCESS,
+        uart: false,
         what: "SERIAL_WRITE_BYTES",
     },
     StrayCapCase {
         label: ipc::serial_labels::SERIAL_READ_BYTES,
+        first: FirstCap::Stray,
         expected: ipc::serial_errors::SUCCESS,
+        uart: true,
         what: "SERIAL_READ_BYTES",
     },
     StrayCapCase {
         label: ipc::serial_labels::SERIAL_REGISTER_RX_NOTIFY,
+        first: FirstCap::Stray,
         expected: ipc::serial_errors::REGISTER_FAILED,
-        what: "SERIAL_REGISTER_RX_NOTIFY",
+        uart: false,
+        what: "SERIAL_REGISTER_RX_NOTIFY rejected",
+    },
+    StrayCapCase {
+        label: ipc::serial_labels::SERIAL_REGISTER_RX_NOTIFY,
+        first: FirstCap::Notification,
+        expected: ipc::serial_errors::SUCCESS,
+        uart: true,
+        what: "SERIAL_REGISTER_RX_NOTIFY accepted",
     },
 ];
 
 /// The virtio-input driver's case: no input label keeps a cap, and a granted
 /// `INPUT_READ_EVENTS` would block for a key, so the unknown label stands for
 /// every label.
-const INPUT_CASES: [StrayCapCase; 1] = [StrayCapCase {
+const INPUT_CASE: StrayCapCase = StrayCapCase {
     label: UNKNOWN_LABEL,
+    first: FirstCap::Stray,
     expected: ipc::input_errors::UNKNOWN_OPCODE,
+    uart: false,
     what: "input unknown label",
-}];
+};
 
 /// A granted SEND on the driver `query_label` names, from `devmgr.registry`,
 /// or `None` when devmgr still reports `NO_DEVICE` after `attempts` tries.
@@ -256,50 +301,72 @@ fn granted_send(devmgr: u64, query_label: u64, name: &str, attempts: u32) -> Opt
     None
 }
 
-/// Send each of `cases` on `driver` `STRAY_CAP_BUDGET / MSG_CAP_SLOTS_MAX`
-/// times, each call carrying `MSG_CAP_SLOTS_MAX` stray SENDs. Each call must
-/// get its case's reply and move every stray out of svctest's `CSpace`: a
-/// driver that kept the strays would fill its own `CSpace` within one case,
-/// and the kernel then refuses the transfer, failing the call or leaving the
-/// strays with svctest (docs/ipc-design.md § Message Format).
-fn flood(driver: u64, cases: &[StrayCapCase])
+/// The first cap of a flood call on `driver`, as `first` names it.
+fn first_cap(driver: u64, first: FirstCap) -> u64
+{
+    match first
+    {
+        FirstCap::Stray =>
+        {
+            syscall::cap_derive(driver, syscall::RIGHTS_EP_SEND).expect("cap_derive of a stray cap")
+        }
+        FirstCap::Notification => std::os::seraph::object_slab_retype(
+            std::os::seraph::NOTIFICATION_RETYPE_BYTES,
+            |slab| syscall::cap_create_notification(slab).ok(),
+        )
+        .expect("notification for a registration"),
+    }
+}
+
+/// Send `case` on `driver` [`FLOOD_CALLS`] times, each call carrying
+/// `MSG_CAP_SLOTS_MAX` caps, and check that each call gets the case's reply
+/// and moves every cap out of svctest's `CSpace`.
+///
+/// A driver that kept a cap it should delete runs out of `CSpace` slots
+/// within one case. Its receive then fails before it parks (`SYS_IPC_RECV`'s
+/// `OutOfMemory`, docs/ipc-design.md § Receive-Failure Policy), so the call
+/// in flight is not answered and the phase stalls; for the serial driver,
+/// logd's writes stall with it. No assertion here sees that failure: the
+/// boot's run timeout is the backstop, which classifies the boot as a
+/// `HANG`.
+fn flood(driver: u64, case: &StrayCapCase)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    for case in cases
+    let what = case.what;
+    for call in 0..FLOOD_CALLS
     {
-        let what = case.what;
-        for call in 0..STRAY_CAP_BUDGET / MSG_CAP_SLOTS_MAX
+        let mut sent = [0u64; MSG_CAP_SLOTS_MAX];
+        sent[0] = first_cap(driver, case.first);
+        for stray in &mut sent[1..]
         {
-            let mut builder = ipc::IpcMessage::builder(case.label);
-            let mut strays = [0u64; MSG_CAP_SLOTS_MAX];
-            for stray in &mut strays
-            {
-                *stray = syscall::cap_derive(driver, syscall::RIGHTS_EP_SEND)
-                    .expect("cap_derive of a stray cap");
-                builder = builder.cap(*stray);
-            }
-            // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-            let reply = unsafe { ipc::ipc_call(driver, &builder.build(), ipc_buf) }
-                .unwrap_or_else(|_| panic!("{what} stray-cap call {call}: ipc_call failed"));
-            assert_eq!(
-                reply.label & 0xFFFF,
-                case.expected,
-                "{what} stray-cap call {call}: reply label"
-            );
+            *stray = syscall::cap_derive(driver, syscall::RIGHTS_EP_SEND)
+                .expect("cap_derive of a stray cap");
+        }
+        let mut builder = ipc::IpcMessage::builder(case.label);
+        for &cap in &sent
+        {
+            builder = builder.cap(cap);
+        }
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(driver, &builder.build(), ipc_buf) }
+            .unwrap_or_else(|_| panic!("{what} call {call}: ipc_call failed"));
+        assert_eq!(
+            reply.label & 0xFFFF,
+            case.expected,
+            "{what} call {call}: reply label"
+        );
+        assert!(
+            reply.caps().is_empty(),
+            "{what} call {call}: reply carried a cap"
+        );
+        // No cap is created between the call and this check, so an empty
+        // slot is the moved cap, not a reused slot.
+        for &cap in &sent
+        {
             assert!(
-                reply.caps().is_empty(),
-                "{what} stray-cap call {call}: reply carried a cap"
+                syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS).is_err(),
+                "{what} call {call}: a cap it carried stayed with svctest"
             );
-            // No cap is created between the call and this check, so an empty
-            // stray slot is the moved cap, not a reused slot.
-            for &stray in &strays
-            {
-                assert!(
-                    syscall::cap_info(stray, syscall::CAP_INFO_TAG_RIGHTS).is_err(),
-                    "{what} stray-cap call {call}: a stray stayed with svctest, so the \
-                     driver's CSpace refused it"
-                );
-            }
         }
     }
 }
@@ -311,13 +378,25 @@ fn stray_cap_flood_phase(caps: &Caps)
         devmgr != 0,
         "drivers stray caps: no devmgr.registry cap seeded"
     );
+    let staged = terminal_staged();
 
     let serial = granted_send(devmgr, ipc::devmgr_labels::QUERY_SERIAL_DEVICE, "serial", 1)
         .expect("drivers stray caps: no serial driver");
-    flood(serial, &SERIAL_CASES);
+    for case in &SERIAL_CASES
+    {
+        if staged && case.uart
+        {
+            std::os::seraph::log!(
+                "drivers stray caps: {} case skipped: terminal staged as a reader",
+                case.what
+            );
+            continue;
+        }
+        flood(serial, case);
+    }
     let _ = syscall::cap_delete(serial);
 
-    if std::fs::metadata(TERMINAL_RECIPE).is_ok()
+    if staged
     {
         std::os::seraph::log!(
             "drivers stray caps: input case skipped: terminal staged as a reader"
@@ -331,6 +410,6 @@ fn stray_cap_flood_phase(caps: &Caps)
         INPUT_ATTEMPTS,
     )
     .expect("drivers stray caps: no input driver");
-    flood(input, &INPUT_CASES);
+    flood(input, &INPUT_CASE);
     let _ = syscall::cap_delete(input);
 }

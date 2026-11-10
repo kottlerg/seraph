@@ -742,9 +742,11 @@ cargo xtask test-crash-report --expect none --log target/xtask/run-parallel-save
 ```
 
 `--expect reports`, the default, also requires one `vm` and one `exception` block of the `crashme`
-fixture, found through the badge logd's `reclaim:` line names it by, each complete, of its main
-thread, its walk starting at its instruction pointer, and each matched by the kernel's
-`handler declined, reason=0x<id>` line. `--expect none` requires the log to hold no block. A log
+fixture's main thread and one `exception` block of a `spawned` thread (its `worker` mode), found
+through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its
+instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying
+the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the
+block read the thread the kernel killed. `--expect none` requires the log to hold no block. A log
 whose `[run-parallel]` trailer records a `QEMU-CRASH` is reported skipped, which passes the
 command, as `test-logd-reclaim` reports it. The model is in
 [docs/testing.md](../docs/testing.md) § Crash reports.

@@ -29,7 +29,7 @@ create call returns), and `RELEASE_HOLD` on a **release token** (the third cap
 a `CREATE_DMA_HOLD` create returns); procmgr identifies the target process by
 the badge `ipc_recv` delivers. Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
 § `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and
-§ `QUERY_LIVE_PROCESSES` below, and labels 19–21 in § Crash Endpoint and Debug Authority.
+§ `QUERY_LIVE_PROCESSES` below, and labels 19–22 in § Crash Endpoint and Debug Authority.
 Labels 4–7 and 10
 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see
@@ -463,7 +463,8 @@ Every cap a request transfers lands in procmgr's CSpace, whether or not the
 request's layout names it. procmgr deletes the caps a layout does not name
 (caps past the last named position, and every cap of a label that names none:
 `START_PROCESS`, `RELEASE_HOLD`, `DESTROY_PROCESS`, `QUERY_PROCESS`,
-`INIT_TEARDOWN_DONE`, and unknown opcodes), and every cap of a refused request, except the init-reap
+`INIT_TEARDOWN_DONE`, and unknown opcodes), and every cap of a refused request, a refused
+`REGISTER_THREAD`'s thread cap among them, except the init-reap
 refusals of an un-badged sender that keep caps init may still be running on
 (§ `REGISTER_INIT_TEARDOWN`). A padded or refused request from any badged sender
 therefore cannot grow procmgr's CSpace. Replies to the calls procmgr makes on a
@@ -656,7 +657,12 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 procmgr creates one **crash endpoint** at startup, before any process, and holds it for its life.
 At finalize it binds every child's main-thread exception class (`FAULT_CLASS_EXCEPTION`) to a SEND
 on it badged with the child's process badge, whether or not the child is pinned; the runtime copies
-the binding onto every thread the child spawns. memmgr forwards each page fault it cannot back to
+the binding onto every thread the child spawns, and procmgr binds each thread that registers
+(Label 22) again under a **crash badge** of the thread's own, so a fault message's badge names the
+faulting thread: the process badge its main thread, or a thread that never registered and kept its
+spawner's binding; a crash badge, which carries bit 63 (a bit of `ipc::VERB_BIT_MASK`, which no
+process badge carries) and is unique for procmgr's life, the registered thread procmgr bound under
+it. memmgr forwards each page fault it cannot back to
 the same class (`FAULT_REPLY_FORWARD`), so the endpoint receives every fault that would kill a
 procmgr-created process that has not declared itself undebuggable (Label 21), except a page fault of
 a child created `CREATE_PINNED` or whose pager binding failed, which no pager forwards
@@ -672,9 +678,10 @@ has with no handler bound, and the kernel's decline line for a forwarded fault i
 pager's own decline printed. The decliner shares nothing with the request loop but a wake
 notification, so a receive on the endpoint never waits behind a request.
 
-Labels 19–21 are the **debug authority**. `REGISTER_CRASH_SERVICE` and `ATTACH_PROCESS` are served
-only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the un-badged
-procmgr source init endows it, for a service whose definition sets `debug_authority = yes`
+Labels 19–21 are the **debug authority**, and label 22 the **thread registry** it reads.
+`REGISTER_CRASH_SERVICE` and `ATTACH_PROCESS` are served only on a badge carrying
+`procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the un-badged procmgr source init endows
+it, for a service whose definition sets `debug_authority = yes`
 ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)); no other path mints it,
 so an image that stages no such service has no attach path. The crash service and the serial GDB
 stub are its consumers.
@@ -707,7 +714,7 @@ of a second one, the handover, the take-back, and a registration after it.
 |---|---|
 | label | `procmgr_labels::ATTACH_PROCESS` (20) |
 | caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
-| `data[0]` | The target's process badge |
+| `data[0]` | The target: its process badge, or a thread's crash badge as a fault message on the crash endpoint carries it |
 | `data[1]` | The index of the first thread to return |
 | caps | none; procmgr deletes any cap the message carried |
 
@@ -715,21 +722,37 @@ Reply `SUCCESS` with:
 
 | Field | Meaning |
 |---|---|
-| `data[0]` | The number of threads procmgr holds a cap for: `1`, the main thread |
+| `data[0]` | The number of threads in the target's list: its main thread, then each thread it registered (Label 22) that procmgr still holds |
 | `data[1]` | The image's load bias |
 | `data[2]`, `data[3]` | The biased start and end (exclusive) of the image's executable segments; both `0` for an image with none |
 | `data[4]` | The address of the target's `ProcessInfo` page |
+| `data[5]` | The target's process badge (`ATTACH_WORD_PROCESS_BADGE`) |
+| `data[6]` | The list index of the thread `data[0]` names (`ATTACH_WORD_NAMED_THREAD`): `0`, the main thread, for a process badge; the registered thread bound under a crash badge; `ATTACH_NO_THREAD` (`u64::MAX`) when that thread is no longer listed |
 | caps | The Thread caps of threads `data[1]..`, each with `OBSERVE`, `CONTROL`, and `UPCALL`, at most `ATTACH_THREADS_PAGE` (`MSG_CAP_SLOTS_MAX`, 4); none past the count |
 
-The caps are derivations of procmgr's own; procmgr's teardown of the target revokes them. The
-threads the runtime spawns are created in the process's own `CSpace` and are not among them: a
-registry through which the runtime hands procmgr a cap of each, which this request would then page
-through, is design intent; not yet implemented
-([#838](https://github.com/kottlerg/seraph/issues/838)). Refusals, in order: `UNAUTHORIZED` without
-the authority; `INVALID_BADGE` when no live process carries the badge, which covers init, memmgr,
-and procmgr, none of which procmgr created;
-`NOT_ATTACHABLE` when the target declared itself undebuggable (Label 21); `OUT_OF_MEMORY` when the
-thread cap cannot be derived. The refusal order is `process_table::attach_target`.
+The list is the main thread at index 0, then the registered threads in registration order. Before
+it replies, procmgr drops from the target's registry each thread that has exited or whose cap the
+runtime revoked (its reclaim of a joined or reaped thread does), so no thread that exited before
+the request is listed; a thread blocked on a fault has not exited and stays listed. A thread whose
+cap the runtime revokes between that sweep and the derivation of the reply's caps is swept out and
+the page derived again, in at most four derivations in all. The list can change between two calls
+of a paged walk, as threads register and exit; the named thread's index is the one in the reply
+that carries it, and a caller that needs that thread's cap from a later page reads `data[6]` of
+that page's reply too. The caps are derivations of procmgr's own; procmgr's teardown of the target,
+and the runtime's reclaim of a registered thread, revoke them. A debugger that binds a listed
+thread's exception class MUST NOT bind it under the process badge `data[5]` returns, nor under a
+crash badge (§ Label 22).
+
+`data[5]`, `data[6]`, and the crash-badge form of `data[0]` extend the reply and the target's
+domain without changing the request: the label, its words, and its caps are as before, a request
+naming a process badge means what it meant, and a caller that reads only `data[0]` to `data[4]`
+and pages from index 0 sees the main thread first, as before, with the registered threads after
+it. Refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_BADGE` when no live process
+carries the badge, or no registered thread of a live process the crash badge, which covers init,
+memmgr, and procmgr, none of which procmgr created; `NOT_ATTACHABLE` when the target declared
+itself undebuggable (Label 21); `OUT_OF_MEMORY` when the cap of a thread still listed cannot be
+derived, or threads keep going through four derivations of the page, the caps already derived for
+the reply then deleted. The refusal order is `process_table::attach_target`.
 
 ### Label 21: `DECLARE_NO_DEBUG`
 
@@ -740,8 +763,10 @@ thread cap cannot be derived. The refusal order is `process_table::attach_target
 | caps | none; procmgr deletes any cap the message carried |
 
 The sender declares itself undebuggable: procmgr marks it, unbinds its main thread's exception
-class from the crash endpoint, and refuses `ATTACH_PROCESS` on it from then on. A process sends it
-before it spawns a thread, since a thread spawned before keeps the binding it copied. The senders
+class from the crash endpoint, releases every thread it registered (Label 22), unbinding each that
+procmgr bound under a crash badge and that still carries that binding, and refuses `ATTACH_PROCESS`
+and `REGISTER_THREAD` on it from then on. A process sends it before it spawns a thread, since a
+thread spawned before that did not register keeps the binding it copied. The senders
 are the processes a stop of which would deadlock a debug-authority holder, which waits on them for
 its log output or its own progress: logd, the serial and framebuffer drivers, and every
 debug-authority holder, so none attaches to itself. Replies `SUCCESS`, or `INVALID_BADGE` when the
@@ -754,6 +779,59 @@ Until it declares, a process is bound and attachable like any other: a fault of 
 driver between its creation and its declaration, which each sends before its bootstrap, reaches the
 crash service, whose log output then waits on the faulting process until the crash service's
 watchdog bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds) declines the fault.
+
+### Label 22: `REGISTER_THREAD`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::REGISTER_THREAD` (22) |
+| caller's cap badge | The sender's own process badge (its `ProcessInfo.procmgr_endpoint_cap`) |
+| `caps[0]` | A Thread cap with `OBSERVE`, `CONTROL`, and `UPCALL` (`RIGHTS_THREAD`); further caps are deleted |
+
+The sender hands procmgr a cap of one of its threads, which procmgr keeps in the process's registry
+until the thread exits, the cap is revoked, or the process is torn down; `ATTACH_PROCESS` lists it.
+The runtime sends it from each thread it spawns, before the thread runs its code, with a copy of
+the thread's own cap ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Thread
+registration). When the thread's exception class is bound under the sender's process badge or under
+a crash badge, any badge with bit 63 set, as a thread that copied its spawner's bindings is
+(whether or not that spawner is still registered), procmgr binds it again under a fresh crash
+badge; a binding of another handler, a debugger's, or none, is left, and the thread is then listed
+without a crash badge. procmgr reads the binding's badge, which `SYS_THREAD_GET_FAULT_HANDLER`
+returns, not its endpoint, so it tells its own binding by the badge alone: a debugger that binds a
+thread's exception class MUST bind it under a badge that is neither the process badge nor a crash
+badge (no badge with bit 63 set), or the threads that thread spawns, which copy that binding, are
+bound back to the crash endpoint when they register.
+
+Before it adds the thread, procmgr drops from the registry the threads that have exited or whose cap
+was revoked, when the registry has reached the count its last sweep set (64 at first, then twice
+what the sweep kept, at least 64), or the bound when that count lies past it, and at least half as
+many registrations as it holds, refused ones included, came since the last sweep. A sweep therefore
+comes after at least half as many requests as threads it reads, so the sweeps cost at most two
+thread-state reads per request on average, and threads that are gone hold the bound for at most
+half a registry's worth of requests.
+
+The registry holds at most `procmgr_labels::REGISTERED_THREADS_MAX` (16384) threads per process
+([docs/limits.md](../../../docs/limits.md) § Shared IPC and protocol crates); past it a thread runs
+unregistered, so no spawn fails for the bound. procmgr does not compare a registration against the
+threads it holds: a thread registered twice takes two entries, both counting toward the bound, and
+the runtime registers each thread once. procmgr does not check that the thread runs in the
+sender's address space, which no kernel query gives: a sender can register only a thread it holds
+`CONTROL` on, which already lets it read and change that thread. procmgr compares a binding with
+the sender's process badge, so another process's thread bound under its own process badge (that
+process's main thread, or a thread that copied it and has not registered yet) is listed in the
+sender's registry but not rebound. One bound under a crash badge is rebound into the sender's
+registry: that thread's faults then reach the crash service under a crash badge the sender's
+process holds, and are reported against the sender's image, and the other process's
+`DECLARE_NO_DEBUG` no longer unbinds it. Such a cap comes from the other process itself, from a
+debug-authority holder's attach, or, for the other process's main thread alone, from its creation
+(`CREATE_PROCESS` and `CREATE_FROM_FILE` give the creator that cap), whose binding is its process
+badge and is not rebound; so no process gains this over a spawned thread it was not given.
+
+Replies `SUCCESS`; refusals, in order: `INVALID_BADGE` when the badge names no live process;
+`NOT_ATTACHABLE` when the process declared itself undebuggable (Label 21), on which the runtime
+sends no further registration; `INVALID_ARGUMENT` without a Thread cap carrying `RIGHTS_THREAD`;
+`THREAD_LIMIT` at the bound, after any sweep due; `OUT_OF_MEMORY` when procmgr's heap cannot hold
+the entry. A refused request's caps are deleted.
 
 ---
 

@@ -1173,11 +1173,17 @@ pub unsafe fn thread_configure_with_tls(
 /// The thread must have been configured via [`thread_configure`] first.
 ///
 /// A `Stopped` thread whose fault episode a stop cancelled before any reply
-/// claimed it, or whose handler's claiming reply was `FAULT_REPLY_KILL`, is
-/// not resumed: starting it kills it as an unhandled fault, which posts its
-/// death and address-space observers, or, for the fault of a restartable
-/// syscall's user copy, fails that syscall with `InvalidAddress`
-/// (docs/fault-handling.md § Delivery, Resume, and Kill).
+/// claimed it, or whose handler's claiming reply was `FAULT_REPLY_KILL` (or a
+/// `FAULT_REPLY_FORWARD` of a delivery other than a virtual-memory one, or of
+/// one with no exception handler bound), is not resumed: starting it kills it
+/// as an unhandled fault, which posts its death and address-space observers,
+/// or, for the fault of a restartable syscall's user copy, fails that syscall
+/// with `InvalidAddress` (docs/fault-handling.md § Delivery, Resume, and
+/// Kill). An upcall delivery (`FAULT_KIND_UPCALL`) that a stop cancelled, or
+/// that the claiming reply declined (`FAULT_REPLY_KILL`, or
+/// `FAULT_REPLY_FORWARD`, a decline for an upcall), drops the upcall instead,
+/// and the start resumes the thread at its registers (docs/fault-handling.md
+/// § Asynchronous Upcalls).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid
@@ -2155,9 +2161,13 @@ pub fn ioport_bind(thread_cap: u64, ioport_cap: u64) -> Result<(), i64>
 /// kill outcome, unless the handler's reply claimed it first, in which case
 /// that reply's outcome is kept; no syscall returns on the target, and the
 /// outcome takes effect at the next [`thread_start`], which kills the thread
-/// on a kill outcome and resumes its faulting instruction on
+/// on a kill outcome (for the fault of a restartable syscall's user copy,
+/// fails that syscall with `InvalidAddress`) and resumes its faulting
+/// instruction on
 /// `FAULT_REPLY_RESUME` (docs/fault-handling.md § Delivery, Resume, and
-/// Kill).
+/// Kill). A thread blocked in an upcall delivery is never killed: whatever
+/// the outcome, the upcall is settled or dropped and the start resumes the
+/// thread at its registers (docs/fault-handling.md § Asynchronous Upcalls).
 ///
 /// If the thread is running on another CPU, the call returns once that CPU
 /// has descheduled it and published its register save, or once an object
@@ -2247,8 +2257,9 @@ pub fn thread_set_affinity(thread_cap: u64, cpu_id: u32) -> Result<(), i64>
 /// which of its badged caps the binder bound (see [`syscall_abi::FAULT_LABEL`]
 /// and `docs/fault-handling.md` § Security). `fault_class_mask` selects the
 /// covered fault classes: [`syscall_abi::FAULT_CLASS_ALL`], or a nonzero
-/// combination of [`syscall_abi::FAULT_CLASS_VM`] and
-/// [`syscall_abi::FAULT_CLASS_EXCEPTION`]; the classes it leaves out keep their
+/// combination of [`syscall_abi::FAULT_CLASS_VM`],
+/// [`syscall_abi::FAULT_CLASS_EXCEPTION`], and
+/// [`syscall_abi::FAULT_CLASS_UPCALL`]; the classes it leaves out keep their
 /// bindings.
 ///
 /// Requires `CONTROL` on `thread_cap`. See `docs/fault-handling.md`.
@@ -2284,9 +2295,10 @@ pub fn thread_set_fault_handler(
 /// (`SYS_THREAD_GET_FAULT_HANDLER`): `Some(badge)` when the class is bound,
 /// with the badge bound with it, `None` when it is not.
 ///
-/// `class` is exactly one class bit, [`syscall_abi::FAULT_CLASS_VM`] or
-/// [`syscall_abi::FAULT_CLASS_EXCEPTION`]. Requires `CONTROL` on
-/// `thread_cap`. See `docs/fault-handling.md` § Fault-Handler Binding.
+/// `class` is exactly one class bit, [`syscall_abi::FAULT_CLASS_VM`],
+/// [`syscall_abi::FAULT_CLASS_EXCEPTION`], or
+/// [`syscall_abi::FAULT_CLASS_UPCALL`]. Requires `CONTROL` on `thread_cap`.
+/// See `docs/fault-handling.md` § Fault-Handler Binding.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidArgument` (`class` not one
@@ -2509,7 +2521,8 @@ pub unsafe fn thread_write_regs_raw(thread_cap: u64, buf: *const u8, len: usize)
 /// Copy `buf.len()` bytes at `va` in the address space `thread_cap`'s thread
 /// executes in into `buf` (`SYS_THREAD_READ_MEM`). `buf.len()` must be in
 /// `1..=MAX_THREAD_MEM_COPY`; every page of the range must be mapped (the
-/// kernel does not fault a page in for the read) and normal memory. The
+/// kernel does not fault a page in for the read), normal memory, and below
+/// the top of RAM. The
 /// thread need not be stopped, but a debugger stops it for a coherent view
 /// (`docs/fault-handling.md` § Debugging). Returns the byte count.
 ///
@@ -2519,9 +2532,9 @@ pub unsafe fn thread_write_regs_raw(thread_cap: u64, buf: *const u8, len: usize)
 /// thread has exited, has no address space, or its address space's teardown
 /// has begun), `InvalidArgument` (a length of 0 or above
 /// `MAX_THREAD_MEM_COPY`), or `InvalidAddress` (either range is not wholly in
-/// the user half, a page of the target range is unmapped or device memory,
-/// or a fault on `buf` is unhandled: the call is restartable, as
-/// [`thread_read_regs`] states).
+/// the user half, a page of the target range is unmapped, device memory, or
+/// above the top of RAM, or a fault on `buf` is unhandled: the call is
+/// restartable, as [`thread_read_regs`] states).
 #[inline]
 pub fn thread_read_mem(thread_cap: u64, va: u64, buf: &mut [u8]) -> Result<u64, i64>
 {
@@ -2566,8 +2579,8 @@ pub unsafe fn thread_read_mem_raw(
 
 /// Copy `buf` to `va` in the address space `thread_cap`'s thread executes in
 /// (`SYS_THREAD_WRITE_MEM`), all or nothing. `buf.len()` must be in
-/// `1..=MAX_THREAD_MEM_COPY`, and every page of the range mapped and normal
-/// memory. A page the thread's mapping makes read-only, such as its text,
+/// `1..=MAX_THREAD_MEM_COPY`, and every page of the range mapped, normal
+/// memory, and below the top of RAM. A page the thread's mapping makes read-only, such as its text,
 /// takes the write only with `flags` = `THREAD_MEM_TEXT`, and only when its
 /// frame is mapped nowhere else. The written bytes are visible to instruction
 /// fetch on every CPU when the call returns; another thread of the space that

@@ -377,10 +377,11 @@ unreported. Both read the log the cell's boot saved and boot nothing
 ([xtask/README.md § test-crash-report](../xtask/README.md#cargo-xtask-test-crash-report)).
 
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by
-procmgr, and logd, the serial and framebuffer drivers, and crashd declare themselves undebuggable,
-as svctest and the GDB stub, debug-authority holders, do in a boot that stages them; their faults
-leave only the kernel's `fault unhandled` and `USERSPACE FAULT` lines. A thread that never
-registered with procmgr is reported without registers or a stack walk
+procmgr, and logd, the serial and framebuffer drivers, the debug port's virtio-console driver, and
+crashd declare themselves undebuggable, as svctest and the GDB stub, debug-authority holders, do in
+a boot that stages them; their faults leave only the kernel's `fault unhandled` and
+`USERSPACE FAULT` lines. A thread that never registered with procmgr is reported without registers
+or a stack walk
 ([crashd Operation § Limits](../services/crashd/docs/operation.md#limits)).
 
 ### Debug port (`test-debug-port`)
@@ -1271,8 +1272,9 @@ its threads, then a detach that hands it back to the crash service. `cargo xtask
 loads the process's sysroot binary for symbols; the stub reports the image's load bias
 (`qOffsets`), so GDB relocates them itself
 ([xtask/README.md](../xtask/README.md#cargo-xtask-run)). A process that declared itself
-undebuggable (logd, the serial and framebuffer drivers, and every debug-authority holder) refuses
-the attach, and a process procmgr did not create (init, memmgr, procmgr) is not listed.
+undebuggable (logd, the serial and framebuffer drivers, the debug port's virtio-console driver,
+and every debug-authority holder) refuses the attach, and a process procmgr did not create (init,
+memmgr, procmgr) is not listed.
 
 ```sh
 # Debug the `gdb-target` fixture (staged by hand here; test-gdb does the same):

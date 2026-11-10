@@ -1526,8 +1526,9 @@ pub unsafe fn flush_kernel_page(virt: u64)
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.
 ///
 /// Returns `Err(PagingError::NotMapped)` if any level is not present. On
-/// success, rewrites the leaf PTE with the new `flags` (preserving physical
-/// address and USER bit), calls `flush_page`, and returns the
+/// success, rewrites the leaf PTE with the rights of `flags` (preserving the
+/// physical address, the USER bit, and the leaf's memory type (PBMT),
+/// whatever `flags.uncacheable` says), calls `flush_page`, and returns the
 /// [`MapOutcome`](crate::mm::paging::MapOutcome) classifying the rights change
 /// (a same-frame rewrite, so never `Fresh`).
 ///
@@ -1564,8 +1565,10 @@ pub unsafe fn protect_user_page(
 
     let prior = leaf.0;
     let phys = leaf.phys_addr();
-    let mut new_pte = PageTableEntry::new_page(phys, flags);
-    new_pte.0 |= USER;
+    let new_pte = PageTableEntry(super::encoding::keep_memory_type(
+        PageTableEntry::new_page(phys, flags).0 | USER,
+        prior,
+    ));
     *leaf = new_pte;
 
     // SAFETY: virt is mapped; flush_page is safe for any VA (and kills any

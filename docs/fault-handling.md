@@ -605,9 +605,10 @@ those caps from procmgr's attach request, which a holder of the debug authority 
 returns the process's main thread and every thread its runtime registered
 ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`);
 a thread the process spawns after an attach is listed by the next one. Such a debugger MUST bind a
-thread's exception class under a badge that is neither the process's badge nor a crash badge,
-since procmgr tells its own crash binding by the badge alone and rebinds a newly spawned thread
-that copied it (§ Label 22: `REGISTER_THREAD` there). The pieces are:
+listed thread's exception or upcall class under a badge carrying
+`procmgr_labels::DEBUGGER_BADGE_TAG` (bit 62) with bit 63 clear, the debugger tag, by which
+procmgr tells a debugger's binding from its own crash binding and from a handler the target bound
+itself (§ Label 20: `ATTACH_PROCESS` there). The pieces are:
 
 - **Breakpoints.** A software breakpoint is `int3` on x86-64 and `ebreak` on RISC-V. It reaches
   the exception handler as `FAULT_KIND_EXCEPTION` with `FAULT_EXC_BREAKPOINT`. The reported
@@ -749,7 +750,9 @@ format, the contract the host-side symbolizer reads, in
   it, and the named thread's place among them, so the crash service reads the registers and stack
   of the thread that faulted ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
   § Label 22: `REGISTER_THREAD`, § Label 20: `ATTACH_PROCESS`). A thread that never registered keeps
-  its spawner's badge and is reported without registers.
+  its spawner's badge, or the process badge when its registration was refused at the registry's
+  bound or for procmgr's heap while it carried a debugger's binding, and is reported without
+  registers.
 - **Receiver.** While no crash service is registered, a procmgr thread receives on the endpoint and
   declines every fault, so an image that stages no crash service kills a faulting thread as with no
   handler bound. A crash service registers with procmgr's debug authority and receives on the
@@ -757,8 +760,9 @@ format, the contract the host-side symbolizer reads, in
   ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)).
 - **Uncovered processes.** A process whose stop would deadlock the crash service, since the service
   waits on it, declares itself undebuggable, which unbinds its exception class: logd and the serial
-  and framebuffer drivers, which carry the service's log output, and the crash service itself; in a
-  boot that stages them, svctest and the GDB stub, debug-authority holders, declare too. init,
+  and framebuffer drivers, which carry the service's log output, the debug port's virtio-console
+  driver, which the GDB stub waits on, and the crash service itself; in a boot that stages them,
+  svctest and the GDB stub, debug-authority holders, declare too. init,
   memmgr, and procmgr are not created by procmgr and are never bound. A fault of any of these
   takes the outcome it has with no handler bound, and the kernel's `fault unhandled` and
   `USERSPACE FAULT` lines are its only report. Any process may declare itself so; the declaration

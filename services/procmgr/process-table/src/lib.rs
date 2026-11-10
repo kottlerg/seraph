@@ -48,7 +48,9 @@ pub use dma_holds::{DmaHolds, HeldReclaim, ReleaseRefusal, release_target, relea
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 pub use names::ProcessName;
 pub use request_caps::{CreateCaps, CreateTailCaps, split_create_caps};
-pub use threads::{CrashBadges, RegisterRefusal, RegisteredThread, ThreadRegistry};
+pub use threads::{
+    CrashBadges, RegisterRefusal, RegisteredThread, ThreadRegistry, is_debugger_badge,
+};
 
 extern crate alloc;
 
@@ -171,7 +173,8 @@ pub struct ProcessEntry
     /// Slot in procmgr's `CSpace` of the main-thread cap of the debugger
     /// attached to the child (`ATTACH_PROCESS` `caps[0]`); `0` with none.
     /// Once that thread has exited, procmgr restores the child's crash
-    /// bindings, as `DETACH_PROCESS` does.
+    /// bindings, as `DETACH_PROCESS` does. The child's `DECLARE_NO_DEBUG`
+    /// takes it ([`ProcessTable::declare_no_debug`]).
     pub debugger: u64,
 }
 
@@ -230,6 +233,64 @@ impl ProcessEntry
     {
         badge == self.badge || threads::is_crash_badge(badge)
     }
+
+    /// Whether a `REGISTER_THREAD` binds a thread of this child, whose
+    /// exception class is bound under `current` (`None`: unbound), to the
+    /// crash endpoint under a fresh crash badge: when procmgr's binding is on
+    /// it ([`Self::is_crash_binding`]), which a thread that copied its
+    /// spawner's carries, or a debugger's ([`threads::is_debugger_badge`])
+    /// while the child has no debugger watched, which a thread that copied a
+    /// debugger's binding carries once that debugger has detached or died. A
+    /// debugger's binding while one is watched, another handler's, and none
+    /// are left.
+    #[must_use]
+    pub fn rebinds_on_register(&self, current: Option<u64>) -> bool
+    {
+        current.is_some_and(|b| {
+            self.is_crash_binding(b) || (self.debugger == 0 && threads::is_debugger_badge(b))
+        })
+    }
+
+    /// Whether a restore of this child's crash bindings (`DETACH_PROCESS`,
+    /// or its watched debugger's death) binds a listed thread, whose
+    /// exception class is bound under `current`, back to the crash endpoint
+    /// under `own`, procmgr's badge for it: the process badge for the main
+    /// thread, a registered thread's crash badge, or `0` for one that has
+    /// none. It does when the class is unbound, bound by a debugger, or bound
+    /// by procmgr under another badge; it leaves a thread already under
+    /// `own`, and one bound to any other handler: one the child bound
+    /// itself, or another process's thread bound under that process's badge.
+    #[must_use]
+    pub fn restores(&self, current: Option<u64>, own: u64) -> bool
+    {
+        match current
+        {
+            None => true,
+            Some(b) if own != 0 && b == own => false,
+            Some(b) => self.is_crash_binding(b) || threads::is_debugger_badge(b),
+        }
+    }
+
+    /// Whether `DECLARE_NO_DEBUG` unbinds a thread of this child whose
+    /// exception class is bound under `current`: when procmgr or a debugger
+    /// bound it, so the declared child is bound to neither the crash
+    /// endpoint nor a debugger's. A handler the child bound itself stays.
+    #[must_use]
+    pub fn declare_unbinds(&self, current: Option<u64>) -> bool
+    {
+        current.is_some_and(|b| self.is_crash_binding(b) || threads::is_debugger_badge(b))
+    }
+}
+
+/// What [`ProcessTable::declare_no_debug`] takes from the entry it marks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Declared
+{
+    /// The main thread's cap slot, whose bindings procmgr then unbinds.
+    pub thread_cap: u64,
+    /// The debugger watch the entry held, now cleared, which procmgr
+    /// deletes; `0` with none.
+    pub debugger: u64,
 }
 
 /// Ring of recently reaped or destroyed processes, queried on `QUERY_PROCESS`
@@ -470,15 +531,20 @@ impl ProcessTable
     }
 
     /// Mark the live entry whose badge matches undebuggable
-    /// (`DECLARE_NO_DEBUG`, sent on the child's own procmgr cap). Returns its
-    /// main-thread cap slot, whose exception class procmgr then unbinds;
+    /// (`DECLARE_NO_DEBUG`, sent on the child's own procmgr cap), and take
+    /// its debugger watch, so no watched debugger's death restores a crash
+    /// binding of a declared child. Returns its main-thread cap slot, whose
+    /// bindings procmgr then unbinds, and the watch, which procmgr deletes;
     /// `None` when the badge names no live entry.
     #[must_use]
-    pub fn declare_no_debug(&mut self, badge: u64) -> Option<u64>
+    pub fn declare_no_debug(&mut self, badge: u64) -> Option<Declared>
     {
         let entry = self.find_mut_by_badge(badge)?;
         entry.no_debug = true;
-        Some(entry.thread_cap)
+        Some(Declared {
+            thread_cap: entry.thread_cap,
+            debugger: core::mem::take(&mut entry.debugger),
+        })
     }
 
     /// The live entry whose badge matches.
@@ -621,8 +687,8 @@ pub enum AttachRefusal
     Unknown,
     /// The target declared itself undebuggable
     /// (`procmgr_labels::DECLARE_NO_DEBUG`; `NOT_ATTACHABLE`): the log sink,
-    /// the serial and framebuffer drivers, and every debug-authority holder,
-    /// the caller among them.
+    /// the serial and framebuffer drivers, the debug port's driver, and every
+    /// debug-authority holder, the caller among them.
     NotAttachable,
 }
 
@@ -1049,7 +1115,7 @@ mod tests
         marked.thread_cap = 41;
         table.insert(marked).unwrap();
         table.insert(entry_with_badge(0x78)).unwrap();
-        assert_eq!(table.declare_no_debug(0x77), Some(41));
+        assert_eq!(table.declare_no_debug(0x77).map(|d| d.thread_cap), Some(41));
         assert_eq!(
             attached(&mut table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x77),
             Err(AttachRefusal::NotAttachable)
@@ -1068,7 +1134,7 @@ mod tests
         let mut table = ProcessTable::new();
         table.insert(entry_with_badge(0x77)).unwrap();
         table.insert(entry_with_badge(0x78)).unwrap();
-        assert_eq!(table.declare_no_debug(0x78), Some(0));
+        assert!(table.declare_no_debug(0x78).is_some());
         let detached = |t: &mut ProcessTable, caller, target| {
             detach_target(t, caller, target).map(|e| e.badge)
         };
@@ -1121,6 +1187,89 @@ mod tests
             table.entries_after(Some(0x15)).next().map(|e| e.badge),
             Some(0x20)
         );
+    }
+
+    #[test]
+    fn a_declaration_takes_the_debugger_watch_so_no_restore_follows()
+    {
+        // A debugger attached with a watch before the child declared: the
+        // declaration hands the watch over for deletion and leaves none.
+        let mut table = ProcessTable::new();
+        let mut watched = entry_with_badge(0x77);
+        watched.thread_cap = 41;
+        watched.debugger = 93;
+        table.insert(watched).unwrap();
+        assert_eq!(
+            table.declare_no_debug(0x77),
+            Some(Declared {
+                thread_cap: 41,
+                debugger: 93
+            })
+        );
+        let entry = table.find_by_badge(0x77).unwrap();
+        assert!(entry.no_debug);
+        assert_eq!(entry.debugger, 0);
+    }
+
+    #[test]
+    fn a_registration_rebinds_procmgrs_binding_and_an_unwatched_debuggers_alone()
+    {
+        let debugger = ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3;
+        let mut table = ProcessTable::new();
+        let crash = table.mint_crash_badge();
+        let mut entry = entry_with_badge(0x50);
+        assert!(entry.rebinds_on_register(Some(0x50)));
+        assert!(entry.rebinds_on_register(Some(crash)));
+        // A debugger's binding with no debugger watched is a dead or
+        // detached debugger's, copied by a thread that registers late.
+        assert!(entry.rebinds_on_register(Some(debugger)));
+        // Another handler's, another process's, and none stay.
+        assert!(!entry.rebinds_on_register(Some(0x51)));
+        assert!(!entry.rebinds_on_register(Some(0)));
+        assert!(!entry.rebinds_on_register(None));
+        // While a debugger is watched, its binding is its own.
+        entry.debugger = 93;
+        assert!(!entry.rebinds_on_register(Some(debugger)));
+        assert!(entry.rebinds_on_register(Some(crash)));
+    }
+
+    #[test]
+    fn a_restore_binds_back_what_a_debugger_or_nobody_holds_and_leaves_other_handlers()
+    {
+        let debugger = ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3;
+        let mut table = ProcessTable::new();
+        let own = table.mint_crash_badge();
+        let other = table.mint_crash_badge();
+        let entry = entry_with_badge(0x50);
+        // The main thread, procmgr's badge for it the process badge.
+        assert!(entry.restores(Some(debugger), 0x50));
+        assert!(entry.restores(None, 0x50));
+        assert!(!entry.restores(Some(0x50), 0x50));
+        // A registered thread with a crash badge, and one with none.
+        assert!(entry.restores(Some(debugger), own));
+        assert!(!entry.restores(Some(own), own));
+        assert!(entry.restores(Some(other), own));
+        assert!(entry.restores(Some(debugger), 0));
+        assert!(entry.restores(Some(0x50), 0));
+        // The child's own handler, and another process's thread bound under
+        // that process's badge, are not taken into this child's crash binding.
+        assert!(!entry.restores(Some(0), 0));
+        assert!(!entry.restores(Some(0x51), 0));
+        assert!(!entry.restores(Some(0x51), own));
+    }
+
+    #[test]
+    fn a_declaration_unbinds_procmgrs_and_a_debuggers_bindings_and_no_other()
+    {
+        let mut table = ProcessTable::new();
+        let crash = table.mint_crash_badge();
+        let entry = entry_with_badge(0x50);
+        assert!(entry.declare_unbinds(Some(0x50)));
+        assert!(entry.declare_unbinds(Some(crash)));
+        assert!(entry.declare_unbinds(Some(ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3)));
+        assert!(!entry.declare_unbinds(Some(0)));
+        assert!(!entry.declare_unbinds(Some(0x51)));
+        assert!(!entry.declare_unbinds(None));
     }
 
     #[test]

@@ -43,7 +43,7 @@ use crate::alloc::Layout;
 use crate::cell::UnsafeCell;
 use crate::marker::PhantomData;
 use crate::mem::{align_of, size_of};
-use crate::os::seraph::current_ipc_buf;
+use crate::os::seraph::{current_ipc_buf, ipc_call_until_answered};
 use crate::ptr::{NonNull, null_mut};
 use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -467,9 +467,13 @@ impl Heap {
             let want = pages - mapped;
             // data[0] low half = want_pages, high half = flags (best-effort = 0).
             let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, want).build();
+            // An interrupted request is made again within the same round: a
+            // grant whose reply the cancelled call could not take is rolled
+            // back by memmgr, so the repeat is not charged twice.
             // SAFETY: ipc_buf is the current thread's kernel-registered,
             // page-aligned IPC buffer.
-            let Ok(reply) = (unsafe { ipc::ipc_call(self.memmgr_ep, &msg, ipc_buf) }) else {
+            let Ok(reply) = (unsafe { ipc_call_until_answered(self.memmgr_ep, &msg, ipc_buf) })
+            else {
                 break false;
             };
             let caps = reply.caps();
@@ -826,8 +830,9 @@ pub fn slab_request_pages(memmgr_ep: u64, min_pages: u64) -> Option<(u64, u64, u
     let flags = u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32;
     let msg =
         ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, u64::from(want) | flags).build();
+    // An interrupted request is made again, as in `Heap::grow_exact`.
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { ipc_call_until_answered(memmgr_ep, &msg, ipc_buf) }.ok()?;
     let caps = reply.caps();
     let layout = ipc::memmgr_grant_layout(&reply);
     let keep = layout.and_then(|(page_counts, _)| page_counts.iter().position(|&p| p >= min_pages));

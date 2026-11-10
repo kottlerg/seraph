@@ -170,7 +170,7 @@ fn pager_refused_access_phase(_: &Caps)
 /// reserved 0, through the raw syscall the typed wrapper cannot express.
 fn pager_forged_badge_phase(_: &Caps)
 {
-    use syscall_abi::{FAULT_CLASS_ALL, SYS_THREAD_SET_FAULT_HANDLER, SyscallError};
+    use syscall_abi::{FAULT_CLASS_VM, SYS_THREAD_SET_FAULT_HANDLER, SyscallError};
 
     let info = startup_info();
     assert_ne!(
@@ -183,17 +183,18 @@ fn pager_forged_badge_phase(_: &Caps)
     let bind = |badge: u64| {
         // SAFETY: raw_syscall4's four conditions hold. SYS_THREAD_SET_FAULT_HANDLER
         // takes no pointer and uses no IPC buffer; it changes no mapping; the
-        // only thread it can change is the calling one, whose fault binding it
-        // would set to the pager cap that binding already names (procmgr bound
-        // the main thread to `pager_endpoint_cap`), leaving its registers alone;
-        // and it changes no CSpace slot.
+        // only thread it can change is the calling one, whose virtual-memory
+        // class alone it would set to the pager cap that binding already names
+        // (procmgr bound that class of the main thread to `pager_endpoint_cap`),
+        // leaving its other classes and its registers alone; and it changes no
+        // CSpace slot.
         unsafe {
             syscall::raw_syscall4(
                 SYS_THREAD_SET_FAULT_HANDLER,
                 info.self_thread,
                 info.pager_endpoint_cap,
                 badge,
-                FAULT_CLASS_ALL,
+                FAULT_CLASS_VM,
             )
         }
     };

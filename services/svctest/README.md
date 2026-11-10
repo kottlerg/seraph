@@ -219,7 +219,12 @@ forwarded page fault, and the faults of two `registry-*` children, whose attach 
 registered threads and none that exited or was joined, and whose spawned thread's crash badge names
 it; on the first of those it acts as a debugger, finding the child with `LIST_PROCESSES` and having
 procmgr restore a registered thread it rebound, by `DETACH_PROCESS` and then by an attach's watch
-thread exiting; then gives the endpoint back and sees a second child declined by procmgr). The
+thread exiting; acts as the debugger of a `debugger-tag` child, whose thread registering with a
+gone debugger's binding is bound back to the crash endpoint and whose declaration, with svctest
+attached and watched, unbinds svctest's bindings and leaves no watch to bind it back; has procmgr
+unbind a debugger's binding from a thread of its own whose registration it refuses, svctest having
+declared itself undebuggable; then gives the endpoint back and sees a second child declined by
+procmgr). The
 devmgr orphan-teardown phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md)
 driver, and the driver-withdrawal phase three [`test-fault`](../drivers/test-fault/README.md)
 drivers, one of which never reports ready, so the phase waits the fault batch's settle bound

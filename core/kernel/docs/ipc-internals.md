@@ -274,7 +274,9 @@ also checked in `fault_dispatch`'s resume), release builds fail closed with
 `fault_dispatch`'s resume fails closed the same way: REDELIVER makes the delivery again under the
 binding current then, FORWARDED makes it again through the exception class (a decline for a
 kernel copy's fault), and any other `fault_outcome` than RESUME, a PENDING left by an unstamped
-wake included, kills the thread (the `fault_outcome` row of
+wake included, is the unhandled outcome: it kills the thread, or, for the fault of a restartable
+syscall's user copy (`copy_fault_dispatch`), fails that syscall with `InvalidAddress`, or, for an
+upcall delivery, drops the upcall and resumes the thread (the `fault_outcome` row of
 [scheduling-internals.md § Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 
 **Resume (non-call parks — fail-open).** Each non-call parking syscall
@@ -301,8 +303,10 @@ every reply wakes the recipient through `enqueue_and_wake` on the CPU
 `select_target_cpu` chooses, after the endpoint lock is released (call) or the
 `reply_tcb` claim is won (reply, which takes no endpoint lock); the run queue
 decides when it runs. A receive first wakes any caller it releases from an
-earlier unreplied binding (its call returns `Interrupted`, or a faulter is
-killed; § Receive Path step 2). Beyond that, a receive that finds a waiting
+earlier unreplied binding (its call returns `Interrupted`, a faulter is
+killed, or, on its restartable syscall's user copy, has that syscall fail with
+`InvalidAddress`, and a caller blocked in an upcall delivery has the upcall
+dropped and resumes; § Receive Path step 2). Beyond that, a receive that finds a waiting
 sender wakes no thread: the server continues and the sender stays parked
 awaiting the reply (`BlockedOnReply`, or `BlockedOnFault` for a fault sender). The call path then
 parks the caller through `schedule`; the reply path returns to the server.

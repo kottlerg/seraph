@@ -24,9 +24,12 @@ debugger/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   └── main.rs            # Debugger and debuggee threads, and the debuggee process
-│                          #   (`--debuggee`); per-architecture breakpoint and
-│                          #   single-step (trap flag; c.ebreak at the successor)
+│   ├── main.rs            # Debugger and debuggee threads, and the debuggee process
+│   │                      #   (`--debuggee`)
+│   └── arch/
+│       ├── mod.rs         # Architecture-dispatch surface
+│       ├── x86_64.rs      # `int3`; single-step by the trap flag
+│       └── riscv64.rs     # `ebreak`; single-step by `c.ebreak` at the successor
 └── tester/
     ├── Cargo.toml
     └── src/

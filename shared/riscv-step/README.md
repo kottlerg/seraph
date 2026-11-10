@@ -25,7 +25,7 @@ riscv-step/
 | `successor(pc, insn, reg)` | The address the thread runs next after the instruction `insn` at `pc`, reading `xN` through `reg(N)`: the fall-through, a conditional branch's taken or not-taken target, or a jump's target. |
 | `instruction_len(parcel)` | 2 or 4: how many bytes of the instruction to read from its first 16-bit parcel. |
 | `C_EBREAK` | The 2-byte `c.ebreak` a debugger plants at the successor. |
-| `StepError` | Why no successor is given: an illegal or over-long encoding, a breakpoint (which traps at itself), or a jump to itself (which a planted breakpoint would trap before it runs). |
+| `StepError` | Why no successor is given: one of the invalid encodings it recognises (an all-zero parcel, `c.jr x0`, a branch with an undefined condition), an over-long encoding, a breakpoint (which traps at itself), or a successor within the instruction's own bytes (a jump to itself, or a 4-byte jump or branch to its own second parcel, which the planted breakpoint would overwrite). |
 
 ## Scope
 

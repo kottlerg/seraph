@@ -205,10 +205,8 @@ fn start_and_step(ctx: &TestContext, b: u64, frame: u64, th: u64, ep: u64) -> Te
 fn step(ctx: &TestContext, th: u64, ep: u64, regs: &[u8], want: u64) -> TestResult
 {
     let pc = ip(regs);
-    let mut insn = [0u8; 4];
-    thread_read_mem(th, pc, &mut insn)
-        .map_err(|_| "integration::single_step: reading the instruction failed")?;
-    let next = riscv_step::successor(pc, u32::from_le_bytes(insn), |n| gpr(regs, n))
+    let insn = read_instruction(th, pc)?;
+    let next = riscv_step::successor(pc, insn, |n| gpr(regs, n))
         .map_err(|_| "integration::single_step: the decoder refused a stub instruction")?;
     if next != want
     {
@@ -230,6 +228,26 @@ fn step(ctx: &TestContext, th: u64, ep: u64, regs: &[u8], want: u64) -> TestResu
         return Err("integration::single_step: the step's breakpoint reported the wrong pointer");
     }
     Ok(())
+}
+
+/// The instruction at `pc` in `th`'s address space: its first parcel, and
+/// the second only when `riscv_step::instruction_len` says it has one, so a
+/// compressed instruction is read without touching the bytes past it.
+fn read_instruction(th: u64, pc: u64) -> Result<u32, &'static str>
+{
+    let mut parcel = [0u8; 2];
+    thread_read_mem(th, pc, &mut parcel)
+        .map_err(|_| "integration::single_step: reading the instruction failed")?;
+    let low = u16::from_le_bytes(parcel);
+    let len = riscv_step::instruction_len(low)
+        .map_err(|_| "integration::single_step: the decoder refused a stub instruction")?;
+    if len == 2
+    {
+        return Ok(u32::from(low));
+    }
+    thread_read_mem(th, pc + 2, &mut parcel)
+        .map_err(|_| "integration::single_step: reading the instruction failed")?;
+    Ok(u32::from(low) | (u32::from(u16::from_le_bytes(parcel)) << 16))
 }
 
 /// Receive a `FAULT_EXC_BREAKPOINT` on `ep`; returns its reported pointer.

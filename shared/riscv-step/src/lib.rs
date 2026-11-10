@@ -30,17 +30,21 @@ pub const C_EBREAK: [u8; 2] = [0x02, 0x90];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepError
 {
-    /// The bytes are not a valid instruction (an all-zero parcel, or a
-    /// reserved compressed encoding).
+    /// The bytes are one of the invalid encodings the decoder recognises: an
+    /// all-zero parcel, the reserved `c.jr x0`, or a conditional branch with
+    /// an undefined condition (`funct3` 2 or 3). Other reserved encodings
+    /// are not recognised and fall through by their length.
     Illegal,
     /// An instruction longer than 32 bits, which RV64GC does not define.
     TooLong,
     /// The instruction is itself a breakpoint (`ebreak` or `c.ebreak`): the
     /// thread would trap at it, not at its successor.
     Breakpoint,
-    /// The instruction transfers control to itself (`j .`): a breakpoint
-    /// planted at the successor would trap before the instruction runs, so
-    /// stepping it never advances.
+    /// The successor lies within the instruction's own bytes: a jump to
+    /// itself (`j .`), or a 4-byte jump or taken branch to its own second
+    /// parcel. A breakpoint planted there overwrites the instruction before
+    /// it runs, so the thread either traps without advancing or runs altered
+    /// bytes.
     SelfTarget,
 }
 
@@ -71,18 +75,24 @@ pub fn instruction_len(parcel: u16) -> Result<usize, StepError>
 /// `insn` are read.
 ///
 /// `ecall` falls through: the syscall returns to the instruction after it.
+/// A reserved encoding the decoder does not recognise falls through by its
+/// length; the thread then raises an illegal-instruction exception at `pc`
+/// instead of reaching the successor.
 ///
 /// # Errors
-/// - `Illegal`: an all-zero parcel or a reserved compressed encoding.
+/// - `Illegal`: an all-zero parcel, the reserved `c.jr x0`, or a conditional
+///   branch with `funct3` 2 or 3.
 /// - `TooLong`: an instruction of 48 bits or more.
 /// - `Breakpoint`: `ebreak` or `c.ebreak`.
-/// - `SelfTarget`: the successor is `pc` itself.
+/// - `SelfTarget`: the successor lies within the instruction's own bytes
+///   (`pc` itself, or `pc + 2` for a 4-byte instruction).
 pub fn successor(pc: u64, insn: u32, reg: impl Fn(u32) -> u64) -> Result<u64, StepError>
 {
     // cast_possible_truncation: the low parcel, which instruction_len reads.
     #[allow(clippy::cast_possible_truncation)]
     let parcel = insn as u16;
-    let next = if instruction_len(parcel)? == 2
+    let len = instruction_len(parcel)?;
+    let next = if len == 2
     {
         compressed_successor(pc, parcel, &reg)?
     }
@@ -90,7 +100,9 @@ pub fn successor(pc: u64, insn: u32, reg: impl Fn(u32) -> u64) -> Result<u64, St
     {
         full_successor(pc, insn, &reg)?
     };
-    if next == pc
+    // The planted c.ebreak covers [next, next + 2); a successor inside the
+    // stepped instruction's own bytes would overwrite it before it runs.
+    if next.wrapping_sub(pc) < len as u64
     {
         return Err(StepError::SelfTarget);
     }
@@ -396,6 +408,23 @@ mod tests
         let r = regs([(0, 0), (0, 0)]);
         assert_eq!(successor(PC, 0x0000_006F, &r), Err(StepError::SelfTarget)); // j .
         assert_eq!(successor(PC, 0xA001, &r), Err(StepError::SelfTarget)); // c.j 0
+    }
+
+    // Defect caught: a 4-byte jump or taken branch to its own second parcel
+    // stepped by planting the breakpoint over that parcel, so the thread runs
+    // an altered instruction instead of the stepped one.
+    #[test]
+    fn a_successor_inside_the_instruction_is_refused()
+    {
+        let r = regs([(5, PC + 2), (0, 0)]);
+        // beq x0, x0, +2 (taken)
+        assert_eq!(successor(PC, 0x0000_0163, &r), Err(StepError::SelfTarget));
+        // jal x0, +2
+        assert_eq!(successor(PC, 0x0020_006F, &r), Err(StepError::SelfTarget));
+        // jalr x0, 0(t0), t0 = pc + 2
+        assert_eq!(successor(PC, 0x0002_8067, &r), Err(StepError::SelfTarget));
+        // c.j +2 lands just past the 2-byte instruction: steppable.
+        assert_eq!(successor(PC, 0xA009, &r), Ok(PC + 2));
     }
 
     // Defect caught: x0 read through the register file instead of as zero,

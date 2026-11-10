@@ -616,9 +616,10 @@ copies, the kernel adds no debugging interface of its own. The pieces are:
     at it too, so the debugger stops the space's other threads while it steps;
   - a step between `lr` and `sc` loses the reservation, so the `sc` fails each time it is stepped
     to and a stepped retry loop never ends;
-  - an instruction that jumps to itself cannot be stepped, since the breakpoint planted at its
-    successor traps before it runs, and a breakpoint instruction cannot be stepped, since it traps
-    at itself; the decoder refuses both.
+  - an instruction whose successor lies within its own bytes (a jump to itself, or a 4-byte jump
+    or taken branch to its own second parcel) cannot be stepped, since the breakpoint planted there
+    overwrites it before it runs, and a breakpoint instruction cannot be stepped, since it traps at
+    itself; the decoder refuses both.
 - **Registers.** A handler reads and writes a stopped thread's registers with
   `SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` ([Modifying the faulting
   thread](#modifying-the-faulting-thread)).
@@ -659,7 +660,7 @@ process's memory and plants, takes, and removes a breakpoint in its text
 ([programs/debugger/README.md](../programs/debugger/README.md)). ktest
 `integration::fault_exception_redirect` drives a resume at a handler-written instruction pointer
 after an illegal instruction; `integration::single_step` steps a `syscall` on x86-64 and, on
-riscv64, steps a thread through branches and jumps taken and not taken, compressed ones among them;
+riscv64, steps a thread through taken and not-taken branches and jumps, compressed ones among them;
 and `integration::thread_memory` drives the memory calls' copies, text writes, and refusals.
 
 ---

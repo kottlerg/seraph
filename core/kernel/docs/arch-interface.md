@@ -170,7 +170,8 @@ pub unsafe fn map_user_page_pooled(
     aso: &AddressSpaceObject,
 ) -> Result<MapOutcome, ()>;
 
-/// Change permissions on an existing user mapping without changing the frame.
+/// Change permissions on an existing user mapping without changing the frame
+/// or the mapping's memory type.
 pub unsafe fn protect_user_page(
     root_virt: u64,
     virt: u64,

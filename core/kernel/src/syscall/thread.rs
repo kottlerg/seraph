@@ -383,9 +383,12 @@ unsafe fn commit_stopped(
 ///
 /// Cancels any park — an IPC wait or a `SYS_THREAD_SLEEP` — including one the
 /// target commits while the stop is in progress: on restart the stopped
-/// thread's blocked syscall returns `Interrupted` and a fault-blocked thread
-/// is killed (see `core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP`), unless
-/// a genuine waker or the sleep timer claimed it first.
+/// thread's blocked syscall returns `Interrupted`, a fault-blocked thread is
+/// killed (for the fault of a restartable syscall's user copy, that syscall
+/// fails with `InvalidAddress`), and a thread blocked in an upcall delivery
+/// has the upcall dropped and resumes (see `core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_STOP`), unless
+/// a genuine waker, the sleep timer, or a handler's reply claimed it first.
 /// A target parked on an endpoint, notification, event queue, or wait set
 /// whose last capability is deleted concurrently is claimed by the stop or by
 /// the source's teardown, which stamps the same `Interrupted`. A thread may
@@ -1177,10 +1180,12 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
             // Mirror BlockedOnReply: `blocked_on` is the handler (server) TCB,
             // whose `reply_tcb` points at this faulter. CAS-clear it so a later
             // handler reply cannot double-wake. On a successful cancel, mark the
-            // disposition Kill (the fault helper terminates the thread on
-            // resume) and release the wake-in-flight claim. If the CAS loses, a
-            // genuine reply already won and committed its own disposition — leave
-            // it untouched.
+            // disposition Kill (on resume the fault helper terminates the
+            // thread, fails with InvalidAddress a restartable syscall whose
+            // user copy faulted, or, for an upcall delivery, drops the upcall
+            // and resumes the thread) and release the wake-in-flight claim. If
+            // the CAS loses, a genuine reply already won and committed its own
+            // disposition — leave it untouched.
             if !blocked_on.is_null()
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
@@ -1363,8 +1368,9 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
 ///        badge of the arg1 cap, never a binder-supplied value
 ///        (`docs/fault-handling.md` § Security).
 /// arg3 = `fault_class_mask`: [`syscall::FAULT_CLASS_ALL`], or a nonzero
-///        combination of [`syscall::FAULT_CLASS_VM`] and
-///        [`syscall::FAULT_CLASS_EXCEPTION`]; the classes it leaves out keep
+///        combination of [`syscall::FAULT_CLASS_VM`],
+///        [`syscall::FAULT_CLASS_EXCEPTION`], and
+///        [`syscall::FAULT_CLASS_UPCALL`]; the classes it leaves out keep
 ///        their bindings.
 ///
 /// Each selected class's binding takes its own reference on the endpoint object
@@ -1596,8 +1602,8 @@ unsafe fn thread_with_rights(
 /// for one fault class.
 ///
 /// arg0 = Thread cap index (must have CONTROL).
-/// arg1 = the class, exactly one class bit ([`syscall::FAULT_CLASS_VM`] or
-///        [`syscall::FAULT_CLASS_EXCEPTION`]).
+/// arg1 = the class, exactly one class bit ([`syscall::FAULT_CLASS_VM`],
+///        [`syscall::FAULT_CLASS_EXCEPTION`], or [`syscall::FAULT_CLASS_UPCALL`]).
 ///
 /// Returns `1` when the class is bound and `0` when it is not, with the bound
 /// badge in the secondary return register (`0` when unbound). The pair is

@@ -863,8 +863,9 @@ pub mod memmgr_labels
     /// memmgr records the region against that badge's tracking entry; a
     /// later page fault inside a registered region is backed on demand by
     /// the fault-handler arm, while a fault outside every registered region
-    /// is declined (the faulting thread is killed), preserving segfault
-    /// semantics.
+    /// is declined (the faulting thread is killed, or, for the fault of a
+    /// restartable syscall's user copy, that syscall fails with
+    /// `InvalidAddress`), preserving segfault semantics.
     ///
     /// Wire format:
     /// * `data[0]` — `va_base` (page-aligned virtual address).
@@ -3985,8 +3986,11 @@ pub unsafe fn ipc_call(ep: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 ///
 /// A reply still pending from an earlier receive is released once the
 /// receive passes its capability check and cap-slot pre-allocation: that
-/// caller's `ipc_call` returns `Interrupted`, and a fault-blocked caller is
-/// killed. A receive refused before then keeps the pending binding (see
+/// caller's `ipc_call` returns `Interrupted`, a fault-blocked caller is
+/// killed (one blocked on its restartable syscall's user copy has that syscall
+/// fail with `InvalidAddress` instead), and a caller blocked in an upcall
+/// delivery has the upcall dropped and resumes. A receive refused before then
+/// keeps the pending binding (see
 /// `docs/ipc-design.md` § The Call/Reply Model).
 ///
 /// # Safety

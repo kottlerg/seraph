@@ -321,6 +321,15 @@ static DTB_PHYS: AtomicU64 = AtomicU64::new(0);
 /// (`compute_max_physical_address`), recorded in Phase 2.
 static DIRECT_MAP_TOP: AtomicU64 = AtomicU64::new(0);
 
+/// The top of RAM, `boot_protocol::max_ram_address` of the boot memory map:
+/// the direct map covers every frame below it but the kernel's own stack guard
+/// pages. Zero before Phase 2.
+#[must_use]
+pub fn ram_top() -> u64
+{
+    DIRECT_MAP_TOP.load(Ordering::Relaxed)
+}
+
 /// The DTB blob's page-aligned `(base, size)`, `(0, 0)` when there is none;
 /// written by [`populate_buddy`].
 static DTB_EXTENT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];

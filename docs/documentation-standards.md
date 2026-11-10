@@ -160,6 +160,9 @@ same mark. An unmarked statement of behavior is a statement of fact and MUST mat
   (RFC 2119 semantics).
 - Write declaratively and concisely. Omit narrative, motivational, and conversational prose.
 - Avoid examples unless an example is the only means of defining a structural rule.
+- State a decision of the maintainer as a decision, in the project's own words. Permanent text
+  (§ Incomplete Work Markers) MUST NOT quote what the maintainer wrote in a working session: a
+  session's wording is not project record. A local, uncommitted record MAY keep the words.
 
 ---
 

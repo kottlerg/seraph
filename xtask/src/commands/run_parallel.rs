@@ -29,6 +29,7 @@ use crate::accel::detect_for_arch;
 use crate::arch::Arch;
 use crate::cli::RunParallelArgs;
 use crate::context::Context as BuildContext;
+use crate::crash_log::{SysrootImages, symbolize_log};
 use crate::disk::{logical_block_size, second_disk_block_size};
 use crate::firmware::find_ovmf_code;
 use crate::qemu::QemuDisplay;
@@ -226,6 +227,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let workdir = workdir.clone();
             let qemu_binary = qemu_binary.clone();
             let save_logs = args.save_logs.clone();
+            let sysroot = ctx.sysroot.clone();
 
             handles.push(thread::spawn(move || -> Result<RunOutcome> {
                 std::fs::create_dir_all(&slot_dir)
@@ -353,6 +355,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     matched,
                 };
 
+                let mut kept_logs = Vec::new();
                 if let Some(dir) = &save_logs
                 {
                     let saved = SavedRun {
@@ -362,8 +365,20 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                         run: run_id,
                     };
                     save_log(dir, &log_path, &saved, &outcome)?;
+                    kept_logs.push(dir.join(saved_log_name(&saved)));
                 }
-                finalize_log(&workdir, &log_path, run_id, &outcome.status)?;
+                kept_logs.extend(finalize_log(&workdir, &log_path, run_id, &outcome.status)?);
+                // Symbolized only for a run that keeps its log, after the log is
+                // in place, so the report can neither cost a discarded run nor
+                // lose a kept log.
+                if !kept_logs.is_empty()
+                {
+                    let crash_report = symbolize_log(&log_text, &SysrootImages { sysroot });
+                    for log in &kept_logs
+                    {
+                        write_crash_report(log, run_id, crash_report.as_deref());
+                    }
+                }
                 println!("{}", format_outcome_line(&outcome));
                 Ok(outcome)
             }));
@@ -502,6 +517,16 @@ fn is_run_log(name: &str) -> bool
             || Status::ALL.iter().any(|s| s.log_prefix() == Some(prefix)))
 }
 
+/// Whether `name` is a file an earlier invocation left in the workdir: a run
+/// log, or the symbolized crash report beside one.
+fn is_purged(name: &str) -> bool
+{
+    is_run_log(name)
+        || name
+            .strip_suffix(CRASH_REPORT_SUFFIX)
+            .is_some_and(|stem| is_run_log(&format!("{stem}.log")))
+}
+
 /// Remove every run log an earlier invocation left in `workdir`, so the
 /// preserved logs there (and the CI artifact upload that globs them)
 /// belong to this invocation alone.
@@ -520,7 +545,7 @@ fn purge_prior_logs(workdir: &Path)
         {
             continue;
         };
-        if is_run_log(name)
+        if is_purged(name)
         {
             let _ = std::fs::remove_file(&path);
         }
@@ -834,13 +859,21 @@ fn save_log(dir: &Path, log_path: &Path, saved: &SavedRun, outcome: &RunOutcome)
     std::fs::write(&dest, body).with_context(|| format!("writing {}", dest.display()))
 }
 
-fn finalize_log(workdir: &Path, log_path: &Path, run_id: u32, status: &Status) -> Result<()>
+/// Keep a classified run's log under its status prefix, or remove it when
+/// the status keeps none; the kept log's path, if any.
+fn finalize_log(
+    workdir: &Path,
+    log_path: &Path,
+    run_id: u32,
+    status: &Status,
+) -> Result<Option<PathBuf>>
 {
     match status.log_prefix()
     {
         None =>
         {
             let _ = std::fs::remove_file(log_path);
+            Ok(None)
         }
         Some(prefix) =>
         {
@@ -848,9 +881,53 @@ fn finalize_log(workdir: &Path, log_path: &Path, run_id: u32, status: &Status) -
             std::fs::rename(log_path, &dest).with_context(|| {
                 format!("renaming {} -> {}", log_path.display(), dest.display())
             })?;
+            Ok(Some(dest))
         }
     }
-    Ok(())
+}
+
+/// Suffix of the symbolized crash report kept beside a run's log:
+/// `<name>.log` has `<name>.crash.txt`.
+const CRASH_REPORT_SUFFIX: &str = ".crash.txt";
+
+/// The path of the symbolized crash report beside `log`.
+fn crash_report_path(log: &Path) -> PathBuf
+{
+    let stem = log
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or("", |name| name.strip_suffix(".log").unwrap_or(name));
+    log.with_file_name(format!("{stem}{CRASH_REPORT_SUFFIX}"))
+}
+
+/// Write run `run_id`'s symbolized crash report beside `log`, or, when the
+/// log holds no crash-report block, remove a report an earlier run of the
+/// same name left there. The report is derived from the kept log, so a
+/// failure is a warning, never the run's or the invocation's failure.
+fn write_crash_report(log: &Path, run_id: u32, report: Option<&str>)
+{
+    let path = crash_report_path(log);
+    let result = match report
+    {
+        Some(report) => std::fs::write(&path, report).map(|()| {
+            println!(
+                "run={run_id}: crash report symbolized to {}",
+                path.display()
+            );
+        }),
+        None => match std::fs::remove_file(&path)
+        {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    };
+    if let Err(err) = result
+    {
+        eprintln!(
+            "run={run_id}: warning: crash report {}: {err}",
+            path.display()
+        );
+    }
 }
 
 fn format_outcome_line(outcome: &RunOutcome) -> String
@@ -1170,8 +1247,44 @@ mod tests
         for prefix in prefixes
         {
             let name = run_log_name(prefix, 17);
-            assert!(is_run_log(&name), "{name} is not purged");
+            assert!(is_purged(&name), "{name} is not purged");
+            let report = crash_report_path(Path::new(&name));
+            let report = report.to_str().unwrap();
+            assert!(is_purged(report), "{report} is not purged");
         }
+    }
+
+    #[test]
+    fn a_crash_report_is_written_beside_its_log_and_a_stale_one_removed()
+    {
+        let dir = std::env::temp_dir().join(format!("seraph-crash-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("x86_64-4cpu-1.log");
+        let report = dir.join("x86_64-4cpu-1.crash.txt");
+        write_crash_report(&log, 1, Some("crash report 00000000000000aa\n"));
+        assert_eq!(
+            std::fs::read_to_string(&report).unwrap(),
+            "crash report 00000000000000aa\n"
+        );
+        write_crash_report(&log, 1, None);
+        assert!(!report.exists());
+        // No report to remove is not an error either.
+        write_crash_report(&log, 1, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_crash_report_sits_beside_its_log_under_the_logs_stem()
+    {
+        assert_eq!(
+            crash_report_path(Path::new("/saved/x86_64-4cpu-3.log")),
+            Path::new("/saved/x86_64-4cpu-3.crash.txt")
+        );
+        assert_eq!(
+            crash_report_path(Path::new("FAIL-2.log")),
+            Path::new("FAIL-2.crash.txt")
+        );
     }
 
     // Files that are not a run's log, including near-misses on the
@@ -1187,9 +1300,11 @@ mod tests
             "OK-3.txt",
             "OK-3.log.bak",
             "vars-0.fd",
+            "notes.crash.txt",
+            "FAIL-x.crash.txt",
         ]
         {
-            assert!(!is_run_log(name), "{name} would be purged");
+            assert!(!is_purged(name), "{name} would be purged");
         }
     }
 

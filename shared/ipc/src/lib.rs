@@ -459,23 +459,66 @@ pub mod procmgr_labels
     /// Attach to a process: the Thread caps procmgr holds for it, each with
     /// `OBSERVE`, `CONTROL`, and `UPCALL`, and where its image lies. Served
     /// only on a badge carrying [`DEBUG_AUTHORITY`] (`UNAUTHORIZED`
-    /// otherwise). `data[0]` is the target's process badge and `data[1]` the
-    /// index of the first thread to return. Replies `SUCCESS` with
-    /// `data[0]` the number of threads procmgr holds for the target,
+    /// otherwise). `data[0]` names the target: its process badge, or the badge
+    /// a fault message on the crash endpoint carries for one of its threads;
+    /// `data[1]` is the index of the first thread to return. Replies `SUCCESS`
+    /// with `data[0]` the number of live threads procmgr holds for the target
+    /// (its main thread, then each registered one, [`REGISTER_THREAD`]),
     /// `data[1]` its load bias, `data[2]`/`data[3]` the start and end of its
-    /// biased text, and `data[4]` the address of its `ProcessInfo` page, and
-    /// with the caps of threads `data[1]..` of the request, at most
-    /// [`ATTACH_THREADS_PAGE`]; `INVALID_BADGE` when no live process carries
-    /// the badge (memmgr and procmgr, which procmgr did not create, among
-    /// them); `NOT_ATTACHABLE` when the target sent [`DECLARE_NO_DEBUG`].
-    /// Specified in `services/procmgr/docs/ipc-interface.md`
-    /// § `ATTACH_PROCESS`.
+    /// biased text, `data[4]` the address of its `ProcessInfo` page,
+    /// `data[`[`ATTACH_WORD_PROCESS_BADGE`]`]` the target's process badge, and
+    /// `data[`[`ATTACH_WORD_NAMED_THREAD`]`]` the index of the thread the
+    /// request's badge names, and with the caps of threads `data[1]..` of the
+    /// request, at most [`ATTACH_THREADS_PAGE`]; `INVALID_BADGE` when no live
+    /// process carries the badge (memmgr and procmgr, which procmgr did not
+    /// create, among them); `NOT_ATTACHABLE` when the target sent
+    /// [`DECLARE_NO_DEBUG`]. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`.
     pub const ATTACH_PROCESS: u64 = 20;
+
+    /// [`ATTACH_PROCESS`] reply word: the target's process badge, the
+    /// request's `data[0]` when that named the process itself.
+    pub const ATTACH_WORD_PROCESS_BADGE: usize = 5;
+
+    /// [`ATTACH_PROCESS`] reply word: the index, in the reply's thread list,
+    /// of the thread the request's `data[0]` names: `0`, the main thread, for
+    /// a process badge; the registered thread a crash badge was bound to; or
+    /// [`ATTACH_NO_THREAD`] when that thread is no longer listed.
+    pub const ATTACH_WORD_NAMED_THREAD: usize = 6;
+
+    /// [`ATTACH_WORD_NAMED_THREAD`] value: the named thread is not listed.
+    pub const ATTACH_NO_THREAD: u64 = u64::MAX;
+
+    /// Register the calling thread with procmgr, so [`ATTACH_PROCESS`]
+    /// returns it. Sent on the sender's own procmgr cap (its process badge
+    /// names the process) by each thread the runtime spawns, before it runs
+    /// its code. Caps: `[thread]`, a Thread cap of the sending thread with
+    /// `OBSERVE`, `CONTROL`, and `UPCALL`, which procmgr keeps until the
+    /// thread exits, its cap is revoked, or the process is torn down. procmgr
+    /// binds the thread's exception class to the crash endpoint under a
+    /// badge of the thread's own when the thread's binding is the process's.
+    /// Replies `SUCCESS`; `INVALID_BADGE` when the badge names no live
+    /// process; `NOT_ATTACHABLE` when the process sent [`DECLARE_NO_DEBUG`];
+    /// `INVALID_ARGUMENT` without a Thread cap carrying those rights;
+    /// `THREAD_LIMIT` at [`REGISTERED_THREADS_MAX`]; `OUT_OF_MEMORY` when the
+    /// heap cannot hold the entry. A refused request's cap is deleted.
+    /// Specified in `services/procmgr/docs/ipc-interface.md`
+    /// § `REGISTER_THREAD`.
+    pub const REGISTER_THREAD: u64 = 22;
+
+    /// Registered threads procmgr holds for one process at most
+    /// ([`REGISTER_THREAD`]): above one thread per default stack the Sv39
+    /// arena zone holds (about 16 000). Past it a thread runs unregistered,
+    /// so no spawn fails for it; it bounds the `CSpace` slots and heap one
+    /// process can make procmgr hold.
+    pub const REGISTERED_THREADS_MAX: usize = 16384;
 
     /// The caller declares itself undebuggable, on its own procmgr cap (its
     /// process badge names it): procmgr unbinds its main thread's exception
-    /// class from the crash endpoint and refuses [`ATTACH_PROCESS`] on it
-    /// from then on, so no [`DEBUG_AUTHORITY`] holder stops it. Sent, before
+    /// class from the crash endpoint, releases every thread it registered
+    /// ([`REGISTER_THREAD`]) and unbinds those it bound, and refuses
+    /// [`ATTACH_PROCESS`] and [`REGISTER_THREAD`] on it from then on, so no
+    /// [`DEBUG_AUTHORITY`] holder stops it. Sent, before
     /// it spawns a thread, by each process a stop of which would deadlock a
     /// debug-authority holder: the log sink, the serial and framebuffer
     /// drivers, and every debug-authority holder. No data, no caps. Replies `SUCCESS`, or
@@ -3185,12 +3228,17 @@ pub mod procmgr_errors
     /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
     /// (**argv and env**).
     pub const ARGV_ENV_STILL_MAPPED: u64 = 14;
-    /// `procmgr_labels::ATTACH_PROCESS` refused: the target declared itself
-    /// undebuggable (`procmgr_labels::DECLARE_NO_DEBUG`).
+    /// `procmgr_labels::ATTACH_PROCESS` or `procmgr_labels::REGISTER_THREAD`
+    /// refused: the target, or the sender, declared itself undebuggable
+    /// (`procmgr_labels::DECLARE_NO_DEBUG`).
     pub const NOT_ATTACHABLE: u64 = 15;
     /// `procmgr_labels::REGISTER_CRASH_SERVICE` refused: a registered crash
     /// service still lives.
     pub const CRASH_SERVICE_PRESENT: u64 = 16;
+    /// `procmgr_labels::REGISTER_THREAD` refused: the sender's process
+    /// already holds `procmgr_labels::REGISTERED_THREADS_MAX` registered
+    /// threads that procmgr could not prune.
+    pub const THREAD_LIMIT: u64 = 17;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }

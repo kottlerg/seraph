@@ -38,11 +38,13 @@ pub mod dma_holds;
 pub mod fs_reads;
 pub mod init_reap;
 pub mod request_caps;
+pub mod threads;
 
 pub use create_blobs::{ArgvEnvRefusal, ArgvEnvTally, checked_total, decode_header};
 pub use dma_holds::{DmaHolds, HeldReclaim, ReleaseRefusal, release_target, release_token_badge};
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 pub use request_caps::{CreateCaps, CreateTailCaps, split_create_caps};
+pub use threads::{CrashBadges, RegisterRefusal, RegisteredThread, ThreadRegistry};
 
 extern crate alloc;
 
@@ -156,6 +158,9 @@ pub struct ProcessEntry
     /// Where the loader placed the child's image, which `ATTACH_PROCESS`
     /// reports.
     pub image: ImageSpan,
+    /// The threads the child's runtime registered (`REGISTER_THREAD`), which
+    /// `ATTACH_PROCESS` lists after the main thread.
+    pub threads: ThreadRegistry,
 }
 
 /// Where the loader placed a child's image: the load bias it drew and the
@@ -200,6 +205,15 @@ impl ProcessEntry
     pub fn badge(&self) -> u64
     {
         self.badge
+    }
+
+    /// Whether `badge` is one this child's threads are bound to the crash
+    /// endpoint with: its process badge, its main thread's, or a registered
+    /// thread's crash badge.
+    #[must_use]
+    pub fn owns_crash_badge(&self, badge: u64) -> bool
+    {
+        badge == self.badge || self.threads.position_of_crash_badge(badge).is_some()
     }
 }
 
@@ -314,6 +328,7 @@ pub struct ProcessTable
     /// Entries sorted by badge, no two sharing a badge.
     entries: Vec<ProcessEntry>,
     holds: DmaHolds,
+    crash_badges: CrashBadges,
 }
 
 impl ProcessTable
@@ -326,7 +341,28 @@ impl ProcessTable
         Self {
             entries: Vec::new(),
             holds: DmaHolds::new(),
+            crash_badges: CrashBadges::new(),
         }
+    }
+
+    /// A fresh thread crash badge, which no process badge and no other
+    /// thread's crash badge equals ([`threads::CrashBadges`]).
+    pub fn mint_crash_badge(&mut self) -> u64
+    {
+        self.crash_badges.mint()
+    }
+
+    /// Index of the live entry one of whose registered threads is bound to
+    /// the crash endpoint under `crash_badge`.
+    fn index_of_crash_badge(&self, crash_badge: u64) -> Option<usize>
+    {
+        if !threads::is_crash_badge(crash_badge)
+        {
+            return None;
+        }
+        self.entries
+            .iter()
+            .position(|e| e.threads.position_of_crash_badge(crash_badge).is_some())
     }
 
     /// Index of the entry whose badge is `badge`, or where one would go.
@@ -575,23 +611,90 @@ pub fn debug_authorized(caller_badge: u64) -> bool
     caller_badge & ipc::procmgr_labels::DEBUG_AUTHORITY != 0
 }
 
+/// The thread the badge of an `ATTACH_PROCESS` request names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamedThread
+{
+    /// A process badge: the process's main thread, the thread its crash
+    /// binding names.
+    Main,
+    /// A thread crash badge: the registered thread procmgr bound under it.
+    Registered(u64),
+}
+
+impl NamedThread
+{
+    /// The index of the named thread in `entry`'s attach list (the main
+    /// thread, then each registered thread), or
+    /// `procmgr_labels::ATTACH_NO_THREAD` when it is no longer listed.
+    #[must_use]
+    pub fn index_in(self, entry: &ProcessEntry) -> u64
+    {
+        match self
+        {
+            NamedThread::Main => 0,
+            NamedThread::Registered(badge) => entry
+                .threads
+                .position_of_crash_badge(badge)
+                .map_or(ipc::procmgr_labels::ATTACH_NO_THREAD, |i| i as u64 + 1),
+        }
+    }
+}
+
 /// The entry an `ATTACH_PROCESS` from `caller_badge` for `target` reaches,
-/// or why it is refused: the caller's authority first, then the target's
-/// presence, then its no-debug mark.
+/// with the thread `target` names, or why it is refused: the caller's
+/// authority first, then the target's presence, then its no-debug mark.
+/// `target` is a process badge, or the crash badge of one of a process's
+/// registered threads, as a fault message on the crash endpoint carries it.
 ///
 /// # Errors
 /// The [`AttachRefusal`] that refuses it.
 pub fn attach_target(
-    table: &ProcessTable,
+    table: &mut ProcessTable,
     caller_badge: u64,
     target: u64,
-) -> Result<&ProcessEntry, AttachRefusal>
+) -> Result<(&mut ProcessEntry, NamedThread), AttachRefusal>
 {
     if !debug_authorized(caller_badge)
     {
         return Err(AttachRefusal::Unauthorized);
     }
-    let entry = table.find_by_badge(target).ok_or(AttachRefusal::Unknown)?;
+    let (idx, named) = if threads::is_crash_badge(target)
+    {
+        let idx = table
+            .index_of_crash_badge(target)
+            .ok_or(AttachRefusal::Unknown)?;
+        (idx, NamedThread::Registered(target))
+    }
+    else
+    {
+        let idx = table.index_of_badge(target).ok_or(AttachRefusal::Unknown)?;
+        (idx, NamedThread::Main)
+    };
+    let entry = &mut table.entries[idx];
+    if entry.no_debug
+    {
+        return Err(AttachRefusal::NotAttachable);
+    }
+    Ok((entry, named))
+}
+
+/// The entry a `REGISTER_THREAD` sent on a cap badged `sender_badge` registers
+/// its thread with, or why it is refused: the sender's presence, then its
+/// no-debug mark.
+///
+/// # Errors
+/// [`AttachRefusal::Unknown`] when no live process carries the badge
+/// (`INVALID_BADGE`); [`AttachRefusal::NotAttachable`] when it declared
+/// itself undebuggable (`NOT_ATTACHABLE`).
+pub fn register_target(
+    table: &mut ProcessTable,
+    sender_badge: u64,
+) -> Result<&mut ProcessEntry, AttachRefusal>
+{
+    let entry = table
+        .find_mut_by_badge(sender_badge)
+        .ok_or(AttachRefusal::Unknown)?;
     if entry.no_debug
     {
         return Err(AttachRefusal::NotAttachable);
@@ -776,7 +879,18 @@ mod tests
             dma_hold: false,
             no_debug: false,
             image: ImageSpan::default(),
+            threads: ThreadRegistry::new(),
         }
+    }
+
+    /// The badge and named-thread index an attach reaches, for comparison.
+    fn attached(
+        table: &mut ProcessTable,
+        caller: u64,
+        target: u64,
+    ) -> Result<(u64, u64), AttachRefusal>
+    {
+        attach_target(table, caller, target).map(|(e, named)| (e.badge, named.index_in(e)))
     }
 
     #[test]
@@ -788,13 +902,13 @@ mod tests
         for badge in [0, 0x1234, DEATH_EQ_AUTHORITY]
         {
             assert_eq!(
-                attach_target(&table, badge, 0x1234).map(ProcessEntry::badge),
+                attached(&mut table, badge, 0x1234),
                 Err(AttachRefusal::Unauthorized)
             );
         }
         assert_eq!(
-            attach_target(&table, DEBUG_AUTHORITY, 0x1234).map(ProcessEntry::badge),
-            Ok(0x1234)
+            attached(&mut table, DEBUG_AUTHORITY, 0x1234),
+            Ok((0x1234, 0))
         );
     }
 
@@ -802,11 +916,67 @@ mod tests
     fn an_attach_to_a_process_procmgr_does_not_hold_is_unknown()
     {
         // memmgr and procmgr are never in the table, and neither is a reaped
-        // child.
-        let table = ProcessTable::new();
+        // child, nor a crash badge no registered thread carries.
+        let mut table = ProcessTable::new();
         assert_eq!(
-            attach_target(&table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x99).map(|e| e.badge),
+            attached(&mut table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x99),
             Err(AttachRefusal::Unknown)
+        );
+        let crash_badge = table.mint_crash_badge();
+        assert_eq!(
+            attached(
+                &mut table,
+                ipc::procmgr_labels::DEBUG_AUTHORITY,
+                crash_badge
+            ),
+            Err(AttachRefusal::Unknown)
+        );
+    }
+
+    #[test]
+    fn an_attach_by_a_thread_crash_badge_reaches_its_process_and_names_the_thread()
+    {
+        use ipc::procmgr_labels::DEBUG_AUTHORITY;
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(0x40)).unwrap();
+        table.insert(entry_with_badge(0x50)).unwrap();
+        let first = table.mint_crash_badge();
+        let second = table.mint_crash_badge();
+        let entry = register_target(&mut table, 0x50).unwrap();
+        for (cap, badge) in [(7, first), (8, 0), (9, second)]
+        {
+            entry.threads.reserve().unwrap();
+            entry.threads.push(RegisteredThread {
+                cap,
+                crash_badge: badge,
+            });
+        }
+        // The list is the main thread, then the registered ones in order.
+        assert_eq!(attached(&mut table, DEBUG_AUTHORITY, first), Ok((0x50, 1)));
+        assert_eq!(attached(&mut table, DEBUG_AUTHORITY, second), Ok((0x50, 3)));
+        assert_eq!(attached(&mut table, DEBUG_AUTHORITY, 0x50), Ok((0x50, 0)));
+        assert!(table.find_by_badge(0x50).unwrap().owns_crash_badge(second));
+        assert!(!table.find_by_badge(0x40).unwrap().owns_crash_badge(second));
+        // A named thread swept out since is no longer listed.
+        let (entry, named) = attach_target(&mut table, DEBUG_AUTHORITY, first).unwrap();
+        entry.threads.sweep(|t| t.cap != 7, |_| {});
+        assert_eq!(named.index_in(entry), ipc::procmgr_labels::ATTACH_NO_THREAD);
+    }
+
+    #[test]
+    fn a_registration_needs_a_live_process_that_did_not_declare_no_debug()
+    {
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(0x60)).unwrap();
+        assert_eq!(
+            register_target(&mut table, 0x61).map(|e| e.badge),
+            Err(AttachRefusal::Unknown)
+        );
+        assert_eq!(register_target(&mut table, 0x60).map(|e| e.badge), Ok(0x60));
+        let _ = table.declare_no_debug(0x60);
+        assert_eq!(
+            register_target(&mut table, 0x60).map(|e| e.badge),
+            Err(AttachRefusal::NotAttachable)
         );
     }
 
@@ -823,13 +993,13 @@ mod tests
         table.insert(entry_with_badge(0x78)).unwrap();
         assert_eq!(table.declare_no_debug(0x77), Some(41));
         assert_eq!(
-            attach_target(&table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x77).map(|e| e.badge),
+            attached(&mut table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x77),
             Err(AttachRefusal::NotAttachable)
         );
         // The declaration marks its sender alone.
         assert_eq!(
-            attach_target(&table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x78).map(|e| e.badge),
-            Ok(0x78)
+            attached(&mut table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x78),
+            Ok((0x78, 0))
         );
     }
 

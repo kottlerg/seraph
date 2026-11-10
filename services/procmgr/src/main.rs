@@ -618,15 +618,8 @@ fn dispatch_ipc(
             init_reap::handle_query(&req, ipc_buf);
         }
 
-        procmgr_labels::REGISTER_CRASH_SERVICE
-        | procmgr_labels::ATTACH_PROCESS
-        | procmgr_labels::DECLARE_NO_DEBUG => dispatch_debug(&req, ipc_buf, table),
-
-        _ =>
-        {
-            release_caps(req.caps());
-            reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
-        }
+        // The debug-authority and thread-registry labels, and unknown opcodes.
+        _ => dispatch_debug(&req, ipc_buf, table),
     }
 }
 
@@ -697,8 +690,9 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
     }
 }
 
-/// Dispatch the debug-authority labels: `REGISTER_CRASH_SERVICE`,
-/// `ATTACH_PROCESS`, and `DECLARE_NO_DEBUG`.
+/// Dispatch the debug-authority labels, `REGISTER_CRASH_SERVICE`,
+/// `ATTACH_PROCESS`, `DECLARE_NO_DEBUG`, and `REGISTER_THREAD`, and answer
+/// any other opcode `UNKNOWN_OPCODE`, deleting the caps it carried.
 fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
 {
     match req.label & 0xFFFF
@@ -709,12 +703,41 @@ fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::Proc
             release_caps(req.caps());
             handle_attach_process(req, ipc_buf, table);
         }
-        _ =>
+        procmgr_labels::REGISTER_THREAD => handle_register_thread(req, ipc_buf, table),
+        procmgr_labels::DECLARE_NO_DEBUG =>
         {
             release_caps(req.caps());
             handle_declare_no_debug(req.badge, ipc_buf, table);
         }
+        _ =>
+        {
+            release_caps(req.caps());
+            reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
+        }
     }
+}
+
+/// Handle `REGISTER_THREAD` — keep the sending thread's cap in its process's
+/// registry (`process::register_thread`;
+/// `services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`). Caps past
+/// `caps[0]`, and the cap of a refused request, are deleted.
+fn handle_register_thread(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+{
+    let (thread, extra) = req
+        .caps()
+        .split_first()
+        .map_or((0, &[][..]), |(&t, rest)| (t, rest));
+    release_caps(extra);
+    let code = match process::register_thread(req.badge, thread, table)
+    {
+        Ok(()) => procmgr_errors::SUCCESS,
+        Err(code) =>
+        {
+            release_caps(&[thread]);
+            code
+        }
+    };
+    reply_empty(ipc_buf, code);
 }
 
 /// Handle `REGISTER_CRASH_SERVICE` — hand the crash endpoint's receive side
@@ -773,13 +796,15 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
 /// process, from the index the request names, and where its image lies
 /// (`services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`).
 ///
-/// procmgr holds one Thread cap per process, its main thread's, so a reply
-/// carries it at index 0 and none past it; the count word says so.
-fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &process::ProcessTable)
+/// The list is the main thread at index 0, then each registered thread in
+/// registration order, those that are gone swept out first, so no exited
+/// thread is listed. The request's badge may be a thread crash badge, which
+/// names its process and, in the reply's named-thread word, that thread.
+fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
 {
-    let entry = match process_table::attach_target(table, req.badge, req.word(0))
+    let (entry, named) = match process_table::attach_target(table, req.badge, req.word(0))
     {
-        Ok(entry) => entry,
+        Ok(found) => found,
         Err(refusal) =>
         {
             let code = match refusal
@@ -792,36 +817,56 @@ fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &process::P
             return;
         }
     };
+    entry.threads.sweep(
+        |t| process::thread_is_listed(t.cap),
+        process::release_registered_thread,
+    );
+    let count = 1 + entry.threads.len();
     let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS)
-        .word(0, 1)
+        .word(0, count as u64)
         .word(1, entry.image.load_bias)
         .word(2, entry.image.text_start)
         .word(3, entry.image.text_end)
-        .word(4, entry.process_info_va);
-    let mut thread = 0;
-    if req.word(1) == 0
+        .word(4, entry.process_info_va)
+        .word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE, entry.badge())
+        .word(
+            procmgr_labels::ATTACH_WORD_NAMED_THREAD,
+            named.index_in(entry),
+        );
+    let first = usize::try_from(req.word(1)).unwrap_or(usize::MAX);
+    let mut derived = [0u64; procmgr_labels::ATTACH_THREADS_PAGE];
+    let mut n = 0;
+    for index in first..count.min(first.saturating_add(procmgr_labels::ATTACH_THREADS_PAGE))
     {
-        let Ok(cap) = syscall::cap_derive(entry.thread_cap, syscall_abi::RIGHTS_THREAD)
+        let source = match index
+        {
+            0 => entry.thread_cap,
+            _ => entry.threads.get(index - 1).map_or(0, |t| t.cap),
+        };
+        let Ok(cap) = syscall::cap_derive(source, syscall_abi::RIGHTS_THREAD)
         else
         {
+            release_caps(&derived[..n]);
             reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
             return;
         };
-        thread = cap;
+        derived[n] = cap;
+        n += 1;
         reply = reply.cap(cap);
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) }.is_err() && thread != 0
+    if unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) }.is_err()
     {
-        let _ = syscall::cap_delete(thread);
+        release_caps(&derived[..n]);
     }
 }
 
 /// Handle `DECLARE_NO_DEBUG` from the process `badge` names, on its own
-/// procmgr cap: mark it undebuggable and unbind its main thread's exception
-/// class from the crash endpoint; the runtime copies that binding, unbound,
-/// onto the threads it spawns after. Reply `SUCCESS`, or `INVALID_BADGE`
-/// when the badge names no live process
+/// procmgr cap: mark it undebuggable, unbind its main thread's exception
+/// class from the crash endpoint, and release every thread it registered,
+/// unbinding each that procmgr bound there; the runtime copies a binding,
+/// unbound, onto the threads it spawns after. Reply `SUCCESS`, or
+/// `INVALID_BADGE` when the badge names no live process
 /// (`services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_DEBUG`).
 fn handle_declare_no_debug(badge: u64, ipc_buf: *mut u64, table: &mut process::ProcessTable)
 {
@@ -831,6 +876,14 @@ fn handle_declare_no_debug(badge: u64, ipc_buf: *mut u64, table: &mut process::P
         {
             let _ =
                 syscall::thread_set_fault_handler(thread, 0, syscall_abi::FAULT_CLASS_EXCEPTION);
+            if let Some(entry) = table.find_mut_by_badge(badge)
+            {
+                let registered = entry.threads.take_all();
+                process::unbind_registered_threads(&registered);
+                registered
+                    .into_iter()
+                    .for_each(process::release_registered_thread);
+            }
             procmgr_errors::SUCCESS
         }
         None => procmgr_errors::INVALID_BADGE,

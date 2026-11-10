@@ -1952,6 +1952,7 @@ fn finalize_creation(
             dma_hold: false,
             no_debug: false,
             image,
+            threads: process_table::ThreadRegistry::new(),
         })
         .is_err()
     {
@@ -2025,24 +2026,136 @@ fn finalize_creation(
 /// outcome it has with no handler.
 fn bind_crash_endpoint(child_thread: u64, badge: u64)
 {
+    if crate::crash::endpoint() != 0 && !bind_exception_class(child_thread, badge)
+    {
+        std::os::seraph::log!("crash endpoint not bound; exceptions stay unbound");
+    }
+}
+
+/// Bind `thread`'s exception class to the crash endpoint under `badge`.
+/// Returns whether the binding took effect; with no crash endpoint it never
+/// does.
+fn bind_exception_class(thread: u64, badge: u64) -> bool
+{
     let ep = crate::crash::endpoint();
     if ep == 0
     {
-        return;
+        return false;
     }
     let Ok(badged) = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, badge)
     else
     {
-        std::os::seraph::log!("crash endpoint badge not derived; exceptions stay unbound");
-        return;
+        return false;
     };
-    if syscall::thread_set_fault_handler(child_thread, badged, FAULT_CLASS_EXCEPTION).is_err()
-    {
-        std::os::seraph::log!("crash endpoint not bound; exceptions stay unbound");
-    }
+    let bound = syscall::thread_set_fault_handler(thread, badged, FAULT_CLASS_EXCEPTION).is_ok();
     // The binding holds its own reference on the endpoint; procmgr needs no
     // copy of the badged cap.
     let _ = syscall::cap_delete(badged);
+    bound
+}
+
+// ── Thread registry ─────────────────────────────────────────────────────────
+
+/// Register the thread `thread_cap` names with the process the request's
+/// `badge` names (`REGISTER_THREAD`), consuming the cap on success.
+///
+/// The cap must be a Thread cap with `RIGHTS_THREAD`. A registry that reached
+/// its sweep count first drops the threads that are gone
+/// ([`thread_is_listed`]). A thread whose exception class is bound under one
+/// of its process's crash badges (`ProcessEntry::owns_crash_badge`), as one
+/// that copied its spawner's bindings is, is bound again under a fresh crash
+/// badge, so its faults name it; a debugger's binding, or none, is left as it
+/// is (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`).
+///
+/// # Errors
+/// The reply code: `INVALID_BADGE` when no live process carries `badge`,
+/// `NOT_ATTACHABLE` when it declared itself undebuggable,
+/// `INVALID_ARGUMENT` when the cap is not a Thread cap with `RIGHTS_THREAD`,
+/// `THREAD_LIMIT` at `procmgr_labels::REGISTERED_THREADS_MAX`, and
+/// `OUT_OF_MEMORY` when the heap cannot hold the entry. The caller deletes
+/// the cap on every error.
+pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) -> Result<(), u64>
+{
+    let crash_badge = table.mint_crash_badge();
+    let entry = process_table::register_target(table, badge).map_err(|r| match r
+    {
+        process_table::AttachRefusal::NotAttachable => procmgr_errors::NOT_ATTACHABLE,
+        _ => procmgr_errors::INVALID_BADGE,
+    })?;
+    if !is_full_thread_cap(thread_cap)
+    {
+        return Err(procmgr_errors::INVALID_ARGUMENT);
+    }
+    if entry.threads.needs_sweep()
+    {
+        entry
+            .threads
+            .sweep(|t| thread_is_listed(t.cap), release_registered_thread);
+    }
+    entry.threads.reserve().map_err(|r| match r
+    {
+        process_table::RegisterRefusal::Limit => procmgr_errors::THREAD_LIMIT,
+        process_table::RegisterRefusal::OutOfMemory => procmgr_errors::OUT_OF_MEMORY,
+    })?;
+    let inherited = syscall::thread_get_fault_handler(thread_cap, FAULT_CLASS_EXCEPTION)
+        .ok()
+        .flatten();
+    let bound = inherited.is_some_and(|b| entry.owns_crash_badge(b))
+        && bind_exception_class(thread_cap, crash_badge);
+    entry.threads.push(process_table::RegisteredThread {
+        cap: thread_cap,
+        crash_badge: if bound { crash_badge } else { 0 },
+    });
+    Ok(())
+}
+
+/// Whether `cap` is a Thread cap carrying every right of `RIGHTS_THREAD`:
+/// the rights `ATTACH_PROCESS` hands out.
+fn is_full_thread_cap(cap: u64) -> bool
+{
+    if cap == 0 || syscall::cap_info(cap, syscall_abi::CAP_INFO_THREAD_STATE).is_err()
+    {
+        return false;
+    }
+    syscall::cap_info(cap, syscall_abi::CAP_INFO_TAG_RIGHTS).is_ok_and(|packed| {
+        let rights = packed & 0xFFFF_FFFF;
+        rights & syscall_abi::RIGHTS_THREAD == syscall_abi::RIGHTS_THREAD
+    })
+}
+
+/// Whether a registered thread's cap still names a thread that has not
+/// exited: the runtime's revocation at its reclaim (or any other) leaves the
+/// slot stale, and an exited thread is no longer listed.
+pub fn thread_is_listed(cap: u64) -> bool
+{
+    syscall::cap_info(cap, syscall_abi::CAP_INFO_THREAD_STATE)
+        .is_ok_and(|packed| (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED)
+}
+
+/// Release one registered thread: revoke the caps `ATTACH_PROCESS` derived
+/// from procmgr's, then delete procmgr's. A slot the runtime already revoked
+/// fails both calls harmlessly, its handle's generation being stale.
+// needless_pass_by_value: the `sweep` callback hands each thread over by value.
+#[allow(clippy::needless_pass_by_value)]
+pub fn release_registered_thread(thread: process_table::RegisteredThread)
+{
+    let _ = syscall::cap_revoke_all(thread.cap);
+    let _ = syscall::cap_delete(thread.cap);
+}
+
+/// Unbind from the crash endpoint each of `threads` procmgr bound there
+/// whose binding is still the one procmgr made, as `DECLARE_NO_DEBUG` does
+/// for the main thread; a debugger's later binding is left.
+pub fn unbind_registered_threads(threads: &[process_table::RegisteredThread])
+{
+    for t in threads.iter().filter(|t| t.crash_badge != 0)
+    {
+        if syscall::thread_get_fault_handler(t.cap, FAULT_CLASS_EXCEPTION)
+            == Ok(Some(t.crash_badge))
+        {
+            let _ = syscall::thread_set_fault_handler(t.cap, 0, FAULT_CLASS_EXCEPTION);
+        }
+    }
 }
 
 /// Delegate a child's address space to memmgr and bind its main thread's
@@ -3591,20 +3704,28 @@ fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
 // reference would invite accidental double-free on subsequent reuse.
 #[allow(clippy::needless_pass_by_value)]
 pub fn teardown_entry(
-    entry: ProcessEntry,
+    mut entry: ProcessEntry,
     exit_reason: u64,
     memmgr_ep: u64,
     ipc_buf: *mut u64,
     holds: &mut DmaHolds,
 )
 {
-    // Order: thread first so the scheduler drops any residual reference to
-    // the aspace before we tear down its page tables. Then cspace (which
-    // owns every cap the child held) before aspace (whose dealloc walks the
-    // page tables). pi_memory and the argv/env region last — leaf resources
-    // the child used read-only; no other object references them.
+    // Order: threads first so the scheduler drops any residual reference to
+    // the aspace before we tear down its page tables: the main thread, then
+    // the registered ones, whose caps, and every copy `ATTACH_PROCESS` handed
+    // out, go with procmgr's. Then cspace (which owns every cap the child
+    // held, the runtime's own thread caps among them) before aspace (whose
+    // dealloc walks the page tables). pi_memory and the argv/env region
+    // last — leaf resources the child used read-only; no other object
+    // references them.
     let _ = syscall::cap_revoke_all(entry.thread_cap);
     let _ = syscall::cap_delete(entry.thread_cap);
+    entry
+        .threads
+        .take_all()
+        .into_iter()
+        .for_each(release_registered_thread);
     let _ = syscall::cap_revoke_all(entry.cspace_cap);
     let _ = syscall::cap_delete(entry.cspace_cap);
     let _ = syscall::cap_revoke_all(entry.aspace_cap);

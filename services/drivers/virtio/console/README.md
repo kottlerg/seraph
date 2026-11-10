@@ -38,6 +38,12 @@ whose definition seeds it holds (see
 whose machine presents no console device, every boot that does not ask for the debug port, has
 no debug port.
 
+The driver declares itself undebuggable to procmgr (`procmgr_labels::DECLARE_NO_DEBUG`) first
+thing, before its bootstrap and before it spawns a thread: the GDB stub reaches its host through
+this driver for every packet, so a stub attached to it would stop the thread it then waits on.
+procmgr then refuses an attach to it, and its faults go unreported
+([procmgr IPC Interface](../../../procmgr/docs/ipc-interface.md) § Label 21: `DECLARE_NO_DEBUG`).
+
 QEMU presents the device when a launch takes `--debug-port <PORT>`
 ([xtask/README.md](../../../../xtask/README.md#cargo-xtask-run)): a `virtio-serial-pci` device
 with one `virtconsole` port, whose host end is a TCP server on `127.0.0.1:<PORT>`.

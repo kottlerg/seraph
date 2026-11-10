@@ -277,19 +277,13 @@ fn label_names(issue: &serde_json::Value) -> Vec<String>
         .unwrap_or_default()
 }
 
-/// Entry point for `cargo xtask issue-file`.
-pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
+/// Create the Issue with `gh` and return its number and URL.
+fn create_issue(
+    ctx: &BuildContext,
+    args: &IssueFileArgs,
+    milestone: Option<&str>,
+) -> Result<(u64, String)>
 {
-    step(&format!("Filing an Issue: {}", args.title));
-    let body = fs::read_to_string(&args.body_file)
-        .with_context(|| format!("cannot read {}", args.body_file.display()))?;
-    let choice = MilestoneChoice::from_args(args.milestone.as_deref(), args.unscheduled);
-    let problems = check_filing(&args.title, &body, &args.label, &choice);
-    if !problems.is_empty()
-    {
-        bail!("refusing to file the Issue: {}", problems.join("; "));
-    }
-
     let body_file = args.body_file.to_string_lossy();
     let mut command = vec![
         "issue",
@@ -303,17 +297,33 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
     {
         command.extend(["--label", label.as_str()]);
     }
-    if let Some(title) = choice.title()
+    if let Some(title) = milestone
     {
         command.extend(["--milestone", title]);
     }
-    let url = gh::run(&ctx.root, &command)?;
-    let number: u64 = url
-        .trim()
+    let url = gh::run(&ctx.root, &command)?.trim().to_owned();
+    let number = url
         .rsplit('/')
         .next()
         .and_then(|n| n.parse().ok())
-        .with_context(|| format!("gh printed no Issue URL: {}", url.trim()))?;
+        .with_context(|| format!("gh printed no Issue URL: {url}"))?;
+    Ok((number, url))
+}
+
+/// Entry point for `cargo xtask issue-file`.
+pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
+{
+    step(&format!("Filing an Issue: {}", args.title));
+    let body = fs::read_to_string(&args.body_file)
+        .with_context(|| format!("cannot read {}", args.body_file.display()))?;
+    let choice = MilestoneChoice::from_args(args.milestone.as_deref(), args.unscheduled);
+    let problems = check_filing(&args.title, &body, &args.label, &choice);
+    if !problems.is_empty()
+    {
+        bail!("refusing to file the Issue: {}", problems.join("; "));
+    }
+
+    let (number, url) = create_issue(ctx, args, choice.title())?;
 
     let issue = gh::issue(&ctx.root, number)?;
     let held_labels = label_names(&issue);
@@ -330,7 +340,7 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
             missing.join(", ")
         );
     }
-    println!("    filed #{number}: {}", url.trim());
+    println!("    filed #{number}: {url}");
     Ok(())
 }
 

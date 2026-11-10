@@ -151,6 +151,20 @@ pub fn refs_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
     refs_in(&pat.refs_ref, text, 1)
 }
 
+/// `line` without the list or quote markers that open it (`-`, `*`, `+`,
+/// `>`), so that `- Fixes #N` reads as the closing line it is.
+fn unmarked(line: &str) -> &str
+{
+    let mut rest = line.trim_start();
+    while let Some(inner) = ["- ", "* ", "+ ", "> "]
+        .iter()
+        .find_map(|marker| rest.strip_prefix(marker))
+    {
+        rest = inner.trim_start();
+    }
+    rest
+}
+
 /// The closing references of `text` that stand inside prose: on a line that
 /// holds anything besides closing references and the punctuation joining
 /// them. GitHub closes the Issue for these exactly as for a `Fixes #N` line,
@@ -162,7 +176,7 @@ pub fn prose_closing_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
         .into_iter()
         .filter(|found| {
             let line = lines.get(found.line - 1).copied().unwrap_or("");
-            let rest = pat.closing_ref.replace_all(line, "");
+            let rest = pat.closing_ref.replace_all(unmarked(line), "");
             rest.split(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | ';'))
                 .any(|word| !word.is_empty() && word != "and")
         })
@@ -466,12 +480,12 @@ fn check_body_closing(pat: &Patterns, body: &str) -> Vec<Diag>
     {
         if referenced.contains(&found.issue)
         {
-            out.push(Diag::error(
+            out.push(Diag::warning(
                 "pr-closes-and-refs",
                 format!("body:{}", found.line),
                 format!(
-                    "the body closes #{} here and references it with `Refs` elsewhere; a PR \
-                     that does not close an Issue must not carry a closing keyword for it",
+                    "the body closes #{} here and also references it with `Refs`; confirm the \
+                     PR means to close it",
                     found.issue
                 ),
             ));
@@ -1350,6 +1364,10 @@ mod tests
         // A line of closing references alone is the intended form.
         assert!(found("Fixes #10").is_empty());
         assert!(found("Fixes #10, closes #11 and resolves #12.").is_empty());
+        // A list item or a quoted line that holds only the closing line.
+        assert!(found("- Fixes #10").is_empty());
+        assert!(found("> * Closes #10").is_empty());
+        assert_eq!(found("- also fixes #10"), [10]);
         assert!(found("Refs #13").is_empty());
 
         let body = format!("{BODY}\nThe next PR carries `Fixes #835`.\n");
@@ -1359,7 +1377,7 @@ mod tests
     }
 
     #[test]
-    fn closing_an_issue_the_body_also_references_is_an_error()
+    fn closing_an_issue_the_body_also_references_is_flagged()
     {
         // The body means `Refs`, and a sentence about a later PR closes the
         // same Issue.

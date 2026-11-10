@@ -229,6 +229,14 @@ fn check_stats(out: &mut Vec<Diag>, name: &str, stats: &Value)
     {
         out.push(shape(name, "stats.failed", "is not a list"));
     }
+    if !stats["run"].as_u64().is_some_and(|run| run > 0)
+    {
+        out.push(shape(
+            name,
+            "stats.run",
+            "is not the run's number in the PR's sequence of runs, counting from 1",
+        ));
+    }
     let head = stats["head"].as_str().unwrap_or("");
     if head.len() < 8 || !head.chars().all(|c| c.is_ascii_hexdigit())
     {
@@ -276,42 +284,16 @@ pub fn check_record(name: &str, record: &Value) -> Vec<Diag>
 
 /// Whether the record file `name` is a run at `head`, by the head its name
 /// states. The name decides, not the content: a record that does not parse
-/// is still a run, and the last run must be well-formed.
+/// is still a run at the head, and every run there must be well-formed.
 fn names_head(name: &str, head: &str) -> bool
 {
     name_parts(name).is_some_and(|(_, stated, _)| !stated.is_empty() && head.starts_with(stated))
 }
 
-/// Whether `mode` is a run with the reviewer.
-fn is_reviewer_mode(mode: &str) -> bool
+/// A record's place in the PR's sequence of runs: `stats.run`.
+fn run_number(record: &Value) -> u64
 {
-    mode != "audit"
-}
-
-/// Where a record's run stands among the runs at one head: by its run number
-/// (the `-<n>` suffix, 1 without one), then an audit after the reviewer run
-/// of the same number. File-name order is not run order (`-2.json` sorts
-/// before `.json`).
-fn run_order(name: &str) -> (u32, bool)
-{
-    name_parts(name).map_or((0, false), |(mode, _, run)| (run, !is_reviewer_mode(mode)))
-}
-
-/// The run number that two reviewer runs at `head` share, if any: a `full`
-/// and a `delta` record with the same number cannot be ordered.
-fn ambiguous_run(records: &[Record], head: &str) -> Option<u32>
-{
-    let mut runs: Vec<u32> = records
-        .iter()
-        .filter(|(name, _)| names_head(name, head))
-        .filter_map(|(name, _)| name_parts(name))
-        .filter(|(mode, _, _)| is_reviewer_mode(mode))
-        .map(|(_, _, run)| run)
-        .collect();
-    runs.sort_unstable();
-    runs.windows(2)
-        .find(|pair| pair[0] == pair[1])
-        .map(|p| p[0])
+    record["stats"]["run"].as_u64().unwrap_or(0)
 }
 
 /// Whether a record's run passes: `AUDIT PASS`, no failed agent, and a
@@ -328,41 +310,56 @@ fn passes(record: &Value) -> bool
         )
 }
 
-/// The merge-prompt condition's record part (docs/conventions.md § Branch
-/// and PR Workflow): the last run at `head` is a well-formed record with no
-/// failed agent, `AUDIT PASS`, and a reviewer verdict that is not `BLOCKING
-/// ISSUES`. An earlier passing run at the same head does not count.
-pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
+/// The last run at `head`: the record there with the greatest `stats.run`.
+/// An error when no record names the head, when one of them is malformed (it
+/// could be the last and cannot be placed), or when two carry one number.
+fn last_run<'a>(records: &'a [Record], head: &str) -> Result<&'a Record, Vec<Diag>>
 {
     let at = head.get(..8).unwrap_or(head);
-    if let Some(run) = ambiguous_run(records, head)
-    {
-        return vec![Diag::error(
-            "gate-review-record",
-            at,
-            format!(
-                "two runs with the reviewer at this head carry run number {run}; name the later \
-                 one `<mode>-<head>-<n>.json`"
-            ),
-        )];
-    }
-    let Some((name, record)) = records
+    let here: Vec<&Record> = records
         .iter()
         .filter(|(name, _)| names_head(name, head))
-        .max_by_key(|(name, _)| run_order(name))
+        .collect();
+    let malformed: Vec<Diag> = here
+        .iter()
+        .flat_map(|(name, record)| check_record(name, record))
+        .collect();
+    if !malformed.is_empty()
+    {
+        return Err(malformed);
+    }
+    let Some(last) = here.iter().max_by_key(|(_, record)| run_number(record))
     else
     {
-        return vec![Diag::error(
+        return Err(vec![Diag::error(
             "gate-review-record",
             at,
             "no run record reviewed this head",
-        )];
+        )]);
     };
-    let mut out = check_record(name, record);
-    if !out.is_empty()
+    let number = run_number(&last.1);
+    if here.iter().filter(|(_, r)| run_number(r) == number).count() > 1
     {
-        return out;
+        return Err(vec![Diag::error(
+            "gate-review-record",
+            at,
+            format!("two run records at this head carry `stats.run` {number}"),
+        )]);
     }
+    Ok(last)
+}
+
+/// The merge-prompt condition's record part (docs/conventions.md § Branch
+/// and PR Workflow): the last run at `head` has no failed agent, `AUDIT
+/// PASS`, and a reviewer verdict that is not `BLOCKING ISSUES`. An earlier
+/// passing run at the same head does not count.
+pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
+{
+    let (name, record) = match last_run(records, head)
+    {
+        Ok(last) => last,
+        Err(diags) => return diags,
+    };
     if !passes(record)
     {
         return vec![Diag::error(
@@ -375,16 +372,16 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
     let open = record["findings"].as_array().map_or(0, Vec::len);
     if record["verdict"] == "NON-BLOCKING ISSUES ONLY" && open > 0
     {
-        out.push(Diag::warning(
+        return vec![Diag::warning(
             "gate-findings-recorded",
             name.as_str(),
             format!(
                 "{open} finding(s) stay on the surface; confirm each is recorded on its Issue \
                  and none is contested"
             ),
-        ));
+        )];
     }
-    out
+    Vec::new()
 }
 
 /// Build the ledger from every record of a PR: the findings each run
@@ -486,7 +483,9 @@ mod tests
             "audit": {"verdict": audit, "sections": []},
             "findings": findings,
             "recorded": [], "ledgered": [], "dropped": [],
-            "stats": {"mode": "delta", "head": HEAD, "since": "1234abcd", "failed": []}
+            "stats": {
+                "mode": "delta", "head": HEAD, "since": "1234abcd", "failed": [], "run": 1
+            }
         })
     }
 
@@ -603,6 +602,16 @@ mod tests
     }
 
     #[test]
+    fn a_record_without_its_run_number_is_reported()
+    {
+        let mut r = passing();
+        r["stats"]["run"] = json!(0);
+        assert_eq!(fields(&r), ["stats.run"]);
+        r["stats"].as_object_mut().unwrap().remove("run");
+        assert_eq!(fields(&r), ["stats.run"]);
+    }
+
+    #[test]
     fn a_record_whose_name_states_another_mode_or_head_is_reported()
     {
         let r = passing();
@@ -639,34 +648,49 @@ mod tests
         }
     }
 
+    /// A record of `mode` that is the PR's `run`-th run.
+    fn run(mode: &str, run: u64, verdict: &str, audit: &str) -> Value
+    {
+        let mut r = record(verdict, audit, vec![]);
+        r["stats"]["mode"] = json!(mode);
+        r["stats"]["run"] = json!(run);
+        r
+    }
+
+    const PASS: (&str, &str) = ("READY TO MERGE", "AUDIT PASS");
+
     #[test]
     fn the_gate_passes_when_the_last_run_at_the_head_passes()
     {
         let records = vec![
             (
                 NAME.to_owned(),
-                record("BLOCKING ISSUES", "AUDIT FAIL", vec![]),
+                run("delta", 2, "BLOCKING ISSUES", "AUDIT FAIL"),
             ),
-            ("delta-0a82b0aa-2.json".to_owned(), passing()),
+            (
+                "delta-0a82b0aa-2.json".to_owned(),
+                run("delta", 3, PASS.0, PASS.1),
+            ),
         ];
         assert!(gate_diags(&records, HEAD).is_empty());
         assert!(gate_diags(&records, "0a82b0aa").is_empty());
     }
 
     #[test]
-    fn the_gate_fails_when_a_later_run_at_the_head_fails()
+    fn the_gate_fails_when_a_later_audit_at_the_head_fails()
     {
         // A re-audit after a body edit: same head, later run. `audit-…-2`
         // sorts before `audit-….json` by name and is still the last run.
-        let audit = |audit_verdict: &str| {
-            let mut r = record("READY TO MERGE", audit_verdict, vec![]);
-            r["stats"]["mode"] = json!("audit");
-            r
-        };
         let records = vec![
-            (NAME.to_owned(), passing()),
-            ("audit-0a82b0aa.json".to_owned(), audit("AUDIT PASS")),
-            ("audit-0a82b0aa-2.json".to_owned(), audit("AUDIT FAIL")),
+            (NAME.to_owned(), run("delta", 2, PASS.0, PASS.1)),
+            (
+                "audit-0a82b0aa.json".to_owned(),
+                run("audit", 3, PASS.0, PASS.1),
+            ),
+            (
+                "audit-0a82b0aa-2.json".to_owned(),
+                run("audit", 4, PASS.0, "AUDIT FAIL"),
+            ),
         ];
         let found = gate_diags(&records, HEAD);
         assert_eq!(rules(&found), ["gate-review-record"]);
@@ -674,11 +698,40 @@ mod tests
     }
 
     #[test]
-    fn the_gate_fails_when_the_last_run_at_the_head_does_not_parse()
+    fn a_reviewer_run_after_an_audit_at_the_head_is_the_last_run()
     {
-        // The earlier run passes; the last one is truncated, so it has no
-        // `stats.head` to be found by. Its file name still makes it the last
-        // run at the head.
+        // An auditor-only run, then the run with the reviewer it called for,
+        // at the same head. The file names give both run number 1 of their
+        // kind; `stats.run` orders them.
+        let blocking_after_audit = vec![
+            (
+                "audit-0a82b0aa.json".to_owned(),
+                run("audit", 2, PASS.0, PASS.1),
+            ),
+            (
+                NAME.to_owned(),
+                run("delta", 3, "BLOCKING ISSUES", "AUDIT PASS"),
+            ),
+        ];
+        let found = gate_diags(&blocking_after_audit, HEAD);
+        assert_eq!(rules(&found), ["gate-review-record"]);
+        assert_eq!(found[0].at, NAME);
+
+        let passing_after_failed_audit = vec![
+            (
+                "audit-0a82b0aa.json".to_owned(),
+                run("audit", 2, PASS.0, "AUDIT FAIL"),
+            ),
+            (NAME.to_owned(), run("delta", 3, PASS.0, PASS.1)),
+        ];
+        assert!(gate_diags(&passing_after_failed_audit, HEAD).is_empty());
+    }
+
+    #[test]
+    fn the_gate_fails_when_a_record_at_the_head_does_not_parse()
+    {
+        // The truncated record has no `stats.run` to be placed by, so it may
+        // be the last run. Its file name still puts it at the head.
         let records = vec![
             (NAME.to_owned(), passing()),
             ("audit-0a82b0aa.json".to_owned(), Value::Null),
@@ -689,28 +742,18 @@ mod tests
     }
 
     #[test]
-    fn the_gate_refuses_two_reviewer_runs_it_cannot_order()
+    fn the_gate_refuses_two_runs_at_the_head_with_one_number()
     {
-        // A full run after a delta run at one head, both without a suffix:
-        // neither name says which came last.
-        let mut full = record("BLOCKING ISSUES", "AUDIT FAIL", vec![]);
-        full["stats"]["mode"] = json!("full");
         let records = vec![
-            (NAME.to_owned(), passing()),
-            ("full-0a82b0aa.json".to_owned(), full.clone()),
+            (NAME.to_owned(), run("delta", 2, PASS.0, PASS.1)),
+            (
+                "full-0a82b0aa.json".to_owned(),
+                run("full", 2, "BLOCKING ISSUES", "AUDIT FAIL"),
+            ),
         ];
         let found = gate_diags(&records, HEAD);
         assert_eq!(rules(&found), ["gate-review-record"]);
-        assert!(found[0].message.contains("run number 1"));
-
-        // Named as the second run, the full run is the last and decides.
-        let ordered = vec![
-            (NAME.to_owned(), passing()),
-            ("full-0a82b0aa-2.json".to_owned(), full),
-        ];
-        let found = gate_diags(&ordered, HEAD);
-        assert_eq!(rules(&found), ["gate-review-record"]);
-        assert_eq!(found[0].at, "full-0a82b0aa-2.json");
+        assert!(found[0].message.contains("`stats.run` 2"));
     }
 
     #[test]

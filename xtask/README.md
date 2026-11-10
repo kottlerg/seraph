@@ -818,8 +818,8 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 |---|---|---|
 | `pr-unticked-box` | error | The body has no unticked task-list item (§ PR-body checklist discipline): `[ ]` after a `-`, `*`, `+`, or numbered list marker, the forms GitHub renders as a checkbox. |
 | `pr-attribution` | error | The body carries no tool attribution line and no session link. |
-| `pr-closes-and-refs` | error | The body does not both close an Issue and reference it with `Refs #N`: a PR that does not close an Issue carries no closing keyword for it. |
-| `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`) is the intended form. |
+| `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`. A drain PR that closes a follow-up Issue carries both (§ Branch and PR Workflow); in any other body the pair usually means a sentence closes an Issue the PR only references. |
+| `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
 | `pr-validation` | error | The body has a `## Validation` section that names a validated head: the first word of that section that is a commit hash in the clone. |
 | `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch, the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. |
 | `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
@@ -840,7 +840,7 @@ fails the gate.
 | `gate-merge-state` | error | GitHub reports the merge state `CLEAN`. |
 | `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
-| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. Runs at one head are ordered by the `-<n>` suffix of the file name, an audit after the reviewer run of the same number; an earlier passing run does not count, a last record that does not parse fails, and two reviewer runs with one number at a head are refused as unordered. |
+| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
 | `gate-findings-recorded` | warning | That record leaves no finding on the surface. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each is recorded and none is contested; the command cannot. |
 
 The command does not judge what needs a reader: whether the body's claims match the diff, whether
@@ -858,7 +858,8 @@ cargo xtask review-check <N>
 A run record is `target/xtask/review/pr<N>/<mode>-<head>.json`, where `<mode>` is `full`, `delta`,
 or `audit` and `<head>` is the head the run reviewed. A further run at a head that already has a
 record of that kind (a second run with the reviewer, a second audit) is `<mode>-<head>-<n>.json`,
-`<n>` counting from 2. It is one JSON object:
+`<n>` counting from 2. The suffix only keeps the names apart: `stats.run` orders the runs. It is
+one JSON object:
 
 | Key | Value |
 |---|---|
@@ -869,7 +870,7 @@ record of that kind (a second run with the reviewer, a second audit) is `<mode>-
 | `recorded` | The findings off the surface. |
 | `ledgered` | The findings the reviewer listed as held by the ledger. |
 | `dropped` | Findings dropped as false. |
-| `stats` | `mode` (as in the file name), `head` (the full hash), `since` (the head the previous run with the reviewer reviewed, or null), and `failed` (the agents that returned no result). |
+| `stats` | `mode` (as in the file name), `head` (the full hash), `since` (the head the previous run with the reviewer reviewed, or null), `failed` (the agents that returned no result), and `run` (the run's number in the PR's sequence of runs, of either kind, counting from 1). |
 
 Each finding is an object with `file`, `line`, `class` (`correctness`, `safety`, `contract`,
 `standards`, `doc-drift`, `coverage`, or `style`), `bucket` (`critical`, `should`, or `nit`),

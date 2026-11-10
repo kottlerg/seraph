@@ -16,7 +16,7 @@ services/svctest/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── main.rs                # Child-mode check, bootstrap, phase run, pass marker, shutdown
+    ├── main.rs                # Child-mode check, no-debug, bootstrap, phases, markers, shutdown
     ├── bootstrap.rs           # Decodes the creator-endpoint bootstrap rounds into `Caps`
     ├── runner.rs              # `Phase` type, per-phase log envelope, failure hooks, markers
     ├── reentry.rs             # argv-role dispatch into each phase module's child mode
@@ -71,8 +71,9 @@ identity last).
 ## Run Sequence
 
 `main` registers the log name `svctest`, so every line carries the `[svctest]` prefix. It then
-installs the failure hooks, requests the bootstrap rounds, hands the hooks the
-authority-badged pwrmgr cap, logs `starting`, and runs each registered phase in order inside
+installs the failure hooks, declares itself undebuggable to procmgr (`DECLARE_NO_DEBUG`, as
+a debug-authority holder; it asserts `SUCCESS`), requests the bootstrap rounds, hands the hooks
+the authority-badged pwrmgr cap, logs `starting`, and runs each registered phase in order inside
 the envelope `phase=<name> starting` / `phase=<name> passed`. After the last phase it logs
 `ALL TESTS PASSED`, the marker defined in
 [docs/testing.md § Reporting marker](../../docs/testing.md#reporting-marker), and sends
@@ -90,8 +91,9 @@ marker first logs it, so a run logs exactly one. A failing thread that finds the
 claimed yields until the run ends instead of aborting, so its abort cannot cut off the
 claimant's marker or `SHUTDOWN`.
 
-Some failures still end the run idle. A panic or allocation failure during the bootstrap rounds
-logs `SOME TESTS FAILED` but sends no `SHUTDOWN`, because the hooks get the pwrmgr cap only
+Some failures still end the run idle. A panic or allocation failure during the declaration or
+the bootstrap rounds (a refused `DECLARE_NO_DEBUG` among them) logs `SOME TESTS FAILED` but sends
+no `SHUTDOWN`, because the hooks get the pwrmgr cap only
 after the rounds return. A `SHUTDOWN` that pwrmgr answers, or whose call fails, is logged and
 leaves the system idle, as on the pass path. A fault in svctest's own process (a stray access,
 a stack overflow) kills it without running either hook, so it logs neither marker.

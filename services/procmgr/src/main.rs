@@ -727,8 +727,8 @@ fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::Proc
 /// authority; `INVALID_ARGUMENT` without the thread cap or with no crash
 /// endpoint; `CRASH_SERVICE_PRESENT` while a registered service lives;
 /// `OUT_OF_MEMORY` when the `RECV` cap cannot be derived or the decliner
-/// cannot be parked. Caps past
-/// `caps[0]`, and every cap of a refused request, are deleted.
+/// cannot be parked. Caps past `caps[0]`, and every cap of a refused
+/// request, are deleted.
 fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let caps = req.caps();

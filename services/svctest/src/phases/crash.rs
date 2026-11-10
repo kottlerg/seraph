@@ -17,8 +17,8 @@
 //! back: a `crashme exception` child it spawns dies of its fault though
 //! svctest receives nothing. A second registration then succeeds, and is
 //! given back the same way. With crashd staged (a manual boot, or burn-in's
-//! svctest cell, which keeps the usertest staging) the endpoint is taken and
-//! the phase checks only the refusal.
+//! svctest cell, which keeps the default crashd staging) the endpoint is
+//! taken and the phase checks only the refusal.
 
 use std::os::seraph::process::ChildExt;
 use std::process::{Command, Stdio};

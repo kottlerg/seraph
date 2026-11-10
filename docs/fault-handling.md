@@ -724,14 +724,15 @@ format, the contract the host-side symbolizer reads, in
   ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)).
 - **Uncovered processes.** A process whose stop would deadlock the crash service, since the service
   waits on it, declares itself undebuggable, which unbinds its exception class: logd and the serial
-  and framebuffer drivers, which carry the service's log output, and the crash service itself. init,
-  memmgr, and procmgr are not created by procmgr and are never bound. A fault of any of these takes
-  the outcome it has with no handler bound, and the kernel's `fault unhandled` and `USERSPACE FAULT`
-  lines are its only report. Any process may declare itself so; the declaration affects the declarer
-  alone and is one-way. Before logd or either driver declares, at its startup, a fault of it reaches
-  the crash service, which declines it once its bound passes. A process created `CREATE_PINNED`, or
-  whose pager binding failed, has no virtual-memory handler: its page faults, which no pager
-  forwards, kill it unreported.
+  and framebuffer drivers, which carry the service's log output, and the crash service itself; in a
+  test boot svctest, a debug-authority holder, declares too. init, memmgr, and procmgr are not
+  created by procmgr and are never bound. A fault of any of these takes the outcome it has with no
+  handler bound, and the kernel's `fault unhandled` and `USERSPACE FAULT` lines are its only report.
+  Any process may declare itself so; the declaration affects the declarer alone and is one-way.
+  Before logd or either driver declares, at its startup, a fault of it reaches the crash service,
+  which declines it once its bound passes. A process created `CREATE_PINNED`, or whose pager binding
+  failed, has no virtual-memory handler: its page faults, which no pager forwards, kill it
+  unreported.
 - **Debuggers.** A debugger binds a thread's exception class over the crash endpoint
   ([Debugging](#debugging)); the crash service then sees none of that thread's faults. An unbind
   leaves the class unbound, not bound to the crash endpoint again.

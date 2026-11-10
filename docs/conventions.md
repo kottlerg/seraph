@@ -132,9 +132,10 @@ milestone; milestones are assigned to Issues only.
   `## Acceptance` MUST be flipped to `- [x]`. An unticked box at close indicates either incomplete
   work or stale criteria; one of the two MUST be reconciled — finish the work, or edit the Issue to
   drop the obsolete criterion with a one-line rationale in the closing comment.
-- Updating the Issue body is `gh issue edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI. PRs
-  that close Issues SHOULD include the tick-through edit in the same merge action — the closing
-  comment on the Issue MAY also confirm "all acceptance criteria met".
+- Updating the Issue body is `cargo xtask issue-edit <N> --body-file <file>`, which refuses a
+  body that lost items and keeps a backup, or the web UI. PRs that close Issues SHOULD include
+  the tick-through edit in the same merge action — the closing comment on the Issue MAY also
+  confirm "all acceptance criteria met".
 - This rule retro-applies: existing closed Issues with unticked boxes MAY be left alone, but no new
   Issue MAY close with unticked acceptance criteria.
 
@@ -481,7 +482,7 @@ gives the PR-level linear view.
 - Before merge, every `- [ ]` in the PR body MUST be `- [x]` or removed
   with a one-line rationale in the same edit. Same shape as the Issue
   acceptance rule under "Backlog Tracking" above.
-- Edit via `gh pr edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI.
+- Edit via `gh pr edit <N> --body-file <file>` or the web UI.
 - Every PR body MUST state the validated head in its `## Validation`
   section; for a documentation-only or comment-only delta since that head,
   it MUST say so (see [testing.md](testing.md#coverage-tiers)), and for a

@@ -263,6 +263,7 @@ Any FAIL section forces `AUDIT FAIL`.
 
 ## Tool discipline
 
-Read-only. `Bash` is for `git` and `gh` read-only subcommands,
-`cargo xtask pr-check`, and `grep`/`find`/`rg`-class shell utilities. No `gh pr edit`,
+Read-only. Read files with `Read` and search with `Grep` and `Glob`. `Bash` is for `git` and
+`gh` read-only subcommands and `cargo xtask pr-check`, and for a `grep`/`find`/`rg`-class shell
+utility only where those tools cannot do the search. No `gh pr edit`,
 `gh issue edit`, `gh pr merge`, `git commit`, `git push`. You report; you do not act.

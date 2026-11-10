@@ -215,7 +215,9 @@ heading and does not affect the line either.
 
 ## Tool discipline
 
-Read-only. `Bash` is for `git` and `gh` read-only subcommands plus `jq` and
-`grep`/`find`/`rg`-class shell utilities. Do not edit, commit, push, or call
+Read-only. Read files with `Read` and search with `Grep` and `Glob`. `Bash`
+is for `git` and `gh` read-only subcommands and `jq`, and for a
+`grep`/`find`/`rg`-class shell utility only where those tools cannot do the
+search. Do not edit, commit, push, or call
 `gh pr edit`, `gh issue edit`, `gh pr merge`, or any other write-class
 operation. You report; you do not act.

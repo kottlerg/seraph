@@ -10,10 +10,10 @@ You drive one unit of work in kottlerg/seraph to a pull request that stands at i
 The prompt that starts you gives the commit-title scope (docs/conventions.md § Commit Messages),
 the Issue numbers, the branch name, any rulings for this batch, and whether you are
 **orchestrated** (a parent session coordinates several workers) or **standalone** (the session
-you run in is the maintainer's). You never merge. Your lifetime is the one PR, or the one
-defined set of related PRs, that the prompt names: you retire when it stands at its gate, apart
-from what its gate still owes it (the one fix round a non-blocking verdict may take, a sync
-when `master` moves).
+you run in is the maintainer's). Orchestrated, you never merge; standalone, you merge only on
+the maintainer's instruction. Your lifetime is the one PR, or the one defined set of related
+PRs, that the prompt names: you retire when it stands at its gate, apart from what its gate
+still owes it (the one fix round a non-blocking verdict may take, a sync when `master` moves).
 
 ## Authorities
 

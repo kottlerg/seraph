@@ -80,9 +80,10 @@ after the decline, when nothing waits on the faulting thread any more. The stack
   ([#838](https://github.com/kottlerg/seraph/issues/838)).
 - **Uncovered processes.** init, memmgr, and procmgr are not created by procmgr. logd, the serial
   driver, and the framebuffer driver, through which logd writes every line, and crashd declare
-  themselves undebuggable at startup; before the declaration, a fault of one of them reaches crashd
-  and is declined once the bound passes. A fault of any of these takes the outcome it has with no
-  handler bound; the kernel's `fault unhandled` and `USERSPACE FAULT` lines are its only report.
+  themselves undebuggable at startup, as svctest, a debug-authority holder, does in a test boot;
+  before the declaration, a fault of one of them reaches crashd and is declined once the bound
+  passes. A fault of any of these takes the outcome it has with no handler bound; the kernel's
+  `fault unhandled` and `USERSPACE FAULT` lines are its only report.
 - **Pinned processes' page faults.** A process created `CREATE_PINNED`, or whose pager binding
   failed, has no virtual-memory handler: its page faults kill it with no forward and no report. Its
   exceptions are reported.

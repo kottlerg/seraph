@@ -75,4 +75,4 @@ procmgr's side, registration, handover, and take-back, with svctest as the crash
 
 ## Summarized By
 
-None
+[Fault Handling](../../docs/fault-handling.md), [Testing](../../docs/testing.md)

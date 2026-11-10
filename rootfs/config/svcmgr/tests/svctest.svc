@@ -16,9 +16,11 @@
 # svcmgr_second_seed_round phase fails the run if they do not arrive.
 # svctest resolves the public pwrmgr.deny no-auth twin itself via
 # QUERY_ENDPOINT. debug_authority = yes delivers procmgr's
-# DEBUG_AUTHORITY SEND|GRANT in the slot after the seeds; the
+# DEBUG_AUTHORITY SEND|GRANT in the slot after the seeds, and svctest,
+# as every holder, declares itself undebuggable at startup; the
 # crash_endpoint phase registers with it as the crash service, which the
-# svctest boot, staging no crashd, leaves free.
+# svctest boot, staging no crashd, leaves free (burn-in's svctest cell
+# stages crashd, and the phase then checks only the refusal).
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT
 # scan. To enable in a boot, copy this file into

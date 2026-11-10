@@ -366,10 +366,10 @@ unreported. Both read the log the cell's boot saved and boot nothing
 ([xtask/README.md § test-crash-report](../xtask/README.md#cargo-xtask-test-crash-report)).
 
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by
-procmgr, and logd, the serial and framebuffer drivers, and crashd declare themselves undebuggable;
-their faults
-leave only the kernel's `fault unhandled` and `USERSPACE FAULT` lines. A thread other than a
-process's main thread is reported without registers or a stack walk
+procmgr, and logd, the serial and framebuffer drivers, and crashd declare themselves undebuggable,
+as svctest, a debug-authority holder, does in a test boot; their faults leave only the kernel's
+`fault unhandled` and `USERSPACE FAULT` lines. A thread other than a process's main thread is
+reported without registers or a stack walk
 ([crashd Operation § Limits](../services/crashd/docs/operation.md#limits)).
 
 ### One shutdown-invoking harness per boot

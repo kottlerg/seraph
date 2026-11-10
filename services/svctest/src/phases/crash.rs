@@ -9,22 +9,27 @@
 //! svctest boot stages no crashd, so the endpoint is free to take.
 //!
 //! The phase registers with a helper thread's cap, is refused a second
-//! registration, receives the forwarded page fault of a `crashme vm` child,
-//! attaches to it and finds its main thread stopped at the fault's
-//! instruction pointer, and declines it. It then ends the helper, after which
-//! procmgr takes the endpoint back: a `crashme exception` child it spawns
-//! dies of its fault though svctest receives nothing. A second registration
-//! then succeeds, and is given back the same way. With crashd staged (a
-//! manual boot) the endpoint is taken and the phase checks only the refusal.
+//! registration, and receives faults on the endpoint until the forwarded
+//! page fault of a `crashme vm` child: it attaches to each fault's process
+//! and knows the child's when the attached main thread's register file
+//! equals the child's own, both stopped at the fault. It declines every
+//! fault. It then ends the helper, after which procmgr takes the endpoint
+//! back: a `crashme exception` child it spawns dies of its fault though
+//! svctest receives nothing. A second registration then succeeds, and is
+//! given back the same way. With crashd staged (a manual boot, or burn-in's
+//! svctest cell, which keeps the usertest staging) the endpoint is taken and
+//! the phase checks only the refusal.
 
 use std::os::seraph::process::ChildExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::{
-    EXIT_FAULT_BASE, EXIT_KILLED, FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL,
-    FAULT_REPLY_KILL, REGS_RISCV64_SIZE, REGS_X86_64_SIZE, RIGHTS_THREAD_OBSERVE,
+    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, EXIT_KILLED, FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM,
+    FAULT_LABEL, FAULT_REPLY_KILL, REGS_RISCV64_SIZE, REGS_X86_64_SIZE, RIGHTS_THREAD_OBSERVE,
+    THREAD_STATE_EXITED,
 };
 
 use crate::bootstrap::Caps;
@@ -34,11 +39,16 @@ use crate::bootstrap::Caps;
 /// endpoint too.
 const MAX_FAULTS: usize = 32;
 
+/// How long the phase waits for a released helper to exit.
+const HELPER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A helper thread whose cap registers svctest as the crash service, and
 /// whose exit gives the endpoint back.
 struct Registrant
 {
     thread: u64,
+    /// A second observe cap on the helper, kept to see it exit.
+    watch: u64,
     release: mpsc::Sender<()>,
     handle: std::thread::JoinHandle<()>,
 }
@@ -58,20 +68,42 @@ impl Registrant
         let own = cap_rx.recv().expect("crash_endpoint: the helper's cap");
         let thread = syscall::cap_derive(own, RIGHTS_THREAD_OBSERVE)
             .expect("crash_endpoint: deriving the helper's cap");
+        let watch = syscall::cap_derive(own, RIGHTS_THREAD_OBSERVE)
+            .expect("crash_endpoint: deriving the helper's watch cap");
         Self {
             thread,
+            watch,
             release,
             handle,
         }
     }
 
-    /// End the helper; procmgr takes the endpoint back on its next pass.
+    /// End the helper and wait until the kernel reports it exited, so
+    /// procmgr's next pass, which any following request wakes, finds it
+    /// gone and takes the endpoint back. A join alone returns before the
+    /// helper's `thread_exit`.
     fn end(self)
     {
         let _ = self.release.send(());
         self.handle
             .join()
             .expect("crash_endpoint: joining the helper");
+        let start = Instant::now();
+        loop
+        {
+            let packed = syscall::cap_info(self.watch, CAP_INFO_THREAD_STATE)
+                .expect("crash_endpoint: the helper's thread state");
+            if (packed >> 32) as u32 == THREAD_STATE_EXITED
+            {
+                break;
+            }
+            assert!(
+                start.elapsed() < HELPER_EXIT_TIMEOUT,
+                "crash_endpoint: the helper did not exit"
+            );
+            let _ = syscall::thread_yield();
+        }
+        let _ = syscall::cap_delete(self.watch);
     }
 }
 

@@ -100,10 +100,11 @@ The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.de
 skip and return when their cap is zero; the devmgr deny and input-ordinal phases (`caps[2]`), the
 orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`), the svcmgr seed-only
 phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names it resolves), the
-svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), and the vfsd phases (`caps[4]`,
-`caps[5]`) instead fail their assertions. The seed-only phase thus fails the run on a zero
-`caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
-reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
+svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd phases (`caps[4]`, `caps[5]`),
+and the `crash_endpoint` phase (`caps[6]`) instead fail their assertions. The seed-only phase thus
+fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
+zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and
+the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -114,7 +115,8 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 ## Capabilities
 
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, the
-fifth and sixth in a second round;
+fifth and sixth in a second round, and then the debug-authority cap the recipe's
+`debug_authority = yes` grants;
 [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each
 name's cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every
 slot stays zero.
@@ -127,6 +129,7 @@ slot stays zero.
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, driver withdrawal, DMA confinement, drivers deny |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases          |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase                |
+| `caps[6]` | (`debug_authority`) | `crash_endpoint` phase; svctest declares itself undebuggable at startup |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the

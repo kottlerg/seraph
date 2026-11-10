@@ -450,9 +450,10 @@ pub mod procmgr_labels
     /// service's main thread, which procmgr keeps to tell when the service is
     /// gone and take the receive side back. Replies `SUCCESS` with
     /// one cap, `RECV` on the crash endpoint; `CRASH_SERVICE_PRESENT` while a
-    /// registered service lives; `INVALID_ARGUMENT` without the thread cap.
-    /// Specified in `services/procmgr/docs/ipc-interface.md` §
-    /// `REGISTER_CRASH_SERVICE`.
+    /// registered service lives; `INVALID_ARGUMENT` without the thread cap
+    /// or with no crash endpoint; `OUT_OF_MEMORY` when the `RECV` cap cannot
+    /// be derived or the decliner cannot be parked. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `REGISTER_CRASH_SERVICE`.
     pub const REGISTER_CRASH_SERVICE: u64 = 19;
 
     /// Attach to a process: the Thread caps procmgr holds for it, each with

@@ -561,10 +561,12 @@ without `MAP_EXECUTABLE` (which no backing satisfies), no delegated AS, or any a
 failure — replies `FAULT_REPLY_FORWARD`; each carries data word 0 the decline reason: the code below
 in its low 32 bits, and in its high 32 the magnitude of the failed syscall's error for code 9, else
 zero. The kernel hands the fault to the thread's exception handler, the crash endpoint procmgr
-binds, with the word as data word 4; with no exception handler bound, the forward is a decline, and
-the kernel prints the word on the kill diagnostic of a user-mode access ([docs/fault-handling.md §
-Reply](../../../docs/fault-handling.md#reply)). Either way the fault takes the decline's outcome
-unless that handler resumes it, and memmgr waits on no handler it forwards to.
+binds, with the word as data word 4; with no exception handler bound, or for the fault of a kernel
+copy (a restartable syscall's user copy, which then fails with `InvalidAddress`), the forward is a
+decline, and the kernel prints the word on the kill diagnostic of a user-mode access
+([docs/fault-handling.md § Reply](../../../docs/fault-handling.md#reply)). Either way the fault
+takes the decline's outcome unless that handler resumes it, and memmgr waits on no handler it
+forwards to.
 
 | Code | Decline |
 |---|---|

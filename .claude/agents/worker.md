@@ -262,9 +262,9 @@ The validation set is `cargo xtask test`, `cargo xtask lint-docs`, then on both 
 `cargo xtask build` and the boots the change sits on: ktest for `core/` and `shared/`, svctest
 and usertest for services and runtimes (recipes: docs/testing.md § Gating, `xtask/README.md`).
 Run the three coverage screens of § Coverage tiers on your own diff and state which local host
-runs they owe, at `--runs 1` unless the PR states a concurrency-fix purpose. An owed run that
-fails or hangs blocks: report it with the log before any re-run, apart from the one re-run alone
-above. A documentation-only or comment-only PR owes `cargo xtask lint-docs` only.
+runs they owe, each at `--runs 1`. An owed run that fails or hangs blocks: report it with the
+log before any re-run, apart from the one re-run alone above. A documentation-only or
+comment-only PR owes `cargo xtask lint-docs` only.
 
 ## Review
 

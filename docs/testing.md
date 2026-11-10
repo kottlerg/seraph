@@ -474,7 +474,7 @@ its own device surface, and variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
+| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
@@ -677,8 +677,8 @@ S="$S|shootdown(_range|_remote)?|service_shootdowns|needs_remote_shootdown"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($S)\b"
 ```
 
-The boundary set is every boundary CPU count below, each once (`--runs 1`, raised only as Repeat
-count says): 16 and 128 CPUs on both architectures, riscv64 16 and 128 harts and x86_64 16 and 128
+The boundary set is every boundary CPU count below, each once (`--runs 1`, as Repeat count
+says): 16 and 128 CPUs on both architectures, riscv64 16 and 128 harts and x86_64 16 and 128
 vCPUs. No run is wider than 128 CPUs, on either architecture: the 256- and 512-vCPU runs are removed
 from every set by the maintainer's decision on
 [#694](https://github.com/kottlerg/seraph/issues/694), since the 512-vCPU run (the old
@@ -884,16 +884,17 @@ git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
     grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
 ```
 
-**Repeat count.** Every owed run runs once (`--runs 1`). A PR states a concurrency-fix purpose when
-its body states that its purpose is the fix of a concurrency defect in the scheduling, wake, or
-cross-CPU signalling mechanisms. Such a PR, unless its changes outside Markdown are all inert, owes
-the whole boundary set, every boundary three times (`--runs 3`), whether or not its diff changes the
-CPU-count surface: a race in those mechanisms can fail rarely enough that one run misses it. That
-PR's other owed runs stay at `--runs 1`. A concurrency fix elsewhere is not a concurrency-fix
-purpose, and a change to those mechanisms' files without that stated purpose does not raise the
-count.
+**Repeat count.** Every owed run, local or release, runs once (`--runs 1`); nothing raises the
+count. A PR states a concurrency-fix purpose when its body states that its purpose is the fix of a
+concurrency defect in the scheduling, wake, or cross-CPU signalling mechanisms. Such a PR, unless
+its changes outside Markdown are all inert, owes the whole boundary set, whether or not its diff
+changes the CPU-count surface: a defect in those mechanisms shows at the boundary CPU counts, which
+CI does not boot. A few repeats add almost nothing to the chance of catching a race that fails
+rarely; the burn-in tier is the repeated-run check. A concurrency fix elsewhere is not a
+concurrency-fix purpose, and a change to those mechanisms' files without that stated purpose owes
+nothing on that account.
 
-**When the runs are owed.** Each local host run a PR owes MUST pass, at its repeat count, at one
+**When the runs are owed.** Each local host run a PR owes MUST pass at one
 head that covers the merge head. For every local and release host run, only a `PASS` outcome of
 `run-parallel` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
 host emulator, is run again and the re-run's outcome stands; `OK` and `ERR` count as failures. The

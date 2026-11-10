@@ -763,7 +763,8 @@ svcmgr service definitions carry no paging key; see
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [core/ktest/README.md](../core/ktest/README.md),
 [Capability Model](capability-model.md), [IPC Design](ipc-design.md),
-[Process Lifecycle](process-lifecycle.md), [Userspace Memory Model](userspace-memory-model.md),
+[Platform Requirements](platform-requirements.md), [Process Lifecycle](process-lifecycle.md),
+[Userspace Memory Model](userspace-memory-model.md),
 [programs/deadline/README.md](../programs/deadline/README.md),
 [programs/debugger/README.md](../programs/debugger/README.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),
@@ -773,4 +774,5 @@ svcmgr service definitions carry no paging key; see
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
-[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md)
+[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md),
+[shared/riscv-step/README.md](../shared/riscv-step/README.md)

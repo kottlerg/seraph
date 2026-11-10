@@ -316,4 +316,4 @@ required-vs-opportunistic rule are architecture-neutral and unchanged.
 [Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Architecture Overview](architecture.md), [Build System](build-system.md),
-[Memory Model](memory-model.md)
+[Fault Handling](fault-handling.md), [Memory Model](memory-model.md)

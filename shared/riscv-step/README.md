@@ -45,6 +45,15 @@ Consumers: ktest's riscv64 `integration::single_step`
 
 ---
 
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/fault-handling.md](../../docs/fault-handling.md) | § Debugging: the riscv64 single-step route this crate decodes for, and its hazards |
+| [docs/platform-requirements.md](../../docs/platform-requirements.md) | § riscv64 Classification: the C extension in the floor, Sdtrig unused |
+
+---
+
 ## Summarized By
 
 None

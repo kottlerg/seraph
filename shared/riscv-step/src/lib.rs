@@ -22,7 +22,8 @@
 /// `c.ebreak` (0x9002), little-endian: the breakpoint a debugger plants at the
 /// successor. Two bytes, so it never reaches past the successor's first
 /// 16-bit parcel, whatever that instruction's length; the C extension that
-/// encodes it is in the RVA23 floor (docs/platform-requirements.md).
+/// encodes it is in the riscv64 required floor
+/// (docs/platform-requirements.md § riscv64 Classification).
 pub const C_EBREAK: [u8; 2] = [0x02, 0x90];
 
 /// Why [`successor`] or [`instruction_len`] gives no address.

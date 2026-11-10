@@ -113,9 +113,20 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         Arch::X86_64 => "x86_64, UEFI",
         Arch::Riscv64 => "riscv64, TCG, UEFI",
     };
-    launch_qemu(args.arch.qemu_binary(), &qemu_args, desc, args.verbose)?;
-
-    Ok(())
+    let (Some(target), Some(port)) = (&args.debug_target, args.debug_port)
+    else
+    {
+        return launch_qemu(args.arch.qemu_binary(), &qemu_args, desc, args.verbose);
+    };
+    crate::debug_stub::stage(ctx, args.arch, target)?;
+    let binary = crate::debug_stub::binary_for(ctx, target);
+    step(&format!(
+        "GDB stub staged for {target}; connect with:\n    {}",
+        crate::debug_stub::gdb_command(args.arch, port, binary.as_deref())
+    ));
+    let launched = launch_qemu(args.arch.qemu_binary(), &qemu_args, desc, args.verbose);
+    crate::debug_stub::unstage(ctx, args.arch)?;
+    launched
 }
 
 fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Result<()>

@@ -107,7 +107,11 @@ fn handle_request(msg: &IpcMessage, irq_cap: u64, rx_notify: &mut u64, ipc_buf: 
     };
     let authorized = required_authority == 0 || msg.badge & required_authority != 0;
     // Only an authorized RX-notify request keeps a cap, its first one, which
-    // `register_rx_notify` keeps or deletes.
+    // `register_rx_notify` keeps or deletes. No client delivers a cap on an
+    // unauthorized request today: devmgr mints its test-deny SENDs without
+    // GRANT, and every SEND it grants carries all of this driver's verb bits.
+    // The `authorized` term keeps a future partial-authority SEND from
+    // leaving its notification here.
     let kept = usize::from(authorized && op == serial_labels::SERIAL_REGISTER_RX_NOTIFY);
     for &cap in msg.caps().iter().skip(kept)
     {

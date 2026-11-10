@@ -475,7 +475,7 @@ its own device surface, and variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -1000,16 +1000,17 @@ cargo xtask test-debug-port --arch <arch>
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
-4), the maintainer MUST run, on the commit to be tagged, the whole boundary set
-(riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three times each
-(`--runs 3`) in the debug profile and once each in the release profile
-(`cargo xtask build --release`, then the same `run-parallel` command at
-`--runs 1`, per the boundary commands above), and the memory variation and every device cell (the
+4), these MUST be run on the commit to be tagged: the whole boundary set
+(riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) once each (`--runs 1`)
+in the debug profile and once each in the release profile
+(`cargo xtask build --release`, then the same `run-parallel` command, per
+the boundary commands above), and the memory variation and every device cell (the
 disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once each, so
 every tag boots at each boundary CPU count in both profiles (CI boots release builds only at 4
 CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, and with a debug port,
 and runs the timing report on the boundary
-logs, which is reported and blocks nothing.
+logs, which is reported and blocks nothing. A tag's repeated-run check is the burn-in tier,
+which the tag push starts.
 The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture
 with the machine's IOMMU detached, so devmgr's unconfined path still serves every driver (svctest
 staged as `build-test.yml` stages it, on a debug-profile sysroot). A run whose outcome is not a

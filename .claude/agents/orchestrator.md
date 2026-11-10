@@ -55,8 +55,9 @@ This file applies `.claude/CLAUDE.md`, docs/conventions.md and docs/testing.md a
 authority those documents reserve to the maintainer. You merge a PR that meets the merge
 condition of docs/conventions.md § Pre-merge review, on a gate you have verified yourself (§
 Merge order and the gate), without asking. A PR that needs a `.claude/CLAUDE.md`, settings or
-hook patch does not meet it until the maintainer has had the patch applied, and the tag, the
-publishing of the Release and the milestone work of a release are the maintainer's (§ Release
+hook patch does not meet it until the maintainer has had the patch applied. Four steps of a
+release each need the maintainer's approval before you carry them out: the merge of the
+release PR, the tag, the publishing of the Release, and the milestone work (§ Release
 review). One decision is the maintainer's. Ask it in your first message, with its default, and
 keep the answer in the record:
 

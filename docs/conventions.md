@@ -260,11 +260,14 @@ A PR MUST NOT merge before it meets the merge condition. `cargo xtask pr-check <
 checks the part of the condition a script can decide and names the rest for its reader. In an
 orchestrated batch the orchestrator merges a PR that meets it, with no further decision of the
 maintainer. A session working alone with the maintainer reports that the PR meets the
-condition, and the maintainer's instruction to merge is the one decision left. Two things stay
-the maintainer's whatever the gate says: a change to `.claude/CLAUDE.md`, to the assistant's
-settings, or to its hooks is applied only on the maintainer's own word; and in § Release
-Production the tag (step 5), the publishing of the Release (step 7), and the milestone work
-of step 8 are the maintainer's. The release PR of step 3 merges as any PR does.
+condition, and the maintainer's instruction to merge is the one decision left. Two things need
+the maintainer's approval whatever the gate says. A change to `.claude/CLAUDE.md`, to the
+assistant's settings, or to its hooks is applied only on the maintainer's own word. In
+§ Release Production the merge of the release PR (step 3), the tag (step 5), the publishing of
+the Release (step 7), and the milestone work of step 8 each need the maintainer's approval of
+that step, and the release PR does not meet the merge condition before its merge is approved.
+Who carries an approved step out is not fixed: the orchestrator of the batch or a session
+does, or the maintainer.
 
 Every finding a run counts is fixed or recorded as the subsections below say. A finding MUST NOT
 be waived or ruled outside the standards.
@@ -510,8 +513,8 @@ See [docs/releases/README.md](releases/README.md) for per-tag release notes disc
 Producing a release for tag `v<X>.<Y>.<Z>`:
 
 1. Once every Issue of the milestone `v<X>.<Y>.<Z>` is closed or is a
-   follow-up Issue of § Branch and PR Workflow (any other open Issue the
-   maintainer moves to a later milestone first), run the release review on
+   follow-up Issue of § Branch and PR Workflow (any other open Issue is
+   moved to a later milestone first, as the maintainer decides), run the release review on
    `master` before the version bump: the `release-review` workflow
    (`.claude/workflows/release-review.js`) in `full` mode, from the previous
    release tag. It reviews the composition of the PRs merged since that tag,
@@ -545,13 +548,14 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    `docs/releases/v<X>.<Y>.<Z>.md`, built from `docs/releases/TEMPLATE.md`.
    One release PR bumps `[workspace.package] version` in the root
    `Cargo.toml` to `<X>.<Y>.<Z>` and adds the notes file from the draft, every
-   section filled, through the normal PR workflow. The tag MUST point at a
+   section filled, through the normal PR workflow, and merges once the
+   maintainer approves its merge (§ Pre-merge review). The tag MUST point at a
    commit that contains both.
 4. Run the release host runs ([testing.md](testing.md#coverage-tiers)
    § Coverage tiers) on the commit to be tagged, a `master` commit that
    contains the bump and the notes file: the whole
-   boundary set (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three
-   times each in the debug profile and once each in the release profile, and
+   boundary set (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) once
+   each in the debug profile and once each in the release profile, and
    the memory variation, the disk variations (a 4Kn disk and three
    second-disk boots, on both architectures), the no-IOMMU variant
    (`--iommu absent`, svctest, on both architectures), the framebuffer
@@ -563,21 +567,22 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    host runs as § PR-body checklist discipline requires.
 5. Run the release review in `delta` mode at that commit, since the head it
    last reviewed, with that report. `RELEASE READY` there is the tag
-   condition: tag that commit and push the tag:
-   `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.
+   condition: once the maintainer approves the tag, tag that commit and
+   push the tag: `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.
 6. The tag push triggers `release.yml` and `burnin.yml`. The `preflight` job in
    `release.yml` aborts the run before any image is built if the workspace
    version does not match the tag or the notes file is missing or does not
    follow `TEMPLATE.md`'s structure.
-7. The maintainer publishes the draft Release manually after verifying the
-   `burnin.yml` run for the same tag completed successfully.
-8. The maintainer creates `v<X>.<Y>.<Z+1>` when no `v<X>.<Y>.*` milestone above `v<X>.<Y>.<Z>`
-   is open, and closes each rolling follow-up Issue of § Branch and PR Workflow whose items are
-   all ticked. Every Issue in `v<X>.<Y>.<Z>` or a lower open milestone moves to `v<X>.<Y>.<Z>`
-   when it is closed and no commit outside the tag closed it, and otherwise to the
-   lowest-versioned open milestone above `v<X>.<Y>.<Z>`. The maintainer then closes
-   `v<X>.<Y>.<Z>` and every lower open milestone; the lowest-versioned open milestone is current
-   (§ Milestones).
+7. The draft Release is published once the `burnin.yml` run for the same tag
+   has completed successfully and the maintainer approves the publishing. No
+   workflow publishes it.
+8. On the maintainer's approval of this step's milestone work: `v<X>.<Y>.<Z+1>` is created
+   when no `v<X>.<Y>.*` milestone above `v<X>.<Y>.<Z>` is open, and each rolling follow-up
+   Issue of § Branch and PR Workflow whose items are all ticked is closed. Every Issue in
+   `v<X>.<Y>.<Z>` or a lower open milestone moves to `v<X>.<Y>.<Z>` when it is closed and no
+   commit outside the tag closed it, and otherwise to the lowest-versioned open milestone above
+   `v<X>.<Y>.<Z>`. `v<X>.<Y>.<Z>` and every lower open milestone are then closed; the
+   lowest-versioned open milestone is current (§ Milestones).
 
 ---
 

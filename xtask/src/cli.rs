@@ -164,6 +164,13 @@ pub enum CliCommand
     /// File a GitHub Issue with the labels and milestone docs/conventions.md
     /// requires, and verify that both were applied (see xtask/README.md).
     IssueFile(IssueFileArgs),
+
+    /// Keep the on-disk state of an orchestration batch
+    /// (`target/xtask/orchestration/state.json`) and its log: the
+    /// orchestrator, the exclusive grant, the workers, the merge order, the
+    /// open questions and the rulings in force. `orch state` prints it (see
+    /// xtask/README.md).
+    Orch(OrchArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -929,6 +936,206 @@ pub struct IssueFileArgs
     /// File without a milestone: future-state work no release has scheduled.
     #[arg(long)]
     pub unscheduled: bool,
+}
+
+// ── Orch ──────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct OrchArgs
+{
+    #[command(subcommand)]
+    pub command: OrchCommand,
+}
+
+#[derive(Subcommand)]
+pub enum OrchCommand
+{
+    /// Start a batch: a fresh state and the first line of its log. Refuses
+    /// while a batch's state exists.
+    Start
+    {
+        /// The batch's goal, in one line.
+        #[arg(long)]
+        goal: String,
+    },
+
+    /// Print the state as text, or as the stored JSON with `--json`.
+    State
+    {
+        /// Print the stored JSON instead of the text form.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Append one timestamped line to the batch's log.
+    Log
+    {
+        /// The line; several words are joined with spaces.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        line: Vec<String>,
+    },
+
+    /// Record the current orchestrator's agent id, or print it when none is
+    /// given.
+    Orchestrator
+    {
+        /// The agent id workers report to.
+        id: Option<String>,
+    },
+
+    /// Set fields of a worker, creating it when it is new, or remove it.
+    Worker(OrchWorkerArgs),
+
+    /// Record the exclusive grant and the requests queued for it.
+    Grant
+    {
+        #[command(subcommand)]
+        command: OrchGrantCommand,
+    },
+
+    /// Replace the merge order.
+    Order
+    {
+        /// The PRs in the order they merge; none clears the order.
+        items: Vec<String>,
+    },
+
+    /// Record a question the maintainer has open, or close one.
+    Question
+    {
+        #[command(subcommand)]
+        command: OrchQuestionCommand,
+    },
+
+    /// Record a ruling in force for the batch, or drop one.
+    Ruling
+    {
+        #[command(subcommand)]
+        command: OrchRulingCommand,
+    },
+
+    /// End the batch: keep its state beside the log and clear the way for
+    /// the next `orch start`.
+    End,
+}
+
+#[derive(Parser)]
+pub struct OrchWorkerArgs
+{
+    /// The worker's name in the batch (for example `W3`).
+    pub name: String,
+
+    /// Remove the worker from the state.
+    #[arg(long, conflicts_with_all = ["id", "model", "effort", "scope", "branch", "worktree", "pr", "phase", "status"])]
+    pub remove: bool,
+
+    /// The worker's agent id.
+    #[arg(long)]
+    pub id: Option<String>,
+
+    /// The model the worker runs on.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// The worker's effort level.
+    #[arg(long)]
+    pub effort: Option<String>,
+
+    /// The commit-title scope of its PR.
+    #[arg(long)]
+    pub scope: Option<String>,
+
+    /// Its branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// The path of its worktree.
+    #[arg(long)]
+    pub worktree: Option<String>,
+
+    /// Its PR's number.
+    #[arg(long)]
+    pub pr: Option<String>,
+
+    /// Its phase: planning, coding, review, gate, merged, retired, or dead.
+    #[arg(long)]
+    pub phase: Option<String>,
+
+    /// Its last report, in one line.
+    #[arg(long)]
+    pub status: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum OrchGrantCommand
+{
+    /// Give the exclusive grant. Refuses while one is outstanding.
+    Set
+    {
+        /// The worker that holds the grant.
+        holder: String,
+        /// The commands the grant covers, flags included.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        commands: Vec<String>,
+    },
+    /// End the outstanding grant.
+    Clear,
+    /// Queue a request for the grant.
+    Queue
+    {
+        /// The worker that asks.
+        holder: String,
+        /// The commands it asks for, flags included.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        commands: Vec<String>,
+    },
+    /// Drop a queued request.
+    Unqueue
+    {
+        /// The worker whose request is dropped.
+        holder: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OrchQuestionCommand
+{
+    /// Record an open question.
+    Add
+    {
+        /// The file that holds its detail; give it before the id.
+        #[arg(long)]
+        file: Option<String>,
+        /// A short id to close it by.
+        id: String,
+        /// The question, in one line.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
+    /// Close a question once it is answered and the answer recorded.
+    Close
+    {
+        /// The id it was added under.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OrchRulingCommand
+{
+    /// Record a ruling in force for the batch.
+    Add
+    {
+        /// The ruling, stated as a decision in one line.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
+    /// Drop a ruling by the number `orch state` prints.
+    Drop
+    {
+        /// The ruling's number.
+        number: usize,
+    },
 }
 
 #[cfg(test)]

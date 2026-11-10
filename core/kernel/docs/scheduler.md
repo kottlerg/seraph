@@ -486,19 +486,20 @@ refuses while a candidate is confirmed).
 
 The loads that choose a pull are read without the CPUs' locks, and a CPU's `schedule()`
 raises its own load for a moment under its lock: it counts every requeue of the running
-thread (such as a slice expiry, a yield, a preemption for RT, the idle loop leaving its idle
-thread, or a park a wake overtook, which `Requeue::IfRunnable` requeues) before the dequeue
-that follows. A reading taken in that window can pass the threshold at a load that, settled,
-fails it, and a load can also change between the reading and the pull. The pull therefore
-decides its rule again under the two run-queue locks, where every load change has completed,
-and moves nothing when it no longer holds (`sched::PullRule`): a pull above the threshold, a
-busy CPU's or an idle CPU's, re-checks that the victim's load exceeds the puller's by more
-than `LOAD_BALANCE_IMBALANCE_THRESHOLD`; an idle CPU's pull from its confirmed candidate
-re-checks no load, since the locked pick of a queued unpinned thread is the backlog it
-confirmed. An idle CPU whose pull above the threshold the re-check refuses applies the
-confirmation rule in the same tick, recording or pulling its candidate as if the scan had seen
-no load past the threshold, so a scan that keeps reading a transient still samples the backlog
-behind it.
+thread on its own queues (such as a slice expiry, a yield, a preemption for RT, the idle loop
+leaving its idle thread, or a park a wake overtook, which `Requeue::IfRunnable` requeues)
+before the dequeue that follows (a requeue its affinity routes to another CPU raises that
+CPU's load instead, as a wake there would). A reading taken while the load is raised can pass the
+threshold at a load that, settled, fails it, and a load can also change between the reading
+and the pull. The pull therefore decides its rule again under the two run-queue locks, where
+every load change has completed, and moves nothing when it no longer holds
+(`sched::PullRule`): a pull above the threshold, a busy CPU's or an idle CPU's, re-checks that
+the victim's load exceeds the puller's by more than `LOAD_BALANCE_IMBALANCE_THRESHOLD`; an idle
+CPU's pull from its confirmed candidate re-checks no load, since the locked pick of a queued
+unpinned thread is the backlog it confirmed. An idle CPU whose pull above the threshold the
+re-check refuses applies the confirmation rule in the same tick, recording or pulling its
+candidate as if the scan had seen no load past the threshold, so a scan that keeps reading a
+transient still samples the backlog behind it.
 
 Migration goes through `pull_unpinned_ready(src_cpu, dst_cpu, rule)`, which shares the
 validate-then-move core `relocate_ready_thread` with `migrate_ready_thread`:

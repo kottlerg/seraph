@@ -24,8 +24,8 @@ use syscall::{
     thread_read_regs, thread_write_regs,
 };
 use syscall_abi::{
-    FAULT_EXC_DEBUG, FAULT_KIND_EXCEPTION, FAULT_LABEL, FAULT_REPLY_RESUME,
-    REGS_X86_64_FLAGS_OFFSET, RIGHTS_NTF_NOTIFY, X86_64_RFLAGS_TF,
+    FAULT_EXC_DEBUG, FAULT_KIND_EXCEPTION, FAULT_LABEL, FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY,
+    X86_64_RFLAGS_TF,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -148,11 +148,7 @@ fn resume_into_recovery(ctx: &TestContext, th: u64, sig: u64) -> TestResult
     let mut regs = [0u8; BUF];
     thread_read_regs(th, &mut regs[..BUF])
         .map_err(|_| "integration::trap_redelivery: thread_read_regs failed")?;
-    let at = REGS_X86_64_FLAGS_OFFSET;
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&regs[at..at + 8]);
-    let rflags = u64::from_le_bytes(word) & !X86_64_RFLAGS_TF;
-    regs[at..at + 8].copy_from_slice(&rflags.to_le_bytes());
+    super::edit_rflags(&mut regs, |rflags| rflags & !X86_64_RFLAGS_TF);
     spawn::redirect_to_entry(&mut regs[..], recovery_entry as *const () as u64);
     // SAFETY: the frame was read from this child, so its stack pointer lies on
     // the child's own `ChildStack`; `redirect_to_entry` pointed it at

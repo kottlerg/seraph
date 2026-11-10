@@ -98,6 +98,7 @@ fn main()
         CliCommand::ReviewLedger(args) => commands::review::run_ledger(&ctx, args),
         CliCommand::IssueEdit(args) => commands::issue::run_edit(&ctx, args),
         CliCommand::IssueFile(args) => commands::issue::run_file(&ctx, args),
+        CliCommand::Orch(args) => commands::orch::run(&ctx, args),
     };
 
     if let Err(err) = result

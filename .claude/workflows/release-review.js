@@ -47,7 +47,11 @@
 //                every finding the run at `since` left standing (its record's
 //                `findings`, contested ones aside) to the refuters again, so
 //                one no fix removed still blocks; it aborts when no saved
-//                record of this release reviewed `since`.
+//                record of this release reviewed `since`. Carried and fresh
+//                records are never merged: reviewers are told the carried
+//                findings and asked not to report them again, and one they
+//                report anyway is listed twice, which the verdict tolerates,
+//                since it asks only whether any blocking finding survives.
 //   mode 'scope' stops after Scope and returns the agent plan and sample
 //                prompts (one agent); with `since` it scopes as delta would.
 //   host_runs    path of the release host-run report; the audit requires it
@@ -747,6 +751,19 @@ const LEDGER_FILTER =
     'line, class, bucket, must_violation, status, issue, claim, fix})] | unique'
 const LEDGER_FILES = scope.ledger_records.join(' ')
 
+// A delta run's carried findings are judged again by their own refuters; the
+// reviewers are told of them so they do not report them a second time.
+const carried_note = (paths) => {
+    const list = paths
+        ? scope.prior_findings.filter((f) => paths.includes(f.file))
+        : scope.prior_findings
+    return list.length
+        ? '\nCarried from the run at ' + SINCE + ' and judged again by refuters of their own; ' +
+            'do not report these again, but report any other defect beside them:\n' +
+            bullets(list, (f) => '- ' + f.file + ':' + f.line + ' (' + f.class + ') ' + f.claim)
+        : null
+}
+
 const ledger_note = (paths) =>
     scope.ledger_records.length === 0
         ? '\nLedger: no saved run record exists for the range; set `ledger` false on every finding.'
@@ -791,6 +808,7 @@ function shard_prompt(shard) {
         '',
         ISSUES_BLOCK,
         ledger_note(paths),
+        carried_note(paths),
         DELTA
             ? '\nClaimed fixes for your files, each to be verified against the code; report a ' +
                 'claimed fix not actually made as a contract finding at its location:\n' +
@@ -913,7 +931,8 @@ if (DELTA) {
 
 const lens_prompt = (lens) =>
     [
-        HEAD_LINE, '', ...lens.body(), '', ISSUES_BLOCK, ledger_note(null), '',
+        HEAD_LINE, '', ...lens.body(), '', ISSUES_BLOCK, ledger_note(null), carried_note(null),
+        '',
         'Fill the structured schema; name in `prs` the PRs whose changes make up each finding. ' +
             'Structured output only.',
     ]
@@ -1244,50 +1263,14 @@ review_items.forEach((item, i) => {
 })
 
 const results = reviewed.filter(Boolean)
-const carried_judged = (await carried_verified).filter(Boolean)
-// A reviewer that reads the file whole reports a still-unfixed carried finding
-// again. Once both are judged, a surviving fresh record that matches a
-// surviving carried one, as dedup matches, is folded into it, so a standing
-// blocker counts once in every run; when the carried record was dropped as
-// fixed, the fresh one stands on its own.
-// The match is dedup's, over every source of the fresh record, so one agent's
-// own adjacent findings stay distinct. The fold takes the fresh record's line
-// (the line at the head, so the next run matches it again), its sources, PRs,
-// duplicates, and notes, and, when the carried record names no Issue, an
-// Issue the fresh record's authority refuter left standing.
-const fold_twin = (f) =>
-    carried_judged
-        .filter(
-            (c) =>
-                c.status !== 'dropped' && !c.sources.some((s) => f.sources.includes(s)) &&
-                c.file === f.file && c.class === f.class && c.bucket === f.bucket &&
-                c.must_violation === f.must_violation &&
-                Math.abs(c.line - f.line) <= DEDUP_LINE_SLACK,
-        )
-        .sort((a, b) => Math.abs(a.line - f.line) - Math.abs(b.line - f.line))[0]
-
-function fold(twin, f) {
-    twin.duplicates += 1 + f.duplicates
-    for (const s of f.sources) if (!twin.sources.includes(s)) twin.sources.push(s)
-    for (const n of f.prs) if (!twin.prs.includes(n)) twin.prs.push(n)
-    twin.evidence += '\n[re-reported by ' + f.sources.join(', ') + ' at line ' + f.line + ': ' +
-        f.claim + '] ' + f.evidence
-    twin.line = f.line
-    twin.annotations.push(...f.annotations)
-    if (!twin.issue && f.issue && f.votes.some((v) => v.lens === 'authority')) {
-        twin.issue = f.issue
-        twin.annotations.push('#' + f.issue + ' names this work (authority refuter of ' +
-            f.sources[0] + ')')
-    }
-}
-
-const fresh_judged = []
-for (const f of results.flatMap((r) => r.findings)) {
-    const twin = f.status === 'dropped' ? null : fold_twin(f)
-    if (twin) fold(twin, f)
-    else fresh_judged.push(f)
-}
-const all = [...carried_judged, ...fresh_judged]
+// Carried and fresh records are never merged. Reviewers are told which
+// findings are carried and asked not to report them again; one that does
+// leaves the same defect listed twice, which the verdict tolerates, since it
+// asks only whether any blocking finding survives.
+const all = [
+    ...(await carried_verified).filter(Boolean),
+    ...results.flatMap((r) => r.findings),
+]
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // A surviving finding on the blocking track blocks the release unless an open
@@ -1432,8 +1415,11 @@ const SYNTH_PROMPT = [
         ') as Markdown.',
     '',
     'Rules: every finding appears exactly once, with its status tag; do not drop, add, merge, ' +
-        're-rank, or soften one. Each entry: `file:line` [status] (bucket, class) claim, with ' +
-        '`(MUST violation)` when must_violation is true and the PRs it names. Authority: the ' +
+        're-rank, or soften one. Order the entries under a heading by file and class, so a ' +
+        'finding carried from the last run and a fresh report of the same defect sit together. ' +
+        'Each entry: `file:line` [status] (bucket, class) claim, with `[carried]` when carried ' +
+        'is true, `(MUST violation)` when must_violation is true, and the PRs it names. ' +
+        'Authority: the ' +
         'cited authority. Rationale: one sentence from the evidence. Fix: the proposed fix. ' +
         'Every bracketed note at the end of a finding\'s evidence is rendered verbatim as its ' +
         'own line. For contested and unverified entries add one line per verifier vote with ' +

@@ -15,7 +15,9 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
-use syscall_abi::{EXIT_KILLED, FAULT_CLASS_EXCEPTION, FAULT_CLASS_VM, PAGE_SIZE, SyscallError};
+use syscall_abi::{
+    EXIT_KILLED, FAULT_CLASS_EXCEPTION, FAULT_CLASS_UPCALL, FAULT_CLASS_VM, PAGE_SIZE, SyscallError,
+};
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 /// The reply's `MSG_DATA_WORDS_MAX` words less the count word fix it, and
@@ -2073,12 +2075,16 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// enough requests since the last sweep) first drops the threads that are
 /// gone ([`thread_is_listed`]). A thread whose exception class is bound under the
 /// sender's process badge or a crash badge (`ProcessEntry::is_crash_binding`), as one
-/// that copied its spawner's bindings is, is bound again under a fresh crash
-/// badge, so its faults name it; a binding under any other badge, a
-/// debugger's, or none, is left as it is. The binding is told by its badge
-/// alone, which is all `SYS_THREAD_GET_FAULT_HANDLER` returns, so a debugger
-/// binds under a badge of its own (`services/procmgr/docs/ipc-interface.md`
-/// § `REGISTER_THREAD`).
+/// that copied its spawner's bindings is, or under a debugger's badge while
+/// the process has no debugger watched, as one that copied a debugger's
+/// binding is once that debugger has gone (`ProcessEntry::rebinds_on_register`),
+/// is bound again under a fresh crash badge, so its faults name it, and,
+/// with no debugger watched, a debugger's upcall binding on it is unbound; a
+/// binding under any other
+/// badge, a watched debugger's, or none, is left as it is. The binding is
+/// told by its badge alone, which is all `SYS_THREAD_GET_FAULT_HANDLER`
+/// returns, so a debugger binds under `procmgr_labels::DEBUGGER_BADGE_TAG`
+/// (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`).
 ///
 /// # Errors
 /// The reply code: `INVALID_BADGE` when no live process carries `badge`,
@@ -2100,10 +2106,10 @@ pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) ->
     }
     // A crash badge the thread copied from a spawner that has exited, and
     // that a sweep dropped, is still procmgr's: the tag tells it.
-    let rebind = syscall::thread_get_fault_handler(thread_cap, FAULT_CLASS_EXCEPTION)
-        .ok()
-        .flatten()
-        .is_some_and(|b| entry.is_crash_binding(b));
+    let rebind = entry.rebinds_on_register(binding(thread_cap, FAULT_CLASS_EXCEPTION));
+    // With no debugger watched, a debugger's upcall binding the thread
+    // copied is a gone debugger's too.
+    let unwatched = entry.debugger == 0;
     if entry.threads.needs_sweep()
     {
         entry
@@ -2117,6 +2123,10 @@ pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) ->
     })?;
     let crash_badge = if rebind { table.mint_crash_badge() } else { 0 };
     let bound = crash_badge != 0 && bind_exception_class(thread_cap, crash_badge);
+    if bound && unwatched
+    {
+        release_debugger_upcall(thread_cap);
+    }
     let entry = table
         .find_mut_by_badge(badge)
         .ok_or(procmgr_errors::INVALID_BADGE)?;
@@ -2162,24 +2172,37 @@ pub fn release_registered_thread(thread: process_table::RegisteredThread)
 }
 
 /// Bind the process `badge` names back to the crash endpoint after a
-/// debugger's attach (`DETACH_PROCESS`, or the attached debugger's death): its
-/// main thread under its process badge, and each registered thread under its
-/// crash badge, minted for a thread that has none (one registered while the
-/// debugger's binding was there, which procmgr leaves). A thread whose bind
-/// fails keeps the binding it has, as does every thread with no crash badge
-/// when procmgr's heap cannot hold the fresh ones; the debugger watch is
-/// released. A badge naming no live process changes nothing.
+/// debugger's attach (`DETACH_PROCESS`, or the attached debugger's death),
+/// and release the debugger watch. Each listed thread whose exception class
+/// is unbound, or bound by a debugger or by procmgr under another badge
+/// (`ProcessEntry::restores`), is bound again: the main thread under its
+/// process badge, a registered thread under its crash badge, minted for one
+/// that has none; a thread bound to any other handler is left. Each upcall
+/// class a debugger bound is unbound, so no thread stays bound to a dead
+/// debugger's endpoint. A thread whose bind fails keeps the binding it has,
+/// as does every thread that needs a fresh crash badge when procmgr's heap
+/// cannot hold them. A declared process (`DECLARE_NO_DEBUG`) is never bound
+/// back, and a badge naming no live process changes nothing.
 pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
 {
-    let Some(unbadged) = table.find_by_badge(badge).map(|e| {
-        (0..e.threads.len())
-            .filter(|&i| e.threads.get(i).is_some_and(|t| t.crash_badge == 0))
-            .count()
-    })
+    let Some(entry) = table.find_mut_by_badge(badge)
     else
     {
         return;
     };
+    let watch = core::mem::take(&mut entry.debugger);
+    if watch != 0
+    {
+        let _ = syscall::cap_delete(watch);
+    }
+    if entry.no_debug
+    {
+        return;
+    }
+    let unbadged = (0..entry.threads.len())
+        .filter_map(|i| entry.threads.get(i))
+        .filter(|t| t.crash_badge == 0 && entry.restores(binding(t.cap, FAULT_CLASS_EXCEPTION), 0))
+        .count();
     let mut fresh: Vec<u64> = Vec::new();
     if fresh.try_reserve_exact(unbadged).is_ok()
     {
@@ -2197,27 +2220,33 @@ pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
     {
         return;
     };
-    if !bind_exception_class(entry.thread_cap, entry.badge)
+    if entry.restores(
+        binding(entry.thread_cap, FAULT_CLASS_EXCEPTION),
+        entry.badge,
+    ) && !bind_exception_class(entry.thread_cap, entry.badge)
     {
         std::os::seraph::log!("crash binding of a detached main thread not restored");
     }
-    for t in entry.threads.iter_mut()
+    release_debugger_upcall(entry.thread_cap);
+    // Out of the entry while it is walked, which the rule reads.
+    let mut threads = core::mem::take(&mut entry.threads);
+    for t in threads.iter_mut()
     {
-        let crash_badge = match t.crash_badge
+        if entry.restores(binding(t.cap, FAULT_CLASS_EXCEPTION), t.crash_badge)
         {
-            0 => fresh.pop().unwrap_or(0),
-            b => b,
-        };
-        if crash_badge != 0 && bind_exception_class(t.cap, crash_badge)
-        {
-            t.crash_badge = crash_badge;
+            let crash_badge = match t.crash_badge
+            {
+                0 => fresh.pop().unwrap_or(0),
+                b => b,
+            };
+            if crash_badge != 0 && bind_exception_class(t.cap, crash_badge)
+            {
+                t.crash_badge = crash_badge;
+            }
         }
+        release_debugger_upcall(t.cap);
     }
-    if entry.debugger != 0
-    {
-        let _ = syscall::cap_delete(entry.debugger);
-        entry.debugger = 0;
-    }
+    entry.threads = threads;
 }
 
 /// Restore the crash bindings of every process whose attached debugger
@@ -2267,18 +2296,39 @@ pub fn watch_debugger(table: &mut ProcessTable, badge: u64, debugger: u64)
     }
 }
 
-/// Unbind from the crash endpoint each of `threads` procmgr bound there
-/// whose binding is still the one procmgr made, as `DECLARE_NO_DEBUG` does
-/// for the main thread; a debugger's later binding is left.
-pub fn unbind_registered_threads(threads: &[process_table::RegisteredThread])
+/// Unbind `thread`, a thread of the declared process `entry`
+/// (`DECLARE_NO_DEBUG`), from procmgr and from any debugger: its exception
+/// class when procmgr or a debugger bound it (`ProcessEntry::declare_unbinds`),
+/// and its upcall class when a debugger bound it. A handler the process bound
+/// itself stays.
+pub fn unbind_declared(entry: &ProcessEntry, thread: u64)
 {
-    for t in threads.iter().filter(|t| t.crash_badge != 0)
+    if entry.declare_unbinds(binding(thread, FAULT_CLASS_EXCEPTION))
     {
-        if syscall::thread_get_fault_handler(t.cap, FAULT_CLASS_EXCEPTION)
-            == Ok(Some(t.crash_badge))
-        {
-            let _ = syscall::thread_set_fault_handler(t.cap, 0, FAULT_CLASS_EXCEPTION);
-        }
+        let _ = syscall::thread_set_fault_handler(thread, 0, FAULT_CLASS_EXCEPTION);
+    }
+    release_debugger_upcall(thread);
+}
+
+/// The badge `thread`'s `class` is bound under; `None` when it is unbound or
+/// the binding cannot be read.
+fn binding(thread: u64, class: u64) -> Option<u64>
+{
+    syscall::thread_get_fault_handler(thread, class)
+        .ok()
+        .flatten()
+}
+
+/// Unbind `thread`'s upcall class when a debugger bound it
+/// (`process_table::is_debugger_badge`): a debugger that is gone, or whose
+/// target procmgr takes back, leaves no thread bound to an endpoint it no
+/// longer receives on. A pending upcall is then dropped and the thread
+/// resumes (docs/fault-handling.md § Asynchronous Upcalls).
+fn release_debugger_upcall(thread: u64)
+{
+    if binding(thread, FAULT_CLASS_UPCALL).is_some_and(process_table::is_debugger_badge)
+    {
+        let _ = syscall::thread_set_fault_handler(thread, 0, FAULT_CLASS_UPCALL);
     }
 }
 

@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::{
-    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, EXIT_KILLED, FAULT_CLASS_EXCEPTION,
+    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, EXIT_KILLED, FAULT_CLASS_EXCEPTION, FAULT_CLASS_UPCALL,
     FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL, REGS_RISCV64_SIZE,
     REGS_X86_64_SIZE, RIGHTS_THREAD, RIGHTS_THREAD_OBSERVE, THREAD_STATE_EXITED,
 };
@@ -203,25 +203,34 @@ impl ChildFault
     /// Whether the fault `msg`, whose attach replied `reply`, is the
     /// child's: the attached main thread and the child's hold the same
     /// registers, both stopped. A spawned thread faults while the child's
-    /// main thread runs, so for its fault the main thread is stopped first.
+    /// main thread runs, so for its fault the main thread is stopped first,
+    /// and started again when the fault is another process's, so the child
+    /// goes on to release its faulting thread.
     fn is_childs(self, msg: &IpcMessage, reply: &IpcMessage, child_thread: u64) -> bool
     {
         if reply.label != procmgr_errors::SUCCESS
         {
             return false;
         }
+        let mut stopped = false;
         if let ChildFault::RegistryWorker = self
         {
             if msg.badge == reply.word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE)
             {
                 return false;
             }
-            let _ = syscall::thread_stop(child_thread);
+            stopped = syscall::thread_stop(child_thread).is_ok();
         }
-        reply.caps().first().is_some_and(|&thread| {
+        let same = reply.caps().first().is_some_and(|&thread| {
             let regs = stopped_regs(thread);
             regs.is_some() && regs == stopped_regs(child_thread)
-        })
+        });
+        if stopped && !same
+        {
+            syscall::thread_start(child_thread)
+                .expect("crash_endpoint: restarting the child's main thread");
+        }
+        same
     }
 
     /// Check the attach `reply` to the child's fault `msg`.
@@ -343,14 +352,20 @@ fn take_child_fault(endpoint: u64, authority: u64, child: &std::process::Child, 
     panic!("crash_endpoint: the child's fault never arrived");
 }
 
-/// The badge a debugger's binding carries in [`debugger_session`]: neither a
-/// process badge nor a crash badge, as procmgr requires of a debugger.
-const DEBUGGER_BADGE: u64 = (1 << 62) | 1;
+/// The badge a debugger's binding carries in [`debugger_session`]: procmgr's
+/// debugger tag, as procmgr requires of a debugger.
+const DEBUGGER_BADGE: u64 = procmgr_labels::DEBUGGER_BADGE_TAG | 1;
 
 /// The badge `thread`'s exception class is bound under.
 fn exception_badge(thread: u64, what: &str) -> Option<u64>
 {
-    syscall::thread_get_fault_handler(thread, FAULT_CLASS_EXCEPTION)
+    class_badge(thread, FAULT_CLASS_EXCEPTION, what)
+}
+
+/// The badge `thread`'s `class` is bound under.
+fn class_badge(thread: u64, class: u64, what: &str) -> Option<u64>
+{
+    syscall::thread_get_fault_handler(thread, class)
         .unwrap_or_else(|e| panic!("crash_endpoint: {what}: reading the binding ({e})"))
 }
 
@@ -395,11 +410,12 @@ fn listed_name(authority: u64, process: u64) -> Option<Vec<u8>>
 
 /// What a debugger does to `crashme registry-main`, its main thread held at
 /// its fault and `threads` the caps its attach returned: it finds the
-/// process by name (`LIST_PROCESSES`), binds a parked thread's exception
-/// class to an endpoint of its own, and hands the crash binding back
-/// (`DETACH_PROCESS`); then it attaches with a watch, binds the thread
-/// again, and dies, its watch thread exiting, after which procmgr's next
-/// pass restores the binding unasked. procmgr's rebind of the main thread
+/// process by name (`LIST_PROCESSES`), binds a parked thread's exception and
+/// upcall classes to an endpoint of its own, and hands the thread back
+/// (`DETACH_PROCESS`), which restores the crash binding and unbinds the
+/// upcall class; then it attaches with a watch, binds the thread again, and
+/// dies, its watch thread exiting, after which procmgr's next pass does the
+/// same unasked. procmgr's rebind of the main thread
 /// to the binding it already has cancels nothing, so the fault stays
 /// svctest's to decline.
 fn debugger_session(authority: u64, process: u64, threads: &[u64])
@@ -422,11 +438,18 @@ fn debugger_session(authority: u64, process: u64, threads: &[u64])
     let send = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, DEBUGGER_BADGE)
         .expect("crash_endpoint: a debugger SEND");
     let bind = || {
-        syscall::thread_set_fault_handler(parked, send, FAULT_CLASS_EXCEPTION)
+        syscall::thread_set_fault_handler(parked, send, FAULT_CLASS_EXCEPTION | FAULT_CLASS_UPCALL)
             .expect("crash_endpoint: binding the parked thread");
         assert_eq!(
             exception_badge(parked, "the debugger's bind"),
             Some(DEBUGGER_BADGE)
+        );
+    };
+    let upcall_unbound = |what: &str| {
+        assert_eq!(
+            class_badge(parked, FAULT_CLASS_UPCALL, what),
+            None,
+            "crash_endpoint: {what} leaves the debugger's upcall binding"
         );
     };
 
@@ -448,6 +471,7 @@ fn debugger_session(authority: u64, process: u64, threads: &[u64])
         Some(crash_badge),
         "crash_endpoint: DETACH_PROCESS restores the crash badge"
     );
+    upcall_unbound("DETACH_PROCESS");
 
     let debugger = Registrant::spawn();
     let reply = call(
@@ -478,6 +502,7 @@ fn debugger_session(authority: u64, process: u64, threads: &[u64])
         Some(crash_badge),
         "crash_endpoint: the debugger's death restores the crash badge"
     );
+    upcall_unbound("the debugger's death");
     let _ = syscall::cap_delete(send);
     let _ = syscall::cap_delete(endpoint);
 }

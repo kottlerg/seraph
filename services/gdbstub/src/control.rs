@@ -12,12 +12,12 @@
 
 use gdb_rsp::command::{Resume, ThreadId, VContAction};
 
-/// The tag of a target thread's binding badge: a verb bit (bit 62, which no
-/// process badge carries), with bit 63 clear, so the badge is neither the
-/// target's process badge nor a crash badge, as procmgr requires of a
-/// debugger's binding (`services/procmgr/docs/ipc-interface.md`
-/// § `REGISTER_THREAD`).
-pub const THREAD_BADGE_TAG: u64 = 1 << 62;
+/// The tag of a target thread's binding badge: procmgr's debugger tag
+/// (`ipc::procmgr_labels::DEBUGGER_BADGE_TAG`), with bit 63 clear, so procmgr
+/// tells the binding as a debugger's and neither the target's process badge
+/// nor a crash badge (`services/procmgr/docs/ipc-interface.md`
+/// § `ATTACH_PROCESS`).
+pub const THREAD_BADGE_TAG: u64 = ipc::procmgr_labels::DEBUGGER_BADGE_TAG;
 
 /// The badge thread `index` of the stub's table is bound under: the tag with
 /// the index plus one. Each thread is bound under the index it is stored at,

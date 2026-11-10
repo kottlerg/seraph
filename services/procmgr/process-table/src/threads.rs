@@ -248,6 +248,20 @@ pub fn is_crash_badge(badge: u64) -> bool
     badge & CRASH_BADGE_TAG != 0
 }
 
+/// Whether a binding under `badge` is a debugger's: the badge carries
+/// `ipc::procmgr_labels::DEBUGGER_BADGE_TAG` and is not a crash badge, which
+/// no process badge is either ([`crate::badge_is_acceptable`] refuses every
+/// verb bit, the tag among them).
+#[must_use]
+pub fn is_debugger_badge(badge: u64) -> bool
+{
+    badge & ipc::procmgr_labels::DEBUGGER_BADGE_TAG != 0 && !is_crash_badge(badge)
+}
+const _: () = assert!(
+    ipc::procmgr_labels::DEBUGGER_BADGE_TAG & ipc::VERB_BIT_MASK != 0
+        && ipc::procmgr_labels::DEBUGGER_BADGE_TAG & CRASH_BADGE_TAG == 0
+);
+
 #[cfg(test)]
 mod tests
 {
@@ -413,6 +427,17 @@ mod tests
         assert_eq!(reg.take_all().len(), FIRST_SWEEP_AT);
         assert!(reg.is_empty());
         assert!(!reg.needs_sweep());
+    }
+
+    #[test]
+    fn a_debugger_badge_carries_the_tag_and_is_never_a_crash_badge()
+    {
+        let tag = ipc::procmgr_labels::DEBUGGER_BADGE_TAG;
+        assert!(is_debugger_badge(tag | 1));
+        assert!(!is_debugger_badge(1));
+        assert!(!is_debugger_badge(0));
+        // A crash badge whose count reached bit 62 stays procmgr's.
+        assert!(!is_debugger_badge(CRASH_BADGE_TAG | tag | 1));
     }
 
     #[test]

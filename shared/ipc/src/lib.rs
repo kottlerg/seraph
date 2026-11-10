@@ -494,6 +494,16 @@ pub mod procmgr_labels
     /// [`ATTACH_WORD_NAMED_THREAD`] value: the named thread is not listed.
     pub const ATTACH_NO_THREAD: u64 = u64::MAX;
 
+    /// The tag of a debugger's binding: a debugger that binds a thread
+    /// [`ATTACH_PROCESS`] listed, on its exception or upcall class, binds it
+    /// under a badge carrying this bit and not bit 63, which procmgr's own
+    /// crash badges carry. procmgr tells a debugger's binding by this bit
+    /// alone: it binds such a thread back to the crash endpoint when it
+    /// registers ([`REGISTER_THREAD`]) while no debugger is watched, and on
+    /// [`DETACH_PROCESS`], and unbinds it on [`DECLARE_NO_DEBUG`]. Specified
+    /// in `services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`.
+    pub const DEBUGGER_BADGE_TAG: u64 = 1 << 62;
+
     /// Register the calling thread with procmgr, so [`ATTACH_PROCESS`]
     /// returns it. Sent on the sender's own procmgr cap (its process badge
     /// names the process) by each thread the runtime spawns, before it runs
@@ -501,8 +511,9 @@ pub mod procmgr_labels
     /// `OBSERVE`, `CONTROL`, and `UPCALL`, which procmgr keeps until the
     /// thread exits, its cap is revoked, or the process is torn down. procmgr
     /// binds the thread's exception class to the crash endpoint under a
-    /// badge of the thread's own when the thread's binding is the process's.
-    /// Replies `SUCCESS`; `INVALID_BADGE` when the badge names no live
+    /// badge of the thread's own when the thread's binding is the process's,
+    /// or a debugger's ([`DEBUGGER_BADGE_TAG`]) while the process has no
+    /// debugger watched ([`ATTACH_PROCESS`] `caps[0]`). Replies `SUCCESS`; `INVALID_BADGE` when the badge names no live
     /// process; `NOT_ATTACHABLE` when the process sent [`DECLARE_NO_DEBUG`];
     /// `INVALID_ARGUMENT` without a Thread cap carrying those rights;
     /// `THREAD_LIMIT` at [`REGISTERED_THREADS_MAX`]; `OUT_OF_MEMORY` when the
@@ -519,14 +530,17 @@ pub mod procmgr_labels
     pub const REGISTERED_THREADS_MAX: usize = 16384;
 
     /// The caller declares itself undebuggable, on its own procmgr cap (its
-    /// process badge names it): procmgr unbinds its main thread's exception
-    /// class from the crash endpoint, releases every thread it registered
-    /// ([`REGISTER_THREAD`]) and unbinds those it bound, and refuses
+    /// process badge names it): procmgr unbinds the exception class of its
+    /// main thread and of every thread it registered ([`REGISTER_THREAD`])
+    /// wherever procmgr or a debugger ([`DEBUGGER_BADGE_TAG`]) bound it, and
+    /// the upcall class wherever a debugger bound it, releases the registered
+    /// threads, drops the debugger it watched for the process, and refuses
     /// [`ATTACH_PROCESS`] and [`REGISTER_THREAD`] on it from then on, so no
     /// [`DEBUG_AUTHORITY`] holder stops it. Sent, before
     /// it spawns a thread, by each process a stop of which would deadlock a
     /// debug-authority holder: the log sink, the serial and framebuffer
-    /// drivers, and every debug-authority holder. No data, no caps. Replies `SUCCESS`, or
+    /// drivers, the debug port's driver, and every debug-authority holder. No
+    /// data, no caps. Replies `SUCCESS`, or
     /// `INVALID_BADGE` when the badge names no live process. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_DEBUG`.
     pub const DECLARE_NO_DEBUG: u64 = 21;
@@ -617,11 +631,13 @@ pub mod procmgr_labels
     }
 
     /// Hand a process's crash bindings back after a debugger's attach:
-    /// procmgr binds its main thread's exception class to the crash endpoint
-    /// under its process badge again, and each registered thread's
-    /// ([`REGISTER_THREAD`]) under the thread's crash badge, minting one for
-    /// a thread that has none, and forgets the debugger it watched for the
-    /// process ([`ATTACH_PROCESS`] `caps[0]`). A debugger holds no SEND on the
+    /// procmgr binds the exception class of its main thread, and of each
+    /// registered thread ([`REGISTER_THREAD`]), that a debugger bound
+    /// ([`DEBUGGER_BADGE_TAG`]) or that is unbound, back to the crash endpoint
+    /// under the process badge or the thread's crash badge, minting one for a
+    /// thread that has none, unbinds each upcall class a debugger bound, and
+    /// forgets the debugger it watched for the process ([`ATTACH_PROCESS`]
+    /// `caps[0]`). A debugger holds no SEND on the
     /// crash endpoint, so it cannot restore those bindings itself. Served
     /// only on a badge carrying [`DEBUG_AUTHORITY`]. `data[0]` is the
     /// target's process badge. Replies `SUCCESS`; `UNAUTHORIZED` without the

@@ -33,7 +33,9 @@ is never reset, so everything you read stays for the whole milestone.
    it when the worker's own message to the orchestrator already said so.
 5. **Do for the orchestrator what only the top session can**: stop an agent it names, schedule
    or cancel a tick it asks for, apply a `.claude/CLAUDE.md`, settings or hook patch on the
-   maintainer's direct word in this conversation.
+   maintainer's direct word in this conversation, and make a `release-review` workflow call it
+   gives you: save the report and the returned object to the paths it names, show the
+   maintainer both verdict lines, and answer the orchestrator with those lines and the paths.
 
 ## What you do not do
 

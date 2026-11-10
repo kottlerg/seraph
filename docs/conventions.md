@@ -217,7 +217,7 @@ are forbidden; `master` MUST NOT receive force pushes.
 Merge is gated by the pre-merge review: the `pr-reviewer` and `pr-auditor` agents
 (`.claude/agents/`), invoked directly and in parallel, run the adversarial code review and the
 closure audit, and their prose verdict lines are the gate. Findings are handled as one batch per
-run, as the subsections below define. `.claude/CLAUDE.md` § PR workflow operations gives the
+run, as the subsections below define. `.claude/skills/pr-review/SKILL.md` gives the
 assistant's procedure.
 
 The reviewer verdict is:

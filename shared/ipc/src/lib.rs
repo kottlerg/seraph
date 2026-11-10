@@ -81,7 +81,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 10;
+pub const PROCMGR_LABELS_VERSION: u32 = 11;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {

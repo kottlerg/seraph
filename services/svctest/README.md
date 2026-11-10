@@ -215,7 +215,9 @@ Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiot
 procmgr), `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults), `capexhaust` (recv
 guard), `demandpaged` (pager), `fsbench` (FS IPC), and `crashme` (crash endpoint: svctest, its
 recipe granting `debug_authority`, registers as the crash service and takes a `crashme` child's
-forwarded page fault, then gives the endpoint back and sees a second child declined by procmgr). The
+forwarded page fault, and the faults of two `registry-*` children, whose attach lists their live
+registered threads and none that exited or was joined, and whose spawned thread's crash badge names
+it; then gives the endpoint back and sees a second child declined by procmgr). The
 devmgr orphan-teardown phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md)
 driver, and the driver-withdrawal phase three [`test-fault`](../drivers/test-fault/README.md)
 drivers, one of which never reports ready, so the phase waits the fault batch's settle bound

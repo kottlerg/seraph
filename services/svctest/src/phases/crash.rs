@@ -13,8 +13,15 @@
 //! page fault of a `crashme vm` child: it attaches to each fault's process
 //! and knows the child's when the attached main thread's register file
 //! equals the child's own, both stopped at the fault. It declines every
-//! fault. It then ends the helper, after which procmgr takes the endpoint
-//! back: a `crashme exception` child it spawns dies of its fault though
+//! fault. Two more children check the registry procmgr keeps of the threads
+//! the runtime spawns (`REGISTER_THREAD`): `crashme registry-main`, whose
+//! main-thread fault's attach lists its two parked threads and not the one
+//! that exited, and `crashme registry-worker`, whose spawned thread faults
+//! under a crash badge of its own, which names its process and the thread,
+//! its joined sibling no longer listed. procmgr then refuses a registration
+//! from svctest, which declared itself undebuggable. It then ends the
+//! helper, after which procmgr takes the endpoint back: a
+//! `crashme exception` child it spawns dies of its fault though
 //! svctest receives nothing. A second registration then succeeds, and is
 //! given back the same way. With crashd staged (a manual boot, or burn-in's
 //! svctest cell, which keeps the default crashd staging) the endpoint is
@@ -28,8 +35,8 @@ use std::time::{Duration, Instant};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::{
     CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, EXIT_KILLED, FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM,
-    FAULT_LABEL, FAULT_REPLY_KILL, REGS_RISCV64_SIZE, REGS_X86_64_SIZE, RIGHTS_THREAD_OBSERVE,
-    THREAD_STATE_EXITED,
+    FAULT_LABEL, FAULT_REPLY_KILL, REGS_RISCV64_SIZE, REGS_X86_64_SIZE, RIGHTS_THREAD,
+    RIGHTS_THREAD_OBSERVE, THREAD_STATE_EXITED,
 };
 
 use crate::bootstrap::Caps;
@@ -78,10 +85,12 @@ impl Registrant
         }
     }
 
-    /// End the helper and wait until the kernel reports it exited, so
-    /// procmgr's next pass, which any following request wakes, finds it
-    /// gone and takes the endpoint back. A join alone returns before the
-    /// helper's `thread_exit`.
+    /// End the helper and wait until its watch cap shows it gone, exited or
+    /// the cap revoked, so procmgr's next pass, which any following request
+    /// wakes, finds it gone and takes the endpoint back. The join's reclaim
+    /// revokes every cap derived from the helper's, the watch cap and the
+    /// one procmgr keeps among them (runtime/ruststd/README.md § Thread
+    /// capability).
     fn end(self)
     {
         let _ = self.release.send(());
@@ -91,11 +100,11 @@ impl Registrant
         let start = Instant::now();
         loop
         {
-            let packed = syscall::cap_info(self.watch, CAP_INFO_THREAD_STATE)
-                .expect("crash_endpoint: the helper's thread state");
-            if (packed >> 32) as u32 == THREAD_STATE_EXITED
+            match syscall::cap_info(self.watch, CAP_INFO_THREAD_STATE)
             {
-                break;
+                Ok(packed) if (packed >> 32) as u32 != THREAD_STATE_EXITED =>
+                {}
+                _ => break,
             }
             assert!(
                 start.elapsed() < HELPER_EXIT_TIMEOUT,
@@ -169,11 +178,120 @@ fn expect_fault_death(mut child: std::process::Child, what: &str)
     );
 }
 
-/// Receive faults on `endpoint`, declining each, until the one of `child`'s
-/// main thread: a forwarded page fault. Each fault's process is attached to
-/// (`ATTACH_PROCESS`), and its fault is the child's when the attached main
-/// thread and the child's, both stopped, hold the same registers.
-fn take_child_fault(endpoint: u64, authority: u64, child: &std::process::Child)
+/// The fault of a `crashme` child the phase takes, and what it checks of
+/// the attach that reaches it.
+#[derive(Clone, Copy)]
+enum ChildFault
+{
+    /// `crashme vm`: its main thread's forwarded page fault; the child holds
+    /// its main thread alone.
+    MainVm,
+    /// `crashme registry-main`: its main thread's fault, with two parked
+    /// threads registered and a detached one exited, which is not listed.
+    RegistryMain,
+    /// `crashme registry-worker`: a spawned thread's fault after its sibling
+    /// was joined, which is not listed; the fault's badge is the thread's
+    /// crash badge, which names its process and it.
+    RegistryWorker,
+}
+
+impl ChildFault
+{
+    /// Whether the fault `msg`, whose attach replied `reply`, is the
+    /// child's: the attached main thread and the child's hold the same
+    /// registers, both stopped. A spawned thread faults while the child's
+    /// main thread runs, so for its fault the main thread is stopped first.
+    fn is_childs(self, msg: &IpcMessage, reply: &IpcMessage, child_thread: u64) -> bool
+    {
+        if reply.label != procmgr_errors::SUCCESS
+        {
+            return false;
+        }
+        if let ChildFault::RegistryWorker = self
+        {
+            if msg.badge == reply.word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE)
+            {
+                return false;
+            }
+            let _ = syscall::thread_stop(child_thread);
+        }
+        reply.caps().first().is_some_and(|&thread| {
+            let regs = stopped_regs(thread);
+            regs.is_some() && regs == stopped_regs(child_thread)
+        })
+    }
+
+    /// Check the attach `reply` to the child's fault `msg`.
+    fn check(self, msg: &IpcMessage, reply: &IpcMessage)
+    {
+        let named = reply.word(procmgr_labels::ATTACH_WORD_NAMED_THREAD);
+        let process = reply.word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE);
+        match self
+        {
+            ChildFault::MainVm =>
+            {
+                assert_eq!(reply.word(0), 1, "crash_endpoint: attached thread count");
+                assert_eq!(msg.word(0), FAULT_KIND_VM, "crash_endpoint: fault kind");
+                assert!(
+                    msg.word_count() > FAULT_FORWARD_REASON_WORD,
+                    "crash_endpoint: the page fault did not come forwarded by the pager"
+                );
+            }
+            ChildFault::RegistryMain =>
+            {
+                assert_eq!(
+                    reply.word(0),
+                    3,
+                    "crash_endpoint: the main thread and two parked ones, not the exited one"
+                );
+                assert_eq!(
+                    named, 0,
+                    "crash_endpoint: a process badge names the main thread"
+                );
+                assert_eq!(process, msg.badge, "crash_endpoint: the process badge");
+                for &thread in reply.caps()
+                {
+                    let packed = syscall::cap_info(thread, CAP_INFO_THREAD_STATE)
+                        .expect("crash_endpoint: a listed thread's state");
+                    assert_ne!(
+                        (packed >> 32) as u32,
+                        THREAD_STATE_EXITED,
+                        "crash_endpoint: an exited thread is listed"
+                    );
+                }
+            }
+            ChildFault::RegistryWorker =>
+            {
+                assert_eq!(
+                    reply.word(0),
+                    2,
+                    "crash_endpoint: the main thread and the faulting one, not the joined one"
+                );
+                assert_eq!(
+                    named, 1,
+                    "crash_endpoint: the crash badge names the spawned thread"
+                );
+                // svctest stopped only the main thread: the named thread's
+                // registers read because it is the one blocked on the fault.
+                assert!(
+                    reply
+                        .caps()
+                        .get(1)
+                        .copied()
+                        .and_then(stopped_regs)
+                        .is_some(),
+                    "crash_endpoint: the named thread is not fault-blocked"
+                );
+            }
+        }
+    }
+}
+
+/// Receive faults on `endpoint`, declining each, until `child`'s `fault`.
+/// Each fault's process is attached to (`ATTACH_PROCESS`, by the fault's
+/// badge), and [`ChildFault::is_childs`] tells the child's apart from those
+/// of other processes (crasher, co-staged, faults on every spawn).
+fn take_child_fault(endpoint: u64, authority: u64, child: &std::process::Child, fault: ChildFault)
 {
     let child_thread = child.main_thread_cap();
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -194,25 +312,14 @@ fn take_child_fault(endpoint: u64, authority: u64, child: &std::process::Child)
                 .build(),
             "ATTACH_PROCESS",
         );
-        let attached = (reply.label == procmgr_errors::SUCCESS)
-            .then(|| reply.caps().first().copied())
-            .flatten();
-        let ours = attached.is_some_and(|thread| {
-            let regs = stopped_regs(thread);
-            regs.is_some() && regs == stopped_regs(child_thread)
-        });
+        let ours = fault.is_childs(&msg, &reply, child_thread);
+        if ours
+        {
+            fault.check(&msg, &reply);
+        }
         for &cap in reply.caps()
         {
             let _ = syscall::cap_delete(cap);
-        }
-        if ours
-        {
-            assert_eq!(reply.word(0), 1, "crash_endpoint: attached thread count");
-            assert_eq!(msg.word(0), FAULT_KIND_VM, "crash_endpoint: fault kind");
-            assert!(
-                msg.word_count() > FAULT_FORWARD_REASON_WORD,
-                "crash_endpoint: the page fault did not come forwarded by the pager"
-            );
         }
         // SAFETY: ipc_buf is this thread's registered IPC buffer page.
         unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_KILL), ipc_buf) }
@@ -223,6 +330,29 @@ fn take_child_fault(endpoint: u64, authority: u64, child: &std::process::Child)
         }
     }
     panic!("crash_endpoint: the child's fault never arrived");
+}
+
+/// svctest declared itself undebuggable, so procmgr refuses to register a
+/// thread of it (`REGISTER_THREAD`, `NOT_ATTACHABLE`), as its runtime's
+/// first registration found.
+fn expect_registration_refused()
+{
+    let own = std::os::seraph::thread::current_thread_cap();
+    let thread = syscall::cap_derive(own, RIGHTS_THREAD)
+        .expect("crash_endpoint: deriving a thread cap to register");
+    let procmgr = std::os::seraph::startup_info().procmgr_endpoint;
+    let reply = call(
+        procmgr,
+        &IpcMessage::builder(procmgr_labels::REGISTER_THREAD)
+            .cap(thread)
+            .build(),
+        "REGISTER_THREAD",
+    );
+    assert_eq!(
+        reply.label,
+        procmgr_errors::NOT_ATTACHABLE,
+        "crash_endpoint: a registration from a process that declared no-debug"
+    );
 }
 
 pub fn crash_endpoint_phase(caps: &Caps)
@@ -257,8 +387,15 @@ pub fn crash_endpoint_phase(caps: &Caps)
     second.end();
 
     let child = crashme("vm");
-    take_child_fault(endpoint, authority, &child);
+    take_child_fault(endpoint, authority, &child, ChildFault::MainVm);
     expect_fault_death(child, "while registered");
+    let child = crashme("registry-main");
+    take_child_fault(endpoint, authority, &child, ChildFault::RegistryMain);
+    expect_fault_death(child, "registry-main");
+    let child = crashme("registry-worker");
+    take_child_fault(endpoint, authority, &child, ChildFault::RegistryWorker);
+    expect_fault_death(child, "registry-worker");
+    expect_registration_refused();
 
     // The helper's exit gives the endpoint back: the next procmgr request,
     // this spawn, finds it gone, and procmgr's decliner declines the fault.

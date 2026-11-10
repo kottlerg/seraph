@@ -29,9 +29,11 @@ tag's release notes.
   missing or lacks any of `TEMPLATE.md`'s `##` section headings as a whole
   line; the publish step re-checks existence before
   `gh release create --notes-file`.
-- New release notes MUST be authored by copying `TEMPLATE.md` and filling
-  every section. Non-template structure introduces inconsistency across
-  releases.
+- New release notes MUST be authored from `TEMPLATE.md`, every section
+  filled. Non-template structure introduces inconsistency across releases.
+  The release review's `RELEASE READY` run returns the draft, built from
+  `TEMPLATE.md` ([conventions.md](../conventions.md#release-production)
+  § Release Production).
 - The notes file MUST be committed before the tag is pushed; the tag MUST
   point at a commit that contains the file.
 

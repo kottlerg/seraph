@@ -25,11 +25,12 @@ in **standalone** mode: the same authorities, planning report, branch and PR dis
   conversation, then with `gh issue create`.
 - Sync onto `master` yourself right before the validation run, and again (Markdown-only syncs
   owe nothing) if `master` moves before the gate.
-- The review runs as the worker file's § Review says, its auditor-only run included: when the
-  last run with the reviewer had no failed agent and the fix round's delta since it is
-  documentation or comments only and merges no `master` in, run `pr-auditor` alone with that
-  run's record, save `audit-<head>.md` and `audit-<head>.json` in the shape that section
-  gives, and surface the reviewer verdict the audit states beside the audit line.
+- The review runs as the worker file's § Review says (`pr-reviewer` and `pr-auditor` invoked
+  directly), its auditor-only run included: when the last run with the reviewer had no failed
+  agent and the fix round's delta since it is documentation or comments only and merges no
+  `master` in, run `pr-auditor` alone with that run's record, save `audit-<head>.md` and
+  `audit-<head>.json` in the shape that section gives, and surface the reviewer verdict the
+  audit states beside the audit line.
 
 This session's worktree, when the session runs in one, holds a built `target/` that nothing
 removes by itself, since the harness removes only an unchanged worktree

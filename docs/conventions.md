@@ -99,7 +99,7 @@ planned for. Only future-state work no release has scheduled (a design umbrella,
 feature) MAY stay unassigned; it is assigned when it is scheduled. The rule applies to open Issues
 filed before it: the maintainer assigns each a milestone or confirms it as unscheduled work. An
 Issue that closes without a milestone, or under one other than the current milestone, MUST be
-assigned the current milestone when it closes; step 7 of § Release Production decides the release
+assigned the current milestone when it closes; step 8 of § Release Production decides the release
 a closed Issue settles on. A pull request MUST NOT carry a milestone; milestones are assigned to
 Issues only.
 
@@ -209,13 +209,14 @@ are forbidden; `master` MUST NOT receive force pushes.
 - PRs that close an Issue MUST carry `Fixes #N` / `Closes #N` in the PR
   description so merge auto-closes the Issue. The acceptance-checklist
   tick-through (see above) lands in the same merge action.
-- Merge is gated by the pre-merge review: the `pr-review` workflow
-  (`.claude/workflows/pr-review.js`) runs the adversarial code review and
-  the closure audit; when the Workflow tool is unavailable, the
-  `pr-reviewer` and `pr-auditor` agents invoked directly are the review,
-  and their prose verdict lines are the gate. Findings are handled per the
-  review surface and the two tracks defined below, as one batch per run. A
-  finding the verifiers contested MUST be put to the maintainer; on the
+- Merge is gated by the pre-merge review: the `pr-reviewer` and
+  `pr-auditor` agents (`.claude/agents/`), invoked directly and in
+  parallel, run the adversarial code review and the closure audit, and
+  their prose verdict lines are the gate. Findings are handled per the
+  review surface and the two tracks defined below, as one batch per run.
+
+  A finding the PR's author disputes, on the facts or on the rule it
+  cites, is contested and MUST be put to the maintainer; on the
   surface it MUST resolve in the same PR as a fix, as a clarification of
   the rule it misread, or, when the maintainer finds it false on the facts,
   as a clarification of the code or document it misread; off the surface it
@@ -313,7 +314,7 @@ are forbidden; `master` MUST NOT receive force pushes.
   same PR, delta or full, MUST NOT re-raise a finding an earlier run
   recorded, dropped, or the maintainer ruled on unless the hunk it anchors
   to changed since the run that reported it, or that run no longer resolves
-  in the clone; the workflow reads a ledger built from the saved run
+  in the clone; the reviewer reads a ledger built from the saved run
   records, each entry naming its run, and a finding the ledger holds whose
   hunk is unchanged since the run its entry names, when that run resolves,
   is listed, not counted. A finding off the surface MUST be recorded, not
@@ -327,16 +328,8 @@ are forbidden; `master` MUST NOT receive force pushes.
   holds is, unless the ledger rule above lists it, reported, counted, and
   fixed or recorded wherever the surface definition above puts it. A finding
   any open follow-up Issue of its scope already holds is not recorded again
-  on any Issue, and its fix ticks its item on the Issue that holds it. A
-  finding two independent refuters refute on evidence is dropped and listed
-  in the report's Dropped section. The review verifies every finding that
-  can block and every Critical or Should finding, on or off the surface,
-  except a finding the ledger rule above lists, not counts, which is listed
-  unverified; a nit that cannot block is fixed or recorded unverified.
-  Verified findings off the surface that share file, class, bucket, MUST
-  flag, named Issue, and authority are one root cause: the first is verified
-  and each of the others takes the group's verdict. Every other finding is
-  fixed or recorded.
+  on any Issue, and its fix ticks its item on the Issue that holds it.
+  Every finding a run counts is fixed or recorded as above.
 
 ### Branch naming
 
@@ -400,28 +393,64 @@ See [docs/releases/README.md](releases/README.md) for per-tag release notes disc
 
 Producing a release for tag `v<X>.<Y>.<Z>`:
 
-1. Bump `[workspace.package] version` in the root `Cargo.toml` to `<X>.<Y>.<Z>`.
-2. Copy `docs/releases/TEMPLATE.md` to `docs/releases/v<X>.<Y>.<Z>.md` and fill
-   every section.
-3. Land both changes on `master` through the normal PR workflow. The tag MUST
-   point at a commit that contains them.
+1. Once every Issue of the milestone `v<X>.<Y>.<Z>` is closed, or open only
+   as step 8 moves it, run the release review on `master` before the
+   version bump: the `release-review` workflow
+   (`.claude/workflows/release-review.js`) in `full` mode, from the previous
+   release tag. It reviews the composition of the PRs merged since that tag,
+   which no PR's own review saw: each file two or more of them touched line
+   by line, and the whole range through lenses (agreement across `abi/`, the
+   kernel, and the runtime; the whole text of every design document the
+   range touched; `## Summarized By` integrity; new `unsafe` code and its
+   safety contracts; test coverage of new syscalls and protocol messages;
+   [limits.md](limits.md) and [platform-requirements.md](platform-requirements.md)
+   against the code). Its ledger is the saved run records of those PRs and
+   of the release's earlier runs, under the ledger rule of § Branch and PR
+   Workflow. Its release audit checks the milestone state, the version, the
+   release notes, the known issues, and the release host runs. Two
+   independent refuters judge every finding that can block and every
+   Critical or Should finding; a finding both refute on evidence is
+   dropped. The workflow computes the verdict: `RELEASE BLOCKED` when a
+   reviewer returned no result, when the audit fails, or when a finding on
+   the blocking track of § Branch and PR Workflow survives and no open Issue
+   names its work; `RELEASE READY` otherwise.
+2. A blocking finding takes a fix PR through the normal PR workflow, and an
+   audit failure its fix; the review then runs again in `delta` mode, since
+   the head it last reviewed. A blocking-track finding an open Issue names is
+   a known issue of the release. Every other finding is recorded as § Branch
+   and PR Workflow records a finding off the surface: on the open Issue that
+   names the work, else on the follow-up Issue of its scope, which step 8
+   moves to the next milestone. A finding contested on the facts or on its
+   rule is put to the maintainer.
+3. On `RELEASE READY` the run returns the draft of
+   `docs/releases/v<X>.<Y>.<Z>.md`, built from `docs/releases/TEMPLATE.md`.
+   One release PR bumps `[workspace.package] version` in the root
+   `Cargo.toml` to `<X>.<Y>.<Z>` and adds the notes file from the draft, every
+   section filled, through the normal PR workflow. The tag MUST point at a
+   commit that contains both.
 4. Run the release host runs ([testing.md](testing.md#coverage-tiers)
-   § Coverage tiers) on that commit: the whole boundary set (riscv64 16 and
-   128 harts, x86_64 16 and 128 vCPUs) three times each in the debug profile
-   and once each in the release profile, and the memory
-   variation, the disk variations (a 4Kn disk and three second-disk boots,
-   on both architectures), the no-IOMMU variant (`--iommu absent`, svctest,
-   on both architectures), and the framebuffer cell (`--display framebuffer`,
-   svctest, on both architectures) once each. When they pass, tag it and push
-   the tag:
+   § Coverage tiers) on the `master` commit that contains them: the whole
+   boundary set (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three
+   times each in the debug profile and once each in the release profile, and
+   the memory variation, the disk variations (a 4Kn disk and three
+   second-disk boots, on both architectures), the no-IOMMU variant
+   (`--iommu absent`, svctest, on both architectures), and the framebuffer
+   cell (`--display framebuffer`, svctest, on both architectures) once each.
+   Their report, each run's command, `--runs` count, outcome, and head, is
+   written to `target/xtask/review/release-v<X>.<Y>.<Z>/host-runs.md`, the
+   file the release audit reads; the release PR's body states its own local
+   host runs as § PR-body checklist discipline requires.
+5. Run the release review in `delta` mode, since the head it last reviewed,
+   with that report. `RELEASE READY` at a head that carries the version bump
+   is the tag condition: tag that commit and push the tag:
    `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.
-5. The tag push triggers `release.yml` and `burnin.yml`. The `preflight` job in
+6. The tag push triggers `release.yml` and `burnin.yml`. The `preflight` job in
    `release.yml` aborts the run before any image is built if the workspace
    version does not match the tag or the notes file is missing or does not
    follow `TEMPLATE.md`'s structure.
-6. The maintainer publishes the draft Release manually after verifying the
+7. The maintainer publishes the draft Release manually after verifying the
    `burnin.yml` run for the same tag completed successfully.
-7. The maintainer creates `v<X>.<Y>.<Z+1>` when no `v<X>.<Y>.*` milestone
+8. The maintainer creates `v<X>.<Y>.<Z+1>` when no `v<X>.<Y>.*` milestone
    above `v<X>.<Y>.<Z>` is open. Every Issue in `v<X>.<Y>.<Z>` or a lower open
    milestone moves to `v<X>.<Y>.<Z>` when it is closed and no commit outside
    the tag closed it, and otherwise to the lowest-versioned open milestone

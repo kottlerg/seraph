@@ -75,8 +75,10 @@ crashd sends no further request of that fault's handling, so no later attach wai
 wherever the upcall was delivered. On the cancellation crashd declines the fault at once, marking
 the block `status=timeout` when an attach was the request cancelled, waits for the watchdog to have
 served the upcall, and logs the rest of the block after the decline, when nothing waits on the
-faulting thread any more. So no cancellation of one fault reaches the next fault's handling. The
-stack scan reads at most
+faulting thread any more. So no cancellation of one fault reaches the next fault's handling,
+unless the watchdog has not served it within another 2 s; crashd then logs that and goes on, and
+the late upcall can cut one request of the next fault's handling short. The stack scan reads at
+most
 8 KiB (`STACK_SCAN_BYTES`).
 
 ---

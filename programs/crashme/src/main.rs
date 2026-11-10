@@ -17,7 +17,10 @@
 //! names it, and reaches the fault two calls deep, so the report's stack walk
 //! has frames to find. `crashme registry-declare` does not fault: it checks
 //! that declaring itself undebuggable unbinds a registered thread's crash
-//! binding as well as the main thread's, and exits 0 when it does. See
+//! binding as well as the main thread's, and exits 0 when it does.
+//! `crashme debugger-tag` does not fault either: svctest, a debugger, sets
+//! each of its steps up and lets it go on with a line on stdin, and it checks
+//! what procmgr does with a debugger's binding. See
 //! programs/crashme/README.md.
 
 mod arch;
@@ -28,7 +31,8 @@ use std::time::{Duration, Instant};
 
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::{
-    CAP_INFO_THREAD_STATE, FAULT_CLASS_EXCEPTION, RIGHTS_THREAD_OBSERVE, THREAD_STATE_EXITED,
+    CAP_INFO_THREAD_STATE, FAULT_CLASS_EXCEPTION, FAULT_CLASS_UPCALL, RIGHTS_THREAD_OBSERVE,
+    THREAD_STATE_EXITED,
 };
 
 /// The fault the fixture dies of.
@@ -62,10 +66,12 @@ fn main()
         "registry-main" => registry_main(&arg),
         "registry-worker" => registry_worker(&arg),
         "registry-declare" => registry_declare(),
+        "debugger-tag" => debugger_tag(),
         _ =>
         {
             println!(
-                "usage: crashme vm|exception|worker|registry-main|registry-worker|registry-declare"
+                "usage: crashme vm|exception|worker|registry-main|registry-worker|registry-declare\
+                 |debugger-tag"
             );
             std::process::exit(2);
         }
@@ -244,6 +250,72 @@ fn registry_declare()
         if pass { "PASS" } else { "FAIL" }
     );
     std::process::exit(i32::from(!pass));
+}
+
+/// What procmgr does with a debugger's binding, in the steps svctest's
+/// `crash_endpoint` phase sets up, each let go by a line on stdin: with the
+/// main thread bound under the debugger tag and no debugger watched, a
+/// thread spawned now copies that binding, and its registration binds it to
+/// the crash endpoint under a crash badge of its own and unbinds the upcall
+/// class; with a debugger attached and watched, the declaration unbinds the
+/// main thread's exception and upcall classes the debugger bound. svctest
+/// then checks that the watch's end binds nothing back, and closes stdin.
+/// Exits 0 when both of this process's checks hold, 1 when either does not.
+fn debugger_tag()
+{
+    let next = || {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).is_ok_and(|n| n > 0)
+    };
+    let binding = |cap, class| syscall::thread_get_fault_handler(cap, class).ok().flatten();
+    if !next()
+    {
+        fail("debugger-tag: no first step");
+    }
+    let (cap_tx, cap_rx) = mpsc::channel();
+    let (stop, parked) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let _ = cap_tx.send(std::os::seraph::thread::current_thread_cap());
+        let _ = parked.recv();
+    });
+    let thread = cap_rx
+        .recv()
+        .unwrap_or_else(|_| fail("debugger-tag: no thread cap"));
+    let (exception, upcall) = (
+        binding(thread, FAULT_CLASS_EXCEPTION),
+        binding(thread, FAULT_CLASS_UPCALL),
+    );
+    // A crash badge carries bit 63 (services/procmgr/docs/ipc-interface.md
+    // § REGISTER_THREAD).
+    let taken_back = exception.is_some_and(|b| b & (1 << 63) != 0) && upcall.is_none();
+    println!(
+        "debugger-tag: registration took the binding back: {taken_back} \
+         ({exception:x?}, {upcall:x?})"
+    );
+
+    if !next()
+    {
+        fail("debugger-tag: no second step");
+    }
+    let main = std::os::seraph::thread::current_thread_cap();
+    // SAFETY: the main thread's registered IPC buffer page.
+    let declared = unsafe {
+        ipc::ipc_call(
+            std::os::seraph::startup_info().procmgr_endpoint,
+            &IpcMessage::new(procmgr_labels::DECLARE_NO_DEBUG),
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .is_ok_and(|r| r.label == procmgr_errors::SUCCESS);
+    let unbound = declared
+        && binding(main, FAULT_CLASS_EXCEPTION).is_none()
+        && binding(main, FAULT_CLASS_UPCALL).is_none();
+    println!("debugger-tag: the declaration unbound the debugger: {unbound}");
+
+    let _ = next();
+    let _ = stop.send(());
+    let _ = worker.join();
+    std::process::exit(i32::from(!(taken_back && unbound)));
 }
 
 /// Fault on a spawned thread after joining its sibling, which the attach

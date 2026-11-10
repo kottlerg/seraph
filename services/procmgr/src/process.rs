@@ -2080,11 +2080,15 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// binding is once that debugger has gone (`ProcessEntry::rebinds_on_register`),
 /// is bound again under a fresh crash badge, so its faults name it, and,
 /// with no debugger watched, a debugger's upcall binding on it is unbound; a
-/// binding under any other
-/// badge, a watched debugger's, or none, is left as it is. The binding is
-/// told by its badge alone, which is all `SYS_THREAD_GET_FAULT_HANDLER`
-/// returns, so a debugger binds under `procmgr_labels::DEBUGGER_BADGE_TAG`
-/// (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`).
+/// binding under any other badge, a watched debugger's, or none, is left as
+/// it is. The binding is told by its badge alone, which is all
+/// `SYS_THREAD_GET_FAULT_HANDLER` returns, so a debugger binds under
+/// `procmgr_labels::DEBUGGER_BADGE_TAG`
+/// (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`). A thread
+/// refused at the bound or for the heap runs unregistered, so a gone
+/// debugger's binding on it is taken back then, under the process badge; one
+/// refused because its process declared itself undebuggable is unbound as the
+/// declaration unbinds its threads.
 ///
 /// # Errors
 /// The reply code: `INVALID_BADGE` when no live process carries `badge`,
@@ -2095,18 +2099,30 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// the cap on every error.
 pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) -> Result<(), u64>
 {
-    let entry = process_table::register_target(table, badge).map_err(|r| match r
+    let entry = match process_table::register_target(table, badge)
     {
-        process_table::AttachRefusal::NotAttachable => procmgr_errors::NOT_ATTACHABLE,
-        _ => procmgr_errors::INVALID_BADGE,
-    })?;
+        Ok(entry) => entry,
+        Err(process_table::AttachRefusal::NotAttachable) =>
+        {
+            // A thread spawned before its process declared copied a binding
+            // procmgr or a debugger made: unbind it as the declaration did.
+            if is_full_thread_cap(thread_cap)
+                && let Some(entry) = table.find_by_badge(badge)
+            {
+                unbind_declared(entry, thread_cap);
+            }
+            return Err(procmgr_errors::NOT_ATTACHABLE);
+        }
+        Err(_) => return Err(procmgr_errors::INVALID_BADGE),
+    };
     if !is_full_thread_cap(thread_cap)
     {
         return Err(procmgr_errors::INVALID_ARGUMENT);
     }
     // A crash badge the thread copied from a spawner that has exited, and
     // that a sweep dropped, is still procmgr's: the tag tells it.
-    let rebind = entry.rebinds_on_register(binding(thread_cap, FAULT_CLASS_EXCEPTION));
+    let current = binding(thread_cap, FAULT_CLASS_EXCEPTION);
+    let rebind = entry.rebinds_on_register(current);
     // With no debugger watched, a debugger's upcall binding the thread
     // copied is a gone debugger's too.
     let unwatched = entry.debugger == 0;
@@ -2116,11 +2132,25 @@ pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) ->
             .threads
             .sweep(|t| thread_is_listed(t.cap), release_registered_thread);
     }
-    entry.threads.reserve().map_err(|r| match r
+    if let Err(r) = entry.threads.reserve()
     {
-        process_table::RegisterRefusal::Limit => procmgr_errors::THREAD_LIMIT,
-        process_table::RegisterRefusal::OutOfMemory => procmgr_errors::OUT_OF_MEMORY,
-    })?;
+        // The thread runs unregistered, so no restore reaches it later: a
+        // gone debugger's binding it copied goes back to the crash endpoint
+        // under the process badge, which its faults then carry.
+        if unwatched && current.is_some_and(process_table::is_debugger_badge)
+        {
+            if !bind_exception_class(thread_cap, badge)
+            {
+                std::os::seraph::log!("crash binding of a refused thread not restored");
+            }
+            release_debugger_upcall(thread_cap);
+        }
+        return Err(match r
+        {
+            process_table::RegisterRefusal::Limit => procmgr_errors::THREAD_LIMIT,
+            process_table::RegisterRefusal::OutOfMemory => procmgr_errors::OUT_OF_MEMORY,
+        });
+    }
     let crash_badge = if rebind { table.mint_crash_badge() } else { 0 };
     let bound = crash_badge != 0 && bind_exception_class(thread_cap, crash_badge);
     if bound && unwatched

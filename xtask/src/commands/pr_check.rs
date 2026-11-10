@@ -577,8 +577,8 @@ const FILE_MODE: &[&str] = &["new file mode ", "deleted file mode "];
 /// One change of a unified diff: its file, and either the changed line with
 /// its sign (`+` or `-`) or a header line (a binary change, a mode change, or
 /// the mode header of an added or a deleted file). `code` is set for every
-/// change except a comment line and the mode header of an added or a deleted
-/// file (`FILE_MODE`), which is judged by the file's lines.
+/// change except a comment or blank line and the mode header of an added or a
+/// deleted file (`FILE_MODE`); such a file is judged by its lines.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Change
 {
@@ -588,8 +588,9 @@ pub struct Change
 }
 
 /// Every change of a unified diff, in order. A binary change, a mode change,
-/// and any line of a file type whose comment syntax is unknown count as code;
-/// so does a line of a Markdown file, which the callers exclude or judge
+/// and any non-blank line of a file type whose comment syntax is unknown count
+/// as code (a blank line never does); so does a non-blank line of a Markdown
+/// file, which the callers exclude or judge
 /// themselves. The diff must be made with `--no-renames`, so a rename shows
 /// its lines.
 pub fn diff_changes(diff: &str) -> Vec<Change>
@@ -666,9 +667,9 @@ pub fn diff_changes(diff: &str) -> Vec<Change>
 }
 
 /// The changes of a unified diff that are not comment lines, as
-/// `<path>: <what>`; empty when the diff alters only comments. A binary
-/// change, a mode change, and any line of a file type whose comment syntax is
-/// unknown count as changes. The diff must be made with `--no-renames`, so a
+/// `<path>: <what>`; empty when the diff alters only comments and blank
+/// lines. A binary change, a mode change, and any non-blank line of a file
+/// type whose comment syntax is unknown count as changes. The diff must be made with `--no-renames`, so a
 /// rename shows its lines.
 pub fn non_comment_changes(diff: &str) -> Vec<String>
 {

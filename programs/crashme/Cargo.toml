@@ -9,5 +9,11 @@ name = "crashme"
 path = "src/main.rs"
 test = false
 
+[dependencies]
+# `worker` binds a thread's exception class and holds its fault itself.
+ipc = { path = "../../shared/ipc" }
+syscall = { path = "../../shared/syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+
 [lints]
 workspace = true

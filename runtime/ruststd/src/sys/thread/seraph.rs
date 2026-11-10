@@ -148,6 +148,11 @@ impl ThreadResources {
     /// is a use-after-free.
     unsafe fn reclaim(self) {
         let _ = syscall::cap_delete(self.done_notification);
+        // Revoke the caps derived from this one first: the copy the thread
+        // registered with procmgr (`register_with_procmgr`), and any a
+        // debugger holds through it, which would otherwise keep the Thread
+        // object, and the slab run below, alive.
+        let _ = syscall::cap_revoke_all(self.thread_cap);
         let _ = syscall::cap_delete(self.thread_cap);
         // The Thread cap is now gone, so `dealloc_object(Thread)` has returned
         // the retype slot's bytes to the source MemoryObject. Hand the slab's
@@ -882,6 +887,55 @@ fn alloc_thread_tls(
     }
 }
 
+/// Set once procmgr refuses a registration `NOT_ATTACHABLE`: the process
+/// declared itself undebuggable, which is one-way, so no later thread of it
+/// sends one.
+static REGISTRY_REFUSED: crate::sync::atomic::AtomicBool =
+    crate::sync::atomic::AtomicBool::new(false);
+
+/// Register the calling thread, a thread this module spawned, with procmgr
+/// (`REGISTER_THREAD`, services/procmgr/docs/ipc-interface.md
+/// § `REGISTER_THREAD`): hand it a copy of `self_thread_cap` with
+/// `RIGHTS_THREAD`, so `ATTACH_PROCESS` lists the thread and procmgr can
+/// bind its exception class under a badge of its own. Runs on the new
+/// thread before its code, so the spawner never waits on procmgr; a thread
+/// that procmgr cannot serve yet waits here alone. Best-effort: a refusal or
+/// a failed call leaves the thread unregistered, and it runs as before. A
+/// process procmgr did not create (no procmgr endpoint) sends nothing.
+fn register_with_procmgr(self_thread_cap: u64, ipc_buf: *mut u64) {
+    use crate::sync::atomic::Ordering;
+    use ipc::{procmgr_errors, procmgr_labels};
+
+    if REGISTRY_REFUSED.load(Ordering::Relaxed) {
+        return;
+    }
+    let procmgr = crate::os::seraph::try_startup_info().map_or(0, |info| info.procmgr_endpoint);
+    if procmgr == 0 {
+        return;
+    }
+    let Ok(cap) = syscall::cap_derive(self_thread_cap, syscall_abi::RIGHTS_THREAD) else {
+        return;
+    };
+    let msg = ipc::IpcMessage::builder(procmgr_labels::REGISTER_THREAD).cap(cap).build();
+    // SAFETY: `ipc_buf` is this thread's IPC buffer page, registered by the
+    // caller just before; the cap moves to procmgr with the message.
+    match unsafe { ipc::ipc_call(procmgr, &msg, ipc_buf) } {
+        Ok(reply) => {
+            for &extra in reply.caps() {
+                let _ = syscall::cap_delete(extra);
+            }
+            if reply.label == procmgr_errors::NOT_ATTACHABLE {
+                REGISTRY_REFUSED.store(true, Ordering::Relaxed);
+            }
+        }
+        // The copy may not have moved: delete it. A slot it moved out of
+        // holds a later generation, so the stale handle deletes nothing.
+        Err(_) => {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+}
+
 extern "C" fn thread_entry(arg: u64) -> ! {
     // SAFETY: arg was produced via `Box::into_raw(Box::new(SpawnArgs {..}))`
     // in Thread::new; this is the sole consumer.
@@ -895,6 +949,7 @@ extern "C" fn thread_entry(arg: u64) -> ! {
         // SAFETY: the page was registered for this thread just above; a
         // refused registration leaves the TLS pointer null.
         unsafe { crate::os::seraph::set_current_ipc_buf(args.ipc_buffer_vaddr as *mut u64) };
+        register_with_procmgr(args.self_thread_cap, args.ipc_buffer_vaddr as *mut u64);
     }
 
     // SAFETY: args.init was produced via `Box::into_raw(init)` in

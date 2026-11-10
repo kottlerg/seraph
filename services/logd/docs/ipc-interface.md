@@ -206,6 +206,7 @@ ordering).
 ## Summarized By
 
 [Testing](../../../docs/testing.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [Crash Block Format](../../crashd/docs/block-format.md),
 [services/logd/README.md](../README.md),
 [services/logd/codec/README.md](../codec/README.md), [xtask/README.md](../../../xtask/README.md)

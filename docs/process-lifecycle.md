@@ -417,6 +417,14 @@ see [Fault Handling](fault-handling.md). For every child, pinned or not, it bind
 the initial thread's exception handler to its crash endpoint
 ([Fault Handling § Crash Reports](fault-handling.md#crash-reports)).
 
+Each thread the child's runtime spawns later registers itself with procmgr before it runs its code
+(`REGISTER_THREAD`), handing procmgr a cap of itself, so procmgr holds every thread of the process
+for a debugger and the crash service, and binds that thread's exception handler under a badge of
+its own. procmgr drops the thread when it exits or the runtime's reclaim of it revokes the cap, and
+releases every registered thread at the process's teardown
+([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 22: `REGISTER_THREAD`;
+[runtime/ruststd/README.md](../runtime/ruststd/README.md) § Thread registration).
+
 ---
 
 ## Process Death

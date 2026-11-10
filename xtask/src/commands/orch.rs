@@ -541,8 +541,7 @@ fn render_questions(state: &Value, out: &mut String)
         let file = question
             .get("file")
             .and_then(Value::as_str)
-            .map(|file| format!(" [{file}]"))
-            .unwrap_or_default();
+            .map_or_default(|file| format!(" [{file}]"));
         push_line(
             out,
             &format!(

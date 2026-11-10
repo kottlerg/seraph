@@ -19,8 +19,7 @@
 //!   worktree the harness would remove (`.claude/agents/worker.md`
 //!   § Reporting);
 //! - `compact-start`, after a session's compaction: names what to read
-//!   again, and adds the batch's state for a session started as the
-//!   orchestrator;
+//!   again;
 //! - `pre-compact`, before one: the instructions for the summary.
 //!
 //! A hook that fails must not stop a session. An event this command cannot
@@ -36,7 +35,6 @@ use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 
 use crate::cli::{HookArgs, HookEvent};
-use crate::commands::orch;
 use crate::commands::pr_check::RELEASE_APPROVAL_RULE;
 use crate::context::Context as BuildContext;
 
@@ -104,8 +102,7 @@ const MERGE_VALUE_OPTIONS: &[&str] = &[
     "--repo",
 ];
 
-/// The agent type that merges and files Issues inside a batch, and that
-/// holds the batch's state.
+/// The agent type that merges and files Issues inside a batch.
 const ORCHESTRATOR: &str = "orchestrator";
 
 /// The agent type whose stop `subagent-stop` checks.
@@ -311,7 +308,10 @@ impl Scan
 
     /// Read `<<` and what follows it. `<<<` is a here string, whose word is
     /// an ordinary word; `<<` and `<<-` name the delimiter of a here
-    /// document, whose body follows the next newline.
+    /// document, whose body follows the next newline. The scan knows no
+    /// arithmetic, so the shift in `$((1<<2))` is read as a here document
+    /// too, and the lines after it are skipped: such a line can let a
+    /// command through, never refuse one.
     fn redirect_here(&mut self)
     {
         self.at += 1;
@@ -872,63 +872,25 @@ fn stop_output(event: &Value) -> Option<Value>
 
 // ── Compaction ────────────────────────────────────────────────────────────────
 
-/// The context a session gets after a compaction: what to read again, and
-/// the batch's state when `state` holds it. `orch state` keeps its text
-/// short enough for the two to pass the harness's limit on a hook's context
-/// together (`orch::STATE_TEXT_MAX`); a longer one is named, not added.
-fn compact_context(state: Option<&str>) -> String
-{
-    match state
-    {
-        Some(state) if state.len() <= orch::STATE_TEXT_MAX =>
-        {
-            format!("{REREAD}\n\nThe state of the orchestration batch:\n\n{state}")
-        }
-        Some(_) => format!(
-            "{REREAD}\n\nAn orchestration batch is open; `cargo xtask orch state` prints its \
-             state."
-        ),
-        None => REREAD.to_owned(),
-    }
-}
-
-/// The JSON the harness reads for the `SessionStart` event `event`.
+/// The JSON the harness reads for a `SessionStart` event: what to read
+/// again from disk.
 ///
 /// `SessionStart` is an event of a session, not of a subagent. The hooks
 /// reference (<https://code.claude.com/docs/en/hooks.md>) fires it when a
 /// session starts, resumes, is cleared or is compacted, and sets its
 /// `agent_type` only for a session started with `claude --agent <name>`
 /// (§ `SessionStart` input); inside a subagent it names the tool events and
-/// `SubagentStart` and `SubagentStop` (§ Hook locations). An orchestrator or
-/// a worker spawned as a subagent therefore gets nothing from this hook, and
-/// reads again as its agent file says.
-///
-/// A session started as the orchestrator gets the batch's state, which
-/// `state` reads. Any other session gets the reminder alone: the supervisor
-/// keeps none of the record in its context
-/// (`.claude/skills/orchestrate/SKILL.md`). A state that cannot be read is
-/// named as such.
-fn compact_output(event: &Value, state: impl FnOnce() -> Result<Option<String>>) -> Value
+/// `SubagentStart` and `SubagentStop` (§ Hook locations). The reminder
+/// therefore reaches a top session: the supervisor of a batch, or a session
+/// working alone. An orchestrator or a worker spawned as a subagent reads
+/// again as its agent file says, the orchestrator its state with
+/// `cargo xtask orch state` (`.claude/agents/orchestrator.md`).
+fn compact_output() -> Value
 {
-    let context = if event["agent_type"].as_str() == Some(ORCHESTRATOR)
-    {
-        match state()
-        {
-            Ok(state) => compact_context(state.as_deref()),
-            Err(err) => format!(
-                "{REREAD}\n\nThe state of the orchestration batch could not be read ({err:#}); \
-                 run `cargo xtask orch state`."
-            ),
-        }
-    }
-    else
-    {
-        compact_context(None)
-    };
     json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": context,
+            "additionalContext": REREAD,
         }
     })
 }
@@ -988,11 +950,7 @@ pub fn run(ctx: &BuildContext, args: &HookArgs)
     {
         HookEvent::Bash => bash_output(&answer_event(&raw, &|number| run_gate(ctx, number))),
         HookEvent::SubagentStop => parse_event(&raw).and_then(|event| stop_output(&event)),
-        HookEvent::CompactStart =>
-        {
-            let event = parse_event(&raw).unwrap_or(Value::Null);
-            Some(compact_output(&event, || orch::state_text(ctx)))
-        }
+        HookEvent::CompactStart => Some(compact_output()),
         HookEvent::PreCompact => None,
     };
     if let Some(output) = output
@@ -1476,73 +1434,13 @@ mod tests
     }
 
     #[test]
-    fn the_context_after_a_compaction_carries_a_state_that_fits()
+    fn the_context_after_a_compaction_is_the_reminder_to_read_again()
     {
-        assert_eq!(compact_context(None), REREAD);
-        let short = compact_context(Some("goal: x\n"));
-        assert!(
-            short.starts_with(REREAD) && short.ends_with("goal: x\n"),
-            "{short}"
-        );
-        let fits = "x".repeat(orch::STATE_TEXT_MAX);
-        assert!(compact_context(Some(&fits)).ends_with(&fits));
-        // With the state at its limit the whole stays within what the
-        // harness lets a hook add.
-        assert!(compact_context(Some(&fits)).len() <= 10_000);
-        let long = compact_context(Some(&"x".repeat(orch::STATE_TEXT_MAX + 1)));
-        assert!(long.contains("cargo xtask orch state"), "{long}");
-        assert!(long.len() < 1_000);
-    }
-
-    fn context_of(output: &Value) -> &str
-    {
+        let output = compact_output();
         assert_eq!(
             output["hookSpecificOutput"]["hookEventName"],
             "SessionStart"
         );
-        output["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-    }
-
-    #[test]
-    fn only_the_orchestrator_gets_the_state_after_a_compaction()
-    {
-        let state = || Ok(Some("goal: x\n".to_owned()));
-        // A session started with `claude --agent orchestrator`: the only
-        // `SessionStart` event the hooks reference gives an `agent_type`.
-        let orchestrator = json!({"source": "compact", "agent_type": "orchestrator"});
-        assert!(context_of(&compact_output(&orchestrator, state)).ends_with("goal: x\n"));
-        for event in [
-            json!({}),
-            json!({"source": "compact"}),
-            json!({"agent_id": "a2", "agent_type": "worker"}),
-            Value::Null,
-        ]
-        {
-            let unread = || -> Result<Option<String>> { panic!("the state is not read") };
-            assert_eq!(
-                context_of(&compact_output(&event, unread)),
-                REREAD,
-                "{event}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_orchestrator_is_told_of_no_batch_and_of_a_state_that_cannot_be_read()
-    {
-        let orchestrator = json!({"agent_type": "orchestrator"});
-        assert_eq!(
-            context_of(&compact_output(&orchestrator, || Ok(None))),
-            REREAD
-        );
-        let broken = compact_output(&orchestrator, || bail!("parsing state.json"));
-        let context = context_of(&broken);
-        assert!(context.starts_with(REREAD), "{context}");
-        assert!(
-            context.contains("could not be read (parsing state.json)"),
-            "{context}"
-        );
+        assert_eq!(output["hookSpecificOutput"]["additionalContext"], REREAD);
     }
 }

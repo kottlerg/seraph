@@ -37,10 +37,9 @@ const LOCK_FILE: &str = "state.lock";
 /// session's context, so every field is one bounded line.
 const LINE_MAX: usize = 300;
 
-/// The size `orch state` stays under. A hook may add 10,000 characters to a
-/// session's context before the harness replaces them with a file path, and
-/// `hook compact-start` adds this text below a reminder of a few hundred.
-pub const STATE_TEXT_MAX: usize = 9_500;
+/// The size `orch state` stays under: what a hook may add to a session's
+/// context before the harness replaces it with a file path.
+const STATE_TEXT_MAX: usize = 10_000;
 
 /// How long a change waits for another writer's lock before it fails.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -862,22 +861,6 @@ fn print_state(dir: &Path, as_json: bool) -> Result<()>
     Ok(())
 }
 
-/// The text `orch state` prints, or `None` when no batch is open.
-pub fn state_text(ctx: &BuildContext) -> Result<Option<String>>
-{
-    state_text_in(&state_dir(ctx))
-}
-
-/// The text of the state in `dir`, or `None` when `dir` holds none.
-fn state_text_in(dir: &Path) -> Result<Option<String>>
-{
-    if !dir.join(STATE_FILE).exists()
-    {
-        return Ok(None);
-    }
-    Ok(Some(render(&load(dir)?)))
-}
-
 /// The warning for a rendered state longer than `STATE_TEXT_MAX`, if it is.
 fn size_warning(rendered: &str) -> Option<String>
 {
@@ -1454,23 +1437,6 @@ mod tests
     {
         assert!(state_change(&OrchCommand::End).is_err());
         assert!(state_change(&OrchCommand::Orchestrator { id: None }).is_err());
-    }
-
-    #[test]
-    fn the_state_text_tells_no_batch_from_a_state_that_cannot_be_read()
-    {
-        let dir = scratch("text");
-        fs::create_dir_all(&dir).unwrap();
-        assert_eq!(state_text_in(&dir).unwrap(), None);
-
-        start(&dir, "close out the milestone", SECS).unwrap();
-        let text = state_text_in(&dir).unwrap().expect("a batch is open");
-        assert_eq!(text, render(&load(&dir).unwrap()));
-        assert!(text.contains("close out the milestone"), "{text}");
-
-        fs::write(dir.join(STATE_FILE), "{ not json").unwrap();
-        assert!(state_text_in(&dir).is_err());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

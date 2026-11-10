@@ -338,23 +338,6 @@ fn init_device(transport: &PciTransport)
     }
 }
 
-/// The low 32 bits of a device address, for a transport register that takes
-/// the address in halves.
-// cast_possible_truncation: keeping the low half is the point; the high half
-// goes to the register's pair through `high_half`.
-#[allow(clippy::cast_possible_truncation)]
-fn low_half(addr: u64) -> u32
-{
-    addr as u32
-}
-
-/// The high 32 bits of a device address ([`low_half`]'s pair).
-fn high_half(addr: u64) -> u32
-{
-    // The shift leaves at most 32 bits, so the conversion cannot fail.
-    u32::try_from(addr >> 32).unwrap_or(0)
-}
-
 /// One virtqueue: its ring and its doorbell.
 struct Queue
 {
@@ -387,12 +370,7 @@ fn setup_queue(
         rings.addr + avail_off,
         rings.addr + used_off,
     );
-    transport.queue_set_desc_lo(low_half(desc));
-    transport.queue_set_desc_hi(high_half(desc));
-    transport.queue_set_avail_lo(low_half(avail));
-    transport.queue_set_avail_hi(high_half(avail));
-    transport.queue_set_used_lo(low_half(used));
-    transport.queue_set_used_hi(high_half(used));
+    transport.queue_set_rings(desc, avail, used);
     transport.queue_set_ready(1);
 
     let notify_off = transport.queue_notify_off();

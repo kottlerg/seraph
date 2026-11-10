@@ -746,7 +746,7 @@ const ISSUES_BLOCK = [
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')
 
-// The ledger filter of `.claude/CLAUDE.md` § PR workflow operations, guarded
+// The ledger filter of `cargo xtask review-ledger` (xtask/README.md), guarded
 // for records that lack a key, run over every saved record of the range's PRs
 // and of this release's earlier runs.
 const LEDGER_FILTER =

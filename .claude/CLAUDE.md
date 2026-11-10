@@ -1,255 +1,103 @@
 # Seraph — AI Project Context
 
-@../README.md
+Seraph is a microkernel operating system written in Rust for x86-64 and RISC-V. The root
+`README.md` describes the top-level directories and links every design document under `docs/`;
+read it to find the document a task needs.
 
 ## Authority
-Per [docs/documentation-standards.md](../docs/documentation-standards.md) § Document Hierarchy:
-- System-wide design and architectural invariants are defined exclusively in `docs/`.
-- Each component’s `README.md` defines that component’s scope, role, and links to any authoritative
-  design documents.
-- Detailed behavior is defined only in component-specific `docs/` where present.
 
-- `docs/coding-standards.md` governs all source code; all code changes MUST comply with its
-  rules (per its preamble), and a suppression MUST be narrowly scoped and carry a rationale
-  comment at the point of use (per [docs/coding-standards.md](../docs/coding-standards.md)
-  § E. Exception Policy).
-- `docs/documentation-standards.md` is the authoritative standard for all documentation; all
-  documentation changes MUST comply with its rules (per its preamble).
-- For the assistant: existing history or code that violates a written rule is not a
-  convention; the rule governs new work.
-
-## Coding invariants
-See [docs/coding-standards.md](../docs/coding-standards.md) — non-negotiable authority.
-
-## Documentation invariants
-See [docs/documentation-standards.md](../docs/documentation-standards.md) — non-negotiable
-authority.
-
-## Project conventions
-See [docs/conventions.md](../docs/conventions.md) for versioning, backlog tracking (GitHub Issues),
-branch/PR workflow, CI gating, and release production. Treat its rules as the source of
-truth for "how work is tracked and shipped" on this project.
-
-## Operating procedure
-- Documentation MUST be consumed in the order of the authoritative scopes
-  [docs/documentation-standards.md](../docs/documentation-standards.md) § Document Hierarchy
-  defines (grouping READMEs only index components; the root README routes to and may
-  summarize the authoritative documents):
-  1. System scope (`docs/`)
-  2. Component scope (`<component>/README.md`)
-  3. Design-authority scope (`<component>/docs/*.md`)
-- Additional documentation MUST NOT be loaded unless required by the task.
+- `docs/` defines system-wide design and invariants. Each component's `README.md` defines its
+  scope and structure, and `<component>/docs/*.md` its internal design
+  ([docs/documentation-standards.md](../docs/documentation-standards.md) § Document Hierarchy).
+  Read in that order, and only what the task needs.
+- [docs/coding-standards.md](../docs/coding-standards.md) governs all source code,
+  [docs/documentation-standards.md](../docs/documentation-standards.md) all documentation, and
+  [docs/conventions.md](../docs/conventions.md) how work is tracked and shipped: versioning,
+  Issues, commits, branches and PRs, CI, and releases. Every change complies with them.
+- Existing code or history that breaks a written rule is not a convention; the rule governs new
+  work.
+- A lint suppression is narrowly scoped and carries its rationale where it is used
+  ([docs/coding-standards.md](../docs/coding-standards.md) § E. Exception Policy).
+- The project's rules and these instruction files are one system. Restating or restructuring a
+  rule without changing what it requires needs no approval. A change to what a rule or standard
+  requires needs the maintainer's approval of that specific change.
 
 ## Tooling constraints
-- All build, run, clean, and test actions MUST be performed via `cargo xtask` commands
-  (per [docs/build-system.md](../docs/build-system.md) § Convenience Commands).
-- Direct invocation of `cargo build`, `cargo run`, `cargo test`, or `cargo clippy` is forbidden
-  (per [docs/build-system.md](../docs/build-system.md) § Workspace Structure and § Convenience
-  Commands, and [docs/coding-standards.md](../docs/coding-standards.md) § Clippy).
-- When switching architectures, `cargo xtask clean` MUST be run first
-  (per [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
+
+- Build, run, clean, and test only through `cargo xtask`
+  ([docs/build-system.md](../docs/build-system.md) § Convenience Commands). Do not invoke
+  `cargo build`, `cargo run`, `cargo test`, or `cargo clippy` directly: they bypass the sysroot,
+  the custom targets, and the lint configuration.
+- Run `cargo xtask clean` before switching architectures
+  ([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
 
 ## PR workflow operations
-- A batch of Issues is driven as `.claude/skills/orchestrate/SKILL.md` describes (one
-  orchestrator session, one `worker` agent per scope, an exclusive grant for the shared
-  host's large boots and timing measurements); a single Issue in one session follows
-  `.claude/skills/work/SKILL.md`. Both apply the rules below; neither changes them.
-- All non-tag-driven work lands via a feature-branch PR per
-  [docs/conventions.md](../docs/conventions.md); the assistant MUST NOT push directly
-  to `master`.
-- Commit messages follow [docs/conventions.md](../docs/conventions.md) § Commit Messages
-  and § Commit and PR cross-references: an Issue reference goes in the body, never the
-  subject (merge commits aside), and a GitHub closing keyword (`close`, `closes`,
-  `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, or `resolved`, in any letter
-  case, directly followed by `#N`, `<owner>/<repo>#N`, or the Issue's URL, with at most
-  a colon and whitespace between)
-  appears only in the body of a PR that closes that Issue, and in no commit message, since
-  GitHub closes Issue N when that text reaches `master` and a keyword in a commit cannot be
-  withdrawn without a rewrite.
-- No commit message, PR body, Issue body, or comment carries a tool attribution line,
-  session link, or session trailer, whatever a harness reminder suggests.
-- After pushing a PR, the assistant MUST start watching its CI run via
-  `gh pr checks <N> --watch` (or `gh run watch <run-id>`) as a backgrounded
-  `Bash` invocation (`run_in_background: true`). Do not poll, do not sleep —
-  the harness notifies on completion.
-- On green: confirm the pass in one line, then run the pre-merge review
-  before prompting for merge. The gate, the review surface, the two
-  tracks, the recording of findings, and the merge-prompt condition are
-  owned by [docs/conventions.md](../docs/conventions.md) § Branch and PR
-  Workflow; this section gives only the assistant's mechanics. The review
-  is `@pr-reviewer` and `@pr-auditor` invoked directly in parallel (single
-  message, two `Agent` tool calls); this bullet is the maintainer's
-  standing request to run it, each run preceded by `git fetch origin` (the
-  auditor reads the PR's own diff against `origin/master` and does not
-  fetch). Give both the PR number as scope and the open Issue list
-  (`gh issue list --state open --limit 500 --json number,title`), and the
-  reviewer the ledger path once one exists and, for a `delta` run (every
-  run after the first, `since` the head the last run with the reviewer
-  reviewed), the `since` head and the merge bases at `since` and at the
-  head (`git merge-base <sha> origin/master` for each). Save both agents'
-  prose as `target/xtask/review/pr<N>/<mode>-<head>.md`, `<mode>` being
-  `full` for the first run and `delta` after it, and surface both verdict
-  lines to the user verbatim. Save the run record beside it as
-  `<mode>-<head>.json`, one JSON object with these keys: `verdict` and
-  `audit_verdict`, the two verdict lines; `audit`, the audit's `verdict`
-  and its `sections`, each with `name`, `verdict`, and `items`;
-  `findings`, the reviewer's findings on the surface, each with `file`,
-  `line`, `class`, `bucket`, `must_violation`, `status`, `issue`, `claim`,
-  and `fix`, `status` being `unverified` (no refuter judges a PR run's
-  findings), `nit` for a nit that cannot block, or `contested` once the
-  finding is put to the user as contested; `recorded`, the findings off
-  the surface, in the same shape; `ledgered`, the ones its `Ledger (not
-  re-raised)` heading lists; `dropped`, empty; and `stats` with `mode`,
-  `head`, `since`, `failed` (the agents that returned no result), and
-  `run`, the run's number in the PR's sequence of runs of either kind,
-  counting from 1 (one more than the highest `run` among the records
-  already saved). A second record of one mode at a head that already has
-  one is saved as `<mode>-<head>-<n>`, `<n>` counting up from 2; the
-  suffix only keeps the names apart, and `stats.run` orders the runs. The
-  ledger command below and the auditor-only run read these records, and
-  `cargo xtask review-check <N>` checks them.
 
-  Before each run after the first, build the ledger that section names
-  from every saved run record of the PR:
-
-  ```sh
-  jq -s '[.[] | .stats.head[0:8] as $run
-          | ((.recorded + .dropped
-              + [.findings[] | select(.status == "contested")]
-              + (if .verdict == "NON-BLOCKING ISSUES ONLY" then .findings else [] end))[]
-             | {run: $run, file, line, class, bucket, must_violation, status, issue,
-                claim, fix})]
-         | unique' \
-      target/xtask/review/pr<N>/*-*.json > target/xtask/review/pr<N>/ledger.json
-  ```
-
-  The surface findings of a `NON-BLOCKING ISSUES ONLY` run enter the ledger
-  because the pass below records them after every such run, whatever its
-  audit verdict and failed-agent list. The glob reads an auditor-only run's
-  `audit-<head>.json` too: its `findings` are the surface findings of the
-  last run with the reviewer that the delta leaves unfixed, and they enter
-  the ledger when it states `NON-BLOCKING ISSUES ONLY`.
-
-  Handle the run's findings as that section says, in one pass: fixes via
-  commits; recorded findings via `gh issue edit` on the Issue the section
-  names; after a `NON-BLOCKING ISSUES ONLY` run, the run's surface
-  findings recorded the same way on the follow-up Issue of each finding's
-  scope, as the section defines it: the Issue the PR drains in that scope
-  when it drains one (the lowest-numbered when it drains several; its
-  body carries `Refs #N` for each), else the scope's rolling Issue, found
-  with `gh issue list --state open --limit 500 --search '"defects found
-  by review" in:title' --json number,title` and, when the scope has none,
-  filed with the user's approval as `gh issue create --milestone
-  <current> --label <subsystem> --label <class>`, the current milestone
-  being the one [docs/conventions.md](../docs/conventions.md) § Milestones
-  defines and the labels the ones its § Labels requires. Before recording a
-  finding, and after fixing one, search every open follow-up Issue of its
-  scope, rolling and earlier-pattern (`gh issue list --state open --limit 500
-  --search '"defects found by" in:title' --json number,title`, then the
-  titles beginning `<scope>:`), for an item stating it: a finding one holds
-  is recorded nowhere, and its fix ticks that item. A PR that fixes items on
-  a follow-up Issue ticks each there with `(fixed by PR #<M>)`, copies those
-  items, ticked, into its body's `## Acceptance`, and carries `Refs #N` in
-  its body, and `Fixes #N` only under that section's closing condition.
-  Before each run, an Issue the PR closes (by its body or a commit) whose
-  milestone is missing or not the current one gets the current one (`gh issue
-  edit <N> --milestone <current>`), which the audit checks. `AUDIT FAIL`
-  items via `gh pr edit`, `gh issue edit`, or commits; a contested finding
-  put to the user and resolved as the section says.
-  Before pushing a fix, for every fact it changes (a symbol, a constant, a
-  rule sentence, a state or section name) walk the `## Summarized By` lists
-  ([docs/documentation-standards.md](../docs/documentation-standards.md)
-  § Change propagation procedure owns that rule) and, as the assistant's
-  mechanics, `git grep -n` the tracked tree for every other statement of
-  it, and update each copy in the same push.
-
-  After the fixes are pushed and CI is green again, run the review again
-  as a `delta` run, or, when the last run with the reviewer completed with no
-  failed agent and the fix round's delta since it is documentation or
-  comments only and merges no `master` in, the auditor-only run that
-  section allows: `@pr-auditor` alone, told it is that run, with the PR
-  number, the `since` head (the head the last run with the reviewer
-  reviewed), the path of that run's record, the claimed fixes, and the
-  open Issue list. Save its report as
-  `target/xtask/review/pr<N>/audit-<head>.md` and its record as
-  `audit-<head>.json` in the shape `.claude/agents/worker.md` § Review
-  gives, whose `verdict` is the reviewer verdict the audit states, as
-  [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow
-  gives it, and surface both verdict lines to the user verbatim. Any later
-  delta that changes anything but documentation or comments, or merges
-  `master` in, takes a `delta` run with the reviewer again, `since` the
-  head of the last run with the reviewer.
-
-  Prompt for the merge decision only under that section's
-  merge-prompt condition; when a `NON-BLOCKING ISSUES ONLY` run meets it,
-  offer one more fix round beside the merge. Merge via
-  `gh pr merge <N> --merge --delete-branch` (per
-  [docs/conventions.md](../docs/conventions.md) § Merge method).
-- At release time the `release-review` workflow
-  (`.claude/workflows/release-review.js`) reviews the release candidate, as
-  [docs/conventions.md](../docs/conventions.md) § Release Production
-  requires and `.claude/skills/orchestrate/SKILL.md` § Release review
-  describes; it is not a PR review.
-- On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
-  or equivalent) so the user can see the actual error without asking.
-- The assistant MUST NOT merge a PR while its CI run is pending or failing (CI gates
-  merge, per [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow).
-  Merge is the user's call; the assistant prepares the merge but does not
-  execute it without explicit instruction.
+- All work lands through a feature-branch PR; nothing is pushed to `master` directly
+  ([docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow).
+- These are the maintainer's standing requests, so no session or worker asks before acting on
+  them:
+  - Given an Issue, commit to its feature branch, push it, and open the PR.
+  - After a push, watch the PR's CI run with `gh pr checks <N> --watch` as a background command.
+    The harness notifies on completion; do not poll or sleep.
+  - On green, say so in one line and run the pre-merge review as the `pr-review` skill
+    describes. On red, show the failing job's tail (`gh run view <run-id> --log-failed`).
+- After a review run, whoever ran it gives both verdict lines verbatim to the one it reports to:
+  a worker to its orchestrator, a standalone session to the maintainer. An orchestrator passes
+  them on only when asked, or when a line is why something blocks, and otherwise reports as the
+  `.claude/agents/orchestrator.md` § Reporting to the maintainer says.
+- Hand searches and specified mechanical work to the `Explore` and `scribe` agents, as
+  `.claude/agents/worker.md` § Delegation describes, and keep every judgement about the code.
+- A commit message follows [docs/conventions.md](../docs/conventions.md) § Commit Messages and
+  § Commit and PR cross-references; `cargo xtask commit-check` checks it. No commit message, PR
+  body, Issue body, or comment carries a tool attribution line or a session link.
+- A decision of the maintainer is stated as a decision, in the project's prose. Nothing tracked
+  or outward-facing (a commit message, a PR body, an Issue, a comment, a file in the tree)
+  quotes what they typed ([docs/conventions.md](../docs/conventions.md) § Style); their words
+  are kept only in the orchestrator's local record.
+- The merge is the maintainer's decision. Merge only on their instruction, given per PR or as a
+  standing instruction for a batch, never while CI is pending or failing
+  ([docs/conventions.md](../docs/conventions.md) § CI Gating), and with
+  `gh pr merge <N> --merge --delete-branch` (§ Merge method). A worker never merges.
+- A batch of Issues is driven as the `orchestrate` skill and `.claude/agents/orchestrator.md`
+  describe, a single Issue in one session as the `work` skill describes, and a release
+  candidate is reviewed by the `release-review` workflow as § Release review of that agent file
+  describes.
 
 ## Validation
-- Changes MUST be validated beyond successful compilation.
-- At minimum, on both `x86_64` and `riscv64`:
-  1. `cargo xtask build` MUST succeed.
-  2. `cargo xtask run` (a pure runner; it does not build) MUST then boot
-     ktest or userspace services under QEMU and the chosen mode's
-     terminal pass marker MUST appear.
-- A change whose own diff makes a non-inert change to the CPU-count
-  surface, the memory surface, or a device surface (a driver's, the
-  storage-wide, or the shared one) [docs/testing.md](../docs/testing.md)
-  "Coverage tiers" names, or whose PR states a concurrency-fix purpose as
-  that section's Repeat count defines it, MUST additionally run the local
-  host runs that section owes for it (the boundary set, the memory
-  variation, and the device cells), at the heads and repeat counts it
-  sets; any other change owes none, whatever directory it touches.
-- Host-side compilation, unit tests, and `cargo check` alone do not
-  satisfy this requirement.
-- A documentation-only or comment-only change, as
-  [docs/testing.md](../docs/testing.md) "Coverage tiers" defines it,
-  requires none of the runs above (the CI gate builds and boots both
-  architectures); the pre-merge review still applies, and the PR body MUST
-  carry what [docs/conventions.md](../docs/conventions.md) § PR-body
-  checklist discipline requires (the validated head, the documentation-only
-  delta, and the local host-run report).
-- `cargo xtask lint-docs` MUST pass on every change, documentation-only
-  ones included (per [docs/conventions.md](../docs/conventions.md) § CI
-  Gating; CI's `host-tests` job runs it, per
+
+- Validate a change beyond successful compilation. Host-side compilation, unit tests, and
+  `cargo check` alone are not validation.
+- At minimum, on both `x86_64` and `riscv64`: `cargo xtask build` succeeds, and a boot of ktest
+  or the userspace services under QEMU (`cargo xtask run`, which does not build) shows the
+  chosen mode's terminal pass marker.
+- A change whose own diff makes a non-inert change to the CPU-count surface, the memory surface,
+  or a device surface that [docs/testing.md](../docs/testing.md) § Coverage tiers names, or
+  whose PR states a concurrency-fix purpose as that section defines it, also runs the local host
+  runs that section owes for it, at the heads and repeat counts it sets. Any other change owes
+  none, whatever directory it touches.
+- A documentation-only or comment-only change, as that section defines it, needs none of the
+  runs above, since the CI gate builds and boots both architectures. The pre-merge review still
+  applies, and the PR body carries what [docs/conventions.md](../docs/conventions.md) § PR-body
+  checklist discipline requires.
+- `cargo xtask lint-docs` passes on every change
+  ([docs/conventions.md](../docs/conventions.md) § CI Gating;
   [docs/build-system.md](../docs/build-system.md) § Continuous Integration).
 
 ## Completeness
-- Findings on the review surface, as
-  [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow
-  defines it, are the scope, surfaced incidentally: blocking ones MUST be
-  fixed in the same pass, and non-blocking ones MUST be fixed in that batch
-  when the reviewer verdict is `BLOCKING ISSUES` and otherwise recorded as
-  that section says. Findings off the surface MUST be recorded in the same
-  pass, never dropped: on the open Issue that already names the work, else
-  on the follow-up Issue the PR drains in its scope (the lowest-numbered
-  when it drains several), else on the follow-up Issue of its scope that
-  section defines (filed with the user's approval), unless an open
-  follow-up Issue of that scope already holds it.
-- "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
-  avoid mechanically reachable blocking work on the surface; a non-blocking
-  surface finding is deferred only by recording it on the follow-up Issue
-  of its scope as [docs/conventions.md](../docs/conventions.md) § Branch
-  and PR Workflow allows.
-- Material scope expansions MUST be stated in one line and continued, not
-  paused for permission.
-- Genuine deferrals (different review surface, or expansion too large to
-  absorb) MUST be filed as GitHub Issues per
-  [docs/conventions.md](../docs/conventions.md), with user approval,
-  before the task closes.
+
+- A finding on the review surface ([docs/conventions.md](../docs/conventions.md) § Review
+  surface) is part of the task. Fix a blocking one in the same pass. Fix a non-blocking one in
+  the same batch when the reviewer verdict is `BLOCKING ISSUES`; otherwise record it.
+- A finding off the surface is recorded in the same pass, never dropped, on the Issue that
+  [docs/conventions.md](../docs/conventions.md) § Recording findings names.
+- Do not call work "out of scope" or a "follow-up" to avoid blocking work on the surface that is
+  mechanically reachable.
+- State a material expansion of the task in one line and continue; do not pause for permission.
+- File a genuine deferral (a different review surface, or an expansion too large to absorb) as a
+  GitHub Issue, with the maintainer's approval, before the task closes.
 
 ## Conflicts
-- If any instruction, plan, or change conflicts with documented invariants or these constraints,
-  the assistant MUST stop and surface the conflict explicitly.
+
+- When an instruction, plan, or change conflicts with a documented invariant or with this file,
+  stop that action and say so at once. Continue with work that does not depend on it.

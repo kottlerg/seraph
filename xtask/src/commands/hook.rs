@@ -108,9 +108,15 @@ const ORCHESTRATOR: &str = "orchestrator";
 /// The agent type whose stop `subagent-stop` checks.
 const WORKER: &str = "worker";
 
+/// The reminder after a compaction. It reaches a top session, which is the
+/// supervisor of a batch or a session working alone (`compact_output`), so
+/// it names what each of the two reads again.
 const REREAD: &str = "The context was compacted. Before the next decision, read again from disk \
-                      the agent or skill file you work under, the Issue, and your pull \
-                      request's body. Do not act on the summary's account of a rule.";
+                      the agent or skill file you work under, and do not act on the summary's \
+                      account of a rule. A session working alone also reads again its Issue and \
+                      its pull request's body. The supervisor of a batch needs the current \
+                      orchestrator's agent id: when the summary does not hold it, \
+                      `cargo xtask orch orchestrator` prints it.";
 
 const SUMMARY_INSTRUCTIONS: &str = "Write the summary for an agent that reads its files again \
                                     from disk. Keep: the task, its Issue and pull request \
@@ -1442,5 +1448,30 @@ mod tests
             "SessionStart"
         );
         assert_eq!(output["hookSpecificOutput"]["additionalContext"], REREAD);
+    }
+
+    #[test]
+    fn the_reminder_names_what_each_top_session_reads_again()
+    {
+        // A session working alone: its Issue and its pull request's body.
+        assert!(REREAD.contains("Issue"), "{REREAD}");
+        assert!(REREAD.contains("pull request's body"), "{REREAD}");
+        // The supervisor of a batch: the current orchestrator's id, from a
+        // command this binary accepts as it is written there.
+        assert!(REREAD.contains("orchestrator's agent id"), "{REREAD}");
+        let command = REREAD
+            .split('`')
+            .find(|span| span.starts_with("cargo xtask orch"))
+            .expect("the reminder names the command that prints the orchestrator's id");
+        let words = command.split_whitespace().skip(1).collect::<Vec<_>>();
+        assert_eq!(words, ["xtask", "orch", "orchestrator"]);
+        let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(&words)
+            .unwrap_or_else(|err| panic!("`{command}` is not a command of this binary: {err}"));
+        assert!(matches!(
+            cli.command,
+            crate::cli::CliCommand::Orch(crate::cli::OrchArgs {
+                command: crate::cli::OrchCommand::Orchestrator { id: None },
+            })
+        ));
     }
 }

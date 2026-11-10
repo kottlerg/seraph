@@ -726,14 +726,14 @@ report below (`--save-logs`).
 
 ```sh
 # Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 16-hart
-# run, at 1x, takes ~80 s; the 128-hart run ~530 s at 8x hart
+# run, at 1x, takes ~50 s; the 128-hart run ~340 s at 8x hart
 # oversubscription; each budget is for HANG classification, see below):
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 300 \
+cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 180 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1620 \
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1140 \
     --save-logs $T
 
 # Release-profile boundary boots, riscv64 (release host runs only, once each;
@@ -743,12 +743,12 @@ cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeo
 # follows a debug-profile build, never the release boots above it):
 cargo xtask build --arch riscv64 --release
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 300
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1620
+cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 180
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1140
 
 # Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU
-# run, at 1x, takes ~60 s; the 128-vCPU run, at 8x vCPU oversubscription,
-# ~78 s, since idle vCPUs halt; each budget is for HANG classification, see
+# run, at 1x, takes ~40 s; the 128-vCPU run, at 8x vCPU oversubscription,
+# ~57 s, since idle vCPUs halt; each budget is for HANG classification, see
 # below):
 cargo xtask clean
 cargo xtask build

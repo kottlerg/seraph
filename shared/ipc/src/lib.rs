@@ -560,7 +560,7 @@ pub mod procmgr_labels
 /// | 24 | devmgr, every thread but its DMA thread |
 /// | 23 | vfsd, fs drivers (fatfs) |
 /// | 21 | svcmgr |
-/// | ≤21 | svcmgr-launched services, per `.svc` recipe (logd 18, timed/pwrmgr 16, terminal/svctest/usertest 10, crasher 5), and what they spawn (the shell, at 5 from terminal) |
+/// | ≤21 | svcmgr-launched services, per `.svc` recipe (crashd 20, logd 18, timed/pwrmgr 16, terminal/svctest/usertest 10, crasher 5), and what they spawn (the shell, at 5 from terminal) |
 ///
 /// Levels for svcmgr-launched services live in their `.svc` recipes
 /// (`priority = ...` / `sched_max = ...`), not here — this module carries

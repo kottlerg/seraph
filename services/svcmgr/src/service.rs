@@ -199,7 +199,9 @@ pub struct SvcmgrCaps
     /// log endpoint object alive across a logd crash. Zero if absent.
     pub master_log_source: u64,
     /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
-    /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it per launch. Zero if absent.
+    /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it per launch,
+    /// and a `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND|GRANT`
+    /// cap per launch. Zero if absent.
     pub procmgr_death_auth_source: u64,
 }
 

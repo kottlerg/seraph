@@ -87,6 +87,12 @@ targets; only the one-time init-logd history pull
   calls would deadlock against it (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   § Death-queue resync).
 
+* **Undebuggable.** At startup logd declares itself undebuggable to procmgr
+  (`procmgr_labels::DECLARE_NO_DEBUG`): every process's log output, a
+  debug-authority holder's own included, waits on logd, so a holder that
+  stopped it would wait on itself (see
+  [services/crashd/README.md](../crashd/README.md) § Limits).
+
 ## Out of scope (follow-up issues)
 
 * Log rotation, durable-disk persistence, query API.

@@ -407,8 +407,9 @@ pending reply and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` label
 and zero caps while the server receives the error (see
 [ipc-design.md](../../../docs/ipc-design.md) § Message Format). A fault reply skips
 cap processing entirely, and the label alone carries the disposition; a `FAULT_REPLY_KILL`
-reply's data word 0, when sent, is read as the handler's decline reason for the kernel's kill
-diagnostic, and an unreadable word is dropped rather than failing the reply (see
+or `FAULT_REPLY_FORWARD` reply's data word 0, when sent, is read as the handler's decline reason
+for the kernel's kill diagnostic or the forwarded message, and an unreadable word is dropped
+rather than failing the reply (see
 [fault-handling.md § Reply](../../../docs/fault-handling.md#reply)).
 
 ---

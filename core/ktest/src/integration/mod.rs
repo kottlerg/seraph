@@ -207,6 +207,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::fault_handler_declines_kills",
         fault_handler_declines_kills::run(ctx)
     );
+    run_integration_test!("integration::fault_forward", fault_forward::run(ctx));
     run_integration_test!(
         "integration::fault_handler_rebind",
         fault_handler_rebind::run(ctx)
@@ -215,7 +216,6 @@ pub fn run_all(ctx: &TestContext)
         "integration::fault_class_bindings",
         fault_class_bindings::run(ctx)
     );
-    run_integration_test!("integration::fault_forward", fault_forward::run(ctx));
     run_integration_test!(
         "integration::fault_syscall_buffer",
         fault_syscall_buffer::run(ctx)

@@ -411,8 +411,10 @@ has finished injecting any additional capabilities.
 
 Unless the caller sets `CREATE_PINNED`, procmgr delegates the child's
 `AddressSpace` to memmgr (`DELEGATE_ASPACE`) and binds the initial thread's
-fault handler to memmgr, the default demand-paging pager, before replying;
-see [Fault Handling](fault-handling.md).
+virtual-memory fault handler to memmgr, the default demand-paging pager, before replying;
+see [Fault Handling](fault-handling.md). For every child, pinned or not, it binds
+the initial thread's exception handler to its crash endpoint
+([Fault Handling § Crash Reports](fault-handling.md#crash-reports)).
 
 ---
 
@@ -437,7 +439,11 @@ A process dies when:
   stop follows when that syscall releases the object or that Mmio object is freed.
 - An unhandled fault of a thread's own access terminates its threads; an unhandled fault of a
   restartable syscall's copy of a user buffer fails that syscall instead (see
-  [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)).
+  [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)). When a crash service is
+  registered, it receives the fault first, through the exception class procmgr binds, logs a
+  report of the faulting process, and declines the fault, so the thread terminates with the same
+  exit reason and the death flow below runs unchanged (see
+  [Fault Handling § Crash Reports](fault-handling.md#crash-reports)).
 
 Under the kill-process pattern and the `CSpace`/`AddressSpace` teardown, an object a concurrent
 syscall is still using is freed only once that syscall is done with it, and a stopped thread's
@@ -568,16 +574,17 @@ is always from-scratch via `CREATE_PROCESS` or `CREATE_FROM_FILE`; zero-copy
 buffer handoff between processes uses Memory-cap moves over IPC.
 
 Userspace fault handling is specified as the pager protocol in [Fault Handling](fault-handling.md).
-An unresolved fault is delivered to the thread's bound handler (memmgr, the default pager, unless
-the process was created `CREATE_PINNED`); a thread with no bound handler, whose handler replies
-`KILL`, or whose fault episode is cancelled by destruction of the handler thread (deletion of its
-last Thread capability), destruction of the handler endpoint while the fault is still queued on it,
-or a later receive on the handler thread that passes its capability and headroom checks, terminates,
-which surfaces through the normal process-death notification flow above; a stop of the faulting
-thread defers that termination (before any reply claims the fault it cancels the episode; after a
-`KILL` reply has claimed it, that disposition stands), and the thread terminates that way, and
-observers are posted, only if it is started again (see
-[Fault Handling](fault-handling.md#delivery-resume-and-kill)).
+An unresolved fault is delivered to the thread's bound handler (for a page fault memmgr, the
+default pager, unless the process was created `CREATE_PINNED`; for an exception, and for a page
+fault memmgr forwards, procmgr's crash endpoint); a thread with no bound handler, whose handler
+replies `KILL`, or whose fault episode is cancelled by destruction of the handler thread (deletion
+of its last Thread capability), destruction of the handler endpoint while the fault is still queued
+on it, or a later receive on the handler thread that passes its capability and headroom checks,
+terminates, which surfaces through the normal process-death notification flow above; a stop of the
+faulting thread defers that termination (before any reply claims the fault it cancels the episode;
+after a `KILL` reply has claimed it, that disposition stands), and the thread terminates that way,
+and observers are posted, only if it is started again (see [Fault
+Handling](fault-handling.md#delivery-resume-and-kill)).
 
 ---
 
@@ -600,6 +607,7 @@ observers are posted, only if it is started again (see
 [programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),
+[services/crashd/README.md](../services/crashd/README.md),
 [services/crasher/README.md](../services/crasher/README.md),
 [services/init/README.md](../services/init/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),

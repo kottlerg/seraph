@@ -10,8 +10,8 @@
 //! creates has its exception class bound to and memmgr forwards its
 //! unresolvable page faults to. For each fault it attaches to the process
 //! (procmgr's `ATTACH_PROCESS`), reads what it can of the faulting thread,
-//! declines the fault with the report's id as the reason, and logs the
-//! report block (services/crashd/docs/report-format.md). The mechanism and
+//! logs the report block (services/crashd/docs/block-format.md), and
+//! declines the fault with the report's id as the reason. The mechanism and
 //! its limits are in services/crashd/README.md.
 
 // cast_possible_truncation: targets are 64-bit; u64/usize conversions are

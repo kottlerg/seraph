@@ -185,10 +185,12 @@ syscall on either side. Nothing is allocated on the path.
    pre-validate the reply cap slots, return the first error they raise,
    else InvalidCapability
 2. If caller_tcb is BlockedOnFault (a fault reply, whose caps the kernel
-   ignores): record RESUME, or DECLINED for a FAULT_REPLY_KILL label, in
-   caller_tcb.fault_outcome; for DECLINED, deposit the label and data
-   word 0 (the decline reason, when sent and readable) in caller_tcb's
-   ipc_msg; stamp the episode, and go to step 6
+   ignores): record RESUME, DECLINED for a FAULT_REPLY_KILL label, or,
+   for a FAULT_REPLY_FORWARD label, FORWARDED when caller_tcb's delivery
+   is of the VM class and DECLINED otherwise, in caller_tcb.fault_outcome;
+   for DECLINED or FORWARDED, deposit the label and data word 0 (the
+   decline reason, when sent and readable) in caller_tcb's ipc_msg; stamp
+   the episode, and go to step 6
 3. Read the data words and pre-validate the reply cap slots; when caps are
    attached, pre-allocate the slots in the caller's CSpace (resolved
    through the registry from caller_tcb's cspace_id/epoch); on any of these

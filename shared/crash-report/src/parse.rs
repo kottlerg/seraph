@@ -91,7 +91,7 @@ impl Block
     }
 
     /// Check that the block is complete and holds every field its kind,
-    /// thread, and status require (services/crashd/docs/report-format.md),
+    /// thread, and status require (services/crashd/docs/block-format.md),
     /// each in its encoding. `code` is never required, since the bytes at a
     /// fetch fault's pointer are often unmapped. Keys it does not know are
     /// not checked.

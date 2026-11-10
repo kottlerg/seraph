@@ -1,7 +1,7 @@
 # crashd — the crash service.
 #
 # crashd reports each process that dies on a fault to the system log, as one
-# marked block (services/crashd/docs/report-format.md). `debug_authority =
+# marked block (services/crashd/docs/block-format.md). `debug_authority =
 # yes` makes svcmgr mint a DEBUG_AUTHORITY SEND|GRANT on procmgr and deliver
 # it in the bootstrap slot after the seeds (cap[0] here, with no seeds):
 # crashd registers with it as the receiver of procmgr's crash endpoint and

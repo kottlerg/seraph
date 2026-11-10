@@ -29,7 +29,8 @@ create call returns), and `RELEASE_HOLD` on a **release token** (the third cap
 a `CREATE_DMA_HOLD` create returns); procmgr identifies the target process by
 the badge `ipc_recv` delivers. Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
 § `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and
-§ `QUERY_LIVE_PROCESSES` below. Labels 4–7 and 10
+§ `QUERY_LIVE_PROCESSES` below, and labels 19–21 in § Crash Endpoint and Debug Authority.
+Labels 4–7 and 10
 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see
 § Capability Transfer).
@@ -139,8 +140,9 @@ header for a std-built sender.
 
 **Pinned flag.** Demand paging is the default: at finalize procmgr binds every child's main thread
 fault handler to memmgr (the system pager) via `SYS_THREAD_SET_FAULT_HANDLER`, for the
-virtual-memory and exception classes (`FAULT_CLASS_VM | FAULT_CLASS_EXCEPTION`; the upcall class
-stays unbound), delegates the child `AddressSpace` to memmgr via `memmgr_labels::DELEGATE_ASPACE`,
+virtual-memory class (`FAULT_CLASS_VM`; the exception class is bound to the crash endpoint, as
+§ Crash Endpoint and Debug Authority says, and the upcall class stays unbound), delegates the
+child `AddressSpace` to memmgr via `memmgr_labels::DELEGATE_ASPACE`,
 and then sets `ProcessInfo.pager_endpoint_cap` (the child's badged memmgr cap, whose derivation
 badge the kernel stamps on each fault) and `pager_badge` (that badge), which tell the runtime the
 process is demand-paged; the runtime copies the spawning thread's bindings, this one among them,
@@ -555,7 +557,7 @@ Wire format:
 **Gate.** Labels 15 and 16 are accepted only on an un-badged cap
 (`req.badge == 0`). Init holds one; the only other badge-0 holder is svcmgr,
 whose `procmgr_death_auth_source` is a mint source for real-logd's
-`DEATH_EQ_AUTHORITY` cap (see the
+`DEATH_EQ_AUTHORITY` cap and a debug-authority holder's `DEBUG_AUTHORITY` cap (see the
 [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)), a trusted minter.
 Every other process holds only SENDs on procmgr badged with a process badge (or
 a badge svcmgr mints from its source), so none of them can stage a handoff or
@@ -649,6 +651,104 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 
 ---
 
+## Crash Endpoint and Debug Authority
+
+procmgr creates one **crash endpoint** at startup, before any process, and holds it for its life.
+At finalize it binds every child's main-thread exception class (`FAULT_CLASS_EXCEPTION`) to a SEND
+on it badged with the child's process badge, whether or not the child is pinned; the runtime copies
+the binding onto every thread the child spawns. memmgr forwards each page fault it cannot back to
+the same class (`FAULT_REPLY_FORWARD`), so the endpoint receives every fault that would kill a
+procmgr-created process ([docs/fault-handling.md](../../../docs/fault-handling.md) § Crash
+Reports). A failure to create the endpoint, or to bind a child, is logged and leaves the class
+unbound; it never fails a creation.
+
+While no crash service is registered, a procmgr thread of its own, the **decliner**, receives on
+the endpoint and declines each fault with `FAULT_REPLY_KILL`, carrying the forwarder's reason for a
+forwarded page fault (data word 4) and no reason for an exception: the fault takes the outcome it
+has with no handler bound, and the kernel's decline line for a forwarded fault is the one the
+pager's own decline printed. The decliner shares nothing with the request loop but a few atomics,
+so a receive on the endpoint never waits behind a request.
+
+Labels 19–21 are the **debug authority**. `REGISTER_CRASH_SERVICE` and `ATTACH_PROCESS` are served
+only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the un-badged
+procmgr source init endows it, for a service whose definition sets `debug_authority = yes`
+([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)); no other path mints it,
+so an image that stages no such service has no attach path. The crash service and the serial GDB
+stub are its consumers.
+
+### Label 19: `REGISTER_CRASH_SERVICE`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::REGISTER_CRASH_SERVICE` (19) |
+| caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
+| `caps[0]` | A Thread cap of the service's main thread (any rights); further caps are deleted |
+
+procmgr keeps the thread cap and replies `SUCCESS` with one cap, `RECV` on the crash endpoint, after
+it stops the decliner where it holds no fault: a decliner found holding one declines it first. The
+service then receives every fault on the endpoint. procmgr checks the kept cap after every death
+drain its loop runs, which the service's own death wakes: once the cap is gone (procmgr's teardown
+of the service revokes every cap derived from its main thread) or its thread has exited, procmgr
+deletes the cap and the decliner receives again, declining the faults already queued. Replies:
+`UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` without a thread cap, or when procmgr has
+no crash endpoint; `CRASH_SERVICE_PRESENT` while a registered service lives; `OUT_OF_MEMORY` when
+the `RECV` cap cannot be derived. A refused request's caps are deleted.
+
+### Label 20: `ATTACH_PROCESS`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::ATTACH_PROCESS` (20) |
+| caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
+| `data[0]` | The target's process badge |
+| `data[1]` | The index of the first thread to return |
+| caps | none; procmgr deletes any cap the message carried |
+
+Reply `SUCCESS` with:
+
+| Field | Meaning |
+|---|---|
+| `data[0]` | The number of threads procmgr holds a cap for: `1`, the main thread |
+| `data[1]` | The image's load bias |
+| `data[2]`, `data[3]` | The biased start and end (exclusive) of the image's executable segments; both `0` for an image with none |
+| `data[4]` | The address of the target's `ProcessInfo` page |
+| caps | The Thread caps of threads `data[1]..`, each with `OBSERVE`, `CONTROL`, and `UPCALL`, at most `ATTACH_THREADS_PAGE` (`MSG_CAP_SLOTS_MAX`, 4); none past the count |
+
+The caps are derivations of procmgr's own; procmgr's teardown of the target revokes them. The
+threads the runtime spawns are created in the process's own `CSpace` and are not among them: a
+registry through which the runtime hands procmgr a cap of each, which this request would then page
+through, is design intent; not yet implemented
+([#838](https://github.com/kottlerg/seraph/issues/838)). Refusals, in order: `UNAUTHORIZED` without
+the authority; `INVALID_BADGE` when no live process carries the badge, which covers init, memmgr,
+and procmgr, none of which procmgr created;
+`NOT_ATTACHABLE` when the target declared itself undebuggable (Label 21); `OUT_OF_MEMORY` when the
+thread cap cannot be derived. The refusal order is `process_table::attach_target`.
+
+### Label 21: `DECLARE_NO_DEBUG`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::DECLARE_NO_DEBUG` (21) |
+| caller's cap badge | The sender's own process badge (its `ProcessInfo.procmgr_endpoint_cap`) |
+| caps | none; procmgr deletes any cap the message carried |
+
+The sender declares itself undebuggable: procmgr marks it, unbinds its main thread's exception
+class from the crash endpoint, and refuses `ATTACH_PROCESS` on it from then on. A process sends it
+before it spawns a thread, since a thread spawned before keeps the binding it copied. The senders
+are the processes a stop of which would deadlock a debug-authority holder, which waits on them for
+its log output or its own progress: logd, the serial driver, and every debug-authority holder, so
+none attaches to itself. Replies `SUCCESS`, or `INVALID_BADGE` when the badge names no live process.
+
+Any process may declare itself, on its own cap alone: the badge names the sender, so a declaration
+affects the declarer and no other process, and it removes no authority a debug-authority holder
+needs over another. It is one-way: nothing makes a declared process debuggable again for its life.
+Until it declares, a process is bound and attachable like any other: a fault of logd or the serial
+driver between its creation and its declaration, which each sends before its bootstrap, reaches the
+crash service, whose log output then waits on the faulting process until the crash service's
+watchdog bound ([services/crashd/README.md](../../crashd/README.md) § Bounds) declines the fault.
+
+---
+
 ## Relevant Design Documents
 
 | Document | Content |
@@ -671,6 +771,7 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 [Namespace Model](../../../docs/namespace-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[services/crashd/README.md](../../crashd/README.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),

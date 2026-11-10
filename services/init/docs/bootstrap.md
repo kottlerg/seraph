@@ -188,9 +188,10 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     `procmgr_death_auth_source`, a badge-0
     `RIGHTS_EP_SEND_GRANT` derive of procmgr's service endpoint (svcmgr
     mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it for per-sender
-    death-EQ registration). Holding `master_log_source` keeps the log
-    endpoint object alive across a logd crash, so log senders are
-    agnostic to which process holds the RECV (per
+    death-EQ registration, and a debug-authority holder's `DEBUG_AUTHORITY`
+    cap). Holding `master_log_source` keeps the log endpoint object alive
+    across a logd crash, so log senders are agnostic to which process holds
+    the RECV (per
     [`log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)). An absent source is
     left off the round and its bit in the `data[1]` presence word clear.
 - After draining the endowment, **svcmgr** (not init) publishes the

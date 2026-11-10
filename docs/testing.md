@@ -129,15 +129,14 @@ fault-injection drivers, and [`test-dma`](../services/drivers/test-dma/README.md
 driver of the `edu` DMA test device, installed there until the devmgr enumeration
 redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
 them. Under `/programs/` are the test fixtures the harnesses and per-program
-testers spawn: `capexhaust`, `deadline`, `debugger`, `demandpaged`, `fsbench`, `pipefault`,
-`pipestress`, `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and `threadstack`. Which
-consumer spawns or drives each one is owned by
-[services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for
-`svctest` phases and by each fixture's README (`programs/<name>/README.md`) for every
-per-program tester that drives it. Under `/config/svcmgr/tests/` are the harness
-recipes (see [Gating](#gating)). Under `/data/` are `/data/test.txt`, a fixture shared
-by `svctest` and the `shell` tester, and the build-synthesised `svctest`-only fixtures
-`/data/svctest/large.bin` and `/data/svctest/bench.bin`.
+testers spawn: `capexhaust`, `crashme`, `deadline`, `debugger`, `demandpaged`, `fsbench`,
+`pipefault`, `pipestress`, `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and
+`threadstack`. Which consumer spawns or drives each one is owned by [services/svctest/README.md §
+Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases and by each fixture's README
+(`programs/<name>/README.md`) for every per-program tester that drives it. Under
+`/config/svcmgr/tests/` are the harness recipes (see [Gating](#gating)). Under `/data/` are
+`/data/test.txt`, a fixture shared by `svctest` and the `shell` tester, and the build-synthesised
+`svctest`-only fixtures `/data/svctest/large.bin` and `/data/svctest/bench.bin`.
 
 ---
 
@@ -342,6 +341,35 @@ the guest finished. Run with no `--log`, it boots the current sysroot once throu
 logd's query API (#720), which gives a harness a read surface for its slots, is
 the planned successor to this serial-line check.
 
+### Crash reports (`test-crash-report`)
+
+The crash service, crashd, is in the default service set
+(`rootfs/config/svcmgr/services/crashd.svc`) and logs a report block for each process that dies
+on a fault ([services/crashd/README.md](../services/crashd/README.md)). No harness reads the
+system log from inside the guest, so `cargo xtask test-crash-report --log <file>` checks the blocks
+in a boot's saved serial log, with the parser of the format crashd emits
+([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)): every block
+must be complete and hold the fields its kind, thread, and status require.
+
+- `--expect reports` reads a usertest boot, which runs the `crashme` fixture's tester
+  ([programs/crashme/README.md](../programs/crashme/README.md)): the log must also hold one `vm`
+  and one `exception` block of `crashme`, tied to it through the badge logd's `reclaim:` line
+  names, each complete, of its main thread, its walk starting at its instruction pointer, and
+  each matched by the kernel's `handler declined` line carrying the block's id.
+- `--expect none` reads a boot of an image that stages no crashd: the log must hold no block, the
+  check that the absent service changes nothing a fault does.
+
+In CI the usertest cell keeps crashd and runs the first after its `run-parallel` boot; the svctest
+cell drops `crashd.svc` with `terminal.svc` and runs the second, while crasher's faults go
+unreported. Both read the log the cell's boot saved and boot nothing
+([xtask/README.md § test-crash-report](../xtask/README.md#cargo-xtask-test-crash-report)).
+
+The crash service cannot cover every process. init, memmgr, and procmgr are not created by
+procmgr, and logd, the serial driver, and crashd declare themselves undebuggable; their faults
+leave only the kernel's `fault unhandled` and `USERSPACE FAULT` lines. A thread other than a
+process's main thread is reported without registers or a stack walk
+([services/crashd/README.md § Limits](../services/crashd/README.md#limits)).
+
 ### One shutdown-invoking harness per boot
 
 `svctest` and `usertest` invoke `pwrmgr` shutdown on completion. Two such
@@ -361,7 +389,9 @@ services/programs surface under test). Because `terminal.svc` lives in the
 default service set, the harness staging removes it and repacks with
 `cargo xtask mkdisk --repack-only` (a normal repack re-mirrors `rootfs/`,
 which would restore it). The terminal is exercised in its own boot
-(`test-terminal`) and runs in the real default boot.
+(`test-terminal`) and runs in the real default boot. The svctest boot also
+drops `crashd.svc`, so one boot per cell runs the image without the crash
+service (see Crash reports above).
 
 CI matrix cells follow these rules per boot. The `usertest` cell runs its
 boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
@@ -1068,6 +1098,7 @@ note in full.
 [core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
 [Console Model](console-model.md), [Project Conventions](conventions.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
+[programs/crashme/README.md](../programs/crashme/README.md),
 [programs/deadline/README.md](../programs/deadline/README.md),
 [programs/debugger/README.md](../programs/debugger/README.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),
@@ -1082,6 +1113,7 @@ note in full.
 [programs/terminal/README.md](../programs/terminal/README.md),
 [programs/threadchurn/README.md](../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
+[services/crashd/README.md](../services/crashd/README.md),
 [services/crasher/README.md](../services/crasher/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),

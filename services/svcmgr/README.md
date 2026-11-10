@@ -173,7 +173,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount v
 
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
 (required), `critical` (required), `namespace` (required), `cwd`,
-`seed`, `provides`, `log_sink`, `priority`, `sched_max`. Unknown keys
+`seed`, `provides`, `log_sink`, `debug_authority`, `priority`, `sched_max`. Unknown keys
 are hard errors. Restart values: `never | on_failure | always`.
 Critical values: `yes | no`. Namespace forms:
 `none | universal | subtree:<path>:<rights>`. `priority` / `sched_max`

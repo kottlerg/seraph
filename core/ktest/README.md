@@ -94,7 +94,8 @@ Per-syscall isolation tests. Every kernel syscall except `SYS_ASPACE_BIND_NOTIFI
 important negative paths (wrong rights, invalid arguments, wrong object state). Those are exercised
 in Tier 2, by `aspace_fault_notification_late_bind.rs`, by `death_notification_late_bind.rs`, by
 `fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`, `fault_handler_declines_kills.rs`,
-`fault_handler_rebind.rs`, `fault_class_bindings.rs`, and `fault_exception_redirect.rs`, by
+`fault_forward.rs`, `fault_handler_rebind.rs`, `fault_class_bindings.rs`, and
+`fault_exception_redirect.rs`, by
 `thread_upcall.rs`, and by `thread_memory.rs`, respectively. Files are grouped by kernel
 subsystem, mirroring the kernel's own source layout.
 
@@ -182,6 +183,7 @@ concurrent notification and queue events.
 | `fault_pager_roundtrip.rs` | A userspace pager resolves a page fault and resumes the thread |
 | `fault_resume_modifies_pc.rs` | A fault handler edits the fault-blocked thread's registers and resumes it at a new instruction pointer |
 | `fault_handler_declines_kills.rs` | A fault handler replying `FAULT_REPLY_KILL` terminates the faulting thread as an unhandled fault |
+| `fault_forward.rs` | A virtual-memory handler replying `FAULT_REPLY_FORWARD` hands the fault to the thread's exception handler, as [docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply) defines: the same message, the exception binding's badge, and the forwarder's word as data word 4, the thread still fault-blocked with its registers readable until that handler resumes it; with no exception handler bound the forward kills as a decline, and a forward of an exception delivery is a decline |
 | `fault_class_bindings.rs` | A thread's fault handler is bound per fault class, as [docs/fault-handling.md § Fault-Handler Binding](../../docs/fault-handling.md#fault-handler-binding) defines: a page fault and an illegal instruction reach their own classes' endpoints with their badges; an unbind of one class leaves the other bound, read back by `SYS_THREAD_GET_FAULT_HANDLER`, and the unbound class's fault is unhandled; a rebind of one class leaves a held fault of the other to its reply; `SYS_THREAD_INHERIT_FAULT_HANDLER` copies one class, or every class, from a source thread, and the copied binding delivers; refused masks and class arguments fail with `InvalidArgument`, and a Thread cap without `CONTROL` (`InsufficientRights`) or a stale handle (`InvalidCapability`) is refused by the query and as either thread of the copy |
 | `fault_handler_rebind.rs` | A binding change while a fault is in flight cancels the delivery, as [docs/fault-handling.md § Delivery, Resume, and Kill](../../docs/fault-handling.md#delivery-resume-and-kill) defines: a clear kills the faulter whether its fault was received or still queued (a wait set confirms the queued message), and fails a queued kernel copy's `SYS_GETRANDOM` with `InvalidAddress`; a rebind, of a received or a queued fault, delivers the fault again to the new endpoint with its badge, the old handler's late reply finding no pending reply; and a rebind to the same endpoint and badge cancels nothing |
 | `fault_syscall_buffer.rs` | A restartable syscall's copy to (`SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_READ_MEM`) or from (`SYS_THREAD_WRITE_REGS`, `SYS_THREAD_WRITE_MEM`) an unbacked buffer faults to the caller's handler with the first unmapped byte (a straddling span names its second page), the copy's access, the present bit where the architecture reports it, and the frame's instruction pointer, and the syscall re-executes on resume; a declined fault (unmapped or read-only page) fails the call with `InvalidAddress` and the caller lives; a handler-written instruction pointer stands on a decline and on a resume, as [docs/fault-handling.md § Kernel Copies](../../docs/fault-handling.md#kernel-copies) defines |
@@ -290,7 +292,8 @@ exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and
 `cap_delete` does not race a still-running pinned child); the migration polls of
 `thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued` and
 `thread::start_suspended_resume`, the exit and report waits of `integration::fault_handler_rebind`,
-the exit and recovery waits of `integration::fault_class_bindings`, the report wait of
+the exit and recovery waits of `integration::fault_class_bindings` and
+`integration::fault_forward`, the report wait of
 `integration::trap_redelivery`, the progress waits and report wait of `integration::thread_upcall`,
 the report waits of `integration::fault_debug` and `integration::single_step`, the convergence
 polls of `thread::load_balancer_redistributes_skewed`, the exit wait of

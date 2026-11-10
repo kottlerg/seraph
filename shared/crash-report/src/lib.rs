@@ -4,7 +4,7 @@
 // shared/crash-report/src/lib.rs
 
 //! The crash-report block: crashd's emitter and the host tools' parser of one
-//! format (services/crashd/docs/report-format.md).
+//! format (services/crashd/docs/block-format.md).
 //!
 //! crashd fills a [`Report`] for a faulting thread and [`Report::emit`]s it as
 //! the lines of one block, each logged to logd; a host tool reads a boot's log

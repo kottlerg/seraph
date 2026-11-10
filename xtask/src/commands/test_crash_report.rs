@@ -10,7 +10,7 @@
 //! (docs/testing.md § Crash reports). Every block in the log must be complete
 //! and hold the fields its kind, thread, and status require
 //! (`crash_report::Block::check`, the parser of the format crashd emits,
-//! services/crashd/docs/report-format.md).
+//! services/crashd/docs/block-format.md).
 //!
 //! With `--expect reports` (the default), the log must also hold, for the
 //! `crashme` fixture the usertest boot runs, one `vm` and one `exception`

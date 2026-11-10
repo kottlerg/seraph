@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "ansi"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "anstream"
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "boot"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "boot-protocol",
  "elf",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "boot-protocol"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "bumpalo"
@@ -145,7 +145,7 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "capexhaust"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -229,7 +229,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cmos-rtc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -250,14 +250,14 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "crash-report"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "syscall-abi",
 ]
 
 [[package]]
 name = "crashd"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "crash-report",
  "crashd-fault-bound",
@@ -268,11 +268,11 @@ dependencies = [
 
 [[package]]
 name = "crashd-fault-bound"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "crasher"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "crashme"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "crashme-tester"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "crc"
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "crypto"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "ctrlc"
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "deadline"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -341,11 +341,11 @@ dependencies = [
 
 [[package]]
 name = "deadline-tester"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "death-set"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ruststd-death-queues",
  "syscall",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "debug-echo"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "gdb-rsp",
  "ipc",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "debugger"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "riscv-step",
@@ -374,15 +374,15 @@ dependencies = [
 
 [[package]]
 name = "debugger-tester"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "demandpaged"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "devmgr"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "boot-protocol",
  "devmgr-firmware",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "devmgr-firmware"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall-abi",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "elf"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "process-abi",
 ]
@@ -431,7 +431,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "fatfs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "fatfs-parse",
  "ipc",
@@ -454,11 +454,11 @@ dependencies = [
 
 [[package]]
 name = "fatfs-parse"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "fb-charset"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "find-msvc-tools"
@@ -486,11 +486,11 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "font"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "framebuffer"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "boot-protocol",
  "font",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "fsbench"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "futures-core"
@@ -530,11 +530,11 @@ dependencies = [
 
 [[package]]
 name = "gdb-rsp"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "gdbstub"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "gdb-rsp",
  "ipc",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "goldfish-rtc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -615,11 +615,11 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hello"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "hello-tester"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "iana-time-zone"
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "init"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "elf",
  "init-protocol",
@@ -683,18 +683,18 @@ dependencies = [
 
 [[package]]
 name = "init-protocol"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "init-sender-table"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "logd-codec",
 ]
 
 [[package]]
 name = "iommu-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "iommu-riscv"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "iommu-core",
  "iommu-store",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "iommu-store"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "iommu-core",
  "ipc",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "iommu-vtd"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "iommu-core",
  "iommu-store",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "ipc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rustc-std-workspace-core",
  "syscall",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "boot-protocol",
  "elf",
@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "ktest"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "boot-protocol",
  "crypto",
@@ -811,7 +811,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "log"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "rustc-std-workspace-core",
@@ -827,7 +827,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "logd"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "logd-codec",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "logd-codec"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall-abi",
@@ -851,7 +851,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memmgr"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "memmgr-free-pool",
@@ -863,18 +863,18 @@ dependencies = [
 
 [[package]]
 name = "memmgr-free-pool"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "syscall-abi",
 ]
 
 [[package]]
 name = "mmio"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "namespace-protocol"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "rustc-std-workspace-core",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "ns-client"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -958,15 +958,15 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pipefault"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "pipestress"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "pipestress-tester"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "syscall",
  "syscall-abi",
@@ -993,14 +993,14 @@ dependencies = [
 
 [[package]]
 name = "process-abi"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rustc-std-workspace-core",
 ]
 
 [[package]]
 name = "process-layout"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "process-abi",
  "rustc-std-workspace-core",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "procmgr"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "death-set",
  "elf",
@@ -1023,14 +1023,14 @@ dependencies = [
 
 [[package]]
 name = "procmgr-process-table"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
 ]
 
 [[package]]
 name = "pwrmgr"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "pwrmgr-acpi",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "pwrmgr-acpi"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "quote"
@@ -1088,14 +1088,14 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "registry"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
 ]
 
 [[package]]
 name = "registry-client"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "rustc-std-workspace-core",
@@ -1105,11 +1105,11 @@ dependencies = [
 
 [[package]]
 name = "relrofault"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "riscv-step"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "rustc-demangle"
@@ -1131,14 +1131,14 @@ checksum = "aa9c45b374136f52f2d6311062c7146bff20fec063c3f5d46a410bd937746955"
 
 [[package]]
 name = "ruststd-argv-env"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rustc-std-workspace-core",
 ]
 
 [[package]]
 name = "ruststd-death-queues"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rustc-std-workspace-alloc",
  "rustc-std-workspace-core",
@@ -1147,14 +1147,14 @@ dependencies = [
 
 [[package]]
 name = "ruststd-heap-fit"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rustc-std-workspace-core",
 ]
 
 [[package]]
 name = "ruststd-spin-wait"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rustc-std-workspace-core",
 ]
@@ -1173,7 +1173,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "seraph-wrapper-shim"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "serde"
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "serial"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -1249,7 +1249,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shmem"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rustc-std-workspace-core",
  "syscall",
@@ -1276,15 +1276,15 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stackoverflow"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "stdiotest"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "stdiotest-tester"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "strsim"
@@ -1294,7 +1294,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "svcmgr"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "death-set",
  "ipc",
@@ -1308,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "svcmgr-defs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "namespace-protocol",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "svcmgr-endowment"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall-abi",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "svctest"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "fatfs-parse",
  "ipc",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "syscall"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rustc-std-workspace-core",
  "syscall-abi",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "syscall-abi"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rustc-std-workspace-core",
 ]
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "test-dma"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "test-fault"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "test-orphan"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -1402,14 +1402,14 @@ dependencies = [
 
 [[package]]
 name = "text"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "font",
 ]
 
 [[package]]
 name = "threadchurn"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "syscall",
  "syscall-abi",
@@ -1417,19 +1417,19 @@ dependencies = [
 
 [[package]]
 name = "threadchurn-tester"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "threadstack"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "threadstack-tester"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "timed"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -1450,7 +1450,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "usertest"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
 ]
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "vfsd"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "boot-protocol",
  "ipc",
@@ -1487,18 +1487,18 @@ dependencies = [
 
 [[package]]
 name = "vfsd-gpt"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "vfsd-root-backend"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "namespace-protocol",
 ]
 
 [[package]]
 name = "virtio-blk"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-console"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "mmio",
@@ -1528,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-input"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ipc",
  "syscall",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "addr2line",
  "anyhow",

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "riscv-step"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# no_std pure logic: the successor-address decoder a debugger single-steps a
+# riscv64 thread with. Host-tested; built for every target that links it.
+[lib]
+test = true
+doctest = false
+
+[lints]
+workspace = true

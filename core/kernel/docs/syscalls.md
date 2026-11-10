@@ -1752,8 +1752,9 @@ faulting registers (see [`docs/fault-handling.md`](../../../docs/fault-handling.
 The buffer receives the kernel's architecture-specific `TrapFrame`
 (`core/kernel/src/arch/x86_64/trap_frame.rs`, `core/kernel/src/arch/riscv64/trap_frame.rs`);
 `abi/syscall` publishes its size and its instruction- and stack-pointer offsets per architecture,
-and on x86-64 its `rflags` offset (`REGS_X86_64_*`, `REGS_RISCV64_*`), and the kernel asserts its
-`TrapFrame` against them at compile time. If `buf_size` is smaller than the required size, the call
+on x86-64 its `rflags` offset, and on riscv64 its `x1` offset, the base of the integer registers
+(`REGS_X86_64_*`, `REGS_RISCV64_*`), and the kernel asserts its `TrapFrame` against them at compile
+time. If `buf_size` is smaller than the required size, the call
 fails with `InvalidArgument`.
 
 A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes

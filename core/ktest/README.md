@@ -213,7 +213,13 @@ checks that a handler that resumes a thread from `int3` with the trap flag set r
 instruction (the stepped `syscall` stepping as one), as
 [docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines. On RISC-V,
 `src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions
-and sanctioned ones the cap lacks the right for.
+and sanctioned ones the cap lacks the right for, and `src/arch/riscv64/single_step.rs` checks that a
+handler steps a thread of a fresh address space through a stub written there, one instruction at a
+time, by planting `c.ebreak` at the successor `riscv_step` computes (with `SYS_THREAD_WRITE_MEM` and
+`THREAD_MEM_TEXT`): each step's `FAULT_EXC_BREAKPOINT` names the stub's next instruction across a
+fall-through, a taken and a not-taken branch, `jal`, `c.addi`, a not-taken `c.beqz`, `c.j`, `auipc`
+and `jalr`, and the stub reads back as written, as
+[docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines.
 
 ### Tier S — `src/stress/`
 

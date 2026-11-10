@@ -60,6 +60,7 @@ members = [
     "shared/ns-client",
     "shared/registry",
     "shared/registry-client",
+    "shared/riscv-step",
     "shared/shmem",
     "shared/text",
     "programs/demandpaged",

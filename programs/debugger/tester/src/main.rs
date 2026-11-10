@@ -6,8 +6,8 @@
 //! Per-program tester for `/programs/debugger`. Spawns it once and asserts
 //! that it printed `PASS` and exited cleanly: its debugger thread took the
 //! debuggee's breakpoint, inspected and modified its memory, single-stepped
-//! it on x86-64, and async-broke it with an upcall, then debugged a debuggee
-//! process through its memory and a breakpoint in its text.
+//! it, and async-broke it with an upcall, then debugged a debuggee process
+//! through its memory and a breakpoint in its text.
 //!
 //! See [docs/testing.md](../../../docs/testing.md) for the protocol.
 

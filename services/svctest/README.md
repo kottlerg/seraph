@@ -43,7 +43,8 @@ services/svctest/
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
         ├── devmgr.rs          # Block, shutdown, debug-port, label deny; input ordinal; orphan,
         │                      #   withdrawal, DMA confinement
-        ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny
+        ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
+        │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
         │                      #   refused access
         ├── shmem.rs           # Kernel shared-memory objects
@@ -99,11 +100,12 @@ leaves the system idle, as on the pass path. A fault in svctest's own process (a
 a stack overflow) kills it without running either hook, so it logs neither marker.
 
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
-skip and return when their cap is zero; the devmgr deny and input-ordinal phases (`caps[2]`), the
-orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`), the svcmgr seed-only
-phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names it resolves), the
-svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd phases (`caps[4]`, `caps[5]`),
-and the `crash_endpoint` phase (`caps[6]`) instead fail their assertions. The seed-only phase thus
+skip and return when their cap is zero; the devmgr deny, input-ordinal, and drivers stray-cap
+phases (`caps[2]`), the orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`),
+the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names
+it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd phases
+(`caps[4]`, `caps[5]`), and the `crash_endpoint` phase (`caps[6]`) instead fail their
+assertions. The seed-only phase thus
 fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
 zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and
 the run ends idle.
@@ -127,7 +129,7 @@ slot stays zero.
 |-----------|-------------------|----------------------------------------|
 | `caps[0]` | `rootfs.root`     | `ns` phase                             |
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
-| `caps[2]` | `devmgr.registry` | devmgr deny and input-ordinal phases   |
+| `caps[2]` | `devmgr.registry` | devmgr deny, input-ordinal, and drivers stray-cap phases |
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, driver withdrawal, DMA confinement, drivers deny |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases          |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase                |
@@ -140,7 +142,18 @@ devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE
 `TEST_QUERY_DENY_DEVICE`, `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`,
 `TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS`, and the input-ordinal
 phase, which requires a cap from `QUERY_INPUT_DEVICE` at instance ordinal 0 (sent and absent) and
-`NO_DEVICE` past the one keyboard of every boot's device set. `caps[3]` exists for devmgr's test
+`NO_DEVICE` past the one keyboard of every boot's device set. The drivers stray-cap phase takes
+granted SENDs on the serial and input drivers' endpoints through `caps[2]` (`QUERY_SERIAL_DEVICE`
+and `QUERY_INPUT_DEVICE`) and floods each driver with calls carrying `MSG_CAP_SLOTS_MAX` caps:
+an unknown label, a zero-byte `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, a
+`SERIAL_REGISTER_RX_NOTIFY` whose stray notification `SYS_IRQ_REGISTER` rejects, and one whose
+fresh notification each call rebinds the UART line to. It requires each call's normal reply and
+each cap to leave svctest's `CSpace`. A driver that keeps a cap it should delete exhausts its
+`CSpace` within one case and exits on its failing receive. For the input driver, devmgr's
+withdrawal then fails the call in flight, and the phase fails. For the serial driver, logd's
+writes stall on it, and the boot ends as a `HANG`. The read and accepted
+registration cases, and the input case, log a skip when `terminal.svc` is staged, since they
+would take the terminal's input. `caps[3]` exists for devmgr's test
 labels (TODO(#165): retire with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim, the
 driver-withdrawal phase's `TEST_SPAWN_FAULT_DRIVERS` and `TEST_QUERY_FAULT_DEVICE` shims, the DMA
 confinement phase's `TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS` shims,

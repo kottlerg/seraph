@@ -17,10 +17,6 @@
 //! ABI and registers the same devmgr slot ([`devmgr_labels::QUERY_INPUT_DEVICE`]),
 //! so consumers never learn the transport.
 
-// cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
-// are lossless. Narrower casts extract the fields a packed `u64` word carries.
-#![allow(clippy::cast_possible_truncation)]
-
 mod decode;
 mod input;
 
@@ -48,6 +44,11 @@ use crate::input::EventRing;
 /// the device no IRQ cap) and tolerates a lost PLIC interrupt on QEMU virt
 /// RISC-V. At 20 ms the poll-only fallback stays well above human typing rates.
 const POLL_INTERVAL_MS: u64 = 20;
+
+/// [`PAGE_SIZE`] as a `usize`, for the byte count of a one-page fill.
+// cast_possible_truncation: PAGE_SIZE is 4096, which every `usize` holds.
+#[allow(clippy::cast_possible_truncation)]
+const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
@@ -182,10 +183,12 @@ fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
         std::os::seraph::log!("QUERY_DEVICE_INFO reply truncated (header)");
         syscall::thread_exit();
     }
-    let kind = words[0] as u32;
-    let version = words[1] as u32;
-    let byte_len = words[2] as usize;
-    if kind != ipc::device_info_kind::VIRTIO_PCI || version != virtio_core::VIRTIO_PCI_INFO_VERSION
+    // A word past the field's width is a mismatch, not a value to truncate.
+    let kind = u32::try_from(words[0]).ok();
+    let version = u32::try_from(words[1]).ok();
+    let byte_len = usize::try_from(words[2]).unwrap_or(usize::MAX);
+    if kind != Some(ipc::device_info_kind::VIRTIO_PCI)
+        || version != Some(virtio_core::VIRTIO_PCI_INFO_VERSION)
     {
         std::os::seraph::log!("QUERY_DEVICE_INFO reply kind/version mismatch");
         syscall::thread_exit();
@@ -340,9 +343,15 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
         std::os::seraph::log!("ring mem_map failed");
         syscall::thread_exit();
     }
+    let Ok(ring_bytes) = usize::try_from(ring_pages * PAGE_SIZE)
+    else
+    {
+        std::os::seraph::log!("{ring_pages} ring pages past the address width");
+        syscall::thread_exit();
+    };
     // SAFETY: ring_va is mapped writable, ring_pages * PAGE_SIZE bytes.
     unsafe {
-        core::ptr::write_bytes(ring_va as *mut u8, 0, (ring_pages * PAGE_SIZE) as usize);
+        core::ptr::write_bytes(ring_va as *mut u8, 0, ring_bytes);
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let ring_addr = unsafe {
@@ -364,12 +373,7 @@ fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_addr:
     let avail_addr = ring_addr + desc_size as u64;
     let used_addr = ring_addr + used_off as u64;
 
-    transport.queue_set_desc_lo(desc_addr as u32);
-    transport.queue_set_desc_hi((desc_addr >> 32) as u32);
-    transport.queue_set_avail_lo(avail_addr as u32);
-    transport.queue_set_avail_hi((avail_addr >> 32) as u32);
-    transport.queue_set_used_lo(used_addr as u32);
-    transport.queue_set_used_hi((used_addr >> 32) as u32);
+    transport.queue_set_rings(desc_addr, avail_addr, used_addr);
 
     transport.queue_set_ready(1);
 }
@@ -449,7 +453,7 @@ fn setup_event_buffers(caps: &DriverCaps, buf_count: u16, ipc_buf: *mut u64) -> 
     }
     // SAFETY: va is mapped writable, one page.
     unsafe {
-        core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE as usize);
+        core::ptr::write_bytes(va as *mut u8, 0, PAGE_BYTES);
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let addr = unsafe {
@@ -604,6 +608,12 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut InputRuntime) -> !
         };
         guard.on_success();
 
+        // No label takes a cap: delete every cap the request carries, which
+        // would otherwise take a slot of this driver's `CSpace` for good.
+        for &cap in msg.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
         if !virtio_input::authorized(msg.label, msg.badge)
         {
             let reply = IpcMessage::new(input_errors::UNAUTHORIZED);

@@ -246,7 +246,9 @@ the Validation report, the Acceptance ticks, and every claim the body makes.
   `sections` with their verdicts and items); `findings`, the surface findings of the last run
   with the reviewer that the audit lists as unfixed, each as that run's record states it;
   `recorded`, `ledgered` and `dropped` empty; and `stats` with `mode` `audit`, `head`,
-  `since`, and `failed` (the agents that returned no result). The ledger command of
+  `since`, `failed` (the agents that returned no result), and `run` (the run's number in
+  the PR's sequence of runs of either kind, counting from 1: one more than the highest `run`
+  among the records already saved). The ledger command of
   `.claude/CLAUDE.md` § PR workflow operations reads it with the other records and takes its
   `findings` into the ledger when its `verdict` is `NON-BLOCKING ISSUES ONLY`, as the pass that
   records them requires. Any later delta that changes anything but documentation or comments,
@@ -273,7 +275,9 @@ the Validation report, the Acceptance ticks, and every claim the body makes.
   A re-audit is its own record, `audit-<head>.md` and `audit-<head>.json` in the shape above,
   so the ledger command reads it; each further audit at a head that already has one is saved
   as `audit-<head>-<n>.md` and `audit-<head>-<n>.json`, `<n>` counting up from 2, so a
-  failed-then-passed audit keeps both.
+  failed-then-passed audit keeps both. A further run with the reviewer at a head that already
+  has one takes the same suffix (`delta-<head>-<n>`), so it does not overwrite the earlier
+  record. The suffix only keeps the names apart; `stats.run` orders the runs.
 - A contested finding is put to the maintainer (through the orchestrator when orchestrated); on
   the surface it resolves in this PR as that section says. A correctness, soundness, safety or
   contract defect in a file you touch is on the surface unless an open Issue names that work;

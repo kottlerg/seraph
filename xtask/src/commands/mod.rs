@@ -8,9 +8,12 @@
 pub mod build;
 pub mod clean;
 pub mod compose_bundle;
+pub mod issue;
 pub mod ktest_timing;
 pub mod lint_docs;
 pub mod mkdisk;
+pub mod pr_check;
+pub mod review;
 pub mod run;
 pub mod run_parallel;
 pub mod symbolize;

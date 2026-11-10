@@ -13,10 +13,6 @@
 //! partition registration (`REGISTER_PARTITION`), and the device geometry
 //! (`BLK_GET_GEOMETRY`) over IPC.
 
-// cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
-// are lossless. Narrower casts extract the fields a packed `u64` word carries.
-#![allow(clippy::cast_possible_truncation)]
-
 mod io;
 
 use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};
@@ -47,6 +43,11 @@ use crate::io::IoLayout;
 /// queueing would need replies decoupled from the receive loop, which no
 /// client's synchronous `ipc_call` would use.
 const QUEUE_SIZE: u16 = 4;
+
+/// [`PAGE_SIZE`] as a `usize`, for the byte count of a one-page fill.
+// cast_possible_truncation: PAGE_SIZE is 4096, which every `usize` holds.
+#[allow(clippy::cast_possible_truncation)]
+const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
@@ -185,10 +186,12 @@ fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
         std::os::seraph::log!("QUERY_DEVICE_INFO reply truncated (header)");
         syscall::thread_exit();
     }
-    let kind = words[0] as u32;
-    let version = words[1] as u32;
-    let byte_len = words[2] as usize;
-    if kind != ipc::device_info_kind::VIRTIO_PCI || version != virtio_core::VIRTIO_PCI_INFO_VERSION
+    // A word past the field's width is a mismatch, not a value to truncate.
+    let kind = u32::try_from(words[0]).ok();
+    let version = u32::try_from(words[1]).ok();
+    let byte_len = usize::try_from(words[2]).unwrap_or(usize::MAX);
+    if kind != Some(ipc::device_info_kind::VIRTIO_PCI)
+        || version != Some(virtio_core::VIRTIO_PCI_INFO_VERSION)
     {
         std::os::seraph::log!("QUERY_DEVICE_INFO reply kind/version mismatch");
         syscall::thread_exit();
@@ -375,9 +378,15 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
         std::os::seraph::log!("ring mem_map failed");
         syscall::thread_exit();
     }
+    let Ok(ring_bytes) = usize::try_from(ring_pages * PAGE_SIZE)
+    else
+    {
+        std::os::seraph::log!("{ring_pages} ring pages past the address width");
+        syscall::thread_exit();
+    };
     // SAFETY: ring_va is mapped writable, ring_pages * PAGE_SIZE bytes.
     unsafe {
-        core::ptr::write_bytes(ring_va as *mut u8, 0, (ring_pages * PAGE_SIZE) as usize);
+        core::ptr::write_bytes(ring_va as *mut u8, 0, ring_bytes);
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let ring_addr = unsafe {
@@ -386,6 +395,23 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
         })
     };
     (ring_addr, ring_pages, ring_va)
+}
+
+/// The low 32 bits of a device address, for a transport register that takes
+/// the address in halves.
+// cast_possible_truncation: keeping the low half is the point; the high half
+// goes to the register's pair through `high_half`.
+#[allow(clippy::cast_possible_truncation)]
+fn low_half(addr: u64) -> u32
+{
+    addr as u32
+}
+
+/// The high 32 bits of a device address ([`low_half`]'s pair).
+fn high_half(addr: u64) -> u32
+{
+    // The shift leaves at most 32 bits, so the conversion cannot fail.
+    u32::try_from(addr >> 32).unwrap_or(0)
 }
 
 /// Write the descriptor/avail/used ring device addresses into the PCI
@@ -399,12 +425,12 @@ fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_addr:
     let avail_addr = ring_addr + desc_size as u64;
     let used_addr = ring_addr + used_off as u64;
 
-    transport.queue_set_desc_lo(desc_addr as u32);
-    transport.queue_set_desc_hi((desc_addr >> 32) as u32);
-    transport.queue_set_avail_lo(avail_addr as u32);
-    transport.queue_set_avail_hi((avail_addr >> 32) as u32);
-    transport.queue_set_used_lo(used_addr as u32);
-    transport.queue_set_used_hi((used_addr >> 32) as u32);
+    transport.queue_set_desc_lo(low_half(desc_addr));
+    transport.queue_set_desc_hi(high_half(desc_addr));
+    transport.queue_set_avail_lo(low_half(avail_addr));
+    transport.queue_set_avail_hi(high_half(avail_addr));
+    transport.queue_set_used_lo(low_half(used_addr));
+    transport.queue_set_used_hi(high_half(used_addr));
 
     transport.queue_set_ready(1);
 }
@@ -502,7 +528,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
 
     // Fill data buffer with sentinel pattern (0xAA) to detect untouched regions.
     // SAFETY: data_va is mapped writable, one page.
-    unsafe { core::ptr::write_bytes(data_va as *mut u8, 0xAA, PAGE_SIZE as usize) };
+    unsafe { core::ptr::write_bytes(data_va as *mut u8, 0xAA, PAGE_BYTES) };
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let data_addr = unsafe {
@@ -811,14 +837,16 @@ fn validate_memory_cap(mem_cap: u64, dir: io::IoDirection, data_len: u32) -> Res
     let invalid = ipc::blk_errors::INVALID_MEMORY_CAP;
     let tag_rights =
         syscall::cap_info(mem_cap, syscall::CAP_INFO_TAG_RIGHTS).map_err(|_| invalid)?;
-    let tag = (tag_rights >> 32) as u8;
+    // The tag is the high half whole: a tag word with bits past the tag's
+    // `u8` set names no Memory cap, rather than truncating to one.
+    let tag = tag_rights >> 32;
     let rights = tag_rights & 0xFFFF_FFFF;
     let required = match dir
     {
         io::IoDirection::Read => syscall::RIGHTS_MEM_MAP_RW,
         io::IoDirection::Write => syscall::RIGHTS_MEM_MAP,
     };
-    if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
+    if tag != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
         return Err(invalid);
     }

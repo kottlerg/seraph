@@ -285,9 +285,9 @@ After every run:
 - `BLOCKING ISSUES`: fix every surface finding in one batch. A batch that changes non-comment
   code re-owes the validation set, so batch before the host runs.
 - `NON-BLOCKING ISSUES ONLY`: record every surface finding first (docs/conventions.md
-  § Recording findings), then report. The choice between the merge and one more round is the
-  maintainer's, or the batch default the spawn prompt carries. A fix round ticks the recorded
-  items it fixes.
+  § Recording findings), then report. A `should` finding takes one fix round, at most once per
+  PR (`.claude/agents/orchestrator.md` § Rulings); what the run after it leaves stays recorded.
+  A fix round ticks the recorded items it fixes.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `cargo xtask issue-edit`, or a commit) and re-run
   the audit.
 - A contested finding goes to the maintainer through the orchestrator. Do not waive or rule on a

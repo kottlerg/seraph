@@ -78,8 +78,10 @@ Handle a run's findings in one pass.
 - `BLOCKING ISSUES`: fix every finding on the surface in one batch of commits, the non-blocking
   ones included.
 - `NON-BLOCKING ISSUES ONLY`: record every finding on the surface on the Issue
-  docs/conventions.md § Recording findings names, then prompt for the merge, offering one more
-  fix round beside it. A batch default from the maintainer can settle that choice in advance.
+  docs/conventions.md § Recording findings names. Then take one fix round when the run has a
+  `should` finding and the PR has had no such round, fixing a nit in it only as
+  `.claude/agents/orchestrator.md` § Rulings allows; otherwise go to the gate. A PR takes at
+  most one such round (docs/conventions.md § Pre-merge review).
 - A finding off the surface is recorded in the same pass and not fixed.
 - Before recording a finding, and after fixing one, search the open follow-up Issues of its
   scope for an item that states it (`gh issue list --state open --limit 500 --search

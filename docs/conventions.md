@@ -245,8 +245,10 @@ run) with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
 
 - `READY TO MERGE`;
 - `NON-BLOCKING ISSUES ONLY`, once every finding the run leaves on the surface is recorded
-  (§ Recording findings) and no contested finding on the surface is unresolved. The prompt then
-  offers the merge or one more fix round.
+  (§ Recording findings) and no contested finding on the surface is unresolved. The findings
+  of such a run MAY take one fix round before the merge. A PR takes at most one such round:
+  what the run after it leaves on the surface is recorded, and no further round is taken for
+  it.
 
 Every finding a run counts is fixed or recorded as the subsections below say. A finding MUST NOT
 be waived or ruled outside the standards.

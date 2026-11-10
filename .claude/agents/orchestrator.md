@@ -50,21 +50,15 @@ session ended, a history rewrite the maintainer asked for, the release host runs
 review); record each.
 
 This file applies `.claude/CLAUDE.md`, docs/conventions.md and docs/testing.md and grants no
-authority those documents reserve to the maintainer. Three decisions are the maintainer's. Ask
-all three in your first message, each with its default, so one reply settles them, and keep the
+authority those documents reserve to the maintainer. Two decisions are the maintainer's. Ask
+both in your first message, each with its default, so one reply settles them, and keep the
 answers in the record:
 
 1. **Merges.** The merge is the maintainer's instruction, per PR or standing for the batch
    (`.claude/CLAUDE.md` § PR workflow operations). Without a standing instruction every PR at
    its gate is a merge prompt and the batch pauses on it. Default to propose: you merge a PR
    whose gate you have verified yourself (§ Merge order and the gate).
-2. **Non-blocking findings.** After a `NON-BLOCKING ISSUES ONLY` run the merge prompt offers the
-   merge or one more fix round (docs/conventions.md § Pre-merge review). The answer replaces
-   the standing default of § Rulings for the batch. Default to propose: one fix round when a
-   finding is a comment or document that states a falsehood, when its fix is comment-only and
-   a later round is owed anyway, or when recording it would need a new Issue for a one-line
-   change; otherwise the findings are recorded and the PR merges.
-3. **Issue filing.** A new Issue needs the maintainer's approval (`.claude/CLAUDE.md`
+2. **Issue filing.** A new Issue needs the maintainer's approval (`.claude/CLAUDE.md`
    § Completeness). Default to propose: approved in advance for a rolling follow-up Issue when
    a scope has none, and for a standalone Issue for a defect found off a PR's surface.
 
@@ -269,9 +263,10 @@ maintainer and whose recommendation you share, and tell the maintainer in one li
 to the maintainer). Only a split recommendation, a major design decision, or a case with no
 clearly best option waits for the maintainer.
 
-- **`NON-BLOCKING ISSUES ONLY`.** The worker records the surface findings first. The standing
-  default, until the maintainer sets another for the batch: a `should` finding takes one fix
-  round. A nit takes none and stays recorded, with two exceptions: a nit whose fix is
+- **`NON-BLOCKING ISSUES ONLY`.** The worker records the surface findings first. A `should`
+  finding takes one fix round, and a PR takes at most one such round (docs/conventions.md
+  § Pre-merge review): what the run after it leaves stays recorded, and the PR goes to its
+  gate. A nit takes no round and stays recorded, with two exceptions: a nit whose fix is
   comment-only, in a PR that owes a fix round anyway, is fixed in that round, and a nit in a PR
   that drains a follow-up Issue of its scope is fixed in the same PR. Each is recorded first and
   ticked `(fixed by PR #<M>)` when the round fixes it.

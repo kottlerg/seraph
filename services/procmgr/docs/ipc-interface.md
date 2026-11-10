@@ -802,9 +802,10 @@ Any process may declare itself, on its own cap alone: the badge names the sender
 affects the declarer and no other process, and it removes no authority a debug-authority holder
 needs over another. It is one-way: nothing makes a declared process debuggable again for its life.
 Until it declares, a process is bound and attachable like any other: a fault of logd or one of
-those drivers between its creation and its declaration, which each sends before its bootstrap, reaches the
-crash service, whose log output then waits on the faulting process until the crash service's
-watchdog bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds) declines the fault.
+those drivers between its creation and its declaration, which each sends before its bootstrap,
+reaches the crash service, whose log output then waits on the faulting process until the crash
+service's watchdog bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds) declines
+the fault.
 
 ### Label 22: `REGISTER_THREAD`
 

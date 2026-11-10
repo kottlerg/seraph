@@ -70,12 +70,13 @@ undebuggable. When the bound passes, the watchdog posts the receiving thread an 
 the blocking request it waits in (`Interrupted`) and is then served by the watchdog. An upcall never
 cancels a fault of the receiving thread's own, a page fault on its pager included, so the bound
 cannot end crashd. Each fault takes a generation, and the watchdog commits to cancel one only while
-it is still being handled ([`fault-bound/`](../fault-bound/src/lib.rs), host-tested). Once it has, crashd sends no further
-request of that fault's handling, so no later attach waits past the bound, wherever the upcall was
-delivered. On the cancellation crashd declines the fault at once, marking the block
-`status=timeout` when an attach was the request cancelled, waits for the watchdog to have served
-the upcall, and logs the rest of the block after the decline, when nothing waits on the faulting
-thread any more. So no cancellation of one fault reaches the next fault's handling. The stack scan reads at most
+it is still being handled ([`fault-bound/`](../fault-bound/src/lib.rs), host-tested). Once it has,
+crashd sends no further request of that fault's handling, so no later attach waits past the bound,
+wherever the upcall was delivered. On the cancellation crashd declines the fault at once, marking
+the block `status=timeout` when an attach was the request cancelled, waits for the watchdog to have
+served the upcall, and logs the rest of the block after the decline, when nothing waits on the
+faulting thread any more. So no cancellation of one fault reaches the next fault's handling. The
+stack scan reads at most
 8 KiB (`STACK_SCAN_BYTES`).
 
 ---

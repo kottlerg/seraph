@@ -415,9 +415,8 @@ fn listed_name(authority: u64, process: u64) -> Option<Vec<u8>>
 /// (`DETACH_PROCESS`), which restores the crash binding and unbinds the
 /// upcall class; then it attaches with a watch, binds the thread again, and
 /// dies, its watch thread exiting, after which procmgr's next pass does the
-/// same unasked. procmgr's rebind of the main thread
-/// to the binding it already has cancels nothing, so the fault stays
-/// svctest's to decline.
+/// same unasked. procmgr leaves the main thread, whose binding is already
+/// its own, so the fault stays svctest's to decline.
 fn debugger_session(authority: u64, process: u64, threads: &[u64])
 {
     assert_eq!(

@@ -149,7 +149,9 @@ an unknown label, a zero-byte `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, a
 `SERIAL_REGISTER_RX_NOTIFY` whose stray notification `SYS_IRQ_REGISTER` rejects, and one whose
 fresh notification each call rebinds the UART line to. It requires each call's normal reply and
 each cap to leave svctest's `CSpace`. A driver that keeps a cap it should delete exhausts its
-`CSpace` within one case, and the stalled call ends the boot as a `HANG`. The read and accepted
+`CSpace` within one case and exits on its failing receive. For the input driver, devmgr's
+withdrawal then fails the call in flight, and the phase fails. For the serial driver, logd's
+writes stall on it, and the boot ends as a `HANG`. The read and accepted
 registration cases, and the input case, log a skip when `terminal.svc` is staged, since they
 would take the terminal's input. `caps[3]` exists for devmgr's test
 labels (TODO(#165): retire with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim, the

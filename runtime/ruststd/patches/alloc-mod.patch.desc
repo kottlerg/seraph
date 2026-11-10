@@ -12,7 +12,9 @@ change by string surgery on the toolchain mirror under `target/`:
  3. Otherwise insert the seraph arm immediately after the `zkvm` arm.
 
 The arm selects `seraph.rs` as the platform module `imp`, whose `alloc`,
-`alloc_zeroed`, `dealloc`, and `realloc` std's `System` allocator calls.
+`alloc_zeroed`, `dealloc`, and `realloc` back both std's `System` allocator
+and std's default global allocator (the `__rdl_*` symbols the `alloc` crate
+calls when no `#[global_allocator]` is set).
 The upstream rust-src is never modified; the mirror is rebuilt whenever
 the toolchain or the overlay changes.
 

@@ -890,19 +890,28 @@ procmgr hands the target's crash bindings back after a debugger's attach: it bin
 thread's exception class to the crash endpoint under the process badge again, and each registered
 thread's (Label 22) under the thread's crash badge, minting one for a thread that has none (one
 that registered while the debugger's binding was on it, which a registration leaves), and deletes
-the debugger watch the attach left (Label 20). A thread whose bind fails keeps the binding it has;
-a failure to bind the main thread is logged. procmgr rebinds over the debugger's binding, so no
-thread is unbound meanwhile, and a fault in flight under the debugger's binding is delivered again
-to the crash endpoint (§ Delivery, Resume, and Kill, Rebind, in
+the debugger watch the attach left (Label 20). A thread whose bind fails keeps the binding it has,
+as does each thread with no crash badge when procmgr's heap cannot hold the fresh ones, which
+procmgr logs; a failure to bind the main thread is logged. procmgr rebinds over the debugger's
+binding, so no thread is unbound meanwhile, and a fault in flight under the debugger's binding is
+delivered again to the crash endpoint (§ Delivery, Resume, and Kill, Rebind, in
 [docs/fault-handling.md](../../../docs/fault-handling.md)). A debugger holds no SEND on the crash
-endpoint, so it cannot restore those bindings itself; the debugger unbinds the upcall class it
-bound, resumes the threads it held, and writes back the text it changed before it sends this.
-procmgr restores the bindings the same way, unasked, when the watched debugger thread has exited.
+endpoint, so it cannot restore those bindings itself: it writes back the text it changed and
+resumes the threads it held, then sends this, and then unbinds any other class it bound, the
+upcall class among them, which procmgr leaves alone. procmgr restores the bindings the same way,
+unasked, when the watched debugger thread has exited.
+
+procmgr restores its own crash bindings, not what the attach found: a handler the target bound on
+a thread's exception class itself, which the debugger's bind replaced, is not bound back, and that
+thread's faults reach the crash endpoint from then on. procmgr binds no other class, so the
+target's own handler of another class the debugger bound over is not bound back either.
 
 Replies `SUCCESS`; refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_BADGE` when
 no live process carries the badge (a thread's crash badge names no process here); `NOT_ATTACHABLE`
 when the target declared itself undebuggable (Label 21). The refusal order is
-`process_table::detach_target`.
+`process_table::detach_target`. svctest's `crash_endpoint` phase drives a `LIST_PROCESSES` walk to
+a process it attached to, this request's restore of a registered thread it rebound, and the same
+restore once an attach's watch thread exits.
 
 ---
 

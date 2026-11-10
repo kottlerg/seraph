@@ -2166,14 +2166,20 @@ pub fn release_registered_thread(thread: process_table::RegisteredThread)
 /// main thread under its process badge, and each registered thread under its
 /// crash badge, minted for a thread that has none (one registered while the
 /// debugger's binding was there, which procmgr leaves). A thread whose bind
-/// fails keeps the binding it has; the debugger watch is released.
+/// fails keeps the binding it has, as does every thread with no crash badge
+/// when procmgr's heap cannot hold the fresh ones; the debugger watch is
+/// released. A badge naming no live process changes nothing.
 pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
 {
-    let unbadged = table.find_by_badge(badge).map_or(0, |e| {
+    let Some(unbadged) = table.find_by_badge(badge).map(|e| {
         (0..e.threads.len())
             .filter(|&i| e.threads.get(i).is_some_and(|t| t.crash_badge == 0))
             .count()
-    });
+    })
+    else
+    {
+        return;
+    };
     let mut fresh: Vec<u64> = Vec::new();
     if fresh.try_reserve_exact(unbadged).is_ok()
     {
@@ -2181,6 +2187,10 @@ pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
         {
             fresh.push(table.mint_crash_badge());
         }
+    }
+    else
+    {
+        std::os::seraph::log!("no heap for crash badges; threads without one keep their binding");
     }
     let Some(entry) = table.find_mut_by_badge(badge)
     else

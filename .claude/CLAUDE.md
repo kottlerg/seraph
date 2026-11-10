@@ -53,7 +53,8 @@ read it to find the document a task needs.
   body, Issue body, or comment carries a tool attribution line or a session link.
 - A decision of the maintainer is stated as a decision, in the project's prose. Nothing tracked
   or outward-facing (a commit message, a PR body, an Issue, a comment, a file in the tree)
-  quotes what they typed; their words are kept only in the orchestrator's local record.
+  quotes what they typed ([docs/conventions.md](../docs/conventions.md) § Style); their words
+  are kept only in the orchestrator's local record.
 - The merge is the maintainer's decision. Merge only on their instruction, given per PR or as a
   standing instruction for a batch, never while CI is pending or failing
   ([docs/conventions.md](../docs/conventions.md) § CI Gating), and with

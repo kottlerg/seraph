@@ -27,7 +27,8 @@
 //!   executable elsewhere (the path-taken check: under QEMU a missing
 //!   synchronisation does not fail);
 //! - a device page (an `Mmio` page ktest maps into B) is refused
-//!   (`InvalidAddress`), when the boot hands ktest an `Mmio`;
+//!   (`InvalidAddress`), and still refused after a `mem_protect` of it, when
+//!   the boot hands ktest an `Mmio`;
 //! - once B is deleted, its thread is `Exited` and both calls refuse it.
 //!
 //! A thread in ktest's own address space reads and writes a ktest static the
@@ -478,17 +479,33 @@ fn device_refused(ctx: &TestContext, b: u64, th: u64) -> TestResult
         };
         // SAFETY: `b` is an address space this test created, not ktest's own.
         let mapped = unsafe { mmio_map(b, lo, B_DEVICE, 0) };
-        let mut buf = [0u8; 8];
-        let read = mapped.map(|()| thread_read_mem(th, B_DEVICE, &mut buf));
+        let result = device_reads_refused(ctx, b, th, mapped);
         // Deleting the page's cap withdraws its mapping from B.
         cap_delete(lo).ok();
-        return match read
-        {
-            Err(_) => Err("integration::thread_memory: mmio_map of the device page failed"),
-            Ok(r) if r == Err(err(SyscallError::InvalidAddress)) => Ok(()),
-            Ok(_) => Err("integration::thread_memory: a device page was not refused"),
-        };
+        return result;
     }
     crate::log("ktest: integration::thread_memory device case SKIP (no Mmio)");
+    Ok(())
+}
+
+/// The reads of B's device page: refused as mapped, and refused again after a
+/// `mem_protect`, which any Memory cap with MAP authorises and which keeps the
+/// page device memory. `mapped` is the outcome of the page's `mmio_map`.
+fn device_reads_refused(ctx: &TestContext, b: u64, th: u64, mapped: Result<(), i64>) -> TestResult
+{
+    mapped.map_err(|_| "integration::thread_memory: mmio_map of the device page failed")?;
+    let refused = Err(err(SyscallError::InvalidAddress));
+    let mut buf = [0u8; 8];
+    if thread_read_mem(th, B_DEVICE, &mut buf) != refused
+    {
+        return Err("integration::thread_memory: a device page was not refused");
+    }
+    // SAFETY: `b` is an address space this test created, not ktest's own.
+    unsafe { mem_protect(ctx.memory_base, b, B_DEVICE, 1, MAP_READ) }
+        .map_err(|_| "integration::thread_memory: mem_protect of the device page failed")?;
+    if thread_read_mem(th, B_DEVICE, &mut buf) != refused
+    {
+        return Err("integration::thread_memory: a protected device page was not refused");
+    }
     Ok(())
 }

@@ -163,9 +163,11 @@ skipping levels, risks deadlock.
    the CAS. Between a claim (a source-lock claim: waiter dequeued, payload deposited,
    `wake_in_flight = 1`; or a waking `reply_tcb` claim: the `endpoint_reply` or dying-server dealloc
    `compare_exchange` (the former also serving the `SYS_IPC_REPLY` failure path), the receive-entry
-   swap that releases an unreplied caller, or a fault-handler binding change's `compare_exchange`
-   in `ipc::fault::claim_fault_park`, which stamps REDELIVER and keeps the pin the binding set) and
-   the waker's `enqueue_and_wake`,
+   swap that releases an unreplied caller, a fault-handler binding change's `compare_exchange`
+   in `ipc::fault::claim_fault_park`, which stamps REDELIVER and keeps the pin the binding set, or
+   an upcall's cancel, the `BlockedOnReply` arm of `cancel_for_upcall` under the client's
+   `sched_lock`, which stamps INTERRUPTED and keeps the pin the binding set for the poster's
+   `enqueue_and_wake`) and the waker's `enqueue_and_wake`,
    the wake is half-complete and owned exclusively by the in-flight waker: code executing *as the
    claimed thread* in that window (it is still live, mid-park) has exactly one legal continuation —
    fall through to `schedule()`. Consuming the deposited payload and returning to user mode is
@@ -175,10 +177,11 @@ skipping levels, risks deadlock.
    the pin is still clear under the commit's locks (the settle loop of `start_under_all_locks`), so
    the late wake aborts on `Stopped` instead of linking a later park; see
    [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol)
-   § `sys_thread_stop` Cross-CPU Stop Protocol, invariant 4. The other `reply_tcb` claims — the
-   cancel, dying-client dealloc, and commit-failure rollback `compare_exchange` — wake no one. The
-   cancel and rollback claims stamp a cancelled disposition (INTERRUPTED, or KILL for a faulter) and
-   clear `wake_in_flight`; the dying-client claim only clears `wake_in_flight` (deposits per the
+   § `sys_thread_stop` Cross-CPU Stop Protocol, invariant 4. The other `reply_tcb` claims — a stop's
+   or teardown's cancel, dying-client dealloc, and commit-failure rollback `compare_exchange` — wake
+   no one. The stop's or teardown's cancel and the rollback claim stamp a cancelled disposition
+   (INTERRUPTED, or KILL for a faulter) and clear `wake_in_flight`; the dying-client claim only
+   clears `wake_in_flight` (deposits per the
    [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes) episode table; the
    `BlockedOnReply` symmetry rules'
    [actors 1-9](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules) enumerate every

@@ -83,7 +83,12 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
 /// one reply carries. A caller drains more input with further reads.
 const MAX_READ_BYTES: usize = 512;
 
-fn handle_request(msg: &IpcMessage, irq_cap: u64, ipc_buf: *mut u64)
+/// Serve one request. Every cap the request carries and the driver does not
+/// keep (all of them but an accepted RX notification) is deleted before the
+/// reply, so no request leaves a slot of the driver's `CSpace` taken.
+/// `rx_notify` is the notification the UART interrupt is bound to (0 when
+/// none is).
+fn handle_request(msg: &IpcMessage, irq_cap: u64, rx_notify: &mut u64, ipc_buf: *mut u64)
 {
     // Label encoding mirrors `stream_labels::STREAM_BYTES`: opcode in bits
     // 0-15, payload byte length in bits 16-31.
@@ -100,7 +105,19 @@ fn handle_request(msg: &IpcMessage, irq_cap: u64, ipc_buf: *mut u64)
         }
         _ => 0,
     };
-    let reply = if required_authority != 0 && msg.badge & required_authority == 0
+    let authorized = required_authority == 0 || msg.badge & required_authority != 0;
+    // Only an authorized RX-notify request keeps a cap, its first one, which
+    // `register_rx_notify` keeps or deletes. No client delivers a cap on an
+    // unauthorized request today: devmgr mints its test-deny SENDs without
+    // GRANT, and every SEND it grants carries all of this driver's verb bits.
+    // The `authorized` term keeps a future partial-authority SEND from
+    // leaving its notification here.
+    let kept = usize::from(authorized && op == serial_labels::SERIAL_REGISTER_RX_NOTIFY);
+    for &cap in msg.caps().iter().skip(kept)
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    let reply = if !authorized
     {
         IpcMessage::new(serial_errors::UNAUTHORIZED)
     }
@@ -145,21 +162,7 @@ fn handle_request(msg: &IpcMessage, irq_cap: u64, ipc_buf: *mut u64)
     }
     else if op == serial_labels::SERIAL_REGISTER_RX_NOTIFY
     {
-        let notif = msg.caps().first().copied().unwrap_or(0);
-        // Mode 0, edge-triggered and active-high: the x86-64 COM1 line is ISA
-        // IRQ 4, which no MADT override reroutes, and riscv64 programs nothing
-        // from the mode. devmgr keeps the line exclusive, so no other binding
-        // has recorded another mode on it.
-        if irq_cap != 0 && notif != 0 && syscall::irq_register(irq_cap, notif, 0).is_ok()
-        {
-            // irq_register leaves the line masked; the first ack arms it.
-            let _ = syscall::irq_ack(irq_cap);
-            IpcMessage::new(serial_errors::SUCCESS)
-        }
-        else
-        {
-            IpcMessage::new(serial_errors::REGISTER_FAILED)
-        }
+        register_rx_notify(irq_cap, msg.caps().first().copied().unwrap_or(0), rx_notify)
     }
     else
     {
@@ -169,8 +172,41 @@ fn handle_request(msg: &IpcMessage, irq_cap: u64, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// Bind the UART interrupt to `notification` and arm it, replacing the
+/// notification bound before, whose cap is then deleted. A refused
+/// registration (no IRQ cap held, no notification supplied, or a cap
+/// `SYS_IRQ_REGISTER` rejects) deletes `notification` and leaves the earlier
+/// binding in place.
+fn register_rx_notify(irq_cap: u64, notification: u64, rx_notify: &mut u64) -> IpcMessage
+{
+    // Mode 0, edge-triggered and active-high: the x86-64 COM1 line is ISA
+    // IRQ 4, which no MADT override reroutes, and riscv64 programs nothing
+    // from the mode. devmgr keeps the line exclusive, so no other binding
+    // has recorded another mode on it.
+    if irq_cap == 0 || notification == 0 || syscall::irq_register(irq_cap, notification, 0).is_err()
+    {
+        if notification != 0
+        {
+            let _ = syscall::cap_delete(notification);
+        }
+        return IpcMessage::new(serial_errors::REGISTER_FAILED);
+    }
+    // A registration through the bound Interrupt cap rebinds it, and returns
+    // once no delivery to the replaced notification is in flight, so the
+    // replaced cap is free to delete.
+    let old = core::mem::replace(rx_notify, notification);
+    if old != 0
+    {
+        let _ = syscall::cap_delete(old);
+    }
+    // irq_register leaves a first binding masked; the first ack arms it.
+    let _ = syscall::irq_ack(irq_cap);
+    IpcMessage::new(serial_errors::SUCCESS)
+}
+
 fn service_loop(service_ep: u64, irq_cap: u64, ipc_buf: *mut u64) -> !
 {
+    let mut rx_notify = 0;
     // No diagnostic hook: a `log!` here is a blocking call into logd, which
     // may itself be blocked calling this driver (see the module doc). The
     // kernel's rate-limited recv-failure line and the guard's exit remain
@@ -189,7 +225,7 @@ fn service_loop(service_ep: u64, irq_cap: u64, ipc_buf: *mut u64) -> !
             }
         };
         guard.on_success();
-        handle_request(&msg, irq_cap, ipc_buf);
+        handle_request(&msg, irq_cap, &mut rx_notify, ipc_buf);
     }
 }
 

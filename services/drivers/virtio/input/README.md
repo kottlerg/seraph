@@ -46,7 +46,8 @@ One device, one client for v0.1.0; multi-device fan-out is out of scope.
 
 Synchronous call/reply (`SYS_IPC_CALL`). Labels and the keysym ABI live in
 `shared/ipc::input_labels`, `shared/ipc::input_errors`, and
-`shared/ipc::keysym`.
+`shared/ipc::keysym`. No label takes a cap: the driver deletes every cap a request carries before
+it replies.
 
 ### Label 1: `INPUT_READ_EVENTS`
 

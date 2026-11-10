@@ -294,12 +294,15 @@ clearly best option waits for the maintainer.
 - **An acceptance box no test can satisfy** is finished or dropped, never ticked. Dropping it is
   the maintainer's decision; ask with the rationale (docs/conventions.md § Acceptance checklist
   discipline).
-- **A history rewrite** (a subject that breaks a rule, a closing keyword in a commit) is yours
-  on the maintainer's instruction, which may be standing for the batch. Rebuild the chain with
-  identical trees (`git commit-tree -S`), check `git diff --quiet <old> <new>`, and push it to
-  the PR's own branch with the lease pinned to the old head:
-  `git push --force-with-lease=<branch>:<old> origin <new>:refs/heads/<branch>`. Do not replace
-  the branch with a fresh one and a superseding PR, and never force-push `master`.
+- **A history rewrite** is for a MUST violation in a pushed commit message (a planning label or
+  an Issue reference in a subject, a closing keyword in a commit). A small SHOULD departure
+  takes none: the worker names the commit and the departure in the PR body (docs/conventions.md
+  § Commit Messages). A rewrite is yours on the maintainer's instruction, which may be standing
+  for the batch. Rebuild the chain with identical trees (`git commit-tree -S`), check
+  `git diff --quiet <old> <new>`, and push it to the PR's own branch with the lease pinned to
+  the old head: `git push --force-with-lease=<branch>:<old> origin <new>:refs/heads/<branch>`.
+  Do not replace the branch with a fresh one and a superseding PR, and never force-push
+  `master`.
 - **`.claude/CLAUDE.md`, `.claude/settings.json` and hooks.** A worker prepares the change as a
   patch file and reports it. Send the supervisor the patch's path: it shows the maintainer the
   diff and applies it on their direct word in that conversation. You do not apply it, since you

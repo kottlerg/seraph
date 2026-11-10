@@ -862,8 +862,9 @@ cargo xtask commit-check [--base <ref>] [--head <ref>] [--strict]
 
 The range is `<base>..<head>`, by default `origin/master..HEAD`. Each finding prints as
 `<level> <rule>: <commit>: <message>`. An error fails the command; a warning fails it only under
-`--strict`. The warnings are that section's SHOULD rules, a departure from which the maintainer
-may accept, and one rule a script cannot decide alone.
+`--strict`. The warnings are that section's SHOULD rules, a departure from which is accepted as
+that section says (a small one the PR body names, a larger one the maintainer accepts), and one
+rule a script cannot decide alone.
 
 | Rule | Level | Check |
 |---|---|---|

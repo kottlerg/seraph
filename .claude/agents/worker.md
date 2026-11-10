@@ -169,9 +169,10 @@ The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a deleg
   decided that ..."). Never quote what they typed in a commit message, a PR body, an Issue, a
   comment or a tracked file, however it reached you (docs/documentation-standards.md § Tone and
   Language for a tracked file and a commit message; docs/conventions.md § Style for a PR body,
-  an Issue and a comment). That holds
-  for their acceptance of a SHOULD departure too: the body states it. Their words are kept in
-  the orchestrator's local record only.
+  an Issue and a comment). That holds for their acceptance of a SHOULD departure too: the body
+  states it. A small departure (five columns, two lines of one commit) needs only the body to
+  name it (docs/conventions.md § Commit Messages). Their words are kept in the orchestrator's
+  local record only.
 - Subjects are `<scope>: ...`, at most 72 columns, with no Issue reference. Bodies are wrapped
   and carry `Refs #N` for the Issues the commit touches. A closing keyword goes in the PR body
   only (docs/conventions.md § Commit and PR cross-references). `cargo xtask commit-check` checks

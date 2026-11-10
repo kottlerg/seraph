@@ -153,8 +153,11 @@ were swept to use `svctest` where they meant the services-tier harness.
 
 ## Commit Messages
 
-A departure from a SHOULD rule of this section is accepted when the PR body records the
-maintainer's acceptance of it, as a statement of that decision.
+A small departure from a SHOULD rule of this section (a subject or a body line at most five
+columns over its limit, on at most two lines of one commit) is accepted without a history
+rewrite: the PR body names the commit and the departure. A larger one is accepted when the PR
+body records the maintainer's acceptance of it, as a statement of that decision. A history
+rewrite (§ Operations) is for a MUST violation.
 
 ### Title
 

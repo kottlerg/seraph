@@ -135,10 +135,12 @@ claims.
    reference, not a task ID), a task ID, or a branch name — is a FAIL, as
    is a closing reference step 5 fails. A departure from a SHOULD rule (a
    subject over 72 characters, a body not wrapped at ~72 columns) is a
-   FAIL unless the PR body records the maintainer's acceptance of it as
-   a statement of that decision, which § Commit Messages makes an
-   accepted departure: report such an item as `accepted`, citing that
-   statement, and it does not fail the section. A commit message
+   FAIL unless § Commit Messages accepts it: a small one (at most five
+   columns over, on at most two lines of the commit) that the PR body
+   names with its commit, or a larger one whose acceptance by the
+   maintainer the PR body records as a statement of that decision. Report
+   such an item as `accepted`, citing the body's text, and it does not
+   fail the section. A commit message
    or changed file that quotes what the maintainer wrote in a session
    breaks `docs/documentation-standards.md` § Tone and Language, and a PR
    body that does breaks § Style: FAIL it.

@@ -85,7 +85,9 @@ after the decline, when nothing waits on the faulting thread any more. The stack
   failed, or the process does not use the runtime's spawn) is not in the attach list, and its
   faults carry its spawner's badge. crashd cannot read its registers, so its block carries
   `thread=unidentified`, the fault, the image placement, and the bytes at the instruction pointer,
-  and no registers and no stack walk.
+  and no registers and no stack walk. When its spawner was a registered thread that has since exited
+  and been dropped from the registry, the spawner's crash badge names no thread any more: the attach
+  is refused, and the block is `status=unattached`, with the fault message's fields alone.
 - **Uncovered processes.** init, memmgr, and procmgr are not created by procmgr. logd, the serial
   driver, and the framebuffer driver, through which logd writes every line, and crashd declare
   themselves undebuggable at startup, as svctest, a debug-authority holder, does in a test boot;

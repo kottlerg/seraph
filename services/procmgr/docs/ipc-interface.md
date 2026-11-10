@@ -732,8 +732,10 @@ Reply `SUCCESS` with:
 
 The list is the main thread at index 0, then the registered threads in registration order. Before
 it replies, procmgr drops from the target's registry each thread that has exited or whose cap the
-runtime revoked (its reclaim of a joined or reaped thread does), so no exited thread is listed; a
-thread blocked on a fault has not exited and stays listed. The list can change between two calls
+runtime revoked (its reclaim of a joined or reaped thread does), so no thread that exited before
+the request is listed; a thread blocked on a fault has not exited and stays listed. A thread whose
+cap the runtime revokes between that sweep and the derivation of the reply's caps is swept out and
+the page derived again, up to four times. The list can change between two calls
 of a paged walk, as threads register and exit; the named thread's index is the one in the reply
 that carries it, and a caller that needs that thread's cap from a later page reads `data[6]` of
 that page's reply too. The caps are derivations of procmgr's own; procmgr's teardown of the target,
@@ -746,8 +748,9 @@ and pages from index 0 sees the main thread first, as before, with the registere
 it. Refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_BADGE` when no live process
 carries the badge, or no registered thread of a live process the crash badge, which covers init,
 memmgr, and procmgr, none of which procmgr created; `NOT_ATTACHABLE` when the target declared
-itself undebuggable (Label 21); `OUT_OF_MEMORY` when a thread cap cannot be derived, the caps
-already derived for the reply then deleted. The refusal order is `process_table::attach_target`.
+itself undebuggable (Label 21); `OUT_OF_MEMORY` when the cap of a thread still listed cannot be
+derived, or threads keep going through four derivations of the page, the caps already derived for
+the reply then deleted. The refusal order is `process_table::attach_target`.
 
 ### Label 21: `DECLARE_NO_DEBUG`
 
@@ -791,22 +794,32 @@ registration). When the thread's exception class is bound under one of its proce
 badges (its process badge, or a registered thread's crash badge), as a thread that copied its
 spawner's bindings is, procmgr binds it again under a fresh crash badge; a binding of another
 handler, a debugger's, or none, is left, and the thread is then listed without a crash badge.
+procmgr reads the binding's badge, which `SYS_THREAD_GET_FAULT_HANDLER` returns, not its endpoint,
+so it tells its own binding by the badge alone: a debugger that binds a thread's exception class
+MUST bind it under a badge that is neither the process badge nor a crash badge (no badge with bit
+63 set), or the threads that thread spawns, which copy that binding, are bound back to the crash
+endpoint when they register. procmgr reads the binding before it sweeps, so a thread whose
+spawner the sweep drops is still bound under a crash badge of its own.
 
 Before it adds the thread, procmgr drops from the registry the threads that have exited or whose cap
 was revoked, when the registry has reached the count its last sweep set: 64 at first, then twice
-what the sweep kept, so the sweeps cost at most two thread-state reads per registration.
+what the sweep kept. At the bound, the next sweep waits instead for as many refused registrations
+as the registry holds. Either way a sweep comes after at least half as many requests as threads it
+reads, so the sweeps cost at most two thread-state reads per request on average.
 
 The registry holds at most `procmgr_labels::REGISTERED_THREADS_MAX` (16384) threads per process
 ([docs/limits.md](../../../docs/limits.md) § Shared IPC and protocol crates); past it a thread runs
-unregistered, so no spawn fails for the bound. procmgr does not check that the thread runs in the
+unregistered, so no spawn fails for the bound. procmgr does not compare a registration against the
+threads it holds: a thread registered twice takes two entries, both counting toward the bound, and
+the runtime registers each thread once. procmgr does not check that the thread runs in the
 sender's address space, which no kernel query gives: a sender can register only a thread it holds
 `CONTROL` on, which already lets it read and change that thread.
 
 Replies `SUCCESS`; refusals, in order: `INVALID_BADGE` when the badge names no live process;
 `NOT_ATTACHABLE` when the process declared itself undebuggable (Label 21), on which the runtime
 sends no further registration; `INVALID_ARGUMENT` without a Thread cap carrying `RIGHTS_THREAD`;
-`THREAD_LIMIT` at the bound, after the sweep; `OUT_OF_MEMORY` when procmgr's heap cannot hold the
-entry. A refused request's caps are deleted.
+`THREAD_LIMIT` at the bound, after any sweep due; `OUT_OF_MEMORY` when procmgr's heap cannot hold
+the entry. A refused request's caps are deleted.
 
 ---
 

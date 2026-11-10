@@ -435,8 +435,11 @@ since procmgr's request does not wait on the new thread:
   and the helper exists to call procmgr: its registration waits on procmgr exactly as its query
   would, while logd's main thread, which serves procmgr's write, goes on without it.
 
-A thread whose spawner waited on it without bound while procmgr waited on that spawner would
-deadlock; no in-tree spawner does that.
+Two patterns would deadlock, and no in-tree process follows either: a spawner that waits on its new
+thread without bound while procmgr waits on that spawner; and a process that hands procmgr a cap
+which a newly spawned thread serves (a file or node for `CREATE_FROM_FILE`, say) before that
+thread's registration has been served, so procmgr's call on the cap waits on a thread that waits on
+procmgr.
 
 ---
 

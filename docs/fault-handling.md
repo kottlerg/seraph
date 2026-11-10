@@ -602,7 +602,10 @@ copies, the kernel adds no debugging interface of its own. A debugger in another
 those caps from procmgr's attach request, which a holder of the debug authority sends and which
 returns the process's main thread and every thread its runtime registered
 ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`);
-a thread the process spawns after an attach is listed by the next one. The pieces are:
+a thread the process spawns after an attach is listed by the next one. Such a debugger MUST bind a
+thread's exception class under a badge that is neither the process's badge nor a crash badge,
+since procmgr tells its own crash binding by the badge alone and rebinds a newly spawned thread
+that copied it (§ Label 22: `REGISTER_THREAD` there). The pieces are:
 
 - **Breakpoints.** A software breakpoint is `int3` on x86-64 and `ebreak` on RISC-V. It reaches
   the exception handler as `FAULT_KIND_EXCEPTION` with `FAULT_EXC_BREAKPOINT`. The reported

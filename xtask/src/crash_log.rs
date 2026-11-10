@@ -168,9 +168,12 @@ impl ImageSource for SysrootImages
 }
 
 /// The sysroot-relative paths a binary logged as `name` may have, in search
-/// order: the name's first word (a registered name may carry an instance
-/// after a space, as `fatfs /data` does) in each of [`IMAGE_DIRS`]; none
-/// for a name whose first word is not a single path component.
+/// order: the name's first word in each of [`IMAGE_DIRS`]; none for a name
+/// whose first word is not a single path component. Every name registered
+/// in the tree today is a bare binary name; taking the first word keeps a
+/// name that carries more after a space (logd prints what a process
+/// registered, spaces included) resolvable, and the text-span check refuses
+/// a wrong binary either way.
 fn candidate_paths(name: &str) -> Vec<String>
 {
     let binary = name.split(' ').next().unwrap_or_default();

@@ -8,24 +8,31 @@
 //!
 //! The image is a binary named by path, or the sysroot's kernel. Each address
 //! less the load bias is an address in the image's link-time address space;
-//! the resolution itself is [`crate::symbolize`]'s.
+//! the resolution itself is [`crate::symbolize`]'s. With `--log`, the
+//! addresses are those of every crash-report block in a serial log, each
+//! against its process's sysroot binary ([`crate::crash_log`]).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 
 use crate::cli::SymbolizeArgs;
 use crate::context::Context;
+use crate::crash_log::{SysrootImages, symbolize_log};
 use crate::symbolize::{Symbolizer, format_resolution, image_address};
 
 /// Entry point for `cargo xtask symbolize`.
 ///
 /// # Errors
 ///
-/// Fails when the image cannot be read or parsed, or when an address lies
-/// below the load bias.
+/// Fails when the image or the log cannot be read, when the image cannot be
+/// parsed, or when an address lies below the load bias.
 pub fn run(ctx: &Context, args: &SymbolizeArgs) -> Result<()>
 {
+    if let Some(log) = &args.log
+    {
+        return run_log(ctx, log);
+    }
     let binary = image_path(ctx, args);
     let data =
         std::fs::read(&binary).with_context(|| format!("cannot read {}", binary.display()))?;
@@ -48,6 +55,22 @@ pub fn run(ctx: &Context, args: &SymbolizeArgs) -> Result<()>
         {
             println!("{line}");
         }
+    }
+    Ok(())
+}
+
+/// The log form: every crash-report block of `log`, symbolized against the
+/// sysroot.
+fn run_log(ctx: &Context, log: &Path) -> Result<()>
+{
+    let bytes = std::fs::read(log).with_context(|| format!("cannot read {}", log.display()))?;
+    let images = SysrootImages {
+        sysroot: ctx.sysroot.clone(),
+    };
+    match symbolize_log(&String::from_utf8_lossy(&bytes), &images)
+    {
+        Some(report) => print!("{report}"),
+        None => println!("{}: no crash-report block", log.display()),
     }
     Ok(())
 }

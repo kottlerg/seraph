@@ -42,9 +42,17 @@ which = "8"
 # does not ship (its llvm-tools carries no symbolizer).
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
 addr2line = { version = "0.27", default-features = false, features = ["std", "rustc-demangle"] }
+# `pr-check`, `review-check`, `review-ledger`, `issue-edit`, `issue-file`: the
+# GitHub CLI answers in JSON, and the review's run records are JSON files.
+serde_json = "1"
 # The crash-report block's parser: test-crash-report reads the blocks with
 # the crate crashd emits them with, not a copy of their grammar.
 crash-report = { path = "../shared/crash-report" }
+# logd's reclaim line (`logd_codec::reclaim`): `symbolize --log` reads the
+# name it prints for a slot that registered none from it, and
+# test-logd-reclaim's parser is tested against the line logd formats, not a
+# copy of its shape.
+logd-codec = { path = "../services/logd/codec" }
 
 [dev-dependencies]
 # `symbolize`'s tests write their ELF fixtures (a symbol table and DWARF
@@ -53,9 +61,6 @@ object = { version = "0.40", default-features = false, features = ["write"] }
 gimli = { version = "0.34", default-features = false, features = ["write"] }
 # The normalized exception codes test-crash-report's tests build reports with.
 syscall-abi = { path = "../abi/syscall" }
-# logd's reclaim-line formatter (`logd_codec::reclaim`): test-logd-reclaim's
-# parser is tested against the line logd formats, not a copy of its shape.
-logd-codec = { path = "../services/logd/codec" }
 
 # Windows console-mode bindings for TerminalGuard. Only pulled in for
 # Windows builds; Linux/macOS/BSD builds skip this crate entirely.

@@ -1139,7 +1139,7 @@ A failing boot is diagnosed with the tool that fits its class of defect:
 | Defect class | Tool |
 |---|---|
 | Timing-sensitive race: a failure that comes and goes across boots, or moves with the CPU count or host load | Log instrumentation and repeat runs |
-| Deterministic userspace fault | The fault report on the serial log, resolved with `cargo xtask symbolize` |
+| Deterministic userspace fault | The crash report on the serial log, resolved with `cargo xtask symbolize --log` |
 | Deterministic kernel crash; a failure before the serial console is up; a wedged guest; a question about raw machine state | QEMU's gdbstub |
 | Per-process debugging of a running system | The serial GDB stub (design intent; not yet implemented, [#835](https://github.com/kottlerg/seraph/issues/835)) |
 
@@ -1149,21 +1149,21 @@ a rare failure into a rate: `cargo xtask run-parallel --runs N --parallel P --sa
 ([xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)) keeps the log of every failing
 run, and the CPU counts of [Coverage tiers](#coverage-tiers) are where SMP races show first.
 
-**Userspace faults.** A thread an unhandled fault kills
-([docs/fault-handling.md](fault-handling.md)) leaves the kernel's `USERSPACE FAULT` dump on the
-serial log, whose instruction pointer (`rip=` on x86_64, `sepc=` on
-riscv64) is a runtime address in the faulting process's image. The image's load bias is on the
-creator's spawn line ([docs/userspace-memory-model.md](userspace-memory-model.md#image-placement)
-§ Image Placement), and `cargo xtask symbolize --binary <binary> --bias <bias> <address>...`
-([xtask/README.md](../xtask/README.md#cargo-xtask-symbolize)) resolves the address to function,
-file, and line, or to the nearest function symbol in a build without debug information. With
-crashd staged, the default, a fault of a process procmgr created also leaves a crash report, a
-marked block in the system log carrying the registers, the bytes at the instruction pointer, the
-load bias, and a stack walk ([services/crashd/README.md](../services/crashd/README.md),
-[services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)): its `load_bias`
-and `frame.<n>` fields are the bias and addresses `symbolize` takes. A symbolizer form that
-resolves every address of such a block from the log is design intent, not yet implemented
-([#834](https://github.com/kottlerg/seraph/issues/834)).
+**Userspace faults.** With crashd staged, the default, a fault that kills a process procmgr
+created leaves a crash report: a marked block in the system log carrying the registers, the bytes
+at the instruction pointer, the load bias, and a stack walk
+([services/crashd/README.md](../services/crashd/README.md),
+[services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)). `cargo xtask
+symbolize --log <file>` ([xtask/README.md](../xtask/README.md#cargo-xtask-symbolize)) prints every
+block of a saved serial log with its instruction pointer and stack frames resolved to function,
+file, and line against the process's sysroot binary, or to the nearest function symbol in a build
+without debug information, and `run-parallel` writes that report beside each log it keeps that
+holds a block. A process crashd cannot cover (Crash reports above) leaves only the kernel's
+`USERSPACE FAULT` dump ([docs/fault-handling.md](fault-handling.md)), whose instruction pointer
+(`rip=` on x86_64, `sepc=` on riscv64) is a runtime address in the process's image: with the load
+bias from the creator's spawn line
+([docs/userspace-memory-model.md](userspace-memory-model.md#image-placement) § Image Placement),
+`cargo xtask symbolize --binary <binary> --bias <bias> <address>...` resolves it the same way.
 
 **Kernel crashes, early failures, and wedged guests.** QEMU's gdbstub reads the machine whatever
 state the guest is in, including before the serial console is up and after the kernel stops

@@ -15,15 +15,21 @@
 //! exited, and joined around them, for svctest's attach checks. Each first
 //! logs under the log name `crashme`, so logd's reclaim line at its death
 //! names it, and reaches the fault two calls deep, so the report's stack walk
-//! has frames to find. See programs/crashme/README.md.
+//! has frames to find. `crashme registry-declare` does not fault: it checks
+//! that declaring itself undebuggable unbinds a registered thread's crash
+//! binding as well as the main thread's, and exits 0 when it does. See
+//! programs/crashme/README.md.
 
 mod arch;
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use syscall_abi::FAULT_CLASS_EXCEPTION;
+use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+use syscall_abi::{
+    CAP_INFO_THREAD_STATE, FAULT_CLASS_EXCEPTION, RIGHTS_THREAD_OBSERVE, THREAD_STATE_EXITED,
+};
 
 /// The fault the fixture dies of.
 #[derive(Clone, Copy)]
@@ -40,8 +46,9 @@ enum Mode
 /// page of `ipc::procmgr_labels::ATTACH_THREADS_PAGE` caps.
 const WORKER_PARKED: usize = ipc::procmgr_labels::ATTACH_THREADS_PAGE;
 
-/// How long the fixture waits for a thread it let exit to finish exiting.
-const EXIT_SETTLE: Duration = Duration::from_millis(100);
+/// How long the fixture waits, at most, for a thread it let exit to finish
+/// exiting.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main()
 {
@@ -54,9 +61,12 @@ fn main()
         "worker" => worker(&arg),
         "registry-main" => registry_main(&arg),
         "registry-worker" => registry_worker(&arg),
+        "registry-declare" => registry_declare(),
         _ =>
         {
-            println!("usage: crashme vm|exception|worker|registry-main|registry-worker");
+            println!(
+                "usage: crashme vm|exception|worker|registry-main|registry-worker|registry-declare"
+            );
             std::process::exit(2);
         }
     }
@@ -146,14 +156,83 @@ fn hold_one_fault(endpoint: u64, held: &mpsc::Sender<()>) -> !
 fn registry_main(arg: &str)
 {
     let parked = [park(), park()];
-    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (watch_tx, watch_rx) = mpsc::channel();
     drop(std::thread::spawn(move || {
-        let _ = done_tx.send(());
+        let own = std::os::seraph::thread::current_thread_cap();
+        let _ = watch_tx.send(syscall::cap_derive(own, RIGHTS_THREAD_OBSERVE).ok());
     }));
-    let _ = done_rx.recv();
-    std::thread::sleep(EXIT_SETTLE);
+    let watch = watch_rx
+        .recv()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("registry-main: no watch cap on the detached thread"));
+    wait_gone(watch);
     let _keep = parked;
     fault_here(arg, Mode::Exception);
+}
+
+/// Wait until the thread `watch` observes has exited, or the cap is gone
+/// (the reaper's reclaim revokes it), at most [`EXIT_TIMEOUT`].
+fn wait_gone(watch: u64)
+{
+    let start = Instant::now();
+    while syscall::cap_info(watch, CAP_INFO_THREAD_STATE)
+        .is_ok_and(|packed| (packed >> 32) as u32 != THREAD_STATE_EXITED)
+    {
+        if start.elapsed() > EXIT_TIMEOUT
+        {
+            fail("a detached thread did not exit");
+        }
+        let _ = syscall::thread_yield();
+    }
+}
+
+/// Check that `DECLARE_NO_DEBUG` unbinds a registered thread's crash
+/// binding, which procmgr made under a badge of the thread's own, with the
+/// main thread's. Exits 0 when it does, 1 when it does not.
+fn registry_declare()
+{
+    let (cap_tx, cap_rx) = mpsc::channel();
+    let (stop, parked) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let _ = cap_tx.send(std::os::seraph::thread::current_thread_cap());
+        let _ = parked.recv();
+    });
+    let thread = cap_rx
+        .recv()
+        .unwrap_or_else(|_| fail("registry-declare: no thread cap"));
+    let main = std::os::seraph::thread::current_thread_cap();
+    let binding = |cap| {
+        syscall::thread_get_fault_handler(cap, FAULT_CLASS_EXCEPTION)
+            .ok()
+            .flatten()
+    };
+    let (main_before, thread_before) = (binding(main), binding(thread));
+    let procmgr = std::os::seraph::startup_info().procmgr_endpoint;
+    // SAFETY: the main thread's registered IPC buffer page.
+    let declared = unsafe {
+        ipc::ipc_call(
+            procmgr,
+            &IpcMessage::new(procmgr_labels::DECLARE_NO_DEBUG),
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .is_ok_and(|r| r.label == procmgr_errors::SUCCESS);
+    let (main_after, thread_after) = (binding(main), binding(thread));
+    let _ = stop.send(());
+    let _ = worker.join();
+    let pass = declared
+        && main_before.is_some()
+        && thread_before.is_some()
+        && thread_before != main_before
+        && main_after.is_none()
+        && thread_after.is_none();
+    println!(
+        "registry-declare: {} (main {main_before:x?} -> {main_after:x?}, thread {thread_before:x?} \
+         -> {thread_after:x?}, declared {declared})",
+        if pass { "PASS" } else { "FAIL" }
+    );
+    std::process::exit(i32::from(!pass));
 }
 
 /// Fault on a spawned thread after joining its sibling, which the attach

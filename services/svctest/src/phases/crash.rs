@@ -19,8 +19,9 @@
 //! that exited, and `crashme registry-worker`, whose spawned thread faults
 //! under a crash badge of its own, which names its process and the thread,
 //! its joined sibling no longer listed. procmgr then refuses a registration
-//! from svctest, which declared itself undebuggable. It then ends the helper, after which procmgr takes the endpoint
-//! back: a `crashme exception` child it spawns dies of its fault though
+//! from svctest, which declared itself undebuggable. It then ends the
+//! helper, after which procmgr takes the endpoint back: a
+//! `crashme exception` child it spawns dies of its fault though
 //! svctest receives nothing. A second registration then succeeds, and is
 //! given back the same way. With crashd staged (a manual boot, or burn-in's
 //! svctest cell, which keeps the default crashd staging) the endpoint is

@@ -5,7 +5,8 @@
 
 //! Per-program tester for `/programs/crashme`. Runs it in each mode the
 //! crash-report check reads, `vm`, `exception`, and `worker`, and checks
-//! that it reached its fault and died of it:
+//! that it reached its fault and died of it (and runs `registry-declare`,
+//! which faults on nothing, checking that it passed):
 //! a non-clean exit whose reason is a fault class, so the crash service's
 //! decline ended the thread as the kernel would have. The report block each
 //! death leaves in the log is checked host-side, from the boot's serial log,
@@ -73,10 +74,27 @@ fn check(mode: &str)
     }
 }
 
+/// Run `/programs/crashme registry-declare`, which faults on nothing, and
+/// check that it passed: its declaration unbound a registered thread's crash
+/// binding with the main thread's.
+fn check_declare()
+{
+    let out = Command::new("/programs/crashme")
+        .arg("registry-declare")
+        .output()
+        .expect("run /programs/crashme registry-declare");
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || !text.contains("registry-declare: PASS")
+    {
+        fail(&format!("registry-declare: {}: {text:?}", out.status));
+    }
+}
+
 fn main()
 {
     check("vm");
     check("exception");
     check("worker");
+    check_declare();
     println!("[crashme-tester] PASS");
 }

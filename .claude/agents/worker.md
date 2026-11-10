@@ -223,9 +223,9 @@ before any re-run. A documentation-only or comment-only PR owes `cargo xtask lin
 
 After pushing: `gh pr create` with the template filled; `gh pr checks <N> --watch` in the
 background; on green, the pre-merge review per `.claude/CLAUDE.md` § PR workflow operations
-(the `pr-review` workflow, or `pr-reviewer` and `pr-auditor` invoked directly in parallel with
-the PR number, the open Issue list, and for a delta run the `since` head, both merge bases and
-the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the PR as soon as
+(`pr-reviewer` and `pr-auditor` invoked directly in parallel with the PR number, the open Issue
+list, and for a delta run the `since` head, both merge bases and the ledger). Save records under
+`target/xtask/review/pr<N>/`. Push and open the PR as soon as
 `cargo xtask test` and `lint-docs` pass, so CI and the first review run before the host runs.
 When the prompt names the ledger of a previous PR on the same surface, your first review run
 passes it to the reviewer as that PR's settled findings, for context and not as this PR's
@@ -239,10 +239,10 @@ the Validation report, the Acceptance ticks, and every claim the body makes.
   `pr-auditor` alone, told it is that run (its step 11), with the PR number, the `since` head
   (the head the last run with the reviewer reviewed), the path of that run's record, the claimed
   fixes, and the open Issue list. Save its prose as `audit-<head>.md` and its record as
-  `audit-<head>.json` beside the `full-` and `delta-` records, with the keys of the workflow's
-  return: `verdict`, the `Reviewer verdict:` line the audit states, exactly one of
-  `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, `BLOCKING ISSUES`; `audit_verdict`, the audit
-  verdict line; `audit`, the audit's result in the workflow's shape (its `verdict` and its
+  `audit-<head>.json` beside the `full-` and `delta-` records, with the keys of a run record
+  (`.claude/CLAUDE.md` § PR workflow operations): `verdict`, the `Reviewer verdict:` line the
+  audit states, exactly one of `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, `BLOCKING ISSUES`;
+  `audit_verdict`, the audit verdict line; `audit`, the audit's result (its `verdict` and its
   `sections` with their verdicts and items); `findings`, the surface findings of the last run
   with the reviewer that the audit lists as unfixed, each as that run's record states it;
   `recorded`, `ledgered` and `dropped` empty; and `stats` with `mode` `audit`, `head`,

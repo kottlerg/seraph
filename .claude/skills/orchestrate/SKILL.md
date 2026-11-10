@@ -10,8 +10,8 @@ You are the orchestrator: one session that plans a batch of Issues, spawns one `
 exclusive grant), orders merges to minimize re-validation, carries the workers' questions to the
 maintainer, files the Issues the maintainer approves, and executes merges the maintainer has
 decided. You write no project code yourself; mechanical steps a worker cannot finish (a
-validation run after its session ended, a history rewrite the maintainer asked for) are the
-exception, and each is recorded.
+validation run after its session ended, a history rewrite the maintainer asked for, the release
+host runs of § Release review) are the exception, and each is recorded.
 
 Everything in this file applies `.claude/CLAUDE.md`, docs/conventions.md and docs/testing.md;
 nothing in it grants an authority those documents reserve to the maintainer. Three decisions
@@ -38,7 +38,7 @@ Until an answer arrives, each case below is a prompt to the maintainer when it c
    off a PR's surface.
 
 Three rules the maintainer has stated stand without a question. Outside the milestone moves of
-docs/conventions.md § Release Production step 7, you move an Issue to a later milestone only on
+docs/conventions.md § Release Production step 8, you move an Issue to a later milestone only on
 a clear and hard dependency on another Issue. A deferral that needs real hardware is work no
 release has scheduled, filed as an Issue without a milestone, as § Milestones allows for such
 work. And you keep a rolling `<scope>: defects found by review` Issue open as the scope's
@@ -61,7 +61,7 @@ allows: it conditions closing, it does not require it.
    id, branch, validated head and next step, the merge order, and the rolling Issues. Below
    it, every grant, merge, ruling, filed Issue, spawn and agent id is appended as a
    timestamped one-line log entry. After a context compaction the record is the state.
-4. Schedule the watchdog (`CronCreate`, every 20 minutes) with this prompt:
+4. Schedule the watchdog (`CronCreate`, every hour) with this prompt:
    "Orchestration watchdog tick: run one shell command that prints the `## ACTIVE GRANT`
    block of `target/xtask/orchestration/<date>.md`, `cat /proc/loadavg`,
    `pgrep -af qemu-system`, `git worktree list`, and each open PR's `mergeStateStatus` and
@@ -74,9 +74,9 @@ allows: it conditions closing, it does not require it.
    PR at its gate is dead: log it, send it the stand-down message and end its task where the
    harness allows (§ Spawn), and respawn it with its plan and every answer already given
    folded into the prompt. Note any PR at its gate (clean verdicts, CI green) that is waiting
-   on a merge. Log the tick as one line in the record. Do nothing else." The tick is that one
-   shell command, that one `ListAgents` call and that one log line. Cancel the watchdog when
-   the batch ends.
+   on a merge. Log the tick as one line in the record. Take no action this prompt does not
+   name." Beyond the ping, grant and respawn it names, the tick is that one shell command,
+   that one `ListAgents` call and that one log line. Cancel the watchdog when the batch ends.
 5. Drain rolling and follow-up Issues in waves on scopes that do not overlap the in-flight
    PRs, started alongside them, never by interrupting in-flight work. New work produces new
    rolling items, so the drain is continuous.
@@ -259,8 +259,8 @@ decision, or a case with no clearly best option waits for the maintainer.
 - `.claude/CLAUDE.md` edits need the maintainer's own words. A worker whose change has a copy
   there reports it and holds its push; you carry the copy to the maintainer, who applies it or
   authorizes the worker in their own words, which you pass on verbatim.
-- A finding two independent refuters refute is dropped (that section); a finding the workers
-  cannot place is put to the maintainer with your recommendation, in one line.
+- A finding the workers cannot place is put to the maintainer with your recommendation, in one
+  line.
 
 ## Issues
 
@@ -315,6 +315,34 @@ record each removal in the record file with the worktree's size (`du -sh <path>`
 it). It is a `git worktree` procedure and not an `xtask` command, since the worktrees sit under
 `.claude/`, outside the sysroot and `target/` that `cargo xtask clean` removes
 (`xtask/README.md` § `cargo xtask clean`).
+
+## Release review
+
+When the current milestone is ready to close, you run the release review of docs/conventions.md
+§ Release Production; workers cannot call the Workflow tool, so it is the one review this session
+runs as a workflow. The workflow's agents (`release-verifier`, `release-auditor`, `pr-reviewer`)
+resolve from the agent definitions the session loaded when it started, so run it in a session
+started after those files are on the checked-out branch.
+
+- `git fetch origin` and check out `origin/master`, clean, in your checkout. Run
+  `Workflow({name: "release-review", args: {mode: "scope", from: "<previous tag>", version:
+  "<X.Y.Z>"}})` and read the plan (its shards, lenses and agent count), then the same with
+  `mode: "full"`. When the script changed since the session loaded it, pass `scriptPath` with
+  the file's path instead of `name`.
+- Save each run's report as `target/xtask/review/release-v<X.Y.Z>/<mode>-<head>.md`, the
+  returned object as `<mode>-<head>.json` beside it (the next run's ledger reads it), and on
+  `RELEASE READY` the `notes` field as `notes-<head>.md`; surface both verdict lines to the
+  maintainer verbatim.
+- `RELEASE BLOCKED`: each blocking finding goes to a worker as a fix PR (§ Spawn), a `[carried]`
+  entry and a fresh entry beside it that state the same defect counting as one, each audit
+  failure to its fix, and you record every other finding as step 2 of that section says; then
+  run `mode: "delta"` with `since` the head the last run reviewed.
+- `RELEASE READY` before the bump: a worker opens the release PR from the draft (step 3). Once
+  it merges, run the release host runs (step 4) yourself, as an exclusive grant to yourself
+  (§ Exclusive grant), and write their report to
+  `target/xtask/review/release-v<X.Y.Z>/host-runs.md`; then run `mode: "delta"` with
+  `host_runs` that path. `RELEASE READY` at the bumped head is a tag prompt to the maintainer
+  (step 5).
 
 ## Hand-off and wind-down
 

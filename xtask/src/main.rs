@@ -14,6 +14,7 @@
 //!    `cli.rs`.
 //! 2. Create `commands/<name>.rs` with a `pub fn run(ctx, args) -> Result<()>`,
 //!    or add a `pub fn run_<name>` to the module that holds its sibling commands.
+//!    (`hook::run` returns nothing: a hook answers every event and never fails.)
 //! 3. Add a match arm in `main` below.
 //! 4. Re-export the module in `commands/mod.rs`.
 

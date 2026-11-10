@@ -19,18 +19,19 @@
 //!   worktree the harness would remove (`.claude/agents/worker.md`
 //!   § Reporting);
 //! - `compact-start`, after a compaction: names what to read again, and adds
-//!   the batch's state for the session that runs it;
+//!   the batch's state for the orchestrator;
 //! - `pre-compact`, before one: the instructions for the summary.
 //!
 //! A hook that fails must not stop a session. An event this command cannot
-//! read is let through with a note on stderr, and a merge whose gate cannot
-//! be checked is put to the maintainer rather than refused.
+//! read, and a check it cannot make, is let through with a note on stderr,
+//! and a merge whose gate cannot be checked is put to the maintainer rather
+//! than refused.
 
 use std::io::Read as _;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 
 use crate::cli::{HookArgs, HookEvent};
@@ -81,6 +82,12 @@ const WRAPPERS: &[(&str, &[&str], usize)] = &[
     ("exec", &[], 0),
 ];
 
+/// Shell reserved words that stand before a command in a compound command
+/// (`if ! cargo check; then …`, `for … ; do cargo test; done`).
+const RESERVED: &[&str] = &[
+    "if", "then", "else", "elif", "while", "until", "do", "!", "{",
+];
+
 /// `gh pr merge` options that take their value as the next word.
 const MERGE_VALUE_OPTIONS: &[&str] = &[
     "-b",
@@ -96,16 +103,12 @@ const MERGE_VALUE_OPTIONS: &[&str] = &[
     "--repo",
 ];
 
-/// The agent type that merges and files Issues inside a batch.
+/// The agent type that merges and files Issues inside a batch, and that
+/// holds the batch's state.
 const ORCHESTRATOR: &str = "orchestrator";
 
 /// The agent type whose stop `subagent-stop` checks.
 const WORKER: &str = "worker";
-
-/// The harness keeps a hook's context to 10,000 characters and files what
-/// is longer; the state is added only while the whole answer stays under
-/// this.
-const CONTEXT_MAX: usize = 9_000;
 
 const REREAD: &str = "The context was compacted. Before the next decision, read again from disk \
                       the agent or skill file you work under, the Issue, and your pull \
@@ -126,115 +129,70 @@ const SUMMARY_INSTRUCTIONS: &str = "Write the summary for an agent that reads it
 /// Split a shell command line into its simple commands, each a list of
 /// words. Quotes are removed; `;`, `&`, `|`, a newline, parentheses, and a
 /// command substitution each end a command, so the command inside a
-/// substitution or a subshell is one of the results. The split is as good as
-/// a scan without a shell grammar can make it: it is a guard against a
-/// mistake, not against a command written to pass it.
-pub fn simple_commands(line: &str) -> Vec<Vec<String>>
+/// substitution or a subshell is one of the results. The body of a here
+/// document is data and is skipped. The split is as good as a scan without a
+/// shell grammar can make it: it is a guard against a mistake, not against a
+/// command written to pass it.
+fn simple_commands(line: &str) -> Vec<Vec<String>>
 {
-    let chars: Vec<char> = line.chars().collect();
-    let mut scan = Scan::default();
-    // `true` for each double-quoted string the scan is inside, `false` for
-    // each subshell or substitution opened since.
-    let mut nesting: Vec<bool> = Vec::new();
-    let mut i = 0;
-    while i < chars.len()
+    let mut scan = Scan {
+        chars: line.chars().collect(),
+        ..Scan::default()
+    };
+    while let Some(c) = scan.take()
     {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        i += 1;
-        if nesting.last() == Some(&true)
+        if scan.nesting.last() == Some(&Nesting::Quoted)
         {
-            match c
-            {
-                '"' =>
-                {
-                    nesting.pop();
-                }
-                '\\' =>
-                {
-                    scan.push(next.unwrap_or('\\'));
-                    i += 1;
-                }
-                '$' if next == Some('(') =>
-                {
-                    scan.end_command();
-                    nesting.push(false);
-                    i += 1;
-                }
-                '`' => scan.end_command(),
-                _ => scan.push(c),
-            }
-            continue;
+            scan.quoted(c);
         }
-        match c
+        else
         {
-            '\'' =>
-            {
-                scan.in_word = true;
-                while i < chars.len() && chars[i] != '\''
-                {
-                    scan.word.push(chars[i]);
-                    i += 1;
-                }
-                i += 1;
-            }
-            '"' =>
-            {
-                scan.in_word = true;
-                nesting.push(true);
-            }
-            '\\' =>
-            {
-                // A backslash before a newline continues the line.
-                if next != Some('\n')
-                {
-                    scan.push(next.unwrap_or('\\'));
-                }
-                i += 1;
-            }
-            '#' if !scan.in_word =>
-            {
-                while i < chars.len() && chars[i] != '\n'
-                {
-                    i += 1;
-                }
-            }
-            '$' if next == Some('(') =>
-            {}
-            '(' =>
-            {
-                scan.end_command();
-                nesting.push(false);
-            }
-            ')' =>
-            {
-                scan.end_command();
-                if nesting.last() == Some(&false)
-                {
-                    nesting.pop();
-                }
-            }
-            '\n' | ';' | '|' | '&' | '`' => scan.end_command(),
-            c if c.is_whitespace() => scan.end_word(),
-            _ => scan.push(c),
+            scan.plain(c);
         }
     }
     scan.end_command();
     scan.commands
 }
 
+/// What the scan is inside: a double-quoted string, or a subshell or command
+/// substitution opened since.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nesting
+{
+    Quoted,
+    Subshell,
+}
+
 #[derive(Default)]
 struct Scan
 {
+    chars: Vec<char>,
+    at: usize,
     commands: Vec<Vec<String>>,
     words: Vec<String>,
     word: String,
     /// A word has begun; an empty quoted string is still a word.
     in_word: bool,
+    nesting: Vec<Nesting>,
+    /// The delimiters of the here documents whose bodies follow the next
+    /// newline, each with whether leading tabs are stripped (`<<-`).
+    heredocs: Vec<(String, bool)>,
 }
 
 impl Scan
 {
+    fn peek(&self) -> Option<char>
+    {
+        self.chars.get(self.at).copied()
+    }
+
+    fn take(&mut self) -> Option<char>
+    {
+        let c = self.peek()?;
+        self.at += 1;
+        Some(c)
+    }
+
     fn push(&mut self, c: char)
     {
         self.word.push(c);
@@ -258,6 +216,160 @@ impl Scan
             self.commands.push(std::mem::take(&mut self.words));
         }
     }
+
+    /// One character inside a double-quoted string.
+    fn quoted(&mut self, c: char)
+    {
+        match c
+        {
+            '"' =>
+            {
+                self.nesting.pop();
+            }
+            '\\' =>
+            {
+                let escaped = self.take().unwrap_or('\\');
+                self.push(escaped);
+            }
+            '$' if self.peek() == Some('(') =>
+            {
+                self.at += 1;
+                self.end_command();
+                self.nesting.push(Nesting::Subshell);
+            }
+            '`' => self.end_command(),
+            _ => self.push(c),
+        }
+    }
+
+    /// One character outside quotes.
+    fn plain(&mut self, c: char)
+    {
+        match c
+        {
+            '\'' =>
+            {
+                self.in_word = true;
+                while let Some(c) = self.take().filter(|c| *c != '\'')
+                {
+                    self.word.push(c);
+                }
+            }
+            '"' =>
+            {
+                self.in_word = true;
+                self.nesting.push(Nesting::Quoted);
+            }
+            // A backslash before a newline continues the line.
+            '\\' => match self.take()
+            {
+                Some('\n') =>
+                {}
+                other => self.push(other.unwrap_or('\\')),
+            },
+            '#' if !self.in_word => self.skip_line(),
+            '$' if self.peek() == Some('(') =>
+            {}
+            '<' if self.peek() == Some('<') => self.redirect_here(),
+            '(' =>
+            {
+                self.end_command();
+                self.nesting.push(Nesting::Subshell);
+            }
+            ')' =>
+            {
+                self.end_command();
+                if self.nesting.last() == Some(&Nesting::Subshell)
+                {
+                    self.nesting.pop();
+                }
+            }
+            '\n' =>
+            {
+                self.end_command();
+                self.skip_heredoc_bodies();
+            }
+            ';' | '|' | '&' | '`' => self.end_command(),
+            c if c.is_whitespace() => self.end_word(),
+            _ => self.push(c),
+        }
+    }
+
+    /// Skip a comment: the rest of the line, leaving its newline.
+    fn skip_line(&mut self)
+    {
+        while self.peek().is_some_and(|c| c != '\n')
+        {
+            self.at += 1;
+        }
+    }
+
+    /// Read `<<` and what follows it. `<<<` is a here string, whose word is
+    /// an ordinary word; `<<` and `<<-` name the delimiter of a here
+    /// document, whose body follows the next newline.
+    fn redirect_here(&mut self)
+    {
+        self.at += 1;
+        if self.peek() == Some('<')
+        {
+            self.at += 1;
+            return;
+        }
+        let strip_tabs = self.peek() == Some('-');
+        if strip_tabs
+        {
+            self.at += 1;
+        }
+        while self.peek().is_some_and(|c| c == ' ' || c == '\t')
+        {
+            self.at += 1;
+        }
+        let mut delimiter = String::new();
+        while let Some(c) = self
+            .peek()
+            .filter(|c| !c.is_whitespace() && !";|&()".contains(*c))
+        {
+            self.at += 1;
+            if !matches!(c, '\'' | '"' | '\\')
+            {
+                delimiter.push(c);
+            }
+        }
+        if !delimiter.is_empty()
+        {
+            self.heredocs.push((delimiter, strip_tabs));
+        }
+    }
+
+    /// Skip the body of each here document that the line just ended opened:
+    /// the lines up to and including the one that is its delimiter.
+    fn skip_heredoc_bodies(&mut self)
+    {
+        for (delimiter, strip_tabs) in std::mem::take(&mut self.heredocs)
+        {
+            while self.at < self.chars.len()
+            {
+                let end = self.chars[self.at..]
+                    .iter()
+                    .position(|c| *c == '\n')
+                    .map_or(self.chars.len(), |n| self.at + n);
+                let text: String = self.chars[self.at..end].iter().collect();
+                self.at = (end + 1).min(self.chars.len());
+                let text = if strip_tabs
+                {
+                    text.trim_start_matches('\t')
+                }
+                else
+                {
+                    text.as_str()
+                };
+                if text == delimiter
+                {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// `NAME=value`, the form of a variable assignment before a command.
@@ -276,13 +388,15 @@ fn base_name(word: &str) -> &str
     word.rsplit('/').next().unwrap_or(word)
 }
 
-/// The program a simple command runs and its arguments, behind any variable
-/// assignments and the wrappers of `WRAPPERS`.
-pub fn program(mut words: &[String]) -> &[String]
+/// The program a simple command runs and its arguments, behind any reserved
+/// words, variable assignments, and the wrappers of `WRAPPERS`.
+fn program(mut words: &[String]) -> &[String]
 {
     loop
     {
-        while words.first().is_some_and(|w| is_assignment(w))
+        while words
+            .first()
+            .is_some_and(|w| is_assignment(w) || RESERVED.contains(&w.as_str()))
         {
             words = &words[1..];
         }
@@ -297,41 +411,42 @@ pub fn program(mut words: &[String]) -> &[String]
         {
             return words;
         };
-        let mut rest = &words[1..];
-        let mut operands = *operands;
-        loop
-        {
-            let Some(word) = rest.first()
-            else
-            {
-                return rest;
-            };
-            if value_options.contains(&word.as_str())
-            {
-                rest = rest.get(2..).unwrap_or(&[]);
-            }
-            else if word.starts_with('-') || is_assignment(word)
-            {
-                rest = &rest[1..];
-            }
-            else if operands > 0
-            {
-                operands -= 1;
-                rest = &rest[1..];
-            }
-            else
-            {
-                break;
-            }
-        }
-        words = rest;
+        words = wrapped(&words[1..], value_options, *operands);
     }
+}
+
+/// The command a wrapper runs: `rest`, the words after the wrapper's name,
+/// behind its options, its assignments, and `operands` operands.
+fn wrapped<'a>(mut rest: &'a [String], value_options: &[&str], mut operands: usize)
+-> &'a [String]
+{
+    while let Some(word) = rest.first()
+    {
+        if value_options.contains(&word.as_str())
+        {
+            rest = rest.get(2..).unwrap_or(&[]);
+        }
+        else if word.starts_with('-') || is_assignment(word)
+        {
+            rest = &rest[1..];
+        }
+        else if operands > 0
+        {
+            operands -= 1;
+            rest = &rest[1..];
+        }
+        else
+        {
+            break;
+        }
+    }
+    rest
 }
 
 /// The subcommand a `cargo` invocation runs, given the words after `cargo`,
 /// and the words after it. `None` when the invocation only prints (a query
 /// option, or no subcommand).
-pub fn cargo_subcommand(args: &[String]) -> Option<(&str, &[String])>
+fn cargo_subcommand(args: &[String]) -> Option<(&str, &[String])>
 {
     let mut i = 0;
     while let Some(word) = args.get(i)
@@ -405,7 +520,7 @@ fn merge_number(args: &[String]) -> Option<u64>
 
 /// What a simple command does that a rule is about.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Act
+enum Act
 {
     /// A `cargo` subcommand outside `CARGO_ALLOWED`.
     Cargo(String),
@@ -416,7 +531,7 @@ pub enum Act
 }
 
 /// The act of a simple command, or `None` when no rule is about it.
-pub fn act(words: &[String]) -> Option<Act>
+fn act(words: &[String]) -> Option<Act>
 {
     let words = program(words);
     let (name, args) = words.split_first()?;
@@ -434,8 +549,10 @@ pub fn act(words: &[String]) -> Option<Act>
         }
         "gh" => match gh_command(args)?
         {
-            ("pr", "merge", rest) => Some(Act::Merge(merge_number(rest))),
-            ("issue", "create" | "new", _) => Some(Act::File("gh issue create")),
+            // A request for the command's help merges nothing.
+            ("pr", "merge", rest) => (!rest.iter().any(|w| w == "-h" || w == "--help"))
+                .then(|| Act::Merge(merge_number(rest))),
+            ("issue", "create", _) => Some(Act::File("gh issue create")),
             _ => None,
         },
         _ => None,
@@ -446,7 +563,7 @@ pub fn act(words: &[String]) -> Option<Act>
 
 /// A hook's answer to a tool call.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Answer
+enum Answer
 {
     /// The harness decides as if no hook ran.
     Pass,
@@ -458,7 +575,7 @@ pub enum Answer
 
 /// What the merge gate says about a pull request.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Gate
+enum Gate
 {
     /// No error. `release` is set when the gate names the release PR.
     Passed
@@ -471,9 +588,37 @@ pub enum Gate
     Unknown(String),
 }
 
+/// Who a tool call comes from, for the rules on merging and filing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Caller
+{
+    /// A top session, or the orchestrator: it may merge and file an Issue.
+    Trusted,
+    /// A subagent that is not the orchestrator: it does neither.
+    Restricted,
+}
+
+impl Caller
+{
+    /// The caller of `event`. The harness sets `agent_id` only inside a
+    /// subagent; a session started as an agent carries `agent_type` alone
+    /// and is a top session.
+    fn of(event: &Value) -> Caller
+    {
+        if event["agent_id"].is_string() && event["agent_type"].as_str() != Some(ORCHESTRATOR)
+        {
+            Caller::Restricted
+        }
+        else
+        {
+            Caller::Trusted
+        }
+    }
+}
+
 /// Read a `pr-check --gate` run: whether it exited with success and what it
 /// printed. A run that printed no summary line did not reach its verdict.
-pub fn read_gate(succeeded: bool, stdout: &str, stderr: &str) -> Gate
+fn read_gate(succeeded: bool, stdout: &str, stderr: &str) -> Gate
 {
     if !stdout.lines().any(|line| line.starts_with("==> pr-check:"))
     {
@@ -523,94 +668,84 @@ fn run_gate(ctx: &BuildContext, number: u64) -> Gate
     }
 }
 
-/// Whether the event comes from a subagent that is not the orchestrator:
-/// one that neither merges nor files an Issue. The harness sets `agent_id`
-/// only inside a subagent; a session started as an agent carries
-/// `agent_type` alone and is not one.
-fn is_restricted(event: &Value) -> bool
+/// The answer to a `gh pr merge` that names `number`, from what the gate
+/// says of that pull request.
+fn answer_merge(number: Option<u64>, gate: &dyn Fn(u64) -> Gate) -> Answer
 {
-    event["agent_id"].is_string() && event["agent_type"].as_str() != Some(ORCHESTRATOR)
+    let Some(number) = number
+    else
+    {
+        return Answer::Deny(
+            "name the pull request by its number (`gh pr merge <N> --merge --delete-branch`), \
+             so that its merge gate can be checked"
+                .to_owned(),
+        );
+    };
+    match gate(number)
+    {
+        Gate::Failed(errors) => Answer::Deny(format!(
+            "PR #{number} does not meet the merge condition (docs/conventions.md § Pre-merge \
+             review); `cargo xtask pr-check {number} --gate` reports:\n{}",
+            errors.join("\n")
+        )),
+        Gate::Unknown(why) => Answer::Ask(format!(
+            "the merge gate of PR #{number} could not be checked ({why}); merge only if the PR \
+             meets the merge condition"
+        )),
+        Gate::Passed { release: true } => Answer::Ask(format!(
+            "PR #{number} is the release PR: its merge needs the maintainer's approval \
+             (docs/conventions.md § Pre-merge review)"
+        )),
+        Gate::Passed { release: false } => Answer::Pass,
+    }
+}
+
+/// The answer to one act of a shell command.
+fn answer_act(act: Act, caller: Caller, gate: &dyn Fn(u64) -> Gate) -> Answer
+{
+    match (act, caller)
+    {
+        (Act::Cargo(subcommand), _) => Answer::Deny(format!(
+            "`cargo {subcommand}` is not run directly: build, run, clean and test only through \
+             `cargo xtask` (.claude/CLAUDE.md § Tooling constraints; xtask/README.md lists the \
+             commands)"
+        )),
+        (Act::File(what), Caller::Restricted) => Answer::Deny(format!(
+            "`{what}` is the orchestrator's: draft the Issue body in the scratchpad and name \
+             its path (.claude/agents/worker.md § Reporting)"
+        )),
+        (Act::File(_), Caller::Trusted) => Answer::Pass,
+        (Act::Merge(_), Caller::Restricted) => Answer::Deny(
+            "a worker never merges: hand back the gate report with the merge command \
+             (.claude/agents/worker.md § Gate)"
+                .to_owned(),
+        ),
+        (Act::Merge(number), Caller::Trusted) => answer_merge(number, gate),
+    }
 }
 
 /// The answer to a shell command: the first refusal among its simple
 /// commands, else a question when one of them needs the maintainer, else a
 /// pass.
-pub fn answer_bash(command: &str, restricted: bool, gate: &dyn Fn(u64) -> Gate) -> Answer
+fn answer_bash(command: &str, caller: Caller, gate: &dyn Fn(u64) -> Gate) -> Answer
 {
-    let mut ask = None;
+    let mut answer = Answer::Pass;
     for words in simple_commands(command)
     {
-        match act(&words)
+        match act(&words).map(|act| answer_act(act, caller, gate))
         {
-            Some(Act::Cargo(subcommand)) =>
-            {
-                return Answer::Deny(format!(
-                    "`cargo {subcommand}` is not run directly: build, run, clean and test only \
-                     through `cargo xtask` (.claude/CLAUDE.md § Tooling constraints; \
-                     xtask/README.md lists the commands)"
-                ));
-            }
-            Some(Act::File(what)) if restricted =>
-            {
-                return Answer::Deny(format!(
-                    "`{what}` is the orchestrator's: draft the Issue body in the scratchpad and \
-                     name its path (.claude/agents/worker.md § Reporting)"
-                ));
-            }
-            None | Some(Act::File(_)) =>
+            Some(deny @ Answer::Deny(_)) => return deny,
+            Some(ask @ Answer::Ask(_)) => answer = ask,
+            Some(Answer::Pass) | None =>
             {}
-            Some(Act::Merge(_)) if restricted =>
-            {
-                return Answer::Deny(
-                    "a worker never merges: hand back the gate report with the merge command \
-                     (.claude/agents/worker.md § Gate)"
-                        .to_owned(),
-                );
-            }
-            Some(Act::Merge(None)) =>
-            {
-                return Answer::Deny(
-                    "name the pull request by its number (`gh pr merge <N> --merge \
-                     --delete-branch`), so that its merge gate can be checked"
-                        .to_owned(),
-                );
-            }
-            Some(Act::Merge(Some(number))) => match gate(number)
-            {
-                Gate::Failed(errors) =>
-                {
-                    return Answer::Deny(format!(
-                        "PR #{number} does not meet the merge condition (docs/conventions.md \
-                         § Pre-merge review); `cargo xtask pr-check {number} --gate` \
-                         reports:\n{}",
-                        errors.join("\n")
-                    ));
-                }
-                Gate::Unknown(why) =>
-                {
-                    ask = Some(format!(
-                        "the merge gate of PR #{number} could not be checked ({why}); merge \
-                         only if the PR meets the merge condition"
-                    ));
-                }
-                Gate::Passed { release: true } =>
-                {
-                    ask = Some(format!(
-                        "PR #{number} is the release PR: its merge needs the maintainer's \
-                         approval (docs/conventions.md § Pre-merge review)"
-                    ));
-                }
-                Gate::Passed { release: false } =>
-                {}
-            },
         }
     }
-    ask.map_or(Answer::Pass, Answer::Ask)
+    answer
 }
 
 /// The JSON the harness reads for `answer` to a `PreToolUse` event, or
 /// `None` for a pass, which prints nothing.
-pub fn bash_output(answer: &Answer) -> Option<Value>
+fn bash_output(answer: &Answer) -> Option<Value>
 {
     let (decision, reason) = match answer
     {
@@ -629,26 +764,53 @@ pub fn bash_output(answer: &Answer) -> Option<Value>
 
 // ── The worker's stop ─────────────────────────────────────────────────────────
 
-/// Run `git <args>` in `dir`: its trimmed stdout, or `None` when it fails.
-fn git(dir: &Path, args: &[&str]) -> Option<String>
+/// Run `git <args>` in `dir` and return its trimmed stdout.
+fn git(dir: &Path, args: &[&str]) -> Result<String>
 {
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
         .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .context("failed to launch git")?;
+    if !output.status.success()
+    {
+        bail!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Whether `dir` is on a branch. `git symbolic-ref -q` exits with 1, and
+/// prints nothing, on a detached HEAD; any other failure is an error.
+fn on_a_branch(dir: &Path) -> Result<bool>
+{
+    let output = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .context("failed to launch git")?;
+    match output.status.code()
+    {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git symbolic-ref failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
 }
 
 /// Why a worker must not hand back from the worktree `dir`, if it must not
 /// (`.claude/agents/worker.md` § Reporting): the worktree is on a detached
 /// HEAD, or it does not differ from `origin/master`, in which case the
-/// harness removes it. `None` for a directory that is not a linked worktree,
-/// and whenever git cannot answer.
-pub fn stop_problem(dir: &Path) -> Option<String>
+/// harness removes it. `None` for a directory that is the main checkout,
+/// which the harness does not remove.
+fn stop_problem(dir: &Path) -> Result<Option<String>>
 {
     let git_dir = git(dir, &["rev-parse", "--absolute-git-dir"])?;
     let common = git(
@@ -657,51 +819,63 @@ pub fn stop_problem(dir: &Path) -> Option<String>
     )?;
     if git_dir == common
     {
-        return None;
+        return Ok(None);
     }
-    if git(dir, &["symbolic-ref", "-q", "HEAD"]).is_none()
+    if !on_a_branch(dir)?
     {
-        return Some(
+        return Ok(Some(
             "the worktree is on a detached HEAD: check out your branch before the hand-back \
              (`git status -sb`)"
                 .to_owned(),
-        );
+        ));
     }
     let ahead = git(dir, &["rev-list", "--count", "origin/master..HEAD"])?;
     let edits = git(dir, &["status", "--porcelain", "--untracked-files=no"])?;
-    (ahead == "0" && edits.is_empty()).then(|| {
+    Ok((ahead == "0" && edits.is_empty()).then(|| {
         "the worktree does not differ from `origin/master`, so the harness removes it when the \
          turn ends and you cannot be resumed: commit the work in progress, or make one empty \
          local commit and say so. When your PR is merged and nothing is left for you, stop \
          again."
             .to_owned()
-    })
+    }))
 }
 
 /// The answer to a `SubagentStop` event: a block, with the reason as the
 /// worker's next instruction, or `None`. The check is made once per stop
 /// (`stop_hook_active` is set when a hook has already blocked it), so a
-/// worker that cannot satisfy it still stops.
-pub fn stop_output(event: &Value) -> Option<Value>
+/// worker that cannot satisfy it still stops. An event that names no
+/// directory, and a check git cannot make, lets the stop through.
+fn stop_output(event: &Value) -> Option<Value>
 {
     if event["agent_type"].as_str() != Some(WORKER) || event["stop_hook_active"] == true
     {
         return None;
     }
-    let reason = stop_problem(Path::new(event["cwd"].as_str()?))?;
-    Some(json!({ "decision": "block", "reason": reason }))
+    let dir = event["cwd"].as_str()?;
+    match stop_problem(Path::new(dir))
+    {
+        Ok(problem) => problem.map(|reason| json!({ "decision": "block", "reason": reason })),
+        Err(err) =>
+        {
+            note(&format!(
+                "the worktree could not be checked ({err:#}); the stop is let through"
+            ));
+            None
+        }
+    }
 }
 
 // ── Compaction ────────────────────────────────────────────────────────────────
 
 /// The context a session gets after a compaction: what to read again, and
-/// the batch's state when `state` holds it and the whole stays short enough
-/// for the harness to pass on.
-pub fn compact_context(state: Option<&str>) -> String
+/// the batch's state when `state` holds it. `orch state` keeps its text
+/// short enough for the two to pass the harness's limit on a hook's context
+/// together (`orch::STATE_TEXT_MAX`); a longer one is named, not added.
+fn compact_context(state: Option<&str>) -> String
 {
     match state
     {
-        Some(state) if REREAD.len() + state.len() <= CONTEXT_MAX =>
+        Some(state) if state.len() <= orch::STATE_TEXT_MAX =>
         {
             format!("{REREAD}\n\nThe state of the orchestration batch:\n\n{state}")
         }
@@ -713,27 +887,43 @@ pub fn compact_context(state: Option<&str>) -> String
     }
 }
 
-/// The JSON the harness reads for a `SessionStart` event.
-fn compact_output(ctx: &BuildContext, event: &Value) -> Value
+/// The JSON the harness reads for the `SessionStart` event `event`. Only
+/// the orchestrator gets the batch's state, which `state` reads: the
+/// supervisor above it keeps none of the record in its context
+/// (`.claude/skills/orchestrate/SKILL.md`), and a worker's state is its
+/// orchestrator's to hold. A state that cannot be read is named as such.
+fn compact_output(event: &Value, state: impl FnOnce() -> Result<Option<String>>) -> Value
 {
-    // A worker's batch state is its orchestrator's to hold.
-    let state = if is_restricted(event)
+    let context = if event["agent_type"].as_str() == Some(ORCHESTRATOR)
     {
-        None
+        match state()
+        {
+            Ok(state) => compact_context(state.as_deref()),
+            Err(err) => format!(
+                "{REREAD}\n\nThe state of the orchestration batch could not be read ({err:#}); \
+                 run `cargo xtask orch state`."
+            ),
+        }
     }
     else
     {
-        orch::state_text(ctx)
+        compact_context(None)
     };
     json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": compact_context(state.as_deref()),
+            "additionalContext": context,
         }
     })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
+
+/// Print a note on stderr, where the harness's debug log keeps it.
+fn note(text: &str)
+{
+    eprintln!("warning: cargo xtask hook: {text}");
+}
 
 /// The event in `raw`, what the harness wrote to stdin, or `None` with a
 /// note on stderr when it is not JSON.
@@ -744,9 +934,7 @@ fn parse_event(raw: &str) -> Option<Value>
         Ok(event) => Some(event),
         Err(err) =>
         {
-            eprintln!(
-                "warning: cargo xtask hook: the event is not JSON ({err}); it is let through"
-            );
+            note(&format!("the event is not JSON ({err}); it is let through"));
             None
         }
     }
@@ -754,7 +942,7 @@ fn parse_event(raw: &str) -> Option<Value>
 
 /// The answer to the `PreToolUse` event in `raw`. An event that cannot be
 /// read, or that carries no command, passes.
-pub fn answer_event(raw: &str, gate: &dyn Fn(u64) -> Gate) -> Answer
+fn answer_event(raw: &str, gate: &dyn Fn(u64) -> Gate) -> Answer
 {
     let Some(event) = parse_event(raw)
     else
@@ -762,12 +950,12 @@ pub fn answer_event(raw: &str, gate: &dyn Fn(u64) -> Gate) -> Answer
         return Answer::Pass;
     };
     let command = event["tool_input"]["command"].as_str().unwrap_or("");
-    answer_bash(command, is_restricted(&event), gate)
+    answer_bash(command, Caller::of(&event), gate)
 }
 
-/// Entry point for `cargo xtask hook`. It never fails: the harness treats a
-/// failing hook as an error of the session, and an event that cannot be
-/// read is let through instead.
+/// Entry point for `cargo xtask hook`. It returns no error: the harness
+/// reads a failing hook as an error of the session, so an event that cannot
+/// be read is let through instead.
 pub fn run(ctx: &BuildContext, args: &HookArgs)
 {
     if matches!(args.event, HookEvent::PreCompact)
@@ -778,7 +966,7 @@ pub fn run(ctx: &BuildContext, args: &HookArgs)
     let mut raw = String::new();
     if let Err(err) = std::io::stdin().read_to_string(&mut raw)
     {
-        eprintln!("warning: cargo xtask hook: stdin could not be read ({err})");
+        note(&format!("stdin could not be read ({err})"));
     }
     let output = match args.event
     {
@@ -787,7 +975,7 @@ pub fn run(ctx: &BuildContext, args: &HookArgs)
         HookEvent::CompactStart =>
         {
             let event = parse_event(&raw).unwrap_or(Value::Null);
-            Some(compact_output(ctx, &event))
+            Some(compact_output(&event, || orch::state_text(ctx)))
         }
         HookEvent::PreCompact => None,
     };
@@ -801,11 +989,6 @@ pub fn run(ctx: &BuildContext, args: &HookArgs)
 mod tests
 {
     use super::*;
-
-    fn words(line: &str) -> Vec<Vec<String>>
-    {
-        simple_commands(line)
-    }
 
     fn acts(line: &str) -> Vec<Act>
     {
@@ -834,7 +1017,9 @@ mod tests
     fn a_command_line_splits_at_every_operator_and_substitution()
     {
         assert_eq!(
-            words("cd a && cargo build; echo \"x $(cargo test -p y) z\" | (nice cargo run)"),
+            simple_commands(
+                "cd a && cargo build; echo \"x $(cargo test -p y) z\" | (nice cargo run)"
+            ),
             [
                 vec!["cd", "a"],
                 vec!["cargo", "build"],
@@ -850,7 +1035,7 @@ mod tests
     fn quoted_text_is_one_word_and_not_a_command()
     {
         assert_eq!(
-            words("git commit -m 'cargo build; gh pr merge 1' \"a b\" c\\ d ''"),
+            simple_commands("git commit -m 'cargo build; gh pr merge 1' \"a b\" c\\ d ''"),
             [vec![
                 "git",
                 "commit",
@@ -868,9 +1053,37 @@ mod tests
     fn a_continued_line_is_one_command()
     {
         assert_eq!(
-            words("cargo xtask run \\\n  --arch x86_64"),
+            simple_commands("cargo xtask run \\\n  --arch x86_64"),
             [vec!["cargo", "xtask", "run", "--arch", "x86_64"]]
         );
+    }
+
+    #[test]
+    fn the_body_of_a_here_document_is_not_a_command()
+    {
+        let line = "cargo xtask lint-docs && cat > notes.md <<'EOF'\ncargo test -p xtask \
+                    hook\nEOF\ncargo fmt";
+        assert_eq!(
+            simple_commands(line),
+            [
+                vec!["cargo", "xtask", "lint-docs"],
+                vec!["cat", ">", "notes.md"],
+                vec!["cargo", "fmt"],
+            ]
+        );
+        assert_eq!(acts(line), []);
+        // Two documents on one line, the second with its tabs stripped.
+        assert_eq!(
+            acts("cat <<A <<-B\ncargo build\nA\n\tcargo run\n\tB\ncargo test"),
+            [Act::Cargo("test".to_owned())]
+        );
+        // A here string is one word, and the next line is a command.
+        assert_eq!(
+            acts("cat <<< EOF\ncargo build\nEOF"),
+            [Act::Cargo("build".to_owned())]
+        );
+        // A body with no end runs to the end of the text.
+        assert_eq!(acts("cat <<EOF\ncargo build"), []);
     }
 
     #[test]
@@ -886,6 +1099,8 @@ mod tests
             "cargo",
             "cargo --list",
             "ls cargo build",
+            "gh pr merge --help",
+            "gh pr view 856",
         ]
         {
             assert_eq!(acts(line), [], "{line}");
@@ -909,6 +1124,9 @@ mod tests
             ("cd xtask && cargo test", "test"),
             ("echo $(cargo run)", "run"),
             ("cargo run -p xtask -- build", "run"),
+            ("for p in xtask kernel; do cargo test -p $p; done", "test"),
+            ("if ! cargo check; then echo bad; fi", "check"),
+            ("while true; do sleep 1; done; { cargo doc; }", "doc"),
         ]
         {
             assert_eq!(acts(line), [Act::Cargo(subcommand.to_owned())], "{line}");
@@ -916,20 +1134,22 @@ mod tests
     }
 
     #[test]
-    fn a_direct_cargo_build_is_refused_for_every_session()
+    fn a_direct_cargo_build_is_refused_for_every_caller()
     {
-        let answer = answer_bash("cd xtask && cargo test", false, &no_gate);
-        assert!(denied(&answer), "{answer:?}");
-        let Answer::Deny(reason) = answer
-        else
+        for caller in [Caller::Trusted, Caller::Restricted]
         {
-            return;
-        };
-        assert!(reason.contains("cargo xtask"), "{reason}");
-        assert_eq!(
-            answer_bash("cargo xtask test", true, &no_gate),
-            Answer::Pass
-        );
+            let answer = answer_bash("cd xtask && cargo test", caller, &no_gate);
+            let Answer::Deny(reason) = answer
+            else
+            {
+                panic!("a direct cargo test is refused");
+            };
+            assert!(reason.contains("cargo xtask"), "{reason}");
+            assert_eq!(
+                answer_bash("cargo xtask test", caller, &no_gate),
+                Answer::Pass
+            );
+        }
     }
 
     #[test]
@@ -945,7 +1165,6 @@ mod tests
         );
         assert_eq!(acts("gh pr merge --merge"), [Act::Merge(None)]);
         assert_eq!(acts("gh pr merge my-branch"), [Act::Merge(None)]);
-        assert_eq!(acts("gh pr view 856"), []);
     }
 
     #[test]
@@ -957,45 +1176,63 @@ mod tests
             "cargo xtask issue-file --title t --body-file f",
         ]
         {
-            assert!(denied(&answer_bash(line, true, &no_gate)), "{line}");
+            assert!(
+                denied(&answer_bash(line, Caller::Restricted, &no_gate)),
+                "{line}"
+            );
         }
         for line in [
             "gh issue create --title t",
             "cargo xtask issue-file --title t --body-file f",
         ]
         {
-            assert_eq!(answer_bash(line, false, &no_gate), Answer::Pass, "{line}");
+            assert_eq!(
+                answer_bash(line, Caller::Trusted, &no_gate),
+                Answer::Pass,
+                "{line}"
+            );
         }
     }
 
     #[test]
     fn only_a_subagent_that_is_not_the_orchestrator_is_restricted()
     {
-        assert!(is_restricted(
-            &json!({"agent_id": "a1", "agent_type": "worker"})
-        ));
-        assert!(is_restricted(&json!({"agent_id": "a1"})));
-        assert!(!is_restricted(
-            &json!({"agent_id": "a1", "agent_type": "orchestrator"})
-        ));
-        // A session started as an agent is not a subagent.
-        assert!(!is_restricted(&json!({"agent_type": "worker"})));
-        assert!(!is_restricted(&json!({})));
+        for (event, caller) in [
+            (
+                json!({"agent_id": "a1", "agent_type": "worker"}),
+                Caller::Restricted,
+            ),
+            (json!({"agent_id": "a1"}), Caller::Restricted),
+            (
+                json!({"agent_id": "a1", "agent_type": "orchestrator"}),
+                Caller::Trusted,
+            ),
+            // A session started as an agent is not a subagent.
+            (json!({"agent_type": "worker"}), Caller::Trusted),
+            (json!({}), Caller::Trusted),
+        ]
+        {
+            assert_eq!(Caller::of(&event), caller, "{event}");
+        }
     }
 
     #[test]
     fn a_merge_is_held_to_the_gate()
     {
         let line = "git fetch origin && gh pr merge 7 --merge --delete-branch";
-        assert_eq!(answer_bash(line, false, &passing), Answer::Pass);
+        assert_eq!(answer_bash(line, Caller::Trusted, &passing), Answer::Pass);
         let failed = |_| Gate::Failed(vec!["error gate-checks: ci: the check is FAILURE".into()]);
-        let Answer::Deny(reason) = answer_bash(line, false, &failed)
+        let Answer::Deny(reason) = answer_bash(line, Caller::Trusted, &failed)
         else
         {
             panic!("a failing gate refuses the merge");
         };
         assert!(reason.contains("gate-checks"), "{reason}");
-        assert!(denied(&answer_bash("gh pr merge --merge", false, &passing)));
+        assert!(denied(&answer_bash(
+            "gh pr merge --merge",
+            Caller::Trusted,
+            &passing
+        )));
     }
 
     #[test]
@@ -1004,14 +1241,20 @@ mod tests
         let line = "gh pr merge 7 --merge --delete-branch";
         let release = |_| Gate::Passed { release: true };
         assert!(matches!(
-            answer_bash(line, false, &release),
+            answer_bash(line, Caller::Trusted, &release),
             Answer::Ask(reason) if reason.contains("release PR")
         ));
         let unknown = |_| Gate::Unknown("error: gh pr view failed: no network".into());
         assert!(matches!(
-            answer_bash(line, false, &unknown),
+            answer_bash(line, Caller::Trusted, &unknown),
             Answer::Ask(reason) if reason.contains("no network")
         ));
+        // A refusal later in the line outranks the question.
+        assert!(denied(&answer_bash(
+            "gh pr merge 7 --merge && cargo build",
+            Caller::Trusted,
+            &release
+        )));
     }
 
     #[test]
@@ -1021,6 +1264,11 @@ mod tests
         {
             assert_eq!(answer_event(raw, &no_gate), Answer::Pass, "{raw:?}");
         }
+    }
+
+    #[test]
+    fn an_event_is_answered_from_its_command_and_its_caller()
+    {
         let event = json!({"tool_input": {"command": "cargo build"}}).to_string();
         assert!(denied(&answer_event(&event, &no_gate)));
         let merge = json!({
@@ -1105,7 +1353,6 @@ mod tests
             let main = base.join("main");
             std::fs::create_dir_all(&main).unwrap();
             let tree = base.join("tree");
-            let made = Worktree { base, tree };
             for args in [
                 &["init", "-q", "-b", "master"][..],
                 &["commit", "-q", "--allow-empty", "-m", "first"],
@@ -1115,7 +1362,7 @@ mod tests
             {
                 Worktree::git_in(&main, args);
             }
-            made
+            Worktree { base, tree }
         }
 
         fn git_in(dir: &Path, args: &[&str])
@@ -1157,7 +1404,9 @@ mod tests
     fn a_worker_does_not_stop_in_a_worktree_the_harness_would_remove()
     {
         let tree = Worktree::new("unchanged");
-        let reason = stop_problem(&tree.tree).expect("an unchanged worktree is a problem");
+        let reason = stop_problem(&tree.tree)
+            .unwrap()
+            .expect("an unchanged worktree is a problem");
         assert!(reason.contains("origin/master"), "{reason}");
         let output = stop_output(&tree.event(WORKER, false)).expect("the stop is blocked");
         assert_eq!(output["decision"], "block");
@@ -1171,12 +1420,12 @@ mod tests
     {
         let tree = Worktree::new("changed");
         tree.git(&["commit", "-q", "--allow-empty", "-m", "work"]);
-        assert_eq!(stop_problem(&tree.tree), None);
+        assert_eq!(stop_problem(&tree.tree).unwrap(), None);
 
         let edited = Worktree::new("edited");
         std::fs::write(edited.tree.join("f"), "x").unwrap();
         edited.git(&["add", "f"]);
-        assert_eq!(stop_problem(&edited.tree), None);
+        assert_eq!(stop_problem(&edited.tree).unwrap(), None);
     }
 
     #[test]
@@ -1185,21 +1434,33 @@ mod tests
         let tree = Worktree::new("detached");
         tree.git(&["commit", "-q", "--allow-empty", "-m", "work"]);
         tree.git(&["checkout", "-q", "--detach"]);
-        let reason = stop_problem(&tree.tree).expect("a detached HEAD is a problem");
+        let reason = stop_problem(&tree.tree)
+            .unwrap()
+            .expect("a detached HEAD is a problem");
         assert!(reason.contains("detached"), "{reason}");
     }
 
     #[test]
-    fn a_directory_that_is_no_linked_worktree_is_not_checked()
+    fn the_main_checkout_is_not_checked()
     {
         let tree = Worktree::new("main");
-        assert_eq!(stop_problem(&tree.base.join("main")), None);
-        assert_eq!(stop_problem(&tree.base), None);
+        assert_eq!(stop_problem(&tree.base.join("main")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_stop_that_cannot_be_checked_goes_through()
+    {
+        let tree = Worktree::new("norepo");
+        // The directory above the repository is in none: git fails there.
+        assert!(stop_problem(&tree.base).is_err());
+        let event = json!({"agent_type": WORKER, "cwd": tree.base.to_str().unwrap()});
+        assert_eq!(stop_output(&event), None);
+        // An event that names no directory.
         assert_eq!(stop_output(&json!({"agent_type": WORKER})), None);
     }
 
     #[test]
-    fn the_context_after_a_compaction_carries_the_state_only_when_it_fits()
+    fn the_context_after_a_compaction_carries_a_state_that_fits()
     {
         assert_eq!(compact_context(None), REREAD);
         let short = compact_context(Some("goal: x\n"));
@@ -1207,8 +1468,63 @@ mod tests
             short.starts_with(REREAD) && short.ends_with("goal: x\n"),
             "{short}"
         );
-        let long = compact_context(Some(&"x".repeat(CONTEXT_MAX)));
+        let fits = "x".repeat(orch::STATE_TEXT_MAX);
+        assert!(compact_context(Some(&fits)).ends_with(&fits));
+        // With the state at its limit the whole stays within what the
+        // harness lets a hook add.
+        assert!(compact_context(Some(&fits)).len() <= 10_000);
+        let long = compact_context(Some(&"x".repeat(orch::STATE_TEXT_MAX + 1)));
         assert!(long.contains("cargo xtask orch state"), "{long}");
-        assert!(long.len() < CONTEXT_MAX);
+        assert!(long.len() < 1_000);
+    }
+
+    fn context_of(output: &Value) -> &str
+    {
+        assert_eq!(
+            output["hookSpecificOutput"]["hookEventName"],
+            "SessionStart"
+        );
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+    }
+
+    #[test]
+    fn only_the_orchestrator_gets_the_state_after_a_compaction()
+    {
+        let state = || Ok(Some("goal: x\n".to_owned()));
+        let orchestrator = json!({"agent_id": "a1", "agent_type": "orchestrator"});
+        assert!(context_of(&compact_output(&orchestrator, state)).ends_with("goal: x\n"));
+        for event in [
+            json!({}),
+            json!({"source": "compact"}),
+            json!({"agent_id": "a2", "agent_type": "worker"}),
+            Value::Null,
+        ]
+        {
+            let unread = || -> Result<Option<String>> { panic!("the state is not read") };
+            assert_eq!(
+                context_of(&compact_output(&event, unread)),
+                REREAD,
+                "{event}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_orchestrator_is_told_of_no_batch_and_of_a_state_that_cannot_be_read()
+    {
+        let orchestrator = json!({"agent_type": "orchestrator"});
+        assert_eq!(
+            context_of(&compact_output(&orchestrator, || Ok(None))),
+            REREAD
+        );
+        let broken = compact_output(&orchestrator, || bail!("parsing state.json"));
+        let context = context_of(&broken);
+        assert!(context.starts_with(REREAD), "{context}");
+        assert!(
+            context.contains("could not be read (parsing state.json)"),
+            "{context}"
+        );
     }
 }

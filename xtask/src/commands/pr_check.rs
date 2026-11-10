@@ -1337,7 +1337,7 @@ pub const RELEASE_APPROVAL_RULE: &str = "gate-release-approval";
 /// The release notes files among `added`, the paths a PR adds: a PR that
 /// adds `docs/releases/v<X>.<Y>.<Z>.md` is the release PR of
 /// docs/conventions.md § Release Production, step 3.
-pub fn added_release_notes<'a>(pat: &Patterns, added: &'a str) -> Vec<&'a str>
+fn added_release_notes<'a>(pat: &Patterns, added: &'a str) -> Vec<&'a str>
 {
     added
         .lines()
@@ -1347,7 +1347,7 @@ pub fn added_release_notes<'a>(pat: &Patterns, added: &'a str) -> Vec<&'a str>
 
 /// The warning for a release PR: its merge needs the maintainer's approval
 /// (docs/conventions.md § Pre-merge review), which no script can read.
-pub fn check_release_approval(pat: &Patterns, added: &str) -> Vec<Diag>
+fn check_release_approval(pat: &Patterns, added: &str) -> Vec<Diag>
 {
     added_release_notes(pat, added)
         .into_iter()
@@ -1380,7 +1380,7 @@ fn gate(
     {
         Ok(added) => out.extend(check_release_approval(pat, &added)),
         Err(err) => out.push(Diag::error(
-            RELEASE_APPROVAL_RULE,
+            "gate-added-files",
             short(head),
             format!("the files the PR adds could not be read: {err:#}"),
         )),

@@ -311,4 +311,6 @@ You are at the gate when `cargo xtask pr-check <N> --gate` passes: CI green, the
 `READY TO MERGE`, or of `NON-BLOCKING ISSUES ONLY` with every surface finding recorded and none
 contested (docs/conventions.md § Pre-merge review). Hand back the gate report with the merge
 command `gh pr merge <N> --merge --delete-branch`. The merge is the orchestrator's, on a gate
-it has verified; standalone, it is made on the maintainer's instruction.
+it has verified; standalone, it is made on the maintainer's instruction. The release PR, which
+the command names with `gate-release-approval`, also needs the maintainer's approval of its
+merge; say so in the gate report.

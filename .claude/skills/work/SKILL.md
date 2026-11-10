@@ -44,4 +44,5 @@ does when asked, as that file describes.
 
 At the gate, give both verdict lines verbatim and say that the PR meets the merge condition
 (docs/conventions.md § Pre-merge review). The maintainer's instruction to merge is the one
-decision left; merge only on it.
+decision left; merge only on it. For the release PR, which the gate names with
+`gate-release-approval`, that instruction is also the approval its merge needs.

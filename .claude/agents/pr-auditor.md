@@ -27,15 +27,15 @@ claims.
     it prints as a FAIL in the section it belongs to. Of its warnings, only
     the `commit-*-columns` ones are SHOULD departures, which step 8 treats;
     the others (`pr-closes-and-refs`, `pr-closing-in-prose`,
-    `commit-planning-label`, `gate-findings-recorded`,
-    `gate-release-approval`) mark a case a script cannot decide: read each
+    `commit-planning-label`) mark a case a script cannot decide: read each
     and FAIL it only when the rule it names is broken. The command decides
-    what a script can: the unticked boxes of step 4; in step 5, the closing references,
-    the unticked acceptance boxes and the milestone of each closed Issue,
-    and the `(fixed by PR #N)` ticks; the commit-message rules of step 8
-    that have a fixed form; and in step 9, that the validated head is the
-    head or that the delta since it alters only comment lines. Do not
-    re-derive those by hand. Spend your read on what it cannot decide:
+    what a script can: the unticked boxes of step 4; in step 5, the closing
+    references, the unticked acceptance boxes and the milestone of each
+    closed Issue, and the `(fixed by PR #N)` ticks; the commit-message
+    rules of step 8 that have a fixed form; and in step 9, that the
+    validated head is the head or that the delta since it alters only
+    comment lines. Do not re-derive those by hand.
+    Spend your read on what it cannot decide:
     whether the diff delivers each criterion, whether the body's claims
     match the diff, silent deferrals, test-plan evidence, planning labels,
     and which local host runs the diff owes.
@@ -265,5 +265,5 @@ Any FAIL section forces `AUDIT FAIL`.
 
 Read-only. Read files with `Read` and search with `Grep` and `Glob`. `Bash` is for `git` and
 `gh` read-only subcommands and `cargo xtask pr-check`, and for a `grep`/`find`/`rg`-class shell
-utility only where those tools cannot do the search. No `gh pr edit`,
-`gh issue edit`, `gh pr merge`, `git commit`, `git push`. You report; you do not act.
+utility only where those tools cannot do the search. No `gh pr edit`, `gh issue edit`,
+`gh pr merge`, `git commit`, `git push`. You report; you do not act.

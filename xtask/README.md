@@ -965,6 +965,7 @@ fails the gate.
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
 | `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
+| `gate-added-files` | error | The files the PR adds can be read from the clone, which the next rule needs. |
 | `gate-release-approval` | warning | The PR adds no `docs/releases/v<X>.<Y>.<Z>.md`. One that does is the release PR of § Release Production, whose merge needs the maintainer's approval (§ Pre-merge review); the command cannot read an approval, so it names the PR for its reader. |
 | `gate-findings-recorded` | warning | That record leaves no finding on the surface that needs a reader: one an Issue must record (a class other than `style`, or a MUST violation; § Recording findings), or one of any class whose `status` is `contested`. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each counted finding is recorded and none is contested; the command cannot. |
 
@@ -1088,7 +1089,7 @@ appends a line for an event that changes no state.
 | Subcommand | Effect |
 |---|---|
 | `start` | Creates the state and the log's first line. Refuses while a state exists. |
-| `state` | Prints the state as text: goal, log, orchestrator, grant and queue, each worker, merge order, open questions, rulings. It warns on stderr when the text passes 10,000 bytes, which keeps it within the 10,000 characters a hook may add to a session's context; `worker --remove` and `question close` shorten it. `--json` prints the stored file. |
+| `state` | Prints the state as text: goal, log, orchestrator, grant and queue, each worker, merge order, open questions, rulings. It warns on stderr when the text passes 9,500 bytes, which keeps it, below the reminder `hook compact-start` puts above it, within the 10,000 characters a hook may add to a session's context; `worker --remove` and `question close` shorten it. `--json` prints the stored file. |
 | `orchestrator` | Records the agent id workers report to. Without an id, prints the recorded one and changes nothing. |
 | `worker` | Sets the named fields of a worker, creating the worker when it is new, and with `--status` the time of that report, which `state` prints beside it; fields it does not name keep their value. A phase is one of `planning`, `coding`, `review`, `gate`, `merged`, `retired`, `dead`. `--remove` drops the worker. |
 | `grant set` | Records the exclusive grant and takes its holder out of the queue. Refuses while a grant is outstanding. |
@@ -1120,23 +1121,28 @@ cargo xtask hook pre-compact
 |---|---|---|
 | `bash` | `PreToolUse` of the Bash tool | Refuses, asks the maintainer, or prints nothing, per the table below. |
 | `subagent-stop` | `SubagentStop` of a `worker` agent | Blocks the stop, once, when the directory the event names is a linked worktree on a detached HEAD, or one with no commit ahead of `origin/master` and no edit to a tracked file: the harness removes such a worktree, and the worker cannot be resumed (`.claude/agents/worker.md` § Reporting). The reason becomes the worker's next instruction. |
-| `compact-start` | `SessionStart` after a compaction | Adds to the session's context what to read again from disk. For the top session and the orchestrator it adds the text of `cargo xtask orch state` while a batch is open, or the command's name when that text would pass the 10,000 characters the harness keeps. |
+| `compact-start` | `SessionStart` after a compaction | Adds to the session's context what to read again from disk. For the orchestrator it adds the text of `cargo xtask orch state` while a batch is open: the command's name in its place when the text is over the 9,500 bytes `orch state` keeps to, and a note when the state cannot be read. No other session gets the state, since the supervisor keeps none of the record in its context. |
 | `pre-compact` | `PreCompact` | Prints the instructions for the compaction summary: keep what no file holds, leave out what the files hold. |
 
 `bash` splits the command line into its simple commands (at `;`, `&`, `|`, a newline,
-parentheses, and command substitutions), and reads each behind variable assignments and the
-wrappers `nice`, `timeout`, `env`, `ionice`, `stdbuf`, `nohup`, `time`, `command`, and `exec`.
+parentheses, and command substitutions), skipping the body of a here document, and reads each
+behind the shell's reserved words (`if`, `then`, `do`, `!`, and the like), variable
+assignments, and the wrappers `nice`, `timeout`, `env`, `ionice`, `stdbuf`, `nohup`, `time`,
+`command`, and `exec`.
 
 | Simple command | Answer |
 |---|---|
 | `cargo <subcommand>` other than `xtask`, `fmt`, `metadata`, `tree`, `version`, `help`, `locate-project`, and `pkgid` | Refused (`.claude/CLAUDE.md` § Tooling constraints). A toolchain selector, cargo's own options, and a path to `cargo` do not hide the subcommand. |
 | `gh pr merge`, `gh issue create`, or `cargo xtask issue-file`, inside a subagent that is not the `orchestrator` | Refused: a worker neither merges nor files an Issue. A subagent is an event that carries `agent_id`. |
 | `gh pr merge` that names no pull request number | Refused, since the gate cannot be checked. |
-| `gh pr merge <N>` | Runs `cargo xtask pr-check <N> --gate`. An error refuses the merge and gives the error lines. The `gate-release-approval` warning asks the maintainer, and so does a gate that could not be checked (no network, a `gh` failure). Otherwise nothing is printed. |
+| `gh pr merge <N>` (not `gh pr merge --help`) | Runs `cargo xtask pr-check <N> --gate`. An error refuses the merge and gives the error lines. The `gate-release-approval` warning asks the maintainer, and so does a gate that could not be checked (no network, a `gh` failure). Otherwise nothing is printed. |
 
 The split is a scan without a shell grammar: the command guards against a mistake, not against a
 command line written to pass it. A hook must not stop a session, so the command always exits
-with success: an event it cannot read is let through with a note on stderr.
+with success: an event it cannot read, and a check it cannot make, is let through with a note
+on stderr. The harness reads a hook's exit code 2 as a refusal, and a checkout whose `xtask`
+has no `hook` command exits with that code, so `.claude/settings.json` writes each command as
+`cargo xtask hook <event> || true`.
 
 ---
 

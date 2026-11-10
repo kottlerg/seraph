@@ -5,6 +5,19 @@ description: Run a batch of Issues as several parallel worker agents under one o
 
 # Orchestrating a batch
 
+**What this is for.** The maintainer opens this at the start of a milestone and settles the open
+design questions with you, on the workers' recommendations, yours, and their own judgement. From
+there you run the work in parallel, as cheaply in tokens and as quickly in wall-clock time as
+the rules allow, until every design and defect Issue of the milestone is closed, the rolling
+Issues included, and the release is reviewed, tested and tagged. The maintainer looks in now and
+then and should see it moving. You go to them for a major blocker or a major design question,
+and for the few decisions the documents reserve to them. Anything else that would need them in
+the middle of the milestone, ask at the start, as a standing answer.
+
+After your context is compacted, re-read this file and the record's `## ACTIVE GRANT` block
+before your next decision. The harness reloads at most the first 5,000 tokens of a skill, and
+the summary is not a source for a rule or for the state.
+
 You are the orchestrator: one session that plans a batch of Issues, spawns one `worker` agent
 (`.claude/agents/worker.md`) per PR, grants the shared host's exclusive runs, orders merges to
 minimize re-validation, carries the workers' questions to the maintainer, files the Issues the
@@ -35,6 +48,38 @@ another Issue. File a deferral that needs real hardware without a milestone, as 
 allows for work no release has scheduled. Keep a rolling `<scope>: defects found by review`
 Issue open as the scope's recording sink even when every item is ticked; PRs reference it with
 `Refs` only.
+
+## Reporting to the maintainer
+
+Your context is the batch's scarcest resource. Every response you make re-reads all of it, and
+everything that enters it (a worker's message, a command's output, your own reply) stays for
+the rest of the session.
+
+Tell the maintainer only:
+
+1. a merge, in a line or two;
+2. what blocks or needs their input, with your recommendation;
+3. a decision you made on their behalf, in one line each;
+4. a rule breach or an anomaly;
+5. what they ask for.
+
+Verdict lines, findings and the state of each round stay in the run records
+(`target/xtask/review/pr<N>/`) and in the record, and you give them when asked. A worker gives
+you a run's two verdict lines verbatim; you pass them on only when asked, or when a line is why
+something blocks.
+
+A worker's message wakes you for a turn, and the last message of a turn is what the maintainer
+reads. A turn woken by routine status ends in one line.
+
+Keep your own reads out of your context the same way:
+
+- The gate is `cargo xtask pr-check <N> --gate`, which prints a verdict and its failures. Do
+  not open a PR body, a run record or a diff to re-derive what it checks.
+- When you must look further (a gate failure you do not understand, a records read, a search
+  of the Issue list), give the read to the `Explore` or `scribe` agent with one question and
+  take a paragraph back.
+- A worker's plan and its detail are files in the scratchpad. Read one when a question needs
+  it, not when it arrives.
 
 ## Plan
 
@@ -79,7 +124,8 @@ Do not poll. Two things have no notification, and each has its own watch:
 ## Spawn
 
 Spawn each worker with the `Agent` tool, `subagent_type` `worker`, worktree isolation, and a
-prompt of this shape; nothing in it repeats the agent file:
+prompt of this shape. Nothing in it repeats the agent file, and what is longer than a line
+(an earlier plan, a ruling's detail) is a path, not text:
 
 > You are orchestrated. Scope `<scope>`; Issues #N, #M (one line each: title and the items in
 > play); branch `<prefix>/<slug>`; report to `main`; previous ledger `<path of the previous PR's
@@ -175,7 +221,8 @@ the worker may still be resumed, park its worktree first
 Workers bring you the decisions they may not make. Apply the document where one settles the
 question. Ask the maintainer where it is theirs, once per batch where a standing answer makes
 sense, and quote the answer in the record. Decide a question that no document reserves to the
-maintainer and whose recommendation you share, and tell the maintainer in your next message.
+maintainer and whose recommendation you share, and tell the maintainer in one line
+(§ Reporting to the maintainer).
 Only a split recommendation, a major design decision, or a case with no clearly best option
 waits for the maintainer.
 
@@ -218,52 +265,16 @@ the closing comment.
 
 ## Worktree removal
 
-A worker's worktree carries a built `target/` of several GiB. The harness removes only an
-unchanged worktree, so every other one persists until you remove it. Remove only worktrees this
-batch spawned and the record lists, in two places:
-
-- **At a worker's retirement:** after its last PR merges (or its gate report, when it has no PR
-  left to merge) and nothing is left for it. A worktree parked on a `park/<name>` branch stays
-  until wind-down.
-- **At wind-down:** every worktree the record lists that is still present, after confirming no
-  active worker owns it.
-
-Before removing one, check both conditions, and skip and report a worktree that fails either:
-
-- The records are in your checkout: `target/xtask/review/pr<N>/` holds the records of every run
-  the worker reported. They exist nowhere else once the worktree is gone.
-- Nothing is unsaved or unpushed: `git -C <path> status --porcelain` prints nothing, and after
-  `git fetch origin`, `git -C <path> rev-list HEAD --not --remotes=origin` prints nothing.
-
-Remove with `git worktree remove --force --force <path>` (the harness locks agent worktrees, and
-a locked worktree refuses a single `--force`), run `git worktree prune` once after a sweep, and
-record each removal with the worktree's size (`du -sh <path>`, taken first). A worktree under
-`.claude/worktrees/` that the record does not list is reported to the maintainer with its branch
-and lock, and removed only on their word.
+A worker's worktree carries a built `target/` of several GiB, and the harness removes only an
+unchanged one. Remove a worktree at its worker's retirement and sweep the rest at wind-down,
+after copying its review records into your checkout. Read `worktree-removal.md` beside this file
+before the first removal: it has the two checks and the command.
 
 ## Release review
 
 When the current milestone is ready to close, run the release review of docs/conventions.md
-§ Release Production. Workers cannot call the Workflow tool, so it is the one review this
-session runs as a workflow. Its agents resolve from the definitions the session loaded at its
-start, so run it in a session started after those files are on the checked-out branch.
-
-- `git fetch origin` and check out `origin/master`, clean. Run
-  `Workflow({name: "release-review", args: {mode: "scope", from: "<previous tag>", version:
-  "<X.Y.Z>"}})` and read the plan, then the same with `mode: "full"`. When the script changed
-  since the session loaded it, pass `scriptPath` with the file's path instead of `name`.
-- Save each run's report as `target/xtask/review/release-v<X.Y.Z>/<mode>-<head>.md`, the
-  returned object as `<mode>-<head>.json` beside it, and on `RELEASE READY` the `notes` field as
-  `notes-<head>.md`. Give both verdict lines to the maintainer verbatim.
-- `RELEASE BLOCKED`: each blocking finding goes to a worker as a fix PR, a `[carried]` entry and
-  a fresh entry beside it that state the same defect counting as one, and each audit failure to
-  its fix. Record every other finding as step 2 of that section says. Then run `mode: "delta"`
-  with `since` the head the last run reviewed.
-- `RELEASE READY` before the bump: a worker opens the release PR from the draft (step 3). Once
-  it merges, run the release host runs (step 4) yourself under an exclusive grant to yourself,
-  write their report to `target/xtask/review/release-v<X.Y.Z>/host-runs.md`, and run
-  `mode: "delta"` with `host_runs` that path. `RELEASE READY` at the bumped head is a tag prompt
-  to the maintainer (step 5).
+§ Release Production. Read `release-review.md` beside this file first: it has the workflow
+calls, the record names, and what each verdict leads to.
 
 ## Hand-off and wind-down
 

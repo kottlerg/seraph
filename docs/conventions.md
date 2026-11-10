@@ -418,7 +418,8 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 2. A blocking finding takes a fix PR through the normal PR workflow, and an
    audit failure its fix; the review then runs again in `delta` mode, since
    the head it last reviewed, and judges again each blocking finding that
-   run left standing. A blocking-track finding an open Issue names is a
+   run left standing, apart from a contested one, which the maintainer's
+   ruling settles. A blocking-track finding an open Issue names is a
    known issue of the release. Every other finding is recorded as § Branch
    and PR Workflow records a finding off the surface: on the open Issue that
    names the work, else on the follow-up Issue of its scope, which step 8

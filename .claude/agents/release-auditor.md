@@ -42,14 +42,15 @@ Production requires before its tag, not code quality: the reviewers own that.
    head, FAIL when `docs/releases/vX.Y.Z.md` is missing or does not follow
    `TEMPLATE.md` as `docs/releases/README.md` § Source of Truth requires,
    when its ABI and protocol table omits or misstates a version constant the
-   range changed, or when its Known Issues section differs from step 6's
-   list.
+   range changed, or when its Known Issues section differs from the list of
+   item 6 below.
 
 6. Known issues: every known-issue candidate the parent lists (a review
    finding on the blocking track whose work that open Issue names, § Release
-   Production step 2), every open Issue labelled `bug` or `security`, in any
-   milestone, whose defect is present at the head, and every known issue the
-   previous release's notes list whose Issue is still open; each with a
+   Production step 2) whose defect is present at the head, every open Issue
+   labelled `bug` or `security`, in any milestone, whose defect is present at
+   the head, and every known issue the previous release's notes list whose
+   Issue is still open; each with a
    one-sentence statement of the shipped defect. Return them as the known
    issues; FAIL only when the Issues cannot be read.
 

@@ -16,12 +16,12 @@
 // puts every finding that can block, and every Critical and Should finding, to
 // two independent refuters as soon as its reviewer completes. Audit runs the
 // `release-auditor` once the findings are judged, with the known-issue
-// candidates (the blocking-track findings an open Issue names, of this run and
-// the release's earlier runs), so the notes it checks and the notes this run
-// drafts take the same list. Synthesize renders one report and, when the
-// verdict is `RELEASE READY`, drafts the release notes from
-// docs/releases/TEMPLATE.md. The script computes the verdict line itself:
-// `RELEASE BLOCKED` when a reviewer failed, a finding on the blocking track
+// candidates (the blocking-track findings an open Issue names, of this run and,
+// while their Issue is open, of the release's earlier runs), so the notes it
+// checks and the notes this run drafts take the same list. Synthesize renders
+// one report and, when the verdict is `RELEASE READY`, drafts the release
+// notes from docs/releases/TEMPLATE.md. The script computes the verdict line
+// itself: `RELEASE BLOCKED` when a reviewer failed, a finding on the blocking track
 // (class correctness, safety, or contract, or a MUST violation anchored
 // outside Markdown) survives verification with no open Issue naming its work,
 // or the audit fails; `RELEASE READY` otherwise. A blocking-class finding an
@@ -65,7 +65,7 @@ export const meta = {
         'Once the milestone is ready to close, per docs/conventions.md § Release Production',
     phases: [
         { title: 'Scope', detail: 'list the range, its PRs and files, and the saved records' },
-        { title: 'Review', detail: 'multi-PR file shards, whole-range lenses, release-auditor' },
+        { title: 'Review', detail: 'multi-PR file shards and whole-range lenses' },
         {
             title: 'Verify',
             detail: 'two independent refuters per finding that can block, or is Critical or Should',
@@ -373,12 +373,18 @@ const FINDINGS_SCHEMA = {
 
 const VERDICT_SCHEMA = {
     type: 'object',
-    required: ['refuted', 'issue_refuted', 'confidence', 'evidence'],
+    required: ['refuted', 'issue_refuted', 'names_issue', 'confidence', 'evidence'],
     properties: {
         refuted: { type: 'boolean' },
         issue_refuted: {
             type: 'boolean',
             description: 'The named open Issue does not name this work (false when none is named).',
+        },
+        names_issue: {
+            type: 'integer',
+            description:
+                'For a carried finding the prompt asks about: the open Issue that names this ' +
+                'work, else 0. Always 0 when the prompt does not ask.',
         },
         confidence: { enum: ['high', 'medium', 'low'] },
         evidence: { type: 'string' },
@@ -933,9 +939,12 @@ const audit_prompt = (candidates) => [
         'output only.',
 ].join('\n')
 
+// An earlier run's known issue stays a candidate only while its Issue is open;
+// the audit then confirms that its defect is still present at the head.
 const prior_candidates = []
 for (const k of scope.prior_known) {
-    if (k.issue && !prior_candidates.some((e) => e.number === k.issue)) {
+    const open = scope.open_issues.some((i) => i.number === k.issue)
+    if (open && !prior_candidates.some((e) => e.number === k.issue)) {
         prior_candidates.push({ number: k.issue, summary: k.claim })
     }
 }
@@ -956,7 +965,8 @@ const plan = {
     ledger_records: scope.ledger_records.length,
     carried_findings: scope.prior_findings.length,
     bumped,
-    review_agents: shards.length + lenses.length + 1,
+    review_agents: shards.length + lenses.length,
+    audit_agents: 1,
 }
 
 if (MODE === 'scope') {
@@ -1009,7 +1019,7 @@ function verify_prompt(f, lens) {
                 'place that exhibits the defect, and also when you can neither confirm nor ' +
                 'refute it; say so, with confidence low. Evidence must cite file:line. Return ' +
                 'issue_refuted=false: whether a named Issue covers the work is the authority ' +
-                'refuter\'s judgement. Structured output only.',
+                'refuter\'s judgement, and so is names_issue: return 0. Structured output only.',
         ].join('\n')
     }
     return [
@@ -1029,6 +1039,16 @@ function verify_prompt(f, lens) {
                     'issue view ' + f.issue + '`) and set issue_refuted=true when it does not ' +
                     'name this work; that judgement is separate from refuted. '
                 : '') +
+            (f.carried && !f.issue
+                ? 'An earlier run reported this finding, and an Issue may have been filed for ' +
+                    'its work since: set names_issue to the open Issue below that names this ' +
+                    'work, reading the body of any whose title matches the area, or 0 when none ' +
+                    'does; a follow-up Issue (title `<scope>: defects found by review`, or ' +
+                    'beginning `<scope>: defects found by PR #<N>\'s review`) names findings, ' +
+                    'not work, and is never the answer. That judgement is separate from ' +
+                    'refuted.\n' + bullets(scope.open_issues, (i) => '- #' + i.number + ' ' +
+                    i.title) + '\n'
+                : 'Return names_issue=0. ') +
             'Structured output only.',
     ].join('\n')
 }
@@ -1100,7 +1120,11 @@ function dedup(findings, source) {
             }
             continue
         }
-        const dup = nearest(seen.filter((s) => s.status !== 'ledgered'), f, source)
+        // A carried record's refuters start before any reviewer reports, so a
+        // fresh finding beside it is never absorbed into it: it is verified on
+        // its own, and survives when the carried one is dropped as fixed.
+        const dup = nearest(
+            seen.filter((s) => s.status !== 'ledgered' && !s.carried), f, source)
         if (dup) {
             absorb(dup, f, source)
             continue
@@ -1153,6 +1177,15 @@ function verify_one(f) {
             f.issue = 0
         } else if (f.issue && !valid.some((v) => v.lens === 'authority')) {
             f.annotations.push('#' + f.issue + ' unjudged: authority refuter returned no result')
+        }
+        // A carried finding may since have an Issue that names its work.
+        const named = valid.find((v) => v.lens === 'authority' && v.names_issue > 0)
+        if (f.carried && !f.issue && named) {
+            const n = named.names_issue
+            if (open_issue_numbers.has(n) && !FOLLOW_UP.test(issue_title(n))) {
+                f.issue = n
+                f.annotations.push('#' + n + ' names this work (authority refuter)')
+            }
         }
         f.votes = valid
         return f
@@ -1293,14 +1326,16 @@ if (failed_verifiers.length) {
 }
 
 // The known issues of the release are the audit's list, which takes in the
-// candidates above; a candidate the audit left out is kept, one entry per Issue.
+// candidates above when their defect is still present, plus this run's own
+// candidates, which the refuters have just judged present; one entry per Issue.
+// An earlier run's candidate the audit left out is not added back.
 const known_issues = []
 for (const k of (audit && audit.known_issues) || []) {
     if (!known_issues.some((e) => e.number === k.number)) known_issues.push(k)
 }
-for (const k of candidates) {
-    if (!known_issues.some((e) => e.number === k.number)) {
-        known_issues.push({ number: k.number, title: issue_title(k.number), summary: k.summary })
+for (const f of known) {
+    if (!known_issues.some((e) => e.number === f.issue)) {
+        known_issues.push({ number: f.issue, title: issue_title(f.issue), summary: f.claim })
     }
 }
 

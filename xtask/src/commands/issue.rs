@@ -266,15 +266,12 @@ pub fn missing_metadata(
 /// The names of the labels an Issue carries, as `gh issue view` returns it.
 fn label_names(issue: &serde_json::Value) -> Vec<String>
 {
-    issue["labels"]
-        .as_array()
-        .map(|labels| {
-            labels
-                .iter()
-                .filter_map(|l| l["name"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+    issue["labels"].as_array().map_or_default(|labels| {
+        labels
+            .iter()
+            .filter_map(|l| l["name"].as_str().map(str::to_owned))
+            .collect()
+    })
 }
 
 /// Create the Issue with `gh` and return its number and URL.

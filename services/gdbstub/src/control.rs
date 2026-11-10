@@ -71,24 +71,55 @@ pub fn credit(held: bool, regs_pc: Option<u64>, stop_ip: u64) -> Credit
     }
 }
 
+/// Which threads can make a stop: only the thread an upcall was posted to,
+/// or the thread whose step's trap flag took `#DB`; or any thread bound
+/// under the badge, as a breakpoint hit or a fault of a thread spawned after
+/// the attach, which copied its spawner's binding, is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin
+{
+    /// Only the thread the badge names: an upcall, or a step's `#DB`.
+    Own,
+    /// Any thread bound under the badge: a breakpoint hit or a fault.
+    Any,
+}
+
+/// The [`Origin`] of a stop of kind `kind` and, for an exception, class
+/// `detail`.
+#[must_use]
+pub fn origin(kind: u64, detail: u64) -> Origin
+{
+    let debug_trap =
+        kind == syscall_abi::FAULT_KIND_EXCEPTION && detail == syscall_abi::FAULT_EXC_DEBUG;
+    if kind == syscall_abi::FAULT_KIND_UPCALL || debug_trap
+    {
+        Origin::Own
+    }
+    else
+    {
+        Origin::Any
+    }
+}
+
 /// What the stub does with a stop [`credit`] did not give to the thread its
 /// badge names, once a refresh has bound the threads the target spawned
-/// since the attach (each bind cancels the delivery in flight under the old
-/// badge and makes it again under the new one).
+/// since the attach (each bind to a new endpoint or badge cancels the
+/// delivery in flight and makes it again under the new binding).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unclaimed
 {
-    /// The named thread is held, and GDB has not been told the target
-    /// stopped: one of the two deliveries is the thread's own and the other
-    /// a new thread's or the kernel's cancelled one, and which is live is
-    /// unknown. Both are resumed, the thread's breakpoint hit rewound first
-    /// ([`rewound_pc`]), so the thread runs its stopping instruction again
-    /// and stops anew under its own badge.
+    /// The named thread is held, GDB has not been told of that stop, and
+    /// both stops are breakpoint hits or faults: one delivery is the
+    /// thread's own and the other a new thread's or one the kernel made
+    /// again, and which is live is unknown. Both are resumed, the thread's
+    /// breakpoint hit rewound first ([`rewound_pc`]); a breakpoint or a
+    /// fault, run again, stops the thread anew under its own badge.
     Restart,
-    /// The named thread is held and reported, the refresh bound no thread,
-    /// and the stop repeats the held one: the kernel made the held delivery
-    /// again (docs/fault-handling.md § Delivery, Resume, and Kill, Rebind),
-    /// so the new delivery replaces it.
+    /// The new stop is the named thread's own and the held one is not: the
+    /// held one, a new thread's credited to it, gives way, and is answered
+    /// with [`decline_label`]. Also the kernel's second delivery of a
+    /// reported held stop, which repeats it while the refresh bound no
+    /// thread (docs/fault-handling.md § Delivery, Resume, and Kill, Rebind).
     Replace,
     /// Any other stop: a new thread's, cancelled by the refresh's bind, or
     /// one of a thread the stub cannot bind. It is answered with
@@ -102,42 +133,50 @@ pub enum Named
 {
     /// Not held.
     Free,
-    /// Held, and GDB has not been told the target stopped since the last
-    /// resume.
+    /// Held, and GDB has not been told of the stop: the all-stop that took
+    /// it has not ended.
     Unreported,
-    /// Held, and GDB has been told the target stopped.
+    /// Held, and the all-stop that took it has ended, so GDB knows the
+    /// thread stopped there.
     Reported,
 }
 
-/// Settle an unclaimed stop whose badge names a thread in state `named`,
+/// Settle an unclaimed stop of origin `stop`, whose badge names a thread in
+/// state `named` holding a stop of origin `held` (any, for a free thread),
 /// after a refresh that `added` a thread or not; `repeats_held` when the
 /// stop's kind, detail, and pointer equal the held stop's.
 #[must_use]
-pub fn settle(named: Named, added: bool, repeats_held: bool) -> Unclaimed
+pub fn settle(
+    named: Named,
+    held: Origin,
+    stop: Origin,
+    added: bool,
+    repeats_held: bool,
+) -> Unclaimed
 {
-    match named
+    match (named, held, stop)
     {
-        Named::Unreported => Unclaimed::Restart,
-        Named::Reported if !added && repeats_held => Unclaimed::Replace,
-        _ => Unclaimed::Decline,
+        (Named::Free, ..) | (_, Origin::Own, Origin::Any) => Unclaimed::Decline,
+        (_, _, Origin::Own) => Unclaimed::Replace,
+        (Named::Unreported, Origin::Any, Origin::Any) => Unclaimed::Restart,
+        (Named::Reported, Origin::Any, Origin::Any) if !added && repeats_held => Unclaimed::Replace,
+        (Named::Reported, Origin::Any, Origin::Any) => Unclaimed::Decline,
     }
 }
 
-/// The reply to a stop no thread of the stub's table claims: an upcall,
-/// which stops no fault, resumes; a fault is declined
-/// (`FAULT_REPLY_KILL`), so it takes the outcome it has with no handler
-/// bound, rather than resuming past a breakpoint or faulting again for
-/// ever. A delivery a bind cancelled ignores the reply.
+/// The reply to a stop no thread of the stub's table claims: an upcall or a
+/// step's `#DB`, which no thread but the one it names makes, resumes; a
+/// breakpoint hit or a fault is declined (`FAULT_REPLY_KILL`), so it takes
+/// the outcome it has with no handler bound, rather than resuming past a
+/// breakpoint or faulting again for ever. A delivery a bind cancelled
+/// ignores the reply.
 #[must_use]
-pub fn decline_label(kind: u64) -> u64
+pub fn decline_label(kind: u64, detail: u64) -> u64
 {
-    if kind == syscall_abi::FAULT_KIND_UPCALL
+    match origin(kind, detail)
     {
-        syscall_abi::FAULT_REPLY_RESUME
-    }
-    else
-    {
-        syscall_abi::FAULT_REPLY_KILL
+        Origin::Own => syscall_abi::FAULT_REPLY_RESUME,
+        Origin::Any => syscall_abi::FAULT_REPLY_KILL,
     }
 }
 
@@ -309,35 +348,75 @@ mod tests
 
     // Defect caught: a spawner's own stop resumed past its breakpoint, and a
     // held stop whose reply a refresh's bind cancelled kept for ever, when a
-    // thread spawned after the attach stopped beside it under its badge.
+    // thread spawned after the attach stopped beside it under its badge; a
+    // step's held #DB restarted, running one instruction too many; a
+    // reported thread restarted during a step.
     #[test]
-    fn an_unclaimed_stop_restarts_an_unreported_thread_and_declines_otherwise()
+    fn an_unclaimed_stop_restarts_only_an_unreported_repeatable_stop()
     {
-        assert_eq!(settle(Named::Unreported, true, true), Unclaimed::Restart);
-        assert_eq!(settle(Named::Unreported, false, false), Unclaimed::Restart);
-        assert_eq!(settle(Named::Reported, false, true), Unclaimed::Replace);
+        use Origin::{Any, Own};
+        assert_eq!(
+            settle(Named::Unreported, Any, Any, true, true),
+            Unclaimed::Restart
+        );
+        assert_eq!(
+            settle(Named::Unreported, Any, Any, false, false),
+            Unclaimed::Restart
+        );
+        // A step's #DB, or an upcall, held: the new stop is another thread's.
+        assert_eq!(
+            settle(Named::Unreported, Own, Any, true, false),
+            Unclaimed::Decline
+        );
+        // The thread's own #DB or upcall arrives: the held stop was not its.
+        assert_eq!(
+            settle(Named::Unreported, Any, Own, true, false),
+            Unclaimed::Replace
+        );
+        assert_eq!(
+            settle(Named::Reported, Any, Any, false, true),
+            Unclaimed::Replace
+        );
         // A new thread's stop beside a reported one: its bind cancelled it.
-        assert_eq!(settle(Named::Reported, true, true), Unclaimed::Decline);
-        assert_eq!(settle(Named::Reported, false, false), Unclaimed::Decline);
-        assert_eq!(settle(Named::Free, true, false), Unclaimed::Decline);
+        assert_eq!(
+            settle(Named::Reported, Any, Any, true, true),
+            Unclaimed::Decline
+        );
+        assert_eq!(
+            settle(Named::Reported, Any, Any, false, false),
+            Unclaimed::Decline
+        );
+        assert_eq!(
+            settle(Named::Free, Any, Any, true, false),
+            Unclaimed::Decline
+        );
     }
 
     // Defect caught: a fault no thread claims resumed, so it ran past a
     // breakpoint on x86-64 or faulted again for ever.
     #[test]
-    fn an_unclaimed_fault_is_declined_and_an_upcall_resumed()
+    fn an_unclaimed_fault_is_declined_and_an_upcall_or_step_trap_resumed()
     {
+        let exc = syscall_abi::FAULT_KIND_EXCEPTION;
+        assert_eq!(origin(syscall_abi::FAULT_KIND_UPCALL, 0), Origin::Own);
+        assert_eq!(origin(exc, syscall_abi::FAULT_EXC_DEBUG), Origin::Own);
+        assert_eq!(origin(exc, syscall_abi::FAULT_EXC_BREAKPOINT), Origin::Any);
         assert_eq!(
-            decline_label(syscall_abi::FAULT_KIND_UPCALL),
+            decline_label(syscall_abi::FAULT_KIND_UPCALL, 0),
             syscall_abi::FAULT_REPLY_RESUME
         );
-        for kind in [
-            syscall_abi::FAULT_KIND_EXCEPTION,
-            syscall_abi::FAULT_KIND_VM,
-        ]
-        {
-            assert_eq!(decline_label(kind), syscall_abi::FAULT_REPLY_KILL);
-        }
+        assert_eq!(
+            decline_label(exc, syscall_abi::FAULT_EXC_DEBUG),
+            syscall_abi::FAULT_REPLY_RESUME
+        );
+        assert_eq!(
+            decline_label(exc, syscall_abi::FAULT_EXC_BREAKPOINT),
+            syscall_abi::FAULT_REPLY_KILL
+        );
+        assert_eq!(
+            decline_label(syscall_abi::FAULT_KIND_VM, 0),
+            syscall_abi::FAULT_REPLY_KILL
+        );
     }
 
     // Defect caught: exited threads counted toward the table's bound, so a

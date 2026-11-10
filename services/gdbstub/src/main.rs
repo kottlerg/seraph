@@ -22,7 +22,7 @@ use gdb_rsp::command::{BreakpointType, Command, ThreadId, ThreadOp, VContActions
 use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
 use gdb_rsp::target::TARGET_XML_ANNEX;
 use gdbstub::breakpoints::{self, Breakpoints};
-use gdbstub::control::{self, Credit, Named, Plan, Unclaimed};
+use gdbstub::control::{self, Credit, Named, Origin, Plan, Unclaimed};
 use gdbstub::{regs, signal, stop_signal};
 use ipc::{
     IpcMessage, devmgr_errors, devmgr_labels, procmgr_errors, procmgr_labels, serial_errors,
@@ -265,6 +265,9 @@ struct Stop
     detail: u64,
     /// Data word 3: the thread's instruction pointer.
     ip: u64,
+    /// Held, the all-stop that took the stop has ended, so GDB knows the
+    /// thread stopped there ([`control::Named::Reported`]).
+    reported: bool,
 }
 
 /// Start receiver `id` on `endpoint`: each message it takes goes to the
@@ -292,6 +295,7 @@ fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Send
                     kind: msg.word(0),
                     detail: msg.word(1),
                     ip: msg.word(3),
+                    reported: false,
                 };
                 if events.send(stop).is_err()
                 {
@@ -611,9 +615,14 @@ impl Stub
         }
         if let Some(target) = &mut self.target
         {
+            // The all-stop ends: GDB is told of it, or, at the attach, asks.
             for t in &mut target.threads
             {
                 t.posted = false;
+                if let Some(stop) = &mut t.held
+                {
+                    stop.reported = true;
+                }
             }
         }
         self.finish_stepping();
@@ -652,8 +661,11 @@ impl Stub
     /// A stop that is not the thread's own ([`control::credit`]) comes from
     /// a thread spawned after the attach under its spawner's badge, or is a
     /// delivery the kernel made again: the stub refreshes its thread list,
-    /// whose bind delivers a new thread's stop again under its own badge,
-    /// and settles the stop as [`control::settle`] says.
+    /// whose bind delivers a new thread's stop again under its own badge.
+    /// When the refresh stored a thread in the stop's own slot, that thread
+    /// copied the slot's badge, and the bind, to the binding it already had,
+    /// cancelled nothing: the stop is credited to it as any other. Any other
+    /// stop is settled as [`control::settle`] says.
     fn hold(&mut self, stop: Stop) -> Option<usize>
     {
         let index = control::thread_index(stop.badge);
@@ -661,60 +673,105 @@ impl Stub
             index.and_then(|i| Some((i, self.target.as_ref()?.threads.get(i)?)))
         else
         {
-            self.reply(stop.receiver, control::decline_label(stop.kind));
+            self.reply(
+                stop.receiver,
+                control::decline_label(stop.kind, stop.detail),
+            );
             return None;
         };
-        let held = thread.held;
-        let regs_pc = if held.is_some()
+        let (cap, held) = (thread.cap, thread.held);
+        let reported = held.is_some_and(|h| h.reported);
+        if self.credit_to(i, stop)
         {
-            None
-        }
-        else
-        {
-            read_pc(thread.cap)
-        };
-        if control::credit(held.is_some(), regs_pc, stop.ip) == Credit::Own
-        {
-            if let Some(t) = self.target.as_mut().and_then(|t| t.threads.get_mut(i))
-            {
-                t.held = Some(stop);
-                t.posted = false;
-            }
             return Some(i);
         }
         let added = self.refresh();
+        let occupant = self
+            .target
+            .as_ref()
+            .and_then(|t| t.threads.get(i))
+            .map(|t| t.cap);
+        if added && occupant != Some(cap) && self.credit_to(i, stop)
+        {
+            return Some(i);
+        }
         let repeats =
             held.is_some_and(|h| (h.kind, h.detail, h.ip) == (stop.kind, stop.detail, stop.ip));
-        let named = match (held, self.running)
+        let named = match (held, reported)
         {
             (None, _) => Named::Free,
-            (Some(_), true) => Named::Unreported,
-            (Some(_), false) => Named::Reported,
+            (Some(_), false) => Named::Unreported,
+            (Some(_), true) => Named::Reported,
         };
-        match control::settle(named, added, repeats)
+        let held_origin = held.map_or(Origin::Any, |h| control::origin(h.kind, h.detail));
+        let origin = control::origin(stop.kind, stop.detail);
+        match control::settle(named, held_origin, origin, added, repeats)
         {
             Unclaimed::Restart => self.restart(i, stop),
             Unclaimed::Replace =>
             {
                 if let Some(t) = self.target.as_mut().and_then(|t| t.threads.get_mut(i))
                 {
-                    t.held = Some(stop);
+                    // GDB's knowledge of the stop carries over.
+                    t.held = Some(Stop { reported, ..stop });
                 }
-                // The replaced delivery was cancelled; its reply is ignored.
+                // The replaced delivery is a new thread's, which its bind
+                // cancelled, or one the kernel cancelled; a live one of a
+                // thread the stub cannot bind is declined.
                 if let Some(old) = held
                 {
-                    self.reply(old.receiver, syscall_abi::FAULT_REPLY_RESUME);
+                    self.reply(old.receiver, control::decline_label(old.kind, old.detail));
+                }
+                if named == Named::Unreported
+                {
+                    return Some(i);
                 }
             }
-            Unclaimed::Decline => self.reply(stop.receiver, control::decline_label(stop.kind)),
+            Unclaimed::Decline =>
+            {
+                self.reply(
+                    stop.receiver,
+                    control::decline_label(stop.kind, stop.detail),
+                );
+            }
         }
         None
     }
 
+    /// Hold `stop` as thread `index`'s own when [`control::credit`] gives it
+    /// to the thread: free, and blocked at the stop's pointer.
+    fn credit_to(&mut self, index: usize, stop: Stop) -> bool
+    {
+        let Some(t) = self.target.as_mut().and_then(|t| t.threads.get_mut(index))
+        else
+        {
+            return false;
+        };
+        let regs_pc = if t.held.is_some()
+        {
+            None
+        }
+        else
+        {
+            read_pc(t.cap)
+        };
+        if control::credit(t.held.is_some(), regs_pc, stop.ip) != Credit::Own
+        {
+            return false;
+        }
+        t.held = Some(Stop {
+            reported: false,
+            ..stop
+        });
+        t.posted = false;
+        true
+    }
+
     /// Resume both the held stop of thread `index` and `stop`, a second
-    /// delivery under its badge, after rewinding the thread's breakpoint hit:
-    /// whichever delivery is live runs the thread's stopping instruction
-    /// again, and the thread stops anew under its own badge
+    /// delivery under its badge, both breakpoint hits or faults, after
+    /// rewinding the thread's breakpoint hit: whichever delivery is live
+    /// runs the thread's breakpoint or faulting instruction again, and the
+    /// thread stops anew under its own badge
     /// ([`control::Unclaimed::Restart`]).
     fn restart(&mut self, index: usize, stop: Stop)
     {
@@ -1092,12 +1149,11 @@ impl Stub
     /// (`k`).
     fn detach(&mut self, ipc_buf: *mut u64)
     {
-        let Some(cap) = self.any_thread()
-        else
+        if self.any_thread().is_none()
         {
             self.drop_target();
             return;
-        };
+        }
         // A step whose thread an all-stop left running gets one more
         // all-stop to take its stop; its text is undone whatever comes.
         self.finish_stepping();
@@ -1106,6 +1162,15 @@ impl Stub
             self.stop_all();
         }
         self.undo_step(true);
+        // A thread that exited during that all-stop no longer reaches the
+        // text, so the cap is taken after it, from the threads still alive.
+        self.alive_count();
+        let Some(cap) = self.any_thread()
+        else
+        {
+            self.drop_target();
+            return;
+        };
         for bp in self.breakpoints.take_all()
         {
             let _ = write_text(cap, bp.addr, bp.original());

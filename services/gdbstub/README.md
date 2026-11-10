@@ -41,7 +41,7 @@ gdbstub/
 └── src/
     ├── main.rs            # Startup, attach, fault receivers, all-stop, the packet loop, detach
     ├── lib.rs             # Host-tested: stop signals, step errors; module roots
-    ├── control.rs         # Host-tested: binding badges, stop credit, rewind, resume plans
+    ├── control.rs         # Host-tested: badges, stop credit and settling, slots, rewind, resumes
     ├── regs.rs            # Host-tested: kernel register file <-> GDB register block
     ├── breakpoints.rs     # Host-tested: breakpoint instructions, the inserted-breakpoint table
     └── arch/
@@ -119,21 +119,28 @@ stub's endpoint.
   pages procmgr's thread list (`ATTACH_PROCESS`) from the count of the table's threads still
   alive, since procmgr lists those first and in the same order, retaking the page when one of them
   exits meanwhile (`REFRESH_TRIES` times), and binds each new thread under its own badge, in the
-  slot of an exited thread or after the last. The bind delivers the new thread's stop again under
-  that badge ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and Kill,
-  Rebind), and the stub declines the first delivery, which the bind cancelled, so the decline does
-  nothing. Then:
-  - When the named thread is held and GDB has not been told the target stopped, the stop and the
-    held one are two deliveries under one badge, one the thread's own and the other a new
-    thread's or one the kernel made again, and which is live is unknown: the stub sets the
-    thread's pointer back to a breakpoint it took, as for a hit it does not report (below), and
-    resumes both, so the thread runs its stopping instruction again and stops anew.
-  - When the named thread is held and reported, the refresh bound no thread, and the stop repeats
-    the held one, the kernel made the held delivery again, and the stop replaces it.
-  - Any other stop is declined: an upcall resumes, and a fault is answered `FAULT_REPLY_KILL`, so
-    a thread the stub cannot bind (the table is full, or the thread never registered) takes the
-    outcome its fault has with no handler bound, rather than resuming past a breakpoint or
-    faulting again for ever.
+  slot of an exited thread or after the last. A bind to a new badge delivers the new thread's stop
+  again under it ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and
+  Kill, Rebind), and cancels the first delivery, which ignores the stub's answer. A new thread
+  stored in the slot of the exited spawner whose badge it copied keeps its binding, which cancels
+  nothing, so the stub credits the stop to that thread when it is the one blocked at its pointer.
+  The stub then tells stops by origin: an upcall or a step's `#DB` only the thread it names makes,
+  and a breakpoint hit or a fault any thread bound under the badge can. With the named thread held:
+  - A stop of its own origin while the held one is not replaces the held one, a new thread's that
+    the stub credited to it, which is declined (below).
+  - A breakpoint hit or a fault beside a held breakpoint hit or fault, while the all-stop that
+    took the held one has not ended, is one of two deliveries under one badge: the thread's
+    own, and a new thread's or one the kernel made again, and which is live is unknown. The stub
+    sets the thread's pointer back to a breakpoint it took, as for a hit it does not report
+    (below), and resumes both, so the thread runs its breakpoint or faulting instruction again and
+    stops anew. A held stop whose all-stop has ended, which GDB knows of, is never restarted.
+  - The kernel's second delivery of a held stop whose all-stop has ended, which repeats it while
+    the refresh bound no thread, replaces it.
+
+  Any other stop is declined: an upcall or a `#DB` resumes, and a breakpoint hit or a fault is
+  answered `FAULT_REPLY_KILL`, so a thread the stub cannot bind (the table is full, or the thread
+  never registered) takes the outcome its fault has with no handler bound, rather than resuming
+  past a breakpoint or faulting again for ever.
 - **Stop replies.** A stop reports the stopping thread (`T<sig>thread:<id>;`) with the signal its
   fault maps to: `SIGTRAP` for a breakpoint or a step, `SIGILL`, `SIGBUS`, `SIGFPE` for those
   exceptions, `SIGSEGV` for any other fault and a page fault the pager forwarded, and `SIGINT` for
@@ -228,7 +235,7 @@ still attached.
 
 | Bound | Value | Past it |
 |---|---|---|
-| `MAX_THREADS` | 32 live threads per attach, refreshes included; an exited thread's slot is taken again | listed threads past it are left bound to the crash endpoint and are not shown to GDB; a thread spawned after the attach past it runs under its spawner's binding, its upcalls resumed and its faults declined |
+| `MAX_THREADS` | 32 live threads per attach, refreshes included; an exited thread's slot is taken again | listed threads past it are left bound to the crash endpoint and are not shown to GDB; a thread spawned after the attach past it runs under its spawner's binding, its stops settled as [Crediting a stop](#stop-model) says, which declines its faults but for one taken beside its spawner's |
 | `STOP_WAIT` | 2 s per all-stop | a thread whose upcall has not arrived runs on |
 | `FIND_ATTEMPTS` × `FIND_INTERVAL` | 600 × 100 ms, for the port and for the target at startup | the stub ends (no port) or serves detached (no target) |
 | `REATTACH_ATTEMPTS` × `FIND_INTERVAL` | 50 × 100 ms, for the target at a `qSupported` that finds the stub detached | the stub stays detached; `?` reports the target exited |
@@ -238,9 +245,10 @@ still attached.
 
 A thread spawned after the attach that stops at the same pointer as its spawner while the
 spawner's own stop is in flight can be credited with the spawner's stop until the spawner's stop
-arrives; the restart above then runs the spawner's stopping instruction again. When the second
-thread is one the stub cannot bind, both deliveries are live and both are resumed, so on x86-64
-that thread, at a breakpoint, resumes past it. The stub's thread ids are table indices, not kernel
+arrives; the restart above then runs the spawner's breakpoint or faulting instruction again. When
+the second thread is one the stub cannot bind, both deliveries are live and both are resumed, so on
+x86-64 that thread, at a breakpoint, resumes past it; one beside a held stop GDB already knows of
+is declined, which kills it. The stub's thread ids are table indices, not kernel
 thread identities, and the id of an exited thread names the thread that takes its slot.
 
 Each bound's entry is in [docs/limits.md](../../docs/limits.md) § Other services.
@@ -250,8 +258,9 @@ Each bound's entry is in [docs/limits.md](../../docs/limits.md) § Other service
 ## Testing
 
 The host tests cover the register map, the breakpoint table and instructions, the stop signals,
-the binding badges, the credit of a stop to its thread, the rewind of an unreported breakpoint hit,
-and the resume plans of `c`, `s`, and `vCont`. `cargo xtask test-gdb` boots the `gdb-target`
+the binding badges, the credit of a stop to its thread, the origin, settling, and decline of a stop
+no thread claims, the slot a new thread takes, the rewind of an unreported breakpoint hit, and the
+resume plans of `c`, `s`, and `vCont`. `cargo xtask test-gdb` boots the `gdb-target`
 fixture (`programs/debugger --gdb-target`,
 [programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and runs a batch
 GDB session over the debug port: it lists two threads, breaks on the fixture's tick function and

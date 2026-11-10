@@ -479,7 +479,7 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | serial, framebuffer and stream byte counts | `shared/ipc/src/lib.rs` | 512 B per call | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | Callers iterate |
 | `INPUT_MAX_EVENTS_PER_READ` | `shared/ipc/src/lib.rs` | 32 | per-message bound (readers loop) | 256 B stack | correct as is | Could use 63 words at no cost |
 | `keysym::pack_event` widths | `shared/ipc/src/lib.rs` | 32 / 31 bits | encoding artefact (one word per event) | none | correct as is | None |
-| `VERB_BIT_MASK` | `shared/ipc/src/lib.rs` | bits 59..63 | encoding artefact (badge high bits) | none | correct as is | None (#76) |
+| `VERB_BIT_MASK` | `shared/ipc/src/lib.rs` | bits 58..63 | encoding artefact (badge high bits) | none | correct as is | None (#76) |
 | `LOG_BADGE_FIRST_CHILD` | `shared/ipc/src/lib.rs` | 16 | encoding artefact (reserved specials) | none | correct as is | None |
 | `IpcMessage.data`, `cap_slots` | `shared/ipc/src/lib.rs` | `MSG_DATA_WORDS_MAX`, `MSG_CAP_SLOTS_MAX` | ABI width | about 552 B per message on the stack | correct as is | None |
 | `IpcMessage.data_len`, `cap_count` | `shared/ipc/src/lib.rs` | `u8` | provably unreachable (at most 64 and 4) | 2 B | correct as is | Pin both against `u8::MAX` with a const assert |

@@ -1150,6 +1150,13 @@ pub mod published_names
     /// `TEST_QUERY_DENY_DEVICE`. Seed-only and seeded only by svctest.
     pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
 
+    /// SEND on devmgr's registry endpoint badged
+    /// `REGISTRY_QUERY_AUTHORITY | DEBUG_PORT_AUTHORITY`: the
+    /// `devmgr.registry` surface plus `QUERY_DEBUG_PORT_DEVICE`, the debug
+    /// port. Seed-only; seeded only by the services that own the debug port
+    /// on a boot that stages them.
+    pub const DEVMGR_DEBUG: &[u8] = b"devmgr.debug";
+
     /// SEND on vfsd's service endpoint badged
     /// `vfsd_labels::MOUNT_AUTHORITY` alone: the `MOUNT` surface, without
     /// `GET_SYSTEM_ROOT_CAP`. Seed-only and seeded only by svctest, whose
@@ -1646,7 +1653,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 14;
+pub const DEVMGR_LABELS_VERSION: u32 = 15;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1873,6 +1880,22 @@ pub mod devmgr_labels
     /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test
     /// labels below.
     pub const QUERY_INPUT_DEVICE: u64 = 11;
+    /// Query for the debug port: the byte transport a debugger stub speaks
+    /// to a host debugger over, apart from the console's UART.
+    ///
+    /// Mints a `serial_labels::WRITE_AUTHORITY | serial_labels::READ_AUTHORITY`-badged
+    /// `SEND_GRANT` cap on the debug port driver's service endpoint, which
+    /// serves the `serial_labels` protocol. The driver is the virtio-console
+    /// driver, spawned for the first `VirtIO` console device devmgr
+    /// enumerates; a boot whose machine presents none has no debug port.
+    /// Caller's badge must have [`DEBUG_PORT_AUTHORITY`] set; the handler
+    /// replies `UNAUTHORIZED` otherwise. Like [`QUERY_INPUT_DEVICE`], it
+    /// replies `NO_DEVICE` until the on-disk drivers are spawned and settled,
+    /// and for the rest of the boot when no debug port driver is served;
+    /// `WITHDRAWN` once the served driver has died; `INVALID_REQUEST` when the
+    /// derivation fails. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`].
+    pub const QUERY_DEBUG_PORT_DEVICE: u64 = 19;
 
     /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
     /// label: trigger devmgr's spawn-orphan fault-injection shim (#176). The
@@ -2050,6 +2073,13 @@ pub mod devmgr_labels
     /// `MOUNT_AUTHORITY` caps with the one consumer devmgr authorises.
     /// Disjoint position from the other authority bits.
     pub const BLOCK_DEVICE_AUTHORITY: u64 = 1u64 << 59;
+    /// Authority bit gating [`QUERY_DEBUG_PORT_DEVICE`], whose reply reads and
+    /// writes the debug port. svcmgr mints it, beside
+    /// [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
+    /// seed-only as [`crate::published_names::DEVMGR_DEBUG`], so only a
+    /// service whose definition seeds that name holds the bit. Disjoint
+    /// position from the other authority bits.
+    pub const DEBUG_PORT_AUTHORITY: u64 = 1u64 << 58;
 }
 
 /// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_FAULT_DRIVERS`. The
@@ -2566,26 +2596,31 @@ pub mod serial_labels
     /// Register a notification kicked when receive data becomes ready.
     ///
     /// Request: the client's notification cap in cap slot 0; the caller's badge
-    /// must carry [`READ_AUTHORITY`]. The driver binds the UART interrupt to
-    /// that notification and arms it. The IRQ is masked on each fire and
-    /// re-armed by the next [`SERIAL_READ_BYTES`], so a client loops: drain
-    /// with `SERIAL_READ_BYTES`, then wait on its notification (with a bounded
-    /// timeout — the driver registers the x86 UART line edge-triggered (mode
-    /// 0), so a byte racing the re-arm is recovered by the timeout-driven
-    /// re-drain). Reply: empty body, status
-    /// in the reply label ([`super::serial_errors::REGISTER_FAILED`] if the
-    /// driver holds no IRQ cap or the binding fails).
+    /// must carry [`READ_AUTHORITY`]. The serial (UART) driver binds the UART
+    /// interrupt to that notification and arms it; the IRQ is masked on each
+    /// fire and re-armed by the next [`SERIAL_READ_BYTES`]. The virtio-console
+    /// driver instead signals the notification from its interrupt-service
+    /// thread on each interrupt of its device. Either way a client loops:
+    /// drain with `SERIAL_READ_BYTES`, then wait on its notification with a
+    /// bounded timeout, so a byte racing the re-arm (the serial driver
+    /// registers the x86 UART line edge-triggered, mode 0) or a lost
+    /// interrupt is recovered by the timeout-driven re-drain. Reply: empty
+    /// body, status in the reply label
+    /// ([`super::serial_errors::REGISTER_FAILED`] if the driver holds no IRQ
+    /// cap or the binding fails).
     pub const SERIAL_REGISTER_RX_NOTIFY: u64 = 3;
 
     /// Authority bit in the serial-service-endpoint badge's high u64 bit.
     /// Set on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_SERIAL_DEVICE`]; gates [`SERIAL_WRITE_BYTES`].
+    /// [`devmgr_labels::QUERY_SERIAL_DEVICE`] and
+    /// [`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`]; gates [`SERIAL_WRITE_BYTES`].
     /// A verb ("may write"), not an identity.
     pub const WRITE_AUTHORITY: u64 = 1u64 << 63;
 
     /// Authority bit gating [`SERIAL_READ_BYTES`] and
     /// [`SERIAL_REGISTER_RX_NOTIFY`]. Set alongside [`WRITE_AUTHORITY`] on caps
-    /// devmgr mints for [`devmgr_labels::QUERY_SERIAL_DEVICE`]. A verb ("may
+    /// devmgr mints for [`devmgr_labels::QUERY_SERIAL_DEVICE`] and
+    /// [`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`]. A verb ("may
     /// read"), not an identity.
     pub const READ_AUTHORITY: u64 = 1u64 << 62;
 }
@@ -2601,8 +2636,9 @@ pub mod serial_errors
     /// `SERIAL_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
-    /// `SERIAL_REGISTER_RX_NOTIFY` could not bind the UART interrupt: the
-    /// driver holds no IRQ cap, or no notification cap was supplied.
+    /// `SERIAL_REGISTER_RX_NOTIFY` could not arrange for the notification to
+    /// be signalled: the driver holds no IRQ cap, no notification cap was
+    /// supplied, or the binding failed.
     pub const REGISTER_FAILED: u64 = 4;
     /// Caller's badge lacks the verb bit gating the requested label
     /// ([`super::serial_labels::WRITE_AUTHORITY`] for writes,
@@ -2892,9 +2928,10 @@ pub mod stream_labels
 /// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
 /// reserve them.
 pub const VERB_BIT_MASK: u64 =
-    (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59);
+    (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59) | (1u64 << 58);
 const _: () = core::assert!(
     devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::DEBUG_PORT_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::TEST_LABEL_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::BLOCK_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0

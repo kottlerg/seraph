@@ -43,7 +43,8 @@ services/svctest/
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
         ├── devmgr.rs          # Block, shutdown, debug-port, label deny; input ordinal; orphan,
         │                      #   withdrawal, DMA confinement
-        ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny
+        ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
+        │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
         │                      #   refused access
         ├── shmem.rs           # Kernel shared-memory objects
@@ -99,11 +100,12 @@ leaves the system idle, as on the pass path. A fault in svctest's own process (a
 a stack overflow) kills it without running either hook, so it logs neither marker.
 
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
-skip and return when their cap is zero; the devmgr deny and input-ordinal phases (`caps[2]`), the
-orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`), the svcmgr seed-only
-phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names it resolves), the
-svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd phases (`caps[4]`, `caps[5]`),
-and the `crash_endpoint` phase (`caps[6]`) instead fail their assertions. The seed-only phase thus
+skip and return when their cap is zero; the devmgr deny, input-ordinal, and drivers stray-cap
+phases (`caps[2]`), the orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`),
+the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names
+it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd phases
+(`caps[4]`, `caps[5]`), and the `crash_endpoint` phase (`caps[6]`) instead fail their
+assertions. The seed-only phase thus
 fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
 zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and
 the run ends idle.
@@ -127,7 +129,7 @@ slot stays zero.
 |-----------|-------------------|----------------------------------------|
 | `caps[0]` | `rootfs.root`     | `ns` phase                             |
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
-| `caps[2]` | `devmgr.registry` | devmgr deny and input-ordinal phases   |
+| `caps[2]` | `devmgr.registry` | devmgr deny, input-ordinal, and drivers stray-cap phases |
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, driver withdrawal, DMA confinement, drivers deny |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases          |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase                |

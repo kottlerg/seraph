@@ -816,7 +816,12 @@ unregistered, so no spawn fails for the bound. procmgr does not compare a regist
 threads it holds: a thread registered twice takes two entries, both counting toward the bound, and
 the runtime registers each thread once. procmgr does not check that the thread runs in the
 sender's address space, which no kernel query gives: a sender can register only a thread it holds
-`CONTROL` on, which already lets it read and change that thread.
+`CONTROL` on, which already lets it read and change that thread. A sender that registers another
+process's thread so held, one bound under that process's crash binding, has procmgr rebind it into
+the sender's registry: that thread's faults then reach the crash service under a crash badge
+the sender's process holds, and are reported against the sender's image, and the other process's
+`DECLARE_NO_DEBUG` no longer unbinds it. Such a cap comes only from the other process itself or
+from a debug-authority holder's attach, so no process gains this over a thread it was not given.
 
 Replies `SUCCESS`; refusals, in order: `INVALID_BADGE` when the badge names no live process;
 `NOT_ATTACHABLE` when the process declared itself undebuggable (Label 21), on which the runtime

@@ -9,9 +9,11 @@
 //! Each thread the runtime spawns registers a Thread cap of its own; procmgr
 //! keeps it in the process's [`ThreadRegistry`] until the thread exits, the
 //! runtime revokes the cap when it reclaims the thread, or the process is torn
-//! down. A thread whose exception class carries one of its process's crash
-//! badges is rebound under a fresh one ([`CrashBadges`]), so the badge of a
-//! fault message names the faulting thread. The registry holds slot indices
+//! down. A thread whose exception class is bound under its process badge or
+//! under any crash badge (`ProcessEntry::is_crash_binding`), as one that
+//! copied its spawner's bindings is, is rebound under a fresh crash badge
+//! ([`CrashBadges`]), so the badge of a fault message names the faulting
+//! thread. The registry holds slot indices
 //! only; procmgr reads each slot's liveness and passes the answer in, so this
 //! module is host-tested (`services/procmgr/docs/ipc-interface.md`
 //! § `REGISTER_THREAD`).
@@ -29,10 +31,11 @@ use ipc::procmgr_labels::REGISTERED_THREADS_MAX;
 pub const CRASH_BADGE_TAG: u64 = 1 << 63;
 const _: () = assert!(CRASH_BADGE_TAG & ipc::VERB_BIT_MASK != 0);
 
-/// Registered threads at or below which a registration never sweeps: the
-/// first sweep comes at this many, and later ones at twice what the last
-/// sweep kept, so the sweeps cost at most two liveness reads per
-/// registration ([`ThreadRegistry::needs_sweep`]).
+/// Registered threads below which a registration never sweeps: the first
+/// sweep comes at this many, and later ones at twice what the last sweep
+/// kept, or at the bound when that lies past it, each once half as many
+/// requests as threads it reads came since the last
+/// ([`ThreadRegistry::needs_sweep`]).
 const FIRST_SWEEP_AT: usize = 64;
 
 /// One registered thread.

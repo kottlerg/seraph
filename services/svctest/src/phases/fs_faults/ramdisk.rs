@@ -165,7 +165,9 @@ impl RamDisk
     {
         (ROOT_LBA..ROOT_LBA + ROOT_SECTORS).find_map(|lba| {
             self.sector(lba)
-                .chunks_exact(32)
+                .as_chunks::<32>()
+                .0
+                .iter()
                 .position(|slot| slot[..11] == *sfn && slot[11] != 0x0F)
                 .map(|i| (lba, i * 32))
         })

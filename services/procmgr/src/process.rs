@@ -2298,14 +2298,12 @@ fn create_process_from_bytes(
     }
 
     let tls_seg = elf::tls_segment(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?;
-    let tls_template = tls_seg
-        .map(|s| ChildTlsTemplate {
-            vaddr: s.vaddr + bias,
-            filesz: s.filesz,
-            memsz: s.memsz,
-            align: s.align,
-        })
-        .unwrap_or_default();
+    let tls_template = tls_seg.map_or_default(|s| ChildTlsTemplate {
+        vaddr: s.vaddr + bias,
+        filesz: s.filesz,
+        memsz: s.memsz,
+        align: s.align,
+    });
 
     let main_tls = if let Some(seg) = tls_seg
         && tls_template.memsz != 0
@@ -3328,14 +3326,12 @@ pub fn create_process_from_file(
     // VFS read to pull `.tdata` into the main thread's TLS block.
     let tls_seg = elf::tls_segment_metadata(ehdr, header_data, file_size)
         .map_err(|_| procmgr_errors::INVALID_ELF)?;
-    let tls_template = tls_seg
-        .map(|s| ChildTlsTemplate {
-            vaddr: s.vaddr + bias,
-            filesz: s.filesz,
-            memsz: s.memsz,
-            align: s.align,
-        })
-        .unwrap_or_default();
+    let tls_template = tls_seg.map_or_default(|s| ChildTlsTemplate {
+        vaddr: s.vaddr + bias,
+        filesz: s.filesz,
+        memsz: s.memsz,
+        align: s.align,
+    });
 
     // Done with the header page; the scratch mapping owns `hdr_memory` and
     // its Drop releases both the VA reservation and the cap slot.

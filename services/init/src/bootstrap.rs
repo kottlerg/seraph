@@ -1349,9 +1349,8 @@ pub unsafe fn write_memmgr_aux_memory(
             mm_final.in_use_count as u64,
         );
     }
-    for i in 0..mm_final.in_use_count
+    for (i, arena) in mm_final.in_use[..mm_final.in_use_count].iter().enumerate()
     {
-        let arena = mm_final.in_use[i];
         let base = mb::IN_USE_BASE_IDX + i * mb::IN_USE_WORDS;
         // SAFETY: base + 3 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the page.
         unsafe {

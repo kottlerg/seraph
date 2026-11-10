@@ -654,7 +654,7 @@ unsafe fn deliver_once(
         // A handler was waiting; enqueue it so it can service the fault.
         // SAFETY: woken_handler returned by endpoint_call; valid TCB.
         unsafe {
-            debug_assert!((*woken_handler).magic == crate::sched::thread::TCB_MAGIC);
+            debug_assert_eq!((*woken_handler).magic, crate::sched::thread::TCB_MAGIC);
             let target_cpu = crate::sched::select_target_cpu(woken_handler);
             crate::sched::enqueue_and_wake(woken_handler, target_cpu);
         }

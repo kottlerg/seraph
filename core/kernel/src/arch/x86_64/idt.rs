@@ -513,34 +513,31 @@ pub(super) unsafe extern "C" fn common_exception_handler(
         }
         crate::arch::current::cpu::halt_loop();
     }
-    else
-    {
-        let cpu = super::cpu::current_cpu();
-        crate::kprintln!(
-            "KERNEL EXCEPTION: cpu={} cause={} (vec={} err={:#x})",
-            cpu,
-            x86_exception_name(vector),
-            vector,
-            error_code,
-        );
-        // `rip`, `cr2` and the register file can hold kernel VAs, and `fatal`
-        // halts only this CPU: serial only
-        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
-        // diagnostics).
-        crate::kprintln_serial!("  rip={:#018x}  cr2={:#018x}", f.rip, cr2);
-        crate::kprintln!("  cs={:#x}  rflags={:#018x}", f.cs, f.rflags,);
-        dump_x86_regs(f);
-        fatal(
-            if (f.cs & 3) != 0
-            {
-                "hardware NMI or abort taken from ring 3"
-            }
-            else
-            {
-                "unhandled kernel exception"
-            },
-        );
-    }
+    let cpu = super::cpu::current_cpu();
+    crate::kprintln!(
+        "KERNEL EXCEPTION: cpu={} cause={} (vec={} err={:#x})",
+        cpu,
+        x86_exception_name(vector),
+        vector,
+        error_code,
+    );
+    // `rip`, `cr2` and the register file can hold kernel VAs, and `fatal`
+    // halts only this CPU: serial only
+    // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+    // diagnostics).
+    crate::kprintln_serial!("  rip={:#018x}  cr2={:#018x}", f.rip, cr2);
+    crate::kprintln!("  cs={:#x}  rflags={:#018x}", f.cs, f.rflags,);
+    dump_x86_regs(f);
+    fatal(
+        if (f.cs & 3) != 0
+        {
+            "hardware NMI or abort taken from ring 3"
+        }
+        else
+        {
+            "unhandled kernel exception"
+        },
+    );
 }
 
 /// Generic exception dispatch for vectors routed through
@@ -1636,7 +1633,7 @@ extern "C" fn ipi_nmi_backtrace_handler(tf: *const TrapFrame, vector: u64, error
     let cpu = super::cpu::current_cpu() as usize;
     let requested = super::interrupts::nmi_backtrace_request(cpu).is_some_and(|pending| {
         pending
-            .fetch_update(
+            .try_update(
                 core::sync::atomic::Ordering::AcqRel,
                 core::sync::atomic::Ordering::Acquire,
                 |n| n.checked_sub(1),

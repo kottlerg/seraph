@@ -704,76 +704,73 @@ unsafe fn kernel_entry_post_rebase(
                 // (core/kernel/docs/initialization.md § Phase 8).
                 fatal("smp: no AP trampoline page; listed CPUs cannot be brought online");
             }
-            else
-            {
-                kprintln!("smp: starting {} AP(s)", ap_count);
+            kprintln!("smp: starting {} AP(s)", ap_count);
 
-                // Copy/patch the trampoline code into the physical page.
-                // SAFETY: direct physical map active (Phase 3); trampoline_pa
-                // from BootInfo points to the bootloader-allocated trampoline page
-                // (below 1 MiB on x86-64; any 4 KiB frame on RISC-V).
-                unsafe {
-                    arch::current::ap_trampoline::setup_trampoline(trampoline_pa);
-                }
-
-                let entry_fn = kernel_entry_ap as *const () as u64;
-                // SAFETY: the BootInfo page and the CPU-id pages are intact
-                // until Phase 9's reclaim scrub, and nothing writes the ids.
-                let hw_ids = unsafe { boot_cpu_ids(boot_info_phys, boot_cpu_count) };
-
-                for cpu_idx in 1..=ap_count
-                {
-                    let hw_id = hw_ids[cpu_idx];
-                    // SAFETY: the idle stacks and their tops slab come from
-                    // Phase 4 storage (sched::init_storage), and the idle TCBs
-                    // were initialised in Phase 8 (sched::init);
-                    // cpu_idx < boot_cpu_count by the loop bound.
-                    let stack_top = unsafe { sched::idle_stack_top_for(cpu_idx) };
-
-                    // Arch-specific: write params + send SIPI / SBI hart_start.
-                    // SAFETY: trampoline setup complete above; all boot phases
-                    // (2-8) initialized; AP will use shared kernel state.
-                    let ok = unsafe {
-                        arch::current::ap_trampoline::start_ap(
-                            trampoline_pa,
-                            cpu_idx as u32,
-                            hw_id,
-                            entry_fn,
-                            stack_top,
-                        )
-                    };
-                    // A listed CPU that cannot be started is fatal
-                    // (core/kernel/docs/initialization.md § Phase 8); on x86-64
-                    // SIPI delivery is unacknowledged, so `start_ap` cannot
-                    // report one, and a CPU that never answers is caught by the
-                    // bounded wait below.
-                    if !ok
-                    {
-                        fatal("smp: start_ap failed; a listed CPU cannot be brought online");
-                    }
-
-                    // Bounded in time, not spins: an AP that never answers
-                    // (an unacknowledged SIPI, a hart the SBI started into a
-                    // fault) halts the boot naming it instead of hanging it.
-                    let online = bounded_wait::spin_until(
-                        || APS_READY.load(Ordering::Acquire) >= cpu_idx as u32,
-                        arch::current::timer::elapsed_us,
-                        AP_ONLINE_BUDGET_US,
-                    );
-                    if !online
-                    {
-                        kprintln!(
-                            "smp: CPU {} (hardware id {:#x}) did not come online within {} ms",
-                            cpu_idx,
-                            hw_id,
-                            AP_ONLINE_BUDGET_US / 1_000
-                        );
-                        fatal("smp: a listed CPU did not come online");
-                    }
-                }
-
-                kprintln!("smp: all {} AP(s) online", ap_count);
+            // Copy/patch the trampoline code into the physical page.
+            // SAFETY: direct physical map active (Phase 3); trampoline_pa
+            // from BootInfo points to the bootloader-allocated trampoline page
+            // (below 1 MiB on x86-64; any 4 KiB frame on RISC-V).
+            unsafe {
+                arch::current::ap_trampoline::setup_trampoline(trampoline_pa);
             }
+
+            let entry_fn = kernel_entry_ap as *const () as u64;
+            // SAFETY: the BootInfo page and the CPU-id pages are intact
+            // until Phase 9's reclaim scrub, and nothing writes the ids.
+            let hw_ids = unsafe { boot_cpu_ids(boot_info_phys, boot_cpu_count) };
+
+            for cpu_idx in 1..=ap_count
+            {
+                let hw_id = hw_ids[cpu_idx];
+                // SAFETY: the idle stacks and their tops slab come from
+                // Phase 4 storage (sched::init_storage), and the idle TCBs
+                // were initialised in Phase 8 (sched::init);
+                // cpu_idx < boot_cpu_count by the loop bound.
+                let stack_top = unsafe { sched::idle_stack_top_for(cpu_idx) };
+
+                // Arch-specific: write params + send SIPI / SBI hart_start.
+                // SAFETY: trampoline setup complete above; all boot phases
+                // (2-8) initialized; AP will use shared kernel state.
+                let ok = unsafe {
+                    arch::current::ap_trampoline::start_ap(
+                        trampoline_pa,
+                        cpu_idx as u32,
+                        hw_id,
+                        entry_fn,
+                        stack_top,
+                    )
+                };
+                // A listed CPU that cannot be started is fatal
+                // (core/kernel/docs/initialization.md § Phase 8); on x86-64
+                // SIPI delivery is unacknowledged, so `start_ap` cannot
+                // report one, and a CPU that never answers is caught by the
+                // bounded wait below.
+                if !ok
+                {
+                    fatal("smp: start_ap failed; a listed CPU cannot be brought online");
+                }
+
+                // Bounded in time, not spins: an AP that never answers
+                // (an unacknowledged SIPI, a hart the SBI started into a
+                // fault) halts the boot naming it instead of hanging it.
+                let online = bounded_wait::spin_until(
+                    || APS_READY.load(Ordering::Acquire) >= cpu_idx as u32,
+                    arch::current::timer::elapsed_us,
+                    AP_ONLINE_BUDGET_US,
+                );
+                if !online
+                {
+                    kprintln!(
+                        "smp: CPU {} (hardware id {:#x}) did not come online within {} ms",
+                        cpu_idx,
+                        hw_id,
+                        AP_ONLINE_BUDGET_US / 1_000
+                    );
+                    fatal("smp: a listed CPU did not come online");
+                }
+            }
+
+            kprintln!("smp: all {} AP(s) online", ap_count);
         }
     }
 

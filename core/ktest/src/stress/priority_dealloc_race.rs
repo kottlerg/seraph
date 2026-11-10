@@ -109,11 +109,11 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// thread) — priority placement only matters once they have been on a queue.
 fn spawn_workers(ctx: &TestContext, moved: u64, workers: &mut Workers) -> TestResult
 {
-    for i in 0..NUM_WORKERS
+    for (i, child) in workers.children.iter_mut().enumerate()
     {
-        workers.children[i] = spawn::new_child(ctx)
+        *child = spawn::new_child(ctx)
             .map_err(|_| "stress::priority_dealloc_race: spawn::new_child failed")?;
-        let child = &workers.children[i];
+        let child = &*child;
         let child_moved = cap_copy(moved, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "stress::priority_dealloc_race: cap_copy moved failed")?;
         // SAFETY: i < NUM_WORKERS; entry i's previous worker (if any, from

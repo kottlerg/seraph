@@ -1369,7 +1369,7 @@ pub(crate) fn slot_reuse_file(ipc_buf: *mut u64) -> usize
     let mut page = vec![0u8; SLOT_REUSE_PAGE];
     for i in 0..pages
     {
-        for chunk in page.chunks_exact_mut(8)
+        for chunk in page.as_chunks_mut::<8>().0
         {
             chunk.copy_from_slice(&page_tag(i));
         }

@@ -12,12 +12,12 @@
 //! started. This child blocks on `stdin().read_line(..)` until those bytes
 //! arrive, processes them, and emits the result through `println!`.
 
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 
 fn main()
 {
     let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+    let mut reader = stdin.lock();
     let mut line = String::new();
     let n = match reader.read_line(&mut line)
     {

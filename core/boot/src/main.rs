@@ -12,7 +12,6 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
-#![feature(never_type)]
 
 mod acpi;
 mod arch;
@@ -1349,9 +1348,8 @@ fn collect_identity_regions(
     };
 
     // Kernel ELF segments.
-    for i in 0..kernel.info.segment_count
+    for seg in &kernel.info.segments[..kernel.info.segment_count]
     {
-        let seg = &kernel.info.segments[i];
         push(seg.phys_base, (seg.size + 4095) & !4095);
     }
     // Fixed boot allocations.
@@ -1363,9 +1361,8 @@ fn collect_identity_regions(
     // produced by `load_init` against the bundle slice for the `init` entry.
     // `phys_addr` carries the `p_vaddr` in-page offset; `build_initial_tables`
     // maps every page the byte range touches.
-    for i in 0..(init.image.segment_count as usize)
+    for seg in &init.image.segments[..init.image.segment_count as usize]
     {
-        let seg = &init.image.segments[i];
         push(seg.phys_addr, seg.size);
     }
     // Bundle blob: one allocation covers every module body and the init

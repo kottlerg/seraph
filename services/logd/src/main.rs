@@ -689,7 +689,7 @@ fn consume_bytes(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: 
 fn flush_partial(badge: u64, slot: &mut crate::slot::Slot)
 {
     let name = slot.name.clone();
-    let line: Vec<u8> = slot.partial.drain(..).collect();
+    let line = std::mem::take(&mut slot.partial);
     emit_line(badge, &name, &line);
     let us = elapsed_us();
     slot.push_history(us, &line);

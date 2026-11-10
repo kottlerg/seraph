@@ -4660,7 +4660,7 @@ unsafe fn relocate_ready_thread(
     }
 
     // The relocation only proceeds for a Ready candidate.
-    debug_assert!(state == thread::ThreadState::Ready);
+    debug_assert_eq!(state, thread::ThreadState::Ready);
     // SAFETY: both run-queue locks held; tcb pinned by them. `remove_from_queue`
     // is the authoritative located-on-src check at `priority`.
     if !unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) }

@@ -133,8 +133,6 @@ font = { path = "shared/font" }
 mmio = { path = "shared/mmio" }
 text = { path = "shared/text" }
 syscall = { path = "abi/syscall", package = "syscall-abi" }
-syscall-abi = { path = "abi/syscall" }
-virtio-core = { path = "services/drivers/virtio/core" }
 
 # opt-level = 2 and debug = 0 are unified across both profiles; debuginfo is
 # opt-in per-package via `cargo xtask build --debug <comp>`. dev and release

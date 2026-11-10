@@ -508,16 +508,9 @@ pub fn read_dir_entry_at_index(
             }
         }
 
-        if let Some(next) = next_dir_cluster(state, cluster, &mut steps, cache, block_dev, ipc_buf)
+        cluster = next_dir_cluster(state, cluster, &mut steps, cache, block_dev, ipc_buf)
             .ok()
-            .flatten()
-        {
-            cluster = next;
-        }
-        else
-        {
-            return None;
-        }
+            .flatten()?;
     }
 }
 

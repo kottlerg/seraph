@@ -698,7 +698,7 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
         // Enqueue the server and yield so it can run.
         // SAFETY: woken_server returned by endpoint_call; is valid TCB.
         unsafe {
-            debug_assert!((*woken_server).magic == crate::sched::thread::TCB_MAGIC);
+            debug_assert_eq!((*woken_server).magic, crate::sched::thread::TCB_MAGIC);
             let target_cpu = crate::sched::select_target_cpu(woken_server);
             debug_assert!(target_cpu < crate::sched::MAX_CPUS);
             crate::sched::enqueue_and_wake(woken_server, target_cpu);
@@ -1136,7 +1136,7 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
                 .fault_outcome
                 .store(outcome, core::sync::atomic::Ordering::Release);
             crate::sched::thread::stamp_deposit_episode(caller);
-            debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
+            debug_assert_eq!((*caller).magic, crate::sched::thread::TCB_MAGIC);
             let target_cpu = crate::sched::select_target_cpu(caller);
             debug_assert!(target_cpu < crate::sched::MAX_CPUS);
             crate::sched::enqueue_and_wake(caller, target_cpu);
@@ -1235,7 +1235,7 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
             caller,
             crate::sched::thread::PARK_DISPOSITION_REPLY,
         );
-        debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
+        debug_assert_eq!((*caller).magic, crate::sched::thread::TCB_MAGIC);
         let target_cpu = crate::sched::select_target_cpu(caller);
         debug_assert!(target_cpu < crate::sched::MAX_CPUS);
         crate::sched::enqueue_and_wake(caller, target_cpu);
@@ -1501,7 +1501,7 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
             // A waiter was woken; enqueue it.
             // SAFETY: woken returned by event_queue_post; is valid TCB.
             unsafe {
-                debug_assert!((*woken).magic == crate::sched::thread::TCB_MAGIC);
+                debug_assert_eq!((*woken).magic, crate::sched::thread::TCB_MAGIC);
                 let target_cpu = crate::sched::select_target_cpu(woken);
                 debug_assert!(target_cpu < crate::sched::MAX_CPUS);
                 crate::sched::enqueue_and_wake(woken, target_cpu);

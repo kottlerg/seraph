@@ -865,7 +865,7 @@ impl CSpace
         let mut prev = old_tail;
         let mut first: Option<NonZeroU32> = None;
         let mut new_free = 0usize;
-        for i in start_slot..L2_SIZE
+        for (i, slot) in page.slots.iter_mut().enumerate().skip(start_slot)
         {
             // `base + i >= 1`: `start_slot` skips slot 0 of the first leaf. A
             // zero index (unreachable) is left off the list — fail closed —
@@ -884,8 +884,8 @@ impl CSpace
             {
                 None
             };
-            page.slots[i].set_next_free(next);
-            page.slots[i].set_prev_free_link(prev);
+            slot.set_next_free(next);
+            slot.set_prev_free_link(prev);
             prev = Some(idx);
             first.get_or_insert(idx);
             new_free += 1;
@@ -1489,9 +1489,8 @@ impl CSpace
                 // sentinel, checked above) and not aliased outside the lock.
                 let page = unsafe { &*page };
                 let start = usize::from(leaf_idx == 0);
-                for slot_idx in start..L2_SIZE
+                for slot in &page.slots[start..]
                 {
-                    let slot = &page.slots[slot_idx];
                     if slot.tag != CapTag::Null
                         && let Some(obj) = slot.object
                     {

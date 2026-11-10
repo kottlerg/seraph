@@ -98,7 +98,7 @@ pub fn config_offset(start_bus: u8, bus: u8, dev: u8, func: u8, reg: u16) -> Opt
 /// address bits the device implements; 0 when `mask` is 0.
 fn lowest_set_bit(mask: u64) -> u64
 {
-    mask & mask.wrapping_neg()
+    mask.isolate_lowest_one()
 }
 
 /// Size of a memory BAR from the all-ones sizing read-back of its low

@@ -58,7 +58,7 @@ defines the record. Five points it leaves to you:
   than the highest `run` among the records already saved. It orders the runs, and the gate
   reads the highest one at the head; the `-<n>` suffix only keeps two file names apart.
 - A finding's `status` is `unverified`, or `nit` for a nit that cannot block, or `contested`
-  once the finding is put to the maintainer.
+  once the author disputes it.
 - `ledgered` holds the findings the reviewer lists under its `Ledger (not re-raised)` heading.
 - In an `audit` record, `verdict` is the reviewer verdict the audit states, `findings` holds the
   surface findings of the last reviewer run that the audit lists as unfixed, each as that run's
@@ -98,8 +98,9 @@ Handle a run's findings in one pass.
   --label <class> --milestone <current> --body-file <file>`.
 - `AUDIT FAIL`: fix each item with `gh pr edit`, `cargo xtask issue-edit`, or a commit, and
   re-run the audit.
-- A finding you dispute is contested: put it to the maintainer, and resolve it as
-  docs/conventions.md § Contested findings says. Never waive one.
+- A finding you dispute is contested: put it to the one docs/conventions.md § Contested
+  findings names (a worker to its orchestrator, a standalone session to the maintainer), and
+  resolve it as that section says. Never waive one.
 
 Before pushing a fix, for every fact it changes (a symbol, a constant, a rule sentence, a
 section name) walk the `## Summarized By` lists (docs/documentation-standards.md § Change

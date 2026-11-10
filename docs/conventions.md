@@ -265,13 +265,23 @@ be waived or ruled outside the standards.
 
 ### Contested findings
 
-A finding the PR's author disputes, on the facts or on the rule it cites, is contested and MUST
-be put to the maintainer.
+A finding the PR's author disputes, on the facts or on the rule it cites, is contested. It MUST
+NOT be waived, and it is decided, not left open:
+
+- In an orchestrated batch the orchestrator decides it. Before deciding, it has the reviewer
+  re-read the finding against the author's argument in one delta run, since the author and the
+  orchestrator both want the PR merged and the reviewer does not; the re-read informs the
+  decision, which stays the orchestrator's.
+- It is put to the maintainer when it turns on a design question no document settles, when
+  resolving it would materially expand the PR's scope, when the author and the orchestrator
+  disagree, and always in a session working alone with the maintainer.
+
+The decision resolves the finding:
 
 - On the surface it MUST resolve in the same PR: as a fix; as a clarification of the rule it
-  misread; or, when the maintainer finds it false on the facts, as a clarification of the code or
-  document it misread.
-- Off the surface it is recorded, with the maintainer's answer, on the Issue that records it
+  misread; or, when it is found false on the facts, as a clarification of the code or document
+  it misread.
+- Off the surface it is recorded, with the decision, on the Issue that records it
   (§ Recording findings); or, when it misread a rule, it is resolved by the clarification of
   that rule alone, which is its record.
 
@@ -389,11 +399,12 @@ records a finding is the first of these that applies:
 
 ### Ledger
 
-A later run of the same PR, delta or full, MUST NOT re-raise a finding an earlier run recorded,
-dropped, or the maintainer ruled on, unless the hunk it anchors to changed since the run that
-reported it, or that run no longer resolves in the clone. The reviewer reads a ledger built from
-the saved run records, each entry naming its run; a finding the ledger holds whose hunk is
-unchanged since the run its entry names, when that run resolves, is listed, not counted.
+A later run of the same PR, delta or full, MUST NOT re-raise a finding an earlier run recorded
+or dropped, or that was decided as § Contested findings says, unless the hunk it anchors to
+changed since the run that reported it, or that run no longer resolves in the clone. The
+reviewer reads a ledger built from the saved run records, each entry naming its run; a finding
+the ledger holds whose hunk is unchanged since the run its entry names, when that run resolves,
+is listed, not counted.
 
 ### Branch naming
 

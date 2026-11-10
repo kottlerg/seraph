@@ -1867,6 +1867,7 @@ dependencies = [
  "logd-codec",
  "object",
  "regex",
+ "serde_json",
  "syscall-abi",
  "uuid",
  "which",

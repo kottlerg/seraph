@@ -28,6 +28,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # commit-check reads the pull request's commits back to the base
+          # branch; the default depth of 1 holds only the merge commit.
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -42,6 +46,13 @@ jobs:
 
       - name: cargo xtask lint-docs
         run: cargo xtask lint-docs
+
+      - name: cargo xtask commit-check
+        if: github.event_name == 'pull_request'
+        run: >-
+          cargo xtask commit-check
+          --base origin/${{ github.base_ref }}
+          --head ${{ github.event.pull_request.head.sha }}
 
       - name: cargo xtask test
         run: cargo xtask test

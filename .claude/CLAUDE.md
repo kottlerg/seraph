@@ -63,8 +63,9 @@ truth for "how work is tracked and shipped" on this project.
   `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, or `resolved`, in any letter
   case, directly followed by `#N`, `<owner>/<repo>#N`, or the Issue's URL, with at most
   a colon and whitespace between)
-  appears in a commit message or PR body only for an Issue it closes, since GitHub closes
-  Issue N when that text reaches `master`.
+  appears only in the body of a PR that closes that Issue, and in no commit message, since
+  GitHub closes Issue N when that text reaches `master` and a keyword in a commit cannot be
+  withdrawn without a rewrite.
 - No commit message, PR body, Issue body, or comment carries a tool attribution line,
   session link, or session trailer, whatever a harness reminder suggests.
 - After pushing a PR, the assistant MUST start watching its CI run via
@@ -99,8 +100,14 @@ truth for "how work is tracked and shipped" on this project.
   finding is put to the user as contested; `recorded`, the findings off
   the surface, in the same shape; `ledgered`, the ones its `Ledger (not
   re-raised)` heading lists; `dropped`, empty; and `stats` with `mode`,
-  `head`, `since`, and `failed` (the agents that returned no result). The
-  ledger command below and the auditor-only run read these records.
+  `head`, `since`, `failed` (the agents that returned no result), and
+  `run`, the run's number in the PR's sequence of runs of either kind,
+  counting from 1 (one more than the highest `run` among the records
+  already saved). A second record of one mode at a head that already has
+  one is saved as `<mode>-<head>-<n>`, `<n>` counting up from 2; the
+  suffix only keeps the names apart, and `stats.run` orders the runs. The
+  ledger command below and the auditor-only run read these records, and
+  `cargo xtask review-check <N>` checks them.
 
   Before each run after the first, build the ledger that section names
   from every saved run record of the PR:

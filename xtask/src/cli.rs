@@ -130,6 +130,38 @@ pub enum CliCommand
     /// links, and document reachability from the root README. Runs in CI's
     /// host-tests job; see xtask/README.md for the rule list and levels.
     LintDocs(LintDocsArgs),
+
+    /// Check the commits of a range against the commit-message rules of
+    /// docs/conventions.md: subject form and width, Issue references and
+    /// planning labels in the subject, closing keywords, attribution, and
+    /// signatures. Runs in CI's host-tests job on a pull request; see
+    /// xtask/README.md for the rule list and levels.
+    CommitCheck(CommitCheckArgs),
+
+    /// Check a pull request against the rules of docs/conventions.md a script
+    /// can decide: its commits, its body's boxes and validated head, its
+    /// milestone, and the Issues it closes or references; with `--gate`, the
+    /// merge gate too. Reads GitHub through `gh` (see xtask/README.md).
+    PrCheck(PrCheckArgs),
+
+    /// Validate the saved run records of a pull request's pre-merge review
+    /// (`target/xtask/review/pr<N>/`) against the record shape (see
+    /// xtask/README.md).
+    ReviewCheck(ReviewCheckArgs),
+
+    /// Build `ledger.json` from the saved run records of a pull request's
+    /// pre-merge review: the findings a later run must not re-raise (see
+    /// xtask/README.md).
+    ReviewLedger(ReviewLedgerArgs),
+
+    /// Replace a GitHub Issue's body from a file, refusing an empty body or
+    /// one that lost task-list items, keeping a backup, and verifying the
+    /// edit (see xtask/README.md).
+    IssueEdit(IssueEditArgs),
+
+    /// File a GitHub Issue with the labels and milestone docs/conventions.md
+    /// requires, and verify that both were applied (see xtask/README.md).
+    IssueFile(IssueFileArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -808,3 +840,96 @@ fn parse_hex_arg(text: &str) -> Result<u64, String>
 
 #[derive(Parser)]
 pub struct LintDocsArgs {}
+
+// ── CommitCheck ───────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct CommitCheckArgs
+{
+    /// The commit or ref the range starts after.
+    #[arg(long, default_value = "origin/master")]
+    pub base: String,
+
+    /// The commit or ref the range ends at.
+    #[arg(long, default_value = "HEAD")]
+    pub head: String,
+
+    /// Fail on warnings too.
+    #[arg(long)]
+    pub strict: bool,
+}
+
+// ── PrCheck ───────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct PrCheckArgs
+{
+    /// The pull request's number.
+    pub pr: u64,
+
+    /// Also check the merge gate: every check green, a clean merge state, the
+    /// base branch included, and a passing last review record for the head.
+    #[arg(long)]
+    pub gate: bool,
+
+    /// Fail on warnings too.
+    #[arg(long)]
+    pub strict: bool,
+}
+
+// ── ReviewCheck / ReviewLedger ────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct ReviewCheckArgs
+{
+    /// The pull request's number.
+    pub pr: u64,
+}
+
+#[derive(Parser)]
+pub struct ReviewLedgerArgs
+{
+    /// The pull request's number.
+    pub pr: u64,
+}
+
+// ── IssueEdit / IssueFile ─────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct IssueEditArgs
+{
+    /// The Issue's number.
+    pub issue: u64,
+
+    /// The file holding the new body.
+    #[arg(long)]
+    pub body_file: PathBuf,
+
+    /// Allow a body with fewer task-list items than the Issue has.
+    #[arg(long)]
+    pub allow_removal: bool,
+}
+
+#[derive(Parser)]
+pub struct IssueFileArgs
+{
+    /// The Issue's title.
+    #[arg(long)]
+    pub title: String,
+
+    /// The file holding the body.
+    #[arg(long)]
+    pub body_file: PathBuf,
+
+    /// A label; repeat for each. At least one subsystem and one class label.
+    #[arg(long)]
+    pub label: Vec<String>,
+
+    /// The milestone's title.
+    #[arg(long)]
+    pub milestone: Option<String>,
+
+    /// File without a milestone: future-state work no release has scheduled.
+    #[arg(long)]
+    pub unscheduled: bool,
+}

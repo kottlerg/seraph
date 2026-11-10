@@ -372,7 +372,8 @@ gives the PR-level linear view.
 - Every PR body MUST report, in its `## Validation` section, each local host
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes (each
   boundary run, the memory variation, and each device cell: the storage cells,
-  the no-IOMMU variant, and the framebuffer cell, per architecture), with its `--runs` count, its
+  the no-IOMMU variant, the framebuffer cell, and the debug-port cell, per architecture), with its
+  `--runs` count, its
   outcome, and the head it ran at (a run the PR does not owe that HANGs or
   fails as that section allows, with the link to its record), or state that
   none is owed and why (that the PR's changes outside Markdown are all inert,
@@ -438,8 +439,9 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    times each in the debug profile and once each in the release profile, and
    the memory variation, the disk variations (a 4Kn disk and three
    second-disk boots, on both architectures), the no-IOMMU variant
-   (`--iommu absent`, svctest, on both architectures), and the framebuffer
-   cell (`--display framebuffer`, svctest, on both architectures) once each.
+   (`--iommu absent`, svctest, on both architectures), the framebuffer
+   cell (`--display framebuffer`, svctest, on both architectures), and the
+   debug-port cell (`test-debug-port`, on both architectures) once each.
    Their report, each run's command, `--runs` count, outcome, and head, is
    written to `target/xtask/review/release-v<X>.<Y>.<Z>/host-runs.md`, the
    file the release audit reads; the release PR's body states its own local

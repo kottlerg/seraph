@@ -83,6 +83,7 @@ fn main()
         CliCommand::TestLogdReclaim(args) => commands::test_logd_reclaim::run(&ctx, args),
         CliCommand::TestCrashReport(args) => commands::test_crash_report::run(args),
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),
+        CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
     };
 

@@ -101,14 +101,20 @@ services/drivers/
 │   │       ├── lib.rs              # Request-length and reply-label logic (host-tested)
 │   │       ├── main.rs
 │   │       └── io.rs
-│   └── input/                      # VirtIO input (keyboard) device driver (binary + lib)
+│   ├── input/                      # VirtIO input (keyboard) device driver (binary + lib)
+│   │   ├── Cargo.toml
+│   │   ├── README.md               # Input-driver IPC interface (INPUT_READ_EVENTS)
+│   │   └── src/
+│   │       ├── lib.rs              # READ_AUTHORITY verb-bit gate (host-tested)
+│   │       ├── main.rs
+│   │       ├── input.rs            # Event virtqueue receive-buffer ring
+│   │       └── decode.rs           # Keycode → keysym tables + modifier state
+│   └── console/                    # VirtIO console driver: the debug port (binary + lib)
 │       ├── Cargo.toml
-│       ├── README.md               # Input-driver IPC interface (INPUT_READ_EVENTS)
+│       ├── README.md               # Debug-port binding, serial protocol, queues
 │       └── src/
-│           ├── lib.rs              # READ_AUTHORITY verb-bit gate (host-tested)
-│           ├── main.rs
-│           ├── input.rs            # Event virtqueue receive-buffer ring
-│           └── decode.rs           # Keycode → keysym tables + modifier state
+│           ├── lib.rs              # Serial verb-bit gate, received-byte queue (host-tested)
+│           └── main.rs
 └── docs/
     ├── driver-model.md             # Driver lifecycle and capability delegation
     └── virtio-architecture.md      # VirtIO transport abstraction and queue internals
@@ -178,6 +184,7 @@ The full driver lifecycle is specified in
 | [`virtio/core/`](virtio/core/README.md) | Library | Shared VirtIO transport primitives: device initialisation, virtqueue setup, descriptor chain management |
 | [`virtio/blk/`](virtio/blk/README.md) | Binary + library | VirtIO block device driver — exposes per-request DMA block-read IPC endpoint |
 | [`virtio/input/`](virtio/input/README.md) | Binary + library | VirtIO input (keyboard) device driver — decodes `EV_KEY` events into keysyms; answers `INPUT_READ_EVENTS` behind devmgr's `QUERY_INPUT_DEVICE` |
+| [`virtio/console/`](virtio/console/README.md) | Binary + library | VirtIO console device driver — the debug port; serves the serial protocol behind devmgr's `QUERY_DEBUG_PORT_DEVICE` |
 | [`serial/`](serial/README.md) | Binary | Serial (UART) device driver — COM1 (x86-64) / NS16550 (RISC-V); sole driver-mediated serial-byte sink |
 | [`framebuffer/`](framebuffer/README.md) | Binary + library | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
 | [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |

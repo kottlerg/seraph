@@ -3,16 +3,18 @@
 
 // services/svctest/src/phases/devmgr.rs
 
-//! devmgr surface — the `QUERY_BLOCK_DEVICE`, `QUERY_SHUTDOWN_DEVICE`, and
-//! test-label authority gates, the instance ordinal of `QUERY_INPUT_DEVICE`,
-//! and driver-spawn orphan teardown (#176).
+//! devmgr surface — the `QUERY_BLOCK_DEVICE`, `QUERY_SHUTDOWN_DEVICE`,
+//! `QUERY_DEBUG_PORT_DEVICE`, and test-label authority gates, the instance
+//! ordinal of `QUERY_INPUT_DEVICE`, and driver-spawn orphan teardown (#176).
 //!
 //! The deny phases send the gated labels on `devmgr.registry`, a cap
 //! carrying `REGISTRY_QUERY_AUTHORITY` but none of `BLOCK_DEVICE_AUTHORITY`,
-//! `SHUTDOWN_DEVICE_AUTHORITY`, and `TEST_LABEL_AUTHORITY`, and assert
-//! `UNAUTHORIZED`: such a holder cannot acquire the whole-disk block cap or
-//! the platform shutdown actuators, or drive devmgr's test labels (the
-//! `TEST_SPAWN_ORPHAN` shim and `TEST_QUERY_DENY_DEVICE`).
+//! `SHUTDOWN_DEVICE_AUTHORITY`, `DEBUG_PORT_AUTHORITY`, and
+//! `TEST_LABEL_AUTHORITY`, and assert `UNAUTHORIZED`: such a holder cannot
+//! acquire the whole-disk block cap, the platform shutdown actuators, or the
+//! debug port, or drive devmgr's test labels (the `TEST_SPAWN_ORPHAN` shim
+//! and `TEST_QUERY_DENY_DEVICE`). The debug-port gate is checked before any
+//! device lookup, so it holds on a boot with no debug port too.
 //!
 //! The ordinal phase asks `devmgr.registry` for the input driver at ordinal 0,
 //! absent and explicit, and past the one keyboard every boot's device set
@@ -66,6 +68,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "devmgr_shutdown_device_deny",
             run: shutdown_device_deny_phase,
+        },
+        Phase {
+            name: "devmgr_debug_port_device_deny",
+            run: debug_port_device_deny_phase,
         },
         Phase {
             name: "devmgr_input_instance_ordinal",
@@ -141,6 +147,16 @@ fn shutdown_device_deny_phase(caps: &Caps)
         ipc::devmgr_labels::QUERY_SHUTDOWN_DEVICE,
         "QUERY_SHUTDOWN_DEVICE",
         "SHUTDOWN_DEVICE_AUTHORITY",
+    );
+}
+
+fn debug_port_device_deny_phase(caps: &Caps)
+{
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::QUERY_DEBUG_PORT_DEVICE,
+        "QUERY_DEBUG_PORT_DEVICE",
+        "DEBUG_PORT_AUTHORITY",
     );
 }
 

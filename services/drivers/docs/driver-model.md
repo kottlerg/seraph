@@ -80,5 +80,6 @@ re-deliveries their own devices did not raise
 
 [Device Management](../../../docs/device-management.md), [services/drivers/README.md](../README.md),
 [services/drivers/virtio/blk/README.md](../virtio/blk/README.md),
+[services/drivers/virtio/console/README.md](../virtio/console/README.md),
 [services/drivers/virtio/core/README.md](../virtio/core/README.md),
 [services/drivers/virtio/input/README.md](../virtio/input/README.md)

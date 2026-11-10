@@ -248,6 +248,10 @@ pub struct QemuLaunchSpec<'a>
     /// Whether the machine's IOMMU is attached; every launch site attaches it
     /// unless the run asks for the no-IOMMU variant (`--iommu absent`).
     pub iommu: Iommu,
+    /// When set, attach the debug port (`--debug-port`): a `virtio-console`
+    /// device whose port QEMU exposes as a TCP server on `127.0.0.1` at this
+    /// port ([`debug_port_args`]).
+    pub debug_port: Option<u16>,
 }
 
 /// The device arguments a launch passes before every other device: the
@@ -361,6 +365,11 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         "-no-reboot".into(),
     ]);
 
+    if let Some(port) = spec.debug_port
+    {
+        args.extend(debug_port_args(port, spec.iommu));
+    }
+
     if let Some(sock) = spec.qmp_socket
     {
         args.extend([
@@ -420,6 +429,32 @@ fn blk_device(drive: &str, block_size: u32, slot: Option<u8>, iommu: Iommu) -> S
          physical_block_size={block_size}{addr}",
         iommu.virtio_property()
     )
+}
+
+/// The QEMU character device id of the debug port's host end.
+const DEBUG_PORT_CHARDEV: &str = "seraph-debug";
+
+/// The arguments that attach the debug port: a `virtio-serial-pci` device,
+/// behind the IOMMU when `iommu` attaches one, carrying one `virtconsole`
+/// port (port 0, the only port a driver without `VIRTIO_CONSOLE_F_MULTIPORT`
+/// drives), whose host end is a TCP server on `127.0.0.1:<port>` that does
+/// not wait for a client (`wait=off`), so the guest boots before the host
+/// connects and a debugger connects with `target remote localhost:<port>`.
+/// devmgr binds the device as the debug port
+/// (services/drivers/virtio/console/README.md).
+fn debug_port_args(port: u16, iommu: Iommu) -> [String; 6]
+{
+    [
+        "-chardev".into(),
+        format!("socket,id={DEBUG_PORT_CHARDEV},host=127.0.0.1,port={port},server=on,wait=off"),
+        "-device".into(),
+        format!(
+            "virtio-serial-pci,disable-legacy=on,id=debugport{}",
+            iommu.virtio_property()
+        ),
+        "-device".into(),
+        format!("virtconsole,chardev={DEBUG_PORT_CHARDEV},bus=debugport.0"),
+    ]
 }
 
 /// Refuse a device block size below 512 bytes or not a power of two, which
@@ -859,6 +894,7 @@ mod tests
             riscv_mmu: RiscvMmu::Sv48,
             x86_paging: X86Paging::Four,
             iommu: Iommu::Attached,
+            debug_port: None,
         }
     }
 
@@ -946,6 +982,7 @@ mod tests
             riscv_mmu: RiscvMmu::Sv48,
             x86_paging: X86Paging::Four,
             iommu: Iommu::Attached,
+            debug_port: None,
         };
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(argv.iter().any(|a| a == "vmgenid,guid=auto"));
@@ -972,7 +1009,36 @@ mod tests
             riscv_mmu: RiscvMmu::Sv48,
             x86_paging,
             iommu: Iommu::Attached,
+            debug_port: None,
         }
+    }
+
+    #[test]
+    fn the_debug_port_attaches_its_device_behind_the_iommu_only_when_asked()
+    {
+        let argv = build_qemu_argv(&riscv_spec(4, 512)).unwrap();
+        assert!(!argv.iter().any(|a| a.starts_with("virtio-serial-pci")));
+
+        let mut spec = riscv_spec(4, 512);
+        spec.debug_port = Some(4444);
+        let argv = build_qemu_argv(&spec).unwrap();
+        assert!(
+            argv.iter()
+                .any(|a| a.contains("port=4444,server=on,wait=off"))
+        );
+        let dev = argv
+            .iter()
+            .find(|a| a.starts_with("virtio-serial-pci"))
+            .unwrap();
+        assert!(dev.contains(",iommu_platform=on"));
+
+        spec.iommu = Iommu::Absent;
+        let argv = build_qemu_argv(&spec).unwrap();
+        let dev = argv
+            .iter()
+            .find(|a| a.starts_with("virtio-serial-pci"))
+            .unwrap();
+        assert!(!dev.contains("iommu_platform"));
     }
 
     #[test]

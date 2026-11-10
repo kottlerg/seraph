@@ -107,13 +107,16 @@ VirtIO PCI devices use vendor ID `0x1AF4`. Device IDs:
 | `0x1042` | Modern virtio-blk |
 | `0x1012` | Transitional virtio-input |
 | `0x1052` | Modern virtio-input |
+| `0x1003` | Transitional virtio-console |
+| `0x1043` | Modern virtio-console |
 
 devmgr matches discovered devices against its driver binaries by vendor and
-device ID: a boot module for virtio-blk, an on-disk driver for virtio-input.
-Every matching device gets its own driver process, in segment, bus, device,
-function order, except a virtio-blk device that gets no IRQ cap (for
-instance, its line lies outside the Interrupt range devmgr holds):
-virtio-blk requires one. A
+device ID: a boot module for virtio-blk, an on-disk driver for virtio-input
+and virtio-console. Every matching device gets its own driver process, in
+segment, bus, device, function order, except that only the first
+virtio-console device gets one (it is the debug port), and except a
+virtio-blk device that gets no IRQ cap (for instance, its line lies outside
+the Interrupt range devmgr holds): virtio-blk requires one. A
 device on a line another device already holds gets an IRQ cap too (step 4).
 Class-based matching is design intent (#165).
 
@@ -190,8 +193,8 @@ For each matched device, devmgr:
 5. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
    boot-module driver (virtio-blk, at enumeration, from a derived copy of the
    module cap per device; the original is released once every device is
-   served) or `CREATE_FROM_FILE` for an on-disk one (virtio-input, whose
-   steps 5-9 run later, once `SET_DRIVERS_DIR` delivers the drivers
+   served) or `CREATE_FROM_FILE` for an on-disk one (virtio-input and
+   virtio-console, whose steps 5-9 run later, once `SET_DRIVERS_DIR` delivers the drivers
    directory), each with `CREATE_PINNED` and `CREATE_DMA_HOLD`, so procmgr
    holds the driver's memory after its death until devmgr releases it.
 6. Starts the driver (`START_PROCESS`). A driver whose bootstrap fails after
@@ -205,16 +208,16 @@ For each matched device, devmgr:
    `ipc::bootstrap::pack_slots` (presence word in `data[0]`), with the IRQ
    line's mode of step 4 in `data[1]` (0 with no IRQ), which the driver passes
    to `SYS_IRQ_REGISTER`, and ends the bootstrap. The IRQ slot is absent when
-   the device got no IRQ cap in step 4; virtio-input then polls, and virtio-blk,
-   which requires the IRQ, is not spawned. A driver checks the delivered BAR
-   indices against the layout it computes from its `QUERY_DEVICE_INFO` reply and
-   exits on a mismatch.
+   the device got no IRQ cap in step 4; virtio-input and virtio-console then
+   poll, and virtio-blk, which requires the IRQ, is not spawned. A driver
+   checks the delivered BAR indices against the layout it computes from its
+   `QUERY_DEVICE_INFO` reply and exits on a mismatch.
 8. Binds a death observer on the driver's thread to devmgr's driver death
    queue, with the device badge as the correlator, and keeps the driver's
    process handle for the rest of the boot.
 9. Once every driver of the batch (the boot batch: virtio-blk, serial, and
-   framebuffer; the on-disk batch: the RTC and virtio-input) has been
-   spawned, settles the batch: serves the drivers' `QUERY_DEVICE_INFO` and
+   framebuffer; the on-disk batch: the RTC, virtio-input, and virtio-console)
+   has been spawned, settles the batch: serves the drivers' `QUERY_DEVICE_INFO` and
    `DRIVER_READY` calls on the private endpoint and takes their deaths until
    every driver has reported ready or died or the settle bound elapses, then
    takes every death still queued, revokes the private endpoint, serves the

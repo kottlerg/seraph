@@ -139,6 +139,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         riscv_mmu: RiscvMmu::Sv48,
         x86_paging: X86Paging::Four,
         iommu: Iommu::Attached,
+        debug_port: None,
     };
     let qemu_args = build_qemu_argv(&spec)?;
     let qemu_binary = require_tool(args.arch.qemu_binary())?;

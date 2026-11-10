@@ -215,6 +215,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let riscv_mmu = args.riscv_mmu;
             let x86_paging = args.x86_paging;
             let iommu = args.iommu;
+            let debug_port = args.debug_port;
             let display = QemuDisplay::from(args.display);
             let debug_listen = args.debug_listen;
             let hold_on_hang = args.hold_on_hang;
@@ -293,6 +294,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     riscv_mmu,
                     x86_paging,
                     iommu,
+                    debug_port,
                 };
                 let qemu_args = build_qemu_argv(&spec)?;
 
@@ -429,6 +431,10 @@ fn validate_args(args: &RunParallelArgs) -> Result<()>
     if (args.debug_listen || args.hold_on_hang) && args.parallel != 1
     {
         bail!("--debug-listen / --hold-on-hang require --parallel 1 (one gdbstub port)");
+    }
+    if args.debug_port.is_some() && args.parallel != 1
+    {
+        bail!("--debug-port requires --parallel 1 (one host port)");
     }
     Ok(())
 }

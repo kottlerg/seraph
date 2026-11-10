@@ -196,6 +196,9 @@ fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
             "audit",
             "is missing; a run of the reviewer alone states it as null",
         ));
+        let mut either = AUDIT_VERDICTS.to_vec();
+        either.push(NOT_RUN);
+        one_of(out, name, "audit_verdict", &record["audit_verdict"], &either);
         return;
     }
     let not_run = record["audit_verdict"] == NOT_RUN;
@@ -878,6 +881,9 @@ mod tests
         let mut no_audit_key = reviewer_alone(1, PASS.0, vec![]);
         no_audit_key.as_object_mut().unwrap().remove("audit");
         assert_eq!(fields(&no_audit_key), ["audit"]);
+        // The missing key does not hide a bad verdict line beside it.
+        no_audit_key["audit_verdict"] = json!("PASS");
+        assert_eq!(fields(&no_audit_key), ["audit", "audit_verdict"]);
         for (name, bad) in [
             (NAME, not_run_with_audit),
             (NAME, audited_without_audit),

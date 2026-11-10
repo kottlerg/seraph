@@ -617,6 +617,16 @@ pub fn diff_changes(diff: &str) -> Vec<Change>
             }));
             continue;
         }
+        // `\ No newline at end of file` belongs to the line before it: a
+        // change to the final newline alone changes no line's text.
+        if line.starts_with('\\')
+        {
+            if let Some(last) = out.last_mut().filter(|c| c.path == path)
+            {
+                last.line.push_str(" (no newline at end of file)");
+            }
+            continue;
+        }
         let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix('-'))
         else
         {
@@ -977,6 +987,9 @@ fn read_synced_delta(
     let mut changes: Vec<String> = difference
         .iter()
         .filter(|(_, c)| c.code && !is_markdown(&c.path))
+        // The line is stated raw, sign and whitespace included, unlike the
+        // trimmed form of `non_comment_changes`: two own diffs can differ
+        // in indentation alone, which a trimmed line would not show.
         .map(|(side, c)| format!("{} ({}): {}", c.path, side.label(), c.line))
         .collect();
     changes.dedup();
@@ -2020,6 +2033,33 @@ mod tests
         assert!(!found.is_empty());
         assert!(found.iter().all(|d| d.rule == "pr-validated-head"));
         assert!(found.iter().any(|d| d.message.contains("    b: 1")));
+    }
+
+    #[test]
+    fn a_final_newline_added_after_a_sync_is_an_error()
+    {
+        let repo = Repo::new("sync-newline");
+        let validated = synced_then_changed(&repo, "c.rs", b"fn c() {}", b"fn c() {}\n");
+        let found = repo.check(&validated, "; later commits are comment-only.");
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|d| d.rule == "pr-validated-head"));
+        assert!(
+            found
+                .iter()
+                .any(|d| d.message.contains("no newline at end of file"))
+        );
+    }
+
+    #[test]
+    fn markdown_in_any_letter_case_is_outside_the_delta()
+    {
+        let repo = Repo::new("upper-markdown");
+        let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.commit("NOTES.MD", "Some notes.\n");
+        assert!(
+            repo.check(&validated, "; later commits are Markdown-only.")
+                .is_empty()
+        );
     }
 
     #[test]

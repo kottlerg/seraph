@@ -29,6 +29,7 @@ pub mod fault_class_bindings;
 pub mod fault_debug;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
+pub mod fault_forward;
 pub mod fault_handler_declines_kills;
 pub mod fault_handler_rebind;
 pub mod fault_kills_thread;
@@ -214,6 +215,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::fault_class_bindings",
         fault_class_bindings::run(ctx)
     );
+    run_integration_test!("integration::fault_forward", fault_forward::run(ctx));
     run_integration_test!(
         "integration::fault_syscall_buffer",
         fault_syscall_buffer::run(ctx)

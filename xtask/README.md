@@ -37,7 +37,7 @@ xtask/
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, test_crash_report, test_debug_port, test_kaslr,
 │   │                           #   test_logd_reclaim, test_map_redo, test_terminal,
-│   │                           #   test_vmgenid, lint_docs, pr_check, review, issue)
+│   │                           #   test_vmgenid, lint_docs, pr_check, review, issue, orch)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -999,6 +999,55 @@ The command refuses a filing without a class label, without a subsystem label, o
 milestone decision (`--unscheduled` is for future-state work no release has scheduled). After
 filing it reads the Issue back and fails when a label or the milestone was not applied, naming
 what is missing.
+
+### `cargo xtask orch`
+
+Keep the state of an orchestration batch on disk, so that a session that starts with an empty
+context can take the batch over (`.claude/agents/orchestrator.md` § Hand-over).
+
+```
+cargo xtask orch start --goal <text>
+cargo xtask orch state [--json]
+cargo xtask orch log <text>...
+cargo xtask orch orchestrator <agent-id>
+cargo xtask orch worker <name> [--id <agent-id>] [--model <m>] [--effort <e>] [--scope <s>] \
+    [--branch <b>] [--worktree <path>] [--pr <N>] [--phase <phase>] [--status <text>]
+cargo xtask orch worker <name> --remove
+cargo xtask orch grant set <holder> <commands>...
+cargo xtask orch grant clear
+cargo xtask orch grant queue <holder> <commands>...
+cargo xtask orch grant unqueue <holder>
+cargo xtask orch order [<pr>...]
+cargo xtask orch question add [--file <path>] <id> <text>...
+cargo xtask orch question close <id>
+cargo xtask orch ruling add <text>...
+cargo xtask orch ruling drop <number>
+cargo xtask orch end
+```
+
+The state is `target/xtask/orchestration/state.json`, and the batch's log is `<date>.md`
+beside it, named for the UTC date of `orch start`. Nothing else writes either file. A change is
+made under a lock file (`state.lock`), written through a temporary file, and followed by one
+line in the log, `- <UTC time> <what changed>`, so the log needs no separate upkeep; `orch log`
+appends a line for an event that changes no state.
+
+| Subcommand | Effect |
+|---|---|
+| `start` | Creates the state and the log's first line. Refuses while a state exists. |
+| `state` | Prints the state as text: goal, log, orchestrator, grant and queue, each worker, merge order, open questions, rulings. It warns on stderr when the text passes 10,000 bytes, the most a hook may add to a session's context. `--json` prints the stored file. |
+| `orchestrator` | Records the agent id workers report to. |
+| `worker` | Sets the named fields of a worker and the time of the change, creating the worker when it is new; fields it does not name keep their value. A phase is one of `planning`, `coding`, `review`, `gate`, `merged`, `retired`, `dead`. `--remove` drops the worker. |
+| `grant set` | Records the exclusive grant and takes its holder out of the queue. Refuses while a grant is outstanding. |
+| `grant clear` | Ends the grant. |
+| `grant queue`, `grant unqueue` | Add or drop a request for the grant; a holder has at most one. |
+| `order` | Replaces the merge order; no argument clears it. |
+| `question add`, `question close` | Record a question the maintainer has open, with the file that holds its detail, or close it. An id is open at most once. |
+| `ruling add`, `ruling drop` | Record a ruling in force, or drop one by the number `state` prints. |
+| `end` | Logs the end and renames the state to `<date>.state.json` (`<date>-<n>.state.json` when that name is taken), so the next `start` begins clean. |
+
+Every stored field is one line of at most 300 characters; longer detail belongs in a file the
+field names. Text arguments take the rest of the command line, flags included, so a grant's
+command list needs no quoting.
 
 ---
 

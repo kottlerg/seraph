@@ -12,6 +12,7 @@ pub mod issue;
 pub mod ktest_timing;
 pub mod lint_docs;
 pub mod mkdisk;
+pub mod orch;
 pub mod pr_check;
 pub mod review;
 pub mod run;

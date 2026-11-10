@@ -2,7 +2,8 @@
 
 VirtIO console device driver: the debug port. Drives a `virtio-console` device's port 0 as a
 byte transport and serves it with the serial protocol (`shared/ipc::serial_labels`), so a
-debugger stub speaks to a host debugger over it while the console keeps the UART.
+debugger stub, the GDB stub ([services/gdbstub/README.md](../../../gdbstub/README.md)), speaks to a
+host debugger over it while the console keeps the UART.
 
 ---
 
@@ -100,9 +101,11 @@ notification. Without an IRQ cap the write's wait is a timed poll.
 
 `cargo xtask test-debug-port` boots the `debug-echo` fixture
 ([services/debug-echo/README.md](../../../debug-echo/README.md)) with the debug port attached
-and drives a GDB remote serial protocol exchange with it from the host. It is the driver's
-device cell, `debug-port`, in [docs/testing.md](../../../../docs/testing.md#coverage-tiers)
-§ Coverage tiers: no canonical CI boot attaches the device.
+and drives a GDB remote serial protocol exchange with it from the host, and `cargo xtask test-gdb`
+boots the GDB stub ([services/gdbstub/README.md](../../../gdbstub/README.md)) with it and runs a
+host GDB session over it. The two boots are the driver's device cell, `debug-port`, in
+[docs/testing.md](../../../../docs/testing.md#coverage-tiers) § Coverage tiers: no canonical CI
+boot attaches the device.
 
 ---
 

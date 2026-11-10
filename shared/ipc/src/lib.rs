@@ -81,7 +81,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 11;
+pub const PROCMGR_LABELS_VERSION: u32 = 12;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -461,9 +461,14 @@ pub mod procmgr_labels
     /// only on a badge carrying [`DEBUG_AUTHORITY`] (`UNAUTHORIZED`
     /// otherwise). `data[0]` names the target: its process badge, or the badge
     /// a fault message on the crash endpoint carries for one of its threads;
-    /// `data[1]` is the index of the first thread to return. Replies `SUCCESS`
-    /// with `data[0]` the number of live threads procmgr holds for the target
-    /// (its main thread, then each registered one, [`REGISTER_THREAD`]),
+    /// `data[1]` is the index of the first thread to return. `caps[0]`, when
+    /// sent, is a Thread cap of the caller's own main thread, of any rights
+    /// (procmgr only reads the thread's state): procmgr keeps it as the
+    /// target's debugger, and once that thread has exited it restores the
+    /// target's crash bindings as [`DETACH_PROCESS`] does, so a debugger that
+    /// dies attached leaves no thread bound to its dead endpoint. Replies
+    /// `SUCCESS` with `data[0]` the number of live threads procmgr holds for
+    /// the target (its main thread, then each registered one, [`REGISTER_THREAD`]),
     /// `data[1]` its load bias, `data[2]`/`data[3]` the start and end of its
     /// biased text, `data[4]` the address of its `ProcessInfo` page,
     /// `data[`[`ATTACH_WORD_PROCESS_BADGE`]`]` the target's process badge, and
@@ -529,8 +534,105 @@ pub mod procmgr_labels
     /// Thread caps one [`ATTACH_PROCESS`] reply carries at most.
     pub const ATTACH_THREADS_PAGE: usize = super::MSG_CAP_SLOTS_MAX;
 
+    /// List the live processes procmgr tracks with their names, one page
+    /// per call, so a debugger finds the process a host names. Served only
+    /// on a badge carrying [`DEBUG_AUTHORITY`] (`UNAUTHORIZED` otherwise).
+    /// `data[0]` is 0 to start the walk or 1 to resume after the badge in
+    /// `data[1]`, as for [`QUERY_LIVE_PROCESSES`]. The reply carries the
+    /// page's count in `data[0]`, then per entry, in ascending badge order,
+    /// [`LIST_PROCESSES_WORDS_PER_ENTRY`] words: the process badge, its
+    /// name's length, and the name's bytes ([`pack_list_entry`]); at most
+    /// [`LIST_PROCESSES_PAGE`] entries, and a page shorter than that ends the
+    /// walk. A name is the first string of the argv the process's creator
+    /// passed, truncated to [`super::svcmgr_labels::NAME_MAX`] bytes, or
+    /// empty: a label the creator chose, not an identity. A process that
+    /// declared itself undebuggable is listed and refuses the attach.
+    /// `INVALID_ARGUMENT` for a `data[0]` other than 0 or 1. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `LIST_PROCESSES`.
+    pub const LIST_PROCESSES: u64 = 23;
+
+    /// Data words one [`LIST_PROCESSES`] entry takes: the badge, the name's
+    /// length, and the name in [`super::svcmgr_labels::NAME_MAX`] bytes.
+    pub const LIST_PROCESSES_WORDS_PER_ENTRY: usize = 2 + super::svcmgr_labels::NAME_MAX / 8;
+
+    /// Entries one [`LIST_PROCESSES`] reply carries at most: as many as fit
+    /// the data words after the count.
+    pub const LIST_PROCESSES_PAGE: usize =
+        (super::MSG_DATA_WORDS_MAX - 1) / LIST_PROCESSES_WORDS_PER_ENTRY;
+
+    /// Write entry `index` of a [`LIST_PROCESSES`] reply into `words` (the
+    /// reply's data words, the count in word 0, which the caller sets): the
+    /// badge, the name's length, and the name's bytes little-endian,
+    /// zero-padded. A name past [`super::svcmgr_labels::NAME_MAX`] bytes is
+    /// truncated. Returns `false`, writing nothing, when the entry does not
+    /// fit `words`.
+    pub fn pack_list_entry(words: &mut [u64], index: usize, badge: u64, name: &[u8]) -> bool
+    {
+        let base = 1 + index * LIST_PROCESSES_WORDS_PER_ENTRY;
+        let Some(entry) = words.get_mut(base..base + LIST_PROCESSES_WORDS_PER_ENTRY)
+        else
+        {
+            return false;
+        };
+        let name = &name[..name.len().min(super::svcmgr_labels::NAME_MAX)];
+        entry.fill(0);
+        entry[0] = badge;
+        entry[1] = name.len() as u64;
+        for (word, chunk) in entry[2..].iter_mut().zip(name.chunks(8))
+        {
+            let mut bytes = [0u8; 8];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            *word = u64::from_le_bytes(bytes);
+        }
+        true
+    }
+
+    /// Read entry `index` of a [`LIST_PROCESSES`] reply's data words
+    /// `words`: its badge, and its name, written to the front of `name`,
+    /// whose length it returns. `None` when `index` is past the reply's
+    /// count or its words, or the entry's length is past
+    /// [`super::svcmgr_labels::NAME_MAX`].
+    #[must_use]
+    pub fn unpack_list_entry(
+        words: &[u64],
+        index: usize,
+        name: &mut [u8; super::svcmgr_labels::NAME_MAX],
+    ) -> Option<(u64, usize)>
+    {
+        let count = usize::try_from(*words.first()?).ok()?;
+        if index >= count
+        {
+            return None;
+        }
+        let base = 1 + index * LIST_PROCESSES_WORDS_PER_ENTRY;
+        let entry = words.get(base..base + LIST_PROCESSES_WORDS_PER_ENTRY)?;
+        let len = usize::try_from(entry[1])
+            .ok()
+            .filter(|&l| l <= super::svcmgr_labels::NAME_MAX)?;
+        for (chunk, word) in name[..len].chunks_mut(8).zip(&entry[2..])
+        {
+            chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
+        }
+        Some((entry[0], len))
+    }
+
+    /// Hand a process's crash bindings back after a debugger's attach:
+    /// procmgr binds its main thread's exception class to the crash endpoint
+    /// under its process badge again, and each registered thread's
+    /// ([`REGISTER_THREAD`]) under the thread's crash badge, minting one for
+    /// a thread that has none, and forgets the debugger it watched for the
+    /// process ([`ATTACH_PROCESS`] `caps[0]`). A debugger holds no SEND on the
+    /// crash endpoint, so it cannot restore those bindings itself. Served
+    /// only on a badge carrying [`DEBUG_AUTHORITY`]. `data[0]` is the
+    /// target's process badge. Replies `SUCCESS`; `UNAUTHORIZED` without the
+    /// authority; `INVALID_BADGE` when no live process carries the badge;
+    /// `NOT_ATTACHABLE` when it declared itself undebuggable. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `DETACH_PROCESS`.
+    pub const DETACH_PROCESS: u64 = 24;
+
     /// Badge bit on procmgr service caps that authorises
-    /// [`REGISTER_CRASH_SERVICE`] and [`ATTACH_PROCESS`]. svcmgr mints it for
+    /// [`REGISTER_CRASH_SERVICE`], [`ATTACH_PROCESS`], [`LIST_PROCESSES`],
+    /// and [`DETACH_PROCESS`]. svcmgr mints it for
     /// a service whose definition sets `debug_authority = yes`; no other
     /// path mints it. Who holds it is in
     /// `services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`.
@@ -3956,6 +4058,54 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_process_list_page_round_trips_names_of_every_length()
+    {
+        use procmgr_labels::{LIST_PROCESSES_PAGE, pack_list_entry, unpack_list_entry};
+        let long = [b'x'; svcmgr_labels::NAME_MAX];
+        let names: [&[u8]; 4] = [b"svctest", &long, b"", b"seven77"];
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        for (i, name) in names.iter().enumerate()
+        {
+            assert!(pack_list_entry(&mut words, i, 0x100 + i as u64, name));
+        }
+        words[0] = names.len() as u64;
+        for (i, name) in names.iter().enumerate()
+        {
+            let mut out = [0u8; svcmgr_labels::NAME_MAX];
+            let (badge, len) = unpack_list_entry(&words, i, &mut out).unwrap();
+            assert_eq!((badge, &out[..len]), (0x100 + i as u64, *name));
+        }
+        assert!(
+            unpack_list_entry(&words, names.len(), &mut [0; svcmgr_labels::NAME_MAX]).is_none()
+        );
+        // A full page fits the message, and the entry past it does not.
+        assert!(pack_list_entry(
+            &mut words,
+            LIST_PROCESSES_PAGE - 1,
+            1,
+            b"a"
+        ));
+        assert!(!pack_list_entry(&mut words, LIST_PROCESSES_PAGE, 1, b"a"));
+    }
+
+    #[test]
+    fn a_process_list_entry_truncates_a_long_name_and_refuses_a_long_length()
+    {
+        use procmgr_labels::{pack_list_entry, unpack_list_entry};
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        let long = [b'n'; svcmgr_labels::NAME_MAX + 9];
+        assert!(pack_list_entry(&mut words, 0, 7, &long));
+        words[0] = 1;
+        let mut out = [0u8; svcmgr_labels::NAME_MAX];
+        assert_eq!(
+            unpack_list_entry(&words, 0, &mut out),
+            Some((7, svcmgr_labels::NAME_MAX))
+        );
+        words[2] = svcmgr_labels::NAME_MAX as u64 + 1;
+        assert!(unpack_list_entry(&words, 0, &mut out).is_none());
+    }
 
     #[test]
     fn a_requester_id_packs_segment_bus_device_and_function()

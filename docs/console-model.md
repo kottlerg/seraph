@@ -146,7 +146,9 @@ svcmgr (a service registry): a UART is a device, not a service. The driver's IPC
 contract is specified in [services/drivers/serial/README.md](../services/drivers/serial/README.md).
 
 The debug port is outside the console model. It is a second byte transport, apart from the UART,
-which a boot attaches only on request: a debugger stub owns it to speak to a host debugger, and no
+which a boot attaches only on request: a debugger stub, the GDB stub
+([services/gdbstub/README.md](../services/gdbstub/README.md)), owns it to speak to a host
+debugger, and no
 console output reaches it, so the UART stays the console and the authoritative marker channel.
 Its driver
 ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md))

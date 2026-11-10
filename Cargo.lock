@@ -528,6 +528,17 @@ name = "gdb-rsp"
 version = "0.1.2"
 
 [[package]]
+name = "gdbstub"
+version = "0.1.2"
+dependencies = [
+ "gdb-rsp",
+ "ipc",
+ "riscv-step",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

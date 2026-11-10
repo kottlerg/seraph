@@ -32,7 +32,7 @@ gdb-rsp/
 | `frame::AckMode` | The acknowledgement a stub sends for each event, until it accepts `QStartNoAckMode`. |
 | `frame::PacketWriter` | Writes one packet (`$`, escaped body, `#`, checksum) into a caller's buffer, with the reply bodies a stub sends: `OK`, `E`, stop replies, exit replies, thread lists, `qOffsets`, `qSupported`, `vCont?`, and `qXfer` chunks. |
 | `frame::unescape`, `frame::unescaped_len` | Undo the binary escaping of `X` data. |
-| `command::Command::parse` | Parses a packet body into a `Command`: `?`, `g`, `G`, `p`, `P`, `m`, `M`, `X`, `c`, `C`, `s`, `S`, `vCont?`, `vCont`, `Z`, `z`, `H`, `T`, `qfThreadInfo`, `qsThreadInfo`, `qC`, `qSupported`, `qAttached`, `qOffsets`, `QStartNoAckMode`, `qXfer:features:read`, `vAttach`, `D`, `k`; any other body is `Unknown`, answered with an empty reply. |
+| `command::Command::parse` | Parses a packet body into a `Command`: `?`, `g`, `G`, `p`, `P`, `m`, `M`, `X`, `c`, `C`, `s`, `S`, `vCont?`, `vCont`, `Z`, `z`, `H`, `T`, `qfThreadInfo`, `qsThreadInfo`, `qC`, `qSupported`, `qAttached`, `qOffsets`, `QStartNoAckMode`, `qXfer:features:read`, `vAttach`, `D`, `k`; any other body is `Unknown`, answered with an empty reply. A resume (`c`, `C`, `s`, `S`, and each `vCont` action) carries its optional address and the signal it delivers, `C`, `S`, and `vCont`'s `C` and `S` actions giving one, so a stub tells a plain resume from one that passes the stop's signal on. |
 | `target::Arch` | Each architecture's target description XML (`TARGET_XML_ANNEX`), its registers in protocol order, the program counter's number, and each register's place in the `g` block. |
 | `PACKET_SIZE` | The largest packet body a stub accepts: the `PacketSize` it advertises and its reader's buffer size. |
 
@@ -51,9 +51,9 @@ The multiprocess thread-id form, conditional breakpoints, and run-length encodin
 the packet set: a stub using this crate advertises none of them, and parses no packet that
 carries them.
 
-Consumers: the `debug-echo` fixture
-([services/debug-echo/README.md](../../services/debug-echo/README.md)) in the guest, and
-`cargo xtask test-debug-port` ([xtask/README.md](../../xtask/README.md)) on the host.
+Consumers: the GDB stub ([services/gdbstub/README.md](../../services/gdbstub/README.md)) and the
+`debug-echo` fixture ([services/debug-echo/README.md](../../services/debug-echo/README.md)) in the
+guest, and `cargo xtask test-debug-port` ([xtask/README.md](../../xtask/README.md)) on the host.
 
 ---
 

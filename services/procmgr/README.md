@@ -29,8 +29,9 @@ procmgr/
 │                                 fs-reply bounds, the init-reap state
 │                                 machine, the first death queue's
 │                                 size (`FIRST_POOL_OBSERVERS`), the
-│                                 attach refusals and image span, and
-│                                 the thread registry and crash badges
+│                                 attach and detach refusals and image
+│                                 span, the process names, and the
+│                                 thread registry and crash badges
 ├── src/
 │   ├── main.rs                 # main() (std runtime), IPC dispatch loop
 │   ├── crash.rs                # Crash endpoint, its decliner, the handover
@@ -96,8 +97,12 @@ procmgr/
   (`src/crash.rs`) until a crash service registers
   (`REGISTER_CRASH_SERVICE`), and again once that service is gone. Serve
   `ATTACH_PROCESS`, which returns a process's Thread caps and image
-  placement to a `DEBUG_AUTHORITY` holder, and `DECLARE_NO_DEBUG`, by which
-  a process opts out of both. See
+  placement to a `DEBUG_AUTHORITY` holder, `LIST_PROCESSES`, which pages
+  the live processes with their names (each child's first argv string,
+  recorded at creation), and `DETACH_PROCESS`, which binds an attached
+  process back to the crash endpoint, as procmgr also does unasked once the
+  attached debugger's thread has exited; and `DECLARE_NO_DEBUG`, by which
+  a process opts out of the crash endpoint and the attach. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § Crash Endpoint and Debug
   Authority.
 - **Thread registry** — keep a cap of each thread a process's runtime

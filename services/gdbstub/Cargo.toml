@@ -1,0 +1,26 @@
+[package]
+name = "gdbstub"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Host-testable register map, breakpoint table, stop signals, run-control
+# decisions, and the session's stop state machine (bins are test = false).
+[lib]
+name = "gdbstub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gdbstub"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+gdb-rsp = { path = "../../shared/gdb-rsp" }
+ipc = { path = "../../shared/ipc" }
+riscv-step = { path = "../../shared/riscv-step" }
+syscall = { path = "../../shared/syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+
+[lints]
+workspace = true

@@ -560,7 +560,8 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    second-disk boots, on both architectures), the no-IOMMU variant
    (`--iommu absent`, svctest, on both architectures), the framebuffer
    cell (`--display framebuffer`, svctest, on both architectures), and the
-   debug-port cell (`test-debug-port`, on both architectures) once each.
+   debug-port cell (`test-debug-port` and `test-gdb`, on both architectures)
+   once each.
    Their report, each run's command, `--runs` count, outcome, and head, is
    written to `target/xtask/review/release-v<X>.<Y>.<Z>/host-runs.md`, the
    file the release audit reads; the release PR's body states its own local

@@ -217,6 +217,8 @@ mod tests
             no_debug: false,
             image: crate::ImageSpan::default(),
             threads: crate::ThreadRegistry::new(),
+            name: crate::ProcessName::EMPTY,
+            debugger: 0,
         }
     }
 

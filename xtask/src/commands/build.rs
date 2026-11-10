@@ -284,6 +284,16 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::Tests,
         arch_only: None,
     },
+    // The GDB stub: installed on every image, started only on a boot that
+    // stages its recipe (`--debug-target` of `run` and `run-parallel`,
+    // `test-gdb`).
+    Spec {
+        name: "gdbstub",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Services,
+        arch_only: None,
+    },
     // The debug-port fixture `test-debug-port` stages: it answers fixed GDB
     // remote serial protocol packets on the debug port.
     Spec {

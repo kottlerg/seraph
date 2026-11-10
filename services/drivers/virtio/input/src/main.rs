@@ -362,23 +362,6 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     (ring_addr, ring_va)
 }
 
-/// The low 32 bits of a device address, for a transport register that takes
-/// the address in halves.
-// cast_possible_truncation: keeping the low half is the point; the high half
-// goes to the register's pair through `high_half`.
-#[allow(clippy::cast_possible_truncation)]
-fn low_half(addr: u64) -> u32
-{
-    addr as u32
-}
-
-/// The high 32 bits of a device address ([`low_half`]'s pair).
-fn high_half(addr: u64) -> u32
-{
-    // The shift leaves at most 32 bits, so the conversion cannot fail.
-    u32::try_from(addr >> 32).unwrap_or(0)
-}
-
 /// Program the descriptor/avail/used ring device addresses into the
 /// transport and mark the queue ready.
 fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_addr: u64)
@@ -390,12 +373,7 @@ fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_addr:
     let avail_addr = ring_addr + desc_size as u64;
     let used_addr = ring_addr + used_off as u64;
 
-    transport.queue_set_desc_lo(low_half(desc_addr));
-    transport.queue_set_desc_hi(high_half(desc_addr));
-    transport.queue_set_avail_lo(low_half(avail_addr));
-    transport.queue_set_avail_hi(high_half(avail_addr));
-    transport.queue_set_used_lo(low_half(used_addr));
-    transport.queue_set_used_hi(high_half(used_addr));
+    transport.queue_set_rings(desc_addr, avail_addr, used_addr);
 
     transport.queue_set_ready(1);
 }

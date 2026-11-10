@@ -197,10 +197,11 @@ The host tests cover the register map, the breakpoint table and instructions, an
 signals. `cargo xtask test-gdb` boots the `gdb-target` fixture (`programs/debugger
 --gdb-target`, [programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and
 runs a batch GDB session over the debug port: it lists two threads, breaks on the fixture's tick
-function and continues to it, rewrites and reads back a variable, single-steps, selects the second
-thread and reads its registers, and detaches ([docs/testing.md](../../docs/testing.md) § GDB stub
-(`test-gdb`)). svctest's `debug_authority_refused` phase
-checks that `LIST_PROCESSES` and `DETACH_PROCESS` refuse a caller without the authority.
+function and continues to it, rewrites and reads back a variable and a register, single-steps,
+selects the second thread and reads its registers, and detaches
+([docs/testing.md](../../docs/testing.md) § GDB stub (`test-gdb`)). svctest's
+`debug_authority_refused` phase checks that `LIST_PROCESSES` and `DETACH_PROCESS` refuse a caller
+without the authority.
 
 ---
 

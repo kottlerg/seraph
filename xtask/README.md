@@ -827,8 +827,9 @@ on either arch. Stages the `gdb-target` recipe (`programs/debugger --gdb-target`
 debug port attached (headless), and waits for the stub's
 `[gdbstub] attached; serving the debug port` line on the serial stream. It then runs
 `gdb -nx -batch` against the port with the target's sysroot binary for symbols: the session lists
-the threads, breaks on the target's tick function and continues to it, rewrites a variable and
-reads it back, single-steps, selects the second thread and reads its registers, and detaches. It
+the threads, breaks on the target's tick function and continues to it, rewrites a variable and a
+register and reads each back, single-steps, selects the second thread and reads its registers, and
+detaches. It
 kills QEMU, removes both recipes, and repacks `disk.img` again, whatever the outcome, and passes
 when GDB's output shows each of those results; [docs/testing.md](../docs/testing.md) § GDB stub
 (`test-gdb`) lists them.

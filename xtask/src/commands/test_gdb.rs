@@ -10,9 +10,9 @@
 //! GDB stub naming it, repacks `disk.img`, and boots the current sysroot once
 //! with the debug port attached. Once the stub logs [`READY_MARKER`], the host
 //! runs `gdb -batch` against the port with the image's symbols ([`SCRIPT`]):
-//! it lists the threads, breaks on `gdb_target_tick`, continues to it, reads
-//! and rewrites a variable, single-steps, selects the second thread and reads
-//! its registers, and detaches. The output is checked against [`expect`]. The
+//! it lists the threads, breaks on `gdb_target_tick`, continues to it,
+//! rewrites a variable and a register and reads each back, single-steps,
+//! selects the second thread and reads its registers, and detaches. The output is checked against [`expect`]. The
 //! recipes are always removed and `disk.img` repacked afterwards; the host
 //! kills QEMU.
 //!
@@ -55,7 +55,10 @@ const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 const GDB_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// The batch session, after `file` and `target remote`. Each `echo` marks a
-/// point [`expect`] finds the output after.
+/// point [`expect`] finds the output after. `$scratch` stands for a
+/// caller-saved register of the architecture ([`scratch_register`]), which
+/// the session rewrites, reads back from the stub past GDB's register cache,
+/// and restores before it steps.
 const SCRIPT: &[&str] = &[
     "info threads",
     "echo @@break\\n",
@@ -66,6 +69,12 @@ const SCRIPT: &[&str] = &[
     "echo @@counter\\n",
     "set var *(unsigned long *)&GDB_TARGET_COUNTER = 0x5eed",
     "x/gx &GDB_TARGET_COUNTER",
+    "echo @@register\\n",
+    "set $seraph_saved = $scratch",
+    "set $scratch = 0x5eed5eed",
+    "maint flush register-cache",
+    "print/x $scratch",
+    "set $scratch = $seraph_saved",
     "echo @@step\\n",
     "stepi",
     "print/x $pc",
@@ -98,7 +107,7 @@ pub fn run(ctx: &Context, args: &TestGdbArgs) -> Result<()>
         .context("restoring disk.img without the stub and its target")?;
     let output = booted?;
     expect(&output)?;
-    step("gdb stub test: PASS (break, step, read and write, second thread, detach)");
+    step("gdb stub test: PASS (break, memory and register write, step, second thread, detach)");
     Ok(())
 }
 
@@ -198,7 +207,10 @@ fn run_gdb(gdb: &Path, arch: Arch, port: u16, binary: &Path) -> Result<String>
         .args(["-ex".to_string(), format!("target remote localhost:{port}")]);
     for line in SCRIPT
     {
-        cmd.args(["-ex", line]);
+        cmd.args([
+            "-ex".to_string(),
+            line.replace("$scratch", scratch_register(arch)),
+        ]);
     }
     step("gdb stub test: running gdb -batch");
     let mut child = cmd
@@ -223,6 +235,18 @@ fn run_gdb(gdb: &Path, arch: Arch, port: u16, binary: &Path) -> Result<String>
         .map_err(|_| anyhow::anyhow!("gdb did not finish within {}s", GDB_TIMEOUT.as_secs()))?;
     println!("{output}");
     Ok(output)
+}
+
+/// The register the session rewrites: one the stopped function's caller
+/// does not expect preserved, so a write the session undoes before it steps
+/// changes nothing the target relies on.
+fn scratch_register(arch: Arch) -> &'static str
+{
+    match arch
+    {
+        Arch::X86_64 => "$rax",
+        Arch::Riscv64 => "$t0",
+    }
 }
 
 /// The part of `output` after `mark` up to the next `@@` mark.
@@ -280,6 +304,10 @@ fn expect(output: &str) -> Result<()>
     {
         bail!("the rewritten GDB_TARGET_COUNTER did not read back");
     }
+    if printed_values(section(output, "@@register")).first() != Some(&0x5eed_5eed)
+    {
+        bail!("the rewritten register did not read back from the stub");
+    }
     let stepped = printed_values(section(output, "@@step"));
     if stepped.first().is_none_or(|&p| p == bp_pc)
     {
@@ -303,18 +331,21 @@ mod tests
     use super::*;
 
     // Defect caught: a check that passes a session missing one of its
-    // results (the step, the rewritten value, the second thread's row).
+    // results (the step, the rewritten variable or register, the second
+    // thread's row).
     #[test]
     fn a_session_missing_a_result_fails_the_check()
     {
         let good = "[New Thread 2]\n  Id   Target Id   Frame\n* 1    Thread 1   0x8 in f ()\n  \
                     2    Thread 2   0x9 in f ()\n@@break\nBreakpoint 1, 0x10 in \
                     gdb_target_tick ()\n@@pc\n$1 = 0x10\n@@counter\n0x20:\t0x0000000000005eed\n\
-                    @@step\n$2 = 0x14\n@@thread\n[Switching to thread 2 (Thread 2)]\n$3 = 0x30\n\
-                    $4 = 0x40\n@@detach\nDetaching from program\n";
+                    @@register\nRegister cache flushed.\n$2 = 0x5eed5eed\n\
+                    @@step\n$3 = 0x14\n@@thread\n[Switching to thread 2 (Thread 2)]\n$4 = 0x30\n\
+                    $5 = 0x40\n@@detach\nDetaching from program\n";
         expect(good).unwrap();
-        assert!(expect(&good.replace("$2 = 0x14", "$2 = 0x10")).is_err());
-        assert!(expect(&good.replace("5eed", "0000")).is_err());
+        assert!(expect(&good.replace("$3 = 0x14", "$3 = 0x10")).is_err());
+        assert!(expect(&good.replace("0x0000000000005eed", "0x0000000000000000")).is_err());
+        assert!(expect(&good.replace("$2 = 0x5eed5eed", "$2 = 0x7")).is_err());
         assert!(expect(&good.replace("2    Thread 2   0x9 in f ()", "")).is_err());
     }
 }

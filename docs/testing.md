@@ -423,9 +423,11 @@ from a host GDB over the debug port, so its check is a host GDB session.
    `[gdbstub] attached; serving the debug port` line on the serial stream.
 3. Run `gdb -batch` against the port with the target's binary for symbols: list the threads,
    break on the tick function and continue to it, read the pointer, rewrite the counter and read
-   it back, single-step, delete the breakpoint, select the second thread and read its registers,
-   and detach. The output must show two threads, the breakpoint's stop, the rewritten value, a
-   step that moved the pointer, the second thread's registers, and the detach.
+   it back, rewrite a caller-saved register, read it back from the stub past GDB's register
+   cache, and restore it, single-step, delete the breakpoint, select the second thread and read
+   its registers, and detach. The output must show two threads, the breakpoint's stop, the
+   rewritten counter and register, a step that moved the pointer, the second thread's registers,
+   and the detach.
 4. Kill QEMU, remove both recipes, and repack `disk.img` again, whatever the outcome.
 
 It needs a host GDB that debugs the guest architecture (`gdb` built with every target, or

@@ -731,6 +731,21 @@ mod tests
     }
 
     #[test]
+    fn a_block_with_a_thread_value_the_parser_does_not_know_is_still_printed_and_resolved()
+    {
+        let regs = [0u64; 21];
+        let ip = BIAS + INNER + 4;
+        let log = log_of(&report(ip, &regs, &[ip]), Some("crashme"))
+            .replace("thread=main", "thread=spawned");
+        let out = symbolize_log(&log, &Fixture::dwarf("x86_64")).unwrap();
+        assert!(out.contains("\n  thread=spawned\n"), "{out}");
+        assert!(
+            out.contains(&format!("\n  ip={ip:#018x}  inner at /src/fixture.rs:20 [debug-info]\n")),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn a_log_without_a_block_has_no_report()
     {
         assert_eq!(

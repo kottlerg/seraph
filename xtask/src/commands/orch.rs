@@ -1444,7 +1444,7 @@ mod tests
     {
         assert_eq!(size_warning(&"x".repeat(STATE_TEXT_MAX)), None);
         let warning = size_warning(&"x".repeat(STATE_TEXT_MAX + 1)).expect("a warning");
-        assert!(warning.contains("10001 bytes"));
+        assert!(warning.contains(&format!("{} bytes", STATE_TEXT_MAX + 1)));
         assert!(warning.contains("--remove"));
     }
 

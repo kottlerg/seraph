@@ -133,10 +133,6 @@ struct FirmwareSet
     vars_template: Option<PathBuf>,
 }
 
-// too_many_lines: a linear dispatch-and-collect driver (wave loop, per-slot
-// thread spawn, join, summary). Splitting it would scatter the shared per-run
-// state across helpers without reducing complexity.
-#[allow(clippy::too_many_lines)]
 pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 {
     validate_args(args)?;
@@ -160,6 +156,10 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 }
 
 /// Boot the runs in waves of `--parallel`, after [`run`]'s staging.
+// too_many_lines: a linear dispatch-and-collect driver (wave loop, per-slot
+// thread spawn, join, summary). Splitting it would scatter the shared per-run
+// state across helpers without reducing complexity.
+#[allow(clippy::too_many_lines)]
 fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 {
     let pass_re =

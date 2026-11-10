@@ -35,8 +35,10 @@ works from a long or summarized context. Three consequences hold throughout this
 
 The maintainer's words stay in the record, which is local and uncommitted. Everything tracked
 or outward-facing (a commit message, a PR body, an Issue, a comment, a file in the tree) states
-their decision as a decision, in the project's prose, and never quotes what they typed. Pass a
-ruling to a worker the same way: the decision, not the quotation.
+their decision as a decision, in the project's prose, and never quotes what they typed
+(docs/documentation-standards.md § Tone and Language; docs/conventions.md § Style for a PR body,
+an Issue and a comment). Pass a ruling to a worker the same way: the decision, not the
+quotation.
 
 If your context is compacted before a hand-over, this file still applies: run
 `cargo xtask orch state` before your next decision, and take no rule or state from the summary.

@@ -33,7 +33,8 @@ only if that does not cure it.
    verbatim, by its id. Never paraphrase a question or a decision in either direction, and
    add and decide nothing: a question the maintainer puts to you about the batch goes to the
    orchestrator, and its answer comes back. The maintainer's words go no further than the
-   orchestrator and its local record; nothing tracked or outward-facing quotes them.
+   orchestrator and its local record; nothing tracked or outward-facing quotes them
+   (docs/documentation-standards.md § Tone and Language; docs/conventions.md § Style).
 3. **Replace the orchestrator at about 250,000 tokens.** Its notifications carry its token
    count. At that size, or when it asks, send `park`; when it answers `parked` and hands back,
    spawn a new one with "resume from the record" and give it its id. Stop the old one only if it

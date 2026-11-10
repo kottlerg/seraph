@@ -165,10 +165,11 @@ what a log or a failure means; the fix for every finding; the correctness of the
 The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a delegate's.
 
 ## Commits and the PR body
-
 - State a decision of the maintainer as a decision, in the project's prose ("the maintainer
   decided that ..."). Never quote what they typed in a commit message, a PR body, an Issue, a
-  comment or a tracked file, however it reached you (docs/conventions.md § Style). That holds
+  comment or a tracked file, however it reached you (docs/documentation-standards.md § Tone and
+  Language for a tracked file and a commit message; docs/conventions.md § Style for a PR body,
+  an Issue and a comment). That holds
   for their acceptance of a SHOULD departure too: the body states it. Their words are kept in
   the orchestrator's local record only.
 - Subjects are `<scope>: ...`, at most 72 columns, with no Issue reference. Bodies are wrapped

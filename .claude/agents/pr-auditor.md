@@ -138,9 +138,10 @@ claims.
    FAIL unless the PR body records the maintainer's acceptance of it as
    a statement of that decision, which § Commit Messages makes an
    accepted departure: report such an item as `accepted`, citing that
-   statement, and it does not fail the section. A PR body, commit
-   message or changed file that quotes what the maintainer wrote in a
-   session breaks § Style: FAIL it.
+   statement, and it does not fail the section. A commit message
+   or changed file that quotes what the maintainer wrote in a session
+   breaks `docs/documentation-standards.md` § Tone and Language, and a PR
+   body that does breaks § Style: FAIL it.
 
 9. Validation claim: the PR body's `## Validation` section states the
    validated head X. X MUST be the PR head, or else X MUST be the merge base

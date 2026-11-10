@@ -551,8 +551,17 @@ fn read_header<'a>(line: &'a str, path: &mut &'a str, out: &mut Vec<String>)
     {
         out.push("binary change".to_owned());
     }
-    else if line.starts_with("old mode ") || line.starts_with("new mode ")
+    else if [
+        "old mode ",
+        "new mode ",
+        "new file mode ",
+        "deleted file mode ",
+    ]
+    .iter()
+    .any(|header| line.starts_with(header))
     {
+        // An added or deleted file states its mode on its own header line,
+        // so a mode change to a file the PR adds shows only there.
         out.push(line.to_owned());
     }
 }
@@ -1683,7 +1692,10 @@ mod tests
     {
         let deleted = "diff --git a/k/a.rs b/k/a.rs\ndeleted file mode 100644\n--- a/k/a.rs\n\
                        +++ /dev/null\n@@ -1 +0,0 @@\n-let x = 1;\n";
-        assert_eq!(non_comment_changes(deleted), ["k/a.rs: let x = 1;"]);
+        assert_eq!(
+            non_comment_changes(deleted),
+            ["k/a.rs: deleted file mode 100644", "k/a.rs: let x = 1;"]
+        );
     }
 
     #[test]
@@ -2047,6 +2059,25 @@ mod tests
             found
                 .iter()
                 .any(|d| d.message.contains("no newline at end of file"))
+        );
+    }
+
+    #[test]
+    fn a_mode_change_to_an_added_file_after_a_sync_is_an_error()
+    {
+        let repo = Repo::new("sync-mode");
+        let validated = repo.commit("run.sh", "# run\n");
+        repo.on_master("b.rs", "fn b() {}\nfn c() {}\n");
+        repo.merge_master(&[]);
+        repo.git(&["update-index", "--chmod=+x", "run.sh"]);
+        repo.git(&["commit", "-q", "-m", "test: chmod"]);
+        let found = repo.check(&validated, "; later commits are comment-only.");
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|d| d.rule == "pr-validated-head"));
+        assert!(
+            found
+                .iter()
+                .any(|d| d.message.contains("new file mode 100755"))
         );
     }
 

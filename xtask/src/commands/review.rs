@@ -403,7 +403,7 @@ fn last_run<'a>(records: &'a [Record], head: &str) -> Result<&'a Record, Vec<Dia
     Ok(last)
 }
 
-/// The merge-prompt condition's record part (docs/conventions.md § Branch
+/// The merge condition's record part (docs/conventions.md § Branch
 /// and PR Workflow): the last run at `head` has no failed agent, `AUDIT
 /// PASS`, and a reviewer verdict that is not `BLOCKING ISSUES`. An earlier
 /// passing run at the same head does not count.
@@ -432,7 +432,9 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
              verdict of READY TO MERGE or NON-BLOCKING ISSUES ONLY",
         )];
     }
-    let open = record["findings"].as_array().map_or(0, Vec::len);
+    let open = record["findings"].as_array().map_or(0, |findings| {
+        findings.iter().filter(|f| needs_reader(f)).count()
+    });
     if record["verdict"] == "NON-BLOCKING ISSUES ONLY" && open > 0
     {
         return vec![Diag::warning(
@@ -445,6 +447,18 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
         )];
     }
     Vec::new()
+}
+
+/// Whether the gate's reader must look at `finding`: one an Issue must
+/// record (docs/conventions.md § Recording findings: every finding but one
+/// of class `style` that is not a MUST violation, whose record is the run
+/// record), or one of any class that is contested, since the merge condition
+/// lets no contested finding stand unresolved.
+fn needs_reader(finding: &Value) -> bool
+{
+    finding["class"] != "style"
+        || finding["must_violation"] == true
+        || finding["status"] == "contested"
 }
 
 /// Build the ledger from every record of a PR: the findings each run
@@ -852,6 +866,47 @@ mod tests
                 "AUDIT PASS",
                 vec![finding("a", "nit")],
             ),
+        )];
+        assert_eq!(
+            rules(&gate_diags(&records, HEAD)),
+            ["gate-findings-recorded"]
+        );
+    }
+
+    #[test]
+    fn the_gate_asks_nothing_for_a_style_finding_that_is_no_must_violation()
+    {
+        let mut style = finding("a", "nit");
+        style["class"] = json!("style");
+        let records = vec![(
+            NAME.to_owned(),
+            record(
+                "NON-BLOCKING ISSUES ONLY",
+                "AUDIT PASS",
+                vec![style.clone()],
+            ),
+        )];
+        assert!(gate_diags(&records, HEAD).is_empty());
+
+        style["must_violation"] = json!(true);
+        let records = vec![(
+            NAME.to_owned(),
+            record("NON-BLOCKING ISSUES ONLY", "AUDIT PASS", vec![style]),
+        )];
+        assert_eq!(
+            rules(&gate_diags(&records, HEAD)),
+            ["gate-findings-recorded"]
+        );
+    }
+
+    #[test]
+    fn the_gate_asks_about_a_contested_style_finding()
+    {
+        let mut style = finding("a", "contested");
+        style["class"] = json!("style");
+        let records = vec![(
+            NAME.to_owned(),
+            record("NON-BLOCKING ISSUES ONLY", "AUDIT PASS", vec![style]),
         )];
         assert_eq!(
             rules(&gate_diags(&records, HEAD)),

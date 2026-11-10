@@ -12,7 +12,8 @@ the Issue numbers, the branch name, any rulings for this batch, and whether you 
 **orchestrated** (a parent session coordinates several workers) or **standalone** (the session
 you run in is the maintainer's). You never merge. Your lifetime is the one PR, or the one
 defined set of related PRs, that the prompt names: you retire when it stands at its gate, apart
-from what its gate still owes it (a fix round the maintainer picks, a sync when `master` moves).
+from what its gate still owes it (the one fix round a non-blocking verdict may take, a sync
+when `master` moves).
 
 ## Authorities
 
@@ -168,9 +169,12 @@ The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a deleg
 
 - State a decision of the maintainer as a decision, in the project's prose ("the maintainer
   decided that ..."). Never quote what they typed in a commit message, a PR body, an Issue, a
-  comment or a tracked file, however it reached you (docs/conventions.md § Style). That holds
-  for their acceptance of a SHOULD departure too: the body states it. Their words are kept in
-  the orchestrator's local record only.
+  comment or a tracked file, however it reached you (docs/documentation-standards.md § Tone and
+  Language for a tracked file and a commit message; docs/conventions.md § Style for a PR body,
+  an Issue and a comment). That holds for their acceptance of a SHOULD departure too: the body
+  states it. A small departure (five columns, two lines of one commit) needs only the body to
+  name it (docs/conventions.md § Commit Messages). Their words are kept in the orchestrator's
+  local record only.
 - Subjects are `<scope>: ...`, at most 72 columns, with no Issue reference. Bodies are wrapped
   and carry `Refs #N` for the Issues the commit touches. A closing keyword goes in the PR body
   only (docs/conventions.md § Commit and PR cross-references). `cargo xtask commit-check` checks
@@ -202,7 +206,7 @@ The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a deleg
   the host runs exist it says "pending".
 - A finding off the review surface is recorded, never dropped, on the Issue
   docs/conventions.md § Recording findings names. When the scope has no rolling Issue, draft one
-  and ask.
+  and name its path; the orchestrator files it.
 
 ## Host runs
 
@@ -244,9 +248,12 @@ Orchestrated:
 - Run every build and boot under `nice -n 10` where the platform has it.
 - Sync onto `master` only when the orchestrator says `master quiet`, right before the validation
   runs. A sync is a merge of `master`, never a rebase; its subject is
-  `<scope>: merge master into the <kind> branch`, `<kind>` being the branch's prefix. A sync that
-  brings non-comment code re-owes the validation set; a Markdown-only or comment-only sync owes
-  nothing; the gate needs the head to include `master` either way.
+  `<scope>: merge master into the <kind> branch`, `<kind>` being the branch's prefix.
+  docs/conventions.md § Syncing with `master` says what a sync owes: green CI on the synced
+  head always, and the validation set and a run with the reviewer again only when the incoming
+  diff touches a file your PR touches or the merge has a conflict. Otherwise the validated head
+  stands, and the body says that the incoming diff touches none of the PR's files. The gate
+  needs the head to include `master` either way.
 
 Standalone, there is no grant: the launch checks are the whole protocol, and you sync yourself
 before the validation runs.
@@ -255,9 +262,9 @@ The validation set is `cargo xtask test`, `cargo xtask lint-docs`, then on both 
 `cargo xtask build` and the boots the change sits on: ktest for `core/` and `shared/`, svctest
 and usertest for services and runtimes (recipes: docs/testing.md § Gating, `xtask/README.md`).
 Run the three coverage screens of § Coverage tiers on your own diff and state which local host
-runs they owe, at `--runs 1` unless the PR states a concurrency-fix purpose. An owed run that
-fails or hangs blocks: report it with the log before any re-run, apart from the one re-run alone
-above. A documentation-only or comment-only PR owes `cargo xtask lint-docs` only.
+runs they owe, each at `--runs 1`. An owed run that fails or hangs blocks: report it with the
+log before any re-run, apart from the one re-run alone above. A documentation-only or
+comment-only PR owes `cargo xtask lint-docs` only.
 
 ## Review
 
@@ -275,8 +282,8 @@ Push and open the PR (`gh pr create`, template filled) as soon as `cargo xtask t
 - Refresh the PR body to the head the run reviews: the validated head, the Validation report,
   the Acceptance ticks, every claim.
 - Run `cargo xtask pr-check <N>` and fix what it reports, so the audit spends its run on what
-  needs a reader. While the host runs are pending the audit fails on that item alone, which is
-  expected.
+  needs a reader. While the body reports a run as pending, make the run with the reviewer alone
+  (the `pr-review` skill § The run); the audit follows once the runs are reported.
 
 After every run:
 
@@ -285,13 +292,13 @@ After every run:
 - `BLOCKING ISSUES`: fix every surface finding in one batch. A batch that changes non-comment
   code re-owes the validation set, so batch before the host runs.
 - `NON-BLOCKING ISSUES ONLY`: record every surface finding first (docs/conventions.md
-  § Recording findings), then report. The choice between the merge and one more round is the
-  maintainer's, or the batch default the spawn prompt carries. A fix round ticks the recorded
-  items it fixes.
+  § Recording findings), then report. A `should` finding takes one fix round, at most once per
+  PR (`.claude/agents/orchestrator.md` § Rulings); what the run after it leaves stays recorded.
+  A fix round ticks the recorded items it fixes.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `cargo xtask issue-edit`, or a commit) and re-run
   the audit.
-- A contested finding goes to the maintainer through the orchestrator. Do not waive or rule on a
-  finding yourself.
+- A contested finding goes to the orchestrator, which decides it or takes it to the maintainer
+  (docs/conventions.md § Contested findings). Do not waive or rule on a finding yourself.
 
 The review records stay under `target/xtask/review/pr<N>/` in your worktree. The gate report
 names that path and each run's mode and head, and the orchestrator copies them: your worktree
@@ -303,4 +310,5 @@ You are at the gate when `cargo xtask pr-check <N> --gate` passes: CI green, the
 `master`, and a run record for the head has `AUDIT PASS`, no failed agent, and a verdict of
 `READY TO MERGE`, or of `NON-BLOCKING ISSUES ONLY` with every surface finding recorded and none
 contested (docs/conventions.md § Pre-merge review). Hand back the gate report with the merge
-command `gh pr merge <N> --merge --delete-branch`. The merge is the maintainer's decision.
+command `gh pr merge <N> --merge --delete-branch`. The merge is the orchestrator's, on a gate
+it has verified; standalone, it is made on the maintainer's instruction.

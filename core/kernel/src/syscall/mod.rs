@@ -30,6 +30,8 @@ pub mod thread;
 
 use crate::arch::current::trap_frame::TrapFrame;
 #[cfg(not(test))]
+use crate::mm::paging::UserAccess;
+#[cfg(not(test))]
 use crate::uaccess::{RestartableError, UserCopyFault};
 #[cfg(not(test))]
 use syscall::SyscallError;
@@ -329,12 +331,13 @@ unsafe fn deliver_copy_fault(tf: UserFrame, fault: UserCopyFault) -> SyscallExit
     let syscall_ip = tf.rewind_syscall();
     let mut access = if fault.write
     {
-        syscall::FAULT_ACCESS_WRITE
+        UserAccess::Store
     }
     else
     {
-        syscall::FAULT_ACCESS_READ
-    };
+        UserAccess::Load
+    }
+    .fault_access_bit();
     // SAFETY: kernel mode in the faulting thread's context, its tables active.
     if unsafe { crate::arch::current::paging::copy_fault_present(fault.va) }
     {

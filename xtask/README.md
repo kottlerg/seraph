@@ -28,10 +28,11 @@ xtask/
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── symbolize.rs            # ELF address resolution: DWARF, symbol-table fallback
+│   ├── tasklist.rs             # GitHub task-list items, as the PR and Issue checks read them
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
-│   ├── commands/               # One module per subcommand (build, run, run_parallel,
+│   ├── commands/               # Subcommand modules (build, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, test_kaslr, test_logd_reclaim, test_map_redo,
 │   │                           #   test_terminal, test_vmgenid, lint_docs, pr_check,
@@ -754,14 +755,14 @@ may accept, and one rule a script cannot decide alone.
 | `commit-subject-ref` | error | The subject carries no Issue reference (`#N`, `<owner>/<repo>#N`, or the Issue's URL). |
 | `commit-closing-keyword` | error | No closing keyword directly before an Issue reference, in the subject or the body. |
 | `commit-attribution` | error | No tool attribution line and no link to an assistant session. |
-| `commit-emoji` | error | No emoji. |
-| `commit-unsigned` | error | The commit is signed (git's `%G?` is not `N`). |
+| `commit-emoji` | error | No character with emoji presentation. A symbol used as text (an arrow, a check mark, an operator) is not one. |
+| `commit-unsigned` | error | The commit object carries a signature (a `gpgsig` header), as § Branch protection requires. Whether it verifies is that rule's to decide; a clone without the signer's key cannot. |
 | `commit-subject-columns` | warning | The subject is at most 72 columns. |
 | `commit-body-columns` | warning | No body line that wrapping could shorten is over 72 columns (a line with no space, or indented four columns, is left alone). |
 | `commit-planning-label` | warning | The subject carries no `step N`, `phase N`, `tier N`, `stage N`, or `round N`; the name of a step a document defines permanently is not a label, which is why this is a warning. |
 
-A merge commit is exempt from the subject rules, as § Commit Messages says; the other rules apply
-to it.
+A merge commit is exempt from the four subject rules, as § Commit Messages says; the other rules,
+`commit-body-columns` among them, apply to it.
 
 ### `cargo xtask pr-check`
 
@@ -779,10 +780,10 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 |---|---|---|
 | `pr-unticked-box` | error | The body has no `- [ ]` (§ PR-body checklist discipline). |
 | `pr-attribution` | error | The body carries no tool attribution line and no session link. |
-| `pr-validation` | error | The body has a `## Validation` section that names a validated head. |
-| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch, the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). |
+| `pr-validation` | error | The body has a `## Validation` section that names a validated head: the first word of that section that is a commit hash in the clone. |
+| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch, the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. |
 | `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
-| `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Follow-up Issues). |
+| `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Branch and PR Workflow). |
 | `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
 | `issue-milestone` | error | Every Issue the PR closes carries the current milestone, the lowest-versioned open one. |
 | `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
@@ -790,14 +791,16 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 The command prints the Issues the body and the commits close and the ones the body references,
 so that a keyword in prose that closes an Issue by accident is seen.
 
-`--gate` adds the merge gate of § Pre-merge review and implies `--strict`:
+`--gate` adds the merge gate of § Branch and PR Workflow. It does not imply `--strict`: a
+warning is for the reader, who may confirm it or hold an acceptance of it, and only an error
+fails the gate.
 
 | Rule | Level | Check |
 |---|---|---|
 | `gate-merge-state` | error | GitHub reports the merge state `CLEAN`. |
-| `gate-checks` | error | Every check of the rollup has succeeded. |
+| `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
-| `gate-review-record` | error | `target/xtask/review/pr<N>/` holds a well-formed run record for the PR head with `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. |
+| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. Runs at one head are ordered by the `-<n>` suffix of the file name, then full or delta before audit; an earlier passing run does not count. |
 | `gate-findings-recorded` | warning | That record leaves no finding on the surface. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each is recorded and none is contested; the command cannot. |
 
 The command does not judge what needs a reader: whether the body's claims match the diff, whether
@@ -836,7 +839,7 @@ does not state its record's mode and head, `error record-name`.
 ### `cargo xtask review-ledger`
 
 Build the ledger of a pull request's review: the findings a later run of the same PR must not
-re-raise ([docs/conventions.md](../docs/conventions.md) § Ledger).
+re-raise ([docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow).
 
 ```
 cargo xtask review-ledger <N>
@@ -906,7 +909,9 @@ what is missing.
 ## Adding a new command
 
 1. Add a variant to `CliCommand` in `src/cli.rs` with a corresponding `Args` struct.
-2. Create `src/commands/<name>.rs` with `pub fn run(ctx: &Context, args: &NameArgs) -> Result<()>`.
+2. Create `src/commands/<name>.rs` with `pub fn run(ctx: &Context, args: &NameArgs) -> Result<()>`,
+   or add a `pub fn run_<name>` to the module that holds its sibling commands (`pr_check`,
+   `review`, and `issue` each hold two).
 3. Add a match arm in `src/main.rs`.
 4. Re-export the module in `src/commands/mod.rs`.
 

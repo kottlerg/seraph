@@ -7,13 +7,14 @@
 //! script can decide about a branch's commits and a pull request.
 //!
 //! `commit-check` reads the commits of a range and checks § Commit Messages
-//! and § Commit and PR cross-references: the subject's form and width, Issue
-//! references and planning labels in it, closing keywords, attribution,
-//! emojis, and signatures. `pr-check` adds the pull request: § PR-body
-//! checklist discipline (unticked boxes, the validated head and its delta),
-//! § Milestones, the Issues the body closes or references, and, with
-//! `--gate`, the merge gate (check rollup, merge state, `master` included,
-//! and a passing review record for the head).
+//! and § Commit and PR cross-references (the subject's form and width, Issue
+//! references and planning labels in it, closing keywords, attribution, and
+//! emojis) and the signed-commit requirement of § Branch protection.
+//! `pr-check` adds the pull request: § PR-body checklist discipline (unticked
+//! boxes, the validated head and its delta), § Milestones, the Issues the
+//! body closes or references, and, with `--gate`, the merge gate (check
+//! rollup, merge state, `master` included, and a passing review record for
+//! the head).
 //!
 //! What needs judgment stays with the pre-merge review: whether the body's
 //! claims match the diff, whether an acceptance item is delivered, and which
@@ -29,8 +30,9 @@ use serde_json::Value;
 use crate::cli::{CommitCheckArgs, PrCheckArgs};
 use crate::commands::review;
 use crate::context::Context as BuildContext;
-use crate::diag::{Diag, report};
+use crate::diag::{Diag, Strictness, report};
 use crate::gh;
+use crate::tasklist::{TaskItem, task_item};
 use crate::util::{run_cmd_capture, step};
 
 /// Subject width limit (docs/conventions.md § Commit Messages, Title).
@@ -39,9 +41,51 @@ const SUBJECT_COLUMNS: usize = 72;
 /// Body wrap column (docs/conventions.md § Commit Messages, Body).
 const BODY_COLUMNS: usize = 72;
 
-/// Title suffix of a rolling follow-up Issue (docs/conventions.md § Follow-up
-/// Issues): a PR references one with `Refs` and never closes it.
+/// Title suffix of a rolling follow-up Issue (docs/conventions.md § Branch
+/// and PR Workflow): a PR references one with `Refs` and never closes it.
 const ROLLING_TITLE_SUFFIX: &str = ": defects found by review";
+
+/// Code points Unicode gives emoji presentation by default, outside the
+/// pictographic planes that `is_emoji` covers as whole ranges. The symbols
+/// commit messages use as text (arrows, check marks, box drawing, operators)
+/// are not in this list.
+const EMOJI_BMP: &[(u32, u32)] = &[
+    (0x231A, 0x231B),
+    (0x23E9, 0x23EC),
+    (0x23F0, 0x23F0),
+    (0x23F3, 0x23F3),
+    (0x25FD, 0x25FE),
+    (0x2614, 0x2615),
+    (0x2648, 0x2653),
+    (0x267F, 0x267F),
+    (0x2693, 0x2693),
+    (0x26A1, 0x26A1),
+    (0x26AA, 0x26AB),
+    (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5),
+    (0x26CE, 0x26CE),
+    (0x26D4, 0x26D4),
+    (0x26EA, 0x26EA),
+    (0x26F2, 0x26F3),
+    (0x26F5, 0x26F5),
+    (0x26FA, 0x26FA),
+    (0x26FD, 0x26FD),
+    (0x2705, 0x2705),
+    (0x270A, 0x270B),
+    (0x2728, 0x2728),
+    (0x274C, 0x274C),
+    (0x274E, 0x274E),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2795, 0x2797),
+    (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF),
+    (0x2B1B, 0x2B1C),
+    (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55),
+    // The variation selector that asks for emoji presentation of a symbol.
+    (0xFE0F, 0xFE0F),
+];
 
 // ── Patterns ──────────────────────────────────────────────────────────────────
 
@@ -54,7 +98,6 @@ pub struct Patterns
     attribution: Regex,
     planning_label: Regex,
     subject_form: Regex,
-    unticked: Regex,
     hex: Regex,
     delta_statement: Regex,
     embed: Regex,
@@ -74,13 +117,15 @@ impl Patterns
             closing_ref: Regex::new(&format!(
                 r"(?i)\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:{reference})"
             ))?,
+            // `Refs` takes the `#N` form only: the Issues it names are looked
+            // up in this repository, and a reference into another repository
+            // names an Issue these checks cannot read.
             refs_ref: Regex::new(r"(?i)\brefs\s*:?\s*#(\d+)")?,
             attribution: Regex::new(
                 r"(?i)claude\.ai/|claude-session|co-authored-by:\s*claude|generated with \[?claude",
             )?,
             planning_label: Regex::new(r"(?i)\b(step|phase|tier|stage|round)\s+\d+\b")?,
             subject_form: Regex::new(r"^[^\s:][^:]*: \S")?,
-            unticked: Regex::new(r"^\s*[-*] \[ \]")?,
             hex: Regex::new(r"\b[0-9a-f]{7,40}\b")?,
             delta_statement: Regex::new(r"(?i)comment|markdown|documentation")?,
             embed: Regex::new(r"include_str!|include_bytes!|global_asm!")?,
@@ -99,11 +144,14 @@ pub struct Commit
     pub body: String,
     /// More than one parent. A merge commit is exempt from the Title rules.
     pub merge: bool,
-    /// git's `%G?` status letter; `N` is an unsigned commit.
-    pub signature: char,
+    /// The commit object carries a signature (a `gpgsig` header). Whether the
+    /// signature verifies is the branch protection rule's to decide; a clone
+    /// without the signer's key cannot.
+    pub signed: bool,
 }
 
-/// An Issue a text closes: the number and the 1-based line of the reference.
+/// An Issue a text closes or references: its number and the 1-based line of
+/// the reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueRef
 {
@@ -143,15 +191,15 @@ pub fn refs_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
     refs_in(&pat.refs_ref, text, 1)
 }
 
-/// Whether `c` is in a pictographic block. The Style rule bans emojis; the
-/// arrows, box-drawing, and mathematical symbols commit messages use
-/// legitimately sit outside these blocks.
+/// Whether `c` has emoji presentation: a code point of the pictographic
+/// planes, or one of the `EMOJI_BMP` ranges.
 fn is_emoji(c: char) -> bool
 {
-    matches!(
-        u32::from(c),
-        0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B50 | 0x2B55 | 0xFE0F
-    )
+    let code = u32::from(c);
+    (0x1F000..=0x1FAFF).contains(&code)
+        || EMOJI_BMP
+            .iter()
+            .any(|(first, last)| (*first..=*last).contains(&code))
 }
 
 fn short(sha: &str) -> &str
@@ -159,69 +207,90 @@ fn short(sha: &str) -> &str
     sha.get(..8).unwrap_or(sha)
 }
 
-/// Check one commit against § Commit Messages and § Commit and PR
-/// cross-references.
+/// A body line over the wrap column that wrapping could shorten: it has a
+/// space to break at and is not an indented block (a command, a quotation of
+/// output).
+fn overlong_body_line(line: &str) -> bool
+{
+    line.chars().count() > BODY_COLUMNS
+        && !line.starts_with("    ")
+        && !line.starts_with('\t')
+        && line.trim().contains(' ')
+}
+
+/// The Title rules of § Commit Messages, which a merge commit is exempt from.
+fn check_subject(pat: &Patterns, at: &str, subject: &str) -> Vec<Diag>
+{
+    let mut out = Vec::new();
+    if !pat.subject_form.is_match(subject)
+    {
+        out.push(Diag::error(
+            "commit-subject-form",
+            at,
+            "the subject is not `<scope>: <summary>`",
+        ));
+    }
+    let width = subject.chars().count();
+    if width > SUBJECT_COLUMNS
+    {
+        out.push(Diag::warning(
+            "commit-subject-columns",
+            at,
+            format!("the subject is {width} columns; the limit is {SUBJECT_COLUMNS}"),
+        ));
+    }
+    if let Some(found) = pat.issue_ref.find(subject)
+    {
+        out.push(Diag::error(
+            "commit-subject-ref",
+            at,
+            format!(
+                "the subject carries the Issue reference `{}`; references go in the body",
+                found.as_str()
+            ),
+        ));
+    }
+    if let Some(found) = pat.planning_label.find(subject)
+    {
+        out.push(Diag::warning(
+            "commit-planning-label",
+            at,
+            format!(
+                "`{}` reads as a planning label; keep it only if it names a step a document \
+                 defines permanently",
+                found.as_str()
+            ),
+        ));
+    }
+    out
+}
+
+/// Check one commit against § Commit Messages, § Commit and PR
+/// cross-references, and the signed-commit requirement.
 pub fn check_commit(pat: &Patterns, commit: &Commit) -> Vec<Diag>
 {
     let at = format!("{} ({})", short(&commit.sha), commit.subject);
-    let mut out = Vec::new();
     let message = format!("{}\n\n{}", commit.subject, commit.body);
-
-    if !commit.merge
+    let mut out = if commit.merge
     {
-        if !pat.subject_form.is_match(&commit.subject)
-        {
-            out.push(Diag::error(
-                "commit-subject-form",
-                &at,
-                "the subject is not `<scope>: <summary>`",
-            ));
-        }
-        let width = commit.subject.chars().count();
-        if width > SUBJECT_COLUMNS
-        {
-            out.push(Diag::warning(
-                "commit-subject-columns",
-                &at,
-                format!("the subject is {width} columns; the limit is {SUBJECT_COLUMNS}"),
-            ));
-        }
-        if let Some(found) = pat.issue_ref.find(&commit.subject)
-        {
-            out.push(Diag::error(
-                "commit-subject-ref",
-                &at,
-                format!(
-                    "the subject carries the Issue reference `{}`; references go in the body",
-                    found.as_str()
-                ),
-            ));
-        }
-        if let Some(found) = pat.planning_label.find(&commit.subject)
-        {
-            out.push(Diag::warning(
-                "commit-planning-label",
-                &at,
-                format!(
-                    "`{}` reads as a planning label; keep it only if it names a step a \
-                     document defines permanently",
-                    found.as_str()
-                ),
-            ));
-        }
-        if let Some(line) = commit.body.lines().find(|l| overlong_body_line(l))
-        {
-            out.push(Diag::warning(
-                "commit-body-columns",
-                &at,
-                format!(
-                    "a body line is {} columns; wrap at about {BODY_COLUMNS}",
-                    line.chars().count()
-                ),
-            ));
-        }
+        Vec::new()
     }
+    else
+    {
+        check_subject(pat, &at, &commit.subject)
+    };
 
+    if let Some(line) = commit.body.lines().find(|l| overlong_body_line(l))
+    {
+        out.push(Diag::warning(
+            "commit-body-columns",
+            &at,
+            format!(
+                "a body line is {} columns; wrap at about {BODY_COLUMNS}",
+                line.chars().count()
+            ),
+        ));
+    }
     for found in closing_refs(pat, &message)
     {
         out.push(Diag::error(
@@ -250,7 +319,7 @@ pub fn check_commit(pat: &Patterns, commit: &Commit) -> Vec<Diag>
             "the message contains an emoji",
         ));
     }
-    if commit.signature == 'N'
+    if !commit.signed
     {
         out.push(Diag::error(
             "commit-unsigned",
@@ -261,18 +330,8 @@ pub fn check_commit(pat: &Patterns, commit: &Commit) -> Vec<Diag>
     out
 }
 
-/// A body line over the wrap column that wrapping could shorten: it has a
-/// space to break at and is not an indented block (a command, a quotation of
-/// output).
-fn overlong_body_line(line: &str) -> bool
-{
-    line.chars().count() > BODY_COLUMNS
-        && !line.starts_with("    ")
-        && !line.starts_with('\t')
-        && line.trim().contains(' ')
-}
-
-/// Parse the output of `git log` in the format `LOG_FORMAT`.
+/// Parse the output of `git log` in the format `LOG_FORMAT`. `signed` is
+/// left false; `commits_in` fills it from each commit object.
 pub fn parse_log(log: &str) -> Vec<Commit>
 {
     log.split('\x1e')
@@ -284,7 +343,6 @@ pub fn parse_log(log: &str) -> Vec<Commit>
                 return None;
             }
             let parents = fields.next()?;
-            let signature = fields.next()?.chars().next().unwrap_or('N');
             let subject = fields.next()?.to_owned();
             let body = fields.next().unwrap_or("").trim_end().to_owned();
             Some(Commit {
@@ -292,25 +350,51 @@ pub fn parse_log(log: &str) -> Vec<Commit>
                 subject,
                 body,
                 merge: parents.split_whitespace().count() > 1,
-                signature,
+                signed: false,
             })
         })
         .collect()
 }
 
+/// Whether the raw commit object `object` (`git cat-file commit`) carries a
+/// signature: a `gpgsig` header before the blank line that ends the headers.
+/// Both OpenPGP and SSH signatures are stored under that header.
+pub fn has_signature(object: &str) -> bool
+{
+    object
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .any(|line| line.starts_with("gpgsig"))
+}
+
 /// Fields separated by U+001F, records by U+001E.
-const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%G?%x1f%s%x1f%b%x1e";
+const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%s%x1f%b%x1e";
+
+fn git(root: &Path, args: &[&str]) -> Result<String>
+{
+    run_cmd_capture(Command::new("git").args(args).current_dir(root))
+}
+
+fn git_ok(root: &Path, args: &[&str]) -> bool
+{
+    Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
 
 fn commits_in(root: &Path, base: &str, head: &str) -> Result<Vec<Commit>>
 {
     let range = format!("{base}..{head}");
-    let log = run_cmd_capture(
-        Command::new("git")
-            .args(["log", LOG_FORMAT, &range])
-            .current_dir(root),
-    )
-    .with_context(|| format!("cannot read the commits of {range}; run `git fetch origin`"))?;
-    Ok(parse_log(&log))
+    let log = git(root, &["log", LOG_FORMAT, &range])
+        .with_context(|| format!("cannot read the commits of {range}; run `git fetch origin`"))?;
+    let mut commits = parse_log(&log);
+    for commit in &mut commits
+    {
+        commit.signed = has_signature(&git(root, &["cat-file", "commit", &commit.sha])?);
+    }
+    Ok(commits)
 }
 
 fn check_commits(pat: &Patterns, commits: &[Commit]) -> Vec<Diag>
@@ -327,7 +411,11 @@ pub fn run_commit_check(ctx: &BuildContext, args: &CommitCheckArgs) -> Result<()
     ));
     let pat = Patterns::new()?;
     let commits = commits_in(&ctx.root, &args.base, &args.head)?;
-    report("commit-check", &check_commits(&pat, &commits), args.strict)
+    report(
+        "commit-check",
+        &check_commits(&pat, &commits),
+        Strictness::from_flag(args.strict),
+    )
 }
 
 // ── PR body ───────────────────────────────────────────────────────────────────
@@ -341,29 +429,27 @@ pub fn section<'a>(body: &'a str, heading: &str) -> Option<Vec<&'a str>>
     Some(lines.take_while(|l| !l.starts_with("## ")).collect())
 }
 
-/// The validated head the `## Validation` section states: its first
-/// hexadecimal word of commit-hash length that has a letter (a run id or a
-/// count is all digits).
-pub fn validated_head(pat: &Patterns, body: &str) -> Option<String>
+/// The words of the `## Validation` section that could be the validated
+/// head: every hexadecimal word of commit-hash length, in order. A run id or
+/// a count can be one too, so the caller takes the first that names a commit.
+pub fn validated_head_candidates(pat: &Patterns, body: &str) -> Vec<String>
 {
-    let lines = section(body, "## Validation")?;
-    lines.iter().find_map(|line| {
-        pat.hex
-            .find_iter(line)
-            .map(|m| m.as_str())
-            .find(|word| word.chars().any(|c| c.is_ascii_alphabetic()))
-            .map(str::to_owned)
-    })
+    section(body, "## Validation")
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|line| pat.hex.find_iter(line))
+        .map(|found| found.as_str().to_owned())
+        .collect()
 }
 
 /// Check the PR body's own text: unticked boxes, attribution, and that the
-/// `## Validation` section names a validated head.
+/// `## Validation` section could name a validated head.
 pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
 {
     let mut out = Vec::new();
     for (index, line) in body.lines().enumerate()
     {
-        if pat.unticked.is_match(line)
+        if task_item(line) == Some(TaskItem::Open)
         {
             out.push(Diag::error(
                 "pr-unticked-box",
@@ -391,7 +477,7 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
             "the body has no `## Validation` section",
         ));
     }
-    else if validated_head(pat, body).is_none()
+    else if validated_head_candidates(pat, body).is_empty()
     {
         out.push(Diag::error(
             "pr-validation",
@@ -402,25 +488,65 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
     out
 }
 
-/// The changed lines of a unified diff that are not comment lines, as
-/// `<path>: <line>`; empty when the diff alters only comments. A file type
-/// whose comment syntax this does not know counts as changed.
+/// The comment marker of a file type, by extension. `None` for a type whose
+/// comment syntax these checks do not know.
+fn comment_marker(path: &str) -> Option<&'static str>
+{
+    match path.rsplit('.').next()
+    {
+        Some("rs") => Some("//"),
+        Some("toml" | "yml" | "yaml" | "sh") => Some("#"),
+        _ => None,
+    }
+}
+
+/// The changes of a unified diff that are not comment lines, as
+/// `<path>: <what>`; empty when the diff alters only comments. A binary
+/// change, a mode change, and any line of a file type whose comment syntax is
+/// unknown count as changes. The diff must be made with `--no-renames`, so a
+/// rename shows its lines.
 pub fn non_comment_changes(diff: &str) -> Vec<String>
 {
     let mut out = Vec::new();
-    let mut path = "";
+    let mut path = String::new();
+    // File headers (`---`, `+++`) appear between a `diff --git` line and the
+    // file's first hunk. Inside a hunk the same prefixes are changed lines.
+    let mut in_hunk = false;
     for line in diff.lines()
     {
-        if let Some(rest) = line.strip_prefix("+++ ")
+        if let Some(rest) = line.strip_prefix("diff --git ")
         {
-            path = rest.strip_prefix("b/").unwrap_or(rest);
+            in_hunk = false;
+            // `a/<path> b/<path>`: a binary or mode-only change has no
+            // `---`/`+++` header to name the file.
+            path = rest
+                .rsplit_once(" b/")
+                .map_or(rest, |(_, new)| new)
+                .to_owned();
             continue;
         }
-        if line.starts_with("--- ") || line.starts_with("diff ") || line.starts_with("@@")
+        if line.starts_with("@@")
+        {
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk
         {
             if let Some(rest) = line.strip_prefix("--- a/")
             {
-                path = rest;
+                path = rest.to_owned();
+            }
+            else if let Some(rest) = line.strip_prefix("+++ b/")
+            {
+                path = rest.to_owned();
+            }
+            else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch")
+            {
+                out.push(format!("{path}: binary change"));
+            }
+            else if line.starts_with("old mode ") || line.starts_with("new mode ")
+            {
+                out.push(format!("{path}: {line}"));
             }
             continue;
         }
@@ -430,13 +556,7 @@ pub fn non_comment_changes(diff: &str) -> Vec<String>
             continue;
         };
         let text = text.trim();
-        let marker = match path.rsplit('.').next()
-        {
-            Some("rs") => Some("//"),
-            Some("toml" | "yml" | "yaml" | "sh") => Some("#"),
-            _ => None,
-        };
-        let comment = text.is_empty() || marker.is_some_and(|m| text.starts_with(m));
+        let comment = text.is_empty() || comment_marker(&path).is_some_and(|m| text.starts_with(m));
         if !comment
         {
             out.push(format!("{path}: {text}"));
@@ -464,18 +584,97 @@ pub fn embedded_paths(pat: &Patterns, names: &str, embeds: &str) -> Vec<String>
         .collect()
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String>
+/// The lines of the tracked Rust sources at `head` that embed a file. `git
+/// grep` exits 1 when nothing matches, which is an empty result, not a
+/// failure.
+fn embed_lines(root: &Path, head: &str) -> Result<String>
 {
-    run_cmd_capture(Command::new("git").args(args).current_dir(root))
-}
-
-fn git_ok(root: &Path, args: &[&str]) -> bool
-{
-    Command::new("git")
-        .args(args)
+    let output = Command::new("git")
+        .args([
+            "grep",
+            "-h",
+            "-E",
+            "include_str!|include_bytes!|global_asm!",
+            head,
+            "--",
+            "*.rs",
+        ])
         .current_dir(root)
         .output()
-        .is_ok_and(|out| out.status.success())
+        .context("failed to launch git grep")?;
+    match output.status.code()
+    {
+        Some(0) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
+        Some(1) => Ok(String::new()),
+        _ => bail!(
+            "git grep failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+/// The findings about the delta from the validated head to the PR head: the
+/// body must say it is documentation or comments only, and it must be.
+fn check_delta(
+    pat: &Patterns,
+    root: &Path,
+    body: &str,
+    validated: &str,
+    head: &str,
+) -> Result<Vec<Diag>>
+{
+    let at = format!("validated head {validated}");
+    let mut out = Vec::new();
+    let stated = section(body, "## Validation")
+        .is_some_and(|lines| lines.iter().any(|l| pat.delta_statement.is_match(l)));
+    if !stated
+    {
+        out.push(Diag::error(
+            "pr-validated-head",
+            &at,
+            "it is not the PR head, and the body does not say the delta since it is \
+             documentation or comments only",
+        ));
+    }
+    // `--no-ext-diff` and `--no-textconv` keep a configured diff tool from
+    // replacing the patch text; `--no-renames` makes a rename show its lines.
+    let diff = git(
+        root,
+        &[
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            validated,
+            head,
+            "--",
+            ".",
+            ":(exclude)*.md",
+        ],
+    )?;
+    for change in non_comment_changes(&diff)
+    {
+        out.push(Diag::error(
+            "pr-validated-head",
+            &at,
+            format!("the delta to the PR head is not comment-only: {change}"),
+        ));
+    }
+    let names = git(
+        root,
+        &["diff", "--name-only", "--no-renames", validated, head],
+    )?;
+    for path in embedded_paths(pat, &names, &embed_lines(root, head)?)
+    {
+        out.push(Diag::error(
+            "pr-validated-head",
+            &at,
+            format!("the delta to the PR head changes {path}, which a build embeds"),
+        ));
+    }
+    Ok(out)
 }
 
 /// Check that the validated head covers the PR head: it is the head, or it is
@@ -489,91 +688,41 @@ fn check_validated_head(
     head: &str,
 ) -> Result<Vec<Diag>>
 {
-    let Some(validated) = validated_head(pat, body)
+    let candidates = validated_head_candidates(pat, body);
+    if candidates.is_empty()
+    {
+        // `check_body` reports the missing head.
+        return Ok(Vec::new());
+    }
+    let is_commit = |word: &str| git_ok(root, &["cat-file", "-e", &format!("{word}^{{commit}}")]);
+    let Some(validated) = candidates.iter().find(|word| is_commit(word))
     else
     {
-        return Ok(Vec::new());
+        return Ok(vec![Diag::error(
+            "pr-validated-head",
+            "body",
+            "no hash in the `## Validation` section names a commit in this clone",
+        )]);
     };
-    if head.starts_with(&validated)
+    if head.starts_with(validated.as_str())
     {
         return Ok(Vec::new());
     }
-    let at = format!("validated head {validated}");
-    let on_branch = git_ok(root, &["merge-base", "--is-ancestor", &validated, head])
-        && git(root, &["merge-base", base, head]).is_ok_and(|mb| {
-            git_ok(
-                root,
-                &["merge-base", "--is-ancestor", mb.trim(), &validated],
-            )
-        });
+    let on_branch = git_ok(root, &["merge-base", "--is-ancestor", validated, head])
+        && git(root, &["merge-base", base, head])
+            .is_ok_and(|mb| git_ok(root, &["merge-base", "--is-ancestor", mb.trim(), validated]));
     if !on_branch
     {
         return Ok(vec![Diag::error(
             "pr-validated-head",
-            at,
+            format!("validated head {validated}"),
             format!(
                 "it is neither the PR head {} nor a commit between the merge base and it",
                 short(head)
             ),
         )]);
     }
-
-    let mut out = Vec::new();
-    let stated = section(body, "## Validation")
-        .is_some_and(|lines| lines.iter().any(|l| pat.delta_statement.is_match(l)));
-    if !stated
-    {
-        out.push(Diag::error(
-            "pr-validated-head",
-            &at,
-            "it is not the PR head, and the body does not say the delta since it is \
-             documentation or comments only",
-        ));
-    }
-    let diff = git(
-        root,
-        &[
-            "diff",
-            "-U0",
-            "--no-color",
-            &validated,
-            head,
-            "--",
-            ".",
-            ":(exclude)*.md",
-        ],
-    )?;
-    for change in non_comment_changes(&diff)
-    {
-        out.push(Diag::error(
-            "pr-validated-head",
-            &at,
-            format!("the delta to the PR head changes a non-comment line: {change}"),
-        ));
-    }
-    let names = git(root, &["diff", "--name-only", &validated, head])?;
-    let embeds = git(
-        root,
-        &[
-            "grep",
-            "-h",
-            "-E",
-            "include_str!|include_bytes!|global_asm!",
-            head,
-            "--",
-            "*.rs",
-        ],
-    )
-    .unwrap_or_default();
-    for path in embedded_paths(pat, &names, &embeds)
-    {
-        out.push(Diag::error(
-            "pr-validated-head",
-            &at,
-            format!("the delta to the PR head changes {path}, which a build embeds"),
-        ));
-    }
-    Ok(out)
+    check_delta(pat, root, body, validated, head)
 }
 
 // ── Issues and milestones ─────────────────────────────────────────────────────
@@ -609,7 +758,7 @@ pub fn current_milestone(open_titles: &[String]) -> Option<String>
 
 /// Check an Issue the PR closes: not a rolling follow-up Issue, every
 /// acceptance box ticked, and the current milestone.
-pub fn check_closed_issue(pat: &Patterns, issue: &Issue, current: Option<&str>) -> Vec<Diag>
+pub fn check_closed_issue(issue: &Issue, current: Option<&str>) -> Vec<Diag>
 {
     let at = format!("#{}", issue.number);
     let mut out = Vec::new();
@@ -622,7 +771,10 @@ pub fn check_closed_issue(pat: &Patterns, issue: &Issue, current: Option<&str>) 
         ));
     }
     let open = section(&issue.body, "## Acceptance").map_or(0, |lines| {
-        lines.iter().filter(|l| pat.unticked.is_match(l)).count()
+        lines
+            .iter()
+            .filter(|l| task_item(l) == Some(TaskItem::Open))
+            .count()
     });
     if open > 0
     {
@@ -630,38 +782,35 @@ pub fn check_closed_issue(pat: &Patterns, issue: &Issue, current: Option<&str>) 
             "issue-acceptance",
             &at,
             format!(
-                "the PR closes it and {open} acceptance box(es) are unticked on the Issue; \
-                 tick each with its evidence, or drop it with a rationale"
+                "the PR closes it and {open} acceptance box(es) are unticked on the Issue; tick \
+                 each with its evidence, or drop it with a rationale"
             ),
         ));
     }
-    match (issue.milestone.as_deref(), current)
+    if let Some(want) = current
+        && issue.milestone.as_deref() != Some(want)
     {
-        (Some(have), Some(want)) if have == want =>
-        {}
-        (have, Some(want)) => out.push(Diag::error(
+        out.push(Diag::error(
             "issue-milestone",
             &at,
             format!(
                 "the PR closes it under milestone {}; the current milestone is {want}",
-                have.unwrap_or("none")
+                issue.milestone.as_deref().unwrap_or("none")
             ),
-        )),
-        (_, None) =>
-        {}
+        ));
     }
     out
 }
 
-/// Check an Issue the PR references with `Refs`: every item carrying this
-/// PR's `(fixed by PR #N)` marker is ticked.
+/// Check an Issue the PR closes or references: every item carrying this PR's
+/// `(fixed by PR #N)` marker is ticked.
 pub fn check_referenced_issue(issue: &Issue, pr: u64) -> Vec<Diag>
 {
     let marker = format!("(fixed by PR #{pr})");
     issue
         .body
         .lines()
-        .filter(|line| line.contains(&marker) && line.trim_start().starts_with("- [ ]"))
+        .filter(|line| line.contains(&marker) && task_item(line) == Some(TaskItem::Open))
         .map(|line| {
             Diag::error(
                 "issue-marker-unticked",
@@ -683,6 +832,71 @@ fn issue_from(value: &Value) -> Issue
         body: value["body"].as_str().unwrap_or("").to_owned(),
         milestone: value["milestone"]["title"].as_str().map(str::to_owned),
     }
+}
+
+fn sorted_issues(refs: impl Iterator<Item = IssueRef>) -> Vec<u64>
+{
+    let mut issues: Vec<u64> = refs.map(|r| r.issue).collect();
+    issues.sort_unstable();
+    issues.dedup();
+    issues
+}
+
+/// Check the Issues the PR closes, by its body or by a commit message, and
+/// the ones its body references with `Refs`.
+fn check_issues(
+    pat: &Patterns,
+    root: &Path,
+    pr: u64,
+    body: &str,
+    commits: &[Commit],
+) -> Result<Vec<Diag>>
+{
+    let commit_refs = commits
+        .iter()
+        .flat_map(|commit| closing_refs(pat, &format!("{}\n\n{}", commit.subject, commit.body)));
+    let closed = sorted_issues(closing_refs(pat, body).into_iter().chain(commit_refs));
+    let referenced = sorted_issues(refs_refs(pat, body).into_iter());
+    println!(
+        "    closes: {}; references: {}",
+        list(&closed),
+        list(&referenced)
+    );
+
+    let mut out = Vec::new();
+    let current = if closed.is_empty()
+    {
+        None
+    }
+    else
+    {
+        current_milestone(&gh::open_milestones(root)?)
+    };
+    for number in &closed
+    {
+        let issue = issue_from(&gh::issue(root, *number)?);
+        out.extend(check_closed_issue(&issue, current.as_deref()));
+        out.extend(check_referenced_issue(&issue, pr));
+    }
+    for number in referenced.iter().filter(|n| !closed.contains(n))
+    {
+        let issue = issue_from(&gh::issue(root, *number)?);
+        out.extend(check_referenced_issue(&issue, pr));
+    }
+    Ok(out)
+}
+
+fn list(issues: &[u64]) -> String
+{
+    if issues.is_empty()
+    {
+        return "none".to_owned();
+    }
+    issues
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ── Gate ──────────────────────────────────────────────────────────────────────
@@ -767,13 +981,12 @@ pub fn run_pr_check(ctx: &BuildContext, args: &PrCheckArgs) -> Result<()>
 {
     step(&format!("Checking pull request #{}", args.pr));
     let pat = Patterns::new()?;
-    let number = args.pr.to_string();
     let pr = gh::json(
         &ctx.root,
         &[
             "pr",
             "view",
-            &number,
+            &args.pr.to_string(),
             "--json",
             "body,headRefOid,baseRefName,mergeStateStatus,statusCheckRollup,milestone",
         ],
@@ -803,64 +1016,12 @@ pub fn run_pr_check(ctx: &BuildContext, args: &PrCheckArgs) -> Result<()>
             "a pull request carries no milestone; milestones are set on Issues",
         ));
     }
-
-    // The Issues the PR closes, by its body or by a commit message, and the
-    // ones it references.
-    let mut closed: Vec<u64> = closing_refs(&pat, body).iter().map(|r| r.issue).collect();
-    for commit in &commits
-    {
-        let message = format!("{}\n\n{}", commit.subject, commit.body);
-        closed.extend(closing_refs(&pat, &message).iter().map(|r| r.issue));
-    }
-    closed.sort_unstable();
-    closed.dedup();
-    let mut referenced: Vec<u64> = refs_refs(&pat, body).iter().map(|r| r.issue).collect();
-    referenced.sort_unstable();
-    referenced.dedup();
-
-    let current = if closed.is_empty()
-    {
-        None
-    }
-    else
-    {
-        current_milestone(&gh::open_milestones(&ctx.root)?)
-    };
-    for issue in &closed
-    {
-        let issue = issue_from(&gh::issue(&ctx.root, *issue)?);
-        diags.extend(check_closed_issue(&pat, &issue, current.as_deref()));
-        diags.extend(check_referenced_issue(&issue, args.pr));
-    }
-    for issue in referenced.iter().filter(|n| !closed.contains(n))
-    {
-        let issue = issue_from(&gh::issue(&ctx.root, *issue)?);
-        diags.extend(check_referenced_issue(&issue, args.pr));
-    }
-    println!(
-        "    closes: {}; references: {}",
-        list(&closed),
-        list(&referenced)
-    );
-
+    diags.extend(check_issues(&pat, &ctx.root, args.pr, body, &commits)?);
     if args.gate
     {
         diags.extend(gate(ctx, &pr, args.pr, &base, head));
     }
-    report("pr-check", &diags, args.strict || args.gate)
-}
-
-fn list(issues: &[u64]) -> String
-{
-    if issues.is_empty()
-    {
-        return "none".to_owned();
-    }
-    issues
-        .iter()
-        .map(|n| format!("#{n}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    report("pr-check", &diags, Strictness::from_flag(args.strict))
 }
 
 #[cfg(test)]
@@ -880,7 +1041,7 @@ mod tests
             subject: subject.into(),
             body: body.into(),
             merge: false,
-            signature: 'G',
+            signed: true,
         }
     }
 
@@ -925,6 +1086,19 @@ mod tests
     }
 
     #[test]
+    fn refs_names_issues_of_this_repository_only()
+    {
+        let p = pat();
+        let found =
+            |text: &str| -> Vec<u64> { refs_refs(&p, text).iter().map(|r| r.issue).collect() };
+        assert_eq!(found("Refs #5\nrefs: #6, REFS #7"), [5, 6, 7]);
+        // A reference into another repository names an Issue the checks
+        // cannot read, and `prefs` only ends in the word.
+        assert!(found("Refs owner/repo#8").is_empty());
+        assert!(found("prefs #9").is_empty());
+    }
+
+    #[test]
     fn a_subject_breaking_the_title_rules_is_reported_per_rule()
     {
         let p = pat();
@@ -960,29 +1134,64 @@ mod tests
     }
 
     #[test]
-    fn a_merge_commit_is_exempt_from_the_title_rules_but_not_from_keywords()
+    fn a_merge_commit_is_exempt_from_the_title_rules_only()
     {
-        let mut c = commit("Merge pull request #5 from owner/feature/x", "Fixes #5");
+        let long = "word ".repeat(20);
+        let mut c = commit(
+            "Merge pull request #5 from owner/feature/x",
+            &format!("{long}\n\nFixes #5"),
+        );
         c.merge = true;
-        assert_eq!(rules(&check_commit(&pat(), &c)), ["commit-closing-keyword"]);
+        assert_eq!(
+            rules(&check_commit(&pat(), &c)),
+            ["commit-body-columns", "commit-closing-keyword"]
+        );
     }
 
     #[test]
-    fn attribution_emoji_and_a_missing_signature_are_errors()
+    fn an_attribution_line_or_a_session_link_is_an_error()
     {
         let p = pat();
-        let mut c = commit(
+        let trailer = commit(
             "xtask: add a check",
             "Body.\n\nCo-Authored-By: Claude <noreply@example.com>",
         );
-        assert_eq!(rules(&check_commit(&p, &c)), ["commit-attribution"]);
-        c.body = "See https://claude.ai/code/session_1".into();
-        assert_eq!(rules(&check_commit(&p, &c)), ["commit-attribution"]);
-        c.body = "Done \u{1F389}".into();
-        assert_eq!(rules(&check_commit(&p, &c)), ["commit-emoji"]);
-        c.body = "An arrow \u{2192} and a section sign \u{a7} are not emojis.".into();
-        c.signature = 'N';
-        assert_eq!(rules(&check_commit(&p, &c)), ["commit-unsigned"]);
+        assert_eq!(rules(&check_commit(&p, &trailer)), ["commit-attribution"]);
+        let link = commit("xtask: add a check", "See https://claude.ai/code/session_1");
+        assert_eq!(rules(&check_commit(&p, &link)), ["commit-attribution"]);
+    }
+
+    #[test]
+    fn an_emoji_is_an_error_and_a_text_symbol_is_not()
+    {
+        let p = pat();
+        for emoji in ["\u{1F389}", "\u{2705}", "\u{26A1}", "\u{2764}\u{FE0F}"]
+        {
+            let c = commit("xtask: add a check", &format!("Done {emoji}"));
+            assert_eq!(rules(&check_commit(&p, &c)), ["commit-emoji"], "{emoji}");
+        }
+        // An arrow, a section sign, a check mark, and an element-of sign.
+        let text = commit("xtask: add a check", "\u{2192} \u{a7} \u{2713} \u{2208}");
+        assert!(check_commit(&p, &text).is_empty());
+    }
+
+    #[test]
+    fn a_commit_without_a_signature_is_an_error()
+    {
+        let mut c = commit("xtask: add a check", "");
+        c.signed = false;
+        assert_eq!(rules(&check_commit(&pat(), &c)), ["commit-unsigned"]);
+    }
+
+    #[test]
+    fn a_signature_is_a_gpgsig_header_of_the_commit_object()
+    {
+        let signed = "tree abc\nparent def\nauthor A\ncommitter C\ngpgsig -----BEGIN SSH \
+                      SIGNATURE-----\n xyz\n -----END SSH SIGNATURE-----\n\nxtask: subject\n";
+        assert!(has_signature(signed));
+        // The word in the message, after the headers, is not a signature.
+        let unsigned = "tree abc\nauthor A\ncommitter C\n\nxtask: subject\n\ngpgsig in a body\n";
+        assert!(!has_signature(unsigned));
     }
 
     #[test]
@@ -1001,18 +1210,16 @@ mod tests
     }
 
     #[test]
-    fn the_log_format_round_trips_subject_body_merge_and_signature()
+    fn the_log_format_round_trips_subject_body_and_merge()
     {
-        let log = "aaa\x1fp1\x1fG\x1fxtask: one\x1fBody line.\n\nRefs #1\n\x1e\n\
-                   bbb\x1fp1 p2\x1fN\x1fMerge branch 'master'\x1f\x1e\n";
+        let log = "aaa\x1fp1\x1fxtask: one\x1fBody line.\n\nRefs #1\n\x1e\n\
+                   bbb\x1fp1 p2\x1fMerge branch 'master'\x1f\x1e\n";
         let commits = parse_log(log);
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].subject, "xtask: one");
         assert_eq!(commits[0].body, "Body line.\n\nRefs #1");
         assert!(!commits[0].merge);
-        assert_eq!(commits[0].signature, 'G');
         assert!(commits[1].merge);
-        assert_eq!(commits[1].signature, 'N');
         assert!(parse_log("").is_empty());
     }
 
@@ -1021,21 +1228,42 @@ mod tests
                         comment-only.\n\n## Notes\nNone.\n";
 
     #[test]
-    fn the_validated_head_is_the_first_hash_of_the_validation_section()
+    fn the_validation_section_offers_every_hash_like_word_in_order()
     {
         let p = pat();
-        assert_eq!(validated_head(&p, BODY).as_deref(), Some("0a82b0aa"));
-        assert_eq!(validated_head(&p, "## Validation\npending\n"), None);
-        assert_eq!(validated_head(&p, "## Summary\nabcdef12\n"), None);
+        // The run id is all digits and of hash length, so it is offered too;
+        // the caller keeps the first word that names a commit.
+        assert_eq!(
+            validated_head_candidates(&p, BODY),
+            ["41635544986", "0a82b0aa"]
+        );
+        assert_eq!(
+            validated_head_candidates(&p, "## Validation\nhead 12345678\n"),
+            ["12345678"]
+        );
+        assert!(validated_head_candidates(&p, "## Validation\npending\n").is_empty());
+        assert!(validated_head_candidates(&p, "## Summary\nabcdef12\n").is_empty());
     }
 
     #[test]
-    fn a_complete_body_has_no_finding_and_each_gap_is_reported()
+    fn a_complete_body_has_no_finding()
+    {
+        assert!(check_body(&pat(), BODY).is_empty());
+    }
+
+    #[test]
+    fn an_unticked_box_in_the_body_is_an_error()
+    {
+        let unticked = BODY.replace("- [x] done", "* [ ] done");
+        let found = check_body(&pat(), &unticked);
+        assert_eq!(rules(&found), ["pr-unticked-box"]);
+        assert_eq!(found[0].at, "body:8");
+    }
+
+    #[test]
+    fn a_body_without_a_validated_head_is_an_error()
     {
         let p = pat();
-        assert!(check_body(&p, BODY).is_empty());
-        let unticked = BODY.replace("- [x] done", "- [ ] done");
-        assert_eq!(rules(&check_body(&p, &unticked)), ["pr-unticked-box"]);
         assert_eq!(
             rules(&check_body(&p, "## Summary\nText.\n")),
             ["pr-validation"]
@@ -1044,8 +1272,13 @@ mod tests
             rules(&check_body(&p, "## Validation\npending\n")),
             ["pr-validation"]
         );
+    }
+
+    #[test]
+    fn a_session_link_in_the_body_is_an_error()
+    {
         let linked = format!("{BODY}\nhttps://claude.ai/code/session_2\n");
-        assert_eq!(rules(&check_body(&p, &linked)), ["pr-attribution"]);
+        assert_eq!(rules(&check_body(&pat(), &linked)), ["pr-attribution"]);
     }
 
     #[test]
@@ -1062,14 +1295,43 @@ mod tests
         let comments = "diff --git a/k/a.rs b/k/a.rs\n--- a/k/a.rs\n+++ b/k/a.rs\n@@ -1 +1 @@\n\
                         -// old\n+// new\n+\n+    /// doc\n";
         assert!(non_comment_changes(comments).is_empty());
-        let code = "--- a/k/a.rs\n+++ b/k/a.rs\n@@ -1 +1 @@\n+let x = 1; // note\n";
+        let code = "diff --git a/k/a.rs b/k/a.rs\n--- a/k/a.rs\n+++ b/k/a.rs\n@@ -1 +1 @@\n\
+                    +let x = 1; // note\n";
         assert_eq!(non_comment_changes(code), ["k/a.rs: let x = 1; // note"]);
-        let config = "--- a/a.yml\n+++ b/a.yml\n@@ -1 +1 @@\n+# note\n-key: value\n";
+        let config = "diff --git a/a.yml b/a.yml\n--- a/a.yml\n+++ b/a.yml\n@@ -1 +1 @@\n\
+                      +# note\n-key: value\n";
         assert_eq!(non_comment_changes(config), ["a.yml: key: value"]);
-        // A file type whose comment syntax is unknown counts as changed, and
-        // a deleted file's lines are attributed to it.
-        let asm = "--- a/k/a.S\n+++ /dev/null\n@@ -1 +0,0 @@\n-# note\n";
-        assert_eq!(non_comment_changes(asm), ["/dev/null: # note"]);
+    }
+
+    #[test]
+    fn a_file_type_with_unknown_comment_syntax_counts_as_changed()
+    {
+        // A deleted file's lines are attributed to the file, not /dev/null.
+        let asm = "diff --git a/k/a.S b/k/a.S\ndeleted file mode 100644\n--- a/k/a.S\n\
+                   +++ /dev/null\n@@ -1 +0,0 @@\n-# note\n";
+        assert_eq!(non_comment_changes(asm), ["k/a.S: # note"]);
+    }
+
+    #[test]
+    fn a_changed_line_that_looks_like_a_file_header_is_still_a_change()
+    {
+        // The removed line is `-- x` and the added one `++ y`: in the diff
+        // they read `--- x` and `+++ y`, inside a hunk.
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n--- x\n+++ y\n";
+        assert_eq!(non_comment_changes(diff), ["a.rs: -- x", "a.rs: ++ y"]);
+    }
+
+    #[test]
+    fn a_binary_or_mode_change_is_not_comment_only()
+    {
+        let binary = "diff --git a/img/logo.png b/img/logo.png\nindex 1..2 100644\n\
+                      Binary files a/img/logo.png and b/img/logo.png differ\n";
+        assert_eq!(non_comment_changes(binary), ["img/logo.png: binary change"]);
+        let mode = "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n";
+        assert_eq!(
+            non_comment_changes(mode),
+            ["run.sh: old mode 100644", "run.sh: new mode 100755"]
+        );
     }
 
     #[test]
@@ -1104,40 +1366,40 @@ mod tests
         }
     }
 
+    const DONE: &str = "## Acceptance\n- [x] a\n\n## Files\n- [ ] not a criterion\n";
+
     #[test]
-    fn a_closed_issue_needs_its_boxes_ticked_and_the_current_milestone()
+    fn a_closed_issue_needs_every_acceptance_box_ticked()
     {
-        let p = pat();
-        let done = "## Acceptance\n- [x] a\n\n## Files\n- [ ] not a criterion\n";
-        assert!(
-            check_closed_issue(&p, &issue("xtask: a", done, Some("v0.1.3")), Some("v0.1.3"))
-                .is_empty()
-        );
+        let current = Some("v0.1.3");
+        assert!(check_closed_issue(&issue("xtask: a", DONE, current), current).is_empty());
         let open = "## Acceptance\n- [x] a\n- [ ] b\n";
         assert_eq!(
             rules(&check_closed_issue(
-                &p,
-                &issue("xtask: a", open, Some("v0.1.3")),
-                Some("v0.1.3")
+                &issue("xtask: a", open, current),
+                current
             )),
             ["issue-acceptance"]
         );
+    }
+
+    #[test]
+    fn a_closed_issue_needs_the_current_milestone()
+    {
+        let current = Some("v0.1.3");
         assert_eq!(
-            rules(&check_closed_issue(
-                &p,
-                &issue("xtask: a", done, None),
-                Some("v0.1.3")
-            )),
+            rules(&check_closed_issue(&issue("xtask: a", DONE, None), current)),
             ["issue-milestone"]
         );
         assert_eq!(
             rules(&check_closed_issue(
-                &p,
-                &issue("xtask: a", done, Some("v0.1.4")),
-                Some("v0.1.3")
+                &issue("xtask: a", DONE, Some("v0.1.4")),
+                current
             )),
             ["issue-milestone"]
         );
+        // With no versioned milestone open there is nothing to compare with.
+        assert!(check_closed_issue(&issue("xtask: a", DONE, None), None).is_empty());
     }
 
     #[test]
@@ -1149,7 +1411,7 @@ mod tests
             Some("v0.1.3"),
         );
         assert_eq!(
-            rules(&check_closed_issue(&pat(), &rolling, Some("v0.1.3"))),
+            rules(&check_closed_issue(&rolling, Some("v0.1.3"))),
             ["pr-closes-rolling"]
         );
     }
@@ -1170,6 +1432,7 @@ mod tests
         let green: Value = serde_json::from_str(
             r#"{"mergeStateStatus":"CLEAN","statusCheckRollup":[
                 {"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"name":"optional","status":"COMPLETED","conclusion":"SKIPPED"},
                 {"context":"legacy","state":"SUCCESS"}]}"#,
         )
         .unwrap();

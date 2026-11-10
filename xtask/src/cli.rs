@@ -795,8 +795,7 @@ pub struct PrCheckArgs
     pub pr: u64,
 
     /// Also check the merge gate: every check green, a clean merge state, the
-    /// base branch included, and a passing review record for the head.
-    /// Implies `--strict`.
+    /// base branch included, and a passing last review record for the head.
     #[arg(long)]
     pub gate: bool,
 

@@ -12,7 +12,8 @@
 //!
 //! 1. Add a variant to `cli::CliCommand` and a corresponding `Args` struct in
 //!    `cli.rs`.
-//! 2. Create `commands/<name>.rs` with a `pub fn run(ctx, args) -> Result<()>`.
+//! 2. Create `commands/<name>.rs` with a `pub fn run(ctx, args) -> Result<()>`,
+//!    or add a `pub fn run_<name>` to the module that holds its sibling commands.
 //! 3. Add a match arm in `main` below.
 //! 4. Re-export the module in `commands/mod.rs`.
 
@@ -39,6 +40,7 @@ mod qmp;
 mod rust_src;
 mod symbolize;
 mod sysroot;
+mod tasklist;
 mod term;
 mod timing;
 mod util;

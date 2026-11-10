@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli::{IssueEditArgs, IssueFileArgs};
 use crate::context::Context as BuildContext;
 use crate::gh;
+use crate::tasklist::task_item;
 use crate::util::step;
 
 /// The class labels (docs/conventions.md § Labels). Every Issue carries at
@@ -30,12 +31,56 @@ const CLASS_LABELS: &[&str] = &[
     "bug", "design", "cleanup", "feature", "perf", "security", "infra",
 ];
 
+/// Whether an edit may leave the Issue with fewer task-list items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemRemoval
+{
+    /// A body with fewer items is refused: it is what a stale copy produces.
+    Refuse,
+    /// The edit drops items on purpose.
+    Allow,
+}
+
+/// The milestone decision of a filing (docs/conventions.md § Milestones).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MilestoneChoice
+{
+    /// File under the milestone with this title.
+    Milestone(String),
+    /// Future-state work no release has scheduled: no milestone.
+    Unscheduled,
+    /// No decision was given.
+    Missing,
+    /// Both a milestone and "unscheduled" were given.
+    Conflicting,
+}
+
+impl MilestoneChoice
+{
+    fn from_args(milestone: Option<&str>, unscheduled: bool) -> Self
+    {
+        match (milestone, unscheduled)
+        {
+            (Some(_), true) => MilestoneChoice::Conflicting,
+            (Some(title), false) => MilestoneChoice::Milestone(title.to_owned()),
+            (None, true) => MilestoneChoice::Unscheduled,
+            (None, false) => MilestoneChoice::Missing,
+        }
+    }
+
+    fn title(&self) -> Option<&str>
+    {
+        match self
+        {
+            MilestoneChoice::Milestone(title) => Some(title),
+            _ => None,
+        }
+    }
+}
+
 fn task_items(body: &str) -> usize
 {
-    body.lines()
-        .map(str::trim_start)
-        .filter(|l| l.starts_with("- [ ]") || l.starts_with("- [x]") || l.starts_with("- [X]"))
-        .count()
+    body.lines().filter(|l| task_item(l).is_some()).count()
 }
 
 /// GitHub stores a body with either line ending; compare without them.
@@ -46,16 +91,15 @@ fn normalized(body: &str) -> String
 
 /// Decide whether `new` may replace `old` as an Issue body. A body that is
 /// empty, or that has fewer task-list items than the one it replaces, is what
-/// a mis-directed fetch or a stale copy produces; `allow_removal` admits the
-/// second case for an edit that drops items on purpose.
-pub fn guard_body(old: &str, new: &str, allow_removal: bool) -> Result<(), String>
+/// a mis-directed fetch or a stale copy produces.
+pub fn guard_body(old: &str, new: &str, removal: ItemRemoval) -> Result<(), String>
 {
     if new.trim().is_empty()
     {
         return Err("the new body is empty".to_owned());
     }
     let (before, after) = (task_items(old), task_items(new));
-    if after < before && !allow_removal
+    if after < before && removal == ItemRemoval::Refuse
     {
         return Err(format!(
             "the new body has {after} task-list item(s) and the Issue has {before}; re-fetch \
@@ -88,7 +132,15 @@ pub fn run_edit(ctx: &BuildContext, args: &IssueEditArgs) -> Result<()>
     let new = fs::read_to_string(&args.body_file)
         .with_context(|| format!("cannot read {}", args.body_file.display()))?;
     let old = issue_body(&ctx.root, args.issue)?;
-    if let Err(reason) = guard_body(&old, &new, args.allow_removal)
+    let removal = if args.allow_removal
+    {
+        ItemRemoval::Allow
+    }
+    else
+    {
+        ItemRemoval::Refuse
+    };
+    if let Err(reason) = guard_body(&old, &new, removal)
     {
         bail!("refusing to edit Issue #{}: {reason}", args.issue);
     }
@@ -137,8 +189,7 @@ pub fn check_filing(
     title: &str,
     body: &str,
     labels: &[String],
-    milestone: Option<&str>,
-    unscheduled: bool,
+    milestone: &MilestoneChoice,
 ) -> Vec<String>
 {
     let mut out = Vec::new();
@@ -165,21 +216,24 @@ pub fn check_filing(
     {
         out.push("no subsystem label".to_owned());
     }
-    match (milestone, unscheduled)
+    match milestone
     {
-        (None, false) => out.push(
+        MilestoneChoice::Missing => out.push(
             "no milestone; give --milestone, or --unscheduled for future-state work no release \
              has scheduled"
                 .to_owned(),
         ),
-        (Some(_), true) => out.push("--milestone and --unscheduled exclude each other".to_owned()),
-        _ =>
+        MilestoneChoice::Conflicting =>
+        {
+            out.push("--milestone and --unscheduled exclude each other".to_owned());
+        }
+        MilestoneChoice::Milestone(_) | MilestoneChoice::Unscheduled =>
         {}
     }
     out
 }
 
-/// The labels and the milestone `wanted` names that the filed Issue lacks.
+/// The labels and the milestone asked for that the filed Issue lacks.
 pub fn missing_metadata(
     held_labels: &[String],
     held_milestone: Option<&str>,
@@ -206,8 +260,8 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
     step(&format!("Filing an Issue: {}", args.title));
     let body = fs::read_to_string(&args.body_file)
         .with_context(|| format!("cannot read {}", args.body_file.display()))?;
-    let milestone = args.milestone.as_deref();
-    let problems = check_filing(&args.title, &body, &args.label, milestone, args.unscheduled);
+    let choice = MilestoneChoice::from_args(args.milestone.as_deref(), args.unscheduled);
+    let problems = check_filing(&args.title, &body, &args.label, &choice);
     if !problems.is_empty()
     {
         bail!("refusing to file the Issue: {}", problems.join("; "));
@@ -226,9 +280,9 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
     {
         command.extend(["--label", label.as_str()]);
     }
-    if let Some(milestone) = milestone
+    if let Some(title) = choice.title()
     {
-        command.extend(["--milestone", milestone]);
+        command.extend(["--milestone", title]);
     }
     let url = gh::run(&ctx.root, &command)?;
     let number: u64 = url
@@ -252,7 +306,7 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
         &held_labels,
         issue["milestone"]["title"].as_str(),
         &args.label,
-        milestone,
+        choice.title(),
     );
     if !missing.is_empty()
     {
@@ -275,18 +329,18 @@ mod tests
     #[test]
     fn an_empty_body_is_refused()
     {
-        assert!(guard_body(OLD, "", false).is_err());
-        assert!(guard_body(OLD, " \n\n", true).is_err());
+        assert!(guard_body(OLD, "", ItemRemoval::Refuse).is_err());
+        assert!(guard_body(OLD, " \n\n", ItemRemoval::Allow).is_err());
     }
 
     #[test]
     fn a_body_that_lost_items_is_refused_unless_removal_is_stated()
     {
         let fewer = "## Acceptance\n- [x] a\n";
-        assert!(guard_body(OLD, fewer, false).is_err());
-        assert!(guard_body(OLD, fewer, true).is_ok());
-        let ticked = "## Acceptance\n- [x] a\n- [x] b (fixed by PR #7)\n- [ ] c\n";
-        assert!(guard_body(OLD, ticked, false).is_ok());
+        assert!(guard_body(OLD, fewer, ItemRemoval::Refuse).is_err());
+        assert!(guard_body(OLD, fewer, ItemRemoval::Allow).is_ok());
+        let ticked = "## Acceptance\n- [x] a\n* [X] b (fixed by PR #7)\n- [ ] c\n";
+        assert!(guard_body(OLD, ticked, ItemRemoval::Refuse).is_ok());
     }
 
     #[test]
@@ -301,24 +355,50 @@ mod tests
         names.iter().map(|n| (*n).to_owned()).collect()
     }
 
+    fn milestone(title: &str) -> MilestoneChoice
+    {
+        MilestoneChoice::Milestone(title.to_owned())
+    }
+
     #[test]
-    fn a_filing_needs_a_class_label_a_subsystem_label_and_a_milestone_decision()
+    fn a_filing_needs_a_class_label_and_a_subsystem_label()
     {
         let ok = labels(&["xtask", "infra"]);
-        assert!(check_filing("t", "b", &ok, Some("v0.1.4"), false).is_empty());
-        assert!(check_filing("t", "b", &ok, None, true).is_empty());
-        assert_eq!(check_filing("t", "b", &ok, None, false).len(), 1);
-        assert_eq!(check_filing("t", "b", &ok, Some("v0.1.4"), true).len(), 1);
+        assert!(check_filing("t", "b", &ok, &milestone("v0.1.4")).is_empty());
+        let no_class = labels(&["xtask"]);
         assert_eq!(
-            check_filing("t", "b", &labels(&["xtask"]), None, true).len(),
+            check_filing("t", "b", &no_class, &milestone("v0.1.4")).len(),
             1
         );
+        let no_subsystem = labels(&["infra", "bug"]);
         assert_eq!(
-            check_filing("t", "b", &labels(&["infra", "bug"]), None, true).len(),
+            check_filing("t", "b", &no_subsystem, &milestone("v0.1.4")).len(),
             1
         );
-        // Empty title, empty body, no label of either kind, no milestone.
-        assert_eq!(check_filing(" ", "", &[], None, false).len(), 5);
+    }
+
+    #[test]
+    fn a_filing_needs_one_milestone_decision()
+    {
+        let ok = labels(&["xtask", "infra"]);
+        let choice = MilestoneChoice::from_args;
+        assert!(check_filing("t", "b", &ok, &choice(Some("v0.1.4"), false)).is_empty());
+        assert!(check_filing("t", "b", &ok, &choice(None, true)).is_empty());
+        assert_eq!(check_filing("t", "b", &ok, &choice(None, false)).len(), 1);
+        assert_eq!(
+            check_filing("t", "b", &ok, &choice(Some("v0.1.4"), true)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_filing_with_an_empty_title_or_body_is_refused()
+    {
+        let ok = labels(&["xtask", "infra"]);
+        assert_eq!(
+            check_filing(" ", "", &ok, &MilestoneChoice::Unscheduled).len(),
+            2
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::fmt;
 use anyhow::{Result, bail};
 
 /// Rule severity. A warning is printed and counted; it fails the command only
-/// under `--strict`.
+/// under `Strictness::Strict`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level
 {
@@ -31,6 +31,32 @@ impl fmt::Display for Level
             Level::Error => "error",
             Level::Warning => "warning",
         })
+    }
+}
+
+/// Whether warnings fail a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strictness
+{
+    /// Only errors fail the run.
+    ErrorsOnly,
+    /// Warnings fail the run too.
+    Strict,
+}
+
+impl Strictness
+{
+    /// The strictness a command's `--strict` flag selects.
+    pub fn from_flag(strict: bool) -> Self
+    {
+        if strict
+        {
+            Strictness::Strict
+        }
+        else
+        {
+            Strictness::ErrorsOnly
+        }
     }
 }
 
@@ -80,17 +106,19 @@ impl fmt::Display for Diag
     }
 }
 
-/// Whether `diags` fails a run: any error, or any warning under `strict`.
-pub fn fails(diags: &[Diag], strict: bool) -> bool
+/// Whether `diags` fails a run under `strictness`.
+pub fn fails(diags: &[Diag], strictness: Strictness) -> bool
 {
-    diags
-        .iter()
-        .any(|d| d.level == Level::Error || (strict && d.level == Level::Warning))
+    diags.iter().any(|d| match d.level
+    {
+        Level::Error => true,
+        Level::Warning => strictness == Strictness::Strict,
+    })
 }
 
 /// Print every diagnostic and a summary line, and return an error when the
 /// run fails.
-pub fn report(name: &str, diags: &[Diag], strict: bool) -> Result<()>
+pub fn report(name: &str, diags: &[Diag], strictness: Strictness) -> Result<()>
 {
     for diag in diags
     {
@@ -99,7 +127,7 @@ pub fn report(name: &str, diags: &[Diag], strict: bool) -> Result<()>
     let errors = diags.iter().filter(|d| d.level == Level::Error).count();
     let warnings = diags.len() - errors;
     println!("==> {name}: {errors} error(s), {warnings} warning(s)");
-    if fails(diags, strict)
+    if fails(diags, strictness)
     {
         bail!("{name} failed");
     }
@@ -112,12 +140,12 @@ mod tests
     use super::*;
 
     #[test]
-    fn a_warning_fails_a_run_only_under_strict()
+    fn a_warning_fails_a_run_only_when_strict()
     {
-        let diags = [Diag::warning("r", "x", "m")];
-        assert!(!fails(&diags, false));
-        assert!(fails(&diags, true));
-        assert!(fails(&[Diag::error("r", "x", "m")], false));
-        assert!(!fails(&[], true));
+        let warning = [Diag::warning("r", "x", "m")];
+        assert!(!fails(&warning, Strictness::ErrorsOnly));
+        assert!(fails(&warning, Strictness::Strict));
+        assert!(fails(&[Diag::error("r", "x", "m")], Strictness::ErrorsOnly));
+        assert!(!fails(&[], Strictness::Strict));
     }
 }

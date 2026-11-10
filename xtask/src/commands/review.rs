@@ -10,8 +10,8 @@
 //! (xtask/README.md § `cargo xtask review-check`), so the ledger and the
 //! merge gate read what they expect. `review-ledger` builds `ledger.json`,
 //! the findings a later run of the same PR must not re-raise
-//! (docs/conventions.md § Ledger). The merge gate of `pr-check --gate` reads
-//! the records through `gate_diags`.
+//! (docs/conventions.md § Branch and PR Workflow). The merge gate of
+//! `pr-check --gate` reads the records through `gate_diags`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 
 use crate::cli::{ReviewCheckArgs, ReviewLedgerArgs};
 use crate::context::Context as BuildContext;
-use crate::diag::{Diag, report};
+use crate::diag::{Diag, Strictness, report};
 use crate::util::step;
 
 const VERDICTS: &[&str] = &[
@@ -30,7 +30,11 @@ const VERDICTS: &[&str] = &[
     "BLOCKING ISSUES",
 ];
 const AUDIT_VERDICTS: &[&str] = &["AUDIT PASS", "AUDIT FAIL"];
+
+/// The record modes, in the order their runs follow each other at one head:
+/// a run with the reviewer, then any audit of it.
 const MODES: &[&str] = &["full", "delta", "audit"];
+
 const CLASSES: &[&str] = &[
     "correctness",
     "safety",
@@ -71,16 +75,29 @@ pub fn record_dir(ctx: &BuildContext, pr: u64) -> PathBuf
         .join(format!("pr{pr}"))
 }
 
-/// Whether `name` is a run record's file name: `<mode>-<head>[-<n>].json`.
-fn is_record_name(name: &str) -> bool
+/// The parts of a run record's file name, `<mode>-<head>[-<n>].json`: the
+/// mode, the head as the name states it, and the run number at that head
+/// (1 when the name has no suffix). `None` for any other file.
+fn name_parts(name: &str) -> Option<(&'static str, &str, u32)>
 {
-    Path::new(name)
+    let path = Path::new(name);
+    if !path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-        && MODES.iter().any(|mode| {
-            name.strip_prefix(mode)
-                .is_some_and(|rest| rest.starts_with('-'))
-        })
+    {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let mode = *MODES.iter().find(|mode| {
+        stem.strip_prefix(**mode)
+            .is_some_and(|rest| rest.starts_with('-'))
+    })?;
+    let rest = stem.strip_prefix(mode)?.strip_prefix('-')?;
+    match rest.split_once('-')
+    {
+        Some((head, run)) => Some((mode, head, run.parse().ok()?)),
+        None => Some((mode, rest, 1)),
+    }
 }
 
 /// Read every run record in `dir`, sorted by file name. A file that is not
@@ -94,7 +111,7 @@ pub fn read_records(dir: &Path) -> Result<Vec<Record>>
     {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_record_name(&name)
+        if name_parts(&name).is_none()
         {
             continue;
         }
@@ -106,13 +123,18 @@ pub fn read_records(dir: &Path) -> Result<Vec<Record>>
     Ok(out)
 }
 
+fn shape(name: &str, field: &str, message: impl Into<String>) -> Diag
+{
+    Diag::error("record-shape", format!("{name}: {field}"), message)
+}
+
 fn one_of(out: &mut Vec<Diag>, name: &str, field: &str, value: &Value, allowed: &[&str])
 {
     if !value.as_str().is_some_and(|v| allowed.contains(&v))
     {
-        out.push(Diag::error(
-            "record-shape",
-            format!("{name}: {field}"),
+        out.push(shape(
+            name,
+            field,
             format!("is {value}; expected one of: {}", allowed.join(", ")),
         ));
     }
@@ -123,44 +145,112 @@ fn check_finding(out: &mut Vec<Diag>, name: &str, at: &str, finding: &Value)
     let Some(fields) = finding.as_object()
     else
     {
-        out.push(Diag::error(
-            "record-shape",
-            format!("{name}: {at}"),
-            "is not an object",
-        ));
+        out.push(shape(name, at, "is not an object"));
         return;
     };
     for field in LEDGER_FIELDS
     {
         if !fields.contains_key(*field)
         {
-            out.push(Diag::error(
-                "record-shape",
-                format!("{name}: {at}"),
-                format!("has no `{field}`"),
-            ));
+            out.push(shape(name, at, format!("has no `{field}`")));
         }
     }
-    if let Some(class) = fields.get("class")
+    for (field, allowed) in [
+        ("class", CLASSES),
+        ("bucket", BUCKETS),
+        ("status", STATUSES),
+    ]
     {
-        one_of(out, name, &format!("{at}.class"), class, CLASSES);
-    }
-    if let Some(bucket) = fields.get("bucket")
-    {
-        one_of(out, name, &format!("{at}.bucket"), bucket, BUCKETS);
-    }
-    if let Some(status) = fields.get("status")
-    {
-        one_of(out, name, &format!("{at}.status"), status, STATUSES);
+        if let Some(value) = fields.get(field)
+        {
+            one_of(out, name, &format!("{at}.{field}"), value, allowed);
+        }
     }
     if fields
         .get("must_violation")
         .is_some_and(|v| !v.is_boolean())
     {
-        out.push(Diag::error(
-            "record-shape",
-            format!("{name}: {at}.must_violation"),
+        out.push(shape(
+            name,
+            &format!("{at}.must_violation"),
             "is not a boolean",
+        ));
+    }
+}
+
+/// The verdict lines and the audit result.
+fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
+{
+    one_of(out, name, "verdict", &record["verdict"], VERDICTS);
+    one_of(
+        out,
+        name,
+        "audit_verdict",
+        &record["audit_verdict"],
+        AUDIT_VERDICTS,
+    );
+    one_of(
+        out,
+        name,
+        "audit.verdict",
+        &record["audit"]["verdict"],
+        AUDIT_VERDICTS,
+    );
+    if !record["audit"]["sections"].is_array()
+    {
+        out.push(shape(name, "audit.sections", "is not a list"));
+    }
+}
+
+/// The four finding lists and each finding in them.
+fn check_lists(out: &mut Vec<Diag>, name: &str, record: &Value)
+{
+    for list in LISTS
+    {
+        match record[*list].as_array()
+        {
+            Some(findings) =>
+            {
+                for (index, finding) in findings.iter().enumerate()
+                {
+                    check_finding(out, name, &format!("{list}[{index}]"), finding);
+                }
+            }
+            None => out.push(shape(name, list, "is not a list")),
+        }
+    }
+}
+
+/// `stats`, and that the file name states the record's own mode and head.
+fn check_stats(out: &mut Vec<Diag>, name: &str, stats: &Value)
+{
+    one_of(out, name, "stats.mode", &stats["mode"], MODES);
+    if !stats["failed"].is_array()
+    {
+        out.push(shape(name, "stats.failed", "is not a list"));
+    }
+    let head = stats["head"].as_str().unwrap_or("");
+    if head.len() < 8 || !head.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        out.push(shape(
+            name,
+            "stats.head",
+            "is not a commit hash of 8 or more hexadecimal digits",
+        ));
+        return;
+    }
+    let Some(mode) = stats["mode"].as_str()
+    else
+    {
+        return;
+    };
+    let stated = name_parts(name);
+    if !stated.is_some_and(|(m, h, _)| m == mode && !h.is_empty() && head.starts_with(h))
+    {
+        out.push(Diag::error(
+            "record-name",
+            name,
+            format!("the name does not state the record's mode `{mode}` and head {head}"),
         ));
     }
 }
@@ -178,86 +268,9 @@ pub fn check_record(name: &str, record: &Value) -> Vec<Diag>
         ));
         return out;
     }
-    one_of(&mut out, name, "verdict", &record["verdict"], VERDICTS);
-    one_of(
-        &mut out,
-        name,
-        "audit_verdict",
-        &record["audit_verdict"],
-        AUDIT_VERDICTS,
-    );
-    one_of(
-        &mut out,
-        name,
-        "audit.verdict",
-        &record["audit"]["verdict"],
-        AUDIT_VERDICTS,
-    );
-    if !record["audit"]["sections"].is_array()
-    {
-        out.push(Diag::error(
-            "record-shape",
-            format!("{name}: audit.sections"),
-            "is not a list",
-        ));
-    }
-    for list in LISTS
-    {
-        match record[*list].as_array()
-        {
-            Some(findings) =>
-            {
-                for (index, finding) in findings.iter().enumerate()
-                {
-                    check_finding(&mut out, name, &format!("{list}[{index}]"), finding);
-                }
-            }
-            None => out.push(Diag::error(
-                "record-shape",
-                format!("{name}: {list}"),
-                "is not a list",
-            )),
-        }
-    }
-
-    let stats = &record["stats"];
-    one_of(&mut out, name, "stats.mode", &stats["mode"], MODES);
-    if !stats["failed"].is_array()
-    {
-        out.push(Diag::error(
-            "record-shape",
-            format!("{name}: stats.failed"),
-            "is not a list",
-        ));
-    }
-    let head = stats["head"].as_str().unwrap_or("");
-    if head.len() < 8 || !head.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        out.push(Diag::error(
-            "record-shape",
-            format!("{name}: stats.head"),
-            "is not a commit hash of 8 or more hexadecimal digits",
-        ));
-    }
-    else if let Some(mode) = stats["mode"].as_str()
-    {
-        // `<mode>-<head>[-<n>].json`: the name states the record's own mode
-        // and head.
-        let stated = name
-            .strip_prefix(mode)
-            .and_then(|rest| rest.strip_prefix('-'))
-            .and_then(|rest| rest.strip_suffix(".json"))
-            .and_then(|rest| rest.split('-').next())
-            .unwrap_or("");
-        if stated.is_empty() || !head.starts_with(stated)
-        {
-            out.push(Diag::error(
-                "record-name",
-                name,
-                format!("the name does not state the record's mode `{mode}` and head {head}"),
-            ));
-        }
-    }
+    check_verdicts(&mut out, name, record);
+    check_lists(&mut out, name, record);
+    check_stats(&mut out, name, &record["stats"]);
     out
 }
 
@@ -269,40 +282,53 @@ fn at_head(record: &Value, head: &str) -> bool
         .is_some_and(|h| !h.is_empty() && (head.starts_with(h) || h.starts_with(head)))
 }
 
-/// The merge-prompt condition's record part (docs/conventions.md § Pre-merge
-/// review): a well-formed record for `head` with no failed agent, `AUDIT
-/// PASS`, and a reviewer verdict that is not `BLOCKING ISSUES`.
+/// Where a record's run stands among the runs at one head: by its run
+/// number, then by its mode, an audit following the reviewer run it audits.
+/// File-name order is not run order (`-2.json` sorts before `.json`).
+fn run_order(name: &str) -> (u32, usize)
+{
+    name_parts(name).map_or((0, 0), |(mode, _, run)| {
+        let rank = MODES.iter().position(|m| *m == mode).unwrap_or(0);
+        (run, rank)
+    })
+}
+
+/// The merge-prompt condition's record part (docs/conventions.md § Branch
+/// and PR Workflow): the last run at `head` is a well-formed record with no
+/// failed agent, `AUDIT PASS`, and a reviewer verdict that is not `BLOCKING
+/// ISSUES`. An earlier passing run at the same head does not count.
 pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
 {
-    let at_this_head: Vec<&Record> = records.iter().filter(|(_, r)| at_head(r, head)).collect();
-    if at_this_head.is_empty()
-    {
-        return vec![Diag::error(
-            "gate-review-record",
-            head.get(..8).unwrap_or(head),
-            "no run record reviewed this head",
-        )];
-    }
-    let passes = |record: &Value| {
-        record["audit_verdict"] == "AUDIT PASS"
-            && record["stats"]["failed"]
-                .as_array()
-                .is_some_and(Vec::is_empty)
-            && matches!(
-                record["verdict"].as_str(),
-                Some("READY TO MERGE" | "NON-BLOCKING ISSUES ONLY")
-            )
-    };
-    let Some((name, record)) = at_this_head.iter().rev().find(|(_, r)| passes(r))
+    let at = head.get(..8).unwrap_or(head);
+    let Some((name, record)) = records
+        .iter()
+        .filter(|(_, r)| at_head(r, head))
+        .max_by_key(|(name, _)| run_order(name))
     else
     {
         return vec![Diag::error(
             "gate-review-record",
-            head.get(..8).unwrap_or(head),
-            "no run record for this head has AUDIT PASS, no failed agent, and a verdict of \
-             READY TO MERGE or NON-BLOCKING ISSUES ONLY",
+            at,
+            "no run record reviewed this head",
         )];
     };
+    let passes = record["audit_verdict"] == "AUDIT PASS"
+        && record["stats"]["failed"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        && matches!(
+            record["verdict"].as_str(),
+            Some("READY TO MERGE" | "NON-BLOCKING ISSUES ONLY")
+        );
+    if !passes
+    {
+        return vec![Diag::error(
+            "gate-review-record",
+            name.as_str(),
+            "the last run at this head does not have AUDIT PASS, no failed agent, and a \
+             verdict of READY TO MERGE or NON-BLOCKING ISSUES ONLY",
+        )];
+    }
     let mut out = check_record(name, record);
     let open = record["findings"].as_array().map_or(0, Vec::len);
     if record["verdict"] == "NON-BLOCKING ISSUES ONLY" && open > 0
@@ -368,7 +394,7 @@ pub fn run_check(ctx: &BuildContext, args: &ReviewCheckArgs) -> Result<()>
         .flat_map(|(name, record)| check_record(name, record))
         .collect();
     println!("    {} record(s)", records.len());
-    report("review-check", &diags, false)
+    report("review-check", &diags, Strictness::ErrorsOnly)
 }
 
 /// Entry point for `cargo xtask review-ledger`.
@@ -399,6 +425,7 @@ mod tests
     use super::*;
 
     const HEAD: &str = "0a82b0aa11112222333344445555666677778888";
+    const NAME: &str = "delta-0a82b0aa.json";
 
     fn finding(claim: &str, status: &str) -> Value
     {
@@ -421,55 +448,123 @@ mod tests
         })
     }
 
+    fn passing() -> Value
+    {
+        record("READY TO MERGE", "AUDIT PASS", vec![])
+    }
+
     fn rules(diags: &[Diag]) -> Vec<&'static str>
     {
         diags.iter().map(|d| d.rule).collect()
+    }
+
+    /// The fields the findings about `record` name, without the file name.
+    fn fields(record: &Value) -> Vec<String>
+    {
+        check_record(NAME, record)
+            .iter()
+            .map(|d| {
+                d.at.trim_start_matches(NAME)
+                    .trim_start_matches(": ")
+                    .to_owned()
+            })
+            .collect()
     }
 
     #[test]
     fn a_well_formed_record_has_no_finding()
     {
         let r = record("READY TO MERGE", "AUDIT PASS", vec![finding("a", "nit")]);
-        assert!(check_record("delta-0a82b0aa.json", &r).is_empty());
+        assert!(check_record(NAME, &r).is_empty());
         assert!(check_record("delta-0a82b0aa-2.json", &r).is_empty());
     }
 
     #[test]
-    fn each_departure_from_the_shape_is_reported()
+    fn a_file_that_is_not_a_json_object_is_reported()
     {
         assert_eq!(
             rules(&check_record("full-x.json", &Value::Null)),
             ["record-shape"]
         );
+    }
 
-        let mut r = record("READY", "AUDIT PASS", vec![]);
-        r["findings"] = json!([{"file": "a", "class": "documentation-drift", "bucket": "Should"}]);
-        r["stats"]["failed"] = Value::Null;
+    #[test]
+    fn a_verdict_outside_the_fixed_lines_is_reported()
+    {
+        let mut r = passing();
+        r["verdict"] = json!("READY");
+        r["audit_verdict"] = json!("PASS");
+        r["audit"]["verdict"] = Value::Null;
+        r["audit"]["sections"] = json!({});
+        assert_eq!(
+            fields(&r),
+            [
+                "verdict",
+                "audit_verdict",
+                "audit.verdict",
+                "audit.sections"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_finding_list_is_reported()
+    {
+        let mut r = passing();
         r.as_object_mut().unwrap().remove("ledgered");
-        let found = check_record("delta-0a82b0aa.json", &r);
-        let about: Vec<&str> = found.iter().map(|d| d.at.as_str()).collect();
-        for field in [
-            "delta-0a82b0aa.json: verdict",
-            "delta-0a82b0aa.json: findings[0].class",
-            "delta-0a82b0aa.json: findings[0].bucket",
-            "delta-0a82b0aa.json: ledgered",
-            "delta-0a82b0aa.json: stats.failed",
-        ]
-        {
-            assert!(about.contains(&field), "no finding about {field}");
-        }
-        // The six fields the entry lacks, one finding each.
+        r["dropped"] = json!("none");
+        assert_eq!(fields(&r), ["ledgered", "dropped"]);
+    }
+
+    #[test]
+    fn a_finding_with_a_missing_field_or_an_unknown_value_is_reported()
+    {
+        let mut r = passing();
+        r["findings"] = json!([
+            {"file": "a", "class": "documentation-drift", "bucket": "Should"},
+            "not an object",
+        ]);
+        r["recorded"] = json!([finding("b", "open")]);
+        r["recorded"][0]["must_violation"] = json!("no");
+        let found = check_record(NAME, &r);
+        // The six fields the first entry lacks, one finding each.
         let missing = found
             .iter()
             .filter(|d| d.message.starts_with("has no"))
             .count();
         assert_eq!(missing, 6);
+        let about: Vec<String> = fields(&r)
+            .into_iter()
+            .filter(|f| f != "findings[0]")
+            .collect();
+        assert_eq!(
+            about,
+            [
+                "findings[0].class",
+                "findings[0].bucket",
+                "findings[1]",
+                "recorded[0].status",
+                "recorded[0].must_violation",
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_stats_are_reported()
+    {
+        let mut r = passing();
+        r["stats"]["mode"] = json!("auditor-only");
+        r["stats"]["failed"] = Value::Null;
+        r["stats"]["head"] = json!("0a82");
+        assert_eq!(fields(&r), ["stats.mode", "stats.failed", "stats.head"]);
+        r["stats"]["head"] = json!("not-a-hash-at-all");
+        assert!(fields(&r).contains(&"stats.head".to_owned()));
     }
 
     #[test]
     fn a_record_whose_name_states_another_mode_or_head_is_reported()
     {
-        let r = record("READY TO MERGE", "AUDIT PASS", vec![]);
+        let r = passing();
         assert_eq!(
             rules(&check_record("delta-deadbeef.json", &r)),
             ["record-name"]
@@ -483,42 +578,72 @@ mod tests
     #[test]
     fn only_run_records_are_read_as_records()
     {
-        assert!(is_record_name("full-0a82b0aa.json"));
-        assert!(is_record_name("audit-0a82b0aa-2.json"));
-        assert!(!is_record_name("ledger.json"));
-        assert!(!is_record_name("open-issues.json"));
-        assert!(!is_record_name("delta-0a82b0aa.md"));
-        assert!(!is_record_name("fullness.json"));
+        assert_eq!(
+            name_parts("full-0a82b0aa.json"),
+            Some(("full", "0a82b0aa", 1))
+        );
+        assert_eq!(
+            name_parts("audit-0a82b0aa-2.json"),
+            Some(("audit", "0a82b0aa", 2))
+        );
+        for other in [
+            "ledger.json",
+            "open-issues.json",
+            "delta-0a82b0aa.md",
+            "fullness.json",
+            "audit-0a82b0aa-x.json",
+        ]
+        {
+            assert_eq!(name_parts(other), None, "{other}");
+        }
     }
 
     #[test]
-    fn the_gate_passes_on_a_clean_record_for_the_head()
+    fn the_gate_passes_when_the_last_run_at_the_head_passes()
     {
         let records = vec![
             (
-                "delta-0a82b0aa.json".to_owned(),
+                NAME.to_owned(),
                 record("BLOCKING ISSUES", "AUDIT FAIL", vec![]),
             ),
-            (
-                "delta-0a82b0aa-2.json".to_owned(),
-                record("READY TO MERGE", "AUDIT PASS", vec![]),
-            ),
+            ("delta-0a82b0aa-2.json".to_owned(), passing()),
         ];
         assert!(gate_diags(&records, HEAD).is_empty());
         assert!(gate_diags(&records, "0a82b0aa").is_empty());
     }
 
     #[test]
-    fn the_gate_fails_without_a_passing_record_for_the_head()
+    fn the_gate_fails_when_a_later_run_at_the_head_fails()
     {
-        let passing = record("READY TO MERGE", "AUDIT PASS", vec![]);
-        let other_head = vec![("delta-0a82b0aa.json".to_owned(), passing.clone())];
+        // A re-audit after a body edit: same head, later run. `audit-…-2`
+        // sorts before `audit-….json` by name and is still the last run.
+        let records = vec![
+            (NAME.to_owned(), passing()),
+            ("audit-0a82b0aa.json".to_owned(), passing()),
+            (
+                "audit-0a82b0aa-2.json".to_owned(),
+                record("READY TO MERGE", "AUDIT FAIL", vec![]),
+            ),
+        ];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["gate-review-record"]);
+        assert_eq!(found[0].at, "audit-0a82b0aa-2.json");
+    }
+
+    #[test]
+    fn the_gate_fails_without_a_record_for_the_head()
+    {
+        let other_head = vec![(NAME.to_owned(), passing())];
         assert_eq!(
             rules(&gate_diags(&other_head, "ffffffff00000000")),
             ["gate-review-record"]
         );
+    }
 
-        let mut failed_agent = passing.clone();
+    #[test]
+    fn the_gate_fails_on_a_blocking_verdict_a_failed_audit_or_a_failed_agent()
+    {
+        let mut failed_agent = passing();
         failed_agent["stats"]["failed"] = json!(["pr-reviewer"]);
         for bad in [
             record("BLOCKING ISSUES", "AUDIT PASS", vec![]),
@@ -526,7 +651,7 @@ mod tests
             failed_agent,
         ]
         {
-            let records = vec![("delta-0a82b0aa.json".to_owned(), bad)];
+            let records = vec![(NAME.to_owned(), bad)];
             assert_eq!(rules(&gate_diags(&records, HEAD)), ["gate-review-record"]);
         }
     }
@@ -535,7 +660,7 @@ mod tests
     fn the_gate_asks_for_the_recording_of_findings_a_non_blocking_run_leaves()
     {
         let records = vec![(
-            "delta-0a82b0aa.json".to_owned(),
+            NAME.to_owned(),
             record(
                 "NON-BLOCKING ISSUES ONLY",
                 "AUDIT PASS",
@@ -568,7 +693,7 @@ mod tests
         );
         let records = vec![
             ("full-0a82b0aa.json".to_owned(), blocking),
-            ("delta-0a82b0aa.json".to_owned(), non_blocking),
+            (NAME.to_owned(), non_blocking),
         ];
         let ledger = ledger(&records);
         let claims: Vec<&str> = ledger

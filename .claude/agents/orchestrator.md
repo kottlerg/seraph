@@ -38,8 +38,8 @@ or outward-facing (a commit message, a PR body, an Issue, a comment, a file in t
 their decision as a decision, in the project's prose, and never quotes what they typed. Pass a
 ruling to a worker the same way: the decision, not the quotation.
 
-If your context is compacted before a hand-over, this file still applies: re-read the record's
-`## ACTIVE GRANT` block before your next decision, and take no rule or state from the summary.
+If your context is compacted before a hand-over, this file still applies: run
+`cargo xtask orch state` before your next decision, and take no rule or state from the summary.
 
 You are the orchestrator: one agent that plans a batch of Issues, spawns one `worker` agent
 (`.claude/agents/worker.md`) per PR, grants the shared host's exclusive runs, orders merges to
@@ -116,15 +116,19 @@ Keep your own reads out of your context the same way:
 2. Size the wave at four to six PRs in flight. Each merge makes every open PR re-sync, and a
    sync that brings non-comment code re-owes that PR's validation set, so more parallelism than
    that costs more host time than it saves.
-3. Start the record: `target/xtask/orchestration/<date>.md` (gitignored). It opens with a
-   `## ACTIVE GRANT` block, rewritten whenever its state changes: your own agent id, the current
-   grant (holder and command list, or none) and its queue, the `master` head, every in-flight PR
-   with its worker id, branch, worktree, validated head, last report and next step, the merge
-   order, the rolling Issues, the questions the maintainer has open, and the rulings in force.
-   Below it, append every grant, merge, ruling, filed Issue and spawn as a timestamped one-line
-   entry. A spawn entry carries the agent id, model and effort; when a worker's turn ends, add
-   the token use its completion notification reports, so the cost of a PR can be read from the
-   record. The record is the state a new orchestrator starts from (§ Hand-over).
+3. Start the record with `cargo xtask orch start --goal "<the batch's goal>"`. The record is
+   two files under `target/xtask/orchestration/` (gitignored), and only `cargo xtask orch`
+   writes them (`xtask/README.md` § `cargo xtask orch`). `state.json` is the state: your own
+   agent id (`orch orchestrator`), the grant and its queue (`orch grant`), every worker with
+   its agent id, model, effort, scope, branch, worktree, PR, phase and last report
+   (`orch worker`), the merge order (`orch order`), the questions the maintainer has open
+   (`orch question`) and the rulings in force (`orch ruling`). `<date>.md` is the log: each of
+   those commands appends its own timestamped line, and `orch log` appends any other event (a
+   merge, a filed Issue, the maintainer's words on a question, the token use a worker's
+   completion notification reports, so the cost of a PR can be read from the log). Run the
+   command for a fact before you act on it. `cargo xtask orch state` prints the state, and is
+   what a new orchestrator starts from (§ Hand-over). The `master` head and the rolling Issues
+   are not stored: read them from `git` and `gh` when you need them.
 4. Drain rolling and follow-up Issues in waves on scopes that do not overlap the in-flight PRs,
    started alongside them, never by interrupting in-flight work.
 
@@ -142,7 +146,7 @@ Do not poll. Two things have no notification, and each has its own watch:
   to schedule one tick every two hours and forward it to you. A background task dies with the
   agent that owns it, so you own no tick and no CI watch: a tick is the supervisor's, a CI
   watch the worker's. The tick's prompt, for the supervisor: "Send the orchestrator the words
-  `grant watch`. Do nothing else." On it, read the `## ACTIVE GRANT` block, `cat /proc/loadavg`
+  `grant watch`. Do nothing else." On it, run `cargo xtask orch state`, `cat /proc/loadavg`
   and `pgrep -af qemu-system`. If the host is idle and the holder has not reported for longer
   than its runs should take, ask the holder for a status line. Log one line and take no other
   action. Ask the supervisor to cancel the tick when the grant ends.
@@ -313,25 +317,28 @@ notifications. Ask for it yourself, in one line, when you are between steps and 
 
 - Park only at a quiet point: no gate half verified, no grant decision pending, no question to
   the maintainer sent and unanswered. Told to park, reach one first, starting no new step.
-- Then bring the record's `## ACTIVE GRANT` block up to date, since anything that exists only
+- Then bring the state up to date with `cargo xtask orch`, since anything that exists only
   in your context is lost: the grant and its queue; every worker with its agent id, PR, branch,
   worktree, phase and last report; the merge order and what each PR waits for; each question
   the maintainer has open and the file that holds it; the rulings in force for the batch.
   Answer `parked` and hand back.
-- Started with "resume from the record": read this file's supporting files only as needed, read
-  the `## ACTIVE GRANT` block, and send each live worker one line with your agent id as its
+- Started with "resume from the record": read this file's supporting files only as needed, run
+  `cargo xtask orch state`, record your id with `cargo xtask orch orchestrator <id>`, and send
+  each live worker one line with your agent id as its
   address from now on. A worker spawned by an earlier orchestrator is still alive and reachable
   by its id. Its hand-back and task notifications go to the supervisor, which forwards them to
   you in one line.
-- Do not re-derive what the block states by reading PRs, records or worktrees. When the block
-  and the world disagree (a PR it lists is merged), fix the block and log the line.
+- Do not re-derive what the state holds by reading PRs, records or worktrees. When the state
+  and the world disagree (a PR it lists is merged), correct the state with the command for
+  that fact, which logs the change.
 
 ## Hand-off and wind-down
 
 When the maintainer stops the batch, workers finish the PRs whose code is committed and start
 nothing else. Every deferred plan goes as a comment on the Issue it belongs to (the approved
 mechanism, the PR grouping, the call sites), so the next batch starts from the Issues. Sweep the
-worktrees, cancel any grant watch, and close the record with the open-Issue count by class.
+worktrees, cancel any grant watch, log the open-Issue count by class, and close the record
+with `cargo xtask orch end`.
 
 ## Failure modes
 
@@ -341,8 +348,8 @@ worktrees, cancel any grant watch, and close the record with the open-Issue coun
 - A usage limit, a crash or a host reboot ends the supervisor and every agent at once, and
   nothing in a session restarts it. Workers commit work in progress before a hand-back for that
   reason. The maintainer opens a new session and runs `/orchestrate resume`; you are then
-  started from the record like any hand-over: read it, list what each worktree holds, and
-  respawn the workers from their branches.
+  started from the record like any hand-over: run `cargo xtask orch state`, list what each
+  worktree holds, and respawn the workers from their branches.
 - A worker's provider limit ends its session mid-run: complete the mechanical steps yourself in
   its worktree, then resume the worker with the results so it writes the body and runs the
   review with its own context.

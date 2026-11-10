@@ -109,13 +109,15 @@ Keep your own reads out of your context the same way:
    sync that brings non-comment code re-owes that PR's validation set, so more parallelism than
    that costs more host time than it saves.
 3. Start the record: `target/xtask/orchestration/<date>.md` (gitignored). It opens with a
-   `## ACTIVE GRANT` block, rewritten whenever its state changes: the current grant (holder and
-   command list, or none), the `master` head, every in-flight PR with its worker id, branch,
-   validated head and next step, the merge order, and the rolling Issues. Below it, append every
+   `## ACTIVE GRANT` block, rewritten whenever its state changes: your own agent id, the
+   current grant (holder and command list, or none) and its queue, the `master` head, every
+   in-flight PR with its worker id, branch, worktree, validated head, last report and next
+   step, the merge order, the rolling Issues, the questions the maintainer has open, and the
+   rulings in force. Below it, append every
    grant, merge, ruling, filed Issue and spawn as a timestamped one-line entry. A spawn entry
    carries the agent id, model and effort; when a worker's turn ends, add the token use its
-   completion notification reports, so the cost of a PR can be read from the record. After a
-   context compaction the record is the state.
+   completion notification reports, so the cost of a PR can be read from the record. The
+   record is the state a new orchestrator starts from (§ Hand-over).
 4. Drain rolling and follow-up Issues in waves on scopes that do not overlap the in-flight PRs,
    started alongside them, never by interrupting in-flight work.
 
@@ -129,12 +131,14 @@ spawn, and say so in the record.
 A worker's hand-back and a background command's exit reach you as notifications; act on those.
 Do not poll. Two things have no notification, and each has its own watch:
 
-- **A grant holder that stalls.** While an exclusive grant is outstanding, schedule one tick
-  every two hours (`CronCreate`; when you do not have the tool, ask the supervisor to schedule
-  it and forward the tick) with the prompt: "Grant watch: print the `## ACTIVE GRANT` block
-  of the record, `cat /proc/loadavg` and `pgrep -af qemu-system`. If the host is idle and the
-  holder has not reported for longer than its runs should take, ask the holder for a status
-  line. Log one line. Take no other action." Cancel it when the grant ends.
+- **A grant holder that stalls.** While an exclusive grant is outstanding, ask the supervisor
+  to schedule one tick every two hours and forward it to you. A background task dies with the
+  agent that owns it, so you own no tick and no CI watch: a tick is the supervisor's, a CI
+  watch the worker's. The tick's prompt, for the supervisor: "Send the orchestrator the words
+  `grant watch`. Do nothing else." On it, read the `## ACTIVE GRANT` block, `cat /proc/loadavg`
+  and `pgrep -af qemu-system`. If the host is idle and the holder has not reported for longer
+  than its runs should take, ask the holder for a status line. Log one line and take no other
+  action. Ask the supervisor to cancel the tick when the grant ends.
 - **A worker that is gone.** When a worker's notification says its session ended without a
   hand-back, or a message to it is undeliverable, it is dead: log it, send the stand-down
   message, ask the supervisor in one line to end its task (an agent cannot stop another's), and
@@ -302,10 +306,13 @@ calls, the record names, and what each verdict leads to.
 The supervisor replaces you at about 250,000 tokens of context, which it reads from your
 notifications. Ask for it yourself, in one line, when you are between steps and past 200,000.
 
-- Told to park: finish the step you are in, start no new one, bring the record's
-  `## ACTIVE GRANT` block up to date (the grant, every worker with its agent id, PR, branch,
-  worktree and phase, the merge order, each question the maintainer has open and the file that
-  holds it, the batch's rulings), answer `parked`, and hand back.
+- Park only at a quiet point: no gate half verified, no grant decision pending, no question to
+  the maintainer sent and unanswered. Told to park, reach one first, starting no new step.
+- Then bring the record's `## ACTIVE GRANT` block up to date, since anything that exists only
+  in your context is lost: the grant and its queue; every worker with its agent id, PR, branch,
+  worktree, phase and last report; the merge order and what each PR waits for; each question
+  the maintainer has open and the file that holds it; the rulings in force for the batch.
+  Answer `parked` and hand back.
 - Started with "resume from the record": read this file's supporting files only as needed, read
   the `## ACTIVE GRANT` block, and send each live worker one line with your agent id as its
   address from now on. A worker spawned by an earlier orchestrator is still alive and reachable

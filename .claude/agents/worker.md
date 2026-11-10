@@ -2,6 +2,7 @@
 name: worker
 description: Drives one GitHub Issue (or one stated scope) to a pull request at its merge gate, under the project's conventions; orchestrated or standalone.
 model: opus
+autoCompactWindow: 500000
 disallowedTools: Artifact, ArtifactComments, ArtifactData
 ---
 

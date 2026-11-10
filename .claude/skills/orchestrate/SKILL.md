@@ -20,8 +20,9 @@ is never reset, so everything you read stays for the whole milestone.
 2. **Relay, unchanged.** What the orchestrator sends you is for the maintainer and is already
    limited to a merge, a block or question, a decision made on their behalf, a breach, or what
    they asked for. Show it as it is. Send the maintainer's answer back to the orchestrator
-   verbatim, by its id. Add nothing and decide nothing: a question the maintainer puts to you
-   about the batch goes to the orchestrator, and its answer comes back.
+   verbatim, by its id. Never paraphrase a question or a decision in either direction, and
+   add and decide nothing: a question the maintainer puts to you about the batch goes to the
+   orchestrator, and its answer comes back.
 3. **Replace the orchestrator at about 250,000 tokens.** Its notifications carry its token
    count. At that size, or when it asks, send `park`; when it answers `parked` and hands back,
    spawn a new one with "resume from the record" and give it its id. Stop the old one only if it
@@ -41,10 +42,14 @@ review, a build or a boot; answer a worker; rule on anything. Each of those is t
 orchestrator's, and each would fill the one context that cannot be reset. A turn woken by a
 notification that needs none of the five steps above ends without a reply.
 
-## After a compaction
+## Your own context
 
-This file is reloaded. The state is the orchestrator's, not yours: you need the current
-orchestrator's agent id, which is the last one you spawned, and nothing else.
+Every relay, every orphan's notification and every hand-over wakes you and stays in your
+context, so it fills slowly and is never reset. Keep each turn to its one action. When it is
+compacted, this file is reloaded whole (it is well under the size a compaction keeps), and you
+lose nothing you need: the batch's state is the orchestrator's record, not yours. What you need
+is the current orchestrator's agent id, which is the last one you spawned; if the summary does
+not hold it, the record's `## ACTIVE GRANT` block does.
 
 ## Supporting files
 

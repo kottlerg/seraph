@@ -187,9 +187,10 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
 /// cap. svctest's own non-zero seeds show six of the refused names are
-/// published; `devmgr.shutdown`, which only pwrmgr seeds, is published by
-/// the same loop as `devmgr.registry` and `devmgr.test`. A queryable
-/// seed-only name would hand its authority to every process.
+/// published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.debug`,
+/// which only the `debug-echo` fixture seeds, are published by the same loop
+/// as `devmgr.registry` and `devmgr.test`. A queryable seed-only name would
+/// hand its authority to every process.
 fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
 {
     for (cap, shown) in [

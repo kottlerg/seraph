@@ -209,17 +209,15 @@ For each matched device, devmgr:
    line's mode of step 4 in `data[1]` (0 with no IRQ), which the driver passes
    to `SYS_IRQ_REGISTER`, and ends the bootstrap. The IRQ slot is absent when
    the device got no IRQ cap in step 4; virtio-input and virtio-console then
-   poll, and virtio-blk,
-   which requires the IRQ, is not spawned. A driver checks the delivered BAR
-   indices against the layout it computes from its `QUERY_DEVICE_INFO` reply and
-   exits on a mismatch.
+   poll, and virtio-blk, which requires the IRQ, is not spawned. A driver
+   checks the delivered BAR indices against the layout it computes from its
+   `QUERY_DEVICE_INFO` reply and exits on a mismatch.
 8. Binds a death observer on the driver's thread to devmgr's driver death
    queue, with the device badge as the correlator, and keeps the driver's
    process handle for the rest of the boot.
 9. Once every driver of the batch (the boot batch: virtio-blk, serial, and
    framebuffer; the on-disk batch: the RTC, virtio-input, and virtio-console)
-   has been
-   spawned, settles the batch: serves the drivers' `QUERY_DEVICE_INFO` and
+   has been spawned, settles the batch: serves the drivers' `QUERY_DEVICE_INFO` and
    `DRIVER_READY` calls on the private endpoint and takes their deaths until
    every driver has reported ready or died or the settle bound elapses, then
    takes every death still queued, revokes the private endpoint, serves the

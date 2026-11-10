@@ -730,7 +730,7 @@ Every entry here is `correct as is`; none is tracked.
 | `POLL_BURST` | `services/drivers/virtio/blk/src/io.rs` | 500 us on the monotonic clock | tuning | none | correct as is | None |
 | `EVENT_QUEUE_SIZE` | `services/drivers/virtio/input/src/input.rs` | 64 | BSS budget (64 x 8 B buffers in one DMA page) | one DMA page | correct as is | None |
 | `POLL_INTERVAL_MS` | `services/drivers/virtio/input/src/main.rs` | 20 | tuning (human input rate) | none | correct as is | None |
-| virtio-console `RX_BUFFERS`, `RX_BUFFER_LEN` | `services/drivers/virtio/console/src/main.rs` | 8 buffers of 512 B, fewer when the device's queue is smaller | BSS budget (the buffers fill one DMA page; one read reply's worth each) | one DMA page | correct as is | None |
+| virtio-console `RX_BUFFERS`, `RX_BUFFER_LEN` | `services/drivers/virtio/console/src/main.rs` | 8 buffers of 512 B, fewer when the device's queue is smaller | fixed allocation (the buffers fill one memmgr DMA page) and ABI width (`RX_BUFFER_LEN` is asserted equal to one read reply, `MSG_DATA_WORDS_MAX * 8`) | one DMA page | correct as is | None |
 | virtio-console `Received` | `services/drivers/virtio/console/src/main.rs` | 1024 B (twice a buffer) | tuning (a read that leaves a buffer's tail still takes the next whole; while it is full the device keeps the buffers and takes no input) | 1 KiB | correct as is | None |
 | virtio-console `TX_QUEUE_SIZE` | `services/drivers/virtio/console/src/main.rs` | 1 | provably unreachable (one write in flight by design) | one ring page and one buffer page | correct as is | None |
 | virtio-console `TX_POLL_MS` | `services/drivers/virtio/console/src/main.rs` | 5 ms | tuning (a write's look at its completion when no interrupt signals it) | none | correct as is | None |

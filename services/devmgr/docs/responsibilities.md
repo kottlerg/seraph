@@ -260,11 +260,10 @@ devmgr's responsibilities are:
   twice `virtio_core::pci::RESET_TIMEOUT` (5 s), so 10 s, counted from the
   start of the settle, after the batch's last spawn. The VirtIO reset, which
   a virtio-blk, virtio-input, or virtio-console driver polls for once, is the
-  longest bounded
-  wait a driver's setup makes, so the settle never ends before a driver's own
-  timeout has, and a margin of one further `RESET_TIMEOUT` covers the rest of
-  the setup. The serial, framebuffer, and RTC drivers make no bounded wait in
-  their setup. The synchronous IPC calls every driver's setup makes (memmgr,
+  longest bounded wait a driver's setup makes, so the settle never ends before
+  a driver's own timeout has, and a margin of one further `RESET_TIMEOUT`
+  covers the rest of the setup. The serial, framebuffer, and RTC drivers make
+  no bounded wait in their setup. The synchronous IPC calls every driver's setup makes (memmgr,
   and devmgr's own `QUERY_DEVICE_INFO`) are not bounded; a driver blocked in
   one past the bound is withdrawn like a hung one. A thread devmgr starts per
   settle sleeps the bound and signals the timer notification; when it cannot

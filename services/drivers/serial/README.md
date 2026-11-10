@@ -74,7 +74,11 @@ error codes in `shared/ipc::serial_errors`. This driver's service loop never blo
 drain whatever is buffered and return at once — so a pending read never starves writers sharing
 the endpoint (logd, the terminal's output). The debug port's
 [virtio-console driver](../virtio/console/README.md) serves the same three operations with the
-same wire shapes; its README states where its behaviour differs (a write waits for the device).
+same wire shapes; its README states where its behaviour differs (a write waits for the device,
+and a registration takes any notification cap, since its interrupt-service thread signals it
+where this driver binds it through `SYS_IRQ_REGISTER`).
+The driver deletes every cap a request carries that it does not keep, before it replies; it keeps
+only the notification of an accepted `SERIAL_REGISTER_RX_NOTIFY`.
 
 ### Label 1: `SERIAL_WRITE_BYTES`
 
@@ -124,7 +128,9 @@ rides the label's high bits, the bytes are packed in the data words. Gated by
 Register a notification the driver kicks when receive data becomes ready. The
 driver binds the UART interrupt to the supplied notification and arms it; the
 client then loops (drain with `SERIAL_READ_BYTES`, wait on its notification
-with a bounded timeout). Gated by `READ_AUTHORITY`.
+with a bounded timeout). An accepted registration replaces the one before it, whose notification
+the driver deletes; a refused one deletes the supplied notification and leaves the earlier
+binding in place. Gated by `READ_AUTHORITY`.
 
 **Request:**
 
@@ -137,7 +143,7 @@ with a bounded timeout). Gated by `READ_AUTHORITY`.
 
 | Field | Value |
 |---|---|
-| label | `0` (`SUCCESS`), `4` (`REGISTER_FAILED` — no IRQ cap held, or no notification supplied), or `5` (`UNAUTHORIZED` — badge lacks `READ_AUTHORITY`) |
+| label | `0` (`SUCCESS`), `4` (`REGISTER_FAILED` — no IRQ cap held, no notification supplied, or a cap `SYS_IRQ_REGISTER` rejects), or `5` (`UNAUTHORIZED` — badge lacks `READ_AUTHORITY`) |
 
 ---
 

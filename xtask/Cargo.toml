@@ -42,6 +42,9 @@ which = "8"
 # does not ship (its llvm-tools carries no symbolizer).
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
 addr2line = { version = "0.27", default-features = false, features = ["std", "rustc-demangle"] }
+# `pr-check`, `review-check`, `review-ledger`, `issue-edit`, `issue-file`: the
+# GitHub CLI answers in JSON, and the review's run records are JSON files.
+serde_json = "1"
 # The crash-report block's parser: test-crash-report reads the blocks with
 # the crate crashd emits them with, not a copy of their grammar.
 crash-report = { path = "../shared/crash-report" }

@@ -642,10 +642,29 @@ fn debugger_tag_check(authority: u64)
 
 /// svctest declared itself undebuggable, so procmgr refuses to register a
 /// thread of it (`REGISTER_THREAD`, `NOT_ATTACHABLE`), as its runtime's
-/// first registration found.
+/// first registration found, and first unbinds the thread as the declaration
+/// unbinds a declared process's threads: a helper thread bound under the
+/// debugger tag comes back unbound.
 fn expect_registration_refused()
 {
-    let own = std::os::seraph::thread::current_thread_cap();
+    let (cap_tx, cap_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let helper = std::thread::spawn(move || {
+        cap_tx
+            .send(std::os::seraph::thread::current_thread_cap())
+            .expect("crash_endpoint: publishing the helper's cap");
+        let _ = release_rx.recv();
+    });
+    let own = cap_rx.recv().expect("crash_endpoint: the helper's cap");
+    let endpoint =
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+            syscall::cap_create_endpoint(slab).ok()
+        })
+        .expect("crash_endpoint: a debugger endpoint");
+    let send = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, DEBUGGER_BADGE)
+        .expect("crash_endpoint: a debugger SEND");
+    syscall::thread_set_fault_handler(own, send, FAULT_CLASS_EXCEPTION | FAULT_CLASS_UPCALL)
+        .expect("crash_endpoint: binding the helper under the debugger tag");
     let thread = syscall::cap_derive(own, RIGHTS_THREAD)
         .expect("crash_endpoint: deriving a thread cap to register");
     let procmgr = std::os::seraph::startup_info().procmgr_endpoint;
@@ -661,6 +680,18 @@ fn expect_registration_refused()
         procmgr_errors::NOT_ATTACHABLE,
         "crash_endpoint: a registration from a process that declared no-debug"
     );
+    assert_eq!(
+        (
+            exception_badge(own, "the refused helper"),
+            class_badge(own, FAULT_CLASS_UPCALL, "the refused helper")
+        ),
+        (None, None),
+        "crash_endpoint: a refused registration of a declared process left a debugger's binding"
+    );
+    let _ = release.send(());
+    helper.join().expect("crash_endpoint: joining the helper");
+    let _ = syscall::cap_delete(send);
+    let _ = syscall::cap_delete(endpoint);
 }
 
 pub fn crash_endpoint_phase(caps: &Caps)

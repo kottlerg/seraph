@@ -2085,8 +2085,8 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// `SYS_THREAD_GET_FAULT_HANDLER` returns, so a debugger binds under
 /// `procmgr_labels::DEBUGGER_BADGE_TAG`
 /// (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`). A thread
-/// refused at the bound or for the heap runs unregistered, so a gone
-/// debugger's binding on it is taken back then, under the process badge; one
+/// refused at the bound or for the heap runs unregistered, so a debugger's
+/// binding on it is taken back then, under the process badge; one
 /// refused because its process declared itself undebuggable is unbound as the
 /// declaration unbinds its threads.
 ///
@@ -2134,10 +2134,11 @@ pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) ->
     }
     if let Err(r) = entry.threads.reserve()
     {
-        // The thread runs unregistered, so no restore reaches it later: a
-        // gone debugger's binding it copied goes back to the crash endpoint
-        // under the process badge, which its faults then carry.
-        if unwatched && current.is_some_and(process_table::is_debugger_badge)
+        // The thread runs unregistered, so no attach lists it and no restore
+        // reaches it later: a debugger's binding it copied, a watched one's
+        // too, goes back to the crash endpoint under the process badge,
+        // which its faults then carry.
+        if current.is_some_and(process_table::is_debugger_badge)
         {
             if !bind_exception_class(thread_cap, badge)
             {

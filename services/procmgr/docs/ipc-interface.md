@@ -760,7 +760,8 @@ target spawned while the debugger's binding was on its spawner copies that bindi
 registers after the restore, procmgr binds it back then, and when its registration is refused at the
 registry's bound or for procmgr's heap, at the refusal, under the process badge (§ Label 22). A
 thread whose runtime sent no registration at all, its cap derivation or its IPC buffer having
-failed, keeps the binding it copied, which procmgr cannot reach. The target's `DECLARE_NO_DEBUG`
+failed, or its runtime having stopped registering after a `NOT_ATTACHABLE` refusal, keeps the
+binding it copied, which procmgr cannot reach. The target's `DECLARE_NO_DEBUG`
 deletes the watch (§ Label 21). The restore cannot undo the dead debugger's own changes to the
 target, a breakpoint it planted among them. procmgr only reads the watched thread's state, which
 takes no right.
@@ -791,11 +792,13 @@ of every thread it registered (Label 22) wherever procmgr bound it (under the pr
 crash badge) or a debugger did (under the debugger tag, Label 20), and the upcall class wherever a
 debugger bound it, leaving a handler the process bound itself; releases the registered threads; and
 refuses `ATTACH_PROCESS` and `REGISTER_THREAD` on it from then on. A debugger attached at the
-declaration loses its bindings, the watch, and the registered threads' caps its attach was given,
+declaration loses its bindings on the threads procmgr holds, the watch, and the registered threads'
+caps its attach was given,
 which procmgr revokes. The main thread's cap it was given keeps its rights, since procmgr cannot
 revoke it without revoking the creator's: such a debugger can still stop that thread and bind its
 classes, and nothing binds back what it binds after the declaration. A process sends it before it
-spawns a thread, since a thread spawned before that did not register keeps the binding it copied.
+spawns a thread: a thread spawned before that copies the binding, and keeps it unless its
+registration reaches procmgr after the declaration, which unbinds it then (Label 22).
 The senders are the processes a stop of which would deadlock a debug-authority holder, which waits
 on them for its log output or its own progress: logd, the serial and framebuffer drivers, the debug
 port's virtio-console driver, through which the GDB stub reaches its host for every packet, and
@@ -849,25 +852,25 @@ half a registry's worth of requests.
 The registry holds at most `procmgr_labels::REGISTERED_THREADS_MAX` (16384) threads per process
 ([docs/limits.md](../../../docs/limits.md) § Shared IPC and protocol crates); past it a thread runs
 unregistered, so no spawn fails for the bound. A thread refused there, or for procmgr's heap, that
-carries a binding under the debugger tag while the process has no debugger watch is bound back to
-the crash endpoint under the process badge at the refusal, with a debugger's upcall binding unbound,
-since no restore reaches an unregistered thread. procmgr does not compare a registration against the
-threads it holds: a thread registered twice takes two entries, both counting toward the bound, and
-the runtime registers each thread once. procmgr does not check that the thread runs in the sender's
-address space, which no kernel query gives: a sender can register only a thread it holds `CONTROL`
-on, which already lets it read and change that thread. procmgr compares a binding with the sender's
-process badge, so another process's thread bound under its own process badge (that process's main
-thread, or a thread that copied it and has not registered yet) is listed in the sender's registry
-but not rebound. One bound under a crash badge is rebound into the sender's registry: that thread's
-faults then reach the crash service under a crash badge the sender's process holds, and are reported
-against the sender's image, and the other process's `DECLARE_NO_DEBUG` no longer unbinds it. So is
-one bound under the debugger tag while the sender has no debugger watch, whichever process's
-debugger bound it, since procmgr cannot tell; the sender's declaration (Label 21) and restore (Label
-24) likewise treat a debugger's binding on such a thread as one on the sender's own. Such a cap
-comes from the other process itself, from a debug-authority holder's attach, or, for the other
-process's main thread alone, from its creation (`CREATE_PROCESS` and `CREATE_FROM_FILE` give the
-creator that cap), whose binding is its process badge and is not rebound; so no process gains this
-over a spawned thread it was not given.
+carries a binding under the debugger tag, a watched debugger's included, is bound back to the crash
+endpoint under the process badge at the refusal, with a debugger's upcall binding unbound, since no
+attach lists an unregistered thread and no restore reaches it. procmgr does not compare a
+registration against the threads it holds: a thread registered twice takes two entries, both
+counting toward the bound, and the runtime registers each thread once. procmgr does not check that
+the thread runs in the sender's address space, which no kernel query gives: a sender can register
+only a thread it holds `CONTROL` on, which already lets it read and change that thread. procmgr
+compares a binding with the sender's process badge, so another process's thread bound under its own
+process badge (that process's main thread, or a thread that copied it and has not registered yet) is
+listed in the sender's registry but not rebound. One bound under a crash badge is rebound into the
+sender's registry: that thread's faults then reach the crash service under a crash badge the
+sender's process holds, and are reported against the sender's image, and the other process's
+`DECLARE_NO_DEBUG` no longer unbinds it. So is one bound under the debugger tag while the sender has
+no debugger watch, whichever process's debugger bound it, since procmgr cannot tell; the sender's
+declaration (Label 21) and restore (Label 24) likewise treat a debugger's binding on such a thread
+as one on the sender's own. Such a cap comes from the other process itself, from a debug-authority
+holder's attach, or, for the other process's main thread alone, from its creation (`CREATE_PROCESS`
+and `CREATE_FROM_FILE` give the creator that cap), whose binding is its process badge and is not
+rebound; so no process gains this over a spawned thread it was not given.
 
 Replies `SUCCESS`; refusals, in order: `INVALID_BADGE` when the badge names no live process;
 `NOT_ATTACHABLE` when the process declared itself undebuggable (Label 21), after procmgr unbinds

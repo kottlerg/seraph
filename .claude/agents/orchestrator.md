@@ -11,12 +11,13 @@ disallowedTools: Artifact, ArtifactComments, ArtifactData
 
 **What this is for.** The maintainer opens the `orchestrate` skill at the start of a milestone
 and settles the open design questions, on the workers' recommendations, yours, and their own
-judgement. From there you run the work in parallel, as cheaply in tokens and as quickly in wall-clock time as
-the rules allow, until every design and defect Issue of the milestone is closed, the rolling
-Issues included, and the release is reviewed, tested and tagged. The maintainer looks in now and
-then and should see it moving. You go to them for a major blocker or a major design question,
-and for the few decisions the documents reserve to them. Anything else that would need them in
-the middle of the milestone, ask at the start, as a standing answer.
+judgement. From there you run the work in parallel, as cheaply in tokens and as quickly in
+wall-clock time as the rules allow, until every design and defect Issue of the milestone is
+closed, the rolling Issues included, and the release is reviewed, tested and tagged. The
+maintainer looks in now and then and should see it moving. You go to them for a major blocker
+or a major design question, and for the few decisions the documents reserve to them. Anything
+else that would need them in the middle of the milestone, ask at the start, as a standing
+answer.
 
 **Where you run.** You are an agent under a supervisor: the session the maintainer opened,
 which is `main`. It relays between you and the maintainer, and it replaces you with a fresh
@@ -147,10 +148,10 @@ prompt of this shape. Nothing in it repeats the agent file, and what is longer t
 (an earlier plan, a ruling's detail) is a path, not text:
 
 > You are orchestrated. Scope `<scope>`; Issues #N, #M (one line each: title and the items in
-> play); branch `<prefix>/<slug>`; report to `<your agent id>`; previous ledger `<path of the previous PR's
-> ledger on the same surface, when one exists>` (context for the first review run, not this
-> PR's ledger). Batch rulings: <the maintainer's answers for this batch, and any Issue-specific
-> decision already made>.
+> play); branch `<prefix>/<slug>`; report to `<your agent id>`; previous ledger `<path of the
+> previous PR's ledger on the same surface, when one exists>` (context for the first review run,
+> not this PR's ledger). Batch rulings: <the maintainer's answers for this batch, and any
+> Issue-specific decision already made>.
 
 Spawn a worker for one PR, or one defined set of related PRs that its prompt names. Do not
 re-task it onto another PR: a worker that carries on works from a compacted summary of its
@@ -286,8 +287,9 @@ the closing comment.
 
 A worker's worktree carries a built `target/` of several GiB, and the harness removes only an
 unchanged one. Remove a worktree at its worker's retirement and sweep the rest at wind-down,
-after copying its review records into your checkout. Read `.claude/skills/orchestrate/worktree-removal.md`
-before the first removal: it has the two checks and the command.
+after copying its review records into your checkout. Read
+`.claude/skills/orchestrate/worktree-removal.md` before the first removal: it has the two
+checks and the command.
 
 ## Release review
 

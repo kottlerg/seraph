@@ -207,6 +207,17 @@ pub(super) const PTE_USER: u64 = 1 << 4;
 /// type, which every RAM mapping uses; NC and IO are the non-cacheable types.
 pub(super) const PTE_PBMT_MASK: u64 = 0b11 << 61;
 
+/// The leaf `new` with the memory type (PBMT) of the leaf `prior` it replaces.
+///
+/// A permission change keeps a page's memory type, so an IO device leaf of
+/// `SYS_MMIO_MAP` stays IO, which `SYS_THREAD_READ_MEM` and
+/// `SYS_THREAD_WRITE_MEM` rely on to refuse device memory
+/// (`AddressSpace::copy_user_bytes`).
+pub(super) fn keep_memory_type(new: u64, prior: u64) -> u64
+{
+    (new & !PTE_PBMT_MASK) | (prior & PTE_PBMT_MASK)
+}
+
 /// The access the user leaf PTE `pte` grants, or `None` when it is not valid
 /// or not user-accessible (`paging::user_leaf_flags`). `uncacheable` is set
 /// for any PBMT other than PMA.
@@ -399,5 +410,25 @@ mod tests
         assert!(io.uncacheable);
         let nc = user_leaf_flags(PTE_VALID | PTE_USER | PTE_READ | (0b01 << 61)).unwrap();
         assert!(nc.uncacheable);
+    }
+
+    // Defect caught: a protect that rebuilt the leaf from its new rights alone
+    // would turn an IO device leaf into PMA memory, so SYS_THREAD_READ_MEM
+    // would take the device frame for RAM and copy it through the direct map;
+    // and one that kept other bits of the old leaf would keep its old rights.
+    #[test]
+    fn a_rights_change_keeps_the_leaf_memory_type()
+    {
+        let ppn = 0x200 << 10;
+        let device = PTE_VALID | PTE_USER | PTE_READ | PTE_WRITE | (0b10 << 61) | ppn;
+        let read_only = PTE_VALID | PTE_USER | PTE_READ | ppn;
+        let protected = keep_memory_type(read_only, device);
+        let flags = user_leaf_flags(protected).unwrap();
+        assert!(flags.uncacheable && !flags.writable);
+        assert_eq!(protected & !PTE_PBMT_MASK, read_only);
+
+        let ram = PTE_VALID | PTE_USER | PTE_READ | ppn;
+        let protected = keep_memory_type(read_only | (0b10 << 61), ram);
+        assert!(!user_leaf_flags(protected).unwrap().uncacheable);
     }
 }

@@ -347,6 +347,33 @@ pub fn page_spans(va: u64, len: usize) -> impl Iterator<Item = PageSpan>
     })
 }
 
+/// Whether `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM` may copy a page
+/// whose user leaf grants `leaf` and names the frame at `phys`, through the
+/// direct map, which covers RAM below `ram_top`.
+///
+/// The leaf must be write-back: an uncacheable leaf is device memory, which
+/// `SYS_MMIO_MAP` installs and no permission change turns write-back, so a
+/// write-back leaf names normal memory (a Memory capability's frame, or RAM
+/// the kernel mapped for init). The frame must also lie below `ram_top`: a
+/// Memory capability over firmware memory, such as the ACPI RSDP page, maps
+/// write-back and may lie above RAM, where the direct map does not reach.
+///
+/// # Errors
+/// `InvalidAddress`: the leaf is uncacheable, or the frame is at or above
+/// `ram_top`.
+pub fn thread_mem_page_check(
+    leaf: crate::mm::paging::PageFlags,
+    phys: u64,
+    ram_top: u64,
+) -> Result<(), SyscallError>
+{
+    if leaf.uncacheable || phys.saturating_add(PAGE_SIZE as u64) > ram_top
+    {
+        return Err(SyscallError::InvalidAddress);
+    }
+    Ok(())
+}
+
 /// Whether `SYS_THREAD_WRITE_MEM` may write a page whose user leaf grants
 /// `leaf`, with `text` as the call's flag gives it; `mappings` counts the
 /// frame's user leaf mappings and is read only for a read-only leaf.
@@ -1383,7 +1410,8 @@ impl AddressSpace
     /// lock, cannot run between the check and the copy, and the frames stay
     /// mapped (and so unfreed) until the copy ends.
     ///
-    /// Each page must be mapped by a 4 KiB user leaf of normal memory; a
+    /// Each page must be mapped by a 4 KiB user leaf of normal memory below
+    /// the top of RAM ([`thread_mem_page_check`]); a
     /// write needs the leaf writable, or [`TextWrite::Permitted`] with the
     /// frame mapped once ([`thread_mem_write_check`]). The thread's own access
     /// rights do not gate a read, so an execute-only page reads. A write's
@@ -1392,8 +1420,8 @@ impl AddressSpace
     ///
     /// # Errors
     /// - `InvalidAddress`: a page is unmapped, mapped by no 4 KiB user leaf,
-    ///   or device memory (an uncacheable leaf; its frame need not be RAM the
-    ///   direct map covers).
+    ///   device memory (an uncacheable leaf; its frame need not be RAM the
+    ///   direct map covers), or a frame at or above the top of RAM.
     /// - `InsufficientRights`, `InvalidState`: a write the leaf refuses
     ///   ([`thread_mem_write_check`]).
     ///
@@ -1416,6 +1444,7 @@ impl AddressSpace
             UserCopy::Read(dst) => (dst.len(), None),
             UserCopy::Write { src, text } => (src.len(), Some(*text)),
         };
+        let ram_top = crate::mm::init::ram_top();
         crate::percpu::preempt_disable();
         self.pt_lock();
         let checked = (|| {
@@ -1426,10 +1455,7 @@ impl AddressSpace
                 let (phys, pte) = unsafe { translate_user_page(self.root_virt, span.page) }
                     .ok_or(SyscallError::InvalidAddress)?;
                 let flags = user_leaf_flags(pte).ok_or(SyscallError::InvalidAddress)?;
-                if flags.uncacheable
-                {
-                    return Err(SyscallError::InvalidAddress);
-                }
+                thread_mem_page_check(flags, phys, ram_top)?;
                 if let Some(text) = write
                 {
                     thread_mem_write_check(flags, text, || {
@@ -1451,10 +1477,17 @@ impl AddressSpace
                     continue;
                 };
                 let frame = phys_to_virt(phys) as *mut u8;
-                // SAFETY: frame is the direct-map alias of a RAM frame (normal
-                // memory, checked above) mapped in this space, which pt_lock
-                // keeps mapped and so unfreed; in_page + n <= PAGE_SIZE, and
-                // the buffer offset + n <= len, by page_spans.
+                // SAFETY: the check pass found the frame's leaf write-back and
+                // the frame below the top of RAM (thread_mem_page_check). A
+                // write-back user leaf names normal memory (a Memory
+                // capability's frame, or RAM the kernel mapped for init):
+                // SYS_MMIO_MAP installs device frames uncacheable, and
+                // protect_user_page keeps a leaf's memory type. The direct map covers every frame below the top of
+                // RAM but the kernel's stack guard pages, which no user leaf
+                // maps, so `frame` is a mapped write-back alias of it. The
+                // frame is mapped in this space, which pt_lock keeps mapped
+                // and so unfreed; in_page + n <= PAGE_SIZE, and the buffer
+                // offset + n <= len, by page_spans.
                 unsafe {
                     match &mut copy
                     {
@@ -1757,6 +1790,36 @@ mod thread_mem_tests
         assert_eq!(
             thread_mem_write_check(leaf(false), TextWrite::Permitted, || 0),
             Err(SyscallError::InvalidState)
+        );
+    }
+
+    // Defect caught: a copy that took a device leaf for RAM, or a frame above
+    // the top of RAM for one the direct map covers, would read or write
+    // device registers through a write-back alias, or take a kernel page
+    // fault on an address the direct map leaves unmapped.
+    #[test]
+    fn a_copy_takes_only_a_write_back_page_below_the_top_of_ram()
+    {
+        let page = PAGE_SIZE as u64;
+        let leaf = |uncacheable| crate::mm::paging::PageFlags {
+            readable: true,
+            writable: true,
+            executable: false,
+            uncacheable,
+        };
+        let top = 16 * page;
+        assert!(thread_mem_page_check(leaf(false), 15 * page, top).is_ok());
+        assert_eq!(
+            thread_mem_page_check(leaf(true), page, top),
+            Err(SyscallError::InvalidAddress)
+        );
+        assert_eq!(
+            thread_mem_page_check(leaf(false), top, top),
+            Err(SyscallError::InvalidAddress)
+        );
+        assert_eq!(
+            thread_mem_page_check(leaf(false), u64::MAX & !(page - 1), top),
+            Err(SyscallError::InvalidAddress)
         );
     }
 }

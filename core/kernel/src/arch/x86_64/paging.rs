@@ -1418,11 +1418,27 @@ pub unsafe fn flush_kernel_page(virt: u64)
     }
 }
 
+/// The leaf bits that select a 4 KiB page's memory type: PWT and PCD (the
+/// kernel sets no PAT bit in a leaf).
+const MEMORY_TYPE: u64 = PCD | PWT;
+
+/// The leaf `new` with the memory type of the leaf `prior` it replaces.
+///
+/// A permission change keeps a page's memory type, so an uncacheable device
+/// leaf of `SYS_MMIO_MAP` stays uncacheable, which `SYS_THREAD_READ_MEM` and
+/// `SYS_THREAD_WRITE_MEM` rely on to refuse device memory
+/// (`AddressSpace::copy_user_bytes`).
+fn keep_memory_type(new: u64, prior: u64) -> u64
+{
+    (new & !MEMORY_TYPE) | (prior & MEMORY_TYPE)
+}
+
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.
 ///
 /// Walks from the root to the PT. Returns `Err(PagingError::NotMapped)` if
 /// the page is not present at any level. On success, rewrites the leaf PTE
-/// with the new `flags` (preserving the physical address and USER bit), calls
+/// with the rights of `flags` (preserving the physical address, the USER bit,
+/// and the leaf's memory type, whatever `flags.uncacheable` says), calls
 /// `flush_page`, and returns the [`MapOutcome`](crate::mm::paging::MapOutcome)
 /// classifying the rights change (a same-frame rewrite, so never `Fresh`).
 ///
@@ -1450,8 +1466,10 @@ pub unsafe fn protect_user_page(
 
     let prior = leaf.0;
     let phys = leaf.phys_addr();
-    let mut new_pte = PageTableEntry::new_page(phys, flags);
-    new_pte.0 |= USER;
+    let new_pte = PageTableEntry(keep_memory_type(
+        PageTableEntry::new_page(phys, flags).0 | USER,
+        prior,
+    ));
     *leaf = new_pte;
 
     // SAFETY: invlpg flushes TLB entry for specified VA; architecture primitive.
@@ -1924,6 +1942,50 @@ mod tests
         assert!(uc.uncacheable);
         let wt = user_leaf_flags(PRESENT | USER | NO_EXECUTE | PWT).unwrap();
         assert!(wt.uncacheable);
+    }
+
+    // Defect caught: a protect that rebuilt the leaf from its new rights alone
+    // would turn an uncacheable device leaf write-back, so SYS_THREAD_READ_MEM
+    // would take the device frame for RAM and copy it through the direct map;
+    // and one that kept other bits of the old leaf would keep its old rights.
+    #[test]
+    fn a_rights_change_keeps_the_leaf_memory_type()
+    {
+        let phys = 0x8_0000;
+        let read_only = PageFlags {
+            readable: true,
+            writable: false,
+            executable: false,
+            uncacheable: false,
+        };
+        let device = PageTableEntry::new_page(
+            phys,
+            PageFlags {
+                writable: true,
+                uncacheable: true,
+                ..read_only
+            },
+        )
+        .0 | USER;
+        let protected =
+            keep_memory_type(PageTableEntry::new_page(phys, read_only).0 | USER, device);
+        let flags = user_leaf_flags(protected).unwrap();
+        assert!(flags.uncacheable && !flags.writable);
+        assert_eq!(PageTableEntry(protected).phys_addr(), phys);
+
+        let ram = PageTableEntry::new_page(phys, read_only).0 | USER;
+        let protected = keep_memory_type(
+            PageTableEntry::new_page(
+                phys,
+                PageFlags {
+                    uncacheable: true,
+                    ..read_only
+                },
+            )
+            .0 | USER,
+            ram,
+        );
+        assert!(!user_leaf_flags(protected).unwrap().uncacheable);
     }
 
     #[test]

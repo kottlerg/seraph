@@ -39,12 +39,14 @@ pub mod death_queues;
 pub mod dma_holds;
 pub mod fs_reads;
 pub mod init_reap;
+pub mod names;
 pub mod request_caps;
 pub mod threads;
 
 pub use create_blobs::{ArgvEnvRefusal, ArgvEnvTally, checked_total, decode_header};
 pub use dma_holds::{DmaHolds, HeldReclaim, ReleaseRefusal, release_target, release_token_badge};
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
+pub use names::ProcessName;
 pub use request_caps::{CreateCaps, CreateTailCaps, split_create_caps};
 pub use threads::{CrashBadges, RegisterRefusal, RegisteredThread, ThreadRegistry};
 
@@ -163,6 +165,14 @@ pub struct ProcessEntry
     /// The threads the child's runtime registered (`REGISTER_THREAD`), which
     /// `ATTACH_PROCESS` lists after the main thread.
     pub threads: ThreadRegistry,
+    /// The child's name, the first string of its argv, which
+    /// `LIST_PROCESSES` reports.
+    pub name: ProcessName,
+    /// Slot in procmgr's `CSpace` of the main-thread cap of the debugger
+    /// attached to the child (`ATTACH_PROCESS` `caps[0]`); `0` with none.
+    /// Once that thread has exited, procmgr restores the child's crash
+    /// bindings, as `DETACH_PROCESS` does.
+    pub debugger: u64,
 }
 
 /// Where the loader placed a child's image: the load bias it drew and the
@@ -506,6 +516,20 @@ impl ProcessTable
     /// inserted or removed between pages.
     pub fn live_badges_after(&self, after: Option<u64>, out: &mut [u64]) -> usize
     {
+        let mut copied = 0;
+        for (slot, entry) in out.iter_mut().zip(self.entries_after(after))
+        {
+            *slot = entry.badge;
+            copied += 1;
+        }
+        copied
+    }
+
+    /// The live entries above `after` (every entry when `after` is `None`),
+    /// in badge order: the walk [`Self::live_badges_after`] and
+    /// `LIST_PROCESSES` page through.
+    pub fn entries_after(&self, after: Option<u64>) -> impl Iterator<Item = &ProcessEntry>
+    {
         let start = match after
         {
             None => 0,
@@ -515,13 +539,7 @@ impl ProcessTable
                 Err(i) => i,
             },
         };
-        let mut copied = 0;
-        for (slot, entry) in out.iter_mut().zip(&self.entries[start..])
-        {
-            *slot = entry.badge;
-            copied += 1;
-        }
-        copied
+        self.entries[start..].iter()
     }
 
     /// Lightweight status lookup for `QUERY_PROCESS`. Returns
@@ -682,6 +700,32 @@ pub fn attach_target(
         return Err(AttachRefusal::NotAttachable);
     }
     Ok((entry, named))
+}
+
+/// The entry a `DETACH_PROCESS` from `caller_badge` for the process badge
+/// `target` reaches, or why it is refused, in [`attach_target`]'s order: the
+/// caller's authority, the target's presence, its no-debug mark. Unlike an
+/// attach, it takes a process badge alone.
+///
+/// # Errors
+/// The [`AttachRefusal`] that refuses it.
+pub fn detach_target(
+    table: &mut ProcessTable,
+    caller_badge: u64,
+    target: u64,
+) -> Result<&mut ProcessEntry, AttachRefusal>
+{
+    if !debug_authorized(caller_badge)
+    {
+        return Err(AttachRefusal::Unauthorized);
+    }
+    let idx = table.index_of_badge(target).ok_or(AttachRefusal::Unknown)?;
+    let entry = &mut table.entries[idx];
+    if entry.no_debug
+    {
+        return Err(AttachRefusal::NotAttachable);
+    }
+    Ok(entry)
 }
 
 /// The entry a `REGISTER_THREAD` sent on a cap badged `sender_badge` registers
@@ -885,6 +929,8 @@ mod tests
             no_debug: false,
             image: ImageSpan::default(),
             threads: ThreadRegistry::new(),
+            name: ProcessName::EMPTY,
+            debugger: 0,
         }
     }
 
@@ -1012,6 +1058,68 @@ mod tests
         assert_eq!(
             attached(&mut table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x78),
             Ok((0x78, 0))
+        );
+    }
+
+    #[test]
+    fn a_detach_is_refused_as_an_attach_is_and_takes_a_process_badge_alone()
+    {
+        let auth = ipc::procmgr_labels::DEBUG_AUTHORITY;
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(0x77)).unwrap();
+        table.insert(entry_with_badge(0x78)).unwrap();
+        assert_eq!(table.declare_no_debug(0x78), Some(0));
+        let detached = |t: &mut ProcessTable, caller, target| {
+            detach_target(t, caller, target).map(|e| e.badge)
+        };
+        assert_eq!(
+            detached(&mut table, 0, 0x77),
+            Err(AttachRefusal::Unauthorized)
+        );
+        assert_eq!(
+            detached(&mut table, auth, 0x79),
+            Err(AttachRefusal::Unknown)
+        );
+        assert_eq!(
+            detached(&mut table, auth, 0x78),
+            Err(AttachRefusal::NotAttachable)
+        );
+        // A thread crash badge names a thread, not the process to detach.
+        let crash = table.mint_crash_badge();
+        assert_eq!(
+            detached(&mut table, auth, crash),
+            Err(AttachRefusal::Unknown)
+        );
+        assert_eq!(detached(&mut table, auth, 0x77), Ok(0x77));
+    }
+
+    #[test]
+    fn a_name_walk_pages_every_entry_in_badge_order_once()
+    {
+        let mut table = ProcessTable::new();
+        for badge in [0x30, 0x10, 0x20]
+        {
+            let mut e = entry_with_badge(badge);
+            let mut capture = names::NameCapture::default();
+            capture.feed(&[b'p', u8::try_from(badge).unwrap(), 0]);
+            e.name = capture.name();
+            table.insert(e).unwrap();
+        }
+        let first: Vec<(u64, Vec<u8>)> = table
+            .entries_after(None)
+            .take(2)
+            .map(|e| (e.badge, e.name.as_bytes().to_vec()))
+            .collect();
+        assert_eq!(
+            first,
+            [(0x10, b"p\x10".to_vec()), (0x20, b"p\x20".to_vec())]
+        );
+        let rest: Vec<u64> = table.entries_after(Some(0x20)).map(|e| e.badge).collect();
+        assert_eq!(rest, [0x30]);
+        // A cursor whose process died resumes at the next badge above it.
+        assert_eq!(
+            table.entries_after(Some(0x15)).next().map(|e| e.badge),
+            Some(0x20)
         );
     }
 

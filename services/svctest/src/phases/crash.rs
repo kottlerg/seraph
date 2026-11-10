@@ -16,7 +16,10 @@
 //! fault. Two more children check the registry procmgr keeps of the threads
 //! the runtime spawns (`REGISTER_THREAD`): `crashme registry-main`, whose
 //! main-thread fault's attach lists its two parked threads and not the one
-//! that exited, and `crashme registry-worker`, whose spawned thread faults
+//! that exited, and on which the phase then acts as a debugger
+//! ([`debugger_session`]: `LIST_PROCESSES` names it, and `DETACH_PROCESS`,
+//! then the death of an attach's watch thread, restore a parked thread's
+//! crash binding), and `crashme registry-worker`, whose spawned thread faults
 //! under a crash badge of its own, which names its process and the thread,
 //! its joined sibling no longer listed. procmgr then refuses a registration
 //! from svctest, which declared itself undebuggable. It then ends the
@@ -34,9 +37,9 @@ use std::time::{Duration, Instant};
 
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::{
-    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, EXIT_KILLED, FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM,
-    FAULT_LABEL, FAULT_REPLY_KILL, REGS_RISCV64_SIZE, REGS_X86_64_SIZE, RIGHTS_THREAD,
-    RIGHTS_THREAD_OBSERVE, THREAD_STATE_EXITED,
+    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, EXIT_KILLED, FAULT_CLASS_EXCEPTION,
+    FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL, REGS_RISCV64_SIZE,
+    REGS_X86_64_SIZE, RIGHTS_THREAD, RIGHTS_THREAD_OBSERVE, THREAD_STATE_EXITED,
 };
 
 use crate::bootstrap::Caps;
@@ -316,6 +319,14 @@ fn take_child_fault(endpoint: u64, authority: u64, child: &std::process::Child, 
         if ours
         {
             fault.check(&msg, &reply);
+            if let ChildFault::RegistryMain = fault
+            {
+                debugger_session(
+                    authority,
+                    reply.word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE),
+                    reply.caps(),
+                );
+            }
         }
         for &cap in reply.caps()
         {
@@ -330,6 +341,145 @@ fn take_child_fault(endpoint: u64, authority: u64, child: &std::process::Child, 
         }
     }
     panic!("crash_endpoint: the child's fault never arrived");
+}
+
+/// The badge a debugger's binding carries in [`debugger_session`]: neither a
+/// process badge nor a crash badge, as procmgr requires of a debugger.
+const DEBUGGER_BADGE: u64 = (1 << 62) | 1;
+
+/// The badge `thread`'s exception class is bound under.
+fn exception_badge(thread: u64, what: &str) -> Option<u64>
+{
+    syscall::thread_get_fault_handler(thread, FAULT_CLASS_EXCEPTION)
+        .unwrap_or_else(|e| panic!("crash_endpoint: {what}: reading the binding ({e})"))
+}
+
+/// Walk `LIST_PROCESSES` for `process`; its name.
+fn listed_name(authority: u64, process: u64) -> Option<Vec<u8>>
+{
+    let mut cursor = None;
+    loop
+    {
+        let reply = call(
+            authority,
+            &IpcMessage::builder(procmgr_labels::LIST_PROCESSES)
+                .word(0, u64::from(cursor.is_some()))
+                .word(1, cursor.unwrap_or(0))
+                .build(),
+            "LIST_PROCESSES",
+        );
+        assert_eq!(
+            reply.label,
+            procmgr_errors::SUCCESS,
+            "crash_endpoint: LIST_PROCESSES with the authority"
+        );
+        let words = reply.words();
+        let count = usize::try_from(words.first().copied().unwrap_or(0)).unwrap_or(0);
+        let mut name = [0u8; ipc::svcmgr_labels::NAME_MAX];
+        for i in 0..count
+        {
+            let (badge, len) = procmgr_labels::unpack_list_entry(words, i, &mut name)
+                .expect("crash_endpoint: a LIST_PROCESSES entry");
+            if badge == process
+            {
+                return Some(name[..len].to_vec());
+            }
+            cursor = Some(badge);
+        }
+        if count < procmgr_labels::LIST_PROCESSES_PAGE
+        {
+            return None;
+        }
+    }
+}
+
+/// What a debugger does to `crashme registry-main`, its main thread held at
+/// its fault and `threads` the caps its attach returned: it finds the
+/// process by name (`LIST_PROCESSES`), binds a parked thread's exception
+/// class to an endpoint of its own, and hands the crash binding back
+/// (`DETACH_PROCESS`); then it attaches with a watch, binds the thread
+/// again, and dies, its watch thread exiting, after which procmgr's next
+/// pass restores the binding unasked. procmgr's rebind of the main thread
+/// to the binding it already has cancels nothing, so the fault stays
+/// svctest's to decline.
+fn debugger_session(authority: u64, process: u64, threads: &[u64])
+{
+    assert_eq!(
+        listed_name(authority, process).as_deref(),
+        Some(&b"/programs/crashme"[..]),
+        "crash_endpoint: LIST_PROCESSES names the child by its argv[0]"
+    );
+    let parked = *threads
+        .get(1)
+        .expect("crash_endpoint: a parked thread's cap");
+    let crash_badge = exception_badge(parked, "a parked thread")
+        .expect("crash_endpoint: a registered thread bound to the crash endpoint");
+    let endpoint =
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+            syscall::cap_create_endpoint(slab).ok()
+        })
+        .expect("crash_endpoint: a debugger endpoint");
+    let send = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, DEBUGGER_BADGE)
+        .expect("crash_endpoint: a debugger SEND");
+    let bind = || {
+        syscall::thread_set_fault_handler(parked, send, FAULT_CLASS_EXCEPTION)
+            .expect("crash_endpoint: binding the parked thread");
+        assert_eq!(
+            exception_badge(parked, "the debugger's bind"),
+            Some(DEBUGGER_BADGE)
+        );
+    };
+
+    bind();
+    let reply = call(
+        authority,
+        &IpcMessage::builder(procmgr_labels::DETACH_PROCESS)
+            .word(0, process)
+            .build(),
+        "DETACH_PROCESS",
+    );
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "crash_endpoint: DETACH_PROCESS with the authority"
+    );
+    assert_eq!(
+        exception_badge(parked, "after DETACH_PROCESS"),
+        Some(crash_badge),
+        "crash_endpoint: DETACH_PROCESS restores the crash badge"
+    );
+
+    let debugger = Registrant::spawn();
+    let reply = call(
+        authority,
+        &IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
+            .word(0, process)
+            .word(1, 0)
+            .cap(debugger.thread)
+            .build(),
+        "ATTACH_PROCESS with a watch",
+    );
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "crash_endpoint: an attach with a watch"
+    );
+    for &cap in reply.caps()
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    bind();
+    debugger.end();
+    // The request wakes procmgr's loop, whose pass finds the watch gone
+    // before it serves the request.
+    let _ = listed_name(authority, process);
+    assert_eq!(
+        exception_badge(parked, "after the watch's exit"),
+        Some(crash_badge),
+        "crash_endpoint: the debugger's death restores the crash badge"
+    );
+    let _ = syscall::cap_delete(send);
+    let _ = syscall::cap_delete(endpoint);
 }
 
 /// svctest declared itself undebuggable, so procmgr refuses to register a

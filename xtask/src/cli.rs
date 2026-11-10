@@ -127,6 +127,12 @@ pub enum CliCommand
     /// unstage the fixture again (see xtask/README.md).
     TestDebugPort(TestDebugPortArgs),
 
+    /// Check the GDB stub: stage it and its `gdb-target` process, boot the
+    /// current sysroot once with `--debug-port`, run the host's GDB in batch
+    /// mode against the port, check what it reports, and unstage both
+    /// again (see xtask/README.md).
+    TestGdb(TestGdbArgs),
+
     /// Check the mechanical documentation and source-header rules: Markdown
     /// column limit, file-header layout, `## Summarized By` shape and forward
     /// links, and document reachability from the root README. Runs in CI's
@@ -334,6 +340,12 @@ pub struct RunArgs
     /// localhost:<PORT>`). The console keeps the UART.
     #[arg(long, value_name = "PORT")]
     pub debug_port: Option<u16>,
+
+    /// Stage the GDB stub for this boot, attached to the process named
+    /// NAME (its argv[0]), and print the GDB command line that connects to
+    /// it; the stub is unstaged when QEMU exits. Requires `--debug-port`.
+    #[arg(long, value_name = "NAME", requires = "debug_port")]
+    pub debug_target: Option<String>,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -539,6 +551,32 @@ pub struct TestDebugPortArgs
     /// The host TCP port the debug port is served on.
     #[arg(long, default_value = "4560")]
     pub port: u16,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
+}
+
+// ── TestGdb ──────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestGdbArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// The host TCP port the debug port is served on.
+    #[arg(long, default_value = "4561")]
+    pub port: u16,
+
+    /// The host GDB to run (it must debug the architecture).
+    #[arg(long, default_value = "gdb")]
+    pub gdb: String,
 
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
@@ -759,6 +797,12 @@ pub struct RunParallelArgs
     /// port).
     #[arg(long, value_name = "PORT")]
     pub debug_port: Option<u16>,
+
+    /// Stage the GDB stub for these boots, attached to the process named
+    /// NAME; same semantics as `cargo xtask run --debug-target`. Requires
+    /// `--debug-port`.
+    #[arg(long, value_name = "NAME", requires = "debug_port")]
+    pub debug_target: Option<String>,
 }
 
 // ── KtestTiming ───────────────────────────────────────────────────────────────

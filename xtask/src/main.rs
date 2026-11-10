@@ -31,6 +31,7 @@ mod cli;
 mod commands;
 mod context;
 mod crash_log;
+mod debug_stub;
 mod diag;
 mod disk;
 mod firmware;
@@ -89,6 +90,7 @@ fn main()
         CliCommand::TestCrashReport(args) => commands::test_crash_report::run(args),
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
+        CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
         CliCommand::CommitCheck(args) => commands::pr_check::run_commit_check(&ctx, args),
         CliCommand::PrCheck(args) => commands::pr_check::run_pr_check(&ctx, args),

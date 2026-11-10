@@ -26,6 +26,8 @@ rootfs/
         *.svc
       tests/          # Opt-in test-harness recipes; staged by hand
         *.svc
+      debug/          # The GDB stub's recipe template; staged by xtask (run and
+        gdbstub.svc   #   run-parallel --debug-target, test-gdb), naming its target
   data/
     test.txt          # Marker fixture for svctest fs / namespace phases
 ```

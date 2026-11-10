@@ -217,7 +217,9 @@ guard), `demandpaged` (pager), `fsbench` (FS IPC), and `crashme` (crash endpoint
 recipe granting `debug_authority`, registers as the crash service and takes a `crashme` child's
 forwarded page fault, and the faults of two `registry-*` children, whose attach lists their live
 registered threads and none that exited or was joined, and whose spawned thread's crash badge names
-it; then gives the endpoint back and sees a second child declined by procmgr). The
+it; on the first of those it acts as a debugger, finding the child with `LIST_PROCESSES` and having
+procmgr restore a registered thread it rebound, by `DETACH_PROCESS` and then by an attach's watch
+thread exiting; then gives the endpoint back and sees a second child declined by procmgr). The
 devmgr orphan-teardown phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md)
 driver, and the driver-withdrawal phase three [`test-fault`](../drivers/test-fault/README.md)
 drivers, one of which never reports ready, so the phase waits the fault batch's settle bound

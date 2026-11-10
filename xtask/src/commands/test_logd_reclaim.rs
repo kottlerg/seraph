@@ -196,6 +196,7 @@ fn boot(ctx: &Context, args: &TestLogdReclaimArgs) -> Result<PathBuf>
         x86_paging: args.x86_paging,
         iommu: crate::qemu::Iommu::Attached,
         debug_port: None,
+        debug_target: None,
         display: crate::qemu::BatchDisplay::Headless,
         pass: DEFAULT_PASS_REGEX.to_string(),
         fail: DEFAULT_FAIL_REGEX.to_string(),

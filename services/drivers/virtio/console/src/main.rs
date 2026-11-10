@@ -753,6 +753,19 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
+    // The GDB stub talks to its host through this driver, so a stub attached
+    // to it would stop the thread it then waits on for every packet: declare
+    // this process undebuggable before it spawns a thread
+    // (`procmgr_labels::DECLARE_NO_DEBUG`). A refusal leaves it debuggable.
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe {
+        ipc::ipc_call(
+            info.procmgr_endpoint,
+            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_DEBUG),
+            ipc_buf,
+        )
+    };
+
     let Some(caps) = bootstrap_caps(info, ipc_buf)
     else
     {

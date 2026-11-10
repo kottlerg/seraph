@@ -31,6 +31,9 @@ threads it cannot report is in [docs/operation.md](docs/operation.md).
 crashd/
 ├── Cargo.toml
 ├── README.md
+├── fault-bound/           # The per-fault bound's state, shared with the watchdog (host-tested)
+│   ├── Cargo.toml
+│   └── src/lib.rs
 ├── docs/
 │   ├── block-format.md    # The block's lines and fields: the symbolizer's contract
 │   └── operation.md       # Startup, per-fault handling, bounds, limits
@@ -45,7 +48,10 @@ crashd/
 ```
 
 The block's emitter and the stack scan are `shared/crash-report`
-([shared/crash-report/README.md](../../shared/crash-report/README.md)), host-tested there.
+([shared/crash-report/README.md](../../shared/crash-report/README.md)), host-tested there. The
+state the fault loop and the watchdog share, which generation is being handled and whether the
+watchdog has committed to cancel it, is `fault-bound/`, host-tested there
+([docs/operation.md](docs/operation.md) § Bounds).
 
 ---
 

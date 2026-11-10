@@ -1008,24 +1008,31 @@ fn derive_attach_page(
 }
 
 /// Handle `DECLARE_NO_DEBUG` from the process `badge` names, on its own
-/// procmgr cap: mark it undebuggable, unbind its main thread's exception
-/// class from the crash endpoint, and release every thread it registered,
-/// unbinding each that procmgr bound there; the runtime copies a binding,
-/// unbound, onto the threads it spawns after. Reply `SUCCESS`, or
-/// `INVALID_BADGE` when the badge names no live process
+/// procmgr cap: mark it undebuggable, delete the debugger watch an attach
+/// left, unbind its main thread and every thread it registered from the
+/// crash endpoint and from any debugger (`process::unbind_declared`), and
+/// release the registered threads; the runtime copies a binding, unbound,
+/// onto the threads it spawns after. Reply `SUCCESS`, or `INVALID_BADGE`
+/// when the badge names no live process
 /// (`services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_DEBUG`).
 fn handle_declare_no_debug(badge: u64, ipc_buf: *mut u64, table: &mut process::ProcessTable)
 {
     let code = match table.declare_no_debug(badge)
     {
-        Some(thread) =>
+        Some(declared) =>
         {
-            let _ =
-                syscall::thread_set_fault_handler(thread, 0, syscall_abi::FAULT_CLASS_EXCEPTION);
+            if declared.debugger != 0
+            {
+                let _ = syscall::cap_delete(declared.debugger);
+            }
             if let Some(entry) = table.find_mut_by_badge(badge)
             {
                 let registered = entry.threads.take_all();
-                process::unbind_registered_threads(&registered);
+                process::unbind_declared(entry, declared.thread_cap);
+                for t in &registered
+                {
+                    process::unbind_declared(entry, t.cap);
+                }
                 registered
                     .into_iter()
                     .for_each(process::release_registered_thread);

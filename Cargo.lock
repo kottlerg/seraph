@@ -260,10 +260,15 @@ name = "crashd"
 version = "0.1.2"
 dependencies = [
  "crash-report",
+ "crashd-fault-bound",
  "ipc",
  "syscall",
  "syscall-abi",
 ]
+
+[[package]]
+name = "crashd-fault-bound"
+version = "0.1.2"
 
 [[package]]
 name = "crasher"

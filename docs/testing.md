@@ -98,8 +98,9 @@ sysroot/
 ├── services/                 # long-running userspace services
 │   ├── …
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
-│   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc,
-│   │                         # iommu-vtd | iommu-riscv, and the test-only
+│   │                         # virtio-console, serial, framebuffer,
+│   │                         # cmos-rtc | goldfish-rtc, iommu-vtd |
+│   │                         # iommu-riscv, and the test-only
 │   │                         # test-orphan, test-fault, and test-dma)
 │   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # program binaries and the test fixtures the
@@ -113,6 +114,7 @@ sysroot/
     ├── svctest               # services-surface harness
     ├── usertest              # programs-surface orchestrator
     ├── crasher               # svcmgr restart-path fixture
+    ├── debug-echo            # debug-port fixture (test-debug-port)
     └── programs/
         ├── hello             # per-program tester for /programs/hello
         ├── stdiotest         # per-program tester for /programs/stdiotest
@@ -162,7 +164,8 @@ rootfs/config/svcmgr/
 └── tests/                    # NOT loaded by svcmgr
     ├── svctest.svc
     ├── usertest.svc
-    └── crasher.svc           # restart-path fixture; co-staged with svctest
+    ├── crasher.svc           # restart-path fixture; co-staged with svctest
+    └── debug-echo.svc        # debug-port fixture; staged by test-debug-port
 ```
 
 To enable a harness for a boot, copy its recipe from
@@ -343,6 +346,31 @@ the guest finished. Run with no `--log`, it boots the current sysroot once throu
 logd's query API (#720), which gives a harness a read surface for its slots, is
 the planned successor to this serial-line check.
 
+### Debug port (`test-debug-port`)
+
+The debug port, the byte transport a debugger stub speaks to a host debugger over, is a
+`virtio-console` device that a launch attaches only with `--debug-port`, and whose host end QEMU
+serves as a TCP port
+([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)).
+No guest-side check can show that bytes cross it, since its far end is the host.
+`cargo xtask test-debug-port [--arch]` (both arches) checks the transport host-side:
+
+1. Stage the [`debug-echo`](../services/debug-echo/README.md) fixture's recipe from
+   `/config/svcmgr/tests/` into `/config/svcmgr/services/` and repack `disk.img`.
+2. Boot the current sysroot once with the debug port, and wait for the fixture's
+   `READY on the debug port` line on the serial stream.
+3. Connect to the port and drive one GDB remote serial protocol exchange, framed at both ends by
+   `shared/gdb-rsp`: `qSupported` and `?` in acknowledged mode, a packet with a bad checksum, which
+   must be refused with `-`, the interrupt byte, `QStartNoAckMode`, then in no-ack mode a binary
+   echo of every byte value through the escapes and a packet past the fixture's buffer, which must
+   be refused with `E02`.
+4. Kill QEMU, remove the recipe, and repack `disk.img` again, whatever the outcome.
+
+The host computes the verdict and kills QEMU, as for `test-terminal`; the fixture invokes no
+shutdown. See [xtask/README.md § test-debug-port](../xtask/README.md#cargo-xtask-test-debug-port)
+for the command. No canonical CI cell attaches the debug port, so the boot is the `debug-port`
+device cell of the local and release host runs (Coverage tiers below).
+
 ### One shutdown-invoking harness per boot
 
 `svctest` and `usertest` invoke `pwrmgr` shutdown on completion. Two such
@@ -387,9 +415,9 @@ Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 with the virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64,
 `riscv-iommu-pci` at 00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA
 confinement phase drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no
-framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`, and
-the framebuffer boot, `--display framebuffer`, are device cells, see Device surfaces, Framebuffer
-cell, and Release host runs below),
+framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`,
+the framebuffer boot, `--display framebuffer`, and the debug-port boot, `test-debug-port`, are
+device cells, see Device surfaces, Framebuffer cell, Debug-port cell, and Release host runs below),
 filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
@@ -413,7 +441,7 @@ its own device surface, and variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, and the framebuffer cell) once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -460,7 +488,9 @@ surface.
   included, each through its cells: the release host runs boot every device cell before each tag
   (Release host runs below), and burn-in repeats the canonical cells. The framebuffer driver's
   device, QEMU std VGA, is outside the main set because the canonical boots are headless; the
-  framebuffer cell (Framebuffer cell below) boots it.
+  framebuffer cell (Framebuffer cell below) boots it. The virtio-console driver's device, the debug
+  port, is outside it because only a launch that asks for a debug port attaches it; the
+  debug-port cell (Debug-port cell below) boots it.
 - **Hardware only.** A driver whose device QEMU cannot present has no QEMU cell in either set; its
   README documents a hardware test procedure, and it is exercised on real hardware by that
   procedure. No in-tree driver is in this tier.
@@ -738,8 +768,9 @@ do not make, are owed when, and only when, the PR's own diff makes a non-inert c
 surface that owes them. They are the storage cells of Disk variations below, each on each
 architecture (4kn, the 4Kn disk; second-disk, the data partition on a second disk; shared-line,
 that disk on the first disk's interrupt line; and oversize-block, the refused 8192-byte second
-disk), no-iommu, the no-IOMMU variant of Release host runs below, and framebuffer, the boot of
-Framebuffer cell below, each on each architecture. A
+disk), no-iommu, the no-IOMMU variant of Release host runs below, framebuffer, the boot of
+Framebuffer cell below, and debug-port, the boot of Debug-port cell below, each on each
+architecture. A
 driver's device surface is that driver's code, with the harness check that drives that driver
 alone where its row names one; the storage-wide surface is the code every storage cell runs beside
 its drivers; and the shared surface is what every driver shares, the launchers' attachment of the
@@ -757,6 +788,7 @@ own diff is on.
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
+| virtio-console, the debug port | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), and svctest's DMA confinement check, which drives it (by definition alone: `dma_confinement_phase`) | no-iommu |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
@@ -782,6 +814,7 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs services/vfsd/ \
     xtask/src/disk.rs xtask/src/commands/mkdisk.rs services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/test-dma/ services/drivers/framebuffer/ \
+    services/drivers/virtio/console/ services/debug-echo/ xtask/src/commands/test_debug_port.rs \
     core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/
 D='sys_irq_(register|ack|split)|(un)?route_device_irq|irq_line_count|dispatch_device_irq'
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
@@ -790,7 +823,7 @@ D="$D|plic_[a-z_]+|[A-Z_]*PLIC_[A-Z_]+|require_plic_context|devmgr_(dma_)?(label
 D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV_IOMMU_DEVICE"
 D="$D|test_dma_labels|dma_confinement_phase"
 D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
-D="$D|rebase_framebuffer|framebuffer_above"
+D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
 D="$D|second_disk(_[a-z_]+)?|second_(src|dst|shared_line)"
 D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"
@@ -899,6 +932,20 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 360 \
     --display framebuffer --fail-also 'framebuffer case skipped'
 ```
 
+**Debug-port cell.** One boot, on each architecture, of `cargo xtask test-debug-port` (Debug
+port (`test-debug-port`) above), which attaches the debug port's `virtio-console` device, so
+devmgr binds it, the virtio-console driver runs, and the `debug-echo` fixture answers the host
+over it. It passes when the host's exchange completes; the command stages and unstages its own
+fixture on the current sysroot, a debug-profile build. It bounds the boot to the fixture's ready
+line by five minutes and each answer by twenty seconds, and has no `run-parallel` budget. The
+boot is the debug-port device cell (Device surfaces above).
+
+```sh
+# Debug-port cell, per architecture (clean between architectures):
+cargo xtask build --arch <arch>
+cargo xtask test-debug-port --arch <arch>
+```
+
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
 4), the maintainer MUST run, on the commit to be tagged, the whole boundary set
@@ -906,9 +953,10 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 360 \
 (`--runs 3`) in the debug profile and once each in the release profile
 (`cargo xtask build --release`, then the same `run-parallel` command at
 `--runs 1`, per the boundary commands above), and the memory variation and every device cell (the
-disk variations, the no-IOMMU variant, and the framebuffer cell) once each, so every tag boots at
-each boundary CPU count in both profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk,
-from two disks, with no IOMMU, and with a framebuffer, and runs the timing report on the boundary
+disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once each, so
+every tag boots at each boundary CPU count in both profiles (CI boots release builds only at 4
+CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, and with a debug port,
+and runs the timing report on the boundary
 logs, which is reported and blocks nothing.
 The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture
 with the machine's IOMMU detached, so devmgr's unconfined path still serves every driver (svctest
@@ -1152,6 +1200,8 @@ note in full.
 [programs/threadchurn/README.md](../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
 [services/crasher/README.md](../services/crasher/README.md),
+[services/debug-echo/README.md](../services/debug-echo/README.md),
+[services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),

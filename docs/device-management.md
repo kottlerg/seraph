@@ -437,6 +437,7 @@ init
  │    ├── driver/iommu-riscv       (IOMMU BAR 0 MMIO caps; iommu_labels, devmgr only; riscv64)
  │    ├── driver/virtio-blk        (MMIO + IRQ caps; QUERY_BLOCK_DEVICE)
  │    ├── driver/virtio-input      (MMIO + opt. IRQ; QUERY_INPUT_DEVICE; on-disk)
+ │    ├── driver/virtio-console    (MMIO + opt. IRQ; QUERY_DEBUG_PORT_DEVICE; on-disk)
  │    ├── driver/serial            (UART hw + IRQ caps; QUERY_SERIAL_DEVICE)
  │    ├── driver/framebuffer       (MMIO cap; QUERY_FRAMEBUFFER_DEVICE)
  │    └── driver/{cmos-rtc,goldfish-rtc} (RTC hw cap; QUERY_RTC_DEVICE)
@@ -455,7 +456,8 @@ only after initial enumeration and binding complete. The dependency ordering is 
 init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
 after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
-devmgr spawns one driver for every virtio-input device it enumerates and for every virtio-blk
+devmgr spawns one driver for every virtio-input device it enumerates, for the first
+virtio-console device (the debug port, below), and for every virtio-blk
 device it can give an IRQ cap (virtio-blk requires one; a device on a line another device already
 holds gets a derivation of that line, § Interrupt Delivery), each with its own service endpoint.
 devmgr serves any driver it spawns, those and the serial, framebuffer, and RTC drivers, only once
@@ -477,6 +479,15 @@ withdrawn serial, framebuffer, or RTC driver's query replies `WITHDRAWN` too. vf
 block ordinal from 0, passing a `WITHDRAWN` one, until another reply is not `SUCCESS`, and holds
 every live disk; the terminal sends none, so it binds the first input instance.
 
+The debug port is a byte transport apart from the console's UART, which a debugger stub owns to
+speak to a host debugger: the first virtio-console device devmgr enumerates, driven by the
+[virtio-console driver](../services/drivers/virtio/console/README.md), which serves the serial
+protocol. devmgr hands it out only on `devmgr_labels::QUERY_DEBUG_PORT_DEVICE`, gated on
+`DEBUG_PORT_AUTHORITY`, which svcmgr mints only onto the seed-only `devmgr.debug` name, so only a
+service whose definition seeds that name reaches the port. A machine presents the device only
+when a launch asks for it (`--debug-port`); a boot without it has no debug port, and the query
+replies `NO_DEVICE`. A further console device is left unbound.
+
 ### Driver binary sources
 
 devmgr loads driver binaries from one of two places:
@@ -487,15 +498,17 @@ devmgr loads driver binaries from one of two places:
   its driver maps a ring) ship in the bundle and
   arrive as Memory caps in devmgr's MODULE bootstrap round. devmgr spawns
   them via `procmgr_labels::CREATE_PROCESS` during initial enumeration.
-- **On-disk rootfs** — non-essentials (the per-arch RTC and the [virtio-input keyboard
-  driver](../services/drivers/virtio/input/README.md)) live at `/services/drivers/` and are loaded
+- **On-disk rootfs** — non-essentials (the per-arch RTC, the [virtio-input keyboard
+  driver](../services/drivers/virtio/input/README.md), and the debug port's virtio-console
+  driver) live at `/services/drivers/` and are loaded
   via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan`, `test-fault`, and
   `test-dma` binaries also live there; devmgr spawns them only on
   `devmgr_labels::TEST_SPAWN_ORPHAN`, `TEST_SPAWN_FAULT_DRIVERS`, and `TEST_SPAWN_DMA_DRIVER`
   (gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only `devmgr.test` cap carries), so
-  a boot without svctest spawns none. virtio-input is
-  PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed then — but its
-  spawn is deferred to this path, since a keyboard is not on the read-the-disk critical path. A PCI
+  a boot without svctest spawns none. virtio-input and virtio-console are
+  PCI-enumerated during the initial scan — their BAR/IRQ caps are carved and stashed then — but
+  their spawns are deferred to this path, since neither a keyboard nor the debug port is on the
+  read-the-disk critical path. A PCI
   device devmgr can give no IRQ cap (for instance, its line lies outside the Interrupt range devmgr
   holds) is delivered a bootstrap that names its IRQ slot absent, and its driver polls its queue.
   Post-handover, svcmgr walks its universal root to `/services/drivers/` and hands devmgr that
@@ -509,7 +522,7 @@ devmgr loads driver binaries from one of two places:
   `ipc_reply` and before devmgr returns to its next `ipc_recv`. The spawn is at-most-once per boot;
   on failure (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did
   not report ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on
-  subsequent `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` calls and clients
+  subsequent `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` / `QUERY_DEBUG_PORT_DEVICE` calls and clients
   ([timed](../services/timed/README.md) degrades to its no-RTC path; the terminal, today's only
   `QUERY_INPUT_DEVICE` consumer, logs and exits). Before the spawn has run the reply is the same
   `NO_DEVICE`, so a client that cannot proceed without the device MAY retry a bounded number of
@@ -531,6 +544,7 @@ specified in [`docs/storage.md`](storage.md).
 [Firmware Parsing](../core/boot/docs/firmware-parsing.md),
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
+[Console Model](console-model.md),
 [Memory Model](memory-model.md), [Platform Requirements](platform-requirements.md),
 [Storage](storage.md), [services/devmgr/README.md](../services/devmgr/README.md),
 [devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
@@ -546,6 +560,7 @@ specified in [`docs/storage.md`](storage.md).
 [services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md),
 [services/drivers/test-orphan/README.md](../services/drivers/test-orphan/README.md),
 [services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),
+[services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md),
 [services/drivers/virtio/core/README.md](../services/drivers/virtio/core/README.md),
 [services/drivers/virtio/input/README.md](../services/drivers/virtio/input/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),

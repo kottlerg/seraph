@@ -51,9 +51,9 @@ The multiprocess thread-id form, conditional breakpoints, and run-length encodin
 the packet set: a stub using this crate advertises none of them, and parses no packet that
 carries them.
 
-Consumers: the `debug-echo` fixture ([services/debug-echo/README.md](../../services/debug-echo/README.md))
-in the guest, and `cargo xtask test-debug-port` ([xtask/README.md](../../xtask/README.md)) on the
-host.
+Consumers: the `debug-echo` fixture
+([services/debug-echo/README.md](../../services/debug-echo/README.md)) in the guest, and
+`cargo xtask test-debug-port` ([xtask/README.md](../../xtask/README.md)) on the host.
 
 ---
 

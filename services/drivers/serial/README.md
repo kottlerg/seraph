@@ -65,8 +65,9 @@ init-logd direct-UART fallback → this driver) is described in
 ## Messages
 
 Three synchronous operations. Labels are defined in `shared/ipc::serial_labels`;
-error codes in `shared/ipc::serial_errors`. The service loop never blocks —
-reads drain whatever is buffered and return at once — so a pending read never
+error codes in `shared/ipc::serial_errors`. The debug port's
+[virtio-console driver](../virtio/console/README.md) serves the same three. The service loop
+never blocks — reads drain whatever is buffered and return at once — so a pending read never
 starves writers sharing the endpoint (logd, the terminal's output).
 
 ### Label 1: `SERIAL_WRITE_BYTES`
@@ -181,4 +182,5 @@ implemented.
 [Device Management](../../../docs/device-management.md),
 [programs/terminal/README.md](../../../programs/terminal/README.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
-[Driver Model](../docs/driver-model.md)
+[Driver Model](../docs/driver-model.md),
+[services/drivers/virtio/console/README.md](../virtio/console/README.md)

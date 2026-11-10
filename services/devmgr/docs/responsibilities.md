@@ -93,7 +93,8 @@ devmgr's responsibilities are:
   driver; it restarts nothing ([#262](https://github.com/kottlerg/seraph/issues/262)). See
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming).
 
-  devmgr spawns one driver for every virtio-input device and for every
+  devmgr spawns one driver for every virtio-input device, for the first
+  virtio-console device (the debug port, below), and for every
   virtio-blk device it can give an IRQ cap, each with its own service
   endpoint, an `Mmio` cap for every BAR the device's VirtIO register regions
   name, its own derivation of its line's held `Interrupt` cap, so devices
@@ -129,13 +130,15 @@ devmgr's responsibilities are:
   batch (the IOMMU driver alone, on x86-64, settled first so it is ready
   before any device is attached), the boot batch (every virtio-blk driver,
   then the serial and framebuffer drivers), and the on-disk batch (the RTC
-  driver, then every virtio-input driver). Each driver's devmgr query cap is a
+  driver, then every virtio-input driver, then the virtio-console driver).
+  Each driver's devmgr query cap is a
   SEND, badged with its device badge, on its batch's private endpoint; the
   IOMMU, serial, and RTC drivers' badges name catalog entries that carry no
   startup info. Once a driver's bootstrap is served,
   devmgr binds a death observer on the driver's thread to its driver death
   queue: one queue for the boot, sized at enumeration to every driver the boot
-  can spawn (one per virtio-blk and virtio-input device, the IOMMU, serial,
+  can spawn (one per virtio-blk and virtio-input device, one for the debug
+  port when a virtio-console device is present, the IOMMU, serial,
   framebuffer, and RTC drivers, and the three fixtures of the test-only fault
   batch and the one of the test-only DMA batch below), so every bind is funded
   and no death is dropped. A driver that
@@ -305,9 +308,10 @@ devmgr's responsibilities are:
   `QUERY_BLOCK_DEVICE` probes, and every query of the serial and framebuffer
   drivers, wait in the registry endpoint's queue until then. The on-disk
   batch settles in the `SET_DRIVERS_DIR` handler, after its reply and before
-  the next receive, so `QUERY_RTC_DEVICE` and `QUERY_INPUT_DEVICE` see the
-  settled drivers. While a batch settles, devmgr receives on no registry
-  endpoint, and every registry caller waits for the settle, at most the settle
+  the next receive, so `QUERY_RTC_DEVICE`, `QUERY_INPUT_DEVICE`, and
+  `QUERY_DEBUG_PORT_DEVICE` see the settled drivers. While a batch settles,
+  devmgr receives on no registry endpoint, and every registry caller waits for
+  the settle, at most the settle
   bound plus up to `RESET_TIMEOUT` for each withdrawn `VirtIO` device (all of
   it for one whose status does not read 0 within the bound, above). devmgr
   cannot serve the settled classes meanwhile: it must reply to a received call
@@ -333,11 +337,11 @@ devmgr's responsibilities are:
     `procmgr_labels::CREATE_PROCESS`-ready Memory caps in devmgr's MODULE
     bootstrap round. devmgr spawns these during initial enumeration, before the
     registry loop opens.
-  - **On-disk rootfs** — non-essential drivers (the per-arch RTC and
-    virtio-input) live at `/services/drivers/<driver>` and are loaded via
-    `procmgr_labels::CREATE_FROM_FILE`. virtio-input is PCI-enumerated at
-    boot, with its BAR and IRQ caps carved then and its spawn deferred to
-    this path. svcmgr delivers a `LOOKUP | READ`-attenuated
+  - **On-disk rootfs** — non-essential drivers (the per-arch RTC,
+    virtio-input, and virtio-console) live at `/services/drivers/<driver>` and
+    are loaded via `procmgr_labels::CREATE_FROM_FILE`. virtio-input and
+    virtio-console are PCI-enumerated at boot, with their BAR and IRQ caps
+    carved then and their spawns deferred to this path. svcmgr delivers a `LOOKUP | READ`-attenuated
     `/services/drivers/` subtree cap via `devmgr_labels::SET_DRIVERS_DIR`
     after handover (gated by `DRIVERS_DIR_AUTHORITY`); devmgr replies
     SUCCESS immediately (so svcmgr never blocks on driver work), then walks
@@ -345,9 +349,9 @@ devmgr's responsibilities are:
     `ipc_recv`, settling the on-disk batch there (above). Each spawn is
     at-most-once per boot; failure, including an on-disk driver's death, or
     its overrun of the settle bound, before it reports ready, is sticky and
-    surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_RTC_DEVICE`
-    and `QUERY_INPUT_DEVICE` queries, the same reply as before the spawn has
-    run, so a client retries it only a bounded number of times. See
+    surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_RTC_DEVICE`,
+    `QUERY_INPUT_DEVICE`, and `QUERY_DEBUG_PORT_DEVICE` queries, the same reply
+    as before the spawn has run, so a client retries it only a bounded number of times. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
@@ -368,6 +372,13 @@ devmgr's responsibilities are:
   framebuffer, RTC, and input queries are gated on `REGISTRY_QUERY_AUTHORITY`,
   which every consumer query cap carries: svcmgr's `devmgr.*` publications,
   the cap svcmgr mints for logd at launch, and vfsd's.
+  `QUERY_DEBUG_PORT_DEVICE` answers with the debug port: the first
+  virtio-console device's driver, which serves the serial protocol
+  ([services/drivers/virtio/console/README.md](../../drivers/virtio/console/README.md)),
+  a byte transport apart from the console's UART that a debugger stub owns. Its
+  reply reads and writes the port, so it is gated on `DEBUG_PORT_AUTHORITY`,
+  which svcmgr mints only onto the seed-only `devmgr.debug` name; a further
+  console device is left unbound, and a boot with none has no debug port.
 - **Broker ACPI and shutdown hardware to pwrmgr** — devmgr is the sole
   owner of the ACPI Memory caps and the only service that walks the ACPI
   table tree (RSDP → XSDT). `QUERY_ACPI_TABLE` locates a table by
@@ -470,6 +481,7 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [services/drivers/test-dma/README.md](../../drivers/test-dma/README.md),
 [services/drivers/test-fault/README.md](../../drivers/test-fault/README.md),
 [services/drivers/virtio/blk/README.md](../../drivers/virtio/blk/README.md),
+[services/drivers/virtio/console/README.md](../../drivers/virtio/console/README.md),
 [services/drivers/virtio/input/README.md](../../drivers/virtio/input/README.md),
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),

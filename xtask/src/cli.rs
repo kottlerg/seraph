@@ -59,6 +59,12 @@ pub enum CliCommand
     /// the command. See xtask/README.md for the tables and the baseline format.
     KtestTiming(KtestTimingArgs),
 
+    /// Resolve runtime addresses in a loaded ELF image (a binary, or the
+    /// sysroot's kernel) to function, file, and line from its DWARF, or to the
+    /// nearest function symbol when no DWARF covers an address. Each output
+    /// line names the source it used. See xtask/README.md.
+    Symbolize(SymbolizeArgs),
+
     /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
     /// and regenerate `disk.img` without invoking cargo. The mirror is
     /// authoritative over `config/`+`data/` (deletions in `rootfs/` are
@@ -691,6 +697,37 @@ pub struct KtestTimingArgs
     /// base, or the baseline's) by at least this many seconds.
     #[arg(long, default_value = "1.0")]
     pub min_secs: f64,
+}
+
+// ── Symbolize ─────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct SymbolizeArgs
+{
+    /// The ELF image the addresses fall in (a sysroot binary, or its build
+    /// output under `target/`).
+    #[arg(long, value_name = "PATH", required_unless_present = "kernel")]
+    pub binary: Option<PathBuf>,
+
+    /// Resolve against the sysroot's kernel image
+    /// (`sysroot/esp/EFI/seraph/kernel`).
+    #[arg(long, conflicts_with = "binary")]
+    pub kernel: bool,
+
+    /// Load bias, in hex: the runtime address of the image's link address 0
+    /// (a PIE's `image bias=` log value, the kernel's `kaslr: slide=` value).
+    #[arg(long, value_name = "HEX", default_value = "0", value_parser = parse_hex_arg)]
+    pub bias: u64,
+
+    /// Runtime addresses to resolve, in hex (`0x` optional).
+    #[arg(required = true, value_name = "ADDR", value_parser = parse_hex_arg)]
+    pub addresses: Vec<u64>,
+}
+
+/// Clap value parser for a hex address.
+fn parse_hex_arg(text: &str) -> Result<u64, String>
+{
+    crate::symbolize::parse_hex(text).map_err(|err| format!("{err:#}"))
 }
 
 // ── LintDocs ──────────────────────────────────────────────────────────────────

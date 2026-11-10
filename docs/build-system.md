@@ -23,6 +23,14 @@ components must be installed:
 
 Run `rustup show` in the repository root to confirm the toolchain is active.
 
+`cargo xtask symbolize` reads DWARF and symbol tables in Rust (the `addr2line` and `object` crates
+of xtask's dependencies), so symbolizing needs no host tool beyond the toolchain. Debugging a guest
+through QEMU's gdbstub ([testing.md § Troubleshooting](testing.md#troubleshooting)) needs a host
+GDB that supports the guest's architecture: a riscv64 guest needs a GDB built for RISC-V as well
+as the host, such as one configured with `--enable-targets=all` or a distribution's multi-target
+package (`gdb-multiarch` on Debian and Ubuntu). `gdb -batch -ex 'set architecture riscv:rv64'`
+fails on a GDB without it.
+
 ---
 
 ## Workspace Structure

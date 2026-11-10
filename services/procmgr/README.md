@@ -28,8 +28,9 @@ procmgr/
 │                                 the create-request cap split, the
 │                                 fs-reply bounds, the init-reap state
 │                                 machine, the first death queue's
-│                                 size (`FIRST_POOL_OBSERVERS`), and the
-│                                 attach refusals and image span
+│                                 size (`FIRST_POOL_OBSERVERS`), the
+│                                 attach refusals and image span, and
+│                                 the thread registry and crash badges
 ├── src/
 │   ├── main.rs                 # main() (std runtime), IPC dispatch loop
 │   ├── crash.rs                # Crash endpoint, its decliner, the handover
@@ -99,6 +100,12 @@ procmgr/
   a process opts out of both. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § Crash Endpoint and Debug
   Authority.
+- **Thread registry** — keep a cap of each thread a process's runtime
+  spawns, which the thread hands over itself (`REGISTER_THREAD`), bounded
+  per process, so `ATTACH_PROCESS` lists every live thread; bind each such
+  thread's exception class under a crash badge of its own, so a fault names
+  its thread. See [docs/ipc-interface.md](docs/ipc-interface.md) § Label 22:
+  `REGISTER_THREAD`.
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff during
   init's Handover stage
   ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover):

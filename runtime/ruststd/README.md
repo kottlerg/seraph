@@ -392,6 +392,57 @@ bind its fault or upcall handlers, read its registers, or post it an upcall
 the `deadline` fixture's supervisor bounds a spinning worker this way
 ([programs/deadline/README.md](../../programs/deadline/README.md)).
 
+The reclaim of a spawned thread, by its `join` or by the reaper after a detach, revokes every cap
+derived from the spawned thread's cap before it deletes that cap: the copy the thread registered
+with procmgr (§ Thread registration), the copies `ATTACH_PROCESS` derived from it for a debugger or
+the crash service, and any a process derived itself. A derived cap is therefore gone once the
+thread is reclaimed, and the Thread object and its slab run are freed then, as without one.
+
+## Thread registration
+
+Each thread `std::thread::spawn` creates registers itself with procmgr before it runs its code:
+its trampoline, once its IPC buffer is set, derives a copy of its own cap with `RIGHTS_THREAD` and
+sends it with `REGISTER_THREAD` on the process's procmgr cap
+([procmgr IPC Interface](../../services/procmgr/docs/ipc-interface.md) § Label 22:
+`REGISTER_THREAD`). procmgr keeps it, so `ATTACH_PROCESS` lists the thread to a debugger and to the
+crash service, and binds the thread's exception class under a crash badge of its own, so a fault of
+the thread names it (`register_with_procmgr` in `src/sys/thread/seraph.rs`). The registration costs
+one IPC per spawn and nothing on any path that does not spawn. A process procmgr did not create,
+whose `ProcessInfo` names no procmgr endpoint (procmgr and memmgr), sends none. A refusal or a
+failed call leaves the thread unregistered, and it runs as before, its faults reported without
+registers; a `NOT_ATTACHABLE` refusal, from a process that declared itself undebuggable
+(`DECLARE_NO_DEBUG`), stops every later registration of the process, since the declaration is
+one-way, so a declared process registers nothing.
+
+The new thread makes the call, not its spawner, so a spawner never waits on procmgr. A thread
+spawned while procmgr is blocked on a request to the same process waits in its registration until
+procmgr returns, before running any of its code. Two such spawns exist, and neither can deadlock,
+since procmgr's request does not wait on the new thread:
+
+- **fatfs's release watchdog.** procmgr reads a binary through fatfs (`CREATE_FROM_FILE`), and
+  fatfs's eviction worker spawns a watchdog thread to send a client `FS_RELEASE_MEMORY` and waits
+  for it at most `RELEASE_TIMEOUT_MS` (100 ms) before it revokes the page anyway
+  ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md) § Driver-to-client
+  release; `services/fs/fat/src/eviction.rs`). The read procmgr waits
+  on is served by fatfs's main thread, which answers a request that finds the cache full with an
+  error at once rather than waiting for the eviction worker, so procmgr's read returns whatever the
+  watchdog does. A watchdog held in its registration past the worker's bound turns that release
+  into the worker's revoke without the client's acknowledgement, the path a client that does not
+  answer takes; it holds one of the worker's `MAX_WATCHDOGS` slots meanwhile, past which a release
+  revokes at once.
+- **logd's resync helper.** procmgr writes its log through logd, and logd's main thread spawns the
+  helper that walks `QUERY_LIVE_PROCESSES` after its death queue may have dropped a post
+  ([services/logd/docs/ipc-interface.md](../../services/logd/docs/ipc-interface.md) § Death-queue
+  resync). logd declared itself undebuggable, so only its first spawned thread sends a registration,
+  and the helper exists to call procmgr: its registration waits on procmgr exactly as its query
+  would, while logd's main thread, which serves procmgr's write, goes on without it.
+
+Two patterns would deadlock, and no in-tree process follows either: a spawner that waits on its new
+thread without bound while procmgr waits on that spawner; and a process that hands procmgr a cap
+which a newly spawned thread serves (a file or node for `CREATE_FROM_FILE`, say) before that
+thread's registration has been served, so procmgr's call on the cap waits on a thread that waits on
+procmgr.
+
 ---
 
 ## Implementation order
@@ -412,6 +463,7 @@ primitives.
 | [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault reply: `FAULT_REPLY_FORWARD` declines an unregistered guard-page fault, which the exception handler declines in turn, killing the faulting thread as an unhandled fault |
 | [docs/capability-model.md](../../docs/capability-model.md) | "Kill process" pattern: a terminal fault on any thread tears down the whole process |
 | [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS`, `REGISTER_REGION`/`UNREGISTER_REGION` |
+| [services/procmgr/docs/ipc-interface.md](../../services/procmgr/docs/ipc-interface.md) | `REGISTER_THREAD`, which each spawned thread sends, and the `CREATE_FROM_FILE` a spawn sends |
 | [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo` layout and version gating |
 | [shared/process-layout/README.md](../../shared/process-layout/README.md) | The stack reservation below every main-thread stack top; `main_stack_growth` |
 
@@ -421,7 +473,8 @@ primitives.
 
 [abi/process-abi/README.md](../../abi/process-abi/README.md),
 [Fault Handling](../../docs/fault-handling.md),
-[Namespace Model](../../docs/namespace-model.md), [Storage](../../docs/storage.md),
+[Namespace Model](../../docs/namespace-model.md),
+[Process Lifecycle](../../docs/process-lifecycle.md), [Storage](../../docs/storage.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
 [programs/threadchurn/README.md](../../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../../programs/threadstack/README.md),

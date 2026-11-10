@@ -51,11 +51,12 @@ The block's emitter and the stack scan are `shared/crash-report`
 
 ## Testing
 
-The `crashme` fixture faults on purpose in both kinds
+The `crashme` fixture faults on purpose in both kinds, on its main thread and on a spawned one
 ([programs/crashme/README.md](../../programs/crashme/README.md)); the usertest boot runs it, and
 `cargo xtask test-crash-report` checks the blocks in that boot's log
 ([docs/testing.md](../../docs/testing.md) § Crash reports). svctest's `crash_endpoint` phase drives
-procmgr's side, registration, handover, and take-back, with svctest as the crash service.
+procmgr's side, registration, handover, and take-back, and the thread list and crash badges an
+attach returns, with svctest as the crash service.
 
 ---
 
@@ -67,7 +68,7 @@ procmgr's side, registration, handover, and take-back, with svctest as the crash
 | [docs/operation.md](docs/operation.md) | Startup, per-fault handling, bounds, limits |
 | [docs/fault-handling.md](../../docs/fault-handling.md) | § Crash Reports, § Reply (`FAULT_REPLY_FORWARD`), § Asynchronous Upcalls |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | § Process Death |
-| [services/procmgr/docs/ipc-interface.md](../procmgr/docs/ipc-interface.md) | `REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `DECLARE_NO_DEBUG` |
+| [services/procmgr/docs/ipc-interface.md](../procmgr/docs/ipc-interface.md) | `REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `DECLARE_NO_DEBUG`, `REGISTER_THREAD` |
 | [services/svcmgr/docs/service-definitions.md](../svcmgr/docs/service-definitions.md) | `debug_authority` |
 | [docs/testing.md](../../docs/testing.md) | § Crash reports |
 

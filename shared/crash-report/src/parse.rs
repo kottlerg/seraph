@@ -107,7 +107,10 @@ impl Block
         self.require_dec("badge")?;
         let arch = Arch::from_name(self.require("arch")?)
             .ok_or_else(|| Defect::Malformed("arch".to_string()))?;
-        let thread = self.require_one_of("thread", &["main", "unidentified"])?;
+        // A `thread` value this reader does not know is a thread it requires
+        // no registers of, as for `unidentified`: a value a later writer adds
+        // does not bump the format's version (block-format.md § Lines).
+        let thread = self.require("thread")?;
         let status = self.require_one_of("status", &["complete", "unattached", "timeout"])?;
         if self.require_one_of("kind", &["vm", "exception"])? == "vm"
         {
@@ -127,7 +130,7 @@ impl Block
             text.split_once('-')
                 .and_then(|(a, b)| Some((parse_hex(a)?, parse_hex(b)?)))
                 .ok_or_else(|| Defect::Malformed("text".to_string()))?;
-            if thread == "main"
+            if matches!(thread, "main" | "spawned")
             {
                 for name in arch.register_names()
                 {

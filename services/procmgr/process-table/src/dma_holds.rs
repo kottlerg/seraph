@@ -216,6 +216,7 @@ mod tests
             dma_hold,
             no_debug: false,
             image: crate::ImageSpan::default(),
+            threads: crate::ThreadRegistry::new(),
         }
     }
 

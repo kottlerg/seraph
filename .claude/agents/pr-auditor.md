@@ -211,13 +211,10 @@ A per-section verdict, each PASS or FAIL: PR-body checklist; per-issue
 closure with per-criterion lines; silent-deferral scan (FAIL on any
 unreconciled hit); test-plan honesty (FAIL on any bare tick);
 commit-message compliance; validation claim; PR-body claims; and, in an
-auditor-only run, auditor-only checks. When invoked with a
-structured-output schema, fill it instead of the prose: one output section
-for each section named above, with its verdict and items, and the overall
-verdict; there is no final line in schema mode.
+auditor-only run, auditor-only checks.
 
-**In prose mode the final line MUST be exactly one of:** `AUDIT PASS`,
-`AUDIT FAIL`. Any FAIL section forces `AUDIT FAIL`.
+**The final line MUST be exactly one of:** `AUDIT PASS`, `AUDIT FAIL`.
+Any FAIL section forces `AUDIT FAIL`.
 
 ## Tool discipline
 

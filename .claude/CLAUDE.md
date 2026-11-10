@@ -76,39 +76,34 @@ truth for "how work is tracked and shipped" on this project.
   tracks, the recording of findings, and the merge-prompt condition are
   owned by [docs/conventions.md](../docs/conventions.md) § Branch and PR
   Workflow; this section gives only the assistant's mechanics. The review
-  is the saved `pr-review` workflow; this bullet is the maintainer's
+  is `@pr-reviewer` and `@pr-auditor` invoked directly in parallel (single
+  message, two `Agent` tool calls); this bullet is the maintainer's
   standing request to run it, each run preceded by `git fetch origin` (the
   auditor reads the PR's own diff against `origin/master` and does not
-  fetch):
-  `Workflow({name: "pr-review", args: {pr: <N>, mode: "full"}})` for the
-  first run on a PR (a later full run adds `ledger` once one exists), then
-  `mode: "delta"` with `since` the head the last run with the reviewer
-  reviewed, and `ledger` the ledger file built below. The named workflow is
-  the copy the session loaded at its start: when the script changed since,
-  pass `scriptPath` with the file's path instead of `name`. The workflow's
-  header comment describes what it does. Save the report as
-  `target/xtask/review/pr<N>/<mode>-<head>.md` and the whole returned
-  object as `<mode>-<head>.json` beside it (the ledger command below reads
-  its `verdict`, `stats`, `findings`, `recorded`, and `dropped`), and
-  surface both verdict lines to the user verbatim. If the Workflow tool is
-  unavailable (the directly invoked agents are then the review, per that
-  section), invoke `@pr-reviewer` and `@pr-auditor` directly in parallel
-  (single message, two `Agent` tool calls) with the PR number as scope,
-  the open Issue list (`gh issue list --state open --limit 500 --json
-  number,title`), the ledger path once one exists, and, for a delta run,
-  the `since` head and the merge bases at `since` and at the head
-  (`git merge-base <sha> origin/master` for each); save the reviewer's
-  findings (status `unverified`, since no refuter judged them, or `nit`
-  for a nit that cannot block), the recorded and dropped ones, the
-  ledger-flagged ones its `Ledger (not re-raised)` heading lists as
-  `ledgered`, the `verdict`, the head as `stats.head`, and the agents that
-  returned no result as `stats.failed`, as `<mode>-<head>.json` in the
-  workflow's shape, so the ledger command and the auditor-only run read a
-  fallback run too, and apply the same verdict handling.
+  fetch). Give both the PR number as scope and the open Issue list
+  (`gh issue list --state open --limit 500 --json number,title`), and the
+  reviewer the ledger path once one exists and, for a `delta` run (every
+  run after the first, `since` the head the last run with the reviewer
+  reviewed), the `since` head and the merge bases at `since` and at the
+  head (`git merge-base <sha> origin/master` for each). Save both agents'
+  prose as `target/xtask/review/pr<N>/<mode>-<head>.md`, `<mode>` being
+  `full` for the first run and `delta` after it, and surface both verdict
+  lines to the user verbatim. Save the run record beside it as
+  `<mode>-<head>.json`, one JSON object with these keys: `verdict` and
+  `audit_verdict`, the two verdict lines; `audit`, the audit's `verdict`
+  and its `sections`, each with `name`, `verdict`, and `items`;
+  `findings`, the reviewer's findings on the surface, each with `file`,
+  `line`, `class`, `bucket`, `must_violation`, `status`, `issue`, `claim`,
+  and `fix`, `status` being `unverified` (no refuter judges a PR run's
+  findings), `nit` for a nit that cannot block, or `contested` once the
+  finding is put to the user as contested; `recorded`, the findings off
+  the surface, in the same shape; `ledgered`, the ones its `Ledger (not
+  re-raised)` heading lists; `dropped`, empty; and `stats` with `mode`,
+  `head`, `since`, and `failed` (the agents that returned no result). The
+  ledger command below and the auditor-only run read these records.
 
-  Before each run after the first (every `delta` run, and a `full` run
-  once a record exists), build the ledger that section names from every
-  saved run record of the PR:
+  Before each run after the first, build the ledger that section names
+  from every saved run record of the PR:
 
   ```sh
   jq -s '[.[] | .stats.head[0:8] as $run
@@ -161,8 +156,8 @@ truth for "how work is tracked and shipped" on this project.
   mechanics, `git grep -n` the tracked tree for every other statement of
   it, and update each copy in the same push.
 
-  After the fixes are pushed and CI is green again, run the workflow in
-  `delta` mode, or, when the last run with the reviewer completed with no
+  After the fixes are pushed and CI is green again, run the review again
+  as a `delta` run, or, when the last run with the reviewer completed with no
   failed agent and the fix round's delta since it is documentation or
   comments only and merges no `master` in, the auditor-only run that
   section allows: `@pr-auditor` alone, told it is that run, with the PR
@@ -175,14 +170,19 @@ truth for "how work is tracked and shipped" on this project.
   [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow
   gives it, and surface both verdict lines to the user verbatim. Any later
   delta that changes anything but documentation or comments, or merges
-  `master` in, takes the workflow in `delta` mode again, `since` the head
-  of the last run with the reviewer.
+  `master` in, takes a `delta` run with the reviewer again, `since` the
+  head of the last run with the reviewer.
 
   Prompt for the merge decision only under that section's
   merge-prompt condition; when a `NON-BLOCKING ISSUES ONLY` run meets it,
   offer one more fix round beside the merge. Merge via
   `gh pr merge <N> --merge --delete-branch` (per
   [docs/conventions.md](../docs/conventions.md) § Merge method).
+- At release time the `release-review` workflow
+  (`.claude/workflows/release-review.js`) reviews the release candidate, as
+  [docs/conventions.md](../docs/conventions.md) § Release Production
+  requires and `.claude/skills/orchestrate/SKILL.md` § Release review
+  describes; it is not a PR review.
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.
 - The assistant MUST NOT merge a PR while its CI run is pending or failing (CI gates

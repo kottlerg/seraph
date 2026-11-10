@@ -51,7 +51,7 @@ pub fn parse_u64(digits: &[u8]) -> Result<u64, Error>
 /// - `Overflow`: `out` is shorter than the decoded bytes.
 pub fn decode(hex: &[u8], out: &mut [u8]) -> Result<usize, Error>
 {
-    if hex.len() % 2 != 0
+    if !hex.len().is_multiple_of(2)
     {
         return Err(Error::Malformed);
     }

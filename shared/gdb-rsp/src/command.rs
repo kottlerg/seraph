@@ -433,19 +433,13 @@ fn parse_signal(digits: &[u8]) -> Result<u8, Error>
 /// `<signal>[;addr]`, after the `C` or `S`.
 fn signal_then_addr(rest: &[u8]) -> Result<Option<u64>, Error>
 {
-    match rest.iter().position(|&b| b == b';')
+    let (signal, addr) = match rest.iter().position(|&b| b == b';')
     {
-        Some(i) =>
-        {
-            parse_signal(&rest[..i])?;
-            parse_u64(&rest[i + 1..]).map(Some)
-        }
-        None =>
-        {
-            parse_signal(rest)?;
-            Ok(None)
-        }
-    }
+        Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+        None => (rest, None),
+    };
+    parse_signal(signal)?;
+    addr.map(parse_u64).transpose()
 }
 
 /// An address that may be absent (`c`, `s`).
@@ -471,7 +465,7 @@ fn addr_len(field: &[u8]) -> Result<(u64, u64), Error>
 /// Hex data: an even count of hex digits.
 fn hex_data(data: &[u8]) -> Result<&[u8], Error>
 {
-    if data.len() % 2 != 0 || data.iter().any(|&b| nibble(b).is_none())
+    if !data.len().is_multiple_of(2) || data.iter().any(|&b| nibble(b).is_none())
     {
         return Err(Error::Malformed);
     }

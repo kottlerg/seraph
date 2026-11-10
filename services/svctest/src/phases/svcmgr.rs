@@ -217,6 +217,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         ipc::published_names::DEVMGR_REGISTRY,
         ipc::published_names::DEVMGR_SHUTDOWN,
         ipc::published_names::DEVMGR_TEST,
+        ipc::published_names::DEVMGR_DEBUG,
         ipc::published_names::VFSD_MOUNT,
         ipc::published_names::VFSD_DENY,
     ]

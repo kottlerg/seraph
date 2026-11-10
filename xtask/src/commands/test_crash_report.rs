@@ -34,7 +34,7 @@ use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_outcome};
 use crate::crash_log::reclaimed_names;
 use crate::util::step;
 
-/// The log name of the fixture whose two reports the usertest boot leaves.
+/// The log name of the fixture whose three reports the usertest boot leaves.
 const FIXTURE: &str = "crashme";
 
 /// The kernel's decline line, up to its reason

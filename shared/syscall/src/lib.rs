@@ -2157,7 +2157,9 @@ pub fn ioport_bind(thread_cap: u64, ioport_cap: u64) -> Result<(), i64>
 /// outcome takes effect at the next [`thread_start`], which kills the thread
 /// on a kill outcome and resumes its faulting instruction on
 /// `FAULT_REPLY_RESUME` (docs/fault-handling.md § Delivery, Resume, and
-/// Kill).
+/// Kill). A thread blocked in an upcall delivery is never killed: whatever
+/// the outcome, the upcall is settled or dropped and the start resumes the
+/// thread at its registers (docs/fault-handling.md § Asynchronous Upcalls).
 ///
 /// If the thread is running on another CPU, the call returns once that CPU
 /// has descheduled it and published its register save, or once an object
@@ -2247,8 +2249,9 @@ pub fn thread_set_affinity(thread_cap: u64, cpu_id: u32) -> Result<(), i64>
 /// which of its badged caps the binder bound (see [`syscall_abi::FAULT_LABEL`]
 /// and `docs/fault-handling.md` § Security). `fault_class_mask` selects the
 /// covered fault classes: [`syscall_abi::FAULT_CLASS_ALL`], or a nonzero
-/// combination of [`syscall_abi::FAULT_CLASS_VM`] and
-/// [`syscall_abi::FAULT_CLASS_EXCEPTION`]; the classes it leaves out keep their
+/// combination of [`syscall_abi::FAULT_CLASS_VM`],
+/// [`syscall_abi::FAULT_CLASS_EXCEPTION`], and
+/// [`syscall_abi::FAULT_CLASS_UPCALL`]; the classes it leaves out keep their
 /// bindings.
 ///
 /// Requires `CONTROL` on `thread_cap`. See `docs/fault-handling.md`.
@@ -2284,9 +2287,10 @@ pub fn thread_set_fault_handler(
 /// (`SYS_THREAD_GET_FAULT_HANDLER`): `Some(badge)` when the class is bound,
 /// with the badge bound with it, `None` when it is not.
 ///
-/// `class` is exactly one class bit, [`syscall_abi::FAULT_CLASS_VM`] or
-/// [`syscall_abi::FAULT_CLASS_EXCEPTION`]. Requires `CONTROL` on
-/// `thread_cap`. See `docs/fault-handling.md` § Fault-Handler Binding.
+/// `class` is exactly one class bit, [`syscall_abi::FAULT_CLASS_VM`],
+/// [`syscall_abi::FAULT_CLASS_EXCEPTION`], or
+/// [`syscall_abi::FAULT_CLASS_UPCALL`]. Requires `CONTROL` on `thread_cap`.
+/// See `docs/fault-handling.md` § Fault-Handler Binding.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidArgument` (`class` not one
@@ -2519,9 +2523,9 @@ pub unsafe fn thread_write_regs_raw(thread_cap: u64, buf: *const u8, len: usize)
 /// thread has exited, has no address space, or its address space's teardown
 /// has begun), `InvalidArgument` (a length of 0 or above
 /// `MAX_THREAD_MEM_COPY`), or `InvalidAddress` (either range is not wholly in
-/// the user half, a page of the target range is unmapped or device memory,
-/// or a fault on `buf` is unhandled: the call is restartable, as
-/// [`thread_read_regs`] states).
+/// the user half, a page of the target range is unmapped, device memory, or
+/// above the top of RAM, or a fault on `buf` is unhandled: the call is
+/// restartable, as [`thread_read_regs`] states).
 #[inline]
 pub fn thread_read_mem(thread_cap: u64, va: u64, buf: &mut [u8]) -> Result<u64, i64>
 {

@@ -34,8 +34,9 @@ Seraph uses the `SYSCALL`/`SYSRET` instructions on x86-64.
 | `r11` | Clobbered by `SYSCALL` (holds saved rflags); not an argument register |
 
 All other registers are preserved across a syscall, except the extra return registers
-the IPC calls name (`r9` for `SYS_IPC_CALL`; `rsi` and `r8` for `SYS_IPC_RECV`). The
-callee-saved set matches the System V AMD64 ABI (`rbx`, `rbp`, `r12`–`r15`).
+the IPC calls name (`r9` for `SYS_IPC_CALL`; `rsi` and `r8` for `SYS_IPC_RECV`; `rsi` for
+`SYS_EVENT_RECV`). The callee-saved set matches the System V AMD64 ABI (`rbx`, `rbp`,
+`r12`–`r15`).
 
 **Return values:**
 
@@ -43,8 +44,8 @@ callee-saved set matches the System V AMD64 ABI (`rbx`, `rbp`, `r12`–`r15`).
   On success, `rax` holds the non-negative result (or zero if the call has no result).
 - `rdx`: secondary return value (e.g. the label from `ipc_recv`, the acquired bits from
   `notification_wait`). A call with no secondary result leaves `rdx` unchanged. The IPC
-  calls also return values in `rsi`, `r8` and `r9`: see § `SYS_IPC_CALL` (0) and
-  § `SYS_IPC_RECV` (2).
+  calls also return values in `rsi`, `r8` and `r9`: see § `SYS_IPC_CALL` (0),
+  § `SYS_IPC_RECV` (2), and § `SYS_EVENT_RECV` (6).
 
 **Errno convention:** The kernel returns the error code directly in `rax` as a
 negative `i64`. There is no `errno` global — callers check the sign of `rax`.
@@ -65,9 +66,9 @@ Seraph uses the `ECALL` instruction on RISC-V. The trap handler in `stvec` dispa
 | `a5` | Argument 5 |
 
 All other registers are preserved, except the extra return registers the IPC calls name
-(`a2` for `SYS_IPC_CALL`; `a2` and `a3` for `SYS_IPC_RECV`). Callee-saved registers are
-`s0`–`s11` and `sp` (matching the RISC-V calling convention); the kernel also restores
-`ra`.
+(`a2` for `SYS_IPC_CALL`; `a2` and `a3` for `SYS_IPC_RECV`; `a2` for `SYS_EVENT_RECV`).
+Callee-saved registers are `s0`–`s11` and `sp` (matching the RISC-V calling convention); the
+kernel also restores `ra`.
 
 **Return values:** `a0` is the primary return value (negative on error). `a1` is the
 secondary return value where applicable.
@@ -437,8 +438,10 @@ cap-transfer result block (count, then the delivered destination handles) at wor
 (the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive
 that passes its capability check and cap-slot pre-allocation while a reply is still pending first
 releases the pending caller (a receive refused before then leaves the binding): its
-`SYS_IPC_CALL` returns `Interrupted`, and a fault-blocked caller is killed as for any cancelled
-fault episode. The binding is therefore never overwritten
+`SYS_IPC_CALL` returns `Interrupted`, a fault-blocked caller is killed as for any cancelled
+fault episode, and a caller blocked in an upcall delivery has its upcall dropped and resumes
+([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
+Upcalls). The binding is therefore never overwritten
 ([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model).
 
 For a call, the badge is the value attached to the sender's endpoint capability via
@@ -1219,7 +1222,8 @@ physical addresses.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 W^X is enforced on the new flags. The requested permissions must be a subset of the
-`memory_cap`'s rights, which are re-checked here.
+`memory_cap`'s rights, which are re-checked here. Only the permissions change: each page keeps
+its memory type, so an uncacheable `SYS_MMIO_MAP` page stays uncacheable.
 
 A protect to executable synchronises instruction fetch on every CPU before the first leaf turns
 executable, also when the pages are executable already: a process that wrote code through a
@@ -1433,12 +1437,16 @@ object),
 Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling,
 or, with `THREAD_START_SUSPENDED`, a configured `Created` thread to `Stopped`.
 Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
-handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` with no exception
-handler bound), kills it as an unhandled fault, which posts its
-death and address-space observers, or, for the fault of a restartable syscall's user copy, fails
-that syscall with `InvalidAddress` (see
+handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` of a delivery other
+than a virtual-memory one, or of one with no exception handler bound), kills it as an unhandled
+fault, which posts its death and address-space observers, or, for the fault of a restartable
+syscall's user copy, fails that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
-Resume, and Kill).
+Resume, and Kill). An upcall delivery (`FAULT_KIND_UPCALL`) is no fault: one a stop cancelled,
+or that the claiming reply declined (`FAULT_REPLY_KILL`, or `FAULT_REPLY_FORWARD`, which is a
+decline for an upcall), drops the upcall, and the start resumes the thread at its registers
+([docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
+Upcalls).
 A stopped thread whose blocked syscall a waker claimed before the stop is restarted only once that
 waker's wake has landed, so the resumed syscall returns the delivered result (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
@@ -1504,7 +1512,12 @@ fault first keeps that reply's outcome: when next started it resumes its faultin
 `FAULT_REPLY_RESUME`, takes the unhandled outcome on `FAULT_REPLY_KILL`, and delivers the fault
 through its exception class on a forwarding `FAULT_REPLY_FORWARD` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
-Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
+Resume, and Kill). A target blocked in an upcall delivery (`FAULT_KIND_UPCALL`) is killed in
+neither case: a stop that cancels the delivery drops the upcall, any reply that claimed it first
+settles it, and the thread resumes at its registers when next started (for a delivery at the
+syscall point, its syscall returns its own result;
+[docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
+Upcalls). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
 cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker
 or the sleep timer claimed it first).
 A target that blocks while the stop is in progress is cancelled the same way, never left registered
@@ -1850,8 +1863,9 @@ running between the check and the copy. It then copies the buffer to `buf_ptr`. 
 through the kernel's mapping of their frames, so the thread's own read permission does not gate the
 read (an execute-only page reads). A page that is not present fails the call: the kernel does not
 fault a page in, and the target's pager is not asked. Device memory (an uncacheable mapping, such as
-an `SYS_MMIO_MAP` one) is refused, since its frame need not be RAM the kernel's mapping covers. On
-an error the buffer's contents are unspecified.
+an `SYS_MMIO_MAP` one, which `SYS_MEM_PROTECT` leaves uncacheable) is refused, since its frame need
+not be RAM the kernel's mapping covers, and so is a page whose frame lies at or above the top of
+RAM, which that mapping does not cover. On an error the buffer's contents are unspecified.
 
 **Capability requirement:** `thread_cap` MUST have Control rights. Read access needs `CONTROL`, not
 `OBSERVE`, because the space's memory holds whatever the process keeps, which register state does
@@ -1861,7 +1875,8 @@ not ([docs/capability-model.md § Thread](../../../docs/capability-model.md#thre
 thread has exited, has no address space, or its address space's teardown has begun),
 `InvalidArgument` (`len` 0 or above `MAX_THREAD_MEM_COPY`), `InvalidAddress` (`[va, va + len)` or
 the buffer not wholly in the user half, a null buffer, a page of the range not present, mapped by
-no 4 KiB leaf, or device memory, or a fault on the buffer that is unhandled; restartable,
+no 4 KiB leaf, device memory, or above the top of RAM, or a fault on the buffer that is unhandled;
+restartable,
 § Restartable Syscalls).
 
 ---
@@ -1884,18 +1899,19 @@ Copy bytes from a caller-supplied buffer into the address space a thread execute
 
 The kernel copies the buffer onto its own stack first, then pins the address space as
 `SYS_THREAD_READ_MEM` does and, under the space's page-table lock, checks every page of
-`[va, va + len)` before it writes any: each MUST be mapped by a 4 KiB user leaf of normal memory,
-and either writable by the thread, or read-only with `THREAD_MEM_TEXT` set and the page's frame
-mapped exactly once across every address space. The write is all or nothing. A read-only page needs
-the flag so that a write to text, such as a software breakpoint, is asked for; and its frame mapped
-once, since a frame mapped elsewhere too may be another process's text or data, which the write
-would change through this thread's capability. procmgr's ELF loader gives each process its own image
-frames ([services/procmgr/README.md](../../../services/procmgr/README.md) § Responsibilities), so
-the text of a process it loads takes the write. The frame is written through the kernel's mapping of
-it; the thread's mapping is not changed, so W^X holds for every user mapping. Every write
-synchronises instruction fetch on every CPU before the call returns, whatever the target's leaves
-grant, since a writable page's frame may be mapped executable elsewhere ([memory-model.md
-§ Instruction-Fetch Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
+`[va, va + len)` before it writes any: each MUST be mapped by a 4 KiB user leaf of normal memory
+whose frame lies below the top of RAM, and either writable by the thread, or read-only with
+`THREAD_MEM_TEXT` set and the page's frame mapped exactly once across every address space. The write
+is all or nothing. A read-only page needs the flag so that a write to text, such as a software
+breakpoint, is asked for; and its frame mapped once, since a frame mapped elsewhere too may be
+another process's text or data, which the write would change through this thread's capability.
+procmgr's ELF loader gives each process its own image frames
+([services/procmgr/README.md](../../../services/procmgr/README.md) § Responsibilities), so the text
+of a process it loads takes the write. The frame is written through the kernel's mapping of it; the
+thread's mapping is not changed, so W^X holds for every user mapping. Every write synchronises
+instruction fetch on every CPU before the call returns, whatever the target's leaves grant, since a
+writable page's frame may be mapped executable elsewhere ([memory-model.md § Instruction-Fetch
+Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
 
 A thread of the space that runs during the write may run or read old or new bytes, and on x86-64 a
 thread running on another CPU may run an instruction it had fetched before the write; a debugger
@@ -1943,7 +1959,8 @@ thread's `sched_lock`; fault delivery reads them once under the same lock and pi
 until the faulting thread parks, so a concurrent rebind or unbind neither pairs one binding's
 endpoint with another's badge nor frees the endpoint mid-delivery, and a delivery that finds the
 binding cleared leaves the fault unhandled (the thread is killed, or a restartable syscall's copy
-fault fails the syscall with `InvalidAddress`; § Restartable Syscalls)
+fault fails the syscall with `InvalidAddress`, § Restartable Syscalls, or, for the upcall class,
+the upcall is dropped and the thread continues)
 ([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel Object
 Reference Counting). A change of a class's binding (an unbind, or a bind to another
 endpoint or with another badge) cancels the fault delivery of that class in flight through the

@@ -431,9 +431,9 @@ records a finding is the first of these that applies:
 
 A finding of class style that is not a MUST violation, reported by a PR's pre-merge review,
 goes on no Issue. The run record that reports it is its record, and the ledger keeps a later
-run from raising it again (§ Ledger); where this section and § Pre-merge review require a
-finding of a PR's review to be recorded, the run record meets that for such a finding. The
-release review records every finding it leaves, as step 2 of § Release Production says.
+run from raising it again (§ Ledger); where § Branch and PR Workflow requires a finding of a
+PR's review to be recorded, the run record meets that for such a finding. The release review
+records every finding it leaves, as step 2 of § Release Production says.
 
 ### Ledger
 

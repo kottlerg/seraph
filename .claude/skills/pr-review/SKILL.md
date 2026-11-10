@@ -64,9 +64,9 @@ defines the record. Five points it leaves to you:
   surface findings of the last reviewer run that the audit lists as unfixed, each as that run's
   record states it, and `recorded`, `ledgered` and `dropped` are empty.
 - A run of the reviewer alone, made while the PR body reports a run as pending, is a `full` or
-  `delta`
-  record with `audit_verdict` `NOT RUN` and `audit` `null`. The gate still needs `AUDIT PASS` in
-  the last record at the head, so the audit it leaves owed is a later `audit` record there.
+  `delta` record with `audit_verdict` `NOT RUN` and `audit` `null`. The gate still needs
+  `AUDIT PASS` in the last record at the head, so the audit it leaves owed is a later `audit`
+  record there.
 
 Run `cargo xtask review-check <N>` and fix the record until it passes: the ledger and the gate
 read these files. Then give both verdict lines verbatim to the one you report to: a worker to

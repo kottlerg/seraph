@@ -17,7 +17,7 @@ are on the checked-out branch; say so to the maintainer if the session is older.
 - The supervisor saves each run's report as
   `target/xtask/review/release-v<X.Y.Z>/<mode>-<head>.md`, the returned object as
   `<mode>-<head>.json` beside it, and on `RELEASE READY` the `notes` field as `notes-<head>.md`.
-  Both verdict lines go to the maintainer verbatim: the release is their step.
+  Both verdict lines go to the maintainer verbatim: the tag is their step.
 - `RELEASE BLOCKED`: each blocking finding goes to a worker as a fix PR, and each audit failure
   to its fix. A `[carried]` entry and a fresh entry that state the same defect count as one
   finding. Record every other finding as step 2 of that section says. Then run `mode: "delta"`

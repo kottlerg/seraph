@@ -34,7 +34,7 @@ gdb-rsp/
 | `frame::unescape`, `frame::unescaped_len` | Undo the binary escaping of `X` data. |
 | `command::Command::parse` | Parses a packet body into a `Command`: `?`, `g`, `G`, `p`, `P`, `m`, `M`, `X`, `c`, `C`, `s`, `S`, `vCont?`, `vCont`, `Z`, `z`, `H`, `T`, `qfThreadInfo`, `qsThreadInfo`, `qC`, `qSupported`, `qAttached`, `qOffsets`, `QStartNoAckMode`, `qXfer:features:read`, `vAttach`, `D`, `k`; any other body is `Unknown`, answered with an empty reply. |
 | `target::Arch` | Each architecture's target description XML (`TARGET_XML_ANNEX`), its registers in protocol order, the program counter's number, and each register's place in the `g` block. |
-| `PACKET_SIZE` | The packet size a stub advertises and reads packets into. |
+| `PACKET_SIZE` | The largest packet body a stub accepts: the `PacketSize` it advertises and its reader's buffer size. |
 
 ## Scope
 

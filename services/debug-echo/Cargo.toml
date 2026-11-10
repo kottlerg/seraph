@@ -13,6 +13,7 @@ test = false
 gdb-rsp = { path = "../../shared/gdb-rsp" }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
+syscall-abi = { path = "../../abi/syscall" }
 
 [lints]
 workspace = true

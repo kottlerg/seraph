@@ -25,10 +25,13 @@ pub mod frame;
 pub mod hex;
 pub mod target;
 
-/// The largest packet, `$`, body, `#` and checksum included, a stub using this
-/// crate accepts: the `PacketSize` it advertises in its `qSupported` reply. It
-/// holds a `G` packet of either architecture's whole register block in hex
-/// ([`target::Arch::register_block_len`] bytes, twice that in hex digits).
+/// The largest packet body (the bytes between `$` and `#`, as sent) a stub
+/// using this crate accepts: the `PacketSize` it advertises in its
+/// `qSupported` reply, and the buffer size of its
+/// [`frame::PacketReader`]. With the framing, a whole packet is at most four
+/// bytes longer. It holds the body of a `G` packet of either architecture's
+/// whole register block in hex ([`target::Arch::register_block_len`] bytes,
+/// twice that in hex digits).
 pub const PACKET_SIZE: usize = 4096;
 
 /// Why a packet could not be parsed or written.

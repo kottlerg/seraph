@@ -418,8 +418,8 @@ holds it high raises no new edge, and the device stays asserted until its interr
 so no later assertion on the line raises one either. The VirtIO interrupt-service thread's timed
 read (`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the driver's timed poll
 finds its completion meanwhile (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
-`POLL_INTERVAL_MS`), so the loss is latency, not a hang. Devices that need several interrupts are to
-get message-signaled ones (design intent, not yet implemented;
+`POLL_INTERVAL_MS`, virtio-console's `TX_POLL_MS`), so the loss is latency, not a hang. Devices
+that need several interrupts are to get message-signaled ones (design intent, not yet implemented;
 [#325](https://github.com/kottlerg/seraph/issues/325)), as further sources beside the wired ones.
 The kernel delivers each routed line to one CPU, chosen when the line is first bound by taking the
 CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 only CPUs whose

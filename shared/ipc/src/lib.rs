@@ -499,7 +499,7 @@ pub mod procmgr_labels
 /// | 28 | memmgr |
 /// | 27 | procmgr |
 /// | 26 | init-logd, serial, virtio-blk, devmgr's DMA thread |
-/// | 25 | framebuffer, rtc, virtio-input |
+/// | 25 | framebuffer, rtc, virtio-input, virtio-console |
 /// | 24 | devmgr, every thread but its DMA thread |
 /// | 23 | vfsd, fs drivers (fatfs) |
 /// | 21 | svcmgr |
@@ -542,7 +542,8 @@ pub mod sched_policy
     /// virtio-blk blocks on for every transfer.
     pub const BOOT_DRIVER_PRIORITY: u8 = 26;
 
-    /// Non-boot-critical device drivers: framebuffer, RTC, virtio-input.
+    /// Non-boot-critical device drivers: framebuffer, RTC, virtio-input, and
+    /// the debug port's virtio-console.
     pub const AUX_DRIVER_PRIORITY: u8 = 25;
 
     /// devmgr — device enumeration and driver supervision.
@@ -1051,7 +1052,7 @@ pub mod svcmgr_labels
     /// [`PUBLISH_ENDPOINT`] by an *external* publisher (no per-publisher
     /// identity in the low bits today — server-side auth is binary: have
     /// the bit, or don't). svcmgr publishes the well-known names it owns
-    /// (`rootfs.root`, `svcmgr`, the three `devmgr.*` names, the two
+    /// (`rootfs.root`, `svcmgr`, the four `devmgr.*` names, the two
     /// `vfsd.*` names, and each provider's `provides` names) directly into
     /// its own registry, so those
     /// need no badge. The gate exists for a future external publisher — devmgr
@@ -1091,7 +1092,7 @@ pub mod svcmgr_labels
 /// derivation, not the published name nor any consumer.
 ///
 /// A name whose cap carries authority is seed-only: `rootfs.root`, the
-/// three `devmgr.*` names, [`published_names::VFSD_MOUNT`], and each provider
+/// four `devmgr.*` names, [`published_names::VFSD_MOUNT`], and each provider
 /// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
 /// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
 /// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`.
@@ -1769,8 +1770,8 @@ pub mod devmgr_labels
     /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
     /// work, so svcmgr never blocks on driver bring-up. The actual walk,
     /// the [`super::procmgr_labels::CREATE_FROM_FILE`] call, and the
-    /// bootstrap-round delivery for the on-disk drivers (the per-arch RTC
-    /// and virtio-input; #165 will generalize), and the settle that waits
+    /// bootstrap-round delivery for the on-disk drivers (the per-arch RTC,
+    /// virtio-input, and virtio-console; #165 will generalize), and the settle that waits
     /// for each of them to report ready ([`DRIVER_READY`]), run after the
     /// reply but before devmgr returns to its next `ipc_recv`. The nested
     /// IPC chain the spawn requires (procmgr → vfsd → block driver) cannot
@@ -2017,7 +2018,7 @@ pub mod devmgr_labels
     /// entering its service loop, so devmgr may serve its endpoint.
     ///
     /// Sent by every driver devmgr spawns (the `VirtIO` PCI drivers
-    /// virtio-blk and virtio-input, and the serial, framebuffer, and RTC
+    /// virtio-blk, virtio-input, and virtio-console, and the serial, framebuffer, and RTC
     /// drivers) on its round-2 devmgr query cap, a SEND badged with its
     /// device badge on the private driver endpoint of its spawn batch; the
     /// registry endpoint replies `UNKNOWN_OPCODE` to it. Request: `data[0]` =
@@ -2549,21 +2550,23 @@ pub mod blk_labels
 /// Wire-protocol version of [`serial_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
 pub const SERIAL_LABELS_VERSION: u32 = 2;
-/// IPC labels for the serial (UART) device driver (`services/drivers/serial`).
+/// IPC labels of the serial protocol: byte write, byte read, and RX-notify
+/// registration on a byte transport.
 ///
-/// The driver answers byte write, byte read, and RX-notify registration. It
+/// Two drivers serve it. The serial (UART) driver (`services/drivers/serial`)
 /// owns the platform UART hardware authority (an `IoPort` for COM1 on x86-64,
 /// an `Mmio` for the QEMU `virt` NS16550 at its platform-static address on
-/// RISC-V) and is the sole
-/// driver-mediated path for userspace serial bytes in both directions. devmgr
-/// spawns it and hands clients a cap badged with
+/// RISC-V) and is the sole driver-mediated path for userspace console serial
+/// bytes in both directions; devmgr hands clients a cap on it badged with
 /// [`serial_labels::WRITE_AUTHORITY`] | [`serial_labels::READ_AUTHORITY`] via
-/// [`devmgr_labels::QUERY_SERIAL_DEVICE`]. Line-control and flow-control
+/// [`devmgr_labels::QUERY_SERIAL_DEVICE`]. The virtio-console driver
+/// (`services/drivers/virtio/console`) serves the debug port, handed out the
+/// same way via [`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`]. Line-control and flow-control
 /// surfaces are planned but unimplemented (see the driver `README.md`); they
 /// are not on the wire.
 pub mod serial_labels
 {
-    /// Write bytes to the UART.
+    /// Write bytes to the transport (the UART, or the debug port).
     ///
     /// Wire format mirrors [`stream_labels::STREAM_BYTES`]: the payload byte
     /// length rides bits 16-31 of the label, the bytes are packed via
@@ -2579,7 +2582,8 @@ pub mod serial_labels
     /// longer write over more calls.
     pub const SERIAL_WRITE_BYTES: u64 = 1;
 
-    /// Read the bytes currently available in the UART receive FIFO.
+    /// Read the bytes currently received: the UART receive FIFO, or the debug
+    /// port's received bytes.
     ///
     /// Non-blocking: the driver drains whatever is ready and replies at once,
     /// possibly with zero bytes. Callers that want to sleep until input arrives

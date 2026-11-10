@@ -324,6 +324,7 @@ dependencies = [
  "gdb-rsp",
  "ipc",
  "syscall",
+ "syscall-abi",
 ]
 
 [[package]]

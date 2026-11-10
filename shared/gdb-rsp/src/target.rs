@@ -862,10 +862,10 @@ mod tests
     #[test]
     fn a_write_of_every_register_fits_one_packet()
     {
-        // `$G`, the block in hex, `#` and the checksum.
+        // The body: `G` and the block in hex.
         for arch in [Arch::X86_64, Arch::Riscv64]
         {
-            assert!(2 + arch.register_block_len() * 2 + 3 <= PACKET_SIZE);
+            assert!(1 + arch.register_block_len() * 2 <= PACKET_SIZE);
         }
     }
 }

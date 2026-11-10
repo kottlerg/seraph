@@ -36,7 +36,7 @@ const QUERY_INTERVAL: Duration = Duration::from_millis(50);
 const RX_WAIT_MS: u64 = 20;
 
 /// The most bytes one serial-protocol message carries.
-const MAX_MESSAGE_BYTES: usize = 512;
+const MAX_MESSAGE_BYTES: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
 fn main()
 {

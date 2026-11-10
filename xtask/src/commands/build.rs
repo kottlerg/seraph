@@ -77,8 +77,9 @@ enum InstallDest
     /// Installed under `sysroot/tests/<install_name>` — the test
     /// harnesses (kernel-surface `ktest`, service-surface `svctest`,
     /// programs-surface orchestrator `usertest`), the `crasher`
-    /// restart-path fixture, and the `debug-echo` debug-port fixture. svcmgr does not scan this path; harness
-    /// recipes live in `rootfs/config/svcmgr/tests/`. See
+    /// restart-path fixture, and the `debug-echo` debug-port fixture.
+    /// svcmgr does not scan this path; harness recipes live in
+    /// `rootfs/config/svcmgr/tests/`. See
     /// docs/testing.md § Sysroot layout.
     Tests,
     /// Installed under `sysroot/tests/programs/<install_name>` —

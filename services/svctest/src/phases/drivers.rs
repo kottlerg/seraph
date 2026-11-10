@@ -327,11 +327,11 @@ fn first_cap(driver: u64, first: FirstCap) -> u64
 /// `OutOfMemory`), and its `RecvGuard` ends it with `EXIT_RECV_WEDGE`
 /// (docs/ipc-design.md § Receive-Failure Policy). devmgr then withdraws it
 /// and revokes its service endpoint, so the call in flight returns an error
-/// and the `ipc_call` check below fails the phase
-/// (docs/device-management.md): the input case's outcome. The serial driver
-/// also carries logd's writes, which stall on it before then, and devmgr
-/// logs the withdrawal through logd, so the boot stalls instead, and its run
-/// timeout classifies it as a `HANG`.
+/// and the `ipc_call` check below fails the phase (docs/device-management.md
+/// § Relationship to Other Services): the input case's outcome. The serial
+/// driver also carries logd's writes, which stall on it before then, and
+/// devmgr logs the withdrawal through logd, so the boot stalls instead, and
+/// its run timeout classifies it as a `HANG`.
 fn flood(driver: u64, case: &StrayCapCase)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();

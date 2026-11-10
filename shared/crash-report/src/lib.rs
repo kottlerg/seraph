@@ -137,14 +137,6 @@ impl Thread
             Thread::Unidentified => "unidentified",
         }
     }
-
-    /// Whether a report of this thread carries its registers and stack walk
-    /// when complete.
-    #[must_use]
-    pub fn carries_registers(self) -> bool
-    {
-        matches!(self, Thread::Main | Thread::Spawned)
-    }
 }
 
 /// How far the reporter got.

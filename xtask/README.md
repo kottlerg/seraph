@@ -1014,7 +1014,7 @@ context can take the batch over (`.claude/agents/orchestrator.md` § Hand-over).
 cargo xtask orch start --goal <text>
 cargo xtask orch state [--json]
 cargo xtask orch log <text>...
-cargo xtask orch orchestrator <agent-id>
+cargo xtask orch orchestrator [<agent-id>]
 cargo xtask orch worker <name> [--id <agent-id>] [--model <m>] [--effort <e>] [--scope <s>] \
     [--branch <b>] [--worktree <path>] [--pr <N>] [--phase <phase>] [--status <text>]
 cargo xtask orch worker <name> --remove
@@ -1031,7 +1031,8 @@ cargo xtask orch end
 ```
 
 The state is `target/xtask/orchestration/state.json`, and the batch's log is `<date>.md`
-beside it, named for the UTC date of `orch start`. Nothing else writes either file. A change is
+beside it, named for the UTC date of `orch start`; a second batch started on the same UTC day
+appends to the same log. Nothing else writes either file. A change is
 made under a lock file (`state.lock`), written through a temporary file, and followed by one
 line in the log, `- <UTC time> <what changed>`, so the log needs no separate upkeep; `orch log`
 appends a line for an event that changes no state.
@@ -1039,9 +1040,9 @@ appends a line for an event that changes no state.
 | Subcommand | Effect |
 |---|---|
 | `start` | Creates the state and the log's first line. Refuses while a state exists. |
-| `state` | Prints the state as text: goal, log, orchestrator, grant and queue, each worker, merge order, open questions, rulings. It warns on stderr when the text passes 10,000 bytes, the most a hook may add to a session's context. `--json` prints the stored file. |
-| `orchestrator` | Records the agent id workers report to. |
-| `worker` | Sets the named fields of a worker and the time of the change, creating the worker when it is new; fields it does not name keep their value. A phase is one of `planning`, `coding`, `review`, `gate`, `merged`, `retired`, `dead`. `--remove` drops the worker. |
+| `state` | Prints the state as text: goal, log, orchestrator, grant and queue, each worker, merge order, open questions, rulings. It warns on stderr when the text passes 10,000 bytes, which keeps it within the 10,000 characters a hook may add to a session's context; `worker --remove` and `question close` shorten it. `--json` prints the stored file. |
+| `orchestrator` | Records the agent id workers report to. Without an id, prints the recorded one and changes nothing. |
+| `worker` | Sets the named fields of a worker, creating the worker when it is new, and with `--status` the time of that report, which `state` prints beside it; fields it does not name keep their value. A phase is one of `planning`, `coding`, `review`, `gate`, `merged`, `retired`, `dead`. `--remove` drops the worker. |
 | `grant set` | Records the exclusive grant and takes its holder out of the queue. Refuses while a grant is outstanding. |
 | `grant clear` | Ends the grant. |
 | `grant queue`, `grant unqueue` | Add or drop a request for the grant; a holder has at most one. |

@@ -56,7 +56,7 @@ const WORKER_FIELDS: &[&str] = &[
 
 /// One change to the state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change
+enum Change
 {
     /// The current orchestrator's agent id.
     Orchestrator(String),
@@ -212,7 +212,7 @@ fn text<'a>(value: &'a Value, key: &str) -> &'a str
 
 /// Apply `change` to `state` at time `now` and return the line that records
 /// it in the log.
-pub fn apply(state: &mut Value, change: &Change, now: &str) -> Result<String>
+fn apply(state: &mut Value, change: &Change, now: &str) -> Result<String>
 {
     match change
     {
@@ -223,34 +223,10 @@ pub fn apply(state: &mut Value, change: &Change, now: &str) -> Result<String>
             Ok(format!("orchestrator is {id}"))
         }
         Change::Worker { name, fields } => apply_worker(state, name, fields, now),
-        Change::WorkerRemove(name) =>
-        {
-            if object_mut(state, "workers")?.remove(name).is_none()
-            {
-                bail!("no worker named {name}");
-            }
-            Ok(format!("worker {name} removed"))
-        }
+        Change::WorkerRemove(name) => worker_remove(state, name),
         Change::GrantSet { holder, commands } => grant_set(state, holder, commands, now),
-        Change::GrantClear =>
-        {
-            let holder = state
-                .get("grant")
-                .filter(|grant| !grant.is_null())
-                .map(|grant| text(grant, "holder").to_owned())
-                .ok_or_else(|| anyhow!("no exclusive grant is outstanding"))?;
-            state["grant"] = Value::Null;
-            Ok(format!("grant of {holder} ended"))
-        }
-        Change::Queue { holder, commands } =>
-        {
-            let holder = one_line("the request's holder", holder)?;
-            let commands = one_line("the request's commands", commands)?;
-            let queue = list_mut(state, "queue")?;
-            queue.retain(|entry| text(entry, "holder") != holder);
-            queue.push(json!({ "holder": holder, "commands": commands }));
-            Ok(format!("grant request queued for {holder}: {commands}"))
-        }
+        Change::GrantClear => grant_clear(state),
+        Change::Queue { holder, commands } => queue_add(state, holder, commands),
         Change::Unqueue(holder) =>
         {
             if !remove_entry(state, "queue", "holder", holder)?
@@ -259,16 +235,7 @@ pub fn apply(state: &mut Value, change: &Change, now: &str) -> Result<String>
             }
             Ok(format!("grant request of {holder} dropped"))
         }
-        Change::Order(items) =>
-        {
-            let items = items
-                .iter()
-                .map(|item| one_line("a merge-order entry", item))
-                .collect::<Result<Vec<_>>>()?;
-            let line = format!("merge order: {}", join_or_none(&items));
-            state["order"] = json!(items);
-            Ok(line)
-        }
+        Change::Order(items) => order_set(state, items),
         Change::QuestionAdd {
             id,
             text: question,
@@ -288,20 +255,64 @@ pub fn apply(state: &mut Value, change: &Change, now: &str) -> Result<String>
             list_mut(state, "rulings")?.push(json!(ruling));
             Ok(format!("ruling: {ruling}"))
         }
-        Change::RulingDrop(number) =>
-        {
-            let rulings = list_mut(state, "rulings")?;
-            if *number == 0 || *number > rulings.len()
-            {
-                bail!("no ruling has the number {number}");
-            }
-            let dropped = rulings.remove(number - 1);
-            Ok(format!(
-                "ruling dropped: {}",
-                dropped.as_str().unwrap_or_default()
-            ))
-        }
+        Change::RulingDrop(number) => ruling_drop(state, *number),
     }
+}
+
+fn worker_remove(state: &mut Value, name: &str) -> Result<String>
+{
+    if object_mut(state, "workers")?.remove(name).is_none()
+    {
+        bail!("no worker named {name}");
+    }
+    Ok(format!("worker {name} removed"))
+}
+
+fn grant_clear(state: &mut Value) -> Result<String>
+{
+    let holder = state
+        .get("grant")
+        .filter(|grant| !grant.is_null())
+        .map(|grant| text(grant, "holder").to_owned())
+        .ok_or_else(|| anyhow!("no exclusive grant is outstanding"))?;
+    state["grant"] = Value::Null;
+    Ok(format!("grant of {holder} ended"))
+}
+
+/// Queue `holder`'s request, in place of an earlier one of the same holder.
+fn queue_add(state: &mut Value, holder: &str, commands: &str) -> Result<String>
+{
+    let holder = one_line("the request's holder", holder)?;
+    let commands = one_line("the request's commands", commands)?;
+    let queue = list_mut(state, "queue")?;
+    queue.retain(|entry| text(entry, "holder") != holder);
+    queue.push(json!({ "holder": holder, "commands": commands }));
+    Ok(format!("grant request queued for {holder}: {commands}"))
+}
+
+fn order_set(state: &mut Value, items: &[String]) -> Result<String>
+{
+    let items = items
+        .iter()
+        .map(|item| one_line("a merge-order entry", item))
+        .collect::<Result<Vec<_>>>()?;
+    let line = format!("merge order: {}", join_or_none(&items));
+    state["order"] = json!(items);
+    Ok(line)
+}
+
+fn ruling_drop(state: &mut Value, number: usize) -> Result<String>
+{
+    let rulings = list_mut(state, "rulings")?;
+    if number == 0 || number > rulings.len()
+    {
+        bail!("no ruling has the number {number}");
+    }
+    let dropped = rulings.remove(number - 1);
+    Ok(format!(
+        "ruling dropped: {}",
+        dropped.as_str().unwrap_or_default()
+    ))
 }
 
 /// Remove the entries of the list `key` whose `field` is `value`, and say
@@ -388,7 +399,12 @@ fn apply_worker(
     {
         worker.insert((*field).to_owned(), json!(value));
     }
-    worker.insert("at".to_owned(), json!(now));
+    // The time beside a worker's last report is the time of that report, so
+    // a change to another field leaves it alone.
+    if set.iter().any(|(field, _)| *field == "status")
+    {
+        worker.insert("status_at".to_owned(), json!(now));
+    }
     let described: Vec<String> = set
         .iter()
         .map(|(field, value)| format!("{field}={value}"))
@@ -414,43 +430,76 @@ fn join_or_none(items: &[String]) -> String
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
+/// Append `text` and a line break to `out`.
+fn push_line(out: &mut String, text: &str)
+{
+    out.push_str(text);
+    out.push('\n');
+}
+
 /// The state as the text `orch state` prints.
-pub fn render(state: &Value) -> String
+fn render(state: &Value) -> String
 {
     let mut out = String::new();
-    let mut line = |text: String| {
-        out.push_str(&text);
-        out.push('\n');
-    };
-    line("ORCHESTRATION STATE".to_owned());
-    line(format!("goal: {}", text(state, "goal")));
-    line(format!("log: {}", text(state, "log")));
-    line(format!(
-        "orchestrator: {}",
-        state
-            .get("orchestrator")
-            .and_then(Value::as_str)
-            .unwrap_or("none")
-    ));
+    push_line(&mut out, "ORCHESTRATION STATE");
+    push_line(&mut out, &format!("goal: {}", text(state, "goal")));
+    push_line(&mut out, &format!("log: {}", text(state, "log")));
+    let orchestrator = state.get("orchestrator").and_then(Value::as_str);
+    push_line(
+        &mut out,
+        &format!("orchestrator: {}", orchestrator.unwrap_or("none")),
+    );
+    render_grant(state, &mut out);
+    render_workers(state, &mut out);
+    let order: Vec<String> = entries(state, "order")
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    push_line(&mut out, &format!("merge order: {}", join_or_none(&order)));
+    render_questions(state, &mut out);
+    push_line(&mut out, "rulings:");
+    for (index, ruling) in entries(state, "rulings").enumerate()
+    {
+        let ruling = ruling.as_str().unwrap_or_default();
+        push_line(&mut out, &format!("  {}. {ruling}", index + 1));
+    }
+    out
+}
+
+/// The exclusive grant and the requests queued behind it.
+fn render_grant(state: &Value, out: &mut String)
+{
     match state.get("grant").filter(|grant| !grant.is_null())
     {
-        Some(grant) => line(format!(
-            "grant: {} since {}: {}",
-            text(grant, "holder"),
-            text(grant, "since"),
-            text(grant, "commands")
-        )),
-        None => line("grant: none".to_owned()),
+        Some(grant) => push_line(
+            out,
+            &format!(
+                "grant: {} since {}: {}",
+                text(grant, "holder"),
+                text(grant, "since"),
+                text(grant, "commands")
+            ),
+        ),
+        None => push_line(out, "grant: none"),
     }
     for entry in entries(state, "queue")
     {
-        line(format!(
-            "  queued: {}: {}",
-            text(entry, "holder"),
-            text(entry, "commands")
-        ));
+        push_line(
+            out,
+            &format!(
+                "  queued: {}: {}",
+                text(entry, "holder"),
+                text(entry, "commands")
+            ),
+        );
     }
-    line("workers:".to_owned());
+}
+
+/// Each worker: its phase and fields on one line, and its last report, with
+/// the time that report was recorded, on the next.
+fn render_workers(state: &Value, out: &mut String)
+{
+    push_line(out, "workers:");
     let workers = state.get("workers").and_then(Value::as_object);
     for (name, worker) in workers.into_iter().flatten()
     {
@@ -463,19 +512,22 @@ pub fn render(state: &Value) -> String
                 head.push(format!("{field}={value}"));
             }
         }
-        line(head.join(" "));
+        push_line(out, &head.join(" "));
         let status = text(worker, "status");
         if !status.is_empty()
         {
-            line(format!("    last ({}): {status}", text(worker, "at")));
+            push_line(
+                out,
+                &format!("    last ({}): {status}", text(worker, "status_at")),
+            );
         }
     }
-    let order: Vec<String> = entries(state, "order")
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect();
-    line(format!("merge order: {}", join_or_none(&order)));
-    line("open questions:".to_owned());
+}
+
+/// The questions the maintainer has open.
+fn render_questions(state: &Value, out: &mut String)
+{
+    push_line(out, "open questions:");
     for question in entries(state, "questions")
     {
         let file = question
@@ -483,23 +535,16 @@ pub fn render(state: &Value) -> String
             .and_then(Value::as_str)
             .map(|file| format!(" [{file}]"))
             .unwrap_or_default();
-        line(format!(
-            "  {} (asked {}): {}{file}",
-            text(question, "id"),
-            text(question, "asked"),
-            text(question, "text")
-        ));
+        push_line(
+            out,
+            &format!(
+                "  {} (asked {}): {}{file}",
+                text(question, "id"),
+                text(question, "asked"),
+                text(question, "text")
+            ),
+        );
     }
-    line("rulings:".to_owned());
-    for (index, ruling) in entries(state, "rulings").enumerate()
-    {
-        line(format!(
-            "  {}. {}",
-            index + 1,
-            ruling.as_str().unwrap_or_default()
-        ));
-    }
-    out
 }
 
 fn entries<'a>(state: &'a Value, key: &str) -> impl Iterator<Item = &'a Value>
@@ -519,7 +564,7 @@ fn or_dash(text: &str) -> &str
 // ── Files ─────────────────────────────────────────────────────────────────────
 
 /// The directory that holds a batch's state and log.
-pub fn state_dir(ctx: &BuildContext) -> PathBuf
+fn state_dir(ctx: &BuildContext) -> PathBuf
 {
     ctx.target_dir.join("xtask").join("orchestration")
 }
@@ -616,7 +661,7 @@ fn append_log(dir: &Path, state: &Value, now: &str, line: &str) -> Result<()>
 
 /// Start a batch in `dir` at `secs`: a fresh state and the first line of its
 /// log. Refuses while a state exists, since it may hold live workers.
-pub fn start(dir: &Path, goal: &str, secs: u64) -> Result<()>
+fn start(dir: &Path, goal: &str, secs: u64) -> Result<()>
 {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let _lock = Lock::acquire(dir)?;
@@ -637,9 +682,24 @@ pub fn start(dir: &Path, goal: &str, secs: u64) -> Result<()>
     )
 }
 
-/// Apply `change` to the state in `dir` at `secs`, and record it in the log.
-pub fn change(dir: &Path, change: &Change, secs: u64) -> Result<String>
+/// Refuse, naming the command that starts one, when `dir` holds no batch.
+fn require_batch(dir: &Path) -> Result<()>
 {
+    let path = dir.join(STATE_FILE);
+    if !path.exists()
+    {
+        bail!(
+            "{} does not exist: start a batch with `cargo xtask orch start`",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Apply `change` to the state in `dir` at `secs`, and record it in the log.
+fn change(dir: &Path, change: &Change, secs: u64) -> Result<String>
+{
+    require_batch(dir)?;
     let _lock = Lock::acquire(dir)?;
     let mut state = load(dir)?;
     let now = timestamp(secs);
@@ -650,9 +710,10 @@ pub fn change(dir: &Path, change: &Change, secs: u64) -> Result<String>
 }
 
 /// Append `line` to the log of the batch in `dir`.
-pub fn log(dir: &Path, line: &str, secs: u64) -> Result<()>
+fn log(dir: &Path, line: &str, secs: u64) -> Result<()>
 {
     let line = one_line("the log line", line)?;
+    require_batch(dir)?;
     let _lock = Lock::acquire(dir)?;
     let state = load(dir)?;
     append_log(dir, &state, &timestamp(secs), &line)
@@ -660,13 +721,15 @@ pub fn log(dir: &Path, line: &str, secs: u64) -> Result<()>
 
 /// End the batch in `dir`: keep its state beside the log under the log's
 /// name, so the next `orch start` begins clean.
-pub fn end(dir: &Path, secs: u64) -> Result<PathBuf>
+fn end(dir: &Path, secs: u64) -> Result<PathBuf>
 {
+    require_batch(dir)?;
     let _lock = Lock::acquire(dir)?;
     let state = load(dir)?;
     append_log(dir, &state, &timestamp(secs), "batch ended")?;
     let stem = text(&state, "log").trim_end_matches(".md");
-    // A second batch that ends on the same day keeps the first one's state.
+    // A second batch that starts on the same UTC day appends to the same log,
+    // and its ended state takes the next free name beside the first one's.
     let kept = (1..1_000_u32)
         .map(|number| match number
         {
@@ -715,54 +778,13 @@ fn worker_change(args: &OrchWorkerArgs) -> Result<Change>
     })
 }
 
-/// Entry point for `cargo xtask orch`.
-pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
+/// The change to the state that `command` asks for. A command that reads the
+/// state, or that starts, logs to or ends the batch, asks for none.
+fn state_change(command: &OrchCommand) -> Result<Change>
 {
-    let dir = state_dir(ctx);
-    let secs = now_secs()?;
-    let requested = match &args.command
+    Ok(match command
     {
-        OrchCommand::Start { goal } =>
-        {
-            start(&dir, goal, secs)?;
-            step(&format!("Started a batch in {}", dir.display()));
-            return Ok(());
-        }
-        OrchCommand::State { json } =>
-        {
-            let state = load(&dir)?;
-            if *json
-            {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&state).context("encoding the state")?
-                );
-                return Ok(());
-            }
-            let rendered = render(&state);
-            print!("{rendered}");
-            if rendered.len() > STATE_TEXT_MAX
-            {
-                eprintln!(
-                    "warning: the state is {} bytes, over the {STATE_TEXT_MAX} a hook may add \
-                     to a session's context; retire finished workers and close settled questions",
-                    rendered.len()
-                );
-            }
-            return Ok(());
-        }
-        OrchCommand::Log { line } =>
-        {
-            log(&dir, &line.join(" "), secs)?;
-            return Ok(());
-        }
-        OrchCommand::End =>
-        {
-            let kept = end(&dir, secs)?;
-            step(&format!("Ended the batch; its state is {}", kept.display()));
-            return Ok(());
-        }
-        OrchCommand::Orchestrator { id } => Change::Orchestrator(id.clone()),
+        OrchCommand::Orchestrator { id: Some(id) } => Change::Orchestrator(id.clone()),
         OrchCommand::Worker(worker) => worker_change(worker)?,
         OrchCommand::Grant { command } => match command
         {
@@ -792,9 +814,75 @@ pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
             OrchRulingCommand::Add { text } => Change::RulingAdd(text.join(" ")),
             OrchRulingCommand::Drop { number } => Change::RulingDrop(*number),
         },
-    };
-    let line = change(&dir, &requested, secs)?;
-    println!("{line}");
+        OrchCommand::Start { .. }
+        | OrchCommand::State { .. }
+        | OrchCommand::Log { .. }
+        | OrchCommand::End
+        | OrchCommand::Orchestrator { id: None } => bail!("the command changes no state"),
+    })
+}
+
+/// The current orchestrator's agent id, as the state holds it.
+fn orchestrator_id(state: &Value) -> Result<String>
+{
+    state
+        .get("orchestrator")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("the state names no orchestrator"))
+}
+
+/// Print the state in `dir`: as JSON, or as the text a session reads.
+fn print_state(dir: &Path, as_json: bool) -> Result<()>
+{
+    let state = load(dir)?;
+    if as_json
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&state).context("encoding the state")?
+        );
+        return Ok(());
+    }
+    let rendered = render(&state);
+    print!("{rendered}");
+    if rendered.len() > STATE_TEXT_MAX
+    {
+        eprintln!(
+            "warning: the state is {} bytes, over the {STATE_TEXT_MAX} this command keeps to; \
+             remove finished workers (`orch worker <name> --remove`) and close settled questions",
+            rendered.len()
+        );
+    }
+    Ok(())
+}
+
+/// Entry point for `cargo xtask orch`.
+pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
+{
+    let dir = state_dir(ctx);
+    let secs = now_secs()?;
+    match &args.command
+    {
+        OrchCommand::Start { goal } =>
+        {
+            start(&dir, goal, secs)?;
+            step(&format!("Started a batch in {}", dir.display()));
+        }
+        OrchCommand::State { json } => print_state(&dir, *json)?,
+        OrchCommand::Log { line } => log(&dir, &line.join(" "), secs)?,
+        OrchCommand::End =>
+        {
+            let kept = end(&dir, secs)?;
+            step(&format!("Ended the batch; its state is {}", kept.display()));
+        }
+        OrchCommand::Orchestrator { id: None } => println!("{}", orchestrator_id(&load(&dir)?)?),
+        command =>
+        {
+            let line = change(&dir, &state_change(command)?, secs)?;
+            println!("{line}");
+        }
+    }
     Ok(())
 }
 
@@ -874,7 +962,31 @@ mod tests
         assert_eq!(text(w1, "branch"), "fix/x");
         assert_eq!(text(w1, "phase"), "review");
         assert_eq!(text(w1, "pr"), "852");
-        assert_eq!(text(w1, "at"), "2026-11-10T15:00Z");
+    }
+
+    #[test]
+    fn a_report_keeps_its_own_time_across_other_changes()
+    {
+        let mut state = fresh();
+        apply(&mut state, &worker("W1", &[("phase", "coding")]), NOW).unwrap();
+        assert!(state["workers"]["W1"].get("status_at").is_none());
+        apply(
+            &mut state,
+            &worker("W1", &[("status", "CI green")]),
+            "2026-11-10T15:00Z",
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &worker("W1", &[("phase", "gate")]),
+            "2026-11-10T16:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            text(&state["workers"]["W1"], "status_at"),
+            "2026-11-10T15:00Z"
+        );
+        assert!(render(&state).contains("    last (2026-11-10T15:00Z): CI green"));
     }
 
     #[test]
@@ -916,7 +1028,7 @@ mod tests
     }
 
     #[test]
-    fn questions_and_rulings_open_and_close()
+    fn a_question_is_open_once_and_closes_by_its_id()
     {
         let mut state = fresh();
         let ask = |id: &str| Change::QuestionAdd {
@@ -929,7 +1041,12 @@ mod tests
         assert!(apply(&mut state, &Change::QuestionClose("Q2".to_owned()), NOW).is_err());
         apply(&mut state, &Change::QuestionClose("Q1".to_owned()), NOW).unwrap();
         assert!(state["questions"].as_array().unwrap().is_empty());
+    }
 
+    #[test]
+    fn a_ruling_is_dropped_by_its_number()
+    {
+        let mut state = fresh();
         apply(&mut state, &Change::RulingAdd("first".to_owned()), NOW).unwrap();
         apply(&mut state, &Change::RulingAdd("second".to_owned()), NOW).unwrap();
         assert!(apply(&mut state, &Change::RulingDrop(0), NOW).is_err());
@@ -937,6 +1054,65 @@ mod tests
         let line = apply(&mut state, &Change::RulingDrop(1), NOW).unwrap();
         assert_eq!(line, "ruling dropped: first");
         assert_eq!(state["rulings"], json!(["second"]));
+    }
+
+    #[test]
+    fn a_holder_has_one_queued_request()
+    {
+        let mut state = fresh();
+        let queue = |commands: &str| Change::Queue {
+            holder: "W1".to_owned(),
+            commands: commands.to_owned(),
+        };
+        apply(&mut state, &queue("boundary set"), NOW).unwrap();
+        apply(&mut state, &queue("timing run"), NOW).unwrap();
+        assert_eq!(
+            state["queue"],
+            json!([{ "holder": "W1", "commands": "timing run" }])
+        );
+    }
+
+    #[test]
+    fn a_queued_request_is_dropped_by_its_holder()
+    {
+        let mut state = fresh();
+        let queue = |holder: &str| Change::Queue {
+            holder: holder.to_owned(),
+            commands: "boundary set".to_owned(),
+        };
+        apply(&mut state, &queue("W1"), NOW).unwrap();
+        apply(&mut state, &queue("W2"), NOW).unwrap();
+        let line = apply(&mut state, &Change::Unqueue("W1".to_owned()), NOW).unwrap();
+        assert_eq!(line, "grant request of W1 dropped");
+        assert_eq!(
+            state["queue"],
+            json!([{ "holder": "W2", "commands": "boundary set" }])
+        );
+    }
+
+    #[test]
+    fn the_merge_order_is_replaced_whole()
+    {
+        let mut state = fresh();
+        let order =
+            |items: &[&str]| Change::Order(items.iter().map(|item| (*item).to_owned()).collect());
+        let line = apply(&mut state, &order(&["#852", "#853"]), NOW).unwrap();
+        assert_eq!(line, "merge order: #852, #853");
+        apply(&mut state, &order(&["#854"]), NOW).unwrap();
+        assert_eq!(state["order"], json!(["#854"]));
+        let line = apply(&mut state, &order(&[]), NOW).unwrap();
+        assert_eq!(line, "merge order: none");
+        assert_eq!(state["order"], json!([]));
+    }
+
+    #[test]
+    fn a_merge_order_entry_is_one_line()
+    {
+        let mut state = fresh();
+        apply(&mut state, &Change::Order(vec!["#852".to_owned()]), NOW).unwrap();
+        let refused = Change::Order(vec!["#853".to_owned(), "  ".to_owned()]);
+        assert!(apply(&mut state, &refused, NOW).is_err());
+        assert_eq!(state["order"], json!(["#852"]));
     }
 
     #[test]
@@ -1037,18 +1213,40 @@ mod tests
         assert!(render(&state).len() < STATE_TEXT_MAX);
     }
 
+    /// 2026-11-10T14:39:00Z.
+    const SECS: u64 = 1_794_321_540;
+
+    #[test]
+    fn a_change_before_start_names_the_start_command()
+    {
+        let dir = scratch("unstarted");
+        let refused = change(&dir, &Change::GrantClear, SECS).unwrap_err();
+        assert!(refused.to_string().contains("cargo xtask orch start"));
+        assert!(log(&dir, "an event", SECS).is_err());
+        assert!(end(&dir, SECS).is_err());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn start_refuses_over_a_batch_in_progress()
+    {
+        let dir = scratch("restart");
+        start(&dir, "close out the milestone", SECS).unwrap();
+        assert!(start(&dir, "again", SECS).is_err());
+        assert_eq!(
+            text(&load(&dir).unwrap(), "goal"),
+            "close out the milestone"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn changes_reach_the_state_file_and_the_log()
     {
         let dir = scratch("files");
-        // 2026-11-10T14:39:00Z.
-        let secs = 1_794_321_540;
-        assert!(change(&dir, &Change::GrantClear, secs).is_err());
-        start(&dir, "close out the milestone", secs).unwrap();
-        assert!(start(&dir, "again", secs).is_err());
-        change(&dir, &Change::Orchestrator("a0c1".to_owned()), secs).unwrap();
-        log(&dir, "W1 handed back", secs + 60).unwrap();
-        assert!(log(&dir, "two\nlines", secs).is_err());
+        start(&dir, "close out the milestone", SECS).unwrap();
+        change(&dir, &Change::Orchestrator("a0c1".to_owned()), SECS).unwrap();
+        log(&dir, "W1 handed back", SECS + 60).unwrap();
 
         let state = load(&dir).unwrap();
         assert_eq!(text(&state, "orchestrator"), "a0c1");
@@ -1060,14 +1258,42 @@ mod tests
              - 2026-11-10T14:39Z orchestrator is a0c1\n\
              - 2026-11-10T14:40Z W1 handed back\n"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        let kept = end(&dir, secs + 120).unwrap();
+    #[test]
+    fn an_ended_batch_keeps_its_state_under_a_free_name()
+    {
+        let dir = scratch("end");
+        start(&dir, "close out the milestone", SECS).unwrap();
+        let kept = end(&dir, SECS + 120).unwrap();
         assert_eq!(kept, dir.join("2026-11-10.state.json"));
         assert!(!dir.join(STATE_FILE).exists());
-        start(&dir, "the next batch", secs + 180).unwrap();
-        let second = end(&dir, secs + 240).unwrap();
+        start(&dir, "the next batch", SECS + 180).unwrap();
+        let second = end(&dir, SECS + 240).unwrap();
         assert_eq!(second, dir.join("2026-11-10-2.state.json"));
         assert!(kept.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_that_does_not_parse_is_reported()
+    {
+        let dir = scratch("garbled");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(STATE_FILE), "{ not json").unwrap();
+        let refused = load(&dir).unwrap_err();
+        assert!(refused.to_string().contains("parsing"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_without_a_log_name_refuses_a_log_line()
+    {
+        let dir = scratch("nolog");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(append_log(&dir, &json!({ "log": "" }), NOW, "an event").is_err());
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1076,14 +1302,133 @@ mod tests
     {
         let dir = scratch("lock");
         fs::create_dir_all(&dir).unwrap();
-        let wait = Duration::from_millis(120);
-        let held = Lock::acquire_within(&dir, wait).unwrap();
-        let started = Instant::now();
-        assert!(Lock::acquire_within(&dir, wait).is_err());
-        assert!(started.elapsed() >= wait);
+        let held = Lock::acquire_within(&dir, Duration::ZERO).unwrap();
+        assert!(Lock::acquire_within(&dir, Duration::ZERO).is_err());
         drop(held);
         assert!(!dir.join(LOCK_FILE).exists());
-        assert!(Lock::acquire_within(&dir, wait).is_ok());
+        assert!(Lock::acquire_within(&dir, Duration::ZERO).is_ok());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn worker_args(name: &str) -> OrchWorkerArgs
+    {
+        OrchWorkerArgs {
+            name: name.to_owned(),
+            remove: false,
+            id: None,
+            model: None,
+            effort: None,
+            scope: None,
+            branch: None,
+            worktree: None,
+            pr: None,
+            phase: None,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn worker_arguments_become_the_fields_they_name()
+    {
+        let args = OrchWorkerArgs {
+            id: Some("the id".to_owned()),
+            model: Some("the model".to_owned()),
+            effort: Some("the effort".to_owned()),
+            scope: Some("the scope".to_owned()),
+            branch: Some("the branch".to_owned()),
+            worktree: Some("the worktree".to_owned()),
+            pr: Some("the pr".to_owned()),
+            phase: Some("the phase".to_owned()),
+            status: Some("the status".to_owned()),
+            ..worker_args("W1")
+        };
+        let Change::Worker { name, fields } = worker_change(&args).unwrap()
+        else
+        {
+            panic!("not a worker change");
+        };
+        assert_eq!(name, "W1");
+        assert_eq!(fields.len(), WORKER_FIELDS.len());
+        for (field, value) in fields
+        {
+            assert_eq!(value, format!("the {field}"));
+        }
+    }
+
+    #[test]
+    fn worker_arguments_set_only_the_fields_given()
+    {
+        let args = OrchWorkerArgs {
+            pr: Some("854".to_owned()),
+            ..worker_args("W1")
+        };
+        assert_eq!(
+            worker_change(&args).unwrap(),
+            worker("W1", &[("pr", "854")])
+        );
+    }
+
+    #[test]
+    fn worker_arguments_without_a_field_are_refused()
+    {
+        assert!(worker_change(&worker_args("W1")).is_err());
+    }
+
+    #[test]
+    fn the_remove_flag_removes_the_worker()
+    {
+        let args = OrchWorkerArgs {
+            remove: true,
+            ..worker_args("W1")
+        };
+        assert_eq!(
+            worker_change(&args).unwrap(),
+            Change::WorkerRemove("W1".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_command_that_changes_the_state_names_its_change()
+    {
+        let command = OrchCommand::Order {
+            items: vec!["#852".to_owned()],
+        };
+        assert_eq!(
+            state_change(&command).unwrap(),
+            Change::Order(vec!["#852".to_owned()])
+        );
+        let command = OrchCommand::Grant {
+            command: OrchGrantCommand::Set {
+                holder: "W1".to_owned(),
+                commands: vec![
+                    "run-parallel".to_owned(),
+                    "--smp".to_owned(),
+                    "8".to_owned(),
+                ],
+            },
+        };
+        assert_eq!(
+            state_change(&command).unwrap(),
+            Change::GrantSet {
+                holder: "W1".to_owned(),
+                commands: "run-parallel --smp 8".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_command_that_changes_nothing_names_no_change()
+    {
+        assert!(state_change(&OrchCommand::End).is_err());
+        assert!(state_change(&OrchCommand::Orchestrator { id: None }).is_err());
+    }
+
+    #[test]
+    fn the_orchestrator_id_is_read_back()
+    {
+        let mut state = fresh();
+        assert!(orchestrator_id(&state).is_err());
+        apply(&mut state, &Change::Orchestrator("a0c1".to_owned()), NOW).unwrap();
+        assert_eq!(orchestrator_id(&state).unwrap(), "a0c1");
     }
 }

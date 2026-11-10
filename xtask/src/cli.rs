@@ -975,11 +975,12 @@ pub enum OrchCommand
         line: Vec<String>,
     },
 
-    /// Record the current orchestrator's agent id.
+    /// Record the current orchestrator's agent id, or print it when none is
+    /// given.
     Orchestrator
     {
         /// The agent id workers report to.
-        id: String,
+        id: Option<String>,
     },
 
     /// Set fields of a worker, creating it when it is new, or remove it.

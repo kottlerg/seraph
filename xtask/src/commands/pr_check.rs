@@ -529,7 +529,8 @@ fn comment_marker(path: &str) -> Option<&'static str>
 }
 
 /// A line of a unified diff outside any hunk: a file header names the path,
-/// and a binary or mode line is a change with no hunk to show it.
+/// and a binary or mode line is a change with no hunk to show it, which goes
+/// to `out` without its path.
 fn read_header<'a>(line: &'a str, path: &mut &'a str, out: &mut Vec<String>)
 {
     if let Some(rest) = line.strip_prefix("diff --git ")
@@ -548,20 +549,31 @@ fn read_header<'a>(line: &'a str, path: &mut &'a str, out: &mut Vec<String>)
     }
     else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch")
     {
-        out.push(format!("{path}: binary change"));
+        out.push("binary change".to_owned());
     }
     else if line.starts_with("old mode ") || line.starts_with("new mode ")
     {
-        out.push(format!("{path}: {line}"));
+        out.push(line.to_owned());
     }
 }
 
-/// The changes of a unified diff that are not comment lines, as
-/// `<path>: <what>`; empty when the diff alters only comments. A binary
-/// change, a mode change, and any line of a file type whose comment syntax is
-/// unknown count as changes. The diff must be made with `--no-renames`, so a
-/// rename shows its lines.
-pub fn non_comment_changes(diff: &str) -> Vec<String>
+/// One change of a unified diff: its file, and the changed line with its
+/// sign (`+` or `-`) or a header that is a change of its own (a binary or a
+/// mode change), with `code` set when the change is not a comment line.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Change
+{
+    pub path: String,
+    pub line: String,
+    pub code: bool,
+}
+
+/// Every change of a unified diff, in order. A binary change, a mode change,
+/// and any line of a file type whose comment syntax is unknown count as code;
+/// so does a line of a Markdown file, which the callers exclude or judge
+/// themselves. The diff must be made with `--no-renames`, so a rename shows
+/// its lines.
+pub fn diff_changes(diff: &str) -> Vec<Change>
 {
     let mut out = Vec::new();
     let mut path = "";
@@ -581,7 +593,13 @@ pub fn non_comment_changes(diff: &str) -> Vec<String>
         }
         if !in_hunk
         {
-            read_header(line, &mut path, &mut out);
+            let mut headers = Vec::new();
+            read_header(line, &mut path, &mut headers);
+            out.extend(headers.into_iter().map(|what| Change {
+                path: path.to_owned(),
+                line: what,
+                code: true,
+            }));
             continue;
         }
         let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix('-'))
@@ -589,11 +607,78 @@ pub fn non_comment_changes(diff: &str) -> Vec<String>
         {
             continue;
         };
+        let sign = &line[..1];
         let text = text.trim();
         let comment = text.is_empty() || comment_marker(path).is_some_and(|m| text.starts_with(m));
-        if !comment
+        out.push(Change {
+            path: path.to_owned(),
+            line: format!("{sign}{text}"),
+            code: !comment,
+        });
+    }
+    out
+}
+
+/// The changes of a unified diff that are not comment lines, as
+/// `<path>: <what>`; empty when the diff alters only comments. A binary
+/// change, a mode change, and any line of a file type whose comment syntax is
+/// unknown count as changes. The diff must be made with `--no-renames`, so a
+/// rename shows its lines.
+pub fn non_comment_changes(diff: &str) -> Vec<String>
+{
+    diff_changes(diff)
+        .into_iter()
+        .filter(|change| change.code)
+        .map(|change| {
+            // A header change is stated whole; a line drops its sign.
+            let what = change
+                .line
+                .strip_prefix(['+', '-'])
+                .unwrap_or(&change.line)
+                .to_owned();
+            format!("{}: {what}", change.path)
+        })
+        .collect()
+}
+
+/// The changes that stand in one of the PR's own diffs and not in the other,
+/// counted as multisets per file: `own_validated` is the PR's change at the
+/// validated head (`git diff <merge base> <validated>`), `own_head` the same
+/// at the PR head. Two diffs made against different merge bases agree when
+/// the PR adds and removes the same lines in each, wherever the lines stand.
+pub fn own_change_difference(own_validated: &str, own_head: &str) -> Vec<Change>
+{
+    let mut left = diff_changes(own_validated);
+    let mut right = diff_changes(own_head);
+    left.sort();
+    right.sort();
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < left.len() || j < right.len()
+    {
+        match (left.get(i), right.get(j))
         {
-            out.push(format!("{path}: {text}"));
+            (Some(a), Some(b)) if a == b =>
+            {
+                i += 1;
+                j += 1;
+            }
+            (Some(a), Some(b)) if a < b =>
+            {
+                out.push(a.clone());
+                i += 1;
+            }
+            (Some(a), None) =>
+            {
+                out.push(a.clone());
+                i += 1;
+            }
+            (_, Some(b)) =>
+            {
+                out.push(b.clone());
+                j += 1;
+            }
+            (None, None) => break,
         }
     }
     out
@@ -657,7 +742,8 @@ pub enum ValidatedHead
     Unknown,
     /// It is the PR head.
     Head,
-    /// It is a commit between the merge base and the PR head.
+    /// It is a commit of the branch: an ancestor of the PR head that the base
+    /// branch does not hold.
     Earlier(String),
     /// It is a commit, but not on the branch.
     OffBranch(String),
@@ -696,23 +782,35 @@ pub fn classify_validated_head(
     }
 }
 
+/// What changed between an earlier validated head and the PR head.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Delta
+{
+    /// The changes outside comments and Markdown, as `<path>: <what>`.
+    pub changes: Vec<String>,
+    /// The changed files a build embeds.
+    pub embedded: Vec<String>,
+    /// The PR's change moved at all, comments and Markdown included, so the
+    /// body must say the delta is documentation or comments only.
+    pub moved: bool,
+    /// A merge of the base branch lies between the two heads, so `changes`
+    /// and `embedded` compare the PR's own change at each head, not the
+    /// delta.
+    pub synced: bool,
+}
+
 /// The findings about the delta from an earlier validated head to the PR
-/// head: the body must say it is documentation or comments only, and
-/// `changes` (the non-comment changes of the delta) and `embedded` (its
-/// files a build embeds) must both be empty.
-pub fn delta_diags(
-    pat: &Patterns,
-    body: &str,
-    validated: &str,
-    changes: &[String],
-    embedded: &[String],
-) -> Vec<Diag>
+/// head: when the PR's change moved, the body must say the delta is
+/// documentation or comments only; `changes` and `embedded` must both be
+/// empty; and a merge of the base branch between the two heads asks the body
+/// to state whether the incoming diff overlaps the PR's files.
+pub fn delta_diags(pat: &Patterns, body: &str, validated: &str, delta: &Delta) -> Vec<Diag>
 {
     let at = format!("validated head {validated}");
     let mut out = Vec::new();
     let stated = section(body, "## Validation")
         .is_some_and(|lines| lines.iter().any(|l| pat.delta_statement.is_match(l)));
-    if !stated
+    if delta.moved && !stated
     {
         out.push(Diag::error(
             "pr-validated-head",
@@ -721,15 +819,23 @@ pub fn delta_diags(
              documentation or comments only",
         ));
     }
-    for change in changes
+    let what = if delta.synced
+    {
+        "the PR's own change differs from the validated one outside comments and Markdown"
+    }
+    else
+    {
+        "the delta to the PR head is not comment-only"
+    };
+    for change in &delta.changes
     {
         out.push(Diag::error(
             "pr-validated-head",
             &at,
-            format!("the delta to the PR head is not comment-only: {change}"),
+            format!("{what}: {change}"),
         ));
     }
-    for path in embedded
+    for path in &delta.embedded
     {
         out.push(Diag::error(
             "pr-validated-head",
@@ -737,49 +843,94 @@ pub fn delta_diags(
             format!("the delta to the PR head changes {path}, which a build embeds"),
         ));
     }
+    if delta.synced && out.is_empty()
+    {
+        out.push(Diag::warning(
+            "pr-validated-sync",
+            &at,
+            "validated before a merge of master; the body must state whether the incoming \
+             diff overlaps this PR's files",
+        ));
+    }
     out
 }
 
-/// The non-comment changes and the build-embedded files of the delta from
-/// `validated` to `head`, Markdown aside.
-fn read_delta(
-    pat: &Patterns,
-    root: &Path,
-    validated: &str,
-    head: &str,
-) -> Result<(Vec<String>, Vec<String>)>
+/// `git diff -U0` between `from` and `to` with the options the checks read
+/// it under: `--no-ext-diff` and `--no-textconv` keep a configured diff tool
+/// from replacing the patch text; `--no-renames` makes a rename show its
+/// lines.
+fn diff_u0(root: &Path, from: &str, to: &str, paths: &[&str]) -> Result<String>
 {
-    // `--no-ext-diff` and `--no-textconv` keep a configured diff tool from
-    // replacing the patch text; `--no-renames` makes a rename show its lines.
-    let diff = git(
-        root,
-        &[
-            "diff",
-            "-U0",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            validated,
-            head,
-            "--",
-            ".",
-            ":(exclude)*.md",
-        ],
-    )?;
+    let mut args = vec![
+        "diff",
+        "-U0",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        from,
+        to,
+        "--",
+    ];
+    args.extend_from_slice(paths);
+    git(root, &args)
+}
+
+/// The delta from `validated` to `head` when no merge of the base branch lies
+/// between them: its non-comment changes and its build-embedded files,
+/// Markdown aside.
+fn read_delta(pat: &Patterns, root: &Path, validated: &str, head: &str) -> Result<Delta>
+{
+    let diff = diff_u0(root, validated, head, &[".", ":(exclude)*.md"])?;
     let names = git(
         root,
         &["diff", "--name-only", "--no-renames", validated, head],
     )?;
-    Ok((
-        non_comment_changes(&diff),
-        embedded_paths(pat, &names, &embed_lines(root, head)?),
-    ))
+    Ok(Delta {
+        changes: non_comment_changes(&diff),
+        embedded: embedded_paths(pat, &names, &embed_lines(root, head)?),
+        moved: true,
+        synced: false,
+    })
+}
+
+/// The delta when a merge of the base branch lies between `validated` and
+/// `head`: the PR's own change at each head, `git diff <merge base> <head>`,
+/// compared by `own_change_difference`, so that what the merge brings from
+/// the base branch is not counted as the PR's.
+fn read_synced_delta(
+    pat: &Patterns,
+    root: &Path,
+    (validated, validated_base): (&str, &str),
+    (head, head_base): (&str, &str),
+) -> Result<Delta>
+{
+    let own_validated = diff_u0(root, validated_base, validated, &["."])?;
+    let own_head = diff_u0(root, head_base, head, &["."])?;
+    let difference = own_change_difference(&own_validated, &own_head);
+    let mut names: Vec<&str> = difference.iter().map(|c| c.path.as_str()).collect();
+    names.dedup();
+    let embedded = embedded_paths(pat, &names.join("\n"), &embed_lines(root, head)?);
+    let mut changes: Vec<String> = difference
+        .iter()
+        .filter(|c| c.code && !c.path.ends_with(".md"))
+        .map(|c| format!("{}: {}", c.path, c.line))
+        .collect();
+    changes.dedup();
+    Ok(Delta {
+        changes,
+        embedded,
+        moved: !difference.is_empty(),
+        synced: true,
+    })
 }
 
 /// Check that the validated head covers the PR head: it is the head, or it is
-/// on the branch and the delta to the head is documentation or comments only,
-/// which the body must say (§ PR-body checklist discipline).
+/// on the branch and the PR's change since it is documentation or comments
+/// only, which the body must say (§ PR-body checklist discipline). When a
+/// merge of the base branch lies between the two, the PR's own change at
+/// each head is compared instead of the delta, and a warning asks the body to
+/// state the merge's overlap with the PR's files.
 fn check_validated_head(
     pat: &Patterns,
     root: &Path,
@@ -789,10 +940,12 @@ fn check_validated_head(
 ) -> Result<Vec<Diag>>
 {
     let is_commit = |word: &str| git_ok(root, &["cat-file", "-e", &format!("{word}^{{commit}}")]);
+    // A commit of the branch: the head holds it and the base branch does
+    // not. After a merge of the base branch the merge base is the merged
+    // tip, which an earlier branch commit does not descend from.
     let on_branch = |word: &str| {
         git_ok(root, &["merge-base", "--is-ancestor", word, head])
-            && git(root, &["merge-base", base, head])
-                .is_ok_and(|mb| git_ok(root, &["merge-base", "--is-ancestor", mb.trim(), word]))
+            && !git_ok(root, &["merge-base", "--is-ancestor", word, base])
     };
     let candidates = validated_head_candidates(pat, body);
     Ok(
@@ -815,8 +968,23 @@ fn check_validated_head(
             )],
             ValidatedHead::Earlier(validated) =>
             {
-                let (changes, embedded) = read_delta(pat, root, &validated, head)?;
-                delta_diags(pat, body, &validated, &changes, &embedded)
+                let validated_base = git(root, &["merge-base", base, &validated])?;
+                let head_base = git(root, &["merge-base", base, head])?;
+                let (validated_base, head_base) = (validated_base.trim(), head_base.trim());
+                let delta = if validated_base == head_base
+                {
+                    read_delta(pat, root, &validated, head)?
+                }
+                else
+                {
+                    read_synced_delta(
+                        pat,
+                        root,
+                        (&validated, validated_base),
+                        (head, head_base),
+                    )?
+                };
+                delta_diags(pat, body, &validated, &delta)
             }
         },
     )
@@ -1518,23 +1686,219 @@ mod tests
     fn an_earlier_validated_head_needs_a_stated_comment_only_delta()
     {
         let p = pat();
+        let moved = Delta {
+            moved: true,
+            ..Delta::default()
+        };
         // BODY's Validation section says later commits are comment-only.
-        assert!(delta_diags(&p, BODY, "deadbeef", &[], &[]).is_empty());
+        assert!(delta_diags(&p, BODY, "deadbeef", &moved).is_empty());
         let silent = "## Validation\nValidated at deadbeef.\n";
         assert_eq!(
-            rules(&delta_diags(&p, silent, "deadbeef", &[], &[])),
+            rules(&delta_diags(&p, silent, "deadbeef", &moved)),
             ["pr-validated-head"]
         );
         let found = delta_diags(
             &p,
             BODY,
             "deadbeef",
-            &words(&["k/a.rs: let x = 1;"]),
-            &words(&["docs/help.md"]),
+            &Delta {
+                changes: words(&["k/a.rs: let x = 1;"]),
+                embedded: words(&["docs/help.md"]),
+                ..moved
+            },
         );
         assert_eq!(rules(&found), ["pr-validated-head", "pr-validated-head"]);
         assert!(found[0].message.contains("k/a.rs: let x = 1;"));
         assert!(found[1].message.contains("docs/help.md"));
+    }
+
+    #[test]
+    fn a_sync_that_leaves_the_prs_own_change_alone_is_a_warning_only()
+    {
+        let p = pat();
+        let synced = Delta {
+            synced: true,
+            ..Delta::default()
+        };
+        // The PR's own change is the same at both heads: no statement owed.
+        let silent = "## Validation\nValidated at deadbeef.\n";
+        assert_eq!(
+            rules(&delta_diags(&p, silent, "deadbeef", &synced)),
+            ["pr-validated-sync"]
+        );
+        let code = Delta {
+            changes: words(&["k/a.rs: +let x = 2;"]),
+            moved: true,
+            ..synced
+        };
+        let found = delta_diags(&p, BODY, "deadbeef", &code);
+        assert_eq!(rules(&found), ["pr-validated-head"]);
+        assert!(found[0].message.contains("PR's own change"));
+    }
+
+    #[test]
+    fn own_changes_compare_as_multisets_per_file()
+    {
+        let at = |lines: &str| format!("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n{lines}");
+        // The same lines at other places in the file agree.
+        let before = at("@@ -1 +1 @@\n-let x = 1;\n+let x = 2;\n");
+        let after = at("@@ -9 +9 @@\n-let x = 1;\n+let x = 2;\n");
+        assert!(own_change_difference(&before, &after).is_empty());
+        // A changed comment differs, but not in code.
+        let commented = at("@@ -1 +1,2 @@\n-let x = 1;\n+let x = 2;\n+// why\n");
+        let found = own_change_difference(&before, &commented);
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].code);
+        // A changed code line differs in code on both sides.
+        let other = at("@@ -1 +1 @@\n-let x = 1;\n+let x = 3;\n");
+        let found = own_change_difference(&before, &other);
+        let lines: Vec<&str> = found.iter().map(|c| c.line.as_str()).collect();
+        assert_eq!(lines, ["+let x = 2;", "+let x = 3;"]);
+        assert!(found.iter().all(|c| c.code));
+    }
+
+    /// A scratch repository for the checks that read history: `master` and
+    /// a branch `pr` cut from it, built commit by commit.
+    struct Repo
+    {
+        root: std::path::PathBuf,
+    }
+
+    impl Repo
+    {
+        fn new(name: &str) -> Repo
+        {
+            let root = std::env::temp_dir().join(format!(
+                "seraph-pr-check-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let repo = Repo { root };
+            repo.git(&["init", "-q", "-b", "master"]);
+            repo.git(&["config", "user.name", "Test"]);
+            repo.git(&["config", "user.email", "test@example.com"]);
+            repo.git(&["config", "commit.gpgsign", "false"]);
+            repo.commit("a.rs", "fn a() {}\nlet x = 1;\n");
+            repo.commit("b.rs", "fn b() {}\n");
+            repo.git(&["checkout", "-q", "-b", "pr"]);
+            repo
+        }
+
+        fn git(&self, args: &[&str]) -> String
+        {
+            git(&self.root, args).unwrap()
+        }
+
+        /// Write `text` to `file` and commit it on the current branch; the
+        /// new head.
+        fn commit(&self, file: &str, text: &str) -> String
+        {
+            std::fs::write(self.root.join(file), text).unwrap();
+            self.git(&["add", file]);
+            self.git(&["commit", "-q", "-m", &format!("test: {file}")]);
+            self.head()
+        }
+
+        fn head(&self) -> String
+        {
+            self.git(&["rev-parse", "HEAD"]).trim().to_owned()
+        }
+
+        /// Merge `master` into `pr`; on a conflict, `resolve` gives each
+        /// conflicted file's text.
+        fn merge_master(&self, resolve: &[(&str, &str)]) -> String
+        {
+            self.git(&["checkout", "-q", "pr"]);
+            if !git_ok(&self.root, &["merge", "-q", "--no-edit", "master"])
+            {
+                for (file, text) in resolve
+                {
+                    std::fs::write(self.root.join(file), text).unwrap();
+                    self.git(&["add", file]);
+                }
+                self.git(&["commit", "-q", "--no-edit"]);
+            }
+            self.head()
+        }
+
+        fn on_master(&self, file: &str, text: &str)
+        {
+            self.git(&["checkout", "-q", "master"]);
+            self.commit(file, text);
+            self.git(&["checkout", "-q", "pr"]);
+        }
+
+        fn check(&self, validated: &str, note: &str) -> Vec<Diag>
+        {
+            let body = format!("## Validation\nValidated at {}{note}\n", short(validated));
+            check_validated_head(&pat(), &self.root, &body, "master", &self.head()).unwrap()
+        }
+    }
+
+    impl Drop for Repo
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_validated_head_that_is_the_head_passes()
+    {
+        let repo = Repo::new("head");
+        let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        assert!(repo.check(&validated, ".").is_empty());
+    }
+
+    #[test]
+    fn a_comment_only_delta_passes_when_the_body_says_so()
+    {
+        let repo = Repo::new("comment");
+        let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.commit("a.rs", "// why\nfn a() {}\nlet x = 2;\n");
+        assert!(
+            repo.check(&validated, "; later commits are comment-only.")
+                .is_empty()
+        );
+        assert_eq!(rules(&repo.check(&validated, ".")), ["pr-validated-head"]);
+    }
+
+    #[test]
+    fn a_master_merge_touching_other_files_is_a_warning_only()
+    {
+        let repo = Repo::new("sync");
+        let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.on_master("b.rs", "fn b() {}\nfn c() {}\n");
+        repo.merge_master(&[]);
+        assert_eq!(rules(&repo.check(&validated, ".")), ["pr-validated-sync"]);
+    }
+
+    #[test]
+    fn a_master_merge_and_a_later_code_commit_is_an_error()
+    {
+        let repo = Repo::new("sync-code");
+        let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.on_master("b.rs", "fn b() {}\nfn c() {}\n");
+        repo.merge_master(&[]);
+        repo.commit("a.rs", "fn a() {}\nlet x = 3;\n");
+        let found = repo.check(&validated, "; later commits are comment-only.");
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|d| d.rule == "pr-validated-head"));
+        assert!(found.iter().any(|d| d.message.contains("let x = 3;")));
+    }
+
+    #[test]
+    fn a_conflict_resolution_that_changes_an_own_code_line_is_an_error()
+    {
+        let repo = Repo::new("sync-conflict");
+        let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.on_master("a.rs", "fn a() {}\nlet x = 3;\n");
+        repo.merge_master(&[("a.rs", "fn a() {}\nlet x = 4;\n")]);
+        let found = repo.check(&validated, ".");
+        assert!(found.iter().any(|d| d.rule == "pr-validated-head"));
+        assert!(found.iter().any(|d| d.message.contains("let x = 4;")));
     }
 
     #[test]

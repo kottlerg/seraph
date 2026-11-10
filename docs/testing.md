@@ -892,7 +892,7 @@ owes some of the cells runs those boots, and the release host runs run all four.
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
     sysroot/config/svcmgr/services/
-rm -f sysroot/config/svcmgr/services/terminal.svc
+rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
 cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420
 cargo xtask mkdisk --arch <arch> --repack-only --split-data
@@ -924,7 +924,7 @@ is the framebuffer device cell (Device surfaces above).
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
     sysroot/config/svcmgr/services/
-rm -f sysroot/config/svcmgr/services/terminal.svc
+rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only
 cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 360 \
     --display framebuffer --fail-also 'framebuffer case skipped'

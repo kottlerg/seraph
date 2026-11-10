@@ -145,6 +145,15 @@ obtain a read/write capability through devmgr (a device authority), not through
 svcmgr (a service registry): a UART is a device, not a service. The driver's IPC
 contract is specified in [services/drivers/serial/README.md](../services/drivers/serial/README.md).
 
+The debug port is outside the console model. It is a second byte transport, apart from the UART,
+which a boot attaches only on request: a debugger stub owns it to speak to a host debugger, and no
+console output reaches it, so the UART stays the console and the authoritative marker channel.
+Its driver
+([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md))
+serves the same serial protocol, and devmgr hands it only to the service whose definition seeds
+`devmgr.debug` ([device-management.md](device-management.md#relationship-to-other-services)
+§ Relationship to Other Services).
+
 ## The framebuffer driver as sole userspace framebuffer owner
 
 The framebuffer driver owns the bootloader-discovered GOP linear

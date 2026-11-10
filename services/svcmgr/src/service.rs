@@ -179,8 +179,8 @@ pub struct SvcmgrCaps
     /// `rootfs.root`. Zero if init could not derive it.
     pub rootfs_root: u64,
     /// `SEND|GRANT`, badge-0 source on devmgr's registry endpoint. svcmgr
-    /// mints the seed-only `devmgr.registry`, `devmgr.shutdown`, and
-    /// `devmgr.test` publish caps and the `SET_DRIVERS_DIR` cap
+    /// mints the seed-only `devmgr.registry`, `devmgr.shutdown`,
+    /// `devmgr.test`, and `devmgr.debug` publish caps and the `SET_DRIVERS_DIR` cap
     /// (`DRIVERS_DIR_AUTHORITY`) from it. Zero if absent.
     pub devmgr_registry: u64,
     /// `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint, published

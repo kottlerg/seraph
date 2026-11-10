@@ -318,6 +318,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "debug-echo"
+version = "0.1.2"
+dependencies = [
+ "gdb-rsp",
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "debugger"
 version = "0.1.2"
 dependencies = [
@@ -482,6 +492,10 @@ dependencies = [
  "pin-project-lite",
  "slab",
 ]
+
+[[package]]
+name = "gdb-rsp"
+version = "0.1.2"
 
 [[package]]
 name = "getrandom"
@@ -1440,6 +1454,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-console"
+version = "0.1.2"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+ "virtio-core",
+]
+
+[[package]]
 name = "virtio-core"
 version = "0.1.2"
 dependencies = [
@@ -1810,6 +1834,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "fatfs 0.3.6",
+ "gdb-rsp",
  "gimli",
  "gpt",
  "libc",

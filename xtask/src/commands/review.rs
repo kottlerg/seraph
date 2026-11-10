@@ -229,7 +229,7 @@ fn check_stats(out: &mut Vec<Diag>, name: &str, stats: &Value)
     {
         out.push(shape(name, "stats.failed", "is not a list"));
     }
-    if !stats["run"].as_u64().is_some_and(|run| run > 0)
+    if stats["run"].as_u64().is_none_or(|run| run == 0)
     {
         out.push(shape(
             name,

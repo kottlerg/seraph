@@ -4,8 +4,8 @@
 // core/ktest/src/integration/fault_debug.rs
 
 //! Integration: a debugger's breakpoint reaches the thread's exception
-//! handler (docs/fault-handling.md § Debugging). The x86-64 single-step is
-//! `arch/x86_64/single_step.rs`.
+//! handler (docs/fault-handling.md § Debugging). Each architecture's
+//! single-step is its `arch/<arch>/single_step.rs`.
 //!
 //! A child bound to an endpoint for the exception class executes a software
 //! breakpoint (`int3` on x86-64, `ebreak` on riscv64). The handler receives

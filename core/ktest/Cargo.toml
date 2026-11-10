@@ -17,6 +17,7 @@ font           = { workspace = true }
 init-protocol  = { path = "../../abi/init-protocol" }
 ipc            = { path = "../../shared/ipc" }
 process-layout = { workspace = true }
+riscv-step     = { path = "../../shared/riscv-step" }
 syscall        = { path = "../../shared/syscall" }
 syscall-abi    = { path = "../../abi/syscall" }
 text           = { workspace = true }

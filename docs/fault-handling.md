@@ -592,9 +592,34 @@ copies, the kernel adds no debugging interface of its own. The pieces are:
     and from a stop of a thread an interrupt preempted; and the first start of a thread created
     stopped (`THREAD_START_SUSPENDED`) whose trap flag was set before that start, where the entry
     instruction runs first.
-- **No single-step on RISC-V.** RISC-V has no user-mode single-step without a debug trigger. The
+- **Single-step (RISC-V).** RISC-V has no user-mode single-step without a debug trigger, and the
   kernel programs none: an instruction-count trigger is not available through the SBI Debug
-  Triggers extension on the reference platform.
+  Triggers extension on the reference platform, so the extension is unused
+  ([platform-requirements.md](platform-requirements.md) § riscv64 Classification). A debugger steps
+  a stopped thread with breakpoints instead, with no kernel interface beyond the memory copies:
+  - it reads the thread's registers and the instruction at its pointer, and computes the address
+    the thread runs next from them (`shared/riscv-step`,
+    [shared/riscv-step/README.md](../shared/riscv-step/README.md)): the fall-through, a
+    conditional branch's taken or not-taken target, or a jump's target;
+  - it saves the two bytes there and plants the 2-byte `c.ebreak` with `SYS_THREAD_WRITE_MEM` and
+    `THREAD_MEM_TEXT`, so the write takes the kernel's text route described under Text writes
+    below: the frame written through the kernel's own mapping, a frame mapped more than once
+    refused, and instruction fetch synchronised on every hart before the call returns;
+  - it resumes the thread, which runs the one instruction and traps at the `c.ebreak`, delivered as
+    `FAULT_EXC_BREAKPOINT` at the successor's address (RISC-V reports the `ebreak` itself, so no
+    pointer moves back); it writes the two bytes back before the next step or resume.
+
+  One fault arrives per instruction, as `FAULT_EXC_BREAKPOINT`, not `FAULT_EXC_DEBUG`. The
+  `c.ebreak` is two bytes, so it never reaches past the successor's first parcel; the C extension
+  that encodes it is in the riscv64 floor. The route has hazards a hardware step has not:
+  - another thread of the space that runs the stepped code while the breakpoint is planted traps
+    at it too, so the debugger stops the space's other threads while it steps;
+  - a step between `lr` and `sc` loses the reservation, so the `sc` fails each time it is stepped
+    to and a stepped retry loop never ends;
+  - an instruction whose successor lies within its own bytes (a jump to itself, or a 4-byte jump
+    or taken branch to its own second parcel) cannot be stepped, since the breakpoint planted there
+    overwrites it before it runs, and a breakpoint instruction cannot be stepped, since it traps at
+    itself; the decoder refuses both.
 - **Registers.** A handler reads and writes a stopped thread's registers with
   `SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` ([Modifying the faulting
   thread](#modifying-the-faulting-thread)).
@@ -629,13 +654,14 @@ copies, the kernel adds no debugging interface of its own. The pieces are:
   say) writes the emulated result and the next instruction's pointer into the thread's registers
   and resumes it.
 
-The `debugger` fixture drives the breakpoint, the x86-64 single-step, register and same-process
-memory access, and the asynchronous break end to end, then reads and writes a debuggee process's
-memory and plants, takes, and removes a breakpoint in its text
+The `debugger` fixture drives the breakpoint, the single-step on both architectures, register and
+same-process memory access, and the asynchronous break end to end, then reads and writes a debuggee
+process's memory and plants, takes, and removes a breakpoint in its text
 ([programs/debugger/README.md](../programs/debugger/README.md)). ktest
 `integration::fault_exception_redirect` drives a resume at a handler-written instruction pointer
-after an illegal instruction, `integration::single_step` steps a `syscall`, and
-`integration::thread_memory` drives the memory calls' copies, text writes, and refusals.
+after an illegal instruction; `integration::single_step` steps a `syscall` on x86-64 and, on
+riscv64, steps a thread through taken and not-taken branches and jumps, compressed ones among them;
+and `integration::thread_memory` drives the memory calls' copies, text writes, and refusals.
 
 ---
 
@@ -738,7 +764,8 @@ svcmgr service definitions carry no paging key; see
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [core/ktest/README.md](../core/ktest/README.md),
 [Capability Model](capability-model.md), [IPC Design](ipc-design.md),
-[Process Lifecycle](process-lifecycle.md), [Userspace Memory Model](userspace-memory-model.md),
+[Platform Requirements](platform-requirements.md), [Process Lifecycle](process-lifecycle.md),
+[Userspace Memory Model](userspace-memory-model.md),
 [programs/deadline/README.md](../programs/deadline/README.md),
 [programs/debugger/README.md](../programs/debugger/README.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),
@@ -748,4 +775,5 @@ svcmgr service definitions carry no paging key; see
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
-[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md)
+[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md),
+[shared/riscv-step/README.md](../shared/riscv-step/README.md)

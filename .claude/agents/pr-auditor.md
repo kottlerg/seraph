@@ -88,11 +88,13 @@ claims.
    marker, report every unmarked `- [x]` item as FAIL; list, without
    failing, an unmarked tick on an earlier-pattern Issue whose file the
    diff touches but does not deliver, since it may predate the marker. A
-   `Fixes #N` on a follow-up Issue is valid only under the closing
-   condition of `docs/conventions.md` § Branch and PR Workflow: no item
-   left open once the findings of the PR's last run are recorded; a drain
-   that leaves items open MUST say `Refs #N` instead. Report a `Fixes` on
-   such an Issue with open items as FAIL.
+   `Fixes #N` on a rolling Issue is a FAIL: `docs/conventions.md`
+   § Follow-up Issues lets no PR close one. A `Fixes #N` on an
+   earlier-pattern Issue is valid only under that section's closing
+   condition: no item left open once the findings of the PR's last run are
+   recorded, with `Refs #N` beside it; a drain that leaves items open
+   carries `Refs #N` alone. Report a `Fixes` on such an Issue with open
+   items as FAIL.
 
 6. Silent-deferral scan. The target notification is *intent to defer
    mechanically-reachable work this PR should have covered*, not in-code

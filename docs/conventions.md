@@ -399,8 +399,13 @@ items:
 - ticks each on the Issue in the same push, appending `(fixed by PR #M)` with its own number;
 - copies those items, ticked, into its own `## Acceptance` section;
 - MUST reference the Issue with `Refs #N`;
-- closes the Issue with `Fixes #N` only when no item is left open once the findings of its last
-  run are recorded.
+- closes an Issue of the earlier pattern (`<scope>: defects found by PR #N's review`) only when
+  no item is left open once the findings of its last run are recorded, and then carries
+  `Fixes #N` beside the `Refs #N`;
+- MUST NOT close a rolling Issue. The rolling Issue is the one recording sink of its scope for
+  the milestone, so that a scope has one such Issue per milestone and not one per PR. It is
+  closed at step 8 of § Release Production when every item is ticked, and otherwise moves to
+  the next milestone with its open items.
 
 A drain PR MUST NOT file a successor: a finding its run leaves in the same scope is appended to
 the Issue it drains, which stays open. When a follow-up Issue accumulates items of one pattern a
@@ -561,12 +566,12 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    follow `TEMPLATE.md`'s structure.
 7. The maintainer publishes the draft Release manually after verifying the
    `burnin.yml` run for the same tag completed successfully.
-8. The maintainer creates `v<X>.<Y>.<Z+1>` when no `v<X>.<Y>.*` milestone
-   above `v<X>.<Y>.<Z>` is open. Every Issue in `v<X>.<Y>.<Z>` or a lower open
-   milestone moves to `v<X>.<Y>.<Z>` when it is closed and no commit outside
-   the tag closed it, and otherwise to the lowest-versioned open milestone
-   above `v<X>.<Y>.<Z>`. The maintainer then closes `v<X>.<Y>.<Z>` and every lower
-   open milestone; the lowest-versioned open milestone is current
+8. The maintainer creates `v<X>.<Y>.<Z+1>` when no `v<X>.<Y>.*` milestone above `v<X>.<Y>.<Z>`
+   is open, and closes each rolling follow-up Issue of § Branch and PR Workflow whose items are
+   all ticked. Every Issue in `v<X>.<Y>.<Z>` or a lower open milestone moves to `v<X>.<Y>.<Z>`
+   when it is closed and no commit outside the tag closed it, and otherwise to the
+   lowest-versioned open milestone above `v<X>.<Y>.<Z>`. The maintainer then closes
+   `v<X>.<Y>.<Z>` and every lower open milestone; the lowest-versioned open milestone is current
    (§ Milestones).
 
 ---

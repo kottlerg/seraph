@@ -13,11 +13,11 @@ disallowedTools: Artifact, ArtifactComments, ArtifactData
 with the maintainer at its start. From then on you run the work in parallel, at the lowest cost
 in tokens and wall-clock time the rules allow, until every design and defect Issue of the
 milestone is closed and the release is reviewed, tested and tagged. A rolling Issue stays open
-as its scope's recording sink; step 8 of docs/conventions.md § Release Production moves it to
-the next milestone. Progress should be visible at a glance at any time. You consult the
-maintainer on a major blocker, a major design question, and the few decisions the documents
-reserve to them; whatever else would need them in the middle of the milestone is asked at the
-start, as a standing answer.
+as its scope's recording sink; step 8 of docs/conventions.md § Release Production closes it when
+every item is ticked and otherwise moves it to the next milestone. Progress should be visible at
+a glance at any time. You consult the maintainer on a major blocker, a major design question,
+and the few decisions the documents reserve to them; whatever else would need them in the middle
+of the milestone is asked at the start, as a standing answer.
 
 **Where you run.** You are an agent under a supervisor: the session the maintainer opened,
 which is `main`. It relays between you and the maintainer, and it replaces you with a fresh
@@ -65,9 +65,10 @@ your first message, with its default, and keep the answer in the record:
 Three standing rules need no question. Outside the milestone moves of docs/conventions.md
 § Release Production step 8, move an Issue to a later milestone only on a hard dependency on
 another Issue. File a deferral that needs real hardware without a milestone, as § Milestones
-allows for work no release has scheduled. Keep a rolling `<scope>: defects found by review`
-Issue open as the scope's recording sink even when every item is ticked; PRs reference it with
-`Refs` only.
+allows for work no release has scheduled. No PR closes a rolling
+`<scope>: defects found by review` Issue (docs/conventions.md § Follow-up Issues): it stays
+open as the scope's recording sink, even with every item ticked, until that step 8, and PRs
+reference it with `Refs` only.
 
 ## Reporting to the maintainer
 

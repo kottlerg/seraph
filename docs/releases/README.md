@@ -10,7 +10,7 @@ published via the project's release workflow.
 | File | Role |
 |---|---|
 | `README.md` | This document. |
-| `TEMPLATE.md` | Skeleton from which new release notes files are copied. |
+| `TEMPLATE.md` | Skeleton from which new release notes files are authored. |
 | `v<X>.<Y>.<Z>.md` | Release notes for tag `v<X>.<Y>.<Z>`. One file per tag. |
 
 ## Naming

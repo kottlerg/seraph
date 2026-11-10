@@ -1,5 +1,5 @@
 ---
-name: pr-verifier
+name: release-verifier
 description: Read-only investigator for the release-review workflow; scope, refute, render, or draft.
 tools: Read, Grep, Glob, Bash
 model: sonnet

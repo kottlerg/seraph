@@ -259,8 +259,8 @@ decision, or a case with no clearly best option waits for the maintainer.
 - `.claude/CLAUDE.md` edits need the maintainer's own words. A worker whose change has a copy
   there reports it and holds its push; you carry the copy to the maintainer, who applies it or
   authorizes the worker in their own words, which you pass on verbatim.
-- A finding two independent refuters refute is dropped (that section); a finding the workers
-  cannot place is put to the maintainer with your recommendation, in one line.
+- A finding the workers cannot place is put to the maintainer with your recommendation, in one
+  line.
 
 ## Issues
 

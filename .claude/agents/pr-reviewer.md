@@ -119,8 +119,8 @@ discipline below has been applied end-to-end.
    anchor it to, per the criterion `docs/conventions.md` § Branch and PR
    Workflow states, so classify on that criterion, not on the track you
    want. Drift the surface definition excludes you still report, marked
-   out of bound; drift an open Issue already names you report with
-   `in_bound` judged as if no Issue named it and `issue` set. Both are
+   out of bound; drift an open Issue already names you report as on or off
+   the surface as if no Issue named it, naming that Issue. Both are
    recorded rather than fixed, never dropped. Same for system-scope design
    docs: if the diff silently contradicts one, the doc and the code now
    disagree, and that is a finding.
@@ -139,8 +139,7 @@ discipline below has been applied end-to-end.
    finding (it blocks when on the review surface, per `docs/conventions.md`
    § Branch and PR Workflow): bucket Critical, `must_violation` true,
    citing that section, class `standards` (`correctness` when the width
-   defect misbehaves at a CPU count up to `MAX_CPUS`), and `introduced` set
-   as the schema defines for the mode. Most PRs owe no boundary boot
+   defect misbehaves at a CPU count up to `MAX_CPUS`). Most PRs owe no boundary boot
    (`docs/testing.md` § Coverage tiers), so this check is the gate for that
    defect class; do not discount a finding because a boot at the boundary
    CPU counts would catch it.

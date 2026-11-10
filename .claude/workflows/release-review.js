@@ -12,10 +12,13 @@
 // findings go). Scope (one agent) lists the range, its first-parent units (one
 // per merged PR), each unit's files, and the saved review records. Review runs
 // one `pr-reviewer` per shard of the files two or more units touched (no other
-// file is reviewed line by line), whole-range lenses, and the
-// `release-auditor`, all in parallel. Verify puts every finding that can
-// block, and every Critical and Should finding, to two independent refuters as
-// soon as its reviewer completes. Synthesize renders one report and, when the
+// file is reviewed line by line) and whole-range lenses, in parallel. Verify
+// puts every finding that can block, and every Critical and Should finding, to
+// two independent refuters as soon as its reviewer completes. Audit runs the
+// `release-auditor` once the findings are judged, with the known-issue
+// candidates (the blocking-track findings an open Issue names, of this run and
+// the release's earlier runs), so the notes it checks and the notes this run
+// drafts take the same list. Synthesize renders one report and, when the
 // verdict is `RELEASE READY`, drafts the release notes from
 // docs/releases/TEMPLATE.md. The script computes the verdict line itself:
 // `RELEASE BLOCKED` when a reviewer failed, a finding on the blocking track
@@ -40,7 +43,11 @@
 //   mode 'delta' reviews what changed between `since` (the head the last run
 //                reviewed) and the head: the multi-PR files the delta changed,
 //                the lenses over the delta, the fixes claimed since then, and a
-//                correctness-only regression lens over the delta.
+//                correctness-only regression lens over the delta. It also puts
+//                every finding the run at `since` left standing (its record's
+//                `findings`, contested ones aside) to the refuters again, so
+//                one no fix removed still blocks; it aborts when no saved
+//                record of this release reviewed `since`.
 //   mode 'scope' stops after Scope and returns the agent plan and sample
 //                prompts (one agent); with `since` it scopes as delta would.
 //   host_runs    path of the release host-run report; the audit requires it
@@ -63,6 +70,7 @@ export const meta = {
             title: 'Verify',
             detail: 'two independent refuters per finding that can block, or is Critical or Should',
         },
+        { title: 'Audit', detail: 'release-auditor, given the known-issue candidates' },
         { title: 'Synthesize', detail: 'report and notes draft; verdict computed by the script' },
     ],
 }
@@ -119,7 +127,7 @@ const SKIPPED_FILES = ['Cargo.lock']
 // Read-only agent types. The investigator's brief pins a cheaper model for the
 // bounded jobs (scope, refute, render, draft); the reviewers run on the model
 // pr-reviewer.md pins.
-const INVESTIGATOR = 'pr-verifier'
+const INVESTIGATOR = 'release-verifier'
 const REVIEWER = 'pr-reviewer'
 const AUDITOR = 'release-auditor'
 
@@ -136,7 +144,7 @@ const SCOPE_SCHEMA = {
         'head', 'from_sha', 'repo_root', 'tree_at_head', 'from_ancestor', 'since_reachable',
         'range_files', 'range_file_count', 'units', 'version_at_head', 'version_at_from',
         'milestones', 'open_issues', 'ledger_records', 'delta_files', 'delta_file_count',
-        'claimed_fixes',
+        'claimed_fixes', 'prior_known', 'prior_findings', 'since_record',
     ],
     properties: {
         head: { type: 'string', description: 'Full SHA of `git rev-parse HEAD`.' },
@@ -255,6 +263,55 @@ const SCOPE_SCHEMA = {
                     line: { type: 'integer', description: '0 when unknown.' },
                     summary: { type: 'string' },
                     pr: { type: 'integer', description: 'The PR that claims it; 0 when none.' },
+                },
+            },
+        },
+        prior_known: {
+            type: 'array',
+            description:
+                'Every entry of a `recorded` list in this release\'s saved records whose ' +
+                '`disposition` is `known issue`, as its `issue` and `claim`.',
+            items: {
+                type: 'object',
+                required: ['issue', 'claim'],
+                properties: { issue: { type: 'integer' }, claim: { type: 'string' } },
+            },
+        },
+        since_record: {
+            type: 'boolean',
+            description:
+                'In delta mode, one of this release\'s saved records has `stats.head` equal to ' +
+                '`since`; true when no `since` was given.',
+        },
+        prior_findings: {
+            type: 'array',
+            description:
+                'In delta mode, every entry of the `findings` list of this release\'s saved ' +
+                'record whose `stats.head` is `since` (resolved to its full SHA) and whose ' +
+                '`status` is not `contested`, with its fields as saved; empty otherwise.',
+            items: {
+                type: 'object',
+                required: [
+                    'file', 'line', 'bucket', 'class', 'must_violation', 'issue', 'authority',
+                    'claim', 'evidence', 'fix',
+                ],
+                properties: {
+                    file: { type: 'string', description: PATH_DESCRIPTION },
+                    line: { type: 'integer' },
+                    bucket: { enum: ['critical', 'should', 'nit'] },
+                    class: {
+                        enum: [
+                            'correctness', 'safety', 'contract', 'standards', 'doc-drift',
+                            'coverage', 'style',
+                        ],
+                    },
+                    must_violation: { type: 'boolean' },
+                    issue: { type: 'integer' },
+                    prs: { type: 'array', items: { type: 'integer' } },
+                    authority: { type: 'string' },
+                    claim: { type: 'string' },
+                    evidence: { type: 'string' },
+                    fix: { type: 'string' },
                 },
             },
         },
@@ -498,6 +555,16 @@ const SCOPE_PROMPT = [
             ? 'every fix the PR bodies and commit messages since ' + SINCE + ' claim, as file, ' +
                 'line (0 when unknown), a one-line summary, and the PR.'
             : 'an empty array.'),
+    '- prior_known: every known-issue entry of this release\'s saved records: `jq -c ' +
+        '\'(.recorded // [])[] | select(.disposition == "known issue") | {issue, claim}\' ' +
+        RECORD_DIR + '/*-*.json` (none when no record exists).',
+    '- prior_findings: ' +
+        (DELTA
+            ? 'the findings the last run left standing: `jq -c --arg h "$(git rev-parse ' +
+                SINCE + ')" \'select(.stats.head == $h) | (.findings // [])[] | ' +
+                'select(.status != "contested")\' ' + RECORD_DIR + '/*-*.json`, each with ' +
+                'its fields as saved; since_record: whether any record matched `$h` at all.'
+            : 'an empty array; since_record: true.'),
     '',
     'Only scope; do not review. Structured output only.',
 ].join('\n')
@@ -512,6 +579,14 @@ if (!scope.from_ancestor) {
 }
 if (DELTA && !scope.since_reachable) {
     return { error: 'since ' + SINCE + ' does not resolve in this clone; run mode full.' }
+}
+// A delta run carries the last run's standing findings forward; without that
+// run's record it could not, and an unfixed blocker would vanish.
+if (DELTA && MODE !== 'scope' && !scope.since_record) {
+    return {
+        error: 'no saved record under ' + RECORD_DIR + ' reviewed head ' + SINCE +
+            '; save that run\'s record, or run mode full.',
+    }
 }
 
 // The current milestone is the lowest-versioned open one (docs/conventions.md
@@ -543,6 +618,7 @@ const normalize = (p) => {
 for (const f of scope.range_files) f.path = normalize(f.path)
 for (const u of scope.units) u.files = u.files.map(normalize)
 for (const c of scope.claimed_fixes) c.file = normalize(c.file)
+for (const f of scope.prior_findings) f.file = normalize(f.file)
 scope.ledger_records = scope.ledger_records.map(normalize)
 const delta_paths = new Set(scope.delta_files.map(normalize))
 
@@ -838,19 +914,31 @@ const lens_prompt = (lens) =>
         .filter((line) => line !== null)
         .join('\n')
 
-const AUDIT_PROMPT = [
+// The audit runs after Verify, so its known-issue list can take the review's
+// known-issue candidates: the findings on the blocking track an open Issue
+// names, from this run and from the release's earlier runs.
+const audit_prompt = (candidates) => [
     'Release audit for ' + TAG + ' (mode ' + MODE + '): previous release ' + FROM + ' (' +
         scope.from_sha + '), candidate head ' + scope.head + '.',
     'Workspace version at the head ' + scope.version_at_head + ', at the previous release ' +
         scope.version_at_from + '; the head ' + (bumped ? 'carries' : 'predates') +
         ' the bump to ' + VERSION + '.',
     'Release host-run report: ' + (HOST_RUNS ? '`' + HOST_RUNS + '`.' : 'none given.'),
+    'Known-issue candidates of the review (an open Issue names each finding\'s work):',
+    bullets(candidates, (k) => '- #' + k.number + ': ' + k.summary),
     'Units of the range:',
     bullets(scope.units, unit_line),
     '',
     'Run your audit per your brief, every section, and fill the structured schema. Structured ' +
         'output only.',
 ].join('\n')
+
+const prior_candidates = []
+for (const k of scope.prior_known) {
+    if (k.issue && !prior_candidates.some((e) => e.number === k.issue)) {
+        prior_candidates.push({ number: k.issue, summary: k.claim })
+    }
+}
 
 const plan = {
     units: scope.units.length,
@@ -866,6 +954,7 @@ const plan = {
     lenses: lenses.map((l) => l.name),
     design_docs,
     ledger_records: scope.ledger_records.length,
+    carried_findings: scope.prior_findings.length,
     bumped,
     review_agents: shards.length + lenses.length + 1,
 }
@@ -877,7 +966,7 @@ if (MODE === 'scope') {
         sample_prompts: {
             shard: shards.length ? shard_prompt(shards[0]) : null,
             lens: lenses.length ? lens_prompt(lenses[0]) : null,
-            audit: AUDIT_PROMPT,
+            audit: audit_prompt(prior_candidates),
         },
     }
 }
@@ -897,6 +986,10 @@ function verify_prompt(f, lens) {
         '- evidence: ' + f.evidence,
         '- proposed fix: ' + f.fix,
         f.issue ? '- named open Issue: #' + f.issue + ' ' + issue_title(f.issue) : null,
+        f.carried
+            ? '- carried: the run at ' + SINCE + ' reported it, and PRs merged since may have ' +
+                'fixed it or moved its line; refuted=true when the head no longer exhibits it.'
+            : null,
     ].filter((line) => line !== null).join('\n')
     const tree =
         'The working tree is checked out at the head; `git diff ' + scope.from_sha + ' ' +
@@ -1067,35 +1160,36 @@ function verify_one(f) {
     return f.verification
 }
 
+// A delta run carries forward the findings the last run left standing: each is
+// put to the refuters again as still present at the head, so a blocker that no
+// fix removed blocks again, and one the fixes removed is dropped.
+const CARRIED = 'carried:' + (SINCE ? SINCE.slice(0, 8) : '')
+const carried = dedup(
+    scope.prior_findings.map((f) => ({ ...f, prs: f.prs || [], ledger: false })),
+    CARRIED,
+)
+for (const f of carried) f.carried = true
+const carried_verified = parallel(carried.map((f) => () => verify_one(f)))
+if (carried.length) log(CARRIED + ': ' + carried.length + ' findings put to the refuters again')
+
 const review_items = [
     ...shards.map((s) => ({ kind: 'shard', label: s.label, shard: s })),
     ...lenses.map((l) => ({ kind: 'lens', label: 'lens:' + l.name, lens: l })),
-    { kind: 'audit', label: 'audit' },
 ]
 
+// The pipeline skips the remaining stages of an item whose stage value is
+// null, so a failure is wrapped rather than passed through.
 const reviewed = await pipeline(
     review_items,
-    (item) => {
-        const launch = item.kind === 'audit'
-            ? run(AUDIT_PROMPT, {
-                agentType: AUDITOR, label: item.label, phase: 'Review', schema: AUDIT_SCHEMA,
-            })
-            : run(item.kind === 'shard' ? shard_prompt(item.shard) : lens_prompt(item.lens), {
-                agentType: REVIEWER, label: item.label, phase: 'Review', schema: FINDINGS_SCHEMA,
-            })
-        // The pipeline skips the remaining stages of an item whose stage value
-        // is null, so a failure is wrapped rather than passed through.
-        return launch.then((result) => ({ result }), () => ({ result: null }))
-    },
+    (item) =>
+        run(item.kind === 'shard' ? shard_prompt(item.shard) : lens_prompt(item.lens), {
+            agentType: REVIEWER, label: item.label, phase: 'Review', schema: FINDINGS_SCHEMA,
+        }).then((result) => ({ result }), () => ({ result: null })),
     ({ result }, item) => {
         if (!result) {
-            ;(item.kind === 'audit' ? failed_other : failed_review).push(item.label)
+            failed_review.push(item.label)
             log(item.label + ': no result (agent failed or was stopped)')
-            return { item, findings: [], audit: null }
-        }
-        if (item.kind === 'audit') {
-            log('audit: ' + result.verdict)
-            return { item, findings: [], audit: result }
+            return { item, findings: [] }
         }
         const fresh = dedup(result.findings, item.label)
         log(item.label + ': ' + result.findings.length + ' findings, ' + fresh.length + ' new')
@@ -1107,18 +1201,19 @@ const reviewed = await pipeline(
 )
 
 // Whatever the runtime did with a failed item, a missing slot is a failed
-// agent. Reconcile by index so no failure slips past the accounting.
+// reviewer. Reconcile by index so no failure slips past the accounting.
 review_items.forEach((item, i) => {
-    const list = item.kind === 'audit' ? failed_other : failed_review
-    if (!reviewed[i] && !list.includes(item.label)) {
-        list.push(item.label)
+    if (!reviewed[i] && !failed_review.includes(item.label)) {
+        failed_review.push(item.label)
         log(item.label + ': no result (dropped by the pipeline)')
     }
 })
 
 const results = reviewed.filter(Boolean)
-const audit = results.map((r) => r.audit).find(Boolean) || null
-const all = results.flatMap((r) => r.findings)
+const all = [
+    ...(await carried_verified).filter(Boolean),
+    ...results.flatMap((r) => r.findings),
+]
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // A surviving finding on the blocking track blocks the release unless an open
@@ -1134,13 +1229,36 @@ const recorded = [...known, ...nonblocking]
 const count = (list, status) => list.filter((f) => f.status === status).length
 
 log(
-    'Review done: ' + all.length + ' findings; ' + findings.length + ' blocking (' +
-        count(findings, 'confirmed') + ' confirmed, ' + count(findings, 'contested') +
-        ' contested, ' + count(findings, 'unverified') + ' unverified), ' + known.length +
-        ' known-issue candidates, ' + nonblocking.length + ' to record, ' + dropped.length +
-        ' dropped, ' + ledgered.length + ' in the ledger' +
+    'Review done: ' + all.length + ' findings (' + carried.length + ' carried); ' +
+        findings.length + ' blocking (' + count(findings, 'confirmed') + ' confirmed, ' +
+        count(findings, 'contested') + ' contested, ' + count(findings, 'unverified') +
+        ' unverified), ' + known.length + ' known-issue candidates, ' + nonblocking.length +
+        ' to record, ' + dropped.length + ' dropped, ' + ledgered.length + ' in the ledger' +
         (failed_review.length ? '; failed reviewers: ' + failed_review.join(', ') : ''),
 )
+
+// ─── Phase: Audit ───
+
+phase('Audit')
+
+// The known-issue candidates: this run's blocking-track findings an open Issue
+// names, and those of the release's earlier runs, one entry per Issue.
+const candidates = [...prior_candidates]
+for (const f of known) {
+    if (!candidates.some((e) => e.number === f.issue)) {
+        candidates.push({ number: f.issue, summary: f.claim })
+    }
+}
+
+const audit = await run(audit_prompt(candidates), {
+    agentType: AUDITOR, label: 'audit', phase: 'Audit', schema: AUDIT_SCHEMA,
+}).catch(() => null)
+if (!audit) {
+    failed_other.push('audit')
+    log('audit: no result (agent failed or was stopped)')
+} else {
+    log('audit: ' + audit.verdict)
+}
 
 // ─── Verdicts (computed here, not by an agent) ───
 
@@ -1174,15 +1292,15 @@ if (failed_verifiers.length) {
         'result; the affected findings were judged on the remaining votes, or marked unverified.')
 }
 
-// The known issues of the release: the audit's list and the blocking-class
-// findings an open Issue names, one entry per Issue.
+// The known issues of the release are the audit's list, which takes in the
+// candidates above; a candidate the audit left out is kept, one entry per Issue.
 const known_issues = []
 for (const k of (audit && audit.known_issues) || []) {
     if (!known_issues.some((e) => e.number === k.number)) known_issues.push(k)
 }
-for (const f of known) {
-    if (!known_issues.some((e) => e.number === f.issue)) {
-        known_issues.push({ number: f.issue, title: issue_title(f.issue), summary: f.claim })
+for (const k of candidates) {
+    if (!known_issues.some((e) => e.number === k.number)) {
+        known_issues.push({ number: k.number, title: issue_title(k.number), summary: k.summary })
     }
 }
 

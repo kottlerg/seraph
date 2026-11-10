@@ -27,12 +27,12 @@ Production requires before its tag, not code quality: the reviewers own that.
 3. Milestone state: `gh issue list --milestone vX.Y.Z --state all --limit
    500 --json number,title,state,labels,body`. FAIL a closed Issue with an
    unticked acceptance item that § Acceptance checklist discipline does not
-   reconcile. List each closed Issue no commit in the range closed, and each
-   open Issue, as one step 8 of § Release Production moves; FAIL an open
-   Issue whose acceptance items are all ticked unless its title is a
-   follow-up Issue's (`<scope>: defects found by review`), which stays open
-   by design. FAIL an Issue a PR of the range closed that carries no
-   milestone or another one (§ Milestones).
+   reconcile. FAIL an open Issue that is not a follow-up Issue (title
+   `<scope>: defects found by review`, or beginning `<scope>: defects found
+   by PR #<N>'s review`), per the precondition of § Release Production step
+   1. List each closed Issue no commit in the range closed, and each open
+   follow-up Issue, as one step 8 moves. FAIL an Issue a PR of the range
+   closed that carries no milestone or another one (§ Milestones).
 
 4. Version: FAIL when a pre-bump head's workspace version is not the
    previous release's, when a bumped head's is not `X.Y.Z`, or when `X.Y.Z`
@@ -45,7 +45,9 @@ Production requires before its tag, not code quality: the reviewers own that.
    range changed, or when its Known Issues section differs from step 6's
    list.
 
-6. Known issues: every open Issue labelled `bug` or `security`, in any
+6. Known issues: every known-issue candidate the parent lists (a review
+   finding on the blocking track whose work that open Issue names, § Release
+   Production step 2), every open Issue labelled `bug` or `security`, in any
    milestone, whose defect is present at the head, and every known issue the
    previous release's notes list whose Issue is still open; each with a
    one-sentence statement of the shipped defect. Return them as the known
@@ -54,9 +56,8 @@ Production requires before its tag, not code quality: the reviewers own that.
 7. Host runs: before the bump, nothing is owed; say so. At a bumped head,
    read the report the parent names and FAIL when it is missing, when a run
    Release host runs requires is absent or below its count, when an outcome
-   is anything but `PASS`, or when a run's head is not the candidate head
-   (or a commit whose delta to it is documentation or comments only, as
-   § Coverage tiers defines it).
+   is anything but `PASS`, or when a run's head is not the candidate head,
+   the commit to be tagged (§ Release Production steps 4 and 5).
 
 ## Output
 

@@ -152,7 +152,7 @@ were swept to use `svctest` where they meant the services-tier harness.
 ## Commit Messages
 
 A departure from a SHOULD rule of this section is accepted when the PR body records the
-maintainer's acceptance of it, quoting the maintainer's words.
+maintainer's acceptance of it, as a statement of that decision.
 
 ### Title
 
@@ -186,6 +186,10 @@ maintainer's acceptance of it, quoting the maintainer's words.
 - No tool or assistant attribution, in a commit message or a PR description: no attribution
   trailer and no link to an assistant session.
 - No `Co-authored-by` trailers unless the change was genuinely co-authored.
+- No quotation of the maintainer. A commit message, a PR description, an Issue, a comment, and
+  a tracked file MUST state a decision of the maintainer as a decision, in the project's own
+  words, and MUST NOT quote what the maintainer wrote in a working session: a session's wording
+  is not project record. A local, uncommitted record MAY keep the words.
 
 ### Operations
 

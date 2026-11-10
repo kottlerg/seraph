@@ -922,7 +922,8 @@ const lens_prompt = (lens) =>
 
 // The audit runs after Verify, so its known-issue list can take the review's
 // known-issue candidates: the findings on the blocking track an open Issue
-// names, from this run and from the release's earlier runs.
+// names, from this run and, while their Issue is open, from the release's
+// earlier runs.
 const audit_prompt = (candidates) => [
     'Release audit for ' + TAG + ' (mode ' + MODE + '): previous release ' + FROM + ' (' +
         scope.from_sha + '), candidate head ' + scope.head + '.',
@@ -1243,10 +1244,21 @@ review_items.forEach((item, i) => {
 })
 
 const results = reviewed.filter(Boolean)
-const all = [
-    ...(await carried_verified).filter(Boolean),
-    ...results.flatMap((r) => r.findings),
-]
+const carried_judged = (await carried_verified).filter(Boolean)
+// A reviewer that reads the file whole reports a still-unfixed carried finding
+// again. Once both are judged, a surviving fresh record that matches a
+// surviving carried one, as dedup matches, is folded into it, so a standing
+// blocker counts once in every run; when the carried record was dropped as
+// fixed, the fresh one stands on its own.
+const fresh_judged = []
+for (const f of results.flatMap((r) => r.findings)) {
+    const twin = f.status === 'dropped'
+        ? null
+        : nearest(carried_judged.filter((c) => c.status !== 'dropped'), f, f.sources[0])
+    if (twin) absorb(twin, f, f.sources[0])
+    else fresh_judged.push(f)
+}
+const all = [...carried_judged, ...fresh_judged]
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // A surviving finding on the blocking track blocks the release unless an open
@@ -1275,7 +1287,8 @@ log(
 phase('Audit')
 
 // The known-issue candidates: this run's blocking-track findings an open Issue
-// names, and those of the release's earlier runs, one entry per Issue.
+// names, and those of the release's earlier runs whose Issue is still open,
+// one entry per Issue.
 const candidates = [...prior_candidates]
 for (const f of known) {
     if (!candidates.some((e) => e.number === f.issue)) {

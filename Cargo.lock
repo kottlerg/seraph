@@ -318,6 +318,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "debug-echo"
+version = "0.1.2"
+dependencies = [
+ "gdb-rsp",
+ "ipc",
+ "syscall",
+]
+
+[[package]]
 name = "debugger"
 version = "0.1.2"
 dependencies = [
@@ -1444,6 +1453,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-console"
+version = "0.1.2"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+ "virtio-core",
+]
+
+[[package]]
 name = "virtio-core"
 version = "0.1.2"
 dependencies = [
@@ -1814,6 +1833,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "fatfs 0.3.6",
+ "gdb-rsp",
  "gimli",
  "gpt",
  "libc",

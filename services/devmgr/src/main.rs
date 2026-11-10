@@ -118,14 +118,16 @@ fn main() -> !
     let mut catalog = DeviceCatalog::default();
 
     // Every driver this boot can spawn, each at most once: one per
-    // virtio-blk and virtio-input device, the simple-device drivers, and the
-    // test-only fault batch (TODO(#165): drop it with that shim). The
+    // virtio-blk and virtio-input device, the debug port's virtio-console
+    // driver, the simple-device drivers, and the test-only fault batch
+    // (TODO(#165): drop it with that shim). The
     // watch's death queue is sized to them, so every death observer is
     // funded and no death is dropped.
     let driver_count = devices
         .iter()
         .filter(|d| pci::is_virtio_blk(d) || pci::is_virtio_input(d))
         .count()
+        + usize::from(devices.iter().any(pci::is_virtio_console))
         + SIMPLE_DEVICE_DRIVERS
         + IOMMU_DRIVERS
         + ipc::devmgr_labels::TEST_FAULT_DRIVERS
@@ -199,8 +201,12 @@ fn main() -> !
             pending_inputs.len() as u64
         );
     }
+    // The debug port, likewise deferred: the first virtio-console device,
+    // when the machine presents one.
+    let mut pending_debug_port =
+        enumerate_debug_port(&devices, &mut caps, &mut irq_range, &mut catalog);
 
-    // On-disk driver state. The RTC and virtio-input binaries live on the
+    // On-disk driver state. The RTC, virtio-input, and virtio-console binaries live on the
     // rootfs at `/services/drivers/<driver>`, not in the boot bundle.
     // svcmgr delivers a `LOOKUP | READ`-attenuated `/services/drivers/`
     // subtree cap via `SET_DRIVERS_DIR` at handover; the walks,
@@ -444,6 +450,7 @@ fn main() -> !
                         &mut caps,
                         drivers_dir_cap,
                         core::mem::take(&mut pending_inputs),
+                        pending_debug_port.take(),
                         &mut watch,
                         &mut catalog,
                         &mut served,
@@ -501,6 +508,31 @@ fn main() -> !
                     reply_served(
                         lookup_ordinal(&served.input, &msg),
                         ipc::input_labels::READ_AUTHORITY,
+                        ipc::devmgr_errors::NO_DEVICE,
+                        ipc_buf,
+                    );
+                }
+            }
+            ipc::devmgr_labels::QUERY_DEBUG_PORT_DEVICE =>
+            {
+                // Like QUERY_INPUT_DEVICE: the driver is spawned on-disk by
+                // the SET_DRIVERS_DIR handler, so none is served until then.
+                // Gated on DEBUG_PORT_AUTHORITY, which only the seed-only
+                // devmgr.debug cap carries. Do not `seraph::log!` here, as
+                // in the device queries it mirrors.
+                if badge & ipc::devmgr_labels::DEBUG_PORT_AUTHORITY == 0
+                {
+                    reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+                }
+                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+                }
+                else
+                {
+                    reply_served(
+                        served.debug_port.get(0),
+                        ipc::serial_labels::WRITE_AUTHORITY | ipc::serial_labels::READ_AUTHORITY,
                         ipc::devmgr_errors::NO_DEVICE,
                         ipc_buf,
                     );
@@ -1803,6 +1835,8 @@ enum DriverClass
 {
     Block,
     Input,
+    /// The debug port: the virtio-console driver.
+    DebugPort,
     Serial,
     Framebuffer,
     Rtc,
@@ -1826,6 +1860,7 @@ impl DriverClass
         {
             Self::Block => "virtio-blk",
             Self::Input => "virtio-input",
+            Self::DebugPort => "virtio-console",
             Self::Serial => "serial",
             Self::Framebuffer => "framebuffer",
             Self::Rtc => "rtc",
@@ -1958,6 +1993,7 @@ struct ServedDrivers
 {
     block: Served<ServedDriver>,
     input: Served<ServedDriver>,
+    debug_port: Served<ServedDriver>,
     serial: Served<ServedDriver>,
     framebuffer: Served<ServedDriver>,
     rtc: Served<ServedDriver>,
@@ -1983,6 +2019,7 @@ impl ServedDrivers
         {
             DriverClass::Block => &mut self.block,
             DriverClass::Input => &mut self.input,
+            DriverClass::DebugPort => &mut self.debug_port,
             DriverClass::Serial => &mut self.serial,
             DriverClass::Framebuffer => &mut self.framebuffer,
             DriverClass::Rtc => &mut self.rtc,
@@ -2029,7 +2066,12 @@ impl ServedDrivers
             return;
         }
         let confined = |d: &ServedDriver| d.dev_caps.as_ref().is_some_and(|c| c.dma.confined());
-        for class in [DriverClass::Block, DriverClass::Input, DriverClass::TestDma]
+        for class in [
+            DriverClass::Block,
+            DriverClass::Input,
+            DriverClass::DebugPort,
+            DriverClass::TestDma,
+        ]
         {
             self.class_mut(class).withdraw_matching(confined, |d| {
                 std::os::seraph::log!("{}: its device's IOMMU is gone; withdrawn", class.name());
@@ -2133,6 +2175,7 @@ impl ServedDrivers
         for class in [
             DriverClass::Block,
             DriverClass::Input,
+            DriverClass::DebugPort,
             DriverClass::Serial,
             DriverClass::Framebuffer,
             DriverClass::Rtc,
@@ -2543,7 +2586,7 @@ fn carve_virtio_bars(
     Some(bars)
 }
 
-// ── VirtIO input (keyboard) driver: deferred on-disk spawn ──────────────────
+// ── VirtIO input and console drivers: deferred on-disk spawn ───────────────
 
 /// Discover every virtio-input device, in BDF order: fill its
 /// `DeviceCatalog` entry and carve its BAR + IRQ caps, returning the stash
@@ -2575,18 +2618,48 @@ fn enumerate_virtio_input(
     pending
 }
 
+/// Discover the debug port: the first virtio-console device in BDF order,
+/// its catalog entry filled and its BAR + IRQ caps carved for a deferred
+/// on-disk spawn, as [`enumerate_virtio_input`] does for each keyboard.
+/// `None` when the machine presents no such device, which is every boot that
+/// does not ask for a debug port, or when its carve fails. A further console
+/// device is left unbound: one consumer owns the debug port.
+fn enumerate_debug_port(
+    devices: &[pci::PciDevice],
+    caps: &mut caps::DevmgrCaps,
+    irq_range: &mut IrqRangeAllocator,
+    catalog: &mut DeviceCatalog,
+) -> Option<VirtioDeviceCaps>
+{
+    let pci_dev = devices.iter().find(|d| pci::is_virtio_console(d))?;
+    let dev_caps = carve_virtio_device(
+        DriverClass::DebugPort.name(),
+        pci_dev,
+        caps,
+        irq_range,
+        catalog,
+    )?;
+    std::os::seraph::log!("devmgr: debug port enumerated (deferred spawn)");
+    Some(dev_caps)
+}
+
 /// Spawn and settle the on-disk batch, from inside the `SET_DRIVERS_DIR`
 /// registry-loop arm, after the handler's `ipc_reply` to svcmgr and before
 /// devmgr's next receive: the platform RTC driver, then the virtio-input
-/// driver of every stashed device, in BDF order, each walked through
-/// `drivers_dir_cap`, the `LOOKUP | READ`-attenuated `/services/drivers/`
-/// subtree cap svcmgr delivered (namespace-protocol rights, not kernel cap
-/// rights). A driver not spawned, or not ready when the batch settles, is
-/// never served, and its device's carved caps are released.
+/// driver of every stashed device, in BDF order, then the debug port's
+/// virtio-console driver, each walked through `drivers_dir_cap`, the
+/// `LOOKUP | READ`-attenuated `/services/drivers/` subtree cap svcmgr
+/// delivered (namespace-protocol rights, not kernel cap rights). A driver not
+/// spawned, or not ready when the batch settles, is never served, and its
+/// device's carved caps are released.
+// too_many_arguments: the batch spans every on-disk driver class; each
+// argument is state one of its spawns consumes.
+#[allow(clippy::too_many_arguments)]
 fn spawn_on_disk_drivers(
     caps: &mut caps::DevmgrCaps,
     drivers_dir_cap: u64,
     pending_inputs: Vec<VirtioDeviceCaps>,
+    pending_debug_port: Option<VirtioDeviceCaps>,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
     served: &mut ServedDrivers,
@@ -2597,7 +2670,7 @@ fn spawn_on_disk_drivers(
     else
     {
         std::os::seraph::log!("on-disk batch: no settle batch; no driver spawned");
-        for dev_caps in &pending_inputs
+        for dev_caps in pending_inputs.iter().chain(&pending_debug_port)
         {
             dev_caps.release();
         }
@@ -2614,15 +2687,23 @@ fn spawn_on_disk_drivers(
         catalog,
         ipc_buf,
     );
-    for dev_caps in pending_inputs
+    let pending = pending_inputs
+        .into_iter()
+        .map(|d| (DriverClass::Input, d))
+        .chain(pending_debug_port.map(|d| (DriverClass::DebugPort, d)));
+    for (class, dev_caps) in pending
     {
         if roster.try_reserve_one().is_err()
         {
-            std::os::seraph::log!("virtio-input: no memory to record a driver; not spawned");
+            std::os::seraph::log!(
+                "{}: no memory to record a driver; not spawned",
+                class.name()
+            );
             dev_caps.release();
             continue;
         }
-        if let Some((ep, child)) = spawn_virtio_input_from_disk(
+        if let Some((ep, child)) = spawn_virtio_from_disk(
+            class,
             caps,
             &dev_caps,
             &batch,
@@ -2634,7 +2715,7 @@ fn spawn_on_disk_drivers(
             let mut dev_caps = dev_caps;
             dev_caps.release_token = child.release_token;
             let spawned = SpawnedDriver {
-                class: DriverClass::Input,
+                class,
                 badge: dev_caps.device_badge,
                 driver: ServedDriver {
                     ep,
@@ -2656,8 +2737,9 @@ fn spawn_on_disk_drivers(
     );
 }
 
-/// Spawn the on-disk virtio-input driver for one stashed device into the
-/// settle `batch`. Walks `/services/drivers/virtio-input` through the
+/// Spawn the on-disk `VirtIO` driver of `class` for one stashed device into
+/// the settle `batch`. Walks `/services/drivers/<name>`, the class's
+/// [`DriverClass::name`] (`virtio-input` or `virtio-console`), through the
 /// `SET_DRIVERS_DIR` subtree cap, then hands the carved BAR/IRQ caps (stashed
 /// at enumeration) to the file-source PCI spawn path. Returns the freshly
 /// created service endpoint and the driver's process handle and release token
@@ -2665,7 +2747,8 @@ fn spawn_on_disk_drivers(
 /// Mirrors [`spawn_rtc_from_disk`], but uses [`spawn::spawn_driver`] (BAR +
 /// IRQ + device-info) rather than the simple-device path. On failure it
 /// returns `None` and releases the stashed BAR and IRQ caps.
-fn spawn_virtio_input_from_disk(
+fn spawn_virtio_from_disk(
+    class: DriverClass,
     caps: &mut caps::DevmgrCaps,
     pending: &VirtioDeviceCaps,
     batch: &settle::SettleBatch,
@@ -2674,24 +2757,25 @@ fn spawn_virtio_input_from_disk(
     ipc_buf: *mut u64,
 ) -> Option<(u64, spawn::HeldChild)>
 {
+    let name = class.name();
     let requested_rights = u64::from(namespace_protocol::rights::READ);
     // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
     // registered at startup), passed down unchanged.
     let walked = unsafe {
-        ns_client::walk_to_file(drivers_dir_cap, b"virtio-input", requested_rights, ipc_buf)
+        ns_client::walk_to_file(drivers_dir_cap, name.as_bytes(), requested_rights, ipc_buf)
     };
     let Some(walked) = walked
     else
     {
-        std::os::seraph::log!("virtio-input: walk_to_file failed (binary missing on rootfs)");
+        std::os::seraph::log!("{}: walk_to_file failed (binary missing on rootfs)", name);
         pending.release();
         return None;
     };
 
-    let Some(input_ep) = create_service_endpoint()
+    let Some(service_ep) = create_service_endpoint()
     else
     {
-        std::os::seraph::log!("virtio-input: failed to create service endpoint");
+        std::os::seraph::log!("{}: failed to create service endpoint", name);
         let _ = syscall::cap_delete(walked.file_cap);
         pending.release();
         return None;
@@ -2708,7 +2792,7 @@ fn spawn_virtio_input_from_disk(
         dma_cap: pending.dma.cap(),
         irq_cap: pending.irq_cap,
         irq_mode: pending.irq_mode,
-        service_ep: input_ep,
+        service_ep,
         query_ep: batch.driver_ep(),
         death_eq,
         device_badge: pending.device_badge,
@@ -2721,19 +2805,19 @@ fn spawn_virtio_input_from_disk(
     {
         spawn::DriverSpawn::Bootstrapped(child) =>
         {
-            std::os::seraph::log!("devmgr: virtio-input driver spawned from disk");
-            Some((input_ep, child))
+            std::os::seraph::log!("devmgr: {} driver spawned from disk", name);
+            Some((service_ep, child))
         }
         spawn::DriverSpawn::Unbootstrapped(child) =>
         {
             withdraw_device(pending, child, ipc_buf);
-            let _ = syscall::cap_delete(input_ep);
+            let _ = syscall::cap_delete(service_ep);
             pending.release();
             None
         }
         spawn::DriverSpawn::Failed =>
         {
-            let _ = syscall::cap_delete(input_ep);
+            let _ = syscall::cap_delete(service_ep);
             pending.release();
             None
         }

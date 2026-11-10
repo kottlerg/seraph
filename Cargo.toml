@@ -40,6 +40,8 @@ members = [
     "services/drivers/virtio/core",
     "services/drivers/virtio/blk",
     "services/drivers/virtio/input",
+    "services/drivers/virtio/console",
+    "services/debug-echo",
     "services/fs/fat",
     "services/fs/fat/fat-parse",
     "abi/boot-protocol",

@@ -1266,8 +1266,10 @@ fn attach_process(
         let mut req = IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
             .word(0, badge)
             .word(1, first);
+        // The watch carries `OBSERVE` alone: procmgr only reads the thread's
+        // state, which takes no right.
         if first == 0
-            && let Ok(watch) = syscall::cap_derive(self_thread, syscall::RIGHTS_ALL)
+            && let Ok(watch) = syscall::cap_derive(self_thread, syscall_abi::RIGHTS_THREAD_OBSERVE)
         {
             req = req.cap(watch);
         }

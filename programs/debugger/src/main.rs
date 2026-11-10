@@ -190,8 +190,8 @@ fn debuggee_process()
 #[unsafe(no_mangle)]
 static GDB_TARGET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The `--gdb-target` worker thread's progress, which the batch test reads
-/// through the worker's own registers.
+/// The count of [`gdb_target_worker_step`] calls: the `--gdb-target` worker
+/// thread's progress, for a host session to watch.
 #[unsafe(no_mangle)]
 static GDB_TARGET_WORKER: AtomicU64 = AtomicU64::new(0);
 

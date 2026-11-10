@@ -462,13 +462,13 @@ pub mod procmgr_labels
     /// otherwise). `data[0]` names the target: its process badge, or the badge
     /// a fault message on the crash endpoint carries for one of its threads;
     /// `data[1]` is the index of the first thread to return. `caps[0]`, when
-    /// sent, is a Thread cap of the caller's own main thread: procmgr keeps
-    /// it as the target's debugger, and once that thread has exited it
-    /// restores the target's crash bindings as [`DETACH_PROCESS`] does, so a
-    /// debugger that dies attached leaves no thread bound to its dead
-    /// endpoint. Replies `SUCCESS`
-    /// with `data[0]` the number of live threads procmgr holds for the target
-    /// (its main thread, then each registered one, [`REGISTER_THREAD`]),
+    /// sent, is a Thread cap of the caller's own main thread, of any rights
+    /// (procmgr only reads the thread's state): procmgr keeps it as the
+    /// target's debugger, and once that thread has exited it restores the
+    /// target's crash bindings as [`DETACH_PROCESS`] does, so a debugger that
+    /// dies attached leaves no thread bound to its dead endpoint. Replies
+    /// `SUCCESS` with `data[0]` the number of live threads procmgr holds for
+    /// the target (its main thread, then each registered one, [`REGISTER_THREAD`]),
     /// `data[1]` its load bias, `data[2]`/`data[3]` the start and end of its
     /// biased text, `data[4]` the address of its `ProcessInfo` page,
     /// `data[`[`ATTACH_WORD_PROCESS_BADGE`]`]` the target's process badge, and

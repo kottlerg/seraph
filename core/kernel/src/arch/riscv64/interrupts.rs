@@ -75,7 +75,7 @@ use super::encoding::{
     plic_threshold_offset_for, sbi_hart_mask,
 };
 use super::trap_frame::TrapFrame;
-use crate::mm::paging::phys_to_virt;
+use crate::mm::paging::{UserAccess, phys_to_virt};
 
 // ── PLIC constants ────────────────────────────────────────────────────────────
 
@@ -689,11 +689,15 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         // kill path.
         if is_userspace && matches!(cause_code, 12 | 13 | 15)
         {
-            let write = cause_code == 15;
-            let instr = cause_code == 12;
+            let access = match cause_code
+            {
+                12 => UserAccess::Fetch,
+                15 => UserAccess::Store,
+                _ => UserAccess::Load,
+            };
             // SAFETY: S-mode; the faulting hart's satp is still active (no
             // context switch since trap entry — SIE is clear).
-            if unsafe { super::paging::user_fault_is_spurious(stval, write, instr) }
+            if unsafe { super::paging::user_fault_is_spurious(stval, access) }
             {
                 // SAFETY: S-mode; drops the stale TLB entry so the retried
                 // instruction re-walks the now-satisfying mapping.
@@ -853,12 +857,17 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 // U-mode fault: flush it and retry the copy, so a page a fault
                 // handler has just mapped is not failed or delivered again
                 // (docs/fault-handling.md § Kernel Copies).
-                let write = cause_code == 15;
-                let spurious = matches!(cause_code, 13 | 15) && {
+                let access = match cause_code
+                {
+                    13 => Some(UserAccess::Load),
+                    15 => Some(UserAccess::Store),
+                    _ => None,
+                };
+                let spurious = access.is_some_and(|access| {
                     // SAFETY: S-mode in the copying thread's context; its satp
                     // is still active (SIE is clear).
-                    unsafe { super::paging::user_fault_is_spurious(live.stval, write, false) }
-                };
+                    unsafe { super::paging::user_fault_is_spurious(live.stval, access) }
+                });
                 if spurious
                 {
                     // SAFETY: S-mode; drops the stale entry for the retry.

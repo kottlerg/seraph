@@ -38,7 +38,7 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 pub use boot_protocol::riscv_paging::PagingMode;
 use boot_protocol::riscv_paging::{next_level_boundary, vpn_index};
 
-use crate::mm::paging::{PageFlags, PagingError, PoolState};
+use crate::mm::paging::{PageFlags, PagingError, PoolState, UserAccess};
 
 // ── Active paging mode ────────────────────────────────────────────────────────
 
@@ -1657,34 +1657,24 @@ fn map_rights_superset(new: u64, prior: u64) -> bool
 
 // ── Spurious-fault classification ─────────────────────────────────────────────
 
-/// Whether a leaf PTE grants a user-mode access of the given class.
+/// Whether a leaf PTE grants a user-mode `access`.
 ///
-/// `write` = the faulting access was a store/AMO; `instr` = an instruction
-/// fetch (a plain load has both false). A user page fault is *spurious* (stale
-/// TLB) only when the live PTE is valid, user-accessible (U), and already
-/// grants the access: a load needs `READ`, a store needs `WRITE`, a fetch
-/// needs `EXECUTE`. The kernel does not make execute-only pages readable (MXR is
-/// kept clear), so each access class checks exactly its own bit. The NAPOT N
-/// bit does not participate: a NAPOT member carries the same V/U/R/W/X bits
-/// as the per-page leaf it stands for.
-fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
+/// A user page fault is *spurious* (stale TLB) only when the live PTE is
+/// valid, user-accessible (U), and already grants the access: a load needs
+/// `READ`, a store or AMO needs `WRITE`, a fetch needs `EXECUTE`. The kernel
+/// does not make execute-only pages readable (MXR is kept clear), so each
+/// access checks exactly its own bit. The NAPOT N bit does not participate: a
+/// NAPOT member carries the same V/U/R/W/X bits as the per-page leaf it stands
+/// for.
+fn pte_permits_user_access(pte: u64, access: UserAccess) -> bool
 {
-    if pte & VALID == 0 || pte & USER == 0
+    let grant = match access
     {
-        return false;
-    }
-    if instr
-    {
-        pte & EXECUTE != 0
-    }
-    else if write
-    {
-        pte & WRITE != 0
-    }
-    else
-    {
-        pte & READ != 0
-    }
+        UserAccess::Load => READ,
+        UserAccess::Store => WRITE,
+        UserAccess::Fetch => EXECUTE,
+    };
+    pte & VALID != 0 && pte & USER != 0 && pte & grant != 0
 }
 
 /// The access a user leaf PTE (from [`translate_user_page`]) grants, or
@@ -1699,9 +1689,9 @@ pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
 /// Classify a userspace page fault at `va` as a spurious stale-TLB fault.
 ///
 /// Walks the *current* (`satp`) page tables for `va` and returns `true` iff
-/// `va` is mapped, user-accessible, and the live leaf PTE permits the faulting
-/// access — meaning the fault must be a stale TLB entry the hart resolves on
-/// retry after a local `sfence.vma`. Returns `false` for any genuine fault
+/// `va` is mapped, user-accessible, and the live leaf PTE permits `access`,
+/// the faulting access — meaning the fault must be a stale TLB entry the hart
+/// resolves on retry after a local `sfence.vma`. Returns `false` for any genuine fault
 /// (unmapped, or the live mapping still forbids the access); the caller then
 /// delivers it as a genuine fault per [fault-handling.md](../../../../../docs/fault-handling.md).
 /// A `true` result requires the live PTE to grant
@@ -1713,7 +1703,7 @@ pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
 /// Must run in S-mode in the faulting thread's context, i.e. before `satp` has
 /// been changed by a context switch.
 #[cfg(not(test))]
-pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
+pub unsafe fn user_fault_is_spurious(va: u64, access: UserAccess) -> bool
 {
     // SAFETY: S-mode; reads satp to recover the active page-table root.
     let root_phys = unsafe { read_root_phys() };
@@ -1721,7 +1711,7 @@ pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
     // SAFETY: root_virt is the direct-map VA of the active root.
     match unsafe { translate_user_page(root_virt, va) }
     {
-        Some((_pa, pte)) => pte_permits_user_access(pte, write, instr),
+        Some((_pa, pte)) => pte_permits_user_access(pte, access),
         None => false,
     }
 }
@@ -2027,33 +2017,31 @@ mod tests
 
     // ── Spurious-fault classification ──────────────────────────────────────────
 
-    const USER_BIT: u64 = 1 << 4;
-
     #[test]
     fn permits_load_only_when_readable()
     {
-        let x_only = VALID | USER_BIT | EXECUTE; // execute-only, MXR clear
-        let r = VALID | USER_BIT | READ;
-        assert!(!pte_permits_user_access(x_only, false, false));
-        assert!(pte_permits_user_access(r, false, false));
+        let x_only = VALID | USER | EXECUTE; // execute-only, MXR clear
+        let r = VALID | USER | READ;
+        assert!(!pte_permits_user_access(x_only, UserAccess::Load));
+        assert!(pte_permits_user_access(r, UserAccess::Load));
     }
 
     #[test]
     fn permits_store_only_when_writable()
     {
-        let ro = VALID | USER_BIT | READ;
-        let rw = VALID | USER_BIT | READ | WRITE;
-        assert!(!pte_permits_user_access(ro, true, false));
-        assert!(pte_permits_user_access(rw, true, false));
+        let ro = VALID | USER | READ;
+        let rw = VALID | USER | READ | WRITE;
+        assert!(!pte_permits_user_access(ro, UserAccess::Store));
+        assert!(pte_permits_user_access(rw, UserAccess::Store));
     }
 
     #[test]
     fn permits_fetch_only_when_executable()
     {
-        let rw = VALID | USER_BIT | READ | WRITE;
-        let rx = VALID | USER_BIT | READ | EXECUTE;
-        assert!(!pte_permits_user_access(rw, false, true));
-        assert!(pte_permits_user_access(rx, false, true));
+        let rw = VALID | USER | READ | WRITE;
+        let rx = VALID | USER | READ | EXECUTE;
+        assert!(!pte_permits_user_access(rw, UserAccess::Fetch));
+        assert!(pte_permits_user_access(rx, UserAccess::Fetch));
     }
 
     #[test]
@@ -2061,10 +2049,10 @@ mod tests
     {
         // Valid + RWX but supervisor-only (U clear): a U-mode access is genuine.
         let kernel = VALID | READ | WRITE | EXECUTE;
-        assert!(!pte_permits_user_access(kernel, false, false));
+        assert!(!pte_permits_user_access(kernel, UserAccess::Load));
         // Invalid: genuine fault regardless of other bits.
-        let invalid = USER_BIT | READ | WRITE | EXECUTE;
-        assert!(!pte_permits_user_access(invalid, false, false));
+        let invalid = USER | READ | WRITE | EXECUTE;
+        assert!(!pte_permits_user_access(invalid, UserAccess::Load));
     }
 
     // ── Shootdown-elision classification ───────────────────────────────────────
@@ -2077,7 +2065,7 @@ mod tests
     /// Raw leaf PTE bits: valid user page on `frame` with the given rights.
     fn leaf(frame: u64, r: bool, w: bool, x: bool) -> u64
     {
-        let mut pte = VALID | USER_BIT | ((frame >> 12) << 10);
+        let mut pte = VALID | USER | ((frame >> 12) << 10);
         if r
         {
             pte |= READ;

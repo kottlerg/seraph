@@ -237,6 +237,21 @@ impl MapOutcome
     }
 }
 
+/// The access a user page fault made, as the architecture's fault report
+/// encodes it, for the spurious-fault retry
+/// (`arch::current::paging::user_fault_is_spurious`), which asks whether the
+/// live leaf PTE grants it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserAccess
+{
+    /// A data read.
+    Load,
+    /// A data write (on RISC-V, a store or AMO).
+    Store,
+    /// An instruction fetch.
+    Fetch,
+}
+
 // ── Static boot table pool ────────────────────────────────────────────────────
 
 /// Number of 4 KiB frames in the stage-1 BSS seed (256 KiB).

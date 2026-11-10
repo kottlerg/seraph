@@ -78,9 +78,10 @@ arch-private support code (`gdt`, `idt`, `ioapic`/`sbi`, `fpu`, `platform`, `ap_
 whose internals are not part of the contract; the items neutral code calls from them are
 listed, with their signatures, in § Module-level constants and free functions.
 
-Addresses cross this boundary as raw `u64`. Page-permission and page-table-rewrite types
-(`PageFlags`, `MapOutcome`, `PagingError`) are architecture-neutral and defined in
-`mm::paging`; the per-architecture mapping code maps them to hardware bits.
+Addresses cross this boundary as raw `u64`. Page-permission, page-table-rewrite, and
+fault-access types (`PageFlags`, `MapOutcome`, `PagingError`, `UserAccess`) are
+architecture-neutral and defined in `mm::paging`; the per-architecture code maps them to and
+from hardware bits.
 
 ---
 
@@ -277,13 +278,14 @@ pub unsafe fn enable_tagged_tlb() -> usize;
 /// before the first userspace mapping or TLB shootdown.
 pub unsafe fn verify_paging_extensions();
 
-/// Classify a user page fault as spurious (the live PTE already permits the
-/// access — a stale entry the handler resolves by retrying) versus a real fault.
+/// Classify a user page fault as spurious (the live PTE already permits
+/// `access`, the faulting load, store, or fetch — a stale entry the handler
+/// resolves by retrying) versus a real fault.
 /// Only a user-accessible leaf can make a fault spurious, so a kernel-half `va`
 /// never is (x86-64 refuses one before walking). Called only by each
 /// architecture's own page-fault handler, for a user-mode fault and for a
 /// fault inside `cpu::copy_user`, not by neutral code.
-pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool;
+pub unsafe fn user_fault_is_spurious(va: u64, access: UserAccess) -> bool;
 
 /// The `FAULT_ACCESS_PRESENT` bit of the fault message the syscall dispatcher
 /// builds for a restartable syscall's user-copy fault at `va`

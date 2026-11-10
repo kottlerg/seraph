@@ -110,8 +110,8 @@ the full contract.
 ### Byte heap (`System`)
 
 `std::sys::seraph::alloc` provides the platform allocator functions behind std's `System`
-allocator and its default global allocator, so no `#[global_allocator]` override is needed. Every `Box`, `Vec`,
-`String`, and `alloc`/`std` collection allocates here. The grow path
+allocator and its default global allocator, so no `#[global_allocator]` override is needed.
+Every `Box`, `Vec`, `String`, and `alloc`/`std` collection allocates here. The grow path
 requests Memory caps from memmgr via `memmgr_labels::REQUEST_MEMORY_CAPS` on
 `ProcessInfo.memmgr_endpoint_cap`, mapping them at a contiguous VA above the
 heap's high-water mark with a single multi-page `mem_map` per returned cap;

@@ -17,8 +17,8 @@ standing request to run it on every PR once CI is green.
 2. Refresh the PR body to the head under review: the validated head, the Validation report, the
    Acceptance ticks, every claim.
 3. `cargo xtask pr-check <N>`, and fix what it reports. It checks the commits, the body's boxes
-   and validated head, and the ticks and milestone of each Issue the PR closes or references, so
-   the audit spends its run on what needs a reader.
+   and validated head, the ticks of each Issue the PR closes or references, and the milestone
+   of each it closes, so the audit spends its run on what needs a reader.
 4. For every run after the first: `cargo xtask review-ledger <N>`, which writes
    `target/xtask/review/pr<N>/ledger.json` from the saved run records.
 
@@ -28,7 +28,10 @@ Invoke `pr-reviewer` and `pr-auditor` in parallel: one message, two `Agent` call
 PR number and the open Issue list (`gh issue list --state open --limit 500 --json number,title`).
 Give the reviewer, in addition:
 
-- the ledger's path, once one exists;
+- the ledger's path, once one exists. The ledger of a previous PR on the same surface, when
+  the spawn prompt names one, goes to the first run as that PR's settled findings, for context
+  and not as this PR's ledger: a finding it lists that stands on this PR's surface is still
+  reported and counted;
 - for a `delta` run (every run after the first), the `since` head, which is the head the last
   run with the reviewer reviewed, and the merge bases at `since` and at the head
   (`git merge-base <sha> origin/master` for each).
@@ -43,7 +46,7 @@ Save both agents' prose as `target/xtask/review/pr<N>/<mode>-<head>.md` and the 
 `<mode>-<head>.json` beside it. `<mode>` is `full` for the first run, `delta` for a later run
 with the reviewer, and `audit` for an auditor-only run or a re-audit; a further run at the same
 head takes the suffix `-<n>`, counting from 2. `xtask/README.md` § `cargo xtask review-check`
-defines the record. Four points it leaves to you:
+defines the record. Five points it leaves to you:
 
 - `stats.run` is the run's number among the PR's runs of every mode, counting from 1: one more
   than the highest `run` among the records already saved. It orders the runs, and the gate
@@ -51,6 +54,10 @@ defines the record. Four points it leaves to you:
 - A finding's `status` is `unverified`, or `nit` for a nit that cannot block, or `contested`
   once the finding is put to the maintainer.
 - `ledgered` holds the findings the reviewer lists under its `Ledger (not re-raised)` heading.
+- A run of the reviewer alone (a first run made while an owed host run is unreported) is a
+  `full` or `delta` record with `audit_verdict` set to `NOT RUN` and `audit` set to `null`. The
+  gate still needs `AUDIT PASS` in the last record at the head, which is then a later `audit`
+  record there.
 - In an `audit` record, `verdict` is the reviewer verdict the audit states, `findings` holds the
   surface findings of the last reviewer run that the audit lists as unfixed, each as that run's
   record states it, and `recorded`, `ledgered` and `dropped` are empty.

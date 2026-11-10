@@ -18,9 +18,9 @@ are on the checked-out branch; say so to the maintainer if the session is older.
   `target/xtask/review/release-v<X.Y.Z>/<mode>-<head>.md`, the returned object as
   `<mode>-<head>.json` beside it, and on `RELEASE READY` the `notes` field as `notes-<head>.md`.
   Both verdict lines go to the maintainer verbatim: the release is their step.
-- `RELEASE BLOCKED`: each blocking finding goes to a worker as a fix PR, a `[carried]` entry and
-  a fresh entry beside it that state the same defect counting as one, and each audit failure to
-  its fix. Record every other finding as step 2 of that section says. Then run `mode: "delta"`
+- `RELEASE BLOCKED`: each blocking finding goes to a worker as a fix PR, and each audit failure
+  to its fix. A `[carried]` entry and a fresh entry that state the same defect count as one
+  finding. Record every other finding as step 2 of that section says. Then run `mode: "delta"`
   with `since` the head the last run reviewed.
 - `RELEASE READY` before the bump: a worker opens the release PR from the draft (step 3). Once
   it merges, run the release host runs (step 4) yourself under an exclusive grant to yourself,

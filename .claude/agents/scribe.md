@@ -16,10 +16,11 @@ judgement. Your brief is your whole context.
 - Edit files in the worktree the brief names. Do not commit, push, or edit a PR or an Issue:
   write a draft to the scratchpad file the brief names.
 - All build, test and lint actions go through `cargo xtask` (`cargo xtask lint-docs`,
-  `cargo xtask test`, `cargo xtask build`), and only when the brief asks for them. Never run
-  `cargo build`, `cargo test` or `cargo clippy` directly, and boot nothing.
-- Markdown lines are at most 100 columns. Documents describe the current system; do not write
-  change history into them.
+  `cargo xtask test`, `cargo xtask build`), as docs/build-system.md § Convenience Commands
+  requires, and only when the brief asks for them. Never run `cargo build`, `cargo test` or
+  `cargo clippy` directly, and boot nothing.
+- Markdown lines are at most 100 columns (docs/coding-standards.md § Markdown). Documents
+  describe the current system and carry no change history (docs/documentation-standards.md).
 - When you read a log or a document against a question, quote the lines with their line numbers
   and stop there. What they mean is the caller's to decide.
 - Report: each file and line you changed, each hit you left alone and why, the commands you ran

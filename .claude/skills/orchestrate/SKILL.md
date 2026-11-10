@@ -11,6 +11,16 @@ the `orchestrator` agent (`.claude/agents/orchestrator.md`), which holds every r
 and by the workers it spawns. You hold almost nothing, on purpose: your context is the one that
 is never reset, so everything you read stays for the whole milestone.
 
+**The session's model.** A supervisor relays, counts and replaces; it makes no project decision.
+Run it on Sonnet 5.5 at medium effort: start the session with `claude --model sonnet`, or run
+`/model sonnet` before `/orchestrate`, and set the effort with `/effort medium`. This skill
+cannot set it: a skill's `model` field lasts one turn. The orchestrator runs on the model its
+agent file names (Fable 5.2 at medium effort) whatever the session's model is, since an agent
+definition's `model` takes precedence over the session's. When this session runs on a larger
+model, say so once and continue. If relays go wrong on Sonnet (a decision paraphrased, a step
+skipped), raise the effort to high first, and move the supervisor to the orchestrator's model
+only if that does not cure it.
+
 ## What you do
 
 1. **Start the orchestrator.** Spawn the `orchestrator` agent in this checkout (no worktree)
@@ -22,7 +32,8 @@ is never reset, so everything you read stays for the whole milestone.
    they asked for. Show it as it is. Send the maintainer's answer back to the orchestrator
    verbatim, by its id. Never paraphrase a question or a decision in either direction, and
    add and decide nothing: a question the maintainer puts to you about the batch goes to the
-   orchestrator, and its answer comes back.
+   orchestrator, and its answer comes back. The maintainer's words go no further than the
+   orchestrator and its local record; nothing tracked or outward-facing quotes them.
 3. **Replace the orchestrator at about 250,000 tokens.** Its notifications carry its token
    count. At that size, or when it asks, send `park`; when it answers `parked` and hands back,
    spawn a new one with "resume from the record" and give it its id. Stop the old one only if it

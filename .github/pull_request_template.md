@@ -3,8 +3,10 @@
 
 Fixes #<issue>
 <!-- For an Issue this PR changes without closing, and for a rolling follow-up Issue, write
-`Refs #<issue>`. Tick each fixed item on the Issue with `(fixed by PR #<this PR>)` and copy only
-those items below (docs/conventions.md § Follow-up Issues). -->
+`Refs #<issue>`. A PR that drains a follow-up Issue carries `Refs #<issue>` for it, beside
+`Fixes #<issue>` when it also closes it. Tick each fixed item on the Issue with
+`(fixed by PR #<this PR>)` and copy only those items below (docs/conventions.md § Follow-up
+Issues). -->
 
 ## Acceptance
 <copy the Acceptance section of the linked Issue verbatim (for a follow-up Issue, only the items

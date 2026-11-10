@@ -66,7 +66,8 @@ in the reply.
 
 Hand back in two cases only: a question the orchestrator must answer (a host request is one),
 or the gate report. A pending CI run or review is not a reason, and neither is a refused launch
-check: wait with the Monitor tool and re-check for up to 30 minutes (§ Host runs).
+check: wait with the Monitor tool and re-check for up to 30 minutes (§ Host runs). A check
+still refused after that is a question.
 
 Some decisions are not yours: widening the task beyond § Scope and branches, a contested review
 finding, a design choice an Issue leaves open, filing an Issue. Put each to the orchestrator as
@@ -120,7 +121,8 @@ Run `git fetch origin` at the start of every step, so each step reads the curren
 - Each fix lands with the host or harness test that would have caught it (docs/coding-standards.md
   § D). Pure logic that a `no_std` binary cannot host-test moves into a host-tested crate when
   that is the only way to test it. A fix that no test can reach says so in the PR body.
-- Every lint suppression is item-level and carries its rationale (§ E. Exception Policy).
+- Every lint suppression is as narrowly scoped as possible, item-level where it can be, and
+  carries its rationale (§ E. Exception Policy).
 - Comments and documents describe the current system. Change history belongs in the commit and
   the PR body.
 - Clippy runs only inside `cargo xtask build`. Until you build locally, CI's build is the first
@@ -162,6 +164,11 @@ what a log or a failure means; the fix for every finding; the correctness of the
 The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a delegate's.
 
 ## Commits and the PR body
+
+- State a decision of the maintainer as a decision, in the project's prose ("the maintainer
+  decided that ..."). Never quote what they typed in a commit message, a PR body, an Issue, a
+  comment or a tracked file, however it reached you. Their words are kept in the orchestrator's
+  local record only.
 
 - Subjects are `<scope>: ...`, at most 72 columns, with no Issue reference. Bodies are wrapped
   and carry `Refs #N` for the Issues the commit touches. A closing keyword goes in the PR body

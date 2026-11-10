@@ -9,15 +9,14 @@ disallowedTools: Artifact, ArtifactComments, ArtifactData
 
 # Orchestrating a batch
 
-**What this is for.** The maintainer opens the `orchestrate` skill at the start of a milestone
-and settles the open design questions, on the workers' recommendations, yours, and their own
-judgement. From there you run the work in parallel, as cheaply in tokens and as quickly in
-wall-clock time as the rules allow, until every design and defect Issue of the milestone is
-closed, the rolling Issues included, and the release is reviewed, tested and tagged. The
-maintainer looks in now and then and should see it moving. You go to them for a major blocker
-or a major design question, and for the few decisions the documents reserve to them. Anything
-else that would need them in the middle of the milestone, ask at the start, as a standing
-answer.
+**What this is for.** A batch is a milestone run to its release. Design questions are settled
+with the maintainer at its start. From then on you run the work in parallel, at the lowest cost
+in tokens and wall-clock time the rules allow, until every design and defect Issue of the
+milestone is closed and the release is reviewed, tested and tagged. A rolling Issue stays open
+as its scope's recording sink until the release stage. Progress should be visible at a glance
+at any time. You consult the maintainer on a major blocker, a major design question, and the
+few decisions the documents reserve to them; whatever else would need them in the middle of the
+milestone is asked at the start, as a standing answer.
 
 **Where you run.** You are an agent under a supervisor: the session the maintainer opened,
 which is `main`. It relays between you and the maintainer, and it replaces you with a fresh
@@ -33,6 +32,11 @@ works from a long or summarized context. Three consequences hold throughout this
 - Your own agent id is your address. The supervisor's first message gives it to you; workers
   report to it, never to `main`.
 
+The maintainer's words stay in the record, which is local and uncommitted. Everything tracked
+or outward-facing (a commit message, a PR body, an Issue, a comment, a file in the tree) states
+their decision as a decision, in the project's prose, and never quotes what they typed. Pass a
+ruling to a worker the same way: the decision, not the quotation.
+
 If your context is compacted before a hand-over, this file still applies: re-read the record's
 `## ACTIVE GRANT` block before your next decision, and take no rule or state from the summary.
 
@@ -46,7 +50,7 @@ review); record each.
 
 This file applies `.claude/CLAUDE.md`, docs/conventions.md and docs/testing.md and grants no
 authority those documents reserve to the maintainer. Three decisions are the maintainer's. Ask
-all three in your first message, each with its default, so one reply settles them, and quote the
+all three in your first message, each with its default, so one reply settles them, and keep the
 answers in the record:
 
 1. **Merges.** The merge is the maintainer's instruction, per PR or standing for the batch
@@ -216,7 +220,8 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
    checkout. A gate whose records you cannot read is not verified.
 2. `git fetch origin`, then `cargo xtask pr-check <N> --gate`. It checks the commits (subject,
    references, closing keywords, attribution, signatures), the PR body (boxes, validated head
-   and its comment-only delta), the Issues the PR closes or references (ticks, milestone), the
+   and its comment-only delta), the Issues the PR closes or references (the ticks of both, the
+   milestone of those it closes), the
    check rollup and merge state, that `master` is an ancestor of the head, and the run record
    for the head.
 3. Read what the command cannot decide: after a `NON-BLOCKING ISSUES ONLY` run, that each
@@ -252,11 +257,10 @@ waits for the maintainer.
 
 - **`NON-BLOCKING ISSUES ONLY`.** The worker records the surface findings first. The standing
   default, until the maintainer sets another for the batch: a `should` finding takes one fix
-  round. A nit takes none and stays recorded, unless it is a comment or document that states a
-  falsehood, its fix is comment-only in a PR that owes a round anyway, recording it would need a
-  new Issue, or the PR drains a follow-up Issue of its scope; then it is fixed in a round and
-  its item ticked. Stop comment-only rounds after the second when each round's new text draws a
-  new finding: record and go to the gate.
+  round. A nit takes none and stays recorded, with two exceptions: a nit whose fix is
+  comment-only, in a PR that owes a fix round anyway, is fixed in that round, and a nit in a PR
+  that drains a follow-up Issue of its scope is fixed in the same PR. Each is recorded first and
+  ticked `(fixed by PR #<M>)` when the round fixes it.
 - **A finding in the PR's own earlier hunk.** A delta run may report it as out of bound. It is
   on the surface (docs/conventions.md § Review surface) and is handled like any surface finding.
 - **A contested finding**, or one the worker cannot fix within its task (a pre-existing code
@@ -272,8 +276,9 @@ waits for the maintainer.
   `git push --force-with-lease=<branch>:<old> origin <new>:refs/heads/<branch>`. Do not replace
   the branch with a fresh one and a superseding PR, and never force-push `master`.
 - **`.claude/CLAUDE.md`, `.claude/settings.json` and hooks.** A worker prepares the change as a
-  patch file and reports it. Show the maintainer the diff, and apply it in this session on their
-  direct word, since no agent's relay authorizes it.
+  patch file and reports it. Send the supervisor the patch's path: it shows the maintainer the
+  diff and applies it on their direct word in that conversation. You do not apply it, since you
+  only ever receive their words relayed, and no agent's relay authorizes it.
 - **A finding the workers cannot place** goes to the maintainer with your recommendation, in
   one line.
 
@@ -330,17 +335,14 @@ worktrees, cancel any grant watch, and close the record with the open-Issue coun
 
 ## Failure modes
 
-- A usage limit, a crash or a host reboot ends the supervisor and every agent at once, and
-  nothing in a session restarts it. The maintainer opens a new session and runs
-  `/orchestrate resume`; you are then started from the record like any hand-over, and respawn
-  the workers from their branches.
-
 - A worker that ends its turn on an unchanged worktree is gone: the harness removes the
   worktree, and a later message does not resume it. The worker file's hand-back rules prevent
   it; the respawn prompt recovers from it.
-- A usage limit or a host reboot ends every session at once. Workers commit work in progress
-  before a hand-back for that reason; after a restart, read the record, list what each worktree
-  holds, and respawn from the branches.
+- A usage limit, a crash or a host reboot ends the supervisor and every agent at once, and
+  nothing in a session restarts it. Workers commit work in progress before a hand-back for that
+  reason. The maintainer opens a new session and runs `/orchestrate resume`; you are then
+  started from the record like any hand-over: read it, list what each worktree holds, and
+  respawn the workers from their branches.
 - A worker's provider limit ends its session mid-run: complete the mechanical steps yourself in
   its worktree, then resume the worker with the results so it writes the body and runs the
   review with its own context.

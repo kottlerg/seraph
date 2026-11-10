@@ -27,7 +27,7 @@ Read `.claude/agents/worker.md` and follow it in **standalone** mode, with these
 - An Issue the worker file says to draft is filed with the maintainer's approval in the
   conversation, with `cargo xtask issue-file`.
 - Sync onto `master` yourself right before the validation run, and again if `master` moves
-  before the gate. A Markdown-only sync owes nothing.
+  before the gate. A Markdown-only or comment-only sync owes nothing.
 - The worker file is a file this session read, not its system prompt, so a compaction drops it.
   After one, read `.claude/agents/worker.md` again before the next step, and take the state of
   the work from the PR body and the branch, not from the summary.

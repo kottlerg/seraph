@@ -561,10 +561,18 @@ fn read_header<'a>(line: &'a str, path: &mut &'a str, out: &mut Vec<String>)
     .any(|header| line.starts_with(header))
     {
         // An added or deleted file states its mode on its own header line,
-        // so a mode change to a file the PR adds shows only there.
+        // so a mode change to a file the PR adds shows only there;
+        // `diff_changes` keeps that line out of `code` (see `FILE_MODE`).
         out.push(line.to_owned());
     }
 }
+
+/// The header lines that state the mode of an added or a deleted file. They
+/// are not code of their own: adding or deleting a file is judged by its
+/// lines (docs/testing.md § Coverage tiers), so a file of comments alone
+/// stays comment-only. The synced comparison counts one as a change when the
+/// PR adds or deletes the file at both heads with different modes.
+const FILE_MODE: &[&str] = &["new file mode ", "deleted file mode "];
 
 /// One change of a unified diff: its file, and the changed line with its
 /// sign (`+` or `-`) or a header that is a change of its own (a binary or a
@@ -620,9 +628,9 @@ pub fn diff_changes(diff: &str) -> Vec<Change>
                 }
                 else
                 {
-                    what
+                    what.clone()
                 },
-                code: true,
+                code: !FILE_MODE.iter().any(|header| what.starts_with(header)),
             }));
             continue;
         }
@@ -993,9 +1001,19 @@ fn read_synced_delta(
     let mut names: Vec<&str> = difference.iter().map(|(_, c)| c.path.as_str()).collect();
     names.dedup();
     let embedded = embedded_paths(pat, &names.join("\n"), &embed_lines(root, head)?);
+    // A file's mode line on both sides: the PR adds (or deletes) the file at
+    // both heads, with different modes.
+    let file_mode = |c: &Change| FILE_MODE.iter().any(|header| c.line.starts_with(header));
+    let remoded = |path: &str| {
+        [Side::Validated, Side::Head].iter().all(|side| {
+            difference
+                .iter()
+                .any(|(s, c)| s == side && c.path == path && file_mode(c))
+        })
+    };
     let mut changes: Vec<String> = difference
         .iter()
-        .filter(|(_, c)| c.code && !is_markdown(&c.path))
+        .filter(|(_, c)| (c.code || (file_mode(c) && remoded(&c.path))) && !is_markdown(&c.path))
         // The line is stated raw, sign and whitespace included, unlike the
         // trimmed form of `non_comment_changes`: two own diffs can differ
         // in indentation alone, which a trimmed line would not show.
@@ -1692,10 +1710,11 @@ mod tests
     {
         let deleted = "diff --git a/k/a.rs b/k/a.rs\ndeleted file mode 100644\n--- a/k/a.rs\n\
                        +++ /dev/null\n@@ -1 +0,0 @@\n-let x = 1;\n";
-        assert_eq!(
-            non_comment_changes(deleted),
-            ["k/a.rs: deleted file mode 100644", "k/a.rs: let x = 1;"]
-        );
+        assert_eq!(non_comment_changes(deleted), ["k/a.rs: let x = 1;"]);
+        // A file of comments alone, added or deleted, is comment-only.
+        let comments = "diff --git a/k/b.rs b/k/b.rs\nnew file mode 100644\n--- /dev/null\n\
+                        +++ b/k/b.rs\n@@ -0,0 +1 @@\n+// note\n";
+        assert!(non_comment_changes(comments).is_empty());
     }
 
     #[test]
@@ -2078,6 +2097,20 @@ mod tests
             found
                 .iter()
                 .any(|d| d.message.contains("new file mode 100755"))
+        );
+    }
+
+    #[test]
+    fn a_file_of_comments_added_after_a_sync_is_comment_only()
+    {
+        let repo = Repo::new("sync-comment-file");
+        let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.on_master("b.rs", "fn b() {}\nfn c() {}\n");
+        repo.merge_master(&[]);
+        repo.commit("d.rs", "// notes\n");
+        assert_eq!(
+            rules(&repo.check(&validated, "; later commits are comment-only.")),
+            ["pr-validated-sync"]
         );
     }
 

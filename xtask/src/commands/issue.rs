@@ -41,6 +41,22 @@ pub enum ItemRemoval
     Allow,
 }
 
+impl ItemRemoval
+{
+    /// The choice the `--allow-removal` flag selects.
+    pub fn from_flag(allow_removal: bool) -> Self
+    {
+        if allow_removal
+        {
+            ItemRemoval::Allow
+        }
+        else
+        {
+            ItemRemoval::Refuse
+        }
+    }
+}
+
 /// The milestone decision of a filing (docs/conventions.md § Milestones).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MilestoneChoice
@@ -132,14 +148,7 @@ pub fn run_edit(ctx: &BuildContext, args: &IssueEditArgs) -> Result<()>
     let new = fs::read_to_string(&args.body_file)
         .with_context(|| format!("cannot read {}", args.body_file.display()))?;
     let old = issue_body(&ctx.root, args.issue)?;
-    let removal = if args.allow_removal
-    {
-        ItemRemoval::Allow
-    }
-    else
-    {
-        ItemRemoval::Refuse
-    };
+    let removal = ItemRemoval::from_flag(args.allow_removal);
     if let Err(reason) = guard_body(&old, &new, removal)
     {
         bail!("refusing to edit Issue #{}: {reason}", args.issue);
@@ -254,6 +263,20 @@ pub fn missing_metadata(
     out
 }
 
+/// The names of the labels an Issue carries, as `gh issue view` returns it.
+fn label_names(issue: &serde_json::Value) -> Vec<String>
+{
+    issue["labels"]
+        .as_array()
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|l| l["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Entry point for `cargo xtask issue-file`.
 pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
 {
@@ -293,15 +316,7 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
         .with_context(|| format!("gh printed no Issue URL: {}", url.trim()))?;
 
     let issue = gh::issue(&ctx.root, number)?;
-    let held_labels: Vec<String> = issue["labels"]
-        .as_array()
-        .map(|labels| {
-            labels
-                .iter()
-                .filter_map(|l| l["name"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    let held_labels = label_names(&issue);
     let missing = missing_metadata(
         &held_labels,
         issue["milestone"]["title"].as_str(),

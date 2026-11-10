@@ -274,23 +274,58 @@ pub fn check_record(name: &str, record: &Value) -> Vec<Diag>
     out
 }
 
-/// Whether a record reviewed `head`: one hash is a prefix of the other.
-fn at_head(record: &Value, head: &str) -> bool
+/// Whether the record file `name` is a run at `head`, by the head its name
+/// states. The name decides, not the content: a record that does not parse
+/// is still a run, and the last run must be well-formed.
+fn names_head(name: &str, head: &str) -> bool
 {
-    record["stats"]["head"]
-        .as_str()
-        .is_some_and(|h| !h.is_empty() && (head.starts_with(h) || h.starts_with(head)))
+    name_parts(name).is_some_and(|(_, stated, _)| !stated.is_empty() && head.starts_with(stated))
 }
 
-/// Where a record's run stands among the runs at one head: by its run
-/// number, then by its mode, an audit following the reviewer run it audits.
-/// File-name order is not run order (`-2.json` sorts before `.json`).
-fn run_order(name: &str) -> (u32, usize)
+/// Whether `mode` is a run with the reviewer.
+fn is_reviewer_mode(mode: &str) -> bool
 {
-    name_parts(name).map_or((0, 0), |(mode, _, run)| {
-        let rank = MODES.iter().position(|m| *m == mode).unwrap_or(0);
-        (run, rank)
-    })
+    mode != "audit"
+}
+
+/// Where a record's run stands among the runs at one head: by its run number
+/// (the `-<n>` suffix, 1 without one), then an audit after the reviewer run
+/// of the same number. File-name order is not run order (`-2.json` sorts
+/// before `.json`).
+fn run_order(name: &str) -> (u32, bool)
+{
+    name_parts(name).map_or((0, false), |(mode, _, run)| (run, !is_reviewer_mode(mode)))
+}
+
+/// The run number that two reviewer runs at `head` share, if any: a `full`
+/// and a `delta` record with the same number cannot be ordered.
+fn ambiguous_run(records: &[Record], head: &str) -> Option<u32>
+{
+    let mut runs: Vec<u32> = records
+        .iter()
+        .filter(|(name, _)| names_head(name, head))
+        .filter_map(|(name, _)| name_parts(name))
+        .filter(|(mode, _, _)| is_reviewer_mode(mode))
+        .map(|(_, _, run)| run)
+        .collect();
+    runs.sort_unstable();
+    runs.windows(2)
+        .find(|pair| pair[0] == pair[1])
+        .map(|p| p[0])
+}
+
+/// Whether a record's run passes: `AUDIT PASS`, no failed agent, and a
+/// reviewer verdict that is not `BLOCKING ISSUES`.
+fn passes(record: &Value) -> bool
+{
+    record["audit_verdict"] == "AUDIT PASS"
+        && record["stats"]["failed"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        && matches!(
+            record["verdict"].as_str(),
+            Some("READY TO MERGE" | "NON-BLOCKING ISSUES ONLY")
+        )
 }
 
 /// The merge-prompt condition's record part (docs/conventions.md § Branch
@@ -300,9 +335,20 @@ fn run_order(name: &str) -> (u32, usize)
 pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
 {
     let at = head.get(..8).unwrap_or(head);
+    if let Some(run) = ambiguous_run(records, head)
+    {
+        return vec![Diag::error(
+            "gate-review-record",
+            at,
+            format!(
+                "two runs with the reviewer at this head carry run number {run}; name the later \
+                 one `<mode>-<head>-<n>.json`"
+            ),
+        )];
+    }
     let Some((name, record)) = records
         .iter()
-        .filter(|(_, r)| at_head(r, head))
+        .filter(|(name, _)| names_head(name, head))
         .max_by_key(|(name, _)| run_order(name))
     else
     {
@@ -312,15 +358,12 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
             "no run record reviewed this head",
         )];
     };
-    let passes = record["audit_verdict"] == "AUDIT PASS"
-        && record["stats"]["failed"]
-            .as_array()
-            .is_some_and(Vec::is_empty)
-        && matches!(
-            record["verdict"].as_str(),
-            Some("READY TO MERGE" | "NON-BLOCKING ISSUES ONLY")
-        );
-    if !passes
+    let mut out = check_record(name, record);
+    if !out.is_empty()
+    {
+        return out;
+    }
+    if !passes(record)
     {
         return vec![Diag::error(
             "gate-review-record",
@@ -329,7 +372,6 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
              verdict of READY TO MERGE or NON-BLOCKING ISSUES ONLY",
         )];
     }
-    let mut out = check_record(name, record);
     let open = record["findings"].as_array().map_or(0, Vec::len);
     if record["verdict"] == "NON-BLOCKING ISSUES ONLY" && open > 0
     {
@@ -495,16 +537,15 @@ mod tests
         r["verdict"] = json!("READY");
         r["audit_verdict"] = json!("PASS");
         r["audit"]["verdict"] = Value::Null;
+        assert_eq!(fields(&r), ["verdict", "audit_verdict", "audit.verdict"]);
+    }
+
+    #[test]
+    fn audit_sections_that_are_not_a_list_are_reported()
+    {
+        let mut r = passing();
         r["audit"]["sections"] = json!({});
-        assert_eq!(
-            fields(&r),
-            [
-                "verdict",
-                "audit_verdict",
-                "audit.verdict",
-                "audit.sections"
-            ]
-        );
+        assert_eq!(fields(&r), ["audit.sections"]);
     }
 
     #[test]
@@ -617,17 +658,59 @@ mod tests
     {
         // A re-audit after a body edit: same head, later run. `audit-…-2`
         // sorts before `audit-….json` by name and is still the last run.
+        let audit = |audit_verdict: &str| {
+            let mut r = record("READY TO MERGE", audit_verdict, vec![]);
+            r["stats"]["mode"] = json!("audit");
+            r
+        };
         let records = vec![
             (NAME.to_owned(), passing()),
-            ("audit-0a82b0aa.json".to_owned(), passing()),
-            (
-                "audit-0a82b0aa-2.json".to_owned(),
-                record("READY TO MERGE", "AUDIT FAIL", vec![]),
-            ),
+            ("audit-0a82b0aa.json".to_owned(), audit("AUDIT PASS")),
+            ("audit-0a82b0aa-2.json".to_owned(), audit("AUDIT FAIL")),
         ];
         let found = gate_diags(&records, HEAD);
         assert_eq!(rules(&found), ["gate-review-record"]);
         assert_eq!(found[0].at, "audit-0a82b0aa-2.json");
+    }
+
+    #[test]
+    fn the_gate_fails_when_the_last_run_at_the_head_does_not_parse()
+    {
+        // The earlier run passes; the last one is truncated, so it has no
+        // `stats.head` to be found by. Its file name still makes it the last
+        // run at the head.
+        let records = vec![
+            (NAME.to_owned(), passing()),
+            ("audit-0a82b0aa.json".to_owned(), Value::Null),
+        ];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["record-shape"]);
+        assert_eq!(found[0].at, "audit-0a82b0aa.json");
+    }
+
+    #[test]
+    fn the_gate_refuses_two_reviewer_runs_it_cannot_order()
+    {
+        // A full run after a delta run at one head, both without a suffix:
+        // neither name says which came last.
+        let mut full = record("BLOCKING ISSUES", "AUDIT FAIL", vec![]);
+        full["stats"]["mode"] = json!("full");
+        let records = vec![
+            (NAME.to_owned(), passing()),
+            ("full-0a82b0aa.json".to_owned(), full.clone()),
+        ];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["gate-review-record"]);
+        assert!(found[0].message.contains("run number 1"));
+
+        // Named as the second run, the full run is the last and decides.
+        let ordered = vec![
+            (NAME.to_owned(), passing()),
+            ("full-0a82b0aa-2.json".to_owned(), full),
+        ];
+        let found = gate_diags(&ordered, HEAD);
+        assert_eq!(rules(&found), ["gate-review-record"]);
+        assert_eq!(found[0].at, "full-0a82b0aa-2.json");
     }
 
     #[test]

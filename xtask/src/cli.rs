@@ -121,8 +121,8 @@ pub enum CliCommand
 
     /// Check the commits of a range against the commit-message rules of
     /// docs/conventions.md: subject form and width, Issue references and
-    /// planning labels in the subject, closing keywords, attribution, emojis,
-    /// and signatures. Runs in CI's host-tests job on a pull request; see
+    /// planning labels in the subject, closing keywords, attribution, and
+    /// signatures. Runs in CI's host-tests job on a pull request; see
     /// xtask/README.md for the rule list and levels.
     CommitCheck(CommitCheckArgs),
 

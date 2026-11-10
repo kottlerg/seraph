@@ -8,8 +8,10 @@
 //!
 //! `commit-check` reads the commits of a range and checks § Commit Messages
 //! and § Commit and PR cross-references (the subject's form and width, Issue
-//! references and planning labels in it, closing keywords, attribution, and
-//! emojis) and the signed-commit requirement of § Branch protection.
+//! references and planning labels in it, closing keywords, and attribution)
+//! and the signed-commit requirement of § Branch protection. The "No emojis"
+//! rule of § Style stays with the reader: it needs no precise definition to
+//! be followed, and a script would need one.
 //! `pr-check` adds the pull request: § PR-body checklist discipline (unticked
 //! boxes, the validated head and its delta), § Milestones, the Issues the
 //! body closes or references, and, with `--gate`, the merge gate (check
@@ -44,48 +46,6 @@ const BODY_COLUMNS: usize = 72;
 /// Title suffix of a rolling follow-up Issue (docs/conventions.md § Branch
 /// and PR Workflow): a PR references one with `Refs` and never closes it.
 const ROLLING_TITLE_SUFFIX: &str = ": defects found by review";
-
-/// Code points Unicode gives emoji presentation by default, outside the
-/// pictographic planes that `is_emoji` covers as whole ranges. The symbols
-/// commit messages use as text (arrows, check marks, box drawing, operators)
-/// are not in this list.
-const EMOJI_BMP: &[(u32, u32)] = &[
-    (0x231A, 0x231B),
-    (0x23E9, 0x23EC),
-    (0x23F0, 0x23F0),
-    (0x23F3, 0x23F3),
-    (0x25FD, 0x25FE),
-    (0x2614, 0x2615),
-    (0x2648, 0x2653),
-    (0x267F, 0x267F),
-    (0x2693, 0x2693),
-    (0x26A1, 0x26A1),
-    (0x26AA, 0x26AB),
-    (0x26BD, 0x26BE),
-    (0x26C4, 0x26C5),
-    (0x26CE, 0x26CE),
-    (0x26D4, 0x26D4),
-    (0x26EA, 0x26EA),
-    (0x26F2, 0x26F3),
-    (0x26F5, 0x26F5),
-    (0x26FA, 0x26FA),
-    (0x26FD, 0x26FD),
-    (0x2705, 0x2705),
-    (0x270A, 0x270B),
-    (0x2728, 0x2728),
-    (0x274C, 0x274C),
-    (0x274E, 0x274E),
-    (0x2753, 0x2755),
-    (0x2757, 0x2757),
-    (0x2795, 0x2797),
-    (0x27B0, 0x27B0),
-    (0x27BF, 0x27BF),
-    (0x2B1B, 0x2B1C),
-    (0x2B50, 0x2B50),
-    (0x2B55, 0x2B55),
-    // The variation selector that asks for emoji presentation of a symbol.
-    (0xFE0F, 0xFE0F),
-];
 
 // ── Patterns ──────────────────────────────────────────────────────────────────
 
@@ -191,15 +151,22 @@ pub fn refs_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
     refs_in(&pat.refs_ref, text, 1)
 }
 
-/// Whether `c` has emoji presentation: a code point of the pictographic
-/// planes, or one of the `EMOJI_BMP` ranges.
-fn is_emoji(c: char) -> bool
+/// The closing references of `text` that stand inside prose: on a line that
+/// holds anything besides closing references and the punctuation joining
+/// them. GitHub closes the Issue for these exactly as for a `Fixes #N` line,
+/// which is how a sentence about another PR closes an Issue by accident.
+pub fn prose_closing_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
 {
-    let code = u32::from(c);
-    (0x1F000..=0x1FAFF).contains(&code)
-        || EMOJI_BMP
-            .iter()
-            .any(|(first, last)| (*first..=*last).contains(&code))
+    let lines: Vec<&str> = text.lines().collect();
+    closing_refs(pat, text)
+        .into_iter()
+        .filter(|found| {
+            let line = lines.get(found.line - 1).copied().unwrap_or("");
+            let rest = pat.closing_ref.replace_all(line, "");
+            rest.split(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | ';'))
+                .any(|word| !word.is_empty() && word != "and")
+        })
+        .collect()
 }
 
 fn short(sha: &str) -> &str
@@ -270,7 +237,6 @@ fn check_subject(pat: &Patterns, at: &str, subject: &str) -> Vec<Diag>
 pub fn check_commit(pat: &Patterns, commit: &Commit) -> Vec<Diag>
 {
     let at = format!("{} ({})", short(&commit.sha), commit.subject);
-    let message = format!("{}\n\n{}", commit.subject, commit.body);
     let mut out = if commit.merge
     {
         Vec::new()
@@ -279,7 +245,6 @@ pub fn check_commit(pat: &Patterns, commit: &Commit) -> Vec<Diag>
     {
         check_subject(pat, &at, &commit.subject)
     };
-
     if let Some(line) = commit.body.lines().find(|l| overlong_body_line(l))
     {
         out.push(Diag::warning(
@@ -291,11 +256,29 @@ pub fn check_commit(pat: &Patterns, commit: &Commit) -> Vec<Diag>
             ),
         ));
     }
+    out.extend(check_message(pat, &at, commit));
+    if !commit.signed
+    {
+        out.push(Diag::error(
+            "commit-unsigned",
+            &at,
+            "the commit is not signed",
+        ));
+    }
+    out
+}
+
+/// The rules on the whole message, subject and body together: closing
+/// keywords and attribution.
+fn check_message(pat: &Patterns, at: &str, commit: &Commit) -> Vec<Diag>
+{
+    let message = format!("{}\n\n{}", commit.subject, commit.body);
+    let mut out = Vec::new();
     for found in closing_refs(pat, &message)
     {
         out.push(Diag::error(
             "commit-closing-keyword",
-            &at,
+            at,
             format!(
                 "the message closes #{}; a closing keyword goes in the PR description only, \
                  since a commit's cannot be withdrawn",
@@ -307,24 +290,8 @@ pub fn check_commit(pat: &Patterns, commit: &Commit) -> Vec<Diag>
     {
         out.push(Diag::error(
             "commit-attribution",
-            &at,
+            at,
             "the message carries a tool attribution line or a session link",
-        ));
-    }
-    if message.chars().any(is_emoji)
-    {
-        out.push(Diag::error(
-            "commit-emoji",
-            &at,
-            "the message contains an emoji",
-        ));
-    }
-    if !commit.signed
-    {
-        out.push(Diag::error(
-            "commit-unsigned",
-            &at,
-            "the commit is not signed",
         ));
     }
     out
@@ -469,6 +436,7 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
             "the body carries a tool attribution line or a session link",
         ));
     }
+    out.extend(check_body_closing(pat, body));
     if section(body, "## Validation").is_none()
     {
         out.push(Diag::error(
@@ -488,6 +456,42 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
     out
 }
 
+/// The closing references of a PR body that contradict its own `Refs`, or
+/// that stand inside a sentence.
+fn check_body_closing(pat: &Patterns, body: &str) -> Vec<Diag>
+{
+    let mut out = Vec::new();
+    let referenced: Vec<u64> = refs_refs(pat, body).iter().map(|r| r.issue).collect();
+    for found in closing_refs(pat, body)
+    {
+        if referenced.contains(&found.issue)
+        {
+            out.push(Diag::error(
+                "pr-closes-and-refs",
+                format!("body:{}", found.line),
+                format!(
+                    "the body closes #{} here and references it with `Refs` elsewhere; a PR \
+                     that does not close an Issue must not carry a closing keyword for it",
+                    found.issue
+                ),
+            ));
+        }
+    }
+    for found in prose_closing_refs(pat, body)
+    {
+        out.push(Diag::warning(
+            "pr-closing-in-prose",
+            format!("body:{}", found.line),
+            format!(
+                "this sentence closes #{} when the PR merges; put `Fixes #{}` on its own line \
+                 if that is meant, or reword it",
+                found.issue, found.issue
+            ),
+        ));
+    }
+    out
+}
+
 /// The comment marker of a file type, by extension. `None` for a type whose
 /// comment syntax these checks do not know.
 fn comment_marker(path: &str) -> Option<&'static str>
@@ -497,6 +501,34 @@ fn comment_marker(path: &str) -> Option<&'static str>
         Some("rs") => Some("//"),
         Some("toml" | "yml" | "yaml" | "sh") => Some("#"),
         _ => None,
+    }
+}
+
+/// A line of a unified diff outside any hunk: a file header names the path,
+/// and a binary or mode line is a change with no hunk to show it.
+fn read_header<'a>(line: &'a str, path: &mut &'a str, out: &mut Vec<String>)
+{
+    if let Some(rest) = line.strip_prefix("diff --git ")
+    {
+        // `a/<path> b/<path>`: a binary or mode-only change has no
+        // `---`/`+++` header to name the file.
+        *path = rest.rsplit_once(" b/").map_or(rest, |(_, new)| new);
+    }
+    else if let Some(rest) = line.strip_prefix("--- a/")
+    {
+        *path = rest;
+    }
+    else if let Some(rest) = line.strip_prefix("+++ b/")
+    {
+        *path = rest;
+    }
+    else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch")
+    {
+        out.push(format!("{path}: binary change"));
+    }
+    else if line.starts_with("old mode ") || line.starts_with("new mode ")
+    {
+        out.push(format!("{path}: {line}"));
     }
 }
 
@@ -514,13 +546,9 @@ pub fn non_comment_changes(diff: &str) -> Vec<String>
     let mut in_hunk = false;
     for line in diff.lines()
     {
-        if let Some(rest) = line.strip_prefix("diff --git ")
+        if line.starts_with("diff --git ")
         {
             in_hunk = false;
-            // `a/<path> b/<path>`: a binary or mode-only change has no
-            // `---`/`+++` header to name the file.
-            path = rest.rsplit_once(" b/").map_or(rest, |(_, new)| new);
-            continue;
         }
         if line.starts_with("@@")
         {
@@ -529,22 +557,7 @@ pub fn non_comment_changes(diff: &str) -> Vec<String>
         }
         if !in_hunk
         {
-            if let Some(rest) = line.strip_prefix("--- a/")
-            {
-                path = rest;
-            }
-            else if let Some(rest) = line.strip_prefix("+++ b/")
-            {
-                path = rest;
-            }
-            else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch")
-            {
-                out.push(format!("{path}: binary change"));
-            }
-            else if line.starts_with("old mode ") || line.starts_with("new mode ")
-            {
-                out.push(format!("{path}: {line}"));
-            }
+            read_header(line, &mut path, &mut out);
             continue;
         }
         let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix('-'))
@@ -610,15 +623,66 @@ fn embed_lines(root: &Path, head: &str) -> Result<String>
     }
 }
 
-/// The findings about the delta from the validated head to the PR head: the
-/// body must say it is documentation or comments only, and it must be.
-fn check_delta(
+/// Where the validated head a body states stands relative to the PR head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValidatedHead
+{
+    /// The `## Validation` section holds no hash-like word.
+    Unstated,
+    /// None of its hash-like words names a commit in the clone.
+    Unknown,
+    /// It is the PR head.
+    Head,
+    /// It is a commit between the merge base and the PR head.
+    Earlier(String),
+    /// It is a commit, but not on the branch.
+    OffBranch(String),
+}
+
+/// Decide which word of `candidates` is the validated head and where it
+/// stands: the first that `is_commit` accepts, which skips a run id or a
+/// count of hash length; then whether it is `head`, or `on_branch`.
+pub fn classify_validated_head(
+    candidates: &[String],
+    head: &str,
+    is_commit: impl Fn(&str) -> bool,
+    on_branch: impl Fn(&str) -> bool,
+) -> ValidatedHead
+{
+    if candidates.is_empty()
+    {
+        return ValidatedHead::Unstated;
+    }
+    let Some(validated) = candidates.iter().find(|word| is_commit(word))
+    else
+    {
+        return ValidatedHead::Unknown;
+    };
+    if head.starts_with(validated.as_str())
+    {
+        ValidatedHead::Head
+    }
+    else if on_branch(validated)
+    {
+        ValidatedHead::Earlier(validated.clone())
+    }
+    else
+    {
+        ValidatedHead::OffBranch(validated.clone())
+    }
+}
+
+/// The findings about the delta from an earlier validated head to the PR
+/// head: the body must say it is documentation or comments only, and
+/// `changes` (the non-comment changes of the delta) and `embedded` (its
+/// files a build embeds) must both be empty.
+pub fn delta_diags(
     pat: &Patterns,
-    root: &Path,
     body: &str,
     validated: &str,
-    head: &str,
-) -> Result<Vec<Diag>>
+    changes: &[String],
+    embedded: &[String],
+) -> Vec<Diag>
 {
     let at = format!("validated head {validated}");
     let mut out = Vec::new();
@@ -633,6 +697,34 @@ fn check_delta(
              documentation or comments only",
         ));
     }
+    for change in changes
+    {
+        out.push(Diag::error(
+            "pr-validated-head",
+            &at,
+            format!("the delta to the PR head is not comment-only: {change}"),
+        ));
+    }
+    for path in embedded
+    {
+        out.push(Diag::error(
+            "pr-validated-head",
+            &at,
+            format!("the delta to the PR head changes {path}, which a build embeds"),
+        ));
+    }
+    out
+}
+
+/// The non-comment changes and the build-embedded files of the delta from
+/// `validated` to `head`, Markdown aside.
+fn read_delta(
+    pat: &Patterns,
+    root: &Path,
+    validated: &str,
+    head: &str,
+) -> Result<(Vec<String>, Vec<String>)>
+{
     // `--no-ext-diff` and `--no-textconv` keep a configured diff tool from
     // replacing the patch text; `--no-renames` makes a rename show its lines.
     let diff = git(
@@ -651,27 +743,14 @@ fn check_delta(
             ":(exclude)*.md",
         ],
     )?;
-    for change in non_comment_changes(&diff)
-    {
-        out.push(Diag::error(
-            "pr-validated-head",
-            &at,
-            format!("the delta to the PR head is not comment-only: {change}"),
-        ));
-    }
     let names = git(
         root,
         &["diff", "--name-only", "--no-renames", validated, head],
     )?;
-    for path in embedded_paths(pat, &names, &embed_lines(root, head)?)
-    {
-        out.push(Diag::error(
-            "pr-validated-head",
-            &at,
-            format!("the delta to the PR head changes {path}, which a build embeds"),
-        ));
-    }
-    Ok(out)
+    Ok((
+        non_comment_changes(&diff),
+        embedded_paths(pat, &names, &embed_lines(root, head)?),
+    ))
 }
 
 /// Check that the validated head covers the PR head: it is the head, or it is
@@ -685,41 +764,38 @@ fn check_validated_head(
     head: &str,
 ) -> Result<Vec<Diag>>
 {
-    let candidates = validated_head_candidates(pat, body);
-    if candidates.is_empty()
-    {
-        // `check_body` reports the missing head.
-        return Ok(Vec::new());
-    }
     let is_commit = |word: &str| git_ok(root, &["cat-file", "-e", &format!("{word}^{{commit}}")]);
-    let Some(validated) = candidates.iter().find(|word| is_commit(word))
-    else
-    {
-        return Ok(vec![Diag::error(
-            "pr-validated-head",
-            "body",
-            "no hash in the `## Validation` section names a commit in this clone",
-        )]);
+    let on_branch = |word: &str| {
+        git_ok(root, &["merge-base", "--is-ancestor", word, head])
+            && git(root, &["merge-base", base, head])
+                .is_ok_and(|mb| git_ok(root, &["merge-base", "--is-ancestor", mb.trim(), word]))
     };
-    if head.starts_with(validated.as_str())
-    {
-        return Ok(Vec::new());
-    }
-    let on_branch = git_ok(root, &["merge-base", "--is-ancestor", validated, head])
-        && git(root, &["merge-base", base, head])
-            .is_ok_and(|mb| git_ok(root, &["merge-base", "--is-ancestor", mb.trim(), validated]));
-    if !on_branch
-    {
-        return Ok(vec![Diag::error(
-            "pr-validated-head",
-            format!("validated head {validated}"),
-            format!(
-                "it is neither the PR head {} nor a commit between the merge base and it",
-                short(head)
-            ),
-        )]);
-    }
-    check_delta(pat, root, body, validated, head)
+    let candidates = validated_head_candidates(pat, body);
+    Ok(
+        match classify_validated_head(&candidates, head, is_commit, on_branch)
+        {
+            // `check_body` reports a section that states no head.
+            ValidatedHead::Unstated | ValidatedHead::Head => Vec::new(),
+            ValidatedHead::Unknown => vec![Diag::error(
+                "pr-validated-head",
+                "body",
+                "no hash in the `## Validation` section names a commit in this clone",
+            )],
+            ValidatedHead::OffBranch(validated) => vec![Diag::error(
+                "pr-validated-head",
+                format!("validated head {validated}"),
+                format!(
+                    "it is neither the PR head {} nor a commit between the merge base and it",
+                    short(head)
+                ),
+            )],
+            ValidatedHead::Earlier(validated) =>
+            {
+                let (changes, embedded) = read_delta(pat, root, &validated, head)?;
+                delta_diags(pat, body, &validated, &changes, &embedded)
+            }
+        },
+    )
 }
 
 // ── Issues and milestones ─────────────────────────────────────────────────────
@@ -1159,20 +1235,6 @@ mod tests
     }
 
     #[test]
-    fn an_emoji_is_an_error_and_a_text_symbol_is_not()
-    {
-        let p = pat();
-        for emoji in ["\u{1F389}", "\u{2705}", "\u{26A1}", "\u{2764}\u{FE0F}"]
-        {
-            let c = commit("xtask: add a check", &format!("Done {emoji}"));
-            assert_eq!(rules(&check_commit(&p, &c)), ["commit-emoji"], "{emoji}");
-        }
-        // An arrow, a section sign, a check mark, and an element-of sign.
-        let text = commit("xtask: add a check", "\u{2192} \u{a7} \u{2713} \u{2208}");
-        assert!(check_commit(&p, &text).is_empty());
-    }
-
-    #[test]
     fn a_commit_without_a_signature_is_an_error()
     {
         let mut c = commit("xtask: add a check", "");
@@ -1272,6 +1334,42 @@ mod tests
     }
 
     #[test]
+    fn a_closing_reference_inside_a_sentence_is_flagged()
+    {
+        let p = pat();
+        let found = |text: &str| -> Vec<u64> {
+            prose_closing_refs(&p, text)
+                .iter()
+                .map(|r| r.issue)
+                .collect()
+        };
+        // A sentence about another PR closes the Issue it names, backticks
+        // or not.
+        assert_eq!(found("the second PR, which carries `Fixes #835`"), [835]);
+        assert_eq!(found("It does not close #637 yet."), [637]);
+        // A line of closing references alone is the intended form.
+        assert!(found("Fixes #10").is_empty());
+        assert!(found("Fixes #10, closes #11 and resolves #12.").is_empty());
+        assert!(found("Refs #13").is_empty());
+
+        let body = format!("{BODY}\nThe next PR carries `Fixes #835`.\n");
+        let diags = check_body(&p, &body);
+        assert_eq!(rules(&diags), ["pr-closing-in-prose"]);
+        assert_eq!(diags[0].at, "body:16");
+    }
+
+    #[test]
+    fn closing_an_issue_the_body_also_references_is_an_error()
+    {
+        // The body means `Refs`, and a sentence about a later PR closes the
+        // same Issue.
+        let body = format!("{BODY}\nThe second PR carries `Fixes #11`.\n");
+        let diags = check_body(&pat(), &body);
+        assert_eq!(rules(&diags), ["pr-closes-and-refs", "pr-closing-in-prose"]);
+        assert!(diags[0].message.contains("#11"));
+    }
+
+    #[test]
     fn a_session_link_in_the_body_is_an_error()
     {
         let linked = format!("{BODY}\nhttps://claude.ai/code/session_2\n");
@@ -1303,10 +1401,17 @@ mod tests
     #[test]
     fn a_file_type_with_unknown_comment_syntax_counts_as_changed()
     {
-        // A deleted file's lines are attributed to the file, not /dev/null.
-        let asm = "diff --git a/k/a.S b/k/a.S\ndeleted file mode 100644\n--- a/k/a.S\n\
-                   +++ /dev/null\n@@ -1 +0,0 @@\n-# note\n";
+        let asm = "diff --git a/k/a.S b/k/a.S\n--- a/k/a.S\n+++ b/k/a.S\n@@ -1 +1 @@\n\
+                   +# note\n";
         assert_eq!(non_comment_changes(asm), ["k/a.S: # note"]);
+    }
+
+    #[test]
+    fn a_deleted_files_lines_are_attributed_to_the_file()
+    {
+        let deleted = "diff --git a/k/a.rs b/k/a.rs\ndeleted file mode 100644\n--- a/k/a.rs\n\
+                       +++ /dev/null\n@@ -1 +0,0 @@\n-let x = 1;\n";
+        assert_eq!(non_comment_changes(deleted), ["k/a.rs: let x = 1;"]);
     }
 
     #[test]
@@ -1329,6 +1434,75 @@ mod tests
             non_comment_changes(mode),
             ["run.sh: old mode 100644", "run.sh: new mode 100755"]
         );
+    }
+
+    fn words(list: &[&str]) -> Vec<String>
+    {
+        list.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    const PR_HEAD: &str = "0a82b0aa11112222333344445555666677778888";
+
+    #[test]
+    fn the_validated_head_is_the_first_word_that_names_a_commit()
+    {
+        // A run id of hash length comes first and names no commit.
+        let candidates = words(&["41635544986", "0a82b0aa", "deadbeef"]);
+        let is_commit = |w: &str| w != "41635544986";
+        assert_eq!(
+            classify_validated_head(&candidates, PR_HEAD, is_commit, |_| true),
+            ValidatedHead::Head
+        );
+    }
+
+    #[test]
+    fn an_earlier_validated_head_must_be_on_the_branch()
+    {
+        let candidates = words(&["deadbeef"]);
+        assert_eq!(
+            classify_validated_head(&candidates, PR_HEAD, |_| true, |_| true),
+            ValidatedHead::Earlier("deadbeef".to_owned())
+        );
+        assert_eq!(
+            classify_validated_head(&candidates, PR_HEAD, |_| true, |_| false),
+            ValidatedHead::OffBranch("deadbeef".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_section_without_a_commit_states_no_validated_head()
+    {
+        assert_eq!(
+            classify_validated_head(&[], PR_HEAD, |_| true, |_| true),
+            ValidatedHead::Unstated
+        );
+        assert_eq!(
+            classify_validated_head(&words(&["41635544986"]), PR_HEAD, |_| false, |_| true),
+            ValidatedHead::Unknown
+        );
+    }
+
+    #[test]
+    fn an_earlier_validated_head_needs_a_stated_comment_only_delta()
+    {
+        let p = pat();
+        // BODY's Validation section says later commits are comment-only.
+        assert!(delta_diags(&p, BODY, "deadbeef", &[], &[]).is_empty());
+        let silent = "## Validation\nValidated at deadbeef.\n";
+        assert_eq!(
+            rules(&delta_diags(&p, silent, "deadbeef", &[], &[])),
+            ["pr-validated-head"]
+        );
+        let found = delta_diags(
+            &p,
+            BODY,
+            "deadbeef",
+            &words(&["k/a.rs: let x = 1;"]),
+            &words(&["docs/help.md"]),
+        );
+        assert_eq!(rules(&found), ["pr-validated-head", "pr-validated-head"]);
+        assert!(found[0].message.contains("k/a.rs: let x = 1;"));
+        assert!(found[1].message.contains("docs/help.md"));
     }
 
     #[test]

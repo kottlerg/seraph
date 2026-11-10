@@ -320,7 +320,9 @@ it). It is a `git worktree` procedure and not an `xtask` command, since the work
 
 When the current milestone is ready to close, you run the release review of docs/conventions.md
 § Release Production; workers cannot call the Workflow tool, so it is the one review this session
-runs as a workflow.
+runs as a workflow. The workflow's agents (`release-verifier`, `release-auditor`, `pr-reviewer`)
+resolve from the agent definitions the session loaded when it started, so run it in a session
+started after those files are on the checked-out branch.
 
 - `git fetch origin` and check out `origin/master`, clean, in your checkout. Run
   `Workflow({name: "release-review", args: {mode: "scope", from: "<previous tag>", version:

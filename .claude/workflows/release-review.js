@@ -57,6 +57,11 @@
 //   host_runs    path of the release host-run report; the audit requires it
 //                once the head carries the version bump.
 //
+// The agent types below resolve from the definitions the session loaded at its
+// start, so the session that runs this workflow must have started after
+// `.claude/agents/release-verifier.md` and `release-auditor.md` were on the
+// checked-out branch.
+//
 // Every stage takes the diff from the local tree (`git diff`), never from
 // `gh pr diff` or the `files` field of `gh pr view`, which GitHub caps. The
 // script checks every returned file list against the count the scope agent

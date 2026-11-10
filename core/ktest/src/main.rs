@@ -69,8 +69,14 @@ mod unit;
 /// `SYS_SYSTEM_INFO(InstructionCacheSyncs)` as ktest's entry reads it, before
 /// ktest maps anything: the kernel's instruction-fetch synchronisations of the
 /// boot, its Phase-9 one for ktest's own image among them
-/// (`unit::sysinfo::boot_image_synchronised`).
-pub(crate) static BOOT_ICACHE_SYNCS: AtomicU64 = AtomicU64::new(0);
+/// (`unit::sysinfo::boot_image_synchronised`), or [`BOOT_ICACHE_SYNCS_UNREAD`]
+/// until a read succeeds.
+pub(crate) static BOOT_ICACHE_SYNCS: AtomicU64 = AtomicU64::new(BOOT_ICACHE_SYNCS_UNREAD);
+
+/// The [`BOOT_ICACHE_SYNCS`] value that holds no count: the entry's
+/// `system_info` read failed (or has not run), which the test reports as that
+/// failure rather than as a boot without a sync. No boot's count reaches it.
+pub(crate) const BOOT_ICACHE_SYNCS_UNREAD: u64 = u64::MAX;
 
 /// Base of the low scratch band (crate docs § Scratch VAs); ktest's fixed
 /// device mappings end below it.
@@ -430,7 +436,7 @@ extern "C" fn run(info_ptr: u64) -> !
     // Before any mapping of ktest's: the count holds only the boot's syncs.
     BOOT_ICACHE_SYNCS.store(
         syscall::system_info(syscall_abi::SystemInfoType::InstructionCacheSyncs as u64)
-            .unwrap_or(0),
+            .unwrap_or(BOOT_ICACHE_SYNCS_UNREAD),
         Ordering::Relaxed,
     );
 

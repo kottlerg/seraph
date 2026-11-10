@@ -24,7 +24,8 @@ use syscall::{
     thread_read_regs, thread_write_regs,
 };
 use syscall_abi::{
-    FAULT_EXC_DEBUG, FAULT_KIND_EXCEPTION, FAULT_LABEL, FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY,
+    FAULT_EXC_DEBUG, FAULT_KIND_EXCEPTION, FAULT_LABEL, FAULT_REPLY_RESUME,
+    REGS_X86_64_FLAGS_OFFSET, RIGHTS_NTF_NOTIFY, X86_64_RFLAGS_TF,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -32,13 +33,6 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// Badges bound with the first and the second endpoint.
 const BADGE_FIRST: u64 = 0xC0FF_EE0A;
 const BADGE_SECOND: u64 = 0xC0FF_EE0B;
-
-/// RFLAGS.TF (bit 8), the single-step trap flag.
-const RFLAGS_TF: u64 = 1 << 8;
-
-/// Offset of RFLAGS in the x86-64 register file: the slot after the
-/// instruction pointer (`core/kernel/src/arch/x86_64/trap_frame.rs` layout).
-const RFLAGS_OFFSET: usize = syscall_abi::REGS_X86_64_IP_OFFSET + 8;
 
 /// Bound, in milliseconds, on the wait for the recovery routine's report.
 /// Applied through [`crate::scaled_bound`], which stretches it past
@@ -154,12 +148,11 @@ fn resume_into_recovery(ctx: &TestContext, th: u64, sig: u64) -> TestResult
     let mut regs = [0u8; BUF];
     thread_read_regs(th, &mut regs[..BUF])
         .map_err(|_| "integration::trap_redelivery: thread_read_regs failed")?;
-    let rflags = u64::from_le_bytes(
-        regs[RFLAGS_OFFSET..RFLAGS_OFFSET + 8]
-            .try_into()
-            .unwrap_or([0u8; 8]),
-    );
-    regs[RFLAGS_OFFSET..RFLAGS_OFFSET + 8].copy_from_slice(&(rflags & !RFLAGS_TF).to_le_bytes());
+    let at = REGS_X86_64_FLAGS_OFFSET;
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&regs[at..at + 8]);
+    let rflags = u64::from_le_bytes(word) & !X86_64_RFLAGS_TF;
+    regs[at..at + 8].copy_from_slice(&rflags.to_le_bytes());
     spawn::redirect_to_entry(&mut regs[..], recovery_entry as *const () as u64);
     // SAFETY: the frame was read from this child, so its stack pointer lies on
     // the child's own `ChildStack`; `redirect_to_entry` pointed it at
@@ -192,11 +185,12 @@ extern "C" fn step_child(_arg: u64) -> !
     unsafe {
         core::arch::asm!(
             "pushfq",
-            "or qword ptr [rsp], 0x100",
+            "or qword ptr [rsp], {tf}",
             "popfq",
             "nop",
             "nop",
-            "nop"
+            "nop",
+            tf = const X86_64_RFLAGS_TF,
         );
     }
     loop

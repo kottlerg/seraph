@@ -353,12 +353,17 @@ fn split_top(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
 /// rebase wrote through data stores; docs/memory-model.md § Instruction-Fetch
 /// Coherence). ktest's entry reads the count before it maps anything, so a
 /// boot that skips the Phase-9 sync reads zero; under QEMU the missing sync
-/// would not otherwise fail.
+/// would not otherwise fail. A failed read at the entry is reported as such,
+/// not as a boot without the sync.
 pub fn boot_image_synchronised(_ctx: &TestContext) -> TestResult
 {
-    if crate::BOOT_ICACHE_SYNCS.load(core::sync::atomic::Ordering::Relaxed) == 0
+    match crate::BOOT_ICACHE_SYNCS.load(core::sync::atomic::Ordering::Relaxed)
     {
-        return Err("sysinfo::boot_image_synchronised: no instruction-fetch sync before ktest ran");
+        crate::BOOT_ICACHE_SYNCS_UNREAD =>
+        {
+            Err("sysinfo::boot_image_synchronised: system_info failed at ktest's entry")
+        }
+        0 => Err("sysinfo::boot_image_synchronised: no instruction-fetch sync before ktest ran"),
+        _ => Ok(()),
     }
-    Ok(())
 }

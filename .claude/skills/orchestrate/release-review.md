@@ -1,6 +1,6 @@
 # The release review
 
-Supporting file of `.claude/skills/orchestrate/SKILL.md` § Release review.
+Supporting file of `.claude/agents/orchestrator.md` § Release review.
 
 When the current milestone is ready to close, run the release review of docs/conventions.md
 § Release Production. Workers cannot call the Workflow tool, so it is the one review this

@@ -39,8 +39,10 @@ Everything you send the orchestrator stays in its context for the rest of the ba
 message wakes it for a turn. So what you send has one of three shapes, and the detail lives in
 files: the PR body, the run records, the scratchpad.
 
-- **Status**: one line of at most 200 characters, by `SendMessage` to the address the prompt
-  names. It does not end your turn. Send one when the orchestrator has to know: the plan is
+- **Status**: one line of at most 200 characters, by `SendMessage` to the orchestrator's agent
+  id: the one your prompt names, or the one a later orchestrator's message gives you, since the
+  orchestrator is replaced during a batch. Never send to `main`, which is the supervisor above
+  it. It does not end your turn. Send one when the orchestrator has to know: the plan is
   written (name its file), the PR is opened, a review returned (both verdict lines verbatim),
   a host request. A step that needs nothing from the orchestrator gets no status.
 - **Question**: the question, the options, your recommendation, in at most 150 words, with the
@@ -55,7 +57,9 @@ anything non-trivial, the tests, each expansion) goes in a scratchpad file, with
 summary of at most five lines in the status.
 
 A hand-back ends your turn, goes through the hand-back tool, and carries the whole report in its
-message, since nothing you wrote before it reaches the orchestrator. Standalone, your replies to
+message, since nothing you wrote before it reaches the orchestrator. When the orchestrator that
+spawned you has been replaced, the hand-back reaches the supervisor instead, so send the same
+report to the current orchestrator's id first. Standalone, your replies to
 the maintainer take the place of all of this, and there the verdict lines and results are shown
 in the reply.
 
@@ -166,7 +170,7 @@ The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a deleg
   docs/conventions.md § Operations allows it on a feature branch: another worker or the
   orchestrator may have built on the remote branch. Report a pushed message that needs changing.
   The orchestrator rewrites it on the maintainer's instruction (standalone, you do, on the
-  maintainer's words), as `.claude/skills/orchestrate/SKILL.md` § Rulings describes.
+  maintainer's words), as `.claude/agents/orchestrator.md` § Rulings describes.
 - Before a push, run `git fetch origin` and
   `git rev-list --left-right --count origin/<branch>...HEAD`. Push only when it prints `0` and a
   positive count, or when `origin/<branch>` does not exist yet. Report a diverged branch; never

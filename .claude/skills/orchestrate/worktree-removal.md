@@ -1,6 +1,6 @@
 # Removing a worker's worktree
 
-Supporting file of `.claude/skills/orchestrate/SKILL.md` § Worktree removal.
+Supporting file of `.claude/agents/orchestrator.md` § Worktree removal.
 
 A worker's worktree carries a built `target/` of several GiB. The harness removes only an
 unchanged worktree, so every other one persists until you remove it. Remove only worktrees this

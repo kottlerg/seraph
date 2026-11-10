@@ -102,9 +102,11 @@ every stop that arrives while it is detached.
 The stub is all-stop: while GDB holds the target, every thread of it is fault-blocked on the
 stub's endpoint.
 
-- **Receivers.** One receiver thread per target thread takes that thread's fault and upcall
-  messages and holds the reply until the serve loop decides it, since a receive on the same
-  thread would cancel the reply pending. The decision is a `FAULT_REPLY_RESUME`, or a
+- **Receivers.** Receiver threads take the fault and upcall messages off the stub's endpoint,
+  each holding one message's reply until the serve loop decides it, since a receive on the same
+  thread would cancel the reply pending. The stub keeps one receiver per slot of its table, and
+  one free beyond every stop it holds or keeps (below), up to `MAX_RECEIVERS`, so the next stop
+  always finds one. The decision is a `FAULT_REPLY_RESUME`, or a
   `FAULT_REPLY_KILL` when GDB resumes a thread stopped on a fault with a signal, so the fault
   takes the outcome it has with no handler bound
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Reply).
@@ -261,6 +263,7 @@ still attached.
 | Bound | Value | Past it |
 |---|---|---|
 | `MAX_THREADS` | 32 live threads per attach, refreshes included; an exited thread's slot is taken again | listed threads past it are left bound to the crash endpoint and are not shown to GDB; a thread spawned after the attach past it runs under its spawner's binding, and its stops are settled as [Crediting a stop](#stop-model) says |
+| `MAX_RECEIVERS` | 64 receiver threads, twice `MAX_THREADS` | a stop waits on the stub's endpoint until a held one is answered |
 | `STOP_WAIT` | 2 s per all-stop | a thread whose upcall has not arrived runs on |
 | `FIND_ATTEMPTS` × `FIND_INTERVAL` | 600 × 100 ms, for the port and for the target at startup | the stub ends (no port) or serves detached (no target) |
 | `REATTACH_ATTEMPTS` × `FIND_INTERVAL` | 50 × 100 ms, for the target at a `qSupported` that finds the stub detached | the stub stays detached; `?` reports the target exited |

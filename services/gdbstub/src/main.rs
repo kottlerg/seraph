@@ -346,6 +346,11 @@ impl Kernel for Sys
         }
     }
 
+    fn receivers(&mut self, count: usize) -> bool
+    {
+        count == 0 || self.ensure_receiver(count - 1)
+    }
+
     fn reply(&mut self, receiver: usize, label: u64)
     {
         if let Some(tx) = self.receivers.get(receiver)
@@ -492,11 +497,15 @@ impl Kernel for Sys
 
     fn breakpoint_at(&mut self, cap: u64, addr: u64) -> bool
     {
-        // The instruction a hit leaves the pointer past is the one as long
-        // as the architecture's advance: x86-64's one-byte `int3`, GDB's
-        // breakpoint kind 1. RISC-V reports the pointer at its `ebreak`, so
-        // nothing is set back there and this is not asked.
-        let Some(insn) = breakpoints::instruction(ARCH, BREAKPOINT_PC_ADVANCE)
+        // A hit leaves the pointer past x86-64's `int3`, GDB's breakpoint
+        // kind 1. RISC-V reports the pointer at its `ebreak`, so nothing is
+        // set back there and this is not asked.
+        let kind = match ARCH
+        {
+            gdb_rsp::target::Arch::X86_64 => 1,
+            gdb_rsp::target::Arch::Riscv64 => return false,
+        };
+        let Some(insn) = breakpoints::instruction(ARCH, kind)
         else
         {
             return false;

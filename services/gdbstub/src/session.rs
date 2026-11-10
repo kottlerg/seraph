@@ -42,12 +42,17 @@ use alloc::vec::Vec;
 use gdb_rsp::command::ThreadId;
 
 use crate::breakpoints::{Breakpoint, Breakpoints};
-use crate::control::{self, Credit, Named, Origin, Plan, Unclaimed};
+use crate::control::{self, Credit, Named, Origin, Plan, Repeat, Unclaimed};
 
-/// The most threads one session holds at once: a bound on the service's
-/// receiver threads, one per target thread, each of which can hold that
-/// thread stopped. An exited thread's slot is taken again.
+/// The most threads one session holds at once: each takes a receiver
+/// thread of the service while it is stopped ([`MAX_RECEIVERS`]). An exited
+/// thread's slot is taken again.
 pub const MAX_THREADS: usize = 32;
+
+/// The most receivers the session asks for: one per held stop and kept
+/// delivery, each holding its thread blocked, and one free to take the next
+/// stop. Past it, a stop waits on the endpoint until a held one is answered.
+pub const MAX_RECEIVERS: usize = 2 * MAX_THREADS;
 
 /// How long an all-stop waits for every thread's upcall to arrive, in
 /// milliseconds.
@@ -102,6 +107,9 @@ pub trait Kernel
     fn now(&mut self) -> u64;
     /// The next stop a receiver passes on, waiting until `until` at most.
     fn next_stop(&mut self, until: u64) -> Option<Stop>;
+    /// Have at least `count` receivers on the stub's endpoint, each holding
+    /// the stop it takes until it is answered; returns whether there are.
+    fn receivers(&mut self, count: usize) -> bool;
     /// Answer the stop `receiver` holds with `label`.
     fn reply(&mut self, receiver: usize, label: u64);
     /// The pointer of a thread that is stopped or fault-blocked; `None` for
@@ -189,7 +197,7 @@ impl Slot
 enum Unheld
 {
     /// Keep the step pending, for the thread's next stop.
-    Keep,
+    Pending,
     /// Undo the step's text anyway, and leave its registers (a detach).
     Abandon,
 }
@@ -259,7 +267,7 @@ impl Session
         let index = free.unwrap_or(self.threads.len());
         if free.is_some() && self.stepping == Some(index)
         {
-            self.undo_step(k, Unheld::Keep);
+            self.undo_step(k, Unheld::Pending);
         }
         let bound = k.bind(index, cap);
         let slot = Slot {
@@ -364,7 +372,7 @@ impl Session
                 self.restart_unreported(k, None);
                 continue;
             }
-            let Some(stop) = k.next_stop(deadline)
+            let Some(stop) = self.next_stop(k, deadline)
             else
             {
                 break;
@@ -382,8 +390,23 @@ impl Session
                 h.reported = true;
             }
         }
-        self.undo_step(k, Unheld::Keep);
+        self.undo_step(k, Unheld::Pending);
         self.running = false;
+    }
+
+    /// The next stop a receiver passes on, waiting until `until` at most,
+    /// once a receiver is free to take it: the session asks for one per
+    /// held stop and kept delivery, each holding its thread, and one more
+    /// ([`MAX_RECEIVERS`] at most).
+    fn next_stop(&self, k: &mut impl Kernel, until: u64) -> Option<Stop>
+    {
+        let holding: usize = self
+            .threads
+            .iter()
+            .map(|t| usize::from(t.held.is_some()) + t.beside.len())
+            .sum();
+        k.receivers((holding + 1).min(MAX_RECEIVERS));
+        k.next_stop(until)
     }
 
     /// Post an upcall to every live thread not held and not yet posted.
@@ -629,7 +652,7 @@ impl Session
             return None;
         }
         let now = k.now();
-        let stop = k.next_stop(now)?;
+        let stop = self.next_stop(k, now)?;
         if stop.kind == syscall_abi::FAULT_KIND_UPCALL
         {
             k.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
@@ -794,7 +817,7 @@ impl Session
             .get(s)
             .map(|t| (t.cap, t.held.is_some(), t.gone));
         if let Some((_, false, false)) = stepped
-            && unheld == Unheld::Keep
+            && unheld == Unheld::Pending
         {
             return;
         }
@@ -827,7 +850,7 @@ impl Session
     {
         if self.stepping.is_some()
         {
-            self.undo_step(k, Unheld::Keep);
+            self.undo_step(k, Unheld::Pending);
         }
         if self.stepping.is_some()
         {
@@ -870,7 +893,7 @@ impl Session
         loop
         {
             let until = deadline.min(k.now() + DRAIN_QUIET);
-            let Some(stop) = k.next_stop(until)
+            let Some(stop) = self.next_stop(k, until)
             else
             {
                 return;
@@ -972,11 +995,19 @@ fn settle_beside(held: &Held, stop: &Stop) -> Unclaimed
         Named::Unreported
     };
     let h = &held.stop;
+    let repeat = if (h.kind, h.detail, h.ip) == (stop.kind, stop.detail, stop.ip)
+    {
+        Repeat::Same
+    }
+    else
+    {
+        Repeat::Other
+    };
     control::settle(
         named,
         control::origin(h.kind, h.detail),
         control::origin(stop.kind, stop.detail),
-        (h.kind, h.detail, h.ip) == (stop.kind, stop.detail, stop.ip),
+        repeat,
     )
 }
 
@@ -1057,6 +1088,8 @@ mod tests
         ip: u64,
         live: bool,
         answers: u32,
+        /// A receiver took it, and holds it until it is answered.
+        taken: bool,
     }
 
     struct Sim
@@ -1079,6 +1112,9 @@ mod tests
         exit_on_resume: Vec<usize>,
         /// Threads whose upcall never arrives.
         deaf: Vec<usize>,
+        /// The receivers on the endpoint, and how many hold a delivery.
+        receivers: usize,
+        busy: usize,
     }
 
     fn cap_of(t: usize) -> u64
@@ -1109,6 +1145,8 @@ mod tests
                 compiled: Vec::new(),
                 exit_on_resume: Vec::new(),
                 deaf: Vec::new(),
+                receivers: 0,
+                busy: 0,
             };
             sim.spawn(None, true);
             sim
@@ -1145,6 +1183,7 @@ mod tests
                 ip: self.threads[t].pc,
                 live: true,
                 answers: 0,
+                taken: false,
             });
             let d = self.ds.len() - 1;
             self.threads[t].run = Run::Blocked(d);
@@ -1187,6 +1226,7 @@ mod tests
                 ip,
                 live: true,
                 answers: 0,
+                taken: false,
             });
             let d = self.ds.len() - 1;
             self.threads[t].run = Run::Blocked(d);
@@ -1258,10 +1298,21 @@ mod tests
 
         fn next_stop(&mut self, until: u64) -> Option<Stop>
         {
-            match self.queue.pop_front()
+            // A delivery waits on the endpoint while every receiver holds one.
+            let taken = if self.busy < self.receivers
+            {
+                self.queue.pop_front()
+            }
+            else
+            {
+                None
+            };
+            match taken
             {
                 Some(d) =>
                 {
+                    self.busy += 1;
+                    self.ds[d].taken = true;
                     let x = &self.ds[d];
                     Some(Stop {
                         receiver: d,
@@ -1279,6 +1330,12 @@ mod tests
             }
         }
 
+        fn receivers(&mut self, count: usize) -> bool
+        {
+            self.receivers = self.receivers.max(count);
+            true
+        }
+
         fn reply(&mut self, receiver: usize, label: u64)
         {
             self.ds[receiver].answers += 1;
@@ -1286,6 +1343,10 @@ mod tests
             {
                 self.broken
                     .push(format!("delivery {receiver} answered twice"));
+            }
+            else if self.ds[receiver].taken
+            {
+                self.busy -= 1;
             }
             if !self.ds[receiver].live
             {
@@ -1389,6 +1450,8 @@ mod tests
         fn bind(&mut self, slot: usize, cap: u64) -> bool
         {
             let t = thread_of(cap);
+            // The service starts a receiver per slot as it binds.
+            self.receivers = self.receivers.max(slot + 1);
             let badge = control::thread_badge(slot);
             if self.threads[t].badge == Some(badge)
             {
@@ -1644,14 +1707,14 @@ mod tests
         let (mut sim, mut s) = attached();
         let r = s.resume(&mut sim, Plan::Step { thread: 0 }, None);
         assert_eq!(r, Resumed::Running);
-        let trap = sim.next_stop(0).expect("the step's #DB");
+        let trap = s.next_stop(&mut sim, 0).expect("the step's #DB");
         assert_eq!((trap.kind, trap.detail), (EXC, DBG));
         assert_eq!(s.hold(&mut sim, trap), Some(0));
         let pc = sim.threads[0].pc;
         // A thread the stub cannot bind faults under its badge meanwhile.
         let n = sim.spawn(Some(0), false);
         sim.fault(n);
-        let other = sim.next_stop(0).unwrap();
+        let other = s.next_stop(&mut sim, 0).unwrap();
         assert_eq!(s.hold(&mut sim, other), None);
         assert_eq!(sim.threads[0].pc, pc, "the stepped thread ran no further");
         assert!(sim.ds[trap.receiver].live && sim.ds[trap.receiver].answers == 0);
@@ -1671,7 +1734,7 @@ mod tests
         let (_, _) = s.poll(&mut sim).expect("the hit");
         let n = sim.spawn(Some(0), false);
         sim.hit(n, 0x100);
-        let repeat = sim.next_stop(0).unwrap();
+        let repeat = s.next_stop(&mut sim, 0).unwrap();
         assert_eq!(s.hold(&mut sim, repeat), None);
         assert!(!sim.threads[0].killed);
         assert!(sim.held_live(&s));
@@ -1854,14 +1917,14 @@ mod tests
         resume(&mut sim, &mut s);
         let n = sim.spawn(Some(0), false);
         sim.fault(n);
-        let theirs = sim.next_stop(0).unwrap();
+        let theirs = s.next_stop(&mut sim, 0).unwrap();
         // Taken for thread 0's, as a credit at a shared pointer takes it.
         s.threads[0].held = Some(Held {
             stop: theirs,
             reported: false,
         });
         sim.deliver(0, UPCALL, 0);
-        let own = sim.next_stop(0).unwrap();
+        let own = s.next_stop(&mut sim, 0).unwrap();
         assert_eq!(s.hold(&mut sim, own), Some(0));
         assert_eq!(
             s.threads[0].held.map(|h| h.stop.receiver),
@@ -1880,7 +1943,7 @@ mod tests
         let (mut sim, mut s) = attached();
         let first = s.threads[0].held.unwrap().stop.receiver;
         sim.redeliver(0);
-        let again = sim.next_stop(0).unwrap();
+        let again = s.next_stop(&mut sim, 0).unwrap();
         assert_eq!(s.hold(&mut sim, again), None, "GDB already knows of it");
         assert_eq!(
             s.threads[0].held.map(|h| h.stop.receiver),

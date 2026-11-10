@@ -424,8 +424,9 @@ pub unsafe fn endpoint_call(
 /// cannot run meanwhile: `endpoint_reply`, the `SYS_IPC_REPLY` failure-path
 /// swap and `endpoint_recv`'s rebind rollback run on this thread, and
 /// `endpoint_call`'s rollback only while this server is parked. On a win the
-/// caller's call fails with `Interrupted`, or a fault-blocked caller is
-/// killed, and the caller is woken; the `wake_in_flight` pin set at bind
+/// caller's call fails with `Interrupted`, a fault-blocked caller is killed,
+/// or a caller blocked in an upcall delivery has the upcall dropped and
+/// resumes, and the caller is woken; the `wake_in_flight` pin set at bind
 /// keeps it alive until that wake clears it.
 ///
 /// # Safety

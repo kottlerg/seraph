@@ -1179,7 +1179,8 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
             // whose `reply_tcb` points at this faulter. CAS-clear it so a later
             // handler reply cannot double-wake. On a successful cancel, mark the
             // disposition Kill (the fault helper terminates the thread on
-            // resume) and release the wake-in-flight claim. If the CAS loses, a
+            // resume, or, for an upcall delivery, drops the upcall and resumes
+            // it) and release the wake-in-flight claim. If the CAS loses, a
             // genuine reply already won and committed its own disposition — leave
             // it untouched.
             if !blocked_on.is_null()

@@ -1173,11 +1173,17 @@ pub unsafe fn thread_configure_with_tls(
 /// The thread must have been configured via [`thread_configure`] first.
 ///
 /// A `Stopped` thread whose fault episode a stop cancelled before any reply
-/// claimed it, or whose handler's claiming reply was `FAULT_REPLY_KILL`, is
-/// not resumed: starting it kills it as an unhandled fault, which posts its
-/// death and address-space observers, or, for the fault of a restartable
-/// syscall's user copy, fails that syscall with `InvalidAddress`
-/// (docs/fault-handling.md § Delivery, Resume, and Kill).
+/// claimed it, or whose handler's claiming reply was `FAULT_REPLY_KILL` (or a
+/// `FAULT_REPLY_FORWARD` of a delivery other than a virtual-memory one, or of
+/// one with no exception handler bound), is not resumed: starting it kills it
+/// as an unhandled fault, which posts its death and address-space observers,
+/// or, for the fault of a restartable syscall's user copy, fails that syscall
+/// with `InvalidAddress` (docs/fault-handling.md § Delivery, Resume, and
+/// Kill). An upcall delivery (`FAULT_KIND_UPCALL`) that a stop cancelled, or
+/// that the claiming reply declined (`FAULT_REPLY_KILL`, or
+/// `FAULT_REPLY_FORWARD`, a decline for an upcall), drops the upcall instead,
+/// and the start resumes the thread at its registers (docs/fault-handling.md
+/// § Asynchronous Upcalls).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid
@@ -2513,7 +2519,8 @@ pub unsafe fn thread_write_regs_raw(thread_cap: u64, buf: *const u8, len: usize)
 /// Copy `buf.len()` bytes at `va` in the address space `thread_cap`'s thread
 /// executes in into `buf` (`SYS_THREAD_READ_MEM`). `buf.len()` must be in
 /// `1..=MAX_THREAD_MEM_COPY`; every page of the range must be mapped (the
-/// kernel does not fault a page in for the read) and normal memory. The
+/// kernel does not fault a page in for the read), normal memory, and below
+/// the top of RAM. The
 /// thread need not be stopped, but a debugger stops it for a coherent view
 /// (`docs/fault-handling.md` § Debugging). Returns the byte count.
 ///
@@ -2570,8 +2577,8 @@ pub unsafe fn thread_read_mem_raw(
 
 /// Copy `buf` to `va` in the address space `thread_cap`'s thread executes in
 /// (`SYS_THREAD_WRITE_MEM`), all or nothing. `buf.len()` must be in
-/// `1..=MAX_THREAD_MEM_COPY`, and every page of the range mapped and normal
-/// memory. A page the thread's mapping makes read-only, such as its text,
+/// `1..=MAX_THREAD_MEM_COPY`, and every page of the range mapped, normal
+/// memory, and below the top of RAM. A page the thread's mapping makes read-only, such as its text,
 /// takes the write only with `flags` = `THREAD_MEM_TEXT`, and only when its
 /// frame is mapped nowhere else. The written bytes are visible to instruction
 /// fetch on every CPU when the call returns; another thread of the space that

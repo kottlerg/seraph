@@ -1108,7 +1108,8 @@ pub(crate) unsafe fn ipc_call_until_answered(
 /// holds the registration. Allocates nothing, so the heap bootstrap can
 /// register its floor before the heap exists.
 ///
-/// The range is one the caller has just reserved, so no other registration
+/// The range is the caller's alone (a fresh reservation, or a range of the
+/// process layout that only `_start` registers), so no other registration
 /// of it exists. An interrupted call may still have registered it, and memmgr
 /// refuses the repeat as an overlap; after such a refusal the range is
 /// unregistered ([`unregister_rw_region`]) and registered again, so the reply

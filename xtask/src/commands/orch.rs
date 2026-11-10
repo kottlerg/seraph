@@ -363,14 +363,10 @@ fn question_add(
     Ok(format!("question {id} open: {question}"))
 }
 
-fn apply_worker(
-    state: &mut Value,
-    name: &str,
-    fields: &[(&'static str, String)],
-    now: &str,
-) -> Result<String>
+/// The fields of a worker change, each checked: one line, and a phase that
+/// is one of `PHASES`.
+fn worker_fields(fields: &[(&'static str, String)]) -> Result<Vec<(&'static str, String)>>
 {
-    let name = one_line("the worker's name", name)?;
     let mut set = Vec::new();
     for (field, value) in fields
     {
@@ -384,6 +380,18 @@ fn apply_worker(
         }
         set.push((*field, value));
     }
+    Ok(set)
+}
+
+fn apply_worker(
+    state: &mut Value,
+    name: &str,
+    fields: &[(&'static str, String)],
+    now: &str,
+) -> Result<String>
+{
+    let name = one_line("the worker's name", name)?;
+    let set = worker_fields(fields)?;
     let workers = object_mut(state, "workers")?;
     let created = !workers.contains_key(&name);
     if created && set.is_empty()
@@ -846,15 +854,23 @@ fn print_state(dir: &Path, as_json: bool) -> Result<()>
     }
     let rendered = render(&state);
     print!("{rendered}");
-    if rendered.len() > STATE_TEXT_MAX
+    if let Some(warning) = size_warning(&rendered)
     {
-        eprintln!(
+        eprintln!("{warning}");
+    }
+    Ok(())
+}
+
+/// The warning for a rendered state longer than `STATE_TEXT_MAX`, if it is.
+fn size_warning(rendered: &str) -> Option<String>
+{
+    (rendered.len() > STATE_TEXT_MAX).then(|| {
+        format!(
             "warning: the state is {} bytes, over the {STATE_TEXT_MAX} this command keeps to; \
              remove finished workers (`orch worker <name> --remove`) and close settled questions",
             rendered.len()
-        );
-    }
-    Ok(())
+        )
+    })
 }
 
 /// Entry point for `cargo xtask orch`.
@@ -1421,6 +1437,15 @@ mod tests
     {
         assert!(state_change(&OrchCommand::End).is_err());
         assert!(state_change(&OrchCommand::Orchestrator { id: None }).is_err());
+    }
+
+    #[test]
+    fn a_state_over_the_limit_draws_the_warning()
+    {
+        assert_eq!(size_warning(&"x".repeat(STATE_TEXT_MAX)), None);
+        let warning = size_warning(&"x".repeat(STATE_TEXT_MAX + 1)).expect("a warning");
+        assert!(warning.contains("10001 bytes"));
+        assert!(warning.contains("--remove"));
     }
 
     #[test]

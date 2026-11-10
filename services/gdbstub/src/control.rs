@@ -233,8 +233,7 @@ pub fn free_slot(slots: impl Iterator<Item = (bool, bool)>) -> Option<usize>
 /// architecture reports the pointer `advance` bytes past the breakpoint (one
 /// on x86-64, none on RISC-V), and `breakpoint_at` says a breakpoint
 /// instruction is there (one the stub planted, or one the target was built
-/// with).
-/// `None` leaves the pointer as it is.
+/// with). `None` leaves the pointer as it is.
 #[must_use]
 pub fn rewound_pc(
     advance: u64,

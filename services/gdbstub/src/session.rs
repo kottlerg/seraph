@@ -108,8 +108,10 @@ pub trait Kernel
     /// The next stop a receiver passes on, waiting until `until` at most.
     fn next_stop(&mut self, until: u64) -> Option<Stop>;
     /// Have at least `count` receivers on the stub's endpoint, each holding
-    /// the stop it takes until it is answered; returns whether there are.
-    fn receivers(&mut self, count: usize) -> bool;
+    /// the stop it takes until it is answered. The service logs a receiver
+    /// it cannot start; the session acts on none, since a stop then waits on
+    /// the endpoint until a held one is answered, as at [`MAX_RECEIVERS`].
+    fn receivers(&mut self, count: usize);
     /// Answer the stop `receiver` holds with `label`.
     fn reply(&mut self, receiver: usize, label: u64);
     /// The pointer of a thread that is stopped or fault-blocked; `None` for
@@ -150,7 +152,8 @@ pub trait Kernel
     fn write_text(&mut self, cap: u64, addr: u64, bytes: &[u8]) -> bool;
     /// Whether the target's text holds the architecture's breakpoint
     /// instruction at `addr`, read through the thread: one the stub planted,
-    /// or one the target was built with.
+    /// or one the target was built with. Asked only where the architecture
+    /// reports the pointer past a breakpoint ([`control::rewound_pc`]).
     fn breakpoint_at(&mut self, cap: u64, addr: u64) -> bool;
     /// Have procmgr restore the target's crash bindings (`DETACH_PROCESS`);
     /// returns whether procmgr answered success.
@@ -625,7 +628,9 @@ impl Session
         };
         if let Some(at) = stops.iter().find_map(|s| self.rewound(k, cap, s, pc))
         {
-            k.set_pc(cap, at);
+            // The pointer was just read, so the thread is blocked; a refusal
+            // means it exited meanwhile, and its stop goes with it.
+            let _ = k.set_pc(cap, at);
         }
     }
 
@@ -673,7 +678,9 @@ impl Session
         let cap = self.threads[index].cap;
         if k.pc(cap).is_some_and(|pc| pc != stop.ip)
         {
-            k.set_pc(cap, stop.ip);
+            // A refusal means the thread exited after its stop, which GDB
+            // then finds gone.
+            let _ = k.set_pc(cap, stop.ip);
         }
         self.current = index;
         Some((index, stop))
@@ -907,7 +914,9 @@ impl Session
                         taken.iter().any(|b| b.addr == a)
                     })
             {
-                k.set_pc(cap, at);
+                // A refusal means the thread exited after its stop, which the
+                // resume below then finds cancelled.
+                let _ = k.set_pc(cap, at);
             }
             k.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
         }
@@ -1330,10 +1339,9 @@ mod tests
             }
         }
 
-        fn receivers(&mut self, count: usize) -> bool
+        fn receivers(&mut self, count: usize)
         {
             self.receivers = self.receivers.max(count);
-            true
         }
 
         fn reply(&mut self, receiver: usize, label: u64)
@@ -1992,6 +2000,52 @@ mod tests
         assert_eq!(r, Resumed::Exited);
         s.drop_all(&mut sim);
         sim.assert_sound();
+    }
+
+    // Defect caught: receivers asked for past MAX_RECEIVERS, one thread each
+    // without bound, or one short of it, a stop left with none below it.
+    #[test]
+    fn the_session_asks_for_one_receiver_more_than_it_holds_up_to_the_bound()
+    {
+        let (mut sim, mut s) = attached();
+        let held = s.threads[0].held.unwrap();
+        // Slots of exited threads, each still holding a stop.
+        let mut hold_more = |s: &mut Session, n: usize| {
+            for _ in 0..n
+            {
+                s.threads.push(Slot {
+                    cap: cap_of(0),
+                    bound: false,
+                    held: Some(held),
+                    beside: Vec::new(),
+                    posted: false,
+                    gone: true,
+                });
+            }
+        };
+        hold_more(&mut s, MAX_RECEIVERS - 3);
+        let _ = s.next_stop(&mut sim, 0);
+        assert_eq!(
+            sim.receivers,
+            MAX_RECEIVERS - 1,
+            "one free beyond those held"
+        );
+        hold_more(&mut s, 1);
+        let _ = s.next_stop(&mut sim, 0);
+        assert_eq!(sim.receivers, MAX_RECEIVERS);
+        hold_more(&mut s, 1);
+        let _ = s.next_stop(&mut sim, 0);
+        assert_eq!(sim.receivers, MAX_RECEIVERS, "no more past the bound");
+        // Every receiver holds a stop: the next waits until one is answered.
+        sim.busy = sim.receivers;
+        let n = sim.spawn(Some(0), false);
+        sim.fault(n);
+        assert_eq!(s.next_stop(&mut sim, 0), None);
+        sim.busy -= 1;
+        assert!(
+            s.next_stop(&mut sim, 0)
+                .is_some_and(|stop| sim.ds[stop.receiver].thread == n)
+        );
     }
 
     // Defect caught: a simulation that misses a resume past a breakpoint,

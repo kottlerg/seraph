@@ -105,10 +105,10 @@ stub's endpoint.
 - **Receivers.** Receiver threads take the fault and upcall messages off the stub's endpoint,
   each holding one message's reply until the serve loop decides it, since a receive on the same
   thread would cancel the reply pending. The stub keeps one receiver per slot of its table, and
-  one free beyond every stop it holds or keeps (below), up to `MAX_RECEIVERS`, so the next stop
-  always finds one. The decision is a `FAULT_REPLY_RESUME`, or a
-  `FAULT_REPLY_KILL` when GDB resumes a thread stopped on a fault with a signal, so the fault
-  takes the outcome it has with no handler bound
+  one free beyond every stop it holds or keeps (below), up to `MAX_RECEIVERS`, so below that
+  bound the next stop finds one; a receiver the stub cannot start is logged. The decision is a
+  `FAULT_REPLY_RESUME`, or a `FAULT_REPLY_KILL` when GDB resumes a thread stopped on a fault with
+  a signal, so the fault takes the outcome it has with no handler bound
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Reply).
 - **Stopping.** To stop the target (the attach, GDB's interrupt byte `0x03`, and the stop of every
   other thread when one stops) the stub posts each running thread an `UPCALL_ANY_INSTRUCTION`

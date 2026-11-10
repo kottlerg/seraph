@@ -124,6 +124,7 @@ fn main()
             events_tx,
             receivers: Vec::new(),
             step: None,
+            receiver_short: false,
             start: Instant::now(),
         },
         session: None,
@@ -303,6 +304,8 @@ struct Sys
     receivers: Vec<Sender<u64>>,
     /// What the step in flight changed, to undo.
     step: Option<StepUndo>,
+    /// The last ask for receivers fell short.
+    receiver_short: bool,
     start: Instant,
 }
 
@@ -346,9 +349,16 @@ impl Kernel for Sys
         }
     }
 
-    fn receivers(&mut self, count: usize) -> bool
+    fn receivers(&mut self, count: usize)
     {
-        count == 0 || self.ensure_receiver(count - 1)
+        let started = count == 0 || self.ensure_receiver(count - 1);
+        // Logged once per shortfall: a stop waits on the endpoint until a
+        // held one is answered, and the serve loop asks again at each wait.
+        if !started && !self.receiver_short
+        {
+            std::os::seraph::log!("a fault receiver could not be started; a stop waits for one");
+        }
+        self.receiver_short = !started;
     }
 
     fn reply(&mut self, receiver: usize, label: u64)

@@ -490,6 +490,22 @@ impl Kernel for Sys
         write_text(cap, addr, bytes)
     }
 
+    fn breakpoint_at(&mut self, cap: u64, addr: u64) -> bool
+    {
+        // The instruction a hit leaves the pointer past is the one as long
+        // as the architecture's advance: x86-64's one-byte `int3`, GDB's
+        // breakpoint kind 1. RISC-V reports the pointer at its `ebreak`, so
+        // nothing is set back there and this is not asked.
+        let Some(insn) = breakpoints::instruction(ARCH, BREAKPOINT_PC_ADVANCE)
+        else
+        {
+            return false;
+        };
+        let mut bytes = [0u8; breakpoints::MAX_BREAKPOINT_BYTES];
+        let bytes = &mut bytes[..insn.len()];
+        syscall::thread_read_mem(cap, addr, bytes).is_ok() && bytes == insn
+    }
+
     fn detach_process(&mut self) -> bool
     {
         let req = IpcMessage::builder(procmgr_labels::DETACH_PROCESS)

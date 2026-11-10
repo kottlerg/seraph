@@ -11,15 +11,17 @@
 //! syscalls and the host tests with a simulated kernel. It keeps these
 //! invariants:
 //!
-//! 1. Every stop a receiver passes on is answered exactly once: a held one
-//!    by a resume, a step, a detach, or the drop of the session; any other
-//!    at once.
+//! 1. Every stop a receiver passes on is answered exactly once: a held one,
+//!    or one kept beside it, by a resume, a step, a detach, or the drop of
+//!    the session; any other at once.
 //! 2. Between two resumes GDB is told of, every live bound thread is held,
 //!    or was posted an upcall that has not arrived within [`STOP_WAIT`]. A
 //!    held stop GDB has been told of is never restarted: it is answered by
 //!    a resume, a step, a detach, or the drop, or replaced by an upcall or
 //!    `#DB` under its badge, which a thread held on its own stop cannot
-//!    make, so the held stop was not its thread's.
+//!    make, so the held stop was not its thread's. A repeat of it under its
+//!    badge, which can be the kernel's second delivery of it, is kept beside
+//!    it and answered with it.
 //! 3. A stop is resumed only as its thread's own, or as the restart of a
 //!    breakpoint hit or a fault that GDB has not been told of, its pointer
 //!    set back to a breakpoint first, which the thread then takes again; a
@@ -55,6 +57,9 @@ pub const STOP_WAIT: u64 = 2000;
 /// resume, in milliseconds, ended early once none has come for
 /// [`DRAIN_QUIET`].
 pub const DRAIN_WAIT: u64 = 500;
+
+/// How long, in milliseconds, a detach's drain waits for one more stop
+/// before it ends, within [`DRAIN_WAIT`].
 pub const DRAIN_QUIET: u64 = 50;
 
 /// How many thread-list pages a refresh takes when a thread of the table
@@ -102,14 +107,18 @@ pub trait Kernel
     /// The pointer of a thread that is stopped or fault-blocked; `None` for
     /// one that runs or has exited.
     fn pc(&mut self, cap: u64) -> Option<u64>;
-    /// Set the pointer of a stopped or fault-blocked thread.
+    /// Set the pointer of a stopped or fault-blocked thread; `false` when
+    /// the kernel refuses (the thread runs or has exited).
     fn set_pc(&mut self, cap: u64, pc: u64) -> bool;
     /// Whether the thread has not exited.
     fn alive(&mut self, cap: u64) -> bool;
-    /// Post the thread an `UPCALL_ANY_INSTRUCTION` upcall.
+    /// Post the thread an `UPCALL_ANY_INSTRUCTION` upcall; `false` when the
+    /// kernel refuses it (the thread has exited, or has an upcall pending).
     fn post_upcall(&mut self, cap: u64) -> bool;
     /// Bind the thread's exception and upcall classes to the stub's
-    /// endpoint under the badge of table slot `slot`, with a receiver for it.
+    /// endpoint under the badge of table slot `slot`, with a receiver for it;
+    /// `false` when the bind or the receiver fails, which leaves the thread's
+    /// bindings as they were.
     fn bind(&mut self, slot: usize, cap: u64) -> bool;
     /// Unbind the thread's upcall class.
     fn unbind_upcall(&mut self, cap: u64);
@@ -117,7 +126,9 @@ pub trait Kernel
     fn delete(&mut self, cap: u64);
     /// The page of procmgr's thread list from `first`, at most `room` caps.
     fn list(&mut self, first: u64, room: usize) -> Option<Page>;
-    /// Arm one instruction's step on the held thread, keeping its undo.
+    /// Arm one instruction's step on the held thread, keeping its undo;
+    /// `false` when the step cannot be armed, which leaves the thread as it
+    /// was.
     fn prepare_step(&mut self, cap: u64) -> bool;
     /// Undo the step's text through the thread, any live one of the target.
     fn undo_step_text(&mut self, cap: u64);
@@ -126,9 +137,15 @@ pub trait Kernel
     /// The stepped thread is alive and never stopped: its registers keep
     /// what the step set.
     fn step_abandoned(&mut self, cap: u64);
-    /// Write `bytes` into the target's text through the thread.
+    /// Write `bytes` into the target's text through the thread; `false`
+    /// when the kernel refuses the write.
     fn write_text(&mut self, cap: u64, addr: u64, bytes: &[u8]) -> bool;
-    /// Have procmgr restore the target's crash bindings (`DETACH_PROCESS`).
+    /// Whether the target's text holds the architecture's breakpoint
+    /// instruction at `addr`, read through the thread: one the stub planted,
+    /// or one the target was built with.
+    fn breakpoint_at(&mut self, cap: u64, addr: u64) -> bool;
+    /// Have procmgr restore the target's crash bindings (`DETACH_PROCESS`);
+    /// returns whether procmgr answered success.
     fn detach_process(&mut self) -> bool;
 }
 
@@ -150,6 +167,9 @@ struct Slot
     /// it lives and is not shown to GDB.
     bound: bool,
     held: Option<Held>,
+    /// Repeats of the held stop, kept beside it once GDB has been told of
+    /// it ([`Unclaimed::Keep`]), and answered with it.
+    beside: Vec<Stop>,
     /// An all-stop posted it an upcall that has not arrived.
     posted: bool,
     gone: bool,
@@ -161,6 +181,17 @@ impl Slot
     {
         self.bound && !self.gone
     }
+}
+
+/// What an undo of the step does when the stepped thread is alive and not
+/// held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unheld
+{
+    /// Keep the step pending, for the thread's next stop.
+    Keep,
+    /// Undo the step's text anyway, and leave its registers (a detach).
+    Abandon,
 }
 
 /// How a resume packet ended.
@@ -228,13 +259,14 @@ impl Session
         let index = free.unwrap_or(self.threads.len());
         if free.is_some() && self.stepping == Some(index)
         {
-            self.undo_step(k, false);
+            self.undo_step(k, Unheld::Keep);
         }
         let bound = k.bind(index, cap);
         let slot = Slot {
             cap,
             bound,
             held: None,
+            beside: Vec::new(),
             posted: false,
             gone: !bound && !k.alive(cap),
         };
@@ -350,7 +382,7 @@ impl Session
                 h.reported = true;
             }
         }
-        self.undo_step(k, false);
+        self.undo_step(k, Unheld::Keep);
         self.running = false;
     }
 
@@ -404,68 +436,95 @@ impl Session
         {
             self.restart_unreported(k, Some(i));
         }
-        let named = match held
+        self.settle_unclaimed(k, i, held, stop)
+    }
+
+    /// Carry out what [`control::settle`] says of `stop`, a delivery under
+    /// slot `i`'s badge that the slot's thread, holding `held`, was not
+    /// credited. Returns the slot when it now holds `stop` unreported.
+    fn settle_unclaimed(
+        &mut self,
+        k: &mut impl Kernel,
+        i: usize,
+        held: Option<Held>,
+        stop: Stop,
+    ) -> Option<usize>
+    {
+        let decline = |s: &Stop| control::decline_label(s.kind, s.detail);
+        let Some(h) = held
+        else
         {
-            None => Named::Free,
-            Some(h) if h.reported => Named::Reported,
-            Some(_) => Named::Unreported,
+            k.reply(stop.receiver, decline(&stop));
+            return None;
         };
-        let held_origin = held.map_or(Origin::Any, |h| control::origin(h.stop.kind, h.stop.detail));
-        let origin = control::origin(stop.kind, stop.detail);
-        match (control::settle(named, held_origin, origin), held)
+        match settle_beside(&h, &stop)
         {
-            (Unclaimed::Restart, Some(h)) =>
+            Unclaimed::Restart =>
             {
                 self.restart(k, i, h.stop, stop);
                 None
             }
-            (Unclaimed::Adopt | Unclaimed::Redelivered, Some(h)) =>
+            settled @ (Unclaimed::Adopt | Unclaimed::Redelivered) =>
             {
-                self.threads[i].held = Some(Held {
-                    stop,
-                    reported: h.reported,
-                });
-                // An adopted stop's predecessor is a new thread's, which
-                // its bind cancelled, or a live one of a thread the stub
-                // cannot bind; a redelivered one's is cancelled.
-                let label = if origin == Origin::Own && held_origin == Origin::Own
+                for old in self.replace_held(i, h, stop)
                 {
-                    syscall_abi::FAULT_REPLY_RESUME
+                    // An adopted stop's predecessors were not the thread's: a
+                    // new thread's its bind cancelled, or a live one of a
+                    // thread the stub cannot bind. A redelivered one's the
+                    // kernel cancelled.
+                    let label = match settled
+                    {
+                        Unclaimed::Adopt => decline(&old),
+                        _ => syscall_abi::FAULT_REPLY_RESUME,
+                    };
+                    k.reply(old.receiver, label);
                 }
-                else
-                {
-                    control::decline_label(h.stop.kind, h.stop.detail)
-                };
-                k.reply(h.stop.receiver, label);
                 (!h.reported).then_some(i)
             }
-            _ =>
+            Unclaimed::Keep =>
             {
-                k.reply(
-                    stop.receiver,
-                    control::decline_label(stop.kind, stop.detail),
-                );
+                self.threads[i].beside.push(stop);
+                None
+            }
+            Unclaimed::Decline =>
+            {
+                k.reply(stop.receiver, decline(&stop));
                 None
             }
         }
+    }
+
+    /// Hold `stop` in slot `i` in place of `held`, keeping whether GDB has
+    /// been told of the stop; returns the deliveries it replaced, the held
+    /// one and those kept beside it, for the caller to answer.
+    fn replace_held(&mut self, i: usize, held: Held, stop: Stop) -> Vec<Stop>
+    {
+        let t = &mut self.threads[i];
+        t.held = Some(Held {
+            stop,
+            reported: held.reported,
+        });
+        let mut old = core::mem::take(&mut t.beside);
+        old.insert(0, held.stop);
+        old
     }
 
     /// Hold `stop` as slot `index`'s own when [`control::credit`] gives it
     /// to the thread: free, and blocked at the stop's pointer.
     fn credit_to(&mut self, k: &mut impl Kernel, index: usize, stop: Stop) -> bool
     {
-        let Some(t) = self.threads.get_mut(index)
+        let Some((cap, holds)) = self.threads.get(index).map(|t| (t.cap, t.held.is_some()))
         else
         {
             return false;
         };
-        let regs_pc = if t.held.is_some() { None } else { k.pc(t.cap) };
-        let planted = |a| self.breakpoints.contains(a);
-        let set_back = control::rewound_pc(self.advance, stop.kind, stop.detail, stop.ip, planted);
-        if control::credit(t.held.is_some(), regs_pc, stop.ip, set_back) != Credit::Own
+        let regs_pc = if holds { None } else { k.pc(cap) };
+        let set_back = self.rewound(k, cap, &stop, stop.ip);
+        if control::credit(holds, regs_pc, stop.ip, set_back) != Credit::Own
         {
             return false;
         }
+        let t = &mut self.threads[index];
         t.held = Some(Held {
             stop,
             reported: false,
@@ -532,8 +591,8 @@ impl Session
     }
 
     /// Set the fault-blocked thread `cap`'s pointer back to the breakpoint
-    /// it took, when one of `stops` is a hit of one planted and the
-    /// architecture reports the pointer past it ([`control::rewound_pc`]).
+    /// it took, when one of `stops` is a breakpoint hit and the architecture
+    /// reports the pointer past it ([`Self::rewound`]).
     fn rewind_hit(&self, k: &mut impl Kernel, cap: u64, stops: &[Stop])
     {
         let Some(pc) = k.pc(cap)
@@ -541,13 +600,21 @@ impl Session
         {
             return;
         };
-        let planted = |a| self.breakpoints.contains(a);
-        if let Some(at) = stops
-            .iter()
-            .find_map(|s| control::rewound_pc(self.advance, s.kind, s.detail, pc, planted))
+        if let Some(at) = stops.iter().find_map(|s| self.rewound(k, cap, s, pc))
         {
             k.set_pc(cap, at);
         }
+    }
+
+    /// The breakpoint address `pc` is past after `stop`
+    /// ([`control::rewound_pc`]): one the stub planted, or one built into the
+    /// target, which the thread `cap` reads in the text, so that a restart
+    /// runs either again rather than past it.
+    fn rewound(&self, k: &mut impl Kernel, cap: u64, stop: &Stop, pc: u64) -> Option<u64>
+    {
+        control::rewound_pc(self.advance, stop.kind, stop.detail, pc, |a| {
+            self.breakpoints.contains(a) || k.breakpoint_at(cap, a)
+        })
     }
 
     /// Take the stops that arrive while the target runs: an upcall then was
@@ -589,7 +656,9 @@ impl Session
         Some((index, stop))
     }
 
-    /// GDB's interrupt: stop the target when it runs.
+    /// GDB's interrupt: stop the target when it runs. Returns whether it
+    /// ran, so a stop is to be reported; `false` leaves the session as it
+    /// is.
     pub fn interrupt(&mut self, k: &mut impl Kernel) -> bool
     {
         if !self.running
@@ -622,6 +691,12 @@ impl Session
                     syscall_abi::FAULT_REPLY_RESUME
                 };
                 k.reply(h.stop.receiver, label);
+                // A delivery kept beside it takes the same answer: whichever
+                // is live is the thread's.
+                for b in t.beside.drain(..)
+                {
+                    k.reply(b.receiver, label);
+                }
             }
         }
         self.running = true;
@@ -692,16 +767,22 @@ impl Session
             return false;
         }
         t.held = None;
+        let beside = core::mem::take(&mut t.beside);
         self.stepping = Some(index);
         k.reply(h.stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
+        for b in beside
+        {
+            k.reply(b.receiver, syscall_abi::FAULT_REPLY_RESUME);
+        }
         self.running = true;
         true
     }
 
     /// Undo the step in flight: its text through any live thread, its
-    /// registers when its thread is held. Unless `force`, a stepped thread
-    /// that is alive and not held keeps the step pending.
-    fn undo_step(&mut self, k: &mut impl Kernel, force: bool)
+    /// registers when its thread is held. A stepped thread that is alive and
+    /// not held keeps the step pending, or has it abandoned, as `unheld`
+    /// says.
+    fn undo_step(&mut self, k: &mut impl Kernel, unheld: Unheld)
     {
         let Some(s) = self.stepping
         else
@@ -713,7 +794,7 @@ impl Session
             .get(s)
             .map(|t| (t.cap, t.held.is_some(), t.gone));
         if let Some((_, false, false)) = stepped
-            && !force
+            && unheld == Unheld::Keep
         {
             return;
         }
@@ -746,7 +827,7 @@ impl Session
     {
         if self.stepping.is_some()
         {
-            self.undo_step(k, false);
+            self.undo_step(k, Unheld::Keep);
         }
         if self.stepping.is_some()
         {
@@ -759,7 +840,7 @@ impl Session
         // below finds it by.
         self.refresh(k);
         self.alive_count(k);
-        self.undo_step(k, true);
+        self.undo_step(k, Unheld::Abandon);
         let taken: Vec<Breakpoint> = self.breakpoints.take_all();
         if let Some(cap) = self.any_cap()
         {
@@ -819,6 +900,10 @@ impl Session
             {
                 k.reply(h.stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
             }
+            for b in &t.beside
+            {
+                k.reply(b.receiver, syscall_abi::FAULT_REPLY_RESUME);
+            }
             k.delete(t.cap);
         }
     }
@@ -874,10 +959,32 @@ impl Session
     }
 }
 
+/// [`control::settle`] of `stop`, a delivery under the badge of a thread
+/// holding `held` that was not credited to it.
+fn settle_beside(held: &Held, stop: &Stop) -> Unclaimed
+{
+    let named = if held.reported
+    {
+        Named::Reported
+    }
+    else
+    {
+        Named::Unreported
+    };
+    let h = &held.stop;
+    control::settle(
+        named,
+        control::origin(h.kind, h.detail),
+        control::origin(stop.kind, stop.detail),
+        (h.kind, h.detail, h.ip) == (stop.kind, stop.detail, stop.ip),
+    )
+}
+
 /// Answer a stop that arrives while no session is attached: one of a thread
 /// procmgr did not rebind at the detach (it never registered) and that
 /// kept the stub's binding, or a late one of the last session. It is
-/// declined as no thread's ([`control::decline_label`]).
+/// declined as no thread's ([`control::decline_label`]). Waits until
+/// `until` at most; returns whether a stop came.
 pub fn decline_detached(k: &mut impl Kernel, until: u64) -> bool
 {
     match k.next_stop(until)
@@ -966,6 +1073,12 @@ mod tests
         crash_endpoint: Vec<usize>,
         /// A step's text is planted and not yet undone.
         step_text: bool,
+        /// Breakpoint instructions the target was built with.
+        compiled: Vec<u64>,
+        /// Threads that exit when next resumed.
+        exit_on_resume: Vec<usize>,
+        /// Threads whose upcall never arrives.
+        deaf: Vec<usize>,
     }
 
     fn cap_of(t: usize) -> u64
@@ -993,6 +1106,9 @@ mod tests
                 detached: false,
                 crash_endpoint: Vec::new(),
                 step_text: false,
+                compiled: Vec::new(),
+                exit_on_resume: Vec::new(),
+                deaf: Vec::new(),
             };
             sim.spawn(None, true);
             sim
@@ -1035,10 +1151,10 @@ mod tests
             self.queue.push_back(d);
         }
 
-        /// Thread `t` runs into the planted breakpoint at `addr`.
+        /// Thread `t` runs into the planted or built-in breakpoint at `addr`.
         fn hit(&mut self, t: usize, addr: u64)
         {
-            assert!(self.planted.contains(&addr));
+            assert!(self.planted.contains(&addr) || self.compiled.contains(&addr));
             self.threads[t].pc = addr + ADVANCE;
             self.deliver(t, EXC, BP);
         }
@@ -1046,6 +1162,35 @@ mod tests
         fn fault(&mut self, t: usize)
         {
             self.deliver(t, EXC, ILL);
+        }
+
+        /// The kernel's second delivery of thread `t`'s fault under the same
+        /// binding, which cancels the first.
+        fn redeliver(&mut self, t: usize)
+        {
+            let Run::Blocked(d) = self.threads[t].run
+            else
+            {
+                panic!("thread {t} is not blocked");
+            };
+            self.ds[d].live = false;
+            self.queue.retain(|&q| q != d);
+            let (badge, kind, detail, ip) = {
+                let x = &self.ds[d];
+                (x.badge, x.kind, x.detail, x.ip)
+            };
+            self.ds.push(Delivery {
+                thread: t,
+                badge,
+                kind,
+                detail,
+                ip,
+                live: true,
+                answers: 0,
+            });
+            let d = self.ds.len() - 1;
+            self.threads[t].run = Run::Blocked(d);
+            self.queue.push_back(d);
         }
 
         fn exit(&mut self, t: usize)
@@ -1157,11 +1302,18 @@ mod tests
                 self.exit(t);
                 return;
             }
+            if self.exit_on_resume.contains(&t)
+            {
+                self.exit(t);
+                return;
+            }
             let pc = self.threads[t].pc;
             let past = pc - ADVANCE;
             if kind == EXC
                 && detail == BP
-                && (self.planted.contains(&past) || self.restored.contains(&past))
+                && (self.planted.contains(&past)
+                    || self.restored.contains(&past)
+                    || self.compiled.contains(&past))
             {
                 self.broken.push(format!(
                     "thread {t} resumed past the breakpoint at {:#x}",
@@ -1169,7 +1321,7 @@ mod tests
                 ));
             }
             self.threads[t].run = Run::Running;
-            if self.planted.contains(&pc)
+            if self.planted.contains(&pc) || self.compiled.contains(&pc)
             {
                 self.hit(t, pc);
             }
@@ -1214,6 +1366,10 @@ mod tests
         fn post_upcall(&mut self, cap: u64) -> bool
         {
             let t = thread_of(cap);
+            if self.deaf.contains(&t)
+            {
+                return self.threads[t].run != Run::Exited;
+            }
             match self.threads[t].run
             {
                 Run::Exited => false,
@@ -1303,6 +1459,11 @@ mod tests
             self.planted.retain(|&a| a != addr);
             self.restored.push(addr);
             true
+        }
+
+        fn breakpoint_at(&mut self, _cap: u64, addr: u64) -> bool
+        {
+            self.planted.contains(&addr) || self.compiled.contains(&addr)
         }
 
         fn detach_process(&mut self) -> bool
@@ -1401,7 +1562,11 @@ mod tests
         sim.hit(n, 0x100);
         sim.hit(0, 0x100);
         let late = sim.withhold(0);
-        let _ = s.poll(&mut sim).expect("the new thread's stop");
+        let (index, _) = s.poll(&mut sim).expect("the new thread's stop");
+        assert_eq!(
+            index, 1,
+            "reported as the new thread's, the spawner not held"
+        );
         assert!(sim.held_live(&s), "every held stop is live");
         sim.release(late);
         sim.threads[n].pc = 0x100;
@@ -1632,6 +1797,138 @@ mod tests
                 .threads
                 .iter()
                 .any(|t| t.stepping && t.run != Run::Exited)
+    }
+
+    // Defect caught: the kernel's second delivery of a reported breakpoint
+    // hit, made during a step of another thread, answered with a kill.
+    #[test]
+    fn a_redelivery_of_a_reported_stop_is_answered_with_it()
+    {
+        let mut sim = Sim::new();
+        let other = sim.spawn(Some(0), true);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        sim.plant(&mut s, 0x100);
+        resume(&mut sim, &mut s);
+        sim.hit(other, 0x100);
+        let (index, _) = s.poll(&mut sim).expect("the hit");
+        assert_eq!(index, 1);
+        sim.redeliver(other);
+        let second = sim.ds.len() - 1;
+        let r = s.resume(&mut sim, Plan::Step { thread: 0 }, None);
+        assert_eq!(r, Resumed::Running);
+        assert_eq!(s.poll(&mut sim), None, "the second delivery is kept");
+        let (index, stop) = s.poll(&mut sim).expect("the step's stop");
+        assert_eq!((index, stop.detail), (0, DBG));
+        assert!(!sim.threads[other].killed);
+        // GDB sets the hit back to the breakpoint and continues: the live
+        // delivery resumes the thread into it again.
+        sim.threads[other].pc = 0x100;
+        resume(&mut sim, &mut s);
+        assert_eq!(sim.ds[second].answers, 1, "the kept delivery is answered");
+        assert!(!sim.threads[other].killed);
+        sim.assert_sound();
+    }
+
+    // Defect caught: on x86-64, a restart of a hit of a breakpoint the target
+    // was built with resumed past it, and the stop was lost.
+    #[test]
+    fn a_restarted_hit_of_a_built_in_breakpoint_stops_again()
+    {
+        let (mut sim, mut s) = attached();
+        resume(&mut sim, &mut s);
+        let _new = sim.spawn(Some(0), true);
+        sim.compiled.push(0x200);
+        sim.hit(0, 0x200);
+        let (index, stop) = s.poll(&mut sim).expect("the breakpoint's stop");
+        assert_eq!((index, stop.detail, stop.ip), (0, BP, 0x200 + ADVANCE));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a thread's own upcall beside a held stop that was not
+    // its own left the held one unanswered, or answered the upcall.
+    #[test]
+    fn a_thread_s_own_upcall_replaces_a_held_stop_of_another_thread()
+    {
+        let (mut sim, mut s) = attached();
+        resume(&mut sim, &mut s);
+        let n = sim.spawn(Some(0), false);
+        sim.fault(n);
+        let theirs = sim.next_stop(0).unwrap();
+        // Taken for thread 0's, as a credit at a shared pointer takes it.
+        s.threads[0].held = Some(Held {
+            stop: theirs,
+            reported: false,
+        });
+        sim.deliver(0, UPCALL, 0);
+        let own = sim.next_stop(0).unwrap();
+        assert_eq!(s.hold(&mut sim, own), Some(0));
+        assert_eq!(
+            s.threads[0].held.map(|h| h.stop.receiver),
+            Some(own.receiver)
+        );
+        assert!(sim.threads[n].killed, "the other stop declined");
+        assert!(sim.held_live(&s));
+        sim.assert_sound();
+    }
+
+    // Defect caught: the kernel's second delivery of a held upcall declined,
+    // or the first kept, leaving the thread's live delivery unanswered.
+    #[test]
+    fn a_redelivered_upcall_takes_the_place_of_the_first()
+    {
+        let (mut sim, mut s) = attached();
+        let first = s.threads[0].held.unwrap().stop.receiver;
+        sim.redeliver(0);
+        let again = sim.next_stop(0).unwrap();
+        assert_eq!(s.hold(&mut sim, again), None, "GDB already knows of it");
+        assert_eq!(
+            s.threads[0].held.map(|h| h.stop.receiver),
+            Some(again.receiver)
+        );
+        assert_eq!(sim.ds[first].answers, 1);
+        assert!(sim.held_live(&s));
+        resume(&mut sim, &mut s);
+        assert_eq!(sim.threads[0].run, Run::Running);
+        sim.assert_sound();
+    }
+
+    // Defect caught: an all-stop that ended with no thread held reported a
+    // stop of none, or left the target taken for stopped.
+    #[test]
+    fn an_all_stop_that_holds_no_thread_leaves_the_target_running()
+    {
+        let (mut sim, mut s) = attached();
+        resume(&mut sim, &mut s);
+        let n = sim.spawn(Some(0), true);
+        sim.deaf.push(n);
+        sim.exit_on_resume.push(0);
+        // Thread 0 faults; the refresh that binds the new thread restarts
+        // it, and it exits; the new thread's upcall never arrives.
+        sim.fault(0);
+        assert_eq!(s.poll(&mut sim), None);
+        assert!(s.running);
+        sim.assert_sound();
+    }
+
+    // Defect caught: a continue after which every thread had exited
+    // reported the target running.
+    #[test]
+    fn a_continue_that_ends_every_thread_reports_the_target_exited()
+    {
+        let (mut sim, mut s) = attached();
+        sim.exit_on_resume.push(0);
+        let r = s.resume(
+            &mut sim,
+            Plan::Continue {
+                thread: 0,
+                signal: None,
+            },
+            None,
+        );
+        assert_eq!(r, Resumed::Exited);
+        s.drop_all(&mut sim);
+        sim.assert_sound();
     }
 
     // Defect caught: a simulation that misses a resume past a breakpoint,

@@ -129,11 +129,19 @@ pub enum Unclaimed
     /// new one is held in its place, and the first answered with
     /// `FAULT_REPLY_RESUME`, which its cancellation ignores.
     Redelivered,
+    /// The named thread holds a breakpoint hit or fault GDB has been told
+    /// of, and the new stop repeats it (the same kind, class, and pointer):
+    /// the kernel's second delivery of it, which a rebind's race can make
+    /// (docs/fault-handling.md § Delivery, Resume, and Kill, Rebind), or a
+    /// stop of a thread the stub cannot bind at the same instruction, and
+    /// which is live is unknown. Neither is answered now: the new one is
+    /// kept beside the held one, and both take the answer the held one
+    /// takes, so the live one is the thread's.
+    Keep,
     /// Any other stop: a new thread's, cancelled by the refresh's bind, or
     /// one of a thread the stub cannot bind. It is answered with
     /// [`decline_label`]; the held stop stays as it is. A held breakpoint
-    /// hit or fault GDB has been told of is never answered here, so a
-    /// second delivery beside it is declined even when it repeats it.
+    /// hit or fault GDB has been told of is never answered here.
     Decline,
 }
 
@@ -152,12 +160,14 @@ pub enum Named
 }
 
 /// Settle an unclaimed stop of origin `stop`, whose badge names a thread in
-/// state `named` holding a stop of origin `held` (any, for a free thread).
+/// state `named` holding a stop of origin `held` (any, for a free thread);
+/// `repeats` when the new stop has the held one's kind, class, and pointer.
 #[must_use]
-pub fn settle(named: Named, held: Origin, stop: Origin) -> Unclaimed
+pub fn settle(named: Named, held: Origin, stop: Origin, repeats: bool) -> Unclaimed
 {
     match (named, held, stop)
     {
+        (Named::Reported, Origin::Any, Origin::Any) if repeats => Unclaimed::Keep,
         (Named::Free, ..)
         | (_, Origin::Own, Origin::Any)
         | (Named::Reported, Origin::Any, Origin::Any) => Unclaimed::Decline,
@@ -211,15 +221,16 @@ pub fn free_slot(slots: impl Iterator<Item = (bool, bool)>) -> Option<usize>
 /// report, so that its resume runs the breakpoint again rather than resuming
 /// past it: `pc - advance` when the stop is a breakpoint exception, the
 /// architecture reports the pointer `advance` bytes past the breakpoint (one
-/// on x86-64, none on RISC-V), and a breakpoint of the stub's is `planted`
-/// there. `None` leaves the pointer as it is.
+/// on x86-64, none on RISC-V), and `planted` says a breakpoint instruction
+/// is there (one the stub planted, or one the target was built with).
+/// `None` leaves the pointer as it is.
 #[must_use]
 pub fn rewound_pc(
     advance: u64,
     kind: u64,
     exception: u64,
     pc: u64,
-    planted: impl Fn(u64) -> bool,
+    planted: impl FnOnce(u64) -> bool,
 ) -> Option<u64>
 {
     if advance == 0
@@ -368,22 +379,47 @@ mod tests
     // thread spawned after the attach stopped beside it under its badge; a
     // step's held #DB restarted, running one instruction too many; a
     // reported thread restarted during a step, or killed by a repeat of its
-    // stop from a thread the stub cannot bind.
+    // stop from a thread the stub cannot bind, or by the kernel's second
+    // delivery of its own.
     #[test]
     fn an_unclaimed_stop_restarts_only_an_unreported_repeatable_stop()
     {
         use Origin::{Any, Own};
-        assert_eq!(settle(Named::Unreported, Any, Any), Unclaimed::Restart);
-        // A step's #DB, or an upcall, held: the new stop is another thread's.
-        assert_eq!(settle(Named::Unreported, Own, Any), Unclaimed::Decline);
-        assert_eq!(settle(Named::Reported, Own, Any), Unclaimed::Decline);
-        // The thread's own #DB or upcall arrives: the held stop was not its.
-        assert_eq!(settle(Named::Unreported, Any, Own), Unclaimed::Adopt);
-        // Two of its own: the kernel delivered the held one again.
-        assert_eq!(settle(Named::Reported, Own, Own), Unclaimed::Redelivered);
-        // Beside a reported breakpoint hit or fault: never the held thread's.
-        assert_eq!(settle(Named::Reported, Any, Any), Unclaimed::Decline);
-        assert_eq!(settle(Named::Free, Any, Any), Unclaimed::Decline);
+        for repeats in [false, true]
+        {
+            assert_eq!(
+                settle(Named::Unreported, Any, Any, repeats),
+                Unclaimed::Restart
+            );
+            // A step's #DB, or an upcall, held: the new stop is another
+            // thread's.
+            assert_eq!(
+                settle(Named::Unreported, Own, Any, repeats),
+                Unclaimed::Decline
+            );
+            assert_eq!(
+                settle(Named::Reported, Own, Any, repeats),
+                Unclaimed::Decline
+            );
+            // The thread's own #DB or upcall arrives: the held stop was not
+            // its.
+            assert_eq!(
+                settle(Named::Unreported, Any, Own, repeats),
+                Unclaimed::Adopt
+            );
+            assert_eq!(settle(Named::Reported, Any, Own, repeats), Unclaimed::Adopt);
+            // Two of its own: the kernel delivered the held one again.
+            assert_eq!(
+                settle(Named::Reported, Own, Own, repeats),
+                Unclaimed::Redelivered
+            );
+            assert_eq!(settle(Named::Free, Any, Any, repeats), Unclaimed::Decline);
+        }
+        // Beside a reported breakpoint hit or fault: kept when it repeats
+        // it, since it can be the kernel's second delivery of it; declined
+        // otherwise, never answered in its place.
+        assert_eq!(settle(Named::Reported, Any, Any, true), Unclaimed::Keep);
+        assert_eq!(settle(Named::Reported, Any, Any, false), Unclaimed::Decline);
     }
 
     // Defect caught: a new thread stored in the slot of the exited spawner

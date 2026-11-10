@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# Host-testable register map, breakpoint table, and stop signals (bins are
-# test = false).
+# Host-testable register map, breakpoint table, stop signals, run-control
+# decisions, and the session's stop state machine (bins are test = false).
 [lib]
 name = "gdbstub"
 path = "src/lib.rs"

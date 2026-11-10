@@ -143,11 +143,17 @@ stub's endpoint.
     one again. The new delivery is held, and the old one, which the kernel cancelled, answered
     `FAULT_REPLY_RESUME`.
   - A breakpoint hit or a fault beside a held one that GDB has not been told of: one of two
-    deliveries under one badge, the thread's own and a new thread's, and which is live is unknown.
-    The stub restarts the thread: it sets its pointer back to a breakpoint it took, as for a hit
-    it does not report (below), and resumes both, so the thread runs its breakpoint or faulting
-    instruction again and stops anew. A restart is idempotent: an answer to a delivery the kernel
-    cancelled is ignored.
+    deliveries under one badge, the thread's own and a new thread's or one the kernel made again,
+    and which is live is unknown. The stub restarts the thread: it sets its pointer back to the
+    breakpoint it took, planted or built into the target, as for a hit it does not report
+    (below), and resumes both, so the thread runs its breakpoint or faulting instruction again
+    and stops anew. A restart is idempotent: an answer to a delivery the kernel cancelled is
+    ignored.
+  - A breakpoint hit or a fault that repeats a held one GDB has been told of (the same kind,
+    class, and pointer): the kernel's second delivery of it, which a rebind's race can make
+    ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and Kill,
+    Rebind), or a stop of a thread the stub cannot bind at the same instruction. The stub keeps
+    it beside the held one, answers neither now, and gives both the answer the held one takes.
 
   A held stop GDB has been told of is never restarted, nor is a held upcall or `#DB`. It is
   answered by a resume, a step, the detach, or the end of a session whose threads have all exited,
@@ -266,9 +272,10 @@ A thread spawned after the attach that stops at the same pointer as its spawner 
 spawner's own stop is in flight can be credited with the spawner's stop until the spawner's stop
 arrives; the restart above then runs the spawner's breakpoint or faulting instruction again. When
 the second thread is one the stub cannot bind, both deliveries are live and both are resumed, so on
-x86-64 that thread, at a breakpoint, resumes past it; one beside a held stop GDB already knows of
-is declined, which kills it. The stub's thread ids are table indices, not kernel
-thread identities, and the id of an exited thread names the thread that takes its slot.
+x86-64 that thread, at a breakpoint, resumes past it, as it does when it repeats a held stop GDB
+already knows of and is resumed with it; one beside such a stop that does not repeat it is
+declined, which kills it. The stub's thread ids are table indices, not kernel thread identities,
+and the id of an exited thread names the thread that takes its slot.
 
 Each bound's entry is in [docs/limits.md](../../docs/limits.md) § Other services.
 
@@ -283,8 +290,11 @@ resume plans of `c`, `s`, and `vCont`. They drive the stop state machine against
 kernel through the interleavings that can break it: a spawner and a thread it spawned after the
 attach at one breakpoint, in either order and with the spawner's stop late; a fault of a thread
 the stub cannot bind; a new thread in its exited spawner's slot; stops during a step; a repeat of
-a stop GDB knows of; stops racing a resume or an all-stop; and a detach with a stop pending, with
-every thread exited, and with the step's thread exited or never stopped. `cargo xtask test-gdb`
+a stop GDB knows of, and the kernel's second delivery of one; a restart at a breakpoint built into
+the target; a thread's own upcall beside a stop that was not its; stops racing a resume or an
+all-stop, and an all-stop that holds no thread; a continue that ends every thread; and a detach
+with a stop pending, with every thread exited, and with the step's thread exited or never
+stopped. `cargo xtask test-gdb`
 boots the `gdb-target`
 fixture (`programs/debugger --gdb-target`,
 [programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and runs a batch

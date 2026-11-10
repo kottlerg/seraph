@@ -15,6 +15,8 @@ test = false
 [dependencies]
 # The report block's emitter and the stack walk, host-tested there.
 crash-report = { path = "../../shared/crash-report" }
+# The state that bounds one fault's handling, host-tested there.
+fault-bound = { package = "crashd-fault-bound", path = "fault-bound" }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }

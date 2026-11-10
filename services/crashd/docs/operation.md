@@ -12,8 +12,9 @@ cannot report.
 2. Its bootstrap round delivers one cap, a `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which
    its recipe's `debug_authority = yes` has svcmgr mint
    ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `debug_authority`).
-3. It binds its main thread's upcall class to an endpoint its watchdog thread receives on, and
-   starts that thread ([Bounds](#bounds)).
+3. It starts its watchdog thread, then binds its main thread's upcall class to an endpoint the
+   watchdog receives on, so the watchdog does not copy that binding onto itself
+   ([Bounds](#bounds)).
 4. It sends `REGISTER_CRASH_SERVICE` with a Thread cap of its main thread, and receives a `RECV` cap
    on procmgr's crash endpoint, which every process procmgr creates has its exception class bound
    to ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint and Debug
@@ -68,11 +69,13 @@ undebuggable. When the bound passes, the watchdog posts the receiving thread an 
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Asynchronous Upcalls), which cancels
 the blocking request it waits in (`Interrupted`) and is then served by the watchdog. An upcall never
 cancels a fault of the receiving thread's own, a page fault on its pager included, so the bound
-cannot end crashd. Each fault takes a generation, which the watchdog re-reads just before the post,
-and an attach cancelled for an earlier generation is sent again, so a late cancellation does not cut
-the next fault's handling short. On the cancellation crashd declines the fault at once, marking the
-block `status=timeout` when the attach was the request cancelled, and logs the rest of the block
-after the decline, when nothing waits on the faulting thread any more. The stack scan reads at most
+cannot end crashd. Each fault takes a generation, and the watchdog commits to cancel one only while
+it is still being handled ([`fault-bound/`](../fault-bound/src/lib.rs), host-tested). Once it has, crashd sends no further
+request of that fault's handling, so no later attach waits past the bound, wherever the upcall was
+delivered. On the cancellation crashd declines the fault at once, marking the block
+`status=timeout` when an attach was the request cancelled, waits for the watchdog to have served
+the upcall, and logs the rest of the block after the decline, when nothing waits on the faulting
+thread any more. So no cancellation of one fault reaches the next fault's handling. The stack scan reads at most
 8 KiB (`STACK_SCAN_BYTES`).
 
 ---
@@ -89,9 +92,9 @@ after the decline, when nothing waits on the faulting thread any more. The stack
   and been dropped from the registry, the spawner's crash badge names no thread any more: the attach
   is refused, and the block is `status=unattached`, with the fault message's fields alone.
 - **Uncovered processes.** init, memmgr, and procmgr are not created by procmgr. logd, the serial
-  driver, and the framebuffer driver, through which logd writes every line, and crashd declare
-  themselves undebuggable at startup, as svctest and the GDB stub, debug-authority holders, do in a
-  boot that stages them;
+  driver, and the framebuffer driver, through which logd writes every line, the debug port's
+  virtio-console driver, which the GDB stub waits on, and crashd declare themselves undebuggable at
+  startup, as svctest and the GDB stub, debug-authority holders, do in a boot that stages them;
   before the declaration, a fault of one of them reaches crashd and is declined once the bound
   passes. A fault of any of these takes the outcome it has with no handler bound; the kernel's
   `fault unhandled` and `USERSPACE FAULT` lines are its only report.

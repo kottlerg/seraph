@@ -16,10 +16,11 @@
 
 mod arch;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crash_report::{Access, Fault, Image, Report, Status, Thread};
+use fault_bound::FaultBound;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::{
     FAULT_CLASS_UPCALL, FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL,
@@ -38,21 +39,15 @@ const WATCHDOG_TICK: Duration = Duration::from_millis(100);
 /// Bytes of stack the walk scans, from the stack pointer up.
 const STACK_SCAN_BYTES: u64 = 8192;
 
-/// The generation of the fault being handled, counting from 1; each fault
-/// takes the next.
-static GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// Milliseconds since the first [`now_ms`] when the current generation's
-/// handling began; 0 while no fault is being handled.
-static ARMED_AT_MS: AtomicU64 = AtomicU64::new(0);
-
-/// The generation whose handling the watchdog cancelled; 0 for none.
-static FIRED: AtomicU64 = AtomicU64::new(0);
+/// The bound of the fault being handled, shared with the watchdog: each
+/// fault takes a generation, which the watchdog cancels once it has run past
+/// [`FAULT_BOUND`].
+static BOUND: FaultBound = FaultBound::new();
 
 /// Whether the watchdog cancelled the handling of generation `generation`.
 fn fired(generation: u64) -> bool
 {
-    FIRED.load(Ordering::Acquire) == generation
+    BOUND.fired(generation)
 }
 
 fn main() -> !
@@ -164,9 +159,9 @@ fn register(authority: u64, ipc_buf: *mut u64) -> Option<u64>
 /// thread with the report id as the decline reason. The block is logged
 /// before the decline, so the kernel's serial diagnostic of the kill, which
 /// the decline triggers, does not land among its lines. A request the
-/// watchdog cancels ends the bound: the thread is declined at once, and the
-/// block's remaining lines follow the decline, when nothing can wait on the
-/// faulting thread any more.
+/// watchdog cancels ends the bound: the thread is declined at once, the
+/// watchdog's cancellation is let finish, and the block's remaining lines
+/// follow, when nothing can wait on the faulting thread any more.
 fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
 {
     let id = report_id();
@@ -188,8 +183,7 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
         }
     };
 
-    let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    ARMED_AT_MS.store(now_ms().max(1), Ordering::Release);
+    let generation = BOUND.arm(now_ms());
     let gathered = gather(msg.badge, ip, authority, generation, ipc_buf);
     let report = Report {
         id,
@@ -212,15 +206,19 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
         std::os::seraph::log!("{}", lines[logged]);
         logged += 1;
     }
-    ARMED_AT_MS.store(0, Ordering::Release);
+    let cancelled = BOUND.end(generation);
 
     let decline = IpcMessage::builder(FAULT_REPLY_KILL).word(0, id).build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&decline, ipc_buf) };
+    if cancelled
+    {
+        await_settled(generation);
+    }
 
     // A write the watchdog cancelled is written again, with the rest; a
     // reader counts a line written twice once.
-    let resume = if fired(generation)
+    let resume = if cancelled
     {
         logged.saturating_sub(1)
     }
@@ -231,6 +229,24 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
     for line in &lines[resume..]
     {
         std::os::seraph::log!("{line}");
+    }
+}
+
+/// Wait until the watchdog has finished cancelling `generation`, its upcall
+/// served at one of these yields' returns, so no upcall of it is left to cut
+/// a later request short; at most [`FAULT_BOUND`], after which crashd goes
+/// on, logged.
+fn await_settled(generation: u64)
+{
+    let start = Instant::now();
+    while !BOUND.settled(generation)
+    {
+        if start.elapsed() > FAULT_BOUND
+        {
+            std::os::seraph::log!("the watchdog did not finish its cancellation");
+            return;
+        }
+        let _ = syscall::thread_yield();
     }
 }
 
@@ -257,9 +273,10 @@ enum AttachFailed
     Cancelled,
 }
 
-/// Send `ATTACH_PROCESS` for `badge` from thread `first`. A call the
-/// watchdog cancelled for an earlier generation, whose cancellation lands
-/// late, is sent again.
+/// Send `ATTACH_PROCESS` for `badge` from thread `first`, unless the
+/// watchdog has cancelled `generation`, so no attach blocks once the bound
+/// has passed. A call interrupted by anything but that cancellation is sent
+/// again.
 fn attach(
     badge: u64,
     first: u64,
@@ -274,6 +291,10 @@ fn attach(
         .build();
     let reply = loop
     {
+        if fired(generation)
+        {
+            return Err(AttachFailed::Cancelled);
+        }
         // SAFETY: ipc_buf is the registered IPC buffer page.
         match unsafe { ipc::ipc_call(authority, &request, ipc_buf) }
         {
@@ -545,9 +566,12 @@ fn now_ms() -> u64
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Bind the calling thread's upcall class to an endpoint the watchdog
-/// thread receives on, and start that thread. `false`, with nothing bound,
-/// when the endpoint, the binding, or the thread cannot be had.
+/// Start the watchdog thread, then bind the calling thread's upcall class to
+/// an endpoint the watchdog receives on. The thread is spawned first, so it
+/// does not copy that binding to an endpoint only it receives on
+/// (docs/fault-handling.md § Asynchronous Upcalls, Nesting), and serves only
+/// once the binding is made. `false`, with nothing bound and the watchdog
+/// gone, when the endpoint, the thread, or the binding cannot be had.
 fn start_watchdog() -> bool
 {
     let receiver = std::os::seraph::thread::current_thread_cap();
@@ -559,59 +583,77 @@ fn start_watchdog() -> bool
     {
         return false;
     };
-    if syscall::thread_set_fault_handler(receiver, endpoint, FAULT_CLASS_UPCALL).is_err()
-    {
-        let _ = syscall::cap_delete(endpoint);
-        return false;
-    }
+    let (go_tx, go) = mpsc::channel::<bool>();
     if std::thread::Builder::new()
         .name("watchdog".into())
-        .spawn(move || watchdog(receiver, endpoint))
+        .spawn(move || {
+            if go.recv() == Ok(true)
+            {
+                watchdog(receiver, endpoint);
+            }
+        })
         .is_err()
     {
-        let _ = syscall::thread_set_fault_handler(receiver, 0, FAULT_CLASS_UPCALL);
         let _ = syscall::cap_delete(endpoint);
         return false;
     }
-    true
+    let bound = syscall::thread_set_fault_handler(receiver, endpoint, FAULT_CLASS_UPCALL).is_ok();
+    let _ = go_tx.send(bound);
+    if !bound
+    {
+        let _ = syscall::cap_delete(endpoint);
+    }
+    bound
 }
 
-/// The watchdog: once a fault's handling has run past [`FAULT_BOUND`], post
-/// the receiving thread an upcall, which cancels the blocking request it
-/// waits in (`Interrupted`), and serve the upcall when it is delivered. An
-/// upcall never cancels a fault of the receiver's own, a page fault on its
-/// pager included, which it waits for. The generation, re-read just before
-/// the post, keeps a fault whose handling ended meanwhile from cancelling the
-/// next one's.
-fn watchdog(receiver: u64, endpoint: u64)
+/// The watchdog: once a fault's handling has run past [`FAULT_BOUND`], commit
+/// to cancel its generation, post the receiving thread an upcall, which
+/// cancels the blocking request it waits in (`Interrupted`), serve the
+/// upcall when it is delivered, and settle the generation. The commit holds
+/// only while the generation is still being handled, so one whose handling
+/// ended meanwhile is not cancelled, nor the next one's handling cut short.
+/// An upcall never cancels a fault of the receiver's own, a page fault on its
+/// pager included, which it waits for.
+fn watchdog(receiver: u64, endpoint: u64) -> !
 {
     let bound_ms = u64::try_from(FAULT_BOUND.as_millis()).unwrap_or(u64::MAX);
     let ipc_buf = std::os::seraph::current_ipc_buf();
     loop
     {
         std::thread::sleep(WATCHDOG_TICK);
-        let generation = GENERATION.load(Ordering::Acquire);
-        let armed = ARMED_AT_MS.load(Ordering::Acquire);
-        if armed == 0
-            || now_ms().saturating_sub(armed) < bound_ms
-            || fired(generation)
-            || GENERATION.load(Ordering::Acquire) != generation
+        let Some(generation) = BOUND.due(now_ms(), bound_ms)
+        else
         {
             continue;
-        }
-        FIRED.store(generation, Ordering::Release);
-        if syscall::thread_post_upcall(receiver, generation, 0).is_err()
+        };
+        if !BOUND.commit(generation)
         {
             continue;
         }
         // The upcall is delivered at the receiver's next syscall return;
         // resume it there.
-        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-        if unsafe { ipc::ipc_recv(endpoint, ipc_buf) }.is_ok()
+        if syscall::thread_post_upcall(receiver, generation, 0).is_ok()
         {
-            // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf) };
+            loop
+            {
+                // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+                match unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+                {
+                    Ok(_) =>
+                    {
+                        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+                        let _ = unsafe {
+                            ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf)
+                        };
+                        break;
+                    }
+                    Err(e) if e == SyscallError::Interrupted as i64 =>
+                    {}
+                    Err(_) => break,
+                }
+            }
         }
+        BOUND.settle(generation);
         std::os::seraph::log!("a fault's handling passed its bound; reporting what was read");
     }
 }

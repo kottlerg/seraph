@@ -1250,12 +1250,41 @@ const carried_judged = (await carried_verified).filter(Boolean)
 // surviving carried one, as dedup matches, is folded into it, so a standing
 // blocker counts once in every run; when the carried record was dropped as
 // fixed, the fresh one stands on its own.
+// The match is dedup's, over every source of the fresh record, so one agent's
+// own adjacent findings stay distinct. The fold takes the fresh record's line
+// (the line at the head, so the next run matches it again), its sources, PRs,
+// duplicates, and notes, and, when the carried record names no Issue, an
+// Issue the fresh record's authority refuter left standing.
+const fold_twin = (f) =>
+    carried_judged
+        .filter(
+            (c) =>
+                c.status !== 'dropped' && !c.sources.some((s) => f.sources.includes(s)) &&
+                c.file === f.file && c.class === f.class && c.bucket === f.bucket &&
+                c.must_violation === f.must_violation &&
+                Math.abs(c.line - f.line) <= DEDUP_LINE_SLACK,
+        )
+        .sort((a, b) => Math.abs(a.line - f.line) - Math.abs(b.line - f.line))[0]
+
+function fold(twin, f) {
+    twin.duplicates += 1 + f.duplicates
+    for (const s of f.sources) if (!twin.sources.includes(s)) twin.sources.push(s)
+    for (const n of f.prs) if (!twin.prs.includes(n)) twin.prs.push(n)
+    twin.evidence += '\n[re-reported by ' + f.sources.join(', ') + ' at line ' + f.line + ': ' +
+        f.claim + '] ' + f.evidence
+    twin.line = f.line
+    twin.annotations.push(...f.annotations)
+    if (!twin.issue && f.issue && f.votes.some((v) => v.lens === 'authority')) {
+        twin.issue = f.issue
+        twin.annotations.push('#' + f.issue + ' names this work (authority refuter of ' +
+            f.sources[0] + ')')
+    }
+}
+
 const fresh_judged = []
 for (const f of results.flatMap((r) => r.findings)) {
-    const twin = f.status === 'dropped'
-        ? null
-        : nearest(carried_judged.filter((c) => c.status !== 'dropped'), f, f.sources[0])
-    if (twin) absorb(twin, f, f.sources[0])
+    const twin = f.status === 'dropped' ? null : fold_twin(f)
+    if (twin) fold(twin, f)
     else fresh_judged.push(f)
 }
 const all = [...carried_judged, ...fresh_judged]

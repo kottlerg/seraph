@@ -499,8 +499,11 @@ pub mod procmgr_labels
     /// under a badge carrying this bit and not bit 63, which procmgr's own
     /// crash badges carry. procmgr tells a debugger's binding by this bit
     /// alone: it binds such a thread back to the crash endpoint when it
-    /// registers ([`REGISTER_THREAD`]) while no debugger is watched, and on
-    /// [`DETACH_PROCESS`], and unbinds it on [`DECLARE_NO_DEBUG`]. Specified
+    /// registers ([`REGISTER_THREAD`]) while no debugger is watched, when its
+    /// registration is refused at [`REGISTERED_THREADS_MAX`] or for
+    /// procmgr's heap (under the process badge), and on [`DETACH_PROCESS`];
+    /// it unbinds it on [`DECLARE_NO_DEBUG`], and when its registration is
+    /// refused because its process sent that declaration. Specified
     /// in `services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`.
     pub const DEBUGGER_BADGE_TAG: u64 = 1 << 62;
 
@@ -513,11 +516,16 @@ pub mod procmgr_labels
     /// binds the thread's exception class to the crash endpoint under a
     /// badge of the thread's own when the thread's binding is the process's,
     /// or a debugger's ([`DEBUGGER_BADGE_TAG`]) while the process has no
-    /// debugger watched ([`ATTACH_PROCESS`] `caps[0]`). Replies `SUCCESS`; `INVALID_BADGE` when the badge names no live
-    /// process; `NOT_ATTACHABLE` when the process sent [`DECLARE_NO_DEBUG`];
+    /// debugger watched ([`ATTACH_PROCESS`] `caps[0]`). Replies `SUCCESS`;
+    /// `INVALID_BADGE` when the badge names no live process; `NOT_ATTACHABLE`
+    /// when the process sent [`DECLARE_NO_DEBUG`], after unbinding the thread
+    /// as the declaration does when the cap carries the rights above;
     /// `INVALID_ARGUMENT` without a Thread cap carrying those rights;
     /// `THREAD_LIMIT` at [`REGISTERED_THREADS_MAX`]; `OUT_OF_MEMORY` when the
-    /// heap cannot hold the entry. A refused request's cap is deleted.
+    /// heap cannot hold the entry. At those two
+    /// refusals a debugger's binding on the thread is bound back to the crash
+    /// endpoint under the process badge, whether or not a debugger is
+    /// watched. A refused request's cap is deleted.
     /// Specified in `services/procmgr/docs/ipc-interface.md`
     /// § `REGISTER_THREAD`.
     pub const REGISTER_THREAD: u64 = 22;

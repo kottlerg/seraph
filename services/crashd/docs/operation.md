@@ -28,7 +28,8 @@ When crashd dies, procmgr declines the faults on the endpoint until a respawned 
 
 The fault message carries the badge the faulting thread's exception class is bound under, the
 fault's kind and words, and the instruction pointer. The badge names the thread: the process badge
-names its main thread (or a thread that never registered, which kept its spawner's binding), and a
+names its main thread (or a thread that never registered, which kept its spawner's binding or, when
+that was a debugger's, was bound back under the process badge at its refused registration), and a
 thread crash badge the registered thread procmgr bound under it
 ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint and Debug
 Authority). crashd:
@@ -89,11 +90,13 @@ most
   before it runs its code ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Thread
   registration). A thread that did not (procmgr refused it at the per-process bound, or the call
   failed, or the process does not use the runtime's spawn) is not in the attach list, and its
-  faults carry its spawner's badge. crashd cannot read its registers, so its block carries
-  `thread=unidentified`, the fault, the image placement, and the bytes at the instruction pointer,
-  and no registers and no stack walk. When its spawner was a registered thread that has since exited
-  and been dropped from the registry, the spawner's crash badge names no thread any more: the attach
-  is refused, and the block is `status=unattached`, with the fault message's fields alone.
+  faults carry its spawner's badge, or the process badge when procmgr refused it at the bound or
+  for its heap while it carried a debugger's binding and bound it back under that badge. crashd
+  cannot read its registers, so its block carries `thread=unidentified`, the fault, the image
+  placement, and the bytes at the instruction pointer, and no registers and no stack walk. When its
+  spawner was a registered thread that has since exited and been dropped from the registry, the
+  spawner's crash badge names no thread any more: the attach is refused, and the block is
+  `status=unattached`, with the fault message's fields alone.
 - **Uncovered processes.** init, memmgr, and procmgr are not created by procmgr. logd, the serial
   driver, and the framebuffer driver, through which logd writes every line, the debug port's
   virtio-console driver, which the GDB stub waits on, and crashd declare themselves undebuggable at

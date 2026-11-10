@@ -750,7 +750,9 @@ format, the contract the host-side symbolizer reads, in
   it, and the named thread's place among them, so the crash service reads the registers and stack
   of the thread that faulted ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
   § Label 22: `REGISTER_THREAD`, § Label 20: `ATTACH_PROCESS`). A thread that never registered keeps
-  its spawner's badge and is reported without registers.
+  its spawner's badge, or the process badge when its registration was refused at the registry's
+  bound or for procmgr's heap while it carried a debugger's binding, and is reported without
+  registers.
 - **Receiver.** While no crash service is registered, a procmgr thread receives on the endpoint and
   declines every fault, so an image that stages no crash service kills a faulting thread as with no
   handler bound. A crash service registers with procmgr's debug authority and receives on the

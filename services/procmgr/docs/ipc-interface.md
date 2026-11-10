@@ -761,8 +761,8 @@ registers after the restore, procmgr binds it back then, and when its registrati
 registry's bound or for procmgr's heap, at the refusal, under the process badge (§ Label 22). A
 thread whose runtime sent no registration at all, its cap derivation or its IPC buffer having
 failed, or its runtime having stopped registering after a `NOT_ATTACHABLE` refusal, keeps the
-binding it copied, which procmgr cannot reach. The target's `DECLARE_NO_DEBUG`
-deletes the watch (§ Label 21). The restore cannot undo the dead debugger's own changes to the
+binding it copied, which procmgr cannot reach. The target's `DECLARE_NO_DEBUG` deletes the watch
+(§ Label 21). The restore cannot undo the dead debugger's own changes to the
 target, a breakpoint it planted among them. procmgr only reads the watched thread's state, which
 takes no right.
 
@@ -793,12 +793,15 @@ crash badge) or a debugger did (under the debugger tag, Label 20), and the upcal
 debugger bound it, leaving a handler the process bound itself; releases the registered threads; and
 refuses `ATTACH_PROCESS` and `REGISTER_THREAD` on it from then on. A debugger attached at the
 declaration loses its bindings on the threads procmgr holds, the watch, and the registered threads'
-caps its attach was given,
-which procmgr revokes. The main thread's cap it was given keeps its rights, since procmgr cannot
-revoke it without revoking the creator's: such a debugger can still stop that thread and bind its
-classes, and nothing binds back what it binds after the declaration. A process sends it before it
-spawns a thread: a thread spawned before that copies the binding, and keeps it unless its
-registration reaches procmgr after the declaration, which unbinds it then (Label 22).
+caps its attach was given, which procmgr revokes. The main thread's cap it was given keeps its
+rights, since procmgr cannot revoke it without revoking the creator's: such a debugger can still
+stop that thread and bind its classes, and nothing binds back what it binds after the declaration.
+A process sends it before it spawns a thread: a thread spawned before that copies its spawner's
+binding, and the declaration reaches it only once it is registered. One whose registration reaches
+procmgr after the declaration is unbound then (Label 22). One procmgr does not hold at the
+declaration, its runtime having sent no registration, or its registration having been refused at
+the registry's bound or for procmgr's heap, keeps a binding: the one it copied, or procmgr's under
+the process badge when that was a debugger's (Label 22).
 The senders are the processes a stop of which would deadlock a debug-authority holder, which waits
 on them for its log output or its own progress: logd, the serial and framebuffer drivers, the debug
 port's virtio-console driver, through which the GDB stub reaches its host for every packet, and

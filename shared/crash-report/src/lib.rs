@@ -117,8 +117,12 @@ pub enum Thread
 {
     /// The process's main thread, whose registers the report carries.
     Main,
-    /// Another thread, which the reporter holds no capability to: the report
-    /// carries the fault and the image, but no registers and no frames.
+    /// A thread the runtime spawned and registered with procmgr, whose
+    /// registers the report carries.
+    Spawned,
+    /// A thread the reporter could not identify (one that never registered):
+    /// the report carries the fault and the image, but no registers and no
+    /// frames.
     Unidentified,
 }
 
@@ -129,8 +133,17 @@ impl Thread
         match self
         {
             Thread::Main => "main",
+            Thread::Spawned => "spawned",
             Thread::Unidentified => "unidentified",
         }
+    }
+
+    /// Whether a report of this thread carries its registers and stack walk
+    /// when complete.
+    #[must_use]
+    pub fn carries_registers(self) -> bool
+    {
+        matches!(self, Thread::Main | Thread::Spawned)
     }
 }
 

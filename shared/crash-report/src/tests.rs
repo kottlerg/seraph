@@ -122,6 +122,36 @@ fn an_unidentified_thread_report_passes_without_registers_or_frames()
 }
 
 #[test]
+fn a_spawned_thread_report_carries_registers_and_fails_without_them()
+{
+    let regs = [5u64; 21];
+    let mut report = main_vm_report(&regs, &[0x90], &[0x1000]);
+    report.thread = Thread::Spawned;
+    let blocks = parse(&logged(&report));
+    assert_eq!(blocks[0].check(), Ok(()));
+    assert_eq!(blocks[0].get("thread"), Some("spawned"));
+    assert_eq!(blocks[0].hex("reg.rax"), Some(5));
+
+    let mut bare = main_vm_report(&[], &[0x90], &[]);
+    bare.thread = Thread::Spawned;
+    assert_eq!(
+        parse(&logged(&bare))[0].check(),
+        Err(Defect::Missing("reg.rax".into()))
+    );
+}
+
+#[test]
+fn a_thread_value_the_reader_does_not_know_requires_no_registers()
+{
+    let mut report = main_vm_report(&[], &[0x90], &[]);
+    report.thread = Thread::Unidentified;
+    let log = logged(&report).replace("thread=unidentified", "thread=later-kind");
+    let blocks = parse(&log);
+    assert_eq!(blocks[0].get("thread"), Some("later-kind"));
+    assert_eq!(blocks[0].check(), Ok(()));
+}
+
+#[test]
 fn an_unattached_report_needs_only_the_fault_message_fields()
 {
     let mut report = main_vm_report(&[], &[], &[]);

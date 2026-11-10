@@ -193,7 +193,7 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
     let gathered = gather(msg.badge, ip, authority, generation, ipc_buf);
     let report = Report {
         id,
-        badge: msg.badge,
+        badge: gathered.badge,
         arch: arch::current::ARCH,
         thread: gathered.thread,
         status: gathered.status,
@@ -237,6 +237,9 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
 /// What [`gather`] read of a faulting process.
 struct Gathered
 {
+    /// The process badge the attach reply names; the fault's own badge when
+    /// no attach succeeded.
+    badge: u64,
     status: Status,
     thread: Thread,
     image: Option<Image>,
@@ -245,23 +248,29 @@ struct Gathered
     frames: Vec<u64>,
 }
 
-/// Attach to the process `badge` names and read its faulting thread: the
-/// main thread's registers when the main thread is the one stopped at `ip`,
-/// the bytes at `ip`, and the stack walk. An attach the watchdog cancelled
-/// for an earlier generation, whose cancellation lands late, is sent again.
-fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u64) -> Gathered
+/// Why [`attach`] returned no reply.
+enum AttachFailed
 {
-    let mut out = Gathered {
-        status: Status::Unattached,
-        thread: Thread::Unidentified,
-        image: None,
-        regs: Vec::new(),
-        code: Vec::new(),
-        frames: Vec::new(),
-    };
+    /// procmgr refused, or the call failed.
+    Refused,
+    /// The watchdog cancelled the call.
+    Cancelled,
+}
+
+/// Send `ATTACH_PROCESS` for `badge` from thread `first`. A call the
+/// watchdog cancelled for an earlier generation, whose cancellation lands
+/// late, is sent again.
+fn attach(
+    badge: u64,
+    first: u64,
+    authority: u64,
+    generation: u64,
+    ipc_buf: *mut u64,
+) -> Result<IpcMessage, AttachFailed>
+{
     let request = IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
         .word(0, badge)
-        .word(1, 0)
+        .word(1, first)
         .build();
     let reply = loop
     {
@@ -273,55 +282,137 @@ fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u6
             other => break other,
         }
     };
-    let reply = match reply
+    match reply
     {
-        Ok(r) if r.label == procmgr_errors::SUCCESS => r,
+        Ok(r) if r.label == procmgr_errors::SUCCESS => Ok(r),
         Ok(r) =>
         {
             delete_caps(r.caps());
-            return out;
+            Err(AttachFailed::Refused)
         }
-        Err(_) =>
+        Err(_) if fired(generation) => Err(AttachFailed::Cancelled),
+        Err(_) => Err(AttachFailed::Refused),
+    }
+}
+
+/// Attach to the process the fault's `badge` names and read its faulting
+/// thread: the thread the badge names, which the reply's named-thread word
+/// gives the index of (the main thread for a process badge, a registered
+/// thread for its crash badge), with its registers and stack walk when it is
+/// stopped at `ip`, and the bytes at `ip`
+/// (services/crashd/docs/operation.md § Per Fault).
+fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u64) -> Gathered
+{
+    let mut out = Gathered {
+        badge,
+        status: Status::Unattached,
+        thread: Thread::Unidentified,
+        image: None,
+        regs: Vec::new(),
+        code: Vec::new(),
+        frames: Vec::new(),
+    };
+    let reply = match attach(badge, 0, authority, generation, ipc_buf)
+    {
+        Ok(r) => r,
+        Err(AttachFailed::Cancelled) =>
         {
-            if fired(generation)
-            {
-                out.status = Status::Timeout;
-            }
+            out.status = Status::Timeout;
             return out;
         }
+        Err(AttachFailed::Refused) => return out,
     };
     out.status = Status::Complete;
+    out.badge = reply.word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE);
     out.image = Some(Image {
         load_bias: reply.word(1),
         text_start: reply.word(2),
         text_end: reply.word(3),
     });
-    let Some((&thread, rest)) = reply.caps().split_first()
+    let named = reply.word(procmgr_labels::ATTACH_WORD_NAMED_THREAD);
+    let kind = if named == 0
+    {
+        Thread::Main
+    }
+    else
+    {
+        Thread::Spawned
+    };
+    let Some(&first) = reply.caps().first()
     else
     {
         return out;
     };
-    delete_caps(rest);
-    read_thread(thread, ip, &mut out);
-    let _ = syscall::cap_delete(thread);
+    // The named thread's cap: in this page, or first in the page that starts
+    // at it. A fault-blocked thread is never swept out, so only threads
+    // before it can move it between the two calls, and the second reply's
+    // named-thread word says where it is then.
+    let in_page = usize::try_from(named)
+        .ok()
+        .and_then(|i| reply.caps().get(i).copied());
+    let thread = match in_page
+    {
+        Some(thread) => Some(thread),
+        None => page_at_named(badge, named, authority, generation, ipc_buf),
+    };
+    match thread
+    {
+        Some(thread) => read_thread(thread, ip, kind, &mut out),
+        // The bytes at `ip` through any thread: the threads share the space.
+        None => out.code = read_code(first, ip),
+    }
+    delete_caps(reply.caps());
+    if let Some(thread) = thread.filter(|t| !reply.caps().contains(t))
+    {
+        let _ = syscall::cap_delete(thread);
+    }
     out
 }
 
-/// Read the main thread `thread` into `out`: its registers and stack walk
-/// when it is stopped at `ip` (the identification
-/// services/crashd/docs/operation.md § Per Fault describes), and the bytes
-/// at `ip` whichever thread faulted, through the address space they share.
-fn read_thread(thread: u64, ip: u64, out: &mut Gathered)
+/// The cap of the thread `named` indexes, from an attach whose page starts
+/// at it; `None` when the thread is not listed or the attach fails.
+fn page_at_named(
+    badge: u64,
+    named: u64,
+    authority: u64,
+    generation: u64,
+    ipc_buf: *mut u64,
+) -> Option<u64>
+{
+    if named == procmgr_labels::ATTACH_NO_THREAD
+    {
+        return None;
+    }
+    let reply = attach(badge, named, authority, generation, ipc_buf).ok()?;
+    let (&thread, rest) = reply.caps().split_first()?;
+    delete_caps(rest);
+    if reply.word(procmgr_labels::ATTACH_WORD_NAMED_THREAD) == named
+    {
+        Some(thread)
+    }
+    else
+    {
+        let _ = syscall::cap_delete(thread);
+        None
+    }
+}
+
+/// Read the faulting thread `thread`, of kind `kind`, into `out`: its
+/// registers and stack walk when it is stopped at `ip`, which checks the
+/// thread its badge named (a thread that never registered carries its
+/// spawner's badge), and the bytes at `ip` in any case, through the address
+/// space every thread of the process shares.
+fn read_thread(thread: u64, ip: u64, kind: Thread, out: &mut Gathered)
 {
     let mut file = [0u8; arch::current::REGS_SIZE];
-    let main_faulted = syscall::thread_read_regs(thread, &mut file).is_ok()
+    let stopped_at_ip = syscall::thread_read_regs(thread, &mut file).is_ok()
         && word_at(&file, arch::current::IP_OFFSET) == ip;
     out.code = read_code(thread, ip);
-    if !main_faulted
+    if !stopped_at_ip
     {
         return;
     }
-    out.thread = Thread::Main;
+    out.thread = kind;
     out.regs = file.chunks_exact(8).map(le_word).collect();
     out.frames.push(ip);
     if let Some(image) = out.image

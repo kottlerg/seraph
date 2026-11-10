@@ -18,8 +18,9 @@
 //! - `subagent-stop`, when a worker stops: refuses a hand-back from a
 //!   worktree the harness would remove (`.claude/agents/worker.md`
 //!   § Reporting);
-//! - `compact-start`, after a compaction: names what to read again, and adds
-//!   the batch's state for the orchestrator;
+//! - `compact-start`, after a session's compaction: names what to read
+//!   again, and adds the batch's state for a session started as the
+//!   orchestrator;
 //! - `pre-compact`, before one: the instructions for the summary.
 //!
 //! A hook that fails must not stop a session. An event this command cannot
@@ -891,11 +892,22 @@ fn compact_context(state: Option<&str>) -> String
     }
 }
 
-/// The JSON the harness reads for the `SessionStart` event `event`. Only
-/// the orchestrator gets the batch's state, which `state` reads: the
-/// supervisor above it keeps none of the record in its context
-/// (`.claude/skills/orchestrate/SKILL.md`), and a worker's state is its
-/// orchestrator's to hold. A state that cannot be read is named as such.
+/// The JSON the harness reads for the `SessionStart` event `event`.
+///
+/// `SessionStart` is an event of a session, not of a subagent. The hooks
+/// reference (<https://code.claude.com/docs/en/hooks.md>) fires it when a
+/// session starts, resumes, is cleared or is compacted, and sets its
+/// `agent_type` only for a session started with `claude --agent <name>`
+/// (§ `SessionStart` input); inside a subagent it names the tool events and
+/// `SubagentStart` and `SubagentStop` (§ Hook locations). An orchestrator or
+/// a worker spawned as a subagent therefore gets nothing from this hook, and
+/// reads again as its agent file says.
+///
+/// A session started as the orchestrator gets the batch's state, which
+/// `state` reads. Any other session gets the reminder alone: the supervisor
+/// keeps none of the record in its context
+/// (`.claude/skills/orchestrate/SKILL.md`). A state that cannot be read is
+/// named as such.
 fn compact_output(event: &Value, state: impl FnOnce() -> Result<Option<String>>) -> Value
 {
     let context = if event["agent_type"].as_str() == Some(ORCHESTRATOR)
@@ -1497,7 +1509,9 @@ mod tests
     fn only_the_orchestrator_gets_the_state_after_a_compaction()
     {
         let state = || Ok(Some("goal: x\n".to_owned()));
-        let orchestrator = json!({"agent_id": "a1", "agent_type": "orchestrator"});
+        // A session started with `claude --agent orchestrator`: the only
+        // `SessionStart` event the hooks reference gives an `agent_type`.
+        let orchestrator = json!({"source": "compact", "agent_type": "orchestrator"});
         assert!(context_of(&compact_output(&orchestrator, state)).ends_with("goal: x\n"));
         for event in [
             json!({}),

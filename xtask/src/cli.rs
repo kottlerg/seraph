@@ -1208,8 +1208,9 @@ pub enum HookEvent
     /// detached HEAD or one that does not differ from `origin/master`.
     SubagentStop,
 
-    /// `SessionStart` after a compaction: name what to read again, and add
-    /// the state of an open orchestration batch.
+    /// `SessionStart` after a session's compaction: name what to read again,
+    /// and add the state of an open orchestration batch for a session
+    /// started as the orchestrator.
     CompactStart,
 
     /// `PreCompact`: print the instructions for the compaction summary.

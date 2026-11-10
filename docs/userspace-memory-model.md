@@ -461,7 +461,7 @@ and the main thread's grows below its committed pages
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
 [Fault Handling](fault-handling.md), [Memory Model](memory-model.md),
-[Process Lifecycle](process-lifecycle.md),
+[Process Lifecycle](process-lifecycle.md), [Testing](testing.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),
 [programs/pipestress/README.md](../programs/pipestress/README.md),
 [programs/relrofault/README.md](../programs/relrofault/README.md),

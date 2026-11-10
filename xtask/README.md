@@ -25,12 +25,13 @@ xtask/
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
+│   ├── symbolize.rs            # ELF address resolution: DWARF, symbol-table fallback
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # One module per subcommand (build, run, run_parallel,
-│   │                           #   ktest_timing, mkdisk, compose_bundle, clean, test,
-│   │                           #   test_kaslr, test_logd_reclaim, test_map_redo,
+│   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
+│   │                           #   test, test_kaslr, test_logd_reclaim, test_map_redo,
 │   │                           #   test_terminal, test_vmgenid, lint_docs)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
@@ -508,6 +509,47 @@ its log.
 
 ---
 
+### `cargo xtask symbolize`
+
+Resolve runtime addresses in a loaded ELF image to function, file, and line, without a debugger.
+An address less the image's load bias is an address in the image's link-time address space; the
+command resolves it from the image's DWARF, innermost inlined function first, each caller it is
+inlined into on its own line, and, where no DWARF covers it (a build without `--debug` for that
+component, or code compiled without debug information), from the image's symbol table, as the
+nearest function symbol and the offset into it. Installed binaries keep their symbol tables
+([docs/build-system.md](../docs/build-system.md) § Debuginfo is opt-in), so the fallback names
+the function in every build. Use cases are in [docs/testing.md](../docs/testing.md#troubleshooting)
+§ Troubleshooting.
+
+```
+cargo xtask symbolize --binary PATH [--bias HEX] ADDR...
+cargo xtask symbolize --kernel [--bias HEX] ADDR...
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--binary` | | The ELF image the addresses fall in: a sysroot binary, or its build output under `target/` |
+| `--kernel` | | Resolve against the sysroot's kernel image, `sysroot/esp/EFI/seraph/kernel` |
+| `--bias` | `0` | The image's load bias in hex: for a userspace process its creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, and, for init itself, the kernel's `init: PIE bias=0x…`), for the kernel the KASLR slide from its serial-only `kaslr: slide=` line (`0` in a boot authored with `mkdisk --no-kaslr`) |
+| `ADDR...` | (required) | Runtime addresses, in hex (`0x` optional) |
+
+Each address prints one line, `<address> (image <address less bias>): <resolution> [<source>]`
+(the image address shown only when the bias is not `0`), where the source is the one used:
+
+| Source | Resolution |
+|---|---|
+| `debug-info` | `<function> at <file>:<line>[:<column>]`, followed by one `    inlined into <function> at <file>:<line>[:<column>]` line per caller the frame is inlined into, each with the position of its call |
+| `symbol-table` | `<symbol>+<offset>` |
+| `unresolved` | `??`: neither source covers the address |
+
+Names are demangled. A frame prints only what its DWARF gives: `??` for an unnamed function, and
+`<function> at <file>` without a line, or a bare `<function>` without a file. An image with no
+DWARF at all prints a note naming the symbol-table fallback first. An address below the bias, an
+unreadable file, or a file that is not an ELF image fails the command; a compressed debug section
+is refused.
+
+---
+
 ### `cargo xtask test-terminal`
 
 Boot the terminal interactive test, exercising keyboard input end-to-end
@@ -702,9 +744,9 @@ pattern also matches legitimate prose.
 |---|---|
 | [docs/build-system.md](../docs/build-system.md) | Toolchain, workspace layout, custom targets, sysroot, CI workflows |
 | [docs/memory-model.md](../docs/memory-model.md) | Randomized kernel layout `test-kaslr` checks; RISC-V paging-mode ceiling behind `--riscv-mmu`; x86-64 paging depth behind `--x86-paging` |
-| [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) | PIE image placement and the per-spawn ASLR bias used with `--gdb` |
+| [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) | PIE image placement and the per-spawn ASLR bias used with `--gdb` and `symbolize --bias` |
 | [docs/storage.md](../docs/storage.md) | GPT role-GUID discovery of the data partition the disk image carries |
-| [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks |
+| [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` enforces; the Markdown and file-header rules `lint-docs` checks |
 | [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |
 | [targets/README.md](targets/README.md) | Custom target specs |

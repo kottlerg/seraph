@@ -13,6 +13,7 @@ pub mod lint_docs;
 pub mod mkdisk;
 pub mod run;
 pub mod run_parallel;
+pub mod symbolize;
 pub mod test;
 pub mod test_kaslr;
 pub mod test_logd_reclaim;

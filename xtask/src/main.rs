@@ -35,6 +35,7 @@ mod fs_compat;
 mod qemu;
 mod qmp;
 mod rust_src;
+mod symbolize;
 mod sysroot;
 mod term;
 mod timing;
@@ -73,6 +74,7 @@ fn main()
         CliCommand::Test(args) => commands::test::run(&ctx, args),
         CliCommand::RunParallel(args) => commands::run_parallel::run(&ctx, args),
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
+        CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),
         CliCommand::ComposeBundle(args) => commands::compose_bundle::run(&ctx, args),
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),

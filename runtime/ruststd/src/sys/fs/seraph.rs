@@ -301,8 +301,10 @@ pub struct ReadDir
 
 impl ReadDir
 {
-    /// A directory handle for the listing (`std::fs::ReadDir::dir`): seraph
-    /// has no path-free directory handle, so it is unsupported.
+    /// A directory handle for the listing (`std::fs::ReadDir::dir`):
+    /// unsupported, since the `Dir` it returns (upstream's path-based
+    /// `common::Dir`) opens through `canonicalize`, which seraph does not
+    /// support until a client-side lexical resolver exists (#54).
     pub fn dir(&self) -> io::Result<Dir> { unsupported() }
 }
 

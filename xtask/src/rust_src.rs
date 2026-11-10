@@ -16,10 +16,13 @@
 //!
 //!   1. Materialise a mirror of the real toolchain at
 //!      `target/seraph-toolchain/`, using symlinks for everything except
-//!      the subtree we need to mutate (`lib/rustlib/src/rust/library/std/
-//!      src/sys/`), which is a physical copy.
-//!   2. Apply the seraph overlay to the physical-copy subtree — no
-//!      upstream rust-src is touched.
+//!      the `lib/rustlib/src/rust/library/` tree, whose files are hard
+//!      links to the real ones, or copies where a link fails (see § Why
+//!      hard-link-mirror the library/ tree below).
+//!   2. Apply the seraph overlay to the mirror's `library/` tree, each
+//!      patched or added file written unlink-then-write so its hard link
+//!      to the real file is broken first — no upstream rust-src is
+//!      touched.
 //!   3. Install the `seraph-wrapper-shim` native binary at
 //!      `target/seraph-toolchain/bin/rustc` (and the same binary again
 //!      as `bin/ws-clippy`). The shim dispatches on argv[0] basename,
@@ -193,8 +196,9 @@ pub fn ensure_seraph_toolchain(ctx: &BuildContext) -> Result<SeraphToolchain>
 // ── Mirror assembly ───────────────────────────────────────────────────────────
 
 /// Materialise `mirror` as a selective copy of `real`: everything is a
-/// symlink to `real` except the subtree `lib/rustlib/src/rust/library/
-/// std/src/sys/` which is a physical copy so it can carry overlays.
+/// symlink to `real` except the `lib/rustlib/src/rust/library/` tree, whose
+/// files are hard links to `real`'s (copies where a link fails), so the
+/// overlays can replace them in the mirror alone.
 ///
 /// Idempotent — a version-stamp file records the underlying rustc
 /// identity plus the overlay content footprint; if it matches, the
@@ -635,7 +639,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
         .and_then(Path::parent)
         .and_then(Path::parent)
         .context("deriving project root from overlay_root")?;
-    apply_sys_visibility_overlay(&rust_src).context("sys visibility overlay")?;
+    apply_sys_reserve_decl_overlay(&rust_src).context("sys/mod.rs reserve declaration overlay")?;
     apply_std_cargo_deps_overlay(&rust_src, project_root).context("std Cargo.toml deps overlay")?;
     apply_restricted_std_overlay(&rust_src).context("restricted_std OS-recognition overlay")?;
     apply_alloc_overlay(&rust_src, overlay_root).context("alloc overlay")?;
@@ -666,7 +670,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
 /// The workspace crates std depends on when built for seraph: the dependency
 /// name, its path under the project root, and any extra key placed between
 /// `path` and `features` in its `library/std/Cargo.toml` line.
-const STD_WORKSPACE_DEPS: [(&str, &str, &str); 12] = [
+const STD_WORKSPACE_DEPS: [(&str, &str, &str); 13] = [
     ("syscall-abi", "abi/syscall", ""),
     ("syscall", "shared/syscall", ""),
     ("ipc", "shared/ipc", ""),
@@ -685,6 +689,11 @@ const STD_WORKSPACE_DEPS: [(&str, &str, &str); 12] = [
         "death-queues",
         "runtime/ruststd/death-queues",
         ", package = \"ruststd-death-queues\"",
+    ),
+    (
+        "heap-fit",
+        "runtime/ruststd/heap-fit",
+        ", package = \"ruststd-heap-fit\"",
     ),
     (
         "spin-wait",
@@ -781,7 +790,7 @@ fn apply_restricted_std_overlay(rust_src: &Path) -> Result<()>
 /// Declare the seraph-only `pub(crate) mod reserve;` (the page-reservation
 /// allocator) in `sys/mod.rs`, beside upstream's `pub mod alloc;`, through
 /// which `std::os::seraph` reaches the seraph PAL's public helpers.
-fn apply_sys_visibility_overlay(rust_src: &Path) -> Result<()>
+fn apply_sys_reserve_decl_overlay(rust_src: &Path) -> Result<()>
 {
     let mod_rs = rust_src.join("library/std/src/sys/mod.rs");
     patch_file(
@@ -817,7 +826,7 @@ fn apply_alloc_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 
 /// Install the seraph-only page-reservation allocator at
 /// `library/std/src/sys/reserve.rs`. The module declaration lives in
-/// `sys/mod.rs` (added by `apply_sys_visibility_overlay`); this overlay
+/// `sys/mod.rs` (added by `apply_sys_reserve_decl_overlay`); this overlay
 /// supplies the implementation. The overlay source is kept under the
 /// conventional `sys/reserve/seraph.rs` name in the project tree even
 /// though the toolchain destination is a single `reserve.rs` file —

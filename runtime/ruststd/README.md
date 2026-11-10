@@ -33,6 +33,9 @@ ruststd/
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
 │                               #   rustc-dep-of-std dep of overlaid std (not re-exported),
 │                               #   and the policy shared/death-set follows for services
+├── heap-fit/                   # `ruststd-heap-fit` crate: pure, host-tested placement rule
+│   └── src/lib.rs              #   of the byte heap (where a request lands in a free block,
+│                               #   what stays free); a rustc-dep-of-std dep of overlaid std
 ├── spin-wait/                  # `ruststd-spin-wait` crate: pure, host-tested contended-wait
 │   └── src/lib.rs              #   policy of the overlay's spin mutex (spin, then sleep); a
 │                               #   rustc-dep-of-std dep of overlaid std
@@ -41,7 +44,7 @@ ruststd/
     ├── os/
     │   └── seraph.rs           # std::os::seraph surface (startup info, caps, cwd)
     └── sys/                    # std::sys::seraph backends, one directory per area
-        ├── alloc/              # byte heap (the platform allocator behind System)
+        ├── alloc/              # byte heap (the platform allocator behind std's allocators)
         ├── args/               # std::env::args — consumes argv_env field walks
         ├── env/                # std::env::{var,vars,…} —
         │                         consumes argv_env::{next_field,split_key_value}
@@ -106,8 +109,8 @@ the full contract.
 
 ### Byte heap (`System`)
 
-`std::sys::seraph::alloc` provides the platform allocator functions behind std's default
-`System` allocator, so no `#[global_allocator]` override is needed. Every `Box`, `Vec`,
+`std::sys::seraph::alloc` provides the platform allocator functions behind std's `System`
+allocator and its default global allocator, so no `#[global_allocator]` override is needed. Every `Box`, `Vec`,
 `String`, and `alloc`/`std` collection allocates here. The grow path
 requests Memory caps from memmgr via `memmgr_labels::REQUEST_MEMORY_CAPS` on
 `ProcessInfo.memmgr_endpoint_cap`, mapping them at a contiguous VA above the

@@ -90,12 +90,24 @@ pub fn getenv(key: &OsStr) -> Option<OsString> {
     guard.get(key).cloned()
 }
 
+/// Set `key` to `val` in the process environment.
+///
+/// # Safety
+/// None beyond `std::env::set_var`'s own contract: the map is behind a mutex,
+/// so a call from any thread, concurrent with any other environment access,
+/// is sound. The function is `unsafe` because the `sys::env` interface every
+/// platform implements declares it so.
 pub unsafe fn setenv(key: &OsStr, val: &OsStr) -> io::Result<()> {
     let mut guard = env_map().lock().unwrap_or_else(|p| p.into_inner());
     guard.insert(key.to_os_string(), val.to_os_string());
     Ok(())
 }
 
+/// Remove `key` from the process environment.
+///
+/// # Safety
+/// As [`setenv`]: none beyond `std::env::remove_var`'s own contract, since
+/// the map is behind a mutex.
 pub unsafe fn unsetenv(key: &OsStr) -> io::Result<()> {
     let mut guard = env_map().lock().unwrap_or_else(|p| p.into_inner());
     guard.remove(key);

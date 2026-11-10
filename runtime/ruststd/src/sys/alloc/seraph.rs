@@ -28,9 +28,16 @@
 //! from for that thread.
 //!
 //! The platform functions `alloc`, `alloc_zeroed`, `dealloc`, and `realloc`
-//! below, which std's `System` allocator calls, delegate to the static heap;
-//! services that want this allocator simply omit a custom
-//! `#[global_allocator]` and use `System` (std's default).
+//! below delegate to the static heap. They back both std's `System` allocator
+//! and std's default global allocator (the `__rdl_*` symbols the `alloc`
+//! crate calls when no `#[global_allocator]` is set), so services that want
+//! this allocator simply omit a custom `#[global_allocator]`.
+//!
+//! A request lands where `heap_fit::fit` (the host-tested
+//! `ruststd-heap-fit` crate) places it in the first free block that holds
+//! it: the block's bytes below and above the request stay on the free list,
+//! so `dealloc`, which returns exactly the request's bytes, leaves no byte
+//! of the heap outside both the free list and a live block.
 
 use crate::alloc::Layout;
 use crate::cell::UnsafeCell;
@@ -197,6 +204,12 @@ fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
+/// The bytes `Heap::alloc` takes for `layout`, and `dealloc` returns: the size,
+/// at least `MIN_BLOCK`, rounded up to `NODE_ALIGN`.
+fn block_size(layout: Layout) -> usize {
+    align_up(layout.size().max(MIN_BLOCK), NODE_ALIGN)
+}
+
 // ── Heap ────────────────────────────────────────────────────────────────────
 
 struct Heap {
@@ -280,42 +293,49 @@ impl Heap {
 
     fn alloc(&mut self, layout: Layout) -> *mut u8 {
         // Reserve-size must itself be a multiple of `NODE_ALIGN`, not just
-        // the block's starting address. `split-off remainder = start +
-        // (padding + want)`, where we then materialise a fresh `FreeNode`
-        // — if `want` is unaligned the remainder is too, and the subsequent
-        // write into `(*new_node).size` trips `ptr::write`'s alignment
+        // the block's starting address: the back free node starts at
+        // `payload + want`, and an unaligned `want` would leave it unaligned,
+        // so its `size` write would trip `ptr::write`'s alignment
         // precondition under build-std debug.
-        let want = align_up(layout.size().max(MIN_BLOCK), NODE_ALIGN);
+        let want = block_size(layout);
         let align = layout.align().max(NODE_ALIGN);
         let mut prev: Option<NonNull<FreeNode>> = None;
         let mut cur = self.head;
         while let Some(c) = cur {
             let (node_size, node_next) = unsafe { ((*c.as_ptr()).size, (*c.as_ptr()).next) };
             let start = c.as_ptr() as usize;
-            let payload = align_up(start, align);
-            let padding = payload - start;
-            if node_size >= padding + want {
-                let total_used = padding + want;
-                let remaining = node_size - total_used;
-                if remaining >= MIN_BLOCK {
-                    let new_node_addr = start + total_used;
-                    let new_node = new_node_addr as *mut FreeNode;
+            // `heap_fit::fit` places the request so that the block's bytes
+            // below it (front) and above it (back) each stay a free node or
+            // are empty: `dealloc` returns exactly `[payload, payload + want)`,
+            // so a byte handed out beyond it, or dropped from the list, would
+            // never come back.
+            if let Some(fit) = heap_fit::fit(start, node_size, want, align, MIN_BLOCK) {
+                let after = if fit.back == 0 {
+                    node_next
+                } else {
+                    let back_node = (fit.payload + want) as *mut FreeNode;
+                    // SAFETY: `[payload + want, start + node_size)` is the free
+                    // block's own tail, at least MIN_BLOCK bytes at NODE_ALIGN.
                     unsafe {
-                        (*new_node).size = remaining;
-                        (*new_node).next = node_next;
+                        (*back_node).size = fit.back;
+                        (*back_node).next = node_next;
                     }
-                    let replacement = NonNull::new(new_node);
+                    NonNull::new(back_node)
+                };
+                if fit.front == 0 {
                     match prev {
-                        Some(p) => unsafe { (*p.as_ptr()).next = replacement },
-                        None => self.head = replacement,
+                        Some(p) => unsafe { (*p.as_ptr()).next = after },
+                        None => self.head = after,
                     }
                 } else {
-                    match prev {
-                        Some(p) => unsafe { (*p.as_ptr()).next = node_next },
-                        None => self.head = node_next,
+                    // The block's node stays in place as the front.
+                    // SAFETY: `c` is a node of this heap's free list.
+                    unsafe {
+                        (*c.as_ptr()).size = fit.front;
+                        (*c.as_ptr()).next = after;
                     }
                 }
-                return payload as *mut u8;
+                return fit.payload as *mut u8;
             }
             prev = Some(c);
             cur = node_next;
@@ -1295,19 +1315,23 @@ pub fn abort_thread() -> ! {
     syscall::thread_exit()
 }
 
-// ── Platform allocator functions for `System` ─────────────────────────────────
+// ── Platform allocator functions ───────────────────────────────────────────────
 
 /// Allocate `layout` from the byte heap, growing it through memmgr as needed;
-/// null when the heap cannot grow to fit. `System` calls it for a non-zero
-/// `layout.size()`.
+/// null when the heap cannot grow to fit. std's `System` and its default
+/// global allocator (the `__rdl_*` symbols) both call it.
+///
+/// # Safety
+/// `layout.size()` is non-zero (the `GlobalAlloc::alloc` contract).
 #[inline]
 pub unsafe fn alloc(layout: Layout) -> *mut u8 {
     let mut heap = HEAP.lock();
     let mut ptr = heap.alloc(layout);
     // Grow to fit and retry, for as long as each grow maps at least one
-    // page: `grow` sizes itself to the request beyond the free block at
-    // the heap's top, so one round normally suffices, and a partial
-    // grant (memmgr's reply carries at most `MSG_CAP_SLOTS_MAX` runs,
+    // page: `grow` sizes the free block at the heap's top to
+    // `heap_fit::fit_bound`, which places the request wherever that block
+    // starts, so one round normally suffices, and a partial grant (memmgr's
+    // reply carries at most `MSG_CAP_SLOTS_MAX` runs,
     // services/memmgr/docs/ipc-interface.md § Label 1) takes another.
     // Every iteration that continues advances `mapped_end` toward the
     // zone bound, so the loop ends: on success, on a grow that maps
@@ -1316,7 +1340,8 @@ pub unsafe fn alloc(layout: Layout) -> *mut u8 {
     // under the lock are non-allocating (the IPC buffer is the
     // pre-registered page, not heap-backed), so there is no re-entrant
     // allocation here.
-    let want = layout.size().saturating_add(layout.align());
+    let want = heap_fit::fit_bound(block_size(layout), layout.align().max(NODE_ALIGN), MIN_BLOCK)
+        .unwrap_or(usize::MAX);
     while ptr.is_null() && heap.grow(want) {
         ptr = heap.alloc(layout);
     }
@@ -1324,10 +1349,13 @@ pub unsafe fn alloc(layout: Layout) -> *mut u8 {
 }
 
 /// [`alloc`], with the block zeroed.
+///
+/// # Safety
+/// As [`alloc`]: `layout.size()` is non-zero.
 #[inline]
 pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
-    // SAFETY: delegating to alloc; zeroing is done here since the
-    // free-list hands back uninitialised pages.
+    // SAFETY: delegating to alloc under the caller's contract; zeroing is
+    // done here since the free-list hands back uninitialised pages.
     let ptr = unsafe { alloc(layout) };
     if !ptr.is_null() {
         // SAFETY: returned block is at least layout.size() bytes of writable memory.
@@ -1337,17 +1365,22 @@ pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
 }
 
 /// Return the block at `ptr`, allocated with `layout`, to the byte heap.
+///
+/// # Safety
+/// `ptr` is a block [`alloc`] (or [`alloc_zeroed`] or [`realloc`]) returned
+/// for exactly `layout` and not yet returned to the heap (the
+/// `GlobalAlloc::dealloc` contract).
 #[inline]
 pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
     if ptr.is_null() {
         return;
     }
-    // Must match `alloc`'s reservation: `want` was
-    // `align_up(layout.size().max(MIN_BLOCK), NODE_ALIGN)`. Insert the
-    // same amount back so the free-list invariant (every node starts at
-    // a `NODE_ALIGN`-aligned address, every block size is a
-    // `NODE_ALIGN` multiple) holds.
-    let size = align_up(layout.size().max(MIN_BLOCK), NODE_ALIGN);
+    // Must match `alloc`'s reservation, `block_size(layout)` bytes at
+    // `ptr`: inserting the same amount back keeps the free-list invariant
+    // (every node starts at a `NODE_ALIGN`-aligned address, every block
+    // size is a `NODE_ALIGN` multiple), and `heap_fit::fit` kept the
+    // bytes around the block on the free list.
+    let size = block_size(layout);
     let mut heap = HEAP.lock();
     // SAFETY: the caller guarantees ptr/layout match a prior alloc.
     unsafe { heap.insert(ptr as usize, size) };
@@ -1356,12 +1389,18 @@ pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
 /// Move the block at `ptr`, allocated with `old_layout`, to a new block of
 /// `new_size` bytes at the same alignment; null, with the old block kept,
 /// when the new one cannot be allocated.
+///
+/// # Safety
+/// `ptr` is a live block of this heap allocated for exactly `old_layout`,
+/// and `new_size` is non-zero and, rounded up to `old_layout.align()`, does
+/// not exceed `isize::MAX` (the `GlobalAlloc::realloc` contract).
 #[inline]
 pub unsafe fn realloc(ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
     let Ok(new_layout) = Layout::from_size_align(new_size, old_layout.align()) else {
         return null_mut();
     };
-    // SAFETY: new_layout is validated above.
+    // SAFETY: new_layout is validated above, and its size is non-zero by the
+    // caller's contract.
     let new_ptr = unsafe { alloc(new_layout) };
     if new_ptr.is_null() {
         return null_mut();

@@ -179,6 +179,13 @@ impl ThreadRegistry
         self.threads.push(thread);
     }
 
+    /// The registered threads, in registration order, for `DETACH_PROCESS`
+    /// to bind each back to the crash endpoint and record its badge.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut RegisteredThread>
+    {
+        self.threads.iter_mut()
+    }
+
     /// The index of the thread bound under `crash_badge`.
     #[must_use]
     pub fn position_of_crash_badge(&self, crash_badge: u64) -> Option<usize>

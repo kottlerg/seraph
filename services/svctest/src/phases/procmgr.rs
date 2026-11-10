@@ -769,11 +769,11 @@ fn phys_access_refused(procmgr: u64)
     );
 }
 
-/// procmgr refuses `ATTACH_PROCESS` and `REGISTER_CRASH_SERVICE` from
-/// svctest, whose procmgr cap carries no `DEBUG_AUTHORITY`, with
-/// `UNAUTHORIZED`, whatever badge the request names: the authority check
-/// precedes the target lookup (`services/procmgr/docs/ipc-interface.md`
-/// § `ATTACH_PROCESS`).
+/// procmgr refuses `ATTACH_PROCESS`, `DETACH_PROCESS`, `LIST_PROCESSES`, and
+/// `REGISTER_CRASH_SERVICE` from svctest, whose procmgr cap carries no
+/// `DEBUG_AUTHORITY`, with `UNAUTHORIZED`, whatever badge the request names:
+/// the authority check precedes the target lookup
+/// (`services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`).
 fn debug_authority_refused(procmgr: u64)
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -790,7 +790,23 @@ fn debug_authority_refused(procmgr: u64)
             procmgr_errors::UNAUTHORIZED,
             "ATTACH_PROCESS without DEBUG_AUTHORITY",
         );
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(procmgr_labels::DETACH_PROCESS)
+                .word(0, target)
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "DETACH_PROCESS without DEBUG_AUTHORITY",
+        );
     }
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(procmgr_labels::LIST_PROCESSES)
+            .word(0, 0)
+            .build(),
+        procmgr_errors::UNAUTHORIZED,
+        "LIST_PROCESSES without DEBUG_AUTHORITY",
+    );
     let thread = syscall::cap_derive(
         std::os::seraph::thread::current_thread_cap(),
         syscall::RIGHTS_THREAD_OBSERVE,

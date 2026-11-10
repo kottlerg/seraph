@@ -311,8 +311,8 @@ pub unsafe fn dispatch(tf: *mut TrapFrame) -> SyscallExit
 /// frame then names the syscall instruction, or the address the handler wrote,
 /// and the syscall re-executes with the frame's argument registers, which no
 /// restartable handler writes. Returns [`SyscallExit::Complete`] when the fault
-/// is unhandled — no handler bound, the handler declined, or the delivery was
-/// cancelled — and the syscall then fails with `InvalidAddress`, the outcome
+/// is unhandled — no handler bound, the handler declined or forwarded, or the
+/// delivery was cancelled — and the syscall then fails with `InvalidAddress`, the outcome
 /// the copy has with no handler bound.
 ///
 /// # Safety
@@ -360,7 +360,7 @@ unsafe fn deliver_copy_fault(tf: UserFrame, fault: UserCopyFault) -> SyscallExit
     // SAFETY: a handler is bound (checked; a binding cleared since is the
     // dispatcher's own unhandled outcome), the published frame is live, and no
     // lock is held.
-    let outcome = unsafe { crate::ipc::fault::fault_dispatch(tcb, &info) };
+    let outcome = unsafe { crate::ipc::fault::copy_fault_dispatch(tcb, &info) };
     if outcome == crate::ipc::fault::FaultOutcome::Resume
     {
         return SyscallExit::Restart;

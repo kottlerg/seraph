@@ -31,8 +31,9 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # One module per subcommand (build, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
-│   │                           #   test, test_debug_port, test_kaslr, test_logd_reclaim,
-│   │                           #   test_map_redo, test_terminal, test_vmgenid, lint_docs)
+│   │                           #   test, test_crash_report, test_debug_port, test_kaslr,
+│   │                           #   test_logd_reclaim, test_map_redo, test_terminal,
+│   │                           #   test_vmgenid, lint_docs)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -669,6 +670,31 @@ which passes the command, for a saved log given with `--log` as well. Stage svct
 [docs/testing.md](../docs/testing.md) § Gating describes.
 
 See [docs/testing.md](../docs/testing.md) for the harness model.
+
+---
+
+### `cargo xtask test-crash-report`
+
+Check the crash service's report blocks in a boot's saved serial log, on either arch; boots
+nothing. Every block in the log must be complete and hold the fields its kind, thread, and status
+require, read with `shared/crash-report`, the crate crashd emits them with
+([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)).
+
+```sh
+# A usertest boot with crashd staged (what CI's usertest cell runs):
+cargo xtask test-crash-report --log target/xtask/run-parallel-saved/x86_64-4cpu-1.log
+
+# A boot of an image that stages no crashd (what CI's svctest cell runs):
+cargo xtask test-crash-report --expect none --log target/xtask/run-parallel-saved/x86_64-4cpu-1.log
+```
+
+`--expect reports`, the default, also requires one `vm` and one `exception` block of the `crashme`
+fixture, found through the badge logd's `reclaim:` line names it by, each complete, of its main
+thread, its walk starting at its instruction pointer, and each matched by the kernel's
+`handler declined, reason=0x<id>` line. `--expect none` requires the log to hold no block. A log
+whose `[run-parallel]` trailer records a `QEMU-CRASH` is reported skipped, which passes the
+command, as `test-logd-reclaim` reports it. The model is in
+[docs/testing.md](../docs/testing.md) § Crash reports.
 
 ---
 

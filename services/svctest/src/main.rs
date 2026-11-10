@@ -68,6 +68,26 @@ fn main()
     // bootstrap rounds, so a failure there also logs the fail marker.
     runner::install_failure_hooks();
 
+    // svctest holds the debug authority, so it declares itself undebuggable
+    // before it spawns a thread, as every holder does
+    // (`procmgr_labels::DECLARE_NO_DEBUG`); its re-entry children, which hold
+    // no authority, stay debuggable.
+    let info = std::os::seraph::startup_info();
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let declared = unsafe {
+        ipc::ipc_call(
+            info.procmgr_endpoint,
+            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_DEBUG),
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .expect("svctest: DECLARE_NO_DEBUG: ipc_call failed");
+    assert_eq!(
+        declared.label,
+        ipc::procmgr_errors::SUCCESS,
+        "svctest: DECLARE_NO_DEBUG"
+    );
+
     let caps = bootstrap::request();
     runner::arm_failure_shutdown(&caps);
 

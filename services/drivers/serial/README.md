@@ -41,6 +41,11 @@ from), per [console-model.md](../../../docs/console-model.md#ownership-across-th
 The interrupt cap is optional: without it the driver still answers reads (RX then relies on
 the client's bounded poll) but `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.
 
+Before its bootstrap the driver declares itself undebuggable to procmgr
+(`procmgr_labels::DECLARE_NO_DEBUG`): logd writes every log line through it, so a debug-authority
+holder that stopped it would wait on its own log output
+([crashd Operation](../../crashd/docs/operation.md) § Limits).
+
 The bootstrap is two rounds: the first carries the service endpoint, the arch authority cap, and
 the interrupt cap when present; the second, terminal one carries the driver's devmgr query cap.
 Once the UART is set up the driver reports `devmgr_labels::DRIVER_READY` on that cap,

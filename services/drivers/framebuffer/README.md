@@ -62,6 +62,11 @@ devmgr-registry badge must carry `REGISTRY_QUERY_AUTHORITY`. Both labels below
 are gated by `WRITE_AUTHORITY`: a request whose badge lacks it is answered
 `UNAUTHORIZED` and has no effect.
 
+Before its bootstrap the driver declares itself undebuggable to procmgr
+(`procmgr_labels::DECLARE_NO_DEBUG`): logd mirrors every log line through it, so a debug-authority
+holder that stopped it would wait on its own log output
+([crashd Operation](../../crashd/docs/operation.md) § Limits).
+
 ---
 
 ## Messages

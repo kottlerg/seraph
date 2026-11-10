@@ -63,6 +63,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount v
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service). Any number of names; slots past one bootstrap round's `MSG_CAP_SLOTS_MAX` (4) caps ride in further rounds; see [`seed`](#seed). |
 | `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
+| `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
 | `sched_max` | no | Band ceiling (`1..=30`): the service's `SchedControl` covers `[1, sched_max]`. Must be ≥ `priority` when both are set. Unset: the service inherits a copy of svcmgr's own band. |
 
@@ -322,6 +323,30 @@ namespace = none
 log_sink  = yes
 ```
 
+## `debug_authority`
+
+`yes` endows the service with procmgr's debug authority: on its first launch and on every restart,
+svcmgr mints a `SEND|GRANT` on procmgr badged `procmgr_labels::DEBUG_AUTHORITY` from the un-badged
+procmgr source init endows it, and delivers it in the bootstrap slot after the `seed` caps (after a
+`provides` service's own RECV and its seeds; `cap[0]` for a service with neither). A derive that
+fails leaves the slot absent. The authority serves procmgr's `REGISTER_CRASH_SERVICE` and
+`ATTACH_PROCESS` ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint
+and Debug Authority); this key is the only path that mints it, so an image whose recipes set it
+nowhere has no attach path. A holder declares itself undebuggable to procmgr itself
+(`DECLARE_NO_DEBUG`), so no holder attaches to another or to itself. The crash service's recipe,
+`crashd.svc`, sets it ([services/crashd/README.md](../../crashd/README.md)).
+
+`debug_authority = yes` alongside `log_sink = yes` is a parser error: the log sink's round is
+minted from the log-sink sources and has no slot for it.
+
+```
+binary          = /services/crashd
+restart         = on_failure
+critical        = no
+namespace       = none
+debug_authority = yes
+```
+
 ## Reconciliation
 
 At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
@@ -356,6 +381,8 @@ not launched. A recipe the heap cannot copy at parse time is dropped like a malf
 
 [Fault Handling](../../../docs/fault-handling.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[services/crashd/README.md](../../crashd/README.md),
+[crashd Operation](../../crashd/docs/operation.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),
 [logd handover protocol](../../logd/docs/handover-protocol.md),

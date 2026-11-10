@@ -157,6 +157,10 @@ and each control character in it, a line break among them, prints as U+FFFD.
 A badge with no slot logs nothing. The line is a test
 contract: `cargo xtask test-logd-reclaim` reads it from svctest's serial log
 (see [docs/testing.md](../../../docs/testing.md#death-forward-to-logd-test-logd-reclaim)).
+It also names a crashed process: a crash report block carries the process
+badge, and a reader finds the process's log name in this line for that badge
+([services/crashd/docs/block-format.md](../../crashd/docs/block-format.md)
+§ Symbolizing), as `cargo xtask test-crash-report` does.
 `logd_codec::reclaim` formats it.
 
 ## Death-queue resync
@@ -201,5 +205,7 @@ ordering).
 
 ## Summarized By
 
-[Testing](../../../docs/testing.md), [services/logd/README.md](../README.md),
+[Testing](../../../docs/testing.md),
+[Crash Block Format](../../crashd/docs/block-format.md),
+[services/logd/README.md](../README.md),
 [services/logd/codec/README.md](../codec/README.md), [xtask/README.md](../../../xtask/README.md)

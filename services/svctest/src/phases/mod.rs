@@ -36,6 +36,7 @@
 
 use crate::runner::Phase;
 
+pub mod crash;
 pub mod devmgr;
 pub mod drivers;
 pub mod exit_code;

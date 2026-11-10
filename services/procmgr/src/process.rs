@@ -189,7 +189,7 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
 // uses, and its `process::split_create_caps` call sites in the create
 // handlers, resolve through this module.
 pub use process_table::{
-    ArgvEnvRefusal, CreateTailCaps, DmaHolds, ProcessEntry, ProcessTable, RecentExits,
+    ArgvEnvRefusal, CreateTailCaps, DmaHolds, ImageSpan, ProcessEntry, ProcessTable, RecentExits,
     ReleaseRefusal, badge_is_acceptable, release_token_badge, resolve_spawn_sched,
     resync_exit_reason, split_create_caps,
 };
@@ -1884,6 +1884,7 @@ fn finalize_creation(
     self_memmgr_ep: u64,
     parent_relay_cap: u64,
     band_max: u8,
+    image: ImageSpan,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
     self_aspace: u64,
@@ -1949,6 +1950,8 @@ fn finalize_creation(
             process_info_va: layout.process_info_va,
             started: false,
             dma_hold: false,
+            no_debug: false,
+            image,
         })
         .is_err()
     {
@@ -2004,12 +2007,42 @@ fn finalize_creation(
     {
         advertise_pager(self_aspace, pi_memory_cap, memmgr_badge);
     }
+    bind_crash_endpoint(child_thread, badge);
 
     Ok(CreateResult {
         process_handle,
         thread_for_caller,
         badge,
     })
+}
+
+/// Bind a child's main thread's exception class to the crash endpoint
+/// (`crate::crash`), badged with the child's process badge, so its
+/// exceptions, and the virtual-memory faults memmgr forwards, reach the crash
+/// service, or procmgr's decliner while none is registered. The runtime
+/// copies the binding onto every thread the child spawns. Best-effort: a
+/// failure, logged, leaves the class unbound, and an exception then takes the
+/// outcome it has with no handler.
+fn bind_crash_endpoint(child_thread: u64, badge: u64)
+{
+    let ep = crate::crash::endpoint();
+    if ep == 0
+    {
+        return;
+    }
+    let Ok(badged) = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, badge)
+    else
+    {
+        std::os::seraph::log!("crash endpoint badge not derived; exceptions stay unbound");
+        return;
+    };
+    if syscall::thread_set_fault_handler(child_thread, badged, FAULT_CLASS_EXCEPTION).is_err()
+    {
+        std::os::seraph::log!("crash endpoint not bound; exceptions stay unbound");
+    }
+    // The binding holds its own reference on the endpoint; procmgr needs no
+    // copy of the badged cap.
+    let _ = syscall::cap_delete(badged);
 }
 
 /// Delegate a child's address space to memmgr and bind its main thread's
@@ -2055,14 +2088,11 @@ fn bind_pager(
     // Bind only after the AS is delegated, so memmgr can service the first
     // fault. The kernel stamps each fault with the derivation badge of
     // memmgr_send_cap, which memmgr minted as the child's memmgr badge. The
-    // fault classes alone: memmgr is no upcall handler, so the upcall class
-    // stays unbound and a post to the child's thread is refused.
-    syscall::thread_set_fault_handler(
-        child_thread,
-        memmgr_send_cap,
-        FAULT_CLASS_VM | FAULT_CLASS_EXCEPTION,
-    )
-    .is_ok()
+    // virtual-memory class alone: memmgr forwards the faults it cannot back
+    // to the exception class, which `bind_crash_endpoint` binds, and is no
+    // upcall handler, so the upcall class stays unbound and a post to the
+    // child's thread is refused.
+    syscall::thread_set_fault_handler(child_thread, memmgr_send_cap, FAULT_CLASS_VM).is_ok()
 }
 
 /// Advertise the pager in a child's `ProcessInfo` (still writable through
@@ -2201,6 +2231,10 @@ fn create_process_from_bytes(
     let child_memmgr_send = universals.memmgr_endpoint;
 
     let mut applied_relocs = 0u64;
+    let mut image = ImageSpan {
+        load_bias: bias,
+        ..ImageSpan::default()
+    };
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
         let seg = seg_result.map_err(|_| procmgr_errors::INVALID_ELF)?;
@@ -2211,6 +2245,10 @@ fn create_process_from_bytes(
 
         let prot = segment_prot(&seg);
         let seg_vaddr = seg.vaddr + bias;
+        if seg.executable
+        {
+            image.add_text(seg_vaddr, seg_vaddr + seg.memsz);
+        }
         let first_page = seg_vaddr & !0xFFF;
         let last_page_end = (seg_vaddr + seg.memsz + 0xFFF) & !0xFFF;
         let num_pages = (last_page_end - first_page) / PAGE_SIZE;
@@ -2367,6 +2405,7 @@ fn create_process_from_bytes(
         // relay terminal faults to; only CREATE_FROM_FILE carries a relay.
         0,
         sched.band_max,
+        image,
         ipc_buf,
         &layout,
         self_aspace,
@@ -3204,6 +3243,10 @@ pub fn create_process_from_file(
 
     // Stream each LOAD segment from VFS at segment granularity.
     let mut applied_relocs = 0u64;
+    let mut image = ImageSpan {
+        load_bias: bias,
+        ..ImageSpan::default()
+    };
     for seg_result in elf::load_segments_metadata(ehdr, header_data, file_size)
     {
         let seg = seg_result.map_err(|_| procmgr_errors::INVALID_ELF)?;
@@ -3214,6 +3257,10 @@ pub fn create_process_from_file(
 
         let prot = segment_prot(&seg);
         let seg_vaddr = seg.vaddr + bias;
+        if seg.executable
+        {
+            image.add_text(seg_vaddr, seg_vaddr + seg.memsz);
+        }
         let first_page = seg_vaddr & !0xFFF;
         let last_page_end = (seg_vaddr + seg.memsz + 0xFFF) & !0xFFF;
         let num_pages = (last_page_end - first_page) / PAGE_SIZE;
@@ -3417,6 +3464,7 @@ pub fn create_process_from_file(
         universals.self_memmgr_ep,
         parent_relay_cap,
         sched.band_max,
+        image,
         ipc_buf,
         &layout,
         self_aspace,

@@ -97,7 +97,7 @@ const RECORD_DIR = 'target/xtask/review/release-' + TAG
 
 const MAX_SHARD_FILES = 6 // files per shard reviewer
 const MAX_SHARD_LINES = 500 // changed lines per shard reviewer
-const MAX_LENS_DOCS = 8 // documents per design-docs or summarized-by lens agent
+const MAX_LENS_DOCS = 8 // documents per design-docs lens agent
 const DEDUP_LINE_SLACK = 3 // lines apart at which same file, class, bucket, and flag are one
 const VERIFY_LENSES = ['reality', 'authority']
 const BLOCKING_CLASSES = ['correctness', 'safety', 'contract']
@@ -395,7 +395,9 @@ function component_of(path) {
 
 // Group the files by component and cut each group into shards of at most
 // MAX_SHARD_FILES files and about MAX_SHARD_LINES changed lines. A file is
-// never split. Group order follows the scope agent's file order, so the same
+// never split, so a file whose own range diff exceeds MAX_SHARD_LINES is a
+// shard of its own at that size: its reviewer reads one file whole, which the
+// composition question needs. Group order follows the scope agent's file order, so the same
 // scope yields the same shards on resume.
 function shards_of(files) {
     const groups = new Map()
@@ -742,42 +744,36 @@ if (lens_has_code) {
 }
 
 // One lens agent per MAX_LENS_DOCS documents, so no agent holds every touched
-// document at once.
-function doc_lenses(name, intro) {
-    const count = Math.ceil(design_docs.length / MAX_LENS_DOCS)
-    for (let start = 0; start < design_docs.length; start += MAX_LENS_DOCS) {
-        const docs = design_docs.slice(start, start + MAX_LENS_DOCS)
-        const index = start / MAX_LENS_DOCS + 1
-        lenses.push({
-            name: name + (count > 1 ? '#' + index : ''),
-            body: () => [
-                ...intro(count > 1 ? ' (documents ' + index + ' of ' + count + ')' : ''),
-                '',
-                'Documents:',
-                bullets(docs, doc_line),
-            ],
-        })
-    }
+// document at once. Each agent reads its documents once for both concerns:
+// their whole text against the code, and their `## Summarized By` lists.
+const doc_lens_count = Math.ceil(design_docs.length / MAX_LENS_DOCS)
+for (let start = 0; start < design_docs.length; start += MAX_LENS_DOCS) {
+    const docs = design_docs.slice(start, start + MAX_LENS_DOCS)
+    const index = start / MAX_LENS_DOCS + 1
+    const part = doc_lens_count > 1 ? ' (documents ' + index + ' of ' + doc_lens_count + ')' : ''
+    lenses.push({
+        name: 'design-docs' + (doc_lens_count > 1 ? '#' + index : ''),
+        body: () => [
+            'Lens: the documents ' + RANGE + ' touched' + part + ', each read in full, for two ' +
+                'concerns.',
+            'Whole-document truth: check every statement of fact, not only the hunks the range ' +
+                'changed, against the code at the head (docs/documentation-standards.md § Design ' +
+                'Intent: an unmarked statement of behaviour MUST match the code). Report each ' +
+                'statement the code contradicts, each pair of statements two PRs of the range ' +
+                'left in conflict, and each cross-reference that no longer resolves.',
+            '`## Summarized By` integrity: apply docs/documentation-standards.md § Backlinks and ' +
+                'Change Propagation and § Authority and Duplication to each document the ' +
+                'standard makes authoritative: every document its list names still summarizes ' +
+                'it, every tracked document that summarizes it is listed, and every such summary ' +
+                'states what the document states at the head. Report a missing or stale entry at ' +
+                'the list and a stale summary at the summary.',
+            'Cite the document path and section.',
+            '',
+            'Documents:',
+            bullets(docs, doc_line),
+        ],
+    })
 }
-
-doc_lenses('design-docs', (part) => [
-    'Lens: whole-document truth of the documents ' + RANGE + ' touched' + part + '.',
-    'Read each document below in full, not only the hunks the range changed, and check every ' +
-        'statement of fact against the code at the head (docs/documentation-standards.md ' +
-        '§ Design Intent: an unmarked statement of behaviour MUST match the code). Report each ' +
-        'statement the code contradicts, each pair of statements two PRs of the range left in ' +
-        'conflict, and each cross-reference that no longer resolves. Cite the document path ' +
-        'and section.',
-])
-
-doc_lenses('summarized-by', (part) => [
-    'Lens: `## Summarized By` integrity of the documents ' + RANGE + ' touched' + part + '.',
-    'Apply docs/documentation-standards.md § Backlinks and Change Propagation and § Authority ' +
-        'and Duplication to each document below that the standard makes authoritative: every ' +
-        'document its list names still summarizes it, every tracked document that summarizes ' +
-        'it is listed, and every such summary states what the document states at the head. ' +
-        'Report a missing or stale entry at the list and a stale summary at the summary.',
-])
 
 if (lens_has_code) {
     lenses.push({

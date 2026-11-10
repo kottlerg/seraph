@@ -38,7 +38,7 @@ pub use boot_protocol::x86_paging::PagingDepth;
 use boot_protocol::x86_paging::next_level_boundary;
 use boot_protocol::x86_paging::table_index;
 
-use crate::mm::paging::{PageFlags, PagingError, PoolState};
+use crate::mm::paging::{PageFlags, PagingError, PoolState, UserAccess};
 
 // ── PTE bit constants ─────────────────────────────────────────────────────────
 
@@ -46,6 +46,9 @@ use crate::mm::paging::{PageFlags, PagingError, PoolState};
 const PRESENT: u64 = 1 << 0;
 /// Read/Write — 1 allows writes, 0 makes the mapping read-only.
 const WRITABLE: u64 = 1 << 1;
+/// User/Supervisor — 1 makes the entry reachable from ring 3; a user page needs
+/// it in its leaf and in every table entry on the walk to it.
+const USER: u64 = 1 << 2;
 /// Page Write-Through — used with PCD to select strong uncacheable memory type.
 const PWT: u64 = 1 << 3;
 /// Page Cache Disable — with PWT clear it selects UC- (PAT entry 2); combined
@@ -691,9 +694,6 @@ pub unsafe fn map_user_page(
 {
     use crate::mm::paging::phys_to_virt;
 
-    // Set USER bit (bit 2) so ring-3 code can access the page.
-    const USER: u64 = 1 << 2;
-
     // SAFETY: root_virt is the direct-map VA of a valid user root (caller
     // contract); every child user_walk_or_alloc yields is a kernel PT-pool
     // frame, reachable through the direct map.
@@ -716,9 +716,6 @@ pub unsafe fn map_user_page(
 #[cfg(not(test))]
 fn user_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 {
-    // Set USER bit so lower-level tables are accessible from ring 3.
-    const USER: u64 = 1 << 2;
-
     if entry.is_present()
     {
         return Ok(entry.phys_addr());
@@ -755,7 +752,6 @@ pub unsafe fn map_user_page_pooled(
 ) -> Result<crate::mm::paging::MapOutcome, ()>
 {
     use crate::mm::paging::phys_to_virt;
-    const USER: u64 = 1 << 2;
 
     // SAFETY: root_virt is the direct-map VA of a valid user root (caller
     // contract); every child user_walk_or_alloc_pooled yields is a frame of
@@ -782,8 +778,6 @@ fn user_walk_or_alloc_pooled(
     aso: &crate::cap::object::AddressSpaceObject,
 ) -> Result<u64, ()>
 {
-    const USER: u64 = 1 << 2;
-
     if entry.is_present()
     {
         return Ok(entry.phys_addr());
@@ -1444,9 +1438,6 @@ pub unsafe fn protect_user_page(
 {
     use crate::mm::paging::{PagingError, phys_to_virt};
 
-    // Set USER bit (bit 2) to preserve user accessibility.
-    const USER: u64 = 1 << 2;
-
     // SAFETY: root_virt is the direct-map VA of a valid user root (caller
     // contract); its reachable child frames are live PT frames.
     let pt = unsafe { descend_existing(root_virt, virt, root_level(), 0, phys_to_virt) }
@@ -1595,33 +1586,23 @@ fn map_rights_superset(new: u64, prior: u64) -> bool
 
 // ── Spurious-fault classification ─────────────────────────────────────────────
 
-/// Whether a leaf PTE grants a user-mode access of the given class.
+/// Whether a leaf PTE grants a user-mode `access`.
 ///
-/// `write` = the faulting access was a write; `instr` = an instruction fetch
-/// (mutually: a plain read has both false). A user page fault is *spurious*
-/// (stale TLB) only when the live PTE is present, user-accessible, and already
-/// grants the access — on x86 every present page is readable, so a read needs
-/// only presence; a write needs `WRITABLE`; a fetch needs NX clear.
-fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
+/// A user page fault is *spurious* (stale TLB) only when the live PTE is
+/// present, user-accessible, and already grants the access — on x86 every
+/// present page is readable, so a load needs only presence; a store needs
+/// `WRITABLE`; a fetch needs NX clear.
+fn pte_permits_user_access(pte: u64, access: UserAccess) -> bool
 {
-    /// User/Supervisor bit — the page is reachable from ring 3.
-    const USER: u64 = 1 << 2;
-
     if pte & PRESENT == 0 || pte & USER == 0
     {
         return false;
     }
-    if instr
+    match access
     {
-        pte & NO_EXECUTE == 0
-    }
-    else if write
-    {
-        pte & WRITABLE != 0
-    }
-    else
-    {
-        true
+        UserAccess::Load => true,
+        UserAccess::Store => pte & WRITABLE != 0,
+        UserAccess::Fetch => pte & NO_EXECUTE == 0,
     }
 }
 
@@ -1632,9 +1613,6 @@ fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
 /// the power-on PAT the kernel keeps.
 pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
 {
-    /// User/Supervisor bit — the page is reachable from ring 3.
-    const USER: u64 = 1 << 2;
-
     if pte & PRESENT == 0 || pte & USER == 0
     {
         return None;
@@ -1650,12 +1628,12 @@ pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
 /// Classify a userspace page fault at `va` as a spurious stale-TLB fault.
 ///
 /// Walks the *current* (CR3) page tables for `va` and returns `true` iff `va`
-/// is mapped, user-accessible, and the live leaf PTE permits the faulting
-/// access — meaning the fault must be a stale TLB entry the CPU resolves on
-/// retry after a local `invlpg`. Returns `false` for any genuine fault
-/// (unmapped, or the live mapping still forbids the access); the caller then
-/// delivers the fault to the thread's fault handler or, with none bound, kills
-/// the thread (see [fault-handling.md](../../../../../docs/fault-handling.md)).
+/// is mapped, user-accessible, and the live leaf PTE permits `access`, the
+/// faulting access — meaning the fault must be a stale TLB entry the CPU
+/// resolves on retry after a local `invlpg`. Returns `false` for any genuine
+/// fault (unmapped, or the live mapping still forbids the access); the caller
+/// then delivers the fault to the thread's fault handler or, with none bound,
+/// kills the thread (see [fault-handling.md](../../../../../docs/fault-handling.md)).
 /// Because a `true` result requires the live PTE to grant the access (and x86
 /// updates A/D in hardware), the retried instruction is guaranteed to make
 /// progress — no retry counter is needed.
@@ -1669,9 +1647,9 @@ pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
 /// Must run at ring 0 in the faulting thread's context, i.e. before CR3 has
 /// been changed by a context switch.
 #[cfg(not(test))]
-pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
+pub unsafe fn user_fault_is_spurious(va: u64, access: UserAccess) -> bool
 {
-    fault_is_spurious_given(va, write, instr, |va| {
+    fault_is_spurious_given(va, access, |va| {
         // SAFETY: ring 0; reads CR3 to recover the active page-table root.
         let root_phys = unsafe { read_root_phys() };
         let root_virt = crate::mm::paging::phys_to_virt(root_phys);
@@ -1706,8 +1684,7 @@ pub unsafe fn copy_fault_present(va: u64) -> bool
 /// unmapped). `live_leaf` is not called for a `va` at or above it.
 fn fault_is_spurious_given(
     va: u64,
-    write: bool,
-    instr: bool,
+    access: UserAccess,
     live_leaf: impl FnOnce(u64) -> Option<u64>,
 ) -> bool
 {
@@ -1715,7 +1692,7 @@ fn fault_is_spurious_given(
     {
         return false;
     }
-    live_leaf(va).is_some_and(|pte| pte_permits_user_access(pte, write, instr))
+    live_leaf(va).is_some_and(|pte| pte_permits_user_access(pte, access))
 }
 
 // ── TLB flush operations ──────────────────────────────────────────────────────
@@ -1893,31 +1870,29 @@ mod tests
 
     // ── Spurious-fault classification ──────────────────────────────────────────
 
-    const USER_BIT: u64 = 1 << 2;
-
     #[test]
     fn permits_read_of_present_user_page()
     {
-        let pte = PRESENT | USER_BIT | NO_EXECUTE; // R-- (NX, not writable)
-        assert!(pte_permits_user_access(pte, false, false));
+        let pte = PRESENT | USER | NO_EXECUTE; // R-- (NX, not writable)
+        assert!(pte_permits_user_access(pte, UserAccess::Load));
     }
 
     #[test]
     fn permits_write_only_when_writable()
     {
-        let ro = PRESENT | USER_BIT | NO_EXECUTE;
-        let rw = PRESENT | USER_BIT | WRITABLE | NO_EXECUTE;
-        assert!(!pte_permits_user_access(ro, true, false));
-        assert!(pte_permits_user_access(rw, true, false));
+        let ro = PRESENT | USER | NO_EXECUTE;
+        let rw = PRESENT | USER | WRITABLE | NO_EXECUTE;
+        assert!(!pte_permits_user_access(ro, UserAccess::Store));
+        assert!(pte_permits_user_access(rw, UserAccess::Store));
     }
 
     #[test]
     fn permits_fetch_only_when_executable()
     {
-        let nx = PRESENT | USER_BIT | NO_EXECUTE;
-        let exec = PRESENT | USER_BIT; // NX clear
-        assert!(!pte_permits_user_access(nx, false, true));
-        assert!(pte_permits_user_access(exec, false, true));
+        let nx = PRESENT | USER | NO_EXECUTE;
+        let exec = PRESENT | USER; // NX clear
+        assert!(!pte_permits_user_access(nx, UserAccess::Fetch));
+        assert!(pte_permits_user_access(exec, UserAccess::Fetch));
     }
 
     #[test]
@@ -1925,10 +1900,10 @@ mod tests
     {
         // Present + writable but supervisor-only: a user access is genuine.
         let kernel = PRESENT | WRITABLE;
-        assert!(!pte_permits_user_access(kernel, false, false));
+        assert!(!pte_permits_user_access(kernel, UserAccess::Load));
         // Not present: genuine fault regardless of other bits.
-        let absent = USER_BIT | WRITABLE;
-        assert!(!pte_permits_user_access(absent, false, false));
+        let absent = USER | WRITABLE;
+        assert!(!pte_permits_user_access(absent, UserAccess::Load));
     }
 
     // Defect caught: a decoder that let a supervisor or absent leaf through
@@ -1940,38 +1915,38 @@ mod tests
     fn a_user_leaf_decodes_to_its_access_and_memory_type()
     {
         assert!(user_leaf_flags(PRESENT | WRITABLE).is_none());
-        assert!(user_leaf_flags(USER_BIT | WRITABLE).is_none());
-        let rx = user_leaf_flags(PRESENT | USER_BIT).unwrap();
+        assert!(user_leaf_flags(USER | WRITABLE).is_none());
+        let rx = user_leaf_flags(PRESENT | USER).unwrap();
         assert!(rx.readable && rx.executable && !rx.writable && !rx.uncacheable);
-        let rw = user_leaf_flags(PRESENT | USER_BIT | WRITABLE | NO_EXECUTE).unwrap();
+        let rw = user_leaf_flags(PRESENT | USER | WRITABLE | NO_EXECUTE).unwrap();
         assert!(rw.writable && !rw.executable);
-        let uc = user_leaf_flags(PRESENT | USER_BIT | NO_EXECUTE | PCD | PWT).unwrap();
+        let uc = user_leaf_flags(PRESENT | USER | NO_EXECUTE | PCD | PWT).unwrap();
         assert!(uc.uncacheable);
-        let wt = user_leaf_flags(PRESENT | USER_BIT | NO_EXECUTE | PWT).unwrap();
+        let wt = user_leaf_flags(PRESENT | USER | NO_EXECUTE | PWT).unwrap();
         assert!(wt.uncacheable);
     }
 
     #[test]
     fn kernel_half_fault_is_never_spurious_even_when_the_lookup_permits()
     {
-        let permitting = |_| Some(PRESENT | USER_BIT | WRITABLE);
+        let permitting = |_| Some(PRESENT | USER | WRITABLE);
         let floor = PagingDepth::Four.kernel_va_base();
         let kernel_half = [user_va_top(), floor, floor + (1 << 30), u64::MAX];
         for va in kernel_half
         {
-            assert!(!fault_is_spurious_given(va, true, false, permitting));
+            assert!(!fault_is_spurious_given(va, UserAccess::Store, permitting));
         }
     }
 
     #[test]
     fn user_half_fault_is_spurious_only_when_the_live_leaf_permits()
     {
-        let read_only = |_| Some(PRESENT | USER_BIT | NO_EXECUTE);
+        let read_only = |_| Some(PRESENT | USER | NO_EXECUTE);
         let unmapped = |_| None;
         let va = 0x40_0000;
-        assert!(fault_is_spurious_given(va, false, false, read_only));
-        assert!(!fault_is_spurious_given(va, true, false, read_only));
-        assert!(!fault_is_spurious_given(va, false, false, unmapped));
+        assert!(fault_is_spurious_given(va, UserAccess::Load, read_only));
+        assert!(!fault_is_spurious_given(va, UserAccess::Store, read_only));
+        assert!(!fault_is_spurious_given(va, UserAccess::Load, unmapped));
     }
 
     // ── Host page-table frames ────────────────────────────────────────────────
@@ -2098,14 +2073,14 @@ mod tests
             top,
             f: frames(top + 2),
         };
-        let lure = PageTableEntry(PRESENT | USER_BIT | WRITABLE | (p.bait() & PHYS_MASK));
+        let lure = PageTableEntry(PRESENT | USER | WRITABLE | (p.bait() & PHYS_MASK));
         for index in 0..512
         {
             p.f.set_entry(p.bait(), index, lure);
         }
         for (i, level) in (2..=top).rev().enumerate()
         {
-            let child = PageTableEntry(PageTableEntry::new_table(p.f.addrs[i + 1]).0 | USER_BIT);
+            let child = PageTableEntry(PageTableEntry::new_table(p.f.addrs[i + 1]).0 | USER);
             p.f.set_entry(p.f.addrs[i], table_index(level, va), child);
         }
         p
@@ -2125,9 +2100,9 @@ mod tests
         for depth in DEPTHS
         {
             let p = path(depth);
-            let leaf = PageTableEntry(PRESENT | USER_BIT | 0x1234_5000);
+            let leaf = PageTableEntry(PRESENT | USER | 0x1234_5000);
             p.f.set_entry(p.pt(), table_index(0, p.va), leaf);
-            let pt = PageTableEntry(PageTableEntry::new_table(p.pt()).0 | USER_BIT);
+            let pt = PageTableEntry(PageTableEntry::new_table(p.pt()).0 | USER);
             p.f.set_entry(p.pd(), table_index(1, p.va), pt);
             assert_eq!(walk(&p).map(|e| e.0), Some(leaf.0), "{depth:?}");
             p.f.set_entry(p.pt(), table_index(0, p.va), PageTableEntry(0));
@@ -2144,7 +2119,7 @@ mod tests
         for depth in DEPTHS
         {
             let p = path(depth);
-            let large = PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (p.bait() & PHYS_MASK));
+            let large = PageTableEntry(PRESENT | USER | LARGE_PAGE | (p.bait() & PHYS_MASK));
             p.f.set_entry(p.pd(), table_index(1, p.va), large);
             assert!(walk(&p).is_none(), "{depth:?}");
         }
@@ -2156,7 +2131,7 @@ mod tests
         for depth in DEPTHS
         {
             let p = path(depth);
-            let large = PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (p.bait() & PHYS_MASK));
+            let large = PageTableEntry(PRESENT | USER | LARGE_PAGE | (p.bait() & PHYS_MASK));
             p.f.set_entry(p.pdpt(), table_index(2, p.va), large);
             assert!(walk(&p).is_none(), "{depth:?}");
         }
@@ -2289,7 +2264,7 @@ mod tests
             let f = frames(top + 1);
             let pd = link_to_pd(&f, depth, va);
             let data = f.addrs[top];
-            let large = PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (data & PHYS_MASK));
+            let large = PageTableEntry(PRESENT | USER | LARGE_PAGE | (data & PHYS_MASK));
             f.set_entry(pd, table_index(1, va), large);
             // SAFETY: as in the test above.
             let pt = unsafe { descend_existing(f.addrs[0], va, top, 0, |pa| pa) };
@@ -2307,7 +2282,7 @@ mod tests
     /// Raw leaf PTE bits: present user page on `frame` with the given rights.
     fn leaf(frame: u64, writable: bool, executable: bool) -> u64
     {
-        let mut pte = PRESENT | USER_BIT | (frame & PHYS_MASK);
+        let mut pte = PRESENT | USER | (frame & PHYS_MASK);
         if writable
         {
             pte |= WRITABLE;

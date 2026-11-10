@@ -62,7 +62,9 @@ const IA32_SFMASK: u32 = 0xC000_0084;
 
 const EFER_SCE: u64 = 1 << 0;
 
-pub(super) const RFLAGS_TF: u64 = 1 << 8;
+/// The trap flag, the bit a fault handler sets through the register file to
+/// single-step a thread: one definition, the ABI's.
+pub(super) const RFLAGS_TF: u64 = ::syscall::X86_64_RFLAGS_TF;
 const RFLAGS_IF: u64 = 1 << 9;
 pub(super) const RFLAGS_DF: u64 = 1 << 10;
 const RFLAGS_IOPL: u64 = 3 << 12;

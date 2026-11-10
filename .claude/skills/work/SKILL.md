@@ -28,6 +28,9 @@ Read `.claude/agents/worker.md` and follow it in **standalone** mode, with these
   conversation, with `cargo xtask issue-file`.
 - Sync onto `master` yourself right before the validation run, and again if `master` moves
   before the gate. A Markdown-only sync owes nothing.
+- The worker file is a file this session read, not its system prompt, so a compaction drops it.
+  After one, read `.claude/agents/worker.md` again before the next step, and take the state of
+  the work from the PR body and the branch, not from the summary.
 
 The review records of the PR sit under `target/xtask/review/pr<N>/` in the checkout the session
 works in, which is the only copy. When the session runs in a worktree, copy them into the main
@@ -35,8 +38,8 @@ checkout at the same path after the merge, since a later PR on the same surface 
 its ledger context; when the session cannot write there, tell the maintainer the path. The
 worktree holds a built `target/` that nothing removes by itself. Once the copy exists and the
 worktree holds nothing unsaved or unpushed (the second check of
-`.claude/skills/orchestrate/SKILL.md` § Worktree removal), the maintainer removes it, or the
-session does when asked, as that section describes.
+`.claude/skills/orchestrate/worktree-removal.md`), the maintainer removes it, or the session
+does when asked, as that file describes.
 
 At the gate, give both verdict lines verbatim and prompt for the merge decision. Merge only on
 the maintainer's instruction.

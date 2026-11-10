@@ -344,16 +344,23 @@ fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u6
         return out;
     };
     // The named thread's cap: in this page, or first in the page that starts
-    // at it. A fault-blocked thread is never swept out, so only threads
-    // before it can move it between the two calls, and the second reply's
-    // named-thread word says where it is then.
+    // at it.
     let in_page = usize::try_from(named)
         .ok()
         .and_then(|i| reply.caps().get(i).copied());
     let thread = match in_page
     {
         Some(thread) => Some(thread),
-        None => page_at_named(badge, named, authority, generation, ipc_buf),
+        None => match page_at_named(badge, named, authority, generation, ipc_buf)
+        {
+            Ok(thread) => thread,
+            Err(AttachFailed::Cancelled) =>
+            {
+                out.status = Status::Timeout;
+                None
+            }
+            Err(AttachFailed::Refused) => None,
+        },
     };
     match thread
     {
@@ -369,32 +376,43 @@ fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u6
     out
 }
 
+/// Attaches a named thread's index is chased through, at most: its index
+/// moves only when threads listed before it exit between two attaches.
+const NAMED_PAGE_TRIES: usize = 3;
+
 /// The cap of the thread `named` indexes, from an attach whose page starts
-/// at it; `None` when the thread is not listed or the attach fails.
+/// at it; `Ok(None)` when the thread is not listed, or still moves after
+/// [`NAMED_PAGE_TRIES`] attaches. A fault-blocked thread is never swept out
+/// of the list, so its index moves only down, when threads before it exit,
+/// and each reply's named-thread word gives where it is then.
 fn page_at_named(
     badge: u64,
-    named: u64,
+    mut named: u64,
     authority: u64,
     generation: u64,
     ipc_buf: *mut u64,
-) -> Option<u64>
+) -> Result<Option<u64>, AttachFailed>
 {
-    if named == procmgr_labels::ATTACH_NO_THREAD
+    for _ in 0..NAMED_PAGE_TRIES
     {
-        return None;
+        if named == procmgr_labels::ATTACH_NO_THREAD
+        {
+            return Ok(None);
+        }
+        let reply = attach(badge, named, authority, generation, ipc_buf)?;
+        let now = reply.word(procmgr_labels::ATTACH_WORD_NAMED_THREAD);
+        match reply.caps().split_first()
+        {
+            Some((&thread, rest)) if now == named =>
+            {
+                delete_caps(rest);
+                return Ok(Some(thread));
+            }
+            _ => delete_caps(reply.caps()),
+        }
+        named = now;
     }
-    let reply = attach(badge, named, authority, generation, ipc_buf).ok()?;
-    let (&thread, rest) = reply.caps().split_first()?;
-    delete_caps(rest);
-    if reply.word(procmgr_labels::ATTACH_WORD_NAMED_THREAD) == named
-    {
-        Some(thread)
-    }
-    else
-    {
-        let _ = syscall::cap_delete(thread);
-        None
-    }
+    Ok(None)
 }
 
 /// Read the faulting thread `thread`, of kind `kind`, into `out`: its

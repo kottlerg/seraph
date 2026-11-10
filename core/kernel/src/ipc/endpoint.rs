@@ -424,9 +424,10 @@ pub unsafe fn endpoint_call(
 /// cannot run meanwhile: `endpoint_reply`, the `SYS_IPC_REPLY` failure-path
 /// swap and `endpoint_recv`'s rebind rollback run on this thread, and
 /// `endpoint_call`'s rollback only while this server is parked. On a win the
-/// caller's call fails with `Interrupted`, a fault-blocked caller is killed,
-/// or a caller blocked in an upcall delivery has the upcall dropped and
-/// resumes, and the caller is woken; the `wake_in_flight` pin set at bind
+/// caller's call fails with `Interrupted`, a fault-blocked caller is killed
+/// (one blocked on its restartable syscall's user copy has that syscall fail
+/// with `InvalidAddress`), or a caller blocked in an upcall delivery has the
+/// upcall dropped and resumes, and the caller is woken; the `wake_in_flight` pin set at bind
 /// keeps it alive until that wake clears it.
 ///
 /// # Safety
@@ -513,8 +514,10 @@ pub unsafe fn endpoint_recv(
         // SAFETY: caller dequeued from send_head.
         let msg = unsafe { (*caller).ipc_msg };
         // A fault sender (kernel-synthesized delivery) parks as BlockedOnFault
-        // so its resume re-executes the faulting instruction and its
-        // cancellation kills it; a normal call sender parks as BlockedOnReply.
+        // so its reply and its cancellation take the fault outcomes
+        // (docs/fault-handling.md § Delivery, Resume, and Kill, § Kernel
+        // Copies, § Asynchronous Upcalls); a normal call sender parks as
+        // BlockedOnReply.
         // SAFETY: caller dequeued from send_head; in_fault_delivery always valid.
         let parked = if unsafe { (*caller).in_fault_delivery }
         {

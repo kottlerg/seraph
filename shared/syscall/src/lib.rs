@@ -2161,7 +2161,9 @@ pub fn ioport_bind(thread_cap: u64, ioport_cap: u64) -> Result<(), i64>
 /// kill outcome, unless the handler's reply claimed it first, in which case
 /// that reply's outcome is kept; no syscall returns on the target, and the
 /// outcome takes effect at the next [`thread_start`], which kills the thread
-/// on a kill outcome and resumes its faulting instruction on
+/// on a kill outcome (for the fault of a restartable syscall's user copy,
+/// fails that syscall with `InvalidAddress`) and resumes its faulting
+/// instruction on
 /// `FAULT_REPLY_RESUME` (docs/fault-handling.md § Delivery, Resume, and
 /// Kill). A thread blocked in an upcall delivery is never killed: whatever
 /// the outcome, the upcall is settled or dropped and the start resumes the

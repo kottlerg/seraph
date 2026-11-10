@@ -384,8 +384,10 @@ unsafe fn commit_stopped(
 /// Cancels any park — an IPC wait or a `SYS_THREAD_SLEEP` — including one the
 /// target commits while the stop is in progress: on restart the stopped
 /// thread's blocked syscall returns `Interrupted`, a fault-blocked thread is
-/// killed, and a thread blocked in an upcall delivery has the upcall dropped
-/// and resumes (see `core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP`), unless
+/// killed (for the fault of a restartable syscall's user copy, that syscall
+/// fails with `InvalidAddress`), and a thread blocked in an upcall delivery
+/// has the upcall dropped and resumes (see `core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_STOP`), unless
 /// a genuine waker, the sleep timer, or a handler's reply claimed it first.
 /// A target parked on an endpoint, notification, event queue, or wait set
 /// whose last capability is deleted concurrently is claimed by the stop or by
@@ -1178,11 +1180,12 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
             // Mirror BlockedOnReply: `blocked_on` is the handler (server) TCB,
             // whose `reply_tcb` points at this faulter. CAS-clear it so a later
             // handler reply cannot double-wake. On a successful cancel, mark the
-            // disposition Kill (the fault helper terminates the thread on
-            // resume, or, for an upcall delivery, drops the upcall and resumes
-            // it) and release the wake-in-flight claim. If the CAS loses, a
-            // genuine reply already won and committed its own disposition — leave
-            // it untouched.
+            // disposition Kill (on resume the fault helper terminates the
+            // thread, fails with InvalidAddress a restartable syscall whose
+            // user copy faulted, or, for an upcall delivery, drops the upcall
+            // and resumes the thread) and release the wake-in-flight claim. If
+            // the CAS loses, a genuine reply already won and committed its own
+            // disposition — leave it untouched.
             if !blocked_on.is_null()
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.

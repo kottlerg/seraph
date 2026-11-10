@@ -3986,8 +3986,10 @@ pub unsafe fn ipc_call(ep: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 /// A reply still pending from an earlier receive is released once the
 /// receive passes its capability check and cap-slot pre-allocation: that
 /// caller's `ipc_call` returns `Interrupted`, a fault-blocked caller is
-/// killed, and a caller blocked in an upcall delivery has the upcall dropped
-/// and resumes. A receive refused before then keeps the pending binding (see
+/// killed (one blocked on its restartable syscall's user copy has that syscall
+/// fail with `InvalidAddress` instead), and a caller blocked in an upcall
+/// delivery has the upcall dropped and resumes. A receive refused before then
+/// keeps the pending binding (see
 /// `docs/ipc-design.md` § The Call/Reply Model).
 ///
 /// # Safety

@@ -302,8 +302,9 @@ every reply wakes the recipient through `enqueue_and_wake` on the CPU
 `reply_tcb` claim is won (reply, which takes no endpoint lock); the run queue
 decides when it runs. A receive first wakes any caller it releases from an
 earlier unreplied binding (its call returns `Interrupted`, a faulter is
-killed, and a caller blocked in an upcall delivery has the upcall dropped and
-resumes; § Receive Path step 2). Beyond that, a receive that finds a waiting
+killed, or, on its restartable syscall's user copy, has that syscall fail with
+`InvalidAddress`, and a caller blocked in an upcall delivery has the upcall
+dropped and resumes; § Receive Path step 2). Beyond that, a receive that finds a waiting
 sender wakes no thread: the server continues and the sender stays parked
 awaiting the reply (`BlockedOnReply`, or `BlockedOnFault` for a fault sender). The call path then
 parks the caller through `schedule`; the reply path returns to the server.

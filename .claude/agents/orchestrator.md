@@ -116,8 +116,10 @@ Keep your own reads out of your context the same way:
 2. Size the wave at four to six PRs in flight. Each merge makes every open PR re-sync, and a
    sync that brings non-comment code re-owes that PR's validation set, so more parallelism than
    that costs more host time than it saves.
-3. Start the record with `cargo xtask orch start --goal "<the batch's goal>"`. The record is the
-   files under `target/xtask/orchestration/` (gitignored): the state and the log, which only
+3. Start the record with `cargo xtask orch start --goal "<the batch's goal>"`; a goal the
+   maintainer gave in more than one line of 300 characters goes into `--goal` as a one-line
+   summary and whole into the answers file described below. The record is the files under
+   `target/xtask/orchestration/` (gitignored): the state and the log, which only
    `cargo xtask orch` writes (`xtask/README.md` § `cargo xtask orch`), and the answers file
    described below, which you write. `state.json` is the state: your own agent id
    (`orch orchestrator`), the grant and its queue (`orch grant`), every worker with its agent
@@ -127,14 +129,16 @@ Keep your own reads out of your context the same way:
    own timestamped line, and `orch log` appends any other event (a merge, a filed Issue, the
    maintainer's words on a question, the token use a worker's completion notification reports,
    so the cost of a PR can be read from the log). A log line is one line of at most 300
-   characters. An answer of the maintainer that is longer is appended whole to the answers file
+   characters. Any words of the maintainer that are longer (an answer, an instruction or a
+   ruling given without a question, the batch's goal) are appended whole to the answers file
    beside the log, `<date>-answers.md` with the log's `<date>`, under a heading that gives the
-   time and the question's id, before the `orch log` line that names the file and the heading.
-   Append to that file and never replace it: no other copy of an answer exists. A second batch
-   started on the same UTC day appends to the same log and the same answers file. Run the
-   command for a fact before you act on it. `cargo xtask orch state` prints the state, and is
-   what a new orchestrator starts from (§ Hand-over). The `master` head and the rolling Issues
-   are not stored: read them from `git` and `gh` when you need them.
+   UTC time, as the log writes it, and the question's id when they answer one, before the
+   `orch log` line that names the file and the heading. Append to that file and never replace
+   it: no other copy of those words exists. A second batch started on the same UTC day appends
+   to the same log and the same answers file. Run the command for a fact before you act on it.
+   `cargo xtask orch state` prints the state; a new orchestrator starts from it (§ Hand-over).
+   The `master` head and the rolling Issues are not stored: read them from `git` and `gh` when
+   you need them.
 4. Drain rolling and follow-up Issues in waves on scopes that do not overlap the in-flight PRs,
    started alongside them, never by interrupting in-flight work.
 

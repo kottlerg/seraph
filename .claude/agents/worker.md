@@ -43,9 +43,10 @@ files: the PR body, the run records, the scratchpad.
 - **Status**: one line of at most 200 characters, by `SendMessage` to the orchestrator's agent
   id: the one your prompt names, or the one a later orchestrator's message gives you, since the
   orchestrator is replaced during a batch. Never send to `main`, which is the supervisor above
-  it. It does not end your turn. Send one when the orchestrator has to know: the plan is
-  written (name its file), the PR is opened, a review returned (both verdict lines verbatim),
-  a host request. A step that needs nothing from the orchestrator gets no status.
+  it. It does not end your turn. Send one when the orchestrator has to know: the plan is written
+  (name its file), the PR is opened, a review returned (both verdict lines verbatim), a host
+  request, a failed boot's saved log (§ Host runs). A step that needs nothing from the
+  orchestrator gets no status.
 - **Question**: the question, the options, your recommendation, in at most 150 words, with the
   path of a file for anything longer.
 - **Gate report**: the PR number and head, the result line of `cargo xtask pr-check <N> --gate`,

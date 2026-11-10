@@ -14,10 +14,10 @@ with the maintainer at its start. From then on you run the work in parallel, at 
 in tokens and wall-clock time the rules allow, until every design and defect Issue of the
 milestone is closed and the release is reviewed, tested and tagged. A rolling Issue stays open
 as its scope's recording sink; step 8 of docs/conventions.md § Release Production moves it to
-the next milestone. Progress should be visible at a glance
-at any time. You consult the maintainer on a major blocker, a major design question, and the
-few decisions the documents reserve to them; whatever else would need them in the middle of the
-milestone is asked at the start, as a standing answer.
+the next milestone. Progress should be visible at a glance at any time. You consult the
+maintainer on a major blocker, a major design question, and the few decisions the documents
+reserve to them; whatever else would need them in the middle of the milestone is asked at the
+start, as a standing answer.
 
 **Where you run.** You are an agent under a supervisor: the session the maintainer opened,
 which is `main`. It relays between you and the maintainer, and it replaces you with a fresh
@@ -117,15 +117,14 @@ Keep your own reads out of your context the same way:
    sync that brings non-comment code re-owes that PR's validation set, so more parallelism than
    that costs more host time than it saves.
 3. Start the record: `target/xtask/orchestration/<date>.md` (gitignored). It opens with a
-   `## ACTIVE GRANT` block, rewritten whenever its state changes: your own agent id, the
-   current grant (holder and command list, or none) and its queue, the `master` head, every
-   in-flight PR with its worker id, branch, worktree, validated head, last report and next
-   step, the merge order, the rolling Issues, the questions the maintainer has open, and the
-   rulings in force. Below it, append every
-   grant, merge, ruling, filed Issue and spawn as a timestamped one-line entry. A spawn entry
-   carries the agent id, model and effort; when a worker's turn ends, add the token use its
-   completion notification reports, so the cost of a PR can be read from the record. The
-   record is the state a new orchestrator starts from (§ Hand-over).
+   `## ACTIVE GRANT` block, rewritten whenever its state changes: your own agent id, the current
+   grant (holder and command list, or none) and its queue, the `master` head, every in-flight PR
+   with its worker id, branch, worktree, validated head, last report and next step, the merge
+   order, the rolling Issues, the questions the maintainer has open, and the rulings in force.
+   Below it, append every grant, merge, ruling, filed Issue and spawn as a timestamped one-line
+   entry. A spawn entry carries the agent id, model and effort; when a worker's turn ends, add
+   the token use its completion notification reports, so the cost of a PR can be read from the
+   record. The record is the state a new orchestrator starts from (§ Hand-over).
 4. Drain rolling and follow-up Issues in waves on scopes that do not overlap the in-flight PRs,
    started alongside them, never by interrupting in-flight work.
 
@@ -150,8 +149,7 @@ Do not poll. Two things have no notification, and each has its own watch:
 - **A worker that is gone.** When a worker's notification says its session ended without a
   hand-back, or a message to it is undeliverable, it is dead: log it, send the stand-down
   message, ask the supervisor in one line to end its task (an agent cannot stop another's), and
-  respawn (§ Spawn). A worker that has
-  handed back is idle, not dead.
+  respawn (§ Spawn). A worker that has handed back is idle, not dead.
 
 ## Spawn
 
@@ -253,10 +251,9 @@ the worker may still be resumed, park its worktree first
 Workers bring you the decisions they may not make. Apply the document where one settles the
 question. Ask the maintainer where it is theirs, once per batch where a standing answer makes
 sense, and quote the answer in the record. Decide a question that no document reserves to the
-maintainer and whose recommendation you share, and tell the maintainer in one line
-(§ Reporting to the maintainer).
-Only a split recommendation, a major design decision, or a case with no clearly best option
-waits for the maintainer.
+maintainer and whose recommendation you share, and tell the maintainer in one line (§ Reporting
+to the maintainer). Only a split recommendation, a major design decision, or a case with no
+clearly best option waits for the maintainer.
 
 - **`NON-BLOCKING ISSUES ONLY`.** The worker records the surface findings first. The standing
   default, until the maintainer sets another for the batch: a `should` finding takes one fix

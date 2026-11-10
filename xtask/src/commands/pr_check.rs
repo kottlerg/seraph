@@ -358,7 +358,7 @@ pub fn parse_log(log: &str) -> Vec<Commit>
 
 /// Whether the raw commit object `object` (`git cat-file commit`) carries a
 /// signature: a `gpgsig` header before the blank line that ends the headers.
-/// Both OpenPGP and SSH signatures are stored under that header.
+/// Both `OpenPGP` and SSH signatures are stored under that header.
 pub fn has_signature(object: &str) -> bool
 {
     object
@@ -508,7 +508,7 @@ fn comment_marker(path: &str) -> Option<&'static str>
 pub fn non_comment_changes(diff: &str) -> Vec<String>
 {
     let mut out = Vec::new();
-    let mut path = String::new();
+    let mut path = "";
     // File headers (`---`, `+++`) appear between a `diff --git` line and the
     // file's first hunk. Inside a hunk the same prefixes are changed lines.
     let mut in_hunk = false;
@@ -519,10 +519,7 @@ pub fn non_comment_changes(diff: &str) -> Vec<String>
             in_hunk = false;
             // `a/<path> b/<path>`: a binary or mode-only change has no
             // `---`/`+++` header to name the file.
-            path = rest
-                .rsplit_once(" b/")
-                .map_or(rest, |(_, new)| new)
-                .to_owned();
+            path = rest.rsplit_once(" b/").map_or(rest, |(_, new)| new);
             continue;
         }
         if line.starts_with("@@")
@@ -534,11 +531,11 @@ pub fn non_comment_changes(diff: &str) -> Vec<String>
         {
             if let Some(rest) = line.strip_prefix("--- a/")
             {
-                path = rest.to_owned();
+                path = rest;
             }
             else if let Some(rest) = line.strip_prefix("+++ b/")
             {
-                path = rest.to_owned();
+                path = rest;
             }
             else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch")
             {
@@ -556,7 +553,7 @@ pub fn non_comment_changes(diff: &str) -> Vec<String>
             continue;
         };
         let text = text.trim();
-        let comment = text.is_empty() || comment_marker(&path).is_some_and(|m| text.starts_with(m));
+        let comment = text.is_empty() || comment_marker(path).is_some_and(|m| text.starts_with(m));
         if !comment
         {
             out.push(format!("{path}: {text}"));

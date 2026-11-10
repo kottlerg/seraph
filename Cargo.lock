@@ -1816,6 +1816,7 @@ dependencies = [
  "logd-codec",
  "object",
  "regex",
+ "serde_json",
  "uuid",
  "which",
  "windows-sys 0.59.0",

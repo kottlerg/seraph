@@ -16,12 +16,14 @@ xtask/
 │   ├── main.rs                 # Entry point; dispatches CliCommand
 │   ├── cli.rs                  # Clap derive structs for every subcommand
 │   ├── context.rs              # Resolved workspace and build-output paths
+│   ├── diag.rs                 # Diagnostics of the pull-request, record, and Issue checks
 │   ├── arch.rs                 # Supported architectures and per-arch constants
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
 │   ├── bundle.rs               # Bootloader bundle composition (MODULES table)
 │   ├── disk.rs                 # GPT disk-image construction from the sysroot
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
+│   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
@@ -32,7 +34,8 @@ xtask/
 │   ├── commands/               # One module per subcommand (build, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, test_kaslr, test_logd_reclaim, test_map_redo,
-│   │                           #   test_terminal, test_vmgenid, lint_docs)
+│   │                           #   test_terminal, test_vmgenid, lint_docs, pr_check,
+│   │                           #   review, issue)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -727,6 +730,153 @@ The lint treats as authoritative every tracked `.md` except the root `README.md`
 defines, with the release-notes exception of § Backlinks and Change Propagation. Warning-level
 rules are reported and counted but do not fail the command; `md-bare-cite` is one because its
 pattern also matches legitimate prose.
+
+---
+
+### `cargo xtask commit-check`
+
+Check the commits of a range against [docs/conventions.md](../docs/conventions.md)
+§ Commit Messages and § Commit and PR cross-references. Runs in CI's `host-tests` job on a pull
+request ([docs/build-system.md](../docs/build-system.md) § Continuous Integration).
+
+```
+cargo xtask commit-check [--base <ref>] [--head <ref>] [--strict]
+```
+
+The range is `<base>..<head>`, by default `origin/master..HEAD`. Each finding prints as
+`<level> <rule>: <commit>: <message>`. An error fails the command; a warning fails it only under
+`--strict`. The warnings are that section's SHOULD rules, a departure from which the maintainer
+may accept, and one rule a script cannot decide alone.
+
+| Rule | Level | Check |
+|---|---|---|
+| `commit-subject-form` | error | The subject is `<scope>: <summary>`. |
+| `commit-subject-ref` | error | The subject carries no Issue reference (`#N`, `<owner>/<repo>#N`, or the Issue's URL). |
+| `commit-closing-keyword` | error | No closing keyword directly before an Issue reference, in the subject or the body. |
+| `commit-attribution` | error | No tool attribution line and no link to an assistant session. |
+| `commit-emoji` | error | No emoji. |
+| `commit-unsigned` | error | The commit is signed (git's `%G?` is not `N`). |
+| `commit-subject-columns` | warning | The subject is at most 72 columns. |
+| `commit-body-columns` | warning | No body line that wrapping could shorten is over 72 columns (a line with no space, or indented four columns, is left alone). |
+| `commit-planning-label` | warning | The subject carries no `step N`, `phase N`, `tier N`, `stage N`, or `round N`; the name of a step a document defines permanently is not a label, which is why this is a warning. |
+
+A merge commit is exempt from the subject rules, as § Commit Messages says; the other rules apply
+to it.
+
+### `cargo xtask pr-check`
+
+Check a pull request against the rules of [docs/conventions.md](../docs/conventions.md) that a
+script can decide. It reads GitHub through the `gh` CLI, which must be installed and
+authenticated, and the PR's head must be in the clone (`git fetch origin`).
+
+```
+cargo xtask pr-check <N> [--gate] [--strict]
+```
+
+It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`), then:
+
+| Rule | Level | Check |
+|---|---|---|
+| `pr-unticked-box` | error | The body has no `- [ ]` (§ PR-body checklist discipline). |
+| `pr-attribution` | error | The body carries no tool attribution line and no session link. |
+| `pr-validation` | error | The body has a `## Validation` section that names a validated head. |
+| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch, the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). |
+| `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
+| `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Follow-up Issues). |
+| `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
+| `issue-milestone` | error | Every Issue the PR closes carries the current milestone, the lowest-versioned open one. |
+| `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
+
+The command prints the Issues the body and the commits close and the ones the body references,
+so that a keyword in prose that closes an Issue by accident is seen.
+
+`--gate` adds the merge gate of § Pre-merge review and implies `--strict`:
+
+| Rule | Level | Check |
+|---|---|---|
+| `gate-merge-state` | error | GitHub reports the merge state `CLEAN`. |
+| `gate-checks` | error | Every check of the rollup has succeeded. |
+| `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
+| `gate-review-record` | error | `target/xtask/review/pr<N>/` holds a well-formed run record for the PR head with `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. |
+| `gate-findings-recorded` | warning | That record leaves no finding on the surface. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each is recorded and none is contested; the command cannot. |
+
+The command does not judge what needs a reader: whether the body's claims match the diff, whether
+an acceptance item is delivered, and which local host runs the change owes. Those stay with the
+pre-merge review's audit.
+
+### `cargo xtask review-check`
+
+Validate the saved run records of a pull request's pre-merge review.
+
+```
+cargo xtask review-check <N>
+```
+
+A run record is `target/xtask/review/pr<N>/<mode>-<head>.json`, or `<mode>-<head>-<n>.json` for a
+further run at the same head, where `<mode>` is `full`, `delta`, or `audit` and `<head>` is the
+head the run reviewed. It is one JSON object:
+
+| Key | Value |
+|---|---|
+| `verdict` | The reviewer verdict: `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, or `BLOCKING ISSUES`. In an `audit` record, the reviewer verdict the audit states. |
+| `audit_verdict` | `AUDIT PASS` or `AUDIT FAIL`. |
+| `audit` | `verdict` (as `audit_verdict`) and `sections`, a list of objects with `name`, `verdict`, and `items`. |
+| `findings` | The findings on the review surface. In an `audit` record, those of the last run with the reviewer that the delta leaves unfixed. |
+| `recorded` | The findings off the surface. |
+| `ledgered` | The findings the reviewer listed as held by the ledger. |
+| `dropped` | Findings dropped as false. |
+| `stats` | `mode` (as in the file name), `head` (the full hash), `since` (the head the previous run with the reviewer reviewed, or null), and `failed` (the agents that returned no result). |
+
+Each finding is an object with `file`, `line`, `class` (`correctness`, `safety`, `contract`,
+`standards`, `doc-drift`, `coverage`, or `style`), `bucket` (`critical`, `should`, or `nit`),
+`must_violation` (a boolean), `status` (`unverified`, `nit`, or `contested`), `issue`, `claim`,
+and `fix`. The command reports each departure as `error record-shape` or, for a file name that
+does not state its record's mode and head, `error record-name`.
+
+### `cargo xtask review-ledger`
+
+Build the ledger of a pull request's review: the findings a later run of the same PR must not
+re-raise ([docs/conventions.md](../docs/conventions.md) § Ledger).
+
+```
+cargo xtask review-ledger <N>
+```
+
+It reads every run record of `target/xtask/review/pr<N>/` and writes `ledger.json` beside them:
+a sorted list without duplicates of each record's `recorded` and `dropped` findings, its
+`contested` findings, and, when its verdict is `NON-BLOCKING ISSUES ONLY`, all its `findings`.
+Each entry carries the finding's fields and `run`, the first eight digits of the head of the run
+that reported it.
+
+### `cargo xtask issue-edit`
+
+Replace a GitHub Issue's body from a file, with the checks that keep a wrong file from
+destroying it.
+
+```
+cargo xtask issue-edit <N> --body-file <path> [--allow-removal]
+```
+
+The command refuses an empty body, and a body with fewer task-list items than the Issue has
+unless `--allow-removal` is given (an edit that drops items on purpose, as
+[docs/conventions.md](../docs/conventions.md) § Acceptance checklist discipline allows). It
+writes the previous body to `target/xtask/issue-backup/<N>-<time>.md`, edits the Issue, reads
+it back, and restores the previous body when what GitHub holds is not what the file holds.
+
+### `cargo xtask issue-file`
+
+File a GitHub Issue with the labels and milestone
+[docs/conventions.md](../docs/conventions.md) § Labels and § Milestones require.
+
+```
+cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
+    (--milestone <title> | --unscheduled)
+```
+
+The command refuses a filing without a class label, without a subsystem label, or without a
+milestone decision (`--unscheduled` is for future-state work no release has scheduled). After
+filing it reads the Issue back and fails when a label or the milestone was not applied, naming
+what is missing.
 
 ---
 

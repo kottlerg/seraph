@@ -29,9 +29,11 @@ mod bundle;
 mod cli;
 mod commands;
 mod context;
+mod diag;
 mod disk;
 mod firmware;
 mod fs_compat;
+mod gh;
 mod qemu;
 mod qmp;
 mod rust_src;
@@ -83,6 +85,12 @@ fn main()
         CliCommand::TestLogdReclaim(args) => commands::test_logd_reclaim::run(&ctx, args),
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
+        CliCommand::CommitCheck(args) => commands::pr_check::run_commit_check(&ctx, args),
+        CliCommand::PrCheck(args) => commands::pr_check::run_pr_check(&ctx, args),
+        CliCommand::ReviewCheck(args) => commands::review::run_check(&ctx, args),
+        CliCommand::ReviewLedger(args) => commands::review::run_ledger(&ctx, args),
+        CliCommand::IssueEdit(args) => commands::issue::run_edit(&ctx, args),
+        CliCommand::IssueFile(args) => commands::issue::run_file(&ctx, args),
     };
 
     if let Err(err) = result

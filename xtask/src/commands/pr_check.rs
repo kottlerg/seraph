@@ -574,11 +574,11 @@ fn read_header<'a>(line: &'a str, path: &mut &'a str, out: &mut Vec<String>)
 /// PR adds or deletes the file at both heads with different modes.
 const FILE_MODE: &[&str] = &["new file mode ", "deleted file mode "];
 
-/// One change of a unified diff: its file, and the changed line with its
-/// sign (`+` or `-`) or a header that is a change of its own (a binary or a
-/// mode change), with `code` set when the change counts on its own: not for
-/// a comment line, and not for the mode header of an added or a deleted file
-/// (`FILE_MODE`).
+/// One change of a unified diff: its file, and either the changed line with
+/// its sign (`+` or `-`) or a header line (a binary change, a mode change, or
+/// the mode header of an added or a deleted file). `code` is set for every
+/// change except a comment line and the mode header of an added or a deleted
+/// file (`FILE_MODE`), which is judged by the file's lines.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Change
 {
@@ -2133,19 +2133,12 @@ mod tests
         // the other `deleted file mode`, which is no change of mode.
         let repo = Repo::new("sync-add-delete");
         let validated = repo.commit("e.rs", "// notes\n");
-        repo.git(&["checkout", "-q", "master"]);
-        std::fs::write(repo.root.join("e.rs"), "// base\n").unwrap();
-        repo.git(&["add", "e.rs"]);
-        repo.git(&["commit", "-q", "-m", "test: e.rs on master"]);
-        repo.git(&["checkout", "-q", "pr"]);
+        repo.on_master("e.rs", "// base\n");
         repo.merge_master(&[("e.rs", "// notes\n")]);
         repo.git(&["rm", "-q", "e.rs"]);
         repo.git(&["commit", "-q", "-m", "test: drop e.rs"]);
         let found = repo.check(&validated, "; later commits are comment-only.");
-        assert!(
-            found.iter().all(|d| !d.message.contains("file mode")),
-            "{found:?}"
-        );
+        assert_eq!(rules(&found), ["pr-validated-sync"], "{found:?}");
     }
 
     #[test]

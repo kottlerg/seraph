@@ -921,7 +921,7 @@ fails the gate.
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
 | `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
-| `gate-findings-recorded` | warning | That record leaves no finding on the surface that an Issue must record: one of a class other than `style`, or a MUST violation (§ Recording findings). After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each such finding is recorded and none is contested; the command cannot. |
+| `gate-findings-recorded` | warning | That record leaves no finding on the surface that needs a reader: one an Issue must record (a class other than `style`, or a MUST violation; § Recording findings), or one of any class whose `status` is `contested`. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each counted finding is recorded and none is contested; the command cannot. |
 
 The command does not judge what needs a reader: whether the body's claims match the diff, whether
 an acceptance item is delivered, and which local host runs the change owes. Those stay with the
@@ -944,7 +944,7 @@ one JSON object:
 | Key | Value |
 |---|---|
 | `verdict` | The reviewer verdict: `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, or `BLOCKING ISSUES`. In an `audit` record, the reviewer verdict the audit states. |
-| `audit_verdict` | `AUDIT PASS` or `AUDIT FAIL`; in a `full` or `delta` record of the reviewer alone, run while an owed host run is unreported, `NOT RUN`. |
+| `audit_verdict` | `AUDIT PASS` or `AUDIT FAIL`; in a `full` or `delta` record of the reviewer alone, run while the PR body reports a run as pending, `NOT RUN`. |
 | `audit` | `verdict` (as `audit_verdict`) and `sections`, a list of objects with `name`, `verdict`, and `items`; `null` in a record of the reviewer alone. |
 | `findings` | The findings on the review surface. In an `audit` record, those of the last run with the reviewer that the delta leaves unfixed. |
 | `recorded` | The findings off the surface. |

@@ -21,15 +21,9 @@
 //! hardware) can stand in for it, so the consumer never learns the
 //! transport.
 
-// cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
-// are lossless. Narrower casts split a device address into the halves the
-// transport's 32-bit registers take.
-#![allow(clippy::cast_possible_truncation)]
-
-use core::sync::atomic::{AtomicU64, Ordering};
 use ipc::{IpcMessage, devmgr_labels, memmgr_errors, memmgr_labels, serial_errors, serial_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
 use virtio_console::RxQueue;
@@ -50,13 +44,17 @@ const TX_QUEUE: u16 = 1;
 /// long, together one DMA page. A power of two, as the queue size must be;
 /// the queue takes fewer when the device offers fewer.
 const RX_BUFFERS: u16 = 8;
-/// Bytes per receive buffer: one read reply's worth.
-const RX_BUFFER_BYTES: usize = 512;
-const _: () = assert!(RX_BUFFERS as usize * RX_BUFFER_BYTES <= PAGE_SIZE as usize);
+/// Bytes per receive buffer, as the descriptor's length field takes it: one
+/// read reply's worth.
+const RX_BUFFER_LEN: u32 = 512;
+/// [`RX_BUFFER_LEN`] as a byte count.
+const RX_BUFFER_BYTES: usize = RX_BUFFER_LEN as usize;
+const _: () = assert!(RX_BUFFERS as u64 * RX_BUFFER_LEN as u64 <= PAGE_SIZE);
 
 /// The most bytes one serial-protocol message carries in either direction:
 /// `MSG_DATA_WORDS_MAX` words of 8 bytes.
-const MAX_MESSAGE_BYTES: usize = 512;
+const MAX_MESSAGE_BYTES: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
+const _: () = assert!(RX_BUFFER_BYTES == MAX_MESSAGE_BYTES);
 
 /// The transmit queue's size: one write is in flight at a time.
 const TX_QUEUE_SIZE: u16 = 1;
@@ -196,10 +194,12 @@ fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     {
         fail("QUERY_DEVICE_INFO reply truncated (header)");
     }
-    let kind = words[0] as u32;
-    let version = words[1] as u32;
-    let byte_len = words[2] as usize;
-    if kind != ipc::device_info_kind::VIRTIO_PCI || version != virtio_core::VIRTIO_PCI_INFO_VERSION
+    // A word past the field's width is a mismatch, not a value to truncate.
+    let kind = u32::try_from(words[0]).ok();
+    let version = u32::try_from(words[1]).ok();
+    let byte_len = usize::try_from(words[2]).unwrap_or(usize::MAX);
+    if kind != Some(ipc::device_info_kind::VIRTIO_PCI)
+        || version != Some(virtio_core::VIRTIO_PCI_INFO_VERSION)
     {
         fail("QUERY_DEVICE_INFO reply kind/version mismatch");
     }
@@ -270,6 +270,12 @@ fn dma_pages(caps: &DriverCaps, pages: u64, what: &str, ipc_buf: *mut u64) -> Dm
         syscall::thread_exit();
     };
     let va = range.va_start();
+    let Ok(bytes) = usize::try_from(pages * PAGE_SIZE)
+    else
+    {
+        std::os::seraph::log!("{}: {} pages past the address width", what, pages);
+        syscall::thread_exit();
+    };
     // SAFETY: `range` is a fresh reservation from the per-process arena,
     // owned here for the mapping's life: VA no Rust object or IPC page
     // occupies.
@@ -290,7 +296,7 @@ fn dma_pages(caps: &DriverCaps, pages: u64, what: &str, ipc_buf: *mut u64) -> Dm
     }
     // SAFETY: va is mapped writable, pages * PAGE_SIZE bytes.
     unsafe {
-        core::ptr::write_bytes(va as *mut u8, 0, (pages * PAGE_SIZE) as usize);
+        core::ptr::write_bytes(va as *mut u8, 0, bytes);
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let addr = unsafe {
@@ -332,6 +338,23 @@ fn init_device(transport: &PciTransport)
     }
 }
 
+/// The low 32 bits of a device address, for a transport register that takes
+/// the address in halves.
+// cast_possible_truncation: keeping the low half is the point; the high half
+// goes to the register's pair through `high_half`.
+#[allow(clippy::cast_possible_truncation)]
+fn low_half(addr: u64) -> u32
+{
+    addr as u32
+}
+
+/// The high 32 bits of a device address ([`low_half`]'s pair).
+fn high_half(addr: u64) -> u32
+{
+    // The shift leaves at most 32 bits, so the conversion cannot fail.
+    u32::try_from(addr >> 32).unwrap_or(0)
+}
+
 /// One virtqueue: its ring and its doorbell.
 struct Queue
 {
@@ -364,12 +387,12 @@ fn setup_queue(
         rings.addr + avail_off,
         rings.addr + used_off,
     );
-    transport.queue_set_desc_lo(desc as u32);
-    transport.queue_set_desc_hi((desc >> 32) as u32);
-    transport.queue_set_avail_lo(avail as u32);
-    transport.queue_set_avail_hi((avail >> 32) as u32);
-    transport.queue_set_used_lo(used as u32);
-    transport.queue_set_used_hi((used >> 32) as u32);
+    transport.queue_set_desc_lo(low_half(desc));
+    transport.queue_set_desc_hi(high_half(desc));
+    transport.queue_set_avail_lo(low_half(avail));
+    transport.queue_set_avail_hi(high_half(avail));
+    transport.queue_set_used_lo(low_half(used));
+    transport.queue_set_used_hi(high_half(used));
     transport.queue_set_ready(1);
 
     let notify_off = transport.queue_notify_off();
@@ -422,7 +445,7 @@ struct Console
     /// The IRQ cap; 0 when devmgr delivered none.
     irq_cap: u64,
     /// The client's RX notification, shared with the interrupt-service thread.
-    rx_notify: Arc<AtomicU64>,
+    rx_notify: Arc<Mutex<u64>>,
 }
 
 impl Console
@@ -431,10 +454,7 @@ impl Console
     fn post_rx(&mut self, slot: u16)
     {
         let addr = self.rx_buffers.addr + u64::from(slot) * RX_BUFFER_BYTES as u64;
-        if let Some(head) = self
-            .rx
-            .vq
-            .add_chain(&[(addr, RX_BUFFER_BYTES as u32, true)])
+        if let Some(head) = self.rx.vq.add_chain(&[(addr, RX_BUFFER_LEN, true)])
         {
             self.rx_slot_for_head[usize::from(head)] = slot;
         }
@@ -461,7 +481,7 @@ impl Console
             let slot = self.rx_slot_for_head[usize::from(head)];
             let base = self.rx_buffers.va + u64::from(slot) * RX_BUFFER_BYTES as u64;
             // The length is device-written: clamp it to the buffer.
-            let len = (len as usize).min(RX_BUFFER_BYTES);
+            let len = usize::try_from(len).map_or(RX_BUFFER_BYTES, |l| l.min(RX_BUFFER_BYTES));
             // SAFETY: the buffer lies inside the mapped receive page
             // (slot < RX_BUFFERS, and the page holds RX_BUFFERS buffers); the
             // device has returned it, and poll_used's acquire fence ordered
@@ -488,6 +508,8 @@ impl Console
             return;
         }
         let n = bytes.len().min(MAX_MESSAGE_BYTES);
+        // At most MAX_MESSAGE_BYTES, so the conversion cannot fail.
+        let len = u32::try_from(n).unwrap_or(0);
         // SAFETY: the transmit page is mapped writable for the driver's life
         // and holds MAX_MESSAGE_BYTES; no transmission is in flight, since
         // the previous write waited for its completion, so the device is not
@@ -495,10 +517,7 @@ impl Console
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.tx_buffer.va as *mut u8, n);
         }
-        let Some(head) = self
-            .tx
-            .vq
-            .add_chain(&[(self.tx_buffer.addr, n as u32, false)])
+        let Some(head) = self.tx.vq.add_chain(&[(self.tx_buffer.addr, len, false)])
         else
         {
             return;
@@ -521,11 +540,19 @@ impl Console
         }
     }
 
-    /// Serve one request.
+    /// Serve one request. Every cap the request carries and the driver does
+    /// not keep (all of them but an accepted RX notification) is deleted
+    /// before the reply, so no request leaves a slot taken.
     fn handle(&mut self, msg: &IpcMessage, ipc_buf: *mut u64)
     {
         let op = msg.label & 0xFFFF;
-        let reply = if !virtio_console::authorized(msg.label, msg.badge)
+        let authorized = virtio_console::authorized(msg.label, msg.badge);
+        let kept = usize::from(authorized && op == serial_labels::SERIAL_REGISTER_RX_NOTIFY);
+        for &cap in msg.caps().iter().skip(kept)
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        let reply = if !authorized
         {
             IpcMessage::new(serial_errors::UNAUTHORIZED)
         }
@@ -533,7 +560,7 @@ impl Console
         {
             // The mask bounds the length to 16 bits; it clamps to the bytes
             // the message carries.
-            let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
+            let byte_len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
             let bytes = msg.data_bytes();
             self.write(&bytes[..byte_len.min(bytes.len())]);
             IpcMessage::new(serial_errors::SUCCESS)
@@ -576,7 +603,13 @@ impl Console
             }
             return IpcMessage::new(serial_errors::REGISTER_FAILED);
         }
-        let old = self.rx_notify.swap(notification, Ordering::AcqRel);
+        // The lock is held across the delete, so the interrupt-service thread
+        // never sends on the old cap's slot once it is deleted or reused.
+        let mut client = self
+            .rx_notify
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let old = core::mem::replace(&mut *client, notification);
         if old != 0
         {
             let _ = syscall::cap_delete(old);
@@ -596,7 +629,7 @@ fn serve_interrupts(
     irq_notification: u64,
     irq_cap: u64,
     wake: u64,
-    rx_notify: &AtomicU64,
+    rx_notify: &Mutex<u64>,
 ) -> !
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(isr_diag);
@@ -627,10 +660,12 @@ fn serve_interrupts(
         if step.signal
         {
             let _ = syscall::notification_send(wake, 1);
-            let client = rx_notify.load(Ordering::Acquire);
-            if client != 0
+            // Sent under the lock, so a registration cannot delete the cap
+            // between the read of its slot and the send.
+            let client = rx_notify.lock().unwrap_or_else(PoisonError::into_inner);
+            if *client != 0
             {
-                let _ = syscall::notification_send(client, 1);
+                let _ = syscall::notification_send(*client, 1);
             }
         }
     }
@@ -683,7 +718,7 @@ fn start_interrupts(
     window_va: u64,
     layout: &RegisterLayout,
     wake: u64,
-    rx_notify: &Arc<AtomicU64>,
+    rx_notify: &Arc<Mutex<u64>>,
 )
 {
     let irq_cap = caps.irq_slot;
@@ -769,7 +804,7 @@ fn main() -> !
     {
         fail("failed to create notification");
     };
-    let rx_notify = Arc::new(AtomicU64::new(0));
+    let rx_notify = Arc::new(Mutex::new(0));
 
     let mut console = Console {
         transport,

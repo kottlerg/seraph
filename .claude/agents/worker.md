@@ -244,9 +244,12 @@ Orchestrated:
 - Run every build and boot under `nice -n 10` where the platform has it.
 - Sync onto `master` only when the orchestrator says `master quiet`, right before the validation
   runs. A sync is a merge of `master`, never a rebase; its subject is
-  `<scope>: merge master into the <kind> branch`, `<kind>` being the branch's prefix. A sync that
-  brings non-comment code re-owes the validation set; a Markdown-only or comment-only sync owes
-  nothing; the gate needs the head to include `master` either way.
+  `<scope>: merge master into the <kind> branch`, `<kind>` being the branch's prefix.
+  docs/conventions.md § Syncing with `master` says what a sync owes: green CI on the synced
+  head always, and the validation set and a run with the reviewer again only when the incoming
+  diff touches a file your PR touches or the merge has a conflict. Otherwise the validated head
+  stands, and the body says that the incoming diff touches none of the PR's files. The gate
+  needs the head to include `master` either way.
 
 Standalone, there is no grant: the launch checks are the whole protocol, and you sync yourself
 before the validation runs.

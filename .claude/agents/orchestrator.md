@@ -107,9 +107,11 @@ Keep your own reads out of your context the same way:
    Classify: follow-up and defect lists (drain scopes), single defects (group by the surface
    they touch, two to seven per PR), design and feature Issues (the maintainer's unless the
    batch names them). The maintainer names the batch's goal; you name the scopes.
-2. Size the wave at four to six PRs in flight. Each merge makes every open PR re-sync, and a
-   sync that brings non-comment code re-owes that PR's validation set, so more parallelism than
-   that costs more host time than it saves.
+2. Size the wave at four to six PRs in flight, on scopes whose files do not overlap. Each
+   merge makes every open PR re-sync. A sync owes green CI, and it re-owes a PR's validation
+   set and a reviewer run only when the incoming diff touches a file that PR touches
+   (docs/conventions.md § Syncing with `master`), so two PRs on the same files cost more in
+   parallel than in sequence.
 3. Start the record with `cargo xtask orch start --goal "<the batch's goal>"`; a goal the
    maintainer gave in more than one line of 300 characters goes into `--goal` as a one-line
    summary and whole into the answers file described below. The record is the files under
@@ -244,13 +246,14 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
 
 Then merge with `gh pr merge <N> --merge --delete-branch`, and tell the maintainer in a line
 (§ Reporting to the maintainer). Fast-forward your own checkout, record the merge, and
-tell every open PR's worker what moved and whether the delta is Markdown-only. That message is
+tell every open PR's worker what moved and which files the merge touched. That message is
 information: `master quiet` is the only instruction to sync.
 
-Order merges to minimize re-validation. Hold a PR at its gate whenever merging it now would
-force more re-validations across the open PRs than merging it later. A PR whose merge touches
-only Markdown or comments costs the others nothing; among code PRs, merge first the one whose
-later syncs the others have not validated yet.
+Order merges to minimize re-validation. A PR whose merge touches only Markdown or comments, or
+no file another open PR touches, costs the others a CI run and nothing else, so merge it as
+soon as its gate passes. Hold a PR at its gate only when its merge touches files another open
+PR touches and merging it later would force fewer re-validations; among such PRs, merge first
+the one whose later syncs the others have not validated yet.
 
 `--delete-branch` removes the remote branch, and a worker whose worktree sits on it may not be
 resumable afterwards. Before merging a worker's last PR, make sure nothing is left for it. If a

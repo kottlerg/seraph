@@ -28,7 +28,7 @@ Read `.claude/agents/worker.md` and follow it in **standalone** mode, with these
   follow-up Issue of a scope that has none without asking, any other with the maintainer's
   approval in the conversation.
 - Sync onto `master` yourself right before the validation run, and again if `master` moves
-  before the gate. A Markdown-only or comment-only sync owes nothing.
+  before the gate. docs/conventions.md § Syncing with `master` says what each sync owes.
 - The worker file is a file this session read, not its system prompt, so a compaction drops it.
   After one, read `.claude/agents/worker.md` again before the next step, and take the state of
   the work from the PR body and the branch, not from the summary.

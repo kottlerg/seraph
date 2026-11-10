@@ -291,13 +291,15 @@ A fix round MAY be followed by an auditor-only run, the closure audit alone, whe
 
 - the last run with the reviewer completed with no failed agent;
 - the round's delta (from the head that run reviewed to the new head) is documentation or
-  comments only, as [testing.md](testing.md#coverage-tiers) § Coverage tiers defines it, and
-  merges no `master` into the branch.
+  comments only, as [testing.md](testing.md#coverage-tiers) § Coverage tiers defines it, apart
+  from the incoming diff of a sync that owes no run with the reviewer (§ Syncing with
+  `master`).
 
 The audit checks the PR body's claims, the recording of findings, the validated head, and the
 closing conditions at the new head. Since no code read covers a changed comment or document in
-that run, it owes a contract-drift check: every comment or document statement the delta changes
-is compared against the code it describes, and one the code contradicts is a FAIL. It reads that
+that run, it owes a contract-drift check: every comment or document statement the PR's own
+change in the delta alters is compared against the code it describes, and one the code
+contradicts is a FAIL. It reads that
 last run's record, confirms that the delta delivers each fix the round claims, and fails a
 finding that run left on the surface that is neither fixed by the delta nor recorded
 (§ Recording findings).
@@ -307,8 +309,26 @@ delta's fixes. It is `READY TO MERGE` when the delta fixes every finding that ru
 surface, `NON-BLOCKING ISSUES ONLY` when every finding it leaves there is non-blocking and
 recorded, and `BLOCKING ISSUES` otherwise.
 
-Any later delta that changes anything but documentation or comments, or that merges `master`
-into the branch, takes a run with the reviewer.
+Any later delta that changes anything but documentation or comments, or that holds a sync
+owing a run with the reviewer, takes a run with the reviewer.
+
+### Syncing with `master`
+
+A PR's head MUST contain `master` when it merges (§ Branch protection). A sync is a merge of
+`master` into the PR's branch, and its incoming diff is what that merge brings in: the diff
+from the PR's merge base with `master` before the sync to its merge base after it.
+
+- Every sync owes a passing CI run on the synced head, which builds and boots both
+  architectures there.
+- A sync whose incoming diff touches a file the PR's own diff touches, or whose merge resolves
+  a conflict, also owes the PR's own validation again at the synced head (the builds and boots
+  its `## Test plan` reports) and a run with the reviewer over the sync.
+- Any other sync owes nothing more. The validated head before it stands, and the PR body's
+  `## Validation` section states that the incoming diff touches none of the PR's files.
+
+The local host runs of [testing.md](testing.md#coverage-tiers) § Coverage tiers keep their own
+rule (When the runs are owed): a sync that leaves the PR's own changes to a run's surface as
+they were owes no such run again.
 
 ### Review surface
 
@@ -444,7 +464,9 @@ gives the PR-level linear view.
 - Edit via `gh pr edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI.
 - Every PR body MUST state the validated head in its `## Validation`
   section; for a documentation-only or comment-only delta since that head,
-  it MUST say so (see [testing.md](testing.md#coverage-tiers)).
+  it MUST say so (see [testing.md](testing.md#coverage-tiers)), and for a
+  sync since that head that leaves it standing, it MUST say that the
+  incoming diff touches none of the PR's files (§ Syncing with `master`).
 - Every PR body MUST report, in its `## Validation` section, each local host
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes (each
   boundary run, the memory variation, and each device cell: the storage cells,

@@ -113,8 +113,9 @@ copy in the same push.
 
 Once the fixes are pushed and CI is green again, run a `delta` run, or the auditor-only run when
 § Auditor-only run allows it. Any later delta that changes anything but documentation or
-comments, or that merges `master` in, takes a run with the reviewer, its `since` the head of the
-last run with the reviewer.
+comments, or that holds a sync owing a reviewer run (docs/conventions.md § Syncing with
+`master`), takes a run with the reviewer, its `since` the head of the last run with the
+reviewer.
 
 ## The merge condition
 

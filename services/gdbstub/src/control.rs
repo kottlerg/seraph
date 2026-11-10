@@ -57,11 +57,15 @@ pub enum Credit
 /// Credit a stop whose badge names a thread that is already `held` or not,
 /// whose register file reads `regs_pc` (`None` when the read is refused, as
 /// it is for a thread that is neither stopped nor fault-blocked), carrying
-/// the instruction pointer `stop_ip` (data word 3 of the message).
+/// the instruction pointer `stop_ip` (data word 3 of the message). The
+/// thread is blocked at the stop's pointer, or at `set_back`, the
+/// breakpoint the stop reports a hit of ([`rewound_pc`]), where a restart
+/// set the thread's pointer while this delivery waited.
 #[must_use]
-pub fn credit(held: bool, regs_pc: Option<u64>, stop_ip: u64) -> Credit
+pub fn credit(held: bool, regs_pc: Option<u64>, stop_ip: u64, set_back: Option<u64>) -> Credit
 {
-    if !held && regs_pc == Some(stop_ip)
+    let at_stop = regs_pc.is_some_and(|pc| pc == stop_ip || Some(pc) == set_back);
+    if !held && at_stop
     {
         Credit::Own
     }
@@ -117,13 +121,19 @@ pub enum Unclaimed
     Restart,
     /// The new stop is the named thread's own and the held one is not: the
     /// held one, a new thread's credited to it, gives way, and is answered
-    /// with [`decline_label`]. Also the kernel's second delivery of a
-    /// reported held stop, which repeats it while the refresh bound no
-    /// thread (docs/fault-handling.md § Delivery, Resume, and Kill, Rebind).
-    Replace,
+    /// with [`decline_label`]; the new one is held in its place.
+    Adopt,
+    /// Both stops are the named thread's own: the new one is the kernel's
+    /// second delivery of the held one, which cancelled the first
+    /// (docs/fault-handling.md § Delivery, Resume, and Kill, Rebind). The
+    /// new one is held in its place, and the first answered with
+    /// `FAULT_REPLY_RESUME`, which its cancellation ignores.
+    Redelivered,
     /// Any other stop: a new thread's, cancelled by the refresh's bind, or
     /// one of a thread the stub cannot bind. It is answered with
-    /// [`decline_label`].
+    /// [`decline_label`]; the held stop stays as it is. A held breakpoint
+    /// hit or fault GDB has been told of is never answered here, so a
+    /// second delivery beside it is declined even when it repeats it.
     Decline,
 }
 
@@ -142,26 +152,30 @@ pub enum Named
 }
 
 /// Settle an unclaimed stop of origin `stop`, whose badge names a thread in
-/// state `named` holding a stop of origin `held` (any, for a free thread),
-/// after a refresh that `added` a thread or not; `repeats_held` when the
-/// stop's kind, detail, and pointer equal the held stop's.
+/// state `named` holding a stop of origin `held` (any, for a free thread).
 #[must_use]
-pub fn settle(
-    named: Named,
-    held: Origin,
-    stop: Origin,
-    added: bool,
-    repeats_held: bool,
-) -> Unclaimed
+pub fn settle(named: Named, held: Origin, stop: Origin) -> Unclaimed
 {
     match (named, held, stop)
     {
-        (Named::Free, ..) | (_, Origin::Own, Origin::Any) => Unclaimed::Decline,
-        (_, _, Origin::Own) => Unclaimed::Replace,
+        (Named::Free, ..)
+        | (_, Origin::Own, Origin::Any)
+        | (Named::Reported, Origin::Any, Origin::Any) => Unclaimed::Decline,
+        (_, Origin::Any, Origin::Own) => Unclaimed::Adopt,
+        (_, Origin::Own, Origin::Own) => Unclaimed::Redelivered,
         (Named::Unreported, Origin::Any, Origin::Any) => Unclaimed::Restart,
-        (Named::Reported, Origin::Any, Origin::Any) if !added && repeats_held => Unclaimed::Replace,
-        (Named::Reported, Origin::Any, Origin::Any) => Unclaimed::Decline,
     }
+}
+
+/// Whether a stop the refresh did not settle is credited again, to the
+/// thread now in its slot: when the refresh stored a new thread there (the
+/// slot's cap `before` the refresh differs from `after`), that thread copied
+/// the slot's badge from the exited spawner it replaces, so its bind, to
+/// the binding it already had, cancelled nothing, and its stop is live.
+#[must_use]
+pub fn credit_again(before: u64, after: Option<u64>) -> bool
+{
+    after.is_some_and(|cap| cap != before)
 }
 
 /// The reply to a stop no thread of the stub's table claims: an upcall or a
@@ -181,9 +195,10 @@ pub fn decline_label(kind: u64, detail: u64) -> u64
 }
 
 /// The slot of the stub's table a new thread takes: the first of an exited
-/// thread with no stop held, so the table stays within the service's
-/// `MAX_THREADS` of live threads however many the target spawns and joins;
-/// `None` to append. `slots` gives each slot's (exited, holds a stop).
+/// thread with no stop held, so the table stays within the session's
+/// [`MAX_THREADS`](crate::session::MAX_THREADS) of live threads however
+/// many the target spawns and joins; `None` to append. `slots` gives each
+/// slot's (exited, holds a stop).
 #[must_use]
 pub fn free_slot(slots: impl Iterator<Item = (bool, bool)>) -> Option<usize>
 {
@@ -316,10 +331,12 @@ mod tests
     #[test]
     fn a_stop_is_credited_only_to_a_free_thread_blocked_at_its_pointer()
     {
-        assert_eq!(credit(false, Some(0x40), 0x40), Credit::Own);
-        assert_eq!(credit(true, Some(0x40), 0x40), Credit::Unknown);
-        assert_eq!(credit(false, None, 0x40), Credit::Unknown);
-        assert_eq!(credit(false, Some(0x44), 0x40), Credit::Unknown);
+        assert_eq!(credit(false, Some(0x40), 0x40, None), Credit::Own);
+        assert_eq!(credit(true, Some(0x40), 0x40, None), Credit::Unknown);
+        assert_eq!(credit(false, None, 0x40, None), Credit::Unknown);
+        assert_eq!(credit(false, Some(0x44), 0x40, None), Credit::Unknown);
+        // A restart set the thread back to the breakpoint the stop reports.
+        assert_eq!(credit(false, Some(0x3f), 0x40, Some(0x3f)), Credit::Own);
     }
 
     // Defect caught: an x86-64 thread held at a breakpoint the stub does not
@@ -350,46 +367,34 @@ mod tests
     // held stop whose reply a refresh's bind cancelled kept for ever, when a
     // thread spawned after the attach stopped beside it under its badge; a
     // step's held #DB restarted, running one instruction too many; a
-    // reported thread restarted during a step.
+    // reported thread restarted during a step, or killed by a repeat of its
+    // stop from a thread the stub cannot bind.
     #[test]
     fn an_unclaimed_stop_restarts_only_an_unreported_repeatable_stop()
     {
         use Origin::{Any, Own};
-        assert_eq!(
-            settle(Named::Unreported, Any, Any, true, true),
-            Unclaimed::Restart
-        );
-        assert_eq!(
-            settle(Named::Unreported, Any, Any, false, false),
-            Unclaimed::Restart
-        );
+        assert_eq!(settle(Named::Unreported, Any, Any), Unclaimed::Restart);
         // A step's #DB, or an upcall, held: the new stop is another thread's.
-        assert_eq!(
-            settle(Named::Unreported, Own, Any, true, false),
-            Unclaimed::Decline
-        );
+        assert_eq!(settle(Named::Unreported, Own, Any), Unclaimed::Decline);
+        assert_eq!(settle(Named::Reported, Own, Any), Unclaimed::Decline);
         // The thread's own #DB or upcall arrives: the held stop was not its.
-        assert_eq!(
-            settle(Named::Unreported, Any, Own, true, false),
-            Unclaimed::Replace
-        );
-        assert_eq!(
-            settle(Named::Reported, Any, Any, false, true),
-            Unclaimed::Replace
-        );
-        // A new thread's stop beside a reported one: its bind cancelled it.
-        assert_eq!(
-            settle(Named::Reported, Any, Any, true, true),
-            Unclaimed::Decline
-        );
-        assert_eq!(
-            settle(Named::Reported, Any, Any, false, false),
-            Unclaimed::Decline
-        );
-        assert_eq!(
-            settle(Named::Free, Any, Any, true, false),
-            Unclaimed::Decline
-        );
+        assert_eq!(settle(Named::Unreported, Any, Own), Unclaimed::Adopt);
+        // Two of its own: the kernel delivered the held one again.
+        assert_eq!(settle(Named::Reported, Own, Own), Unclaimed::Redelivered);
+        // Beside a reported breakpoint hit or fault: never the held thread's.
+        assert_eq!(settle(Named::Reported, Any, Any), Unclaimed::Decline);
+        assert_eq!(settle(Named::Free, Any, Any), Unclaimed::Decline);
+    }
+
+    // Defect caught: a new thread stored in the slot of the exited spawner
+    // whose badge it copied, rebound to the same binding, had its live stop
+    // declined.
+    #[test]
+    fn a_stop_is_credited_again_only_to_a_new_occupant_of_its_slot()
+    {
+        assert!(credit_again(0x10, Some(0x20)));
+        assert!(!credit_again(0x10, Some(0x10)));
+        assert!(!credit_again(0x10, None));
     }
 
     // Defect caught: a fault no thread claims resumed, so it ran past a

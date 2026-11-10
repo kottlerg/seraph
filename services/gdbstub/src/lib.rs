@@ -6,15 +6,17 @@
 //! Host-testable logic of the GDB stub: the map between the kernel's
 //! register file and GDB's register block ([`regs`]), the inserted
 //! breakpoints ([`breakpoints`]), the run-control decisions ([`control`]),
-//! and the signal a stop reports ([`stop_signal`]). The service (`main.rs`)
-//! holds the target's threads, the debug port, and the fault receivers, and
-//! carries the decisions out.
+//! the stop state machine of an attached session ([`session`]), and the
+//! signal a stop reports ([`stop_signal`]). The service (`main.rs`) holds
+//! the debug port and the fault receivers, and implements the machine's
+//! [`session::Kernel`] with syscalls.
 
 #![no_std]
 
 pub mod breakpoints;
 pub mod control;
 pub mod regs;
+pub mod session;
 
 /// Why a single step could not be prepared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

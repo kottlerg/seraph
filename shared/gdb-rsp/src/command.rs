@@ -73,8 +73,12 @@ pub enum Resume
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VContAction
 {
+    /// What the action does.
     pub resume: Resume,
+    /// The signal a `C` or `S` action passes; `None` for `c`, `s`, and `t`.
     pub signal: Option<u8>,
+    /// The thread the action names; `None` for every thread no earlier
+    /// action named.
     pub thread: Option<ThreadId>,
 }
 

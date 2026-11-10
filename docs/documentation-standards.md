@@ -105,7 +105,7 @@ None
 ```
 
 **Exception — release notes.** The per-tag release notes under `docs/releases/`
-(`<tag>.md`) and the `docs/releases/TEMPLATE.md` skeleton they are copied from are
+(`<tag>.md`) and the `docs/releases/TEMPLATE.md` skeleton they are authored from are
 release records, not authoritative documents: they sit outside the hierarchy above,
 carry no content another document summarizes, and (for `<tag>.md`) change after their
 tag only through the procedure in [docs/releases/README.md](releases/README.md)

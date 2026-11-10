@@ -25,7 +25,9 @@ discipline below has been applied end-to-end.
    `gh pr view <N> --json headRefOid,baseRefName` and the base from
    `git merge-base <head> origin/<baseRefName>` (a supplied merge base and
    head take precedence); else `git diff <base>...HEAD` against the supplied
-   base, else `git diff master...HEAD`. Never `gh pr diff` or the `files`
+   base, else `git diff master...HEAD`; for a release candidate (the
+   `release-review` workflow names the previous release and the head),
+   `git diff <previous> <head>`. Never `gh pr diff` or the `files`
    field of `gh pr view`: GitHub caps them (300 files or 20000 lines for the
    diff, 100 files for the field).
 
@@ -59,14 +61,21 @@ discipline below has been applied end-to-end.
     (`jq` is available). Set `ledger` on a finding an entry already states
     when the hunk it anchors to is unchanged since the run the entry names
     (its `run` field; `git diff <run> <head> -- <file>` shows the change);
-    the workflow lists such a finding and does not count it. When that hunk
+    the run lists such a finding and does not count it. When that hunk
     changed, or `<run>` does not resolve in the clone, report the finding
     with `ledger` false, as a fresh finding.
 
-    A lens prompt (call sites, design documents, cross-boundary surfaces,
-    regression) names one concern over the whole diff instead of shard
-    files: apply steps 3 to 7 to what the lens names, report only within
-    that concern, and leave the rest to the shard reviewers.
+    A lens prompt names one concern over the whole diff (such as agreement
+    across the boundary, design documents, `unsafe` code, or regression)
+    instead of shard files: apply steps 3 to 7 to what the lens names,
+    report only within that concern, and leave the rest to the shard
+    reviewers.
+
+    A release review (the `release-review` workflow) names a release
+    candidate instead of a PR. It has no review surface and no PR body: the
+    prompt's shard or lens bounds what you report, the ledger it names holds
+    the findings the range's PRs and the release's earlier runs settled, and
+    its schema defines each field.
 
     When the parent supplies no open-Issue list, run
     `gh issue list --state open --limit 500 --json number,title` and read
@@ -110,8 +119,8 @@ discipline below has been applied end-to-end.
    anchor it to, per the criterion `docs/conventions.md` § Branch and PR
    Workflow states, so classify on that criterion, not on the track you
    want. Drift the surface definition excludes you still report, marked
-   out of bound; drift an open Issue already names you report with
-   `in_bound` judged as if no Issue named it and `issue` set. Both are
+   out of bound; drift an open Issue already names you report as on or off
+   the surface as if no Issue named it, naming that Issue. Both are
    recorded rather than fixed, never dropped. Same for system-scope design
    docs: if the diff silently contradicts one, the doc and the code now
    disagree, and that is a finding.
@@ -130,8 +139,7 @@ discipline below has been applied end-to-end.
    finding (it blocks when on the review surface, per `docs/conventions.md`
    § Branch and PR Workflow): bucket Critical, `must_violation` true,
    citing that section, class `standards` (`correctness` when the width
-   defect misbehaves at a CPU count up to `MAX_CPUS`), and `introduced` set
-   as the schema defines for the mode. Most PRs owe no boundary boot
+   defect misbehaves at a CPU count up to `MAX_CPUS`). Most PRs owe no boundary boot
    (`docs/testing.md` § Coverage tiers), so this check is the gate for that
    defect class; do not discount a finding because a boot at the boundary
    CPU counts would catch it.
@@ -171,9 +179,10 @@ per the tracks and the contract-versus-drift criterion `docs/conventions.md`
   for hiding distinct findings. In schema mode there is no collapsing:
   one entry per site.
 
-When invoked with a structured-output schema, fill it instead of the
-prose buckets: one entry per finding with `file` (repository-relative)
-and `line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
+When invoked with a structured-output schema (the `release-review`
+workflow), fill it instead of the prose buckets: one entry per finding,
+each field as the schema describes it, with `file` (repository-relative)
+and `line`, `bucket`, and `class` (`correctness`: wrong behaviour or logic;
 `safety`: memory, concurrency, or soundness, including a document's
 statement of a safety invariant that the code contradicts; `contract`: a
 caller, ABI, or documented promise broken, including a document's
@@ -182,26 +191,11 @@ contradicts; `standards`: a binding standard's rule; `doc-drift`: any
 other disagreement between a document and the code (a stale name, count,
 path, or cross-reference, or a summary out of step with its owner), per
 `docs/conventions.md` § Branch and PR Workflow; `coverage`: a missing
-test; `style`: readability and naming), whether the diff `introduced` it
-(in `delta` mode, whether the delta or the PR's own earlier commits
-did), whether it is a `must_violation` of a binding standard, whether a
-`ledger` entry the parent supplied already states it at a hunk unchanged
-since the run the entry names (its `run` field; false when that run does
-not resolve), whether it is `in_bound` (on the review surface
-`docs/conventions.md` § Branch and PR Workflow defines, judged as if no
-open Issue named the work; a correctness, soundness, safety, or contract
-defect in a touched file is; in a delta run, a standards, doc-drift,
-coverage, or style finding only when the delta or the PR's own earlier
-commits introduced it), the `issue` that names it when one does (the
-parent lists the open Issues; per `docs/conventions.md` § Branch and PR
-Workflow an Issue whose title is `<scope>: defects found by review`, or
-begins with the earlier `<scope>: defects found by PR #<N>'s review`, is
-a follow-up Issue, which names findings, not work: it takes nothing off
-the surface, so `issue` is never set to it, and a finding it already
-holds is flagged `ledger` only as step 2a says, and otherwise reported
-where the surface puts it), the `authority`, the `claim`, the
-`evidence`, and the `fix`. There is no final line in schema mode; the
-workflow computes the verdict from the entries.
+test; `style`: readability and naming). A follow-up Issue (title
+`<scope>: defects found by review`, or beginning with the earlier
+`<scope>: defects found by PR #<N>'s review`) names findings, not work, so
+an `issue` field is never set to it. There is no final line in schema
+mode; the workflow computes the verdict from the entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
 `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound correctness,

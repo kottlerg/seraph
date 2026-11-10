@@ -67,6 +67,10 @@ pub struct ThreadRegistry
     /// The count at which the next registration sweeps out the threads that
     /// are gone.
     sweep_at: usize,
+    /// Registrations refused at the bound since the last sweep: at the
+    /// bound, a sweep waits for as many refusals as the registry holds, so
+    /// a process past it costs procmgr no more per request than one below.
+    refused: usize,
 }
 
 impl Default for ThreadRegistry
@@ -86,6 +90,7 @@ impl ThreadRegistry
         Self {
             threads: Vec::new(),
             sweep_at: FIRST_SWEEP_AT,
+            refused: 0,
         }
     }
 
@@ -111,11 +116,16 @@ impl ThreadRegistry
     }
 
     /// Whether the next registration sweeps first: the registry reached the
-    /// count its last sweep set, or the bound.
+    /// count its last sweep set, or, held at the bound (where the count can
+    /// lie past the bound), as many registrations as it holds were refused
+    /// since the last sweep. Either way the requests between two sweeps
+    /// number at least half the threads a sweep reads, so the sweeps cost at
+    /// most two thread-state reads per request on average.
     #[must_use]
     pub fn needs_sweep(&self) -> bool
     {
-        self.threads.len() >= self.sweep_at || self.threads.len() >= REGISTERED_THREADS_MAX
+        let len = self.threads.len();
+        len >= self.sweep_at || (len >= REGISTERED_THREADS_MAX && self.refused >= len)
     }
 
     /// Drop every thread `is_live` reports gone, handing each to `dropped`
@@ -136,17 +146,20 @@ impl ThreadRegistry
             live
         });
         self.sweep_at = self.threads.len().saturating_mul(2).max(FIRST_SWEEP_AT);
+        self.refused = 0;
     }
 
     /// Make room for one more thread.
     ///
     /// # Errors
-    /// [`RegisterRefusal::Limit`] at [`REGISTERED_THREADS_MAX`];
+    /// [`RegisterRefusal::Limit`] at [`REGISTERED_THREADS_MAX`], counted
+    /// toward the next sweep ([`Self::needs_sweep`]);
     /// [`RegisterRefusal::OutOfMemory`] when the heap cannot grow the registry.
     pub fn reserve(&mut self) -> Result<(), RegisterRefusal>
     {
         if self.threads.len() >= REGISTERED_THREADS_MAX
         {
+            self.refused = self.refused.saturating_add(1);
             return Err(RegisterRefusal::Limit);
         }
         self.threads
@@ -179,6 +192,7 @@ impl ThreadRegistry
     pub fn take_all(&mut self) -> Vec<RegisteredThread>
     {
         self.sweep_at = FIRST_SWEEP_AT;
+        self.refused = 0;
         core::mem::take(&mut self.threads)
     }
 }
@@ -246,6 +260,31 @@ mod tests
         // A sweep that finds a thread gone makes room again.
         reg.sweep(|t| t.cap != 1, |_| {});
         assert_eq!(reg.reserve(), Ok(()));
+    }
+
+    #[test]
+    fn at_the_bound_a_sweep_waits_for_as_many_refusals_as_the_registry_holds()
+    {
+        let mut reg = ThreadRegistry::new();
+        for i in 0..REGISTERED_THREADS_MAX as u64
+        {
+            if reg.needs_sweep()
+            {
+                reg.sweep(|_| true, |_| {});
+            }
+            reg.reserve().unwrap();
+            reg.push(thread(i + 1, 0));
+        }
+        // Every thread live: the sweep at the bound keeps them all, and the
+        // next one waits for a registry's worth of refusals.
+        assert!(reg.needs_sweep());
+        reg.sweep(|_| true, |_| {});
+        for _ in 0..REGISTERED_THREADS_MAX
+        {
+            assert!(!reg.needs_sweep());
+            assert_eq!(reg.reserve(), Err(RegisterRefusal::Limit));
+        }
+        assert!(reg.needs_sweep());
     }
 
     #[test]

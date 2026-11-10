@@ -2064,8 +2064,11 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// ([`thread_is_listed`]). A thread whose exception class is bound under one
 /// of its process's crash badges (`ProcessEntry::owns_crash_badge`), as one
 /// that copied its spawner's bindings is, is bound again under a fresh crash
-/// badge, so its faults name it; a debugger's binding, or none, is left as it
-/// is (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`).
+/// badge, so its faults name it; a binding under any other badge, a
+/// debugger's, or none, is left as it is. The binding is told by its badge
+/// alone, which is all `SYS_THREAD_GET_FAULT_HANDLER` returns, so a debugger
+/// binds under a badge of its own (`services/procmgr/docs/ipc-interface.md`
+/// § `REGISTER_THREAD`).
 ///
 /// # Errors
 /// The reply code: `INVALID_BADGE` when no live process carries `badge`,
@@ -2076,7 +2079,6 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// the cap on every error.
 pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) -> Result<(), u64>
 {
-    let crash_badge = table.mint_crash_badge();
     let entry = process_table::register_target(table, badge).map_err(|r| match r
     {
         process_table::AttachRefusal::NotAttachable => procmgr_errors::NOT_ATTACHABLE,
@@ -2086,6 +2088,12 @@ pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) ->
     {
         return Err(procmgr_errors::INVALID_ARGUMENT);
     }
+    // Whether the binding is the process's is read before the sweep, which
+    // may drop the spawner whose crash badge the thread copied.
+    let rebind = syscall::thread_get_fault_handler(thread_cap, FAULT_CLASS_EXCEPTION)
+        .ok()
+        .flatten()
+        .is_some_and(|b| entry.owns_crash_badge(b));
     if entry.threads.needs_sweep()
     {
         entry
@@ -2097,11 +2105,11 @@ pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) ->
         process_table::RegisterRefusal::Limit => procmgr_errors::THREAD_LIMIT,
         process_table::RegisterRefusal::OutOfMemory => procmgr_errors::OUT_OF_MEMORY,
     })?;
-    let inherited = syscall::thread_get_fault_handler(thread_cap, FAULT_CLASS_EXCEPTION)
-        .ok()
-        .flatten();
-    let bound = inherited.is_some_and(|b| entry.owns_crash_badge(b))
-        && bind_exception_class(thread_cap, crash_badge);
+    let crash_badge = if rebind { table.mint_crash_badge() } else { 0 };
+    let bound = crash_badge != 0 && bind_exception_class(thread_cap, crash_badge);
+    let entry = table
+        .find_mut_by_badge(badge)
+        .ok_or(procmgr_errors::INVALID_BADGE)?;
     entry.threads.push(process_table::RegisteredThread {
         cap: thread_cap,
         crash_badge: if bound { crash_badge } else { 0 },

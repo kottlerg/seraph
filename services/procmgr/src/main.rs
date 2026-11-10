@@ -817,13 +817,28 @@ fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
             return;
         }
     };
-    entry.threads.sweep(
-        |t| process::thread_is_listed(t.cap),
-        process::release_registered_thread,
-    );
-    let count = 1 + entry.threads.len();
+    let first = usize::try_from(req.word(1)).unwrap_or(usize::MAX);
+    let mut page = Err(PageFailed::Gone);
+    for _ in 0..ATTACH_PAGE_TRIES
+    {
+        entry.threads.sweep(
+            |t| process::thread_is_listed(t.cap),
+            process::release_registered_thread,
+        );
+        page = derive_attach_page(entry, first);
+        if !matches!(page, Err(PageFailed::Gone))
+        {
+            break;
+        }
+    }
+    let Ok((derived, n)) = page
+    else
+    {
+        reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+        return;
+    };
     let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS)
-        .word(0, count as u64)
+        .word(0, 1 + entry.threads.len() as u64)
         .word(1, entry.image.load_bias)
         .word(2, entry.image.text_start)
         .word(3, entry.image.text_end)
@@ -833,7 +848,41 @@ fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
             procmgr_labels::ATTACH_WORD_NAMED_THREAD,
             named.index_in(entry),
         );
-    let first = usize::try_from(req.word(1)).unwrap_or(usize::MAX);
+    for &cap in &derived[..n]
+    {
+        reply = reply.cap(cap);
+    }
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) }.is_err()
+    {
+        release_caps(&derived[..n]);
+    }
+}
+
+/// Times an attach sweeps and derives its page again when a registered
+/// thread's cap went between its sweep and its derive (the runtime revoked
+/// it, reclaiming the thread): each try sweeps that thread out, so a retry
+/// fails only when another thread goes meanwhile.
+const ATTACH_PAGE_TRIES: usize = 4;
+
+/// Why [`derive_attach_page`] derived no page.
+enum PageFailed
+{
+    /// A registered thread's cap went before its derive; sweep and retry.
+    Gone,
+    /// The derive of a cap that is there failed (`OUT_OF_MEMORY`).
+    OutOfMemory,
+}
+
+/// Derive the caps of `entry`'s attach list from index `first`, at most
+/// `ATTACH_THREADS_PAGE`: the main thread at 0, then the registered threads.
+/// Returns them and their count; on failure, deletes the ones derived.
+fn derive_attach_page(
+    entry: &process::ProcessEntry,
+    first: usize,
+) -> Result<([u64; procmgr_labels::ATTACH_THREADS_PAGE], usize), PageFailed>
+{
+    let count = 1 + entry.threads.len();
     let mut derived = [0u64; procmgr_labels::ATTACH_THREADS_PAGE];
     let mut n = 0;
     for index in first..count.min(first.saturating_add(procmgr_labels::ATTACH_THREADS_PAGE))
@@ -847,18 +896,21 @@ fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
         else
         {
             release_caps(&derived[..n]);
-            reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
-            return;
+            return Err(
+                if index > 0 && !process::thread_is_listed(source)
+                {
+                    PageFailed::Gone
+                }
+                else
+                {
+                    PageFailed::OutOfMemory
+                },
+            );
         };
         derived[n] = cap;
         n += 1;
-        reply = reply.cap(cap);
     }
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) }.is_err()
-    {
-        release_caps(&derived[..n]);
-    }
+    Ok((derived, n))
 }
 
 /// Handle `DECLARE_NO_DEBUG` from the process `badge` names, on its own

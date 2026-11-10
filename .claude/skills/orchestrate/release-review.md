@@ -17,13 +17,17 @@ are on the checked-out branch; say so to the maintainer if the session is older.
 - The supervisor saves each run's report as
   `target/xtask/review/release-v<X.Y.Z>/<mode>-<head>.md`, the returned object as
   `<mode>-<head>.json` beside it, and on `RELEASE READY` the `notes` field as `notes-<head>.md`.
-  Both verdict lines go to the maintainer verbatim: the release is their step.
+  Both verdict lines go to the maintainer verbatim: the steps that follow need their
+  approval.
 - `RELEASE BLOCKED`: each blocking finding goes to a worker as a fix PR, and each audit failure
   to its fix. A `[carried]` entry and a fresh entry that state the same defect count as one
   finding. Record every other finding as step 2 of that section says. Then run `mode: "delta"`
   with `since` the head the last run reviewed.
-- `RELEASE READY` before the bump: a worker opens the release PR from the draft (step 3). Once
-  it merges, run the release host runs (step 4) yourself under an exclusive grant to yourself,
-  write their report to `target/xtask/review/release-v<X.Y.Z>/host-runs.md`, and run
-  `mode: "delta"` with `host_runs` that path. `RELEASE READY` at the bumped head is a tag prompt
-  to the maintainer (step 5).
+- `RELEASE READY` before the bump: a worker opens the release PR from the draft (step 3). At
+  its gate, ask the maintainer to approve its merge, and merge it once they do. Then run the
+  release host runs (step 4) yourself under an exclusive grant to yourself, write their report
+  to `target/xtask/review/release-v<X.Y.Z>/host-runs.md`, and run `mode: "delta"` with
+  `host_runs` that path.
+- `RELEASE READY` at the bumped head: ask the maintainer to approve the tag (step 5), and
+  create and push it once they do. The publishing of the Release (step 7) and the milestone
+  work (step 8) each take their own approval in the same way.

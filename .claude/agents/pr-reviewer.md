@@ -205,8 +205,9 @@ safety, or contract finding, or MUST violation anchored in a file that is
 not a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 `docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it, in the order
-`docs/conventions.md` § Recording findings gives, and do not affect the
-line. A follow-up Issue takes nothing off the surface: a finding one
+`docs/conventions.md` § Recording findings gives (a `style` finding that is
+not a MUST violation names none: the run record is its record), and do not
+affect the line. A follow-up Issue takes nothing off the surface: a finding one
 already holds is reported where the surface puts it. A finding a ledger
 entry already states at a hunk unchanged since the run the entry names, when
 that run resolves in the clone, is listed under a `Ledger (not re-raised)`

@@ -24,10 +24,11 @@ Read `.claude/agents/worker.md` and follow it in **standalone** mode, with these
 - A decision the worker file routes to the orchestrator is the maintainer's: ask in the
   conversation. `.claude/agents/orchestrator.md` § Rulings lists the recurring ones and
   which document settles each.
-- An Issue the worker file says to draft is filed with the maintainer's approval in the
-  conversation, with `cargo xtask issue-file`.
+- An Issue the worker file says to draft is filed with `cargo xtask issue-file`: the rolling
+  follow-up Issue of a scope that has none without asking, any other with the maintainer's
+  approval in the conversation.
 - Sync onto `master` yourself right before the validation run, and again if `master` moves
-  before the gate. A Markdown-only or comment-only sync owes nothing.
+  before the gate. docs/conventions.md § Syncing with `master` says what each sync owes.
 - The worker file is a file this session read, not its system prompt, so a compaction drops it.
   After one, read `.claude/agents/worker.md` again before the next step, and take the state of
   the work from the PR body and the branch, not from the summary.
@@ -41,5 +42,6 @@ worktree holds nothing unsaved or unpushed (the second check of
 `.claude/skills/orchestrate/worktree-removal.md`), the maintainer removes it, or the session
 does when asked, as that file describes.
 
-At the gate, give both verdict lines verbatim and prompt for the merge decision. Merge only on
-the maintainer's instruction.
+At the gate, give both verdict lines verbatim and say that the PR meets the merge condition
+(docs/conventions.md § Pre-merge review). The maintainer's instruction to merge is the one
+decision left; merge only on it.

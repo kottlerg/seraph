@@ -774,7 +774,7 @@ const ledger_note = (paths) =>
     scope.ledger_records.length === 0
         ? '\nLedger: no saved run record exists for the range; set `ledger` false on every finding.'
         : '\nLedger: the findings the PRs\' own reviews and this release\'s earlier runs ' +
-            'recorded, dropped, or put to the maintainer (status contested), each with the head ' +
+            'recorded or dropped, or that were contested (status contested), each with the head ' +
             'of the run that reported it. ' +
             (paths
                 ? 'Read the entries for your files: `jq -s \'' + LEDGER_FILTER + ' | map(select(' +

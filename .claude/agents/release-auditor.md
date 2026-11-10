@@ -31,7 +31,7 @@ Production requires before its tag, not code quality: the reviewers own that.
    `<scope>: defects found by review`, or beginning `<scope>: defects found
    by PR #<N>'s review`), per the precondition of § Release Production step
    1. List each closed Issue no commit in the range closed, and each open
-   follow-up Issue, as one step 8 moves. FAIL an Issue a PR of the range
+   follow-up Issue, as one step 8 closes or moves. FAIL an Issue a PR of the range
    closed that carries no milestone or another one (§ Milestones).
 
 4. Version: FAIL when a pre-bump head's workspace version is not the

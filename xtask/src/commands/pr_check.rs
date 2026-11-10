@@ -43,9 +43,9 @@ const SUBJECT_COLUMNS: usize = 72;
 /// Body wrap column (docs/conventions.md § Commit Messages, Body).
 const BODY_COLUMNS: usize = 72;
 
-/// Title suffix of a rolling follow-up Issue (docs/conventions.md § Branch
-/// and PR Workflow): a PR references one with `Refs` and never closes it.
-const ROLLING_TITLE_SUFFIX: &str = ": defects found by review";
+/// Title suffix of a rolling follow-up Issue (docs/conventions.md
+/// § Follow-up Issues): a PR references one with `Refs` and never closes it.
+pub const ROLLING_TITLE_SUFFIX: &str = ": defects found by review";
 
 // ── Patterns ──────────────────────────────────────────────────────────────────
 

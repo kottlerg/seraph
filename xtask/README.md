@@ -905,8 +905,9 @@ cargo xtask commit-check [--base <ref>] [--head <ref>] [--strict]
 
 The range is `<base>..<head>`, by default `origin/master..HEAD`. Each finding prints as
 `<level> <rule>: <commit>: <message>`. An error fails the command; a warning fails it only under
-`--strict`. The warnings are that section's SHOULD rules, a departure from which the maintainer
-may accept, and one rule a script cannot decide alone.
+`--strict`. The warnings are that section's SHOULD rules, a departure from which is accepted as
+that section says (a small one the PR body names, a larger one the maintainer accepts), and one
+rule a script cannot decide alone.
 
 | Rule | Level | Check |
 |---|---|---|
@@ -938,13 +939,13 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 |---|---|---|
 | `pr-unticked-box` | error | The body has no unticked task-list item (§ PR-body checklist discipline): `[ ]` after a `-`, `*`, `+`, or numbered list marker, the forms GitHub renders as a checkbox. |
 | `pr-attribution` | error | The body carries no tool attribution line and no session link. |
-| `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`. A drain PR that closes a follow-up Issue carries both (§ Branch and PR Workflow); in any other body the pair usually means a sentence closes an Issue the PR only references. |
+| `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`. A drain PR that closes a follow-up Issue of the earlier pattern carries both (§ Follow-up Issues); in any other body the pair usually means a sentence closes an Issue the PR only references. |
 | `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
 | `pr-validation` | error | The body has a `## Validation` section that names a validated head: the first word of that section that is a commit hash in the clone. |
 | `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch (one the head holds and the base branch does not), the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown (`*.md` in any letter case) aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any non-blank line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. When a merge of the base branch lies between the two heads, the command compares the PR's own change at each, `git diff <merge base> <validated>` and `git diff <merge base> <head>`, as multisets of changed lines per file, whitespace included, instead of the delta: they must differ only in comment or Markdown lines and in no file a build embeds, two binary changes agree only when their `index` lines match (the same blobs before and after, and the same mode), a change to a final newline alone is a change, as is a different mode for a file the PR adds or deletes at both heads (an added or deleted file is otherwise judged by its lines, so a file of comments alone stays comment-only), each difference is reported with the head it stands at, and the section must say the delta is documentation or comments only when the two differ at all. |
-| `pr-validated-sync` | warning | No merge of the base branch lies between a validated head that passes `pr-validated-head` and the PR head. After one the body states whether the incoming diff overlaps the PR's files; a reader decides the overlap, the command cannot. |
+| `pr-validated-sync` | warning | No merge of the base branch lies between a validated head that passes `pr-validated-head` and the PR head. After one the body states whether the incoming diff overlaps the PR's files (§ Syncing with `master`); a reader decides the overlap, the command cannot. |
 | `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
-| `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Branch and PR Workflow). |
+| `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Follow-up Issues). |
 | `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
 | `issue-milestone` | error | Every Issue the PR closes carries the current milestone, the lowest-versioned open one. |
 | `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
@@ -963,7 +964,7 @@ fails the gate.
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
 | `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
-| `gate-findings-recorded` | warning | That record leaves no finding on the surface. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each is recorded and none is contested; the command cannot. |
+| `gate-findings-recorded` | warning | That record leaves no finding on the surface that needs a reader: one an Issue must record (a class other than `style`, or a MUST violation; § Recording findings), or one of any class whose `status` is `contested`. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each counted finding is recorded and none is contested; the command cannot. |
 
 The command does not judge what needs a reader: whether the body's claims match the diff, whether
 an acceptance item is delivered, and which local host runs the change owes. Those stay with the
@@ -986,7 +987,7 @@ one JSON object:
 | Key | Value |
 |---|---|
 | `verdict` | The reviewer verdict: `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, or `BLOCKING ISSUES`. In an `audit` record, the reviewer verdict the audit states. |
-| `audit_verdict` | `AUDIT PASS` or `AUDIT FAIL`; in a `full` or `delta` record of the reviewer alone, run while an owed host run is unreported, `NOT RUN`. |
+| `audit_verdict` | `AUDIT PASS` or `AUDIT FAIL`; in a `full` or `delta` record of the reviewer alone, run while the PR body reports a run as pending, `NOT RUN`. |
 | `audit` | `verdict` (as `audit_verdict`) and `sections`, a list of objects with `name`, `verdict`, and `items`; `null` in a record of the reviewer alone. |
 | `findings` | The findings on the review surface. In an `audit` record, those of the last run with the reviewer that the delta leaves unfixed. |
 | `recorded` | The findings off the surface. |
@@ -1044,7 +1045,9 @@ cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
 ```
 
 The command refuses a filing without a class label, without a subsystem label, or without a
-milestone decision (`--unscheduled` is for future-state work no release has scheduled). After
+milestone decision (`--unscheduled` is for future-state work no release has scheduled). It
+refuses a rolling follow-up Issue (a title ending `: defects found by review`) under anything
+but the current milestone, the lowest-versioned open one, which it reads from GitHub. After
 filing it reads the Issue back and fails when a label or the milestone was not applied, naming
 what is missing.
 

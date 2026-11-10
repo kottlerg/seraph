@@ -510,8 +510,8 @@ its own device surface, and variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
+| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -588,9 +588,9 @@ concurrency-fix purpose owes the whole boundary set on its own (see Repeat count
 CPU-count surface is the code that fixes the CPU-count width, enumerates and brings up CPUs, sizes
 per-CPU storage, or signals across CPUs, and it is exactly what this paragraph lists. Code that only
 reads `CPU_COUNT` or a `cpu_count` argument to iterate over CPUs is not on it unless it lies in a
-whole-surface file, names a listed item, or lies within one's definition; the rules of
-[coding-standards.md](coding-standards.md) § CPU-Count Width and the release host runs cover it. The
-surface is these files as a whole:
+whole-surface file, names a listed item, lies within one's definition, or is a test case whose
+work grows with the CPU count (below); the rules of [coding-standards.md](coding-standards.md)
+§ CPU-Count Width and the release host runs cover it. The surface is these files as a whole:
 
 - `core/kernel/src/cpu_mask.rs` (the CPU mask type and its width);
 - `core/kernel/src/percpu.rs` (per-CPU data and its slabs);
@@ -600,9 +600,11 @@ surface is these files as a whole:
 - `core/kernel/src/mm/tag_allocator.rs` (the per-CPU address-space tags, whose count it fits to
   the CPU count);
 
-and, in any other file, a line that adds a structure with one entry or one bit per CPU, and a
-changed line that names one of these items as a whole identifier or lies within one's definition
-(its attributes, signature, fields, or body):
+and, in any other file, a line that adds a structure with one entry or one bit per CPU, a line
+that adds or changes a test case whose work grows with the CPU count (a ktest or svctest case
+that runs a step, or spawns a thread, for each CPU), and a changed line that names one of these
+items as a whole identifier or lies within one's definition (its attributes, signature, fields,
+or body):
 
 - CPU-count width: `MAX_CPUS`, `AtomicCpuMask`, `MaskSource`, `mask_words`, `set_boot_cpu_count`;
 - per-CPU storage: `alloc_zeroed_slab` and the page count it takes (`slab_pages`); the per-CPU
@@ -650,27 +652,42 @@ changed line that names one of these items as a whole identifier or lies within 
 - the TLB-shootdown broadcast: `shootdown`, `shootdown_range`, `service_shootdowns`,
   `shootdown_remote`, and `needs_remote_shootdown`.
 
-A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. A PR
-that adds an item of the kinds above that names none of the listed items MUST add it to this list.
+A changed line that only uses a listed type is not on the surface: an import of it, a signature
+or type annotation that names it, a read or write of one of its fields, or a call of one of its
+methods, where the line changes neither the type's fields or size, nor a structure with one
+entry or one bit per CPU, nor how such a structure is sized or indexed. The listed types are
+`AtomicCpuMask`, `MaskSource`, `PerCpuSlab`, `CpuTopology`, `IpiWaitCtx`, `WaitTimer`, and the
+element types of the per-CPU arrays and slabs. A line that names any other listed item, or that
+lies within a listed item's definition, stays on the surface.
+
+A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. The
+release host runs (Release host runs below) boot every boundary before each tag and are the
+backstop for a scaling defect this surface misses. A boundary set MAY also be run for a PR that
+does not owe it, when whoever coordinates the work (the orchestrator of a batch, or the
+maintainer) judges that the change warrants it; nothing schedules such a run, and the PR body
+reports it as a run the PR does not owe (Hangs at oversubscription below). A PR that adds an
+item of the kinds above that names none of the listed items MUST add it to this list.
 `cargo xtask lint-docs` fails when a name this list, the memory and device surfaces' lists, or
 their screens state no longer names code, a tracked file, or a tracked directory (its
-`md-coverage-symbols` rule, [xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a PR
-that renames or deletes a listed item updates the list in the same change.
-The commands below screen a diff for the surface. The first lists the whole-surface files the diff
-changes. The second prints every file header of the diff and every line, changed or context, that
-names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
+`md-coverage-symbols` rule, [xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a
+PR that renames or deletes a listed item updates the list in the same change. The commands below
+screen a diff for the surface. The first lists the whole-surface files the diff changes. The
+second prints every file header of the diff and every line, changed or context, that names a
+listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
 item's definition prints that item's name. Each printed name is a candidate: the PR owes the set
 when a non-inert changed line names the item or lies within its definition, read in that file's
-hunk. A printed `alloc_per_cpu_slab` or `alloc_zeroed_slab` call is a candidate for the initialiser
-that encloses it (except `frame_map::init` and `init_cspace_registry`, which the memory surface
-covers): the set is
-owed when a non-inert changed line lies within that function, read in the widened hunk. The
-screen finds named items and changes inside their definitions; it does not follow a size
-change through a nested type or a sizing constant, so a diff that changes a struct's fields or a
-constant's value is also read against the per-CPU storage bullet (`git grep -n -w <name> <head>`
-shows where the type or constant is held). A diff for which neither command prints a candidate,
-that adds no per-CPU structure, and whose type and constant changes reach no per-CPU element or
-allocation is off the surface.
+hunk, unless the line only uses a listed type as the paragraph above defines it. A printed
+`alloc_per_cpu_slab` or `alloc_zeroed_slab` call is a candidate for the initialiser that
+encloses it (except `frame_map::init` and `init_cspace_registry`, which the memory surface
+covers): the set is owed when a non-inert changed line lies within that function, read in the
+widened hunk. The screen finds named items and changes inside their definitions; it does not
+follow a size change through a nested type or a sizing constant, so a diff that changes a
+struct's fields or a constant's value is also read against the per-CPU storage bullet
+(`git grep -n -w <name> <head>` shows where the type or constant is held). The screen does not
+find a test case whose work grows with the CPU count either: a diff that adds or changes a ktest
+or svctest case is read for one. A diff for which neither command prints a candidate, that adds
+no per-CPU structure and no such test case, and whose type and constant changes reach no per-CPU
+element or allocation is off the surface.
 
 ```sh
 B=$(git merge-base <head> origin/master)
@@ -696,8 +713,8 @@ S="$S|shootdown(_range|_remote)?|service_shootdowns|needs_remote_shootdown"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($S)\b"
 ```
 
-The boundary set is every boundary CPU count below, each once (`--runs 1`, raised only as Repeat
-count says): 16 and 128 CPUs on both architectures, riscv64 16 and 128 harts and x86_64 16 and 128
+The boundary set is every boundary CPU count below, each once (`--runs 1`, as Repeat count
+says): 16 and 128 CPUs on both architectures, riscv64 16 and 128 harts and x86_64 16 and 128
 vCPUs. No run is wider than 128 CPUs, on either architecture: the 256- and 512-vCPU runs are removed
 from every set by the maintainer's decision on
 [#694](https://github.com/kottlerg/seraph/issues/694), since the 512-vCPU run (the old
@@ -905,16 +922,17 @@ git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
     grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
 ```
 
-**Repeat count.** Every owed run runs once (`--runs 1`). A PR states a concurrency-fix purpose when
-its body states that its purpose is the fix of a concurrency defect in the scheduling, wake, or
-cross-CPU signalling mechanisms. Such a PR, unless its changes outside Markdown are all inert, owes
-the whole boundary set, every boundary three times (`--runs 3`), whether or not its diff changes the
-CPU-count surface: a race in those mechanisms can fail rarely enough that one run misses it. That
-PR's other owed runs stay at `--runs 1`. A concurrency fix elsewhere is not a concurrency-fix
-purpose, and a change to those mechanisms' files without that stated purpose does not raise the
-count.
+**Repeat count.** Every owed run, local or release, runs once (`--runs 1`); nothing raises the
+count. A PR states a concurrency-fix purpose when its body states that its purpose is the fix of a
+concurrency defect in the scheduling, wake, or cross-CPU signalling mechanisms. Such a PR, unless
+its changes outside Markdown are all inert, owes the whole boundary set, whether or not its diff
+changes the CPU-count surface: a defect in those mechanisms shows at the boundary CPU counts, which
+CI does not boot. A few repeats add almost nothing to the chance of catching a race that fails
+rarely; the burn-in tier is the repeated-run check. A concurrency fix elsewhere is not a
+concurrency-fix purpose, and a change to those mechanisms' files without that stated purpose owes
+nothing on that account.
 
-**When the runs are owed.** Each local host run a PR owes MUST pass, at its repeat count, at one
+**When the runs are owed.** Each local host run a PR owes MUST pass at one
 head that covers the merge head. For every local and release host run, only a `PASS` outcome of
 `run-parallel` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
 host emulator, is run again and the re-run's outcome stands; `OK` and `ERR` count as failures. The
@@ -1026,16 +1044,17 @@ cargo xtask test-gdb --arch <arch>
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
-4), the maintainer MUST run, on the commit to be tagged, the whole boundary set
-(riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three times each
-(`--runs 3`) in the debug profile and once each in the release profile
-(`cargo xtask build --release`, then the same `run-parallel` command at
-`--runs 1`, per the boundary commands above), and the memory variation and every device cell (the
+4), these MUST be run on the commit to be tagged: the whole boundary set
+(riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) once each (`--runs 1`)
+in the debug profile and once each in the release profile
+(`cargo xtask build --release`, then the same `run-parallel` command, per
+the boundary commands above), and the memory variation and every device cell (the
 disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once each, so
 every tag boots at each boundary CPU count in both profiles (CI boots release builds only at 4
 CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, and with a debug port,
 and runs the timing report on the boundary
-logs, which is reported and blocks nothing.
+logs, which is reported and blocks nothing. A tag's repeated-run check is the burn-in tier,
+which the tag push starts.
 The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture
 with the machine's IOMMU detached, so devmgr's unconfined path still serves every driver (svctest
 staged as `build-test.yml` stages it, on a debug-profile sysroot). A run whose outcome is not a

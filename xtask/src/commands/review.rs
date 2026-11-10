@@ -198,7 +198,13 @@ fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
         ));
         let mut either = AUDIT_VERDICTS.to_vec();
         either.push(NOT_RUN);
-        one_of(out, name, "audit_verdict", &record["audit_verdict"], &either);
+        one_of(
+            out,
+            name,
+            "audit_verdict",
+            &record["audit_verdict"],
+            &either,
+        );
         return;
     }
     let not_run = record["audit_verdict"] == NOT_RUN;

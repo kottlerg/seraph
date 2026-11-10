@@ -393,6 +393,17 @@ pub fn is_virtio_input(dev: &PciDevice) -> bool
     dev.vendor_id == VIRTIO_VENDOR && (dev.device_id == 0x1012 || dev.device_id == 0x1052)
 }
 
+/// Check if a PCI device is a `VirtIO` console device.
+///
+/// virtio-console is virtio device type 3: modern PCI device ID `0x1043`,
+/// legacy/transitional `0x1003`. QEMU's `virtio-serial-pci` with
+/// `disable-legacy=on` presents as `0x1043`.
+#[must_use]
+pub fn is_virtio_console(dev: &PciDevice) -> bool
+{
+    dev.vendor_id == VIRTIO_VENDOR && (dev.device_id == 0x1003 || dev.device_id == 0x1043)
+}
+
 #[cfg(test)]
 mod tests
 {

@@ -34,9 +34,9 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # Subcommand modules (build, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
-│   │                           #   test, test_kaslr, test_logd_reclaim, test_map_redo,
-│   │                           #   test_terminal, test_vmgenid, lint_docs, pr_check,
-│   │                           #   review, issue)
+│   │                           #   test, test_debug_port, test_kaslr, test_logd_reclaim,
+│   │                           #   test_map_redo, test_terminal, test_vmgenid, lint_docs,
+│   │                           #   pr_check, review, issue)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -78,7 +78,8 @@ or stamped for a different architecture.
 cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
     [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] \
     [--iommu attached|absent] \
-    [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]]
+    [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
+    [--debug-port PORT]
 ```
 
 | Option | Description |
@@ -95,6 +96,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--second-disk` | Attach `PATH` as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of its GPT (see Attached devices). `mkdisk --split-data` authors `disk-data.img` for it; any GPT image at 512- or 4096-byte blocks serves too, and any other image needs `--second-disk-block-size` |
 | `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
 | `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
+| `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -135,7 +137,9 @@ the q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhc
 added only when a `gtk` or `sdl` display backend is available. `--headless` drops the display
 adapter, so no framebuffer is advertised. `run-parallel --display framebuffer` keeps the adapter
 with no display window (`-display none`): the q35 default adapter on x86-64 and `-device VGA`
-alone on riscv64, whatever display backends QEMU has.
+alone on riscv64, whatever display backends QEMU has. `--debug-port` adds a `virtio-serial-pci`
+device, behind the IOMMU when one is attached, carrying one `virtconsole` port on the character
+device `seraph-debug`, a TCP server on `127.0.0.1` at the given port (`server=on,wait=off`).
 
 The disk device presents the logical block size of the image it boots, 512 or 4096 bytes
 (`logical_block_size` and `physical_block_size`), read from the LBA its GPT header sits at, so a
@@ -360,6 +364,7 @@ cargo xtask run-parallel \
     [--iommu attached|absent] \
     [--display headless|framebuffer] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
+    [--debug-port PORT] \
     [--pass REGEX] \
     [--fail REGEX] \
     [--fail-also REGEX] \
@@ -384,6 +389,7 @@ cargo xtask run-parallel \
 | `--second-disk` | (none) | Attach `PATH` as a second disk, as `cargo xtask run --second-disk` does; each slot boots its own copy, as it does of `disk.img` |
 | `--second-disk-block-size` | (the image's) | Block size of the second disk's device; same semantics as `cargo xtask run --second-disk-block-size` |
 | `--second-disk-shared-line` | off | Place the second disk on the first disk's `INTx` line; same semantics as `cargo xtask run --second-disk-shared-line` |
+| `--debug-port` | (none) | Attach the debug port, served on `127.0.0.1:PORT`; same semantics as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host port) |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
@@ -699,6 +705,39 @@ See [docs/testing.md](../docs/testing.md) for the harness model.
 
 ---
 
+### `cargo xtask test-debug-port`
+
+Check the debug port's transport, on either arch. Stages the `debug-echo` fixture's recipe
+([services/debug-echo/README.md](../services/debug-echo/README.md)) from
+`config/svcmgr/tests/` into `config/svcmgr/services/`, repacks `disk.img`, boots the current
+sysroot once with the debug port attached (as `run --debug-port` attaches it, headless), waits for
+the fixture's `[debug-echo] READY on the debug port` line on the serial stream, connects to the
+port, and drives one GDB remote serial protocol exchange with the fixture, framed at both ends by
+`shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)). It then kills QEMU,
+removes the recipe, and repacks `disk.img` again, whatever the outcome. It passes when every
+answer of the exchange arrives as expected; [docs/testing.md](../docs/testing.md) § Debug port
+(`test-debug-port`) lists the exchange.
+
+A pure runner; requires a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test-debug-port [--arch x86_64|riscv64] [--port PORT] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--port` | `4560` | The host TCP port the debug port is served on |
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+The boot to the fixture's line is bounded by five minutes and each answer by twenty seconds. The
+boot is the debug-port device cell of the local and release host runs
+([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
+
+---
+
 ### `cargo xtask lint-docs`
 
 Check the mechanical documentation and source-header rules. Runs in CI's
@@ -902,6 +941,7 @@ what is missing.
 | [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) | PIE image placement and the per-spawn ASLR bias used with `--gdb` and `symbolize --bias` |
 | [docs/storage.md](../docs/storage.md) | GPT role-GUID discovery of the data partition the disk image carries |
 | [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves |
+| [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md) | The debug port `--debug-port` attaches and `test-debug-port` drives |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` enforces; the Markdown and file-header rules `lint-docs` checks |
 | [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |
 | [targets/README.md](targets/README.md) | Custom target specs |

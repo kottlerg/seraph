@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "gdb-rsp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# no_std pure logic: the GDB remote serial protocol's framing, packet parse
+# and encode, and the target descriptions of both architectures. Host-tested;
+# built for every target that links it, and by xtask for the host side of the
+# debug-port test.
+[lib]
+test = true
+doctest = false
+
+[lints]
+workspace = true

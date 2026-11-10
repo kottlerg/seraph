@@ -1014,7 +1014,7 @@ pub struct SvcmgrEndowment
 /// rights) and the publish-role source caps: a `SEND` on the root
 /// filesystem namespace endpoint (svcmgr publishes it as `rootfs.root`) and
 /// a badge-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
-/// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.test` publish caps and
+/// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.test` / `devmgr.debug` publish caps and
 /// the `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it), plus two SENDs on
 /// vfsd's service endpoint svcmgr publishes seed-only: `MOUNT_AUTHORITY`-badged
 /// (`vfsd.mount`) and `DENY_BADGE`-badged (`vfsd.deny`). An absent source

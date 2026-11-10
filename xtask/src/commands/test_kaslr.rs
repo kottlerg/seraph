@@ -108,6 +108,7 @@ impl Guest
             riscv_mmu: args.riscv_mmu,
             x86_paging: args.x86_paging,
             iommu: Iommu::Attached,
+            debug_port: None,
         };
         let qemu_args = build_qemu_argv(&spec)?;
 

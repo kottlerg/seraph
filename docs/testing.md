@@ -1,8 +1,9 @@
 # Testing
 
 System-wide standard for the in-tree test harnesses, the per-program tester
-protocol, the sysroot layout for test binaries, and the gating mechanism
-that determines which harnesses run in a given boot.
+protocol, the sysroot layout for test binaries, the gating mechanism
+that determines which harnesses run in a given boot, and the tools that
+diagnose a failing boot.
 
 This document covers booted functional testing. Host-side `#[cfg(test)]` unit
 tests — their quality rules and the boundary between host-unit and booted
@@ -1087,7 +1088,7 @@ hung guest alive for attaching
 ([xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)). GDB runs in batch mode, so its
 output lands in a file like any log. The kernel is static-PIE, so its symbols load at the KASLR
 slide from the serial-only `kaslr: slide=` line, or at their link addresses in a boot whose disk
-was authored with `cargo xtask mkdisk --no-kaslr`; a userspace image's load at its bias, as
+was authored with `cargo xtask mkdisk --no-kaslr`; a userspace image's symbols load at its bias, as
 [xtask/README.md](../xtask/README.md#cargo-xtask-run) describes under `--gdb`. Source lines need
 the image built with debug information (`cargo xtask build --debug kernel`,
 [docs/build-system.md](build-system.md#debuginfo-is-opt-in)). On riscv64 the GDB must be built for

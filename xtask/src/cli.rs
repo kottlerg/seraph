@@ -715,7 +715,8 @@ pub struct SymbolizeArgs
     pub kernel: bool,
 
     /// Load bias, in hex: the runtime address of the image's link address 0
-    /// (a PIE's `image bias=` log value, the kernel's `kaslr: slide=` value).
+    /// (a PIE's `image bias=` or, for init, `init: PIE bias=` log value; the
+    /// kernel's `kaslr: slide=` value).
     #[arg(long, value_name = "HEX", default_value = "0", value_parser = parse_hex_arg)]
     pub bias: u64,
 

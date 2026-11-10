@@ -107,6 +107,12 @@ pub enum CliCommand
     /// through `run-parallel` and reads the log it saves (see xtask/README.md).
     TestLogdReclaim(TestLogdReclaimArgs),
 
+    /// Check the crash service's report blocks in a boot's saved serial log:
+    /// every block well-formed, and the `crashme` fixture's two reports
+    /// present (`--expect reports`), or no block at all (`--expect none`)
+    /// (see xtask/README.md).
+    TestCrashReport(TestCrashReportArgs),
+
     /// Check that a boot whose bootloader redoes its steps 6 and 7 completes:
     /// stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot
     /// once through `run-parallel`, assert the bootloader's knob line and the
@@ -428,6 +434,32 @@ pub struct TestKaslrArgs
     /// when CPUID reports LA57, so this selects the depth a run exercises.
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+}
+
+// ── TestCrashReport ───────────────────────────────────────────────────────────
+
+/// What `test-crash-report` expects of a log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CrashReportExpect
+{
+    /// The `crashme` fixture's `vm` and `exception` reports: a usertest boot
+    /// with crashd staged.
+    Reports,
+    /// No report block: a boot of an image that stages no crashd.
+    None,
+}
+
+#[derive(Parser)]
+pub struct TestCrashReportArgs
+{
+    /// A boot's saved serial log to check (a `run-parallel --save-logs`
+    /// log). Nothing boots.
+    #[arg(long, value_name = "FILE")]
+    pub log: PathBuf,
+
+    /// What the log must hold beyond well-formed blocks.
+    #[arg(long, value_enum, default_value = "reports")]
+    pub expect: CrashReportExpect,
 }
 
 // ── TestLogdReclaim ───────────────────────────────────────────────────────────

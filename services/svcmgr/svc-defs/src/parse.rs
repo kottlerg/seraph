@@ -175,7 +175,7 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// inconsistent combination (`cwd` with `namespace = none`, a `cwd` of the
 /// root under `namespace = universal`, a `cwd` outside a
 /// `namespace = subtree:` path or under one whose rights lack `LOOKUP`,
-/// `log_sink` with `seed`/`provides`,
+/// `log_sink` with `seed`/`provides` or with `debug_authority`,
 /// `sched_max` below `priority`), a `binary` or
 /// subtree path over `ipc::MAX_PATH_LEN` or with no path components
 /// ([`ParseError::InvalidValue`]), or
@@ -206,6 +206,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut seed: Vec<String> = Vec::new();
     let mut provides: Vec<ProvidedName> = Vec::new();
     let mut log_sink: Option<bool> = None;
+    let mut debug_authority: Option<bool> = None;
     let mut priority: Option<u8> = None;
     let mut sched_max: Option<u8> = None;
 
@@ -411,6 +412,25 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     }
                 });
             }
+            "debug_authority" =>
+            {
+                if debug_authority.is_some()
+                {
+                    return Err(ParseError::DuplicateKey(lineno, "debug_authority"));
+                }
+                debug_authority = Some(match value
+                {
+                    "yes" => true,
+                    "no" => false,
+                    _ =>
+                    {
+                        return Err(ParseError::InvalidValue(
+                            lineno,
+                            "debug_authority must be yes or no",
+                        ));
+                    }
+                });
+            }
             "priority" =>
             {
                 if priority.is_some()
@@ -494,6 +514,16 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
             "log_sink is exclusive of seed and provides",
         ));
     }
+    let debug_authority = debug_authority.unwrap_or(false);
+    if log_sink && debug_authority
+    {
+        // The log sink's round is minted from the log-sink sources and has
+        // no slot for the authority cap.
+        return Err(ParseError::InvalidValue(
+            0,
+            "log_sink is exclusive of debug_authority",
+        ));
+    }
 
     // The service's own band must cover its starting level, so it can
     // always restore its initial priority. procmgr enforces the same
@@ -519,6 +549,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         seed,
         provides,
         log_sink,
+        debug_authority,
         priority,
         sched_max,
     })
@@ -775,6 +806,39 @@ sched_max = 12\n";
         assert!(matches!(
             parse_with("sched_max = 5\nsched_max = 6\n"),
             Err(ParseError::DuplicateKey(_, "sched_max"))
+        ));
+    }
+
+    #[test]
+    fn debug_authority_is_off_unless_the_recipe_sets_it()
+    {
+        assert!(!parse_with("").expect("default").debug_authority);
+        assert!(
+            parse_with("debug_authority = yes\n")
+                .expect("set")
+                .debug_authority
+        );
+        assert!(
+            !parse_with("debug_authority = no\n")
+                .expect("cleared")
+                .debug_authority
+        );
+        assert!(matches!(
+            parse_with("debug_authority = maybe\n"),
+            Err(ParseError::InvalidValue(_, _))
+        ));
+        assert!(matches!(
+            parse_with("debug_authority = yes\ndebug_authority = yes\n"),
+            Err(ParseError::DuplicateKey(_, "debug_authority"))
+        ));
+    }
+
+    #[test]
+    fn the_log_sink_cannot_hold_the_debug_authority()
+    {
+        assert!(matches!(
+            parse_with("log_sink = yes\ndebug_authority = yes\n"),
+            Err(ParseError::InvalidValue(_, _))
         ));
     }
 

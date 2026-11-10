@@ -1206,6 +1206,23 @@ pub const FAULT_REPLY_RESUME: u64 = 0;
 /// ignored.
 pub const FAULT_REPLY_KILL: u64 = 1;
 
+/// Fault reply label: the handler of a [`FAULT_CLASS_VM`] delivery declines
+/// and forwards the fault to the thread's [`FAULT_CLASS_EXCEPTION`] handler.
+/// The kernel delivers the same fault message there, its data words 0–3
+/// unchanged and data word 4 the forwarder's data word 0 (`0` when the reply
+/// carries none), and that handler's reply then decides. With no exception
+/// handler bound, the forward is a [`FAULT_REPLY_KILL`] reply carrying the
+/// forwarder's data word 0 as its decline reason. On a delivery of any other
+/// class, and on the fault of a restartable syscall's user copy, which the
+/// thread survives, it is a [`FAULT_REPLY_KILL`] reply (docs/fault-handling.md
+/// § Reply).
+pub const FAULT_REPLY_FORWARD: u64 = 2;
+
+/// Data word of a forwarded fault message ([`FAULT_REPLY_FORWARD`]) that
+/// carries the forwarder's data word 0; a delivery that no handler forwarded
+/// carries four data words, and a forwarded one five.
+pub const FAULT_FORWARD_REASON_WORD: usize = 4;
+
 /// Fault class bit: virtual-memory faults ([`FAULT_KIND_VM`]), the faults of a
 /// restartable syscall's user copy among them. A `fault_class_mask` selects
 /// classes by these bits (`docs/fault-handling.md` § Fault-Handler Binding).

@@ -18,8 +18,8 @@ use registry::{Resolver, Visibility};
 use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::registry_lookup_derived;
 use crate::restart::{
-    CreatedProcess, RestartCtx, StartupBlobs, destroy_partial_child, start_process,
-    walk_and_create_from_file,
+    CreatedProcess, RestartCtx, StartupBlobs, destroy_partial_child, mint_debug_authority,
+    start_process, walk_and_create_from_file,
 };
 
 /// Outcome of a successful launch — the bits svcmgr records on the
@@ -270,8 +270,13 @@ fn assemble_provided_boot_caps(
     };
 
     // Resolve seeds after namespace setup. Resolution cannot fail: an
-    // unresolved name becomes `0` in its slot (see `resolve_seeds`).
-    let seed_caps = resolve_seeds(&def.seed, &def.name, registry);
+    // unresolved name becomes `0` in its slot (see `resolve_seeds`). A
+    // debug-authority holder's authority cap rides the slot after them.
+    let mut seed_caps = resolve_seeds(&def.seed, &def.name, registry);
+    if def.debug_authority
+    {
+        seed_caps.push(mint_debug_authority(ctx));
+    }
 
     // A provider's own service-endpoint RECV is cap[0], ahead of the positional
     // seeds. Derive it before assembly so a derive failure tears the partial

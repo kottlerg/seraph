@@ -56,6 +56,12 @@ pub const FAULT_OUTCOME_REDELIVER: u8 = 3;
 /// the reply deposited its label and decline-reason word in the faulting
 /// thread's `ipc_msg`, which [`fault_dispatch`] reads for [`KillCause::Declined`].
 pub const FAULT_OUTCOME_DECLINED: u8 = 4;
+/// [`ThreadControlBlock::fault_outcome`] value: the handler of a
+/// [`CLASS_VM`] delivery replied [`syscall::FAULT_REPLY_FORWARD`];
+/// [`fault_dispatch`] delivers the fault again through the
+/// [`CLASS_EXCEPTION`] binding, with the reason word the reply deposited in
+/// the faulting thread's `ipc_msg` (docs/fault-handling.md § Reply).
+pub const FAULT_OUTCOME_FORWARDED: u8 = 5;
 
 /// [`deliver_once`]'s result when no binding was found: never a
 /// `fault_outcome` value, it reports [`KillCause::BindingCleared`].
@@ -171,13 +177,19 @@ pub enum KillCause
     /// thread, or a stop of the faulting thread).
     Cancelled,
     /// The handler replied [`syscall::FAULT_REPLY_KILL`], with the reason its
-    /// reply's data word 0 carried, if it sent one.
+    /// reply's data word 0 carried, if it sent one; or a VM-class handler
+    /// replied [`syscall::FAULT_REPLY_FORWARD`] with that reason while no
+    /// exception-class handler was bound.
     Declined(Option<u64>),
+    /// No handler was bound for the fault's class when the architecture
+    /// handler checked; nothing was delivered.
+    NoHandler,
 }
 
 /// Print, on the kernel serial console, why the user-mode fault of the thread
 /// whose id is `tid` went unhandled; the architecture kill path's
-/// `USERSPACE FAULT` diagnostic follows it. The decline reason is the
+/// `USERSPACE FAULT` diagnostic, which names the fault's kind, address, and
+/// instruction pointer, follows it. The decline reason is the
 /// handler's own value, printed verbatim; it is not interpreted here.
 #[cfg(not(test))]
 pub fn report_user_kill(tid: u32, cause: KillCause)
@@ -204,7 +216,34 @@ pub fn report_user_kill(tid: u32, cause: KillCause)
                 "fault unhandled: tid={tid} handler declined, reason={reason:#x}"
             );
         }
+        KillCause::NoHandler =>
+        {
+            crate::kprintln_serial!("fault unhandled: tid={tid} no handler bound");
+        }
     }
+}
+
+/// Print the [`KillCause::NoHandler`] line for the user-mode fault of `tcb`,
+/// which the architecture handler found no handler bound for and is about to
+/// kill (thread id 0 for a null `tcb`, as the kill path's own diagnostic
+/// prints it).
+///
+/// # Safety
+/// `tcb` is the running user thread's TCB, or null.
+#[cfg(not(test))]
+pub unsafe fn report_unbound_kill(tcb: *mut ThreadControlBlock)
+{
+    let tid = if tcb.is_null()
+    {
+        0
+    }
+    else
+    {
+        // SAFETY: tcb non-null and valid (contract); thread_id is fixed at
+        // creation.
+        unsafe { (*tcb).thread_id }
+    };
+    report_user_kill(tid, KillCause::NoHandler);
 }
 
 /// True iff `tcb` has a fault handler bound for the class of a fault of
@@ -409,9 +448,13 @@ pub unsafe fn release_endpoints(eps: [*mut EndpointObject; FAULT_CLASSES])
 /// the binding current then, in this loop rather than by a return to user
 /// mode, so a trap-type exception whose saved instruction pointer is already
 /// past the trapping instruction is not lost; a binding found cleared returns
-/// [`FaultOutcome::Kill`], the unhandled-fault path. Every pass parks, and
-/// only a binding change re-runs one, so the loop is iterative and bounded by
-/// the binder's changes.
+/// [`FaultOutcome::Kill`], the unhandled-fault path. A [`CLASS_VM`] delivery
+/// its handler forwarded ([`FAULT_OUTCOME_FORWARDED`]) is made again through
+/// the [`CLASS_EXCEPTION`] binding, which every later pass of the fault uses,
+/// with the forwarder's reason as data word 4; with that binding cleared the
+/// fault takes the outcome of the forwarder's own decline. Every pass parks,
+/// and only a binding change or the one forward re-runs one, so the loop is
+/// iterative and bounded by the binder's changes.
 ///
 /// # Preconditions
 /// - `tcb.trap_frame` already points at the canonical register frame the handler
@@ -424,35 +467,121 @@ pub unsafe fn release_endpoints(eps: [*mut EndpointObject; FAULT_CLASSES])
 #[cfg(not(test))]
 pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> FaultOutcome
 {
+    // SAFETY: this fn's contract is dispatch's.
+    unsafe { dispatch(tcb, info, Forwarding::Followed) }
+}
+
+/// [`fault_dispatch`] for the fault of a restartable syscall's user copy
+/// (docs/fault-handling.md § Kernel Copies): a forward of it is a decline,
+/// so the syscall fails with `InvalidAddress` and no exception handler sees a
+/// fault the thread survives (docs/fault-handling.md § Reply).
+///
+/// # Safety
+/// As for [`fault_dispatch`].
+#[cfg(not(test))]
+pub unsafe fn copy_fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> FaultOutcome
+{
+    // SAFETY: this fn's contract is dispatch's.
+    unsafe { dispatch(tcb, info, Forwarding::Declined) }
+}
+
+/// Whether [`dispatch`] delivers a forwarded fault through the exception
+/// class or takes the forward as a decline.
+#[cfg(not(test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Forwarding
+{
+    /// A forward is delivered through the exception class.
+    Followed,
+    /// A forward is a decline: the fault of a kernel copy.
+    Declined,
+}
+
+/// The loop [`fault_dispatch`] describes, with a forward taken as
+/// `forwarding` says.
+///
+/// # Safety
+/// As for [`fault_dispatch`].
+#[cfg(not(test))]
+unsafe fn dispatch(
+    tcb: *mut ThreadControlBlock,
+    info: &FaultInfo,
+    forwarding: Forwarding,
+) -> FaultOutcome
+{
+    let mut class = class_of_kind(info.kind);
+    let mut forwarded = Forward::None;
     loop
     {
-        // SAFETY: this fn's contract and preconditions are deliver_once's.
-        match unsafe { deliver_once(tcb, info) }
+        // SAFETY: this fn's contract and preconditions are deliver_once's;
+        // class < FAULT_CLASSES.
+        match unsafe { deliver_once(tcb, info, class, forwarded) }
         {
             FAULT_OUTCOME_RESUME => return FaultOutcome::Resume,
             FAULT_OUTCOME_REDELIVER =>
             {}
+            FAULT_OUTCOME_FORWARDED if forwarding == Forwarding::Declined =>
+            {
+                // SAFETY: tcb resumed by the wake of the forwarding reply.
+                return FaultOutcome::Kill(KillCause::Declined(unsafe { reply_reason(tcb) }));
+            }
+            FAULT_OUTCOME_FORWARDED =>
+            {
+                // SAFETY: tcb resumed by the wake of the forwarding reply.
+                forwarded = Forward::Reason(unsafe { reply_reason(tcb) });
+                class = CLASS_EXCEPTION;
+            }
             FAULT_OUTCOME_DECLINED =>
             {
-                // SAFETY: tcb still valid; the declining reply wrote ipc_msg as
-                // the winner of this episode's reply claim, before the wake
-                // that resumed this thread, and nothing writes it after that
-                // claim.
-                let reply = unsafe { &(*tcb).ipc_msg };
-                return FaultOutcome::Kill(KillCause::Declined(
-                    (reply.data_count > 0).then(|| reply.data[0]),
-                ));
+                // SAFETY: tcb resumed by the wake of the declining reply.
+                return FaultOutcome::Kill(KillCause::Declined(unsafe { reply_reason(tcb) }));
             }
-            DELIVERY_UNBOUND => return FaultOutcome::Kill(KillCause::BindingCleared),
+            DELIVERY_UNBOUND =>
+            {
+                return FaultOutcome::Kill(match forwarded
+                {
+                    Forward::Reason(reason) => KillCause::Declined(reason),
+                    Forward::None => KillCause::BindingCleared,
+                });
+            }
             // KILL, or a PENDING a spurious wake left: a cancelled delivery.
             _ => return FaultOutcome::Kill(KillCause::Cancelled),
         }
     }
 }
 
-/// Make one delivery of `info` through `tcb`'s binding and block until it is
-/// given a disposition, which is returned as its `fault_outcome` value, or
-/// return [`DELIVERY_UNBOUND`] when no binding was found.
+/// Whether a fault in [`fault_dispatch`] has been forwarded from the VM class
+/// to the exception class, and with which reason word.
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+enum Forward
+{
+    /// Not forwarded.
+    None,
+    /// Forwarded, with the forwarder's reason word if its reply carried one.
+    Reason(Option<u64>),
+}
+
+/// The reason word the declining or forwarding fault reply deposited in
+/// `tcb`'s `ipc_msg`, if the reply carried one.
+///
+/// # Safety
+/// `tcb` is the current CPU's running thread, resumed by the wake of that
+/// reply, which wrote `ipc_msg` as the winner of the episode's reply claim
+/// before the wake; nothing writes it after that claim.
+#[cfg(not(test))]
+unsafe fn reply_reason(tcb: *mut ThreadControlBlock) -> Option<u64>
+{
+    // SAFETY: the contract above.
+    let reply = unsafe { &(*tcb).ipc_msg };
+    (reply.data_count > 0).then(|| reply.data[0])
+}
+
+/// Make one delivery of `info` through `tcb`'s binding for `class` and block
+/// until it is given a disposition, which is returned as its `fault_outcome`
+/// value, or return [`DELIVERY_UNBOUND`] when no binding was found. A
+/// `forwarded` delivery carries the forwarder's reason (`0` for none) as data
+/// word [`syscall::FAULT_FORWARD_REASON_WORD`].
 ///
 /// Mirrors [`crate::syscall::ipc::sys_ipc_call`] but commits the
 /// [`IpcThreadState::BlockedOnFault`] state and reads the disposition from
@@ -468,13 +597,18 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
 /// queued there.
 ///
 /// # Safety
-/// As for [`fault_dispatch`].
+/// As for [`fault_dispatch`]; `class < FAULT_CLASSES`.
 #[cfg(not(test))]
-unsafe fn deliver_once(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> u8
+unsafe fn deliver_once(
+    tcb: *mut ThreadControlBlock,
+    info: &FaultInfo,
+    class: usize,
+    forwarded: Forward,
+) -> u8
 {
     // SAFETY: tcb is the current CPU's running thread; no lock is held; the
-    // class index is below FAULT_CLASSES.
-    let Some((ep_obj, badge)) = (unsafe { pin_binding(tcb, class_of_kind(info.kind)) })
+    // class index is below FAULT_CLASSES (this fn's contract).
+    let Some((ep_obj, badge)) = (unsafe { pin_binding(tcb, class) })
     else
     {
         return DELIVERY_UNBOUND;
@@ -500,6 +634,11 @@ unsafe fn deliver_once(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> u8
     msg.data[2] = info.d2;
     msg.data[3] = info.ip;
     msg.data_count = 4;
+    if let Forward::Reason(reason) = forwarded
+    {
+        msg.data[syscall::FAULT_FORWARD_REASON_WORD] = reason.unwrap_or(0);
+        msg.data_count = syscall::FAULT_FORWARD_REASON_WORD + 1;
+    }
 
     // SAFETY: ep_state is a valid EndpointState (this delivery's pin keeps it
     // live); tcb is the current CPU's running thread (this fn's contract); no

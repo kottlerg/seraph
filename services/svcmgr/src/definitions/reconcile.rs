@@ -400,6 +400,7 @@ fn recipe_from(def: &Definition) -> Option<RestartRecipe>
         cwd,
         seed: try_strings(&def.seed)?,
         log_sink: def.log_sink,
+        debug_authority: def.debug_authority,
         priority: def.priority.unwrap_or(0),
         sched_max: def.sched_max.unwrap_or(0),
     })

@@ -463,6 +463,8 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | `iommu_labels::MAX_FAULTS_PER_REPLY` | `shared/ipc/src/lib.rs` | 31 faults per `TAKE_FAULTS` reply, `(MSG_DATA_WORDS_MAX - 1) / 2` | ABI width (two data words per fault after the count) | none | correct as is | None; a fault past it stays queued for the next take, and devmgr takes again until a reply carries fewer |
 | `svcmgr_labels::NAME_MAX`, `NAME_WORDS` | `shared/ipc/src/lib.rs` | 64 B / 8 words | encoding artefact (a name beside the label and round header fits one message; longest name in use 15 B) | none | correct as is | None: the one svcmgr name limit, which the registry, its client, svcmgr, its parser and init's endowment share with the `pack_name` codec |
 | `QUERY_LIVE_PROCESSES` page | `shared/ipc/src/lib.rs` (`LIVE_PROCESSES_PAGE`) | `MSG_DATA_WORDS_MAX - 1` = 63 badges | per-message bound (the caller pages on) | none | correct as is | None |
+| `ATTACH_PROCESS` page | `shared/ipc/src/lib.rs` (`ATTACH_THREADS_PAGE`) | `MSG_CAP_SLOTS_MAX` = 4 Thread caps | per-message bound (the caller pages on with the first-thread index) | none | correct as is | None |
+| crash block frames, code bytes | `shared/crash-report/src/lib.rs` (`MAX_FRAMES`, `MAX_CODE_BYTES`) | 32 frames / 16 B | tuning (a stack scan's useful depth; the longest instruction of either architecture, 15 B) | none | correct as is | None |
 | `CREATE_SCHED_FIELD_MASK` | `shared/ipc/src/lib.rs` | 5 bits | ABI width (32 priority levels) | none | correct as is | None |
 | `BASELINE_PRIORITY_MAX`, `DEVMGR_BAND_MAX` | `shared/ipc/src/lib.rs` | 28 / 26 | encoding artefact (policy placement in 32 levels) | none | correct as is | None |
 | `INIT_REAP_CORRELATOR`, per-child correlator | `shared/ipc/src/lib.rs` | `u64::MAX`; the full process badge | ABI width (the kernel correlator is `u64`; the sentinel carries every verb bit, so no minted badge equals it) | none | correct as is | None |
@@ -668,6 +670,8 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 | wall time | `services/timed/src/main.rs` | `u64` microseconds | ABI width (about 584 000 years) | none | correct as is | None |
 | `forward_lines` buffer | `services/usertest/src/main.rs` | 512 B read chunk | batch size (lines accumulate unbounded) | 512 B stack | correct as is | None |
 | crasher settle sleep | `services/crasher/src/main.rs` | 500 ms | tuning (under the 3 s softlockup window) | none | correct as is | None |
+| `FAULT_BOUND`, `WATCHDOG_TICK` | `services/crashd/src/main.rs` | 2 s, checked every 100 ms | tuning (a report reads a few pages and writes about 60 log lines; the bound only ends a wait on a process blocked on the fault) | none | correct as is | None |
+| `STACK_SCAN_BYTES` | `services/crashd/src/main.rs` | 8 KiB | tuning (two pages of stack hold the frames a report shows) | 4 KiB stack chunk | correct as is | None |
 
 ### devmgr
 

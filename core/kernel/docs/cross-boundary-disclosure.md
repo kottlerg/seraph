@@ -73,7 +73,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, write_cap_results}` | b/c |
-| Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for`, `syscall::deliver_copy_fault` | b/d |
+| Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge, and, on a forwarded fault, data word 4 (the forwarding handler's reason word) | `ipc::fault::FaultInfo`, `ipc::fault::deliver_once`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for`, `syscall::deliver_copy_fault` | b/d |
 | Upcall message (`FAULT_KIND_UPCALL`) → the poster's cookie, the delivery point, and the thread's user instruction pointer, to the receiver of the thread's upcall binding; no kernel address, and nothing identifying the poster | `ipc::upcall::deliver`, `ipc::fault::FaultInfo` | b/d |
 | Exit / death reason encoding + death entry `(reason, correlator)` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
@@ -105,14 +105,16 @@ Notes on the non-obvious entries:
   it is reported clear there. RISC-V never sets the bit. The fault of a restartable
   syscall's user copy (`syscall::deliver_copy_fault`) carries the same words: the user
   faulting address, the access of the copy, the bit from a walk of the caller's own
-  tables (`copy_fault_present`, x86-64 only), and the syscall instruction as `ip`. No
-  other word carries a kernel VA or a value derived from one. The forwarded/readable
-  `TrapFrame` holds only user-mode register state (no kernel stack pointer, kernel return
-  address, or `CR3`/`satp`); the write path re-validates through `sanitize_for_user_resume`.
-  `sys_thread_read_regs` pins the Thread it resolves through `lookup_cap` for the call, so a
-  sibling's concurrent delete or revoke of the last Thread capability cannot free the thread
-  slab while `sched::with_held_frame` snapshots its trap frame: the snapshot
-  `copy_to_user_restartable` returns is the target's user register state.
+  tables (`copy_fault_present`, x86-64 only), and the syscall instruction as `ip`. A
+  fault a virtual-memory handler forwarded (`FAULT_REPLY_FORWARD`) carries the same words
+  and, as data word 4, the word that handler's reply sent, a user value the kernel copies
+  uninterpreted. No other word carries a kernel VA or a value derived from one. The
+  forwarded/readable `TrapFrame` holds only user-mode register state (no kernel stack pointer,
+  kernel return address, or `CR3`/`satp`); the write path re-validates through
+  `sanitize_for_user_resume`. `sys_thread_read_regs` pins the Thread it resolves through
+  `lookup_cap` for the call, so a sibling's concurrent delete or revoke of the last Thread
+  capability cannot free the thread slab while `sched::with_held_frame` snapshots its trap frame:
+  the snapshot `copy_to_user_restartable` returns is the target's user register state.
 - **Descriptor-table registers** are a hardware output, not a value the kernel emits:
   with `CR4.UMIP` clear, `SIDT` and `SGDT` execute at CPL 3 and return the IDTR and GDTR.
   The IDT and the BSP's GDT are statics in the kernel image, so on any CPU `SIDT`, and
@@ -329,13 +331,12 @@ serial-only class ([docs/console-model.md](../../../docs/console-model.md) § Ow
 across the boot lifecycle) is not userspace-readable. The
 always-on `USERSPACE FAULT` serial dumps print the faulting thread's *own* user
 registers, not kernel addresses, and the `fault unhandled` line ahead of one prints only the
-thread id and the fault handler's own decline-reason word. Every kernel VA outside the low-VA
-identity mappings (the boot-stack mapping and, until Phase 8, the AP trampoline page, whose VAs
-equal their physical addresses) lies in one of the two regions KASLR randomizes (the image
-or the direct map; see
-[docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout), so
-kernel-pointer console output is governed by the serial-only rule below; it must not be
-routed to any userspace-reachable IPC or log channel.
+thread id and the fault handler's own decline-reason word, or the kernel's own cause. Every
+kernel VA outside the low-VA identity mappings (the boot-stack mapping and, until Phase 8, the AP
+trampoline page, whose VAs equal their physical addresses) lies in one of the two regions KASLR
+randomizes (the image or the direct map; see [docs/memory-model.md](../../../docs/memory-model.md) §
+Virtual Address Space Layout), so kernel-pointer console output is governed by the serial-only rule
+below; it must not be routed to any userspace-reachable IPC or log channel.
 
 **KASLR values are serial-only.** The randomized kernel image base, direct-map base, and slide, and
 any kernel virtual address derived from them (an image VA or a direct-map VA), are secrets whose

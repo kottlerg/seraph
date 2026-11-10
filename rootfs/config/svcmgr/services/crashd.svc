@@ -1,0 +1,20 @@
+# crashd — the crash service.
+#
+# crashd reports each process that dies on a fault to the system log, as one
+# marked block (services/crashd/docs/block-format.md). `debug_authority =
+# yes` makes svcmgr mint a DEBUG_AUTHORITY SEND|GRANT on procmgr and deliver
+# it in the bootstrap slot after the seeds (cap[0] here, with no seeds):
+# crashd registers with it as the receiver of procmgr's crash endpoint and
+# attaches to each faulting process. Removing this recipe from the image
+# removes the reports: procmgr then declines every fault on that endpoint,
+# and a fault kills as it does with no handler.
+#
+# `restart = on_failure`: procmgr declines the faults that arrive while crashd
+# is down, and hands the endpoint to the respawned crashd when it registers.
+# `critical = no`: without crashd the system runs, unreported.
+binary          = /services/crashd
+priority        = 20
+restart         = on_failure
+critical        = no
+namespace       = none
+debug_authority = yes

@@ -144,6 +144,12 @@ jobs:
         # removal stick: a normal repack re-mirrors rootfs, which would restore
         # terminal.svc. The terminal is exercised in its own boot
         # (test-terminal, below).
+        #
+        # The svctest cell also drops crashd (the crash service, default-on), so
+        # one boot per arch and profile runs an image without it: its faults,
+        # crasher's among them, must kill as with no handler and leave no crash
+        # report (test-crash-report --expect none, below). The usertest cell keeps
+        # crashd and checks the crashme fixture's reports.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
@@ -152,6 +158,7 @@ jobs:
               cp sysroot/config/svcmgr/tests/crasher.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
+              rm -f sysroot/config/svcmgr/services/crashd.svc
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
               ;;
             usertest)
@@ -205,6 +212,10 @@ jobs:
             # naming svctest's logd_death_forward child.
             cargo xtask test-logd-reclaim --arch ${{ matrix.arch }} \
               --log target/xtask/run-parallel-saved/${{ matrix.arch }}-4cpu-1.log
+            # No extra boot: the image staged no crashd, so the log must hold
+            # no crash report.
+            cargo xtask test-crash-report --expect none \
+              --log target/xtask/run-parallel-saved/${{ matrix.arch }}-4cpu-1.log
           fi
           if [ "${{ matrix.tester }}" = "ktest" ]; then
             # Extra boots: the KASLR randomization test (#252). Boots the
@@ -221,6 +232,11 @@ jobs:
             cargo xtask test-map-redo --arch ${{ matrix.arch }} --timeout "$budget"
           fi
           if [ "${{ matrix.tester }}" = "usertest" ]; then
+            # No extra boot: the crash reports of the crashme fixture, which the
+            # usertest boot above ran with crashd staged, checked in the log it
+            # saved.
+            cargo xtask test-crash-report --expect reports \
+              --log target/xtask/run-parallel-saved/${{ matrix.arch }}-4cpu-1.log
             # Second boot: the terminal interactive test (keyboard input
             # through the terminal). It needs the QMP `test-terminal` runner
             # (host-side key injection) and so cannot ride run-parallel;

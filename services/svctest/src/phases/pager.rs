@@ -78,9 +78,9 @@ pub fn phases() -> &'static [Phase]
 /// Send memmgr, on this process's own memmgr cap, the fault message the
 /// kernel would for an access to `va` (memmgr attributes a fault by the
 /// cap's badge, docs/fault-handling.md § Security), and return its reply
-/// label, `FAULT_REPLY_RESUME` or `FAULT_REPLY_KILL`, with the decline code a
-/// `FAULT_REPLY_KILL` carries in the low half of data word 0 (zero on a
-/// resume): services/memmgr/docs/ipc-interface.md § Kernel-origin fault
+/// label, `FAULT_REPLY_RESUME` or `FAULT_REPLY_FORWARD`, with the decline
+/// code a `FAULT_REPLY_FORWARD` carries in the low half of data word 0 (zero
+/// on a resume): services/memmgr/docs/ipc-interface.md § Kernel-origin fault
 /// message tables the codes.
 fn forged_vm_fault(va: u64, access: u64) -> (u64, u64)
 {
@@ -95,7 +95,7 @@ fn forged_vm_fault(va: u64, access: u64) -> (u64, u64)
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &msg, ipc_buf) }
         .expect("refused_access: forged fault ipc_call failed");
-    let code = if reply.label == syscall_abi::FAULT_REPLY_KILL
+    let code = if reply.label == syscall_abi::FAULT_REPLY_FORWARD
     {
         reply.word(0) & 0xFFFF_FFFF
     }
@@ -119,13 +119,15 @@ const DECLINE_NO_REGION: u64 = 3;
 /// access, then, once the region is unregistered, no region.
 fn pager_refused_access_phase(_: &Caps)
 {
-    use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_READ, FAULT_REPLY_KILL, FAULT_REPLY_RESUME};
+    use syscall_abi::{
+        FAULT_ACCESS_EXEC, FAULT_ACCESS_READ, FAULT_REPLY_FORWARD, FAULT_REPLY_RESUME,
+    };
 
     let range = std::os::seraph::register_demand_paged(1).expect("refused_access: register");
     let va = range.va_start();
     assert_eq!(
         forged_vm_fault(va, FAULT_ACCESS_EXEC),
-        (FAULT_REPLY_KILL, DECLINE_ACCESS_REFUSED),
+        (FAULT_REPLY_FORWARD, DECLINE_ACCESS_REFUSED),
         "refused_access: a fetch from an unbacked read-write page was not declined as refused"
     );
     assert_eq!(
@@ -135,7 +137,7 @@ fn pager_refused_access_phase(_: &Caps)
     );
     assert_eq!(
         forged_vm_fault(va, FAULT_ACCESS_EXEC),
-        (FAULT_REPLY_KILL, DECLINE_ACCESS_REFUSED),
+        (FAULT_REPLY_FORWARD, DECLINE_ACCESS_REFUSED),
         "refused_access: a fetch from a backed read-write page was not declined as refused"
     );
 
@@ -156,7 +158,7 @@ fn pager_refused_access_phase(_: &Caps)
     );
     assert_eq!(
         forged_vm_fault(va, FAULT_ACCESS_READ),
-        (FAULT_REPLY_KILL, DECLINE_NO_REGION),
+        (FAULT_REPLY_FORWARD, DECLINE_NO_REGION),
         "refused_access: a read of an unregistered page was not declined as outside every region"
     );
     std::os::seraph::unreserve_pages(range);

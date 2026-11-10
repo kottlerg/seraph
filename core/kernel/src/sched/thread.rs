@@ -781,9 +781,11 @@ pub struct ThreadControlBlock
     /// [`crate::ipc::fault::FAULT_OUTCOME_RESUME`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_KILL`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_REDELIVER`] /
-    /// [`crate::ipc::fault::FAULT_OUTCOME_DECLINED`]. Set to `PENDING` with
+    /// [`crate::ipc::fault::FAULT_OUTCOME_DECLINED`] /
+    /// [`crate::ipc::fault::FAULT_OUTCOME_FORWARDED`]. Set to `PENDING` with
     /// the binding read that opens a delivery (under `sched_lock`), and by the
-    /// single wake-claim winner: `RESUME` or `DECLINED` by a genuine reply,
+    /// single wake-claim winner: `RESUME`, `DECLINED`, or `FORWARDED` by a
+    /// genuine reply,
     /// `KILL` by handler-thread destruction or cancellation, `REDELIVER` by a
     /// binding change, so
     /// resume-vs-cancellation is unambiguous. See `docs/fault-handling.md`.
@@ -808,8 +810,10 @@ pub struct ThreadControlBlock
     /// marks, written with it under [`sched_lock`](Self::sched_lock) by
     /// `fault_dispatch`'s binding read and read under that lock by a binder's
     /// in-flight check (`ipc::fault::delivery_in_flight`), so a change of one
-    /// class's binding cancels only a delivery of that class. Meaningful only
-    /// while `in_fault_delivery` is set.
+    /// class's binding cancels only a delivery of that class; also read by the
+    /// claiming fault reply (`sys_ipc_reply`), which the delivery's message
+    /// orders after the write, to honour a forward only from the VM class.
+    /// Meaningful only while `in_fault_delivery` is set.
     pub fault_delivery_class: u8,
 
     // === Asynchronous upcall ===

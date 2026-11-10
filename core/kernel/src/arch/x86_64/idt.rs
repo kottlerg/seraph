@@ -611,6 +611,11 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
             }
             // Handler declined (Kill) — fall through to terminate the thread.
         }
+        else
+        {
+            // SAFETY: tcb is the running user thread or null.
+            unsafe { crate::ipc::fault::report_unbound_kill(tcb) };
+        }
     }
 
     // Not resumed by a handler — kill (userspace) or fatal (kernel, or #DF/#MC
@@ -1353,6 +1358,11 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
                 return;
             }
             // Handler declined (Kill) — fall through to terminate the thread.
+        }
+        else
+        {
+            // SAFETY: tcb is the running user thread or null.
+            unsafe { crate::ipc::fault::report_unbound_kill(tcb) };
         }
     }
 

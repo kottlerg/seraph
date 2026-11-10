@@ -214,6 +214,8 @@ mod tests
             process_info_va: 0,
             started,
             dma_hold,
+            no_debug: false,
+            image: crate::ImageSpan::default(),
         }
     }
 

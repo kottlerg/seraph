@@ -171,6 +171,11 @@ pub struct Definition
     /// recipe carries this; supervision/restart otherwise follow the normal
     /// `restart`/`critical` fields.
     pub log_sink: bool,
+    /// `debug_authority = yes` endows the service with procmgr's debug
+    /// authority: svcmgr mints a `DEBUG_AUTHORITY`-badged `SEND|GRANT` on
+    /// procmgr and delivers it in the bootstrap slot after the `seed` caps.
+    /// Exclusive of `log_sink`.
+    pub debug_authority: bool,
     /// Priority level the service's initial thread is created at
     /// (`priority = ...`, range `1..=30`). `None` = unspecified: procmgr
     /// applies its default (`sched_policy::DEFAULT_SPAWN_PRIORITY` clamped

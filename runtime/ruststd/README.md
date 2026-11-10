@@ -407,7 +407,7 @@ primitives.
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Three-surface VA model, frame-allocation contract |
 | [docs/build-system.md](../../docs/build-system.md) | Std userspace target specs, including the inline stack probes that reach a thread stack's guard page |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline, process death |
-| [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault reply: `FAULT_REPLY_KILL` declines an unregistered guard-page fault, killing the faulting thread as an unhandled fault |
+| [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault reply: `FAULT_REPLY_FORWARD` declines an unregistered guard-page fault, which the exception handler declines in turn, killing the faulting thread as an unhandled fault |
 | [docs/capability-model.md](../../docs/capability-model.md) | "Kill process" pattern: a terminal fault on any thread tears down the whole process |
 | [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS`, `REGISTER_REGION`/`UNREGISTER_REGION` |
 | [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo` layout and version gating |

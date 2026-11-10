@@ -294,6 +294,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "crashd",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Services,
+        arch_only: None,
+    },
+    Spec {
         name: "svcmgr",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -471,6 +478,20 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "debugger-tester",
         install_name: Some("debugger"),
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::TestsPrograms,
+        arch_only: None,
+    },
+    Spec {
+        name: "crashme",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
+        name: "crashme-tester",
+        install_name: Some("crashme"),
         profile: BuildProfile::StdUser,
         dest: InstallDest::TestsPrograms,
         arch_only: None,

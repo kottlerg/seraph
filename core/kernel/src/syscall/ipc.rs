@@ -1079,12 +1079,14 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Fault reply: the caller is a thread the kernel parked BlockedOnFault by
     // fault redirection, not a SYS_IPC_CALL caller. The reply label alone
-    // carries the disposition (RESUME default, KILL declines); its caps are
-    // neither validated nor moved, and the faulter's CSpace is not grown. A
-    // KILL reply's data word 0, when sent, is the handler's decline reason:
-    // it is deposited in the faulter's ipc_msg, which this won claim owns,
-    // for the kill diagnostic (docs/fault-handling.md § Reply); an unreadable
-    // word deposits no reason rather than failing the reply. Record the
+    // carries the disposition (RESUME default, KILL declines, FORWARD
+    // declines a VM-class delivery to the exception class and is a KILL on any
+    // other); its caps are neither validated nor moved, and the faulter's
+    // CSpace is not grown. A KILL or FORWARD reply's data word 0, when sent,
+    // is the handler's decline reason: it is deposited in the faulter's
+    // ipc_msg, which this won claim owns, for the kill diagnostic or the
+    // forwarded message (docs/fault-handling.md § Reply); an unreadable word
+    // deposits no reason rather than failing the reply. Record the
     // outcome for the fault helper and wake the faulter, which resumes by
     // re-executing its faulting instruction (or continuing from a
     // handler-modified PC) rather than returning a syscall value. We won the
@@ -1094,7 +1096,7 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     // stable until enqueue_and_wake clears it.
     if unsafe { (*caller).ipc_state } == crate::sched::thread::IpcThreadState::BlockedOnFault
     {
-        let outcome = if label == syscall::FAULT_REPLY_KILL
+        let outcome = if label == syscall::FAULT_REPLY_KILL || label == syscall::FAULT_REPLY_FORWARD
         {
             let mut reply = Message::new(label);
             // SAFETY: tcb is the calling thread's valid TCB; ipc_buffer is
@@ -1109,7 +1111,18 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
             // SAFETY: caller pinned by the won claim, which owns its ipc_msg
             // until the wake below.
             unsafe { (*caller).ipc_msg = reply };
-            crate::ipc::fault::FAULT_OUTCOME_DECLINED
+            // SAFETY: caller pinned by the won claim; fault_delivery_class
+            // was written under its sched_lock when its delivery opened,
+            // before the message this reply answers was sent.
+            let class = usize::from(unsafe { (*caller).fault_delivery_class });
+            if label == syscall::FAULT_REPLY_FORWARD && class == crate::ipc::fault::CLASS_VM
+            {
+                crate::ipc::fault::FAULT_OUTCOME_FORWARDED
+            }
+            else
+            {
+                crate::ipc::fault::FAULT_OUTCOME_DECLINED
+            }
         }
         else
         {

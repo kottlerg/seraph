@@ -1631,9 +1631,9 @@ pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
 /// is mapped, user-accessible, and the live leaf PTE permits `access`, the
 /// faulting access — meaning the fault must be a stale TLB entry the CPU
 /// resolves on retry after a local `invlpg`. Returns `false` for any genuine
-/// fault (unmapped, or the live mapping still forbids the access); the caller then
-/// delivers the fault to the thread's fault handler or, with none bound, kills
-/// the thread (see [fault-handling.md](../../../../../docs/fault-handling.md)).
+/// fault (unmapped, or the live mapping still forbids the access); the caller
+/// then delivers the fault to the thread's fault handler or, with none bound,
+/// kills the thread (see [fault-handling.md](../../../../../docs/fault-handling.md)).
 /// Because a `true` result requires the live PTE to grant the access (and x86
 /// updates A/D in hardware), the retried instruction is guaranteed to make
 /// progress — no retry counter is needed.

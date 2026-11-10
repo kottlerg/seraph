@@ -1275,6 +1275,24 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
     const ERR_RSVD: u64 = 1 << 3;
     const ERR_INSTR: u64 = 1 << 4;
 
+    /// The access a `#PF` error code reports: an instruction fetch, else a
+    /// write, else a read (a fetch never sets the write bit).
+    fn access_of(error_code: u64) -> UserAccess
+    {
+        if error_code & ERR_INSTR != 0
+        {
+            UserAccess::Fetch
+        }
+        else if error_code & ERR_WRITE != 0
+        {
+            UserAccess::Store
+        }
+        else
+        {
+            UserAccess::Load
+        }
+    }
+
     super::cpu::debug_assert_kernel_entry_flags();
 
     // SAFETY: tf is constructed by isr_page_fault on this stack.
@@ -1295,18 +1313,7 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
         unsafe {
             core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
         }
-        let access = if error_code & ERR_INSTR != 0
-        {
-            UserAccess::Fetch
-        }
-        else if error_code & ERR_WRITE != 0
-        {
-            UserAccess::Store
-        }
-        else
-        {
-            UserAccess::Load
-        };
+        let access = access_of(error_code);
         // SAFETY: ring 0; the faulting thread's CR3 is still active (no context
         // switch since entry — the interrupt gate left IF=0).
         if unsafe { super::paging::user_fault_is_spurious(cr2, access) }
@@ -1370,18 +1377,10 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
             unsafe {
                 core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
             }
-            // A copy's fault is a data access: a load or a store.
-            let access = if error_code & ERR_WRITE != 0
-            {
-                UserAccess::Store
-            }
-            else
-            {
-                UserAccess::Load
-            };
+            // A copy's fault is a data access, which decodes as a load or a store.
             // SAFETY: ring 0 in the copying thread's context; its CR3 is still
             // active (the interrupt gate left IF=0).
-            if unsafe { super::paging::user_fault_is_spurious(cr2, access) }
+            if unsafe { super::paging::user_fault_is_spurious(cr2, access_of(error_code)) }
             {
                 // SAFETY: ring 0; drops the stale entry so the retried copy
                 // re-walks the satisfying mapping.
@@ -1421,12 +1420,7 @@ unsafe fn redirect_user_page_fault(
     present: bool,
 ) -> bool
 {
-    let mut bits = match access
-    {
-        UserAccess::Load => syscall::FAULT_ACCESS_READ,
-        UserAccess::Store => syscall::FAULT_ACCESS_WRITE,
-        UserAccess::Fetch => syscall::FAULT_ACCESS_EXEC,
-    };
+    let mut bits = access.fault_access_bit();
     if present
     {
         bits |= syscall::FAULT_ACCESS_PRESENT;

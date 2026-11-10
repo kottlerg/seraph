@@ -1691,13 +1691,13 @@ pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
 /// Walks the *current* (`satp`) page tables for `va` and returns `true` iff
 /// `va` is mapped, user-accessible, and the live leaf PTE permits `access`,
 /// the faulting access — meaning the fault must be a stale TLB entry the hart
-/// resolves on retry after a local `sfence.vma`. Returns `false` for any genuine fault
-/// (unmapped, or the live mapping still forbids the access); the caller then
-/// delivers it as a genuine fault per [fault-handling.md](../../../../../docs/fault-handling.md).
-/// A `true` result requires the live PTE to grant
-/// the access, and [`PageTableEntry::new_page`] pre-sets A (and D for writable
-/// leaves), so the retried instruction cannot re-fault on an A/D update even
-/// without Svadu — no retry counter is needed.
+/// resolves on retry after a local `sfence.vma`. Returns `false` for any
+/// genuine fault (unmapped, or the live mapping still forbids the access); the
+/// caller then delivers it as a genuine fault per
+/// [fault-handling.md](../../../../../docs/fault-handling.md). A `true` result
+/// requires the live PTE to grant the access, and [`PageTableEntry::new_page`]
+/// pre-sets A (and D for writable leaves), so the retried instruction cannot
+/// re-fault on an A/D update even without Svadu — no retry counter is needed.
 ///
 /// # Safety
 /// Must run in S-mode in the faulting thread's context, i.e. before `satp` has

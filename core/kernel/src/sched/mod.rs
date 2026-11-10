@@ -4892,11 +4892,12 @@ enum PullOutcome
     /// A thread moved to the destination.
     Moved,
     /// The loads read under the two locks fail the caller's [`PullRule`]: the
-    /// lock-free reading that chose the pull was transient.
+    /// lock-free reading that chose the pull no longer holds, being a transient
+    /// or a load that has changed since.
     RuleFailed,
-    /// Nothing moved for another reason: a contended try-lock, no unpinned
-    /// fully-saved `Ready` thread on the source, or a move the candidate's
-    /// `sched_lock` re-check refused.
+    /// Nothing moved for another reason: CPU indices that are equal or out of
+    /// range, a contended try-lock, no unpinned fully-saved `Ready` thread on
+    /// the source, or a move the candidate's `sched_lock` re-check refused.
     Deferred,
 }
 
@@ -4948,7 +4949,7 @@ impl IdleScan
     /// The scan with its most-loaded CPU dropped, so that [`idle_pull_step`]
     /// decides by the confirmation rule alone: the step that follows a pull at
     /// once whose re-check under the locks found the load past the threshold
-    /// transient.
+    /// no longer there.
     fn without_heaviest(self) -> Self
     {
         Self {
@@ -5161,17 +5162,17 @@ unsafe fn try_pull_idle(this_cpu: usize)
     let mut step = idle_pull_step(scan, candidate);
     if let IdlePullStep::Pull(src, PullRule::Imbalance) = step
     {
-        sched.set_idle_pull_candidate(None);
         // SAFETY: src < cpu_count and src != this_cpu (the scan names other
         // CPUs only); no scheduler lock held.
         if unsafe { pull_unpinned_ready(src, this_cpu, PullRule::Imbalance) }
             != PullOutcome::RuleFailed
         {
+            sched.set_idle_pull_candidate(None);
             return;
         }
-        // The load past the threshold was transient, so the confirmation rule
-        // decides this tick; otherwise a scan that kept reading the transient
-        // would never record the backlog behind it.
+        // The load past the threshold no longer holds, so the confirmation
+        // rule decides this tick; otherwise a scan that kept reading a
+        // transient would never record the backlog behind it.
         step = idle_pull_step(scan.without_heaviest(), candidate);
     }
 
@@ -5280,11 +5281,10 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize, rule: PullRule) ->
 /// `rule` on the two loads, pick the first unpinned fully-saved `Ready` thread
 /// on `src_cpu`, and move it to `dst_cpu` under its `sched_lock`, try-acquired.
 ///
-/// The caller chose the pull from loads read without these locks, and a
-/// CPU's `schedule()` raises its load for a moment under its own lock: it
-/// counts a slice-expiry requeue of the running thread before the dequeue
-/// that follows. A reading taken in that window passes a rule the settled
-/// load fails, so the rule is decided again here, where every load change has
+/// The caller chose the pull from loads read without these locks, which can
+/// catch a load `schedule()` has raised for a moment (a requeue of the running
+/// thread counted before the dequeue that follows) or one that has changed
+/// since, so the rule is decided again here, where every load change has
 /// completed (core/kernel/docs/scheduler.md § Load Balancing).
 ///
 /// # Safety
@@ -7235,9 +7235,9 @@ mod idle_pull_tests
     }
 
     // The defect caught: a pull chosen on a load `schedule()` had raised for a
-    // moment (a slice-expiry requeue counted before its dequeue) migrating a
-    // thread once that load has settled at a value the threshold rule fails, or
-    // a confirmed backlog refused for a load no rule asks of it.
+    // moment (a requeue of the running thread counted before its dequeue)
+    // migrating a thread once that load has settled at a value the threshold
+    // rule fails, or a confirmed backlog refused for a load no rule asks of it.
     #[test]
     fn a_pull_re_decided_under_the_locks_applies_only_its_own_rule()
     {
@@ -7249,7 +7249,7 @@ mod idle_pull_tests
     }
 
     // The defect caught: an idle CPU whose pull at once the re-check refused
-    // records nothing, so a scan that keeps reading the transient load never
+    // records nothing, so a scan that keeps reading a transient load never
     // samples the backlog behind it and the queued thread starves; or one that
     // passes over a candidate it has confirmed.
     #[test]

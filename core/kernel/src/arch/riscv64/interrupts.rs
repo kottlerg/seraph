@@ -687,14 +687,8 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         // (core/kernel/docs/memory-internals.md § SMP TLB Shootdown). Flush it locally and
         // re-execute the instruction (sepc not advanced); genuine faults fall through to the
         // kill path.
-        if is_userspace && matches!(cause_code, 12 | 13 | 15)
+        if is_userspace && let Some(access) = page_fault_access(cause_code)
         {
-            let access = match cause_code
-            {
-                12 => UserAccess::Fetch,
-                15 => UserAccess::Store,
-                _ => UserAccess::Load,
-            };
             // SAFETY: S-mode; the faulting hart's satp is still active (no
             // context switch since trap entry — SIE is clear).
             if unsafe { super::paging::user_fault_is_spurious(stval, access) }
@@ -849,26 +843,18 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
             // region is an unmapped or read-only user buffer. Redirect to the fixup
             // — which clears SUM and returns the bytes not copied — instead of
             // panicking.
-            if matches!(cause_code, 12 | 13 | 15)
+            if let Some(access) = page_fault_access(cause_code)
                 && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
             {
                 // A load or store fault the live tables already satisfy is a
                 // stale entry (a hart may cache an invalid one), as for a
                 // U-mode fault: flush it and retry the copy, so a page a fault
                 // handler has just mapped is not failed or delivered again
-                // (docs/fault-handling.md § Kernel Copies).
-                let access = match cause_code
-                {
-                    13 => Some(UserAccess::Load),
-                    15 => Some(UserAccess::Store),
-                    _ => None,
-                };
-                let spurious = access.is_some_and(|access| {
-                    // SAFETY: S-mode in the copying thread's context; its satp
-                    // is still active (SIE is clear).
-                    unsafe { super::paging::user_fault_is_spurious(live.stval, access) }
-                });
-                if spurious
+                // (docs/fault-handling.md § Kernel Copies). A fetch fault at a
+                // copy's sepc names a kernel VA, which is never spurious.
+                // SAFETY: S-mode in the copying thread's context; its satp is
+                // still active (SIE is clear).
+                if unsafe { super::paging::user_fault_is_spurious(live.stval, access) }
                 {
                     // SAFETY: S-mode; drops the stale entry for the retry.
                     unsafe { super::paging::flush_page(live.stval) };
@@ -934,33 +920,37 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
 #[cfg(not(test))]
 fn fault_info_for(cause_code: u64, frame: &TrapFrame) -> crate::ipc::fault::FaultInfo
 {
-    match cause_code
+    match page_fault_access(cause_code)
     {
-        // scause: 12 = instruction page fault, 13 = load page fault, 15 =
-        // store/AMO page fault. RISC-V does not encode present-vs-not-present in
-        // scause, so the PRESENT flag is left unset (a handler that needs it
-        // inspects its mappings).
-        12 | 13 | 15 =>
-        {
-            let access = match cause_code
-            {
-                12 => syscall::FAULT_ACCESS_EXEC,
-                15 => syscall::FAULT_ACCESS_WRITE,
-                _ => syscall::FAULT_ACCESS_READ, // 13 = load
-            };
-            crate::ipc::fault::FaultInfo {
-                kind: syscall::FAULT_KIND_VM,
-                d1: frame.stval,
-                d2: access,
-                ip: frame.sepc,
-            }
-        }
-        _ => crate::ipc::fault::FaultInfo {
+        // RISC-V does not encode present-vs-not-present in scause, so the
+        // PRESENT flag is left unset (a handler that needs it inspects its
+        // mappings).
+        Some(access) => crate::ipc::fault::FaultInfo {
+            kind: syscall::FAULT_KIND_VM,
+            d1: frame.stval,
+            d2: access.fault_access_bit(),
+            ip: frame.sepc,
+        },
+        None => crate::ipc::fault::FaultInfo {
             kind: syscall::FAULT_KIND_EXCEPTION,
             d1: normalize_riscv_exception(cause_code),
             d2: frame.stval,
             ip: frame.sepc,
         },
+    }
+}
+
+/// The access a page-fault `scause` reports (12 = instruction page fault,
+/// 13 = load page fault, 15 = store/AMO page fault), or `None` for any other
+/// cause.
+fn page_fault_access(cause_code: u64) -> Option<UserAccess>
+{
+    match cause_code
+    {
+        12 => Some(UserAccess::Fetch),
+        13 => Some(UserAccess::Load),
+        15 => Some(UserAccess::Store),
+        _ => None,
     }
 }
 

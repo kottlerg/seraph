@@ -1,11 +1,10 @@
 ## Summary
 <one to three sentences: what changed and why>
 
-Closes #<issue>
-<!-- For a follow-up Issue this PR drains, write `Refs #<issue>` (or `Fixes #<issue>` when no item
-is left open once the PR's last run is recorded), tick each fixed item on the Issue with
-`(fixed by PR #<this PR>)`, and copy only those items below
-(docs/conventions.md § Branch and PR Workflow). -->
+Fixes #<issue>
+<!-- For an Issue this PR changes without closing, and for a rolling follow-up Issue, write
+`Refs #<issue>`. Tick each fixed item on the Issue with `(fixed by PR #<this PR>)` and copy only
+those items below (docs/conventions.md § Follow-up Issues). -->
 
 ## Acceptance
 <copy the Acceptance section of the linked Issue verbatim (for a follow-up Issue, only the items
@@ -15,9 +14,10 @@ this PR fixes); tick items completed by this PR>
 ## Test plan
 - [ ] `cargo xtask lint-docs`
 - [ ] `cargo xtask build` (x86_64)
-- [ ] `cargo xtask run` (x86_64), terminal pass marker observed
+- [ ] boot on x86_64 (`cargo xtask run`, or `run-parallel --parallel 1 --runs 1`), terminal pass
+      marker observed
 - [ ] `cargo xtask build --arch riscv64`
-- [ ] `cargo xtask run --arch riscv64`, terminal pass marker observed
+- [ ] boot on riscv64, terminal pass marker observed
 - [ ] additional component-specific checks: <…>
 
 ## Validation

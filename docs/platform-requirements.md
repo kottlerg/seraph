@@ -165,11 +165,13 @@ Each feature is classified per architecture as one of:
 
 ### Required
 
-- **Instruction baseline** — RV64GCV plus Zba/Zbb/Zbs. The Vector extension is a hard requirement;
+- **Instruction baseline** — RV64GCV plus Zba/Zbb/Zbs. The compressed (C) extension is part of it; a
+  debugger's single-step plants the 2-byte `c.ebreak` it encodes
+  ([fault-handling.md](fault-handling.md) § Debugging). The Vector extension is a hard requirement;
   the kernel reads `vlenb` on the boot hart and refuses `vlenb == 0`, a `vlenb` above 8192 (VLEN
-  65536, the V specification's largest), or one that is not a power of two. Any other vector
-  length is accepted: each thread's save area grows with it (`304 + 32 * vlenb` bytes, rounded up
-  to pages; `core/kernel/src/arch/riscv64/fpu.rs`, `core/kernel/src/sched/thread_slot.rs`).
+  65536, the V specification's largest), or one that is not a power of two. Any other vector length
+  is accepted: each thread's save area grows with it (`304 + 32 * vlenb` bytes, rounded up to pages;
+  `core/kernel/src/arch/riscv64/fpu.rs`, `core/kernel/src/sched/thread_slot.rs`).
 - **Uniform vector length** — every hart has the boot hart's `vlenb`. Each thread's save area is
   sized from the boot hart's, and the save and restore paths stride by the running hart's, so each
   secondary hart reads its own `vlenb` at bring-up and a different value halts the boot.
@@ -227,6 +229,11 @@ Each feature is classified per architecture as one of:
 - **Zkr seed CSR** — not used: M-mode-owned under default firmware, so it is not an S-mode
   entropy source; the kernel reports no riscv64 hardware RNG (see
   [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
+- **Sdtrig debug triggers (SBI Debug Triggers, DBTR)** — not used: the kernel programs no trigger.
+  The reference platform (QEMU `-cpu max` under OpenSBI) offers two triggers through DBTR, of the
+  address-match types, and no instruction-count (`icount`) trigger, which a single-step would
+  need; a debugger steps a riscv64 thread with software breakpoints instead
+  ([fault-handling.md](fault-handling.md) § Debugging).
 
 ---
 
@@ -309,4 +316,5 @@ required-vs-opportunistic rule are architecture-neutral and unchanged.
 [Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Architecture Overview](architecture.md), [Build System](build-system.md),
-[Memory Model](memory-model.md)
+[Fault Handling](fault-handling.md), [Memory Model](memory-model.md),
+[shared/riscv-step/README.md](../shared/riscv-step/README.md)

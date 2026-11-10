@@ -62,6 +62,8 @@ use super::gdt::KERNEL_CS;
 use super::trap_frame::TrapFrame;
 #[cfg(not(test))]
 use crate::fatal;
+#[cfg(not(test))]
+use crate::mm::paging::UserAccess;
 
 // ── IdtEntry ──────────────────────────────────────────────────────────────────
 
@@ -1273,6 +1275,24 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
     const ERR_RSVD: u64 = 1 << 3;
     const ERR_INSTR: u64 = 1 << 4;
 
+    /// The access a `#PF` error code reports: an instruction fetch, else a
+    /// write, else a read (a fetch never sets the write bit).
+    fn access_of(error_code: u64) -> UserAccess
+    {
+        if error_code & ERR_INSTR != 0
+        {
+            UserAccess::Fetch
+        }
+        else if error_code & ERR_WRITE != 0
+        {
+            UserAccess::Store
+        }
+        else
+        {
+            UserAccess::Load
+        }
+    }
+
     super::cpu::debug_assert_kernel_entry_flags();
 
     // SAFETY: tf is constructed by isr_page_fault on this stack.
@@ -1293,11 +1313,10 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
         unsafe {
             core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
         }
-        let write = error_code & ERR_WRITE != 0;
-        let instr = error_code & ERR_INSTR != 0;
+        let access = access_of(error_code);
         // SAFETY: ring 0; the faulting thread's CR3 is still active (no context
         // switch since entry — the interrupt gate left IF=0).
-        if unsafe { super::paging::user_fault_is_spurious(cr2, write, instr) }
+        if unsafe { super::paging::user_fault_is_spurious(cr2, access) }
         {
             // SAFETY: ring 0; drops the stale TLB entry so the retried
             // instruction re-walks the now-satisfying mapping.
@@ -1329,7 +1348,7 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
             let present = error_code & ERR_PRESENT != 0 && cr2 < crate::mm::user_va_top();
             // SAFETY: tf is the live TrapFrame; the redirect points the TCB at it
             // for the block and returns whether to resume.
-            if unsafe { redirect_user_page_fault(tcb, tf, cr2, write, instr, present) }
+            if unsafe { redirect_user_page_fault(tcb, tf, cr2, access, present) }
             {
                 return;
             }
@@ -1358,10 +1377,10 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
             unsafe {
                 core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
             }
-            let write = error_code & ERR_WRITE != 0;
+            // A copy's fault is a data access, which decodes as a load or a store.
             // SAFETY: ring 0 in the copying thread's context; its CR3 is still
             // active (the interrupt gate left IF=0).
-            if unsafe { super::paging::user_fault_is_spurious(cr2, write, false) }
+            if unsafe { super::paging::user_fault_is_spurious(cr2, access_of(error_code)) }
             {
                 // SAFETY: ring 0; drops the stale entry so the retried copy
                 // re-walks the satisfying mapping.
@@ -1397,27 +1416,14 @@ unsafe fn redirect_user_page_fault(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
     frame: *mut TrapFrame,
     cr2: u64,
-    write: bool,
-    instr: bool,
+    access: UserAccess,
     present: bool,
 ) -> bool
 {
-    let mut access = 0u64;
-    if write
-    {
-        access |= syscall::FAULT_ACCESS_WRITE;
-    }
-    if instr
-    {
-        access |= syscall::FAULT_ACCESS_EXEC;
-    }
-    if !write && !instr
-    {
-        access |= syscall::FAULT_ACCESS_READ;
-    }
+    let mut bits = access.fault_access_bit();
     if present
     {
-        access |= syscall::FAULT_ACCESS_PRESENT;
+        bits |= syscall::FAULT_ACCESS_PRESENT;
     }
 
     // SAFETY: frame is valid.
@@ -1425,7 +1431,7 @@ unsafe fn redirect_user_page_fault(
     let info = crate::ipc::fault::FaultInfo {
         kind: syscall::FAULT_KIND_VM,
         d1: cr2,
-        d2: access,
+        d2: bits,
         ip: rip,
     };
 

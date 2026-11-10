@@ -21,10 +21,10 @@
 //! Tier 2 scenarios:
 //! - `sbi_gating.rs` — `SYS_SBI_CALL` refuses kernel-reserved extensions and
 //!   sanctioned ones the cap lacks the right for
-//!
-//! No single-step scenario: x86-64 runs `single_step.rs` here, but RISC-V has
-//! no user-mode single-step without a debug trigger, which the kernel does not
-//! program (docs/fault-handling.md § Debugging; #820).
+//! - `single_step.rs` — a debugger steps a thread by planting `c.ebreak` at
+//!   each successor (RISC-V has no user-mode single-step without a debug
+//!   trigger, which the kernel does not program; docs/fault-handling.md
+//!   § Debugging)
 
 pub mod callee_saved;
 pub mod code_stub;
@@ -34,6 +34,7 @@ mod sbi_call;
 mod sbi_gating;
 mod sbi_shutdown;
 pub mod serial;
+mod single_step;
 
 use init_protocol::InitInfo;
 
@@ -257,6 +258,5 @@ pub fn run_unit(ctx: &TestContext)
 pub fn run_integration(ctx: &TestContext)
 {
     crate::run_integration_test!("integration::sbi_gating", sbi_gating::run(ctx));
-    // No `integration::single_step`: RISC-V has no user-mode single-step
-    // (docs/fault-handling.md § Debugging; #820).
+    crate::run_integration_test!("integration::single_step", single_step::run(ctx));
 }

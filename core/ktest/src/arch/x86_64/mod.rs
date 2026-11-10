@@ -128,6 +128,17 @@ pub const fn entry_stack_pointer(sp: u64) -> u64
     (sp & !0xF).wrapping_sub(8)
 }
 
+/// Rewrite the `rflags` slot of the register file `regs` (as
+/// `thread_read_regs` returns it, at least [`TRAP_FRAME_BYTES`] long) through
+/// `edit`: the trap-flag edit of the x86-64 cells that step a thread.
+fn edit_rflags(regs: &mut [u8], edit: impl FnOnce(u64) -> u64)
+{
+    let at = syscall_abi::REGS_X86_64_FLAGS_OFFSET;
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&regs[at..at + 8]);
+    regs[at..at + 8].copy_from_slice(&edit(u64::from_le_bytes(word)).to_le_bytes());
+}
+
 /// Byte offset of the syscall-number register (`rax`) in the kernel
 /// `TrapFrame`: it holds the number of the syscall a thread is blocked in
 /// until the dispatcher writes the return value on the way out.

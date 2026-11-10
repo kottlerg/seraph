@@ -18,6 +18,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`process-layout/`](process-layout/README.md) | Per-process bootstrap virtual-address layout for process creators |
 | [`registry/`](registry/README.md) | Growable name→endpoint-cap registry used by supervisor services |
 | [`registry-client/`](registry-client/README.md) | Client-side helper for the svcmgr name→cap discovery registry |
+| [`riscv-step/`](riscv-step/README.md) | Successor-address decoder a debugger single-steps a riscv64 thread with |
 | [`shmem/`](shmem/README.md) | Shared-memory byte transport — multi-page `SharedBuffer` plus SPSC ring |
 | [`syscall/`](syscall/README.md) | Userspace syscall wrappers — inline asm over `abi/syscall/` |
 | [`text/`](text/README.md) | Byte-stream → glyph primitives shared by every framebuffer console |

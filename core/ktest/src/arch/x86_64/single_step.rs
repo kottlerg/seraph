@@ -25,8 +25,7 @@ use syscall::{
 };
 use syscall_abi::{
     FAULT_CLASS_EXCEPTION, FAULT_EXC_BREAKPOINT, FAULT_EXC_DEBUG, FAULT_KIND_EXCEPTION,
-    FAULT_LABEL, FAULT_REPLY_RESUME, REGS_X86_64_FLAGS_OFFSET, RIGHTS_NTF_NOTIFY, SYS_THREAD_YIELD,
-    X86_64_RFLAGS_TF,
+    FAULT_LABEL, FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY, SYS_THREAD_YIELD, X86_64_RFLAGS_TF,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -155,11 +154,7 @@ fn edit_flags(th: u64, edit: impl FnOnce(u64) -> u64) -> TestResult
     let mut regs = [0u8; BUF];
     thread_read_regs(th, &mut regs[..BUF])
         .map_err(|_| "integration::single_step: thread_read_regs failed")?;
-    let at = REGS_X86_64_FLAGS_OFFSET;
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&regs[at..at + 8]);
-    let flags = edit(u64::from_le_bytes(word));
-    regs[at..at + 8].copy_from_slice(&flags.to_le_bytes());
+    super::edit_rflags(&mut regs, edit);
     // SAFETY: the frame was read from this child, fault-blocked; only the
     // trap flag changes, which decides whether the next instruction traps,
     // and nothing of the thread's memory or control flow.

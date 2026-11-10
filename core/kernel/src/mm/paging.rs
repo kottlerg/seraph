@@ -237,6 +237,36 @@ impl MapOutcome
     }
 }
 
+/// The access a user page fault made, decoded once from the architecture's
+/// fault report: the spurious-fault retry
+/// (`arch::current::paging::user_fault_is_spurious`) asks whether the live leaf
+/// PTE grants it, and the fault message names it ([`Self::fault_access_bit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserAccess
+{
+    /// A data read.
+    Load,
+    /// A data write (on RISC-V, a store or AMO).
+    Store,
+    /// An instruction fetch.
+    Fetch,
+}
+
+impl UserAccess
+{
+    /// The `FAULT_ACCESS_*` bit that names this access in a `FAULT_KIND_VM`
+    /// fault message's `d2` (docs/fault-handling.md).
+    pub fn fault_access_bit(self) -> u64
+    {
+        match self
+        {
+            Self::Load => syscall::FAULT_ACCESS_READ,
+            Self::Store => syscall::FAULT_ACCESS_WRITE,
+            Self::Fetch => syscall::FAULT_ACCESS_EXEC,
+        }
+    }
+}
+
 // ── Static boot table pool ────────────────────────────────────────────────────
 
 /// Number of 4 KiB frames in the stage-1 BSS seed (256 KiB).
@@ -1230,6 +1260,28 @@ mod tests
 {
     use super::*;
     use boot_protocol::{MemoryMapEntry, MemoryMapSlice, MemoryType};
+
+    // ── User fault access ────────────────────────────────────────────────────
+
+    // The defect caught: a fault message that names the wrong access (a store
+    // reported to the handler as a read, a fetch as a write), which a pager
+    // reads to decide how to satisfy the fault.
+    #[test]
+    fn each_user_access_names_its_own_fault_access_bit()
+    {
+        assert_eq!(
+            UserAccess::Load.fault_access_bit(),
+            syscall::FAULT_ACCESS_READ
+        );
+        assert_eq!(
+            UserAccess::Store.fault_access_bit(),
+            syscall::FAULT_ACCESS_WRITE
+        );
+        assert_eq!(
+            UserAccess::Fetch.fault_access_bit(),
+            syscall::FAULT_ACCESS_EXEC
+        );
+    }
 
     // ── Kernel MMIO in the direct map ────────────────────────────────────────
 

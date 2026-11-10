@@ -80,13 +80,21 @@ fn fault_here(arg: &str, mode: Mode) -> !
     outer(mode);
 }
 
-/// A thread parked until its sender drops or sends.
+/// A thread parked until its sender drops or sends, returned once it runs.
+/// The runtime registers a thread with procmgr before it runs its code, so
+/// the thread is registered (or refused) by then, and an attach after it
+/// lists the thread in its place.
 fn park() -> (mpsc::Sender<()>, JoinHandle<()>)
 {
     let (tx, rx) = mpsc::channel::<()>();
+    let (ready_tx, ready) = mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
+        let _ = ready_tx.send(());
         let _ = rx.recv();
     });
+    ready
+        .recv()
+        .unwrap_or_else(|_| fail("a parked thread did not start"));
     (tx, handle)
 }
 
@@ -103,7 +111,7 @@ fn worker(arg: &str)
         })
         .unwrap_or_else(|| fail("worker: no endpoint"));
     let (held_tx, held_rx) = mpsc::channel::<()>();
-    let _holder = std::thread::spawn(move || hold_one_fault(endpoint, &held_tx));
+    let _holder = std::thread::spawn(move || hold_one_fault(endpoint, held_tx));
 
     let (cap_tx, cap_rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel::<()>();
@@ -136,8 +144,10 @@ fn worker(arg: &str)
 
 /// Receive one fault on `endpoint`, tell the main thread, and never answer
 /// it, so its thread stays fault-blocked until the process dies. The thread
-/// receives nothing more, which would cancel the held fault.
-fn hold_one_fault(endpoint: u64, held: &mpsc::Sender<()>) -> !
+/// receives nothing more, which would cancel the held fault. A failed
+/// receive drops `held` unsent, so the main thread's wait fails and the
+/// fixture reports the setup failure.
+fn hold_one_fault(endpoint: u64, held: mpsc::Sender<()>) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: ipc_buf is this thread's registered IPC buffer page.
@@ -145,6 +155,7 @@ fn hold_one_fault(endpoint: u64, held: &mpsc::Sender<()>) -> !
     {
         let _ = held.send(());
     }
+    drop(held);
     loop
     {
         std::thread::park();

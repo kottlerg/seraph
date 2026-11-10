@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// services/gdbstub/src/arch/riscv64/mod.rs
+
+//! riscv64: the single step plants `c.ebreak` at the stepped instruction's
+//! successor (`shared/riscv-step`) through `THREAD_MEM_TEXT`, while every
+//! other thread of the target is stopped, and writes the saved bytes back
+//! when the breakpoint is taken.
+
+/// What a step left to undo when its stop arrives: the `c.ebreak` planted at
+/// `addr` over `saved`, written back then.
+#[derive(Clone, Copy, Debug)]
+pub struct StepUndo
+{
+    addr: u64,
+    saved: [u8; 2],
+}
+
+/// The target description the stub serves.
+pub const ARCH: gdb_rsp::target::Arch = gdb_rsp::target::Arch::Riscv64;
+
+/// Read `buf.len()` bytes at `va` of `thread`'s address space.
+fn read(thread: u64, va: u64, buf: &mut [u8]) -> Result<(), ()>
+{
+    syscall::thread_read_mem(thread, va, buf)
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+/// Plant `c.ebreak` at the successor of the instruction the stopped thread
+/// `thread` (register file `regs`) runs next, saving the bytes it replaces.
+///
+/// # Errors
+/// The instruction cannot be read, or the decoder gives no successor
+/// (`riscv_step::StepError`), or the plant fails.
+pub fn prepare_step(thread: u64, regs: &mut [u8]) -> Result<StepUndo, ()>
+{
+    let pc = gdbstub::regs::pc(ARCH, regs);
+    let mut first = [0u8; 2];
+    read(thread, pc, &mut first)?;
+    let parcel = u16::from_le_bytes(first);
+    let len = riscv_step::instruction_len(parcel).map_err(|_| ())?;
+    let mut insn = [0u8; 4];
+    insn[..2].copy_from_slice(&first);
+    if len == 4
+    {
+        read(thread, pc + 2, &mut insn[2..])?;
+    }
+    let reg = |n: u32| {
+        let at = syscall_abi::REGS_RISCV64_X1_OFFSET + (n as usize - 1) * 8;
+        regs.get(at..at + 8)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u64::from_le_bytes)
+    };
+    let next = riscv_step::successor(pc, u32::from_le_bytes(insn), reg).map_err(|_| ())?;
+    let mut saved = [0u8; 2];
+    read(thread, next, &mut saved)?;
+    // SAFETY: the write lands in the target's address space, not the stub's
+    // own, through the kernel's text route; every other thread of the target
+    // is stopped, as the route requires (docs/fault-handling.md § Debugging).
+    unsafe {
+        syscall::thread_write_mem(
+            thread,
+            next,
+            &riscv_step::C_EBREAK,
+            syscall_abi::THREAD_MEM_TEXT,
+        )
+    }
+    .map_err(|_| ())?;
+    Ok(StepUndo { addr: next, saved })
+}
+
+/// Write the bytes [`prepare_step`] saved back over its `c.ebreak`.
+pub fn finish_step(thread: u64, undo: StepUndo, _regs: &mut [u8])
+{
+    // SAFETY: as in prepare_step: the target's text, through the kernel's
+    // text route, with the target's other threads stopped.
+    let _ = unsafe {
+        syscall::thread_write_mem(thread, undo.addr, &undo.saved, syscall_abi::THREAD_MEM_TEXT)
+    };
+}

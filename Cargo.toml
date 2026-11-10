@@ -43,6 +43,7 @@ members = [
     "services/drivers/virtio/input",
     "services/drivers/virtio/console",
     "services/debug-echo",
+    "services/gdbstub",
     "services/fs/fat",
     "services/fs/fat/fat-parse",
     "abi/boot-protocol",

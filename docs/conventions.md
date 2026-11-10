@@ -186,10 +186,11 @@ maintainer's acceptance of it, as a statement of that decision.
 - No tool or assistant attribution, in a commit message or a PR description: no attribution
   trailer and no link to an assistant session.
 - No `Co-authored-by` trailers unless the change was genuinely co-authored.
-- No quotation of the maintainer. A commit message, a PR description, an Issue, a comment, and
-  a tracked file MUST state a decision of the maintainer as a decision, in the project's own
-  words, and MUST NOT quote what the maintainer wrote in a working session: a session's wording
-  is not project record. A local, uncommitted record MAY keep the words.
+- No quotation of the maintainer. [documentation-standards.md](documentation-standards.md)
+  § Tone and Language owns the rule for permanent text, commit messages included: a decision of
+  the maintainer is stated as a decision, in the project's own words, and what the maintainer
+  wrote in a working session is not quoted. A PR description, an Issue, and a comment on
+  either MUST follow the same rule.
 
 ### Operations
 

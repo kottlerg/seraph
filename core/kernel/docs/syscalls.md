@@ -439,7 +439,8 @@ cap-transfer result block (count, then the delivered destination handles) at wor
 that passes its capability check and cap-slot pre-allocation while a reply is still pending first
 releases the pending caller (a receive refused before then leaves the binding): its
 `SYS_IPC_CALL` returns `Interrupted`, a fault-blocked caller is killed as for any cancelled
-fault episode, and a caller blocked in an upcall delivery has its upcall dropped and resumes
+fault episode (for the fault of a restartable syscall's user copy, that syscall fails with
+`InvalidAddress`), and a caller blocked in an upcall delivery has its upcall dropped and resumes
 ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
 Upcalls). The binding is therefore never overwritten
 ([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model).

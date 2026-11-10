@@ -1,8 +1,9 @@
 # Testing
 
 System-wide standard for the in-tree test harnesses, the per-program tester
-protocol, the sysroot layout for test binaries, and the gating mechanism
-that determines which harnesses run in a given boot.
+protocol, the sysroot layout for test binaries, the gating mechanism
+that determines which harnesses run in a given boot, and the tools that
+diagnose a failing boot.
 
 This document covers booted functional testing. Host-side `#[cfg(test)]` unit
 tests — their quality rules and the boundary between host-unit and booted
@@ -1075,6 +1076,76 @@ via ACPI (x86_64) or SBI (riscv64) per `KtestConfig::DEFAULT.shutdown_policy`
   deliver, or a public name that did not resolve, MUST log the missing cap
   when it skips or fails, so failures attributable to missing capabilities
   are diagnosable.
+
+---
+
+## Troubleshooting
+
+A failing boot is diagnosed with the tool that fits its class of defect:
+
+| Defect class | Tool |
+|---|---|
+| Timing-sensitive race: a failure that comes and goes across boots, or moves with the CPU count or host load | Log instrumentation and repeat runs |
+| Deterministic userspace fault | The fault report on the serial log, resolved with `cargo xtask symbolize` |
+| Deterministic kernel crash; a failure before the serial console is up; a wedged guest; a question about raw machine state | QEMU's gdbstub |
+| Per-process debugging of a running system | The serial GDB stub (design intent; not yet implemented, [#835](https://github.com/kottlerg/seraph/issues/835)) |
+
+**Races.** A debugger stops the CPUs it inspects and moves the timing a race depends on, so a
+race is chased with log lines placed around the suspect window and with repeated boots, which turn
+a rare failure into a rate: `cargo xtask run-parallel --runs N --parallel P --save-logs DIR`
+([xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)) keeps the log of every failing
+run, and the CPU counts of [Coverage tiers](#coverage-tiers) are where SMP races show first.
+
+**Userspace faults.** A thread an unhandled fault kills
+([docs/fault-handling.md](fault-handling.md)) leaves the kernel's `USERSPACE FAULT` dump on the
+serial log, whose instruction pointer (`rip=` on x86_64, `sepc=` on
+riscv64) is a runtime address in the faulting process's image. The image's load bias is on the
+creator's spawn line ([docs/userspace-memory-model.md](userspace-memory-model.md#image-placement)
+§ Image Placement), and `cargo xtask symbolize --binary <binary> --bias <bias> <address>...`
+([xtask/README.md](../xtask/README.md#cargo-xtask-symbolize)) resolves the address to function,
+file, and line, or to the nearest function symbol in a build without debug information. With
+crashd staged, the default, a fault of a process procmgr created also leaves a crash report, a
+marked block in the system log carrying the registers, the bytes at the instruction pointer, the
+load bias, and a stack walk ([services/crashd/README.md](../services/crashd/README.md),
+[services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)): its `load_bias`
+and `frame.<n>` fields are the bias and addresses `symbolize` takes. A symbolizer form that
+resolves every address of such a block from the log is design intent, not yet implemented
+([#834](https://github.com/kottlerg/seraph/issues/834)).
+
+**Kernel crashes, early failures, and wedged guests.** QEMU's gdbstub reads the machine whatever
+state the guest is in, including before the serial console is up and after the kernel stops
+answering. `cargo xtask run --gdb` starts the guest paused with the stub on `localhost:1234`;
+`cargo xtask run-parallel --parallel 1 --debug-listen --hold-on-hang` runs it unpaused and keeps a
+hung guest alive for attaching
+([xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)). GDB runs in batch mode, so its
+output lands in a file like any log. The kernel is static-PIE, so its symbols load at the KASLR
+slide from the serial-only `kaslr: slide=` line, or at their link addresses in a boot whose disk
+was authored with `cargo xtask mkdisk --no-kaslr`; a userspace image's symbols load at its bias, as
+[xtask/README.md](../xtask/README.md#cargo-xtask-run) describes under `--gdb`. Source lines need
+the image built with debug information (`cargo xtask build --debug kernel`,
+[docs/build-system.md](build-system.md#debuginfo-is-opt-in)). On riscv64 the GDB must be built for
+that target ([docs/build-system.md](build-system.md#toolchain)).
+
+```sh
+# A wedged guest: boot until HANG, then, from another shell, read every CPU's
+# state (SLIDE from the log's `kaslr: slide=` line; `bt 8` bounds each unwind,
+# which otherwise runs on past a CPU's entry frame into stack words) and end
+# the held guest:
+cargo xtask run-parallel --arch riscv64 --parallel 1 --runs 1 --timeout 300 \
+    --debug-listen --hold-on-hang
+gdb -batch -ex 'target remote :1234' \
+    -ex "symbol-file -o $SLIDE sysroot/esp/EFI/seraph/kernel" \
+    -ex 'thread apply all bt 8' -ex 'info registers' -ex kill
+
+# A deterministic kernel crash: stop at the panic handler of a boot without
+# KASLR, with source lines (a hardware breakpoint, since the kernel is not yet
+# mapped when the guest starts paused, so a software one cannot be written):
+cargo xtask build --debug kernel
+cargo xtask mkdisk --no-kaslr
+cargo xtask run --gdb --headless          # in one shell; waits paused
+gdb -batch -ex 'target remote :1234' -ex 'hbreak kernel::panic' -ex continue \
+    -ex bt -ex 'info registers' sysroot/esp/EFI/seraph/kernel
+```
 
 ---
 

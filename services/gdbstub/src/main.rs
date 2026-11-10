@@ -406,6 +406,10 @@ impl Kernel for Sys
     {
         if !self.ensure_receiver(slot)
         {
+            std::os::seraph::log!(
+                "a fault receiver could not be started; thread {} is left unbound",
+                slot + 1
+            );
             return false;
         }
         let badge = control::thread_badge(slot);

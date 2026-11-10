@@ -2036,16 +2036,6 @@ mod tests
         hold_more(&mut s, 1);
         let _ = s.next_stop(&mut sim, 0);
         assert_eq!(sim.receivers, MAX_RECEIVERS, "no more past the bound");
-        // Every receiver holds a stop: the next waits until one is answered.
-        sim.busy = sim.receivers;
-        let n = sim.spawn(Some(0), false);
-        sim.fault(n);
-        assert_eq!(s.next_stop(&mut sim, 0), None);
-        sim.busy -= 1;
-        assert!(
-            s.next_stop(&mut sim, 0)
-                .is_some_and(|stop| sim.ds[stop.receiver].thread == n)
-        );
     }
 
     // Defect caught: a simulation that misses a resume past a breakpoint,

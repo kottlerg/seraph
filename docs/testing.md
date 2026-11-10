@@ -160,11 +160,15 @@ rootfs/config/svcmgr/
 ├── services/                 # always loaded by svcmgr
 │   ├── procmgr.svc
 │   └── …
-└── tests/                    # NOT loaded by svcmgr
-    ├── svctest.svc
-    ├── usertest.svc
-    ├── crasher.svc           # restart-path fixture; co-staged with svctest
-    └── debug-echo.svc        # debug-port fixture; staged by test-debug-port
+├── tests/                    # NOT loaded by svcmgr
+│   ├── svctest.svc
+│   ├── usertest.svc
+│   ├── crasher.svc           # restart-path fixture; co-staged with svctest
+│   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
+│   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
+└── debug/                    # NOT loaded by svcmgr
+    └── gdbstub.svc           # GDB stub template; staged, naming its target,
+                              # by run --debug-target and test-gdb
 ```
 
 To enable a harness for a boot, copy its recipe from
@@ -373,9 +377,9 @@ unreported. Both read the log the cell's boot saved and boot nothing
 
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by
 procmgr, and logd, the serial and framebuffer drivers, and crashd declare themselves undebuggable,
-as svctest, a debug-authority holder, does in a test boot; their faults leave only the kernel's
-`fault unhandled` and `USERSPACE FAULT` lines. A thread that never registered with procmgr is
-reported without registers or a stack walk
+as svctest and the GDB stub, debug-authority holders, do in a boot that stages them; their faults
+leave only the kernel's `fault unhandled` and `USERSPACE FAULT` lines. A thread that never
+registered with procmgr is reported without registers or a stack walk
 ([crashd Operation § Limits](../services/crashd/docs/operation.md#limits)).
 
 ### Debug port (`test-debug-port`)
@@ -402,6 +406,32 @@ The host computes the verdict and kills QEMU, as for `test-terminal`; the fixtur
 shutdown. See [xtask/README.md § test-debug-port](../xtask/README.md#cargo-xtask-test-debug-port)
 for the command. No canonical CI cell attaches the debug port, so the boot is the `debug-port`
 device cell of the local and release host runs (Coverage tiers below).
+
+### GDB stub (`test-gdb`)
+
+The GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) debugs a guest process
+from a host GDB over the debug port, so its check is a host GDB session.
+`cargo xtask test-gdb [--arch] [--port] [--gdb]` (both arches) runs it:
+
+1. Stage the `gdb-target` recipe (`programs/debugger --gdb-target`, a process of two threads with
+   an exported counter and tick function;
+   [programs/debugger/README.md](../programs/debugger/README.md)) from `/config/svcmgr/tests/`,
+   and the stub's template from `/config/svcmgr/debug/` naming it, into
+   `/config/svcmgr/services/`, and repack `disk.img`.
+2. Boot the current sysroot once with the debug port, and wait for the stub's
+   `[gdbstub] attached; serving the debug port` line on the serial stream.
+3. Run `gdb -batch` against the port with the target's binary for symbols: list the threads,
+   break on the tick function and continue to it, read the pointer, rewrite the counter and read
+   it back, single-step, delete the breakpoint, select the second thread and read its registers,
+   and detach. The output must show two threads, the breakpoint's stop, the rewritten value, a
+   step that moved the pointer, the second thread's registers, and the detach.
+4. Kill QEMU, remove both recipes, and repack `disk.img` again, whatever the outcome.
+
+It needs a host GDB that debugs the guest architecture (`gdb` built with every target, or
+`gdb-multiarch` through `--gdb`). The host computes the verdict and kills QEMU, as for
+`test-debug-port`, and its boot is part of the same `debug-port` device cell (Coverage tiers
+below). See [xtask/README.md § test-gdb](../xtask/README.md#cargo-xtask-test-gdb) for the
+command.
 
 ### One shutdown-invoking harness per boot
 
@@ -450,9 +480,9 @@ with the virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x
 `riscv-iommu-pci` at 00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA
 confinement phase drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no
 framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`,
-the framebuffer boot, `--display framebuffer`, and the debug-port boot, `test-debug-port`, are
-device cells, see Device surfaces, Framebuffer cell, Debug-port cell, and Release host runs below),
-filesystem (FAT), riscv64
+the framebuffer boot, `--display framebuffer`, and the debug-port boots, `test-debug-port` and
+`test-gdb`, are device cells, see Device surfaces, Framebuffer cell, Debug-port cell, and Release
+host runs below), filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
 5-level runs via `cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a
@@ -822,7 +852,7 @@ own diff is on.
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
-| virtio-console, the debug port | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`) | debug-port |
+| virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), and svctest's DMA confinement check, which drives it (by definition alone: `dma_confinement_phase`) | no-iommu |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
@@ -967,18 +997,22 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 360 \
     --display framebuffer --fail-also 'framebuffer case skipped'
 ```
 
-**Debug-port cell.** One boot, on each architecture, of `cargo xtask test-debug-port` (Debug
-port (`test-debug-port`) above), which attaches the debug port's `virtio-console` device, so
-devmgr binds it, the virtio-console driver runs, and the `debug-echo` fixture answers the host
-over it. It passes when the host's exchange completes; the command stages and unstages its own
-fixture on the current sysroot, a debug-profile build. It bounds the boot to the fixture's ready
-line by five minutes and each answer by twenty seconds, and has no `run-parallel` budget. The
-boot is the debug-port device cell (Device surfaces above).
+**Debug-port cell.** Two boots, on each architecture, each of which attaches the debug port's
+`virtio-console` device, so devmgr binds it and the virtio-console driver runs: one of
+`cargo xtask test-debug-port` (Debug port (`test-debug-port`) above), in which the `debug-echo`
+fixture answers the host over the port, and one of `cargo xtask test-gdb` (GDB stub (`test-gdb`)
+above), in which the GDB stub serves a host GDB session against the `gdb-target` process. The cell
+passes when both host checks pass; each command stages and unstages its own recipes on the
+current sysroot, a debug-profile build. `test-debug-port` bounds the boot to the fixture's ready
+line by five minutes and each answer by twenty seconds; `test-gdb` bounds the boot to the stub's
+ready line by five minutes and the GDB session by three. Neither has a `run-parallel` budget. The
+two boots are the debug-port device cell (Device surfaces above).
 
 ```sh
 # Debug-port cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cargo xtask test-debug-port --arch <arch>
+cargo xtask test-gdb --arch <arch>
 ```
 
 **Release host runs.** Before each tag
@@ -1141,7 +1175,7 @@ A failing boot is diagnosed with the tool that fits its class of defect:
 | Timing-sensitive race: a failure that comes and goes across boots, or moves with the CPU count or host load | Log instrumentation and repeat runs |
 | Deterministic userspace fault | The crash report on the serial log, resolved with `cargo xtask symbolize --log` |
 | Deterministic kernel crash; a failure before the serial console is up; a wedged guest; a question about raw machine state | QEMU's gdbstub |
-| Per-process debugging of a running system | The serial GDB stub (design intent; not yet implemented, [#835](https://github.com/kottlerg/seraph/issues/835)) |
+| Per-process debugging of a running system | The GDB stub over the debug port |
 
 **Races.** A debugger stops the CPUs it inspects and moves the timing a race depends on, so a
 race is chased with log lines placed around the suspect window and with repeated boots, which turn
@@ -1200,6 +1234,28 @@ gdb -batch -ex 'target remote :1234' -ex 'hbreak kernel::panic' -ex continue \
     -ex bt -ex 'info registers' sysroot/esp/EFI/seraph/kernel
 ```
 
+**A process of a running system.** The GDB stub
+([services/gdbstub/README.md](../services/gdbstub/README.md)) debugs one process from a host GDB
+while the rest of the system runs on: breakpoints, single-step, registers and memory of each of
+its threads, then a detach that hands it back to the crash service. `cargo xtask run --debug-port
+<PORT> --debug-target <NAME>` stages the stub for the boot, naming the process by its `argv[0]`
+(for a service, the first word of its recipe's `argv`), and prints the GDB command line, which
+loads the process's sysroot binary for symbols; the stub reports the image's load bias
+(`qOffsets`), so GDB relocates them itself
+([xtask/README.md](../xtask/README.md#cargo-xtask-run)). A process that declared itself
+undebuggable (logd, the serial and framebuffer drivers, and every debug-authority holder) refuses
+the attach, and a process procmgr did not create (init, memmgr, procmgr) is not listed.
+
+```sh
+# Debug the `gdb-target` fixture (staged by hand here; test-gdb does the same):
+cargo xtask build
+cp sysroot/config/svcmgr/tests/gdb-target.svc sysroot/config/svcmgr/services/
+cargo xtask mkdisk --repack-only
+cargo xtask run --debug-port 4561 --debug-target gdb-target   # in one shell
+gdb -ex 'set architecture i386:x86-64' -ex 'target remote localhost:4561' \
+    sysroot/programs/debugger                                    # in another
+```
+
 ---
 
 ## Historical naming
@@ -1241,6 +1297,7 @@ note in full.
 [services/crasher/README.md](../services/crasher/README.md),
 [services/debug-echo/README.md](../services/debug-echo/README.md),
 [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md),
+[services/gdbstub/README.md](../services/gdbstub/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),

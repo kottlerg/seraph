@@ -17,6 +17,7 @@ xtask/
 │   ├── cli.rs                  # Clap derive structs for every subcommand
 │   ├── context.rs              # Resolved workspace and build-output paths
 │   ├── crash_log.rs            # Symbolized crash reports from a serial log (symbolize --log)
+│   ├── debug_stub.rs           # GDB stub staging (run --debug-target, test-gdb)
 │   ├── diag.rs                 # Diagnostics of the pull-request, record, and Issue checks
 │   ├── arch.rs                 # Supported architectures and per-arch constants
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
@@ -35,7 +36,7 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # Subcommand modules (build, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
-│   │                           #   test, test_crash_report, test_debug_port, test_kaslr,
+│   │                           #   test, test_crash_report, test_debug_port, test_gdb, test_kaslr,
 │   │                           #   test_logd_reclaim, test_map_redo, test_terminal,
 │   │                           #   test_vmgenid, lint_docs, pr_check, review, issue)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
@@ -80,7 +81,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
     [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] \
     [--iommu attached|absent] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
-    [--debug-port PORT]
+    [--debug-port PORT [--debug-target NAME]]
 ```
 
 | Option | Description |
@@ -98,6 +99,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
 | `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
+| `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack `disk.img`, and print the host GDB command line, with the process's sysroot binary for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. The stub is removed and `disk.img` repacked when QEMU exits; a `run` interrupted before that leaves it staged until the next `mkdisk` or `run --debug-target`. Requires `--debug-port` |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -810,7 +812,43 @@ cargo xtask test-debug-port [--arch x86_64|riscv64] [--port PORT] [--cpus N] [--
 | `--mem` | `512` | Guest memory size in MiB |
 
 The boot to the fixture's line is bounded by five minutes and each answer by twenty seconds. The
-boot is the debug-port device cell of the local and release host runs
+boot is one of the two of the debug-port device cell of the local and release host runs
+([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
+
+---
+
+### `cargo xtask test-gdb`
+
+Check the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) from a host GDB,
+on either arch. Stages the `gdb-target` recipe (`programs/debugger --gdb-target`) from
+`config/svcmgr/tests/` and the stub's template from `config/svcmgr/debug/` naming it, as
+`run --debug-target gdb-target` does, repacks `disk.img`, boots the current sysroot once with the
+debug port attached (headless), and waits for the stub's
+`[gdbstub] attached; serving the debug port` line on the serial stream. It then runs
+`gdb -nx -batch` against the port with the target's sysroot binary for symbols: the session lists
+the threads, breaks on the target's tick function and continues to it, rewrites a variable and
+reads it back, single-steps, selects the second thread and reads its registers, and detaches. It
+kills QEMU, removes both recipes, and repacks `disk.img` again, whatever the outcome, and passes
+when GDB's output shows each of those results; [docs/testing.md](../docs/testing.md) § GDB stub
+(`test-gdb`) lists them.
+
+A pure runner; requires a populated sysroot and a host GDB that debugs the architecture:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test-gdb [--arch x86_64|riscv64] [--port PORT] [--gdb GDB] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--port` | `4561` | The host TCP port the debug port is served on |
+| `--gdb` | `gdb` | The host GDB to run: one built with every target, or `gdb-multiarch` |
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+The boot to the stub's line is bounded by five minutes and the GDB session by three. The boot is
+one of the two of the debug-port device cell of the local and release host runs
 ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
 ---
@@ -1020,6 +1058,7 @@ what is missing.
 | [docs/storage.md](../docs/storage.md) | GPT role-GUID discovery of the data partition the disk image carries |
 | [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves |
 | [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md) | The debug port `--debug-port` attaches and `test-debug-port` drives |
+| [services/gdbstub/README.md](../services/gdbstub/README.md) | The GDB stub `--debug-target` stages and `test-gdb` drives |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` enforces; the Markdown and file-header rules `lint-docs` checks |
 | [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |
 | [targets/README.md](targets/README.md) | Custom target specs |
@@ -1045,4 +1084,5 @@ what is missing.
 [Build System](../docs/build-system.md), [Coding Standards](../docs/coding-standards.md),
 [Memory Model](../docs/memory-model.md), [Testing](../docs/testing.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
-[rootfs/README.md](../rootfs/README.md)
+[rootfs/README.md](../rootfs/README.md),
+[services/gdbstub/README.md](../services/gdbstub/README.md)

@@ -29,7 +29,7 @@ create call returns), and `RELEASE_HOLD` on a **release token** (the third cap
 a `CREATE_DMA_HOLD` create returns); procmgr identifies the target process by
 the badge `ipc_recv` delivers. Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
 § `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and
-§ `QUERY_LIVE_PROCESSES` below, and labels 19–22 in § Crash Endpoint and Debug Authority.
+§ `QUERY_LIVE_PROCESSES` below, and labels 19–24 in § Crash Endpoint and Debug Authority.
 Labels 4–7 and 10
 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see
@@ -678,13 +678,14 @@ has with no handler bound, and the kernel's decline line for a forwarded fault i
 pager's own decline printed. The decliner shares nothing with the request loop but a wake
 notification, so a receive on the endpoint never waits behind a request.
 
-Labels 19–21 are the **debug authority**, and label 22 the **thread registry** it reads.
-`REGISTER_CRASH_SERVICE` and `ATTACH_PROCESS` are served only on a badge carrying
-`procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the un-badged procmgr source init endows
-it, for a service whose definition sets `debug_authority = yes`
-([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)); no other path mints it,
-so an image that stages no such service has no attach path. The crash service and the serial GDB
-stub are its consumers.
+Labels 19–21, 23, and 24 are the **debug authority**, and label 22 the **thread registry** it
+reads. `REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `LIST_PROCESSES`, and `DETACH_PROCESS` are
+served only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the
+un-badged procmgr source init endows it, for a service whose definition sets
+`debug_authority = yes` ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md));
+no other path mints it, so an image that stages no such service has no attach path. The crash
+service ([services/crashd/README.md](../../crashd/README.md)) and the GDB stub
+([services/gdbstub/README.md](../../gdbstub/README.md)) are its consumers.
 
 ### Label 19: `REGISTER_CRASH_SERVICE`
 
@@ -716,7 +717,7 @@ of a second one, the handover, the take-back, and a registration after it.
 | caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
 | `data[0]` | The target: its process badge, or a thread's crash badge as a fault message on the crash endpoint carries it |
 | `data[1]` | The index of the first thread to return |
-| caps | none; procmgr deletes any cap the message carried |
+| `caps[0]` | Optional: the **debugger watch**, a Thread cap of the caller's own main thread, of any rights; further caps are deleted |
 
 Reply `SUCCESS` with:
 
@@ -743,16 +744,30 @@ and the runtime's reclaim of a registered thread, revoke them. A debugger that b
 thread's exception class MUST NOT bind it under the process badge `data[5]` returns, nor under a
 crash badge (§ Label 22).
 
-`data[5]`, `data[6]`, and the crash-badge form of `data[0]` extend the reply and the target's
-domain without changing the request: the label, its words, and its caps are as before, a request
-naming a process badge means what it meant, and a caller that reads only `data[0]` to `data[4]`
-and pages from index 0 sees the main thread first, as before, with the registered threads after
-it. Refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_BADGE` when no live process
-carries the badge, or no registered thread of a live process the crash badge, which covers init,
-memmgr, and procmgr, none of which procmgr created; `NOT_ATTACHABLE` when the target declared
-itself undebuggable (Label 21); `OUT_OF_MEMORY` when the cap of a thread still listed cannot be
-derived, or threads keep going through four derivations of the page, the caps already derived for
-the reply then deleted. The refusal order is `process_table::attach_target`.
+A debugger that rebinds the target's threads sends the watch with its first request. When the
+attach succeeds, procmgr keeps the watch as the target's debugger, replacing, and deleting, the
+one an earlier attach left; a watch that is not a Thread cap, or that a refused attach carried, is
+deleted. procmgr reads the watched thread's state on every pass of its loop, which a process's
+death wakes: once the thread has exited, or its cap went with its process's teardown, procmgr logs
+`debugger gone; crash bindings restored` and restores the target's crash bindings as
+`DETACH_PROCESS` does (Label 24). So a debugger that dies attached leaves no thread of its target
+bound to an endpoint no one receives on: a fault the target takes meanwhile waits there, and the
+restore delivers it again to the crash endpoint
+([docs/fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and Kill, Rebind).
+The restore cannot undo the dead debugger's own changes to the target, a breakpoint it planted
+among them. procmgr only reads the watched thread's state, which takes no right.
+
+`data[5]`, `data[6]`, the crash-badge form of `data[0]`, and the watch extend the reply and the
+target's domain without changing what an earlier request means: a request that carries no cap is
+answered as before, a request naming a process badge means what it meant, and a caller that
+reads only `data[0]` to `data[4]` and pages from index 0 sees the main thread first, as before,
+with the registered threads after it. Refusals, in order: `UNAUTHORIZED` without the authority;
+`INVALID_BADGE` when no live process carries the badge, or no registered thread of a live process
+the crash badge, which covers init, memmgr, and procmgr, none of which procmgr created;
+`NOT_ATTACHABLE` when the target declared itself undebuggable (Label 21); `OUT_OF_MEMORY` when the
+cap of a thread still listed cannot be derived, or threads keep going through four derivations of
+the page, the caps already derived for the reply then deleted. The refusal order is
+`process_table::attach_target`.
 
 ### Label 21: `DECLARE_NO_DEBUG`
 
@@ -833,6 +848,62 @@ sends no further registration; `INVALID_ARGUMENT` without a Thread cap carrying 
 `THREAD_LIMIT` at the bound, after any sweep due; `OUT_OF_MEMORY` when procmgr's heap cannot hold
 the entry. A refused request's caps are deleted.
 
+### Label 23: `LIST_PROCESSES`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::LIST_PROCESSES` (23) |
+| caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
+| `data[0]` | `0` to start the walk, `1` to resume after the badge in `data[1]` |
+| `data[1]` | The cursor badge when `data[0]` is `1` |
+| caps | none; procmgr deletes any cap the message carried |
+
+Reply `SUCCESS` with `data[0]` = the page's count, then, for each live process above the cursor in
+ascending badge order, `LIST_PROCESSES_WORDS_PER_ENTRY` (10) words: its process badge, its name's
+length in bytes, and the name in eight words, little-endian and zero-padded
+(`procmgr_labels::pack_list_entry`, `unpack_list_entry`). A page holds at most
+`LIST_PROCESSES_PAGE` (`(MSG_DATA_WORDS_MAX - 1) / 10` = 6) entries; a page shorter than that ends
+the walk, and a full page is followed by a call resuming after its last badge. A process that stays
+live across the whole walk is listed exactly once, as for `QUERY_LIVE_PROCESSES`; a cursor whose
+process died resumes at the next badge above it.
+
+A process's name is the first string of the argv its creator passed (`CREATE_ARGV_ENV`), up to
+its NUL, truncated to `svcmgr_labels::NAME_MAX` (64) bytes, or empty for a process created
+without argv. For a service it is the first word of its recipe's `argv`. procmgr records it at
+creation and never changes it. It is a label the creator chose, not an identity: two processes can
+share one, and a debugger that looks a process up by name takes the first match in badge order.
+The walk lists every live process procmgr created, those that declared themselves undebuggable
+(Label 21) among them, which then refuse the attach. Refusals: `UNAUTHORIZED` without the
+authority; `INVALID_ARGUMENT` for a `data[0]` other than 0 or 1. The GDB stub walks it to find the
+process its host names ([services/gdbstub/README.md](../../gdbstub/README.md)).
+
+### Label 24: `DETACH_PROCESS`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::DETACH_PROCESS` (24) |
+| caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
+| `data[0]` | The target's process badge |
+| caps | none; procmgr deletes any cap the message carried |
+
+procmgr hands the target's crash bindings back after a debugger's attach: it binds the main
+thread's exception class to the crash endpoint under the process badge again, and each registered
+thread's (Label 22) under the thread's crash badge, minting one for a thread that has none (one
+that registered while the debugger's binding was on it, which a registration leaves), and deletes
+the debugger watch the attach left (Label 20). A thread whose bind fails keeps the binding it has;
+a failure to bind the main thread is logged. procmgr rebinds over the debugger's binding, so no
+thread is unbound meanwhile, and a fault in flight under the debugger's binding is delivered again
+to the crash endpoint (§ Delivery, Resume, and Kill, Rebind, in
+[docs/fault-handling.md](../../../docs/fault-handling.md)). A debugger holds no SEND on the crash
+endpoint, so it cannot restore those bindings itself; the debugger unbinds the upcall class it
+bound, resumes the threads it held, and writes back the text it changed before it sends this.
+procmgr restores the bindings the same way, unasked, when the watched debugger thread has exited.
+
+Replies `SUCCESS`; refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_BADGE` when
+no live process carries the badge (a thread's crash badge names no process here); `NOT_ATTACHABLE`
+when the target declared itself undebuggable (Label 21). The refusal order is
+`process_table::detach_target`.
+
 ---
 
 ## Relevant Design Documents
@@ -859,6 +930,7 @@ the entry. A refused request's caps are deleted.
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [crashd Operation](../../crashd/docs/operation.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
+[services/gdbstub/README.md](../../gdbstub/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),
 [logd IPC interface](../../logd/docs/ipc-interface.md),

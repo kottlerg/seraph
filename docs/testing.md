@@ -564,9 +564,11 @@ surface is these files as a whole:
 - `core/kernel/src/mm/tag_allocator.rs` (the per-CPU address-space tags, whose count it fits to
   the CPU count);
 
-and, in any other file, a line that adds a structure with one entry or one bit per CPU, and a
-changed line that names one of these items as a whole identifier or lies within one's definition
-(its attributes, signature, fields, or body):
+and, in any other file, a line that adds a structure with one entry or one bit per CPU, a line
+that adds or changes a test case whose work grows with the CPU count (a ktest or svctest case
+that runs a step, or spawns a thread, for each CPU), and a changed line that names one of these
+items as a whole identifier or lies within one's definition (its attributes, signature, fields,
+or body):
 
 - CPU-count width: `MAX_CPUS`, `AtomicCpuMask`, `MaskSource`, `mask_words`, `set_boot_cpu_count`;
 - per-CPU storage: `alloc_zeroed_slab` and the page count it takes (`slab_pages`); the per-CPU
@@ -614,27 +616,42 @@ changed line that names one of these items as a whole identifier or lies within 
 - the TLB-shootdown broadcast: `shootdown`, `shootdown_range`, `service_shootdowns`,
   `shootdown_remote`, and `needs_remote_shootdown`.
 
-A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. A PR
-that adds an item of the kinds above that names none of the listed items MUST add it to this list.
+A changed line that only uses a listed type is not on the surface: an import of it, a signature
+or type annotation that names it, a read or write of one of its fields, or a call of one of its
+methods, where the line changes neither the type's fields or size, nor a structure with one
+entry or one bit per CPU, nor how such a structure is sized or indexed. The listed types are
+`AtomicCpuMask`, `MaskSource`, `PerCpuSlab`, `CpuTopology`, `IpiWaitCtx`, `WaitTimer`, and the
+element types of the per-CPU arrays and slabs. A line that names any other listed item, or that
+lies within a listed item's definition, stays on the surface.
+
+A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. The
+release host runs (Release host runs below) boot every boundary before each tag and are the
+backstop for a scaling defect this surface misses. A boundary set MAY also be run for a PR that
+does not owe it, when whoever coordinates the work (the orchestrator of a batch, or the
+maintainer) judges that the change warrants it; nothing schedules such a run, and the PR body
+reports it as a run the PR does not owe (Hangs at oversubscription below). A PR that adds an
+item of the kinds above that names none of the listed items MUST add it to this list.
 `cargo xtask lint-docs` fails when a name this list, the memory and device surfaces' lists, or
 their screens state no longer names code, a tracked file, or a tracked directory (its
-`md-coverage-symbols` rule, [xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a PR
-that renames or deletes a listed item updates the list in the same change.
-The commands below screen a diff for the surface. The first lists the whole-surface files the diff
-changes. The second prints every file header of the diff and every line, changed or context, that
-names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
+`md-coverage-symbols` rule, [xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a
+PR that renames or deletes a listed item updates the list in the same change. The commands below
+screen a diff for the surface. The first lists the whole-surface files the diff changes. The
+second prints every file header of the diff and every line, changed or context, that names a
+listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
 item's definition prints that item's name. Each printed name is a candidate: the PR owes the set
 when a non-inert changed line names the item or lies within its definition, read in that file's
-hunk. A printed `alloc_per_cpu_slab` or `alloc_zeroed_slab` call is a candidate for the initialiser
-that encloses it (except `frame_map::init` and `init_cspace_registry`, which the memory surface
-covers): the set is
-owed when a non-inert changed line lies within that function, read in the widened hunk. The
-screen finds named items and changes inside their definitions; it does not follow a size
-change through a nested type or a sizing constant, so a diff that changes a struct's fields or a
-constant's value is also read against the per-CPU storage bullet (`git grep -n -w <name> <head>`
-shows where the type or constant is held). A diff for which neither command prints a candidate,
-that adds no per-CPU structure, and whose type and constant changes reach no per-CPU element or
-allocation is off the surface.
+hunk, unless the line only uses a listed type as the paragraph above defines it. A printed
+`alloc_per_cpu_slab` or `alloc_zeroed_slab` call is a candidate for the initialiser that
+encloses it (except `frame_map::init` and `init_cspace_registry`, which the memory surface
+covers): the set is owed when a non-inert changed line lies within that function, read in the
+widened hunk. The screen finds named items and changes inside their definitions; it does not
+follow a size change through a nested type or a sizing constant, so a diff that changes a
+struct's fields or a constant's value is also read against the per-CPU storage bullet
+(`git grep -n -w <name> <head>` shows where the type or constant is held). The screen does not
+find a test case whose work grows with the CPU count either: a diff that adds or changes a ktest
+or svctest case is read for one. A diff for which neither command prints a candidate, that adds
+no per-CPU structure and no such test case, and whose type and constant changes reach no per-CPU
+element or allocation is off the surface.
 
 ```sh
 B=$(git merge-base <head> origin/master)

@@ -218,6 +218,10 @@ and any timing-sensitive measurement take the exclusive grant:
 - `master quiet` tells a worker to sync now, right before its validation runs, so one run
   covers the sync. Say it when no merge will land before that worker's gate; otherwise hold the
   worker and let the pending merge land first.
+- You MAY run a boundary set, or direct a worker to, for a PR that does not owe one, when you
+  judge that the change warrants it (docs/testing.md § Coverage tiers, Boundary surface).
+  Nothing schedules such a run; the release host runs are the backstop. The PR body reports it
+  as a run the PR does not owe.
 - Queue order: the exclusive runs of PRs already at their gates first, then the first rounds of
   new PRs, then the long boundary sets. A boundary set runs once per PR, at a head whose own
   non-inert surface lines are final, usually after the first review batch.

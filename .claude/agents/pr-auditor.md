@@ -164,9 +164,11 @@ claims.
    defines them, and run that section's screen commands, reading each
    candidate's hunk and each type or constant change as that section says.
    The boundary set is owed only when a non-inert line meets the Boundary
-   surface definition, the memory variation only when one meets the Memory
-   surface definition, each device cell only when one lies on a device
-   surface that section's table says owes that cell, and the whole boundary
+   surface definition (a line that only uses a listed type does not, and a
+   test case whose work grows with the CPU count does), the memory
+   variation only when one meets the Memory surface definition, each
+   device cell only when one lies on a device surface that section's
+   table says owes that cell, and the whole boundary
    set (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) at `--runs 3`
    whenever the PR states a concurrency-fix purpose as Repeat count defines
    it and has a non-inert line, whether or not a line meets any surface.

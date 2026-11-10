@@ -16,6 +16,7 @@ xtask/
 │   ├── main.rs                 # Entry point; dispatches CliCommand
 │   ├── cli.rs                  # Clap derive structs for every subcommand
 │   ├── context.rs              # Resolved workspace and build-output paths
+│   ├── crash_log.rs            # Symbolized crash reports from a serial log (symbolize --log)
 │   ├── arch.rs                 # Supported architectures and per-arch constants
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
 │   ├── bundle.rs               # Bootloader bundle composition (MODULES table)
@@ -423,8 +424,11 @@ cargo xtask run-parallel --arch x86_64 --parallel 4 --runs 100 \
 non-passing runs are preserved under `target/xtask/run-parallel/` as
 `OK-<run>.log`, `FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or
 `QEMU-CRASH-<run>.log`. PASS logs are discarded there (`--save-logs` keeps a copy of every
-log elsewhere). Each invocation first removes
-the run logs an earlier one left there, so the preserved logs are its own.
+log elsewhere). Beside each log it keeps, in either place, whose log holds a crash-report block, a
+run writes the block's symbolized report, `cargo xtask symbolize --log`'s output against the
+current sysroot, as `<name>.crash.txt` for `<name>.log`, and removes a stale `<name>.crash.txt` of
+a log without one. Each invocation first removes the run logs and crash reports an earlier one left
+under `target/xtask/run-parallel/`, so the preserved files are its own.
 
 **Outcome precedence**:
 1. `--fail` regex matches → `FAIL` (a live match also triggers early abort
@@ -525,12 +529,14 @@ inlined into on its own line, and, where no DWARF covers it (a build without `--
 component, or code compiled without debug information), from the image's symbol table, as the
 nearest function symbol and the offset into it. Installed binaries keep their symbol tables
 ([docs/build-system.md](../docs/build-system.md) § Debuginfo is opt-in), so the fallback names
-the function in every build. Use cases are in [docs/testing.md](../docs/testing.md#troubleshooting)
+the function in every build. With `--log`, the addresses are those of the crash reports in a
+serial log. Use cases are in [docs/testing.md](../docs/testing.md#troubleshooting)
 § Troubleshooting.
 
 ```
 cargo xtask symbolize --binary PATH [--bias HEX] ADDR...
 cargo xtask symbolize --kernel [--bias HEX] ADDR...
+cargo xtask symbolize --log FILE
 ```
 
 | Option | Default | Description |
@@ -538,10 +544,12 @@ cargo xtask symbolize --kernel [--bias HEX] ADDR...
 | `--binary` | | The ELF image the addresses fall in: a sysroot binary, or its build output under `target/` |
 | `--kernel` | | Resolve against the sysroot's kernel image, `sysroot/esp/EFI/seraph/kernel` |
 | `--bias` | `0` | The image's load bias in hex: for a userspace process its creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, and, for init itself, the kernel's `init: PIE bias=0x…`), for the kernel the KASLR slide from its serial-only `kaslr: slide=` line (`0` in a boot authored with `mkdisk --no-kaslr`) |
-| `ADDR...` | (required) | Runtime addresses, in hex (`0x` optional) |
+| `ADDR...` | (required without `--log`) | Runtime addresses, in hex (`0x` optional) |
+| `--log` | | A serial log: symbolize every crash-report block in it (below) instead of `ADDR...` |
 
-Each address prints one line, `<address> (image <address less bias>): <resolution> [<source>]`
-(the image address shown only when the bias is not `0`), where the source is the one used:
+Each address's first line is `<address> (image <address less bias>): <resolution> [<source>]`
+(the image address shown only when the bias is not `0`), where the source is the one used; a
+`debug-info` resolution goes on to one line per inlined caller:
 
 | Source | Resolution |
 |---|---|
@@ -554,6 +562,34 @@ Names are demangled. A frame prints only what its DWARF gives: `??` for an unnam
 DWARF at all prints a note naming the symbol-table fallback first. An address below the bias, an
 unreadable file, or a file that is not an ELF image fails the command; a compressed debug section
 is refused.
+
+**Log form.** `--log` reads the crash-report blocks crashd logs
+([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)) with
+`shared/crash-report`'s parser. A block names its process by badge; logd's
+`reclaim: badge=<badge> … name=<log name>` line for that badge gives the log name, and the image is
+the sysroot binary of that file name, searched in `services/`, `services/drivers/`,
+`services/fs/`, `programs/`, `tests/`, and `tests/programs/`, in that order. Each block prints as:
+
+```
+crash report <id> (format version <v>): process <log name>
+  image: sysroot/<dir>/<log name>
+  <key>=<value>
+  ip=<address>  <resolution> [<source>]
+  frame.<n>=<address>  <resolution> [<source>]
+  …
+end <id>
+```
+
+Every field line follows in the block's order, as logged. `ip`, and each `frame.<n>` inside the
+block's `text`, carries its resolution in the address form's shape, the inlined-caller lines
+indented below it; a frame past `frame.0` is a candidate return address, so it resolves at its
+address less one, inside the call it returns from, and an `ip` outside `text` reads
+`outside the image's text`. In place of the `image:` line a block says why it is not symbolized:
+the process is unnamed (no `reclaim:` line carries its badge), no sysroot binary has its name, the
+block's `arch` is not the sysroot's, it carries no `load_bias` and `text` (a report whose attach
+failed), or the image is not an ELF image; its fields then print as logged. An incomplete or
+defective block is marked `defective block (<defect>)` and printed all the same. A log without a
+block prints that it has none. `run-parallel` writes the same report beside each log it keeps.
 
 ---
 

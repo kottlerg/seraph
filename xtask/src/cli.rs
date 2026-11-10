@@ -62,7 +62,9 @@ pub enum CliCommand
     /// Resolve runtime addresses in a loaded ELF image (a binary, or the
     /// sysroot's kernel) to function, file, and line from its DWARF, or to the
     /// nearest function symbol when no DWARF covers an address. Each output
-    /// line names the source it used. See xtask/README.md.
+    /// line names the source it used. With `--log`, print every crash-report
+    /// block of a serial log with its addresses resolved against the
+    /// sysroot's binaries. See xtask/README.md.
     Symbolize(SymbolizeArgs),
 
     /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
@@ -779,7 +781,7 @@ pub struct SymbolizeArgs
 {
     /// The ELF image the addresses fall in (a sysroot binary, or its build
     /// output under `target/`).
-    #[arg(long, value_name = "PATH", required_unless_present = "kernel")]
+    #[arg(long, value_name = "PATH", required_unless_present_any = ["kernel", "log"])]
     pub binary: Option<PathBuf>,
 
     /// Resolve against the sysroot's kernel image
@@ -794,8 +796,18 @@ pub struct SymbolizeArgs
     pub bias: u64,
 
     /// Runtime addresses to resolve, in hex (`0x` optional).
-    #[arg(required = true, value_name = "ADDR", value_parser = parse_hex_arg)]
+    #[arg(
+        required_unless_present = "log",
+        value_name = "ADDR",
+        value_parser = parse_hex_arg
+    )]
     pub addresses: Vec<u64>,
+
+    /// A serial log: print every crash-report block in it with its code
+    /// addresses resolved, each process's image found in the sysroot by the
+    /// log name logd's `reclaim:` line gives its badge.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["binary", "kernel", "bias", "addresses"])]
+    pub log: Option<PathBuf>,
 }
 
 /// Clap value parser for a hex address.

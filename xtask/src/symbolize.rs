@@ -259,9 +259,20 @@ pub fn format_resolution(addr: u64, vaddr: u64, resolution: &Resolution) -> Vec<
     {
         format!("{addr:#018x} (image {vaddr:#x})")
     };
+    let mut lines = describe_resolution(resolution);
+    lines[0] = format!("{head}: {}", lines[0]);
+    lines
+}
+
+/// Render a resolution without its address: the first line is the resolution
+/// and its source in brackets (`<function> at <file>:<line> [debug-info]`,
+/// `<symbol>+<offset> [symbol-table]`, or `?? [unresolved]`); each further
+/// line, indented, is a caller the first frame is inlined into. Never empty.
+pub fn describe_resolution(resolution: &Resolution) -> Vec<String>
+{
     match resolution
     {
-        Resolution::DebugInfo(frames) =>
+        Resolution::DebugInfo(frames) if !frames.is_empty() =>
         {
             let mut lines = Vec::with_capacity(frames.len());
             for (idx, frame) in frames.iter().enumerate()
@@ -269,7 +280,7 @@ pub fn format_resolution(addr: u64, vaddr: u64, resolution: &Resolution) -> Vec<
                 let text = format_frame(frame);
                 if idx == 0
                 {
-                    lines.push(format!("{head}: {text} [debug-info]"));
+                    lines.push(format!("{text} [debug-info]"));
                 }
                 else
                 {
@@ -280,9 +291,9 @@ pub fn format_resolution(addr: u64, vaddr: u64, resolution: &Resolution) -> Vec<
         }
         Resolution::SymbolTable { name, offset } =>
         {
-            vec![format!("{head}: {name}+{offset:#x} [symbol-table]")]
+            vec![format!("{name}+{offset:#x} [symbol-table]")]
         }
-        Resolution::Unresolved => vec![format!("{head}: ?? [unresolved]")],
+        Resolution::DebugInfo(_) | Resolution::Unresolved => vec!["?? [unresolved]".to_owned()],
     }
 }
 
@@ -318,38 +329,39 @@ pub fn parse_hex(text: &str) -> Result<u64>
     u64::from_str_radix(digits, 16).with_context(|| format!("not a hex address: {text:?}"))
 }
 
+/// ELF fixtures with a known symbol table and DWARF, written in-test, for
+/// this module's tests and the crash-log tests.
 #[cfg(test)]
-mod tests
+pub(crate) mod fixture
 {
     use ::gimli::write::{
         Address, AttributeValue, DwarfUnit, EndianVec, FileId, LineProgram, LineString, Sections,
         Unit, UnitEntryId,
     };
     use ::gimli::{Encoding, Format, LineEncoding, LittleEndian, constants};
+    pub(crate) use object::Architecture;
     use object::write::{Object, StandardSection, Symbol, SymbolSection};
-    use object::{
-        Architecture, BinaryFormat, Endianness, SectionFlags, SectionKind, SymbolFlags, SymbolScope,
-    };
+    use object::{BinaryFormat, Endianness, SectionFlags, SectionKind, SymbolFlags, SymbolScope};
 
-    use super::*;
+    use super::SymbolKind;
 
     /// Link address of the fixture's functions' base for a user PIE.
-    const USER_BASE: u64 = 0;
+    pub(crate) const USER_BASE: u64 = 0;
     /// Link address of the fixture's functions' base for a kernel image.
-    const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
+    pub(crate) const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
 
     // The fixture's layout, as offsets from its base: `outer` at 0x100..0x140,
     // with `inner` inlined into it at 0x110..0x120 from a call on line 11;
     // `anon` at 0x180..0x1c0, an unnamed DWARF function with no line rows;
     // `leaf` at 0x200..0x220 and `tail` at 0x280 with no size, in the symbol
     // table only. The compile unit spans 0x100..0x1c0.
-    const OUTER: u64 = 0x100;
-    const INNER: u64 = 0x110;
-    const ANON: u64 = 0x180;
-    const LEAF: u64 = 0x200;
-    const TAIL: u64 = 0x280;
-    const OUTER_MANGLED: &str = "_ZN7fixture5outer17h0123456789abcdefE";
-    const SYMBOLS: [(&str, u64, u64); 4] = [
+    pub(crate) const OUTER: u64 = 0x100;
+    pub(crate) const INNER: u64 = 0x110;
+    pub(crate) const ANON: u64 = 0x180;
+    pub(crate) const LEAF: u64 = 0x200;
+    pub(crate) const TAIL: u64 = 0x280;
+    pub(crate) const OUTER_MANGLED: &str = "_ZN7fixture5outer17h0123456789abcdefE";
+    pub(crate) const SYMBOLS: [(&str, u64, u64); 4] = [
         (OUTER_MANGLED, OUTER, 0x40),
         ("_ZN7fixture4anon17h0123456789abcdefE", ANON, 0x40),
         ("_ZN7fixture4leaf17h0123456789abcdefE", LEAF, 0x20),
@@ -358,14 +370,14 @@ mod tests
 
     /// Which sections the fixture image carries.
     #[derive(Clone, Copy, PartialEq)]
-    enum Debug
+    pub(crate) enum Debug
     {
         Dwarf,
         SymbolsOnly,
     }
 
     /// The fixture's line program: one sequence over `outer`.
-    fn fixture_line_program(encoding: Encoding, base: u64) -> (LineProgram, FileId)
+    pub(crate) fn fixture_line_program(encoding: Encoding, base: u64) -> (LineProgram, FileId)
     {
         let mut program = LineProgram::new(
             encoding,
@@ -392,7 +404,7 @@ mod tests
 
     /// Add a DIE of `tag` under `parent` covering `base + start` for `len`
     /// bytes, with the further attributes `attrs`.
-    fn add_ranged_die(
+    pub(crate) fn add_ranged_die(
         unit: &mut Unit,
         parent: UnitEntryId,
         tag: constants::DwTag,
@@ -416,7 +428,7 @@ mod tests
 
     /// The fixture's DIEs: the unit, `inner`'s abstract instance, `outer`
     /// with `inner` inlined into it, and the unnamed `anon`.
-    fn fixture_dies(unit: &mut Unit, base: u64, file: FileId)
+    pub(crate) fn fixture_dies(unit: &mut Unit, base: u64, file: FileId)
     {
         let root = unit.root();
         let cu = unit.get_mut(root);
@@ -491,7 +503,7 @@ mod tests
     }
 
     /// The fixture's DWARF sections, by name.
-    fn fixture_dwarf(base: u64) -> Vec<(&'static str, Vec<u8>)>
+    pub(crate) fn fixture_dwarf(base: u64) -> Vec<(&'static str, Vec<u8>)>
     {
         let encoding = Encoding {
             format: Format::Dwarf32,
@@ -521,7 +533,7 @@ mod tests
     /// An ELF image of `arch` whose functions sit at link addresses from
     /// `base`, with [`SYMBOLS`] in its symbol table and `debug` as its debug
     /// sections: name, contents, and ELF section flags.
-    fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)>) -> Vec<u8>
+    pub(crate) fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)>) -> Vec<u8>
     {
         let mut obj = Object::new(BinaryFormat::Elf, arch, Endianness::Little);
         let text = obj.section_id(StandardSection::Text);
@@ -553,7 +565,7 @@ mod tests
 
     /// The fixture image: [`elf`] with the DWARF of [`fixture_dwarf`] for
     /// `Debug::Dwarf`, with no debug sections for `Debug::SymbolsOnly`.
-    fn fixture(arch: Architecture, base: u64, debug: Debug) -> Vec<u8>
+    pub(crate) fn fixture(arch: Architecture, base: u64, debug: Debug) -> Vec<u8>
     {
         let sections = match debug
         {
@@ -568,8 +580,11 @@ mod tests
 
     /// The fixture's DWARF with section `name`'s contents passed through
     /// `edit` and its flags set to `sh_flags`.
-    fn fixture_with_section(name: &str, sh_flags: u64, edit: impl Fn(Vec<u8>) -> Vec<u8>)
-    -> Vec<u8>
+    pub(crate) fn fixture_with_section(
+        name: &str,
+        sh_flags: u64,
+        edit: impl Fn(Vec<u8>) -> Vec<u8>,
+    ) -> Vec<u8>
     {
         let sections = fixture_dwarf(USER_BASE)
             .into_iter()
@@ -586,6 +601,13 @@ mod tests
             .collect();
         elf(Architecture::X86_64, USER_BASE, sections)
     }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::fixture::*;
+    use super::*;
 
     fn frame(function: &str, line: u32) -> Frame
     {
@@ -786,6 +808,10 @@ mod tests
         assert_eq!(
             format_resolution(0x5, 0x5, &Resolution::Unresolved),
             vec!["0x0000000000000005: ?? [unresolved]"]
+        );
+        assert_eq!(
+            describe_resolution(&Resolution::DebugInfo(Vec::new())),
+            vec!["?? [unresolved]"]
         );
     }
 

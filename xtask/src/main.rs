@@ -29,6 +29,7 @@ mod bundle;
 mod cli;
 mod commands;
 mod context;
+mod crash_log;
 mod disk;
 mod firmware;
 mod fs_compat;

@@ -31,7 +31,7 @@
 //! (v0.0.1): no pipes/redirection, quoting/escaping, variable expansion,
 //! globbing, or job control.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -78,7 +78,7 @@ fn main()
 fn stdin_reader(tx: &Sender<Event>)
 {
     let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+    let mut reader = stdin.lock();
     loop
     {
         let mut line = String::new();

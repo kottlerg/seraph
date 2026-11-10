@@ -23,12 +23,10 @@ pub fn scan(
 ) -> impl Iterator<Item = u64> + '_
 {
     stack
-        .chunks_exact(8)
-        .map(|word| {
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(word);
-            u64::from_le_bytes(bytes)
-        })
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&word| u64::from_le_bytes(word))
         .filter(move |&word| word >= text_start && word < text_end)
         .take(limit)
 }

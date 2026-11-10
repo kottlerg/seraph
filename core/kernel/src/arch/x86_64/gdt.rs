@@ -697,7 +697,9 @@ pub unsafe fn load_iopb(iopb: Option<&ThreadIopb>)
         Some(src) =>
         {
             for (dst, &part) in tss_iopb
-                .chunks_exact_mut(IOPB_PART_BYTES)
+                .as_chunks_mut::<IOPB_PART_BYTES>()
+                .0
+                .iter_mut()
                 .zip(src.parts.iter())
             {
                 // SAFETY: each part is a live IOPB_PART_BYTES block no other

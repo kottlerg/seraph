@@ -69,7 +69,7 @@ use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sys::fs::File;
 use crate::thread::JoinHandle;
 use super::CommandEnvs;
-use super::env::CommandEnv;
+use super::env::{CommandEnv, CommandResolvedEnvs};
 
 use ipc::{procmgr_errors, procmgr_labels};
 
@@ -255,6 +255,10 @@ impl Command {
 
     pub fn get_env_clear(&self) -> bool {
         self.env.does_clear()
+    }
+
+    pub fn get_resolved_envs(&self) -> CommandResolvedEnvs {
+        CommandResolvedEnvs::new(self.env.capture())
     }
 
     pub fn get_current_dir(&self) -> Option<&Path> {

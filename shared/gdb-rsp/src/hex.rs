@@ -57,10 +57,10 @@ pub fn decode(hex: &[u8], out: &mut [u8]) -> Result<usize, Error>
     }
     let n = hex.len() / 2;
     let out = out.get_mut(..n).ok_or(Error::Overflow)?;
-    for (byte, pair) in out.iter_mut().zip(hex.chunks_exact(2))
+    for (byte, &[hi, lo]) in out.iter_mut().zip(hex.as_chunks::<2>().0)
     {
-        let hi = nibble(pair[0]).ok_or(Error::Malformed)?;
-        let lo = nibble(pair[1]).ok_or(Error::Malformed)?;
+        let hi = nibble(hi).ok_or(Error::Malformed)?;
+        let lo = nibble(lo).ok_or(Error::Malformed)?;
         *byte = hi << 4 | lo;
     }
     Ok(n)

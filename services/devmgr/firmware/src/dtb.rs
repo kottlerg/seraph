@@ -256,7 +256,7 @@ fn compatible_contains(data: &[u8], needle: &[u8]) -> bool
         let end = data[off..]
             .iter()
             .position(|&b| b == 0)
-            .map_or(data.len() - off, |p| p);
+            .unwrap_or(data.len() - off);
         if &data[off..off + end] == needle
         {
             return true;

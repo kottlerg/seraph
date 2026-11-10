@@ -203,7 +203,7 @@ impl FrameMap
             return Ok(());
         };
         counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
             .map(|_| ())
             .map_err(|_| ())
     }
@@ -220,7 +220,7 @@ impl FrameMap
             return;
         };
         if counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_err()
         {
             report_underflow(phys);

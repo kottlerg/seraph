@@ -820,7 +820,7 @@ impl PageCache
         let dropped =
             self.slots[idx]
                 .refcount
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
         debug_assert!(dropped.is_ok(), "cache slot {idx} released with refcount 0");
         if dropped.is_err()
         {

@@ -431,7 +431,12 @@ fn read_thread(thread: u64, ip: u64, kind: Thread, out: &mut Gathered)
         return;
     }
     out.thread = kind;
-    out.regs = file.chunks_exact(8).map(le_word).collect();
+    out.regs = file
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&word| u64::from_le_bytes(word))
+        .collect();
     out.frames.push(ip);
     if let Some(image) = out.image
     {

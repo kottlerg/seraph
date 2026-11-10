@@ -1141,6 +1141,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruststd-heap-fit"
+version = "0.1.2"
+dependencies = [
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "ruststd-spin-wait"
 version = "0.1.2"
 dependencies = [

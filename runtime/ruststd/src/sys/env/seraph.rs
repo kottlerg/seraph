@@ -90,12 +90,24 @@ pub fn getenv(key: &OsStr) -> Option<OsString> {
     guard.get(key).cloned()
 }
 
+/// Set `key` to `val` in the process environment.
+///
+/// # Safety
+/// None beyond `std::env::set_var`'s own contract: the map is behind a mutex,
+/// so a call from any thread, concurrent with any other environment access,
+/// is sound. The function is `unsafe` because the `sys::env` interface every
+/// platform implements declares it so.
 pub unsafe fn setenv(key: &OsStr, val: &OsStr) -> io::Result<()> {
     let mut guard = env_map().lock().unwrap_or_else(|p| p.into_inner());
     guard.insert(key.to_os_string(), val.to_os_string());
     Ok(())
 }
 
+/// Remove `key` from the process environment.
+///
+/// # Safety
+/// As [`setenv`]: none beyond `std::env::remove_var`'s own contract, since
+/// the map is behind a mutex.
 pub unsafe fn unsetenv(key: &OsStr) -> io::Result<()> {
     let mut guard = env_map().lock().unwrap_or_else(|p| p.into_inner());
     guard.remove(key);
@@ -103,10 +115,10 @@ pub unsafe fn unsetenv(key: &OsStr) -> io::Result<()> {
 }
 
 // Cwd surface backing `std::env::current_dir` / `std::env::set_current_dir`
-// on seraph. Wired up by the `apply_env_dispatch_overlay` patch to
-// `library/std/src/env.rs`, which adds a `target_os = "seraph"` cfg arm
-// dispatching here instead of through `os_imp::*` (seraph has no PAL
-// under `sys/pal/seraph/`).
+// on seraph. Wired up by the `apply_paths_overlay` patch to
+// `library/std/src/sys/paths/mod.rs`, whose `target_os = "seraph"` cfg arm
+// takes `getcwd` and `chdir` from here instead of from upstream's
+// `unsupported` paths module.
 //
 // `chdir` is a thin shim over `crate::os::seraph::set_current_dir`,
 // which performs the namespace walk from `root_dir_cap()` and stores

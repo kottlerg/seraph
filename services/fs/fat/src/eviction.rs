@@ -280,7 +280,7 @@ enum Release
 fn cooperative_release(endpoint: u64, cookie: u64) -> Release
 {
     let reserved = LIVE_WATCHDOGS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < MAX_WATCHDOGS).then_some(n + 1)
         })
         .is_ok();

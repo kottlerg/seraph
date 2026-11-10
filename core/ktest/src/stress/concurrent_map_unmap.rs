@@ -173,7 +173,7 @@ fn release(ctx: &TestContext, mappers: &mut Mappers) -> TestResult
         child.delete_cspace().ok();
     }
     let mut result = Ok(());
-    for i in 0..mappers.allocated
+    for (i, &frame) in mappers.frames[..mappers.allocated].iter().enumerate()
     {
         let va = child_va(i);
         // A VA its child left unmapped refuses the unmap; either way the
@@ -189,7 +189,7 @@ fn release(ctx: &TestContext, mappers: &mut Mappers) -> TestResult
         // SAFETY: the frame came from the pool, every child that could map
         // it was deleted above, and its only VA is unmapped (the query just
         // failed), so `frame_pool::free`'s unmapped precondition holds.
-        unsafe { crate::frame_pool::free(mappers.frames[i]) };
+        unsafe { crate::frame_pool::free(frame) };
     }
     result
 }

@@ -16,10 +16,13 @@
 //!
 //!   1. Materialise a mirror of the real toolchain at
 //!      `target/seraph-toolchain/`, using symlinks for everything except
-//!      the subtree we need to mutate (`lib/rustlib/src/rust/library/std/
-//!      src/sys/`), which is a physical copy.
-//!   2. Apply the seraph overlay to the physical-copy subtree — no
-//!      upstream rust-src is touched.
+//!      the `lib/rustlib/src/rust/library/` tree, whose files are hard
+//!      links to the real ones, or copies where a link fails (see § Why
+//!      hard-link-mirror the library/ tree below).
+//!   2. Apply the seraph overlay to the mirror's `library/` tree, each
+//!      patched or added file written unlink-then-write so its hard link
+//!      to the real file is broken first — no upstream rust-src is
+//!      touched.
 //!   3. Install the `seraph-wrapper-shim` native binary at
 //!      `target/seraph-toolchain/bin/rustc` (and the same binary again
 //!      as `bin/ws-clippy`). The shim dispatches on argv[0] basename,
@@ -193,8 +196,9 @@ pub fn ensure_seraph_toolchain(ctx: &BuildContext) -> Result<SeraphToolchain>
 // ── Mirror assembly ───────────────────────────────────────────────────────────
 
 /// Materialise `mirror` as a selective copy of `real`: everything is a
-/// symlink to `real` except the subtree `lib/rustlib/src/rust/library/
-/// std/src/sys/` which is a physical copy so it can carry overlays.
+/// symlink to `real` except the `lib/rustlib/src/rust/library/` tree, whose
+/// files are hard links to `real`'s (copies where a link fails), so the
+/// overlays can replace them in the mirror alone.
 ///
 /// Idempotent — a version-stamp file records the underlying rustc
 /// identity plus the overlay content footprint; if it matches, the
@@ -635,7 +639,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
         .and_then(Path::parent)
         .and_then(Path::parent)
         .context("deriving project root from overlay_root")?;
-    apply_sys_visibility_overlay(&rust_src).context("sys visibility overlay")?;
+    apply_sys_reserve_decl_overlay(&rust_src).context("sys/mod.rs reserve declaration overlay")?;
     apply_std_cargo_deps_overlay(&rust_src, project_root).context("std Cargo.toml deps overlay")?;
     apply_restricted_std_overlay(&rust_src).context("restricted_std OS-recognition overlay")?;
     apply_alloc_overlay(&rust_src, overlay_root).context("alloc overlay")?;
@@ -656,7 +660,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
     apply_time_overlay(&rust_src, overlay_root).context("time overlay")?;
     apply_args_overlay(&rust_src, overlay_root).context("args overlay")?;
     apply_env_overlay(&rust_src, overlay_root).context("env overlay")?;
-    apply_env_dispatch_overlay(&rust_src).context("env dispatch overlay")?;
+    apply_paths_overlay(&rust_src).context("sys/paths overlay")?;
     apply_process_overlay(&rust_src, overlay_root).context("process overlay")?;
     apply_pipe_overlay(&rust_src, overlay_root).context("pipe overlay")?;
     apply_fs_overlay(&rust_src, overlay_root).context("fs overlay")?;
@@ -666,7 +670,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
 /// The workspace crates std depends on when built for seraph: the dependency
 /// name, its path under the project root, and any extra key placed between
 /// `path` and `features` in its `library/std/Cargo.toml` line.
-const STD_WORKSPACE_DEPS: [(&str, &str, &str); 12] = [
+const STD_WORKSPACE_DEPS: [(&str, &str, &str); 13] = [
     ("syscall-abi", "abi/syscall", ""),
     ("syscall", "shared/syscall", ""),
     ("ipc", "shared/ipc", ""),
@@ -685,6 +689,11 @@ const STD_WORKSPACE_DEPS: [(&str, &str, &str); 12] = [
         "death-queues",
         "runtime/ruststd/death-queues",
         ", package = \"ruststd-death-queues\"",
+    ),
+    (
+        "heap-fit",
+        "runtime/ruststd/heap-fit",
+        ", package = \"ruststd-heap-fit\"",
     ),
     (
         "spin-wait",
@@ -778,48 +787,21 @@ fn apply_restricted_std_overlay(rust_src: &Path) -> Result<()>
     )
 }
 
-/// Widen `mod alloc;` in `sys/mod.rs` to `pub(crate) mod alloc;` so
-/// `std::os::seraph` can reach the seraph PAL's public helpers, and
-/// declare the seraph-only `pub(crate) mod reserve;` (the page-
-/// reservation allocator). Both overlays touch the same file, so they
-/// share one idempotent surgery pass.
-fn apply_sys_visibility_overlay(rust_src: &Path) -> Result<()>
+/// Declare the seraph-only `pub(crate) mod reserve;` (the page-reservation
+/// allocator) in `sys/mod.rs`, beside upstream's `pub mod alloc;`, through
+/// which `std::os::seraph` reaches the seraph PAL's public helpers.
+fn apply_sys_reserve_decl_overlay(rust_src: &Path) -> Result<()>
 {
     let mod_rs = rust_src.join("library/std/src/sys/mod.rs");
-    let original = "mod alloc;\n";
-    let stale_visibility_only = "// seraph-overlay: expose sys::alloc to the crate for os::seraph\n\
-         pub(crate) mod alloc;\n";
-    let final_block = "// seraph-overlay: expose sys::alloc to the crate for os::seraph\n\
-         pub(crate) mod alloc;\n\
+    patch_file(
+        &mod_rs,
+        "sys/mod.rs",
+        "pub mod alloc;\n",
+        "pub mod alloc;\n\
          // seraph-overlay: page-reservation allocator (seraph-only)\n\
          #[cfg(target_os = \"seraph\")]\n\
-         pub(crate) mod reserve;\n";
-
-    let text =
-        fs::read_to_string(&mod_rs).with_context(|| format!("reading {}", mod_rs.display()))?;
-    if text.contains(final_block)
-    {
-        return Ok(());
-    }
-    let patched = if text.contains(stale_visibility_only)
-    {
-        text.replace(stale_visibility_only, final_block)
-    }
-    else if text.contains(original)
-    {
-        text.replace(original, final_block)
-    }
-    else
-    {
-        bail!(
-            "sys/mod.rs has an unexpected shape — neither the upstream `mod alloc;` \
-             nor the prior overlay block was found at {}",
-            mod_rs.display()
-        );
-    };
-    write_new_file(&mod_rs, &patched)?;
-    step(&format!("seraph-toolchain: patched {}", mod_rs.display()));
-    Ok(())
+         pub(crate) mod reserve;\n",
+    )
 }
 
 fn apply_alloc_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
@@ -834,16 +816,17 @@ fn apply_alloc_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
     patch_file(
         &mod_rs,
         "alloc/mod.rs",
-        "    target_os = \"zkvm\" => {\n        mod zkvm;\n    }\n",
-        "    target_os = \"zkvm\" => {\n        mod zkvm;\n    }\n    \
+        "    target_os = \"zkvm\" => {\n        mod zkvm;\n        use zkvm as imp;\n    }\n",
+        "    target_os = \"zkvm\" => {\n        mod zkvm;\n        use zkvm as imp;\n    }\n    \
          // seraph-overlay: seraph alloc (pub(crate) so os::seraph can reach it)\n    \
-         target_os = \"seraph\" => {\n        pub(crate) mod seraph;\n    }\n",
+         target_os = \"seraph\" => {\n        pub(crate) mod seraph;\n        \
+         use seraph as imp;\n    }\n",
     )
 }
 
 /// Install the seraph-only page-reservation allocator at
 /// `library/std/src/sys/reserve.rs`. The module declaration lives in
-/// `sys/mod.rs` (added by `apply_sys_visibility_overlay`); this overlay
+/// `sys/mod.rs` (added by `apply_sys_reserve_decl_overlay`); this overlay
 /// supplies the implementation. The overlay source is kept under the
 /// conventional `sys/reserve/seraph.rs` name in the project tree even
 /// though the toolchain destination is a single `reserve.rs` file —
@@ -892,8 +875,8 @@ fn apply_random_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
                target_os = \"seraph\" => {\n        mod seraph;\n        \
                pub use seraph::{fill_bytes, hashmap_random_keys};\n    }\n";
 
-    let a2 = "    target_os = \"vexos\",\n)))]\npub fn hashmap_random_keys()";
-    let a2r = "    target_os = \"vexos\",\n    target_os = \"seraph\",\n)))]\npub fn hashmap_random_keys()";
+    let a2 = ")))]\npub fn hashmap_random_keys()";
+    let a2r = "    target_os = \"seraph\",\n)))]\npub fn hashmap_random_keys()";
 
     if !orig.contains(a1) || !orig.contains(a2)
     {
@@ -978,49 +961,32 @@ fn apply_env_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 
 /// Route `std::env::current_dir` / `std::env::set_current_dir` through
 /// the seraph env-imp module on seraph. Upstream dispatches both to
-/// `os_imp::*` (= `sys::pal::*::os`), but seraph has no PAL under
-/// `sys/pal/seraph/` — `os_imp` resolves to `sys::pal::unsupported::os`,
-/// which returns `Unsupported`. The two functions delegate to
-/// `crate::sys::env::seraph::{getcwd, chdir}` instead, which bridge to
-/// the cap-native cwd surface in `crate::os::seraph`.
-fn apply_env_dispatch_overlay(rust_src: &Path) -> Result<()>
+/// `sys::paths::{getcwd, chdir}`, whose fallback arm returns `Unsupported`.
+/// A seraph arm in `sys/paths/mod.rs` takes those two from
+/// `crate::sys::env::seraph`, which bridges to the cap-native cwd surface in
+/// `crate::os::seraph`, and the rest of the paths surface from upstream's
+/// `unsupported` module.
+fn apply_paths_overlay(rust_src: &Path) -> Result<()>
 {
-    let env_rs = rust_src.join("library/std/src/env.rs");
-    let orig =
-        fs::read_to_string(&env_rs).with_context(|| format!("reading {}", env_rs.display()))?;
-    if orig.contains(MARKER)
-    {
-        return Ok(());
-    }
-
-    let a1 = "pub fn current_dir() -> io::Result<PathBuf> {\n    os_imp::getcwd()\n}";
-    let a1r = "pub fn current_dir() -> io::Result<PathBuf> {\n    \
-               // seraph-overlay: dispatch through sys::env for cwd-cap bridge\n    \
-               #[cfg(target_os = \"seraph\")]\n    \
-               { env_imp::getcwd() }\n    \
-               #[cfg(not(target_os = \"seraph\"))]\n    \
-               { os_imp::getcwd() }\n}";
-
-    let a2 = "pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {\n    \
-              os_imp::chdir(path.as_ref())\n}";
-    let a2r = "pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {\n    \
-               // seraph-overlay: dispatch through sys::env for cwd-cap bridge\n    \
-               #[cfg(target_os = \"seraph\")]\n    \
-               { env_imp::chdir(path.as_ref()) }\n    \
-               #[cfg(not(target_os = \"seraph\"))]\n    \
-               { os_imp::chdir(path.as_ref()) }\n}";
-
-    if !orig.contains(a1) || !orig.contains(a2)
-    {
-        bail!(
-            "env.rs anchors not found — upstream layout likely changed at {}",
-            env_rs.display()
-        );
-    }
-    let patched = orig.replace(a1, a1r).replace(a2, a2r);
-    write_new_file(&env_rs, &patched)?;
-    step(&format!("seraph-toolchain: patched {}", env_rs.display()));
-    Ok(())
+    let mod_rs = rust_src.join("library/std/src/sys/paths/mod.rs");
+    patch_file(
+        &mod_rs,
+        "sys/paths/mod.rs",
+        "    target_os = \"windows\" => {\n        mod windows;\n        use windows as imp;\n    }\n",
+        "    target_os = \"windows\" => {\n        mod windows;\n        use windows as imp;\n    }\n    \
+         // seraph-overlay: cwd through the cap-native bridge in sys::env::seraph\n    \
+         target_os = \"seraph\" => {\n        \
+         #[expect(dead_code)]\n        \
+         mod unsupported;\n        \
+         mod imp {\n            \
+         pub use crate::sys::env::{chdir, getcwd};\n            \
+         pub use super::unsupported::{\n                \
+         JoinPathsError, SplitPaths, SplitPathsRef, current_exe, home_dir, join_paths,\n                \
+         split_paths, split_paths_ref, temp_dir,\n            \
+         };\n        \
+         }\n    \
+         }\n",
+    )
 }
 
 fn apply_stdio_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
@@ -1056,8 +1022,8 @@ fn apply_exit_overlay(rust_src: &Path) -> Result<()>
     patch_file(
         &exit_rs,
         "sys/exit.rs",
-        "        target_os = \"xous\" => {\n            crate::os::xous::ffi::exit(code as u32)\n        }\n",
-        "        target_os = \"xous\" => {\n            crate::os::xous::ffi::exit(code as u32)\n        }\n        \
+        "        target_os = \"xous\" => crate::os::xous::ffi::exit(code as u32),\n",
+        "        target_os = \"xous\" => crate::os::xous::ffi::exit(code as u32),\n        \
          // seraph-overlay: exit the process via SYS_PROCESS_EXIT, forwarding the code\n        \
          target_os = \"seraph\" => {\n            \
          crate::sys::fs::close_open_files();\n            \
@@ -1138,17 +1104,18 @@ fn apply_thread_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
     patch_file(
         &mod_rs,
         "thread/mod.rs",
-        "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::{Thread, available_parallelism, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};\n\n        #[expect(dead_code)]\n        mod unsupported;\n        pub use unsupported::{current_os_id, set_name};\n    }\n",
-        "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::{Thread, available_parallelism, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};\n\n        #[expect(dead_code)]\n        mod unsupported;\n        pub use unsupported::{current_os_id, set_name};\n    }\n    \
+        "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::{DEFAULT_MIN_STACK_SIZE, Thread, available_parallelism, sleep, yield_now};\n\n        #[expect(dead_code)]\n        mod unsupported;\n        pub use unsupported::{current_os_id, set_name};\n    }\n",
+        "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::{DEFAULT_MIN_STACK_SIZE, Thread, available_parallelism, sleep, yield_now};\n\n        #[expect(dead_code)]\n        mod unsupported;\n        pub use unsupported::{current_os_id, set_name};\n    }\n    \
          // seraph-overlay: seraph thread via Notification caps\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::{Thread, available_parallelism, current_os_id, set_name, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};\n    }\n",
     )?;
 
-    // Ensure the sleep_until fallback cfg list also excludes seraph, so we
-    // pick up the generic sleep-loop impl rather than tripping a duplicate.
-    let cfg_anchor = "    target_os = \"vexos\"\n)))]\npub fn sleep_until";
-    let cfg_replacement = "    target_os = \"vexos\"\n)))]\n// seraph-overlay: keep seraph on the generic sleep_until fallback\npub fn sleep_until";
+    // seraph stays off the cfg list that excludes platforms with their own
+    // `sleep_until`, so it takes the generic sleep-loop fallback; the marker
+    // comment records that choice beside the fallback in the mirror.
+    let cfg_anchor = ")))]\npub fn sleep_until";
+    let cfg_replacement = ")))]\n// seraph-overlay: keep seraph on the generic sleep_until fallback\npub fn sleep_until";
     let text =
         fs::read_to_string(&mod_rs).with_context(|| format!("reading {}", mod_rs.display()))?;
     if !text.contains("// seraph-overlay: keep seraph on the generic sleep_until fallback")

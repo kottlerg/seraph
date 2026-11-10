@@ -573,7 +573,7 @@ impl Pipe {
         }
     }
 
-    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         let cap = cursor.capacity();
         if cap == 0 {
             return Ok(());

@@ -33,6 +33,9 @@ ruststd/
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
 │                               #   rustc-dep-of-std dep of overlaid std (not re-exported),
 │                               #   and the policy shared/death-set follows for services
+├── heap-fit/                   # `ruststd-heap-fit` crate: pure, host-tested placement rule
+│   └── src/lib.rs              #   of the byte heap (where a request lands in a free block,
+│                               #   what stays free); a rustc-dep-of-std dep of overlaid std
 ├── spin-wait/                  # `ruststd-spin-wait` crate: pure, host-tested contended-wait
 │   └── src/lib.rs              #   policy of the overlay's spin mutex (spin, then sleep); a
 │                               #   rustc-dep-of-std dep of overlaid std
@@ -41,7 +44,7 @@ ruststd/
     ├── os/
     │   └── seraph.rs           # std::os::seraph surface (startup info, caps, cwd)
     └── sys/                    # std::sys::seraph backends, one directory per area
-        ├── alloc/              # byte heap (GlobalAlloc for System)
+        ├── alloc/              # byte heap (the platform allocator behind std's allocators)
         ├── args/               # std::env::args — consumes argv_env field walks
         ├── env/                # std::env::{var,vars,…} —
         │                         consumes argv_env::{next_field,split_key_value}
@@ -106,9 +109,9 @@ the full contract.
 
 ### Byte heap (`System`)
 
-`std::sys::seraph::alloc` implements `GlobalAlloc` for std's default `System`
-allocator, so no `#[global_allocator]` override is needed. Every `Box`, `Vec`,
-`String`, and `alloc`/`std` collection allocates here. The grow path
+`std::sys::seraph::alloc` provides the platform allocator functions behind std's `System`
+allocator and its default global allocator, so no `#[global_allocator]` override is needed.
+Every `Box`, `Vec`, `String`, and `alloc`/`std` collection allocates here. The grow path
 requests Memory caps from memmgr via `memmgr_labels::REQUEST_MEMORY_CAPS` on
 `ProcessInfo.memmgr_endpoint_cap`, mapping them at a contiguous VA above the
 heap's high-water mark with a single multi-page `mem_map` per returned cap;
@@ -118,9 +121,8 @@ before `fn main()` runs: a demand region registered with memmgr in a
 demand-paged process, whose pages the pager backs on their first touch
 (`Thread::new` touches a spawned thread's IPC buffer, a heap page, before the
 thread registers it, since the kernel's IPC-buffer copies need it backed), and
-an eager mapping otherwise. On OOM,
-`GlobalAlloc::alloc` returns null and the `alloc` crate aborts through
-`handle_alloc_error`; nothing unwinds. See
+an eager mapping otherwise. On OOM, the platform `alloc` returns null and the `alloc` crate
+aborts through `handle_alloc_error`; nothing unwinds. See
 [§ Byte Heap](../../docs/userspace-memory-model.md#byte-heap).
 
 One spin mutex (`SpinMutex`, `src/sys/alloc/seraph.rs`) guards the byte heap.
@@ -306,8 +308,8 @@ returns `Unsupported`. A process with a non-zero root but zero cwd
 can open absolute paths only; relative paths return `Unsupported`
 until `set_current_dir` installs a cwd cap.
 
-The setter is the seraph-native cwd primitive. The env-dispatch overlay
-(a patch to `library/std/src/env.rs`) bridges the upstream API to it:
+The setter is the seraph-native cwd primitive. The paths overlay (a seraph arm in
+`library/std/src/sys/paths/mod.rs`) bridges the upstream API to it:
 `std::env::set_current_dir` delegates to `std::os::seraph::set_current_dir`,
 which walks the root cap and installs the cwd cap and its path string
 together. `std::env::current_dir` returns the recorded path, or

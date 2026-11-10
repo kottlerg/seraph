@@ -20,6 +20,10 @@ font = { path = "../../../shared/font" }
 ipc = { path = "../../../shared/ipc" }
 syscall = { path = "../../../shared/syscall" }
 syscall-abi = { path = "../../../abi/syscall" }
+
+# The binary alone uses `text`, and it builds for the Seraph targets only, so
+# the host-tested library does not pull it into a host build.
+[target.'cfg(target_os = "seraph")'.dependencies]
 text = { path = "../../../shared/text" }
 
 [lints]

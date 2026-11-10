@@ -304,7 +304,9 @@ impl Fdt
     pub(crate) fn pci_ranges(&self, node: &FdtNode) -> impl Iterator<Item = (u32, u64, u64)> + '_
     {
         let data = self.struct_slice(node.ranges.0, node.ranges.1);
-        data.chunks_exact(PCI_RANGES_ENTRY_BYTES)
+        data.as_chunks::<PCI_RANGES_ENTRY_BYTES>()
+            .0
+            .iter()
             .map(|e| (read_be32(e), read_be64(&e[12..]), read_be64(&e[20..])))
     }
 

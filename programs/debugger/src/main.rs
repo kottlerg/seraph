@@ -91,10 +91,16 @@ mod arch;
 
 fn main()
 {
-    if std::env::args().nth(1).as_deref() == Some("--debuggee")
+    match std::env::args().nth(1).as_deref()
     {
-        debuggee_process();
-        return;
+        Some("--debuggee") =>
+        {
+            debuggee_process();
+            return;
+        }
+        Some("--gdb-target") => gdb_target(),
+        _ =>
+        {}
     }
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
@@ -176,6 +182,67 @@ fn debuggee_process()
         std::thread::sleep(Duration::from_millis(1));
     }
     println!("SEEN {:x}", child_target());
+}
+
+/// What the GDB stub's batch test reads and rewrites in the `--gdb-target`
+/// process: the count of [`gdb_target_tick`] calls. An exported symbol, so
+/// the host's GDB finds it in the image's symbol table.
+#[unsafe(no_mangle)]
+static GDB_TARGET_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The `--gdb-target` worker thread's progress, which the batch test reads
+/// through the worker's own registers.
+#[unsafe(no_mangle)]
+static GDB_TARGET_WORKER: AtomicU64 = AtomicU64::new(0);
+
+/// The `--gdb-target` process, the GDB stub's batch-test target
+/// (`cargo xtask test-gdb`): a second thread, which registers with procmgr
+/// as every `std` thread does, loops in [`gdb_target_worker_step`], and the
+/// main thread calls [`gdb_target_tick`] for ever, each on a short sleep, so
+/// a breakpoint on either is taken and both threads are listed.
+fn gdb_target() -> !
+{
+    // svcmgr launches it from a recipe with no seeds, and serves it one
+    // empty bootstrap round, which it waits for before it launches the next
+    // service.
+    let info = std::os::seraph::startup_info();
+    if info.creator_endpoint != 0
+    {
+        // SAFETY: current_ipc_buf is this thread's registered IPC buffer.
+        let _ = unsafe {
+            ipc::bootstrap::request_round(info.creator_endpoint, std::os::seraph::current_ipc_buf())
+        };
+    }
+    let _worker = std::thread::spawn(|| {
+        loop
+        {
+            gdb_target_worker_step();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    println!("gdb-target: running");
+    loop
+    {
+        gdb_target_tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// One tick of the `--gdb-target` main thread: the function the batch test
+/// breaks on.
+#[unsafe(no_mangle)]
+#[inline(never)]
+extern "C" fn gdb_target_tick()
+{
+    GDB_TARGET_COUNTER.fetch_add(1, Ordering::AcqRel);
+}
+
+/// One step of the `--gdb-target` worker thread.
+#[unsafe(no_mangle)]
+#[inline(never)]
+extern "C" fn gdb_target_worker_step()
+{
+    GDB_TARGET_WORKER.fetch_add(1, Ordering::AcqRel);
 }
 
 /// The function whose first instruction the debugger replaces with a

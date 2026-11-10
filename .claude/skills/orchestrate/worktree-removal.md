@@ -4,7 +4,8 @@ Supporting file of `.claude/agents/orchestrator.md` § Worktree removal.
 
 A worker's worktree carries a built `target/` of several GiB. The harness removes only an
 unchanged worktree, so every other one persists until you remove it. Remove only worktrees this
-batch spawned and the record lists, in two places:
+batch spawned and the record lists (the state, or the log for a worker that
+`cargo xtask orch worker <name> --remove` has taken out of the state), in two places:
 
 - **At a worker's retirement:** after its last PR merges (or its gate report, when it has no PR
   left to merge) and nothing is left for it. A worktree parked on a `park/<name>` branch stays

@@ -62,7 +62,7 @@ context, so it fills slowly and is never reset. Keep each turn to its one action
 compacted, this file is reloaded whole (it is well under the size a compaction keeps), and you
 lose nothing you need: the batch's state is the orchestrator's record, not yours. What you need
 is the current orchestrator's agent id, which is the last one you spawned; if the summary does
-not hold it, the first lines of `cargo xtask orch state` do.
+not hold it, `cargo xtask orch orchestrator` prints it, and nothing else of the record.
 
 ## Supporting files
 

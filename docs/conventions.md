@@ -202,134 +202,172 @@ are forbidden; `master` MUST NOT receive force pushes.
 
 - PRs have no second human reviewer; the file-by-file diff view, line
   comments, and CI status integration are the value, and the pre-merge
-  review below gates the merge alongside CI.
+  review (§ Pre-merge review) gates the merge alongside CI.
 - CI MUST gate merge. `master` MUST stay linearly green: every commit on
   `master` is a passing CI state. Branches MAY have intermediate failures;
   merge is the green gate.
 - PRs that close an Issue MUST carry `Fixes #N` / `Closes #N` in the PR
   description so merge auto-closes the Issue. The acceptance-checklist
-  tick-through (see above) lands in the same merge action.
-- Merge is gated by the pre-merge review: the `pr-reviewer` and
-  `pr-auditor` agents (`.claude/agents/`), invoked directly and in
-  parallel, run the adversarial code review and the closure audit, and
-  their prose verdict lines are the gate. Findings are handled per the
-  review surface and the two tracks defined below, as one batch per run.
+  tick-through (§ Acceptance checklist discipline) lands in the same merge
+  action.
 
-  A finding the PR's author disputes, on the facts or on the rule it
-  cites, is contested and MUST be put to the maintainer; on the
-  surface it MUST resolve in the same PR as a fix, as a clarification of
-  the rule it misread, or, when the maintainer finds it false on the facts,
-  as a clarification of the code or document it misread; off the surface it
-  is recorded, with the maintainer's answer, on the Issue that records it
-  (the open Issue that already names the work, else the follow-up Issue of
-  its scope defined below), or, when it misread a rule, resolved by the
-  clarification of that rule alone, which is its record. A finding MUST
-  NOT be waived or ruled outside the standards. The reviewer verdict is
-  `BLOCKING ISSUES` when a blocking finding is on the surface or a reviewer
-  returned no result, `NON-BLOCKING ISSUES ONLY` when only non-blocking
-  findings are on it, and `READY TO MERGE` when none is. The merge prompt
-  MUST follow a completed run (one with the reviewer, or the auditor-only
-  run the next item allows) with no failed agent and `AUDIT PASS` whose
-  reviewer verdict is `READY TO MERGE`, or `NON-BLOCKING ISSUES ONLY` once
-  every finding the run leaves on the surface is recorded as the item on the
-  review surface below says and no contested finding on the surface is
-  unresolved; the prompt offers the merge or one more fix round.
-  `.claude/CLAUDE.md` § PR workflow operations gives the assistant's
-  procedure.
-- A fix round MAY be followed by an auditor-only run, the closure audit
-  alone, when the last run with the reviewer completed with no failed agent
-  and the round's delta (from the head that run reviewed to the new head)
-  is documentation or comments only, as
-  [testing.md](testing.md#coverage-tiers) § Coverage tiers defines it, and
-  merges no `master` into the branch. The audit checks the PR body's
-  claims, the recording of findings, the validated head, and the closing
-  conditions at the new head. Since no code read covers a changed comment
-  or document in that run, it owes a contract-drift check: every comment or
-  document statement the delta changes is compared against the code it
-  describes, and one the code contradicts is a FAIL. It reads that last
-  run's record, confirms that the delta delivers each fix the round claims,
-  fails a finding that run left on the surface that is neither fixed by
-  the delta nor recorded as the next item says, and states the reviewer
-  verdict: that of the last run with the reviewer, read with the delta's
-  fixes, `READY TO MERGE` when the delta fixes every finding that run left
-  on the surface, `NON-BLOCKING ISSUES ONLY` when every finding it leaves
-  there is non-blocking and recorded, and `BLOCKING ISSUES` otherwise. Any
-  later delta that changes anything but documentation or comments, or
-  that merges `master` into the branch, takes a run with the reviewer.
-- The review surface of a change is what it touches: the changed hunks and
-  the items that contain them (a function, a paragraph, a section, a table
-  row, a list; for a hunk inside a file header, the header block of license,
-  path, and description), everything the change introduces, and the callers and
-  reverse dependencies of what it changes; a correctness, soundness, safety,
-  or contract defect anywhere in a touched file is on the surface too,
-  unless an open Issue already names it. In a re-review of a PR (a delta
-  run), a standards, documentation-drift, coverage, or style finding is on
-  the surface only when the delta or the PR's own earlier commits
-  introduced it, wherever it anchors: a statement the delta made stale, a
-  test the delta's new code lacks, or a finding in a hunk an earlier commit
-  of the PR introduced is one the PR introduced. Correctness, soundness,
-  safety, and contract findings stay on the surface as above. A finding on
-  the surface is on one of two tracks. It is blocking when it is of class
-  correctness, safety (which covers soundness), or contract, wherever it
-  anchors, or a MUST violation of a binding standard, of whatever class,
-  anchored in a file that is not a Markdown document; a blocking finding on
-  the surface MUST be fixed before merge. A document statement the code
-  contradicts is a contract or safety defect when it states behaviour a
-  caller or user relies on (a syscall, ABI, IPC, or command-line contract,
-  or a safety invariant); every other disagreement between a document and
-  the code (a stale name, count, path, or cross-reference, or a summary out
-  of step with its owner) is documentation drift. Every other finding on the
-  surface (one of class standards, documentation-drift, coverage, or style
-  that is not a MUST violation or is one anchored in a Markdown document:
-  wording, wrapping, nits) is non-blocking: when the reviewer verdict is
-  `BLOCKING ISSUES` it is fixed in the same batch, and after a
-  `NON-BLOCKING ISSUES ONLY` run it MUST be recorded on the follow-up Issue
-  of its scope before the merge prompt. The follow-up Issue of a scope is
-  the one open Issue whose title is `<scope>: defects found by review`,
-  where `<scope>` is a commit-title scope (§ Commit Messages), the narrowest
-  that covers the file; every PR's findings in that scope append to it, and
-  it is filed, with the maintainer's approval, the current milestone
-  (§ Milestones), and the labels § Labels requires, only when the scope has
-  none open. An open Issue whose title begins
-  `<scope>: defects found by PR #N's review`, filed before the rolling
-  Issues, is a follow-up Issue under every rule below; a finding recorded in
-  its scope goes to the rolling Issue unless the recording PR drains it. The
-  rolling Issue is where a finding off the surface is recorded too when no
-  open Issue already names the work. A finding is recorded as a `- [ ]`
-  task-list item under the Issue's `## Acceptance` section, carrying file,
-  line, authority, fix, and the PR and head that reported it. A follow-up
-  Issue is drained in batch, by a PR that changes its scope for another
-  reason or by a sweep PR that drains several scopes' Issues; no merge
-  requires a drain. A PR that fixes recorded items ticks each on the Issue
-  in the same push, appending `(fixed by PR #M)` with its own number, copies
-  those items, ticked, into its own `## Acceptance` section, and MUST
-  reference the Issue with `Refs #N`; it closes the Issue with `Fixes #N`
-  only when no item is left open once the findings of its last run are
-  recorded. A finding such a PR's run leaves in the same scope is appended
-  to the Issue it drains (the lowest-numbered, when it drains several in
-  that scope), which stays open; a drain PR MUST NOT file a successor. When
-  a follow-up Issue accumulates items of one pattern a script can decide (a
-  wrapping or layout rule), the preferred drain is a `cargo xtask lint-docs`
-  rule for the pattern, whose landing ticks those items. A later run of the
-  same PR, delta or full, MUST NOT re-raise a finding an earlier run
-  recorded, dropped, or the maintainer ruled on unless the hunk it anchors
-  to changed since the run that reported it, or that run no longer resolves
-  in the clone; the reviewer reads a ledger built from the saved run
-  records, each entry naming its run, and a finding the ledger holds whose
-  hunk is unchanged since the run its entry names, when that run resolves,
-  is listed, not counted. A finding off the surface MUST be recorded, not
-  fixed: the pre-merge review reports it as out of bound, and it is appended
-  as a recorded item to the open Issue that already names the work, else to
-  the follow-up Issue of its scope, before the merge prompt. No finding is
-  dropped for being off the surface. Work an open Issue already names, filed
-  with the maintainer's approval, is off the surface of every other PR; a
-  finding on it is recorded against that Issue. A follow-up Issue names
-  findings, not work: it takes nothing off any PR's surface, so a finding it
-  holds is, unless the ledger rule above lists it, reported, counted, and
-  fixed or recorded wherever the surface definition above puts it. A finding
-  any open follow-up Issue of its scope already holds is not recorded again
-  on any Issue, and its fix ticks its item on the Issue that holds it.
-  Every finding a run counts is fixed or recorded as above.
+### Pre-merge review
+
+Merge is gated by the pre-merge review: the `pr-reviewer` and `pr-auditor` agents
+(`.claude/agents/`), invoked directly and in parallel, run the adversarial code review and the
+closure audit, and their prose verdict lines are the gate. Findings are handled as one batch per
+run, as the subsections below define. `.claude/CLAUDE.md` § PR workflow operations gives the
+assistant's procedure.
+
+The reviewer verdict is:
+
+- `BLOCKING ISSUES` when a blocking finding is on the review surface or a reviewer returned no
+  result;
+- `NON-BLOCKING ISSUES ONLY` when only non-blocking findings are on it;
+- `READY TO MERGE` when none is.
+
+The merge prompt MUST follow a completed run (one with the reviewer, or the auditor-only run of
+§ Auditor-only run) with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
+
+- `READY TO MERGE`;
+- `NON-BLOCKING ISSUES ONLY`, once every finding the run leaves on the surface is recorded
+  (§ Recording findings) and no contested finding on the surface is unresolved. The prompt then
+  offers the merge or one more fix round.
+
+Every finding a run counts is fixed or recorded as the subsections below say. A finding MUST NOT
+be waived or ruled outside the standards.
+
+### Contested findings
+
+A finding the PR's author disputes, on the facts or on the rule it cites, is contested and MUST
+be put to the maintainer.
+
+- On the surface it MUST resolve in the same PR: as a fix; as a clarification of the rule it
+  misread; or, when the maintainer finds it false on the facts, as a clarification of the code or
+  document it misread.
+- Off the surface it is recorded, with the maintainer's answer, on the Issue that records it
+  (§ Recording findings); or, when it misread a rule, it is resolved by the clarification of
+  that rule alone, which is its record.
+
+### Auditor-only run
+
+A fix round MAY be followed by an auditor-only run, the closure audit alone, when both hold:
+
+- the last run with the reviewer completed with no failed agent;
+- the round's delta (from the head that run reviewed to the new head) is documentation or
+  comments only, as [testing.md](testing.md#coverage-tiers) § Coverage tiers defines it, and
+  merges no `master` into the branch.
+
+The audit checks the PR body's claims, the recording of findings, the validated head, and the
+closing conditions at the new head. Since no code read covers a changed comment or document in
+that run, it owes a contract-drift check: every comment or document statement the delta changes
+is compared against the code it describes, and one the code contradicts is a FAIL. It reads that
+last run's record, confirms that the delta delivers each fix the round claims, and fails a
+finding that run left on the surface that is neither fixed by the delta nor recorded
+(§ Recording findings).
+
+The audit states the reviewer verdict: that of the last run with the reviewer, read with the
+delta's fixes. It is `READY TO MERGE` when the delta fixes every finding that run left on the
+surface, `NON-BLOCKING ISSUES ONLY` when every finding it leaves there is non-blocking and
+recorded, and `BLOCKING ISSUES` otherwise.
+
+Any later delta that changes anything but documentation or comments, or that merges `master`
+into the branch, takes a run with the reviewer.
+
+### Review surface
+
+The review surface of a change is what it touches:
+
+- the changed hunks and the items that contain them (a function, a paragraph, a section, a table
+  row, a list; for a hunk inside a file header, the header block of license, path, and
+  description);
+- everything the change introduces;
+- the callers and reverse dependencies of what it changes;
+- a correctness, soundness, safety, or contract defect anywhere in a touched file, unless an
+  open Issue already names it.
+
+In a re-review of a PR (a delta run), a standards, documentation-drift, coverage, or style
+finding is on the surface only when the delta or the PR's own earlier commits introduced it,
+wherever it anchors: a statement the delta made stale, a test the delta's new code lacks, or a
+finding in a hunk an earlier commit of the PR introduced is one the PR introduced. Correctness,
+soundness, safety, and contract findings stay on the surface as above.
+
+Work an open Issue already names, filed with the maintainer's approval, is off the surface of
+every other PR; a finding on it is recorded against that Issue. A follow-up Issue
+(§ Follow-up Issues) names findings, not work: it takes nothing off any PR's surface, so a
+finding it holds is, unless the ledger lists it (§ Ledger), reported, counted, and fixed or
+recorded wherever this definition puts it.
+
+### Tracks
+
+A finding on the surface is on one of two tracks.
+
+- **Blocking:** a finding of class correctness, safety (which covers soundness), or contract,
+  wherever it anchors; or a MUST violation of a binding standard, of whatever class, anchored in
+  a file that is not a Markdown document. A blocking finding on the surface MUST be fixed before
+  merge.
+- **Non-blocking:** every other finding on the surface, that is, one of class standards,
+  documentation-drift, coverage, or style that is not a MUST violation or is one anchored in a
+  Markdown document (wording, wrapping, nits). When the reviewer verdict is `BLOCKING ISSUES` it
+  is fixed in the same batch; after a `NON-BLOCKING ISSUES ONLY` run it MUST be recorded
+  (§ Recording findings) before the merge prompt.
+
+A document statement the code contradicts is a contract or safety defect when it states
+behaviour a caller or user relies on (a syscall, ABI, IPC, or command-line contract, or a safety
+invariant). Every other disagreement between a document and the code (a stale name, count, path,
+or cross-reference, or a summary out of step with its owner) is documentation drift.
+
+A finding off the surface MUST be recorded, not fixed: the pre-merge review reports it as out of
+bound, and it is recorded (§ Recording findings) before the merge prompt. No finding is dropped
+for being off the surface.
+
+### Follow-up Issues
+
+The follow-up Issue of a scope is the one open Issue whose title is
+`<scope>: defects found by review`, where `<scope>` is a commit-title scope (§ Commit Messages),
+the narrowest that covers the file. Every PR's findings in that scope append to it, and so it is
+also called the rolling Issue. It is filed only when the scope has none open, with the
+maintainer's approval, the current milestone (§ Milestones), and the labels § Labels requires.
+
+An open Issue whose title begins `<scope>: defects found by PR #N's review`, filed before the
+rolling Issues, is a follow-up Issue under every rule of this section; a finding recorded in its
+scope goes to the rolling Issue unless the recording PR drains it.
+
+A follow-up Issue is drained in batch, by a PR that changes its scope for another reason or by a
+sweep PR that drains several scopes' Issues; no merge requires a drain. A PR that fixes recorded
+items:
+
+- ticks each on the Issue in the same push, appending `(fixed by PR #M)` with its own number;
+- copies those items, ticked, into its own `## Acceptance` section;
+- MUST reference the Issue with `Refs #N`;
+- closes the Issue with `Fixes #N` only when no item is left open once the findings of its last
+  run are recorded.
+
+A drain PR MUST NOT file a successor: a finding its run leaves in the same scope is appended to
+the Issue it drains, which stays open. When a follow-up Issue accumulates items of one pattern a
+script can decide (a wrapping or layout rule), the preferred drain is a `cargo xtask lint-docs`
+rule for the pattern, whose landing ticks those items.
+
+### Recording findings
+
+A finding is recorded as a `- [ ]` task-list item under the Issue's `## Acceptance` section,
+carrying file, line, authority, fix, and the PR and head that reported it. The Issue that
+records a finding is the first of these that applies:
+
+1. An open follow-up Issue of its scope that already holds it. The finding is not recorded
+   again on any Issue, and its fix ticks its item on the Issue that holds it.
+2. For a finding off the surface, the open Issue that already names the work.
+3. The follow-up Issue the PR drains in that scope (the lowest-numbered, when it drains several
+   in that scope).
+4. The rolling Issue of its scope.
+
+### Ledger
+
+A later run of the same PR, delta or full, MUST NOT re-raise a finding an earlier run recorded,
+dropped, or the maintainer ruled on, unless the hunk it anchors to changed since the run that
+reported it, or that run no longer resolves in the clone. The reviewer reads a ledger built from
+the saved run records, each entry naming its run; a finding the ledger holds whose hunk is
+unchanged since the run its entry names, when that run resolves, is listed, not counted.
 
 ### Branch naming
 

@@ -4848,6 +4848,59 @@ static LOAD_BALANCE_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 /// Balancing's.
 const LOAD_BALANCE_IMBALANCE_THRESHOLD: u32 = 2;
 
+/// The threshold rule: whether a CPU whose load is `theirs` is busier than one
+/// whose load is `mine` by more than [`LOAD_BALANCE_IMBALANCE_THRESHOLD`].
+fn exceeds_imbalance(theirs: u32, mine: u32) -> bool
+{
+    theirs > mine.saturating_add(LOAD_BALANCE_IMBALANCE_THRESHOLD)
+}
+
+/// The rule a pull re-decides under the two run-queue locks before it moves a
+/// thread (core/kernel/docs/scheduler.md § Load Balancing).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PullRule
+{
+    /// The source's load exceeds the destination's past the threshold
+    /// ([`exceeds_imbalance`]): a busy CPU's pull, and an idle CPU's pull that
+    /// does not wait for a confirming tick.
+    Imbalance,
+    /// A backlog an idle CPU confirmed across two ticks: the pull from its
+    /// candidate, which no load decides; the locked pick of a queued unpinned
+    /// thread is the confirmation.
+    Backlog,
+}
+
+impl PullRule
+{
+    /// Whether the rule holds for a source whose load, read under its lock, is
+    /// `src_load` and a destination whose load, read under its lock, is
+    /// `dst_load`.
+    fn passes(self, src_load: u32, dst_load: u32) -> bool
+    {
+        match self
+        {
+            Self::Imbalance => exceeds_imbalance(src_load, dst_load),
+            Self::Backlog => true,
+        }
+    }
+}
+
+/// What [`pull_unpinned_ready`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PullOutcome
+{
+    /// A thread moved to the destination.
+    Moved,
+    /// The loads read under the two locks fail the caller's [`PullRule`]: the
+    /// lock-free reading that chose the pull no longer holds, being a transient
+    /// or a load that has changed since.
+    RuleFailed,
+    /// Nothing moved for another reason: CPU indices that are equal or out of
+    /// range, a contended try-lock, no unpinned fully-saved `Ready` thread on
+    /// the source, or a move the candidate's `sched_lock` re-check refused.
+    Deferred,
+}
+
 /// What an idle CPU's scan of the other CPUs found, folded one CPU at a time by
 /// [`IdleScan::note`] (see [`idle_scan`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4892,15 +4945,27 @@ impl IdleScan
             self.backlogged = Some((cpu, load));
         }
     }
+
+    /// The scan with its most-loaded CPU dropped, so that [`idle_pull_step`]
+    /// decides by the confirmation rule alone: the step that follows a pull at
+    /// once whose re-check under the locks found the load past the threshold
+    /// no longer there.
+    fn without_heaviest(self) -> Self
+    {
+        Self {
+            heaviest: None,
+            ..self
+        }
+    }
 }
 
 /// What an idle CPU's balance step does, decided by [`idle_pull_step`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IdlePullStep
 {
-    /// Pull an unpinned `Ready` thread from this CPU now, and clear the
-    /// candidate.
-    Pull(usize),
+    /// Pull an unpinned `Ready` thread from this CPU now under this rule, and
+    /// clear the candidate.
+    Pull(usize, PullRule),
     /// Record this CPU as the candidate and pull nothing this tick.
     Remember(usize),
     /// Clear the candidate: no other CPU has a queued thread.
@@ -4914,14 +4979,15 @@ enum IdlePullStep
 /// thread (`None` when none is recorded).
 fn idle_pull_step(scan: IdleScan, candidate: Option<(usize, bool)>) -> IdlePullStep
 {
+    // An idle CPU's own load is zero (`try_pull_idle` returns otherwise).
     if let Some((cpu, load)) = scan.heaviest
-        && load > LOAD_BALANCE_IMBALANCE_THRESHOLD
+        && exceeds_imbalance(load, 0)
     {
-        return IdlePullStep::Pull(cpu);
+        return IdlePullStep::Pull(cpu, PullRule::Imbalance);
     }
     if let Some((cpu, true)) = candidate
     {
-        return IdlePullStep::Pull(cpu);
+        return IdlePullStep::Pull(cpu, PullRule::Backlog);
     }
     match scan.backlogged
     {
@@ -5021,7 +5087,7 @@ unsafe fn try_pull_balance(this_cpu: usize)
         // SAFETY: cpu_count is CPU_COUNT; slab initialised.
         match unsafe { heaviest_other_cpu(this_cpu, cpu_count) }
         {
-            Some((cpu, load)) if load > LOAD_BALANCE_IMBALANCE_THRESHOLD => cpu,
+            Some((cpu, load)) if exceeds_imbalance(load, my_load) => cpu,
             _ => return,
         }
     }
@@ -5038,7 +5104,7 @@ unsafe fn try_pull_balance(this_cpu: usize)
         }
         // SAFETY: v < cpu_count; slab initialised.
         let their_load = unsafe { (*scheduler_ptr(v)).current_load() };
-        if their_load <= my_load.saturating_add(LOAD_BALANCE_IMBALANCE_THRESHOLD)
+        if !exceeds_imbalance(their_load, my_load)
         {
             return;
         }
@@ -5046,7 +5112,7 @@ unsafe fn try_pull_balance(this_cpu: usize)
     };
 
     // SAFETY: victim, this_cpu are valid and distinct.
-    unsafe { pull_unpinned_ready(victim, this_cpu) };
+    unsafe { pull_unpinned_ready(victim, this_cpu, PullRule::Imbalance) };
 }
 
 /// Test stub.
@@ -5093,14 +5159,31 @@ unsafe fn try_pull_idle(this_cpu: usize)
             (cpu, unsafe { (*scheduler_ptr(cpu)).has_queued_thread() })
         });
 
-    match idle_pull_step(scan, candidate)
+    let mut step = idle_pull_step(scan, candidate);
+    if let IdlePullStep::Pull(src, PullRule::Imbalance) = step
     {
-        IdlePullStep::Pull(src) =>
+        // SAFETY: src < cpu_count and src != this_cpu (the scan names other
+        // CPUs only); no scheduler lock held.
+        if unsafe { pull_unpinned_ready(src, this_cpu, PullRule::Imbalance) }
+            != PullOutcome::RuleFailed
+        {
+            sched.set_idle_pull_candidate(None);
+            return;
+        }
+        // The load past the threshold no longer holds, so the confirmation
+        // rule decides this tick; otherwise a scan that kept reading a
+        // transient would never record the backlog behind it.
+        step = idle_pull_step(scan.without_heaviest(), candidate);
+    }
+
+    match step
+    {
+        IdlePullStep::Pull(src, rule) =>
         {
             sched.set_idle_pull_candidate(None);
             // SAFETY: src < cpu_count and src != this_cpu (the scan and the
             // candidate filter name other CPUs only); no scheduler lock held.
-            unsafe { pull_unpinned_ready(src, this_cpu) };
+            unsafe { pull_unpinned_ready(src, this_cpu, rule) };
         }
         IdlePullStep::Remember(src) => sched.set_idle_pull_candidate(Some(src)),
         IdlePullStep::Forget => sched.set_idle_pull_candidate(None),
@@ -5111,9 +5194,10 @@ unsafe fn try_pull_idle(this_cpu: usize)
 #[cfg(test)]
 unsafe fn try_pull_idle(_this_cpu: usize) {}
 
-/// Locate the first unpinned Ready thread on `src_cpu`'s run queues and
-/// migrate it to `dst_cpu` under both scheduler locks (ascending order,
-/// try-acquired — a contended pull backs off to the next balance tick).
+/// Migrate the first unpinned Ready thread on `src_cpu`'s run queues to
+/// `dst_cpu` under both scheduler locks (ascending order, try-acquired — a
+/// contended pull backs off to the next balance tick), when `rule` still holds
+/// on the loads read under those locks ([`pull_under_cpu_locks`]).
 ///
 /// Pinned threads are invisible to this pull. Caller MUST NOT hold either
 /// scheduler lock.
@@ -5121,18 +5205,18 @@ unsafe fn try_pull_idle(_this_cpu: usize) {}
 /// # Safety
 /// Both CPU indices must be valid (`< CPU_COUNT`) and distinct.
 #[cfg(not(test))]
-unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
+unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize, rule: PullRule) -> PullOutcome
 {
     use core::sync::atomic::Ordering;
 
     if src_cpu == dst_cpu
     {
-        return;
+        return PullOutcome::Deferred;
     }
     let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
     if src_cpu >= cpu_count || dst_cpu >= cpu_count
     {
-        return;
+        return PullOutcome::Deferred;
     }
 
     let (lo, hi) = if src_cpu < dst_cpu
@@ -5162,7 +5246,7 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     let Some(saved_lo) = (unsafe { lo_sched.lock.try_lock_raw() })
     else
     {
-        return;
+        return PullOutcome::Deferred;
     };
     // Ascending-CPU order (lock-hierarchy rule 4) is retained; try keeps the
     // acquisition non-queuing.
@@ -5172,8 +5256,51 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     {
         // SAFETY: paired with try_lock_raw above.
         unsafe { lo_sched.lock.unlock_raw(saved_lo) };
-        return;
+        return PullOutcome::Deferred;
     };
+
+    // SAFETY: both CPUs valid and distinct; both run-queue locks held.
+    let outcome = unsafe { pull_under_cpu_locks(src_cpu, dst_cpu, rule) };
+
+    // SAFETY: paired with try_lock_raw above; release hi first, lo last (lo
+    // captured the caller's interrupt flags).
+    unsafe {
+        hi_sched.lock.unlock_raw(saved_hi);
+        lo_sched.lock.unlock_raw(saved_lo);
+    }
+
+    if outcome == PullOutcome::Moved
+    {
+        // SAFETY: dst_cpu validated < cpu_count.
+        unsafe { wake_idle_cpu(dst_cpu) };
+    }
+    outcome
+}
+
+/// The body of [`pull_unpinned_ready`] under both run-queue locks: re-decide
+/// `rule` on the two loads, pick the first unpinned fully-saved `Ready` thread
+/// on `src_cpu`, and move it to `dst_cpu` under its `sched_lock`, try-acquired.
+///
+/// The caller chose the pull from loads read without these locks, which can
+/// catch a load `schedule()` has raised for a moment (a requeue of the running
+/// thread counted before the dequeue that follows) or one that has changed
+/// since, so the rule is decided again here, where every load change has
+/// completed (core/kernel/docs/scheduler.md § Load Balancing).
+///
+/// # Safety
+/// Both CPU indices must be valid and distinct, and the caller MUST hold both
+/// CPUs' scheduler locks.
+#[cfg(not(test))]
+unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -> PullOutcome
+{
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: both CPUs valid (caller's contract).
+    let (src, dst) = unsafe { (&*scheduler_ptr(src_cpu), &*scheduler_ptr(dst_cpu)) };
+    if !rule.passes(src.current_load(), dst.current_load())
+    {
+        return PullOutcome::RuleFailed;
+    }
 
     // No skip-owner predicate is needed: `switch_out_save` clears this CPU's
     // `fpu_owner` and XSAVEs the live regs before `switch()` publishes
@@ -5191,22 +5318,16 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     // CPU's `switch()` republishes `cs = 1` once the register save is
     // committed). A skipped mid-handoff thread is dispatched by its source CPU
     // and pulled on a later balance tick once `cs == 1`.
-    // SAFETY: src_cpu valid; lock held; predicate is read-only.
+    // SAFETY: src's lock held (caller's contract); predicate is read-only.
     let pick = unsafe {
-        (*scheduler_ptr(src_cpu)).find_runnable(|tcb| {
+        src.find_runnable(|tcb| {
             (*tcb).cpu_affinity == AFFINITY_ANY && (*tcb).context_saved.load(Ordering::Acquire) == 1
         })
     };
-
     let Some((tcb, priority)) = pick
     else
     {
-        // SAFETY: paired with lock_raw above; release hi first, lo last (lo
-        // captured the caller's interrupt flags).
-        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-        // SAFETY: paired with lock_raw above.
-        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
-        return;
+        return PullOutcome::Deferred;
     };
 
     // Acquire the candidate's sched_lock so the Scheduling-field write below
@@ -5222,11 +5343,7 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     let Some(tcb_sched_saved) = (unsafe { (*tcb).sched_lock.try_lock_raw() })
     else
     {
-        // SAFETY: paired with lock_raw above; release hi first, lo last.
-        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-        // SAFETY: paired with lock_raw above.
-        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
-        return;
+        return PullOutcome::Deferred;
     };
 
     // Validate (Ready && context_saved==1 && affinity permits dst) under the
@@ -5240,24 +5357,26 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     // SAFETY: sched_lock + both run-queue locks held.
     let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
 
-    // SAFETY: paired above; release the candidate's sched_lock and hi, then lo
-    // last (lo captured the caller's interrupt flags).
-    unsafe {
-        (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
-        hi_sched.lock.unlock_raw(saved_hi);
-        lo_sched.lock.unlock_raw(saved_lo);
-    }
+    // SAFETY: paired with try_lock_raw above; released before the caller
+    // releases the run-queue locks.
+    unsafe { (*tcb).sched_lock.unlock_raw(tcb_sched_saved) };
 
     if moved
     {
-        // SAFETY: dst_cpu validated < cpu_count.
-        unsafe { wake_idle_cpu(dst_cpu) };
+        PullOutcome::Moved
+    }
+    else
+    {
+        PullOutcome::Deferred
     }
 }
 
 /// Test stub.
 #[cfg(test)]
-unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
+unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize, _rule: PullRule) -> PullOutcome
+{
+    PullOutcome::Deferred
+}
 
 /// Make a not-live thread `Ready` and link it on `target_cpu`'s run queue,
 /// waking that CPU if idle — the cross-CPU wake primitive (IPC, IRQ, timer).
@@ -5675,7 +5794,7 @@ pub unsafe fn select_target_cpu_excluding(
     {
         // SAFETY: pref < cpu_count; slab initialised.
         let pref_load = unsafe { (*scheduler_ptr(pref)).current_load() };
-        if pref_load <= min_load.saturating_add(LOAD_BALANCE_IMBALANCE_THRESHOLD)
+        if !exceeds_imbalance(pref_load, min_load)
         {
             return pref;
         }
@@ -7022,7 +7141,10 @@ mod class_tests
 #[cfg(test)]
 mod idle_pull_tests
 {
-    use super::{IdlePullStep, IdleScan, LOAD_BALANCE_IMBALANCE_THRESHOLD, idle_pull_step};
+    use super::{
+        IdlePullStep, IdleScan, LOAD_BALANCE_IMBALANCE_THRESHOLD, PullRule, exceeds_imbalance,
+        idle_pull_step,
+    };
 
     /// A scan whose most-loaded CPU is `heaviest` and whose most-loaded CPU with
     /// a queued thread other than its idle thread is `backlogged`.
@@ -7058,7 +7180,7 @@ mod idle_pull_tests
         assert_eq!(idle_pull_step(backlog, None), IdlePullStep::Remember(3));
         assert_eq!(
             idle_pull_step(backlog, Some((3, true))),
-            IdlePullStep::Pull(3)
+            IdlePullStep::Pull(3, PullRule::Backlog)
         );
         // The candidate drained but another CPU holds a backlog: that one is
         // sampled afresh rather than pulled unconfirmed.
@@ -7093,8 +7215,53 @@ mod idle_pull_tests
     {
         let heavy = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
         let past = scan(Some((2, heavy)), Some((2, heavy)));
-        assert_eq!(idle_pull_step(past, None), IdlePullStep::Pull(2));
-        assert_eq!(idle_pull_step(past, Some((4, true))), IdlePullStep::Pull(2));
+        let at_once = IdlePullStep::Pull(2, PullRule::Imbalance);
+        assert_eq!(idle_pull_step(past, None), at_once);
+        assert_eq!(idle_pull_step(past, Some((4, true))), at_once);
+    }
+
+    // The defect caught: a threshold test off by one at the boundary (a pull at
+    // a difference equal to the threshold, or none just past it), or one whose
+    // sum wraps at a large load of the puller's and passes every victim.
+    #[test]
+    fn the_threshold_rule_holds_only_past_the_threshold_difference()
+    {
+        let t = LOAD_BALANCE_IMBALANCE_THRESHOLD;
+        assert!(exceeds_imbalance(t + 1, 0));
+        assert!(!exceeds_imbalance(t, 0));
+        assert!(exceeds_imbalance(t + 4, 3));
+        assert!(!exceeds_imbalance(t + 3, 3));
+        assert!(!exceeds_imbalance(u32::MAX, u32::MAX));
+    }
+
+    // The defect caught: a pull chosen on a load `schedule()` had raised for a
+    // moment (a requeue of the running thread counted before its dequeue)
+    // migrating a thread once that load has settled at a value the threshold
+    // rule fails, or a confirmed backlog refused for a load no rule asks of it.
+    #[test]
+    fn a_pull_re_decided_under_the_locks_applies_only_its_own_rule()
+    {
+        let t = LOAD_BALANCE_IMBALANCE_THRESHOLD;
+        assert!(!PullRule::Imbalance.passes(t, 0));
+        assert!(PullRule::Imbalance.passes(t + 1, 0));
+        // A backlog of one queued thread beside the idle thread, load 2.
+        assert!(PullRule::Backlog.passes(2, 0));
+    }
+
+    // The defect caught: an idle CPU whose pull at once the re-check refused
+    // records nothing, so a scan that keeps reading a transient load never
+    // samples the backlog behind it and the queued thread starves; or one that
+    // passes over a candidate it has confirmed.
+    #[test]
+    fn a_refused_pull_at_once_falls_back_to_the_confirmation_rule()
+    {
+        let heavy = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        let past = scan(Some((2, heavy)), Some((2, heavy))).without_heaviest();
+        assert_eq!(idle_pull_step(past, None), IdlePullStep::Remember(2));
+        assert_eq!(
+            idle_pull_step(past, Some((4, true))),
+            IdlePullStep::Pull(4, PullRule::Backlog)
+        );
     }
 
     // The defect caught: a stale candidate kept across ticks on which no CPU

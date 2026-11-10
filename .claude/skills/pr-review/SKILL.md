@@ -46,7 +46,7 @@ Save both agents' prose as `target/xtask/review/pr<N>/<mode>-<head>.md` and the 
 `<mode>-<head>.json` beside it. `<mode>` is `full` for the first run, `delta` for a later run
 with the reviewer, and `audit` for an auditor-only run or a re-audit; a further run at the same
 head takes the suffix `-<n>`, counting from 2. `xtask/README.md` § `cargo xtask review-check`
-defines the record. Four points it leaves to you:
+defines the record. Five points it leaves to you:
 
 - `stats.run` is the run's number among the PR's runs of every mode, counting from 1: one more
   than the highest `run` among the records already saved. It orders the runs, and the gate
@@ -57,6 +57,9 @@ defines the record. Four points it leaves to you:
 - In an `audit` record, `verdict` is the reviewer verdict the audit states, `findings` holds the
   surface findings of the last reviewer run that the audit lists as unfixed, each as that run's
   record states it, and `recorded`, `ledgered` and `dropped` are empty.
+- A run of the reviewer alone, made while an owed host run is unreported, is a `full` or `delta`
+  record with `audit_verdict` `NOT RUN` and `audit` `null`. The gate still needs `AUDIT PASS` in
+  the last record at the head, so the audit it leaves owed is a later `audit` record there.
 
 Run `cargo xtask review-check <N>` and fix the record until it passes: the ledger and the gate
 read these files. Then give both verdict lines verbatim to the one you report to: a worker to

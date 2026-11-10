@@ -10,6 +10,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`death-set/`](death-set/README.md) | Growable death-queue set and main wait set used by supervisor services |
 | [`elf/`](elf/README.md) | ELF64 parser — header validation, segment enumeration |
 | [`font/`](font/README.md) | Embedded 9×20 bitmap font shared by every framebuffer console |
+| [`gdb-rsp/`](gdb-rsp/README.md) | GDB remote serial protocol — packet framing, packet parse and encode, and the target descriptions a stub serves |
 | [`ipc/`](ipc/README.md) | IPC helpers — `IpcMessage` snapshot type, `ipc_call`/`recv`/`reply` wrappers, bootstrap protocol, and the `RecvGuard` receive-failure policy for blocking recv loops |
 | [`log/`](log/README.md) | System log primitives — wire-format helpers and process-global cache for the badged log cap |
 | [`mmio/`](mmio/README.md) | Architecture-specific MMIO ordering barriers for device drivers |

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// programs/debugger/src/arch/riscv64.rs
+// programs/debugger/src/arch/riscv64/mod.rs
 
 //! riscv64 breakpoint and single-step: the 4-byte `ebreak`, and a `c.ebreak`
 //! planted at each successor, one `FAULT_EXC_BREAKPOINT` per instruction.

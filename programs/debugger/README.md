@@ -28,8 +28,10 @@ debugger/
 │   │                      #   (`--debuggee`)
 │   └── arch/
 │       ├── mod.rs         # Architecture-dispatch surface
-│       ├── x86_64.rs      # `int3`; single-step by the trap flag
-│       └── riscv64.rs     # `ebreak`; single-step by `c.ebreak` at the successor
+│       ├── x86_64/
+│       │   └── mod.rs     # `int3`; single-step by the trap flag
+│       └── riscv64/
+│           └── mod.rs     # `ebreak`; single-step by `c.ebreak` at the successor
 └── tester/
     ├── Cargo.toml
     └── src/

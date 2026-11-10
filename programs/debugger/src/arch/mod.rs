@@ -17,11 +17,11 @@
 //!   `single_step` takes.
 
 #[cfg(target_arch = "x86_64")]
-#[path = "x86_64.rs"]
+#[path = "x86_64/mod.rs"]
 mod current;
 
 #[cfg(target_arch = "riscv64")]
-#[path = "riscv64.rs"]
+#[path = "riscv64/mod.rs"]
 mod current;
 
 pub use current::{BREAKPOINT, IP, RESUME_ADVANCE, arm_step, breakpoint, reported, single_step};

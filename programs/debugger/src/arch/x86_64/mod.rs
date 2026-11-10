@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// programs/debugger/src/arch/x86_64.rs
+// programs/debugger/src/arch/x86_64/mod.rs
 
 //! x86-64 breakpoint and single-step: `int3`, and the trap flag, one
 //! `FAULT_EXC_DEBUG` per instruction.

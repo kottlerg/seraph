@@ -247,14 +247,7 @@ impl Scan
     {
         match c
         {
-            '\'' =>
-            {
-                self.in_word = true;
-                while let Some(c) = self.take().filter(|c| *c != '\'')
-                {
-                    self.word.push(c);
-                }
-            }
+            '\'' => self.single_quoted(),
             '"' =>
             {
                 self.in_word = true;
@@ -292,6 +285,17 @@ impl Scan
             ';' | '|' | '&' | '`' => self.end_command(),
             c if c.is_whitespace() => self.end_word(),
             _ => self.push(c),
+        }
+    }
+
+    /// Read a single-quoted string, whose opening quote is taken: its text,
+    /// up to the closing quote, is part of the word as it stands.
+    fn single_quoted(&mut self)
+    {
+        self.in_word = true;
+        while let Some(c) = self.take().filter(|c| *c != '\'')
+        {
+            self.word.push(c);
         }
     }
 

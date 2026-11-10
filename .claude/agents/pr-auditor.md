@@ -34,11 +34,10 @@ claims.
     closed Issue, and the `(fixed by PR #N)` ticks; the commit-message
     rules of step 8 that have a fixed form; and in step 9, that the
     validated head is the head or that the delta since it alters only
-    comment lines. Do not re-derive those by hand.
-    Spend your read on what it cannot decide:
-    whether the diff delivers each criterion, whether the body's claims
-    match the diff, silent deferrals, test-plan evidence, planning labels,
-    and which local host runs the diff owes.
+    comment lines. Do not re-derive those by hand. Spend your read on what
+    it cannot decide: whether the diff delivers each criterion, whether
+    the body's claims match the diff, silent deferrals, test-plan evidence,
+    planning labels, and which local host runs the diff owes.
 
 2. Resolve scope from the parent's invocation: PR number, or current-branch
    PR via `gh pr view --json number,body,title,headRefOid,baseRefName`, or

@@ -880,7 +880,7 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     xtask/src/disk.rs xtask/src/commands/mkdisk.rs services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/test-dma/ services/drivers/framebuffer/ \
     services/drivers/virtio/console/ services/debug-echo/ xtask/src/commands/test_debug_port.rs \
-    shared/gdb-rsp/ \
+    shared/gdb-rsp/ services/gdbstub/ xtask/src/debug_stub.rs xtask/src/commands/test_gdb.rs \
     core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/
 D='sys_irq_(register|ack|split)|(un)?route_device_irq|irq_line_count|dispatch_device_irq'
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
@@ -890,6 +890,8 @@ D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV
 D="$D|test_dma_labels|dma_confinement_phase"
 D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
 D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
+D="$D|gdb_target(_tick|_worker_step)?|handle_list_processes|handle_detach_process"
+D="$D|restore_crash_bindings|watch_debugger|check_debuggers"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
 D="$D|second_disk(_[a-z_]+)?|second_(src|dst|shared_line)"
 D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"

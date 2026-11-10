@@ -30,6 +30,7 @@ mod bundle;
 mod cli;
 mod commands;
 mod context;
+mod crash_log;
 mod diag;
 mod disk;
 mod firmware;

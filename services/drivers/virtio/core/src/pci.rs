@@ -50,6 +50,17 @@ pub fn poll_until(
     }
 }
 
+/// `addr` as the `(low, high)` 32-bit halves a common-configuration register
+/// pair takes a 64-bit device address in (`VirtIO` 1.2 §4.1.4.3).
+// cast_possible_truncation: keeping the low half is the point, and the shift
+// leaves the high half at 32 bits.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn split_address(addr: u64) -> (u32, u32)
+{
+    (addr as u32, (addr >> 32) as u32)
+}
+
 /// Modern PCI transport backed by MMIO-mapped BAR regions.
 ///
 /// The four register regions are reached through the driver's register
@@ -203,40 +214,17 @@ impl PciTransport
         )
     }
 
-    /// Set descriptor table device address (low 32 bits), as `DMA_MAP` returned it.
-    pub fn queue_set_desc_lo(&self, addr: u32)
+    /// Set the selected queue's descriptor table, available ring, and used
+    /// ring device addresses, as `DMA_MAP` returned them. Each register pair
+    /// takes its address in 32-bit halves ([`split_address`]).
+    pub fn queue_set_rings(&self, desc: u64, avail: u64, used: u64)
     {
-        self.write_common_u32(0x20, addr);
-    }
-
-    /// Set descriptor table device address (high 32 bits), as `DMA_MAP` returned it.
-    pub fn queue_set_desc_hi(&self, addr: u32)
-    {
-        self.write_common_u32(0x24, addr);
-    }
-
-    /// Set available ring device address (low 32 bits), as `DMA_MAP` returned it.
-    pub fn queue_set_avail_lo(&self, addr: u32)
-    {
-        self.write_common_u32(0x28, addr);
-    }
-
-    /// Set available ring device address (high 32 bits), as `DMA_MAP` returned it.
-    pub fn queue_set_avail_hi(&self, addr: u32)
-    {
-        self.write_common_u32(0x2C, addr);
-    }
-
-    /// Set used ring device address (low 32 bits), as `DMA_MAP` returned it.
-    pub fn queue_set_used_lo(&self, addr: u32)
-    {
-        self.write_common_u32(0x30, addr);
-    }
-
-    /// Set used ring device address (high 32 bits), as `DMA_MAP` returned it.
-    pub fn queue_set_used_hi(&self, addr: u32)
-    {
-        self.write_common_u32(0x34, addr);
+        for (offset, addr) in [(0x20, desc), (0x28, avail), (0x30, used)]
+        {
+            let (low, high) = split_address(addr);
+            self.write_common_u32(offset, low);
+            self.write_common_u32(offset + 4, high);
+        }
     }
 
     /// Enable (1) or disable (0) the selected queue.
@@ -429,6 +417,19 @@ mod tests
     use super::*;
 
     use core::cell::Cell;
+
+    #[test]
+    fn split_address_gives_the_low_then_the_high_half()
+    {
+        // Distinct halves with their top bits set: a swapped pair, a
+        // sign-extending or a dropped half reads back wrong.
+        let (low, high) = split_address(0x8765_4321_89AB_CDEF);
+        assert_eq!((low, high), (0x89AB_CDEF, 0x8765_4321));
+        assert_eq!(
+            u64::from(high) << 32 | u64::from(low),
+            0x8765_4321_89AB_CDEF
+        );
+    }
 
     #[test]
     fn poll_until_gives_up_at_the_deadline_whatever_the_poll_count()

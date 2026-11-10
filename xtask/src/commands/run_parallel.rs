@@ -144,14 +144,14 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     // The stub is staged into `disk.img` before the slots copy it, and
     // unstaged after the last run, whatever its outcome.
     validate_sysroot_for_launch(ctx, args.arch)?;
-    crate::debug_stub::stage(ctx, args.arch, target)?;
+    let layout = crate::debug_stub::stage(ctx, args.arch, target)?;
     let binary = crate::debug_stub::binary_for(ctx, target);
     step(&format!(
         "GDB stub staged for {target}; connect with:\n    {}",
         crate::debug_stub::gdb_command(args.arch, port, binary.as_deref())
     ));
     let ran = run_waves(ctx, args);
-    crate::debug_stub::unstage(ctx, args.arch)?;
+    crate::debug_stub::unstage(ctx, args.arch, layout)?;
     ran
 }
 

@@ -12,9 +12,11 @@
 //! runs `gdb -batch` against the port with the image's symbols ([`SCRIPT`]):
 //! it lists the threads, breaks on `gdb_target_tick`, continues to it,
 //! rewrites a variable and a register and reads each back, single-steps,
-//! selects the second thread and reads its registers, and detaches. The output is checked against [`expect`]. The
-//! recipes are always removed and `disk.img` repacked afterwards; the host
-//! kills QEMU.
+//! selects the second thread and reads its registers, and detaches. The
+//! output is checked against [`expect`], and the stub's own detach line
+//! against [`expect_restored`]: procmgr gave the target its crash bindings
+//! back. The recipes are always removed and the disk images repacked in the
+//! layout they had afterwards; the host kills QEMU.
 //!
 //! A pure runner: requires a populated sysroot from `cargo xtask build` and a
 //! host GDB that debugs the architecture (`gdb` built with all targets, or
@@ -48,8 +50,16 @@ const TARGET_NAME: &str = "gdb-target";
 /// `services/gdbstub/src/main.rs`.
 const READY_MARKER: &str = "[gdbstub] attached; serving the debug port";
 
+/// The start of the stub's line once it has detached, which ends with
+/// whether procmgr restored the target's crash bindings. Kept in sync with
+/// `services/gdbstub/src/main.rs`.
+const DETACHED_MARKER: &str = "[gdbstub] detached from gdb-target (crash bindings restored: ";
+
 /// Budget for the boot to reach [`READY_MARKER`].
 const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Budget, from GDB's exit, for the stub's [`DETACHED_MARKER`] line.
+const DETACH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Budget for GDB's whole session.
 const GDB_TIMEOUT: Duration = Duration::from_mins(3);
@@ -98,22 +108,42 @@ pub fn run(ctx: &Context, args: &TestGdbArgs) -> Result<()>
     let target_source = ctx.sysroot.join("config/svcmgr/tests").join(TARGET_RECIPE);
     std::fs::copy(&target_source, &target_staged)
         .with_context(|| format!("staging {}", target_source.display()))?;
-    let booted =
-        debug_stub::stage(ctx, args.arch, TARGET_NAME).and_then(|()| boot(ctx, args, &gdb));
+    let staged = debug_stub::stage(ctx, args.arch, TARGET_NAME);
+    let booted = staged.as_ref().ok().map(|_| boot(ctx, args, &gdb));
     // Restore first, and surface its failure ahead of the boot's.
-    std::fs::remove_file(&target_staged)
-        .with_context(|| format!("removing {}", target_staged.display()))
-        .and_then(|()| debug_stub::unstage(ctx, args.arch))
+    let removed = std::fs::remove_file(&target_staged)
+        .with_context(|| format!("removing {}", target_staged.display()));
+    let layout = staged?;
+    removed
+        .and_then(|()| debug_stub::unstage(ctx, args.arch, layout))
         .context("restoring disk.img without the stub and its target")?;
-    let output = booted?;
-    expect(&output)?;
+    let session = booted.context("the boot did not run")??;
+    expect(&session.gdb)?;
+    expect_restored(session.detached.as_deref())?;
     step("gdb stub test: PASS (break, memory and register write, step, second thread, detach)");
     Ok(())
 }
 
-/// Boot with the debug port, wait for the stub, run GDB, kill QEMU; returns
-/// GDB's output.
-fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path) -> Result<String>
+/// What one session left to check.
+struct Session
+{
+    /// GDB's output.
+    gdb: String,
+    /// The stub's [`DETACHED_MARKER`] line, when it appeared within
+    /// [`DETACH_TIMEOUT`] of GDB's exit.
+    detached: Option<String>,
+}
+
+/// A line of the guest's serial output the test waits on.
+enum Serial
+{
+    Ready,
+    Detached(String),
+}
+
+/// Boot with the debug port, wait for the stub, run GDB, wait for the stub's
+/// detach line, kill QEMU.
+fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path) -> Result<Session>
 {
     let (firmware_code, firmware_vars) = match args.arch
     {
@@ -158,38 +188,72 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path) -> Result<String>
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
-    let (tx, rx) = mpsc::channel::<()>();
-    let reader = thread::spawn(move || {
-        let mut signalled = false;
-        for line in BufReader::new(stdout).lines()
+    let (tx, rx) = mpsc::channel::<Serial>();
+    let reader = thread::spawn(move || forward_serial(stdout, &tx));
+    let binary = ctx.sysroot.join("programs/debugger");
+    let ready = loop
+    {
+        match rx.recv_timeout(BOOT_TIMEOUT)
         {
-            let Ok(l) = line
-            else
+            Ok(Serial::Ready) => break Ok(()),
+            Ok(Serial::Detached(_)) =>
+            {}
+            Err(_) =>
             {
-                break;
-            };
-            println!("{l}");
-            if !signalled && l.contains(READY_MARKER)
-            {
-                signalled = true;
-                let _ = tx.send(());
+                break Err(anyhow::anyhow!(
+                    "the stub's {READY_MARKER:?} line did not appear within {}s",
+                    BOOT_TIMEOUT.as_secs()
+                ));
             }
         }
-    });
-    let binary = ctx.sysroot.join("programs/debugger");
-    let result = rx
-        .recv_timeout(BOOT_TIMEOUT)
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "the stub's {READY_MARKER:?} line did not appear within {}s",
-                BOOT_TIMEOUT.as_secs()
-            )
-        })
-        .and_then(|()| run_gdb(gdb, args.arch, args.port, &binary));
+    };
+    let result = ready
+        .and_then(|()| run_gdb(gdb, args.arch, args.port, &binary))
+        .map(|output| Session {
+            gdb: output,
+            detached: loop
+            {
+                match rx.recv_timeout(DETACH_TIMEOUT)
+                {
+                    Ok(Serial::Detached(line)) => break Some(line),
+                    Ok(Serial::Ready) =>
+                    {}
+                    Err(_) => break None,
+                }
+            },
+        });
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
     result
+}
+
+/// Echo the guest's serial output, and send `tx` each line the test waits
+/// on.
+fn forward_serial(stdout: std::process::ChildStdout, tx: &mpsc::Sender<Serial>)
+{
+    for line in BufReader::new(stdout).lines()
+    {
+        let Ok(l) = line
+        else
+        {
+            break;
+        };
+        println!("{l}");
+        let event = if l.contains(READY_MARKER)
+        {
+            Serial::Ready
+        }
+        else if l.contains(DETACHED_MARKER)
+        {
+            Serial::Detached(l)
+        }
+        else
+        {
+            continue;
+        };
+        let _ = tx.send(event);
+    }
 }
 
 /// Run the batch session, bounded by [`GDB_TIMEOUT`]; returns its output.
@@ -318,11 +382,26 @@ fn expect(output: &str) -> Result<()>
     {
         bail!("thread 2 was not selected, or its registers not read");
     }
-    if !section(output, "@@detach").contains("etach")
+    if !section(output, "@@detach").contains("[Inferior 1 (Remote target) detached]")
     {
         bail!("the session did not detach");
     }
     Ok(())
+}
+
+/// Check the stub's detach line: procmgr took the target's crash bindings
+/// back.
+fn expect_restored(line: Option<&str>) -> Result<()>
+{
+    match line
+    {
+        Some(l) if l.contains(&format!("{DETACHED_MARKER}true)")) => Ok(()),
+        Some(l) => bail!("the stub detached without restoring the crash bindings: {l}"),
+        None => bail!(
+            "the stub's detach line did not appear within {}s",
+            DETACH_TIMEOUT.as_secs()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -341,11 +420,29 @@ mod tests
                     gdb_target_tick ()\n@@pc\n$1 = 0x10\n@@counter\n0x20:\t0x0000000000005eed\n\
                     @@register\nRegister cache flushed.\n$2 = 0x5eed5eed\n\
                     @@step\n$3 = 0x14\n@@thread\n[Switching to thread 2 (Thread 2)]\n$4 = 0x30\n\
-                    $5 = 0x40\n@@detach\nDetaching from program\n";
+                    $5 = 0x40\n@@detach\n[Inferior 1 (Remote target) detached]\n";
         expect(good).unwrap();
+        assert!(
+            expect(&good.replace(
+                "[Inferior 1 (Remote target) detached]",
+                "Can't detach Thread 1"
+            ))
+            .is_err()
+        );
         assert!(expect(&good.replace("$3 = 0x14", "$3 = 0x10")).is_err());
         assert!(expect(&good.replace("0x0000000000005eed", "0x0000000000000000")).is_err());
         assert!(expect(&good.replace("$2 = 0x5eed5eed", "$2 = 0x7")).is_err());
         assert!(expect(&good.replace("2    Thread 2   0x9 in f ()", "")).is_err());
+    }
+
+    // Defect caught: a detach that left the target's crash bindings with the
+    // stub, or no detach line at all, passing the test.
+    #[test]
+    fn a_detach_without_the_restored_bindings_fails_the_check()
+    {
+        let line = "$ [1.7] [gdbstub] detached from gdb-target (crash bindings restored: true)";
+        expect_restored(Some(line)).unwrap();
+        assert!(expect_restored(Some(&line.replace("true", "false"))).is_err());
+        assert!(expect_restored(None).is_err());
     }
 }

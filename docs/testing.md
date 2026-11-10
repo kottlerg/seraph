@@ -418,7 +418,7 @@ from a host GDB over the debug port, so its check is a host GDB session.
    an exported counter and tick function;
    [programs/debugger/README.md](../programs/debugger/README.md)) from `/config/svcmgr/tests/`,
    and the stub's template from `/config/svcmgr/debug/` naming it, into
-   `/config/svcmgr/services/`, and repack `disk.img`.
+   `/config/svcmgr/services/`, and repack the disk images in the layout they have.
 2. Boot the current sysroot once with the debug port, and wait for the stub's
    `[gdbstub] attached; serving the debug port` line on the serial stream.
 3. Run `gdb -batch` against the port with the target's binary for symbols: list the threads,
@@ -427,8 +427,11 @@ from a host GDB over the debug port, so its check is a host GDB session.
    cache, and restore it, single-step, delete the breakpoint, select the second thread and read
    its registers, and detach. The output must show two threads, the breakpoint's stop, the
    rewritten counter and register, a step that moved the pointer, the second thread's registers,
-   and the detach.
-4. Kill QEMU, remove both recipes, and repack `disk.img` again, whatever the outcome.
+   and GDB's `[Inferior 1 (Remote target) detached]`.
+4. Wait up to 30 s for the stub's `[gdbstub] detached from gdb-target (crash bindings restored:
+   true)` line: procmgr took the target's crash bindings back.
+5. Kill QEMU, remove both recipes, and repack the images in that layout again, whatever the
+   outcome.
 
 It needs a host GDB that debugs the guest architecture (`gdb` built with every target, or
 `gdb-multiarch` through `--gdb`). The host computes the verdict and kills QEMU, as for
@@ -1010,7 +1013,8 @@ above), in which the GDB stub serves a host GDB session against the `gdb-target`
 passes when both host checks pass; each command stages and unstages its own recipes on the
 current sysroot, a debug-profile build. `test-debug-port` bounds the boot to the fixture's ready
 line by five minutes and each answer by twenty seconds; `test-gdb` bounds the boot to the stub's
-ready line by five minutes and the GDB session by three. Neither has a `run-parallel` budget. The
+ready line by five minutes, the GDB session by three, and the stub's detach line by 30 s after
+it. Neither has a `run-parallel` budget. The
 two boots are the debug-port device cell (Device surfaces above).
 
 ```sh
@@ -1257,8 +1261,8 @@ cargo xtask build
 cp sysroot/config/svcmgr/tests/gdb-target.svc sysroot/config/svcmgr/services/
 cargo xtask mkdisk --repack-only
 cargo xtask run --debug-port 4561 --debug-target gdb-target   # in one shell
-gdb -ex 'set architecture i386:x86-64' -ex 'target remote localhost:4561' \
-    sysroot/programs/debugger                                    # in another
+gdb -ex 'set architecture i386:x86-64' -ex 'set remotetimeout 30' \
+    -ex 'target remote localhost:4561' sysroot/programs/debugger  # in another
 ```
 
 ---

@@ -63,6 +63,38 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         }
     };
 
+    // The stub is staged, and the images repacked, before the launch reads
+    // their block sizes.
+    let staged = match (&args.debug_target, args.debug_port)
+    {
+        (Some(target), Some(port)) =>
+        {
+            let layout = crate::debug_stub::stage(ctx, args.arch, target)?;
+            let binary = crate::debug_stub::binary_for(ctx, target);
+            step(&format!(
+                "GDB stub staged for {target}; connect with:\n    {}",
+                crate::debug_stub::gdb_command(args.arch, port, binary.as_deref())
+            ));
+            Some(layout)
+        }
+        _ => None,
+    };
+    let launched = launch(ctx, args, &firmware_code, firmware_vars.as_deref());
+    if let Some(layout) = staged
+    {
+        crate::debug_stub::unstage(ctx, args.arch, layout)?;
+    }
+    launched
+}
+
+/// Build the QEMU command line for the sysroot's images and run it.
+fn launch(
+    ctx: &BuildContext,
+    args: &RunArgs,
+    firmware_code: &std::path::Path,
+    firmware_vars: Option<&std::path::Path>,
+) -> Result<()>
+{
     let disk_path = ctx.disk_image();
     let second_disk = match &args.second_disk
     {
@@ -78,8 +110,8 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         disk_path: &disk_path,
         disk_block_size: logical_block_size(&disk_path)?,
         second_disk,
-        firmware_code_path: &firmware_code,
-        firmware_vars_path: firmware_vars.as_deref(),
+        firmware_code_path: firmware_code,
+        firmware_vars_path: firmware_vars,
         cpus: args.cpus,
         mem_mib: args.mem,
         display: if args.headless
@@ -113,20 +145,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         Arch::X86_64 => "x86_64, UEFI",
         Arch::Riscv64 => "riscv64, TCG, UEFI",
     };
-    let (Some(target), Some(port)) = (&args.debug_target, args.debug_port)
-    else
-    {
-        return launch_qemu(args.arch.qemu_binary(), &qemu_args, desc, args.verbose);
-    };
-    crate::debug_stub::stage(ctx, args.arch, target)?;
-    let binary = crate::debug_stub::binary_for(ctx, target);
-    step(&format!(
-        "GDB stub staged for {target}; connect with:\n    {}",
-        crate::debug_stub::gdb_command(args.arch, port, binary.as_deref())
-    ));
-    let launched = launch_qemu(args.arch.qemu_binary(), &qemu_args, desc, args.verbose);
-    crate::debug_stub::unstage(ctx, args.arch)?;
-    launched
+    launch_qemu(args.arch.qemu_binary(), &qemu_args, desc, args.verbose)
 }
 
 fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Result<()>

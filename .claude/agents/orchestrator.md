@@ -140,6 +140,16 @@ Keep your own reads out of your context the same way:
    you need them.
 4. Drain rolling and follow-up Issues in waves on scopes that do not overlap the in-flight PRs,
    started alongside them, never by interrupting in-flight work.
+5. An acceptance box that asks for a burn-in (a number of runs without a hit) is written as
+   runs "on a head that contains the fix", so that the runs can be taken on any later head and
+   no freeze of `master` is needed. Reword such a box with the maintainer's agreement when an
+   Issue states it otherwise.
+6. At each merge, log one `orch log` line of the PR's cost: the tokens of its worker (from its
+   completion notifications), the reviewer runs and the audits, the host minutes under grant,
+   each sync and what it re-owed, the minutes the PR was held at its gate, and the style
+   findings left in the run records. These lines are how the maintainer judges the rules a
+   batch ran under, among them the rule that leaves a style finding off the Issues
+   (docs/conventions.md § Recording findings), which is on trial.
 
 An instruction-file merge (`.claude/`, or a document the agent files cite) changes what the next
 worker should read, but this session and the agents it spawns keep the copies loaded at its

@@ -103,10 +103,10 @@ pub unsafe fn unsetenv(key: &OsStr) -> io::Result<()> {
 }
 
 // Cwd surface backing `std::env::current_dir` / `std::env::set_current_dir`
-// on seraph. Wired up by the `apply_env_dispatch_overlay` patch to
-// `library/std/src/env.rs`, which adds a `target_os = "seraph"` cfg arm
-// dispatching here instead of through `os_imp::*` (seraph has no PAL
-// under `sys/pal/seraph/`).
+// on seraph. Wired up by the `apply_paths_overlay` patch to
+// `library/std/src/sys/paths/mod.rs`, whose `target_os = "seraph"` cfg arm
+// takes `getcwd` and `chdir` from here instead of from upstream's
+// `unsupported` paths module.
 //
 // `chdir` is a thin shim over `crate::os::seraph::set_current_dir`,
 // which performs the namespace walk from `root_dir_cap()` and stores

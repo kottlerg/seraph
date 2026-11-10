@@ -153,7 +153,7 @@ impl io::Read for Stdin {
         }
     }
 
-    fn read_buf(&mut self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    fn read_buf(&mut self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         match pipe_for(IDX_STDIN) {
             Some(p) => p.read_buf(cursor),
             None => Ok(()),

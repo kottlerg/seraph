@@ -78,7 +78,7 @@ use crate::fs::TryLockError;
 use crate::hash::{Hash, Hasher};
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
-pub use crate::sys::fs::common::Dir;
+pub use crate::sys::fs::common::{Dir, ExtraHomeDirs, ExtraMediaDirs};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::vec::Vec;
@@ -297,6 +297,13 @@ pub struct ReadDir
     /// failure). A rejected entry name is an error for that entry alone;
     /// the iteration continues past it.
     done: bool,
+}
+
+impl ReadDir
+{
+    /// A directory handle for the listing (`std::fs::ReadDir::dir`): seraph
+    /// has no path-free directory handle, so it is unsupported.
+    pub fn dir(&self) -> io::Result<Dir> { unsupported() }
 }
 
 impl Iterator for ReadDir
@@ -1818,7 +1825,7 @@ impl File
         Ok(0)
     }
     pub fn is_read_vectored(&self) -> bool { false }
-    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()>
+    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_, u8>) -> io::Result<()>
     {
         let mut tmp = [0u8; PAGE_SIZE_USIZE];
         let cap = cursor.capacity().min(tmp.len());
@@ -2295,7 +2302,16 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()>
     Ok(())
 }
 
+/// [`rename`]: `FS_RENAME` refuses an occupied destination with `EXISTS`
+/// (services/fs/docs/fs-driver-protocol.md § Label 16), so every seraph
+/// rename already leaves an existing destination in place.
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()>
+{
+    rename(from, to)
+}
+
 pub fn set_perm(_: &Path, _: FilePermissions) -> io::Result<()> { unsupported() }
+pub fn set_perm_nofollow(_: &Path, _: FilePermissions) -> io::Result<()> { unsupported() }
 pub fn set_times(_: &Path, _: FileTimes) -> io::Result<()> { unsupported() }
 pub fn set_times_nofollow(_: &Path, _: FileTimes) -> io::Result<()> { unsupported() }
 

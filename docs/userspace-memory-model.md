@@ -31,8 +31,8 @@ Authority over memory is partitioned across four layers:
   See [`services/procmgr/README.md`](../services/procmgr/README.md).
 - **`std::sys::seraph`** — per-process Rust standard library platform
   layer. Owns the process's virtual address space layout, provides the
-  `GlobalAlloc` impl behind std's default `System` allocator, and hosts
-  the page-granular reservation allocator for foreign Memory mappings.
+  platform allocator functions behind std's default `System` allocator, and
+  hosts the page-granular reservation allocator for foreign Memory mappings.
 
 The kernel hands the initial RAM memory caps to init at boot. Init
 moves them to memmgr, which holds each one alone (see
@@ -79,7 +79,7 @@ disjoint surfaces:
 
 | Surface | Granularity | Owner | Used for |
 |---|---|---|---|
-| Byte heap | Bytes | `std::sys::seraph::alloc` (`GlobalAlloc` for `System`) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
+| Byte heap | Bytes | `std::sys::seraph::alloc` (the platform allocator behind `System`) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
 | Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, demand-paged spawned-thread stacks (heap-backed stacks and spawned-thread IPC buffers come from the byte heap) |
 | Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo` page and `InitInfo` region, main-thread stack (with the demand-growth range `std::os::seraph::_start` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
 
@@ -93,10 +93,10 @@ communicates them via `ProcessInfo` / `InitInfo`.
 
 ### Byte Heap
 
-`std::sys::seraph::alloc` implements `GlobalAlloc` for std's default
-`System` allocator, so with no `#[global_allocator]` override the full
-`alloc` / `std` collections surface (`Box`, `Vec`, `String`,
-`BTreeMap`, …) is available to every std-built service.
+`std::sys::seraph::alloc` provides the platform allocator functions (`alloc`,
+`alloc_zeroed`, `dealloc`, and `realloc`) behind std's default `System` allocator, so with
+no `#[global_allocator]` override the full `alloc` / `std` collections surface (`Box`, `Vec`,
+`String`, `BTreeMap`, …) is available to every std-built service.
 
 - **Backing store.** The allocator's grow path requests Memory caps
   from memmgr via `REQUEST_MEMORY_CAPS` on the process's
@@ -124,8 +124,8 @@ communicates them via `ProcessInfo` / `InitInfo`.
   A process with no pager maps the floor eagerly through
   `REQUEST_MEMORY_CAPS`. The floor's size is a `std::sys::seraph`
   implementation detail.
-- **Out-of-memory.** `GlobalAlloc::alloc` returns null and the `alloc`
-  crate aborts through `handle_alloc_error` (std's abort path, which
+- **Out-of-memory.** The platform `alloc` returns null, `System` reports the
+  failure, and the `alloc` crate aborts through `handle_alloc_error` (std's abort path, which
   traps on seraph): a terminal fault that tears down the whole process
   (procmgr reaps it on the address-space death notification; when a
   full death queue dropped that post, procmgr's death resync recovers it

@@ -1,22 +1,25 @@
-Patch description: add a `target_os = "seraph" => { mod seraph; }` arm to
-`library/std/src/sys/alloc/mod.rs`.
+Patch description: add a `target_os = "seraph"` arm to the platform
+`cfg_select!` of `library/std/src/sys/alloc/mod.rs`.
 
 Rather than a unified diff (fragile across toolchain bumps), the overlay
-code in `xtask/src/rust_src.rs` applies this change by string surgery:
+code in `xtask/src/rust_src.rs` (`apply_alloc_overlay`) applies this
+change by string surgery on the toolchain mirror under `target/`:
 
- 1. Read `library/std/src/sys/alloc/mod.rs` from the toolchain rust-src.
- 2. If the marker `seraph-overlay` is already present, skip.
- 3. Otherwise locate the final `}` closing `cfg_select! { … }` and insert
-    the seraph arm immediately before it.
- 4. Copy `ruststd/src/sys/alloc/seraph.rs` into the toolchain rust-src at
+ 1. Copy `ruststd/src/sys/alloc/seraph.rs` into the mirror at
     `library/std/src/sys/alloc/seraph.rs`.
+ 2. Read the mirror's `library/std/src/sys/alloc/mod.rs`. If the marker
+    `seraph-overlay` is already present, skip.
+ 3. Otherwise insert the seraph arm immediately after the `zkvm` arm.
 
-Applied in-place to the toolchain rust-src, idempotent across invocations,
-auto-reapplied after `rustup update` wipes the patch.
+The arm selects `seraph.rs` as the platform module `imp`, whose `alloc`,
+`alloc_zeroed`, `dealloc`, and `realloc` std's `System` allocator calls.
+The upstream rust-src is never modified; the mirror is rebuilt whenever
+the toolchain or the overlay changes.
 
 The snippet inserted:
 
-    // seraph-overlay: seraph OS alloc
+    // seraph-overlay: seraph alloc (pub(crate) so os::seraph can reach it)
     target_os = "seraph" => {
-        mod seraph;
+        pub(crate) mod seraph;
+        use seraph as imp;
     }

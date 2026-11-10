@@ -27,11 +27,12 @@
 //! triggered grow thus targets the buffer the kernel actually reads
 //! from for that thread.
 //!
-//! `unsafe impl GlobalAlloc for System` below delegates to the static
-//! heap; services that want this allocator simply omit a custom
+//! The platform functions `alloc`, `alloc_zeroed`, `dealloc`, and `realloc`
+//! below, which std's `System` allocator calls, delegate to the static heap;
+//! services that want this allocator simply omit a custom
 //! `#[global_allocator]` and use `System` (std's default).
 
-use crate::alloc::{GlobalAlloc, Layout, System};
+use crate::alloc::Layout;
 use crate::cell::UnsafeCell;
 use crate::marker::PhantomData;
 use crate::mem::{align_of, size_of};
@@ -1294,76 +1295,81 @@ pub fn abort_thread() -> ! {
     syscall::thread_exit()
 }
 
-// ── GlobalAlloc for System ──────────────────────────────────────────────────
+// ── Platform allocator functions for `System` ─────────────────────────────────
 
-#[stable(feature = "alloc_system_type", since = "1.28.0")]
-unsafe impl GlobalAlloc for System {
-    #[inline]
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut heap = HEAP.lock();
-        let mut ptr = heap.alloc(layout);
-        // Grow to fit and retry, for as long as each grow maps at least one
-        // page: `grow` sizes itself to the request beyond the free block at
-        // the heap's top, so one round normally suffices, and a partial
-        // grant (memmgr's reply carries at most `MSG_CAP_SLOTS_MAX` runs,
-        // services/memmgr/docs/ipc-interface.md § Label 1) takes another.
-        // Every iteration that continues advances `mapped_end` toward the
-        // zone bound, so the loop ends: on success, on a grow that maps
-        // nothing (memmgr out of memory, or the zone cannot hold the
-        // request), and null then reaches `handle_alloc_error`. IPC wrappers
-        // under the lock are non-allocating (the IPC buffer is the
-        // pre-registered page, not heap-backed), so there is no re-entrant
-        // allocation here.
-        let want = layout.size().saturating_add(layout.align());
-        while ptr.is_null() && heap.grow(want) {
-            ptr = heap.alloc(layout);
-        }
-        ptr
+/// Allocate `layout` from the byte heap, growing it through memmgr as needed;
+/// null when the heap cannot grow to fit. `System` calls it for a non-zero
+/// `layout.size()`.
+#[inline]
+pub unsafe fn alloc(layout: Layout) -> *mut u8 {
+    let mut heap = HEAP.lock();
+    let mut ptr = heap.alloc(layout);
+    // Grow to fit and retry, for as long as each grow maps at least one
+    // page: `grow` sizes itself to the request beyond the free block at
+    // the heap's top, so one round normally suffices, and a partial
+    // grant (memmgr's reply carries at most `MSG_CAP_SLOTS_MAX` runs,
+    // services/memmgr/docs/ipc-interface.md § Label 1) takes another.
+    // Every iteration that continues advances `mapped_end` toward the
+    // zone bound, so the loop ends: on success, on a grow that maps
+    // nothing (memmgr out of memory, or the zone cannot hold the
+    // request), and null then reaches `handle_alloc_error`. IPC wrappers
+    // under the lock are non-allocating (the IPC buffer is the
+    // pre-registered page, not heap-backed), so there is no re-entrant
+    // allocation here.
+    let want = layout.size().saturating_add(layout.align());
+    while ptr.is_null() && heap.grow(want) {
+        ptr = heap.alloc(layout);
     }
+    ptr
+}
 
-    #[inline]
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: delegating to alloc; zeroing is done here since the
-        // free-list hands back uninitialised pages.
-        let ptr = unsafe { <Self as GlobalAlloc>::alloc(self, layout) };
-        if !ptr.is_null() {
-            // SAFETY: returned block is at least layout.size() bytes of writable memory.
-            unsafe { core::ptr::write_bytes(ptr, 0, layout.size()) };
-        }
-        ptr
+/// [`alloc`], with the block zeroed.
+#[inline]
+pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
+    // SAFETY: delegating to alloc; zeroing is done here since the
+    // free-list hands back uninitialised pages.
+    let ptr = unsafe { alloc(layout) };
+    if !ptr.is_null() {
+        // SAFETY: returned block is at least layout.size() bytes of writable memory.
+        unsafe { core::ptr::write_bytes(ptr, 0, layout.size()) };
     }
+    ptr
+}
 
-    #[inline]
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ptr.is_null() {
-            return;
-        }
-        // Must match `alloc`'s reservation: `want` was
-        // `align_up(layout.size().max(MIN_BLOCK), NODE_ALIGN)`. Insert the
-        // same amount back so the free-list invariant (every node starts at
-        // a `NODE_ALIGN`-aligned address, every block size is a
-        // `NODE_ALIGN` multiple) holds.
-        let size = align_up(layout.size().max(MIN_BLOCK), NODE_ALIGN);
-        let mut heap = HEAP.lock();
-        // SAFETY: the caller guarantees ptr/layout match a prior alloc.
-        unsafe { heap.insert(ptr as usize, size) };
+/// Return the block at `ptr`, allocated with `layout`, to the byte heap.
+#[inline]
+pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
+    if ptr.is_null() {
+        return;
     }
+    // Must match `alloc`'s reservation: `want` was
+    // `align_up(layout.size().max(MIN_BLOCK), NODE_ALIGN)`. Insert the
+    // same amount back so the free-list invariant (every node starts at
+    // a `NODE_ALIGN`-aligned address, every block size is a
+    // `NODE_ALIGN` multiple) holds.
+    let size = align_up(layout.size().max(MIN_BLOCK), NODE_ALIGN);
+    let mut heap = HEAP.lock();
+    // SAFETY: the caller guarantees ptr/layout match a prior alloc.
+    unsafe { heap.insert(ptr as usize, size) };
+}
 
-    #[inline]
-    unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
-        let Ok(new_layout) = Layout::from_size_align(new_size, old_layout.align()) else {
-            return null_mut();
-        };
-        // SAFETY: new_layout is validated above.
-        let new_ptr = unsafe { <Self as GlobalAlloc>::alloc(self, new_layout) };
-        if new_ptr.is_null() {
-            return null_mut();
-        }
-        let copy_len = old_layout.size().min(new_size);
-        // SAFETY: both buffers are non-null and owned; ranges non-overlapping.
-        unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len) };
-        // SAFETY: caller guarantees (ptr, old_layout) match a prior alloc.
-        unsafe { <Self as GlobalAlloc>::dealloc(self, ptr, old_layout) };
-        new_ptr
+/// Move the block at `ptr`, allocated with `old_layout`, to a new block of
+/// `new_size` bytes at the same alignment; null, with the old block kept,
+/// when the new one cannot be allocated.
+#[inline]
+pub unsafe fn realloc(ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+    let Ok(new_layout) = Layout::from_size_align(new_size, old_layout.align()) else {
+        return null_mut();
+    };
+    // SAFETY: new_layout is validated above.
+    let new_ptr = unsafe { alloc(new_layout) };
+    if new_ptr.is_null() {
+        return null_mut();
     }
+    let copy_len = old_layout.size().min(new_size);
+    // SAFETY: both buffers are non-null and owned; ranges non-overlapping.
+    unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len) };
+    // SAFETY: caller guarantees (ptr, old_layout) match a prior alloc.
+    unsafe { dealloc(ptr, old_layout) };
+    new_ptr
 }

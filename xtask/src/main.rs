@@ -97,6 +97,11 @@ fn main()
         CliCommand::IssueEdit(args) => commands::issue::run_edit(&ctx, args),
         CliCommand::IssueFile(args) => commands::issue::run_file(&ctx, args),
         CliCommand::Orch(args) => commands::orch::run(&ctx, args),
+        CliCommand::Hook(args) =>
+        {
+            commands::hook::run(&ctx, args);
+            Ok(())
+        }
     };
 
     if let Err(err) = result

@@ -861,6 +861,18 @@ fn print_state(dir: &Path, as_json: bool) -> Result<()>
     Ok(())
 }
 
+/// The text `orch state` prints, or `None` when no batch is open or its
+/// state cannot be read.
+pub fn state_text(ctx: &BuildContext) -> Option<String>
+{
+    let dir = state_dir(ctx);
+    if !dir.join(STATE_FILE).exists()
+    {
+        return None;
+    }
+    load(&dir).ok().map(|state| render(&state))
+}
+
 /// The warning for a rendered state longer than `STATE_TEXT_MAX`, if it is.
 fn size_warning(rendered: &str) -> Option<String>
 {

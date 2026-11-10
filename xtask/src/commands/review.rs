@@ -441,8 +441,8 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
             "gate-findings-recorded",
             name.as_str(),
             format!(
-                "{open} finding(s) stay on the surface; confirm each is recorded on its Issue \
-                 and none is contested"
+                "{open} finding(s) stay on the surface; confirm each is recorded and none is \
+                 contested"
             ),
         )];
     }

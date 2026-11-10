@@ -171,6 +171,11 @@ pub enum CliCommand
     /// open questions and the rulings in force. `orch state` prints it (see
     /// xtask/README.md).
     Orch(OrchArgs),
+
+    /// Answer a hook of the assistant's harness: read the event's JSON on
+    /// stdin and print the answer the harness reads. `.claude/settings.json`
+    /// names these commands (see xtask/README.md).
+    Hook(HookArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -1136,6 +1141,35 @@ pub enum OrchRulingCommand
         /// The ruling's number.
         number: usize,
     },
+}
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct HookArgs
+{
+    #[command(subcommand)]
+    pub event: HookEvent,
+}
+
+#[derive(Subcommand)]
+pub enum HookEvent
+{
+    /// `PreToolUse` of the Bash tool: refuse a direct cargo build, a merge
+    /// or an Issue filing by a subagent that is not the orchestrator, and a
+    /// merge that fails the merge gate.
+    Bash,
+
+    /// `SubagentStop` of a worker: refuse a hand-back from a worktree on a
+    /// detached HEAD or one that does not differ from `origin/master`.
+    SubagentStop,
+
+    /// `SessionStart` after a compaction: name what to read again, and add
+    /// the state of an open orchestration batch.
+    CompactStart,
+
+    /// `PreCompact`: print the instructions for the compaction summary.
+    PreCompact,
 }
 
 #[cfg(test)]

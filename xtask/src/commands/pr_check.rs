@@ -61,6 +61,7 @@ pub struct Patterns
     hex: Regex,
     delta_statement: Regex,
     embed: Regex,
+    release_notes: Regex,
 }
 
 impl Patterns
@@ -89,6 +90,7 @@ impl Patterns
             hex: Regex::new(r"\b[0-9a-f]{7,40}\b")?,
             delta_statement: Regex::new(r"(?i)comment|markdown|documentation")?,
             embed: Regex::new(r"include_str!|include_bytes!|global_asm!")?,
+            release_notes: Regex::new(r"^docs/releases/v\d+\.\d+\.\d+\.md$")?,
         })
     }
 }
@@ -1328,9 +1330,61 @@ pub fn check_merge_state(pr: &Value) -> Vec<Diag>
     out
 }
 
-fn gate(ctx: &BuildContext, pr: &Value, number: u64, base: &str, head: &str) -> Vec<Diag>
+/// Rule of the warning that names the release PR, which a caller reads to
+/// know that the merge needs the maintainer's approval.
+pub const RELEASE_APPROVAL_RULE: &str = "gate-release-approval";
+
+/// The release notes files among `added`, the paths a PR adds: a PR that
+/// adds `docs/releases/v<X>.<Y>.<Z>.md` is the release PR of
+/// docs/conventions.md § Release Production, step 3.
+pub fn added_release_notes<'a>(pat: &Patterns, added: &'a str) -> Vec<&'a str>
+{
+    added
+        .lines()
+        .filter(|path| pat.release_notes.is_match(path))
+        .collect()
+}
+
+/// The warning for a release PR: its merge needs the maintainer's approval
+/// (docs/conventions.md § Pre-merge review), which no script can read.
+pub fn check_release_approval(pat: &Patterns, added: &str) -> Vec<Diag>
+{
+    added_release_notes(pat, added)
+        .into_iter()
+        .map(|path| {
+            Diag::warning(
+                RELEASE_APPROVAL_RULE,
+                path,
+                "the PR adds a release's notes, so it is the release PR: its merge needs the \
+                 maintainer's approval",
+            )
+        })
+        .collect()
+}
+
+fn gate(
+    ctx: &BuildContext,
+    pat: &Patterns,
+    pr: &Value,
+    number: u64,
+    base: &str,
+    head: &str,
+) -> Vec<Diag>
 {
     let mut out = check_merge_state(pr);
+    let range = format!("{base}...{head}");
+    match git(
+        &ctx.root,
+        &["diff", "--name-only", "--diff-filter=A", &range],
+    )
+    {
+        Ok(added) => out.extend(check_release_approval(pat, &added)),
+        Err(err) => out.push(Diag::error(
+            RELEASE_APPROVAL_RULE,
+            short(head),
+            format!("the files the PR adds could not be read: {err:#}"),
+        )),
+    }
     if !git_ok(&ctx.root, &["merge-base", "--is-ancestor", base, head])
     {
         out.push(Diag::error(
@@ -1395,7 +1449,7 @@ pub fn run_pr_check(ctx: &BuildContext, args: &PrCheckArgs) -> Result<()>
     diags.extend(check_issues(&pat, &ctx.root, args.pr, body, &commits)?);
     if args.gate
     {
-        diags.extend(gate(ctx, &pr, args.pr, &base, head));
+        diags.extend(gate(ctx, &pat, &pr, args.pr, &base, head));
     }
     report("pr-check", &diags, Strictness::from_flag(args.strict))
 }
@@ -1424,6 +1478,26 @@ mod tests
     fn rules(diags: &[Diag]) -> Vec<&'static str>
     {
         diags.iter().map(|d| d.rule).collect()
+    }
+
+    #[test]
+    fn a_pr_that_adds_release_notes_is_named_as_the_release_pr()
+    {
+        let added = "docs/releases/v0.1.3.md\nxtask/src/commands/hook.rs\n";
+        let diags = check_release_approval(&pat(), added);
+        assert_eq!(rules(&diags), [RELEASE_APPROVAL_RULE]);
+        assert_eq!(diags[0].level, crate::diag::Level::Warning);
+        assert_eq!(diags[0].at, "docs/releases/v0.1.3.md");
+        for other in [
+            "docs/releases/README.md\n",
+            "docs/releases/TEMPLATE.md\n",
+            "notes/docs/releases/v0.1.3.md\n",
+            "docs/releases/v0.1.3.md.orig\n",
+            "",
+        ]
+        {
+            assert_eq!(check_release_approval(&pat(), other), [], "{other:?}");
+        }
     }
 
     #[test]

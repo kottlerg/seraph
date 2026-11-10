@@ -257,17 +257,17 @@ with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
   it.
 
 A PR MUST NOT merge before it meets the merge condition. `cargo xtask pr-check <N> --gate`
-checks the part of the condition a script can decide and names the rest for its reader. In an
-orchestrated batch the orchestrator merges a PR that meets it, with no further decision of the
-maintainer. A session working alone with the maintainer reports that the PR meets the
-condition, and the maintainer's instruction to merge is the one decision left. Two things need
-the maintainer's approval whatever the gate says. A change to `.claude/CLAUDE.md`, to the
-assistant's settings, or to its hooks is applied only on the maintainer's own word. In
-§ Release Production the merge of the release PR (step 3), the tag (step 5), the publishing of
-the Release (step 7), and the milestone work of step 8 each need the maintainer's approval of
-that step, and the release PR does not meet the merge condition before its merge is approved.
-Who carries an approved step out is not fixed: the orchestrator of the batch or a session
-does, or the maintainer.
+checks the part of the condition a script can decide and names the rest for its reader, the
+release PR's need of an approval included. In an orchestrated batch the orchestrator merges a PR
+that meets it, with no further decision of the maintainer. A session working alone with the
+maintainer reports that the PR meets the condition, and the maintainer's instruction to merge is
+the one decision left. Two things need the maintainer's approval whatever the gate says. A
+change to `.claude/CLAUDE.md`, to the assistant's settings, or to its hooks is applied only on
+the maintainer's own word. In § Release Production the merge of the release PR (step 3), the tag
+(step 5), the publishing of the Release (step 7), and the milestone work of step 8 each need the
+maintainer's approval of that step, and the release PR does not meet the merge condition before
+its merge is approved. Who carries an approved step out is not fixed: the orchestrator of the
+batch or a session does, or the maintainer.
 
 Every finding a run counts is fixed or recorded as the subsections below say. A finding MUST NOT
 be waived or ruled outside the standards.

@@ -67,12 +67,12 @@ keep the answer in the record:
    standalone Issue for a defect found off a PR's surface.
 
 Three standing rules need no question. Outside the milestone moves of docs/conventions.md
-§ Release Production step 8, move an Issue to a later milestone only on a hard dependency on
-another Issue. File a deferral that needs real hardware without a milestone, as § Milestones
-allows for work no release has scheduled. No PR closes a rolling
-`<scope>: defects found by review` Issue (docs/conventions.md § Follow-up Issues): it stays
-open as the scope's recording sink, even with every item ticked, until that step 8, and PRs
-reference it with `Refs` only.
+§ Release Production (those of step 1, as the maintainer decides them, and those of step 8),
+move an Issue to a later milestone only on a hard dependency on another Issue. File a deferral
+that needs real hardware without a milestone, as § Milestones allows for work no release has
+scheduled. No PR closes a rolling `<scope>: defects found by review` Issue (docs/conventions.md
+§ Follow-up Issues): it stays open as the scope's recording sink, even with every item ticked,
+until that step 8, and PRs reference it with `Refs` only.
 
 ## Reporting to the maintainer
 
@@ -255,9 +255,10 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
    milestone of those it closes), the check rollup and merge state, that `master` is an
    ancestor of the head, and the run record for the head.
 3. Read what the command cannot decide: after a `NON-BLOCKING ISSUES ONLY` run, that each
-   finding it counts is recorded and none is contested; that the Issues the command prints as
-   closed are the ones the PR means to close; and that the worker's worktree sits on its branch
-   (`git -C <worktree> status -sb`).
+   finding it counts is recorded and none is contested; for the release PR, which the command
+   names with `gate-release-approval`, that the maintainer has approved its merge; that the
+   Issues the command prints as closed are the ones the PR means to close; and that the
+   worker's worktree sits on its branch (`git -C <worktree> status -sb`).
 
 Then merge with `gh pr merge <N> --merge --delete-branch`, and tell the maintainer in a line
 (§ Reporting to the maintainer). Fast-forward your own checkout, record the merge, and

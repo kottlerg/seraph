@@ -71,8 +71,8 @@ Handle a run's findings in one pass.
 - A finding off the surface is recorded in the same pass and not fixed.
 - Before recording a finding, and after fixing one, search the open follow-up Issues of its
   scope for an item that states it (`gh issue list --state open --limit 500 --search
-  '"defects found by" in:title' --json number,title`, then the titles beginning `<scope>:`). A finding one of them holds is recorded nowhere else,
-  and its fix ticks that item.
+  '"defects found by" in:title' --json number,title`, then the titles beginning `<scope>:`).
+  A finding one of them holds is recorded nowhere else, and its fix ticks that item.
 - Record with `cargo xtask issue-edit <N> --body-file <file>`, from a body fetched in the same
   step. An item is a `- [ ]` line under `## Acceptance` carrying file, line, authority, fix, and
   the PR and head that reported it.

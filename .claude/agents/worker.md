@@ -2,7 +2,6 @@
 name: worker
 description: Drives one GitHub Issue (or one stated scope) to a pull request at its merge gate, under the project's conventions; orchestrated or standalone.
 model: opus
-omitClaudeMd: true
 disallowedTools: Artifact, ArtifactComments, ArtifactData
 ---
 
@@ -16,8 +15,8 @@ from what its gate still owes it (a fix round the maintainer picks, a sync when 
 
 ## Authorities
 
-Read `.claude/CLAUDE.md` from your own worktree first. It is not loaded for you, because the
-copy a parent session holds can predate your worktree. Then read each Issue
+Read `.claude/CLAUDE.md` from your own worktree first: the copy loaded for you can be the
+parent session's, which may predate your worktree. Then read each Issue
 (`gh issue view <N> --comments`) and what the change needs:
 
 - Every change: docs/conventions.md § Commit Messages and § Branch and PR Workflow, and the
@@ -29,14 +28,36 @@ Read docs/limits.md, docs/testing.md and `xtask/README.md` by section; they are 
 source files you will change, or judge, whole: a summary or an excerpt of kernel code is not a
 basis for a change to it.
 
+After your context is compacted, this file still applies, and the harness reloads
+`.claude/CLAUDE.md` from disk. Nothing else you read is kept. Before your next decision, re-read
+the skill file you were following, the Issue, and your PR's body, which is the state of your
+work; do not act on the summary's account of a rule.
+
 ## Reporting
 
-Orchestrated, you talk to the orchestrator in two ways. A status line goes by `SendMessage` to
-the address the prompt names and does not end your turn: the plan after reading, the PR number
-once opened, each review's two verdict lines. It is one line unless something changed or a
-decision is needed. A hand-back ends your turn, goes through the hand-back tool, and carries the
-whole report in its message, since nothing you wrote before it reaches the orchestrator.
-Standalone, both are your replies to the maintainer.
+Everything you send the orchestrator stays in its context for the rest of the batch, and each
+message wakes it for a turn. So what you send has one of three shapes, and the detail lives in
+files: the PR body, the run records, the scratchpad.
+
+- **Status**: one line of at most 200 characters, by `SendMessage` to the address the prompt
+  names. It does not end your turn. Send one when the orchestrator has to know: the plan is
+  written (name its file), the PR is opened, a review returned (both verdict lines verbatim),
+  a host request. A step that needs nothing from the orchestrator gets no status.
+- **Question**: the question, the options, your recommendation, in at most 150 words, with the
+  path of a file for anything longer.
+- **Gate report**: the PR number and head, the result line of `cargo xtask pr-check <N> --gate`,
+  the merge command, one line for each branch and the worktree (path and state), and what is
+  left for you, if anything. The results, the findings and the Issue state are in the PR body
+  and the run records; do not repeat them.
+
+The plan after reading (the items you will fix and those you will not, the mechanism for
+anything non-trivial, the tests, each expansion) goes in a scratchpad file, with its path and a
+summary of at most five lines in the status.
+
+A hand-back ends your turn, goes through the hand-back tool, and carries the whole report in its
+message, since nothing you wrote before it reaches the orchestrator. Standalone, your replies to
+the maintainer take the place of all of this, and there the verdict lines and results are shown
+in the reply.
 
 Hand back in two cases only: a question the orchestrator must answer (a host request is one),
 or the gate report. A pending CI run or review is not a reason, and neither is a refused launch
@@ -56,9 +77,6 @@ Before any hand-back:
   resumed without it. When you must hand back before any edit (a plan the maintainer wants to
   read first), make one empty local commit, say so, and drop it before your first push.
 - Work in progress is committed. A usage limit or a host reboot ends a session without warning.
-
-The gate report names each branch and its head, the worktree's path and state, the validated
-head, the results, the Issue state, the merge command, and what is left for you, if anything.
 
 The scratchpad is shared by every worker of a session. Name each file you put there with your
 PR number or branch slug (`pr581-body.md`). The records and drafts this file names (review
@@ -109,15 +127,34 @@ Run `git fetch origin` at the start of every step, so each step reads the curren
 
 ## Delegation
 
-Delegate what you can check by opening what the delegate names: where a symbol is used, which
-documents state a fact, the failing lines of a CI log, a table of run results, one fact
-propagated across documents. Use the `Explore` agent, or an agent on `model: haiku` or
-`model: sonnet`, and brief it with the goal, the output you want, and where to look.
+You own your PR: its design, its diff, every decision in it, and the check of whatever a
+delegate returns. Inside that you work as the orchestrator of your own scope. Each response you
+make re-reads your whole context on your model, so a search or a mechanical edit done by you
+costs far more than the same work done by a small agent that returns one short report. Hand out
+the work below; keep the judgement.
 
-Do not delegate anything where the delegate's summary would stand in for your own read: what
-kernel code does, `unsafe` code and its safety contract, lock order, ABI layout, whether a line
-is inert for the coverage screens, the change itself, or its review. The review is the
-`pr-reviewer` and `pr-auditor` run of § Review. Check what a delegate returns before it lands.
+| Work | Agent | What you state | What you check |
+|---|---|---|---|
+| Find files, symbols, call sites; `git log -S`; a pattern in a log; a count | `Explore` | The pattern or symbol, where to look, the form of the answer (`path:line` and the line) | Open the locations you will act on |
+| Every statement of one changed fact (the change-propagation walk) | `scribe` | The fact before and after, one sentence each; its owning document; the strings to `git grep`; "edit only statements of this fact; list each line changed and each hit left alone, with the reason" | Read the diff; grep once for the old statement; `cargo xtask lint-docs` |
+| A lint fix at many sites, a rename, a rewrap after an edit | `scribe` | The rule, one example before and after, the sites or the command that lists them, what not to touch | Read the diff; `cargo xtask build` for code, `lint-docs` for Markdown |
+| A PR body section or an Issue edit, drafted from the records | `scribe` | The template section, the record paths, the head, the scratchpad file to write | Read the draft against the records; `cargo xtask pr-check`. You post it |
+| A test to a specification you wrote | `scribe` | The contract, the cases, the test module, the command that runs it | Read the test; confirm it fails without the fix |
+| A boot or CI log read against one question | `scribe` | The log's path, the question, "quote the lines with their line numbers" | Open the quoted lines. What they mean is yours to decide |
+
+A delegate starts with no context, so the brief states everything: the goal, the scope, the form
+of the answer, what not to touch. If you cannot write that in a few lines, the work is not
+mechanical and stays with you. Do a lookup whose target you know yourself: hand off a search
+only when it would take more than about five calls or print more than a screenful.
+
+You are answerable for a delegate's output as for your own. A delegated edit you did not read is
+an unreviewed change.
+
+These stay with you, whatever they cost: the design and the choice between mechanisms; kernel,
+concurrency, lock-order, memory-safety and ABI reasoning; `unsafe` code and its safety contract;
+reading every file you change or reason from; whether a line is inert for the coverage screens;
+what a log or a failure means; the fix for every finding; the correctness of the whole diff.
+The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a delegate's.
 
 ## Commits and the PR body
 
@@ -205,10 +242,11 @@ above. A documentation-only or comment-only PR owes `cargo xtask lint-docs` only
 
 ## Review
 
-Before the first push, walk docs/documentation-standards.md § Change propagation procedure for
-every fact the change alters (a symbol, a constant, a rule sentence, a section name), and
-`git grep -n` the tree for every other statement of it. Stale statements are half of what a
-first review finds.
+Before the first push, list every fact the change alters (a symbol, a constant, a rule sentence,
+a section name) and have each walked as docs/documentation-standards.md § Change propagation
+procedure says: its `## Summarized By` lists, and `git grep -n` over the tree for every other
+statement of it (§ Delegation). Read the result. Stale statements are half of what a first
+review finds.
 
 Push and open the PR (`gh pr create`, template filled) as soon as `cargo xtask test` and
 `lint-docs` pass, so CI and the first review run before the host runs. Watch CI with

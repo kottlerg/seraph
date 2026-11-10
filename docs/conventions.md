@@ -239,9 +239,10 @@ The reviewer verdict is:
 - `NON-BLOCKING ISSUES ONLY` when only non-blocking findings are on it;
 - `READY TO MERGE` when none is.
 
-The merge prompt MUST follow a completed run (one with the reviewer and the auditor, a run of
-the reviewer alone that its audit has completed, or the auditor-only run of § Auditor-only
-run) with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
+A PR meets the merge condition when its CI is green, its head contains `master`, and the last
+run at its head is a completed run (one with the reviewer and the auditor, a run of the
+reviewer alone that its audit has completed, or the auditor-only run of § Auditor-only run)
+with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
 
 - `READY TO MERGE`;
 - `NON-BLOCKING ISSUES ONLY`, once every finding the run leaves on the surface is recorded
@@ -249,6 +250,15 @@ run) with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
   of such a run MAY take one fix round before the merge. A PR takes at most one such round:
   what the run after it leaves on the surface is recorded, and no further round is taken for
   it.
+
+A PR MUST NOT merge before it meets the merge condition, and a PR that meets it merges without
+a further decision. `cargo xtask pr-check <N> --gate` checks the part of the condition a
+script can decide and names the rest for its reader. In an orchestrated batch the orchestrator
+merges such a PR; a session working alone with the maintainer reports that the PR meets the
+condition and merges on the maintainer's instruction. Two things stay the maintainer's
+whatever the gate says: a change to `.claude/CLAUDE.md`, to the assistant's settings, or to
+its hooks is applied only on the maintainer's own word, and the release steps of § Release
+Production are the maintainer's.
 
 Every finding a run counts is fixed or recorded as the subsections below say. A finding MUST NOT
 be waived or ruled outside the standards.
@@ -326,7 +336,7 @@ A finding on the surface is on one of two tracks.
   documentation-drift, coverage, or style that is not a MUST violation or is one anchored in a
   Markdown document (wording, wrapping, nits). When the reviewer verdict is `BLOCKING ISSUES` it
   is fixed in the same batch; after a `NON-BLOCKING ISSUES ONLY` run it MUST be recorded
-  (§ Recording findings) before the merge prompt.
+  (§ Recording findings) before the merge.
 
 A document statement the code contradicts is a contract or safety defect when it states
 behaviour a caller or user relies on (a syscall, ABI, IPC, or command-line contract, or a safety
@@ -334,7 +344,7 @@ invariant). Every other disagreement between a document and the code (a stale na
 or cross-reference, or a summary out of step with its owner) is documentation drift.
 
 A finding off the surface MUST be recorded, not fixed: the pre-merge review reports it as out of
-bound, and it is recorded (§ Recording findings) before the merge prompt. No finding is dropped
+bound, and it is recorded (§ Recording findings) before the merge. No finding is dropped
 for being off the surface.
 
 ### Follow-up Issues

@@ -403,7 +403,7 @@ fn last_run<'a>(records: &'a [Record], head: &str) -> Result<&'a Record, Vec<Dia
     Ok(last)
 }
 
-/// The merge-prompt condition's record part (docs/conventions.md § Branch
+/// The merge condition's record part (docs/conventions.md § Branch
 /// and PR Workflow): the last run at `head` has no failed agent, `AUDIT
 /// PASS`, and a reviewer verdict that is not `BLOCKING ISSUES`. An earlier
 /// passing run at the same head does not count.

@@ -1,12 +1,12 @@
 ---
 name: pr-review
-description: Run the pre-merge review of a pull request once its CI is green (the pr-reviewer and pr-auditor agents), save the run record, build the ledger, and handle the findings up to the merge prompt.
+description: Run the pre-merge review of a pull request once its CI is green (the pr-reviewer and pr-auditor agents), save the run record, build the ledger, and handle the findings up to the merge condition.
 ---
 
 # The pre-merge review
 
 docs/conventions.md § Branch and PR Workflow owns the rules: the review surface, the two tracks,
-where a finding is recorded, the ledger, the auditor-only run, and the merge-prompt condition.
+where a finding is recorded, the ledger, the auditor-only run, and the merge condition.
 This skill is the procedure that applies them. `.claude/CLAUDE.md` carries the maintainer's
 standing request to run it on every PR once CI is green.
 
@@ -113,9 +113,12 @@ Once the fixes are pushed and CI is green again, run a `delta` run, or the audit
 comments, or that merges `master` in, takes a run with the reviewer, its `since` the head of the
 last run with the reviewer.
 
-## The merge prompt
+## The merge condition
 
-Prompt for the merge only when `cargo xtask pr-check <N> --gate` passes. After a
-`NON-BLOCKING ISSUES ONLY` run, read its warning and confirm that each finding it counts is
-recorded and none is contested. The merge command is `gh pr merge <N> --merge --delete-branch`
-(docs/conventions.md § Merge method), run only on the maintainer's instruction.
+The PR meets the merge condition of docs/conventions.md § Pre-merge review when
+`cargo xtask pr-check <N> --gate` passes. After a `NON-BLOCKING ISSUES ONLY` run, read its
+warning and confirm that each finding it counts is recorded and none is contested. A worker
+then hands its gate report to the orchestrator, which verifies the gate and merges. A
+standalone session tells the maintainer that the PR meets the condition and merges on their
+instruction. The merge command is `gh pr merge <N> --merge --delete-branch`
+(docs/conventions.md § Merge method).

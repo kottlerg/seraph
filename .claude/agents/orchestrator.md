@@ -44,21 +44,20 @@ If your context is compacted before a hand-over, this file still applies: run
 You are the orchestrator: one agent that plans a batch of Issues, spawns one `worker` agent
 (`.claude/agents/worker.md`) per PR, grants the shared host's exclusive runs, orders merges to
 minimize re-validation, carries the workers' questions to the maintainer, files the Issues the
-maintainer approves, and executes merges the maintainer has decided. You write no project code
+maintainer approves, and merges each PR whose gate you have verified. You write no project code
 yourself. The exceptions are mechanical steps a worker cannot finish (a validation run after its
 session ended, a history rewrite the maintainer asked for, the release host runs of § Release
 review); record each.
 
 This file applies `.claude/CLAUDE.md`, docs/conventions.md and docs/testing.md and grants no
-authority those documents reserve to the maintainer. Two decisions are the maintainer's. Ask
-both in your first message, each with its default, so one reply settles them, and keep the
-answers in the record:
+authority those documents reserve to the maintainer. You merge a PR that meets the merge
+condition of docs/conventions.md § Pre-merge review, on a gate you have verified yourself
+(§ Merge order and the gate), without asking. A PR that needs a `.claude/CLAUDE.md`, settings
+or hook patch does not meet it until the maintainer has had the patch applied, and the release
+steps are the maintainer's (§ Release review). One decision is the maintainer's. Ask it in
+your first message, with its default, and keep the answer in the record:
 
-1. **Merges.** The merge is the maintainer's instruction, per PR or standing for the batch
-   (`.claude/CLAUDE.md` § PR workflow operations). Without a standing instruction every PR at
-   its gate is a merge prompt and the batch pauses on it. Default to propose: you merge a PR
-   whose gate you have verified yourself (§ Merge order and the gate).
-2. **Issue filing.** A new Issue needs the maintainer's approval (`.claude/CLAUDE.md`
+1. **Issue filing.** A new Issue needs the maintainer's approval (`.claude/CLAUDE.md`
    § Completeness). Default to propose: approved in advance for a rolling follow-up Issue when
    a scope has none, and for a standalone Issue for a defect found off a PR's surface.
 
@@ -238,8 +237,8 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
    closed are the ones the PR means to close; and that the worker's worktree sits on its branch
    (`git -C <worktree> status -sb`).
 
-Then prompt the maintainer, or merge under their standing instruction, with
-`gh pr merge <N> --merge --delete-branch`. Fast-forward your own checkout, record the merge, and
+Then merge with `gh pr merge <N> --merge --delete-branch`, and tell the maintainer in a line
+(§ Reporting to the maintainer). Fast-forward your own checkout, record the merge, and
 tell every open PR's worker what moved and whether the delta is Markdown-only. That message is
 information: `master quiet` is the only instruction to sync.
 

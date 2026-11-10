@@ -1095,19 +1095,22 @@ that target ([docs/build-system.md](build-system.md#toolchain)).
 
 ```sh
 # A wedged guest: boot until HANG, then, from another shell, read every CPU's
-# state (SLIDE from the log's `kaslr: slide=` line):
+# state (SLIDE from the log's `kaslr: slide=` line; `bt 8` bounds each unwind,
+# which otherwise runs on past a CPU's entry frame into stack words) and end
+# the held guest:
 cargo xtask run-parallel --arch riscv64 --parallel 1 --runs 1 --timeout 300 \
     --debug-listen --hold-on-hang
 gdb -batch -ex 'target remote :1234' \
     -ex "symbol-file -o $SLIDE sysroot/esp/EFI/seraph/kernel" \
-    -ex 'thread apply all bt' -ex 'info registers'
+    -ex 'thread apply all bt 8' -ex 'info registers' -ex kill
 
 # A deterministic kernel crash: stop at the panic handler of a boot without
-# KASLR, with source lines:
+# KASLR, with source lines (a hardware breakpoint, since the kernel is not yet
+# mapped when the guest starts paused, so a software one cannot be written):
 cargo xtask build --debug kernel
 cargo xtask mkdisk --no-kaslr
 cargo xtask run --gdb --headless          # in one shell; waits paused
-gdb -batch -ex 'target remote :1234' -ex 'break kernel::panic' -ex continue \
+gdb -batch -ex 'target remote :1234' -ex 'hbreak kernel::panic' -ex continue \
     -ex bt -ex 'info registers' sysroot/esp/EFI/seraph/kernel
 ```
 

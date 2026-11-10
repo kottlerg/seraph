@@ -8,23 +8,29 @@
 //! The crash service logs one block per faulting process
 //! (services/crashd/docs/block-format.md), read here with
 //! `shared/crash-report`'s parser. Each block names its process by badge
-//! only; logd's `reclaim:` line for that badge gives the process's log name,
-//! and the image is the sysroot binary of that file name. Each address in
-//! the block's text is then the image address `address - load_bias`, which
-//! [`crate::symbolize`] resolves.
+//! only. logd's `reclaim:` line for that badge gives the process's log name,
+//! and the image is the sysroot binary of that name, accepted only when its
+//! executable segments span the block's text; a process logd names no name
+//! for is matched by that span alone. Each address in the block's text is
+//! then the image address `address - load_bias`, which [`crate::symbolize`]
+//! resolves.
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use crash_report::Block;
+use logd_codec::reclaim::UNNAMED;
 
 use crate::symbolize::{Symbolizer, describe_resolution, text_span};
 
-/// The start of logd's death-drain reclaim line after its timestamp
-/// (services/logd/docs/ipc-interface.md § Death-notification cascade).
-const RECLAIM_TAG: &str = "[logd] reclaim: badge=";
+/// The tags of logd's reclaim lines after their timestamp: a death drained
+/// from logd's death queue, and a resync's eviction
+/// (services/logd/docs/ipc-interface.md § Death-notification cascade,
+/// § Death-queue resync).
+const RECLAIM_TAGS: [&str; 2] = ["[logd] reclaim: badge=", "[logd] reclaim (resync): badge="];
 
 /// The sysroot directories searched, in this order, for the binary a log
 /// name names: the boot modules and services, the drivers, the filesystem
@@ -39,31 +45,36 @@ const IMAGE_DIRS: [&str; 6] = [
     "tests/programs",
 ];
 
-/// The badge and log name of each `[logd] reclaim:` line of `log`.
+/// The badge and registered log name of each logd reclaim line of `log`. A
+/// slot that registered no name (logd prints it as `?`) has no entry.
 pub fn reclaimed_names(log: &str) -> HashMap<u64, String>
 {
     let mut names = HashMap::new();
     for line in log.lines()
     {
-        let Some(at) = line.find(RECLAIM_TAG)
+        let Some(rest) = RECLAIM_TAGS
+            .iter()
+            .find_map(|tag| line.find(tag).map(|at| &line[at + tag.len()..]))
         else
         {
             continue;
         };
-        let rest = &line[at + RECLAIM_TAG.len()..];
         let Some((badge, rest)) = rest.split_once(' ')
         else
         {
             continue;
         };
-        let Some((_, name)) = rest.split_once(" name=")
+        let Some(name) = rest
+            .strip_prefix("name=")
+            .or_else(|| rest.split_once(" name=").map(|(_, name)| name))
         else
         {
             continue;
         };
-        if let Ok(badge) = badge.parse()
+        let name = name.trim_end_matches('\r');
+        if let (Ok(badge), false) = (badge.parse(), name == UNNAMED)
         {
-            names.insert(badge, name.trim_end_matches('\r').to_string());
+            names.insert(badge, name.to_string());
         }
     }
     names
@@ -73,14 +84,26 @@ pub fn reclaimed_names(log: &str) -> HashMap<u64, String>
 /// path relative to the image root.
 pub trait ImageSource
 {
-    /// The architecture the images are built for, `None` when unknown.
-    fn arch(&self) -> Option<String>;
+    /// The architecture the images are built for, `Ok(None)` when unrecorded.
+    ///
+    /// # Errors
+    ///
+    /// The record exists but cannot be read.
+    fn arch(&self) -> Result<Option<String>, String>;
 
     /// Every binary's relative path.
-    fn list(&self) -> Vec<String>;
+    ///
+    /// # Errors
+    ///
+    /// A directory of the images exists but cannot be read.
+    fn list(&self) -> Result<Vec<String>, String>;
 
-    /// The bytes of the binary at `relative`, `None` when there is none.
-    fn read(&self, relative: &str) -> Option<Vec<u8>>;
+    /// The bytes of the binary at `relative`, `Ok(None)` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// The binary exists but cannot be read.
+    fn read(&self, relative: &str) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// The images of a sysroot: the files of [`IMAGE_DIRS`].
@@ -91,25 +114,37 @@ pub struct SysrootImages
 
 impl ImageSource for SysrootImages
 {
-    fn arch(&self) -> Option<String>
+    fn arch(&self) -> Result<Option<String>, String>
     {
-        let tag = std::fs::read_to_string(self.sysroot.join(".arch")).ok()?;
-        Some(tag.trim().to_owned())
+        let path = self.sysroot.join(".arch");
+        match std::fs::read_to_string(&path)
+        {
+            Ok(tag) => Ok(Some(tag.trim().to_owned())),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("cannot read {}: {err}", path.display())),
+        }
     }
 
-    fn list(&self) -> Vec<String>
+    fn list(&self) -> Result<Vec<String>, String>
     {
         let mut paths = Vec::new();
         for dir in IMAGE_DIRS
         {
-            let Ok(entries) = std::fs::read_dir(self.sysroot.join(dir))
-            else
+            let path = self.sysroot.join(dir);
+            let entries = match std::fs::read_dir(&path)
             {
-                continue;
+                Ok(entries) => entries,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(format!("cannot list {}: {err}", path.display())),
             };
-            for entry in entries.flatten()
+            for entry in entries
             {
-                let is_file = entry.file_type().is_ok_and(|kind| kind.is_file());
+                let entry =
+                    entry.map_err(|err| format!("cannot list {}: {err}", path.display()))?;
+                let is_file = entry
+                    .file_type()
+                    .map_err(|err| format!("cannot stat {}: {err}", entry.path().display()))?
+                    .is_file();
                 if let (true, Some(name)) = (is_file, entry.file_name().to_str())
                 {
                     paths.push(format!("{dir}/{name}"));
@@ -117,57 +152,75 @@ impl ImageSource for SysrootImages
             }
         }
         paths.sort();
-        paths
+        Ok(paths)
     }
 
-    fn read(&self, relative: &str) -> Option<Vec<u8>>
+    fn read(&self, relative: &str) -> Result<Option<Vec<u8>>, String>
     {
-        std::fs::read(self.sysroot.join(relative)).ok()
+        let path = self.sysroot.join(relative);
+        match std::fs::read(&path)
+        {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("cannot read {}: {err}", path.display())),
+        }
     }
 }
 
 /// The sysroot-relative paths a binary logged as `name` may have, in search
-/// order; none for a name that is not a single path component.
+/// order: the name's first word (a registered name may carry an instance
+/// after a space, as `fatfs /data` does) in each of [`IMAGE_DIRS`]; none
+/// for a name whose first word is not a single path component.
 fn candidate_paths(name: &str) -> Vec<String>
 {
-    if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".."
+    let binary = name.split(' ').next().unwrap_or_default();
+    if binary.is_empty() || binary.contains(['/', '\\']) || binary == "." || binary == ".."
     {
         return Vec::new();
     }
     IMAGE_DIRS
         .iter()
-        .map(|dir| format!("{dir}/{name}"))
+        .map(|dir| format!("{dir}/{binary}"))
         .collect()
 }
+
+/// Each image's relative path and unbiased text span, or why the images
+/// cannot be read.
+type ImageSpans = Result<Vec<(String, (u64, u64))>, String>;
 
 /// The unbiased text span of each image of `images`, computed once per log
 /// and only for a log with an unnamed block.
 struct Spans<'a>
 {
     images: &'a dyn ImageSource,
-    spans: OnceCell<Vec<(String, (u64, u64))>>,
+    spans: OnceCell<ImageSpans>,
 }
 
 impl Spans<'_>
 {
     /// The images whose executable segments span exactly `span`.
-    fn matching(&self, span: (u64, u64)) -> Vec<&str>
+    fn matching(&self, span: (u64, u64)) -> Result<Vec<&str>, String>
     {
-        self.spans
+        let spans = self
+            .spans
             .get_or_init(|| {
-                self.images
-                    .list()
-                    .into_iter()
-                    .filter_map(|relative| {
-                        let span = text_span(&self.images.read(&relative)?)?;
-                        Some((relative, span))
-                    })
-                    .collect()
+                let mut spans = Vec::new();
+                for relative in self.images.list()?
+                {
+                    if let Some(span) = self.images.read(&relative)?.as_deref().and_then(text_span)
+                    {
+                        spans.push((relative, span));
+                    }
+                }
+                Ok(spans)
             })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(spans
             .iter()
             .filter(|(_, image_span)| *image_span == span)
             .map(|(relative, _)| relative.as_str())
-            .collect()
+            .collect())
     }
 }
 
@@ -196,7 +249,10 @@ pub fn symbolize_log(log: &str, images: &dyn ImageSource) -> Option<String>
         let source = BlockSource {
             name: name.map(String::as_str),
             images,
-            images_arch: images_arch.as_deref(),
+            images_arch: images_arch
+                .as_ref()
+                .map(Option::as_deref)
+                .map_err(String::as_str),
             spans: &spans,
         };
         symbolize_block(&mut out, block, &source);
@@ -207,10 +263,12 @@ pub fn symbolize_log(log: &str, images: &dyn ImageSource) -> Option<String>
 /// What a block's image is looked up with.
 struct BlockSource<'a>
 {
-    /// The process's log name, from logd's reclaim line for its badge.
+    /// The process's registered log name, from logd's reclaim line for its
+    /// badge.
     name: Option<&'a str>,
     images: &'a dyn ImageSource,
-    images_arch: Option<&'a str>,
+    /// The images' architecture, or why it cannot be read.
+    images_arch: Result<Option<&'a str>, &'a str>,
     spans: &'a Spans<'a>,
 }
 
@@ -224,7 +282,7 @@ fn symbolize_block(out: &mut String, block: &Block, source: &BlockSource<'_>)
     {
         Some(name) => format!("process {name}"),
         None => format!(
-            "process unnamed (badge {}: no logd reclaim line carries it)",
+            "process unnamed (badge {}: logd has no registered name for it)",
             block.get("badge").unwrap_or("absent")
         ),
     };
@@ -237,23 +295,7 @@ fn symbolize_block(out: &mut String, block: &Block, source: &BlockSource<'_>)
     {
         let _ = writeln!(out, "  defective block ({defect:?}): fields as logged");
     }
-    let image = match block_image(block, source)
-    {
-        Ok((label, bytes)) =>
-        {
-            let _ = writeln!(out, "  image: {label}");
-            Some(bytes)
-        }
-        Err(reason) =>
-        {
-            let _ = writeln!(out, "  not symbolized: {reason}");
-            if let Some(command) = rerun_command(block)
-            {
-                let _ = writeln!(out, "  with its binary: {command}");
-            }
-            None
-        }
-    };
+    let image = block_image_lines(out, block, source);
     let symbolizer = match image.as_deref().map(Symbolizer::new)
     {
         Some(Ok(symbolizer)) => Some(symbolizer),
@@ -274,9 +316,41 @@ fn symbolize_block(out: &mut String, block: &Block, source: &BlockSource<'_>)
     let resolver = symbolizer
         .as_ref()
         .and_then(|symbolizer| Resolver::new(block, symbolizer));
+    write_fields(out, block, resolver.as_ref());
+    let _ = writeln!(out, "end {:016x}", block.id);
+}
+
+/// Look up `block`'s image and append the line saying which it is, or why
+/// there is none and how to resolve the block once the binary is known; the
+/// image's bytes, if any.
+fn block_image_lines(out: &mut String, block: &Block, source: &BlockSource<'_>) -> Option<Vec<u8>>
+{
+    match block_image(block, source)
+    {
+        Ok((label, bytes)) =>
+        {
+            let _ = writeln!(out, "  image: {label}");
+            Some(bytes)
+        }
+        Err(reason) =>
+        {
+            let _ = writeln!(out, "  not symbolized: {reason}");
+            if let Some(command) = rerun_command(block)
+            {
+                let _ = writeln!(out, "  with its binary: {command}");
+            }
+            None
+        }
+    }
+}
+
+/// Append every field line of `block` as logged, each code address followed
+/// by what `resolver` resolves it to.
+fn write_fields(out: &mut String, block: &Block, resolver: Option<&Resolver<'_, '_>>)
+{
     for (key, value) in block.fields()
     {
-        match resolver.as_ref().and_then(|r| r.resolve(key, value))
+        match resolver.and_then(|r| r.resolve(key, value))
         {
             Some(lines) =>
             {
@@ -292,7 +366,6 @@ fn symbolize_block(out: &mut String, block: &Block, source: &BlockSource<'_>)
             }
         }
     }
-    let _ = writeln!(out, "end {:016x}", block.id);
 }
 
 /// The address form that resolves `block`'s instruction pointer and frames
@@ -317,9 +390,10 @@ fn rerun_command(block: &Block) -> Option<String>
 
 /// The image of `block`'s process, labelled with how it was found, or why
 /// there is none to symbolize with. A named process's image is the first
-/// binary of its name in [`IMAGE_DIRS`]; an unnamed one's is the one binary
-/// whose executable segments span exactly the block's `text` less its
-/// `load_bias`, never a guess among several.
+/// binary of its name in [`IMAGE_DIRS`], accepted only when its executable
+/// segments span exactly the block's `text` less its `load_bias` (a binary
+/// rebuilt since the boot is refused); an unnamed one's is the one binary
+/// whose span matches, never a guess among several.
 fn block_image(block: &Block, source: &BlockSource<'_>) -> Result<(String, Vec<u8>), String>
 {
     let (Some(load_bias), Some((text_start, text_end))) =
@@ -328,40 +402,74 @@ fn block_image(block: &Block, source: &BlockSource<'_>) -> Result<(String, Vec<u
     {
         return Err("the block carries no load bias and text range".to_owned());
     };
-    if let (Some(block_arch), Some(images_arch)) = (block.get("arch"), source.images_arch)
+    let images_arch = source
+        .images_arch
+        .map_err(|err| format!("the images' architecture: {err}"))?;
+    if let (Some(block_arch), Some(images_arch)) = (block.get("arch"), images_arch)
         && block_arch != images_arch
     {
         return Err(format!(
             "the block is {block_arch}, the images are built for {images_arch}"
         ));
     }
-    if let Some(name) = source.name
-    {
-        return candidate_paths(name)
-            .into_iter()
-            .find_map(|relative| {
-                let bytes = source.images.read(&relative)?;
-                Some((format!("sysroot/{relative}"), bytes))
-            })
-            .ok_or_else(|| format!("no binary named {name} in the images"));
-    }
     let span = (
         text_start.wrapping_sub(load_bias),
         text_end.wrapping_sub(load_bias),
     );
-    match source.spans.matching(span).as_slice()
+    match source.name
+    {
+        Some(name) => named_image(source.images, name, span),
+        None => unnamed_image(source, span),
+    }
+}
+
+/// The first binary of `name` in [`IMAGE_DIRS`], refused unless its
+/// executable segments span `span`.
+fn named_image(
+    images: &dyn ImageSource,
+    name: &str,
+    span: (u64, u64),
+) -> Result<(String, Vec<u8>), String>
+{
+    for relative in candidate_paths(name)
+    {
+        let Some(bytes) = images.read(&relative)?
+        else
+        {
+            continue;
+        };
+        return match text_span(&bytes)
+        {
+            Some(image_span) if image_span == span => Ok((format!("sysroot/{relative}"), bytes)),
+            Some((start, end)) => Err(format!(
+                "sysroot/{relative}'s text spans {start:#x}-{end:#x}, the block's {:#x}-{:#x}: \
+                 the binary is not the one that ran",
+                span.0, span.1
+            )),
+            None => Err(format!(
+                "sysroot/{relative} is not an ELF image with an executable segment"
+            )),
+        };
+    }
+    Err(format!("no binary named {name} in the images"))
+}
+
+/// The one binary whose executable segments span `span`.
+fn unnamed_image(source: &BlockSource<'_>, span: (u64, u64)) -> Result<(String, Vec<u8>), String>
+{
+    match source.spans.matching(span)?.as_slice()
     {
         [] => Err("the process is unnamed, and no binary's text matches the block's".to_owned()),
         [relative] => source
             .images
-            .read(relative)
+            .read(relative)?
             .map(|bytes| {
                 (
                     format!("sysroot/{relative} (the one binary whose text matches the block's)"),
                     bytes,
                 )
             })
-            .ok_or_else(|| format!("cannot read {relative}")),
+            .ok_or_else(|| format!("sysroot/{relative} is gone")),
         several => Err(format!(
             "the process is unnamed, and the text of several binaries matches the block's: {}",
             several.join(", ")
@@ -401,7 +509,7 @@ impl<'a, 'data> Resolver<'a, 'data>
     /// code address. `ip` and `frame.0` resolve at their address; a later
     /// frame is a candidate return address, so it resolves at the address
     /// less one, inside the call it returns from. An address outside the
-    /// text resolves to nothing.
+    /// text is not resolved and reads `outside the image's text`.
     fn resolve(&self, key: &str, value: &str) -> Option<Vec<String>>
     {
         let return_address = match key
@@ -430,6 +538,7 @@ impl<'a, 'data> Resolver<'a, 'data>
 mod tests
 {
     use crash_report::{Access, Arch, Fault, Image, Report, Status, Thread};
+    use logd_codec::reclaim::{Cause, ReclaimLine};
 
     use super::*;
     use crate::symbolize::fixture::{
@@ -444,11 +553,13 @@ mod tests
         text_end: BIAS + USER_BASE + 0x300,
     };
 
-    /// Images of one architecture, by relative path.
+    /// Images of one architecture, by relative path; with `list_error`,
+    /// listing them fails.
     struct Fixture
     {
         arch: &'static str,
         images: Vec<(&'static str, Vec<u8>)>,
+        list_error: bool,
     }
 
     impl Fixture
@@ -459,37 +570,47 @@ mod tests
             Fixture {
                 arch,
                 images: vec![("programs/crashme", image)],
+                list_error: false,
             }
         }
 
         /// The DWARF fixture as `programs/crashme`, built for `arch`.
         fn dwarf(arch: &'static str) -> Self
         {
-            Self::crashme(arch, fixture(Architecture::X86_64, USER_BASE, Debug::Dwarf))
+            Self::crashme(
+                arch,
+                with_text_segment(fixture(Architecture::X86_64, USER_BASE, Debug::Dwarf)),
+            )
         }
     }
 
     impl ImageSource for Fixture
     {
-        fn arch(&self) -> Option<String>
+        fn arch(&self) -> Result<Option<String>, String>
         {
-            Some(self.arch.to_owned())
+            Ok(Some(self.arch.to_owned()))
         }
 
-        fn list(&self) -> Vec<String>
+        fn list(&self) -> Result<Vec<String>, String>
         {
-            self.images
+            if self.list_error
+            {
+                return Err("cannot list the images: denied".to_owned());
+            }
+            Ok(self
+                .images
                 .iter()
                 .map(|(path, _)| (*path).to_owned())
-                .collect()
+                .collect())
         }
 
-        fn read(&self, relative: &str) -> Option<Vec<u8>>
+        fn read(&self, relative: &str) -> Result<Option<Vec<u8>>, String>
         {
-            self.images
+            Ok(self
+                .images
                 .iter()
                 .find(|(path, _)| *path == relative)
-                .map(|(_, bytes)| bytes.clone())
+                .map(|(_, bytes)| bytes.clone()))
         }
     }
 
@@ -529,6 +650,41 @@ mod tests
     const RX: u32 = 5;
     const R: u32 = 4;
 
+    /// `elf`, an ELF64 image without program headers, given one executable
+    /// loadable segment over `[OUTER, 0x300)`: the span of [`IMAGE`]'s text
+    /// less its bias.
+    fn with_text_segment(mut elf: Vec<u8>) -> Vec<u8>
+    {
+        while elf.len() % 8 != 0
+        {
+            elf.push(0);
+        }
+        let phoff = u64::try_from(elf.len()).unwrap();
+        elf.extend_from_slice(&1u32.to_le_bytes()); // p_type: PT_LOAD
+        elf.extend_from_slice(&RX.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+        elf.extend_from_slice(&(USER_BASE + OUTER).to_le_bytes());
+        elf.extend_from_slice(&(USER_BASE + OUTER).to_le_bytes()); // p_paddr
+        elf.extend_from_slice(&0u64.to_le_bytes()); // p_filesz
+        elf.extend_from_slice(&(0x300 - OUTER).to_le_bytes()); // p_memsz
+        elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        elf[0x20..0x28].copy_from_slice(&phoff.to_le_bytes()); // e_phoff
+        elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        elf
+    }
+
+    /// logd's reclaim line for `badge`, as its self-log prints it.
+    fn reclaim_line(badge: u64, cause: Cause, name: &str) -> String
+    {
+        let line = ReclaimLine {
+            badge,
+            cause,
+            name: name.as_bytes(),
+        };
+        format!("[2.6] [logd] {line}\r\n")
+    }
+
     /// The serial lines of `report`'s block as logd prints crashd's lines,
     /// and, when `name` is given, logd's reclaim line naming the process.
     fn log_of(report: &Report<'_>, name: Option<&str>) -> String
@@ -537,9 +693,12 @@ mod tests
         report.emit(|line| log.push_str(&format!("[2.5] [crashd] {line}\r\n")));
         if let Some(name) = name
         {
-            log.push_str(&format!(
-                "[2.6] [logd] reclaim: badge={} exit_reason=0x100e name={name}\r\n",
-                report.badge
+            log.push_str(&reclaim_line(
+                report.badge,
+                Cause::Death {
+                    exit_reason: 0x100e,
+                },
+                name,
             ));
         }
         log
@@ -616,11 +775,6 @@ mod tests
         let ip = BIAS + INNER;
         let cases = [
             (
-                None,
-                "x86_64",
-                "not symbolized: the process is unnamed, and no binary's text matches the block's",
-            ),
-            (
                 Some("other"),
                 "x86_64",
                 "not symbolized: no binary named other in the images",
@@ -664,7 +818,7 @@ mod tests
         let ip = BIAS + INNER + 4;
         let images = Fixture::crashme(
             "x86_64",
-            fixture(Architecture::X86_64, USER_BASE, Debug::SymbolsOnly),
+            with_text_segment(fixture(Architecture::X86_64, USER_BASE, Debug::SymbolsOnly)),
         );
         let out =
             symbolize_log(&log_of(&report(ip, &regs, &[ip]), Some("crashme")), &images).unwrap();
@@ -686,7 +840,10 @@ mod tests
         let not_elf = Fixture::crashme("x86_64", b"not an ELF image".to_vec());
         let out = symbolize_log(&log, &not_elf).unwrap();
         assert!(
-            out.contains("\n  not symbolized: not an ELF image"),
+            out.contains(
+                "\n  not symbolized: sysroot/programs/crashme is not an ELF image with an executable \
+                 segment\n"
+            ),
             "{out}"
         );
         assert!(out.contains(&format!("\n  ip={ip:#018x}\n")));
@@ -694,14 +851,14 @@ mod tests
         // image loads but the resolution fails.
         let broken = Fixture::crashme(
             "x86_64",
-            fixture_with_section(".debug_info", 0, |mut data| {
+            with_text_segment(fixture_with_section(".debug_info", 0, |mut data| {
                 let name = data
                     .windows(6)
                     .position(|bytes| bytes == b"inner\0")
                     .expect("inner's name in .debug_info");
                 data[name - 1] = 0x7f;
                 data
-            }),
+            })),
         );
         let out = symbolize_log(&log, &broken).unwrap();
         assert!(
@@ -740,7 +897,9 @@ mod tests
         let out = symbolize_log(&log, &Fixture::dwarf("x86_64")).unwrap();
         assert!(out.contains("\n  thread=spawned\n"), "{out}");
         assert!(
-            out.contains(&format!("\n  ip={ip:#018x}  inner at /src/fixture.rs:20 [debug-info]\n")),
+            out.contains(&format!(
+                "\n  ip={ip:#018x}  inner at /src/fixture.rs:20 [debug-info]\n"
+            )),
             "{out}"
         );
     }
@@ -760,6 +919,7 @@ mod tests
     #[test]
     fn a_log_name_is_searched_in_the_sysroot_directories_in_order()
     {
+        assert_eq!(candidate_paths("fatfs /data")[0], "services/fatfs");
         assert_eq!(
             candidate_paths("crashme"),
             [
@@ -783,12 +943,16 @@ mod tests
         let regs = [0u64; 21];
         let ip = BIAS + INNER;
         let frames = [ip, BIAS + LEAF + 9];
-        let out = symbolize_log(
-            &log_of(&report(ip, &regs, &frames), None),
-            &Fixture::dwarf("x86_64"),
-        )
-        .unwrap();
-        assert!(out.contains("process unnamed (badge 42: no logd reclaim line carries it)"));
+        let none = Fixture {
+            arch: "x86_64",
+            images: Vec::new(),
+            list_error: false,
+        };
+        let out = symbolize_log(&log_of(&report(ip, &regs, &frames), None), &none).unwrap();
+        assert!(out.contains("process unnamed (badge 42: logd has no registered name for it)"));
+        assert!(out.contains(
+            "\n  not symbolized: the process is unnamed, and no binary's text matches the block's\n"
+        ));
         assert!(out.contains(&format!(
             "\n  with its binary: cargo xtask symbolize --binary <binary> --bias {BIAS:#x} {ip:#x} \
              {:#x}\n",
@@ -809,6 +973,7 @@ mod tests
                 ("programs/one", matching.clone()),
                 ("programs/other", other),
             ],
+            list_error: false,
         };
         let log = log_of(&report(ip, &regs, &[ip]), None);
         let out = symbolize_log(&log, &images).unwrap();
@@ -826,6 +991,7 @@ mod tests
         let twins = Fixture {
             arch: "x86_64",
             images: vec![("programs/one", matching.clone()), ("tests/two", matching)],
+            list_error: false,
         };
         let out = symbolize_log(&log, &twins).unwrap();
         assert!(out.contains(
@@ -848,5 +1014,130 @@ mod tests
         );
         assert_eq!(text_span(&segments_only(&[(R, 0, 0x1000)])), None);
         assert_eq!(text_span(b"not an ELF image"), None);
+    }
+
+    #[test]
+    fn a_slot_logd_names_question_mark_is_unnamed_and_matched_by_its_text()
+    {
+        let regs = [0u64; 21];
+        let ip = BIAS + INNER + 4;
+        let log = log_of(&report(ip, &regs, &[ip]), Some(""));
+        assert!(log.contains("name=?"), "{log}");
+        let out = symbolize_log(&log, &Fixture::dwarf("x86_64")).unwrap();
+        assert!(out.contains("process unnamed (badge 42: "), "{out}");
+        assert!(out.contains(
+            "\n  image: sysroot/programs/crashme (the one binary whose text matches the block's)\n"
+        ));
+    }
+
+    #[test]
+    fn a_resync_reclaim_line_names_its_process()
+    {
+        let regs = [0u64; 21];
+        let ip = BIAS + INNER + 4;
+        let mut log = log_of(&report(ip, &regs, &[ip]), None);
+        log.push_str(&reclaim_line(42, Cause::Resync, "crashme"));
+        let out = symbolize_log(&log, &Fixture::dwarf("x86_64")).unwrap();
+        assert!(out.contains("): process crashme\n"), "{out}");
+        assert!(
+            out.contains("\n  image: sysroot/programs/crashme\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_name_with_an_instance_resolves_through_its_first_word()
+    {
+        let regs = [0u64; 21];
+        let ip = BIAS + INNER + 4;
+        let log = log_of(&report(ip, &regs, &[ip]), Some("crashme /data"));
+        let out = symbolize_log(&log, &Fixture::dwarf("x86_64")).unwrap();
+        assert!(out.contains("): process crashme /data\n"), "{out}");
+        assert!(
+            out.contains("\n  image: sysroot/programs/crashme\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_named_binary_whose_text_differs_from_the_blocks_is_refused()
+    {
+        let regs = [0u64; 21];
+        let ip = BIAS + INNER + 4;
+        let rebuilt = Fixture::crashme("x86_64", segments_only(&[(RX, OUTER, 0x180)]));
+        let out = symbolize_log(
+            &log_of(&report(ip, &regs, &[ip]), Some("crashme")),
+            &rebuilt,
+        )
+        .unwrap();
+        assert!(
+            out.contains(
+                "\n  not symbolized: sysroot/programs/crashme's text spans 0x100-0x280, the \
+                 block's 0x100-0x300: the binary is not the one that ran\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_image_listing_that_fails_is_reported_for_an_unnamed_block()
+    {
+        let regs = [0u64; 21];
+        let ip = BIAS + INNER;
+        let images = Fixture {
+            list_error: true,
+            ..Fixture::dwarf("x86_64")
+        };
+        let out = symbolize_log(&log_of(&report(ip, &regs, &[ip]), None), &images).unwrap();
+        assert!(
+            out.contains("\n  not symbolized: cannot list the images: denied\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_sysroot_reads_its_binaries_and_reports_what_it_cannot_read()
+    {
+        let root = std::env::temp_dir().join(format!("seraph-crash-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("programs")).unwrap();
+        std::fs::create_dir_all(root.join("tests/programs/dir-not-file")).unwrap();
+        std::fs::write(root.join("programs/crashme"), b"bytes").unwrap();
+        std::fs::write(root.join(".arch"), "riscv64\n").unwrap();
+        let images = SysrootImages {
+            sysroot: root.clone(),
+        };
+        assert_eq!(images.arch(), Ok(Some("riscv64".to_owned())));
+        assert_eq!(images.list(), Ok(vec!["programs/crashme".to_owned()]));
+        assert_eq!(images.read("programs/crashme"), Ok(Some(b"bytes".to_vec())));
+        assert_eq!(images.read("programs/absent"), Ok(None));
+        assert!(images.read("tests/programs/dir-not-file").is_err());
+
+        // A directory of the images that is a file, and an `.arch` that is a
+        // directory, cannot be read: errors, not absences.
+        std::fs::write(root.join("services"), b"").unwrap();
+        assert!(images.list().is_err());
+        std::fs::remove_file(root.join(".arch")).unwrap();
+        std::fs::create_dir(root.join(".arch")).unwrap();
+        assert!(images.arch().is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(images.arch(), Ok(None));
+        assert_eq!(images.list(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn reclaimed_names_read_both_line_forms_and_skip_unregistered_slots()
+    {
+        let log = [
+            reclaim_line(1, Cause::Death { exit_reason: 0 }, "shell"),
+            reclaim_line(2, Cause::Resync, "fatfs /data"),
+            reclaim_line(3, Cause::Death { exit_reason: 0 }, ""),
+            "[2.7] [hello] reclaim: badge=4 exit_reason=0x0 name=impostor\n".to_owned(),
+        ]
+        .concat();
+        let names = reclaimed_names(&log);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert_eq!(names[&1], "shell");
+        assert_eq!(names[&2], "fatfs /data");
     }
 }

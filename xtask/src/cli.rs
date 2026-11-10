@@ -147,15 +147,16 @@ pub struct BuildArgs
     #[arg(long)]
     pub release: bool,
 
-    /// Build only one component (default: all).
-    #[arg(long, default_value = "all")]
+    /// Build only one component (default: all): `boot`, or the crate name
+    /// of any component the build installs.
+    #[arg(long, default_value = "all", value_parser = parse_build_component)]
     pub component: BuildComponent,
 
     /// Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named
     /// component(s) only, within the active profile (default or `--release`).
     /// Comma-separated, e.g. `--debug kernel,procmgr`; names match
     /// `--component`. Only components in the current build are affected.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', value_parser = parse_build_component)]
     pub debug: Vec<BuildComponent>,
 
     /// Skip `cargo fmt` and per-component `cargo check` (clippy). `cargo
@@ -167,55 +168,37 @@ pub struct BuildArgs
     pub skip_lints: bool,
 }
 
-/// Components that can be built individually.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+/// A component `cargo xtask build` builds: the bootloader, every component,
+/// or one crate of the build's spec table (`SPECS` in
+/// `xtask/src/commands/build.rs`), by its crate name. The names are read from
+/// that table, so a crate added to it is accepted with no second list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildComponent
 {
     Boot,
-    Kernel,
-    Init,
-    Ktest,
-    Procmgr,
-    Memmgr,
-    Devmgr,
-    Vfsd,
-    VirtioBlk,
-    Serial,
-    Framebuffer,
-    CmosRtc,
-    GoldfishRtc,
-    Fatfs,
-    Crasher,
-    Svctest,
-    Usertest,
-    Svcmgr,
-    Pwrmgr,
-    Timed,
-    Hello,
-    HelloTester,
-    FbCharset,
-    Terminal,
-    Fsbench,
-    Pipefault,
-    Shell,
-    ShellTester,
-    Stackoverflow,
-    Relrofault,
-    Capexhaust,
-    Demandpaged,
-    Stdiotest,
-    StdiotestTester,
-    Threadstack,
-    ThreadstackTester,
-    Deadline,
-    DeadlineTester,
-    Debugger,
-    DebuggerTester,
-    Threadchurn,
-    ThreadchurnTester,
-    Pipestress,
-    PipestressTester,
     All,
+    /// A crate of the spec table, by its crate name.
+    Spec(&'static str),
+}
+
+/// Clap value parser for a [`BuildComponent`]: `boot`, `all`, or the crate
+/// name of a spec-table entry.
+fn parse_build_component(text: &str) -> Result<BuildComponent, String>
+{
+    match text
+    {
+        "boot" => Ok(BuildComponent::Boot),
+        "all" => Ok(BuildComponent::All),
+        name => crate::commands::build::spec_name(name)
+            .map(BuildComponent::Spec)
+            .ok_or_else(|| {
+                let names: Vec<&str> = crate::commands::build::spec_names().collect();
+                format!(
+                    "no component named {name:?}; expected boot, all, or one of: {}",
+                    names.join(", ")
+                )
+            }),
+    }
 }
 
 // ── Run ───────────────────────────────────────────────────────────────────────
@@ -805,7 +788,8 @@ pub struct SymbolizeArgs
 
     /// A serial log: print every crash-report block in it with its code
     /// addresses resolved, each process's image found in the sysroot by the
-    /// log name logd's `reclaim:` line gives its badge.
+    /// log name logd's `reclaim:` line gives its badge, or, for a process
+    /// logd names none for, as the one binary whose text span matches.
     #[arg(long, value_name = "FILE", conflicts_with_all = ["binary", "kernel", "bias", "addresses"])]
     pub log: Option<PathBuf>,
 }
@@ -820,3 +804,23 @@ fn parse_hex_arg(text: &str) -> Result<u64, String>
 
 #[derive(Parser)]
 pub struct LintDocsArgs {}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn every_built_crate_is_accepted_as_a_build_component()
+    {
+        let names: Vec<&str> = crate::commands::build::spec_names().collect();
+        assert!(names.contains(&"crashme") && names.contains(&"crashd"));
+        for name in names
+        {
+            assert_eq!(parse_build_component(name), Ok(BuildComponent::Spec(name)));
+        }
+        assert_eq!(parse_build_component("boot"), Ok(BuildComponent::Boot));
+        assert_eq!(parse_build_component("all"), Ok(BuildComponent::All));
+        assert!(parse_build_component("no-such-crate").is_err());
+    }
+}

@@ -57,8 +57,8 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture |
 | `--release` | off | Build in release mode |
-| `--component` | `all` | Build a single component: any `BuildComponent` name (`boot`, `kernel`, `init`, `ktest`, each service or program crate), or `all` |
-| `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, e.g. `--debug kernel,procmgr`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
+| `--component` | `all` | Build a single component: `boot`, the crate name of any component the build installs (an entry of the `SPECS` table in `xtask/src/commands/build.rs`: `kernel`, `init`, `ktest`, each service, driver, program, fixture, and tester crate), or `all` |
+| `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, each named as `--component` names it, e.g. `--debug kernel,crashme`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
 
 The sysroot is architecture-specific. Building for a different arch than the
 existing sysroot is an error — run `cargo xtask clean` first (per
@@ -427,8 +427,9 @@ non-passing runs are preserved under `target/xtask/run-parallel/` as
 log elsewhere). Beside each log it keeps, in either place, whose log holds a crash-report block, a
 run writes the block's symbolized report, `cargo xtask symbolize --log`'s output against the
 current sysroot, as `<name>.crash.txt` for `<name>.log`, and removes a stale `<name>.crash.txt` of
-a log without one. Each invocation first removes the run logs and crash reports an earlier one left
-under `target/xtask/run-parallel/`, so the preserved files are its own.
+a log without one; it symbolizes only for a run that keeps its log, and a failure writing the report
+is a warning that changes no outcome. Each invocation first removes the run logs and crash reports
+an earlier one left under `target/xtask/run-parallel/`, so the preserved files are its own.
 
 **Outcome precedence**:
 1. `--fail` regex matches → `FAIL` (a live match also triggers early abort
@@ -566,9 +567,13 @@ is refused.
 **Log form.** `--log` reads the crash-report blocks crashd logs
 ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)) with
 `shared/crash-report`'s parser. A block names its process by badge; logd's
-`reclaim: badge=<badge> … name=<log name>` line for that badge gives the log name, and the image is
-the sysroot binary of that file name, searched in `services/`, `services/drivers/`,
-`services/fs/`, `programs/`, `tests/`, and `tests/programs/`, in that order. Each block prints as:
+`reclaim: badge=<badge> … name=<log name>` line for that badge (or its resync form,
+`reclaim (resync): badge=<badge> name=<log name>`) gives the log name, and the image is the sysroot
+binary named by the log name's first word, searched in `services/`, `services/drivers/`,
+`services/fs/`, `programs/`, `tests/`, and `tests/programs/`, in that order. The binary is used only
+when its executable segments span exactly the block's `text` less its `load_bias`, the span
+procmgr records at spawn, so a binary rebuilt since the boot is refused rather than resolved
+against. Each block prints as:
 
 ```
 crash report <id> (format version <v>): process <log name>
@@ -586,18 +591,19 @@ indented below it; a frame past `frame.0` is a candidate return address, so it r
 address less one, inside the call it returns from, and an `ip` outside `text` reads
 `outside the image's text`.
 
-A process that registered no log name with logd has no `reclaim:` line, and its block's header
-reads `process unnamed (badge <badge>: …)`. Its image is then the one binary of those directories
-whose executable segments span exactly the block's `text` less its `load_bias` (the span procmgr
-records at spawn), labelled as found that way; when none or several match, the block is not
-symbolized, and no name is guessed. In place of the `image:` line a block that is not symbolized
-says why (the process is unnamed and its text matches no binary or several, no sysroot binary has
-its name, the block's `arch` is not the sysroot's, it carries no `load_bias` and `text` because the
-report's attach failed, or the image is not an ELF image) and, when it has a `load_bias`, gives the
-address-form command that resolves its addresses once the binary is known; its fields then print
-as logged. An incomplete or defective block is marked `defective block (<defect>)` and printed all
-the same. A log without a block prints that it has none. `run-parallel` writes the same report
-beside each log it keeps.
+A process that registered no log name with logd has a `reclaim:` line naming it `?` when it wrote
+to the log, and none when it did not; either way its block's header reads
+`process unnamed (badge <badge>: …)`. Its image is then the one binary of those directories whose
+executable segments span the block's text in the same way, labelled as found that way; when none or
+several match, the block is not symbolized, and no name is guessed. In place of the `image:` line a
+block that is not symbolized says why (the process is unnamed and its text matches no binary or
+several, no sysroot binary has its name, the named binary's text differs from the block's, the
+block's `arch` is not the sysroot's, it carries no `load_bias` and `text` because the report's
+attach failed, a sysroot file cannot be read, or the image is not an ELF image) and, when it has a
+`load_bias`, gives the address-form command that resolves its addresses once the binary is known;
+its fields then print as logged. An incomplete or defective block is marked
+`defective block (<defect>)` and printed all the same. A log without a block prints that it has
+none. `run-parallel` writes the same report beside each log it keeps.
 
 ---
 

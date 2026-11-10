@@ -355,8 +355,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     matched,
                 };
 
-                let crash_report = symbolize_log(&log_text, &SysrootImages { sysroot });
-
+                let mut kept_logs = Vec::new();
                 if let Some(dir) = &save_logs
                 {
                     let saved = SavedRun {
@@ -366,12 +365,19 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                         run: run_id,
                     };
                     save_log(dir, &log_path, &saved, &outcome)?;
-                    let saved_path = dir.join(saved_log_name(&saved));
-                    write_crash_report(&saved_path, run_id, crash_report.as_deref())?;
+                    kept_logs.push(dir.join(saved_log_name(&saved)));
                 }
-                if let Some(kept) = finalize_log(&workdir, &log_path, run_id, &outcome.status)?
+                kept_logs.extend(finalize_log(&workdir, &log_path, run_id, &outcome.status)?);
+                // Symbolized only for a run that keeps its log, after the log is
+                // in place, so the report can neither cost a discarded run nor
+                // lose a kept log.
+                if !kept_logs.is_empty()
                 {
-                    write_crash_report(&kept, run_id, crash_report.as_deref())?;
+                    let crash_report = symbolize_log(&log_text, &SysrootImages { sysroot });
+                    for log in &kept_logs
+                    {
+                        write_crash_report(log, run_id, crash_report.as_deref());
+                    }
                 }
                 println!("{}", format_outcome_line(&outcome));
                 Ok(outcome)
@@ -896,26 +902,32 @@ fn crash_report_path(log: &Path) -> PathBuf
 
 /// Write run `run_id`'s symbolized crash report beside `log`, or, when the
 /// log holds no crash-report block, remove a report an earlier run of the
-/// same name left there.
-fn write_crash_report(log: &Path, run_id: u32, report: Option<&str>) -> Result<()>
+/// same name left there. The report is derived from the kept log, so a
+/// failure is a warning, never the run's or the invocation's failure.
+fn write_crash_report(log: &Path, run_id: u32, report: Option<&str>)
 {
     let path = crash_report_path(log);
-    match report
+    let result = match report
     {
-        Some(report) =>
-        {
-            std::fs::write(&path, report).with_context(|| format!("writing {}", path.display()))?;
+        Some(report) => std::fs::write(&path, report).map(|()| {
             println!(
                 "run={run_id}: crash report symbolized to {}",
                 path.display()
             );
-        }
-        None =>
+        }),
+        None => match std::fs::remove_file(&path)
         {
-            let _ = std::fs::remove_file(&path);
-        }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    };
+    if let Err(err) = result
+    {
+        eprintln!(
+            "run={run_id}: warning: crash report {}: {err}",
+            path.display()
+        );
     }
-    Ok(())
 }
 
 fn format_outcome_line(outcome: &RunOutcome) -> String
@@ -1240,6 +1252,26 @@ mod tests
             let report = report.to_str().unwrap();
             assert!(is_purged(report), "{report} is not purged");
         }
+    }
+
+    #[test]
+    fn a_crash_report_is_written_beside_its_log_and_a_stale_one_removed()
+    {
+        let dir = std::env::temp_dir().join(format!("seraph-crash-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("x86_64-4cpu-1.log");
+        let report = dir.join("x86_64-4cpu-1.crash.txt");
+        write_crash_report(&log, 1, Some("crash report 00000000000000aa\n"));
+        assert_eq!(
+            std::fs::read_to_string(&report).unwrap(),
+            "crash report 00000000000000aa\n"
+        );
+        write_crash_report(&log, 1, None);
+        assert!(!report.exists());
+        // No report to remove is not an error either.
+        write_crash_report(&log, 1, None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

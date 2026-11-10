@@ -369,7 +369,7 @@ pub(crate) mod fixture
     /// Link address of the fixture's functions' base for a user PIE.
     pub(crate) const USER_BASE: u64 = 0;
     /// Link address of the fixture's functions' base for a kernel image.
-    pub(crate) const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
+    pub(super) const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
 
     // The fixture's layout, as offsets from its base: `outer` at 0x100..0x140,
     // with `inner` inlined into it at 0x110..0x120 from a call on line 11;
@@ -378,11 +378,11 @@ pub(crate) mod fixture
     // table only. The compile unit spans 0x100..0x1c0.
     pub(crate) const OUTER: u64 = 0x100;
     pub(crate) const INNER: u64 = 0x110;
-    pub(crate) const ANON: u64 = 0x180;
+    pub(super) const ANON: u64 = 0x180;
     pub(crate) const LEAF: u64 = 0x200;
-    pub(crate) const TAIL: u64 = 0x280;
-    pub(crate) const OUTER_MANGLED: &str = "_ZN7fixture5outer17h0123456789abcdefE";
-    pub(crate) const SYMBOLS: [(&str, u64, u64); 4] = [
+    pub(super) const TAIL: u64 = 0x280;
+    pub(super) const OUTER_MANGLED: &str = "_ZN7fixture5outer17h0123456789abcdefE";
+    pub(super) const SYMBOLS: [(&str, u64, u64); 4] = [
         (OUTER_MANGLED, OUTER, 0x40),
         ("_ZN7fixture4anon17h0123456789abcdefE", ANON, 0x40),
         ("_ZN7fixture4leaf17h0123456789abcdefE", LEAF, 0x20),
@@ -398,7 +398,7 @@ pub(crate) mod fixture
     }
 
     /// The fixture's line program: one sequence over `outer`.
-    pub(crate) fn fixture_line_program(encoding: Encoding, base: u64) -> (LineProgram, FileId)
+    pub(super) fn fixture_line_program(encoding: Encoding, base: u64) -> (LineProgram, FileId)
     {
         let mut program = LineProgram::new(
             encoding,
@@ -425,7 +425,7 @@ pub(crate) mod fixture
 
     /// Add a DIE of `tag` under `parent` covering `base + start` for `len`
     /// bytes, with the further attributes `attrs`.
-    pub(crate) fn add_ranged_die(
+    pub(super) fn add_ranged_die(
         unit: &mut Unit,
         parent: UnitEntryId,
         tag: constants::DwTag,
@@ -449,7 +449,7 @@ pub(crate) mod fixture
 
     /// The fixture's DIEs: the unit, `inner`'s abstract instance, `outer`
     /// with `inner` inlined into it, and the unnamed `anon`.
-    pub(crate) fn fixture_dies(unit: &mut Unit, base: u64, file: FileId)
+    pub(super) fn fixture_dies(unit: &mut Unit, base: u64, file: FileId)
     {
         let root = unit.root();
         let cu = unit.get_mut(root);
@@ -524,7 +524,7 @@ pub(crate) mod fixture
     }
 
     /// The fixture's DWARF sections, by name.
-    pub(crate) fn fixture_dwarf(base: u64) -> Vec<(&'static str, Vec<u8>)>
+    pub(super) fn fixture_dwarf(base: u64) -> Vec<(&'static str, Vec<u8>)>
     {
         let encoding = Encoding {
             format: Format::Dwarf32,
@@ -554,7 +554,7 @@ pub(crate) mod fixture
     /// An ELF image of `arch` whose functions sit at link addresses from
     /// `base`, with [`SYMBOLS`] in its symbol table and `debug` as its debug
     /// sections: name, contents, and ELF section flags.
-    pub(crate) fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)>) -> Vec<u8>
+    pub(super) fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)>) -> Vec<u8>
     {
         let mut obj = Object::new(BinaryFormat::Elf, arch, Endianness::Little);
         let text = obj.section_id(StandardSection::Text);

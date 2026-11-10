@@ -251,7 +251,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
-          path: target/xtask/run-parallel/**/*.log
+          path: |
+            target/xtask/run-parallel/**/*.log
+            target/xtask/run-parallel/**/*.crash.txt
           if-no-files-found: ignore
 
       - name: Upload saved run logs
@@ -262,6 +264,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: run-parallel-saved-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
-          path: target/xtask/run-parallel-saved/*.log
+          path: |
+            target/xtask/run-parallel-saved/*.log
+            target/xtask/run-parallel-saved/*.crash.txt
           if-no-files-found: ignore
           retention-days: 14

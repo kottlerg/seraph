@@ -209,13 +209,16 @@ impl ProcessEntry
         self.badge
     }
 
-    /// Whether `badge` is one this child's threads are bound to the crash
-    /// endpoint with: its process badge, its main thread's, or a registered
-    /// thread's crash badge.
+    /// Whether a thread of this child bound under `badge` is bound to the
+    /// crash endpoint by procmgr: under its process badge, its main thread's,
+    /// or under a crash badge, which carries [`threads::CRASH_BADGE_TAG`]
+    /// whether or not the thread procmgr bound under it is still registered
+    /// (a spawner that exited). A debugger binds under a badge that is
+    /// neither (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`).
     #[must_use]
-    pub fn owns_crash_badge(&self, badge: u64) -> bool
+    pub fn is_crash_binding(&self, badge: u64) -> bool
     {
-        badge == self.badge || self.threads.position_of_crash_badge(badge).is_some()
+        badge == self.badge || threads::is_crash_badge(badge)
     }
 }
 
@@ -957,8 +960,15 @@ mod tests
         assert_eq!(attached(&mut table, DEBUG_AUTHORITY, first), Ok((0x50, 1)));
         assert_eq!(attached(&mut table, DEBUG_AUTHORITY, second), Ok((0x50, 3)));
         assert_eq!(attached(&mut table, DEBUG_AUTHORITY, 0x50), Ok((0x50, 0)));
-        assert!(table.find_by_badge(0x50).unwrap().owns_crash_badge(second));
-        assert!(!table.find_by_badge(0x40).unwrap().owns_crash_badge(second));
+        // A crash badge is procmgr's binding whether or not its thread is
+        // still registered; another process's badge, or a debugger's, is not.
+        let unregistered = table.mint_crash_badge();
+        let entry = table.find_by_badge(0x50).unwrap();
+        assert!(entry.is_crash_binding(second));
+        assert!(entry.is_crash_binding(0x50));
+        assert!(entry.is_crash_binding(unregistered));
+        assert!(!entry.is_crash_binding(0x40));
+        assert!(!entry.is_crash_binding(0x51));
         // A named thread swept out since is no longer listed.
         let (entry, named) = attach_target(&mut table, DEBUG_AUTHORITY, first).unwrap();
         entry.threads.sweep(|t| t.cap != 7, |_| {});

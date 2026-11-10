@@ -735,11 +735,13 @@ it replies, procmgr drops from the target's registry each thread that has exited
 runtime revoked (its reclaim of a joined or reaped thread does), so no thread that exited before
 the request is listed; a thread blocked on a fault has not exited and stays listed. A thread whose
 cap the runtime revokes between that sweep and the derivation of the reply's caps is swept out and
-the page derived again, up to four times. The list can change between two calls
+the page derived again, in at most four derivations in all. The list can change between two calls
 of a paged walk, as threads register and exit; the named thread's index is the one in the reply
 that carries it, and a caller that needs that thread's cap from a later page reads `data[6]` of
 that page's reply too. The caps are derivations of procmgr's own; procmgr's teardown of the target,
-and the runtime's reclaim of a registered thread, revoke them.
+and the runtime's reclaim of a registered thread, revoke them. A debugger that binds a listed
+thread's exception class MUST NOT bind it under the process badge `data[5]` returns, nor under a
+crash badge (§ Label 22).
 
 `data[5]`, `data[6]`, and the crash-badge form of `data[0]` extend the reply and the target's
 domain without changing the request: the label, its words, and its caps are as before, a request
@@ -790,22 +792,23 @@ The sender hands procmgr a cap of one of its threads, which procmgr keeps in the
 until the thread exits, the cap is revoked, or the process is torn down; `ATTACH_PROCESS` lists it.
 The runtime sends it from each thread it spawns, before the thread runs its code, with a copy of
 the thread's own cap ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Thread
-registration). When the thread's exception class is bound under one of its process's crash-endpoint
-badges (its process badge, or a registered thread's crash badge), as a thread that copied its
-spawner's bindings is, procmgr binds it again under a fresh crash badge; a binding of another
-handler, a debugger's, or none, is left, and the thread is then listed without a crash badge.
-procmgr reads the binding's badge, which `SYS_THREAD_GET_FAULT_HANDLER` returns, not its endpoint,
-so it tells its own binding by the badge alone: a debugger that binds a thread's exception class
-MUST bind it under a badge that is neither the process badge nor a crash badge (no badge with bit
-63 set), or the threads that thread spawns, which copy that binding, are bound back to the crash
-endpoint when they register. procmgr reads the binding before it sweeps, so a thread whose
-spawner the sweep drops is still bound under a crash badge of its own.
+registration). When the thread's exception class is bound under its process badge or under a crash
+badge, any badge with bit 63 set, as a thread that copied its spawner's bindings is (whether or not
+that spawner is still registered), procmgr binds it again under a fresh crash badge; a binding of
+another handler, a debugger's, or none, is left, and the thread is then listed without a crash
+badge. procmgr reads the binding's badge, which `SYS_THREAD_GET_FAULT_HANDLER` returns, not its
+endpoint, so it tells its own binding by the badge alone: a debugger that binds a thread's exception
+class MUST bind it under a badge that is neither the process badge nor a crash badge (no badge with
+bit 63 set), or the threads that thread spawns, which copy that binding, are bound back to the
+crash endpoint when they register.
 
 Before it adds the thread, procmgr drops from the registry the threads that have exited or whose cap
-was revoked, when the registry has reached the count its last sweep set: 64 at first, then twice
-what the sweep kept. At the bound, the next sweep waits instead for as many refused registrations
-as the registry holds. Either way a sweep comes after at least half as many requests as threads it
-reads, so the sweeps cost at most two thread-state reads per request on average.
+was revoked, when the registry has reached the count its last sweep set (64 at first, then twice
+what the sweep kept), or the bound when that count lies past it, and at least half as many
+registrations as it holds, refused ones included, came since the last sweep. A sweep therefore
+comes after at least half as many requests as threads it reads, so the sweeps cost at most two
+thread-state reads per request on average, and threads that are gone hold the bound for at most
+half a registry's worth of requests.
 
 The registry holds at most `procmgr_labels::REGISTERED_THREADS_MAX` (16384) threads per process
 ([docs/limits.md](../../../docs/limits.md) § Shared IPC and protocol crates); past it a thread runs

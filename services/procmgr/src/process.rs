@@ -2061,8 +2061,8 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 ///
 /// The cap must be a Thread cap with `RIGHTS_THREAD`. A registry that reached
 /// its sweep count first drops the threads that are gone
-/// ([`thread_is_listed`]). A thread whose exception class is bound under one
-/// of its process's crash badges (`ProcessEntry::owns_crash_badge`), as one
+/// ([`thread_is_listed`]). A thread whose exception class is bound under its
+/// process badge or a crash badge (`ProcessEntry::is_crash_binding`), as one
 /// that copied its spawner's bindings is, is bound again under a fresh crash
 /// badge, so its faults name it; a binding under any other badge, a
 /// debugger's, or none, is left as it is. The binding is told by its badge
@@ -2088,12 +2088,12 @@ pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) ->
     {
         return Err(procmgr_errors::INVALID_ARGUMENT);
     }
-    // Whether the binding is the process's is read before the sweep, which
-    // may drop the spawner whose crash badge the thread copied.
+    // A crash badge the thread copied from a spawner that has exited, and
+    // that a sweep dropped, is still procmgr's: the tag tells it.
     let rebind = syscall::thread_get_fault_handler(thread_cap, FAULT_CLASS_EXCEPTION)
         .ok()
         .flatten()
-        .is_some_and(|b| entry.owns_crash_badge(b));
+        .is_some_and(|b| entry.is_crash_binding(b));
     if entry.threads.needs_sweep()
     {
         entry

@@ -93,9 +93,11 @@ Every Issue MUST carry at least one **Subsystem** label and at least one **Class
 
 Each `Y` bump (`v0.1.0`, `v0.2.0`, …) and each `Z` patch (`v0.1.1`, …), shipped or planned, has a
 GitHub milestone. The current milestone is the lowest-versioned open one. An Issue a release will
-absorb (a defect, a cleanup, a follow-up Issue the pre-merge review files, scheduled work of any
-class) MUST carry a milestone from creation: the current milestone, or the later release it is
-planned for. Only future-state work no release has scheduled (a design umbrella, an unscheduled
+absorb (a defect, a cleanup, scheduled work of any class) MUST carry a milestone from creation:
+the current milestone, or the later release it is planned for. A follow-up Issue the pre-merge
+review files (§ Follow-up Issues) MUST carry the current milestone: it records findings on work
+the current release contains, and step 8 of § Release Production moves it on when the release
+closes. Only future-state work no release has scheduled (a design umbrella, an unscheduled
 feature) MAY stay unassigned; it is assigned when it is scheduled. The rule applies to open Issues
 filed before it: the maintainer assigns each a milestone or confirms it as unscheduled work. An
 Issue that closes without a milestone, or under one other than the current milestone, MUST be

@@ -45,7 +45,7 @@ const BODY_COLUMNS: usize = 72;
 
 /// Title suffix of a rolling follow-up Issue (docs/conventions.md § Branch
 /// and PR Workflow): a PR references one with `Refs` and never closes it.
-const ROLLING_TITLE_SUFFIX: &str = ": defects found by review";
+pub const ROLLING_TITLE_SUFFIX: &str = ": defects found by review";
 
 // ── Patterns ──────────────────────────────────────────────────────────────────
 

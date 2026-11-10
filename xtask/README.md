@@ -1001,7 +1001,9 @@ cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
 ```
 
 The command refuses a filing without a class label, without a subsystem label, or without a
-milestone decision (`--unscheduled` is for future-state work no release has scheduled). After
+milestone decision (`--unscheduled` is for future-state work no release has scheduled). It
+refuses a rolling follow-up Issue (a title ending `: defects found by review`) under anything
+but the current milestone, the lowest-versioned open one, which it reads from GitHub. After
 filing it reads the Issue back and fails when a label or the milestone was not applied, naming
 what is missing.
 

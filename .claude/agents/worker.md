@@ -167,9 +167,9 @@ The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a deleg
 
 - State a decision of the maintainer as a decision, in the project's prose ("the maintainer
   decided that ..."). Never quote what they typed in a commit message, a PR body, an Issue, a
-  comment or a tracked file, however it reached you. Their words are kept in the orchestrator's
-  local record only.
-
+  comment or a tracked file, however it reached you (docs/conventions.md § Style). That holds
+  for their acceptance of a SHOULD departure too: the body states it. Their words are kept in
+  the orchestrator's local record only.
 - Subjects are `<scope>: ...`, at most 72 columns, with no Issue reference. Bodies are wrapped
   and carry `Refs #N` for the Issues the commit touches. A closing keyword goes in the PR body
   only (docs/conventions.md § Commit and PR cross-references). `cargo xtask commit-check` checks
@@ -223,6 +223,12 @@ While the orchestrator holds the host for another worker's grant, launch no boot
 timing-sensitive measurement no build either, until it says the grant ended. Run one QEMU of
 your own at a time. A timeout or timing failure of a boot that ran beside another QEMU, and that
 § Coverage tiers does not owe, is re-run once alone before it counts.
+
+A boot that fails, hangs, or shows a kill you did not expect is evidence. Before any re-run,
+copy its saved log, and its `.crash.txt` when there is one, to a name that says what it is (the
+PR, the head, the architecture, the symptom): a re-run that saves logs to the same path
+overwrites them. When the failure matches an open Issue, or a process was killed with a
+signature you cannot explain, send the orchestrator the copied log's path before the re-run.
 
 Run every command through `cargo xtask`. Boot with
 `cargo xtask run-parallel --arch <a> --parallel 1 --runs 1 --timeout <s>`, which boots the same

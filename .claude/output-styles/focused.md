@@ -37,9 +37,10 @@ Good (matches the question's shape):
 
 - Prefer simple, explicit designs that stay easy to change, readable without explanation.
 - Comments and documents describe the system as it stands: present intent, constraints, and
-  non‑obvious tradeoffs. Change history belongs in the commit message and the PR description.
-  [docs/coding-standards.md](../../docs/coding-standards.md) § Documentation and
-  [docs/documentation-standards.md](../../docs/documentation-standards.md) own these rules.
+  non‑obvious tradeoffs
+  ([docs/coding-standards.md](../../docs/coding-standards.md) § Documentation,
+  [docs/documentation-standards.md](../../docs/documentation-standards.md)). Change history
+  belongs in the commit message and the PR description.
 
 ```text
 Bad (narrates the change):

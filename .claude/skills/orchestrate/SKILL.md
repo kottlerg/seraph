@@ -13,9 +13,9 @@ is never reset, so everything you read stays for the whole milestone.
 
 **The session's model.** A supervisor relays, counts and replaces; it makes no project decision.
 Run it on Sonnet 5.5 at medium effort: start the session with `claude --model sonnet`, or run
-`/model sonnet` before `/orchestrate`, and set the effort with `/effort medium`. This skill
-cannot set it: a skill's `model` field lasts one turn. The orchestrator runs on the model its
-agent file names (Fable 5.2 at medium effort) whatever the session's model is, since an agent
+`/model sonnet` before `/orchestrate`, and set the session's effort to medium. This skill
+cannot set either: a skill's `model` field lasts one turn. The orchestrator runs on the model
+and at the effort its agent file names, whatever the session's model is, since an agent
 definition's `model` takes precedence over the session's. When this session runs on a larger
 model, say so once and continue. If relays go wrong on Sonnet (a decision paraphrased, a step
 skipped), raise the effort to high first, and move the supervisor to the orchestrator's model

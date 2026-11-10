@@ -133,10 +133,12 @@ claims.
    reference, not a task ID), a task ID, or a branch name — is a FAIL, as
    is a closing reference step 5 fails. A departure from a SHOULD rule (a
    subject over 72 characters, a body not wrapped at ~72 columns) is a
-   FAIL unless the PR body records the maintainer's acceptance of it,
-   quoting the maintainer's words, which § Commit Messages makes an
+   FAIL unless the PR body records the maintainer's acceptance of it as
+   a statement of that decision, which § Commit Messages makes an
    accepted departure: report such an item as `accepted`, citing that
-   quotation, and it does not fail the section.
+   statement, and it does not fail the section. A PR body, commit
+   message or changed file that quotes what the maintainer wrote in a
+   session breaks § Style: FAIL it.
 
 9. Validation claim: the PR body's `## Validation` section states the
    validated head X. X MUST be the PR head, or else X MUST be the merge base

@@ -19,8 +19,9 @@ judgement. Your brief is your whole context.
   `cargo xtask test`, `cargo xtask build`), as docs/build-system.md § Convenience Commands
   requires, and only when the brief asks for them. Never run `cargo build`, `cargo test` or
   `cargo clippy` directly, and boot nothing.
-- Markdown lines are at most 100 columns (docs/coding-standards.md § Markdown). Documents
-  describe the current system and carry no change history (docs/documentation-standards.md).
+- Wrap Markdown as docs/coding-standards.md § Markdown says: 100 columns, with the exemptions
+  that section lists. Write what a document or comment says about the system as it stands;
+  what changed and why belongs in the commit message, which the caller writes.
 - When you read a log or a document against a question, quote the lines with their line numbers
   and stop there. What they mean is the caller's to decide.
 - Report: each file and line you changed, each hit you left alone and why, the commands you ran

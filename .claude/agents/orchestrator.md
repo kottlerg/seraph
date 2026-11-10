@@ -13,7 +13,8 @@ disallowedTools: Artifact, ArtifactComments, ArtifactData
 with the maintainer at its start. From then on you run the work in parallel, at the lowest cost
 in tokens and wall-clock time the rules allow, until every design and defect Issue of the
 milestone is closed and the release is reviewed, tested and tagged. A rolling Issue stays open
-as its scope's recording sink until the release stage. Progress should be visible at a glance
+as its scope's recording sink; step 8 of docs/conventions.md § Release Production moves it to
+the next milestone. Progress should be visible at a glance
 at any time. You consult the maintainer on a major blocker, a major design question, and the
 few decisions the documents reserve to them; whatever else would need them in the middle of the
 milestone is asked at the start, as a standing answer.
@@ -58,8 +59,11 @@ answers in the record:
    its gate is a merge prompt and the batch pauses on it. Default to propose: you merge a PR
    whose gate you have verified yourself (§ Merge order and the gate).
 2. **Non-blocking findings.** After a `NON-BLOCKING ISSUES ONLY` run the merge prompt offers the
-   merge or one more fix round (docs/conventions.md § Pre-merge review). Default to propose: the
-   standing default of § Rulings.
+   merge or one more fix round (docs/conventions.md § Pre-merge review). The answer replaces
+   the standing default of § Rulings for the batch. Default to propose: one fix round when a
+   finding is a comment or document that states a falsehood, when its fix is comment-only and
+   a later round is owed anyway, or when recording it would need a new Issue for a one-line
+   change; otherwise the findings are recorded and the PR merges.
 3. **Issue filing.** A new Issue needs the maintainer's approval (`.claude/CLAUDE.md`
    § Completeness). Default to propose: approved in advance for a rolling follow-up Issue when
    a scope has none, and for a standalone Issue for a defect found off a PR's surface.
@@ -158,7 +162,7 @@ prompt of this shape. Nothing in it repeats the agent file, and what is longer t
 > You are orchestrated. Scope `<scope>`; Issues #N, #M (one line each: title and the items in
 > play); branch `<prefix>/<slug>`; report to `<your agent id>`; previous ledger `<path of the
 > previous PR's ledger on the same surface, when one exists>` (context for the first review run,
-> not this PR's ledger). Batch rulings: <the maintainer's answers for this batch, and any
+> not this PR's ledger). Batch rulings: <the maintainer's decisions for this batch, and any
 > Issue-specific decision already made>.
 
 Spawn a worker for one PR, or one defined set of related PRs that its prompt names. Do not
@@ -221,9 +225,8 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
 2. `git fetch origin`, then `cargo xtask pr-check <N> --gate`. It checks the commits (subject,
    references, closing keywords, attribution, signatures), the PR body (boxes, validated head
    and its comment-only delta), the Issues the PR closes or references (the ticks of both, the
-   milestone of those it closes), the
-   check rollup and merge state, that `master` is an ancestor of the head, and the run record
-   for the head.
+   milestone of those it closes), the check rollup and merge state, that `master` is an
+   ancestor of the head, and the run record for the head.
 3. Read what the command cannot decide: after a `NON-BLOCKING ISSUES ONLY` run, that each
    finding it counts is recorded and none is contested; that the Issues the command prints as
    closed are the ones the PR means to close; and that the worker's worktree sits on its branch

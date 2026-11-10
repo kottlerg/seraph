@@ -46,7 +46,7 @@ Save both agents' prose as `target/xtask/review/pr<N>/<mode>-<head>.md` and the 
 `<mode>-<head>.json` beside it. `<mode>` is `full` for the first run, `delta` for a later run
 with the reviewer, and `audit` for an auditor-only run or a re-audit; a further run at the same
 head takes the suffix `-<n>`, counting from 2. `xtask/README.md` § `cargo xtask review-check`
-defines the record. Five points it leaves to you:
+defines the record. Four points it leaves to you:
 
 - `stats.run` is the run's number among the PR's runs of every mode, counting from 1: one more
   than the highest `run` among the records already saved. It orders the runs, and the gate
@@ -54,10 +54,6 @@ defines the record. Five points it leaves to you:
 - A finding's `status` is `unverified`, or `nit` for a nit that cannot block, or `contested`
   once the finding is put to the maintainer.
 - `ledgered` holds the findings the reviewer lists under its `Ledger (not re-raised)` heading.
-- A run of the reviewer alone (a first run made while an owed host run is unreported) is a
-  `full` or `delta` record with `audit_verdict` set to `NOT RUN` and `audit` set to `null`. The
-  gate still needs `AUDIT PASS` in the last record at the head, which is then a later `audit`
-  record there.
 - In an `audit` record, `verdict` is the reviewer verdict the audit states, `findings` holds the
   surface findings of the last reviewer run that the audit lists as unfixed, each as that run's
   record states it, and `recorded`, `ledgered` and `dropped` are empty.

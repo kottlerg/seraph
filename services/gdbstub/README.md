@@ -78,10 +78,10 @@ Framing, command parsing, and the target descriptions are `shared/gdb-rsp`
    `argv`.
 4. It attaches (`ATTACH_PROCESS`), paging the thread list, with a cap of its own main thread as
    procmgr's watch ([Detach](#detach)), and binds each listed thread's exception and upcall classes
-   to its fault endpoint under a badge of its own: bit 62 with the index of the stub's table the
-   thread is stored at plus one, bit 63 clear, so the binding is neither the target's process
-   badge nor a crash badge, as procmgr requires of a debugger
-   ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md) § Label 22: `REGISTER_THREAD`). A
+   to its fault endpoint under a badge carrying the debugger tag (`DEBUGGER_BADGE_TAG`, bit 62,
+   bit 63 clear) with the index of the stub's table the thread is stored at plus one, by which
+   procmgr tells a debugger's binding
+   ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`). A
    thread whose bind fails keeps its place in the table, so the indices after it stay those of
    procmgr's list, and is not shown to GDB. A refused or failed page deletes the caps already
    taken and has procmgr drop the watch again (`DETACH_PROCESS`).
@@ -232,10 +232,11 @@ again under its own badge, writes every breakpoint's bytes back through a live t
 left, and resumes every held thread. It answers `FAULT_REPLY_RESUME` for `DRAIN_WAIT`
 ([Limits](#limits)) to each stop that reaches its endpoint meanwhile, first setting a hit of a
 breakpoint it wrote back to the breakpoint's address, so the thread runs the restored bytes. It
-then sends procmgr `DETACH_PROCESS`, which binds the target's main thread back to the crash
-endpoint under its process badge and each registered thread under its crash badge, minting one for
-a thread that registered during the attach, and does so as well when every thread has exited.
-The stub unbinds the upcall class, drops the thread caps, and logs
+then sends procmgr `DETACH_PROCESS`, which binds each listed thread whose exception class is
+bound under the debugger tag, is unbound, or is bound by procmgr under another badge back to the
+crash endpoint, leaves a thread bound to any other handler, and unbinds each upcall class bound
+under the debugger tag, and does so as well when every thread has exited. The stub's own unbind of
+the upcall class after it changes nothing. The stub drops the thread caps and logs
 `detached from <name> (crash bindings restored: <bool>)`. The stub
 cannot restore the crash bindings itself, since it holds no SEND on procmgr's crash endpoint. A
 handler the target had bound on a thread's exception or upcall class itself, which the attach's

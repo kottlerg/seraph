@@ -87,6 +87,24 @@ pub struct StartupBlobs<'a>
     pub env_count: u64,
 }
 
+/// Mint a `DEBUG_AUTHORITY` `SEND|GRANT` on procmgr for a `debug_authority`
+/// service's bootstrap round, from the un-badged procmgr source init endows;
+/// `GRANT` because `REGISTER_CRASH_SERVICE` transfers a cap. `0` when the
+/// source is absent or the derive fails, and the slot is then absent.
+pub(crate) fn mint_debug_authority(ctx: &RestartCtx) -> u64
+{
+    if ctx.procmgr_death_auth_source == 0
+    {
+        return 0;
+    }
+    syscall::cap_derive_badge(
+        ctx.procmgr_death_auth_source,
+        syscall::RIGHTS_EP_SEND_GRANT,
+        procmgr_labels::DEBUG_AUTHORITY,
+    )
+    .unwrap_or(0)
+}
+
 /// Walk svcmgr's root for `path`, then call procmgr `CREATE_FROM_FILE`.
 /// Returns the freshly created (suspended) process, or `None` (each arm
 /// logged) when the argv/env cap cannot be built
@@ -500,11 +518,17 @@ fn restart_boot_caps(
         return Some(mint_logd_boot_caps(ctx, LaunchKind::Restart));
     }
 
-    let restart_caps: Vec<u64> = match recipe
+    let mut restart_caps: Vec<u64> = match recipe
     {
         Some(r) => resolve_seeds(&r.seed, svc.name_str(), registry),
         None => Vec::new(),
     };
+    // A debug-authority holder's authority cap rides the slot after its
+    // seeds, as on first launch.
+    if matches!(recipe, Some(r) if r.debug_authority)
+    {
+        restart_caps.push(mint_debug_authority(ctx));
+    }
 
     let provided_recv = if svc.provided_endpoint != 0
     {

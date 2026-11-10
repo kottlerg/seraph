@@ -144,6 +144,10 @@ pub struct RestartRecipe
     /// reserved log-sink sources (with no `HANDOVER_PULL` SEND), not from
     /// `seed`/provider caps. See `definitions::launch::mint_logd_boot_caps`.
     pub log_sink: bool,
+    /// The `debug_authority = yes` service: a freshly minted
+    /// `DEBUG_AUTHORITY` cap rides the slot after its seeds on every launch.
+    /// See `restart::mint_debug_authority`.
+    pub debug_authority: bool,
     /// Recipe `priority = ...` value; `0` = unspecified (procmgr default).
     /// Replayed on every restart so a respawned child lands at the same
     /// level it got on first launch.

@@ -1479,8 +1479,10 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, pro
 }
 
 /// Why [`handle_fault`] declined a fault: the low 32 bits of the decline-reason
-/// word its `FAULT_REPLY_KILL` reply carries in data word 0, which the kernel
-/// prints in its kill diagnostic (docs/fault-handling.md § Reply). The values
+/// word its `FAULT_REPLY_FORWARD` reply carries in data word 0, which the
+/// kernel hands to the exception handler as the forwarded message's data
+/// word 4, or prints in its kill diagnostic when none is bound
+/// (docs/fault-handling.md § Reply). The values
 /// are memmgr's wire contract, tabled in
 /// `services/memmgr/docs/ipc-interface.md` § Kernel-origin fault message.
 #[derive(Clone, Copy)]
@@ -1508,13 +1510,19 @@ enum FaultDecline
     MapFailed = 9,
 }
 
-/// Reply `FAULT_REPLY_KILL` to the faulting thread, with data word 0 the
+/// Decline the fault with `FAULT_REPLY_FORWARD`, with data word 0 the
 /// reason word: `reason` in its low 32 bits and `detail` (the failed
-/// syscall's error magnitude, or 0) in its high 32.
+/// syscall's error magnitude, or 0) in its high 32. The kernel hands the
+/// fault, with the reason word, to the faulting thread's exception handler
+/// (the crash endpoint procmgr binds, for a report before the kill); with
+/// none bound, or on a delivery that is not of the virtual-memory class, the
+/// forward is a `FAULT_REPLY_KILL` carrying the same reason word
+/// (docs/fault-handling.md § Reply). memmgr depends on no handler it
+/// forwards to: the reply never blocks.
 fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 {
     let word = (detail << 32) | u64::from(reason as u32);
-    let reply = IpcMessage::builder(syscall_abi::FAULT_REPLY_KILL)
+    let reply = IpcMessage::builder(syscall_abi::FAULT_REPLY_FORWARD)
         .word(0, word)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -1540,7 +1548,8 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// non-VM fault, unknown process, address outside every region, an access
 /// the region's protection does not grant ([`region_grants`]), no delegated
 /// AS, or any allocation/map failure — replies
-/// [`syscall_abi::FAULT_REPLY_KILL`], preserving default segfault semantics,
+/// [`syscall_abi::FAULT_REPLY_FORWARD`], preserving default segfault
+/// semantics once the exception handler, if any, has seen the fault,
 /// with the [`FaultDecline`] that refused it in data word 0 ([`decline_fault`]).
 ///
 /// The chunk is accounted to the process record (reclaimed on `PROCESS_DIED` /

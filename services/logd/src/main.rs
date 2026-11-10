@@ -102,6 +102,19 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = startup.ipc_buffer.cast::<u64>();
 
+    // Every process's log output, a debug-authority holder's own included,
+    // waits on logd, so a holder that stopped it would block on itself:
+    // declare this process undebuggable before it spawns a thread
+    // (`procmgr_labels::DECLARE_NO_DEBUG`). A refusal leaves it debuggable.
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe {
+        ipc::ipc_call(
+            startup.procmgr_endpoint,
+            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_DEBUG),
+            ipc_buf,
+        )
+    };
+
     let Some(caps) = bootstrap_caps(startup.creator_endpoint, ipc_buf)
     else
     {

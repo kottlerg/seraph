@@ -81,7 +81,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 9;
+pub const PROCMGR_LABELS_VERSION: u32 = 10;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -440,6 +440,62 @@ pub mod procmgr_labels
     /// Badges one [`QUERY_LIVE_PROCESSES`] reply carries at most: every data
     /// word after the count.
     pub const LIVE_PROCESSES_PAGE: usize = super::MSG_DATA_WORDS_MAX - 1;
+
+    /// Register the caller as the crash service: the receiver of procmgr's
+    /// crash endpoint, which procmgr binds the exception class of every
+    /// process it creates to, badged with its process badge, until the
+    /// process sends [`DECLARE_NO_DEBUG`]. Served only on a badge carrying
+    /// [`DEBUG_AUTHORITY`]
+    /// (`UNAUTHORIZED` otherwise). Caps: `[thread]`, a Thread cap of the
+    /// service's main thread, which procmgr keeps to tell when the service is
+    /// gone and take the receive side back. Replies `SUCCESS` with
+    /// one cap, `RECV` on the crash endpoint; `CRASH_SERVICE_PRESENT` while a
+    /// registered service lives; `INVALID_ARGUMENT` without the thread cap.
+    /// Specified in `services/procmgr/docs/ipc-interface.md` §
+    /// `REGISTER_CRASH_SERVICE`.
+    pub const REGISTER_CRASH_SERVICE: u64 = 19;
+
+    /// Attach to a process: the Thread caps procmgr holds for it, each with
+    /// `OBSERVE`, `CONTROL`, and `UPCALL`, and where its image lies. Served
+    /// only on a badge carrying [`DEBUG_AUTHORITY`] (`UNAUTHORIZED`
+    /// otherwise). `data[0]` is the target's process badge and `data[1]` the
+    /// index of the first thread to return. Replies `SUCCESS` with
+    /// `data[0]` the number of threads procmgr holds for the target,
+    /// `data[1]` its load bias, `data[2]`/`data[3]` the start and end of its
+    /// biased text, and `data[4]` the address of its `ProcessInfo` page, and
+    /// with the caps of threads `data[1]..` of the request, at most
+    /// [`ATTACH_THREADS_PAGE`]; `INVALID_BADGE` when no live process carries
+    /// the badge (memmgr and procmgr, which procmgr did not create, among
+    /// them); `NOT_ATTACHABLE` when the target sent [`DECLARE_NO_DEBUG`].
+    /// Specified in `services/procmgr/docs/ipc-interface.md`
+    /// § `ATTACH_PROCESS`.
+    pub const ATTACH_PROCESS: u64 = 20;
+
+    /// The caller declares itself undebuggable, on its own procmgr cap (its
+    /// process badge names it): procmgr unbinds its main thread's exception
+    /// class from the crash endpoint and refuses [`ATTACH_PROCESS`] on it
+    /// from then on, so no [`DEBUG_AUTHORITY`] holder stops it. Sent, before
+    /// it spawns a thread, by each process a stop of which would deadlock a
+    /// debug-authority holder: the log sink, the serial driver, and every
+    /// debug-authority holder. No data, no caps. Replies `SUCCESS`, or
+    /// `INVALID_BADGE` when the badge names no live process. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_DEBUG`.
+    pub const DECLARE_NO_DEBUG: u64 = 21;
+
+    /// Thread caps one [`ATTACH_PROCESS`] reply carries at most.
+    pub const ATTACH_THREADS_PAGE: usize = super::MSG_CAP_SLOTS_MAX;
+
+    /// Badge bit on procmgr service caps that authorises
+    /// [`REGISTER_CRASH_SERVICE`] and [`ATTACH_PROCESS`]. svcmgr mints it for
+    /// a service whose definition sets `debug_authority = yes`; no other
+    /// path mints it. Who holds it is in
+    /// `services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`.
+    pub const DEBUG_AUTHORITY: u64 = 1u64 << 60;
+    const _: () = core::assert!(
+        DEBUG_AUTHORITY & crate::VERB_BIT_MASK != 0
+            && DEBUG_AUTHORITY != DEATH_EQ_AUTHORITY
+            && DEBUG_AUTHORITY != HOLD_RELEASE_AUTHORITY
+    );
 
     /// Hand init's kernel-object caps and reclaimable Memory caps to
     /// procmgr for the reap after init exits; init calls it on its exit
@@ -3087,6 +3143,12 @@ pub mod procmgr_errors
     /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
     /// (**argv and env**).
     pub const ARGV_ENV_STILL_MAPPED: u64 = 14;
+    /// `procmgr_labels::ATTACH_PROCESS` refused: the target declared itself
+    /// undebuggable (`procmgr_labels::DECLARE_NO_DEBUG`).
+    pub const NOT_ATTACHABLE: u64 = 15;
+    /// `procmgr_labels::REGISTER_CRASH_SERVICE` refused: a registered crash
+    /// service still lives.
+    pub const CRASH_SERVICE_PRESENT: u64 = 16;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }

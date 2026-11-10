@@ -765,6 +765,43 @@ fn phys_access_refused(procmgr: u64)
     );
 }
 
+/// procmgr refuses `ATTACH_PROCESS` and `REGISTER_CRASH_SERVICE` from
+/// svctest, whose procmgr cap carries no `DEBUG_AUTHORITY`, with
+/// `UNAUTHORIZED`, whatever badge the request names: the authority check
+/// precedes the target lookup (`services/procmgr/docs/ipc-interface.md`
+/// § `ATTACH_PROCESS`).
+fn debug_authority_refused(procmgr: u64)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    for target in [0, u64::MAX >> 4]
+    {
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
+                .word(0, target)
+                .word(1, 0)
+                .cap(spare_cap())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "ATTACH_PROCESS without DEBUG_AUTHORITY",
+        );
+    }
+    let thread = syscall::cap_derive(
+        std::os::seraph::thread::current_thread_cap(),
+        syscall::RIGHTS_THREAD_OBSERVE,
+    )
+    .expect("deriving a thread cap to register failed");
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(procmgr_labels::REGISTER_CRASH_SERVICE)
+            .cap(thread)
+            .build(),
+        procmgr_errors::UNAUTHORIZED,
+        "REGISTER_CRASH_SERVICE without DEBUG_AUTHORITY",
+    );
+}
+
 /// Look up `/programs/hello` and return `(file_cap, size)`.
 fn hello_file() -> (u64, u64)
 {
@@ -787,7 +824,9 @@ fn hello_file() -> (u64, u64)
 /// any badged sender, an unknown opcode, a `CREATE_FROM_FILE` that sets
 /// `CREATE_DEATH_RELAY` on a message whose only cap is the file cap, a
 /// `CREATE_FROM_FILE` asking `CREATE_PHYS_ACCESS` (a phys-class child) from
-/// svctest, which is not phys-class, and a `CONFIGURE_PIPE` with an unknown
+/// svctest, which is not phys-class, `ATTACH_PROCESS` and
+/// `REGISTER_CRASH_SERVICE` from a sender without the `DEBUG_AUTHORITY` badge,
+/// and a `CONFIGURE_PIPE` with an unknown
 /// direction or for a direction already configured. Each refused request
 /// carries caps. procmgr's slot count is not observable from a client, so
 /// each cell asserts the refusal reply, and a
@@ -866,6 +905,7 @@ pub fn procmgr_refusals_phase(_: &Caps)
             "CREATE_FROM_FILE with the relay flag and only the file cap",
         );
         phys_access_refused(procmgr);
+        debug_authority_refused(procmgr);
     }
 
     configure_pipe_refusals();

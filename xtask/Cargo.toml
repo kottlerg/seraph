@@ -34,8 +34,13 @@ libc = "0.2"
 # pointing at the install package, rather than the OS's opaque
 # "No such file or directory" from Command::spawn.
 which = "8"
+# The crash-report block's parser: test-crash-report reads the blocks with
+# the crate crashd emits them with, not a copy of their grammar.
+crash-report = { path = "../shared/crash-report" }
 
 [dev-dependencies]
+# The normalized exception codes test-crash-report's tests build reports with.
+syscall-abi = { path = "../abi/syscall" }
 # logd's reclaim-line formatter (`logd_codec::reclaim`): test-logd-reclaim's
 # parser is tested against the line logd formats, not a copy of its shape.
 logd-codec = { path = "../services/logd/codec" }

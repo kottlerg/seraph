@@ -203,6 +203,19 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
+    // logd writes every log line through this driver, so a debug-authority
+    // holder that stopped it would block on its own log output: declare this
+    // process undebuggable before it spawns a thread
+    // (`procmgr_labels::DECLARE_NO_DEBUG`). A refusal leaves it debuggable.
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe {
+        ipc::ipc_call(
+            info.procmgr_endpoint,
+            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_DEBUG),
+            ipc_buf,
+        )
+    };
+
     let Some(caps) = bootstrap_caps(info.creator_endpoint, ipc_buf)
     else
     {

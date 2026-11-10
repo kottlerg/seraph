@@ -149,6 +149,48 @@ pub struct ProcessEntry
     /// its memmgr reclaim back until its creator's `RELEASE_HOLD`
     /// ([`DmaHolds`]).
     pub dma_hold: bool,
+    /// Set by the child's `DECLARE_NO_DEBUG` ([`ProcessTable::declare_no_debug`]):
+    /// procmgr unbound its crash handler and refuses `ATTACH_PROCESS` on it
+    /// ([`attach_target`]).
+    pub no_debug: bool,
+    /// Where the loader placed the child's image, which `ATTACH_PROCESS`
+    /// reports.
+    pub image: ImageSpan,
+}
+
+/// Where the loader placed a child's image: the load bias it drew and the
+/// biased bounds of the image's executable segments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageSpan
+{
+    /// The bias added to every ELF address of the image.
+    pub load_bias: u64,
+    /// Lowest biased address of an executable segment; `0` with none.
+    pub text_start: u64,
+    /// One past the highest biased address of an executable segment; `0`
+    /// with none.
+    pub text_end: u64,
+}
+
+impl ImageSpan
+{
+    /// Widen the text bounds to cover the executable segment
+    /// `[start, end)` (biased); an empty segment changes nothing.
+    pub fn add_text(&mut self, start: u64, end: u64)
+    {
+        if start >= end
+        {
+            return;
+        }
+        if self.text_start == self.text_end
+        {
+            self.text_start = start;
+            self.text_end = end;
+            return;
+        }
+        self.text_start = self.text_start.min(start);
+        self.text_end = self.text_end.max(end);
+    }
 }
 
 impl ProcessEntry
@@ -376,6 +418,26 @@ impl ProcessTable
         Some(&mut self.entries[idx])
     }
 
+    /// Mark the live entry whose badge matches undebuggable
+    /// (`DECLARE_NO_DEBUG`, sent on the child's own procmgr cap). Returns its
+    /// main-thread cap slot, whose exception class procmgr then unbinds;
+    /// `None` when the badge names no live entry.
+    #[must_use]
+    pub fn declare_no_debug(&mut self, badge: u64) -> Option<u64>
+    {
+        let entry = self.find_mut_by_badge(badge)?;
+        entry.no_debug = true;
+        Some(entry.thread_cap)
+    }
+
+    /// The live entry whose badge matches.
+    #[must_use]
+    pub fn find_by_badge(&self, badge: u64) -> Option<&ProcessEntry>
+    {
+        let idx = self.index_of_badge(badge)?;
+        Some(&self.entries[idx])
+    }
+
     /// Remove and return the entry whose badge matches. The death dispatch
     /// resolves a death event's correlator, the full badge, through it; a
     /// stale correlator (entry already reaped) returns `None`, and the caller
@@ -484,6 +546,57 @@ pub fn child_memmgr_flags(
     let creator_is_phys = creator_badge == 0
         || creator_memmgr_badge.is_some_and(|b| b & ipc::memmgr_labels::PHYS_CLASS_BADGE_BIT != 0);
     creator_is_phys.then_some(ipc::memmgr_labels::REGISTER_PHYS_CLASS)
+}
+
+// ── Debug authority ─────────────────────────────────────────────────────────
+
+/// Why procmgr refuses an `ATTACH_PROCESS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachRefusal
+{
+    /// The caller's badge lacks `procmgr_labels::DEBUG_AUTHORITY`
+    /// (`UNAUTHORIZED`).
+    Unauthorized,
+    /// No live process carries the target badge (`INVALID_BADGE`). memmgr
+    /// and procmgr, which procmgr did not create, are never in the table.
+    Unknown,
+    /// The target declared itself undebuggable
+    /// (`procmgr_labels::DECLARE_NO_DEBUG`; `NOT_ATTACHABLE`): the log sink,
+    /// the serial driver, and every debug-authority holder, the caller among
+    /// them.
+    NotAttachable,
+}
+
+/// Whether a request on procmgr's endpoint badged `caller_badge` carries
+/// `procmgr_labels::DEBUG_AUTHORITY`.
+#[must_use]
+pub fn debug_authorized(caller_badge: u64) -> bool
+{
+    caller_badge & ipc::procmgr_labels::DEBUG_AUTHORITY != 0
+}
+
+/// The entry an `ATTACH_PROCESS` from `caller_badge` for `target` reaches,
+/// or why it is refused: the caller's authority first, then the target's
+/// presence, then its no-debug mark.
+///
+/// # Errors
+/// The [`AttachRefusal`] that refuses it.
+pub fn attach_target(
+    table: &ProcessTable,
+    caller_badge: u64,
+    target: u64,
+) -> Result<&ProcessEntry, AttachRefusal>
+{
+    if !debug_authorized(caller_badge)
+    {
+        return Err(AttachRefusal::Unauthorized);
+    }
+    let entry = table.find_by_badge(target).ok_or(AttachRefusal::Unknown)?;
+    if entry.no_debug
+    {
+        return Err(AttachRefusal::NotAttachable);
+    }
+    Ok(entry)
 }
 
 // ── Spawn scheduling resolution ──────────────────────────────────────────────
@@ -661,7 +774,81 @@ mod tests
             process_info_va: 0,
             started: false,
             dma_hold: false,
+            no_debug: false,
+            image: ImageSpan::default(),
         }
+    }
+
+    #[test]
+    fn an_attach_needs_the_debug_authority_badge()
+    {
+        use ipc::procmgr_labels::{DEATH_EQ_AUTHORITY, DEBUG_AUTHORITY};
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(0x1234)).unwrap();
+        for badge in [0, 0x1234, DEATH_EQ_AUTHORITY]
+        {
+            assert_eq!(
+                attach_target(&table, badge, 0x1234).map(ProcessEntry::badge),
+                Err(AttachRefusal::Unauthorized)
+            );
+        }
+        assert_eq!(
+            attach_target(&table, DEBUG_AUTHORITY, 0x1234).map(ProcessEntry::badge),
+            Ok(0x1234)
+        );
+    }
+
+    #[test]
+    fn an_attach_to_a_process_procmgr_does_not_hold_is_unknown()
+    {
+        // memmgr and procmgr are never in the table, and neither is a reaped
+        // child.
+        let table = ProcessTable::new();
+        assert_eq!(
+            attach_target(&table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x99).map(|e| e.badge),
+            Err(AttachRefusal::Unknown)
+        );
+    }
+
+    #[test]
+    fn an_attach_to_a_process_that_declared_no_debug_is_refused()
+    {
+        // The log sink, the serial driver, and every debug-authority holder,
+        // the caller among them, declare themselves undebuggable.
+        let mut table = ProcessTable::new();
+        let mut marked = entry_with_badge(0x77);
+        marked.thread_cap = 41;
+        table.insert(marked).unwrap();
+        table.insert(entry_with_badge(0x78)).unwrap();
+        assert_eq!(table.declare_no_debug(0x77), Some(41));
+        assert_eq!(
+            attach_target(&table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x77).map(|e| e.badge),
+            Err(AttachRefusal::NotAttachable)
+        );
+        // The declaration marks its sender alone.
+        assert_eq!(
+            attach_target(&table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x78).map(|e| e.badge),
+            Ok(0x78)
+        );
+    }
+
+    #[test]
+    fn a_declaration_from_a_badge_with_no_live_process_marks_nothing()
+    {
+        let mut table = ProcessTable::new();
+        assert_eq!(table.declare_no_debug(0x77), None);
+    }
+
+    #[test]
+    fn the_text_span_covers_every_executable_segment_and_skips_empty_ones()
+    {
+        let mut span = ImageSpan::default();
+        span.add_text(0x5000, 0x5000);
+        assert_eq!((span.text_start, span.text_end), (0, 0));
+        span.add_text(0x3000, 0x4000);
+        span.add_text(0x8000, 0x9000);
+        span.add_text(0x1000, 0x2000);
+        assert_eq!((span.text_start, span.text_end), (0x1000, 0x9000));
     }
 
     #[test]

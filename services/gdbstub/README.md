@@ -118,11 +118,22 @@ stub's endpoint.
   file reads at the pointer the message carries. Any other stop makes it refresh its table: it
   pages procmgr's thread list (`ATTACH_PROCESS`) from the count of the table's threads still
   alive, since procmgr lists those first and in the same order, retaking the page when one of them
-  exits meanwhile (`REFRESH_TRIES` times), and binds each new thread under its own badge. The bind
-  delivers the new thread's stop again under that badge
-  ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and Kill, Rebind),
-  and the stub answers the first delivery, which the bind cancelled. A stop the refresh finds no
-  thread for (the table is full, or the thread never registered) is resumed.
+  exits meanwhile (`REFRESH_TRIES` times), and binds each new thread under its own badge, in the
+  slot of an exited thread or after the last. The bind delivers the new thread's stop again under
+  that badge ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and Kill,
+  Rebind), and the stub declines the first delivery, which the bind cancelled, so the decline does
+  nothing. Then:
+  - When the named thread is held and GDB has not been told the target stopped, the stop and the
+    held one are two deliveries under one badge, one the thread's own and the other a new
+    thread's or one the kernel made again, and which is live is unknown: the stub sets the
+    thread's pointer back to a breakpoint it took, as for a hit it does not report (below), and
+    resumes both, so the thread runs its stopping instruction again and stops anew.
+  - When the named thread is held and reported, the refresh bound no thread, and the stop repeats
+    the held one, the kernel made the held delivery again, and the stop replaces it.
+  - Any other stop is declined: an upcall resumes, and a fault is answered `FAULT_REPLY_KILL`, so
+    a thread the stub cannot bind (the table is full, or the thread never registered) takes the
+    outcome its fault has with no handler bound, rather than resuming past a breakpoint or
+    faulting again for ever.
 - **Stop replies.** A stop reports the stopping thread (`T<sig>thread:<id>;`) with the signal its
   fault maps to: `SIGTRAP` for a breakpoint or a step, `SIGILL`, `SIGBUS`, `SIGFPE` for those
   exceptions, `SIGSEGV` for any other fault and a page fault the pager forwarded, and `SIGINT` for
@@ -140,7 +151,11 @@ stub's endpoint.
   instruction's decode gives and removed at the step's stop, with the hazards
   [docs/fault-handling.md](../../docs/fault-handling.md) § Debugging lists for that route. An
   all-stop that ends otherwise (GDB's interrupt, another thread's stop) undoes the step once its
-  thread is held, so no trap flag or planted `c.ebreak` outlives it.
+  thread is held, and the planted `c.ebreak` is written back through any live thread once the
+  stepped one has exited. A detach whose stepped thread an all-stop left running stops the target
+  once more and writes the `c.ebreak` back whatever comes; a trap flag on an x86-64 thread that
+  never stopped stays set, which the stub logs, and the thread's next instruction then traps to
+  the crash endpoint.
 - **Resuming.** `c`, `C`, `s`, `S`, and `vCont` act on the current thread or the one the action
   names; an address the packet gives becomes that thread's pointer first. A signal passed to a
   thread stopped on a fault declines the fault (`FAULT_REPLY_KILL`), so a step that passes one is a
@@ -213,18 +228,20 @@ still attached.
 
 | Bound | Value | Past it |
 |---|---|---|
-| `MAX_THREADS` | 32 threads per attach, refreshes included | listed threads past it are left bound to the crash endpoint and are not shown to GDB; a thread spawned after the attach past it runs under its spawner's binding, its stops resumed |
+| `MAX_THREADS` | 32 live threads per attach, refreshes included; an exited thread's slot is taken again | listed threads past it are left bound to the crash endpoint and are not shown to GDB; a thread spawned after the attach past it runs under its spawner's binding, its upcalls resumed and its faults declined |
 | `STOP_WAIT` | 2 s per all-stop | a thread whose upcall has not arrived runs on |
 | `FIND_ATTEMPTS` × `FIND_INTERVAL` | 600 × 100 ms, for the port and for the target at startup | the stub ends (no port) or serves detached (no target) |
 | `REATTACH_ATTEMPTS` × `FIND_INTERVAL` | 50 × 100 ms, for the target at a `qSupported` that finds the stub detached | the stub stays detached; `?` reports the target exited |
-| `REFRESH_TRIES` | 3 pages per refresh | the stop is resumed unclaimed, and the next stop that is not its thread's own refreshes again |
+| `REFRESH_TRIES` | 3 pages per refresh | the stop is settled as no new thread's, and the next stop that is not its thread's own refreshes again |
 | `DRAIN_WAIT`, `DRAIN_QUIET` | 500 ms, ended early by 50 ms with no stop, per detach | a stop that reaches the stub's endpoint later is answered by the next attach |
 | `POLL_MS` | 10 ms | the serve loop's wait for port bytes between looks at the threads' stops |
 
 A thread spawned after the attach that stops at the same pointer as its spawner while the
 spawner's own stop is in flight can be credited with the spawner's stop until the spawner's stop
-arrives and refreshes the table. The stub's thread ids are table indices, not kernel thread
-identities.
+arrives; the restart above then runs the spawner's stopping instruction again. When the second
+thread is one the stub cannot bind, both deliveries are live and both are resumed, so on x86-64
+that thread, at a breakpoint, resumes past it. The stub's thread ids are table indices, not kernel
+thread identities, and the id of an exited thread names the thread that takes its slot.
 
 Each bound's entry is in [docs/limits.md](../../docs/limits.md) § Other services.
 

@@ -80,12 +80,18 @@ pub fn prepare_step(thread: u64, regs: &mut [u8]) -> Result<StepUndo, StepError>
     Ok(StepUndo { addr: next, saved })
 }
 
-/// Write the bytes [`prepare_step`] saved back over its `c.ebreak`.
-pub fn finish_step(thread: u64, undo: StepUndo, _regs: &mut [u8])
+/// Undo the text part of [`prepare_step`]: write the bytes it saved back
+/// over its `c.ebreak`, through `thread`, any thread of the target, the
+/// stepped one or another, since the text is the whole space's.
+pub fn finish_step_text(thread: u64, undo: StepUndo)
 {
     // SAFETY: as in prepare_step: the target's text, through the kernel's
-    // text route, with the target's other threads stopped.
+    // text route, with the target's threads held as far as the stub could
+    // hold them.
     let _ = unsafe {
         syscall::thread_write_mem(thread, undo.addr, &undo.saved, syscall_abi::THREAD_MEM_TEXT)
     };
 }
+
+/// Undo the register part of [`prepare_step`]: none on riscv64.
+pub fn finish_step_regs(_undo: StepUndo, _regs: &mut [u8]) {}

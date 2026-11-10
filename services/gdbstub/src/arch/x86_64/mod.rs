@@ -35,9 +35,12 @@ pub fn prepare_step(_thread: u64, regs: &mut [u8]) -> Result<StepUndo, StepError
     Ok(StepUndo)
 }
 
-/// Undo [`prepare_step`] once the step's stop arrived: clear the trap flag
-/// in `regs`, which the caller writes back.
-pub fn finish_step(_thread: u64, _undo: StepUndo, regs: &mut [u8])
+/// Undo the text part of [`prepare_step`]: none on x86-64.
+pub fn finish_step_text(_thread: u64, _undo: StepUndo) {}
+
+/// Undo the register part of [`prepare_step`] once the stepped thread is
+/// held: clear the trap flag in `regs`, which the caller writes back.
+pub fn finish_step_regs(_undo: StepUndo, regs: &mut [u8])
 {
     update_flags(regs, |f| f & !syscall_abi::X86_64_RFLAGS_TF);
 }

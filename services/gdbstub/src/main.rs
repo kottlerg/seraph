@@ -22,7 +22,7 @@ use gdb_rsp::command::{BreakpointType, Command, ThreadId, ThreadOp, VContActions
 use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
 use gdb_rsp::target::TARGET_XML_ANNEX;
 use gdbstub::breakpoints::{self, Breakpoints};
-use gdbstub::control::{self, Credit, Plan};
+use gdbstub::control::{self, Credit, Named, Plan, Unclaimed};
 use gdbstub::{regs, signal, stop_signal};
 use ipc::{
     IpcMessage, devmgr_errors, devmgr_labels, procmgr_errors, procmgr_labels, serial_errors,
@@ -312,16 +312,16 @@ fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Send
 
 // ── The target ───────────────────────────────────────────────────────────────
 
-/// One thread of the target, at the index of procmgr's thread list it was
-/// listed at.
+/// One thread of the target, at the index of the stub's table it was stored
+/// at: the attach stores procmgr's list in order, and a refresh stores each
+/// new thread in the slot of an exited one, or after the last.
 struct Thread
 {
     /// The attach's cap, with `OBSERVE`, `CONTROL`, and `UPCALL`.
     cap: u64,
     /// The thread's classes are bound to the stub's endpoint under
     /// `control::thread_badge` of its index; an unbound thread (its bind
-    /// failed) keeps its place, so later indices stay in step with
-    /// procmgr's list, and is not shown to GDB.
+    /// failed) keeps its slot while it lives and is not shown to GDB.
     bound: bool,
     /// The receiver holding the thread's stop, while it is stopped.
     held: Option<Stop>,
@@ -435,30 +435,51 @@ impl Stub
             self.add_thread(cap);
         }
         self.current = 0;
+        // The target runs until this all-stop holds it; GDB has been told of
+        // no stop.
+        self.running = true;
         self.stop_all();
         std::os::seraph::log!("{READY_MARKER} ({})", self.name);
     }
 
-    /// Append `cap` to the thread table, binding it under the index it is
-    /// stored at.
+    /// Store `cap` in the thread table, in the slot of an exited thread
+    /// ([`control::free_slot`]) or after the last, binding it under the
+    /// index it is stored at.
     fn add_thread(&mut self, cap: u64)
     {
-        let Some(index) = self.target.as_ref().map(|t| t.threads.len())
+        let Some((index, reused)) = self.target.as_ref().map(|t| {
+            control::free_slot(t.threads.iter().map(|t| (t.gone, t.held.is_some())))
+                .map_or((t.threads.len(), false), |i| (i, true))
+        })
         else
         {
             let _ = syscall::cap_delete(cap);
             return;
         };
+        // A step whose thread exited is undone before its slot is taken.
+        if reused && self.stepping.is_some_and(|s| s.thread == index)
+        {
+            self.finish_stepping();
+        }
         let bound = self.ensure_receiver(index) && bind_thread(self.endpoint, cap, index);
+        let thread = Thread {
+            cap,
+            bound,
+            held: None,
+            posted: false,
+            gone: !bound && !thread_alive(cap),
+        };
         if let Some(target) = &mut self.target
         {
-            target.threads.push(Thread {
-                cap,
-                bound,
-                held: None,
-                posted: false,
-                gone: !bound && !thread_alive(cap),
-            });
+            if reused
+            {
+                let old = core::mem::replace(&mut target.threads[index], thread);
+                let _ = syscall::cap_delete(old.cap);
+            }
+            else
+            {
+                target.threads.push(thread);
+            }
         }
     }
 
@@ -485,9 +506,10 @@ impl Stub
         let badge = target.badge;
         for _ in 0..REFRESH_TRIES
         {
+            // Exited threads' slots are taken again, so only the live ones
+            // count toward the bound.
             let alive = self.alive_count();
-            let room =
-                MAX_THREADS.saturating_sub(self.target.as_ref().map_or(0, |t| t.threads.len()));
+            let room = MAX_THREADS.saturating_sub(alive);
             let Some(page) =
                 attach_process(self.debug, badge, alive as u64, None, room, self.ipc_buf)
             else
@@ -628,74 +650,133 @@ impl Stub
 
     /// Record `stop` as its thread's held stop; returns the thread's index.
     /// A stop that is not the thread's own ([`control::credit`]) comes from
-    /// a thread spawned after the attach under its spawner's badge: the
-    /// stub refreshes its thread list, whose bind delivers that stop again
-    /// under the new thread's badge, and answers this delivery, which the
-    /// bind cancelled.
+    /// a thread spawned after the attach under its spawner's badge, or is a
+    /// delivery the kernel made again: the stub refreshes its thread list,
+    /// whose bind delivers a new thread's stop again under its own badge,
+    /// and settles the stop as [`control::settle`] says.
     fn hold(&mut self, stop: Stop) -> Option<usize>
     {
         let index = control::thread_index(stop.badge);
-        let Some(thread) = index.and_then(|i| self.target.as_ref()?.threads.get(i))
+        let Some((i, thread)) =
+            index.and_then(|i| Some((i, self.target.as_ref()?.threads.get(i)?)))
         else
         {
-            self.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
+            self.reply(stop.receiver, control::decline_label(stop.kind));
             return None;
         };
-        let held = thread.held.is_some();
-        let regs_pc = if held { None } else { read_pc(thread.cap) };
-        match control::credit(held, regs_pc, stop.ip)
+        let held = thread.held;
+        let regs_pc = if held.is_some()
         {
-            Credit::Own =>
+            None
+        }
+        else
+        {
+            read_pc(thread.cap)
+        };
+        if control::credit(held.is_some(), regs_pc, stop.ip) == Credit::Own
+        {
+            if let Some(t) = self.target.as_mut().and_then(|t| t.threads.get_mut(i))
             {
-                if let Some(t) = index.and_then(|i| self.target.as_mut()?.threads.get_mut(i))
+                t.held = Some(stop);
+                t.posted = false;
+            }
+            return Some(i);
+        }
+        let added = self.refresh();
+        let repeats =
+            held.is_some_and(|h| (h.kind, h.detail, h.ip) == (stop.kind, stop.detail, stop.ip));
+        let named = match (held, self.running)
+        {
+            (None, _) => Named::Free,
+            (Some(_), true) => Named::Unreported,
+            (Some(_), false) => Named::Reported,
+        };
+        match control::settle(named, added, repeats)
+        {
+            Unclaimed::Restart => self.restart(i, stop),
+            Unclaimed::Replace =>
+            {
+                if let Some(t) = self.target.as_mut().and_then(|t| t.threads.get_mut(i))
                 {
                     t.held = Some(stop);
-                    t.posted = false;
                 }
-                index
+                // The replaced delivery was cancelled; its reply is ignored.
+                if let Some(old) = held
+                {
+                    self.reply(old.receiver, syscall_abi::FAULT_REPLY_RESUME);
+                }
             }
-            Credit::Unknown =>
-            {
-                self.refresh();
-                self.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
-                None
-            }
+            Unclaimed::Decline => self.reply(stop.receiver, control::decline_label(stop.kind)),
         }
+        None
+    }
+
+    /// Resume both the held stop of thread `index` and `stop`, a second
+    /// delivery under its badge, after rewinding the thread's breakpoint hit:
+    /// whichever delivery is live runs the thread's stopping instruction
+    /// again, and the thread stops anew under its own badge
+    /// ([`control::Unclaimed::Restart`]).
+    fn restart(&mut self, index: usize, stop: Stop)
+    {
+        let Some(t) = self.target.as_mut().and_then(|t| t.threads.get_mut(index))
+        else
+        {
+            return;
+        };
+        let held = t.held.take();
+        t.posted = false;
+        let cap = t.cap;
+        self.rewind_hit(cap, held.iter().chain([&stop]));
+        if let Some(h) = held
+        {
+            self.reply(h.receiver, syscall_abi::FAULT_REPLY_RESUME);
+        }
+        self.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
     }
 
     /// Undo a breakpoint hit of held thread `index` that the stub does not
-    /// report: set its pointer back to the breakpoint where the architecture
-    /// reports it past it ([`control::rewound_pc`]), so its resume runs the
-    /// breakpoint again, and reports it then, rather than resuming inside
-    /// the replaced instruction (docs/fault-handling.md § Debugging).
+    /// report ([`Self::rewind_hit`]).
     fn cancel_hit(&mut self, index: usize)
     {
-        let Some(t) = self.target.as_ref().and_then(|t| t.threads.get(index))
+        let Some((cap, stop)) = self
+            .target
+            .as_ref()
+            .and_then(|t| t.threads.get(index))
+            .and_then(|t| Some((t.cap, t.held?)))
         else
         {
             return;
         };
-        let Some(stop) = t.held
-        else
-        {
-            return;
-        };
+        self.rewind_hit(cap, [&stop].into_iter());
+    }
+
+    /// Set the pointer of the fault-blocked thread `cap` back to the
+    /// breakpoint it took, when one of `stops` is a breakpoint hit and the
+    /// architecture reports the pointer past it ([`control::rewound_pc`]),
+    /// so its resume runs the breakpoint again, and reports it then, rather
+    /// than resuming inside the replaced instruction
+    /// (docs/fault-handling.md § Debugging).
+    fn rewind_hit<'a>(&self, cap: u64, mut stops: impl Iterator<Item = &'a Stop>)
+    {
         let mut file = [0u8; 512];
         let size = regs::file_size(ARCH);
-        if syscall::thread_read_regs(t.cap, &mut file[..size]).is_err()
+        if syscall::thread_read_regs(cap, &mut file[..size]).is_err()
         {
             return;
         }
         let pc = regs::pc(ARCH, &file);
         let planted = |a| self.breakpoints.contains(a);
-        if let Some(at) =
-            control::rewound_pc(BREAKPOINT_PC_ADVANCE, stop.kind, stop.detail, pc, planted)
+        let Some(at) = stops.find_map(|s| {
+            control::rewound_pc(BREAKPOINT_PC_ADVANCE, s.kind, s.detail, pc, planted)
+        })
+        else
         {
-            regs::set_pc(ARCH, &mut file[..size], at);
-            // SAFETY: the register file was read from this held thread just
-            // above; only its pointer moved back to the breakpoint it took.
-            let _ = unsafe { syscall::thread_write_regs(t.cap, &file[..size]) };
-        }
+            return;
+        };
+        regs::set_pc(ARCH, &mut file[..size], at);
+        // SAFETY: the register file was read from this fault-blocked thread
+        // just above; only its pointer moved back to the breakpoint it took.
+        let _ = unsafe { syscall::thread_write_regs(cap, &file[..size]) };
     }
 
     /// Undo the step in flight, once its thread is held: its trap flag, or
@@ -703,32 +784,61 @@ impl Stub
     /// for its next stop.
     fn finish_stepping(&mut self)
     {
+        self.undo_step(false);
+    }
+
+    /// Undo the step in flight: its text part (riscv64's planted
+    /// `c.ebreak`) through any live thread of the target, and its register
+    /// part (x86-64's trap flag) when the stepped thread is held. Unless
+    /// `force`, a stepped thread that is alive and not held keeps the step
+    /// pending; with it (a detach), the text is undone anyway, and a trap
+    /// flag left on a thread that never stopped is logged.
+    fn undo_step(&mut self, force: bool)
+    {
         let Some(step) = self.stepping
         else
         {
             return;
         };
-        let Some(t) = self
+        let stepped = self
             .target
             .as_ref()
             .and_then(|t| t.threads.get(step.thread))
-        else
-        {
-            self.stepping = None;
-            return;
-        };
-        if t.held.is_none() && !t.gone
+            .map(|t| (t.cap, t.held.is_some(), t.gone));
+        if let Some((_, false, false)) = stepped
+            && !force
         {
             return;
         }
-        let mut file = [0u8; 512];
-        let size = regs::file_size(ARCH);
-        if syscall::thread_read_regs(t.cap, &mut file[..size]).is_ok()
+        let text = match stepped
         {
-            arch::finish_step(t.cap, step.undo, &mut file[..size]);
-            // SAFETY: read from this held thread just above; only the step's
-            // trap flag changed.
-            let _ = unsafe { syscall::thread_write_regs(t.cap, &file[..size]) };
+            Some((cap, _, false)) => Some(cap),
+            _ => self.any_thread(),
+        };
+        if let Some(cap) = text
+        {
+            arch::finish_step_text(cap, step.undo);
+        }
+        match stepped
+        {
+            Some((cap, true, _)) =>
+            {
+                let mut file = [0u8; 512];
+                let size = regs::file_size(ARCH);
+                if syscall::thread_read_regs(cap, &mut file[..size]).is_ok()
+                {
+                    arch::finish_step_regs(step.undo, &mut file[..size]);
+                    // SAFETY: read from this held thread just above; only
+                    // the step's trap flag changed.
+                    let _ = unsafe { syscall::thread_write_regs(cap, &file[..size]) };
+                }
+            }
+            Some((_, false, false)) if ARCH == gdb_rsp::target::Arch::X86_64 =>
+            {
+                std::os::seraph::log!("a step's thread never stopped; its trap flag stays set");
+            }
+            _ =>
+            {}
         }
         self.stepping = None;
     }
@@ -837,7 +947,9 @@ impl Stub
         // above; only the trap flag changed.
         if unsafe { syscall::thread_write_regs(t.cap, &file[..size]) }.is_err()
         {
-            arch::finish_step(t.cap, undo, &mut file[..size]);
+            // The registers were not written; only a planted c.ebreak needs
+            // taking back.
+            arch::finish_step_text(t.cap, undo);
             return false;
         }
         t.held = None;
@@ -953,6 +1065,19 @@ impl Stub
         // All-stop: hold every other thread too before GDB sees the stop;
         // the stop_all finishes the step this stop may end.
         self.stop_all();
+        // A second delivery under the thread's badge during the all-stop
+        // can have restarted it (`Unclaimed::Restart`): the stop reported is
+        // then another held thread's, and with none held the target runs on.
+        let reported = self.target.as_ref().and_then(|t| {
+            let held = |i: usize| t.threads.get(i)?.held.map(|s| (i, s));
+            held(index).or_else(|| (0..t.threads.len()).find_map(held))
+        });
+        let Some((index, stop)) = reported
+        else
+        {
+            self.running = true;
+            return;
+        };
         self.current = index;
         let sig = stop_signal(stop.kind, stop.detail);
         self.send(ipc_buf, |w| {
@@ -973,8 +1098,14 @@ impl Stub
             self.drop_target();
             return;
         };
+        // A step whose thread an all-stop left running gets one more
+        // all-stop to take its stop; its text is undone whatever comes.
         self.finish_stepping();
-        self.stepping = None;
+        if self.stepping.is_some()
+        {
+            self.stop_all();
+        }
+        self.undo_step(true);
         for bp in self.breakpoints.take_all()
         {
             let _ = write_text(cap, bp.addr, bp.original());

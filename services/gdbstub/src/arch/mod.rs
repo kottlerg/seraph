@@ -9,7 +9,9 @@
 //! One module per architecture, selected here by `target_arch` (the
 //! arch-module declaration site, per docs/coding-standards.md § C). Each
 //! exposes the same items: `ARCH`, `BREAKPOINT_PC_ADVANCE`, `StepUndo`,
-//! `prepare_step`, and `finish_step`.
+//! `prepare_step`, and the undo of a step in its two parts:
+//! `finish_step_text`, through any thread of the target, and
+//! `finish_step_regs`, on the held stepped thread's register file.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]
@@ -19,4 +21,6 @@ mod current;
 #[path = "riscv64/mod.rs"]
 mod current;
 
-pub use current::{ARCH, BREAKPOINT_PC_ADVANCE, StepUndo, finish_step, prepare_step};
+pub use current::{
+    ARCH, BREAKPOINT_PC_ADVANCE, StepUndo, finish_step_regs, finish_step_text, prepare_step,
+};

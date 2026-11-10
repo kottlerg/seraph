@@ -20,14 +20,14 @@ test = false
 [dependencies]
 iommu-core = { path = "../core" }
 ipc = { path = "../../../../shared/ipc" }
-mmio = { path = "../../../../shared/mmio" }
 syscall = { path = "../../../../shared/syscall" }
 syscall-abi = { path = "../../../../abi/syscall" }
 
-# The binary's page store builds for the Seraph targets only, so the
-# host-tested library does not pull it into a host build.
+# The binary's page store and its MMIO access build for the Seraph targets only,
+# so the host-tested library does not pull them into a host build.
 [target.'cfg(target_os = "seraph")'.dependencies]
 iommu-store = { path = "../store" }
+mmio = { path = "../../../../shared/mmio" }
 
 [lints]
 workspace = true

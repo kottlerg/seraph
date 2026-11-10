@@ -225,6 +225,13 @@ closure audit, and their prose verdict lines are the gate. Findings are handled 
 run, as the subsections below define. `.claude/skills/pr-review/SKILL.md` gives the
 assistant's procedure.
 
+A run MAY be made with the reviewer alone while the PR body's `## Validation` section reports
+a build, a boot, or an owed local host run as pending, since an audit of that head would fail
+on that report alone. Its record is a `full` or `delta` record that states the audit as not
+run (`audit_verdict` `NOT RUN`, `audit` `null`). The audit that run leaves owed is made once
+the runs are reported: with the next run when a fix round has moved the head, and otherwise
+alone at the same head, as an `audit` record there that completes the run.
+
 The reviewer verdict is:
 
 - `BLOCKING ISSUES` when a blocking finding is on the review surface or a reviewer returned no
@@ -232,8 +239,9 @@ The reviewer verdict is:
 - `NON-BLOCKING ISSUES ONLY` when only non-blocking findings are on it;
 - `READY TO MERGE` when none is.
 
-The merge prompt MUST follow a completed run (one with the reviewer, or the auditor-only run of
-§ Auditor-only run) with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
+The merge prompt MUST follow a completed run (one with the reviewer and the auditor, a run of
+the reviewer alone that its audit has completed, or the auditor-only run of § Auditor-only
+run) with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
 
 - `READY TO MERGE`;
 - `NON-BLOCKING ISSUES ONLY`, once every finding the run leaves on the surface is recorded

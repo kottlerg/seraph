@@ -275,8 +275,8 @@ Push and open the PR (`gh pr create`, template filled) as soon as `cargo xtask t
 - Refresh the PR body to the head the run reviews: the validated head, the Validation report,
   the Acceptance ticks, every claim.
 - Run `cargo xtask pr-check <N>` and fix what it reports, so the audit spends its run on what
-  needs a reader. While the host runs are pending the audit fails on that item alone, which is
-  expected.
+  needs a reader. While the body reports a run as pending, make the run with the reviewer alone
+  (the `pr-review` skill § The run); the audit follows once the runs are reported.
 
 After every run:
 

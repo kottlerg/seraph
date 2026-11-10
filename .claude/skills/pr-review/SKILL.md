@@ -36,6 +36,12 @@ Give the reviewer, in addition:
   run with the reviewer reviewed, and the merge bases at `since` and at the head
   (`git merge-base <sha> origin/master` for each).
 
+While the PR body's `## Validation` section reports a run as pending, make the run with
+`pr-reviewer` alone (docs/conventions.md § Pre-merge review): the audit would fail on that item
+alone. Once the runs are reported, the audit is owed. When a fix round has moved the head, it
+runs with the next run. When the head is the one the reviewer reviewed, run `pr-auditor` alone
+on it as an ordinary audit, not as the auditor-only run below, and save it as an `audit` record.
+
 When docs/conventions.md § Auditor-only run allows it, the next run may be `pr-auditor` alone.
 Tell it that it is that run, and give it the PR number, the `since` head, the path of the last
 reviewer run's record, the fixes the round claims, and the open Issue list.

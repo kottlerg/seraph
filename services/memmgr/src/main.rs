@@ -1479,10 +1479,11 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, pro
 }
 
 /// Why [`handle_fault`] declined a fault: the low 32 bits of the decline-reason
-/// word its `FAULT_REPLY_FORWARD` reply carries in data word 0, which the
-/// kernel hands to the exception handler as the forwarded message's data
-/// word 4, or prints in its kill diagnostic when none is bound
-/// (docs/fault-handling.md § Reply). The values
+/// word its reply carries in data word 0 ([`decline_fault`]): a
+/// `FAULT_REPLY_FORWARD`, whose word the kernel hands to the exception handler
+/// as the forwarded message's data word 4, or prints in its kill diagnostic
+/// when none is bound, or, for [`FaultDecline::NotVm`], a `FAULT_REPLY_KILL`,
+/// whose word it prints (docs/fault-handling.md § Reply). The values
 /// are memmgr's wire contract, tabled in
 /// `services/memmgr/docs/ipc-interface.md` § Kernel-origin fault message.
 #[derive(Clone, Copy)]

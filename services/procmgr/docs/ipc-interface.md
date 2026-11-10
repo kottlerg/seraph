@@ -658,16 +658,19 @@ At finalize it binds every child's main-thread exception class (`FAULT_CLASS_EXC
 on it badged with the child's process badge, whether or not the child is pinned; the runtime copies
 the binding onto every thread the child spawns. memmgr forwards each page fault it cannot back to
 the same class (`FAULT_REPLY_FORWARD`), so the endpoint receives every fault that would kill a
-procmgr-created process ([docs/fault-handling.md](../../../docs/fault-handling.md) § Crash
-Reports). A failure to create the endpoint, or to bind a child, is logged and leaves the class
-unbound; it never fails a creation.
+procmgr-created process that has not declared itself undebuggable (Label 21), except a page fault of
+a child created `CREATE_PINNED` or whose pager binding failed, which no pager forwards
+([docs/fault-handling.md](../../../docs/fault-handling.md) § Crash Reports). A fault of a
+restartable syscall's user copy, which the process survives, does not reach it either: the forward
+of one is a decline. A failure to create the endpoint, or to bind a child, is logged and leaves the
+class unbound; it never fails a creation.
 
 While no crash service is registered, a procmgr thread of its own, the **decliner**, receives on
 the endpoint and declines each fault with `FAULT_REPLY_KILL`, carrying the forwarder's reason for a
 forwarded page fault (data word 4) and no reason for an exception: the fault takes the outcome it
 has with no handler bound, and the kernel's decline line for a forwarded fault is the one the
-pager's own decline printed. The decliner shares nothing with the request loop but a few atomics,
-so a receive on the endpoint never waits behind a request.
+pager's own decline printed. The decliner shares nothing with the request loop but a wake
+notification, so a receive on the endpoint never waits behind a request.
 
 Labels 19–21 are the **debug authority**. `REGISTER_CRASH_SERVICE` and `ATTACH_PROCESS` are served
 only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the un-badged
@@ -684,15 +687,19 @@ stub are its consumers.
 | caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
 | `caps[0]` | A Thread cap of the service's main thread (any rights); further caps are deleted |
 
-procmgr keeps the thread cap and replies `SUCCESS` with one cap, `RECV` on the crash endpoint, after
-it stops the decliner where it holds no fault: a decliner found holding one declines it first. The
-service then receives every fault on the endpoint. procmgr checks the kept cap after every death
-drain its loop runs, which the service's own death wakes: once the cap is gone (procmgr's teardown
-of the service revokes every cap derived from its main thread) or its thread has exited, procmgr
-deletes the cap and the decliner receives again, declining the faults already queued. Replies:
-`UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` without a thread cap, or when procmgr has
-no crash endpoint; `CRASH_SERVICE_PRESENT` while a registered service lives; `OUT_OF_MEMORY` when
-the `RECV` cap cannot be derived. A refused request's caps are deleted.
+procmgr parks the decliner, keeps the thread cap, and replies `SUCCESS` with one cap, `RECV` on the
+crash endpoint. The park is a message on the endpoint itself: procmgr's request loop calls the
+endpoint, un-badged and with a label no fault carries, and the decliner, which receives it only
+after every fault queued ahead of it and declines those, answers it and waits on its wake
+notification. The service then receives every fault on the endpoint. procmgr checks the kept cap on
+every pass of its loop, which the service's own death, or any request, wakes: once the cap is gone
+(procmgr's teardown of the service revokes every cap derived from its main thread) or its thread
+has exited, procmgr deletes the cap and signals the decliner, which receives again, declining the
+faults already queued. Replies: `UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` without a
+thread cap, or when procmgr has no crash endpoint; `CRASH_SERVICE_PRESENT` while a registered
+service lives; `OUT_OF_MEMORY` when the `RECV` cap cannot be derived or the park fails. A refused
+request's caps are deleted. svctest's `crash_endpoint` phase drives the registration, the refusal
+of a second one, the handover, the take-back, and a registration after it.
 
 ### Label 20: `ATTACH_PROCESS`
 
@@ -736,16 +743,17 @@ The sender declares itself undebuggable: procmgr marks it, unbinds its main thre
 class from the crash endpoint, and refuses `ATTACH_PROCESS` on it from then on. A process sends it
 before it spawns a thread, since a thread spawned before keeps the binding it copied. The senders
 are the processes a stop of which would deadlock a debug-authority holder, which waits on them for
-its log output or its own progress: logd, the serial driver, and every debug-authority holder, so
-none attaches to itself. Replies `SUCCESS`, or `INVALID_BADGE` when the badge names no live process.
+its log output or its own progress: logd, the serial and framebuffer drivers, and every
+debug-authority holder, so none attaches to itself. Replies `SUCCESS`, or `INVALID_BADGE` when the
+badge names no live process.
 
 Any process may declare itself, on its own cap alone: the badge names the sender, so a declaration
 affects the declarer and no other process, and it removes no authority a debug-authority holder
 needs over another. It is one-way: nothing makes a declared process debuggable again for its life.
-Until it declares, a process is bound and attachable like any other: a fault of logd or the serial
+Until it declares, a process is bound and attachable like any other: a fault of logd or either
 driver between its creation and its declaration, which each sends before its bootstrap, reaches the
 crash service, whose log output then waits on the faulting process until the crash service's
-watchdog bound ([services/crashd/README.md](../../crashd/README.md) § Bounds) declines the fault.
+watchdog bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds) declines the fault.
 
 ---
 
@@ -771,7 +779,7 @@ watchdog bound ([services/crashd/README.md](../../crashd/README.md) § Bounds) d
 [Namespace Model](../../../docs/namespace-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
-[services/crashd/README.md](../../crashd/README.md),
+[crashd Operation](../../crashd/docs/operation.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),

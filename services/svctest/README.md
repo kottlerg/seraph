@@ -37,6 +37,7 @@ services/svctest/
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
         │                      # death queues; logd death forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
+        ├── crash.rs           # procmgr's crash endpoint: registration, handover, take-back
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
@@ -195,27 +196,29 @@ spawner tears them down), and an unmatched token falls through to the normal run
 
 Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiotest` (pipes,
 procmgr), `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults), `capexhaust` (recv
-guard), `demandpaged` (pager), and `fsbench` (FS IPC). The devmgr orphan-teardown phase has devmgr
-spawn the [`test-orphan`](../drivers/test-orphan/README.md) driver, and the driver-withdrawal phase
-three [`test-fault`](../drivers/test-fault/README.md) drivers, one of which never reports ready, so
-the phase waits the fault batch's settle bound (`TEST_FAULT_SETTLE_TIMEOUT_MS`, 1 s). The DMA
-confinement phase has devmgr bind QEMU's `edu` device, which xtask attaches on both architectures,
-to the [`test-dma`](../drivers/test-dma/README.md) driver and asks it to probe: a copy through a
-mapped page must arrive, and where an IOMMU confines the device a copy to the page's device address
-after its unmap must not reach the page, and devmgr must have taken an IOMMU fault for the device at
-that address. The phase asks devmgr for the device's faults (`TEST_DMA_FAULTS`) once, then again
-every 10 ms until it reports one, at most 300 times more (3 s, `FAULT_RECORD_POLLS`), so a fault the
-IOMMU reports to its driver after the probe's reply still counts; a missing fault fails only at that
-bound. Without
-an IOMMU it checks the mapped copies only, and a machine without the device skips it. The
-`fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
+guard), `demandpaged` (pager), `fsbench` (FS IPC), and `crashme` (crash endpoint: svctest, its
+recipe granting `debug_authority`, registers as the crash service and takes a `crashme` child's
+forwarded page fault, then gives the endpoint back and sees a second child declined by procmgr). The
+devmgr orphan-teardown phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md)
+driver, and the driver-withdrawal phase three [`test-fault`](../drivers/test-fault/README.md)
+drivers, one of which never reports ready, so the phase waits the fault batch's settle bound
+(`TEST_FAULT_SETTLE_TIMEOUT_MS`, 1 s). The DMA confinement phase has devmgr bind QEMU's `edu`
+device, which xtask attaches on both architectures, to the
+[`test-dma`](../drivers/test-dma/README.md) driver and asks it to probe: a copy through a mapped
+page must arrive, and where an IOMMU confines the device a copy to the page's device address after
+its unmap must not reach the page, and devmgr must have taken an IOMMU fault for the device at that
+address. The phase asks devmgr for the device's faults (`TEST_DMA_FAULTS`) once, then again every 10
+ms until it reports one, at most 300 times more (3 s, `FAULT_RECORD_POLLS`), so a fault the IOMMU
+reports to its driver after the probe's reply still counts; a missing fault fails only at that
+bound. Without an IOMMU it checks the mapped copies only, and a machine without the device skips it.
+The `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
 with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS phases
 also read the build-synthesised `/data/svctest/large.bin` and write their scratch files under
-`/data/svctest/`; `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
-build-synthesised `/data/svctest/bench.bin`, which the `fs_eviction_routes_release_to_its_open`
-phase also holds open. The sysroot placement of all of these is listed in
-[docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
+`/data/svctest/`; `fsbench`, spawned by the `fs_crossover_bench` phase, reads the build-synthesised
+`/data/svctest/bench.bin`, which the `fs_eviction_routes_release_to_its_open` phase also holds open.
+The sysroot placement of all of these is listed in [docs/testing.md § Sysroot
+layout](../../docs/testing.md#sysroot-layout).
 
 ---
 

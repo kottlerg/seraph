@@ -243,7 +243,7 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 |---|---|---|
 | `sys_ipc_reply` normal arm | `reply_tcb` CAS won in `endpoint_reply` | episode + REPLY (after cap-result writes) |
 | `sys_ipc_reply` payload, cap-validation, pre-allocation, or cap-transfer refusal arm (`deposit_transfer_failed_reply`) | same CAS | episode + REPLY (the synthetic `IPC_REPLY_TRANSFER_FAILED` message, with no reply staged; the server receives the error) |
-| `sys_ipc_reply` fault arm | same CAS | episode only (`fault_outcome` carries RESUME or DECLINED; a DECLINED reply's label and reason word go to `ipc_msg`) |
+| `sys_ipc_reply` fault arm | same CAS | episode only (`fault_outcome` carries RESUME, DECLINED, or FORWARDED; a DECLINED or FORWARDED reply's label and reason word go to `ipc_msg`) |
 | `release_unreplied_caller` (`SYS_IPC_RECV` entry, a caller bound by an earlier unreplied receive) | `reply_tcb.swap(null)` non-null | episode + INTERRUPTED (faulter: episode + KILL) |
 | `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `ipc::fault::claim_fault_park` (a fault-handler binding change, `redeliver_in_flight`), received arm | `reply_tcb` CAS under the faulter's `sched_lock` behind a `blocked_on_object` re-read | episode only (`fault_outcome` carries REDELIVER) |
@@ -272,7 +272,8 @@ tid/park-episode/deposit-episode — the #352-class spurious-resume tripwire,
 also checked in `fault_dispatch`'s resume), release builds fail closed with
 `Interrupted` rather than surfacing stale `ipc_msg` bytes as a success.
 `fault_dispatch`'s resume fails closed the same way: REDELIVER makes the delivery again under the
-binding current then, and any other `fault_outcome` than RESUME, a PENDING left by an unstamped
+binding current then, FORWARDED makes it again through the exception class (a decline for a
+kernel copy's fault), and any other `fault_outcome` than RESUME, a PENDING left by an unstamped
 wake included, kills the thread (the `fault_outcome` row of
 [scheduling-internals.md § Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 

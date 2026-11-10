@@ -316,6 +316,62 @@ mod tests
     }
 
     #[test]
+    fn a_fixture_report_of_another_thread_fails()
+    {
+        // A well-formed block of an unidentified thread, so the block checks
+        // as a block but not as the fixture's main-thread report.
+        let mut vm = fixture_report(
+            0xaa,
+            Fault::Vm {
+                access: Access::Write,
+                addr: 0,
+                pager_reason: Some(3),
+            },
+            &[],
+        );
+        vm.thread = Thread::Unidentified;
+        vm.frames = &[];
+        let regs = [0u64; 21];
+        let mut exception = fixture_report(
+            0xbb,
+            Fault::Exception {
+                code: syscall_abi::FAULT_EXC_ILLEGAL_INSTRUCTION,
+                aux: 0,
+            },
+            &regs,
+        );
+        exception.badge = 43;
+        let mut log = death(&vm, FIXTURE);
+        log.push_str(&death(&exception, FIXTURE));
+        let error = check_log(&log, CrashReportExpect::Reports).unwrap_err();
+        assert!(format!("{error:#}").contains("main thread"));
+    }
+
+    #[test]
+    fn a_fixture_walk_not_starting_at_the_instruction_pointer_fails()
+    {
+        let regs = [0u64; 21];
+        let log = both_reports(&regs).replacen(
+            "frame.0=0x0000000010001010",
+            "frame.0=0x0000000010001020",
+            1,
+        );
+        let error = check_log(&log, CrashReportExpect::Reports).unwrap_err();
+        assert!(format!("{error:#}").contains("walk does not start"));
+    }
+
+    #[test]
+    fn a_log_a_host_emulator_crash_ended_is_skipped()
+    {
+        let log = "[1.0] [crashd] CRASH-BEGIN id=00000000000000aa version=1\n\
+                   [run-parallel] arch=x86_64 cpus=4 accel=kvm run=1 outcome=QEMU-CRASH_rc=139\n";
+        assert_eq!(
+            check_log(log, CrashReportExpect::Reports).unwrap(),
+            Verdict::Skipped("QEMU-CRASH_rc=139".to_string())
+        );
+    }
+
+    #[test]
     fn expecting_none_passes_a_log_without_blocks_and_fails_one_with_a_block()
     {
         let quiet = "[1.0] kernel: USERSPACE FAULT: tid=27 cpu=1 cause=#PF\n";

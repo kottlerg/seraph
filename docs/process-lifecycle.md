@@ -144,7 +144,7 @@ Init requests procmgr to start only the bootstrap-essential services
 — devmgr and vfsd (`CREATE_PROCESS`, from boot modules), then svcmgr
 (`CREATE_FROM_FILE`, from `/services/svcmgr`) — by IPC to procmgr's service
 endpoint. The
-non-bootstrap services (`logd`, `timed`, `pwrmgr`, `terminal`, the staged test
+non-bootstrap services (`logd`, `timed`, `pwrmgr`, `crashd`, `terminal`, the staged test
 harnesses) are not in this list: svcmgr launches them itself
 post-handover from
 their `/config/svcmgr/services/*.svc` recipes. Nor is the per-arch RTC

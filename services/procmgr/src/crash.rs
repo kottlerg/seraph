@@ -13,44 +13,38 @@
 //! service is registered, procmgr's decliner thread receives on it and
 //! declines every fault, so a fault takes the outcome it has with no handler.
 //! A crash service that registers (`REGISTER_CRASH_SERVICE`) receives a
-//! `RECV` cap on it, and the decliner parks; when that service dies, the
+//! `RECV` cap on it, and the decliner parks; when that service is gone, the
 //! decliner receives again, faults already queued included
 //! (`services/procmgr/docs/ipc-interface.md` § `REGISTER_CRASH_SERVICE`).
 //!
 //! The decliner is a thread of its own so that a receive on the endpoint
-//! never waits behind procmgr's request loop. It shares nothing with that
-//! loop but the atomics below, and makes no request of procmgr.
+//! never waits behind procmgr's request loop. The handover is a message on
+//! the endpoint itself: procmgr's request loop calls the endpoint with
+//! [`PARK_LABEL`], which the decliner receives only after every fault queued
+//! ahead of it, so it parks holding none. No stop is involved, and no fault
+//! is ever left with a receiver that does not run.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::IpcMessage;
 use syscall_abi::{FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL};
+
+/// The label of the handover message procmgr's request loop sends the
+/// decliner on the crash endpoint, un-badged. Every fault the kernel delivers
+/// carries `FAULT_LABEL` and the badge of a process's binding, never zero, and
+/// only procmgr holds a `SEND` on the endpoint, so nothing else carries it.
+const PARK_LABEL: u64 = 0;
 
 /// The crash endpoint (procmgr's full cap on it); 0 when it could not be
 /// created, and no process is then bound to it.
 static ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
-/// The decliner thread's Thread cap; 0 until it publishes it.
-static DECLINER: AtomicU64 = AtomicU64::new(0);
-
 /// The notification the parked decliner waits on.
 static WAKE: AtomicU64 = AtomicU64::new(0);
 
-/// Whether a crash service holds the receive side.
-static REGISTERED: AtomicBool = AtomicBool::new(false);
-
-/// Where the decliner is in its loop, which the handover reads after
-/// stopping it.
-static PHASE: AtomicU8 = AtomicU8::new(PHASE_IDLE);
-
-/// Between iterations, holding no fault.
-const PHASE_IDLE: u8 = 0;
-/// About to receive, or blocked receiving: holding no fault.
-const PHASE_RECEIVING: u8 = 1;
-/// Holding a received fault until its reply.
-const PHASE_HOLDING: u8 = 2;
-/// Waiting on [`WAKE`] while a crash service is registered.
-const PHASE_PARKED: u8 = 3;
+/// The registered crash service's Thread cap, in procmgr's `CSpace`; 0 while
+/// none is registered. Written and read only by procmgr's request loop.
+static REGISTRANT: AtomicU64 = AtomicU64::new(0);
 
 /// The crash endpoint, 0 when there is none.
 pub fn endpoint() -> u64
@@ -82,52 +76,48 @@ pub fn start()
         std::os::seraph::log!("crash wake notification not created; exceptions stay unbound");
         return;
     };
-    WAKE.store(wake, Ordering::Release);
     if std::thread::Builder::new()
         .name("crash-decliner".into())
-        .spawn(move || decline_loop(ep))
+        .spawn(move || decline_loop(ep, wake))
         .is_err()
     {
         let _ = syscall::cap_delete(ep);
+        let _ = syscall::cap_delete(wake);
         std::os::seraph::log!("crash decliner not started; exceptions stay unbound");
         return;
     }
+    WAKE.store(wake, Ordering::Release);
     // Published only once a receiver exists, so no process is bound to an
     // endpoint nobody serves.
     ENDPOINT.store(ep, Ordering::Release);
 }
 
-/// The decliner: receive each fault on the crash endpoint and decline it,
-/// while no crash service is registered; park while one is.
-fn decline_loop(ep: u64) -> !
+/// The decliner: receive each fault on the crash endpoint and decline it;
+/// on the handover message, answer it and park on `wake` until procmgr takes
+/// the endpoint back.
+fn decline_loop(ep: u64, wake: u64) -> !
 {
-    DECLINER.store(
-        std::os::seraph::thread::current_thread_cap(),
-        Ordering::Release,
-    );
     let ipc_buf = std::os::seraph::current_ipc_buf();
     loop
     {
-        PHASE.store(PHASE_IDLE, Ordering::Release);
-        if REGISTERED.load(Ordering::Acquire)
-        {
-            PHASE.store(PHASE_PARKED, Ordering::Release);
-            let _ = syscall::notification_wait(WAKE.load(Ordering::Acquire));
-            continue;
-        }
-        PHASE.store(PHASE_RECEIVING, Ordering::Release);
         // SAFETY: ipc_buf is this thread's registered IPC buffer page.
         let Ok(msg) = (unsafe { ipc::ipc_recv(ep, ipc_buf) })
         else
         {
-            // A stop of this thread cancels the receive (`Interrupted`).
             continue;
         };
-        PHASE.store(PHASE_HOLDING, Ordering::Release);
         if msg.label == FAULT_LABEL
         {
             decline(&msg, ipc_buf);
+            continue;
         }
+        // The handover: answer it, then wait for the endpoint back. A wait
+        // the kernel cancels is waited again; only `take_back`'s signal
+        // ends it.
+        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(0), ipc_buf) };
+        while !matches!(syscall::notification_wait(wake), Ok(bits) if bits != 0)
+        {}
     }
 }
 
@@ -151,10 +141,6 @@ fn decline(msg: &IpcMessage, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// The registered crash service's Thread cap, in procmgr's `CSpace`; 0 while
-/// none is registered. Written only by procmgr's request loop.
-static REGISTRANT: AtomicU64 = AtomicU64::new(0);
-
 /// Why [`register`] refuses a crash service.
 pub enum RegisterRefusal
 {
@@ -162,19 +148,22 @@ pub enum RegisterRefusal
     NoEndpointOrThread,
     /// A registered crash service still lives.
     Present,
-    /// The `RECV` cap for the service could not be derived.
+    /// The `RECV` cap for the service could not be derived, or the decliner
+    /// could not be parked.
     OutOfSlots,
 }
 
 /// Register the crash service whose main thread `thread_cap` names (moved
-/// into procmgr's `CSpace` by the request): returns the `RECV` cap on the
-/// crash endpoint to reply with, after the receive side is handed over.
-/// `thread_cap` is kept to tell when the service is gone
-/// ([`check_registrant`]); on a refusal it is deleted.
+/// into procmgr's `CSpace` by the request): park the decliner, then return
+/// the `RECV` cap on the crash endpoint to reply with. `thread_cap` is kept
+/// to tell when the service is gone ([`check_registrant`]); on a refusal it
+/// is deleted. `ipc_buf` is the request loop's IPC buffer: the handover is a
+/// call on the endpoint, made while the request's own reply is pending, which
+/// a downstream call leaves bound.
 ///
 /// # Errors
 /// The [`RegisterRefusal`] that refuses it.
-pub fn register(thread_cap: u64) -> Result<u64, RegisterRefusal>
+pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<u64, RegisterRefusal>
 {
     let ep = endpoint();
     if ep == 0 || thread_cap == 0
@@ -183,7 +172,7 @@ pub fn register(thread_cap: u64) -> Result<u64, RegisterRefusal>
         return Err(RegisterRefusal::NoEndpointOrThread);
     }
     check_registrant();
-    if registered()
+    if REGISTRANT.load(Ordering::Acquire) != 0
     {
         delete_nonzero(thread_cap);
         return Err(RegisterRefusal::Present);
@@ -194,15 +183,23 @@ pub fn register(thread_cap: u64) -> Result<u64, RegisterRefusal>
         delete_nonzero(thread_cap);
         return Err(RegisterRefusal::OutOfSlots);
     };
+    // The decliner answers once it has declined every fault queued ahead of
+    // the call, and then receives no more.
+    // SAFETY: ipc_buf is the request loop's registered IPC buffer page.
+    if unsafe { ipc::ipc_call(ep, &IpcMessage::new(PARK_LABEL), ipc_buf) }.is_err()
+    {
+        let _ = syscall::cap_delete(recv);
+        delete_nonzero(thread_cap);
+        return Err(RegisterRefusal::OutOfSlots);
+    }
     REGISTRANT.store(thread_cap, Ordering::Release);
-    hand_over();
     Ok(recv)
 }
 
 /// Take the receive side back when the registered crash service is gone:
 /// its thread cap revoked (procmgr's teardown of the service revokes every
 /// cap derived from its main thread) or its thread exited. procmgr's loop
-/// calls it after every death drain, which the service's death wakes.
+/// calls it on every pass, which the service's death, or any request, wakes.
 pub fn check_registrant()
 {
     let thread = REGISTRANT.load(Ordering::Acquire);
@@ -219,7 +216,9 @@ pub fn check_registrant()
     {
         REGISTRANT.store(0, Ordering::Release);
         let _ = syscall::cap_delete(thread);
-        take_back();
+        // The parked decliner receives again, the faults queued for the
+        // service that is gone first.
+        let _ = syscall::notification_send(WAKE.load(Ordering::Acquire), 1);
         std::os::seraph::log!("crash service gone; declining faults again");
     }
 }
@@ -229,67 +228,5 @@ fn delete_nonzero(cap: u64)
     if cap != 0
     {
         let _ = syscall::cap_delete(cap);
-    }
-}
-
-/// Whether a registered crash service holds the receive side.
-pub fn registered() -> bool
-{
-    REGISTERED.load(Ordering::Acquire)
-}
-
-/// Hand the receive side to a crash service: mark it registered and stop
-/// the decliner where it holds no fault. A decliner found holding one is
-/// started again to decline it, and stopped again after; a parked one is
-/// started again to park. Returns once the decliner neither receives nor
-/// holds a fault.
-fn hand_over()
-{
-    REGISTERED.store(true, Ordering::Release);
-    let decliner = DECLINER.load(Ordering::Acquire);
-    if decliner == 0
-    {
-        return;
-    }
-    loop
-    {
-        // The stop returns once the decliner has left its CPU, so the phase
-        // read after it is the one it stopped in; a receive it was blocked in
-        // is cancelled and has taken no fault.
-        let _ = syscall::thread_stop(decliner);
-        match PHASE.load(Ordering::Acquire)
-        {
-            // Stopped before or inside its receive: it stays stopped,
-            // holding nothing, until [`take_back`] starts it.
-            PHASE_RECEIVING => return,
-            // Parked, or between iterations: run on, to park.
-            PHASE_PARKED =>
-            {
-                let _ = syscall::thread_start(decliner);
-                return;
-            }
-            // Holding a fault, or between its reply and its flag check: let
-            // it decline the fault and reach its park.
-            _ =>
-            {
-                let _ = syscall::thread_start(decliner);
-                std::thread::yield_now();
-            }
-        }
-    }
-}
-
-/// Take the receive side back from a crash service that died: the decliner
-/// receives again, and declines the faults queued for the dead service.
-fn take_back()
-{
-    REGISTERED.store(false, Ordering::Release);
-    let _ = syscall::notification_send(WAKE.load(Ordering::Acquire), 1);
-    let decliner = DECLINER.load(Ordering::Acquire);
-    if decliner != 0
-    {
-        // A decliner stopped in its receive resumes it; a running one
-        // refuses the start, harmlessly.
-        let _ = syscall::thread_start(decliner);
     }
 }

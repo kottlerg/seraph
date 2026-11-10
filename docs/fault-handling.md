@@ -156,9 +156,13 @@ its badge. The classes are `FAULT_CLASS_VM`, the virtual-memory faults (`FAULT_K
 faults of a restartable syscall's user copy among them), `FAULT_CLASS_EXCEPTION`, every
 other kernel-unresolvable user exception (`FAULT_KIND_EXCEPTION`), and `FAULT_CLASS_UPCALL`, the
 asynchronous upcalls (`FAULT_KIND_UPCALL`; [Asynchronous Upcalls](#asynchronous-upcalls)). A fault
-is delivered through its class's binding alone, so distinct services can own a thread's classes (a
+is delivered through its class's binding, so distinct services can own a thread's classes (a
 pager its virtual-memory faults, a debugger its exceptions, a supervisor its upcalls); with no
-handler bound for its class, a fault takes the outcome it has with no handler bound at all.
+handler bound for its class, a fault takes the outcome it has with no handler bound at all. The one
+fault that crosses classes is a virtual-memory fault its handler forwards
+([`FAULT_REPLY_FORWARD`](#reply)), delivered again through the exception class; an exception
+handler therefore dispatches on the message's kind, as [Fault Message](#fault-message) gives it, and
+may receive `FAULT_KIND_VM` with a fifth data word.
 
 `SYS_THREAD_SET_FAULT_HANDLER(thread_cap, endpoint_cap, reserved, fault_class_mask)`:
 
@@ -299,10 +303,12 @@ syscall point, past the `ecall` its reported pointer names.
   fault also cancels the episode, but acts on nothing at once: it gives the episode a kill outcome
   and leaves the thread `Stopped`; when next started, the fault is unhandled. A stop after the
   handler's reply claimed the fault leaves that reply's disposition: when next started, the thread
-  resumes on a `FAULT_REPLY_RESUME` reply, and the fault is unhandled on a `FAULT_REPLY_KILL`
-  reply. Destroying it while stopped ends it as for any stopped thread. A cancelled fault-blocked
-  thread is never resumed at its faulting instruction: a thread whose own access faulted is killed
-  (a stopped one when next started), and one whose kernel copy faulted has that syscall fail.
+  resumes on a `FAULT_REPLY_RESUME` reply, the fault is unhandled on a `FAULT_REPLY_KILL` reply,
+  and on a `FAULT_REPLY_FORWARD` reply the fault is delivered through the exception class, as for
+  any forward ([Reply](#reply)). Destroying it while stopped ends it as for any stopped thread. A
+  cancelled fault-blocked thread is never resumed at its faulting instruction: a thread whose own
+  access faulted is killed (a stopped one when next started), and one whose kernel copy faulted has
+  that syscall fail.
 - **Rebind (redelivery).** A change of the binding of the fault's class, by
   `SYS_THREAD_SET_FAULT_HANDLER` or `SYS_THREAD_INHERIT_FAULT_HANDLER` (an unbind, or a bind to
   another endpoint or with another badge), while a fault is in flight, before any reply or other
@@ -347,10 +353,10 @@ The reply **label** conveys disposition:
   delivery of the fault (after a change of the exception class's binding) is made through the
   exception class. With no exception handler bound, the forward is a `FAULT_REPLY_KILL` reply
   carrying the forwarder's data word 0 as its reason, so the outcome and the kernel's diagnostic
-  are those of the decline. On a delivery of any other class, a forward is a `FAULT_REPLY_KILL`
-  reply. The forwarder never waits on the handler it forwards to; memmgr, the pager, forwards every
-  fault it cannot back, so a crash service sees them
-  ([Crash Reports](#crash-reports)).
+  are those of the decline. On a delivery of any other class, and on the fault of a restartable
+  syscall's user copy ([Kernel Copies](#kernel-copies)), a forward is a `FAULT_REPLY_KILL` reply.
+  The forwarder never waits on the handler it forwards to; memmgr, the pager, forwards every fault
+  it cannot back, so a crash service sees them ([Crash Reports](#crash-reports)).
 
 The kernel ignores reply capabilities, and every data word but one: data word 0 of a
 `FAULT_REPLY_KILL` or `FAULT_REPLY_FORWARD` reply, when the reply carries data words, is the
@@ -359,11 +365,14 @@ user-mode access faulted, the kernel prints it on its serial console, on a `faul
 ahead of the `USERSPACE FAULT` diagnostic, which names the fault's kind, its address, and the
 instruction pointer, and dumps the registers. The `fault unhandled` line also names the kernel's own
 unhandled causes: the binding of the fault's class found cleared at delivery, the delivery cancelled
-before a reply, and no handler bound for the fault's class at all, so every killed user fault has
-one. A decline with no data words prints no reason. memmgr's reasons are tabled in
+before a reply, and no handler bound for the fault's class at all, so every killed user fault that
+the fault path considered has one. The kills the fault path never considers print none: an x86-64
+user `#PF` with a reserved bit set, which no user action causes, and a syscall return whose
+instruction pointer is not canonical ([Implementation Status](#implementation-status)). A decline
+with no data words prints no reason. memmgr's reasons are tabled in
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md#kernel-origin-fault-message-fault_label),
 and the crash service's reason is its report's id
-([services/crashd/README.md](../services/crashd/README.md)).
+([services/crashd/docs/operation.md](../services/crashd/docs/operation.md) § Per Fault).
 
 A declined fault, like every other unhandled one (the binding of its class cleared before delivery,
 or the delivery cancelled; [Delivery, Resume, and Kill](#delivery-resume-and-kill)), takes the
@@ -402,10 +411,11 @@ the fault path for such a fault:
 - **No progress.** A handler that resumes without making the access satisfiable takes the same
   fault again on the re-execution, as a user-mode access would: each round is a full delivery to
   the handler, never a kernel retry, and ending the loop is the handler's policy.
-- **Unhandled.** A fault the handler declines, or that is otherwise unhandled ([Reply](#reply)),
-  fails the syscall with `InvalidAddress`; the thread continues past the syscall instruction, or
-  from an instruction pointer the handler wrote. With no handler bound the syscall fails with
-  `InvalidAddress` at once.
+- **Unhandled.** A fault the handler declines or forwards (a forward of a kernel copy's fault is a
+  decline, so no exception handler sees a fault the thread survives), or that is otherwise
+  unhandled ([Reply](#reply)), fails the syscall with `InvalidAddress`; the thread continues past
+  the syscall instruction, or from an instruction pointer the handler wrote. With no handler bound
+  the syscall fails with `InvalidAddress` at once.
 - **Stale entries.** A copy fault the live page tables already satisfy (a stale TLB entry, which a
   mapping the handler just installed can leave on another CPU) is retried in the kernel, as a
   user-mode fault is, and reaches neither the handler nor the caller.
@@ -697,7 +707,8 @@ The crash service is a userspace handler of the exception class that reports a p
 fault to the system log, then ends the faulting thread as the kernel would have: it declines the
 fault (`FAULT_REPLY_KILL`), so the thread dies with the same exit reason and the same death flow
 ([Process Lifecycle § Process Death](process-lifecycle.md#process-death)). The service, its report,
-and its limits are in [services/crashd/README.md](../services/crashd/README.md); the report's
+and its limits are in [services/crashd/README.md](../services/crashd/README.md) and
+[crashd Operation](../services/crashd/docs/operation.md); the report's
 format, the contract the host-side symbolizer reads, in
 [services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md).
 
@@ -713,12 +724,14 @@ format, the contract the host-side symbolizer reads, in
   ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)).
 - **Uncovered processes.** A process whose stop would deadlock the crash service, since the service
   waits on it, declares itself undebuggable, which unbinds its exception class: logd and the serial
-  driver, which carry the service's log output, and the crash service itself. init, memmgr, and
-  procmgr are not created by procmgr and are never bound. A fault of any of these takes the outcome
-  it has with no handler bound, and the kernel's `fault unhandled` and `USERSPACE FAULT` lines are
-  its only report. Any process may declare itself so; the declaration affects the declarer alone
-  and is one-way. Before logd or the serial driver declares, at its startup, a fault of it reaches
-  the crash service, which declines it once its bound passes.
+  and framebuffer drivers, which carry the service's log output, and the crash service itself. init,
+  memmgr, and procmgr are not created by procmgr and are never bound. A fault of any of these takes
+  the outcome it has with no handler bound, and the kernel's `fault unhandled` and `USERSPACE FAULT`
+  lines are its only report. Any process may declare itself so; the declaration affects the declarer
+  alone and is one-way. Before logd or either driver declares, at its startup, a fault of it reaches
+  the crash service, which declines it once its bound passes. A process created `CREATE_PINNED`, or
+  whose pager binding failed, has no virtual-memory handler: its page faults, which no pager
+  forwards, kill it unreported.
 - **Debuggers.** A debugger binds a thread's exception class over the crash endpoint
   ([Debugging](#debugging)); the crash service then sees none of that thread's faults. An unbind
   leaves the class unbound, not bound to the crash endpoint again.
@@ -839,6 +852,7 @@ svcmgr service definitions carry no paging key; see
 [programs/threadstack/README.md](../programs/threadstack/README.md),
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/crashd/README.md](../services/crashd/README.md),
+[crashd Operation](../services/crashd/docs/operation.md),
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),

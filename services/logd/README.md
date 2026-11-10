@@ -91,7 +91,7 @@ targets; only the one-time init-logd history pull
   (`procmgr_labels::DECLARE_NO_DEBUG`): every process's log output, a
   debug-authority holder's own included, waits on logd, so a holder that
   stopped it would wait on itself (see
-  [services/crashd/README.md](../crashd/README.md) § Limits).
+  [crashd Operation](../crashd/docs/operation.md) § Limits).
 
 ## Out of scope (follow-up issues)
 

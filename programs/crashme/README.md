@@ -8,9 +8,10 @@ log.
 ## Role
 
 The fixture's per-program tester, `crashme-tester`, runs it once in each mode, and the `usertest`
-orchestrator discovers and runs that tester. The fixture installs at `/programs/crashme` and the
-tester at `/tests/programs/crashme`, per
-[docs/testing.md § Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
+orchestrator discovers and runs that tester. svctest's `crash_endpoint` phase also spawns it
+([services/svctest/README.md § Fixtures](../../services/svctest/README.md#fixtures)). The fixture
+installs at `/programs/crashme` and the tester at `/tests/programs/crashme`, per [docs/testing.md §
+Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
 
 | Mode | Fault |
 |---|---|

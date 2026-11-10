@@ -27,9 +27,10 @@ CRASH-END id=<id> lines=<count>
   that repeats one already read, key and value alike, is read once: crashd writes a line again
   when the watchdog cancelled its first write, which may have landed.
 
-The `id` is drawn at random per block. crashd also gives it as the reason of the decline that ends
-the thread, so the kernel's `fault unhandled: tid=<n> handler declined, reason=<id>` line on the
-serial console belongs to the block with that `id`.
+The `id` is drawn from the kernel's entropy per block (from the time since crashd started when the
+draw fails, which still tells a boot's blocks apart). crashd also gives it as the reason of the
+decline that ends the thread, so the kernel's `fault unhandled: tid=<n> handler declined,
+reason=<id>` line on the serial console belongs to the block with that `id`.
 
 ---
 
@@ -42,8 +43,8 @@ not know is skipped.
 |---|---|---|
 | `badge` | The process badge, decimal: the key logd's `reclaim: badge=<badge> exit_reason=<reason> name=<log name>` line names the process by at its death | always |
 | `arch` | `x86_64` or `riscv64` | always |
-| `thread` | `main`, the process's main thread, whose registers the block carries; or `unidentified`, another thread ([README § Limits](../README.md#limits)) | always |
-| `status` | `complete`; `unattached`, procmgr refused the attach (the process had exited); or `timeout`, the watchdog's bound passed first | always |
+| `thread` | `main`, the process's main thread, whose registers the block carries; or `unidentified`, another thread ([operation.md](operation.md) § Per Fault, § Limits) | always |
+| `status` | `complete`; `unattached`, the attach failed: procmgr refused it (the process had exited, or declared itself undebuggable) or the call failed; or `timeout`, the watchdog cancelled the attach ([operation.md](operation.md) § Bounds) | always |
 | `kind` | `vm`, a page fault the pager forwarded; or `exception` | always |
 | `access` | `read`, `write`, or `fetch` | `vm` |
 | `addr` | The faulting address, hexadecimal | `vm` |

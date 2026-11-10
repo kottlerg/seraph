@@ -476,8 +476,8 @@ pub mod procmgr_labels
     /// class from the crash endpoint and refuses [`ATTACH_PROCESS`] on it
     /// from then on, so no [`DEBUG_AUTHORITY`] holder stops it. Sent, before
     /// it spawns a thread, by each process a stop of which would deadlock a
-    /// debug-authority holder: the log sink, the serial driver, and every
-    /// debug-authority holder. No data, no caps. Replies `SUCCESS`, or
+    /// debug-authority holder: the log sink, the serial and framebuffer
+    /// drivers, and every debug-authority holder. No data, no caps. Replies `SUCCESS`, or
     /// `INVALID_BADGE` when the badge names no live process. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_DEBUG`.
     pub const DECLARE_NO_DEBUG: u64 = 21;

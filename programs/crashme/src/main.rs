@@ -14,38 +14,47 @@
 
 mod arch;
 
+/// The fault the fixture dies of.
+#[derive(Clone, Copy)]
+enum Mode
+{
+    /// A write to the null page.
+    Vm,
+    /// An illegal instruction.
+    Exception,
+}
+
 fn main()
 {
     std::os::seraph::log::register_name(b"crashme");
-    let mode = std::env::args().nth(1).unwrap_or_default();
-    match mode.as_str()
+    let arg = std::env::args().nth(1).unwrap_or_default();
+    let mode = match arg.as_str()
     {
-        "vm" | "exception" =>
-        {
-            std::os::seraph::log!("faulting ({mode})");
-            println!("faulting ({mode})");
-            outer(mode == "vm");
-        }
+        "vm" => Mode::Vm,
+        "exception" => Mode::Exception,
         _ =>
         {
             println!("usage: crashme vm|exception");
             std::process::exit(2);
         }
-    }
+    };
+    std::os::seraph::log!("faulting ({arg})");
+    println!("faulting ({arg})");
+    outer(mode);
 }
 
 /// The first of the two calls the fault happens under.
 #[inline(never)]
-fn outer(vm: bool) -> !
+fn outer(mode: Mode) -> !
 {
-    inner(std::hint::black_box(vm))
+    inner(std::hint::black_box(mode))
 }
 
-/// Fault: a null-page write for `vm`, else an illegal instruction.
+/// Fault as `mode` says.
 #[inline(never)]
-fn inner(vm: bool) -> !
+fn inner(mode: Mode) -> !
 {
-    if vm
+    if let Mode::Vm = mode
     {
         // SAFETY: deliberately invalid: the write faults, memmgr cannot back
         // the null page, and the thread dies before the write returns.

@@ -12,27 +12,24 @@
 //! (procmgr's `ATTACH_PROCESS`), reads what it can of the faulting thread,
 //! logs the report block (services/crashd/docs/block-format.md), and
 //! declines the fault with the report's id as the reason. The mechanism and
-//! its limits are in services/crashd/README.md.
-
-// cast_possible_truncation: targets are 64-bit; u64/usize conversions are
-// lossless.
-#![allow(clippy::cast_possible_truncation)]
+//! its limits are in services/crashd/docs/operation.md.
 
 mod arch;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crash_report::{Access, Fault, Image, Report, Status, Thread};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::{
-    FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL, MAX_THREAD_MEM_COPY,
-    PAGE_SIZE, SyscallError,
+    FAULT_CLASS_UPCALL, FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL,
+    FAULT_REPLY_RESUME, MAX_THREAD_MEM_COPY, PAGE_SIZE, SyscallError,
 };
 
-/// How long the reading of one fault may take before the watchdog cancels
-/// it. Only the attach request can block, on a procmgr that is itself waiting
-/// on the faulting process; the cancellation breaks that wait.
+/// How long the reading and logging of one fault may take before the
+/// watchdog cancels the request it waits in: the attach, which can wait on a
+/// procmgr that is itself waiting on the faulting process, or a log write,
+/// which can wait on a driver logd writes through.
 const FAULT_BOUND: Duration = Duration::from_secs(2);
 
 /// How often the watchdog checks the bound.
@@ -41,16 +38,22 @@ const WATCHDOG_TICK: Duration = Duration::from_millis(100);
 /// Bytes of stack the walk scans, from the stack pointer up.
 const STACK_SCAN_BYTES: u64 = 8192;
 
-/// The thread that receives faults, which the watchdog stops and starts
-/// again to cancel a blocked request.
-static RECEIVER: AtomicU64 = AtomicU64::new(0);
+/// The generation of the fault being handled, counting from 1; each fault
+/// takes the next.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Milliseconds since [`epoch`] when the current fault's reading began; 0
-/// while none is being read.
+/// Milliseconds since the first [`now_ms`] when the current generation's
+/// handling began; 0 while no fault is being handled.
 static ARMED_AT_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Whether the watchdog cancelled the current fault's reading.
-static FIRED: AtomicBool = AtomicBool::new(false);
+/// The generation whose handling the watchdog cancelled; 0 for none.
+static FIRED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the watchdog cancelled the handling of generation `generation`.
+fn fired(generation: u64) -> bool
+{
+    FIRED.load(Ordering::Acquire) == generation
+}
 
 fn main() -> !
 {
@@ -84,23 +87,15 @@ fn main() -> !
                 syscall::thread_exit();
             }
         };
+    if !start_watchdog()
+    {
+        std::os::seraph::log!("watchdog not started; a fault's handling is unbounded");
+    }
     let Some(endpoint) = register(authority, ipc_buf)
     else
     {
         syscall::thread_exit();
     };
-
-    RECEIVER.store(
-        std::os::seraph::thread::current_thread_cap(),
-        Ordering::Release,
-    );
-    if std::thread::Builder::new()
-        .name("watchdog".into())
-        .spawn(watchdog)
-        .is_err()
-    {
-        std::os::seraph::log!("watchdog not started; a fault's reading is unbounded");
-    }
     std::os::seraph::log!("reporting crashes");
 
     loop
@@ -113,8 +108,8 @@ fn main() -> !
         };
         if msg.label != FAULT_LABEL
         {
-            // Only procmgr holds a SEND on the endpoint, and it sends none;
-            // answer anything else without acting on it.
+            // Only procmgr holds a SEND on the endpoint, and it sends crashd
+            // none; answer anything else without acting on it.
             // SAFETY: ipc_buf is the registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_KILL), ipc_buf) };
             continue;
@@ -146,10 +141,12 @@ fn register(authority: u64, ipc_buf: *mut u64) -> Option<u64>
         Ok(r)
             if r.label == procmgr_errors::SUCCESS && r.caps().first().is_some_and(|&c| c != 0) =>
         {
+            delete_caps(&r.caps()[1..]);
             Some(r.caps()[0])
         }
         Ok(r) =>
         {
+            delete_caps(r.caps());
             std::os::seraph::log!("register refused (label={:#x})", r.label);
             None
         }
@@ -191,9 +188,9 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
         }
     };
 
-    FIRED.store(false, Ordering::Release);
+    let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     ARMED_AT_MS.store(now_ms().max(1), Ordering::Release);
-    let gathered = gather(msg.badge, ip, authority, ipc_buf);
+    let gathered = gather(msg.badge, ip, authority, generation, ipc_buf);
     let report = Report {
         id,
         badge: msg.badge,
@@ -210,7 +207,7 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
     let mut lines: Vec<String> = Vec::new();
     report.emit(|line| lines.push(line.to_string()));
     let mut logged = 0;
-    while logged < lines.len() && !FIRED.load(Ordering::Acquire)
+    while logged < lines.len() && !fired(generation)
     {
         std::os::seraph::log!("{}", lines[logged]);
         logged += 1;
@@ -221,8 +218,9 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&decline, ipc_buf) };
 
-    // A write the watchdog cancelled is written again, with the rest.
-    let resume = if FIRED.load(Ordering::Acquire)
+    // A write the watchdog cancelled is written again, with the rest; a
+    // reader counts a line written twice once.
+    let resume = if fired(generation)
     {
         logged.saturating_sub(1)
     }
@@ -249,8 +247,9 @@ struct Gathered
 
 /// Attach to the process `badge` names and read its faulting thread: the
 /// main thread's registers when the main thread is the one stopped at `ip`,
-/// the bytes at `ip`, and the stack walk.
-fn gather(badge: u64, ip: u64, authority: u64, ipc_buf: *mut u64) -> Gathered
+/// the bytes at `ip`, and the stack walk. An attach the watchdog cancelled
+/// for an earlier generation, whose cancellation lands late, is sent again.
+fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u64) -> Gathered
 {
     let mut out = Gathered {
         status: Status::Unattached,
@@ -264,22 +263,27 @@ fn gather(badge: u64, ip: u64, authority: u64, ipc_buf: *mut u64) -> Gathered
         .word(0, badge)
         .word(1, 0)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(authority, &request, ipc_buf) };
+    let reply = loop
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        match unsafe { ipc::ipc_call(authority, &request, ipc_buf) }
+        {
+            Err(e) if e == SyscallError::Interrupted as i64 && !fired(generation) =>
+            {}
+            other => break other,
+        }
+    };
     let reply = match reply
     {
         Ok(r) if r.label == procmgr_errors::SUCCESS => r,
         Ok(r) =>
         {
-            for &cap in r.caps()
-            {
-                let _ = syscall::cap_delete(cap);
-            }
+            delete_caps(r.caps());
             return out;
         }
-        Err(e) =>
+        Err(_) =>
         {
-            if e == SyscallError::Interrupted as i64 || FIRED.load(Ordering::Acquire)
+            if fired(generation)
             {
                 out.status = Status::Timeout;
             }
@@ -292,19 +296,21 @@ fn gather(badge: u64, ip: u64, authority: u64, ipc_buf: *mut u64) -> Gathered
         text_start: reply.word(2),
         text_end: reply.word(3),
     });
-    let Some(&thread) = reply.caps().first()
+    let Some((&thread, rest)) = reply.caps().split_first()
     else
     {
         return out;
     };
+    delete_caps(rest);
     read_thread(thread, ip, &mut out);
     let _ = syscall::cap_delete(thread);
     out
 }
 
 /// Read the main thread `thread` into `out`: its registers and stack walk
-/// when it is the thread stopped at `ip`, and the bytes at `ip` whichever
-/// thread faulted, through the address space they share.
+/// when it is stopped at `ip` (the identification
+/// services/crashd/docs/operation.md § Per Fault describes), and the bytes
+/// at `ip` whichever thread faulted, through the address space they share.
 fn read_thread(thread: u64, ip: u64, out: &mut Gathered)
 {
     let mut file = [0u8; arch::current::REGS_SIZE];
@@ -340,7 +346,7 @@ fn read_code(thread: u64, ip: u64) -> Vec<u8>
     {
         return buf.to_vec();
     }
-    let to_page_end = (PAGE_SIZE - (ip % PAGE_SIZE)) as usize;
+    let to_page_end = usize::try_from(PAGE_SIZE - (ip % PAGE_SIZE)).unwrap_or(buf.len());
     let len = to_page_end.min(buf.len());
     if syscall::thread_read_mem(thread, ip, &mut buf[..len]).is_ok()
     {
@@ -360,13 +366,18 @@ fn read_stack(thread: u64, sp: u64) -> Vec<u8>
     while at < end
     {
         let page_end = (at | (PAGE_SIZE - 1)).saturating_add(1);
-        let len = (page_end.min(end) - at) as usize;
+        // At most one page: a page's bytes fit `chunk` and a `usize`.
+        let Ok(len) = usize::try_from(page_end.min(end) - at)
+        else
+        {
+            break;
+        };
         if syscall::thread_read_mem(thread, at, &mut chunk[..len]).is_err()
         {
             break;
         }
         stack.extend_from_slice(&chunk[..len]);
-        at += len as u64;
+        at = at.saturating_add(page_end.min(end) - at);
     }
     stack
 }
@@ -383,6 +394,18 @@ fn le_word(bytes: &[u8]) -> u64
     let mut word = [0u8; 8];
     word.copy_from_slice(bytes);
     u64::from_le_bytes(word)
+}
+
+/// Delete each nonzero cap of `caps`.
+fn delete_caps(caps: &[u64])
+{
+    for &cap in caps
+    {
+        if cap != 0
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
 }
 
 /// A fresh report id from the kernel's entropy; a time-derived one when the
@@ -408,27 +431,73 @@ fn now_ms() -> u64
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// The watchdog: once a fault's reading has run past [`FAULT_BOUND`], stop
-/// the receiving thread and start it again, which cancels the request it is
-/// blocked in (`Interrupted`); the thread keeps the fault it holds, since a
-/// stop cancels no pending reply.
-fn watchdog()
+/// Bind the calling thread's upcall class to an endpoint the watchdog
+/// thread receives on, and start that thread. `false`, with nothing bound,
+/// when the endpoint, the binding, or the thread cannot be had.
+fn start_watchdog() -> bool
 {
+    let receiver = std::os::seraph::thread::current_thread_cap();
+    let Some(endpoint) =
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |s| {
+            syscall::cap_create_endpoint(s).ok()
+        })
+    else
+    {
+        return false;
+    };
+    if syscall::thread_set_fault_handler(receiver, endpoint, FAULT_CLASS_UPCALL).is_err()
+    {
+        let _ = syscall::cap_delete(endpoint);
+        return false;
+    }
+    if std::thread::Builder::new()
+        .name("watchdog".into())
+        .spawn(move || watchdog(receiver, endpoint))
+        .is_err()
+    {
+        let _ = syscall::thread_set_fault_handler(receiver, 0, FAULT_CLASS_UPCALL);
+        let _ = syscall::cap_delete(endpoint);
+        return false;
+    }
+    true
+}
+
+/// The watchdog: once a fault's handling has run past [`FAULT_BOUND`], post
+/// the receiving thread an upcall, which cancels the blocking request it
+/// waits in (`Interrupted`), and serve the upcall when it is delivered. An
+/// upcall never cancels a fault of the receiver's own, a page fault on its
+/// pager included, which it waits for. The generation, re-read just before
+/// the post, keeps a fault whose handling ended meanwhile from cancelling the
+/// next one's.
+fn watchdog(receiver: u64, endpoint: u64)
+{
+    let bound_ms = u64::try_from(FAULT_BOUND.as_millis()).unwrap_or(u64::MAX);
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     loop
     {
         std::thread::sleep(WATCHDOG_TICK);
+        let generation = GENERATION.load(Ordering::Acquire);
         let armed = ARMED_AT_MS.load(Ordering::Acquire);
-        if armed == 0 || now_ms().saturating_sub(armed) < FAULT_BOUND.as_millis() as u64
+        if armed == 0
+            || now_ms().saturating_sub(armed) < bound_ms
+            || fired(generation)
+            || GENERATION.load(Ordering::Acquire) != generation
         {
             continue;
         }
-        if FIRED.swap(true, Ordering::AcqRel)
+        FIRED.store(generation, Ordering::Release);
+        if syscall::thread_post_upcall(receiver, generation, 0).is_err()
         {
             continue;
         }
-        let receiver = RECEIVER.load(Ordering::Acquire);
-        let _ = syscall::thread_stop(receiver);
-        let _ = syscall::thread_start(receiver);
-        std::os::seraph::log!("a fault's reading passed its bound; reporting what was read");
+        // The upcall is delivered at the receiver's next syscall return;
+        // resume it there.
+        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+        if unsafe { ipc::ipc_recv(endpoint, ipc_buf) }.is_ok()
+        {
+            // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf) };
+        }
+        std::os::seraph::log!("a fault's handling passed its bound; reporting what was read");
     }
 }

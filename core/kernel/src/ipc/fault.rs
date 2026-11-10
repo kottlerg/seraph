@@ -467,6 +467,48 @@ pub unsafe fn release_endpoints(eps: [*mut EndpointObject; FAULT_CLASSES])
 #[cfg(not(test))]
 pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> FaultOutcome
 {
+    // SAFETY: this fn's contract is dispatch's.
+    unsafe { dispatch(tcb, info, Forwarding::Followed) }
+}
+
+/// [`fault_dispatch`] for the fault of a restartable syscall's user copy
+/// (docs/fault-handling.md § Kernel Copies): a forward of it is a decline,
+/// so the syscall fails with `InvalidAddress` and no exception handler sees a
+/// fault the thread survives (docs/fault-handling.md § Reply).
+///
+/// # Safety
+/// As for [`fault_dispatch`].
+#[cfg(not(test))]
+pub unsafe fn copy_fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> FaultOutcome
+{
+    // SAFETY: this fn's contract is dispatch's.
+    unsafe { dispatch(tcb, info, Forwarding::Declined) }
+}
+
+/// Whether [`dispatch`] delivers a forwarded fault through the exception
+/// class or takes the forward as a decline.
+#[cfg(not(test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Forwarding
+{
+    /// A forward is delivered through the exception class.
+    Followed,
+    /// A forward is a decline: the fault of a kernel copy.
+    Declined,
+}
+
+/// The loop [`fault_dispatch`] describes, with a forward taken as
+/// `forwarding` says.
+///
+/// # Safety
+/// As for [`fault_dispatch`].
+#[cfg(not(test))]
+unsafe fn dispatch(
+    tcb: *mut ThreadControlBlock,
+    info: &FaultInfo,
+    forwarding: Forwarding,
+) -> FaultOutcome
+{
     let mut class = class_of_kind(info.kind);
     let mut forwarded = Forward::None;
     loop
@@ -478,6 +520,11 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
             FAULT_OUTCOME_RESUME => return FaultOutcome::Resume,
             FAULT_OUTCOME_REDELIVER =>
             {}
+            FAULT_OUTCOME_FORWARDED if forwarding == Forwarding::Declined =>
+            {
+                // SAFETY: tcb resumed by the wake of the forwarding reply.
+                return FaultOutcome::Kill(KillCause::Declined(unsafe { reply_reason(tcb) }));
+            }
             FAULT_OUTCOME_FORWARDED =>
             {
                 // SAFETY: tcb resumed by the wake of the forwarding reply.

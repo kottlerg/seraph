@@ -1883,7 +1883,7 @@ fn finalize_creation(
     demand_paged: bool,
     self_memmgr_ep: u64,
     parent_relay_cap: u64,
-    sched: ChildSched,
+    band_max: u8,
     image: ImageSpan,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
@@ -1891,7 +1891,6 @@ fn finalize_creation(
 ) -> Result<CreateResult, u64>
 {
     let badge = process_badge;
-    let band_max = sched.band_max;
     let pi_memory_cap = info_caps.pi_memory.cap();
 
     // Bind a death observer from procmgr's death queues on the child's main
@@ -2405,7 +2404,7 @@ fn create_process_from_bytes(
         // Boot-module spawns (CREATE_PROCESS) have no parent death queue to
         // relay terminal faults to; only CREATE_FROM_FILE carries a relay.
         0,
-        sched,
+        sched.band_max,
         image,
         ipc_buf,
         &layout,
@@ -3464,7 +3463,7 @@ pub fn create_process_from_file(
         universals.demand_paged,
         universals.self_memmgr_ep,
         parent_relay_cap,
-        sched,
+        sched.band_max,
         image,
         ipc_buf,
         &layout,

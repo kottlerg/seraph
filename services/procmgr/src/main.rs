@@ -741,7 +741,7 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
         .split_first()
         .map_or((0, &[][..]), |(&t, rest)| (t, rest));
     release_caps(extra);
-    match crash::register(thread)
+    match crash::register(thread, ipc_buf)
     {
         Ok(recv) =>
         {

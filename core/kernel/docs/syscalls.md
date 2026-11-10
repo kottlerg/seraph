@@ -1433,7 +1433,8 @@ object),
 Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling,
 or, with `THREAD_START_SUSPENDED`, a configured `Created` thread to `Stopped`.
 Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
-handler's claiming reply was `FAULT_REPLY_KILL`, kills it as an unhandled fault, which posts its
+handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` with no exception
+handler bound), kills it as an unhandled fault, which posts its
 death and address-space observers, or, for the fault of a restartable syscall's user copy, fails
 that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
@@ -1500,7 +1501,8 @@ with a kill outcome (no syscall returns) and the thread is left `Stopped`; the n
 `SYS_THREAD_START` then kills it as an unhandled fault (for the fault of a restartable syscall's
 user copy, fails that syscall with `InvalidAddress`). A thread whose handler's reply claimed the
 fault first keeps that reply's outcome: when next started it resumes its faulting instruction on
-`FAULT_REPLY_RESUME` and takes the unhandled outcome on `FAULT_REPLY_KILL` (see
+`FAULT_REPLY_RESUME`, takes the unhandled outcome on `FAULT_REPLY_KILL`, and delivers the fault
+through its exception class on a forwarding `FAULT_REPLY_FORWARD` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
 cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker

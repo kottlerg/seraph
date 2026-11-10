@@ -381,6 +381,7 @@ not launched. A recipe the heap cannot copy at parse time is dropped like a malf
 [Fault Handling](../../../docs/fault-handling.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [services/crashd/README.md](../../crashd/README.md),
+[crashd Operation](../../crashd/docs/operation.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),
 [logd handover protocol](../../logd/docs/handover-protocol.md),

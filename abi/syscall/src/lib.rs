@@ -1213,7 +1213,9 @@ pub const FAULT_REPLY_KILL: u64 = 1;
 /// carries none), and that handler's reply then decides. With no exception
 /// handler bound, the forward is a [`FAULT_REPLY_KILL`] reply carrying the
 /// forwarder's data word 0 as its decline reason. On a delivery of any other
-/// class it is a [`FAULT_REPLY_KILL`] reply (docs/fault-handling.md § Reply).
+/// class, and on the fault of a restartable syscall's user copy, which the
+/// thread survives, it is a [`FAULT_REPLY_KILL`] reply (docs/fault-handling.md
+/// § Reply).
 pub const FAULT_REPLY_FORWARD: u64 = 2;
 
 /// Data word of a forwarded fault message ([`FAULT_REPLY_FORWARD`]) that

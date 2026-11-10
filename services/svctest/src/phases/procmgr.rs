@@ -138,7 +138,7 @@ pub fn init_cspace_released_phase(_: &Caps)
     panic!("init_cspace_released: init's reap did not run within the poll budget");
 }
 
-/// `command_*`, `stdio_file_unsupported`, `procmgr_refusals`,
+/// `command_*`, `stdio_file_unsupported`, `procmgr_refusals`, `crash_endpoint`,
 /// `procmgr_dma_hold`, and `death_queue_growth` run after the namespace cluster has established
 /// attenuation invariants.
 pub fn command_phases() -> &'static [Phase]
@@ -175,6 +175,10 @@ pub fn command_phases() -> &'static [Phase]
         Phase {
             name: "procmgr_refusals",
             run: procmgr_refusals_phase,
+        },
+        Phase {
+            name: "crash_endpoint",
+            run: super::crash::crash_endpoint_phase,
         },
         Phase {
             name: "procmgr_dma_hold",

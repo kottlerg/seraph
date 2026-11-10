@@ -19,6 +19,14 @@
 //!   3. **Forward from the exception class.** A forward of an exception
 //!      delivery is a decline too: the thread exits with the illegal
 //!      instruction's reason, and nothing reaches the VM endpoint.
+//!   4. **Forward of a kernel copy.** A forward of the fault of a
+//!      `SYS_GETRANDOM` copy into an unmapped buffer is a decline: the
+//!      syscall fails with `InvalidAddress` and the thread runs on, reporting
+//!      it, without the exception handler receiving anything.
+//!   5. **Rebind after a forward.** A change of the exception class's binding
+//!      while the forwarded delivery waits there delivers the fault again
+//!      under the new binding, with its badge and the forwarder's word still
+//!      data word 4.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -29,8 +37,8 @@ use syscall::{
 };
 use syscall_abi::{
     EXIT_FAULT_BASE, FAULT_CLASS_EXCEPTION, FAULT_CLASS_VM, FAULT_FORWARD_REASON_WORD,
-    FAULT_KIND_EXCEPTION, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_FORWARD, FAULT_REPLY_RESUME,
-    RIGHTS_NTF_NOTIFY,
+    FAULT_KIND_EXCEPTION, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_FORWARD, FAULT_REPLY_KILL,
+    FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -39,9 +47,14 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// paging mode (below the 2^38 Sv39 user half). Distinct from other tests.
 const RESERVED_VA: u64 = 0x3E_E000_0000;
 
-/// Badges bound with the VM and the exception endpoint.
+/// Badges bound with the VM and the exception endpoint, and with the
+/// endpoint the exception class is rebound to.
 const BADGE_VM: u64 = 0xC0FF_EE1A;
 const BADGE_EXC: u64 = 0xC0FF_EE1B;
+const BADGE_OTHER: u64 = 0xC0FF_EE1C;
+
+/// Bytes the copy-fault child's `SYS_GETRANDOM` asks for.
+const COPY_LEN: usize = 16;
 
 /// The reason word the VM handler forwards.
 const REASON: u64 = 0x5EED_0003;
@@ -64,7 +77,7 @@ const BUF: usize = 512;
 const _: () = assert!(BUF as u64 >= crate::arch::TRAP_FRAME_BYTES);
 
 /// One child per phase.
-const CHILDREN: usize = 3;
+const CHILDREN: usize = 5;
 
 static mut STACKS: [ChildStack; CHILDREN] = [ChildStack::ZERO; CHILDREN];
 
@@ -77,6 +90,7 @@ struct Parts
 {
     ep_vm: Option<u64>,
     ep_exc: Option<u64>,
+    ep_other: Option<u64>,
     sig: Option<u64>,
     ws: Option<u64>,
     children: [Option<spawn::SpawnedChild>; CHILDREN],
@@ -87,6 +101,7 @@ struct Objects
 {
     ep_vm: u64,
     ep_exc: u64,
+    ep_other: u64,
     sig: u64,
     ws: u64,
 }
@@ -101,9 +116,15 @@ pub fn run(ctx: &TestContext) -> TestResult
         ok &= child.delete_thread().is_ok();
         ok &= child.delete_cspace().is_ok();
     }
-    for cap in [parts.ws, parts.ep_vm, parts.ep_exc, parts.sig]
-        .into_iter()
-        .flatten()
+    for cap in [
+        parts.ws,
+        parts.ep_vm,
+        parts.ep_exc,
+        parts.ep_other,
+        parts.sig,
+    ]
+    .into_iter()
+    .flatten()
     {
         ok &= cap_delete(cap).is_ok();
     }
@@ -128,6 +149,9 @@ fn phases(ctx: &TestContext, parts: &mut Parts) -> TestResult
         ep_exc: *parts
             .ep_exc
             .insert(cap_create_endpoint(ctx.memory_base).map_err(fail)?),
+        ep_other: *parts
+            .ep_other
+            .insert(cap_create_endpoint(ctx.memory_base).map_err(fail)?),
         sig: *parts
             .sig
             .insert(cap_create_notification(ctx.memory_base).map_err(fail)?),
@@ -141,7 +165,60 @@ fn phases(ctx: &TestContext, parts: &mut Parts) -> TestResult
         .map_err(|_| "integration::fault_forward: wait_set_add (exception) failed")?;
     forward_to_bound(ctx, parts, &objects)?;
     forward_to_none(ctx, parts, &objects)?;
-    forward_from_exception(ctx, parts, &objects)
+    forward_from_exception(ctx, parts, &objects)?;
+    forward_of_kernel_copy(ctx, parts, &objects)?;
+    rebind_after_forward(ctx, parts, &objects)
+}
+
+/// Phase 4: a forward of a kernel copy's fault fails the syscall, and the
+/// thread reports it; the exception endpoint receives nothing.
+fn forward_of_kernel_copy(ctx: &TestContext, parts: &mut Parts, objects: &Objects) -> TestResult
+{
+    let th = spawn_child(ctx, parts, 3, objects)?;
+    bind_vm(th, objects)?;
+    bind_exception(th, objects)?;
+    start_child(parts, 3, copy_entry)?;
+    let msg = expect_fault_at(ctx, objects, WS_VM)?;
+    if msg.word(0) != FAULT_KIND_VM || msg.word(1) != RESERVED_VA
+    {
+        return Err("integration::fault_forward: unexpected copy fault message");
+    }
+    reply_with_reason(ctx, FAULT_REPLY_FORWARD)?;
+    let bits = notification_wait_timeout(objects.sig, crate::scaled_bound(REPORT_MS))
+        .map_err(|_| "integration::fault_forward: copy report wait failed")?;
+    if bits != COPY_REFUSED
+    {
+        return Err("integration::fault_forward: a forwarded copy fault did not fail the syscall");
+    }
+    Ok(())
+}
+
+/// Phase 5: a rebind of the exception class while the forwarded delivery is
+/// queued there delivers it again under the new binding.
+fn rebind_after_forward(ctx: &TestContext, parts: &mut Parts, objects: &Objects) -> TestResult
+{
+    let th = spawn_child(ctx, parts, 4, objects)?;
+    bind_vm(th, objects)?;
+    bind_exception(th, objects)?;
+    start_child(parts, 4, store_entry)?;
+    expect_fault_at(ctx, objects, WS_VM)?;
+    reply_with_reason(ctx, FAULT_REPLY_FORWARD)?;
+    crate::bind_fault_handler_classes(th, objects.ep_other, BADGE_OTHER, FAULT_CLASS_EXCEPTION)
+        .map_err(|_| "integration::fault_forward: rebind (exception) failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(objects.ep_other, ctx.ipc_buf) }
+        .map_err(|_| "integration::fault_forward: ipc_recv on the rebound endpoint failed")?;
+    if msg.label != FAULT_LABEL
+        || msg.badge != BADGE_OTHER
+        || msg.word(0) != FAULT_KIND_VM
+        || msg.word(FAULT_FORWARD_REASON_WORD) != REASON
+    {
+        return Err("integration::fault_forward: the rebound delivery is not the forwarded fault");
+    }
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_KILL), ctx.ipc_buf) }
+        .map_err(|_| "integration::fault_forward: reply (kill) failed")?;
+    expect_exit(th, crate::arch::PAGE_FAULT_STORE_VECTOR)
 }
 
 /// Phase 1: the forward delivers the fault to the exception endpoint, where
@@ -333,6 +410,28 @@ extern "C" fn store_entry(_arg: u64) -> !
     // this page.
     unsafe {
         p.write_volatile(0xDEAD_BEEF);
+    }
+    loop
+    {
+        core::hint::spin_loop();
+    }
+}
+
+/// The copy-fault child's report: its `SYS_GETRANDOM` failed with
+/// `InvalidAddress`.
+const COPY_REFUSED: u64 = 0x2;
+
+/// Child entry: `SYS_GETRANDOM` into the unmapped reserved VA, whose copy
+/// faults; report through the published notification cap when the syscall
+/// fails with `InvalidAddress`. The loop only satisfies `-> !`.
+extern "C" fn copy_entry(_arg: u64) -> !
+{
+    // SAFETY: the span is unmapped, and no Rust object occupies it; the kernel
+    // refuses the copy, or writes it once a handler backs it, which none does.
+    let r = unsafe { syscall::getrandom_raw(RESERVED_VA as *mut u8, COPY_LEN) };
+    if r == Err(syscall_abi::SyscallError::InvalidAddress as i64)
+    {
+        syscall::notification_send(RECOVERY_SIG.load(Ordering::Acquire), COPY_REFUSED).ok();
     }
     loop
     {

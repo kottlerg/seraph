@@ -44,7 +44,7 @@ the client's bounded poll) but `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAI
 Before its bootstrap the driver declares itself undebuggable to procmgr
 (`procmgr_labels::DECLARE_NO_DEBUG`): logd writes every log line through it, so a debug-authority
 holder that stopped it would wait on its own log output
-([services/crashd/README.md](../../crashd/README.md) § Limits).
+([crashd Operation](../../crashd/docs/operation.md) § Limits).
 
 The bootstrap is two rounds: the first carries the service endpoint, the arch authority cap, and
 the interrupt cap when present; the second, terminal one carries the driver's devmgr query cap.

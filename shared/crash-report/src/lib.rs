@@ -261,9 +261,9 @@ pub struct Image
 {
     /// The bias the loader added to every ELF address of the image.
     pub load_bias: u64,
-    /// First byte of the image's executable segment, biased.
+    /// Lowest byte of the image's executable segments, biased.
     pub text_start: u64,
-    /// One past the last byte of the image's executable segment, biased.
+    /// One past the highest byte of the image's executable segments, biased.
     pub text_end: u64,
 }
 

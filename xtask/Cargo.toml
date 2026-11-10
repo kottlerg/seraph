@@ -34,8 +34,17 @@ libc = "0.2"
 # pointing at the install package, rather than the OS's opaque
 # "No such file or directory" from Command::spawn.
 which = "8"
+# `symbolize`: ELF parsing (sections, symbol table) and DWARF address-to-line
+# resolution, in Rust, so symbolizing needs no host tool the pinned toolchain
+# does not ship (its llvm-tools carries no symbolizer).
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
+addr2line = { version = "0.27", default-features = false, features = ["std", "rustc-demangle"] }
 
 [dev-dependencies]
+# `symbolize`'s tests write their ELF fixtures (a symbol table and DWARF
+# with a known function, file, and line) instead of checking binaries in.
+object = { version = "0.40", default-features = false, features = ["write"] }
+gimli = { version = "0.34", default-features = false, features = ["write"] }
 # logd's reclaim-line formatter (`logd_codec::reclaim`): test-logd-reclaim's
 # parser is tested against the line logd formats, not a copy of its shape.
 logd-codec = { path = "../services/logd/codec" }

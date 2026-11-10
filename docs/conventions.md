@@ -91,19 +91,19 @@ Every Issue MUST carry at least one **Subsystem** label and at least one **Class
 
 ### Milestones
 
-Each `Y` bump (`v0.1.0`, `v0.2.0`, …) and each `Z` patch (`v0.1.1`, …), shipped or planned, has a
-GitHub milestone. The current milestone is the lowest-versioned open one. An Issue a release will
-absorb (a defect, a cleanup, scheduled work of any class) MUST carry a milestone from creation:
-the current milestone, or the later release it is planned for. A follow-up Issue the pre-merge
-review files (§ Follow-up Issues) MUST carry the current milestone: it records findings on work
-the current release contains, and step 8 of § Release Production moves it on when the release
-closes. Only future-state work no release has scheduled (a design umbrella, an unscheduled
-feature) MAY stay unassigned; it is assigned when it is scheduled. The rule applies to open Issues
-filed before it: the maintainer assigns each a milestone or confirms it as unscheduled work. An
-Issue that closes without a milestone, or under one other than the current milestone, MUST be
-assigned the current milestone when it closes; step 8 of § Release Production decides the release
-a closed Issue settles on. A pull request MUST NOT carry a milestone; milestones are assigned to
-Issues only.
+Each `Y` bump (`v0.1.0`, `v0.2.0`, …) and each `Z` patch (`v0.1.1`, …), shipped or planned, has
+a GitHub milestone. The current milestone is the lowest-versioned open one. An Issue a release
+will absorb (a defect, a cleanup, scheduled work of any class) MUST carry a milestone from
+creation: the current milestone, or the later release it is planned for. A follow-up Issue the
+pre-merge review files (§ Follow-up Issues) MUST carry the current milestone: it records
+findings on work the current release contains, and step 8 of § Release Production closes it or
+moves it on when the release closes. Only future-state work no release has scheduled (a design
+umbrella, an unscheduled feature) MAY stay unassigned; it is assigned when it is scheduled. The
+rule applies to open Issues filed before it: the maintainer assigns each a milestone or confirms
+it as unscheduled work. An Issue that closes without a milestone, or under one other than the
+current milestone, MUST be assigned the current milestone when it closes; step 8 of § Release
+Production decides the release a closed Issue settles on. A pull request MUST NOT carry a
+milestone; milestones are assigned to Issues only.
 
 ### Commit and PR cross-references
 
@@ -256,14 +256,15 @@ with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
   what the run after it leaves on the surface is recorded, and no further round is taken for
   it.
 
-A PR MUST NOT merge before it meets the merge condition, and a PR that meets it merges without
-a further decision. `cargo xtask pr-check <N> --gate` checks the part of the condition a
-script can decide and names the rest for its reader. In an orchestrated batch the orchestrator
-merges such a PR; a session working alone with the maintainer reports that the PR meets the
-condition and merges on the maintainer's instruction. Two things stay the maintainer's
-whatever the gate says: a change to `.claude/CLAUDE.md`, to the assistant's settings, or to
-its hooks is applied only on the maintainer's own word, and the release steps of § Release
-Production are the maintainer's.
+A PR MUST NOT merge before it meets the merge condition. `cargo xtask pr-check <N> --gate`
+checks the part of the condition a script can decide and names the rest for its reader. In an
+orchestrated batch the orchestrator merges a PR that meets it, with no further decision of the
+maintainer. A session working alone with the maintainer reports that the PR meets the
+condition, and the maintainer's instruction to merge is the one decision left. Two things stay
+the maintainer's whatever the gate says: a change to `.claude/CLAUDE.md`, to the assistant's
+settings, or to its hooks is applied only on the maintainer's own word; and in § Release
+Production the tag (step 5), the publishing of the Release (step 7), and the milestone work
+of step 8 are the maintainer's. The release PR of step 3 merges as any PR does.
 
 Every finding a run counts is fixed or recorded as the subsections below say. A finding MUST NOT
 be waived or ruled outside the standards.
@@ -428,10 +429,11 @@ records a finding is the first of these that applies:
    in that scope).
 4. The rolling Issue of its scope.
 
-A finding of class style that is not a MUST violation goes on no Issue. The run record that
-reports it is its record, and the ledger keeps a later run from raising it again (§ Ledger);
-where this document requires a finding to be recorded, the run record meets that for such a
-finding.
+A finding of class style that is not a MUST violation, reported by a PR's pre-merge review,
+goes on no Issue. The run record that reports it is its record, and the ledger keeps a later
+run from raising it again (§ Ledger); where this section and § Pre-merge review require a
+finding of a PR's review to be recorded, the run record meets that for such a finding. The
+release review records every finding it leaves, as step 2 of § Release Production says.
 
 ### Ledger
 

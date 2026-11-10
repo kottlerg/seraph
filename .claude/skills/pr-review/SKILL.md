@@ -63,7 +63,8 @@ defines the record. Five points it leaves to you:
 - In an `audit` record, `verdict` is the reviewer verdict the audit states, `findings` holds the
   surface findings of the last reviewer run that the audit lists as unfixed, each as that run's
   record states it, and `recorded`, `ledgered` and `dropped` are empty.
-- A run of the reviewer alone, made while an owed host run is unreported, is a `full` or `delta`
+- A run of the reviewer alone, made while the PR body reports a run as pending, is a `full` or
+  `delta`
   record with `audit_verdict` `NOT RUN` and `audit` `null`. The gate still needs `AUDIT PASS` in
   the last record at the head, so the audit it leaves owed is a later `audit` record there.
 

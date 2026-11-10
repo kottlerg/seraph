@@ -42,5 +42,6 @@ worktree holds nothing unsaved or unpushed (the second check of
 `.claude/skills/orchestrate/worktree-removal.md`), the maintainer removes it, or the session
 does when asked, as that file describes.
 
-At the gate, give both verdict lines verbatim and prompt for the merge decision. Merge only on
-the maintainer's instruction.
+At the gate, give both verdict lines verbatim and say that the PR meets the merge condition
+(docs/conventions.md § Pre-merge review). The maintainer's instruction to merge is the one
+decision left; merge only on it.

@@ -552,7 +552,8 @@ concurrency-fix purpose owes the whole boundary set on its own (see Repeat count
 CPU-count surface is the code that fixes the CPU-count width, enumerates and brings up CPUs, sizes
 per-CPU storage, or signals across CPUs, and it is exactly what this paragraph lists. Code that only
 reads `CPU_COUNT` or a `cpu_count` argument to iterate over CPUs is not on it unless it lies in a
-whole-surface file, names a listed item, or lies within one's definition; the rules of
+whole-surface file, names a listed item, lies within one's definition, or is a test case whose
+work grows with the CPU count (below); the rules of
 [coding-standards.md](coding-standards.md) § CPU-Count Width and the release host runs cover it. The
 surface is these files as a whole:
 

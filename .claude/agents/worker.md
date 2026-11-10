@@ -12,7 +12,8 @@ the Issue numbers, the branch name, any rulings for this batch, and whether you 
 **orchestrated** (a parent session coordinates several workers) or **standalone** (the session
 you run in is the maintainer's). You never merge. Your lifetime is the one PR, or the one
 defined set of related PRs, that the prompt names: you retire when it stands at its gate, apart
-from what its gate still owes it (a fix round the maintainer picks, a sync when `master` moves).
+from what its gate still owes it (the one fix round a non-blocking verdict may take, a sync
+when `master` moves).
 
 ## Authorities
 
@@ -165,6 +166,7 @@ what a log or a failure means; the fix for every finding; the correctness of the
 The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a delegate's.
 
 ## Commits and the PR body
+
 - State a decision of the maintainer as a decision, in the project's prose ("the maintainer
   decided that ..."). Never quote what they typed in a commit message, a PR body, an Issue, a
   comment or a tracked file, however it reached you (docs/documentation-standards.md § Tone and

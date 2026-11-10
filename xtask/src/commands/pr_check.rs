@@ -669,8 +669,8 @@ pub fn diff_changes(diff: &str) -> Vec<Change>
 /// The changes of a unified diff that are not comment lines, as
 /// `<path>: <what>`; empty when the diff alters only comments and blank
 /// lines. A binary change, a mode change, and any non-blank line of a file
-/// type whose comment syntax is unknown count as changes. The diff must be made with `--no-renames`, so a
-/// rename shows its lines.
+/// type whose comment syntax is unknown count as changes. The diff must be
+/// made with `--no-renames`, so a rename shows its lines.
 pub fn non_comment_changes(diff: &str) -> Vec<String>
 {
     diff_changes(diff)

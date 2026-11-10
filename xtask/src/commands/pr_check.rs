@@ -913,7 +913,12 @@ fn read_synced_delta(
     let embedded = embedded_paths(pat, &names.join("\n"), &embed_lines(root, head)?);
     let mut changes: Vec<String> = difference
         .iter()
-        .filter(|c| c.code && !c.path.ends_with(".md"))
+        .filter(|c| {
+            c.code
+                && !Path::new(&c.path)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        })
         .map(|c| format!("{}: {}", c.path, c.line))
         .collect();
     changes.dedup();
@@ -977,12 +982,7 @@ fn check_validated_head(
                 }
                 else
                 {
-                    read_synced_delta(
-                        pat,
-                        root,
-                        (&validated, validated_base),
-                        (head, head_base),
-                    )?
+                    read_synced_delta(pat, root, (&validated, validated_base), (head, head_base))?
                 };
                 delta_diags(pat, body, &validated, &delta)
             }
@@ -1768,10 +1768,8 @@ mod tests
     {
         fn new(name: &str) -> Repo
         {
-            let root = std::env::temp_dir().join(format!(
-                "seraph-pr-check-{name}-{}",
-                std::process::id()
-            ));
+            let root =
+                std::env::temp_dir().join(format!("seraph-pr-check-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             let repo = Repo { root };

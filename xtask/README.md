@@ -16,6 +16,7 @@ xtask/
 │   ├── main.rs                 # Entry point; dispatches CliCommand
 │   ├── cli.rs                  # Clap derive structs for every subcommand
 │   ├── context.rs              # Resolved workspace and build-output paths
+│   ├── crash_log.rs            # Symbolized crash reports from a serial log (symbolize --log)
 │   ├── diag.rs                 # Diagnostics of the pull-request, record, and Issue checks
 │   ├── arch.rs                 # Supported architectures and per-arch constants
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
@@ -59,8 +60,8 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture |
 | `--release` | off | Build in release mode |
-| `--component` | `all` | Build a single component: any `BuildComponent` name (`boot`, `kernel`, `init`, `ktest`, each service or program crate), or `all` |
-| `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, e.g. `--debug kernel,procmgr`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
+| `--component` | `all` | Build a single component: `boot`, the crate name of any component the build installs (an entry of the `SPECS` table in `xtask/src/commands/build.rs`: `kernel`, `init`, `ktest`, each service, driver, program, fixture, and tester crate), or `all` |
+| `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, each named as `--component` names it, e.g. `--debug kernel,crashme`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
 
 The sysroot is architecture-specific. Building for a different arch than the
 existing sysroot is an error — run `cargo xtask clean` first (per
@@ -426,8 +427,12 @@ cargo xtask run-parallel --arch x86_64 --parallel 4 --runs 100 \
 non-passing runs are preserved under `target/xtask/run-parallel/` as
 `OK-<run>.log`, `FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or
 `QEMU-CRASH-<run>.log`. PASS logs are discarded there (`--save-logs` keeps a copy of every
-log elsewhere). Each invocation first removes
-the run logs an earlier one left there, so the preserved logs are its own.
+log elsewhere). Beside each log it keeps, in either place, whose log holds a crash-report block, a
+run writes the block's symbolized report, `cargo xtask symbolize --log`'s output against the
+current sysroot, as `<name>.crash.txt` for `<name>.log`, and removes a stale `<name>.crash.txt` of
+a log without one; it symbolizes only for a run that keeps its log, and a failure writing the report
+is a warning that changes no outcome. Each invocation first removes the run logs and crash reports
+an earlier one left under `target/xtask/run-parallel/`, so the preserved files are its own.
 
 **Outcome precedence**:
 1. `--fail` regex matches → `FAIL` (a live match also triggers early abort
@@ -528,12 +533,14 @@ inlined into on its own line, and, where no DWARF covers it (a build without `--
 component, or code compiled without debug information), from the image's symbol table, as the
 nearest function symbol and the offset into it. Installed binaries keep their symbol tables
 ([docs/build-system.md](../docs/build-system.md) § Debuginfo is opt-in), so the fallback names
-the function in every build. Use cases are in [docs/testing.md](../docs/testing.md#troubleshooting)
+the function in every build. With `--log`, the addresses are those of the crash reports in a
+serial log. Use cases are in [docs/testing.md](../docs/testing.md#troubleshooting)
 § Troubleshooting.
 
 ```
 cargo xtask symbolize --binary PATH [--bias HEX] ADDR...
 cargo xtask symbolize --kernel [--bias HEX] ADDR...
+cargo xtask symbolize --log FILE
 ```
 
 | Option | Default | Description |
@@ -541,10 +548,12 @@ cargo xtask symbolize --kernel [--bias HEX] ADDR...
 | `--binary` | | The ELF image the addresses fall in: a sysroot binary, or its build output under `target/` |
 | `--kernel` | | Resolve against the sysroot's kernel image, `sysroot/esp/EFI/seraph/kernel` |
 | `--bias` | `0` | The image's load bias in hex: for a userspace process its creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, and, for init itself, the kernel's `init: PIE bias=0x…`), for the kernel the KASLR slide from its serial-only `kaslr: slide=` line (`0` in a boot authored with `mkdisk --no-kaslr`) |
-| `ADDR...` | (required) | Runtime addresses, in hex (`0x` optional) |
+| `ADDR...` | (required without `--log`) | Runtime addresses, in hex (`0x` optional) |
+| `--log` | | A serial log: symbolize every crash-report block in it (below) instead of `ADDR...` |
 
-Each address prints one line, `<address> (image <address less bias>): <resolution> [<source>]`
-(the image address shown only when the bias is not `0`), where the source is the one used:
+Each address's first line is `<address> (image <address less bias>): <resolution> [<source>]`
+(the image address shown only when the bias is not `0`), where the source is the one used; a
+`debug-info` resolution goes on to one line per inlined caller:
 
 | Source | Resolution |
 |---|---|
@@ -557,6 +566,47 @@ Names are demangled. A frame prints only what its DWARF gives: `??` for an unnam
 DWARF at all prints a note naming the symbol-table fallback first. An address below the bias, an
 unreadable file, or a file that is not an ELF image fails the command; a compressed debug section
 is refused.
+
+**Log form.** `--log` reads the crash-report blocks crashd logs
+([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)) with
+`shared/crash-report`'s parser. A block names its process by badge; logd's
+`reclaim: badge=<badge> … name=<log name>` line for that badge (or its resync form,
+`reclaim (resync): badge=<badge> name=<log name>`) gives the log name, and the image is the sysroot
+binary named by the log name's first word, searched in `services/`, `services/drivers/`,
+`services/fs/`, `programs/`, `tests/`, and `tests/programs/`, in that order. The binary is used only
+when its executable segments span exactly the block's `text` less its `load_bias`, the span
+procmgr records at spawn, so a binary rebuilt since the boot is refused rather than resolved
+against. Each block prints as:
+
+```
+crash report <id> (format version <v>): process <log name>
+  image: sysroot/<dir>/<log name>
+  <key>=<value>
+  ip=<address>  <resolution> [<source>]
+  frame.<n>=<address>  <resolution> [<source>]
+  …
+end <id>
+```
+
+Every field line follows in the block's order, as logged. `ip`, and each `frame.<n>` inside the
+block's `text`, carries its resolution in the address form's shape, the inlined-caller lines
+indented below it; a frame past `frame.0` is a candidate return address, so it resolves at its
+address less one, inside the call it returns from, and an `ip` outside `text` reads
+`outside the image's text`.
+
+A process that registered no log name with logd has a `reclaim:` line naming it `?` when it wrote
+to the log, and none when it did not; either way its block's header reads
+`process unnamed (badge <badge>: …)`. Its image is then the one binary of those directories whose
+executable segments span the block's text in the same way, labelled as found that way; when none or
+several match, the block is not symbolized, and no name is guessed. In place of the `image:` line a
+block that is not symbolized says why (the process is unnamed and its text matches no binary or
+several, no sysroot binary has its name, the named binary's text differs from the block's, the
+block's `arch` is not the sysroot's, it carries no `load_bias` and `text` because the report's
+attach failed, a sysroot file cannot be read, or the image is not an ELF image) and, when it has a
+`load_bias`, gives the address-form command that resolves its addresses once the binary is known;
+its fields then print as logged. An incomplete or defective block is marked
+`defective block (<defect>)` and printed all the same. A log without a block prints that it has
+none. `run-parallel` writes the same report beside each log it keeps.
 
 ---
 

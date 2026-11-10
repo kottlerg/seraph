@@ -149,5 +149,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: burnin-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
-          path: target/xtask/run-parallel/**/*.log
+          path: |
+            target/xtask/run-parallel/**/*.log
+            target/xtask/run-parallel/**/*.crash.txt
           if-no-files-found: ignore

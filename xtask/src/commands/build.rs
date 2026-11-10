@@ -526,56 +526,27 @@ const SPECS: &[Spec] = &[
     },
 ];
 
+/// The crate names of the spec table, in its order: the components
+/// `--component` and `--debug` accept besides `boot` and `all`.
+pub(crate) fn spec_names() -> impl Iterator<Item = &'static str>
+{
+    SPECS.iter().map(|spec| spec.name)
+}
+
+/// The spec table's own copy of the crate name `name`, `None` when no entry
+/// has it.
+pub(crate) fn spec_name(name: &str) -> Option<&'static str>
+{
+    spec_names().find(|spec| *spec == name)
+}
+
 fn spec_for(component: BuildComponent) -> Option<&'static Spec>
 {
-    let name = match component
+    match component
     {
-        BuildComponent::Boot | BuildComponent::All => return None,
-        BuildComponent::Kernel => "kernel",
-        BuildComponent::Init => "init",
-        BuildComponent::Ktest => "ktest",
-        BuildComponent::Procmgr => "procmgr",
-        BuildComponent::Memmgr => "memmgr",
-        BuildComponent::Devmgr => "devmgr",
-        BuildComponent::Vfsd => "vfsd",
-        BuildComponent::VirtioBlk => "virtio-blk",
-        BuildComponent::Serial => "serial",
-        BuildComponent::Framebuffer => "framebuffer",
-        BuildComponent::CmosRtc => "cmos-rtc",
-        BuildComponent::GoldfishRtc => "goldfish-rtc",
-        BuildComponent::Fatfs => "fatfs",
-        BuildComponent::Crasher => "crasher",
-        BuildComponent::Svcmgr => "svcmgr",
-        BuildComponent::Svctest => "svctest",
-        BuildComponent::Usertest => "usertest",
-        BuildComponent::Pwrmgr => "pwrmgr",
-        BuildComponent::Timed => "timed",
-        BuildComponent::Hello => "hello",
-        BuildComponent::HelloTester => "hello-tester",
-        BuildComponent::FbCharset => "fb-charset",
-        BuildComponent::Terminal => "terminal",
-        BuildComponent::Fsbench => "fsbench",
-        BuildComponent::Shell => "shell",
-        BuildComponent::ShellTester => "shell-tester",
-        BuildComponent::Stackoverflow => "stackoverflow",
-        BuildComponent::Relrofault => "relrofault",
-        BuildComponent::Capexhaust => "capexhaust",
-        BuildComponent::Pipefault => "pipefault",
-        BuildComponent::Demandpaged => "demandpaged",
-        BuildComponent::Stdiotest => "stdiotest",
-        BuildComponent::StdiotestTester => "stdiotest-tester",
-        BuildComponent::Threadstack => "threadstack",
-        BuildComponent::ThreadstackTester => "threadstack-tester",
-        BuildComponent::Deadline => "deadline",
-        BuildComponent::DeadlineTester => "deadline-tester",
-        BuildComponent::Debugger => "debugger",
-        BuildComponent::DebuggerTester => "debugger-tester",
-        BuildComponent::Threadchurn => "threadchurn",
-        BuildComponent::ThreadchurnTester => "threadchurn-tester",
-        BuildComponent::Pipestress => "pipestress",
-        BuildComponent::PipestressTester => "pipestress-tester",
-    };
-    SPECS.iter().find(|s| s.name == name)
+        BuildComponent::Boot | BuildComponent::All => None,
+        BuildComponent::Spec(name) => SPECS.iter().find(|s| s.name == name),
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -604,7 +575,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
             crate::bundle::compose(ctx, args.arch, crate::bundle::Harness::Init)?;
             crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())?;
         }
-        c =>
+        c @ BuildComponent::Spec(_) =>
         {
             let spec = spec_for(c)
                 .with_context(|| format!("no build spec registered for component {c:?}"))?;
@@ -1116,7 +1087,7 @@ fn debug_includes(args: &BuildArgs, pkg: &str) -> bool
     {
         BuildComponent::All => true,
         BuildComponent::Boot => pkg == "boot",
-        other => spec_for(*other).is_some_and(|s| s.name == pkg),
+        BuildComponent::Spec(name) => *name == pkg,
     })
 }
 

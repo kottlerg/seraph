@@ -331,7 +331,8 @@ runs as a workflow.
   returned object as `<mode>-<head>.json` beside it (the next run's ledger reads it), and on
   `RELEASE READY` the `notes` field as `notes-<head>.md`; surface both verdict lines to the
   maintainer verbatim.
-- `RELEASE BLOCKED`: each blocking finding goes to a worker as a fix PR (§ Spawn), each audit
+- `RELEASE BLOCKED`: each blocking finding goes to a worker as a fix PR (§ Spawn), a `[carried]`
+  entry and a fresh entry beside it that state the same defect counting as one, each audit
   failure to its fix, and you record every other finding as step 2 of that section says; then
   run `mode: "delta"` with `since` the head the last run reviewed.
 - `RELEASE READY` before the bump: a worker opens the release PR from the draft (step 3). Once

@@ -759,7 +759,8 @@ const carried_note = (paths) => {
         : scope.prior_findings
     return list.length
         ? '\nCarried from the run at ' + SINCE + ' and judged again by refuters of their own; ' +
-            'do not report these again, but report any other defect beside them:\n' +
+            'do not report these again, even where a fix claimed for one was not made, but ' +
+            'report any other defect beside them:\n' +
             bullets(list, (f) => '- ' + f.file + ':' + f.line + ' (' + f.class + ') ' + f.claim)
         : null
 }
@@ -1415,8 +1416,8 @@ const SYNTH_PROMPT = [
         ') as Markdown.',
     '',
     'Rules: every finding appears exactly once, with its status tag; do not drop, add, merge, ' +
-        're-rank, or soften one. Order the entries under a heading by file and class, so a ' +
-        'finding carried from the last run and a fresh report of the same defect sit together. ' +
+        're-rank, or soften one. Order the entries under a heading by file, then class, then ' +
+        'line, so a carried entry and a fresh entry of the same file and class sit together. ' +
         'Each entry: `file:line` [status] (bucket, class) claim, with `[carried]` when carried ' +
         'is true, `(MUST violation)` when must_violation is true, and the PRs it names. ' +
         'Authority: the ' +

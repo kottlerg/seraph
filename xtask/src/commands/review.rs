@@ -189,6 +189,15 @@ fn check_finding(out: &mut Vec<Diag>, name: &str, at: &str, finding: &Value)
 fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
 {
     one_of(out, name, "verdict", &record["verdict"], VERDICTS);
+    if record.get("audit").is_none()
+    {
+        out.push(shape(
+            name,
+            "audit",
+            "is missing; a run of the reviewer alone states it as null",
+        ));
+        return;
+    }
     let not_run = record["audit_verdict"] == NOT_RUN;
     if not_run || record["audit"].is_null()
     {
@@ -865,6 +874,10 @@ mod tests
         audited_without_audit["audit"] = Value::Null;
         let mut audit_not_run = reviewer_alone(1, PASS.0, vec![]);
         audit_not_run["stats"]["mode"] = json!("audit");
+        // The null is stated; a missing key is a shape error.
+        let mut no_audit_key = reviewer_alone(1, PASS.0, vec![]);
+        no_audit_key.as_object_mut().unwrap().remove("audit");
+        assert_eq!(fields(&no_audit_key), ["audit"]);
         for (name, bad) in [
             (NAME, not_run_with_audit),
             (NAME, audited_without_audit),
@@ -894,11 +907,7 @@ mod tests
     {
         let records = vec![(
             NAME.to_owned(),
-            reviewer_alone(
-                1,
-                "NON-BLOCKING ISSUES ONLY",
-                vec![finding("a nit", "nit")],
-            ),
+            reviewer_alone(1, "NON-BLOCKING ISSUES ONLY", vec![finding("a nit", "nit")]),
         )];
         let ledger = ledger(&records);
         assert_eq!(ledger.as_array().map(Vec::len), Some(1));

@@ -93,7 +93,9 @@ Handle a run's findings in one pass.
 - A PR that fixes recorded items ticks each with `(fixed by PR #<M>)`, copies the ticked items
   into its own `## Acceptance`, and carries `Refs #N`; it carries `Fixes #N` only under the
   closing condition of docs/conventions.md § Follow-up Issues.
-- When a scope has no rolling Issue, filing one needs the maintainer's approval. File it with
+- When a scope has no rolling Issue, one is filed without asking the maintainer
+  (docs/conventions.md § Follow-up Issues): a worker drafts the body and its orchestrator
+  files it, and a standalone session files it itself. The command is
   `cargo xtask issue-file --title "<scope>: defects found by review" --label <subsystem>
   --label <class> --milestone <current> --body-file <file>`.
 - `AUDIT FAIL`: fix each item with `gh pr edit`, `cargo xtask issue-edit`, or a commit, and

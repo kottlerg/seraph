@@ -362,8 +362,9 @@ for being off the surface.
 The follow-up Issue of a scope is the one open Issue whose title is
 `<scope>: defects found by review`, where `<scope>` is a commit-title scope (§ Commit Messages),
 the narrowest that covers the file. Every PR's findings in that scope append to it, and so it is
-also called the rolling Issue. It is filed only when the scope has none open, with the
-maintainer's approval, the current milestone (§ Milestones), and the labels § Labels requires.
+also called the rolling Issue. It is filed only when the scope has none open, with the current
+milestone (§ Milestones) and the labels § Labels requires. Filing it needs no approval of its
+own: the maintainer's standing approval covers the rolling Issue of a scope that has none.
 
 An open Issue whose title begins `<scope>: defects found by PR #N's review`, filed before the
 rolling Issues, is a follow-up Issue under every rule of this section; a finding recorded in its

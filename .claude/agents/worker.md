@@ -202,7 +202,7 @@ The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a deleg
   the host runs exist it says "pending".
 - A finding off the review surface is recorded, never dropped, on the Issue
   docs/conventions.md § Recording findings names. When the scope has no rolling Issue, draft one
-  and ask.
+  and name its path; the orchestrator files it.
 
 ## Host runs
 

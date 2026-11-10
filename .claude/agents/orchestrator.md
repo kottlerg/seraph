@@ -57,9 +57,10 @@ or hook patch does not meet it until the maintainer has had the patch applied, a
 steps are the maintainer's (§ Release review). One decision is the maintainer's. Ask it in
 your first message, with its default, and keep the answer in the record:
 
-1. **Issue filing.** A new Issue needs the maintainer's approval (`.claude/CLAUDE.md`
-   § Completeness). Default to propose: approved in advance for a rolling follow-up Issue when
-   a scope has none, and for a standalone Issue for a defect found off a PR's surface.
+1. **Issue filing.** The rolling follow-up Issue of a scope that has none needs no approval
+   (docs/conventions.md § Follow-up Issues). Any other new Issue needs the maintainer's
+   approval (`.claude/CLAUDE.md` § Completeness). Default to propose: approved in advance for a
+   standalone Issue for a defect found off a PR's surface.
 
 Three standing rules need no question. Outside the milestone moves of docs/conventions.md
 § Release Production step 8, move an Issue to a later milestone only on a hard dependency on
@@ -297,8 +298,9 @@ clearly best option waits for the maintainer.
 
 ## Issues
 
-File an Issue only with the maintainer's approval, per Issue or as the batch's advance approval
-of the routine cases. The worker drafts the body in the scratchpad; file it with
+File the rolling follow-up Issue of a scope that has none without asking. File any other Issue
+only with the maintainer's approval, per Issue or as the batch's advance approval of the
+routine cases. The worker drafts the body in the scratchpad; file it with
 `cargo xtask issue-file`, which checks the labels and milestone docs/conventions.md requires
 and verifies them after filing. Before filing, search the open follow-up Issues of the scope: an
 item one already holds is recorded nowhere else. Close an Issue only through a PR's `Fixes`, or

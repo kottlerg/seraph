@@ -151,18 +151,28 @@ pub fn refs_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
     refs_in(&pat.refs_ref, text, 1)
 }
 
-/// `line` without the list or quote markers that open it (`-`, `*`, `+`,
-/// `>`), so that `- Fixes #N` reads as the closing line it is.
+/// `line` without what may open it before its text: quote markers (`>`),
+/// list markers (`-`, `*`, `+`, or digits and `.` or `)`), and a task box
+/// (`[ ]`, `[x]`), so that `- [x] Fixes #N` reads as the closing line it is.
 fn unmarked(line: &str) -> &str
 {
     let mut rest = line.trim_start();
-    while let Some(inner) = ["- ", "* ", "+ ", "> "]
-        .iter()
-        .find_map(|marker| rest.strip_prefix(marker))
+    loop
     {
-        rest = inner.trim_start();
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        let numbered = (digits > 0)
+            .then(|| &rest[digits..])
+            .and_then(|r| r.strip_prefix(". ").or_else(|| r.strip_prefix(") ")));
+        let inner = [">", "- ", "* ", "+ ", "[ ] ", "[x] ", "[X] "]
+            .iter()
+            .find_map(|marker| rest.strip_prefix(marker))
+            .or(numbered);
+        match inner
+        {
+            Some(inner) => rest = inner.trim_start(),
+            None => return rest,
+        }
     }
-    rest
 }
 
 /// The closing references of `text` that stand inside prose: on a line that
@@ -1367,7 +1377,11 @@ mod tests
         // A list item or a quoted line that holds only the closing line.
         assert!(found("- Fixes #10").is_empty());
         assert!(found("> * Closes #10").is_empty());
+        assert!(found("1. Fixes #10").is_empty());
+        assert!(found(">Fixes #10").is_empty());
+        assert!(found("- [x] Fixes #10").is_empty());
         assert_eq!(found("- also fixes #10"), [10]);
+        assert_eq!(found("2) this one resolves #10"), [10]);
         assert!(found("Refs #13").is_empty());
 
         let body = format!("{BODY}\nThe next PR carries `Fixes #835`.\n");

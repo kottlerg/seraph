@@ -31,8 +31,8 @@ const VERDICTS: &[&str] = &[
 ];
 const AUDIT_VERDICTS: &[&str] = &["AUDIT PASS", "AUDIT FAIL"];
 
-/// The record modes, in the order their runs follow each other at one head:
-/// a run with the reviewer, then any audit of it.
+/// The record modes: a first run, a later run with the reviewer, and an
+/// audit alone.
 const MODES: &[&str] = &["full", "delta", "audit"];
 
 const CLASSES: &[&str] = &[
@@ -76,9 +76,10 @@ pub fn record_dir(ctx: &BuildContext, pr: u64) -> PathBuf
 }
 
 /// The parts of a run record's file name, `<mode>-<head>[-<n>].json`: the
-/// mode, the head as the name states it, and the run number at that head
-/// (1 when the name has no suffix). `None` for any other file.
-fn name_parts(name: &str) -> Option<(&'static str, &str, u32)>
+/// mode and the head as the name states it. The numeric suffix `-<n>` only
+/// keeps two records of one mode at one head apart. `None` for any other
+/// file.
+fn name_parts(name: &str) -> Option<(&'static str, &str)>
 {
     let path = Path::new(name);
     if !path
@@ -95,8 +96,8 @@ fn name_parts(name: &str) -> Option<(&'static str, &str, u32)>
     let rest = stem.strip_prefix(mode)?.strip_prefix('-')?;
     match rest.split_once('-')
     {
-        Some((head, run)) => Some((mode, head, run.parse().ok()?)),
-        None => Some((mode, rest, 1)),
+        Some((head, suffix)) => suffix.parse::<u32>().ok().map(|_| (mode, head)),
+        None => Some((mode, rest)),
     }
 }
 
@@ -253,7 +254,7 @@ fn check_stats(out: &mut Vec<Diag>, name: &str, stats: &Value)
         return;
     };
     let stated = name_parts(name);
-    if !stated.is_some_and(|(m, h, _)| m == mode && !h.is_empty() && head.starts_with(h))
+    if !stated.is_some_and(|(m, h)| m == mode && !h.is_empty() && head.starts_with(h))
     {
         out.push(Diag::error(
             "record-name",
@@ -287,7 +288,7 @@ pub fn check_record(name: &str, record: &Value) -> Vec<Diag>
 /// is still a run at the head, and every run there must be well-formed.
 fn names_head(name: &str, head: &str) -> bool
 {
-    name_parts(name).is_some_and(|(_, stated, _)| !stated.is_empty() && head.starts_with(stated))
+    name_parts(name).is_some_and(|(_, stated)| !stated.is_empty() && head.starts_with(stated))
 }
 
 /// A record's place in the PR's sequence of runs: `stats.run`.
@@ -628,13 +629,10 @@ mod tests
     #[test]
     fn only_run_records_are_read_as_records()
     {
-        assert_eq!(
-            name_parts("full-0a82b0aa.json"),
-            Some(("full", "0a82b0aa", 1))
-        );
+        assert_eq!(name_parts("full-0a82b0aa.json"), Some(("full", "0a82b0aa")));
         assert_eq!(
             name_parts("audit-0a82b0aa-2.json"),
-            Some(("audit", "0a82b0aa", 2))
+            Some(("audit", "0a82b0aa"))
         );
         for other in [
             "ledger.json",

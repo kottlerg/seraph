@@ -2062,8 +2062,8 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// The cap must be a Thread cap with `RIGHTS_THREAD`. A registry whose sweep
 /// is due (`ThreadRegistry::needs_sweep`: its sweep count, or the bound, and
 /// enough requests since the last sweep) first drops the threads that are
-/// gone ([`thread_is_listed`]). A thread whose exception class is bound under its
-/// process badge or a crash badge (`ProcessEntry::is_crash_binding`), as one
+/// gone ([`thread_is_listed`]). A thread whose exception class is bound under the
+/// sender's process badge or a crash badge (`ProcessEntry::is_crash_binding`), as one
 /// that copied its spawner's bindings is, is bound again under a fresh crash
 /// badge, so its faults name it; a binding under any other badge, a
 /// debugger's, or none, is left as it is. The binding is told by its badge

@@ -792,20 +792,20 @@ The sender hands procmgr a cap of one of its threads, which procmgr keeps in the
 until the thread exits, the cap is revoked, or the process is torn down; `ATTACH_PROCESS` lists it.
 The runtime sends it from each thread it spawns, before the thread runs its code, with a copy of
 the thread's own cap ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Thread
-registration). When the thread's exception class is bound under its process badge or under a crash
-badge, any badge with bit 63 set, as a thread that copied its spawner's bindings is (whether or not
-that spawner is still registered), procmgr binds it again under a fresh crash badge; a binding of
-another handler, a debugger's, or none, is left, and the thread is then listed without a crash
-badge. procmgr reads the binding's badge, which `SYS_THREAD_GET_FAULT_HANDLER` returns, not its
-endpoint, so it tells its own binding by the badge alone: a debugger that binds a thread's exception
-class MUST bind it under a badge that is neither the process badge nor a crash badge (no badge with
-bit 63 set), or the threads that thread spawns, which copy that binding, are bound back to the
-crash endpoint when they register.
+registration). When the thread's exception class is bound under the sender's process badge or under
+a crash badge, any badge with bit 63 set, as a thread that copied its spawner's bindings is
+(whether or not that spawner is still registered), procmgr binds it again under a fresh crash
+badge; a binding of another handler, a debugger's, or none, is left, and the thread is then listed
+without a crash badge. procmgr reads the binding's badge, which `SYS_THREAD_GET_FAULT_HANDLER`
+returns, not its endpoint, so it tells its own binding by the badge alone: a debugger that binds a
+thread's exception class MUST bind it under a badge that is neither the process badge nor a crash
+badge (no badge with bit 63 set), or the threads that thread spawns, which copy that binding, are
+bound back to the crash endpoint when they register.
 
 Before it adds the thread, procmgr drops from the registry the threads that have exited or whose cap
 was revoked, when the registry has reached the count its last sweep set (64 at first, then twice
-what the sweep kept), or the bound when that count lies past it, and at least half as many
-registrations as it holds, refused ones included, came since the last sweep. A sweep therefore
+what the sweep kept, at least 64), or the bound when that count lies past it, and at least half as
+many registrations as it holds, refused ones included, came since the last sweep. A sweep therefore
 comes after at least half as many requests as threads it reads, so the sweeps cost at most two
 thread-state reads per request on average, and threads that are gone hold the bound for at most
 half a registry's worth of requests.
@@ -816,12 +816,16 @@ unregistered, so no spawn fails for the bound. procmgr does not compare a regist
 threads it holds: a thread registered twice takes two entries, both counting toward the bound, and
 the runtime registers each thread once. procmgr does not check that the thread runs in the
 sender's address space, which no kernel query gives: a sender can register only a thread it holds
-`CONTROL` on, which already lets it read and change that thread. A sender that registers another
-process's thread so held, one bound under that process's crash binding, has procmgr rebind it into
-the sender's registry: that thread's faults then reach the crash service under a crash badge
-the sender's process holds, and are reported against the sender's image, and the other process's
-`DECLARE_NO_DEBUG` no longer unbinds it. Such a cap comes only from the other process itself or
-from a debug-authority holder's attach, so no process gains this over a thread it was not given.
+`CONTROL` on, which already lets it read and change that thread. procmgr compares a binding with
+the sender's process badge, so another process's thread bound under its own process badge (that
+process's main thread, or a thread that copied it and has not registered yet) is listed in the
+sender's registry but not rebound. One bound under a crash badge is rebound into the sender's
+registry: that thread's faults then reach the crash service under a crash badge the sender's
+process holds, and are reported against the sender's image, and the other process's
+`DECLARE_NO_DEBUG` no longer unbinds it. Such a cap comes from the other process itself, from a
+debug-authority holder's attach, or, for the other process's main thread alone, from its creation
+(`CREATE_PROCESS` and `CREATE_FROM_FILE` give the creator that cap), whose binding is its process
+badge and is not rebound; so no process gains this over a spawned thread it was not given.
 
 Replies `SUCCESS`; refusals, in order: `INVALID_BADGE` when the badge names no live process;
 `NOT_ATTACHABLE` when the process declared itself undebuggable (Label 21), on which the runtime

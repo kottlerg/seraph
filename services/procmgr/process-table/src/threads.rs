@@ -9,8 +9,8 @@
 //! Each thread the runtime spawns registers a Thread cap of its own; procmgr
 //! keeps it in the process's [`ThreadRegistry`] until the thread exits, the
 //! runtime revokes the cap when it reclaims the thread, or the process is torn
-//! down. A thread whose exception class is bound under its process badge or
-//! under any crash badge (`ProcessEntry::is_crash_binding`), as one that
+//! down. A thread whose exception class is bound under its sender's process
+//! badge or under any crash badge (`ProcessEntry::is_crash_binding`), as one that
 //! copied its spawner's bindings is, is rebound under a fresh crash badge
 //! ([`CrashBadges`]), so the badge of a fault message names the faulting
 //! thread. The registry holds slot indices

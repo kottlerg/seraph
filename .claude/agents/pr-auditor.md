@@ -236,7 +236,9 @@ claims.
     record's `findings` that the range does not fix, and each entry of its
     `recorded`, that no open Issue records as that section says: an item
     stating it, either the one this PR recorded or the one an open
-    follow-up Issue of its scope already held. List each finding of the
+    follow-up Issue of its scope already held. A finding of class `style`
+    that is not a MUST violation needs no item: the run record is its
+    record (`docs/conventions.md` § Recording findings). List each finding of the
     record's `findings` that the range leaves unfixed, as the record states
     it, so the parent's record of this run carries it, and the ledger takes
     it when the run's reviewer verdict is `NON-BLOCKING ISSUES ONLY`. End

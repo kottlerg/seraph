@@ -432,7 +432,9 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
              verdict of READY TO MERGE or NON-BLOCKING ISSUES ONLY",
         )];
     }
-    let open = record["findings"].as_array().map_or(0, Vec::len);
+    let open = record["findings"].as_array().map_or(0, |findings| {
+        findings.iter().filter(|f| needs_issue(f)).count()
+    });
     if record["verdict"] == "NON-BLOCKING ISSUES ONLY" && open > 0
     {
         return vec![Diag::warning(
@@ -445,6 +447,14 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
         )];
     }
     Vec::new()
+}
+
+/// Whether an Issue must record `finding` (docs/conventions.md § Recording
+/// findings): every finding but one of class `style` that is not a MUST
+/// violation, whose record is the run record.
+fn needs_issue(finding: &Value) -> bool
+{
+    finding["class"] != "style" || finding["must_violation"] == true
 }
 
 /// Build the ledger from every record of a PR: the findings each run
@@ -852,6 +862,32 @@ mod tests
                 "AUDIT PASS",
                 vec![finding("a", "nit")],
             ),
+        )];
+        assert_eq!(
+            rules(&gate_diags(&records, HEAD)),
+            ["gate-findings-recorded"]
+        );
+    }
+
+    #[test]
+    fn the_gate_asks_nothing_for_a_style_finding_that_is_no_must_violation()
+    {
+        let mut style = finding("a", "nit");
+        style["class"] = json!("style");
+        let records = vec![(
+            NAME.to_owned(),
+            record(
+                "NON-BLOCKING ISSUES ONLY",
+                "AUDIT PASS",
+                vec![style.clone()],
+            ),
+        )];
+        assert!(gate_diags(&records, HEAD).is_empty());
+
+        style["must_violation"] = json!(true);
+        let records = vec![(
+            NAME.to_owned(),
+            record("NON-BLOCKING ISSUES ONLY", "AUDIT PASS", vec![style]),
         )];
         assert_eq!(
             rules(&gate_diags(&records, HEAD)),

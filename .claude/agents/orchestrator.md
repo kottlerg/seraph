@@ -270,13 +270,14 @@ maintainer and whose recommendation you share, and tell the maintainer in one li
 to the maintainer). Only a split recommendation, a major design decision, or a case with no
 clearly best option waits for the maintainer.
 
-- **`NON-BLOCKING ISSUES ONLY`.** The worker records the surface findings first. A `should`
-  finding takes one fix round, and a PR takes at most one such round (docs/conventions.md
-  § Pre-merge review): what the run after it leaves stays recorded, and the PR goes to its
-  gate. A nit takes no round and stays recorded, with two exceptions: a nit whose fix is
-  comment-only, in a PR that owes a fix round anyway, is fixed in that round, and a nit in a PR
-  that drains a follow-up Issue of its scope is fixed in the same PR. Each is recorded first and
-  ticked `(fixed by PR #<M>)` when the round fixes it.
+- **`NON-BLOCKING ISSUES ONLY`.** The worker records the surface findings first; a `style`
+  finding that is not a MUST violation goes on no Issue and stays in the run record
+  (docs/conventions.md § Recording findings). A `should` finding takes one fix round, and a PR
+  takes at most one such round (docs/conventions.md § Pre-merge review): what the run after it
+  leaves stays recorded, and the PR goes to its gate. A nit takes no round and stays recorded,
+  with two exceptions: a nit whose fix is comment-only, in a PR that owes a fix round anyway, is
+  fixed in that round, and a nit in a PR that drains a follow-up Issue of its scope is fixed in
+  the same PR. Each is recorded first and ticked `(fixed by PR #<M>)` when the round fixes it.
 - **A finding in the PR's own earlier hunk.** A delta run may report it as out of bound. It is
   on the surface (docs/conventions.md § Review surface) and is handled like any surface finding.
 - **A contested finding** is yours to decide (docs/conventions.md § Contested findings). First

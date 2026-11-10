@@ -418,6 +418,11 @@ records a finding is the first of these that applies:
    in that scope).
 4. The rolling Issue of its scope.
 
+A finding of class style that is not a MUST violation goes on no Issue. The run record that
+reports it is its record, and the ledger keeps a later run from raising it again (§ Ledger);
+where this document requires a finding to be recorded, the run record meets that for such a
+finding.
+
 ### Ledger
 
 A later run of the same PR, delta or full, MUST NOT re-raise a finding an earlier run recorded

@@ -5,10 +5,10 @@
 
 //! Per-program tester for `/programs/crashme`. Runs it in each mode the
 //! crash-report check reads, `vm`, `exception`, and `worker`, and checks
-//! that it reached its fault and died of it (and runs `registry-declare`,
-//! which faults on nothing, checking that it passed):
-//! a non-clean exit whose reason is a fault class, so the crash service's
-//! decline ended the thread as the kernel would have. The report block each
+//! that it reached its fault and died of it: a non-clean exit whose reason
+//! is a fault class, so the crash service's decline ended the thread as the
+//! kernel would have. It also runs `registry-declare`, which faults on
+//! nothing, and checks that it passed. The report block each
 //! death leaves in the log is checked host-side, from the boot's serial log,
 //! by `cargo xtask test-crash-report` (docs/testing.md § Crash reports).
 //!

@@ -25,17 +25,25 @@ When crashd dies, procmgr declines the faults on the endpoint until a respawned 
 
 ## Per Fault
 
-The fault message names the process by its badge, the fault's kind and words, and the instruction
-pointer. crashd:
+The fault message carries the badge the faulting thread's exception class is bound under, the
+fault's kind and words, and the instruction pointer. The badge names the thread: the process badge
+names its main thread (or a thread that never registered, which kept its spawner's binding), and a
+thread crash badge the registered thread procmgr bound under it
+([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint and Debug
+Authority). crashd:
 
-1. sends `ATTACH_PROCESS` for the badge, which returns the Thread caps procmgr holds for the
-   process, today its main thread's, and the image's load bias and text bounds;
-2. reads the main thread's registers. The read succeeds only for a thread that is stopped or
-   fault-blocked, and crashd takes the main thread as the faulting one when it does and the
-   register file's instruction pointer is the message's. This is a heuristic, not an
-   identification: a main thread stopped, or blocked on another fault, at the same instruction
-   pointer as the faulting sibling would be taken for it. The block's `thread` is `main` when the
-   heuristic holds, and the block then carries the registers and the stack walk;
+1. sends `ATTACH_PROCESS` for the badge, which returns the Thread caps of the process's threads
+   from the first, its main thread, then each registered one, at most four a reply; the image's
+   load bias and text bounds; the process badge; and the index of the thread the badge names;
+2. takes the named thread's cap, from that reply, or from a second attach whose page starts at the
+   index when the index lies past the first page, and reads its registers. The read succeeds only
+   for a thread that is stopped or fault-blocked, and crashd takes the thread as the faulting one
+   when it does and the register file's instruction pointer is the message's; the check catches a
+   thread that never registered, whose spawner's badge named another thread. The block's `thread`
+   is then `main` or `spawned`, and the block carries the registers and the stack walk; otherwise it
+   is `unidentified`. Another thread of the process blocked on a fault at the same instruction,
+   whose fault some other handler holds, is not taken for the faulting one: its badge is not the
+   message's;
 3. reads the bytes at the instruction pointer through the same cap, since every thread of the
    process shares its address space;
 4. logs the block ([block-format.md](block-format.md)), then declines the fault with the block's id
@@ -71,13 +79,13 @@ after the decline, when nothing waits on the faulting thread any more. The stack
 
 ## Limits
 
-- **Threads other than the main one.** procmgr holds a Thread cap for a process's main thread only;
-  the threads the runtime spawns are created in the process's own `CSpace`. For a fault of such a
-  thread, crashd cannot read the registers, so its block carries `thread=unidentified`, the fault,
-  the image placement, and the bytes at the instruction pointer, and no registers and no stack
-  walk. A runtime registry of spawned threads, through which `ATTACH_PROCESS` returns every thread
-  of a process, is design intent; not yet implemented
-  ([#838](https://github.com/kottlerg/seraph/issues/838)).
+- **Threads that never registered.** A thread the runtime spawns registers itself with procmgr
+  before it runs its code ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Thread
+  registration). A thread that did not (procmgr refused it at the per-process bound, or the call
+  failed, or the process does not use the runtime's spawn) is not in the attach list, and its
+  faults carry its spawner's badge. crashd cannot read its registers, so its block carries
+  `thread=unidentified`, the fault, the image placement, and the bytes at the instruction pointer,
+  and no registers and no stack walk.
 - **Uncovered processes.** init, memmgr, and procmgr are not created by procmgr. logd, the serial
   driver, and the framebuffer driver, through which logd writes every line, and crashd declare
   themselves undebuggable at startup, as svctest, a debug-authority holder, does in a test boot;

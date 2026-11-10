@@ -93,8 +93,9 @@ first touch faults, memmgr maps a frame and resumes. See
 (`REGISTER_REGION`, `DELEGATE_ASPACE`, and the fault arm).
 
 The crash-report consumer of the exception class is implemented on both architectures: procmgr's
-crash endpoint, the forward of a declined page fault (`FAULT_REPLY_FORWARD`), and the crash service
-([Crash Reports](#crash-reports)).
+crash endpoint, the forward of a declined page fault (`FAULT_REPLY_FORWARD`), the crash service, and
+procmgr's registry of the threads the runtime spawns, through which a fault of any registered thread
+is reported with its registers ([Crash Reports](#crash-reports)).
 
 A change of the binding of an in-flight fault's class cancels that delivery and delivers the
 fault again under the binding current then ([Rebind](#delivery-resume-and-kill)), on both
@@ -597,7 +598,11 @@ A debugger is a userspace handler of a thread's exception class. It holds a Thre
 `OBSERVE`, to read the thread's registers, and `CONTROL`, to write them, to read and write the
 memory of the address space the thread executes in, and to bind its handlers. An asynchronous
 break also needs the upcall binding, and `UPCALL` beside `CONTROL` on the cap. Beyond the memory
-copies, the kernel adds no debugging interface of its own. The pieces are:
+copies, the kernel adds no debugging interface of its own. A debugger in another process takes
+those caps from procmgr's attach request, which a holder of the debug authority sends and which
+returns the process's main thread and every thread its runtime registered
+([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`);
+a thread the process spawns after an attach is listed by the next one. The pieces are:
 
 - **Breakpoints.** A software breakpoint is `int3` on x86-64 and `ebreak` on RISC-V. It reaches
   the exception handler as `FAULT_KIND_EXCEPTION` with `FAULT_EXC_BREAKPOINT`. The reported
@@ -717,6 +722,14 @@ format, the contract the host-side symbolizer reads, in
   spawns ([Inheritance is userspace policy](#inheritance-is-userspace-policy)). The virtual-memory
   class stays memmgr's, and memmgr forwards each fault it cannot back
   ([`FAULT_REPLY_FORWARD`](#reply)), so a page fault reaches the crash service too.
+- **Threads.** Each thread the runtime spawns registers itself with procmgr before it runs its
+  code, handing procmgr a cap of itself, and procmgr binds its exception class again under a crash
+  badge of the thread's own. The badge of a fault message therefore names the faulting thread, and
+  procmgr's attach request, given that badge, returns the thread's process, every live thread of
+  it, and the named thread's place among them, so the crash service reads the registers and stack
+  of the thread that faulted ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
+  § Label 22: `REGISTER_THREAD`, § Label 20: `ATTACH_PROCESS`). A thread that never registered keeps
+  its spawner's badge and is reported without registers.
 - **Receiver.** While no crash service is registered, a procmgr thread receives on the endpoint and
   declines every fault, so an image that stages no crash service kills a faulting thread as with no
   handler bound. A crash service registers with procmgr's debug authority and receives on the

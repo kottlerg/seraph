@@ -16,8 +16,10 @@
 //! words and blob bytes, the create-request cap-layout split
 //! ([`split_create_caps`]), the bounds procmgr applies to fs-driver
 //! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), the
-//! init-reap handoff state machine ([`InitReap`]), and the size of procmgr's
-//! first death queue ([`death_queues::FIRST_POOL_OBSERVERS`]). None of these
+//! init-reap handoff state machine ([`InitReap`]), the size of procmgr's
+//! first death queue ([`death_queues::FIRST_POOL_OBSERVERS`]), and the
+//! registry of the threads a process registers with their crash badges
+//! ([`threads`]). None of these
 //! touch a syscall, IPC, or `std::os::seraph` surface — the cap fields are
 //! slot *indices* (plain integers), never live capabilities, and the decoder
 //! reads a stack [`ipc::IpcMessage`] snapshot — so the whole crate is

@@ -357,9 +357,12 @@ must be complete and hold the fields its kind, thread, and status require.
 
 - `--expect reports` reads a usertest boot, which runs the `crashme` fixture's tester
   ([programs/crashme/README.md](../programs/crashme/README.md)): the log must also hold one `vm`
-  and one `exception` block of `crashme`, tied to it through the badge logd's `reclaim:` line
-  names, each complete, of its main thread, its walk starting at its instruction pointer, and
-  each matched by the kernel's `handler declined` line carrying the block's id.
+  and one `exception` block of `crashme`'s main thread and one `exception` block of a `spawned`
+  thread, whose fault the fixture takes while a sibling is held blocked on a fault at the same
+  instruction, each tied to `crashme` through the badge logd's `reclaim:` line names, complete, its
+  walk starting at its instruction pointer, matched by the kernel's `handler declined` line
+  carrying the block's id, and carrying the stack pointer the kernel's register dump of that line's
+  thread prints, so the block read the thread that faulted.
 - `--expect none` reads a boot of an image that stages no crashd: the log must hold no block, the
   check that the absent service changes nothing a fault does.
 
@@ -371,7 +374,7 @@ unreported. Both read the log the cell's boot saved and boot nothing
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by
 procmgr, and logd, the serial and framebuffer drivers, and crashd declare themselves undebuggable,
 as svctest, a debug-authority holder, does in a test boot; their faults leave only the kernel's
-`fault unhandled` and `USERSPACE FAULT` lines. A thread other than a process's main thread is
+`fault unhandled` and `USERSPACE FAULT` lines. A thread that never registered with procmgr is
 reported without registers or a stack walk
 ([crashd Operation § Limits](../services/crashd/docs/operation.md#limits)).
 

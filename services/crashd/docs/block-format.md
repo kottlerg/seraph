@@ -19,7 +19,10 @@ CRASH-END id=<id> lines=<count>
 ```
 
 - The begin marker opens the block and names the format's `version`, today `1`. A change that
-  renames or removes a field or changes a value's encoding bumps it; a new field does not.
+  renames or removes a field or changes a value's encoding bumps it; a new field, or a new value of
+  a field that names one of a set (`thread`, `status`, `kind`, `exception`), does not. A reader
+  skips a key it does not know, and reads a `thread` value it does not know as a thread whose
+  block carries no registers, as `unidentified`; `thread=spawned` was added so.
 - Each field line carries one field. A reader keys the line to the open block whose `id` it
   carries, so the lines of two blocks, and lines of other senders, may interleave.
 - The end marker closes the block; `count` is the number of field lines. A block whose end marker
@@ -41,9 +44,9 @@ not know is skipped.
 
 | Key | Value | Present |
 |---|---|---|
-| `badge` | The process badge, decimal: the key logd's `reclaim: badge=<badge> exit_reason=<reason> name=<log name>` line names the process by at its death | always |
+| `badge` | The process badge, decimal: the key logd's `reclaim: badge=<badge> exit_reason=<reason> name=<log name>` line names the process by at its death. Taken from the attach reply; a block whose attach failed carries the fault message's badge, which for a registered thread is its crash badge and names no `reclaim:` line | always |
 | `arch` | `x86_64` or `riscv64` | always |
-| `thread` | `main`, the process's main thread, whose registers the block carries; or `unidentified`, another thread ([operation.md](operation.md) § Per Fault, § Limits) | always |
+| `thread` | `main`, the process's main thread; `spawned`, a thread the runtime spawned and registered with procmgr, each block carrying its registers; or `unidentified`, a thread crashd could not read, one that never registered ([operation.md](operation.md) § Per Fault, § Limits) | always |
 | `status` | `complete`; `unattached`, the attach failed: procmgr refused it (the process had exited, or declared itself undebuggable) or the call failed; or `timeout`, the watchdog cancelled the attach ([operation.md](operation.md) § Bounds) | always |
 | `kind` | `vm`, a page fault the pager forwarded; or `exception` | always |
 | `access` | `read`, `write`, or `fetch` | `vm` |
@@ -54,10 +57,10 @@ not know is skipped.
 | `ip` | The faulting instruction pointer from the fault message, hexadecimal | always |
 | `load_bias` | The bias the loader added to every ELF address of the image, hexadecimal | `complete` |
 | `text` | The biased bounds of the image's executable segments, `0x<start>-0x<end>`, the end exclusive | `complete` |
-| `reg.<name>` | One line per register of the register file, hexadecimal: on x86-64 `rax` to `r15`, `rip`, `rflags`, `rsp`, `cs`, `ss`, `fs_base`; on riscv64 `ra` to `t6` by ABI name, then `sepc`, `scause`, `stval`, `sstatus` | `complete` and `main` |
+| `reg.<name>` | One line per register of the register file, hexadecimal: on x86-64 `rax` to `r15`, `rip`, `rflags`, `rsp`, `cs`, `ss`, `fs_base`; on riscv64 `ra` to `t6` by ABI name, then `sepc`, `scause`, `stval`, `sstatus` | `complete`, and `main` or `spawned` |
 | `code` | The bytes at `ip`, up to sixteen, two hexadecimal digits each; fewer at the end of a page whose successor is not present | when `ip`'s page is present |
-| `walk` | `scan`: the frames are the stack scan below | `complete` and `main` |
-| `frame.<n>` | Frame `n`, hexadecimal, from `0`: `frame.0` is `ip`, and each later frame an aligned stack word, read from the stack pointer up, that lies inside `text`; at most 32 | `complete` and `main` |
+| `walk` | `scan`: the frames are the stack scan below | `complete`, and `main` or `spawned` |
+| `frame.<n>` | Frame `n`, hexadecimal, from `0`: `frame.0` is `ip`, and each later frame an aligned stack word, read from the stack pointer up, that lies inside `text`; at most 32 | `complete`, and `main` or `spawned` |
 
 ---
 

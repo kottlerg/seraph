@@ -110,13 +110,12 @@ pub fn run(ctx: &Context, args: &TestGdbArgs) -> Result<()>
         .with_context(|| format!("staging {}", target_source.display()))?;
     let staged = debug_stub::stage(ctx, args.arch, TARGET_NAME);
     let booted = staged.as_ref().ok().map(|_| boot(ctx, args, &gdb));
-    // Restore first, and surface its failure ahead of the boot's.
-    let removed = std::fs::remove_file(&target_staged)
-        .with_context(|| format!("removing {}", target_staged.display()));
-    let layout = staged?;
-    removed
-        .and_then(|()| debug_stub::unstage(ctx, args.arch, layout))
-        .context("restoring disk.img without the stub and its target")?;
+    // Restore first, and surface its failure ahead of the staging's and the
+    // boot's.
+    std::fs::remove_file(&target_staged)
+        .with_context(|| format!("removing {}", target_staged.display()))?;
+    debug_stub::unstage(ctx, args.arch, staged?)
+        .context("restoring the disk images without the stub and its target")?;
     let session = booted.context("the boot did not run")??;
     expect(&session.gdb)?;
     expect_restored(session.detached.as_deref())?;

@@ -67,12 +67,14 @@ pub enum Resume
     Stop,
 }
 
-/// One action of a `vCont` packet: what to do, and to which thread (every
-/// thread no earlier action named, when `None`).
+/// One action of a `vCont` packet: what to do, the signal a `C` or `S`
+/// action passes, and to which thread (every thread no earlier action named,
+/// when `None`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VContAction
 {
     pub resume: Resume,
+    pub signal: Option<u8>,
     pub thread: Option<ThreadId>,
 }
 
@@ -133,12 +135,20 @@ pub enum Command<'a>
     {
         addr: u64, data: &'a [u8]
     },
-    /// `c[addr]` or `C<signal>[;addr]`: resume, at `addr` when given. A
-    /// stub delivers no signal, so `C` resumes as `c` does.
-    Continue(Option<u64>),
+    /// `c[addr]` or `C<signal>[;addr]`: resume, at `addr` when given, passing
+    /// `signal` (`C`) to the stopped thread.
+    Continue
+    {
+        addr: Option<u64>,
+        signal: Option<u8>,
+    },
     /// `s[addr]` or `S<signal>[;addr]`: step one instruction, from `addr`
-    /// when given; `S` steps as `s` does.
-    Step(Option<u64>),
+    /// when given, passing `signal` (`S`).
+    Step
+    {
+        addr: Option<u64>,
+        signal: Option<u8>,
+    },
     /// `vCont?`: which `vCont` actions the stub takes.
     VContQuery,
     /// `vCont;<action>[:thread]...`: resume or stop threads.
@@ -236,10 +246,30 @@ impl<'a> Command<'a>
             }
             b'M' => parse_write_memory(rest),
             b'X' => parse_write_binary(rest),
-            b'c' => Ok(Self::Continue(optional_addr(rest)?)),
-            b's' => Ok(Self::Step(optional_addr(rest)?)),
-            b'C' => Ok(Self::Continue(signal_then_addr(rest)?)),
-            b'S' => Ok(Self::Step(signal_then_addr(rest)?)),
+            b'c' => Ok(Self::Continue {
+                addr: optional_addr(rest)?,
+                signal: None,
+            }),
+            b's' => Ok(Self::Step {
+                addr: optional_addr(rest)?,
+                signal: None,
+            }),
+            b'C' =>
+            {
+                let (signal, addr) = signal_then_addr(rest)?;
+                Ok(Self::Continue {
+                    addr,
+                    signal: Some(signal),
+                })
+            }
+            b'S' =>
+            {
+                let (signal, addr) = signal_then_addr(rest)?;
+                Ok(Self::Step {
+                    addr,
+                    signal: Some(signal),
+                })
+            }
             b'Z' | b'z' =>
             {
                 let (ty, addr, kind) = parse_breakpoint(rest)?;
@@ -321,24 +351,20 @@ fn parse_action(action: &[u8]) -> Result<VContAction, Error>
         Some(i) => (&action[..i], Some(parse_thread(&action[i + 1..])?)),
         None => (action, None),
     };
-    let resume = match verb
+    let (resume, signal) = match verb
     {
-        b"c" => Resume::Continue,
-        b"s" => Resume::Step,
-        b"t" => Resume::Stop,
-        [b'C', sig @ ..] =>
-        {
-            parse_signal(sig)?;
-            Resume::Continue
-        }
-        [b'S', sig @ ..] =>
-        {
-            parse_signal(sig)?;
-            Resume::Step
-        }
+        b"c" => (Resume::Continue, None),
+        b"s" => (Resume::Step, None),
+        b"t" => (Resume::Stop, None),
+        [b'C', sig @ ..] => (Resume::Continue, Some(parse_signal(sig)?)),
+        [b'S', sig @ ..] => (Resume::Step, Some(parse_signal(sig)?)),
         _ => return Err(Error::Malformed),
     };
-    Ok(VContAction { resume, thread })
+    Ok(VContAction {
+        resume,
+        signal,
+        thread,
+    })
 }
 
 /// `M<addr>,<len>:<hex>`, after the `M`.
@@ -431,15 +457,14 @@ fn parse_signal(digits: &[u8]) -> Result<u8, Error>
 }
 
 /// `<signal>[;addr]`, after the `C` or `S`.
-fn signal_then_addr(rest: &[u8]) -> Result<Option<u64>, Error>
+fn signal_then_addr(rest: &[u8]) -> Result<(u8, Option<u64>), Error>
 {
     let (signal, addr) = match rest.iter().position(|&b| b == b';')
     {
         Some(i) => (&rest[..i], Some(&rest[i + 1..])),
         None => (rest, None),
     };
-    parse_signal(signal)?;
-    addr.map(parse_u64).transpose()
+    Ok((parse_signal(signal)?, addr.map(parse_u64).transpose()?))
 }
 
 /// An address that may be absent (`c`, `s`).
@@ -566,13 +591,15 @@ mod tests
     }
 
     #[test]
-    fn resume_commands_take_an_optional_address_and_ignore_a_signal()
+    fn resume_commands_take_an_optional_address_and_signal()
     {
-        assert_eq!(parse(b"c"), Ok(Command::Continue(None)));
-        assert_eq!(parse(b"c4000"), Ok(Command::Continue(Some(0x4000))));
-        assert_eq!(parse(b"s"), Ok(Command::Step(None)));
-        assert_eq!(parse(b"C05"), Ok(Command::Continue(None)));
-        assert_eq!(parse(b"S0b;4000"), Ok(Command::Step(Some(0x4000))));
+        let cont = |addr, signal| Ok(Command::Continue { addr, signal });
+        let step = |addr, signal| Ok(Command::Step { addr, signal });
+        assert_eq!(parse(b"c"), cont(None, None));
+        assert_eq!(parse(b"c4000"), cont(Some(0x4000), None));
+        assert_eq!(parse(b"s"), step(None, None));
+        assert_eq!(parse(b"C05"), cont(None, Some(5)));
+        assert_eq!(parse(b"S0b;4000"), step(Some(0x4000), Some(0x0b)));
         assert_eq!(parse(b"C5"), Err(Error::Malformed));
         assert_eq!(parse(b"cxyz"), Err(Error::Malformed));
     }
@@ -592,18 +619,22 @@ mod tests
             [
                 VContAction {
                     resume: Resume::Step,
+                    signal: None,
                     thread: Some(ThreadId::Id(2))
                 },
                 VContAction {
                     resume: Resume::Continue,
+                    signal: Some(5),
                     thread: Some(ThreadId::All)
                 },
                 VContAction {
                     resume: Resume::Stop,
+                    signal: None,
                     thread: Some(ThreadId::Any)
                 },
                 VContAction {
                     resume: Resume::Continue,
+                    signal: None,
                     thread: None
                 },
             ]

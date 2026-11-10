@@ -274,7 +274,9 @@ also checked in `fault_dispatch`'s resume), release builds fail closed with
 `fault_dispatch`'s resume fails closed the same way: REDELIVER makes the delivery again under the
 binding current then, FORWARDED makes it again through the exception class (a decline for a
 kernel copy's fault), and any other `fault_outcome` than RESUME, a PENDING left by an unstamped
-wake included, kills the thread (the `fault_outcome` row of
+wake included, is the unhandled outcome: it kills the thread, or, for the fault of a restartable
+syscall's user copy (`copy_fault_dispatch`), fails that syscall with `InvalidAddress`, or, for an
+upcall delivery, drops the upcall and resumes the thread (the `fault_outcome` row of
 [scheduling-internals.md § Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 
 **Resume (non-call parks — fail-open).** Each non-call parking syscall

@@ -863,8 +863,9 @@ pub mod memmgr_labels
     /// memmgr records the region against that badge's tracking entry; a
     /// later page fault inside a registered region is backed on demand by
     /// the fault-handler arm, while a fault outside every registered region
-    /// is declined (the faulting thread is killed), preserving segfault
-    /// semantics.
+    /// is declined (the faulting thread is killed, or, for the fault of a
+    /// restartable syscall's user copy, that syscall fails with
+    /// `InvalidAddress`), preserving segfault semantics.
     ///
     /// Wire format:
     /// * `data[0]` — `va_base` (page-aligned virtual address).

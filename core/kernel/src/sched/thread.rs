@@ -261,9 +261,11 @@ pub enum IpcThreadState
     /// Distinct from [`Self::BlockedOnReply`] because resume semantics differ:
     /// a fault-blocked thread resumes by re-executing its faulting instruction
     /// (or continuing from a handler-modified PC), not by returning a syscall
-    /// value, and cancellation kills it rather than returning `Interrupted`.
-    /// The disposition is carried in `ThreadControlBlock::fault_outcome`. See
-    /// `docs/fault-handling.md`.
+    /// value. Cancellation returns no `Interrupted`: it kills the thread, or,
+    /// for the fault of a restartable syscall's user copy, fails that syscall
+    /// with `InvalidAddress`, or, for an upcall delivery, drops the upcall and
+    /// resumes the thread. The disposition is carried in
+    /// `ThreadControlBlock::fault_outcome`. See `docs/fault-handling.md`.
     BlockedOnFault,
     /// Blocked waiting for a notification bitmask to become non-zero.
     BlockedOnNotification,

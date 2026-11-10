@@ -15,6 +15,7 @@ pub mod run;
 pub mod run_parallel;
 pub mod symbolize;
 pub mod test;
+pub mod test_debug_port;
 pub mod test_kaslr;
 pub mod test_logd_reclaim;
 pub mod test_map_redo;

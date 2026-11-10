@@ -113,6 +113,12 @@ pub enum CliCommand
     /// pass marker, and remove the knob again (see xtask/README.md).
     TestMapRedo(TestMapRedoArgs),
 
+    /// Check the debug port's transport: stage the `debug-echo` fixture,
+    /// boot the current sysroot once with `--debug-port`, exchange GDB remote
+    /// serial protocol packets with the fixture over the port's TCP end, and
+    /// unstage the fixture again (see xtask/README.md).
+    TestDebugPort(TestDebugPortArgs),
+
     /// Check the mechanical documentation and source-header rules: Markdown
     /// column limit, file-header layout, `## Summarized By` shape and forward
     /// links, and document reachability from the root README. Runs in CI's
@@ -286,6 +292,13 @@ pub struct RunArgs
     /// share one line.
     #[arg(long, requires = "second_disk")]
     pub second_disk_shared_line: bool,
+
+    /// Attach the debug port: a `virtio-console` device, which devmgr binds
+    /// as the debug port, its host end a TCP server QEMU listens with on
+    /// `127.0.0.1:<PORT>` (a debugger connects with `target remote
+    /// localhost:<PORT>`). The console keeps the UART.
+    #[arg(long, value_name = "PORT")]
+    pub debug_port: Option<u16>,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -450,6 +463,28 @@ pub struct TestMapRedoArgs
     /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64).
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+}
+
+// ── TestDebugPort ─────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestDebugPortArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// The host TCP port the debug port is served on.
+    #[arg(long, default_value = "4560")]
+    pub port: u16,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
 }
 
 // ── ComposeBundle ────────────────────────────────────────────────────────────
@@ -656,6 +691,12 @@ pub struct RunParallelArgs
     /// semantics as `cargo xtask run --second-disk-shared-line`.
     #[arg(long, requires = "second_disk")]
     pub second_disk_shared_line: bool,
+
+    /// Attach the debug port, served on `127.0.0.1:<PORT>`; same semantics
+    /// as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host
+    /// port).
+    #[arg(long, value_name = "PORT")]
+    pub debug_port: Option<u16>,
 }
 
 // ── KtestTiming ───────────────────────────────────────────────────────────────

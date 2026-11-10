@@ -17,6 +17,9 @@ anyhow = "1"
 # Seraph-minted GPT partition type GUIDs are defined here so xtask
 # (producer) and vfsd (consumer) reference the same byte arrays.
 boot-protocol = { path = "../abi/boot-protocol" }
+# `test-debug-port`: the GDB remote serial protocol's framing, shared with the
+# guest fixture it drives.
+gdb-rsp = { path = "../shared/gdb-rsp" }
 gpt = "4"
 fatfs = "0.3"
 uuid = "1"

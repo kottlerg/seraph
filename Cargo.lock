@@ -276,6 +276,11 @@ dependencies = [
 [[package]]
 name = "crashme"
 version = "0.1.2"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
 
 [[package]]
 name = "crashme-tester"

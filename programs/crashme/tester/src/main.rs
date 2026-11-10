@@ -3,8 +3,9 @@
 
 // programs/crashme/tester/src/main.rs
 
-//! Per-program tester for `/programs/crashme`. Runs it in each mode, `vm`
-//! and `exception`, and checks that it reached its fault and died of it:
+//! Per-program tester for `/programs/crashme`. Runs it in each mode the
+//! crash-report check reads, `vm`, `exception`, and `worker`, and checks
+//! that it reached its fault and died of it:
 //! a non-clean exit whose reason is a fault class, so the crash service's
 //! decline ended the thread as the kernel would have. The report block each
 //! death leaves in the log is checked host-side, from the boot's serial log,
@@ -76,5 +77,6 @@ fn main()
 {
     check("vm");
     check("exception");
+    check("worker");
     println!("[crashme-tester] PASS");
 }

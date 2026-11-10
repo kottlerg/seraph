@@ -108,7 +108,7 @@ pub enum CliCommand
     TestLogdReclaim(TestLogdReclaimArgs),
 
     /// Check the crash service's report blocks in a boot's saved serial log:
-    /// every block well-formed, and the `crashme` fixture's two reports
+    /// every block well-formed, and the `crashme` fixture's three reports
     /// present (`--expect reports`), or no block at all (`--expect none`)
     /// (see xtask/README.md).
     TestCrashReport(TestCrashReportArgs),
@@ -410,7 +410,8 @@ pub struct TestKaslrArgs
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CrashReportExpect
 {
-    /// The `crashme` fixture's `vm` and `exception` reports: a usertest boot
+    /// The `crashme` fixture's `vm` and `exception` reports of its main
+    /// thread and its `worker` report of a spawned thread: a usertest boot
     /// with crashd staged.
     Reports,
     /// No report block: a boot of an image that stages no crashd.

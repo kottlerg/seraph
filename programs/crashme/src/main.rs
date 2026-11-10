@@ -7,12 +7,23 @@
 //! death leaves in the system log.
 //!
 //! `crashme vm` writes to the null page, a page fault memmgr cannot back;
-//! `crashme exception` executes an illegal instruction. Each first logs under
-//! the log name `crashme`, so logd's reclaim line at its death names it, and
-//! reaches the fault two calls deep, so the report's stack walk has frames to
-//! find. See programs/crashme/README.md.
+//! `crashme exception` executes an illegal instruction. `crashme worker`
+//! dies of the illegal instruction on a spawned thread while a sibling is
+//! held fault-blocked at the same instruction, so the report must tell the
+//! two apart. `crashme registry-main` and `crashme registry-worker` fault on
+//! the main thread and on a spawned one with threads registered, parked,
+//! exited, and joined around them, for svctest's attach checks. Each first
+//! logs under the log name `crashme`, so logd's reclaim line at its death
+//! names it, and reaches the fault two calls deep, so the report's stack walk
+//! has frames to find. See programs/crashme/README.md.
 
 mod arch;
+
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use syscall_abi::FAULT_CLASS_EXCEPTION;
 
 /// The fault the fixture dies of.
 #[derive(Clone, Copy)]
@@ -24,23 +35,150 @@ enum Mode
     Exception,
 }
 
+/// Parked threads `worker` spawns before its faulting thread, so the
+/// faulting thread's index in procmgr's attach list lies past the first
+/// page of `ipc::procmgr_labels::ATTACH_THREADS_PAGE` caps.
+const WORKER_PARKED: usize = ipc::procmgr_labels::ATTACH_THREADS_PAGE;
+
+/// How long the fixture waits for a thread it let exit to finish exiting.
+const EXIT_SETTLE: Duration = Duration::from_millis(100);
+
 fn main()
 {
     std::os::seraph::log::register_name(b"crashme");
     let arg = std::env::args().nth(1).unwrap_or_default();
-    let mode = match arg.as_str()
+    match arg.as_str()
     {
-        "vm" => Mode::Vm,
-        "exception" => Mode::Exception,
+        "vm" => fault_here(&arg, Mode::Vm),
+        "exception" => fault_here(&arg, Mode::Exception),
+        "worker" => worker(&arg),
+        "registry-main" => registry_main(&arg),
+        "registry-worker" => registry_worker(&arg),
         _ =>
         {
-            println!("usage: crashme vm|exception");
+            println!("usage: crashme vm|exception|worker|registry-main|registry-worker");
             std::process::exit(2);
         }
-    };
+    }
+}
+
+/// Announce the fault on the log and stdout, then take it as `mode` says.
+fn fault_here(arg: &str, mode: Mode) -> !
+{
     std::os::seraph::log!("faulting ({arg})");
     println!("faulting ({arg})");
     outer(mode);
+}
+
+/// A thread parked until its sender drops or sends.
+fn park() -> (mpsc::Sender<()>, JoinHandle<()>)
+{
+    let (tx, rx) = mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let _ = rx.recv();
+    });
+    (tx, handle)
+}
+
+/// Fault on a spawned thread while another is fault-blocked at the same
+/// instruction: a holder thread receives the first worker's fault on an
+/// endpoint the main thread bound its exception class to, and keeps it
+/// unanswered; the second worker's fault, past `WORKER_PARKED` parked
+/// threads, reaches the crash service.
+fn worker(arg: &str)
+{
+    let endpoint =
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |s| {
+            syscall::cap_create_endpoint(s).ok()
+        })
+        .unwrap_or_else(|| fail("worker: no endpoint"));
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+    let _holder = std::thread::spawn(move || hold_one_fault(endpoint, &held_tx));
+
+    let (cap_tx, cap_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let _first = std::thread::spawn(move || {
+        let _ = cap_tx.send(std::os::seraph::thread::current_thread_cap());
+        let _ = go_rx.recv();
+        outer(Mode::Exception);
+    });
+    let first = cap_rx
+        .recv()
+        .unwrap_or_else(|_| fail("worker: no thread cap"));
+    if syscall::thread_set_fault_handler(first, endpoint, FAULT_CLASS_EXCEPTION).is_err()
+    {
+        fail("worker: binding the first worker's exception class");
+    }
+    let _ = go_tx.send(());
+    held_rx
+        .recv()
+        .unwrap_or_else(|_| fail("worker: the first worker's fault was not held"));
+
+    let parked: Vec<_> = (0..WORKER_PARKED).map(|_| park()).collect();
+    std::os::seraph::log!("faulting ({arg})");
+    println!("faulting ({arg})");
+    let second = std::thread::spawn(|| {
+        outer(Mode::Exception);
+    });
+    let _ = second.join();
+    drop(parked);
+}
+
+/// Receive one fault on `endpoint`, tell the main thread, and never answer
+/// it, so its thread stays fault-blocked until the process dies. The thread
+/// receives nothing more, which would cancel the held fault.
+fn hold_one_fault(endpoint: u64, held: &mpsc::Sender<()>) -> !
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+    if unsafe { ipc::ipc_recv(endpoint, ipc_buf) }.is_ok()
+    {
+        let _ = held.send(());
+    }
+    loop
+    {
+        std::thread::park();
+    }
+}
+
+/// Fault on the main thread with two parked threads registered and a
+/// detached one exited, which the attach must not list.
+fn registry_main(arg: &str)
+{
+    let parked = [park(), park()];
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    drop(std::thread::spawn(move || {
+        let _ = done_tx.send(());
+    }));
+    let _ = done_rx.recv();
+    std::thread::sleep(EXIT_SETTLE);
+    let _keep = parked;
+    fault_here(arg, Mode::Exception);
+}
+
+/// Fault on a spawned thread after joining its sibling, which the attach
+/// must not list.
+fn registry_worker(arg: &str)
+{
+    let (gone_tx, gone) = park();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let faulting = std::thread::spawn(move || {
+        let _ = go_rx.recv();
+        outer(Mode::Exception);
+    });
+    drop(gone_tx);
+    let _ = gone.join();
+    std::os::seraph::log!("faulting ({arg})");
+    println!("faulting ({arg})");
+    let _ = go_tx.send(());
+    let _ = faulting.join();
+}
+
+/// Report a setup failure and exit with a code that is not a fault's.
+fn fail(what: &str) -> !
+{
+    println!("crashme: {what}");
+    std::process::exit(3);
 }
 
 /// The first of the two calls the fault happens under.

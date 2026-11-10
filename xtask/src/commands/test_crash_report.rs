@@ -22,20 +22,16 @@
 //! does not stage crashd. A log whose `run-parallel` trailer records a
 //! `QEMU-CRASH` is skipped, as `test-logd-reclaim` skips it.
 
-use std::collections::HashMap;
-
 use anyhow::{Context as _, Result, bail};
 use crash_report::Block;
 
 use crate::cli::{CrashReportExpect, TestCrashReportArgs};
 use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_outcome};
+use crate::crash_log::reclaimed_names;
 use crate::util::step;
 
 /// The log name of the fixture whose two reports the usertest boot leaves.
 const FIXTURE: &str = "crashme";
-
-/// The start of logd's death-drain reclaim line after its timestamp.
-const RECLAIM_TAG: &str = "[logd] reclaim: badge=";
 
 /// The kernel's decline line, up to its reason
 /// (`report_user_kill` in `core/kernel/src/ipc/fault.rs`).
@@ -49,36 +45,6 @@ enum Verdict
     Pass(usize),
     /// A host-emulator crash ended the boot; nothing is checked.
     Skipped(String),
-}
-
-/// The badge and log name of each `[logd] reclaim:` line.
-fn reclaimed_names(log: &str) -> HashMap<u64, String>
-{
-    let mut names = HashMap::new();
-    for line in log.lines()
-    {
-        let Some(at) = line.find(RECLAIM_TAG)
-        else
-        {
-            continue;
-        };
-        let rest = &line[at + RECLAIM_TAG.len()..];
-        let Some((badge, rest)) = rest.split_once(' ')
-        else
-        {
-            continue;
-        };
-        let Some((_, name)) = rest.split_once(" name=")
-        else
-        {
-            continue;
-        };
-        if let Ok(badge) = badge.parse()
-        {
-            names.insert(badge, name.trim_end_matches('\r').to_string());
-        }
-    }
-    names
 }
 
 /// The decline reasons the kernel's `fault unhandled` lines print.

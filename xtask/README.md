@@ -584,12 +584,20 @@ Every field line follows in the block's order, as logged. `ip`, and each `frame.
 block's `text`, carries its resolution in the address form's shape, the inlined-caller lines
 indented below it; a frame past `frame.0` is a candidate return address, so it resolves at its
 address less one, inside the call it returns from, and an `ip` outside `text` reads
-`outside the image's text`. In place of the `image:` line a block says why it is not symbolized:
-the process is unnamed (no `reclaim:` line carries its badge), no sysroot binary has its name, the
-block's `arch` is not the sysroot's, it carries no `load_bias` and `text` (a report whose attach
-failed), or the image is not an ELF image; its fields then print as logged. An incomplete or
-defective block is marked `defective block (<defect>)` and printed all the same. A log without a
-block prints that it has none. `run-parallel` writes the same report beside each log it keeps.
+`outside the image's text`.
+
+A process that registered no log name with logd has no `reclaim:` line, and its block's header
+reads `process unnamed (badge <badge>: …)`. Its image is then the one binary of those directories
+whose executable segments span exactly the block's `text` less its `load_bias` (the span procmgr
+records at spawn), labelled as found that way; when none or several match, the block is not
+symbolized, and no name is guessed. In place of the `image:` line a block that is not symbolized
+says why (the process is unnamed and its text matches no binary or several, no sysroot binary has
+its name, the block's `arch` is not the sysroot's, it carries no `load_bias` and `text` because the
+report's attach failed, or the image is not an ELF image) and, when it has a `load_bias`, gives the
+address-form command that resolves its addresses once the binary is known; its fields then print
+as logged. An incomplete or defective block is marked `defective block (<defect>)` and printed all
+the same. A log without a block prints that it has none. `run-parallel` writes the same report
+beside each log it keeps.
 
 ---
 

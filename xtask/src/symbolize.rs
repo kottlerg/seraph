@@ -17,7 +17,10 @@ use std::borrow::Cow;
 
 use addr2line::gimli::{self, EndianSlice, RunTimeEndian};
 use anyhow::{Context as _, Result, bail};
-use object::{CompressionFormat, Object as _, ObjectSection as _, ObjectSymbol as _, SymbolKind};
+use object::{
+    CompressionFormat, Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _,
+    SegmentFlags, SymbolKind,
+};
 
 /// The DWARF context type the symbolizer reads through.
 type DwarfContext<'data> = addr2line::Context<EndianSlice<'data, RunTimeEndian>>;
@@ -225,6 +228,24 @@ fn dwarf_frames(dwarf: &DwarfContext<'_>, vaddr: u64) -> Result<Vec<Frame>>
         });
     }
     Ok(frames)
+}
+
+/// The unbiased bounds of `data`'s executable loadable segments: the lowest
+/// segment address to one past the highest segment end (address plus memory
+/// size), the span procmgr biases into a crash report's `text`. `None` for
+/// data that is not an ELF image or an image without an executable segment.
+pub fn text_span(data: &[u8]) -> Option<(u64, u64)>
+{
+    let file = object::File::parse(data).ok()?;
+    file.segments()
+        .filter(|segment| match segment.flags()
+        {
+            SegmentFlags::Elf { p_flags, .. } => p_flags.contains(object::elf::PF_X),
+            _ => false,
+        })
+        .map(|segment| (segment.address(), segment.address() + segment.size()))
+        .filter(|(start, end)| start < end)
+        .reduce(|(lo, hi), (start, end)| (lo.min(start), hi.max(end)))
 }
 
 /// The image address of runtime address `addr` in an image loaded at

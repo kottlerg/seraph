@@ -896,7 +896,8 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 | `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`. A drain PR that closes a follow-up Issue carries both (§ Branch and PR Workflow); in any other body the pair usually means a sentence closes an Issue the PR only references. |
 | `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
 | `pr-validation` | error | The body has a `## Validation` section that names a validated head: the first word of that section that is a commit hash in the clone. |
-| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch, the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. |
+| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch (one the head holds and the base branch does not), the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. When a merge of the base branch lies between the two heads, the command compares the PR's own change at each, `git diff <merge base> <validated>` and `git diff <merge base> <head>`, as multisets of changed lines per file, instead of the delta: they must differ only in comment or Markdown lines and in no file a build embeds, and the section must say so only when they differ at all. |
+| `pr-validated-sync` | warning | No merge of the base branch lies between a validated head that passes `pr-validated-head` and the PR head. After one the body states whether the incoming diff overlaps the PR's files; a reader decides the overlap, the command cannot. |
 | `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
 | `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Branch and PR Workflow). |
 | `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
@@ -915,6 +916,7 @@ fails the gate.
 | `gate-merge-state` | error | GitHub reports the merge state `CLEAN`. |
 | `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
+| `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
 | `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
 | `gate-findings-recorded` | warning | That record leaves no finding on the surface. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each is recorded and none is contested; the command cannot. |
 
@@ -939,8 +941,8 @@ one JSON object:
 | Key | Value |
 |---|---|
 | `verdict` | The reviewer verdict: `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, or `BLOCKING ISSUES`. In an `audit` record, the reviewer verdict the audit states. |
-| `audit_verdict` | `AUDIT PASS` or `AUDIT FAIL`. |
-| `audit` | `verdict` (as `audit_verdict`) and `sections`, a list of objects with `name`, `verdict`, and `items`. |
+| `audit_verdict` | `AUDIT PASS` or `AUDIT FAIL`; in a `full` or `delta` record of the reviewer alone, run while an owed host run is unreported, `NOT RUN`. |
+| `audit` | `verdict` (as `audit_verdict`) and `sections`, a list of objects with `name`, `verdict`, and `items`; `null` in a record of the reviewer alone. |
 | `findings` | The findings on the review surface. In an `audit` record, those of the last run with the reviewer that the delta leaves unfixed. |
 | `recorded` | The findings off the surface. |
 | `ledgered` | The findings the reviewer listed as held by the ledger. |
@@ -951,7 +953,9 @@ Each finding is an object with `file`, `line`, `class` (`correctness`, `safety`,
 `standards`, `doc-drift`, `coverage`, or `style`), `bucket` (`critical`, `should`, or `nit`),
 `must_violation` (a boolean), `status` (`unverified`, `nit`, or `contested`), `issue`, `claim`,
 and `fix`. The command reports each departure as `error record-shape` or, for a file name that
-does not state its record's mode and head, `error record-name`.
+does not state its record's mode and head, `error record-name`. A record with `audit_verdict`
+`NOT RUN` and a non-null `audit`, a null `audit` with any other `audit_verdict`, or an `audit`
+record with `NOT RUN` is `error record-audit-shape`.
 
 ### `cargo xtask review-ledger`
 

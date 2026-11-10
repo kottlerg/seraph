@@ -225,7 +225,10 @@ After pushing: `gh pr create` with the template filled; `gh pr checks <N> --watc
 background; on green, the pre-merge review per `.claude/CLAUDE.md` § PR workflow operations
 (`pr-reviewer` and `pr-auditor` invoked directly in parallel with the PR number, the open Issue
 list, and for a delta run the `since` head, both merge bases and the ledger). Save records under
-`target/xtask/review/pr<N>/`. Push and open the PR as soon as
+`target/xtask/review/pr<N>/`. A run of the reviewer alone, made while an owed host run is
+unreported, is a `full` or `delta` record with `audit_verdict` `NOT RUN` and `audit` `null`, and
+the audit it leaves owed at that head is a later `audit` record there (`cargo xtask review-check`
+in xtask/README.md). Push and open the PR as soon as
 `cargo xtask test` and `lint-docs` pass, so CI and the first review run before the host runs.
 When the prompt names the ledger of a previous PR on the same surface, your first review run
 passes it to the reviewer as that PR's settled findings, for context and not as this PR's

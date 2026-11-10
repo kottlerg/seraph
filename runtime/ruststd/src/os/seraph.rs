@@ -1078,10 +1078,41 @@ pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
     Ok(range)
 }
 
+/// `ipc::ipc_call`, made again for as long as it returns `Interrupted`, so the
+/// result is the server's reply or an error no stop or upcall caused.
+///
+/// A stop or an upcall post cancels a blocked call with `Interrupted`, which
+/// does not mean the request went undelivered (docs/fault-handling.md
+/// § Asynchronous Upcalls › Blocking syscalls): a caller of this helper sends
+/// only a request that is safe to repeat once the server may have carried it
+/// out. Allocates nothing.
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+pub(crate) unsafe fn ipc_call_until_answered(
+    ep: u64,
+    msg: &ipc::IpcMessage,
+    ipc_buf: *mut u64,
+) -> Result<ipc::IpcMessage, i64> {
+    loop {
+        // SAFETY: the caller passes the registered IPC buffer page.
+        match unsafe { ipc::ipc_call(ep, msg, ipc_buf) } {
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => {}
+            result => return result,
+        }
+    }
+}
+
 /// Register `[va, va + pages * PAGE_SIZE)` with memmgr (`REGISTER_REGION`) as
 /// a read-write demand-paged region of this process. Returns whether memmgr
-/// accepted it. Issues one IPC and allocates nothing, so the heap bootstrap
-/// can register its floor before the heap exists.
+/// holds the registration. Allocates nothing, so the heap bootstrap can
+/// register its floor before the heap exists.
+///
+/// The range is one the caller has just reserved, so no other registration
+/// of it exists. An interrupted call may still have registered it, and memmgr
+/// refuses the repeat as an overlap; after such a refusal the range is
+/// unregistered ([`unregister_rw_region`]) and registered again, so the reply
+/// that decides is one no interruption preceded.
 ///
 /// # Safety
 /// `ipc_buf` is the calling thread's registered IPC buffer page.
@@ -1091,15 +1122,50 @@ pub(crate) unsafe fn register_rw_region(
     va: u64,
     pages: u64,
 ) -> bool {
+    let len = pages.saturating_mul(syscall_abi::PAGE_SIZE);
     let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_REGION)
         .word(0, va)
-        .word(1, pages.saturating_mul(syscall_abi::PAGE_SIZE))
+        .word(1, len)
         .word(2, syscall_abi::MAP_WRITABLE)
+        .build();
+    let mut interrupted = false;
+    loop {
+        // SAFETY: the caller passes the registered IPC buffer page.
+        match unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) } {
+            Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => return true,
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => interrupted = true,
+            Ok(reply) if interrupted && reply.label == ipc::memmgr_errors::INVALID_ARGUMENT => {
+                // SAFETY: as above.
+                if !unsafe { unregister_rw_region(memmgr_ep, ipc_buf, va, len) } {
+                    return false;
+                }
+                interrupted = false;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Unregister the region `[va, va + len)` this process registered with
+/// memmgr (`UNREGISTER_REGION`), memmgr unmapping and reclaiming every frame
+/// it backed there. Returns `true` once memmgr has answered, when the range
+/// is no longer registered: a refusal of an exact range means no region
+/// matches it, which is also the outcome of a repeat after an interrupted
+/// call that memmgr carried out. Returns `false` when no answer came, and the
+/// range may still be registered.
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+unsafe fn unregister_rw_region(memmgr_ep: u64, ipc_buf: *mut u64, va: u64, len: u64) -> bool {
+    let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::UNREGISTER_REGION)
+        .word(0, va)
+        .word(1, len)
         .build();
     // SAFETY: the caller passes the registered IPC buffer page.
     matches!(
-        unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) },
+        unsafe { ipc_call_until_answered(memmgr_ep, &msg, ipc_buf) },
         Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
+            || reply.label == ipc::memmgr_errors::INVALID_ARGUMENT
     )
 }
 
@@ -1245,19 +1311,22 @@ pub(crate) fn reserve_guarded_stack(
 /// Tear down a guarded stack: UNREGISTER_REGION the usable region (memmgr unmaps
 /// every frame it backed and returns them to the pool), then release the VA.
 /// Call only once the thread has left user-mode — its stack is no longer in use.
+///
+/// The VA is released only once memmgr has answered the unregister. When no
+/// answer comes, memmgr may still hold the region, so the reservation is kept
+/// for the process's lifetime rather than handed to a later reservation whose
+/// pages memmgr would back.
 pub(crate) fn unregister_guarded_stack(stack: GuardedStack) {
     let ipc_buf = current_ipc_buf();
     let memmgr_ep = startup_info().memmgr_endpoint;
-    if !ipc_buf.is_null() && memmgr_ep != 0 {
-        let usable_len = stack.usable_pages.saturating_mul(syscall_abi::PAGE_SIZE);
-        let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::UNREGISTER_REGION)
-            .word(0, stack.usable_base)
-            .word(1, usable_len)
-            .build();
+    let usable_len = stack.usable_pages.saturating_mul(syscall_abi::PAGE_SIZE);
+    let answered = !ipc_buf.is_null() && memmgr_ep != 0 && {
         // SAFETY: current_ipc_buf returns the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
+        unsafe { unregister_rw_region(memmgr_ep, ipc_buf, stack.usable_base, usable_len) }
+    };
+    if answered {
+        unreserve_pages(stack.range);
     }
-    unreserve_pages(stack.range);
 }
 
 // ── System log macro surface ────────────────────────────────────────────────

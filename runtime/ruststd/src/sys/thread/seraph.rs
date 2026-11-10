@@ -243,9 +243,10 @@ fn alloc_stack(
 
 /// Release a stack allocation: a heap stack is `dealloc`'d; a demand stack is
 /// unregistered (memmgr unmaps and reclaims its backing frames) and its VA
-/// released. Call only when the thread no longer uses the stack — on the error
-/// unwind in [`Thread::new`] (before start) or in [`Thread::join`] (after the
-/// thread has left user-mode).
+/// released once memmgr has answered (`unregister_guarded_stack`). Call only
+/// when the thread no longer uses the stack — on the error unwind in
+/// [`Thread::new`] (before start) or in [`Thread::join`] (after the thread has
+/// left user-mode).
 fn free_stack(stack: StackAlloc) {
     match stack {
         // SAFETY: `base` came from `alloc(layout)` in `alloc_stack`.

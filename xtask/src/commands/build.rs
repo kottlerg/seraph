@@ -285,7 +285,8 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     // The GDB stub: installed on every image, started only on a boot that
-    // stages its recipe (`run --debug-target`, `test-gdb`).
+    // stages its recipe (`--debug-target` of `run` and `run-parallel`,
+    // `test-gdb`).
     Spec {
         name: "gdbstub",
         install_name: None,

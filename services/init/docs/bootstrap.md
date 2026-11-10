@@ -219,9 +219,9 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     `TEST_QUERY_DENY_DEVICE` (TODO(#165)); svctest is the only recipe seeding it.
   - `devmgr.debug` — the same SEND with `DEBUG_PORT_AUTHORITY` added, gating
     `QUERY_DEBUG_PORT_DEVICE`, the debug port; the `debug-echo` fixture, which only
-    `cargo xtask test-debug-port` stages, and the GDB stub, which only
-    `cargo xtask run --debug-target` and `test-gdb` stage, are the only recipes
-    seeding it.
+    `cargo xtask test-debug-port` stages, and the GDB stub, which only the
+    `--debug-target` option of `cargo xtask run` and `run-parallel`, and
+    `test-gdb`, stage, are the only recipes seeding it.
   - `vfsd.mount` / `vfsd.deny` — the endowed `MOUNT_AUTHORITY`-badged and
     `DENY_BADGE`-badged SENDs on vfsd's service endpoint, published as
     they arrive; svctest is the only recipe seeding them.

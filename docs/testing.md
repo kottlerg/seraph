@@ -168,7 +168,8 @@ rootfs/config/svcmgr/
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
     └── gdbstub.svc           # GDB stub template; staged, naming its target,
-                              # by run --debug-target and test-gdb
+                              # by run and run-parallel --debug-target, and
+                              # by test-gdb
 ```
 
 To enable a harness for a boot, copy its recipe from

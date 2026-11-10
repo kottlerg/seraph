@@ -785,6 +785,12 @@ pub struct RunParallelArgs
     /// port).
     #[arg(long, value_name = "PORT")]
     pub debug_port: Option<u16>,
+
+    /// Stage the GDB stub for these boots, attached to the process named
+    /// NAME; same semantics as `cargo xtask run --debug-target`. Requires
+    /// `--debug-port`.
+    #[arg(long, value_name = "NAME", requires = "debug_port")]
+    pub debug_target: Option<String>,
 }
 
 // ── KtestTiming ───────────────────────────────────────────────────────────────

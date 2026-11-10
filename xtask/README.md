@@ -17,7 +17,7 @@ xtask/
 │   ├── cli.rs                  # Clap derive structs for every subcommand
 │   ├── context.rs              # Resolved workspace and build-output paths
 │   ├── crash_log.rs            # Symbolized crash reports from a serial log (symbolize --log)
-│   ├── debug_stub.rs           # GDB stub staging (run --debug-target, test-gdb)
+│   ├── debug_stub.rs           # GDB stub staging (--debug-target, test-gdb)
 │   ├── diag.rs                 # Diagnostics of the pull-request, record, and Issue checks
 │   ├── arch.rs                 # Supported architectures and per-arch constants
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
@@ -367,7 +367,7 @@ cargo xtask run-parallel \
     [--iommu attached|absent] \
     [--display headless|framebuffer] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
-    [--debug-port PORT] \
+    [--debug-port PORT [--debug-target NAME]] \
     [--pass REGEX] \
     [--fail REGEX] \
     [--fail-also REGEX] \
@@ -393,6 +393,7 @@ cargo xtask run-parallel \
 | `--second-disk-block-size` | (the image's) | Block size of the second disk's device; same semantics as `cargo xtask run --second-disk-block-size` |
 | `--second-disk-shared-line` | off | Place the second disk on the first disk's `INTx` line; same semantics as `cargo xtask run --second-disk-shared-line` |
 | `--debug-port` | (none) | Attach the debug port, served on `127.0.0.1:PORT`; same semantics as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host port) |
+| `--debug-target` | (none) | Stage the GDB stub for these boots, attached to the process named `NAME`, and print the host GDB command line; same semantics as `cargo xtask run --debug-target`. The stub is staged into `disk.img` before the runs copy it and removed after the last run. Requires `--debug-port` |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |

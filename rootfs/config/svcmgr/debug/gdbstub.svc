@@ -2,9 +2,10 @@
 #
 # Lives under /config/svcmgr/debug/, which svcmgr does NOT scan: an image
 # that does not stage the stub has no attach path through it. `cargo xtask
-# run --debug-port PORT --debug-target NAME` (and `test-gdb`) writes it into
-# /config/svcmgr/services/ with the target's name appended to `argv`, and
-# repacks disk.img. See services/gdbstub/README.md.
+# run --debug-port PORT --debug-target NAME` (and `run-parallel` with the
+# same options, and `test-gdb`) writes it into /config/svcmgr/services/ with
+# the target's name appended to `argv`, and repacks disk.img. See
+# services/gdbstub/README.md.
 #
 # seed = devmgr.debug is the DEBUG_PORT_AUTHORITY SEND for the debug port;
 # `debug_authority = yes` makes svcmgr deliver a DEBUG_AUTHORITY SEND on

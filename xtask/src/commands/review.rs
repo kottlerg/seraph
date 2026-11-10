@@ -31,6 +31,10 @@ const VERDICTS: &[&str] = &[
 ];
 const AUDIT_VERDICTS: &[&str] = &["AUDIT PASS", "AUDIT FAIL"];
 
+/// The `audit_verdict` of a run of the reviewer alone, whose audit is still
+/// owed at its head.
+const NOT_RUN: &str = "NOT RUN";
+
 /// The record modes: a first run, a later run with the reviewer, and an
 /// audit alone.
 const MODES: &[&str] = &["full", "delta", "audit"];
@@ -179,10 +183,59 @@ fn check_finding(out: &mut Vec<Diag>, name: &str, at: &str, finding: &Value)
     }
 }
 
-/// The verdict lines and the audit result.
+/// The verdict lines and the audit result. A run of the reviewer alone is a
+/// `full` or `delta` record with `audit_verdict` `NOT RUN` and `audit` null;
+/// any other record carries an audit verdict and its result.
 fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
 {
     one_of(out, name, "verdict", &record["verdict"], VERDICTS);
+    if record.get("audit").is_none()
+    {
+        out.push(shape(
+            name,
+            "audit",
+            "is missing; a run of the reviewer alone states it as null",
+        ));
+        let mut either = AUDIT_VERDICTS.to_vec();
+        either.push(NOT_RUN);
+        one_of(
+            out,
+            name,
+            "audit_verdict",
+            &record["audit_verdict"],
+            &either,
+        );
+        return;
+    }
+    let not_run = record["audit_verdict"] == NOT_RUN;
+    if not_run || record["audit"].is_null()
+    {
+        let message = if !not_run
+        {
+            "`audit` is null and `audit_verdict` is not `NOT RUN`; a run of the reviewer \
+             alone has both, an audited run neither"
+        }
+        else if !record["audit"].is_null()
+        {
+            "`audit_verdict` is `NOT RUN` and `audit` is not null; a run of the reviewer \
+             alone has both, an audited run neither"
+        }
+        else if record["stats"]["mode"] == "audit"
+        {
+            "an `audit` record states the audit it is; `NOT RUN` belongs to a `full` or \
+             `delta` record"
+        }
+        else
+        {
+            return;
+        };
+        out.push(Diag::error(
+            "record-audit-shape",
+            format!("{name}: audit_verdict"),
+            message,
+        ));
+        return;
+    }
     one_of(
         out,
         name,
@@ -350,7 +403,7 @@ fn last_run<'a>(records: &'a [Record], head: &str) -> Result<&'a Record, Vec<Dia
     Ok(last)
 }
 
-/// The merge-prompt condition's record part (docs/conventions.md § Branch
+/// The merge condition's record part (docs/conventions.md § Branch
 /// and PR Workflow): the last run at `head` has no failed agent, `AUDIT
 /// PASS`, and a reviewer verdict that is not `BLOCKING ISSUES`. An earlier
 /// passing run at the same head does not count.
@@ -361,6 +414,15 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
         Ok(last) => last,
         Err(diags) => return diags,
     };
+    if record["audit_verdict"] == NOT_RUN
+    {
+        return vec![Diag::error(
+            "gate-audit-not-run",
+            name.as_str(),
+            "the last run at this head is the reviewer alone; the audit is still owed, as an \
+             `audit` record at this head with a greater `stats.run`",
+        )];
+    }
     if !passes(record)
     {
         return vec![Diag::error(
@@ -370,19 +432,33 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
              verdict of READY TO MERGE or NON-BLOCKING ISSUES ONLY",
         )];
     }
-    let open = record["findings"].as_array().map_or(0, Vec::len);
+    let open = record["findings"].as_array().map_or(0, |findings| {
+        findings.iter().filter(|f| needs_reader(f)).count()
+    });
     if record["verdict"] == "NON-BLOCKING ISSUES ONLY" && open > 0
     {
         return vec![Diag::warning(
             "gate-findings-recorded",
             name.as_str(),
             format!(
-                "{open} finding(s) stay on the surface; confirm each is recorded on its Issue \
-                 and none is contested"
+                "{open} finding(s) stay on the surface; confirm each is recorded and none is \
+                 contested"
             ),
         )];
     }
     Vec::new()
+}
+
+/// Whether the gate's reader must look at `finding`: one an Issue must
+/// record (docs/conventions.md § Recording findings: every finding but one
+/// of class `style` that is not a MUST violation, whose record is the run
+/// record), or one of any class that is contested, since the merge condition
+/// lets no contested finding stand unresolved.
+fn needs_reader(finding: &Value) -> bool
+{
+    finding["class"] != "style"
+        || finding["must_violation"] == true
+        || finding["status"] == "contested"
 }
 
 /// Build the ledger from every record of a PR: the findings each run
@@ -795,6 +871,114 @@ mod tests
             rules(&gate_diags(&records, HEAD)),
             ["gate-findings-recorded"]
         );
+    }
+
+    #[test]
+    fn the_gate_asks_nothing_for_a_style_finding_that_is_no_must_violation()
+    {
+        let mut style = finding("a", "nit");
+        style["class"] = json!("style");
+        let records = vec![(
+            NAME.to_owned(),
+            record(
+                "NON-BLOCKING ISSUES ONLY",
+                "AUDIT PASS",
+                vec![style.clone()],
+            ),
+        )];
+        assert!(gate_diags(&records, HEAD).is_empty());
+
+        style["must_violation"] = json!(true);
+        let records = vec![(
+            NAME.to_owned(),
+            record("NON-BLOCKING ISSUES ONLY", "AUDIT PASS", vec![style]),
+        )];
+        assert_eq!(
+            rules(&gate_diags(&records, HEAD)),
+            ["gate-findings-recorded"]
+        );
+    }
+
+    #[test]
+    fn the_gate_asks_about_a_contested_style_finding()
+    {
+        let mut style = finding("a", "contested");
+        style["class"] = json!("style");
+        let records = vec![(
+            NAME.to_owned(),
+            record("NON-BLOCKING ISSUES ONLY", "AUDIT PASS", vec![style]),
+        )];
+        assert_eq!(
+            rules(&gate_diags(&records, HEAD)),
+            ["gate-findings-recorded"]
+        );
+    }
+
+    /// A run of the reviewer alone: `NOT RUN` and no audit.
+    fn reviewer_alone(run_number: u64, verdict: &str, findings: Vec<Value>) -> Value
+    {
+        let mut r = run("delta", run_number, verdict, NOT_RUN);
+        r["audit"] = Value::Null;
+        r["findings"] = json!(findings);
+        r
+    }
+
+    #[test]
+    fn a_reviewer_alone_record_is_well_formed()
+    {
+        assert!(check_record(NAME, &reviewer_alone(1, PASS.0, vec![])).is_empty());
+    }
+
+    #[test]
+    fn a_mix_of_the_reviewer_alone_and_the_audited_forms_is_reported()
+    {
+        let mut not_run_with_audit = passing();
+        not_run_with_audit["audit_verdict"] = json!(NOT_RUN);
+        let mut audited_without_audit = passing();
+        audited_without_audit["audit"] = Value::Null;
+        let mut audit_not_run = reviewer_alone(1, PASS.0, vec![]);
+        audit_not_run["stats"]["mode"] = json!("audit");
+        // The null is stated; a missing key is a shape error.
+        let mut no_audit_key = reviewer_alone(1, PASS.0, vec![]);
+        no_audit_key.as_object_mut().unwrap().remove("audit");
+        assert_eq!(fields(&no_audit_key), ["audit"]);
+        // The missing key does not hide a bad verdict line beside it.
+        no_audit_key["audit_verdict"] = json!("PASS");
+        assert_eq!(fields(&no_audit_key), ["audit", "audit_verdict"]);
+        for (name, bad) in [
+            (NAME, not_run_with_audit),
+            (NAME, audited_without_audit),
+            ("audit-0a82b0aa.json", audit_not_run),
+        ]
+        {
+            assert_eq!(rules(&check_record(name, &bad)), ["record-audit-shape"]);
+        }
+    }
+
+    #[test]
+    fn the_gate_owes_the_audit_after_a_reviewer_alone_run()
+    {
+        let mut records = vec![(NAME.to_owned(), reviewer_alone(2, PASS.0, vec![]))];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["gate-audit-not-run"]);
+        assert_eq!(found[0].at, NAME);
+        records.push((
+            "audit-0a82b0aa.json".to_owned(),
+            run("audit", 3, PASS.0, PASS.1),
+        ));
+        assert!(gate_diags(&records, HEAD).is_empty());
+    }
+
+    #[test]
+    fn the_ledger_reads_a_reviewer_alone_record()
+    {
+        let records = vec![(
+            NAME.to_owned(),
+            reviewer_alone(1, "NON-BLOCKING ISSUES ONLY", vec![finding("a nit", "nit")]),
+        )];
+        let ledger = ledger(&records);
+        assert_eq!(ledger.as_array().map(Vec::len), Some(1));
+        assert_eq!(ledger[0]["claim"], "a nit");
     }
 
     #[test]

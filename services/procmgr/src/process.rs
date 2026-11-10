@@ -622,6 +622,8 @@ pub struct ChildArgvEnv
     memory: CapGuard,
     pages: u64,
     header: ipc::procmgr_labels::ArgvEnvHeader,
+    /// The child's name, the first string of its argv (`LIST_PROCESSES`).
+    name: process_table::ProcessName,
 }
 
 impl ChildArgvEnv
@@ -633,6 +635,7 @@ impl ChildArgvEnv
             memory: CapGuard::new(0),
             pages: 0,
             header: ipc::procmgr_labels::ArgvEnvHeader::default(),
+            name: process_table::ProcessName::EMPTY,
         }
     }
 }
@@ -872,7 +875,7 @@ pub fn copy_argv_env(
         return Err(ArgvEnvCopyError::StillMapped);
     }
     copied?;
-    tally.finish().map_err(|refusal| {
+    let name = tally.finish().map_err(|refusal| {
         std::os::seraph::log!("create argv/env refused: {refusal:?}");
         Reply(procmgr_errors::INVALID_ARGUMENT)
     })?;
@@ -880,6 +883,7 @@ pub fn copy_argv_env(
         memory,
         pages,
         header: request.header,
+        name,
     })
 }
 
@@ -1058,6 +1062,8 @@ struct ChildInfoCaps
 {
     pi_memory: CapGuard,
     argv_env_memory: CapGuard,
+    /// The child's name, carried from its argv to its table entry.
+    name: process_table::ProcessName,
 }
 
 impl ChildInfoCaps
@@ -1420,6 +1426,7 @@ unsafe fn populate_child_info(
     Ok(ChildInfoCaps {
         pi_memory,
         argv_env_memory: argv_env.memory,
+        name: argv_env.name,
     })
 }
 
@@ -1953,6 +1960,8 @@ fn finalize_creation(
             no_debug: false,
             image,
             threads: process_table::ThreadRegistry::new(),
+            name: info_caps.name,
+            debugger: 0,
         })
         .is_err()
     {
@@ -2150,6 +2159,112 @@ pub fn release_registered_thread(thread: process_table::RegisteredThread)
 {
     let _ = syscall::cap_revoke_all(thread.cap);
     let _ = syscall::cap_delete(thread.cap);
+}
+
+/// Bind the process `badge` names back to the crash endpoint after a
+/// debugger's attach (`DETACH_PROCESS`, or the attached debugger's death): its
+/// main thread under its process badge, and each registered thread under its
+/// crash badge, minted for a thread that has none (one registered while the
+/// debugger's binding was there, which procmgr leaves). A thread whose bind
+/// fails keeps the binding it has, as does every thread with no crash badge
+/// when procmgr's heap cannot hold the fresh ones; the debugger watch is
+/// released. A badge naming no live process changes nothing.
+pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
+{
+    let Some(unbadged) = table.find_by_badge(badge).map(|e| {
+        (0..e.threads.len())
+            .filter(|&i| e.threads.get(i).is_some_and(|t| t.crash_badge == 0))
+            .count()
+    })
+    else
+    {
+        return;
+    };
+    let mut fresh: Vec<u64> = Vec::new();
+    if fresh.try_reserve_exact(unbadged).is_ok()
+    {
+        for _ in 0..unbadged
+        {
+            fresh.push(table.mint_crash_badge());
+        }
+    }
+    else
+    {
+        std::os::seraph::log!("no heap for crash badges; threads without one keep their binding");
+    }
+    let Some(entry) = table.find_mut_by_badge(badge)
+    else
+    {
+        return;
+    };
+    if !bind_exception_class(entry.thread_cap, entry.badge)
+    {
+        std::os::seraph::log!("crash binding of a detached main thread not restored");
+    }
+    for t in entry.threads.iter_mut()
+    {
+        let crash_badge = match t.crash_badge
+        {
+            0 => fresh.pop().unwrap_or(0),
+            b => b,
+        };
+        if crash_badge != 0 && bind_exception_class(t.cap, crash_badge)
+        {
+            t.crash_badge = crash_badge;
+        }
+    }
+    if entry.debugger != 0
+    {
+        let _ = syscall::cap_delete(entry.debugger);
+        entry.debugger = 0;
+    }
+}
+
+/// Restore the crash bindings of every process whose attached debugger
+/// (`ATTACH_PROCESS` `caps[0]`) is gone: its thread exited, or its cap went
+/// with its process's teardown. procmgr's loop calls it on every pass, which
+/// a process's death, the debugger's among them, wakes.
+pub fn check_debuggers(table: &mut ProcessTable)
+{
+    let mut gone: Vec<u64> = Vec::new();
+    table.for_each(|e| {
+        if e.debugger != 0 && !thread_is_listed(e.debugger) && gone.try_reserve(1).is_ok()
+        {
+            gone.push(e.badge);
+        }
+    });
+    for badge in gone
+    {
+        std::os::seraph::log!("debugger gone; crash bindings restored");
+        restore_crash_bindings(table, badge);
+    }
+}
+
+/// Keep `debugger`, the main-thread cap of the debugger an `ATTACH_PROCESS`
+/// carried, as the watch of the process `badge` names, replacing (and
+/// deleting) an earlier one. A cap that is not a Thread cap is deleted.
+pub fn watch_debugger(table: &mut ProcessTable, badge: u64, debugger: u64)
+{
+    if syscall::cap_info(debugger, syscall_abi::CAP_INFO_THREAD_STATE).is_err()
+    {
+        let _ = syscall::cap_delete(debugger);
+        return;
+    }
+    match table.find_mut_by_badge(badge)
+    {
+        Some(entry) =>
+        {
+            let old = core::mem::replace(&mut entry.debugger, debugger);
+            if old != 0
+            {
+                let _ = syscall::cap_delete(old);
+            }
+        }
+        None =>
+        {
+            let _ = syscall::cap_delete(debugger);
+        }
+    }
 }
 
 /// Unbind from the crash endpoint each of `threads` procmgr bound there
@@ -3741,6 +3856,10 @@ pub fn teardown_entry(
     {
         let _ = syscall::cap_revoke_all(entry.argv_env_memory_cap);
         let _ = syscall::cap_delete(entry.argv_env_memory_cap);
+    }
+    if entry.debugger != 0
+    {
+        let _ = syscall::cap_delete(entry.debugger);
     }
     if entry.tls_memory_cap != 0
     {

@@ -160,11 +160,16 @@ rootfs/config/svcmgr/
 ├── services/                 # always loaded by svcmgr
 │   ├── procmgr.svc
 │   └── …
-└── tests/                    # NOT loaded by svcmgr
-    ├── svctest.svc
-    ├── usertest.svc
-    ├── crasher.svc           # restart-path fixture; co-staged with svctest
-    └── debug-echo.svc        # debug-port fixture; staged by test-debug-port
+├── tests/                    # NOT loaded by svcmgr
+│   ├── svctest.svc
+│   ├── usertest.svc
+│   ├── crasher.svc           # restart-path fixture; co-staged with svctest
+│   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
+│   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
+└── debug/                    # NOT loaded by svcmgr
+    └── gdbstub.svc           # GDB stub template; staged, naming its target,
+                              # by run and run-parallel --debug-target, and
+                              # by test-gdb
 ```
 
 To enable a harness for a boot, copy its recipe from
@@ -373,9 +378,9 @@ unreported. Both read the log the cell's boot saved and boot nothing
 
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by
 procmgr, and logd, the serial and framebuffer drivers, and crashd declare themselves undebuggable,
-as svctest, a debug-authority holder, does in a test boot; their faults leave only the kernel's
-`fault unhandled` and `USERSPACE FAULT` lines. A thread that never registered with procmgr is
-reported without registers or a stack walk
+as svctest and the GDB stub, debug-authority holders, do in a boot that stages them; their faults
+leave only the kernel's `fault unhandled` and `USERSPACE FAULT` lines. A thread that never
+registered with procmgr is reported without registers or a stack walk
 ([crashd Operation § Limits](../services/crashd/docs/operation.md#limits)).
 
 ### Debug port (`test-debug-port`)
@@ -402,6 +407,37 @@ The host computes the verdict and kills QEMU, as for `test-terminal`; the fixtur
 shutdown. See [xtask/README.md § test-debug-port](../xtask/README.md#cargo-xtask-test-debug-port)
 for the command. No canonical CI cell attaches the debug port, so the boot is the `debug-port`
 device cell of the local and release host runs (Coverage tiers below).
+
+### GDB stub (`test-gdb`)
+
+The GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) debugs a guest process
+from a host GDB over the debug port, so its check is a host GDB session.
+`cargo xtask test-gdb [--arch] [--port] [--gdb]` (both arches) runs it:
+
+1. Stage the `gdb-target` recipe (`programs/debugger --gdb-target`, a process of two threads with
+   an exported counter and tick function;
+   [programs/debugger/README.md](../programs/debugger/README.md)) from `/config/svcmgr/tests/`,
+   and the stub's template from `/config/svcmgr/debug/` naming it, into
+   `/config/svcmgr/services/`, and repack the disk images in the layout they have.
+2. Boot the current sysroot once with the debug port, and wait for the stub's
+   `[gdbstub] attached; serving the debug port` line on the serial stream.
+3. Run `gdb -batch` against the port with the target's binary for symbols: list the threads,
+   break on the tick function and continue to it, read the pointer, rewrite the counter and read
+   it back, rewrite a caller-saved register, read it back from the stub past GDB's register
+   cache, and restore it, single-step, delete the breakpoint, select the second thread and read
+   its registers, and detach. The output must show two threads, the breakpoint's stop, the
+   rewritten counter and register, a step that moved the pointer, the second thread's registers,
+   and GDB's `[Inferior 1 (Remote target) detached]`.
+4. Wait up to 30 s for the stub's `[gdbstub] detached from gdb-target (crash bindings restored:
+   true)` line: procmgr took the target's crash bindings back.
+5. Kill QEMU, remove both recipes, and repack the images in that layout again, whatever the
+   outcome.
+
+It needs a host GDB that debugs the guest architecture (`gdb` built with every target, or
+`gdb-multiarch` through `--gdb`). The host computes the verdict and kills QEMU, as for
+`test-debug-port`, and its boot is part of the same `debug-port` device cell (Coverage tiers
+below). See [xtask/README.md § test-gdb](../xtask/README.md#cargo-xtask-test-gdb) for the
+command.
 
 ### One shutdown-invoking harness per boot
 
@@ -450,9 +486,9 @@ with the virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x
 `riscv-iommu-pci` at 00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA
 confinement phase drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no
 framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`,
-the framebuffer boot, `--display framebuffer`, and the debug-port boot, `test-debug-port`, are
-device cells, see Device surfaces, Framebuffer cell, Debug-port cell, and Release host runs below),
-filesystem (FAT), riscv64
+the framebuffer boot, `--display framebuffer`, and the debug-port boots, `test-debug-port` and
+`test-gdb`, are device cells, see Device surfaces, Framebuffer cell, Debug-port cell, and Release
+host runs below), filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
 5-level runs via `cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a
@@ -474,8 +510,8 @@ its own device surface, and variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
+| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -552,9 +588,9 @@ concurrency-fix purpose owes the whole boundary set on its own (see Repeat count
 CPU-count surface is the code that fixes the CPU-count width, enumerates and brings up CPUs, sizes
 per-CPU storage, or signals across CPUs, and it is exactly what this paragraph lists. Code that only
 reads `CPU_COUNT` or a `cpu_count` argument to iterate over CPUs is not on it unless it lies in a
-whole-surface file, names a listed item, or lies within one's definition; the rules of
-[coding-standards.md](coding-standards.md) § CPU-Count Width and the release host runs cover it. The
-surface is these files as a whole:
+whole-surface file, names a listed item, lies within one's definition, or is a test case whose
+work grows with the CPU count (below); the rules of [coding-standards.md](coding-standards.md)
+§ CPU-Count Width and the release host runs cover it. The surface is these files as a whole:
 
 - `core/kernel/src/cpu_mask.rs` (the CPU mask type and its width);
 - `core/kernel/src/percpu.rs` (per-CPU data and its slabs);
@@ -564,9 +600,11 @@ surface is these files as a whole:
 - `core/kernel/src/mm/tag_allocator.rs` (the per-CPU address-space tags, whose count it fits to
   the CPU count);
 
-and, in any other file, a line that adds a structure with one entry or one bit per CPU, and a
-changed line that names one of these items as a whole identifier or lies within one's definition
-(its attributes, signature, fields, or body):
+and, in any other file, a line that adds a structure with one entry or one bit per CPU, a line
+that adds or changes a test case whose work grows with the CPU count (a ktest or svctest case
+that runs a step, or spawns a thread, for each CPU), and a changed line that names one of these
+items as a whole identifier or lies within one's definition (its attributes, signature, fields,
+or body):
 
 - CPU-count width: `MAX_CPUS`, `AtomicCpuMask`, `MaskSource`, `mask_words`, `set_boot_cpu_count`;
 - per-CPU storage: `alloc_zeroed_slab` and the page count it takes (`slab_pages`); the per-CPU
@@ -614,27 +652,42 @@ changed line that names one of these items as a whole identifier or lies within 
 - the TLB-shootdown broadcast: `shootdown`, `shootdown_range`, `service_shootdowns`,
   `shootdown_remote`, and `needs_remote_shootdown`.
 
-A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. A PR
-that adds an item of the kinds above that names none of the listed items MUST add it to this list.
+A changed line that only uses a listed type is not on the surface: an import of it, a signature
+or type annotation that names it, a read or write of one of its fields, or a call of one of its
+methods, where the line changes neither the type's fields or size, nor a structure with one
+entry or one bit per CPU, nor how such a structure is sized or indexed. The listed types are
+`AtomicCpuMask`, `MaskSource`, `PerCpuSlab`, `CpuTopology`, `IpiWaitCtx`, `WaitTimer`, and the
+element types of the per-CPU arrays and slabs. A line that names any other listed item, or that
+lies within a listed item's definition, stays on the surface.
+
+A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. The
+release host runs (Release host runs below) boot every boundary before each tag and are the
+backstop for a scaling defect this surface misses. A boundary set MAY also be run for a PR that
+does not owe it, when whoever coordinates the work (the orchestrator of a batch, or the
+maintainer) judges that the change warrants it; nothing schedules such a run, and the PR body
+reports it as a run the PR does not owe (Hangs at oversubscription below). A PR that adds an
+item of the kinds above that names none of the listed items MUST add it to this list.
 `cargo xtask lint-docs` fails when a name this list, the memory and device surfaces' lists, or
 their screens state no longer names code, a tracked file, or a tracked directory (its
-`md-coverage-symbols` rule, [xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a PR
-that renames or deletes a listed item updates the list in the same change.
-The commands below screen a diff for the surface. The first lists the whole-surface files the diff
-changes. The second prints every file header of the diff and every line, changed or context, that
-names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
+`md-coverage-symbols` rule, [xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a
+PR that renames or deletes a listed item updates the list in the same change. The commands below
+screen a diff for the surface. The first lists the whole-surface files the diff changes. The
+second prints every file header of the diff and every line, changed or context, that names a
+listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
 item's definition prints that item's name. Each printed name is a candidate: the PR owes the set
 when a non-inert changed line names the item or lies within its definition, read in that file's
-hunk. A printed `alloc_per_cpu_slab` or `alloc_zeroed_slab` call is a candidate for the initialiser
-that encloses it (except `frame_map::init` and `init_cspace_registry`, which the memory surface
-covers): the set is
-owed when a non-inert changed line lies within that function, read in the widened hunk. The
-screen finds named items and changes inside their definitions; it does not follow a size
-change through a nested type or a sizing constant, so a diff that changes a struct's fields or a
-constant's value is also read against the per-CPU storage bullet (`git grep -n -w <name> <head>`
-shows where the type or constant is held). A diff for which neither command prints a candidate,
-that adds no per-CPU structure, and whose type and constant changes reach no per-CPU element or
-allocation is off the surface.
+hunk, unless the line only uses a listed type as the paragraph above defines it. A printed
+`alloc_per_cpu_slab` or `alloc_zeroed_slab` call is a candidate for the initialiser that
+encloses it (except `frame_map::init` and `init_cspace_registry`, which the memory surface
+covers): the set is owed when a non-inert changed line lies within that function, read in the
+widened hunk. The screen finds named items and changes inside their definitions; it does not
+follow a size change through a nested type or a sizing constant, so a diff that changes a
+struct's fields or a constant's value is also read against the per-CPU storage bullet
+(`git grep -n -w <name> <head>` shows where the type or constant is held). The screen does not
+find a test case whose work grows with the CPU count either: a diff that adds or changes a ktest
+or svctest case is read for one. A diff for which neither command prints a candidate, that adds
+no per-CPU structure and no such test case, and whose type and constant changes reach no per-CPU
+element or allocation is off the surface.
 
 ```sh
 B=$(git merge-base <head> origin/master)
@@ -660,8 +713,8 @@ S="$S|shootdown(_range|_remote)?|service_shootdowns|needs_remote_shootdown"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($S)\b"
 ```
 
-The boundary set is every boundary CPU count below, each once (`--runs 1`, raised only as Repeat
-count says): 16 and 128 CPUs on both architectures, riscv64 16 and 128 harts and x86_64 16 and 128
+The boundary set is every boundary CPU count below, each once (`--runs 1`, as Repeat count
+says): 16 and 128 CPUs on both architectures, riscv64 16 and 128 harts and x86_64 16 and 128
 vCPUs. No run is wider than 128 CPUs, on either architecture: the 256- and 512-vCPU runs are removed
 from every set by the maintainer's decision on
 [#694](https://github.com/kottlerg/seraph/issues/694), since the 512-vCPU run (the old
@@ -822,7 +875,7 @@ own diff is on.
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
-| virtio-console, the debug port | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`) | debug-port |
+| virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), and svctest's DMA confinement check, which drives it (by definition alone: `dma_confinement_phase`) | no-iommu |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
@@ -849,7 +902,7 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     xtask/src/disk.rs xtask/src/commands/mkdisk.rs services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/test-dma/ services/drivers/framebuffer/ \
     services/drivers/virtio/console/ services/debug-echo/ xtask/src/commands/test_debug_port.rs \
-    shared/gdb-rsp/ \
+    shared/gdb-rsp/ services/gdbstub/ xtask/src/debug_stub.rs xtask/src/commands/test_gdb.rs \
     core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/
 D='sys_irq_(register|ack|split)|(un)?route_device_irq|irq_line_count|dispatch_device_irq'
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
@@ -859,6 +912,8 @@ D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV
 D="$D|test_dma_labels|dma_confinement_phase"
 D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
 D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
+D="$D|gdb_target(_tick|_worker_step)?|handle_list_processes|handle_detach_process"
+D="$D|restore_crash_bindings|watch_debugger|check_debuggers"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
 D="$D|second_disk(_[a-z_]+)?|second_(src|dst|shared_line)"
 D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"
@@ -867,16 +922,17 @@ git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
     grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
 ```
 
-**Repeat count.** Every owed run runs once (`--runs 1`). A PR states a concurrency-fix purpose when
-its body states that its purpose is the fix of a concurrency defect in the scheduling, wake, or
-cross-CPU signalling mechanisms. Such a PR, unless its changes outside Markdown are all inert, owes
-the whole boundary set, every boundary three times (`--runs 3`), whether or not its diff changes the
-CPU-count surface: a race in those mechanisms can fail rarely enough that one run misses it. That
-PR's other owed runs stay at `--runs 1`. A concurrency fix elsewhere is not a concurrency-fix
-purpose, and a change to those mechanisms' files without that stated purpose does not raise the
-count.
+**Repeat count.** Every owed run, local or release, runs once (`--runs 1`); nothing raises the
+count. A PR states a concurrency-fix purpose when its body states that its purpose is the fix of a
+concurrency defect in the scheduling, wake, or cross-CPU signalling mechanisms. Such a PR, unless
+its changes outside Markdown are all inert, owes the whole boundary set, whether or not its diff
+changes the CPU-count surface: a defect in those mechanisms shows at the boundary CPU counts, which
+CI does not boot. A few repeats add almost nothing to the chance of catching a race that fails
+rarely; the burn-in tier is the repeated-run check. A concurrency fix elsewhere is not a
+concurrency-fix purpose, and a change to those mechanisms' files without that stated purpose owes
+nothing on that account.
 
-**When the runs are owed.** Each local host run a PR owes MUST pass, at its repeat count, at one
+**When the runs are owed.** Each local host run a PR owes MUST pass at one
 head that covers the merge head. For every local and release host run, only a `PASS` outcome of
 `run-parallel` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
 host emulator, is run again and the re-run's outcome stands; `OK` and `ERR` count as failures. The
@@ -967,32 +1023,38 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 360 \
     --display framebuffer --fail-also 'framebuffer case skipped'
 ```
 
-**Debug-port cell.** One boot, on each architecture, of `cargo xtask test-debug-port` (Debug
-port (`test-debug-port`) above), which attaches the debug port's `virtio-console` device, so
-devmgr binds it, the virtio-console driver runs, and the `debug-echo` fixture answers the host
-over it. It passes when the host's exchange completes; the command stages and unstages its own
-fixture on the current sysroot, a debug-profile build. It bounds the boot to the fixture's ready
-line by five minutes and each answer by twenty seconds, and has no `run-parallel` budget. The
-boot is the debug-port device cell (Device surfaces above).
+**Debug-port cell.** Two boots, on each architecture, each of which attaches the debug port's
+`virtio-console` device, so devmgr binds it and the virtio-console driver runs: one of
+`cargo xtask test-debug-port` (Debug port (`test-debug-port`) above), in which the `debug-echo`
+fixture answers the host over the port, and one of `cargo xtask test-gdb` (GDB stub (`test-gdb`)
+above), in which the GDB stub serves a host GDB session against the `gdb-target` process. The cell
+passes when both host checks pass; each command stages and unstages its own recipes on the
+current sysroot, a debug-profile build. `test-debug-port` bounds the boot to the fixture's ready
+line by five minutes and each answer by twenty seconds; `test-gdb` bounds the boot to the stub's
+ready line by five minutes, the GDB session by three, and the stub's detach line by 30 s after
+it. Neither has a `run-parallel` budget. The
+two boots are the debug-port device cell (Device surfaces above).
 
 ```sh
 # Debug-port cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cargo xtask test-debug-port --arch <arch>
+cargo xtask test-gdb --arch <arch>
 ```
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
-4), the maintainer MUST run, on the commit to be tagged, the whole boundary set
-(riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three times each
-(`--runs 3`) in the debug profile and once each in the release profile
-(`cargo xtask build --release`, then the same `run-parallel` command at
-`--runs 1`, per the boundary commands above), and the memory variation and every device cell (the
+4), these MUST be run on the commit to be tagged: the whole boundary set
+(riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) once each (`--runs 1`)
+in the debug profile and once each in the release profile
+(`cargo xtask build --release`, then the same `run-parallel` command, per
+the boundary commands above), and the memory variation and every device cell (the
 disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once each, so
 every tag boots at each boundary CPU count in both profiles (CI boots release builds only at 4
 CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, and with a debug port,
 and runs the timing report on the boundary
-logs, which is reported and blocks nothing.
+logs, which is reported and blocks nothing. A tag's repeated-run check is the burn-in tier,
+which the tag push starts.
 The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture
 with the machine's IOMMU detached, so devmgr's unconfined path still serves every driver (svctest
 staged as `build-test.yml` stages it, on a debug-profile sysroot). A run whose outcome is not a
@@ -1141,7 +1203,7 @@ A failing boot is diagnosed with the tool that fits its class of defect:
 | Timing-sensitive race: a failure that comes and goes across boots, or moves with the CPU count or host load | Log instrumentation and repeat runs |
 | Deterministic userspace fault | The crash report on the serial log, resolved with `cargo xtask symbolize --log` |
 | Deterministic kernel crash; a failure before the serial console is up; a wedged guest; a question about raw machine state | QEMU's gdbstub |
-| Per-process debugging of a running system | The serial GDB stub (design intent; not yet implemented, [#835](https://github.com/kottlerg/seraph/issues/835)) |
+| Per-process debugging of a running system | The GDB stub over the debug port |
 
 **Races.** A debugger stops the CPUs it inspects and moves the timing a race depends on, so a
 race is chased with log lines placed around the suspect window and with repeated boots, which turn
@@ -1200,6 +1262,28 @@ gdb -batch -ex 'target remote :1234' -ex 'hbreak kernel::panic' -ex continue \
     -ex bt -ex 'info registers' sysroot/esp/EFI/seraph/kernel
 ```
 
+**A process of a running system.** The GDB stub
+([services/gdbstub/README.md](../services/gdbstub/README.md)) debugs one process from a host GDB
+while the rest of the system runs on: breakpoints, single-step, registers and memory of each of
+its threads, then a detach that hands it back to the crash service. `cargo xtask run --debug-port
+<PORT> --debug-target <NAME>` stages the stub for the boot, naming the process by its `argv[0]`
+(for a service, the first word of its recipe's `argv`), and prints the GDB command line, which
+loads the process's sysroot binary for symbols; the stub reports the image's load bias
+(`qOffsets`), so GDB relocates them itself
+([xtask/README.md](../xtask/README.md#cargo-xtask-run)). A process that declared itself
+undebuggable (logd, the serial and framebuffer drivers, and every debug-authority holder) refuses
+the attach, and a process procmgr did not create (init, memmgr, procmgr) is not listed.
+
+```sh
+# Debug the `gdb-target` fixture (staged by hand here; test-gdb does the same):
+cargo xtask build
+cp sysroot/config/svcmgr/tests/gdb-target.svc sysroot/config/svcmgr/services/
+cargo xtask mkdisk --repack-only
+cargo xtask run --debug-port 4561 --debug-target gdb-target   # in one shell
+gdb -ex 'set architecture i386:x86-64' -ex 'set remotetimeout 30' \
+    -ex 'target remote localhost:4561' sysroot/programs/debugger  # in another
+```
+
 ---
 
 ## Historical naming
@@ -1241,6 +1325,7 @@ note in full.
 [services/crasher/README.md](../services/crasher/README.md),
 [services/debug-echo/README.md](../services/debug-echo/README.md),
 [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md),
+[services/gdbstub/README.md](../services/gdbstub/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),

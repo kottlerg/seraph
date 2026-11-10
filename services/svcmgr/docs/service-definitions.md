@@ -247,7 +247,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
 | `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| TEST_LABEL_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
-| `devmgr.debug` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| DEBUG_PORT_AUTHORITY`-badged SEND on devmgr's registry endpoint: the debug port (seeded only by the debug-port fixture `debug-echo`, staged by `test-debug-port`) | no |
+| `devmgr.debug` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| DEBUG_PORT_AUTHORITY`-badged SEND on devmgr's registry endpoint: the debug port (seeded only by the debug-port fixture `debug-echo`, staged by `test-debug-port`, and the GDB stub `gdbstub`, staged by `--debug-target` of `run` and `run-parallel`, and by `test-gdb`) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
 
@@ -329,12 +329,14 @@ log_sink  = yes
 svcmgr mints a `SEND|GRANT` on procmgr badged `procmgr_labels::DEBUG_AUTHORITY` from the un-badged
 procmgr source init endows it, and delivers it in the bootstrap slot after the `seed` caps (after a
 `provides` service's own RECV and its seeds; `cap[0]` for a service with neither). A derive that
-fails leaves the slot absent. The authority serves procmgr's `REGISTER_CRASH_SERVICE` and
-`ATTACH_PROCESS` ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint
-and Debug Authority); this key is the only path that mints it, so an image whose recipes set it
-nowhere has no attach path. A holder declares itself undebuggable to procmgr itself
-(`DECLARE_NO_DEBUG`), so no holder attaches to another or to itself. The crash service's recipe,
-`crashd.svc`, sets it ([services/crashd/README.md](../../crashd/README.md)).
+fails leaves the slot absent. The authority serves procmgr's `REGISTER_CRASH_SERVICE`,
+`ATTACH_PROCESS`, `LIST_PROCESSES`, and `DETACH_PROCESS`
+([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint and Debug
+Authority); this key is the only path that mints it, so an image whose recipes set it nowhere has
+no attach path. A holder declares itself undebuggable to procmgr itself (`DECLARE_NO_DEBUG`), so no
+holder attaches to another or to itself. The crash service's recipe, `crashd.svc`, sets it
+([services/crashd/README.md](../../crashd/README.md)), as does the GDB stub's template,
+`config/svcmgr/debug/gdbstub.svc` ([services/gdbstub/README.md](../../gdbstub/README.md)).
 
 `debug_authority = yes` alongside `log_sink = yes` is a parser error: the log sink's round is
 minted from the log-sink sources and has no slot for it.

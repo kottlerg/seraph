@@ -9,7 +9,8 @@ labels: ''
 Pick exactly one class label: feature | cleanup | perf | security | infra.
 Add subsystem labels for every component this touches.
 Set the milestone: the current one (the lowest-versioned open milestone) or the release this is
-planned for; leave it unset only for future-state work no release has scheduled
+planned for; leave it unset only for future-state work no release has scheduled. A rolling
+follow-up Issue (`<scope>: defects found by review`) takes the current one
 (docs/conventions.md § Milestones).
 Drop sections below that don't apply.
 -->

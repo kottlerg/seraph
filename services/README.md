@@ -14,6 +14,7 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | [`fs/`](fs/README.md) | Filesystem driver implementations (mounted by `vfsd`) |
 | [`logd/`](logd/README.md) | Logging daemon |
 | [`crashd/`](crashd/README.md) | Crash service — reports each process that dies on a fault to the system log |
+| [`gdbstub/`](gdbstub/README.md) | GDB stub — debugs one process from a host GDB over the debug port (staged per boot, opt-in) |
 | [`netd/`](netd/README.md) | Network stack daemon (design intent; not yet implemented) |
 | [`pwrmgr/`](pwrmgr/README.md) | Power manager — platform shutdown and reboot |
 | [`timed/`](timed/README.md) | Wall-clock service over the devmgr-resolved RTC |

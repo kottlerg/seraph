@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{IssueEditArgs, IssueFileArgs};
+use crate::commands::pr_check::{ROLLING_TITLE_SUFFIX, current_milestone};
 use crate::context::Context as BuildContext;
 use crate::gh;
 use crate::tasklist::task_item;
@@ -242,6 +243,38 @@ pub fn check_filing(
     out
 }
 
+/// Why a rolling follow-up Issue may not be filed under `milestone` when the
+/// current milestone is `current` (docs/conventions.md § Milestones); `None`
+/// when the title is not a rolling Issue's or the milestone is the current
+/// one.
+pub fn rolling_milestone_problem(
+    title: &str,
+    milestone: &MilestoneChoice,
+    current: Option<&str>,
+) -> Option<String>
+{
+    if !title.trim_end().ends_with(ROLLING_TITLE_SUFFIX)
+    {
+        return None;
+    }
+    let Some(current) = current
+    else
+    {
+        return Some(
+            "a rolling follow-up Issue takes the current milestone, and no versioned \
+                     milestone is open"
+                .to_owned(),
+        );
+    };
+    if milestone.title() == Some(current)
+    {
+        return None;
+    }
+    Some(format!(
+        "a rolling follow-up Issue takes the current milestone, `{current}`"
+    ))
+}
+
 /// The labels and the milestone asked for that the filed Issue lacks.
 pub fn missing_metadata(
     held_labels: &[String],
@@ -314,7 +347,16 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
     let body = fs::read_to_string(&args.body_file)
         .with_context(|| format!("cannot read {}", args.body_file.display()))?;
     let choice = MilestoneChoice::from_args(args.milestone.as_deref(), args.unscheduled);
-    let problems = check_filing(&args.title, &body, &args.label, &choice);
+    let mut problems = check_filing(&args.title, &body, &args.label, &choice);
+    if args.title.trim_end().ends_with(ROLLING_TITLE_SUFFIX)
+    {
+        let current = current_milestone(&gh::open_milestones(&ctx.root)?);
+        problems.extend(rolling_milestone_problem(
+            &args.title,
+            &choice,
+            current.as_deref(),
+        ));
+    }
     if !problems.is_empty()
     {
         bail!("refusing to file the Issue: {}", problems.join("; "));
@@ -410,6 +452,37 @@ mod tests
         assert_eq!(
             check_filing("t", "b", &ok, &choice(Some("v0.1.4"), true)).len(),
             1
+        );
+    }
+
+    #[test]
+    fn a_rolling_issue_takes_the_current_milestone()
+    {
+        let rolling = "xtask: defects found by review";
+        let current = Some("v0.1.4");
+        assert_eq!(
+            rolling_milestone_problem(rolling, &milestone("v0.1.4"), current),
+            None
+        );
+        for wrong in [milestone("v0.1.5"), MilestoneChoice::Unscheduled]
+        {
+            let problem = rolling_milestone_problem(rolling, &wrong, current).expect("a refusal");
+            assert!(problem.contains("`v0.1.4`"), "{problem}");
+        }
+        assert!(rolling_milestone_problem(rolling, &milestone("v0.1.4"), None).is_some());
+    }
+
+    #[test]
+    fn any_other_issue_may_take_a_later_milestone()
+    {
+        let title = "xtask: a later feature";
+        assert_eq!(
+            rolling_milestone_problem(title, &milestone("v0.1.5"), Some("v0.1.4")),
+            None
+        );
+        assert_eq!(
+            rolling_milestone_problem(title, &MilestoneChoice::Unscheduled, Some("v0.1.4")),
+            None
         );
     }
 

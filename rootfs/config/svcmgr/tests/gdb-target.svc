@@ -1,0 +1,12 @@
+# /programs/debugger --gdb-target — the GDB stub's batch-test target.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# `cargo xtask test-gdb` stages it, with the gdbstub recipe naming it, for
+# one boot with `--debug-port`. Its process is named `gdb-target` (argv[0]),
+# which the stub finds in procmgr's process list. It loops for ever on two
+# threads and invokes no shutdown: the host test kills QEMU.
+binary    = /programs/debugger
+argv      = gdb-target --gdb-target
+restart   = never
+critical  = no
+namespace = none

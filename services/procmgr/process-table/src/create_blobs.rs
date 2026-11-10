@@ -22,6 +22,8 @@
 use ipc::IpcMessage;
 use ipc::procmgr_labels::{ARGV_ENV_HEADER_WORDS, ArgvEnvHeader};
 
+use crate::names::{NameCapture, ProcessName};
+
 /// Why procmgr refuses a create request's argv and env. Every refusal is
 /// replied as `procmgr_errors::INVALID_ARGUMENT`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +132,8 @@ pub struct ArgvEnvTally
     fed: u64,
     args: BlobTally,
     env: BlobTally,
+    /// The process's name, read from the argv blob as it is fed.
+    name: NameCapture,
 }
 
 impl ArgvEnvTally
@@ -143,6 +147,7 @@ impl ArgvEnvTally
             fed: 0,
             args: BlobTally::default(),
             env: BlobTally::default(),
+            name: NameCapture::default(),
         }
     }
 
@@ -158,17 +163,19 @@ impl ArgvEnvTally
             .map_or(chunk.len(), |left| left.min(chunk.len()));
         let (args, env) = chunk.split_at(args_left);
         self.args.feed(args);
+        self.name.feed(args);
         self.env.feed(env);
         self.fed += take as u64;
     }
 
-    /// Check the fed blobs against the header.
+    /// Check the fed blobs against the header; returns the process's name,
+    /// the first string of the argv blob ([`ProcessName`]).
     ///
     /// # Errors
     /// [`ArgvEnvRefusal::Malformed`] when fewer bytes were fed than the
     /// header declares, or either blob's NULs disagree with its count, or a
     /// nonempty blob does not end in a NUL.
-    pub fn finish(self) -> Result<(), ArgvEnvRefusal>
+    pub fn finish(self) -> Result<ProcessName, ArgvEnvRefusal>
     {
         let h = self.header;
         let complete = Some(self.fed) == h.total_bytes();
@@ -176,7 +183,7 @@ impl ArgvEnvTally
             && self.args.holds(h.args_bytes, h.args_count)
             && self.env.holds(h.env_bytes, h.env_count)
         {
-            Ok(())
+            Ok(self.name.name())
         }
         else
         {
@@ -214,7 +221,7 @@ mod tests
         {
             t.feed(piece);
         }
-        t.finish()
+        t.finish().map(|_| ())
     }
 
     // Defect guarded: a sender encoding or procmgr decoding the header words

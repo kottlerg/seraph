@@ -171,6 +171,9 @@ fn main() -> !
         // A crash service's death wakes this loop: take the crash endpoint's
         // receive side back once it is gone.
         crash::check_registrant();
+        // A debugger's death wakes it too: restore the crash bindings of the
+        // process it was attached to.
+        process::check_debuggers(&mut table);
 
         match badge
         {
@@ -691,8 +694,9 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 }
 
 /// Dispatch the debug-authority labels, `REGISTER_CRASH_SERVICE`,
-/// `ATTACH_PROCESS`, `DECLARE_NO_DEBUG`, and `REGISTER_THREAD`, and answer
-/// any other opcode `UNKNOWN_OPCODE`, deleting the caps it carried.
+/// `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `DECLARE_NO_DEBUG`,
+/// and `REGISTER_THREAD`, and answer any other opcode `UNKNOWN_OPCODE`,
+/// deleting the caps it carried.
 fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
 {
     match req.label & 0xFFFF
@@ -700,8 +704,26 @@ fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::Proc
         procmgr_labels::REGISTER_CRASH_SERVICE => handle_register_crash_service(req, ipc_buf),
         procmgr_labels::ATTACH_PROCESS =>
         {
+            let (watch, extra) = req
+                .caps()
+                .split_first()
+                .map_or((0, &[][..]), |(&c, rest)| (c, rest));
+            release_caps(extra);
+            match handle_attach_process(req, ipc_buf, table)
+            {
+                Some(badge) if watch != 0 => process::watch_debugger(table, badge, watch),
+                _ => release_caps(&[watch]),
+            }
+        }
+        procmgr_labels::LIST_PROCESSES =>
+        {
             release_caps(req.caps());
-            handle_attach_process(req, ipc_buf, table);
+            handle_list_processes(req, ipc_buf, table);
+        }
+        procmgr_labels::DETACH_PROCESS =>
+        {
+            release_caps(req.caps());
+            handle_detach_process(req, ipc_buf, table);
         }
         procmgr_labels::REGISTER_THREAD => handle_register_thread(req, ipc_buf, table),
         procmgr_labels::DECLARE_NO_DEBUG =>
@@ -800,7 +822,13 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
 /// registration order, those that are gone swept out first, so no exited
 /// thread is listed. The request's badge may be a thread crash badge, which
 /// names its process and, in the reply's named-thread word, that thread.
-fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+/// Returns the target's process badge when the attach succeeded, for the
+/// caller to keep the debugger watch `caps[0]` carried.
+fn handle_attach_process(
+    req: &IpcMessage,
+    ipc_buf: *mut u64,
+    table: &mut process::ProcessTable,
+) -> Option<u64>
 {
     let (entry, named) = match process_table::attach_target(table, req.badge, req.word(0))
     {
@@ -814,7 +842,7 @@ fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
                 process_table::AttachRefusal::NotAttachable => procmgr_errors::NOT_ATTACHABLE,
             };
             reply_empty(ipc_buf, code);
-            return;
+            return None;
         }
     };
     let first = usize::try_from(req.word(1)).unwrap_or(usize::MAX);
@@ -835,7 +863,7 @@ fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
     else
     {
         reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
-        return;
+        return None;
     };
     let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS)
         .word(0, 1 + entry.threads.len() as u64)
@@ -852,11 +880,77 @@ fn handle_attach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
     {
         reply = reply.cap(cap);
     }
+    let badge = entry.badge();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) }.is_err()
     {
         release_caps(&derived[..n]);
     }
+    Some(badge)
+}
+
+/// Handle `LIST_PROCESSES` — reply with one page of live processes, in
+/// ascending badge order after the cursor the request names, each with its
+/// name (`services/procmgr/docs/ipc-interface.md` § `LIST_PROCESSES`).
+/// Refused `UNAUTHORIZED` without `DEBUG_AUTHORITY`; `INVALID_ARGUMENT` for a
+/// `data[0]` other than 0 or 1.
+fn handle_list_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &process::ProcessTable)
+{
+    if !process_table::debug_authorized(req.badge)
+    {
+        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        return;
+    }
+    let after = match req.word(0)
+    {
+        0 => None,
+        1 => Some(req.word(1)),
+        _ =>
+        {
+            reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+            return;
+        }
+    };
+    let mut words = [0u64; syscall_abi::MSG_DATA_WORDS_MAX];
+    let mut count = 0;
+    for entry in table
+        .entries_after(after)
+        .take(procmgr_labels::LIST_PROCESSES_PAGE)
+    {
+        if procmgr_labels::pack_list_entry(&mut words, count, entry.badge(), entry.name.as_bytes())
+        {
+            count += 1;
+        }
+    }
+    words[0] = count as u64;
+    let used = 1 + count * procmgr_labels::LIST_PROCESSES_WORDS_PER_ENTRY;
+    let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS);
+    for (i, &w) in words[..used].iter().enumerate()
+    {
+        reply = reply.word(i, w);
+    }
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) };
+}
+
+/// Handle `DETACH_PROCESS` — bind the process `data[0]` names back to the
+/// crash endpoint (`process::restore_crash_bindings`;
+/// `services/procmgr/docs/ipc-interface.md` § `DETACH_PROCESS`).
+fn handle_detach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+{
+    let code = match process_table::detach_target(table, req.badge, req.word(0))
+    {
+        Ok(entry) =>
+        {
+            let badge = entry.badge();
+            process::restore_crash_bindings(table, badge);
+            procmgr_errors::SUCCESS
+        }
+        Err(process_table::AttachRefusal::Unauthorized) => procmgr_errors::UNAUTHORIZED,
+        Err(process_table::AttachRefusal::Unknown) => procmgr_errors::INVALID_BADGE,
+        Err(process_table::AttachRefusal::NotAttachable) => procmgr_errors::NOT_ATTACHABLE,
+    };
+    reply_empty(ipc_buf, code);
 }
 
 /// Times an attach sweeps and derives its page again when a registered

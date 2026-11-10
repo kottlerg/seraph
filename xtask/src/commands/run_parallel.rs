@@ -133,13 +133,35 @@ struct FirmwareSet
     vars_template: Option<PathBuf>,
 }
 
+pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
+{
+    validate_args(args)?;
+    let (Some(target), Some(port)) = (&args.debug_target, args.debug_port)
+    else
+    {
+        return run_waves(ctx, args);
+    };
+    // The stub is staged into `disk.img` before the slots copy it, and
+    // unstaged after the last run, whatever its outcome.
+    validate_sysroot_for_launch(ctx, args.arch)?;
+    let layout = crate::debug_stub::stage(ctx, args.arch, target)?;
+    let binary = crate::debug_stub::binary_for(ctx, target);
+    step(&format!(
+        "GDB stub staged for {target}; connect with:\n    {}",
+        crate::debug_stub::gdb_command(args.arch, port, binary.as_deref())
+    ));
+    let ran = run_waves(ctx, args);
+    crate::debug_stub::unstage(ctx, args.arch, layout)?;
+    ran
+}
+
+/// Boot the runs in waves of `--parallel`, after [`run`]'s staging.
 // too_many_lines: a linear dispatch-and-collect driver (wave loop, per-slot
 // thread spawn, join, summary). Splitting it would scatter the shared per-run
 // state across helpers without reducing complexity.
 #[allow(clippy::too_many_lines)]
-pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
+fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 {
-    validate_args(args)?;
     let pass_re =
         Regex::new(&args.pass).with_context(|| format!("invalid --pass regex {:?}", args.pass))?;
     let fail_re = fail_regex(&args.fail, args.fail_also.as_deref())?;

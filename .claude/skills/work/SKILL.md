@@ -5,46 +5,44 @@ description: Drive one Issue (or one scope) to a pull request at its merge gate 
 
 # Working one Issue
 
-`/work <issue> [<issue> ...] [scope]` makes this session the worker for one scope: the Issue
-numbers are the worker prompt's Issues, the scope is the commit-title scope that covers them
-(derived from the Issues' files when not given), and the branch name takes the
-docs/conventions.md § Branch naming prefix that matches the work's purpose (`fix/` for a bug
-or security defect, `cleanup/` for cleanup and follow-up drains, `feature/` for feature and
-perf work, `audit/` for an audit) and a slug naming the scope. Follow `.claude/agents/worker.md`
-in **standalone** mode: the same authorities, planning report, branch and PR discipline, tests,
-§ Delegation, host runs and review, with these differences.
+`/work <issue> [<issue> ...] [scope]` makes this session the worker for one PR. The Issue
+numbers are the worker prompt's Issues. The scope is the commit-title scope that covers them,
+derived from the Issues' files when not given. The branch takes the docs/conventions.md
+§ Branch naming prefix that fits the work (`fix/` for a bug or security defect, `cleanup/` for
+cleanup and follow-up drains, `feature/` for feature and perf work, `audit/` for an audit) and a
+slug naming the scope.
 
-- There is no exclusive grant. The launch checks of the worker file's § Host runs are the
-  whole protocol; `nice` is optional.
-- Reports go to the maintainer in this conversation: the plan before coding, the host-run
-  results, each review's verdict lines verbatim, and the gate.
-- Decisions the worker file routes to "the orchestrator" are the maintainer's: ask them in the
-  conversation and wait. `.claude/skills/orchestrate/SKILL.md` § Rulings lists the recurring
-  ones and which document settles each.
-- Issues the worker file says to draft are filed with the maintainer's approval in the
-  conversation, then with `gh issue create`.
-- Sync onto `master` yourself right before the validation run, and again (Markdown-only syncs
-  owe nothing) if `master` moves before the gate.
-- The review runs as the worker file's § Review says (`pr-reviewer` and `pr-auditor` invoked
-  directly), its auditor-only run included: when the last run with the reviewer had no failed
-  agent and the fix round's delta since it is documentation or comments only and merges no
-  `master` in, run `pr-auditor` alone with that run's record, save `audit-<head>.md` and
-  `audit-<head>.json` in the shape that section gives, and surface the reviewer verdict the
-  audit states beside the audit line.
+Read `.claude/agents/worker.md` and follow it in **standalone** mode, with these differences:
 
-This session's worktree, when the session runs in one, holds a built `target/` that nothing
-removes by itself, since the harness removes only an unchanged worktree
-(`.claude/agents/worker.md` § Reporting). The review records of the PR sit under
-`target/xtask/review/pr<N>/` in the checkout the session works in, which is the only copy.
-After the merge, and not before, the session copies the records into the main checkout at the
-same path (a later PR on the same surface takes them as its ledger context); when its sandbox
-refuses that write, the session tells the maintainer, who copies from the worktree path the
-gate report already names. Once the copy exists, and only when the worktree holds nothing
-unsaved or unpushed (the second check of `.claude/skills/orchestrate/SKILL.md` § Worktree
-removal, whose failure is reported to the maintainer and not forced), the maintainer removes
-the worktree (`git worktree remove --force --force <path>` from the main checkout, the doubled
-flag because the harness locks the worktree, then `git worktree prune`), or the session does
-so when the maintainer asks it to.
+- The session's own model and effort do the work. The tiers of
+  `.claude/agents/orchestrator.md` § Spawn say which fit the task; when the session runs
+  above the tier the task needs, say so before starting, so the maintainer can restart it lower.
+- There is no exclusive grant. The launch checks of the worker file's § Host runs are the whole
+  protocol, and `nice` is optional.
+- Reports and hand-backs are replies to the maintainer in this conversation: the plan before
+  coding, the host-run results, each review's verdict lines verbatim, and the gate.
+- A decision the worker file routes to the orchestrator is the maintainer's: ask in the
+  conversation. `.claude/agents/orchestrator.md` § Rulings lists the recurring ones and
+  which document settles each.
+- An Issue the worker file says to draft is filed with `cargo xtask issue-file`: the rolling
+  follow-up Issue of a scope that has none without asking, any other with the maintainer's
+  approval in the conversation.
+- Sync onto `master` yourself right before the validation run, and again if `master` moves
+  before the gate. docs/conventions.md § Syncing with `master` says what each sync owes.
+- The worker file is a file this session read, not its system prompt, so a compaction drops it.
+  After one, read `.claude/agents/worker.md` again before the next step, and take the state of
+  the work from the PR body and the branch, not from the summary.
 
-At the gate, surface both verdict lines verbatim and prompt for the merge decision per
-`.claude/CLAUDE.md` § PR workflow operations; merge only on the maintainer's instruction.
+The review records of the PR sit under `target/xtask/review/pr<N>/` in the checkout the session
+works in, which is the only copy. When the session runs in a worktree, copy them into the main
+checkout at the same path after the merge, since a later PR on the same surface takes them as
+its ledger context; when the session cannot write there, tell the maintainer the path. The
+worktree holds a built `target/` that nothing removes by itself. Once the copy exists and the
+worktree holds nothing unsaved or unpushed (the second check of
+`.claude/skills/orchestrate/worktree-removal.md`), the maintainer removes it, or the session
+does when asked, as that file describes.
+
+At the gate, give both verdict lines verbatim and say that the PR meets the merge condition
+(docs/conventions.md § Pre-merge review). The maintainer's instruction to merge is the one
+decision left; merge only on it. For the release PR, which the gate names with
+`gate-release-approval`, that instruction is also the approval its merge needs.

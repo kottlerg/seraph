@@ -90,7 +90,8 @@ after the decline, when nothing waits on the faulting thread any more. The stack
   is refused, and the block is `status=unattached`, with the fault message's fields alone.
 - **Uncovered processes.** init, memmgr, and procmgr are not created by procmgr. logd, the serial
   driver, and the framebuffer driver, through which logd writes every line, and crashd declare
-  themselves undebuggable at startup, as svctest, a debug-authority holder, does in a test boot;
+  themselves undebuggable at startup, as svctest and the GDB stub, debug-authority holders, do in a
+  boot that stages them;
   before the declaration, a fault of one of them reaches crashd and is declined once the bound
   passes. A fault of any of these takes the outcome it has with no handler bound; the kernel's
   `fault unhandled` and `USERSPACE FAULT` lines are its only report.

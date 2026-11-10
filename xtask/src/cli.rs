@@ -127,6 +127,12 @@ pub enum CliCommand
     /// unstage the fixture again (see xtask/README.md).
     TestDebugPort(TestDebugPortArgs),
 
+    /// Check the GDB stub: stage it and its `gdb-target` process, boot the
+    /// current sysroot once with `--debug-port`, run the host's GDB in batch
+    /// mode against the port, check what it reports, and unstage both
+    /// again (see xtask/README.md).
+    TestGdb(TestGdbArgs),
+
     /// Check the mechanical documentation and source-header rules: Markdown
     /// column limit, file-header layout, `## Summarized By` shape and forward
     /// links, and document reachability from the root README. Runs in CI's
@@ -164,6 +170,18 @@ pub enum CliCommand
     /// File a GitHub Issue with the labels and milestone docs/conventions.md
     /// requires, and verify that both were applied (see xtask/README.md).
     IssueFile(IssueFileArgs),
+
+    /// Keep the on-disk state of an orchestration batch
+    /// (`target/xtask/orchestration/state.json`) and its log: the
+    /// orchestrator, the exclusive grant, the workers, the merge order, the
+    /// open questions and the rulings in force. `orch state` prints it (see
+    /// xtask/README.md).
+    Orch(OrchArgs),
+
+    /// Answer a hook of the assistant's harness: read the event's JSON on
+    /// stdin and print the answer the harness reads. `.claude/settings.json`
+    /// names these commands (see xtask/README.md).
+    Hook(HookArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -322,6 +340,12 @@ pub struct RunArgs
     /// localhost:<PORT>`). The console keeps the UART.
     #[arg(long, value_name = "PORT")]
     pub debug_port: Option<u16>,
+
+    /// Stage the GDB stub for this boot, attached to the process named
+    /// NAME (its argv[0]), and print the GDB command line that connects to
+    /// it; the stub is unstaged when QEMU exits. Requires `--debug-port`.
+    #[arg(long, value_name = "NAME", requires = "debug_port")]
+    pub debug_target: Option<String>,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -527,6 +551,32 @@ pub struct TestDebugPortArgs
     /// The host TCP port the debug port is served on.
     #[arg(long, default_value = "4560")]
     pub port: u16,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
+}
+
+// ── TestGdb ──────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestGdbArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// The host TCP port the debug port is served on.
+    #[arg(long, default_value = "4561")]
+    pub port: u16,
+
+    /// The host GDB to run (it must debug the architecture).
+    #[arg(long, default_value = "gdb")]
+    pub gdb: String,
 
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
@@ -747,6 +797,12 @@ pub struct RunParallelArgs
     /// port).
     #[arg(long, value_name = "PORT")]
     pub debug_port: Option<u16>,
+
+    /// Stage the GDB stub for these boots, attached to the process named
+    /// NAME; same semantics as `cargo xtask run --debug-target`. Requires
+    /// `--debug-port`.
+    #[arg(long, value_name = "NAME", requires = "debug_port")]
+    pub debug_target: Option<String>,
 }
 
 // ── KtestTiming ───────────────────────────────────────────────────────────────
@@ -929,6 +985,234 @@ pub struct IssueFileArgs
     /// File without a milestone: future-state work no release has scheduled.
     #[arg(long)]
     pub unscheduled: bool,
+}
+
+// ── Orch ──────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct OrchArgs
+{
+    #[command(subcommand)]
+    pub command: OrchCommand,
+}
+
+#[derive(Subcommand)]
+pub enum OrchCommand
+{
+    /// Start a batch: a fresh state and the first line of its log. Refuses
+    /// while a batch's state exists.
+    Start
+    {
+        /// The batch's goal, in one line.
+        #[arg(long)]
+        goal: String,
+    },
+
+    /// Print the state as text, or as the stored JSON with `--json`.
+    State
+    {
+        /// Print the stored JSON instead of the text form.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Append one timestamped line to the batch's log.
+    Log
+    {
+        /// The line; several words are joined with spaces.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        line: Vec<String>,
+    },
+
+    /// Record the current orchestrator's agent id, or print it when none is
+    /// given.
+    Orchestrator
+    {
+        /// The agent id workers report to.
+        id: Option<String>,
+    },
+
+    /// Set fields of a worker, creating it when it is new, or remove it.
+    Worker(OrchWorkerArgs),
+
+    /// Record the exclusive grant and the requests queued for it.
+    Grant
+    {
+        #[command(subcommand)]
+        command: OrchGrantCommand,
+    },
+
+    /// Replace the merge order.
+    Order
+    {
+        /// The PRs in the order they merge; none clears the order.
+        items: Vec<String>,
+    },
+
+    /// Record a question the maintainer has open, or close one.
+    Question
+    {
+        #[command(subcommand)]
+        command: OrchQuestionCommand,
+    },
+
+    /// Record a ruling in force for the batch, or drop one.
+    Ruling
+    {
+        #[command(subcommand)]
+        command: OrchRulingCommand,
+    },
+
+    /// End the batch: keep its state beside the log and clear the way for
+    /// the next `orch start`.
+    End,
+}
+
+#[derive(Parser)]
+pub struct OrchWorkerArgs
+{
+    /// The worker's name in the batch (for example `W3`).
+    pub name: String,
+
+    /// Remove the worker from the state.
+    #[arg(long, conflicts_with_all = ["id", "model", "effort", "scope", "branch", "worktree", "pr", "phase", "status"])]
+    pub remove: bool,
+
+    /// The worker's agent id.
+    #[arg(long)]
+    pub id: Option<String>,
+
+    /// The model the worker runs on.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// The worker's effort level.
+    #[arg(long)]
+    pub effort: Option<String>,
+
+    /// The commit-title scope of its PR.
+    #[arg(long)]
+    pub scope: Option<String>,
+
+    /// Its branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// The path of its worktree.
+    #[arg(long)]
+    pub worktree: Option<String>,
+
+    /// Its PR's number.
+    #[arg(long)]
+    pub pr: Option<String>,
+
+    /// Its phase: planning, coding, review, gate, merged, retired, or dead.
+    #[arg(long)]
+    pub phase: Option<String>,
+
+    /// Its last report, in one line.
+    #[arg(long)]
+    pub status: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum OrchGrantCommand
+{
+    /// Give the exclusive grant. Refuses while one is outstanding.
+    Set
+    {
+        /// The worker that holds the grant.
+        holder: String,
+        /// The commands the grant covers, flags included.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        commands: Vec<String>,
+    },
+    /// End the outstanding grant.
+    Clear,
+    /// Queue a request for the grant.
+    Queue
+    {
+        /// The worker that asks.
+        holder: String,
+        /// The commands it asks for, flags included.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        commands: Vec<String>,
+    },
+    /// Drop a queued request.
+    Unqueue
+    {
+        /// The worker whose request is dropped.
+        holder: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OrchQuestionCommand
+{
+    /// Record an open question.
+    Add
+    {
+        /// The file that holds its detail; give it before the id.
+        #[arg(long)]
+        file: Option<String>,
+        /// A short id to close it by.
+        id: String,
+        /// The question, in one line.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
+    /// Close a question once it is answered and the answer recorded.
+    Close
+    {
+        /// The id it was added under.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OrchRulingCommand
+{
+    /// Record a ruling in force for the batch.
+    Add
+    {
+        /// The ruling, stated as a decision in one line.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
+    /// Drop a ruling by the number `orch state` prints.
+    Drop
+    {
+        /// The ruling's number.
+        number: usize,
+    },
+}
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct HookArgs
+{
+    #[command(subcommand)]
+    pub event: HookEvent,
+}
+
+#[derive(Subcommand)]
+pub enum HookEvent
+{
+    /// `PreToolUse` of the Bash tool: refuse a direct cargo build, a merge
+    /// or an Issue filing by a subagent that is not the orchestrator, and a
+    /// merge that fails the merge gate.
+    Bash,
+
+    /// `SubagentStop` of a worker: refuse a hand-back from a worktree on a
+    /// detached HEAD or one that does not differ from `origin/master`.
+    SubagentStop,
+
+    /// `SessionStart` after a session's compaction: name what to read again.
+    CompactStart,
+
+    /// `PreCompact`: print the instructions for the compaction summary.
+    PreCompact,
 }
 
 #[cfg(test)]

@@ -112,7 +112,9 @@ A debugger's access to the memory of the address space a thread executes in
 (`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, [Debugging](#debugging)) is implemented on both
 architectures, the instruction-fetch synchronisation of a text write included. Its end-to-end
 consumer is the `debugger` fixture, which debugs a child process
-([programs/debugger/README.md](../programs/debugger/README.md)).
+([programs/debugger/README.md](../programs/debugger/README.md)). The GDB stub, which debugs a
+process of a running system from a host GDB over the debug port, is implemented on both
+architectures ([services/gdbstub/README.md](../services/gdbstub/README.md)).
 
 ---
 
@@ -698,6 +700,21 @@ that copied it (§ Label 22: `REGISTER_THREAD` there). The pieces are:
   say) writes the emulated result and the next instruction's pointer into the thread's registers
   and resumes it.
 
+A debugger that rebinds a process's exception class takes the process's crash reports away for as
+long as it holds it, and holds no SEND on procmgr's crash endpoint to bind it back. procmgr does
+that for it: the debugger sends `DETACH_PROCESS` when it lets go, and procmgr restores the bindings
+unasked once the debugger's thread that the attach named as its watch has exited
+([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`,
+§ Label 24: `DETACH_PROCESS`). A debugger finds a process by the name its creator gave it
+(§ Label 23: `LIST_PROCESSES` there).
+
+The GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) puts these pieces behind
+a host GDB: it attaches to the process its host names, binds each listed thread's exception and
+upcall classes to its own endpoint, stops every thread with an `UPCALL_ANY_INSTRUCTION` upcall
+whenever one stops (all-stop), and serves the GDB remote serial protocol on the debug port
+([device-management.md](device-management.md)). `cargo xtask test-gdb` drives it from a batch GDB
+session on both architectures ([testing.md](testing.md) § GDB stub (`test-gdb`)).
+
 The `debugger` fixture drives the breakpoint, the single-step on both architectures, register and
 same-process memory access, and the asynchronous break end to end, then reads and writes a debuggee
 process's memory and plants, takes, and removes a breakpoint in its text
@@ -741,17 +758,18 @@ format, the contract the host-side symbolizer reads, in
 - **Uncovered processes.** A process whose stop would deadlock the crash service, since the service
   waits on it, declares itself undebuggable, which unbinds its exception class: logd and the serial
   and framebuffer drivers, which carry the service's log output, and the crash service itself; in a
-  test boot svctest, a debug-authority holder, declares too. init, memmgr, and procmgr are not
-  created by procmgr and are never bound. A fault of any of these takes the outcome it has with no
-  handler bound, and the kernel's `fault unhandled` and `USERSPACE FAULT` lines are its only report.
-  Any process may declare itself so; the declaration affects the declarer alone and is one-way.
-  Before logd or either driver declares, at its startup, a fault of it reaches the crash service,
-  which declines it once its bound passes. A process created `CREATE_PINNED`, or whose pager binding
-  failed, has no virtual-memory handler: its page faults, which no pager forwards, kill it
-  unreported.
+  boot that stages them, svctest and the GDB stub, debug-authority holders, declare too. init,
+  memmgr, and procmgr are not created by procmgr and are never bound. A fault of any of these
+  takes the outcome it has with no handler bound, and the kernel's `fault unhandled` and
+  `USERSPACE FAULT` lines are its only report. Any process may declare itself so; the declaration
+  affects the declarer alone and is one-way. Before logd or either driver declares, at its startup,
+  a fault of it reaches the crash service, which declines it once its bound passes. A process
+  created `CREATE_PINNED`, or whose pager binding failed, has no virtual-memory handler: its page
+  faults, which no pager forwards, kill it unreported.
 - **Debuggers.** A debugger binds a thread's exception class over the crash endpoint
   ([Debugging](#debugging)); the crash service then sees none of that thread's faults. An unbind
-  leaves the class unbound, not bound to the crash endpoint again.
+  leaves the class unbound, not bound to the crash endpoint again; procmgr binds it back on the
+  debugger's `DETACH_PROCESS`, and when the debugger dies attached.
 
 Writing reports to disk is not the crash service's: the report persists through logd's disk and
 network sinks, so the filesystem stays off the crash path (design intent; not yet implemented). A
@@ -870,6 +888,7 @@ svcmgr service definitions carry no paging key; see
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/crashd/README.md](../services/crashd/README.md),
 [crashd Operation](../services/crashd/docs/operation.md),
+[services/gdbstub/README.md](../services/gdbstub/README.md),
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),

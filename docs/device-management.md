@@ -479,8 +479,9 @@ withdrawn serial, framebuffer, or RTC driver's query replies `WITHDRAWN` too. vf
 block ordinal from 0, passing a `WITHDRAWN` one, until another reply is not `SUCCESS`, and holds
 every live disk; the terminal sends none, so it binds the first input instance.
 
-The debug port is a byte transport apart from the console's UART, which a debugger stub owns to
-speak to a host debugger: the first virtio-console device devmgr enumerates, driven by the
+The debug port is a byte transport apart from the console's UART, which a debugger stub, the
+[GDB stub](../services/gdbstub/README.md), owns to speak to a host debugger: the first
+virtio-console device devmgr enumerates, driven by the
 [virtio-console driver](../services/drivers/virtio/console/README.md), which serves the serial
 protocol. devmgr hands it out only on `devmgr_labels::QUERY_DEBUG_PORT_DEVICE`, gated on
 `DEBUG_PORT_AUTHORITY`, which svcmgr mints only onto the seed-only `devmgr.debug` name, so only a

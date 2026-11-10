@@ -50,9 +50,10 @@ release-profile disk images per architecture, compresses them with zstd,
 generates `SHA256SUMS`, and creates a draft GitHub Release whose body is
 `docs/releases/<tag>.md`.
 
-The draft is published manually by the maintainer after verifying the
-burn-in workflow at `.github/workflows/burnin.yml` completed successfully
-on the same tag (per [conventions.md](../conventions.md#release-production)).
+No workflow publishes the draft. It is published on the maintainer's
+approval, once the burn-in workflow at `.github/workflows/burnin.yml` has
+completed successfully on the same tag (per
+[conventions.md](../conventions.md#release-production)).
 
 ## Post-Publish Edits
 

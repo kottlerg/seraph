@@ -14,6 +14,7 @@
 //!    `cli.rs`.
 //! 2. Create `commands/<name>.rs` with a `pub fn run(ctx, args) -> Result<()>`,
 //!    or add a `pub fn run_<name>` to the module that holds its sibling commands.
+//!    (`hook::run` returns nothing: a hook answers every event and never fails.)
 //! 3. Add a match arm in `main` below.
 //! 4. Re-export the module in `commands/mod.rs`.
 
@@ -31,6 +32,7 @@ mod cli;
 mod commands;
 mod context;
 mod crash_log;
+mod debug_stub;
 mod diag;
 mod disk;
 mod firmware;
@@ -89,6 +91,7 @@ fn main()
         CliCommand::TestCrashReport(args) => commands::test_crash_report::run(args),
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
+        CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
         CliCommand::CommitCheck(args) => commands::pr_check::run_commit_check(&ctx, args),
         CliCommand::PrCheck(args) => commands::pr_check::run_pr_check(&ctx, args),
@@ -96,6 +99,12 @@ fn main()
         CliCommand::ReviewLedger(args) => commands::review::run_ledger(&ctx, args),
         CliCommand::IssueEdit(args) => commands::issue::run_edit(&ctx, args),
         CliCommand::IssueFile(args) => commands::issue::run_file(&ctx, args),
+        CliCommand::Orch(args) => commands::orch::run(&ctx, args),
+        CliCommand::Hook(args) =>
+        {
+            commands::hook::run(&ctx, args);
+            Ok(())
+        }
     };
 
     if let Err(err) = result

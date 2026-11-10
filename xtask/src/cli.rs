@@ -59,6 +59,12 @@ pub enum CliCommand
     /// the command. See xtask/README.md for the tables and the baseline format.
     KtestTiming(KtestTimingArgs),
 
+    /// Resolve runtime addresses in a loaded ELF image (a binary, or the
+    /// sysroot's kernel) to function, file, and line from its DWARF, or to the
+    /// nearest function symbol when no DWARF covers an address. Each output
+    /// line names the source it used. See xtask/README.md.
+    Symbolize(SymbolizeArgs),
+
     /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
     /// and regenerate `disk.img` without invoking cargo. The mirror is
     /// authoritative over `config/`+`data/` (deletions in `rootfs/` are
@@ -101,17 +107,61 @@ pub enum CliCommand
     /// through `run-parallel` and reads the log it saves (see xtask/README.md).
     TestLogdReclaim(TestLogdReclaimArgs),
 
+    /// Check the crash service's report blocks in a boot's saved serial log:
+    /// every block well-formed, and the `crashme` fixture's two reports
+    /// present (`--expect reports`), or no block at all (`--expect none`)
+    /// (see xtask/README.md).
+    TestCrashReport(TestCrashReportArgs),
+
     /// Check that a boot whose bootloader redoes its steps 6 and 7 completes:
     /// stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot
     /// once through `run-parallel`, assert the bootloader's knob line and the
     /// pass marker, and remove the knob again (see xtask/README.md).
     TestMapRedo(TestMapRedoArgs),
 
+    /// Check the debug port's transport: stage the `debug-echo` fixture,
+    /// boot the current sysroot once with `--debug-port`, exchange GDB remote
+    /// serial protocol packets with the fixture over the port's TCP end, and
+    /// unstage the fixture again (see xtask/README.md).
+    TestDebugPort(TestDebugPortArgs),
+
     /// Check the mechanical documentation and source-header rules: Markdown
     /// column limit, file-header layout, `## Summarized By` shape and forward
     /// links, and document reachability from the root README. Runs in CI's
     /// host-tests job; see xtask/README.md for the rule list and levels.
     LintDocs(LintDocsArgs),
+
+    /// Check the commits of a range against the commit-message rules of
+    /// docs/conventions.md: subject form and width, Issue references and
+    /// planning labels in the subject, closing keywords, attribution, and
+    /// signatures. Runs in CI's host-tests job on a pull request; see
+    /// xtask/README.md for the rule list and levels.
+    CommitCheck(CommitCheckArgs),
+
+    /// Check a pull request against the rules of docs/conventions.md a script
+    /// can decide: its commits, its body's boxes and validated head, its
+    /// milestone, and the Issues it closes or references; with `--gate`, the
+    /// merge gate too. Reads GitHub through `gh` (see xtask/README.md).
+    PrCheck(PrCheckArgs),
+
+    /// Validate the saved run records of a pull request's pre-merge review
+    /// (`target/xtask/review/pr<N>/`) against the record shape (see
+    /// xtask/README.md).
+    ReviewCheck(ReviewCheckArgs),
+
+    /// Build `ledger.json` from the saved run records of a pull request's
+    /// pre-merge review: the findings a later run must not re-raise (see
+    /// xtask/README.md).
+    ReviewLedger(ReviewLedgerArgs),
+
+    /// Replace a GitHub Issue's body from a file, refusing an empty body or
+    /// one that lost task-list items, keeping a backup, and verifying the
+    /// edit (see xtask/README.md).
+    IssueEdit(IssueEditArgs),
+
+    /// File a GitHub Issue with the labels and milestone docs/conventions.md
+    /// requires, and verify that both were applied (see xtask/README.md).
+    IssueFile(IssueFileArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -280,6 +330,13 @@ pub struct RunArgs
     /// share one line.
     #[arg(long, requires = "second_disk")]
     pub second_disk_shared_line: bool,
+
+    /// Attach the debug port: a `virtio-console` device, which devmgr binds
+    /// as the debug port, its host end a TCP server QEMU listens with on
+    /// `127.0.0.1:<PORT>` (a debugger connects with `target remote
+    /// localhost:<PORT>`). The console keeps the UART.
+    #[arg(long, value_name = "PORT")]
+    pub debug_port: Option<u16>,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -379,6 +436,32 @@ pub struct TestKaslrArgs
     pub x86_paging: X86Paging,
 }
 
+// ── TestCrashReport ───────────────────────────────────────────────────────────
+
+/// What `test-crash-report` expects of a log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CrashReportExpect
+{
+    /// The `crashme` fixture's `vm` and `exception` reports: a usertest boot
+    /// with crashd staged.
+    Reports,
+    /// No report block: a boot of an image that stages no crashd.
+    None,
+}
+
+#[derive(Parser)]
+pub struct TestCrashReportArgs
+{
+    /// A boot's saved serial log to check (a `run-parallel --save-logs`
+    /// log). Nothing boots.
+    #[arg(long, value_name = "FILE")]
+    pub log: PathBuf,
+
+    /// What the log must hold beyond well-formed blocks.
+    #[arg(long, value_enum, default_value = "reports")]
+    pub expect: CrashReportExpect,
+}
+
 // ── TestLogdReclaim ───────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -444,6 +527,28 @@ pub struct TestMapRedoArgs
     /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64).
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+}
+
+// ── TestDebugPort ─────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestDebugPortArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// The host TCP port the debug port is served on.
+    #[arg(long, default_value = "4560")]
+    pub port: u16,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
 }
 
 // ── ComposeBundle ────────────────────────────────────────────────────────────
@@ -650,6 +755,12 @@ pub struct RunParallelArgs
     /// semantics as `cargo xtask run --second-disk-shared-line`.
     #[arg(long, requires = "second_disk")]
     pub second_disk_shared_line: bool,
+
+    /// Attach the debug port, served on `127.0.0.1:<PORT>`; same semantics
+    /// as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host
+    /// port).
+    #[arg(long, value_name = "PORT")]
+    pub debug_port: Option<u16>,
 }
 
 // ── KtestTiming ───────────────────────────────────────────────────────────────
@@ -693,7 +804,132 @@ pub struct KtestTimingArgs
     pub min_secs: f64,
 }
 
+// ── Symbolize ─────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct SymbolizeArgs
+{
+    /// The ELF image the addresses fall in (a sysroot binary, or its build
+    /// output under `target/`).
+    #[arg(long, value_name = "PATH", required_unless_present = "kernel")]
+    pub binary: Option<PathBuf>,
+
+    /// Resolve against the sysroot's kernel image
+    /// (`sysroot/esp/EFI/seraph/kernel`).
+    #[arg(long, conflicts_with = "binary")]
+    pub kernel: bool,
+
+    /// Load bias, in hex: the runtime address of the image's link address 0
+    /// (a PIE's `image bias=` or, for init, `init: PIE bias=` log value; the
+    /// kernel's `kaslr: slide=` value).
+    #[arg(long, value_name = "HEX", default_value = "0", value_parser = parse_hex_arg)]
+    pub bias: u64,
+
+    /// Runtime addresses to resolve, in hex (`0x` optional).
+    #[arg(required = true, value_name = "ADDR", value_parser = parse_hex_arg)]
+    pub addresses: Vec<u64>,
+}
+
+/// Clap value parser for a hex address.
+fn parse_hex_arg(text: &str) -> Result<u64, String>
+{
+    crate::symbolize::parse_hex(text).map_err(|err| format!("{err:#}"))
+}
+
 // ── LintDocs ──────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 pub struct LintDocsArgs {}
+
+// ── CommitCheck ───────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct CommitCheckArgs
+{
+    /// The commit or ref the range starts after.
+    #[arg(long, default_value = "origin/master")]
+    pub base: String,
+
+    /// The commit or ref the range ends at.
+    #[arg(long, default_value = "HEAD")]
+    pub head: String,
+
+    /// Fail on warnings too.
+    #[arg(long)]
+    pub strict: bool,
+}
+
+// ── PrCheck ───────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct PrCheckArgs
+{
+    /// The pull request's number.
+    pub pr: u64,
+
+    /// Also check the merge gate: every check green, a clean merge state, the
+    /// base branch included, and a passing last review record for the head.
+    #[arg(long)]
+    pub gate: bool,
+
+    /// Fail on warnings too.
+    #[arg(long)]
+    pub strict: bool,
+}
+
+// ── ReviewCheck / ReviewLedger ────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct ReviewCheckArgs
+{
+    /// The pull request's number.
+    pub pr: u64,
+}
+
+#[derive(Parser)]
+pub struct ReviewLedgerArgs
+{
+    /// The pull request's number.
+    pub pr: u64,
+}
+
+// ── IssueEdit / IssueFile ─────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct IssueEditArgs
+{
+    /// The Issue's number.
+    pub issue: u64,
+
+    /// The file holding the new body.
+    #[arg(long)]
+    pub body_file: PathBuf,
+
+    /// Allow a body with fewer task-list items than the Issue has.
+    #[arg(long)]
+    pub allow_removal: bool,
+}
+
+#[derive(Parser)]
+pub struct IssueFileArgs
+{
+    /// The Issue's title.
+    #[arg(long)]
+    pub title: String,
+
+    /// The file holding the body.
+    #[arg(long)]
+    pub body_file: PathBuf,
+
+    /// A label; repeat for each. At least one subsystem and one class label.
+    #[arg(long)]
+    pub label: Vec<String>,
+
+    /// The milestone's title.
+    #[arg(long)]
+    pub milestone: Option<String>,
+
+    /// File without a milestone: future-state work no release has scheduled.
+    #[arg(long)]
+    pub unscheduled: bool,
+}

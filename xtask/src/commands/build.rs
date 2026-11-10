@@ -76,9 +76,10 @@ enum InstallDest
     Programs,
     /// Installed under `sysroot/tests/<install_name>` — the test
     /// harnesses (kernel-surface `ktest`, service-surface `svctest`,
-    /// programs-surface orchestrator `usertest`) and the `crasher`
-    /// restart-path fixture. svcmgr does not scan this path; harness
-    /// recipes live in `rootfs/config/svcmgr/tests/`. See
+    /// programs-surface orchestrator `usertest`), the `crasher`
+    /// restart-path fixture, and the `debug-echo` debug-port fixture.
+    /// svcmgr does not scan this path; harness recipes live in
+    /// `rootfs/config/svcmgr/tests/`. See
     /// docs/testing.md § Sysroot layout.
     Tests,
     /// Installed under `sysroot/tests/programs/<install_name>` —
@@ -182,6 +183,15 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::ServicesDrivers,
         arch_only: None,
     },
+    // The debug port's driver: devmgr spawns it only for a virtio-console
+    // device, which a launch attaches only with `--debug-port`.
+    Spec {
+        name: "virtio-console",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: None,
+    },
     Spec {
         name: "serial",
         install_name: None,
@@ -272,6 +282,22 @@ const SPECS: &[Spec] = &[
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::Tests,
+        arch_only: None,
+    },
+    // The debug-port fixture `test-debug-port` stages: it answers fixed GDB
+    // remote serial protocol packets on the debug port.
+    Spec {
+        name: "debug-echo",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Tests,
+        arch_only: None,
+    },
+    Spec {
+        name: "crashd",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
@@ -452,6 +478,20 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "debugger-tester",
         install_name: Some("debugger"),
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::TestsPrograms,
+        arch_only: None,
+    },
+    Spec {
+        name: "crashme",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
+        name: "crashme-tester",
+        install_name: Some("crashme"),
         profile: BuildProfile::StdUser,
         dest: InstallDest::TestsPrograms,
         arch_only: None,

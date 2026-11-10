@@ -1479,8 +1479,11 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, pro
 }
 
 /// Why [`handle_fault`] declined a fault: the low 32 bits of the decline-reason
-/// word its `FAULT_REPLY_KILL` reply carries in data word 0, which the kernel
-/// prints in its kill diagnostic (docs/fault-handling.md § Reply). The values
+/// word its reply carries in data word 0 ([`decline_fault`]): a
+/// `FAULT_REPLY_FORWARD`, whose word the kernel hands to the exception handler
+/// as the forwarded message's data word 4, or prints in its kill diagnostic
+/// when none is bound, or, for [`FaultDecline::NotVm`], a `FAULT_REPLY_KILL`,
+/// whose word it prints (docs/fault-handling.md § Reply). The values
 /// are memmgr's wire contract, tabled in
 /// `services/memmgr/docs/ipc-interface.md` § Kernel-origin fault message.
 #[derive(Clone, Copy)]
@@ -1508,15 +1511,29 @@ enum FaultDecline
     MapFailed = 9,
 }
 
-/// Reply `FAULT_REPLY_KILL` to the faulting thread, with data word 0 the
-/// reason word: `reason` in its low 32 bits and `detail` (the failed
-/// syscall's error magnitude, or 0) in its high 32.
+/// Decline the fault, with data word 0 the reason word: `reason` in its low
+/// 32 bits and `detail` (the failed syscall's error magnitude, or 0) in its
+/// high 32. A virtual-memory fault is declined with `FAULT_REPLY_FORWARD`:
+/// the kernel hands it, with the reason word, to the faulting thread's
+/// exception handler (the crash endpoint procmgr binds, for a report before
+/// the kill), and with none bound the forward is a `FAULT_REPLY_KILL`
+/// carrying the same reason word (docs/fault-handling.md § Reply). A fault of
+/// another kind ([`FaultDecline::NotVm`]), which the exception class's own
+/// handler already received if one is bound, is declined with
+/// `FAULT_REPLY_KILL`. memmgr depends on no handler it forwards to: the
+/// reply never blocks.
 fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 {
     let word = (detail << 32) | u64::from(reason as u32);
-    let reply = IpcMessage::builder(syscall_abi::FAULT_REPLY_KILL)
-        .word(0, word)
-        .build();
+    let label = if matches!(reason, FaultDecline::NotVm)
+    {
+        syscall_abi::FAULT_REPLY_KILL
+    }
+    else
+    {
+        syscall_abi::FAULT_REPLY_FORWARD
+    };
+    let reply = IpcMessage::builder(label).word(0, word).build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
@@ -1536,12 +1553,14 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// mapped across up to `DEMAND_CHUNK_PAGES` pages — and replies
 /// [`syscall_abi::FAULT_REPLY_RESUME`]; a fault on a page an earlier chunk
 /// backed is resumed without backing. Backing a chunk rather than a single page
-/// bounds cap-slot consumption (one cap per chunk). Every other case —
-/// non-VM fault, unknown process, address outside every region, an access
-/// the region's protection does not grant ([`region_grants`]), no delegated
-/// AS, or any allocation/map failure — replies
-/// [`syscall_abi::FAULT_REPLY_KILL`], preserving default segfault semantics,
-/// with the [`FaultDecline`] that refused it in data word 0 ([`decline_fault`]).
+/// bounds cap-slot consumption (one cap per chunk). Every other VM case —
+/// unknown process, address outside every region, an access the region's
+/// protection does not grant ([`region_grants`]), no delegated AS, or any
+/// allocation/map failure — replies [`syscall_abi::FAULT_REPLY_FORWARD`],
+/// preserving default segfault semantics once the exception handler, if
+/// any, has seen the fault, and a non-VM fault replies
+/// [`syscall_abi::FAULT_REPLY_KILL`]; each with the [`FaultDecline`] that
+/// refused it in data word 0 ([`decline_fault`]).
 ///
 /// The chunk is accounted to the process record (reclaimed on `PROCESS_DIED` /
 /// `UNREGISTER_REGION` like any issued cap); `pool_total` is unchanged because

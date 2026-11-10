@@ -1002,7 +1002,9 @@ pub struct SvcmgrEndowment
     pub master_log_source: u64,
     /// Reserved badge-0 `SEND|GRANT` source on procmgr's service endpoint.
     /// svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it per launch
-    /// (used by logd to register sender death-notifications for slot reclaim).
+    /// (used by logd to register sender death-notifications for slot reclaim),
+    /// and a `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND|GRANT`
+    /// cap per launch.
     pub procmgr_death_auth_source: u64,
 }
 
@@ -1014,7 +1016,7 @@ pub struct SvcmgrEndowment
 /// rights) and the publish-role source caps: a `SEND` on the root
 /// filesystem namespace endpoint (svcmgr publishes it as `rootfs.root`) and
 /// a badge-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
-/// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.test` publish caps and
+/// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.test` / `devmgr.debug` publish caps and
 /// the `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it), plus two SENDs on
 /// vfsd's service endpoint svcmgr publishes seed-only: `MOUNT_AUTHORITY`-badged
 /// (`vfsd.mount`) and `DENY_BADGE`-badged (`vfsd.deny`). An absent source
@@ -1329,8 +1331,10 @@ pub fn phase3_svcmgr_handover(
     // per-mount fatfs cap to publish.
     let master_log_source = syscall::cap_derive(log_ep, syscall::RIGHTS_ALL).unwrap_or(0);
     // Badge-0 `SEND|GRANT` source on procmgr's service endpoint; svcmgr mints
-    // logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it. `GRANT` because logd's
-    // death-EQ registration transfers a cap, which the IPC kernel gates on it.
+    // logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it, and a
+    // `debug_authority = yes` service's `DEBUG_AUTHORITY` cap. `GRANT` because
+    // logd's death-EQ registration and the crash service's registration
+    // transfer a cap, which the IPC kernel gates on it.
     let procmgr_death_auth_source =
         syscall::cap_derive(procmgr_ep, syscall::RIGHTS_EP_SEND_GRANT).unwrap_or(0);
     let endowment = SvcmgrEndowment {

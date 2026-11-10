@@ -16,22 +16,27 @@ xtask/
 │   ├── main.rs                 # Entry point; dispatches CliCommand
 │   ├── cli.rs                  # Clap derive structs for every subcommand
 │   ├── context.rs              # Resolved workspace and build-output paths
+│   ├── diag.rs                 # Diagnostics of the pull-request, record, and Issue checks
 │   ├── arch.rs                 # Supported architectures and per-arch constants
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
 │   ├── bundle.rs               # Bootloader bundle composition (MODULES table)
 │   ├── disk.rs                 # GPT disk-image construction from the sysroot
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
+│   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
+│   ├── symbolize.rs            # ELF address resolution: DWARF, symbol-table fallback
+│   ├── tasklist.rs             # GitHub task-list items, as the PR and Issue checks read them
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
-│   ├── commands/               # One module per subcommand (build, run, run_parallel,
-│   │                           #   ktest_timing, mkdisk, compose_bundle, clean, test,
-│   │                           #   test_kaslr, test_logd_reclaim, test_map_redo,
-│   │                           #   test_terminal, test_vmgenid, lint_docs)
+│   ├── commands/               # Subcommand modules (build, run, run_parallel,
+│   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
+│   │                           #   test, test_crash_report, test_debug_port, test_kaslr,
+│   │                           #   test_logd_reclaim, test_map_redo, test_terminal,
+│   │                           #   test_vmgenid, lint_docs, pr_check, review, issue)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -73,7 +78,8 @@ or stamped for a different architecture.
 cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
     [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] \
     [--iommu attached|absent] \
-    [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]]
+    [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
+    [--debug-port PORT]
 ```
 
 | Option | Description |
@@ -90,6 +96,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--second-disk` | Attach `PATH` as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of its GPT (see Attached devices). `mkdisk --split-data` authors `disk-data.img` for it; any GPT image at 512- or 4096-byte blocks serves too, and any other image needs `--second-disk-block-size` |
 | `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
 | `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
+| `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -130,7 +137,9 @@ the q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhc
 added only when a `gtk` or `sdl` display backend is available. `--headless` drops the display
 adapter, so no framebuffer is advertised. `run-parallel --display framebuffer` keeps the adapter
 with no display window (`-display none`): the q35 default adapter on x86-64 and `-device VGA`
-alone on riscv64, whatever display backends QEMU has.
+alone on riscv64, whatever display backends QEMU has. `--debug-port` adds a `virtio-serial-pci`
+device, behind the IOMMU when one is attached, carrying one `virtconsole` port on the character
+device `seraph-debug`, a TCP server on `127.0.0.1` at the given port (`server=on,wait=off`).
 
 The disk device presents the logical block size of the image it boots, 512 or 4096 bytes
 (`logical_block_size` and `physical_block_size`), read from the LBA its GPT header sits at, so a
@@ -355,6 +364,7 @@ cargo xtask run-parallel \
     [--iommu attached|absent] \
     [--display headless|framebuffer] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
+    [--debug-port PORT] \
     [--pass REGEX] \
     [--fail REGEX] \
     [--fail-also REGEX] \
@@ -379,6 +389,7 @@ cargo xtask run-parallel \
 | `--second-disk` | (none) | Attach `PATH` as a second disk, as `cargo xtask run --second-disk` does; each slot boots its own copy, as it does of `disk.img` |
 | `--second-disk-block-size` | (the image's) | Block size of the second disk's device; same semantics as `cargo xtask run --second-disk-block-size` |
 | `--second-disk-shared-line` | off | Place the second disk on the first disk's `INTx` line; same semantics as `cargo xtask run --second-disk-shared-line` |
+| `--debug-port` | (none) | Attach the debug port, served on `127.0.0.1:PORT`; same semantics as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host port) |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
@@ -508,6 +519,47 @@ its log.
 
 ---
 
+### `cargo xtask symbolize`
+
+Resolve runtime addresses in a loaded ELF image to function, file, and line, without a debugger.
+An address less the image's load bias is an address in the image's link-time address space; the
+command resolves it from the image's DWARF, innermost inlined function first, each caller it is
+inlined into on its own line, and, where no DWARF covers it (a build without `--debug` for that
+component, or code compiled without debug information), from the image's symbol table, as the
+nearest function symbol and the offset into it. Installed binaries keep their symbol tables
+([docs/build-system.md](../docs/build-system.md) § Debuginfo is opt-in), so the fallback names
+the function in every build. Use cases are in [docs/testing.md](../docs/testing.md#troubleshooting)
+§ Troubleshooting.
+
+```
+cargo xtask symbolize --binary PATH [--bias HEX] ADDR...
+cargo xtask symbolize --kernel [--bias HEX] ADDR...
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--binary` | | The ELF image the addresses fall in: a sysroot binary, or its build output under `target/` |
+| `--kernel` | | Resolve against the sysroot's kernel image, `sysroot/esp/EFI/seraph/kernel` |
+| `--bias` | `0` | The image's load bias in hex: for a userspace process its creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, and, for init itself, the kernel's `init: PIE bias=0x…`), for the kernel the KASLR slide from its serial-only `kaslr: slide=` line (`0` in a boot authored with `mkdisk --no-kaslr`) |
+| `ADDR...` | (required) | Runtime addresses, in hex (`0x` optional) |
+
+Each address prints one line, `<address> (image <address less bias>): <resolution> [<source>]`
+(the image address shown only when the bias is not `0`), where the source is the one used:
+
+| Source | Resolution |
+|---|---|
+| `debug-info` | `<function> at <file>:<line>[:<column>]`, followed by one `    inlined into <function> at <file>:<line>[:<column>]` line per caller the frame is inlined into, each with the position of its call |
+| `symbol-table` | `<symbol>+<offset>` |
+| `unresolved` | `??`: neither source covers the address |
+
+Names are demangled. A frame prints only what its DWARF gives: `??` for an unnamed function, and
+`<function> at <file>` without a line, or a bare `<function>` without a file. An image with no
+DWARF at all prints a note naming the symbol-table fallback first. An address below the bias, an
+unreadable file, or a file that is not an ELF image fails the command; a compressed debug section
+is refused.
+
+---
+
 ### `cargo xtask test-terminal`
 
 Boot the terminal interactive test, exercising keyboard input end-to-end
@@ -624,6 +676,31 @@ See [docs/testing.md](../docs/testing.md) for the harness model.
 
 ---
 
+### `cargo xtask test-crash-report`
+
+Check the crash service's report blocks in a boot's saved serial log, on either arch; boots
+nothing. Every block in the log must be complete and hold the fields its kind, thread, and status
+require, read with `shared/crash-report`, the crate crashd emits them with
+([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)).
+
+```sh
+# A usertest boot with crashd staged (what CI's usertest cell runs):
+cargo xtask test-crash-report --log target/xtask/run-parallel-saved/x86_64-4cpu-1.log
+
+# A boot of an image that stages no crashd (what CI's svctest cell runs):
+cargo xtask test-crash-report --expect none --log target/xtask/run-parallel-saved/x86_64-4cpu-1.log
+```
+
+`--expect reports`, the default, also requires one `vm` and one `exception` block of the `crashme`
+fixture, found through the badge logd's `reclaim:` line names it by, each complete, of its main
+thread, its walk starting at its instruction pointer, and each matched by the kernel's
+`handler declined, reason=0x<id>` line. `--expect none` requires the log to hold no block. A log
+whose `[run-parallel]` trailer records a `QEMU-CRASH` is reported skipped, which passes the
+command, as `test-logd-reclaim` reports it. The model is in
+[docs/testing.md](../docs/testing.md) § Crash reports.
+
+---
+
 ### `cargo xtask test-map-redo`
 
 Check that a boot whose bootloader redoes its steps 6 and 7 completes, on either arch. Stages the
@@ -650,6 +727,39 @@ ends `FAIL`, `HANG`, `OK` or `ERR` fails the command before the check, as it fai
 a `QEMU-CRASH` boot is reported skipped, as `test-logd-reclaim` reports it.
 
 See [docs/testing.md](../docs/testing.md) for the harness model.
+
+---
+
+### `cargo xtask test-debug-port`
+
+Check the debug port's transport, on either arch. Stages the `debug-echo` fixture's recipe
+([services/debug-echo/README.md](../services/debug-echo/README.md)) from
+`config/svcmgr/tests/` into `config/svcmgr/services/`, repacks `disk.img`, boots the current
+sysroot once with the debug port attached (as `run --debug-port` attaches it, headless), waits for
+the fixture's `[debug-echo] READY on the debug port` line on the serial stream, connects to the
+port, and drives one GDB remote serial protocol exchange with the fixture, framed at both ends by
+`shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)). It then kills QEMU,
+removes the recipe, and repacks `disk.img` again, whatever the outcome. It passes when every
+answer of the exchange arrives as expected; [docs/testing.md](../docs/testing.md) § Debug port
+(`test-debug-port`) lists the exchange.
+
+A pure runner; requires a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test-debug-port [--arch x86_64|riscv64] [--port PORT] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--port` | `4560` | The host TCP port the debug port is served on |
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+The boot to the fixture's line is bounded by five minutes and each answer by twenty seconds. The
+boot is the debug-port device cell of the local and release host runs
+([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
 ---
 
@@ -688,6 +798,158 @@ pattern also matches legitimate prose.
 
 ---
 
+### `cargo xtask commit-check`
+
+Check the commits of a range against [docs/conventions.md](../docs/conventions.md)
+§ Commit Messages and § Commit and PR cross-references. Runs in CI's `host-tests` job on a pull
+request ([docs/build-system.md](../docs/build-system.md) § Continuous Integration).
+
+```
+cargo xtask commit-check [--base <ref>] [--head <ref>] [--strict]
+```
+
+The range is `<base>..<head>`, by default `origin/master..HEAD`. Each finding prints as
+`<level> <rule>: <commit>: <message>`. An error fails the command; a warning fails it only under
+`--strict`. The warnings are that section's SHOULD rules, a departure from which the maintainer
+may accept, and one rule a script cannot decide alone.
+
+| Rule | Level | Check |
+|---|---|---|
+| `commit-subject-form` | error | The subject is `<scope>: <summary>`. |
+| `commit-subject-ref` | error | The subject carries no Issue reference (`#N`, `<owner>/<repo>#N`, or the Issue's URL). |
+| `commit-closing-keyword` | error | No closing keyword directly before an Issue reference, in the subject or the body. |
+| `commit-attribution` | error | No tool attribution line and no link to an assistant session. |
+| `commit-unsigned` | error | The commit object carries a signature (a `gpgsig` header), as § Branch protection requires. Whether it verifies is that rule's to decide; a clone without the signer's key cannot. |
+| `commit-subject-columns` | warning | The subject is at most 72 columns. |
+| `commit-body-columns` | warning | No body line that wrapping could shorten is over 72 columns (a line with no space, or indented four columns, is left alone). |
+| `commit-planning-label` | warning | The subject carries no `step N`, `phase N`, `tier N`, `stage N`, or `round N`; the name of a step a document defines permanently is not a label, which is why this is a warning. |
+
+A merge commit is exempt from the four subject rules, as § Commit Messages says; the other rules,
+`commit-body-columns` among them, apply to it.
+
+### `cargo xtask pr-check`
+
+Check a pull request against the rules of [docs/conventions.md](../docs/conventions.md) that a
+script can decide. It reads GitHub through the `gh` CLI, which must be installed and
+authenticated, and the PR's head must be in the clone (`git fetch origin`).
+
+```
+cargo xtask pr-check <N> [--gate] [--strict]
+```
+
+It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`), then:
+
+| Rule | Level | Check |
+|---|---|---|
+| `pr-unticked-box` | error | The body has no unticked task-list item (§ PR-body checklist discipline): `[ ]` after a `-`, `*`, `+`, or numbered list marker, the forms GitHub renders as a checkbox. |
+| `pr-attribution` | error | The body carries no tool attribution line and no session link. |
+| `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`. A drain PR that closes a follow-up Issue carries both (§ Branch and PR Workflow); in any other body the pair usually means a sentence closes an Issue the PR only references. |
+| `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
+| `pr-validation` | error | The body has a `## Validation` section that names a validated head: the first word of that section that is a commit hash in the clone. |
+| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch, the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. |
+| `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
+| `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Branch and PR Workflow). |
+| `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
+| `issue-milestone` | error | Every Issue the PR closes carries the current milestone, the lowest-versioned open one. |
+| `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
+
+The command prints the Issues the body and the commits close and the ones the body references,
+so that a keyword in prose that closes an Issue by accident is seen.
+
+`--gate` adds the merge gate of § Branch and PR Workflow. It does not imply `--strict`: a
+warning is for the reader, who may confirm it or hold an acceptance of it, and only an error
+fails the gate.
+
+| Rule | Level | Check |
+|---|---|---|
+| `gate-merge-state` | error | GitHub reports the merge state `CLEAN`. |
+| `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
+| `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
+| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
+| `gate-findings-recorded` | warning | That record leaves no finding on the surface. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each is recorded and none is contested; the command cannot. |
+
+The command does not judge what needs a reader: whether the body's claims match the diff, whether
+an acceptance item is delivered, and which local host runs the change owes. Those stay with the
+pre-merge review's audit.
+
+### `cargo xtask review-check`
+
+Validate the saved run records of a pull request's pre-merge review.
+
+```
+cargo xtask review-check <N>
+```
+
+A run record is `target/xtask/review/pr<N>/<mode>-<head>.json`, where `<mode>` is `full`, `delta`,
+or `audit` and `<head>` is the head the run reviewed. A further run at a head that already has a
+record of that kind (a second run with the reviewer, a second audit) is `<mode>-<head>-<n>.json`,
+`<n>` counting from 2. The suffix only keeps the names apart: `stats.run` orders the runs. It is
+one JSON object:
+
+| Key | Value |
+|---|---|
+| `verdict` | The reviewer verdict: `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, or `BLOCKING ISSUES`. In an `audit` record, the reviewer verdict the audit states. |
+| `audit_verdict` | `AUDIT PASS` or `AUDIT FAIL`. |
+| `audit` | `verdict` (as `audit_verdict`) and `sections`, a list of objects with `name`, `verdict`, and `items`. |
+| `findings` | The findings on the review surface. In an `audit` record, those of the last run with the reviewer that the delta leaves unfixed. |
+| `recorded` | The findings off the surface. |
+| `ledgered` | The findings the reviewer listed as held by the ledger. |
+| `dropped` | Findings dropped as false. |
+| `stats` | `mode` (as in the file name), `head` (the full hash), `since` (the head the previous run with the reviewer reviewed, or null), `failed` (the agents that returned no result), and `run` (the run's number in the PR's sequence of runs, of either kind, counting from 1). |
+
+Each finding is an object with `file`, `line`, `class` (`correctness`, `safety`, `contract`,
+`standards`, `doc-drift`, `coverage`, or `style`), `bucket` (`critical`, `should`, or `nit`),
+`must_violation` (a boolean), `status` (`unverified`, `nit`, or `contested`), `issue`, `claim`,
+and `fix`. The command reports each departure as `error record-shape` or, for a file name that
+does not state its record's mode and head, `error record-name`.
+
+### `cargo xtask review-ledger`
+
+Build the ledger of a pull request's review: the findings a later run of the same PR must not
+re-raise ([docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow).
+
+```
+cargo xtask review-ledger <N>
+```
+
+It reads every run record of `target/xtask/review/pr<N>/` and writes `ledger.json` beside them:
+a sorted list without duplicates of each record's `recorded` and `dropped` findings, its
+`contested` findings, and, when its verdict is `NON-BLOCKING ISSUES ONLY`, all its `findings`.
+Each entry carries the finding's fields and `run`, the first eight digits of the head of the run
+that reported it.
+
+### `cargo xtask issue-edit`
+
+Replace a GitHub Issue's body from a file, with the checks that keep a wrong file from
+destroying it.
+
+```
+cargo xtask issue-edit <N> --body-file <path> [--allow-removal]
+```
+
+The command refuses an empty body, and a body with fewer task-list items than the Issue has
+unless `--allow-removal` is given (an edit that drops items on purpose, as
+[docs/conventions.md](../docs/conventions.md) § Acceptance checklist discipline allows). It
+writes the previous body to `target/xtask/issue-backup/<N>-<time>.md`, edits the Issue, reads
+it back, and restores the previous body when what GitHub holds is not what the file holds.
+
+### `cargo xtask issue-file`
+
+File a GitHub Issue with the labels and milestone
+[docs/conventions.md](../docs/conventions.md) § Labels and § Milestones require.
+
+```
+cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
+    (--milestone <title> | --unscheduled)
+```
+
+The command refuses a filing without a class label, without a subsystem label, or without a
+milestone decision (`--unscheduled` is for future-state work no release has scheduled). After
+filing it reads the Issue back and fails when a label or the milestone was not applied, naming
+what is missing.
+
+---
+
 ## Sub-crates
 
 | Sub-crate | Purpose |
@@ -702,9 +964,10 @@ pattern also matches legitimate prose.
 |---|---|
 | [docs/build-system.md](../docs/build-system.md) | Toolchain, workspace layout, custom targets, sysroot, CI workflows |
 | [docs/memory-model.md](../docs/memory-model.md) | Randomized kernel layout `test-kaslr` checks; RISC-V paging-mode ceiling behind `--riscv-mmu`; x86-64 paging depth behind `--x86-paging` |
-| [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) | PIE image placement and the per-spawn ASLR bias used with `--gdb` |
+| [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) | PIE image placement and the per-spawn ASLR bias used with `--gdb` and `symbolize --bias` |
 | [docs/storage.md](../docs/storage.md) | GPT role-GUID discovery of the data partition the disk image carries |
-| [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks |
+| [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves |
+| [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md) | The debug port `--debug-port` attaches and `test-debug-port` drives |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` enforces; the Markdown and file-header rules `lint-docs` checks |
 | [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |
 | [targets/README.md](targets/README.md) | Custom target specs |
@@ -714,7 +977,9 @@ pattern also matches legitimate prose.
 ## Adding a new command
 
 1. Add a variant to `CliCommand` in `src/cli.rs` with a corresponding `Args` struct.
-2. Create `src/commands/<name>.rs` with `pub fn run(ctx: &Context, args: &NameArgs) -> Result<()>`.
+2. Create `src/commands/<name>.rs` with `pub fn run(ctx: &Context, args: &NameArgs) -> Result<()>`,
+   or add a `pub fn run_<name>` to the module that holds its sibling commands (`pr_check`,
+   `review`, and `issue` each hold two).
 3. Add a match arm in `src/main.rs`.
 4. Re-export the module in `src/commands/mod.rs`.
 

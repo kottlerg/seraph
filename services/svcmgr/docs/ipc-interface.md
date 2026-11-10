@@ -60,9 +60,10 @@ no change to the encoding.
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
 svcmgr mints the `devmgr.registry` publish cap
-(`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown` and `devmgr.test`
-publish caps (`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY`
-or `TEST_LABEL_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
+(`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown`, `devmgr.test`, and
+`devmgr.debug` publish caps (`REGISTRY_QUERY_AUTHORITY` plus
+`SHUTDOWN_DEVICE_AUTHORITY`, `TEST_LABEL_AUTHORITY`, or
+`DEBUG_PORT_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
 (`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source, and publishes
 the two vfsd SENDs as they arrive (their badges ride through to the
 seeding recipe unchanged). A version
@@ -89,7 +90,7 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 |---|---|
 | caps[..] | the present slots, in slot order |
 | slot 0 | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch and the first-launch handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`; see [`log_sink`](service-definitions.md#log_sink)); holding it keeps the log endpoint alive across a logd crash (absent if its derive fails) |
-| slot 1 | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (absent if its derive fails) |
+| slot 1 | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (absent if its derive fails), and the `DEBUG_AUTHORITY` `SEND\|GRANT` cap of a `debug_authority = yes` service |
 | data[0] | `3` (`LOGD_SOURCES`) |
 | data[1] | presence word: bit 0 `MASTER_LOG`, bit 1 `PROCMGR_DEATH_AUTH` |
 
@@ -110,8 +111,8 @@ bind death-notification at endowment time — the matching `.svc`
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
-`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, `vfsd.mount`,
-`vfsd.deny`) into its own registry and installs devmgr's
+`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, `devmgr.debug`,
+`vfsd.mount`, `vfsd.deny`) into its own registry and installs devmgr's
 `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering the event
 loop.
 
@@ -203,7 +204,7 @@ freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint.
 
 Only public names resolve. A name whose cap carries authority is published
 seed-only and answers `UNKNOWN_NAME`, as an unknown name does: `rootfs.root`,
-the three `devmgr.*` names, `vfsd.mount`, and each provider name whose badge
+the four `devmgr.*` names, `vfsd.mount`, and each provider name whose badge
 carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` entries, today
 `pwrmgr.shutdown`). `vfsd.deny` carries no authority but is seed-only too: it
 is svctest's test twin, reached only through svctest's recipe. A
@@ -236,7 +237,7 @@ through [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
 `svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
 caller's cap badge) gating `PUBLISH_ENDPOINT` for *external* publishers.
 svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`,
-the three `devmgr.*` names, the two `vfsd.*` names, and each provider's
+the four `devmgr.*` names, the two `vfsd.*` names, and each provider's
 `provides` names) directly into
 its own registry, so those need no badge. The gate exists for a future
 external publisher — devmgr holds a `PUBLISH_AUTHORITY`-badged SEND from

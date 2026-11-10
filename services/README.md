@@ -13,12 +13,14 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | [`vfsd/`](vfsd/README.md) | Virtual filesystem daemon |
 | [`fs/`](fs/README.md) | Filesystem driver implementations (mounted by `vfsd`) |
 | [`logd/`](logd/README.md) | Logging daemon |
+| [`crashd/`](crashd/README.md) | Crash service — reports each process that dies on a fault to the system log |
 | [`netd/`](netd/README.md) | Network stack daemon (design intent; not yet implemented) |
 | [`pwrmgr/`](pwrmgr/README.md) | Power manager — platform shutdown and reboot |
 | [`timed/`](timed/README.md) | Wall-clock service over the devmgr-resolved RTC |
 | [`usertest/`](usertest/README.md) | Programs-surface test orchestrator |
 | [`svctest/`](svctest/README.md) | Services-surface test harness |
 | [`crasher/`](crasher/README.md) | Test-tier fixture: deliberate-crash canary for svcmgr's restart path (gated, opt-in) |
+| [`debug-echo/`](debug-echo/README.md) | Test-tier fixture: answers fixed GDB remote serial protocol packets on the debug port (gated, opt-in) |
 
 ---
 

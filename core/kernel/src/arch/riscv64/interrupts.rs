@@ -733,6 +733,11 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 }
                 // Handler declined (Kill) — fall through to terminate the thread.
             }
+            else
+            {
+                // SAFETY: tcb is the running user thread or null.
+                unsafe { crate::ipc::fault::report_unbound_kill(tcb) };
+            }
 
             let tid = if tcb.is_null()
             {

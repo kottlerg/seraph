@@ -23,6 +23,14 @@ components must be installed:
 
 Run `rustup show` in the repository root to confirm the toolchain is active.
 
+`cargo xtask symbolize` reads DWARF and symbol tables in Rust (the `addr2line` and `object` crates
+of xtask's dependencies), so symbolizing needs no host tool beyond the toolchain. Debugging a guest
+through QEMU's gdbstub ([testing.md § Troubleshooting](testing.md#troubleshooting)) needs a host
+GDB that supports the guest's architecture: a riscv64 guest needs a GDB built for RISC-V as well
+as the host, such as one configured with `--enable-targets=all` or a distribution's multi-target
+package (`gdb-multiarch` on Debian and Ubuntu). `gdb -batch -ex 'set architecture riscv:rv64'`
+fails on a GDB without it.
+
 ---
 
 ## Workspace Structure
@@ -384,7 +392,7 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs` and then `cargo xtask test`; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-logd-reclaim --log` on the log their boot saved, and usertest cells re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then `cargo xtask test`; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-logd-reclaim --log` and `test-crash-report --expect none --log` on the log their boot saved, and usertest cells run `test-crash-report --expect reports --log` on theirs, then re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
 | `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
@@ -441,7 +449,8 @@ The merge-gating rule (CI must pass green before merge) lives in
 [RISC-V UEFI Boot](../core/boot/docs/riscv-uefi-boot.md),
 [core/kernel/README.md](../core/kernel/README.md), [System Bootstrap](bootstrap.md),
 [Coding Standards](coding-standards.md), [Platform Requirements](platform-requirements.md),
-[docs/releases/README.md](releases/README.md), [rootfs/README.md](../rootfs/README.md),
+[docs/releases/README.md](releases/README.md), [Testing](testing.md),
+[rootfs/README.md](../rootfs/README.md),
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [Driver Model](../services/drivers/docs/driver-model.md),

@@ -59,9 +59,9 @@ claims.
    (`#N`, `<owner>/<repo>#N`, or the Issue's URL) with at most a colon and
    whitespace between (a subject such as `fix #N items` closes #N exactly
    as `Fixes #N` does; the `(fixed by PR #M)` marker is not a closing
-   reference). Report as FAIL a closing reference in a commit message to
-   an Issue the PR body does not close with `Fixes #N` or `Closes #N`, per
-   that section. For each closed Issue, `gh issue view <N> --json body`.
+   reference). Report as FAIL every closing reference in a commit
+   message, per that section: a closing keyword goes in the PR body only.
+   For each closed Issue, `gh issue view <N> --json body`.
    For every `- [ ]` under `## Acceptance` in the issue, one of two
    outcomes MUST be reconciled per `docs/conventions.md`: either the diff
    delivers the criterion, or the issue was edited to drop the criterion
@@ -235,5 +235,5 @@ Any FAIL section forces `AUDIT FAIL`.
 ## Tool discipline
 
 Read-only. `Bash` is for `git` and `gh` read-only subcommands,
-`cargo xtask pr-check`, and `grep`/`find`/`rg`-class shell utilities. No `gh pr edit`, `gh issue edit`,
-`gh pr merge`, `git commit`, `git push`. You report; you do not act.
+`cargo xtask pr-check`, and `grep`/`find`/`rg`-class shell utilities. No `gh pr edit`,
+`gh issue edit`, `gh pr merge`, `git commit`, `git push`. You report; you do not act.

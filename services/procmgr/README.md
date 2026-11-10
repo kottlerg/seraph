@@ -27,10 +27,12 @@ procmgr/
 │                                 argv/env header decoder and checks and
 │                                 the create-request cap split, the
 │                                 fs-reply bounds, the init-reap state
-│                                 machine, and the first death queue's
-│                                 size (`FIRST_POOL_OBSERVERS`)
+│                                 machine, the first death queue's
+│                                 size (`FIRST_POOL_OBSERVERS`), and the
+│                                 attach refusals and image span
 ├── src/
 │   ├── main.rs                 # main() (std runtime), IPC dispatch loop
+│   ├── crash.rs                # Crash endpoint, its decliner, the handover
 │   ├── death_queues.rs         # Death-queue ring capacity (`DEATH_EQ_CAPACITY`)
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
@@ -87,6 +89,16 @@ procmgr/
   key). The kernel posts nothing to logd's queue: procmgr is the source
   of logd's death events, so the queue needs no death-observer nodes. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § `REGISTER_DEATH_EQ`.
+- **Crash endpoint and debug authority** — create one crash endpoint at
+  startup and bind every child's exception class to it, badged with the
+  child's process badge; decline its faults on a thread of its own
+  (`src/crash.rs`) until a crash service registers
+  (`REGISTER_CRASH_SERVICE`), and again once that service is gone. Serve
+  `ATTACH_PROCESS`, which returns a process's Thread caps and image
+  placement to a `DEBUG_AUTHORITY` holder, and `DECLARE_NO_DEBUG`, by which
+  a process opts out of both. See
+  [docs/ipc-interface.md](docs/ipc-interface.md) § Crash Endpoint and Debug
+  Authority.
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff during
   init's Handover stage
   ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover):

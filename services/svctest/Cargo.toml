@@ -32,8 +32,9 @@ syscall = { path = "../../shared/syscall" }
 # `FAULT_REPLY_KILL`: its forged-fault case sends a fault-shaped request
 # and expects the KILL reply. `SYS_THREAD_SET_FAULT_HANDLER` and
 # `FAULT_CLASS_ALL`: the pager forged-badge phase issues the raw bind.
-# `FAULT_KIND_VM`, `FAULT_ACCESS_*`, and `FAULT_REPLY_RESUME`: the pager
-# refused-access phase forges VM faults and expects RESUME or KILL.
+# `FAULT_KIND_VM`, `FAULT_ACCESS_*`, `FAULT_REPLY_RESUME`, and
+# `FAULT_REPLY_FORWARD`: the pager refused-access phase forges VM faults and
+# expects RESUME or FORWARD.
 # `PAGE_SIZE`: the argv/env refusal cell declares a header one byte past its
 # one-page cap.
 syscall-abi = { path = "../../abi/syscall" }

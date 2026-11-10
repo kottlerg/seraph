@@ -108,15 +108,17 @@ Issues only.
 - Commit messages MAY reference Issues by `#N` where useful.
 - A commit or PR description that changes an Issue without closing it (ticking items on a
   follow-up Issue it drains in part) MUST reference it via `Refs #N`, which auto-closes nothing.
-- Any commit or PR description that closes an Issue MUST reference it via `Fixes #N` /
-  `Closes #N` so the merge auto-closes the Issue. Manual `gh issue close` after the fact is a
-  procedural miss, not a substitute.
-- A commit message or PR description MUST NOT put a GitHub closing keyword (`close`, `closes`,
-  `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, or `resolved`, in any letter case)
-  directly before a reference to Issue N (`#N`, `<owner>/<repo>#N`, or the Issue's URL), with at
-  most a colon and whitespace between them, unless it closes Issue N: GitHub closes the Issue when
-  that text reaches `master`, whatever words follow the reference. Other forms of those verbs
-  (`closing`, `fixing`, `resolving`) are not closing keywords. A keyword separated from the
+- A PR that closes an Issue MUST reference it via `Fixes #N` / `Closes #N` in its description, so
+  the merge auto-closes the Issue. Manual `gh issue close` after the fact is a procedural miss,
+  not a substitute.
+- A GitHub closing keyword (`close`, `closes`, `closed`, `fix`, `fixes`, `fixed`, `resolve`,
+  `resolves`, or `resolved`, in any letter case) directly before a reference to Issue N (`#N`,
+  `<owner>/<repo>#N`, or the Issue's URL), with at most a colon and whitespace between them, MUST
+  appear only in the description of a PR that closes Issue N, and MUST NOT appear in a commit
+  message. GitHub closes the Issue when that text reaches `master`, whatever words follow the
+  reference; an Issue closes by a PR's merge, since no commit reaches `master` without a PR; and
+  a keyword in a commit cannot be withdrawn without rewriting the commit. Other forms of those
+  verbs (`closing`, `fixing`, `resolving`) are not closing keywords. A keyword separated from the
   reference by other words, as in the `(fixed by PR #M)` marker of § Branch and PR Workflow, is
   not a closing reference.
 
@@ -175,9 +177,8 @@ maintainer's acceptance of it, quoting the maintainer's words.
 - Optional for trivial changes (typo fixes, single-line tweaks).
 - Expected for substantive changes: explain the why, not the what (the diff shows the what).
 - SHOULD wrap at ~72 columns.
-- A commit (or its enclosing PR description) that closes an Issue MUST include `Fixes #N` /
-  `Closes #N` so the merge auto-closes the Issue. Closing manually after the fact is a procedural
-  miss, not a substitute.
+- A body MUST NOT carry a closing keyword; the PR description closes an Issue
+  (§ Commit and PR cross-references). `Refs #N` names an Issue the commit touches.
 
 ### Style
 
@@ -410,7 +411,8 @@ gives the PR-level linear view.
 - Every PR body MUST report, in its `## Validation` section, each local host
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes (each
   boundary run, the memory variation, and each device cell: the storage cells,
-  the no-IOMMU variant, and the framebuffer cell, per architecture), with its `--runs` count, its
+  the no-IOMMU variant, the framebuffer cell, and the debug-port cell, per architecture), with its
+  `--runs` count, its
   outcome, and the head it ran at (a run the PR does not owe that HANGs or
   fails as that section allows, with the link to its record), or state that
   none is owed and why (that the PR's changes outside Markdown are all inert,
@@ -476,8 +478,9 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    times each in the debug profile and once each in the release profile, and
    the memory variation, the disk variations (a 4Kn disk and three
    second-disk boots, on both architectures), the no-IOMMU variant
-   (`--iommu absent`, svctest, on both architectures), and the framebuffer
-   cell (`--display framebuffer`, svctest, on both architectures) once each.
+   (`--iommu absent`, svctest, on both architectures), the framebuffer
+   cell (`--display framebuffer`, svctest, on both architectures), and the
+   debug-port cell (`test-debug-port`, on both architectures) once each.
    Their report, each run's command, `--runs` count, outcome, and head, is
    written to `target/xtask/review/release-v<X>.<Y>.<Z>/host-runs.md`, the
    file the release audit reads; the release PR's body states its own local
@@ -507,4 +510,4 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 [abi/syscall/README.md](../abi/syscall/README.md), [Build System](build-system.md),
 [Documentation Standards](documentation-standards.md),
 [docs/releases/README.md](releases/README.md), [Testing](testing.md),
-[shared/ipc/README.md](../shared/ipc/README.md)
+[shared/ipc/README.md](../shared/ipc/README.md), [xtask/README.md](../xtask/README.md)

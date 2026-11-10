@@ -16,7 +16,7 @@ services/svctest/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── main.rs                # Child-mode check, bootstrap, phase run, pass marker, shutdown
+    ├── main.rs                # Child-mode check, no-debug, bootstrap, phases, markers, shutdown
     ├── bootstrap.rs           # Decodes the creator-endpoint bootstrap rounds into `Caps`
     ├── runner.rs              # `Phase` type, per-phase log envelope, failure hooks, markers
     ├── reentry.rs             # argv-role dispatch into each phase module's child mode
@@ -37,11 +37,12 @@ services/svctest/
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
         │                      # death queues; logd death forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
+        ├── crash.rs           # procmgr's crash endpoint: registration, handover, take-back
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
-        ├── devmgr.rs          # Block, shutdown, label deny; input ordinal; orphan, withdrawal,
-        │                      #   DMA confinement
+        ├── devmgr.rs          # Block, shutdown, debug-port, label deny; input ordinal; orphan,
+        │                      #   withdrawal, DMA confinement
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
         │                      #   refused access
@@ -70,8 +71,9 @@ identity last).
 ## Run Sequence
 
 `main` registers the log name `svctest`, so every line carries the `[svctest]` prefix. It then
-installs the failure hooks, requests the bootstrap rounds, hands the hooks the
-authority-badged pwrmgr cap, logs `starting`, and runs each registered phase in order inside
+installs the failure hooks, declares itself undebuggable to procmgr (`DECLARE_NO_DEBUG`, as
+a debug-authority holder; it asserts `SUCCESS`), requests the bootstrap rounds, hands the hooks
+the authority-badged pwrmgr cap, logs `starting`, and runs each registered phase in order inside
 the envelope `phase=<name> starting` / `phase=<name> passed`. After the last phase it logs
 `ALL TESTS PASSED`, the marker defined in
 [docs/testing.md § Reporting marker](../../docs/testing.md#reporting-marker), and sends
@@ -89,8 +91,9 @@ marker first logs it, so a run logs exactly one. A failing thread that finds the
 claimed yields until the run ends instead of aborting, so its abort cannot cut off the
 claimant's marker or `SHUTDOWN`.
 
-Some failures still end the run idle. A panic or allocation failure during the bootstrap rounds
-logs `SOME TESTS FAILED` but sends no `SHUTDOWN`, because the hooks get the pwrmgr cap only
+Some failures still end the run idle. A panic or allocation failure during the declaration or
+the bootstrap rounds (a refused `DECLARE_NO_DEBUG` among them) logs `SOME TESTS FAILED` but sends
+no `SHUTDOWN`, because the hooks get the pwrmgr cap only
 after the rounds return. A `SHUTDOWN` that pwrmgr answers, or whose call fails, is logged and
 leaves the system idle, as on the pass path. A fault in svctest's own process (a stray access,
 a stack overflow) kills it without running either hook, so it logs neither marker.
@@ -99,10 +102,11 @@ The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.de
 skip and return when their cap is zero; the devmgr deny and input-ordinal phases (`caps[2]`), the
 orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`), the svcmgr seed-only
 phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names it resolves), the
-svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), and the vfsd phases (`caps[4]`,
-`caps[5]`) instead fail their assertions. The seed-only phase thus fails the run on a zero
-`caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
-reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
+svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd phases (`caps[4]`, `caps[5]`),
+and the `crash_endpoint` phase (`caps[6]`) instead fail their assertions. The seed-only phase thus
+fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
+zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and
+the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -113,7 +117,8 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 ## Capabilities
 
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, the
-fifth and sixth in a second round;
+fifth and sixth in a second round, and then the debug-authority cap the recipe's
+`debug_authority = yes` grants;
 [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each
 name's cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every
 slot stays zero.
@@ -126,41 +131,41 @@ slot stays zero.
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, driver withdrawal, DMA confinement, drivers deny |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases          |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase                |
+| `caps[6]` | (`debug_authority`) | `crash_endpoint` phase; svctest declares itself undebuggable at startup |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the
 devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`,
-`QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, `TEST_QUERY_DENY_DEVICE`,
-`TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`, `TEST_SPAWN_DMA_DRIVER`,
-`TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS`, and the input-ordinal phase, which requires a cap
-from `QUERY_INPUT_DEVICE` at instance ordinal 0 (sent and absent) and `NO_DEVICE` past the one
-keyboard of every boot's device set. `caps[3]` exists for devmgr's test labels (TODO(#165): retire
-with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim, the driver-withdrawal phase's
-`TEST_SPAWN_FAULT_DRIVERS` and `TEST_QUERY_FAULT_DEVICE` shims, the DMA confinement phase's
-`TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS` shims, and
-`TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a SEND on the serial, input, or
+`QUERY_SHUTDOWN_DEVICE`, `QUERY_DEBUG_PORT_DEVICE`, `TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`,
+`TEST_QUERY_DENY_DEVICE`, `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`,
+`TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS`, and the input-ordinal
+phase, which requires a cap from `QUERY_INPUT_DEVICE` at instance ordinal 0 (sent and absent) and
+`NO_DEVICE` past the one keyboard of every boot's device set. `caps[3]` exists for devmgr's test
+labels (TODO(#165): retire with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim, the
+driver-withdrawal phase's `TEST_SPAWN_FAULT_DRIVERS` and `TEST_QUERY_FAULT_DEVICE` shims, the DMA
+confinement phase's `TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS` shims,
+and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a SEND on the serial, input, or
 framebuffer driver's endpoint badged with none of the driver's verb bits. That phase requires an
 `UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and
 `INPUT_READ_EVENTS` (at once, without blocking for a key), and to `FB_WRITE_BYTES` and
 `FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's, devmgr runs none and the
 framebuffer case logs a skip, which the framebuffer device cell
-([docs/testing.md](../../docs/testing.md#coverage-tiers) § Coverage tiers) fails on. The input
-case also logs a skip when `terminal.svc` is staged: the input driver serves one request at a time
-and the terminal keeps a blocking read pending, so the deny would wait behind it for a keypress.
-`caps[4]` and `caps[5]` are SENDs on vfsd's service
-endpoint, badged `MOUNT_AUTHORITY` and the no-authority `DENY_BADGE`
-(services/vfsd/docs/vfs-ipc-interface.md § Endpoint). The vfsd phases require an `UNAUTHORIZED`
-reply to `MOUNT` on `caps[5]` with nothing mounted; a `TABLE_FULL` reply on `caps[4]` to `MOUNT` of
-the root role at `/` and of the data role at `/esp`, both already mounted, in each of six rounds
-(vfsd checks the mount point before it registers a partition or spawns a driver, so a rejection that
-started a spawn first would change a later reply); a `NOT_FOUND` reply to a `MOUNT` whose path
-length exceeds the path bytes it carries; and that the mounted filesystems still answer afterwards.
-The two vfsd seeds ride in a second bootstrap round, so every svctest boot receives a seed list
-longer than one round, and the svcmgr second-seed-round phase fails the run when either arrives
-empty. Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is public,
-so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap` and spends
-no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED` reply to
-`SHUTDOWN`.
+([docs/testing.md](../../docs/testing.md#coverage-tiers) § Coverage tiers) fails on. The input case
+also logs a skip when `terminal.svc` is staged: the input driver serves one request at a time and
+the terminal keeps a blocking read pending, so the deny would wait behind it for a keypress.
+`caps[4]` and `caps[5]` are SENDs on vfsd's service endpoint, badged `MOUNT_AUTHORITY` and the
+no-authority `DENY_BADGE` (services/vfsd/docs/vfs-ipc-interface.md § Endpoint). The vfsd phases
+require an `UNAUTHORIZED` reply to `MOUNT` on `caps[5]` with nothing mounted; a `TABLE_FULL` reply
+on `caps[4]` to `MOUNT` of the root role at `/` and of the data role at `/esp`, both already
+mounted, in each of six rounds (vfsd checks the mount point before it registers a partition or
+spawns a driver, so a rejection that started a spawn first would change a later reply); a
+`NOT_FOUND` reply to a `MOUNT` whose path length exceeds the path bytes it carries; and that the
+mounted filesystems still answer afterwards. The two vfsd seeds ride in a second bootstrap round, so
+every svctest boot receives a seed list longer than one round, and the svcmgr second-seed-round
+phase fails the run when either arrives empty. Every seed is seed-only in svcmgr's registry. The
+no-authority `pwrmgr.deny` cap is public, so svctest resolves it through `QUERY_ENDPOINT` on its
+per-process `service_registry_cap` and spends no seed slot on it; it drives the pwrmgr cap-deny
+phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
 
 ---
 
@@ -195,27 +200,29 @@ spawner tears them down), and an unmatched token falls through to the normal run
 
 Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiotest` (pipes,
 procmgr), `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults), `capexhaust` (recv
-guard), `demandpaged` (pager), and `fsbench` (FS IPC). The devmgr orphan-teardown phase has devmgr
-spawn the [`test-orphan`](../drivers/test-orphan/README.md) driver, and the driver-withdrawal phase
-three [`test-fault`](../drivers/test-fault/README.md) drivers, one of which never reports ready, so
-the phase waits the fault batch's settle bound (`TEST_FAULT_SETTLE_TIMEOUT_MS`, 1 s). The DMA
-confinement phase has devmgr bind QEMU's `edu` device, which xtask attaches on both architectures,
-to the [`test-dma`](../drivers/test-dma/README.md) driver and asks it to probe: a copy through a
-mapped page must arrive, and where an IOMMU confines the device a copy to the page's device address
-after its unmap must not reach the page, and devmgr must have taken an IOMMU fault for the device at
-that address. The phase asks devmgr for the device's faults (`TEST_DMA_FAULTS`) once, then again
-every 10 ms until it reports one, at most 300 times more (3 s, `FAULT_RECORD_POLLS`), so a fault the
-IOMMU reports to its driver after the probe's reply still counts; a missing fault fails only at that
-bound. Without
-an IOMMU it checks the mapped copies only, and a machine without the device skips it. The
-`fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
+guard), `demandpaged` (pager), `fsbench` (FS IPC), and `crashme` (crash endpoint: svctest, its
+recipe granting `debug_authority`, registers as the crash service and takes a `crashme` child's
+forwarded page fault, then gives the endpoint back and sees a second child declined by procmgr). The
+devmgr orphan-teardown phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md)
+driver, and the driver-withdrawal phase three [`test-fault`](../drivers/test-fault/README.md)
+drivers, one of which never reports ready, so the phase waits the fault batch's settle bound
+(`TEST_FAULT_SETTLE_TIMEOUT_MS`, 1 s). The DMA confinement phase has devmgr bind QEMU's `edu`
+device, which xtask attaches on both architectures, to the
+[`test-dma`](../drivers/test-dma/README.md) driver and asks it to probe: a copy through a mapped
+page must arrive, and where an IOMMU confines the device a copy to the page's device address after
+its unmap must not reach the page, and devmgr must have taken an IOMMU fault for the device at that
+address. The phase asks devmgr for the device's faults (`TEST_DMA_FAULTS`) once, then again every 10
+ms until it reports one, at most 300 times more (3 s, `FAULT_RECORD_POLLS`), so a fault the IOMMU
+reports to its driver after the probe's reply still counts; a missing fault fails only at that
+bound. Without an IOMMU it checks the mapped copies only, and a machine without the device skips it.
+The `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
 with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS phases
 also read the build-synthesised `/data/svctest/large.bin` and write their scratch files under
-`/data/svctest/`; `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
-build-synthesised `/data/svctest/bench.bin`, which the `fs_eviction_routes_release_to_its_open`
-phase also holds open. The sysroot placement of all of these is listed in
-[docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
+`/data/svctest/`; `fsbench`, spawned by the `fs_crossover_bench` phase, reads the build-synthesised
+`/data/svctest/bench.bin`, which the `fs_eviction_routes_release_to_its_open` phase also holds open.
+The sysroot placement of all of these is listed in [docs/testing.md § Sysroot
+layout](../../docs/testing.md#sysroot-layout).
 
 ---
 

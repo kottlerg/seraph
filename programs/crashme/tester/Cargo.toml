@@ -1,0 +1,13 @@
+[package]
+name = "crashme-tester"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "crashme-tester"
+path = "src/main.rs"
+test = false
+
+[lints]
+workspace = true

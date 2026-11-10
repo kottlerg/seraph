@@ -81,7 +81,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 9;
+pub const PROCMGR_LABELS_VERSION: u32 = 10;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -441,6 +441,63 @@ pub mod procmgr_labels
     /// word after the count.
     pub const LIVE_PROCESSES_PAGE: usize = super::MSG_DATA_WORDS_MAX - 1;
 
+    /// Register the caller as the crash service: the receiver of procmgr's
+    /// crash endpoint, which procmgr binds the exception class of every
+    /// process it creates to, badged with its process badge, until the
+    /// process sends [`DECLARE_NO_DEBUG`]. Served only on a badge carrying
+    /// [`DEBUG_AUTHORITY`]
+    /// (`UNAUTHORIZED` otherwise). Caps: `[thread]`, a Thread cap of the
+    /// service's main thread, which procmgr keeps to tell when the service is
+    /// gone and take the receive side back. Replies `SUCCESS` with
+    /// one cap, `RECV` on the crash endpoint; `CRASH_SERVICE_PRESENT` while a
+    /// registered service lives; `INVALID_ARGUMENT` without the thread cap
+    /// or with no crash endpoint; `OUT_OF_MEMORY` when the `RECV` cap cannot
+    /// be derived or the decliner cannot be parked. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `REGISTER_CRASH_SERVICE`.
+    pub const REGISTER_CRASH_SERVICE: u64 = 19;
+
+    /// Attach to a process: the Thread caps procmgr holds for it, each with
+    /// `OBSERVE`, `CONTROL`, and `UPCALL`, and where its image lies. Served
+    /// only on a badge carrying [`DEBUG_AUTHORITY`] (`UNAUTHORIZED`
+    /// otherwise). `data[0]` is the target's process badge and `data[1]` the
+    /// index of the first thread to return. Replies `SUCCESS` with
+    /// `data[0]` the number of threads procmgr holds for the target,
+    /// `data[1]` its load bias, `data[2]`/`data[3]` the start and end of its
+    /// biased text, and `data[4]` the address of its `ProcessInfo` page, and
+    /// with the caps of threads `data[1]..` of the request, at most
+    /// [`ATTACH_THREADS_PAGE`]; `INVALID_BADGE` when no live process carries
+    /// the badge (memmgr and procmgr, which procmgr did not create, among
+    /// them); `NOT_ATTACHABLE` when the target sent [`DECLARE_NO_DEBUG`].
+    /// Specified in `services/procmgr/docs/ipc-interface.md`
+    /// § `ATTACH_PROCESS`.
+    pub const ATTACH_PROCESS: u64 = 20;
+
+    /// The caller declares itself undebuggable, on its own procmgr cap (its
+    /// process badge names it): procmgr unbinds its main thread's exception
+    /// class from the crash endpoint and refuses [`ATTACH_PROCESS`] on it
+    /// from then on, so no [`DEBUG_AUTHORITY`] holder stops it. Sent, before
+    /// it spawns a thread, by each process a stop of which would deadlock a
+    /// debug-authority holder: the log sink, the serial and framebuffer
+    /// drivers, and every debug-authority holder. No data, no caps. Replies `SUCCESS`, or
+    /// `INVALID_BADGE` when the badge names no live process. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_DEBUG`.
+    pub const DECLARE_NO_DEBUG: u64 = 21;
+
+    /// Thread caps one [`ATTACH_PROCESS`] reply carries at most.
+    pub const ATTACH_THREADS_PAGE: usize = super::MSG_CAP_SLOTS_MAX;
+
+    /// Badge bit on procmgr service caps that authorises
+    /// [`REGISTER_CRASH_SERVICE`] and [`ATTACH_PROCESS`]. svcmgr mints it for
+    /// a service whose definition sets `debug_authority = yes`; no other
+    /// path mints it. Who holds it is in
+    /// `services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`.
+    pub const DEBUG_AUTHORITY: u64 = 1u64 << 60;
+    const _: () = core::assert!(
+        DEBUG_AUTHORITY & crate::VERB_BIT_MASK != 0
+            && DEBUG_AUTHORITY != DEATH_EQ_AUTHORITY
+            && DEBUG_AUTHORITY != HOLD_RELEASE_AUTHORITY
+    );
+
     /// Hand init's kernel-object caps and reclaimable Memory caps to
     /// procmgr for the reap after init exits; init calls it on its exit
     /// path, then `sys_thread_exit`s. The rounds, the death-EQ binding on
@@ -499,11 +556,11 @@ pub mod procmgr_labels
 /// | 28 | memmgr |
 /// | 27 | procmgr |
 /// | 26 | init-logd, serial, virtio-blk, devmgr's DMA thread |
-/// | 25 | framebuffer, rtc, virtio-input |
+/// | 25 | framebuffer, rtc, virtio-input, virtio-console |
 /// | 24 | devmgr, every thread but its DMA thread |
 /// | 23 | vfsd, fs drivers (fatfs) |
 /// | 21 | svcmgr |
-/// | ≤21 | svcmgr-launched services, per `.svc` recipe (logd 18, timed/pwrmgr 16, terminal/svctest/usertest 10, crasher 5), and what they spawn (the shell, at 5 from terminal) |
+/// | ≤21 | svcmgr-launched services, per `.svc` recipe (crashd 20, logd 18, timed/pwrmgr 16, terminal/svctest/usertest 10, crasher 5), and what they spawn (the shell, at 5 from terminal) |
 ///
 /// Levels for svcmgr-launched services live in their `.svc` recipes
 /// (`priority = ...` / `sched_max = ...`), not here — this module carries
@@ -542,7 +599,8 @@ pub mod sched_policy
     /// virtio-blk blocks on for every transfer.
     pub const BOOT_DRIVER_PRIORITY: u8 = 26;
 
-    /// Non-boot-critical device drivers: framebuffer, RTC, virtio-input.
+    /// Non-boot-critical device drivers: framebuffer, RTC, virtio-input, and
+    /// the debug port's virtio-console.
     pub const AUX_DRIVER_PRIORITY: u8 = 25;
 
     /// devmgr — device enumeration and driver supervision.
@@ -1051,7 +1109,7 @@ pub mod svcmgr_labels
     /// [`PUBLISH_ENDPOINT`] by an *external* publisher (no per-publisher
     /// identity in the low bits today — server-side auth is binary: have
     /// the bit, or don't). svcmgr publishes the well-known names it owns
-    /// (`rootfs.root`, `svcmgr`, the three `devmgr.*` names, the two
+    /// (`rootfs.root`, `svcmgr`, the four `devmgr.*` names, the two
     /// `vfsd.*` names, and each provider's `provides` names) directly into
     /// its own registry, so those
     /// need no badge. The gate exists for a future external publisher — devmgr
@@ -1091,7 +1149,7 @@ pub mod svcmgr_labels
 /// derivation, not the published name nor any consumer.
 ///
 /// A name whose cap carries authority is seed-only: `rootfs.root`, the
-/// three `devmgr.*` names, [`published_names::VFSD_MOUNT`], and each provider
+/// four `devmgr.*` names, [`published_names::VFSD_MOUNT`], and each provider
 /// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
 /// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
 /// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`.
@@ -1149,6 +1207,13 @@ pub mod published_names
     /// `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` fault-injection shim and
     /// `TEST_QUERY_DENY_DEVICE`. Seed-only and seeded only by svctest.
     pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
+
+    /// SEND on devmgr's registry endpoint badged
+    /// `REGISTRY_QUERY_AUTHORITY | DEBUG_PORT_AUTHORITY`: the
+    /// `devmgr.registry` surface plus `QUERY_DEBUG_PORT_DEVICE`, the debug
+    /// port. Seed-only; seeded only by the services that own the debug port
+    /// on a boot that stages them.
+    pub const DEVMGR_DEBUG: &[u8] = b"devmgr.debug";
 
     /// SEND on vfsd's service endpoint badged
     /// `vfsd_labels::MOUNT_AUTHORITY` alone: the `MOUNT` surface, without
@@ -1646,7 +1711,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 14;
+pub const DEVMGR_LABELS_VERSION: u32 = 15;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1762,8 +1827,8 @@ pub mod devmgr_labels
     /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
     /// work, so svcmgr never blocks on driver bring-up. The actual walk,
     /// the [`super::procmgr_labels::CREATE_FROM_FILE`] call, and the
-    /// bootstrap-round delivery for the on-disk drivers (the per-arch RTC
-    /// and virtio-input; #165 will generalize), and the settle that waits
+    /// bootstrap-round delivery for the on-disk drivers (the per-arch RTC,
+    /// virtio-input, and virtio-console; #165 will generalize), and the settle that waits
     /// for each of them to report ready ([`DRIVER_READY`]), run after the
     /// reply but before devmgr returns to its next `ipc_recv`. The nested
     /// IPC chain the spawn requires (procmgr → vfsd → block driver) cannot
@@ -1873,6 +1938,22 @@ pub mod devmgr_labels
     /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test
     /// labels below.
     pub const QUERY_INPUT_DEVICE: u64 = 11;
+    /// Query for the debug port: the byte transport a debugger stub speaks
+    /// to a host debugger over, apart from the console's UART.
+    ///
+    /// Mints a `serial_labels::WRITE_AUTHORITY | serial_labels::READ_AUTHORITY`-badged
+    /// `SEND_GRANT` cap on the debug port driver's service endpoint, which
+    /// serves the `serial_labels` protocol. The driver is the virtio-console
+    /// driver, spawned for the first `VirtIO` console device devmgr
+    /// enumerates; a boot whose machine presents none has no debug port.
+    /// Caller's badge must have [`DEBUG_PORT_AUTHORITY`] set; the handler
+    /// replies `UNAUTHORIZED` otherwise. Like [`QUERY_INPUT_DEVICE`], it
+    /// replies `NO_DEVICE` until the on-disk drivers are spawned and settled,
+    /// and for the rest of the boot when no debug port driver is served;
+    /// `WITHDRAWN` once the served driver has died; `INVALID_REQUEST` when the
+    /// derivation fails. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`].
+    pub const QUERY_DEBUG_PORT_DEVICE: u64 = 19;
 
     /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
     /// label: trigger devmgr's spawn-orphan fault-injection shim (#176). The
@@ -1994,7 +2075,7 @@ pub mod devmgr_labels
     /// entering its service loop, so devmgr may serve its endpoint.
     ///
     /// Sent by every driver devmgr spawns (the `VirtIO` PCI drivers
-    /// virtio-blk and virtio-input, and the serial, framebuffer, and RTC
+    /// virtio-blk, virtio-input, and virtio-console, and the serial, framebuffer, and RTC
     /// drivers) on its round-2 devmgr query cap, a SEND badged with its
     /// device badge on the private driver endpoint of its spawn batch; the
     /// registry endpoint replies `UNKNOWN_OPCODE` to it. Request: `data[0]` =
@@ -2050,6 +2131,13 @@ pub mod devmgr_labels
     /// `MOUNT_AUTHORITY` caps with the one consumer devmgr authorises.
     /// Disjoint position from the other authority bits.
     pub const BLOCK_DEVICE_AUTHORITY: u64 = 1u64 << 59;
+    /// Authority bit gating [`QUERY_DEBUG_PORT_DEVICE`], whose reply reads and
+    /// writes the debug port. svcmgr mints it, beside
+    /// [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
+    /// seed-only as [`crate::published_names::DEVMGR_DEBUG`], so only a
+    /// service whose definition seeds that name holds the bit. Disjoint
+    /// position from the other authority bits.
+    pub const DEBUG_PORT_AUTHORITY: u64 = 1u64 << 58;
 }
 
 /// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_FAULT_DRIVERS`. The
@@ -2519,21 +2607,23 @@ pub mod blk_labels
 /// Wire-protocol version of [`serial_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
 pub const SERIAL_LABELS_VERSION: u32 = 2;
-/// IPC labels for the serial (UART) device driver (`services/drivers/serial`).
+/// IPC labels of the serial protocol: byte write, byte read, and RX-notify
+/// registration on a byte transport.
 ///
-/// The driver answers byte write, byte read, and RX-notify registration. It
+/// Two drivers serve it. The serial (UART) driver (`services/drivers/serial`)
 /// owns the platform UART hardware authority (an `IoPort` for COM1 on x86-64,
 /// an `Mmio` for the QEMU `virt` NS16550 at its platform-static address on
-/// RISC-V) and is the sole
-/// driver-mediated path for userspace serial bytes in both directions. devmgr
-/// spawns it and hands clients a cap badged with
+/// RISC-V) and is the sole driver-mediated path for userspace console serial
+/// bytes in both directions; devmgr hands clients a cap on it badged with
 /// [`serial_labels::WRITE_AUTHORITY`] | [`serial_labels::READ_AUTHORITY`] via
-/// [`devmgr_labels::QUERY_SERIAL_DEVICE`]. Line-control and flow-control
+/// [`devmgr_labels::QUERY_SERIAL_DEVICE`]. The virtio-console driver
+/// (`services/drivers/virtio/console`) serves the debug port, handed out the
+/// same way via [`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`]. Line-control and flow-control
 /// surfaces are planned but unimplemented (see the driver `README.md`); they
 /// are not on the wire.
 pub mod serial_labels
 {
-    /// Write bytes to the UART.
+    /// Write bytes to the transport (the UART, or the debug port).
     ///
     /// Wire format mirrors [`stream_labels::STREAM_BYTES`]: the payload byte
     /// length rides bits 16-31 of the label, the bytes are packed via
@@ -2549,7 +2639,8 @@ pub mod serial_labels
     /// longer write over more calls.
     pub const SERIAL_WRITE_BYTES: u64 = 1;
 
-    /// Read the bytes currently available in the UART receive FIFO.
+    /// Read the bytes currently received: the UART receive FIFO, or the debug
+    /// port's received bytes.
     ///
     /// Non-blocking: the driver drains whatever is ready and replies at once,
     /// possibly with zero bytes. Callers that want to sleep until input arrives
@@ -2566,26 +2657,31 @@ pub mod serial_labels
     /// Register a notification kicked when receive data becomes ready.
     ///
     /// Request: the client's notification cap in cap slot 0; the caller's badge
-    /// must carry [`READ_AUTHORITY`]. The driver binds the UART interrupt to
-    /// that notification and arms it. The IRQ is masked on each fire and
-    /// re-armed by the next [`SERIAL_READ_BYTES`], so a client loops: drain
-    /// with `SERIAL_READ_BYTES`, then wait on its notification (with a bounded
-    /// timeout — the driver registers the x86 UART line edge-triggered (mode
-    /// 0), so a byte racing the re-arm is recovered by the timeout-driven
-    /// re-drain). Reply: empty body, status
-    /// in the reply label ([`super::serial_errors::REGISTER_FAILED`] if the
-    /// driver holds no IRQ cap or the binding fails).
+    /// must carry [`READ_AUTHORITY`]. The serial (UART) driver binds the UART
+    /// interrupt to that notification and arms it; the IRQ is masked on each
+    /// fire and re-armed by the next [`SERIAL_READ_BYTES`]. The virtio-console
+    /// driver instead signals the notification from its interrupt-service
+    /// thread on each interrupt of its device. Either way a client loops:
+    /// drain with `SERIAL_READ_BYTES`, then wait on its notification with a
+    /// bounded timeout, so a byte racing the re-arm (the serial driver
+    /// registers the x86 UART line edge-triggered, mode 0) or a lost
+    /// interrupt is recovered by the timeout-driven re-drain. Reply: empty
+    /// body, status in the reply label
+    /// ([`super::serial_errors::REGISTER_FAILED`] if the driver holds no IRQ
+    /// cap or the binding fails).
     pub const SERIAL_REGISTER_RX_NOTIFY: u64 = 3;
 
     /// Authority bit in the serial-service-endpoint badge's high u64 bit.
     /// Set on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_SERIAL_DEVICE`]; gates [`SERIAL_WRITE_BYTES`].
+    /// [`devmgr_labels::QUERY_SERIAL_DEVICE`] and
+    /// [`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`]; gates [`SERIAL_WRITE_BYTES`].
     /// A verb ("may write"), not an identity.
     pub const WRITE_AUTHORITY: u64 = 1u64 << 63;
 
     /// Authority bit gating [`SERIAL_READ_BYTES`] and
     /// [`SERIAL_REGISTER_RX_NOTIFY`]. Set alongside [`WRITE_AUTHORITY`] on caps
-    /// devmgr mints for [`devmgr_labels::QUERY_SERIAL_DEVICE`]. A verb ("may
+    /// devmgr mints for [`devmgr_labels::QUERY_SERIAL_DEVICE`] and
+    /// [`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`]. A verb ("may
     /// read"), not an identity.
     pub const READ_AUTHORITY: u64 = 1u64 << 62;
 }
@@ -2601,8 +2697,9 @@ pub mod serial_errors
     /// `SERIAL_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
-    /// `SERIAL_REGISTER_RX_NOTIFY` could not bind the UART interrupt: the
-    /// driver holds no IRQ cap, or no notification cap was supplied.
+    /// `SERIAL_REGISTER_RX_NOTIFY` could not arrange for the notification to
+    /// be signalled: the driver holds no IRQ cap, no notification cap was
+    /// supplied, or the binding failed.
     pub const REGISTER_FAILED: u64 = 4;
     /// Caller's badge lacks the verb bit gating the requested label
     /// ([`super::serial_labels::WRITE_AUTHORITY`] for writes,
@@ -2892,9 +2989,10 @@ pub mod stream_labels
 /// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
 /// reserve them.
 pub const VERB_BIT_MASK: u64 =
-    (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59);
+    (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59) | (1u64 << 58);
 const _: () = core::assert!(
     devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::DEBUG_PORT_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::TEST_LABEL_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::BLOCK_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
@@ -3087,6 +3185,12 @@ pub mod procmgr_errors
     /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
     /// (**argv and env**).
     pub const ARGV_ENV_STILL_MAPPED: u64 = 14;
+    /// `procmgr_labels::ATTACH_PROCESS` refused: the target declared itself
+    /// undebuggable (`procmgr_labels::DECLARE_NO_DEBUG`).
+    pub const NOT_ATTACHABLE: u64 = 15;
+    /// `procmgr_labels::REGISTER_CRASH_SERVICE` refused: a registered crash
+    /// service still lives.
+    pub const CRASH_SERVICE_PRESENT: u64 = 16;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }

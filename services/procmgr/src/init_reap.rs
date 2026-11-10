@@ -32,8 +32,9 @@
 //! `do_reap` tears init's objects down in the order
 //! `docs/process-lifecycle.md` § Init reap specifies.
 
-// Procmgr runs single-threaded under its lone `service_ep` recv loop;
-// the `Mutex` here is only the `Sync` shell required for a `static`.
+// Procmgr's dispatch runs single-threaded under its lone `service_ep` recv
+// loop, the only thread that reaches this state (its crash decliner never
+// does); the `Mutex` here is only the `Sync` shell required for a `static`.
 // `expect` on `.lock()` therefore cannot fire in practice (no contention
 // → no poisoning), and a Vec inside the state avoids any unsafe statics.
 #![allow(clippy::expect_used)]

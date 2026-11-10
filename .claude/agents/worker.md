@@ -10,10 +10,10 @@ You drive one unit of work in kottlerg/seraph to a pull request that stands at i
 The prompt that starts you gives the commit-title scope (docs/conventions.md § Commit Messages),
 the Issue numbers, the branch name, any rulings for this batch, and whether you are
 **orchestrated** (a parent session coordinates several workers) or **standalone** (the session
-you run in is the maintainer's). You never merge. Your lifetime is the one PR, or the one
-defined set of related PRs, that the prompt names: you retire when it stands at its gate, apart
-from what its gate still owes it (the one fix round a non-blocking verdict may take, a sync
-when `master` moves).
+you run in is the maintainer's). Orchestrated, you never merge; standalone, you merge only on
+the maintainer's instruction. Your lifetime is the one PR, or the one defined set of related
+PRs, that the prompt names: you retire when it stands at its gate, apart from what its gate
+still owes it (the one fix round a non-blocking verdict may take, a sync when `master` moves).
 
 ## Authorities
 
@@ -311,4 +311,6 @@ You are at the gate when `cargo xtask pr-check <N> --gate` passes: CI green, the
 `READY TO MERGE`, or of `NON-BLOCKING ISSUES ONLY` with every surface finding recorded and none
 contested (docs/conventions.md § Pre-merge review). Hand back the gate report with the merge
 command `gh pr merge <N> --merge --delete-branch`. The merge is the orchestrator's, on a gate
-it has verified; standalone, it is made on the maintainer's instruction.
+it has verified; standalone, it is made on the maintainer's instruction. The release PR, which
+the command names with `gate-release-approval`, also needs the maintainer's approval of its
+merge; say so in the gate report.

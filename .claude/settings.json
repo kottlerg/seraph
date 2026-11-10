@@ -20,10 +20,34 @@
             "Bash(gh run list *)",
 
             "Bash(git checkout -b *)"
+        ],
+        "deny": [
+            "Bash(cargo build *)",
+            "Bash(cargo b *)",
+            "Bash(cargo run *)",
+            "Bash(cargo r *)",
+            "Bash(cargo test *)",
+            "Bash(cargo t *)",
+            "Bash(cargo clippy *)",
+            "Bash(cargo check *)",
+            "Bash(cargo c *)",
+            "Bash(cargo bench *)",
+            "Bash(cargo doc *)",
+            "Bash(cargo d *)",
+            "Bash(cargo clean *)",
+            "Bash(cargo install *)",
+            "Bash(cargo uninstall *)",
+            "Bash(cargo fix *)",
+            "Bash(cargo rustc *)",
+            "Bash(cargo rustdoc *)",
+            "Bash(cargo miri *)",
+            "Bash(cargo add *)",
+            "Bash(cargo remove *)",
+            "Bash(cargo update *)",
+            "Bash(cargo publish *)",
+            "Bash(git commit --no-verify *)",
+            "Bash(git commit -n *)"
         ]
-    },
-    "enabledPlugins": {
-        "rust-analyzer-lsp@claude-plugins-official": true
     },
     "showThinkingSummaries": true,
     "outputStyle": "Focused",
@@ -32,5 +56,79 @@
         "commit": "",
         "pr": "",
         "sessionUrl": false
+    },
+    "includeGitInstructions": false,
+    "enableArtifact": false,
+    "disableClaudeAiConnectors": true,
+    "skillOverrides": {
+        "dataviz": "off",
+        "artifact-design": "off",
+        "artifact-diagramming": "off",
+        "artifact-capabilities": "off",
+        "keybindings-help": "off",
+        "schedule": "off",
+        "run": "off",
+        "plugin-authoring": "off",
+        "claude-api": "off",
+        "code-review": "off",
+        "simplify": "off",
+        "security-review": "off",
+        "init": "off"
+    },
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "if": "Bash(cargo *)",
+                        "command": "cargo xtask hook bash || true"
+                    },
+                    {
+                        "type": "command",
+                        "if": "Bash(gh pr merge *)",
+                        "command": "cargo xtask hook bash || true"
+                    },
+                    {
+                        "type": "command",
+                        "if": "Bash(gh issue create *)",
+                        "command": "cargo xtask hook bash || true"
+                    }
+                ]
+            }
+        ],
+        "SubagentStop": [
+            {
+                "matcher": "worker",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "cargo xtask hook subagent-stop || true"
+                    }
+                ]
+            }
+        ],
+        "SessionStart": [
+            {
+                "matcher": "compact",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "cargo xtask hook compact-start || true"
+                    }
+                ]
+            }
+        ],
+        "PreCompact": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "cargo xtask hook pre-compact || true"
+                    }
+                ]
+            }
+        ]
     }
 }

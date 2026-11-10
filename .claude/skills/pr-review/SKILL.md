@@ -123,8 +123,9 @@ reviewer.
 
 The PR meets the merge condition of docs/conventions.md § Pre-merge review when
 `cargo xtask pr-check <N> --gate` passes. After a `NON-BLOCKING ISSUES ONLY` run, read its
-warning and confirm that each finding it counts is recorded and none is contested. A worker
-then hands its gate report to the orchestrator, which verifies the gate and merges. A
-standalone session tells the maintainer that the PR meets the condition and merges on their
-instruction. The merge command is `gh pr merge <N> --merge --delete-branch`
-(docs/conventions.md § Merge method).
+warning and confirm that each finding it counts is recorded and none is contested. For the
+release PR the command prints `gate-release-approval`: that PR meets the condition only once the
+maintainer has approved its merge. A worker then hands its gate report to the orchestrator,
+which verifies the gate and merges. A standalone session tells the maintainer that the PR meets
+the condition and merges on their instruction. The merge command is
+`gh pr merge <N> --merge --delete-branch` (docs/conventions.md § Merge method).

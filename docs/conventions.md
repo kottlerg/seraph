@@ -132,9 +132,10 @@ milestone; milestones are assigned to Issues only.
   `## Acceptance` MUST be flipped to `- [x]`. An unticked box at close indicates either incomplete
   work or stale criteria; one of the two MUST be reconciled — finish the work, or edit the Issue to
   drop the obsolete criterion with a one-line rationale in the closing comment.
-- Updating the Issue body is `gh issue edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI. PRs
-  that close Issues SHOULD include the tick-through edit in the same merge action — the closing
-  comment on the Issue MAY also confirm "all acceptance criteria met".
+- Updating the Issue body is `cargo xtask issue-edit <N> --body-file <file>`, which refuses a
+  body that lost items and keeps a backup, or the web UI. PRs that close Issues SHOULD include
+  the tick-through edit in the same merge action — the closing comment on the Issue MAY also
+  confirm "all acceptance criteria met".
 - This rule retro-applies: existing closed Issues with unticked boxes MAY be left alone, but no new
   Issue MAY close with unticked acceptance criteria.
 
@@ -257,17 +258,17 @@ with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
   it.
 
 A PR MUST NOT merge before it meets the merge condition. `cargo xtask pr-check <N> --gate`
-checks the part of the condition a script can decide and names the rest for its reader. In an
-orchestrated batch the orchestrator merges a PR that meets it, with no further decision of the
-maintainer. A session working alone with the maintainer reports that the PR meets the
-condition, and the maintainer's instruction to merge is the one decision left. Two things need
-the maintainer's approval whatever the gate says. A change to `.claude/CLAUDE.md`, to the
-assistant's settings, or to its hooks is applied only on the maintainer's own word. In
-§ Release Production the merge of the release PR (step 3), the tag (step 5), the publishing of
-the Release (step 7), and the milestone work of step 8 each need the maintainer's approval of
-that step, and the release PR does not meet the merge condition before its merge is approved.
-Who carries an approved step out is not fixed: the orchestrator of the batch or a session
-does, or the maintainer.
+checks the part of the condition a script can decide and names the rest for its reader, the
+release PR's need of an approval included. In an orchestrated batch the orchestrator merges a PR
+that meets it, with no further decision of the maintainer. A session working alone with the
+maintainer reports that the PR meets the condition, and the maintainer's instruction to merge is
+the one decision left. Two things need the maintainer's approval whatever the gate says. A
+change to `.claude/CLAUDE.md`, to the assistant's settings, or to its hooks is applied only on
+the maintainer's own word. In § Release Production the merge of the release PR (step 3), the tag
+(step 5), the publishing of the Release (step 7), and the milestone work of step 8 each need the
+maintainer's approval of that step, and the release PR does not meet the merge condition before
+its merge is approved. Who carries an approved step out is not fixed: the orchestrator of the
+batch or a session does, or the maintainer.
 
 Every finding a run counts is fixed or recorded as the subsections below say. A finding MUST NOT
 be waived or ruled outside the standards.
@@ -481,7 +482,7 @@ gives the PR-level linear view.
 - Before merge, every `- [ ]` in the PR body MUST be `- [x]` or removed
   with a one-line rationale in the same edit. Same shape as the Issue
   acceptance rule under "Backlog Tracking" above.
-- Edit via `gh pr edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI.
+- Edit via `gh pr edit <N> --body-file <file>` or the web UI.
 - Every PR body MUST state the validated head in its `## Validation`
   section; for a documentation-only or comment-only delta since that head,
   it MUST say so (see [testing.md](testing.md#coverage-tiers)), and for a

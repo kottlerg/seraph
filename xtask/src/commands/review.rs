@@ -582,8 +582,9 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
         )];
     }
     // An audit that completes a run of the reviewer alone judges that run:
-    // its verdict and its findings are the run's as much as the audit's, so
-    // a blocking verdict of the run blocks whatever the audit record states.
+    // its verdict, its failed agents and its findings are the run's as much
+    // as the audit's, so a failed agent or a blocking verdict of the run
+    // blocks whatever the audit record states.
     let completed = completed_run(&runs);
     if let Some((run_name, run)) = completed
         && !(verdict_passes(run) && run["stats"]["failed"].as_array().is_some_and(Vec::is_empty))

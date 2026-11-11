@@ -46,7 +46,9 @@ While the PR body's `## Validation` section reports a run as pending, make the r
 alone. Once the runs are reported, the audit is owed. When a fix round has moved the head, it
 runs with the next run. When the head is the one the reviewer reviewed, run `pr-auditor` alone
 on it as the audit that completes that run, not as the auditor-only run below: give it the path
-of the reviewer-alone record, and save it as an `audit` record.
+of the reviewer-alone record, and save it as an `audit` record. A re-audit after such an audit
+failed completes the same run: run and save it the same way, with the same reviewer-alone
+record.
 
 When docs/conventions.md § Auditor-only run allows it, the next run may be `pr-auditor` alone.
 Tell it that it is that run, and give it the PR number, the `since` head, the path of the last
@@ -57,8 +59,8 @@ reviewer run's record, the fixes the round claims, and the open Issue list.
 Save both agents' prose as `target/xtask/review/pr<N>/<mode>-<head>.md` and the run record as
 `<mode>-<head>.json` beside it. `<mode>` is `full` for the first run, `delta` for a later run
 with the reviewer, and `audit` for an auditor-only run, the audit that completes a run of the
-reviewer alone, or a re-audit; a further run at the same
-head takes the suffix `-<n>`, counting from 2. `xtask/README.md` § `cargo xtask review-check`
+reviewer alone (a re-audit after it included), or a re-audit; a further run at the same head
+takes the suffix `-<n>`, counting from 2. `xtask/README.md` § `cargo xtask review-check`
 defines the record. Six points it leaves to you:
 
 - `stats.form` is `defects`, and each finding carries `file`, `line`, `status`, `issue`,

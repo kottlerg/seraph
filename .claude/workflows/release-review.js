@@ -17,9 +17,9 @@
 // PR), and each unit's files. Review runs one `pr-reviewer` per shard of the
 // code files two or more units touched (no other code file is reviewed line by
 // line), one lens over every Markdown document and instruction file the range
-// touched, and the whole-range lenses, in parallel. Verify puts every defect that can
-// block (one no open Issue names) to two independent refuters as soon as its
-// reviewer completes; the reality refuter also judges whether the defect was
+// touched, and the whole-range lenses, in parallel. Verify puts every defect
+// that can block (one no open Issue names) to two independent refuters as
+// soon as its reviewer completes; the reality refuter also judges whether the defect was
 // already present at the previous release, which sets it apart as predating
 // the range. A defect an open Issue names is a known issue and takes no
 // refuters. Audit runs the `release-auditor` with the known-issue candidates.

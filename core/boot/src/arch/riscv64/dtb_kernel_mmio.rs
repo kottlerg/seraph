@@ -7,7 +7,9 @@
 //!
 //! Walks an FDT blob for compatible matches and writes first-match
 //! values into [`KernelMmio::plic_base`] / `plic_size` / `plic_ndev` and
-//! [`KernelMmio::uart_base`] / `uart_size`, and fills the non-MMIO hart
+//! [`KernelMmio::uart_base`] / `uart_size`, the supervisor-level AIA
+//! controllers into [`KernelMmio::aplic`] and [`KernelMmio::imsic`], and
+//! fills the non-MMIO hart
 //! facts [`KernelMmio::timebase_freq`] and [`KernelMmio::hart_caps`]
 //! from the `/cpus` nodes. Runs only for fields the caller left zero
 //! (`hart_caps` bits are only ever set), so an earlier ACPI pass's
@@ -26,8 +28,10 @@ use boot_protocol::KernelMmio;
 /// - `sifive,plic-1.0.0` / `riscv,plic0` → `plic_base`, `plic_size`, and
 ///   `plic_ndev` from the node's `riscv,ndev`.
 /// - `ns16550a` → `uart_base`, `uart_size`.
+/// - The supervisor-level `riscv,aplic` and `riscv,imsics` nodes (via
+///   [`crate::dtb::parse_aia`]) → `aplic`, `imsic`.
 /// - `/cpus` nodes → `timebase_freq` and the `HART_CAP_*` bits every
-///   enabled hart advertises (Sstc, Svpbmt, Svinval, Svnapot).
+///   enabled hart advertises (Sstc, Svpbmt, Svinval, Svnapot, Ssaia).
 ///
 /// First match wins (real boards have one PLIC and one primary UART).
 /// A field already populated by a prior pass is left untouched; the
@@ -85,6 +89,20 @@ pub unsafe fn parse_kernel_mmio(dtb_addr: u64, km: &mut KernelMmio)
             }
             km.uart_base == 0
         });
+    }
+
+    if km.aplic.base == 0 || km.imsic.base == 0
+    {
+        // SAFETY: caller guarantees dtb_addr is a valid, identity-mapped DTB.
+        let aia = unsafe { crate::dtb::parse_aia(dtb_addr) };
+        if km.aplic.base == 0
+        {
+            km.aplic = aia.aplic;
+        }
+        if km.imsic.base == 0
+        {
+            km.imsic = aia.imsic;
+        }
     }
 
     // SAFETY: caller guarantees dtb_addr is a valid, identity-mapped DTB.

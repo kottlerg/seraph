@@ -21,30 +21,35 @@
 //! - [`count_aperture_seed`]: count the seeds [`parse_aperture_seed`]
 //!   writes, which sizes the seed buffer.
 //! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
-//!   ECAM + ranges, `virtio,mmio` transports) as seeds for
-//!   [`super::memory_map::derive_mmio_apertures`].
+//!   ECAM + ranges, `virtio,mmio` transports, the supervisor-level APLIC and
+//!   IMSIC) as seeds for [`super::memory_map::derive_mmio_apertures`].
+//! - [`parse_aia`]: find the supervisor-level APLIC domain and IMSIC layout,
+//!   resolving the APLIC's `msi-parent` and each hart's `riscv,cpu-intc`
+//!   phandle in the IMSIC's `interrupts-extended`.
 //! - [`parse_rng_seed`]: extract and scrub the `/chosen/rng-seed` boot-entropy
 //!   fallback.
 //!
 //! The arch-specific `kernel_mmio` extractor for RISC-V (PLIC + UART
-//! from compatible nodes) lives under [`crate::arch::riscv64`] and
+//! from compatible nodes, APLIC + IMSIC from [`parse_aia`]) lives under [`crate::arch::riscv64`] and
 //! consumes the [`Fdt`] surface exposed here.
 
 use crate::bprintln;
 use boot_protocol::riscv_paging::PagingMode;
 use boot_protocol::{
-    HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT, HART_CAP_SVPBMT, MmioAperture,
+    AplicDomain, HART_CAP_SSAIA, HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT,
+    HART_CAP_SVPBMT, ImsicLayout, MmioAperture,
 };
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// ISA-extension names the CPU-node walker recognizes, with the
 /// `hart_caps` bit each one confirms. Shared by the DTB stringlist /
 /// legacy-ISA branches here and the ACPI RHCT ISA-string parser.
-pub(crate) const HART_CAP_NAMES: [(&[u8], u64); 4] = [
+pub(crate) const HART_CAP_NAMES: [(&[u8], u64); 5] = [
     (b"sstc", HART_CAP_SSTC),
     (b"svpbmt", HART_CAP_SVPBMT),
     (b"svinval", HART_CAP_SVINVAL),
     (b"svnapot", HART_CAP_SVNAPOT),
+    (b"ssaia", HART_CAP_SSAIA),
 ];
 
 // ── FDT constants ─────────────────────────────────────────────────────────────
@@ -63,13 +68,14 @@ const FDT_END: u32 = 9;
 
 /// Maximum FDT node nesting depth the walkers track. Device trees in the wild
 /// nest well under it (buses inside buses inside `/soc`); the cost is stack
-/// only, one per-depth state per level, about 6 KiB for `walk_compatible`'s,
+/// only, one per-depth state per level, about 7 KiB for `walk_compatible`'s,
 /// and a deeper node's properties are skipped with a diagnostic.
 const MAX_DEPTH: usize = 32;
 
 /// Maximum `reg` entries (address+size pairs) extracted per node. Only the
-/// first is consumed (aperture seeds, kernel MMIO bases); surplus entries are
-/// dropped with a diagnostic.
+/// first is consumed (aperture seeds, kernel MMIO bases), apart from a
+/// supervisor-level IMSIC's, whose every window holds interrupt files
+/// ([`parse_aia`]); surplus entries are dropped with a diagnostic.
 const MAX_REG_ENTRIES: usize = 8;
 /// Maximum number of `interrupts` values collected per node. No consumer reads
 /// them; surplus values are dropped with a diagnostic.
@@ -123,6 +129,77 @@ pub struct FdtNode
     /// The `riscv,ndev` property (a PLIC's interrupt-source count), or 0
     /// when the node has none.
     pub riscv_ndev: u32,
+    /// The AIA properties of an APLIC or IMSIC node; all zero or `None` on
+    /// any other node.
+    pub aia: AiaProps,
+}
+
+/// The properties of an APLIC (`riscv,aplic`) or IMSIC (`riscv,imsics`) node
+/// the AIA discovery reads ([`parse_aia`]); a property the node lacks reads
+/// as zero, or `None` where the binding gives it a default.
+#[derive(Clone, Copy)]
+pub struct AiaProps
+{
+    /// The node's `phandle`, or 0 when it has none.
+    pub phandle: u32,
+    /// The first cell of `msi-parent` (the IMSIC an APLIC forwards to), or 0.
+    pub msi_parent: u32,
+    /// Where the node's `interrupts-extended` data lies in the struct block,
+    /// as `(offset, length)`; `(0, 0)` when it has none. Read in place, so no
+    /// entry bound applies.
+    pub interrupts_extended: (u32, u32),
+    /// `riscv,num-ids`: the identities each IMSIC file implements.
+    pub num_ids: u32,
+    /// `riscv,num-sources`: the sources an APLIC domain implements.
+    pub num_sources: u32,
+    /// `riscv,guest-index-bits`.
+    pub guest_index_bits: Option<u32>,
+    /// `riscv,hart-index-bits`.
+    pub hart_index_bits: Option<u32>,
+    /// `riscv,group-index-bits`.
+    pub group_index_bits: Option<u32>,
+    /// `riscv,group-index-shift`.
+    pub group_index_shift: Option<u32>,
+}
+
+impl AiaProps
+{
+    const fn new() -> Self
+    {
+        AiaProps {
+            phandle: 0,
+            msi_parent: 0,
+            interrupts_extended: (0, 0),
+            num_ids: 0,
+            num_sources: 0,
+            guest_index_bits: None,
+            hart_index_bits: None,
+            group_index_bits: None,
+            group_index_shift: None,
+        }
+    }
+
+    /// Record `name`'s value `data` when it is one of the properties above;
+    /// `data_off` and `len` locate it in the struct block for the ones read
+    /// in place.
+    fn record(&mut self, name: &[u8], data: &[u8], data_off: u32, len: u32)
+    {
+        let cell = (data.len() >= 4).then(|| read_be32(data));
+        match name
+        {
+            b"phandle" => self.phandle = cell.unwrap_or(0),
+            b"msi-parent" => self.msi_parent = cell.unwrap_or(0),
+            b"interrupts-extended" => self.interrupts_extended = (data_off, len),
+            b"riscv,num-ids" => self.num_ids = cell.unwrap_or(0),
+            b"riscv,num-sources" => self.num_sources = cell.unwrap_or(0),
+            b"riscv,guest-index-bits" => self.guest_index_bits = cell,
+            b"riscv,hart-index-bits" => self.hart_index_bits = cell,
+            b"riscv,group-index-bits" => self.group_index_bits = cell,
+            b"riscv,group-index-shift" => self.group_index_shift = cell,
+            _ =>
+            {}
+        }
+    }
 }
 
 // ── Per-depth traversal state (private) ───────────────────────────────────────
@@ -138,6 +215,7 @@ struct NodeState
     irq_count: usize,
     ranges: (u32, u32),
     riscv_ndev: u32,
+    aia: AiaProps,
 }
 
 impl NodeState
@@ -152,6 +230,7 @@ impl NodeState
             irq_count: 0,
             ranges: (0, 0),
             riscv_ndev: 0,
+            aia: AiaProps::new(),
         }
     }
 }
@@ -372,6 +451,7 @@ impl Fdt
                             irq_count: s.irq_count,
                             ranges: s.ranges,
                             riscv_ndev: s.riscv_ndev,
+                            aia: s.aia,
                         };
                         if !callback(node)
                         {
@@ -460,6 +540,11 @@ impl Fdt
                         // Recorded in place; `Fdt::pci_ranges` reads the
                         // entries, however many the property holds.
                         state.ranges = (data_off, prop_len);
+                    }
+                    else
+                    {
+                        let data = self.struct_slice(data_off, prop_len);
+                        state.aia.record(name, data, data_off, prop_len);
                     }
                 }
                 FDT_NOP =>
@@ -693,6 +778,142 @@ impl Fdt
                         {
                             None
                         };
+                    }
+                }
+                FDT_NOP =>
+                {}
+                // FDT_END = end of struct block; any other token = malformed/unknown.
+                _ => break,
+            }
+        }
+        report_walk_limits(too_deep, false);
+    }
+
+    /// Walk the enabled CPU nodes' interrupt controllers and call
+    /// `callback(phandle, hart_id)` for each: a `riscv,cpu-intc` child, with
+    /// a `phandle`, of a CPU node `walk_cpu_nodes` reports (`compatible =
+    /// "riscv"`, a one-cell `reg`, not `status = "disabled"`).
+    ///
+    /// Relies on the devicetree rule that a node's properties precede its
+    /// child nodes, so the CPU node's own properties are known when its
+    /// controller child closes.
+    ///
+    /// `callback` returns `true` to continue or `false` to stop early.
+    // too_many_lines: DTB traversal state machine; splitting would fragment the
+    // node-tracking logic across functions without meaningful abstraction.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn walk_cpu_intc<F>(&self, mut callback: F)
+    where
+        F: FnMut(u32, u32) -> bool,
+    {
+        #[derive(Clone, Copy)]
+        struct IntcState
+        {
+            is_riscv_cpu: bool,
+            disabled: bool,
+            hart_id: Option<u32>,
+            is_cpu_intc: bool,
+            phandle: u32,
+        }
+        const EMPTY: IntcState = IntcState {
+            is_riscv_cpu: false,
+            disabled: false,
+            hart_id: None,
+            is_cpu_intc: false,
+            phandle: 0,
+        };
+
+        let mut states = [EMPTY; MAX_DEPTH];
+        let mut depth: usize = 0;
+        let mut off: u32 = 0;
+        let mut too_deep = false;
+
+        while let Some(token) = self.read_struct_u32(off)
+        {
+            off += 4;
+            match token
+            {
+                FDT_BEGIN_NODE =>
+                {
+                    if depth < MAX_DEPTH
+                    {
+                        states[depth] = EMPTY;
+                    }
+                    else
+                    {
+                        too_deep = true;
+                    }
+                    depth += 1;
+                    let Some(next) = skip_node_name(self, off)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
+                }
+                FDT_END_NODE =>
+                {
+                    if depth == 0
+                    {
+                        break;
+                    }
+                    depth -= 1;
+                    if depth == 0 || depth >= MAX_DEPTH
+                    {
+                        continue;
+                    }
+                    let s = states[depth];
+                    let cpu = states[depth - 1];
+                    if s.is_cpu_intc
+                        && s.phandle != 0
+                        && cpu.is_riscv_cpu
+                        && !cpu.disabled
+                        && let Some(hart_id) = cpu.hart_id
+                        && !callback(s.phandle, hart_id)
+                    {
+                        break;
+                    }
+                }
+                FDT_PROP =>
+                {
+                    let Some(prop_len) = self.read_struct_u32(off)
+                    else
+                    {
+                        break;
+                    };
+                    off += 4;
+                    let Some(nameoff) = self.read_struct_u32(off)
+                    else
+                    {
+                        break;
+                    };
+                    off += 4;
+                    let data_off = off;
+                    let Some(next) = advance_prop(off, prop_len)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
+
+                    if depth == 0 || depth > MAX_DEPTH
+                    {
+                        continue;
+                    }
+                    let state = &mut states[depth - 1];
+                    let data = self.struct_slice(data_off, prop_len);
+                    match self.string_at(nameoff)
+                    {
+                        b"compatible" =>
+                        {
+                            state.is_riscv_cpu |= prop_contains(data, b"riscv");
+                            state.is_cpu_intc |= prop_contains(data, b"riscv,cpu-intc");
+                        }
+                        b"reg" if data.len() >= 4 => state.hart_id = Some(read_be32(data)),
+                        b"status" => state.disabled |= data.starts_with(b"disabled"),
+                        b"phandle" if data.len() >= 4 => state.phandle = read_be32(data),
+                        _ =>
+                        {}
                     }
                 }
                 FDT_NOP =>
@@ -1052,6 +1273,221 @@ pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Optio
     boot_hart_mode.or(widest)
 }
 
+// ── AIA discovery (APLIC and IMSIC) ──────────────────────────────────────────
+
+/// The supervisor external interrupt (`IRQ_S_EXT`), the hart-local interrupt
+/// a supervisor-level IMSIC's `interrupts-extended` entries name.
+const IRQ_S_EXT: u32 = 9;
+
+/// Size of one `interrupts-extended` entry of an IMSIC node: a hart's
+/// `riscv,cpu-intc` phandle and its one interrupt cell
+/// (`#interrupt-cells = <1>`).
+const INTERRUPTS_EXTENDED_ENTRY_BYTES: usize = 8;
+
+/// Default `riscv,group-index-shift` of the IMSIC binding.
+const IMSIC_DEFAULT_GROUP_SHIFT: u32 = 24;
+
+/// What the DTB reports of the AIA interrupt controllers the supervisor
+/// uses ([`parse_aia`]).
+#[derive(Clone, Copy)]
+pub struct DtbAia
+{
+    /// The APLIC domain that forwards to the supervisor-level IMSIC; zero
+    /// when there is none.
+    pub aplic: AplicDomain,
+    /// The supervisor-level IMSIC layout; zero when there is none, or when
+    /// [`Self::off_layout_hart`] is set.
+    pub imsic: ImsicLayout,
+    /// The supervisor-level IMSIC node's `reg` windows, and how many are
+    /// valid: the aperture seeds of its files.
+    pub imsic_regs: ([(u64, u64); MAX_REG_ENTRIES], usize),
+    /// The hart ID of the first enabled hart whose supervisor-level file is
+    /// missing from the IMSIC, or does not lie at the layout's
+    /// [`ImsicLayout::s_file_address`] for that ID.
+    pub off_layout_hart: Option<u32>,
+}
+
+/// Whether `node`, an IMSIC node, serves supervisor mode: its
+/// `interrupts-extended` names at least one hart and only the supervisor
+/// external interrupt.
+fn is_supervisor_imsic(fdt: &Fdt, node: &FdtNode) -> bool
+{
+    let (off, len) = node.aia.interrupts_extended;
+    let data = fdt.struct_slice(off, len);
+    let entries = data.as_chunks::<INTERRUPTS_EXTENDED_ENTRY_BYTES>().0;
+    !entries.is_empty() && entries.iter().all(|e| read_be32(&e[4..]) == IRQ_S_EXT)
+}
+
+/// The layout the supervisor-level IMSIC `node` states: its first `reg`
+/// base, its identity count, and its index widths, a width it does not state
+/// taking the binding's default (guest and group bits 0, group shift 24, hart
+/// bits the fewest that index every `interrupts-extended` entry). `None`
+/// when the node has no `reg` or a width does not fit its field.
+fn imsic_layout(fdt: &Fdt, node: &FdtNode) -> Option<ImsicLayout>
+{
+    if node.reg_count == 0
+    {
+        return None;
+    }
+    let (off, len) = node.aia.interrupts_extended;
+    let harts = fdt.struct_slice(off, len).len() / INTERRUPTS_EXTENDED_ENTRY_BYTES;
+    // The fewest bits that give each hart an index: ceil(log2(harts)).
+    let default_hart_bits = harts.saturating_sub(1).bit_width();
+    let a = &node.aia;
+    Some(ImsicLayout {
+        base: node.reg_entries[0].0,
+        ids: a.num_ids,
+        guest_index_bits: u8::try_from(a.guest_index_bits.unwrap_or(0)).ok()?,
+        hart_index_bits: u8::try_from(a.hart_index_bits.unwrap_or(default_hart_bits)).ok()?,
+        group_index_bits: u8::try_from(a.group_index_bits.unwrap_or(0)).ok()?,
+        group_index_shift: u8::try_from(a.group_index_shift.unwrap_or(IMSIC_DEFAULT_GROUP_SHIFT))
+            .ok()?,
+    })
+}
+
+/// Address of the file of the `index`-th `interrupts-extended` entry of the
+/// IMSIC `node`: the files lie `stride` bytes apart, filling its `reg`
+/// windows in order. `None` past the last window.
+fn imsic_file_in_regs(node: &FdtNode, mut index: u64, stride: u64) -> Option<u64>
+{
+    for &(base, size) in &node.reg_entries[..node.reg_count]
+    {
+        let files = size / stride;
+        if index < files
+        {
+            return base.checked_add(index * stride);
+        }
+        index -= files;
+    }
+    None
+}
+
+/// The AIA discovery behind [`parse_aia`], over a validated tree.
+fn discover_aia(fdt: &Fdt) -> DtbAia
+{
+    let mut found = DtbAia {
+        aplic: AplicDomain::zero(),
+        imsic: ImsicLayout::zero(),
+        imsic_regs: ([(0, 0); MAX_REG_ENTRIES], 0),
+        off_layout_hart: None,
+    };
+
+    let mut imsic_node: Option<FdtNode> = None;
+    fdt.walk_compatible(b"riscv,imsics", |node| {
+        if is_supervisor_imsic(fdt, &node)
+        {
+            imsic_node = Some(node);
+            return false;
+        }
+        true
+    });
+    let Some(imsic) = imsic_node
+    else
+    {
+        return found;
+    };
+    found.imsic_regs = (imsic.reg_entries, imsic.reg_count);
+
+    if imsic.aia.phandle != 0
+    {
+        fdt.walk_compatible(b"riscv,aplic", |node| {
+            if node.aia.msi_parent == imsic.aia.phandle && node.reg_count > 0
+            {
+                found.aplic = AplicDomain {
+                    base: node.reg_entries[0].0,
+                    size: node.reg_entries[0].1,
+                    sources: u64::from(node.aia.num_sources),
+                };
+                return false;
+            }
+            true
+        });
+    }
+
+    let Some(layout) = imsic_layout(fdt, &imsic)
+    else
+    {
+        return found;
+    };
+    // s_file_address refuses a layout outside the specification's widths, so
+    // the guest bits below are at most 6 once it accepts hart 0.
+    if layout.s_file_address(0).is_none()
+    {
+        return found;
+    }
+    let stride = 1u64 << (12 + u32::from(layout.guest_index_bits));
+    let (ie_off, ie_len) = imsic.aia.interrupts_extended;
+    let entries = fdt
+        .struct_slice(ie_off, ie_len)
+        .as_chunks::<INTERRUPTS_EXTENDED_ENTRY_BYTES>()
+        .0;
+    let mut off_layout = None;
+    fdt.walk_cpu_intc(|phandle, hart_id| {
+        let file = entries
+            .iter()
+            .position(|e| read_be32(e) == phandle)
+            .and_then(|i| imsic_file_in_regs(&imsic, i as u64, stride));
+        if file.is_none() || file != layout.s_file_address(u64::from(hart_id))
+        {
+            off_layout = Some(hart_id);
+            return false;
+        }
+        true
+    });
+    found.off_layout_hart = off_layout;
+    if off_layout.is_none()
+    {
+        found.imsic = layout;
+    }
+    found
+}
+
+/// Find the supervisor's AIA interrupt controllers in the DTB: the IMSIC
+/// node (`riscv,imsics`) whose `interrupts-extended` names only the
+/// supervisor external interrupt, and the APLIC node (`riscv,aplic`) whose
+/// `msi-parent` is that IMSIC. The machine-level IMSIC and APLIC, which the
+/// SBI firmware keeps, are never reported.
+///
+/// The IMSIC layout is reported only when every enabled hart's
+/// `riscv,cpu-intc` appears in the IMSIC's `interrupts-extended` and the file
+/// that position names lies at [`ImsicLayout::s_file_address`] of the hart's
+/// ID; otherwise it is zero and a diagnostic names the first hart that
+/// failed. All zero when the DTB is invalid or names no supervisor IMSIC.
+///
+/// # Safety
+/// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
+#[cfg_attr(
+    all(not(target_arch = "riscv64"), not(test)),
+    expect(
+        dead_code,
+        reason = "the only non-test caller is core/boot/src/arch/riscv64/dtb_kernel_mmio.rs; the \
+                  module is compiled on every arch"
+    )
+)]
+pub unsafe fn parse_aia(dtb_addr: u64) -> DtbAia
+{
+    // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
+    let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
+    else
+    {
+        return DtbAia {
+            aplic: AplicDomain::zero(),
+            imsic: ImsicLayout::zero(),
+            imsic_regs: ([(0, 0); MAX_REG_ENTRIES], 0),
+            off_layout_hart: None,
+        };
+    };
+    let found = discover_aia(&fdt);
+    if let Some(hart) = found.off_layout_hart
+    {
+        bprintln!(
+            "[--------] boot: DTB: IMSIC file of hart {hart} is not at its layout address; IMSIC \
+             not reported"
+        );
+    }
+    found
+}
+
 // ── Aperture seeder ──────────────────────────────────────────────────────────
 
 /// Walk the DTB and collect MMIO extents into `out` for aperture seeding.
@@ -1064,6 +1500,8 @@ pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Optio
 /// - PCI host bridge BAR windows (from the `ranges` property; 32-bit and
 ///   64-bit MMIO spaces).
 /// - Each `virtio,mmio` register window.
+/// - The supervisor-level APLIC domain's window and each `reg` window of its
+///   IMSIC (the nodes [`parse_aia`] selects); never the machine-level ones.
 ///
 /// Callable unconditionally on every supported architecture; a zero
 /// `dtb_addr` (no DTB) is a fast no-op that returns 0. The caller
@@ -1166,6 +1604,22 @@ unsafe fn walk_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> (usize,
         push_first_reg(out, &mut n, &mut found, &node);
         true
     });
+
+    // The supervisor-level AIA controllers: the APLIC domain's window and
+    // each window of its IMSIC's files. The machine-level ones belong to the
+    // SBI firmware and are not seeded.
+    let aia = discover_aia(&fdt);
+    if aia.aplic.size > 0
+    {
+        push_seed(out, &mut n, &mut found, aia.aplic.base, aia.aplic.size);
+    }
+    for &(base, size) in &aia.imsic_regs.0[..aia.imsic_regs.1]
+    {
+        if size > 0
+        {
+            push_seed(out, &mut n, &mut found, base, size);
+        }
+    }
 
     (n, found)
 }
@@ -1792,5 +2246,189 @@ mod tests
         assert_eq!(out, [0xABu8; 32]);
         // The whole 48-byte property is scrubbed, not just the copied prefix.
         assert!(blob.windows(48).all(|w| w != seed));
+    }
+
+    /// The DTB QEMU 11.1 `virt` builds with `aia=aplic-imsic` and 4 harts in
+    /// one socket (`dumpdtb`, its `rng-seed` zeroed): machine- and
+    /// supervisor-level IMSICs at `0x2400_0000` and `0x2800_0000`, and
+    /// APLICs at `0xc00_0000` and `0xd00_0000`.
+    const QEMU_VIRT_AIA_DTB: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/qemu-virt-aia-smp4.dtb"
+    ));
+
+    fn aia(blob: &[u8]) -> DtbAia
+    {
+        // SAFETY: blob is a valid in-memory FDT.
+        unsafe { parse_aia(blob.as_ptr() as u64) }
+    }
+
+    fn seeds(blob: &[u8]) -> Vec<(u64, u64)>
+    {
+        let addr = blob.as_ptr() as u64;
+        // SAFETY: blob is a valid in-memory FDT.
+        let count = unsafe { count_aperture_seed(addr) };
+        let mut out = vec![
+            MmioAperture {
+                phys_base: 0,
+                size: 0
+            };
+            count
+        ];
+        // SAFETY: as above.
+        let n = unsafe { parse_aperture_seed(addr, &mut out) };
+        out[..n].iter().map(|a| (a.phys_base, a.size)).collect()
+    }
+
+    // Defect caught: the machine-level IMSIC or APLIC (the SBI firmware's)
+    // reported in place of the supervisor-level ones, the IMSIC binding's
+    // defaults not applied, or the APLIC's source count not read.
+    #[test]
+    fn the_qemu_virt_aia_dtb_reports_the_supervisor_aplic_and_imsic()
+    {
+        let found = aia(QEMU_VIRT_AIA_DTB);
+        assert_eq!(
+            found.aplic,
+            AplicDomain {
+                base: 0xd00_0000,
+                size: 0x8000,
+                sources: 96,
+            }
+        );
+        assert_eq!(
+            found.imsic,
+            ImsicLayout {
+                base: 0x2800_0000,
+                ids: 255,
+                guest_index_bits: 0,
+                hart_index_bits: 2,
+                group_index_bits: 0,
+                group_index_shift: 24,
+            }
+        );
+        assert_eq!(found.off_layout_hart, None);
+    }
+
+    // Defect caught: the supervisor-level APLIC and IMSIC missing from the
+    // aperture seeds, or the machine-level ones seeded, which OpenSBI's PMP
+    // denies the supervisor.
+    #[test]
+    fn the_qemu_virt_aia_dtb_seeds_only_the_supervisor_aplic_and_imsic()
+    {
+        let s = seeds(QEMU_VIRT_AIA_DTB);
+        assert!(s.contains(&(0xd00_0000, 0x8000)), "{s:x?}");
+        assert!(s.contains(&(0x2800_0000, 0x4000)), "{s:x?}");
+        assert!(
+            !s.iter().any(|&(b, _)| b == 0xc00_0000 || b == 0x2400_0000),
+            "{s:x?}"
+        );
+    }
+
+    // Defect caught: Ssaia missing from the extensions the CPU nodes are read
+    // for, so the kernel cannot tell the harts implement it.
+    #[test]
+    fn the_qemu_virt_aia_dtb_confirms_ssaia()
+    {
+        assert_ne!(hart_caps(QEMU_VIRT_AIA_DTB).1 & HART_CAP_SSAIA, 0);
+    }
+
+    /// A tree of two harts (IDs 0 and 1, `riscv,cpu-intc` phandles `0x10`
+    /// and `0x11`) and, in this order, a machine-level APLIC (`msi-parent`
+    /// the machine-level IMSIC), a supervisor-level APLIC whose `msi-parent`
+    /// is `aplic_parent`, the machine-level IMSIC (phandle `0x20`) and the
+    /// supervisor-level IMSIC (phandle `0x21`, two files at `0x2800_0000`)
+    /// whose `interrupts-extended` lists the harts in `ie_harts` order.
+    fn aia_tree(ie_harts: &[u32], aplic_parent: u32) -> Vec<u8>
+    {
+        fn reg(base: u64, size: u64) -> Vec<u8>
+        {
+            [base.to_be_bytes(), size.to_be_bytes()].concat()
+        }
+        fn interrupts_extended(harts: &[u32], irq: u32) -> Vec<u8>
+        {
+            harts
+                .iter()
+                .flat_map(|&h| [(0x10 + h).to_be_bytes(), irq.to_be_bytes()])
+                .flatten()
+                .collect()
+        }
+
+        let mut b = FdtBuilder::new();
+        b.begin_node(b"");
+        b.begin_node(b"cpus");
+        for hart in 0..2u32
+        {
+            b.begin_node(b"cpu");
+            b.prop(b"compatible", b"riscv\0");
+            b.prop(b"reg", &hart.to_be_bytes());
+            b.begin_node(b"interrupt-controller");
+            b.prop(b"compatible", b"riscv,cpu-intc\0");
+            b.prop(b"phandle", &(0x10 + hart).to_be_bytes());
+            b.end_node();
+            b.end_node();
+        }
+        b.end_node();
+        b.begin_node(b"soc");
+        for (base, parent) in [(0xc00_0000u64, 0x20u32), (0xd00_0000, aplic_parent)]
+        {
+            b.begin_node(b"interrupt-controller");
+            b.prop(b"compatible", b"riscv,aplic\0");
+            b.prop(b"reg", &reg(base, 0x8000));
+            b.prop(b"msi-parent", &parent.to_be_bytes());
+            b.prop(b"riscv,num-sources", &96u32.to_be_bytes());
+            b.end_node();
+        }
+        for (phandle, base, harts, irq) in [
+            (0x20u32, 0x2400_0000u64, &[0u32, 1][..], 11u32),
+            (0x21, 0x2800_0000, ie_harts, IRQ_S_EXT),
+        ]
+        {
+            b.begin_node(b"interrupt-controller");
+            b.prop(b"compatible", b"riscv,imsics\0");
+            b.prop(b"phandle", &phandle.to_be_bytes());
+            b.prop(b"reg", &reg(base, 0x2000));
+            b.prop(b"interrupts-extended", &interrupts_extended(harts, irq));
+            b.prop(b"riscv,num-ids", &255u32.to_be_bytes());
+            b.end_node();
+        }
+        b.end_node();
+        b.end_node();
+        b.finish()
+    }
+
+    // Defect caught: an IMSIC reported although its `interrupts-extended`
+    // order puts a hart's file elsewhere than the hart's ID does, so the
+    // kernel would deliver each hart's interrupts to another hart's file.
+    #[test]
+    fn an_imsic_listing_the_harts_out_of_id_order_is_refused()
+    {
+        let in_order = aia(&aia_tree(&[0, 1], 0x21));
+        assert_eq!(in_order.imsic.base, 0x2800_0000);
+        assert_eq!(in_order.imsic.hart_index_bits, 1);
+        assert_eq!(in_order.off_layout_hart, None);
+
+        let swapped = aia(&aia_tree(&[1, 0], 0x21));
+        assert_eq!(swapped.imsic, ImsicLayout::zero());
+        assert_eq!(swapped.off_layout_hart, Some(0));
+    }
+
+    // Defect caught: an IMSIC reported although an enabled hart has no file
+    // in it.
+    #[test]
+    fn an_imsic_missing_a_hart_is_refused()
+    {
+        let found = aia(&aia_tree(&[0], 0x21));
+        assert_eq!(found.imsic, ImsicLayout::zero());
+        assert_eq!(found.off_layout_hart, Some(1));
+    }
+
+    // Defect caught: the first `riscv,aplic` node in tree order taken as the
+    // supervisor's whatever its `msi-parent`, which reports the machine-level
+    // APLIC.
+    #[test]
+    fn the_aplic_is_the_one_whose_msi_parent_is_the_supervisor_imsic()
+    {
+        assert_eq!(aia(&aia_tree(&[0, 1], 0x21)).aplic.base, 0xd00_0000);
+        assert_eq!(aia(&aia_tree(&[0, 1], 0x20)).aplic, AplicDomain::zero());
     }
 }

@@ -31,13 +31,15 @@
 //!   `time` CSR frequency and the `HART_CAP_*` bits every hart advertises.
 //! - [`parse_vmgenid_paddr`]: SSDT walk (QEMU VMGENID) producing the
 //!   physical address of the 16-byte VM Generation ID GUID, or `0`.
+//! - [`madt_aia`]: MADT walk (RISC-V, ACPI 6.5+) producing the
+//!   supervisor-level APLIC domain and IMSIC layout.
 //!
 //! Arch-specific `kernel_mmio` extractors (LAPIC+IOAPIC on x86-64;
-//! PLIC+UART on RISC-V) consume the byte helpers and layout constants
-//! exposed here but live under [`crate::arch`].
+//! PLIC+APLIC+IMSIC+UART on RISC-V) consume the byte helpers and layout
+//! constants exposed here but live under [`crate::arch`].
 
 use crate::bprintln;
-use boot_protocol::MmioAperture;
+use boot_protocol::{AplicDomain, ImsicLayout, MmioAperture};
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
@@ -70,6 +72,8 @@ const MADT_TYPE_LAPIC: u8 = 0; // x86-64: Processor Local APIC, length 8
 pub(crate) const MADT_TYPE_IOAPIC: u8 = 1;
 const MADT_TYPE_LOCAL_X2APIC: u8 = 9; // x86-64: Processor Local x2APIC, length 16
 const MADT_TYPE_RINTC: u8 = 0x18; // RISC-V INTC (MADT type 24), length 36
+const MADT_TYPE_IMSIC: u8 = 0x19; // RISC-V IMSIC (MADT type 25), length 16
+const MADT_TYPE_APLIC: u8 = 0x1A; // RISC-V APLIC (MADT type 26), length 36
 pub(crate) const MADT_TYPE_PLIC: u8 = 0x1B; // RISC-V PLIC (MADT type 27)
 
 // MCFG: entries start at offset 44 (SDT_HDR_LEN + 8 reserved bytes).
@@ -615,6 +619,179 @@ fn madt_cpu_ids(table: &[u8]) -> impl Iterator<Item = u32> + '_
     })
 }
 
+// ── AIA discovery (RISC-V APLIC and IMSIC, ACPI 6.5+) ────────────────────────
+
+/// Lengths of the MADT's RISC-V AIA structures.
+mod madt_len
+{
+    /// A RINTC structure that carries its hart's IMSIC file address
+    /// (version 1 and later).
+    pub(super) const RINTC_IMSIC: usize = 36;
+    /// The IMSIC structure.
+    pub(super) const IMSIC: usize = 16;
+    /// The APLIC structure.
+    pub(super) const APLIC: usize = 36;
+}
+
+/// The MADT entries of `table` as `(type, entry)`, in table order, ending at
+/// the first entry whose length is under 2 or runs past the table.
+fn madt_entries(table: &[u8]) -> impl Iterator<Item = (u8, &[u8])> + '_
+{
+    let mut off = MADT_ENTRIES_OFF;
+    core::iter::from_fn(move || {
+        if off + 2 > table.len()
+        {
+            return None;
+        }
+        let entry_len = read_u8(table, off + 1) as usize;
+        if entry_len < 2 || off + entry_len > table.len()
+        {
+            return None;
+        }
+        let entry = &table[off..off + entry_len];
+        off += entry_len;
+        Some((entry[0], entry))
+    })
+}
+
+/// The supervisor-level IMSIC file each enabled RINTC structure of `table`
+/// names, as `(hart_id, file_address, file_size)`; address and size zero for a
+/// RINTC too short to carry them.
+///
+/// RINTC structure layout (version 1, 36 bytes):
+/// - `+ 4`: `flags(u32)`, bit 0 = enabled
+/// - `+ 8`: `hart_id(u64)`
+/// - `+16`: `acpi_processor_uid(u32)`
+/// - `+20`: `external_interrupt_controller_id(u32)`
+/// - `+24`: `imsic_base_address(u64)`
+/// - `+32`: `imsic_size(u32)`
+fn rintc_imsic_files(table: &[u8]) -> impl Iterator<Item = (u64, u64, u64)> + '_
+{
+    madt_entries(table).filter_map(|(ty, e)| {
+        if ty != MADT_TYPE_RINTC || e.len() < 16 || read_u32(e, 4) & 0x1 == 0
+        {
+            return None;
+        }
+        let (addr, size) = if e.len() >= madt_len::RINTC_IMSIC
+        {
+            (read_u64(e, 24), u64::from(read_u32(e, 32)))
+        }
+        else
+        {
+            (0, 0)
+        };
+        Some((read_u64(e, 8), addr, size))
+    })
+}
+
+/// What the MADT reports of the supervisor's AIA interrupt controllers
+/// ([`madt_aia`]).
+pub(crate) struct MadtAia
+{
+    /// The first APLIC structure with a non-zero base; zero when none.
+    pub aplic: AplicDomain,
+    /// The IMSIC layout; zero when the MADT has no IMSIC structure, no
+    /// enabled RINTC, or [`Self::off_layout_hart`] is set.
+    pub imsic: ImsicLayout,
+    /// The hart ID of the first enabled RINTC whose IMSIC file address does
+    /// not lie at [`ImsicLayout::s_file_address`] of its hart ID under the
+    /// layout the first enabled RINTC fixes.
+    pub off_layout_hart: Option<u64>,
+}
+
+/// The supervisor's APLIC domain and IMSIC layout the MADT `table` reports.
+///
+/// The IMSIC structure gives the index widths and the identity count; the
+/// RINTC structures give each hart's file address. The layout's base is the
+/// first enabled RINTC's file address less [`ImsicLayout::s_file_offset`] of
+/// its hart ID, and the layout is reported only when every enabled RINTC's
+/// file lies at [`ImsicLayout::s_file_address`] of its own hart ID.
+///
+/// IMSIC structure layout (16 bytes):
+/// - `+ 4`: `flags(u32)`
+/// - `+ 8`: `supervisor_interrupt_identities(u16)`
+/// - `+10`: `guest_interrupt_identities(u16)`
+/// - `+12`: `guest_index_bits(u8)`, `+13`: `hart_index_bits(u8)`,
+///   `+14`: `group_index_bits(u8)`, `+15`: `group_index_shift(u8)`
+///
+/// APLIC structure layout (36 bytes):
+/// - `+ 3`: `aplic_id(u8)`, `+ 4`: `flags(u32)`, `+ 8`: `hardware_id(8B)`
+/// - `+16`: `idc_count(u16)`, `+18`: `external_interrupt_sources(u16)`
+/// - `+20`: `gsi_base(u32)`, `+24`: `base(u64)`, `+32`: `size(u32)`
+#[cfg_attr(
+    all(not(target_arch = "riscv64"), not(test)),
+    expect(
+        dead_code,
+        reason = "the only non-test caller is core/boot/src/arch/riscv64/acpi_kernel_mmio.rs; \
+                  the module is compiled on every arch"
+    )
+)]
+pub(crate) fn madt_aia(table: &[u8]) -> MadtAia
+{
+    let mut found = MadtAia {
+        aplic: AplicDomain::zero(),
+        imsic: ImsicLayout::zero(),
+        off_layout_hart: None,
+    };
+    let mut layout = None;
+    for (ty, e) in madt_entries(table)
+    {
+        match ty
+        {
+            MADT_TYPE_IMSIC if e.len() >= madt_len::IMSIC && layout.is_none() =>
+            {
+                layout = Some(ImsicLayout {
+                    base: 0,
+                    ids: u32::from(read_u16(e, 8)),
+                    guest_index_bits: read_u8(e, 12),
+                    hart_index_bits: read_u8(e, 13),
+                    group_index_bits: read_u8(e, 14),
+                    group_index_shift: read_u8(e, 15),
+                });
+            }
+            MADT_TYPE_APLIC
+                if e.len() >= madt_len::APLIC && found.aplic.base == 0 && read_u64(e, 24) != 0 =>
+            {
+                found.aplic = AplicDomain {
+                    base: read_u64(e, 24),
+                    size: u64::from(read_u32(e, 32)),
+                    sources: u64::from(read_u16(e, 18)),
+                };
+            }
+            _ =>
+            {}
+        }
+    }
+
+    let Some(mut layout) = layout
+    else
+    {
+        return found;
+    };
+    let mut harts = 0usize;
+    for (hart_id, addr, _) in rintc_imsic_files(table)
+    {
+        if harts == 0
+        {
+            layout.base = layout
+                .s_file_offset(hart_id)
+                .and_then(|offset| addr.checked_sub(offset))
+                .unwrap_or(0);
+        }
+        harts += 1;
+        if addr == 0 || layout.s_file_address(hart_id) != Some(addr)
+        {
+            found.off_layout_hart = Some(hart_id);
+            return found;
+        }
+    }
+    if harts > 0
+    {
+        found.imsic = layout;
+    }
+    found
+}
+
 // ── Aperture seeder ──────────────────────────────────────────────────────────
 
 /// MADT entry type 5 — `LocalApicAddressOverride` (overrides the 32-bit
@@ -674,6 +851,9 @@ pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 /// - Each I/O APIC register window (x86-64, MADT type 1).
 /// - Each RISC-V PLIC register window (MADT type 0x1B, present on
 ///   RISC-V platforms that expose ACPI such as QEMU+EDK2 virt).
+/// - Each RISC-V APLIC register window (MADT type 0x1A), and one window
+///   spanning the supervisor-level IMSIC files the enabled RINTC structures
+///   (MADT type 0x18) name.
 /// - Each MCFG ECAM window.
 /// - Each VT-d remapping unit's register set (DMAR DRHD), which no other
 ///   table names.
@@ -819,6 +999,9 @@ unsafe fn walk_aperture_seed(
             // LAPIC base from header; may be overridden by MADT type 5.
             // Zero on RISC-V (no LAPIC); emitted only when non-zero.
             let mut lapic = u64::from(read_u32(table, SDT_HDR_LEN));
+            // The span of the enabled harts' supervisor-level IMSIC files,
+            // seeded as one window rather than one per hart.
+            let mut imsic_span: Option<(u64, u64)> = None;
             let mut off = MADT_ENTRIES_OFF;
             while off + 2 <= table.len()
             {
@@ -853,10 +1036,39 @@ unsafe fn walk_aperture_seed(
                         let base = read_u64(table, off + 24);
                         push!(base, size);
                     }
+                    MADT_TYPE_APLIC if entry_len >= madt_len::APLIC =>
+                    {
+                        // Layout at `madt_aia`.
+                        let size = u64::from(read_u32(table, off + 32));
+                        let base = read_u64(table, off + 24);
+                        push!(base, size);
+                    }
+                    MADT_TYPE_RINTC
+                        if entry_len >= madt_len::RINTC_IMSIC
+                            && read_u32(table, off + 4) & 0x1 != 0 =>
+                    {
+                        // Layout at `rintc_imsic_files`.
+                        let base = read_u64(table, off + 24);
+                        let size = u64::from(read_u32(table, off + 32));
+                        if let Some(end) = base.checked_add(size)
+                            && base != 0
+                            && size != 0
+                        {
+                            imsic_span = Some(match imsic_span
+                            {
+                                Some((lo, hi)) => (lo.min(base), hi.max(end)),
+                                None => (base, end),
+                            });
+                        }
+                    }
                     _ =>
                     {}
                 }
                 off += entry_len;
+            }
+            if let Some((lo, hi)) = imsic_span
+            {
+                push!(lo, hi - lo);
             }
             if lapic != 0
             {
@@ -1219,6 +1431,141 @@ mod tests
             |a: &[MmioAperture]| a.iter().map(|a| (a.phys_base, a.size)).collect::<Vec<_>>();
         assert_eq!(spans(&exact), spans(&out[..named]));
         assert_eq!(spans(&exact_h), spans(&out_h[..heuristic]));
+    }
+
+    /// The MADT QEMU 11.1 `virt` with `aia=aplic-imsic` and 4 harts in one
+    /// socket hands EDK2: four RINTC v1 structures (harts 0 to 3, files at
+    /// `0x2800_0000 + hart * 0x1000`), one IMSIC, one supervisor-level APLIC.
+    const QEMU_VIRT_AIA_MADT: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/qemu-virt-aia-smp4-madt.bin"
+    ));
+    /// The RHCT of the same machine (`-cpu max` with Ssaia and Smaia).
+    const QEMU_VIRT_AIA_RHCT: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/qemu-virt-aia-smp4-rhct.bin"
+    ));
+
+    /// Offset of hart `hart`'s RINTC structure in [`QEMU_VIRT_AIA_MADT`].
+    fn qemu_rintc_off(hart: usize) -> usize
+    {
+        MADT_ENTRIES_OFF + hart * madt_len::RINTC_IMSIC
+    }
+
+    // Defect caught: an IMSIC or APLIC structure read at the wrong offsets, a
+    // layout base not derived from the RINTC file addresses, or the APLIC's
+    // source count taken from its IDC count.
+    #[test]
+    fn madt_aia_reports_the_qemu_virt_aplic_and_imsic()
+    {
+        let aia = madt_aia(QEMU_VIRT_AIA_MADT);
+        assert_eq!(
+            aia.aplic,
+            AplicDomain {
+                base: 0xd00_0000,
+                size: 0x8000,
+                sources: 96,
+            }
+        );
+        assert_eq!(
+            aia.imsic,
+            ImsicLayout {
+                base: 0x2800_0000,
+                ids: 255,
+                guest_index_bits: 0,
+                hart_index_bits: 2,
+                group_index_bits: 0,
+                group_index_shift: 24,
+            }
+        );
+        assert_eq!(aia.off_layout_hart, None);
+    }
+
+    // Defect caught: an IMSIC reported although a hart's RINTC names a file
+    // elsewhere than the layout puts it, so the kernel would deliver that
+    // hart's interrupts to another hart's file.
+    #[test]
+    fn madt_aia_refuses_a_rintc_file_off_the_layout()
+    {
+        let mut madt = QEMU_VIRT_AIA_MADT.to_vec();
+        // Swap the files of harts 1 and 2.
+        let one = qemu_rintc_off(1) + 24;
+        let two = qemu_rintc_off(2) + 24;
+        madt[one..one + 8].copy_from_slice(&0x2800_2000u64.to_le_bytes());
+        madt[two..two + 8].copy_from_slice(&0x2800_1000u64.to_le_bytes());
+        let aia = madt_aia(&madt);
+        assert_eq!(aia.imsic, ImsicLayout::zero());
+        assert_eq!(aia.off_layout_hart, Some(1));
+        // The APLIC does not depend on the IMSIC layout.
+        assert_eq!(aia.aplic.base, 0xd00_0000);
+    }
+
+    // Defect caught: a layout reported with no IMSIC structure, or one
+    // derived from a disabled hart's RINTC.
+    #[test]
+    fn madt_aia_needs_an_imsic_structure_and_skips_disabled_harts()
+    {
+        let mut madt = QEMU_VIRT_AIA_MADT.to_vec();
+        // Hart 0 disabled, with a file no layout reaches: the base comes from
+        // hart 1.
+        let h0 = qemu_rintc_off(0);
+        madt[h0 + 4..h0 + 8].copy_from_slice(&0u32.to_le_bytes());
+        madt[h0 + 24..h0 + 32].copy_from_slice(&0x1234_5000u64.to_le_bytes());
+        assert_eq!(madt_aia(&madt).imsic.base, 0x2800_0000);
+
+        // Retype the IMSIC structure: no IMSIC, so no layout and no refusal.
+        let imsic = qemu_rintc_off(4);
+        assert_eq!(madt[imsic], MADT_TYPE_IMSIC);
+        madt[imsic] = 0x7f;
+        let aia = madt_aia(&madt);
+        assert_eq!(aia.imsic, ImsicLayout::zero());
+        assert_eq!(aia.off_layout_hart, None);
+    }
+
+    // Defect caught: the APLIC or the IMSIC files missing from the aperture
+    // seeds, so devmgr has no aperture to carve them from; or one seed per
+    // hart instead of one span.
+    #[test]
+    fn the_qemu_virt_aia_madt_seeds_the_aplic_and_the_imsic_files()
+    {
+        let mut xsdt_body = Vec::new();
+        xsdt_body.extend_from_slice(&(QEMU_VIRT_AIA_MADT.as_ptr() as u64).to_le_bytes());
+        let xsdt = sdt(b"XSDT", &xsdt_body);
+        let mut rsdp = vec![0u8; 36];
+        rsdp[..8].copy_from_slice(RSDP_SIG);
+        rsdp[RSDP_OFF_REVISION] = 2;
+        rsdp[RSDP_OFF_XSDT..RSDP_OFF_XSDT + 8]
+            .copy_from_slice(&(xsdt.as_ptr() as u64).to_le_bytes());
+        let addr = rsdp.as_ptr() as u64;
+
+        let empty = MmioAperture {
+            phys_base: 0,
+            size: 0,
+        };
+        // SAFETY: rsdp, xsdt and the MADT are live, well-formed tables at the
+        // addresses they name.
+        let (named, heuristic) = unsafe { count_aperture_seed(addr) };
+        let mut out = vec![empty; named];
+        let mut out_h = vec![empty; heuristic];
+        // SAFETY: as above.
+        unsafe { parse_aperture_seed(addr, &mut out, &mut out_h) };
+        let defaults = crate::arch::current::default_mmio_apertures().len();
+        let mut seeds: Vec<(u64, u64)> = out[..named - defaults]
+            .iter()
+            .map(|a| (a.phys_base, a.size))
+            .collect();
+        seeds.sort_unstable();
+        assert_eq!(seeds, [(0xd00_0000, 0x8000), (0x2800_0000, 0x4000)]);
+    }
+
+    // Defect caught: Ssaia missing from the extensions the RHCT ISA string is
+    // read for, so the kernel cannot tell the harts implement it.
+    #[test]
+    fn the_qemu_virt_aia_rhct_confirms_ssaia()
+    {
+        let (timebase, caps) = parse_rhct(QEMU_VIRT_AIA_RHCT);
+        assert_eq!(timebase, 10_000_000);
+        assert_ne!(caps & boot_protocol::HART_CAP_SSAIA, 0);
     }
 
     /// Run `madt_topology` over a synthetic MADT; returns the count, the

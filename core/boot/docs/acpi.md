@@ -53,11 +53,11 @@ The XSDT pointer at RSDP offset 24 is the authoritative table root; the
 
 | Table | Signature | Extracted into |
 |---|---|---|
-| MADT | `"APIC"` | `BootInfo.cpu_count` / `cpu_ids` via LAPIC (type 0), Local x2APIC (type 9, 32-bit IDs), and RINTC (type 0x18). On x86-64: `BootInfo.kernel_mmio` LAPIC base (MADT header + type-5 override) and IOAPIC entries (type 1). On RISC-V: `BootInfo.kernel_mmio.plic_base` / `plic_size` / `plic_ndev` (total external interrupt sources) from the first PLIC entry (type 0x1B). Aperture seeds for LAPIC, IOAPIC, and RISC-V PLIC. |
+| MADT | `"APIC"` | `BootInfo.cpu_count` / `cpu_ids` via LAPIC (type 0), Local x2APIC (type 9, 32-bit IDs), and RINTC (type 0x18). On x86-64: `BootInfo.kernel_mmio` LAPIC base (MADT header + type-5 override) and IOAPIC entries (type 1). On RISC-V: `BootInfo.kernel_mmio.plic_base` / `plic_size` / `plic_ndev` (total external interrupt sources) from the first PLIC entry (type 0x1B); `kernel_mmio.aplic` (base, size, and external interrupt sources) from the first APLIC entry (type 0x1A) with a non-zero base; and `kernel_mmio.imsic`, the index widths and identity count from the IMSIC entry (type 0x19) and the base from the first enabled RINTC's IMSIC file address less that hart's offset in the layout, reported only when every enabled RINTC's IMSIC file lies at the layout's address for its hart ID. Aperture seeds for LAPIC, IOAPIC, RISC-V PLIC and APLIC, and one window spanning the IMSIC files the enabled RINTC entries name. |
 | MCFG | `"MCFG"` | Aperture seeds for each ECAM window and the derived 32-bit / 64-bit PCI BAR windows (QEMU-layout heuristic: real hardware advertises these windows through the host bridge's `_CRS`, which the bootloader does not evaluate; see [firmware-parsing.md](firmware-parsing.md) §"Parsing Depth"). An absent MCFG contributes no seed; the arch's platform defaults below are appended either way. The ECAM windows are named seeds; the PCI BAR windows are heuristic windows, which reach `mmio_apertures` only where the memory map leaves them undescribed or reports MMIO (see [firmware-parsing.md](firmware-parsing.md) §"Firmware exclusion"). |
 | DMAR | `"DMAR"` | x86-64 VT-d platforms: an aperture seed for each DMA Remapping Hardware Unit's register set (DRHD, type 0: its register base and `2^size` pages). No other table names those pages, and devmgr hands each to the VT-d IOMMU driver as an `Mmio` cap ([docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming) § IOMMU Discovery and Programming). A DRHD with a zero or unaligned base is skipped. The bootloader reads nothing else from the DMAR; devmgr walks it for the units' scopes. |
 | SPCR | `"SPCR"` | RISC-V only: `BootInfo.kernel_mmio.uart_base` (from the Generic Address Structure when the address-space identifier is MMIO). `uart_size` is set to the ns16550a conventional 0x100 (SPCR does not carry a region size; the later DTB pass fills `uart_base` / `uart_size` only when ACPI left `uart_base` zero). The pre-Step-1 serial-init path uses the same walk to pick up a UART base for early diagnostics (see [console.md](console.md)). |
-| RHCT | `"RHCT"` | RISC-V only, Step 9 (`populate_kernel_mmio`): `BootInfo.kernel_mmio.timebase_freq` from the time-base-frequency field, and the `HART_CAP_*` bits (Sstc, Svpbmt, Svinval, Svnapot) named by every ISA-string node (a per-bit AND; zero when no ISA-string node exists). |
+| RHCT | `"RHCT"` | RISC-V only, Step 9 (`populate_kernel_mmio`): `BootInfo.kernel_mmio.timebase_freq` from the time-base-frequency field, and the `HART_CAP_*` bits (Sstc, Svpbmt, Svinval, Svnapot, Ssaia) named by every ISA-string node (a per-bit AND; zero when no ISA-string node exists). |
 | SSDT | `"SSDT"` | Every architecture where an RSDP is present, Step 9: `BootInfo.vmgenid_paddr`, the non-zero, 4 KiB-aligned `VGIA` named-DWORD value plus the 40-byte GUID offset; an SSDT whose OEM table ID starts with `VMGENID` is preferred, otherwise the first SSDT carrying the pattern. No AML is evaluated. |
 
 After the table walk, `parse_aperture_seed` appends the arch's platform defaults whenever the RSDP
@@ -89,6 +89,9 @@ Malformed tables are skipped, not fatal:
   § Tables Consumed) are still appended.
 - An MADT entry with an impossible length byte stops the walk early.
 - Unknown MADT entry types are silently skipped.
+- On RISC-V, an enabled RINTC entry whose IMSIC file address is zero, or does not lie at the
+  IMSIC layout's address for its hart ID, leaves `kernel_mmio.imsic` zero, with a diagnostic
+  naming the hart.
 - An MCFG allocation entry with a zero base, an end bus below its start bus, or an ECAM
   window whose start or end overflows a 64-bit physical address is skipped, along with its
   derived PCI BAR windows.
@@ -96,7 +99,7 @@ Malformed tables are skipped, not fatal:
 No diagnostic is logged for a malformed or absent table; the walkers'
 only diagnostics report surplus entries (more than `MAX_CPUS` enabled
 CPUs, on x86-64 more than `MAX_IOAPICS` IOAPICs, or aperture seeds past
-the seed buffers). The
+the seed buffers) and, on RISC-V, an IMSIC file off its layout. The
 bootloader proceeds with whatever it successfully extracted. The kernel
 falls back to its compile-time defaults
 for any zero MMIO base field, but a zero riscv64 `timebase_freq` or a missing `hart_caps`

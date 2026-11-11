@@ -171,7 +171,6 @@ pub struct RestartRecipe
 // `ProcessInfo` / `StartupInfo`, not these rounds.
 
 /// Well-known capability slots acquired from the handover endowment.
-#[allow(clippy::struct_field_names)]
 pub struct SvcmgrCaps
 {
     /// Service protocol endpoint capability slot.

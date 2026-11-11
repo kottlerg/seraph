@@ -153,7 +153,7 @@ concurrent notification and queue events.
 | `cap_transfer_large.rs` | IPC transfer of a cap with a multi-batch child list, both directions |
 | `wait_concurrency.rs` | Wait set with concurrent notification + queue sources |
 | `memory_lifecycle.rs` | Pool-frame map → protect → unmap, with `aspace_query` after the map and after the unmap |
-| `multi_caller_ipc_fifo.rs` | Three concurrent IPC callers verify FIFO send-queue ordering ([docs/ipc-design.md § Endpoints](../../docs/ipc-design.md#endpoints)) |
+| `multi_caller_ipc_fifo.rs` | Three IPC callers, queued in an order strict priority fixes, verify FIFO send-queue ordering ([docs/ipc-design.md § Endpoints](../../docs/ipc-design.md#endpoints)) |
 | `ipc_call_interrupted_stop_start.rs` | A client stopped while parked in `ipc_call` and then restarted returns `Interrupted`, never a stale reply (#361) |
 | `park_interrupted_stop_start.rs` | A thread stopped while parked in any non-call blocking syscall and then restarted returns `Interrupted`, never a stale wake deposit (#363) |
 | `reply_binding_displaced.rs` | A server that receives again without replying releases the caller its earlier receive bound, as [docs/ipc-design.md § The Call/Reply Model](../../docs/ipc-design.md#the-callreply-model) defines: a released `ipc_call` returns `Interrupted` and the released caller stops and restarts; a released fault-blocked thread, still alive before the later receive, is killed with the fault exit reason; the later receive's caller gets its reply |
@@ -270,8 +270,9 @@ acknowledgement and exit bounds of `stop_source_delete`; the preemption budget o
 the pull budget and the exit polls of `integration::idle_pull_starved_ready`; the expiry and
 report bounds of `integration::queued_waiters_fifo`; the observation window and finish wait of
 `integration::irq_preserves_user_regs`; the delivery waits of `integration::irq_shared_line`; the
-child waits of `integration::stop_read_regs_remote`; the
-probe and redirect polls of `integration::write_regs_blocked_syscall`; the report bounds of
+child waits of `integration::stop_read_regs_remote`; the barrier wait of
+`integration::multi_caller_ipc_fifo`; the probe and redirect polls of
+`integration::write_regs_blocked_syscall`; the report bounds of
 `integration::cross_cspace_revoke_no_alias`, `integration::reply_binding_displaced`,
 `integration::destroyed_source_interrupts`, `integration::fault_syscall_buffer`,
 `wait_set::shared_set_waiters` and `wait_set::stale_endpoint_entry_skipped`; the post waits of

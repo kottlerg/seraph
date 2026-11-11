@@ -585,8 +585,8 @@ mod tests
         for i in (0..slots).filter(|&i| used(i))
         {
             let first = 1000 * u64::from(i + 1);
-            #[allow(clippy::cast_possible_truncation)]
-            let e = entry_bytes((i + 1) as u8, first, first + 99, 0);
+            let type_byte = u8::try_from(i + 1).expect("fewer than 256 slots");
+            let e = entry_bytes(type_byte, first, first + 99, 0);
             let off = (i * entry_size) as usize;
             disk[off..off + 128].copy_from_slice(&e);
         }

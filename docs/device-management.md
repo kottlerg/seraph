@@ -232,8 +232,8 @@ it and its reserved ranges. With none, the device can reach memory only at physi
 addresses, so the address devmgr returns is the frames' physical address and the mapping is
 bookkeeping alone. The protocol and the driver's code are the same in both modes.
 
-devmgr serves the DMA endpoint on a thread of its own, apart from the registry loop, because that
-loop makes nested calls (a driver spawn from the root filesystem reads the binary through the
+devmgr serves the DMA endpoint on a thread of its own, apart from its control thread, because that
+thread makes nested calls (a driver spawn from the root filesystem reads the binary through the
 block driver, which maps the read's buffer) and settles batches whose drivers map their rings
 before they report ready, and a mapping must never wait on it. The thread runs at the boot
 drivers' level (`ipc::sched_policy::BOOT_DRIVER_PRIORITY`, above devmgr's own) because the block
@@ -337,7 +337,7 @@ ready, leaves that unit blocking every device behind it, which devmgr cannot und
 register cap; its log line says so, and those devices' DMA fails. The case that is not an absent
 IOMMU is a driver that dies after it reported ready: the units go on translating through the tables
 it left, so devmgr cannot fall back to unconfined DMA. It fails closed. A death watch thread of
-devmgr's own sees the death at once, independent of the registry loop, which may be blocked in a
+devmgr's own sees the death at once, independent of the control thread, which may be blocked in a
 call to the dead driver. devmgr then logs once, refuses every later `DMA_MAP` of every confined
 device, answers any of its own calls still queued on the dead driver's endpoint with an error, and
 withdraws the driver of every confined device; it restarts nothing, restartability being
@@ -567,8 +567,9 @@ devmgr loads driver binaries from one of two places:
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
   [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md). Devmgr
   replies SUCCESS before doing any spawn work so svcmgr never blocks on driver bring-up; the actual
-  walk + `CREATE_FROM_FILE` + bootstrap rounds, and the settle of those drivers, run after
-  `ipc_reply` and before devmgr returns to its next `ipc_recv`. The spawn is at-most-once per boot;
+  walk + `CREATE_FROM_FILE` + bootstrap rounds, and the settle of those drivers, run on devmgr's
+  control thread after `ipc_reply`, while its registry workers go on serving; a query that would
+  find no driver waits until the settle has ended. The spawn is at-most-once per boot;
   on failure (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did
   not report ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on
   subsequent `QUERY_DEVICE` calls on the rtc, input, and debug-port classes and clients

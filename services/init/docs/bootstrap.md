@@ -245,8 +245,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     cap on a `DRIVERS_DIR_AUTHORITY`-badged copy of the
     devmgr-registry source. Devmgr replies SUCCESS *before* any spawn
     work, then lists the directory, reads each entry's driver declaration, binds the PCI
-    devices still unbound, and spawns the per-arch RTC driver between
-    its `ipc_reply` and next `ipc_recv` (procmgr `CREATE_FROM_FILE` —
+    devices still unbound, and spawns the per-arch RTC driver on its
+    control thread after the reply (procmgr `CREATE_FROM_FILE` —
     the binaries live on the rootfs, not in the boot bundle; see
     [Driver binary sources](../../../docs/device-management.md#driver-binary-sources)). Best-effort:
     a failure leaves the system without a wallclock — timed degrades to

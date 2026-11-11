@@ -600,7 +600,8 @@ pub struct IommuSpawnConfig<'a>
     /// devmgr's driver death queue.
     pub death_eq: u64,
     /// The IOMMU death watch's queue, a second observer of the driver's
-    /// death that no registry-loop call can delay (`crate::iommu`).
+    /// death that no call of devmgr's control thread can delay
+    /// (`crate::iommu`).
     pub watch_eq: u64,
     pub device_badge: u64,
     pub priority: u8,

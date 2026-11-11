@@ -399,6 +399,7 @@ dependencies = [
  "namespace-protocol",
  "ns-client",
  "process-abi",
+ "recv-pool",
  "syscall",
  "syscall-abi",
  "virtio-core",

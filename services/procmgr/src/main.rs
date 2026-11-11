@@ -47,6 +47,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 ///            per child for `ProcessInfo.service_registry_cap`; the
 ///            child can `QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT`.
 ///            Zero means no registry is available yet.
+// struct_field_names: the shared `_ep` suffix says each field is an endpoint
+// cap; dropping it would leave names that hide the cap kind.
 #[allow(clippy::struct_field_names)]
 struct InitBootstrap
 {
@@ -298,6 +300,8 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 /// `process_table::child_memmgr_flags` reads, and is sent back in the
 /// `PROCESS_DIED` payload at child teardown so memmgr can reclaim the
 /// right record.
+// not_unsafe_ptr_arg_deref: procmgr is a binary, not a library, and every
+// caller passes its thread's registered IPC buffer page as `ipc_buf`.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn register_with_memmgr(memmgr_ep: u64, flags: u64, ipc_buf: *mut u64) -> (u64, u64)
 {
@@ -332,6 +336,8 @@ pub fn register_with_memmgr(memmgr_ep: u64, flags: u64, ipc_buf: *mut u64) -> (u
 /// Memory caps allocated against `child_send_cap` are accounted to that child's
 /// memmgr record and reclaimed on `PROCESS_DIED`. Memory caps allocated against
 /// procmgr's own `pi.memmgr_endpoint_cap` are accounted to procmgr.
+// not_unsafe_ptr_arg_deref: procmgr is a binary, not a library, and every
+// caller passes its thread's registered IPC buffer page as `ipc_buf`.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
 {
@@ -384,6 +390,8 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
 /// Used to back kernel-object retypes whose source Memory cap must be
 /// contiguous (e.g. `Thread`, `AddressSpace`, `CSpace`); as
 /// [`memmgr_alloc_contig_grant`], without the region id.
+// not_unsafe_ptr_arg_deref: procmgr is a binary, not a library, and every
+// caller passes its thread's registered IPC buffer page as `ipc_buf`.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn memmgr_alloc_pages_contig(memmgr_send: u64, pages: u64, ipc_buf: *mut u64) -> Option<u64>
 {
@@ -399,6 +407,8 @@ pub fn memmgr_alloc_pages_contig(memmgr_send: u64, pages: u64, ipc_buf: *mut u64
 /// exactly `pages` pages or an error. A reply of any other shape is refused,
 /// and every cap it carried is returned to memmgr's pool ([`release_grant`])
 /// rather than left billed to the account behind `memmgr_send`.
+// not_unsafe_ptr_arg_deref: procmgr is a binary, not a library, and every
+// caller passes its thread's registered IPC buffer page as `ipc_buf`.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn memmgr_alloc_contig_grant(
     memmgr_send: u64,
@@ -437,6 +447,8 @@ pub fn memmgr_alloc_contig_grant(
 /// (`RELEASE_MEMORY_CAPS`), so the pages go back to the pool instead of
 /// staying billed until the account's `PROCESS_DIED`. A reply whose layout
 /// does not decode names no id; its slots are deleted only.
+// not_unsafe_ptr_arg_deref: procmgr is a binary, not a library, and every
+// caller passes its thread's registered IPC buffer page as `ipc_buf`.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn release_grant(memmgr_send: u64, reply: &IpcMessage, ipc_buf: *mut u64)
 {

@@ -188,6 +188,7 @@ fn bootstrap_pwrmgr_auth() -> u64
     {
         return 0;
     }
+    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned, stricter than u64.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
@@ -210,6 +211,7 @@ fn shutdown(pwrmgr_auth: u64)
         return;
     }
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned, stricter than u64.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);

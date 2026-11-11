@@ -33,7 +33,7 @@ procmgr/
 │                                 span, the process names, and the
 │                                 thread registry and crash badges
 ├── src/
-│   ├── main.rs                 # main() (std runtime), IPC dispatch loop
+│   ├── main.rs                 # main() (std runtime), request workers, reaper
 │   ├── crash.rs                # Crash endpoint, its decliner, the handover
 │   ├── death_queues.rs         # Death-queue ring capacity (`DEATH_EQ_CAPACITY`)
 │   ├── loader.rs               # ELF load pipeline
@@ -246,13 +246,15 @@ up to `EVENT_QUEUE_MAX_CAPACITY`). A further queue is one contiguous grant from 
 once a pool reaches the kernel maximum); when memmgr refuses it, procmgr retries at half the pool,
 down to the first pool's size, whose request is three pages.
 
-The queues share procmgr's main wait set with its service endpoint, and procmgr's death-queue set
-(`DeathSet`, the [`shared/death-set`](../../shared/death-set/README.md) crate, following the
+The queues share one wait set, which holds them alone and on which only the reaper waits
+(§ Concurrency), and procmgr's death-queue set (`DeathSet`, the
+[`shared/death-set`](../../shared/death-set/README.md) crate, following the
 `ruststd-death-queues` growth policy) owns that wait set: it starts with room for two members (the
-endpoint and the first queue), and when the queues fill it, procmgr creates one with twice the
-members, up to `WAIT_SET_MAX_MEMBERS` (1024), moves every member across, and deletes the old one;
-the main loop waits on whichever is current. The kernel queues a member that is already ready when
-it is added, so the move loses no pending request or death post. Up to 1023 queues then hold far
+growth policy counts one for a service endpoint, which this set does not hold, beside the first
+queue), and when the queues fill it, procmgr creates one with twice the members, up to
+`WAIT_SET_MAX_MEMBERS` (1024), moves every member across, and deletes the old one; the reaper waits
+on whichever is current. The kernel queues a member that is already ready when it is added, so the
+move loses no pending death post. Up to 1023 queues then hold far
 more nodes than twice the children procmgr's `CSpace` can hold. In RAM so fragmented that memmgr
 refuses every request above three pages, the queues settle at 128 nodes, the largest pool a
 three-page request covers, and the wait set at 256 members (a 512-member set is a five-page
@@ -265,7 +267,7 @@ set's (32 members or more) dedicated grant returns to memmgr through
 fails (procmgr out of memory) fails the spawn, the address-space bind included.
 
 Each death queue has a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256), and
-procmgr drains every queue on each death wakeup. The kernel drops a post to a
+the reaper drains every queue on each death wakeup. The kernel drops a post to a
 full queue, so a drain that takes a full queue's worth of events or more from
 one queue rescans the table and reaps every entry whose main thread the kernel
 reports exited (`CAP_INFO_THREAD_STATE`), or whose address space it reports took
@@ -289,19 +291,85 @@ release token would otherwise release it.
 
 ---
 
+## Concurrency
+
+procmgr serves its service endpoint on a pool of four request workers (`RECV_WORKERS`, the main
+thread among them), on the [`shared/recv-pool`](../../shared/recv-pool/README.md) crate, and reaps
+on a thread of its own, the reaper (`procmgr-reaper`), the only thread that waits on the death
+queues' wait set. A create that waits on a slow file server, on memmgr, or on the kernel holds one
+worker; the others go on serving, and the reaper goes on reaping. A file server is the creator's to
+choose, so each call on a caller-supplied file cap is bounded at `FILE_CAP_CALL_TIMEOUT_MS` (10 s),
+past which the create fails with `IO_ERROR`
+([docs/ipc-interface.md](docs/ipc-interface.md) § Label 13: `CREATE_FROM_FILE`). A caller past the
+four workers waits in the endpoint's queue. procmgr's own `ProcessInfo` names no procmgr endpoint,
+so its threads send no `REGISTER_THREAD` and start without waiting on one
+([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Thread registration).
+
+The shared state is behind these locks:
+
+- The table lock guards the process table and the recent-exits ring (`process::Tables`). Its holder
+  makes syscalls that do not block on another process, and no IPC call but the two below; every
+  other call, to memmgr for a child, to a file server, or to the crash decliner, is made after it
+  is released.
+- The death-set lock guards the death queues and their wait set. A bind that grows the set funds
+  the new queue or wait set from memmgr while it holds the lock; memmgr calls no procmgr label, so
+  that call cannot wait on a lock procmgr holds.
+- The init-reap lock guards the init-reap state (§ Init reap). `REGISTER_INIT_TEARDOWN` binds init's
+  death observers on the death set while it holds it.
+- The crash-registration lock is held by `REGISTER_CRASH_SERVICE`, by the undoing of a refused
+  registration, and by the check that takes the crash endpoint back from a crash service that is
+  gone, so two registrations cannot both find no registrant. A registration holds it across its
+  park call to the crash decliner, which answers without taking any lock.
+- The `CSpace` top-up lock (§ CSpace headroom) is only tried, never waited on.
+
+Under any of these locks, two IPC calls can still happen, each a departure from holding no lock
+across a call ([docs/ipc-design.md](../../docs/ipc-design.md) § Multi-threaded servers), stated
+where each lock is defined. A growth of procmgr's heap calls memmgr. A log line calls logd, bounded
+at `LOG_CALL_TIMEOUT_MS` (5 s), and at `LOG_CALL_UNANSWERED_TIMEOUT_MS` (10 ms) once a log call of
+procmgr's has gone unanswered ([docs/limits.md](../../docs/limits.md)). Neither memmgr nor logd
+calls a procmgr label, so neither call can wait on a lock procmgr holds. A wedged logd can still
+stall a lock's holder, and every worker that waits on the lock, for one 5 s call. So the log lines
+of the checks every worker makes before each request (a crash service gone, a debugger gone) are
+written after their locks are released, and the locks are held across a log line only on paths
+that are not taken on every request.
+
+The init-reap lock, then the death-set lock, is the only order in which two of them are held. The
+table lock is never held with the death-set lock: the reaper copies each pass's death events out
+under the death-set lock and handles them after releasing it, and a create binds its child's death
+observers before it takes the table lock to insert the entry.
+
+A create reserves its badge under the table lock, which keeps a concurrent create from drawing it,
+and builds the child (its kernel objects, its image, its death observers, its pager and crash
+bindings) with no lock held. It inserts the complete entry last, so no other worker sees a
+half-built child. A teardown, by the reaper or by `DESTROY_PROCESS`, takes the entry, records the
+exit, releases the child's kernel objects, and parks a held reclaim in one hold of the table lock,
+and sends `PROCESS_DIED` to memmgr after releasing it. So a `DESTROY_PROCESS` that finds no entry
+finds the child torn down, and a `RELEASE_HOLD` after it finds the reclaim parked.
+
+The reaper checks, after each pass, for a gone crash service and for gone debuggers, whose deaths
+woke it. A registered crash service or a debugger's watch that is a thread other than its
+process's main thread posts no death when it exits, so a worker makes the same checks before it
+serves each request. A teardown's stop of a process posts no death either
+([docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Exit reason), so the worker that
+serves `DESTROY_PROCESS` makes them again after its teardown.
+
+---
+
 ## CSpace headroom
 
 procmgr holds several capabilities per live child (its address space, CSpace, thread, slab, and
 memmgr caps), so spawning draws its own `CSpace`'s slots. A `CSpace` keeps its last
 `CSPACE_IPC_RECV_RESERVE` free slots for IPC capability transfer, and general allocations fail
 first ([docs/capability-model.md](../../docs/capability-model.md) § Address-space and CSpace
-growth budgets). Before every wait, procmgr compares its headroom
+growth budgets). Before it serves each request, a request worker compares its headroom
 (`std::os::seraph::cspace_slot_headroom`) and its growth budget (`CAP_INFO_CSPACE_BUDGET`)
 against `CSPACE_LOW_WATER` (256 slots) plus a page for its body arena
 (`syscall_abi::cspace_topup_pages`). Short of either, procmgr funds the slot-page pool to
 `CSPACE_TOPUP_SLOTS` (1024) through
-`std::os::seraph::fund_cspace_slot_budget`, which draws the pages from memmgr. A failed top-up is
-logged once per streak of failures and retried on the next pass.
+`std::os::seraph::fund_cspace_slot_budget`, which draws the pages from memmgr. One worker tops up
+at a time; a worker that finds another topping up serves its request without waiting, since the
+low-water mark leaves room for every worker's request. A failed top-up is logged once per streak
+of failures and retried on the next request.
 
 ---
 

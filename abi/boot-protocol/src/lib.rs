@@ -146,7 +146,13 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     `mmio_apertures.count` has no protocol bound.
 /// v19: [`MAX_CPUS`] rose from 512 to 8192, a sanity ceiling no structure is
 ///     sized from, so `cpu_count` may reach 8192. No layout change.
-pub const BOOT_PROTOCOL_VERSION: u32 = 19;
+/// v20: The riscv64 [`KernelMmio`] gained `aplic` ([`AplicDomain`], the
+///     supervisor-level APLIC domain) and `imsic` ([`ImsicLayout`], the
+///     supervisor-level IMSIC interrupt files), from the ACPI MADT (RINTC,
+///     IMSIC and APLIC structures) or the DTB (`riscv,aplic`, `riscv,imsics`);
+///     zero when the platform reports none. `hart_caps` gained bit 4
+///     ([`HART_CAP_SSAIA`]). The PLIC fields are unchanged.
+pub const BOOT_PROTOCOL_VERSION: u32 = 20;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -614,10 +620,20 @@ pub struct KernelMmio
     pub timebase_freq: u64,
     /// ISA-capability bits the bootloader positively confirmed on every
     /// enabled hart (bit 0 = [`HART_CAP_SSTC`], bit 1 = [`HART_CAP_SVPBMT`],
-    /// bit 2 = [`HART_CAP_SVINVAL`], bit 3 = [`HART_CAP_SVNAPOT`]). Each
-    /// firmware source ORs in the bits it can confirm; zero means
-    /// undiscovered or absent.
+    /// bit 2 = [`HART_CAP_SVINVAL`], bit 3 = [`HART_CAP_SVNAPOT`], bit 4 =
+    /// [`HART_CAP_SSAIA`]). Each firmware source ORs in the bits it can
+    /// confirm; zero means undiscovered or absent.
     pub hart_caps: u64,
+    /// The supervisor-level APLIC domain, from the first ACPI MADT APLIC
+    /// structure or the DTB `riscv,aplic` node whose `msi-parent` is the
+    /// supervisor-level IMSIC. All zero when neither source reported one.
+    pub aplic: AplicDomain,
+    /// The supervisor-level IMSIC interrupt files, from the ACPI MADT IMSIC
+    /// and RINTC structures or the DTB `riscv,imsics` node wired to the
+    /// harts' supervisor external interrupt. All zero when neither source
+    /// reported one, or when a hart's file does not lie at
+    /// [`ImsicLayout::s_file_address`] of its hart ID.
+    pub imsic: ImsicLayout,
 }
 
 // The `HART_CAP_*` constants are deliberately not gated on
@@ -643,6 +659,145 @@ pub const HART_CAP_SVINVAL: u64 = 1 << 2;
 /// (naturally-aligned power-of-two contiguous translations, PTE bit 63).
 pub const HART_CAP_SVNAPOT: u64 = 1 << 3;
 
+/// riscv64 `hart_caps` bit 4: every enabled hart implements Ssaia (the
+/// supervisor-level Advanced Interrupt Architecture CSRs: `siselect`,
+/// `sireg`, `stopei`, `stopi`).
+pub const HART_CAP_SSAIA: u64 = 1 << 4;
+
+// `AplicDomain` and `ImsicLayout` are not gated on `target_arch = "riscv64"`
+// for the reason the `HART_CAP_*` constants are not: the arch-neutral firmware
+// parsers that produce them are compiled, and host-tested, on every arch.
+
+/// One APLIC interrupt domain (RISC-V Advanced Interrupt Architecture): its
+/// register window and the number of wired sources it implements (sources
+/// `1..=sources`). All fields zero when no domain was reported.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AplicDomain
+{
+    /// Physical base of the domain's register window.
+    pub base: u64,
+    /// Size of the register window in bytes.
+    pub size: u64,
+    /// Number of interrupt sources the domain implements.
+    pub sources: u64,
+}
+
+impl AplicDomain
+{
+    /// The all-zero domain: none reported.
+    #[must_use]
+    pub const fn zero() -> Self
+    {
+        Self {
+            base: 0,
+            size: 0,
+            sources: 0,
+        }
+    }
+}
+
+/// The supervisor-level interrupt files of an IMSIC (RISC-V Advanced
+/// Interrupt Architecture), as the address layout that locates each hart's
+/// file. All fields zero when no IMSIC was reported.
+///
+/// A hart's files occupy `2^guest_index_bits` consecutive 4 KiB pages, its
+/// supervisor-level file the first of them; the hart's region lies at its hart
+/// index times that size, within its group, and group `g` lies at
+/// `g << group_index_shift` from [`Self::base`] (the AIA specification's
+/// IMSIC memory region layout). The bootloader reports a layout only when
+/// every enabled hart's file lies where [`Self::s_file_address`] puts it for
+/// that hart's ID.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImsicLayout
+{
+    /// Physical address of the supervisor-level file of group 0, hart index
+    /// 0; zero when no IMSIC was reported.
+    pub base: u64,
+    /// Number of interrupt identities each supervisor-level file implements
+    /// (identities `1..=ids`).
+    pub ids: u32,
+    /// Width of the guest-file index: each hart has `2^guest_index_bits`
+    /// pages of files.
+    pub guest_index_bits: u8,
+    /// Width of the hart index within a group.
+    pub hart_index_bits: u8,
+    /// Width of the group index.
+    pub group_index_bits: u8,
+    /// Bit position of the group index in a file address.
+    pub group_index_shift: u8,
+}
+
+impl ImsicLayout
+{
+    /// The all-zero layout: none reported.
+    #[must_use]
+    pub const fn zero() -> Self
+    {
+        Self {
+            base: 0,
+            ids: 0,
+            guest_index_bits: 0,
+            hart_index_bits: 0,
+            group_index_bits: 0,
+            group_index_shift: 0,
+        }
+    }
+
+    /// Physical address of the supervisor-level file of the hart whose hart
+    /// ID is `hart_id`: [`Self::base`] plus [`Self::s_file_offset`].
+    ///
+    /// `None` when [`Self::base`] is zero, when [`Self::s_file_offset`] is
+    /// `None`, or when the address overflows.
+    #[must_use]
+    pub fn s_file_address(&self, hart_id: u64) -> Option<u64>
+    {
+        if self.base == 0
+        {
+            return None;
+        }
+        self.base.checked_add(self.s_file_offset(hart_id)?)
+    }
+
+    /// Offset from [`Self::base`] of the supervisor-level file of the hart
+    /// whose hart ID is `hart_id`, taking the ID's low `hart_index_bits` bits
+    /// as its hart index and the bits above them as its group index:
+    /// `(group << group_index_shift) + (index << (12 + guest_index_bits))`.
+    ///
+    /// `None` when the group index is past `2^group_index_bits`, or a width
+    /// lies outside the AIA specification's ranges (guest index bits at most
+    /// 6, hart index bits at most 15, group index bits at most 7, and, with
+    /// any group bits, a group shift in `24..=55` above the hart-index field).
+    /// [`Self::base`] is not read.
+    #[must_use]
+    pub fn s_file_offset(&self, hart_id: u64) -> Option<u64>
+    {
+        let guest = u32::from(self.guest_index_bits);
+        let hart = u32::from(self.hart_index_bits);
+        let group = u32::from(self.group_index_bits);
+        let shift = u32::from(self.group_index_shift);
+        if guest > 6 || hart > 15 || group > 7
+        {
+            return None;
+        }
+        if group > 0 && (!(24..=55).contains(&shift) || shift < 12 + guest + hart)
+        {
+            return None;
+        }
+        let index = hart_id & ((1u64 << hart) - 1);
+        let group_index = hart_id >> hart;
+        if group_index >> group != 0
+        {
+            return None;
+        }
+        // At most 7 group bits at a shift of at most 55, and at most 15 index
+        // bits at 18 or below: neither term nor their sum overflows.
+        let group_offset = if group == 0 { 0 } else { group_index << shift };
+        Some(group_offset + (index << (12 + guest)))
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
 impl KernelMmio
 {
@@ -661,6 +816,8 @@ impl KernelMmio
             uart_size: 0,
             timebase_freq: 0,
             hart_caps: 0,
+            aplic: AplicDomain::zero(),
+            imsic: ImsicLayout::zero(),
         }
     }
 }
@@ -1052,6 +1209,106 @@ mod tests
         assert_eq!(core::mem::size_of::<MmioApertureSlice>(), 16);
         assert_eq!(core::mem::size_of::<MmioAperture>(), 16);
         assert_eq!(FramebufferInfo::SIZE, 24);
+        assert_eq!(core::mem::size_of::<AplicDomain>(), 24);
+        assert_eq!(core::mem::size_of::<ImsicLayout>(), 16);
+    }
+
+    /// QEMU `virt`'s supervisor-level IMSIC layout with `aia=aplic-imsic`
+    /// and 4 harts in one socket.
+    fn qemu_virt_imsic() -> ImsicLayout
+    {
+        ImsicLayout {
+            base: 0x2800_0000,
+            ids: 255,
+            guest_index_bits: 0,
+            hart_index_bits: 2,
+            group_index_bits: 0,
+            group_index_shift: 24,
+        }
+    }
+
+    // Defect caught: a file address that ignores the hart index, or places
+    // consecutive harts other than one 4 KiB page apart without guest files.
+    #[test]
+    fn s_file_address_places_each_hart_one_page_apart()
+    {
+        let l = qemu_virt_imsic();
+        assert_eq!(l.s_file_address(0), Some(0x2800_0000));
+        assert_eq!(l.s_file_address(3), Some(0x2800_3000));
+    }
+
+    // Defect caught: a hart ID past the hart-index field silently wrapping
+    // onto another hart's file when the layout has no group field.
+    #[test]
+    fn s_file_address_refuses_a_hart_past_the_index_field_without_groups()
+    {
+        assert_eq!(qemu_virt_imsic().s_file_address(4), None);
+    }
+
+    // Defect caught: guest files not scaling the per-hart stride, or the
+    // group index not placed at its shift.
+    #[test]
+    fn s_file_address_scales_by_guest_files_and_places_groups_at_their_shift()
+    {
+        let l = ImsicLayout {
+            guest_index_bits: 1,
+            group_index_bits: 1,
+            ..qemu_virt_imsic()
+        };
+        // Hart 1 of group 0: one hart of two pages in.
+        assert_eq!(l.s_file_address(1), Some(0x2800_2000));
+        // Hart 5 = group 1, index 1.
+        assert_eq!(l.s_file_address(5), Some(0x2900_2000));
+        // Hart 8 = group 2, past the one-bit group field.
+        assert_eq!(l.s_file_address(8), None);
+    }
+
+    // Defect caught: a layout outside the specification's widths producing an
+    // address (or a shift overflow panic) instead of being refused.
+    #[test]
+    fn s_file_address_refuses_absent_or_out_of_range_layouts()
+    {
+        assert_eq!(ImsicLayout::zero().s_file_address(0), None);
+        let wide_guest = ImsicLayout {
+            guest_index_bits: 7,
+            ..qemu_virt_imsic()
+        };
+        assert_eq!(wide_guest.s_file_address(0), None);
+        let bad_shift = ImsicLayout {
+            group_index_bits: 1,
+            group_index_shift: 200,
+            ..qemu_virt_imsic()
+        };
+        assert_eq!(bad_shift.s_file_address(0), None);
+        let overlapping = ImsicLayout {
+            hart_index_bits: 13,
+            group_index_bits: 1,
+            group_index_shift: 24,
+            ..qemu_virt_imsic()
+        };
+        assert_eq!(overlapping.s_file_address(0), None);
+        // Without a group field the shift is never applied, so any value is
+        // accepted there.
+        let unused_shift = ImsicLayout {
+            group_index_shift: 200,
+            ..qemu_virt_imsic()
+        };
+        assert_eq!(unused_shift.s_file_address(1), Some(0x2800_1000));
+    }
+
+    // Defect caught: an offset that depends on the base, which the ACPI
+    // parser derives the base from (a hart's file address minus its offset)
+    // before any base is known.
+    #[test]
+    fn s_file_offset_needs_no_base()
+    {
+        let l = ImsicLayout {
+            base: 0,
+            ..qemu_virt_imsic()
+        };
+        assert_eq!(l.s_file_offset(3), Some(0x3000));
+        assert_eq!(l.s_file_address(3), None);
+        assert_eq!(l.s_file_offset(4), None);
     }
 
     /// Round-trip: a populated `FramebufferInfo` survives `to_bytes` then

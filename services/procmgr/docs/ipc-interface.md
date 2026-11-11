@@ -293,9 +293,12 @@ however the child granted a copy onward before it died, is refused
 be minted by a holder of an un-badged SEND on procmgr's endpoint, which only
 init and svcmgr hold (§ `REGISTER_INIT_TEARDOWN`).
 
-procmgr serves its requests in order, so a `DESTROY_PROCESS` the creator sends
-first has torn the child down, and parked its record, before the release is
-served, whether or not procmgr had reaped the child already. A release that
+procmgr replies to a `DESTROY_PROCESS` only once the child is torn down and its
+record parked, by whichever of its threads tore the child down, since a
+teardown takes the child's entry and parks its record in one hold of the table
+lock ([README.md](../README.md) § Concurrency). So a release the creator sends
+after the destroy's reply finds the record parked, whether or not procmgr had
+reaped the child already. A release that
 finds no held record changes nothing: the child is live, was never started or
 never held, or was released already. procmgr never hands a held record's badge
 to a new child.
@@ -436,6 +439,15 @@ of the relay queue's observer nodes, so a terminal fault in any of the child's t
 fault class to the spawner's own death queue, then deletes its copy; a failed creation deletes it
 unbound. `CREATE_PROCESS` ignores bit 17.
 
+The file cap's server is the caller's to choose, so procmgr bounds each call it makes on the file
+cap and on its open (`FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, `FS_CLOSE`) at
+`FILE_CAP_CALL_TIMEOUT_MS` (10 s): an `FS_OPEN` or a read the server has not answered by then fails
+the create with `IO_ERROR`, as a refused one does, whichever read it is (the ELF header, the
+relocation table, the stack-size note, a segment, or the `.tdata` template), and an unanswered
+release or close is given up as a failed one is. procmgr makes no further read of the file once one
+has failed or gone unanswered, so a server that stops answering costs the create one such wait on
+its reads, however many reads the image's headers would still call for.
+
 **Reply (success):** as for `CREATE_PROCESS` (cap[0] process handle, cap[1]
 child `Thread` cap, and, with `CREATE_DMA_HOLD`, cap[2] the release token),
 including the destruction of a child whose reply caps cannot be delivered. A
@@ -446,10 +458,10 @@ included, as for `CREATE_PROCESS`.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed (the TLS block's checks aside; see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the main thread's TLS block could not be built (whatever the cause: an oversized or overaligned `PT_TLS`, a short `.tdata` read, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed (a failed read aside, see `IO_ERROR`; the TLS block's checks aside, see `OUT_OF_MEMORY`) |
+| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the main thread's TLS block could not be built (whatever the cause but a failed read: an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[31..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
-| 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
+| 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`; an `FS_READ` against procmgr's open (of the ELF header, the relocation table, the stack-size note, a segment's relocations, or the `.tdata` template and its relocations) failed or went unanswered for that long, or the `.tdata` template ended short; or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |
@@ -683,7 +695,7 @@ While no crash service is registered, a procmgr thread of its own, the **decline
 the endpoint and declines each fault with `FAULT_REPLY_KILL`, carrying the forwarder's reason for a
 forwarded page fault (data word 4) and no reason for an exception: the fault takes the outcome it
 has with no handler bound, and the kernel's decline line for a forwarded fault is the one the
-pager's own decline printed. The decliner shares nothing with the request loop but a wake
+pager's own decline printed. The decliner shares nothing with procmgr's request workers but a wake
 notification, so a receive on the endpoint never waits behind a request.
 
 Labels 19–21, 23, and 24 are the **debug authority**, and label 22 the **thread registry** it
@@ -704,21 +716,22 @@ service ([services/crashd/README.md](../../crashd/README.md)) and the GDB stub
 | `caps[0]` | A Thread cap of the service's main thread (any rights); further caps are deleted |
 
 procmgr parks the decliner, keeps the thread cap, and replies `SUCCESS` with one cap, `RECV` on the
-crash endpoint. The park is a message on the endpoint itself: procmgr's request loop calls the
-endpoint, un-badged and with a label no fault carries, and the decliner, which receives it only
-after every fault queued ahead of it and declines those, answers it and waits on its wake
-notification. The service then receives every fault on the endpoint. procmgr checks the kept cap on
-every pass of its loop, which the service's own death, or any request, wakes: once the cap is gone
-(procmgr's teardown of the service revokes every cap derived from its main thread) or its thread
-has exited, procmgr deletes the cap and signals the decliner, which receives again, declining the
-faults already queued. Replies: `UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` without a
-thread cap, or when procmgr has no crash endpoint; `CRASH_SERVICE_PRESENT` while a registered
-service lives; `OUT_OF_MEMORY` when the `RECV` cap cannot be derived or the park fails. A refused
-request's caps are deleted. A `SUCCESS` reply that cannot deliver the `RECV` cap (the caller's
-`CSpace` cannot take it, or the caller is gone) registers nothing: procmgr deletes the `RECV` cap
-and the kept thread cap and signals the decliner, as at the take-back. svctest's `crash_endpoint`
-phase drives the registration, the refusal of a second one, the handover, the take-back, and a
-registration after it.
+crash endpoint. The park is a message on the endpoint itself: the request worker serving the
+registration calls the endpoint, un-badged and with a label no fault carries, and the decliner,
+which receives it only after every fault queued ahead of it and declines those, answers it and waits
+on its wake notification. The service then receives every fault on the endpoint. procmgr checks the
+kept cap on every pass of its reaper, which the service's own death wakes, before it serves any
+request, and after the teardown of a `DESTROY_PROCESS`, which posts no death ([README](../README.md)
+§ Concurrency): once the cap is gone (procmgr's teardown of the service revokes every cap derived
+from its main thread) or its thread has exited, procmgr deletes the cap and signals the decliner,
+which receives again, declining the faults already queued. Replies: `UNAUTHORIZED` without the
+authority; `INVALID_ARGUMENT` without a thread cap, or when procmgr has no crash endpoint;
+`CRASH_SERVICE_PRESENT` while a registered service lives; `OUT_OF_MEMORY` when the `RECV` cap cannot
+be derived or the park fails. A refused request's caps are deleted. A `SUCCESS` reply that cannot
+deliver the `RECV` cap (the caller's `CSpace` cannot take it, or the caller is gone) registers
+nothing: procmgr deletes the `RECV` cap and the kept thread cap and signals the decliner, as at the
+take-back. svctest's `crash_endpoint` phase drives the registration, the refusal of a second one,
+the handover, the take-back, and a registration after it.
 
 ### Label 20: `ATTACH_PROCESS`
 
@@ -763,9 +776,10 @@ earlier attach left; a watch that is not a Thread cap, or that a refused attach 
 An attach whose reply cannot deliver its caps (the caller's `CSpace` cannot take them, or the caller
 is gone) has not succeeded: procmgr deletes the caps derived for it and the watch, and keeps the
 earlier one.
-procmgr reads the watched thread's state on every pass of its loop, which a process's death wakes:
-once the thread has exited, or its cap went with its process's teardown, procmgr logs `debugger
-gone; crash bindings restored` and restores the target's crash bindings as `DETACH_PROCESS` does
+procmgr reads the watched thread's state on every pass of its reaper, which a process's death
+wakes, before it serves any request, and after every `DESTROY_PROCESS`: once the thread has exited,
+or its cap went with its process's teardown, procmgr logs `debugger gone; crash bindings restored`
+and restores the target's crash bindings as `DETACH_PROCESS` does
 (Label 24). So a debugger that dies attached leaves no thread of its target bound to an endpoint no
 one receives on: a fault the target takes meanwhile waits there, and the restore delivers it again
 to the crash endpoint ([docs/fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume,

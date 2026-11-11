@@ -24,13 +24,14 @@ core/boot/
 ├── build.rs                    # Passes the RISC-V UEFI linker script to the linker
 ├── linker/
 │   └── riscv64-uefi.ld         # Linker script for RISC-V PE/COFF pipeline
+├── testdata/                   # QEMU virt AIA DTB, MADT and RHCT; the parsers' host-test input
 └── src/
     ├── main.rs                 # efi_main — boot sequence orchestrator
     ├── uefi.rs                 # UEFI protocol wrappers and memory services
     ├── elf.rs                  # UEFI-allocation layer over `shared/elf` + InitImage construction
     ├── firmware.rs             # ACPI RSDP / DTB discovery; MADT/DTB shared CPU-id placement
-    ├── acpi.rs                 # ACPI walker (CPUs, hart caps, apertures, VMGENID)
-    ├── dtb.rs                  # DTB walker (CPUs, hart caps, mmu-type, apertures, rng-seed)
+    ├── acpi.rs                 # ACPI walker (CPUs, hart caps, AIA, apertures, VMGENID)
+    ├── dtb.rs                  # DTB walker (CPUs, hart caps, AIA, mmu-type, apertures, rng-seed)
     ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation
     ├── framebuffer.rs          # Framebuffer text renderer (uses shared/font)
     ├── console.rs              # Early console: dual serial + framebuffer writer

@@ -34,9 +34,9 @@ use backend::{Unit, Vtd};
 // ── Declaration ────────────────────────────────────────────────────────────
 
 // What devmgr binds this driver to and how it starts it
-// (docs/driver-binding.md § Driver Declarations). devmgr reads it but starts
-// this driver on its fixed path until platform device records carry the key
-// it matches (docs/driver-binding.md § Status).
+// (docs/driver-binding.md § Driver Declarations): the IOMMU family record
+// of the platform's remapping table, which devmgr binds before any device
+// driver.
 driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     name: "iommu-vtd",
     class: None,

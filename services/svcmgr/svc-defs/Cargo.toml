@@ -15,6 +15,9 @@ ipc = { path = "../../../shared/ipc" }
 namespace-protocol = { path = "../../../shared/namespace-protocol" }
 # `process_abi::ARGV_ENV_MAX_BYTES` bounds a recipe's argv and env together.
 process-abi = { path = "../../../abi/process-abi" }
+# The line grammar (`key = value`, `#` comments) both parsers read through,
+# shared with devmgr's platform description table parser.
+svc-grammar = { path = "../../../shared/svc-grammar" }
 syscall-abi = { path = "../../../abi/syscall" }
 
 [lints]

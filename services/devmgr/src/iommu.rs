@@ -12,9 +12,10 @@
 //! x86-64 the ACPI DMAR, whose VT-d units' register `Mmio` caps it carves
 //! from the apertures; on riscv64 the ACPI RIMT, whose RISC-V IOMMUs are PCI
 //! functions, each unit's register cap being its BAR 0, carved after devmgr
-//! turns on the function's memory decode and bus mastering. It spawns the
-//! family's driver (`iommu-vtd`, `iommu-riscv`) from its boot module in a
-//! settle batch of its own, handing it every unit (`iommu_core::bootstrap`);
+//! turns on the function's memory decode and bus mastering. It spawns, in a
+//! settle batch of its own, the boot-module driver whose declaration matches
+//! the family's record key ([`Family::key`]: `dmar` binds `iommu-vtd`,
+//! `rimt` binds `iommu-riscv`), handing it every unit (`iommu_core::bootstrap`);
 //! devmgr keeps no copy of a register cap. Once the driver reports ready
 //! every function a unit translates is blocked until devmgr attaches it, so
 //! [`Iommu::confine`] attaches each DMA-capable device before its DMA grant
@@ -50,6 +51,8 @@ use std::os::seraph::thread::BuilderExt;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use driver_binding::decl::{DriverDecl, Tier};
+use firmware::binding::{Choice, MatchTable, RecordKeys, Source};
 use firmware::dma::{Confinement, ReservedError, ReservedRange, iova_limit, reserved_ranges};
 use firmware::dmar::{self, Bdf, Resolved};
 use firmware::rimt;
@@ -87,6 +90,17 @@ impl Family
         {
             Self::Vtd => "VT-d units",
             Self::Riscv => "RISC-V IOMMUs",
+        }
+    }
+
+    /// The family's IOMMU family key, which its record carries and its
+    /// driver's declaration names (docs/driver-binding.md § Device Records).
+    fn key(self) -> &'static [u8]
+    {
+        match self
+        {
+            Self::Vtd => b"dmar",
+            Self::Riscv => b"rimt",
         }
     }
 }
@@ -954,8 +968,12 @@ fn riscv_round(
 /// pools, from init's bootstrap, against which each device's reserved regions
 /// are checked; `None` when the set is not known in full, which refuses every
 /// device with a reserved region.
+// too_many_arguments: the IOMMU pass takes the boot modules, the pooled
+// extents, and every table a settle batch records into.
+#[allow(clippy::too_many_arguments)]
 pub fn bring_up(
     devices: &[pci::PciDevice],
+    modules: &mut Vec<(DriverDecl, u64)>,
     pooled: Option<Vec<(u64, u64)>>,
     caps: &mut caps::DevmgrCaps,
     watch: &mut settle::DriverWatch,
@@ -964,10 +982,6 @@ pub fn bring_up(
     ipc_buf: *mut u64,
 ) -> Option<Iommu>
 {
-    // Released on every exit the spawn does not take it on: a retained
-    // module cap pins init's donated pool run.
-    let module_cap = caps.module_cap_for_kind(caps::module_kind::IOMMU);
-    let module_guard = spawn::ModuleCapGuard::new(module_cap);
     let unconfined = |why: &str| {
         std::os::seraph::log!("{}: DMA-capable devices run unconfined", why);
     };
@@ -978,9 +992,23 @@ pub fn bring_up(
         unconfined("no IOMMU found");
         return None;
     };
-    if module_cap == 0
+    let Some((decl, module_cap)) = take_family_driver(family, modules)
+    else
     {
         unconfined("no IOMMU driver module");
+        return None;
+    };
+    // Released on every exit the spawn does not take it on: a retained
+    // module cap pins init's donated pool run.
+    let module_guard = spawn::ModuleCapGuard::new(module_cap);
+    let grants = firmware::binding::grants(&decl, Source::BootModule, true);
+    if !decl.dma || !grants.phys_access
+    {
+        std::os::seraph::log!(
+            "{}: declares no DMA or no physical access, which the IOMMU driver needs; not bound",
+            decl.name.as_str()
+        );
+        unconfined("IOMMU driver not started");
         return None;
     }
     let (rounds, topology) = match family
@@ -1002,7 +1030,9 @@ pub fn bring_up(
     };
     let settled = spawn_and_settle(
         caps,
-        module_guard,
+        &decl,
+        grants.tier,
+        (module_cap, module_guard),
         &rounds,
         &client,
         death_eq,
@@ -1050,6 +1080,70 @@ pub fn bring_up(
         faults,
         pooled,
     })
+}
+
+/// The IOMMU pass's match: take out of `modules` every boot-module
+/// declaration that matches the family record of `family` (its IOMMU family
+/// key, docs/driver-binding.md § Matching) and choose one through a match
+/// table of its own. The chosen declaration and module cap, or `None`, logged
+/// when two match equally; every other taken module is released.
+fn take_family_driver(
+    family: Family,
+    modules: &mut Vec<(DriverDecl, u64)>,
+) -> Option<(DriverDecl, u64)>
+{
+    let record = RecordKeys {
+        iommu_family: Some(family.key()),
+        ..RecordKeys::default()
+    };
+    let mut table: MatchTable<u64> = MatchTable::new();
+    let mut i = 0;
+    while i < modules.len()
+    {
+        if firmware::binding::decl_rank(&modules[i].0, Source::BootModule, &record).is_none()
+        {
+            i += 1;
+            continue;
+        }
+        let (decl, cap) = modules.remove(i);
+        if table.add(decl, Source::BootModule, cap).is_err()
+        {
+            std::os::seraph::log!(
+                "{}: no memory to consider the driver; not bound",
+                decl.name.as_str()
+            );
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+    let chosen = match table.choose(&record)
+    {
+        Choice::Bind(index) => Some(index),
+        Choice::Conflict(first, second) =>
+        {
+            let candidates = table.candidates();
+            std::os::seraph::log!(
+                "IOMMU record: {} and {} match it equally; neither bound",
+                candidates[first].decl.name.as_str(),
+                candidates[second].decl.name.as_str()
+            );
+            None
+        }
+        Choice::Unmatched => None,
+    };
+    let decl = chosen.map(|index| table.candidates()[index].decl);
+    let mut module = None;
+    for (index, cap) in table.drain_binaries().enumerate()
+    {
+        if Some(index) == chosen
+        {
+            module = Some(cap);
+        }
+        else
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+    decl.zip(module)
 }
 
 /// Every PCI-to-PCI bridge of `devices`: its segment, function, and bus
@@ -1175,16 +1269,19 @@ enum Settled
     NotReady,
 }
 
-/// Spawn the IOMMU driver from its module, which `module_guard` holds, over
-/// `rounds` with the client's endpoint as its service endpoint, in a settle
-/// batch of its own, its death watched on `death_eq` as well as devmgr's
-/// death queue, and settle it.
-// too_many_arguments: the spawn and its settle consume the client, the death
-// watch, the batch's death queue, the catalog, and the served classes.
+/// Spawn the IOMMU driver `decl` from its module, the cap `module.0` that
+/// the guard `module.1` holds, at `tier`, over `rounds` with the client's
+/// endpoint as its service endpoint, in a settle batch of its own, its death
+/// watched on `death_eq` as well as devmgr's death queue, and settle it.
+// too_many_arguments: the spawn and its settle consume the declaration, the
+// client, the death watch, the batch's death queue, the catalog, and the
+// served classes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_and_settle(
     caps: &caps::DevmgrCaps,
-    mut module_guard: spawn::ModuleCapGuard,
+    decl: &DriverDecl,
+    tier: Tier,
+    module: (u64, spawn::ModuleCapGuard),
     rounds: &[spawn::UnitRound],
     client: &IommuClient,
     death_eq: u64,
@@ -1206,11 +1303,12 @@ fn spawn_and_settle(
     };
     // `spawn_iommu_driver` owns the module cap's lifecycle from here
     // (consumed by CREATE_PROCESS, or released on failure).
+    let (module_cap, mut module_guard) = module;
     module_guard.disarm();
     let config = spawn::IommuSpawnConfig {
         procmgr_ep: caps.procmgr_ep,
         bootstrap_ep: caps.self_bootstrap_ep,
-        module_cap: caps.module_cap_for_kind(caps::module_kind::IOMMU),
+        module_cap,
         units: rounds,
         service_ep: client.ep,
         query_ep: batch.driver_ep(),
@@ -1218,8 +1316,13 @@ fn spawn_and_settle(
         watch_eq: death_eq,
         device_badge,
         // devmgr's DMA thread, at the boot drivers' level, calls the driver
-        // on every map and unmap of the root-disk path.
-        priority: ipc::sched_policy::BOOT_DRIVER_PRIORITY,
+        // on every map and unmap of the root-disk path; a boot-module
+        // declaration of the boot tier is given it.
+        priority: match tier
+        {
+            Tier::Boot => ipc::sched_policy::BOOT_DRIVER_PRIORITY,
+            Tier::Auxiliary => ipc::sched_policy::AUX_DRIVER_PRIORITY,
+        },
     };
     let process_handle = match spawn::spawn_iommu_driver(&config, ipc_buf)
     {
@@ -1234,12 +1337,13 @@ fn spawn_and_settle(
         spawn::DriverSpawn::Failed => return Settled::NotStarted,
     };
     let spawned = SpawnedDriver {
-        name: crate::fixed::IOMMU,
+        name: decl.name,
         serves: Serves::Iommu,
         badge: device_badge,
         driver: ServedDriver {
             ep: client.ep,
             dev_caps: None,
+            platform_caps: None,
             process_handle,
         },
     };

@@ -375,6 +375,88 @@ fn serve_extent_rounds(
     true
 }
 
+/// The boot modules init starts itself or hands to the service it starts
+/// them through, never forwarded to devmgr: the bootstrap services and the
+/// root filesystem driver.
+const BOOTSTRAP_MODULES: [&[u8]; 6] =
+    [b"init", b"procmgr", b"memmgr", b"devmgr", b"vfsd", b"fatfs"];
+
+/// Module caps one `kind::MODULE` round carries (`MSG_CAP_SLOTS_MAX`).
+const MODULES_PER_ROUND: usize = 4;
+
+/// Serve devmgr a copy of every boot module outside [`BOOTSTRAP_MODULES`],
+/// untagged, in `kind::MODULE` rounds of up to [`MODULES_PER_ROUND`] caps:
+/// the driver modules and the platform description tables, which devmgr
+/// tells apart by their content. Each round's data words carry each module's
+/// size in bytes, from its `CapDescriptor`: the cap covers whole pages, and
+/// the bytes past the module's end are not the module's. A module whose
+/// copy cannot be derived, or whose descriptor is missing, is skipped,
+/// logged, as `serve_region_rounds` skips a region: returning would leave
+/// devmgr blocked in `request_round` without the terminal round. Returns
+/// `false`, after logging, when a round fails.
+fn serve_module_rounds(
+    info: &InitInfo,
+    bootstrap_ep: u64,
+    child_badge: u64,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let count = (info.module_name_count as usize).min(init_protocol::INIT_MAX_NAMED_MODULES);
+    let mut forwarded = info.module_names[..count].iter().filter(|entry| {
+        let name = init_protocol::module_name_str(&entry.name);
+        !BOOTSTRAP_MODULES.contains(&name)
+    });
+    loop
+    {
+        let mut caps = [0u64; MODULES_PER_ROUND];
+        let mut data = [0u64; 2 + MODULES_PER_ROUND];
+        let mut n = 0usize;
+        for entry in forwarded.by_ref()
+        {
+            let Some(bytes) = crate::descriptors(info)
+                .iter()
+                .find(|d| d.slot == entry.slot)
+                .map(|d| d.aux1)
+            else
+            {
+                log("devmgr: boot module has no descriptor; module skipped");
+                continue;
+            };
+            let Ok(copy) = syscall::cap_derive(entry.slot, MODULE_COPY_RIGHTS)
+            else
+            {
+                log("devmgr: boot module cap derive failed; module skipped");
+                continue;
+            };
+            caps[n] = copy;
+            data[2 + n] = bytes;
+            n += 1;
+            if n == MODULES_PER_ROUND
+            {
+                break;
+            }
+        }
+        if n == 0
+        {
+            return true;
+        }
+        data[0] = kind::MODULE;
+        data[1] = n as u64;
+        if !serve(
+            bootstrap_ep,
+            child_badge,
+            ipc_buf,
+            false,
+            &caps[..n],
+            &data[..2 + n],
+            "devmgr: bootstrap module round failed",
+        )
+        {
+            return false;
+        }
+    }
+}
+
 // ── devmgr creation ──────────────────────────────────────────────────────────
 
 /// Round-kind discriminator for post-R1 bootstrap rounds (devmgr side).
@@ -387,26 +469,6 @@ mod kind
     pub const SVCMGR_BUNDLE: u64 = 4;
     pub const FRAMEBUFFER_INFO: u64 = 5;
     pub const RAM_EXTENT: u64 = 6;
-}
-
-/// Per-cap class tag carried in a `kind::MODULE` round's data words so
-/// devmgr resolves a driver module by class rather than delivery position.
-/// Mirrors `devmgr/src/caps.rs::module_kind`.
-///
-/// Only bootstrap-essential drivers ship as bundle modules, the IOMMU
-/// driver of the architecture's IOMMU family among them (`iommu-vtd` on
-/// x86-64, `iommu-riscv` on riscv64). The per-arch RTC binary lives on the
-/// rootfs disk and is loaded lazily by devmgr after init delivers a
-/// `/services/drivers/` subtree cap via `devmgr_labels::SET_DRIVERS_DIR`; no
-/// RTC `module_kind` is delivered.
-mod module_kind
-{
-    pub const VIRTIO_BLK: u64 = 1;
-    pub const SERIAL: u64 = 2;
-    pub const FRAMEBUFFER: u64 = 3;
-    pub const IOMMU: u64 = 4;
-    /// Module kinds init delivers at most one module of each.
-    pub const COUNT: usize = 4;
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Tells devmgr which optional
@@ -486,7 +548,8 @@ fn serve_region_rounds(
 ///   - `data[2..]` = kind-specific payload:
 ///       - aperture / ACPI: `(base, size)` pairs per cap
 ///       - RAM extent: `(base, size)` pairs, one per extent memmgr pools
-///       - module: one `module_kind` tag per cap
+///       - module: each module's size in bytes, one word per cap; each cap
+///         is one boot module, untagged
 ///   - terminal round has `done = true`.
 ///
 /// The bootstrap layout mirrors `devmgr/src/caps.rs::bootstrap_caps`.
@@ -641,7 +704,6 @@ pub fn create_devmgr_with_caps(
 
     // SVCMGR_BUNDLE is unconditionally the terminal round; every prior
     // round therefore sets `done=false` regardless of what follows.
-    let virtio_blk_module = crate::find_module_by_name(info, b"virtio-blk");
 
     // ── Aperture and ACPI region rounds ─────────────────────────────────
     if !serve_region_rounds(
@@ -663,66 +725,10 @@ pub fn create_devmgr_with_caps(
         return None;
     }
 
-    // ── Module round (driver binaries devmgr spawns) ────────────────────
-    //
-    // Each delivered cap is tagged with its `module_kind` in the data
-    // words so devmgr binds a module by class, not by delivery position.
-    // Only bootstrap-essential drivers are delivered; the per-arch RTC
-    // lives on the rootfs and is loaded by devmgr lazily after the
-    // `SET_DRIVERS_DIR` handshake (Phase 3, below).
-    let serial_module = crate::find_module_by_name(info, b"serial");
-    let framebuffer_module = crate::find_module_by_name(info, b"framebuffer");
-    // The bundle carries the IOMMU driver of its architecture's family only.
-    let iommu_module = crate::find_module_by_name(info, b"iommu-vtd")
-        .or_else(|| crate::find_module_by_name(info, b"iommu-riscv"));
+    // ── Module rounds (every boot module outside the bootstrap set) ─────
+    if !serve_module_rounds(info, bootstrap_ep, child_badge, ipc_buf)
     {
-        let mut module_caps = [0u64; module_kind::COUNT];
-        let mut module_data = [0u64; 2 + module_kind::COUNT];
-        module_data[0] = kind::MODULE;
-        let mut n = 0usize;
-
-        for (source, tag) in [
-            (virtio_blk_module, module_kind::VIRTIO_BLK),
-            (serial_module, module_kind::SERIAL),
-            (framebuffer_module, module_kind::FRAMEBUFFER),
-            (iommu_module, module_kind::IOMMU),
-        ]
-        {
-            let Some(module_cap) = source
-            else
-            {
-                continue;
-            };
-            // A failed derive skips the module, as `serve_region_rounds` skips
-            // a region: returning here would leave devmgr blocked in
-            // `request_round` without the terminal round.
-            let Ok(module_copy) = syscall::cap_derive(module_cap, MODULE_COPY_RIGHTS)
-            else
-            {
-                log("devmgr: driver module cap derive failed; module skipped");
-                continue;
-            };
-            module_caps[n] = module_copy;
-            module_data[2 + n] = tag;
-            n += 1;
-        }
-
-        if n > 0
-        {
-            module_data[1] = n as u64;
-            if !serve(
-                bootstrap_ep,
-                child_badge,
-                ipc_buf,
-                false,
-                &module_caps[..n],
-                &module_data[..2 + n],
-                "devmgr: bootstrap module round failed",
-            )
-            {
-                return None;
-            }
-        }
+        return None;
     }
 
     // ── Framebuffer-info round ──────────────────────────────────────────

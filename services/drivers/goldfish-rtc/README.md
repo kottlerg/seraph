@@ -9,15 +9,15 @@ fixed physical address `0x101000`. It returns wall-clock time as a
 64-bit nanosecond count since the Unix epoch in two 32-bit MMIO
 register reads.
 
-Installed to `/services/drivers/goldfish-rtc` on the rootfs. Spawned
-by [devmgr](../../devmgr/README.md) on RISC-V QEMU virt via the non-PCI simple-device path,
+Installed to `/services/drivers/goldfish-rtc` on the rootfs. Bound
+by [devmgr](../../devmgr/README.md) on RISC-V QEMU virt to the platform record of the
+`qemu-virt` platform description table,
 `procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
 walks to from the `LOOKUP | READ | READDIR` `/services/drivers/` subtree cap
 svcmgr delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR` (see
 [Device Management](../../../docs/device-management.md#driver-binary-sources)). The driver
 carries a declaration in the ELF note section `.note.seraph.driver` (platform key
-`google,goldfish-rtc`) that no device record devmgr builds matches yet, so devmgr starts it on its
-fixed path.
+`google,goldfish-rtc`), which the drivers-directory pass matches against that record.
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities) owns the
 driver's service endpoint and mints client SEND caps on
 `devmgr_labels::QUERY_DEVICE` on the `rtc` class SEND, each badged with
@@ -40,17 +40,12 @@ goldfish-rtc/
 
 ## Endpoint
 
-Bootstrap caps from devmgr, in two rounds. Round 1 (`done=false`) carries two
-caps:
-
-| Slot      | Cap                                                  |
-|-----------|------------------------------------------------------|
-| `caps[0]` | Service-endpoint RECV (driver receives on this)      |
-| `caps[1]` | `Mmio` covering one page at `0x101000`         |
-
-Round 2 (`done=true`) carries one cap, the driver's devmgr query cap: a SEND
-badged with its device badge on the private endpoint of its devmgr spawn
-batch.
+devmgr delivers the record's resource list, decoded with
+`driver_binding::resources::PlatformDelivery`: the `Mmio` resource covering one page at
+`0x101000`, and in the end round the service-endpoint RECV and the driver's devmgr query cap, a
+SEND badged with its device badge on the private endpoint of its devmgr spawn batch. The record
+also names the RTC's line (PLIC / APLIC source 11), but the declaration asks for no interrupt,
+so devmgr delivers none.
 
 The driver reserves one page of VA via `reserve_pages`, funds the AS's
 page-table growth budget for that page via `fund_aspace_pt_budget`, and maps
@@ -105,14 +100,16 @@ is **not discoverable** at runtime:
 - EDK2 does not emit an ACPI entry for the Goldfish RTC (no
   standard `_HID`).
 
-The driver therefore depends on the bootloader seeding
+The device is therefore described by the `qemu-virt` platform description table
+(`services/devmgr/platform/qemu-virt.platform`,
+[Driver Binding](../../../docs/driver-binding.md#platform-description-tables)), which devmgr uses
+when the XSDT's OEM table ID is `BXPC`, and the driver depends on the bootloader seeding
 `(0x101000, 0x1000)` as a platform-default aperture, which its ACPI
 walker appends whenever the RSDP and XSDT validate, MCFG present or
 absent (beside the PCI-ECAM default that exists for the same
 firmware-discovery reason; see
-[ACPI Parsing](../../../core/boot/docs/acpi.md#tables-consumed)). devmgr
-identifies this driver's region by matching the well-known base
-address `0x101000`, not by any discovery mechanism.
+[ACPI Parsing](../../../core/boot/docs/acpi.md#tables-consumed)). devmgr carves the record's
+`Mmio` from that aperture.
 
 Real RISC-V boards diverge from QEMU `virt`. Per-board RTC support
 (I2C chips, vendor-specific MMIO RTCs, boards with no RTC at all)

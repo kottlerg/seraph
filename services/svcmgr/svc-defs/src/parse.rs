@@ -219,20 +219,13 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut seen_seed = false;
     let mut seen_provides = false;
 
-    for (idx, raw) in contents.lines().enumerate()
+    for entry in svc_grammar::entries(contents)
     {
-        let lineno = idx + 1;
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#')
-        {
-            continue;
-        }
-
-        let (key, value) = match line.split_once('=')
-        {
-            Some((k, v)) => (k.trim(), v.trim()),
-            None => return Err(ParseError::MissingEquals(lineno)),
-        };
+        let svc_grammar::Entry {
+            line: lineno,
+            key,
+            value,
+        } = entry.map_err(|svc_grammar::MissingEquals(l)| ParseError::MissingEquals(l))?;
 
         match key
         {

@@ -5,10 +5,11 @@
 
 //! Seraph Goldfish RTC driver (QEMU `virt` RISC-V).
 //!
-//! Spawned by devmgr with a one-page `Mmio` cap covering the
-//! Goldfish RTC register page (`0x101000` on QEMU virt) plus a RECV
-//! cap on the driver's service endpoint in a first bootstrap round, and its
-//! devmgr query cap in a second, terminal one. Once the page is mapped it
+//! devmgr binds it to the platform device record a platform description
+//! table names `google,goldfish-rtc` (`0x101000` on QEMU virt) and delivers
+//! the record's register page as an `Mmio` range, with the driver's service
+//! endpoint and its devmgr query cap, in a resource list
+//! (`driver_binding::resources`). Once the page is mapped it
 //! reports ready (`devmgr_labels::DRIVER_READY`) on the query cap,
 //! immediately before its service loop: devmgr serves the driver's endpoint
 //! only after that report. Implements the one-label RTC driver contract
@@ -17,8 +18,10 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_ptr_alignment)]
 
+use driver_binding::resources::{self, PlatformDelivery, Resource};
 use ipc::{IpcMessage, rtc_errors, rtc_labels};
 use std::os::seraph::{reserve_pages, startup_info};
+use syscall_abi::PAGE_SIZE;
 
 // ── Register offsets (Goldfish RTC) ────────────────────────────────────────
 
@@ -28,9 +31,7 @@ const REG_TIME_HIGH: u64 = 0x04;
 // ── Declaration ────────────────────────────────────────────────────────────
 
 // What devmgr binds this driver to and how it starts it
-// (docs/driver-binding.md § Driver Declarations). devmgr reads it but starts
-// this driver on its fixed path until platform device records carry the key
-// it matches (docs/driver-binding.md § Status).
+// (docs/driver-binding.md § Driver Declarations).
 driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     name: "goldfish-rtc",
     class: Some("rtc"),
@@ -46,40 +47,28 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 
-struct BootCaps
-{
-    service_ep: u64,
-    mmio_cap: u64,
-    /// devmgr query cap: a SEND badged with this device's badge on its spawn
-    /// batch's private endpoint, for `DRIVER_READY`.
-    devmgr_query_ep: u64,
-}
-
-/// Request the two bootstrap rounds: round 1 (not terminal)
-/// `[service_ep, mmio_cap]`, round 2 (terminal) `[devmgr_query_ep]`.
-fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
+/// Receive the resource list (`driver_binding::resources`): the RTC's
+/// register page as an `Mmio` range, and the endpoints. `None` unless the
+/// range is page-aligned, holds the time registers, and spans at most one
+/// page, so its cap maps into a one-page reservation.
+fn bootstrap(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<(u64, PlatformDelivery)>
 {
     if creator_endpoint == 0
     {
         return None;
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let r1 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if r1.cap_count < 2 || r1.done
+    let list = unsafe { resources::receive(creator_endpoint, ipc_buf) }.ok()?;
+    let device = PlatformDelivery::from_list(&list)?;
+    let Resource::Mmio {
+        cap, phys, bytes, ..
+    } = device.registers
+    else
     {
         return None;
-    }
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let r2 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if r2.cap_count < 1 || !r2.done
-    {
-        return None;
-    }
-    Some(BootCaps {
-        service_ep: r1.caps[0],
-        mmio_cap: r1.caps[1],
-        devmgr_query_ep: r2.caps[0],
-    })
+    };
+    let fits = phys % PAGE_SIZE == 0 && (REG_TIME_HIGH + 4..=PAGE_SIZE).contains(&bytes);
+    fits.then_some((cap, device))
 }
 
 // ── MMIO read sequence ─────────────────────────────────────────────────────
@@ -175,18 +164,12 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(caps) = bootstrap_caps(info.creator_endpoint, ipc_buf)
+    let Some((mmio_cap, device)) = bootstrap(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!("bootstrap caps missing");
+        std::os::seraph::log!("resource list missing or without a one-page register range");
         syscall::thread_exit();
     };
-
-    if caps.mmio_cap == 0
-    {
-        std::os::seraph::log!("no MMIO cap");
-        syscall::thread_exit();
-    }
 
     // Reserve one page of VA for the MMIO mapping. The reservation
     // lives for the driver process's lifetime; ReservedRange has no
@@ -205,29 +188,23 @@ fn main() -> !
         syscall::thread_exit();
     }
     // SAFETY: `range` is a fresh one-page reservation from the per-process
-    // arena, owned for the process's lifetime, and devmgr carves the RTC
-    // `Mmio` cap as one page (`carve_rtc_authority`), so the whole-region
-    // mapping stays inside it: VA no Rust object or IPC page occupies.
-    // `read_epoch_ns` reaches the mapping only through raw `read_volatile`,
-    // never a reference, and the reservation stays held for the process's
-    // lifetime (`mmio_map` § Safety).
-    if unsafe { syscall::mmio_map(info.self_aspace, caps.mmio_cap, base_va, 0) }.is_err()
+    // arena, owned for the process's lifetime, and `bootstrap` admits only a
+    // page-aligned range of at most one page, whose cap devmgr carves to the
+    // page end, so the whole-region mapping stays inside it: VA no Rust
+    // object or IPC page occupies. `read_epoch_ns` reaches the mapping only
+    // through raw `read_volatile`, never a reference, and the reservation
+    // stays held for the process's lifetime (`mmio_map` § Safety).
+    if unsafe { syscall::mmio_map(info.self_aspace, mmio_cap, base_va, 0) }.is_err()
     {
         std::os::seraph::log!("mmio_map failed");
         syscall::thread_exit();
     }
 
-    if caps.service_ep == 0
-    {
-        std::os::seraph::log!("no service endpoint");
-        syscall::thread_exit();
-    }
-
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if let Err(e) = unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
+    if let Err(e) = unsafe { ipc::report_driver_ready(device.endpoints.devmgr_query, ipc_buf) }
     {
         std::os::seraph::log!("DRIVER_READY failed ({:?}); exiting", e);
         syscall::thread_exit();
     }
-    service_loop(caps.service_ep, ipc_buf, base_va);
+    service_loop(device.endpoints.service, ipc_buf, base_va);
 }

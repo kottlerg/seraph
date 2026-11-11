@@ -449,7 +449,7 @@ devmgr's responsibilities are:
     its overrun of the settle bound, before it reports ready, is sticky and
     surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
     the rtc, input, and debug-port classes, the same reply
-    as before the spawn has run, so a client retries it only a bounded number of times. See
+    as before `SET_DRIVERS_DIR` arrives, so a client retries it only a bounded number of times. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves

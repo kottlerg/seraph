@@ -1937,9 +1937,13 @@ pub mod devmgr_labels
     /// ordinals after it keep their drivers, so a client probing ordinals 0,
     /// 1, ... passes a `WITHDRAWN` reply and stops at the first other reply
     /// that is not `SUCCESS`. Replies [`super::devmgr_errors::NO_DEVICE`]
-    /// past the last served driver, which includes every ordinal of a class
-    /// whose drivers are not yet spawned and settled ([`SET_DRIVERS_DIR`]),
-    /// and `INVALID_REQUEST` when the derivation fails.
+    /// past the last served driver, which before [`SET_DRIVERS_DIR`] includes
+    /// every ordinal of a class whose drivers devmgr spawns from disk, and
+    /// `INVALID_REQUEST` when the derivation fails. A query received once
+    /// [`SET_DRIVERS_DIR`]'s pass is posted, whose answer would name no
+    /// driver, waits until that pass and the settle of its drivers are done
+    /// and is then answered from the settled drivers; a query that names a
+    /// served driver is answered at once.
     ///
     /// The handler logs nothing: logd is a caller, blocked in this call
     /// outside its log loop, so a log line here would deadlock.
@@ -2185,8 +2189,10 @@ pub mod devmgr_labels
     /// of the served `test-dma` fixture, the driver devmgr binds to the DMA
     /// test device (QEMU's `edu`, PCI `1234:11e8`) at [`SET_DRIVERS_DIR`]
     /// by its declaration, like any driver (the fixture checks no badge).
-    /// devmgr serves it once that settle batch ends; until then the query
-    /// replies `NO_DEVICE`, as it does on a machine with no such device.
+    /// devmgr serves it once that settle batch ends: before
+    /// [`SET_DRIVERS_DIR`] the query replies `NO_DEVICE`, as it does on a
+    /// machine with no such device, and one received during the pass waits
+    /// until the batch has settled.
     /// Reply: `SUCCESS` with the cap in `caps[0]` and `data[0]` =
     /// [`TEST_DMA_CONFINED`] when an IOMMU confines the device or
     /// [`TEST_DMA_UNCONFINED`] when none does; `WITHDRAWN` once the fixture
@@ -3696,13 +3702,14 @@ pub mod devmgr_errors
     /// Requested device or table is unavailable. Returned by `QUERY_DEVICE`
     /// when the requested instance ordinal is past the last served driver
     /// of the class, which it is for every ordinal while devmgr either (a)
-    /// has not yet spawned and settled the class's on-disk drivers (no
-    /// [`super::devmgr_labels::SET_DRIVERS_DIR`] yet, or its settle still
-    /// running), or (b) attempted the disk-walked spawn and failed (missing
-    /// binary, ELF corrupt, hardware carve failed, OOM, the driver died or
-    /// did not report ready within the settle bound, etc.), or (c) binds no
-    /// driver of the class on this machine. Case (a) is transient: it ends
-    /// once the `SET_DRIVERS_DIR` spawns and their settle complete, so a
+    /// has not yet received [`super::devmgr_labels::SET_DRIVERS_DIR`], so
+    /// it has not spawned the class's on-disk drivers, or (b) attempted the
+    /// disk-walked spawn and failed (missing binary, ELF corrupt, hardware
+    /// carve failed, OOM, the driver died or did not report ready within
+    /// the settle bound, etc.), or (c) binds no driver of the class on this
+    /// machine. A query received while the drivers-directory pass or its
+    /// settle runs waits until both are done and gets no case (a) reply.
+    /// Case (a) is transient: it ends once `SET_DRIVERS_DIR` arrives, so a
     /// client that cannot proceed without the device MAY retry with a
     /// bounded number of attempts. Cases (b) and (c) are sticky for the
     /// boot, since a single attempt is made, and a client cannot tell (a)

@@ -234,6 +234,15 @@ Hardware interrupts are received by the kernel and delivered to drivers as
 asynchronous IPC notifications. Drivers re‑enable interrupt delivery explicitly
 after handling.
 
+**Binding**
+A module declares what it serves and the always-shipped core discovers the declaration: no
+resident binary every deployment ships carries knowledge of one particular driver, so a
+deployment ships only the drivers it needs. Each driver binary declares its match keys,
+device class, and resource needs, and devmgr matches enumerated devices against those
+declarations and binds them through one path (design intent; not yet implemented,
+[#165](https://github.com/kottlerg/seraph/issues/165)). See
+[driver-binding.md](driver-binding.md).
+
 ---
 
 ## IPC (summary — [ipc-design.md](ipc-design.md))

@@ -225,9 +225,13 @@ what the run is:
 - A run docs/testing.md § Coverage tiers owes: `--alone`, which admits it only with no other
   QEMU running, whatever its vCPU count, since its hang or failure blocks as that section says.
 
-`--host-override` is the maintainer's, for interactive use; a worker does not pass it. Run one
-QEMU of your own at a time. A timeout or timing failure of a boot that ran beside another QEMU,
-and that § Coverage tiers does not owe, is re-run once alone before it counts.
+`--host-override` is the maintainer's, for interactive use; a worker does not pass it. While the
+orchestrator holds the host for another worker's grant, launch no boot (the command refuses one
+not passed that grant), and during a timing-sensitive measurement no build either, until it says
+the grant ended: the command refuses a build only while a `--timing` boot runs, not between the
+holder's boots. Run one QEMU of your own at a time. A timeout or timing failure of a boot that ran
+beside another QEMU, and that § Coverage tiers does not owe, is re-run once alone before it
+counts.
 
 A boot that fails, hangs, or shows a kill you did not expect is evidence. Before any re-run,
 copy its saved log, and its `.crash.txt` when there is one, to a name that says what it is (the

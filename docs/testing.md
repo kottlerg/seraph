@@ -337,7 +337,9 @@ must be complete and hold the fields its kind, thread, and status require.
   instruction, each tied to `crashme` through the badge logd's `reclaim:` line names, complete, its
   walk starting at its instruction pointer, matched by the kernel's `handler declined` line
   carrying the block's id, and carrying the stack pointer the kernel's register dump of that line's
-  thread prints, so the block read the thread that faulted.
+  thread prints, so the block read the thread that faulted. The `vm` block's `addr`, the fault
+  message's address, must also be the faulting address that dump prints (`cr2` on x86_64, `stval`
+  on riscv64), so the dump names the access that faulted.
 - `--expect none` reads a boot of an image that stages no crashd: the log must hold no block, the
   check that the absent service changes nothing a fault does.
 

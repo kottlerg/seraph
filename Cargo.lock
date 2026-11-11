@@ -422,6 +422,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-binding"
+version = "0.1.3"
+dependencies = [
+ "ipc",
+ "process-abi",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "elf"
 version = "0.1.3"
 dependencies = [

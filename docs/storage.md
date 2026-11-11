@@ -35,9 +35,13 @@ Four system-scope invariants govern the stack:
   `blk_labels::MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr for
   each block driver, and fs drivers hold partition-identity-badged caps
   the block driver mints on `REGISTER_PARTITION`; unbadged callers are
-  rejected. vfsd is the sole holder of the whole-disk caps: devmgr
-  mints one on `QUERY_DEVICE` only for a caller whose SEND is the
-  `block` class SEND, which init requests for vfsd alone. Out-of-bounds LBAs are rejected by
+  rejected. vfsd is the sole holder of the whole-disk caps while no
+  service definition seeds `devmgr.class.block`, and no shipped one
+  does: devmgr mints one on `QUERY_DEVICE` only for a caller whose SEND
+  is a `block` class SEND, which init requests for vfsd and svcmgr
+  publishes seed-only as `devmgr.class.block`. A definition that seeds
+  that name gives its service whole-disk authority, `REGISTER_PARTITION`
+  included. Out-of-bounds LBAs are rejected by
   the block driver on every request. See
   [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
 - **System root is delivered, never discovered.** Every process
@@ -83,10 +87,11 @@ Distribution". Badge semantics, derivation, and revocation are owned by
 
 `REGISTER_PARTITION` is rejected unless the caller's badge carries
 `blk_labels::MOUNT_AUTHORITY`: only the holder of the devmgr-minted whole-disk cap
-can mint a partition binding. vfsd is the only such holder: devmgr
+can mint a partition binding. vfsd is the only such holder while no
+service definition seeds `devmgr.class.block` (§ Invariants): devmgr
 mints a whole-disk cap on `QUERY_DEVICE` only for a caller
-whose SEND is the `block` class SEND, which init requests for
-vfsd alone. The block driver
+whose SEND is a `block` class SEND, which init requests for
+vfsd and svcmgr publishes seed-only as `devmgr.class.block`. The block driver
 enforces the LBA bound on every read and write against the caller's
 badge. See
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
@@ -213,8 +218,8 @@ by structure. See
 The contract between fs drivers and the block driver has three
 elements:
 
-- **Two-tier endpoint.** Whole-disk `blk_labels::MOUNT_AUTHORITY`-badged (vfsd
-  only) versus
+- **Two-tier endpoint.** Whole-disk `blk_labels::MOUNT_AUTHORITY`-badged (vfsd;
+  § Invariants) versus
   per-partition badged (fs drivers); unbadged callers
   are rejected. The block driver distinguishes by the
   kernel-supplied caller badge.

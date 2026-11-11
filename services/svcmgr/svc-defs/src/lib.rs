@@ -178,9 +178,10 @@ pub struct Definition
     pub provides: Vec<ProvidedName>,
     /// `log_sink = yes` marks the service as the system log sink (real-logd).
     /// svcmgr mints its bootstrap round — master-log RECV, the first-launch
-    /// `HANDOVER_PULL` SEND, a `DEATH_EQ_AUTHORITY` `SEND|GRANT`, and a
-    /// `devmgr.registry` query cap — from the reserved log-sink sources and
-    /// the `devmgr.registry` source it holds, rather than from `seed` /
+    /// `HANDOVER_PULL` SEND, a `DEATH_EQ_AUTHORITY` `SEND|GRANT`, and the
+    /// `serial` and `framebuffer` class SENDs — from the reserved log-sink
+    /// sources and its `devmgr.class.serial` and `devmgr.class.framebuffer`
+    /// publications, rather than from `seed` /
     /// `provides` (which the parser rejects in combination). Exactly one
     /// recipe carries this; supervision/restart otherwise follow the normal
     /// `restart`/`critical` fields.

@@ -295,8 +295,9 @@ A log-sink service's bootstrap round is **not** assembled from `seed` or
 `provides`. svcmgr mints it from the reserved log-sink sources init endows
 at handover (the master-log endpoint source and the procmgr `SEND|GRANT`
 death-auth source — see
-[`process-lifecycle.md`](../../../docs/process-lifecycle.md)) plus the
-`devmgr.registry` source. The round has five positional slots, carried with a presence word as
+[`process-lifecycle.md`](../../../docs/process-lifecycle.md)) and from
+its `devmgr.class.serial` and `devmgr.class.framebuffer` publications. The round has five
+positional slots, carried with a presence word as
 [`seed`](#seed) describes, so an absent slot rides as no cap:
 
 | Index | Cap |
@@ -312,7 +313,8 @@ position in the round; declaring either alongside `log_sink = yes` is a
 parser error. The same svcmgr-minted round drives the first launch (`cap[1]`
 present, history pulled from init-logd per the
 [logd handover protocol](../../logd/docs/handover-protocol.md)). A slot whose source is absent
-from the endowment, or whose derive fails, is absent from the round; logd requires only `cap[0]`.
+from the endowment or not published (slots 3 and 4 when no class file configured the class), or
+whose derive fails, is absent from the round; logd requires only `cap[0]`.
 svcmgr holds the master-log source for the system's life, so the round is designed to also
 drive every restart (`cap[1]` absent, history pull skipped), each relaunched logd
 re-attaching a fresh RECV to the same endpoint object every sender already

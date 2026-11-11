@@ -5190,7 +5190,10 @@ impl KernelCpus
     /// `cpu`'s scheduler.
     fn scheduler(&self, cpu: usize) -> &'static PerCpuScheduler
     {
-        assert!(cpu < self.cpu_count, "idle pull reads cpu {cpu} past CPU_COUNT");
+        assert!(
+            cpu < self.cpu_count,
+            "idle pull reads cpu {cpu} past CPU_COUNT"
+        );
         // SAFETY: cpu < CPU_COUNT (asserted) and the slab is initialised
         // (`new`'s contract).
         unsafe { &*scheduler_ptr(cpu) }

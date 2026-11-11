@@ -273,10 +273,11 @@ pub struct AddressSpace
 The terminal-fault observer state (the `death_observers` chain of observer nodes,
 `terminal_faulted`, `terminal_fault_reason`) changes and is read only under `death_lock`: the bind
 (`sys_aspace_bind_notification`) pushes a node, drawn from the observing queue's pool, under it, and
-the terminal-fault post reads the chain head and records the first fault under it before walking the
-chain and posting outside it (a linked node's links never change until the teardown takes the
-chain), and `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_TERMINAL_FAULT` reads the retained reason under it
-(`AddressSpace::retained_terminal_fault`).
+the terminal-fault path records the first fault and reads the chain head under it before the
+faulting thread's `Exited` commit (`record_aspace_terminal_fault`), then walks the chain and posts
+outside it after the commit (`post_aspace_death_notification`; a linked node's links never change
+until the teardown takes the chain), and `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_TERMINAL_FAULT` reads
+the retained reason under it (`AddressSpace::retained_terminal_fault`).
 
 ### Lifecycle
 

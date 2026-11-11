@@ -524,17 +524,25 @@ fn runs_at<'a>(records: &'a [Record], head: &str) -> Result<Vec<&'a Record>, Vec
     Ok(here)
 }
 
-/// The run of the reviewer alone that the last run at a head completes: the
-/// run before it at the head, when the last run is an `audit` record and that
-/// run has `audit_verdict` `NOT RUN` (docs/conventions.md § Pre-merge review).
+/// The run of the reviewer alone that the last run at a head completes
+/// (docs/conventions.md § Pre-merge review): when the last run is an `audit`
+/// record, the latest run before it at the head that has `audit_verdict`
+/// `NOT RUN`, provided only `audit` records lie between them (a failed audit
+/// and its re-audit both complete the same run). A run with the reviewer in
+/// between, or none at all, completes nothing.
 fn completed_run<'a>(runs: &[&'a Record]) -> Option<&'a Record>
 {
-    let [.., before, last] = runs
-    else
+    let (last, before) = runs.split_last()?;
+    if last.1["stats"]["mode"] != "audit"
     {
         return None;
-    };
-    (last.1["stats"]["mode"] == "audit" && before.1["audit_verdict"] == NOT_RUN).then_some(*before)
+    }
+    before
+        .iter()
+        .rev()
+        .find(|(_, r)| r["stats"]["mode"] != "audit")
+        .filter(|(_, r)| r["audit_verdict"] == NOT_RUN)
+        .copied()
 }
 
 /// The merge condition's record part (docs/conventions.md § Pre-merge
@@ -578,13 +586,13 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
     // a blocking verdict of the run blocks whatever the audit record states.
     let completed = completed_run(&runs);
     if let Some((run_name, run)) = completed
-        && !verdict_passes(run)
+        && !(verdict_passes(run) && run["stats"]["failed"].as_array().is_some_and(Vec::is_empty))
     {
         return vec![Diag::error(
             "gate-review-record",
             run_name.as_str(),
             "the run of the reviewer alone that the last audit at this head completes has a \
-             verdict that does not pass",
+             failed agent or a verdict that does not pass",
         )];
     }
     let judged: Vec<&Value> = std::iter::once(record)
@@ -1465,6 +1473,7 @@ mod tests
         let mut first = defect_record("BLOCKING ISSUES", vec![defect("a", "unverified")]);
         first["recorded"] = json!([defect("off", "unverified")]);
         first["stats"]["head"] = json!("1111aaaa22223333");
+        first["stats"]["mode"] = json!("full");
         let mut last = defect_record("READY TO MERGE", vec![]);
         let mut other = defect("off two", "unverified");
         other["line"] = json!(20);
@@ -1658,6 +1667,58 @@ mod tests
         let found = gate_diags(&records, HEAD);
         assert_eq!(rules(&found), ["gate-review-record"]);
         assert_eq!(found[0].at, NAME);
+    }
+
+    #[test]
+    fn the_gate_fails_an_audit_that_completes_a_reviewer_run_with_a_failed_agent()
+    {
+        let mut failed = reviewer_alone(2, "READY TO MERGE", vec![]);
+        failed["stats"]["failed"] = json!(["pr-reviewer"]);
+        let records = vec![
+            (NAME.to_owned(), failed),
+            (
+                "audit-0a82b0aa.json".to_owned(),
+                run("audit", 3, "READY TO MERGE", "AUDIT PASS"),
+            ),
+        ];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["gate-review-record"]);
+        assert_eq!(found[0].at, NAME);
+    }
+
+    #[test]
+    fn a_re_audit_after_a_failed_audit_completes_the_same_reviewer_run()
+    {
+        let records = vec![
+            (
+                NAME.to_owned(),
+                reviewer_alone(2, "BLOCKING ISSUES", vec![finding("a", "unverified")]),
+            ),
+            (
+                "audit-0a82b0aa.json".to_owned(),
+                run("audit", 3, "READY TO MERGE", "AUDIT FAIL"),
+            ),
+            (
+                "audit-0a82b0aa-2.json".to_owned(),
+                run("audit", 4, "READY TO MERGE", "AUDIT PASS"),
+            ),
+        ];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["gate-review-record"]);
+        assert_eq!(found[0].at, NAME);
+        // A run with the reviewer between them ends the reach: the audit
+        // completes nothing, and the delta run's own record stands.
+        let mut between = records;
+        between.insert(
+            1,
+            (
+                "delta-0a82b0aa-2.json".to_owned(),
+                run("delta", 3, "READY TO MERGE", "AUDIT PASS"),
+            ),
+        );
+        between[2].1["stats"]["run"] = json!(4);
+        between[3].1["stats"]["run"] = json!(5);
+        assert!(gate_diags(&between, HEAD).is_empty());
     }
 
     #[test]

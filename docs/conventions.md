@@ -377,8 +377,8 @@ the reviewer reviewed, and judges only:
   changes. The incoming diff of a sync is not the PR's change.
 
 A delta run raises no new finding on code an earlier round passed: a defect outside the delta's
-own change that an earlier run did not report does not affect the verdict, whatever its anchor:
-the reviewer reports it as out of bound, and it is recorded (§ Recording findings).
+own change that an earlier run did not report does not affect the verdict, whatever its anchor.
+The reviewer reports it as out of bound, and it is recorded (§ Recording findings).
 
 A run with the reviewer that a sync owes (§ Syncing with `master`) also judges the sync: how
 the incoming change composes with the PR's own change in the files both touch, and any conflict

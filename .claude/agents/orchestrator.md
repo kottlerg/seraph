@@ -254,10 +254,11 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
    and its comment-only delta), the Issues the PR closes or references (the ticks of both, the
    milestone of those it closes), the check rollup and merge state, that `master` is an
    ancestor of the head, and the run record for the head.
-3. Read what the command cannot decide: for records of the earlier form, when it prints
-   `gate-findings-recorded`, that each finding it counts is recorded and none is contested; for
-   the release PR, which the command
-   names with `gate-release-approval`, that the maintainer has approved its merge; that the
+3. Read what the command cannot decide: when it prints `gate-defects-recorded`, that each
+   defect a run recorded off the surface is on its Issue (docs/conventions.md § Findings); for
+   records of the earlier form, when it prints `gate-findings-recorded`, that each finding it
+   counts is recorded and none is contested; for the release PR, which the command names with
+   `gate-release-approval`, that the maintainer has approved its merge; that the
    Issues the command prints as closed are the ones the PR means to close; and that the
    worker's worktree sits on its branch (`git -C <worktree> status -sb`).
 

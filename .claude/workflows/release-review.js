@@ -17,8 +17,7 @@
 // PR), and each unit's files. Review runs one `pr-reviewer` per shard of the
 // code files two or more units touched (no other code file is reviewed line by
 // line), one lens over every Markdown document and instruction file the range
-// touched,
-// and the whole-range lenses, in parallel. Verify puts every defect that can
+// touched, and the whole-range lenses, in parallel. Verify puts every defect that can
 // block (one no open Issue names) to two independent refuters as soon as its
 // reviewer completes; the reality refuter also judges whether the defect was
 // already present at the previous release, which sets it apart as predating
@@ -506,9 +505,8 @@ const open_issue_numbers = new Set(scope.open_issues.map((i) => i.number))
 
 // The known-issue candidates: in a full run, the defects an open Issue names
 // (a defect that predates the range has no Issue yet, so it is not one); in
-// audit mode, the Known
-// Issues the release notes at the head list, which record the maintainer's
-// decision on the full run's list.
+// audit mode, the Known Issues the release notes at the head list, which
+// record the maintainer's decision on the full run's list.
 const audit_prompt = (candidates) => [
     'Release audit for ' + TAG + ' (mode ' + MODE + '): previous release ' + FROM + ' (' +
         scope.from_sha + '), candidate head ' + scope.head + '.',

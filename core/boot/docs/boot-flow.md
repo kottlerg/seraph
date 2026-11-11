@@ -131,17 +131,18 @@ the kernel's own consumption:
   `cpu_ids` pages (one more for a BSP the table omits, at most `MAX_CPUS`), and a second
   fills them; their address and the count are written into `BootInfo` in step 9.
 - **`kernel_mmio`** — arch-specific MMIO bases: LAPIC / IOAPIC on x86-64
-  (from MADT), PLIC (MADT) / UART (SPCR) on RISC-V, or DTB compatible
-  nodes, plus the riscv64 hart facts (`timebase_freq`, `hart_caps`).
+  (from MADT), PLIC (MADT) / UART (SPCR) and the supervisor-level APLIC
+  domain and IMSIC layout (MADT) on RISC-V, or DTB compatible nodes, plus
+  the riscv64 hart facts (`timebase_freq`, `hart_caps`).
   Extracted into `BootInfo` in step 9.
 
 A third extraction, run in step 9, produces **seed entries** for `mmio_apertures` — coarse
 `{phys_base, size}` regions the kernel mints as `Mmio` capabilities. The seed covers LAPIC / IOAPIC
-/ PLIC / CLINT / UART / ECAM / BAR windows / VT-d remapping units / `virtio,mmio` transports from
-the firmware tables, the arch's platform-default MMIO apertures the ACPI seeder appends
-([acpi.md](acpi.md) § Tables Consumed), and the GOP framebuffer. Each seed is clipped to the memory
-map (named seeds lose the RAM-class and firmware-exclusive ranges, heuristic PCI windows every
-non-MMIO range) and merged there with the UEFI memory map's `MemoryMappedIO` regions
+/ PLIC / APLIC / IMSIC / CLINT / UART / ECAM / BAR windows / VT-d remapping units / `virtio,mmio`
+transports from the firmware tables, the arch's platform-default MMIO apertures the ACPI seeder
+appends ([acpi.md](acpi.md) § Tables Consumed), and the GOP framebuffer. Each seed is clipped to
+the memory map (named seeds lose the RAM-class and firmware-exclusive ranges, heuristic PCI
+windows every non-MMIO range) and merged there with the UEFI memory map's `MemoryMappedIO` regions
 (firmware-parsing.md § [`mmio_apertures`
 construction](firmware-parsing.md#mmio_apertures-construction)).
 
@@ -276,7 +277,7 @@ Pointer and resource-address fields hold physical addresses; `init_image` carrie
 unbiased link virtual addresses, and the only kernel virtual addresses are the
 KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel scrubs from
 this donated page after consuming them. The `version` field is set to
-`BOOT_PROTOCOL_VERSION` (currently `19`). Fields are populated as follows:
+`BOOT_PROTOCOL_VERSION` (currently `20`). Fields are populated as follows:
 
 | Field | Source |
 |---|---|
@@ -290,7 +291,7 @@ this donated page after consuming them. The `version` field is set to
 | `framebuffer` | GOP framebuffer from step 1 (zeroed if GOP is absent) |
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
-| `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see [firmware-parsing.md](firmware-parsing.md)). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel [Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation). |
+| `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see [firmware-parsing.md](firmware-parsing.md)). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; the riscv64 `aplic` and `imsic` fields, zero when neither source reports them, are not read by the kernel; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel [Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation). |
 | `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds, each seed clipped to the memory map as firmware-parsing.md § Firmware exclusion defines), in pages allocated in step 6 and sized from the entry array's capacity and the seeders' seed counts (`memory_map::aperture_capacity`). Empty if no MMIO regions were reported. |
 | `cpu_count` | Count of distinct hardware IDs among the enabled or online-capable Local APIC / Local x2APIC entries from MADT (x86-64) or the enabled RINTC entries (RISC-V), the BSP counted once whether or not the MADT lists it, capped at `MAX_CPUS`; or the DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |

@@ -14,7 +14,8 @@ The implementation lives in [`core/boot/src/dtb.rs`](../src/dtb.rs).
 
 The bootloader extracts a minimal set of platform resources from the
 DTB: MMIO-backed peripherals matched by known `compatible` strings,
-PLIC interrupt controllers (with their `riscv,ndev` source count), PCI
+PLIC interrupt controllers (with their `riscv,ndev` source count), the
+supervisor-level AIA interrupt controllers (§ AIA Controllers), PCI
 host bridges, the `/cpus` hart IDs (the
 CPU-topology fallback when no ACPI is present), the `/cpus` hart
 capabilities (`timebase-frequency` and the `HART_CAP_*` bits) and the
@@ -35,7 +36,9 @@ the system-scope IOMMU model.
 
 The bootloader does **not** resolve `interrupt-map` tables, complex
 `ranges` translations, phandle graphs, or node-tree semantics beyond a
-flat walk. Driver binding and property-evaluation logic belong to
+flat walk, apart from the two phandle references § AIA Controllers
+resolves: an APLIC's `msi-parent` and an IMSIC's `interrupts-extended`
+entries. Driver binding and property-evaluation logic belong to
 `devmgr` (see [`docs/device-management.md`](../../../docs/device-management.md)).
 
 ---
@@ -78,8 +81,10 @@ RISC-V platform targeted. Nodes that override these with different
 values are parsed as if the defaults applied; any resulting
 misinterpretation is bounded (the node's `reg` entries become garbage; a
 garbage first entry with non-zero size still becomes an `MmioAperture`
-seed, and for a PLIC or UART node the garbage first entry becomes the
-corresponding `kernel_mmio` base). Full cell-inheritance support belongs
+seed, and for a PLIC, APLIC, IMSIC or UART node the garbage first entry
+becomes the corresponding `kernel_mmio` base). The AIA walk also assumes
+`#interrupt-cells = 1` on each hart's `riscv,cpu-intc`, so each IMSIC
+`interrupts-extended` entry is two cells (§ AIA Controllers). Full cell-inheritance support belongs
 to `devmgr` (design intent, not yet implemented: devmgr's DTB reader
 likewise assumes `#address-cells = 2` and `#size-cells = 2`).
 
@@ -101,7 +106,8 @@ discovery is a userspace concern (see Responsibilities in
 MMIO peripherals are matched by an exact entry in the node's
 `compatible` string list (`ns16550a`, `virtio,mmio`, …). A match
 contributes its first `reg` entry as an `MmioAperture` seed; PCI host
-bridges additionally contribute their MMIO `ranges` windows. Unknown
+bridges additionally contribute their MMIO `ranges` windows, and the
+supervisor-level IMSIC every `reg` window (§ AIA Controllers). Unknown
 `compatible` strings are skipped
 without warning; `devmgr` is responsible for identifying every other
 device (see [`docs/device-management.md`](../../../docs/device-management.md)).
@@ -115,13 +121,48 @@ implemented; see Parse firmware tables in
 
 ---
 
+## AIA Controllers
+
+A RISC-V AIA platform's tree carries an IMSIC (`riscv,imsics`) and an
+APLIC (`riscv,aplic`) for each privilege level the firmware sets up. The
+machine-level ones belong to the SBI firmware, which keeps them from the
+supervisor, so the bootloader reports only the supervisor-level pair, in
+`kernel_mmio.aplic` and `kernel_mmio.imsic` and as aperture seeds
+(`crate::dtb::parse_aia`):
+
+- The supervisor-level IMSIC is the first `riscv,imsics` node whose
+  `interrupts-extended` names at least one hart and only the supervisor
+  external interrupt (9). Its layout is its first `reg` base, its
+  `riscv,num-ids`, and its `riscv,guest-index-bits`,
+  `riscv,hart-index-bits`, `riscv,group-index-bits` and
+  `riscv,group-index-shift`, each absent one taking the binding's default:
+  guest and group bits 0, group shift 24, and hart bits the fewest that
+  index every `interrupts-extended` entry.
+- The supervisor-level APLIC is the first `riscv,aplic` node whose
+  `msi-parent` is that IMSIC's `phandle`; it gives the base and size of its
+  first `reg` entry and its `riscv,num-sources`.
+- The IMSIC is reported only when every enabled hart's file lies where the
+  layout puts it for the hart's ID. A hart's file is the one its
+  `interrupts-extended` position names: the entry whose phandle is that
+  of the `riscv,cpu-intc` child of the hart's CPU node, counted in files
+  of `2^(12 + guest-index-bits)` bytes across the node's `reg` windows in
+  order. A hart missing from `interrupts-extended` (a hart whose
+  `riscv,cpu-intc` is absent or has no `phandle` is), or a file elsewhere,
+  leaves `kernel_mmio.imsic` zero, with one diagnostic naming the hart.
+  The APLIC does not depend on that check.
+- The aperture seeds are the APLIC's first `reg` window and every `reg`
+  window of the IMSIC, whatever the check found.
+
+---
+
 ## Error Handling
 
 Malformed nodes are skipped; partial results are returned. An
 unreadable or unknown token ends the walk with the partial results
 collected so far. A bad header aborts DTB parsing entirely (see
-§Header Validation). Nothing is logged for skipped nodes, and the
-bootloader never halts on a DTB parse error.
+§Header Validation). Nothing is logged for skipped nodes, apart from
+the IMSIC check of § AIA Controllers, and the bootloader never halts on
+a DTB parse error.
 
 ---
 

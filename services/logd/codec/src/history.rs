@@ -7,8 +7,8 @@
 //! variable-length into a fixed byte buffer, read back in push order by the
 //! handover drain.
 //!
-//! Each record is a header (sender badge, receipt microseconds, line length)
-//! followed by the line bytes, and a record may wrap around the end of the
+//! Each record is a header (sender badge, receipt microseconds, line length,
+//! level) followed by the line bytes, and a record may wrap around the end of the
 //! buffer. A push that does not fit evicts the oldest records until it does,
 //! so the ring's line capacity follows the lines' lengths instead of being
 //! paid for at [`LINE_BUF_SIZE`] per line. Lines carry absolute push sequence
@@ -16,11 +16,12 @@
 //! ([handover-protocol.md](../../docs/handover-protocol.md) § `LINE`).
 
 use crate::LINE_BUF_SIZE;
+use ipc::stream_labels::LEVEL_MASK;
 
-/// Bytes of a record's header: badge (8), receipt microseconds (8), and line
+/// Bytes of a record's header: badge (8), receipt microseconds (8), line
 /// length (2; a line is at most [`LINE_BUF_SIZE`] bytes, which a `u16`
-/// holds).
-pub const RECORD_HEADER_BYTES: usize = 18;
+/// holds), and level (1; an `ipc::stream_labels::LEVEL_*` code).
+pub const RECORD_HEADER_BYTES: usize = 19;
 
 const _: () = assert!(LINE_BUF_SIZE <= u16::MAX as usize);
 
@@ -34,6 +35,8 @@ pub struct HistoryLine
     pub badge: u64,
     /// Receipt time in microseconds since boot.
     pub us: u64,
+    /// The line's level, an `ipc::stream_labels::LEVEL_*` code.
+    pub level: u64,
     /// Number of line bytes copied into the caller's buffer.
     pub len: usize,
 }
@@ -106,10 +109,11 @@ impl<const BYTES: usize> HistoryRing<BYTES>
         self.total
     }
 
-    /// Append one line, evicting the oldest lines until it fits. An empty
-    /// line is not recorded; a line longer than [`LINE_BUF_SIZE`] is clipped
-    /// to it.
-    pub fn push(&mut self, badge: u64, us: u64, line: &[u8])
+    /// Append one line at `level` (an `ipc::stream_labels::LEVEL_*` code,
+    /// kept to the level field's bits), evicting the oldest lines until it
+    /// fits. An empty line is not recorded; a line longer than
+    /// [`LINE_BUF_SIZE`] is clipped to it.
+    pub fn push(&mut self, badge: u64, us: u64, level: u64, line: &[u8])
     {
         if line.is_empty()
         {
@@ -127,6 +131,11 @@ impl<const BYTES: usize> HistoryRing<BYTES>
         // At most LINE_BUF_SIZE, which the const assert above fits in a u16.
         #[allow(clippy::cast_possible_truncation)]
         header[16..18].copy_from_slice(&(line.len() as u16).to_le_bytes());
+        // Masked to the three-bit level field, so it fits a byte.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            header[18] = (level & LEVEL_MASK) as u8;
+        }
         self.write_at(self.tail, &header);
         self.write_at((self.tail + RECORD_HEADER_BYTES) % BYTES, line);
         self.tail = (self.tail + need) % BYTES;
@@ -153,12 +162,13 @@ impl<const BYTES: usize> HistoryRing<BYTES>
         {
             return None;
         }
-        let (badge, us, len) = self.header_at(cursor.off);
+        let (badge, us, level, len) = self.header_at(cursor.off);
         self.read_at((cursor.off + RECORD_HEADER_BYTES) % BYTES, &mut out[..len]);
         let line = HistoryLine {
             seq: cursor.seq,
             badge,
             us,
+            level,
             len,
         };
         cursor.seq += 1;
@@ -171,15 +181,16 @@ impl<const BYTES: usize> HistoryRing<BYTES>
     /// the const assert in [`Self::new`] keeps below `BYTES`.
     fn evict_oldest(&mut self)
     {
-        let (_, _, len) = self.header_at(self.head);
+        let (_, _, _, len) = self.header_at(self.head);
         let size = RECORD_HEADER_BYTES + len;
         self.head = (self.head + size) % BYTES;
         self.used -= size;
         self.first_seq += 1;
     }
 
-    /// Decode the record header at `off`: badge, microseconds, length.
-    fn header_at(&self, off: usize) -> (u64, u64, usize)
+    /// Decode the record header at `off`: badge, microseconds, level,
+    /// length.
+    fn header_at(&self, off: usize) -> (u64, u64, u64, usize)
     {
         let mut header = [0u8; RECORD_HEADER_BYTES];
         self.read_at(off, &mut header);
@@ -189,7 +200,7 @@ impl<const BYTES: usize> HistoryRing<BYTES>
         word.copy_from_slice(&header[8..16]);
         let us = u64::from_le_bytes(word);
         let len = usize::from(u16::from_le_bytes([header[16], header[17]]));
-        (badge, us, len.min(LINE_BUF_SIZE))
+        (badge, us, u64::from(header[18]), len.min(LINE_BUF_SIZE))
     }
 
     /// Copy `bytes` into the buffer from `off`, wrapping at the end.
@@ -222,6 +233,7 @@ impl<const BYTES: usize> Default for HistoryRing<BYTES>
 mod tests
 {
     use super::*;
+    use ipc::stream_labels::{LEVEL_INFO as INFO, LEVEL_WARN};
 
     /// Room for exactly three 100-byte lines.
     const SMALL: usize = 3 * (RECORD_HEADER_BYTES + 100);
@@ -244,8 +256,8 @@ mod tests
     fn lines_read_back_in_push_order_with_their_badge_and_time()
     {
         let mut ring = HistoryRing::<SMALL>::new();
-        ring.push(7, 11, b"first");
-        ring.push(8, 12, b"second");
+        ring.push(7, 11, INFO, b"first");
+        ring.push(8, 12, INFO, b"second");
         let mut cursor = HistoryCursor::default();
         let mut out = [0u8; LINE_BUF_SIZE];
         let a = ring.read_next(&mut cursor, &mut out).unwrap();
@@ -262,12 +274,27 @@ mod tests
     }
 
     #[test]
+    fn a_line_reads_back_with_its_level()
+    {
+        let mut ring = HistoryRing::<SMALL>::new();
+        ring.push(1, 0, LEVEL_WARN, b"w");
+        ring.push(1, 0, INFO, b"i");
+        let mut cursor = HistoryCursor::default();
+        let mut out = [0u8; LINE_BUF_SIZE];
+        assert_eq!(
+            ring.read_next(&mut cursor, &mut out).unwrap().level,
+            LEVEL_WARN
+        );
+        assert_eq!(ring.read_next(&mut cursor, &mut out).unwrap().level, INFO);
+    }
+
+    #[test]
     fn a_push_that_does_not_fit_evicts_the_oldest_lines()
     {
         let mut ring = HistoryRing::<SMALL>::new();
         for i in 0..4u8
         {
-            ring.push(u64::from(i), 0, &[i; 100]);
+            ring.push(u64::from(i), 0, INFO, &[i; 100]);
         }
         let lines = read_all(&ring, &mut HistoryCursor::default());
         let seqs: Vec<u64> = lines.iter().map(|l| l.0).collect();
@@ -282,7 +309,7 @@ mod tests
         let mut ring = HistoryRing::<SMALL>::new();
         for i in 0..10u64
         {
-            ring.push(i, 0, b"0123456789");
+            ring.push(i, 0, INFO, b"0123456789");
         }
         assert_eq!(read_all(&ring, &mut HistoryCursor::default()).len(), 10);
     }
@@ -297,7 +324,7 @@ mod tests
             let line: Vec<u8> = (0..(37 + usize::from(i) * 7) % 120 + 1)
                 .map(|k| i.wrapping_add(k as u8))
                 .collect();
-            ring.push(u64::from(i), u64::from(i) * 3, &line);
+            ring.push(u64::from(i), u64::from(i) * 3, INFO, &line);
             expected.push((u64::from(i), line));
         }
         let lines = read_all(&ring, &mut HistoryCursor::default());
@@ -314,14 +341,14 @@ mod tests
     fn a_cursor_behind_the_ring_restarts_at_the_oldest_live_line()
     {
         let mut ring = HistoryRing::<SMALL>::new();
-        ring.push(0, 0, &[0; 100]);
+        ring.push(0, 0, INFO, &[0; 100]);
         let mut cursor = HistoryCursor::default();
         let mut out = [0u8; LINE_BUF_SIZE];
         assert_eq!(ring.read_next(&mut cursor, &mut out).unwrap().seq, 0);
         // The cursor now sits at sequence 1; push enough to evict 1 and 2.
         for i in 1..6u8
         {
-            ring.push(u64::from(i), 0, &[i; 100]);
+            ring.push(u64::from(i), 0, INFO, &[i; 100]);
         }
         let seqs: Vec<u64> = read_all(&ring, &mut cursor).iter().map(|l| l.0).collect();
         assert_eq!(seqs, [3, 4, 5]);
@@ -331,10 +358,10 @@ mod tests
     fn a_caught_up_cursor_reads_lines_pushed_later()
     {
         let mut ring = HistoryRing::<SMALL>::new();
-        ring.push(1, 0, b"a");
+        ring.push(1, 0, INFO, b"a");
         let mut cursor = HistoryCursor::default();
         assert_eq!(read_all(&ring, &mut cursor).len(), 1);
-        ring.push(2, 0, b"b");
+        ring.push(2, 0, INFO, b"b");
         let lines = read_all(&ring, &mut cursor);
         assert_eq!(lines, [(1, 2, b"b".to_vec())]);
     }
@@ -343,8 +370,8 @@ mod tests
     fn empty_lines_are_not_recorded_and_long_lines_are_clipped()
     {
         let mut ring = HistoryRing::<SMALL>::new();
-        ring.push(1, 0, b"");
-        ring.push(2, 0, &[9; LINE_BUF_SIZE + 10]);
+        ring.push(1, 0, INFO, b"");
+        ring.push(2, 0, INFO, &[9; LINE_BUF_SIZE + 10]);
         let lines = read_all(&ring, &mut HistoryCursor::default());
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].2.len(), LINE_BUF_SIZE);

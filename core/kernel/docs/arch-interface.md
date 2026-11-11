@@ -150,14 +150,17 @@ pub fn direct_map_base() -> u64;
 pub fn user_va_top() -> u64;
 
 /// Map `phys` at `virt` in the user region of the address space rooted at
-/// `root_virt`. Returns how the rewrite changed any prior mapping
-/// (`MapOutcome`), which the caller uses to decide whether a remote TLB
-/// shootdown is required. The caller must invalidate the local TLB for `virt`.
+/// `root_virt`, recording `grant` in two software bits of the leaf
+/// (memory-internals.md § Leaf Grant). Returns how the rewrite changed any
+/// prior mapping (`MapOutcome`), which the caller uses to decide whether a
+/// remote TLB shootdown is required. The caller must invalidate the local TLB
+/// for `virt`.
 pub unsafe fn map_user_page(
     root_virt: u64,
     virt: u64,
     phys: u64,
     flags: PageFlags,
+    grant: LeafGrant,
 ) -> Result<MapOutcome, ()>;
 
 /// As `map_user_page`, but draws intermediate page-table frames from the
@@ -167,11 +170,13 @@ pub unsafe fn map_user_page_pooled(
     virt: u64,
     phys: u64,
     flags: PageFlags,
+    grant: LeafGrant,
     aso: &AddressSpaceObject,
 ) -> Result<MapOutcome, ()>;
 
-/// Change permissions on an existing user mapping without changing the frame
-/// or the mapping's memory type.
+/// Change permissions on an existing user mapping without changing the frame,
+/// the mapping's memory type, or its grant; `PagingError::NotGranted`, with
+/// the leaf unchanged, when `flags` asks for write or execute the grant lacks.
 pub unsafe fn protect_user_page(
     root_virt: u64,
     virt: u64,
@@ -362,6 +367,12 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool;
 /// memory type (PCD or PWT on x86-64, a PBMT other than PMA on RISC-V). The
 /// thread-memory copies (`AddressSpace::copy_user_bytes`) gate on it.
 pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>;
+
+/// The grant a user leaf PTE (from `translate_user_page`) records: the Write
+/// and Execute rights of the capability that installed it (memory-internals.md
+/// § Leaf Grant). The text-write check of `AddressSpace::copy_user_bytes`
+/// reads it.
+pub fn user_leaf_grant(pte: u64) -> LeafGrant;
 
 /// Drop this CPU's cached translations of the kernel address `virt` in every
 /// address space: RISC-V `sfence.vma virt, zero`; x86-64 `invlpg` without

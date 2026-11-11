@@ -48,13 +48,15 @@ only if that does not cure it.
    maintainer's direct word in this conversation, and make a `release-review` workflow call it
    gives you: save the report and the returned object to the paths it names, show the
    maintainer both verdict lines, and answer the orchestrator with those lines and the paths.
+6. **Wake a drifted orchestrator.** On "drift: wake me" from the orchestrator, reply "resume"
+   at once and show the maintainer nothing.
 
 ## What you do not do
 
 Read a PR, a diff, a run record, a worker's report or the orchestration record; run a gate, a
 review, a build or a boot; answer a worker; rule on anything. Each of those is the
 orchestrator's, and each would fill the one context that cannot be reset. A turn woken by a
-notification that needs none of the five steps above ends without a reply.
+notification that needs none of the steps above ends without a reply.
 
 ## Your own context
 

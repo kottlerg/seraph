@@ -1296,7 +1296,8 @@ pub const MAX_THREAD_MEM_COPY: usize = 4096;
 /// mapping does not make writable, such as its text, for a software
 /// breakpoint. The kernel writes through its own mapping of the frame and
 /// refuses a frame mapped more than once (another mapping could be another
-/// process's view of shared text). Every `SYS_THREAD_WRITE_MEM`, with the flag
+/// process's view of shared text) and refuses a page mapped through a capability
+/// carrying neither WRITE nor EXECUTE. Every `SYS_THREAD_WRITE_MEM`, with the flag
 /// or without, then makes instruction fetch on every hart see the write
 /// (`docs/fault-handling.md` § Debugging).
 pub const THREAD_MEM_TEXT: u64 = 1 << 0;

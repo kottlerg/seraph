@@ -788,7 +788,10 @@ pub unsafe fn mem_unmap_reclaim(aspace_cap: u64, virt: u64, page_count: u64) -> 
 ///
 /// `memory_cap` authorises the requested permissions: they must be a subset of
 /// the Memory cap's rights. `prot` encoding: bit 1 = WRITE, bit 2 = EXECUTE.
-/// W^X is enforced. Returns an error if any page is not currently mapped.
+/// Each page is also bounded by the WRITE and EXECUTE rights of the cap that
+/// mapped it: a page mapped through a Map-only cap stays read-only, and an
+/// `mmio_map` page never becomes executable. W^X is enforced. Returns an
+/// error if any page is not currently mapped.
 ///
 /// # Safety
 /// When `aspace_cap` names the calling program's own address space, no page
@@ -802,7 +805,8 @@ pub unsafe fn mem_unmap_reclaim(aspace_cap: u64, virt: u64, page_count: u64) -> 
 /// the range leaves the user half, or a page in it is not mapped),
 /// `InvalidArgument` (zero page count, overflow, or no free frame during the
 /// page-table walk), `WxViolation`, `InvalidCapability`, or
-/// `InsufficientRights` (requested permissions exceed the cap's rights).
+/// `InsufficientRights` (requested permissions exceed the cap's rights or
+/// those of the cap that mapped a page; earlier pages stay changed).
 #[inline]
 pub unsafe fn mem_protect(
     memory_cap: u64,
@@ -2581,7 +2585,8 @@ pub unsafe fn thread_read_mem_raw(
 /// (`SYS_THREAD_WRITE_MEM`), all or nothing. `buf.len()` must be in
 /// `1..=MAX_THREAD_MEM_COPY`, and every page of the range mapped, normal
 /// memory, and below the top of RAM. A page the thread's mapping makes read-only, such as its text,
-/// takes the write only with `flags` = `THREAD_MEM_TEXT`, and only when its
+/// takes the write only with `flags` = `THREAD_MEM_TEXT`, and only when the page
+/// was mapped through a cap carrying WRITE or EXECUTE and its
 /// frame is mapped nowhere else. The written bytes are visible to instruction
 /// fetch on every CPU when the call returns; another thread of the space that
 /// runs during the write may run old or new bytes, so a debugger stops the
@@ -2597,7 +2602,8 @@ pub unsafe fn thread_read_mem_raw(
 /// Returns a negative `i64` error code: `InvalidCapability`,
 /// `InsufficientRights`, `InvalidArgument` (also an undefined `flags` bit),
 /// `InvalidState`, and `InvalidAddress` as [`thread_read_mem`];
-/// `InsufficientRights` also for a read-only page without `THREAD_MEM_TEXT`;
+/// `InsufficientRights` also for a read-only page without `THREAD_MEM_TEXT`
+/// or one mapped through a Map-only cap;
 /// `InvalidState` also when a read-only page's frame is mapped more than
 /// once.
 #[inline]

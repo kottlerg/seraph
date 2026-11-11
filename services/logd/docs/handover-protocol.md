@@ -72,10 +72,11 @@ log line itself (see [`main.rs`](../src/main.rs)).
   `RELEASE_RETRY_BUDGET_US` (1 s) of wall-clock time, until one is delivered
   (see [Termination](#termination)).
 
-The reply label's upper 16 bits (`(byte_len << 16)`) carry the
-inline byte length on `SLOT` and `LINE` chunk kinds, matching the
-stream-protocol convention. Real-logd masks the bottom 16 bits to
-extract the status code.
+Bits 16-31 of the reply label (`(byte_len << 16)`) carry the
+inline byte length on `SLOT` and `LINE` chunk kinds, and bits 32-34 the
+line's level on `LINE`, matching the stream-protocol convention
+([`ipc-interface.md`](ipc-interface.md) § Levels). Real-logd masks the
+bottom 16 bits to extract the status code.
 
 ## Chunk kinds
 
@@ -135,9 +136,11 @@ including by a further drain after a deferred release.
 | 4..  | line bytes (packed via `.bytes(4, ...)`, offset 32 in `data_bytes`) |
 
 No trailing `\n`. The line is the buffered content between two
-`\n`-terminated `STREAM_BYTES` flushes, unmodified. As for `SLOT`,
-real-logd takes at most the bytes the message carries, whatever length
-word 3 declares. Real-logd stores it via
+`\n`-terminated `STREAM_BYTES` flushes, unmodified. The line's level
+rides the reply label's level field (bits 32-34, a
+`ipc::stream_labels::LEVEL_*` code; a label without one reads as info).
+As for `SLOT`, real-logd takes at most the bytes the message carries,
+whatever length word 3 declares. Real-logd stores it, with its level, via
 [`SlotTable::install_history_line`](../src/slot.rs); the slot is
 created lazily if no `SLOT` entry preceded it (a history line may
 outlive its registering sender's slot in init-logd's small

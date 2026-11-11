@@ -13,10 +13,11 @@ real-logd's death-queue resync decisions (`is_resync_candidate`, `decode_live_pa
 and the `WalkGate` that runs one walk at a time; see
 [`docs/ipc-interface.md`](../docs/ipc-interface.md) § Death-queue resync), and the line real-logd
 logs when it evicts a slot (`ReclaimLine`; see the same document § Death-notification cascade, where
-the line is a test contract). It also holds the line and name widths both log receivers keep per
-sender (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), and `BoundedStr`, the fixed-capacity, UTF-8-safe formatter
-logd uses for its own diagnostics. It issues no syscall and no IPC, so both ends keep the IPC calls
-and the logic stays host-reachable, per
+the line is a test contract). It also holds the level tag both log receivers render after a line's
+`[name]` prefix (`level::tag`; see the same document § Levels), the line and name widths both log
+receivers keep per sender (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), and `BoundedStr`, the
+fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics. It issues no syscall and
+no IPC, so both ends keep the IPC calls and the logic stays host-reachable, per
 [coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
 
 `no_std`; depends on `shared/ipc` (`IpcMessage`) and `abi/syscall` (`MSG_DATA_WORDS_MAX`).
@@ -34,6 +35,7 @@ services/logd/codec/
     ├── handover.rs             # Handover wire contract: codes, encoders,
     │                           # decoder, NameResend, release retry
     ├── history.rs              # HistoryRing: init-logd's captured history
+    ├── level.rs                # The level tag a rendered line carries
     ├── reclaim.rs              # ReclaimLine: the slot-eviction log line
     ├── resync.rs               # Death-queue resync: candidates, live-page
     │                           # decoder, eviction set, WalkGate

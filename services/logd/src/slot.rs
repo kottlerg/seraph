@@ -35,25 +35,42 @@ pub struct LineRecord
     /// Receipt microseconds since boot
     /// (`system_info(ElapsedUs)`-derived).
     pub us: u64,
+    /// The line's level, an `ipc::stream_labels::LEVEL_*` code.
+    pub level: u64,
     /// Line bytes, no trailing `\n`. Length bounded by
     /// [`LINE_BUF_SIZE`].
     pub bytes: Vec<u8>,
 }
 
 /// Per-sender bucket. Stores the display name registered via
-/// `STREAM_REGISTER_NAME`, the in-progress line buffer, and the
-/// bounded ring of completed lines.
+/// `STREAM_REGISTER_NAME`, the in-progress line buffer and its level, and
+/// the bounded ring of completed lines.
 #[derive(Default)]
 pub struct Slot
 {
     pub name: Vec<u8>,
     pub partial: Vec<u8>,
+    /// Level of the in-progress line: that of the `STREAM_BYTES` message
+    /// that carried its first byte. Meaningful only once that byte has
+    /// arrived ([`Self::begin_byte`]).
+    pub partial_level: u64,
     pub history: std::collections::VecDeque<LineRecord>,
 }
 
 impl Slot
 {
-    pub fn push_history(&mut self, us: u64, bytes: &[u8])
+    /// Note that the next byte, a line byte or the newline that ends the
+    /// line, arrived in a message at `level`; it sets the line's level when
+    /// it is the line's first.
+    pub fn begin_byte(&mut self, level: u64)
+    {
+        if self.partial.is_empty()
+        {
+            self.partial_level = level;
+        }
+    }
+
+    pub fn push_history(&mut self, us: u64, level: u64, bytes: &[u8])
     {
         if self.history.len() == PER_SLOT_HISTORY
         {
@@ -61,6 +78,7 @@ impl Slot
         }
         self.history.push_back(LineRecord {
             us,
+            level,
             bytes: bytes.to_vec(),
         });
     }
@@ -117,8 +135,8 @@ impl SlotTable
     /// lines may have originated from senders whose slot was evicted
     /// from init-logd's small ring; the line itself still attributes
     /// to its badge).
-    pub fn install_history_line(&mut self, badge: u64, us: u64, bytes: &[u8])
+    pub fn install_history_line(&mut self, badge: u64, us: u64, level: u64, bytes: &[u8])
     {
-        self.get_or_create(badge).push_history(us, bytes);
+        self.get_or_create(badge).push_history(us, level, bytes);
     }
 }

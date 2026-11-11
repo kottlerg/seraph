@@ -215,8 +215,9 @@ the map installs. The query reads one count per page of the window it names, at 
 of the region; a larger region is read window by window.
 
 **Text-write check.** `SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT` writes a page the thread's
-leaf makes read-only only when its frame's count is exactly 1, read under the target space's
-`pt_lock` with the leaf present (`mm::address_space::thread_mem_write_check`). By the invariant,
+leaf makes read-only only when the leaf's grant holds Write or Execute (§ Leaf Grant) and its
+frame's count is exactly 1, read under the target space's `pt_lock` with the leaf present
+(`mm::address_space::thread_mem_write_check`). By the invariant,
 a count of 1 means no other user leaf names the frame when the count is read. The count can exceed
 the leaves (a `SYS_MEM_MAP` pin, or a removal whose lowering waits for its invalidation), so such a
 write can be refused while the frame is, or is about to be, mapped once. The check sees the
@@ -312,6 +313,44 @@ chain), and `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_TERMINAL_FAULT` reads the retained
 Seraph does not provide a `fork()` equivalent. New address spaces are created empty
 and populated by the process loader. Copy-on-write is not implemented. Shared memory
 is established by mapping the same memory capability into multiple address spaces.
+
+---
+
+## Leaf Grant
+
+Every user leaf records its grant: the Write and Execute rights of the capability that installed
+it, the most the leaf may ever allow (`mm::paging::LeafGrant`). Its invariant is:
+
+> **A user leaf is writable only if its grant holds Write, and executable only if its grant holds
+> Execute; the grant is fixed when the leaf is installed and no permission change alters it.**
+
+- **Install.** `SYS_MEM_MAP` records the Memory capability's Write and Execute, whatever
+  protection the call asks for, so a page mapped read-only through a capability that carries
+  Write can later be made writable. `SYS_MMIO_MAP` records the Mmio capability's Write and never
+  Execute. The kernel's own maps for init (`AddressSpace::map_page`) record the rights they
+  install, so no permission change widens init's image, InitInfo page or stack.
+- **Protect.** `SYS_MEM_PROTECT` authorises the call with the Memory capability it names, and
+  bounds each page by its own leaf's grant besides: that capability need not cover the frames
+  under the range. `protect_page` reads the grant and rewrites the leaf under `pt_lock`, keeping
+  the grant and the memory type, and refuses write or execute beyond the grant with
+  `PagingError::NotGranted`, which the syscall returns as `InsufficientRights`. The pages of the
+  range before the refused one keep their new permissions.
+- **Text write.** `SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT` writes a read-only leaf only when
+  its grant holds Write or Execute: the capability that mapped it let its holder change or run
+  what the page holds. A page mapped through a Map-only capability, such as a firmware table
+  (ACPI, the RSDP, the DTB) or a page lent read-only, refuses the write with `InsufficientRights`
+  (`mm::address_space::thread_mem_write_check`; the frame-count part of the check is § Frame Map
+  Table's Text-write check).
+
+**Storage.** The grant takes two software bits of the leaf, which the hardware ignores in a leaf
+and which no other leaf use claims: bits 52 (Write) and 53 (Execute) on x86-64
+(`GRANT_WRITE`, `GRANT_EXECUTE`), and the two RSW bits 8 (Write) and 9 (Execute) on RISC-V
+(`PTE_GRANT_WRITE`, `PTE_GRANT_EXECUTE`). The other software bit the paging code uses,
+`POOLED_TABLE` (bit 9 on x86-64, bit 8 on RISC-V), is set only in table entries (§ Page Table
+Node Ownership); on RISC-V, where it shares bit 8 with the grant, every reader of it tells a table
+entry from a leaf first. User leaves are 4 KiB pages only; a RISC-V NAPOT run
+promotes only members whose non-PPN bits, the grant included, are identical, and a demotion
+copies them, so the grant survives both.
 
 ---
 

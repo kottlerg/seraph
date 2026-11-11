@@ -16,8 +16,9 @@ Cross-Boundary VAs). Includes `INIT_PROTOCOL_VERSION`; init MUST check the versi
 accessing any other fields.
 
 **Constraints:** `no_std`, `#[repr(C)]` structs and fixed-width integer-repr enums, no
-dependencies outside `core`. Changes that alter the `InitInfo` layout, field semantics, or
-`CSpace` population order MUST increment `INIT_PROTOCOL_VERSION`.
+dependencies outside `core`. Changes that alter the `InitInfo` layout, field semantics, `CSpace`
+population order, or the capacity the root `CSpace` carries for init (the body pages init splits
+from before it funds its own `CSpace`) MUST increment `INIT_PROTOCOL_VERSION`.
 
 `InitInfo` delivers the full RAM Memory cap range (`memory_base`/`memory_count`) to init's
 CSpace. init moves the RAM Memory caps left after its own bootstrap allocations to memmgr

@@ -42,6 +42,12 @@
 //! no backing satisfies such an access, so a resume would fault again forever.
 //! Each decline is checked for memmgr's reason code: a refused access, then,
 //! once the region is unregistered, no region.
+//!
+//! A sixth phase, **page-table drain**, shows a demand fault is backed when
+//! the faulting address space's page-table pool is empty: the child registers
+//! a region, empties its own pool with mappings of its own, then touches a
+//! block of the region that needs a fresh page table. memmgr funds the pool
+//! itself and resumes rather than declining the fault.
 
 use std::os::seraph::process::CommandExt;
 use std::os::seraph::startup_info;
@@ -71,6 +77,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "pager_refused_access_declined",
             run: pager_refused_access_phase,
+        },
+        Phase {
+            name: "demand_paging_pt_drain",
+            run: demand_paging_pt_drain_phase,
         },
     ]
 }
@@ -230,6 +240,33 @@ fn demand_paging_phase(_: &Caps)
     // memmgr's accounting identity must remain closed across the cycle.
     assert_ram_identity();
     std::os::seraph::log!("demand_paging phase passed");
+}
+
+/// The child empties its address space's page-table pool after registering a
+/// region, then touches a block of the region whose leaf table does not exist
+/// yet. A clean exit proves memmgr funded the pool and backed the fault; a
+/// fault exit is memmgr declining it with code 9 (`mem_map` failed,
+/// `OutOfMemory`). The exit codes are the fixture's
+/// (programs/demandpaged/README.md).
+fn demand_paging_pt_drain_phase(_: &Caps)
+{
+    use std::process::Command;
+
+    let mut child = Command::new("/programs/demandpaged")
+        .arg("ptdrain")
+        .spawn()
+        .expect("spawn /programs/demandpaged ptdrain failed");
+    let status = child.wait().expect("demandpaged ptdrain wait failed");
+    std::os::seraph::log!("demandpaged ptdrain exited: {status}");
+    assert!(
+        status.success(),
+        "a demand fault with the page-table pool empty must be backed: {status}"
+    );
+
+    // The pages memmgr donated to the child's page-table pool are accounted to
+    // its record and reclaimed with it; the identity must hold.
+    assert_ram_identity();
+    std::os::seraph::log!("demand_paging_pt_drain phase passed");
 }
 
 // cast_sign_loss: ExitStatus::code() is i32 but exit reasons are non-negative

@@ -14,8 +14,10 @@
 //! domain's other ranges, and only then calls the backend. It keeps each
 //! mapped cap while its range is installed and deletes it at the range's
 //! `UNMAP`, the domain's `BLOCK`, or at once when it refuses the request. A
-//! unit whose backend reports a timeout is treated as failed: every later
-//! request on it is refused with `HARDWARE_TIMEOUT`.
+//! firmware-reserved range `MAP_RESERVED` installs at its own address carries
+//! no cap and stands until the domain's `BLOCK`. A unit whose backend reports
+//! a timeout is treated as failed: every later request on it is refused with
+//! `HARDWARE_TIMEOUT`.
 //!
 //! [`serve`] receives on the service endpoint for the rest of the driver's
 //! life and [`poll_faults`] polls the units' fault records on a thread of the
@@ -152,12 +154,13 @@ pub trait Lock<T>
 }
 
 /// One installed range of a domain, and the cap over its frames the driver
-/// keeps while it stands.
+/// keeps while it stands: `None` for a firmware-reserved range
+/// (`MAP_RESERVED`), which no cap covers and no `UNMAP` withdraws.
 struct Range
 {
     iova: u64,
     len: u64,
-    cap: u64,
+    cap: Option<u64>,
 }
 
 impl Range
@@ -314,6 +317,10 @@ impl<B: Backend, C: CapOps> Service<B, C>
                 }
                 result.err().unwrap_or(iommu_errors::SUCCESS)
             }
+            iommu_labels::MAP_RESERVED => self
+                .map_reserved(msg.word(1), msg.word(2), msg.word(3))
+                .err()
+                .unwrap_or(iommu_errors::SUCCESS),
             iommu_labels::UNMAP => self.unmap(msg.word(1), msg.word(2)),
             iommu_labels::BLOCK => self.block(msg.word(1)),
             iommu_labels::QUERY_UNIT => match self.query(msg.word(1))
@@ -432,18 +439,47 @@ impl<B: Backend, C: CapOps> Service<B, C>
             Access::ReadWrite => RIGHTS_MEM_MAP | RIGHTS_MEM_WRITE,
             Access::Read => RIGHTS_MEM_MAP,
         };
+        if mem.rights & needed != needed || mem.phys & (PAGE_SIZE - 1) != 0
+        {
+            return Err(invalid);
+        }
+        self.install(index, iova, mem.phys, mem.len, access, Some(cap))
+    }
+
+    /// Install the firmware-reserved range of `len` bytes at `base` in the
+    /// domain `handle` at its own address, read-write, with no cap.
+    fn map_reserved(&mut self, handle: u64, base: u64, len: u64) -> Result<(), u64>
+    {
+        let index = self.domain_index(handle)?;
+        self.install(index, base, base, len, Access::ReadWrite, None)
+    }
+
+    /// Install `len` bytes from `phys` at `iova` in the domain at `index`,
+    /// once the range is checked page-aligned, nonempty, within the unit's
+    /// width, clear of the domain's other ranges, and within the domain's
+    /// bound, recording it with `cap`.
+    fn install(
+        &mut self,
+        index: usize,
+        iova: u64,
+        phys: u64,
+        len: u64,
+        access: Access,
+        cap: Option<u64>,
+    ) -> Result<(), u64>
+    {
+        let invalid = iommu_errors::INVALID_REQUEST;
         let unit = self.domains[index].unit;
         let width = self.backend.query(unit).width_bits;
-        let end = iova.checked_add(mem.len).ok_or(invalid)?;
-        if mem.rights & needed != needed
-            || mem.len == 0
-            || (iova | mem.len | mem.phys) & (PAGE_SIZE - 1) != 0
+        let end = iova.checked_add(len).ok_or(invalid)?;
+        if len == 0
+            || (iova | len) & (PAGE_SIZE - 1) != 0
             || u32::from(width) < 64 && end > 1u64 << width
         {
             return Err(invalid);
         }
         let record = &self.domains[index];
-        if record.ranges.iter().any(|r| r.overlaps(iova, mem.len))
+        if record.ranges.iter().any(|r| r.overlaps(iova, len))
         {
             return Err(iommu_errors::ADDRESS_IN_USE);
         }
@@ -456,19 +492,11 @@ impl<B: Backend, C: CapOps> Service<B, C>
             .ranges
             .try_reserve(1)
             .map_err(|_| iommu_errors::OUT_OF_RESOURCES)?;
-        let mapped = self.backend.map(
-            &mut self.domains[index].domain,
-            iova,
-            mem.phys,
-            mem.len,
-            access,
-        );
+        let mapped = self
+            .backend
+            .map(&mut self.domains[index].domain, iova, phys, len, access);
         mapped.map_err(|e| self.backend_failure(unit, e))?;
-        self.domains[index].ranges.push(Range {
-            iova,
-            len: mem.len,
-            cap,
-        });
+        self.domains[index].ranges.push(Range { iova, len, cap });
         Ok(())
     }
 
@@ -488,6 +516,10 @@ impl<B: Backend, C: CapOps> Service<B, C>
         {
             return iommu_errors::NO_MAPPING;
         };
+        if self.domains[index].ranges[at].cap.is_none()
+        {
+            return iommu_errors::INVALID_REQUEST;
+        }
         if let Err(code) = self.unit_ok(unit)
         {
             return code;
@@ -500,7 +532,10 @@ impl<B: Backend, C: CapOps> Service<B, C>
             return self.backend_failure(unit, e);
         }
         let range = self.domains[index].ranges.swap_remove(at);
-        self.caps.delete(range.cap);
+        if let Some(cap) = range.cap
+        {
+            self.caps.delete(cap);
+        }
         iommu_errors::SUCCESS
     }
 
@@ -521,9 +556,9 @@ impl<B: Backend, C: CapOps> Service<B, C>
             return self.backend_failure(unit, e);
         }
         let record = self.domains.swap_remove(index);
-        for r in record.ranges
+        for cap in record.ranges.into_iter().filter_map(|r| r.cap)
         {
-            self.caps.delete(r.cap);
+            self.caps.delete(cap);
         }
         iommu_errors::SUCCESS
     }
@@ -1099,6 +1134,95 @@ mod tests
         let first = s.handle(&take);
         assert_eq!(first.word(0), iommu_labels::MAX_FAULTS_PER_REPLY as u64);
         assert_eq!(s.handle(&take).words()[..1], [1]);
+    }
+
+    fn map_reserved(s: &mut Service<Fake, FakeCaps>, d: u64, base: u64, len: u64) -> u64
+    {
+        s.handle(&req(iommu_labels::MAP_RESERVED, &[d, base, len], &[]))
+            .label
+    }
+
+    #[test]
+    fn a_reserved_range_is_installed_read_write_at_its_own_address_with_no_cap()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        assert_eq!(
+            map_reserved(&mut s, d, 0x7c00_0000, 3 * PAGE_SIZE),
+            iommu_errors::SUCCESS
+        );
+        assert_eq!(
+            s.domains[0].domain.ranges,
+            [(0x7c00_0000, 0x7c00_0000, 3 * PAGE_SIZE, Access::ReadWrite)]
+        );
+        // A cap sent with it is not kept.
+        let with_cap = req(
+            iommu_labels::MAP_RESERVED,
+            &[d, 0x7d00_0000, PAGE_SIZE],
+            &[6],
+        );
+        assert_eq!(s.handle(&with_cap).label, iommu_errors::SUCCESS);
+        assert_eq!(deleted(&s), [6]);
+    }
+
+    #[test]
+    fn a_misused_reserved_range_is_refused_before_the_backend()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        let width_end = 1u64 << 39;
+        for (domain, base, len) in [
+            (d + 1, 0x7c00_0000, PAGE_SIZE),    // no such domain
+            (d, 0x7c00_0800, PAGE_SIZE),        // unaligned base
+            (d, 0x7c00_0000, PAGE_SIZE + 1),    // unaligned length
+            (d, 0x7c00_0000, 0),                // empty
+            (d, width_end - PAGE_SIZE, 0x2000), // past the unit's width
+            (d, u64::MAX - 0xfff, PAGE_SIZE),   // wraps
+        ]
+        {
+            assert_eq!(
+                map_reserved(&mut s, domain, base, len),
+                iommu_errors::INVALID_REQUEST
+            );
+        }
+        assert!(s.domains[0].domain.ranges.is_empty());
+    }
+
+    #[test]
+    fn a_reserved_range_and_a_mapping_may_not_overlap()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        assert_eq!(map(&mut s, d, 0x10_0000, RW, 3), iommu_errors::SUCCESS);
+        assert_eq!(
+            map_reserved(&mut s, d, 0x10_1000, PAGE_SIZE),
+            iommu_errors::ADDRESS_IN_USE
+        );
+        assert_eq!(
+            map_reserved(&mut s, d, 0x20_0000, PAGE_SIZE),
+            iommu_errors::SUCCESS
+        );
+        assert_eq!(
+            map(&mut s, d, 0x1f_f000, RW, 4),
+            iommu_errors::ADDRESS_IN_USE
+        );
+        assert_eq!(deleted(&s), [4]);
+    }
+
+    #[test]
+    fn a_reserved_range_is_not_unmapped_and_goes_with_the_domains_block()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        assert_eq!(map_reserved(&mut s, d, 0x7c00_0000, PAGE_SIZE), 0);
+        assert_eq!(map(&mut s, d, 0x10_0000, RW, 3), iommu_errors::SUCCESS);
+        let unmap = req(iommu_labels::UNMAP, &[d, 0x7c00_0000], &[]);
+        assert_eq!(s.handle(&unmap).label, iommu_errors::INVALID_REQUEST);
+        assert_eq!(s.domains[0].domain.ranges.len(), 2);
+        let block = req(iommu_labels::BLOCK, &[d], &[]);
+        assert_eq!(s.handle(&block).label, iommu_errors::SUCCESS);
+        // Only the mapped cap is deleted: the reserved range carried none.
+        assert_eq!(deleted(&s), [3]);
     }
 
     #[test]

@@ -158,8 +158,9 @@ For each matched device, devmgr:
    fails, refuses the device, logged, with its BAR caps released. devmgr
    then gives the device DMA. Where a VT-d unit translates the device, it
    first attaches the device to an IOMMU domain of its own through the IOMMU
-   driver, and refuses a device an RMRR names, whose unit it could not hand
-   over, or whose attach fails (see
+   driver and maps there, at their own addresses, the ranges an RMRR reserves
+   for it, and refuses a device whose reserved ranges cannot be mapped, whose
+   unit it could not hand over, or whose attach fails (see
    [docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming)
    § IOMMU Discovery and Programming). It registers the device in its DMA
    table with that confinement and derives the device's DMA capability, a

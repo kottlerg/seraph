@@ -53,6 +53,10 @@ pub mod kind
     /// stride|format<<32]`. Skipped (and devmgr's `fb_info` stays
     /// `None`) when no framebuffer is present.
     pub const FRAMEBUFFER_INFO: u64 = 5;
+    /// Cap-less round carrying `(base, size)` pairs, one per extent of RAM
+    /// memmgr pools (now or at init's reap): data words `[kind, count,
+    /// base, size, ...]`. Read into [`DevmgrCaps::pooled`].
+    pub const RAM_EXTENT: u64 = 6;
 }
 
 /// Per-cap class tag carried alongside each `kind::MODULE` round cap, so
@@ -122,6 +126,12 @@ pub struct DevmgrCaps
     // ACPI reclaimable-region Memory caps.
     pub acpi_regions: Vec<AcpiRegion>,
 
+    /// The `(base, size)` of every extent of RAM memmgr pools, from init's
+    /// [`kind::RAM_EXTENT`] rounds, against which a device's firmware-reserved
+    /// ranges are checked; `None` once an extent could not be recorded, so the
+    /// set is not known in full.
+    pub pooled: Option<Vec<(u64, u64)>>,
+
     // From StartupInfo / endpoints.
     pub procmgr_ep: u64,
     pub registry_ep: u64,
@@ -175,6 +185,7 @@ impl DevmgrCaps
             config_space: SpanTable::new(),
             ecam_windows: Vec::new(),
             acpi_regions: Vec::new(),
+            pooled: Some(Vec::new()),
             procmgr_ep: info.procmgr_endpoint,
             registry_ep: 0,
             self_bootstrap_ep: 0,
@@ -207,8 +218,8 @@ impl DevmgrCaps
 //   data[2] = dtb_page_base  (valid if DTB bit set)
 //   data[3] = dtb_size       (valid if DTB bit set)
 //
-// Round 2+ (variable, ≤4 caps, up to 10 data words)
-//   data[0] = round kind (APERTURE / ACPI_REGION / MODULE /
+// Round 2+ (variable, ≤4 caps, up to MSG_DATA_WORDS_MAX data words)
+//   data[0] = round kind (APERTURE / ACPI_REGION / RAM_EXTENT / MODULE /
 //             FRAMEBUFFER_INFO / SVCMGR_BUNDLE)
 //   APERTURE / ACPI_REGION / MODULE / SVCMGR_BUNDLE:
 //     data[1] = count of caps in this round
@@ -217,6 +228,8 @@ impl DevmgrCaps
 //       MODULE → one `module_kind` tag per cap
 //       SVCMGR_BUNDLE → no payload; one or two caps (publish, optional
 //         arch shutdown); the terminal round
+//   RAM_EXTENT: zero caps; data[1] = count of (base, size) pairs,
+//     data[2..] = the pairs, one per extent of RAM memmgr pools
 //   FRAMEBUFFER_INFO: zero caps; data[1] = physical_base,
 //     data[2] = width | height << 32, data[3] = stride | format << 32
 //   Terminal round has `done = true`.
@@ -328,6 +341,36 @@ fn absorb_acpi_region_round(
     }
 }
 
+/// Unpack one RAM-extent round into [`DevmgrCaps::pooled`]: `data[1]` pairs
+/// follow, bounded by the words the round carries. An extent the list cannot
+/// grow to hold is logged and leaves the set unknown (`None`), so every device
+/// with a firmware-reserved range is refused rather than checked against part
+/// of it.
+fn absorb_ram_extent_round(
+    round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
+    data_words: usize,
+    caps: &mut DevmgrCaps,
+)
+{
+    let count = usize::try_from(round_data[1]).unwrap_or(usize::MAX);
+    let n = count.min(data_words.min(round_data.len()).saturating_sub(2) / 2);
+    let Some(pooled) = caps.pooled.as_mut()
+    else
+    {
+        return;
+    };
+    if pooled.try_reserve(n).is_err()
+    {
+        std::os::seraph::log!("pooled RAM extents not recorded (no memory)");
+        caps.pooled = None;
+        return;
+    }
+    for i in 0..n
+    {
+        pooled.push((round_data[2 + i * 2], round_data[3 + i * 2]));
+    }
+}
+
 /// Unpack one module-cap round. `data[2 + i]` carries the `module_kind`
 /// tag for `caps[i]`. The `.min(4)` is `MSG_CAP_SLOTS_MAX`, the caps one
 /// round carries. A module of an unknown kind, or a second module of a kind
@@ -409,6 +452,10 @@ fn bootstrap_rounds(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
             kind::ACPI_REGION =>
             {
                 absorb_acpi_region_round(&round.caps, round.cap_count, &round.data, caps);
+            }
+            kind::RAM_EXTENT =>
+            {
+                absorb_ram_extent_round(&round.data, round.data_words, caps);
             }
             kind::MODULE =>
             {

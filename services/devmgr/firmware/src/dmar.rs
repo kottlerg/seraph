@@ -8,9 +8,10 @@
 //! keep reaching, and which unit translates a given PCI function.
 //!
 //! devmgr discovers each unit here, hands the unit's register range and the
-//! functions it covers to the VT-d IOMMU driver, and checks whether an RMRR
-//! names a DMA-capable device before it binds one
-//! (`docs/device-management.md` § IOMMU Discovery and Programming). Layouts
+//! functions it covers to the VT-d IOMMU driver, and reads the RMRRs that name
+//! a DMA-capable device before it binds one, to identity-map them in the
+//! device's domain (`docs/device-management.md` § IOMMU Discovery and
+//! Programming). Layouts
 //! are the Intel VT-d specification's (rev. 4.1, chapter 8, "BIOS
 //! Considerations"). Operates on a caller-mapped byte slice of the table, as
 //! [`crate::acpi`] does. No alloc.
@@ -391,22 +392,31 @@ pub fn unit_for(
     catch_all
 }
 
-/// Whether an RMRR names function `target` of `segment`: firmware expects it
-/// to keep reaching a reserved region after the hand-over, so its domain
-/// needs that region mapped before translation is enabled for it.
-pub fn has_reserved_region(
+/// Pass to `out` the first and last byte of each RMRR that names function
+/// `target` of `segment`, in table order: the regions firmware expects it to
+/// keep reaching after the hand-over, which its domain maps at their own
+/// addresses before its DMA grant.
+///
+/// `secondary_bus` and `bus_range` read a bridge's secondary bus and its
+/// (secondary, subordinate) bus range, as for [`unit_for`].
+pub fn reserved_regions(
     dmar: &[u8],
     segment: u16,
     target: Bdf,
     mut secondary_bus: impl FnMut(Bdf) -> Option<u8>,
     mut bus_range: impl FnMut(Bdf) -> Option<(u8, u8)>,
-) -> bool
+    mut out: impl FnMut(u64, u64),
+)
 {
-    rmrrs(dmar).any(|r| {
-        r.segment == segment
+    for r in rmrrs(dmar)
+    {
+        if r.segment == segment
             && r.scopes(dmar)
                 .any(|s| scope_names(&s, target, &mut secondary_bus, &mut bus_range))
-    })
+        {
+            out(r.base, r.limit);
+        }
+    }
 }
 
 /// PCI functions one resolved device scope names: the function itself, or
@@ -674,38 +684,58 @@ mod tests
         assert_eq!(found, vec![vec![(4, 0)]]);
     }
 
+    /// The reserved regions `reserved_regions` passes for `target`.
+    fn regions_of(
+        table: &[u8],
+        segment: u16,
+        target: Bdf,
+        range: impl FnMut(Bdf) -> Option<(u8, u8)>,
+    ) -> Vec<(u64, u64)>
+    {
+        let mut found = Vec::new();
+        reserved_regions(table, segment, target, no_bridges, range, |b, l| {
+            found.push((b, l));
+        });
+        found
+    }
+
     #[test]
-    fn an_rmrr_naming_a_function_marks_it_reserved()
+    fn the_rmrrs_naming_a_function_are_its_reserved_regions()
     {
         let usb = scope(SCOPE_PCI_ENDPOINT, 0, &[(0x14, 0)]);
+        let gpu = scope(SCOPE_PCI_ENDPOINT, 0, &[(2, 0)]);
         let table = dmar(
             39,
             &[
                 drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_0000, &[]),
-                rmrr(0, 0x7c00_0000, 0x7c0f_ffff, &[usb]),
+                rmrr(0, 0x7c00_0000, 0x7c0f_ffff, &[usb.clone()]),
+                rmrr(0, 0x8000_0000, 0x8fff_ffff, &[gpu]),
+                rmrr(0, 0x000e_8000, 0x000e_8fff, &[usb]),
             ],
         );
-        assert!(has_reserved_region(
-            &table,
-            0,
-            bdf(0, 0x14, 0),
-            no_bridges,
-            no_ranges
-        ));
-        assert!(!has_reserved_region(
-            &table,
-            0,
-            bdf(0, 3, 0),
-            no_bridges,
-            no_ranges
-        ));
-        assert!(!has_reserved_region(
-            &table,
-            1,
-            bdf(0, 0x14, 0),
-            no_bridges,
-            no_ranges
-        ));
+        assert_eq!(
+            regions_of(&table, 0, bdf(0, 0x14, 0), no_ranges),
+            [(0x7c00_0000, 0x7c0f_ffff), (0x000e_8000, 0x000e_8fff)]
+        );
+        assert_eq!(
+            regions_of(&table, 0, bdf(0, 2, 0), no_ranges),
+            [(0x8000_0000, 0x8fff_ffff)]
+        );
+        assert!(regions_of(&table, 0, bdf(0, 3, 0), no_ranges).is_empty());
+        assert!(regions_of(&table, 1, bdf(0, 0x14, 0), no_ranges).is_empty());
+    }
+
+    #[test]
+    fn an_rmrr_naming_a_sub_hierarchy_reserves_for_every_function_behind_it()
+    {
+        let tree = scope(SCOPE_PCI_SUB_HIERARCHY, 0, &[(0x1c, 0)]);
+        let table = dmar(39, &[rmrr(0, 0x7c00_0000, 0x7c00_0fff, &[tree])]);
+        let range = |b: Bdf| (b == bdf(0, 0x1c, 0)).then_some((2, 4));
+        assert_eq!(
+            regions_of(&table, 0, bdf(3, 0, 0), range),
+            [(0x7c00_0000, 0x7c00_0fff)]
+        );
+        assert!(regions_of(&table, 0, bdf(5, 0, 0), range).is_empty());
     }
 
     #[test]

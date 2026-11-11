@@ -189,10 +189,7 @@ fn synthesise_svctest_bench_bin(ctx: &BuildContext) -> Result<PathBuf>
 /// The content of `bench.bin`: byte `i` is `i` modulo 256.
 fn bench_bin_bytes() -> Vec<u8>
 {
-    (0..=u8::MAX)
-        .cycle()
-        .take(SVCTEST_BENCH_BIN_SIZE)
-        .collect()
+    (0..=u8::MAX).cycle().take(SVCTEST_BENCH_BIN_SIZE).collect()
 }
 
 /// Make the rootfs mirror authoritative over `roots`: remove every regular file

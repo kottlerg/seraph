@@ -55,6 +55,7 @@ core/kernel/
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
 │   │       ├── aia.rs          # APLIC (MSI delivery mode) and IMSIC interrupt files
+│   │       ├── aia_encoding.rs # AIA bounds, source modes, MSI targets, EID rows; host-tested
 │   │       ├── paging.rs       # Page table management (mode-parameterized)
 │   │       ├── context.rs      # Thread context save/restore, context switch
 │   │       ├── trap_frame.rs   # Trap frame: user register snapshot
@@ -64,7 +65,7 @@ core/kernel/
 │   │       ├── timer.rs        # Sstc (stimecmp) timer for preemption
 │   │       ├── syscall.rs      # No-op syscall init; ecall is routed by interrupts.rs trap_dispatch
 │   │       ├── cpu.rs          # Baseline gate, ASID probe, tp per-hart pointer, user copy
-│   │       ├── encoding.rs     # AIA encodings, SBI mask, F/D/V, PTE permissions; host-tested
+│   │       ├── encoding.rs     # SBI mask, F/D/V, page rounding, PTE permissions; host-tested
 │   │       ├── gdt.rs          # GDT stub
 │   │       ├── fpu.rs          # Extended-state (F/D/V) control
 │   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)

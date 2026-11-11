@@ -7,6 +7,7 @@
 
 #[cfg(not(test))]
 pub mod aia;
+pub mod aia_encoding;
 pub mod ap_trampoline;
 pub mod console;
 pub mod context;
@@ -34,11 +35,11 @@ pub const ARCH_NAME: &str = "riscv64";
 pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_RISCV;
 
 /// Maximum APLIC source number the IRQ id range admits: the AIA specification's last
-/// source, 1023 (`encoding::APLIC_MAX_SOURCES`); source 0 is reserved by the spec.
+/// source, 1023 (`aia_encoding::APLIC_MAX_SOURCES`); source 0 is reserved by the spec.
 /// `SYS_IRQ_REGISTER` refuses an id outside `MIN_IRQ_ID..=MAX_IRQ_ID`; within it,
 /// `irq::register` refuses a source past the APLIC domain's reported count
 /// (`aia::source_count`).
-pub const MAX_IRQ_ID: u32 = encoding::APLIC_MAX_SOURCES;
+pub const MAX_IRQ_ID: u32 = aia_encoding::APLIC_MAX_SOURCES;
 
 /// Minimum valid APLIC source number. APLIC source 0 is reserved and never
 /// wired to a real device.

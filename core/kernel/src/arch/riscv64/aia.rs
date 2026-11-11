@@ -57,7 +57,7 @@
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use super::encoding::{
+use super::aia_encoding::{
     APLIC_MAX_HART_INDEX, APLIC_MAX_SOURCES, APLIC_MIN_WINDOW, IMSIC_MAX_IDS, SourceRoute,
     aplic_mode_is_level, aplic_msi_target, aplic_source_mode, aplic_sources_for, imsic_ids_valid,
     imsic_reg_words, lowest_free_eid,

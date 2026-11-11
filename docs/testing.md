@@ -852,7 +852,7 @@ own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
-| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, and `core/kernel/src/arch/riscv64/aia.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, and `sys_irq_split`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, and `select_ioapics`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch (`dispatch_external`) and the AIA encodings it routes and claims with (`aplic_source_mode`, `aplic_mode_is_level`, `aplic_msi_target`, `aplic_sources_for`, `imsic_ids_valid`, `imsic_reg_words`, `lowest_free_eid`, `SourceRoute`, `APLIC_MAX_SOURCES`, `APLIC_MIN_WINDOW`, `APLIC_MAX_HART_INDEX`, `IMSIC_MIN_IDS`, `IMSIC_MAX_IDS`, `SOURCE_ROUTED`, and `SOURCE_LEVEL`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, and `RISCV_IOMMU_DEVICE`) | every device cell |
+| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, and `core/kernel/src/arch/riscv64/aia_encoding.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, and `sys_irq_split`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, and `select_ioapics`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, and `RISCV_IOMMU_DEVICE`) | every device cell |
 | Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `vfsd_errors`, `fs_labels`, `fs_errors`, `blk_labels`, and `blk_errors`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_shared_line`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
@@ -881,7 +881,8 @@ an item listed by definition alone), read in that file's hunk.
 ```sh
 git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs \
-    core/kernel/src/arch/riscv64/aia.rs services/vfsd/ \
+    core/kernel/src/arch/riscv64/aia.rs core/kernel/src/arch/riscv64/aia_encoding.rs \
+    services/vfsd/ \
     xtask/src/disk.rs xtask/src/commands/mkdisk.rs services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/test-dma/ services/drivers/framebuffer/ \
     services/drivers/virtio/console/ services/debug-echo/ xtask/src/commands/test_debug_port.rs \
@@ -889,10 +890,8 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/
 D='sys_irq_(register|ack|split)|(un)?route_device_irq|irq_line_count|dispatch_device_irq'
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
-D="$D|InterruptObject|dispatch_external|devmgr_(dma_)?(labels|errors)"
-D="$D|aplic_(source_mode|mode_is_level|msi_target|sources_for)|lowest_free_eid|SourceRoute"
-D="$D|SOURCE_(ROUTED|LEVEL)"
-D="$D|imsic_(ids_valid|reg_words)|APLIC_(MAX_SOURCES|MIN_WINDOW|MAX_HART_INDEX)|IMSIC_M(IN|AX)_IDS"
+D="$D|InterruptObject|dispatch_external|init_eid_storage|M(IN|AX)_IRQ_ID"
+D="$D|devmgr_(dma_)?(labels|errors)"
 D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV_IOMMU_DEVICE"
 D="$D|test_dma_labels|dma_confinement_phase"
 D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"

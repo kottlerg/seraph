@@ -459,14 +459,8 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
             9 =>
             {
                 // Supervisor external interrupt: this hart's IMSIC file has a
-                // pending identity. The claim clears its pending bit and maps it
-                // to the APLIC source routed to it on this hart; a claim that
-                // finds nothing pending, or a free identity, dispatches nothing.
-                // A further pending identity keeps SEIP set and traps again.
-                if let Some(irq) = super::aia::claim()
-                {
-                    dispatch_external(irq);
-                }
+                // pending identity.
+                dispatch_external();
             }
             _ =>
             {
@@ -1010,18 +1004,24 @@ pub fn irq_line_count() -> u32
     super::aia::source_count() + 1
 }
 
-/// Dispatch APLIC source `irq`, claimed from this hart's IMSIC file, to its
-/// registered notifications.
+/// Claim this hart's top pending IMSIC identity and dispatch the APLIC source
+/// routed to it to its registered notifications.
 ///
-/// Called from `trap_dispatch` after the claim. Routing is handled by
-/// [`crate::irq::dispatch_device_irq`], which masks the source and calls
-/// [`acknowledge`].
+/// Called from `trap_dispatch` on a supervisor external interrupt. The claim
+/// (`aia::claim`) clears the identity's pending bit and maps it to the source
+/// through this hart's EID row; a claim that finds nothing pending, or a free
+/// identity, dispatches nothing. A further pending identity keeps SEIP set and
+/// traps again. Routing is handled by [`crate::irq::dispatch_device_irq`],
+/// which masks the source and calls [`acknowledge`].
 #[cfg(not(test))]
-fn dispatch_external(irq: u32)
+fn dispatch_external()
 {
-    // SAFETY: called from trap_dispatch in interrupt context with sstatus.SIE clear;
-    // irq is the source the claimed identity maps to.
-    unsafe { crate::irq::dispatch_device_irq(irq) };
+    if let Some(irq) = super::aia::claim()
+    {
+        // SAFETY: called from trap_dispatch in interrupt context with
+        // sstatus.SIE clear; irq is the source the claimed identity maps to.
+        unsafe { crate::irq::dispatch_device_irq(irq) };
+    }
 }
 
 // ── Public interface ──────────────────────────────────────────────────────────

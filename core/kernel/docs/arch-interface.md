@@ -46,11 +46,12 @@ core/kernel/src/arch/
 │   ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs └── speculation.rs
 └── riscv64/
     ├── mod.rs      ├── aia.rs      # APLIC (MSI mode) and IMSIC
+    ├── aia_encoding.rs # AIA register-map arithmetic; no arch-module deps
     ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
     ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
-    └── encoding.rs # AIA, SBI mask, F/D/V, page rounding, PTE bits; no arch-module deps
+    └── encoding.rs # SBI mask, F/D/V, page rounding, PTE permissions; no arch-module deps
 ```
 
 `arch/mod.rs` performs the conditional compilation, and also defines the one type it holds

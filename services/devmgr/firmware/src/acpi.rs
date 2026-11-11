@@ -1057,4 +1057,106 @@ mod tests
         // Polarity reserved, trigger edge: active-low from the default.
         assert_eq!(line_mode(iso(0b0110), 10), IRQ_MODE_ACTIVE_LOW);
     }
+
+    /// A FADT `len` bytes long whose 32-bit `DSDT` field is `dsdt` and whose
+    /// `X_DSDT` field, when the table reaches it, is `x_dsdt`.
+    fn fadt_with_dsdt(len: u32, dsdt: u32, x_dsdt: u64) -> Vec<u8>
+    {
+        let mut b = fadt(len, 0x604);
+        if b.len() >= FADT_OFF_DSDT + 4
+        {
+            b[FADT_OFF_DSDT..FADT_OFF_DSDT + 4].copy_from_slice(&dsdt.to_le_bytes());
+        }
+        if b.len() >= FADT_OFF_X_DSDT + 8
+        {
+            b[FADT_OFF_X_DSDT..FADT_OFF_X_DSDT + 8].copy_from_slice(&x_dsdt.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn fadt_dsdt_prefers_a_nonzero_x_dsdt()
+    {
+        let t = fadt_with_dsdt(276, 0x7FE0_0000, 0x1_7FE0_0000);
+        assert_eq!(fadt_dsdt_phys(&t), Some(0x1_7FE0_0000));
+        // A zero X_DSDT falls back to the 32-bit field.
+        let t = fadt_with_dsdt(276, 0x7FE0_0000, 0);
+        assert_eq!(fadt_dsdt_phys(&t), Some(0x7FE0_0000));
+        // An ACPI 1.0 FADT that stops before X_DSDT.
+        let t = fadt_with_dsdt(116, 0x7FE0_0000, 0x1_7FE0_0000);
+        assert_eq!(fadt_dsdt_phys(&t), Some(0x7FE0_0000));
+    }
+
+    #[test]
+    fn fadt_dsdt_refuses_a_zero_short_or_foreign_table()
+    {
+        assert_eq!(fadt_dsdt_phys(&fadt_with_dsdt(276, 0, 0)), None);
+        // The reported length stops before the DSDT field.
+        assert_eq!(fadt_dsdt_phys(&fadt_with_dsdt(42, 0x7FE0_0000, 0)), None);
+        // The slice is shorter than the reported length: X_DSDT is not read.
+        let mut t = fadt_with_dsdt(276, 0x7FE0_0000, 0x1_7FE0_0000);
+        t.truncate(FADT_OFF_X_DSDT + 4);
+        assert_eq!(fadt_dsdt_phys(&t), Some(0x7FE0_0000));
+        let mut t = fadt_with_dsdt(276, 0x7FE0_0000, 0);
+        t[..4].copy_from_slice(b"APIC");
+        assert_eq!(fadt_dsdt_phys(&t), None);
+    }
+
+    #[test]
+    fn oem_table_id_is_read_from_a_whole_header_only()
+    {
+        let mut t = sdt(b"XSDT", 36);
+        t[SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + 8].copy_from_slice(b"BXPC    ");
+        assert_eq!(sdt_oem_table_id(&t), Some(*b"BXPC    "));
+        assert_eq!(sdt_oem_table_id(&t[..SDT_OFF_OEM_TABLE_ID + 7]), None);
+    }
+
+    #[test]
+    fn an_isa_irq_no_override_names_keeps_its_number_and_described_mode()
+    {
+        let other = [SourceOverride {
+            source: 0,
+            gsi: 2,
+            flags: 0,
+        }];
+        assert_eq!(isa_line(other, 4, 0), (4, 0));
+        assert_eq!(isa_line([], 8, IRQ_MODE_ACTIVE_LOW), (8, IRQ_MODE_ACTIVE_LOW));
+    }
+
+    #[test]
+    fn an_isa_override_gives_the_gsi_and_overrides_field_by_field()
+    {
+        let iso = |flags| {
+            [SourceOverride {
+                source: 4,
+                gsi: 20,
+                flags,
+            }]
+        };
+        // Level, active-low.
+        assert_eq!(isa_line(iso(0b1111), 4, 0), (20, IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW));
+        // Edge, active-high, over a described level active-low line.
+        assert_eq!(isa_line(iso(0b0101), 4, PCI_INTX_MODE), (20, 0));
+        // Both fields conform: the described mode.
+        assert_eq!(isa_line(iso(0), 4, IRQ_MODE_LEVEL), (20, IRQ_MODE_LEVEL));
+        // Polarity reserved, trigger level: polarity from the description.
+        assert_eq!(
+            isa_line(iso(0b1110), 4, IRQ_MODE_ACTIVE_LOW),
+            (20, IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW)
+        );
+        // The first override naming the IRQ wins.
+        let two = [
+            SourceOverride {
+                source: 4,
+                gsi: 20,
+                flags: 0,
+            },
+            SourceOverride {
+                source: 4,
+                gsi: 21,
+                flags: 0,
+            },
+        ];
+        assert_eq!(isa_line(two, 4, 0), (20, 0));
+    }
 }

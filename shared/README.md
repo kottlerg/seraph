@@ -23,6 +23,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`registry-client/`](registry-client/README.md) | Client-side helper for the svcmgr name→cap discovery registry |
 | [`riscv-step/`](riscv-step/README.md) | Successor-address decoder a debugger single-steps a riscv64 thread with |
 | [`shmem/`](shmem/README.md) | Shared-memory byte transport — multi-page `SharedBuffer` plus SPSC ring |
+| [`svc-grammar/`](svc-grammar/README.md) | Line grammar of the `.svc` files (`key = value`, `#` comments), shared by svcmgr's definition and class parsers and devmgr's platform table parser |
 | [`syscall/`](syscall/README.md) | Userspace syscall wrappers — inline asm over `abi/syscall/` |
 | [`text/`](text/README.md) | Byte-stream → glyph primitives shared by every framebuffer console |
 

@@ -25,12 +25,12 @@
 
 use driver_binding::decl::{DriverDecl, InterruptNeed, Reset, Tier};
 use driver_binding::resources::{InterruptKind, Resource};
+use firmware::aml::CrsResource;
 use firmware::binding::{
     Candidate, Choice, MatchTable, PciIdentity, RecordKeys, Source, class_admits,
 };
 use firmware::classes::Classes;
 use firmware::dma::Confinement;
-use firmware::aml::CrsResource;
 use firmware::lines::{HoldError, LineError};
 use firmware::records::{PlatformRecord, PlatformRecords};
 use firmware::resource::{CarveError, Span, SplitError};
@@ -111,6 +111,13 @@ impl Records
         })
     }
 
+    /// The number of records, PCI and platform: the most drivers the bind
+    /// passes can start, each record being bound at most once.
+    pub fn count(&self) -> usize
+    {
+        self.pci.devices.len() + self.platform_bound.len()
+    }
+
     /// Whether `decl`, from `source`, matches a record no driver is bound
     /// to.
     fn matches_unbound(&self, decl: &DriverDecl, source: Source) -> bool
@@ -131,7 +138,11 @@ impl Records
     /// Whether every record has a driver.
     fn all_bound(&self) -> bool
     {
-        self.pci.bound.iter().chain(&self.platform_bound).all(|&b| b)
+        self.pci
+            .bound
+            .iter()
+            .chain(&self.platform_bound)
+            .all(|&b| b)
     }
 }
 
@@ -325,7 +336,14 @@ fn bind_records(
             }
             Choice::Bind(chosen) =>
             {
-                if bind_platform(index, record, &table.candidates()[chosen], carve, pass, ipc_buf)
+                if bind_platform(
+                    index,
+                    record,
+                    &table.candidates()[chosen],
+                    carve,
+                    pass,
+                    ipc_buf,
+                )
                 {
                     *bound = true;
                     table.note_bound(chosen);
@@ -525,12 +543,10 @@ fn carve_platform_device(
             }
             CrsResource::IoPort { base, count } =>
             {
-                arch::current::carve_io_ports(carve.caps, base, count).map(|cap| {
-                    Resource::IoPort {
-                        cap,
-                        base: u64::from(base),
-                        count: u64::from(count),
-                    }
+                arch::current::carve_io_ports(carve.caps, base, count).map(|cap| Resource::IoPort {
+                    cap,
+                    base: u64::from(base),
+                    count: u64::from(count),
                 })
             }
             CrsResource::Interrupt { .. } => continue,
@@ -538,42 +554,24 @@ fn carve_platform_device(
         let Some(carved) = carved
         else
         {
-            std::os::seraph::log!("{}: a register range of the record not carved; not bound", name);
+            std::os::seraph::log!(
+                "{}: a register range of the record not carved; not bound",
+                name
+            );
             dev.release();
             return None;
         };
         if !dev.push(carved)
         {
-            std::os::seraph::log!("{}: more resources than a driver is delivered; not bound", name);
+            std::os::seraph::log!(
+                "{}: more resources than a driver is delivered; not bound",
+                name
+            );
             dev.release();
             return None;
         }
     }
-    let line = record.resources().find_map(|r| match r
-    {
-        CrsResource::Interrupt {
-            line, mode, isa, ..
-        } => Some((line, mode, isa)),
-        _ => None,
-    });
-    let wired = match (decl.interrupt.need, line)
-    {
-        (InterruptNeed::None, _) | (_, None) => None,
-        (_, Some((line, mode, isa))) =>
-        {
-            let (gsi, mode) = arch::current::platform_line(carve.irq_range, line, mode, isa);
-            match carve.irq_range.exclusive_line(gsi)
-            {
-                Ok(cap) => Some((cap, mode)),
-                Err(e) =>
-                {
-                    std::os::seraph::log!("{}: no IRQ cap for line {:#x} ({:?})", name, gsi, e);
-                    None
-                }
-            }
-        }
-    };
-    match wired
+    match platform_wired(name, record, decl, carve)
     {
         Some((cap, mode)) =>
         {
@@ -615,6 +613,40 @@ fn carve_platform_device(
     };
     dev.device_badge = badge;
     Some(dev)
+}
+
+/// The cap on the first interrupt line of `record`, carved exclusive, and
+/// the line's mode, for a driver `decl` that takes an interrupt; `None` when
+/// it takes none, the record has no line, or the line cannot be carved
+/// (logged under `name`).
+fn platform_wired(
+    name: &str,
+    record: &PlatformRecord,
+    decl: &DriverDecl,
+    carve: &mut Carve,
+) -> Option<(u64, u64)>
+{
+    if decl.interrupt.need == InterruptNeed::None
+    {
+        return None;
+    }
+    let (line, mode, isa) = record.resources().find_map(|r| match r
+    {
+        CrsResource::Interrupt {
+            line, mode, isa, ..
+        } => Some((line, mode, isa)),
+        _ => None,
+    })?;
+    let (gsi, mode) = arch::current::platform_line(carve.irq_range, line, mode, isa);
+    match carve.irq_range.exclusive_line(gsi)
+    {
+        Ok(cap) => Some((cap, mode)),
+        Err(e) =>
+        {
+            std::os::seraph::log!("{}: no IRQ cap for line {:#x} ({:?})", name, gsi, e);
+            None
+        }
+    }
 }
 
 /// The caps devmgr keeps for a platform record it bound a driver to: the

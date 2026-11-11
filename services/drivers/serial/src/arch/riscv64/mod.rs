@@ -5,8 +5,8 @@
 
 //! RISC-V serial I/O via a memory-mapped NS16550 UART.
 //!
-//! The driver maps the `Mmio` cap devmgr delegated (the platform-static
-//! UART base; `0x10000000` on QEMU virt) into its own address space, then
+//! The driver maps the `Mmio` range devmgr delivered (the range the UART's
+//! device record names; `0x10000000` on QEMU virt) into its own address space, then
 //! writes the transmit register and drains the receive register after polling
 //! the line status register. Registers are byte-addressed (reg-shift 0),
 //! matching the bootloader's NS16550 access. The UART was programmed by an
@@ -17,6 +17,9 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::os::seraph::{fund_aspace_pt_budget, reserve_pages};
 
+use driver_binding::resources::Resource;
+use syscall_abi::PAGE_SIZE;
+
 /// NS16550 register offsets (byte-addressed).
 const UART_RX: u64 = 0; // receive holding register
 const UART_TX: u64 = 0; // transmit holding register
@@ -26,22 +29,40 @@ const UART_LSR: u64 = 5; // line status register
 /// Mapped UART base virtual address, set once by [`serial_init`].
 static UART_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// Reserve a VA page, map the UART `Mmio` cap into it, and enable the
-/// receive-data interrupt when `enable_rx_irq` is set. The reservation lives
-/// for the process's lifetime. `self_thread` is unused on RISC-V. Returns
-/// `false` if reservation or mapping fails.
+/// Reserve a VA page, map the UART's `Mmio` range, `registers`, into it, and
+/// enable the receive-data interrupt when `enable_rx_irq` is set. The
+/// reservation lives for the process's lifetime. `self_thread` is unused on
+/// RISC-V. Returns `false` if `registers` is not a page-aligned `Mmio` range
+/// of at most one page holding the registers, or reservation or mapping
+/// fails.
 ///
 /// # Safety
-/// `self_aspace` must be this process's own address space and `mmio_cap`
-/// must name an `Mmio` region of one page, so the whole-region mapping
-/// stays inside the one-page reservation (`syscall::mmio_map`'s contract).
+/// `self_aspace` must be this process's own address space, and `registers`
+/// the range devmgr delivered: its cap spans the range from its page-aligned
+/// base to the page end, so a range of at most one page keeps the
+/// whole-region mapping inside the one-page reservation
+/// (`syscall::mmio_map`'s contract).
 pub unsafe fn serial_init(
     _self_thread: u64,
     self_aspace: u64,
-    mmio_cap: u64,
+    registers: &Resource,
     enable_rx_irq: bool,
 ) -> bool
 {
+    let Resource::Mmio {
+        cap: mmio_cap,
+        phys,
+        bytes,
+        ..
+    } = *registers
+    else
+    {
+        return false;
+    };
+    if phys % PAGE_SIZE != 0 || bytes <= UART_LSR || bytes > PAGE_SIZE
+    {
+        return false;
+    }
     let Ok(range) = reserve_pages(1)
     else
     {

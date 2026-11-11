@@ -136,6 +136,10 @@ pub const MAX_PLATFORM_DEVICES: usize = 16;
 pub const MAX_PLATFORM_KEY_BYTES: usize = 32;
 /// Resources one platform device lists.
 pub const MAX_PLATFORM_RESOURCES: usize = 4;
+/// Longest platform description table, in bytes: room for
+/// [`MAX_PLATFORM_DEVICES`] device lines of every resource with comments to
+/// spare. A longer table is rejected whole.
+pub const MAX_TABLE_BYTES: usize = 8192;
 /// Longest `oem_table_id`, in bytes.
 const OEM_ID_BYTES: usize = 8;
 
@@ -223,7 +227,10 @@ impl PlatformTable
     #[must_use]
     pub fn is_for(&self, field: &[u8]) -> bool
     {
-        let id = self.oem_table_id.get(..usize::from(self.id_len)).unwrap_or(&[]);
+        let id = self
+            .oem_table_id
+            .get(..usize::from(self.id_len))
+            .unwrap_or(&[]);
         trim_field(id) == trim_field(field)
     }
 
@@ -239,6 +246,8 @@ impl PlatformTable
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableError
 {
+    /// The table is longer than [`MAX_TABLE_BYTES`].
+    TooLarge,
     /// A line has no `=`.
     MissingEquals(usize),
     /// A line names an unknown key.
@@ -260,7 +269,9 @@ fn number(token: Option<&str>) -> Option<u64>
     {
         return None;
     }
-    match token.strip_prefix("0x").or_else(|| token.strip_prefix("0X"))
+    match token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
     {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => token.parse().ok(),
@@ -348,25 +359,25 @@ fn parse_device(value: &str, line: usize) -> Result<PlatformDevice, TableError>
     Ok(dev)
 }
 
-/// Parse a platform description table.
+/// Parse a platform description table, read through the `.svc` line
+/// grammar (`svc_grammar::entries`).
 ///
 /// # Errors
-/// A line without `=`, an unknown or repeated key, a missing `oem_table_id`,
-/// a malformed value, or an allocation failure.
+/// A table longer than [`MAX_TABLE_BYTES`], a line without `=`, an unknown
+/// or repeated key, a missing `oem_table_id`, a malformed value, or an
+/// allocation failure.
 pub fn parse_table(contents: &str) -> Result<PlatformTable, TableError>
 {
+    if contents.len() > MAX_TABLE_BYTES
+    {
+        return Err(TableError::TooLarge);
+    }
     let mut oem: Option<([u8; OEM_ID_BYTES], u8)> = None;
     let mut devices: Vec<PlatformDevice> = Vec::new();
-    for (idx, raw) in contents.lines().enumerate()
+    for entry in svc_grammar::entries(contents)
     {
-        let line = idx + 1;
-        let text = raw.trim();
-        if text.is_empty() || text.starts_with('#')
-        {
-            continue;
-        }
-        let (key, value) = text.split_once('=').ok_or(TableError::MissingEquals(line))?;
-        let (key, value) = (key.trim(), value.trim());
+        let svc_grammar::Entry { line, key, value } =
+            entry.map_err(|svc_grammar::MissingEquals(l)| TableError::MissingEquals(l))?;
         match key
         {
             "oem_table_id" =>
@@ -380,7 +391,7 @@ pub fn parse_table(contents: &str) -> Result<PlatformTable, TableError>
                 {
                     return Err(TableError::InvalidValue(line, "bad oem_table_id"));
                 }
-                let mut id = [0_u8; OEM_ID_BYTES];
+                let mut id = [0u8; OEM_ID_BYTES];
                 if let Some(dst) = id.get_mut(..bytes.len())
                 {
                     dst.copy_from_slice(bytes);
@@ -415,7 +426,7 @@ mod tests
 
     fn spcr_bytes() -> Vec<u8>
     {
-        let mut t = vec![0_u8; 80];
+        let mut t = vec![0u8; 80];
         t[..4].copy_from_slice(b"SPCR");
         t[4..8].copy_from_slice(&80_u32.to_le_bytes());
         t[36] = 3;
@@ -466,7 +477,7 @@ mod tests
         assert_eq!(spcr(&t).map(|s| s.base), Some(SpcrBase::IoPort(0x3F8)));
         t[44..52].copy_from_slice(&0x1_0000_u64.to_le_bytes());
         assert_eq!(spcr(&t), None);
-        t[44..52].copy_from_slice(&0_u64.to_le_bytes());
+        t[44..52].copy_from_slice(&0u64.to_le_bytes());
         assert_eq!(spcr(&t), None);
         t[40] = 2;
         t[44] = 1;
@@ -622,6 +633,9 @@ mod tests
         {
             full.push_str("device = k\n");
         }
-        assert_eq!(parse_table(&full).unwrap().devices().len(), MAX_PLATFORM_DEVICES);
+        assert_eq!(
+            parse_table(&full).unwrap().devices().len(),
+            MAX_PLATFORM_DEVICES
+        );
     }
 }

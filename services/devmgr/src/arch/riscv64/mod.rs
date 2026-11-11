@@ -110,7 +110,8 @@ pub fn carve_io_ports(_caps: &mut DevmgrCaps, _base: u16, _count: u16) -> Option
 /// The line and `SYS_IRQ_REGISTER` mode of a platform record's interrupt
 /// `line`: the PLIC or APLIC source and the mode its description gives; no
 /// ISA routing exists on riscv64.
-pub fn platform_line(_irq_range: &IrqRangeAllocator, line: u32, mode: u64, _isa: bool) -> (u32, u64)
+pub fn platform_line(_irq_range: &IrqRangeAllocator, line: u32, mode: u64, _isa: bool)
+-> (u32, u64)
 {
     (line, mode)
 }

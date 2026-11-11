@@ -59,46 +59,6 @@ pub mod kind
     pub const RAM_EXTENT: u64 = 6;
 }
 
-/// Per-cap class tag carried alongside each `kind::MODULE` round cap, so
-/// devmgr resolves a driver module by class rather than by delivery
-/// position. Mirrors `init/src/service.rs::module_kind`.
-///
-/// Only bootstrap-essential drivers ship as bundle modules — those
-/// needed to read anything off the disk in the first place (virtio-blk,
-/// fatfs, and the IOMMU driver that must confine the disk before its driver
-/// maps a ring: `iommu-vtd` on x86-64, `iommu-riscv` on riscv64) plus the
-/// pre-vfsd console pair (serial, framebuffer). The per-arch RTC driver
-/// lives on the rootfs disk and is loaded lazily by devmgr through its
-/// `SET_DRIVERS_DIR` subtree cap; no `RTC` module is delivered.
-pub mod module_kind
-{
-    // dead_code: the tag mirrors init's, which still delivers the disk
-    // driver's module under it; the boot pass binds that module by its
-    // declaration, so devmgr never names the tag.
-    #[allow(dead_code)]
-    pub const VIRTIO_BLK: u64 = 1;
-    pub const SERIAL: u64 = 2;
-    pub const FRAMEBUFFER: u64 = 3;
-    /// The IOMMU driver of the architecture's IOMMU family (`iommu-vtd`,
-    /// `iommu-riscv`).
-    pub const IOMMU: u64 = 4;
-    /// Number of module kinds: the tags run `1..=COUNT`, one module each.
-    pub const COUNT: usize = 4;
-    /// The kinds whose drivers devmgr starts on fixed paths rather than by
-    /// their declarations (docs/driver-binding.md § Status): the console
-    /// pair, until platform device records bind them, and the IOMMU driver,
-    /// which devmgr starts before any device is bound. The boot pass reads
-    /// the declaration of every other module.
-    pub const FIXED_PATH: [u64; 3] = [SERIAL, FRAMEBUFFER, IOMMU];
-
-    /// Slot of `kind` in a per-kind table, or `None` for an unknown tag.
-    pub fn index(kind: u64) -> Option<usize>
-    {
-        let i = usize::try_from(kind.checked_sub(1)?).ok()?;
-        (i < COUNT).then_some(i)
-    }
-}
-
 /// Presence-bitmap bits on R1's `data[0]`. Mirrors
 /// `init/src/service.rs::present`.
 mod present
@@ -148,10 +108,12 @@ pub struct DevmgrCaps
     pub self_bootstrap_ep: u64,
     pub self_aspace: u64,
 
-    // Driver module caps, one slot per `module_kind` (indexed by
-    // `module_kind::index`), so a module is resolved by class rather than by
-    // delivery position; 0 where no module of that kind was delivered.
-    pub driver_modules: [u64; module_kind::COUNT],
+    /// The boot modules init forwards, untagged, in delivery order: every
+    /// module of the boot bundle outside init's bootstrap set, the driver
+    /// modules and the platform description tables.
+    /// [`crate::decls::classify_modules`] takes them and tells each by its
+    /// content.
+    pub modules: Vec<u64>,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
     // badged on. Reserved for devmgr-initiated publications (who
@@ -200,20 +162,13 @@ impl DevmgrCaps
             registry_ep: 0,
             self_bootstrap_ep: 0,
             self_aspace: info.self_aspace,
-            driver_modules: [0; module_kind::COUNT],
+            modules: Vec::new(),
             svcmgr_publish_cap: 0,
             arch: crate::arch::current::ArchCaps::empty(),
             fb_info: None,
             dma: None,
             iommu: None,
         }
-    }
-
-    /// Resolve a delivered driver-module cap by its [`module_kind`] tag.
-    /// Returns `0` if no module of that class was delivered.
-    pub fn module_cap_for_kind(&self, kind: u64) -> u64
-    {
-        module_kind::index(kind).map_or(0, |i| self.driver_modules[i])
     }
 }
 
@@ -235,7 +190,7 @@ impl DevmgrCaps
 //     data[1] = count of caps in this round
 //     data[2..] = kind-specific payload:
 //       APERTURE / ACPI_REGION → (base, size) pairs per cap
-//       MODULE → one `module_kind` tag per cap
+//       MODULE → no payload; each cap is one boot module, untagged
 //       SVCMGR_BUNDLE → no payload; one or two caps (publish, optional
 //         arch shutdown); the terminal round
 //   RAM_EXTENT: zero caps; data[1] = count of (base, size) pairs,
@@ -381,40 +336,26 @@ fn absorb_ram_extent_round(
     }
 }
 
-/// Unpack one module-cap round. `data[2 + i]` carries the `module_kind`
-/// tag for `caps[i]`. The `.min(4)` is `MSG_CAP_SLOTS_MAX`, the caps one
-/// round carries. A module of an unknown kind, or a second module of a kind
-/// already held, is logged and its cap released: a retained module cap pins
-/// init's donated pool run.
-fn absorb_module_round(
-    round_caps: &[u64],
-    round_cap_count: usize,
-    round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
-    caps: &mut DevmgrCaps,
-)
+/// Unpack one module-cap round: each cap is one boot module, untagged. The
+/// `.min(4)` is `MSG_CAP_SLOTS_MAX`, the caps one round carries. A module the
+/// list cannot grow to hold is logged and its cap released: a retained module
+/// cap pins init's donated pool run.
+fn absorb_module_round(round_caps: &[u64], round_cap_count: usize, caps: &mut DevmgrCaps)
 {
     let n = round_cap_count.min(4);
-    for (i, &slot) in round_caps.iter().take(n).enumerate()
+    for &slot in round_caps.iter().take(n)
     {
         if slot == 0
         {
             continue;
         }
-        let kind = round_data[2 + i];
-        match module_kind::index(kind)
+        if caps.modules.try_reserve(1).is_err()
         {
-            Some(k) if caps.driver_modules[k] == 0 => caps.driver_modules[k] = slot,
-            Some(_) =>
-            {
-                std::os::seraph::log!("second driver module of kind {}; released", kind);
-                let _ = syscall::cap_delete(slot);
-            }
-            None =>
-            {
-                std::os::seraph::log!("driver module of unknown kind {}; released", kind);
-                let _ = syscall::cap_delete(slot);
-            }
+            std::os::seraph::log!("boot module not recorded (no memory); released");
+            let _ = syscall::cap_delete(slot);
+            continue;
         }
+        caps.modules.push(slot);
     }
 }
 
@@ -469,7 +410,7 @@ fn bootstrap_rounds(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
             }
             kind::MODULE =>
             {
-                absorb_module_round(&round.caps, round.cap_count, &round.data, caps);
+                absorb_module_round(&round.caps, round.cap_count, caps);
             }
             kind::FRAMEBUFFER_INFO =>
             {

@@ -37,7 +37,9 @@ pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable]) -> Pla
     for &block in &acpi.definition_blocks
     {
         let read = tables::with_acpi_table(caps, block, |bytes| {
-            Some(aml::devices(bytes, |device| add_namespace_device(device, &mut records)))
+            Some(aml::devices(bytes, |device| {
+                add_namespace_device(device, &mut records);
+            }))
         });
         if read.is_none()
         {
@@ -69,7 +71,7 @@ pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable]) -> Pla
             shared: false,
             isa: i.isa,
         });
-        records.add(identity, core::iter::once(base).chain(interrupt));
+        add(&mut records, identity, core::iter::once(base).chain(interrupt));
     }
     platform_table(acpi.oem_table_id, tables_found, &mut records);
     for (index, record) in records.records().iter().enumerate()
@@ -123,7 +125,7 @@ fn boot_framebuffer(caps: &caps::DevmgrCaps, records: &mut PlatformRecords)
         base,
         size: end - base,
     };
-    if let (Added::New(i), Some(info)) = (records.add(identity, [mmio]), info)
+    if let (Added::New(i), Some(info)) = (add(records, identity, [mmio]), info)
         && let Some(record) = records.get_mut(i)
     {
         record.set_info(info);
@@ -150,7 +152,7 @@ fn add_namespace_device(device: &aml::AmlDevice<'_>, records: &mut PlatformRecor
             }
         });
     }
-    records.add(identity, resources.into_iter().flatten());
+    add(records, identity, resources.into_iter().flatten());
 }
 
 /// Attach the FADT's `CENTURY` index as device info to every record that
@@ -226,8 +228,27 @@ fn platform_table(
                 isa: false,
             },
         });
-        records.add(identity, resources);
+        add(records, identity, resources);
     }
+}
+
+/// Add a device to `records` ([`PlatformRecords::add`]), logging one the
+/// full set drops; a device with no base or no key is no record to log.
+fn add(
+    records: &mut PlatformRecords,
+    identity: Identity,
+    resources: impl IntoIterator<Item = CrsResource>,
+) -> Added
+{
+    let added = records.add(identity, resources);
+    if added == Added::Full
+    {
+        std::os::seraph::log!(
+            "platform record set full ({} records); a device is not recorded",
+            firmware::records::MAX_PLATFORM_RECORDS
+        );
+    }
+    added
 }
 
 /// Log record `index`: its first key and its resources.
@@ -239,14 +260,16 @@ fn log_record(index: usize, record: &firmware::records::PlatformRecord)
             .acpi_hid
             .or(k.platform)
             .or_else(|| k.acpi_cids.first().copied())
-            .unwrap_or(if k.boot_framebuffer
-            {
-                b"boot-framebuffer"
-            }
-            else
-            {
-                b"spcr"
-            });
+            .unwrap_or(
+                if k.boot_framebuffer
+                {
+                    b"boot-framebuffer"
+                }
+                else
+                {
+                    b"spcr"
+                },
+            );
         let n = src.len().min(name.len());
         name[..n].copy_from_slice(&src[..n]);
         (name, n)

@@ -5,11 +5,11 @@
 
 //! Seraph userspace serial (UART) device driver.
 //!
-//! Spawned by devmgr with the platform UART authority cap — an `IoPort`
-//! covering COM1 on x86-64, an `Mmio` covering the QEMU `virt` NS16550 at
-//! its platform-static address on RISC-V — a RECV cap on its service
-//! endpoint, and (optionally) the UART interrupt cap in a first bootstrap
-//! round, and its devmgr query cap in a second, terminal one. Once the UART
+//! Bound by devmgr to the UART's platform device record, it receives the
+//! resource list (`driver_binding::resources`): the UART's register window
+//! (an `IoPort` range on x86-64, an `Mmio` range on RISC-V), its wired line
+//! when the record has one, a RECV cap on its service endpoint, and its
+//! devmgr query cap. Once the UART
 //! is set up it reports ready (`devmgr_labels::DRIVER_READY`) on the query
 //! cap, immediately before its service loop: devmgr serves the driver's
 //! endpoint only after that report, and the driver exits when devmgr refuses
@@ -30,15 +30,15 @@
 
 mod arch;
 
+use driver_binding::resources::{self, PlatformDelivery};
 use ipc::{IpcMessage, serial_errors, serial_labels};
 use std::os::seraph::startup_info;
 
 // ── Declaration ────────────────────────────────────────────────────────────
 
 // What devmgr binds this driver to and how it starts it
-// (docs/driver-binding.md § Driver Declarations). devmgr reads it but starts
-// this driver on its fixed path until platform device records carry the key
-// it matches (docs/driver-binding.md § Status).
+// (docs/driver-binding.md § Driver Declarations): the console UART the SPCR
+// names, or an ACPI namespace device of `_HID` `PNP0501`.
 driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     name: "serial",
     class: Some("serial"),
@@ -58,45 +58,29 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 
-struct BootCaps
+/// The UART's interrupt: its cap (zero when devmgr delivered no line, so RX
+/// degrades to timeout polling on the client side, and
+/// `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`) and the mode the
+/// record gives it.
+#[derive(Clone, Copy)]
+struct Irq
 {
-    service_ep: u64,
-    hw_cap: u64,
-    /// UART interrupt cap (x86 ISA IRQ4, riscv NS16550 PLIC source). Zero when
-    /// devmgr delivered no IRQ: RX then degrades to timeout polling on the
-    /// client side, and `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.
-    irq_cap: u64,
-    /// devmgr query cap: a SEND badged with this device's badge on its spawn
-    /// batch's private endpoint, for `DRIVER_READY`.
-    devmgr_query_ep: u64,
+    cap: u64,
+    mode: u64,
 }
 
-/// Request the two bootstrap rounds: round 1 (not terminal)
-/// `[service_ep, hw_cap, irq_cap?]`, round 2 (terminal) `[devmgr_query_ep]`.
-fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
+/// Receive the resource list (`driver_binding::resources`): the UART's
+/// register window, an `IoPort` or `Mmio` range, its wired line if the
+/// record has one, and the endpoints.
+fn bootstrap(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<PlatformDelivery>
 {
     if creator_endpoint == 0
     {
         return None;
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let r1 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if r1.cap_count < 2 || r1.done
-    {
-        return None;
-    }
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let r2 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if r2.cap_count < 1 || !r2.done
-    {
-        return None;
-    }
-    Some(BootCaps {
-        service_ep: r1.caps[0],
-        hw_cap: r1.caps[1],
-        irq_cap: if r1.cap_count >= 3 { r1.caps[2] } else { 0 },
-        devmgr_query_ep: r2.caps[0],
-    })
+    let list = unsafe { resources::receive(creator_endpoint, ipc_buf) }.ok()?;
+    PlatformDelivery::from_list(&list)
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────
@@ -111,7 +95,7 @@ const MAX_READ_BYTES: usize = 512;
 /// reply, so no request leaves a slot of the driver's `CSpace` taken.
 /// `rx_notify` is the notification the UART interrupt is bound to (0 when
 /// none is).
-fn handle_request(msg: &IpcMessage, irq_cap: u64, rx_notify: &mut u64, ipc_buf: *mut u64)
+fn handle_request(msg: &IpcMessage, irq: Irq, rx_notify: &mut u64, ipc_buf: *mut u64)
 {
     // Label encoding mirrors `stream_labels::STREAM_BYTES`: opcode in bits
     // 0-15, payload byte length in bits 16-31.
@@ -175,9 +159,9 @@ fn handle_request(msg: &IpcMessage, irq_cap: u64, rx_notify: &mut u64, ipc_buf: 
         // Re-arm the receive interrupt: the kernel masks the line on each fire,
         // and the ack unmasks it for the next byte. Idempotent, so it is also
         // safe on a poll-driven read where no IRQ was pending.
-        if irq_cap != 0
+        if irq.cap != 0
         {
-            let _ = syscall::irq_ack(irq_cap);
+            let _ = syscall::irq_ack(irq.cap);
         }
         IpcMessage::builder(serial_errors::SUCCESS | ((n as u64) << 16))
             .bytes(0, &buf[..n])
@@ -185,7 +169,7 @@ fn handle_request(msg: &IpcMessage, irq_cap: u64, rx_notify: &mut u64, ipc_buf: 
     }
     else if op == serial_labels::SERIAL_REGISTER_RX_NOTIFY
     {
-        register_rx_notify(irq_cap, msg.caps().first().copied().unwrap_or(0), rx_notify)
+        register_rx_notify(irq, msg.caps().first().copied().unwrap_or(0), rx_notify)
     }
     else
     {
@@ -200,13 +184,15 @@ fn handle_request(msg: &IpcMessage, irq_cap: u64, rx_notify: &mut u64, ipc_buf: 
 /// registration (no IRQ cap held, no notification supplied, or a cap
 /// `SYS_IRQ_REGISTER` rejects) deletes `notification` and leaves the earlier
 /// binding in place.
-fn register_rx_notify(irq_cap: u64, notification: u64, rx_notify: &mut u64) -> IpcMessage
+fn register_rx_notify(irq: Irq, notification: u64, rx_notify: &mut u64) -> IpcMessage
 {
-    // Mode 0, edge-triggered and active-high: the x86-64 COM1 line is ISA
-    // IRQ 4, which no MADT override reroutes, and riscv64 programs nothing
-    // from the mode. devmgr keeps the line exclusive, so no other binding
-    // has recorded another mode on it.
-    if irq_cap == 0 || notification == 0 || syscall::irq_register(irq_cap, notification, 0).is_err()
+    // The mode the device record gives the line, as devmgr delivered it.
+    // devmgr keeps the line exclusive, so no other binding has recorded
+    // another mode on it.
+    let irq_cap = irq.cap;
+    if irq_cap == 0
+        || notification == 0
+        || syscall::irq_register(irq_cap, notification, irq.mode).is_err()
     {
         if notification != 0
         {
@@ -227,7 +213,7 @@ fn register_rx_notify(irq_cap: u64, notification: u64, rx_notify: &mut u64) -> I
     IpcMessage::new(serial_errors::SUCCESS)
 }
 
-fn service_loop(service_ep: u64, irq_cap: u64, ipc_buf: *mut u64) -> !
+fn service_loop(service_ep: u64, irq: Irq, ipc_buf: *mut u64) -> !
 {
     let mut rx_notify = 0;
     // No diagnostic hook: a `log!` here is a blocking call into logd, which
@@ -248,7 +234,7 @@ fn service_loop(service_ep: u64, irq_cap: u64, ipc_buf: *mut u64) -> !
             }
         };
         guard.on_success();
-        handle_request(&msg, irq_cap, &mut rx_notify, ipc_buf);
+        handle_request(&msg, irq, &mut rx_notify, ipc_buf);
     }
 }
 
@@ -275,26 +261,24 @@ fn main() -> !
         )
     };
 
-    let Some(caps) = bootstrap_caps(info.creator_endpoint, ipc_buf)
+    let Some(device) = bootstrap(info.creator_endpoint, ipc_buf)
     else
     {
         syscall::thread_exit();
     };
+    let (cap, mode) = device.wired.unwrap_or((0, 0));
+    let irq = Irq { cap, mode };
 
-    if caps.service_ep == 0 || caps.hw_cap == 0 || caps.devmgr_query_ep == 0
-    {
-        syscall::thread_exit();
-    }
-
-    // SAFETY: `info.self_aspace` is this process's address space; on riscv64
-    // devmgr hands this driver the one-page UART `Mmio` cap
-    // (`carve_uart_authority`), and on x86-64 the call maps nothing.
+    // SAFETY: `info.self_aspace` is this process's address space, and
+    // `device.registers` is the register window devmgr delivered, whose cap
+    // the call maps (riscv64) or binds (x86-64) only after checking its kind
+    // and size.
     if !unsafe {
         arch::current::serial_init(
             info.self_thread,
             info.self_aspace,
-            caps.hw_cap,
-            caps.irq_cap != 0,
+            &device.registers,
+            irq.cap != 0,
         )
     }
     {
@@ -302,9 +286,9 @@ fn main() -> !
     }
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }.is_err()
+    if unsafe { ipc::report_driver_ready(device.endpoints.devmgr_query, ipc_buf) }.is_err()
     {
         syscall::thread_exit();
     }
-    service_loop(caps.service_ep, caps.irq_cap, ipc_buf);
+    service_loop(device.endpoints.service, irq, ipc_buf);
 }

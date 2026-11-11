@@ -9,6 +9,10 @@
 //! holds, and of each entry of the `/services/drivers/` directory svcmgr
 //! hands it at `SET_DRIVERS_DIR`.
 //!
+//! init forwards its boot modules untagged; [`classify_modules`] tells each
+//! by its content: an ELF executable is a driver module, anything else a
+//! platform description table (`firmware::platform`).
+//!
 //! The reads are bounded, as § Declaration Bounds requires: the ELF header
 //! page, the section header table, the section name table, and the one note
 //! section, which is read only up to [`NOTE_SECTION_BYTES`]. A binary that is
@@ -18,6 +22,7 @@
 
 use driver_binding::DRIVER_NOTE_SECTION;
 use driver_binding::decl::DriverDecl;
+use firmware::platform::PlatformTable;
 use ipc::IpcMessage;
 use process_abi::{NT_SERAPH_DRIVER, SERAPH_NOTE_OWNER};
 use std::os::seraph::{reserve_pages, unreserve_pages};
@@ -46,6 +51,10 @@ const MAX_DIR_ENTRIES: u32 = 4096;
 /// The longest entry name devmgr walks to: the namespace's own bound on a
 /// name.
 const MAX_ENTRY_NAME: usize = 255;
+
+/// The first bytes of an ELF file, by which a boot module is told to be a
+/// driver module rather than a platform description table.
+const ELF_MAGIC: &[u8] = b"\x7fELF";
 
 /// Where devmgr starts a driver from.
 #[derive(Clone, Copy)]
@@ -127,10 +136,112 @@ fn read_decl(
     }
 }
 
-/// The declaration of the boot module `module_cap`; `None`, as the module
-/// documentation says, when it has none or the module cannot be mapped.
-/// The module is mapped read-only, whole, for the read, and unmapped after.
-pub fn module_decl(caps: &caps::DevmgrCaps, module_cap: u64) -> Option<DriverDecl>
+/// The boot modules init forwarded, told apart by their content
+/// ([`classify_modules`]).
+pub struct BootModules
+{
+    /// Each driver module with its declaration; devmgr keeps the module cap
+    /// until a bind pass consumes or releases it.
+    pub drivers: Vec<(DriverDecl, u64)>,
+    /// Each platform description table, parsed; its module cap is released.
+    pub tables: Vec<PlatformTable>,
+}
+
+/// Take every boot module of `caps` and tell each by its content: an ELF
+/// executable is a driver module, kept with its declaration; any other
+/// module is a platform description table, parsed
+/// ([`firmware::platform::parse_table`]) and released. A driver module with
+/// no declaration, and a module that is neither, are logged and released, as
+/// is every module when the lists cannot grow.
+pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
+{
+    let mut out = BootModules {
+        drivers: Vec::new(),
+        tables: Vec::new(),
+    };
+    for module_cap in core::mem::take(&mut caps.modules)
+    {
+        match with_module(caps, module_cap, classify)
+        {
+            Some(Classified::Driver(decl)) if out.drivers.try_reserve(1).is_ok() =>
+            {
+                out.drivers.push((decl, module_cap));
+                continue;
+            }
+            Some(Classified::Table(table)) if out.tables.try_reserve(1).is_ok() =>
+            {
+                out.tables.push(table);
+            }
+            Some(Classified::Driver(_) | Classified::Table(_)) =>
+            {
+                std::os::seraph::log!("boot module: no memory to record it; released");
+            }
+            Some(Classified::Neither) | None =>
+            {}
+        }
+        let _ = syscall::cap_delete(module_cap);
+    }
+    out
+}
+
+/// What a boot module's content is.
+// large_enum_variant: one value lives at a time, on the stack, for one module;
+// boxing the declaration would add an allocation that cannot fail softly.
+#[allow(clippy::large_enum_variant)]
+enum Classified
+{
+    Driver(DriverDecl),
+    Table(PlatformTable),
+    /// Logged by [`classify`].
+    Neither,
+}
+
+/// Tell a boot module by its bytes: an ELF executable by its magic, its
+/// declaration read within § Declaration Bounds; anything else as a
+/// platform description table.
+fn classify(bytes: &[u8]) -> Classified
+{
+    if bytes.starts_with(ELF_MAGIC)
+    {
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let decl = read_decl("boot module", size, |offset, dst| {
+            let start = usize::try_from(offset).ok()?;
+            let src = bytes.get(start..start.checked_add(dst.len())?)?;
+            dst.copy_from_slice(src);
+            Some(dst.len())
+        });
+        if let Some(decl) = decl
+        {
+            return Classified::Driver(decl);
+        }
+        std::os::seraph::log!("boot module: an executable with no declaration; released");
+        return Classified::Neither;
+    }
+    let Ok(text) = core::str::from_utf8(bytes)
+    else
+    {
+        std::os::seraph::log!("boot module: neither an executable nor a text table; released");
+        return Classified::Neither;
+    };
+    match firmware::platform::parse_table(text)
+    {
+        Ok(table) => Classified::Table(table),
+        Err(e) =>
+        {
+            std::os::seraph::log!("boot module: platform table rejected ({:?}); released", e);
+            Classified::Neither
+        }
+    }
+}
+
+/// Call `read` on the bytes of the boot module `module_cap`, mapped
+/// read-only, whole, for the call and unmapped after; `None`, logged, when
+/// the module cannot be mapped.
+fn with_module<R>(
+    caps: &caps::DevmgrCaps,
+    module_cap: u64,
+    read: impl FnOnce(&[u8]) -> R,
+) -> Option<R>
 {
     let size = syscall::cap_info(module_cap, syscall::CAP_INFO_MEMORY_SIZE).ok()?;
     let pages = size.div_ceil(PAGE_SIZE);
@@ -142,13 +253,13 @@ pub fn module_decl(caps: &caps::DevmgrCaps, module_cap: u64) -> Option<DriverDec
     let Ok(range) = reserve_pages(pages)
     else
     {
-        std::os::seraph::log!("boot module: no VA to read its declaration");
+        std::os::seraph::log!("boot module: no VA to read it");
         return None;
     };
     let va = range.va_start();
     if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, pages)
     {
-        std::os::seraph::log!("boot module: page-table budget not funded; declaration not read");
+        std::os::seraph::log!("boot module: page-table budget not funded; not read");
         unreserve_pages(range);
         return None;
     }
@@ -166,7 +277,7 @@ pub fn module_decl(caps: &caps::DevmgrCaps, module_cap: u64) -> Option<DriverDec
     };
     if mapped.is_err()
     {
-        std::os::seraph::log!("boot module: not mapped; declaration not read");
+        std::os::seraph::log!("boot module: not mapped; not read");
         unreserve_pages(range);
         return None;
     }
@@ -174,17 +285,13 @@ pub fn module_decl(caps: &caps::DevmgrCaps, module_cap: u64) -> Option<DriverDec
     // `va` above, and nothing writes the module while it is mapped: init
     // handed devmgr the module and keeps no writable mapping of it.
     let bytes = unsafe { core::slice::from_raw_parts(va as *const u8, span) };
-    let decl = read_decl("boot module", size, |offset, dst| {
-        let start = usize::try_from(offset).ok()?;
-        let src = bytes.get(start..start.checked_add(dst.len())?)?;
-        dst.copy_from_slice(src);
-        Some(dst.len())
-    });
+    let out = read(bytes);
     // SAFETY: the span is this call's own reservation, and `bytes`, the only
-    // reference into it, is not used past the read above.
+    // reference into it, is not used past `read`, whose result borrows none
+    // of it.
     let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, pages) };
     unreserve_pages(range);
-    decl
+    Some(out)
 }
 
 /// The declaration of the drivers-directory entry `name`, whose file node

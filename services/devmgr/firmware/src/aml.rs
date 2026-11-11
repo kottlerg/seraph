@@ -8,7 +8,9 @@
 //!
 //! devmgr reports every `Device` object whose `_HID`, `_CID`, `_UID`, and
 //! `_CRS` are `Name` objects as a device record
-//! (`docs/driver-binding.md` § Device Records). No AML is executed: the walk
+//! (`docs/driver-binding.md` § Device Records), except one whose `_STA` is a
+//! `Name` with its present bit (bit 0) clear; a `_STA` method is not
+//! evaluated, so its device is reported. No AML is executed: the walk
 //! follows the AML grammar of ACPI 6.5 § 20 through the term lists that hold
 //! `Scope`, `Device`, `Name`, and `Method` objects, skips every other
 //! construct by its `PkgLength`, and stops a term list at the first construct
@@ -88,7 +90,7 @@ impl Id
         {
             return None;
         }
-        let mut out = [0_u8; MAX_ID_BYTES];
+        let mut out = [0u8; MAX_ID_BYTES];
         out.get_mut(..bytes.len())?.copy_from_slice(bytes);
         Some(Self {
             bytes: out,
@@ -217,7 +219,7 @@ fn le(buf: &[u8], off: usize, n: usize) -> Option<u64>
         bytes
             .iter()
             .rev()
-            .fold(0_u64, |acc, b| (acc << 8) | u64::from(*b)),
+            .fold(0u64, |acc, b| (acc << 8) | u64::from(*b)),
     )
 }
 
@@ -266,8 +268,8 @@ fn data_size(buf: &[u8], pos: usize) -> Option<usize>
 fn eisa_id(value: u32) -> Option<Id>
 {
     let s = value.swap_bytes();
-    let mut text = [0_u8; 7];
-    for (i, shift) in [26_u32, 21, 16].into_iter().enumerate()
+    let mut text = [0u8; 7];
+    for (i, shift) in [26u32, 21, 16].into_iter().enumerate()
     {
         let letter = u8::try_from((s >> shift) & 0x1F).ok()?;
         if !(1..=26).contains(&letter)
@@ -276,7 +278,7 @@ fn eisa_id(value: u32) -> Option<Id>
         }
         *text.get_mut(i)? = letter + 0x40;
     }
-    for (i, shift) in [12_u32, 8, 4, 0].into_iter().enumerate()
+    for (i, shift) in [12u32, 8, 4, 0].into_iter().enumerate()
     {
         let digit = u8::try_from((s >> shift) & 0xF).ok()?;
         *text.get_mut(3 + i)? = b"0123456789ABCDEF".get(usize::from(digit)).copied()?;
@@ -346,7 +348,7 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
                 self.term_list(buf.get(body..end)?, depth + 1, None);
                 Some(end)
             }
-            OP_NAME => self.def_name(buf, pos, dev),
+            OP_NAME => Self::def_name(buf, pos, dev),
             OP_METHOD =>
             {
                 let (_, end, name) = Self::named_package(buf, pos + 1)?;
@@ -389,7 +391,7 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
                 let (body, end, _) = Self::named_package(buf, pos + 2)?;
                 let mut c = Collect::default();
                 self.term_list(buf.get(body..end)?, depth + 1, Some(&mut c));
-                self.report(c);
+                self.report(&c);
                 Some(end)
             }
             EXT_FIELD | EXT_INDEX_FIELD | EXT_BANK_FIELD | EXT_PROCESSOR | EXT_POWER_RES
@@ -434,25 +436,20 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
     }
 
     /// `DefName` at `pos`.
-    fn def_name(
-        &mut self,
-        buf: &'a [u8],
-        pos: usize,
-        dev: &mut Option<&mut Collect<'a>>,
-    ) -> Option<usize>
+    fn def_name(buf: &'a [u8], pos: usize, dev: &mut Option<&mut Collect<'a>>) -> Option<usize>
     {
         let (nl, last) = name_string(buf, pos + 1)?;
         let value = pos + 1 + nl;
         let size = data_size(buf, value)?;
         if let (Some(c), Some(name)) = (dev.as_deref_mut(), last)
         {
-            record(c, &name, buf, value, size);
+            record(c, name, buf, value, size);
         }
         Some(value + size)
     }
 
     /// Report a finished device if it qualifies.
-    fn report(&mut self, c: Collect<'a>)
+    fn report(&mut self, c: &Collect<'a>)
     {
         let static_id = c.hid.is_some() || c.cids.iter().any(Option::is_some);
         let absent = c.sta.is_some_and(|sta| sta & 1 == 0);
@@ -478,14 +475,14 @@ fn is_dynamic_name(name: [u8; 4]) -> bool
 }
 
 /// Record the value of `Name(name, <data at value..value+size>)` into `c`.
-fn record<'a>(c: &mut Collect<'a>, name: &[u8; 4], buf: &'a [u8], value: usize, size: usize)
+fn record<'a>(c: &mut Collect<'a>, name: [u8; 4], buf: &'a [u8], value: usize, size: usize)
 {
     let Some(data) = buf.get(..value + size)
     else
     {
         return;
     };
-    match name
+    match &name
     {
         b"_HID" =>
         {
@@ -697,7 +694,11 @@ pub fn crs_resources(crs: &[u8], visit: impl FnMut(CrsResource)) -> usize
             {
                 break;
             };
-            let len = len as usize;
+            let Ok(len) = usize::try_from(len)
+            else
+            {
+                break;
+            };
             let Some(body) = crs.get(pos + 3..pos + 3 + len)
             else
             {
@@ -738,7 +739,7 @@ fn small<F: FnMut(CrsResource)>(em: &mut Emit<F>, kind: u8, body: &[u8]) -> bool
             let (level, active_low, shared) = flags.map_or((false, false, false), |f| {
                 (f & 1 == 0, f & (1 << 3) != 0, f & (1 << 4) != 0)
             });
-            for bit in 0..16_u32
+            for bit in 0..16u32
             {
                 if mask & (1 << bit) != 0
                     && !em.push(CrsResource::Interrupt {
@@ -1152,7 +1153,11 @@ mod tests
         ];
         let t = table(&device(
             "UAR0",
-            &[named("_HID", &string("PNP0501")), named("_CRS", &buffer(&crs))].concat(),
+            &[
+                named("_HID", &string("PNP0501")),
+                named("_CRS", &buffer(&crs)),
+            ]
+            .concat(),
         ));
         let devs = collect(&t);
         assert_eq!(devs.len(), 1);
@@ -1199,7 +1204,10 @@ mod tests
             "DEV1",
             &[named("_HID", &eisa("PNP0501")), method("_CRS")].concat(),
         );
-        let hid_method = device("DEV2", &[method("_HID"), named("_UID", &[OP_ZERO])].concat());
+        let hid_method = device(
+            "DEV2",
+            &[method("_HID"), named("_UID", &[OP_ZERO])].concat(),
+        );
         let ok = device("DEV3", &named("_HID", &eisa("PNP0501")));
         let t = table(&[crs_method, hid_method, ok].concat());
         let devs = collect(&t);
@@ -1210,7 +1218,10 @@ mod tests
     fn nested_device()
     {
         let inner = device("INNR", &named("_HID", &string("ACPI0002")));
-        let outer = device("OUTR", &[named("_HID", &string("ACPI0001")), inner].concat());
+        let outer = device(
+            "OUTR",
+            &[named("_HID", &string("ACPI0001")), inner].concat(),
+        );
         let t = table(&outer);
         let devs = collect(&t);
         assert_eq!(devs.len(), 2);
@@ -1313,7 +1324,10 @@ mod tests
     #[test]
     fn long_or_empty_string_hid_ignored()
     {
-        let t = table(&device("DEV0", &named("_HID", &string("ABCDEFGHIJKLMNOPQ"))));
+        let t = table(&device(
+            "DEV0",
+            &named("_HID", &string("ABCDEFGHIJKLMNOPQ")),
+        ));
         assert_eq!(collect(&t).len(), 0);
         let t = table(&device("DEV0", &named("_HID", &string(""))));
         assert_eq!(collect(&t).len(), 0);
@@ -1364,7 +1378,10 @@ mod tests
         let cids = package_val(&[eisa("PNP0501"), string("ACPI0001")]);
         let t2 = table(&scope(
             "SCP0",
-            &device("DEV0", &[named("_CID", &cids), named("_CRS", &buffer(&[0x79, 0]))].concat()),
+            &device(
+                "DEV0",
+                &[named("_CID", &cids), named("_CRS", &buffer(&[0x79, 0]))].concat(),
+            ),
         ));
         let full = devices(&t2, |_| {});
         for k in 0..=t2.len()
@@ -1406,9 +1423,13 @@ mod tests
     {
         let mut t = vec![0x4B, 0x60, 0x00, 0x05]; // fixed I/O 0x60 count 5
         t.extend([0x4B, 0x70, 0x00, 0x00]); // zero count: skipped
-        t.extend([0x86, 9, 0, 0, 0x00, 0x00, 0x00, 0xFE, 0x00, 0x10, 0x00, 0x00]); // Mem32Fixed
+        t.extend([
+            0x86, 9, 0, 0, 0x00, 0x00, 0x00, 0xFE, 0x00, 0x10, 0x00, 0x00,
+        ]); // Mem32Fixed
         // Memory32 with min == max: info, min, max, alignment, size.
-        t.extend([0x85, 17, 0, 0, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00]);
+        t.extend([
+            0x85, 17, 0, 0, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
+        ]);
         t.extend([0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00]);
         t.extend(addr32(1, 0x3000_0000, 0x1000));
         t.extend(addr64(1, 0x4000_0000, 0x8000));
@@ -1464,9 +1485,8 @@ mod tests
     #[test]
     fn sta_absent_device_not_reported()
     {
-        let dev = |n: &str, sta: Vec<u8>| {
-            device(n, &[named("_HID", &eisa("PNP0501")), sta].concat())
-        };
+        let dev =
+            |n: &str, sta: Vec<u8>| device(n, &[named("_HID", &eisa("PNP0501")), sta].concat());
         let t = table(
             &[
                 dev("DEV1", named("_STA", &[OP_ZERO])),

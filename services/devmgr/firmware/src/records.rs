@@ -231,9 +231,12 @@ pub enum Added
     New(usize),
     /// Its keys merged into the earlier record at this index.
     Merged(usize),
-    /// Dropped: it carries no `Mmio` or `IoPort` resource and no key, or the
-    /// set is full, or no memory was left.
-    Dropped,
+    /// Dropped as unusable: it carries no `Mmio` or `IoPort` resource to
+    /// carve, or no key to match.
+    Unusable,
+    /// Dropped because the set holds [`MAX_PLATFORM_RECORDS`] records or no
+    /// memory was left for another.
+    Full,
 }
 
 /// Every platform device record, in enumeration order.
@@ -272,8 +275,11 @@ impl PlatformRecords
     /// record of its own carrying its first [`MAX_RECORD_RESOURCES`]
     /// resources. A description with no `Mmio` or `IoPort` resource cannot be
     /// carved for, and one with no key cannot be matched: both are dropped.
-    pub fn add(&mut self, identity: Identity, resources: impl IntoIterator<Item = CrsResource>)
-    -> Added
+    pub fn add(
+        &mut self,
+        identity: Identity,
+        resources: impl IntoIterator<Item = CrsResource>,
+    ) -> Added
     {
         let mut own = [None; MAX_RECORD_RESOURCES];
         for (slot, r) in own.iter_mut().zip(resources)
@@ -282,7 +288,7 @@ impl PlatformRecords
         }
         if !own.iter().flatten().any(|r| base_of(*r).is_some())
         {
-            return Added::Dropped;
+            return Added::Unusable;
         }
         if let Some(index) = self.records.iter().position(|r| r.shares_base(&own))
         {
@@ -294,9 +300,13 @@ impl PlatformRecords
             || identity.spcr.is_some()
             || identity.platform.is_some()
             || identity.boot_framebuffer;
-        if !keyed || self.records.len() >= MAX_PLATFORM_RECORDS || self.records.try_reserve(1).is_err()
+        if !keyed
         {
-            return Added::Dropped;
+            return Added::Unusable;
+        }
+        if self.records.len() >= MAX_PLATFORM_RECORDS || self.records.try_reserve(1).is_err()
+        {
+            return Added::Full;
         }
         self.records.push(PlatformRecord {
             identity,
@@ -344,7 +354,10 @@ mod tests
     fn records_keep_enumeration_order()
     {
         let mut set = PlatformRecords::new();
-        assert_eq!(set.add(hid("PNP0501"), [port(0x3F8), irq(4)]), Added::New(0));
+        assert_eq!(
+            set.add(hid("PNP0501"), [port(0x3F8), irq(4)]),
+            Added::New(0)
+        );
         assert_eq!(set.add(hid("PNP0B00"), [port(0x70)]), Added::New(1));
         let resources: Vec<_> = set.records()[0].resources().collect();
         assert_eq!(resources, [port(0x3F8), irq(4)]);
@@ -359,11 +372,17 @@ mod tests
             spcr: Some(0x12),
             ..Identity::default()
         };
-        assert_eq!(set.add(spcr, [mmio(0x1000_0000), irq(33)]), Added::Merged(0));
+        assert_eq!(
+            set.add(spcr, [mmio(0x1000_0000), irq(33)]),
+            Added::Merged(0)
+        );
         let record = &set.records()[0];
         assert_eq!(record.identity().spcr, Some(0x12));
         // The earlier record's resources stand.
-        assert_eq!(record.resources().collect::<Vec<_>>(), [mmio(0x1000_0000), irq(10)]);
+        assert_eq!(
+            record.resources().collect::<Vec<_>>(),
+            [mmio(0x1000_0000), irq(10)]
+        );
         record.with_keys(|k| {
             assert_eq!(k.acpi_hid, Some(&b"PNP0501"[..]));
             assert_eq!(k.spcr, Some(0x12));
@@ -399,8 +418,8 @@ mod tests
     fn descriptions_without_a_base_or_a_key_are_dropped()
     {
         let mut set = PlatformRecords::new();
-        assert_eq!(set.add(hid("PNP0C0F"), [irq(5)]), Added::Dropped);
-        assert_eq!(set.add(Identity::default(), [mmio(0x1000)]), Added::Dropped);
+        assert_eq!(set.add(hid("PNP0C0F"), [irq(5)]), Added::Unusable);
+        assert_eq!(set.add(Identity::default(), [mmio(0x1000)]), Added::Unusable);
         assert!(set.records().is_empty());
     }
 
@@ -410,9 +429,12 @@ mod tests
         let mut set = PlatformRecords::new();
         for i in 0..MAX_PLATFORM_RECORDS as u64
         {
-            assert_eq!(set.add(hid("X"), [mmio(i * 0x1000)]), Added::New(i as usize));
+            assert_eq!(
+                set.add(hid("X"), [mmio(i * 0x1000)]),
+                Added::New(i as usize)
+            );
         }
-        assert_eq!(set.add(hid("X"), [mmio(0x1000_0000)]), Added::Dropped);
+        assert_eq!(set.add(hid("X"), [mmio(0x1000_0000)]), Added::Full);
         let mut set = PlatformRecords::new();
         set.add(hid("X"), (0..20).map(|i| mmio(i * 0x1000)));
         assert_eq!(set.records()[0].resources().count(), MAX_RECORD_RESOURCES);

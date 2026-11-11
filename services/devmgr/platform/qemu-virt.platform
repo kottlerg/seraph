@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+#
+# Platform description table: QEMU riscv64 `virt`.
+#
+# The devices this machine has that no firmware table devmgr reads
+# describes. devmgr uses this table when the XSDT's OEM table ID equals
+# `oem_table_id` (docs/driver-binding.md § Platform Description Tables).
+
+oem_table_id = BXPC
+
+# The goldfish RTC: its register page, and its interrupt source on the
+# PLIC / APLIC (QEMU hw/riscv/virt.c, VIRT_RTC, RTC_IRQ).
+device = google,goldfish-rtc mmio 0x101000 0x1000 wired 11 level-high

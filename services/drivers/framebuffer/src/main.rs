@@ -5,16 +5,14 @@
 
 //! Seraph userspace framebuffer device driver.
 //!
-//! Spawned by devmgr with the bootloader-discovered GOP linear-
-//! framebuffer `Mmio` cap plus a RECV cap on its service
-//! endpoint. Owns the framebuffer end-to-end and is the sole
-//! driver-mediated sink for userspace framebuffer bytes.
-//!
-//! Two-round bootstrap (mirrors `services/drivers/virtio/blk`):
-//!   Round 1 (non-terminal): `[service_ep, mmio_cap]`
-//!   Round 2 (terminal):     `[devmgr_query_ep]` (a SEND badged with this
-//!                            device's catalog badge on the private driver
-//!                            endpoint of its devmgr spawn batch)
+//! Bound by devmgr to the boot framebuffer's platform device record (the
+//! `boot-framebuffer` key), it receives the resource list
+//! (`driver_binding::resources`): the bootloader-discovered GOP linear
+//! framebuffer's pages as one `Mmio` range, a RECV cap on its service
+//! endpoint, and its devmgr query cap (a SEND badged with this device's
+//! catalog badge on the private driver endpoint of its devmgr spawn batch).
+//! Owns the framebuffer end-to-end and is the sole driver-mediated sink for
+//! userspace framebuffer bytes.
 //!
 //! After bootstrap the driver queries devmgr for its
 //! [`boot_protocol::FramebufferInfo`] (geometry: width, height,
@@ -41,6 +39,7 @@
 mod arch;
 
 use boot_protocol::FramebufferInfo;
+use driver_binding::resources::{self, PlatformDelivery, Resource};
 use framebuffer::{authority, render};
 use ipc::{IpcMessage, devmgr_labels, fb_errors, fb_labels};
 use std::os::seraph::startup_info;
@@ -51,9 +50,8 @@ const REPLACEMENT_CODEPOINT: u32 = 0xFFFD;
 // ── Declaration ────────────────────────────────────────────────────────────
 
 // What devmgr binds this driver to and how it starts it
-// (docs/driver-binding.md § Driver Declarations). devmgr reads it but starts
-// this driver on its fixed path until platform device records carry the key
-// it matches (docs/driver-binding.md § Status).
+// (docs/driver-binding.md § Driver Declarations): the boot framebuffer's
+// record.
 driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     name: "framebuffer",
     class: Some("framebuffer"),
@@ -69,44 +67,17 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 
-struct BootCaps
-{
-    service_ep: u64,
-    mmio_cap: u64,
-    devmgr_query_ep: u64,
-}
-
-fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
+/// Receive the resource list (`driver_binding::resources`): the
+/// framebuffer's pages as one `Mmio` range, and the endpoints.
+fn bootstrap(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<PlatformDelivery>
 {
     if creator_endpoint == 0
     {
         return None;
     }
-
-    // Round 1: [service_ep, mmio_cap], non-terminal.
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let r1 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if r1.cap_count < 2 || r1.done
-    {
-        return None;
-    }
-    let service_ep = r1.caps[0];
-    let mmio_cap = r1.caps[1];
-
-    // Round 2: [devmgr_query_ep], terminal.
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let r2 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if r2.cap_count < 1 || !r2.done
-    {
-        return None;
-    }
-    let devmgr_query_ep = r2.caps[0];
-
-    Some(BootCaps {
-        service_ep,
-        mmio_cap,
-        devmgr_query_ep,
-    })
+    let list = unsafe { resources::receive(creator_endpoint, ipc_buf) }.ok()?;
+    PlatformDelivery::from_list(&list)
 }
 
 /// Query devmgr for this device's [`FramebufferInfo`] via the generic
@@ -316,43 +287,48 @@ fn main() -> !
         )
     };
 
-    let Some(caps) = bootstrap_caps(info.creator_endpoint, ipc_buf)
+    let Some(device) = bootstrap(info.creator_endpoint, ipc_buf)
+    else
+    {
+        syscall::thread_exit();
+    };
+    let Resource::Mmio {
+        cap: mmio_cap,
+        phys,
+        bytes,
+        ..
+    } = device.registers
     else
     {
         syscall::thread_exit();
     };
 
-    if caps.service_ep == 0 || caps.mmio_cap == 0 || caps.devmgr_query_ep == 0
-    {
-        syscall::thread_exit();
-    }
-
     // Query devmgr for the framebuffer geometry. The reply size (and
     // therefore the MMIO mapping size we reserve) depends on it.
-    let Some(fb_info) = query_framebuffer_info(caps.devmgr_query_ep, ipc_buf)
+    let Some(fb_info) = query_framebuffer_info(device.endpoints.devmgr_query, ipc_buf)
     else
     {
         syscall::thread_exit();
     };
 
     // Compute the VA reservation: the page-aligned aperture covering
-    // `[physical_base, physical_base + stride * height)`, the same span
-    // devmgr carves the `Mmio` cap over (`spawn_framebuffer`), so the
-    // whole-region mapping fits the reservation.
+    // `[physical_base, physical_base + stride * height)`. The delivered
+    // range must be exactly that aperture, the range devmgr's record of the
+    // boot framebuffer carves its `Mmio` cap over, so the whole-region
+    // mapping fits the reservation.
     let span = u64::from(fb_info.stride) * u64::from(fb_info.height);
     let in_page = fb_info.physical_base & 0xFFF;
     let total_pages = (in_page + span).div_ceil(0x1000);
-    if span == 0
+    if span == 0 || phys != fb_info.physical_base - in_page || bytes != total_pages * 0x1000
     {
         syscall::thread_exit();
     }
 
-    // SAFETY: `info.self_aspace` is this process's address space, and devmgr
-    // carves the framebuffer `Mmio` cap over exactly the page-aligned
-    // aperture of the geometry it reports here (`spawn_framebuffer`), so the
-    // region spans `total_pages` pages.
+    // SAFETY: `info.self_aspace` is this process's address space, and the
+    // delivered `Mmio` range, whose cap spans it, is checked above to be the
+    // `total_pages` pages of the geometry devmgr reports.
     let Some(aperture) =
-        (unsafe { arch::current::fb_mmio_init(info.self_aspace, caps.mmio_cap, total_pages) })
+        (unsafe { arch::current::fb_mmio_init(info.self_aspace, mmio_cap, total_pages) })
     else
     {
         syscall::thread_exit();
@@ -372,9 +348,9 @@ fn main() -> !
     };
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }.is_err()
+    if unsafe { ipc::report_driver_ready(device.endpoints.devmgr_query, ipc_buf) }.is_err()
     {
         syscall::thread_exit();
     }
-    service_loop(caps.service_ep, writer, ipc_buf);
+    service_loop(device.endpoints.service, writer, ipc_buf);
 }

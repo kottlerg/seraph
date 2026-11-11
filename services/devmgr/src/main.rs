@@ -100,8 +100,8 @@ fn main() -> !
     // order.
     let modules = decls::classify_modules(&mut caps);
     let platform_records = platform::enumerate(&caps, &modules.tables);
-    let records = bind::PciRecords::new(devices)
-        .and_then(|pci| bind::Records::new(pci, platform_records));
+    let records =
+        bind::PciRecords::new(devices).and_then(|pci| bind::Records::new(pci, platform_records));
     let Some(mut records) = records
     else
     {
@@ -128,9 +128,7 @@ fn main() -> !
     // record (a record is bound at most once), the IOMMU driver, and the test-only fault batch (TODO(#165): drop it
     // with that shim). The watch's death queue is sized to them, so every
     // death observer is funded and no death is dropped.
-    let driver_count = records.count()
-        + IOMMU_DRIVERS
-        + ipc::devmgr_labels::TEST_FAULT_DRIVERS;
+    let driver_count = records.count() + IOMMU_DRIVERS + ipc::devmgr_labels::TEST_FAULT_DRIVERS;
     let Some(mut watch) = settle::DriverWatch::new(driver_count, caps.registry_ep)
     else
     {
@@ -157,10 +155,10 @@ fn main() -> !
     // once it reports ready every device behind a remapping unit is blocked
     // until devmgr attaches it, which a bind does before each DMA grant.
     // `None` runs every device unconfined, logged once.
-    let (iommu_module, mut boot_modules) = iommu::take_module(modules.drivers);
+    let mut boot_modules = modules.drivers;
     caps.iommu = iommu::bring_up(
         records.pci.devices(),
-        iommu_module,
+        &mut boot_modules,
         caps.pooled.take(),
         &mut caps,
         &mut watch,
@@ -177,7 +175,7 @@ fn main() -> !
     // modules, settled before the registry loop opens.
     spawn_boot_drivers(
         &mut records,
-        core::mem::take(&mut boot_modules),
+        boot_modules,
         &mut caps,
         &mut irq_range,
         &mut watch,
@@ -577,9 +575,9 @@ mod class
     pub const TEST_DMA: &str = "test-dma";
 }
 
-/// The drivers devmgr starts on fixed paths, by name and the class each is
-/// served under: the test-only fault fixtures until P5 of #165 binds them by
-/// declaration (docs/driver-binding.md § Status), and the IOMMU driver.
+/// The driver devmgr starts on a fixed path, by name and the class it is
+/// served under: the test-only fault fixture until P5 of #165 binds it by
+/// declaration (docs/driver-binding.md § Status).
 mod fixed
 {
     use driver_binding::decl::{ClassName, DriverName};
@@ -589,8 +587,6 @@ mod fixed
         DriverName::literal_key("test-fault"),
         ClassName::literal_class(super::class::TEST_FAULT),
     );
-    /// The IOMMU driver, served under no class.
-    pub const IOMMU: DriverName = DriverName::literal_key("iommu");
 }
 
 /// Reply to a device query with a `SEND_GRANT` badged `verb_bits` on the
@@ -1303,26 +1299,26 @@ impl ServedDriver
     /// no-op for one procmgr has reaped); then [`Self::release`].
     fn withdraw(&self, ipc_buf: *mut u64)
     {
-        match &self.dev_caps
+        if let Some(dev_caps) = &self.dev_caps
         {
-            Some(dev_caps) => bind::withdraw_device(
+            bind::withdraw_device(
                 dev_caps,
                 spawn::HeldChild {
                     process_handle: self.process_handle,
                     release_token: dev_caps.release_token,
                 },
                 ipc_buf,
-            ),
-            None =>
+            );
+        }
+        else
+        {
+            if let Some(platform) = &self.platform_caps
             {
-                if let Some(platform) = &self.platform_caps
-                {
-                    platform.take_from_driver();
-                }
-                if self.process_handle != 0
-                {
-                    spawn::destroy_child(self.process_handle, ipc_buf);
-                }
+                platform.take_from_driver();
+            }
+            if self.process_handle != 0
+            {
+                spawn::destroy_child(self.process_handle, ipc_buf);
             }
         }
         self.release();
@@ -1633,6 +1629,9 @@ fn settle_batch(
 /// ([`bind::boot_pass`]), from the declared boot modules `modules`. The
 /// registry loop opens only after it, so every client sees the settled
 /// drivers.
+// too_many_arguments: the boot pass takes the records, the boot modules, and
+// every table a bind and its settle batch carve from or record into.
+#[allow(clippy::too_many_arguments)]
 fn spawn_boot_drivers(
     records: &mut bind::Records,
     modules: Vec<(driver_binding::decl::DriverDecl, u64)>,
@@ -1837,6 +1836,7 @@ fn spawn_simple_into(
             driver: ServedDriver {
                 ep: slots.service_ep,
                 dev_caps: None,
+                platform_caps: None,
                 process_handle,
             },
         };

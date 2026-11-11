@@ -236,7 +236,9 @@ fn labelled(id: u64, len: usize, level: u64) -> u64
 /// its first byte.
 /// Silently drops on a zero `cap`, null `ipc_buf`, empty `bytes`, or
 /// mid-chunk IPC failure, a call the receiver leaves unanswered for
-/// its bound ([`LOG_CALL_TIMEOUT_MS`]) among them.
+/// its bound ([`LOG_CALL_TIMEOUT_MS`]) among them: the chunks after the
+/// failed one are not sent, and the failed one's bytes are dropped unless the
+/// receiver had already received them ([`LOG_CALL_TIMEOUT_MS`]).
 ///
 /// # Safety
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
@@ -248,9 +250,11 @@ pub unsafe fn write_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8])
     let _ = unsafe { send_bytes(cap, ipc_buf, level, bytes) };
 }
 
-/// [`write_bytes`], reporting whether every chunk was delivered: `false` on a
-/// zero `cap`, a null `ipc_buf`, or an IPC failure (the bytes from the failed
-/// chunk on are dropped). Empty `bytes` sends nothing and succeeds.
+/// [`write_bytes`], reporting whether every chunk's call was answered: `false`
+/// on a zero `cap`, a null `ipc_buf`, or a failed call. The chunks after a
+/// failed call are not sent; a chunk whose call timed out may still have been
+/// received, and then written, so a `false` does not say its bytes were
+/// dropped ([`LOG_CALL_TIMEOUT_MS`]). Empty `bytes` sends nothing and succeeds.
 ///
 /// # Safety
 /// As for [`write_bytes`].
@@ -281,8 +285,9 @@ unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8]) -> b
 /// Send `record`, a record's payload (`ipc::log_record`), at `level` as one
 /// `STREAM_RECORD` message on `cap`. A record fits one message, so nothing
 /// is split. Silently drops on a zero `cap`, a null `ipc_buf`, or an IPC
-/// failure (a call unanswered within its bound ([`LOG_CALL_TIMEOUT_MS`]) among them); the
-/// receiver's reply, `RECORD_REJECTED` for a payload that is not a record, is
+/// failure, a call unanswered within its bound among them, unless the receiver
+/// had already received the record ([`LOG_CALL_TIMEOUT_MS`]); the receiver's
+/// reply, `RECORD_REJECTED` for a payload that is not a record, is
 /// not reported.
 ///
 /// # Safety

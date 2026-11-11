@@ -278,8 +278,10 @@ place. A walk of several pages is not a snapshot, and a client assumes only
 this across its pages:
 
 - `QUERY_SLOTS` reads each (badge, state) pair at most once. A slot retired
-  between two pages is read twice, live and then retired, when the walk passed
-  its badge before the retire. A slot created below the walk's cursor, or a
+  between two pages is read twice, live and then retired, only when its live
+  entry was the last one the earlier page carried; a slot retired after the walk
+  has passed its badge is read once, as live, and one retired before the walk
+  reaches it once, as retired. A slot created below the walk's cursor, or a
   retired slot dropped before the walk reaches it, is missed.
 - `QUERY_HISTORY` reads each entry at most once, since `seq` is unique and the
   walk moves to older `seq` only; a retire keeps an entry's `seq`. An entry
@@ -411,8 +413,9 @@ leaves a full queue of events behind it for that drain or the next), so it start
 a resync:
 
 1. logd snapshots the badges of its child slots: every badge at or above
-   `log_badges::LOG_BADGE_FIRST_CHILD`, which only procmgr-spawned children
-   carry.
+   `log_badges::LOG_BADGE_FIRST_CHILD` with no `ipc::VERB_BIT_MASK` bit, which
+   only procmgr-spawned children carry. A `LOG_QUERY_AUTHORITY` badge (§ Queries)
+   that sent a stream label has a slot but is no candidate.
 2. A helper thread walks procmgr's live badges with
    [`QUERY_LIVE_PROCESSES`](../../procmgr/docs/ipc-interface.md) through the
    `DEATH_EQ_AUTHORITY` cap, page by page, checking that each page ascends past

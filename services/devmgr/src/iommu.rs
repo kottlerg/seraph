@@ -33,16 +33,16 @@
 //! behind it, which devmgr, holding no register cap, cannot undo, and logs
 //! as such.
 //!
-//! The [`IommuClient`] is shared by devmgr's registry thread (`ATTACH`,
+//! The [`IommuClient`] is shared by devmgr's control thread (`ATTACH`,
 //! `BLOCK`), its DMA thread (`MAP`, `UNMAP`), and its fault-log thread
 //! (`TAKE_FAULTS`), each call made with no devmgr lock held. When the driver
 //! dies after it reported ready, the hardware goes on translating, so devmgr
 //! cannot fall back to unconfined DMA. A death watch thread of its own sees
-//! the death at once, independent of the registry loop, which may itself be
+//! the death at once, independent of the control thread, which may itself be
 //! blocked in a call to the dead driver: [`IommuClient::fail`] makes every
 //! later call fail at once, logged once, and starts a thread that answers any
 //! call still queued on the driver's endpoint with an error. When the
-//! registry loop takes the death, devmgr withdraws every confined device's
+//! control thread takes the death, devmgr withdraws every confined device's
 //! driver. No restart is attempted;
 //! restartability is [#262](https://github.com/kottlerg/seraph/issues/262).
 //! See `docs/device-management.md` § IOMMU Discovery and Programming.
@@ -311,7 +311,7 @@ impl IommuClient
     /// still queued on its endpoint with an error from a thread of devmgr's
     /// own, so no devmgr thread waits on a driver that will never receive.
     /// Called by the death watch ([`start_death_watch`]) as soon as the
-    /// death posts, and again, to no effect, by the registry loop when it
+    /// death posts, and again, to no effect, by the control thread when it
     /// takes the death; returns whether this call was the first.
     pub fn fail(&self) -> bool
     {
@@ -736,8 +736,9 @@ impl Iommu
 /// fault another thread's take has handed devmgr (`TEST_DMA_FAULTS` reads
 /// it beside the fault-log thread). The lock is held across the
 /// `TAKE_FAULTS` IPC, which `docs/coding-standards.md` § Concurrency advises
-/// against: only the fault-log thread and `TEST_DMA_FAULTS` take it, so the
-/// one waiter waits no longer than its own call to the driver would, and a
+/// against: only the fault-log thread and `TEST_DMA_FAULTS`, on a registry
+/// worker, take it, so a waiter waits no longer than the holders' calls to
+/// the driver, each no longer than its own would, and a
 /// dead driver's calls are answered (`IommuClient::fail`), so the holder
 /// does not block for good.
 fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
@@ -1202,7 +1203,7 @@ fn release_rounds(rounds: &[spawn::UnitRound])
 /// through, and start the thread that watches for the driver's death: it
 /// waits on an event queue of its own, to which the driver's spawn binds a
 /// second death observer, and fails the client at once on a death post, so
-/// the failure never waits on devmgr's registry loop, which may itself be
+/// the failure never waits on devmgr's control thread, which may itself be
 /// blocked in a call to the dead driver (directly, or through a read whose
 /// buffer the DMA thread is mapping). A post with tag 0, which no death post
 /// carries (the correlator is a nonzero device badge), only ends the thread.

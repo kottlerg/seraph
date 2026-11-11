@@ -7,7 +7,7 @@
 
 use ipc::IpcMessage;
 
-use crate::caps::DevmgrCaps;
+use crate::caps::{DevmgrCaps, Firmware};
 use crate::{IrqRangeAllocator, reply_status};
 use firmware::EcamLocation;
 
@@ -87,7 +87,7 @@ pub fn intx_fallback_gsi(pin: u8, dev: u8) -> Option<u32>
 
 /// The overrides the PCI `INTx` lines' modes come from: none on riscv64,
 /// where every line takes [`pci_line_mode`]'s fixed mode.
-pub fn pci_line_overrides(_caps: &DevmgrCaps) -> Vec<firmware::acpi::SourceOverride>
+pub fn pci_line_overrides(_firmware: &Firmware) -> Vec<firmware::acpi::SourceOverride>
 {
     Vec::new()
 }
@@ -121,15 +121,15 @@ pub fn platform_line(_irq_range: &IrqRangeAllocator, line: u32, mode: u64, _isa:
 /// (`msg` is unused; the request carries no RISC-V parameter). Replies
 /// `NO_DEVICE` when devmgr holds no `SbiControl` cap and
 /// `INVALID_REQUEST` when the derivation fails.
-pub fn reply_shutdown_device(caps: &DevmgrCaps, _msg: &IpcMessage, ipc_buf: *mut u64)
+pub fn reply_shutdown_device(firmware: &Firmware, _msg: &IpcMessage, ipc_buf: *mut u64)
 {
-    if caps.arch.sbi_control_cap == 0
+    if firmware.arch.sbi_control_cap == 0
     {
         reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
         return;
     }
     // pwrmgr needs only system reset (SRST); attenuate to the minimum.
-    let Ok(sbi) = syscall::cap_derive(caps.arch.sbi_control_cap, syscall::RIGHTS_SBI_RESET)
+    let Ok(sbi) = syscall::cap_derive(firmware.arch.sbi_control_cap, syscall::RIGHTS_SBI_RESET)
     else
     {
         reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);

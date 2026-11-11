@@ -10,30 +10,27 @@
 //!
 //! devmgr keeps one [`DriverWatch`] for the boot: a death event queue every
 //! driver's death observer posts to, with its device badge as the
-//! correlator, and a wait set over that queue and, once the registry opens,
-//! the registry endpoint. devmgr spawns its drivers in two batches (at boot,
-//! the drivers bound to PCI records by the boot modules' declarations and
-//! the serial and framebuffer drivers; after `SET_DRIVERS_DIR`, the RTC
-//! driver and the drivers bound by the drivers directory's declarations),
-//! and, on svctest's test-only `TEST_SPAWN_FAULT_DRIVERS`, a third of
-//! `test-fault` fixtures (TODO(#165)), each against a [`SettleBatch`]: a
-//! private driver endpoint on which each driver's devmgr query cap is a SEND
-//! badged with its device badge.
-//! [`SettleBatch::settle`] takes the registry endpoint out of the wait set,
-//! adds the private endpoint and a timer notification, and runs the
+//! correlator, a job notification the registry's workers signal when a
+//! request leaves work for the control thread (`crate::Registry`), and a
+//! wait set over both that devmgr's control thread waits on. devmgr spawns
+//! its drivers in two production batches after the IOMMU batch (at boot, the
+//! drivers bound by the boot modules' declarations; after `SET_DRIVERS_DIR`,
+//! the drivers bound by the drivers directory's declarations), and, on
+//! svctest's test-only `TEST_SPAWN_FAULT_DRIVERS`, a third of `test-fault`
+//! fixtures (TODO(#165)), each against a [`SettleBatch`]: a private driver
+//! endpoint on which each driver's devmgr query cap is a SEND badged with its
+//! device badge. [`SettleBatch::settle`] takes the job notification out of the
+//! wait set, adds the private endpoint and a timer notification, and runs the
 //! host-tested [`roster::settle`] loop: it serves the drivers'
 //! `QUERY_DEVICE_INFO` and `DRIVER_READY` calls on the private endpoint and
 //! takes their deaths until the [`Roster`] is settled or the batch's bound
-//! elapses ([`SETTLE_TIMEOUT`] for the two production batches,
+//! elapses ([`SETTLE_TIMEOUT`] for the production batches,
 //! `TEST_FAULT_SETTLE_TIMEOUT_MS` for the fault batch), then takes every
-//! death still queued. A death of a driver an
-//! earlier batch settled goes to the caller, which withdraws it. While a
-//! batch settles devmgr receives on no registry endpoint, so registry callers
-//! stay queued until it returns to its registry loop: devmgr replies to a
-//! received call before its next receive and holds no saved reply
-//! capability, so it cannot serve other labels while a query on the settling
-//! class waits. See `services/devmgr/docs/responsibilities.md`
-//! § Responsibilities.
+//! death still queued. A death of a driver an earlier batch settled goes to
+//! the caller, which withdraws it. The registry's workers go on serving
+//! meanwhile; a query whose answer a batch still unsettled could change
+//! waits for it (`crate::Registry`). See
+//! `services/devmgr/docs/responsibilities.md` § Responsibilities.
 
 use core::time::Duration;
 
@@ -62,24 +59,24 @@ use crate::DeviceCatalog;
 pub const SETTLE_TIMEOUT: Duration =
     Duration::from_secs(2 * virtio_core::pci::RESET_TIMEOUT.as_secs());
 
-/// Wait-set badge of the registry endpoint.
-const WS_BADGE_REGISTRY: u64 = 1;
+/// Wait-set badge of the job notification.
+const WS_BADGE_JOB: u64 = 1;
 /// Wait-set badge of a settling batch's private driver endpoint.
 const WS_BADGE_DRIVER: u64 = 2;
 /// Wait-set badge of the driver death queue.
 const WS_BADGE_DEATH: u64 = 3;
 /// Wait-set badge of a settling batch's timer notification.
 const WS_BADGE_TIMER: u64 = 4;
-/// Wait-set member capacity: the death queue, and either the registry
-/// endpoint or a settling batch's private endpoint and timer.
+/// Wait-set member capacity: the death queue, and either the job
+/// notification or a settling batch's private endpoint and timer.
 const WS_MEMBERS: u32 = 3;
 
-/// What woke the registry loop's wait.
+/// What woke the control thread's wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RegistryWake
+pub enum ControlWake
 {
-    /// A call is queued on the registry endpoint.
-    Registry,
+    /// The job notification was signalled; its bits are taken.
+    Job,
     /// The death queue holds at least one post.
     Death,
     /// Any other wake; the loop waits again.
@@ -87,15 +84,15 @@ pub enum RegistryWake
 }
 
 /// devmgr's death observation for the boot: the death event queue every
-/// driver's death observer posts to, and the wait set the registry loop and
-/// the settles wait on.
+/// driver's death observer posts to, the job notification, and the wait set
+/// the control thread and the settles wait on.
 pub struct DriverWatch
 {
     death_eq: u64,
     wait_set: u64,
-    registry_ep: u64,
-    /// Whether `registry_ep` is a member of `wait_set`.
-    registry_open: bool,
+    job_note: u64,
+    /// Whether `job_note` is a member of `wait_set`.
+    jobs_open: bool,
 }
 
 impl DriverWatch
@@ -106,9 +103,10 @@ impl DriverWatch
     /// on each, so no death is dropped and every bind is funded. The queue
     /// holds at most the kernel's `EVENT_QUEUE_MAX_CAPACITY`; past it, the
     /// bind of a driver beyond the queue's nodes fails and that driver is not
-    /// spawned, logged. Returns `None`, logging why and releasing what it
+    /// spawned, logged. The job notification is a member of the wait set
+    /// from the start. Returns `None`, logging why and releasing what it
     /// created, when an object cannot be created.
-    pub fn new(drivers: usize, registry_ep: u64) -> Option<Self>
+    pub fn new(drivers: usize) -> Option<Self>
     {
         let capacity = u32::try_from(drivers)
             .unwrap_or(u32::MAX)
@@ -141,9 +139,22 @@ impl DriverWatch
             let _ = syscall::cap_delete(death_eq);
             return None;
         };
+        let Some(job_note) = std::os::seraph::object_slab_retype(
+            std::os::seraph::NOTIFICATION_RETYPE_BYTES,
+            |slab| syscall::cap_create_notification(slab).ok(),
+        )
+        else
+        {
+            std::os::seraph::log!("watch: job notification not created");
+            let _ = syscall::cap_delete(wait_set);
+            let _ = syscall::cap_delete(death_eq);
+            return None;
+        };
         if syscall::wait_set_add(wait_set, death_eq, WS_BADGE_DEATH).is_err()
+            || syscall::wait_set_add(wait_set, job_note, WS_BADGE_JOB).is_err()
         {
             std::os::seraph::log!("watch: wait set registration failed");
+            let _ = syscall::cap_delete(job_note);
             let _ = syscall::cap_delete(wait_set);
             let _ = syscall::cap_delete(death_eq);
             return None;
@@ -151,8 +162,8 @@ impl DriverWatch
         Some(Self {
             death_eq,
             wait_set,
-            registry_ep,
-            registry_open: false,
+            job_note,
+            jobs_open: true,
         })
     }
 
@@ -163,44 +174,46 @@ impl DriverWatch
         self.death_eq
     }
 
-    /// Add the registry endpoint to the wait set, so [`wait`](Self::wait)
-    /// reports its calls beside the drivers' deaths. A no-op when it is
-    /// already a member.
+    /// The job notification the registry's workers signal when a request
+    /// leaves work for the control thread.
+    #[must_use]
+    pub fn job_note(&self) -> u64
+    {
+        self.job_note
+    }
+
+    /// Add the job notification back to the wait set after a settle took it
+    /// out. A no-op when it is already a member.
     ///
     /// # Errors
-    /// The `SYS_WAIT_SET_ADD` error when the kernel refuses the membership;
-    /// the registry endpoint is then not a member
-    /// ([`registry_open`](Self::registry_open) is `false`).
-    pub fn open_registry(&mut self) -> Result<(), i64>
+    /// The `SYS_WAIT_SET_ADD` error when the kernel refuses the membership.
+    fn open_jobs(&mut self) -> Result<(), i64>
     {
-        if !self.registry_open
+        if !self.jobs_open
         {
-            syscall::wait_set_add(self.wait_set, self.registry_ep, WS_BADGE_REGISTRY)?;
-            self.registry_open = true;
+            syscall::wait_set_add(self.wait_set, self.job_note, WS_BADGE_JOB)?;
+            self.jobs_open = true;
         }
         Ok(())
     }
 
-    /// Whether the registry endpoint is in the wait set, so the registry loop
-    /// waits on it beside the death queue rather than receiving on it
-    /// directly.
-    #[must_use]
-    pub fn registry_open(&self) -> bool
-    {
-        self.registry_open
-    }
-
-    /// Block until a registry call or a death post is queued.
+    /// Block until the job notification is signalled or a death post is
+    /// queued. A signalled notification stays ready on the set until its
+    /// bits are taken, so a job wake takes them.
     ///
     /// # Errors
     /// Returns the wait's failure.
-    pub fn wait(&self) -> Result<RegistryWake, i64>
+    pub fn wait(&self) -> Result<ControlWake, i64>
     {
         Ok(match syscall::wait_set_wait(self.wait_set)?
         {
-            WS_BADGE_REGISTRY => RegistryWake::Registry,
-            WS_BADGE_DEATH => RegistryWake::Death,
-            _ => RegistryWake::Other,
+            WS_BADGE_JOB =>
+            {
+                let _ = syscall::notification_try_wait(self.job_note);
+                ControlWake::Job
+            }
+            WS_BADGE_DEATH => ControlWake::Death,
+            _ => ControlWake::Other,
         })
     }
 
@@ -269,11 +282,14 @@ impl SettleBatch
         bound: Duration,
     ) -> SettleEnd
     {
-        let reopen = watch.registry_open;
+        // A job signalled during the settle would keep the notification
+        // ready on the set and wake every wait of the settle, so it is taken
+        // out; its signal stays pending until it is added back.
+        let reopen = watch.jobs_open;
         if reopen
         {
-            let _ = syscall::wait_set_remove(watch.wait_set, watch.registry_ep);
-            watch.registry_open = false;
+            let _ = syscall::wait_set_remove(watch.wait_set, watch.job_note);
+            watch.jobs_open = false;
         }
         let end = if syscall::wait_set_add(watch.wait_set, self.driver_ep, WS_BADGE_DRIVER).is_ok()
         {
@@ -299,10 +315,11 @@ impl SettleBatch
             std::os::seraph::log!("settle: driver endpoint not added to the wait set");
             SettleEnd::Settled
         };
-        if reopen && let Err(e) = watch.open_registry()
+        if reopen && let Err(e) = watch.open_jobs()
         {
             std::os::seraph::log!(
-                "settle: registry endpoint not re-added to the wait set (err={e})"
+                "settle: job notification not re-added to the wait set (err={e}); \
+                 jobs wait for a death to wake the control thread"
             );
         }
         end

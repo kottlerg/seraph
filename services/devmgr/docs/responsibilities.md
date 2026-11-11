@@ -98,7 +98,7 @@ devmgr's responsibilities are:
   behind it, which the log line states). A thread of devmgr's
   takes the driver's recorded faults every second (`TAKE_FAULTS`) and logs
   each against its device. If the driver dies after it reported ready, a death
-  watch thread of devmgr's own, which no registry call can delay, fails the
+  watch thread of devmgr's own, which no call of its control thread can delay, fails the
   IOMMU client at once; devmgr logs once, refuses every later `DMA_MAP` of
   every confined device, answers any of its own calls still queued on the
   driver's endpoint from a drain thread, and withdraws every confined device's
@@ -165,8 +165,8 @@ devmgr's responsibilities are:
   driver install the mapping (`MAP`, moving it a derivation of the cap) before it
   replies, and remove it (`UNMAP`) before it deletes the cap; a refused or
   failed IOMMU call replies `IOMMU_FAILED`. The thread serves it apart from the registry
-  loop because that loop makes nested calls and settles batches during which
-  drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary through
+  and the control thread (below) because the control thread makes nested calls and settles
+  batches during which drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary through
   virtio-blk, which maps the read's buffer, and every `VirtIO` driver maps its
   rings before it reports ready. The two threads share the device and mapping
   table (`devmgr_firmware::dma::DmaTable`) under one lock, taken only around
@@ -280,7 +280,7 @@ devmgr's responsibilities are:
      reset.
 
   Each withdrawal resets once, and the wait for the confirmation holds
-  devmgr's thread (the settle, or the registry loop) per withdrawn device for
+  devmgr's control thread (the settle, or a death's withdrawal) per withdrawn device for
   up to the bound of its reset: `RESET_TIMEOUT` for the VirtIO status reset,
   all of it for a device whose status does not read 0 within the bound, and
   `FLR_COMPLETION_MS` for a Function Level Reset. A driver still running (one
@@ -366,8 +366,8 @@ devmgr's responsibilities are:
 
   The instance ordinals of a class count its served drivers in spawn order
   and are fixed once its batch settles. devmgr observes every driver's death
-  for the rest of the boot: its registry loop waits on the registry endpoint
-  and the death queue together, and a settle hands the deaths of drivers
+  for the rest of the boot: its control thread waits on the death queue and
+  its job notification together, and a settle hands the deaths of drivers
   outside its batch back to it. A served driver that dies is withdrawn as
   above, so callers queued on its endpoint return (the endpoint's teardown
   wakes them), and a tombstone holds its ordinal: its query replies
@@ -375,19 +375,30 @@ devmgr's responsibilities are:
   it keep their drivers, so vfsd's probe of block ordinals, which continues
   past a `WITHDRAWN` reply, skips no live disk.
 
-  The serving order follows from where each batch settles. The boot batch
-  settles during initial enumeration, before the registry loop opens. vfsd's
-  block class probes, and every query of the serial and framebuffer
-  drivers, wait in the registry endpoint's queue until then. The on-disk
-  batch settles in the `SET_DRIVERS_DIR` handler, after its reply and before
-  the next receive, so `QUERY_DEVICE` on the rtc, input, and debug-port
-  classes sees the settled drivers. While a batch settles,
-  devmgr receives on no registry endpoint, and every registry caller waits for
-  the settle, at most the settle bound plus the bound of each withdrawn
-  device's reset (above). devmgr
-  cannot serve the settled classes meanwhile: it must reply to a received call
-  before its next receive, and it holds no saved reply capability, so an input
-  query cannot wait while other labels are served.
+  The serving order follows from where each batch settles. devmgr's main
+  thread is its control thread: it enumerates, spawns and settles every
+  batch, and withdraws every driver whose death it takes. Four registry
+  worker threads (`REGISTRY_WORKERS`, a concurrency setting that bounds no
+  capacity) receive on the registry endpoint once the boot batch has
+  settled, each on its own IPC buffer page
+  ([shared/recv-pool](../../../shared/recv-pool/README.md)); vfsd's block
+  class probes, and every query of the serial and framebuffer drivers, wait
+  in the registry endpoint's queue until then. A request that leaves work
+  for the control thread (`SET_DRIVERS_DIR`'s drivers-directory pass and
+  on-disk settle, and the test-only fault batch and orphan spawn) posts it
+  as a job and replies; the control thread runs it. A query whose answer
+  names no driver (an ordinal past the class's last served driver, so
+  `NO_DEVICE`) waits while a posted job is not done, and is answered once it
+  is, so a query received after `SET_DRIVERS_DIR`'s reply sees the on-disk
+  batch's drivers, at most the settle bound plus the bound of each withdrawn
+  device's reset (above) after its pass. A query whose answer names a
+  driver, live or withdrawn, is answered at once, during a settle too: a
+  class's ordinals only grow, so that answer is final. The workers and the
+  control thread share the served drivers under one lock, under which no
+  thread makes an IPC call or logs; a reply carrying a SEND derived from a
+  driver's endpoint is sent while the lock is held, so a withdrawal, which
+  takes the driver out under the lock and revokes its endpoint after, cannot
+  delete that SEND before the reply.
 
   The settle does not deadlock against the log path as long as the drivers'
   synchronous log calls reach a receiver that does not wait on devmgr. During
@@ -398,8 +409,10 @@ devmgr's responsibilities are:
   `HANDOVER_PULL`, while init-logd still drains the log endpoint, and caches
   both outcomes. The precondition fails only when the serial driver cannot be
   resolved: logd then queries the `serial` class (`QUERY_DEVICE`) again on
-  later emits, and devmgr's own logging in that handler, and the line it logs
-  when it withdraws a served driver, already have the same deadlock window.
+  later emits, and that query, which names no driver, waits for the on-disk
+  job, while the control thread's own log lines during that job, and the
+  line it logs when it withdraws a served driver, wait on logd: the same
+  deadlock window.
 
   Driver binaries are sourced from one of two places:
 
@@ -422,8 +435,8 @@ devmgr's responsibilities are:
     delivers a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
     subtree cap via `devmgr_labels::SET_DRIVERS_DIR` after handover (gated by
     `DRIVERS_DIR_AUTHORITY`); devmgr replies SUCCESS immediately (so svcmgr
-    never blocks on driver work), then, between `ipc_reply` and the next
-    `ipc_recv`, runs the drivers-directory pass, settling the on-disk batch there (above). The pass
+    never blocks on driver work), and its control thread runs the
+    drivers-directory pass, settling the on-disk batch (above). The pass
     lists the directory (`NS_READDIR`, at most 4096 entries) and reads each
     entry's declaration through `FS_READ` on its file cap, bounded as
     [docs/driver-binding.md](../../../docs/driver-binding.md#declaration-bounds)
@@ -436,7 +449,7 @@ devmgr's responsibilities are:
     its overrun of the settle bound, before it reports ready, is sticky and
     surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
     the rtc, input, and debug-port classes, the same reply
-    as before the spawn has run, so a client retries it only a bounded number of times. See
+    as before `SET_DRIVERS_DIR` arrives, so a client retries it only a bounded number of times. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves

@@ -14,7 +14,7 @@
 //! (`driver_binding::resources::SLOT_DMA`). The thread serves `DMA_MAP` and
 //! `DMA_UNMAP` (`ipc::devmgr_dma_labels`) on its own, at the boot drivers'
 //! level (`BOOT_DRIVER_PRIORITY`, above devmgr's), so a driver's mapping never
-//! waits for the registry loop: that loop makes nested calls (a
+//! waits for the control thread: that thread makes nested calls (a
 //! `CREATE_FROM_FILE` reads the driver binary through virtio-blk, which maps
 //! the read's buffer) and settles a batch whose drivers map their rings
 //! before they report ready.
@@ -24,7 +24,7 @@
 //! with a derivation of the carried Memory cap) before it replies, and
 //! withdraw it (`UNMAP`) before it deletes the cap; an unconfined device's
 //! device address is its frames' physical address. The table is shared with
-//! the registry loop, which withdraws a device's grant
+//! the control thread, which withdraws a device's grant
 //! ([`DmaGrant::withdraw`], which blocks a confined device in the IOMMU and
 //! hands back the Memory caps of the device's standing mappings, deleted only
 //! once the device can no longer reach them: [`Withdrawal`]). Either thread
@@ -90,10 +90,10 @@ impl DmaService
         // root-disk path, blocks on this thread twice per transfer, so a
         // thread below it would let any runnable thread between the two
         // levels delay that path (`ipc::sched_policy`). One inversion stays,
-        // bounded: the thread shares the table's lock with the registry loop
-        // (24), and while the loop holds it in a `grant` or `withdraw` (a
+        // bounded: the thread shares the table's lock with the control
+        // thread (24), and while it holds it in a `grant` or `withdraw` (a
         // table operation, which may grow the table through memmgr) a thread
-        // at 25 can preempt the loop and so delay this one, for at most that
+        // at 25 can preempt it and so delay this one, for at most that
         // operation (core/kernel/docs/scheduler.md § Priority Inversion
         // Mitigation).
         if std::thread::Builder::new()

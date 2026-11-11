@@ -421,11 +421,27 @@ fn driver_withdrawal_phase(caps: &Caps)
         "TEST_SPAWN_FAULT_DRIVERS ack"
     );
 
-    // Served once devmgr returns to its registry loop, after the batch's
-    // settle: the never-ready fixture holds it until the bound.
+    // devmgr's registry workers serve a class already settled while the
+    // fault batch settles, which the never-ready fixture holds until the
+    // bound: the input query returns before the bound has elapsed since the
+    // ack. A registry that served nothing during a settle would answer it
+    // only after the bound.
+    let bound = Duration::from_millis(ipc::devmgr_labels::TEST_FAULT_SETTLE_TIMEOUT_MS);
+    assert_granted(
+        &query_input(caps.input_class, None),
+        "input QUERY_DEVICE during the fault settle",
+    );
+    let served_during = start.elapsed();
+    assert!(
+        served_during < bound,
+        "devmgr_withdrawal: the input query returned after {served_during:?}, not before the \
+         fault batch's settle bound {bound:?}: the registry served nothing while it settled"
+    );
+
+    // Served once the batch's settle has ended: a fixture query that finds
+    // no fixture waits for it.
     let first = fault_cap(&query_fault(devmgr, 0), "fault ordinal 0");
     let settle = start.elapsed();
-    let bound = Duration::from_millis(ipc::devmgr_labels::TEST_FAULT_SETTLE_TIMEOUT_MS);
     assert!(
         settle >= bound,
         "devmgr_withdrawal: the settle ended after {settle:?}, before its bound {bound:?}, \

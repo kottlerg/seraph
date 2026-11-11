@@ -909,11 +909,15 @@ undebuggable (Label 21). Such a cap comes from the other process itself, from a 
 holder's attach, or, for the other process's main thread alone, from its creation (`CREATE_PROCESS`
 and `CREATE_FROM_FILE` give the creator that cap), whose binding is its process badge, which procmgr
 does not rebind and records as that process's, none once that process has declared itself
-undebuggable, the debugger tag while a debugger attached to that process holds it, or a crash badge
-another registry put on it. So no process gains this over a spawned thread it was not given, and no
-restore of the creator's binds a declared child's main thread back (Label 24) unless that thread
-carried the debugger tag, or a crash badge no live registry lists, when the creator first registered
-it.
+undebuggable, the debugger tag while a debugger attached to that process holds it, a crash badge
+another registry put on it, or any binding the cap's holder sets with its `CONTROL`. So no process
+gains this over a spawned thread it was not given. No restore of the creator's binds a declared
+child's main thread back (Label 24) unless that thread carried the debugger tag, or a crash badge no
+live registry lists, at one of the creator's registrations of it, since procmgr records each
+registration by the binding it then shows. The creator can bring that about itself, by binding the
+thread under a badge that carries the debugger tag and then registering it; that gives it nothing
+over the thread its `CONTROL` does not already give, since that cap lets it bind the thread's
+exception class to a handler of its own.
 
 Replies `SUCCESS`; refusals, in order: `INVALID_BADGE` when the badge names no live process, or the
 request came on a process handle (§ Messages);
@@ -1000,9 +1004,14 @@ exited. A declared process (Label 21) is never bound back: the declaration delet
 this request refuses it.
 
 procmgr restores its own crash bindings, not what the attach found: a handler the target bound on
-a thread's exception class itself, which the debugger's bind replaced, is not bound back, and that
-thread's faults reach the crash endpoint from then on. procmgr binds no other class, so the
-target's own handler of another class the debugger bound over is not bound back either.
+a thread's exception class itself, which the debugger's bind replaced, is not bound back. The main
+thread, and a registered thread recorded as the target's own (Label 22), the target having bound
+its handler after the registration, are bound to the crash endpoint instead, and their faults reach
+it from then on. A registered thread that carried the target's handler when the target registered it
+is recorded unknown, so the debugger's binding on it is unbound, and its faults are unhandled from
+then on (§ Reply in [docs/fault-handling.md](../../../docs/fault-handling.md)). procmgr binds no
+other class, so the target's own handler of another class the debugger bound over is not bound back
+either.
 
 Replies `SUCCESS`; refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_BADGE` when
 no live process carries the badge (a thread's crash badge names no process here); `NOT_ATTACHABLE`

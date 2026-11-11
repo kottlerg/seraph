@@ -11,7 +11,7 @@
 //! registers the device in the shared [`DmaTable`] with its confinement and
 //! derives a SEND on the endpoint badged with the device's badge, which
 //! devmgr keeps and from which it derives the driver's copy
-//! (`virtio_core::bootstrap::SLOT_DMA`). The thread serves `DMA_MAP` and
+//! (`driver_binding::resources::SLOT_DMA`). The thread serves `DMA_MAP` and
 //! `DMA_UNMAP` (`ipc::devmgr_dma_labels`) on its own, at the boot drivers'
 //! level (`BOOT_DRIVER_PRIORITY`, above devmgr's), so a driver's mapping never
 //! waits for the registry loop: that loop makes nested calls (a
@@ -300,6 +300,9 @@ fn serve(ep: u64, shared: &Shared)
         return;
     }
     let mut guard = RecvGuard::new(crate::recv_diag);
+    // infinite_loop: the thread returns early when it has no IPC buffer, so
+    // `serve` cannot be `-> !`; the receive loop itself never ends.
+    #[expect(clippy::infinite_loop)]
     loop
     {
         // SAFETY: ipc_buf is this thread's registered IPC buffer.

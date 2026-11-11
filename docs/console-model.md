@@ -85,11 +85,14 @@ direct console paths remain as fallbacks for the life of the system.
    restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
    targets; the log senders are uninterrupted across the restart and need no re-derivation of
    their `log_send_cap`. A restarted logd re-resolves the serial driver via `QUERY_SERIAL_DEVICE`
-   and resumes serial-mediated output. While logd is down, a sender's `STREAM_BYTES` queues at
-   the kernel endpoint until the restarted logd drains it; the kernel panic console remains the
-   guaranteed output path for any fault in that window. Today svcmgr's death handler blocks on
-   its own `log!` calls to the master-log endpoint before it respawns logd, so the restart never
-   happens, and procmgr rejects a restarted logd's `REGISTER_DEATH_EQ` (first-wins), per
+   and resumes serial-mediated output. While logd is down, a sender's `STREAM_BYTES` call waits
+   at the kernel endpoint for at most its bound (`LOG_CALL_TIMEOUT_MS`, then
+   `LOG_CALL_UNANSWERED_TIMEOUT_MS` once one of the process's calls has gone unanswered, per
+   [shared/log](../shared/log/README.md)), and a line no logd takes within it is dropped; the
+   kernel panic console remains the guaranteed output path for any fault in that window. Today
+   svcmgr's death handler makes its own `log!` calls to the master-log endpoint before it
+   respawns logd, so the respawn is delayed by those bounds, not prevented, and procmgr rejects
+   a restarted logd's `REGISTER_DEATH_EQ` (first-wins), per
    [svcmgr restart protocol](../services/svcmgr/docs/restart-protocol.md) § Supervision
    hierarchy.
 

@@ -45,6 +45,7 @@ pub mod fs_ipc;
 pub mod fs_opens;
 pub mod fs_std;
 pub mod layout;
+pub mod log_client;
 pub mod memmgr;
 pub mod namespace;
 pub mod pager;
@@ -96,6 +97,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(pwrmgr::deny_only());
     out.extend_from_slice(svcmgr::phases());
     out.extend_from_slice(timed::phases());
+    out.extend_from_slice(log_client::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(vfsd::phases());
     out.extend_from_slice(procmgr::init_reap());

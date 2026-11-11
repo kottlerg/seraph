@@ -422,6 +422,15 @@ pub struct PerCpuScheduler
     /// atomic only so a shared reference can reach it.
     idle_pull_candidate: AtomicUsize,
 
+    /// Where this CPU's idle pull starts its scan of the other CPUs: the CPU
+    /// after the last one whose confirmed backlog its pull found nothing it
+    /// could take on (pinned threads only, or none fully saved), so the next
+    /// backlog it records is another CPU's
+    /// (core/kernel/docs/scheduler.md § Load Balancing). Written and read only
+    /// by this CPU's `timer_tick`, so Relaxed suffices; atomic only so a shared
+    /// reference can reach it.
+    idle_pull_cursor: AtomicUsize,
+
     /// Interrupt-flag word saved by [`lock_saving_flags`](Self::lock_saving_flags)
     /// while this CPU's lock is held as part of an all-CPU-locks operation
     /// (`commit_state_under_all_locks`, `relocate_ready_priority`'s walk
@@ -468,6 +477,7 @@ impl PerCpuScheduler
             lock: crate::sync::Spinlock::new(),
             load: AtomicU32::new(0),
             idle_pull_candidate: AtomicUsize::new(NO_IDLE_PULL_CANDIDATE),
+            idle_pull_cursor: AtomicUsize::new(0),
             saved_lock_flags: AtomicU64::new(0),
             deferred_reclaim_head: AtomicPtr::new(core::ptr::null_mut()),
         }
@@ -531,7 +541,7 @@ impl PerCpuScheduler
         let p = priority as usize;
         let q = queue_index(priority);
         // Debug: detect use-after-free via magic cookie.
-        // SAFETY: tcb is guaranteed valid by the caller; magic and thread_id are always readable.
+        // tcb is guaranteed valid by the caller; magic and thread_id are always readable.
         // undocumented_unsafe_blocks: the unsafe blocks sit inside `debug_assert!`
         // arguments, where no per-block SAFETY comment can be placed; the comment
         // above covers both.
@@ -662,7 +672,7 @@ impl PerCpuScheduler
             return self.idle();
         };
         // Debug: detect use-after-free via magic cookie.
-        // SAFETY: tcb is from the run queue; magic field is always readable on valid TCB.
+        // tcb is from the run queue; magic field is always readable on valid TCB.
         // undocumented_unsafe_blocks: the unsafe block sits inside a `debug_assert!`
         // argument, where no per-block SAFETY comment can be placed.
         #[allow(clippy::undocumented_unsafe_blocks)]
@@ -950,6 +960,22 @@ impl PerCpuScheduler
             self.idle_pull_candidate
                 .store(NO_IDLE_PULL_CANDIDATE, Ordering::Relaxed);
         }
+    }
+
+    /// Where this CPU's idle pull starts its scan (see the `idle_pull_cursor`
+    /// field).
+    #[cfg(not(test))]
+    pub fn idle_pull_cursor(&self) -> usize
+    {
+        self.idle_pull_cursor.load(Ordering::Relaxed)
+    }
+
+    /// Record `cpu` as where this CPU's idle pull starts its next scan. Called
+    /// only by this CPU's `timer_tick`.
+    #[cfg(not(test))]
+    pub fn set_idle_pull_cursor(&self, cpu: usize)
+    {
+        self.idle_pull_cursor.store(cpu, Ordering::Relaxed);
     }
 
     // Test stubs for host-side unit tests

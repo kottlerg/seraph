@@ -8,7 +8,9 @@ the first page of its BAR 0, which holds every register, to this driver, and dri
 contract whichever IOMMU sits behind it
 ([docs/device-management.md](../../../../docs/device-management.md#iommu-discovery-and-programming)
 § IOMMU Discovery and Programming). It is riscv64 only, and ships as a boot module, since it must
-confine the root disk before the disk's driver maps a ring. The bootstrap, the request checks, and
+confine the root disk before the disk's driver maps a ring; it carries a declaration in the ELF
+note section `.note.seraph.driver` (IOMMU family `rimt`) that no device record devmgr builds
+matches yet, so devmgr starts it on its fixed path. The bootstrap, the request checks, and
 the fault queue are [`iommu-core`](../core/README.md)'s, and the table pages
 [`iommu-store`](../store/README.md)'s; this crate is the RISC-V IOMMU `Backend`.
 

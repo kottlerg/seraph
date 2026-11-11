@@ -30,6 +30,24 @@ const STATUS_B_BINARY: u8 = 0x04;
 const STATUS_B_24H: u8 = 0x02;
 const HOUR_PM_BIT: u8 = 0x80;
 
+// ── Declaration ────────────────────────────────────────────────────────────
+
+// What devmgr binds this driver to and how it starts it
+// (docs/driver-binding.md § Driver Declarations). devmgr reads it but starts
+// this driver on its fixed path until platform device records carry the key
+// it matches (docs/driver-binding.md § Status).
+driver_binding::driver_declaration!(driver_binding::decl::Declaration {
+    name: "cmos-rtc",
+    class: Some("rtc"),
+    matches: &[driver_binding::decl::Match::AcpiHid("PNP0B00")],
+    instance_limit: Some(1),
+    interrupt: driver_binding::decl::Interrupt::NONE,
+    dma: false,
+    phys_access: false,
+    reset: driver_binding::decl::Reset::None,
+    tier: driver_binding::decl::Tier::Auxiliary,
+});
+
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 
 struct BootCaps

@@ -167,7 +167,8 @@ pub struct SleepExpiry
     pub ipc_state: IpcThreadState,
     /// The popped park's binding: the source it is parked on, or null.
     pub blocked_on: *mut u8,
-    /// `park_seq` of the popped park: a timed-wait claim requires it unchanged.
+    /// `park_seq` of the popped park: a timed-wait claim requires it unchanged,
+    /// or, for a timed call, in the same [`call_episode`].
     pub park_seq: u32,
 }
 
@@ -343,6 +344,23 @@ pub const PARK_DISPOSITION_REPLY: u8 = 1;
 /// won against the park commit); the resume returns `Interrupted` and must
 /// not read the wake deposit (`ipc_msg`/`wakeup_value`/`timed_out`).
 pub const PARK_DISPOSITION_INTERRUPTED: u8 = 2;
+
+/// The park's timeout expired: the sleep-list timer claimed it through
+/// `syscall::thread::cancel_for_timeout`. Stamped only for the endpoint and
+/// wait-set parks (`SYS_IPC_CALL`, `SYS_IPC_RECV`, `SYS_WAIT_SET_WAIT`); the
+/// resume returns `WouldBlock` and must not read the wake deposit.
+pub const PARK_DISPOSITION_TIMED_OUT: u8 = 3;
+
+/// The call episode a `park_seq` value belongs to. A park commit
+/// (`commit_blocked_under_local_lock`) advances `park_seq` to the next even
+/// value and a reply rebind (`commit_reply_rebind_under_local_lock`) sets its
+/// low bit, so the two parks of one `SYS_IPC_CALL` (send queue, then reply)
+/// share an episode while every other commit starts a new one.
+#[inline]
+pub const fn call_episode(park_seq: u32) -> u32
+{
+    park_seq >> 1
+}
 
 /// Stamp `tcb`'s current park episode with `disposition`.
 ///
@@ -530,7 +548,56 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
         disposition != PARK_DISPOSITION_REPLY,
         "non-call park resume with REPLY disposition",
     );
+    // TIMED_OUT is stamped only on the parks that resume through
+    // consume_park_cancel.
+    debug_assert!(
+        disposition != PARK_DISPOSITION_TIMED_OUT,
+        "park resume with TIMED_OUT disposition outside consume_park_cancel",
+    );
     disposition == PARK_DISPOSITION_INTERRUPTED
+}
+
+/// How a non-call park that the sleep-list timer may cancel ended, read on
+/// resume by [`consume_park_cancel`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ParkCancel
+{
+    /// A genuine wake, or a refused park whose coalesced deposit stands: the
+    /// caller reads the deposit (fail-open, as [`consume_park_interrupted`]).
+    None,
+    /// A cancellation claim stamped [`PARK_DISPOSITION_INTERRUPTED`].
+    Interrupted,
+    /// The timer claim stamped [`PARK_DISPOSITION_TIMED_OUT`].
+    TimedOut,
+}
+
+/// [`consume_park_interrupted`] for the non-call parks whose timeout the
+/// timer claims as a cancel (`SYS_IPC_RECV`, `SYS_WAIT_SET_WAIT`): it also
+/// reports a [`PARK_DISPOSITION_TIMED_OUT`] stamp. The Acquire pairs with the
+/// stamp's Release.
+///
+/// # Safety
+/// `tcb` must be the current thread's valid TCB, resuming from a non-call
+/// park.
+#[inline]
+pub unsafe fn consume_park_cancel(tcb: *mut ThreadControlBlock) -> ParkCancel
+{
+    // SAFETY: tcb valid per caller contract.
+    let disposition = unsafe {
+        (*tcb)
+            .park_disposition
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
+    debug_assert!(
+        disposition != PARK_DISPOSITION_REPLY,
+        "non-call park resume with REPLY disposition",
+    );
+    match disposition
+    {
+        PARK_DISPOSITION_INTERRUPTED => ParkCancel::Interrupted,
+        PARK_DISPOSITION_TIMED_OUT => ParkCancel::TimedOut,
+        _ => ParkCancel::None,
+    }
 }
 
 // ── ThreadControlBlock ────────────────────────────────────────────────────────
@@ -645,8 +712,10 @@ pub struct ThreadControlBlock
     pub park_started_tick: u64,
 
     /// Park-binding generation: advanced under [`sched_lock`](Self::sched_lock)
-    /// by every commit that publishes a new `Blocked` binding
-    /// (`commit_blocked_under_local_lock`, `commit_reply_rebind_under_local_lock`).
+    /// by every commit that publishes a new `Blocked` binding: a park commit
+    /// (`commit_blocked_under_local_lock`) to the next even value, a reply
+    /// rebind (`commit_reply_rebind_under_local_lock`) by setting the low bit,
+    /// so [`call_episode`] names the one `SYS_IPC_CALL` both parks belong to.
     /// A stop or teardown snapshots it with `state`, cancels the park it saw,
     /// and commits only if it is unchanged, so it never writes `Stopped` or
     /// `Exited` over a live park: one it did not cancel was already claimed by
@@ -740,7 +809,9 @@ pub struct ThreadControlBlock
     /// Bound fault-handler endpoint object per fault class (`null` = none).
     /// Kernel-unresolvable faults of a class on this thread are delivered to
     /// that class's endpoint's receiver; with no handler bound for its class a
-    /// fault is terminal. Stored as the `EndpointObject`
+    /// fault takes its unhandled outcome (the thread is killed, or a
+    /// restartable syscall's copy fails with `InvalidAddress`), and an upcall
+    /// is not posted or is dropped. Stored as the `EndpointObject`
     /// (not the bare `EndpointState`) so the binding can hold an `inc_ref` on
     /// the object for its lifetime — closing the liveness gap where a
     /// fault-blocked thread (queued on neither the endpoint's send nor receive

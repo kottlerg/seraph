@@ -150,14 +150,17 @@ The full driver lifecycle is specified in
   settles). See [docs/capability-model.md](../../docs/capability-model.md) for
   capability types and rights.
 - **Spawning** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
-  discovers devices (PCI enumeration, firmware tables), matches them to driver
-  binaries, and requests procmgr to create driver processes. devmgr then delegates
-  per-device capabilities to the new process.
+  discovers devices (PCI enumeration, firmware tables), matches each PCI device to the most
+  specific driver declaration (every driver binary but the test-only `test-fault` and
+  `test-orphan` fixtures carries one in the ELF note section `.note.seraph.driver`, emitted by
+  `driver_binding::driver_declaration!`; see
+  [docs/driver-binding.md](../../docs/driver-binding.md)), and requests procmgr to create driver
+  processes. devmgr then delegates per-device capabilities to the new process.
 - **Communication** — drivers expose IPC endpoints for their clients (e.g. a
   block driver exposes a read/write endpoint consumed by filesystem drivers via
   vfsd; see [docs/storage.md](../../docs/storage.md)). See
   [docs/ipc-design.md](../../docs/ipc-design.md) for IPC semantics.
-- **DMA** — devmgr gives each DMA-capable (PCI BAR + IRQ) driver a DMA
+- **DMA** — devmgr gives each DMA-capable driver a DMA
   capability, a SEND badged with its device on devmgr's DMA endpoint. The driver
   maps every buffer its device reaches through it (`DMA_MAP`) and programs the
   device only with the device addresses it returns, never with a physical

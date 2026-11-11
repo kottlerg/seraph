@@ -293,7 +293,8 @@ pub enum SyscallError
 
 ### `SYS_IPC_CALL` (0)
 
-Send a message to an endpoint and block until a reply is received.
+Send a message to an endpoint and block until a reply is received, or until an optional
+timeout elapses.
 
 **Arguments:**
 
@@ -301,9 +302,16 @@ Send a message to an endpoint and block until a reply is received.
 |---|---|---|
 | 0 | `endpoint_cap` | Send capability to an IPC endpoint |
 | 1 | `label` | Message label (opaque word; passed to server as-is) |
-| 2 | `data_count` | Number of data words (0–MSG_DATA_WORDS_MAX) |
+| 2 | `data_count`, `timeout_ms` | Bits 0–31: number of data words (0–MSG_DATA_WORDS_MAX). Bits 32–63: `timeout_ms`, `0` = no timeout (`syscall_abi::ipc_call_count_arg` packs both) |
 | 3 | `cap_count` | Number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) |
 | 4, 5 | (unused) | Ignored |
+
+**Timeout:** A non-zero `timeout_ms` bounds the whole call, its wait for a receiver and its
+wait for the reply, at timer-tick granularity. On expiry the call returns `WouldBlock`: a
+caller still queued leaves the endpoint's send queue, and a caller already received loses its
+reply binding, so the server's later `SYS_IPC_REPLY` finds no pending caller and returns
+`InvalidCapability`. The request may therefore have been received, and acted on, when the call
+times out. The field has no try-once value: every non-zero value is a bound in milliseconds.
 
 **Capability handles:** When `cap_count` > 0, the kernel reads the `cap_count`
 **full** cap handles (slot index plus per-slot generation, one `u64` per word) from
@@ -339,7 +347,8 @@ or `cap_count` above its maximum is clamped, not refused),
 slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
 transfer), `QuotaExceeded` (a cap's object has its reference count at its 2^31 ceiling),
 `Interrupted` (the call was cancelled while blocked, including by the receiving thread
-receiving again before it replied; see `SYS_IPC_RECV`). Cap-slot
+receiving again before it replied; see `SYS_IPC_RECV`), `WouldBlock` (the timeout elapsed
+before the reply). Cap-slot
 problems are rejected before the caller blocks; a refusal that arises only
 afterwards degrades to delivery with zero caps (the caller keeps its
 capabilities; see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
@@ -417,13 +426,20 @@ rather than failing the reply (see
 
 ### `SYS_IPC_RECV` (2)
 
-Wait for a call on an endpoint. Blocks until a caller arrives.
+Wait for a call on an endpoint, with an optional bounded wait.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `endpoint_cap` | Receive capability to an IPC endpoint |
+| 1 | `timeout_ms` | Wait policy: the sentinels of `SYS_EVENT_RECV` (below) |
+
+| Value | Behaviour |
+|---|---|
+| `0` | Block until a caller arrives |
+| `u64::MAX` (`WAIT_TRY_ONCE`) | Non-blocking try-once: take a queued caller, or return `WouldBlock` at once |
+| `1 ..= MAX-1` | Block until a caller arrives or `timeout_ms` ms elapse, then return `WouldBlock` (at timer-tick granularity) |
 
 **Return:**
 
@@ -437,7 +453,10 @@ cap-transfer result block (count, then the delivered destination handles) at wor
 `MSG_DATA_WORDS_MAX`. The kernel binds the caller to the receiving thread as its reply capability
 (the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive
 that passes its capability check and cap-slot pre-allocation while a reply is still pending first
-releases the pending caller (a receive refused before then leaves the binding): its
+releases the pending caller (a receive refused before then leaves the binding, and so does a
+try-once that finds no caller, which therefore leaves the reply owed; a try-once that finds one
+releases the pending caller as it binds the new one, and a bounded receive releases it before it
+waits, whether or not the wait then times out): its
 `SYS_IPC_CALL` returns `Interrupted`, a fault-blocked caller is killed as for any cancelled
 fault episode (for the fault of a restartable syscall's user copy, that syscall fails with
 `InvalidAddress`), and a caller blocked in an upcall delivery has its upcall dropped and resumes
@@ -462,7 +481,8 @@ receive reserve that general allocations leave free
 ([capability-internals.md](capability-internals.md) § IPC Receive Reserve), so only received
 caps that have spent the reserve fail a receive
 (see [ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy),
-`Interrupted`. If an already-queued sender's cap transfer is refused (a source slot went stale
+`Interrupted`, `WouldBlock` (a try-once found no caller, or a bounded wait elapsed). If an
+already-queued sender's cap transfer is refused (a source slot went stale
 or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, a
 cap's object has its reference count at its 2^31 ceiling, or the server's CSpace cannot supply the
 destination slots, which the pre-park grow makes unlikely but does not reserve), the message is
@@ -505,7 +525,13 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 | # | Name | Description |
 |---|---|---|
 | 0 | `notification_cap` | Notification capability with Wait rights |
-| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = return with a zero bitmask once `timeout_ms` ms have elapsed (at timer-tick granularity; the kernel's sleep list has no capacity to refuse the wait, [thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4) |
+| 1 | `timeout_ms` | Wait policy: see sentinels below |
+
+| Value | Behaviour |
+|---|---|
+| `0` | Block until a bit is set |
+| `u64::MAX` (`WAIT_TRY_ONCE`) | Non-blocking try-once: return the pending bits, clearing them, or `WouldBlock` at once when none are set; the caller joins neither the notification's wait queue nor the sleep list |
+| `1 ..= MAX-1` | Block until a bit is set, or return a zero bitmask once `timeout_ms` ms have elapsed (at timer-tick granularity; the kernel's sleep list has no capacity to refuse the wait, [thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4) |
 
 **Return:**
 
@@ -521,7 +547,9 @@ full 64-bit bitmask range is usable.
 **Capability requirement:** `notification_cap` must have Wait rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted` (the caller was stopped or
-interrupted by an upcall, or the notification was destroyed while the caller waited).
+interrupted by an upcall, or the notification was destroyed while the caller waited),
+`WouldBlock` (a try-once found no bit set; an elapsed bounded wait returns a zero bitmask
+instead).
 
 Several threads may wait on one notification. They queue in arrival order, and each delivery wakes
 the longest-waiting one with every pending bit. A wait that enters while bits are pending takes
@@ -562,8 +590,9 @@ Dequeue the next entry from an event queue with optional bounded wait.
 | 0 | `queue_cap`  | Event queue capability with Recv rights                 |
 | 1 | `timeout_ms` | Wait policy: see sentinels below                        |
 
-`timeout_ms` sentinels (`0` matches `SYS_NOTIFICATION_WAIT`; the `u64::MAX` try-once mode
-is specific to `SYS_EVENT_RECV`):
+`timeout_ms` sentinels, shared by `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, and
+`SYS_WAIT_SET_WAIT` (`u64::MAX` is `syscall_abi::WAIT_TRY_ONCE`; an elapsed
+`SYS_NOTIFICATION_WAIT` returns a zero bitmask rather than `WouldBlock`):
 
 | Value             | Behaviour                                                       |
 |-------------------|-----------------------------------------------------------------|
@@ -1454,7 +1483,8 @@ Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it 
 or, with `THREAD_START_SUSPENDED`, a configured `Created` thread to `Stopped`.
 Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
 handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` of a delivery other
-than a virtual-memory one, or of one with no exception handler bound), kills it as an unhandled
+than a virtual-memory one, of one with no exception handler bound, or of the fault of a
+restartable syscall's user copy), kills it as an unhandled
 fault, which posts its death and address-space observers, or, for the fault of a restartable
 syscall's user copy, fails that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
@@ -1525,8 +1555,10 @@ with a kill outcome (no syscall returns) and the thread is left `Stopped`; the n
 `SYS_THREAD_START` then kills it as an unhandled fault (for the fault of a restartable syscall's
 user copy, fails that syscall with `InvalidAddress`). A thread whose handler's reply claimed the
 fault first keeps that reply's outcome: when next started it resumes its faulting instruction on
-`FAULT_REPLY_RESUME`, takes the unhandled outcome on `FAULT_REPLY_KILL`, and delivers the fault
-through its exception class on a forwarding `FAULT_REPLY_FORWARD` (see
+`FAULT_REPLY_RESUME`, takes the unhandled outcome on `FAULT_REPLY_KILL`, and on
+`FAULT_REPLY_FORWARD` delivers the fault through its exception class when the reply answered the
+virtual-memory class's delivery of a fault other than a kernel copy's and an exception handler is
+bound, and otherwise takes the unhandled outcome (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). A target blocked in an upcall delivery (`FAULT_KIND_UPCALL`) is killed in
 neither case: a stop that cancels the delivery drops the upcall, any reply that claimed it first
@@ -1535,13 +1567,17 @@ syscall point, its syscall returns its own result;
 [docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
 Upcalls). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
 cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker
-or the sleep timer claimed it first).
+or the elapsed deadline of a sleep or a timed wait claimed it first).
 A target that blocks while the stop is in progress is cancelled the same way, never left registered
 as a waiter (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop`
 Cross-CPU Stop Protocol). A target waiting on an endpoint (queued to send or receive), a
 notification, an event queue, or a wait set whose last capability is deleted concurrently is
 claimed either by the stop or by the object's teardown, and both stamp the same cancellation: on
-restart its syscall returns `Interrupted`, or a queued fault sender is killed. A thread running on
+restart its syscall returns `Interrupted`, or a queued fault sender is killed (a restartable
+syscall's copy fault fails that syscall with `InvalidAddress`, and a queued upcall delivery has its
+upcall dropped and resumes;
+[docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
+Upcalls). A thread running on
 another CPU is marked `Stopped` under every CPU's scheduler lock, and the call returns once that
 CPU has descheduled it and published its register save, at its next slice expiry, at a tick
 that preempts it for an RT thread (a target dispatched at a fair level), or at the thread's own
@@ -1956,7 +1992,9 @@ its address space's teardown has begun, or a read-only page's frame is mapped mo
 Bind (or clear) the per-thread fault-handler endpoint for the fault classes a mask selects. A
 kernel-unresolvable fault on the target thread is delivered as a synchronous, kernel-originated
 IPC to the receiver of its class's endpoint, suspending the thread until the handler replies; with
-no handler bound for its class the fault is terminal. See
+no handler bound for its class the fault takes its unhandled outcome: the thread is killed, or a
+restartable syscall's copy fails with `InvalidAddress`
+([Restartable Syscalls](#restartable-syscalls)), and an upcall is not posted or is dropped. See
 [`docs/fault-handling.md`](../../../docs/fault-handling.md).
 
 **Arguments:**
@@ -2255,13 +2293,20 @@ Remove a previously added source from a wait set.
 
 ### `SYS_WAIT_SET_WAIT` (28)
 
-Block until any member of the wait set becomes ready.
+Block until any member of the wait set becomes ready, with an optional bounded wait.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `wait_set_cap` | Wait set capability (Wait rights) |
+| 1 | `timeout_ms` | Wait policy: the sentinels of `SYS_EVENT_RECV` |
+
+| Value | Behaviour |
+|---|---|
+| `0` | Block until a member is ready |
+| `u64::MAX` (`WAIT_TRY_ONCE`) | Non-blocking try-once: return a ready member's badge, or `WouldBlock` at once |
+| `1 ..= MAX-1` | Block until a member is ready or `timeout_ms` ms elapse, then return `WouldBlock` (at timer-tick granularity; a badge is any `u64`, so no in-band value marks the expiry) |
 
 **Return:**
 
@@ -2298,7 +2343,7 @@ Readiness Model, P2).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `Interrupted` (the
 caller was stopped or interrupted by an upcall, or the wait set was destroyed while the caller
-waited).
+waited), `WouldBlock` (a try-once found no member ready, or a bounded wait elapsed).
 
 ---
 
@@ -3033,7 +3078,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
   `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
   or is posted an upcall it does not mask (`SYS_THREAD_POST_UPCALL`), unless its wake (a delivery,
-  or a sleep's elapsed deadline) was claimed first. `SYS_IPC_CALL` and
+  or the elapsed deadline of a sleep or a timed wait) was claimed first. `SYS_IPC_CALL` and
   `SYS_IPC_RECV` queued on an endpoint, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
   `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
   caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or
@@ -3048,6 +3093,8 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 |---|---|---|
 | `MSG_DATA_WORDS_MAX` | 64 | Maximum data words per message |
 | `MSG_CAP_SLOTS_MAX` | 4 | Maximum capabilities per message |
+| `WAIT_TRY_ONCE` | `u64::MAX` | The `timeout_ms` that makes `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, or `SYS_WAIT_SET_WAIT` a non-blocking try-once |
+| `IPC_CALL_TIMEOUT_SHIFT` | 32 | Bit position of `SYS_IPC_CALL`'s `timeout_ms` in its arg 2, above `data_count` |
 | `CSPACE_IPC_RECV_RESERVE` | 4 | Free slots every CSpace keeps back from general allocations for IPC capability transfer (§ Error Codes) |
 | `CSPACE_SLOTS_PER_PAGE` | 56 | Capability slots one donated CSpace slot page backs |
 | `CSPACE_BODIES_PER_PAGE` | 31 | Capability bodies one page of a CSpace's body arena holds |

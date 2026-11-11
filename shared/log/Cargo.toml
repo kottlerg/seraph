@@ -5,8 +5,9 @@ edition.workspace = true
 publish.workspace = true
 
 # no_std: wire-format helpers and the process-global log-cap cache behind
-# the std overlay's `seraph::log!` macro. Its only consumer is std, which
-# re-exports it so std-built services reach it through `std::os::seraph`.
+# the std overlay's `seraph::log!` macro. std re-exports it so std-built
+# services reach it through `std::os::seraph`; svctest also depends on it
+# directly, to drive the wire helpers against an endpoint of its own.
 [lib]
 doctest = false
 

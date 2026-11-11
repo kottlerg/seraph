@@ -303,8 +303,8 @@ pub mod procmgr_labels
     #[must_use]
     pub const fn create_sched_bits(priority: u8, band_max: u8) -> u64
     {
-        ((priority as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_PRIORITY_SHIFT
-            | ((band_max as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_BAND_MAX_SHIFT
+        (((priority as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_PRIORITY_SHIFT)
+            | (((band_max as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_BAND_MAX_SHIFT)
     }
 
     /// Release the held memory reclaim of a child created with
@@ -1441,7 +1441,7 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// **Acquisition path**: the RTC driver binary lives on the rootfs disk
 /// at `/services/drivers/<chip>` and is loaded by devmgr from there.
 /// svcmgr walks its system root to `/services/drivers/` and hands devmgr a
-/// `LOOKUP | READ`-attenuated subtree cap via
+/// `LOOKUP | READ | READDIR`-attenuated subtree cap via
 /// [`devmgr_labels::SET_DRIVERS_DIR`]. Devmgr replies SUCCESS to that
 /// handshake *before* doing any spawn work (so svcmgr never blocks on
 /// driver bring-up); it then walks the per-arch driver name
@@ -1907,7 +1907,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 15;
+pub const DEVMGR_LABELS_VERSION: u32 = 16;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -2005,14 +2005,16 @@ pub mod devmgr_labels
     /// `GET_WALL_TIME` thereafter.
     pub const QUERY_RTC_DEVICE: u64 = 5;
     /// svcmgr-only handshake: install the
-    /// `LOOKUP | READ`-attenuated `/services/drivers/` namespace cap from
-    /// which devmgr walks its on-disk driver binaries.
+    /// `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` namespace
+    /// cap from which devmgr lists, reads the declarations of, and walks to
+    /// its on-disk driver binaries.
     ///
     /// Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = badged SEND on the
     /// `/services/drivers/` directory node, which svcmgr walks from its
     /// system root via `namespace_lookup_dir(root_dir_cap, …, LOOKUP |
-    /// READ)` (so the node is served by the root filesystem).
+    /// READ | READDIR)` (so the node is served by the root filesystem, and
+    /// devmgr can list it with `NS_READDIR`).
     /// Caller's badge MUST carry [`DRIVERS_DIR_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
     /// [`super::devmgr_errors::INVALID_REQUEST`] when `caps[0]` is
@@ -2021,11 +2023,13 @@ pub mod devmgr_labels
     ///
     /// Devmgr stashes the cap and replies
     /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
-    /// work, so svcmgr never blocks on driver bring-up. The actual walk,
-    /// the [`super::procmgr_labels::CREATE_FROM_FILE`] call, and the
-    /// bootstrap-round delivery for the on-disk drivers (the per-arch RTC,
-    /// virtio-input, and virtio-console; #165 will generalize), and the settle that waits
-    /// for each of them to report ready ([`DRIVER_READY`]), run after the
+    /// work, so svcmgr never blocks on driver bring-up. The spawn of the
+    /// per-arch RTC driver, the drivers-directory pass (the listing, the
+    /// read of each entry's driver declaration, and the bind of every PCI
+    /// device still unbound that a declaration matches), the
+    /// [`super::procmgr_labels::CREATE_FROM_FILE`] calls and bootstrap
+    /// rounds they make, and the settle that waits for each driver to
+    /// report ready ([`DRIVER_READY`]), run after the
     /// reply but before devmgr returns to its next `ipc_recv`. The nested
     /// IPC chain the spawn requires (procmgr → vfsd → block driver) cannot
     /// run inside a request-handler frame without clobbering the
@@ -2224,33 +2228,21 @@ pub mod devmgr_labels
     /// one fault batch spawns, which devmgr's driver death queue reserves
     /// room for.
     pub const TEST_FAULT_DRIVERS: usize = 3;
-    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    /// label: bind the DMA test device (QEMU's `edu`, PCI `1234:11e8`) to
-    /// the `test-dma` fixture driver from `/services/drivers/` in a settle
-    /// batch of its own: devmgr attaches the device to its IOMMU domain where
-    /// an IOMMU confines it, grants it DMA, turns on its memory decode and
-    /// bus mastering, and spawns the driver, which reports ready once it has
-    /// found the device. The handler replies before it binds (the bind does
-    /// nested `ipc_call`s), and the driver is then queried with
-    /// [`TEST_QUERY_DMA_DEVICE`], which waits in the registry queue until the
-    /// settle has ended. Reply: `SUCCESS` with `data[0]` =
+    /// TODO(#165): remove with the test labels. Test-only label: mint a
+    /// `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the service endpoint
+    /// of the served `test-dma` fixture, the driver devmgr binds to the DMA
+    /// test device (QEMU's `edu`, PCI `1234:11e8`) at [`SET_DRIVERS_DIR`]
+    /// by its declaration, like any driver (the fixture checks no badge).
+    /// devmgr serves it once that settle batch ends; until then the query
+    /// replies `NO_DEVICE`, as it does on a machine with no such device.
+    /// Reply: `SUCCESS` with the cap in `caps[0]` and `data[0]` =
     /// [`TEST_DMA_CONFINED`] when an IOMMU confines the device or
-    /// [`TEST_DMA_UNCONFINED`] when none does; `NO_DEVICE` when the machine
-    /// has no such device; `INVALID_REQUEST` for a repeated request (at most
-    /// once per boot) or one before [`SET_DRIVERS_DIR`]. Request: `data[0]` =
-    /// caller's compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
-    /// [`TEST_SPAWN_ORPHAN`].
-    pub const TEST_SPAWN_DMA_DRIVER: u64 = 16;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Test-only label:
-    /// mint a `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the served
-    /// `test-dma` driver's service endpoint (the driver checks no badge).
-    /// Reply: `SUCCESS` with the cap in `caps[0]`; `WITHDRAWN` once the
-    /// driver is withdrawn; `NO_DEVICE` when none is served;
-    /// `INVALID_REQUEST` for a failed derive. Request: `data[0]` = caller's
-    /// compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
-    /// [`TEST_SPAWN_ORPHAN`].
+    /// [`TEST_DMA_UNCONFINED`] when none does; `WITHDRAWN` once the fixture
+    /// is withdrawn; `NO_DEVICE` when none is served; `INVALID_REQUEST` for a
+    /// failed derive. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
     pub const TEST_QUERY_DMA_DEVICE: u64 = 17;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Test-only label:
+    /// TODO(#165): remove with the test labels. Test-only label:
     /// the IOMMU faults devmgr has taken for the DMA test device, after it
     /// takes the IOMMU driver's pending ones (`iommu_labels::TAKE_FAULTS`)
     /// and logs them. Reply: `SUCCESS` with `data[0]` = the faults taken for
@@ -2259,10 +2251,10 @@ pub mod devmgr_labels
     /// Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
     pub const TEST_DMA_FAULTS: u64 = 18;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Its reply word: an
+    /// TODO(#165): remove with [`TEST_QUERY_DMA_DEVICE`]. Its reply word: an
     /// IOMMU confines the DMA test device.
     pub const TEST_DMA_CONFINED: u64 = 1;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Its reply word: no
+    /// TODO(#165): remove with [`TEST_QUERY_DMA_DEVICE`]. Its reply word: no
     /// IOMMU confines the DMA test device, so its device addresses are
     /// physical.
     pub const TEST_DMA_UNCONFINED: u64 = 2;
@@ -2270,10 +2262,10 @@ pub mod devmgr_labels
     /// Driver-only: report that the driver has set its device up and is
     /// entering its service loop, so devmgr may serve its endpoint.
     ///
-    /// Sent by every driver devmgr spawns (the `VirtIO` PCI drivers
-    /// virtio-blk, virtio-input, and virtio-console, and the serial, framebuffer, and RTC
-    /// drivers) on its round-2 devmgr query cap, a SEND badged with its
-    /// device badge on the private driver endpoint of its spawn batch; the
+    /// Sent by every driver devmgr spawns (a driver bound to a PCI device by
+    /// its declaration, and the serial, framebuffer, and RTC drivers) on its
+    /// devmgr query cap, a SEND badged with its device badge on the private
+    /// driver endpoint of its spawn batch; the
     /// registry endpoint replies `UNKNOWN_OPCODE` to it. Request: `data[0]` =
     /// caller's compiled [`super::DEVMGR_LABELS_VERSION`]. Reply: `SUCCESS`
     /// when the badge names a driver of the batch that has not died (a
@@ -2313,8 +2305,8 @@ pub mod devmgr_labels
     /// TODO(#165): remove with the test labels. Authority bit gating
     /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`],
     /// [`TEST_QUERY_DENY_DEVICE`], [`TEST_SPAWN_FAULT_DRIVERS`],
-    /// [`TEST_QUERY_FAULT_DEVICE`], [`TEST_SPAWN_DMA_DRIVER`],
-    /// [`TEST_QUERY_DMA_DEVICE`], and [`TEST_DMA_FAULTS`]. svcmgr mints it,
+    /// [`TEST_QUERY_FAULT_DEVICE`], [`TEST_QUERY_DMA_DEVICE`], and
+    /// [`TEST_DMA_FAULTS`]. svcmgr mints it,
     /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
@@ -2366,7 +2358,7 @@ pub mod test_fault_labels
     pub const FAULT_EXIT_DELAY_MS: u64 = 200;
 }
 
-/// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_DMA_DRIVER`. The
+/// TODO(#165): remove with `devmgr_labels::TEST_QUERY_DMA_DEVICE`. The
 /// `test-dma` fixture driver's service label.
 ///
 /// The fixture drives QEMU's `edu` device, whose DMA engine copies between
@@ -2411,7 +2403,7 @@ pub enum ReadyError
 }
 
 /// Report a driver's device set up to devmgr: [`devmgr_labels::DRIVER_READY`]
-/// on `devmgr_ep`, the driver's round-2 devmgr query cap. A driver calls it
+/// on `devmgr_ep`, the devmgr query cap of the driver's bootstrap. A driver calls it
 /// immediately before its service loop, since devmgr serves the driver's
 /// endpoint only after the report. It logs nothing, so the serial and
 /// framebuffer drivers, which must not log, call it too.
@@ -4123,12 +4115,40 @@ impl IpcMessageBuilder
 #[inline]
 pub unsafe fn ipc_call(ep: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
+    // SAFETY: this fn's contract is ipc_call_timeout's.
+    unsafe { ipc_call_timeout(ep, msg, ipc_buf, 0) }
+}
+
+/// [`ipc_call`] bounded by `timeout_ms` milliseconds over the whole call: the
+/// wait for a receiver and the wait for its reply. `0` waits without bound,
+/// as [`ipc_call`] does.
+///
+/// # Safety
+/// As [`ipc_call`].
+///
+/// # Errors
+/// As [`ipc_call`], and `WouldBlock` when the timeout expired first. The
+/// request may then have been received: a server that replies after the
+/// expiry finds no pending caller.
+#[inline]
+pub unsafe fn ipc_call_timeout(
+    ep: u64,
+    msg: &IpcMessage,
+    ipc_buf: *mut u64,
+    timeout_ms: u32,
+) -> Result<IpcMessage, i64>
+{
     // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
     unsafe {
         msg.write_to_ipc_buf(ipc_buf);
     }
-    let (reply_label, reply_word_count) =
-        syscall::raw_ipc_call(ep, msg.label, msg.word_count(), msg.caps().len())?;
+    let (reply_label, reply_word_count) = syscall::raw_ipc_call_timeout(
+        ep,
+        msg.label,
+        msg.word_count(),
+        msg.caps().len(),
+        timeout_ms,
+    )?;
     // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote the
     // reply (data + cap metadata) into it before return. `reply_word_count`
     // is already clamped to MSG_DATA_WORDS_MAX by `raw_ipc_call`.
@@ -4171,11 +4191,49 @@ pub unsafe fn ipc_call(ep: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 #[inline]
 pub unsafe fn ipc_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
-    let (label, badge, word_count) = syscall::raw_ipc_recv(ep)?;
+    // SAFETY: this fn's contract is ipc_recv_timeout's.
+    unsafe { ipc_recv_timeout(ep, ipc_buf, 0) }
+}
+
+/// [`ipc_recv`] under `SYS_IPC_RECV`'s `timeout_ms` policy: `0` waits without
+/// bound (as [`ipc_recv`]), `u64::MAX` (`syscall::WAIT_TRY_ONCE`) never
+/// waits ([`ipc_try_recv`]), and any other value waits up to `timeout_ms`
+/// milliseconds. A try-once that finds no caller keeps a reply still pending
+/// from an earlier receive; one that finds a caller releases it as
+/// [`ipc_recv`] does.
+///
+/// # Safety
+/// As [`ipc_recv`].
+///
+/// # Errors
+/// As [`ipc_recv`], and `WouldBlock` on an empty try-once or an expiry.
+#[inline]
+pub unsafe fn ipc_recv_timeout(
+    ep: u64,
+    ipc_buf: *mut u64,
+    timeout_ms: u64,
+) -> Result<IpcMessage, i64>
+{
+    let (label, badge, word_count) = syscall::raw_ipc_recv_timeout(ep, timeout_ms)?;
     // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote data +
     // cap metadata there before return. `word_count` is already clamped to
-    // MSG_DATA_WORDS_MAX by `raw_ipc_recv`.
+    // MSG_DATA_WORDS_MAX by `raw_ipc_recv_timeout`.
     Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, label, badge, word_count) })
+}
+
+/// Receive a call already waiting on `ep` without blocking
+/// ([`ipc_recv_timeout`] with `syscall::WAIT_TRY_ONCE`).
+///
+/// # Safety
+/// As [`ipc_recv`].
+///
+/// # Errors
+/// As [`ipc_recv`], and `WouldBlock` when no caller is waiting.
+#[inline]
+pub unsafe fn ipc_try_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
+{
+    // SAFETY: this fn's contract is ipc_recv_timeout's.
+    unsafe { ipc_recv_timeout(ep, ipc_buf, syscall::WAIT_TRY_ONCE) }
 }
 
 /// Reply to the current thread's pending caller with `msg`.

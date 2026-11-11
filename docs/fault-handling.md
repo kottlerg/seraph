@@ -307,11 +307,13 @@ syscall point, past the `ecall` its reported pointer names.
   and leaves the thread `Stopped`; when next started, the fault is unhandled. A stop after the
   handler's reply claimed the fault leaves that reply's disposition: when next started, the thread
   resumes on a `FAULT_REPLY_RESUME` reply, the fault is unhandled on a `FAULT_REPLY_KILL` reply,
-  and on a `FAULT_REPLY_FORWARD` reply the fault is delivered through the exception class, as for
-  any forward ([Reply](#reply)). Destroying it while stopped ends it as for any stopped thread. A
-  cancelled fault-blocked thread is never resumed at its faulting instruction: a thread whose own
-  access faulted is killed (a stopped one when next started), and one whose kernel copy faulted has
-  that syscall fail.
+  and a `FAULT_REPLY_FORWARD` reply is acted on as at any forward ([Reply](#reply)): the fault is
+  delivered through the exception class when the reply answered the `FAULT_CLASS_VM` delivery of
+  a fault other than a kernel copy's and an exception handler is bound, and is otherwise
+  unhandled. Destroying it while stopped ends it as for any stopped thread. A cancelled
+  fault-blocked thread is never resumed at its faulting instruction: a thread whose own access
+  faulted is killed (a stopped one when next started), and one whose kernel copy faulted has that
+  syscall fail.
 - **Rebind (redelivery).** A change of the binding of the fault's class, by
   `SYS_THREAD_SET_FAULT_HANDLER` or `SYS_THREAD_INHERIT_FAULT_HANDLER` (an unbind, or a bind to
   another endpoint or with another badge), while a fault is in flight, before any reply or other
@@ -536,12 +538,13 @@ A post to a thread blocked in a syscall that can block cancels the block as a st
 wakes the thread. Those syscalls are listed in
 [syscalls.md § Atomicity and Preemption Guarantees](../core/kernel/docs/syscalls.md#atomicity-and-preemption-guarantees)
 (Blocking syscalls are interruptible).
-The syscall returns `Interrupted`, unless a genuine wake or a sleep's elapsed deadline claimed it
-first, and the upcall is delivered at that return. A blocking syscall that the thread enters with an
-upcall pending returns `Interrupted` at once instead of blocking. The kernel restarts nothing;
-whether to retry is the program's choice. For `SYS_IPC_CALL`, `Interrupted` does not mean that the
-request went undelivered: a server that already received the message finds no reply pending, so a
-program that retries a call may repeat its request, as after a stop.
+The syscall returns `Interrupted`, unless a genuine wake or the elapsed deadline of a sleep or a
+timed wait claimed it first, and the upcall is delivered at that return. A blocking syscall that
+the thread enters with an upcall pending returns `Interrupted` at once instead of blocking. The
+kernel restarts nothing; whether to retry is the program's choice. For `SYS_IPC_CALL`,
+`Interrupted` does not mean that the request went undelivered: a server that already received the
+message finds no reply pending, so a program that retries a call may repeat its request, as after
+a stop.
 
 A fault-blocked thread's fault, or an upcall delivery in progress, is never cancelled for an upcall:
 the upcall waits for it to resolve. The protocol that keeps a post from missing a thread that is
@@ -865,7 +868,9 @@ The default MUST exempt only the narrow set that cannot depend on the fault path
   demand fault could back it, so DMA-capable drivers must be eager-mapped. The creator opts a
   process out with `procmgr_labels::CREATE_PINNED` (see
   [services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md));
-  devmgr sets it for the DMA-capable driver class (PCI devices with BAR + IRQ). The exemption
+  devmgr sets it for every PCI-bound driver whose declaration declares DMA
+  ([driver-binding.md](driver-binding.md#driver-declarations) § Driver Declarations), and for
+  the IOMMU driver, whose units walk its table pages. The exemption
   is a creation-request flag, never a badge-range test.
 
 A userspace fault round-trip is costlier than a kernel-internal fill; this cost is accepted

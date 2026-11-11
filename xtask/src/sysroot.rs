@@ -181,16 +181,15 @@ fn synthesise_svctest_bench_bin(ctx: &BuildContext) -> Result<PathBuf>
     {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let mut buf = Vec::with_capacity(SVCTEST_BENCH_BIN_SIZE);
-    for i in 0..SVCTEST_BENCH_BIN_SIZE
-    {
-        #[allow(clippy::cast_possible_truncation)]
-        let b = (i & 0xFF) as u8;
-        buf.push(b);
-    }
-    fs::write(&dst, &buf).with_context(|| format!("writing {}", dst.display()))?;
+    fs::write(&dst, bench_bin_bytes()).with_context(|| format!("writing {}", dst.display()))?;
     step(&format!("Rootfs: {} (synthesised, 64 KiB)", dst.display()));
     Ok(dst)
+}
+
+/// The content of `bench.bin`: byte `i` is `i` modulo 256.
+fn bench_bin_bytes() -> Vec<u8>
+{
+    (0..=u8::MAX).cycle().take(SVCTEST_BENCH_BIN_SIZE).collect()
 }
 
 /// Make the rootfs mirror authoritative over `roots`: remove every regular file
@@ -302,6 +301,22 @@ mod tests
         );
 
         fs::remove_dir_all(&sysroot).unwrap();
+    }
+
+    // Defect caught: a change to how `bench.bin` is generated that alters
+    // its size or its position-derived pattern, which the readers compare
+    // against.
+    #[test]
+    fn bench_bin_is_its_position_modulo_256()
+    {
+        let bytes = bench_bin_bytes();
+        assert_eq!(bytes.len(), SVCTEST_BENCH_BIN_SIZE);
+        assert!(
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| usize::from(b) == i % 256)
+        );
     }
 
     /// A managed root that does not exist on disk is skipped without error.

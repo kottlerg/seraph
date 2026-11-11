@@ -617,7 +617,7 @@ fn run(info_ptr: u64) -> !
         logging::log("init: FATAL: cannot derive badged log SEND");
         syscall::thread_exit();
     };
-    // SAFETY: INIT_IPC_BUF_VA is registered and page-aligned.
+    // INIT_IPC_BUF_VA is registered and page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = INIT_IPC_BUF_VA as *mut u64;
     logging::set_ipc_logging(init_log_send, ipc_buf);
@@ -731,7 +731,7 @@ fn run(info_ptr: u64) -> !
     // TEMP_MAP_BASE (the mapping outlives the move of its cap); memmgr reads
     // it back via the RO cap derived above. See
     // `bootstrap::write_memmgr_aux_memory`.
-    // SAFETY: TEMP_MAP_BASE is mapped writable, one page, page-aligned.
+    // TEMP_MAP_BASE is mapped writable, one page, page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let phys_dst = TEMP_MAP_BASE as *mut u64;
     // SAFETY: phys_dst points at the one mapped 4 KiB page.

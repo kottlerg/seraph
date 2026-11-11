@@ -681,19 +681,26 @@ pub fn tls_segment(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<TlsSegment>, 
     Ok(None)
 }
 
-// ── Seraph stack-size note parser ───────────────────────────────────────────
+// ── ELF note locator ────────────────────────────────────────────────────────
 //
-// The on-disk note format and the `stack_pages!` macro live in
-// `process-abi` (the binary contract between spawner and child). This
-// crate consumes the same constants on the loader side: section header
-// walking and note-payload validation.
+// A Seraph binary carries what its loader and devmgr read before running it
+// as ELF notes in named sections: the main-thread stack size
+// (`.note.seraph.stack`, whose format and macro live in `process-abi`) and a
+// driver's declaration (`.note.seraph.driver`, whose format and macro live in
+// `shared/driver-binding`). The locator walks the section header table for
+// the named `SHT_NOTE` section, then the note records in it for the one whose
+// owner and type match, and returns that note's descriptor. Section headers
+// serve only this lookup; loaders never depend on them for segment data,
+// which lives in `PT_LOAD`.
 
 /// Section type: notes (`SHT_NOTE`).
 const SHT_NOTE: u32 = 7;
 
-/// 64-bit ELF section header (`Elf64_Shdr`). Used only when locating the
-/// stack-size note; loaders never depend on section headers for segment
-/// data (which lives in `PT_LOAD`).
+/// Bytes of a note record's header: `namesz`, `descsz`, and `ntype`, each a
+/// `u32`.
+const NOTE_HEADER_BYTES: usize = 12;
+
+/// 64-bit ELF section header (`Elf64_Shdr`).
 #[repr(C)]
 #[allow(clippy::struct_field_names)]
 struct Elf64Shdr
@@ -710,21 +717,24 @@ struct Elf64Shdr
     sh_entsize: u64,
 }
 
-/// Locate the `.note.seraph.stack` note in a fully-mapped ELF image and
-/// return the declared page count.
+/// Locate, in a fully-mapped ELF image, the note of type `ntype` whose owner
+/// is `owner` (the name without its NUL, such as `b"seraph"`) in the
+/// `SHT_NOTE` section named `section`, and return its descriptor bytes.
 ///
-/// Returns `None` when the binary has no note, or when the note is
-/// malformed (wrong name, wrong type, wrong descsz). Loaders should
-/// treat `None` as "use default."
-///
-/// `ehdr` must come from a successful [`validate`] or [`validate_executable`]
-/// on `data`. Walks the
-/// section header table; the descriptor is read directly from the byte
-/// slice without allocating.
+/// Returns `None` when the image has no such section, the section holds no
+/// such note, or a header, the section, or a note record lies outside `data`
+/// or overflows. `ehdr` must come from a successful [`validate`] or
+/// [`validate_executable`] on `data`. Reads byte-wise and does not allocate.
 #[must_use]
-pub fn parse_stack_note(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<u32>
+pub fn find_note<'a>(
+    ehdr: &Elf64Ehdr,
+    data: &'a [u8],
+    section: &str,
+    owner: &[u8],
+    ntype: u32,
+) -> Option<&'a [u8]>
 {
-    let shoff = ehdr.e_shoff as usize;
+    let shoff = usize::try_from(ehdr.e_shoff).ok()?;
     let shnum = ehdr.e_shnum as usize;
     let shentsize = ehdr.e_shentsize as usize;
     if shoff == 0 || shnum == 0 || shentsize < size_of::<Elf64Shdr>()
@@ -741,16 +751,8 @@ pub fn parse_stack_note(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<u32>
     {
         return None;
     }
-
     let strtab = read_shdr(data, shoff, shentsize, strtab_idx)?;
-    let strtab_off = strtab.sh_offset as usize;
-    let strtab_size = strtab.sh_size as usize;
-    let strtab_end = strtab_off.checked_add(strtab_size)?;
-    if strtab_end > data.len()
-    {
-        return None;
-    }
-    let strtab_bytes = &data[strtab_off..strtab_end];
+    let strtab_bytes = slice_at(data, strtab.sh_offset, strtab.sh_size)?;
 
     for i in 0..shnum
     {
@@ -760,41 +762,34 @@ pub fn parse_stack_note(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<u32>
             continue;
         };
         if shdr.sh_type != SHT_NOTE
+            || !section_name_eq(strtab_bytes, shdr.sh_name as usize, section)
         {
             continue;
         }
-        if !section_name_eq(
-            strtab_bytes,
-            shdr.sh_name as usize,
-            process_abi::SERAPH_STACK_NOTE_SECTION,
-        )
-        {
-            continue;
-        }
-        let off = shdr.sh_offset as usize;
-        let size = shdr.sh_size as usize;
-        let end = off.checked_add(size)?;
-        if end > data.len()
-        {
-            return None;
-        }
-        return parse_note_payload(&data[off..end]);
+        let notes = slice_at(data, shdr.sh_offset, shdr.sh_size)?;
+        return notes.get(note_desc(notes, owner, ntype)?);
     }
     None
 }
 
-/// Locate `.note.seraph.stack` when only the ELF header page is in
-/// memory. `read_at` fetches `dst.len()` bytes from `file_offset` and
-/// returns the number of bytes copied (or `None` on I/O error).
+/// Locate the note [`find_note`] locates when only the ELF header is in
+/// memory: `read_at(offset, dst)` fetches `dst.len()` bytes from file offset
+/// `offset` and returns the bytes copied, or `None` on an I/O error.
 ///
-/// Used by procmgr's VFS-streaming spawn path: the section header table
-/// and the matching note section are fetched on demand via the same
-/// `vfs_read` primitive that loads `PT_LOAD` pages.
-pub fn parse_stack_note_streaming<F>(
+/// Reads the section header table one header at a time, the section name
+/// string table (at most [`MAX_STREAMING_STRTAB`] bytes), and the one note
+/// section, into `buf`; a note section larger than `buf` is refused. Returns
+/// the descriptor's byte range within `buf`, or `None` as [`find_note`] does,
+/// and also when a read fails, comes back short, or reaches past `file_size`.
+pub fn find_note_streaming<F>(
     ehdr: &Elf64Ehdr,
     file_size: u64,
+    section: &str,
+    owner: &[u8],
+    ntype: u32,
+    buf: &mut [u8],
     mut read_at: F,
-) -> Option<u32>
+) -> Option<core::ops::Range<usize>>
 where
     F: FnMut(u64, &mut [u8]) -> Option<usize>,
 {
@@ -818,23 +813,14 @@ where
     }
 
     let strtab_shdr = read_shdr_streaming(shoff, shentsize, strtab_idx, &mut read_at)?;
-    let strtab_off = strtab_shdr.sh_offset;
-    let strtab_size = strtab_shdr.sh_size as usize;
+    let strtab_size = usize::try_from(strtab_shdr.sh_size).ok()?;
     if strtab_size == 0 || strtab_size > MAX_STREAMING_STRTAB
     {
         return None;
     }
-    if strtab_off.checked_add(strtab_size as u64)? > file_size
-    {
-        return None;
-    }
     let mut strtab_buf = [0u8; MAX_STREAMING_STRTAB];
-    let got = read_at(strtab_off, &mut strtab_buf[..strtab_size])?;
-    if got < strtab_size
-    {
-        return None;
-    }
-    let strtab_bytes = &strtab_buf[..strtab_size];
+    let strtab_bytes = &mut strtab_buf[..strtab_size];
+    read_exact_at(strtab_shdr.sh_offset, strtab_bytes, file_size, &mut read_at)?;
 
     for i in 0..shnum
     {
@@ -844,60 +830,162 @@ where
             continue;
         };
         if shdr.sh_type != SHT_NOTE
+            || !section_name_eq(strtab_bytes, shdr.sh_name as usize, section)
         {
             continue;
         }
-        if !section_name_eq(
-            strtab_bytes,
-            shdr.sh_name as usize,
-            process_abi::SERAPH_STACK_NOTE_SECTION,
-        )
-        {
-            continue;
-        }
-        let size = shdr.sh_size as usize;
-        if size == 0 || size > MAX_STREAMING_NOTE
+        let size = usize::try_from(shdr.sh_size).ok()?;
+        if size == 0 || size > buf.len()
         {
             return None;
         }
-        if shdr.sh_offset.checked_add(size as u64)? > file_size
-        {
-            return None;
-        }
-        let mut buf = [0u8; MAX_STREAMING_NOTE];
-        let got = read_at(shdr.sh_offset, &mut buf[..size])?;
-        if got < size
-        {
-            return None;
-        }
-        return parse_note_payload(&buf[..size]);
+        let notes = &mut buf[..size];
+        read_exact_at(shdr.sh_offset, notes, file_size, &mut read_at)?;
+        return note_desc(notes, owner, ntype);
     }
     None
 }
 
+/// Locate the `.note.seraph.stack` note in a fully-mapped ELF image and
+/// return the declared page count ([`find_note`]).
+///
+/// Returns `None` when the binary has no note, or when the note is
+/// malformed (a descriptor other than the eight bytes of
+/// `process_abi::StackNoteDesc`). Loaders treat `None` as "use default."
+///
+/// `ehdr` must come from a successful [`validate`] or [`validate_executable`]
+/// on `data`.
+#[must_use]
+pub fn parse_stack_note(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<u32>
+{
+    let desc = find_note(
+        ehdr,
+        data,
+        process_abi::SERAPH_STACK_NOTE_SECTION,
+        process_abi::SERAPH_NOTE_OWNER,
+        process_abi::NT_SERAPH_STACK,
+    )?;
+    stack_pages_of(desc)
+}
+
+/// Locate `.note.seraph.stack` when only the ELF header page is in
+/// memory ([`find_note_streaming`]). `read_at` fetches `dst.len()` bytes from
+/// `file_offset` and returns the number of bytes copied (or `None` on I/O
+/// error).
+///
+/// Used by procmgr's VFS-streaming spawn path: the section header table
+/// and the matching note section are fetched on demand via the same
+/// `vfs_read` primitive that loads `PT_LOAD` pages.
+pub fn parse_stack_note_streaming<F>(ehdr: &Elf64Ehdr, file_size: u64, read_at: F) -> Option<u32>
+where
+    F: FnMut(u64, &mut [u8]) -> Option<usize>,
+{
+    let mut buf = [0u8; MAX_STREAMING_NOTE];
+    let desc = find_note_streaming(
+        ehdr,
+        file_size,
+        process_abi::SERAPH_STACK_NOTE_SECTION,
+        process_abi::SERAPH_NOTE_OWNER,
+        process_abi::NT_SERAPH_STACK,
+        &mut buf,
+        read_at,
+    )?;
+    stack_pages_of(buf.get(desc)?)
+}
+
+/// The page count of a stack note's descriptor, `process_abi::StackNoteDesc`:
+/// eight bytes, the count in the first four.
+fn stack_pages_of(desc: &[u8]) -> Option<u32>
+{
+    if desc.len() != size_of::<process_abi::StackNoteDesc>()
+    {
+        return None;
+    }
+    Some(u32_le(&desc[0..4]))
+}
+
 /// Upper bound on the section name string table size accepted by the
-/// streaming parser. In-tree binaries land well under 4 KiB; the cap
+/// streaming locator. In-tree binaries land well under 4 KiB; the cap
 /// keeps the on-stack buffer fixed without heap allocation. The table holds
 /// only section names, a fixed set the linker emits, so program size does
 /// not grow it.
-const MAX_STREAMING_STRTAB: usize = 4096;
+pub const MAX_STREAMING_STRTAB: usize = 4096;
 
-/// Upper bound on the note section size accepted by the streaming
-/// parser. Our note is 28 bytes; 64 leaves headroom for future fields.
+/// Upper bound on the stack-note section size accepted by
+/// [`parse_stack_note_streaming`]. The note is 28 bytes; 64 leaves headroom
+/// for future fields.
 const MAX_STREAMING_NOTE: usize = 64;
+
+/// The byte range of the descriptor of the note of type `ntype` owned by
+/// `owner` among the note records of `notes`, each a header, its name padded
+/// to four bytes, and its descriptor padded to four bytes. `None` when no
+/// record matches, or a record's name or descriptor runs past `notes` (the
+/// walk stops there, as nothing after it can be located).
+fn note_desc(notes: &[u8], owner: &[u8], ntype: u32) -> Option<core::ops::Range<usize>>
+{
+    let mut at = 0usize;
+    while notes.len().saturating_sub(at) >= NOTE_HEADER_BYTES
+    {
+        let namesz = u32_le(&notes[at..at + 4]) as usize;
+        let descsz = u32_le(&notes[at + 4..at + 8]) as usize;
+        let ty = u32_le(&notes[at + 8..at + 12]);
+        let name_start = at + NOTE_HEADER_BYTES;
+        let name_end = name_start.checked_add(namesz)?;
+        let desc_start = name_start.checked_add(align4(namesz)?)?;
+        let desc_end = desc_start.checked_add(descsz)?;
+        if desc_end > notes.len()
+        {
+            return None;
+        }
+        // The name is the owner and its NUL.
+        let named = namesz == owner.len() + 1
+            && notes[name_start..name_end - 1] == *owner
+            && notes[name_end - 1] == 0;
+        if named && ty == ntype
+        {
+            return Some(desc_start..desc_end);
+        }
+        at = align4(desc_end)?;
+    }
+    None
+}
+
+/// `n` rounded up to the 4-byte alignment of a note's fields; `None` on
+/// overflow.
+fn align4(n: usize) -> Option<usize>
+{
+    Some(n.checked_add(3)? & !3)
+}
+
+/// The `size` bytes of `data` from `offset`, or `None` when they overflow or
+/// run past its end.
+fn slice_at(data: &[u8], offset: u64, size: u64) -> Option<&[u8]>
+{
+    let start = usize::try_from(offset).ok()?;
+    let end = start.checked_add(usize::try_from(size).ok()?)?;
+    data.get(start..end)
+}
+
+/// Fill `dst` from file offset `offset` through `read_at`; `None` when the
+/// span reaches past `file_size`, or the read fails or comes back short.
+fn read_exact_at<F>(offset: u64, dst: &mut [u8], file_size: u64, read_at: &mut F) -> Option<()>
+where
+    F: FnMut(u64, &mut [u8]) -> Option<usize>,
+{
+    if offset.checked_add(dst.len() as u64)? > file_size
+    {
+        return None;
+    }
+    let got = read_at(offset, dst)?;
+    (got >= dst.len()).then_some(())
+}
 
 fn read_shdr(data: &[u8], shoff: usize, shentsize: usize, idx: usize) -> Option<Elf64Shdr>
 {
     let offset = shoff.checked_add(idx.checked_mul(shentsize)?)?;
     let end = offset.checked_add(size_of::<Elf64Shdr>())?;
-    if end > data.len()
-    {
-        return None;
-    }
-    // Bounds-checked above; `decode_shdr` reads fields byte-wise, so `data`
-    // needs no alignment.
-    let bytes = &data[offset..end];
-    Some(decode_shdr(bytes))
+    // `decode_shdr` reads fields byte-wise, so `data` needs no alignment.
+    Some(decode_shdr(data.get(offset..end)?))
 }
 
 fn read_shdr_streaming<F>(
@@ -963,34 +1051,6 @@ fn section_name_eq(strtab: &[u8], offset: usize, expected: &str) -> bool
         return false;
     }
     strtab[end] == 0
-}
-
-fn parse_note_payload(bytes: &[u8]) -> Option<u32>
-{
-    if bytes.len() < 12
-    {
-        return None;
-    }
-    let namesz = u32_le(&bytes[0..4]) as usize;
-    let descsz = u32_le(&bytes[4..8]) as usize;
-    let ntype = u32_le(&bytes[8..12]);
-    if ntype != process_abi::NT_SERAPH_STACK || namesz != 7 || descsz != 8
-    {
-        return None;
-    }
-    let name_padded = (namesz + 3) & !3;
-    let name_end = 12usize.checked_add(name_padded)?;
-    let desc_end = name_end.checked_add(descsz)?;
-    if desc_end > bytes.len()
-    {
-        return None;
-    }
-    if bytes[12..12 + 7] != process_abi::SERAPH_NOTE_NAME[..7]
-    {
-        return None;
-    }
-    let pages = u32_le(&bytes[name_end..name_end + 4]);
-    Some(pages)
 }
 
 /// Locate the `PT_TLS` segment using only the ELF header page, validating
@@ -2217,6 +2277,266 @@ mod tests
         assert_eq!(
             rela_table_metadata(&ehdr, short, FILE_SIZE as u64, |_, _| None),
             Err(ElfError::PhdrTableOverflow)
+        );
+    }
+
+    // ── Note locator ────────────────────────────────────────────────────────
+
+    /// Section name string table of a note-carrying image: the null name,
+    /// then the two Seraph note sections.
+    const NOTE_STRTAB: &[u8] = b"\0.note.seraph.stack\0.note.seraph.driver\0";
+    /// Offsets of the two names in [`NOTE_STRTAB`].
+    const STACK_NAME: u32 = 1;
+    const DRIVER_NAME: u32 = 20;
+    /// File layout past the canonical image: the string table, then the note
+    /// section, then the section header table (null, strtab, notes).
+    const STRTAB_OFF: usize = FILE_SIZE;
+    const NOTES_OFF: usize = FILE_SIZE + 0x40;
+    const NOTE_SHDRS: u16 = 3;
+
+    /// One note record: header, owner and NUL padded to four bytes, and the
+    /// descriptor padded to four bytes.
+    fn note_record(owner: &[u8], ntype: u32, desc: &[u8]) -> Vec<u8>
+    {
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&(owner.len() as u32 + 1).to_le_bytes());
+        rec.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+        rec.extend_from_slice(&ntype.to_le_bytes());
+        rec.extend_from_slice(owner);
+        rec.push(0);
+        while rec.len() % 4 != 0
+        {
+            rec.push(0);
+        }
+        rec.extend_from_slice(desc);
+        while rec.len() % 4 != 0
+        {
+            rec.push(0);
+        }
+        rec
+    }
+
+    fn shdr_bytes(name: u32, sh_type: u32, offset: u64, size: u64) -> [u8; 64]
+    {
+        let mut b = [0u8; 64];
+        put(&mut b, 0, &name.to_le_bytes());
+        put(&mut b, 4, &sh_type.to_le_bytes());
+        put(&mut b, 24, &offset.to_le_bytes());
+        put(&mut b, 32, &size.to_le_bytes());
+        b
+    }
+
+    /// The canonical image with a string table and one `SHT_NOTE` section
+    /// named at `name` holding `notes`.
+    fn image_with_notes(name: u32, notes: &[u8]) -> Vec<u8>
+    {
+        let mut img = build_image(ET_EXEC, &std_dynamic());
+        img.resize(NOTES_OFF, 0);
+        put(&mut img, STRTAB_OFF, NOTE_STRTAB);
+        img.extend_from_slice(notes);
+        while img.len() % 8 != 0
+        {
+            img.push(0);
+        }
+        let shoff = img.len();
+        img.extend_from_slice(&[0u8; 64]);
+        img.extend_from_slice(&shdr_bytes(
+            0,
+            3, // SHT_STRTAB
+            STRTAB_OFF as u64,
+            NOTE_STRTAB.len() as u64,
+        ));
+        img.extend_from_slice(&shdr_bytes(
+            name,
+            SHT_NOTE,
+            NOTES_OFF as u64,
+            notes.len() as u64,
+        ));
+        put(&mut img, 40, &(shoff as u64).to_le_bytes()); // e_shoff
+        put(&mut img, 58, &64u16.to_le_bytes()); // e_shentsize
+        put(&mut img, 60, &NOTE_SHDRS.to_le_bytes()); // e_shnum
+        put(&mut img, 62, &1u16.to_le_bytes()); // e_shstrndx
+        img
+    }
+
+    const DRIVER_SECTION: &str = ".note.seraph.driver";
+    const NT_DRIVER: u32 = process_abi::NT_SERAPH_DRIVER;
+
+    fn streamed<'a>(img: &'a [u8]) -> impl FnMut(u64, &mut [u8]) -> Option<usize> + 'a
+    {
+        move |off, dst| {
+            let start = usize::try_from(off).ok()?;
+            let src = img.get(start..start + dst.len())?;
+            dst.copy_from_slice(src);
+            Some(dst.len())
+        }
+    }
+
+    fn located(img: &[u8], owner: &[u8], ntype: u32) -> (Option<Vec<u8>>, Option<Vec<u8>>)
+    {
+        let (ehdr, _) = valid_executable(img);
+        let in_memory = find_note(&ehdr, img, DRIVER_SECTION, owner, ntype).map(<[u8]>::to_vec);
+        let mut buf = [0u8; 256];
+        let streaming = find_note_streaming(
+            &ehdr,
+            img.len() as u64,
+            DRIVER_SECTION,
+            owner,
+            ntype,
+            &mut buf,
+            streamed(img),
+        )
+        .map(|r| buf[r].to_vec());
+        (in_memory, streaming)
+    }
+
+    #[test]
+    fn a_named_note_is_located_in_memory_and_streaming()
+    {
+        let img = image_with_notes(DRIVER_NAME, &note_record(b"seraph", NT_DRIVER, b"declared"));
+        let (in_memory, streaming) = located(&img, b"seraph", NT_DRIVER);
+        assert_eq!(in_memory.as_deref(), Some(&b"declared"[..]));
+        assert_eq!(streaming.as_deref(), Some(&b"declared"[..]));
+    }
+
+    #[test]
+    fn the_matching_record_is_found_past_others_in_its_section()
+    {
+        let mut notes = note_record(b"GNU", NT_DRIVER, b"other owner");
+        notes.extend(note_record(b"seraph", NT_DRIVER + 1, b"other type"));
+        notes.extend(note_record(b"seraph", NT_DRIVER, b"wanted"));
+        let img = image_with_notes(DRIVER_NAME, &notes);
+        let (in_memory, streaming) = located(&img, b"seraph", NT_DRIVER);
+        assert_eq!(in_memory.as_deref(), Some(&b"wanted"[..]));
+        assert_eq!(streaming.as_deref(), Some(&b"wanted"[..]));
+    }
+
+    #[test]
+    fn a_note_of_another_owner_type_or_section_is_not_located()
+    {
+        let img = image_with_notes(DRIVER_NAME, &note_record(b"seraph", NT_DRIVER, b"d"));
+        assert_eq!(located(&img, b"seraph", NT_DRIVER + 1), (None, None));
+        assert_eq!(located(&img, b"serap", NT_DRIVER), (None, None));
+        // The same record in the stack-note section is not the driver note.
+        let img = image_with_notes(STACK_NAME, &note_record(b"seraph", NT_DRIVER, b"d"));
+        assert_eq!(located(&img, b"seraph", NT_DRIVER), (None, None));
+    }
+
+    #[test]
+    fn a_record_reaching_past_its_section_is_refused()
+    {
+        let mut notes = note_record(b"seraph", NT_DRIVER, b"declared");
+        // descsz claims more bytes than the section holds.
+        notes[4..8].copy_from_slice(&64u32.to_le_bytes());
+        let img = image_with_notes(DRIVER_NAME, &notes);
+        assert_eq!(located(&img, b"seraph", NT_DRIVER), (None, None));
+        // A namesz that overflows the walk.
+        let mut notes = note_record(b"seraph", NT_DRIVER, b"declared");
+        notes[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let img = image_with_notes(DRIVER_NAME, &notes);
+        assert_eq!(located(&img, b"seraph", NT_DRIVER), (None, None));
+    }
+
+    #[test]
+    fn a_section_reaching_past_the_image_is_refused()
+    {
+        let mut img = image_with_notes(DRIVER_NAME, &note_record(b"seraph", NT_DRIVER, b"d"));
+        let note_shdr = img.len() - 64;
+        let past_end = img.len() as u64;
+        put(&mut img, note_shdr + 32, &past_end.to_le_bytes()); // sh_size
+        assert_eq!(located(&img, b"seraph", NT_DRIVER), (None, None));
+    }
+
+    #[test]
+    fn a_streamed_note_section_larger_than_the_buffer_is_refused()
+    {
+        let desc = [7u8; 300];
+        let img = image_with_notes(DRIVER_NAME, &note_record(b"seraph", NT_DRIVER, &desc));
+        let (in_memory, streaming) = located(&img, b"seraph", NT_DRIVER);
+        assert_eq!(in_memory.as_deref(), Some(&desc[..]));
+        assert_eq!(
+            streaming, None,
+            "the 256-byte buffer cannot hold the section"
+        );
+    }
+
+    #[test]
+    fn a_short_or_failed_read_locates_nothing()
+    {
+        let img = image_with_notes(DRIVER_NAME, &note_record(b"seraph", NT_DRIVER, b"d"));
+        let (ehdr, _) = valid_executable(&img);
+        let mut buf = [0u8; 256];
+        let short = find_note_streaming(
+            &ehdr,
+            img.len() as u64,
+            DRIVER_SECTION,
+            b"seraph",
+            NT_DRIVER,
+            &mut buf,
+            |_, dst| Some(dst.len() - 1),
+        );
+        assert_eq!(short, None);
+        let failed = find_note_streaming(
+            &ehdr,
+            img.len() as u64,
+            DRIVER_SECTION,
+            b"seraph",
+            NT_DRIVER,
+            &mut buf,
+            |_, _| None,
+        );
+        assert_eq!(failed, None);
+        // A declared file size that ends before the section header table.
+        let truncated = find_note_streaming(
+            &ehdr,
+            NOTES_OFF as u64,
+            DRIVER_SECTION,
+            b"seraph",
+            NT_DRIVER,
+            &mut buf,
+            streamed(&img),
+        );
+        assert_eq!(truncated, None);
+    }
+
+    #[test]
+    fn an_image_without_section_headers_has_no_note()
+    {
+        let img = build_image(ET_EXEC, &std_dynamic());
+        assert_eq!(located(&img, b"seraph", NT_DRIVER), (None, None));
+        let (ehdr, _) = valid_executable(&img);
+        assert_eq!(parse_stack_note(&ehdr, &img), None);
+    }
+
+    #[test]
+    fn the_stack_note_is_read_through_the_locator()
+    {
+        let mut desc = [0u8; 8];
+        desc[..4].copy_from_slice(&24u32.to_le_bytes());
+        let img = image_with_notes(
+            STACK_NAME,
+            &note_record(b"seraph", process_abi::NT_SERAPH_STACK, &desc),
+        );
+        let (ehdr, _) = valid_executable(&img);
+        assert_eq!(parse_stack_note(&ehdr, &img), Some(24));
+        assert_eq!(
+            parse_stack_note_streaming(&ehdr, img.len() as u64, streamed(&img)),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn a_stack_note_of_another_descriptor_size_reads_as_none()
+    {
+        let img = image_with_notes(
+            STACK_NAME,
+            &note_record(b"seraph", process_abi::NT_SERAPH_STACK, &[1, 0, 0, 0]),
+        );
+        let (ehdr, _) = valid_executable(&img);
+        assert_eq!(parse_stack_note(&ehdr, &img), None);
+        assert_eq!(
+            parse_stack_note_streaming(&ehdr, img.len() as u64, streamed(&img)),
+            None
         );
     }
 }

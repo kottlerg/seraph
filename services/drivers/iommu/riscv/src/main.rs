@@ -28,6 +28,24 @@ use std::os::seraph::{reserve_pages, startup_info};
 
 use backend::{Riscv, Unit};
 
+// ── Declaration ────────────────────────────────────────────────────────────
+
+// What devmgr binds this driver to and how it starts it
+// (docs/driver-binding.md § Driver Declarations). devmgr reads it but starts
+// this driver on its fixed path until platform device records carry the key
+// it matches (docs/driver-binding.md § Status).
+driver_binding::driver_declaration!(driver_binding::decl::Declaration {
+    name: "iommu-riscv",
+    class: None,
+    matches: &[driver_binding::decl::Match::IommuFamily("rimt")],
+    instance_limit: Some(1),
+    interrupt: driver_binding::decl::Interrupt::NONE,
+    dma: true,
+    phys_access: true,
+    reset: driver_binding::decl::Reset::None,
+    tier: driver_binding::decl::Tier::Boot,
+});
+
 /// The driver's one [`Service`], shared by the service loop and the fault
 /// poll thread.
 struct Shared(Mutex<Service<Riscv, KernelCaps>>);

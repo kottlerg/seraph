@@ -46,23 +46,27 @@ touches these):
   suspended commit, `commit_suspended_start`), `sys_thread_stop`, `sys_thread_read_regs`,
   `sys_thread_write_regs`, `sys_thread_read_mem`, `sys_thread_write_mem`,
   `sys_thread_set_priority`, `sys_thread_set_affinity`, `sys_exit`,
-  `sys_process_exit`, `sys_thread_sleep`, `cancel_ipc_block`, `cancel_for_upcall`, and the
-  self-teardown epilogue of `syscall::dispatch`.
+  `sys_process_exit`, `sys_thread_sleep`, `cancel_ipc_block`, `cancel_for_upcall`,
+  `cancel_for_timeout`, and the self-teardown epilogue of `syscall::dispatch`.
 - `core/kernel/src/ipc/upcall.rs` — `post`, the post's cancel and wake (§ Upcall Cancel-and-Wake
   Protocol).
-- `core/kernel/src/syscall/ipc.rs` — `sys_notification_wait`, `sys_event_recv`, `sys_ipc_reply`,
-  `deposit_transfer_failed_reply`.
-- `core/kernel/src/ipc/mod.rs` — `WaitQueue`, `arm_timed_park` (called by `notification_wait`
-  and `event_queue_recv`), and the waiter claims that drop a sleep-list entry: `claim_waiter`
-  (called by `notification_send`, `event_queue_post`, `waitset_notify`, `waitset_add`, the timer's
-  timed-wait arms, and `interrupt_all_waiters`) and `interrupt_all_waiters` (called by the
-  Notification dealloc arm, `event_queue_drop`, and `wait_set_drop`).
+- `core/kernel/src/syscall/ipc.rs` — `sys_ipc_call`, `sys_ipc_recv`, `sys_notification_wait`,
+  `sys_event_recv`, `sys_wait_set_wait`, `sys_ipc_reply`, `deposit_transfer_failed_reply`.
+- `core/kernel/src/ipc/mod.rs` — `WaitQueue`, `arm_timed_park` (called by `notification_wait`,
+  `event_queue_recv`, `waitset_wait`, `endpoint_recv`, and `endpoint_call`),
+  `cancel_timed_entry` (invariant 7), and the waiter claims that drop a sleep-list entry:
+  `claim_waiter` (called by `notification_send`, `event_queue_post`, `waitset_notify`,
+  `waitset_add`, the timer's timed-wait arms, and `interrupt_all_waiters`) and
+  `interrupt_all_waiters` (called by the Notification dealloc arm, `event_queue_drop`, and
+  `wait_set_drop`).
 - `core/kernel/src/ipc/{notification,event_queue,wait_set}.rs` — the claimers that call them.
-- `core/kernel/src/ipc/endpoint.rs` — `endpoint_call`, `endpoint_recv`, `endpoint_reply`
-  (`reply_tcb` publish and claim).
+- `core/kernel/src/ipc/endpoint.rs` — `endpoint_call`, `endpoint_recv`, `endpoint_try_recv`,
+  `endpoint_reply` (`reply_tcb` publish and claim).
 - `core/kernel/src/cap/object.rs` — the `ObjectType::Thread` arm of `dealloc_object_one`,
-  `push_deferred_reclaim`, `drain_deferred_reclaim` (§ Self-teardown), and the sleep-list removal
-  and timer quiesce in its Notification and EventQueue arms.
+  `push_deferred_reclaim`, `drain_deferred_reclaim` (§ Self-teardown), the sleep-list removal
+  and timer quiesce in its Notification and EventQueue arms, and the sleep-list removal in its
+  Endpoint arm's queue drains (no quiesce: the timer's endpoint and wait-set arms hold no pop-time
+  source pointer, invariant 6).
 - The fault handlers in `core/kernel/src/arch/{x86_64/idt.rs,riscv64/interrupts.rs}` that drive
   thread-fault exits (fault → `Exited` transition).
 
@@ -74,9 +78,10 @@ The sleep list is a single global min-heap of tick deadlines (`sched::deadline_h
 through the waiting TCBs' `sleep_node` fields, so it holds one entry per thread and preallocates
 nothing. A TCB is on the list after `sleep_list_add` linked its node with a non-zero
 `sleep_deadline`. The BSP timer tick pops the expired minimum entries under `SLEEP_LIST_LOCK`,
-releases the lock, and arbitrates wake claims against concurrent IPC sources via the relevant
-source IPC lock (Notification / EventQueue / "plain sleep" only — `sys_thread_sleep` is a plain
-sleep with no source).
+releases the lock, and arbitrates wake claims against concurrent IPC sources: via the relevant
+source IPC lock for a Notification or EventQueue wait, through the park cancel
+(`cancel_for_timeout`) for a timed endpoint call or receive or wait-set wait, and at the pop for a
+plain sleep (`sys_thread_sleep`, which has no source).
 
 The list is one global heap rather than one per CPU. A per-CPU structure would add no capacity, the
 heap already has none to exhaust, and would split the dispatch sequence of invariant 9 and the
@@ -92,8 +97,10 @@ operation per expired entry, not a scan of every entry.
    not nested.
 
 2. **A listed TCB is a `Blocked` sleeper or timed waiter.** Its `ipc_state` is `None` (plain sleep)
-   or `BlockedOnNotification` / `BlockedOnEventQueue` with a non-null `blocked_on_object`
-   (debug-asserted at the pop). Its `state` may already be `Exited` (a `dealloc_object(Thread)` that
+   or `BlockedOnNotification` / `BlockedOnEventQueue` / `BlockedOnSend` / `BlockedOnRecv` /
+   `BlockedOnReply` / `BlockedOnWaitSet` with a non-null `blocked_on_object` (debug-asserted at
+   the pop). A timed `SYS_IPC_CALL` keeps one entry across its send park and its reply park; no
+   fault park is ever timed. Its `state` may already be `Exited` (a `dealloc_object(Thread)` that
    has not yet reached its removal, drain step 11); the claim's `enqueue_and_wake` then aborts.
 
 3. **An entry and its deadline go together.** `sleep_deadline` is set by the parker before
@@ -108,8 +115,8 @@ operation per expired entry, not a scan of every entry.
    `sleep_deadline_after_ms` never yields 0.
 
 4. **There is no capacity.** Each entry is the waiting TCB's own node, so `sleep_list_add` lists
-   every park it does not refuse as cancelled: a sleep never fails for room, and a timed
-   `sys_notification_wait` or `sys_event_recv` never times out before its deadline.
+   every park it does not refuse as cancelled: a sleep never fails for room, and a timed wait never
+   times out before its deadline.
 
 5. **`sleep_check_wakeups` is BSP-only.** APs' timer ticks do not touch the sleep list. A BSP stuck
    in an interrupt-disabled critical section delays all timeout wakes; this is a deliberate
@@ -129,6 +136,24 @@ operation per expired entry, not a scan of every entry.
      `park_seq` advanced at that park's commit, which runs under the same source lock. Membership
      is the TCB's `ipc_wait_queue` tag (the TCB outlives the batch, invariant 9); the TCB is written
      only once the claim is won.
+   - `BlockedOnSend` / `BlockedOnRecv` / `BlockedOnReply` / `BlockedOnWaitSet`: expire the park
+     through `syscall::thread::cancel_for_timeout`, the park cancel a stop or an upcall makes, with
+     the snapshot as its gate. It never uses the pop-time `blocked_on_object`: it re-reads the
+     binding under the TCB's `sched_lock` and reaches the source (the endpoint's or wait set's
+     lock, or the server's `reply_tcb`) through that re-read, as a stop does. A receive or
+     wait-set park is claimed only while `ipc_state` and `park_seq` equal the snapshot; a call is
+     claimed while it is in the send or reply park of the snapshot's call episode
+     (`thread::call_episode`: a park commit advances `park_seq` to the next even value, the reply
+     rebind sets its low bit), since its one entry bounds both parks. That rebind is the one write
+     of a listed park's binding that does not follow the entry's removal, so
+     `commit_reply_rebind_under_local_lock` writes a listed caller's `(ipc_state,
+     blocked_on_object)` under `SLEEP_LIST_LOCK`, nested in the caller's `sched_lock`, and the
+     pop's snapshot never races it; a caller whose deadline reads 0 (Acquire, against the pop's
+     Release clear) is unlisted or already snapshotted. A call whose send park the
+     receive rebinds to its reply park between the cancel's first hold and its source lock loses
+     the send arm and is claimed by a second pass on the reply arm. A won claim stamps the park
+     `PARK_DISPOSITION_TIMED_OUT` and sets `wake_in_flight` in the claim's hold; the timer then
+     wakes the thread, whose syscall returns `WouldBlock`.
    - any other binding: never claimed and never dereferenced (invariant 2 makes it unreachable).
 
 7. **Every waiter claim removes the entry under the source lock.** A notification or event queue
@@ -140,15 +165,29 @@ operation per expired entry, not a scan of every entry.
    an entry bound to a source exists only while that source still queues the TCB. A deadline of 0
    read under the source lock means no entry (the parker arms under that lock, and every removal
    clears both together), so the wakers skip the remove for an untimed wait.
+   The endpoint and wait-set parks follow the same rule through `ipc::cancel_timed_entry`, called
+   by every claim of such a park right after the claim and before its wake: `waitset_notify` and
+   `waitset_add` (through `claim_waiter`), `endpoint_call`'s dequeue of a receiver, a receive's
+   reply rebind refused for a stopped or dying caller, the release of a displaced or unreplied
+   caller, `endpoint_reply`'s `reply_tcb` claim, `rollback_uncommitted_call`, the endpoint
+   dealloc drains, the thread dealloc's detach of a bound caller, and every arm of `cancel_park`.
+   A call's claim by the reply binding holds no source lock, so a rendezvous call arms its entry
+   differently (invariant 8).
 
 8. **A timed park arms its sleep-list entry in the source-lock critical section that queues and
-   commits it.** `notification_wait` and `event_queue_recv` take the deadline and call
-   `arm_timed_park` after a committed park, before releasing the source lock, so no waker can
-   claim the TCB before its entry exists, and the syscall never locks the source again once the
-   caller is claimable (the syscall drops its capability pin before it parks, so a later lock could
-   reach a source freed by a concurrent last-cap delete). An entry armed after a claim would outlive
-   the wait it timed and hijack the TCB's next unrelated `notification_wait` / `event_recv`,
-   delivering `wakeup_value = 0` instead of real bits or payload.
+   commits it.** `notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`, and
+   `endpoint_call`'s send-queue path take the deadline and call `arm_timed_park` after a committed
+   park, before releasing the source lock, so no waker can claim the TCB before its entry exists,
+   and the syscall never locks the source again once the caller is claimable (the syscall drops its
+   capability pin before it parks, so a later lock could reach a source freed by a concurrent
+   last-cap delete). An entry armed after a claim would outlive the wait it timed and hijack the
+   TCB's next unrelated `notification_wait` / `event_recv`, delivering `wakeup_value = 0` instead
+   of real bits or payload. `endpoint_call`'s rendezvous path parks the caller on the server's
+   `reply_tcb`, which a stop of the caller can claim without the endpoint lock, so it stores the
+   deadline before it publishes `reply_tcb` (the Release carries it to every claimant, which clears
+   it with its claim) and calls `sleep_list_add` after the commit, still under the endpoint lock;
+   a claim that landed in between cleared the deadline, the add refuses (`Cancelled`, invariant 3),
+   and the claim owns the episode.
 
 9. **A source or TCB outlives every batch that popped it.** The timer's arms use the pop-time
    source and TCB pointers, which hold no reference. A batch advances `TIMER_DISPATCH_SEQ` to odd
@@ -544,15 +583,18 @@ domains:
    `rollback_uncommitted_call` rolls the binding back under the same `ep.lock` —
    `compare_exchange(caller, null)` on `reply_tcb`; on a win it stamps a cancelled deposit
    (INTERRUPTED, or KILL for a faulter) and clears `wake_in_flight`.
-2. **Server in `endpoint_recv`** — dequeues a `BlockedOnSend` caller and rebinds it to
-   `reply_tcb = caller` under `ep.lock` by the same store into an empty slot, then commits the
-   caller's
-   `BlockedOnSend → BlockedOnReply` (`ipc_state` + `blocked_on_object`) transition via
-   `commit_reply_rebind_under_local_lock` (the caller's per-TCB `sched_lock`), mirroring
-   `endpoint_call`'s `commit_blocked_under_local_lock`. If that commit fails (the caller
-   died/stopped concurrently) it rolls the binding back — `compare_exchange(caller, null)` on
-   `reply_tcb`; on a win it stamps a cancelled deposit (INTERRUPTED, or KILL for a faulter) and
-   clears `wake_in_flight` — and skips to the next queued sender. See invariant 4 (#289).
+2. **Server in `endpoint_recv` or `endpoint_try_recv`** — dequeues a `BlockedOnSend` caller under
+   `ep.lock` and rebinds it in `commit_reply_rebind_under_local_lock` (the caller's per-TCB
+   `sched_lock`), mirroring `endpoint_call`'s `commit_blocked_under_local_lock`: inside that hold
+   it publishes `reply_tcb = caller` by `swap(caller, AcqRel)` and commits the caller's
+   `BlockedOnSend → BlockedOnReply` (`ipc_state` + `blocked_on_object`) transition. The swap
+   returns the binding it displaced: null for `endpoint_recv`, which released any earlier binding
+   at entry (actor 8); for a try-once, which releases nothing until it finds a caller, the
+   unreplied caller, whose episode the swap claimed and which the receive releases as actor 8 does
+   once `ep.lock` drops. If the caller died or stopped concurrently the commit refuses and
+   publishes nothing: the send-queue dequeue already claimed the episode, so the receive stamps a
+   cancelled deposit (INTERRUPTED, or KILL for a faulter), clears `wake_in_flight`, and skips to
+   the next queued sender, leaving the server's binding as it was. See invariant 4 (#289).
 3. **Server in `endpoint_reply`** — loads `reply_tcb` (Acquire), then claims it by
    `compare_exchange(caller, null, AcqRel, Acquire)` with no lock held; on a lost race it returns
    `None` and the winning claimant owns the wake. `sys_ipc_reply` makes this claim before it reads
@@ -592,9 +634,16 @@ domains:
 8. **Server at receive entry via `release_unreplied_caller`** — `endpoint_recv` first runs
    `swap(null, AcqRel)` with no lock held. A non-null result is a caller bound by an earlier
    receive the server never replied to; the swap is its episode claim: it stamps a cancelled
-   deposit (INTERRUPTED, or KILL for a faulter) and wakes it with `enqueue_and_wake`, so the binding
-   is never overwritten (the contract of [ipc-design.md](../../../docs/ipc-design.md) § The
-   Call/Reply Model).
+   deposit (INTERRUPTED, or KILL for a faulter), removes a timed call's sleep-list entry, and wakes
+   it with `enqueue_and_wake` (`release_displaced_caller`), so the binding is never overwritten
+   (the contract of [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model). A
+   try-once receive (`endpoint_try_recv`) skips this entry swap, so one that finds no caller
+   leaves the binding; its rebind (actor 2) displaces the binding instead.
+10. **The sleep-list timer via `cancel_for_timeout`** — a timed call's expiry in its reply park
+    takes actor 4's path: the same `blocked_on_object` re-read and `compare_exchange(this_client,
+    null)` under the client's `sched_lock`, gated on the popped park's `park_seq` and no fault
+    delivery; on a win it stamps `TIMED_OUT` and keeps the binding's `wake_in_flight` for the
+    timer's wake (Sleep List Invariant 6).
 9. **Fault-handler binder via `ipc::fault::claim_fault_park`** — for a `BlockedOnFault` client
    only: a `SYS_THREAD_SET_FAULT_HANDLER` or `SYS_THREAD_INHERIT_FAULT_HANDLER` that changes the
    binding of the class of a thread's in-flight delivery (`apply_bindings`, then
@@ -607,13 +656,14 @@ domains:
 
 **Symmetry rule:** every actor that may invalidate a client's place in the reply slot MUST claim it
 by an atomic read-modify-write that observes the bound client (never an unconditional store) so
-concurrent actors can determine whether they got there first. Actors 3 through 6, actor 9, and the
-commit-failure rollbacks of actors 1 and 2 use `compare_exchange(this_client, null, ...)`. Actor 8
-uses `swap(null)`: only the slot-owning server performs it, while it is entering `SYS_IPC_RECV`, and
-no publisher can install a different caller meanwhile (`endpoint_call` binds only a server it
-dequeued from a receive queue, and `endpoint_recv` runs only on the server itself), so a non-null
-result is as exclusive a claim as a won CAS. The publish stores of actors 1 and 2 are plain stores,
-not claims: they write only an empty slot, because actor 8 runs before any receive can bind. The
+concurrent actors can determine whether they got there first. Actors 3 through 6, actors 9 and 10,
+and the commit-failure rollback of actor 1 use `compare_exchange(this_client, null, ...)`. Actor 8
+and actor 2's rebind use `swap`: only the slot-owning server performs them, while it is in
+`SYS_IPC_RECV`, and no publisher can install a different caller meanwhile (`endpoint_call` binds
+only a server it dequeued from a receive queue, and the receive runs only on the server itself), so
+a non-null result is as exclusive a claim as a won CAS. The publish store of actor 1 is a plain
+store, not a claim: it writes only an empty slot, because a server reaches a receive queue only
+through `endpoint_recv`, whose actor 8 runs first. The
 single `fault_outcome` writer is whichever actor wins this claim, so a fault's resume-vs-kill
 disposition is never decided by two racing actors.
 
@@ -621,10 +671,11 @@ disposition is never decided by two racing actors.
 
 1. The client's `blocked_on_object` is the server TCB pointer (NOT an endpoint or other source).
 2. The server is the lifetime owner of the reply slot. As long as the server is alive,
-   `endpoint_call` and `endpoint_recv` publish the slot under `ep.lock`. Their commit-failure
-   rollback is itself a `compare_exchange(caller, null)` claim taken under `ep.lock`; every other
-   claim (`endpoint_reply`, cancel, dealloc, and the receive-entry `swap(null)`) is taken outside
-   it. `endpoint_reply` takes no lock and claims by CAS; cancel and dealloc paths
+   `endpoint_call` and the receive's rebind publish the slot under `ep.lock`. `endpoint_call`'s
+   commit-failure rollback is itself a `compare_exchange(caller, null)` claim taken under
+   `ep.lock`, and a refused rebind publishes nothing; every other claim (`endpoint_reply`, cancel,
+   the timer's expiry, dealloc, and the receive-entry `swap(null)`) is taken outside it.
+   `endpoint_reply` takes no lock and claims by CAS; cancel, the timer's expiry, and dealloc paths
    claim by it because they cannot acquire `ep.lock` (they don't know which endpoint this reply is
    for; the server may have moved on to a different endpoint between the original `call` and the
    cancel).
@@ -648,8 +699,8 @@ disposition is never decided by two racing actors.
    chokepoint; see
    [scheduling-internals.md § ThreadState Transitions](scheduling-internals.md#threadstate-transitions)
    (Enqueue-chokepoint enforcement)), or TCB-field corruption if reused-and-running (the residual
-   #284 `#GP` / corrupt `iopb`). On a failed commit `endpoint_recv` rolls the binding back and
-   skips the dead sender.
+   #284 `#GP` / corrupt `iopb`). The rebind publishes `reply_tcb` inside that commit's hold, so a
+   failed commit publishes nothing, and the receive retires the dead sender's episode and skips it.
 
 ---
 
@@ -663,12 +714,12 @@ invariants common with the global wake protocol (`RESCHEDULE_PENDING`, `non_empt
 | Atomic / field | Set ordering | Read ordering | Pairing rationale |
 |---|---|---|---|
 | `tcb.timed_out` (bool, plain field) | non-atomic store under `eq.lock` (timer `BlockedOnEventQueue` arm); cleared by the resuming syscall | non-atomic load by resuming syscall on the same CPU | Single-writer per park (eq.lock excludes any concurrent payload-delivery write); reader is local CPU after `schedule()` returns. No atomic required because the source IPC lock provides mutual exclusion at the write side and the `Blocked → Ready` commit, which `enqueue_and_wake` makes under the waiter's `sched_lock` and the run-queue lock after `eq.lock` is released, provides the happens-before edge to the reader through the run-queue Release / dispatch Acquire pairing. |
-| `tcb.sleep_deadline` (`AtomicU64`) | Relaxed store of the deadline by the parker before `sleep_list_add` (plain sleep: before the park commit; timed IPC wait: under the source lock); Relaxed store or `swap` of 0 only under `SLEEP_LIST_LOCK` (timer pop, `sleep_list_remove`), except a parker's own rollback of a deadline it never listed | Relaxed loads: under `SLEEP_LIST_LOCK` (pop, add, remove — the load-bearing observations); under the source lock (waker prechecks, Sleep List Invariant 7); by the softlockup watchdog (diagnostic) under `SLEEP_LIST_LOCK` (sleep-list dump) or the thread's try-locked `sched_lock` (owed-wake scan, registry dump) | The locks order every load-bearing access; the atomic type only makes the source-lock prechecks, which race the pop's clear, well defined. A precheck that reads a stale non-zero value calls a `sleep_list_remove` that finds nothing. |
-| `tcb.park_seq` (`AtomicU32`) | Relaxed `fetch_add` under `(*tcb).sched_lock` by every commit that publishes a `Blocked` binding (`commit_blocked_under_local_lock`, `commit_reply_rebind_under_local_lock`); the IPC parks commit under their source lock too | Relaxed loads: under `(*tcb).sched_lock` (`commit_cancelling_park`'s snapshot, the commit's re-read inside the all-locks hold, and `cancel_ipc_block`'s source-arm claim gate in all five source arms, `ipc::lock_bound_source`, Lock Hierarchy rule 7 of scheduling-internals.md, and a fault-handler binder's snapshot and queued-arm claim gate, `ipc::fault::redeliver_in_flight`); under `SLEEP_LIST_LOCK` (the timer pop's snapshot, while the popped park is still committed); under the source lock (the timer's notification and event-queue claim, Sleep List Invariant 6) | Each reader holds a lock that orders it against the writes it compares: `sched_lock` for the stop protocol (`commit_cancelling_park`, and `cancel_ipc_block`'s entry snapshot and its source-arm gate, which re-reads the binding under `sched_lock` before it try-locks the source), and for the timer claim the source lock under which the waiter-queue entry and the park commit of the same park (or its `commit_reply_rebind_under_local_lock` rebind) are published. |
+| `tcb.sleep_deadline` (`AtomicU64`) | Relaxed store of the deadline by the parker before `sleep_list_add` (plain sleep: before the park commit; timed IPC wait: under the source lock; a rendezvous `SYS_IPC_CALL`: under ep.lock before its Release publish of the server's `reply_tcb`, which carries it to every claimant of that binding, Sleep List Invariant 8); store or `swap` of 0 only under `SLEEP_LIST_LOCK` (the timer pop's Release store, `sleep_list_remove`'s Relaxed `swap`), except a parker's own rollback of a deadline it never listed | Relaxed loads under `SLEEP_LIST_LOCK` (pop, add, remove — the load-bearing observations); Acquire loads under the source lock or the caller's `sched_lock` (`ipc::cancel_timed_entry` and the reply rebind's check, Sleep List Invariants 6 and 7), so a 0 the pop stored orders the pop's binding snapshot before the reader's writes to the binding; Relaxed loads by the softlockup watchdog (diagnostic) under `SLEEP_LIST_LOCK` (sleep-list dump) or the thread's try-locked `sched_lock` (owed-wake scan, registry dump) | The locks order every load-bearing access; the atomic type makes the prechecks, which race the pop's clear, well defined, and the pop's Release clear pairs with their Acquire. A precheck that reads a stale non-zero value calls a `sleep_list_remove` that finds nothing. |
+| `tcb.park_seq` (`AtomicU32`) | Relaxed write under `(*tcb).sched_lock` by every commit that publishes a `Blocked` binding: `commit_blocked_under_local_lock` advances it to the next even value, `commit_reply_rebind_under_local_lock` sets its low bit, so the send and reply parks of one call share a `call_episode` (Sleep List Invariant 6); the IPC parks commit under their source lock too | Relaxed loads: under `(*tcb).sched_lock` (`commit_cancelling_park`'s snapshot, the commit's re-read inside the all-locks hold, and `cancel_ipc_block`'s source-arm claim gate in all five source arms, `ipc::lock_bound_source`, Lock Hierarchy rule 7 of scheduling-internals.md, and a fault-handler binder's snapshot and queued-arm claim gate, `ipc::fault::redeliver_in_flight`); under `SLEEP_LIST_LOCK` (the timer pop's snapshot, while the popped park is still committed); under the source lock (the timer's notification and event-queue claim, Sleep List Invariant 6) | Each reader holds a lock that orders it against the writes it compares: `sched_lock` for the stop protocol (`commit_cancelling_park`, and `cancel_ipc_block`'s entry snapshot and its source-arm gate, which re-reads the binding under `sched_lock` before it try-locks the source), and for the timer claim the source lock under which the waiter-queue entry and the park commit of the same park (or its `commit_reply_rebind_under_local_lock` rebind) are published. |
 | `TIMER_DISPATCH_SEQ` (`AtomicU64`) | Relaxed `fetch_add` to odd under `SLEEP_LIST_LOCK` by a pop that took an entry; Release `fetch_add` to even after that batch's last claim | Acquire load under `SLEEP_LIST_LOCK`, then Acquire loads in the spin, by `sleep_wakeups_quiesce` | The lock orders the quiescer after the pops it must wait for; the Release/Acquire pair orders the batch's last access to the popped source or TCB before the quiescer's free, whether the quiescer returns at once or after the spin (Sleep List Invariant 9). |
 | `tcb.state` (enum, plain field) | non-atomic store under the TCB's own `(*tcb).sched_lock`, except `sched::enter`'s boot dispatch of init, which holds no lock (no other thread exists yet, and the idle APs reach CPU 0's scheduler only through the load balancer, which never touches init's `state`): alone in `commit_blocked_under_local_lock`, `commit_suspended_start`, `enqueue_and_wake`, `enqueue_ready_thread`, and `schedule()`'s requeue and dispatch flips; held outer of every CPU's scheduler.lock in `set_state_under_all_locks`, `start_under_all_locks`, `exit_under_all_locks`, `commit_cancelling_park` and `dealloc_object(Thread)`'s inline `Exited` write | under `(*tcb).sched_lock` (dispatch flip, commits, wakes); `schedule()`'s dequeue skip-loop and `sys_thread_stop`'s drain spin confirm `Stopped`/`Exited` under a CPU's run-queue lock; unlocked non-atomic loads that race the stores: the lifecycle syscalls' prechecks (`sys_thread_start`, `sys_thread_stop`), each re-decided under the all-locks commit; the other unlocked reads are the exceptions [scheduling-internals.md § Cross-CPU TCB Ownership](scheduling-internals.md#cross-cpu-tcb-ownership) lists | The state field is in the Scheduling field group per [scheduling-internals.md § Cross-CPU TCB Ownership](scheduling-internals.md#cross-cpu-tcb-ownership). `(*tcb).sched_lock` serializes every store after boot. The additional all-CPU-locks hold on the `Stopped`/`Exited` writes of a thread a run queue may link (every one but `commit_suspended_start`'s, whose `Created` target no queue links) is what makes those states visible to every CPU's run-queue-locked skip check. |
 | `tcb.priority` (u8, plain field) | non-atomic store by `sys_thread_set_priority` under `(*tcb).sched_lock` | non-atomic loads, each under the TCB's own `(*tcb).sched_lock`: `dealloc_object(Thread)` and `set_state_under_all_locks` (sched_lock held outer of their all-locks region), `migrate_ready_thread`, `enqueue_and_wake`, `enqueue_ready_thread`, `schedule()`'s requeue arm, `schedule()`'s deferred-dispatch re-link and dispatch flip (under `next.sched_lock`), and its same-thread re-mark (under `current.sched_lock`), the last two recording the running level in `PerCpuScheduler::current_level`; `sched::enter`'s boot dispatch of init reads it holding no lock (no other thread exists yet) | `(*tcb).sched_lock` is the serializer: every writer and every functional reader of this field after boot holds it; the softlockup watchdog's dump reads it under that lock too, try-locked. `timer_tick` does not read it: it takes the running thread's level from `PerCpuScheduler::current_level`, so a priority change of a running thread reaches its class at its next dispatch and its slice at the first tick after it. `schedule()`'s dequeue and validation of `next`, before it takes `next.sched_lock`, deliberately does NOT read `(*next).priority` (it would race the store); it dispatches by run-queue index, which `dequeue_highest` already validated. After the store, `sys_thread_set_priority` relocates the Ready TCB's queue entry to the new priority (`relocate_ready_priority`, under the run-queue lock); the brief link-at-old / `priority`-new window inside the `sched_lock` region is benign because consumers dispatch by queue index, not by this field. |
-| `tcb.reply_tcb` (`AtomicPtr<TCB>`) | Release on the `endpoint_call` / `endpoint_recv` publish store under ep.lock (into an empty slot: `release_unreplied_caller` cleared it at receive entry); AcqRel on `compare_exchange` from the commit-failure rollback (under ep.lock) and from `endpoint_reply`, cancel, the fault-handler binder's claim (`claim_fault_park`), client-dealloc, and server-dealloc paths (no ep.lock); AcqRel on the `swap` of `release_unreplied_caller` (no lock) | Acquire on `endpoint_reply`'s pre-CAS load (no lock), which `sys_ipc_reply` runs before it reads the caller; Acquire on the server-dealloc snapshot under all sched.locks; Relaxed on the softlockup watchdog's diagnostic load (`watchdog_read_blocked_on`) | Every claim is an atomic read-modify-write that observes the bound client. The `compare_exchange` clears the slot only when it still references the claimant's expected TCB, so two concurrent claimants cannot clear a third unrelated client's binding; the `swap` is safe because only the slot-owning server performs it, while no publisher can install a different caller at its `SYS_IPC_RECV` entry (per the Symmetry rule). The publish is a plain store, not a claim, into a slot actor 8 emptied at receive entry, so it never overwrites a binding (debug-asserted). The Release publish pairs with each claimant's Acquire. |
+| `tcb.reply_tcb` (`AtomicPtr<TCB>`) | Release on the `endpoint_call` publish store under ep.lock (into an empty slot: `release_unreplied_caller` cleared it at receive entry); AcqRel on the receive's rebind `swap(caller)` under ep.lock and the caller's `sched_lock`; AcqRel on `compare_exchange` from `endpoint_call`'s commit-failure rollback (under ep.lock) and from `endpoint_reply`, cancel, the timer's expiry (`cancel_for_timeout`), the fault-handler binder's claim (`claim_fault_park`), client-dealloc, and server-dealloc paths (no ep.lock); AcqRel on the `swap(null)` of `release_unreplied_caller` (no lock) | Acquire on `endpoint_reply`'s pre-CAS load (no lock), which `sys_ipc_reply` runs before it reads the caller; Acquire on the server-dealloc snapshot under all sched.locks; Relaxed on the softlockup watchdog's diagnostic load (`watchdog_read_blocked_on`) | Every claim is an atomic read-modify-write that observes the bound client. The `compare_exchange` clears the slot only when it still references the claimant's expected TCB, so two concurrent claimants cannot clear a third unrelated client's binding; the `swap` is safe because only the slot-owning server performs it, while no publisher can install a different caller at its `SYS_IPC_RECV` entry (per the Symmetry rule). `endpoint_call`'s publish is a plain store, not a claim, into a slot actor 8 emptied at receive entry, so it never overwrites a binding (debug-asserted); the rebind's swap claims the binding it displaces. The Release publish pairs with each claimant's Acquire. |
 
 ---
 

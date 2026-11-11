@@ -72,7 +72,7 @@ fn next_process_badge(table: &ProcessTable) -> Result<u64, u64>
 /// is seeded, which it is before any userspace runs.
 fn draw_layout_entropy() -> Option<[u8; process_layout::LAYOUT_ENTROPY_BYTES]>
 {
-    let mut entropy = [0_u8; process_layout::LAYOUT_ENTROPY_BYTES];
+    let mut entropy = [0u8; process_layout::LAYOUT_ENTROPY_BYTES];
     let n = syscall::getrandom(&mut entropy).ok()?;
     (n == entropy.len() as u64).then_some(entropy)
 }

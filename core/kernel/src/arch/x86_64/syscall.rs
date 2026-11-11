@@ -220,6 +220,7 @@ unsafe extern "C" fn syscall_entry()
         "mov rdi, rsp",             // arg0 = *const TrapFrame (the user frame)
         "mov esi, 13",              // arg1 = vector (#GP)
         "xor edx, edx",             // arg2 = error_code
+        "xor ecx, ecx",             // arg3 = fault_addr (none for a #GP)
         "call {terminate}",
         "ud2",
 

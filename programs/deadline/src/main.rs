@@ -90,6 +90,9 @@ fn main()
             std::os::seraph::thread::current_thread_cap(),
             Ordering::Release,
         );
+        // infinite_loop: the worker spins until the process exits, and a
+        // `thread::spawn` closure returns a value type, not `!`.
+        #[expect(clippy::infinite_loop)]
         loop
         {
             SPINS.fetch_add(1, Ordering::Relaxed);

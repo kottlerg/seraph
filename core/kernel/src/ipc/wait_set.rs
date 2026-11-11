@@ -548,13 +548,18 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u16)
 /// - Otherwise queues `caller` behind any threads already waiting, commits
 ///   the park (a refused commit dequeues it again), and returns `None`: the
 ///   caller went through the park commit and must reach `schedule()`, then
-///   read `caller.wakeup_value`.
+///   read `caller.wakeup_value`. A committed timed wait (non-zero
+///   `deadline`) is armed on the sleep list in the same critical section.
 ///
 /// # Safety
 /// `ws` must be a valid pointer. Acquires the wait set's internal
 /// `Spinlock` for the duration; no caller-side locks are required.
 #[cfg(not(test))]
-pub unsafe fn waitset_wait(ws: *mut WaitSetState, caller: *mut ThreadControlBlock) -> Option<u64>
+pub unsafe fn waitset_wait(
+    ws: *mut WaitSetState,
+    caller: *mut ThreadControlBlock,
+    deadline: u64,
+) -> Option<u64>
 {
     // SAFETY: caller guarantees ws is valid for &mut access for the
     // duration of this call (the cap holding ws remains alive).
@@ -563,15 +568,8 @@ pub unsafe fn waitset_wait(ws: *mut WaitSetState, caller: *mut ThreadControlBloc
     // SAFETY: lock is owned by ws; matched unlock_raw on every return path.
     let saved = unsafe { ws.lock.lock_raw() };
 
-    // An entry is a hint: the member's source is re-checked as it is popped,
-    // so a readiness that lapsed since the push is skipped, and the backstop
-    // walk follows an empty ring; see core/kernel/docs/ipc-internals.md
-    // § Wait Path (Wait Set) steps 2 and 3.
-    // SAFETY: an occupied member's source is pinned alive by the +1 reference
-    // the member holds on its header (module docs); the reads are lock-free
-    // atomic loads, with no source lock (which would invert the
-    // source.lock -> ws.lock order).
-    if let Some(badge) = ws.next_ready(|m| unsafe { source_is_ready(m.source_ptr, m.source_tag) })
+    // SAFETY: ws.lock held.
+    if let Some(badge) = unsafe { next_ready_member(ws) }
     {
         // SAFETY: paired with lock_raw above.
         unsafe { ws.lock.unlock_raw(saved) };
@@ -624,9 +622,56 @@ pub unsafe fn waitset_wait(ws: *mut WaitSetState, caller: *mut ThreadControlBloc
                 .store(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    else if deadline != 0
+    {
+        // SAFETY: caller committed Blocked; ws.lock held since the push.
+        unsafe { crate::ipc::arm_timed_park(caller, deadline, "waitset_wait") };
+    }
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
     None
+}
+
+/// Return the next pending badge without waiting (`SYS_WAIT_SET_WAIT`
+/// try-once): the member [`waitset_wait`] would return at once, or `None`
+/// when no member is ready. The caller is never queued, parked, or listed on
+/// the sleep list.
+///
+/// # Safety
+/// `ws` must be a valid pointer. Acquires the wait set's internal `Spinlock`;
+/// no caller-side locks are required.
+#[cfg(not(test))]
+pub unsafe fn waitset_try_wait(ws: *mut WaitSetState) -> Option<u64>
+{
+    // SAFETY: caller guarantees ws is valid for &mut access for the
+    // duration of this call (the cap holding ws remains alive).
+    let ws = unsafe { &mut *ws };
+    // SAFETY: lock is owned by ws; paired with unlock_raw below.
+    let saved = unsafe { ws.lock.lock_raw() };
+    // SAFETY: ws.lock held.
+    let badge = unsafe { next_ready_member(ws) };
+    // SAFETY: paired with lock_raw above.
+    unsafe { ws.lock.unlock_raw(saved) };
+    badge
+}
+
+/// The badge a wait returns without parking, read off the live sources
+/// ([`WaitSetState::next_ready`]).
+///
+/// # Safety
+/// The caller holds `ws.lock`.
+#[cfg(not(test))]
+unsafe fn next_ready_member(ws: &mut WaitSetState) -> Option<u64>
+{
+    // An entry is a hint: the member's source is re-checked as it is popped,
+    // so a readiness that lapsed since the push is skipped, and the backstop
+    // walk follows an empty ring; see core/kernel/docs/ipc-internals.md
+    // § Wait Path (Wait Set) steps 2 and 3.
+    // SAFETY: an occupied member's source is pinned alive by the +1 reference
+    // the member holds on its header (module docs); the reads are lock-free
+    // atomic loads, with no source lock (which would invert the
+    // source.lock -> ws.lock order).
+    ws.next_ready(|m| unsafe { source_is_ready(m.source_ptr, m.source_tag) })
 }
 
 /// Register a source in the wait set.

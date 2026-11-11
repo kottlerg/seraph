@@ -69,6 +69,9 @@ pub fn platform_default_ecam() -> Option<EcamLocation>
 /// #165 (manifest-driven discovery).
 pub const RTC_DRIVER_NAME: &[u8] = b"goldfish-rtc";
 
+/// The ELF machine of a driver binary devmgr reads a declaration from.
+pub const ELF_MACHINE: u16 = elf::EM_RISCV;
+
 /// The IOMMU family of riscv64 platforms: the RISC-V IOMMU as a PCI
 /// function, its units described by the ACPI RIMT and programmed by
 /// `iommu-riscv`.

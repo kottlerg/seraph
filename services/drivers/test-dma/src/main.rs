@@ -7,11 +7,12 @@
 //! engine copies between a 4 KiB buffer inside the device, at device offset
 //! `0x40000`, and a device address the driver programs.
 //!
-//! devmgr binds it on svctest's `TEST_SPAWN_DMA_DRIVER` through the PCI
-//! spawn path: round 1 carries the cap of the first page of BAR 0 (the
-//! identification and DMA registers), round 2 the service endpoint, the
-//! devmgr query cap, and the device's DMA capability. It checks the
-//! device's identification register, reports ready, and answers
+//! devmgr binds it to the device by the declaration below when svcmgr hands
+//! it the drivers directory, like any driver, and delivers it the resource
+//! list of `driver_binding::resources`: BAR 0 whole (the identification and
+//! DMA registers), then the service endpoint, the devmgr query cap, and the
+//! device's DMA capability. It checks the device's identification register,
+//! reports ready, and answers
 //! `ipc::test_dma_labels::DMA_PROBE`: it maps one page of its memory for the
 //! device, copies a pattern from the page into the device's buffer and back
 //! to the page's second half, unmaps the page, and copies the buffer to the
@@ -23,9 +24,26 @@
 
 use std::time::{Duration, Instant};
 
+use driver_binding::decl::{Declaration, Interrupt, Match, Reset, Tier};
+use driver_binding::resources::{Endpoints, Resource};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, test_dma_labels};
 use std::os::seraph::{reserve_pages, startup_info};
 use syscall_abi::PAGE_SIZE;
+
+driver_binding::driver_declaration!(Declaration {
+    name: "test-dma",
+    class: Some("test-dma"),
+    matches: &[Match::PciId {
+        vendor: 0x1234,
+        device: 0x11e8,
+    }],
+    instance_limit: Some(1),
+    interrupt: Interrupt::NONE,
+    dma: true,
+    phys_access: false,
+    reset: Reset::None,
+    tier: Tier::Auxiliary,
+});
 
 /// The identification register and the value an `edu` device reads there
 /// (major version 1, minor 0).
@@ -205,32 +223,22 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let rounds = unsafe {
-        ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf).and_then(|r1| {
-            ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf).map(|r2| (r1, r2))
-        })
-    };
-    let caps = rounds.ok().and_then(|(r1, r2)| {
-        let bars = virtio_core::bootstrap::DeliveredBars::from_round(&r1)?;
-        let eps = virtio_core::bootstrap::DriverEndpoints::from_round(&r2)?;
-        Some((*bars.caps().first()?, eps))
-    });
-    let Some((bar_cap, eps)) = caps
+    let Some((bar_cap, bar_pages, eps)) = receive(info.creator_endpoint, ipc_buf)
     else
     {
         std::os::seraph::log!("test-dma: bootstrap caps missing");
         syscall::thread_exit();
     };
-    let Ok(range) = reserve_pages(1)
+    let Ok(range) = reserve_pages(bar_pages)
     else
     {
         syscall::thread_exit();
     };
     let regs = range.va_start();
-    let funded = std::os::seraph::fund_aspace_pt_budget(info.self_aspace, 1);
-    // SAFETY: `range` is a fresh one-page reservation, kept for the driver's
-    // life, and the BAR cap spans one page; the registers are reached only
+    let funded = std::os::seraph::fund_aspace_pt_budget(info.self_aspace, bar_pages);
+    // SAFETY: `range` is a fresh reservation of `bar_pages` pages, kept for
+    // the driver's life, and the BAR cap spans at most `bar_pages` pages, so
+    // the whole-cap mapping stays inside it; the registers are reached only
     // through raw volatile accesses (`mmio_map` § Safety).
     if !funded || unsafe { syscall::mmio_map(info.self_aspace, bar_cap, regs, 0) }.is_err()
     {
@@ -254,6 +262,29 @@ fn main() -> !
         syscall::thread_exit();
     }
     serve(&driver, eps.service, ipc_buf);
+}
+
+/// Request the resource list from `creator`, the driver's creator endpoint:
+/// the cap of BAR 0 with the pages it spans, and the end round's endpoints.
+/// `None` when the list does not decode, carries no BAR 0, or carries no DMA
+/// capability.
+fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Endpoints)>
+{
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let list = unsafe { driver_binding::resources::receive(creator, ipc_buf) }.ok()?;
+    let eps = list.endpoints()?;
+    let bar = list.resources().iter().find_map(|r| match *r
+    {
+        Resource::Mmio {
+            cap,
+            bar: Some(0),
+            bytes,
+            ..
+        } => Some((cap, bytes.div_ceil(PAGE_SIZE))),
+        _ => None,
+    });
+    let (cap, pages) = bar?;
+    (eps.dma != 0 && eps.service != 0).then_some((cap, pages, eps))
 }
 
 /// Answer `DMA_PROBE` for the rest of the driver's life.

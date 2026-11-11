@@ -646,6 +646,46 @@ pub const MSG_CAP_SLOTS_MAX: usize = 4;
 /// this word on.
 pub const MSG_CAP_HANDLES_WORD: usize = MSG_DATA_WORDS_MAX + 1;
 
+// ── Wait timeouts ─────────────────────────────────────────────────────────────
+
+/// The `timeout_ms` sentinel that makes a wait a non-blocking try-once: the
+/// wait takes what is ready, or returns `WouldBlock` at once without parking.
+/// `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
+/// `SYS_WAIT_SET_WAIT` accept it; `0` blocks indefinitely, and any other value
+/// bounds the wait in milliseconds (`core/kernel/docs/syscalls.md`).
+pub const WAIT_TRY_ONCE: u64 = u64::MAX;
+
+/// Bit position of `SYS_IPC_CALL`'s `timeout_ms` in its `arg2`: the low 32
+/// bits carry `data_count`, the high 32 bits `timeout_ms` (`0` = no timeout).
+pub const IPC_CALL_TIMEOUT_SHIFT: u32 = 32;
+
+/// `SYS_IPC_CALL`'s `arg2`: `data_count` in the low 32 bits, `timeout_ms` in
+/// the high 32 (`0` = block until the reply). A `data_count` wider than 32
+/// bits is cut to its low 32 bits, which the kernel then clamps to
+/// [`MSG_DATA_WORDS_MAX`] as it clamps any larger count.
+#[must_use]
+pub const fn ipc_call_count_arg(data_count: u64, timeout_ms: u32) -> u64
+{
+    (data_count & 0xFFFF_FFFF) | ((timeout_ms as u64) << IPC_CALL_TIMEOUT_SHIFT)
+}
+
+/// The `data_count` field of a `SYS_IPC_CALL` `arg2` ([`ipc_call_count_arg`]),
+/// before the kernel's clamp to [`MSG_DATA_WORDS_MAX`].
+#[must_use]
+pub const fn ipc_call_data_count(arg2: u64) -> u64
+{
+    arg2 & 0xFFFF_FFFF
+}
+
+/// The `timeout_ms` field of a `SYS_IPC_CALL` `arg2` ([`ipc_call_count_arg`]).
+// cast_possible_truncation: the shift leaves only the high 32 bits.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub const fn ipc_call_timeout_ms(arg2: u64) -> u32
+{
+    (arg2 >> IPC_CALL_TIMEOUT_SHIFT) as u32
+}
+
 /// Free slots every `CSpace` keeps back from general allocations for IPC
 /// capability transfer: one message's worth ([`MSG_CAP_SLOTS_MAX`]). A
 /// general allocation (a `cap_create_*`, `cap_copy`, `cap_derive`, a
@@ -1434,6 +1474,33 @@ pub const STACK_CLASS_HANDOFF: u64 = 2;
 mod tests
 {
     use super::*;
+
+    // Defects guarded: a packing that lets the timeout leak into the data
+    // count (a timed call then sends a wrong word count), one that drops
+    // timeout bits, or an untimed call whose arg2 is not its bare count.
+    #[test]
+    fn ipc_call_count_arg_round_trips_count_and_timeout()
+    {
+        assert_eq!(ipc_call_count_arg(7, 0), 7, "untimed arg2 is the count");
+        for (count, timeout) in [
+            (0, 1),
+            (64, 5000),
+            (0xFFFF_FFFF, u32::MAX),
+            (3, 0x8000_0000),
+        ]
+        {
+            let arg = ipc_call_count_arg(count, timeout);
+            assert_eq!(ipc_call_data_count(arg), count);
+            assert_eq!(ipc_call_timeout_ms(arg), timeout);
+        }
+        let wide = ipc_call_count_arg(0x1_0000_0005, 9);
+        assert_eq!(ipc_call_data_count(wide), 5, "count cut to 32 bits");
+        assert_eq!(
+            ipc_call_timeout_ms(wide),
+            9,
+            "count bits never reach the timeout"
+        );
+    }
 
     // The defect caught: a top-up that leaves the body arena no page after
     // the slots it funds (a split then fails while slot headroom looked

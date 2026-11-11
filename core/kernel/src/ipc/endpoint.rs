@@ -29,8 +29,9 @@
 //! `ep.lock`. Callers enter with no scheduler lock held (lock order:
 //! core/kernel/docs/scheduling-internals.md § Lock Hierarchy). A server's `reply_tcb` is
 //! claimed by compare-exchange (`endpoint_reply`, cancel, teardown) or by an
-//! atomic swap (the `SYS_IPC_REPLY` failure path and the release of an
-//! unreplied caller at receive entry); the claim protocol is in
+//! atomic swap (the `SYS_IPC_REPLY` failure path, the release of an unreplied
+//! caller at receive entry, and the receive's rebind, which displaces the
+//! earlier binding as it publishes the next); the claim protocol is in
 //! core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership, and the swap claim
 //! in core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes.
 
@@ -189,9 +190,11 @@ unsafe fn dequeue(
 /// call): CAS the server's `reply_tcb` back to null (the caller's own dealloc
 /// may have beaten us; if so it owns the teardown). On the CAS win (the
 /// episode claim), stamp the cancelled disposition so the caller's resume
-/// takes the error path, and release the wake-in-flight claim so its dealloc
-/// can proceed (#160). On a loss, another claimant owns the wake and will
-/// clear it. Either way, republish `context_saved` (the park never happened).
+/// takes the error path, clear a timed call's deadline, which its sleep-list
+/// add then refuses, and release the wake-in-flight claim so its dealloc can
+/// proceed (#160). On a loss, another claimant owns the wake and the deadline,
+/// and will clear both. Either way, republish `context_saved` (the park never
+/// happened).
 ///
 /// # Safety
 /// `server` and `caller` must be valid TCBs; the lock of the endpoint that
@@ -220,6 +223,7 @@ unsafe fn rollback_uncommitted_call(
                 caller,
                 crate::sched::thread::ParkKind::of_blocked(parked_state),
             );
+            crate::ipc::cancel_timed_entry(caller);
             (*caller)
                 .wake_in_flight
                 .store(0, core::sync::atomic::Ordering::Release);
@@ -249,6 +253,11 @@ unsafe fn rollback_uncommitted_call(
 /// `in_fault_delivery` flag tells a later [`endpoint_recv`] which awaiting-reply
 /// state to transition it to.
 ///
+/// `deadline` is the tick at which a timed call expires, or `0` for an untimed
+/// one (a fault delivery is never timed). The one sleep-list entry it arms
+/// bounds the whole call, its send park and its reply park
+/// (core/kernel/docs/ipc-internals.md § Call Path (Sender)).
+///
 /// # Safety
 /// `ep` and `caller` must be valid, and `caller` must be the running thread.
 /// Call with no scheduler lock and no `ep.lock` held.
@@ -258,6 +267,7 @@ pub unsafe fn endpoint_call(
     caller: *mut ThreadControlBlock,
     msg: &Message,
     parked_state: IpcThreadState,
+    deadline: u64,
 ) -> Result<*mut ThreadControlBlock, ()>
 {
     // SAFETY: ep validated by caller.
@@ -272,6 +282,10 @@ pub unsafe fn endpoint_call(
     let server = unsafe { dequeue(&mut ep.recv_head, &mut ep.recv_tail) };
     if !server.is_null()
     {
+        // The dequeue claimed the server's receive, so a timed receive's
+        // entry goes with it, under ep.lock.
+        // SAFETY: server was just dequeued under ep.lock.
+        unsafe { crate::ipc::cancel_timed_entry(server) };
         // undocumented_unsafe_blocks: the two unsafe reads sit inside debug_assert!
         // arguments, where a per-block SAFETY comment cannot be placed. Both are
         // sound: server was just dequeued from recv_head under ep.lock and is a live
@@ -316,6 +330,13 @@ pub unsafe fn endpoint_call(
             (*caller)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
+            // A timed call's deadline, too, before reply_tcb is published:
+            // the Release carries it to every claimant, which clears it with
+            // its claim, and the sleep-list add after the commit below then
+            // refuses rather than list a claimed park.
+            (*caller)
+                .sleep_deadline
+                .store(deadline, core::sync::atomic::Ordering::Relaxed);
             // The server reached the recv queue through endpoint_recv, which
             // released any binding it still held, so the slot is empty.
             debug_assert!(
@@ -348,6 +369,15 @@ pub unsafe fn endpoint_call(
             // call.
             // SAFETY: caller / server validated; ep.lock held.
             unsafe { rollback_uncommitted_call(server, caller, parked_state) };
+        }
+        else if deadline != 0
+        {
+            // A claimant may already have cleared the deadline (the server
+            // replied, or a stop cancelled the reply park, since the commit);
+            // the add then refuses, and the claim owns the episode.
+            // SAFETY: caller is the running thread, committed Blocked;
+            // SLEEP_LIST_LOCK nests under ep.lock as a leaf.
+            let _ = unsafe { crate::sched::sleep_list_add(caller) };
         }
         // SAFETY: paired with lock_raw above.
         unsafe { ep.lock.unlock_raw(saved) };
@@ -404,6 +434,12 @@ pub unsafe fn endpoint_call(
                 .store(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    else if deadline != 0
+    {
+        // SAFETY: caller is the running thread, committed Blocked and queued
+        // under the ep.lock held since its push.
+        unsafe { crate::ipc::arm_timed_park(caller, deadline, "endpoint_call") };
+    }
     // Notify a registered wait set of every call queued, not only the one
     // that made the send queue non-empty: each arrival wakes one of the
     // threads waiting on the set (core/kernel/docs/ipc-internals.md
@@ -422,16 +458,12 @@ pub unsafe fn endpoint_call(
 /// never replied to.
 ///
 /// The swap of `reply_tcb` to null is the episode claim, competing as any
-/// reply-slot claim does with `cancel_ipc_block` and the
-/// `dealloc_object(Thread)` client and server arms. The other claimants
+/// reply-slot claim does with `cancel_ipc_block`, a timed call's expiry, and
+/// the `dealloc_object(Thread)` client and server arms. The other claimants
 /// cannot run meanwhile: `endpoint_reply`, the `SYS_IPC_REPLY` failure-path
-/// swap and `endpoint_recv`'s rebind rollback run on this thread, and
-/// `endpoint_call`'s rollback only while this server is parked. On a win the
-/// caller's call fails with `Interrupted`, a fault-blocked caller is killed
-/// (one blocked on its restartable syscall's user copy has that syscall fail
-/// with `InvalidAddress`), or a caller blocked in an upcall delivery has the
-/// upcall dropped and resumes, and the caller is woken; the `wake_in_flight` pin set at bind
-/// keeps it alive until that wake clears it.
+/// swap and the receive's rebind run on this thread, and `endpoint_call`'s
+/// rollback only while this server is parked. On a win the caller is
+/// released as [`release_displaced_caller`] describes.
 ///
 /// # Safety
 /// `server` must be the running thread's valid TCB. Call with no scheduler
@@ -445,6 +477,26 @@ unsafe fn release_unreplied_caller(server: *mut ThreadControlBlock)
             .reply_tcb
             .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel)
     };
+    // SAFETY: a non-null caller is the binding the swap claimed; no lock held.
+    unsafe { release_displaced_caller(caller) };
+}
+
+/// Release `caller`, a reply binding whose episode a swap of the server's
+/// `reply_tcb` just claimed (at receive entry, or by the rebind of the next
+/// caller); a null `caller` is no binding. The caller's call fails with
+/// `Interrupted`, a fault-blocked caller is killed (one blocked on its
+/// restartable syscall's user copy has that syscall fail with
+/// `InvalidAddress`), or a caller blocked in an upcall delivery has the upcall
+/// dropped and resumes; a timed call's sleep-list entry is removed; and the
+/// caller is woken. The `wake_in_flight` pin set at bind keeps it alive until
+/// that wake clears it.
+///
+/// # Safety
+/// `caller` is null, or the valid TCB of a binding the caller's swap claimed.
+/// Call with no scheduler or endpoint lock held.
+#[cfg(not(test))]
+unsafe fn release_displaced_caller(caller: *mut ThreadControlBlock)
+{
     if caller.is_null()
     {
         return;
@@ -456,40 +508,29 @@ unsafe fn release_unreplied_caller(server: *mut ThreadControlBlock)
             caller,
             crate::sched::thread::ParkKind::of_sender(caller),
         );
+        crate::ipc::cancel_timed_entry(caller);
         let target_cpu = crate::sched::select_target_cpu(caller);
         crate::sched::enqueue_and_wake(caller, target_cpu);
     }
 }
 
-/// Attempt to receive on `ep` as `server`.
+/// Dequeue the first live sender on `ep` and bind it to `server` for the
+/// reply, under `ep.lock`, which the caller holds.
 ///
-/// First releases a caller still bound from an earlier unreplied receive
-/// (`release_unreplied_caller`). Returns `Ok(caller, msg)` if a sender was
-/// waiting (server continues running; sender remains blocked on reply).
-/// Returns `Err(())` if no sender was available (the server is committed
-/// `BlockedOnRecv` on the recv queue, unless the park is refused, in which case
-/// it is unlinked and, on a stop-won or upcall refusal, its park is stamped
-/// INTERRUPTED).
+/// Returns `Some((caller, msg, displaced))` when a sender was bound:
+/// `displaced` is the binding the rebind's swap displaced (null when the slot
+/// was empty), which the caller MUST release with [`release_displaced_caller`]
+/// once it has dropped `ep.lock`. Returns `None` when the send queue holds no
+/// live sender, and `server`'s binding is then unchanged.
 ///
 /// # Safety
-/// `ep` and `server` must be valid, and `server` must be the running thread.
-/// Call with no scheduler lock and no `ep.lock` held.
+/// `server` must be the running thread's valid TCB, and `ep.lock` held.
 #[cfg(not(test))]
-pub unsafe fn endpoint_recv(
-    ep: *mut EndpointState,
+unsafe fn bind_next_sender(
+    ep: &mut EndpointState,
     server: *mut ThreadControlBlock,
-) -> Result<(*mut ThreadControlBlock, Message), ()>
+) -> Option<(*mut ThreadControlBlock, Message, *mut ThreadControlBlock)>
 {
-    // SAFETY: server is the running thread; no lock held (contract).
-    unsafe { release_unreplied_caller(server) };
-
-    // SAFETY: ep validated by caller.
-    let ep = unsafe { &mut *ep };
-
-    // SAFETY: lock serialises the send/recv queues and the call/recv rendezvous
-    // (reply is serialised by the `reply_tcb` claim); paired with unlock_raw below.
-    let saved = unsafe { ep.lock.lock_raw() };
-
     // Dequeue successive senders, skipping any that died / were stopped
     // mid-rebind. The BlockedOnSend → BlockedOnReply transition publishes the
     // reply binding (`server.reply_tcb`, the caller's `ipc_state` /
@@ -497,11 +538,12 @@ pub unsafe fn endpoint_recv(
     // `(ipc_state, blocked_on_object)` to find and clear that binding when the
     // caller dies. `endpoint_call` keeps the two consistent by committing the
     // transition under the scheduler lock (`commit_blocked_under_local_lock`);
-    // this path must do the same via `commit_reply_rebind_under_local_lock`. If
-    // the caller died concurrently the commit fails: tear the binding down so no
-    // stale `reply_tcb` survives to fire against the freed/reused slot
-    // (#289 use-after-free / double-enqueue; #284 TCB-field corruption), then
-    // skip to the next queued sender.
+    // this path does the same via `commit_reply_rebind_under_local_lock`, which
+    // publishes `reply_tcb` inside that hold. If the caller died or was stopped
+    // concurrently the commit refuses and publishes nothing, so no stale
+    // `reply_tcb` survives to fire against the freed/reused slot (#289
+    // use-after-free / double-enqueue; #284 TCB-field corruption); this path
+    // then retires the dequeued sender's episode and skips to the next.
     loop
     {
         // SAFETY: send_head/send_tail maintained by enqueue/dequeue operations.
@@ -512,7 +554,7 @@ pub unsafe fn endpoint_recv(
         unsafe { ep.refresh_send_ready() };
         if caller.is_null()
         {
-            break;
+            return None;
         }
         // SAFETY: caller dequeued from send_head.
         let msg = unsafe { (*caller).ipc_msg };
@@ -530,74 +572,94 @@ pub unsafe fn endpoint_recv(
         {
             IpcThreadState::BlockedOnReply
         };
-        // SAFETY: server validated by syscall layer.
+        // Caller transitions BlockedOnSend → `parked` (BlockedOnReply, or
+        // BlockedOnFault for a fault sender): claim it for the eventual reply
+        // wake BEFORE the rebind publishes reply_tcb, so dealloc's
+        // BlockedOnReply / BlockedOnFault detach (which Acquire-loads
+        // reply_tcb) sees the flag and gates on it before retype_free (#160).
+        // SAFETY: caller dequeued from send_head under ep.lock.
         unsafe {
-            // Caller transitions BlockedOnSend → `parked` (BlockedOnReply, or
-            // BlockedOnFault for a fault sender): claim it for the eventual reply wake
-            // BEFORE publishing reply_tcb, so dealloc's BlockedOnReply / BlockedOnFault
-            // detach (which Acquire-loads reply_tcb) sees the flag and gates on it before
-            // retype_free (#160).
             (*caller)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
-            // Entry released any earlier binding, and a failed rebind below
-            // clears this one, so the slot is empty.
-            debug_assert!(
-                (*server)
-                    .reply_tcb
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                    .is_null(),
-                "endpoint_recv: server already holds a reply binding"
-            );
-            (*server)
-                .reply_tcb
-                .store(caller, core::sync::atomic::Ordering::Release);
         }
         // Commit the rebind under the caller's scheduler lock so the
         // (ipc_state, blocked_on_object) publication is serialised with
         // dealloc_object(Thread)'s all-CPU-locks Exited mark and SYS_THREAD_STOP.
-        // SAFETY: caller is a valid Blocked TCB dequeued from the send queue.
-        let committed = unsafe {
-            crate::sched::commit_reply_rebind_under_local_lock(caller, parked, server.cast::<u8>())
-        };
-        if committed
+        // A timed call keeps its sleep-list entry: the timeout bounds the
+        // reply park too.
+        // SAFETY: caller is a valid Blocked TCB dequeued from the send queue;
+        // server is the running thread.
+        let committed =
+            unsafe { crate::sched::commit_reply_rebind_under_local_lock(caller, parked, server) };
+        if let Some(displaced) = committed
         {
-            // SAFETY: paired with lock_raw above.
-            unsafe { ep.lock.unlock_raw(saved) };
-            return Ok((caller, msg));
+            return Some((caller, msg, displaced));
         }
-        // Rollback: the caller is dying or stopped. CAS the reply binding back
-        // to null (the caller's own dealloc may have beaten us; if so it owns
-        // the teardown) and release the wake-in-flight claim so its dealloc
-        // can proceed past the #160 gate. Then skip this dead sender.
-        // SAFETY: server / caller validated.
+        // Refused: the caller is dying or stopped, and nothing was published.
+        // The send-queue dequeue above is the episode claim (and why a
+        // concurrent cancel_ipc_block's unlink lost and did not stamp): a
+        // STOPPED caller resumes on restart via this disposition. Stamp
+        // before releasing the wake-in-flight gate — after the release a
+        // dying caller's dealloc may free the TCB. The refusal already
+        // removed a timed call's entry. Then skip this dead sender.
+        // SAFETY: caller validated; ep.lock held.
         unsafe {
-            let cleared = (*server)
-                .reply_tcb
-                .compare_exchange(
-                    caller,
-                    core::ptr::null_mut(),
-                    core::sync::atomic::Ordering::AcqRel,
-                    core::sync::atomic::Ordering::Acquire,
-                )
-                .is_ok();
-            if cleared
-            {
-                // Teardown CAS win = episode claim. The send-queue dequeue
-                // above is also why a concurrent cancel_ipc_block's unlink
-                // lost and did not stamp: a STOPPED caller resumes on restart
-                // via this disposition. Stamp before releasing the
-                // wake-in-flight gate — after the release a dying caller's
-                // dealloc may free the TCB.
-                crate::sched::thread::stamp_cancelled_deposit(
-                    caller,
-                    crate::sched::thread::ParkKind::of_blocked(parked),
-                );
-                (*caller)
-                    .wake_in_flight
-                    .store(0, core::sync::atomic::Ordering::Release);
-            }
+            crate::sched::thread::stamp_cancelled_deposit(
+                caller,
+                crate::sched::thread::ParkKind::of_blocked(parked),
+            );
+            (*caller)
+                .wake_in_flight
+                .store(0, core::sync::atomic::Ordering::Release);
         }
+    }
+}
+
+/// Attempt to receive on `ep` as `server`.
+///
+/// First releases a caller still bound from an earlier unreplied receive
+/// (`release_unreplied_caller`). Returns `Ok(caller, msg)` if a sender was
+/// waiting (server continues running; sender remains blocked on reply).
+/// Returns `Err(())` if no sender was available (the server is committed
+/// `BlockedOnRecv` on the recv queue, unless the park is refused, in which case
+/// it is unlinked and, on a stop-won or upcall refusal, its park is stamped
+/// INTERRUPTED).
+///
+/// `deadline` is the tick at which a timed receive's park expires, or `0` for
+/// an untimed one.
+///
+/// # Safety
+/// `ep` and `server` must be valid, and `server` must be the running thread.
+/// Call with no scheduler lock and no `ep.lock` held.
+#[cfg(not(test))]
+pub unsafe fn endpoint_recv(
+    ep: *mut EndpointState,
+    server: *mut ThreadControlBlock,
+    deadline: u64,
+) -> Result<(*mut ThreadControlBlock, Message), ()>
+{
+    // SAFETY: server is the running thread; no lock held (contract).
+    unsafe { release_unreplied_caller(server) };
+
+    // SAFETY: ep validated by caller.
+    let ep = unsafe { &mut *ep };
+
+    // SAFETY: lock serialises the send/recv queues and the call/recv rendezvous
+    // (reply is serialised by the `reply_tcb` claim); paired with unlock_raw below.
+    let saved = unsafe { ep.lock.lock_raw() };
+
+    // SAFETY: server is the running thread; ep.lock held.
+    if let Some((caller, msg, displaced)) = unsafe { bind_next_sender(ep, server) }
+    {
+        // Entry released any earlier binding, and only this thread binds.
+        debug_assert!(
+            displaced.is_null(),
+            "endpoint_recv: server already held a reply binding"
+        );
+        // SAFETY: paired with lock_raw above.
+        unsafe { ep.lock.unlock_raw(saved) };
+        return Ok((caller, msg));
     }
 
     // No sender — block server on recv queue.
@@ -649,9 +711,47 @@ pub unsafe fn endpoint_recv(
                 .store(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    else if deadline != 0
+    {
+        // SAFETY: server is the running thread, committed Blocked and queued
+        // under the ep.lock held since its push.
+        unsafe { crate::ipc::arm_timed_park(server, deadline, "endpoint_recv") };
+    }
     // SAFETY: paired with lock_raw above.
     unsafe { ep.lock.unlock_raw(saved) };
     Err(())
+}
+
+/// Receive on `ep` as `server` without parking (`SYS_IPC_RECV` try-once).
+///
+/// Returns `Some((caller, msg))` when a sender was waiting, bound as
+/// [`endpoint_recv`] binds it; the caller this binding displaced (one still
+/// bound from an earlier unreplied receive) is released only then, after
+/// `ep.lock` drops. Returns `None` when no sender was waiting, and leaves
+/// `server`'s earlier binding in place, so a later `SYS_IPC_REPLY` still
+/// reaches that caller.
+///
+/// # Safety
+/// `ep` and `server` must be valid, and `server` must be the running thread.
+/// Call with no scheduler lock and no `ep.lock` held.
+#[cfg(not(test))]
+pub unsafe fn endpoint_try_recv(
+    ep: *mut EndpointState,
+    server: *mut ThreadControlBlock,
+) -> Option<(*mut ThreadControlBlock, Message)>
+{
+    // SAFETY: ep validated by caller.
+    let ep = unsafe { &mut *ep };
+    // SAFETY: paired with unlock_raw below.
+    let saved = unsafe { ep.lock.lock_raw() };
+    // SAFETY: server is the running thread; ep.lock held.
+    let bound = unsafe { bind_next_sender(ep, server) };
+    // SAFETY: paired with lock_raw above.
+    unsafe { ep.lock.unlock_raw(saved) };
+    let (caller, msg, displaced) = bound?;
+    // SAFETY: the rebind's swap claimed `displaced`; no lock held.
+    unsafe { release_displaced_caller(displaced) };
+    Some((caller, msg))
 }
 
 /// Claim the caller bound in `server.reply_tcb` for a reply.
@@ -703,11 +803,15 @@ pub unsafe fn endpoint_reply(server: *mut ThreadControlBlock) -> Option<*mut Thr
             .is_err()
     }
     {
-        // A concurrent `cancel_ipc_block` or dealloc arm already cleared
-        // the slot; it owns the wake (and the client may already be
-        // Stopped or Exited).
+        // A concurrent `cancel_ipc_block`, timed call's expiry, or dealloc
+        // arm already cleared the slot; it owns the wake (and the client may
+        // already be Stopped or Exited).
         return None;
     }
+    // The CAS win ends the call's episode, so a timed call's entry goes now,
+    // before the wake: a later timed park of the caller arms a new one.
+    // SAFETY: the CAS claimed caller, whose wake_in_flight pin keeps it live.
+    unsafe { crate::ipc::cancel_timed_entry(caller) };
 
     // `caller.wake_in_flight` was set to 1 when the caller became
     // BlockedOnReply or BlockedOnFault (in endpoint_call / endpoint_recv,
@@ -726,8 +830,8 @@ pub unsafe fn endpoint_reply(server: *mut ThreadControlBlock) -> Option<*mut Thr
 ///
 /// Returns `true` if the TCB was found and removed, `false` if not present.
 ///
-/// Used by `cancel_ipc_block` (the `SYS_THREAD_STOP` and object-teardown
-/// cancel path), by `dealloc_object(Thread)`'s `BlockedOnSend` /
+/// Used by `cancel_park` (the `SYS_THREAD_STOP`, object-teardown, upcall and
+/// timeout cancel path), by `dealloc_object(Thread)`'s `BlockedOnSend` /
 /// `BlockedOnRecv` unlink, and by the refused-park rollbacks in
 /// `endpoint_call` and `endpoint_recv`.
 ///

@@ -244,8 +244,8 @@ const SPECS: &[Spec] = &[
     },
     // TODO(#165): remove with the devmgr enumeration redesign. Test-only
     // driver for QEMU's `edu` DMA device, which every launch attaches; it
-    // ships on the rootfs and is spawned only by devmgr's
-    // TEST_SPAWN_DMA_DRIVER shim under svctest.
+    // ships on the rootfs, and devmgr binds it to that device by its
+    // declaration at SET_DRIVERS_DIR.
     Spec {
         name: "test-dma",
         install_name: None,

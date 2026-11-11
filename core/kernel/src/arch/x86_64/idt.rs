@@ -385,6 +385,13 @@ macro_rules! paranoid_exit_asm {
 /// until one needs this CPU: it acks no further IPI, so the next TLB shootdown
 /// that names it ends in the IPI watchdog's `fatal`.
 ///
+/// The dump prints `fault_addr` as `cr2`: the faulting address of a `#PF`, which
+/// [`page_fault_handler`] reads from CR2 at the fault's entry, and 0 for every
+/// other vector. CR2 is not read here: a page fault delivered to a fault
+/// handler that declined it reaches this path only after the thread blocked on
+/// the handler, by which time other page faults on the CPU have overwritten
+/// CR2.
+///
 /// # Safety
 /// `tf` must point to a valid user-or-kernel [`TrapFrame`] on the current kernel
 /// stack; `vector` and `error_code` classify the fault (taken from the stub
@@ -394,25 +401,13 @@ pub(super) unsafe extern "C" fn common_exception_handler(
     tf: *const TrapFrame,
     vector: u64,
     error_code: u64,
+    fault_addr: u64,
 ) -> !
 {
     // SAFETY: tf is valid per this function's contract — built on this kernel
     // stack by an exception trampoline or by syscall_entry's register save.
     let f = unsafe { &*tf };
-    // Read CR2 (faulting address) for page faults (vector 14).
-    let cr2: u64 = if vector == 14
-    {
-        let v: u64;
-        // SAFETY: CR2 is a valid read-only register at ring 0; page fault context.
-        unsafe {
-            core::arch::asm!("mov {}, cr2", out(reg) v, options(nostack, nomem));
-        }
-        v
-    }
-    else
-    {
-        0
-    };
+    let cr2 = fault_addr;
 
     // Check if the fault came from userspace (CPL 3) or kernel (CPL 0). A
     // hardware NMI, #DF, and #MC take the fatal path whatever ring they
@@ -619,7 +614,7 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
     // from either ring).
     // SAFETY: tf valid; common_exception_handler never returns.
     unsafe {
-        common_exception_handler(tf.cast_const(), vector, error_code);
+        common_exception_handler(tf.cast_const(), vector, error_code, 0);
     }
 }
 
@@ -1297,6 +1292,17 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
 
     super::cpu::debug_assert_kernel_entry_flags();
 
+    // The faulting address, read once at entry: a delivery to a fault handler
+    // blocks this thread, and other page faults on the CPU overwrite CR2 before
+    // a declined fault reaches the kill path's dump.
+    let cr2: u64;
+    // SAFETY: CR2 holds the faulting linear address for a #PF; read-only at
+    // ring 0, and no fault has been taken since entry (the interrupt gate left
+    // IF=0).
+    unsafe {
+        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
+    }
+
     // SAFETY: tf is constructed by isr_page_fault on this stack.
     let f = unsafe { &*tf };
     let from_user = (f.cs & 3) != 0;
@@ -1309,12 +1315,6 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
     // present/permission faults from userspace are retry candidates.
     if from_user && error_code & ERR_RSVD == 0
     {
-        let cr2: u64;
-        // SAFETY: CR2 holds the faulting linear address for a #PF; read-only at
-        // ring 0.
-        unsafe {
-            core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
-        }
         let access = access_of(error_code);
         // SAFETY: ring 0; the faulting thread's CR3 is still active (no context
         // switch since entry — the interrupt gate left IF=0).
@@ -1378,12 +1378,6 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
         // again (docs/fault-handling.md § Kernel Copies).
         if error_code & ERR_RSVD == 0
         {
-            let cr2: u64;
-            // SAFETY: CR2 holds the faulting linear address for a #PF; read-only
-            // at ring 0.
-            unsafe {
-                core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
-            }
             // A copy's fault is a data access, which decodes as a load or a store.
             // SAFETY: ring 0 in the copying thread's context; its CR3 is still
             // active (the interrupt gate left IF=0).
@@ -1406,7 +1400,7 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
     // (userspace) or fatal (kernel).
     // SAFETY: tf is valid; common_exception_handler never returns.
     unsafe {
-        common_exception_handler(tf.cast_const(), 14, error_code);
+        common_exception_handler(tf.cast_const(), 14, error_code, cr2);
     }
 }
 
@@ -1645,7 +1639,7 @@ extern "C" fn ipi_nmi_backtrace_handler(tf: *const TrapFrame, vector: u64, error
         // Real hardware NMI — defer to the standard fatal path.
         // SAFETY: tf constructed by ipi_nmi_backtrace_stub above.
         unsafe {
-            common_exception_handler(tf, vector, error_code);
+            common_exception_handler(tf, vector, error_code, 0);
         }
     }
     // SAFETY: tf constructed by ipi_nmi_backtrace_stub above.
@@ -1727,7 +1721,7 @@ extern "C" fn ipi_tlb_shootdown_handler()
     }
 
     // Send EOI to local APIC.
-    // SAFETY: Vector 250 is the TLB shootdown vector.
+    // Vector 250 is the TLB shootdown vector.
     super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_TLB_SHOOTDOWN));
 }
 
@@ -1740,7 +1734,7 @@ extern "C" fn ipi_tlb_shootdown_handler()
 extern "C" fn ipi_wakeup_handler()
 {
     // Send EOI to local APIC. No other work needed; the interrupt wakes the CPU.
-    // SAFETY: Vector 251 is the wakeup IPI vector.
+    // Vector 251 is the wakeup IPI vector.
     super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_WAKEUP));
 }
 

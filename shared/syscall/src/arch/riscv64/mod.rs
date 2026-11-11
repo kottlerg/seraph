@@ -153,7 +153,7 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 /// # Safety
 ///
 /// The `# Safety` contract of `crate::raw_syscall4`, its only caller, which
-/// replaces the raw-wrapper contract in [`crate::arch`] § Safety: the call must
+/// replaces the raw-wrapper contract in [`crate::arch`] § Safety. The call must
 /// leave untouched everything the calling program runs on (see that contract's
 /// four conditions). Under it any argument value is admissible, and `nr` need
 /// not be a defined syscall.
@@ -253,9 +253,9 @@ pub unsafe fn syscall2_ret3(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64)
     (ret, secondary, tertiary)
 }
 
-/// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
+/// Issue a syscall with 2 arguments. Returns (primary, secondary, tertiary, quaternary).
 ///
-/// Used by `raw_ipc_recv` to retrieve `(ret, label, badge, word_count)`.
+/// Used by `raw_ipc_recv_timeout` to retrieve `(ret, label, badge, word_count)`.
 ///
 /// # Safety
 ///
@@ -264,7 +264,7 @@ pub unsafe fn syscall2_ret3(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64)
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
 #[allow(clippy::inline_always, clippy::cast_possible_wrap)]
 #[inline(always)]
-pub unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
+pub unsafe fn syscall2_ret4(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64, u64)
 {
     let ret: i64;
     let secondary: u64;
@@ -272,12 +272,13 @@ pub unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
     let quaternary: u64;
     let a0 = a0 as i64;
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
-    // arg in a0 (inout); reads secondary from a1, tertiary from a2, quaternary from a3.
+    // args in a0 and a1 (inout); reads secondary from a1, tertiary from a2, quaternary
+    // from a3.
     unsafe {
         core::arch::asm!(
             "ecall",
             inout("a0") a0 => ret,
-            lateout("a1") secondary,
+            inout("a1") a1 => secondary,
             lateout("a2") tertiary,
             lateout("a3") quaternary,
             in("a7") nr,

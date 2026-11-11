@@ -341,7 +341,7 @@ fn running_qemus() -> Vec<u32>
 #[cfg(unix)]
 fn load_average() -> Option<f64>
 {
-    let mut loads = [0.0_f64; 3];
+    let mut loads = [0.0f64; 3];
     // SAFETY: `getloadavg` writes at most `nelem` (here 1) doubles into the
     // buffer it is given, which holds 3, and keeps no pointer to it.
     let read = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };

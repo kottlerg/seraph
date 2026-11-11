@@ -195,7 +195,7 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
     };
     let split_at = ram_size - pool_chunk;
 
-    // SAFETY: ram_frame validated above; single-threaded boot.
+    // ram_frame validated above; single-threaded boot.
     let Ok(pool_tail) = syscall::memory_split(ram_frame, split_at)
     else
     {

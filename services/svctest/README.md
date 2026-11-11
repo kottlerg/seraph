@@ -32,6 +32,7 @@ services/svctest/
         │                      # object-slab release; deferred reclaim; identity;
         │                      # physical base withheld
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
+        ├── log_client.rs      # Log-call bounds against a log receiver that never answers
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
@@ -46,7 +47,7 @@ services/svctest/
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
         │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
-        │                      #   refused access
+        │                      #   refused access; page-table drain; teardown
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
@@ -142,7 +143,7 @@ that its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, 
 devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`,
 `QUERY_SHUTDOWN_DEVICE`, `QUERY_DEBUG_PORT_DEVICE`, `TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`,
 `TEST_QUERY_DENY_DEVICE`, `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`,
-`TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS`, and the input-ordinal
+`TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS`, and the input-ordinal
 phase, which requires a cap from `QUERY_INPUT_DEVICE` at instance ordinal 0 (sent and absent) and
 `NO_DEVICE` past the one keyboard of every boot's device set. The drivers stray-cap phase takes
 granted SENDs on the serial and input drivers' endpoints through `caps[2]` (`QUERY_SERIAL_DEVICE`
@@ -158,7 +159,7 @@ registration cases, and the input case, log a skip when `terminal.svc` is staged
 would take the terminal's input. `caps[3]` exists for devmgr's test
 labels (TODO(#165): retire with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim, the
 driver-withdrawal phase's `TEST_SPAWN_FAULT_DRIVERS` and `TEST_QUERY_FAULT_DEVICE` shims, the DMA
-confinement phase's `TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS` shims,
+confinement phase's `TEST_QUERY_DMA_DEVICE` and `TEST_DMA_FAULTS` shims,
 and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a SEND on the serial, input, or
 framebuffer driver's endpoint badged with none of the driver's verb bits. That phase requires an
 `UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and
@@ -233,15 +234,17 @@ procmgr). The
 devmgr orphan-teardown phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md)
 driver, and the driver-withdrawal phase three [`test-fault`](../drivers/test-fault/README.md)
 drivers, one of which never reports ready, so the phase waits the fault batch's settle bound
-(`TEST_FAULT_SETTLE_TIMEOUT_MS`, 1 s). The DMA confinement phase has devmgr bind QEMU's `edu`
-device, which xtask attaches on both architectures, to the
-[`test-dma`](../drivers/test-dma/README.md) driver and asks it to probe: a copy through a mapped
+(`TEST_FAULT_SETTLE_TIMEOUT_MS`, 1 s). The DMA confinement phase polls `TEST_QUERY_DMA_DEVICE`
+(10 ms apart, `INPUT_ATTEMPTS` times) until devmgr serves the
+[`test-dma`](../drivers/test-dma/README.md) fixture, which devmgr binds to QEMU's
+`edu` device (attached by xtask on both architectures) by its declaration at `SET_DRIVERS_DIR`,
+and asserts it is served; it then asks the driver to probe: a copy through a mapped
 page must arrive, and where an IOMMU confines the device a copy to the page's device address after
 its unmap must not reach the page, and devmgr must have taken an IOMMU fault for the device at that
 address. The phase asks devmgr for the device's faults (`TEST_DMA_FAULTS`) once, then again every 10
 ms until it reports one, at most 300 times more (3 s, `FAULT_RECORD_POLLS`), so a fault the IOMMU
 reports to its driver after the probe's reply still counts; a missing fault fails only at that
-bound. Without an IOMMU it checks the mapped copies only, and a machine without the device skips it.
+bound. Without an IOMMU it checks the mapped copies only.
 The `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
 with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS phases

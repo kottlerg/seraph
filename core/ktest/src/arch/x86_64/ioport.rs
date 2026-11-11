@@ -32,7 +32,7 @@ struct WideCap
     end: u32,
 }
 
-// SAFETY: ktest is single-threaded on every path that touches this.
+// ktest is single-threaded on every path that touches this.
 static mut WIDE: WideCap = WideCap {
     slot: 0,
     base: 0,

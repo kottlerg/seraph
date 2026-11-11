@@ -22,6 +22,8 @@ syscall-abi = { path = "../../../../abi/syscall" }
 # The binary alone uses `virtio-core`, and it builds for the Seraph targets only, so
 # the host-tested library does not pull it into a host build.
 [target.'cfg(target_os = "seraph")'.dependencies]
+# The binary's declaration note (`driver_declaration!`).
+driver-binding = { path = "../../../../shared/driver-binding" }
 virtio-core = { path = "../core" }
 
 [lints]

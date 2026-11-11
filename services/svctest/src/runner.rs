@@ -83,6 +83,9 @@ fn fail_run()
         crate::phases::pwrmgr::request_shutdown(SHUTDOWN_CAP.load(Ordering::Acquire));
         return;
     }
+    // infinite_loop: the marker's claimant returns, so `fail_run` cannot be
+    // `-> !`; every other caller yields here until the process ends.
+    #[expect(clippy::infinite_loop)]
     loop
     {
         std::thread::yield_now();

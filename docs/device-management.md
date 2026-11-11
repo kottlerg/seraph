@@ -219,10 +219,11 @@ buffer for the duration of the one request that uses it.
 devmgr returns every device address; no driver chooses one. With an IOMMU confining the device,
 the address is an IOVA in the device's domain, which devmgr allocates first fit from 1 MiB below
 the device's limit (the width the device's remapping unit translates, narrowed for a device whose
-DMA reaches fewer address bits; [limits.md](limits.md)), and the mapping is installed in the
-IOMMU's tables, through the IOMMU driver (§ IOMMU Discovery and Programming), before devmgr
-replies, and withdrawn from them before devmgr deletes its cap at `DMA_UNMAP`, so the device
-reaches exactly the frames mapped for it. With none, the device can reach memory only at physical
+DMA reaches fewer address bits; [limits.md](limits.md)), outside every firmware-reserved range the
+domain maps at its own address, and the mapping is installed in the IOMMU's tables, through the
+IOMMU driver (§ IOMMU Discovery and Programming), before devmgr replies, and withdrawn from them
+before devmgr deletes its cap at `DMA_UNMAP`, so the device reaches exactly the frames mapped for
+it and its reserved ranges. With none, the device can reach memory only at physical
 addresses, so the address devmgr returns is the frames' physical address and the mapping is
 bookkeeping alone. The protocol and the driver's code are the same in both modes.
 
@@ -288,16 +289,38 @@ token at the spawn: a unit may walk any of its table pages while translation is 
 quarantined for the boot. For each DMA-capable device devmgr then decides, before it grants the
 device DMA:
 
-- **Confined.** A unit translates the device: devmgr attaches it (`ATTACH`) and grants it DMA in
-  that domain.
-- **Refused.** An RMRR names the device, whose firmware expects it to keep reaching a reserved
-  region: devmgr refuses it with a log line, since identity-mapping reserved regions is
-  [#773](https://github.com/kottlerg/seraph/issues/773). A device whose `ATTACH` fails is
-  refused too, since its unit blocks it. So is a device whose unit devmgr could not hand over: that
-  unit is never programmed, so it does not block the device, but devmgr does not run a device
-  unconfined behind an IOMMU it found. So is a device the RIMT gives an IOMMU device ID other than
-  its requester ID, since the IOMMU driver addresses each device's context by its requester ID.
+- **Confined.** A unit translates the device: devmgr attaches it (`ATTACH`), maps the regions the
+  firmware reserves for it (below) in that domain, and grants it DMA there.
+- **Refused.** A device whose `ATTACH` fails is refused, since its unit blocks it. So is a device
+  whose reserved regions cannot be mapped (below). So is a device whose unit devmgr could not hand
+  over: that unit is never programmed, so it does not block the device, but devmgr does not run a
+  device unconfined behind an IOMMU it found. So is a device the RIMT gives an IOMMU device ID other
+  than its requester ID, since the IOMMU driver addresses each device's context by its requester ID.
 - **Unconfined.** No unit translates the device: it runs DMA-unsafe.
+
+Firmware can require a device to keep reaching fixed physical ranges once the IOMMU is on: a VT-d
+RMRR names the functions that reach its range (USB controllers with legacy emulation, integrated
+graphics, some storage units). Each range firmware reserves for a confined device is mapped in the
+device's domain at its own address (an identity mapping), read-write, rounded out to whole pages,
+after `ATTACH` and before the DMA grant (`MAP_RESERVED`, which carries no cap, since no Memory cap
+covers firmware-reserved memory), and devmgr logs each range against the device. The range stands
+for the domain's life: the driver's `DMA_UNMAP` cannot reach it, the IOMMU driver refuses its
+`UNMAP`, and the domain's `BLOCK` withdraws it with the rest. devmgr's IOVA allocator gives no
+mapping of the device an address inside one (§ DMA Authorisation). devmgr refuses the device, with a
+log line, when a range overlaps memory memmgr pools, which the device would then reach (a platform
+error: firmware must report its reserved ranges as reserved), when a range passes what its unit
+translates, when more than `MAX_RESERVED_RANGES_PER_DEVICE` ranges remain once the ones that touch
+are merged ([limits.md](limits.md)), or when a mapping fails, blocking the device again. devmgr
+learns what memmgr pools from init at its bootstrap, as the extent of every Memory cap init holds
+but the firmware tables', which is everything memmgr pools then or at init's reap
+([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md)); when that set is not known
+in full, devmgr refuses every device with a reserved range. The check covers pooled memory only:
+RAM the kernel holds for itself is not checked. The RIMT describes no
+reserved region, and no Device Tree reserved range is read, so on riscv64 no device has one. A
+device reaches its reserved ranges only from its `ATTACH`: from the IOMMU driver's ready report
+until then it reaches nothing, as every function a unit translates does, and a device no driver
+binds is never attached, so the firmware's own use of its ranges (an SMM handler's USB legacy
+emulation) stops when the driver reports ready.
 
 When no unit is found, no IOMMU driver module was delivered, or the driver does not report ready
 within the settle bound, devmgr logs once that DMA runs unconfined and every device runs so. A

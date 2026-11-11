@@ -24,8 +24,11 @@
 //! pending or unmapping mapping's cap stays with the thread mid-call, which
 //! finds the device gone when it returns. A device holds at most
 //! [`MAX_MAPPINGS_PER_DEVICE`] mappings, and no two of a device's mappings
-//! overlap in device-address space. The table never reads or writes IOMMU
-//! state. See `docs/device-management.md` § DMA Authorisation.
+//! overlap in device-address space. A confined device registers with the
+//! firmware-reserved ranges its domain maps at their own addresses
+//! ([`reserved_ranges`]), which no mapping's IOVA overlaps. The table never
+//! reads or writes IOMMU state. See `docs/device-management.md` § DMA
+//! Authorisation and § IOMMU Discovery and Programming.
 
 extern crate alloc;
 
@@ -45,10 +48,21 @@ use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP, RIGHTS_MEM_WRITE};
 /// classifies it.
 pub const MAX_MAPPINGS_PER_DEVICE: usize = 16;
 
-/// The lowest IOVA devmgr gives a confined device. The first MiB of every
-/// domain stays unmapped, so a device programmed with a small stray address
-/// (a zero or an offset taken for an address) faults instead of reaching a
-/// mapping.
+/// Firmware-reserved ranges one device's domain maps at once, after
+/// [`reserved_ranges`] merges the ones that touch.
+///
+/// A device an RMRR names is a USB controller with legacy emulation, an
+/// integrated graphics unit, or a storage unit, each named by one or two
+/// regions on the platforms that carry them; four leaves room past that
+/// without letting a malformed table grow the device's domain without
+/// bound. `docs/limits.md` classifies it. A device with more is refused.
+pub const MAX_RESERVED_RANGES_PER_DEVICE: usize = 4;
+
+/// The lowest IOVA devmgr gives a confined device's mappings. The first MiB
+/// of every domain stays unmapped but for the firmware-reserved ranges a
+/// device's domain maps at their own addresses, so a device programmed with a
+/// small stray address (a zero or an offset taken for an address) faults
+/// instead of reaching a mapping.
 pub const IOVA_BASE: u64 = 0x10_0000;
 
 /// The IOVA limit of a device whose DMA reaches only 28 address bits:
@@ -124,6 +138,123 @@ impl Mapping
     {
         self.device_addr < addr + len && addr < self.device_addr + self.len
     }
+}
+
+/// A firmware-reserved range of a confined device: whole pages its domain
+/// maps at their own addresses, read-write, for its life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservedRange
+{
+    /// The first byte; page-aligned.
+    pub base: u64,
+    /// Bytes; a nonzero multiple of the page size.
+    pub len: u64,
+}
+
+impl ReservedRange
+{
+    /// Whether the range shares a byte with `[addr, addr + len)`.
+    fn overlaps(&self, addr: u64, len: u64) -> bool
+    {
+        self.base < addr.saturating_add(len) && addr < self.base + self.len
+    }
+}
+
+/// Why a device's firmware-reserved ranges cannot be mapped, so the device
+/// is refused ([`reserved_ranges`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedError
+{
+    /// The range, rounded out to whole pages, overlaps memory memmgr pools,
+    /// which the device would then reach: a firmware error.
+    Pooled(ReservedRange),
+    /// The range ends past what the device's remapping unit translates, or
+    /// past the end of the address space.
+    PastWidth
+    {
+        /// The range's first byte, as the firmware gives it.
+        base: u64,
+        /// The range's last byte, as the firmware gives it.
+        last: u64,
+    },
+    /// More than [`MAX_RESERVED_RANGES_PER_DEVICE`] ranges remain once the
+    /// ones that touch are merged.
+    TooMany,
+    /// The list could not grow.
+    OutOfMemory,
+}
+
+/// The firmware-reserved ranges a confined device's domain maps at their own
+/// addresses, from the `(first, last)` byte of each region the firmware
+/// reserves for it (a VT-d RMRR names it).
+///
+/// Each region is rounded out to whole pages, since a domain maps pages, and
+/// ranges that overlap or abut are merged, in ascending order. `pooled` holds
+/// the `(base, size)` of every extent of memory memmgr pools; `width_bits` is
+/// what the device's remapping unit translates (`QUERY_UNIT`).
+///
+/// # Errors
+/// [`ReservedError::PastWidth`] for a region whose rounded end passes the
+/// unit's width or the address space; [`ReservedError::Pooled`] for a
+/// rounded range that overlaps a `pooled` extent; [`ReservedError::TooMany`]
+/// past [`MAX_RESERVED_RANGES_PER_DEVICE`]; [`ReservedError::OutOfMemory`]
+/// when the list cannot grow.
+pub fn reserved_ranges(
+    regions: &[(u64, u64)],
+    pooled: &[(u64, u64)],
+    width_bits: u8,
+) -> Result<Vec<ReservedRange>, ReservedError>
+{
+    let unit_end = 1u64.checked_shl(u32::from(width_bits)).unwrap_or(u64::MAX);
+    let mut ranges: Vec<ReservedRange> = Vec::new();
+    ranges
+        .try_reserve(regions.len())
+        .map_err(|_| ReservedError::OutOfMemory)?;
+    for &(first, last) in regions
+    {
+        let past = ReservedError::PastWidth { base: first, last };
+        let base = first & !(PAGE_SIZE - 1);
+        let end = last
+            .checked_add(1)
+            .and_then(|e| e.checked_next_multiple_of(PAGE_SIZE))
+            .ok_or(past)?;
+        if last < first || end > unit_end
+        {
+            return Err(past);
+        }
+        ranges.push(ReservedRange {
+            base,
+            len: end - base,
+        });
+    }
+    ranges.sort_unstable_by_key(|r| r.base);
+    let mut merged: Vec<ReservedRange> = Vec::new();
+    merged
+        .try_reserve(ranges.len())
+        .map_err(|_| ReservedError::OutOfMemory)?;
+    for r in ranges
+    {
+        match merged.last_mut()
+        {
+            Some(prev) if r.base <= prev.base + prev.len =>
+            {
+                let end = (prev.base + prev.len).max(r.base + r.len);
+                prev.len = end - prev.base;
+            }
+            _ => merged.push(r),
+        }
+    }
+    if let Some(r) = merged
+        .iter()
+        .find(|r| pooled.iter().any(|&(base, size)| r.overlaps(base, size)))
+    {
+        return Err(ReservedError::Pooled(*r));
+    }
+    if merged.len() > MAX_RESERVED_RANGES_PER_DEVICE
+    {
+        return Err(ReservedError::TooMany);
+    }
+    Ok(merged)
 }
 
 /// Why a mapping was refused.
@@ -217,11 +348,13 @@ struct Entry
     state: State,
 }
 
-/// A registered device, its confinement, and its mappings.
+/// A registered device, its confinement, its firmware-reserved ranges, and
+/// its mappings.
 struct Device
 {
     badge: u64,
     confinement: Confinement,
+    reserved: Vec<ReservedRange>,
     entries: Vec<Entry>,
 }
 
@@ -235,15 +368,28 @@ impl Device
     }
 
     /// The lowest page-aligned address in `[IOVA_BASE, limit)` where `len`
-    /// bytes overlap none of the device's mappings.
+    /// bytes overlap none of the device's mappings and none of its reserved
+    /// ranges.
     fn free_iova(&self, len: u64, limit: u64) -> Option<u64>
     {
         let len = len.checked_next_multiple_of(PAGE_SIZE)?;
         let mut start = IOVA_BASE;
-        while let Some(clash) = self.entries.iter().find(|e| e.mapping.overlaps(start, len))
+        loop
         {
-            start = (clash.mapping.device_addr + clash.mapping.len)
-                .checked_next_multiple_of(PAGE_SIZE)?;
+            let clash_end = if let Some(e) =
+                self.entries.iter().find(|e| e.mapping.overlaps(start, len))
+            {
+                e.mapping.device_addr + e.mapping.len
+            }
+            else if let Some(r) = self.reserved.iter().find(|r| r.overlaps(start, len))
+            {
+                r.base + r.len
+            }
+            else
+            {
+                break;
+            };
+            start = clash_end.checked_next_multiple_of(PAGE_SIZE)?;
         }
         (start.checked_add(len)? <= limit).then_some(start)
     }
@@ -325,24 +471,34 @@ impl DmaTable
         self.devices.iter_mut().find(|d| d.badge == badge)
     }
 
-    /// Register the device `badge` with no mappings and `confinement`, so its
-    /// driver's requests are served. Registering a registered badge changes
-    /// nothing.
+    /// Register the device `badge` with no mappings, `confinement`, and the
+    /// firmware-reserved ranges its domain maps (`reserved`, empty for an
+    /// unconfined device), so its driver's requests are served and no
+    /// mapping's IOVA overlaps a reserved range. Registering a registered
+    /// badge changes nothing.
     ///
     /// # Errors
     /// The allocation error when the table cannot grow; nothing is
     /// registered then.
-    pub fn register(&mut self, badge: u64, confinement: Confinement)
-    -> Result<(), TryReserveError>
+    pub fn register(
+        &mut self,
+        badge: u64,
+        confinement: Confinement,
+        reserved: &[ReservedRange],
+    ) -> Result<(), TryReserveError>
     {
         if self.device_mut(badge).is_some()
         {
             return Ok(());
         }
+        let mut kept = Vec::new();
+        kept.try_reserve_exact(reserved.len())?;
+        kept.extend_from_slice(reserved);
         self.devices.try_reserve(1)?;
         self.devices.push(Device {
             badge,
             confinement,
+            reserved: kept,
             entries: Vec::new(),
         });
         Ok(())
@@ -584,7 +740,7 @@ mod tests
     fn table_with(badge: u64, confinement: Confinement) -> DmaTable
     {
         let mut t = DmaTable::new();
-        t.register(badge, confinement).unwrap();
+        t.register(badge, confinement, &[]).unwrap();
         t
     }
 
@@ -776,7 +932,7 @@ mod tests
     fn devices_do_not_share_an_address_space()
     {
         let mut t = table_with(7, DOMAIN);
-        t.register(8, DOMAIN).unwrap();
+        t.register(8, DOMAIN, &[]).unwrap();
         assert_eq!(map_iova(&mut t, 7, PAGE_SIZE), Ok(IOVA_BASE));
         assert_eq!(map_iova(&mut t, 8, PAGE_SIZE), Ok(IOVA_BASE));
     }
@@ -818,9 +974,127 @@ mod tests
     {
         let mut t = table_with(7, DOMAIN);
         let iova = map_iova(&mut t, 7, PAGE_SIZE).unwrap();
-        t.register(7, Confinement::Unconfined).unwrap();
+        t.register(7, Confinement::Unconfined, &[]).unwrap();
         assert_eq!(t.confinement(7), Some(DOMAIN));
         assert!(unmap(&mut t, 7, iova).is_ok());
+    }
+
+    const fn rr(base: u64, len: u64) -> ReservedRange
+    {
+        ReservedRange { base, len }
+    }
+
+    #[test]
+    fn reserved_regions_are_rounded_out_to_pages_merged_and_sorted()
+    {
+        let regions = [
+            (0x7c00_0000, 0x7c0f_ffff),
+            // Inside the first page and its last byte: one page.
+            (0x000e_8100, 0x000e_8eff),
+            // Abuts the first region: merged with it.
+            (0x7c10_0000, 0x7c10_0fff),
+            // Overlaps the region above it.
+            (0x7c0f_f800, 0x7c10_07ff),
+        ];
+        assert_eq!(
+            reserved_ranges(&regions, &[], 39),
+            Ok(vec![rr(0x000e_8000, PAGE_SIZE), rr(0x7c00_0000, 0x10_1000)])
+        );
+    }
+
+    #[test]
+    fn a_reserved_region_overlapping_pooled_memory_is_refused()
+    {
+        let pooled = [(0x10_0000, 0x7bf0_0000), (0x1_0000_0000, 0x4000_0000)];
+        // Ends right below the pooled extent: accepted.
+        assert_eq!(
+            reserved_ranges(&[(0x000e_8000, 0x000e_8fff)], &pooled, 39),
+            Ok(vec![rr(0x000e_8000, PAGE_SIZE)])
+        );
+        // Starts right past the first extent: accepted.
+        assert!(reserved_ranges(&[(0x7c00_0000, 0x7c0f_ffff)], &pooled, 39).is_ok());
+        // Its rounded first page reaches into the pooled extent's last page.
+        assert_eq!(
+            reserved_ranges(&[(0x7bff_f800, 0x7c00_0fff)], &pooled, 39),
+            Err(ReservedError::Pooled(rr(0x7bff_f000, 0x2000)))
+        );
+        assert_eq!(
+            reserved_ranges(&[(0x1_2000_0000, 0x1_2000_0fff)], &pooled, 39),
+            Err(ReservedError::Pooled(rr(0x1_2000_0000, PAGE_SIZE)))
+        );
+    }
+
+    #[test]
+    fn a_reserved_region_past_the_units_width_or_the_address_space_is_refused()
+    {
+        let width_end = 1u64 << 39;
+        assert_eq!(
+            reserved_ranges(&[(width_end - PAGE_SIZE, width_end - 1)], &[], 39),
+            Ok(vec![rr(width_end - PAGE_SIZE, PAGE_SIZE)])
+        );
+        assert_eq!(
+            reserved_ranges(&[(width_end - PAGE_SIZE, width_end)], &[], 39),
+            Err(ReservedError::PastWidth {
+                base: width_end - PAGE_SIZE,
+                last: width_end
+            })
+        );
+        assert_eq!(
+            reserved_ranges(&[(u64::MAX - 0xff, u64::MAX)], &[], 64),
+            Err(ReservedError::PastWidth {
+                base: u64::MAX - 0xff,
+                last: u64::MAX
+            })
+        );
+        assert_eq!(
+            reserved_ranges(&[(0x2000, 0x1000)], &[], 39),
+            Err(ReservedError::PastWidth {
+                base: 0x2000,
+                last: 0x1000
+            })
+        );
+    }
+
+    #[test]
+    fn a_device_holds_at_most_its_bound_of_reserved_ranges()
+    {
+        let regions: Vec<_> = (0..=MAX_RESERVED_RANGES_PER_DEVICE as u64)
+            .map(|i| (i * 0x10_0000, i * 0x10_0000 + 0xfff))
+            .collect();
+        assert_eq!(
+            reserved_ranges(&regions, &[], 39),
+            Err(ReservedError::TooMany)
+        );
+        assert_eq!(
+            reserved_ranges(&regions[1..], &[], 39).map(|r| r.len()),
+            Ok(MAX_RESERVED_RANGES_PER_DEVICE)
+        );
+    }
+
+    #[test]
+    fn no_confined_mapping_takes_an_iova_of_a_reserved_range()
+    {
+        let mut t = DmaTable::new();
+        // The second page of the device's space, and one below IOVA_BASE.
+        let reserved = [
+            rr(IOVA_BASE + PAGE_SIZE, PAGE_SIZE),
+            rr(0xe_8000, PAGE_SIZE),
+        ];
+        t.register(7, DOMAIN, &reserved).unwrap();
+        assert_eq!(map_iova(&mut t, 7, PAGE_SIZE), Ok(IOVA_BASE));
+        // Two pages fit only past the reserved page.
+        assert_eq!(
+            map_iova(&mut t, 7, 2 * PAGE_SIZE),
+            Ok(IOVA_BASE + 2 * PAGE_SIZE)
+        );
+        assert_eq!(
+            map_iova(&mut t, 7, PAGE_SIZE),
+            Err(MapError::NoAddressSpace)
+        );
+        // A withdrawal hands back the mappings alone: the reserved ranges
+        // carry no cap.
+        let w = t.withdraw(7).unwrap();
+        assert_eq!(w.mappings.len(), 2);
     }
 
     #[test]

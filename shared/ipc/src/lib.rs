@@ -2594,7 +2594,7 @@ pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Res
 
 /// Wire-protocol version of [`iommu_labels`]; bumped as the block comment
 /// above the label modules describes, which also lists its runtime check.
-pub const IOMMU_LABELS_VERSION: u32 = 2;
+pub const IOMMU_LABELS_VERSION: u32 = 3;
 /// IPC labels for an IOMMU driver's service endpoint, on which devmgr directs
 /// the IOMMU of one family (VT-d, the RISC-V IOMMU).
 ///
@@ -2614,7 +2614,7 @@ pub const IOMMU_LABELS_VERSION: u32 = 2;
 pub mod iommu_labels
 {
     /// Give a PCI function its own translation domain, in which it reaches
-    /// nothing until [`MAP`] installs a range.
+    /// nothing until [`MAP`] or [`MAP_RESERVED`] installs a range.
     ///
     /// Request: `data[1]` = the unit index, in the order the driver's
     /// bootstrap delivered the units; `data[2]` = the function's requester
@@ -2637,7 +2637,8 @@ pub mod iommu_labels
     ///
     /// Request: `data[1]` = domain, `data[2]` = the IOVA. Reply: empty body,
     /// label `SUCCESS` once the range is removed and the invalidation it
-    /// needs has completed, or an error code.
+    /// needs has completed, or an error code; `INVALID_REQUEST` for a range
+    /// [`MAP_RESERVED`] installed.
     pub const UNMAP: u64 = 3;
     /// Block a domain's function: it reaches no frame from the reply on.
     /// Every range of the domain is withdrawn with it.
@@ -2661,6 +2662,18 @@ pub mod iommu_labels
     /// the RISC-V IOMMU's 12-bit `CAUSE`), and the faulting IOVA. A fault
     /// past the bound stays for the next call.
     pub const TAKE_FAULTS: u64 = 6;
+    /// Make a physical range the firmware reserves for a domain's function
+    /// (a VT-d RMRR) reachable by it at the same address: an identity
+    /// mapping, read-write, that devmgr installs right after [`ATTACH`] and
+    /// before the function's DMA grant.
+    ///
+    /// Request: `data[1]` = domain, `data[2]` = the range's first byte,
+    /// page-aligned, `data[3]` = its length, a nonzero multiple of the page
+    /// size; no cap, since no Memory cap covers firmware-reserved memory.
+    /// The range stays for the domain's life: [`UNMAP`] refuses it, and the
+    /// domain's [`BLOCK`] withdraws it. Reply: empty body, label `SUCCESS`,
+    /// or an error code.
+    pub const MAP_RESERVED: u64 = 7;
 
     /// Faults one [`TAKE_FAULTS`] reply carries: two words each after the
     /// count, within the message's data words.
@@ -2684,9 +2697,10 @@ pub mod iommu_errors
     /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// The request is malformed: an unknown unit or domain, a requester ID
-    /// outside the unit's scope, an IOVA that is unaligned or past the
-    /// unit's width, a missing or non-Memory cap, or an access word outside
-    /// `devmgr_dma_labels::ACCESS_MASK`.
+    /// outside the unit's scope, an IOVA or reserved range that is
+    /// unaligned, empty, or past the unit's width, a missing or non-Memory
+    /// cap, an access word outside `devmgr_dma_labels::ACCESS_MASK`, or an
+    /// `UNMAP` of a reserved range.
     pub const INVALID_REQUEST: u64 = 1;
     /// Caller's compiled `IOMMU_LABELS_VERSION`, carried in `data[0]`,
     /// does not match the driver's.

@@ -160,6 +160,7 @@ fn main() -> !
     // DMA grant. `None` runs every device unconfined, logged once.
     caps.iommu = iommu::bring_up(
         &devices,
+        caps.pooled.take(),
         &mut caps,
         &mut watch,
         &mut catalog,
@@ -1799,8 +1800,10 @@ fn carve_virtio_device(
 /// Give the device `pci_dev`, catalogued as `device_badge`, its DMA grant:
 /// first attach it to an IOMMU domain of its own when a remapping unit
 /// translates it ([`iommu::Iommu::confine`]), so it reaches nothing its
-/// driver has not mapped. `None`, logged under `name`, when the device is
-/// refused (an RMRR names it, its unit is not programmed, or its `ATTACH`
+/// driver has not mapped but the regions the firmware reserves for it, which
+/// the domain maps at their own addresses and no mapping's IOVA overlaps.
+/// `None`, logged under `name`, when the device is refused (its unit is
+/// not programmed, its reserved regions cannot be mapped, or its `ATTACH`
 /// fails) or the grant fails; an attached device is blocked again then.
 fn grant_dma(
     name: &str,
@@ -1809,15 +1812,15 @@ fn grant_dma(
     device_badge: u64,
 ) -> Option<dma::DmaGrant>
 {
-    let confinement = match caps.iommu.as_ref()
+    let (confinement, reserved) = match caps.iommu.as_ref()
     {
         Some(i) => i.confine(name, pci_dev).ok()?,
-        None => Confinement::Unconfined,
+        None => (Confinement::Unconfined, Vec::new()),
     };
     let grant = caps
         .dma
         .as_ref()
-        .and_then(|d| d.grant(device_badge, confinement));
+        .and_then(|d| d.grant(device_badge, confinement, &reserved));
     if grant.is_none()
     {
         std::os::seraph::log!("{}: no DMA grant; not spawned", name);

@@ -38,7 +38,7 @@ use std::os::seraph::thread::BuilderExt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use firmware::dma::{
-    Confinement, DmaTable, IommuBlock, MapError, Mapping, UnmapError, check_access,
+    Confinement, DmaTable, IommuBlock, MapError, Mapping, ReservedRange, UnmapError, check_access,
 };
 use ipc::recv_guard::RecvGuard;
 use ipc::{IpcMessage, devmgr_dma_errors, devmgr_dma_labels, iommu_errors};
@@ -117,15 +117,21 @@ impl DmaService
         let _ = self.shared.iommu.set(client);
     }
 
-    /// Give the device `device_badge` DMA with `confinement`: register it in
-    /// the table and derive its DMA capability, a SEND on the DMA endpoint
-    /// badged `device_badge`, which the returned grant keeps. `None`, logged,
-    /// when the table cannot grow or the derivation fails; nothing is
-    /// registered then.
-    pub fn grant(&self, device_badge: u64, confinement: Confinement) -> Option<DmaGrant>
+    /// Give the device `device_badge` DMA with `confinement` and the
+    /// firmware-reserved ranges its domain maps (`reserved`): register it in
+    /// the table, so no mapping's IOVA overlaps a reserved range, and derive
+    /// its DMA capability, a SEND on the DMA endpoint badged `device_badge`,
+    /// which the returned grant keeps. `None`, logged, when the table cannot
+    /// grow or the derivation fails; nothing is registered then.
+    pub fn grant(
+        &self,
+        device_badge: u64,
+        confinement: Confinement,
+        reserved: &[ReservedRange],
+    ) -> Option<DmaGrant>
     {
         if lock(&self.shared.table)
-            .register(device_badge, confinement)
+            .register(device_badge, confinement, reserved)
             .is_err()
         {
             std::os::seraph::log!("DMA table full; device {} not given DMA", device_badge);

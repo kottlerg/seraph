@@ -18,8 +18,10 @@
 //! # Ready ring
 //! `ready_ring` is a circular buffer of member indices, at most one per
 //! member. An arrival on a member with no waiting thread queues it there
-//! unless it is already queued; `waitset_wait` pops from it. An entry is a
-//! hint: one whose source is no longer ready when it is popped is skipped.
+//! unless it is already queued; `waitset_wait` pops from it, and queues a
+//! member it returns again behind the others, so ready members are returned
+//! in turn. An entry is a hint: one whose source is no longer ready when it
+//! is popped is skipped and dropped.
 //!
 //! # One wait set per source
 //! A source can be in at most one wait set at a time. `sys_wait_set_add`
@@ -307,10 +309,9 @@ impl WaitSetState
     /// fill the ring past the other members' entries, and the ring, which
     /// holds `capacity` entries, never fills: the full check below cannot
     /// fire while every entry names a distinct occupied member, which
-    /// [`Self::vacate_member`] keeps. Work a member still holds after its
-    /// entry is popped is found by `waitset_wait`'s level-readiness walk once the ring
-    /// holds no ready entry, per core/kernel/docs/ipc-internals.md § Multiple
-    /// Ready Sources.
+    /// [`Self::vacate_member`] keeps. A member a wait returns keeps its entry
+    /// ([`Self::pop_ready`] queues it again), per
+    /// core/kernel/docs/ipc-internals.md § Multiple Ready Sources.
     #[inline]
     fn push_ready(&mut self, member_idx: u16)
     {
@@ -334,8 +335,14 @@ impl WaitSetState
     /// source `ready` reports no longer ready (an endpoint whose queued sender
     /// was stopped or destroyed after its call pushed the entry, or a
     /// notification a direct waiter drained), and any that names a vacant
-    /// slot. Each popped member's `queued` flag is cleared, so its next
-    /// arrival queues it again, behind the members already queued.
+    /// slot. A skipped member's `queued` flag is cleared, so its next arrival
+    /// queues it again.
+    ///
+    /// The member returned is queued again at the tail, behind every other
+    /// queued member, so a member with work left after this return is served
+    /// again in turn, after the others, and a member whose arrivals keep
+    /// landing cannot hold the ring's head while another member's backlog
+    /// waits. If the caller drains it, its entry is skipped at its next pop.
     ///
     /// Returns `Some(badge)` for the first entry whose member is present and
     /// ready, `None` if the ring is empty or every remaining entry is stale.
@@ -344,14 +351,20 @@ impl WaitSetState
         while self.has_ready()
         {
             // SAFETY: ready_head < ring_len; the ring has ring_len slots.
-            let idx = usize::from(unsafe { *self.ready_ring.add(usize::from(self.ready_head)) });
+            let entry = unsafe { *self.ready_ring.add(usize::from(self.ready_head)) };
             self.ready_head = (self.ready_head + 1) % self.ring_len();
-            let m = &mut self.members_mut()[idx];
-            m.queued = false;
+            let m = &mut self.members_mut()[usize::from(entry)];
             if m.is_occupied() && ready(m)
             {
-                return Some(m.badge);
+                let badge = m.badge;
+                // The pop above freed a slot, so the re-queue always fits; the
+                // member keeps its one entry and its `queued` flag.
+                // SAFETY: ready_tail < ring_len; the ring has ring_len slots.
+                unsafe { *self.ready_ring.add(usize::from(self.ready_tail)) = entry };
+                self.ready_tail = (self.ready_tail + 1) % self.ring_len();
+                return Some(badge);
             }
+            m.queued = false;
         }
         None
     }
@@ -926,7 +939,7 @@ mod tests
         assert_eq!(ws.pop_ready(always_ready), Some(100));
         assert_eq!(ws.pop_ready(always_ready), Some(101));
         assert_eq!(ws.pop_ready(always_ready), Some(102));
-        assert_eq!(ws.pop_ready(always_ready), None);
+        drain(&mut ws);
         // The indices now wrap past the ring's end.
         ws.push_ready(2);
         ws.push_ready(0);
@@ -934,13 +947,22 @@ mod tests
         assert_eq!(ws.pop_ready(always_ready), Some(102));
         assert_eq!(ws.pop_ready(always_ready), Some(100));
         assert_eq!(ws.pop_ready(always_ready), Some(101));
-        assert_eq!(ws.pop_ready(always_ready), None);
+        drain(&mut ws);
     }
 
     /// The readiness predicate of a set whose every source is ready.
     fn always_ready(_: &WaitSetMember) -> bool
     {
         true
+    }
+
+    /// Pop with every source drained, which skips and clears every entry, and
+    /// require that nothing was returned and the ring is now empty.
+    fn drain(ws: &mut WaitSetState)
+    {
+        assert_eq!(ws.pop_ready(|_| false), None);
+        assert!(!ws.has_ready());
+        assert!(ws.members().iter().all(|m| !m.queued));
     }
 
     // Defect guarded: a member that stays ready and keeps receiving work (an
@@ -959,15 +981,36 @@ mod tests
         ws.push_ready(1);
         assert_eq!(ws.pop_ready(always_ready), Some(100));
         assert_eq!(ws.pop_ready(always_ready), Some(101));
-        assert_eq!(ws.pop_ready(always_ready), None);
-        // A popped member queues again on its next arrival, behind the
+        drain(&mut ws);
+        // A drained member queues again on its next arrival, behind the
         // members already queued.
         ws.push_ready(1);
         ws.push_ready(0);
         ws.push_ready(1);
         assert_eq!(ws.pop_ready(always_ready), Some(101));
         assert_eq!(ws.pop_ready(always_ready), Some(100));
-        assert_eq!(ws.pop_ready(always_ready), None);
+        drain(&mut ws);
+    }
+
+    // Defect guarded: a member returned by a wait lost its entry, so the rest
+    // of its backlog was reachable only through the level walk, which runs
+    // only when the ring holds no ready entry and favours the lowest index; a
+    // lower-indexed member whose arrivals kept landing between the waits was
+    // returned every time and the other member's backlog waited.
+    #[test]
+    fn a_returned_member_is_queued_again_behind_the_others()
+    {
+        let mut fx = Fixture::<2, 3>::new();
+        let mut ws = fx.set();
+        ws.push_ready(1);
+        ws.push_ready(0);
+        let mut returned = [0u64; 4];
+        for badge in &mut returned
+        {
+            *badge = ws.pop_ready(always_ready).unwrap();
+            ws.push_ready(0);
+        }
+        assert_eq!(returned, [101, 100, 101, 100]);
     }
 
     // Defect guarded: a removed member's entry left in the ring, followed by a
@@ -993,11 +1036,11 @@ mod tests
         assert_eq!(ws.pop_ready(always_ready), Some(102));
         assert_eq!(ws.pop_ready(always_ready), Some(101));
         assert_eq!(ws.pop_ready(always_ready), Some(200));
-        assert_eq!(ws.pop_ready(always_ready), None);
+        drain(&mut ws);
         // A vacant slot takes no entry.
         ws.vacate_member(1);
         ws.push_ready(1);
-        assert_eq!(ws.pop_ready(always_ready), None);
+        assert!(!ws.has_ready());
     }
 
     // Defect guarded: a pop that returned a removed member's badge would wake
@@ -1011,7 +1054,8 @@ mod tests
         ws.push_ready(1);
         ws.members_mut()[0] = WaitSetMember::vacant();
         assert_eq!(ws.pop_ready(always_ready), Some(101));
-        assert_eq!(ws.pop_ready(always_ready), None);
+        assert_eq!(ws.pop_ready(always_ready), Some(101));
+        drain(&mut ws);
     }
 
     // Defect guarded: a pop that returned the badge of a member whose source
@@ -1029,7 +1073,9 @@ mod tests
         let ready = |m: &WaitSetMember| m.badge != 100;
         assert_eq!(ws.pop_ready(ready), Some(101));
         assert_eq!(ws.pop_ready(ready), Some(102));
-        assert_eq!(ws.pop_ready(ready), None);
+        assert_eq!(ws.pop_ready(ready), Some(101));
+        assert!(!ws.members()[0].queued);
+        drain(&mut ws);
         ws.push_ready(0);
         assert_eq!(ws.pop_ready(|_| false), None);
         assert_eq!(ws.pop_ready(always_ready), None);

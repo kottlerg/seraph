@@ -2248,7 +2248,8 @@ Block until any member of the wait set becomes ready.
 - `rdx`/`a1`: badge of the ready source (valid on success)
 
 Only one ready source is returned per call (wake-one semantics). If multiple sources
-are ready simultaneously, subsequent calls return them without blocking (see
+are ready simultaneously, subsequent calls return them in turn without blocking, a
+source that stays ready again after the others (see
 [ipc-internals.md](ipc-internals.md) § Multiple Ready Sources).
 
 Any number of threads may wait on one wait set. They queue in arrival order, and each

@@ -11,11 +11,11 @@
 //! Tests cover immediate return (source signalled before the wait),
 //! cross-thread return (a child thread signals the source; the parent blocks
 //! unless the unpinned child signals first), two threads waiting on one set
-//! at once, each arrival waking one, and a member that takes several
-//! arrivals holding one ready-ring entry. The remove test verifies that only
-//! the remaining member can wake the wait set after removal, and the
-//! stale-entry test that a member whose source stopped being ready after it
-//! was queued is not returned.
+//! at once, each arrival waking one, a member that takes several arrivals
+//! holding one ready-ring entry, and ready members returned in turn. The
+//! remove test verifies that only the remaining member can wake the wait set
+//! after removal, and the stale-entry test that a member whose source stopped
+//! being ready after it was queued is not returned.
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
@@ -240,6 +240,59 @@ fn busy_run(ws: u64, eq: u64, sig: u64) -> TestResult
     if (first, second) != (BUSY_BADGE, QUIET_BADGE)
     {
         return Err("wait_set::busy_member: the busy member crowded the other out of the ring");
+    }
+    Ok(())
+}
+
+/// A member's backlog is served while a lower-indexed member keeps taking
+/// arrivals: in a two-member set of event queues, three posts to the second
+/// and one to the first, then four rounds of wait, receive one entry from the
+/// queue returned, and post one more entry to the first queue, return the two
+/// members in turn. Fails if a returned member lost its ring entry, which left
+/// the second queue's backlog to the level walk, which runs only when the ring
+/// holds no ready entry: the first queue, queued again by every round's post,
+/// was then returned every round after the first.
+pub fn backlog_served_beside_arrivals(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_base, 2)
+        .map_err(|_| "wait_set::backlog_served: wait_set_create failed")?;
+    let low = event_queue_create(ctx.memory_base, 4);
+    let high = event_queue_create(ctx.memory_base, 4);
+    let result = match (low, high)
+    {
+        (Ok(low), Ok(high)) => backlog_run(ws, low, high),
+        _ => Err("wait_set::backlog_served: event_queue_create failed"),
+    };
+    for cap in [low.ok(), high.ok(), Some(ws)].into_iter().flatten()
+    {
+        cap_delete(cap).ok();
+    }
+    result
+}
+
+/// Body of [`backlog_served_beside_arrivals`].
+fn backlog_run(ws: u64, low: u64, high: u64) -> TestResult
+{
+    wait_set_add(ws, low, BUSY_BADGE)
+        .map_err(|_| "wait_set::backlog_served: wait_set_add(low) failed")?;
+    wait_set_add(ws, high, QUIET_BADGE)
+        .map_err(|_| "wait_set::backlog_served: wait_set_add(high) failed")?;
+    for n in 0..3
+    {
+        event_post(high, n).map_err(|_| "wait_set::backlog_served: event_post(high) failed")?;
+    }
+    event_post(low, 0).map_err(|_| "wait_set::backlog_served: event_post(low) failed")?;
+    let mut returned = [0u64; 4];
+    for badge in &mut returned
+    {
+        *badge = wait_set_wait(ws).map_err(|_| "wait_set::backlog_served: wait failed")?;
+        let queue = if *badge == BUSY_BADGE { low } else { high };
+        event_recv(queue).map_err(|_| "wait_set::backlog_served: event_recv failed")?;
+        event_post(low, 0).map_err(|_| "wait_set::backlog_served: event_post(low) failed")?;
+    }
+    if returned != [QUIET_BADGE, BUSY_BADGE, QUIET_BADGE, BUSY_BADGE]
+    {
+        return Err("wait_set::backlog_served: a member's backlog waited behind arrivals elsewhere");
     }
     Ok(())
 }

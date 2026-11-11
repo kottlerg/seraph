@@ -696,7 +696,9 @@ waitset_notify(wait_set, member_idx):
 
 A member holds at most one ring entry, however many arrivals it takes while no thread
 waits, so the ring never holds more entries than the set has members and never fills,
-and a member that keeps receiving work cannot crowd another member's entry out of it.
+and a member that keeps receiving work cannot crowd another member's entry out of it. A
+member a wait returns keeps its entry, queued again behind the others (§ Wait Path step
+2c).
 
 ### Wait Path
 
@@ -705,10 +707,11 @@ and a member that keeps receiving work cannot crowd another member's entry out o
 ```
 1. Acquire lock
 2. while ready_ring is non-empty:
-   a. member_idx = ready_ring.pop(); members[member_idx].queued = false
+   a. member_idx = ready_ring.pop()
    b. if members[member_idx] is vacant, or its source is not
-      source_is_ready right now: skip it
-   c. Release lock; return members[member_idx].badge
+      source_is_ready right now: members[member_idx].queued = false; skip it
+   c. ready_ring.push(member_idx) (queued stays set: the member is queued
+      again behind the others); Release lock; return members[member_idx].badge
 3. Level-readiness self-heal: for each member, if source_is_ready(source)
    right now, Release lock and return its badge.
 4. else, still under the lock:
@@ -750,13 +753,12 @@ offers that (`SYS_EVENT_RECV`'s try-once mode), or accepts that its blocking
 receive waits for the source's next arrival.
 
 **Why step 3 exists, and its memory-ordering requirement.** Every arrival of work
-on a member reaches `waitset_notify` (§ Readiness Notification), but an arrival
-that finds no thread waiting leaves only a ring entry, and the ring does not name
-every unit of work a member holds: a member holds at most one entry however many
-arrivals it takes (§ Readiness Notification), and a member already ready when it is
-added gets one entry however many senders or entries it holds. For a consumer that
-handles one item per wakeup, the items no entry names would be invisible without the
-level re-check in step 3.
+on a member reaches `waitset_notify` (§ Readiness Notification), and a member a wait
+returns keeps its entry while its source stays ready (step 2c), but an arrival that
+finds a thread waiting wakes that thread and queues no entry. A member whose woken
+thread does not take the work (a thread stopped or destroyed after the wake, or one
+that receives from another source first) then holds work that no entry names, and it
+would stay invisible to later waits without the level re-check in step 3.
 
 The self-heal reads source readiness **without taking the source lock**: taking
 it here would acquire `source.lock` while holding `ws.lock`, inverting the
@@ -819,14 +821,13 @@ returns `Interrupted`.
 
 If multiple members become ready before `SYS_WAIT_SET_WAIT` is called, `ready_ring`
 buffers their member indices in the order they were queued, one entry per member
-(§ Readiness Notification), so it holds every ready member and never fills. A member
-popped from the ring is queued again, behind the members already queued, by its next
-arrival. Subsequent `SYS_WAIT_SET_WAIT` calls drain the ring without blocking until it
-is empty, skipping an entry whose source is no longer ready (§ Wait Path step 2b), per
-[syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28).
-Work a member still holds after its entry is popped, with no arrival since, is
-returned by the level-readiness self-heal (§ Wait Path step 3) once the ring holds no
-ready entry.
+(§ Readiness Notification), so it holds every ready member and never fills. A member a
+wait returns is queued again at the tail while its source stays ready (§ Wait Path step
+2c), so subsequent `SYS_WAIT_SET_WAIT` calls return the ready members in turn without
+blocking, and a member whose arrivals keep landing does not hold back another member's
+backlog, per [syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28). An
+entry whose source is no longer ready is skipped and dropped (§ Wait Path step 2b); the
+member's next arrival queues it again.
 
 ---
 

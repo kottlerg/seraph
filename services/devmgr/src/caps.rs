@@ -112,8 +112,9 @@ pub struct DevmgrCaps
     /// module of the boot bundle outside init's bootstrap set, the driver
     /// modules and the platform description tables.
     /// [`crate::decls::classify_modules`] takes them and tells each by its
-    /// content.
-    pub modules: Vec<u64>,
+    /// content. Each is the module cap and the module's size in bytes, which
+    /// the cap, covering whole pages, does not give.
+    pub modules: Vec<(u64, u64)>,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
     // badged on. Reserved for devmgr-initiated publications (who
@@ -190,7 +191,8 @@ impl DevmgrCaps
 //     data[1] = count of caps in this round
 //     data[2..] = kind-specific payload:
 //       APERTURE / ACPI_REGION → (base, size) pairs per cap
-//       MODULE → no payload; each cap is one boot module, untagged
+//       MODULE → one word per cap, the module's size in bytes; each cap
+//         is one boot module, untagged
 //       SVCMGR_BUNDLE → no payload; one or two caps (publish, optional
 //         arch shutdown); the terminal round
 //   RAM_EXTENT: zero caps; data[1] = count of (base, size) pairs,
@@ -336,26 +338,41 @@ fn absorb_ram_extent_round(
     }
 }
 
-/// Unpack one module-cap round: each cap is one boot module, untagged. The
-/// `.min(4)` is `MSG_CAP_SLOTS_MAX`, the caps one round carries. A module the
-/// list cannot grow to hold is logged and its cap released: a retained module
-/// cap pins init's donated pool run.
-fn absorb_module_round(round_caps: &[u64], round_cap_count: usize, caps: &mut DevmgrCaps)
+/// Unpack one module-cap round: each cap is one boot module, untagged, and
+/// `data[2 + i]` is the size in bytes of the module of cap `i`. The `.min(4)`
+/// is `MSG_CAP_SLOTS_MAX`, the caps one round carries. A module whose size
+/// the round does not carry, or that the list cannot grow to hold, is logged
+/// and its cap released: a retained module cap pins init's donated pool run.
+fn absorb_module_round(
+    round_caps: &[u64],
+    round_cap_count: usize,
+    round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
+    round_data_words: usize,
+    caps: &mut DevmgrCaps,
+)
 {
     let n = round_cap_count.min(4);
-    for &slot in round_caps.iter().take(n)
+    let sizes = &round_data[..round_data_words.min(round_data.len())];
+    for (i, &slot) in round_caps.iter().take(n).enumerate()
     {
         if slot == 0
         {
             continue;
         }
+        let Some(&bytes) = sizes.get(2 + i)
+        else
+        {
+            std::os::seraph::log!("boot module without its size; released");
+            let _ = syscall::cap_delete(slot);
+            continue;
+        };
         if caps.modules.try_reserve(1).is_err()
         {
             std::os::seraph::log!("boot module not recorded (no memory); released");
             let _ = syscall::cap_delete(slot);
             continue;
         }
-        caps.modules.push(slot);
+        caps.modules.push((slot, bytes));
     }
 }
 
@@ -410,7 +427,13 @@ fn bootstrap_rounds(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
             }
             kind::MODULE =>
             {
-                absorb_module_round(&round.caps, round.cap_count, caps);
+                absorb_module_round(
+                    &round.caps,
+                    round.cap_count,
+                    &round.data,
+                    round.data_words,
+                    caps,
+                );
             }
             kind::FRAMEBUFFER_INFO =>
             {

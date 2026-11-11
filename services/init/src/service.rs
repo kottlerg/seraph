@@ -387,10 +387,13 @@ const MODULES_PER_ROUND: usize = 4;
 /// Serve devmgr a copy of every boot module outside [`BOOTSTRAP_MODULES`],
 /// untagged, in `kind::MODULE` rounds of up to [`MODULES_PER_ROUND`] caps:
 /// the driver modules and the platform description tables, which devmgr
-/// tells apart by their content. A module whose copy cannot be derived is
-/// skipped, logged, as `serve_region_rounds` skips a region: returning would
-/// leave devmgr blocked in `request_round` without the terminal round.
-/// Returns `false`, after logging, when a round fails.
+/// tells apart by their content. Each round's data words carry each module's
+/// size in bytes, from its `CapDescriptor`: the cap covers whole pages, and
+/// the bytes past the module's end are not the module's. A module whose
+/// copy cannot be derived, or whose descriptor is missing, is skipped,
+/// logged, as `serve_region_rounds` skips a region: returning would leave
+/// devmgr blocked in `request_round` without the terminal round. Returns
+/// `false`, after logging, when a round fails.
 fn serve_module_rounds(
     info: &InitInfo,
     bootstrap_ep: u64,
@@ -406,9 +409,19 @@ fn serve_module_rounds(
     loop
     {
         let mut caps = [0u64; MODULES_PER_ROUND];
+        let mut data = [0u64; 2 + MODULES_PER_ROUND];
         let mut n = 0usize;
         for entry in forwarded.by_ref()
         {
+            let Some(bytes) = crate::descriptors(info)
+                .iter()
+                .find(|d| d.slot == entry.slot)
+                .map(|d| d.aux1)
+            else
+            {
+                log("devmgr: boot module has no descriptor; module skipped");
+                continue;
+            };
             let Ok(copy) = syscall::cap_derive(entry.slot, MODULE_COPY_RIGHTS)
             else
             {
@@ -416,6 +429,7 @@ fn serve_module_rounds(
                 continue;
             };
             caps[n] = copy;
+            data[2 + n] = bytes;
             n += 1;
             if n == MODULES_PER_ROUND
             {
@@ -426,13 +440,15 @@ fn serve_module_rounds(
         {
             return true;
         }
+        data[0] = kind::MODULE;
+        data[1] = n as u64;
         if !serve(
             bootstrap_ep,
             child_badge,
             ipc_buf,
             false,
             &caps[..n],
-            &[kind::MODULE, n as u64],
+            &data[..2 + n],
             "devmgr: bootstrap module round failed",
         )
         {
@@ -532,7 +548,8 @@ fn serve_region_rounds(
 ///   - `data[2..]` = kind-specific payload:
 ///       - aperture / ACPI: `(base, size)` pairs per cap
 ///       - RAM extent: `(base, size)` pairs, one per extent memmgr pools
-///       - module: none; each cap is one boot module, untagged
+///       - module: each module's size in bytes, one word per cap; each cap
+///         is one boot module, untagged
 ///   - terminal round has `done = true`.
 ///
 /// The bootstrap layout mirrors `devmgr/src/caps.rs::bootstrap_caps`.

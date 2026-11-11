@@ -159,9 +159,9 @@ pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
         drivers: Vec::new(),
         tables: Vec::new(),
     };
-    for module_cap in core::mem::take(&mut caps.modules)
+    for (module_cap, module_bytes) in core::mem::take(&mut caps.modules)
     {
-        match with_module(caps, module_cap, classify)
+        match with_module(caps, module_cap, module_bytes, classify)
         {
             Some(Classified::Driver(decl)) if out.drivers.try_reserve(1).is_ok() =>
             {
@@ -234,18 +234,20 @@ fn classify(bytes: &[u8]) -> Classified
     }
 }
 
-/// Call `read` on the bytes of the boot module `module_cap`, mapped
-/// read-only, whole, for the call and unmapped after; `None`, logged, when
-/// the module cannot be mapped.
+/// Call `read` on the `module_bytes` bytes of the boot module `module_cap`,
+/// mapped read-only, whole, for the call and unmapped after; `None`, logged,
+/// when the module cannot be mapped. The cap covers whole pages: the bytes
+/// past `module_bytes` are not the module's, and `read` never sees them.
 fn with_module<R>(
     caps: &caps::DevmgrCaps,
     module_cap: u64,
+    module_bytes: u64,
     read: impl FnOnce(&[u8]) -> R,
 ) -> Option<R>
 {
     let size = syscall::cap_info(module_cap, syscall::CAP_INFO_MEMORY_SIZE).ok()?;
     let pages = size.div_ceil(PAGE_SIZE);
-    let span = usize::try_from(size).ok()?;
+    let span = usize::try_from(module_bytes.min(size)).ok()?;
     if pages == 0
     {
         return None;

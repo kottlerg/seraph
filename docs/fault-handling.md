@@ -683,7 +683,9 @@ itself (§ Label 20: `ATTACH_PROCESS` there). The pieces are:
   instruction, and removed by writing the instruction back. Text is mapped read-only, so the write
   takes `THREAD_MEM_TEXT`: the kernel writes the frame through its own mapping and leaves the
   thread's mapping read-only and executable, so W^X holds for every user mapping. It refuses the
-  write when the page's frame is mapped more than once, since the frame would then be text or data
+  write with `InsufficientRights` when the page was mapped through a capability carrying neither
+  Write nor Execute (firmware tables, a page lent read-only, a loaded process's read-only data),
+  and when the page's frame is mapped more than once, since the frame would then be text or data
   of another mapping, possibly another process's; procmgr's loader gives each process its own image
   frames ([services/procmgr/README.md](../services/procmgr/README.md) § Responsibilities), so a
   process's text takes it. Every write synchronises instruction fetch on every CPU before it

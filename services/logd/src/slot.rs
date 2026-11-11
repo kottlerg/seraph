@@ -19,9 +19,12 @@ use ipc::log_record::{FieldSpan, Record, Span};
 pub use logd_codec::{LINE_BUF_SIZE, MAX_NAME_LEN};
 
 /// Number of completed log entries retained per slot for future query
-/// surfaces. Bounded to keep total memory predictable at ~10k senders
-/// (10k * 16 * 480 ≈ 75 MiB worst case if every sender saturates with
-/// records of the longest length; in practice most slots stay near empty).
+/// surfaces. Bounded to keep total memory predictable at ~10k senders. The
+/// largest entry is a 480-byte record of 119 fields, each a one-byte key and
+/// an empty value (four payload bytes), whose field table adds 119 * 8
+/// bytes: about 1.5 KiB with the entry itself, so 10k * 16 * 1.5 KiB ≈
+/// 230 MiB worst case if every sender saturates with such records; in
+/// practice most slots stay near empty.
 /// A retention tuning value that bounds no capacity: `push_entry` drops the
 /// oldest entry, never a sender.
 pub const PER_SLOT_HISTORY: usize = 16;

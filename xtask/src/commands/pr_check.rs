@@ -533,17 +533,19 @@ fn check_body_closing(pat: &Patterns, body: &str) -> Vec<Diag>
 {
     let mut out = Vec::new();
     let referenced: Vec<u64> = refs_refs(pat, body).iter().map(|r| r.issue).collect();
+    // `Refs` names this repository's Issues only; a closing reference that
+    // names a repository is not compared, since the body cannot say whether
+    // that repository is this one.
     for found in closing_refs(pat, body)
     {
-        if referenced.contains(&found.issue)
+        if found.repo.is_none() && referenced.contains(&found.issue)
         {
             out.push(Diag::warning(
                 "pr-closes-and-refs",
                 format!("body:{}", found.line),
                 format!(
-                    "the body closes {} here and also references #{} with `Refs`; confirm the \
+                    "the body closes #{} here and also references it with `Refs`; confirm the \
                      PR means to close it",
-                    found.label(),
                     found.issue
                 ),
             ));
@@ -1989,6 +1991,10 @@ mod tests
         let diags = check_body(&pat(), &body);
         assert_eq!(rules(&diags), ["pr-closes-and-refs", "pr-closing-in-prose"]);
         assert!(diags[0].message.contains("#11"));
+        // A closing reference into another repository is another Issue
+        // than this repository's `Refs #11`.
+        let other = BODY.replace("Fixes #10", "Fixes other/repo#11");
+        assert!(check_body(&pat(), &other).is_empty());
     }
 
     #[test]

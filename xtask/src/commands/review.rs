@@ -458,10 +458,12 @@ pub fn check_record(name: &str, record: &Value) -> Vec<Diag>
 
 /// Whether the record file `name` is a run at `head`, by the head its name
 /// states. The name decides, not the content: a record that does not parse
-/// is still a run at the head, and every run there must be well-formed.
+/// is still a run at the head, and every run there must be well-formed. A
+/// name that states fewer than 8 digits of the head is a run there too, so
+/// that `check_record` refuses it rather than the gate passing it over.
 fn names_head(name: &str, head: &str) -> bool
 {
-    name_parts(name).is_some_and(|(_, stated)| names_a_commit(stated) && head.starts_with(stated))
+    name_parts(name).is_some_and(|(_, stated)| !stated.is_empty() && head.starts_with(stated))
 }
 
 /// Whether a record's `stats.head` is the commit `head` names: one of the two
@@ -1283,9 +1285,18 @@ mod tests
             rules(&check_record("delta-0a82b0a.json", &r)),
             ["record-name"]
         );
-        // A one-digit name is no run at a head that starts with the digit.
-        let short = vec![("delta-0.json".to_owned(), passing())];
-        assert_eq!(rules(&gate_diags(&short, HEAD)), ["gate-review-record"]);
+        // A short-named record of the head is still a run there, which the
+        // gate refuses, even beside a passing record of a full name.
+        let short = vec![
+            (NAME.to_owned(), run("delta", 2, PASS.0, PASS.1)),
+            (
+                "delta-0a82b0a.json".to_owned(),
+                run("delta", 3, "BLOCKING ISSUES", "AUDIT PASS"),
+            ),
+        ];
+        let found = gate_diags(&short, HEAD);
+        assert_eq!(rules(&found), ["record-name"]);
+        assert_eq!(found[0].at, "delta-0a82b0a.json");
     }
 
     #[test]

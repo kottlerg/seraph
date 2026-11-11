@@ -315,8 +315,8 @@ fn assemble_provided_boot_caps(
 ///
 /// A seed that fails to resolve leaves its slot absent: the round omits it
 /// and clears its presence bit, so the child's decoder sees `0` in that
-/// position. This matches the "absent dep ⇒ skip" pattern svctest's
-/// pwrmgr phases use; consumers that don't tolerate a missing cap fail on
+/// position. This matches the "absent dep ⇒ skip" pattern consumers use
+/// for an optional seed; consumers that don't tolerate a missing cap fail on
 /// first use, which is the right surface for a real misconfiguration.
 ///
 /// `bind_target` carries the death correlator for supervised launches,

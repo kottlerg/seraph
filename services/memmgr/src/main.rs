@@ -499,11 +499,14 @@ fn return_taken(l: &mut MemLedger, cap_slot: u64, pages: u32, phys_base: u64)
     }
 }
 
-/// Pool pages one page-table top-up donates. A donation can keep one page for
-/// the kernel's donation bookkeeping, so a top-up is never a single page.
+/// Pool pages one page-table top-up donates, to memmgr's own address space or
+/// to a client's. A donation can keep one page for the kernel's donation
+/// bookkeeping, so a top-up is never a single page.
 const ASPACE_TOPUP_PAGES: u32 = 4;
 
-/// Page-table top-ups one self-map attempts before giving up.
+/// Page-table top-ups one map attempts before giving up: a self-map
+/// ([`map_self_page`]) or a demand chunk's map into a client
+/// ([`map_client_chunk`]).
 const PT_FUND_ROUNDS: u32 = 4;
 
 /// Fund memmgr's own page-table growth pool from its free pool: donate a
@@ -1506,8 +1509,10 @@ enum FaultDecline
     NoContiguousRun = 7,
     /// The chunk's frame descriptor could not be recorded.
     FrameRecord = 8,
-    /// `mem_map` of the chunk into the process failed; the high 32 bits of
-    /// the reason word carry the magnitude of its `SyscallError`.
+    /// `mem_map` of the chunk into the process failed, after memmgr funded
+    /// the process's page-table pool as often as [`PT_FUND_ROUNDS`] allows
+    /// when the failure was an exhausted pool; the high 32 bits of the reason
+    /// word carry the magnitude of its `SyscallError`.
     MapFailed = 9,
 }
 
@@ -1553,7 +1558,11 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// mapped across up to `DEMAND_CHUNK_PAGES` pages — and replies
 /// [`syscall_abi::FAULT_REPLY_RESUME`]; a fault on a page an earlier chunk
 /// backed is resumed without backing. Backing a chunk rather than a single page
-/// bounds cap-slot consumption (one cap per chunk). Every other VM case —
+/// bounds cap-slot consumption (one cap per chunk). The page tables the map
+/// needs come from the client address space's own pool; when that pool is
+/// exhausted, memmgr funds it and maps again ([`map_client_chunk`]), so a
+/// region's fault does not depend on the client having funded the pool in
+/// advance. Every other VM case —
 /// unknown process, address outside every region, an access the region's
 /// protection does not grant ([`region_grants`]), no delegated AS, or any
 /// allocation/map failure — replies [`syscall_abi::FAULT_REPLY_FORWARD`],
@@ -1563,8 +1572,11 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// refused it in data word 0 ([`decline_fault`]).
 ///
 /// The chunk is accounted to the process record (reclaimed on `PROCESS_DIED` /
-/// `UNREGISTER_REGION` like any issued cap); `pool_total` is unchanged because
-/// the pages were already owned — they move from a free run to the record.
+/// `UNREGISTER_REGION` like any issued cap), and so is each page-table run
+/// memmgr donates for it (reclaimed on `PROCESS_DIED`); `pool_total` is
+/// unchanged because the pages were already owned — they move from a free run
+/// to the record. A declined fault's chunk is unmapped before it returns to
+/// the pool ([`release_unmapped_chunk`]).
 fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 {
     if req.word(0) != syscall_abi::FAULT_KIND_VM
@@ -1625,15 +1637,8 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     };
     let (outer, pages, phys) = grant.entries[0];
-    let run = FreeRun {
-        cap_slot: outer,
-        page_count: u64::from(pages),
-        phys_base: phys,
-    };
-
-    // Account the chunk so it is reclaimed on death/unregister; roll back to the
-    // pool on any subsequent failure. `chunk_base` is the chunk's mapped VA so
-    // UNREGISTER_REGION can find and unmap it.
+    // `chunk_base` is the chunk's mapped VA, so UNREGISTER_REGION can find and
+    // unmap it.
     let frame = FrameDesc {
         cap_slot: outer,
         page_count: pages,
@@ -1641,39 +1646,154 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         va: chunk_base,
         region_id: NO_REGION_ID,
     };
-    if !l.push_frame(rec, frame)
-    {
-        insert_run(l, run);
-        decline_fault(ipc_buf, FaultDecline::FrameRecord, 0);
-        return;
-    }
 
-    // Map the whole chunk into the child at `chunk_base` with the region's prot.
-    // Pool outers are full-rights, so `mem_map` gates the mapping to `region.prot`
-    // directly (the kernel grants read at every map, and W^X is enforced); no
-    // per-fault inner derivation is needed. The kernel holds the mapping
-    // independently of the cap, which stays in memmgr as the reclaim anchor.
-    // SAFETY: `aspace_cap` is a client address space procmgr delegated
-    // (`DELEGATE_ASPACE`), never memmgr's own, so the map changes nothing
-    // memmgr runs on.
-    let mapped = unsafe {
-        syscall::mem_map(
-            outer,
-            aspace_cap,
-            chunk_base,
-            0,
-            u64::from(pages),
-            region.prot,
-        )
-    };
-    if let Err(e) = mapped
+    // Map first, then account the chunk to the record: a page-table top-up
+    // during the map records its own frame on the record, which must not land
+    // above an already-pushed chunk that a failure would then pop.
+    if let Err(e) = map_client_chunk(l, rec, aspace_cap, &frame, region.prot)
     {
-        let _ = l.pop_frame(rec);
-        insert_run(l, run);
+        release_unmapped_chunk(l, rec, aspace_cap, frame);
         decline_fault(ipc_buf, FaultDecline::MapFailed, e.unsigned_abs());
         return;
     }
+    // Account the chunk so it is reclaimed on death or unregister.
+    if !ensure_slots(l, 1) || !l.push_frame(rec, frame)
+    {
+        release_unmapped_chunk(l, rec, aspace_cap, frame);
+        decline_fault(ipc_buf, FaultDecline::FrameRecord, 0);
+        return;
+    }
     reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
+}
+
+/// Map the demand chunk `frame` describes into the client address space
+/// `aspace_cap` at `frame.va` with `prot`. When the kernel reports the
+/// client's page-table pool exhausted, memmgr funds the pool from its own
+/// ([`fund_client_page_tables`]) and maps again, at most [`PT_FUND_ROUNDS`]
+/// times. Returns the last map error otherwise.
+///
+/// Pool outers are full-rights, so `mem_map` gates the mapping to `prot`
+/// directly (the kernel grants read at every map, and W^X is enforced); no
+/// per-fault inner derivation is needed. The kernel holds the mapping
+/// independently of the cap, which stays in memmgr as the reclaim anchor. A
+/// failed map can leave the chunk's first pages mapped; a repeat maps them
+/// again in place.
+fn map_client_chunk(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    aspace_cap: u64,
+    frame: &FrameDesc,
+    prot: u64,
+) -> Result<(), i64>
+{
+    let mut rounds = 0;
+    loop
+    {
+        // SAFETY: `aspace_cap` is a client address space procmgr delegated
+        // (`DELEGATE_ASPACE`), never memmgr's own, so the map changes nothing
+        // memmgr runs on.
+        let mapped = unsafe {
+            syscall::mem_map(
+                frame.cap_slot,
+                aspace_cap,
+                frame.va,
+                0,
+                u64::from(frame.page_count),
+                prot,
+            )
+        };
+        let Err(e) = mapped
+        else
+        {
+            return Ok(());
+        };
+        if e != SyscallError::OutOfMemory as i64
+            || rounds == PT_FUND_ROUNDS
+            || !fund_client_page_tables(l, rec, aspace_cap)
+        {
+            return Err(e);
+        }
+        rounds += 1;
+    }
+}
+
+/// Fund the client address space `aspace_cap`'s page-table growth pool from
+/// memmgr's free pool: donate a contiguous run of [`ASPACE_TOPUP_PAGES`] (or
+/// two pages when no such run is free) with augment-mode `cap_create_aspace`,
+/// and account the run to the client's record `rec` like a grant memmgr did
+/// not map ([`FRAME_VA_UNMAPPED`], no region id), so only `PROCESS_DIED`
+/// reclaims it, once the address space's teardown has released the donation
+/// (services/memmgr/docs/memory-pool.md § Client page-table funding). memmgr
+/// keeps the run's cap as the reclaim anchor. A refused donation returns the
+/// run to the pool.
+fn fund_client_page_tables(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64) -> bool
+{
+    // One slot for this run's descriptor, and one held for the chunk's.
+    if !ensure_slots(l, 2)
+    {
+        return false;
+    }
+    let Ok(grant) =
+        select(l, ASPACE_TOPUP_PAGES, Fit::Contiguous).or_else(|_| select(l, 2, Fit::Contiguous))
+    else
+    {
+        return false;
+    };
+    let (outer, pages, phys) = grant.entries[0];
+    let run = FreeRun {
+        cap_slot: outer,
+        page_count: u64::from(pages),
+        phys_base: phys,
+    };
+    let frame = FrameDesc {
+        cap_slot: outer,
+        page_count: pages,
+        phys_base: phys,
+        va: FRAME_VA_UNMAPPED,
+        region_id: NO_REGION_ID,
+    };
+    if !l.push_frame(rec, frame)
+    {
+        insert_run(l, run);
+        return false;
+    }
+    if syscall::cap_create_aspace(outer, aspace_cap, u64::from(pages)).is_ok()
+    {
+        return true;
+    }
+    let _ = l.pop_frame(rec);
+    insert_run(l, run);
+    false
+}
+
+/// Give back a demand chunk whose fault memmgr is declining: unmap whatever
+/// part of it a failed map left mapped in the client address space
+/// `aspace_cap`, then return it to the free pool. When the unmap fails, the
+/// chunk may still be mapped, so it is accounted to the record `rec` instead,
+/// for `PROCESS_DIED` to reclaim; with no slot for that either, it stays owned
+/// and counted in `pool_total` but out of circulation.
+fn release_unmapped_chunk(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64, frame: FrameDesc)
+{
+    // SAFETY: `aspace_cap` is a client address space procmgr delegated
+    // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing
+    // memmgr runs on.
+    let unmapped =
+        unsafe { syscall::mem_unmap_reclaim(aspace_cap, frame.va, u64::from(frame.page_count)) };
+    if unmapped.is_ok()
+    {
+        insert_run(
+            l,
+            FreeRun {
+                cap_slot: frame.cap_slot,
+                page_count: u64::from(frame.page_count),
+                phys_base: frame.phys_base,
+            },
+        );
+    }
+    else if ensure_slots(l, 1)
+    {
+        let _ = l.push_frame(rec, frame);
+    }
 }
 
 /// Total pages of RAM memmgr owns: every page it has taken ownership of since

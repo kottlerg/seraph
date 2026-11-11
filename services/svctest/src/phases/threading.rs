@@ -10,6 +10,7 @@
 //! wakes for several queued readers and its non-blocking paths, `Condvar`
 //! `notify_all` and `Once` completion waking every queued waiter, a timed
 //! `Condvar` waiter leaving the middle of the queue, `Condvar::wait_timeout`,
+//! sustained contended handoffs of `Mutex`, `Condvar`, and `RwLock`,
 //! spawn-time placement through `BuilderExt::spawn_at_priority`, and the
 //! byte heap's lock contended by a strict-priority thread against a
 //! fair-class holder on the same CPU.
@@ -72,6 +73,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "timeout",
             run: timeout_phase,
+        },
+        Phase {
+            name: "sync_handoff_stress",
+            run: sync_handoff_stress_phase,
         },
         Phase {
             name: "spawn_at_priority",
@@ -579,6 +584,175 @@ pub fn condvar_timed_middle_waiter_phase(_: &Caps)
         w.join().expect("condvar untimed waiter panicked");
     }
     std::os::seraph::log!("condvar_timed_middle_waiter phase passed");
+}
+
+/// How long `sync_handoff_stress` waits for one of its workers to report: far
+/// over its whole run, a few seconds on slow TCG.
+const STRESS_BOUND: Duration = Duration::from_mins(1);
+
+/// Spawn `f` on a new thread that reports on `done` once `f` returns.
+fn spawn_reporting<F>(done: &mpsc::Sender<()>, f: F) -> thread::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let done = done.clone();
+    thread::spawn(move || {
+        f();
+        let _ = done.send(());
+    })
+}
+
+/// Wait for one report on `reports` per handle, failing after
+/// [`STRESS_BOUND`] for any one, then join every handle. A lost wake leaves a
+/// worker parked for good, so the bound turns that hang into a failure that
+/// names `what`.
+fn await_workers(what: &str, reports: &mpsc::Receiver<()>, handles: Vec<thread::JoinHandle<()>>)
+{
+    for i in 0..handles.len()
+    {
+        reports.recv_timeout(STRESS_BOUND).unwrap_or_else(|_| {
+            panic!(
+                "{what}: only {i} of {} workers finished; a wake was lost",
+                handles.len()
+            )
+        });
+    }
+    for h in handles
+    {
+        h.join()
+            .unwrap_or_else(|_| panic!("{what}: a worker panicked"));
+    }
+}
+
+/// Sustained contended handoffs of `Mutex`, `Condvar`, and `RwLock`, each
+/// worker's completion bounded so a lost wake fails the phase rather than
+/// hanging it.
+pub fn sync_handoff_stress_phase(_: &Caps)
+{
+    mutex_handoff_stress();
+    condvar_ping_pong_stress();
+    rwlock_handoff_stress();
+    std::os::seraph::log!("sync_handoff_stress phase passed");
+}
+
+/// Workers increment one `Mutex` counter, each yielding with the lock held
+/// every few increments so the others spin out and park on it. Every
+/// increment lands, and every parked waiter is woken by an unlock.
+fn mutex_handoff_stress()
+{
+    const THREADS: u32 = 4;
+    const ITERS: u32 = 2_000;
+    const YIELD_EVERY: u32 = 8;
+
+    let counter = Arc::new(Mutex::new(0u32));
+    let (done, reports) = mpsc::channel();
+    let handles = (0..THREADS)
+        .map(|_| {
+            let counter = counter.clone();
+            spawn_reporting(&done, move || {
+                for i in 0..ITERS
+                {
+                    let mut guard = counter.lock().expect("mutex poisoned");
+                    *guard += 1;
+                    if i % YIELD_EVERY == 0
+                    {
+                        thread::yield_now();
+                    }
+                }
+            })
+        })
+        .collect();
+    await_workers("mutex handoff", &reports, handles);
+    let total = *counter.lock().expect("mutex poisoned");
+    assert_eq!(
+        total,
+        THREADS * ITERS,
+        "mutex handoff: increments lost under contention"
+    );
+}
+
+/// Two threads hand a turn back and forth through one `Condvar` with
+/// `notify_one`, each waiting for its own turn: every notify reaches the one
+/// waiter, or the exchange stops.
+fn condvar_ping_pong_stress()
+{
+    const ROUNDS: u32 = 1_000;
+
+    // (whose turn, 0 or 1; handoffs made) under one mutex.
+    let shared = Arc::new((Mutex::new((0u32, 0u32)), Condvar::new()));
+    let (done, reports) = mpsc::channel();
+    let handles = (0..2u32)
+        .map(|me| {
+            let shared = shared.clone();
+            spawn_reporting(&done, move || {
+                let (lock, cv) = &*shared;
+                for _ in 0..ROUNDS
+                {
+                    let state = lock.lock().expect("mutex poisoned");
+                    let mut state = cv.wait_while(state, |s| s.0 != me).expect("mutex poisoned");
+                    state.0 = 1 - me;
+                    state.1 += 1;
+                    drop(state);
+                    cv.notify_one();
+                }
+            })
+        })
+        .collect();
+    await_workers("condvar ping-pong", &reports, handles);
+    let handoffs = shared.0.lock().expect("mutex poisoned").1;
+    assert_eq!(handoffs, 2 * ROUNDS, "condvar ping-pong: handoffs lost");
+}
+
+/// Writers bump a pair of counters together under the write lock, yielding
+/// between the two stores every few writes, while readers, yielding between
+/// reads, check under the read lock that the pair is equal. No reader sees a
+/// write in progress, every write lands, and no queued reader or writer is
+/// stranded.
+fn rwlock_handoff_stress()
+{
+    const WRITERS: u32 = 2;
+    const READERS: u32 = 2;
+    const WRITES: u32 = 1_000;
+    const READS: u32 = 2_000;
+    const YIELD_EVERY: u32 = 4;
+
+    let pair = Arc::new(RwLock::new((0u32, 0u32)));
+    let (done, reports) = mpsc::channel();
+    let writers = (0..WRITERS).map(|_| {
+        let pair = pair.clone();
+        spawn_reporting(&done, move || {
+            for i in 0..WRITES
+            {
+                let mut guard = pair.write().expect("rwlock poisoned");
+                guard.0 += 1;
+                if i % YIELD_EVERY == 0
+                {
+                    thread::yield_now();
+                }
+                guard.1 += 1;
+            }
+        })
+    });
+    let readers = (0..READERS).map(|_| {
+        let pair = pair.clone();
+        spawn_reporting(&done, move || {
+            for _ in 0..READS
+            {
+                let guard = pair.read().expect("rwlock poisoned");
+                assert_eq!(guard.0, guard.1, "rwlock: a reader saw a write in progress");
+                drop(guard);
+                thread::yield_now();
+            }
+        })
+    });
+    let handles = writers.chain(readers).collect();
+    await_workers("rwlock handoff", &reports, handles);
+    let (a, b) = *pair.read().expect("rwlock poisoned");
+    assert_eq!(
+        (a, b),
+        (WRITERS * WRITES, WRITERS * WRITES),
+        "rwlock handoff: writes lost under contention"
+    );
 }
 
 /// `BuilderExt::spawn_at_priority` refuses a level of 0 before any spawn and

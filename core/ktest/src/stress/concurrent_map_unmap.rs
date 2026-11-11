@@ -89,6 +89,11 @@ fn copy_failed(index: usize, source: u64, error: i64, message: &'static str) -> 
 {
     crate::log_u64("ktest: concurrent_map_unmap copy child=", index as u64);
     crate::log_u64("ktest: concurrent_map_unmap copy source=", source);
+    crate::log_u64(
+        "ktest: concurrent_map_unmap copy source_in_pool=",
+        u64::from(crate::frame_pool::is_pool_frame(source)),
+    );
+    crate::frame_pool::check_slots();
     crate::tally::log_error("ktest: concurrent_map_unmap copy error=", error);
     message
 }

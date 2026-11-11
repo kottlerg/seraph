@@ -125,9 +125,10 @@ fn main() -> !
     let mut catalog = DeviceCatalog::default();
 
     // Every driver this boot can spawn, each at most once: one per device
-    // record (a record is bound at most once), the IOMMU driver, and the test-only fault batch (TODO(#165): drop it
-    // with that shim). The watch's death queue is sized to them, so every
-    // death observer is funded and no death is dropped.
+    // record (a record is bound at most once), the IOMMU driver, and the
+    // test-only fault batch (TODO(#165): drop it with that shim). The watch's
+    // death queue is sized to them, so every death observer is funded and no
+    // death is dropped.
     let driver_count = records.count() + IOMMU_DRIVERS + ipc::devmgr_labels::TEST_FAULT_DRIVERS;
     let Some(mut watch) = settle::DriverWatch::new(driver_count, caps.registry_ep)
     else

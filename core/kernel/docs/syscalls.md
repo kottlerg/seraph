@@ -2252,8 +2252,9 @@ are ready simultaneously, subsequent calls return them without blocking (see
 [ipc-internals.md](ipc-internals.md) § Multiple Ready Sources).
 
 Any number of threads may wait on one wait set. They queue in arrival order, and each
-readiness notification of a member wakes the longest-waiting one with that member's badge;
-the others stay parked.
+arrival of work on a member (a call queued on an endpoint, an entry posted to an event queue,
+a send to a notification that wakes no direct waiter) wakes the longest-waiting one with that
+member's badge; the others stay parked.
 
 The badge names a source that was ready when the wait returned, or when its readiness
 woke the caller; a source whose readiness lapsed before the call (an endpoint whose

@@ -309,10 +309,12 @@ pub unsafe fn event_queue_post(
     }
     eq.write_idx = (eq.write_idx + 1) % ring_len;
     // Release: publishes the new level to the lockless `source_is_ready` reader.
-    let prev = eq.count.fetch_add(1, core::sync::atomic::Ordering::Release);
+    eq.count.fetch_add(1, core::sync::atomic::Ordering::Release);
 
-    // Notify a registered wait set on the transition empty → non-empty.
-    if prev == 0 && !eq.wait_set.is_null()
+    // Notify a registered wait set of every entry rung, not only the one that
+    // made the queue non-empty: each arrival wakes one of the threads waiting
+    // on the set (core/kernel/docs/ipc-internals.md § Readiness Notification).
+    if !eq.wait_set.is_null()
     {
         // SAFETY: wait_set is a valid *mut WaitSetState.
         unsafe { crate::ipc::wait_set::waitset_notify(eq.wait_set, eq.wait_set_member_idx) };

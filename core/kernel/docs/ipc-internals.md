@@ -100,8 +100,9 @@ one set of links suffices). No separate allocation. Threads are served in arriva
    c. commit_blocked_under_local_lock(current_tcb, BlockedOnSend, ep);
       on a refusal, unlink current_tcb from the send queue and stamp the
       call cancelled (INTERRUPTED, or KILL for a fault delivery)
-   d. If the park committed and made the send queue non-empty, notify the
-      endpoint's wait set (waitset_notify)
+   d. If the park committed, notify the endpoint's wait set (waitset_notify),
+      for every call queued, not only the first
+      (§ Wait Set, Readiness Notification)
    e. Release endpoint lock
    f. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then
@@ -533,7 +534,8 @@ creation.
 3. if count >= capacity:
    Release eq.lock; return QueueFull
 4. ring[write_idx] = entry; write_idx = (write_idx + 1) % (capacity + 1)
-5. count += 1 (Release); on the 0 -> 1 transition, waitset_notify
+5. count += 1 (Release); if a wait set is registered, waitset_notify (on
+   every entry rung, not only the 0 -> 1 transition)
 6. Release eq.lock
 ```
 
@@ -668,8 +670,10 @@ refuses `SYS_WAIT_SET_ADD` with `InvalidArgument`, per
 ### Readiness Notification
 
 Each IPC object type is extended with a "wait set registration" — a pointer back to
-the `WaitSetState` and the member index. When an object becomes ready (a sender calls an
-endpoint, a notification has bits set, an event is posted), it calls into the wait set:
+the `WaitSetState` and the member index. On every arrival of work on the object (a call
+queued on an endpoint, a send to a notification that wakes no direct waiter, an entry rung
+on an event queue), not only on the one that makes it ready, it calls into the wait set, so
+that each arrival wakes one of the threads waiting on the set:
 
 ```
 waitset_notify(wait_set, member_idx):
@@ -735,12 +739,13 @@ shares a set with others therefore receives without blocking where the source
 offers that (`SYS_EVENT_RECV`'s try-once mode), or accepts that its blocking
 receive waits for the source's next arrival.
 
-**Why step 3 exists, and its memory-ordering requirement.** Readiness
-notifications (`waitset_notify`) are *edge-triggered*: `event_queue_post` fires
-only on the empty→non-empty `count` transition and `endpoint_call` only on the
-empty→non-empty send-queue transition. A second item that arrives while a first
-is still queued therefore fires no notify, and — for a consumer that handles one
-item per wakeup — would be invisible without the level re-check in step 3.
+**Why step 3 exists, and its memory-ordering requirement.** Every arrival of work
+on a member reaches `waitset_notify` (§ Readiness Notification), but an arrival
+that finds no thread waiting leaves only a ring entry, and the ring does not name
+every unit of work a member holds: a push to a full ring is dropped (§ Multiple
+Ready Sources), and a member already ready when it is added gets one entry however
+many senders or entries it holds. For a consumer that handles one item per wakeup,
+the items no entry names would be invisible without the level re-check in step 3.
 
 The self-heal reads source readiness **without taking the source lock**: taking
 it here would acquire `source.lock` while holding `ws.lock`, inverting the
@@ -752,7 +757,7 @@ self-heal reads with `Acquire`. `EventQueueState::count` and
 `EndpointState::send_nonempty` MUST be mutated with `Release` under the source lock,
 and the `Acquire` load pairs with those stores. Without that pairing, a weak-memory
 target (riscv64) can observe a stale not-ready and strand a queued sender or event
-whose enqueue fired no edge notify (lost wakeup). `NotificationState::bits` is the
+that no ring entry names (lost wakeup). `NotificationState::bits` is the
 exception. `notification_send` sets it with a lock-free `Relaxed` `fetch_or` that
 the SeqCst Dekker fence pair orders against `notification_wait`, so the self-heal's
 `Acquire` load of `bits` has no `Release` partner (`bits` carries no dependent
@@ -802,11 +807,12 @@ returns `Interrupted`.
 
 If multiple members become ready before `SYS_WAIT_SET_WAIT` is called, `ready_ring`
 buffers their member indices in arrival order, up to the set's capacity in
-entries; it does not deduplicate, and a push to a full ring is dropped.
+entries; it does not deduplicate (a member gets one entry per arrival), and a push
+to a full ring is dropped.
 Subsequent `SYS_WAIT_SET_WAIT` calls drain the ring without blocking until it is
 empty, skipping an entry whose source is no longer ready (§ Wait Path step 2b), per
 [syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28).
-An edge lost to a full ring is recovered by the level-readiness self-heal
+An entry lost to a full ring is recovered by the level-readiness self-heal
 (§ Wait Path step 3), which returns any member whose source is still ready.
 
 ---

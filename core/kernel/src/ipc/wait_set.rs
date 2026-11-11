@@ -296,7 +296,7 @@ impl WaitSetState
     /// Push `member_idx` onto the ready ring.
     ///
     /// A push to a full ring (`capacity` pending entries) is dropped; the lost
-    /// edge is recovered by `waitset_wait`'s level-readiness walk, per
+    /// entry is recovered by `waitset_wait`'s level-readiness walk, per
     /// core/kernel/docs/ipc-internals.md § Multiple Ready Sources.
     #[inline]
     fn push_ready(&mut self, member_idx: u16)
@@ -338,9 +338,10 @@ impl WaitSetState
 
 /// Notify the wait set that member `member_idx` is ready.
 ///
-/// Called from `endpoint_call` and `event_queue_post` on their empty→non-empty
-/// transitions, and from `notification_send` on every send that finds no
-/// blocked waiter while a wait set is registered.
+/// Called once per arrival of work on a registered source: from
+/// `endpoint_call` for every call it queues, from `event_queue_post` for every
+/// entry it rings, and from `notification_send` on every send that finds no
+/// blocked waiter.
 ///
 /// If threads are blocked in `waitset_wait`, the longest-waiting one is woken
 /// with the member's badge and the others stay parked. Otherwise the member

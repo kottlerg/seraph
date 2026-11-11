@@ -39,14 +39,22 @@ fn after_marker(line: &str) -> Option<&str>
 /// `[x]`, or `[X]`. These are the forms GitHub renders as a checkbox.
 pub fn task_item(line: &str) -> Option<TaskItem>
 {
+    task_item_text(line).map(|(state, _)| state)
+}
+
+/// The task-list item `line` holds and its text after the box, trimmed.
+pub fn task_item_text(line: &str) -> Option<(TaskItem, &str)>
+{
     let rest = after_marker(line)?;
-    if rest.starts_with("[ ]")
+    if let Some(text) = rest.strip_prefix("[ ]")
     {
-        Some(TaskItem::Open)
+        Some((TaskItem::Open, text.trim()))
     }
-    else if rest.starts_with("[x]") || rest.starts_with("[X]")
+    else if let Some(text) = rest
+        .strip_prefix("[x]")
+        .or_else(|| rest.strip_prefix("[X]"))
     {
-        Some(TaskItem::Ticked)
+        Some((TaskItem::Ticked, text.trim()))
     }
     else
     {

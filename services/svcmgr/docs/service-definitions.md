@@ -317,9 +317,10 @@ drive every restart (`cap[1]` absent, history pull skipped), each relaunched log
 re-attaching a fresh RECV to the same endpoint object every sender already
 targets, with `restart` and `critical` behaving as for any other service;
 design intent; not yet implemented (#262). Today, on a logd death svcmgr's
-death handler blocks in `log!` on the master-log endpoint with no logd
-receiving, so it reaches neither the restart nor the critical
-graceful-shutdown path (per
+death handler makes `log!` calls on the master-log endpoint with no logd
+receiving; each is dropped once its bound expires
+([shared/log](../../../shared/log/README.md)), so the handler reaches the
+restart and the critical graceful-shutdown path late, not never (per
 [restart-protocol.md](restart-protocol.md#supervision-hierarchy)).
 
 ```

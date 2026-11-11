@@ -59,7 +59,7 @@ pub unsafe fn serial_init(
     {
         return false;
     };
-    if phys % PAGE_SIZE != 0 || bytes <= UART_LSR || bytes > PAGE_SIZE
+    if phys % PAGE_SIZE != 0 || !(UART_LSR + 1..=PAGE_SIZE).contains(&bytes)
     {
         return false;
     }

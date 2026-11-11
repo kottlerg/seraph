@@ -67,7 +67,7 @@ fn bootstrap(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<(u64, PlatformD
     {
         return None;
     };
-    let fits = phys % PAGE_SIZE == 0 && bytes >= REG_TIME_HIGH + 4 && bytes <= PAGE_SIZE;
+    let fits = phys % PAGE_SIZE == 0 && (REG_TIME_HIGH + 4..=PAGE_SIZE).contains(&bytes);
     fits.then_some((cap, device))
 }
 

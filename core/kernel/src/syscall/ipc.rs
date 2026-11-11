@@ -515,9 +515,9 @@ unsafe fn open_call_episode(tcb: *mut crate::sched::thread::ThreadControlBlock)
 
 /// Consume the reply disposition the park episode's wake-claim winner
 /// stamped. `Ok(())` means a REPLY deposit is present and `ipc_msg` is
-/// readable; `Err(Interrupted)` covers a cancelled episode (stop, server
-/// dealloc, teardown) and — fail-closed — a spurious resume with no deposit
-/// at all. The Acquire pairs with the stamp's Release, ordering the deposit
+/// readable; `Err(WouldBlock)` means a timed call expired; `Err(Interrupted)`
+/// covers a cancelled episode (stop, server dealloc, teardown) and —
+/// fail-closed — a spurious resume with no deposit at all. The Acquire pairs with the stamp's Release, ordering the deposit
 /// payload before the caller's `ipc_msg` reads. Reading `ipc_msg` without
 /// this gate was the #352 variant-B shape: a cancel/dealloc wake (or a
 /// spurious resume) surfaced stale `ipc_msg` bytes to userspace as a
@@ -560,6 +560,11 @@ unsafe fn consume_call_disposition(
     {
         return Ok(());
     }
+    // A timed call's expiry claimed the episode (send or reply phase).
+    if disposition == crate::sched::thread::PARK_DISPOSITION_TIMED_OUT
+    {
+        return Err(SyscallError::WouldBlock);
+    }
     // INTERRUPTED, or NONE (no deposit at all — spurious resume; the debug
     // tripwire above has already named it). Fail closed: Interrupted is
     // strictly better than surfacing stale ipc_msg bytes as a success.
@@ -572,9 +577,15 @@ unsafe fn consume_call_disposition(
 
 /// `SYS_IPC_CALL` (0): synchronous call on an endpoint.
 ///
-/// arg0 = endpoint cap handle, arg1 = label, arg2 = `data_count`,
+/// arg0 = endpoint cap handle, arg1 = label, arg2 = `data_count` in bits
+/// 0..31 and `timeout_ms` in bits 32..63 ([`syscall::ipc_call_count_arg`]),
 /// arg3 = `cap_count` (0-4); the `cap_count` cap handles are read from the
 /// caller's IPC buffer at word `MSG_CAP_HANDLES_WORD`.
+///
+/// A nonzero `timeout_ms` bounds the whole call, its wait for a receiver and
+/// its wait for the reply: on expiry the call returns `WouldBlock`, and a
+/// reply the server sends later fails with `InvalidCapability`. `0` waits
+/// without bound.
 ///
 /// If `cap_count` > 0, the endpoint cap must have `EpRights::GRANT`. Capabilities
 /// at the specified slots are moved from the caller's `CSpace` to the server's
@@ -594,7 +605,8 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
     let label = tf.arg(1);
     // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
     #[allow(clippy::cast_possible_truncation)]
-    let data_count = (tf.arg(2) as usize).min(MSG_DATA_WORDS_MAX);
+    let data_count = (syscall::ipc_call_data_count(tf.arg(2)) as usize).min(MSG_DATA_WORDS_MAX);
+    let timeout_ms = syscall::ipc_call_timeout_ms(tf.arg(2));
     // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
     #[allow(clippy::cast_possible_truncation)]
     let cap_count = (tf.arg(3) as usize).min(MSG_CAP_SLOTS_MAX);
@@ -669,6 +681,15 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller.
     unsafe { open_call_episode(tcb) };
 
+    let deadline = if timeout_ms == 0
+    {
+        0
+    }
+    else
+    {
+        crate::sched::sleep_deadline_after_ms(u64::from(timeout_ms))
+    };
+
     // SAFETY: ep_state is the state of the Endpoint `slot` pins until the
     // drop below; tcb is the running thread (current_tcb above); no scheduler
     // lock and no ep.lock held.
@@ -678,6 +699,7 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
             tcb,
             &msg,
             crate::sched::thread::IpcThreadState::BlockedOnReply,
+            deadline,
         )
     };
 
@@ -800,14 +822,17 @@ fn log_recv_preallocate_failure(
 
 /// `SYS_IPC_RECV` (2): receive the next message on an endpoint.
 ///
-/// arg0 = endpoint cap index.
+/// arg0 = endpoint cap index, arg1 = `timeout_ms`: `0` waits without bound,
+/// [`syscall::WAIT_TRY_ONCE`] (`u64::MAX`) never parks, and any other value
+/// bounds the wait; an empty try-once and an expiry return `WouldBlock`.
 ///
 /// First releases a caller still bound by an earlier receive this thread never
 /// replied to (its call returns `Interrupted`; a fault-blocked caller is
 /// killed, or, blocked on its restartable syscall's user copy, has that
 /// syscall fail with `InvalidAddress`; and one blocked in an upcall delivery
 /// has the upcall dropped and resumes), once the capability check and the
-/// cap-slot pre-allocation pass.
+/// cap-slot pre-allocation pass. A try-once receive releases it only when it
+/// binds the next caller, and an empty one leaves it bound.
 /// Blocks server until a caller sends. On return, the message label and data
 /// words are available in return registers and the server's IPC buffer.
 /// If the message carried capabilities, their delivered handles in the server's
@@ -816,6 +841,7 @@ fn log_recv_preallocate_failure(
 pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let ep_idx = tf.arg(0);
+    let timeout_ms = tf.arg(1);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -868,13 +894,31 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
-    // SAFETY: ep_state is the state of the Endpoint `slot` pins until the
-    // drop before the park below (or the return of the immediate delivery);
-    // tcb is the running thread (current_tcb above); no scheduler lock and no
-    // ep.lock held.
-    let result = unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb) };
+    // SAFETY (both arms): ep_state is the state of the Endpoint `slot` pins
+    // until the drop before the park below (or the return of the immediate
+    // delivery); tcb is the running thread (current_tcb above); no scheduler
+    // lock and no ep.lock held.
+    let result = if timeout_ms == syscall::WAIT_TRY_ONCE
+    {
+        // SAFETY: see above.
+        let bound = unsafe { crate::ipc::endpoint::endpoint_try_recv(ep_state, tcb) };
+        Some(bound.ok_or(SyscallError::WouldBlock)?)
+    }
+    else
+    {
+        let deadline = if timeout_ms == 0
+        {
+            0
+        }
+        else
+        {
+            crate::sched::sleep_deadline_after_ms(timeout_ms)
+        };
+        // SAFETY: see above.
+        unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb, deadline) }.ok()
+    };
 
-    if let Ok((caller, msg)) = result
+    if let Some((caller, msg)) = result
     {
         // A caller was waiting; deliver message immediately.
         // SAFETY: tcb validated above.
@@ -942,13 +986,16 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
 
     // A cancellation claim (stop while parked, endpoint dealloc's recv-queue
     // drain, or a stop that won against the park commit) stamped the episode
-    // INTERRUPTED; consume it before the ipc_msg read — publishing the stale
-    // message into the server's userspace buffer as a success was the #363
-    // recv surface.
+    // INTERRUPTED, and a timed receive's expiry TIMED_OUT; consume it before
+    // the ipc_msg read — publishing the stale message into the server's
+    // userspace buffer as a success was the #363 recv surface.
     // SAFETY: tcb still valid after resume.
-    if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
+    match unsafe { crate::sched::thread::consume_park_cancel(tcb) }
     {
-        return Err(SyscallError::Interrupted);
+        crate::sched::thread::ParkCancel::None =>
+        {}
+        crate::sched::thread::ParkCancel::Interrupted => return Err(SyscallError::Interrupted),
+        crate::sched::thread::ParkCancel::TimedOut => return Err(SyscallError::WouldBlock),
     }
 
     // On resume, deliver the message the waking caller copied into ipc_msg.
@@ -1349,8 +1396,10 @@ pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
 /// `SYS_NOTIFICATION_WAIT` (4): block until a notification bit is set, then return the bits.
 ///
 /// arg0 = notification cap index (WAIT right).
-/// arg1 = `timeout_ms`. `0` blocks indefinitely. `> 0` blocks until bits
-///        are delivered *or* `timeout_ms` milliseconds have elapsed.
+/// arg1 = `timeout_ms`. `0` blocks indefinitely. [`syscall::WAIT_TRY_ONCE`]
+///        (`u64::MAX`) never blocks: it takes the pending bits, or returns
+///        `WouldBlock` when none are pending. Any other value blocks until
+///        bits are delivered *or* `timeout_ms` milliseconds have elapsed.
 ///
 /// On success returns `0` in rax/a0 and the bitmask in the secondary return
 /// register (rdx/a1). A notification wake always carries non-zero bits because
@@ -1390,6 +1439,18 @@ pub fn sys_notification_wait(tf: UserFrame) -> Result<u64, SyscallError>
         let sig_obj = obj_ptr.cast::<crate::cap::object::NotificationObject>();
         (*sig_obj).state
     };
+
+    if timeout_ms == syscall::WAIT_TRY_ONCE
+    {
+        // SAFETY: sig_state extracted from the Notification object `slot` pins.
+        let bits = unsafe { crate::ipc::notification::notification_try_wait(sig_state) };
+        if bits == 0
+        {
+            return Err(SyscallError::WouldBlock);
+        }
+        tf.set_ipc_return(0, bits);
+        return Ok(0);
+    }
 
     // Open the park episode before the caller can be queued as a waiter.
     // SAFETY: tcb is the running caller, not yet claimable.
@@ -2112,6 +2173,11 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
 /// `SYS_WAIT_SET_WAIT` (28): block until any registered source becomes ready.
 ///
 /// arg0 = wait set cap index (must have WAIT right).
+/// arg1 = `timeout_ms`. `0` blocks indefinitely. [`syscall::WAIT_TRY_ONCE`]
+///        (`u64::MAX`) never blocks: with no source ready it returns
+///        `WouldBlock`. Any other value bounds the wait, and its expiry
+///        returns `WouldBlock` (a badge is any `u64`, so no in-band value can
+///        mark it).
 ///
 /// If a source is already ready (from a prior notification), returns immediately.
 /// Otherwise blocks until any member fires. The opaque badge chosen at
@@ -2125,6 +2191,7 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
 pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let ws_idx = tf.arg(0);
+    let timeout_ms = tf.arg(1);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -2149,12 +2216,30 @@ pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
         (*ws_obj).state
     };
 
+    if timeout_ms == syscall::WAIT_TRY_ONCE
+    {
+        // SAFETY: ws_state is the state of the WaitSet `ws_slot` pins;
+        // scheduler lock not held.
+        let badge = unsafe { crate::ipc::wait_set::waitset_try_wait(ws_state) }
+            .ok_or(SyscallError::WouldBlock)?;
+        tf.set_ipc_return(0, badge);
+        return Ok(0);
+    }
+
     // Open the park episode before the caller can be queued as a waiter.
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
+    let deadline = if timeout_ms == 0
+    {
+        0
+    }
+    else
+    {
+        crate::sched::sleep_deadline_after_ms(timeout_ms)
+    };
     // SAFETY: ws_state valid; scheduler lock not held.
-    let result = unsafe { crate::ipc::wait_set::waitset_wait(ws_state, tcb) };
+    let result = unsafe { crate::ipc::wait_set::waitset_wait(ws_state, tcb, deadline) };
 
     if let Some(badge) = result
     {
@@ -2173,16 +2258,27 @@ pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
         crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
-    // A cancellation claim stamped the episode INTERRUPTED; consume it before
-    // the deposit read so a cancelled wait cannot surface a stale badge.
+    // A cancellation claim stamped the episode INTERRUPTED, and a timed wait's
+    // expiry TIMED_OUT; consume it before the deposit read so a cancelled or
+    // expired wait cannot surface a stale badge.
     // SAFETY: tcb still valid after resume.
-    if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
+    let cancel = unsafe { crate::sched::thread::consume_park_cancel(tcb) };
+    if cancel != crate::sched::thread::ParkCancel::None
     {
         // SAFETY: tcb validated above.
         unsafe {
             (*tcb).wakeup_value = 0;
         }
-        return Err(SyscallError::Interrupted);
+        return Err(
+            if cancel == crate::sched::thread::ParkCancel::TimedOut
+            {
+                SyscallError::WouldBlock
+            }
+            else
+            {
+                SyscallError::Interrupted
+            },
+        );
     }
 
     // On resume, waitset_notify stored the badge in wakeup_value.

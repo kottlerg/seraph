@@ -71,7 +71,7 @@ pub use syscall_abi::{
     RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE,
     RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND,
     RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL,
-    RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
+    RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -79,7 +79,7 @@ pub use syscall_abi::{
 mod arch;
 
 use arch::current::{
-    syscall1_ret4, syscall2, syscall2_ret3, syscall3, syscall4, syscall4_any, syscall5,
+    syscall2, syscall2_ret3, syscall2_ret4, syscall3, syscall4, syscall4_any, syscall5,
     syscall5_ret2, syscall6, syscall6_ret3,
 };
 
@@ -254,11 +254,33 @@ pub fn raw_ipc_call(
     cap_count: usize,
 ) -> Result<(u64, usize), i64>
 {
+    raw_ipc_call_timeout(ep, label, data_count, cap_count, 0)
+}
+
+/// [`raw_ipc_call`] bounded by `timeout_ms` milliseconds over the whole call,
+/// its wait for a receiver and its wait for the reply; `0` waits without
+/// bound, as [`raw_ipc_call`] does.
+///
+/// # Errors
+/// As [`raw_ipc_call`], and `-6` (`WouldBlock`) when the timeout expired
+/// before the reply arrived; a reply the server sends after that fails on the
+/// server's side.
+#[doc(hidden)]
+#[inline]
+pub fn raw_ipc_call_timeout(
+    ep: u64,
+    label: u64,
+    data_count: usize,
+    cap_count: usize,
+    timeout_ms: u32,
+) -> Result<(u64, usize), i64>
+{
     // cast_possible_truncation: word count fits in 16 bits by invariant.
     #[allow(clippy::cast_possible_truncation)]
     let data_count_u64 = data_count as u64;
     #[allow(clippy::cast_possible_truncation)]
     let cap_count_u64 = cap_count as u64;
+    let count_arg = syscall_abi::ipc_call_count_arg(data_count_u64, timeout_ms);
     // SAFETY: syscall6_ret3 issues the raw syscall; every argument is a scalar
     // the kernel validates, and the two unused argument registers are zero. The
     // kernel reads the request words and cap handles from, and writes the reply
@@ -267,7 +289,7 @@ pub fn raw_ipc_call(
     // the page is live across this call, which is the raw-wrapper contract's
     // IPC-buffer clause.
     let (ret, reply_label, reply_word_count) =
-        unsafe { syscall6_ret3(SYS_IPC_CALL, ep, label, data_count_u64, cap_count_u64, 0, 0) };
+        unsafe { syscall6_ret3(SYS_IPC_CALL, ep, label, count_arg, cap_count_u64, 0, 0) };
     if ret < 0
     {
         Err(ret)
@@ -282,7 +304,7 @@ pub fn raw_ipc_call(
     }
 }
 
-/// Raw `SYS_IPC_RECV` issuing syscall1_ret4. Intended for `shared/ipc`'s
+/// Raw `SYS_IPC_RECV`, waiting without bound. Intended for `shared/ipc`'s
 /// `IpcMessage`-snapshot wrapper; other callers should use that higher-level
 /// entry point.
 ///
@@ -301,12 +323,28 @@ pub fn raw_ipc_call(
 #[inline]
 pub fn raw_ipc_recv(ep: u64) -> Result<(u64, u64, usize), i64>
 {
-    // SAFETY: syscall1_ret4 issues the raw syscall; `ep` is a scalar the kernel
-    // validates. The kernel writes the delivered message into this thread's
-    // registered IPC buffer page; registering it required `ipc_buffer_set`'s
-    // contract, under which no Rust reference into the page is live across this
-    // call, which is the raw-wrapper contract's IPC-buffer clause.
-    let (ret, label, badge, word_count) = unsafe { syscall1_ret4(SYS_IPC_RECV, ep) };
+    raw_ipc_recv_timeout(ep, 0)
+}
+
+/// Raw `SYS_IPC_RECV` under its `timeout_ms` policy: `0` waits without bound
+/// (as [`raw_ipc_recv`]), [`WAIT_TRY_ONCE`] (`u64::MAX`) never waits, and
+/// any other value waits up to `timeout_ms` milliseconds. A try-once that
+/// finds no caller leaves a reply this thread still owes pending.
+///
+/// # Errors
+/// As [`raw_ipc_recv`], and `-6` (`WouldBlock`) on an empty try-once or an
+/// expiry.
+#[doc(hidden)]
+#[inline]
+pub fn raw_ipc_recv_timeout(ep: u64, timeout_ms: u64) -> Result<(u64, u64, usize), i64>
+{
+    // SAFETY: syscall2_ret4 issues the raw syscall; `ep` and `timeout_ms` are
+    // scalars the kernel validates. The kernel writes the delivered message
+    // into this thread's registered IPC buffer page; registering it required
+    // `ipc_buffer_set`'s contract, under which no Rust reference into the page
+    // is live across this call, which is the raw-wrapper contract's IPC-buffer
+    // clause.
+    let (ret, label, badge, word_count) = unsafe { syscall2_ret4(SYS_IPC_RECV, ep, timeout_ms) };
     if ret < 0
     {
         Err(ret)
@@ -401,7 +439,9 @@ pub fn notification_wait(sig: u64) -> Result<u64, i64>
 /// elapses. Returns the acquired bitmask (non-zero) on wake, or `Ok(0)`
 /// on timeout.
 ///
-/// `timeout_ms == 0` is equivalent to [`notification_wait`] — block indefinitely.
+/// `timeout_ms == 0` is equivalent to [`notification_wait`] — block
+/// indefinitely; `timeout_ms == u64::MAX` ([`WAIT_TRY_ONCE`]) is
+/// [`notification_try_wait`], which never blocks.
 ///
 /// Same register layout as [`notification_wait`]: status in the primary register,
 /// bitmask in the secondary. Timeout is notified in-band as `bits == 0`
@@ -419,6 +459,18 @@ pub fn notification_wait_timeout(sig: u64, timeout_ms: u64) -> Result<u64, i64>
     // (0 = infinite, matching the single-arg behaviour).
     let (ret, bits) = unsafe { syscall5_ret2(SYS_NOTIFICATION_WAIT, sig, timeout_ms, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(bits) }
+}
+
+/// Take the bits pending on a notification cap without blocking. Returns the
+/// bitmask (non-zero), cleared from the notification.
+///
+/// # Errors
+/// Returns `-6` (`WouldBlock`) when no bit is pending, or a negative `i64`
+/// error code if the notification cap is invalid or lacks Wait rights.
+#[inline]
+pub fn notification_try_wait(sig: u64) -> Result<u64, i64>
+{
+    notification_wait_timeout(sig, WAIT_TRY_ONCE)
 }
 
 /// Retype a Memory cap into a new Endpoint. Returns the new capability handle
@@ -2032,6 +2084,33 @@ pub fn wait_set_wait(ws_cap: u64) -> Result<u64, i64>
     // kernel validates cap, blocks until source ready, returns badge in secondary register.
     let (ret, badge) = unsafe { syscall5_ret2(SYS_WAIT_SET_WAIT, ws_cap, 0, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(badge) }
+}
+
+/// [`wait_set_wait`] under `SYS_WAIT_SET_WAIT`'s `timeout_ms` policy: `0`
+/// blocks indefinitely, `u64::MAX` ([`WAIT_TRY_ONCE`]) never blocks, and any
+/// other value blocks for up to `timeout_ms` milliseconds.
+///
+/// # Errors
+/// As [`wait_set_wait`], and `-6` (`WouldBlock`) when no source was ready by
+/// the timeout, or at once for a try-once.
+#[inline]
+pub fn wait_set_wait_timeout(ws_cap: u64, timeout_ms: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; ws_cap and
+    // timeout_ms are scalars the kernel validates; the badge comes back in
+    // the secondary register.
+    let (ret, badge) = unsafe { syscall5_ret2(SYS_WAIT_SET_WAIT, ws_cap, timeout_ms, 0, 0, 0) };
+    if ret < 0 { Err(ret) } else { Ok(badge) }
+}
+
+/// Return the badge of a ready source in `ws_cap` without blocking.
+///
+/// # Errors
+/// As [`wait_set_wait`], and `-6` (`WouldBlock`) when no source is ready.
+#[inline]
+pub fn wait_set_try_wait(ws_cap: u64) -> Result<u64, i64>
+{
+    wait_set_wait_timeout(ws_cap, WAIT_TRY_ONCE)
 }
 
 // ── Hardware access wrappers ──────────────────────────────────────────────────

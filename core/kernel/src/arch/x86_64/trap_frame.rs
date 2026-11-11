@@ -174,7 +174,7 @@ impl TrapFrame
     }
 
     /// Write `SYS_IPC_RECV` return values: primary in rax, label in rdx,
-    /// badge in rsi, data-word count in r8. Matches `shared/syscall::syscall1_ret4`.
+    /// badge in rsi, data-word count in r8. Matches `shared/syscall::syscall2_ret4`.
     pub fn set_ipc_recv_return(&mut self, primary: u64, label: u64, badge: u64, word_count: u64)
     {
         self.rax = primary;

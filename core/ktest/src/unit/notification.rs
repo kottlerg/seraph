@@ -9,7 +9,7 @@
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, cap_derive, notification_send,
-    notification_wait, notification_wait_timeout, system_info, thread_exit,
+    notification_try_wait, notification_wait, notification_wait_timeout, system_info, thread_exit,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -228,6 +228,47 @@ pub fn wait_timeout_fires(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(sig).map_err(|_| "cap_delete sig after wait_timeout_fires failed")?;
+    Ok(())
+}
+
+// ── SYS_NOTIFICATION_WAIT (try-once) ────────────────────────────────────────────────
+
+/// `notification_try_wait` on a notification with no pending bits returns
+/// `WouldBlock` at once.
+pub fn try_wait_empty_would_block(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for try_wait_empty_would_block failed")?;
+
+    let r = notification_try_wait(sig);
+    cap_delete(sig).map_err(|_| "cap_delete sig after try_wait_empty_would_block failed")?;
+    if r != Err(SyscallError::WouldBlock as i64)
+    {
+        return Err("notification_try_wait on an idle cap did not return WouldBlock");
+    }
+    Ok(())
+}
+
+/// `notification_try_wait` returns the pending bits and clears them: a second
+/// try-once finds nothing.
+pub fn try_wait_takes_pending_bits(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for try_wait_takes_pending_bits failed")?;
+
+    notification_send(sig, 0b101)
+        .map_err(|_| "notification_send before try_wait_takes_pending_bits failed")?;
+    let first = notification_try_wait(sig);
+    let second = notification_try_wait(sig);
+    cap_delete(sig).map_err(|_| "cap_delete sig after try_wait_takes_pending_bits failed")?;
+    if first != Ok(0b101)
+    {
+        return Err("notification_try_wait did not return the pending bits (expected 0b101)");
+    }
+    if second != Err(SyscallError::WouldBlock as i64)
+    {
+        return Err("notification_try_wait did not clear the bits it returned");
+    }
     Ok(())
 }
 

@@ -15,7 +15,12 @@ the entry point the std overlay's `seraph::log!` macro reaches through
 `std::os::seraph::log::__emit_record`, and drops a record as `emit` drops a line. The levels, the
 filter, and the wire encodings are specified in
 [logd IPC interface](../../services/logd/docs/ipc-interface.md) § Levels and
-§ `stream_labels::STREAM_RECORD`. The crate's only consumer is std.
+§ `stream_labels::STREAM_RECORD`. Every log call is bounded (`LOG_CALL_TIMEOUT_MS`), and once one
+times out the process's later calls take the short `LOG_CALL_UNANSWERED_TIMEOUT_MS` bound until
+one is answered, so a log receiver that stops answering costs a sender one long wait and then a
+short one per line ([docs/limits.md](../../docs/limits.md) § Shared IPC and protocol crates). The
+crate's consumers are std and svctest, whose `log_client` phase drives the wire helpers against an
+endpoint of its own that never answers.
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 

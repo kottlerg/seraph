@@ -38,7 +38,7 @@ xtask/
 │   ├── commands/               # Subcommand modules (build, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, test_crash_report, test_debug_port, test_gdb, test_kaslr,
-│   │                           #   test_logd_reclaim, test_map_redo, test_terminal,
+│   │                           #   test_map_redo, test_terminal,
 │   │                           #   test_vmgenid, lint_docs, pr_check, review, issue, orch,
 │   │                           #   hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
@@ -706,43 +706,6 @@ See [docs/testing.md](../docs/testing.md) for the harness model and
 
 ---
 
-### `cargo xtask test-logd-reclaim`
-
-Check that a child's death reaches logd and evicts its slot, on either arch. Reads a svctest
-boot's serial log and passes when the log holds svctest's pass marker and exactly one logd line
-`reclaim: badge=<b> exit_reason=0x17 name="svctest-logd-reclaim exit_reason=0x0"`: the slot of
-the child svctest's `logd_death_forward` phase spawns, evicted on its exit with code `0x17`. The
-line's fields are read with `logd_codec::record::fields`, so the forged ` exit_reason=0x0` in the
-child's name stays inside the name, and the line must be exactly the rendering of the record they
-give. The check also requires the child's record line `logd-reclaim child exiting code=23` and,
-after it, the child's text line `partial text line resumed`, which the child sends in two halves
-around its records, whole. The line's shape is stated in
-[services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
-§ Death-notification cascade.
-
-```sh
-# Check a saved svctest log; boots nothing (what CI's svctest cell runs):
-cargo xtask test-logd-reclaim --log target/xtask/run-parallel-saved/x86_64-4cpu-1.log
-
-# Boot the current sysroot once, svctest staged, and check its log:
-cargo xtask test-logd-reclaim [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [--mem MIB] \
-    [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5]
-```
-
-With no `--log`, the boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass
-and fail markers, `--timeout` defaulting to 900 s) with `--save-logs` into
-`target/xtask/test-logd-reclaim/`, and the check reads the log saved there (a log an earlier
-boot left there is removed first). A boot that ends `FAIL`, `HANG`, `OK` or `ERR` fails the command
-before the check, as it fails `run-parallel`. A `QEMU-CRASH` boot, a host-emulator crash that
-`run-parallel` does not count as a failure, leaves a log without the pass marker: the check reads
-the outcome from the log's `[run-parallel]` trailer, its last line, and reports itself skipped,
-which passes the command, for a saved log given with `--log` as well. Stage svctest first, as
-[docs/testing.md](../docs/testing.md) § Gating describes.
-
-See [docs/testing.md](../docs/testing.md) for the harness model.
-
----
-
 ### `cargo xtask test-crash-report`
 
 Check the crash service's report blocks in a boot's saved serial log, on either arch; boots
@@ -764,8 +727,9 @@ through the badge logd's `reclaim:` line names it by, each complete, its walk st
 instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying
 the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the
 block read the thread the kernel killed. `--expect none` requires the log to hold no block. A log
-whose `[run-parallel]` trailer records a `QEMU-CRASH` is reported skipped, which passes the
-command, as `test-logd-reclaim` reports it. The model is in
+whose `[run-parallel]` trailer, its last line, records a `QEMU-CRASH`, a host-emulator crash that
+`run-parallel` does not count as a failure, is reported skipped, which passes the command. The
+model is in
 [docs/testing.md](../docs/testing.md) § Crash reports.
 
 ---
@@ -793,7 +757,8 @@ The boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass 
 `--timeout` defaulting to 900 s) with `--save-logs` into `target/xtask/test-map-redo/`, and the
 check reads the log saved there (a log an earlier boot left there is removed first). A boot that
 ends `FAIL`, `HANG`, `OK` or `ERR` fails the command before the check, as it fails `run-parallel`;
-a `QEMU-CRASH` boot is reported skipped, as `test-logd-reclaim` reports it.
+a `QEMU-CRASH` boot, a host-emulator crash that `run-parallel` does not count as a failure, is
+reported skipped, which passes the command.
 
 See [docs/testing.md](../docs/testing.md) for the harness model.
 
@@ -1197,8 +1162,8 @@ has no `hook` command exits with that code, so `.claude/settings.json` writes ea
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build` and `clean` as builds; `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-logd-reclaim` (when it
-boots), `test-map-redo`, `test-debug-port` and `test-gdb` as boots.
+`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port`
+and `test-gdb` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 2 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

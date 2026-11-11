@@ -27,8 +27,7 @@ pub fn spawn_only() -> &'static [Phase]
     }]
 }
 
-/// The logd death-forward fixture, run just after [`spawn_only`]: early, so
-/// logd has drained the child's death long before the run shuts down.
+/// The logd death-forward check, run just after [`spawn_only`].
 pub fn logd_forward() -> &'static [Phase]
 {
     &[Phase {
@@ -37,15 +36,16 @@ pub fn logd_forward() -> &'static [Phase]
     }]
 }
 
-/// The log name [`logd_death_forward_phase`]'s child registers, which
-/// `cargo xtask test-logd-reclaim` finds in logd's `reclaim:` line. No other
-/// process registers it. It holds a forged `exit_reason` field, which logd's
-/// line must carry inside the quoted name, never as a field of its own.
+/// The log name [`logd_death_forward_phase`]'s child registers, by which the
+/// phase finds the child's slot. No other process registers it. It holds a
+/// forged `exit_reason` field, which logd's `reclaim:` line must carry inside
+/// the quoted name, never as a field of its own.
 const LOGD_RECLAIM_NAME: &[u8] = b"svctest-logd-reclaim exit_reason=0x0";
 
-/// The code [`logd_death_forward_phase`]'s child exits with, which logd's
-/// `reclaim:` line carries as `exit_reason=0x17`. Nonzero, so the check also
-/// sees that the forward carries the exit reason, not only the badge.
+/// The code [`logd_death_forward_phase`]'s child exits with, which logd
+/// reports as the exit reason of the child's retired slot. Nonzero, so the
+/// check also sees that the forward carries the exit reason, not only the
+/// badge.
 const LOGD_RECLAIM_EXIT_CODE: i32 = 0x17;
 
 /// Role token of [`logd_death_forward_phase`]'s child.
@@ -58,9 +58,9 @@ const LOGD_RECLAIM_ROLE: &str = "logd-reclaim-child";
 /// Between the halves of one text line, [`LOGD_PARTIAL_TEXT`] then
 /// [`LOGD_RESUMED_TEXT`], the child sends a malformed record, which logd must
 /// refuse, and a record with a `code` field of [`LOGD_RECLAIM_EXIT_CODE`].
-/// `cargo xtask test-logd-reclaim` finds the record's line, and the text line
-/// whole after it: a record leaves a sender's pending text line as it was.
-/// A refused record or a failed send panics, so the exit code differs.
+/// The phase reads the record from logd's history, and the text line whole
+/// after it: a record leaves a sender's pending text line as it was. A
+/// refused record or a failed send panics, so the exit code differs.
 fn logd_reclaim_child_main() -> !
 {
     use ipc::stream_labels::{
@@ -91,23 +91,38 @@ fn logd_reclaim_child_main() -> !
 }
 
 /// The first half of the text line [`logd_reclaim_child_main`] splits around
-/// its records; `cargo xtask test-logd-reclaim` reads the line whole.
+/// its records; the phase reads the line whole ([`LOGD_WHOLE_TEXT`]).
 const LOGD_PARTIAL_TEXT: &[u8] = b"partial text ";
 
 /// The second half, which ends the line.
 const LOGD_RESUMED_TEXT: &[u8] = b"line resumed\n";
 
+/// The text line logd retains from the two halves, without its newline.
+const LOGD_WHOLE_TEXT: &[u8] = b"partial text line resumed";
+
+/// The message of the child's record.
+const LOGD_RECORD_MESSAGE: &[u8] = b"logd-reclaim child exiting";
+
 /// Spawn a child that registers [`LOGD_RECLAIM_NAME`] with logd and exits
 /// with [`LOGD_RECLAIM_EXIT_CODE`], and assert that code. procmgr's teardown
 /// forwards the death to logd's death queue (`forward_death_to_logd`), and
-/// logd evicts the child's slot and logs
-/// `reclaim: badge=<b> exit_reason=0x17 name="svctest-logd-reclaim
-/// exit_reason=0x0"`. logd has
-/// no read surface, so svctest cannot observe the eviction:
-/// `cargo xtask test-logd-reclaim` checks the line in the boot's serial log
-/// (docs/testing.md § Death forward to logd).
-pub fn logd_death_forward_phase(_: &Caps)
+/// logd evicts the child's slot into its retired slots
+/// (`services/logd/docs/ipc-interface.md` § Retired slots). Through the
+/// `logd.query` seed the phase reads logd's slots (`QUERY_SLOTS`) until the
+/// child's slot is retired by a death, then checks that it is retired once,
+/// with exit reason [`LOGD_RECLAIM_EXIT_CODE`], and that no live slot keeps
+/// its name. It reads the child's history (`QUERY_HISTORY`), newest first:
+/// the whole text line [`LOGD_WHOLE_TEXT`], then the record with its `code`
+/// field, and nothing older, so logd retained neither the malformed record
+/// nor a part of the split line. Last, a query on svctest's own log cap,
+/// whose process badge carries no `LOG_QUERY_AUTHORITY`, must be refused
+/// `QUERY_DENIED`; it runs after the eviction is seen, when logd, not
+/// init-logd, holds the endpoint.
+pub fn logd_death_forward_phase(caps: &Caps)
 {
+    use ipc::log_query::{QUERY_DENIED, reply_status, slots_request};
+
+    assert_ne!(caps.logd_query, 0, "logd_death_forward: no logd.query seed");
     let status = std::process::Command::new("/tests/svctest")
         .arg(LOGD_RECLAIM_ROLE)
         .status()
@@ -117,7 +132,195 @@ pub fn logd_death_forward_phase(_: &Caps)
         Some(LOGD_RECLAIM_EXIT_CODE),
         "logd_death_forward: child exit code not propagated: {status}"
     );
-    std::os::seraph::log!("logd_death_forward: named child exited: {status}");
+
+    let badge = logd_await_retired(caps.logd_query);
+    check_logd_history(&logd_history(caps.logd_query, badge));
+
+    let own = std::os::seraph::log::acquire();
+    let denied = logd_query_call(own, &slots_request(None));
+    assert_eq!(
+        reply_status(denied.label),
+        QUERY_DENIED,
+        "logd_death_forward: a query without LOG_QUERY_AUTHORITY was not refused ({:#x})",
+        denied.label
+    );
+    std::os::seraph::log!("logd_death_forward: child's slot retired with its history: {status}");
+}
+
+/// One logd query call on `cap`; a failed call panics.
+fn logd_query_call(cap: u64, msg: &ipc::IpcMessage) -> ipc::IpcMessage
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    unsafe { ipc::ipc_call(cap, msg, ipc_buf) }
+        .unwrap_or_else(|e| panic!("logd_death_forward: query ipc_call failed ({e})"))
+}
+
+/// Every slot named [`LOGD_RECLAIM_NAME`], live or retired, as (badge, state,
+/// exit reason), read across every `QUERY_SLOTS` page.
+fn logd_named_slots(query: u64) -> Vec<(u64, u8, u64)>
+{
+    use ipc::log_query::{QUERY_OK, reply_more, reply_status, slot_entry, slots_request};
+
+    let mut found = Vec::new();
+    let mut after = None;
+    loop
+    {
+        let reply = logd_query_call(query, &slots_request(after));
+        assert_eq!(
+            reply_status(reply.label),
+            QUERY_OK,
+            "logd_death_forward: QUERY_SLOTS refused ({:#x})",
+            reply.label
+        );
+        let mut index = 0;
+        while let Some(entry) = slot_entry(&reply, index)
+        {
+            if entry.name() == LOGD_RECLAIM_NAME
+            {
+                found.push((entry.badge, entry.state, entry.exit_reason));
+            }
+            after = Some(entry.cursor());
+            index += 1;
+        }
+        if !reply_more(reply.label)
+        {
+            return found;
+        }
+        assert!(
+            index > 0,
+            "logd_death_forward: QUERY_SLOTS page empty but more"
+        );
+    }
+}
+
+/// Poll logd's slots until the child's slot is retired by a death, check that
+/// it is the one slot of that name, retired with [`LOGD_RECLAIM_EXIT_CODE`],
+/// and return its badge.
+fn logd_await_retired(query: u64) -> u64
+{
+    use ipc::log_query::{SLOT_EVICTED_DEATH, SLOT_LIVE};
+
+    const POLL_INTERVAL_MS: u64 = 10;
+    // 30 s, as `init_cspace_released` polls: procmgr posts the death after
+    // its teardown, and logd drains it on its next wake.
+    const MAX_POLLS: u32 = 3000;
+
+    let mut retired = None;
+    for _ in 0..MAX_POLLS
+    {
+        let found = logd_named_slots(query);
+        if found
+            .iter()
+            .any(|&(_, state, _)| state == SLOT_EVICTED_DEATH)
+        {
+            retired = Some(found);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+    }
+    let found = retired.unwrap_or_else(|| {
+        panic!("logd_death_forward: child's slot not evicted within the poll budget")
+    });
+    let [(badge, _, exit_reason)] = found[..]
+    else
+    {
+        panic!("logd_death_forward: expected the child's one retired slot, found {found:?}");
+    };
+    assert_eq!(
+        exit_reason,
+        u64::from(LOGD_RECLAIM_EXIT_CODE.unsigned_abs()),
+        "logd_death_forward: retired slot carries exit reason {exit_reason:#x}"
+    );
+    assert!(
+        !found.iter().any(|&(_, state, _)| state == SLOT_LIVE),
+        "logd_death_forward: a live slot keeps the child's name"
+    );
+    badge
+}
+
+/// The history of `badge`, newest first, as (kind, bytes), read across every
+/// `QUERY_HISTORY` page.
+fn logd_history(query: u64, badge: u64) -> Vec<(u8, Vec<u8>)>
+{
+    use ipc::log_query::{HistoryEntries, HistoryRequest, QUERY_OK, reply_more, reply_status};
+
+    let mut history = Vec::new();
+    let mut req = HistoryRequest {
+        badge: Some(badge),
+        before: None,
+    };
+    loop
+    {
+        let reply = logd_query_call(query, &req.message());
+        assert_eq!(
+            reply_status(reply.label),
+            QUERY_OK,
+            "logd_death_forward: QUERY_HISTORY refused ({:#x})",
+            reply.label
+        );
+        let read_before = history.len();
+        for entry in HistoryEntries::new(&reply)
+        {
+            assert_eq!(
+                entry.badge, badge,
+                "logd_death_forward: another badge's entry"
+            );
+            history.push((entry.kind, entry.bytes.to_vec()));
+            req.before = Some(entry.seq);
+        }
+        if !reply_more(reply.label)
+        {
+            return history;
+        }
+        assert!(
+            history.len() > read_before,
+            "logd_death_forward: QUERY_HISTORY page empty but more"
+        );
+    }
+}
+
+/// Check the child's history, newest first: exactly the whole text line
+/// [`LOGD_WHOLE_TEXT`], then the record [`LOGD_RECORD_MESSAGE`] with its
+/// `code` field.
+fn check_logd_history(history: &[(u8, Vec<u8>)])
+{
+    use ipc::log_query::{ENTRY_RECORD, ENTRY_TEXT};
+
+    let [(text_kind, text), (record_kind, record)] = history
+    else
+    {
+        panic!(
+            "logd_death_forward: expected the child's text line and record, found {} entries",
+            history.len()
+        );
+    };
+    assert_eq!(
+        *text_kind, ENTRY_TEXT,
+        "logd_death_forward: newest entry is not text"
+    );
+    assert_eq!(
+        text.as_slice(),
+        LOGD_WHOLE_TEXT,
+        "logd_death_forward: text line not retained whole"
+    );
+    assert_eq!(
+        *record_kind, ENTRY_RECORD,
+        "logd_death_forward: older entry is not a record"
+    );
+    let record = ipc::log_record::Record::decode(record)
+        .unwrap_or_else(|e| panic!("logd_death_forward: retained record does not decode ({e:?})"));
+    assert_eq!(
+        record.message(),
+        LOGD_RECORD_MESSAGE,
+        "logd_death_forward: record message"
+    );
+    let fields: Vec<(&[u8], &[u8])> = record.fields().map(|f| (f.key, f.value)).collect();
+    assert_eq!(
+        fields,
+        [(&b"code"[..], &b"23"[..])],
+        "logd_death_forward: record fields"
+    );
 }
 
 /// The init-reap release check. Registered late (see [`super::all`]) so

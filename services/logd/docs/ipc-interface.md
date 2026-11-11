@@ -50,6 +50,7 @@ driver's write endpoint and, when a framebuffer driver is present, the framebuff
 |---|---|---|
 | logd's main thread | `RECV` | drains the endpoint via `ipc_recv` inside the wait-set loop |
 | every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_RECORD`, `STREAM_REGISTER_NAME` |
+| a service that seeds `logd.query` | `SEND` badged `LOG_QUERY_AUTHORITY` | `QUERY_SLOTS`, `QUERY_HISTORY` (§ Queries) |
 | real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); repeated after a further drain while init-logd defers it), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1]` reads as `0`) on a restart (design intent; not yet implemented (#262)) |
 
 ## Labels accepted
@@ -69,8 +70,7 @@ history ring with its level.
 
 The history ring holds `PER_SLOT_HISTORY` (16) completed entries per slot, text lines and
 records (§ History; [`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest
-entry (FIFO). The ring has no read surface. TODO: a query IPC that reads the history ring
-(#720).
+entry (FIFO). `log_labels::QUERY_HISTORY` reads it (§ Queries).
 
 Lines exceeding `LINE_BUF_SIZE` (256 bytes) flush without a
 trailing `\n` to keep the per-line attribution visible. Senders
@@ -194,8 +194,9 @@ Reply: `label = 0`. Sender unblocks.
 One-shot init-logd → real-logd state transfer. Documented in
 [`handover-protocol.md`](handover-protocol.md). real-logd is the caller,
 not a handler: its receive loop dispatches only `STREAM_BYTES`,
-`STREAM_RECORD`, and `STREAM_REGISTER_NAME`, and any other label, this one
-included, gets an empty reply. init-logd is the only receiver of the label.
+`STREAM_RECORD`, `STREAM_REGISTER_NAME`, `QUERY_SLOTS`, and `QUERY_HISTORY`,
+and any other label, this one included, gets an empty reply. init-logd is the
+only receiver of the label.
 
 ### `log_labels::GET_LOG_CAP` (12) — legacy
 
@@ -210,11 +211,12 @@ logd.
 
 ## History
 
-The stored form the history query surface (#720) reads. Each of logd's
+The stored form `log_labels::QUERY_HISTORY` reads (§ Queries). Each of logd's
 per-slot entries ([`slot.rs`](../src/slot.rs) `HistoryEntry`) holds:
 
 | Field | Content |
 |---|---|
+| `seq` | logd-wide arrival sequence: one counter across every slot, taken when the entry is retained, so a larger `seq` is a later entry whatever its sender; entries installed from the handover take theirs in install order, oldest first |
 | `us` | receipt time, microseconds since boot |
 | `level` | an `ipc::stream_labels::LEVEL_*` code (§ Levels) |
 | `kind` | `Text`, a `STREAM_BYTES` line, or `Record`, a `STREAM_RECORD` record with its field table |
@@ -228,13 +230,113 @@ with the sender's badge, and the handover carries each entry in a `LINE` or
 `RECORD` chunk ([`handover-protocol.md`](handover-protocol.md)); logd builds
 a record's field table again when it installs the chunk.
 
+### Retired slots
+
+An evicted slot (§ Death-notification cascade, § Death-queue resync) leaves the
+badge table and joins logd's retired slots, a FIFO of at most `RETIRED_SLOTS`
+(64) entries ([`slot.rs`](../src/slot.rs)); retiring one into a full FIFO drops
+its oldest. A retired slot keeps its badge, its display name, its history ring,
+and how it was evicted: by a death, with the death entry's exit reason, or by a
+resync. A badge retired again replaces its older retired slot, so a badge
+appears at most once among them. procmgr may hand a dead process's badge to a
+new one, so a live slot and a retired slot can share a badge.
+
+## Queries
+
+Two labels read the badge table, the retired slots, and the history. They are
+served only on a badge carrying `log_labels::LOG_QUERY_AUTHORITY` (`1 << 63`,
+a [verb bit](../../../docs/capability-model.md#verb-bit-authority-pattern)):
+svcmgr mints a SEND on the master log endpoint with that badge from its
+master-log source and publishes it seed-only as `logd.query`
+([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `seed`),
+so only a recipe that seeds the name holds it. No sender's badge carries a verb
+bit: procmgr redraws a process badge that does
+([`log_badges`](../../../shared/ipc/src/lib.rs)), and `LOG_BADGE_INIT` and
+`LOG_BADGE_PROCMGR` carry none. A query on any other badge is refused with
+`QUERY_DENIED`.
+
+logd's main thread answers a query from the table and the rings it owns, in the
+same receive loop that drains the stream labels, and calls no other service to
+answer it, so a query cannot block the receive path (§ Death-queue resync gives
+the deadlock a call to procmgr would risk). The wire format is defined in
+`ipc::log_query`. Every request carries `ipc::LOG_LABELS_VERSION` (5) in
+`data[0]`, which logd checks on every query. The reply's label carries the
+status in bits 0-15, the reply's entry count in bits 16-31, and in bit 32 whether
+more entries follow this page:
+
+| Status | Value | Meaning |
+|---|---|---|
+| `QUERY_OK` | 0 | the page follows |
+| `QUERY_DENIED` | 1 | the badge carries no `LOG_QUERY_AUTHORITY` |
+| `QUERY_VERSION_MISMATCH` | 2 | `data[0]` is not logd's `LOG_LABELS_VERSION` |
+| `QUERY_INVALID` | 3 | a request word holds a value the label does not define |
+
+A refused query's reply carries no entries. A page is a snapshot of the moment
+logd answers it; a caller walks the pages by resuming after the last entry it
+read, so an entry added or dropped between two pages shifts no other entry's
+place.
+
+init-logd, which holds the endpoint's RECV until the handover, answers every
+label it does not serve with an empty `label = 0` reply, which reads as an empty
+last page. A caller that runs before logd has taken the endpoint sees no slots
+and no history.
+
+### `log_labels::QUERY_SLOTS` (16)
+
+The badge table and the retired slots, in ascending order of badge and then
+state, so a live slot comes before a retired one with the same badge.
+
+| Request word | Content |
+|---|---|
+| `data[0]` | `LOG_LABELS_VERSION` |
+| `data[1]` | 0 to start the walk, 1 to resume after the entry in `data[2]` and `data[3]`; any other value: `QUERY_INVALID` |
+| `data[2]` | the badge of the last entry read |
+| `data[3]` | the state of the last entry read |
+
+The reply carries up to `SLOTS_PAGE` (7) entries of `SLOT_ENTRY_WORDS` (9) data
+words each, from `data[0]`:
+
+| Word | Content |
+|---|---|
+| 0 | badge |
+| 1 | state in bits 0-7 (`SLOT_LIVE` 0, `SLOT_EVICTED_DEATH` 1, `SLOT_EVICTED_RESYNC` 2), the name's length in bits 8-15 |
+| 2 | exit reason of the death that evicted the slot; 0 for any other state |
+| 3-8 | the display name, `MAX_NAME_LEN` (48) bytes little-endian, zero-padded; empty for a slot that registered none |
+
+### `log_labels::QUERY_HISTORY` (17)
+
+History entries, newest first: those of every live and retired slot, or of one
+badge (its live slot and its retired slot).
+
+| Request word | Content |
+|---|---|
+| `data[0]` | `LOG_LABELS_VERSION` |
+| `data[1]` | bit 0: one badge's entries only; bit 1: resume before the `seq` in `data[3]`; any other bit set: `QUERY_INVALID` |
+| `data[2]` | the badge, with bit 0 of `data[1]` |
+| `data[3]` | the `seq` of the last entry read, with bit 1 of `data[1]` |
+
+The reply carries as many whole entries as fit its 64 data words, from
+`data[0]`, each word-aligned:
+
+| Words | Content |
+|---|---|
+| 0 | `seq` (§ History) |
+| 1 | `us` |
+| 2 | the sender's badge |
+| 3 | level in bits 0-7 (`ipc::stream_labels::LEVEL_*`), kind in bits 8-15 (`ENTRY_TEXT` 0, `ENTRY_RECORD` 1), the byte length in bits 16-31 |
+| 4 on | the entry's bytes (§ History), zero-padded to a word |
+
+Every entry fits one reply: the longest, a `RECORD_MAX_BYTES` (480) record,
+takes 4 + 60 words. A record's bytes are its `STREAM_RECORD` payload, which
+`ipc::log_record::Record::decode` reads back to its message and fields.
+
 ## Wait-set
 
 logd's main loop waits on a 3-member `WaitSet`:
 
 | Badge | Source | Purpose |
 |---|---|---|
-| `WS_BADGE_LOG` (0) | RECV on the master log endpoint | `STREAM_BYTES` / `STREAM_RECORD` / `STREAM_REGISTER_NAME` arrivals |
+| `WS_BADGE_LOG` (0) | RECV on the master log endpoint | `STREAM_BYTES` / `STREAM_RECORD` / `STREAM_REGISTER_NAME` / `QUERY_SLOTS` / `QUERY_HISTORY` arrivals |
 | `WS_BADGE_DEATH` (1) | RECV on logd's death-notification `EventQueue` | drained per loop iteration before service dispatch |
 | `WS_BADGE_RESYNC` (2) | logd's resync `Notification` | the resync helper thread's walk has ended (§ Death-queue resync) |
 
@@ -277,10 +379,10 @@ and the name is the slot's registered display name (`STREAM_REGISTER_NAME`),
 one holding a space or `=` among them, is quoted and escaped, so a name such
 as `x exit_reason=0x0` stays inside its value and cannot add a field:
 `name="x exit_reason=0x0"`. A reader takes the fields with
-`logd_codec::record::fields`. A badge with no slot logs nothing. The line is a test
-contract: `cargo xtask test-logd-reclaim` reads it from svctest's serial log
-(see [docs/testing.md](../../../docs/testing.md#death-forward-to-logd-test-logd-reclaim)).
-It also names a crashed process: a crash report block carries the process
+`logd_codec::record::fields`. A badge with no slot logs nothing. The evicted slot
+is retired (§ Retired slots), so `QUERY_SLOTS` reports it evicted with the same
+exit reason, and svctest's `logd_death_forward` phase checks the forward that
+way. The line names a crashed process: a crash report block carries the process
 badge, and a reader finds the process's log name in this line for that badge
 ([services/crashd/docs/block-format.md](../../crashd/docs/block-format.md)
 § Symbolizing), as `cargo xtask test-crash-report` does.
@@ -329,10 +431,10 @@ ordering).
 
 ## Summarized By
 
-[Testing](../../../docs/testing.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [Crash Block Format](../../crashd/docs/block-format.md),
 [services/logd/README.md](../README.md),
 [services/logd/codec/README.md](../codec/README.md),
 [`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md),
-[shared/log/README.md](../../../shared/log/README.md), [xtask/README.md](../../../xtask/README.md)
+[services/svctest/README.md](../../svctest/README.md),
+[shared/log/README.md](../../../shared/log/README.md)

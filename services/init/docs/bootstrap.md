@@ -186,7 +186,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     implemented (#262)): `master_log_source`, a `RIGHTS_ALL` derive of init's master log
     endpoint (svcmgr mints real-logd's master-log RECV from it on every
     (re)launch, plus the one-shot `HANDOVER_PULL` SEND on the first
-    launch; see [`log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)), and
+    launch; see [`log_sink`](../../svcmgr/docs/service-definitions.md#log_sink); and the
+    `LOG_QUERY_AUTHORITY` SEND it publishes as `logd.query`), and
     `procmgr_death_auth_source`, a badge-0
     `RIGHTS_EP_SEND_GRANT` derive of procmgr's service endpoint (svcmgr
     mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it for per-sender

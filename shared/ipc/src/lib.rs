@@ -58,6 +58,8 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     DEVMGR_LABELS_VERSION     — every devmgr_labels request
 //     DEVMGR_DMA_LABELS_VERSION — every devmgr_dma_labels request
 //     IOMMU_LABELS_VERSION      — every iommu_labels request (devmgr ↔ IOMMU driver)
+//     LOG_LABELS_VERSION        — every log_labels::QUERY_SLOTS and QUERY_HISTORY
+//                                 request (client ↔ logd)
 //
 //   Implicitly covered by a parent-channel handshake:
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
@@ -73,8 +75,6 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     SERIAL_LABELS_VERSION
 //     FB_LABELS_VERSION
 //     INPUT_LABELS_VERSION
-//     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP carries it, but no
-//                             caller issues that handshake
 //     STREAM_LABELS_VERSION — stream caps arrive pre-installed in
 //                             ProcessInfo.log_send_cap (init derives its
 //                             own), not via a handshake
@@ -1395,6 +1395,13 @@ pub mod published_names
     /// which carries no verb bit: the negative-test twin of [`VFSD_MOUNT`].
     /// Seed-only and seeded only by svctest.
     pub const VFSD_DENY: &[u8] = b"vfsd.deny";
+
+    /// SEND on the master log endpoint badged
+    /// `log_labels::LOG_QUERY_AUTHORITY`: logd's `QUERY_SLOTS` and
+    /// `QUERY_HISTORY` surface. svcmgr mints it from its master-log source.
+    /// Seed-only; seeded only by svctest, whose `logd_death_forward` phase
+    /// reads a dead child's retired slot through it.
+    pub const LOGD_QUERY: &[u8] = b"logd.query";
 }
 
 /// Wire-protocol version of [`rtc_labels`]; bumped as the block comment above
@@ -3243,6 +3250,9 @@ const _: () = core::assert!(
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::DENY_BADGE & VERB_BIT_MASK == 0
+        && log_labels::LOG_QUERY_AUTHORITY & VERB_BIT_MASK != 0
+        && log_badges::LOG_BADGE_INIT & VERB_BIT_MASK == 0
+        && log_badges::LOG_BADGE_PROCMGR & VERB_BIT_MASK == 0
 );
 
 /// Reserved log-endpoint badges.
@@ -3275,7 +3285,7 @@ pub mod log_badges
 
 /// Wire-protocol version of [`log_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const LOG_LABELS_VERSION: u32 = 4;
+pub const LOG_LABELS_VERSION: u32 = 5;
 /// IPC labels for the system log endpoint's legacy discovery interface
 /// and the one-shot init-logd → real-logd handover.
 ///
@@ -3348,6 +3358,32 @@ pub mod log_labels
     /// multi-sender log endpoint) from wedging init-logd — which would
     /// otherwise block procmgr's reap of init's Memory caps indefinitely.
     pub const HANDOVER_RELEASE: u64 = 14;
+
+    /// Badge bit on a SEND on the master log endpoint that authorises
+    /// [`QUERY_SLOTS`] and [`QUERY_HISTORY`]. svcmgr mints it from its
+    /// master-log source and publishes it seed-only as
+    /// [`crate::published_names::LOGD_QUERY`]. No sender's badge carries it:
+    /// procmgr redraws a process badge carrying a
+    /// [`crate::VERB_BIT_MASK`] bit, and the reserved
+    /// [`crate::log_badges`] carry none.
+    pub const LOG_QUERY_AUTHORITY: u64 = 1u64 << 63;
+
+    /// Read logd's sender slots: its badge table and its retired slots,
+    /// ascending by badge and then state, a page of up to
+    /// [`crate::log_query::SLOTS_PAGE`] entries per call, each the badge, its
+    /// state (live, or evicted by a death with its exit reason, or by a
+    /// resync), and its display name. Served only on a badge carrying
+    /// [`LOG_QUERY_AUTHORITY`]. Wire format: [`crate::log_query`]; specified
+    /// in `services/logd/docs/ipc-interface.md` § Queries.
+    pub const QUERY_SLOTS: u64 = 16;
+
+    /// Read logd's history, newest first: every slot's entries or one
+    /// badge's, as many whole entries per call as one reply holds, each its
+    /// sequence, receipt time, badge, level, kind, and bytes. Served only on
+    /// a badge carrying [`LOG_QUERY_AUTHORITY`]. Wire format:
+    /// [`crate::log_query`]; specified in
+    /// `services/logd/docs/ipc-interface.md` § Queries.
+    pub const QUERY_HISTORY: u64 = 17;
 }
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────
@@ -3364,6 +3400,8 @@ pub mod log_labels
 // cap-role enum; no per-service sentinels.
 
 pub mod bootstrap;
+
+pub mod log_query;
 
 pub mod log_record;
 

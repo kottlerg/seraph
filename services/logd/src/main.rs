@@ -131,10 +131,11 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    // Record the devmgr-registry cap for the emit path. The
-    // serial driver is resolved lazily on first emit via
-    // `QUERY_SERIAL_DEVICE`; until then serial output is dropped (init-logd
-    // covered the pre-driver window) while history still accrues.
+    // Record the devmgr-registry cap for the emit path. The serial driver is
+    // resolved via `QUERY_SERIAL_DEVICE` before the handover pull
+    // (`resolve_output_drivers`), and again on a later emit while it is not
+    // resolvable; until then serial output is dropped (init-logd covered the
+    // pre-driver window) while history still accrues.
     serial_init(caps.devmgr_registry_ep);
 
     // logd serves the log endpoint, so it must never emit through it. Route
@@ -163,6 +164,12 @@ fn main() -> !
         syscall::thread_exit();
     };
     register_with_procmgr(caps.procmgr_death_auth_send, death_eq, ipc_buf);
+    // Resolve the serial and framebuffer drivers through devmgr now, while
+    // init-logd still drains the log endpoint: the first write that would
+    // resolve them is held until after the release, when the endpoint has no
+    // reader until the event loop, and devmgr may then be logging
+    // (`services/devmgr/docs/responsibilities.md`, the on-disk settle).
+    resolve_output_drivers(ipc_buf);
     let Some(resync_note) = create_resync_note()
     else
     {
@@ -888,6 +895,15 @@ fn resolve_serial_cap(ipc_buf: *mut u64) -> u64
     let cap = reply_caps[0];
     SERIAL_CAP.store(cap, Ordering::Release);
     cap
+}
+
+/// Resolve, and cache, the serial driver's and the framebuffer driver's SEND
+/// caps without writing anything: [`resolve_serial_cap`] and
+/// [`resolve_fb_cap`] on the calling thread's IPC buffer.
+fn resolve_output_drivers(ipc_buf: *mut u64)
+{
+    let _ = resolve_serial_cap(ipc_buf);
+    let _ = resolve_fb_cap(ipc_buf);
 }
 
 /// Write a fully-formatted line to the serial driver via one or more

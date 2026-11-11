@@ -5,17 +5,21 @@
 
 //! System log primitives for Seraph userspace.
 //!
-//! Two halves:
+//! Three parts:
 //!
 //! * **Wire-format helpers ([`write_bytes`], [`write_args`],
 //!   [`register_name`]):** thin no-allocation wrappers over the IPC
 //!   labels defined in `ipc::stream_labels`. Callers supply their
-//!   badged SEND cap and IPC buffer pointer explicitly.
+//!   badged SEND cap, IPC buffer pointer, and line level explicitly.
 //! * **Process-global cap cache ([`install_badged_cap`],
 //!   [`ensure_badged_cap`]):** holds the pre-installed badged SEND
 //!   cap. Std's `_start` installs the cap procmgr seeded in
 //!   `ProcessInfo.log_send_cap`. No discovery roundtrip — the cap is
 //!   live from the first user instruction.
+//! * **Process-global level filter ([`set_max_level`], [`enabled`]):**
+//!   the most verbose level [`emit`] sends, which std's `_start` sets
+//!   from the process's `SERAPH_LOG` environment entry
+//!   (`services/logd/docs/ipc-interface.md` § Levels).
 //!
 //! The user-facing macro lives in the std overlay (it needs thread-
 //! local IPC-buffer access) and reaches [`emit`]; std is the crate's only

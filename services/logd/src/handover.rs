@@ -74,7 +74,7 @@ unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTa
     // Bound on chunks per drain. A first drain sends 1 header + up to
     // init-logd's MAX_SENDERS (32) slots + its history ring's lines + 1
     // DONE. The ring packs lines by length, so it holds at most one line per
-    // `history::RECORD_HEADER_BYTES + 1` bytes of its 16 KiB, about 860;
+    // `history::RECORD_HEADER_BYTES + 1` bytes of its 16 KiB, about 820;
     // slots resent after a rename and lines pushed during the drain add to
     // that only while senders keep renaming or logging. 2048 leaves headroom
     // for both, and also ends a malformed reply stream that never sends

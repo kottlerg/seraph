@@ -69,7 +69,9 @@ startup-failure code (`STARTUP_FAIL_BAD_ABI`) when the page's version is not `PR
 It then reads the top of its user half once (`SystemInfoType::UserVaTop`, exposed as
 `std::os::seraph::user_va_top()`), which sizes the heap and reservation-arena zones
 (`process_layout::growth_zones`), registers the IPC buffer, builds `std::os::seraph::StartupInfo`
-from the page, wires stdio, the log and service-registry caps, and the namespace caps, and, when the
+from the page, wires stdio, the log and service-registry caps, and the namespace caps, sets the
+level `seraph::log!` filters at from the env blob's `SERAPH_LOG` entry
+([logd IPC interface](../../services/logd/docs/ipc-interface.md) § Levels), and, when the
 page carries a memmgr endpoint, bootstraps the heap against memmgr (exiting with `STARTUP_FAIL_HEAP`
 if that fails), and, when the page carries a pager and the image is `ET_DYN`, registers the
 main-thread stack's demand-growth range

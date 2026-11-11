@@ -92,6 +92,9 @@ rejects a recipe whose packing the child could not receive:
   procmgr would refuse the create. The parser rejects such a line as
   `InvalidValue`.
 
+An `env` entry `SERAPH_LOG=<level>` sets the most verbose level a std-built service's
+`seraph::log!` sends ([logd IPC interface](../../logd/docs/ipc-interface.md) § Levels).
+
 ## `restart`
 
 | Value | Semantics |

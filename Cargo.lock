@@ -689,6 +689,7 @@ version = "0.1.3"
 name = "init-sender-table"
 version = "0.1.3"
 dependencies = [
+ "ipc",
  "logd-codec",
 ]
 

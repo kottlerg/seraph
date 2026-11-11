@@ -551,6 +551,13 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     // roundtrip. Zero is tolerated (the macro silently drops in
     // processes without a logger).
     ::log::install_badged_cap(info.log_send_cap);
+    // The most verbose level `seraph::log!` sends: the one the process's
+    // `SERAPH_LOG` environment entry names, read once here, else info.
+    if let Some(level) = argv_env::env_value(env_blob, info.env_count as usize, ::log::LEVEL_ENV_KEY)
+        .and_then(::log::parse_level)
+    {
+        ::log::set_max_level(level);
+    }
 
     // Install the per-process svcmgr SEND cap into the registry-client
     // cache. Zero is tolerated (processes spawned before svcmgr exists,
@@ -587,6 +594,7 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
             // installed it as `current_ipc_buf` above.
             unsafe { ::log::emit(
                 current_ipc_buf(),
+                ::ipc::stream_labels::LEVEL_ERROR,
                 format_args!(
                     "std::os::seraph: FATAL: heap_bootstrap failed (memmgr_ep={}); \
                      likely memmgr frame-pool exhaustion — aborting",
@@ -1357,9 +1365,10 @@ pub mod log {
     /// Register a display name for this process's log stream.
     /// Idempotent — re-registration with the same name is a silent
     /// no-op at the receiver. Names longer than the receiver's
-    /// per-slot buffer are truncated; collisions with other senders'
-    /// names are resolved server-side via `name.2` / `name.3` /
-    /// suffixes.
+    /// per-slot buffer are truncated. A name another sender holds is
+    /// stored with a `.2` / `.3` / … suffix by init-logd, before the
+    /// handover, and as given by logd
+    /// (`ipc::stream_labels::STREAM_REGISTER_NAME`).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn register_name(name: &[u8]) {
         let buf = current_ipc_buf();
@@ -1370,18 +1379,38 @@ pub mod log {
         unsafe { ::log::register_name(cap, buf, name) };
     }
 
-    /// Macro entry point. Resolves the calling thread's IPC buffer and
-    /// the process-global badged cap, then formats `args` and emits
-    /// one `STREAM_BYTES` message (split across IPC chunks if longer
-    /// than 512 bytes). Silently drops when no log cap is acquirable.
+    /// Macro entry point of a bare `log!`: [`__emit_at`] at the info
+    /// level.
     #[doc(hidden)]
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn __emit(args: core::fmt::Arguments<'_>) {
+        __emit_at(::ipc::stream_labels::LEVEL_INFO, args);
+    }
+
+    /// Macro entry point of a levelled `log!`. Resolves the calling
+    /// thread's IPC buffer and the process-global badged cap, then formats
+    /// `args` and emits one line at `level` (an
+    /// `ipc::stream_labels::LEVEL_*` code) as `STREAM_BYTES` messages
+    /// (split across IPC chunks if longer than 512 bytes). Silently drops
+    /// when no log cap is acquirable.
+    #[doc(hidden)]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn __emit_at(level: u64, args: core::fmt::Arguments<'_>) {
         // SAFETY: `current_ipc_buf` is null or this thread's registered IPC
         // buffer page (`_start` and the spawn trampoline set it after
         // registering).
-        unsafe { ::log::emit(current_ipc_buf(), args) };
+        unsafe { ::log::emit(current_ipc_buf(), level, args) };
     }
+
+    // The level codes `log!`'s arms pass to `__emit_at` as literals, since
+    // the macro expands in crates that cannot name `ipc`.
+    const _: () = assert!(
+        ::ipc::stream_labels::LEVEL_ERROR == 1
+            && ::ipc::stream_labels::LEVEL_WARN == 2
+            && ::ipc::stream_labels::LEVEL_INFO == 3
+            && ::ipc::stream_labels::LEVEL_DEBUG == 4
+            && ::ipc::stream_labels::LEVEL_TRACE == 5
+    );
 }
 
 /// Service-registry client surface. Re-exports
@@ -1415,9 +1444,15 @@ pub mod registry {
 }
 
 /// System-log macro. Formats and emits one log line on the process's
-/// badged SEND cap, lazy-acquired from the discovery cap on first
-/// call. The receiver tags each line with the registered display name
+/// badged SEND cap, which `_start` installs from `ProcessInfo.log_send_cap`.
+/// The receiver tags each line with the registered display name
 /// (default `[?]`); see [`log::register_name`].
+///
+/// `log!("fmt", args…)` logs at the info level. A leading `error:`,
+/// `warn:`, `info:`, `debug:`, or `trace:` sets the level, as in
+/// `log!(warn: "retrying {name}")`; the receiver tags a line of any level
+/// but info with it (`services/logd/docs/ipc-interface.md`
+/// § `stream_labels::STREAM_BYTES`).
 ///
 /// Non-allocating — stages the text in a 512-byte stack buffer that is
 /// sent in chunks as it fills, so a message of any length is sent in full;
@@ -1426,6 +1461,23 @@ pub mod registry {
 #[macro_export]
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 macro_rules! __seraph_log {
+    // The literal codes are `ipc::stream_labels::LEVEL_*`, which
+    // `std::os::seraph::log` asserts.
+    (error: $($arg:tt)+) => {{
+        $crate::os::seraph::log::__emit_at(1, ::core::format_args!($($arg)+))
+    }};
+    (warn: $($arg:tt)+) => {{
+        $crate::os::seraph::log::__emit_at(2, ::core::format_args!($($arg)+))
+    }};
+    (info: $($arg:tt)+) => {{
+        $crate::os::seraph::log::__emit_at(3, ::core::format_args!($($arg)+))
+    }};
+    (debug: $($arg:tt)+) => {{
+        $crate::os::seraph::log::__emit_at(4, ::core::format_args!($($arg)+))
+    }};
+    (trace: $($arg:tt)+) => {{
+        $crate::os::seraph::log::__emit_at(5, ::core::format_args!($($arg)+))
+    }};
     ($($arg:tt)*) => {{
         $crate::os::seraph::log::__emit(::core::format_args!($($arg)*))
     }};

@@ -252,8 +252,8 @@ pub struct AddressSpace
     death_observers: crate::sched::thread::DeathObserverChain,
     /// Serialises `death_observers` and the retained
     /// terminal-fault state below against a concurrent bind
-    /// (`sys_aspace_bind_notification`) and the terminal-fault post
-    /// (`post_aspace_death_notification`) — the address-space analogue of a
+    /// (`sys_aspace_bind_notification`) and the terminal-fault record
+    /// (`record_aspace_terminal_fault`) — the address-space analogue of a
     /// thread's `sched_lock` role for `ThreadControlBlock::death_observers`.
     /// Those three fields are bare under the exception of
     /// docs/coding-standards.md § Concurrency, with this lock as their owner
@@ -603,7 +603,7 @@ impl AddressSpace
     ///
     /// The address-space analogue of `sys_thread_bind_notification`'s
     /// retained-delivery branch. Serialises on `death_lock` against the
-    /// terminal-fault post ([`crate::sched::post_aspace_death_notification`]),
+    /// terminal-fault record ([`crate::sched::record_aspace_terminal_fault`]),
     /// so a fault concurrent with a bind is delivered exactly once and never
     /// dropped — closing the bind-after-fault window for an observer bound after
     /// the space was already running.
@@ -664,10 +664,11 @@ impl AddressSpace
 
     /// Record a terminal fault (first fault wins) and return the first node of
     /// the observer chain, read under `death_lock`. The terminal-fault post
-    /// path walks the chain from it outside the lock (a linked node's links
-    /// never change until the teardown takes the chain); recording the reason
-    /// lets a later `bind_or_retained` deliver it to an observer bound after
-    /// the fault, and stops any further link.
+    /// walks the chain from it outside the lock, after the faulting thread's
+    /// `Exited` commit (a linked node's links never change until the teardown
+    /// takes the chain); recording the reason lets `retained_terminal_fault`
+    /// read it back and a later `bind_or_retained` deliver it to an observer
+    /// bound after the fault, and stops any further link.
     ///
     /// # Safety
     /// `this` must be a valid `AddressSpace` pointer. The caller must NOT hold

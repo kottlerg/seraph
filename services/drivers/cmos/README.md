@@ -7,8 +7,10 @@ Installed to `/services/drivers/cmos-rtc` on the rootfs. Spawned by
 devmgr on x86-64 platforms via the non-PCI simple-device path
 ([Device Management](../../../docs/device-management.md#driver-binary-sources)),
 `procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
-walks to from the `LOOKUP | READ` `/services/drivers/` subtree cap svcmgr
-delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR`.
+walks to from the `LOOKUP | READ | READDIR` `/services/drivers/` subtree cap svcmgr
+delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR`. The driver carries a declaration in
+the ELF note section `.note.seraph.driver` (ACPI `PNP0B00`) that no device record devmgr builds
+matches yet, so devmgr starts it on its fixed path.
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities) owns
 the driver's service endpoint and mints client SEND caps on
 `devmgr_labels::QUERY_RTC_DEVICE`, each badged with

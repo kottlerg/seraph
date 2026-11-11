@@ -3,12 +3,36 @@
 The data-driven model by which devmgr enumerates devices, matches each to a driver that
 declares it, binds the two, and serves the bound driver to consumers by device class.
 
-Implementation status: everything below is design intent; not yet implemented
-([#165](https://github.com/kottlerg/seraph/issues/165)). devmgr binds its drivers today through
-one hardcoded spawn path per driver and serves them through one query label per class, as
+Implementation status: partly implemented
+([#165](https://github.com/kottlerg/seraph/issues/165)); § Status names what is design intent;
+not yet implemented.
+
+---
+
+## Status
+
+Implemented for PCI device records: every driver binary but the test-only `test-fault` and
+`test-orphan` fixtures carries its declaration (§ Driver Declarations); devmgr reads the
+declarations of the boot modules it starts no fixed path for and of the drivers-directory
+entries, within § Declaration Bounds as far as they concern a PCI record; it matches them
+against the PCI records (§ Matching), binds each matched record through one path that delivers
+the resource list (§ Binding), and withdraws a bound driver in the order § Binding gives. The
+rest is design intent; not yet implemented:
+
+- every enumerator but PCI (§ Device Records): devmgr starts the serial, framebuffer, RTC, and
+  IOMMU drivers on fixed paths of their own, and gives them their simple-device or IOMMU
+  bootstrap rounds rather than the resource list, though each of them carries its declaration;
+- init's untagged forwarding of the modules that carry a declaration: init tags each boot
+  module with its module class, as it delivers them today;
+- message-signaled vectors: a PCI function's driver is given its wired line only;
+- device classes (§ Device Classes): the class files, the boot-only mark, `QUERY_DEVICE`, and
+  the generic badge. devmgr serves each class under the class name its drivers declare, through
+  one query label per class;
+- the retirement of the test-only labels, and the declarations of the `test-fault` and
+  `test-orphan` fixtures, which devmgr starts only on those labels (§ Test Fixtures).
+
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
-§ Responsibilities specifies; that document stays authoritative for the running system until
-the phases of #165 replace it.
+§ Responsibilities specifies the running system.
 
 ---
 
@@ -294,5 +318,11 @@ installs. The fixtures and labels it retires are listed on
 
 ## Summarized By
 
-[Architecture Overview](architecture.md),
-[PCI Enumeration](../services/devmgr/docs/pci-enumeration.md)
+[Architecture Overview](architecture.md), [Device Management](device-management.md),
+[PCI Enumeration](../services/devmgr/docs/pci-enumeration.md),
+[devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
+[services/drivers/README.md](../services/drivers/README.md),
+[Driver Model](../services/drivers/docs/driver-model.md),
+[services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md),
+[services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),
+[shared/driver-binding/README.md](../shared/driver-binding/README.md)

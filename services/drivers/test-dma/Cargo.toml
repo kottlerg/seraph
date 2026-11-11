@@ -13,9 +13,12 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# The driver's declaration note and the resource list devmgr delivers it.
+driver-binding = { path = "../../../shared/driver-binding" }
 ipc = { path = "../../../shared/ipc" }
 syscall = { path = "../../../shared/syscall" }
 syscall-abi = { path = "../../../abi/syscall" }
+# The DMA capability's `DMA_MAP` and `DMA_UNMAP` calls.
 virtio-core = { path = "../virtio/core" }
 
 [lints]

@@ -26,12 +26,15 @@ virtio/blk/
 
 ## Endpoint
 
-Devmgr spawns the driver, creates its service endpoint, and delivers an `Mmio`
-cap for every BAR the device's VirtIO register regions name in the first
-bootstrap round, each with its PCI BAR index, then the service endpoint, the
-IRQ with its line's `SYS_IRQ_REGISTER` mode, a per-device badged devmgr
-query endpoint, and the device's DMA capability in the second (the rounds
-`virtio_core::bootstrap` specifies).
+The driver carries a declaration in the ELF note section `.note.seraph.driver` (PCI `1AF4:1001`
+and `1AF4:1042`, class `block`, interrupt required, DMA, VirtIO status reset, boot tier), and
+devmgr binds it to each matching device ([driver-binding.md](../../../../docs/driver-binding.md)).
+Devmgr spawns the driver, creates its service endpoint, and delivers the resource list of
+`driver_binding::resources`: an `Mmio` cap for every BAR the device's VirtIO register regions
+name, each with its PCI BAR index and clipped to the pages the regions reach, the IRQ with its
+line's `SYS_IRQ_REGISTER` mode, then the end round with the service endpoint, a per-device
+badged devmgr query endpoint, and the device's DMA capability (read by
+`virtio_core::bootstrap::DeliveredDevice`).
 The driver maps the BARs into one
 register window and reaches each region through its own BAR's mapping. Once
 its device is set up, immediately before its service loop, the driver reports

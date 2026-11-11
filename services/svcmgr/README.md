@@ -12,11 +12,12 @@ one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliatio
 
 svcmgr also owns the system-wide discovery registry: it publishes the well-known names it owns
 (`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, `devmgr.debug`,
-`vfsd.mount`, `vfsd.deny`, and each provider's `provides` names like `pwrmgr.shutdown` /
-`timed`) into the registry itself — from the source caps init endows it with at handover, and
-from each provider's launch. Consumers resolve any name through their `.svc` `seed = ...` line at
-launch time, and the public names (`svcmgr`, `pwrmgr.deny`, `timed`) also via `QUERY_ENDPOINT`; a
-name whose cap carries authority is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. The
+`vfsd.mount`, `vfsd.deny`, `logd.query`, and each provider's `provides` names like
+`pwrmgr.shutdown` / `timed`) into the registry itself — from the source caps init endows it
+with at handover, and from each provider's launch. Consumers resolve any name through their
+`.svc` `seed = ...` line at launch time, and the public names (`svcmgr`, `pwrmgr.deny`,
+`timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority is seed-only, so
+`QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. The
 endowment and registry wire format are in [docs/ipc-interface.md](docs/ipc-interface.md).
 
 A raw-syscall fallback that lets svcmgr recreate procmgr if procmgr
@@ -192,7 +193,7 @@ in the host-tested `svc-defs` crate.
 ## Cap publication
 
 svcmgr publishes every well-known name into its own registry — there is
-no init-side `PUBLISH_ENDPOINT` traffic. The first eight are published in
+no init-side `PUBLISH_ENDPOINT` traffic. The first nine are published in
 `main()` right after the endowment is drained, from the source caps init
 endows svcmgr with at handover; the provider names are published on each
 provider's launch path from its `provides` line
@@ -214,6 +215,7 @@ column). The handover endowment and
 | `devmgr.debug` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| DEBUG_PORT_AUTHORITY`-badged SEND on devmgr's registry endpoint: the debug port (seeded only by the debug-port fixture `debug-echo`, staged by `test-debug-port`, and the GDB stub `gdbstub`, staged by `--debug-target` of `run` and `run-parallel`, and by `test-gdb`) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
+| `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
 | `timed` | svcmgr (`timed.svc` [provider](docs/service-definitions.md)) | SEND on timed's service endpoint | yes |

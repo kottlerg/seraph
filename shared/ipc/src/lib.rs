@@ -58,6 +58,8 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     DEVMGR_LABELS_VERSION     — every devmgr_labels request
 //     DEVMGR_DMA_LABELS_VERSION — every devmgr_dma_labels request
 //     IOMMU_LABELS_VERSION      — every iommu_labels request (devmgr ↔ IOMMU driver)
+//     LOG_LABELS_VERSION        — every log_labels::QUERY_SLOTS and QUERY_HISTORY
+//                                 request (client ↔ logd)
 //
 //   Implicitly covered by a parent-channel handshake:
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
@@ -73,8 +75,6 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     SERIAL_LABELS_VERSION
 //     FB_LABELS_VERSION
 //     INPUT_LABELS_VERSION
-//     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP carries it, but no
-//                             caller issues that handshake
 //     STREAM_LABELS_VERSION — stream caps arrive pre-installed in
 //                             ProcessInfo.log_send_cap (init derives its
 //                             own), not via a handshake
@@ -1319,7 +1319,8 @@ pub mod svcmgr_labels
 /// derivation, not the published name nor any consumer.
 ///
 /// A name whose cap carries authority is seed-only: `rootfs.root`, the
-/// four `devmgr.*` names, [`published_names::VFSD_MOUNT`], and each provider
+/// four `devmgr.*` names, [`published_names::VFSD_MOUNT`],
+/// [`published_names::LOGD_QUERY`], and each provider
 /// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
 /// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
 /// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`.
@@ -1395,6 +1396,13 @@ pub mod published_names
     /// which carries no verb bit: the negative-test twin of [`VFSD_MOUNT`].
     /// Seed-only and seeded only by svctest.
     pub const VFSD_DENY: &[u8] = b"vfsd.deny";
+
+    /// SEND on the master log endpoint badged
+    /// `log_labels::LOG_QUERY_AUTHORITY`: logd's `QUERY_SLOTS` and
+    /// `QUERY_HISTORY` surface. svcmgr mints it from its master-log source.
+    /// Seed-only; seeded only by svctest, whose `logd_death_forward` phase
+    /// reads a dead child's retired slot through it.
+    pub const LOGD_QUERY: &[u8] = b"logd.query";
 }
 
 /// Wire-protocol version of [`rtc_labels`]; bumped as the block comment above
@@ -1415,7 +1423,7 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// **Acquisition path**: the RTC driver binary lives on the rootfs disk
 /// at `/services/drivers/<chip>` and is loaded by devmgr from there.
 /// svcmgr walks its system root to `/services/drivers/` and hands devmgr a
-/// `LOOKUP | READ`-attenuated subtree cap via
+/// `LOOKUP | READ | READDIR`-attenuated subtree cap via
 /// [`devmgr_labels::SET_DRIVERS_DIR`]. Devmgr replies SUCCESS to that
 /// handshake *before* doing any spawn work (so svcmgr never blocks on
 /// driver bring-up); it then walks the per-arch driver name
@@ -1881,7 +1889,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 15;
+pub const DEVMGR_LABELS_VERSION: u32 = 16;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1979,14 +1987,16 @@ pub mod devmgr_labels
     /// `GET_WALL_TIME` thereafter.
     pub const QUERY_RTC_DEVICE: u64 = 5;
     /// svcmgr-only handshake: install the
-    /// `LOOKUP | READ`-attenuated `/services/drivers/` namespace cap from
-    /// which devmgr walks its on-disk driver binaries.
+    /// `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` namespace
+    /// cap from which devmgr lists, reads the declarations of, and walks to
+    /// its on-disk driver binaries.
     ///
     /// Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = badged SEND on the
     /// `/services/drivers/` directory node, which svcmgr walks from its
     /// system root via `namespace_lookup_dir(root_dir_cap, …, LOOKUP |
-    /// READ)` (so the node is served by the root filesystem).
+    /// READ | READDIR)` (so the node is served by the root filesystem, and
+    /// devmgr can list it with `NS_READDIR`).
     /// Caller's badge MUST carry [`DRIVERS_DIR_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
     /// [`super::devmgr_errors::INVALID_REQUEST`] when `caps[0]` is
@@ -1995,11 +2005,13 @@ pub mod devmgr_labels
     ///
     /// Devmgr stashes the cap and replies
     /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
-    /// work, so svcmgr never blocks on driver bring-up. The actual walk,
-    /// the [`super::procmgr_labels::CREATE_FROM_FILE`] call, and the
-    /// bootstrap-round delivery for the on-disk drivers (the per-arch RTC,
-    /// virtio-input, and virtio-console; #165 will generalize), and the settle that waits
-    /// for each of them to report ready ([`DRIVER_READY`]), run after the
+    /// work, so svcmgr never blocks on driver bring-up. The spawn of the
+    /// per-arch RTC driver, the drivers-directory pass (the listing, the
+    /// read of each entry's driver declaration, and the bind of every PCI
+    /// device still unbound that a declaration matches), the
+    /// [`super::procmgr_labels::CREATE_FROM_FILE`] calls and bootstrap
+    /// rounds they make, and the settle that waits for each driver to
+    /// report ready ([`DRIVER_READY`]), run after the
     /// reply but before devmgr returns to its next `ipc_recv`. The nested
     /// IPC chain the spawn requires (procmgr → vfsd → block driver) cannot
     /// run inside a request-handler frame without clobbering the
@@ -2198,33 +2210,21 @@ pub mod devmgr_labels
     /// one fault batch spawns, which devmgr's driver death queue reserves
     /// room for.
     pub const TEST_FAULT_DRIVERS: usize = 3;
-    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    /// label: bind the DMA test device (QEMU's `edu`, PCI `1234:11e8`) to
-    /// the `test-dma` fixture driver from `/services/drivers/` in a settle
-    /// batch of its own: devmgr attaches the device to its IOMMU domain where
-    /// an IOMMU confines it, grants it DMA, turns on its memory decode and
-    /// bus mastering, and spawns the driver, which reports ready once it has
-    /// found the device. The handler replies before it binds (the bind does
-    /// nested `ipc_call`s), and the driver is then queried with
-    /// [`TEST_QUERY_DMA_DEVICE`], which waits in the registry queue until the
-    /// settle has ended. Reply: `SUCCESS` with `data[0]` =
+    /// TODO(#165): remove with the test labels. Test-only label: mint a
+    /// `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the service endpoint
+    /// of the served `test-dma` fixture, the driver devmgr binds to the DMA
+    /// test device (QEMU's `edu`, PCI `1234:11e8`) at [`SET_DRIVERS_DIR`]
+    /// by its declaration, like any driver (the fixture checks no badge).
+    /// devmgr serves it once that settle batch ends; until then the query
+    /// replies `NO_DEVICE`, as it does on a machine with no such device.
+    /// Reply: `SUCCESS` with the cap in `caps[0]` and `data[0]` =
     /// [`TEST_DMA_CONFINED`] when an IOMMU confines the device or
-    /// [`TEST_DMA_UNCONFINED`] when none does; `NO_DEVICE` when the machine
-    /// has no such device; `INVALID_REQUEST` for a repeated request (at most
-    /// once per boot) or one before [`SET_DRIVERS_DIR`]. Request: `data[0]` =
-    /// caller's compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
-    /// [`TEST_SPAWN_ORPHAN`].
-    pub const TEST_SPAWN_DMA_DRIVER: u64 = 16;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Test-only label:
-    /// mint a `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the served
-    /// `test-dma` driver's service endpoint (the driver checks no badge).
-    /// Reply: `SUCCESS` with the cap in `caps[0]`; `WITHDRAWN` once the
-    /// driver is withdrawn; `NO_DEVICE` when none is served;
-    /// `INVALID_REQUEST` for a failed derive. Request: `data[0]` = caller's
-    /// compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
-    /// [`TEST_SPAWN_ORPHAN`].
+    /// [`TEST_DMA_UNCONFINED`] when none does; `WITHDRAWN` once the fixture
+    /// is withdrawn; `NO_DEVICE` when none is served; `INVALID_REQUEST` for a
+    /// failed derive. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
     pub const TEST_QUERY_DMA_DEVICE: u64 = 17;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Test-only label:
+    /// TODO(#165): remove with the test labels. Test-only label:
     /// the IOMMU faults devmgr has taken for the DMA test device, after it
     /// takes the IOMMU driver's pending ones (`iommu_labels::TAKE_FAULTS`)
     /// and logs them. Reply: `SUCCESS` with `data[0]` = the faults taken for
@@ -2233,10 +2233,10 @@ pub mod devmgr_labels
     /// Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
     pub const TEST_DMA_FAULTS: u64 = 18;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Its reply word: an
+    /// TODO(#165): remove with [`TEST_QUERY_DMA_DEVICE`]. Its reply word: an
     /// IOMMU confines the DMA test device.
     pub const TEST_DMA_CONFINED: u64 = 1;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Its reply word: no
+    /// TODO(#165): remove with [`TEST_QUERY_DMA_DEVICE`]. Its reply word: no
     /// IOMMU confines the DMA test device, so its device addresses are
     /// physical.
     pub const TEST_DMA_UNCONFINED: u64 = 2;
@@ -2244,10 +2244,10 @@ pub mod devmgr_labels
     /// Driver-only: report that the driver has set its device up and is
     /// entering its service loop, so devmgr may serve its endpoint.
     ///
-    /// Sent by every driver devmgr spawns (the `VirtIO` PCI drivers
-    /// virtio-blk, virtio-input, and virtio-console, and the serial, framebuffer, and RTC
-    /// drivers) on its round-2 devmgr query cap, a SEND badged with its
-    /// device badge on the private driver endpoint of its spawn batch; the
+    /// Sent by every driver devmgr spawns (a driver bound to a PCI device by
+    /// its declaration, and the serial, framebuffer, and RTC drivers) on its
+    /// devmgr query cap, a SEND badged with its device badge on the private
+    /// driver endpoint of its spawn batch; the
     /// registry endpoint replies `UNKNOWN_OPCODE` to it. Request: `data[0]` =
     /// caller's compiled [`super::DEVMGR_LABELS_VERSION`]. Reply: `SUCCESS`
     /// when the badge names a driver of the batch that has not died (a
@@ -2287,8 +2287,8 @@ pub mod devmgr_labels
     /// TODO(#165): remove with the test labels. Authority bit gating
     /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`],
     /// [`TEST_QUERY_DENY_DEVICE`], [`TEST_SPAWN_FAULT_DRIVERS`],
-    /// [`TEST_QUERY_FAULT_DEVICE`], [`TEST_SPAWN_DMA_DRIVER`],
-    /// [`TEST_QUERY_DMA_DEVICE`], and [`TEST_DMA_FAULTS`]. svcmgr mints it,
+    /// [`TEST_QUERY_FAULT_DEVICE`], [`TEST_QUERY_DMA_DEVICE`], and
+    /// [`TEST_DMA_FAULTS`]. svcmgr mints it,
     /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
@@ -2340,7 +2340,7 @@ pub mod test_fault_labels
     pub const FAULT_EXIT_DELAY_MS: u64 = 200;
 }
 
-/// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_DMA_DRIVER`. The
+/// TODO(#165): remove with `devmgr_labels::TEST_QUERY_DMA_DEVICE`. The
 /// `test-dma` fixture driver's service label.
 ///
 /// The fixture drives QEMU's `edu` device, whose DMA engine copies between
@@ -2385,7 +2385,7 @@ pub enum ReadyError
 }
 
 /// Report a driver's device set up to devmgr: [`devmgr_labels::DRIVER_READY`]
-/// on `devmgr_ep`, the driver's round-2 devmgr query cap. A driver calls it
+/// on `devmgr_ep`, the devmgr query cap of the driver's bootstrap. A driver calls it
 /// immediately before its service loop, since devmgr serves the driver's
 /// endpoint only after the report. It logs nothing, so the serial and
 /// framebuffer drivers, which must not log, call it too.
@@ -3243,6 +3243,9 @@ const _: () = core::assert!(
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::DENY_BADGE & VERB_BIT_MASK == 0
+        && log_labels::LOG_QUERY_AUTHORITY & VERB_BIT_MASK != 0
+        && log_badges::LOG_BADGE_INIT & VERB_BIT_MASK == 0
+        && log_badges::LOG_BADGE_PROCMGR & VERB_BIT_MASK == 0
 );
 
 /// Reserved log-endpoint badges.
@@ -3275,7 +3278,7 @@ pub mod log_badges
 
 /// Wire-protocol version of [`log_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const LOG_LABELS_VERSION: u32 = 4;
+pub const LOG_LABELS_VERSION: u32 = 5;
 /// IPC labels for the system log endpoint's legacy discovery interface
 /// and the one-shot init-logd → real-logd handover.
 ///
@@ -3348,6 +3351,32 @@ pub mod log_labels
     /// multi-sender log endpoint) from wedging init-logd — which would
     /// otherwise block procmgr's reap of init's Memory caps indefinitely.
     pub const HANDOVER_RELEASE: u64 = 14;
+
+    /// Badge bit on a SEND on the master log endpoint that authorises
+    /// [`QUERY_SLOTS`] and [`QUERY_HISTORY`]. svcmgr mints it from its
+    /// master-log source and publishes it seed-only as
+    /// [`crate::published_names::LOGD_QUERY`]. No sender's badge carries it:
+    /// procmgr redraws a process badge carrying a
+    /// [`crate::VERB_BIT_MASK`] bit, and the reserved
+    /// [`crate::log_badges`] carry none.
+    pub const LOG_QUERY_AUTHORITY: u64 = 1u64 << 63;
+
+    /// Read logd's sender slots: its badge table and its retired slots,
+    /// ascending by badge and then state, a page of up to
+    /// [`crate::log_query::SLOTS_PAGE`] entries per call, each the badge, its
+    /// state (live, or evicted by a death with its exit reason, or by a
+    /// resync), and its display name. Served only on a badge carrying
+    /// [`LOG_QUERY_AUTHORITY`]. Wire format: [`crate::log_query`]; specified
+    /// in `services/logd/docs/ipc-interface.md` § Queries.
+    pub const QUERY_SLOTS: u64 = 16;
+
+    /// Read logd's history, newest first: every slot's entries or one
+    /// badge's, as many whole entries per call as one reply holds, each its
+    /// sequence, receipt time, badge, level, kind, and bytes. Served only on
+    /// a badge carrying [`LOG_QUERY_AUTHORITY`]. Wire format:
+    /// [`crate::log_query`]; specified in
+    /// `services/logd/docs/ipc-interface.md` § Queries.
+    pub const QUERY_HISTORY: u64 = 17;
 }
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────
@@ -3364,6 +3393,8 @@ pub mod log_labels
 // cap-role enum; no per-service sentinels.
 
 pub mod bootstrap;
+
+pub mod log_query;
 
 pub mod log_record;
 

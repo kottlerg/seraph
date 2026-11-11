@@ -30,9 +30,9 @@
 //!    donations have landed; the phase polls to close the residual race.
 //! 6. [`procmgr::init_reap`] just before it, for the same reason: it waits
 //!    for init's reap, and polls for it.
-//! 7. [`procmgr::logd_forward`] just after [`procmgr::spawn_only`]: logd
-//!    must drain its child's death before the run shuts down, since the
-//!    host-side check reads the reclaim line logd logs for it.
+//! 7. [`procmgr::logd_forward`] just after [`procmgr::spawn_only`]: it
+//!    reads its child's retired slot from logd before many other children
+//!    die and retire theirs, and polls until logd has drained the death.
 
 use crate::runner::Phase;
 

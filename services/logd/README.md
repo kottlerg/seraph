@@ -71,9 +71,19 @@ targets; only the one-time init-logd history pull
   (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § History, which
   states the stored form) and seeded at startup from init-logd's handover
   `LINE` and `RECORD` chunks (see
-  [`docs/handover-protocol.md`](docs/handover-protocol.md) § `LINE`). The
-  ring has no read surface. TODO: a query IPC that reads the history ring
-  (#720).
+  [`docs/handover-protocol.md`](docs/handover-protocol.md) § `LINE`). An
+  evicted slot is retired with its name and ring, a bounded number of them
+  kept (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § Retired
+  slots).
+
+* **Query API.** `QUERY_SLOTS` reads the sender slots, live and retired,
+  with each one's name and how it was evicted, and `QUERY_HISTORY` reads the
+  history of every slot or of one badge, newest first, a reply's worth per
+  call. Both are served only on a SEND badged `LOG_QUERY_AUTHORITY`, which
+  svcmgr mints from its master-log source and publishes seed-only as
+  `logd.query`. logd's main thread answers them from the state it owns and
+  calls no other service to do so (see
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Queries).
 
 * **Per-sender slot reclamation.** logd creates an `EventQueue` and
   registers it with procmgr via `procmgr_labels::REGISTER_DEATH_EQ`
@@ -105,7 +115,7 @@ targets; only the one-time init-logd history pull
 
 ## Out of scope (follow-up issues)
 
-* Log rotation, durable-disk persistence, query API.
+* Log rotation, durable-disk persistence.
 * Network-syslog sink.
 
 ## Source Layout
@@ -117,7 +127,8 @@ logd/
 ├── codec/                      # logd-codec, its own component shared
 │                               # with init-logd: handover wire contract,
 │                               # init-logd's history ring, the resync
-│                               # decisions, the reclaim line, record
+│                               # decisions, the reclaim line, query
+│                               # paging, record
 │                               # rendering, the shared line and name
 │                               # widths, and BoundedStr
 │                               # (see codec/README.md)
@@ -130,7 +141,8 @@ logd/
     │                           # emit, self_log
     ├── handover.rs             # HANDOVER_PULL / HANDOVER_RELEASE caller
     └── slot.rs                 # SlotTable: HashMap<badge, Slot>
-                                # with per-sender history ring
+                                # with per-sender history ring, and
+                                # the retired slots
 ```
 
 ## Bootstrap caps
@@ -167,7 +179,7 @@ the devmgr-registry cap for its lifetime (see
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
-| [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, and the `reclaim:` line logd logs when it evicts a slot |
+| [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, the query API (`QUERY_SLOTS`, `QUERY_HISTORY`) and its `LOG_QUERY_AUTHORITY`, the history's stored form and the retired slots, and the `reclaim:` line logd logs when it evicts a slot |
 | [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with, the `reclaim:` line, log record rendering, and the `BoundedStr` diagnostic formatter |
 
 ---

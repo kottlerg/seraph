@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "driver-binding"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# no_std: the driver declaration a driver carries in `.note.seraph.driver`
+# and the resource list devmgr delivers it, encoded and decoded once for both
+# sides. Pure logic, host-tested.
+[lib]
+doctest = false
+
+[dependencies]
+# `request_round`, `BootstrapRound`, and the positional-slot packing the
+# resource list's end round uses.
+ipc = { path = "../ipc" }
+# The `seraph` note owner and the driver note's type.
+process-abi = { path = "../../abi/process-abi" }
+# `cap_delete` of the caps a refused resource list delivered.
+syscall = { path = "../syscall" }
+# `MSG_CAP_SLOTS_MAX` and the `SYS_IRQ_REGISTER` mode mask.
+syscall-abi = { path = "../../abi/syscall" }
+
+[lints]
+workspace = true

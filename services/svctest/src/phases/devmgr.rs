@@ -39,14 +39,15 @@
 //! once every fixture is gone, that memmgr's free pool recovers the memory
 //! the hung fixture held, which only its destruction returns.
 //!
-//! The DMA confinement phase drives devmgr's `TEST_SPAWN_DMA_DRIVER` shim,
-//! which binds QEMU's `edu` device (attached on both architectures) to the
-//! `test-dma` fixture, and asks the fixture to probe: a copy through a page
-//! its driver mapped (`DMA_MAP`) must arrive, and, where an IOMMU confines
-//! the device, a copy to the same device address after its `DMA_UNMAP` must
-//! not reach the page, and devmgr must have taken an IOMMU fault for the
-//! device at that address. Without an IOMMU the phase checks the mapped
-//! copies only; a machine without the device skips it.
+//! The DMA confinement phase asks devmgr's `TEST_QUERY_DMA_DEVICE` shim for
+//! the `test-dma` fixture, which devmgr binds to QEMU's `edu` device
+//! (attached by every launch, on both architectures) by its declaration when
+//! svcmgr hands it the drivers directory, and asks the fixture to probe: a
+//! copy through a page its driver mapped (`DMA_MAP`) must arrive, and, where
+//! an IOMMU confines the device, a copy to the same device address after its
+//! `DMA_UNMAP` must not reach the page, and devmgr must have taken an IOMMU
+//! fault for the device at that address. Without an IOMMU the phase checks
+//! the mapped copies only.
 //! TODO(#165): retire the teardown, withdrawal, DMA confinement, and
 //! test-label deny phases with the devmgr enumeration redesign and its
 //! shims.
@@ -482,9 +483,7 @@ fn driver_withdrawal_phase(caps: &Caps)
 /// for it.
 fn dma_confinement_phase(caps: &Caps)
 {
-    use ipc::devmgr_labels::{
-        TEST_DMA_CONFINED, TEST_DMA_FAULTS, TEST_QUERY_DMA_DEVICE, TEST_SPAWN_DMA_DRIVER,
-    };
+    use ipc::devmgr_labels::{TEST_DMA_CONFINED, TEST_DMA_FAULTS, TEST_QUERY_DMA_DEVICE};
     use ipc::test_dma_labels::{DMA_PROBE, PROBE_PASSED, PROBE_SKIPPED};
 
     // A test wait bound: it limits only how long the phase polls devmgr,
@@ -500,27 +499,24 @@ fn dma_confinement_phase(caps: &Caps)
             .unwrap_or_else(|_| panic!("devmgr_dma: label {label} ipc_call failed"))
     };
 
-    let bind = call(TEST_SPAWN_DMA_DRIVER);
-    if bind.label == ipc::devmgr_errors::NO_DEVICE
+    // Served once the settle of devmgr's drivers-directory pass ends, which
+    // can lag svctest's start as the input driver's does.
+    let mut query = call(TEST_QUERY_DMA_DEVICE);
+    for _ in 1..INPUT_ATTEMPTS
     {
-        std::os::seraph::log!("devmgr_dma_confinement skipped: the machine has no DMA test device");
-        return;
+        if query.label != ipc::devmgr_errors::NO_DEVICE
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        query = call(TEST_QUERY_DMA_DEVICE);
     }
-    assert_eq!(
-        bind.label,
-        ipc::devmgr_errors::SUCCESS,
-        "TEST_SPAWN_DMA_DRIVER ack"
-    );
-    let confined = bind.word(0) == TEST_DMA_CONFINED;
-
-    // Served once devmgr returns to its registry loop, after the bind's
-    // settle.
-    let query = call(TEST_QUERY_DMA_DEVICE);
     assert_eq!(
         query.label,
         ipc::devmgr_errors::SUCCESS,
         "the test-dma fixture must be served"
     );
+    let confined = query.word(0) == TEST_DMA_CONFINED;
     let fixture = query.caps().first().copied().unwrap_or(0);
     assert!(fixture != 0, "TEST_QUERY_DMA_DEVICE carried no cap");
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
@@ -613,10 +609,6 @@ fn test_label_deny_phase(caps: &Caps)
         "TEST_LABEL_AUTHORITY",
     );
     for (label, name) in [
-        (
-            ipc::devmgr_labels::TEST_SPAWN_DMA_DRIVER,
-            "TEST_SPAWN_DMA_DRIVER",
-        ),
         (
             ipc::devmgr_labels::TEST_QUERY_DMA_DEVICE,
             "TEST_QUERY_DMA_DEVICE",

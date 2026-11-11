@@ -55,6 +55,7 @@ members = [
     "shared/crash-report",
     "shared/crypto",
     "shared/death-set",
+    "shared/driver-binding",
     "shared/elf",
     "shared/font",
     "shared/mmio",
@@ -124,6 +125,39 @@ undocumented_unsafe_blocks       = "warn"
 cast_ptr_alignment               = "warn"
 unwrap_used                      = "deny"
 expect_used                      = "deny"
+
+# restriction lints
+as_underscore                       = "warn"
+assertions_on_result_states         = "warn"
+dbg_macro                           = "warn"
+default_union_representation        = "warn"
+empty_enum_variants_with_brackets   = "warn"
+fn_to_numeric_cast_any              = "warn"
+get_unwrap                          = "warn"
+iter_over_hash_type                 = "warn"
+mem_forget                          = "warn"
+mixed_read_write_in_expression      = "warn"
+pub_without_shorthand               = "warn"
+renamed_function_params             = "warn"
+self_named_module_files             = "warn"
+suspicious_xor_used_as_pow          = "warn"
+todo                                = "warn"
+try_err                             = "warn"
+unimplemented                       = "warn"
+unnecessary_self_imports            = "warn"
+unneeded_field_pattern              = "warn"
+
+# nursery lints
+as_ptr_cast_mut                     = "warn"
+collection_is_never_read            = "warn"
+debug_assert_with_mut_call          = "warn"
+fallible_impl_from                  = "warn"
+literal_string_with_formatting_args = "warn"
+read_zero_byte_vec                  = "warn"
+significant_drop_in_scrutinee       = "warn"
+trailing_empty_array                = "warn"
+transmute_undefined_repr            = "warn"
+uninhabited_references              = "warn"
 
 [workspace.dependencies]
 ansi = { path = "shared/ansi" }

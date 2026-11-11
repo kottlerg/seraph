@@ -10,7 +10,7 @@
 //! mapping; the walk itself (function discovery, BAR probing, `VirtIO`
 //! capability parsing) is [`firmware::scan`].
 
-pub use firmware::scan::{PciDevice, is_virtio_blk, is_virtio_console, is_virtio_input};
+pub use firmware::scan::PciDevice;
 
 /// A mapped ECAM window: `va` is the configuration space of `start_bus`,
 /// and each later bus through `end_bus` follows at 1 MiB strides.

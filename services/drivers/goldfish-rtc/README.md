@@ -12,9 +12,12 @@ register reads.
 Installed to `/services/drivers/goldfish-rtc` on the rootfs. Spawned
 by [devmgr](../../devmgr/README.md) on RISC-V QEMU virt via the non-PCI simple-device path,
 `procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
-walks to from the `LOOKUP | READ` `/services/drivers/` subtree cap
+walks to from the `LOOKUP | READ | READDIR` `/services/drivers/` subtree cap
 svcmgr delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR` (see
-[Device Management](../../../docs/device-management.md#driver-binary-sources)).
+[Device Management](../../../docs/device-management.md#driver-binary-sources)). The driver
+carries a declaration in the ELF note section `.note.seraph.driver` (platform key
+`google,goldfish-rtc`) that no device record devmgr builds matches yet, so devmgr starts it on its
+fixed path.
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities) owns the
 driver's service endpoint and mints client SEND caps on
 `devmgr_labels::QUERY_RTC_DEVICE`, each badged with

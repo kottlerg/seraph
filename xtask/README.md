@@ -38,7 +38,7 @@ xtask/
 │   ├── commands/               # Subcommand modules (build, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, test_crash_report, test_debug_port, test_gdb, test_kaslr,
-│   │                           #   test_logd_reclaim, test_map_redo, test_terminal,
+│   │                           #   test_map_redo, test_terminal,
 │   │                           #   test_vmgenid, lint_docs, pr_check, review, issue, orch,
 │   │                           #   hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
@@ -706,43 +706,6 @@ See [docs/testing.md](../docs/testing.md) for the harness model and
 
 ---
 
-### `cargo xtask test-logd-reclaim`
-
-Check that a child's death reaches logd and evicts its slot, on either arch. Reads a svctest
-boot's serial log and passes when the log holds svctest's pass marker and exactly one logd line
-`reclaim: badge=<b> exit_reason=0x17 name="svctest-logd-reclaim exit_reason=0x0"`: the slot of
-the child svctest's `logd_death_forward` phase spawns, evicted on its exit with code `0x17`. The
-line's fields are read with `logd_codec::record::fields`, so the forged ` exit_reason=0x0` in the
-child's name stays inside the name, and the line must be exactly the rendering of the record they
-give. The check also requires the child's record line `logd-reclaim child exiting code=23` and,
-after it, the child's text line `partial text line resumed`, which the child sends in two halves
-around its records, whole. The line's shape is stated in
-[services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
-§ Death-notification cascade.
-
-```sh
-# Check a saved svctest log; boots nothing (what CI's svctest cell runs):
-cargo xtask test-logd-reclaim --log target/xtask/run-parallel-saved/x86_64-4cpu-1.log
-
-# Boot the current sysroot once, svctest staged, and check its log:
-cargo xtask test-logd-reclaim [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [--mem MIB] \
-    [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5]
-```
-
-With no `--log`, the boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass
-and fail markers, `--timeout` defaulting to 900 s) with `--save-logs` into
-`target/xtask/test-logd-reclaim/`, and the check reads the log saved there (a log an earlier
-boot left there is removed first). A boot that ends `FAIL`, `HANG`, `OK` or `ERR` fails the command
-before the check, as it fails `run-parallel`. A `QEMU-CRASH` boot, a host-emulator crash that
-`run-parallel` does not count as a failure, leaves a log without the pass marker: the check reads
-the outcome from the log's `[run-parallel]` trailer, its last line, and reports itself skipped,
-which passes the command, for a saved log given with `--log` as well. Stage svctest first, as
-[docs/testing.md](../docs/testing.md) § Gating describes.
-
-See [docs/testing.md](../docs/testing.md) for the harness model.
-
----
-
 ### `cargo xtask test-crash-report`
 
 Check the crash service's report blocks in a boot's saved serial log, on either arch; boots
@@ -763,9 +726,11 @@ fixture's main thread and one `exception` block of a `spawned` thread (its `work
 through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its
 instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying
 the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the
-block read the thread the kernel killed. `--expect none` requires the log to hold no block. A log
-whose `[run-parallel]` trailer records a `QEMU-CRASH` is reported skipped, which passes the
-command, as `test-logd-reclaim` reports it. The model is in
+block read the thread the kernel killed. The `vm` block's `addr` must also be the faulting address
+that dump prints (`cr2` on x86_64, `stval` on riscv64). `--expect none` requires the log to hold
+no block. A log whose `[run-parallel]` trailer, its last line, records a `QEMU-CRASH`, a
+host-emulator crash that `run-parallel` does not count as a failure, is reported skipped, which
+passes the command. The model is in
 [docs/testing.md](../docs/testing.md) § Crash reports.
 
 ---
@@ -793,7 +758,8 @@ The boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass 
 `--timeout` defaulting to 900 s) with `--save-logs` into `target/xtask/test-map-redo/`, and the
 check reads the log saved there (a log an earlier boot left there is removed first). A boot that
 ends `FAIL`, `HANG`, `OK` or `ERR` fails the command before the check, as it fails `run-parallel`;
-a `QEMU-CRASH` boot is reported skipped, as `test-logd-reclaim` reports it.
+a `QEMU-CRASH` boot, a host-emulator crash that `run-parallel` does not count as a failure, is
+reported skipped, which passes the command.
 
 See [docs/testing.md](../docs/testing.md) for the harness model.
 
@@ -953,10 +919,10 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 |---|---|---|
 | `pr-unticked-box` | error | The body has no unticked task-list item (§ PR-body checklist discipline): `[ ]` after a `-`, `*`, `+`, or numbered list marker, the forms GitHub renders as a checkbox. |
 | `pr-attribution` | error | The body carries no tool attribution line and no session link. |
-| `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`. A drain PR that closes a follow-up Issue of the earlier pattern carries both (§ Follow-up Issues); in any other body the pair usually means a sentence closes an Issue the PR only references. |
+| `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`; a closing reference that names a repository (`<owner>/<repo>#N`, or the Issue's URL) is not compared. A drain PR that closes a follow-up Issue of the earlier pattern carries both (§ Follow-up Issues); in any other body the pair usually means a sentence closes an Issue the PR only references. |
 | `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
 | `pr-validation` | error | The body has a `## Validation` section that names a validated head: the first word of that section that is a commit hash in the clone. |
-| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch (one the head holds and the base branch does not), the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown (`*.md` in any letter case) aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any non-blank line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. When a merge of the base branch lies between the two heads, the command compares the PR's own change at each, `git diff <merge base> <validated>` and `git diff <merge base> <head>`, as multisets of changed lines per file, whitespace included, instead of the delta: they must differ only in comment or Markdown lines and in no file a build embeds, two binary changes agree only when their `index` lines match (the same blobs before and after, and the same mode), a change to a final newline alone is a change, as is a different mode for a file the PR adds or deletes at both heads (an added or deleted file is otherwise judged by its lines, so a file of comments alone stays comment-only), each difference is reported with the head it stands at, and the section must say the delta is documentation or comments only when the two differ at all. |
+| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch (one the head holds and the base branch does not), the section says the delta since it is documentation or comments only (a phrase that pairs `only` with comments, Markdown, or documentation, such as `comment-only`, `Markdown only`, or `only in comments`, not after a `not` within three words and outside a template placeholder `<…>`; whether the phrase is about the delta stays with the auditor), and `git diff <validated> <head>` alters, Markdown (`*.md` in any letter case) aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any non-blank line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. When a merge of the base branch lies between the two heads, the command compares the PR's own change at each, `git diff <merge base> <validated>` and `git diff <merge base> <head>`, as multisets of changed lines per file, whitespace included, instead of the delta: they must differ only in comment or Markdown lines and in no file a build embeds, two binary changes agree only when their `index` lines match (the same blobs before and after, and the same mode), a change to a final newline alone is a change, as is a different mode for a file the PR adds or deletes at both heads (an added or deleted file is otherwise judged by its lines, so a file of comments alone stays comment-only), each difference is reported with the head it stands at; a line the PR reordered or moved within its own files since the validated head, which the multisets cannot see, is read from `git diff <validated> <head>` over those files less the sync's incoming diff, and a code line of it in a file whose own change compares equal is reported as moved or reordered; and the section must say the delta is documentation or comments only when the two differ at all. |
 | `pr-validated-sync` | warning | No merge of the base branch lies between a validated head that passes `pr-validated-head` and the PR head. After one the body states whether the incoming diff overlaps the PR's files (§ Syncing with `master`); a reader decides the overlap, the command cannot. |
 | `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
 | `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Follow-up Issues). |
@@ -965,7 +931,9 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 | `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
 
 The command prints the Issues the body and the commits close and the ones the body references,
-so that a keyword in prose that closes an Issue by accident is seen.
+so that a keyword in prose that closes an Issue by accident is seen. A closing reference into
+another repository (`<owner>/<repo>#N`, or that Issue's URL, naming a repository other than this
+one) is printed apart and not checked, since the Issue rules read this repository's Issues.
 
 `--gate` adds the merge gate of § Branch and PR Workflow. It does not imply `--strict`: a
 warning is for the reader, who may confirm it or hold an acceptance of it, and only an error
@@ -977,7 +945,7 @@ fails the gate.
 | `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
-| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and the reviewer verdict `READY TO MERGE` (or, in a record of the earlier form, `NON-BLOCKING ISSUES ONLY`). The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. When that record is an `audit` record that completes a run of the reviewer alone (the latest `NOT RUN` record at the head with only `audit` records after it), that run must have no failed agent and a passing verdict too. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
+| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and the reviewer verdict `READY TO MERGE` (or, in a record of the earlier form, `NON-BLOCKING ISSUES ONLY`). The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. When that record is an `audit` record that completes a run of the reviewer alone (the latest `NOT RUN` record at the head with only `audit` records after it), that run must have no failed agent and a passing verdict too. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. A record is at the head when its name states the head's first digits; one whose `stats.head` names another commit is refused. |
 | `gate-added-files` | error | The files the PR adds can be read from the clone, which the next rule needs. |
 | `gate-release-approval` | warning | The PR adds no `docs/releases/v<X>.<Y>.<Z>.md`. One that does is the release PR of § Release Production, whose merge needs the maintainer's approval (§ Pre-merge review); the command cannot read an approval, so it names the PR for its reader. |
 | `gate-findings-recorded` | warning | A record of the earlier form with the verdict `NON-BLOCKING ISSUES ONLY` leaves no finding on the surface that needs a reader: one an Issue had to record (a class other than `style`, or a MUST violation), or one of any class whose `status` is `contested`. When the last record is an `audit` record that completes a run of the reviewer alone, that run's verdict and findings count too. The reader confirms each counted finding is recorded and none is contested; the command cannot. |
@@ -996,10 +964,10 @@ cargo xtask review-check <N>
 ```
 
 A run record is `target/xtask/review/pr<N>/<mode>-<head>.json`, where `<mode>` is `full`, `delta`,
-or `audit` and `<head>` is the head the run reviewed. A further run at a head that already has a
-record of that kind (a second run with the reviewer, a second audit) is `<mode>-<head>-<n>.json`,
-`<n>` counting from 2. The suffix only keeps the names apart: `stats.run` orders the runs. It is
-one JSON object:
+or `audit` and `<head>` is the head the run reviewed, at least its first 8 hexadecimal digits. A
+further run at a head that already has a record of that kind (a second run with the reviewer, a
+second audit) is `<mode>-<head>-<n>.json`, `<n>` counting from 2. The suffix only keeps the names
+apart: `stats.run` orders the runs. It is one JSON object:
 
 | Key | Value |
 |---|---|
@@ -1065,9 +1033,13 @@ destroying it.
 cargo xtask issue-edit <N> --body-file <path> [--allow-removal]
 ```
 
-The command refuses an empty body, and a body with fewer task-list items than the Issue has
-unless `--allow-removal` is given (an edit that drops items on purpose, as
-[docs/conventions.md](../docs/conventions.md) § Acceptance checklist discipline allows). It
+The command refuses an empty body. Unless `--allow-removal` is given (an edit that drops,
+rewords, or reopens items on purpose, as
+[docs/conventions.md](../docs/conventions.md) § Acceptance checklist discipline allows), it also
+refuses a body that lacks a task-list item the Issue holds, or that reopens one the Issue has
+ticked: what a copy fetched before another edit produces. An item is matched by its text, box
+aside, to one of the new body whose text starts with it, so a tick that appends
+`(fixed by PR #M)` keeps it. It
 writes the previous body to `target/xtask/issue-backup/<N>-<time>.md`, edits the Issue, reads
 it back, and restores the previous body when what GitHub holds is not what the file holds.
 
@@ -1197,8 +1169,8 @@ has no `hook` command exits with that code, so `.claude/settings.json` writes ea
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build` and `clean` as builds; `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-logd-reclaim` (when it
-boots), `test-map-redo`, `test-debug-port` and `test-gdb` as boots.
+`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port`
+and `test-gdb` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 2 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

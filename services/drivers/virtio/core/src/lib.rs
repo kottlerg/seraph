@@ -8,8 +8,8 @@
 //! Provides the modern PCI transport, virtqueue management, device negotiation,
 //! the startup message format used by devmgr to pass PCI capability info
 //! to `VirtIO` drivers, the register layout by which a driver maps every BAR
-//! the register regions name ([`RegisterLayout`]), the devmgr-to-driver
-//! bootstrap rounds ([`bootstrap`]), the mapping of a driver's buffers for its
+//! the register regions name ([`RegisterLayout`]), the driver's reading of
+//! the resource list devmgr delivers it ([`bootstrap`]), the mapping of a driver's buffers for its
 //! device ([`dma`]), and the interrupt-service loop each driver runs on a
 //! thread of its own ([`isr`]).
 
@@ -205,9 +205,8 @@ const PCI_BAR_COUNT: u8 = 6;
 
 /// Most distinct BARs a `VirtIO` device's register regions name: one per
 /// region (common, notification, ISR, and device configuration, the four
-/// region types `VirtIO` 1.2 § 4.1.4 defines). A hardware-spec bound; the
-/// one bootstrap round that delivers the BARs holds that many caps
-/// ([`bootstrap`]).
+/// region types `VirtIO` 1.2 § 4.1.4 defines). A hardware-spec bound; a
+/// driver refuses a resource list that delivers more ([`bootstrap`]).
 pub const MAX_VIRTIO_BARS: usize = 4;
 
 /// One BAR a device's register regions name.

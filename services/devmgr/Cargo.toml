@@ -11,12 +11,19 @@ test = false
 
 [dependencies]
 boot-protocol = { path = "../../abi/boot-protocol" }
+# Driver declarations, decoded from each candidate driver's note, and the
+# resource list a bound driver is delivered.
+driver-binding = { path = "../../shared/driver-binding" }
+# The section-header walk that locates a driver's declaration note.
+elf = { path = "../../shared/elf" }
 # ACPI / DTB table parsers, extracted so they are host-testable.
 firmware = { path = "firmware", package = "devmgr-firmware" }
 # The IOMMU driver's bootstrap layout and scope encoding.
 iommu-core = { path = "../drivers/iommu/core" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
+# The `seraph` note owner and the driver note's type.
+process-abi = { path = "../../abi/process-abi" }
 ns-client = { path = "../../shared/ns-client" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }

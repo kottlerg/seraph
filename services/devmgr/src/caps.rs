@@ -72,6 +72,10 @@ pub mod kind
 /// `SET_DRIVERS_DIR` subtree cap; no `RTC` module is delivered.
 pub mod module_kind
 {
+    // dead_code: the tag mirrors init's, which still delivers the disk
+    // driver's module under it; the boot pass binds that module by its
+    // declaration, so devmgr never names the tag.
+    #[allow(dead_code)]
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
     pub const FRAMEBUFFER: u64 = 3;
@@ -80,6 +84,12 @@ pub mod module_kind
     pub const IOMMU: u64 = 4;
     /// Number of module kinds: the tags run `1..=COUNT`, one module each.
     pub const COUNT: usize = 4;
+    /// The kinds whose drivers devmgr starts on fixed paths rather than by
+    /// their declarations (docs/driver-binding.md § Status): the console
+    /// pair, until platform device records bind them, and the IOMMU driver,
+    /// which devmgr starts before any device is bound. The boot pass reads
+    /// the declaration of every other module.
+    pub const FIXED_PATH: [u64; 3] = [SERIAL, FRAMEBUFFER, IOMMU];
 
     /// Slot of `kind` in a per-kind table, or `None` for an unknown tag.
     pub fn index(kind: u64) -> Option<usize>

@@ -255,8 +255,9 @@ Orchestrated:
   `<scope>: merge master into the <kind> branch`, `<kind>` being the branch's prefix.
   docs/conventions.md § Syncing with `master` says what a sync owes: green CI on the synced
   head always, and the validation set and a run with the reviewer again only when the incoming
-  diff touches a file your PR touches or the merge has a conflict. Otherwise the validated head
-  stands, and the body says that the incoming diff touches none of the PR's files. The gate
+  diff touches a file your PR touches and is not comment-only (docs/testing.md § Coverage
+  tiers), or the merge has a conflict. Otherwise the validated head stands, and the body says
+  that the incoming diff touches none of the PR's files, or that it is comment-only. The gate
   needs the head to include `master` either way.
 
 Standalone, there is no grant: the commands' launch rules are the whole protocol, and you sync

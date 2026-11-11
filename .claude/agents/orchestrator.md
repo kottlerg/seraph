@@ -114,8 +114,9 @@ Keep your own reads out of your context the same way:
    batch names them). The maintainer names the batch's goal; you name the scopes.
 2. Size the wave at four to six PRs in flight, on scopes whose files do not overlap. Each
    merge makes every open PR re-sync. A sync owes green CI, and it re-owes a PR's validation
-   set and a reviewer run only when the incoming diff touches a file that PR touches
-   (docs/conventions.md § Syncing with `master`), so two PRs on the same files cost more in
+   set and a reviewer run only when the incoming diff touches a file that PR touches and is
+   not comment-only, or the merge resolves a conflict (docs/conventions.md § Syncing with
+   `master`), so two PRs on the same files cost more in
    parallel than in sequence.
 3. Start the record with `cargo xtask orch start --goal "<the batch's goal>"`; a goal the
    maintainer gave in more than one line of 300 characters goes into `--goal` as a one-line

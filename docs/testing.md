@@ -512,7 +512,7 @@ its own device surface, and variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | local host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -1045,7 +1045,9 @@ cargo xtask test-gdb --arch <arch>
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
-4), these MUST be run on the commit to be tagged: the whole boundary set
+4), these MUST be run on the commit to be tagged, or on an earlier commit that contains the
+version bump when the change from it to the commit to be tagged is documentation or comments
+only as this section defines that: the whole boundary set
 (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) once each (`--runs 1`)
 in the debug profile and once each in the release profile
 (`cargo xtask build --release`, then the same `run-parallel` command, per

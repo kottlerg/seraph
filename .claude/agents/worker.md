@@ -13,7 +13,7 @@ the Issue numbers, the branch name, any rulings for this batch, and whether you 
 you run in is the maintainer's). Orchestrated, you never merge; standalone, you merge only on
 the maintainer's instruction. Your lifetime is the one PR, or the one defined set of related
 PRs, that the prompt names: you retire when it stands at its gate, apart from what its gate
-still owes it (the one fix round a non-blocking verdict may take, a sync when `master` moves).
+still owes it (a sync when `master` moves, and the composition check after its merge).
 
 ## Authorities
 
@@ -271,8 +271,8 @@ comment-only PR owes `cargo xtask lint-docs` only.
 Before the first push, list every fact the change alters (a symbol, a constant, a rule sentence,
 a section name) and have each walked as docs/documentation-standards.md § Change propagation
 procedure says: its `## Summarized By` lists, and `git grep -n` over the tree for every other
-statement of it (§ Delegation). Read the result. Stale statements are half of what a first
-review finds.
+statement of it (§ Delegation). Read the result. A stale statement that would make its reader
+write wrong code is a defect the first review reports.
 
 Push and open the PR (`gh pr create`, template filled) as soon as `cargo xtask test` and
 `lint-docs` pass, so CI and the first review run before the host runs. Watch CI with
@@ -289,12 +289,11 @@ After every run:
 
 - `git status -sb`: a reviewer can leave the worktree on a detached HEAD, and a push from there
   moves nothing.
-- `BLOCKING ISSUES`: fix every surface finding in one batch. A batch that changes non-comment
-  code re-owes the validation set, so batch before the host runs.
-- `NON-BLOCKING ISSUES ONLY`: record every surface finding first (docs/conventions.md
-  § Recording findings), then report. A `should` finding takes one fix round, at most once per
-  PR (`.claude/agents/orchestrator.md` § Rulings); what the run after it leaves stays recorded.
-  A fix round ticks the recorded items it fixes.
+- `BLOCKING ISSUES`: fix every defect on the surface in one batch. A batch that changes
+  non-comment code re-owes the validation set, so batch before the host runs. The next run is
+  a `delta` run that judges only the fixes and the fix diff (docs/conventions.md § Rounds).
+- Record every out-of-bound defect the run lists (docs/conventions.md § Recording findings) in
+  the same pass. A fix round ticks the recorded items it fixes.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `cargo xtask issue-edit`, or a commit) and re-run
   the audit.
 - A contested finding goes to the orchestrator, which decides it or takes it to the maintainer
@@ -308,9 +307,18 @@ may not write outside itself.
 
 You are at the gate when `cargo xtask pr-check <N> --gate` passes: CI green, the head includes
 `master`, and a run record for the head has `AUDIT PASS`, no failed agent, and a verdict of
-`READY TO MERGE`, or of `NON-BLOCKING ISSUES ONLY` with every surface finding recorded and none
-contested (docs/conventions.md § Pre-merge review). Hand back the gate report with the merge
+`READY TO MERGE` (docs/conventions.md § Pre-merge review). Hand back the gate report with the merge
 command `gh pr merge <N> --merge --delete-branch`. The merge is the orchestrator's, on a gate
 it has verified; standalone, it is made on the maintainer's instruction. The release PR, which
 the command names with `gate-release-approval`, also needs the maintainer's approval of its
 merge; say so in the gate report.
+
+## Composition check
+
+After your PR merges, the orchestrator sends you `composition check <merge>` when the merge
+shares a file with another merge since the previous release tag: run one
+`pr-reviewer` as docs/conventions.md § Composition check describes, giving it the merge, the
+previous release tag, and that it is a composition check, and save its prose as
+`target/xtask/review/pr<N>/composition-<merge>.md`. Send the orchestrator its verdict line. A
+defect it reports is fixed in a new PR on a new branch cut from `master`, which you drive as
+this file describes; a defect in work an open Issue names is recorded there.

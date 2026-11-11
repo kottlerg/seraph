@@ -8,54 +8,51 @@
 // The pre-merge review of every pull request read each PR's own lines; this
 // workflow reviews what none of them saw, the composition of the merged PRs
 // between the previous release tag and the candidate head
-// (docs/conventions.md § Release Production says when it runs and where its
-// findings go). Scope (one agent) lists the range, its first-parent units (one
-// per merged PR), each unit's files, and the saved review records. Review runs
-// one `pr-reviewer` per shard of the files two or more units touched (no other
-// file is reviewed line by line) and whole-range lenses, in parallel. Verify
-// puts every finding that can block, and every Critical and Should finding, to
-// two independent refuters as soon as its reviewer completes. Audit runs the
-// `release-auditor` once the findings are judged, with the known-issue
-// candidates (the blocking-track findings an open Issue names, of this run and,
-// while their Issue is open, of the release's earlier runs), so the notes it
-// checks and the notes this run drafts take the same list. Synthesize renders
-// one report and, when the verdict is `RELEASE READY`, drafts the release
-// notes from docs/releases/TEMPLATE.md. The script computes the verdict line
-// itself: `RELEASE BLOCKED` when a reviewer failed, a finding on the blocking track
-// (class correctness, safety, or contract, or a MUST violation anchored
-// outside Markdown) survives verification with no open Issue naming its work,
-// or the audit fails; `RELEASE READY` otherwise. A blocking-class finding an
-// open Issue names is a known-issue candidate, not a blocker; every other
-// surviving finding is recorded on an Issue.
+// (docs/conventions.md § Release Production says when it runs and what
+// follows from it). It runs once per release, before the version bump; it is
+// not run again over the fixes. Its reviewers report defects only
+// (docs/conventions.md § Findings).
 //
-// The ledger is the union of the saved run records of the range's PRs
-// (`target/xtask/review/pr<N>/*-*.json`) and of this release's earlier runs
-// (`target/xtask/review/release-v<X.Y.Z>/*-*.json`); reviewers read it with
-// `jq`, and a finding an entry states at a hunk unchanged since the run the
-// entry names, when that run resolves in the clone, is listed, not counted.
+// Scope (one agent) lists the range, its first-parent units (one per merged
+// PR), and each unit's files. Review runs one `pr-reviewer` per shard of the
+// code files two or more units touched (no other code file is reviewed line by
+// line), one lens over every Markdown document and instruction file the range
+// touched, and the whole-range lenses, in parallel. Verify puts every defect
+// that can block (one no open Issue names) to two independent refuters as
+// soon as its reviewer completes; the reality refuter also judges whether the
+// defect was already present at the previous release, which sets it apart as
+// predating the range. A defect an open Issue names is a known issue and
+// takes no refuters. Audit runs the `release-auditor` with the known-issue
+// candidates. Synthesize renders one report and drafts the release notes from
+// docs/releases/TEMPLATE.md. The script computes the verdict line itself:
+// `RELEASE BLOCKED` when a reviewer failed, the run reached its agent ceiling,
+// a confirmed defect stands that no open Issue names and that does not predate
+// the range, or the audit fails; `RELEASE READY` otherwise. The confirmed
+// defects go to the maintainer as one list, each with a recommendation.
 //
-// args: { mode: 'scope' | 'full' | 'delta', from: string, version: string,
-//         since?: string, host_runs?: string }
+// The ledger is the union of the saved run records of the range's PRs and of
+// this release's own runs; reviewers read it with `cargo xtask review-ledger
+// --release` (xtask/README.md), and a finding an entry states at a hunk
+// unchanged since the run the entry names, when that run resolves in the
+// clone, is listed, not counted.
+//
+// args: { mode: 'scope' | 'full' | 'audit', from: string, version: string,
+//         host_runs?: string, max_agents?: number }
 //   from         the previous release tag (or any commit) the range starts at.
 //   version      the target version `X.Y.Z`; `vX.Y.Z` must be the current
 //                milestone (docs/conventions.md § Milestones).
-//   mode 'full'  reviews the whole range `from..HEAD`.
-//   mode 'delta' reviews what changed between `since` (the head the last run
-//                reviewed) and the head: the multi-PR files the delta changed,
-//                the lenses over the delta, the fixes claimed since then, and a
-//                correctness-only regression lens over the delta. It also puts
-//                every finding the run at `since` left standing (its record's
-//                `findings`, contested ones aside) to the refuters again, so
-//                one no fix removed still blocks; it aborts when no saved
-//                record of this release reviewed `since`. Carried and fresh
-//                records are never merged: reviewers are told the carried
-//                findings and asked not to report them again, and one they
-//                report anyway is listed twice, which the verdict tolerates,
-//                since it asks only whether any blocking finding survives.
-//   mode 'scope' stops after Scope and returns the agent plan and sample
-//                prompts (one agent); with `since` it scopes as delta would.
+//   mode 'full'  reviews the whole range `from..HEAD` and audits it.
+//   mode 'scope' stops after Scope and returns the agent plan, its agent
+//                count before verification, and sample prompts (one agent).
+//   mode 'audit' runs the release audit alone at the head (Release Production
+//                step 5): Scope, then the `release-auditor`.
 //   host_runs    path of the release host-run report; the audit requires it
 //                once the head carries the version bump.
+//   max_agents   the agent ceiling (default 250). A run whose plan exceeds it
+//                stops before it reviews; a run that reaches it during
+//                verification stops verifying, leaves the rest unverified,
+//                and is `RELEASE BLOCKED` until the maintainer decides how to
+//                go on.
 //
 // The agent types below resolve from the definitions the session loaded at its
 // start, so the session that runs this workflow must have started after
@@ -73,12 +70,9 @@ export const meta = {
     whenToUse:
         'Once the milestone is ready to close, per docs/conventions.md § Release Production',
     phases: [
-        { title: 'Scope', detail: 'list the range, its PRs and files, and the saved records' },
-        { title: 'Review', detail: 'multi-PR file shards and whole-range lenses' },
-        {
-            title: 'Verify',
-            detail: 'two independent refuters per finding that can block, or is Critical or Should',
-        },
+        { title: 'Scope', detail: 'list the range, its PRs and files; count the agents' },
+        { title: 'Review', detail: 'multi-PR code shards, the documents lens, range lenses' },
+        { title: 'Verify', detail: 'two independent refuters per defect that can block' },
         { title: 'Audit', detail: 'release-auditor, given the known-issue candidates' },
         { title: 'Synthesize', detail: 'report and notes draft; verdict computed by the script' },
     ],
@@ -86,47 +80,34 @@ export const meta = {
 
 // ─── Arguments ───
 
-const MODES = ['full', 'delta', 'scope']
+const MODES = ['full', 'scope', 'audit']
 const text_arg = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null)
 const MODE = args && MODES.includes(args.mode) ? args.mode : null
 const FROM = args ? text_arg(args.from) : null
 const VERSION = args ? text_arg(args.version) : null
-const SINCE = args ? text_arg(args.since) : null
 const HOST_RUNS = args ? text_arg(args.host_runs) : null
-const DELTA = SINCE !== null
+const DEFAULT_MAX_AGENTS = 250
+const MAX_AGENTS =
+    args && Number.isInteger(args.max_agents) && args.max_agents > 0
+        ? args.max_agents
+        : DEFAULT_MAX_AGENTS
 
-if (MODE === null) return { error: "args.mode must be 'full', 'delta', or 'scope'" }
+if (MODE === null) return { error: "args.mode must be 'full', 'scope', or 'audit'" }
 if (FROM === null) return { error: 'args.from must name the previous release tag' }
 if (VERSION === null || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(VERSION)) {
     return { error: 'args.version must be the target version X.Y.Z' }
 }
-if (MODE === 'delta' && !DELTA) {
-    return { error: "args.since (the head the last run reviewed) is required in 'delta' mode" }
-}
-if (MODE === 'full' && DELTA) {
-    return { error: "args.since is only meaningful with mode 'delta' or 'scope'" }
-}
 
 const TAG = 'v' + VERSION
-const RECORD_DIR = 'target/xtask/review/release-' + TAG
 
 // ─── Tunables ───
 
 const MAX_SHARD_FILES = 6 // files per shard reviewer
 const MAX_SHARD_LINES = 500 // changed lines per shard reviewer
-const MAX_LENS_DOCS = 8 // documents per design-docs lens agent
-const DEDUP_LINE_SLACK = 3 // lines apart at which same file, class, bucket, and flag are one
+const DEDUP_LINE_SLACK = 3 // lines apart at which two findings in one file are one
 const VERIFY_LENSES = ['reality', 'authority']
-const BLOCKING_CLASSES = ['correctness', 'safety', 'contract']
-const OTHER_CLASSES = ['standards', 'doc-drift', 'coverage', 'style']
-// The blocking track (docs/conventions.md § Branch and PR Workflow): a finding
-// of a blocking class, or a MUST violation of a standard, of whatever class,
-// anchored outside Markdown.
-const blocks = (f) =>
-    BLOCKING_CLASSES.includes(f.class) || (f.must_violation && !f.file.endsWith('.md'))
-// The findings docs/conventions.md § Release Production says the release
-// review verifies.
-const verifiable = (f) => blocks(f) || f.bucket !== 'nit'
+// Agents a full run makes after Verify: audit, synthesize, and notes.
+const AFTER_VERIFY = 3
 // The sections release-auditor's Output lists; the audit must return each.
 const AUDIT_SECTION_NAMES = [
     'milestone state', 'version', 'release notes', 'known issues', 'host runs',
@@ -150,10 +131,9 @@ const PATHS = { type: 'array', items: { type: 'string', description: PATH_DESCRI
 const SCOPE_SCHEMA = {
     type: 'object',
     required: [
-        'head', 'from_sha', 'repo_root', 'tree_at_head', 'from_ancestor', 'since_reachable',
-        'range_files', 'range_file_count', 'units', 'version_at_head', 'version_at_from',
-        'milestones', 'open_issues', 'ledger_records', 'delta_files', 'delta_file_count',
-        'claimed_fixes', 'prior_known', 'prior_findings', 'since_record',
+        'head', 'from_sha', 'repo_root', 'tree_at_head', 'from_ancestor', 'range_files',
+        'range_file_count', 'units', 'version_at_head', 'version_at_from', 'milestones',
+        'open_issues',
     ],
     properties: {
         head: { type: 'string', description: 'Full SHA of `git rev-parse HEAD`.' },
@@ -166,10 +146,6 @@ const SCOPE_SCHEMA = {
         from_ancestor: {
             type: 'boolean',
             description: '`git merge-base --is-ancestor <from_sha> <head>` exits 0.',
-        },
-        since_reachable: {
-            type: 'boolean',
-            description: '`since` resolves to a commit in this clone; true without `since`.',
         },
         range_files: {
             type: 'array',
@@ -248,126 +224,40 @@ const SCOPE_SCHEMA = {
                 properties: { number: { type: 'integer' }, title: { type: 'string' } },
             },
         },
-        ledger_records: {
-            ...PATHS,
-            description: 'Every saved run record the `ls` commands print, as relative paths.',
-        },
-        delta_files: {
-            ...PATHS,
-            description:
-                'In delta mode, every path `git diff --name-only --no-renames <since> <head>` ' +
-                'prints; empty otherwise.',
-        },
-        delta_file_count: {
-            type: 'integer',
-            description: 'In delta mode, the number that list holds (`wc -l`); 0 otherwise.',
-        },
-        claimed_fixes: {
-            type: 'array',
-            items: {
-                type: 'object',
-                required: ['file', 'line', 'summary', 'pr'],
-                properties: {
-                    file: { type: 'string', description: PATH_DESCRIPTION },
-                    line: { type: 'integer', description: '0 when unknown.' },
-                    summary: { type: 'string' },
-                    pr: { type: 'integer', description: 'The PR that claims it; 0 when none.' },
-                },
-            },
-        },
-        prior_known: {
-            type: 'array',
-            description:
-                'Every entry of a `recorded` list in this release\'s saved records whose ' +
-                '`disposition` is `known issue`, as its `issue` and `claim`.',
-            items: {
-                type: 'object',
-                required: ['issue', 'claim'],
-                properties: { issue: { type: 'integer' }, claim: { type: 'string' } },
-            },
-        },
-        since_record: {
-            type: 'boolean',
-            description:
-                'In delta mode, one of this release\'s saved records has `stats.head` equal to ' +
-                '`since`; true when no `since` was given.',
-        },
-        prior_findings: {
-            type: 'array',
-            description:
-                'In delta mode, every entry of the `findings` list of this release\'s saved ' +
-                'record whose `stats.head` is `since` (resolved to its full SHA) and whose ' +
-                '`status` is not `contested`, with its fields as saved; empty otherwise.',
-            items: {
-                type: 'object',
-                required: [
-                    'file', 'line', 'bucket', 'class', 'must_violation', 'issue', 'authority',
-                    'claim', 'evidence', 'fix',
-                ],
-                properties: {
-                    file: { type: 'string', description: PATH_DESCRIPTION },
-                    line: { type: 'integer' },
-                    bucket: { enum: ['critical', 'should', 'nit'] },
-                    class: {
-                        enum: [
-                            'correctness', 'safety', 'contract', 'standards', 'doc-drift',
-                            'coverage', 'style',
-                        ],
-                    },
-                    must_violation: { type: 'boolean' },
-                    issue: { type: 'integer' },
-                    prs: { type: 'array', items: { type: 'integer' } },
-                    authority: { type: 'string' },
-                    claim: { type: 'string' },
-                    evidence: { type: 'string' },
-                    fix: { type: 'string' },
-                },
-            },
-        },
     },
 }
 
 const FINDING_SCHEMA = {
     type: 'object',
     required: [
-        'file', 'line', 'bucket', 'class', 'must_violation', 'ledger', 'issue', 'prs', 'authority',
-        'claim', 'evidence', 'fix',
+        'file', 'line', 'ledger', 'issue', 'prs', 'authority', 'claim', 'evidence', 'fix',
     ],
     properties: {
         file: { type: 'string', description: PATH_DESCRIPTION },
-        line: { type: 'integer', description: '1-based line at the head the finding anchors to.' },
-        bucket: {
-            enum: ['critical', 'should', 'nit'],
-            description:
-                'Severity as you judge it; which findings block the release is decided by class, ' +
-                'MUST flag, and the anchor file, not by the bucket.',
-        },
-        class: { enum: [...BLOCKING_CLASSES, ...OTHER_CLASSES] },
-        must_violation: {
-            type: 'boolean',
-            description: 'It names a MUST violation of a binding standard.',
-        },
+        line: { type: 'integer', description: '1-based line at the head the defect anchors to.' },
         ledger: {
             type: 'boolean',
             description:
-                'A ledger entry already states this finding, and the hunk it anchors to is ' +
+                'A ledger entry already states this defect, and the hunk it anchors to is ' +
                 'unchanged since the run the entry names (false when that hunk changed or that ' +
                 'run does not resolve in the clone).',
         },
         issue: {
             type: 'integer',
             description:
-                'The open Issue that already names this work, when one does (0 otherwise). A ' +
-                'follow-up Issue (title `<scope>: defects found by review`, or one beginning ' +
-                '`<scope>: defects found by PR #<N>\'s review`) names findings, not work: never ' +
-                'name one here.',
+                'The open Issue that already names this defect, when one does (0 otherwise): ' +
+                'its body states it, it is an item of a rolling Issue, or an Issue comment ' +
+                'lists it.',
         },
         prs: {
             type: 'array',
             items: { type: 'integer' },
             description: 'The PRs of the range whose changes make up the defect (empty when none).',
         },
-        authority: { type: 'string', description: 'Doc path and section, or contract location.' },
+        authority: {
+            type: 'string',
+            description: 'The contract, document section, or behaviour the location breaks.',
+        },
         claim: { type: 'string' },
         evidence: { type: 'string', description: 'Cites file:line.' },
         fix: { type: 'string' },
@@ -382,18 +272,14 @@ const FINDINGS_SCHEMA = {
 
 const VERDICT_SCHEMA = {
     type: 'object',
-    required: ['refuted', 'issue_refuted', 'names_issue', 'confidence', 'evidence'],
+    required: ['refuted', 'predates', 'confidence', 'evidence'],
     properties: {
         refuted: { type: 'boolean' },
-        issue_refuted: {
+        predates: {
             type: 'boolean',
-            description: 'The named open Issue does not name this work (false when none is named).',
-        },
-        names_issue: {
-            type: 'integer',
             description:
-                'For a carried finding the prompt asks about: the open Issue that names this ' +
-                'work, else 0. Always 0 when the prompt does not ask.',
+                'The defect was already present at the previous release. Always false when ' +
+                'the prompt does not ask.',
         },
         confidence: { enum: ['high', 'medium', 'low'] },
         evidence: { type: 'string' },
@@ -513,10 +399,6 @@ function shards_of(files) {
 
 const bullets = (items, render) => (items.length ? items.map(render).join('\n') : '- (none)')
 const short = (sha) => sha.slice(0, 8)
-const fix_line = (c) =>
-    '- ' + c.file + (c.line > 0 ? ':' + c.line : '') + ' — ' + c.summary +
-    (c.pr ? ' (PR #' + c.pr + ')' : '')
-const doc_line = (d) => '- ' + d
 
 // ─── Phase: Scope ───
 
@@ -524,8 +406,7 @@ phase('Scope')
 
 const SCOPE_PROMPT = [
     'Scope the release candidate for ' + TAG + ': the range from the previous release `' + FROM +
-        '` to the checked-out head.' +
-        (DELTA ? ' Re-review: the last run reviewed head ' + SINCE + '.' : ''),
+        '` to the checked-out head.',
     '',
     'Run, at the working tree root: `git rev-parse --show-toplevel`, `git rev-parse HEAD` (the ' +
         'head), `git status --porcelain`, `git rev-parse ' + FROM + '^{commit}` (from_sha), ' +
@@ -538,48 +419,19 @@ const SCOPE_PROMPT = [
         '`[workspace.package] version` from `git show <head>:Cargo.toml` and `git show ' +
         '<from_sha>:Cargo.toml`. Run `gh api \'repos/{owner}/{repo}/milestones?state=open&' +
         'per_page=100\' --jq \'.[].title\'` and `gh issue list --state open --limit 500 --json ' +
-        'number,title`. List the saved review records with `ls -1 target/xtask/review/pr<N>/' +
-        '*-*.json` for each unit\'s PR number N and `ls -1 ' + RECORD_DIR + '/*-*.json`; a ' +
-        'directory or pattern that matches nothing lists nothing, which is not an error. Take ' +
-        'every list from the local tree: never `gh pr diff` or the `files` field of `gh pr ' +
-        'view`, which GitHub caps.' +
-        (DELTA
-            ? ' Then run `git cat-file -e ' + SINCE + '^{commit}`, `git diff --name-only ' +
-                '--no-renames ' + SINCE + ' <head>` (the delta files; count with `wc -l`), and ' +
-                '`git log --first-parent --format=%H ' + SINCE + '..<head>`; for each of those ' +
-                'units read its PR body (`gh pr view <N> --json body`) and commit messages (`git ' +
-                'log --format=%B <sha>^1..<sha>`) for the fixes they claim.'
-            : ''),
+        'number,title`. Take every list from the local tree: never `gh pr diff` or the `files` ' +
+        'field of `gh pr view`, which GitHub caps.',
     '',
     'Return, per the schema, every path repository-relative exactly as git prints it, every ' +
         'list complete however long:',
     '- head, from_sha, repo_root; tree_at_head: the status printed nothing; from_ancestor: the ' +
-        'ancestry check exited 0; since_reachable: ' +
-        (DELTA ? 'whether ' + SINCE + ' resolves to a commit.' : 'true (no `since` given).'),
+        'ancestry check exited 0.',
     '- range_files: one entry per range path with changed = added plus deleted lines, at_head, ' +
         'and kind = code (Rust, assembly, linker scripts, build inputs, anything a build ' +
         'embeds), markdown, rules (under `.claude/` or `.github/`), or other; range_file_count.',
     '- units: one per first-parent commit, with its PR number (0 when its subject is not ' +
         '`Merge pull request #N ...`), title, files, and file_count.',
     '- version_at_head, version_at_from, milestones (every open milestone title), open_issues.',
-    '- ledger_records: every path the `ls` commands printed.',
-    '- delta_files and delta_file_count: ' +
-        (DELTA ? 'the delta list and its count.' : 'an empty list and 0.'),
-    '- claimed_fixes: ' +
-        (DELTA
-            ? 'every fix the PR bodies and commit messages since ' + SINCE + ' claim, as file, ' +
-                'line (0 when unknown), a one-line summary, and the PR.'
-            : 'an empty array.'),
-    '- prior_known: every known-issue entry of this release\'s saved records: `jq -c ' +
-        '\'(.recorded // [])[] | select(.disposition == "known issue") | {issue, claim}\' ' +
-        RECORD_DIR + '/*-*.json` (none when no record exists).',
-    '- prior_findings: ' +
-        (DELTA
-            ? 'the findings the last run left standing: `jq -c --arg h "$(git rev-parse ' +
-                SINCE + ')" \'select(.stats.head == $h) | (.findings // [])[] | ' +
-                'select(.status != "contested")\' ' + RECORD_DIR + '/*-*.json`, each with ' +
-                'its fields as saved; since_record: whether any record matched `$h` at all.'
-            : 'an empty array; since_record: true.'),
     '',
     'Only scope; do not review. Structured output only.',
 ].join('\n')
@@ -591,17 +443,6 @@ if (!scope) return { error: 'Scope agent returned no result; nothing was reviewe
 if (!scope.tree_at_head) return { error: 'The working tree at ' + scope.head + ' is not clean.' }
 if (!scope.from_ancestor) {
     return { error: FROM + ' (' + scope.from_sha + ') is not an ancestor of ' + scope.head }
-}
-if (DELTA && !scope.since_reachable) {
-    return { error: 'since ' + SINCE + ' does not resolve in this clone; run mode full.' }
-}
-// A delta run carries the last run's standing findings forward; without that
-// run's record it could not, and an unfixed blocker would vanish.
-if (DELTA && MODE !== 'scope' && !scope.since_record) {
-    return {
-        error: 'no saved record under ' + RECORD_DIR + ' reviewed head ' + SINCE +
-            '; save that run\'s record, or run mode full.',
-    }
 }
 
 // The current milestone is the lowest-versioned open one (docs/conventions.md
@@ -632,10 +473,6 @@ const normalize = (p) => {
 }
 for (const f of scope.range_files) f.path = normalize(f.path)
 for (const u of scope.units) u.files = u.files.map(normalize)
-for (const c of scope.claimed_fixes) c.file = normalize(c.file)
-for (const f of scope.prior_findings) f.file = normalize(f.file)
-scope.ledger_records = scope.ledger_records.map(normalize)
-const delta_paths = new Set(scope.delta_files.map(normalize))
 
 // Count checks: a short list would leave files unreviewed or the shard rule
 // misapplied, so every list must hold exactly the count read from the local diff.
@@ -657,19 +494,100 @@ for (const u of scope.units) {
         }
     }
 }
-if (DELTA && (delta_paths.size !== scope.delta_file_count)) {
-    return {
-        error: 'scope returned ' + delta_paths.size + ' delta files for a delta of ' +
-            scope.delta_file_count + ' files',
-    }
-}
 
 const unit_label = (u) => (u.pr ? '#' + u.pr : short(u.sha))
 const unit_line = (u) => '- ' + unit_label(u) + ' (merge ' + short(u.sha) + ') ' + u.title
+const bumped = scope.version_at_head === VERSION
+const issue_title = (n) => (scope.open_issues.find((i) => i.number === n) || {}).title || ''
+const open_issue_numbers = new Set(scope.open_issues.map((i) => i.number))
 
-// The shard rule: a file is reviewed line by line only when two or more units
-// of the range touched it. The units of a file are the first-parent commits
-// whose own diff (`<sha>^1..<sha>`) names it.
+// ─── The audit (every mode but scope) ───
+
+// The known-issue candidates: in a full run, the defects an open Issue names
+// (a defect that predates the range has no Issue yet, so it is not one); in
+// audit mode, the Known Issues the release notes at the head list, which
+// record the maintainer's decision on the full run's list.
+const audit_prompt = (candidates) => [
+    'Release audit for ' + TAG + ' (mode ' + MODE + '): previous release ' + FROM + ' (' +
+        scope.from_sha + '), candidate head ' + scope.head + '.',
+    'Workspace version at the head ' + scope.version_at_head + ', at the previous release ' +
+        scope.version_at_from + '; the head ' + (bumped ? 'carries' : 'predates') +
+        ' the bump to ' + VERSION + '.',
+    'Release host-run report: ' + (HOST_RUNS ? '`' + HOST_RUNS + '`.' : 'none given.'),
+    MODE === 'audit'
+        ? 'Known-issue candidates: the entries of the Known Issues section of ' +
+            '`docs/releases/' + TAG + '.md` at the head, which records the maintainer\'s ' +
+            'decision on the release review\'s list.'
+        : 'Known-issue candidates of the review (an open Issue names each defect):\n' +
+            bullets(candidates, (k) => '- #' + k.number + ': ' + k.summary),
+    'Units of the range:',
+    bullets(scope.units, unit_line),
+    '',
+    'Run your audit per your brief, every section, and fill the structured schema. Structured ' +
+        'output only.',
+].join('\n')
+
+async function run_audit(candidates) {
+    const result = await run(audit_prompt(candidates), {
+        agentType: AUDITOR, label: 'audit', phase: 'Audit', schema: AUDIT_SCHEMA,
+    }).catch(() => null)
+    if (!result) {
+        failed_other.push('audit')
+        log('audit: no result (agent failed or was stopped)')
+    } else {
+        log('audit: ' + result.verdict)
+    }
+    return result
+}
+
+function audit_outcome(audit) {
+    const present = (name) =>
+        audit.sections.some((s) => s.name.toLowerCase().includes(name.toLowerCase()))
+    const missing = audit ? AUDIT_SECTION_NAMES.filter((n) => !present(n)) : []
+    const failed =
+        !audit || missing.length > 0 || audit.verdict === 'AUDIT FAIL' ||
+        audit.sections.some((s) => s.verdict === 'FAIL')
+    const notes = []
+    if (!audit) notes.push('The auditor returned no result; treated as AUDIT FAIL.')
+    if (missing.length) {
+        notes.push('The audit lacks the sections ' + missing.join(', ') +
+            '; treated as AUDIT FAIL.')
+    }
+    return { failed, verdict: failed ? 'AUDIT FAIL' : 'AUDIT PASS', notes }
+}
+
+if (MODE === 'audit') {
+    phase('Audit')
+    const audit = await run_audit([])
+    const outcome = audit_outcome(audit)
+    const verdict = outcome.failed ? 'RELEASE BLOCKED' : 'RELEASE READY'
+    const sections = audit
+        ? audit.sections.map((s) => '## ' + s.name + ': ' + s.verdict + '\n\n' +
+            bullets(s.items, (i) => '- ' + i)).join('\n\n')
+        : '(no audit result)'
+    const notes = outcome.notes.length ? '\n' + outcome.notes.join('\n') + '\n' : ''
+    return {
+        verdict,
+        audit_verdict: outcome.verdict,
+        report: '# Release audit: ' + TAG + '\n\n' + sections + '\n\n' + verdict + '\n' +
+            outcome.verdict + '\n' + notes,
+        audit,
+        stats: {
+            mode: MODE, version: VERSION, from: FROM, from_sha: scope.from_sha, head: scope.head,
+            bumped, agents: agent_calls, failed: [...failed_other],
+        },
+    }
+}
+
+// ─── Plan ───
+
+// The shard rule: a code file is reviewed line by line only when two or more
+// units of the range touched it. The units of a file are the first-parent
+// commits whose own diff (`<sha>^1..<sha>`) names it. A Markdown file, a
+// document or an instruction file under `.claude/` or `.github/`, is read by
+// the documents lens instead; a rules file that is not Markdown (a CI
+// workflow, this script, the settings) is code and is sharded.
+const is_document = (f) => f.path.toLowerCase().endsWith('.md')
 const touched_by = new Map()
 for (const u of scope.units) {
     for (const p of u.files) {
@@ -678,120 +596,63 @@ for (const u of scope.units) {
     }
 }
 const multi = [...touched_by.entries()].filter(([, us]) => us.length >= 2).map(([p]) => p)
-const skipped = { absent: [], unchanged: [], generated: [], outside_delta: [] }
+const skipped = { absent: [], unchanged: [], generated: [], document: [] }
 const shard_files = []
 for (const p of multi) {
     const f = scope.range_files.find((r) => r.path === p)
     if (!f) skipped.unchanged.push(p)
     else if (!f.at_head) skipped.absent.push(p)
     else if (SKIPPED_FILES.includes(p.split('/').pop())) skipped.generated.push(p)
-    else if (DELTA && !delta_paths.has(p)) skipped.outside_delta.push(p)
+    else if (is_document(f)) skipped.document.push(p)
     else shard_files.push({ ...f, units: touched_by.get(p) })
 }
 for (const [why, list] of Object.entries(skipped)) {
-    if (list.length) log('multi-PR files not sharded (' + why + '): ' + list.join(', '))
+    if (list.length) log('multi-PR files not sharded (' + why + '): ' + list.length)
 }
 const shards = shards_of(shard_files)
 
-// The range the lenses read: the whole candidate, or in delta mode the delta.
-const LENS_FROM = DELTA ? SINCE : scope.from_sha
-const lens_paths = DELTA
-    ? scope.range_files.filter((f) => delta_paths.has(f.path))
-    : scope.range_files
-const lens_has_code = lens_paths.some((f) => f.kind === 'code')
-// The documents the documentation hierarchy holds (docs/documentation-standards.md
-// § Document Hierarchy): Markdown outside `.claude/` and `.github/`, and not a
-// per-tag release record or the template, which that standard's release-notes
-// exception sets apart.
-const in_hierarchy = (p) =>
-    p.endsWith('.md') && !p.startsWith('.claude/') && !p.startsWith('.github/') &&
-    !(p.startsWith('docs/releases/') && p !== 'docs/releases/README.md')
-const design_docs = lens_paths.filter((f) => f.at_head && in_hierarchy(f.path)).map((f) => f.path)
-const bumped = scope.version_at_head === VERSION
-const sharded_paths = new Set(shard_files.map((f) => f.path))
-const unmatched_fixes = scope.claimed_fixes.filter((c) => !sharded_paths.has(c.file))
-
-log(
-    TAG + ' ' + MODE + ': ' + scope.units.length + ' units, ' + scope.range_files.length +
-        ' range files, ' + multi.length + ' touched by two or more PRs, ' + shard_files.length +
-        ' sharded into ' + shards.length + ' shards, ' + design_docs.length + ' design docs, ' +
-        scope.ledger_records.length + ' ledger records; head ' +
-        (bumped ? 'carries' : 'predates') + ' the bump to ' + VERSION +
-        (DELTA ? '; ' + delta_paths.size + ' delta files, ' + scope.claimed_fixes.length +
-            ' claimed fixes' : ''),
-)
+const lens_has_code = scope.range_files.some((f) => f.kind === 'code')
+const documents = scope.range_files.filter((f) => f.at_head && is_document(f)).map((f) => f.path)
 
 // ─── Prompts ───
 
 const HEAD_LINE =
-    'Scope: release candidate ' + TAG + ', mode ' + MODE + '. The range runs from the previous ' +
-    'release ' + FROM + ' (' + scope.from_sha + ') to the head ' + scope.head + ', at which the ' +
-    'working tree is checked out; `git diff ' + scope.from_sha + ' ' + scope.head + '` is the ' +
-    'range diff, and a PR\'s own change is `git diff <merge>^1 <merge>` (never `gh pr diff`, ' +
-    'which GitHub caps). Every PR of the range passed its own pre-merge review; this review ' +
-    'looks for what no single PR\'s review could see.' +
-    (DELTA
-        ? ' Re-review: the last run reviewed head ' + SINCE + '; `git diff ' + SINCE + ' ' +
-            scope.head + '` is the delta, made of the PRs merged since then, which claim fixes ' +
-            'for that run\'s findings.'
-        : '')
+    'Scope: release candidate ' + TAG + '. The range runs from the previous release ' + FROM +
+    ' (' + scope.from_sha + ') to the head ' + scope.head + ', at which the working tree is ' +
+    'checked out; `git diff ' + scope.from_sha + ' ' + scope.head + '` is the range diff, and a ' +
+    'PR\'s own change is `git diff <merge>^1 <merge>` (never `gh pr diff`, which GitHub caps). ' +
+    'Every PR of the range passed its own pre-merge review; this review looks for what no ' +
+    'single PR\'s review could see. Report defects only (docs/conventions.md § Findings): ' +
+    'wrong or unsafe behaviour, a broken contract between components, or a document statement ' +
+    'that would make its reader write wrong code. Report nothing else.'
 
-// Work an open Issue already names does not block the release: such a finding
-// is a known-issue candidate. A follow-up Issue holds findings, not work.
 const ISSUES_BLOCK = [
-    'Open Issues (set `issue` on a finding whose work one of them already names, reading the ' +
-        'Issue body when its title matches the area; 0 otherwise). A follow-up Issue (title ' +
-        '`<scope>: defects found by review`, or beginning `<scope>: defects found by PR ' +
-        '#<N>\'s review`) names findings, not work: never set `issue` to one.',
+    'Open Issues. Set `issue` on a defect one of them already names: its body states it, it ' +
+        'is an item of a rolling Issue (title `<scope>: defects found by review`), or a ' +
+        'comment on the Issue lists it. Read the body and comments of any Issue whose title ' +
+        'matches the area; 0 otherwise.',
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')
 
-// The ledger filter of `cargo xtask review-ledger` (xtask/README.md), guarded
-// for records that lack a key, run over every saved record of the range's PRs
-// and of this release's earlier runs.
-const LEDGER_FILTER =
-    '[.[] | .stats.head[0:8] as $run | (((.recorded // []) + (.dropped // []) + ' +
-    '[(.findings // [])[] | select(.status == "contested")] + (if .verdict == ' +
-    '"NON-BLOCKING ISSUES ONLY" then (.findings // []) else [] end))[] | {run: $run, file, ' +
-    'line, class, bucket, must_violation, status, issue, claim, fix})] | unique'
-const LEDGER_FILES = scope.ledger_records.join(' ')
-
-// A delta run's carried findings are judged again by their own refuters; the
-// reviewers are told of them so they do not report them a second time.
-const carried_note = (paths) => {
-    const list = paths
-        ? scope.prior_findings.filter((f) => paths.includes(f.file))
-        : scope.prior_findings
-    return list.length
-        ? '\nCarried from the run at ' + SINCE + ' and judged again by refuters of their own; ' +
-            'do not report these again, even where a fix claimed for one was not made, but ' +
-            'report any other defect beside them:\n' +
-            bullets(list, (f) => '- ' + f.file + ':' + f.line + ' (' + f.class + ') ' + f.claim)
-        : null
-}
+const LEDGER_COMMAND = 'cargo xtask review-ledger --release ' + VERSION + ' --from ' + FROM
 
 const ledger_note = (paths) =>
-    scope.ledger_records.length === 0
-        ? '\nLedger: no saved run record exists for the range; set `ledger` false on every finding.'
-        : '\nLedger: the findings the PRs\' own reviews and this release\'s earlier runs ' +
-            'recorded or dropped, or that were contested (status contested), each with the head ' +
-            'of the run that reported it. ' +
-            (paths
-                ? 'Read the entries for your files: `jq -s \'' + LEDGER_FILTER + ' | map(select(' +
-                    paths.map((p) => '.file == "' + p + '"').join(' or ') + '))\' ' +
-                    LEDGER_FILES + '`. '
-                : 'Read the entries for the files you report on: `jq -s \'' + LEDGER_FILTER +
-                    ' | map(select(.file == "<path>"))\' ' + LEDGER_FILES + '`. ') +
-            'Report a finding an entry already states with `ledger` true when the hunk it ' +
-            'anchors to is unchanged since the run the entry names (`git diff <run> ' +
-            scope.head + ' -- <file>`); the workflow lists it and does not count it. Report it ' +
-            'with `ledger` false when that hunk changed, or when `<run>` does not resolve.'
+    '\nLedger: the findings the PRs\' own reviews and this release\'s earlier runs recorded or ' +
+    'dropped, or that a decision settled, each with the head of the run that reported it. ' +
+    (paths
+        ? 'Read the entries for your files: `' + LEDGER_COMMAND + ' ' +
+            paths.map((p) => '--file ' + p).join(' ') + '`. '
+        : 'Read the entries for the files you report on: `' + LEDGER_COMMAND +
+            ' --file <path>`. ') +
+    'Report a defect an entry already states with `ledger` true when the hunk it anchors to ' +
+    'is unchanged since the run the entry names (`git diff <run> ' + scope.head + ' -- ' +
+    '<file>`); the workflow lists it and does not count it. Report it with `ledger` false when ' +
+    'that hunk changed, or when `<run>` does not resolve.'
 
 function shard_prompt(shard) {
     const units = []
     for (const f of shard.files) for (const u of f.units) if (!units.includes(u)) units.push(u)
     const paths = shard.files.map((f) => f.path)
-    const fixes = scope.claimed_fixes.filter((c) => paths.includes(c.file))
     return [
         HEAD_LINE,
         '',
@@ -801,10 +662,10 @@ function shard_prompt(shard) {
             'the head and each PR\'s own change to it, and apply your brief (steps 3 to 7) to ' +
             'the file as the range left it. Look first for composition defects: one PR\'s ' +
             'change breaking an assumption another relies on, a later change leaving an ' +
-            'earlier one\'s comment, test, or invariant stale, definitions duplicated or in ' +
-            'conflict, and a lock, ordering, or state rule two changes apply differently. ' +
-            'Report every correctness, safety, or contract defect in the file too, and name in ' +
-            '`prs` the PRs whose changes make up each finding.',
+            'earlier one\'s invariant or documented contract untrue, definitions in conflict, ' +
+            'and a lock, ordering, or state rule two changes apply differently. Report every ' +
+            'other defect in the file too, and name in `prs` the PRs whose changes make up ' +
+            'each one.',
         bullets(shard.files, (f) =>
             '- ' + f.path + ' (' + f.changed + ' changed lines in the range; ' +
                 f.units.map(unit_label).join(', ') + ')'),
@@ -814,20 +675,14 @@ function shard_prompt(shard) {
         '',
         ISSUES_BLOCK,
         ledger_note(paths),
-        carried_note(paths),
-        DELTA
-            ? '\nClaimed fixes for your files, each to be verified against the code; report a ' +
-                'claimed fix not actually made as a contract finding at its location:\n' +
-                bullets(fixes, fix_line)
-            : null,
         '',
         'Other files belong to other reviewers: read them as callers or dependencies, and ' +
             'report on them only where such a read finds a defect.',
-        'Fill the structured schema: one entry per finding. Structured output only.',
-    ].filter((line) => line !== null).join('\n')
+        'Fill the structured schema: one entry per defect. Structured output only.',
+    ].join('\n')
 }
 
-const RANGE = '`git diff ' + LENS_FROM + ' ' + scope.head + '`'
+const RANGE = '`git diff ' + scope.from_sha + ' ' + scope.head + '`'
 const lenses = []
 
 if (lens_has_code) {
@@ -849,34 +704,26 @@ if (lens_has_code) {
     })
 }
 
-// One lens agent per MAX_LENS_DOCS documents, so no agent holds every touched
-// document at once. Each agent reads its documents once for both concerns:
-// their whole text against the code, and their `## Summarized By` lists.
-const doc_lens_count = Math.ceil(design_docs.length / MAX_LENS_DOCS)
-for (let start = 0; start < design_docs.length; start += MAX_LENS_DOCS) {
-    const docs = design_docs.slice(start, start + MAX_LENS_DOCS)
-    const index = start / MAX_LENS_DOCS + 1
-    const part = doc_lens_count > 1 ? ' (documents ' + index + ' of ' + doc_lens_count + ')' : ''
+// One lens over every document and instruction file the range touched, in
+// place of line-by-line shards of them: it reads the range's change to each
+// and reports only a statement that would make its reader write wrong code.
+if (documents.length) {
     lenses.push({
-        name: 'design-docs' + (doc_lens_count > 1 ? '#' + index : ''),
+        name: 'documents',
         body: () => [
-            'Lens: the documents ' + RANGE + ' touched' + part + ', each read in full, for two ' +
-                'concerns.',
-            'Whole-document truth: check every statement of fact, not only the hunks the range ' +
-                'changed, against the code at the head (docs/documentation-standards.md § Design ' +
-                'Intent: an unmarked statement of behaviour MUST match the code). Report each ' +
-                'statement the code contradicts, each pair of statements two PRs of the range ' +
-                'left in conflict, and each cross-reference that no longer resolves.',
-            '`## Summarized By` integrity: apply docs/documentation-standards.md § Backlinks and ' +
-                'Change Propagation and § Authority and Duplication to each document the ' +
-                'standard makes authoritative: every document its list names still summarizes ' +
-                'it, every tracked document that summarizes it is listed, and every such summary ' +
-                'states what the document states at the head. Report a missing or stale entry at ' +
-                'the list and a stale summary at the summary.',
-            'Cite the document path and section.',
+            'Lens: the documents and instruction files ' + RANGE + ' touched, read through the ' +
+                'range\'s change to each (`git diff ' + scope.from_sha + ' ' + scope.head +
+                ' -- <path>`) and the sections around it.',
+            'Report a statement the range added or left standing that the code at the head ' +
+                'contradicts and that would make its reader write wrong code (a syscall, ABI, ' +
+                'IPC, command-line, or safety contract; a rule an instruction file states that ' +
+                'its owning document contradicts), and a pair of statements two PRs of the ' +
+                'range left in conflict on such a point. Do not report wording, layout, ' +
+                '`## Summarized By` lists, or a statement that is merely incomplete; ' +
+                '`cargo xtask lint-docs` checks what a script can decide.',
             '',
             'Documents:',
-            bullets(docs, doc_line),
+            bullets(documents, (d) => '- ' + d),
         ],
     })
 }
@@ -887,22 +734,10 @@ if (lens_has_code) {
         body: () => [
             'Lens: `unsafe` code over ' + RANGE + '.',
             'Find every `unsafe` block, `unsafe fn`, `unsafe impl`, and `unsafe extern` the ' +
-                'range adds or changes. For each, check it against docs/coding-standards.md ' +
-                '§ Unsafe Code: its safety comment states the invariants the operation needs, ' +
-                'and the code and every caller uphold them at the head, including where another ' +
-                'PR of the range changed a caller, a lock, a lifetime, or a layout the comment ' +
-                'relies on.',
-        ],
-    })
-    lenses.push({
-        name: 'coverage',
-        body: () => [
-            'Lens: test coverage of new interfaces over ' + RANGE + '.',
-            'List every syscall, syscall flag or argument, IPC label, and protocol message the ' +
-                'range adds or whose contract it changes. For each, find the test that exercises ' +
-                'it, per docs/coding-standards.md § D. Testing Invariants and docs/testing.md. ' +
-                'Report, class coverage, each one whose success path or a documented error path ' +
-                'no test exercises, anchored at its definition.',
+                'range adds or changes. For each, check that the invariants the operation ' +
+                'needs hold at the head, at the site and at every caller, including where ' +
+                'another PR of the range changed a caller, a lock, a lifetime, or a layout the ' +
+                'safety comment relies on (docs/coding-standards.md § Unsafe Code).',
         ],
     })
     lenses.push({
@@ -910,70 +745,24 @@ if (lens_has_code) {
         body: () => [
             'Lens: the catalogues against the code over ' + RANGE + '.',
             'Read docs/limits.md and docs/platform-requirements.md in full. Report every bound ' +
-                'the range adds or changes that docs/limits.md does not catalogue, or catalogues ' +
-                'with a stale value or location, and every CPU or platform feature the range ' +
-                'starts or stops requiring or using that docs/platform-requirements.md does not ' +
-                'state as the code now stands.',
-        ],
-    })
-}
-
-if (DELTA) {
-    lenses.push({
-        name: 'regression',
-        body: () => [
-            'Lens: correctness only, over the delta `git diff ' + SINCE + ' ' + scope.head + '`.',
-            'The fixes since ' + SINCE + ' may have introduced a defect. Read the delta with ' +
-                'its surrounding code and report logic errors, unsoundness, memory or ' +
-                'concurrency defects, resource leaks, and broken contracts. Do not report ' +
-                'style, naming, or documentation.',
-            '',
-            'Claimed fixes outside the sharded files. Verify each against the code and report ' +
-                'every fix not actually made as a contract finding at the claimed location:',
-            bullets(unmatched_fixes, fix_line),
+                'the range adds or changes that docs/limits.md states with a value or location ' +
+                'the code contradicts, and every CPU or platform feature the range starts or ' +
+                'stops requiring that docs/platform-requirements.md states otherwise.',
         ],
     })
 }
 
 const lens_prompt = (lens) =>
     [
-        HEAD_LINE, '', ...lens.body(), '', ISSUES_BLOCK, ledger_note(null), carried_note(null),
-        '',
-        'Fill the structured schema; name in `prs` the PRs whose changes make up each finding. ' +
-            'Structured output only.',
-    ]
-        .filter((line) => line !== null)
-        .join('\n')
+        HEAD_LINE, '', ...lens.body(), '', ISSUES_BLOCK, ledger_note(null), '',
+        'Fill the structured schema: one entry per defect; name in `prs` the PRs whose changes ' +
+            'make up each one. Structured output only.',
+    ].join('\n')
 
-// The audit runs after Verify, so its known-issue list can take the review's
-// known-issue candidates: the findings on the blocking track an open Issue
-// names, from this run and, while their Issue is open, from the release's
-// earlier runs.
-const audit_prompt = (candidates) => [
-    'Release audit for ' + TAG + ' (mode ' + MODE + '): previous release ' + FROM + ' (' +
-        scope.from_sha + '), candidate head ' + scope.head + '.',
-    'Workspace version at the head ' + scope.version_at_head + ', at the previous release ' +
-        scope.version_at_from + '; the head ' + (bumped ? 'carries' : 'predates') +
-        ' the bump to ' + VERSION + '.',
-    'Release host-run report: ' + (HOST_RUNS ? '`' + HOST_RUNS + '`.' : 'none given.'),
-    'Known-issue candidates of the review (an open Issue names each finding\'s work):',
-    bullets(candidates, (k) => '- #' + k.number + ': ' + k.summary),
-    'Units of the range:',
-    bullets(scope.units, unit_line),
-    '',
-    'Run your audit per your brief, every section, and fill the structured schema. Structured ' +
-        'output only.',
-].join('\n')
-
-// An earlier run's known issue stays a candidate only while its Issue is open;
-// the audit then confirms that its defect is still present at the head.
-const prior_candidates = []
-for (const k of scope.prior_known) {
-    const open = scope.open_issues.some((i) => i.number === k.issue)
-    if (open && !prior_candidates.some((e) => e.number === k.issue)) {
-        prior_candidates.push({ number: k.issue, summary: k.claim })
-    }
-}
+// The agents the run makes before Verify, and after it; Verify adds two per
+// defect that can block, which no plan can know.
+const review_agents = shards.length + lenses.length
+const fixed_agents = 1 + review_agents + AFTER_VERIFY
 
 const plan = {
     units: scope.units.length,
@@ -987,13 +776,20 @@ const plan = {
         })),
     })),
     lenses: lenses.map((l) => l.name),
-    design_docs,
-    ledger_records: scope.ledger_records.length,
-    carried_findings: scope.prior_findings.length,
+    documents: documents.length,
     bumped,
-    review_agents: shards.length + lenses.length,
-    audit_agents: 1,
+    review_agents,
+    agents_without_verify: fixed_agents,
+    verify_agents_per_defect: VERIFY_LENSES.length,
+    max_agents: MAX_AGENTS,
 }
+
+log(
+    TAG + ' ' + MODE + ': ' + scope.units.length + ' units, ' + scope.range_files.length +
+        ' range files, ' + shard_files.length + ' multi-PR code files in ' + shards.length +
+        ' shards, ' + lenses.length + ' lenses; ' + fixed_agents + ' agents before ' +
+        'verification, 2 per defect that can block, ceiling ' + MAX_AGENTS,
+)
 
 if (MODE === 'scope') {
     return {
@@ -1002,35 +798,34 @@ if (MODE === 'scope') {
         sample_prompts: {
             shard: shards.length ? shard_prompt(shards[0]) : null,
             lens: lenses.length ? lens_prompt(lenses[0]) : null,
-            audit: audit_prompt(prior_candidates),
+            audit: audit_prompt([]),
         },
     }
 }
 
-const issue_title = (n) => (scope.open_issues.find((i) => i.number === n) || {}).title || ''
-const open_issue_numbers = new Set(scope.open_issues.map((i) => i.number))
-const FOLLOW_UP = /^[^:]+: defects found by (?:review|PR #\d+'s review)/
+if (fixed_agents > MAX_AGENTS) {
+    return {
+        error: 'the run needs ' + fixed_agents + ' agents before verification, over the ' +
+            'ceiling of ' + MAX_AGENTS + '; ask the maintainer, then run with a higher ' +
+            'max_agents',
+        plan,
+    }
+}
 
 function verify_prompt(f, lens) {
     const finding = [
-        'Finding under test (release candidate ' + TAG + ', head ' + scope.head + '):',
+        'Defect under test (release candidate ' + TAG + ', head ' + scope.head + '):',
         '- location: ' + f.file + ':' + f.line,
-        '- class: ' + f.class + '; severity: ' + f.bucket,
         '- PRs: ' + (f.prs.length ? f.prs.map((n) => '#' + n).join(', ') : '(none named)'),
         '- claim: ' + f.claim,
         '- cited authority: ' + f.authority,
         '- evidence: ' + f.evidence,
         '- proposed fix: ' + f.fix,
-        f.issue ? '- named open Issue: #' + f.issue + ' ' + issue_title(f.issue) : null,
-        f.carried
-            ? '- carried: the run at ' + SINCE + ' reported it, and PRs merged since may have ' +
-                'fixed it or moved its line; refuted=true when the head no longer exhibits it.'
-            : null,
-    ].filter((line) => line !== null).join('\n')
+    ].join('\n')
     const tree =
         'The working tree is checked out at the head; `git diff ' + scope.from_sha + ' ' +
         scope.head + '` is the range diff. A defect may be in code or in a document; an absence ' +
-        '(a missing check, test, or statement) is exhibited by the place where it should be.'
+        '(a missing check or statement) is exhibited by the place where it should be.'
     if (lens === 'reality') {
         return [
             'You are an independent skeptic. Try to refute this review finding on the facts. ' +
@@ -1043,9 +838,11 @@ function verify_prompt(f, lens) {
                 'stated, that the code or document already handles the case, or that the ' +
                 'evidence does not support the claim. refuted=false when you can point to the ' +
                 'place that exhibits the defect, and also when you can neither confirm nor ' +
-                'refute it; say so, with confidence low. Evidence must cite file:line. Return ' +
-                'issue_refuted=false: whether a named Issue covers the work is the authority ' +
-                'refuter\'s judgement, and so is names_issue: return 0. Structured output only.',
+                'refute it; say so, with confidence low. Evidence must cite file:line. When the ' +
+                'defect stands, also judge whether it was already present at the previous ' +
+                'release ' + FROM + ': read the same place there (`git show ' + scope.from_sha +
+                ':<path>`) and set predates=true when it exhibits the same defect. ' +
+                'Structured output only.',
         ].join('\n')
     }
     return [
@@ -1055,27 +852,13 @@ function verify_prompt(f, lens) {
         finding,
         '',
         'Read the cited authority in full. refuted=true only with quoted evidence that the ' +
-            'authority does not say what the finding claims, that it is not binding here, or ' +
-            'that the location does not violate it as claimed. refuted=false when the authority ' +
-            'says what is claimed and the location violates it, when the authority is a ' +
-            'correctness contract the location breaks, and also when you can neither confirm ' +
-            'nor refute it; say so, with confidence low. ' +
-            (f.issue
-                ? 'The finding names an open Issue as already naming this work: read it (`gh ' +
-                    'issue view ' + f.issue + '`) and set issue_refuted=true when it does not ' +
-                    'name this work; that judgement is separate from refuted. '
-                : '') +
-            (f.carried && !f.issue
-                ? 'An earlier run reported this finding, and an Issue may have been filed for ' +
-                    'its work since: set names_issue to the open Issue below that names this ' +
-                    'work, reading the body of any whose title matches the area, or 0 when none ' +
-                    'does; a follow-up Issue (title `<scope>: defects found by review`, or ' +
-                    'beginning `<scope>: defects found by PR #<N>\'s review`) names findings, ' +
-                    'not work, and is never the answer. That judgement is separate from ' +
-                    'refuted.\n' + bullets(scope.open_issues, (i) => '- #' + i.number + ' ' +
-                    i.title) + '\n'
-                : 'Return names_issue=0. ') +
-            'Structured output only.',
+            'authority does not say what the finding claims, that it is not binding here, that ' +
+            'the location does not break it as claimed, or that what the finding describes is ' +
+            'not a defect (docs/conventions.md § Findings: wrong or unsafe behaviour, a broken ' +
+            'contract, or a document statement that would make its reader write wrong code). ' +
+            'refuted=false when the location breaks it, and also when you can neither confirm ' +
+            'nor refute it; say so, with confidence low. Return predates=false: that judgement ' +
+            'is the reality refuter\'s. Structured output only.',
     ].join('\n')
 }
 
@@ -1085,28 +868,32 @@ phase('Review')
 
 const seen = []
 const ledgered = []
+let ceiling_reached = false
+// The agents the run has committed to: every one the plan counts (scope, the
+// reviewers whether started or not, and those after Verify), and each pair of
+// refuters as it is granted, so the ceiling holds however the runtime orders
+// the reviewers and the refuters.
+let committed_agents = fixed_agents
 
-// A later finding from another agent on the same file, class, bucket, and
-// MUST-violation flag within DEDUP_LINE_SLACK lines is the same finding: the
-// nearest such record keeps its claim and evidence and absorbs the later one,
-// its PRs, and, before its verification starts, a later reporter's Issue. A
-// record absorbs at most one finding per agent, so one agent's own adjacent
-// findings stay distinct. A finding flagged as already in the ledger becomes a
-// `ledgered` record, or joins the ledgered record at its anchor: listed, never
-// verified or counted.
+// A later finding from another agent in the same file within DEDUP_LINE_SLACK
+// lines is the same defect: the nearest such record keeps its claim and
+// evidence and absorbs the later one, its PRs, and, before its verification
+// starts, a later reporter's Issue. A record absorbs at most one finding per
+// agent, so one agent's own adjacent findings stay distinct. A finding flagged
+// as already in the ledger becomes a `ledgered` record, or joins the ledgered
+// record at its anchor: listed, never verified or counted.
 const nearest = (list, f, source) =>
     list
         .filter(
             (s) =>
-                !s.sources.includes(source) && s.file === f.file && s.class === f.class &&
-                s.bucket === f.bucket && s.must_violation === f.must_violation &&
+                !s.sources.includes(source) && s.file === f.file &&
                 Math.abs(s.line - f.line) <= DEDUP_LINE_SLACK,
         )
         .sort((a, b) => Math.abs(a.line - f.line) - Math.abs(b.line - f.line))[0]
 
 const new_record = (f, source) => ({
     ...f, prs: [...new Set(f.prs)], sources: [source], duplicates: 0, status: 'pending',
-    votes: [], verify_started: false, annotations: [], verification: null,
+    predates: false, votes: [], verify_started: false, annotations: [], verification: null,
 })
 
 function absorb(dup, f, source) {
@@ -1131,11 +918,8 @@ function dedup(findings, source) {
         if (f.issue && !open_issue_numbers.has(f.issue)) {
             log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue + ', not open')
             f.issue = 0
-        } else if (f.issue && FOLLOW_UP.test(issue_title(f.issue))) {
-            log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue + ', a follow-up')
-            f.issue = 0
         }
-        if (f.ledger === true && scope.ledger_records.length) {
+        if (f.ledger === true) {
             const same = nearest(ledgered, f, source)
             if (same) absorb(same, f, source)
             else {
@@ -1146,11 +930,7 @@ function dedup(findings, source) {
             }
             continue
         }
-        // A carried record's refuters start before any reviewer reports, so a
-        // fresh finding beside it is never absorbed into it: it is verified on
-        // its own, and survives when the carried one is dropped as fixed.
-        const dup = nearest(
-            seen.filter((s) => s.status !== 'ledgered' && !s.carried), f, source)
+        const dup = nearest(seen.filter((s) => s.status !== 'ledgered'), f, source)
         if (dup) {
             absorb(dup, f, source)
             continue
@@ -1163,18 +943,26 @@ function dedup(findings, source) {
 }
 
 // Verification writes into the record itself, so annotations dedup adds later
-// still reach the report.
+// still reach the report. A defect an open Issue names cannot block and takes
+// no refuters; one the ceiling leaves no room for stays unverified.
 function verify_one(f) {
-    if (!verifiable(f)) {
-        f.status = 'nit'
+    if (f.issue) {
+        f.status = 'known'
         return Promise.resolve(f)
     }
     if (f.verification) return f.verification
+    if (committed_agents + VERIFY_LENSES.length > MAX_AGENTS) {
+        ceiling_reached = true
+        f.status = 'unverified'
+        f.annotations.push('not verified: the run reached its ceiling of ' + MAX_AGENTS)
+        return Promise.resolve(f)
+    }
+    committed_agents += VERIFY_LENSES.length
     f.verify_started = true
     f.verification = parallel(
         VERIFY_LENSES.map((lens) => () => {
             // The 1-based record index keeps the label unique when two records
-            // share a location (dedup keeps different buckets or flags apart).
+            // share a location.
             const index = seen.indexOf(f) + 1
             const label = 'verify:' + lens + ':' + f.file + ':' + f.line + '#' + index
             return run(verify_prompt(f, lens), {
@@ -1198,38 +986,12 @@ function verify_one(f) {
         else if (all_refute) f.status = 'dropped'
         else if (refutes > 0) f.status = 'contested'
         else f.status = 'confirmed'
-        if (f.issue && valid.some((v) => v.lens === 'authority' && v.issue_refuted)) {
-            f.annotations.push('#' + f.issue + ' does not name this work (authority refuter)')
-            f.issue = 0
-        } else if (f.issue && !valid.some((v) => v.lens === 'authority')) {
-            f.annotations.push('#' + f.issue + ' unjudged: authority refuter returned no result')
-        }
-        // A carried finding may since have an Issue that names its work.
-        const named = valid.find((v) => v.lens === 'authority' && v.names_issue > 0)
-        if (f.carried && !f.issue && named) {
-            const n = named.names_issue
-            if (open_issue_numbers.has(n) && !FOLLOW_UP.test(issue_title(n))) {
-                f.issue = n
-                f.annotations.push('#' + n + ' names this work (authority refuter)')
-            }
-        }
+        f.predates = valid.some((v) => v.lens === 'reality' && !v.refuted && v.predates)
         f.votes = valid
         return f
     })
     return f.verification
 }
-
-// A delta run carries forward the findings the last run left standing: each is
-// put to the refuters again as still present at the head, so a blocker that no
-// fix removed blocks again, and one the fixes removed is dropped.
-const CARRIED = 'carried:' + (SINCE ? SINCE.slice(0, 8) : '')
-const carried = dedup(
-    scope.prior_findings.map((f) => ({ ...f, prs: f.prs || [], ledger: false })),
-    CARRIED,
-)
-for (const f of carried) f.carried = true
-const carried_verified = parallel(carried.map((f) => () => verify_one(f)))
-if (carried.length) log(CARRIED + ': ' + carried.length + ' findings put to the refuters again')
 
 const review_items = [
     ...shards.map((s) => ({ kind: 'shard', label: s.label, shard: s })),
@@ -1268,35 +1030,29 @@ review_items.forEach((item, i) => {
     }
 })
 
-const results = reviewed.filter(Boolean)
-// Carried and fresh records are never merged. Reviewers are told which
-// findings are carried and asked not to report them again; one that does
-// leaves the same defect listed twice, which the verdict tolerates, since it
-// asks only whether any blocking finding survives.
-const all = [
-    ...(await carried_verified).filter(Boolean),
-    ...results.flatMap((r) => r.findings),
-]
+const all = reviewed.filter(Boolean).flatMap((r) => r.findings)
 const dropped = all.filter((f) => f.status === 'dropped')
-const surviving = all.filter((f) => f.status !== 'dropped')
-// A surviving finding on the blocking track blocks the release unless an open
-// Issue names its work, which makes it a known-issue candidate; every other
-// surviving finding is recorded on an Issue (docs/conventions.md § Release
-// Production).
-const findings = surviving.filter((f) => blocks(f) && !f.issue)
-const known = surviving.filter((f) => blocks(f) && f.issue)
-const nonblocking = surviving.filter((f) => !blocks(f))
-for (const f of known) f.disposition = 'known issue'
-for (const f of nonblocking) f.disposition = 'record'
-const recorded = [...known, ...nonblocking]
-const count = (list, status) => list.filter((f) => f.status === status).length
+// Only a confirmed defect that no open Issue names and that does not predate
+// the range blocks the release; it is recommended for a fix before the tag.
+// A defect an open Issue names, and a confirmed one that predates the range,
+// is a known issue by default. A contested or unverified finding goes to the
+// maintainer with the list, undecided.
+const findings = all.filter((f) => f.status === 'confirmed' && !f.predates)
+const predating = all.filter((f) => f.status === 'confirmed' && f.predates)
+const known = all.filter((f) => f.status === 'known')
+const undecided = all.filter((f) => f.status === 'contested' || f.status === 'unverified')
+for (const f of findings) f.recommendation = 'fix'
+for (const f of [...predating, ...known]) f.recommendation = 'known issue'
+for (const f of undecided) f.recommendation = 'maintainer to decide'
+const recorded = [...known, ...predating]
+for (const f of recorded) f.disposition = 'known issue'
 
 log(
-    'Review done: ' + all.length + ' findings (' + carried.length + ' carried); ' +
-        findings.length + ' blocking (' + count(findings, 'confirmed') + ' confirmed, ' +
-        count(findings, 'contested') + ' contested, ' + count(findings, 'unverified') +
-        ' unverified), ' + known.length + ' known-issue candidates, ' + nonblocking.length +
-        ' to record, ' + dropped.length + ' dropped, ' + ledgered.length + ' in the ledger' +
+    'Review done: ' + all.length + ' defects; ' + findings.length + ' blocking, ' +
+        predating.length + ' predating the range, ' + known.length + ' named by an open ' +
+        'Issue, ' + undecided.length + ' contested or unverified, ' + dropped.length +
+        ' dropped, ' + ledgered.length + ' in the ledger' +
+        (ceiling_reached ? '; the ceiling of ' + MAX_AGENTS + ' was reached' : '') +
         (failed_review.length ? '; failed reviewers: ' + failed_review.join(', ') : ''),
 )
 
@@ -1304,68 +1060,50 @@ log(
 
 phase('Audit')
 
-// The known-issue candidates: this run's blocking-track findings an open Issue
-// names, and those of the release's earlier runs whose Issue is still open,
-// one entry per Issue.
-const candidates = [...prior_candidates]
-for (const f of known) {
-    if (!candidates.some((e) => e.number === f.issue)) {
+const candidates = []
+for (const f of recorded) {
+    if (f.issue && !candidates.some((e) => e.number === f.issue)) {
         candidates.push({ number: f.issue, summary: f.claim })
     }
 }
-
-const audit = await run(audit_prompt(candidates), {
-    agentType: AUDITOR, label: 'audit', phase: 'Audit', schema: AUDIT_SCHEMA,
-}).catch(() => null)
-if (!audit) {
-    failed_other.push('audit')
-    log('audit: no result (agent failed or was stopped)')
-} else {
-    log('audit: ' + audit.verdict)
-}
+const audit = await run_audit(candidates)
+const outcome = audit_outcome(audit)
+const audit_verdict = outcome.verdict
 
 // ─── Verdicts (computed here, not by an agent) ───
 
-const section_present = (name) =>
-    audit.sections.some((s) => s.name.toLowerCase().includes(name.toLowerCase()))
-const missing_sections = audit ? AUDIT_SECTION_NAMES.filter((n) => !section_present(n)) : []
-const audit_failed =
-    !audit || missing_sections.length > 0 || audit.verdict === 'AUDIT FAIL' ||
-    audit.sections.some((s) => s.verdict === 'FAIL')
-const audit_verdict = audit_failed ? 'AUDIT FAIL' : 'AUDIT PASS'
-// A failed reviewer leaves part of the composition unreviewed, which blocks in
-// itself, as does an unresolved blocking finding or a failed audit.
+// A failed reviewer leaves part of the composition unreviewed, and a run at
+// its ceiling leaves defects unverified, which block in themselves, as does a
+// blocking defect or a failed audit.
 const verdict =
-    failed_review.length > 0 || findings.length > 0 || audit_failed
+    failed_review.length > 0 || ceiling_reached || findings.length > 0 || outcome.failed
         ? 'RELEASE BLOCKED'
         : 'RELEASE READY'
 
-const notes_lines = []
-if (!audit) notes_lines.push('The auditor returned no result; treated as AUDIT FAIL.')
-if (missing_sections.length) {
-    notes_lines.push('The audit lacks the sections ' + missing_sections.join(', ') +
-        '; treated as AUDIT FAIL.')
-}
+const notes_lines = [...outcome.notes]
 if (failed_review.length) {
     notes_lines.push('Incomplete run: ' + failed_review.join(', ') +
         ' returned no result; treated as blocking.')
 }
+if (ceiling_reached) {
+    notes_lines.push('The run reached its ceiling of ' + MAX_AGENTS + ' agents; the defects ' +
+        'it could not verify are unverified, and the maintainer decides how to go on.')
+}
 const failed_verifiers = failed_other.filter((l) => l.startsWith('verify:'))
 if (failed_verifiers.length) {
     notes_lines.push('Incomplete verification: ' + failed_verifiers.join(', ') + ' returned no ' +
-        'result; the affected findings were judged on the remaining votes, or marked unverified.')
+        'result; the affected defects were judged on the remaining votes, or marked unverified.')
 }
 
 // The known issues of the release are the audit's list, which takes in the
 // candidates above when their defect is still present, plus this run's own
-// candidates, which the refuters have just judged present; one entry per Issue.
-// An earlier run's candidate the audit left out is not added back.
+// Issue-named defects; one entry per Issue.
 const known_issues = []
 for (const k of (audit && audit.known_issues) || []) {
     if (!known_issues.some((e) => e.number === k.number)) known_issues.push(k)
 }
-for (const f of known) {
-    if (!known_issues.some((e) => e.number === f.issue)) {
+for (const f of recorded) {
+    if (f.issue && !known_issues.some((e) => e.number === f.issue)) {
         known_issues.push({ number: f.issue, title: issue_title(f.issue), summary: f.claim })
     }
 }
@@ -1376,7 +1114,6 @@ const stats = {
     version: VERSION,
     from: FROM,
     from_sha: scope.from_sha,
-    since: SINCE,
     head: scope.head,
     bumped,
     units: scope.units.length,
@@ -1385,14 +1122,13 @@ const stats = {
     shards: shards.length,
     lenses: lenses.map((l) => l.name),
     blocking: findings.length,
-    confirmed: count(findings, 'confirmed'),
-    contested: count(findings, 'contested'),
-    unverified: count(findings, 'unverified'),
+    predating: predating.length,
     known: known.length,
-    recorded: recorded.length,
-    nits: count(recorded, 'nit'),
+    undecided: undecided.length,
     dropped: dropped.length,
     ledgered: ledgered.length,
+    max_agents: MAX_AGENTS,
+    ceiling_reached,
     get failed() {
         return [...failed_review, ...failed_other]
     },
@@ -1409,7 +1145,6 @@ function for_render(f) {
     const { annotations, verification, ...rest } = f
     return {
         ...rest,
-        blocking: blocks(f),
         evidence: clip(f.evidence, RENDER_EVIDENCE_CHARS) +
             annotations.map((a) => '\n[' + a + ']').join(''),
         votes: f.votes.map((v) => ({ ...v, evidence: clip(v.evidence, RENDER_VOTE_CHARS) })),
@@ -1417,37 +1152,36 @@ function for_render(f) {
 }
 
 const SYNTH_PROMPT = [
-    'Render the release review report for ' + TAG + ' (mode ' + MODE + ', head ' + scope.head +
-        ') as Markdown.',
+    'Render the release review report for ' + TAG + ' (head ' + scope.head + ') as Markdown.',
     '',
-    'Rules: every finding appears exactly once, with its status tag; do not drop, add, merge, ' +
-        're-rank, or soften one. Order the entries under a heading by file, then class, then ' +
-        'line, so a carried entry and a fresh entry of the same file and class sit together. ' +
-        'Each entry: `file:line` [status] (bucket, class) claim, with `[carried]` when carried ' +
-        'is true, `(MUST violation)` when must_violation is true, and the PRs it names. ' +
-        'Authority: the ' +
-        'cited authority. Rationale: one sentence from the evidence. Fix: the proposed fix. ' +
-        'Every bracketed note at the end of a finding\'s evidence is rendered verbatim as its ' +
-        'own line. For contested and unverified entries add one line per verifier vote with ' +
-        'its lens, refuted flag, confidence, and evidence. Dropped and ledgered findings take ' +
-        'one line each. The audit section lists each audit section with its verdict and items, ' +
-        'then the known issues.',
+    'Rules: every finding appears exactly once, with its status tag and its recommendation; do ' +
+        'not drop, add, merge, re-rank, or soften one. Order the entries under a heading by ' +
+        'file, then line. Each entry: `file:line` [status] claim, and the PRs it names. ' +
+        'Authority: the cited authority. Rationale: one sentence from the evidence. Fix: the ' +
+        'proposed fix. Recommendation: its recommendation. Every bracketed note at the end of ' +
+        'a finding\'s evidence is rendered verbatim as its own line. For contested and ' +
+        'unverified entries add one line per verifier vote with its lens, refuted flag, ' +
+        'confidence, and evidence. Dropped and ledgered findings take one line each. The audit ' +
+        'section lists each audit section with its verdict and items, then the known issues.',
     '',
-    'Headings, in this order: `# Release review: ' + TAG + '`, `## Blocking`, `## Known-issue ' +
-        'candidates` (blocking-class findings an open Issue names; each names its Issue), ' +
-        '`## Recorded` (non-blocking findings, recorded on the open Issue that names the work, ' +
-        'else the follow-up Issue of their scope), `## Dropped by verification`, `## Ledger ' +
-        '(not re-raised)`, `## Audit`. Write `(none)` under an empty heading. Do not write ' +
-        'verdict lines; the workflow appends them.',
+    'Headings, in this order: `# Release review: ' + TAG + '`, `## For the maintainer: fix ' +
+        'before the tag` (the blocking defects), `## Predating the range` (confirmed defects ' +
+        'already present at ' + FROM + '; known issues by default), `## Named by an open ' +
+        'Issue` (known issues; each names its Issue), `## Contested or unverified`, `## ' +
+        'Dropped by verification`, `## Ledger (not re-raised)`, `## Audit`. Write `(none)` ' +
+        'under an empty heading. Do not write verdict lines; the workflow appends them.',
     '',
     'Blocking (JSON):',
     JSON.stringify(findings.map(for_render), null, 1),
     '',
-    'Known-issue candidates (JSON):',
+    'Predating (JSON):',
+    JSON.stringify(predating.map(for_render), null, 1),
+    '',
+    'Named by an open Issue (JSON):',
     JSON.stringify(known.map(for_render), null, 1),
     '',
-    'Recorded (JSON):',
-    JSON.stringify(nonblocking.map(for_render), null, 1),
+    'Contested or unverified (JSON):',
+    JSON.stringify(undecided.map(for_render), null, 1),
     '',
     'Dropped (JSON):',
     JSON.stringify(dropped.map(for_render), null, 1),
@@ -1477,7 +1211,8 @@ const NOTES_PROMPT = [
         ' ' + scope.head + '` for the ABI and protocol version constants ' +
         '(docs/conventions.md § ABI / wire-protocol versions names where they live; list each ' +
         'whose value changed, with its new value). Known Issues lists exactly the entries ' +
-        'below, each linking its Issue, or `None` when there are none.',
+        'below, each linking its Issue, or `None` when there are none; the release PR adds ' +
+        'the defects the maintainer decides to ship.',
     '',
     'PRs of the range:',
     bullets(scope.units, unit_line),
@@ -1492,18 +1227,16 @@ const [synthesized, drafted] = await parallel([
     () => run(SYNTH_PROMPT, {
         agentType: INVESTIGATOR, label: 'synthesize', phase: 'Synthesize', schema: REPORT_SCHEMA,
     }),
-    () => verdict === 'RELEASE READY'
-        ? run(NOTES_PROMPT, {
-            agentType: INVESTIGATOR, label: 'notes', phase: 'Synthesize', schema: NOTES_SCHEMA,
-        })
-        : Promise.resolve(null),
+    () => run(NOTES_PROMPT, {
+        agentType: INVESTIGATOR, label: 'notes', phase: 'Synthesize', schema: NOTES_SCHEMA,
+    }),
 ])
 
 if (!synthesized) {
     failed_other.push('synthesize')
     notes_lines.push('The synthesizer returned no result; the report body is a placeholder.')
 }
-if (verdict === 'RELEASE READY' && !drafted) {
+if (!drafted) {
     failed_other.push('notes')
     notes_lines.push('The notes agent returned no result; no release-notes draft was produced.')
 }
@@ -1511,7 +1244,8 @@ if (verdict === 'RELEASE READY' && !drafted) {
 const body = synthesized
     ? synthesized.report
     : '# Release review: ' + TAG + '\n\nSynthesis agent returned no result; the raw findings ' +
-        'are in the `findings`, `recorded`, `ledgered`, `dropped`, and `audit` fields.\n'
+        'are in the `findings`, `predating`, `recorded`, `undecided`, `ledgered`, `dropped`, ' +
+        'and `audit` fields.\n'
 
 // The two verdict lines stand alone so they can be surfaced verbatim; notes
 // follow on their own lines.
@@ -1530,9 +1264,11 @@ return {
     verdict,
     audit_verdict,
     report,
-    notes: verdict === 'RELEASE READY' && drafted ? drafted.notes : null,
+    notes: drafted ? drafted.notes : null,
     findings: findings.map(plain),
+    predating: predating.map(plain),
     recorded: recorded.map(plain),
+    undecided: undecided.map(plain),
     ledgered: ledgered.map(plain),
     dropped: dropped.map(plain),
     audit,

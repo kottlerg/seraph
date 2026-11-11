@@ -194,8 +194,9 @@ correct. They are not error handling.
   operation is sound: what invariants hold, what has been checked, and why safe Rust
   cannot express it.
 - Unsafe SHOULD NOT be used to work around a design problem — reconsider the design
-  first. This is a review gate, not a lint-checkable rule; violations are design-smell
-  and should surface in code review.
+  first. No lint checks this rule, and the pre-merge review reports it only where the
+  workaround is a defect ([conventions.md](conventions.md) § Findings): a safety contract
+  the code does not uphold, or one its callers cannot.
 - `unsafe fn` MUST document their safety contract under a `# Safety` rustdoc heading.
 
 ```rust

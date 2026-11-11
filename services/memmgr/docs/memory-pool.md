@@ -515,6 +515,6 @@ terminal fault tears down the whole process (see
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
-[FS Driver Protocol](../../fs/docs/fs-driver-protocol.md),
+[Filesystem Driver Protocol](../../fs/docs/fs-driver-protocol.md),
 [services/memmgr/README.md](../README.md),
 [memmgr IPC Interface](ipc-interface.md)

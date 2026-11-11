@@ -148,10 +148,10 @@ Keep your own reads out of your context the same way:
    Issue states it otherwise.
 6. At each merge, log one `orch log` line of the PR's cost: the tokens of its worker (from its
    completion notifications), the reviewer runs and the audits, the host minutes under grant,
-   each sync and what it re-owed, the minutes the PR was held at its gate, and the style
-   findings left in the run records. These lines are how the maintainer judges the rules a
-   batch ran under, among them the rule that leaves a style finding off the Issues
-   (docs/conventions.md § Recording findings), which is on trial.
+   each sync and what it re-owed, the minutes the PR was held at its gate, and the number of
+   review rounds. These lines are how the maintainer judges the rules a batch ran under, among
+   them the rule that a review reports defects only, in bounded rounds (docs/conventions.md
+   § Findings, § Rounds).
 
 An instruction-file merge (`.claude/`, or a document the agent files cite) changes what the next
 worker should read, but this session and the agents it spawns keep the copies loaded at its
@@ -199,7 +199,7 @@ Choose the model and effort per spawn:
 
 | Work | Model | Effort |
 |---|---|---|
-| Nit drains, wrapping, link and cross-reference fixes | `sonnet` | `medium`, then `high` after a failed round |
+| Mechanical drains, link and cross-reference fixes | `sonnet` | `medium`, then `high` after a failed round |
 | Bounded code: a defect list on one component, a test, an `xtask` change | `opus` | `medium` |
 | Documents that state rules: `.claude/`, docs/conventions.md, docs/testing.md, the standards | `opus` | `medium` |
 | Design-laden or multi-component work: kernel, ABI, drivers, protocol changes | `opus` | `high` |
@@ -254,9 +254,11 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
    and its comment-only delta), the Issues the PR closes or references (the ticks of both, the
    milestone of those it closes), the check rollup and merge state, that `master` is an
    ancestor of the head, and the run record for the head.
-3. Read what the command cannot decide: after a `NON-BLOCKING ISSUES ONLY` run, that each
-   finding it counts is recorded and none is contested; for the release PR, which the command
-   names with `gate-release-approval`, that the maintainer has approved its merge; that the
+3. Read what the command cannot decide: when it prints `gate-defects-recorded`, that each
+   defect a run recorded off the surface is on its Issue (docs/conventions.md § Findings); for
+   records of the earlier form, when it prints `gate-findings-recorded`, that each finding it
+   counts is recorded and none is contested; for the release PR, which the command names with
+   `gate-release-approval`, that the maintainer has approved its merge; that the
    Issues the command prints as closed are the ones the PR means to close; and that the
    worker's worktree sits on its branch (`git -C <worktree> status -sb`).
 
@@ -264,6 +266,12 @@ Then merge with `gh pr merge <N> --merge --delete-branch`, and tell the maintain
 (§ Reporting to the maintainer). Fast-forward your own checkout, record the merge, and
 tell every open PR's worker what moved and which files the merge touched. That message is
 information: `master quiet` is the only instruction to sync.
+
+After each merge that shares a file with another merge since the previous release tag, send the
+merged PR's worker `composition check <merge>` (docs/conventions.md § Composition check;
+`.claude/agents/worker.md` § Composition check), its worktree parked first; a worker already
+retired is respawned for it. A merge that shares no file owes no check. A defect the check
+finds is the worker's next PR, which you schedule like any other.
 
 Order merges to minimize re-validation. A PR whose merge touches only Markdown or comments, or
 no file another open PR touches, costs the others a CI run and nothing else, so merge it as
@@ -286,17 +294,15 @@ maintainer and whose recommendation you share, and tell the maintainer in one li
 to the maintainer). Only a split recommendation, a major design decision, or a case with no
 clearly best option waits for the maintainer.
 
-- **`NON-BLOCKING ISSUES ONLY`.** The worker records the surface findings first; a `style`
-  finding that is not a MUST violation goes on no Issue and stays in the run record
-  (docs/conventions.md § Recording findings). A `should` finding takes one fix round, and a PR
-  takes at most one such round (docs/conventions.md § Pre-merge review): what the run after it
-  leaves stays recorded, and the PR goes to its gate. A nit takes no round and stays recorded,
-  with two exceptions, both within the PR's one round: a nit whose fix is comment-only is fixed
-  in a round the PR owes anyway, and a nit in a PR that drains a follow-up Issue of its scope
-  is fixed in that round, or takes it when no `should` finding did. After the round a nit stays
-  recorded. Each is recorded first and ticked `(fixed by PR #<M>)` when the round fixes it.
-- **A finding in the PR's own earlier hunk.** A delta run may report it as out of bound. It is
-  on the surface (docs/conventions.md § Review surface) and is handled like any surface finding.
+- **A finding that is not a defect.** A review reports defects only (docs/conventions.md
+  § Findings). A worker disputes a finding that is not one as a contested finding, below; it
+  is not fixed or recorded.
+- **Review rounds that repeat.** When successive runs on one PR keep finding the same kind of
+  defect in the same mechanism, tell the worker to stop fixing the findings one by one: it
+  restates the mechanism at a higher level (its states, its invariants, a model that host tests
+  exercise), rebuilds the change on that, and the next run reviews the rebuilt change. Record
+  the instruction. A stop logic that became a state machine over a kernel trait, with a
+  simulated kernel under test, is the pattern.
 - **A contested finding** is yours to decide (docs/conventions.md § Contested findings). First
   have the worker run one delta run in which the reviewer re-reads the finding against the
   worker's argument, then decide, record the decision, and tell the maintainer in one line. It

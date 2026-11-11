@@ -45,9 +45,10 @@ Production requires before its tag, not code quality: the reviewers own that.
    range changed, or when its Known Issues section differs from the list of
    item 6 below.
 
-6. Known issues: every known-issue candidate the parent lists (a review
-   finding on the blocking track whose work that open Issue names, § Release
-   Production step 2) whose defect is present at the head, every open Issue
+6. Known issues: every known-issue candidate the parent lists (a defect
+   the release review found that an open Issue names, § Release Production
+   steps 1 and 2, or, in audit mode, an entry of the Known Issues section
+   of the notes at the head) whose defect is present at the head, every open Issue
    labelled `bug` or `security`, in any milestone, whose defect is present at
    the head, and every known issue the previous release's notes list whose
    Issue is still open; each with a
@@ -57,8 +58,14 @@ Production requires before its tag, not code quality: the reviewers own that.
 7. Host runs: before the bump, nothing is owed; say so. At a bumped head,
    read the report the parent names and FAIL when it is missing, when a run
    Release host runs requires is absent or below its count, when an outcome
-   is anything but `PASS`, or when a run's head is not the candidate head,
-   the commit to be tagged (§ Release Production steps 4 and 5).
+   is anything but `PASS`, or when a run's head is neither the candidate
+   head, the commit to be tagged, nor an earlier commit that contains the
+   bump from which the change to the candidate head is documentation or
+   comments only (`git diff --name-only <run head> <head>` names only
+   Markdown, and `git diff <run head> <head>` alters only comment lines of
+   any other file, text a build embeds such as an `include_str!`,
+   `include_bytes!`, or `global_asm!` input counting as build input, as
+   `docs/testing.md` § Coverage tiers says; § Release Production step 4).
 
 ## Output
 

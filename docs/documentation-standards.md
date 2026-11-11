@@ -7,15 +7,11 @@ It governs document structure, authority relationships, linking, and maintenance
 
 ## Violations
 
-A violation of this standard that the pre-merge review finds on the review surface in a
-Markdown document is non-blocking; [conventions.md](conventions.md) § Branch and PR Workflow
-owns that rule. The exception is a finding the review classes as correctness, safety (which
-covers soundness), or contract: a document statement the code contradicts that states behaviour
-a caller or user relies on (a syscall, ABI, IPC, or command-line contract, or a safety
-invariant), which that section puts on the blocking track. A non-blocking violation is fixed in
-the batch when the reviewer verdict is `BLOCKING ISSUES`, and after a run whose verdict is
-`NON-BLOCKING ISSUES ONLY` it is recorded before the merge, as that section's rules on
-recording findings say. A violation off the surface is recorded as that section says.
+`cargo xtask lint-docs` checks the rules of this standard that a script can decide, in CI. A
+review reports a document only when it is wrong: a statement that would make its reader write
+wrong code is a defect ([conventions.md](conventions.md) § Findings), which blocks on the review
+surface and is recorded off it. A document that could read better, and a rule of this standard
+no script checks, are not reported.
 
 ---
 
@@ -91,7 +87,8 @@ summarizes a child doc, the parent MUST appear in the child's `## Summarized By`
 [Title](relative/path.md), [Title](relative/path.md)
 ```
 
-Entries are sorted by path and wrapped to the column limit; an entry for a `README.md` is
+Entries are sorted by the repository path each link resolves to, byte by byte (`README.md`
+before a lowercase name), and wrapped to the column limit; an entry for a `README.md` is
 labelled with its repository path, any other entry with the document's `# Title`.
 
 If no document summarizes this document:

@@ -86,7 +86,11 @@ table, not devmgr code.
 
 One device has one record. Records are merged by resource identity: a record whose `Mmio` base
 or `IoPort` base an earlier record already holds adds its identity keys to that record rather
-than standing alone. The console UART that the namespace describes as `PNP0501` and the SPCR
+than standing alone. A record keeps the first key of each single-valued kind it is given (the
+`_HID`, the SPCR interface type, the platform key): a later description's key of a kind the
+record already carries is dropped, so a declaration matches the merged record by the first
+description's key of that kind. A later `_CID` the record lacks is added while the record holds
+fewer than four. The console UART that the namespace describes as `PNP0501` and the SPCR
 names is therefore one record carrying both keys. A PCI function the RIMT names as an IOMMU
 belongs to the IOMMU record and has no record of its own.
 

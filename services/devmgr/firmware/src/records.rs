@@ -13,7 +13,9 @@
 //! records keep it: it is the firmware's table order an instance limit counts
 //! in. One device has one record: a record whose `Mmio` or `IoPort` base an
 //! earlier record already holds adds its identity keys to that record
-//! ([`PlatformRecords::add`]) and keeps none of its own resources. Every record
+//! ([`PlatformRecords::add`]) and keeps none of its own resources: the record
+//! keeps the first `_HID`, SPCR interface type and platform key it is given,
+//! and adds a later `_CID` while it has room ([`MAX_CIDS`]). Every record
 //! carries at most [`MAX_RECORD_RESOURCES`] resources, and the set at most
 //! [`MAX_PLATFORM_RECORDS`] records.
 

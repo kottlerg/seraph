@@ -1817,22 +1817,20 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
                         .has_observer
                         .store(1, core::sync::atomic::Ordering::Relaxed);
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
+                    if let Ok(idx) =
+                        crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
                     {
-                        Ok(idx) =>
-                        {
-                            (*sig).wait_set = ws_state.cast::<u8>();
-                            (*sig).wait_set_member_idx = idx;
-                            (*source_header).inc_ref();
-                            Ok(idx)
-                        }
-                        Err(()) =>
-                        {
-                            // No member was installed: has_observer again
-                            // reflects the direct waiters alone.
-                            (*sig).refresh_observer();
-                            Err(SyscallError::InvalidArgument)
-                        }
+                        (*sig).wait_set = ws_state.cast::<u8>();
+                        (*sig).wait_set_member_idx = idx;
+                        (*source_header).inc_ref();
+                        Ok(idx)
+                    }
+                    else
+                    {
+                        // No member was installed: has_observer again
+                        // reflects the direct waiters alone.
+                        (*sig).refresh_observer();
+                        Err(SyscallError::InvalidArgument)
                     }
                 }
                 else

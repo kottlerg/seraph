@@ -1,0 +1,8 @@
+# debug-port: the debug serial port drivers (virtio-console).
+#
+# A QUERY_DEVICE reply through the class SEND carries
+# serial_labels::WRITE_AUTHORITY (bit 63) and READ_AUTHORITY (bit 62).
+# svcmgr publishes it seed-only as `devmgr.class.debug-port`; gdbstub's and
+# debug-echo's seeds take it, so only a debug or test definition reaches
+# the port.
+verbs = 63 62

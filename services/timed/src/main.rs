@@ -5,17 +5,15 @@
 
 //! Seraph wall-clock service.
 //!
-//! Resolves the platform RTC via devmgr's
-//! [`devmgr_labels::QUERY_RTC_DEVICE`], reads the current wall-clock
+//! Resolves the platform RTC via [`devmgr_labels::QUERY_DEVICE`] on the
+//! `rtc` class SEND its definition seeds, reads the current wall-clock
 //! time once, computes a fixed offset against the kernel monotonic
 //! clock, and serves [`timed_labels::GET_WALL_TIME`] from `offset +
 //! system_info(ElapsedUs)` thereafter.
 
 #![allow(clippy::cast_possible_truncation)]
 
-use ipc::{
-    IpcMessage, devmgr_errors, devmgr_labels, rtc_errors, rtc_labels, timed_errors, timed_labels,
-};
+use ipc::{IpcMessage, rtc_errors, rtc_labels, timed_errors, timed_labels};
 use std::os::seraph::startup_info;
 use syscall_abi::SystemInfoType;
 
@@ -24,7 +22,7 @@ use syscall_abi::SystemInfoType;
 struct BootCaps
 {
     service_ep: u64,
-    devmgr_registry_ep: u64,
+    rtc_class: u64,
 }
 
 fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
@@ -36,15 +34,15 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
     // SAFETY: ipc_buf is the registered IPC buffer page.
     // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`. Both slots are required.
-    let [service_ep, devmgr_registry_ep] =
+    let [service_ep, rtc_class] =
         unsafe { ipc::bootstrap::request_slots::<2>(creator_endpoint, ipc_buf) }.ok()?;
-    if service_ep == 0 || devmgr_registry_ep == 0
+    if service_ep == 0 || rtc_class == 0
     {
         return None;
     }
     Some(BootCaps {
         service_ep,
-        devmgr_registry_ep,
+        rtc_class,
     })
 }
 
@@ -141,34 +139,18 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 
 // ── Entry ──────────────────────────────────────────────────────────────────
 
-/// Resolve the RTC SEND via devmgr's `QUERY_RTC_DEVICE`. Returns `0`
-/// when devmgr replies anything other than success (registry badge
-/// rejected, label-version mismatch, no RTC driver bound).
-fn resolve_rtc_cap(devmgr_registry_ep: u64, ipc_buf: *mut u64) -> u64
+/// Resolve the first RTC driver's SEND through `rtc_class`, the `rtc` class
+/// SEND (`QUERY_DEVICE` at ordinal 0). Returns `0` when devmgr replies
+/// anything other than success (label-version mismatch, no RTC driver
+/// served).
+fn resolve_rtc_cap(rtc_class: u64, ipc_buf: *mut u64) -> u64
 {
-    if devmgr_registry_ep == 0
+    if rtc_class == 0
     {
         return 0;
     }
-    let msg = IpcMessage::builder(devmgr_labels::QUERY_RTC_DEVICE)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(devmgr_registry_ep, &msg, ipc_buf) })
-    else
-    {
-        return 0;
-    };
-    if reply.label != devmgr_errors::SUCCESS
-    {
-        return 0;
-    }
-    let caps = reply.caps();
-    if caps.is_empty()
-    {
-        return 0;
-    }
-    caps[0]
+    unsafe { ipc::query_device(rtc_class, 0, ipc_buf) }.unwrap_or(0)
 }
 
 /// Resolve the RTC via devmgr and compute the wall-clock offset.
@@ -179,9 +161,9 @@ fn resolve_rtc_cap(devmgr_registry_ep: u64, ipc_buf: *mut u64) -> u64
 /// moment of the RTC sample is approximated as the midpoint of the
 /// roundtrip; subtracting that midpoint from the RTC value removes
 /// most of the IPC-roundtrip bias from the resulting offset.
-fn compute_offset(devmgr_registry_ep: u64, ipc_buf: *mut u64) -> Option<u64>
+fn compute_offset(rtc_class: u64, ipc_buf: *mut u64) -> Option<u64>
 {
-    let rtc_cap = resolve_rtc_cap(devmgr_registry_ep, ipc_buf);
+    let rtc_cap = resolve_rtc_cap(rtc_class, ipc_buf);
     if rtc_cap == 0
     {
         return None;
@@ -210,7 +192,7 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    let offset = compute_offset(caps.devmgr_registry_ep, ipc_buf);
+    let offset = compute_offset(caps.rtc_class, ipc_buf);
 
     service_loop(caps.service_ep, ipc_buf, offset);
 }

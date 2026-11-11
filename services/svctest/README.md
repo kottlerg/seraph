@@ -101,12 +101,13 @@ leaves the system idle, as on the pass path. A fault in svctest's own process (a
 a stack overflow) kills it without running either hook, so it logs neither marker.
 
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
-skip and return when their cap is zero; the devmgr deny, input-ordinal, and drivers stray-cap
-phases (`caps[2]`), the orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`),
+skip and return when their cap is zero; the devmgr class-deny phase (`caps[2]` and `caps[3]`), the
+input-ordinal phase (`caps[8]`), the drivers stray-cap phases (`caps[7]` and `caps[8]`), the
+orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`),
 the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names
 it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd phases
 (`caps[4]`, `caps[5]`), the `logd_death_forward` phase (`caps[6]`), and the `crash_endpoint` phase
-(`caps[7]`) instead fail their
+(`caps[9]`) instead fail their
 assertions. The seed-only phase thus
 fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
 zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and
@@ -120,52 +121,53 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 
 ## Capabilities
 
-The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, the
-fifth to seventh in a second round, and then the debug-authority cap the recipe's
-`debug_authority = yes` grants;
-[service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each
-name's cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every
-slot stays zero.
+The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, the fifth
+to eighth in a second round, the ninth in a third, and then the debug-authority cap the recipe's
+`debug_authority = yes` grants; [service-definitions.md §
+`seed`](../svcmgr/docs/service-definitions.md#seed) defines each name's cap shape and the zero slot
+an unresolved name leaves. With no creator endpoint, every slot stays zero.
 
 | Slot      | Seed              | Use in svctest                         |
 |-----------|-------------------|----------------------------------------|
 | `caps[0]` | `rootfs.root`     | `ns` phase                             |
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
-| `caps[2]` | `devmgr.registry` | devmgr deny, input-ordinal, and drivers stray-cap phases |
+| `caps[2]` | `devmgr.registry` | devmgr class-deny and shutdown-deny phases |
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, driver withdrawal, DMA confinement, drivers deny |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases          |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase                |
 | `caps[6]` | `logd.query`      | `logd_death_forward` phase: reads logd's slots and history |
-| `caps[7]` | (`debug_authority`) | `crash_endpoint` phase; svctest declares itself undebuggable at startup |
+| `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
+| `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
+| `caps[9]` | (`debug_authority`) | `crash_endpoint` phase; svctest declares itself undebuggable at startup |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
-that its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the
-devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`,
-`QUERY_SHUTDOWN_DEVICE`, `QUERY_DEBUG_PORT_DEVICE`, `TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`,
-`TEST_QUERY_DENY_DEVICE`, `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`,
-`TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS`, and the input-ordinal
-phase, which requires a cap from `QUERY_INPUT_DEVICE` at instance ordinal 0 (sent and absent) and
-`NO_DEVICE` past the one keyboard of every boot's device set. The drivers stray-cap phase takes
-granted SENDs on the serial and input drivers' endpoints through `caps[2]` (`QUERY_SERIAL_DEVICE`
-and `QUERY_INPUT_DEVICE`) and floods each driver with calls carrying `MSG_CAP_SLOTS_MAX` caps:
-an unknown label, a zero-byte `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, a
-`SERIAL_REGISTER_RX_NOTIFY` whose stray notification `SYS_IRQ_REGISTER` rejects, and one whose
-fresh notification each call rebinds the UART line to. It requires each call's normal reply and
-each cap to leave svctest's `CSpace`. A driver that keeps a cap it should delete exhausts its
-`CSpace` within one case and exits on its failing receive. For the input driver, devmgr's
-withdrawal then fails the call in flight, and the phase fails. For the serial driver, logd's
-writes stall on it, and the boot ends as a `HANG`. The read and accepted
-registration cases, and the input case, log a skip when `terminal.svc` is staged, since they
-would take the terminal's input. `caps[3]` exists for devmgr's test
-labels (TODO(#165): retire with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim, the
-driver-withdrawal phase's `TEST_SPAWN_FAULT_DRIVERS` and `TEST_QUERY_FAULT_DEVICE` shims, the DMA
-confinement phase's `TEST_QUERY_DMA_DEVICE` and `TEST_DMA_FAULTS` shims,
-and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a SEND on the serial, input, or
-framebuffer driver's endpoint badged with none of the driver's verb bits. That phase requires an
-`UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and
-`INPUT_READ_EVENTS` (at once, without blocking for a key), and to `FB_WRITE_BYTES` and
-`FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's, devmgr runs none and the
-framebuffer case logs a skip, which the framebuffer device cell
+that its name is published, the six `devmgr.class.*` names among them. `caps[2]` carries
+`REGISTRY_QUERY_AUTHORITY` alone, so it drives the devmgr deny phases, which require an
+`UNAUTHORIZED` reply to `QUERY_DEVICE` and `MINT_CLASS_SEND` (on `caps[2]` and `caps[3]`, neither of
+whose badges carries a class slot), and `QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`,
+`TEST_ORPHAN_RESULT`, `TEST_QUERY_DENY_DEVICE`, `TEST_SPAWN_FAULT_DRIVERS`,
+`TEST_QUERY_FAULT_DEVICE`, `TEST_QUERY_DMA_DEVICE`, and `TEST_DMA_FAULTS`. `caps[7]` and `caps[8]`
+are the `serial` and `input` class SENDs. The input-ordinal phase requires a cap from `QUERY_DEVICE`
+on `caps[8]` at instance ordinal 0 (sent and absent) and `NO_DEVICE` past the one keyboard of every
+boot's device set. The drivers stray-cap phase takes granted SENDs on the serial and input drivers'
+endpoints through `caps[7]` and `caps[8]` (`QUERY_DEVICE`) and floods each driver with calls
+carrying `MSG_CAP_SLOTS_MAX` caps: an unknown label, a zero-byte `SERIAL_WRITE_BYTES`,
+`SERIAL_READ_BYTES`, a `SERIAL_REGISTER_RX_NOTIFY` whose stray notification `SYS_IRQ_REGISTER`
+rejects, and one whose fresh notification each call rebinds the UART line to. It requires each
+call's normal reply and each cap to leave svctest's `CSpace`. A driver that keeps a cap it should
+delete exhausts its `CSpace` within one case and exits on its failing receive. For the input driver,
+devmgr's withdrawal then fails the call in flight, and the phase fails. For the serial driver,
+logd's writes stall on it, and the boot ends as a `HANG`. The read and accepted registration cases,
+and the input case, log a skip when `terminal.svc` is staged, since they would take the terminal's
+input. `caps[3]` exists for devmgr's test labels (TODO(#165): retire with them): the orphan-teardown
+phase's `TEST_SPAWN_ORPHAN` shim, the driver-withdrawal phase's `TEST_SPAWN_FAULT_DRIVERS` and
+`TEST_QUERY_FAULT_DEVICE` shims, the DMA confinement phase's `TEST_QUERY_DMA_DEVICE` and
+`TEST_DMA_FAULTS` shims, and `TEST_QUERY_DENY_DEVICE`, which takes a class name and hands the
+drivers deny phase a SEND on the serial, input, or framebuffer driver's endpoint badged with none of
+the driver's verb bits. That phase requires an `UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`,
+`SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and `INPUT_READ_EVENTS` (at once, without blocking
+for a key), and to `FB_WRITE_BYTES` and `FB_SET_ATTRS` when a framebuffer driver runs; on a headless
+boot, CI's, devmgr runs none and the framebuffer case logs a skip, which the framebuffer device cell
 ([docs/testing.md](../../docs/testing.md#coverage-tiers) § Coverage tiers) fails on. The input case
 also logs a skip when `terminal.svc` is staged: the input driver serves one request at a time and
 the terminal keeps a blocking read pending, so the deny would wait behind it for a keypress.

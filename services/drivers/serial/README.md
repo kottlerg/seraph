@@ -58,11 +58,10 @@ driver's endpoint only after the report, and withdraws it when the driver dies.
 Clients obtain a read/write cap through devmgr, not svcmgr: a UART is a device,
 not a service
 ([console-model.md](../../../docs/console-model.md#the-serial-driver-as-sole-userspace-uart-owner)).
-devmgr answers `devmgr_labels::QUERY_SERIAL_DEVICE` by minting
+devmgr answers `devmgr_labels::QUERY_DEVICE` by minting
 a `SEND_GRANT` cap on the driver's service endpoint badged with
-`serial_labels::WRITE_AUTHORITY` | `serial_labels::READ_AUTHORITY`,
-mirroring the `QUERY_BLOCK_DEVICE` reply shape. The caller's devmgr-registry badge
-must carry `REGISTRY_QUERY_AUTHORITY`.
+`serial_labels::WRITE_AUTHORITY` | `serial_labels::READ_AUTHORITY`. The caller sends it on the
+`serial` class SEND, whose badge carries those verbs.
 
 The boot-phase ownership of console output (bootloader → kernel early console →
 init-logd direct-UART fallback → this driver) is described in

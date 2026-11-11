@@ -20,7 +20,7 @@ carries a declaration in the ELF note section `.note.seraph.driver` (platform ke
 fixed path.
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities) owns the
 driver's service endpoint and mints client SEND caps on
-`devmgr_labels::QUERY_RTC_DEVICE`, each badged with
+`devmgr_labels::QUERY_DEVICE` on the `rtc` class SEND, each badged with
 `rtc_labels::READ_AUTHORITY`. The [`timed`](../../timed/README.md) service resolves the SEND
 once at startup to seed its wall-clock offset.
 
@@ -66,7 +66,7 @@ endpoint only after the report, and withdraws it when the driver dies.
 * **`rtc_labels::RTC_GET_EPOCH_TIME`** — no payload. The driver
   re-reads the device on every request. Caller's badge must carry
   `rtc_labels::READ_AUTHORITY` (devmgr stamps it on every SEND minted
-  from `QUERY_RTC_DEVICE`); the driver replies
+  from `QUERY_DEVICE` on the `rtc` class); the driver replies
   `rtc_errors::UNAUTHORIZED` otherwise. Reply label is a
   [`rtc_errors`](../../../shared/ipc/src/lib.rs) status code; on
   `SUCCESS`, `data[0]` is `u64` microseconds since the Unix epoch.
@@ -127,7 +127,7 @@ ships.
 | Document | Content |
 |---|---|
 | [docs/device-management.md](../../../docs/device-management.md) | Driver binary sources; devmgr spawn and RTC query flow |
-| [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md) | Per-driver capability carve and `QUERY_RTC_DEVICE` |
+| [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md) | Per-driver capability carve and `QUERY_DEVICE` |
 | [Firmware Parsing](../../../core/boot/docs/firmware-parsing.md) | Why no DTB reaches the RISC-V boot path |
 | [ACPI Parsing](../../../core/boot/docs/acpi.md) | Platform-default aperture seeding for this device |
 | [services/timed/README.md](../../timed/README.md) | The sole client of this driver |

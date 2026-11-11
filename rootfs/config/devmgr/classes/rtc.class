@@ -1,0 +1,6 @@
+# rtc: real-time clock drivers.
+#
+# A QUERY_DEVICE reply through the class SEND carries
+# rtc_labels::READ_AUTHORITY (bit 63). svcmgr publishes it seed-only as
+# `devmgr.class.rtc`; timed's seed takes it.
+verbs = 63

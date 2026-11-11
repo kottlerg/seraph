@@ -1,0 +1,7 @@
+# serial: the console UART drivers.
+#
+# A QUERY_DEVICE reply through the class SEND carries
+# serial_labels::WRITE_AUTHORITY (bit 63) and READ_AUTHORITY (bit 62).
+# svcmgr publishes it seed-only as `devmgr.class.serial`; logd's slot 3 and
+# terminal's seed take it.
+verbs = 63 62

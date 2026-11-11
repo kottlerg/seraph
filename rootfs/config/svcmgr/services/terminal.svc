@@ -10,9 +10,9 @@
 # argv[1] is the child binary the terminal spawns: /programs/shell (#112).
 # namespace = universal + cwd = /data so the terminal can resolve and spawn the
 # child via procmgr (mirrors the program-spawning test harnesses); the shell
-# re-seeds its own cwd to the namespace root at startup. seed = devmgr.registry
-# is the REGISTRY_QUERY_AUTHORITY SEND used for QUERY_INPUT_DEVICE /
-# QUERY_FRAMEBUFFER_DEVICE / QUERY_SERIAL_DEVICE.
+# re-seeds its own cwd to the namespace root at startup. The seeds are the
+# input, framebuffer, and serial class SENDs, in that order, each queried
+# with QUERY_DEVICE.
 binary    = /programs/terminal
 priority  = 10
 sched_max = 10
@@ -21,4 +21,4 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = devmgr.registry
+seed      = devmgr.class.input devmgr.class.framebuffer devmgr.class.serial

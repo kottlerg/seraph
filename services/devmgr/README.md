@@ -21,7 +21,7 @@ devmgr/
 │                                   #   (PCI identity keys, match ranking, declaration
 │                                   #   bounds), the served-class table, bounded image reads
 ├── src/
-│   ├── main.rs                     # Bootstrap, registry loop, QUERY_* handlers, device catalog
+│   ├── main.rs                     # Bootstrap, registry loop, QUERY_DEVICE handler, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, UART/RTC carves, shutdown
 │   │   ├── mod.rs                  # `arch::current` re-export (the only cfg(target_arch) site)
 │   │   ├── x86_64/mod.rs           # IoPort carves (COM1, CMOS, PM1a + 8042); no ECAM default

@@ -3,8 +3,8 @@
 
 // services/vfsd/src/partition.rs
 
-//! Disk and partition discovery: devmgr's block-device registry queried at
-//! every instance ordinal, and block-device I/O wrapped around the pure
+//! Disk and partition discovery: devmgr's `block` class queried at every
+//! instance ordinal, and block-device I/O wrapped around the pure
 //! [`gpt`] format parser on each disk found.
 //!
 //! This module owns the IPC — querying devmgr for each block driver,
@@ -30,7 +30,7 @@ use gpt::{
     GptEntry, GptError, GptHeader, MAX_BLOCK_SIZE, ScanStop, collect_partitions, parse_header,
 };
 use ipc::{
-    IpcMessage, blk_errors, blk_labels, devmgr_errors, devmgr_labels, memmgr_errors, memmgr_labels,
+    ClassCallError, IpcMessage, blk_errors, blk_labels, devmgr_errors, memmgr_errors, memmgr_labels,
 };
 use syscall_abi::MAP_WRITABLE;
 
@@ -43,7 +43,7 @@ const SECTOR_OFFSET_IN_MEMORY: u64 = 0;
 pub struct Disk
 {
     /// `blk_labels::MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` on the
-    /// disk's block driver, from `QUERY_BLOCK_DEVICE`. Every
+    /// disk's block driver, from `QUERY_DEVICE` on the `block` class. Every
     /// `REGISTER_PARTITION` for a partition of this disk goes here.
     pub blk_ep: u64,
     /// Every used GPT entry of this disk, parsed once at startup; empty when
@@ -53,7 +53,8 @@ pub struct Disk
 
 /// Query devmgr for every block driver it runs and parse each disk's GPT.
 ///
-/// Sends `QUERY_BLOCK_DEVICE` at instance ordinals 0, 1, ... and stops at
+/// Sends `QUERY_DEVICE` on `block_class`, the `block` class SEND, at
+/// instance ordinals 0, 1, ... and stops at
 /// the first reply that is neither `SUCCESS` nor `WITHDRAWN` (devmgr's reply
 /// past the last driver) or the first failed call. A `WITHDRAWN` ordinal, a
 /// driver devmgr served and withdrew when it died, is skipped: devmgr keeps
@@ -76,7 +77,7 @@ pub struct Disk
 /// only refused, so do the old page and its slot: at most one page per
 /// such disk, at startup.
 pub fn discover_disks(
-    registry_ep: u64,
+    block_class: u64,
     memmgr_ep: u64,
     self_aspace: u64,
     ipc_buf: *mut u64,
@@ -88,12 +89,12 @@ pub fn discover_disks(
     let mut ordinal: u64 = 0;
     loop
     {
-        match query_block_device(registry_ep, ordinal, ipc_buf)
+        match query_block_device(block_class, ordinal, ipc_buf)
         {
             BlockDeviceReply::End(label) =>
             {
                 std::os::seraph::log!(
-                    "disk {ordinal}: QUERY_BLOCK_DEVICE replied {label}; disk discovery ends"
+                    "disk {ordinal}: QUERY_DEVICE replied {label}; disk discovery ends"
                 );
                 break;
             }
@@ -104,7 +105,7 @@ pub fn discover_disks(
             }
             BlockDeviceReply::NoCap =>
             {
-                std::os::seraph::log!("disk {ordinal}: QUERY_BLOCK_DEVICE reply carried no cap");
+                std::os::seraph::log!("disk {ordinal}: QUERY_DEVICE reply carried no cap");
             }
             BlockDeviceReply::Disk(blk_ep) =>
             {
@@ -174,7 +175,7 @@ fn replace_scratch(
     }
 }
 
-/// The outcome of one `QUERY_BLOCK_DEVICE`.
+/// The outcome of one `QUERY_DEVICE` on the `block` class.
 enum BlockDeviceReply
 {
     /// A reply other than `SUCCESS` or `WITHDRAWN`, with its label: past the
@@ -193,32 +194,21 @@ enum BlockDeviceReply
     Disk(u64),
 }
 
-/// `QUERY_BLOCK_DEVICE` at instance ordinal `ordinal` (`data[1]`).
-fn query_block_device(registry_ep: u64, ordinal: u64, ipc_buf: *mut u64) -> BlockDeviceReply
+/// `QUERY_DEVICE` on `block_class` at instance ordinal `ordinal`.
+fn query_block_device(block_class: u64, ordinal: u64, ipc_buf: *mut u64) -> BlockDeviceReply
 {
-    let msg = IpcMessage::builder(devmgr_labels::QUERY_BLOCK_DEVICE)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .word(1, ordinal)
-        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(registry_ep, &msg, ipc_buf) })
-    else
+    match unsafe { ipc::query_device(block_class, ordinal, ipc_buf) }
     {
-        std::os::seraph::log!("disk {ordinal}: QUERY_BLOCK_DEVICE ipc_call failed");
-        return BlockDeviceReply::CallFailed;
-    };
-    if reply.label == devmgr_errors::WITHDRAWN
-    {
-        return BlockDeviceReply::Withdrawn;
-    }
-    if reply.label != devmgr_errors::SUCCESS
-    {
-        return BlockDeviceReply::End(reply.label);
-    }
-    match reply.caps().first().copied()
-    {
-        Some(cap) if cap != 0 => BlockDeviceReply::Disk(cap),
-        _ => BlockDeviceReply::NoCap,
+        Ok(cap) => BlockDeviceReply::Disk(cap),
+        Err(ClassCallError::Refused(devmgr_errors::WITHDRAWN)) => BlockDeviceReply::Withdrawn,
+        Err(ClassCallError::Refused(label)) => BlockDeviceReply::End(label),
+        Err(ClassCallError::NoCap) => BlockDeviceReply::NoCap,
+        Err(ClassCallError::Call(_)) =>
+        {
+            std::os::seraph::log!("disk {ordinal}: QUERY_DEVICE ipc_call failed");
+            BlockDeviceReply::CallFailed
+        }
     }
 }
 

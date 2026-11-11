@@ -25,20 +25,19 @@ virtio/input/
 
 ## Endpoint
 
-The driver carries a declaration in the ELF note section `.note.seraph.driver` (PCI `1AF4:1012`
-and `1AF4:1052`, class `input`, interrupt optional, DMA, auxiliary tier). Devmgr binds it to each
-matching virtio-input PCI device, carves the device's per-device capabilities (an
-`Mmio` cap for every BAR its VirtIO register regions name, its own derivation of its
-line's `Interrupt` cap, a line another device shares included, and the device's DMA
-capability), and spawns this driver from
-the rootfs (`/services/drivers/virtio-input`) — it is not bootstrap-essential, so it loads
-lazily through devmgr's `SET_DRIVERS_DIR` subtree cap, like the RTC drivers (see
-[docs/device-management.md](../../../../docs/device-management.md)). The driver
-reports `DRIVER_READY` on its devmgr query endpoint once its device is set up,
-immediately before its service loop, and devmgr serves its endpoint only after that
-report. Devmgr owns the service endpoint and mints clients an
-`input_labels::READ_AUTHORITY`-badged SEND cap via `devmgr_labels::QUERY_INPUT_DEVICE` (see
-[devmgr Responsibilities](../../../devmgr/docs/responsibilities.md#responsibilities)).
+The driver carries a declaration in the ELF note section `.note.seraph.driver` (PCI `1AF4:1012` and
+`1AF4:1052`, class `input`, interrupt optional, DMA, auxiliary tier). Devmgr binds it to each
+matching virtio-input PCI device, carves the device's per-device capabilities (an `Mmio` cap for
+every BAR its VirtIO register regions name, its own derivation of its line's `Interrupt` cap, a line
+another device shares included, and the device's DMA capability), and spawns this driver from the
+rootfs (`/services/drivers/virtio-input`) — it is not bootstrap-essential, so it loads lazily
+through devmgr's `SET_DRIVERS_DIR` subtree cap, like the RTC drivers (see
+[docs/device-management.md](../../../../docs/device-management.md)). The driver reports
+`DRIVER_READY` on its devmgr query endpoint once its device is set up, immediately before its
+service loop, and devmgr serves its endpoint only after that report. Devmgr owns the service
+endpoint and mints clients an `input_labels::READ_AUTHORITY`-badged SEND cap via
+`devmgr_labels::QUERY_DEVICE` on the `input` class SEND (see [devmgr
+Responsibilities](../../../devmgr/docs/responsibilities.md#responsibilities)).
 
 One device, one client for v0.1.0; multi-device fan-out is out of scope.
 

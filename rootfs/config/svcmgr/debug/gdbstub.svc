@@ -7,7 +7,7 @@
 # the target's name appended to `argv`, and repacks disk.img. See
 # services/gdbstub/README.md.
 #
-# seed = devmgr.debug is the DEBUG_PORT_AUTHORITY SEND for the debug port;
+# seed = devmgr.class.debug-port is the debug-port class SEND for the port;
 # `debug_authority = yes` makes svcmgr deliver a DEBUG_AUTHORITY SEND on
 # procmgr in the bootstrap slot after it, for LIST_PROCESSES, ATTACH_PROCESS,
 # and DETACH_PROCESS.
@@ -17,5 +17,5 @@ priority        = 15
 restart         = never
 critical        = no
 namespace       = none
-seed            = devmgr.debug
+seed            = devmgr.class.debug-port
 debug_authority = yes

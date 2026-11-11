@@ -14,8 +14,9 @@
 //! diagnostics and panic output to the serial driver, in the README's
 //! § Role and `docs/console-model.md`. `main` follows that order: bootstrap
 //! caps, the serial sink and panic sink, the dropped `log_send_cap`, the
-//! death EQ and its registration, the wait set, the handover pull, then the
-//! event loop.
+//! death EQ and its registration, the wait set, the handover pull, the
+//! release of the self-log lines held until init-logd stops writing the UART
+//! ([`SELF_LOG_HOLD`]), then the event loop.
 
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
@@ -25,6 +26,7 @@ mod slot;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
 use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
@@ -34,6 +36,7 @@ use ipc::stream_labels::{
     STREAM_REGISTER_NAME, level_of,
 };
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+use logd_codec::hold::HeldLines;
 use logd_codec::reclaim::{Cause, ReclaimLine};
 use logd_codec::record::RENDERED_MAX_BYTES;
 use std::os::seraph::startup_info;
@@ -65,12 +68,15 @@ struct BootCaps
     /// call `REGISTER_DEATH_EQ` at startup and, from the resync helper
     /// thread, `QUERY_LIVE_PROCESSES`. Kept across the lifetime of real-logd.
     procmgr_death_auth_send: u64,
-    /// SEND cap on devmgr's registry endpoint carrying
-    /// `REGISTRY_QUERY_AUTHORITY`. logd resolves the serial driver's
-    /// write endpoint through it via `QUERY_SERIAL_DEVICE`. Zero
-    /// disables serial output (logd then buffers received log lines in
-    /// memory only).
-    devmgr_registry_ep: u64,
+    /// The `serial` class SEND (svcmgr's `devmgr.class.serial`
+    /// publication). logd resolves the serial driver's write endpoint
+    /// through it via `QUERY_DEVICE`. Zero disables serial output (logd
+    /// then buffers received log lines in memory only).
+    serial_class: u64,
+    /// The `framebuffer` class SEND (svcmgr's `devmgr.class.framebuffer`
+    /// publication), through which logd resolves the framebuffer driver
+    /// the same way. Zero disables the framebuffer mirror.
+    fb_class: u64,
 }
 
 fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
@@ -87,8 +93,9 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
         log_ep_recv,
         log_ep_handover_send,
         procmgr_death_auth_send,
-        devmgr_registry_ep,
-    ] = unsafe { ipc::bootstrap::request_slots::<4>(creator_endpoint, ipc_buf) }.ok()?;
+        serial_class,
+        fb_class,
+    ] = unsafe { ipc::bootstrap::request_slots::<5>(creator_endpoint, ipc_buf) }.ok()?;
     if log_ep_recv == 0
     {
         return None;
@@ -97,7 +104,8 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
         log_ep_recv,
         log_ep_handover_send,
         procmgr_death_auth_send,
-        devmgr_registry_ep,
+        serial_class,
+        fb_class,
     })
 }
 
@@ -128,11 +136,12 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    // Record the devmgr-registry cap for the emit path. The
-    // serial driver is resolved lazily on first emit via
-    // `QUERY_SERIAL_DEVICE`; until then serial output is dropped (init-logd
-    // covered the pre-driver window) while history still accrues.
-    serial_init(caps.devmgr_registry_ep);
+    // Record the class SENDs for the emit path. The serial driver is
+    // resolved via `QUERY_DEVICE` on the `serial` class SEND before the
+    // handover pull (`resolve_output_drivers`), and again on a later emit
+    // while it is not resolvable; until then serial output is dropped
+    // (init-logd covered the pre-driver window) while history still accrues.
+    serial_init(caps.serial_class, caps.fb_class);
 
     // logd serves the log endpoint, so it must never emit through it. Route
     // panic / alloc-error / precondition output to the serial driver (the
@@ -156,20 +165,26 @@ fn main() -> !
     let Some(death_eq) = create_death_eq()
     else
     {
-        self_log("FATAL: death-EQ create failed; halting");
+        fatal("FATAL: death-EQ create failed; halting");
         syscall::thread_exit();
     };
     register_with_procmgr(caps.procmgr_death_auth_send, death_eq, ipc_buf);
+    // Resolve the serial and framebuffer drivers through devmgr now, while
+    // init-logd still drains the log endpoint: the first write that would
+    // resolve them is held until after the release, when the endpoint has no
+    // reader until the event loop, and devmgr may then be logging
+    // (`services/devmgr/docs/responsibilities.md`, the on-disk settle).
+    resolve_output_drivers(ipc_buf);
     let Some(resync_note) = create_resync_note()
     else
     {
-        self_log("FATAL: resync notification create failed; halting");
+        fatal("FATAL: resync notification create failed; halting");
         syscall::thread_exit();
     };
     let Some(ws_cap) = create_wait_set(caps.log_ep_recv, death_eq, resync_note)
     else
     {
-        self_log("FATAL: wait_set create failed; halting");
+        fatal("FATAL: wait_set create failed; halting");
         syscall::thread_exit();
     };
 
@@ -186,6 +201,10 @@ fn main() -> !
         // SAFETY: ipc_buf is the registered IPC buffer page.
         unsafe { handover::transfer(caps.log_ep_handover_send, ipc_buf, &mut table) };
         let _ = syscall::cap_delete(caps.log_ep_handover_send);
+        // Init-logd has acknowledged the release and writes no more (or no
+        // release reached it, and holding longer would only lose the lines):
+        // write the held self-log lines.
+        open_self_log();
 
         let mut buf = SerialFmt::new();
         let _ = write!(
@@ -200,7 +219,9 @@ fn main() -> !
     {
         // A svcmgr restart: there is no handover source (init-logd exited
         // after the first launch). Serve a fresh table; in-flight history
-        // from the prior instance is not recoverable.
+        // from the prior instance is not recoverable. No init-logd writes the
+        // UART, so nothing needs holding.
+        open_self_log();
         self_log("started (restart); no handover source, serving fresh");
     }
 
@@ -806,10 +827,13 @@ fn register_name(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: 
 
 // ── Serial output (driver-mediated) ────────────────────────────────────────
 
-/// SEND cap on devmgr's registry endpoint (`REGISTRY_QUERY_AUTHORITY`).
-static DEVMGR_REGISTRY_EP: AtomicU64 = AtomicU64::new(0);
+/// The `serial` class SEND on devmgr's registry endpoint.
+static SERIAL_CLASS: AtomicU64 = AtomicU64::new(0);
+/// The `framebuffer` class SEND on devmgr's registry endpoint.
+static FB_CLASS: AtomicU64 = AtomicU64::new(0);
 /// Resolved SEND cap on the serial driver's service endpoint, cached after
-/// the first successful `QUERY_SERIAL_DEVICE`. Zero = unresolved.
+/// the first successful `QUERY_DEVICE` on [`SERIAL_CLASS`]. Zero =
+/// unresolved.
 static SERIAL_CAP: AtomicU64 = AtomicU64::new(0);
 /// Resolved SEND cap on the framebuffer driver's service endpoint. `0` =
 /// not yet attempted; [`FB_UNAVAILABLE`] = attempted and no driver present
@@ -819,7 +843,7 @@ static SERIAL_CAP: AtomicU64 = AtomicU64::new(0);
 static FB_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Sentinel stored in [`FB_CAP`] once a resolution attempt finds no
-/// framebuffer driver. Repeating the `QUERY_FRAMEBUFFER_DEVICE` per log line
+/// framebuffer driver. Repeating the `QUERY_DEVICE` per log line
 /// would open a deadlock window against devmgr's own logging — devmgr →
 /// `log_ep` → logd, while logd blocks here on devmgr's reply — so the attempt
 /// is made exactly once. `u64::MAX` names no cap: no handle sets bit 63.
@@ -827,10 +851,11 @@ const FB_UNAVAILABLE: u64 = u64::MAX;
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` (one full IPC data area).
 const SERIAL_CHUNK: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
-/// Record the devmgr-registry cap for the emit path.
-fn serial_init(devmgr_registry_ep: u64)
+/// Record the class SENDs for the emit path.
+fn serial_init(serial_class: u64, fb_class: u64)
 {
-    DEVMGR_REGISTRY_EP.store(devmgr_registry_ep, Ordering::Release);
+    SERIAL_CLASS.store(serial_class, Ordering::Release);
+    FB_CLASS.store(fb_class, Ordering::Release);
 }
 
 /// The calling thread's registered IPC buffer, for the emit path's
@@ -842,8 +867,8 @@ fn emit_ipc_buf() -> *mut u64
     std::os::seraph::current_ipc_buf()
 }
 
-/// Resolve (and cache) the serial driver's SEND cap via devmgr's
-/// `QUERY_SERIAL_DEVICE`. Returns 0 while the driver is not yet resolvable
+/// Resolve (and cache) the serial driver's SEND cap via `QUERY_DEVICE` at
+/// ordinal 0 on the `serial` class. Returns 0 while the driver is not yet resolvable
 /// (devmgr not reachable, or driver not spawned); the caller then drops the
 /// bytes.
 fn resolve_serial_cap(ipc_buf: *mut u64) -> u64
@@ -853,32 +878,28 @@ fn resolve_serial_cap(ipc_buf: *mut u64) -> u64
     {
         return cached;
     }
-    let registry = DEVMGR_REGISTRY_EP.load(Ordering::Acquire);
-    if registry == 0
+    let class = SERIAL_CLASS.load(Ordering::Acquire);
+    if class == 0
     {
         return 0;
     }
-    let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_SERIAL_DEVICE)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
+    let Ok(cap) = (unsafe { ipc::query_device(class, 0, ipc_buf) })
     else
     {
         return 0;
     };
-    if reply.label != ipc::devmgr_errors::SUCCESS
-    {
-        return 0;
-    }
-    let reply_caps = reply.caps();
-    if reply_caps.is_empty()
-    {
-        return 0;
-    }
-    let cap = reply_caps[0];
     SERIAL_CAP.store(cap, Ordering::Release);
     cap
+}
+
+/// Resolve, and cache, the serial driver's and the framebuffer driver's SEND
+/// caps without writing anything: [`resolve_serial_cap`] and
+/// [`resolve_fb_cap`] on the calling thread's IPC buffer.
+fn resolve_output_drivers(ipc_buf: *mut u64)
+{
+    let _ = resolve_serial_cap(ipc_buf);
+    let _ = resolve_fb_cap(ipc_buf);
 }
 
 /// Write a fully-formatted line to the serial driver via one or more
@@ -912,11 +933,11 @@ fn serial_write(bytes: &[u8])
     }
 }
 
-/// Resolve (and cache) the framebuffer driver's SEND cap via devmgr's
-/// `QUERY_FRAMEBUFFER_DEVICE`. Returns 0 while the driver is not yet
-/// resolvable (devmgr unreachable, headless boot, or driver not spawned);
-/// the caller then skips the framebuffer mirror. Reuses the same registry
-/// cap and IPC buffer the serial path resolved through.
+/// Resolve (and cache) the framebuffer driver's SEND cap via `QUERY_DEVICE`
+/// at ordinal 0 on the `framebuffer` class. Returns 0 while the driver is
+/// not yet resolvable (devmgr unreachable, headless boot, or driver not
+/// spawned); the caller then skips the framebuffer mirror. Uses the same
+/// IPC buffer the serial path resolved through.
 fn resolve_fb_cap(ipc_buf: *mut u64) -> u64
 {
     let cached = FB_CAP.load(Ordering::Acquire);
@@ -928,42 +949,34 @@ fn resolve_fb_cap(ipc_buf: *mut u64) -> u64
     {
         return cached;
     }
-    let registry = DEVMGR_REGISTRY_EP.load(Ordering::Acquire);
-    if registry == 0
+    let class = FB_CLASS.load(Ordering::Acquire);
+    if class == 0
     {
-        // Registry not recorded yet (serial_init sets it before the drain
-        // loop); retry once it is.
+        // No class SEND recorded (serial_init sets it before the drain
+        // loop, and a boot without the framebuffer class has none): no IPC,
+        // so nothing to latch.
         return 0;
     }
-    let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
-    else
+    let cap = match unsafe { ipc::query_device(class, 0, ipc_buf) }
     {
+        Ok(cap) => cap,
         // Could not complete the query (transient — the call returned rather
         // than blocking, so this is not the logd↔devmgr deadlock path). Leave
         // the cache unset and retry on the next line, matching
-        // resolve_serial_cap; the serial cap resolves on this same registry
+        // resolve_serial_cap; the serial class resolves on the same devmgr
         // endpoint, so a hard failure here does not recur in practice.
-        return 0;
+        Err(ipc::ClassCallError::Call(_)) => return 0,
+        // devmgr answered with no driver.
+        Err(_) => 0,
     };
     // devmgr answered. Latch the outcome so the drain loop issues at most one
-    // more QUERY_FRAMEBUFFER_DEVICE: the resolved cap, or FB_UNAVAILABLE when
-    // devmgr reports no framebuffer driver (headless boot). The driver, when
+    // more QUERY_DEVICE: the resolved cap, or FB_UNAVAILABLE when devmgr
+    // reports no framebuffer driver (headless boot). The driver, when
     // present, is spawned before svcmgr launches logd, so this resolves it.
     // Latching the no-driver answer is what prevents a per-line re-query, which
     // would open a deadlock window against devmgr's own logging (devmgr →
     // log_ep → logd, while logd blocks here on devmgr's reply).
-    let cap = if reply.label == ipc::devmgr_errors::SUCCESS
-    {
-        reply.caps().first().copied().unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
     FB_CAP.store(
         if cap == 0 { FB_UNAVAILABLE } else { cap },
         Ordering::Release,
@@ -1098,10 +1111,9 @@ impl LineBuf
         }
     }
 
-    /// Push `[sec.usfrac] ` from the current monotonic clock.
-    fn push_timestamp(&mut self)
+    /// Push `[sec.usfrac] ` for `us` microseconds of the monotonic clock.
+    fn push_timestamp(&mut self, us: u64)
     {
-        let us = elapsed_us();
         self.push(b'[');
         self.push_decimal(us / 1_000_000);
         self.push(b'.');
@@ -1110,12 +1122,19 @@ impl LineBuf
         self.push(b' ');
     }
 
-    /// Push a line's `[sec.usfrac] [name] ` prefix, `[?]` for an empty
-    /// `name`, then the level's tag and a space for any level but info
+    /// Push a line's `[sec.usfrac] [name] ` prefix stamped now, `[?]` for an
+    /// empty `name`, then the level's tag and a space for any level but info
     /// (`logd_codec::level::tag`).
     fn push_prefix(&mut self, name: &[u8], level: u64)
     {
-        self.push_timestamp();
+        self.push_prefix_at(name, level, elapsed_us());
+    }
+
+    /// [`Self::push_prefix`], stamped `us` microseconds of the monotonic
+    /// clock.
+    fn push_prefix_at(&mut self, name: &[u8], level: u64, us: u64)
+    {
+        self.push_timestamp(us);
         self.push(b'[');
         let name = if name.is_empty()
         {
@@ -1178,20 +1197,92 @@ fn panic_to_serial(bytes: &[u8])
     serial_write(bytes);
 }
 
-/// Emit `[sec.usfrac] [logd] <payload>\r\n` to the serial driver. Used for
-/// logd's own diagnostics in place of `seraph::log!` (which would self-IPC
-/// into the endpoint logd serves).
+/// Emit `[sec.usfrac] [logd] <payload>\r\n` to the serial driver, stamped
+/// when called. Used for logd's own diagnostics in place of `seraph::log!`
+/// (which would self-IPC into the endpoint logd serves). Until
+/// [`open_self_log`], the line is held in [`SELF_LOG_HOLD`] instead; a payload
+/// longer than `LINE_BUF_SIZE` bytes is cut at a character boundary.
 fn self_log(payload: &str)
 {
+    let mut line = HeldLine {
+        us: elapsed_us(),
+        payload: SerialFmt::new(),
+    };
+    let _ = line.payload.write_str(payload);
+    let now = SELF_LOG_HOLD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .hold(line);
+    if let Some(line) = now
+    {
+        write_self_log(&line);
+    }
+}
+
+/// Most self-log lines [`SELF_LOG_HOLD`] keeps until init-logd stops writing
+/// the UART. A line past it is dropped and counted, and [`open_self_log`]
+/// reports the count in one line. A tuning value: logd self-logs at most
+/// three lines before the release (the death-EQ registration's outcome, a
+/// failed wait-set step, and the start of the pull).
+const SELF_LOG_HELD_MAX: usize = 8;
+
+/// One self-log line: when it was logged, and its text.
+struct HeldLine
+{
+    us: u64,
+    payload: SerialFmt,
+}
+
+/// logd's self-log lines from its start until init-logd has acknowledged
+/// `HANDOVER_RELEASE`. Until then init-logd writes each line it forwards to
+/// the UART directly, byte by byte, and the serial driver logd writes through
+/// drives the same UART under no lock the two share, so a line of each
+/// written at once interleaves byte by byte
+/// (`services/logd/docs/handover-protocol.md` § Startup ordering). The
+/// panic sink ([`panic_to_serial`]) is not held.
+static SELF_LOG_HOLD: Mutex<HeldLines<HeldLine, SELF_LOG_HELD_MAX>> = Mutex::new(HeldLines::new());
+
+/// Write one self-log line to the serial driver, stamped when it was logged.
+fn write_self_log(line: &HeldLine)
+{
     let mut out = LineBuf::new();
-    out.push_prefix(b"logd", LEVEL_INFO);
-    for b in payload.bytes()
+    out.push_prefix_at(b"logd", LEVEL_INFO, line.us);
+    for b in line.payload.as_str().bytes()
     {
         out.push_escaped(b);
     }
     out.push(b'\r');
     out.push(b'\n');
     out.flush();
+}
+
+/// Stop holding self-log lines: write the held ones in order, then one line
+/// for those dropped past [`SELF_LOG_HELD_MAX`], if any. A later call writes
+/// nothing.
+fn open_self_log()
+{
+    let dropped = SELF_LOG_HOLD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .open(|line| write_self_log(&line));
+    if dropped > 0
+    {
+        let mut buf = SerialFmt::new();
+        let _ = write!(
+            buf,
+            "{dropped} self-log lines dropped before the handover release (hold of \
+             {SELF_LOG_HELD_MAX})"
+        );
+        self_log(buf.as_str());
+    }
+}
+
+/// Self-log `payload` on the way to a halt, after the held lines: a halt
+/// before the handover release writes them now, since nothing would later.
+fn fatal(payload: &str)
+{
+    open_self_log();
+    self_log(payload);
 }
 
 /// Stack-buffer `fmt::Write` target for one-shot formatted diagnostics,

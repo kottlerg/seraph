@@ -80,16 +80,17 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    completes leaves init-logd serving and init's memory caps held until
    shutdown (a benign hold, not a wedge).
    svcmgr publishes the well-known names it now owns (`rootfs.root`,
-   `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, `devmgr.debug`,
-   `vfsd.mount`, `vfsd.deny`, `logd.query`) and installs
-   devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR` from the endowment (see
+   `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`,
+   `vfsd.mount`, `vfsd.deny`, `logd.query`), configures devmgr's device classes and publishes
+   each as `devmgr.class.<class>`, and installs devmgr's `/services/drivers/` cap via
+   `SET_DRIVERS_DIR` from the endowment (see
    [svcmgr IPC interface](../svcmgr/docs/ipc-interface.md)); it then
    launches the non-bootstrap services itself — real-logd (the log sink), `timed` and
    `pwrmgr` (providers), `terminal`, the staged test harnesses — and publishes their
    names (see [svcmgr](../svcmgr/README.md)). The per-arch RTC chip driver is
    spawned lazily by devmgr after `SET_DRIVERS_DIR` (see
    [devmgr responsibilities](../devmgr/docs/responsibilities.md#responsibilities)) and
-   resolved by [timed](../timed/README.md) via `QUERY_RTC_DEVICE`.
+   resolved by [timed](../timed/README.md) via `QUERY_DEVICE` on the rtc class SEND.
 
 See [docs/bootstrap.md](docs/bootstrap.md) for the authoritative
 stage-by-stage enumeration, source citations, and per-stage capability

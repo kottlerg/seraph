@@ -289,9 +289,6 @@ pub struct RestartCtx
     /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it, and a
     /// `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND|GRANT` cap.
     pub procmgr_death_auth_source: u64,
-    /// Badge-0 `SEND|GRANT` source on devmgr's registry endpoint. svcmgr mints
-    /// real-logd's `REGISTRY_QUERY_AUTHORITY` query cap from it.
-    pub devmgr_registry: u64,
 }
 
 /// Handle a service death detected via event queue notification.
@@ -516,7 +513,7 @@ fn restart_boot_caps(
 {
     if matches!(recipe, Some(r) if r.log_sink)
     {
-        return Some(mint_logd_boot_caps(ctx, LaunchKind::Restart));
+        return Some(mint_logd_boot_caps(ctx, LaunchKind::Restart, registry));
     }
 
     let mut restart_caps: Vec<u64> = match recipe

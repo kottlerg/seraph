@@ -58,7 +58,11 @@ direct console paths remain as fallbacks for the life of the system.
    [logd handover protocol](../services/logd/docs/handover-protocol.md)). This direct path is a
    fixed part of the boot design, not a stopgap: together with init's main thread, which writes
    the UART directly until init-logd is spawned, it is the only userspace writer until real-logd
-   takes the endpoint. The handover is unconditional, so if the serial driver never
+   takes the endpoint. real-logd starts before that and holds its own diagnostics until init-logd
+   has acknowledged the release, since the two writers share no lock and their lines would
+   interleave on the UART byte by byte; init-logd writes its last line before that
+   acknowledgement ([logd handover protocol](../services/logd/docs/handover-protocol.md)
+   § Startup ordering). The handover is unconditional, so if the serial driver never
    comes up, userspace serial output after the handover is dropped (real-logd keeps the lines in
    its history ring). init-logd has no direct-framebuffer path; before the framebuffer driver is
    up, userspace output reaches only the UART.
@@ -68,8 +72,8 @@ direct console paths remain as fallbacks for the life of the system.
    real-logd, every userspace UART writer routes bytes to it via
    `serial_labels::SERIAL_WRITE_BYTES`. real-logd
    (`services/logd/src/main.rs`) is the primary client: svcmgr launches and
-   supervises it, it resolves the driver's write endpoint through devmgr's
-   `devmgr_labels::QUERY_SERIAL_DEVICE`, and it emits both received log lines
+   supervises it, it resolves the driver's write endpoint through
+   `devmgr_labels::QUERY_DEVICE` sent on its serial class SEND, and it emits both received log lines
    and its own diagnostics through it — including its own panic / alloc-error
    output, routed here via a `std::os::seraph::set_panic_sink` sink rather than
    the log endpoint logd serves (logd deletes its seeded `log_send_cap` at
@@ -84,9 +88,10 @@ direct console paths remain as fallbacks for the life of the system.
    intended model, svcmgr holds the master-log endpoint source for the system's life, so a
    restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
    targets; the log senders are uninterrupted across the restart and need no re-derivation of
-   their `log_send_cap`. A restarted logd re-resolves the serial driver via `QUERY_SERIAL_DEVICE`
-   and resumes serial-mediated output. While logd is down, a sender's `STREAM_BYTES` call waits
-   at the kernel endpoint for at most its bound (`LOG_CALL_TIMEOUT_MS`, then
+   their `log_send_cap`. A restarted logd re-resolves the serial driver via `QUERY_DEVICE` on
+   the serial class SEND and resumes serial-mediated output. While logd is down, a sender's
+   `STREAM_BYTES` call waits at the kernel endpoint for at most its bound
+   (`LOG_CALL_TIMEOUT_MS`, then
    `LOG_CALL_UNANSWERED_TIMEOUT_MS` once one of the process's calls has gone unanswered, per
    [shared/log](../shared/log/README.md)), and a line no logd takes within it is dropped; the
    kernel panic console remains the guaranteed output path for any fault in that window. Today
@@ -101,16 +106,16 @@ direct console paths remain as fallbacks for the life of the system.
    framebuffer writers route bytes to it via `fb_labels::FB_WRITE_BYTES`.
    Consumers:
    - **real-logd** (`services/logd/src/main.rs`) resolves the framebuffer
-     write cap via `devmgr_labels::QUERY_FRAMEBUFFER_DEVICE` — the same
-     registry cap it already holds for the serial driver — and mirrors
+     write cap via `devmgr_labels::QUERY_DEVICE` sent on its framebuffer class SEND and mirrors
      every log line it writes to serial onto the framebuffer too, so the
      steady-state userspace log stream reaches the screen as well as the
      UART. The framebuffer driver, when present, is spawned before svcmgr launches logd;
      logd resolves the mirror once and, when devmgr reports no framebuffer driver (headless
      boot), latches it off for its lifetime, so serial stays the authoritative channel.
    - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
-     framebuffer write cap via `QUERY_FRAMEBUFFER_DEVICE` and renders its child's stdout — the
-     shell (#112) and anything the shell runs — to the screen, mirrored to serial.
+     framebuffer write cap via `QUERY_DEVICE` on its framebuffer class SEND and renders its
+     child's stdout — the shell (#112) and anything the shell runs — to the screen, mirrored to
+     serial.
      This is the production console path: ordinary programs do not resolve the
      framebuffer themselves; they write stdout and the terminal relays it.
      [programs/fb-charset/README.md](../programs/fb-charset/README.md) describes one such
@@ -156,7 +161,8 @@ console output reaches it, so the UART stays the console and the authoritative m
 Its driver
 ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md))
 serves the same serial protocol, and devmgr hands it only to the service whose definition seeds
-`devmgr.debug` ([device-management.md](device-management.md#relationship-to-other-services)
+`devmgr.class.debug-port`
+([device-management.md](device-management.md#relationship-to-other-services)
 § Relationship to Other Services).
 
 ## The framebuffer driver as sole userspace framebuffer owner

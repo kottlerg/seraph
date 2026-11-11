@@ -34,7 +34,7 @@ targets; only the one-time init-logd history pull
 * **Driver-mediated serial writer.** logd emits received log lines
   and its own diagnostics through the userspace serial driver
   (`services/drivers/serial/`), resolved once via devmgr's
-  `QUERY_SERIAL_DEVICE` and written with `SERIAL_WRITE_BYTES`. logd
+  `QUERY_DEVICE` on the `serial` class SEND and written with `SERIAL_WRITE_BYTES`. logd
   holds no UART hardware authority. It cannot route its own
   diagnostics through `seraph::log!` because it IS the log receiver;
   the macro would self-IPC into the endpoint logd serves and
@@ -44,12 +44,16 @@ targets; only the one-time init-logd history pull
   and logd deletes its procmgr-seeded `ProcessInfo.log_send_cap` at
   startup so no path can self-IPC. Until the driver is resolvable,
   serial output is dropped while history still accrues; early-boot
-  output is covered by init-logd's direct-UART fallback. See
+  output is covered by init-logd's direct-UART fallback. logd holds its
+  own diagnostics until init-logd, which writes the UART directly, has
+  acknowledged the handover release, so the two never write a line at
+  once (see [`docs/handover-protocol.md`](docs/handover-protocol.md)
+  § Startup ordering). See
   [docs/console-model.md](../../docs/console-model.md).
 
 * **Driver-mediated framebuffer mirror.** logd also mirrors each line
   it writes to serial onto the framebuffer, resolved at most once via
-  devmgr's `QUERY_FRAMEBUFFER_DEVICE` and written with `FB_WRITE_BYTES`,
+  devmgr's `QUERY_DEVICE` on the `framebuffer` class SEND and written with `FB_WRITE_BYTES`,
   so the steady-state userspace log stream reaches the screen as well as
   the UART (matching the early-kernel console). The mirror soft-degrades
   to a no-op when no framebuffer driver is present (headless boot),
@@ -147,10 +151,10 @@ logd/
 
 ## Bootstrap caps
 
-svcmgr's bootstrap rounds (four slots fit one round, marked `done`) fill four positional slots,
-carrying only the present caps and a presence word naming the slot each fills (an absent slot reads
-as `0`), minted from the reserved log-sink sources svcmgr holds (master-log endpoint, procmgr
-`SEND|GRANT`, devmgr registry; see
+svcmgr's bootstrap rounds (four slots fit a round, the last marked `done`) fill five positional
+slots, carrying only the present caps and a presence word naming the slot each fills (an absent slot
+reads as `0`), minted from the reserved log-sink sources svcmgr holds (master-log endpoint, procmgr
+`SEND|GRANT`, `devmgr.class.serial` and `devmgr.class.framebuffer` publications; see
 [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md) and
 [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 
@@ -159,10 +163,11 @@ as `0`), minted from the reserved log-sink sources svcmgr holds (master-log endp
 | 0 | RECV on the master log endpoint |
 | 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, repeated after a further drain while init-logd defers it, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). Absent on a restart — there is no init-logd left to pull from, so logd skips the handover (restart: design intent; not yet implemented (#262)) |
 | 2 | Badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
-| 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
+| 3 | The `serial` class SEND, derived from the `devmgr.class.serial` publication (to resolve the serial driver via `QUERY_DEVICE`) |
+| 4 | The `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (to resolve the framebuffer driver via `QUERY_DEVICE`) |
 
 logd registers its death-EQ with procmgr before the handover pull and keeps
-the devmgr-registry cap for its lifetime (see
+the two class SENDs for its lifetime (see
 [`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering and
 [`docs/ipc-interface.md`](docs/ipc-interface.md) § Bootstrap caps).
 

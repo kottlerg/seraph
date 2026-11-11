@@ -41,7 +41,7 @@ use gdbstub::control::{self, Plan};
 use gdbstub::session::{self, Kernel, Page, Resumed, Session, Stop};
 use gdbstub::{regs, signal, stop_signal};
 use ipc::{
-    IpcMessage, devmgr_errors, devmgr_labels, procmgr_errors, procmgr_labels, serial_errors,
+    ClassCallError, IpcMessage, devmgr_errors, procmgr_errors, procmgr_labels, serial_errors,
     serial_labels, svcmgr_labels,
 };
 
@@ -95,10 +95,10 @@ fn main()
         std::os::seraph::log!("DECLARE_NO_DEBUG not accepted; exiting");
         return;
     }
-    // The recipe's seed is `devmgr.debug`; `debug_authority = yes` delivers
-    // the authority cap in the slot after it.
+    // The recipe's seed is `devmgr.class.debug-port`; `debug_authority = yes`
+    // delivers the authority cap in the slot after it.
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok([registry, debug]) =
+    let Ok([debug_port_class, debug]) =
         (unsafe { ipc::bootstrap::request_slots::<2>(info.creator_endpoint, ipc_buf) })
     else
     {
@@ -111,12 +111,12 @@ fn main()
         std::os::seraph::log!("no target name in argv; exiting");
         return;
     };
-    if registry == 0 || debug == 0
+    if debug_port_class == 0 || debug == 0
     {
-        std::os::seraph::log!("devmgr.debug or the debug authority missing; exiting");
+        std::os::seraph::log!("devmgr.class.debug-port or the debug authority missing; exiting");
         return;
     }
-    let Some(port) = Port::open(registry, ipc_buf)
+    let Some(port) = Port::open(debug_port_class, ipc_buf)
     else
     {
         std::os::seraph::log!("no debug port served; exiting");
@@ -160,8 +160,8 @@ fn main()
 
 // ── The debug port ───────────────────────────────────────────────────────────
 
-/// The debug port: the serial-protocol cap devmgr hands the debug-port
-/// authority, and the notification its driver signals on receive (`0` with
+/// The debug port: the serial-protocol cap devmgr serves through the
+/// `debug-port` class SEND, and the notification its driver signals on receive (`0` with
 /// none registered).
 struct Port
 {
@@ -171,27 +171,27 @@ struct Port
 
 impl Port
 {
-    /// Take the port from devmgr, waiting out its driver's on-disk spawn,
-    /// and register an RX notification on it.
-    fn open(registry: u64, ipc_buf: *mut u64) -> Option<Self>
+    /// Take the port from devmgr through `debug_port_class`, the
+    /// `debug-port` class SEND (`QUERY_DEVICE` at ordinal 0), waiting out
+    /// its driver's on-disk spawn, and register an RX notification on it.
+    fn open(debug_port_class: u64, ipc_buf: *mut u64) -> Option<Self>
     {
         let mut cap = 0;
         for _ in 0..FIND_ATTEMPTS
         {
-            let req = IpcMessage::builder(devmgr_labels::QUERY_DEBUG_PORT_DEVICE)
-                .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-                .build();
             // SAFETY: ipc_buf is the registered IPC buffer.
-            let reply = unsafe { ipc::ipc_call(registry, &req, ipc_buf) }.ok()?;
-            match (reply.label, reply.caps().first())
+            match unsafe { ipc::query_device(debug_port_class, 0, ipc_buf) }
             {
-                (devmgr_errors::SUCCESS, Some(&c)) if c != 0 =>
+                Ok(c) =>
                 {
                     cap = c;
                     break;
                 }
-                (devmgr_errors::NO_DEVICE, _) => std::thread::sleep(FIND_INTERVAL),
-                _ => return None,
+                Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE)) =>
+                {
+                    std::thread::sleep(FIND_INTERVAL);
+                }
+                Err(_) => return None,
             }
         }
         if cap == 0

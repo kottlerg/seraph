@@ -21,8 +21,8 @@ debug-echo/
 
 ## Behaviour
 
-The fixture takes the debug port from devmgr with `QUERY_DEBUG_PORT_DEVICE`, through its
-recipe's `devmgr.debug` seed, retrying while devmgr replies `NO_DEVICE` (the virtio-console
+The fixture takes the debug port from devmgr with `QUERY_DEVICE`, through its recipe's
+`devmgr.class.debug-port` seed, retrying while devmgr replies `NO_DEVICE` (the virtio-console
 driver loads with devmgr's on-disk batch), registers an RX notification on it, and logs
 `READY on the debug port`. It exits, logging why, when the seed is absent or no debug port is
 served (a boot without `--debug-port`).
@@ -51,9 +51,9 @@ It invokes no shutdown: the host test computes the verdict and kills QEMU.
 
 The bootstrap round delivers the recipe's one seed:
 
-| Slot      | Cap                                                                         |
-|-----------|-----------------------------------------------------------------------------|
-| `caps[0]` | `devmgr.debug`: SEND on devmgr's registry endpoint with `DEBUG_PORT_AUTHORITY` |
+| Slot      | Cap                                                                   |
+|-----------|-----------------------------------------------------------------------|
+| `caps[0]` | `devmgr.class.debug-port`: the `debug-port` class SEND (serial `WRITE` and `READ` verbs) |
 
 ---
 

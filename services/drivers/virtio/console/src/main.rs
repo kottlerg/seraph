@@ -15,8 +15,8 @@
 //! receive queue holds, and an RX-notify registration has the
 //! interrupt-service thread signal the client's notification.
 //!
-//! devmgr hands the endpoint only to the holder of the debug-port authority
-//! (`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`): this is the debug port, not a
+//! devmgr hands the endpoint only to a holder of the `debug-port` class SEND
+//! (`devmgr_labels::QUERY_DEVICE`): this is the debug port, not a
 //! console. Any driver that serves the same protocol (a UART driver on
 //! hardware) can stand in for it, so the consumer never learns the
 //! transport.
@@ -55,6 +55,7 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     instance_limit: Some(1),
     interrupt: driver_binding::decl::Interrupt::OPTIONAL,
     dma: true,
+    dma_width: None,
     phys_access: false,
     reset: driver_binding::decl::Reset::VirtioStatus,
     tier: driver_binding::decl::Tier::Auxiliary,

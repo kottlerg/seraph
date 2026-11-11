@@ -6,19 +6,21 @@
 //! Pure `.svc` service-definition types and parser for svcmgr.
 //!
 //! Holds the plain-data recipe record ([`Definition`] and its component
-//! enums), the `key = value` parser ([`parse`]), the argv/env wire-blob
-//! encoder ([`build_blob`]) whose output the parser bounds by the child's
-//! argv/env region, and the policies svcmgr applies at runtime:
-//! the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
+//! enums), the `key = value` parser ([`parse`]) and that of the device
+//! class files svcmgr configures devmgr's classes from ([`class`]), the
+//! argv/env wire-blob encoder ([`build_blob`]) whose output the parser
+//! bounds by the child's argv/env region, and the policies svcmgr applies at
+//! runtime: the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
 //! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), and the windowed restart
 //! budget ([`RestartBudget`]). Nothing here touches a syscall, IPC, or
 //! `std::os::seraph` surface, so the whole crate is host-reachable and
-//! host-tested — the `.svc` files are external input and their parser
-//! carries unit tests per
+//! host-tested — the `.svc` and class files are external input and their
+//! parsers carry unit tests per
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 //! The impure launch/restart machinery that consumes a parsed [`Definition`]
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
+pub mod class;
 pub mod parse;
 pub mod restart_budget;
 
@@ -176,9 +178,10 @@ pub struct Definition
     pub provides: Vec<ProvidedName>,
     /// `log_sink = yes` marks the service as the system log sink (real-logd).
     /// svcmgr mints its bootstrap round — master-log RECV, the first-launch
-    /// `HANDOVER_PULL` SEND, a `DEATH_EQ_AUTHORITY` `SEND|GRANT`, and a
-    /// `devmgr.registry` query cap — from the reserved log-sink sources and
-    /// the `devmgr.registry` source it holds, rather than from `seed` /
+    /// `HANDOVER_PULL` SEND, a `DEATH_EQ_AUTHORITY` `SEND|GRANT`, and the
+    /// `serial` and `framebuffer` class SENDs — from the reserved log-sink
+    /// sources and its `devmgr.class.serial` and `devmgr.class.framebuffer`
+    /// publications, rather than from `seed` /
     /// `provides` (which the parser rejects in combination). Exactly one
     /// recipe carries this; supervision/restart otherwise follow the normal
     /// `restart`/`critical` fields.

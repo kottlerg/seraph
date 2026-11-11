@@ -152,9 +152,10 @@ devmgr's responsibilities are:
   records a mapping of the Memory cap a driver sends, which devmgr keeps while
   the mapping stands, and replies its device address, and `DMA_UNMAP` removes
   one (`ipc::devmgr_dma_labels`). For a confined device the address is an IOVA
-  devmgr allocates in the device's own IOVA space
-  (`devmgr_firmware::dma::iova_limit`), and the thread has the IOMMU driver
-  install the mapping (`MAP`, moving it a derivation of the cap) before it
+  devmgr allocates in the device's own IOVA space, below the smaller of the
+  unit's translated width and the DMA address width the bound declaration
+  states (`devmgr_firmware::dma::iova_limit`), and the thread has the IOMMU
+  driver install the mapping (`MAP`, moving it a derivation of the cap) before it
   replies, and remove it (`UNMAP`) before it deletes the cap; a refused or
   failed IOMMU call replies `IOMMU_FAILED`. The thread serves it apart from the registry
   loop because that loop makes nested calls and settles batches during which
@@ -310,11 +311,11 @@ devmgr's responsibilities are:
   no boot, for the same reasons. Nor has the deletion of a lent cap in a
   virtio-blk reply that fails: it needs the driver's client to die, or run out
   of slots, mid-request, and no test process can call the driver, since only
-  vfsd and fatfs hold a SEND on it (svctest's devmgr phase checks that svctest
-  holds no `BLOCK_DEVICE_AUTHORITY`).
+  vfsd and fatfs hold a SEND on it (svctest's devmgr phase checks that
+  `QUERY_DEVICE` on a registry SEND without a class slot replies `UNAUTHORIZED`).
 
   The catalog entry of a withdrawn driver, or of one that failed to spawn,
-  stays, so a badge is never reused. No `QUERY_*` reply hands out the endpoint
+  stays, so a badge is never reused. No `QUERY_DEVICE` reply hands out the endpoint
   of a driver that has not reported its device ready.
 
   The settle bound, `SETTLE_TIMEOUT` (`services/devmgr/src/settle.rs`), is
@@ -366,11 +367,11 @@ devmgr's responsibilities are:
 
   The serving order follows from where each batch settles. The boot batch
   settles during initial enumeration, before the registry loop opens. vfsd's
-  `QUERY_BLOCK_DEVICE` probes, and every query of the serial and framebuffer
+  block class probes, and every query of the serial and framebuffer
   drivers, wait in the registry endpoint's queue until then. The on-disk
   batch settles in the `SET_DRIVERS_DIR` handler, after its reply and before
-  the next receive, so `QUERY_RTC_DEVICE`, `QUERY_INPUT_DEVICE`, and
-  `QUERY_DEBUG_PORT_DEVICE` see the settled drivers. While a batch settles,
+  the next receive, so `QUERY_DEVICE` on the rtc, input, and debug-port
+  classes sees the settled drivers. While a batch settles,
   devmgr receives on no registry endpoint, and every registry caller waits for
   the settle, at most the settle bound plus the bound of each withdrawn
   device's reset (above). devmgr
@@ -383,12 +384,12 @@ devmgr's responsibilities are:
   the boot settle, before handover, that receiver is init-logd, which never
   calls devmgr; the serial and framebuffer drivers do not log at all. During
   the on-disk settle it may be logd. logd calls devmgr only to resolve the
-  serial and framebuffer drivers on its first emit. That emit comes before its
-  `HANDOVER_PULL`, while init-logd still drains the log endpoint, and logd
-  caches both outcomes. The precondition fails only when the serial driver
-  cannot be resolved: logd then queries `QUERY_SERIAL_DEVICE` again on later
-  emits, and devmgr's own logging in that handler, and the line it logs when
-  it withdraws a served driver, already have the same deadlock window.
+  serial and framebuffer drivers. It resolves both before its
+  `HANDOVER_PULL`, while init-logd still drains the log endpoint, and caches
+  both outcomes. The precondition fails only when the serial driver cannot be
+  resolved: logd then queries the `serial` class (`QUERY_DEVICE`) again on
+  later emits, and devmgr's own logging in that handler, and the line it logs
+  when it withdraws a served driver, already have the same deadlock window.
 
   Driver binaries are sourced from one of two places:
 
@@ -419,40 +420,59 @@ devmgr's responsibilities are:
     skipped when every device is bound. Each spawn is
     at-most-once per boot; failure, including an on-disk driver's death, or
     its overrun of the settle bound, before it reports ready, is sticky and
-    surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_RTC_DEVICE`,
-    `QUERY_INPUT_DEVICE`, and `QUERY_DEBUG_PORT_DEVICE` queries, the same reply
+    surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
+    the rtc, input, and debug-port classes, the same reply
     as before the spawn has run, so a client retries it only a bounded number of times. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
-  every block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
-  (`QUERY_SERIAL_DEVICE`), `programs/terminal` resolves the framebuffer and
-  input drivers (`QUERY_FRAMEBUFFER_DEVICE` / `QUERY_INPUT_DEVICE`), timed
-  resolves the platform RTC (`QUERY_RTC_DEVICE`), and netd (design intent; not
-  yet implemented, #30). devmgr owns each driver's service endpoint and mints a
-  badged SEND on query. `QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select
-  one driver of their class by an optional instance ordinal in `data[1]`
-  (absent means the first), counted over the served drivers (those that
-  reported their device ready) in PCI segment, bus, device, function order and
-  not stable across boots; a withdrawn driver's ordinal replies `WITHDRAWN`
-  (above).
-  `QUERY_BLOCK_DEVICE`, whose reply is the `MOUNT_AUTHORITY`-badged whole-disk
-  cap, is gated on `BLOCK_DEVICE_AUTHORITY`, which only the registry cap init
-  mints for vfsd carries. The serial,
-  framebuffer, RTC, and input queries are gated on `REGISTRY_QUERY_AUTHORITY`,
-  which every consumer query cap carries: svcmgr's `devmgr.*` publications,
-  the cap svcmgr mints for logd at launch, and vfsd's.
-  `QUERY_DEBUG_PORT_DEVICE` answers with the debug port: the driver served
-  under the `debug-port` class, which virtio-console declares with an
+  every block device, logd the serial and framebuffer drivers,
+  `programs/terminal` the framebuffer, input, and serial drivers, timed the
+  platform RTC, and netd (design intent; not yet implemented, #30). devmgr
+  owns each driver's service endpoint and mints a badged SEND on query. One
+  label, `QUERY_DEVICE`, serves every class, sent on a *class SEND*: a SEND on
+  the registry endpoint whose badge names a class slot and the verb bits the
+  reply carries (`devmgr_labels::class_badge`). The class and the verbs come
+  from the badge, never the message; `data[1]` is the instance ordinal
+  (absent means the first), counted over the class's served drivers (those
+  that reported their device ready) in PCI segment, bus, device, function
+  order and not stable across boots. A registry SEND without a class slot
+  (`devmgr.registry`, `devmgr.test`) gets `UNAUTHORIZED`. A withdrawn driver's
+  ordinal replies `WITHDRAWN` (above) and an ordinal past the last served
+  driver of the class `NO_DEVICE`. The query logs nothing.
+
+  devmgr mints class SENDs on `MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`
+  (badge bit 59), which svcmgr and init each derive from their badge-0
+  registry source and no published name carries. The request carries the verbs, the flags
+  (`CLASS_BOOT_ONLY`), and the class name (at most `MAX_CLASS_NAME_BYTES`, 32,
+  bytes); devmgr interns the class into its class table and replies a SEND
+  whose badge carries the class's slot and the verbs. svcmgr sends one per
+  class file before `SET_DRIVERS_DIR` ([service-definitions.md § Device class
+  files](../../svcmgr/docs/service-definitions.md#device-class-files)); init requests the
+  `block` class SEND for vfsd. The class table holds at most
+  `MAX_CLASSES` (64) classes: a new class's request past it is refused, and a
+  ready driver of a new class is withdrawn, logged. devmgr refuses, logging
+  and not binding, a drivers-directory declaration whose class a request
+  marked boot-only, and refuses `INVALID_REQUEST` a boot-only mark after the
+  drivers-directory pass began. After the drivers-directory settle devmgr logs
+  each class configured with no served driver and each served class no class
+  file configured.
+
+  The `block` class's reply is the `MOUNT_AUTHORITY`-badged whole-disk cap, so
+  its class file marks it boot-only, and it reaches only vfsd, through the
+  class SEND init requests for it, and a service whose definition seeds
+  `devmgr.class.block`, which no shipped definition does. The `debug-port`
+  class answers with the debug port: the driver served under that class,
+  which virtio-console declares with an
   instance limit of 1, so it is bound to the first virtio-console device in
   PCI order. It serves the serial protocol
   ([services/drivers/virtio/console/README.md](../../drivers/virtio/console/README.md)),
   a byte transport apart from the console's UART that a debugger stub owns. Its
-  reply reads and writes the port, so it is gated on `DEBUG_PORT_AUTHORITY`,
-  which svcmgr mints only onto the seed-only `devmgr.debug` name; a further
-  console device is left unbound, and a boot with none has no debug port.
-  Each query looks its class up by name in the class table devmgr interns the
-  declared class names into (`devmgr_firmware::classes::Classes`).
+  reply reads and writes the port, so only a service whose definition seeds
+  `devmgr.class.debug-port` reaches it; a further console device is left
+  unbound, and a boot with none has no debug port. Each query looks its class
+  up by slot in the class table devmgr interns the class names into
+  (`devmgr_firmware::classes::Classes`).
 - **Broker ACPI and shutdown hardware to pwrmgr** — devmgr is the sole
   owner of the ACPI Memory caps and the only service that walks the ACPI
   table tree (RSDP → XSDT). `QUERY_ACPI_TABLE` locates a table by
@@ -506,7 +526,7 @@ how devmgr uses them.
 
 | Capability | Rights | Purpose |
 |---|---|---|
-| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_*_DEVICE`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and the test-only `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` / `TEST_QUERY_DENY_DEVICE` / `TEST_SPAWN_FAULT_DRIVERS` / `TEST_QUERY_FAULT_DEVICE` / `TEST_QUERY_DMA_DEVICE` / `TEST_DMA_FAULTS` labels the enumeration redesign removes (#165) on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). The test labels are gated on `TEST_LABEL_AUTHORITY`, which only the `devmgr.test` cap carries: a seed-only name svctest alone seeds. `TEST_QUERY_DENY_DEVICE` mints a SEND on the serial, input, or framebuffer driver's endpoint badged `TEST_DENY_BADGE`, which carries none of the driver's verb bits, so svctest can assert each driver's `UNAUTHORIZED` reply; every other SEND devmgr mints on those endpoints carries the bits |
+| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and the test-only `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` / `TEST_QUERY_DENY_DEVICE` / `TEST_SPAWN_FAULT_DRIVERS` / `TEST_QUERY_FAULT_DEVICE` / `TEST_QUERY_DMA_DEVICE` / `TEST_DMA_FAULTS` labels the enumeration redesign removes (#165) on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). The test labels are gated on `TEST_LABEL_AUTHORITY`, which only the `devmgr.test` cap carries: a seed-only name svctest alone seeds. `TEST_QUERY_DENY_DEVICE` takes a class name (`data[1]` = its length, `data[2..]` = its bytes) and mints a SEND on that class's driver endpoint badged `TEST_DENY_BADGE`, which carries none of the driver's verb bits, so svctest can assert each driver's `UNAUTHORIZED` reply; every other SEND devmgr mints on those endpoints carries the bits |
 | Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr moves to the IOMMU driver; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps delegated to drivers |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |

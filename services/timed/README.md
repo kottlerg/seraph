@@ -2,7 +2,7 @@
 
 Userspace wall-clock service. RTC-source agnostic: resolves the
 platform RTC via devmgr's
-[`devmgr_labels::QUERY_RTC_DEVICE`](../../shared/ipc/src/lib.rs) once
+[`devmgr_labels::QUERY_DEVICE`](../../shared/ipc/src/lib.rs) on the `rtc` class once
 at startup, computes a fixed offset against the kernel's monotonic
 clock, then serves
 [`timed_labels::GET_WALL_TIME`](../../shared/ipc/src/lib.rs) from
@@ -32,15 +32,15 @@ runs on every supported arch.
 
 Bootstrap caps from svcmgr (one round, `done=true`, carrying the two slots below with the
 presence word of [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed);
-recipe `provides = timed`, `seed = devmgr.registry`):
+recipe `provides = timed`, `seed = devmgr.class.rtc`):
 
 | Slot      | Cap                                                          |
 |-----------|--------------------------------------------------------------|
 | `caps[0]` | Service-endpoint RECV (timed receives on this)               |
-| `caps[1]` | SEND on devmgr's registry endpoint, badged with `REGISTRY_QUERY_AUTHORITY` |
+| `caps[1]` | `devmgr.class.rtc`: the `rtc` class SEND |
 
-No other caps are needed; the registry SEND is used once for the
-`QUERY_RTC_DEVICE` resolve.
+No other caps are needed; the class SEND is used once for the
+`QUERY_DEVICE` resolve, at instance ordinal 0.
 
 ---
 
@@ -55,7 +55,7 @@ No other caps are needed; the registry SEND is used once for the
   at request time. `offset` is fixed at startup; future NTP discipline
   will update it in place without any client-side change.
 
-If `QUERY_RTC_DEVICE` resolution failed at startup (no RTC reachable
+If `QUERY_DEVICE` resolution failed at startup (no RTC reachable
 through devmgr), timed enters a degraded state and replies
 `timed_errors::WALL_CLOCK_UNAVAILABLE` to every `GET_WALL_TIME`.
 
@@ -63,9 +63,9 @@ through devmgr), timed enters a degraded state and replies
 
 ## Startup Sequence
 
-1. Pull the service endpoint and devmgr-registry SEND via the
+1. Pull the service endpoint and `rtc` class SEND via the
    spawner's bootstrap round.
-2. `devmgr.QUERY_RTC_DEVICE` → `READ_AUTHORITY`-badged SEND on the
+2. `devmgr.QUERY_DEVICE` (ordinal 0) → `READ_AUTHORITY`-badged SEND on the
    per-board RTC driver bound by devmgr.
 3. `rtc_driver.RTC_GET_EPOCH_TIME` → `rtc_us` (Unix-epoch us).
 4. Bracket the RTC read with two `system_info(ElapsedUs)` samples; `kernel_us` is their
@@ -87,7 +87,7 @@ monotonic time since.
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System-wide service inventory; timed's role |
-| [docs/device-management.md](../../docs/device-management.md) | devmgr's `QUERY_RTC_DEVICE` broker and RTC driver binding |
+| [docs/device-management.md](../../docs/device-management.md) | devmgr's `QUERY_DEVICE` broker and RTC driver binding |
 | [Restart Protocol](../svcmgr/docs/restart-protocol.md) | timed's `restart = on_failure`, `critical = no` supervision |
 
 ---

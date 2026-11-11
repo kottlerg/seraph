@@ -108,7 +108,7 @@ subsystem, mirroring the kernel's own source layout.
 | `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` and an over-maximum length refused with `InvalidArgument` |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
-| `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including a second concurrent `wait_set_wait` refused with `InvalidState` and a ready-ring entry skipped once its endpoint's only sender is stopped, as [docs/ipc-design.md § Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) defines |
+| `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including two threads waiting on one set at once, each arrival on a member waking one of them, a member that takes several arrivals holding one ready-ring entry so another member's still reaches a waiter, a member's backlog served in turn while another member keeps taking arrivals, work a woken waiter leaves returned by a later wait, and a ready-ring entry skipped once its endpoint's only sender is stopped, as [docs/ipc-design.md § Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) defines |
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; the suspended start (`THREAD_START_SUSPENDED`: a configured thread left `Stopped`, unrun, its entry in its register file, then resumed from a frame a register write redirected); the reserved badge word of `SYS_THREAD_SET_FAULT_HANDLER`; `SYS_SCHED_SPLIT`; the `SYS_CAP_CREATE_THREAD` priority arguments |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
@@ -157,7 +157,7 @@ concurrent notification and queue events.
 | `ipc_call_interrupted_stop_start.rs` | A client stopped while parked in `ipc_call` and then restarted returns `Interrupted`, never a stale reply (#361) |
 | `park_interrupted_stop_start.rs` | A thread stopped while parked in any non-call blocking syscall and then restarted returns `Interrupted`, never a stale wake deposit (#363) |
 | `reply_binding_displaced.rs` | A server that receives again without replying releases the caller its earlier receive bound, as [docs/ipc-design.md § The Call/Reply Model](../../docs/ipc-design.md#the-callreply-model) defines: a released `ipc_call` returns `Interrupted` and the released caller stops and restarts; a released fault-blocked thread, still alive before the later receive, is killed with the fault exit reason; the later receive's caller gets its reply |
-| `destroyed_source_interrupts.rs` | Every waiter parked on a notification (two untimed or two timed), an event queue (two), or a wait set (one) destroyed under it returns `Interrupted`, never a fabricated success, as [docs/ipc-design.md § Notifications](../../docs/ipc-design.md#notifications), [§ Event Queues](../../docs/ipc-design.md#event-queues), and [§ Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) define |
+| `destroyed_source_interrupts.rs` | Every waiter parked on a notification (two untimed or two timed), an event queue (two), or a wait set (two) destroyed under it returns `Interrupted`, never a fabricated success, as [docs/ipc-design.md § Notifications](../../docs/ipc-design.md#notifications), [§ Event Queues](../../docs/ipc-design.md#event-queues), and [§ Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) define |
 | `queued_waiters_fifo.rs` | Two threads waiting on one notification or event queue are woken in arrival order, as [docs/ipc-design.md § Notifications](../../docs/ipc-design.md#notifications) and [§ Event Queues](../../docs/ipc-design.md#event-queues) define: each delivery wakes the longest waiter only, and a queued waiter whose timed wait expires (at the head or the tail) leaves the other waiting for the next delivery |
 | `cap_delegation_chain.rs` | Multi-level rights attenuation and cascaded revocation |
 | `tlb_coherency.rs` | Map/unmap cycles across CPUs to exercise TLB shootdown, then the same with `mem_unmap_reclaim` |
@@ -274,7 +274,7 @@ child waits of `integration::stop_read_regs_remote`; the
 probe and redirect polls of `integration::write_regs_blocked_syscall`; the report bounds of
 `integration::cross_cspace_revoke_no_alias`, `integration::reply_binding_displaced`,
 `integration::destroyed_source_interrupts`, `integration::fault_syscall_buffer`,
-`wait_set::occupied_wait_refused` and `wait_set::stale_endpoint_entry_skipped`; the post waits of
+`wait_set::shared_set_waiters` and `wait_set::stale_endpoint_entry_skipped`; the post waits of
 `event::recv_timeout_payload_zero_wins` and `event::recv_timeout_payload_nonzero_wins`; the exit,
 event and memory polls of `integration::fault_kills_thread`,
 `integration::fault_exception_no_handler_kills`, `integration::fault_handler_declines_kills`,

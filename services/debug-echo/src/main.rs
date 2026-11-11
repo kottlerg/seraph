@@ -27,7 +27,8 @@ const READY_MARKER: &str = "READY on the debug port";
 const ECHO_QUERY: &[u8] = b"qSeraph.Echo:";
 
 /// How often, and how long apart, the fixture asks devmgr for the debug port
-/// while its driver's on-disk spawn has not yet settled.
+/// while devmgr has not yet received the drivers directory its driver loads
+/// from.
 const QUERY_ATTEMPTS: u32 = 200;
 const QUERY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -78,8 +79,9 @@ fn bootstrap_seed(creator_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 
 /// Ask devmgr for the debug port through `debug_port_class`, the
 /// `debug-port` class SEND (`QUERY_DEVICE` at ordinal 0), waiting out its
-/// driver's on-disk spawn: devmgr replies `NO_DEVICE` until that batch
-/// settles.
+/// driver's on-disk spawn: devmgr replies `NO_DEVICE` until
+/// `SET_DRIVERS_DIR` arrives, and a query received after that waits in
+/// devmgr until the on-disk batch has settled.
 fn query_debug_port(debug_port_class: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     for _ in 0..QUERY_ATTEMPTS

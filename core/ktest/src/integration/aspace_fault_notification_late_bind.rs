@@ -116,7 +116,13 @@ impl Drop for RoundCaps
 {
     fn drop(&mut self)
     {
-        for cap in [self.eq, self.thread_eq, self.thread, self.cspace, self.aspace]
+        for cap in [
+            self.eq,
+            self.thread_eq,
+            self.thread,
+            self.cspace,
+            self.aspace,
+        ]
         {
             if cap != 0
             {

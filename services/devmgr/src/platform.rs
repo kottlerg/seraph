@@ -71,7 +71,11 @@ pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable]) -> Pla
             shared: false,
             isa: i.isa,
         });
-        add(&mut records, identity, core::iter::once(base).chain(interrupt));
+        add(
+            &mut records,
+            identity,
+            core::iter::once(base).chain(interrupt),
+        );
     }
     platform_table(acpi.oem_table_id, tables_found, &mut records);
     for (index, record) in records.records().iter().enumerate()

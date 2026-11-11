@@ -1120,7 +1120,10 @@ mod tests
             flags: 0,
         }];
         assert_eq!(isa_line(other, 4, 0), (4, 0));
-        assert_eq!(isa_line([], 8, IRQ_MODE_ACTIVE_LOW), (8, IRQ_MODE_ACTIVE_LOW));
+        assert_eq!(
+            isa_line([], 8, IRQ_MODE_ACTIVE_LOW),
+            (8, IRQ_MODE_ACTIVE_LOW)
+        );
     }
 
     #[test]
@@ -1134,7 +1137,10 @@ mod tests
             }]
         };
         // Level, active-low.
-        assert_eq!(isa_line(iso(0b1111), 4, 0), (20, IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW));
+        assert_eq!(
+            isa_line(iso(0b1111), 4, 0),
+            (20, IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW)
+        );
         // Edge, active-high, over a described level active-low line.
         assert_eq!(isa_line(iso(0b0101), 4, PCI_INTX_MODE), (20, 0));
         // Both fields conform: the described mode.

@@ -419,7 +419,10 @@ mod tests
     {
         let mut set = PlatformRecords::new();
         assert_eq!(set.add(hid("PNP0C0F"), [irq(5)]), Added::Unusable);
-        assert_eq!(set.add(Identity::default(), [mmio(0x1000)]), Added::Unusable);
+        assert_eq!(
+            set.add(Identity::default(), [mmio(0x1000)]),
+            Added::Unusable
+        );
         assert!(set.records().is_empty());
     }
 

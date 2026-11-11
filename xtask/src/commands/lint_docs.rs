@@ -57,6 +57,8 @@ const RULES: &[(&str, Level)] = &[
     ("src-header", Level::Error),
     ("md-summarized-by", Level::Error),
     ("md-backlink-forward", Level::Error),
+    ("md-summarized-by-order", Level::Error),
+    ("md-summarized-by-label", Level::Error),
     ("md-reachable", Level::Error),
     ("md-coverage-symbols", Level::Error),
     ("md-bare-cite", Level::Warning),
@@ -235,6 +237,9 @@ struct Patterns
     /// A Markdown inline link, including a badge whose text is an image; group 1
     /// is the outer target.
     md_link: Regex,
+    /// A plain Markdown link, as a `## Summarized By` entry is written; group 1
+    /// is the label, group 2 the target.
+    entry_link: Regex,
 }
 
 impl Patterns
@@ -247,6 +252,7 @@ impl Patterns
             )?,
             bare_cite: Regex::new(r"\(see [A-Za-z0-9_./-]+\.md\)")?,
             md_link: Regex::new(r"\[(?:!\[[^\]]*\]\([^)]*\)|[^\]]*)\]\(([^)\s]+)\)")?,
+            entry_link: Regex::new(r"\[([^\]]*)\]\(([^)\s]+)\)")?,
         })
     }
 }
@@ -474,7 +480,7 @@ fn header_violation(path: &str, text: &str) -> Option<(usize, String)>
     None
 }
 
-// ── md-summarized-by, md-backlink-forward ────────────────────────────────────
+// ── md-summarized-by, md-backlink-forward, md-summarized-by-order/-label ─────
 
 /// Prose paragraphs of `text` outside fenced code: each maximal run of
 /// consecutive non-blank prose lines joined with single spaces, so a link whose
@@ -656,6 +662,10 @@ fn check_summarized_by(pat: &Patterns, markdown: &[&SourceFile]) -> Vec<Diagnost
         .iter()
         .map(|f| (f.path.as_str(), link_targets(pat, &f.path, &f.text)))
         .collect();
+    let titles: BTreeMap<&str, String> = markdown
+        .iter()
+        .filter_map(|f| title_of(&f.text).map(|t| (f.path.as_str(), t)))
+        .collect();
     let mut diags = Vec::new();
     for file in markdown.iter().filter(|f| is_authoritative(&f.path))
     {
@@ -674,6 +684,7 @@ fn check_summarized_by(pat: &Patterns, markdown: &[&SourceFile]) -> Vec<Diagnost
             }
         };
         let line = file.text.lines().count();
+        diags.extend(check_entry_form(pat, file, &titles));
         for entry in entries
         {
             match links.get(entry.as_str())
@@ -693,6 +704,89 @@ fn check_summarized_by(pat: &Patterns, markdown: &[&SourceFile]) -> Vec<Diagnost
                 Some(_) =>
                 {}
             }
+        }
+    }
+    diags
+}
+
+/// A document's `# Title`: its first prose line that is a level-one heading.
+fn title_of(text: &str) -> Option<String>
+{
+    prose_lines(text)
+        .map(|(_, l)| l.trim_end())
+        .find_map(|l| l.strip_prefix("# ").map(|t| t.trim().to_owned()))
+}
+
+/// The label a `## Summarized By` entry for `target` carries
+/// (docs/documentation-standards.md § Backlinks and Change Propagation): the
+/// repository path of a `README.md`, the `# Title` of any other document.
+fn expected_label(target: &str, titles: &BTreeMap<&str, String>) -> Option<String>
+{
+    if target == "README.md" || target.ends_with("/README.md")
+    {
+        return Some(target.to_owned());
+    }
+    titles.get(target).cloned()
+}
+
+/// The form of a `## Summarized By` list that a script can decide: entries
+/// sorted by the path they resolve to, byte by byte (so `README.md` sorts
+/// before a lowercase name beside it), none twice, and each labelled as
+/// [`expected_label`] says. The section's shape is `md-summarized-by`'s.
+fn check_entry_form(
+    pat: &Patterns,
+    file: &SourceFile,
+    titles: &BTreeMap<&str, String>,
+) -> Vec<Diagnostic>
+{
+    let Ok((line, body)) = summarized_by_section(&file.text)
+    else
+    {
+        return Vec::new();
+    };
+    let dir = Path::new(&file.path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let entries: Vec<(String, String)> = pat
+        .entry_link
+        .captures_iter(&body)
+        .filter_map(|cap| resolve_link(dir, &cap[2]).map(|t| (cap[1].trim().to_owned(), t)))
+        .collect();
+    let mut diags = Vec::new();
+    for pair in entries.windows(2)
+    {
+        let (before, after) = (&pair[0].1, &pair[1].1);
+        if before >= after
+        {
+            let what = if before == after
+            {
+                format!("Summarized By lists `{after}` twice")
+            }
+            else
+            {
+                format!("Summarized By entry `{after}` sorts before `{before}`; sort by path")
+            };
+            diags.push(Diagnostic::new(
+                "md-summarized-by-order",
+                &file.path,
+                line,
+                what,
+            ));
+        }
+    }
+    for (label, target) in &entries
+    {
+        if let Some(expected) = expected_label(target, titles)
+            && *label != expected
+        {
+            diags.push(Diagnostic::new(
+                "md-summarized-by-label",
+                &file.path,
+                line,
+                format!(
+                    "Summarized By entry `{target}` is labelled `{label}`; expected `{expected}`"
+                ),
+            ));
         }
     }
     diags
@@ -1599,6 +1693,52 @@ mod tests
         let diags = check_summarized_by(&pat(), &[&doc, &silent]);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "md-backlink-forward");
+    }
+
+    /// The diagnostics of `rule` that [`check_summarized_by`] reports for
+    /// `docs/a.md` holding `list`, beside the documents it names.
+    fn entry_form(list: &str, rule: &str) -> Vec<String>
+    {
+        let doc = md(
+            "docs/a.md",
+            &format!("# A\n\n---\n\n## Summarized By\n\n{list}\n"),
+        );
+        let others = [
+            md("README.md", "# Seraph\n\n[A](docs/a.md)\n"),
+            md("docs/b.md", "# Bee Doc\n\n[A](a.md)\n\n---\n\n## Summarized By\n\nNone\n"),
+            md("core/README.md", "# core\n\n[A](../docs/a.md)\n\n---\n\n## Summarized By\n\nNone\n"),
+            md("core/x/README.md", "# x\n\n[A](../../docs/a.md)\n\n---\n\n## Summarized By\n\nNone\n"),
+        ];
+        let mut all: Vec<&SourceFile> = vec![&doc];
+        all.extend(others.iter());
+        check_summarized_by(&pat(), &all)
+            .into_iter()
+            .filter(|d| d.rule == rule && d.path == "docs/a.md")
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn summarized_by_entries_are_sorted_by_path_byte_by_byte_without_duplicates()
+    {
+        let sorted = "[README.md](../README.md), [core/README.md](../core/README.md),\n\
+                      [core/x/README.md](../core/x/README.md), [Bee Doc](b.md)";
+        assert!(entry_form(sorted, "md-summarized-by-order").is_empty());
+        let unsorted = "[Bee Doc](b.md), [README.md](../README.md)";
+        assert_eq!(entry_form(unsorted, "md-summarized-by-order").len(), 1);
+        let twice = "[Bee Doc](b.md), [Bee Doc](./b.md)";
+        let found = entry_form(twice, "md-summarized-by-order");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("twice"));
+    }
+
+    #[test]
+    fn summarized_by_entries_carry_the_readme_path_or_the_document_title()
+    {
+        let good = "[README.md](../README.md), [core/README.md](../core/README.md), [Bee Doc](b.md)";
+        assert!(entry_form(good, "md-summarized-by-label").is_empty());
+        let bad = "[Seraph](../README.md), [core](../core/README.md), [B](b.md)";
+        assert_eq!(entry_form(bad, "md-summarized-by-label").len(), 3);
     }
 
     #[test]

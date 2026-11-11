@@ -839,19 +839,22 @@ fn orchestrator_id(state: &Value) -> Result<String>
         .ok_or_else(|| anyhow!("the state names no orchestrator"))
 }
 
-/// Print the state in `dir`: as JSON, or as the text a session reads.
-fn print_state(dir: &Path, as_json: bool) -> Result<()>
+/// Print the state in `dir` as the JSON it is stored as.
+fn print_state_json(dir: &Path) -> Result<()>
 {
     let state = load(dir)?;
-    if as_json
-    {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&state).context("encoding the state")?
-        );
-        return Ok(());
-    }
-    let rendered = render(&state);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&state).context("encoding the state")?
+    );
+    Ok(())
+}
+
+/// Print the state in `dir` as the text a session reads, with a warning on
+/// stderr when it has grown past `STATE_TEXT_MAX`.
+fn print_state_text(dir: &Path) -> Result<()>
+{
+    let rendered = render(&load(dir)?);
     print!("{rendered}");
     if let Some(warning) = size_warning(&rendered)
     {
@@ -884,7 +887,8 @@ pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
             start(&dir, goal, secs)?;
             step(&format!("Started a batch in {}", dir.display()));
         }
-        OrchCommand::State { json } => print_state(&dir, *json)?,
+        OrchCommand::State { json: true } => print_state_json(&dir)?,
+        OrchCommand::State { json: false } => print_state_text(&dir)?,
         OrchCommand::Log { line } => log(&dir, &line.join(" "), secs)?,
         OrchCommand::End =>
         {

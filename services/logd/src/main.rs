@@ -842,7 +842,12 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
         let mut out = LineBuf::new();
         let line_done = {
             let mut state = logd.lock();
-            let (slot, seq) = state.table.get_or_create_with_seq(badge);
+            let Some((slot, seq)) = state.table.sender_slot(badge)
+            else
+            {
+                // An evicted sender's message (`SlotTable::sender_slot`).
+                return;
+            };
             let mut done = false;
             while let Some((&b, tail)) = rest.split_first()
             {
@@ -896,7 +901,13 @@ fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) ->
     let mut out = LineBuf::new();
     {
         let mut state = logd.lock();
-        let (slot, seq) = state.table.get_or_create_with_seq(badge);
+        let Some((slot, seq)) = state.table.sender_slot(badge)
+        else
+        {
+            // An evicted sender's record (`SlotTable::sender_slot`): dropped,
+            // and answered as consumed, since nothing is wrong with it.
+            return RECORD_ACCEPTED;
+        };
         let us = elapsed_us();
         out.push_prefix_at(&slot.name, level, us);
         logd_codec::record::render(&record, |b| out.push(b));
@@ -930,7 +941,12 @@ fn register_name(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
     let bytes = msg.data_bytes();
     let n = byte_len.min(bytes.len()).min(MAX_NAME_LEN);
     let mut state = logd.lock();
-    let slot = state.table.get_or_create(badge);
+    let Some((slot, _)) = state.table.sender_slot(badge)
+    else
+    {
+        // An evicted sender's name (`SlotTable::sender_slot`).
+        return;
+    };
     slot.name.clear();
     slot.name.extend_from_slice(&bytes[..n]);
 }

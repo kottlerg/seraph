@@ -240,7 +240,8 @@ its oldest. A retired slot keeps its badge, its display name, its history ring,
 and how it was evicted: by a death, with the death entry's exit reason, or by a
 resync. A badge retired again replaces its older retired slot, so a badge
 appears at most once among them. procmgr may hand a dead process's badge to a
-new one, so a live slot and a retired slot can share a badge.
+new one, so a live slot and a retired slot can share a badge, unless the badge
+is among logd's most recent evictions (§ Wait-set).
 
 ## Queries
 
@@ -366,10 +367,10 @@ again.
   ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Thread registration): spawned
   after the pull, every worker could be waiting on procmgr while procmgr waits on the unread log
   endpoint to log its reap of init.
-- **State.** The badge table, the retired slots, the history rings, and the death drain's count are
-  under one lock. A worker takes it to complete, render, and retain a line or a record, to record a
-  name, or to answer a query, and releases it before it writes the line to the drivers. No thread
-  holds it across an IPC call.
+- **State.** The badge table, the retired slots, the recently evicted badges (§ Wait-set), the
+  history rings, and the death drain's count are under one lock. A worker takes it to complete,
+  render, and retain a line or a record, to record a name, or to answer a query, and releases it
+  before it writes the line to the drivers. No thread holds it across an IPC call.
 - **Output.** A rendered line is written whole: the serial driver's calls for one line are made
   under one output lock and the framebuffer driver's under another, so a line longer than one call
   (a record) is not split by another worker's. Each output lock is held across its driver's calls,
@@ -390,11 +391,19 @@ logd's main thread waits on a 2-member `WaitSet`:
 | `WS_BADGE_DEATH` (1) | RECV on logd's death-notification `EventQueue` | drained on the wake |
 | `WS_BADGE_RESYNC` (2) | logd's resync `Notification` | bit `RESYNC_WALK_DONE` (1): the resync helper thread's walk has ended; bit `RESYNC_REQUESTED` (2): a drain asks for a resync (§ Death-queue resync) |
 
-Each receive worker drains the death queue before it serves a request, so a sender whose death
-procmgr posted before the request is served has its slot evicted before logd processes any of its
-still-queued `STREAM_BYTES` or `STREAM_RECORD`. Mirrors procmgr's drain-deaths-first pattern. The
-main thread drains the queue when it is ready, so deaths no request follows are drained too. Each
-take from the queue is made, with its eviction, under the state lock (§ Receive pool).
+Each receive worker drains the death queue before it serves a request, mirroring procmgr's
+drain-deaths-first pattern. The main thread drains the queue when it is ready, so deaths no request
+follows are drained too. Each take from the queue is made, with its eviction, under the state lock
+(§ Receive pool).
+
+A worker can still serve a request after its sender's eviction: the request was received before
+the sender's death, and the death was taken, by this worker or another thread, before the worker
+took the state lock; a resync's eviction can fall in the same place. logd keeps the badges of its
+last `EVICTED_BADGES` (128) evictions, by a death or a resync, whether or not the badge had a slot
+([`slot.rs`](../src/slot.rs)). A `STREAM_BYTES`, `STREAM_RECORD` or `STREAM_REGISTER_NAME` whose
+badge has no live slot and is among them is the evicted sender's, and logd drops it and replies as
+for one it consumed, rather than give the badge a live slot again. procmgr draws process badges at
+random, so a new process takes one of those badges only by chance.
 
 ## Death-notification cascade
 

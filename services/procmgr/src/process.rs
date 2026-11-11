@@ -2225,11 +2225,10 @@ pub fn release_registered_thread(thread: process_table::RegisteredThread)
 /// registered thread takes the action `ProcessTable::restore_action` names
 /// by its origin: the process's own is bound again under its crash badge,
 /// minted for one that has none, when the main thread's rule would bind it;
-/// another process's, while that process lives undeclared, is restored as
-/// the process's own when procmgr rebound it under a crash badge, unless its
-/// class is unbound, and otherwise bound back under that process's badge
-/// from a debugger's binding alone; and any other thread is never bound to
-/// the crash endpoint, a debugger's binding on it unbound.
+/// another process's that procmgr left under that process's badge is bound
+/// back under it from a debugger's binding while that process lives
+/// undeclared; and any other thread is never bound to the crash endpoint, a
+/// debugger's binding on it unbound.
 /// Each upcall class a debugger bound is unbound, so no thread stays
 /// bound to a dead debugger's endpoint. A thread whose bind fails keeps the
 /// binding it has, as does every thread that needs a fresh crash badge when

@@ -507,15 +507,16 @@ impl ProcessTable
     /// * the sender's own: bound back under its crash badge, a fresh one when
     ///   it has none, when [`ProcessEntry::restores`] says so (an unbound
     ///   class among them);
-    /// * another process's that is live and undeclared: a thread procmgr
-    ///   rebound under a crash badge of the sender's is restored as the
-    ///   sender's own unless its class is unbound, which it leaves; one it
-    ///   left is bound back under that process's badge from a debugger's
-    ///   binding alone;
-    /// * another process's that declared itself undebuggable or is gone, or
-    ///   a thread unbound at its registration: never bound to the crash
-    ///   endpoint, so no restore binds a thread recorded as a declared
-    ///   process's back; a debugger's binding on it is unbound.
+    /// * another process's that is live and undeclared, which procmgr left
+    ///   under that process's badge at the registration: bound back under
+    ///   that badge from a debugger's binding alone;
+    /// * any other thread of another process (one procmgr rebound under a
+    ///   crash badge of the sender's, which may be a declared process's that
+    ///   a third registry had rebound, or one of a process that declared
+    ///   itself undebuggable or is gone), or a thread unbound at its
+    ///   registration: never bound to the crash endpoint, so no restore binds
+    ///   a thread not recorded as the sender's own back for a declared
+    ///   process; a debugger's binding on it is unbound.
     ///
     /// A badge that names no live process leaves every thread.
     #[must_use]
@@ -545,24 +546,16 @@ impl ProcessTable
         match thread.origin()
         {
             Origin::Own => own_rule(),
+            // Bound under that process's own badge at the registration, the
+            // thread is that process's or copied its binding; one procmgr
+            // rebound under a crash badge may be a declared process's that a
+            // third registry had rebound, which no binding shows.
             Origin::Foreign(owner)
-                if self.find_by_badge(owner).is_some_and(|e| !e.no_debug) =>
+                if from_debugger
+                    && thread.crash_badge == 0
+                    && self.find_by_badge(owner).is_some_and(|e| !e.no_debug) =>
             {
-                // An unbound class of such a thread is left: the thread may
-                // be a declared process's, which neither its binding nor its
-                // origin shows.
-                if thread.crash_badge != 0 && current.is_some()
-                {
-                    own_rule()
-                }
-                else if from_debugger
-                {
-                    RestoreAction::Bind(owner)
-                }
-                else
-                {
-                    RestoreAction::Leave
-                }
+                RestoreAction::Bind(owner)
             }
             Origin::Foreign(_) | Origin::Unbound if from_debugger => RestoreAction::Unbind,
             Origin::Foreign(_) | Origin::Unbound => RestoreAction::Leave,
@@ -1556,19 +1549,21 @@ mod tests
             RestoreAction::Bind(0)
         );
         // Another process's thread procmgr rebound into the sender's crash
-        // binding is restored as the sender's own while that process lives
-        // undeclared, unless its class is unbound: a declaration of the
-        // process the thread really is (one a third registry rebound) leaves
-        // it so.
+        // binding may be a declared process's that a third registry had
+        // rebound: never bound back, though that process lives undeclared,
+        // and a debugger's binding on it is taken off.
         let rebound = RegisteredThread::new(10, own, Origin::Foreign(0x50));
         assert_eq!(
             table.restore_action(0x40, &rebound, Some(debugger)),
-            RestoreAction::Bind(own)
+            RestoreAction::Unbind
         );
-        assert_eq!(
-            table.restore_action(0x40, &rebound, None),
-            RestoreAction::Leave
-        );
+        for current in [None, Some(other), Some(0x50)]
+        {
+            assert_eq!(
+                table.restore_action(0x40, &rebound, current),
+                RestoreAction::Leave
+            );
+        }
         // A thread unbound at its registration is never bound to the crash
         // endpoint; a debugger's binding on it is taken off.
         let unknown = RegisteredThread::new(11, 0, Origin::Unbound);

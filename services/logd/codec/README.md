@@ -21,9 +21,11 @@ log receivers render after a line's `[name]` prefix (`level::tag`; see the same 
 how both render a log record and the parser that reads its fields back from the rendered text
 (`record::render`, `record::fields`, `RENDERED_MAX_BYTES`; see the same document
 § `stream_labels::STREAM_RECORD`), the line and name widths both log
-receivers keep per sender (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), and `BoundedStr`, the
-fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics. It issues no syscall and
-no IPC, so both ends keep the IPC calls and the logic stays host-reachable, per
+receivers keep per sender (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), `BoundedStr`, the
+fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics, and `HeldLines`, the
+bounded hold on those diagnostics until init-logd acknowledges the handover release (see
+[`docs/handover-protocol.md`](../docs/handover-protocol.md) § Startup ordering). It issues no
+syscall and no IPC, so both ends keep the IPC calls and the logic stays host-reachable, per
 [coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
 
 `no_std`; depends on `shared/ipc` (`IpcMessage`, `log_record`, `log_query`) and `abi/syscall`
@@ -42,6 +44,8 @@ services/logd/codec/
     ├── handover.rs             # Handover wire contract: codes, encoders,
     │                           # decoder, NameResend, release retry
     ├── history.rs              # HistoryRing: init-logd's captured history
+    ├── hold.rs                 # HeldLines: logd's self-log lines held
+    │                           # until the handover release
     ├── level.rs                # The level tag a rendered line carries
     ├── query.rs                # Query pages: which slots and history
     │                           # entries a reply carries

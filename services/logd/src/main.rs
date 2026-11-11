@@ -14,8 +14,9 @@
 //! diagnostics and panic output to the serial driver, in the README's
 //! § Role and `docs/console-model.md`. `main` follows that order: bootstrap
 //! caps, the serial sink and panic sink, the dropped `log_send_cap`, the
-//! death EQ and its registration, the wait set, the handover pull, then the
-//! event loop.
+//! death EQ and its registration, the wait set, the handover pull, the
+//! release of the self-log lines held until init-logd stops writing the UART
+//! ([`SELF_LOG_HOLD`]), then the event loop.
 
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
@@ -25,6 +26,7 @@ mod slot;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
 use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
@@ -34,6 +36,7 @@ use ipc::stream_labels::{
     STREAM_REGISTER_NAME, level_of,
 };
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+use logd_codec::hold::HeldLines;
 use logd_codec::reclaim::{Cause, ReclaimLine};
 use logd_codec::record::RENDERED_MAX_BYTES;
 use std::os::seraph::startup_info;
@@ -156,20 +159,20 @@ fn main() -> !
     let Some(death_eq) = create_death_eq()
     else
     {
-        self_log("FATAL: death-EQ create failed; halting");
+        fatal("FATAL: death-EQ create failed; halting");
         syscall::thread_exit();
     };
     register_with_procmgr(caps.procmgr_death_auth_send, death_eq, ipc_buf);
     let Some(resync_note) = create_resync_note()
     else
     {
-        self_log("FATAL: resync notification create failed; halting");
+        fatal("FATAL: resync notification create failed; halting");
         syscall::thread_exit();
     };
     let Some(ws_cap) = create_wait_set(caps.log_ep_recv, death_eq, resync_note)
     else
     {
-        self_log("FATAL: wait_set create failed; halting");
+        fatal("FATAL: wait_set create failed; halting");
         syscall::thread_exit();
     };
 
@@ -186,6 +189,10 @@ fn main() -> !
         // SAFETY: ipc_buf is the registered IPC buffer page.
         unsafe { handover::transfer(caps.log_ep_handover_send, ipc_buf, &mut table) };
         let _ = syscall::cap_delete(caps.log_ep_handover_send);
+        // Init-logd has acknowledged the release and writes no more (or no
+        // release reached it, and holding longer would only lose the lines):
+        // write the held self-log lines.
+        open_self_log();
 
         let mut buf = SerialFmt::new();
         let _ = write!(
@@ -200,7 +207,9 @@ fn main() -> !
     {
         // A svcmgr restart: there is no handover source (init-logd exited
         // after the first launch). Serve a fresh table; in-flight history
-        // from the prior instance is not recoverable.
+        // from the prior instance is not recoverable. No init-logd writes the
+        // UART, so nothing needs holding.
+        open_self_log();
         self_log("started (restart); no handover source, serving fresh");
     }
 
@@ -1098,10 +1107,9 @@ impl LineBuf
         }
     }
 
-    /// Push `[sec.usfrac] ` from the current monotonic clock.
-    fn push_timestamp(&mut self)
+    /// Push `[sec.usfrac] ` for `us` microseconds of the monotonic clock.
+    fn push_timestamp(&mut self, us: u64)
     {
-        let us = elapsed_us();
         self.push(b'[');
         self.push_decimal(us / 1_000_000);
         self.push(b'.');
@@ -1110,12 +1118,19 @@ impl LineBuf
         self.push(b' ');
     }
 
-    /// Push a line's `[sec.usfrac] [name] ` prefix, `[?]` for an empty
-    /// `name`, then the level's tag and a space for any level but info
+    /// Push a line's `[sec.usfrac] [name] ` prefix stamped now, `[?]` for an
+    /// empty `name`, then the level's tag and a space for any level but info
     /// (`logd_codec::level::tag`).
     fn push_prefix(&mut self, name: &[u8], level: u64)
     {
-        self.push_timestamp();
+        self.push_prefix_at(name, level, elapsed_us());
+    }
+
+    /// [`Self::push_prefix`], stamped `us` microseconds of the monotonic
+    /// clock.
+    fn push_prefix_at(&mut self, name: &[u8], level: u64, us: u64)
+    {
+        self.push_timestamp(us);
         self.push(b'[');
         let name = if name.is_empty()
         {
@@ -1178,20 +1193,92 @@ fn panic_to_serial(bytes: &[u8])
     serial_write(bytes);
 }
 
-/// Emit `[sec.usfrac] [logd] <payload>\r\n` to the serial driver. Used for
-/// logd's own diagnostics in place of `seraph::log!` (which would self-IPC
-/// into the endpoint logd serves).
+/// Emit `[sec.usfrac] [logd] <payload>\r\n` to the serial driver, stamped
+/// when called. Used for logd's own diagnostics in place of `seraph::log!`
+/// (which would self-IPC into the endpoint logd serves). Until
+/// [`open_self_log`], the line is held in [`SELF_LOG_HOLD`] instead; a payload
+/// longer than `LINE_BUF_SIZE` bytes is cut at a character boundary.
 fn self_log(payload: &str)
 {
+    let mut line = HeldLine {
+        us: elapsed_us(),
+        payload: SerialFmt::new(),
+    };
+    let _ = line.payload.write_str(payload);
+    let now = SELF_LOG_HOLD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .hold(line);
+    if let Some(line) = now
+    {
+        write_self_log(&line);
+    }
+}
+
+/// Most self-log lines [`SELF_LOG_HOLD`] keeps until init-logd stops writing
+/// the UART. A line past it is dropped and counted, and [`open_self_log`]
+/// reports the count in one line. A tuning value: logd self-logs at most
+/// three lines before the release (the death-EQ registration's outcome, a
+/// failed wait-set step, and the start of the pull).
+const SELF_LOG_HELD_MAX: usize = 8;
+
+/// One self-log line: when it was logged, and its text.
+struct HeldLine
+{
+    us: u64,
+    payload: SerialFmt,
+}
+
+/// logd's self-log lines from its start until init-logd has acknowledged
+/// `HANDOVER_RELEASE`. Until then init-logd writes each line it forwards to
+/// the UART directly, byte by byte, and the serial driver logd writes through
+/// drives the same UART under no lock the two share, so a line of each
+/// written at once interleaves byte by byte
+/// (`services/logd/docs/handover-protocol.md` § Startup ordering). The
+/// panic sink ([`panic_to_serial`]) is not held.
+static SELF_LOG_HOLD: Mutex<HeldLines<HeldLine, SELF_LOG_HELD_MAX>> = Mutex::new(HeldLines::new());
+
+/// Write one self-log line to the serial driver, stamped when it was logged.
+fn write_self_log(line: &HeldLine)
+{
     let mut out = LineBuf::new();
-    out.push_prefix(b"logd", LEVEL_INFO);
-    for b in payload.bytes()
+    out.push_prefix_at(b"logd", LEVEL_INFO, line.us);
+    for b in line.payload.as_str().bytes()
     {
         out.push_escaped(b);
     }
     out.push(b'\r');
     out.push(b'\n');
     out.flush();
+}
+
+/// Stop holding self-log lines: write the held ones in order, then one line
+/// for those dropped past [`SELF_LOG_HELD_MAX`], if any. A later call writes
+/// nothing.
+fn open_self_log()
+{
+    let dropped = SELF_LOG_HOLD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .open(|line| write_self_log(&line));
+    if dropped > 0
+    {
+        let mut buf = SerialFmt::new();
+        let _ = write!(
+            buf,
+            "{dropped} self-log lines dropped before the handover release (hold of \
+             {SELF_LOG_HELD_MAX})"
+        );
+        self_log(buf.as_str());
+    }
+}
+
+/// Self-log `payload` on the way to a halt, after the held lines: a halt
+/// before the handover release writes them now, since nothing would later.
+fn fatal(payload: &str)
+{
+    open_self_log();
+    self_log(payload);
 }
 
 /// Stack-buffer `fmt::Write` target for one-shot formatted diagnostics,

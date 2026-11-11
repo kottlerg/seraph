@@ -672,6 +672,7 @@ The entries left open are tracked by the Issue each recommendation names.
 | `RELEASE_RETRY_BUDGET_US` (`send_release`) | `services/logd/codec/src/handover.rs` | 1 s of wall-clock time | tuning (bounds no capacity; time-based, so load does not shorten it) | none | correct as is | None |
 | `MAX_RELEASE_DEFERRALS` | `services/logd/codec/src/handover.rs` | 8 | tuning (liveness bound against name churn) | none | correct as is | None |
 | `NameResend.pending` | `services/logd/codec/src/handover.rs` | init `MAX_SENDERS` | encoding artefact (mirror) | 32 B | correct as is | None |
+| `SELF_LOG_HELD_MAX` (`SELF_LOG_HOLD`) | `services/logd/src/main.rs` | 8 self-log lines | tuning (logd self-logs at most three lines before init-logd acknowledges the handover release; a line past the bound is dropped and counted, and the count is written in one line after the held ones) | 8 `SerialFmt` payloads and their timestamps, about 2.3 KiB static | correct as is | None |
 | `LineBuf.buf` (`LINE_OUT_BYTES`), `SerialFmt` | `services/logd/src/main.rs` | 2009 (a line's frame and `RENDERED_MAX_BYTES`) / 256 | line length (`LineBuf` holds the longest rendered record, written in `SERIAL_CHUNK` calls; `SerialFmt` a self-log payload of `LINE_BUF_SIZE`) | about 2 KiB stack | correct as is | None |
 
 ### Other services

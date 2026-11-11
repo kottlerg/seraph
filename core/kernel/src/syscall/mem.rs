@@ -34,7 +34,7 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::object::{AddressSpaceObject, MemoryObject};
     use crate::cap::slot::{AsRights, MemRights};
     use crate::mm::PAGE_SIZE;
-    use crate::mm::paging::PageFlags;
+    use crate::mm::paging::{LeafGrant, PageFlags};
     use crate::syscall::current_tcb;
 
     let memory_idx = tf.arg(0);
@@ -172,6 +172,13 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         executable,
         uncacheable: false,
     };
+    // Each leaf records the cap's Write and Execute, whatever `prot_bits`
+    // asked for: the most a later SYS_MEM_PROTECT may make of it, and what a
+    // text write of SYS_THREAD_WRITE_MEM needs of a read-only page.
+    let grant = LeafGrant {
+        writable: memory_slot.rights.contains(MemRights::WRITE.erase()),
+        executable: memory_slot.rights.contains(MemRights::EXECUTE.erase()),
+    };
 
     // Resolve AddressSpace cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
@@ -203,7 +210,7 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: virt is in user range (validated above); phys is from a
         // Memory cap confirmed by the kernel at capability creation.
         // as_ptr validated non-null; aso_raw is valid and wraps as_ptr.
-        unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, &*aso_raw) }
+        unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, grant, &*aso_raw) }
             .map_err(|()| SyscallError::OutOfMemory)?;
     }
 
@@ -530,6 +537,10 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Protect loop ──────────────────────────────────────────────────────────
 
+    // Each page is also bounded by its own leaf's grant, the Write and Execute
+    // of the capability that mapped it: the Memory cap named here authorises
+    // the call, not the frames under the range. A page that refuses stops the
+    // loop with the pages before it already changed.
     for i in 0..page_count
     {
         let virt = virt_base + (i * PAGE_SIZE) as u64;
@@ -537,6 +548,7 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe { (*as_ptr).protect_page(virt, page_flags) }.map_err(|e| match e
         {
             PagingError::NotMapped => SyscallError::InvalidAddress,
+            PagingError::NotGranted => SyscallError::InsufficientRights,
             PagingError::OutOfFrames => SyscallError::InvalidArgument,
         })?;
     }

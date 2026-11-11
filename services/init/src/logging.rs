@@ -23,8 +23,9 @@
 //!   `STREAM_BYTES` message carries a badge (delivered by the kernel
 //!   from the badged SEND cap they hold) and a length-prefixed payload.
 //!   The thread maintains a per-badge line buffer; on `\n` it emits
-//!   `[name] <line>\r\n` to the serial port AND records the line in a
-//!   bounded history ring for handover to real-logd.
+//!   `[name] <line>\r\n` (with the line's level tag after `[name]` for any
+//!   level but info) to the serial port AND records the line in a bounded
+//!   history ring for handover to real-logd.
 //!
 //! * **Handover (`HANDOVER_PULL` + `HANDOVER_RELEASE`):** the receiver
 //!   serves real-logd's drain of the badge table and history ring, and
@@ -39,7 +40,7 @@ use init_protocol::InitInfo;
 use init_sender_table::{SenderSlot, SenderTable};
 
 use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
-use ipc::stream_labels::STREAM_BYTES;
+use ipc::stream_labels::{STREAM_BYTES, level_of};
 use logd_codec::LINE_BUF_SIZE;
 use logd_codec::handover::{self, NameResend};
 use logd_codec::history::{HistoryCursor, HistoryRing};
@@ -368,7 +369,7 @@ static HANDOVER_COMPLETE: core::sync::atomic::AtomicBool =
 fn history_push(history: &mut HistoryRing<HISTORY_RING_BYTES>, slot: &SenderSlot)
 {
     let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
-    history.push(slot.badge(), us, slot.line());
+    history.push(slot.badge(), us, slot.level(), slot.line());
 }
 
 /// `RecvGuard` diagnostic hook. Init's serial sink is direct, so emit
@@ -547,7 +548,7 @@ impl HandoverDrain
         let mut line = [0u8; LINE_BUF_SIZE];
         if let Some(entry) = history.read_next(&mut self.history, &mut line)
         {
-            return handover::encode_line(entry.badge, entry.us, &line[..entry.len]);
+            return handover::encode_line(entry.badge, entry.us, entry.level, &line[..entry.len]);
         }
         handover::encode_done()
     }
@@ -709,8 +710,10 @@ fn flush_synthetic_logd_line(payload: &[u8])
 
 /// Append `byte_len` bytes from the IPC buffer onto the slot for `badge`,
 /// flushing complete lines (`\n`-terminated) to the serial port as `[name] <line>\r\n`.
-/// A sender new to a full table takes an evicted slot
-/// ([`SenderTable::find_or_alloc`]), whose partial line is dropped.
+/// A line takes the level of the message carrying its first byte
+/// ([`SenderSlot::begin_byte`]). A sender new to a full table takes an
+/// evicted slot ([`SenderTable::find_or_alloc`]), whose partial line is
+/// dropped.
 fn consume_bytes(
     senders: &mut SenderTable<MAX_SENDERS>,
     history: &mut HistoryRing<HISTORY_RING_BYTES>,
@@ -725,10 +728,12 @@ fn consume_bytes(
     let mut tmp = [0u8; STREAM_CHUNK_SIZE];
     tmp[..copy_len].copy_from_slice(&bytes[..copy_len]);
 
+    let level = level_of(msg.label);
     let slot_idx = senders.find_or_alloc(badge);
     let slot = senders.slot_mut(slot_idx);
     for &b in &tmp[..copy_len]
     {
+        slot.begin_byte(level);
         // A newline ends the line; a full buffer is flushed too, to keep the
         // prefix visible.
         if b == b'\n' || slot.push_byte(b)
@@ -740,9 +745,11 @@ fn consume_bytes(
     }
 }
 
-/// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port.
-/// `[name]` uses the display name registered via `STREAM_REGISTER_NAME`;
-/// senders that have not registered yet render as `[?]`.
+/// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port, with
+/// the line's level tag and a space after `[name] ` for any level but info
+/// (`logd_codec::level::tag`). `[name]` uses the display name registered via
+/// `STREAM_REGISTER_NAME`; senders that have not registered yet render as
+/// `[?]`.
 fn flush_line(slot: &SenderSlot)
 {
     // ── Timestamp: [sec.usfrac:06] ─────────────────────────────────────
@@ -776,6 +783,15 @@ fn flush_line(slot: &SenderSlot)
     }
     arch::current::serial_write_byte(b']');
     arch::current::serial_write_byte(b' ');
+
+    if let Some(tag) = logd_codec::level::tag(slot.level())
+    {
+        for &b in tag.as_bytes()
+        {
+            arch::current::serial_write_byte(b);
+        }
+        arch::current::serial_write_byte(b' ');
+    }
 
     for &b in slot.line()
     {

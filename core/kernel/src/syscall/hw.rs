@@ -263,7 +263,7 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::object::{AddressSpaceObject, MmioObject};
     use crate::cap::slot::{AsRights, MmioRights};
     use crate::mm::PAGE_SIZE;
-    use crate::mm::paging::PageFlags;
+    use crate::mm::paging::{LeafGrant, PageFlags};
     use crate::syscall::current_tcb;
 
     // Virtual address must be page-aligned and in user half.
@@ -336,6 +336,8 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     // MMIO mappings are never executable.
     // Writability is derived from the cap's WRITE right, not the flags arg.
     // The flags arg is reserved for future use (cache mode overrides, etc.).
+    // The leaf's grant is the same rights, so no SYS_MEM_PROTECT makes a
+    // device page writable without WRITE, or executable at all.
     let writable = mmio_slot.rights.contains(MmioRights::WRITE.erase());
     let _ = flags; // reserved
     let page_flags = PageFlags {
@@ -344,6 +346,7 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
         executable: false,
         uncacheable: true,
     };
+    let grant = LeafGrant::of(page_flags);
 
     // Intermediate PT pages come from the address space's own caller-funded
     // pool, as in sys_mem_map; the kernel page-table pool is never drawn on
@@ -373,7 +376,7 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: virt in user range (validated above); phys from a
         // kernel-provisioned Mmio boot object; aso_raw is valid and wraps
         // as_ptr.
-        unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, &*aso_raw) }
+        unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, grant, &*aso_raw) }
             .map_err(|()| SyscallError::OutOfMemory)?;
     }
 

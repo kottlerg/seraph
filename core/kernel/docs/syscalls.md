@@ -1149,6 +1149,12 @@ nonzero so the explicit path is taken instead of deriving from the cap's rights.
 If `prot_bits` is zero, permissions are derived from the memory cap's rights directly.
 This fails with `WxViolation` if the memory cap has both WRITE and EXECUTE rights.
 
+Each page records the memory cap's WRITE and EXECUTE rights, whatever `prot_bits` asks for: the
+most a later `SYS_MEM_PROTECT` may make of the page, and what a `THREAD_MEM_TEXT` write of
+`SYS_THREAD_WRITE_MEM` needs of it when it is read-only (see
+[memory-internals.md § Leaf Grant](memory-internals.md#leaf-grant)). A page mapped through a
+Map-only cap stays read-only and never executable.
+
 An executable mapping synchronises instruction fetch on every CPU before its first leaf is
 installed, so bytes written to its frames before the call run as written (see
 [docs/memory-model.md § Instruction-Fetch Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
@@ -1223,8 +1229,15 @@ physical addresses.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 W^X is enforced on the new flags. The requested permissions must be a subset of the
-`memory_cap`'s rights, which are re-checked here. Only the permissions change: each page keeps
-its memory type, so an uncacheable `SYS_MMIO_MAP` page stays uncacheable.
+`memory_cap`'s rights, which are re-checked here. `memory_cap` authorises the call; it need not
+cover the frames under the range. Each page is bounded besides by the rights of the capability
+that mapped it, which `SYS_MEM_MAP` and `SYS_MMIO_MAP` record in the page (see
+[memory-internals.md § Leaf Grant](memory-internals.md#leaf-grant)): a page becomes writable only
+if that capability carried WRITE, and executable only if it carried EXECUTE, so a `SYS_MMIO_MAP`
+page never becomes executable, and one mapped through a Map-only cap stays read-only. Pages are
+changed in order, and a page that refuses ends the call with the pages before it already
+changed. Only the permissions change: each page keeps its memory type, so an uncacheable
+`SYS_MMIO_MAP` page stays uncacheable.
 
 A protect to executable synchronises instruction fetch on every CPU before the first leaf turns
 executable, also when the pages are executable already: a process that wrote code through a
@@ -1237,7 +1250,7 @@ writable alias of an executable frame makes the code visible this way (see
 in the range is not mapped), `InvalidArgument` (zero page count, size/range overflow,
 or no free frame during the page-table walk), `WxViolation` (both WRITE and EXECUTE
 requested), `InvalidCapability`, `InsufficientRights` (requested perms exceed
-`memory_cap` rights).
+`memory_cap` rights, or a page's mapping capability lacks WRITE or EXECUTE the request asks for).
 
 ---
 
@@ -1313,7 +1326,9 @@ rather than the default writeback caching (see
 
 MMIO mappings are never executable, and mapping writability is derived from the
 `mmio_cap`'s Write right, not from `flags`. The kernel forces the uncacheable
-attribute unconditionally.
+attribute unconditionally. Each page records the same rights as its most, so no
+`SYS_MEM_PROTECT` makes it executable, or writable when `mmio_cap` lacks Write (see
+[memory-internals.md § Leaf Grant](memory-internals.md#leaf-grant)).
 
 The `mmio_cap`'s object records the mapping, holding a reference on the address space, before any
 page is mapped. When the object is freed, because `mmio_cap` (or the copy it is) was deleted,
@@ -1902,13 +1917,18 @@ The kernel copies the buffer onto its own stack first, then pins the address spa
 `SYS_THREAD_READ_MEM` does and, under the space's page-table lock, checks every page of
 `[va, va + len)` before it writes any: each MUST be mapped by a 4 KiB user leaf of normal memory
 whose frame lies below the top of RAM, and either writable by the thread, or read-only with
-`THREAD_MEM_TEXT` set and the page's frame mapped exactly once across every address space. The write
-is all or nothing. A read-only page needs the flag so that a write to text, such as a software
-breakpoint, is asked for; and its frame mapped once, since a frame mapped elsewhere too may be
-another process's text or data, which the write would change through this thread's capability.
-procmgr's ELF loader gives each process its own image frames
+`THREAD_MEM_TEXT` set, mapped through a capability that carried WRITE or EXECUTE, and the page's
+frame mapped exactly once across every address space. The write is all or nothing. A read-only
+page needs the flag so that a write to text, such as a software breakpoint, is asked for; a
+mapping capability with WRITE or EXECUTE, since one with neither (a firmware table, a page lent
+read-only) gave its holder no right to change or run what the page holds (see
+[memory-internals.md § Leaf Grant](memory-internals.md#leaf-grant)); and its frame mapped once,
+since a frame mapped elsewhere too may be another process's text or data, which the write would
+change through this thread's capability. procmgr's ELF loader gives each process its own image
+frames and maps text through an Execute-bearing capability
 ([services/procmgr/README.md](../../../services/procmgr/README.md) § Responsibilities), so the text
-of a process it loads takes the write. The frame is written through the kernel's mapping of it; the
+of a process it loads takes the write; its read-only data segments, mapped through Map-only
+capabilities, do not. The frame is written through the kernel's mapping of it; the
 thread's mapping is not changed, so W^X holds for every user mapping. Every write synchronises
 instruction fetch on every CPU before the call returns, whatever the target's leaves grant, since a
 writable page's frame may be mapped executable elsewhere ([memory-model.md § Instruction-Fetch
@@ -1922,7 +1942,8 @@ stops the space's threads around a text write
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control, or a page is read-only
-and `THREAD_MEM_TEXT` is clear), `InvalidState` (the thread has exited, has no address space, or
+and `THREAD_MEM_TEXT` is clear or its mapping capability carried neither WRITE nor EXECUTE),
+`InvalidState` (the thread has exited, has no address space, or
 its address space's teardown has begun, or a read-only page's frame is mapped more than once),
 `InvalidArgument` (`len` 0 or above `MAX_THREAD_MEM_COPY`, or an undefined `flags` bit),
 `InvalidAddress` (as for `SYS_THREAD_READ_MEM`; a fault on the buffer is restartable,
@@ -3044,6 +3065,7 @@ source of truth.
 [Device Management](../../../docs/device-management.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Testing](../../../docs/testing.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [services/drivers/serial/README.md](../../../services/drivers/serial/README.md),
 [memmgr Memory Pool](../../../services/memmgr/docs/memory-pool.md),
 [Restart Protocol](../../../services/svcmgr/docs/restart-protocol.md),

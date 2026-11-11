@@ -38,7 +38,7 @@ pub use boot_protocol::x86_paging::PagingDepth;
 use boot_protocol::x86_paging::next_level_boundary;
 use boot_protocol::x86_paging::table_index;
 
-use crate::mm::paging::{PageFlags, PagingError, PoolState, UserAccess};
+use crate::mm::paging::{LeafGrant, PageFlags, PagingError, PoolState, UserAccess};
 
 // ── PTE bit constants ─────────────────────────────────────────────────────────
 
@@ -66,6 +66,15 @@ const NO_EXECUTE: u64 = 1 << 63;
 /// [memory-internals.md](../../../docs/memory-internals.md) § Page Table Node
 /// Ownership.
 const POOLED_TABLE: u64 = 1 << 9;
+/// Software bit of a user 4 KiB leaf: its [`LeafGrant`] holds write. Bits
+/// \[58:52\] of a PTE are ignored by the processor, and \[62:59\] too while
+/// `CR4.PKE` is clear, which the kernel never sets; the user mapping path
+/// installs no large leaf. See
+/// [memory-internals.md](../../../docs/memory-internals.md) § Leaf Grant.
+const GRANT_WRITE: u64 = 1 << 52;
+/// Software bit of a user 4 KiB leaf: its [`LeafGrant`] holds execute
+/// (as [`GRANT_WRITE`]).
+const GRANT_EXECUTE: u64 = 1 << 53;
 /// Mask extracting the physical page number from bits \[51:12\].
 const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
@@ -673,7 +682,7 @@ pub unsafe fn read_root_phys() -> u64
 
 /// Map a single 4 KiB user page `virt` → `phys` in the page table rooted at
 /// `root_virt`, drawing missing intermediate frames from
-/// `crate::mm::kernel_pt_pool`.
+/// `crate::mm::kernel_pt_pool`. The leaf records `grant` in its software bits.
 ///
 /// Returns the [`MapOutcome`](crate::mm::paging::MapOutcome) classifying the
 /// rewrite so the caller can decide whether a remote shootdown is required.
@@ -690,6 +699,7 @@ pub unsafe fn map_user_page(
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
+    grant: LeafGrant,
 ) -> Result<crate::mm::paging::MapOutcome, ()>
 {
     use crate::mm::paging::phys_to_virt;
@@ -703,8 +713,7 @@ pub unsafe fn map_user_page(
         })?
     };
 
-    let mut pte = PageTableEntry::new_page(phys, flags);
-    pte.0 |= USER;
+    let pte = new_user_leaf(phys, flags, grant);
     let prior = pt[table_index(0, virt)].0;
     pt[table_index(0, virt)] = pte;
 
@@ -737,7 +746,8 @@ fn user_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 ///
 /// Each new PT page is charged to the AS's growth budget; exhaustion returns
 /// `Err(())` (see [capability-model.md](../../../../../docs/capability-model.md)
-/// § Address-space and `CSpace` growth budgets).
+/// § Address-space and `CSpace` growth budgets). The leaf records `grant` in
+/// its software bits.
 ///
 /// # Safety
 /// Same contract as [`map_user_page`]. `aso` must be the wrapper paired
@@ -748,6 +758,7 @@ pub unsafe fn map_user_page_pooled(
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
+    grant: LeafGrant,
     aso: &crate::cap::object::AddressSpaceObject,
 ) -> Result<crate::mm::paging::MapOutcome, ()>
 {
@@ -762,12 +773,37 @@ pub unsafe fn map_user_page_pooled(
         })?
     };
 
-    let mut pte = PageTableEntry::new_page(phys, flags);
-    pte.0 |= USER;
+    let pte = new_user_leaf(phys, flags, grant);
     let prior = pt[table_index(0, virt)].0;
     pt[table_index(0, virt)] = pte;
 
     Ok(classify_user_map(prior, pte.0))
+}
+
+/// A user 4 KiB leaf for `phys` with the rights of `flags` and the software
+/// bits of `grant`.
+fn new_user_leaf(phys: u64, flags: PageFlags, grant: LeafGrant) -> PageTableEntry
+{
+    let mut pte = PageTableEntry::new_page(phys, flags);
+    pte.0 |= USER;
+    if grant.writable
+    {
+        pte.0 |= GRANT_WRITE;
+    }
+    if grant.executable
+    {
+        pte.0 |= GRANT_EXECUTE;
+    }
+    pte
+}
+
+/// The [`LeafGrant`] a user leaf PTE records.
+pub fn user_leaf_grant(pte: u64) -> LeafGrant
+{
+    LeafGrant {
+        writable: pte & GRANT_WRITE != 0,
+        executable: pte & GRANT_EXECUTE != 0,
+    }
 }
 
 /// Pooled equivalent of [`user_walk_or_alloc`]: pulls a freshly-zeroed PT
@@ -1422,25 +1458,39 @@ pub unsafe fn flush_kernel_page(virt: u64)
 /// kernel sets no PAT bit in a leaf).
 const MEMORY_TYPE: u64 = PCD | PWT;
 
-/// The leaf `new` with the memory type of the leaf `prior` it replaces.
+/// The bits a permission change keeps from the leaf it rewrites: the memory
+/// type and the grant.
+const KEPT_BY_PROTECT: u64 = MEMORY_TYPE | GRANT_WRITE | GRANT_EXECUTE;
+
+/// The user leaf a permission change to the rights of `flags` makes of the
+/// present user leaf `prior`, or [`PagingError::NotGranted`] when `flags`
+/// asks for write or execute that `prior`'s grant lacks.
 ///
-/// A permission change keeps a page's memory type, so an uncacheable device
-/// leaf of `SYS_MMIO_MAP` stays uncacheable, which `SYS_THREAD_READ_MEM` and
-/// `SYS_THREAD_WRITE_MEM` rely on to refuse device memory
-/// (`AddressSpace::copy_user_bytes`).
-fn keep_memory_type(new: u64, prior: u64) -> u64
+/// The new leaf keeps `prior`'s frame, grant and memory type, whatever
+/// `flags.uncacheable` says: an uncacheable device leaf of `SYS_MMIO_MAP`
+/// stays uncacheable, which `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`
+/// rely on to refuse device memory (`AddressSpace::copy_user_bytes`), and the
+/// grant stays what the installing capability carried.
+fn protected_leaf(prior: u64, flags: PageFlags) -> Result<u64, PagingError>
 {
-    (new & !MEMORY_TYPE) | (prior & MEMORY_TYPE)
+    if !user_leaf_grant(prior).admits(flags)
+    {
+        return Err(PagingError::NotGranted);
+    }
+    let new = PageTableEntry::new_page(PageTableEntry(prior).phys_addr(), flags).0 | USER;
+    Ok((new & !KEPT_BY_PROTECT) | (prior & KEPT_BY_PROTECT))
 }
 
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.
 ///
 /// Walks from the root to the PT. Returns `Err(PagingError::NotMapped)` if
-/// the page is not present at any level. On success, rewrites the leaf PTE
-/// with the rights of `flags` (preserving the physical address, the USER bit,
-/// and the leaf's memory type, whatever `flags.uncacheable` says), calls
-/// `flush_page`, and returns the [`MapOutcome`](crate::mm::paging::MapOutcome)
-/// classifying the rights change (a same-frame rewrite, so never `Fresh`).
+/// the page is not present at any level, and `Err(PagingError::NotGranted)`,
+/// changing nothing, if `flags` asks for write or execute the leaf's grant
+/// lacks. On success, rewrites the leaf PTE with the rights of `flags`
+/// ([`protected_leaf`]: the physical address, the USER bit, the grant and the
+/// memory type are kept), calls `flush_page`, and returns the
+/// [`MapOutcome`](crate::mm::paging::MapOutcome) classifying the rights change
+/// (a same-frame rewrite, so never `Fresh`).
 ///
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB root
@@ -1465,11 +1515,7 @@ pub unsafe fn protect_user_page(
     }
 
     let prior = leaf.0;
-    let phys = leaf.phys_addr();
-    let new_pte = PageTableEntry(keep_memory_type(
-        PageTableEntry::new_page(phys, flags).0 | USER,
-        prior,
-    ));
+    let new_pte = PageTableEntry(protected_leaf(prior, flags)?);
     *leaf = new_pte;
 
     // SAFETY: invlpg flushes TLB entry for specified VA; architecture primitive.
@@ -1958,34 +2004,101 @@ mod tests
             executable: false,
             uncacheable: false,
         };
-        let device = PageTableEntry::new_page(
-            phys,
-            PageFlags {
-                writable: true,
-                uncacheable: true,
-                ..read_only
-            },
-        )
-        .0 | USER;
-        let protected =
-            keep_memory_type(PageTableEntry::new_page(phys, read_only).0 | USER, device);
+        let device_flags = PageFlags {
+            writable: true,
+            uncacheable: true,
+            ..read_only
+        };
+        let device = new_user_leaf(phys, device_flags, LeafGrant::of(device_flags)).0;
+        let protected = protected_leaf(device, read_only).unwrap();
         let flags = user_leaf_flags(protected).unwrap();
         assert!(flags.uncacheable && !flags.writable);
         assert_eq!(PageTableEntry(protected).phys_addr(), phys);
 
-        let ram = PageTableEntry::new_page(phys, read_only).0 | USER;
-        let protected = keep_memory_type(
-            PageTableEntry::new_page(
-                phys,
-                PageFlags {
-                    uncacheable: true,
-                    ..read_only
-                },
-            )
-            .0 | USER,
+        let ram = new_user_leaf(phys, read_only, LeafGrant::default()).0;
+        let protected = protected_leaf(
             ram,
-        );
+            PageFlags {
+                uncacheable: true,
+                ..read_only
+            },
+        )
+        .unwrap();
         assert!(!user_leaf_flags(protected).unwrap().uncacheable);
+    }
+
+    // Defect caught (#868): a permission change that let a leaf take write or
+    // execute its installing capability lacked, so a read-only Mmio or Memory
+    // mapping turned writable or executable through any other Memory
+    // capability; one that dropped the grant, so a narrowing lost the rights
+    // a later protect may take back; or a grant kept in bits the processor
+    // reads (the frame, the rights, the memory type).
+    #[test]
+    fn a_rights_change_stays_within_the_leaf_grant_and_keeps_it()
+    {
+        let phys = 0x9_0000;
+        let rights = |writable, executable| PageFlags {
+            readable: true,
+            writable,
+            executable,
+            uncacheable: false,
+        };
+        let read_only = rights(false, false);
+        let write = LeafGrant {
+            writable: true,
+            executable: false,
+        };
+        let exec = LeafGrant {
+            writable: false,
+            executable: true,
+        };
+
+        // A Map-only leaf: no widening at all, a read-only rewrite taken.
+        let map_only = new_user_leaf(phys, read_only, LeafGrant::default()).0;
+        assert_eq!(map_only & (GRANT_WRITE | GRANT_EXECUTE), 0);
+        assert_eq!(
+            protected_leaf(map_only, rights(true, false)),
+            Err(PagingError::NotGranted)
+        );
+        assert_eq!(
+            protected_leaf(map_only, rights(false, true)),
+            Err(PagingError::NotGranted)
+        );
+        assert_eq!(protected_leaf(map_only, read_only), Ok(map_only));
+
+        // A read-only leaf of a Write-bearing capability widens to write, not
+        // to execute, and keeps its grant across a narrowing and back.
+        let rw_cap = new_user_leaf(phys, read_only, write).0;
+        assert_eq!(user_leaf_grant(rw_cap), write);
+        let widened = protected_leaf(rw_cap, rights(true, false)).unwrap();
+        assert!(user_leaf_flags(widened).unwrap().writable);
+        assert_eq!(user_leaf_grant(widened), write);
+        assert_eq!(
+            protected_leaf(rw_cap, rights(false, true)),
+            Err(PagingError::NotGranted)
+        );
+        let narrowed = protected_leaf(widened, read_only).unwrap();
+        assert_eq!(narrowed, rw_cap);
+
+        // An Execute-bearing one widens to execute only.
+        let rx_cap = new_user_leaf(phys, read_only, exec).0;
+        assert!(
+            user_leaf_flags(protected_leaf(rx_cap, rights(false, true)).unwrap())
+                .unwrap()
+                .executable
+        );
+        assert_eq!(
+            protected_leaf(rx_cap, rights(true, false)),
+            Err(PagingError::NotGranted)
+        );
+
+        // The grant bits change no hardware-read field of the leaf.
+        let both = new_user_leaf(phys, rights(true, false), LeafGrant::of(rights(true, true))).0;
+        let plain = new_user_leaf(phys, rights(true, false), LeafGrant::default()).0;
+        assert_eq!(both & !(GRANT_WRITE | GRANT_EXECUTE), plain);
+        assert_eq!(PageTableEntry(both).phys_addr(), phys);
+        assert_eq!(GRANT_WRITE & PHYS_MASK, 0);
+        assert_eq!(GRANT_EXECUTE & PHYS_MASK, 0);
     }
 
     #[test]

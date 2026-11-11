@@ -54,7 +54,12 @@ procmgr/
   child, filled by copying the file's bytes in, so no frame of a child's image
   is mapped by another process; a debugger's text write
   (`SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT`) relies on it, since the
-  kernel refuses that write to a frame mapped more than once.
+  kernel refuses that write to a frame mapped more than once. Each page is
+  mapped through a copy of its cap derived to the segment's protection
+  (`derive_memory_for_prot`): text through Map and Execute, writable data
+  through Map and Write, and read-only data and the `PT_GNU_RELRO` pages
+  through Map alone, so the kernel keeps each page within that protection
+  and a text write reaches text but not read-only data.
 - **Process creation** — create `AddressSpace`, `CSpace`, and `Thread`
   kernel objects; configure the thread's address space, CSpace, and
   IPC buffer bindings.

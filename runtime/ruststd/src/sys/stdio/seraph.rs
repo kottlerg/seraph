@@ -299,7 +299,8 @@ pub fn set_panic_sink(sink: fn(&[u8])) {
 /// Panic-output sink. Prefers a registered [`set_panic_sink`] sink; absent
 /// one, falls back to the system log endpoint via the process's pre-seeded
 /// badged SEND cap from `ProcessInfo.log_send_cap` (installed by `_start`),
-/// sending each `write` as `STREAM_BYTES` chunks. Non-allocating —
+/// sending each `write` as `STREAM_BYTES` chunks at the error level, so the
+/// log receiver tags each line of the panic message `ERROR`. Non-allocating —
 /// `log::write_bytes` stages bytes into the per-thread IPC buffer, so
 /// panics survive allocator failure. Silent-drops on a zero cap or any IPC
 /// error.
@@ -326,7 +327,7 @@ impl io::Write for PanicWriter {
         // SAFETY: `current_ipc_buf` is non-null (checked above), so it is
         // this thread's registered IPC buffer page (`_start` and the spawn
         // trampoline set it after registering).
-        unsafe { ::log::write_bytes(cap, ipc_ptr, buf) };
+        unsafe { ::log::write_bytes(cap, ipc_ptr, ::ipc::stream_labels::LEVEL_ERROR, buf) };
         Ok(buf.len())
     }
 

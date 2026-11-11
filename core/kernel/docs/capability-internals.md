@@ -640,8 +640,9 @@ bitwise AND: `(slot.rights & required) == required`.
 W^X is enforced at mapping time. `sys_mem_map` takes the mapping's writable and executable
 flags from the requested protection bits, each of which must be backed by the Memory cap's
 Write or Execute right, or from those rights when no bits are given. `sys_mem_protect`
-takes them from the new protection bits. Either syscall returns `WxViolation` when both
-flags are set.
+takes them from the new protection bits, each bounded also by the Write and Execute rights of
+the cap that mapped the page ([memory-internals.md § Leaf Grant](memory-internals.md#leaf-grant)).
+Either syscall returns `WxViolation` when both flags are set.
 
 A capability may carry both Write and Execute rights (representing independent
 authorities). W^X is enforced when those rights are exercised on a specific

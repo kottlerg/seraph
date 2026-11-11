@@ -6,15 +6,37 @@
 //! Integration: endpoint send-queue FIFO ordering with three concurrent callers.
 //!
 //! Verifies that `ipc_recv` dequeues blocked callers in the order they arrived
-//! on the send queue (FIFO), not priority order or any other order.
+//! on the send queue (FIFO), not priority order or any other order
+//! (core/kernel/docs/ipc-internals.md, the endpoint's send queue).
 //!
 //! ## Approach
 //!
-//! Start callers A (label=1), B (label=2), C (label=3) one at a time, sleeping
-//! 1 ms between each start so the floor-priority caller runs. Each caller's entry
-//! point immediately calls `ipc_call`, so after the sleep it is blocked on the
-//! send queue.  The server then calls `ipc_recv` three times and verifies the
-//! label sequence 1 → 2 → 3.
+//! The kernel orders the send queue by arrival, and it promises nothing about
+//! when a started thread reaches its first syscall: a thread at a fair level
+//! can be preempted at any tick before its `ipc_call` and requeued behind a
+//! thread started after it (core/kernel/docs/scheduler.md § Time Slice
+//! Policy). So the arrival order is fixed by strict priority, not by time.
+//! Callers A (label 1), B (label 2) and C (label 3) are started in that order
+//! at the strictly decreasing RT levels of [`CALLER_LEVELS`], all pinned to
+//! [`CALLER_CPU`], and a barrier thread is started last below them on the same
+//! CPU; its entry only exits. Each assertion rests on a kernel promise:
+//!
+//! - The arrival order is A, B, C: a CPU dispatches the highest non-empty run
+//!   queue, and a slice expiry with no peer at the thread's level or above
+//!   reselects the same thread (core/kernel/docs/scheduler.md § Scheduling
+//!   Classes and § Timer-Driven Preemption). B, started after A at a lower
+//!   level on A's CPU, runs only once A is not ready there, which is once A has
+//!   blocked in `ipc_call`; C likewise after B.
+//! - All three are on the send queue when the server first receives: the
+//!   barrier, below all three, runs and exits only once none of them is ready
+//!   on that CPU, and a caller that exits instead of calling is caught by its
+//!   thread state (`CAP_INFO_THREAD_STATE`). The server waits for the
+//!   barrier's exit under a `crate::scaled_polls` bound.
+//! - The receive order is the arrival order, whatever the callers' levels: the
+//!   server first moves the queued callers to the increasing levels of
+//!   [`RECV_LEVELS`] (`SYS_THREAD_SET_PRIORITY`, core/kernel/docs/syscalls.md),
+//!   so a queue ordered by priority would return C first, and a
+//!   last-in-first-out one would too. The labels must come back 1, 2, 3.
 //!
 //! Each caller ORs a distinct bit into the shared `done` notification after receiving
 //! its reply; the server waits for all three bits before returning.
@@ -22,16 +44,37 @@
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
-    notification_wait, thread_exit, thread_sleep,
+    notification_wait, thread_exit, thread_set_priority,
 };
 use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
+use crate::spawn::SpawnedChild;
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-// One stack per caller to avoid aliasing.
-static mut STACK_A: ChildStack = ChildStack::ZERO;
-static mut STACK_B: ChildStack = ChildStack::ZERO;
-static mut STACK_C: ChildStack = ChildStack::ZERO;
+/// CPU every caller and the barrier are pinned to, so strict priority on one
+/// run queue orders their arrivals.
+const CALLER_CPU: u32 = 0;
+
+/// RT levels callers A, B, C are created at: strictly decreasing in start
+/// order, so each runs only once the callers started before it have blocked.
+/// All are below the harness thread's level (`PRIORITY_MAX`).
+const CALLER_LEVELS: [u8; 3] = [24, 23, 22];
+
+/// Level of the barrier thread: the lowest RT level, below every caller.
+const BARRIER_LEVEL: u8 = 21;
+
+/// Levels callers A, B, C are moved to once all three are queued: increasing,
+/// the reverse of their arrival order.
+const RECV_LEVELS: [u8; 3] = [22, 23, 24];
+
+/// 1 ms polls the server waits, at most, for the barrier to exit (stretched
+/// by `crate::scaled_polls`); a bound so a lost caller fails the test rather
+/// than hanging it.
+const BARRIER_POLLS: u32 = 10_000;
+
+// One stack per child to avoid aliasing; entries 0, 1, 2 are callers A, B, C.
+static mut CALLER_STACKS: [ChildStack; 3] = [ChildStack::ZERO, ChildStack::ZERO, ChildStack::ZERO];
+static mut BARRIER_STACK: ChildStack = ChildStack::ZERO;
 
 /// Per-caller arguments (slots in the caller's own `CSpace`), handed to
 /// `caller_entry` by address; entries 0, 1, 2 are callers A, B, C.
@@ -49,114 +92,73 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, 3> = spawn::ArgBlock::new(Caller
     label: 0,
 });
 
-/// Publish caller `index`'s arguments and return the entry address.
-///
-/// # Safety
-///
-/// `index < 3`, and that caller has not been started yet in this run.
-unsafe fn caller_arg(index: usize, ep: u64, done: u64, label: u64) -> u64
-{
-    // SAFETY: caller contract (entry `index` is that caller's alone).
-    unsafe { CALLER_ARGS.publish(index, CallerArgs { ep, done, label }) }
-}
-
 pub fn run(ctx: &TestContext) -> TestResult
 {
     crate::log("multi_caller_ipc_fifo: starting");
 
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "multi_caller_ipc_fifo: cap_create_endpoint failed")?;
-    let done = cap_create_notification(ctx.memory_base)
-        .map_err(|_| "multi_caller_ipc_fifo: cap_create_notification failed")?;
-
-    // ── Build and start caller A ──────────────────────────────────────────────
-    let mut child_a =
-        spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child A failed")?;
-    let ep_a = cap_copy(ep, child_a.cs, RIGHTS_EP_SEND_GRANT)
-        .map_err(|_| "multi_caller_ipc_fifo: ep_a failed")?;
-    let done_a = cap_copy(done, child_a.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
-        .map_err(|_| "multi_caller_ipc_fifo: done_a failed")?;
-    // SAFETY: entry 0 is caller A's, not yet started.
-    let arg_a = unsafe { caller_arg(0, ep_a, done_a, 1) };
-    let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
-    // Pin to CPU 0 so sleep-based FIFO ordering is reliable under SMP.
-    // SAFETY: the stack is `STACK_A`, this test's own `ChildStack`,
-    // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe { spawn::configure_and_start_pinned(&child_a, caller_entry, stack_a, arg_a, 0) }
-        .map_err(|_| "multi_caller_ipc_fifo: start A failed")?;
-    // Sleep so A (floor priority, strictly below this thread) runs and
-    // blocks on ipc_call before B is started.
-    thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after A failed")?;
-
-    // ── Build and start caller B ──────────────────────────────────────────────
-    let mut child_b =
-        spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child B failed")?;
-    let ep_b = cap_copy(ep, child_b.cs, RIGHTS_EP_SEND_GRANT)
-        .map_err(|_| "multi_caller_ipc_fifo: ep_b failed")?;
-    let done_b = cap_copy(done, child_b.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
-        .map_err(|_| "multi_caller_ipc_fifo: done_b failed")?;
-    // SAFETY: entry 1 is caller B's, not yet started.
-    let arg_b = unsafe { caller_arg(1, ep_b, done_b, 2) };
-    let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
-    // SAFETY: the stack is `STACK_B`, this test's own `ChildStack`,
-    // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe { spawn::configure_and_start_pinned(&child_b, caller_entry, stack_b, arg_b, 0) }
-        .map_err(|_| "multi_caller_ipc_fifo: start B failed")?;
-    thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after B failed")?;
-
-    // ── Build and start caller C ──────────────────────────────────────────────
-    let mut child_c =
-        spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child C failed")?;
-    let ep_c = cap_copy(ep, child_c.cs, RIGHTS_EP_SEND_GRANT)
-        .map_err(|_| "multi_caller_ipc_fifo: ep_c failed")?;
-    let done_c = cap_copy(done, child_c.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
-        .map_err(|_| "multi_caller_ipc_fifo: done_c failed")?;
-    // SAFETY: entry 2 is caller C's, not yet started.
-    let arg_c = unsafe { caller_arg(2, ep_c, done_c, 3) };
-    let stack_c = ChildStack::top(core::ptr::addr_of!(STACK_C));
-    // SAFETY: the stack is `STACK_C`, this test's own `ChildStack`,
-    // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe { spawn::configure_and_start_pinned(&child_c, caller_entry, stack_c, arg_c, 0) }
-        .map_err(|_| "multi_caller_ipc_fifo: start C failed")?;
-    thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after C failed")?;
-
-    // ── Drain send queue in FIFO order ────────────────────────────────────────
-    let reply = IpcMessage::new(0);
-    crate::log("multi_caller_ipc_fifo: recv 1 (expect label=1)");
-    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    let msg_a = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
-        .map_err(|_| "multi_caller_ipc_fifo: ipc_recv[0] failed")?;
-    if msg_a.label != 1
+    let Ok(done) = cap_create_notification(ctx.memory_base)
+    else
     {
-        return Err("FIFO violated: expected label 1 first");
-    }
-    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }
-        .map_err(|_| "multi_caller_ipc_fifo: ipc_reply[0] failed")?;
+        cap_delete(ep).ok();
+        return Err("multi_caller_ipc_fifo: cap_create_notification failed");
+    };
 
-    crate::log("multi_caller_ipc_fifo: recv 2 (expect label=2)");
-    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    let msg_b = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
-        .map_err(|_| "multi_caller_ipc_fifo: ipc_recv[1] failed")?;
-    if msg_b.label != 2
-    {
-        return Err("FIFO violated: expected label 2 second");
-    }
-    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }
-        .map_err(|_| "multi_caller_ipc_fifo: ipc_reply[1] failed")?;
+    // The guards delete every child on every path, the callers first.
+    let mut callers = [
+        SpawnedChild::EMPTY,
+        SpawnedChild::EMPTY,
+        SpawnedChild::EMPTY,
+    ];
+    let mut barrier = SpawnedChild::EMPTY;
+    let result = drive(ctx, ep, done, &mut callers, &mut barrier);
+    drop(callers);
+    drop(barrier);
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    result?;
 
-    crate::log("multi_caller_ipc_fifo: recv 3 (expect label=3)");
-    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    let msg_c = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
-        .map_err(|_| "multi_caller_ipc_fifo: ipc_recv[2] failed")?;
-    if msg_c.label != 3
+    crate::log("multi_caller_ipc_fifo: PASS");
+    Ok(())
+}
+
+/// Start the callers and the barrier into the guards, wait until all three
+/// callers are queued, and check the receive order.
+fn drive(
+    ctx: &TestContext,
+    ep: u64,
+    done: u64,
+    callers: &mut [SpawnedChild; 3],
+    barrier: &mut SpawnedChild,
+) -> TestResult
+{
+    for (index, caller) in callers.iter_mut().enumerate()
     {
-        return Err("FIFO violated: expected label 3 third");
+        *caller = start_caller(ctx, index, ep, done)?;
     }
-    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }
-        .map_err(|_| "multi_caller_ipc_fifo: ipc_reply[2] failed")?;
+    *barrier = start_barrier(ctx)?;
+
+    spawn::wait_until_exited(barrier.th, crate::scaled_polls(BARRIER_POLLS))
+        .map_err(|_| "multi_caller_ipc_fifo: the barrier never ran below the callers")?;
+    for caller in callers.iter()
+    {
+        if spawn::is_exited(caller.th)?
+        {
+            return Err("multi_caller_ipc_fifo: a caller exited before calling");
+        }
+    }
+    for (caller, &level) in callers.iter().zip(&RECV_LEVELS)
+    {
+        thread_set_priority(caller.th, level, ctx.sched_control_cap)
+            .map_err(|_| "multi_caller_ipc_fifo: re-level a queued caller failed")?;
+    }
+
+    let labels = receive_three(ctx, ep)?;
+    if labels != [1, 2, 3]
+    {
+        return Err("FIFO violated: labels not received in arrival order 1, 2, 3");
+    }
 
     // Wait for all three callers to confirm they received their reply.
     //
@@ -169,21 +171,88 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "multi_caller_ipc_fifo: notification_wait done failed")?;
         all_done |= bits;
     }
-
-    child_a.delete_thread().ok();
-    child_a.delete_cspace().ok();
-    child_b.delete_thread().ok();
-    child_b.delete_cspace().ok();
-    child_c.delete_thread().ok();
-    child_c.delete_cspace().ok();
-    cap_delete(ep).ok();
-    cap_delete(done).ok();
-
-    crate::log("multi_caller_ipc_fifo: PASS");
     Ok(())
 }
 
-// ── Child thread entry ────────────────────────────────────────────────────────
+/// Receive and reply three times, logging and returning each label in the
+/// order received.
+fn receive_three(ctx: &TestContext, ep: u64) -> Result<[u64; 3], &'static str>
+{
+    let reply = IpcMessage::new(0);
+    let mut labels = [0u64; 3];
+    for label in &mut labels
+    {
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+            .map_err(|_| "multi_caller_ipc_fifo: ipc_recv failed")?;
+        *label = msg.label;
+        crate::log_u64("multi_caller_ipc_fifo: received label=", msg.label);
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }
+            .map_err(|_| "multi_caller_ipc_fifo: ipc_reply failed")?;
+    }
+    Ok(labels)
+}
+
+/// Create caller `index` (0, 1, 2 for A, B, C) at its `CALLER_LEVELS` level
+/// with copies of `ep` and `done`, and start it pinned to `CALLER_CPU`.
+fn start_caller(
+    ctx: &TestContext,
+    index: usize,
+    ep: u64,
+    done: u64,
+) -> Result<SpawnedChild, &'static str>
+{
+    let child = spawn::new_child_at(ctx, ctx.sched_control_cap, CALLER_LEVELS[index])
+        .map_err(|_| "multi_caller_ipc_fifo: new_child_at caller failed")?;
+    let ep_child = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
+        .map_err(|_| "multi_caller_ipc_fifo: copy the endpoint failed")?;
+    let done_child = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "multi_caller_ipc_fifo: copy the done notification failed")?;
+    // Labels 1, 2, 3 for callers A, B, C.
+    let label = index as u64 + 1;
+    // SAFETY: entry `index` is this caller's alone, and it has not started.
+    let arg = unsafe {
+        CALLER_ARGS.publish(
+            index,
+            CallerArgs {
+                ep: ep_child,
+                done: done_child,
+                label,
+            },
+        )
+    };
+    // SAFETY: takes the element's raw address without forming a reference to
+    // the `static mut`.
+    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CALLER_STACKS[index]) });
+    // SAFETY: the stack is this caller's own `ChildStack`, on which no other
+    // live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(&child, caller_entry, stack, arg, CALLER_CPU) }
+        .map_err(|_| "multi_caller_ipc_fifo: start a caller failed")?;
+    Ok(child)
+}
+
+/// Create the barrier at `BARRIER_LEVEL` and start it pinned to `CALLER_CPU`.
+fn start_barrier(ctx: &TestContext) -> Result<SpawnedChild, &'static str>
+{
+    let child = spawn::new_child_at(ctx, ctx.sched_control_cap, BARRIER_LEVEL)
+        .map_err(|_| "multi_caller_ipc_fifo: new_child_at barrier failed")?;
+    let stack = ChildStack::top(core::ptr::addr_of!(BARRIER_STACK));
+    // SAFETY: the stack is `BARRIER_STACK`, this test's own `ChildStack`, on
+    // which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(&child, barrier_entry, stack, 0, CALLER_CPU) }
+        .map_err(|_| "multi_caller_ipc_fifo: start the barrier failed")?;
+    Ok(child)
+}
+
+// ── Child thread entries ──────────────────────────────────────────────────────
+
+/// Barrier entry: exit at once. Its exit is the evidence that it ran, which
+/// strict priority allows only once no caller is ready on its CPU.
+extern "C" fn barrier_entry(_arg: u64) -> !
+{
+    thread_exit()
+}
 
 /// IPC pages of the three [`caller_entry`] children, one per caller label.
 static mut CALLER_IPC_PAGES: [crate::IpcPage; 3] = [crate::IpcPage::ZERO; 3];

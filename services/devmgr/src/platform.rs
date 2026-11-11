@@ -33,10 +33,10 @@ pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable]) -> Pla
 {
     let mut records = PlatformRecords::new();
     boot_framebuffer(caps, &mut records);
-    let acpi = tables::platform_tables(caps);
+    let acpi = tables::platform_tables(&caps.firmware);
     for &block in &acpi.definition_blocks
     {
-        let read = tables::with_acpi_table(caps, block, |bytes| {
+        let read = tables::with_acpi_table(&caps.firmware, block, |bytes| {
             Some(aml::devices(bytes, |device| {
                 add_namespace_device(device, &mut records);
             }))
@@ -49,7 +49,7 @@ pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable]) -> Pla
     attach_century(caps, &mut records);
     if let Some(spcr) = acpi
         .spcr
-        .and_then(|t| tables::with_acpi_table(caps, t, firmware::platform::spcr))
+        .and_then(|t| tables::with_acpi_table(&caps.firmware, t, firmware::platform::spcr))
     {
         let identity = Identity {
             spcr: Some(spcr.interface),
@@ -164,8 +164,9 @@ fn add_namespace_device(device: &aml::AmlDevice<'_>, records: &mut PlatformRecor
 /// register. Nothing is attached when the FADT names none.
 fn attach_century(caps: &caps::DevmgrCaps, records: &mut PlatformRecords)
 {
-    let index = tables::locate_table_by_sig(caps, *b"FACP")
-        .and_then(|fadt| tables::with_acpi_table(caps, fadt, firmware::acpi::fadt_century_index));
+    let index = tables::locate_table_by_sig(&caps.firmware, *b"FACP").and_then(|fadt| {
+        tables::with_acpi_table(&caps.firmware, fadt, firmware::acpi::fadt_century_index)
+    });
     let Some(info) = index.and_then(|i| {
         DeviceInfo::new(
             ipc::device_info_kind::RTC_CENTURY,

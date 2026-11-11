@@ -24,14 +24,16 @@ devmgr/
 │                                   #   the platform description table parser
 ├── platform/                       # Platform description tables, one `<machine>.platform` each
 ├── src/
-│   ├── main.rs                     # Bootstrap, registry loop, QUERY_DEVICE handler, device catalog
+│   ├── main.rs                     # Bootstrap, the registry's workers and control thread,
+│   │                               #   QUERY_DEVICE handler, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, port carves, shutdown
 │   │   ├── mod.rs                  # `arch::current` re-export (the only cfg(target_arch) site)
 │   │   ├── x86_64/mod.rs           # IoPort carves (platform records, PM1a + 8042); no ECAM default
 │   │   └── riscv64/mod.rs          # QEMU virt ECAM default; SbiControl
 │   ├── bind.rs                     # Binding PCI and platform records to matching driver
 │   │                               #   declarations; withdrawal of a bound driver
-│   ├── caps.rs                     # Bootstrap-round capability absorbers and DevmgrCaps
+│   ├── caps.rs                     # Bootstrap-round capability absorbers, DevmgrCaps, and the
+│   │                               #   firmware-table caps the registry's workers share
 │   ├── decls.rs                    # Driver declarations read from boot modules and the drivers
 │   │                               #   directory
 │   ├── dma.rs                      # DMA endpoint and its thread: per-device DMA caps, map/unmap
@@ -40,7 +42,8 @@ devmgr/
 │   ├── phys.rs                     # Physical-address credential (a memmgr page with `Phys`)
 │   ├── platform.rs                 # Platform enumerators: boot framebuffer, ACPI namespace, SPCR,
 │   │                               #   platform description table
-│   ├── settle.rs                   # Driver death watch; batch settle: ready, deaths, bound
+│   ├── settle.rs                   # Driver death watch and job notification; batch settle:
+│   │                               #   ready, deaths, bound
 │   ├── spawn.rs                    # Driver-process spawn helpers (bound, IOMMU, test fixtures)
 │   └── tables.rs                   # Firmware-table mapping: ECAM discovery, ACPI table lookup
 └── docs/

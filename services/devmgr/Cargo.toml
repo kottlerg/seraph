@@ -24,6 +24,8 @@ ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 # The `seraph` note owner and the driver note's type.
 process-abi = { path = "../../abi/process-abi" }
+# The registry's worker pool.
+recv-pool = { path = "../../shared/recv-pool" }
 ns-client = { path = "../../shared/ns-client" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }

@@ -26,10 +26,7 @@
 use driver_binding::decl::{DriverDecl, InterruptNeed, Reset, Tier};
 use driver_binding::resources::{InterruptKind, Resource};
 use firmware::aml::CrsResource;
-use firmware::binding::{
-    Candidate, Choice, MatchTable, PciIdentity, RecordKeys, Source, class_admits,
-};
-use firmware::classes::Classes;
+use firmware::binding::{Candidate, Choice, MatchTable, PciIdentity, RecordKeys, Source};
 use firmware::dma::Confinement;
 use firmware::lines::{HoldError, LineError};
 use firmware::records::{PlatformRecord, PlatformRecords};
@@ -211,14 +208,14 @@ pub fn boot_pass(
 
 /// The drivers-directory pass: list `dir_cap`, the `/services/drivers/`
 /// directory svcmgr handed devmgr, read the declaration of each entry, and
-/// bind the records still unbound to them. A declaration of a class
-/// `classes` marks boot-only is not considered, logged
-/// ([`firmware::binding::class_admits`]). Every file cap is released once
-/// the pass ends.
-pub fn drivers_dir_pass<T>(
+/// bind the records still unbound to them. A declaration `admits` refuses
+/// (one of a class a class request marked boot-only,
+/// [`firmware::binding::class_admits`]) is not considered, logged. Every file
+/// cap is released once the pass ends.
+pub fn drivers_dir_pass(
     records: &mut Records,
     dir_cap: u64,
-    classes: &Classes<T>,
+    admits: impl Fn(&DriverDecl) -> bool,
     carve: &mut Carve,
     pass: &mut Pass,
     ipc_buf: *mut u64,
@@ -240,7 +237,7 @@ pub fn drivers_dir_pass<T>(
         };
         let label = core::str::from_utf8(name).unwrap_or("drivers-directory entry");
         let mut decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
-        if let Some(d) = decl.filter(|d| !class_admits(classes, d, Source::DriversDir))
+        if let Some(d) = decl.filter(|d| !admits(d))
         {
             std::os::seraph::log!(
                 "{}: declares boot-only class {}; not considered",

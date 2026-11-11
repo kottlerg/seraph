@@ -82,20 +82,14 @@ pub fn parse_class(name: &str, contents: &str) -> Result<ClassDefinition, ParseE
     }
     let mut verbs: Option<u64> = None;
     let mut boot_only: Option<bool> = None;
-    for (idx, raw) in contents.lines().enumerate()
+    for entry in svc_grammar::entries(contents)
     {
-        let lineno = idx + 1;
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#')
-        {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=')
-        else
-        {
-            return Err(ParseError::MissingEquals(lineno));
-        };
-        match (key.trim(), value.trim())
+        let svc_grammar::Entry {
+            line: lineno,
+            key,
+            value,
+        } = entry.map_err(|svc_grammar::MissingEquals(l)| ParseError::MissingEquals(l))?;
+        match (key, value)
         {
             ("verbs", value) =>
             {

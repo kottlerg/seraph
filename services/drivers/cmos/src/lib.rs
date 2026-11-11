@@ -28,8 +28,23 @@ pub const REG_YEAR: u8 = 0x09;
 pub const REG_STATUS_A: u8 = 0x0A;
 /// Status B register: BCD/binary and 12/24-hour mode bits.
 pub const REG_STATUS_B: u8 = 0x0B;
+/// The century register an `ipc::device_info_kind::RTC_CENTURY` device-info
+/// payload names, from the reply's payload length `byte_len` and its first
+/// payload word `first_word`: the payload is one byte, the FADT `CENTURY`
+/// index, read through [`century_register`]. `None` for a payload of any
+/// other length.
+#[must_use]
+pub fn century_from_payload(byte_len: u64, first_word: u64) -> Option<u8>
+{
+    if byte_len != 1
+    {
+        return None;
+    }
+    century_register(first_word & 0xFF)
+}
+
 /// The CMOS RAM index of a century register the platform names in `index`
-/// (the FADT `CENTURY` field, carried in a `u64` bootstrap word), when the
+/// (the FADT `CENTURY` field), when the
 /// driver can read it: 0x0E to 0x7F. 0 names no register. 0x00 to 0x0D are
 /// the clock and status registers, which hold no century. 0x80 and up lie
 /// past the standard bank the driver's ports reach: written to the index
@@ -189,6 +204,20 @@ mod tests
         {
             assert_eq!(century_register(refused), None, "index {refused:#x}");
         }
+    }
+
+    #[test]
+    fn century_payload_is_one_byte_read_through_the_register_bounds()
+    {
+        // The payload byte is the low byte of the first payload word.
+        assert_eq!(century_from_payload(1, 0x32), Some(0x32));
+        assert_eq!(century_from_payload(1, 0xFFFF_FF32), Some(0x32));
+        // A register the driver cannot read, or none.
+        assert_eq!(century_from_payload(1, 0x80), None);
+        assert_eq!(century_from_payload(1, 0), None);
+        // A payload of any other length.
+        assert_eq!(century_from_payload(0, 0x32), None);
+        assert_eq!(century_from_payload(2, 0x32), None);
     }
 
     #[test]

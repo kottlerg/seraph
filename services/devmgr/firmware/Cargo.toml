@@ -15,6 +15,9 @@ virtio-core = { path = "../../drivers/virtio/core" }
 driver-binding = { path = "../../../shared/driver-binding" }
 # The `DMA_MAP` access bits the DMA table checks.
 ipc = { path = "../../../shared/ipc" }
+# The line grammar of the platform description table, shared with svcmgr's
+# `.svc` and class file parsers.
+svc-grammar = { path = "../../../shared/svc-grammar" }
 # The `SYS_IRQ_REGISTER` mode bits a MADT override maps to.
 syscall-abi = { path = "../../../abi/syscall" }
 

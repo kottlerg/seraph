@@ -42,11 +42,15 @@ pub fn system_time_phase(_: &Caps)
     let since_epoch = t0
         .duration_since(UNIX_EPOCH)
         .expect("SystemTime::now must be at or after UNIX_EPOCH");
-    if since_epoch == Duration::ZERO
-    {
-        std::os::seraph::log!("SystemTime phase skipped: timed unavailable (UNIX_EPOCH reply)");
-        return;
-    }
+    // Every machine the harness boots has an RTC that a platform device
+    // record describes (the CMOS RTC on x86-64, the goldfish RTC on riscv64),
+    // and devmgr settles that driver's bind pass before it receives timed's
+    // query: a UNIX_EPOCH reply means that record or its bind is missing.
+    assert!(
+        since_epoch != Duration::ZERO,
+        "SystemTime returned UNIX_EPOCH: timed has no wall clock, so no RTC \
+         driver is bound to the machine's RTC record",
+    );
 
     let secs = since_epoch.as_secs();
     assert!(

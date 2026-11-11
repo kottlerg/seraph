@@ -3,14 +3,14 @@
 x86-64 CMOS / MC146818-compatible RTC driver. Serves
 [`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/lib.rs).
 
-Installed to `/services/drivers/cmos-rtc` on the rootfs. Spawned by
-devmgr on x86-64 platforms via the non-PCI simple-device path
+Installed to `/services/drivers/cmos-rtc` on the rootfs. Bound by
+devmgr on x86-64 platforms to the platform device record the ACPI namespace gives `PNP0B00`
 ([Device Management](../../../docs/device-management.md#driver-binary-sources)),
 `procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
 walks to from the `LOOKUP | READ | READDIR` `/services/drivers/` subtree cap svcmgr
 delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR`. The driver carries a declaration in
-the ELF note section `.note.seraph.driver` (ACPI `PNP0B00`) that no device record devmgr builds
-matches yet, so devmgr starts it on its fixed path.
+the ELF note section `.note.seraph.driver` (ACPI `PNP0B00`), which the drivers-directory pass
+matches against that record.
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities) owns
 the driver's service endpoint and mints client SEND caps on
 `devmgr_labels::QUERY_DEVICE` on the `rtc` class SEND, each badged with
@@ -34,22 +34,17 @@ cmos/
 
 ## Endpoint
 
-Bootstrap caps from devmgr, in two rounds. Round 1 (`done=false`) carries
-two caps and one data word:
+devmgr delivers the record's resource list, decoded with
+`driver_binding::resources::PlatformDelivery`: the `IoPort` resource covering the CMOS
+index/data ports (the ACPI `_CRS` of `PNP0B00`, `0x70` for 8 ports on QEMU q35), and in the end
+round the service-endpoint RECV and the driver's devmgr query cap, a SEND badged with its device
+badge on the private endpoint of its devmgr spawn batch.
 
-| Slot      | Cap                                                  |
-|-----------|------------------------------------------------------|
-| `caps[0]` | Service-endpoint RECV (driver receives on this)      |
-| `caps[1]` | `IoPort` covering CMOS index/data ports `0x70`–`0x71` |
-
-`data[0]` is the CMOS RAM index of the century register, from the FADT's
-`CENTURY` field, or 0 when the FADT names none. The driver reads only an
-index from `0x0E` to `0x7F`: lower ones are the clock and status registers,
-and higher ones lie past the bank its ports reach.
-
-Round 2 (`done=true`) carries one cap, the driver's devmgr query cap: a
-SEND badged with its device badge on the private endpoint of its devmgr
-spawn batch.
+The CMOS RAM index of the century register comes from the FADT's `CENTURY` field, which devmgr
+attaches to the record as device info (`ipc::device_info_kind::RTC_CENTURY`, a one-byte
+payload). The driver reads it with `QUERY_DEVICE_INFO` on the query cap, and with none takes
+the century 20. It uses only an index from `0x0E` to `0x7F`: lower ones are the clock and
+status registers, and higher ones lie past the bank its ports reach.
 
 The driver binds the `IoPort` cap to its main thread via
 `syscall::ioport_bind` and uses `in`/`out` to drive the CMOS access

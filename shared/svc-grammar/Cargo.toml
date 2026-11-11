@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "svc-grammar"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `no_std`, no allocation, no dependency: the line grammar of the `.svc`
+# files, shared by svcmgr's definition and class parsers (`svcmgr-defs`) and
+# devmgr's platform description table parser (`devmgr-firmware`).
+[lib]
+doctest = false
+
+[lints]
+workspace = true

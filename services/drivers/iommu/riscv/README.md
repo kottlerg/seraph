@@ -1,18 +1,18 @@
 # iommu/riscv
 
 The RISC-V IOMMU driver (`iommu-riscv`): the separate driver process that programs RISC-V IOMMUs
-(RISC-V IOMMU Architecture Specification v1.0) for devmgr. devmgr discovers each IOMMU that is a
-PCI function through the ACPI RIMT, turns on the function's memory decode and bus mastering, moves
-the first page of its BAR 0, which holds every register, to this driver, and drives it over
+(RISC-V IOMMU Architecture Specification v1.0) for devmgr. devmgr discovers each IOMMU that is a PCI
+function through the ACPI RIMT, turns on the function's memory decode and bus mastering, moves the
+first page of its BAR 0, which holds every register, to this driver, and drives it over
 `ipc::iommu_labels` from behind its DMA endpoint, so device drivers keep the `devmgr_dma_labels`
 contract whichever IOMMU sits behind it
 ([docs/device-management.md](../../../../docs/device-management.md#iommu-discovery-and-programming)
 § IOMMU Discovery and Programming). It is riscv64 only, and ships as a boot module, since it must
-confine the root disk before the disk's driver maps a ring; it carries a declaration in the ELF
-note section `.note.seraph.driver` (IOMMU family `rimt`) that no device record devmgr builds
-matches yet, so devmgr starts it on its fixed path. The bootstrap, the request checks, and
-the fault queue are [`iommu-core`](../core/README.md)'s, and the table pages
-[`iommu-store`](../store/README.md)'s; this crate is the RISC-V IOMMU `Backend`.
+confine the root disk before the disk's driver maps a ring; it carries a declaration in the ELF note
+section `.note.seraph.driver` (IOMMU family `rimt`), which devmgr matches against the IOMMU family
+record in a pass of its own and starts with the IOMMU bootstrap rounds, not the resource list. The
+bootstrap, the request checks, and the fault queue are [`iommu-core`](../core/README.md)'s, and the
+table pages [`iommu-store`](../store/README.md)'s; this crate is the RISC-V IOMMU `Backend`.
 
 The driver runs each IOMMU with first-stage translation only, the second stage Bare, since the
 system runs no guests:

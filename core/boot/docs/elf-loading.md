@@ -194,7 +194,9 @@ whose dynamic section describes any other relocation format
 ## Boot Module Loading
 
 Boot modules are flat binary images for early userspace services (e.g.
-procmgr, devmgr). The bootloader does not open per-module files —
+procmgr, devmgr), and the text platform description tables devmgr reads
+([driver-binding.md](../../../docs/driver-binding.md#platform-description-tables)
+§ Platform Description Tables). The bootloader does not open per-module files —
 every module body is already inside the bundle that
 [Boot Flow § Step 2](boot-flow.md#step-2-load-bootstrap-bundle) loads. Per
 module, the bootloader's bundle walker:

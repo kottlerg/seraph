@@ -602,7 +602,11 @@ address less one, inside the call it returns from, and an `ip` outside `text` re
 
 A process that registered no log name with logd has a `reclaim:` line naming it `?` when it wrote
 to the log, and none when it did not; either way its block's header reads
-`process unnamed (badge <badge>: …)`. Its image is then the one binary of those directories whose
+`process unnamed (badge <badge>: …)`. A block whose attach failed carries the fault message's badge,
+which for a registered thread is its thread crash badge (procmgr's `CRASH_BADGE_TAG`, bit 63, set);
+such a block names no process, and its header reads
+`process unknown (thread crash badge <badge>: the attach failed, so the block names no process)`.
+An unnamed process's image is then the one binary of those directories whose
 executable segments span the block's text in the same way, labelled as found that way; when none or
 several match, the block is not symbolized, and no name is guessed. In place of the `image:` line a
 block that is not symbolized says why (the process is unnamed and its text matches no binary or

@@ -28,7 +28,10 @@ pub use parse::{Block, Defect, parse};
 
 /// The block format's version, carried on the begin marker. A change that
 /// renames or removes a field, or changes a value's encoding, bumps it; a new
-/// field does not, since a parser ignores keys it does not know.
+/// field does not, since a parser ignores keys it does not know, and neither
+/// does a new value of a field that names one of a set, since [`Block::check`]
+/// reads a value it does not know as services/crashd/docs/block-format.md
+/// § Lines says.
 pub const VERSION: u32 = 1;
 
 /// The begin marker's tag.

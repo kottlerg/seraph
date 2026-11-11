@@ -23,6 +23,7 @@ use std::path::PathBuf;
 
 use crash_report::Block;
 use logd_codec::reclaim::UNNAMED;
+use procmgr_process_table::threads;
 
 use crate::symbolize::{Symbolizer, describe_resolution, text_span};
 
@@ -281,13 +282,19 @@ struct BlockSource<'a>
 /// by what it resolves to.
 fn symbolize_block(out: &mut String, block: &Block, source: &BlockSource<'_>)
 {
+    let badge = block.get("badge").unwrap_or("absent");
     let process = match source.name
     {
         Some(name) => format!("process {name}"),
-        None => format!(
-            "process unnamed (badge {}: logd has no registered name for it)",
-            block.get("badge").unwrap_or("absent")
+        // A block whose attach failed carries the fault message's badge,
+        // which for a registered thread is its crash badge: it names no
+        // process, and no `reclaim:` line names it
+        // (services/crashd/docs/block-format.md § Fields).
+        None if badge.parse().is_ok_and(threads::is_crash_badge) => format!(
+            "process unknown (thread crash badge {badge}: the attach failed, so the block names \
+             no process)"
         ),
+        None => format!("process unnamed (badge {badge}: logd has no registered name for it)"),
     };
     let _ = writeln!(
         out,
@@ -961,6 +968,38 @@ mod tests
              {:#x}\n",
             BIAS + LEAF + 9
         )));
+    }
+
+    #[test]
+    fn an_unattached_block_with_a_thread_crash_badge_names_no_process()
+    {
+        let ip = BIAS + INNER;
+        let mut unattached = report(ip, &[], &[]);
+        unattached.status = Status::Unattached;
+        unattached.thread = Thread::Unidentified;
+        unattached.image = None;
+        unattached.badge = threads::CRASH_BADGE_TAG | 7;
+        // crashme registered its log name; the reclaim line names its process
+        // badge, which the block does not carry.
+        let mut log = log_of(&unattached, None);
+        log.push_str(&reclaim_line(
+            42,
+            Cause::Death {
+                exit_reason: 0x100e,
+            },
+            "crashme",
+        ));
+        let out = symbolize_log(&log, &Fixture::dwarf("x86_64")).unwrap();
+        assert!(
+            out.starts_with(&format!(
+                "crash report 00000000000000aa (format version 1): process unknown (thread crash \
+                 badge {}: the attach failed, so the block names no process)\n",
+                threads::CRASH_BADGE_TAG | 7
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("process unnamed"), "{out}");
+        assert!(!out.contains("defective block"), "{out}");
     }
 
     #[test]

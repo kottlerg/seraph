@@ -25,7 +25,10 @@
 //!   The thread maintains a per-badge line buffer; on `\n` it emits
 //!   `[name] <line>\r\n` (with the line's level tag after `[name]` for any
 //!   level but info) to the serial port AND records the line in a bounded
-//!   history ring for handover to real-logd.
+//!   history ring for handover to real-logd. A `STREAM_RECORD` message is
+//!   one complete record: the thread renders it as one line
+//!   (`logd_codec::record`) and records it in the same ring, leaving the
+//!   sender's partial text line as it was.
 //!
 //! * **Handover (`HANDOVER_PULL` + `HANDOVER_RELEASE`):** the receiver
 //!   serves real-logd's drain of the badge table and history ring, and
@@ -40,10 +43,11 @@ use init_protocol::InitInfo;
 use init_sender_table::{SenderSlot, SenderTable};
 
 use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
-use ipc::stream_labels::{STREAM_BYTES, level_of};
+use ipc::log_record::{RECORD_MAX_BYTES, Record};
+use ipc::stream_labels::{RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD, level_of};
 use logd_codec::LINE_BUF_SIZE;
 use logd_codec::handover::{self, NameResend};
-use logd_codec::history::{HistoryCursor, HistoryRing};
+use logd_codec::history::{ENTRY_MAX_BYTES, EntryKind, HistoryCursor, HistoryRing};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 //
@@ -73,11 +77,11 @@ const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 /// new boot-time services.
 const MAX_SENDERS: usize = 32;
 
-/// Bytes of init-logd's captured-history ring. Lines are packed by length
-/// (`logd_codec::history`), so the ring holds about 160 lines of the 80-odd
+/// Bytes of init-logd's captured-history ring. Entries are packed by length
+/// (`logd_codec::history`), so the ring holds about 160 entries of the 80-odd
 /// bytes boot lines run to, against a pre-handover peak of about 50, and
 /// still more than 50 lines at the full `LINE_BUF_SIZE`. A full ring drops
-/// its oldest lines (FIFO), losing only boot history real-logd would
+/// its oldest entries (FIFO), losing only boot history real-logd would
 /// otherwise inherit, never a sender or a live line.
 const HISTORY_RING_BYTES: usize = 16 * 1024;
 
@@ -351,8 +355,9 @@ extern "C" fn log_thread_entry(arg: u64) -> !
 /// thread is its only user; `log_receive_loop` takes the one reference to it.
 static mut SENDERS: SenderTable<MAX_SENDERS> = SenderTable::new();
 
-/// Captured history: the completed log lines `consume_bytes` records for
-/// handover to real-logd, oldest dropped first when full. Too large for the
+/// Captured history: the completed log lines `consume_bytes` records and
+/// the records `consume_record` records, for handover to real-logd, oldest
+/// dropped first when full. Too large for the
 /// log thread's 16 KiB stack, so it sits in init's BSS like [`SENDERS`]. The
 /// log thread is its only user; `log_receive_loop` takes the one reference
 /// to it.
@@ -435,6 +440,12 @@ fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }
+        else if label_id == STREAM_RECORD
+        {
+            let status = consume_record(senders, history, &recv, recv.badge, byte_len);
+            // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(status), ipc_buf_raw) };
+        }
         else if label_id == ipc::stream_labels::STREAM_REGISTER_NAME
         {
             if let Some(slot_idx) = register_sender_name(senders, &recv, recv.badge, byte_len)
@@ -483,7 +494,7 @@ struct HandoverDrain
     header_sent: bool,
     /// The next slot-table index the slot pass sends.
     slot_idx: usize,
-    /// The next history line to send.
+    /// The next history entry to send.
     history: HistoryCursor,
     /// Slots whose name changed after the slot pass began; the drain sends
     /// them again before it reports `DONE` or acks the release.
@@ -504,7 +515,7 @@ impl HandoverDrain
 
     /// Build the next `HANDOVER_PULL` reply chunk and advance past it: the
     /// header, every occupied slot, every slot whose name changed after the
-    /// slot pass began, then the history lines. On the last entry, the reply
+    /// slot pass began, then the history entries. On the last entry, the reply
     /// is `DONE`, meaning only "no more data": the init-logd thread
     /// terminates on a separate acknowledged [`HANDOVER_RELEASE`], not on
     /// this `DONE`, so a dropped data chunk cannot wedge init-logd (which
@@ -542,13 +553,21 @@ impl HandoverDrain
             }
         }
 
-        // History, by absolute push sequence: a line evicted before it was
-        // sent is skipped, and lines pushed after the drain caught up are
+        // History, by absolute push sequence: an entry evicted before it was
+        // sent is skipped, and entries pushed after the drain caught up are
         // sent by a later pull (a deferred release's further drain).
-        let mut line = [0u8; LINE_BUF_SIZE];
-        if let Some(entry) = history.read_next(&mut self.history, &mut line)
+        let mut bytes = [0u8; ENTRY_MAX_BYTES];
+        if let Some(entry) = history.read_next(&mut self.history, &mut bytes)
         {
-            return handover::encode_line(entry.badge, entry.us, entry.level, &line[..entry.len]);
+            let bytes = &bytes[..entry.len];
+            return match entry.kind
+            {
+                EntryKind::Text => handover::encode_line(entry.badge, entry.us, entry.level, bytes),
+                EntryKind::Record =>
+                {
+                    handover::encode_record(entry.badge, entry.us, entry.level, bytes)
+                }
+            };
         }
         handover::encode_done()
     }
@@ -745,12 +764,64 @@ fn consume_bytes(
     }
 }
 
+/// Render one `STREAM_RECORD` message's record as one line on the serial
+/// port and record it in the history ring. The record does not touch the
+/// sender's partial text line. Returns the reply label: `RECORD_ACCEPTED`, or
+/// `RECORD_REJECTED` for a payload longer than a record or than the message,
+/// or one `ipc::log_record` refuses, which is neither rendered nor recorded.
+fn consume_record(
+    senders: &mut SenderTable<MAX_SENDERS>,
+    history: &mut HistoryRing<HISTORY_RING_BYTES>,
+    msg: &ipc::IpcMessage,
+    badge: u64,
+    byte_len: usize,
+) -> u64
+{
+    let bytes = msg.data_bytes();
+    if byte_len > RECORD_MAX_BYTES || byte_len > bytes.len()
+    {
+        return RECORD_REJECTED;
+    }
+    let Ok(record) = Record::decode(&bytes[..byte_len])
+    else
+    {
+        return RECORD_REJECTED;
+    };
+    let level = level_of(msg.label);
+    let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
+    history.push_record(badge, us, level, record.payload());
+    let slot_idx = senders.find_or_alloc(badge);
+    write_line_prefix(senders.slots()[slot_idx].name(), level);
+    logd_codec::record::render(&record, arch::current::serial_write_byte);
+    arch::current::serial_write_byte(b'\r');
+    arch::current::serial_write_byte(b'\n');
+    RECORD_ACCEPTED
+}
+
 /// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port, with
 /// the line's level tag and a space after `[name] ` for any level but info
 /// (`logd_codec::level::tag`). `[name]` uses the display name registered via
 /// `STREAM_REGISTER_NAME`; senders that have not registered yet render as
 /// `[?]`.
 fn flush_line(slot: &SenderSlot)
+{
+    write_line_prefix(slot.name(), slot.level());
+    for &b in slot.line()
+    {
+        if b == b'\n'
+        {
+            arch::current::serial_write_byte(b'\r');
+        }
+        arch::current::serial_write_byte(b);
+    }
+    arch::current::serial_write_byte(b'\r');
+    arch::current::serial_write_byte(b'\n');
+}
+
+/// Emit a line's `[sec.usfrac] [name] ` prefix, and the level's tag and a
+/// space for any level but info, to the serial port: `[?]` for a sender with
+/// no registered `name`.
+fn write_line_prefix(name: &[u8], level: u64)
 {
     // ── Timestamp: [sec.usfrac:06] ─────────────────────────────────────
     //
@@ -770,13 +841,13 @@ fn flush_line(slot: &SenderSlot)
 
     // ── Name: [<registered name>] or [?] ───────────────────────────────
     arch::current::serial_write_byte(b'[');
-    if slot.name().is_empty()
+    if name.is_empty()
     {
         arch::current::serial_write_byte(b'?');
     }
     else
     {
-        for &b in slot.name()
+        for &b in name
         {
             arch::current::serial_write_byte(b);
         }
@@ -784,7 +855,7 @@ fn flush_line(slot: &SenderSlot)
     arch::current::serial_write_byte(b']');
     arch::current::serial_write_byte(b' ');
 
-    if let Some(tag) = logd_codec::level::tag(slot.level())
+    if let Some(tag) = logd_codec::level::tag(level)
     {
         for &b in tag.as_bytes()
         {
@@ -792,17 +863,6 @@ fn flush_line(slot: &SenderSlot)
         }
         arch::current::serial_write_byte(b' ');
     }
-
-    for &b in slot.line()
-    {
-        if b == b'\n'
-        {
-            arch::current::serial_write_byte(b'\r');
-        }
-        arch::current::serial_write_byte(b);
-    }
-    arch::current::serial_write_byte(b'\r');
-    arch::current::serial_write_byte(b'\n');
 }
 
 /// Write `value` as base-10 ASCII to the serial port with no padding.

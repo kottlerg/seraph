@@ -49,7 +49,7 @@ driver's write endpoint and, when a framebuffer driver is present, the framebuff
 | Cap holder | Right | Purpose |
 |---|---|---|
 | logd's main thread | `RECV` | drains the endpoint via `ipc_recv` inside the wait-set loop |
-| every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_REGISTER_NAME` |
+| every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_RECORD`, `STREAM_REGISTER_NAME` |
 | real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); repeated after a further drain while init-logd defers it), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1]` reads as `0`) on a restart (design intent; not yet implemented (#262)) |
 
 ## Labels accepted
@@ -67,9 +67,10 @@ driver (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
 (`FB_WRITE_BYTES`) when one is present, then appended to the slot's
 history ring with its level.
 
-The history ring holds `PER_SLOT_HISTORY` (16) completed lines per slot (see
-[`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest line (FIFO). The ring
-has no read surface. TODO: a query IPC that reads the history ring.
+The history ring holds `PER_SLOT_HISTORY` (16) completed entries per slot, text lines and
+records (§ History; [`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest
+entry (FIFO). The ring has no read surface. TODO: a query IPC that reads the history ring
+(#720).
 
 Lines exceeding `LINE_BUF_SIZE` (256 bytes) flush without a
 trailing `\n` to keep the per-line attribution visible. Senders
@@ -81,7 +82,7 @@ Reply: `label = 0` (success), empty payload. Sender unblocks.
 
 A log line carries one of five levels, from least to most verbose: error,
 warn, info, debug, trace. The level code rides bits 32-34 of every
-`STREAM_BYTES` label (`ipc::stream_labels::LEVEL_SHIFT`, `LEVEL_MASK`, and the
+`STREAM_BYTES` and `STREAM_RECORD` label (`ipc::stream_labels::LEVEL_SHIFT`, `LEVEL_MASK`, and the
 `LEVEL_*` codes 1 to 5). Code 0 means no level was given and, like the
 unassigned codes 6 and 7, reads as info (`ipc::stream_labels::level_of`), so
 a sender that sets no level logs at info.
@@ -91,12 +92,14 @@ a sender that sets no level logs at info.
   (`seraph::log!(warn: "fmt", args…)`). Every call site written before
   levels existed logs at info and stays so. std's panic, allocation-error,
   and precondition output, sent through the same cap, is at error. Bytes a
-  sender writes with `log::write_bytes` carry the level it passes.
+  sender writes with `log::write_bytes` carry the level it passes. A record
+  (§ `stream_labels::STREAM_RECORD`) carries its level the same way.
 - **Filter.** A std process sends only lines at or less verbose than its
   level, which std's `_start` reads once from the process's `SERAPH_LOG`
   environment entry (`error`, `warn`, `info`, `debug`, or `trace`; absent
   or any other value: info). A line above that level is neither formatted
-  nor sent, so it costs no IPC. A service sets the entry with the `.svc`
+  nor sent, so it costs no IPC; a record is filtered as a line is. A
+  service sets the entry with the `.svc`
   `env` key ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)
   § `argv` / `env`), a spawner with `Command::env`. Neither receiver
   filters: each renders every line it receives. An error line is sent at
@@ -112,18 +115,65 @@ a sender that sets no level logs at info.
   the `reclaim:` line below) is unchanged. A line of any other level carries
   its tag and a space after `[name] `: `ERROR`, `WARN`, `DEBUG`, or `TRACE`
   (`logd_codec::level::tag`): `[sec.usfrac] [name] WARN <line>`.
-- **History.** Each history line keeps its level, init-logd's across the
-  handover ([`handover-protocol.md`](handover-protocol.md) § `LINE`).
+- **History.** Each history entry keeps its level, init-logd's across the
+  handover ([`handover-protocol.md`](handover-protocol.md) § `LINE`,
+  § `RECORD`).
 
-#### Fields
+### `stream_labels::STREAM_RECORD` (15)
 
-The stream provides no framing for structured fields here: a line is text.
-A line that reports values writes each as `key=value` text, separated from
-the next by a space, as the `reclaim:` line (§ Death-notification cascade)
-does; a reader that parses fields (an xtask harness, a log query) splits the
-text. Text does not delimit a value from a following key, so a value that
-holds ` key=` reads as a further field. Framed fields, which give logd each
-key and value apart from the text, are tracked by #879.
+One log record per message: a message text and a list of fields, each a key
+and a value, delimited by lengths rather than by text, so no value or
+message byte can read as a key. Bits 16-31 of the label carry the record's
+byte length and bits 32-34 its level (§ Levels); the record's bytes are
+packed into the data words from word 0. `ipc::log_record` defines the
+layout and its encoder and decoder:
+
+| Part | Bytes |
+|---|---|
+| message length | 2, little-endian |
+| message | as many as its length |
+| each field: key length | 1 |
+| key | as many as its length, `[a-z0-9_]`, 1 to `KEY_MAX_LEN` (32) |
+| value length | 2, little-endian |
+| value | as many as its length, any bytes |
+
+A record is at most `RECORD_MAX_BYTES` (480) bytes, and its parts fill it
+exactly. A key may repeat; a reader sees each occurrence, in order.
+
+- **Sender.** `seraph::log!(warn: "fmt", args…; key = value, …)` sends one
+  record (the macro's documentation in `runtime/ruststd/src/os/seraph.rs`,
+  through `log::emit_record`): the format string and
+  its positional arguments make the message, and each value is formatted with
+  `Display`. Keys are checked against the alphabet at compile time. A record
+  that would be longer than the limit is cut at the sender: a message or
+  value that does not fit is cut on a character boundary, a field that has
+  no room for its key and lengths is dropped, and once anything is cut or
+  dropped every later field is dropped too, so the fields that arrive are a
+  prefix of those the sender wrote.
+- **Receivers.** Both init-logd and logd accept the label. A record is
+  complete in its message: the receiver renders it as one line at once and
+  leaves the slot's partial text line (§ `stream_labels::STREAM_BYTES`)
+  pending, then retains it in the history (§ History).
+- **Rendering.** `[sec.usfrac] [name] [TAG ]<message> key=value …`, the
+  prefix and tag as for a text line (§ Levels). The message is written as a
+  text line's bytes are, except that a newline is written `\n`, so a record
+  stays on one line. A value is written bare when it is a non-empty run of
+  UTF-8 characters, none of them whitespace, a control character, `=`, or
+  `"`; any other value is written in double quotes, with `\"`, `\\`, `\n`,
+  `\r`, and `\t` escaped, and `\xNN` for each byte of any other control
+  character and each byte of an invalid UTF-8 sequence. An info record with
+  no fields renders as the text line of its message does. A rendered body is
+  at most `RENDERED_MAX_BYTES` (1920) bytes. `logd_codec::record` renders a
+  record, and its `fields` reads the text after the message back to the same
+  keys and value bytes. The message is the sender's own text, as a text line
+  is, so a reader that needs the fields takes them from after the message
+  it expects.
+- **Reply.** `label = RECORD_ACCEPTED` (0) for a record rendered and
+  retained, `RECORD_REJECTED` (1) for a payload that is longer than a record
+  or than the message, or that `ipc::log_record` does not decode (a length
+  that overruns the payload, a key outside the alphabet, bytes left over):
+  such a payload is neither rendered nor retained. The payload is empty.
+  Sender unblocks.
 
 ### `stream_labels::STREAM_REGISTER_NAME` (11)
 
@@ -143,9 +193,9 @@ Reply: `label = 0`. Sender unblocks.
 
 One-shot init-logd → real-logd state transfer. Documented in
 [`handover-protocol.md`](handover-protocol.md). real-logd is the caller,
-not a handler: its receive loop dispatches only `STREAM_BYTES` and
-`STREAM_REGISTER_NAME`, and any other label, this one included, gets an
-empty reply. init-logd is the only receiver of the label.
+not a handler: its receive loop dispatches only `STREAM_BYTES`,
+`STREAM_RECORD`, and `STREAM_REGISTER_NAME`, and any other label, this one
+included, gets an empty reply. init-logd is the only receiver of the label.
 
 ### `log_labels::GET_LOG_CAP` (12) — legacy
 
@@ -158,20 +208,40 @@ Handover Discipline). logd replies empty if it ever
 arrives, so an out-of-tree v0 caller fails closed without crashing
 logd.
 
+## History
+
+The stored form the history query surface (#720) reads. Each of logd's
+per-slot entries ([`slot.rs`](../src/slot.rs) `HistoryEntry`) holds:
+
+| Field | Content |
+|---|---|
+| `us` | receipt time, microseconds since boot |
+| `level` | an `ipc::stream_labels::LEVEL_*` code (§ Levels) |
+| `kind` | `Text`, a `STREAM_BYTES` line, or `Record`, a `STREAM_RECORD` record with its field table |
+| `bytes` | a text line's bytes without its newline (at most `LINE_BUF_SIZE`, 256), or a record's payload as it arrived (at most `RECORD_MAX_BYTES`, 480) |
+
+A `Record` entry's field table is a span (start and length into `bytes`) for
+its message and a key span and a value span for each field, in the sender's
+order, so a reader selects by a key's value without parsing text. init-logd's
+ring (`logd_codec::history`) stores the same level, kind, and bytes per entry,
+with the sender's badge, and the handover carries each entry in a `LINE` or
+`RECORD` chunk ([`handover-protocol.md`](handover-protocol.md)); logd builds
+a record's field table again when it installs the chunk.
+
 ## Wait-set
 
 logd's main loop waits on a 3-member `WaitSet`:
 
 | Badge | Source | Purpose |
 |---|---|---|
-| `WS_BADGE_LOG` (0) | RECV on the master log endpoint | `STREAM_BYTES` / `STREAM_REGISTER_NAME` arrivals |
+| `WS_BADGE_LOG` (0) | RECV on the master log endpoint | `STREAM_BYTES` / `STREAM_RECORD` / `STREAM_REGISTER_NAME` arrivals |
 | `WS_BADGE_DEATH` (1) | RECV on logd's death-notification `EventQueue` | drained per loop iteration before service dispatch |
 | `WS_BADGE_RESYNC` (2) | logd's resync `Notification` | the resync helper thread's walk has ended (§ Death-queue resync) |
 
 Death events are drained inside every loop iteration (before
 servicing the log endpoint) so a recently-died sender's slot is
 evicted before logd processes any of its still-queued
-`STREAM_BYTES`. Mirrors procmgr's drain-deaths-first pattern.
+`STREAM_BYTES` or `STREAM_RECORD`. Mirrors procmgr's drain-deaths-first pattern.
 
 ## Death-notification cascade
 
@@ -198,12 +268,16 @@ tagged `[logd]`:
 reclaim: badge=<badge> exit_reason=0x<reason> name=<name>
 ```
 
-The badge is decimal, the exit reason lower-case hex (the death entry's
-`exit_reason`), and the name is the slot's registered display name
-(`STREAM_REGISTER_NAME`), `?` for a slot that registered none. The name is
-the last field and runs to the end of the line; each invalid UTF-8 sequence
-and each control character in it, a line break among them, prints as U+FFFD.
-A badge with no slot logs nothing. The line is a test
+The line is a record (§ `stream_labels::STREAM_RECORD`) with the message
+`reclaim:` and the fields `badge`, `exit_reason`, and `name`, which logd
+renders on its own line as a received record is rendered. The badge is
+decimal, the exit reason lower-case hex (the death entry's `exit_reason`),
+and the name is the slot's registered display name (`STREAM_REGISTER_NAME`),
+`?` for a slot that registered none. A name the renderer does not write bare,
+one holding a space or `=` among them, is quoted and escaped, so a name such
+as `x exit_reason=0x0` stays inside its value and cannot add a field:
+`name="x exit_reason=0x0"`. A reader takes the fields with
+`logd_codec::record::fields`. A badge with no slot logs nothing. The line is a test
 contract: `cargo xtask test-logd-reclaim` reads it from svctest's serial log
 (see [docs/testing.md](../../../docs/testing.md#death-forward-to-logd-test-logd-reclaim)).
 It also names a crashed process: a crash report block carries the process
@@ -230,8 +304,9 @@ a resync:
    the cursor, sends the list back over a channel, and signals the resync
    notification.
 3. On that wake the main thread evicts every snapshot badge the walk did not
-   list, logging `reclaim (resync): badge=<badge> name=<name>` for each (the
-   fields are those of the death drain's line). A slot created after the
+   list, logging `reclaim (resync): badge=<badge> name=<name>` for each (a
+   record with the message `reclaim (resync):` and the death drain's fields
+   but `exit_reason`). A slot created after the
    snapshot is no candidate, so a sender that starts during the walk keeps its
    slot. A failed walk evicts nothing.
 

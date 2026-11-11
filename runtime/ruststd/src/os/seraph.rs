@@ -1402,8 +1402,76 @@ pub mod log {
         unsafe { ::log::emit(current_ipc_buf(), level, args) };
     }
 
-    // The level codes `log!`'s arms pass to `__emit_at` as literals, since
-    // the macro expands in crates that cannot name `ipc`.
+    /// Macro entry point of a `log!` with fields. Resolves the calling
+    /// thread's IPC buffer and the process-global badged cap, then builds a
+    /// record of `message` and `fields` (`ipc::log_record`) and emits it at
+    /// `level` as one `STREAM_RECORD` message, clipped to the record limit.
+    /// Silently drops when no log cap is acquirable.
+    #[doc(hidden)]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn __emit_record(
+        level: u64,
+        message: core::fmt::Arguments<'_>,
+        fields: &[(&str, &dyn core::fmt::Display)],
+    ) {
+        // SAFETY: `current_ipc_buf` is null or this thread's registered IPC
+        // buffer page (`_start` and the spawn trampoline set it after
+        // registering).
+        unsafe { ::log::emit_record(current_ipc_buf(), level, message, fields) };
+    }
+
+    /// Whether `key` is a valid field key, `[a-z0-9_]` of 1 to
+    /// `ipc::log_record::KEY_MAX_LEN` bytes. `log!` checks each key with it
+    /// at compile time.
+    ///
+    /// This is `ipc::log_record::is_valid_key` restated: a const-stable std
+    /// function cannot call a const function of a crate outside std's staged
+    /// API. The assertion below holds the two to the same answers.
+    #[doc(hidden)]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[rustc_const_stable(feature = "seraph_ext", since = "1.0.0")]
+    #[must_use]
+    pub const fn __valid_key(key: &str) -> bool {
+        let key = key.as_bytes();
+        if key.is_empty() || key.len() > ::ipc::log_record::KEY_MAX_LEN {
+            return false;
+        }
+        let mut i = 0;
+        while i < key.len() {
+            let b = key[i];
+            if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    // `__valid_key` and `ipc::log_record::is_valid_key` agree on each class
+    // of key: valid, empty, too long, and each kind of refused byte.
+    const _: () = {
+        const KEYS: [&str; 9] = [
+            "exit_reason",
+            "a0_",
+            "",
+            "abcdefghijklmnopqrstuvwxyz_01234",
+            "abcdefghijklmnopqrstuvwxyz_012345",
+            "Badge",
+            "r#type",
+            "a-b",
+            "caf\u{e9}",
+        ];
+        let mut i = 0;
+        while i < KEYS.len() {
+            assert!(
+                __valid_key(KEYS[i]) == ::ipc::log_record::is_valid_key(KEYS[i].as_bytes())
+            );
+            i += 1;
+        }
+    };
+
+    // The level codes `log!`'s arms pass to `__emit_at` and `__emit_record`
+    // as literals, since the macro expands in crates that cannot name `ipc`.
     const _: () = assert!(
         ::ipc::stream_labels::LEVEL_ERROR == 1
             && ::ipc::stream_labels::LEVEL_WARN == 2
@@ -1458,11 +1526,57 @@ pub mod registry {
 /// sent in chunks as it fills, so a message of any length is sent in full;
 /// a failed send drops the chunks after it, and the receiver may emit a
 /// long message as several lines.
+///
+/// A `;` after the format string and its positional arguments starts a
+/// list of fields, as in `log!(warn: "retrying {}", path; attempt = n,
+/// errno = e)`. Each value is formatted with `Display`, and the line is
+/// sent as one record whose message and values reach the receiver
+/// length-delimited, so no value or message text can read as a further
+/// field (`services/logd/docs/ipc-interface.md`
+/// § `stream_labels::STREAM_RECORD`). A key is `[a-z0-9_]{1,32}` and is
+/// checked at compile time; a key may repeat. This form takes no named
+/// format arguments. A record is at most `ipc::log_record::RECORD_MAX_BYTES`
+/// long, staged on the stack: a message or value that does not fit is cut on
+/// a character boundary, a field with no room for its key is dropped, and
+/// once anything is cut or dropped every later field is dropped too.
 #[macro_export]
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 macro_rules! __seraph_log {
     // The literal codes are `ipc::stream_labels::LEVEL_*`, which
-    // `std::os::seraph::log` asserts.
+    // `std::os::seraph::log` asserts. The arms with fields come before the
+    // plain arms they would otherwise reach.
+    (error: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+        $crate::__seraph_log!(@record 1, $fmt $(, $arg)* ; $($key = $val),+)
+    }};
+    (warn: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+        $crate::__seraph_log!(@record 2, $fmt $(, $arg)* ; $($key = $val),+)
+    }};
+    (info: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+        $crate::__seraph_log!(@record 3, $fmt $(, $arg)* ; $($key = $val),+)
+    }};
+    (debug: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+        $crate::__seraph_log!(@record 4, $fmt $(, $arg)* ; $($key = $val),+)
+    }};
+    (trace: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+        $crate::__seraph_log!(@record 5, $fmt $(, $arg)* ; $($key = $val),+)
+    }};
+    (@record $lvl:literal, $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+) => {{
+        $(
+            const _: () = ::core::assert!(
+                $crate::os::seraph::log::__valid_key(::core::stringify!($key)),
+                ::core::concat!(
+                    "seraph::log!: field key `",
+                    ::core::stringify!($key),
+                    "` is not 1 to 32 of [a-z0-9_]"
+                ),
+            );
+        )+
+        $crate::os::seraph::log::__emit_record(
+            $lvl,
+            ::core::format_args!($fmt $(, $arg)*),
+            &[$((::core::stringify!($key), &$val as &dyn ::core::fmt::Display)),+],
+        )
+    }};
     (error: $($arg:tt)+) => {{
         $crate::os::seraph::log::__emit_at(1, ::core::format_args!($($arg)+))
     }};
@@ -1477,6 +1591,9 @@ macro_rules! __seraph_log {
     }};
     (trace: $($arg:tt)+) => {{
         $crate::os::seraph::log::__emit_at(5, ::core::format_args!($($arg)+))
+    }};
+    ($fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+        $crate::__seraph_log!(@record 3, $fmt $(, $arg)* ; $($key = $val),+)
     }};
     ($($arg:tt)*) => {{
         $crate::os::seraph::log::__emit(::core::format_args!($($arg)*))

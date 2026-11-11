@@ -39,8 +39,9 @@ pub fn logd_forward() -> &'static [Phase]
 
 /// The log name [`logd_death_forward_phase`]'s child registers, which
 /// `cargo xtask test-logd-reclaim` finds in logd's `reclaim:` line. No other
-/// process registers it.
-const LOGD_RECLAIM_NAME: &[u8] = b"svctest-logd-reclaim";
+/// process registers it. It holds a forged `exit_reason` field, which logd's
+/// line must carry inside the quoted name, never as a field of its own.
+const LOGD_RECLAIM_NAME: &[u8] = b"svctest-logd-reclaim exit_reason=0x0";
 
 /// The code [`logd_death_forward_phase`]'s child exits with, which logd's
 /// `reclaim:` line carries as `exit_reason=0x17`. Nonzero, so the check also
@@ -50,21 +51,58 @@ const LOGD_RECLAIM_EXIT_CODE: i32 = 0x17;
 /// Role token of [`logd_death_forward_phase`]'s child.
 const LOGD_RECLAIM_ROLE: &str = "logd-reclaim-child";
 
-/// Register [`LOGD_RECLAIM_NAME`], log one line under it, and exit with
+/// Register [`LOGD_RECLAIM_NAME`], log under it, and exit with
 /// [`LOGD_RECLAIM_EXIT_CODE`]. The registration is a synchronous call, so
 /// logd holds the named slot before the child can exit.
+///
+/// Between the halves of one text line, [`LOGD_PARTIAL_TEXT`] then
+/// [`LOGD_RESUMED_TEXT`], the child sends a malformed record, which logd must
+/// refuse, and a record with a `code` field of [`LOGD_RECLAIM_EXIT_CODE`].
+/// `cargo xtask test-logd-reclaim` finds the record's line, and the text line
+/// whole after it: a record leaves a sender's pending text line as it was.
+/// A refused record or a failed send panics, so the exit code differs.
 fn logd_reclaim_child_main() -> !
 {
+    use ipc::stream_labels::{
+        LEVEL_INFO, LEVEL_SHIFT, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD,
+    };
+
     std::os::seraph::log::register_name(LOGD_RECLAIM_NAME);
-    std::os::seraph::log!("logd-reclaim child exiting");
+    let cap = std::os::seraph::log::acquire();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let send = |id: u64, bytes: &[u8]| {
+        let label = id | ((bytes.len() as u64) << 16) | (LEVEL_INFO << LEVEL_SHIFT);
+        let msg = ipc::IpcMessage::builder(label).bytes(0, bytes).build();
+        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
+        unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }
+            .expect("logd_reclaim child: log send failed")
+            .label
+    };
+    send(STREAM_BYTES, LOGD_PARTIAL_TEXT);
+    // A message length of 5 with no message bytes after it.
+    assert_eq!(
+        send(STREAM_RECORD, &[5, 0]),
+        RECORD_REJECTED,
+        "logd_reclaim child: logd accepted a malformed record"
+    );
+    std::os::seraph::log!("logd-reclaim child exiting"; code = LOGD_RECLAIM_EXIT_CODE);
+    send(STREAM_BYTES, LOGD_RESUMED_TEXT);
     std::process::exit(LOGD_RECLAIM_EXIT_CODE)
 }
+
+/// The first half of the text line [`logd_reclaim_child_main`] splits around
+/// its records; `cargo xtask test-logd-reclaim` reads the line whole.
+const LOGD_PARTIAL_TEXT: &[u8] = b"partial text ";
+
+/// The second half, which ends the line.
+const LOGD_RESUMED_TEXT: &[u8] = b"line resumed\n";
 
 /// Spawn a child that registers [`LOGD_RECLAIM_NAME`] with logd and exits
 /// with [`LOGD_RECLAIM_EXIT_CODE`], and assert that code. procmgr's teardown
 /// forwards the death to logd's death queue (`forward_death_to_logd`), and
 /// logd evicts the child's slot and logs
-/// `reclaim: badge=<b> exit_reason=0x17 name=svctest-logd-reclaim`. logd has
+/// `reclaim: badge=<b> exit_reason=0x17 name="svctest-logd-reclaim
+/// exit_reason=0x0"`. logd has
 /// no read surface, so svctest cannot observe the eviction:
 /// `cargo xtask test-logd-reclaim` checks the line in the boot's serial log
 /// (docs/testing.md § Death forward to logd).

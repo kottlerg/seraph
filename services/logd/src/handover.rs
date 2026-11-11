@@ -19,6 +19,7 @@
 
 use ipc::IpcMessage;
 use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
+use ipc::log_record::Record;
 use logd_codec::handover::{self as wire, Chunk};
 
 use crate::slot::SlotTable;
@@ -72,13 +73,13 @@ pub unsafe fn transfer(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut Sl
 unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTable)
 {
     // Bound on chunks per drain. A first drain sends 1 header + up to
-    // init-logd's MAX_SENDERS (32) slots + its history ring's lines + 1
-    // DONE. The ring packs lines by length, so it holds at most one line per
-    // `history::RECORD_HEADER_BYTES + 1` bytes of its 16 KiB, about 820;
-    // slots resent after a rename and lines pushed during the drain add to
-    // that only while senders keep renaming or logging. 2048 leaves headroom
-    // for both, and also ends a malformed reply stream that never sends
-    // DONE.
+    // init-logd's MAX_SENDERS (32) slots + its history ring's entries + 1
+    // DONE. The ring packs entries by length, so it holds at most one entry
+    // per `history::RECORD_HEADER_BYTES + 1` bytes of its 16 KiB, about 780
+    // (a text line is at least 1 byte, a record at least 2); slots resent
+    // after a rename and entries pushed during the drain add to that only
+    // while senders keep renaming or logging. 2048 leaves headroom for both,
+    // and also ends a malformed reply stream that never sends DONE.
     const MAX_ITERS: usize = 2048;
 
     for _ in 0..MAX_ITERS
@@ -104,6 +105,20 @@ unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTa
                 level,
                 bytes,
             } => table.install_history_line(badge, us, level, bytes),
+            // A record is stored only when it decodes: its payload is the
+            // peer's.
+            Chunk::Record {
+                badge,
+                us,
+                level,
+                bytes,
+            } =>
+            {
+                if let Ok(record) = Record::decode(bytes)
+                {
+                    table.install_history_record(badge, us, level, &record);
+                }
+            }
             // The header is informational; an unknown kind is skipped.
             Chunk::Header | Chunk::Skip =>
             {}

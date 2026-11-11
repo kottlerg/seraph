@@ -57,13 +57,23 @@ targets; only the one-time init-logd history pull
   exactly once so a headless boot does not re-query devmgr per line.
   See [docs/console-model.md](../../docs/console-model.md).
 
+* **Log records.** Beside the text stream, a sender can send a log record,
+  a message and fields whose keys and values arrive length-delimited
+  (`STREAM_RECORD`; `seraph::log!` with a `; key = value` list). logd
+  renders each as one line, quoting and escaping a value that could
+  otherwise read as further fields, and retains it with its field table
+  (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
+  § `stream_labels::STREAM_RECORD`).
+
 * **History buffer.** logd keeps a bounded per-sender ring of completed
-  log lines (oldest line dropped when full), appended on every
-  `STREAM_BYTES` line flush (see
-  [`docs/ipc-interface.md`](docs/ipc-interface.md) § `stream_labels::STREAM_BYTES`)
-  and seeded at startup from init-logd's handover `LINE` chunks (see
+  entries, text lines and records (oldest entry dropped when full),
+  appended on every `STREAM_BYTES` line flush and every `STREAM_RECORD`
+  (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § History, which
+  states the stored form) and seeded at startup from init-logd's handover
+  `LINE` and `RECORD` chunks (see
   [`docs/handover-protocol.md`](docs/handover-protocol.md) § `LINE`). The
-  ring has no read surface. TODO: a query IPC that reads the history ring.
+  ring has no read surface. TODO: a query IPC that reads the history ring
+  (#720).
 
 * **Per-sender slot reclamation.** logd creates an `EventQueue` and
   registers it with procmgr via `procmgr_labels::REGISTER_DEATH_EQ`
@@ -75,8 +85,8 @@ targets; only the one-time init-logd history pull
   death-observer nodes (see
   [`services/procmgr/docs/ipc-interface.md`](../procmgr/docs/ipc-interface.md)
   § `REGISTER_DEATH_EQ`). logd evicts the slot of exactly that badge from
-  its hash-keyed badge table and logs a `reclaim:` line naming the badge,
-  the exit reason, and the slot's registered name (see
+  its hash-keyed badge table and logs a `reclaim:` line, a record, naming
+  the badge, the exit reason, and the slot's registered name (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Death-notification
   cascade). The EQ has a fixed
   tuning capacity. A death posted to a full EQ is dropped, so a drain that
@@ -107,8 +117,9 @@ logd/
 ├── codec/                      # logd-codec, its own component shared
 │                               # with init-logd: handover wire contract,
 │                               # init-logd's history ring, the resync
-│                               # decisions, the reclaim line, the shared
-│                               # line and name widths, and BoundedStr
+│                               # decisions, the reclaim line, record
+│                               # rendering, the shared line and name
+│                               # widths, and BoundedStr
 │                               # (see codec/README.md)
 ├── docs/
 │   ├── handover-protocol.md    # init-logd → logd wire format
@@ -157,7 +168,7 @@ the devmgr-registry cap for its lifetime (see
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
 | [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, and the `reclaim:` line logd logs when it evicts a slot |
-| [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with, the `reclaim:` line formatter, and the `BoundedStr` diagnostic formatter |
+| [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with, the `reclaim:` line, log record rendering, and the `BoundedStr` diagnostic formatter |
 
 ---
 

@@ -5,17 +5,24 @@
 
 //! The diagnostic line logd logs when it evicts a sender's slot.
 //!
-//! [`ReclaimLine`] formats both shapes: a death drain's
-//! `reclaim: badge=<b> exit_reason=0x<r> name=<n>` and a resync's
-//! `reclaim (resync): badge=<b> name=<n>`. The badge is decimal, the exit
-//! reason lower-case hex, and the name, the last field, runs to the end of
-//! the line: a control character in it, a line break among them, prints as
-//! U+FFFD, as does each invalid UTF-8 sequence. `cargo xtask
-//! test-logd-reclaim` reads the death drain's shape from the serial log, so
-//! the shape is a contract, stated in `services/logd/docs/ipc-interface.md`
+//! [`ReclaimLine`] builds it as a log record (`ipc::log_record`) of both
+//! shapes: a death drain's message `reclaim:` with the fields `badge`,
+//! `exit_reason`, and `name`, and a resync's message `reclaim (resync):` with
+//! `badge` and `name`. The badge is decimal and the exit reason `0x` and
+//! lower-case hex. logd renders the record as both receivers render one
+//! ([`crate::record`]), so `reclaim: badge=<b> exit_reason=0x<r> name=<n>`
+//! for a plain name, and the name, which its sender chose, is quoted and
+//! escaped when it holds a space, `=`, a control character, or invalid
+//! UTF-8: it cannot read as a further field. `cargo xtask test-logd-reclaim`
+//! reads the death drain's fields from the serial log, so the line is a
+//! contract, stated in `services/logd/docs/ipc-interface.md`
 //! § Death-notification cascade.
 
-use core::fmt::{self, Write as _};
+use core::fmt;
+
+use ipc::log_record::{Record, RecordWriter};
+
+use crate::record::Rendered;
 
 /// The name a line prints for a slot that never registered one, and the
 /// name logd's line tag shows for such a sender.
@@ -36,8 +43,8 @@ pub enum Cause
     Resync,
 }
 
-/// One reclaim line. `Display` writes it without logd's `[logd]` tag or a
-/// line ending.
+/// One reclaim line. `Display` writes its rendering without logd's `[logd]`
+/// tag or a line ending.
 #[derive(Clone, Copy, Debug)]
 pub struct ReclaimLine<'a>
 {
@@ -49,61 +56,64 @@ pub struct ReclaimLine<'a>
     pub name: &'a [u8],
 }
 
+impl ReclaimLine<'_>
+{
+    /// The message text of this line's shape.
+    #[must_use]
+    pub fn message(&self) -> &'static str
+    {
+        match self.cause
+        {
+            Cause::Death { .. } => "reclaim:",
+            Cause::Resync => "reclaim (resync):",
+        }
+    }
+
+    /// The line as a log record. The name is the slot's registered name, or
+    /// [`UNNAMED`] when it registered none; a stored name is at most
+    /// `MAX_NAME_LEN` bytes, so the record is never clipped.
+    #[must_use]
+    pub fn record(&self) -> RecordWriter
+    {
+        let mut w = RecordWriter::with_message_bytes(self.message().as_bytes());
+        w.field("badge", format_args!("{}", self.badge));
+        if let Cause::Death { exit_reason } = self.cause
+        {
+            w.field("exit_reason", format_args!("0x{exit_reason:x}"));
+        }
+        let name = if self.name.is_empty()
+        {
+            UNNAMED.as_bytes()
+        }
+        else
+        {
+            self.name
+        };
+        w.field_bytes(b"name", name);
+        w
+    }
+}
+
 impl fmt::Display for ReclaimLine<'_>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
     {
-        match self.cause
+        let w = self.record();
+        // A record `RecordWriter` built decodes.
+        match Record::decode(w.as_bytes())
         {
-            Cause::Death { exit_reason } => write!(
-                f,
-                "reclaim: badge={} exit_reason=0x{exit_reason:x} name=",
-                self.badge
-            )?,
-            Cause::Resync => write!(f, "reclaim (resync): badge={} name=", self.badge)?,
-        }
-        write_name(f, self.name)
-    }
-}
-
-/// Write `name`, or [`UNNAMED`] when it is empty. A registered name is
-/// sender input: it need not be UTF-8, and may hold control characters that
-/// would end or reshape the line. Each invalid sequence and each control
-/// character is written as U+FFFD.
-fn write_name(f: &mut fmt::Formatter<'_>, name: &[u8]) -> fmt::Result
-{
-    if name.is_empty()
-    {
-        return f.write_str(UNNAMED);
-    }
-    for chunk in name.utf8_chunks()
-    {
-        for c in chunk.valid().chars()
-        {
-            f.write_char(
-                if c.is_control()
-                {
-                    char::REPLACEMENT_CHARACTER
-                }
-                else
-                {
-                    c
-                },
-            )?;
-        }
-        if !chunk.invalid().is_empty()
-        {
-            f.write_char(char::REPLACEMENT_CHARACTER)?;
+            Ok(rec) => Rendered(&rec).fmt(f),
+            Err(_) => Err(fmt::Error),
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests
 {
     use super::*;
-    use crate::{BoundedStr, LINE_BUF_SIZE, MAX_NAME_LEN};
+    use crate::MAX_NAME_LEN;
+    use crate::record::fields;
 
     #[test]
     fn a_death_line_names_the_badge_reason_and_name()
@@ -129,7 +139,7 @@ mod tests
         };
         assert_eq!(
             line.to_string(),
-            "reclaim (resync): badge=71 name=fatfs /data"
+            r#"reclaim (resync): badge=71 name="fatfs /data""#
         );
     }
 
@@ -145,7 +155,7 @@ mod tests
     }
 
     #[test]
-    fn each_invalid_name_sequence_becomes_one_replacement_character()
+    fn an_invalid_name_sequence_is_escaped_byte_for_byte()
     {
         let line = ReclaimLine {
             badge: 73,
@@ -154,12 +164,12 @@ mod tests
         };
         assert_eq!(
             line.to_string(),
-            "reclaim (resync): badge=73 name=a\u{fffd}b\u{fffd}"
+            r#"reclaim (resync): badge=73 name="a\xffb\xe2\x82""#
         );
     }
 
     #[test]
-    fn a_control_character_in_a_name_becomes_a_replacement_character()
+    fn a_control_character_in_a_name_stays_inside_its_value()
     {
         let line = ReclaimLine {
             badge: 74,
@@ -168,15 +178,42 @@ mod tests
         };
         assert_eq!(
             line.to_string(),
-            "reclaim: badge=74 exit_reason=0x0 name=a\u{fffd}b\u{fffd}\u{fffd}"
+            r#"reclaim: badge=74 exit_reason=0x0 name="a\nb\r\x1b""#
         );
     }
 
-    // The widest line fits logd's diagnostic buffer untruncated: the largest
-    // badge and reason, and a name of the longest stored length whose every
-    // byte prints as a three-byte U+FFFD.
+    // A registered name that spells a further field cannot forge one: the
+    // line's fields read back as logd's, and the name whole.
     #[test]
-    fn the_widest_line_fits_the_diagnostic_buffer()
+    fn a_name_holding_a_field_cannot_forge_the_exit_reason()
+    {
+        let line = ReclaimLine {
+            badge: 70,
+            cause: Cause::Death { exit_reason: 0x17 },
+            name: b"svctest-logd-reclaim exit_reason=0x0",
+        };
+        let text = line.to_string();
+        let rest = text.strip_prefix(line.message()).expect("the message");
+        let got: Vec<(String, Vec<u8>)> = fields(rest)
+            .map(|f| (f.key.to_string(), f.value.bytes().collect()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("badge".to_string(), b"70".to_vec()),
+                ("exit_reason".to_string(), b"0x17".to_vec()),
+                (
+                    "name".to_string(),
+                    b"svctest-logd-reclaim exit_reason=0x0".to_vec()
+                ),
+            ]
+        );
+    }
+
+    // The widest line is never clipped: the largest badge and reason, and a
+    // name of the longest stored length whose every byte is escaped.
+    #[test]
+    fn the_widest_line_is_not_clipped()
     {
         let name = [0xff; MAX_NAME_LEN];
         let line = ReclaimLine {
@@ -186,10 +223,7 @@ mod tests
             },
             name: &name,
         };
-        let text = line.to_string();
-        assert_eq!(text.len(), 72 + 3 * MAX_NAME_LEN);
-        let mut buf = BoundedStr::<LINE_BUF_SIZE>::new();
-        write!(buf, "{line}").expect("BoundedStr writes never fail");
-        assert_eq!(buf.as_str(), text);
+        assert!(!line.record().clipped());
+        assert_eq!(line.to_string().len(), 74 + 4 * MAX_NAME_LEN);
     }
 }

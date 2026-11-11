@@ -498,8 +498,8 @@ pub struct ProcessInfo
     pub current_dir_cap: u64,
 
     /// `CSpace` slot of a badged SEND cap on the system log endpoint
-    /// suitable for direct `STREAM_BYTES` / `STREAM_REGISTER_NAME`
-    /// use.
+    /// suitable for direct `STREAM_BYTES` / `STREAM_RECORD` /
+    /// `STREAM_REGISTER_NAME` use.
     ///
     /// **Deprecated**: this slot predates the service registry and is
     /// on a migration path to lookup via [`Self::service_registry_cap`]. New

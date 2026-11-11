@@ -3117,26 +3117,29 @@ pub mod keysym
 
 /// Wire-protocol version of [`stream_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const STREAM_LABELS_VERSION: u32 = 2;
+pub const STREAM_LABELS_VERSION: u32 = 3;
 /// IPC labels for the system log stream: the badged SEND cap on the master
 /// log endpoint each process holds (`ProcessInfo.log_send_cap`).
 ///
-/// One label, one direction, bytes inline. The producer issues
+/// Text is a byte stream. The producer issues
 /// `ipc_call(cap, label=STREAM_BYTES | (byte_len << 16) | (level << 32), …)`
 /// per write (chunked at `MSG_DATA_WORDS_MAX * 8` per call). The receiver
 /// reads `byte_len.div_ceil(8)` data words from its IPC buffer and unpacks
 /// `byte_len` bytes. The receiver replies empty to unblock the writer.
-///
 /// No multi-chunk reassembly framing on the wire — line buffering
 /// (e.g. logd's `[name]` per-newline prefix) lives in the receiver.
 ///
+/// A record ([`STREAM_RECORD`]) is one complete log line whose message text
+/// and fields are framed apart, in one message ([`crate::log_record`]).
+///
 /// # Label encoding
-/// - Bits 0-15: label ID ([`STREAM_BYTES`])
-/// - Bits 16-31: byte length of the payload in this call (0..=512).
-/// - Bits 32-34 ([`LEVEL_SHIFT`], [`LEVEL_MASK`]): the log level of the
-///   bytes, a `LEVEL_*` code. A line takes the level of the message that
+/// - Bits 0-15: label ID ([`STREAM_BYTES`] or [`STREAM_RECORD`])
+/// - Bits 16-31: byte length of the payload in this call (0..=512; at most
+///   [`crate::log_record::RECORD_MAX_BYTES`] for a record).
+/// - Bits 32-34 ([`LEVEL_SHIFT`], [`LEVEL_MASK`]): the log level, a
+///   `LEVEL_*` code. A text line takes the level of the message that
 ///   carries its first byte (`services/logd/docs/ipc-interface.md`
-///   § `stream_labels::STREAM_BYTES`).
+///   § `stream_labels::STREAM_BYTES`); a record carries its own.
 pub mod stream_labels
 {
     // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
@@ -3165,9 +3168,9 @@ pub mod stream_labels
     /// Step-by-step detail.
     pub const LEVEL_TRACE: u64 = 5;
 
-    /// The level a [`STREAM_BYTES`] label carries: [`LEVEL_ERROR`] to
-    /// [`LEVEL_TRACE`], with [`LEVEL_UNSPECIFIED`] and the unassigned codes
-    /// 6 and 7 read as [`LEVEL_INFO`].
+    /// The level a [`STREAM_BYTES`] or [`STREAM_RECORD`] label carries:
+    /// [`LEVEL_ERROR`] to [`LEVEL_TRACE`], with [`LEVEL_UNSPECIFIED`] and the
+    /// unassigned codes 6 and 7 read as [`LEVEL_INFO`].
     #[must_use]
     pub const fn level_of(label: u64) -> u64
     {
@@ -3189,6 +3192,23 @@ pub mod stream_labels
     /// stores names as given (`services/logd/docs/ipc-interface.md`
     /// § `stream_labels::STREAM_REGISTER_NAME`).
     pub const STREAM_REGISTER_NAME: u64 = 11;
+
+    /// One log record: a message and its fields, framed apart
+    /// ([`crate::log_record`]). Payload: the record via `.bytes(0, record)`,
+    /// its byte length in bits 16-31 and its level in bits 32-34, as on
+    /// [`STREAM_BYTES`]. A record is complete in its message, so it does not
+    /// join the sender's partial text line. The receiver replies
+    /// [`RECORD_ACCEPTED`], or [`RECORD_REJECTED`] for a payload that is not a
+    /// record, which it neither renders nor stores
+    /// (`services/logd/docs/ipc-interface.md`
+    /// § `stream_labels::STREAM_RECORD`).
+    pub const STREAM_RECORD: u64 = 15;
+    /// [`STREAM_RECORD`] reply label: the record was rendered and stored.
+    pub const RECORD_ACCEPTED: u64 = 0;
+    /// [`STREAM_RECORD`] reply label: the payload is not a record (its
+    /// length is over the limit or disagrees with the label, or
+    /// `log_record::Record::decode` refuses it).
+    pub const RECORD_REJECTED: u64 = 1;
 }
 
 /// Badge bits that endpoints gating a label on a verb-bit use for it: each
@@ -3241,7 +3261,7 @@ pub mod log_badges
 
 /// Wire-protocol version of [`log_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const LOG_LABELS_VERSION: u32 = 3;
+pub const LOG_LABELS_VERSION: u32 = 4;
 /// IPC labels for the system log endpoint's legacy discovery interface
 /// and the one-shot init-logd → real-logd handover.
 ///
@@ -3273,14 +3293,14 @@ pub mod log_labels
     /// RECV and serves every other sender between pulls. The replies
     /// carry, in order:
     ///
-    /// * A header — the total history-line count and the active slot
+    /// * A header — the total history-entry count and the active slot
     ///   count.
     /// * The badge table — for every active sender badge init-logd
     ///   has seen, the `(badge, display_name)` pair, and again for each
     ///   slot whose name changed after the table was sent.
-    /// * The captured-history ring — the complete lines init-logd still
-    ///   holds, oldest first, attributed by badge and timestamped at the
-    ///   original receipt instant.
+    /// * The captured-history ring — the complete text lines and records
+    ///   init-logd still holds, oldest first, attributed by badge and
+    ///   timestamped at the original receipt instant.
     ///
     /// Wire encoding is documented in
     /// `services/logd/docs/handover-protocol.md` and defined in
@@ -3330,6 +3350,8 @@ pub mod log_labels
 // cap-role enum; no per-service sentinels.
 
 pub mod bootstrap;
+
+pub mod log_record;
 
 pub mod recv_guard;
 

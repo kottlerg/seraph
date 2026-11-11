@@ -27,11 +27,11 @@ use procmgr_process_table::threads;
 
 use crate::symbolize::{Symbolizer, describe_resolution, text_span};
 
-/// The tags of logd's reclaim lines after their timestamp: a death drained
-/// from logd's death queue, and a resync's eviction
-/// (services/logd/docs/ipc-interface.md § Death-notification cascade,
-/// § Death-queue resync).
-const RECLAIM_TAGS: [&str; 2] = ["[logd] reclaim: badge=", "[logd] reclaim (resync): badge="];
+/// logd's tag and the message of each of its reclaim lines, the fields after
+/// which name the slot: a death drained from logd's death queue, and a
+/// resync's eviction (services/logd/docs/ipc-interface.md § Death-notification
+/// cascade, § Death-queue resync).
+const RECLAIM_TAGS: [&str; 2] = ["[logd] reclaim: ", "[logd] reclaim (resync): "];
 
 /// The sysroot directories searched, in this order, for the binary a log
 /// name names: the boot modules and services, the drivers, the filesystem
@@ -46,8 +46,10 @@ const IMAGE_DIRS: [&str; 6] = [
     "tests/programs",
 ];
 
-/// The badge and registered log name of each logd reclaim line of `log`. A
-/// slot that registered no name (logd prints it as `?`) has no entry.
+/// The badge and registered log name of each logd reclaim line of `log`,
+/// read from the line's fields (`logd_codec::record::fields`), so a quoted
+/// name is read whole and unescaped. A slot that registered no name (logd
+/// prints it as `?`) has no entry.
 pub fn reclaimed_names(log: &str) -> HashMap<u64, String>
 {
     let mut names = HashMap::new();
@@ -60,22 +62,18 @@ pub fn reclaimed_names(log: &str) -> HashMap<u64, String>
         {
             continue;
         };
-        let Some((badge, rest)) = rest.split_once(' ')
-        else
+        let fields: Vec<_> = logd_codec::record::fields(rest.trim_end_matches('\r')).collect();
+        let badge = fields
+            .iter()
+            .find(|f| f.key == "badge")
+            .and_then(|f| String::from_utf8(f.value.bytes().collect()).ok())
+            .and_then(|b| b.parse().ok());
+        let name = fields.iter().find(|f| f.key == "name");
+        if let (Some(badge), Some(name)) = (badge, name)
+            && !name.value.is(UNNAMED.as_bytes())
         {
-            continue;
-        };
-        let Some(name) = rest
-            .strip_prefix("name=")
-            .or_else(|| rest.split_once(" name=").map(|(_, name)| name))
-        else
-        {
-            continue;
-        };
-        let name = name.trim_end_matches('\r');
-        if let (Ok(badge), false) = (badge.parse(), name == UNNAMED)
-        {
-            names.insert(badge, name.to_string());
+            let name: Vec<u8> = name.value.bytes().collect();
+            names.insert(badge, String::from_utf8_lossy(&name).into_owned());
         }
     }
     names
@@ -1175,11 +1173,13 @@ mod tests
             reclaim_line(2, Cause::Resync, "fatfs /data"),
             reclaim_line(3, Cause::Death { exit_reason: 0 }, ""),
             "[2.7] [hello] reclaim: badge=4 exit_reason=0x0 name=impostor\n".to_owned(),
+            reclaim_line(5, Cause::Death { exit_reason: 0 }, "x badge=9 name=\"y\""),
         ]
         .concat();
         let names = reclaimed_names(&log);
-        assert_eq!(names.len(), 2, "{names:?}");
+        assert_eq!(names.len(), 3, "{names:?}");
         assert_eq!(names[&1], "shell");
         assert_eq!(names[&2], "fatfs /data");
+        assert_eq!(names[&5], "x badge=9 name=\"y\"");
     }
 }

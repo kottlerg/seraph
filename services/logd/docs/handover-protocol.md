@@ -73,14 +73,15 @@ log line itself (see [`main.rs`](../src/main.rs)).
   (see [Termination](#termination)).
 
 Bits 16-31 of the reply label (`(byte_len << 16)`) carry the
-inline byte length on `SLOT` and `LINE` chunk kinds, and bits 32-34 the
-line's level on `LINE`, matching the stream-protocol convention
+inline byte length on `SLOT`, `LINE`, and `RECORD` chunk kinds, and bits
+32-34 the entry's level on `LINE` and `RECORD`, matching the stream-protocol
+convention
 ([`ipc-interface.md`](ipc-interface.md) § Levels). Real-logd masks the
 bottom 16 bits to extract the status code.
 
 ## Chunk kinds
 
-`word(0)` of each reply identifies the chunk kind. Three kinds:
+`word(0)` of each reply identifies the chunk kind. Four kinds:
 
 ### `HEADER` (1)
 
@@ -90,7 +91,7 @@ state up front.
 | Word | Meaning |
 |---|---|
 | 0 | `HEADER` |
-| 1 | total history-line count ever pushed (monotonic; exceeds the lines the ring still holds once it has dropped its oldest) |
+| 1 | total history-entry count ever pushed, text lines and records (monotonic; exceeds the entries the ring still holds once it has dropped its oldest) |
 | 2 | active sender-slot count (non-zero badges in init-logd's slot table) |
 
 No inline bytes. No transferred caps.
@@ -121,10 +122,11 @@ name).
 ### `LINE` (3)
 
 One completed log line from init-logd's bounded history ring, a byte
-ring that packs lines by length and drops the oldest when full. Sent
-in FIFO order, by absolute push sequence: oldest live line first. A
-line the ring drops before it is sent is skipped, and lines
-pushed while the drain runs are sent after the ones before them,
+ring that packs its entries, text lines and records, by length and drops
+the oldest when full. Entries are sent in FIFO order, by absolute push
+sequence: oldest live entry first, each a `LINE` or a `RECORD` chunk as its
+kind says. An entry the ring drops before it is sent is skipped, and
+entries pushed while the drain runs are sent after the ones before them,
 including by a further drain after a deferred release.
 
 | Word | Meaning |
@@ -142,9 +144,30 @@ rides the reply label's level field (bits 32-34, a
 As for `SLOT`, real-logd takes at most the bytes the message carries,
 whatever length word 3 declares. Real-logd stores it, with its level, via
 [`SlotTable::install_history_line`](../src/slot.rs); the slot is
-created lazily if no `SLOT` entry preceded it (a history line may
+created lazily if no `SLOT` entry preceded it (a history entry may
 outlive its registering sender's slot in init-logd's small
 `MAX_SENDERS` table).
+
+### `RECORD` (4)
+
+One log record from the same history ring
+([`ipc-interface.md`](ipc-interface.md) § `stream_labels::STREAM_RECORD`),
+in the ring's push order with the `LINE` chunks.
+
+| Word | Meaning |
+|---|---|
+| 0 | `RECORD` |
+| 1 | sender badge at receipt time |
+| 2 | receipt timestamp in microseconds since boot |
+| 3 | record byte length |
+| 4..  | the record's payload as it arrived (packed via `.bytes(4, ...)`, offset 32 in `data_bytes`) |
+
+A record is at most `RECORD_MAX_BYTES` (480) bytes, which the 60 data words
+after word 3 hold whole. The level rides the reply label as on `LINE`, and
+real-logd takes at most the bytes the message carries, as for `LINE`. It
+stores a record that `ipc::log_record` decodes, with its level and field
+table, via [`SlotTable::install_history_record`](../src/slot.rs), creating
+the slot as for `LINE`, and skips one that does not decode.
 
 ## Name changes during the drain
 
@@ -152,10 +175,10 @@ Init-logd sends the header, then every occupied slot, then the history
 lines. A `STREAM_REGISTER_NAME` that changes a slot's stored name after
 the header was sent may land behind the slot pass, so init-logd records
 the slot and sends it again as a further `SLOT` chunk ahead of the
-remaining history lines and before `DONE`. A name change that arrives
+remaining history entries and before `DONE`. A name change that arrives
 after `DONE` and before `HANDOVER_RELEASE` is caught at the release:
 init-logd answers `RELEASE_PENDING`, keeps serving, and real-logd pulls
-again (receiving the recorded `SLOT` chunks, any history lines pushed
+again (receiving the recorded `SLOT` chunks, any history entries pushed
 since, and `DONE`) before it repeats the release. Init-logd defers at most
 `MAX_RELEASE_DEFERRALS` (8) releases and acknowledges the next one
 whatever is pending, so a sender that keeps renaming itself cannot hold
@@ -164,7 +187,7 @@ pull-and-release rounds.
 
 ## Termination
 
-After the last `LINE` (or the last `SLOT` if no history), init-logd
+After the last `LINE` or `RECORD` (or the last `SLOT` if no history), init-logd
 replies `DONE` with no data words. `DONE` transfers no exit semantics;
 init-logd keeps serving. Real-logd, on seeing `DONE`, returns from its
 drain and issues `HANDOVER_RELEASE`, retrying a call that fails for up to
@@ -175,7 +198,7 @@ On `RELEASE_ACK` init-logd sets `HANDOVER_COMPLETE` and its next loop iteration
 calls `sys_thread_exit`; on `RELEASE_PENDING` real-logd drains again and repeats
 the release, as the previous section describes.
 
-In-flight `STREAM_BYTES` sends from other processes queue at the kernel
+In-flight `STREAM_BYTES` and `STREAM_RECORD` sends from other processes queue at the kernel
 endpoint and are drained by real-logd once it enters its main receive
 loop.
 
@@ -188,7 +211,8 @@ loop.
 | `HANDOVER_RELEASE` retries exhausted (`send_release` retries for `RELEASE_RETRY_BUDGET_US` (1 s), no attempt delivered) | init-logd unreachable on the handover SEND for every attempt | `send_release` returns without an ack and logd deletes `cap[1]` regardless; init-logd keeps serving and procmgr never reaps init, so init's memory caps stay held until shutdown (the same benign hold as the row above). |
 | `HANDOVER_RELEASE` deferred `MAX_RELEASE_DEFERRALS` (8) times | Senders kept registering or changing names through every round | Init-logd acknowledges the next release whatever is pending and exits; a name changed in that last window reaches real-logd only if its sender registers again. |
 | Reply with unknown `word(0)` kind | Wire-format drift; one side built against an out-of-sync `logd-codec` or `shared/ipc` revision | Real-logd skips the chunk and continues. A bounded iteration cap (`MAX_ITERS`) in `pull_all` guarantees termination on a malformed reply stream. |
-| `SLOT` or `LINE` length word larger than the carried payload | A malformed or hostile reply | Real-logd takes the bytes the message carries and ignores the excess; the declared length cannot overflow its bounds arithmetic. |
+| `SLOT`, `LINE`, or `RECORD` length word larger than the carried payload | A malformed or hostile reply | Real-logd takes the bytes the message carries and ignores the excess; the declared length cannot overflow its bounds arithmetic. |
+| `RECORD` payload that does not decode as a record | A malformed or hostile reply | Real-logd skips the chunk and continues. |
 
 ## Reference
 

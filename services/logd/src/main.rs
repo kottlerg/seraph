@@ -26,6 +26,8 @@ mod slot;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
+use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
 use ipc::stream_labels::{
     LEVEL_INFO, RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD,
@@ -37,7 +39,7 @@ use logd_codec::record::RENDERED_MAX_BYTES;
 use std::os::seraph::startup_info;
 use syscall::RIGHTS_EQ_POST;
 
-use crate::slot::{LINE_BUF_SIZE, MAX_NAME_LEN, SlotTable};
+use crate::slot::{Eviction, LINE_BUF_SIZE, MAX_NAME_LEN, SlotTable};
 
 /// `WaitSet` badge for logd's resync notification, signalled by the resync
 /// helper thread when its walk of procmgr's live badges ends.
@@ -503,7 +505,7 @@ fn evict_missing(snapshot: &[u64], live: &[u64], table: &mut SlotTable)
 {
     for badge in logd_codec::resync::evictable(snapshot, live)
     {
-        if let Some(slot) = table.evict(badge)
+        if let Some(slot) = table.retire(badge, Eviction::Resync)
         {
             log_reclaim(badge, Cause::Resync, &slot.name);
         }
@@ -591,15 +593,10 @@ fn drain_deaths(death_eq: u64, table: &mut SlotTable) -> bool
     {
         drained = drained.saturating_add(1);
         let badge = death.correlator;
-        if let Some(slot) = table.evict(badge)
+        let exit_reason = death.exit_reason;
+        if let Some(slot) = table.retire(badge, Eviction::Death { exit_reason })
         {
-            log_reclaim(
-                badge,
-                Cause::Death {
-                    exit_reason: death.exit_reason,
-                },
-                &slot.name,
-            );
+            log_reclaim(badge, Cause::Death { exit_reason }, &slot.name);
         }
     }
     if drained < DEATH_EQ_CAPACITY
@@ -651,11 +648,54 @@ fn dispatch_log(
         register_name(table, recv.badge, &recv, byte_len);
         reply_ack(ipc_buf);
     }
+    else if label_id == QUERY_SLOTS || label_id == QUERY_HISTORY
+    {
+        let reply = answer_query(table, &recv);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    }
     else
     {
         // Unknown / legacy label (e.g. GET_LOG_CAP from a hypothetical
         // pre-pivot caller). Reply empty so the sender unblocks.
         reply_ack(ipc_buf);
+    }
+}
+
+/// Answer a `QUERY_SLOTS` or `QUERY_HISTORY` request from the slot table
+/// and history logd owns (`services/logd/docs/ipc-interface.md` § Queries).
+/// It reads only that state and calls no other service, so a query never
+/// blocks the receive loop. `QUERY_DENIED` for a badge without
+/// `LOG_QUERY_AUTHORITY`.
+fn answer_query(table: &SlotTable, msg: &IpcMessage) -> IpcMessage
+{
+    if msg.badge & LOG_QUERY_AUTHORITY == 0
+    {
+        return refusal(QUERY_DENIED);
+    }
+    if msg.label & 0xFFFF == QUERY_SLOTS
+    {
+        match decode_slots_request(msg)
+        {
+            Ok(after) =>
+            {
+                let (page, more) = logd_codec::query::slot_page(|| table.slot_rows(), after);
+                page.reply(more)
+            }
+            Err(status) => refusal(status),
+        }
+    }
+    else
+    {
+        match HistoryRequest::decode(msg)
+        {
+            Ok(req) =>
+            {
+                let (page, more) = logd_codec::query::history_page(|| table.history_views(), &req);
+                page.reply(more)
+            }
+            Err(status) => refusal(status),
+        }
     }
 }
 
@@ -687,20 +727,20 @@ fn consume_bytes(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: 
     let mut staged = [0u8; STREAM_CHUNK_SIZE];
     staged[..n].copy_from_slice(&bytes[..n]);
     let level = level_of(msg.label);
-    let slot = table.get_or_create(badge);
+    let (slot, seq) = table.get_or_create_with_seq(badge);
     for &b in &staged[..n]
     {
         slot.begin_byte(level);
         if b == b'\n'
         {
-            flush_partial(badge, slot);
+            flush_partial(badge, slot, seq);
         }
         else if slot.partial.len() < LINE_BUF_SIZE
         {
             slot.partial.push(b);
             if slot.partial.len() == LINE_BUF_SIZE
             {
-                flush_partial(badge, slot);
+                flush_partial(badge, slot, seq);
             }
         }
     }
@@ -724,29 +764,29 @@ fn consume_record(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len:
         return RECORD_REJECTED;
     };
     let level = level_of(msg.label);
-    let slot = table.get_or_create(badge);
+    let (slot, seq) = table.get_or_create_with_seq(badge);
     let mut out = LineBuf::new();
     out.push_prefix(&slot.name, level);
     logd_codec::record::render(&record, |b| out.push(b));
     out.push(b'\r');
     out.push(b'\n');
     out.flush();
-    slot.push_record(elapsed_us(), level, &record);
+    slot.push_record(SlotTable::next_seq(seq), elapsed_us(), level, &record);
     RECORD_ACCEPTED
 }
 
 /// Snapshot the slot's in-progress line, emit it to serial, append
-/// it to the history ring, clear the partial buffer. Separated so
-/// the `&slot.name`/`&slot.partial` borrows don't alias the
-/// subsequent `&mut slot` calls.
-fn flush_partial(badge: u64, slot: &mut crate::slot::Slot)
+/// it to the history ring as the next entry of `seq`, clear the partial
+/// buffer. Separated so the `&slot.name`/`&slot.partial` borrows don't alias
+/// the subsequent `&mut slot` calls.
+fn flush_partial(badge: u64, slot: &mut crate::slot::Slot, seq: &mut u64)
 {
     let name = slot.name.clone();
     let line = std::mem::take(&mut slot.partial);
     let level = slot.partial_level;
     emit_line(badge, &name, level, &line);
     let us = elapsed_us();
-    slot.push_history(us, level, &line);
+    slot.push_history(SlotTable::next_seq(seq), us, level, &line);
 }
 
 /// Record / update the display name for `badge`. Lines emitted with

@@ -88,7 +88,6 @@ fn main()
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),
         CliCommand::TestVmgenid(args) => commands::test_vmgenid::run(&ctx, args),
         CliCommand::TestKaslr(args) => commands::test_kaslr::run(&ctx, args),
-        CliCommand::TestLogdReclaim(args) => commands::test_logd_reclaim::run(&ctx, args),
         CliCommand::TestCrashReport(args) => commands::test_crash_report::run(args),
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),

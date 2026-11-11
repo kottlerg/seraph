@@ -195,8 +195,10 @@ pub struct SvcmgrCaps
     pub vfsd_deny: u64,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the
-    /// one-shot `HANDOVER_PULL` SEND on the first launch. Holding it keeps the
-    /// log endpoint object alive across a logd crash. Zero if absent.
+    /// one-shot `HANDOVER_PULL` SEND on the first launch, and publishes the
+    /// `LOG_QUERY_AUTHORITY` SEND minted from it as `logd.query`. Holding it
+    /// keeps the log endpoint object alive across a logd crash. Zero if
+    /// absent.
     pub master_log_source: u64,
     /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
     /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it per launch,

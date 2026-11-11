@@ -14,7 +14,9 @@ real-logd's death-queue resync decisions (`is_resync_candidate`, `decode_live_pa
 and the `WalkGate` that runs one walk at a time; see
 [`docs/ipc-interface.md`](../docs/ipc-interface.md) § Death-queue resync), and the line real-logd
 logs when it evicts a slot (`ReclaimLine`, built as a log record; see the same document
-§ Death-notification cascade, where the line is a test contract). It also holds the level tag both
+§ Death-notification cascade, where the line is a test contract), and which entries a page of
+real-logd's `QUERY_SLOTS` and `QUERY_HISTORY` replies carries (`query::slot_page`,
+`query::history_page`; see the same document § Queries). It also holds the level tag both
 log receivers render after a line's `[name]` prefix (`level::tag`; see the same document § Levels),
 how both render a log record and the parser that reads its fields back from the rendered text
 (`record::render`, `record::fields`, `RENDERED_MAX_BYTES`; see the same document
@@ -24,7 +26,7 @@ fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics. It issue
 no IPC, so both ends keep the IPC calls and the logic stays host-reachable, per
 [coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
 
-`no_std`; depends on `shared/ipc` (`IpcMessage`, `log_record`) and `abi/syscall`
+`no_std`; depends on `shared/ipc` (`IpcMessage`, `log_record`, `log_query`) and `abi/syscall`
 (`MSG_DATA_WORDS_MAX`).
 
 ---
@@ -41,6 +43,8 @@ services/logd/codec/
     │                           # decoder, NameResend, release retry
     ├── history.rs              # HistoryRing: init-logd's captured history
     ├── level.rs                # The level tag a rendered line carries
+    ├── query.rs                # Query pages: which slots and history
+    │                           # entries a reply carries
     ├── reclaim.rs              # ReclaimLine: the slot-eviction log line
     ├── record.rs               # Log record rendering and the rendered-field
     │                           # parser

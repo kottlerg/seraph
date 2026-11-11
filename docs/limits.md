@@ -658,9 +658,14 @@ The entries left open are tracked by the Issue each recommendation names.
 | `log_hex` buffer | `services/init/src/bootstrap.rs` | 96 B | diagnostic output cap | 96 B stack | correct as is | None |
 | `SlotTable.slots` | `services/logd/src/slot.rs` | unbounded map | none | none | correct as is | Already pay-as-you-go |
 | `PER_SLOT_HISTORY` | `services/logd/src/slot.rs` | 16 entries | tuning (per-sender retention) | none up front | correct as is | None |
+| `RETIRED_SLOTS` | `services/logd/src/slot.rs` | 64 evicted slots, each with its name and history ring | tuning (retention for the query API: a full set drops its oldest retired slot, never a live one) | none up front; at most 64 * 16 entries of about 1.5 KiB, about 1.5 MiB, when every retired ring is full of the largest records | correct as is | None |
+| history entry `seq` | `services/logd/src/slot.rs` | `u64`, one per retained entry, logd-wide | ABI width | 8 B per entry | correct as is | None |
+| `SLOTS_PAGE` (`QUERY_SLOTS` reply) | `shared/ipc/src/log_query.rs` | 7 entries of `SLOT_ENTRY_WORDS` (9) words | ABI width (`MSG_DATA_WORDS_MAX`; a walk takes as many calls as it needs) | 512 B stack | correct as is | None |
+| `QUERY_HISTORY` reply | `shared/ipc/src/log_query.rs` | as many whole entries as fit 64 words, a 4-word header each; `HISTORY_BYTES_MAX` (480) entry bytes, const-asserted to hold the longest line and record | ABI width (`MSG_DATA_WORDS_MAX`; a walk takes as many calls as it needs) | 512 B stack | correct as is | None |
+| query reply count field | `shared/ipc/src/log_query.rs` | 16 bits of the reply label | provably unreachable (at most `SLOTS_PAGE`, or 16 history entries, per reply) | none | correct as is | None |
 | `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | 128 | tuning (a drain of a full queue's worth starts a resync from procmgr's `QUERY_LIVE_PROCESSES`, which evicts the slots a dropped post left) | about 2.1 KiB | correct as is | None |
 | eviction by the death correlator (`drain_deaths`) | `services/logd/src/main.rs` | the full `u64` badge procmgr posts; no death-observer nodes | ABI width | none | correct as is | None |
-| death exit reason | `services/logd/src/main.rs` | full `u64` (`DeathEvent.exit_reason`, logged whole in the `reclaim:` line) | ABI width | none | correct as is | None |
+| death exit reason | `services/logd/src/main.rs` | full `u64` (`DeathEvent.exit_reason`, logged whole in the `reclaim:` line and kept whole in the retired slot `QUERY_SLOTS` reports) | ABI width | none | correct as is | None |
 | handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 780 entries in its 16 KiB ring) | none | correct as is | Derive from those constants |
 | `RELEASE_RETRY_BUDGET_US` (`send_release`) | `services/logd/codec/src/handover.rs` | 1 s of wall-clock time | tuning (bounds no capacity; time-based, so load does not shorten it) | none | correct as is | None |
 | `MAX_RELEASE_DEFERRALS` | `services/logd/codec/src/handover.rs` | 8 | tuning (liveness bound against name churn) | none | correct as is | None |

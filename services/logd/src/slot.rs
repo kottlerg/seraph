@@ -4,35 +4,41 @@
 // services/logd/src/slot.rs
 
 //! Per-sender state: display name, partial-line buffer, and the bounded
-//! history ring of completed text lines and records retained for future
-//! query/disk/syslog sinks (the stored form is
-//! `services/logd/docs/ipc-interface.md` § History).
+//! history ring of completed text lines and records (the stored form is
+//! `services/logd/docs/ipc-interface.md` § History), and the retired slots
+//! eviction leaves (§ Retired slots), which logd's queries read (§ Queries).
 //!
 //! Slots are keyed by the kernel-delivered badge on every IPC message —
 //! the same `u64` procmgr uses as the child's process badge and posts as
 //! the correlator of the child's death to logd's death queue. Slot
 //! eviction is driven by the death event drained inside logd's main loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
+use ipc::log_query::{
+    ENTRY_RECORD, ENTRY_TEXT, HistoryEntryView, SLOT_EVICTED_DEATH, SLOT_EVICTED_RESYNC, SLOT_LIVE,
+};
 use ipc::log_record::{FieldSpan, Record, Span};
+use logd_codec::query::SlotRow;
 pub use logd_codec::{LINE_BUF_SIZE, MAX_NAME_LEN};
 
-/// Number of completed log entries retained per slot for future query
-/// surfaces. Bounded to keep total memory predictable at ~10k senders. The
-/// largest entry is a 480-byte record of 119 fields, each a one-byte key and
-/// an empty value (four payload bytes), whose field table adds 119 * 8
-/// bytes: about 1.5 KiB with the entry itself, so 10k * 16 * 1.5 KiB ≈
-/// 230 MiB worst case if every sender saturates with such records; in
-/// practice most slots stay near empty.
+/// Number of completed log entries retained per slot. Bounded to keep total
+/// memory predictable at ~10k senders. The largest entry is a 480-byte record
+/// of 119 fields, each a one-byte key and an empty value (four payload bytes),
+/// whose field table adds 119 * 8 bytes: about 1.5 KiB with the entry itself,
+/// so 10k * 16 * 1.5 KiB ≈ 230 MiB worst case if every sender saturates with
+/// such records; in practice most slots stay near empty.
 /// A retention tuning value that bounds no capacity: `push_entry` drops the
 /// oldest entry, never a sender.
 pub const PER_SLOT_HISTORY: usize = 16;
 
+/// Number of evicted slots logd retains, with their names and history, for
+/// its queries. A retention tuning value that bounds no capacity: retiring a
+/// slot into a full set drops the oldest retired slot, never a live one. At
+/// most 64 * [`PER_SLOT_HISTORY`] * 1.5 KiB ≈ 1.5 MiB worst case.
+pub const RETIRED_SLOTS: usize = 64;
+
 /// What a retained entry holds.
-// The spans are read by the history query surface (#720), which has no
-// caller yet.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub enum EntryKind
 {
@@ -40,6 +46,10 @@ pub enum EntryKind
     Text,
     /// A log record from `STREAM_RECORD`: the entry's bytes are its payload
     /// (`ipc::log_record`), and these spans into them its field table.
+    // The field table is the stored form a reader selecting by a key's value
+    // reads (ipc-interface.md § History); `QUERY_HISTORY` sends the payload,
+    // which its client decodes, so nothing in logd reads the spans yet.
+    #[allow(dead_code)]
     Record
     {
         /// The message text.
@@ -50,14 +60,26 @@ pub enum EntryKind
     },
 }
 
-/// One retained completed entry. Fields are written when the line flushes or
-/// the record arrives, and read by the history query surface (#720) and
-/// future disk-persistence / network-syslog sinks, none of which has a
-/// caller yet, so they are dead-code-flagged.
-#[allow(dead_code)]
+impl EntryKind
+{
+    /// The kind code a `QUERY_HISTORY` entry carries.
+    const fn wire(&self) -> u8
+    {
+        match self
+        {
+            Self::Text => ENTRY_TEXT,
+            Self::Record { .. } => ENTRY_RECORD,
+        }
+    }
+}
+
+/// One retained completed entry, written when the line flushes or the record
+/// arrives.
 #[derive(Clone)]
 pub struct HistoryEntry
 {
+    /// logd-wide arrival sequence ([`SlotTable::next_seq`]).
+    pub seq: u64,
     /// Receipt microseconds since boot
     /// (`system_info(ElapsedUs)`-derived).
     pub us: u64,
@@ -83,7 +105,7 @@ pub struct Slot
     /// that carried its first byte. Meaningful only once that byte has
     /// arrived ([`Self::begin_byte`]).
     pub partial_level: u64,
-    pub history: std::collections::VecDeque<HistoryEntry>,
+    pub history: VecDeque<HistoryEntry>,
 }
 
 impl Slot
@@ -99,10 +121,11 @@ impl Slot
         }
     }
 
-    /// Retain a completed text line.
-    pub fn push_history(&mut self, us: u64, level: u64, bytes: &[u8])
+    /// Retain a completed text line as entry `seq`.
+    pub fn push_history(&mut self, seq: u64, us: u64, level: u64, bytes: &[u8])
     {
         self.push_entry(HistoryEntry {
+            seq,
             us,
             level,
             kind: EntryKind::Text,
@@ -110,10 +133,11 @@ impl Slot
         });
     }
 
-    /// Retain a record, with its field table.
-    pub fn push_record(&mut self, us: u64, level: u64, record: &Record<'_>)
+    /// Retain a record, with its field table, as entry `seq`.
+    pub fn push_record(&mut self, seq: u64, us: u64, level: u64, record: &Record<'_>)
     {
         self.push_entry(HistoryEntry {
+            seq,
             us,
             level,
             kind: EntryKind::Record {
@@ -135,14 +159,40 @@ impl Slot
     }
 }
 
-/// Badge-keyed slot map. `Default::default()` is the empty state at
-/// boot; the ingested handover state from init-logd is merged in via
-/// [`Self::install_from_handover`].
+/// How a slot left the badge table.
+#[derive(Clone, Copy)]
+pub enum Eviction
+{
+    /// A death procmgr posted, with its exit reason.
+    Death
+    {
+        exit_reason: u64
+    },
+    /// A death-queue resync: procmgr no longer listed the badge.
+    Resync,
+}
+
+/// An evicted slot logd retains for its queries.
+struct Retired
+{
+    badge: u64,
+    cause: Eviction,
+    slot: Slot,
+}
+
+/// Badge-keyed slot map, with the retired slots eviction leaves.
+/// `Default::default()` is the empty state at boot; the ingested handover
+/// state from init-logd is merged in via [`Self::install_from_handover`].
 #[derive(Default)]
 pub struct SlotTable
 {
     /// Live slots by badge. Grows with the sender count, so it sets no ceiling.
     pub slots: HashMap<u64, Slot>,
+    /// Evicted slots, oldest first, at most [`RETIRED_SLOTS`], each badge at
+    /// most once.
+    retired: VecDeque<Retired>,
+    /// The `seq` the next retained entry takes.
+    seq: u64,
 }
 
 impl SlotTable
@@ -152,22 +202,87 @@ impl SlotTable
         self.slots.entry(badge).or_default()
     }
 
-    /// Look up `badge`, returning `None` when the sender has been
-    /// evicted (by death-EQ) or never logged. Used by future query
-    /// surfaces; kept for symmetry with `get_or_create` even though
-    /// no caller in this PR exercises it.
-    #[allow(dead_code)]
-    pub fn get(&self, badge: u64) -> Option<&Slot>
+    /// The slot for `badge`, created when absent, and the table's sequence,
+    /// for a caller that retains entries in the slot while it holds it
+    /// ([`Self::next_seq`]).
+    pub fn get_or_create_with_seq(&mut self, badge: u64) -> (&mut Slot, &mut u64)
     {
-        self.slots.get(&badge)
+        (self.slots.entry(badge).or_default(), &mut self.seq)
     }
 
-    /// Evict the slot for `badge` and return it, for the reclaim line to
-    /// name. Called with each death event's correlator, and by the resync.
-    /// Idempotent on unknown badges, which return `None`.
-    pub fn evict(&mut self, badge: u64) -> Option<Slot>
+    /// Take the next entry sequence from `seq`, the table's counter as
+    /// [`Self::get_or_create_with_seq`] lends it. A `u64` counting one per
+    /// retained entry does not wrap.
+    pub fn next_seq(seq: &mut u64) -> u64
     {
-        self.slots.remove(&badge)
+        let s = *seq;
+        *seq += 1;
+        s
+    }
+
+    /// Evict the slot for `badge` into the retired slots and return it, for
+    /// the reclaim line to name. Called with each death event's correlator,
+    /// and by the resync. Idempotent on unknown badges, which return `None`.
+    /// A retired slot of the same badge is replaced; a full set drops its
+    /// oldest.
+    pub fn retire(&mut self, badge: u64, cause: Eviction) -> Option<&Slot>
+    {
+        let mut slot = self.slots.remove(&badge)?;
+        // An unfinished line is never retained; free its buffer.
+        slot.partial = Vec::new();
+        self.retired.retain(|r| r.badge != badge);
+        if self.retired.len() == RETIRED_SLOTS
+        {
+            self.retired.pop_front();
+        }
+        self.retired.push_back(Retired { badge, cause, slot });
+        self.retired.back().map(|r| &r.slot)
+    }
+
+    /// Every live and retired slot, as `QUERY_SLOTS` reports it, in no
+    /// order.
+    pub fn slot_rows(&self) -> impl Iterator<Item = SlotRow<'_>>
+    {
+        let live = self.slots.iter().map(|(&badge, slot)| SlotRow {
+            badge,
+            state: SLOT_LIVE,
+            exit_reason: 0,
+            name: &slot.name,
+        });
+        let retired = self.retired.iter().map(|r| {
+            let (state, exit_reason) = match r.cause
+            {
+                Eviction::Death { exit_reason } => (SLOT_EVICTED_DEATH, exit_reason),
+                Eviction::Resync => (SLOT_EVICTED_RESYNC, 0),
+            };
+            SlotRow {
+                badge: r.badge,
+                state,
+                exit_reason,
+                name: &r.slot.name,
+            }
+        });
+        live.chain(retired)
+    }
+
+    /// Every history entry of every live and retired slot, as
+    /// `QUERY_HISTORY` carries it, in no order.
+    pub fn history_views(&self) -> impl Iterator<Item = HistoryEntryView<'_>>
+    {
+        self.slots
+            .iter()
+            .map(|(&badge, slot)| (badge, slot))
+            .chain(self.retired.iter().map(|r| (r.badge, &r.slot)))
+            .flat_map(|(badge, slot)| {
+                slot.history.iter().map(move |e| HistoryEntryView {
+                    seq: e.seq,
+                    us: e.us,
+                    badge,
+                    level: e.level as u8,
+                    kind: e.kind.wire(),
+                    bytes: &e.bytes,
+                })
+            })
     }
 
     /// Install one slot's (badge, name) pair from the init-logd
@@ -188,7 +303,8 @@ impl SlotTable
     /// to its badge).
     pub fn install_history_line(&mut self, badge: u64, us: u64, level: u64, bytes: &[u8])
     {
-        self.get_or_create(badge).push_history(us, level, bytes);
+        let (slot, seq) = self.get_or_create_with_seq(badge);
+        slot.push_history(Self::next_seq(seq), us, level, bytes);
     }
 
     /// Append one history record from the init-logd handover into the
@@ -196,6 +312,7 @@ impl SlotTable
     /// [`Self::install_history_line`] does.
     pub fn install_history_record(&mut self, badge: u64, us: u64, level: u64, record: &Record<'_>)
     {
-        self.get_or_create(badge).push_record(us, level, record);
+        let (slot, seq) = self.get_or_create_with_seq(badge);
+        slot.push_record(Self::next_seq(seq), us, level, record);
     }
 }

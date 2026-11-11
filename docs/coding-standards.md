@@ -35,6 +35,19 @@ The following individual lints are additionally mandatory:
 - `clippy::unwrap_used`
 - `clippy::expect_used`
 - `clippy::undocumented_unsafe_blocks`
+- From `clippy::restriction`: `as_underscore`, `assertions_on_result_states`, `dbg_macro`,
+  `default_union_representation`, `empty_enum_variants_with_brackets`, `fn_to_numeric_cast_any`,
+  `get_unwrap`, `iter_over_hash_type`, `mem_forget`, `mixed_read_write_in_expression`,
+  `pub_without_shorthand`, `renamed_function_params`, `self_named_module_files`,
+  `suspicious_xor_used_as_pow`, `todo`, `try_err`, `unimplemented`, `unnecessary_self_imports`,
+  and `unneeded_field_pattern`.
+- From `clippy::nursery`: `as_ptr_cast_mut`, `collection_is_never_read`,
+  `debug_assert_with_mut_call`, `fallible_impl_from`, `literal_string_with_formatting_args`,
+  `read_zero_byte_vec`, `significant_drop_in_scrutinee`, `trailing_empty_array`,
+  `transmute_undefined_repr`, and `uninhabited_references`.
+
+`pub_without_shorthand` keeps the `pub(crate)` form and `self_named_module_files` the
+`mod.rs` form of a module with children.
 
 `cargo xtask build` runs Clippy with all warnings treated as errors. Code that does
 not pass this configuration is non-compliant. Configuration lives in `[workspace.lints]`

@@ -13,8 +13,9 @@
 //! ([`crate::record`]), so `reclaim: badge=<b> exit_reason=0x<r> name=<n>`
 //! for a plain name, and the name, which its sender chose, is quoted and
 //! escaped when it holds a space, `=`, a control character, or invalid
-//! UTF-8: it cannot read as a further field. `cargo xtask test-logd-reclaim`
-//! reads the death drain's fields from the serial log, so the line is a
+//! UTF-8: it cannot read as a further field. A reader of the serial log finds
+//! a crashed process's name in the death drain's line for its badge
+//! (`cargo xtask symbolize --log`, `test-crash-report`), so the line is a
 //! contract, stated in `services/logd/docs/ipc-interface.md`
 //! § Death-notification cascade.
 

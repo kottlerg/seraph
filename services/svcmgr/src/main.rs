@@ -202,8 +202,25 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
         ),
     ]
     {
-        publish_devmgr_registry_send(registry, caps.devmgr_registry, name, badge);
+        publish_minted_send(
+            registry,
+            caps.devmgr_registry,
+            "devmgr-registry",
+            name,
+            badge,
+        );
     }
+
+    // logd.query — a `LOG_QUERY_AUTHORITY`-badged SEND minted from the
+    // reserved master-log source: logd's query labels. Seed-only, like the
+    // devmgr names above.
+    publish_minted_send(
+        registry,
+        caps.master_log_source,
+        "master-log",
+        ipc::published_names::LOGD_QUERY,
+        ipc::log_labels::LOG_QUERY_AUTHORITY,
+    );
 }
 
 /// Publish the endowed, pre-derived SEND `cap` seed-only as `name`, as-is:
@@ -226,11 +243,12 @@ fn publish_endowed_send(registry: &mut registry::Registry, cap: u64, name: &[u8]
 }
 
 /// Publish `name` seed-only as a `badge`-badged SEND minted from the
-/// endowed devmgr-registry `source`; logs and skips when the source is
-/// absent or the derive or publish fails.
-fn publish_devmgr_registry_send(
+/// endowed `source` (named `source_name` in the log); logs and skips when the
+/// source is absent or the derive or publish fails.
+fn publish_minted_send(
     registry: &mut registry::Registry,
     source: u64,
+    source_name: &str,
     name: &[u8],
     badge: u64,
 )
@@ -238,7 +256,7 @@ fn publish_devmgr_registry_send(
     let shown = core::str::from_utf8(name).unwrap_or("?");
     if source == 0
     {
-        std::os::seraph::log!("no devmgr-registry source cap; {shown} not published");
+        std::os::seraph::log!("no {source_name} source cap; {shown} not published");
         return;
     }
     match syscall::cap_derive_badge(source, syscall::RIGHTS_EP_SEND, badge)

@@ -881,6 +881,8 @@ pre-merge review's.
 | `src-header` | error | Every tracked `.rs`, `.ld`, `.S`, `.sh`, `.yml`: the SPDX line first (after a shebang in `.sh`; on line 2, after `/*`, in a block-comment `.ld`); exactly one blank line, then the path line; for Rust, exactly one blank line, then the `//!` block before any `#![` attribute, per [docs/coding-standards.md](../docs/coding-standards.md) § File Headers. |
 | `md-summarized-by` | error | Every authoritative document ends with `---` and a `## Summarized By` section holding `None` or a non-empty list of links, each resolving to a path inside the repository (no external URL, in-page-only anchor, or `..` past the root), per [docs/documentation-standards.md](../docs/documentation-standards.md) § Backlinks and Change Propagation. |
 | `md-backlink-forward` | error | Every `## Summarized By` entry names a tracked document that links this one. |
+| `md-summarized-by-order` | error | The `## Summarized By` entries are sorted by the path they link, byte by byte, and none is listed twice. |
+| `md-summarized-by-label` | error | Each `## Summarized By` entry for a `README.md` is labelled with its repository path, and each other entry with the linked document's `# Title`. |
 | `md-reachable` | error | Every authoritative document is reachable by links from the root `README.md`; the root README links every `docs/*.md` and every other README links each document in its own `docs/`, per [docs/documentation-standards.md](../docs/documentation-standards.md) § Discoverability and Linking. |
 | `md-coverage-symbols` | error | Every name the surface list of [docs/testing.md](../docs/testing.md) § Coverage tiers states resolves: from the paragraph starting `**Boundary surface.**` up to the one starting `**Repeat count.**`, each code span naming an item, field path, or `_*` family, and each alternative of the `S`, `M`, and `D` screen variables (groups expanded, character classes kept), matches as a whole word in the code of a tracked Rust source outside `xtask/` with `//` comments stripped, or, from the paragraph starting `**Device surfaces.**` on, in that of one inside `xtask/` other than the rule's own `lint_docs.rs`; each listed `.rs` path (`*` within one component; a bare file name in any directory) names a tracked file; and each listed directory, written with a trailing `/` (`*` within one component), has a tracked file beneath it. |
 | `md-bare-cite` | warning | A `(see <name>.md)` citation outside link syntax. |
@@ -964,10 +966,10 @@ fails the gate.
 | `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
-| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and a reviewer verdict of `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY`. The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
+| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and the reviewer verdict `READY TO MERGE` (or, in a record of the earlier form, `NON-BLOCKING ISSUES ONLY`). The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
 | `gate-added-files` | error | The files the PR adds can be read from the clone, which the next rule needs. |
 | `gate-release-approval` | warning | The PR adds no `docs/releases/v<X>.<Y>.<Z>.md`. One that does is the release PR of § Release Production, whose merge needs the maintainer's approval (§ Pre-merge review); the command cannot read an approval, so it names the PR for its reader. |
-| `gate-findings-recorded` | warning | That record leaves no finding on the surface that needs a reader: one an Issue must record (a class other than `style`, or a MUST violation; § Recording findings), or one of any class whose `status` is `contested`. After a `NON-BLOCKING ISSUES ONLY` run the reader confirms each counted finding is recorded and none is contested; the command cannot. |
+| `gate-findings-recorded` | warning | A record of the earlier form with the verdict `NON-BLOCKING ISSUES ONLY` leaves no finding on the surface that needs a reader: one an Issue had to record (a class other than `style`, or a MUST violation), or one of any class whose `status` is `contested`. When the last record is an `audit` record that completes a run of the reviewer alone, that run's verdict and findings count too. The reader confirms each counted finding is recorded and none is contested; the command cannot. |
 
 The command does not judge what needs a reader: whether the body's claims match the diff, whether
 an acceptance item is delivered, and which local host runs the change owes. Those stay with the
@@ -989,19 +991,27 @@ one JSON object:
 
 | Key | Value |
 |---|---|
-| `verdict` | The reviewer verdict: `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, or `BLOCKING ISSUES`. In an `audit` record, the reviewer verdict the audit states. |
+| `verdict` | The reviewer verdict: `READY TO MERGE` or `BLOCKING ISSUES`. In an `audit` record, the reviewer verdict the audit states; in one that completes a run of the reviewer alone, that run's. |
 | `audit_verdict` | `AUDIT PASS` or `AUDIT FAIL`; in a `full` or `delta` record of the reviewer alone, run while the PR body reports a run as pending, `NOT RUN`. |
 | `audit` | `verdict` (as `audit_verdict`) and `sections`, a list of objects with `name`, `verdict`, and `items`; `null` in a record of the reviewer alone. |
-| `findings` | The findings on the review surface. In an `audit` record, those of the last run with the reviewer that the delta leaves unfixed. |
-| `recorded` | The findings off the surface. |
+| `findings` | The defects on the review surface. In an `audit` record, those of the last run with the reviewer that the delta leaves unfixed; in one that completes a run of the reviewer alone, that run's. |
+| `recorded` | The defects off the surface. |
 | `ledgered` | The findings the reviewer listed as held by the ledger. |
 | `dropped` | Findings dropped as false. |
-| `stats` | `mode` (as in the file name), `head` (the full hash), `since` (the head the previous run with the reviewer reviewed, or null), `failed` (the agents that returned no result), and `run` (the run's number in the PR's sequence of runs, of either kind, counting from 1). |
+| `stats` | `form` (`defects`), `mode` (as in the file name), `head` (the full hash), `since` (the head the previous run with the reviewer reviewed, or null), `failed` (the agents that returned no result), and `run` (the run's number in the PR's sequence of runs, of either kind, counting from 1). |
 
-Each finding is an object with `file`, `line`, `class` (`correctness`, `safety`, `contract`,
-`standards`, `doc-drift`, `coverage`, or `style`), `bucket` (`critical`, `should`, or `nit`),
-`must_violation` (a boolean), `status` (`unverified`, `nit`, or `contested`), `issue`, `claim`,
-and `fix`. The command reports each departure as `error record-shape` or, for a file name that
+Each finding is an object with `file`, `line`, `status` (`unverified` or `contested`), `issue`,
+`claim`, and `fix` ([docs/conventions.md](../docs/conventions.md) § Findings).
+
+A record without `stats.form` is of the earlier form, which records written before the defect
+form use, and is checked as it was written: its reviewer verdict may also be
+`NON-BLOCKING ISSUES ONLY`, and each finding also carries `class` (`correctness`, `safety`,
+`contract`, `standards`, `doc-drift`, `coverage`, or `style`), `bucket` (`critical`, `should`, or
+`nit`), and `must_violation` (a boolean), with the `status` `nit` allowed. Such a record still
+meets the gate as it did. A defect-form finding that carries `class`, `bucket`, or
+`must_violation` is a shape error.
+
+The command reports each departure as `error record-shape` or, for a file name that
 does not state its record's mode and head, `error record-name`. A record with `audit_verdict`
 `NOT RUN` and a non-null `audit`, a null `audit` with any other `audit_verdict`, or an `audit`
 record with `NOT RUN` is `error record-audit-shape`; a record without an `audit` key is
@@ -1009,18 +1019,28 @@ record with `NOT RUN` is `error record-audit-shape`; a record without an `audit`
 
 ### `cargo xtask review-ledger`
 
-Build the ledger of a pull request's review: the findings a later run of the same PR must not
-re-raise ([docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow).
+Build the ledger of a review: the findings a later run must not re-raise
+([docs/conventions.md](../docs/conventions.md) § Ledger).
 
 ```
 cargo xtask review-ledger <N>
+cargo xtask review-ledger --release <X.Y.Z> --from <previous tag> [--file <path>]...
 ```
 
-It reads every run record of `target/xtask/review/pr<N>/` and writes `ledger.json` beside them:
-a sorted list without duplicates of each record's `recorded` and `dropped` findings, its
-`contested` findings, and, when its verdict is `NON-BLOCKING ISSUES ONLY`, all its `findings`.
-Each entry carries the finding's fields and `run`, the first eight digits of the head of the run
-that reported it.
+With a pull request's number it reads every run record of `target/xtask/review/pr<N>/` and
+writes `ledger.json` beside them: a sorted list without duplicates of each record's `recorded`
+and `dropped` findings, its `contested` findings, and, in an earlier-form record whose verdict
+is `NON-BLOCKING ISSUES ONLY`, all its `findings`. Each entry carries the finding's fields and
+`run`, the first eight digits of the head of the run that reported it.
+
+With `--release` it prints the release review's ledger as JSON on stdout: the entries of every
+pull request a first-parent merge `Merge pull request #N` of `<previous tag>..HEAD` names, and
+those of the release's own records in `target/xtask/review/release-v<X.Y.Z>/`, sorted and
+without duplicates, limited to the files `--file` names when it is given. A release record's
+finding the workflow marked `contested`, because its refuters split, enters only once the
+maintainer's decision is saved on it as `ruling`. Only run records are read
+(`<mode>-<head>[-<n>].json`); a pull request without records adds nothing. The count goes to
+stderr, so stdout holds the JSON alone.
 
 ### `cargo xtask issue-edit`
 

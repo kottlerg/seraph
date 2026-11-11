@@ -93,9 +93,8 @@ read it to find the document a task needs.
 
 ## Completeness
 
-- A finding on the review surface ([docs/conventions.md](../docs/conventions.md) § Review
-  surface) is part of the task. Fix a blocking one in the same pass. Fix a non-blocking one in
-  the same batch when the reviewer verdict is `BLOCKING ISSUES`; otherwise record it.
+- A review reports defects only ([docs/conventions.md](../docs/conventions.md) § Findings). A
+  defect on the review surface (§ Review surface) is part of the task: fix it in the same pass.
 - A finding off the surface is recorded in the same pass, never dropped, as
   [docs/conventions.md](../docs/conventions.md) § Recording findings says.
 - Do not call work "out of scope" or a "follow-up" to avoid blocking work on the surface that is

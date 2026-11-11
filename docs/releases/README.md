@@ -31,7 +31,7 @@ tag's release notes.
   `gh release create --notes-file`.
 - New release notes MUST be authored from `TEMPLATE.md`, every section
   filled. Non-template structure introduces inconsistency across releases.
-  The release review's `RELEASE READY` run returns the draft, built from
+  The release review's `full` run returns the draft, built from
   `TEMPLATE.md` ([conventions.md](../conventions.md#release-production)
   § Release Production).
 - The notes file MUST be committed before the tag is pushed; the tag MUST

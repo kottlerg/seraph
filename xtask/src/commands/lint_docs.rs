@@ -9,7 +9,7 @@
 //! Each rule prints `error <rule>: <path>:<line>: <message>` (or `warning`)
 //! per violation; any error-level diagnostic fails the command. The rules
 //! check only what a script can decide: column widths, header layout, the
-//! `## Summarized By` section's shape and forward links, document
+//! `## Summarized By` section's shape, forward links, order, and labels, document
 //! reachability, and that every name docs/testing.md § Coverage tiers lists
 //! for its surface screens still names code, a file, or a directory in the
 //! tree. Whether a passage is a summary, or any other statement matches the

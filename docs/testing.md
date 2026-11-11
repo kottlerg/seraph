@@ -1045,7 +1045,9 @@ cargo xtask test-gdb --arch <arch>
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
-4), these MUST be run on the commit to be tagged: the whole boundary set
+4), these MUST be run on the commit to be tagged, or on an earlier commit that contains the
+version bump when the change from it to the commit to be tagged is documentation or comments
+only as this section defines that: the whole boundary set
 (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) once each (`--runs 1`)
 in the debug profile and once each in the release profile
 (`cargo xtask build --release`, then the same `run-parallel` command, per

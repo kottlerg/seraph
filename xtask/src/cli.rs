@@ -134,8 +134,9 @@ pub enum CliCommand
     TestGdb(TestGdbArgs),
 
     /// Check the mechanical documentation and source-header rules: Markdown
-    /// column limit, file-header layout, `## Summarized By` shape and forward
-    /// links, and document reachability from the root README. Runs in CI's
+    /// column limit, file-header layout, `## Summarized By` shape, forward
+    /// links, order, and labels, and document reachability from the root
+    /// README. Runs in CI's
     /// host-tests job; see xtask/README.md for the rule list and levels.
     LintDocs(LintDocsArgs),
 

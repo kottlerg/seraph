@@ -227,35 +227,27 @@ are forbidden; `master` MUST NOT receive force pushes.
 
 Merge is gated by the pre-merge review: the `pr-reviewer` and `pr-auditor` agents
 (`.claude/agents/`), invoked directly and in parallel, run the adversarial code review and the
-closure audit, and their prose verdict lines are the gate. Findings are handled as one batch per
-run, as the subsections below define. `.claude/skills/pr-review/SKILL.md` gives the
-assistant's procedure.
+closure audit, and their prose verdict lines are the gate. The reviewer reports defects only
+(§ Findings), in a bounded number of rounds (§ Rounds); the audit checks the PR's claims against
+the diff. `.claude/skills/pr-review/SKILL.md` gives the assistant's procedure.
 
 A run MAY be made with the reviewer alone while the PR body's `## Validation` section reports
 a build, a boot, or an owed local host run as pending, since an audit of that head would fail
 on that report alone. Its record is a `full` or `delta` record that states the audit as not
 run (`audit_verdict` `NOT RUN`, `audit` `null`). The audit that run leaves owed is made once
 the runs are reported: with the next run when a fix round has moved the head, and otherwise
-alone at the same head, as an `audit` record there that completes the run.
+alone at the same head, as an `audit` record there that completes the run and carries its
+verdict and findings.
 
 The reviewer verdict is:
 
-- `BLOCKING ISSUES` when a blocking finding is on the review surface or a reviewer returned no
-  result;
-- `NON-BLOCKING ISSUES ONLY` when only non-blocking findings are on it;
-- `READY TO MERGE` when none is.
+- `BLOCKING ISSUES` when a defect is on the review surface or a reviewer returned no result;
+- `READY TO MERGE` otherwise.
 
 A PR meets the merge condition when its CI is green, its head contains `master`, and the last
 run at its head is a completed run (one with the reviewer and the auditor, a run of the
 reviewer alone that its audit has completed, or the auditor-only run of § Auditor-only run)
-with no failed agent and `AUDIT PASS`, whose reviewer verdict is one of:
-
-- `READY TO MERGE`;
-- `NON-BLOCKING ISSUES ONLY`, once every finding the run leaves on the surface is recorded
-  (§ Recording findings) and no contested finding on the surface is unresolved. The findings
-  of such a run MAY take one fix round before the merge. A PR takes at most one such round:
-  what the run after it leaves on the surface is recorded, and no further round is taken for
-  it.
+with no failed agent, `AUDIT PASS`, and the reviewer verdict `READY TO MERGE`.
 
 A PR MUST NOT merge before it meets the merge condition. `cargo xtask pr-check <N> --gate`
 checks the part of the condition a script can decide and names the rest for its reader, the
@@ -270,7 +262,7 @@ maintainer's approval of that step, and the release PR does not meet the merge c
 its merge is approved. Who carries an approved step out is not fixed: the orchestrator of the
 batch or a session does, or the maintainer.
 
-Every finding a run counts is fixed or recorded as the subsections below say. A finding MUST NOT
+Every defect a run reports is fixed or recorded as the subsections below say. A finding MUST NOT
 be waived or ruled outside the standards.
 
 ### Contested findings
@@ -311,13 +303,11 @@ that run, it owes a contract-drift check: every comment or document statement th
 change in the delta alters is compared against the code it describes, and one the code
 contradicts is a FAIL. It reads that
 last run's record, confirms that the delta delivers each fix the round claims, and fails a
-finding that run left on the surface that is neither fixed by the delta nor recorded
-(§ Recording findings).
+defect that run left on the surface that the delta does not fix.
 
 The audit states the reviewer verdict: that of the last run with the reviewer, read with the
-delta's fixes. It is `READY TO MERGE` when the delta fixes every finding that run left on the
-surface, `NON-BLOCKING ISSUES ONLY` when every finding it leaves there is non-blocking and
-recorded, and `BLOCKING ISSUES` otherwise.
+delta's fixes. It is `READY TO MERGE` when the delta fixes every defect that run left on the
+surface, and `BLOCKING ISSUES` otherwise.
 
 Any later delta that changes anything but documentation or comments, or that holds a sync
 owing a run with the reviewer, takes a run with the reviewer.
@@ -340,6 +330,25 @@ The local host runs of [testing.md](testing.md#coverage-tiers) § Coverage tiers
 rule (When the runs are owed): a sync that leaves the PR's own changes to a run's surface as
 they were owes no such run again.
 
+### Findings
+
+A review reports one class of finding, a defect:
+
+- behaviour that is wrong or unsafe: a logic error, unsoundness, a memory or concurrency defect,
+  a resource leak, or a structure whose width does not follow the CPU count as
+  [coding-standards.md](coding-standards.md) § CPU-Count Width requires;
+- a broken contract between components: a caller, an ABI, an IPC protocol, a command line, or
+  a documented promise that the code no longer keeps;
+- a document statement that would make its reader write wrong code: a statement of behaviour,
+  of a contract, or of a rule that the code or the owning document contradicts.
+
+A review reports nothing else. Wording, wrapping, naming, the form of a commit message, the form
+of a `## Summarized By` list, a document that could read better, and a test the surrounding
+pattern would add are not defects: what a script can decide of them, `cargo xtask` checks in CI
+(`lint-docs`, `commit-check`, `pr-check`), and what it cannot is not enforced by review. A
+defect on the review surface blocks the merge and is fixed in the PR. A defect off the surface
+is recorded (§ Recording findings), not fixed.
+
 ### Review surface
 
 The review surface of a change is what it touches:
@@ -349,50 +358,35 @@ The review surface of a change is what it touches:
   description);
 - everything the change introduces;
 - the callers and reverse dependencies of what it changes;
-- a correctness, soundness, safety, or contract defect anywhere in a touched file, unless an
-  open Issue already names it.
-
-In a re-review of a PR (a delta run), a standards, documentation-drift, coverage, or style
-finding is on the surface only when the delta or the PR's own earlier commits introduced it,
-wherever it anchors: a statement the delta made stale, a test the delta's new code lacks, or a
-finding in a hunk an earlier commit of the PR introduced is one the PR introduced. Correctness,
-soundness, safety, and contract findings stay on the surface as above.
+- a defect anywhere in a touched file, unless an open Issue already names it.
 
 Work an open Issue already names, filed with the maintainer's approval, is off the surface of
-every other PR; a finding on it is recorded against that Issue. A follow-up Issue
-(§ Follow-up Issues) names findings, not work: it takes nothing off any PR's surface, so a
-finding it holds is, unless the ledger lists it (§ Ledger), reported, counted, and fixed or
-recorded wherever this definition puts it.
+every other PR; a defect in it is recorded against that Issue. A follow-up Issue
+(§ Follow-up Issues) names defects, not work: it takes nothing off any PR's surface, so a
+defect it holds is, unless the ledger lists it (§ Ledger), reported and fixed or recorded
+wherever this definition puts it.
 
-### Tracks
+### Rounds
 
-A finding on the surface is on one of two tracks.
+A PR's review runs in bounded rounds. The first run with the reviewer is a `full` run over the
+whole PR. Every later run with the reviewer is a `delta` run since the head the last run with
+the reviewer reviewed, and judges only:
 
-- **Blocking:** a finding of class correctness, safety (which covers soundness), or contract,
-  wherever it anchors; or a MUST violation of a binding standard, of whatever class, anchored in
-  a file that is not a Markdown document. A blocking finding on the surface MUST be fixed before
-  merge.
-- **Non-blocking:** every other finding on the surface, that is, one of class standards,
-  documentation-drift, coverage, or style that is not a MUST violation or is one anchored in a
-  Markdown document (wording, wrapping, nits). When the reviewer verdict is `BLOCKING ISSUES` it
-  is fixed in the same batch; after a `NON-BLOCKING ISSUES ONLY` run it MUST be recorded
-  (§ Recording findings) before the merge.
+- whether each defect an earlier run left on the surface is fixed at the head;
+- the delta's own change: its hunks and the callers and reverse dependencies of what it
+  changes. The incoming diff of a sync is not the PR's change.
 
-A document statement the code contradicts is a contract or safety defect when it states
-behaviour a caller or user relies on (a syscall, ABI, IPC, or command-line contract, or a safety
-invariant). Every other disagreement between a document and the code (a stale name, count, path,
-or cross-reference, or a summary out of step with its owner) is documentation drift.
-
-A finding off the surface MUST be recorded, not fixed: the pre-merge review reports it as out of
-bound, and it is recorded (§ Recording findings) before the merge. No finding is dropped
-for being off the surface.
+A delta run raises no new finding on code an earlier round passed: a defect outside the delta's
+own change that an earlier run did not report is not reported, whatever its anchor. It is
+recorded (§ Recording findings) when the reviewer meets it.
 
 ### Follow-up Issues
 
 The follow-up Issue of a scope is the one open Issue whose title is
 `<scope>: defects found by review`, where `<scope>` is a commit-title scope (§ Commit Messages),
-the narrowest that covers the file. Every PR's findings in that scope append to it, and so it is
-also called the rolling Issue. It is filed only when the scope has none open, with the current
+the narrowest that covers the file. It holds defects only (§ Findings), each found off the
+surface of the PR whose review found it, and every PR's such defects in that scope append to it,
+so it is also called the rolling Issue. It is filed only when the scope has none open, with the current
 milestone (§ Milestones) and the labels § Labels requires. Filing it needs no approval of its
 own: the maintainer's standing approval covers the rolling Issue of a scope that has none.
 
@@ -415,14 +409,12 @@ items:
   closed at step 8 of § Release Production when every item is ticked, and otherwise moves to
   the next milestone with its open items.
 
-A drain PR MUST NOT file a successor: a finding its run leaves in the same scope is appended to
-the Issue it drains, which stays open. When a follow-up Issue accumulates items of one pattern a
-script can decide (a wrapping or layout rule), the preferred drain is a `cargo xtask lint-docs`
-rule for the pattern, whose landing ticks those items.
+A drain PR MUST NOT file a successor: a defect its run leaves in the same scope is appended to
+the Issue it drains, which stays open.
 
 ### Recording findings
 
-A finding is recorded as a `- [ ]` task-list item under the Issue's `## Acceptance` section,
+A defect is recorded as a `- [ ]` task-list item under the Issue's `## Acceptance` section,
 carrying file, line, authority, fix, and the PR and head that reported it. The Issue that
 records a finding is the first of these that applies:
 
@@ -433,11 +425,8 @@ records a finding is the first of these that applies:
    in that scope).
 4. The rolling Issue of its scope.
 
-A finding of class style that is not a MUST violation, reported by a PR's pre-merge review,
-goes on no Issue. The run record that reports it is its record, and the ledger keeps a later
-run from raising it again (§ Ledger); where § Branch and PR Workflow requires a finding of a
-PR's review to be recorded, the run record meets that for such a finding. The release review
-records every finding it leaves, as step 2 of § Release Production says.
+The release review records each defect the maintainer decides to ship as a known issue, as
+step 2 of § Release Production says.
 
 ### Ledger
 
@@ -447,6 +436,18 @@ changed since the run that reported it, or that run no longer resolves in the cl
 reviewer reads a ledger built from the saved run records, each entry naming its run; a finding
 the ledger holds whose hunk is unchanged since the run its entry names, when that run resolves,
 is listed, not counted.
+
+### Composition check
+
+Each PR passed its own review just before it merged, so the merge is not reviewed again. After
+each merge, one `pr-reviewer` run checks its composition with the other merges since the
+previous release tag: the files the merge's own change (`git diff <merge>^1 <merge>`) shares
+with the change of another first-parent merge since that tag, and in them only whether one
+change breaks an assumption, an invariant, a lock or ordering rule, or a documented contract
+that another relies on. It reports no other defect, and none on code only one PR touched. A
+defect it finds goes to the worker of the merged PR while it still holds the context, and is
+fixed in a new PR; a defect in work an open Issue names is recorded there. The run's report
+is saved as `target/xtask/review/pr<N>/composition-<merge>.md`.
 
 ### Branch naming
 
@@ -515,43 +516,52 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 
 1. Once every Issue of the milestone `v<X>.<Y>.<Z>` is closed or is a
    follow-up Issue of § Branch and PR Workflow (any other open Issue is
-   moved to a later milestone first, as the maintainer decides), run the release review on
-   `master` before the version bump: the `release-review` workflow
-   (`.claude/workflows/release-review.js`) in `full` mode, from the previous
-   release tag. It reviews the composition of the PRs merged since that tag,
-   which no PR's own review saw: each file two or more of them touched line
-   by line, and the whole range through lenses (agreement across `abi/`, the
-   kernel, and the runtime; the whole text of every design document the
-   range touched; `## Summarized By` integrity; new `unsafe` code and its
-   safety contracts; test coverage of new syscalls and protocol messages;
+   moved to a later milestone first, as the maintainer decides), run the
+   release review once on `master` before the version bump: the
+   `release-review` workflow (`.claude/workflows/release-review.js`) in
+   `full` mode, from the previous release tag. Its `scope` mode states the
+   run's agent count first, and a run that reaches the ceiling it is given
+   stops and asks the maintainer before it goes on. It reviews the
+   composition of the PRs merged since that tag and reports defects only
+   (§ Findings): each code file two or more of them touched line by line,
+   one lens over the documents and instruction files the range touched,
+   and lenses over the whole range (agreement across `abi/`, the kernel, and
+   the runtime; new `unsafe` code and its safety contracts;
    [limits.md](limits.md) and [platform-requirements.md](platform-requirements.md)
    against the code). Its ledger is the saved run records of those PRs and
-   of the release's earlier runs, under the ledger rule of § Branch and PR
-   Workflow. Its release audit checks the milestone state, the version, the
-   release notes, the known issues, and the release host runs. Two
-   independent refuters judge every finding that can block and every
-   Critical or Should finding; a finding both refute on evidence is
-   dropped. The workflow computes the verdict: `RELEASE BLOCKED` when a
-   reviewer returned no result, when the audit fails, or when a finding on
-   the blocking track of § Branch and PR Workflow survives and no open Issue
-   names its work; `RELEASE READY` otherwise.
-2. A blocking finding takes a fix PR through the normal PR workflow, and an
-   audit failure its fix; the review then runs again in `delta` mode, since
-   the head it last reviewed, and judges again each blocking finding that
-   run left standing, apart from a contested one, which the maintainer's
-   ruling settles. A blocking-track finding an open Issue names is a
-   known issue of the release. Every other finding is recorded as § Branch
-   and PR Workflow records a finding off the surface: on the open Issue that
-   names the work, else on the follow-up Issue of its scope, which step 8
-   moves to the next milestone. A finding contested on the facts or on its
-   rule is put to the maintainer.
-3. On `RELEASE READY` the run returns the draft of
-   `docs/releases/v<X>.<Y>.<Z>.md`, built from `docs/releases/TEMPLATE.md`.
-   One release PR bumps `[workspace.package] version` in the root
-   `Cargo.toml` to `<X>.<Y>.<Z>` and adds the notes file from the draft, every
-   section filled, through the normal PR workflow, and merges once the
-   maintainer approves its merge (§ Pre-merge review). The tag MUST point at a
-   commit that contains both.
+   of the release's own runs, under the ledger rule of § Branch and PR
+   Workflow, read with `cargo xtask review-ledger --release`. A defect an
+   open Issue names (an Issue's body, an item of a rolling Issue, or a
+   finding listed in an Issue comment) is not a blocker; it is a known
+   issue of the release. Every other defect is put to two independent
+   refuters, and one both refute on evidence is dropped. A defect present
+   at the previous release tag predates the range: it is reported apart,
+   and is a known issue unless the maintainer decides otherwise. The
+   workflow computes the verdict: `RELEASE BLOCKED` when a reviewer
+   returned no result, when the run reached its ceiling, when the audit
+   fails, or when a confirmed defect stands that no open Issue names and
+   that does not predate the range; `RELEASE READY` otherwise. Its release
+   audit checks the milestone state, the version, the release notes, the
+   known issues, and the release host runs.
+2. The run's confirmed defects go to the maintainer as one list, each with
+   a recommendation: fix before the tag, or ship as a known issue. A
+   defect the maintainer decides to ship gets an open Issue that names it.
+   The defects the maintainer decides to fix go into one fix PR through
+   the normal PR workflow, and each audit failure into its fix. The fix
+   PR's review checks only that each listed defect is fixed and that its
+   fix has a test ([coding-standards.md](coding-standards.md) § D. Testing
+   Invariants); it raises no new finding on the surrounding code. The
+   release review is not run again over the fix. A refuted, contested, or
+   unverified finding goes to the maintainer with the list, and is
+   recorded only as they decide.
+3. The run returns the draft of `docs/releases/v<X>.<Y>.<Z>.md`, built from
+   `docs/releases/TEMPLATE.md`, its Known Issues from the known issues of
+   step 1. One release PR bumps `[workspace.package] version` in the root
+   `Cargo.toml` to `<X>.<Y>.<Z>` and adds the notes file from the draft,
+   every section filled and the Known Issues as the maintainer decided
+   them, through the normal PR workflow, and merges once the maintainer
+   approves its merge (§ Pre-merge review). The tag MUST point at a commit
+   that contains both.
 4. Run the release host runs ([testing.md](testing.md#coverage-tiers)
    § Coverage tiers) on the commit to be tagged, a `master` commit that
    contains the bump and the notes file: the whole
@@ -562,15 +572,20 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    (`--iommu absent`, svctest, on both architectures), the framebuffer
    cell (`--display framebuffer`, svctest, on both architectures), and the
    debug-port cell (`test-debug-port` and `test-gdb`, on both architectures)
-   once each.
+   once each. A run at an earlier `master` commit that contains the bump
+   stands for the commit to be tagged when the change between the two is
+   documentation or comments only, as [testing.md](testing.md#coverage-tiers)
+   § Coverage tiers defines it.
    Their report, each run's command, `--runs` count, outcome, and head, is
    written to `target/xtask/review/release-v<X>.<Y>.<Z>/host-runs.md`, the
    file the release audit reads; the release PR's body states its own local
    host runs as § PR-body checklist discipline requires.
-5. Run the release review in `delta` mode at that commit, since the head it
-   last reviewed, with that report. `RELEASE READY` there is the tag
-   condition: once the maintainer approves the tag, tag that commit and
-   push the tag: `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.
+5. Run the release review in `audit` mode at that commit, with that report:
+   the release audit alone. The tag condition is that the release host runs
+   and the commit's CI pass, that the release audit passes, and that the
+   maintainer has decided the list of step 2. Once the maintainer approves
+   the tag, tag that commit and push the tag:
+   `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.
 6. The tag push triggers `release.yml` and `burnin.yml`. The `preflight` job in
    `release.yml` aborts the run before any image is built if the workspace
    version does not match the tag or the notes file is missing or does not
@@ -579,11 +594,13 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    has completed successfully and the maintainer approves the publishing. No
    workflow publishes it.
 8. On the maintainer's approval of this step's milestone work: `v<X>.<Y>.<Z+1>` is created
-   when no `v<X>.<Y>.*` milestone above `v<X>.<Y>.<Z>` is open, and each rolling follow-up
-   Issue of § Branch and PR Workflow whose items are all ticked is closed. Every Issue in
-   `v<X>.<Y>.<Z>` or a lower open milestone moves to `v<X>.<Y>.<Z>` when it is closed and no
-   commit outside the tag closed it, and otherwise to the lowest-versioned open milestone above
-   `v<X>.<Y>.<Z>`. `v<X>.<Y>.<Z>` and every lower open milestone are then closed; the
+   when no `v<X>.<Y>.*` milestone above `v<X>.<Y>.<Z>` is open. A rolling follow-up Issue of
+   § Branch and PR Workflow whose items were all ticked by PRs the tag contains is closed and
+   stays in `v<X>.<Y>.<Z>`; one with an item open, or ticked by a PR merged after the tag, moves
+   to the lowest-versioned open milestone above `v<X>.<Y>.<Z>`, so that a fix the tag lacks is
+   recorded against the release that ships it. Every other Issue in `v<X>.<Y>.<Z>` or a lower
+   open milestone moves to `v<X>.<Y>.<Z>` when it is closed and no commit outside the tag closed
+   it, and otherwise to the lowest-versioned open milestone above `v<X>.<Y>.<Z>`. `v<X>.<Y>.<Z>` and every lower open milestone are then closed; the
    lowest-versioned open milestone is current (§ Milestones).
 
 ---

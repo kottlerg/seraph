@@ -55,6 +55,7 @@ pub mod procmgr;
 pub mod pwrmgr;
 pub mod random;
 pub mod recv_guard;
+pub mod recv_pool;
 pub mod shmem;
 pub mod startup;
 pub mod svcmgr;
@@ -77,6 +78,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(exit_code::phases());
     out.extend_from_slice(random::phases());
     out.extend_from_slice(recv_guard::phases());
+    out.extend_from_slice(recv_pool::phases());
     out.extend_from_slice(devmgr::phases());
     out.extend_from_slice(pager::phases());
     out.extend_from_slice(shmem::phases());

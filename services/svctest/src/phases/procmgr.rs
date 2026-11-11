@@ -148,7 +148,7 @@ pub fn logd_death_forward_phase(caps: &Caps)
 }
 
 /// One logd query call on `cap`; a failed call panics.
-fn logd_query_call(cap: u64, msg: &ipc::IpcMessage) -> ipc::IpcMessage
+pub(crate) fn logd_query_call(cap: u64, msg: &ipc::IpcMessage) -> ipc::IpcMessage
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
@@ -245,7 +245,7 @@ fn logd_await_retired(query: u64) -> u64
 
 /// The history of `badge`, newest first, as (kind, bytes), read across every
 /// `QUERY_HISTORY` page.
-fn logd_history(query: u64, badge: u64) -> Vec<(u8, Vec<u8>)>
+pub(crate) fn logd_history(query: u64, badge: u64) -> Vec<(u8, Vec<u8>)>
 {
     use ipc::log_query::{HistoryEntries, HistoryRequest, QUERY_OK, reply_more, reply_status};
 

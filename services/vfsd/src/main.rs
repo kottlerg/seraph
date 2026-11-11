@@ -436,14 +436,11 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
 /// multi-threaded recv on `namespace_ep` would only buy concurrency
 /// between independent `NS_*` requests and is not load-bearing today.
 ///
-/// Load-bearing single-thread invariant: [`try_forward_lookup_fallthrough`]
-/// reuses this thread's registered `ipc_buf` page to receive the upstream
-/// fall-through reply, overwriting the original inbound message in place.
-/// A second dispatcher thread sharing the same `namespace_ep` (or a worker
-/// pool servicing namespace requests) would corrupt that buffer mid-call.
-/// Any future parallelism here must either give each worker its own
-/// `ipc_buf` page (and an own-cap derivation) or move the fall-through to
-/// a buffer-disjoint shape.
+/// [`try_forward_lookup_fallthrough`] makes its fall-through call on this
+/// thread's own `ipc_buf` page, after the request was copied out of it, and
+/// reads only the copied request and the copied reply. Further dispatcher
+/// threads on `namespace_ep`, each on its own page, would need no change to
+/// it (`docs/ipc-design.md` § Multi-threaded servers).
 fn namespace_loop(rt: &'static VfsdRuntime) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();

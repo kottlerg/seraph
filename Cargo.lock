@@ -1370,6 +1370,7 @@ dependencies = [
  "process-abi",
  "process-layout",
  "procmgr-process-table",
+ "recv-pool",
  "shmem",
  "syscall",
  "syscall-abi",

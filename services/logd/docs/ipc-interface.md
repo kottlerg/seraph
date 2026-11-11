@@ -378,9 +378,14 @@ again.
   happens before either lock is taken, by one thread at a time. The panic sink takes no lock.
 - **Order.** A line is retained, and its `seq` taken (§ History), under the state lock, and is
   written after it, so the lines of different workers reach the serial driver in the order the
-  workers take the output lock, which can differ from their `seq` order. One sender thread's lines
-  keep their order, since its call returns only once its line is written. Two threads of one
-  process share a slot (§ Levels).
+  workers take the output lock, which can differ from their `seq` order. A worker replies only once
+  the line a message completed is retained and written, so the lines of one sender thread whose
+  calls are answered keep their order, in `seq` and on the drivers. A log call is bounded
+  ([shared/log/README.md](../../../shared/log/README.md)), and one that times out after a worker
+  received it ends that worker's binding, not its service of the message: the sender's next call,
+  served by another worker, can be retained and written first, so it takes the smaller `seq` and
+  reaches the drivers first, and the bytes of a timed-out `STREAM_BYTES` chunk can join the slot's
+  partial line after those of a later chunk. Two threads of one process share a slot (§ Levels).
 
 ## Wait-set
 

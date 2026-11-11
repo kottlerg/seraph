@@ -1135,8 +1135,10 @@ its pool ([memory-pool.md § Reclamation](../../../services/memmgr/docs/memory-p
 address space has taken a terminal fault, and otherwise the retained reason of the first one
 (`EXIT_FAULT_BASE` plus the fault vector or cause; never `0`), which later faults do not overwrite.
 It is the reason a `SYS_ASPACE_BIND_NOTIFICATION` observer of the space receives, read under the
-same lock that serialises the post and the bind, so a holder that missed the post reads the outcome
-back here.
+same lock that serialises the fault's record and the bind, so a holder that missed the post reads
+the outcome back here. The kernel records the reason before it commits the faulting thread's
+`Exited` state, and posts it to the observers after, so a holder that has read a thread of the space
+`Exited` by a terminal fault (`CAP_INFO_THREAD_STATE`) reads a non-zero reason here.
 
 **Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which
 needs the Memory `Phys` right on the queried cap or the credential; `cap_info` otherwise reads

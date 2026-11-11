@@ -181,7 +181,8 @@ live in the component scope:
 Boot modules (the eight entries of `xtask/src/bundle.rs::MODULES`: procmgr,
 memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs, and the
 `ARCH_MODULES` entry of the architecture's IOMMU driver, iommu-vtd on x86-64
-and iommu-riscv on riscv64) are packed into
+and iommu-riscv on riscv64, and on riscv64 the platform description table
+`platform-qemu-virt` of the `ARCH_TABLES` entry) are packed into
 `\EFI\seraph\bootstrap.bundle` by `cargo xtask build` (see
 [`xtask/README.md`](../xtask/README.md) for the producer side and
 [`abi/boot-protocol`](../abi/boot-protocol/README.md)'s

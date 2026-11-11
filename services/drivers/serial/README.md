@@ -28,16 +28,15 @@ serial/
 
 ## Endpoint
 
-[Devmgr](../../devmgr/docs/responsibilities.md#responsibilities) carves the platform UART at
-its platform-static location (COM1 at I/O port `0x3F8` on x86-64; the QEMU `virt` NS16550 at
-`0x1000_0000` on RISC-V; data-driven discovery is
-[#165](https://github.com/kottlerg/seraph/issues/165)), spawns the driver via procmgr on its
-fixed path (the driver carries a declaration in the ELF note section `.note.seraph.driver`, SPCR
-interface types `0x00` and `0x12` and ACPI `PNP0501`, that no device record devmgr builds matches
-yet), and
-delegates the per-device arch authority cap — an `IoPort` on x86-64,
-an `Mmio` on RISC-V — plus the UART interrupt cap (COM1 is ISA IRQ 4; the QEMU `virt` NS16550
-is PLIC source 10). The driver owns those caps end-to-end. Outside the driver, UART authority
+[Devmgr](../../devmgr/docs/responsibilities.md#responsibilities) binds the driver to the
+platform device record of the console UART (the ACPI namespace's `PNP0501` device or the SPCR's
+console UART, merged into one record; COM1 at I/O port `0x3F8` on x86-64, the QEMU `virt`
+NS16550 at `0x1000_0000` on RISC-V). The driver carries a declaration in the ELF note section
+`.note.seraph.driver` (SPCR interface types `0x00` and `0x12` and ACPI `PNP0501`) and is a boot
+module, bound in the boot pass. devmgr spawns it via procmgr and delegates the record's
+resources — an `IoPort` on x86-64, an `Mmio` on RISC-V — plus the UART interrupt cap, carved
+exclusive (COM1 is ISA IRQ 4; the QEMU `virt` NS16550 is PLIC source 10). The driver owns those
+caps end-to-end. Outside the driver, UART authority
 is held only by init (used by its init-logd thread, the direct-UART path until the real-logd
 handover) and by devmgr (the `IoPort` / `Mmio` caps it carves the driver's cap
 from), per [console-model.md](../../../docs/console-model.md#ownership-across-the-boot-lifecycle).
@@ -49,8 +48,9 @@ Before its bootstrap the driver declares itself undebuggable to procmgr
 holder that stopped it would wait on its own log output
 ([crashd Operation](../../crashd/docs/operation.md) § Limits).
 
-The bootstrap is two rounds: the first carries the service endpoint, the arch authority cap, and
-the interrupt cap when present; the second, terminal one carries the driver's devmgr query cap.
+The bootstrap is the resource list (`driver_binding::resources`), decoded with
+`PlatformDelivery`: the register resource, the wired line when present, and in the end round the
+service endpoint and the driver's devmgr query cap.
 Once the UART is set up the driver reports `devmgr_labels::DRIVER_READY` on that cap,
 immediately before its service loop, and exits when devmgr refuses it: devmgr serves the
 driver's endpoint only after the report, and withdraws it when the driver dies.

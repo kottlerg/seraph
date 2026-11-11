@@ -30,8 +30,10 @@ recipe travels on the wire.
 
 ## Grammar
 
-Line-oriented `key = value`. Lines starting with `#` are comments.
-Blank lines are tolerated. Whitespace around `=` is tolerated.
+Line-oriented `key = value`, split by the line grammar of
+[`shared/svc-grammar`](../../../shared/svc-grammar/README.md), which svcmgr's definition and class
+parsers and devmgr's platform description table parser share. Lines starting with `#` are
+comments. Blank lines are tolerated. Whitespace around `=` is tolerated.
 Unknown keys are **hard errors** — a typo cannot silently degrade a
 service.
 

@@ -6976,17 +6976,69 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
     }
 }
 
-/// Post a terminal-fault notification to an address space's death observers,
-/// recording the fault so an observer bound *after* it still learns of the
-/// death.
+/// The address-space observers a terminal fault notifies, snapshotted when the
+/// fault was recorded ([`record_aspace_terminal_fault`]), and the reason
+/// [`post_aspace_death_notification`] posts to them.
+#[cfg(not(test))]
+#[must_use = "a recorded terminal fault is posted by post_aspace_death_notification"]
+pub struct AspaceFaultPost
+{
+    /// First node of the observer chain read under the space's `death_lock`
+    /// when the fault was recorded; null when the space has no observer or
+    /// the thread has no address space.
+    first: *mut thread::DeathObserver,
+    /// The recorded fault's exit reason.
+    exit_reason: u64,
+}
+
+/// Record a terminal fault on the faulting thread's address space, so a holder
+/// of the space reads it back (`CAP_INFO_ASPACE_TERMINAL_FAULT`) and an
+/// observer bound *after* it still learns of the death, and snapshot the
+/// observers to notify.
 ///
-/// Mirrors [`post_death_notification`]: it records the terminal-fault reason on
-/// the address space (first fault wins) and snapshots the observer set under
-/// the space's `death_lock`, then posts the entry `(exit_reason, correlator)`
-/// to each bound node's `EventQueue` outside the lock. A bind that arrives after the fault receives
-/// the retained reason via `AddressSpace::bind_or_retained`. The kernel only
-/// notifies here — it does not enumerate or terminate the address space's
-/// threads.
+/// Records the reason (first fault wins) and reads the observer chain's head in
+/// one hold of the space's `death_lock`, so every observer is notified exactly
+/// once: one linked before the record is in the snapshot, and a bind after it
+/// receives the retained reason through `AddressSpace::bind_or_retained`.
+///
+/// The terminal-fault path calls this BEFORE it commits the thread's `Exited`
+/// state: the `death_lock` release here precedes the all-locks commit, so a
+/// reader that sees the thread `Exited` under a scheduler lock and then takes
+/// `death_lock` reads the record (core/kernel/docs/syscalls.md
+/// § `SYS_CAP_INFO`). The posts follow the commit
+/// ([`post_aspace_death_notification`]).
+///
+/// # Safety
+/// `as_ptr` may be null (nothing recorded, nothing to post) or a valid
+/// `AddressSpace` pointer. Must be called from the terminal-fault path of the
+/// running thread, without holding the space's `death_lock`.
+#[cfg(not(test))]
+pub unsafe fn record_aspace_terminal_fault(
+    as_ptr: *mut crate::mm::address_space::AddressSpace,
+    exit_reason: u64,
+) -> AspaceFaultPost
+{
+    let first = if as_ptr.is_null()
+    {
+        core::ptr::null_mut()
+    }
+    else
+    {
+        // SAFETY: as_ptr validated non-null; not called holding death_lock.
+        unsafe {
+            crate::mm::address_space::AddressSpace::record_fault_and_snapshot(as_ptr, exit_reason)
+        }
+    };
+    AspaceFaultPost { first, exit_reason }
+}
+
+/// Post a recorded terminal fault ([`record_aspace_terminal_fault`]) to the
+/// address-space death observers its snapshot holds.
+///
+/// Mirrors [`post_death_notification`]: it walks the snapshotted chain outside
+/// any lock and posts the entry `(exit_reason, correlator)` to each bound
+/// node's `EventQueue`. The kernel only notifies here — it does not enumerate
+/// or terminate the address space's threads.
 ///
 /// On a main-thread terminal fault this fires in addition to the per-thread
 /// [`post_death_notification`]; when both target the same consumer queue
@@ -6994,34 +7046,21 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
 /// residue — the process is torn down regardless.
 ///
 /// # Safety
-/// `as_ptr` may be null (no-op) or a valid `AddressSpace` pointer. Must be
-/// called from the terminal-fault path, after the faulting thread has been
-/// marked `Exited`, without holding the space's `death_lock`.
+/// `post` must come from [`record_aspace_terminal_fault`] on this terminal-fault
+/// path of the running thread, which has stayed on its CPU since, and must be
+/// called after the thread has been marked `Exited`, without holding the
+/// space's `death_lock` or a thread's `sched_lock`.
 #[cfg(not(test))]
-pub unsafe fn post_aspace_death_notification(
-    as_ptr: *mut crate::mm::address_space::AddressSpace,
-    exit_reason: u64,
-)
+pub unsafe fn post_aspace_death_notification(post: &AspaceFaultPost)
 {
-    if as_ptr.is_null()
-    {
-        return;
-    }
-
-    // Record the terminal fault (so an observer bound after it still learns of
-    // the death) and read the observer chain's head under the space's
-    // death_lock; post outside the lock.
-    // SAFETY: as_ptr validated non-null; not called holding death_lock.
-    let first = unsafe {
-        crate::mm::address_space::AddressSpace::record_fault_and_snapshot(as_ptr, exit_reason)
-    };
-
+    let AspaceFaultPost { first, exit_reason } = *post;
     // SAFETY: every node reachable from `first` lives in its queue, which the
     // node's own reference keeps live: only the address space's teardown
     // returns the nodes and releases the references, and that first stops
     // every bound thread, this faulting one included, and waits until it runs
-    // on no CPU, so no link changes during the walk. Not called holding a
-    // thread's sched_lock.
+    // on no CPU. The thread has stayed on its CPU since the snapshot (the
+    // contract), so no link changes between the snapshot and the walk. Not
+    // called holding a thread's sched_lock.
     unsafe {
         thread::for_each_observer(first, |node| {
             post_one_death_event((*node).eq, (*node).correlator, exit_reason);

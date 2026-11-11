@@ -288,10 +288,11 @@ cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--harness` | `init` | Which binary becomes the bundle's `init` entry: `init` for the regular userspace init, `ktest` for the kernel-test harness |
 
-`--harness init` produces a 10-entry bundle on both architectures (`init` +
-the 8 boot modules listed in `xtask/src/bundle.rs::MODULES`, and the IOMMU
+`--harness init` produces a 10-entry bundle on x86-64 and an 11-entry bundle on
+riscv64 (`init` + the 8 boot modules listed in `xtask/src/bundle.rs::MODULES`, the IOMMU
 driver of the architecture's family from `ARCH_MODULES`, `iommu-vtd` on
-x86-64 and `iommu-riscv` on riscv64; the bootloader and init address entries
+x86-64 and `iommu-riscv` on riscv64, and, on riscv64, the platform description table
+`platform-qemu-virt` from `ARCH_TABLES`; the bootloader and init address entries
 by name, so order is not significant). `--harness ktest`
 produces a single-entry bundle (`ktest` as the `init` entry, zero
 modules); ktest is monolithic and does not spawn userspace.

@@ -8,9 +8,8 @@
 //! Creates driver processes via procmgr, then serves the driver's bootstrap
 //! over IPC to deliver its per-device capability set: for a driver bound to
 //! a device, the device's resource list ([`driver_binding::resources`]); for
-//! the IOMMU driver and the platform drivers on fixed paths, their own
-//! rounds. log + procmgr caps arrive via `ProcessInfo` and are not part of
-//! this protocol.
+//! the IOMMU driver and the test-only fault fixture, their own rounds. log +
+//! procmgr caps arrive via `ProcessInfo` and are not part of this protocol.
 
 use driver_binding::resources::{END_SLOTS, Endpoints, Resource, Round};
 use ipc::{IpcMessage, procmgr_labels};

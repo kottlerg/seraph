@@ -154,20 +154,20 @@ claims.
    X and the head, `docs/conventions.md` § Syncing with `master` decides
    whether X stands: `cargo xtask pr-check` compares the PR's own change at
    X and at the head in place of that delta, and you check what it cannot:
-   the body MUST state that the incoming diff touches none of the PR's
-   files or that it is comment-only, no file of the incoming diff (`git
-   diff --name-only <merge base at X> <merge base at the head>`) may be one
-   the PR's own diff names (`git diff --name-only <merge base at the head>
-   <head>`) unless that incoming diff alters, Markdown aside, only comment
-   lines and no build-embedded text (`git diff <merge base at X> <merge
-   base at the head>`, judged as the delta above), and the merge
-   commit may resolve no conflict (`git show <merge>` prints no combined
-   diff). FAIL a sync that breaks one of these without a validation at the
-   synced head. FAIL when X is absent, when X is none of the head,
-   the merge base, or a commit between them, when X is not the head and that
-   statement is missing or that range is not documentation or comments only,
-   or when the body claims the whole PR is documentation-only and the PR
-   diff is not.
+   judge each merge M of the base branch in `git log --merges X..<head>`
+   on its own incoming diff (`git diff $(git merge-base M^1 M^2) M^2`).
+   For each, the body MUST state that its incoming diff touches none of
+   the PR's files or that it is comment-only, no file of that incoming
+   diff (the same command with `--name-only`) may be one the PR's own diff
+   names (`git diff --name-only <merge base at the head> <head>`) unless
+   that incoming diff alters, Markdown aside, only comment lines and no
+   build-embedded text (judged as the delta above), and M may resolve no
+   conflict (`git show M` prints no combined diff). FAIL a sync that
+   breaks one of these without a validation at the synced head. FAIL when
+   X is absent, when X is none of the head, the merge base, or a commit
+   between them, when X is not the head and that statement is missing or
+   that range is not documentation or comments only, or when the body
+   claims the whole PR is documentation-only and the PR diff is not.
 
    Local host runs: `docs/testing.md` § Coverage tiers owns which runs a PR
    owes (its Inert changes, Boundary surface, Memory surface, Device

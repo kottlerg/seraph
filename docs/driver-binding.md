@@ -26,11 +26,15 @@ What the core keeps is knowledge of standards and of the system's own structure:
   tables devmgr reads, and the IOMMU table formats (DMAR, RIMT);
 - the fixed bootstrap set and its order (init, memmgr, procmgr, devmgr, vfsd, svcmgr;
   [process-lifecycle.md](process-lifecycle.md));
-- the device classes, each a service protocol of `shared/ipc` with its access policy
-  (§ Device Classes);
-- the binding mechanism: carving, DMA authorisation, the settle, and withdrawal.
+- the binding and query mechanism: carving, DMA authorisation, the settle, withdrawal, and
+  the class-keyed registry query, in which a device class is an opaque name the core does not
+  interpret (§ Device Classes).
 
-The build (`xtask`) and the source tree grow with each module, and MAY list modules by name.
+No shared crate, no resident binary's source, and no central table grows with the number of
+drivers. Adding a driver is adding its binary; adding a device class is adding its protocol
+and its class file (§ Device Classes). The build (`xtask`) and the source tree grow with each
+module, and MAY list modules by name: they build packages, and a deployment chooses which to
+install.
 
 ---
 
@@ -71,17 +75,19 @@ capability per vector it grants. The kernel's minting of message-signaled target
 
 ## Driver Declarations
 
-Every driver binary carries its declaration in an ELF note (a `PT_NOTE` segment), encoded and
-decoded by one shared `no_std` crate that the driver and devmgr both use and that is
-host-tested. The binary is the single carrier: a boot-bundle module and a driver on the root
-filesystem are declared the same way, and a declaration cannot drift from the binary it
-describes.
+Every driver binary carries its declaration in an ELF note section, `.note.seraph.driver`,
+located by the same section-header walk `shared/elf` performs for the stack-size note
+(`.note.seraph.stack`). One shared `no_std` crate, host-tested, encodes the declaration in
+the driver and decodes it in devmgr. The binary is the single carrier: a boot-bundle module
+and a driver on the root filesystem are declared the same way, a package is one file that is
+installed, updated, and removed by itself, a declaration cannot drift from the binary it
+describes, and a signature over the binary would cover its declaration with it.
 
 | Field | Meaning |
 |---|---|
 | Name | The driver's name in log lines |
 | Match entries | One or more keys of § Device Records: a PCI vendor and device, or a PCI class, subclass, and programming interface under a mask; an ACPI `_HID` or `_CID`; an SPCR interface type; a platform key |
-| Class | The device class the driver serves (§ Device Classes) |
+| Class | The name of the device class the driver serves (§ Device Classes) |
 | Instance limit | The most devices of its match the driver is bound to; absent means every one |
 | Interrupt need | None, optional, or required, and for a message-signaled capable driver the vector count it requests |
 | DMA | Whether the device performs DMA: the driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD` and given a DMA capability ([device-management.md](device-management.md#dma-authorisation) § DMA Authorisation) |
@@ -100,6 +106,32 @@ devmgr collects declarations from two places:
   (`NS_READDIR`, so svcmgr sends the subtree cap with `READDIR` beside `LOOKUP | READ`) and
   reads the note of each entry. A binary whose declaration matches no recorded device is not
   loaded.
+
+### Declaration Bounds
+
+A declaration is untrusted input to devmgr, and it is as trusted as the authority that
+installed its binary: whoever can write `/services/drivers/` or compose the boot bundle can
+already install a driver devmgr hands hardware to. The bounds below make sure a declaration
+never claims more than its device and the system's policy give it:
+
+- **Resources.** devmgr carves only from the device record. A declaration selects among the
+  record's resources; it cannot name an address, a port, an interrupt, or a DMA right the
+  record lacks, so a DMA declaration for a record with no `Dma` resource gets no DMA
+  capability.
+- **No preemption.** A bind pass binds only unbound records, and the boot pass runs first. A
+  drivers-directory declaration cannot take a device a boot driver holds, however specific
+  its key.
+- **Source.** The boot priority tier, and a class whose class file marks it boot-only
+  (§ Device Classes), are accepted only from a boot-bundle declaration. A drivers-directory
+  declaration of a boot-only class is logged and ignored, and a drivers-directory driver runs
+  at the auxiliary tier.
+- **Class.** Declaring a class decides which of that class's consumers talk to the driver; it
+  grants no access, since the class's policy is configuration (§ Device Classes). Consumers
+  treat a driver's data as untrusted.
+- **Form.** Every field has a fixed bound (the match entries, the name's length, the vector
+  count). A declaration that exceeds one, carries an unknown field kind, or fails to decode is
+  rejected whole and logged. devmgr's reads of a candidate binary are bounded too: the ELF
+  header, the section header table, and the one note.
 
 ---
 
@@ -131,8 +163,8 @@ and for a hot-added device:
    declaration's need and the record's kind allow, and keep the `Config` page.
 2. For a DMA declaration, give the device its DMA grant, confining it where an IOMMU unit
    translates it.
-3. Create the driver through procmgr with the flags and priority its declaration implies, from
-   its boot module or its file.
+3. Create the driver through procmgr with the flags and priority its declaration implies,
+   within § Declaration Bounds, from its boot module or its file.
 4. Deliver the capabilities over the bootstrap protocol as a self-describing resource list:
    each capability with its resource kind and its fields, then the service endpoint, the
    devmgr query capability, and the DMA capability. One delivery shape serves every driver,
@@ -150,19 +182,46 @@ the DMA and Bus Master Enable steps that apply to every DMA-capable device.
 
 ## Device Classes
 
-A device class is a service protocol of `shared/ipc` (the block, serial, framebuffer, RTC,
-input, and debug-port protocols today). The class table in `shared/ipc` gives each class its
-identifier, the registry authority bit a query for it requires, and the verb bits devmgr
-stamps on the SEND it hands out. The policy belongs to the protocol, not to a driver: every
-driver of a class is served under the same gate, so no declaration can widen access to its
-class.
+A device class is a name (`block`, `serial`, `audio`) shared by the drivers that serve one
+service protocol and the consumers that speak it. devmgr does not interpret the name: it
+interns each class name a declaration or a class file gives it into a bounded runtime table,
+and no source or shared crate lists the classes.
+
+A class's access policy is configuration, set where every other access is set, never by a
+driver:
+
+- **Class file.** `/config/devmgr/classes/<name>.class`, in the `.svc` grammar
+  ([service-definitions.md](../services/svcmgr/docs/service-definitions.md#grammar)), gives
+  the class's name, the client verb mask devmgr stamps on the SEND it hands out, and whether
+  the class is boot-only (§ Declaration Bounds).
+- **Publication.** For each class file, svcmgr asks devmgr, over a privileged label that only
+  svcmgr and init hold, for a registry SEND whose badge carries the class's slot and its verb
+  mask, and publishes it seed-only as `devmgr.class.<name>`. A service reaches a class only
+  when its `.svc` `seed` line names that publication. init mints the classes the bootstrap set
+  needs before svcmgr runs (block for vfsd, serial for logd) the same way, from the boot
+  bundle's copies of their class files.
+- **Badge.** One generic badge layout, defined once beside the registry protocol, carries the
+  slot and the mask. It replaces the per-class authority bits (`BLOCK_DEVICE_AUTHORITY`,
+  `DEBUG_PORT_AUTHORITY`, `TEST_LABEL_AUTHORITY`).
+
+Every driver of a class is served under its class file's policy, so no declaration can widen
+access to its class, and a deployment that installs no class file for a class serves it to no
+one.
 
 One registry label, `QUERY_DEVICE`, replaces the per-class `QUERY_*_DEVICE` labels. It carries
-the class identifier and an instance ordinal; devmgr checks the class table's authority bit,
-then answers as the per-class queries answer today: the SEND on the served driver at that
-ordinal, `WITHDRAWN` at a withdrawn driver's ordinal, and `NO_DEVICE` past the last served
-driver of the class or before the pass that binds it has settled. Ordinals count the served
-drivers of the class in record order and are fixed once its pass settles.
+an instance ordinal and takes the class from the caller's badge; devmgr answers as the
+per-class queries answer today: the SEND on the served driver at that ordinal, stamped with
+the badge's verb mask, `WITHDRAWN` at a withdrawn driver's ordinal, and `NO_DEVICE` past the
+last served driver of the class or before the pass that binds it has settled. Ordinals count
+the served drivers of the class in record order and are fixed once its pass settles. A
+declared class with no class file, and a class file no declaration serves, are logged at
+`SET_DRIVERS_DIR`.
+
+The class's protocol (its labels, message layouts, and verb bit positions) is the contract
+between its drivers and its consumers, and is the one artefact both compile against. It is
+per class, never per driver, and neither devmgr nor svcmgr reads it. The existing protocols
+live in `shared/ipc`; a new class's protocol SHOULD be a crate of its own, so adding a class
+edits no existing crate.
 
 ---
 
@@ -179,7 +238,8 @@ driver, which leaves a tombstone at its ordinal. The event sources are specified
 
 No test-only spawn label survives the binding redesign: a fixture driver is bound through
 `bind(device, driver)` against a device the test launch attaches, like any driver, and a test
-reaches it through `QUERY_DEVICE` under the test authority bit. The fixtures and labels it
+reaches it through `QUERY_DEVICE` on the test class, whose class file only a test deployment
+installs. The fixtures and labels it
 retires are listed on [#165](https://github.com/kottlerg/seraph/issues/165).
 
 ---

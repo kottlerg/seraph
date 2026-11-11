@@ -75,10 +75,13 @@ devmgr's responsibilities are:
   ([docs/device-management.md](../../../docs/device-management.md#physical-addresses)
   § Physical Addresses). Once it is ready devmgr attaches every
   DMA-capable device it binds to a domain of its own (`iommu_labels::ATTACH`)
-  before the device's DMA grant, refusing, with a log line, a device an RMRR
-  names ([#773](https://github.com/kottlerg/seraph/issues/773)), one the RIMT
-  gives an IOMMU device ID other than its requester ID, one whose unit it could
-  not hand over, and one whose `ATTACH` fails; a device no unit translates
+  before the device's DMA grant and maps there, at their own addresses, the
+  ranges an RMRR reserves for it (`iommu_labels::MAP_RESERVED`), logging each.
+  It refuses, with a log line, a device whose reserved ranges overlap pooled
+  memory, pass its unit's width, number past `MAX_RESERVED_RANGES_PER_DEVICE`,
+  or fail to map, one the RIMT gives an IOMMU device ID other than its
+  requester ID, one whose unit it could not hand over, and one whose `ATTACH`
+  fails; a device no unit translates
   runs DMA-unsafe. With no DMAR or RIMT, no driver module, or a driver not
   ready within the settle bound, devmgr logs once that DMA runs unconfined and
   every DMA-capable driver runs DMA-unsafe (a driver that died or hung after
@@ -414,7 +417,11 @@ Interrupt range, RSDP, and DTB caps are present, with a presence bitmap, the exa
 RSDP physical address, the DTB page base, and the DTB's page-rounded size in its data
 words. Each later round names its kind in `data[0]`: `APERTURE` rounds carry up to
 four Mmio caps and `ACPI_REGION` rounds up to four Memory caps, each round with its
-base/size pairs; one `MODULE` round carries the boot-bundle
+base/size pairs; cap-less `RAM_EXTENT` rounds carry the base/size pair of every
+extent of RAM memmgr pools, against which devmgr checks the regions firmware reserves
+for a device
+([docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming)
+§ IOMMU Discovery and Programming); one `MODULE` round carries the boot-bundle
 driver images, each tagged with its module class; a cap-less `FRAMEBUFFER_INFO`
 round carries the framebuffer geometry (a zero base means no framebuffer); and the
 terminal `SVCMGR_BUNDLE` round carries the svcmgr publish cap and the arch

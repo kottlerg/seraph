@@ -17,12 +17,13 @@
 //! settle batch of its own, handing it every unit (`iommu_core::bootstrap`);
 //! devmgr keeps no copy of a register cap. Once the driver reports ready
 //! every function a unit translates is blocked until devmgr attaches it, so
-//! [`Iommu::confine`] attaches each DMA-capable device before its DMA grant,
-//! refusing a device the firmware reserves memory for (a DMAR RMRR names it;
-//! identity-mapping such regions is
-//! [#773](https://github.com/kottlerg/seraph/issues/773); the RIMT describes
-//! none), one the RIMT gives a device ID other than its requester ID, one
-//! whose unit it could not hand over, or one whose `ATTACH` fails. When no
+//! [`Iommu::confine`] attaches each DMA-capable device before its DMA grant
+//! and maps, at their own addresses, the regions the firmware reserves for it
+//! (each DMAR RMRR that names it; the RIMT describes none). It refuses a
+//! device whose reserved regions overlap memory memmgr pools, pass its unit's
+//! width, or number past `MAX_RESERVED_RANGES_PER_DEVICE`, one the RIMT gives
+//! a device ID other than its requester ID, one whose unit it could not hand
+//! over, and one whose `ATTACH` or reserved mapping fails. When no
 //! unit is found, no driver module was delivered, or the driver does not
 //! report ready within the settle bound, devmgr logs once that DMA runs
 //! unconfined and every device runs so; a driver that fails its own setup
@@ -49,7 +50,9 @@ use std::os::seraph::thread::BuilderExt;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use firmware::dma::{Confinement, EDU_ID, iova_limit};
+use firmware::dma::{
+    Confinement, EDU_ID, ReservedError, ReservedRange, iova_limit, reserved_ranges,
+};
 use firmware::dmar::{self, Bdf, Resolved};
 use firmware::rimt;
 use iommu_core::Scope;
@@ -217,6 +220,21 @@ impl IommuClient
         self.call(&msg).map(|_| ())
     }
 
+    /// Install the firmware-reserved range of `len` bytes at `base` in the
+    /// domain `handle` at its own address (`MAP_RESERVED`).
+    ///
+    /// # Errors
+    /// The driver's error label; nothing is installed.
+    pub fn map_reserved(&self, handle: u64, base: u64, len: u64) -> Result<(), u64>
+    {
+        let msg = Self::request(iommu_labels::MAP_RESERVED)
+            .word(1, handle)
+            .word(2, base)
+            .word(3, len)
+            .build();
+        self.call(&msg).map(|_| ())
+    }
+
     /// Remove the range at `iova` of the domain `handle`.
     ///
     /// # Errors
@@ -362,7 +380,7 @@ enum Topology
     /// VT-d units, from the DMAR.
     Dmar
     {
-        /// The DMAR's bytes, for the RMRR and unit lookups of each device.
+        /// The DMAR's bytes, for the unit and RMRR lookups of each device.
         dmar: Vec<u8>,
         /// For each DRHD in table order, its unit index in the driver;
         /// `None` for a unit devmgr could not hand over.
@@ -406,10 +424,6 @@ impl Topology
             {
                 let range = |b| bridge_range(bridges, segment, b);
                 let secondary = |b| range(b).map(|r: (u8, u8)| r.0);
-                if dmar::has_reserved_region(dmar, segment, target, secondary, range)
-                {
-                    return Placement::Reserved;
-                }
                 let Some(drhd) = dmar::unit_for(dmar, segment, target, secondary, range)
                 else
                 {
@@ -440,16 +454,46 @@ impl Topology
             }
         }
     }
+
+    /// The `(first, last)` byte of each region the firmware reserves for the
+    /// function `target` of `segment`: every DMAR RMRR that names it; none
+    /// from the RIMT, which describes no reserved region. `None` when the
+    /// list cannot grow.
+    fn reserved_regions(&self, segment: u16, target: Bdf) -> Option<Vec<(u64, u64)>>
+    {
+        let mut regions = Vec::new();
+        let mut complete = true;
+        if let Self::Dmar { dmar, bridges, .. } = self
+        {
+            let range = |b| bridge_range(bridges, segment, b);
+            let secondary = |b| range(b).map(|r: (u8, u8)| r.0);
+            dmar::reserved_regions(dmar, segment, target, secondary, range, |first, last| {
+                if regions.try_reserve(1).is_ok()
+                {
+                    regions.push((first, last));
+                }
+                else
+                {
+                    complete = false;
+                }
+            });
+        }
+        complete.then_some(regions)
+    }
 }
 
 /// The units devmgr discovered and handed to the IOMMU driver, the firmware
-/// description they came from, and the client devmgr calls the driver
-/// through.
+/// description they came from, the client devmgr calls the driver through,
+/// and the extents of memory memmgr pools, which no device's reserved region
+/// may overlap.
 pub struct Iommu
 {
     client: Arc<IommuClient>,
     topology: Topology,
     faults: Arc<Mutex<FaultCounts>>,
+    /// The `(base, size)` of every extent of memory memmgr pools, as init
+    /// reports it; `None` when the set is not known in full.
+    pooled: Option<Vec<(u64, u64)>>,
 }
 
 /// Why a device is not given DMA.
@@ -462,8 +506,6 @@ enum Placement
     Unit(usize),
     /// No unit translates it.
     Untranslated,
-    /// An RMRR names it.
-    Reserved,
     /// The RIMT gives it a device ID other than its requester ID, which the
     /// driver's units are not told.
     Renamed,
@@ -492,8 +534,8 @@ impl Iommu
 
     /// The driver's unit index for `pci_dev`: `Ok(None)` when no unit
     /// translates it, so it runs unconfined; `Err` when it must be refused
-    /// (an RMRR names it, the RIMT renames its device ID, or its unit was not
-    /// handed over), logged.
+    /// (the RIMT renames its device ID, or its unit was not handed over),
+    /// logged.
     fn unit_of(&self, name: &str, pci_dev: &pci::PciDevice) -> Result<Option<usize>, Refused>
     {
         match self.placement(pci_dev)
@@ -506,14 +548,6 @@ impl Iommu
                     name
                 );
                 Ok(None)
-            }
-            Placement::Reserved =>
-            {
-                std::os::seraph::log!(
-                    "{}: firmware reserves memory for the device (RMRR); refused (#773)",
-                    name
-                );
-                Err(Refused)
             }
             Placement::Renamed =>
             {
@@ -532,43 +566,137 @@ impl Iommu
     }
 
     /// Whether `pci_dev` would be confined: a programmed unit translates it
-    /// by its own requester ID, no RMRR names it, and the driver has not
-    /// failed. No IPC; [`Self::confine`] decides.
+    /// by its own requester ID and the driver has not failed. No IPC;
+    /// [`Self::confine`] decides, and also refuses a device whose reserved
+    /// regions cannot be mapped.
     pub fn would_confine(&self, pci_dev: &pci::PciDevice) -> bool
     {
         matches!(self.placement(pci_dev), Placement::Unit(_)) && !self.client.failed()
     }
 
     /// Attach `pci_dev` to a domain of its own before its DMA grant, so its
-    /// driver's mappings are confined to it: its confinement, unconfined
-    /// when no unit translates it. Logged `Err` when it is refused: an RMRR
-    /// names it, the RIMT renames its device ID, its unit is not programmed,
-    /// the driver has failed, or the `ATTACH` fails.
-    pub fn confine(&self, name: &str, pci_dev: &pci::PciDevice) -> Result<Confinement, Refused>
+    /// driver's mappings are confined to it, and map there, at their own
+    /// addresses, the regions the firmware reserves for it: its confinement
+    /// and those ranges, unconfined with none when no unit translates it.
+    /// Logged `Err` when it is refused: the RIMT renames its device ID, its
+    /// unit is not programmed, the driver has failed, its reserved regions
+    /// overlap pooled memory, pass the unit's width, or are too many, or the
+    /// `ATTACH` or a reserved mapping fails; a device attached by then is
+    /// blocked again.
+    pub fn confine(
+        &self,
+        name: &str,
+        pci_dev: &pci::PciDevice,
+    ) -> Result<(Confinement, Vec<ReservedRange>), Refused>
     {
         let Some(unit) = self.unit_of(name, pci_dev)?
         else
         {
-            return Ok(Confinement::Unconfined);
+            return Ok((Confinement::Unconfined, Vec::new()));
         };
+        let reserved = self.reserved_ranges(name, pci_dev, unit)?;
         let rid =
             iommu_labels::requester_id(pci_dev.segment, pci_dev.bus, pci_dev.dev, pci_dev.func);
-        match self.client.attach(unit, rid)
+        let handle = match self.client.attach(unit, rid)
         {
-            Ok(handle) => Ok(Confinement::Domain {
-                handle,
-                limit: iova_limit(
-                    self.client.width(unit),
-                    pci_dev.vendor_id,
-                    pci_dev.device_id,
-                ),
-            }),
+            Ok(handle) => handle,
             Err(code) =>
             {
                 std::os::seraph::log!("{}: IOMMU ATTACH refused ({}); not spawned", name, code);
-                Err(Refused)
+                return Err(Refused);
             }
+        };
+        for r in &reserved
+        {
+            if let Err(code) = self.client.map_reserved(handle, r.base, r.len)
+            {
+                std::os::seraph::log!(
+                    "{}: firmware-reserved range {:#x}..{:#x} not mapped ({}); refused",
+                    name,
+                    r.base,
+                    r.base + r.len,
+                    code
+                );
+                self.client.block(handle);
+                return Err(Refused);
+            }
+            std::os::seraph::log!(
+                "{}: firmware-reserved range {:#x}..{:#x} identity-mapped",
+                name,
+                r.base,
+                r.base + r.len
+            );
         }
+        let limit = iova_limit(
+            self.client.width(unit),
+            pci_dev.vendor_id,
+            pci_dev.device_id,
+        );
+        Ok((Confinement::Domain { handle, limit }, reserved))
+    }
+
+    /// The ranges the domain of `pci_dev`, which unit `unit` translates,
+    /// maps at their own addresses ([`reserved_ranges`]); logged `Err` when
+    /// they cannot be mapped, so the device is refused.
+    fn reserved_ranges(
+        &self,
+        name: &str,
+        pci_dev: &pci::PciDevice,
+        unit: usize,
+    ) -> Result<Vec<ReservedRange>, Refused>
+    {
+        let target = Bdf {
+            bus: pci_dev.bus,
+            device: pci_dev.dev,
+            function: pci_dev.func,
+        };
+        let Some(regions) = self.topology.reserved_regions(pci_dev.segment, target)
+        else
+        {
+            std::os::seraph::log!("{}: reserved regions not read (no memory); refused", name);
+            return Err(Refused);
+        };
+        if regions.is_empty()
+        {
+            return Ok(Vec::new());
+        }
+        let Some(pooled) = self.pooled.as_deref()
+        else
+        {
+            std::os::seraph::log!(
+                "{}: firmware-reserved regions not checked (pooled memory not known); refused",
+                name
+            );
+            return Err(Refused);
+        };
+        reserved_ranges(&regions, pooled, self.client.width(unit)).map_err(|e| {
+            match e
+            {
+                ReservedError::Pooled(r) => std::os::seraph::log!(
+                    "{}: firmware-reserved range {:#x}..{:#x} overlaps pooled memory; \
+                     refused (platform error)",
+                    name,
+                    r.base,
+                    r.base + r.len
+                ),
+                ReservedError::PastWidth { base, last } => std::os::seraph::log!(
+                    "{}: firmware-reserved region {:#x}..={:#x} past the unit's width; refused",
+                    name,
+                    base,
+                    last
+                ),
+                ReservedError::TooMany => std::os::seraph::log!(
+                    "{}: more than {} firmware-reserved ranges; refused",
+                    name,
+                    firmware::dma::MAX_RESERVED_RANGES_PER_DEVICE as u64
+                ),
+                ReservedError::OutOfMemory => std::os::seraph::log!(
+                    "{}: reserved ranges not built (no memory); refused",
+                    name
+                ),
+            }
+            Refused
+        })
     }
 
     /// Take the driver's recorded faults and log each against its device;
@@ -821,8 +949,13 @@ fn riscv_round(
 /// logged once, and every device then runs unconfined, except, when the
 /// driver was started but did not report ready, those behind a unit it
 /// turned translation on for before it failed, which that unit blocks.
+/// `pooled` holds the `(base, size)` of every extent of memory memmgr
+/// pools, from init's bootstrap, against which each device's reserved regions
+/// are checked; `None` when the set is not known in full, which refuses every
+/// device with a reserved region.
 pub fn bring_up(
     devices: &[pci::PciDevice],
+    pooled: Option<Vec<(u64, u64)>>,
     caps: &mut caps::DevmgrCaps,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
@@ -914,6 +1047,7 @@ pub fn bring_up(
         client,
         topology,
         faults,
+        pooled,
     })
 }
 

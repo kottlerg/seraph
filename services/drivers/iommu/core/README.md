@@ -22,6 +22,8 @@ its `Backend`: VT-d's is [`iommu-vtd`](../vtd/README.md) and the RISC-V IOMMU's 
   nonempty, within the unit's width, and clear of the domain's other ranges, and the bounds on
   domains and ranges ([docs/limits.md](../../../../docs/limits.md)). It keeps a mapped cap while
   its range is installed and deletes it at `UNMAP`, at `BLOCK`, or at once on a refusal. A
+  `MAP_RESERVED` range, a firmware-reserved range devmgr names by its physical address, is
+  installed at that address, read-write, with no cap; `UNMAP` refuses it and `BLOCK` withdraws it. A
   function attached twice keeps its first domain; domain ID 0 is never given. A unit whose
   backend times out is treated as failed and refuses every later request.
 - **Faults.** A thread of the driver's own polls the units' fault records every `FAULT_POLL_MS`

@@ -284,6 +284,97 @@ fn acpi_region_caps(info: &InitInfo) -> impl Iterator<Item = (u64, u64, u64)> + 
         .map(|d| (d.slot, d.aux0, d.aux1))
 }
 
+/// The `(base, size)` of every extent of RAM memmgr pools, now or once init's
+/// reap donates it: every Memory cap init holds but the firmware-table ones
+/// (the RSDP page, the DTB, the ACPI reclaimable regions), which no one pools.
+/// The descriptors give the usable-RAM caps (the bootstrap arenas and every
+/// run init splits are carved from them), the boot modules, and the
+/// bootloader and bundle reclaim ranges; init's segment, stack, and `InitInfo`
+/// caps have no descriptor, so their extents are read from the kernel. An
+/// extent init cannot read is given as the whole address space, so devmgr
+/// refuses every device with a firmware-reserved range rather than miss
+/// pooled memory (docs/device-management.md § IOMMU Discovery and
+/// Programming).
+fn pooled_extents(info: &InitInfo) -> impl Iterator<Item = (u64, u64)> + '_
+{
+    let acpi_lo = info.acpi_region_memory_base;
+    let acpi_hi = acpi_lo.saturating_add(info.acpi_region_memory_count);
+    let described = crate::descriptors(info)
+        .iter()
+        .filter(move |d| {
+            d.cap_type == CapType::Memory
+                && !(info.acpi_rsdp_memory_cap != 0 && d.slot == info.acpi_rsdp_memory_cap)
+                && !(info.dtb_memory_cap != 0 && d.slot == info.dtb_memory_cap)
+                && !(d.slot >= acpi_lo && d.slot < acpi_hi)
+        })
+        .map(|d| (d.aux0, d.aux1));
+    let own = [
+        (info.segment_memory_base, info.segment_memory_count),
+        (info.init_stack_memory_base, info.init_stack_memory_count),
+        (info.init_info_memory_base, info.init_info_memory_count),
+    ]
+    .into_iter()
+    .flat_map(|(base, count)| base..base.saturating_add(count))
+    .map(|slot| {
+        if let (Ok(base), Ok(size)) = (
+            syscall::cap_info(slot, syscall::CAP_INFO_MEMORY_PHYS_BASE),
+            syscall::cap_info(slot, syscall::CAP_INFO_MEMORY_SIZE),
+        )
+        {
+            (base, size)
+        }
+        else
+        {
+            log("devmgr: an extent of init's own memory unread; sent as all memory");
+            (0, u64::MAX)
+        }
+    });
+    described.chain(own)
+}
+
+/// Pairs one `kind::RAM_EXTENT` round carries: every data word after the kind
+/// and the count.
+const EXTENTS_PER_ROUND: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 2) / 2;
+
+/// Serve devmgr the cap-less `kind::RAM_EXTENT` rounds for `extents`,
+/// [`EXTENTS_PER_ROUND`] `(base, size)` pairs per round. Returns `false`,
+/// after logging, when a round fails.
+fn serve_extent_rounds(
+    bootstrap_ep: u64,
+    child_badge: u64,
+    ipc_buf: *mut u64,
+    extents: impl IntoIterator<Item = (u64, u64)>,
+) -> bool
+{
+    let mut extents = extents.into_iter().peekable();
+    while extents.peek().is_some()
+    {
+        let mut data = [0u64; 2 + EXTENTS_PER_ROUND * 2];
+        let mut n = 0usize;
+        for (base, size) in extents.by_ref().take(EXTENTS_PER_ROUND)
+        {
+            data[2 + n * 2] = base;
+            data[3 + n * 2] = size;
+            n += 1;
+        }
+        data[0] = kind::RAM_EXTENT;
+        data[1] = n as u64;
+        if !serve(
+            bootstrap_ep,
+            child_badge,
+            ipc_buf,
+            false,
+            &[],
+            &data[..2 + n * 2],
+            "devmgr: bootstrap RAM extent round failed",
+        )
+        {
+            return false;
+        }
+    }
+    true
+}
+
 // ── devmgr creation ──────────────────────────────────────────────────────────
 
 /// Round-kind discriminator for post-R1 bootstrap rounds (devmgr side).
@@ -295,6 +386,7 @@ mod kind
     pub const ACPI_REGION: u64 = 3;
     pub const SVCMGR_BUNDLE: u64 = 4;
     pub const FRAMEBUFFER_INFO: u64 = 5;
+    pub const RAM_EXTENT: u64 = 6;
 }
 
 /// Per-cap class tag carried in a `kind::MODULE` round's data words so
@@ -386,12 +478,15 @@ fn serve_region_rounds(
 ///   - caps: `[registry_ep, irq_range, rsdp_memory, dtb_memory]`
 ///     (zero-slots pass through where the kernel minted none)
 ///   - data: `[rsdp_page_base, dtb_page_base, dtb_size]`
-/// * Round 2+ (variable, ≤4 caps, up to 9 data words)
-///   - `data[0]` = round kind (`APERTURE` / `ACPI_REGION` / `MODULE`)
-///   - `data[1]` = count of caps in this round
+/// * Round 2+ (variable, ≤4 caps, up to `MSG_DATA_WORDS_MAX` data words)
+///   - `data[0]` = round kind (`APERTURE` / `ACPI_REGION` / `RAM_EXTENT` /
+///     `MODULE`)
+///   - `data[1]` = count of caps in this round (of `(base, size)` pairs in a
+///     cap-less `RAM_EXTENT` round)
 ///   - `data[2..]` = kind-specific payload:
 ///       - aperture / ACPI: `(base, size)` pairs per cap
-///       - module: none
+///       - RAM extent: `(base, size)` pairs, one per extent memmgr pools
+///       - module: one `module_kind` tag per cap
 ///   - terminal round has `done = true`.
 ///
 /// The bootstrap layout mirrors `devmgr/src/caps.rs::bootstrap_caps`.
@@ -563,7 +658,7 @@ pub fn create_devmgr_with_caps(
         kind::ACPI_REGION,
         acpi_region_caps(info),
         "devmgr: bootstrap ACPI region round failed",
-    )
+    ) || !serve_extent_rounds(bootstrap_ep, child_badge, ipc_buf, pooled_extents(info))
     {
         return None;
     }

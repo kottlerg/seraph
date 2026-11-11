@@ -63,6 +63,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount v
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service). Any number of names; slots past one bootstrap round's `MSG_CAP_SLOTS_MAX` (4) caps ride in further rounds; see [`seed`](#seed). |
 | `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
+| `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth`. Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
 | `sched_max` | no | Band ceiling (`1..=30`): the service's `SchedControl` covers `[1, sched_max]`. Must be ≥ `priority` when both are set. Unset: the service inherits a copy of svcmgr's own band. |
@@ -123,21 +124,23 @@ exhausted, or a restart attempt failed).
 | Value | Behaviour once permanently down |
 |---|---|
 | `no` | Logged; service marked inactive. The system continues degraded. |
-| `yes` | svcmgr logs `critical service unrecoverable: <name>; initiating graceful shutdown` and issues [`pwrmgr_labels::SHUTDOWN`](../../../shared/ipc/src/lib.rs) via the cap it resolves from [`published_names::PWRMGR_SHUTDOWN`](../../../shared/ipc/src/lib.rs). See [restart-protocol.md](restart-protocol.md). |
+| `yes` | svcmgr logs `critical service unrecoverable: <name>; initiating graceful shutdown` and issues [`pwrmgr_labels::SHUTDOWN`](../../../shared/ipc/src/lib.rs) through the [`shutdown_actuator`](#shutdown_actuator). See [restart-protocol.md](restart-protocol.md). |
 
 Because the two fields are independent, any combination is valid — e.g.
 `restart = always` + `critical = no` (the `crasher` fixture: respawned on
 every fault, but its eventual permanent death is non-fatal).
 
-**pwrmgr's own death** is the edge case. pwrmgr is `restart = on_failure`
-+ `critical = no`: a crashed pwrmgr is recoverable (svcmgr re-creates it
-and it re-acquires its actuator caps from devmgr — see
-[services/pwrmgr/README.md](../../pwrmgr/README.md)), and its *permanent*
-death is deliberately non-fatal. It is `critical = no` precisely because
-the graceful-shutdown escalation routes through `pwrmgr.shutdown` — if
-pwrmgr is the dead service, that source is gone, so escalation would be
-circular. The honest terminal state is logged-and-continue. Setting
-`critical = yes` on pwrmgr would be self-defeating for this reason.
+**The shutdown actuator's own death** is the edge case. pwrmgr, the
+actuator, is `restart = on_failure` + `critical = no`: a crashed pwrmgr is
+recoverable (svcmgr re-creates it and it re-acquires its actuator caps from
+devmgr — see [services/pwrmgr/README.md](../../pwrmgr/README.md)), and its
+*permanent* death is deliberately non-fatal. It is `critical = no` precisely
+because the graceful-shutdown escalation routes through the actuator — if
+the actuator is the dead service, nothing can power the system off, so
+escalation would be circular. The honest terminal state is
+logged-and-continue. Setting `critical = yes` on the actuator would be
+self-defeating for this reason: svcmgr logs the degraded state instead of
+shutting down (see [`shutdown_actuator`](#shutdown_actuator)).
 
 ## `namespace`
 
@@ -324,6 +327,46 @@ restart   = on_failure
 critical  = yes
 namespace = none
 log_sink  = yes
+```
+
+## `shutdown_actuator`
+
+`shutdown_actuator = <name>` declares the service the system's shutdown actuator, the one service
+that powers the platform off. `<name>` is one entry of the recipe's own [`provides`](#provides)
+list and carries `:auth`. When a `critical = yes` service is permanently down, svcmgr derives a
+SEND stamped with that entry's badge, the authority bit the actuator's gate tests, from the
+actuator's own service endpoint, and calls
+[`pwrmgr_labels::SHUTDOWN`](../../../shared/ipc/src/lib.rs), the request label the actuator
+serves, through it. It does not resolve `<name>` from the discovery registry, which keeps a
+name's first publisher: the registry's entry for `<name>` may be another service's endpoint, or,
+when the recipe also lists `<name>:deny` first, the no-authority SEND. svcmgr knows the actuator
+only by this key; its code names no service.
+
+The actuator is supervised: the parser rejects the key on a `restart = never` recipe, a name that
+is not one of the recipe's `provides` entries, an entry without `:auth`, a value of more than one
+name, and a repeated key. Only the first recipe that declares the key, in reconciliation's launch
+order, is the actuator; svcmgr logs each later one (`<service> also declares shutdown_actuator; not
+recognised`) and launches it as an ordinary service. An actuator whose entry holds no service
+endpoint (one init spawned, which svcmgr only binds) is not recorded, and svcmgr logs that
+graceful shutdown is unavailable.
+
+svcmgr calls the actuator only while it runs: its entry is active and the kernel reports its
+thread not exited. The actuator's service endpoint outlives it, so a call to a dead actuator would
+block svcmgr with no receiver to answer. An actuator whose entry is active but whose thread has
+exited has a death svcmgr has not yet routed; svcmgr routes it first, so the actuator restarts
+under its own `restart` policy or ends down, and then checks again. When no actuator is recorded,
+or the recorded one is down (its own permanent death included), svcmgr logs `graceful shutdown
+impossible` and the system continues degraded. An actuator that dies during the call still leaves
+svcmgr blocked.
+
+```
+binary            = /services/pwrmgr
+restart           = on_failure
+critical          = no
+namespace         = none
+provides          = pwrmgr.shutdown:auth pwrmgr.deny:deny
+seed              = devmgr.shutdown
+shutdown_actuator = pwrmgr.shutdown
 ```
 
 ## `debug_authority`

@@ -132,7 +132,7 @@ operation per expired entry, not a scan of every entry.
    - any other binding: never claimed and never dereferenced (invariant 2 makes it unreachable).
 
 7. **Every waiter claim removes the entry under the source lock.** A notification or event queue
-   keeps its blocked threads in a FIFO (`WaitQueue`; a wait set holds at most one), and a waiter is
+   keeps its blocked threads in a FIFO (`WaitQueue`, as a wait set does), and a waiter is
    claimed by removing it from that queue under the source lock. `notification_send`,
    `event_queue_post`, the Notification and EventQueue dealloc wakes (through `claim_waiter` and
    `interrupt_all_waiters`), and `cancel_ipc_block` (inline) call `sleep_list_remove` in the same

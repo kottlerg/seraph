@@ -1071,9 +1071,11 @@ pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
         .map_err(|_| crate::io::Error::other("seraph: VA reservation failed"))?;
     // Fund this address space's page-table growth budget for the region. The
     // pager maps frames into this AS on fault via `map_page_pooled`, which
-    // draws intermediate page tables from the AS's own retype-backed pool; the
-    // demand region is far from the eager mappings, so without funding the pool
-    // is exhausted and the on-fault map fails (the pager then kills the thread).
+    // draws intermediate page tables from the AS's own retype-backed pool. The
+    // funding is not reserved for the region, since any other mapping of the
+    // process may draw it first; the pager funds the pool itself when a fault
+    // finds it exhausted (services/memmgr/docs/memory-pool.md § Client
+    // page-table funding), so this keeps the common fault off that path.
     if !fund_aspace_pt_budget(info.self_aspace, pages) {
         unreserve_pages(range);
         return Err(crate::io::Error::other("seraph: page-table budget funding failed"));

@@ -187,6 +187,41 @@ RAM is exhausted.
 
 ---
 
+## Client page-table funding
+
+memmgr maps a demand chunk into the faulting process's address space, and the kernel takes the
+page tables that map needs from that address space's own page-table growth pool
+([docs/capability-model.md](../../../docs/capability-model.md) § Address-space and CSpace growth
+budgets). The pool is shared by every mapping in the address space, the process's own and the
+pager's. A process that funds the pool before it registers a region (ruststd's
+`fund_aspace_pt_budget`) cannot reserve that funding for the region: any later mapping may draw it
+first. So memmgr does not depend on it. When the map of a chunk fails with `OutOfMemory`, memmgr
+funds the pool itself and maps the chunk again, at most four times:
+
+1. It selects a contiguous run of four pages from the free pool, or of two when no four-page run
+   is free. A donation can keep one page for the kernel's donation bookkeeping, so it never
+   donates a single page.
+2. It records the run on the process's entry like a grant it did not map: no mapped VA and no
+   region id. No `RELEASE_MEMORY_CAPS` or `UNREGISTER_REGION` can take it back.
+3. It donates the run to the pool with augment-mode `cap_create_aspace` on the delegated
+   `AddressSpace` cap, and keeps its own cap to the run as the reclaim anchor. When the kernel
+   refuses the donation, memmgr takes the record back and returns the run to the free pool.
+
+The donated pages stay in the address space until it is destroyed, and `PROCESS_DIED` reclaims
+them with the process's other frames. The address space's teardown releases the donation, so the
+run is quiescent by then, or waits on the deferred list until it is (see
+[Reclamation](#reclamation)). The pages move from a free run to the process's entry, so
+`pool_total` is unchanged.
+
+A fault whose map still fails, because the free pool cannot fund the pool or the map fails for
+another reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md) § Kernel-origin
+fault message). A failed map can leave the first pages of the chunk mapped. memmgr unmaps the
+chunk's span before it returns the chunk to the free pool, so no page of a pooled run stays
+mapped in the process. When that unmap fails, the chunk stays recorded on the process's entry
+until `PROCESS_DIED`.
+
+---
+
 ## Metadata Arena
 
 All of memmgr's bookkeeping — free runs, deferred runs, process records, and

@@ -8,7 +8,9 @@
 //! behind.
 //!
 //! The client calls an endpoint with no receiver and a 200 ms timeout, and
-//! parks on the send queue. The controller stops it, waits past the
+//! parks on the send queue. The controller sees it queued through a wait set
+//! that holds the endpoint, whose readiness a queued call raises without
+//! being consumed, then stops it, waits past the
 //! deadline (an entry left on the sleep list would fire on a stopped thread),
 //! and restarts it. The client itself asserts `Interrupted`, as the
 //! unbounded call does in `ipc_call_interrupted_stop_start`. Afterwards a
@@ -22,7 +24,8 @@
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
     notification_send, notification_wait_timeout, raw_ipc_call_timeout, raw_ipc_recv_timeout,
-    thread_exit, thread_sleep, thread_start, thread_stop,
+    thread_exit, thread_sleep, thread_start, thread_stop, wait_set_add, wait_set_create,
+    wait_set_wait_timeout,
 };
 use syscall_abi::{RIGHTS_EP_SEND_GRANT, RIGHTS_NTF_NOTIFY, SyscallError, WAIT_TRY_ONCE};
 
@@ -35,9 +38,6 @@ const BIT_BAD: u64 = 1 << 2;
 
 /// The client's call timeout, before `crate::scaled_bound`.
 const CALL_TIMEOUT_MS: u64 = 200;
-/// Wall-clock settle after the READY signal so the client has, in practice,
-/// reached its park before the stop lands.
-const SETTLE_SLEEP_MS: u64 = 20;
 /// Sleep while the client is stopped, past its call deadline, before
 /// `crate::scaled_bound`.
 const PAST_DEADLINE_MS: u64 = 400;
@@ -69,6 +69,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_timeout_stop: create ep failed")?;
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::ipc_call_timeout_stop: create done failed")?;
+    // The probe of the client's park: the endpoint turns the set ready once a
+    // call is queued on it.
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "integration::ipc_call_timeout_stop: create wait set failed")?;
+    wait_set_add(ws, ep, 1)
+        .map_err(|_| "integration::ipc_call_timeout_stop: wait_set_add failed")?;
     let mut client = spawn::new_child(ctx)
         .map_err(|_| "integration::ipc_call_timeout_stop: spawn client failed")?;
     let c_ep = cap_copy(ep, client.cs, RIGHTS_EP_SEND_GRANT)
@@ -93,7 +99,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_timeout_stop: start client failed")?;
 
     wait_for(done, BIT_READY)?;
-    let _ = thread_sleep(SETTLE_SLEEP_MS);
+    if wait_set_wait_timeout(ws, crate::scaled_bound(REPORT_MS)) != Ok(1)
+    {
+        return Err("integration::ipc_call_timeout_stop: the client's call never queued");
+    }
     thread_stop(client.th).map_err(|_| "integration::ipc_call_timeout_stop: thread_stop failed")?;
     let _ = thread_sleep(crate::scaled_bound(PAST_DEADLINE_MS));
     thread_start(client.th)
@@ -116,6 +125,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .delete_thread()
         .and(client.delete_cspace())
         .map_err(|_| "integration::ipc_call_timeout_stop: reap client failed")?;
+    cap_delete(ws).map_err(|_| "integration::ipc_call_timeout_stop: del wait set failed")?;
     cap_delete(ep).map_err(|_| "integration::ipc_call_timeout_stop: del ep failed")?;
     cap_delete(done).map_err(|_| "integration::ipc_call_timeout_stop: del done failed")?;
     Ok(())

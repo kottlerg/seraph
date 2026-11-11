@@ -540,8 +540,10 @@ wakes the thread. Those syscalls are listed in
 (Blocking syscalls are interruptible).
 The syscall returns `Interrupted`, unless a genuine wake or the elapsed deadline of a sleep or a
 timed wait claimed it first, and the upcall is delivered at that return. A blocking syscall that
-the thread enters with an upcall pending returns `Interrupted` at once instead of blocking. The
-kernel restarts nothing; whether to retry is the program's choice. For `SYS_IPC_CALL`,
+the thread enters with an upcall pending returns `Interrupted` at once instead of blocking: the
+pending upcall refuses the park, so a try-once (`WAIT_TRY_ONCE`), which never parks, and a call
+whose result is already available return their own result. The kernel restarts nothing; whether
+to retry is the program's choice. For `SYS_IPC_CALL`,
 `Interrupted` does not mean that the request went undelivered: a server that already received the
 message finds no reply pending, so a program that retries a call may repeat its request, as after
 a stop.

@@ -2453,8 +2453,10 @@ pub fn thread_inherit_fault_handler(
 /// `Interrupted`, unless its wake (a delivery, or the elapsed deadline of a
 /// sleep or a timed wait) was claimed first, and the upcall is delivered at
 /// that return; a blocking syscall it enters with the upcall pending returns
-/// `Interrupted` at once. A fault or upcall delivery in progress is left to
-/// resolve, never cancelled for the post. See `docs/fault-handling.md`
+/// `Interrupted` at once instead of blocking, while a try-once
+/// (`WAIT_TRY_ONCE`), or a call whose result is already available, returns
+/// its own result. A fault or upcall delivery in progress is left to resolve,
+/// never cancelled for the post. See `docs/fault-handling.md`
 /// § Asynchronous Upcalls and `core/kernel/docs/syscalls.md`
 /// § Atomicity and Preemption Guarantees.
 ///

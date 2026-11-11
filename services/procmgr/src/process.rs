@@ -69,7 +69,8 @@ fn next_process_badge(tables: &Tables) -> Result<BadgeReservation<'_>, u64>
         {
             continue;
         }
-        match tables.lock().table.reserve_badge(t)
+        let reserved = tables.lock().table.reserve_badge(t);
+        match reserved
         {
             Ok(()) => return Ok(BadgeReservation { tables, badge: t }),
             Err(process_table::InsertError::BadgeInUse) => (),
@@ -1993,7 +1994,8 @@ fn finalize_creation(
     // thread. Correlator = the table badge; on death, dispatch_death recovers
     // the entry via `take_by_badge`. A pool that runs out is followed by a
     // further queue, so a failure here is procmgr's memory running out.
-    if let Err(e) = crate::lock(deaths).bind_thread(child_thread, badge)
+    let bound = crate::lock(deaths).bind_thread(child_thread, badge);
+    if let Err(e) = bound
     {
         std::os::seraph::log!("main-thread death bind failed (err={e}); spawn refused");
         return Err(procmgr_errors::OUT_OF_MEMORY);
@@ -2008,7 +2010,8 @@ fn finalize_creation(
     // thread's fault would never reap the process, so its failure refuses
     // the spawn; the caller's guards destroy the child, which returns the
     // main-thread observer's node.
-    if let Err(e) = crate::lock(deaths).bind_aspace(child_aspace, badge)
+    let bound = crate::lock(deaths).bind_aspace(child_aspace, badge);
+    if let Err(e) = bound
     {
         std::os::seraph::log!("address-space death bind failed (err={e}); spawn refused");
         return Err(procmgr_errors::OUT_OF_MEMORY);

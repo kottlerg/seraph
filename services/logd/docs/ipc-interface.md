@@ -117,14 +117,13 @@ a sender that sets no level logs at info.
 
 #### Fields
 
-The stream provides no framing for structured fields: a line is text. A
-line that reports values writes each as `key=value` text, separated from the
-next by a space, as the `reclaim:` line (§ Death-notification cascade) does;
-a reader that parses fields (an xtask harness, a log query) splits the text.
-No wire framing exists for fields because no reader needs fields apart from
-the text: the history ring stores lines, and the planned history query
-(TODO above) reads lines back. Framing would change the label set and the
-history and handover formats of both receivers for no consumer.
+The stream provides no framing for structured fields here: a line is text.
+A line that reports values writes each as `key=value` text, separated from
+the next by a space, as the `reclaim:` line (§ Death-notification cascade)
+does; a reader that parses fields (an xtask harness, a log query) splits the
+text. Text does not delimit a value from a following key, so a value that
+holds ` key=` reads as a further field. Framed fields, which give logd each
+key and value apart from the text, are tracked by #879.
 
 ### `stream_labels::STREAM_REGISTER_NAME` (11)
 

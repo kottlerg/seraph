@@ -18,18 +18,25 @@
 //! (`services/procmgr/docs/ipc-interface.md` § `REGISTER_CRASH_SERVICE`).
 //!
 //! The decliner is a thread of its own so that a receive on the endpoint
-//! never waits behind procmgr's request loop. The handover is a message on
-//! the endpoint itself: procmgr's request loop calls the endpoint with
-//! [`PARK_LABEL`], which the decliner receives only after every fault queued
-//! ahead of it, so it parks holding none. No stop is involved, and no fault
-//! is ever left with a receiver that does not run.
+//! never waits behind procmgr's request workers. The handover is a message on
+//! the endpoint itself: the worker serving the registration calls the
+//! endpoint with [`PARK_LABEL`], which the decliner receives only after every
+//! fault queued ahead of it, so it parks holding none. No stop is involved,
+//! and no fault is ever left with a receiver that does not run.
+//!
+//! A registration, its undoing, and the check that takes the endpoint back
+//! run on procmgr's request workers and on its reaper thread, so each holds
+//! [`REGISTRATION`] throughout: two registrations cannot both find no
+//! registrant, and a check cannot take back a registration whose park call
+//! is still in flight.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use ipc::IpcMessage;
 use syscall_abi::{FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL};
 
-/// The label of the handover message procmgr's request loop sends the
+/// The label of the handover message a procmgr request worker sends the
 /// decliner on the crash endpoint, un-badged. Every fault the kernel delivers
 /// carries `FAULT_LABEL` and the badge of a process's binding, never zero, and
 /// only procmgr holds a `SEND` on the endpoint, so nothing else carries it.
@@ -43,8 +50,20 @@ static ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static WAKE: AtomicU64 = AtomicU64::new(0);
 
 /// The registered crash service's Thread cap, in procmgr's `CSpace`; 0 while
-/// none is registered. Written and read only by procmgr's request loop.
+/// none is registered. Written only under [`REGISTRATION`].
 static REGISTRANT: AtomicU64 = AtomicU64::new(0);
+
+/// Held by [`register`], [`unregister`] and [`check_registrant`] for their
+/// whole run. [`register`] holds it across its park call to the decliner,
+/// a lock held across an IPC call: the decliner, procmgr's own thread,
+/// answers that call without taking any lock, so the call cannot wait on
+/// the lock's holder.
+static REGISTRATION: Mutex<()> = Mutex::new(());
+
+fn lock_registration() -> MutexGuard<'static, ()>
+{
+    REGISTRATION.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The crash endpoint, 0 when there is none.
 pub fn endpoint() -> u64
@@ -157,9 +176,9 @@ pub enum RegisterRefusal
 /// into procmgr's `CSpace` by the request): park the decliner, then return
 /// the `RECV` cap on the crash endpoint to reply with. `thread_cap` is kept
 /// to tell when the service is gone ([`check_registrant`]); on a refusal it
-/// is deleted. `ipc_buf` is the request loop's IPC buffer: the handover is a
-/// call on the endpoint, made while the request's own reply is pending, which
-/// a downstream call leaves bound.
+/// is deleted. `ipc_buf` is the serving worker's IPC buffer: the handover is
+/// a call on the endpoint, made while the request's own reply is pending,
+/// which a downstream call leaves bound.
 ///
 /// # Errors
 /// The [`RegisterRefusal`] that refuses it.
@@ -171,7 +190,8 @@ pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<u64, RegisterRefus
         delete_nonzero(thread_cap);
         return Err(RegisterRefusal::NoEndpointOrThread);
     }
-    check_registrant();
+    let _registration = lock_registration();
+    take_back_if_gone();
     if REGISTRANT.load(Ordering::Acquire) != 0
     {
         delete_nonzero(thread_cap);
@@ -185,7 +205,7 @@ pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<u64, RegisterRefus
     };
     // The decliner answers once it has declined every fault queued ahead of
     // the call, and then receives no more.
-    // SAFETY: ipc_buf is the request loop's registered IPC buffer page.
+    // SAFETY: ipc_buf is the serving worker's registered IPC buffer page.
     if unsafe { ipc::ipc_call(ep, &IpcMessage::new(PARK_LABEL), ipc_buf) }.is_err()
     {
         let _ = syscall::cap_delete(recv);
@@ -198,9 +218,18 @@ pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<u64, RegisterRefus
 
 /// Take the receive side back when the registered crash service is gone:
 /// its thread cap revoked (procmgr's teardown of the service revokes every
-/// cap derived from its main thread) or its thread exited. procmgr's loop
-/// calls it on every pass, which the service's death, or any request, wakes.
+/// cap derived from its main thread) or its thread exited. procmgr's reaper
+/// calls it on every pass, which the service's death wakes, and the worker
+/// that destroys a process calls it after the teardown.
 pub fn check_registrant()
+{
+    let _registration = lock_registration();
+    take_back_if_gone();
+}
+
+/// [`check_registrant`]'s check, under [`REGISTRATION`], which the caller
+/// holds.
+fn take_back_if_gone()
 {
     let thread = REGISTRANT.load(Ordering::Acquire);
     if thread == 0
@@ -224,6 +253,7 @@ pub fn check_registrant()
 /// back to the decliner, so no fault waits on a receiver that holds nothing.
 pub fn unregister()
 {
+    let _registration = lock_registration();
     let thread = REGISTRANT.load(Ordering::Acquire);
     if thread != 0
     {
@@ -233,6 +263,7 @@ pub fn unregister()
 
 /// Forget the registrant `thread`, delete its cap, and wake the parked
 /// decliner, which receives again, the faults queued for the service first.
+/// The caller holds [`REGISTRATION`].
 fn take_back(thread: u64)
 {
     REGISTRANT.store(0, Ordering::Release);

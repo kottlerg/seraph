@@ -233,8 +233,11 @@ fn refuse(refusal: Refusal, caps: &[u64], ipc_buf: *mut u64)
 /// un-badged cap (`req.badge == 0`: init's, or svcmgr's mint source) is
 /// accepted, and only before the reap.
 /// On the first round, binds death-EQ observers on both init threads (main +
-/// init-logd) with `INIT_REAP_CORRELATOR`.
-pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &DeathSet)
+/// init-logd) with `INIT_REAP_CORRELATOR`, taking the death-set lock inside
+/// the init-reap lock: the one order the two are held in, since the reaper
+/// handles the init deaths it drained ([`run_reap`]) after it releases the
+/// death-set lock.
+pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &Mutex<DeathSet>)
 {
     let caps = req.caps();
     let is_first = req.word(0) != 0;
@@ -267,12 +270,16 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &DeathSet)
     // correlator. Both are alive at this point (init's main is mid-handoff;
     // init-logd is still serving the log endpoint), so neither bind lands
     // on an already-exited thread. The reap waits for both.
-    if deaths
-        .bind_thread(main_thread, procmgr_labels::INIT_REAP_CORRELATOR)
-        .is_err()
-        || deaths
-            .bind_thread(logd_thread, procmgr_labels::INIT_REAP_CORRELATOR)
-            .is_err()
+    let bound = {
+        let deaths = crate::lock(deaths);
+        deaths
+            .bind_thread(main_thread, procmgr_labels::INIT_REAP_CORRELATOR)
+            .is_ok()
+            && deaths
+                .bind_thread(logd_thread, procmgr_labels::INIT_REAP_CORRELATOR)
+                .is_ok()
+    };
+    if !bound
     {
         std::os::seraph::log!("init-reap: thread_bind_notification failed; refusing handoff");
         refuse(Refusal::Invalid(CapDisposition::Keep), caps, ipc_buf);

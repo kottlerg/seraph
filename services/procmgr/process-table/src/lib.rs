@@ -15,11 +15,13 @@
 //! create requests ([`create_blobs`]), which bound client-controlled data
 //! words and blob bytes, the create-request cap-layout split
 //! ([`split_create_caps`]), the bounds procmgr applies to fs-driver
-//! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), the
-//! init-reap handoff state machine ([`InitReap`]), the size of procmgr's
-//! first death queue ([`death_queues::FIRST_POOL_OBSERVERS`]), and the
-//! registry of the threads a process registers with their crash badges
-//! ([`threads`]). None of these
+//! read replies, the `FS_READ_MEMORY` reply-cap split, and the record of a
+//! failed file read ([`fs_reads`]), the init-reap handoff state machine
+//! ([`InitReap`]), the size of procmgr's first death queue
+//! ([`death_queues::FIRST_POOL_OBSERVERS`]), the registry of the threads a
+//! process registers with their crash badges ([`threads`]), and the
+//! registered crash service with its registration's generation
+//! ([`crash_registrant`]). None of these
 //! touch a syscall, IPC, or `std::os::seraph` surface — the cap fields are
 //! slot *indices* (plain integers), never live capabilities, and the decoder
 //! reads a stack [`ipc::IpcMessage`] snapshot — so the whole crate is
@@ -34,6 +36,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod crash_registrant;
 pub mod create_blobs;
 pub mod death_queues;
 pub mod dma_holds;
@@ -72,16 +75,14 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 
 /// Per-process resource record. Fields read when teardown is implemented.
 ///
-/// All fields are non-atomic. Concurrent access is precluded by
-/// procmgr's structurally single-threaded dispatch: every mutating
-/// path (`configure_namespace`, `start_process`, `teardown_entry`,
-/// memmgr reclaim handlers) runs sequentially under the lone
-/// `service_ep` recv loop in `main.rs`. If procmgr is ever made
-/// multi-threaded — as vfsd was, for spawn-deadlock avoidance — the
-/// `started` bool (read by `configure_namespace`, read+written by
-/// `start_process`) must become `AtomicBool` with compare-and-swap
-/// transitions, and the namespace/cwd-override slots need per-entry
-/// serialisation to keep the install-once contract.
+/// All fields are non-atomic. procmgr's request workers and its reaper
+/// reach an entry only through the table, which sits behind procmgr's one
+/// table lock (`process::Tables`, services/procmgr/README.md
+/// § Concurrency): every read and every mutating path
+/// (`configure_namespace`, `start_process`, the take that precedes a
+/// teardown) holds that lock throughout, so the `started` check and its
+/// transition, and the install-once namespace and cwd-override slots, are
+/// each one step no other thread interleaves.
 pub struct ProcessEntry
 {
     /// The child's process badge: the table key, the correlator of its death
@@ -422,6 +423,9 @@ pub struct ProcessTable
     entries: Vec<ProcessEntry>,
     holds: DmaHolds,
     crash_badges: CrashBadges,
+    /// Badges of the creates in progress ([`Self::reserve_badge`]): few, one
+    /// per create a worker is serving.
+    pending: Vec<u64>,
 }
 
 impl ProcessTable
@@ -435,6 +439,7 @@ impl ProcessTable
             entries: Vec::new(),
             holds: DmaHolds::new(),
             crash_badges: CrashBadges::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -581,13 +586,46 @@ impl ProcessTable
         self.entries.is_empty()
     }
 
-    /// Whether a live entry or a held reclaim holds `badge`. Badge minting
-    /// redraws such a candidate, so [`Self::insert`] does not refuse it later
-    /// and no new child's process handle can release another's held reclaim.
+    /// Whether a live entry, a held reclaim, or a create in progress
+    /// ([`Self::reserve_badge`]) holds `badge`. Badge minting redraws such a
+    /// candidate, so [`Self::insert`] does not refuse it later, no two
+    /// concurrent creates mint one badge, and no new child's process handle
+    /// can release another's held reclaim.
     #[must_use]
     pub fn badge_in_use(&self, badge: u64) -> bool
     {
-        self.index_of_badge(badge).is_some() || self.holds.holds(badge)
+        self.index_of_badge(badge).is_some()
+            || self.holds.holds(badge)
+            || self.pending.contains(&badge)
+    }
+
+    /// Reserve `badge` for a create in progress, which builds the child
+    /// under it with no table lock held and inserts its entry later
+    /// ([`Self::insert`] ends the reservation), or ends the reservation on
+    /// failure ([`Self::release_badge`]).
+    ///
+    /// # Errors
+    /// [`InsertError::BadgeInUse`] when [`Self::badge_in_use`] holds for
+    /// `badge`; [`InsertError::OutOfMemory`] when the heap cannot hold the
+    /// reservation.
+    pub fn reserve_badge(&mut self, badge: u64) -> Result<(), InsertError>
+    {
+        if self.badge_in_use(badge)
+        {
+            return Err(InsertError::BadgeInUse);
+        }
+        self.pending
+            .try_reserve(1)
+            .map_err(|_| InsertError::OutOfMemory)?;
+        self.pending.push(badge);
+        Ok(())
+    }
+
+    /// End the reservation of `badge` a failed create made; a badge not
+    /// reserved changes nothing.
+    pub fn release_badge(&mut self, badge: u64)
+    {
+        self.pending.retain(|&b| b != badge);
     }
 
     /// Arm the live entry `badge` for a held reclaim (`CREATE_DMA_HOLD`),
@@ -617,7 +655,8 @@ impl ProcessTable
         &mut self.holds
     }
 
-    /// Insert `entry`, changing nothing on refusal.
+    /// Insert `entry`, ending the reservation of its badge
+    /// ([`Self::reserve_badge`]), and changing nothing on refusal.
     ///
     /// # Errors
     /// [`InsertError::BadgeInUse`] when a live entry already holds the badge;
@@ -632,6 +671,7 @@ impl ProcessTable
         self.entries
             .try_reserve(1)
             .map_err(|_| InsertError::OutOfMemory)?;
+        self.release_badge(entry.badge);
         self.entries.insert(idx, entry);
         Ok(())
     }
@@ -1830,6 +1870,58 @@ mod tests
             Err(InsertError::BadgeInUse)
         );
         assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn a_reserved_badge_is_in_use_and_refused_a_second_reservation()
+    {
+        let mut table = ProcessTable::new();
+        assert_eq!(table.reserve_badge(0x20), Ok(()));
+        assert!(table.badge_in_use(0x20));
+        assert_eq!(table.reserve_badge(0x20), Err(InsertError::BadgeInUse));
+        // A reservation is no live entry: nothing finds it.
+        assert!(table.find_by_badge(0x20).is_none());
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn a_badge_a_live_entry_or_a_held_reclaim_holds_is_refused_a_reservation()
+    {
+        let mut table = ProcessTable::new();
+        assert_eq!(table.insert(entry_with_badge(0x20)), Ok(()));
+        assert_eq!(table.reserve_badge(0x20), Err(InsertError::BadgeInUse));
+        assert_eq!(table.arm_dma_hold(0x20), Ok(()));
+        let mut entry = table.take_by_badge(0x20).expect("live entry");
+        entry.started = true;
+        assert!(table.holds_mut().park(&entry));
+        assert_eq!(table.reserve_badge(0x20), Err(InsertError::BadgeInUse));
+    }
+
+    #[test]
+    fn insert_ends_the_reservation_of_its_badge()
+    {
+        let mut table = ProcessTable::new();
+        assert_eq!(table.reserve_badge(0x20), Ok(()));
+        assert_eq!(table.insert(entry_with_badge(0x20)), Ok(()));
+        assert!(table.find_by_badge(0x20).is_some());
+        // Taken out again, the badge is free: no reservation outlived it.
+        assert!(table.take_by_badge(0x20).is_some());
+        assert!(!table.badge_in_use(0x20));
+    }
+
+    #[test]
+    fn a_released_reservation_frees_its_badge_and_no_other()
+    {
+        let mut table = ProcessTable::new();
+        assert_eq!(table.reserve_badge(0x20), Ok(()));
+        assert_eq!(table.reserve_badge(0x40), Ok(()));
+        table.release_badge(0x20);
+        assert!(!table.badge_in_use(0x20));
+        assert!(table.badge_in_use(0x40));
+        // Releasing a badge never reserved changes nothing.
+        table.release_badge(0x60);
+        assert!(table.badge_in_use(0x40));
+        assert_eq!(table.reserve_badge(0x20), Ok(()));
     }
 
     #[test]

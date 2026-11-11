@@ -32,6 +32,7 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labe
 // extracted into the `procmgr-process-table` crate.
 use process::TableExt;
 use std::os::seraph::startup_info;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Init → procmgr bootstrap plan (one round on procmgr's creator endpoint):
 ///   caps[0]: service endpoint (procmgr receives requests on this)
@@ -98,8 +99,6 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = startup.ipc_buffer.cast::<u64>();
 
-    let self_aspace = startup.self_aspace;
-
     // Bootstrap service endpoint + log endpoint from init.
     let Some(boot) = bootstrap_from_init(startup.creator_endpoint, ipc_buf)
     else
@@ -107,15 +106,10 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    let mut table = process::ProcessTable::new();
-    let mut recent = process::RecentExits::new();
-
-    // The main wait set, holding the service endpoint and the first death
-    // queue; further queues join it as pools run out, and it is replaced by a
-    // wider one as they fill it.
-    let Some(deaths) = death_set::DeathSet::new(
-        boot.service_ep,
-        WS_BADGE_SERVICE,
+    // The death queues and the wait set the reaper waits on, which holds
+    // them alone; further queues join it as pools run out, and it is
+    // replaced by a wider one as they fill it.
+    let Some(deaths) = death_set::DeathSet::new_death_only(
         WS_BADGE_DEATH,
         death_queues::DEATH_EQ_CAPACITY,
         process_table::death_queues::FIRST_POOL_OBSERVERS,
@@ -130,73 +124,111 @@ fn main() -> !
     // service is registered; before any process is created.
     crash::start();
 
-    let mut ctx = ProcmgrCtx {
-        self_aspace,
+    // Every thread of procmgr shares the context for procmgr's life, which
+    // never ends, so it is leaked rather than counted.
+    let ctx: &'static ProcmgrCtx = Box::leak(Box::new(ProcmgrCtx {
+        self_aspace: startup.self_aspace,
+        self_cspace: startup.self_cspace,
         self_endpoint: boot.service_ep,
         log_ep: boot.log_ep,
         registry_ep: boot.registry_ep,
         memmgr_ep: startup.memmgr_endpoint,
-        deaths,
+        deaths: Mutex::new(deaths),
+        tables: process::Tables::new(),
         sched_baseline: startup.sched_control_cap,
-    };
-    let service_ep = boot.service_ep;
+    }));
 
-    // One guard covers both spin shapes: a failing wait_set_wait, and a
-    // level-triggered wait set that keeps reporting ready while the recv in
-    // dispatch_ipc keeps failing. Only a successful recv counts as progress.
+    // procmgr's ProcessInfo names no procmgr endpoint, so its own spawned
+    // threads send no `REGISTER_THREAD` and start without waiting on it
+    // (runtime/ruststd/README.md § Thread registration).
+    if std::thread::Builder::new()
+        .name("procmgr-reaper".into())
+        .spawn(move || reap_loop(ctx))
+        .is_err()
+    {
+        std::os::seraph::log!("reaper thread not started; exiting");
+        syscall::thread_exit();
+    }
+
+    let pool = recv_pool::RecvPool::new(boot.service_ep, recv_diag, move |req, buf| {
+        dispatch_ipc(req, buf.as_ptr(), ctx);
+    });
+    // The main thread is the last worker, so a failed spawn leaves at least
+    // one serving.
+    if let Err(e) = pool.spawn("procmgr-recv", RECV_WORKERS - 1)
+    {
+        std::os::seraph::log!(
+            "{} of {RECV_WORKERS} request workers started: {}",
+            e.running + 1,
+            e.error
+        );
+    }
+    pool.serve_on_current()
+}
+
+/// Threads receiving on procmgr's service endpoint, the main thread among
+/// them: a concurrency setting that bounds no capacity, since callers past it
+/// queue on the endpoint. A create that waits on a slow file server, on
+/// memmgr, or on the kernel holds one worker, and the others go on serving.
+const RECV_WORKERS: usize = 4;
+
+/// The reaper: wait on the death queues, and on every wake drain them, reap
+/// each dead process, and make the checks a death calls for
+/// ([`reap_checks`]). The only thread that waits on the death-only wait set.
+fn reap_loop(ctx: &ProcmgrCtx) -> !
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null()
+    {
+        std::os::seraph::log!("reaper has no IPC buffer; exiting");
+        syscall::thread_exit();
+    }
+    // A failing wait counts toward the guard's fatal streak. A wait the
+    // replacement of the wait set cancels (`Interrupted`, or
+    // `InvalidCapability` for a wait that began after the delete) counts
+    // once, and the next pass reads the new set.
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
-    let mut headroom_warned = false;
+    let mut batch: Vec<syscall::DeathEvent> = Vec::new();
     loop
     {
-        hold_cspace_headroom(startup.self_cspace, &mut headroom_warned);
-        // Read every time: a bind that grows the death queues may have
-        // replaced the wait set.
-        let badge = match syscall::wait_set_wait(ctx.deaths.ws_cap())
+        // Read under the lock and waited on after it: a bind that grows the
+        // death queues may replace the set meanwhile.
+        let ws = lock(&ctx.deaths).ws_cap();
+        if let Err(e) = syscall::wait_set_wait(ws)
         {
-            Ok(badge) => badge,
-            Err(e) =>
-            {
-                guard.on_failure(e);
-                continue;
-            }
-        };
-
-        // Drain any pending deaths before servicing a SERVICE request.
-        // SERVICE handlers may allocate from memmgr; without this, a child
-        // can die in the same wakeup batch as the parent's spawn-causing
-        // IPC, and the SERVICE branch wins the wait_set_wait dispatch
-        // ordering — leaving the dead child's memory caps pinned in memmgr's
-        // per-process record until the next loop iteration. Under fast
-        // spawn-after-wait churn that races allocations against pool
-        // reclaim. dispatch_death is a no-op when the EQ is empty.
-        dispatch_death(&ctx.deaths, ctx.memmgr_ep, ipc_buf, &mut table, &mut recent);
-        // A crash service's death wakes this loop: take the crash endpoint's
-        // receive side back once it is gone.
-        crash::check_registrant();
-        // A debugger's death wakes it too: restore the crash bindings of the
-        // process it was attached to.
-        process::check_debuggers(&mut table);
-
-        match badge
-        {
-            WS_BADGE_SERVICE =>
-            {
-                dispatch_ipc(
-                    service_ep,
-                    ipc_buf,
-                    &mut ctx,
-                    &mut table,
-                    &mut recent,
-                    &mut guard,
-                );
-            }
-            WS_BADGE_DEATH =>
-            {
-                // Already drained above; nothing to do.
-            }
-            _ => (),
+            guard.on_failure(e);
+            continue;
         }
+        guard.on_success();
+        dispatch_death(ctx, ipc_buf, &mut batch);
+        reap_checks(ctx);
     }
+}
+
+/// The checks a death calls for, which the reaper makes on every pass, a
+/// worker before it serves each request, and a worker again after a
+/// teardown it ran itself, since a teardown's stop of a process posts no
+/// death to wake the reaper (docs/process-lifecycle.md, `EXIT_KILLED`):
+/// take the crash endpoint's receive side back from a crash
+/// service that is gone, and restore the crash bindings of every process
+/// whose debugger is gone.
+fn reap_checks(ctx: &ProcmgrCtx)
+{
+    crash::check_registrant();
+    // The guard drops at the end of the statement, so the log lines below
+    // follow the lock's release.
+    let restored = process::check_debuggers(&mut ctx.tables.lock().table);
+    for _ in 0..restored
+    {
+        std::os::seraph::log!("debugger gone; crash bindings restored");
+    }
+}
+
+/// Lock `mutex`, taking a poisoned lock as it is: procmgr is built with
+/// `panic = "abort"`, so no holder unwinds.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T>
+{
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Monotonic time since the first call, in nanoseconds, for the
@@ -209,8 +241,6 @@ pub(crate) fn now_ns() -> u64
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// `WaitSet` badge for procmgr's service endpoint.
-const WS_BADGE_SERVICE: u64 = 0;
 /// `WaitSet` badge for procmgr's death event queues, all of them.
 const WS_BADGE_DEATH: u64 = 1;
 
@@ -453,14 +483,28 @@ const CSPACE_LOW_WATER: u64 = 256;
 /// Headroom a top-up funds: about 18 slot pages.
 const CSPACE_TOPUP_SLOTS: u64 = 1024;
 
+/// Whether the last top-up failed, so a streak of failures logs once; held
+/// by the one worker topping up, and passed over by any other meanwhile.
+static HEADROOM_WARNED: Mutex<bool> = Mutex::new(false);
+
 /// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, with
 /// a page of growth budget beyond them for its body arena, so
 /// its allocations never meet an exhausted `CSpace` and its receives keep the
-/// IPC receive reserve (services/procmgr/README.md § `CSpace` headroom). A
-/// failed top-up is retried on the next loop pass; `warned` limits the log
-/// to the first failure of a streak.
-fn hold_cspace_headroom(self_cspace: u64, warned: &mut bool)
+/// IPC receive reserve (services/procmgr/README.md § `CSpace` headroom). Each
+/// request runs it before it is served; a worker that finds another topping
+/// up goes on, since the low-water mark leaves room for every worker's
+/// request. A failed top-up is retried on the next request, and the log
+/// names only the first failure of a streak.
+fn hold_cspace_headroom(self_cspace: u64)
 {
+    // The top-up (a call to memmgr) and the failure's log line (a call to
+    // logd) are IPC calls made under this lock, which no other lock nests
+    // and no thread waits on (`try_lock`).
+    let Ok(mut warned) = HEADROOM_WARNED.try_lock()
+    else
+    {
+        return;
+    };
     // The growth budget also funds the body arena (the bodies of procmgr's
     // splits), so a page of it is held beyond the slots
     // (`syscall_abi::cspace_topup_pages`).
@@ -499,29 +543,18 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     }
 }
 
-/// Service-endpoint dispatch. Called when the wait-set wakes for the
-/// service endpoint; the sender is already queued so `ipc_recv` returns
-/// without blocking.
-fn dispatch_ipc(
-    service_ep: u64,
-    ipc_buf: *mut u64,
-    ctx: &mut ProcmgrCtx,
-    table: &mut process::ProcessTable,
-    recent: &mut process::RecentExits,
-    guard: &mut ipc::recv_guard::RecvGuard,
-)
+/// Serve one request a worker received on the service endpoint, on that
+/// worker's IPC buffer `ipc_buf`. Each arm takes the table lock only for its
+/// own reads and writes of the table, and makes its IPC calls with no lock
+/// held (services/procmgr/README.md § Concurrency).
+fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let mut req = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
-    {
-        Ok(req) => req,
-        Err(e) =>
-        {
-            guard.on_failure(e);
-            return;
-        }
-    };
-    guard.on_success();
+    hold_cspace_headroom(ctx.self_cspace);
+    // A crash service or a debugger watch that is a thread other than its
+    // process's main thread posts no death when it exits, so every request
+    // makes the checks before it is served, as the reaper does on a death.
+    reap_checks(ctx);
+    let mut req = *req;
     let label = req.label;
     // A process handle carries `PROCESS_HANDLE_TAG` beside its child's
     // badge. Every label is served under the child's badge alone, but the
@@ -546,14 +579,17 @@ fn dispatch_ipc(
     {
         procmgr_labels::CREATE_PROCESS =>
         {
-            handle_create(&req, ipc_buf, ctx, table);
+            handle_create(&req, ipc_buf, ctx);
         }
 
         procmgr_labels::START_PROCESS =>
         {
             release_caps(req.caps());
-            // Badge from ipc_recv identifies which process to start.
-            let code = match process::start_process(badge, table, ctx.self_aspace)
+            // Badge from ipc_recv identifies which process to start. The
+            // start makes syscalls only, under the table lock.
+            let started =
+                process::start_process(badge, &mut ctx.tables.lock().table, ctx.self_aspace);
+            let code = match started
             {
                 Ok(()) => procmgr_errors::SUCCESS,
                 Err(code) => code,
@@ -568,11 +604,11 @@ fn dispatch_ipc(
             // exit is recorded like a reaped death's, so a `QUERY_PROCESS`
             // racing a death drain the destroy overtook still answers
             // `EXITED`.
-            if let Some(reason) = process::destroy_process(badge, ctx.memmgr_ep, ipc_buf, table)
-            {
-                recent.record(badge, reason, now_ns());
-            }
+            let _ = process::destroy_process(badge, ctx.memmgr_ep, ipc_buf, &ctx.tables, true);
             reply_empty(ipc_buf, procmgr_errors::SUCCESS);
+            // The destroyed process may have been the crash service or an
+            // attached debugger.
+            reap_checks(ctx);
         }
 
         procmgr_labels::RELEASE_HOLD =>
@@ -580,7 +616,7 @@ fn dispatch_ipc(
             release_caps(req.caps());
             // Badge from ipc_recv: the release token of the torn-down child
             // whose held reclaim the creator releases.
-            let code = match process::release_hold(badge, ctx.memmgr_ep, ipc_buf, table.holds_mut())
+            let code = match process::release_hold(badge, ctx.memmgr_ep, ipc_buf, &ctx.tables)
             {
                 Ok(()) => procmgr_errors::SUCCESS,
                 Err(process_table::ReleaseRefusal::Unauthorized) => procmgr_errors::UNAUTHORIZED,
@@ -595,7 +631,11 @@ fn dispatch_ipc(
             // Badge identifies which process to query. Reply data:
             //   word 0 = state code (see `procmgr_process_state`)
             //   word 1 = exit_reason (only meaningful for `EXITED`)
-            let (state, exit_reason) = resolve_query_state(badge, table, recent);
+            let (state, exit_reason) = {
+                let mut state = ctx.tables.lock();
+                let process::TableState { table, recent } = &mut *state;
+                resolve_query_state(badge, table, recent)
+            };
             let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
                 .word(0, state)
                 .word(1, exit_reason)
@@ -606,17 +646,20 @@ fn dispatch_ipc(
 
         procmgr_labels::CREATE_FROM_FILE =>
         {
-            handle_create_from_file(&req, ipc_buf, ctx, table);
+            handle_create_from_file(&req, ipc_buf, ctx);
         }
 
         procmgr_labels::CONFIGURE_PIPE =>
         {
-            handle_configure_pipe(&req, ipc_buf, ctx.self_aspace, table);
+            // Maps the child's ProcessInfo page and copies caps into its
+            // CSpace: syscalls, and a failed copy's log line, under the
+            // table lock (services/procmgr/README.md § Concurrency).
+            handle_configure_pipe(&req, ipc_buf, ctx.self_aspace, &mut ctx.tables.lock().table);
         }
 
         procmgr_labels::CONFIGURE_NAMESPACE =>
         {
-            handle_configure_namespace(&req, ipc_buf, table);
+            handle_configure_namespace(&req, ipc_buf, &mut ctx.tables.lock().table);
         }
 
         procmgr_labels::REGISTER_DEATH_EQ =>
@@ -627,7 +670,7 @@ fn dispatch_ipc(
         procmgr_labels::QUERY_LIVE_PROCESSES =>
         {
             release_caps(req.caps());
-            handle_query_live_processes(&req, ipc_buf, table);
+            handle_query_live_processes(&req, ipc_buf, &ctx.tables.lock().table);
         }
 
         procmgr_labels::REGISTER_INIT_TEARDOWN =>
@@ -646,7 +689,7 @@ fn dispatch_ipc(
         }
 
         // The debug-authority and thread-registry labels, and unknown opcodes.
-        _ => dispatch_debug(&req, ipc_buf, table),
+        _ => dispatch_debug(&req, ipc_buf, &ctx.tables),
     }
 }
 
@@ -720,12 +763,21 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 /// Dispatch the debug-authority labels, `REGISTER_CRASH_SERVICE`,
 /// `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `DECLARE_NO_DEBUG`,
 /// and `REGISTER_THREAD`, and answer any other opcode `UNKNOWN_OPCODE`,
-/// deleting the caps it carried.
-fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+/// deleting the caps it carried. Every label but `REGISTER_CRASH_SERVICE`,
+/// which reads no table and calls the crash decliner, is served under the
+/// table lock: each makes syscalls, its reply among them, and a failed
+/// rebind's log line (services/procmgr/README.md § Concurrency).
+fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables)
 {
-    match req.label & 0xFFFF
+    let label = req.label & 0xFFFF;
+    if label == procmgr_labels::REGISTER_CRASH_SERVICE
     {
-        procmgr_labels::REGISTER_CRASH_SERVICE => handle_register_crash_service(req, ipc_buf),
+        handle_register_crash_service(req, ipc_buf);
+        return;
+    }
+    let table = &mut tables.lock().table;
+    match label
+    {
         procmgr_labels::ATTACH_PROCESS =>
         {
             let (watch, extra) = req
@@ -755,6 +807,7 @@ fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::Proc
             release_caps(req.caps());
             handle_declare_no_debug(req.badge, ipc_buf, table);
         }
+        // `REGISTER_CRASH_SERVICE` is served above.
         _ =>
         {
             release_caps(req.caps());
@@ -813,18 +866,18 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
     release_caps(extra);
     match crash::register(thread, ipc_buf)
     {
-        Ok(recv) =>
+        Ok(registered) =>
         {
             let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
-                .cap(recv)
+                .cap(registered.recv)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer page.
             if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
             {
                 // The caller holds no RECV cap, so the registration is
                 // undone and the decliner receives again.
-                let _ = syscall::cap_delete(recv);
-                crash::unregister();
+                let _ = syscall::cap_delete(registered.recv);
+                crash::unregister(&registered);
                 std::os::seraph::log!("crash service reply undeliverable; registration undone");
                 return;
             }
@@ -1158,9 +1211,17 @@ fn resolve_query_state(
     }
 }
 
-/// Death-queue dispatch. Drains all pending death events on every death
-/// queue, reaps each by correlator (the process badge), and records the exit
-/// reason in the recent-exits ring for `QUERY_PROCESS`.
+/// Death-queue dispatch, on the reaper. Drains all pending death events on
+/// every death queue, reaps each by correlator (the process badge), and
+/// records the exit reason in the recent-exits ring for `QUERY_PROCESS`.
+///
+/// The drain moves the events into `batch` under the death-set lock, and
+/// they are handled after it is released: a reap makes IPC calls to memmgr,
+/// and the init reap takes the init-reap lock, which `REGISTER_INIT_TEARDOWN`
+/// holds while it binds on the death set, so no handling runs under the
+/// death-set lock. `batch` keeps its room from pass to pass. An event the
+/// heap has no room for is dropped as a full queue drops a post, and the
+/// pass resyncs.
 ///
 /// A drain that takes [`death_queues::DEATH_EQ_CAPACITY`] events or more
 /// from one queue may have followed a full queue, and the kernel drops a post
@@ -1168,15 +1229,23 @@ fn resolve_query_state(
 /// behind it, which this drain or the next one receives, so the drain that
 /// crosses the capacity ends after the drop; [`resync_deaths`] then finds the
 /// process whose post was lost.
-fn dispatch_death(
-    deaths: &death_set::DeathSet,
-    memmgr_ep: u64,
-    ipc_buf: *mut u64,
-    table: &mut process::ProcessTable,
-    recent: &mut process::RecentExits,
-)
+fn dispatch_death(ctx: &ProcmgrCtx, ipc_buf: *mut u64, batch: &mut Vec<syscall::DeathEvent>)
 {
-    let full = deaths.drain(|death| {
+    let memmgr_ep = ctx.memmgr_ep;
+    batch.clear();
+    let mut dropped = false;
+    let full = lock(&ctx.deaths).drain(|death| {
+        if batch.try_reserve(1).is_ok()
+        {
+            batch.push(death);
+        }
+        else
+        {
+            dropped = true;
+        }
+    });
+    for death in batch.iter()
+    {
         if death.correlator == procmgr_labels::INIT_REAP_CORRELATOR
         {
             // An init thread exited. `run_reap` counts down the two init
@@ -1186,24 +1255,20 @@ fn dispatch_death(
             // and releases the caps init still holds
             // (`docs/process-lifecycle.md` § Init reap).
             init_reap::run_reap(memmgr_ep, ipc_buf);
-            return;
+            continue;
         }
-        if let Some(entry) = table.take_by_badge(death.correlator)
-        {
-            recent.record(entry.badge(), death.exit_reason, now_ns());
-            process::teardown_entry(
-                entry,
-                death.exit_reason,
-                memmgr_ep,
-                ipc_buf,
-                table.holds_mut(),
-            );
-        }
-    });
-    if full
+        process::reap_dead(
+            death.correlator,
+            death.exit_reason,
+            memmgr_ep,
+            ipc_buf,
+            &ctx.tables,
+        );
+    }
+    if full || dropped
     {
         std::os::seraph::log!("a death queue drained full; resyncing the process table");
-        resync_deaths(memmgr_ep, ipc_buf, table, recent);
+        resync_deaths(memmgr_ep, ipc_buf, &ctx.tables);
     }
 }
 
@@ -1220,16 +1285,12 @@ fn dispatch_death(
 /// An init death the full queue dropped is not recovered here; init's reap
 /// then waits, the benign hold of a handover that never completes
 /// (`services/procmgr/README.md` § Init reap).
-fn resync_deaths(
-    memmgr_ep: u64,
-    ipc_buf: *mut u64,
-    table: &mut process::ProcessTable,
-    recent: &mut process::RecentExits,
-)
+fn resync_deaths(memmgr_ep: u64, ipc_buf: *mut u64, tables: &process::Tables)
 {
     let mut dead: Vec<(u64, u64)> = Vec::new();
     let mut short = false;
-    table.for_each(|entry| {
+    // The scan reads kernel state only, under the table lock.
+    tables.lock().table.for_each(|entry| {
         let main_thread =
             syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
         let terminal_fault = syscall::cap_info(
@@ -1261,11 +1322,7 @@ fn resync_deaths(
     }
     for (badge, exit_reason) in dead
     {
-        if let Some(entry) = table.take_by_badge(badge)
-        {
-            recent.record(badge, exit_reason, now_ns());
-            process::teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf, table.holds_mut());
-        }
+        process::reap_dead(badge, exit_reason, memmgr_ep, ipc_buf, tables);
     }
 }
 
@@ -1469,13 +1526,10 @@ enum HoldRefusal
 /// # Errors
 /// The [`HoldRefusal`] naming why no hold is armed; the caller refuses the
 /// create ([`refuse_unarmed_create`]).
-fn arm_held_reclaim(
-    result: &process::CreateResult,
-    ctx: &ProcmgrCtx,
-    table: &mut process::ProcessTable,
-) -> Result<u64, HoldRefusal>
+fn arm_held_reclaim(result: &process::CreateResult, ctx: &ProcmgrCtx) -> Result<u64, HoldRefusal>
 {
-    table.arm_dma_hold(result.badge).map_err(|e| match e
+    let armed = ctx.tables.lock().table.arm_dma_hold(result.badge);
+    armed.map_err(|e| match e
     {
         process_table::ArmError::OutOfMemory => HoldRefusal::NoRoom,
         process_table::ArmError::NotFound => HoldRefusal::NotFound,
@@ -1497,7 +1551,6 @@ fn refuse_unarmed_create(
     why: HoldRefusal,
     ipc_buf: *mut u64,
     ctx: &ProcmgrCtx,
-    table: &mut process::ProcessTable,
 )
 {
     match why
@@ -1517,7 +1570,7 @@ fn refuse_unarmed_create(
     }
     let _ = syscall::cap_delete(result.thread_for_caller);
     let _ = syscall::cap_delete(result.process_handle);
-    let _ = process::destroy_process(result.badge, ctx.memmgr_ep, ipc_buf, table);
+    let _ = process::destroy_process(result.badge, ctx.memmgr_ep, ipc_buf, &ctx.tables, false);
     reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
 }
 
@@ -1529,7 +1582,6 @@ fn arm_and_reply_create(
     result: &process::CreateResult,
     ipc_buf: *mut u64,
     ctx: &ProcmgrCtx,
-    table: &mut process::ProcessTable,
 )
 {
     let release_token = if label & procmgr_labels::CREATE_DMA_HOLD == 0
@@ -1538,17 +1590,17 @@ fn arm_and_reply_create(
     }
     else
     {
-        match arm_held_reclaim(result, ctx, table)
+        match arm_held_reclaim(result, ctx)
         {
             Ok(token) => Some(token),
             Err(why) =>
             {
-                refuse_unarmed_create(result, why, ipc_buf, ctx, table);
+                refuse_unarmed_create(result, why, ipc_buf, ctx);
                 return;
             }
         }
     };
-    reply_create_result(result, release_token, ipc_buf, ctx.memmgr_ep, table);
+    reply_create_result(result, release_token, ipc_buf, ctx.memmgr_ep, &ctx.tables);
 }
 
 /// Reply with a successful process creation result, or destroy the child
@@ -1566,7 +1618,7 @@ fn reply_create_result(
     release_token: Option<u64>,
     ipc_buf: *mut u64,
     memmgr_ep: u64,
-    table: &mut process::ProcessTable,
+    tables: &process::Tables,
 )
 {
     let mut msg = IpcMessage::builder(procmgr_errors::SUCCESS)
@@ -1588,7 +1640,7 @@ fn reply_create_result(
             let _ = syscall::cap_delete(token);
         }
         // No handle to this child survives, so nothing can query its exit.
-        let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
+        let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, tables, false);
     }
 }
 
@@ -1614,12 +1666,7 @@ fn reply_create_result(
 /// IPCs (one per piped direction) on the returned badged `process_handle`
 /// between create and `START_PROCESS`; the create path itself stays
 /// stdio-agnostic.
-fn handle_create(
-    req: &IpcMessage,
-    ipc_buf: *mut u64,
-    ctx: &ProcmgrCtx,
-    table: &mut process::ProcessTable,
-)
+fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 {
     let label = req.label;
     let all_caps = req.caps();
@@ -1647,7 +1694,8 @@ fn handle_create(
     // Resolve the scheduling fields and check the argv/env before any
     // resource acquisition. The transferred caps are procmgr's to release on
     // the reject path.
-    let Some((sched, argv_env)) = check_create_request(req, 0, caps.argv_env, table)
+    let checked = check_create_request(req, 0, caps.argv_env, &ctx.tables.lock().table);
+    let Some((sched, argv_env)) = checked
     else
     {
         release_caps(&[module_cap, creator_ep, caps.argv_env]);
@@ -1709,7 +1757,7 @@ fn handle_create(
         ctx.self_aspace,
         ctx.memmgr_ep,
         ipc_buf,
-        table,
+        &ctx.tables,
         ctx.self_endpoint,
         creator_ep,
         &universals,
@@ -1754,7 +1802,7 @@ fn handle_create(
         Ok(result) =>
         {
             log_spawn_sched(sched);
-            arm_and_reply_create(label, &result, ipc_buf, ctx, table);
+            arm_and_reply_create(label, &result, ipc_buf, ctx);
         }
         // § Label 1 names `OUT_OF_MEMORY` for every creation failure past the
         // request's own checks, whatever the cause `create_process` reports.
@@ -1777,11 +1825,15 @@ fn log_spawn_sched(sched: process::ChildSched)
     );
 }
 
-/// Long-lived procmgr state used by all request handlers. All fields are
-/// fixed for the lifetime of the process.
+/// Long-lived procmgr state every request worker and the reaper share. The
+/// cap fields are fixed for the lifetime of the process; the death set and
+/// the tables are behind their locks (services/procmgr/README.md
+/// § Concurrency).
 pub struct ProcmgrCtx
 {
     pub self_aspace: u64,
+    /// procmgr's own `CSpace`, whose headroom each request tops up.
+    pub self_cspace: u64,
     pub self_endpoint: u64,
     /// Un-badged SEND cap on the log endpoint received from init
     /// during procmgr's own bootstrap. Procmgr uses it as the
@@ -1806,11 +1858,18 @@ pub struct ProcmgrCtx
     /// memory-cap allocations (memmgr auto-registers procmgr's badge at
     /// bootstrap so `REQUEST_MEMORY_CAPS` on this cap is allowed).
     pub memmgr_ep: u64,
-    /// The death-notification event queues and the main wait set they share
-    /// with the service endpoint (`WS_BADGE_SERVICE`, every queue under
-    /// `WS_BADGE_DEATH`). Every spawned child binds its main thread and its
-    /// address space on the queues with `correlator = entry.badge`.
-    pub deaths: death_set::DeathSet,
+    /// The death-notification event queues and the wait set that holds
+    /// them alone (every queue under `WS_BADGE_DEATH`), which the reaper
+    /// waits on. Every spawned child binds its main thread and its address
+    /// space on the queues with `correlator = entry.badge`. A bind that grows
+    /// the set funds the new queue or wait set from memmgr while the lock is
+    /// held, an IPC call under a lock: memmgr calls no procmgr label, so the
+    /// call cannot wait on the lock's holder. The init-reap lock is the one
+    /// lock taken around this one (`init_reap::handle_register`); the table
+    /// lock is never held with it.
+    pub deaths: Mutex<death_set::DeathSet>,
+    /// The process table and the recent-exits ring.
+    pub tables: process::Tables,
     /// Procmgr's baseline `SchedControl` cap, delivered via its own
     /// `ProcessInfo.sched_control_cap` (band
     /// `[1, sched_policy::BASELINE_PRIORITY_MAX]`). The fan-out source for
@@ -1831,12 +1890,7 @@ pub struct ProcmgrCtx
 /// endpoint is deleted once the child holds its own copy, the relay is
 /// consumed by `finalize_creation` on success, and every other cap, and every
 /// cap of a rejected request, is deleted here.
-fn handle_create_from_file(
-    req: &IpcMessage,
-    ipc_buf: *mut u64,
-    ctx: &ProcmgrCtx,
-    table: &mut process::ProcessTable,
-)
+fn handle_create_from_file(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 {
     let label = req.label;
     let all_caps = req.caps();
@@ -1863,7 +1917,8 @@ fn handle_create_from_file(
     // resource acquisition. The transferred caps are procmgr's to release on
     // the reject path; the file cap is not opened yet, so the fs driver holds
     // no state for it.
-    let Some((sched, argv_env)) = check_create_request(req, 1, caps.argv_env, table)
+    let checked = check_create_request(req, 1, caps.argv_env, &ctx.tables.lock().table);
+    let Some((sched, argv_env)) = checked
     else
     {
         release_caps(&[caps.source, caps.creator, caps.argv_env, caps.relay]);
@@ -1877,7 +1932,7 @@ fn handle_create_from_file(
         ctx,
         caps.source,
         file_size,
-        table,
+        &ctx.tables,
         ipc_buf,
         caps.creator,
         argv_env.as_ref(),
@@ -1898,7 +1953,7 @@ fn handle_create_from_file(
         Ok(result) =>
         {
             log_spawn_sched(sched);
-            arm_and_reply_create(label, &result, ipc_buf, ctx, table);
+            arm_and_reply_create(label, &result, ipc_buf, ctx);
         }
         Err(code) =>
         {

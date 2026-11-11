@@ -15,9 +15,29 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use syscall_abi::{
     EXIT_KILLED, FAULT_CLASS_EXCEPTION, FAULT_CLASS_UPCALL, FAULT_CLASS_VM, PAGE_SIZE, SyscallError,
 };
+
+/// How long procmgr waits, at most, on each call it makes on a
+/// caller-supplied file cap (`FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`,
+/// `FS_RELEASE_MEMORY`, `FS_CLOSE`): 10 s. The cap's server is untrusted, so
+/// a server that never answers fails the create with `IO_ERROR` once the
+/// bound passes instead of holding the request worker for good
+/// (services/procmgr/README.md § Concurrency).
+const FILE_CAP_CALL_TIMEOUT_MS: u32 = 10_000;
+
+/// Call the server of a caller-supplied file cap, bounded by
+/// [`FILE_CAP_CALL_TIMEOUT_MS`].
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+unsafe fn file_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
+{
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe { ipc::ipc_call_timeout(cap, msg, ipc_buf, FILE_CAP_CALL_TIMEOUT_MS) }
+}
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 /// The reply's `MSG_DATA_WORDS_MAX` words less the count word fix it, and
@@ -36,33 +56,117 @@ const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 /// Single allocation point so the value threads to `populate_child_info`
 /// (writes the badged SEND derivation into `pi.log_send_cap`) AND
 /// `finalize_creation` (table key, death-EQ correlator, process-handle badge).
+/// The badge is reserved in the table from the draw
+/// (`ProcessTable::reserve_badge`), so no concurrent create draws it, until
+/// `finalize_creation` inserts its entry or the returned reservation drops.
 ///
 /// Redraws until the badge clears `LOG_BADGE_FIRST_CHILD` — keeping it out
 /// of the reserved log-badge / no-correlator range that the old monotonic
 /// counter held structurally by starting at 16 — and avoids the reserved
 /// init-reap correlator, and until no verb bit (`ipc::VERB_BIT_MASK`) is set;
 /// see [`badge_is_acceptable`]. It also redraws a badge a live process
-/// already holds, so the death correlator names one live process.
+/// already holds, or a create in progress reserved, so the death correlator
+/// names one live process.
 ///
 /// # Errors
 /// `procmgr_errors::OUT_OF_MEMORY`, the code § Label 1 and § Label 13 of
 /// `services/procmgr/docs/ipc-interface.md` give a failed badge allocation,
 /// when the entropy draw fails (a kernel-contract violation), failing the
-/// spawn rather than minting a weak badge.
-fn next_process_badge(table: &ProcessTable) -> Result<u64, u64>
+/// spawn rather than minting a weak badge, or when the heap cannot hold the
+/// reservation.
+fn next_process_badge(tables: &Tables) -> Result<BadgeReservation<'_>, u64>
 {
     loop
     {
         let t = syscall::random_u64().map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-        if badge_is_acceptable(
+        if !badge_is_acceptable(
             t,
             ipc::log_badges::LOG_BADGE_FIRST_CHILD,
             ipc::procmgr_labels::INIT_REAP_CORRELATOR,
             ipc::VERB_BIT_MASK,
-        ) && !table.badge_in_use(t)
+        )
         {
-            return Ok(t);
+            continue;
         }
+        let reserved = tables.lock().table.reserve_badge(t);
+        match reserved
+        {
+            Ok(()) => return Ok(BadgeReservation { tables, badge: t }),
+            Err(process_table::InsertError::BadgeInUse) => (),
+            Err(process_table::InsertError::OutOfMemory) =>
+            {
+                return Err(procmgr_errors::OUT_OF_MEMORY);
+            }
+        }
+    }
+}
+
+/// A badge [`next_process_badge`] reserved for a create in progress. Its
+/// drop ends the reservation, which the entry's insertion has already ended
+/// on success. It takes the table lock, so it never drops while its thread
+/// holds that lock.
+struct BadgeReservation<'a>
+{
+    tables: &'a Tables,
+    badge: u64,
+}
+
+impl BadgeReservation<'_>
+{
+    fn badge(&self) -> u64
+    {
+        self.badge
+    }
+}
+
+impl Drop for BadgeReservation<'_>
+{
+    fn drop(&mut self)
+    {
+        self.tables.lock().table.release_badge(self.badge);
+    }
+}
+
+/// procmgr's process table and recent-exits ring, behind the one lock its
+/// request workers and its reaper share (`services/procmgr/README.md`
+/// § Concurrency). Every holder of the lock makes only syscalls that do not
+/// block on another process, and an IPC call is made after the lock is
+/// released, with two departures: a growth of procmgr's heap calls memmgr,
+/// and a log line calls logd, bounded at `LOG_CALL_TIMEOUT_MS`. Neither
+/// memmgr nor logd calls procmgr, so neither call waits on the lock; the
+/// checks every worker makes before each request log after the release.
+pub struct Tables
+{
+    state: Mutex<TableState>,
+}
+
+/// What [`Tables`] guards.
+pub struct TableState
+{
+    pub table: ProcessTable,
+    pub recent: RecentExits,
+}
+
+impl Tables
+{
+    /// An empty table and ring.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            state: Mutex::new(TableState {
+                table: ProcessTable::new(),
+                recent: RecentExits::new(),
+            }),
+        }
+    }
+
+    /// Lock the table and the ring. procmgr is built with `panic = "abort"`,
+    /// so no holder unwinds and a poisoned lock is never seen; it is taken as
+    /// it is.
+    pub fn lock(&self) -> MutexGuard<'_, TableState>
+    {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -118,10 +222,10 @@ fn choose_image_bias_or_default() -> u64
 /// carries no death-observer nodes and no pool of its own bounds the
 /// processes logd hears of.
 ///
-/// Single-writer (the `REGISTER_DEATH_EQ` handler runs under
-/// procmgr's single-threaded dispatch); readers race only with the
-/// writer, and the Acquire load pairs with the Release half of the store on
-/// registration.
+/// Written once, by the compare-exchange of [`install_logd_death_eq`],
+/// whichever request worker serves the first `REGISTER_DEATH_EQ`; readers
+/// race only with that write, and the Acquire load pairs with the Release
+/// half of the exchange.
 pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Install logd's death-notification EQ cap. Called by
@@ -191,7 +295,7 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
 // uses, and its `process::split_create_caps` call sites in the create
 // handlers, resolve through this module.
 pub use process_table::{
-    ArgvEnvRefusal, CreateTailCaps, DmaHolds, ImageSpan, ProcessEntry, ProcessTable, RecentExits,
+    ArgvEnvRefusal, CreateTailCaps, ImageSpan, ProcessEntry, ProcessTable, RecentExits,
     ReleaseRefusal, badge_is_acceptable, release_token_badge, resolve_spawn_sched,
     resync_exit_reason, split_create_caps,
 };
@@ -1867,7 +1971,13 @@ fn vfs_read_exact(file_cap: u64, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) ->
     })
 }
 
-/// Derive caller-facing caps and record the process in the table.
+/// Derive caller-facing caps, wire the child's pager and crash binding, and
+/// record the process in the table.
+///
+/// The entry is inserted last, under the table lock, so a request served on
+/// another worker never finds a child whose wiring is still in progress; the
+/// pager's delegation, an IPC call to memmgr, runs with no lock held. Only
+/// the death relay's bind follows the insertion.
 ///
 /// # Errors
 /// `procmgr_errors::OUT_OF_MEMORY` when a death observer cannot be bound,
@@ -1884,9 +1994,9 @@ fn finalize_creation(
     info_caps: &ChildInfoCaps,
     entry_point: u64,
     main_tls: MainTls,
-    table: &mut ProcessTable,
+    tables: &Tables,
     self_endpoint: u64,
-    deaths: &DeathSet,
+    deaths: &Mutex<DeathSet>,
     memmgr_send_cap: u64,
     memmgr_badge: u64,
     process_badge: u64,
@@ -1907,7 +2017,8 @@ fn finalize_creation(
     // thread. Correlator = the table badge; on death, dispatch_death recovers
     // the entry via `take_by_badge`. A pool that runs out is followed by a
     // further queue, so a failure here is procmgr's memory running out.
-    if let Err(e) = deaths.bind_thread(child_thread, badge)
+    let bound = crate::lock(deaths).bind_thread(child_thread, badge);
+    if let Err(e) = bound
     {
         std::os::seraph::log!("main-thread death bind failed (err={e}); spawn refused");
         return Err(procmgr_errors::OUT_OF_MEMORY);
@@ -1922,7 +2033,8 @@ fn finalize_creation(
     // thread's fault would never reap the process, so its failure refuses
     // the spawn; the caller's guards destroy the child, which returns the
     // main-thread observer's node.
-    if let Err(e) = deaths.bind_aspace(child_aspace, badge)
+    let bound = crate::lock(deaths).bind_aspace(child_aspace, badge);
+    if let Err(e) = bound
     {
         std::os::seraph::log!("address-space death bind failed (err={e}); spawn refused");
         return Err(procmgr_errors::OUT_OF_MEMORY);
@@ -1947,36 +2059,59 @@ fn finalize_creation(
         return Err(procmgr_errors::OUT_OF_MEMORY);
     };
 
-    if table
-        .insert(ProcessEntry {
-            badge,
-            aspace_cap: child_aspace,
-            cspace_cap: child_cspace,
-            thread_cap: child_thread,
-            pi_memory_cap,
-            tls_memory_cap: main_tls.memory_cap,
-            argv_env_memory_cap: info_caps.argv_env_memory.cap(),
+    // Demand-paged wiring (best-effort): delegate the child address space to
+    // memmgr and bind the main thread's fault handler to it, then advertise
+    // the pager in `ProcessInfo`. A failure at any step degrades to "no
+    // pager" (the child keeps its memory eager) rather than failing an
+    // otherwise-complete creation; the advertisement is written last, so the
+    // page never names a pager the child does not have. Which processes are
+    // exempt from the default pager is in docs/fault-handling.md § Default
+    // System Pager.
+    if demand_paged
+        && memmgr_send_cap != 0
+        && self_memmgr_ep != 0
+        && bind_pager(
+            child_aspace,
+            child_thread,
             memmgr_send_cap,
             memmgr_badge,
-            namespace_override: 0,
-            cwd_override: 0,
-            band_max,
-            entry_point,
-            tls_base_va: main_tls.base_va,
-            stack_top_vaddr: layout.stack_top,
-            process_info_va: layout.process_info_va,
-            started: false,
-            dma_hold: false,
-            no_debug: false,
-            image,
-            threads: process_table::ThreadRegistry::new(),
-            name: info_caps.name,
-            debugger: 0,
-        })
-        .is_err()
+            self_memmgr_ep,
+            ipc_buf,
+        )
     {
-        // Heap exhausted (the badge was checked free when it was minted, and
-        // nothing ran since): drop the caps we minted for the caller; the caller's
+        advertise_pager(self_aspace, pi_memory_cap, memmgr_badge);
+    }
+    bind_crash_endpoint(child_thread, badge);
+
+    let inserted = tables.lock().table.insert(ProcessEntry {
+        badge,
+        aspace_cap: child_aspace,
+        cspace_cap: child_cspace,
+        thread_cap: child_thread,
+        pi_memory_cap,
+        tls_memory_cap: main_tls.memory_cap,
+        argv_env_memory_cap: info_caps.argv_env_memory.cap(),
+        memmgr_send_cap,
+        memmgr_badge,
+        namespace_override: 0,
+        cwd_override: 0,
+        band_max,
+        entry_point,
+        tls_base_va: main_tls.base_va,
+        stack_top_vaddr: layout.stack_top,
+        process_info_va: layout.process_info_va,
+        started: false,
+        dma_hold: false,
+        no_debug: false,
+        image,
+        threads: process_table::ThreadRegistry::new(),
+        name: info_caps.name,
+        debugger: 0,
+    });
+    if inserted.is_err()
+    {
+        // Heap exhausted (the badge was reserved when it was minted, so no
+        // other entry holds it): drop the caps we minted for the caller; the caller's
         // guards still own the child kernel objects and per-child memory caps
         // and will release them when finalize returns an error.
         let _ = syscall::cap_delete(thread_for_caller);
@@ -2004,30 +2139,6 @@ fn finalize_creation(
         }
         let _ = syscall::cap_delete(parent_relay_cap);
     }
-
-    // Demand-paged wiring (best-effort): delegate the child address space to
-    // memmgr and bind the main thread's fault handler to it, then advertise
-    // the pager in `ProcessInfo`. A failure at any step degrades to "no
-    // pager" (the child keeps its memory eager) rather than failing an
-    // otherwise-complete creation; the advertisement is written last, so the
-    // page never names a pager the child does not have. Which processes are
-    // exempt from the default pager is in docs/fault-handling.md § Default
-    // System Pager.
-    if demand_paged
-        && memmgr_send_cap != 0
-        && self_memmgr_ep != 0
-        && bind_pager(
-            child_aspace,
-            child_thread,
-            memmgr_send_cap,
-            memmgr_badge,
-            self_memmgr_ep,
-            ipc_buf,
-        )
-    {
-        advertise_pager(self_aspace, pi_memory_cap, memmgr_badge);
-    }
-    bind_crash_endpoint(child_thread, badge);
 
     Ok(CreateResult {
         process_handle,
@@ -2319,9 +2430,15 @@ pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
 
 /// Restore the crash bindings of every process whose attached debugger
 /// (`ATTACH_PROCESS` `caps[0]`) is gone: its thread exited, or its cap went
-/// with its process's teardown. procmgr's loop calls it on every pass, which
-/// a process's death, the debugger's among them, wakes.
-pub fn check_debuggers(table: &mut ProcessTable)
+/// with its process's teardown. procmgr's reaper calls it on every pass,
+/// which a process's death, the debugger's among them, wakes; a request
+/// worker calls it before it serves each request, since a watch thread other
+/// than its process's main thread posts no death when it exits; and the
+/// worker that serves a `DESTROY_PROCESS` calls it after the teardown. Each
+/// caller holds the table lock, and logs a line for each process restored,
+/// whose count this returns, once it releases the lock.
+#[must_use]
+pub fn check_debuggers(table: &mut ProcessTable) -> usize
 {
     let mut gone: Vec<u64> = Vec::new();
     table.for_each(|e| {
@@ -2330,11 +2447,11 @@ pub fn check_debuggers(table: &mut ProcessTable)
             gone.push(e.badge);
         }
     });
-    for badge in gone
+    for &badge in &gone
     {
-        std::os::seraph::log!("debugger gone; crash bindings restored");
         restore_crash_bindings(table, badge);
     }
+    gone.len()
 }
 
 /// Keep `debugger`, the main-thread cap of the debugger an `ATTACH_PROCESS`
@@ -2497,12 +2614,12 @@ fn advertise_pager(self_aspace: u64, pi_memory_cap: u64, memmgr_badge: u64)
 fn create_process_from_bytes(
     module_bytes: &[u8],
     self_aspace: u64,
-    table: &mut ProcessTable,
+    tables: &Tables,
     self_endpoint: u64,
     creator_endpoint: u64,
     universals: &UniversalCaps,
     argv_env: ChildArgvEnv,
-    deaths: &DeathSet,
+    deaths: &Mutex<DeathSet>,
     sched: ChildSched,
     ipc_buf: *mut u64,
 ) -> Result<CreateResult, u64>
@@ -2702,7 +2819,8 @@ fn create_process_from_bytes(
 
     let main_tls_memory = CapGuard::new(main_tls.memory_cap);
 
-    let process_badge = next_process_badge(table)?;
+    let reservation = next_process_badge(tables)?;
+    let process_badge = reservation.badge();
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     let info_caps = unsafe {
@@ -2746,7 +2864,7 @@ fn create_process_from_bytes(
         &info_caps,
         entry,
         main_tls,
-        table,
+        tables,
         self_endpoint,
         deaths,
         child_memmgr_send,
@@ -2788,12 +2906,12 @@ pub fn create_process(
     self_aspace: u64,
     _self_memmgr_ep: u64,
     ipc_buf: *mut u64,
-    table: &mut ProcessTable,
+    tables: &Tables,
     self_endpoint: u64,
     creator_endpoint: u64,
     universals: &UniversalCaps,
     argv_env: ChildArgvEnv,
-    deaths: &DeathSet,
+    deaths: &Mutex<DeathSet>,
     sched: ChildSched,
 ) -> Result<CreateResult, u64>
 {
@@ -2810,7 +2928,7 @@ pub fn create_process(
     let result = create_process_from_bytes(
         module_bytes,
         self_aspace,
-        table,
+        tables,
         self_endpoint,
         creator_endpoint,
         universals,
@@ -2874,7 +2992,7 @@ fn vfs_read_memory(
         .build();
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { file_call(file_cap, &msg, ipc_buf) }.ok()?;
     let bytes_valid = reply.word(0) as usize;
     let (kept, surplus) =
         process_table::fs_reads::read_memory_reply_caps(reply.label, bytes_valid, reply.caps());
@@ -2903,7 +3021,7 @@ fn vfs_read(
         .build();
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { file_call(file_cap, &msg, ipc_buf) }.ok()?;
     // FS_READ replies carry no caps; the untrusted server's are deleted.
     crate::release_caps(reply.caps());
     if reply.label != 0
@@ -2933,7 +3051,7 @@ fn vfs_open(node_cap: u64, ipc_buf: *mut u64) -> Option<OpenedFile>
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_OPEN);
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) };
+    let reply = unsafe { file_call(node_cap, &msg, ipc_buf) };
     let _ = syscall::cap_delete(node_cap);
     let reply = reply.ok()?;
     let (opened, surplus) = match *reply.caps()
@@ -2964,7 +3082,7 @@ fn vfs_close(file: OpenedFile, ipc_buf: *mut u64)
     let file_cap = file.cap;
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if let Ok(reply) = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
+    if let Ok(reply) = unsafe { file_call(file_cap, &msg, ipc_buf) }
     {
         // FS_CLOSE replies carry no caps; the untrusted server's are deleted.
         crate::release_caps(reply.caps());
@@ -3377,7 +3495,7 @@ fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
         .word(0, cookie)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if let Ok(reply) = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
+    if let Ok(reply) = unsafe { file_call(file_cap, &msg, ipc_buf) }
     {
         // FS_RELEASE_MEMORY replies carry no caps; the untrusted server's
         // are deleted.
@@ -3400,14 +3518,17 @@ fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
 /// # Errors
 /// The `CREATE_FROM_FILE` reply code § Label 13 of
 /// `services/procmgr/docs/ipc-interface.md` names for the failure:
-/// - `procmgr_errors::IO_ERROR` (10) — the `FS_OPEN` of `file_cap` failed, the
-///   ELF header could not be read, or a segment's file bytes did not all
-///   arrive;
+/// - `procmgr_errors::IO_ERROR` (10) — the `FS_OPEN` of `file_cap` failed, an
+///   `FS_READ` of the file failed (a refused or an unanswered one: the ELF
+///   header, the relocation table, the stack-size note, a segment's
+///   relocations, or the `.tdata` template and its relocations), or a
+///   segment's file bytes did not all arrive;
 /// - `procmgr_errors::INVALID_ELF` (1) — `file_size` is zero, or ELF
-///   validation or relocation failed;
+///   validation or relocation failed with every read answered;
 /// - `procmgr_errors::OUT_OF_MEMORY` (2) — a memory-cap, kernel-object, or
-///   badge allocation failed, the main thread's TLS block could not be built,
-///   or the stack or IPC-buffer pages could not be mapped;
+///   badge allocation failed, the main thread's TLS block could not be built
+///   for a cause other than a failed read, or the stack or IPC-buffer pages
+///   could not be mapped;
 /// - `procmgr_errors::MAP_FAILED` (11) — mapping failed during segment load;
 /// - `procmgr_errors::INSUFFICIENT_RIGHTS` (12) — a rights derivation failed
 ///   during segment load;
@@ -3429,11 +3550,11 @@ pub fn create_process_from_file(
     ctx: &crate::ProcmgrCtx,
     file_cap: u64,
     file_size: u64,
-    table: &mut ProcessTable,
+    tables: &Tables,
     ipc_buf: *mut u64,
     creator_endpoint: u64,
     argv_env: Option<&ArgvEnvRequest>,
-    deaths: &DeathSet,
+    deaths: &Mutex<DeathSet>,
     demand_paged: bool,
     parent_relay_cap: u64,
     sched: ChildSched,
@@ -3509,6 +3630,12 @@ pub fn create_process_from_file(
     // header page.
     let header_len =
         vfs_read_exact(file_cap.cap(), ipc_buf, 0, hdr_page).ok_or(procmgr_errors::IO_ERROR)?;
+    // Every later read goes through `reads`, which makes none once one has
+    // failed, so an unanswering server costs the create one bounded wait.
+    // The parsers it feeds report a failed read as a malformed image or as
+    // no stack note, and a failed read, an unanswered one included, fails
+    // the create with `IO_ERROR`.
+    let reads = process_table::fs_reads::ReadFailures::new();
 
     // Parse ELF headers from the header page.
     let header_data: &[u8] = &hdr_page[..header_len];
@@ -3544,9 +3671,9 @@ pub fn create_process_from_file(
     let rela = if kind == elf::ElfKind::Dyn
     {
         elf::rela_table_metadata(ehdr, header_data, file_size, |off, dst| {
-            vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)
+            reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
         })
-        .map_err(|_| procmgr_errors::INVALID_ELF)?
+        .map_err(|_| reads.code(procmgr_errors::INVALID_ELF))?
     }
     else
     {
@@ -3560,10 +3687,10 @@ pub fn create_process_from_file(
             let count = walk_relocs_streaming(
                 t,
                 machine,
-                |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+                |off, dst| reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
                 |r| in_span &= elf::reloc_target_in_span(r, span_min, span_end),
             )
-            .ok_or(procmgr_errors::INVALID_ELF)?;
+            .ok_or_else(|| reads.code(procmgr_errors::INVALID_ELF))?;
             if !in_span
             {
                 return Err(procmgr_errors::INVALID_ELF);
@@ -3583,13 +3710,18 @@ pub fn create_process_from_file(
     // section are fetched on demand via `vfs_read`; the helper hands a
     // closure that drives the same primitive used to stream `PT_LOAD`
     // pages, so no extra IPC machinery is involved.
-    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
+    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary. A
+    // failed read reads as no note, so it is checked apart.
     let stack_pages = resolve_stack_pages(elf::parse_stack_note_streaming(
         ehdr,
         file_size,
-        |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+        |off, dst| reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
     ))
-    .ok_or(procmgr_errors::INVALID_ELF)?;
+    .ok_or_else(|| reads.code(procmgr_errors::INVALID_ELF))?;
+    if reads.failed()
+    {
+        return Err(procmgr_errors::IO_ERROR);
+    }
     let layout = choose_child_layout();
 
     // The three child kernel-object caps, guarded from creation so
@@ -3644,18 +3776,24 @@ pub fn create_process_from_file(
                     streamed = stream_segment_bytes(buf, dest_offset, &seg, &load_ctx);
                     // Writable segments only, matching the kernel's init
                     // applier: a target in text/rodata goes unapplied and the
-                    // applied-count check below rejects the image.
+                    // applied-count check below rejects the image. A segment
+                    // whose bytes did not all arrive fails the spawn below,
+                    // so its walk would only add reads of the file.
                     if seg.writable
+                        && streamed.is_ok()
                         && let Some(t) = &rela
                     {
                         let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
-                        // A read failure mid-walk leaves records unapplied; the
-                        // applied-count check below then rejects the spawn.
+                        // A read failure mid-walk leaves records unapplied;
+                        // `reads` notes it, and the check after the segment
+                        // fails the spawn.
                         let _ = walk_relocs_streaming(
                             t,
                             machine,
                             |off, dst| {
-                                vfs_read_exact(load_ctx.file_cap, load_ctx.ipc_buf, off, dst)
+                                reads.read(|| {
+                                    vfs_read_exact(load_ctx.file_cap, load_ctx.ipc_buf, off, dst)
+                                })
                             },
                             |r| {
                                 applied_relocs +=
@@ -3667,8 +3805,13 @@ pub fn create_process_from_file(
             )
         }?;
         // A segment whose file bytes did not all arrive would run with a
-        // zeroed tail; the spawn fails instead.
+        // zeroed tail; the spawn fails instead. So does a failed read in the
+        // segment's relocation walk, before the next segment reads the file.
         streamed?;
+        if reads.failed()
+        {
+            return Err(procmgr_errors::IO_ERROR);
+        }
     }
     // Every pre-validated record must have landed in exactly one segment;
     // a shortfall means a target in a gap between segments or a lost read.
@@ -3719,7 +3862,9 @@ pub fn create_process_from_file(
                         let _ = walk_relocs_streaming(
                             t,
                             machine,
-                            |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+                            |off, dst| {
+                                reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
+                            },
                             |r| {
                                 let _ = elf::apply_reloc_in_span(r, bias, seg.vaddr, template);
                             },
@@ -3728,15 +3873,31 @@ pub fn create_process_from_file(
                 },
             )
         }
-        // § Label 13 answers every failure of the main thread's TLS block
-        // `OUT_OF_MEMORY`, whatever cause the helper reports.
-        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
+        // § Label 13 answers a failure of the main thread's TLS block
+        // `IO_ERROR` when a read of the file failed, and `OUT_OF_MEMORY`
+        // whatever other cause the helper reports.
+        .map_err(|e| {
+            if e == procmgr_errors::IO_ERROR
+            {
+                e
+            }
+            else
+            {
+                reads.code(procmgr_errors::OUT_OF_MEMORY)
+            }
+        })?
     }
     else
     {
         MainTls::default()
     };
     let main_tls_memory_guard = CapGuard::new(main_tls.memory_cap);
+    // A failed read in the template's relocation walk leaves `.tdata`
+    // records unapplied, which the walk does not report.
+    if reads.failed()
+    {
+        return Err(procmgr_errors::IO_ERROR);
+    }
 
     // Disarm and consume the file cap: success-path `vfs_close` issues
     // FS_CLOSE and deletes the slots. From here on `file_cap` is no longer
@@ -3754,7 +3915,8 @@ pub fn create_process_from_file(
         demand_paged,
         self_memmgr_ep: ctx.memmgr_ep,
     };
-    let process_badge = next_process_badge(table)?;
+    let reservation = next_process_badge(tables)?;
+    let process_badge = reservation.badge();
     // SAFETY: `child_objs.aspace()` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     let info_caps = unsafe {
@@ -3808,7 +3970,7 @@ pub fn create_process_from_file(
         &info_caps,
         entry,
         main_tls_for_finalize,
-        table,
+        tables,
         self_endpoint,
         deaths,
         mms.cap(),
@@ -3863,25 +4025,62 @@ pub fn create_process_from_file(
 /// the reason the kernel records for a thread its teardown stops. The death
 /// forwarded to logd carries the same reason.
 ///
+/// With `record`, the exit is recorded in the recent-exits ring under the
+/// same lock that takes the entry, so a `QUERY_PROCESS` served on another
+/// worker finds the process either live or exited, never unknown.
+///
 /// Idempotent: returns `None` if the badge is unknown (already destroyed).
 pub fn destroy_process(
     badge: u64,
     memmgr_ep: u64,
     ipc_buf: *mut u64,
-    table: &mut ProcessTable,
+    tables: &Tables,
+    record: bool,
 ) -> Option<u64>
 {
-    let entry = table.take_by_badge(badge)?;
-    let exit_reason = match syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
-    {
-        Ok(packed) if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED =>
+    let (tail, exit_reason) = {
+        let mut state = tables.lock();
+        let entry = state.table.take_by_badge(badge)?;
+        let exit_reason =
+            match syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
+            {
+                Ok(packed) if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED =>
+                {
+                    packed & 0xFFFF_FFFF
+                }
+                _ => EXIT_KILLED,
+            };
+        if record
         {
-            packed & 0xFFFF_FFFF
+            state.recent.record(badge, exit_reason, crate::now_ns());
         }
-        _ => EXIT_KILLED,
+        (
+            teardown_entry(entry, exit_reason, &mut state.table),
+            exit_reason,
+        )
     };
-    teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf, table.holds_mut());
+    tail.finish(memmgr_ep, ipc_buf);
     Some(exit_reason)
+}
+
+/// Reap the process `badge` names after its death, with `exit_reason`, as
+/// [`destroy_process`] tears down a destroyed one: take its entry, record
+/// the exit in the recent-exits ring, and tear it down, under one hold of the
+/// table lock, then tell memmgr after it. Nothing when the badge is unknown
+/// (a destroy or an earlier event already reaped it).
+pub fn reap_dead(badge: u64, exit_reason: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables)
+{
+    let tail = {
+        let mut state = tables.lock();
+        let Some(entry) = state.table.take_by_badge(badge)
+        else
+        {
+            return;
+        };
+        state.recent.record(badge, exit_reason, crate::now_ns());
+        teardown_entry(entry, exit_reason, &mut state.table)
+    };
+    tail.finish(memmgr_ep, ipc_buf);
 }
 
 /// Send memmgr the held-back `PROCESS_DIED` of the torn-down
@@ -3890,16 +4089,17 @@ pub fn destroy_process(
 ///
 /// # Errors
 /// [`ReleaseRefusal::Unauthorized`] when `sender` is not a release token, the
-/// hold staying; [`ReleaseRefusal::NotHeld`] when `holds` keeps no reclaim for
-/// the token's child.
+/// hold staying; [`ReleaseRefusal::NotHeld`] when the table keeps no reclaim
+/// for the token's child.
 pub fn release_hold(
     sender: u64,
     memmgr_ep: u64,
     ipc_buf: *mut u64,
-    holds: &mut DmaHolds,
+    tables: &Tables,
 ) -> Result<(), ReleaseRefusal>
 {
-    let held = holds.release(sender)?;
+    // The hold is taken under the table lock; memmgr is told after it.
+    let held = tables.lock().table.holds_mut().release(sender)?;
     notify_memmgr_died(memmgr_ep, held.memmgr_badge, ipc_buf);
     if held.memmgr_send_cap != 0
     {
@@ -3923,14 +4123,22 @@ fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
 }
 
-/// Shared cleanup for both the explicit-IPC reap path (`destroy_process`)
-/// and the auto-reap paths (`dispatch_death` and `resync_deaths` in
-/// `main.rs`). Revokes and deletes every kernel object procmgr held on
-/// behalf of the child, then forwards the death, with `exit_reason`, to
-/// logd ([`forward_death_to_logd`]).
+/// Shared cleanup for both the explicit-IPC reap path ([`destroy_process`])
+/// and the auto-reap path ([`reap_dead`], from `dispatch_death` and
+/// `resync_deaths` in `main.rs`). Revokes and deletes every kernel object
+/// procmgr held on behalf of the child, and returns the steps left for
+/// after the table lock ([`TeardownTail::finish`]): the memmgr reclaim and
+/// the death forward, with `exit_reason`, to logd
+/// ([`forward_death_to_logd`]).
+///
+/// The caller holds the table lock from the entry's take to the return, and
+/// the steps here are syscalls that wait on no other process. So the
+/// teardown is one step to every other thread: a `DESTROY_PROCESS` that
+/// finds no entry finds it torn down, and a `RELEASE_HOLD` after it finds
+/// its reclaim parked.
 ///
 /// The memmgr reclaim of a started child created with `CREATE_DMA_HOLD` is
-/// parked in `holds` instead of sent: a device the child drove may still be
+/// parked in the table's held reclaims instead of sent: a device the child drove may still be
 /// writing its frames, so they return to memmgr only on the creator's
 /// `RELEASE_HOLD` on the child's release token ([`release_hold`];
 /// docs/process-lifecycle.md § Process Death). Its `CSpace` goes as any
@@ -3947,10 +4155,8 @@ fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
 pub fn teardown_entry(
     mut entry: ProcessEntry,
     exit_reason: u64,
-    memmgr_ep: u64,
-    ipc_buf: *mut u64,
-    holds: &mut DmaHolds,
-)
+    table: &mut ProcessTable,
+) -> TeardownTail
 {
     // Order: threads first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables: the main thread, then
@@ -4001,19 +4207,45 @@ pub fn teardown_entry(
         let _ = syscall::cap_delete(entry.cwd_override);
     }
 
-    // Notify memmgr to reclaim every memory cap attributed to this child's
-    // memmgr badge, then drop procmgr's badged SEND copy, unless the reclaim
-    // is held for the creator's `RELEASE_HOLD`.
-    if !holds.park(&entry)
-    {
-        notify_memmgr_died(memmgr_ep, entry.memmgr_badge, ipc_buf);
-        if entry.memmgr_send_cap != 0
-        {
-            let _ = syscall::cap_delete(entry.memmgr_send_cap);
-        }
+    // memmgr reclaims every memory cap attributed to this child's memmgr
+    // badge after the lock, unless the reclaim is held for the creator's
+    // `RELEASE_HOLD`.
+    let parked = table.holds_mut().park(&entry);
+    TeardownTail {
+        badge: entry.badge,
+        exit_reason,
+        reclaim: (!parked).then_some((entry.memmgr_badge, entry.memmgr_send_cap)),
     }
+}
 
-    forward_death_to_logd(entry.badge, exit_reason);
+/// What a teardown ([`teardown_entry`]) leaves for after the table lock.
+#[must_use]
+pub struct TeardownTail
+{
+    badge: u64,
+    exit_reason: u64,
+    /// The child's memmgr badge and procmgr's badged memmgr SEND for it,
+    /// unless its reclaim was parked.
+    reclaim: Option<(u64, u64)>,
+}
+
+impl TeardownTail
+{
+    /// Notify memmgr to reclaim the child's memory, then drop procmgr's
+    /// badged SEND copy, unless the reclaim was parked; then forward the
+    /// death to logd. Called with no lock held.
+    pub fn finish(self, memmgr_ep: u64, ipc_buf: *mut u64)
+    {
+        if let Some((memmgr_badge, memmgr_send_cap)) = self.reclaim
+        {
+            notify_memmgr_died(memmgr_ep, memmgr_badge, ipc_buf);
+            if memmgr_send_cap != 0
+            {
+                let _ = syscall::cap_delete(memmgr_send_cap);
+            }
+        }
+        forward_death_to_logd(self.badge, self.exit_reason);
+    }
 }
 
 // ── Process start ───────────────────────────────────────────────────────────

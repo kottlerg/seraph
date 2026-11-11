@@ -206,8 +206,9 @@ pub fn destroy_held(child: HeldChild, ipc_buf: *mut u64)
 /// its held pages to memmgr (`RELEASE_HOLD` on its release token), and
 /// release both caps. Called only once the child's device is confirmed quiet;
 /// procmgr's teardown of the child, by this destroy or by its own reap of a
-/// dead child, precedes the release, since procmgr serves both calls in
-/// order.
+/// dead child, precedes the release: procmgr replies to the destroy only
+/// once the child is torn down and its reclaim parked, by whichever of its
+/// threads tore it down (services/procmgr/README.md § Concurrency).
 pub fn destroy_and_release(child: HeldChild, ipc_buf: *mut u64)
 {
     send_destroy(child.process_handle, ipc_buf);

@@ -4,17 +4,20 @@
 // shared/death-set/src/lib.rs
 
 //! A supervisor service's death queues and the main wait set they share
-//! with its service endpoint: the growable set every death observer the
-//! service binds lands on (procmgr's and svcmgr's).
+//! with its service endpoint, or that holds them alone: the growable set
+//! every death observer the service binds lands on (procmgr's and svcmgr's).
 //!
 //! Each bind takes one node from its queue's pool, fixed when the queue is
 //! created, so a pool that runs out is followed by a further queue funded
 //! from the service's own memory with twice the nodes (half again, down to
 //! the first pool's size, when memmgr refuses a contiguous grant that large).
 //! [`DeathSet`] owns the main wait set: the service endpoint under its
-//! service badge and every queue under its death badge. When the queues fill
-//! it, it is replaced by a wait set of twice the members, up to
-//! `WAIT_SET_MAX_MEMBERS`, and every member moves across. Where a bind goes,
+//! service badge, when the set has one ([`DeathSet::new`]; a death-only set,
+//! [`DeathSet::new_death_only`], has none), and every queue under its death
+//! badge. When the queues fill it, it is replaced by a wait set of twice the
+//! members, up to `WAIT_SET_MAX_MEMBERS`, and every member moves across. The
+//! growth policy counts one member for the service endpoint either way, so a
+//! death-only set widens one queue sooner than it must. Where a bind goes,
 //! and when either grows, is the `ruststd-death-queues` crate's
 //! [`DeathQueues`] policy, host-tested there; this crate makes the syscalls
 //! and funds the objects through `std::os::seraph`, so it is compiled only
@@ -34,9 +37,10 @@ use syscall_abi::SyscallError;
 /// memory cannot fund it.
 const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
 
-/// The death queues and the main wait set. A service's dispatch is
-/// single-threaded, and [`Self::drain`] holds no borrow while its callback
-/// runs, so the `RefCell` borrows never overlap.
+/// The death queues and the main wait set. [`Self::drain`] holds no borrow
+/// while its callback runs, so the `RefCell` borrows of one thread never
+/// overlap. The set is `Send` and not `Sync`: a service whose threads share
+/// it puts it behind a `Mutex`, as procmgr does.
 pub struct DeathSet
 {
     /// The main wait set; replaced when the queues fill it.
@@ -45,8 +49,8 @@ pub struct DeathSet
     /// memmgr when a replacement deletes the set; `None` while the set is a
     /// sub-page retype the runtime reclaims itself.
     ws_grant: Cell<Option<ObjectGrant>>,
-    service_ep: u64,
-    service_badge: u64,
+    /// The service endpoint and its badge; `None` for a death-only set.
+    service: Option<(u64, u64)>,
     death_badge: u64,
     /// Ring capacity of each death queue. The kernel drops a death post to
     /// a full queue, so [`Self::drain`] reports a queue that gave up this
@@ -71,8 +75,33 @@ impl DeathSet
         first_observers: u32,
     ) -> Option<Self>
     {
+        Self::create(
+            Some((service_ep, service_badge)),
+            death_badge,
+            entries,
+            first_observers,
+        )
+    }
+
+    /// Create a main wait set of death queues alone, with no service
+    /// endpoint, for a thread that waits on deaths only (procmgr's reaper),
+    /// and its first death queue, as [`Self::new`] does.
+    #[must_use]
+    pub fn new_death_only(death_badge: u64, entries: u32, first_observers: u32) -> Option<Self>
+    {
+        Self::create(None, death_badge, entries, first_observers)
+    }
+
+    fn create(
+        service: Option<(u64, u64)>,
+        death_badge: u64,
+        entries: u32,
+        first_observers: u32,
+    ) -> Option<Self>
+    {
         let (ws_cap, ws_grant) = create_wait_set(FIRST_WAIT_SET_MEMBERS).ok()?;
-        if syscall::wait_set_add(ws_cap, service_ep, service_badge).is_err()
+        if let Some((service_ep, service_badge)) = service
+            && syscall::wait_set_add(ws_cap, service_ep, service_badge).is_err()
         {
             delete_object(ws_cap, ws_grant);
             return None;
@@ -80,8 +109,7 @@ impl DeathSet
         let set = Self {
             ws_cap: Cell::new(ws_cap),
             ws_grant: Cell::new(ws_grant),
-            service_ep,
-            service_badge,
+            service,
             death_badge,
             entries,
             queues: RefCell::new(DeathQueues::new(first_observers, FIRST_WAIT_SET_MEMBERS)),
@@ -97,7 +125,7 @@ impl DeathSet
     }
 
     /// The main wait set to wait on. It changes when the queues outgrow it,
-    /// so the main loop reads it before every wait.
+    /// so the waiting loop reads it before every wait.
     #[must_use]
     pub fn ws_cap(&self) -> u64
     {
@@ -157,7 +185,7 @@ impl DeathSet
     }
 
     /// Replace the main wait set with one of `members` members and move the
-    /// service endpoint and every queue in `queues` across. On any failure
+    /// service endpoint, if any, and every queue in `queues` across. On any failure
     /// every member is back in the old set and the new one is deleted.
     fn replace_wait_set(&self, queues: &[u64], members: u32) -> Result<(), i64>
     {
@@ -169,7 +197,9 @@ impl DeathSet
             .try_reserve_exact(queues.len() + 1)
             .map_err(|_| OUT_OF_MEMORY)?;
         let (new, new_grant) = create_wait_set(members)?;
-        let sources = core::iter::once((self.service_ep, self.service_badge))
+        let sources = self
+            .service
+            .into_iter()
             .chain(queues.iter().map(|&q| (q, self.death_badge)));
         for (source, badge) in sources
         {

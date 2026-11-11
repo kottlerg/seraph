@@ -386,9 +386,10 @@ The follow-up Issue of a scope is the one open Issue whose title is
 `<scope>: defects found by review`, where `<scope>` is a commit-title scope (§ Commit Messages),
 the narrowest that covers the file. It holds defects only (§ Findings), each found off the
 surface of the PR whose review found it, and every PR's such defects in that scope append to it,
-so it is also called the rolling Issue. It is filed only when the scope has none open, with the current
-milestone (§ Milestones) and the labels § Labels requires. Filing it needs no approval of its
-own: the maintainer's standing approval covers the rolling Issue of a scope that has none.
+so it is also called the rolling Issue. It is filed only when the scope has none open, with the
+current milestone (§ Milestones) and the labels § Labels requires. Filing it needs no approval
+of its own: the maintainer's standing approval covers the rolling Issue of a scope that has
+none.
 
 An open Issue whose title begins `<scope>: defects found by PR #N's review`, filed before the
 rolling Issues, is a follow-up Issue under every rule of this section; a finding recorded in its
@@ -600,8 +601,9 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    to the lowest-versioned open milestone above `v<X>.<Y>.<Z>`, so that a fix the tag lacks is
    recorded against the release that ships it. Every other Issue in `v<X>.<Y>.<Z>` or a lower
    open milestone moves to `v<X>.<Y>.<Z>` when it is closed and no commit outside the tag closed
-   it, and otherwise to the lowest-versioned open milestone above `v<X>.<Y>.<Z>`. `v<X>.<Y>.<Z>` and every lower open milestone are then closed; the
-   lowest-versioned open milestone is current (§ Milestones).
+   it, and otherwise to the lowest-versioned open milestone above `v<X>.<Y>.<Z>`.
+   `v<X>.<Y>.<Z>` and every lower open milestone are then closed; the lowest-versioned open
+   milestone is current (§ Milestones).
 
 ---
 

@@ -1037,8 +1037,9 @@ With `--release` it prints the release review's ledger as JSON on stdout: the en
 pull request a first-parent merge `Merge pull request #N` of `<previous tag>..HEAD` names, and
 those of the release's own records in `target/xtask/review/release-v<X.Y.Z>/`, sorted and
 without duplicates, limited to the files `--file` names when it is given. A release record's
-finding the workflow marked `contested`, because its refuters split, enters only once the
-maintainer's decision is saved on it as `ruling`. Only run records are read
+finding the workflow left undecided (one in its `undecided` list, or a `contested` one, whose
+refuters split, in its `findings`) enters only once the maintainer's decision is saved on
+it as `ruling`. Only run records are read
 (`<mode>-<head>[-<n>].json`); a pull request without records adds nothing. The count goes to
 stderr, so stdout holds the JSON alone.
 

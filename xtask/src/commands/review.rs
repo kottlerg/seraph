@@ -656,15 +656,39 @@ pub fn ledger(records: &[Record]) -> Value
 }
 
 /// The ledger part of a release review's own runs. The workflow marks a
-/// finding `contested` when its two refuters split, which settles nothing:
-/// such a finding enters the ledger only once the maintainer's decision is
-/// saved on it as `ruling`.
+/// finding `contested` when its two refuters split, which settles nothing,
+/// and lists it with the unverified ones under `undecided`: such a finding
+/// enters the ledger only once the maintainer's decision is saved on it as
+/// `ruling`.
 fn release_ledger(records: &[Record]) -> Vec<Value>
 {
-    ledger_of(records, |f| {
+    let ruled = |f: &Value| {
         f.get("ruling")
             .is_some_and(|r| r.as_str().is_some_and(|s| !s.trim().is_empty()))
-    })
+    };
+    let decided: Vec<Record> = records
+        .iter()
+        .map(|(name, record)| {
+            let mut record = record.clone();
+            let undecided: Vec<Value> = record["undecided"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|f| ruled(f))
+                .cloned()
+                .collect();
+            if let Some(recorded) = record["recorded"].as_array_mut()
+            {
+                recorded.extend(undecided);
+            }
+            else if !undecided.is_empty()
+            {
+                record["recorded"] = Value::Array(undecided);
+            }
+            (name.clone(), record)
+        })
+        .collect();
+    ledger_of(&decided, ruled)
 }
 
 /// The pull requests whose merges `git log --first-parent --format=%s`
@@ -1433,8 +1457,19 @@ mod tests
         // In a pull request's ledger the author's dispute is the contest.
         assert_eq!(ledger(&records).as_array().map(Vec::len), Some(2));
         split["ruling"] = json!("  ");
-        let blank = defect_record("BLOCKING ISSUES", vec![split]);
+        let blank = defect_record("BLOCKING ISSUES", vec![split.clone()]);
         assert!(release_ledger(&[("full-0a82b0aa.json".to_owned(), blank)]).is_empty());
+        // The workflow lists a split finding under `undecided`.
+        let mut ruled_undecided = split.clone();
+        ruled_undecided["claim"] = json!("ruled undecided");
+        ruled_undecided["ruling"] = json!("fixed in the release fix PR");
+        let mut r = defect_record("BLOCKING ISSUES", vec![]);
+        r["undecided"] = json!([split, ruled_undecided]);
+        let claims: Vec<Value> = release_ledger(&[("full-0a82b0aa.json".to_owned(), r)])
+            .iter()
+            .map(|e| e["claim"].clone())
+            .collect();
+        assert_eq!(claims, [json!("ruled undecided")]);
     }
 
     #[test]

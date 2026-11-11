@@ -104,6 +104,8 @@ const TIMEOUT: Duration = Duration::from_mins(3);
 pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
+    // Held until the command returns, after its last QEMU has exited.
+    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
 
     let (firmware_code, firmware_vars) = match args.arch
     {

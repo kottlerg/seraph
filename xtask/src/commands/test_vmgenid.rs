@@ -274,6 +274,8 @@ impl Guest
 pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, Arch::X86_64)?;
+    // Held until the command returns, after its last QEMU has exited.
+    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let qemu_binary = require_tool(Arch::X86_64.qemu_binary())?;
 
     let work_dir = ctx.target_dir.join("xtask");

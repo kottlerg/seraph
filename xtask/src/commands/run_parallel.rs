@@ -136,6 +136,10 @@ struct FirmwareSet
 pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 {
     validate_args(args)?;
+    // Held until the command returns, after the last wave's QEMUs have
+    // exited; a wave runs `--parallel` QEMUs side by side.
+    let _host =
+        crate::host_lock::admit_boot(ctx, &args.host, args.cpus, args.parallel.min(args.runs))?;
     let (Some(target), Some(port)) = (&args.debug_target, args.debug_port)
     else
     {

@@ -16,9 +16,15 @@
 //! - **`EventQueue`**: has at least one entry.
 //!
 //! # Ready ring
-//! `ready_ring` is a circular buffer of member indices. Notifications push to
-//! it; `waitset_wait` pops from it. An entry is a hint: one whose member was
-//! removed, or whose source is no longer ready when it is popped, is skipped.
+//! `ready_ring` is a circular buffer of member indices, at most one per
+//! member. Every arrival of work on a member queues it there unless it is
+//! already queued, whether or not the arrival also wakes a waiting thread;
+//! `waitset_wait` pops from it, and queues a member it returns again behind
+//! the others, so every ready member is queued and ready members are returned
+//! in turn. An entry is a hint: one whose source is no longer ready when it
+//! is popped is skipped and dropped. The states and invariants are those of
+//! core/kernel/docs/ipc-internals.md § Wait Set Readiness Model, which the
+//! host tests below check on generated sequences.
 //!
 //! # One wait set per source
 //! A source can be in at most one wait set at a time. `sys_wait_set_add`
@@ -135,6 +141,11 @@ pub struct WaitSetMember
     /// Kind of source, determines how `source_ptr` is interpreted.
     /// Meaningful only when `source_ptr` is non-null.
     pub source_tag: WaitSetSourceTag,
+    /// Whether the ready ring holds an entry for this member. A member has at
+    /// most one entry, so the ring, which holds `capacity` entries, never
+    /// fills; see [`WaitSetState::push_ready`]. Sits in the padding after
+    /// `source_tag`, so the member stays 24 B.
+    pub queued: bool,
     /// Caller-chosen opaque badge returned by `sys_wait_set_wait`.
     pub badge: u64,
 }
@@ -148,6 +159,7 @@ impl WaitSetMember
         Self {
             source_ptr: core::ptr::null_mut(),
             source_tag: WaitSetSourceTag::Endpoint,
+            queued: false,
             badge: 0,
         }
     }
@@ -192,8 +204,8 @@ pub struct WaitSetState
     members: *mut WaitSetMember,
     /// Inline circular buffer of `capacity + 1` pending member indices; one
     /// slot stays empty to tell full from empty, so it holds up to `capacity`
-    /// entries. Stale entries (a removed member, or a source no longer ready)
-    /// are skipped during pop.
+    /// entries. Each names a distinct occupied member (`WaitSetMember::queued`).
+    /// An entry whose source is no longer ready is skipped during pop.
     /// Fixed at construction.
     ready_ring: *mut u16,
     /// Member capacity, chosen by the creator. Fixed at construction.
@@ -204,9 +216,9 @@ pub struct WaitSetState
     ready_head: u16,
     /// Write pointer into the ready ring (next index to push).
     ready_tail: u16,
-    /// The thread blocked on `sys_wait_set_wait`, if any. At most one: a wait
-    /// while another thread waits is refused (`WaitSetPending::Occupied`).
-    /// Held as a [`WaitQueue`](crate::ipc::WaitQueue) so its claims share the
+    /// The threads blocked in `sys_wait_set_wait`, in arrival order. Any
+    /// number may wait; each readiness notification wakes the head. A
+    /// [`WaitQueue`](crate::ipc::WaitQueue), so its claims share the
     /// notification and event-queue code.
     pub waiters: crate::ipc::WaitQueue,
 }
@@ -293,27 +305,47 @@ impl WaitSetState
         self.ready_head != self.ready_tail
     }
 
-    /// Push `member_idx` onto the ready ring.
+    /// Queue `member_idx` on the ready ring, unless it already has an entry
+    /// or its slot is vacant.
     ///
-    /// A push to a full ring (`capacity` pending entries) is dropped; the lost
-    /// edge is recovered by `waitset_wait`'s level-readiness walk, per
+    /// A member holds at most one entry, so a member that stays busy cannot
+    /// fill the ring past the other members' entries, and the ring, which
+    /// holds `capacity` entries, never fills: the full check below cannot
+    /// fire while every entry names a distinct occupied member, which
+    /// [`Self::vacate_member`] keeps. A member a wait returns keeps its entry
+    /// ([`Self::pop_ready`] queues it again), per
     /// core/kernel/docs/ipc-internals.md § Multiple Ready Sources.
     #[inline]
     fn push_ready(&mut self, member_idx: u16)
     {
+        let m = &self.members()[usize::from(member_idx)];
+        if m.queued || !m.is_occupied()
+        {
+            return;
+        }
         let next = (self.ready_tail + 1) % self.ring_len();
+        debug_assert!(next != self.ready_head, "wait set ready ring full");
         if next != self.ready_head
         {
             // SAFETY: ready_tail < ring_len; the ring has ring_len slots.
             unsafe { *self.ready_ring.add(usize::from(self.ready_tail)) = member_idx };
             self.ready_tail = next;
+            self.members_mut()[usize::from(member_idx)].queued = true;
         }
     }
 
-    /// Pop from the ready ring, skipping stale entries: those of a removed
-    /// member, and those of a member whose source `ready` reports no longer
-    /// ready (an endpoint whose queued sender was stopped or destroyed after
-    /// its call pushed the entry, or a notification a direct waiter drained).
+    /// Pop from the ready ring, skipping stale entries: those of a member whose
+    /// source `ready` reports no longer ready (an endpoint whose queued sender
+    /// was stopped or destroyed after its call pushed the entry, or a
+    /// notification a direct waiter drained), and any that names a vacant
+    /// slot. A skipped member's `queued` flag is cleared, so its next arrival
+    /// queues it again.
+    ///
+    /// The member returned is queued again at the tail, behind every other
+    /// queued member, so a member with work left after this return is served
+    /// again in turn, after the others, and a member whose arrivals keep
+    /// landing cannot hold the ring's head while another member's backlog
+    /// waits. If the caller drains it, its entry is skipped at its next pop.
     ///
     /// Returns `Some(badge)` for the first entry whose member is present and
     /// ready, `None` if the ring is empty or every remaining entry is stale.
@@ -322,15 +354,127 @@ impl WaitSetState
         while self.has_ready()
         {
             // SAFETY: ready_head < ring_len; the ring has ring_len slots.
-            let idx = usize::from(unsafe { *self.ready_ring.add(usize::from(self.ready_head)) });
+            let entry = unsafe { *self.ready_ring.add(usize::from(self.ready_head)) };
             self.ready_head = (self.ready_head + 1) % self.ring_len();
-            let m = &self.members()[idx];
+            let m = &mut self.members_mut()[usize::from(entry)];
             if m.is_occupied() && ready(m)
             {
-                return Some(m.badge);
+                let badge = m.badge;
+                // The pop above freed a slot, so the re-queue always fits; the
+                // member keeps its one entry and its `queued` flag.
+                // SAFETY: ready_tail < ring_len; the ring has ring_len slots.
+                unsafe { *self.ready_ring.add(usize::from(self.ready_tail)) = entry };
+                self.ready_tail = (self.ready_tail + 1) % self.ring_len();
+                return Some(badge);
             }
+            m.queued = false;
         }
         None
+    }
+
+    /// Vacate member `idx` and drop its ready-ring entry, if it has one, so a
+    /// member added later at the same index starts with no entry and every
+    /// entry names a distinct occupied member.
+    fn vacate_member(&mut self, idx: usize)
+    {
+        if self.members()[idx].queued
+        {
+            let len = self.ring_len();
+            let (mut read, mut write) = (self.ready_head, self.ready_head);
+            while read != self.ready_tail
+            {
+                // SAFETY: read and write are < ring_len; the ring has ring_len
+                // slots.
+                unsafe {
+                    let entry = *self.ready_ring.add(usize::from(read));
+                    if usize::from(entry) != idx
+                    {
+                        *self.ready_ring.add(usize::from(write)) = entry;
+                        write = (write + 1) % len;
+                    }
+                }
+                read = (read + 1) % len;
+            }
+            self.ready_tail = write;
+        }
+        self.members_mut()[idx] = WaitSetMember::vacant();
+    }
+
+    // ── Readiness model ───────────────────────────────────────────────────
+    //
+    // The transitions of core/kernel/docs/ipc-internals.md § Wait Set
+    // Readiness Model, as pure functions over the members and the ring, under
+    // `lock`. The kernel entry points below add only the lock and the waiter
+    // queue; the host tests drive these directly.
+
+    /// Arrival of work on member `member_idx` (its source raised its level
+    /// just before): queue the member unless it is already queued, and, if
+    /// `threads_parked`, return the badge to wake the longest-waiting thread
+    /// with.
+    fn on_arrival(&mut self, member_idx: u16, threads_parked: bool) -> Option<u64>
+    {
+        self.push_ready(member_idx);
+        let m = &self.members()[usize::from(member_idx)];
+        threads_parked.then_some(if m.is_occupied() { m.badge } else { 0 })
+    }
+
+    /// Install `member` in the first vacant slot. If `ready` reports its
+    /// source ready, queue it, and, if `threads_parked`, also return the badge
+    /// to wake the longest-waiting thread with. Returns the slot index and that
+    /// wake, or `None` when every slot is occupied.
+    fn install(
+        &mut self,
+        member: &WaitSetMember,
+        ready: impl Fn(&WaitSetMember) -> bool,
+        threads_parked: bool,
+    ) -> Option<(u16, Option<u64>)>
+    {
+        let idx = self.members().iter().position(|m| !m.is_occupied())?;
+        self.members_mut()[idx] = WaitSetMember {
+            source_ptr: member.source_ptr,
+            source_tag: member.source_tag,
+            queued: false,
+            badge: member.badge,
+        };
+        self.member_count += 1;
+        // cast_possible_truncation: idx < capacity, a u16.
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = idx as u16;
+        let m = &self.members()[usize::from(idx)];
+        let (badge, is_ready) = (m.badge, ready(m));
+        if !is_ready
+        {
+            return Some((idx, None));
+        }
+        self.push_ready(idx);
+        Some((idx, threads_parked.then_some(badge)))
+    }
+
+    /// Remove the member at `idx` and its ring entry.
+    fn remove_member(&mut self, idx: usize)
+    {
+        self.vacate_member(idx);
+        self.member_count -= 1;
+    }
+
+    /// The badge a wait returns without parking, or `None` when no member is
+    /// ready and the caller parks: the next ready entry of the ring
+    /// ([`Self::pop_ready`]), else the first ready member the backstop walk
+    /// finds, which it queues behind the others.
+    fn next_ready(&mut self, ready: impl Fn(&WaitSetMember) -> bool) -> Option<u64>
+    {
+        if let Some(badge) = self.pop_ready(&ready)
+        {
+            return Some(badge);
+        }
+        let idx = (0..usize::from(self.capacity)).find(|&i| {
+            let m = &self.members()[i];
+            m.is_occupied() && ready(m)
+        })?;
+        // cast_possible_truncation: idx < capacity, a u16.
+        #[allow(clippy::cast_possible_truncation)]
+        self.push_ready(idx as u16);
+        Some(self.members()[idx].badge)
     }
 }
 
@@ -338,12 +482,15 @@ impl WaitSetState
 
 /// Notify the wait set that member `member_idx` is ready.
 ///
-/// Called from `endpoint_call` and `event_queue_post` on their empty→non-empty
-/// transitions, and from `notification_send` on every send that finds no
-/// blocked waiter while a wait set is registered.
+/// Called once per arrival of work on a registered source: from
+/// `endpoint_call` for every call it queues, from `event_queue_post` for every
+/// entry it rings, and from `notification_send` on every send that finds no
+/// blocked waiter.
 ///
-/// If a thread is blocked in `waitset_wait`, it is woken immediately.
-/// Otherwise the member index is pushed to the ready ring for the next caller.
+/// The member is queued on the ready ring unless it is already queued, and, if
+/// threads are blocked in `waitset_wait`, the longest-waiting one is woken
+/// with the member's badge and the others stay parked (transition 2 of
+/// core/kernel/docs/ipc-internals.md § Wait Set Readiness Model).
 ///
 /// # Safety
 /// `ws_opaque` must be a valid `*mut WaitSetState` cast to `*mut u8`.
@@ -363,20 +510,17 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u16)
     // SAFETY: lock is owned by ws; matched unlock_raw at every return path.
     let saved = unsafe { ws.lock.lock_raw() };
 
-    if ws.waiters.is_empty()
+    let parked = !ws.waiters.is_empty();
+    let Some(badge) = ws.on_arrival(member_idx, parked)
+    else
     {
-        ws.push_ready(member_idx);
         // SAFETY: paired with lock_raw above.
         unsafe { ws.lock.unlock_raw(saved) };
         return;
-    }
+    };
 
     // Snapshot under ws.lock, release, then enqueue_and_wake — see
     // core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5.
-    let badge = {
-        let m = &ws.members()[usize::from(member_idx)];
-        if m.is_occupied() { m.badge } else { 0 }
-    };
     // Claim the head waiter for wake before releasing ws.lock; dealloc's
     // BlockedOnWaitSet unlink takes ws.lock and spins on wake_in_flight
     // (#160), cleared by enqueue_and_wake.
@@ -394,39 +538,23 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u16)
     unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
 }
 
-/// Why [`waitset_wait`] returned without a badge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitSetPending
-{
-    /// The caller went through the park commit (committed, or refused and
-    /// rolled back); it must reach `schedule()` and then read its deposit.
-    Parked,
-    /// Another thread already waits on the set; the caller did not park and
-    /// the syscall returns `InvalidState`.
-    Occupied,
-}
-
 /// Block `caller` until any member becomes ready, or return the next pending badge.
 ///
-/// - If another thread already waits on the set, returns
-///   `Err(WaitSetPending::Occupied)` without parking: a wait set takes one
-///   waiter (any number of member sources).
-/// - If the ready ring is non-empty, pops and returns `Ok(badge)` without blocking.
-/// - Else, if a registered member's source is level-ready, returns
-///   `Ok(badge)` for it without blocking (core/kernel/docs/ipc-internals.md
-///   § Wait Path, Wait Set, step 3).
-/// - Otherwise makes `caller` the waiter, commits the park (a refused commit
-///   rolls the waiter back), and returns `Err(WaitSetPending::Parked)`.
-///   The syscall handler calls `schedule()`, then reads `caller.wakeup_value`.
+/// - If the ready ring holds a ready member, returns `Some(badge)` for it
+///   without blocking, and queues it again behind the others.
+/// - Else, if a registered member's source is level-ready, queues it and
+///   returns `Some(badge)` for it without blocking
+///   (core/kernel/docs/ipc-internals.md § Wait Path, Wait Set, step 3).
+/// - Otherwise queues `caller` behind any threads already waiting, commits
+///   the park (a refused commit dequeues it again), and returns `None`: the
+///   caller went through the park commit and must reach `schedule()`, then
+///   read `caller.wakeup_value`.
 ///
 /// # Safety
 /// `ws` must be a valid pointer. Acquires the wait set's internal
 /// `Spinlock` for the duration; no caller-side locks are required.
 #[cfg(not(test))]
-pub unsafe fn waitset_wait(
-    ws: *mut WaitSetState,
-    caller: *mut ThreadControlBlock,
-) -> Result<u64, WaitSetPending>
+pub unsafe fn waitset_wait(ws: *mut WaitSetState, caller: *mut ThreadControlBlock) -> Option<u64>
 {
     // SAFETY: caller guarantees ws is valid for &mut access for the
     // duration of this call (the cap holding ws remains alive).
@@ -435,47 +563,19 @@ pub unsafe fn waitset_wait(
     // SAFETY: lock is owned by ws; matched unlock_raw on every return path.
     let saved = unsafe { ws.lock.lock_raw() };
 
-    if !ws.waiters.is_empty()
-    {
-        // SAFETY: paired with lock_raw above.
-        unsafe { ws.lock.unlock_raw(saved) };
-        return Err(WaitSetPending::Occupied);
-    }
-
     // An entry is a hint: the member's source is re-checked as it is popped,
-    // so a readiness that lapsed since the push is skipped; see
-    // core/kernel/docs/ipc-internals.md § Wait Path (Wait Set) step 2.
+    // so a readiness that lapsed since the push is skipped, and the backstop
+    // walk follows an empty ring; see core/kernel/docs/ipc-internals.md
+    // § Wait Path (Wait Set) steps 2 and 3.
     // SAFETY: an occupied member's source is pinned alive by the +1 reference
     // the member holds on its header (module docs); the reads are lock-free
-    // atomic loads.
-    if let Some(badge) = ws.pop_ready(|m| unsafe { source_is_ready(m.source_ptr, m.source_tag) })
+    // atomic loads, with no source lock (which would invert the
+    // source.lock -> ws.lock order).
+    if let Some(badge) = ws.next_ready(|m| unsafe { source_is_ready(m.source_ptr, m.source_tag) })
     {
         // SAFETY: paired with lock_raw above.
         unsafe { ws.lock.unlock_raw(saved) };
-        return Ok(badge);
-    }
-
-    // Level-state self-heal: return the first member whose source is
-    // level-ready now; see core/kernel/docs/ipc-internals.md § Wait Path
-    // (Wait Set) step 3.
-    for idx in 0..usize::from(ws.capacity)
-    {
-        let m = &ws.members()[idx];
-        if !m.is_occupied()
-        {
-            continue;
-        }
-        let (source_ptr, source_tag, badge) = (m.source_ptr, m.source_tag, m.badge);
-        // SAFETY: source_ptr is pinned alive by the +1 cap-level ref this
-        // member holds on its source's `KernelObjectHeader` (see module
-        // docs). Reads use atomic loads where appropriate; no source-side
-        // lock required.
-        if unsafe { source_is_ready(source_ptr, source_tag) }
-        {
-            // SAFETY: paired with lock_raw above.
-            unsafe { ws.lock.unlock_raw(saved) };
-            return Ok(badge);
-        }
+        return Some(badge);
     }
 
     // Nothing ready — block caller.
@@ -526,15 +626,15 @@ pub unsafe fn waitset_wait(
     }
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
-    Err(WaitSetPending::Parked)
+    None
 }
 
 /// Register a source in the wait set.
 ///
 /// Returns `Ok(member_idx)` on success, `Err(())` if the wait set is full.
 ///
-/// Also checks whether the source is already ready at add time; if so,
-/// pushes to `ready_ring` immediately.
+/// Also checks whether the source is already ready at add time; if so, queues
+/// it on `ready_ring` and wakes the longest-waiting thread, if any.
 ///
 /// # Safety
 /// `ws` and `source_ptr` (the source's state struct) must be valid. The caller
@@ -555,42 +655,36 @@ pub unsafe fn waitset_add(
     // SAFETY: lock owned by ws; matched unlock_raw on every return path.
     let saved = unsafe { ws.lock.lock_raw() };
 
-    // Find a free slot.
-    let Some(idx) = ws.members().iter().position(|m| !m.is_occupied())
+    // Install, then check ready-at-add-time so notifications are not missed.
+    let member = WaitSetMember {
+        source_ptr,
+        source_tag,
+        queued: false,
+        badge,
+    };
+    let parked = !ws.waiters.is_empty();
+    // SAFETY: source_ptr is a valid pointer to the source's state struct; tag
+    // determines concrete type.
+    let installed = ws.install(
+        &member,
+        |m| unsafe { source_is_ready(m.source_ptr, m.source_tag) },
+        parked,
+    );
+    let Some((idx, wake)) = installed
     else
     {
         // SAFETY: paired with lock_raw above.
         unsafe { ws.lock.unlock_raw(saved) };
         return Err(());
     };
-    ws.members_mut()[idx] = WaitSetMember {
-        source_ptr,
-        source_tag,
-        badge,
-    };
-    ws.member_count += 1;
-
-    // Check ready-at-add-time so notifications are not missed.
-    // SAFETY: source_ptr is a valid pointer to the source's state struct; tag determines concrete type.
-    let already_ready = unsafe { source_is_ready(source_ptr, source_tag) };
-    let mut deferred_wake: Option<(*mut ThreadControlBlock, usize)> = None;
-    if already_ready
-    {
-        // cast_possible_truncation: idx < capacity, a u16.
-        #[allow(clippy::cast_possible_truncation)]
-        ws.push_ready(idx as u16);
-        // Snapshot the wake; enqueue_and_wake runs after unlock per
-        // core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5.
-        if !ws.waiters.is_empty()
-        {
-            // SAFETY: ws.lock held; claim the head waiter for wake (#160).
-            deferred_wake = Some(unsafe {
-                let waiter = ws.waiters.pop();
-                crate::ipc::claim_waiter(waiter, badge);
-                (waiter, crate::sched::select_target_cpu(waiter))
-            });
-        }
-    }
+    // Snapshot the wake; enqueue_and_wake runs after unlock per
+    // core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5.
+    // SAFETY: ws.lock held; claim the head waiter for wake (#160).
+    let deferred_wake = wake.map(|badge| unsafe {
+        let waiter = ws.waiters.pop();
+        crate::ipc::claim_waiter(waiter, badge);
+        (waiter, crate::sched::select_target_cpu(waiter))
+    });
 
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
@@ -600,16 +694,13 @@ pub unsafe fn waitset_add(
         // SAFETY: waiter remains valid.
         unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
     }
-
-    // cast_possible_truncation: idx < capacity, a u16.
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(idx as u16)
+    Ok(idx)
 }
 
 /// Remove a source from the wait set by its raw state pointer.
 ///
-/// Clears the member slot; stale `ready_ring` entries for this slot are skipped
-/// automatically during pop. Does NOT clear the source's back-pointer —
+/// Clears the member slot and drops its `ready_ring` entry. Does NOT clear the
+/// source's back-pointer —
 /// the caller (syscall handler) must do that.
 ///
 /// Returns `Ok(())` if found, `Err(())` if not present.
@@ -637,8 +728,7 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
         return Err(());
     };
 
-    ws.members_mut()[idx] = WaitSetMember::vacant();
-    ws.member_count -= 1;
+    ws.remove_member(idx);
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
     Ok(())
@@ -714,7 +804,7 @@ pub unsafe fn wait_set_drop(
         }
     }
 
-    // Under ws.lock, claim and wake the blocked waiter with its park stamped
+    // Under ws.lock, claim and wake every blocked waiter with its park stamped
     // INTERRUPTED (the destroyed wait set cancels the wait;
     // `SYS_WAIT_SET_WAIT` returns Interrupted).
     // SAFETY: lock owned by ws; matched unlock_raw below.
@@ -871,6 +961,7 @@ mod tests
                 *m = WaitSetMember {
                     source_ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
                     source_tag: WaitSetSourceTag::Notification,
+                    queued: false,
                     badge: 100 + i as u64,
                 };
             }
@@ -879,10 +970,10 @@ mod tests
     }
 
     // Defect guarded: a ring that holds one entry fewer than its capacity, or
-    // overwrites at full, or loses order across the wrap, drops or reorders
-    // ready members of a caller-sized set.
+    // loses order across the wrap, drops or reorders ready members of a
+    // caller-sized set.
     #[test]
-    fn ring_holds_capacity_entries_drops_the_next_and_pops_in_order_across_the_wrap()
+    fn ring_holds_capacity_entries_and_pops_in_order_across_the_wrap()
     {
         let mut fx = Fixture::<3, 4>::new();
         let mut ws = fx.set();
@@ -894,7 +985,7 @@ mod tests
         assert_eq!(ws.pop_ready(always_ready), Some(100));
         assert_eq!(ws.pop_ready(always_ready), Some(101));
         assert_eq!(ws.pop_ready(always_ready), Some(102));
-        assert_eq!(ws.pop_ready(always_ready), None);
+        drain(&mut ws);
         // The indices now wrap past the ring's end.
         ws.push_ready(2);
         ws.push_ready(0);
@@ -902,13 +993,100 @@ mod tests
         assert_eq!(ws.pop_ready(always_ready), Some(102));
         assert_eq!(ws.pop_ready(always_ready), Some(100));
         assert_eq!(ws.pop_ready(always_ready), Some(101));
-        assert_eq!(ws.pop_ready(always_ready), None);
+        drain(&mut ws);
     }
 
     /// The readiness predicate of a set whose every source is ready.
     fn always_ready(_: &WaitSetMember) -> bool
     {
         true
+    }
+
+    /// Pop with every source drained, which skips and clears every entry, and
+    /// require that nothing was returned and the ring is now empty.
+    fn drain(ws: &mut WaitSetState)
+    {
+        assert_eq!(ws.pop_ready(|_| false), None);
+        assert!(!ws.has_ready());
+        assert!(ws.members().iter().all(|m| !m.queued));
+    }
+
+    // Defect guarded: a member that stays ready and keeps receiving work (an
+    // endpoint with a stream of calls) filled the ring with its own entries, so
+    // another member's arrival was dropped and that member was not returned
+    // while the busy one stayed ready.
+    #[test]
+    fn a_busy_member_holds_one_entry_and_does_not_crowd_out_another()
+    {
+        let mut fx = Fixture::<2, 3>::new();
+        let mut ws = fx.set();
+        for _ in 0..3
+        {
+            ws.push_ready(0);
+        }
+        ws.push_ready(1);
+        assert_eq!(ws.pop_ready(always_ready), Some(100));
+        assert_eq!(ws.pop_ready(always_ready), Some(101));
+        drain(&mut ws);
+        // A drained member queues again on its next arrival, behind the
+        // members already queued.
+        ws.push_ready(1);
+        ws.push_ready(0);
+        ws.push_ready(1);
+        assert_eq!(ws.pop_ready(always_ready), Some(101));
+        assert_eq!(ws.pop_ready(always_ready), Some(100));
+        drain(&mut ws);
+    }
+
+    // Defect guarded: a member returned by a wait lost its entry, so the rest
+    // of its backlog was reachable only through the level walk, which runs
+    // only when the ring holds no ready entry and favours the lowest index; a
+    // lower-indexed member whose arrivals kept landing between the waits was
+    // returned every time and the other member's backlog waited.
+    #[test]
+    fn a_returned_member_is_queued_again_behind_the_others()
+    {
+        let mut fx = Fixture::<2, 3>::new();
+        let mut ws = fx.set();
+        ws.push_ready(1);
+        ws.push_ready(0);
+        let mut returned = [0u64; 4];
+        for badge in &mut returned
+        {
+            *badge = ws.pop_ready(always_ready).unwrap();
+            ws.push_ready(0);
+        }
+        assert_eq!(returned, [101, 100, 101, 100]);
+    }
+
+    // Defect guarded: a removed member's entry left in the ring, followed by a
+    // member added at the same index, gave that index two entries, so the ring
+    // filled and another member's arrival was dropped.
+    #[test]
+    fn vacating_a_member_drops_its_entry()
+    {
+        let mut fx = Fixture::<3, 4>::new();
+        let mut ws = fx.set();
+        ws.push_ready(2);
+        ws.push_ready(0);
+        ws.push_ready(1);
+        ws.vacate_member(0);
+        assert!(!ws.members()[0].queued);
+        ws.members_mut()[0] = WaitSetMember {
+            source_ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
+            source_tag: WaitSetSourceTag::Notification,
+            queued: false,
+            badge: 200,
+        };
+        ws.push_ready(0);
+        assert_eq!(ws.pop_ready(always_ready), Some(102));
+        assert_eq!(ws.pop_ready(always_ready), Some(101));
+        assert_eq!(ws.pop_ready(always_ready), Some(200));
+        drain(&mut ws);
+        // A vacant slot takes no entry.
+        ws.vacate_member(1);
+        ws.push_ready(1);
+        assert!(!ws.has_ready());
     }
 
     // Defect guarded: a pop that returned a removed member's badge would wake
@@ -922,7 +1100,8 @@ mod tests
         ws.push_ready(1);
         ws.members_mut()[0] = WaitSetMember::vacant();
         assert_eq!(ws.pop_ready(always_ready), Some(101));
-        assert_eq!(ws.pop_ready(always_ready), None);
+        assert_eq!(ws.pop_ready(always_ready), Some(101));
+        drain(&mut ws);
     }
 
     // Defect guarded: a pop that returned the badge of a member whose source
@@ -940,7 +1119,9 @@ mod tests
         let ready = |m: &WaitSetMember| m.badge != 100;
         assert_eq!(ws.pop_ready(ready), Some(101));
         assert_eq!(ws.pop_ready(ready), Some(102));
-        assert_eq!(ws.pop_ready(ready), None);
+        assert_eq!(ws.pop_ready(ready), Some(101));
+        assert!(!ws.members()[0].queued);
+        drain(&mut ws);
         ws.push_ready(0);
         assert_eq!(ws.pop_ready(|_| false), None);
         assert_eq!(ws.pop_ready(always_ready), None);
@@ -962,5 +1143,301 @@ mod tests
         assert!(ws.members().iter().all(|m| !m.is_occupied()));
         assert_eq!(ws.pop_ready(always_ready), None);
         assert_eq!(ws.capacity(), 4);
+    }
+
+    // ── Readiness model on generated sequences ───────────────────────────────
+
+    /// Largest member capacity the model runs with.
+    const MODEL_CAP: usize = 6;
+    /// Most threads the model runs with.
+    const MODEL_THREADS: usize = 4;
+    /// Steps per generated sequence.
+    const MODEL_STEPS: usize = 400;
+    /// Generated sequences.
+    const MODEL_SEEDS: u64 = 400;
+
+    /// xorshift64: a deterministic generator, so a failing seed replays.
+    struct Rng(u64);
+
+    impl Rng
+    {
+        fn below(&mut self, n: usize) -> usize
+        {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            usize::try_from(self.0 % n as u64).unwrap()
+        }
+    }
+
+    /// A thread of the modelled pool.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Thread
+    {
+        /// Running, about to wait on the set.
+        Free,
+        /// Handed member `idx` of source epoch `epoch`, by a wake or a
+        /// wait's return; it next takes one unit of work from it, or
+        /// abandons it.
+        Holding
+        {
+            idx: usize, epoch: u32
+        },
+        /// Parked on the set.
+        Parked,
+    }
+
+    /// The modelled world around one set: each slot's source and its units of
+    /// work, the pool's threads, and the parked threads in FIFO order.
+    struct World
+    {
+        cap: usize,
+        work: [u32; MODEL_CAP],
+        epoch: [u32; MODEL_CAP],
+        threads: [Thread; MODEL_THREADS],
+        nthreads: usize,
+        parked: std::collections::VecDeque<usize>,
+        /// Per member: successful waits since it was last returned, counted
+        /// while it holds work.
+        starve: [usize; MODEL_CAP],
+    }
+
+    /// Badge of slot `idx` in the model.
+    fn model_badge(idx: usize) -> u64
+    {
+        100 + idx as u64
+    }
+
+    /// Slot of a model badge.
+    fn model_slot(badge: u64) -> usize
+    {
+        usize::try_from(badge - 100).unwrap()
+    }
+
+    impl World
+    {
+        /// Hand the head parked thread the member `badge` names (a wake).
+        fn wake(&mut self, badge: u64)
+        {
+            let t = self
+                .parked
+                .pop_front()
+                .expect("a wake with no thread parked");
+            assert_eq!(self.threads[t], Thread::Parked);
+            let idx = model_slot(badge);
+            self.threads[t] = Thread::Holding {
+                idx,
+                epoch: self.epoch[idx],
+            };
+        }
+
+        fn arrive(&mut self, ws: &mut WaitSetState, idx: usize)
+        {
+            self.work[idx] += 1;
+            let parked = !self.parked.is_empty();
+            let wake = ws.on_arrival(u16::try_from(idx).unwrap(), parked);
+            // I4: while threads are parked, every arrival wakes one.
+            assert_eq!(wake.is_some(), parked);
+            if let Some(badge) = wake
+            {
+                assert_eq!(badge, model_badge(idx));
+                self.wake(badge);
+            }
+        }
+
+        fn wait(&mut self, ws: &mut WaitSetState, t: usize)
+        {
+            let work = self.work;
+            let returned = ws.next_ready(|m| work[model_slot(m.badge)] > 0);
+            let Some(badge) = returned
+            else
+            {
+                // I4: a thread parks only when no member holds work.
+                assert!(self.work.iter().all(|&w| w == 0), "parked beside work");
+                self.threads[t] = Thread::Parked;
+                self.parked.push_back(t);
+                return;
+            };
+            let idx = model_slot(badge);
+            assert!(ws.members()[idx].is_occupied() && self.work[idx] > 0);
+            self.threads[t] = Thread::Holding {
+                idx,
+                epoch: self.epoch[idx],
+            };
+            // I3: every other member with work waits fewer than `cap`
+            // successful waits for its turn.
+            for j in 0..self.cap
+            {
+                self.starve[j] = if j == idx || self.work[j] == 0
+                {
+                    0
+                }
+                else
+                {
+                    self.starve[j] + 1
+                };
+                assert!(self.starve[j] < self.cap, "member {j} passed over");
+            }
+        }
+
+        fn add(&mut self, ws: &mut WaitSetState, work: u32)
+        {
+            let parked = !self.parked.is_empty();
+            let Some(vacant) = ws.members().iter().position(|m| !m.is_occupied())
+            else
+            {
+                return;
+            };
+            self.epoch[vacant] += 1;
+            self.work[vacant] = work;
+            self.starve[vacant] = 0;
+            let member = WaitSetMember {
+                source_ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
+                source_tag: WaitSetSourceTag::EventQueue,
+                queued: false,
+                badge: model_badge(vacant),
+            };
+            let (idx, wake) = ws.install(&member, |_| work > 0, parked).unwrap();
+            assert_eq!(usize::from(idx), vacant);
+            assert_eq!(wake.is_some(), parked && work > 0);
+            if let Some(badge) = wake
+            {
+                self.wake(badge);
+            }
+        }
+
+        fn remove(&mut self, ws: &mut WaitSetState, idx: usize)
+        {
+            ws.remove_member(idx);
+            self.work[idx] = 0;
+            self.starve[idx] = 0;
+        }
+
+        /// I1 and I2, after every step.
+        fn check(&self, ws: &WaitSetState)
+        {
+            let mut in_ring = [0usize; MODEL_CAP];
+            let mut at = ws.ready_head;
+            while at != ws.ready_tail
+            {
+                // SAFETY: at < ring_len; the ring has ring_len slots.
+                let idx = usize::from(unsafe { *ws.ready_ring.add(usize::from(at)) });
+                in_ring[idx] += 1;
+                at = (at + 1) % ws.ring_len();
+            }
+            let occupied = ws.members().iter().filter(|m| m.is_occupied()).count();
+            assert_eq!(usize::from(ws.member_count), occupied);
+            for (idx, m) in ws.members().iter().enumerate()
+            {
+                // I1: a queued member has exactly one entry, and only an
+                // occupied member is queued.
+                assert_eq!(in_ring[idx], usize::from(m.queued), "slot {idx} entries");
+                assert!(!m.queued || m.is_occupied());
+                // I2: a member with work is queued.
+                assert!(
+                    !m.is_occupied() || self.work[idx] == 0 || m.queued,
+                    "slot {idx} holds work and is not queued"
+                );
+            }
+            // I4: with the whole pool parked, no work waits: each arrival
+            // since the last park woke a thread.
+            if self.threads[..self.nthreads]
+                .iter()
+                .all(|&t| t == Thread::Parked)
+            {
+                assert!(
+                    self.work.iter().all(|&w| w == 0),
+                    "the pool parked beside work"
+                );
+            }
+        }
+    }
+
+    /// Run one generated sequence of arrivals, waits, takes, abandoned
+    /// handouts, removes, and adds against a set of a generated capacity and
+    /// pool size.
+    fn run_model(seed: u64)
+    {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let cap = 1 + rng.below(MODEL_CAP);
+        let mut members = [const { WaitSetMember::vacant() }; MODEL_CAP];
+        let mut ring = [0u16; MODEL_CAP + 1];
+        // SAFETY: the arrays hold MODEL_CAP >= cap members and cap + 1 ring
+        // slots, and outlive ws.
+        let mut ws = unsafe {
+            WaitSetState::new(
+                u16::try_from(cap).unwrap(),
+                members.as_mut_ptr(),
+                ring.as_mut_ptr(),
+            )
+        };
+        let mut w = World {
+            cap,
+            work: [0; MODEL_CAP],
+            epoch: [0; MODEL_CAP],
+            threads: [Thread::Free; MODEL_THREADS],
+            nthreads: 1 + rng.below(MODEL_THREADS),
+            parked: std::collections::VecDeque::new(),
+            starve: [0; MODEL_CAP],
+        };
+        for _ in 0..cap
+        {
+            w.add(&mut ws, 0);
+        }
+        for _ in 0..MODEL_STEPS
+        {
+            let t = rng.below(w.nthreads);
+            let idx = rng.below(cap);
+            match rng.below(10)
+            {
+                0..=2 if ws.members()[idx].is_occupied() && w.work[idx] < 8 =>
+                {
+                    w.arrive(&mut ws, idx);
+                }
+                3..=5 if w.threads[t] == Thread::Free => w.wait(&mut ws, t),
+                6 | 7 =>
+                {
+                    // Take one unit of what the thread holds, if its source
+                    // is still the member it was handed.
+                    if let Thread::Holding { idx, epoch } = w.threads[t]
+                    {
+                        if epoch == w.epoch[idx] && w.work[idx] > 0
+                        {
+                            w.work[idx] -= 1;
+                        }
+                        w.threads[t] = Thread::Free;
+                    }
+                }
+                8 if matches!(w.threads[t], Thread::Holding { .. }) =>
+                {
+                    // Abandon: the thread takes nothing from what it holds.
+                    w.threads[t] = Thread::Free;
+                }
+                9 if ws.members()[idx].is_occupied() => w.remove(&mut ws, idx),
+                9 =>
+                {
+                    let work = u32::try_from(rng.below(3)).unwrap();
+                    w.add(&mut ws, work);
+                }
+                _ =>
+                {}
+            }
+            w.check(&ws);
+        }
+    }
+
+    // Defect guarded: an ordering or coverage gap in the ready ring (a member
+    // with work and no entry, two entries for one member, a member passed over
+    // for `capacity` or more turns while it holds work, a thread parked beside
+    // work, or an arrival with threads parked that wakes none) over any
+    // interleaving of arrivals, waits, takes, abandoned handouts, removes, and
+    // adds, per core/kernel/docs/ipc-internals.md § Wait Set Readiness Model.
+    #[test]
+    fn generated_sequences_keep_the_readiness_invariants()
+    {
+        for seed in 1..=MODEL_SEEDS
+        {
+            run_model(seed);
+        }
     }
 }

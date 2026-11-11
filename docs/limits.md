@@ -238,7 +238,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | Endpoint, Notification, EventQueue state size asserts | `core/kernel/src/ipc/*.rs` | 128 B bin | encoding artefact | none | correct as is | Keep |
 | `WAIT_SET_MAX_MEMBERS` | `abi/syscall/src/lib.rs` | 1024, caller-sized below it | per-call bound (the interrupts-off level-readiness walk over every member) | 24 B per member, caller-funded | correct as is | A server with more sources splits them across sets |
 | Wait-set member indices | `core/kernel/src/ipc/wait_set.rs` | `u16` | encoding artefact (above `WAIT_SET_MAX_MEMBERS`, asserted) | embedded | correct as is | None |
-| `WaitSetState.waiters` | `core/kernel/src/ipc/wait_set.rs` | 1 | unknown | none | needs a design | A second waiter is refused (#464) |
+| `WaitSetState.waiters` | `core/kernel/src/ipc/wait_set.rs` | unbounded, one link per waiting TCB | none (intrusive through the TCB) | 8 B per set (the queue's tail) | correct as is | None |
 | One wait set per source | `core/kernel/src/ipc/wait_set.rs` | 1 | design choice (bounds no capacity) | 8 B per source | correct as is | None |
 | Wait-set size asserts | `core/kernel/src/ipc/wait_set.rs` | member 24 B, state 40 B | encoding artefact | none | correct as is | Keep |
 | Bound-source backoff | `core/kernel/src/ipc/mod.rs` | 64 spins | tuning (a backoff, not a bound) | none | correct as is | None |

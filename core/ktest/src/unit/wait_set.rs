@@ -10,10 +10,13 @@
 //!
 //! Tests cover immediate return (source signalled before the wait),
 //! cross-thread return (a child thread signals the source; the parent blocks
-//! unless the unpinned child signals first), and the refusal of a second
-//! concurrent waiter. The remove test verifies that only the remaining member
-//! can wake the wait set after removal, and the stale-entry test that a member
-//! whose source stopped being ready after it was queued is not returned.
+//! unless the unpinned child signals first), two threads waiting on one set
+//! at once, each arrival waking one, a member that takes several arrivals
+//! holding one ready-ring entry, ready members returned in turn, and work a
+//! woken waiter leaves returned by a later wait. The remove test verifies
+//! that only the remaining member can wake the wait set after removal, and
+//! the stale-entry test that a member whose source stopped being ready after
+//! it was queued is not returned.
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
@@ -31,26 +34,27 @@ const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 // Child stack for the blocking_wait test.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-// Child stacks for occupied_wait_refused's two waiters. The test deletes both
+// Child stacks for the waiters of shared_set_waiters (two) and
+// woken_member_stays_queued (one, on the first). Each test deletes its
 // children on every path, so a failed run leaves no thread on either stack.
-static mut OCCUPIED_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
+static mut SHARED_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
 
-/// `(ws, done)` for each of `occupied_wait_refused`'s two waiters, indexed like
-/// [`OCCUPIED_STACKS`]: each handle fills a word, so the pair goes by address.
-static OCCUPIED_ARGS: crate::spawn::ArgBlock<(u64, u64), 2> = crate::spawn::ArgBlock::new((0, 0));
+/// `(ws, done)` for each waiter on [`SHARED_STACKS`], indexed like
+/// [`SHARED_STACKS`]: each handle fills a word, so the pair goes by address.
+static SHARED_ARGS: crate::spawn::ArgBlock<(u64, u64), 2> = crate::spawn::ArgBlock::new((0, 0));
 
-/// `occupied_wait_refused`'s `done` bits for waiter 0; waiter 1 reports the
-/// same verdicts shifted by [`WAITER_SHIFT`]. Each waiter waits once on the
-/// set and reports one verdict: refused with `InvalidState`, returned with the
+/// `shared_set_waiters`' `done` bits for waiter 0; waiter 1 reports the same
+/// bits shifted by [`WAITER_SHIFT`]. Each waiter announces that it is about
+/// to wait, waits once on the set, and reports one verdict: returned with the
 /// member's badge, or returned otherwise.
-const BIT_REFUSED: u64 = 1 << 0;
+const BIT_READY: u64 = 1 << 0;
 const BIT_OK: u64 = 1 << 1;
 const BIT_BAD: u64 = 1 << 2;
 const WAITER_SHIFT: u32 = 3;
-const OCCUPIED_BADGE: u64 = 9;
-/// After the refusal, how long to look for a wake it wrongly caused, so that
-/// such a wake fails under its own message; a wrong wake after this window
-/// still fails the final badge check.
+const SHARED_BADGE: u64 = 9;
+/// Wall-clock settle: after both waiters announce themselves, so that each has,
+/// in practice, parked before the first arrival; and after a wake, to look for
+/// a second wake the same arrival wrongly caused.
 const SETTLE_SLEEP_MS: u64 = 20;
 /// Bound on each report. Applied through [`crate::scaled_bound`], which
 /// stretches it past [`crate::UNSCALED_CPUS`] CPUs, where a waiter's CPU
@@ -191,6 +195,214 @@ pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+// ── Ready ring: one entry per member ──────────────────────────────────────────
+
+const BUSY_BADGE: u64 = 0xB0;
+const QUIET_BADGE: u64 = 0xB1;
+
+/// A member that takes several arrivals while no thread waits does not crowd
+/// another member out of the ready ring: in a two-member set, three posts to
+/// an event queue and then one send to a notification leave both members
+/// queued, so two waits, neither of which consumes anything, return both
+/// badges in that order. Fails if each post queued its own entry, which
+/// filled the two-entry ring, dropped the notification's, and returned the
+/// still-ready queue to both waits.
+pub fn busy_member_does_not_crowd_out(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_base, 2)
+        .map_err(|_| "wait_set::busy_member: wait_set_create failed")?;
+    let eq = event_queue_create(ctx.memory_base, 4);
+    let sig = cap_create_notification(ctx.memory_base);
+    let result = match (eq, sig)
+    {
+        (Ok(eq), Ok(sig)) => busy_run(ws, eq, sig),
+        _ => Err("wait_set::busy_member: creating a member failed"),
+    };
+    for cap in [eq.ok(), sig.ok(), Some(ws)].into_iter().flatten()
+    {
+        cap_delete(cap).ok();
+    }
+    result
+}
+
+/// Body of [`busy_member_does_not_crowd_out`].
+fn busy_run(ws: u64, eq: u64, sig: u64) -> TestResult
+{
+    wait_set_add(ws, eq, BUSY_BADGE)
+        .map_err(|_| "wait_set::busy_member: wait_set_add(eq) failed")?;
+    wait_set_add(ws, sig, QUIET_BADGE)
+        .map_err(|_| "wait_set::busy_member: wait_set_add(sig) failed")?;
+    for n in 0..3
+    {
+        event_post(eq, n).map_err(|_| "wait_set::busy_member: event_post failed")?;
+    }
+    notification_send(sig, 0x1).map_err(|_| "wait_set::busy_member: notification_send failed")?;
+    let first = wait_set_wait(ws).map_err(|_| "wait_set::busy_member: first wait failed")?;
+    let second = wait_set_wait(ws).map_err(|_| "wait_set::busy_member: second wait failed")?;
+    if (first, second) != (BUSY_BADGE, QUIET_BADGE)
+    {
+        return Err("wait_set::busy_member: the busy member crowded the other out of the ring");
+    }
+    Ok(())
+}
+
+/// A member's backlog is served while a lower-indexed member keeps taking
+/// arrivals: in a two-member set of event queues, three posts to the second
+/// and one to the first, then four rounds of wait, receive one entry from the
+/// queue returned, and post one more entry to the first queue, return the two
+/// members in turn. Fails if a returned member lost its ring entry, which left
+/// the second queue's backlog to the level walk, which runs only when the ring
+/// holds no ready entry: the first queue, queued again by every round's post,
+/// was then returned every round after the first.
+pub fn backlog_served_beside_arrivals(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_base, 2)
+        .map_err(|_| "wait_set::backlog_served: wait_set_create failed")?;
+    let low = event_queue_create(ctx.memory_base, 4);
+    let high = event_queue_create(ctx.memory_base, 4);
+    let result = match (low, high)
+    {
+        (Ok(low), Ok(high)) => backlog_run(ws, low, high),
+        _ => Err("wait_set::backlog_served: event_queue_create failed"),
+    };
+    for cap in [low.ok(), high.ok(), Some(ws)].into_iter().flatten()
+    {
+        cap_delete(cap).ok();
+    }
+    result
+}
+
+/// Body of [`backlog_served_beside_arrivals`].
+fn backlog_run(ws: u64, low: u64, high: u64) -> TestResult
+{
+    wait_set_add(ws, low, BUSY_BADGE)
+        .map_err(|_| "wait_set::backlog_served: wait_set_add(low) failed")?;
+    wait_set_add(ws, high, QUIET_BADGE)
+        .map_err(|_| "wait_set::backlog_served: wait_set_add(high) failed")?;
+    for n in 0..3
+    {
+        event_post(high, n).map_err(|_| "wait_set::backlog_served: event_post(high) failed")?;
+    }
+    event_post(low, 0).map_err(|_| "wait_set::backlog_served: event_post(low) failed")?;
+    let mut returned = [0u64; 4];
+    for badge in &mut returned
+    {
+        *badge = wait_set_wait(ws).map_err(|_| "wait_set::backlog_served: wait failed")?;
+        let queue = if *badge == BUSY_BADGE { low } else { high };
+        event_recv(queue).map_err(|_| "wait_set::backlog_served: event_recv failed")?;
+        event_post(low, 0).map_err(|_| "wait_set::backlog_served: event_post(low) failed")?;
+    }
+    if returned != [QUIET_BADGE, BUSY_BADGE, QUIET_BADGE, BUSY_BADGE]
+    {
+        return Err(
+            "wait_set::backlog_served: a member's backlog waited behind arrivals elsewhere",
+        );
+    }
+    Ok(())
+}
+
+/// The caps and child `woken_member_stays_queued` creates; each is deleted on
+/// every path.
+#[derive(Default)]
+struct Woken
+{
+    ws: Option<u64>,
+    busy: Option<u64>,
+    member: Option<u64>,
+    done: Option<u64>,
+    waiter: Option<crate::spawn::SpawnedChild>,
+}
+
+/// An arrival that wakes a parked thread queues its member too, so work the
+/// woken thread leaves is returned by a later wait while another member stays
+/// busy: a child parks on a two-member set, a post to the higher-indexed queue
+/// wakes it, and it exits without receiving; the parent then posts a backlog
+/// to the lower-indexed queue, reposting after each entry it takes, and
+/// requires the left entry's member within two waits. Fails if the waking
+/// arrival queued no entry, which left that member to the level walk, which
+/// runs only when the ring holds no ready member (ipc-internals.md § Wait Set
+/// Readiness Model, I2).
+pub fn woken_member_stays_queued(ctx: &TestContext) -> TestResult
+{
+    let mut w = Woken::default();
+    let result = woken_run(ctx, &mut w);
+    let mut ok = true;
+    if let Some(mut child) = w.waiter.take()
+    {
+        ok &= child.delete_thread().is_ok();
+        ok &= child.delete_cspace().is_ok();
+    }
+    for cap in [w.ws, w.busy, w.member, w.done].into_iter().flatten()
+    {
+        ok &= cap_delete(cap).is_ok();
+    }
+    result?;
+    if ok
+    {
+        Ok(())
+    }
+    else
+    {
+        Err("wait_set::woken_member_stays_queued: cap_delete in cleanup failed")
+    }
+}
+
+/// Body of [`woken_member_stays_queued`].
+fn woken_run(ctx: &TestContext, w: &mut Woken) -> TestResult
+{
+    let err = "wait_set::woken_member_stays_queued: setup failed";
+    let ws = *w
+        .ws
+        .insert(wait_set_create(ctx.memory_base, 2).map_err(|_| err)?);
+    let busy = *w
+        .busy
+        .insert(event_queue_create(ctx.memory_base, 4).map_err(|_| err)?);
+    let member = *w
+        .member
+        .insert(event_queue_create(ctx.memory_base, 4).map_err(|_| err)?);
+    let done = *w
+        .done
+        .insert(cap_create_notification(ctx.memory_base).map_err(|_| err)?);
+    wait_set_add(ws, busy, BUSY_BADGE).map_err(|_| err)?;
+    wait_set_add(ws, member, SHARED_BADGE).map_err(|_| err)?;
+
+    let child = w
+        .waiter
+        .insert(crate::spawn::new_child(ctx).map_err(|_| err)?);
+    start_shared_child(child, 0, shared_waiter_0, ws, done)?;
+    let acc = collect(done, 0, waiter_bits(0, BIT_READY))
+        .map_err(|_| "wait_set::woken_member_stays_queued: the waiter did not start")?;
+    // In practice the waiter has parked by now; if it has not, the post below
+    // queues the member and its wait returns it, which leaves the member
+    // queued too, so the check below cannot fail on that interleaving.
+    let _ = thread_sleep(crate::scaled_bound(SETTLE_SLEEP_MS));
+
+    event_post(member, 0).map_err(|_| err)?;
+    let acc = collect(done, acc, waiter_bits(0, BIT_OK | BIT_BAD))
+        .map_err(|_| "wait_set::woken_member_stays_queued: the post woke no waiter")?;
+    if acc & waiter_bits(0, BIT_BAD) != 0
+    {
+        return Err("wait_set::woken_member_stays_queued: the waiter got another badge");
+    }
+
+    for n in 0..3
+    {
+        event_post(busy, n).map_err(|_| err)?;
+    }
+    for _ in 0..2
+    {
+        let badge =
+            wait_set_wait(ws).map_err(|_| "wait_set::woken_member_stays_queued: wait failed")?;
+        if badge == SHARED_BADGE
+        {
+            return Ok(());
+        }
+        event_recv(busy).map_err(|_| err)?;
+        event_post(busy, 0).map_err(|_| err)?;
+    }
+    Err("wait_set::woken_member_stays_queued: work a woken waiter left was not returned")
+}
+
 // ── wait_set_wait (blocking) ──────────────────────────────────────────────────
 
 /// A child thread signals a registered notification and `wait_set_wait` returns
@@ -243,105 +455,185 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── wait_set_wait (occupied set) ──────────────────────────────────────────────
+// ── wait_set_wait (several waiters) ───────────────────────────────────────────
 
-/// The caps and children `occupied_wait_refused` creates; each is deleted on
-/// every path.
+/// The kind of member `shared_set_waiters` makes ready, and how it arrives.
+#[derive(Clone, Copy)]
+enum SharedMember
+{
+    /// A notification; each arrival is a `notification_send`.
+    Notification,
+    /// An event queue; each arrival is an `event_post`.
+    EventQueue,
+    /// An endpoint; each arrival is a caller's `ipc_call`, which stays queued
+    /// (nothing receives on the endpoint).
+    Endpoint,
+}
+
+/// The caps and children one `shared_set_waiters` phase creates; each is
+/// deleted on every path.
 #[derive(Default)]
-struct Occupied
+struct Shared
 {
     ws: Option<u64>,
-    sig: Option<u64>,
+    member: Option<u64>,
     done: Option<u64>,
     waiters: [Option<crate::spawn::SpawnedChild>; 2],
+    callers: [Option<crate::spawn::SpawnedChild>; 2],
 }
 
-/// Of two children waiting on one wait set, whichever enters second is refused
-/// with `InvalidState` at once, and the other's wait is unaffected: it does not
-/// return, and a member fire still reaches it. The refusal itself shows the
-/// other child is parked, so the test does not depend on which runs first.
-pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
+// Child stacks and IPC pages for the endpoint phase's two callers, which the
+// phase deletes on every path.
+static mut SHARED_CALLER_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
+static mut SHARED_CALLER_PAGES: [crate::IpcPage; 2] = [crate::IpcPage::ZERO; 2];
+
+/// Two threads wait on one wait set at once, and each arrival of work on its
+/// member wakes one of them: the first arrival wakes exactly one waiter with
+/// the member's badge and leaves the other parked, and the second arrival
+/// wakes the other. One phase per member kind: a notification, an event queue
+/// (two posts), and an endpoint (two queued calls). Fails if the set refuses
+/// or fails the second wait, if one arrival wakes both waiters, or if an
+/// arrival while the member is still ready wakes no one (a source that
+/// notifies the set only on its empty-to-non-empty transition).
+pub fn shared_set_waiters(ctx: &TestContext) -> TestResult
 {
-    let mut o = Occupied::default();
-    let result = occupied_run(ctx, &mut o);
-    // Deleting a thread tears the child down wherever it is, so the stacks
-    // are free even when the test failed with a child still parked.
-    let mut ok = true;
-    for child in o.waiters.iter_mut().flatten()
+    for member in [
+        SharedMember::Notification,
+        SharedMember::EventQueue,
+        SharedMember::Endpoint,
+    ]
     {
-        ok &= child.delete_thread().is_ok();
-        ok &= child.delete_cspace().is_ok();
-    }
-    for cap in [o.ws, o.sig, o.done].into_iter().flatten()
-    {
-        ok &= cap_delete(cap).is_ok();
-    }
-    result?;
-    if ok
-    {
-        Ok(())
-    }
-    else
-    {
-        Err("cap_delete after occupied test failed")
-    }
-}
-
-/// Create the set, its member, and `done`; start both waiters; wait for one
-/// refusal; then fire the member and require the other waiter's badge.
-fn occupied_run(ctx: &TestContext, o: &mut Occupied) -> TestResult
-{
-    let ws = *o.ws.insert(
-        wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
-            .map_err(|_| "wait_set_create for occupied failed")?,
-    );
-    let sig = *o.sig.insert(
-        cap_create_notification(ctx.memory_base)
-            .map_err(|_| "cap_create_notification (member) for occupied failed")?,
-    );
-    let done = *o.done.insert(
-        cap_create_notification(ctx.memory_base)
-            .map_err(|_| "cap_create_notification (done) for occupied failed")?,
-    );
-    wait_set_add(ws, sig, OCCUPIED_BADGE).map_err(|_| "wait_set_add for occupied failed")?;
-
-    let entries: [extern "C" fn(u64) -> !; 2] = [occupied_waiter_0, occupied_waiter_1];
-    for (k, entry) in entries.into_iter().enumerate()
-    {
-        let spawned =
-            crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for occupied failed")?;
-        let child = o.waiters[k].insert(spawned);
-        start_occupied_child(child, k, entry, ws, done)?;
-    }
-
-    let refused_any = waiter_bits(0, BIT_REFUSED) | waiter_bits(1, BIT_REFUSED);
-    let returned_any = waiter_bits(0, BIT_OK | BIT_BAD) | waiter_bits(1, BIT_OK | BIT_BAD);
-    let mut acc = collect(done, 0, refused_any | returned_any)?;
-    acc |= notification_wait_timeout(done, SETTLE_SLEEP_MS)
-        .map_err(|_| "notification_wait_timeout on done for occupied failed")?;
-    if acc & returned_any != 0
-    {
-        return Err("a wait set waiter returned before any member fired");
-    }
-    let parked: u32 = match acc & refused_any
-    {
-        b if b == waiter_bits(0, BIT_REFUSED) => 1,
-        b if b == waiter_bits(1, BIT_REFUSED) => 0,
-        _ => return Err("both waits on the wait set were refused with InvalidState"),
-    };
-
-    notification_send(sig, 0x1).map_err(|_| "notification_send for occupied failed")?;
-    acc = collect(done, acc, returned_any)?;
-    if acc & waiter_bits(parked, BIT_OK) == 0
-    {
-        return Err("the parked wait set waiter did not receive the member's badge");
+        let mut sh = Shared::default();
+        let result = shared_run(ctx, member, &mut sh);
+        // Deleting a thread tears the child down wherever it is, so the
+        // stacks are free even when the phase failed with a child parked.
+        let mut ok = true;
+        for child in sh.waiters.iter_mut().chain(sh.callers.iter_mut()).flatten()
+        {
+            ok &= child.delete_thread().is_ok();
+            ok &= child.delete_cspace().is_ok();
+        }
+        for cap in [sh.ws, sh.member, sh.done].into_iter().flatten()
+        {
+            ok &= cap_delete(cap).is_ok();
+        }
+        result?;
+        if !ok
+        {
+            return Err("wait_set::shared_set_waiters: cap_delete in cleanup failed");
+        }
     }
     Ok(())
 }
 
-/// Start `child` at `entry` on occupied stack `stack`, passing it copies of
-/// `ws` and `done` through entry `stack` of [`OCCUPIED_ARGS`].
-fn start_occupied_child(
+/// Create the set, its `member`, and `done`; park both waiters; then make two
+/// arrivals on the member, requiring one wake for each.
+fn shared_run(ctx: &TestContext, member: SharedMember, sh: &mut Shared) -> TestResult
+{
+    let ws = *sh.ws.insert(
+        wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+            .map_err(|_| "wait_set::shared_set_waiters: wait_set_create failed")?,
+    );
+    let source = *sh.member.insert(
+        match member
+        {
+            SharedMember::Notification => cap_create_notification(ctx.memory_base),
+            SharedMember::EventQueue => event_queue_create(ctx.memory_base, 4),
+            SharedMember::Endpoint => cap_create_endpoint(ctx.memory_base),
+        }
+        .map_err(|_| "wait_set::shared_set_waiters: creating the member failed")?,
+    );
+    let done = *sh.done.insert(
+        cap_create_notification(ctx.memory_base)
+            .map_err(|_| "wait_set::shared_set_waiters: cap_create_notification (done) failed")?,
+    );
+    wait_set_add(ws, source, SHARED_BADGE)
+        .map_err(|_| "wait_set::shared_set_waiters: wait_set_add failed")?;
+
+    let entries: [extern "C" fn(u64) -> !; 2] = [shared_waiter_0, shared_waiter_1];
+    let mut acc = 0;
+    for (k, entry) in entries.into_iter().enumerate()
+    {
+        let spawned = crate::spawn::new_child(ctx)
+            .map_err(|_| "wait_set::shared_set_waiters: spawn::new_child failed")?;
+        let child = sh.waiters[k].insert(spawned);
+        start_shared_child(child, k, entry, ws, done)?;
+        // cast_possible_truncation: k < 2.
+        #[allow(clippy::cast_possible_truncation)]
+        let mask = waiter_bits(k as u32, BIT_READY);
+        acc = collect(done, acc, mask)?;
+    }
+    let _ = thread_sleep(crate::scaled_bound(SETTLE_SLEEP_MS));
+
+    let returned = |k: u32| waiter_bits(k, BIT_OK | BIT_BAD);
+    let returned_any = returned(0) | returned(1);
+    acc |= notification_wait_timeout(done, SETTLE_SLEEP_MS)
+        .map_err(|_| "wait_set::shared_set_waiters: waiting on done failed")?;
+    if acc & returned_any != 0
+    {
+        return Err("wait_set::shared_set_waiters: a waiter returned before any arrival");
+    }
+
+    arrive(ctx, member, source, 0, sh)?;
+    acc = collect(done, acc, returned_any)?;
+    acc |= notification_wait_timeout(done, SETTLE_SLEEP_MS)
+        .map_err(|_| "wait_set::shared_set_waiters: waiting on done failed")?;
+    let parked: u32 = match (acc & returned(0) != 0, acc & returned(1) != 0)
+    {
+        (true, false) => 1,
+        (false, true) => 0,
+        _ => return Err("wait_set::shared_set_waiters: one arrival woke both waiters"),
+    };
+
+    arrive(ctx, member, source, 1, sh)?;
+    acc = collect(done, acc, returned(parked)).map_err(|_| {
+        "wait_set::shared_set_waiters: a second arrival on a still-ready member did not wake \
+         the second waiter"
+    })?;
+    if acc & (waiter_bits(0, BIT_BAD) | waiter_bits(1, BIT_BAD)) != 0
+    {
+        return Err("wait_set::shared_set_waiters: a waiter returned without the member's badge");
+    }
+    Ok(())
+}
+
+/// Make arrival `n` (0 or 1) of work on `source`, a `member` kind of source.
+/// An endpoint's arrival is caller `n`'s call, the caller kept in `sh`.
+fn arrive(
+    ctx: &TestContext,
+    member: SharedMember,
+    source: u64,
+    n: usize,
+    sh: &mut Shared,
+) -> TestResult
+{
+    let err = "wait_set::shared_set_waiters: an arrival on the member failed";
+    match member
+    {
+        SharedMember::Notification => notification_send(source, 0x1).map_err(|_| err),
+        SharedMember::EventQueue => event_post(source, 0xA0 + n as u64).map_err(|_| err),
+        SharedMember::Endpoint =>
+        {
+            let entries: [extern "C" fn(u64) -> !; 2] = [shared_caller_0, shared_caller_1];
+            let caller = sh.callers[n].insert(crate::spawn::new_child(ctx).map_err(|_| err)?);
+            let c_ep = cap_copy(source, caller.cs, RIGHTS_EP_SEND_GRANT).map_err(|_| err)?;
+            // SAFETY: each caller stack belongs to one of this phase's two
+            // callers, which the phase deletes before returning; unit tests
+            // run sequentially.
+            let stack_top =
+                ChildStack::top(unsafe { core::ptr::addr_of!(SHARED_CALLER_STACKS[n]) });
+            // SAFETY: the stack is `SHARED_CALLER_STACKS[n]`, this test's own
+            // `ChildStack`, on which no other live thread runs (`ChildStack`'s
+            // rule).
+            unsafe { crate::spawn::configure_and_start(caller, entries[n], stack_top, c_ep) }
+                .map_err(|_| err)
+        }
+    }
+}
+
+/// Start `child` at `entry` on shared stack `stack`, passing it copies of
+/// `ws` and `done` through entry `stack` of [`SHARED_ARGS`].
+fn start_shared_child(
     child: &crate::spawn::SpawnedChild,
     stack: usize,
     entry: extern "C" fn(u64) -> !,
@@ -349,20 +641,22 @@ fn start_occupied_child(
     done: u64,
 ) -> TestResult
 {
-    let c_ws = cap_copy(ws, child.cs, RIGHTS_ALL).map_err(|_| "cap_copy ws for occupied failed")?;
-    let c_done =
-        cap_copy(done, child.cs, RIGHTS_NOTIFY).map_err(|_| "cap_copy done for occupied failed")?;
-    // SAFETY: each occupied stack belongs to one of this test's two children,
-    // which the test deletes before returning; unit tests run sequentially.
-    let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(OCCUPIED_STACKS[stack]) });
-    // SAFETY: `stack` < 2; the entry's previous child (one of an earlier
-    // run's waiters, deleted before that run returned) has exited, and this
+    let c_ws = cap_copy(ws, child.cs, RIGHTS_ALL)
+        .map_err(|_| "wait_set: cap_copy(ws) for a waiter failed")?;
+    let c_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
+        .map_err(|_| "wait_set: cap_copy(done) for a waiter failed")?;
+    // SAFETY: each shared stack belongs to one child of the running test,
+    // which deletes it before returning; unit tests run sequentially.
+    let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(SHARED_STACKS[stack]) });
+    // SAFETY: `stack` < 2; the entry's previous child (a waiter of an earlier
+    // test, phase, or run, deleted before it returned) has exited, and this
     // one has not started.
-    let arg = unsafe { OCCUPIED_ARGS.publish(stack, (c_ws, c_done)) };
-    // SAFETY: the stack is `OCCUPIED_STACKS[stack]`, this test's own `ChildStack`,
-    // on which no other live thread runs (`ChildStack`'s rule).
+    let arg = unsafe { SHARED_ARGS.publish(stack, (c_ws, c_done)) };
+    // SAFETY: the stack is `SHARED_STACKS[stack]`, a `ChildStack` of this
+    // module's waiters, on which no other live thread runs (`ChildStack`'s
+    // rule).
     unsafe { crate::spawn::configure_and_start(child, entry, stack_top, arg) }
-        .map_err(|_| "configure_and_start for occupied failed")
+        .map_err(|_| "wait_set: configure_and_start of a waiter failed")
 }
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
@@ -372,10 +666,10 @@ fn collect(done: u64, mut acc: u64, mask: u64) -> Result<u64, &'static str>
     while acc & mask == 0
     {
         let bits = notification_wait_timeout(done, crate::scaled_bound(REPORT_MS))
-            .map_err(|_| "notification_wait_timeout on done for occupied failed")?;
+            .map_err(|_| "wait_set::shared_set_waiters: waiting on done failed")?;
         if bits == 0
         {
-            return Err("the wait set waiter did not report in time");
+            return Err("wait_set::shared_set_waiters: a waiter did not report in time");
         }
         acc |= bits;
     }
@@ -692,17 +986,18 @@ extern "C" fn sender_entry(sig_slot: u64) -> !
     thread_exit()
 }
 
-/// Wait once on the occupied set and report waiter `k`'s verdict; `arg` is
-/// the waiter's [`OCCUPIED_ARGS`] entry.
-fn occupied_waiter(arg: u64, k: u32) -> !
+/// Announce, wait once on the shared set, and report waiter `k`'s verdict;
+/// `arg` is the waiter's [`SHARED_ARGS`] entry. The waiter does not receive on
+/// the member, so the member stays ready after its wake.
+fn shared_waiter(arg: u64, k: u32) -> !
 {
-    // SAFETY: `arg` is the `OCCUPIED_ARGS` entry `start_occupied_child`
-    // published for this waiter.
+    // SAFETY: `arg` is the `SHARED_ARGS` entry `start_shared_child` published
+    // for this waiter.
     let (ws, done): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
+    notification_send(done, waiter_bits(k, BIT_READY)).ok();
     let bit = match wait_set_wait(ws)
     {
-        Err(e) if e == SyscallError::InvalidState as i64 => BIT_REFUSED,
-        Ok(OCCUPIED_BADGE) => BIT_OK,
+        Ok(SHARED_BADGE) => BIT_OK,
         _ => BIT_BAD,
     };
     notification_send(done, waiter_bits(k, bit)).ok();
@@ -710,13 +1005,43 @@ fn occupied_waiter(arg: u64, k: u32) -> !
 }
 
 /// Waiter 0's entry.
-extern "C" fn occupied_waiter_0(arg: u64) -> !
+extern "C" fn shared_waiter_0(arg: u64) -> !
 {
-    occupied_waiter(arg, 0)
+    shared_waiter(arg, 0)
 }
 
 /// Waiter 1's entry.
-extern "C" fn occupied_waiter_1(arg: u64) -> !
+extern "C" fn shared_waiter_1(arg: u64) -> !
 {
-    occupied_waiter(arg, 1)
+    shared_waiter(arg, 1)
+}
+
+/// Register caller `n`'s IPC page and call the endpoint `ep`, which nothing
+/// receives on: the call stays queued until the phase deletes the caller.
+fn shared_caller(ep: u64, n: usize) -> !
+{
+    // SAFETY: `n` < 2; the page is caller `n`'s own, registered by one thread
+    // at a time (`IpcPage`'s rule); no Rust object lives in it, and the thread
+    // reaches it only through the raw `buf` pointer.
+    let buf = unsafe { core::ptr::addr_of_mut!(SHARED_CALLER_PAGES[n]) }.cast::<u64>();
+    // SAFETY: as above.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    {
+        thread_exit()
+    }
+    // SAFETY: `buf` was registered as this thread's IPC buffer above.
+    let _ = unsafe { ipc::ipc_call(ep, &ipc::IpcMessage::new(0), buf) };
+    thread_exit()
+}
+
+/// Caller 0's entry.
+extern "C" fn shared_caller_0(ep: u64) -> !
+{
+    shared_caller(ep, 0)
+}
+
+/// Caller 1's entry.
+extern "C" fn shared_caller_1(ep: u64) -> !
+{
+    shared_caller(ep, 1)
 }

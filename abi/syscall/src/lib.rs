@@ -228,8 +228,8 @@ pub const SYS_CAP_MOVE: u64 = 25;
 pub const SYS_WAIT_SET_ADD: u64 = 26;
 /// `WaitSet`: remove a member.
 pub const SYS_WAIT_SET_REMOVE: u64 = 27;
-/// `WaitSet`: wait for any member to become ready. A wait set takes one
-/// waiting thread: a wait while another thread waits returns `InvalidState`.
+/// `WaitSet`: wait for any member to become ready. Several threads may wait
+/// on one set; each readiness wakes the longest-waiting one.
 pub const SYS_WAIT_SET_WAIT: u64 = 28;
 /// IRQ: acknowledge a delivered interrupt.
 pub const SYS_IRQ_ACK: u64 = 29;

@@ -118,6 +118,29 @@ shared memory capability rather than embedding data in the message.
 The sender maps a region, writes data, and passes a capability to the receiver. No
 kernel copy occurs. The capability controls access rights (read-only, read-write).
 
+### Multi-threaded servers
+
+Several threads of a server MAY receive on one endpoint: the endpoint queues them as blocked
+receivers, and each caller is bound to the thread that received it (§ The Call/Reply Model). The
+threads of such a server follow these rules. `shared/recv-pool` provides a pool that keeps them
+for std services ([shared/recv-pool/README.md](../shared/recv-pool/README.md)); a `no_std`
+server keeps them in its own code.
+
+- Each thread MUST make every IPC syscall on its own IPC buffer page, the one it registered with
+  `SYS_IPC_BUFFER_SET` (§ Message Format). A page two threads share holds whichever message the
+  kernel wrote to it last.
+- A received message is copied out of the page as the receive returns (`IpcMessage`), so a thread
+  MAY make a nested call on its own page while it serves the request. Words read from the page
+  itself after a nested call are the nested reply's, not the request's.
+- A thread MUST reply, or deliberately leave the caller unanswered, before it receives again: a
+  receive while a reply is pending releases the pending caller (§ The Call/Reply Model).
+- A thread MUST NOT hold a lock across a nested call whose callee can call back into the server,
+  directly or through other services: the call back is received by another thread, which may need
+  the lock while its holder waits on the callee. A lock held across a call to a service that never
+  calls the server is a departure from
+  [coding-standards.md](coding-standards.md#concurrency) § Concurrency, which the code states with
+  its reason.
+
 ---
 
 ## Asynchronous Primitives
@@ -292,5 +315,7 @@ The kernel does not provide:
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
 [Fault Handling](fault-handling.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
+[logd IPC interface](../services/logd/docs/ipc-interface.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
-[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)
+[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md),
+[shared/recv-pool/README.md](../shared/recv-pool/README.md)

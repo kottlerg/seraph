@@ -282,8 +282,8 @@ accounting, and never breaks the identity.
 memmgr is single-threaded today: one receive loop owns all bookkeeping. The
 bookkeeping is shaped so the SMP pager
 ([#266](https://github.com/kottlerg/seraph/issues/266)), over per-thread IPC
-buffers ([#254](https://github.com/kottlerg/seraph/issues/254)), is a
-service-internal change rather than a rewrite of this layer:
+buffers ([IPC Design](../../../docs/ipc-design.md) § Multi-threaded servers),
+is a service-internal change rather than a rewrite of this layer:
 
 - The arena, the free pool, the deferred list, and the process index are
   plain values with no global state, mutated only through exclusive
@@ -299,6 +299,14 @@ neighbour, or a record whose frames came from several shards) takes shard
 locks in ascending shard order; and the all-RAM-accounted identity is the sum
 over shards, with `pool_total` kept in one counter updated under any shard's
 lock with an atomic add.
+
+memmgr cannot use the worker-pool receive helper
+([shared/recv-pool/README.md](../../../shared/recv-pool/README.md)), which spawns
+`std` threads: memmgr is `no_std`. Its receive threads are design intent; not yet
+implemented. memmgr would create each with the raw thread syscalls, register a
+page of its own for each with `SYS_IPC_BUFFER_SET`, and keep the rules of
+[IPC Design](../../../docs/ipc-design.md) § Multi-threaded servers in its own
+code; how the threads share the ledgers is the sharding above.
 
 ---
 

@@ -14,7 +14,7 @@ programs/demandpaged/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Mode selection, the in-region, out-of-region and drain modes
+    └── main.rs            # Mode selection, the in-region, out-of-region, drain and teardown modes
 ```
 
 ---
@@ -26,14 +26,15 @@ creates unless the creator opts out with `CREATE_PINNED`
 ([docs/fault-handling.md](../../docs/fault-handling.md#demand-paging-and-the-default-system-pager)).
 memmgr backs faults inside a region the process registered and kills the thread on any other
 fault ([memmgr IPC Interface](../../services/memmgr/docs/ipc-interface.md)). The mode is
-selected by argv: any argument equal to `oor` selects the out-of-region mode, and any equal to
-`ptdrain` the page-table drain mode.
+selected by argv: any argument equal to `oor` selects the out-of-region mode, any equal to
+`ptdrain` the page-table drain mode, and any equal to `teardown` the teardown mode.
 
 | Mode | Behaviour | Exit status |
 |---|---|---|
 | default | `register_demand_paged(4)` reserves four pages and registers them read-write with the pager; the program writes a per-(page, byte) pattern across all four, then reads it back | `0` on a full match; `2` if registration fails; `3` on a mismatch |
 | `oor` | `reserve_pages(1)` reserves one page ([page reservations](../../docs/userspace-memory-model.md#page-reservations)) that is never registered; the program writes to it | Expected to be killed; `0` if the write survives, so the harness's must-be-killed assertion fails; `2` if the reservation fails |
 | `ptdrain` | `register_demand_paged(1024)` registers a region holding a whole 2 MiB block that nothing has mapped, so its first touch needs a fresh page table. The program then maps one page of a `REQUEST_MEMORY_CAPS` frame in each 2 MiB block of a second reservation, with no funding, until `mem_map` returns `OutOfMemory` and the address space's page-table pool (`CAP_INFO_ASPACE_PT_BUDGET`) is empty. It then writes a pattern to the block's first page and reads it back, so the pager must fund the pool itself ([memmgr Memory Pool § Client page-table funding](../../services/memmgr/docs/memory-pool.md#client-page-table-funding)) | `0` on a full match; `2` if a reservation or the registration fails; `3` on a mismatch; `4` if the frame request or a drain mapping fails for a reason other than an empty pool; `5` if the drain does not empty the pool; killed if the pager declines the fault |
+| `teardown` | `register_demand_paged(4)` registers a region, and the program fills and reads it back as the default mode does, then tears it down with `unregister_demand_paged`, which unregisters it with the pager and releases the reservation. It then registers four pages again, which the lowest-address first-fit reservation places on the same VA, so the pager accepts the registration only if the teardown removed the first one, and fills, reads back and tears down the second region the same way | `0` when both rounds pass; `2` if a registration fails; `3` on a mismatch; `4` if a teardown gets no answer from the pager; `5` if the second region lands at another VA |
 
 ---
 
@@ -45,6 +46,7 @@ selected by argv: any argument equal to `oor` selects the out-of-region mode, an
 | `demand_paging_segfault` | `oor` argument | Killed with an exit reason at or above `EXIT_FAULT_BASE` |
 | `demand_paging_pinned` | Default mode, `pinned(true)` | Killed with an exit reason at or above `EXIT_FAULT_BASE`, since no pager is bound; the RAM identity still holds |
 | `demand_paging_pt_drain` | `ptdrain` argument | Clean exit; the RAM identity still holds |
+| `demand_paging_teardown` | `teardown` argument | Clean exit; the RAM identity still holds |
 
 ---
 

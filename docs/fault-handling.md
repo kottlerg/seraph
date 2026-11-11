@@ -536,12 +536,13 @@ A post to a thread blocked in a syscall that can block cancels the block as a st
 wakes the thread. Those syscalls are listed in
 [syscalls.md § Atomicity and Preemption Guarantees](../core/kernel/docs/syscalls.md#atomicity-and-preemption-guarantees)
 (Blocking syscalls are interruptible).
-The syscall returns `Interrupted`, unless a genuine wake or a sleep's elapsed deadline claimed it
-first, and the upcall is delivered at that return. A blocking syscall that the thread enters with an
-upcall pending returns `Interrupted` at once instead of blocking. The kernel restarts nothing;
-whether to retry is the program's choice. For `SYS_IPC_CALL`, `Interrupted` does not mean that the
-request went undelivered: a server that already received the message finds no reply pending, so a
-program that retries a call may repeat its request, as after a stop.
+The syscall returns `Interrupted`, unless a genuine wake or the elapsed deadline of a sleep or a
+timed wait claimed it first, and the upcall is delivered at that return. A blocking syscall that
+the thread enters with an upcall pending returns `Interrupted` at once instead of blocking. The
+kernel restarts nothing; whether to retry is the program's choice. For `SYS_IPC_CALL`,
+`Interrupted` does not mean that the request went undelivered: a server that already received the
+message finds no reply pending, so a program that retries a call may repeat its request, as after
+a stop.
 
 A fault-blocked thread's fault, or an upcall delivery in progress, is never cancelled for an upcall:
 the upcall waits for it to resolve. The protocol that keeps a post from missing a thread that is

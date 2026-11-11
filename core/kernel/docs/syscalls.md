@@ -1483,7 +1483,8 @@ Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it 
 or, with `THREAD_START_SUSPENDED`, a configured `Created` thread to `Stopped`.
 Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
 handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` of a delivery other
-than a virtual-memory one, or of one with no exception handler bound), kills it as an unhandled
+than a virtual-memory one, of one with no exception handler bound, or of the fault of a
+restartable syscall's user copy), kills it as an unhandled
 fault, which posts its death and address-space observers, or, for the fault of a restartable
 syscall's user copy, fails that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
@@ -1554,8 +1555,10 @@ with a kill outcome (no syscall returns) and the thread is left `Stopped`; the n
 `SYS_THREAD_START` then kills it as an unhandled fault (for the fault of a restartable syscall's
 user copy, fails that syscall with `InvalidAddress`). A thread whose handler's reply claimed the
 fault first keeps that reply's outcome: when next started it resumes its faulting instruction on
-`FAULT_REPLY_RESUME`, takes the unhandled outcome on `FAULT_REPLY_KILL`, and delivers the fault
-through its exception class on a forwarding `FAULT_REPLY_FORWARD` (see
+`FAULT_REPLY_RESUME`, takes the unhandled outcome on `FAULT_REPLY_KILL`, and on
+`FAULT_REPLY_FORWARD` delivers the fault through its exception class when it is a virtual-memory
+fault other than a kernel copy's and an exception handler is bound, and otherwise takes the
+unhandled outcome (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). A target blocked in an upcall delivery (`FAULT_KIND_UPCALL`) is killed in
 neither case: a stop that cancels the delivery drops the upcall, any reply that claimed it first
@@ -1564,13 +1567,17 @@ syscall point, its syscall returns its own result;
 [docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
 Upcalls). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
 cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker
-or the sleep timer claimed it first).
+or the elapsed deadline of a sleep or a timed wait claimed it first).
 A target that blocks while the stop is in progress is cancelled the same way, never left registered
 as a waiter (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop`
 Cross-CPU Stop Protocol). A target waiting on an endpoint (queued to send or receive), a
 notification, an event queue, or a wait set whose last capability is deleted concurrently is
 claimed either by the stop or by the object's teardown, and both stamp the same cancellation: on
-restart its syscall returns `Interrupted`, or a queued fault sender is killed. A thread running on
+restart its syscall returns `Interrupted`, or a queued fault sender is killed (a restartable
+syscall's copy fault fails that syscall with `InvalidAddress`, and a queued upcall delivery has its
+upcall dropped and resumes;
+[docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
+Upcalls). A thread running on
 another CPU is marked `Stopped` under every CPU's scheduler lock, and the call returns once that
 CPU has descheduled it and published its register save, at its next slice expiry, at a tick
 that preempts it for an RT thread (a target dispatched at a fair level), or at the thread's own
@@ -1985,7 +1992,9 @@ its address space's teardown has begun, or a read-only page's frame is mapped mo
 Bind (or clear) the per-thread fault-handler endpoint for the fault classes a mask selects. A
 kernel-unresolvable fault on the target thread is delivered as a synchronous, kernel-originated
 IPC to the receiver of its class's endpoint, suspending the thread until the handler replies; with
-no handler bound for its class the fault is terminal. See
+no handler bound for its class the fault takes its unhandled outcome: the thread is killed, or a
+restartable syscall's copy fails with `InvalidAddress`
+([Restartable Syscalls](#restartable-syscalls)), and an upcall is not posted or is dropped. See
 [`docs/fault-handling.md`](../../../docs/fault-handling.md).
 
 **Arguments:**
@@ -3069,7 +3078,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
   `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
   or is posted an upcall it does not mask (`SYS_THREAD_POST_UPCALL`), unless its wake (a delivery,
-  or a sleep's elapsed deadline) was claimed first. `SYS_IPC_CALL` and
+  or the elapsed deadline of a sleep or a timed wait) was claimed first. `SYS_IPC_CALL` and
   `SYS_IPC_RECV` queued on an endpoint, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
   `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
   caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or

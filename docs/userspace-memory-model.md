@@ -446,6 +446,10 @@ registers a range via `std::os::seraph::register_demand_paged`, and on each
 first-touch fault memmgr backs the chunk of the registered region that
 contains the faulting page (up to `DEMAND_CHUNK_PAGES` pages; see
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)).
+The process tears the range down with `std::os::seraph::unregister_demand_paged`,
+which unregisters it with memmgr (`UNREGISTER_REGION`), so memmgr unmaps and
+reclaims the frames it backed, and releases the reservation only once memmgr has
+answered.
 Stacks grow the same way: a spawned thread's stack is a demand region above
 an unregistered guard page
 ([ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)),

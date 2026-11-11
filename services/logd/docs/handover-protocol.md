@@ -49,12 +49,15 @@ In-flight history from the prior instance is not recoverable.
 
 logd creates its death-notification `EventQueue` and registers it with procmgr
 (`REGISTER_DEATH_EQ`) before it issues the first `HANDOVER_PULL`. The handover ends with
-init-logd exiting, which lets procmgr reap init; that reap logs, and until logd enters its
-receive loop the master log endpoint has no reader. Registering first, while init-logd still
+init-logd exiting, which lets procmgr reap init; that reap logs, and until logd's receive workers
+start receiving the master log endpoint has no reader. Registering first, while init-logd still
 serves the endpoint and procmgr is not yet reaping init, keeps logd from blocking on procmgr in
-that window, which would deadlock against procmgr blocking on the unread log endpoint. After the
-release, logd has no further procmgr dependency before its receive loop, so it drains the reap's
-log line itself (see [`main.rs`](../src/main.rs)).
+that window, which would deadlock against procmgr blocking on the unread log endpoint. For the same
+reason logd spawns its receive workers before the pull, behind the receive pool's gate: each
+worker's start waits on procmgr's thread registration, and the spawn returns once every worker
+has started ([`ipc-interface.md`](ipc-interface.md) § Receive pool). After the release, logd has
+no further procmgr dependency before it opens the gate, so its workers drain the reap's log line
+(see [`main.rs`](../src/main.rs)).
 
 Until init-logd acknowledges the release, it writes each line it forwards to the UART directly, byte
 by byte, and logd's serial writes go through the serial driver to the same UART; the two share no

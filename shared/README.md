@@ -19,6 +19,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`namespace-protocol/`](namespace-protocol/README.md) | Cap-native namespace wire format, name validation, rights composition, and per-request `NamespaceBackend` dispatch used by every namespace server |
 | [`ns-client/`](ns-client/README.md) | `no_std` namespace walk helpers for holders of a vfsd namespace cap |
 | [`process-layout/`](process-layout/README.md) | Per-process bootstrap virtual-address layout for process creators |
+| [`recv-pool/`](recv-pool/README.md) | Worker-pool receive helper: several threads serving one endpoint, each on its own IPC buffer page |
 | [`registry/`](registry/README.md) | Growable name→endpoint-cap registry used by supervisor services |
 | [`registry-client/`](registry-client/README.md) | Client-side helper for the svcmgr name→cap discovery registry |
 | [`riscv-step/`](riscv-step/README.md) | Successor-address decoder a debugger single-steps a riscv64 thread with |

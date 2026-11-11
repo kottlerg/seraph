@@ -14,6 +14,8 @@ ipc = { path = "../../shared/ipc" }
 # Pure handover decoding and diagnostic formatting, extracted so it is
 # host-testable.
 logd-codec = { path = "codec" }
+# The worker pool that receives on the master log endpoint.
+recv-pool = { path = "../../shared/recv-pool" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }
 

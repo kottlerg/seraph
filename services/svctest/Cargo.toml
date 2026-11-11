@@ -24,6 +24,9 @@ process-layout = { path = "../../shared/process-layout" }
 # `FIRST_POOL_OBSERVERS`: the death_queue_growth phase sizes its children
 # from procmgr's first death-queue pool.
 process_table = { path = "../procmgr/process-table", package = "procmgr-process-table" }
+# `RecvPool`: the recv_pool phase serves an endpoint of its own through the
+# worker pool.
+recv-pool = { path = "../../shared/recv-pool" }
 syscall = { path = "../../shared/syscall" }
 # `MSG_DATA_WORDS_MAX`: the `fs_std` rename cell sizes its long leaf names
 # so two of them overflow the `FS_RENAME` data area, and the

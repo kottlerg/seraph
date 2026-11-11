@@ -2226,15 +2226,14 @@ pub fn release_registered_thread(thread: process_table::RegisteredThread)
 /// registered thread takes the action `ProcessTable::restore_action` names
 /// by the origin its registration recorded: one recorded as the process's
 /// own is bound again under its crash badge, minted for one that has none,
-/// when the main thread's rule would bind it; one left under another
-/// process's badge is bound back under that badge from a debugger's binding
-/// while that process lives undeclared; and any other is never bound to the
-/// crash endpoint, a debugger's binding on it unbound. Each upcall class a
-/// debugger bound is unbound, so no thread stays bound to a dead debugger's
-/// endpoint. A thread whose bind fails keeps the binding it has, as does
-/// every thread that needs a fresh crash badge when procmgr's heap cannot
-/// hold them. A declared process (`DECLARE_NO_DEBUG`) is never bound back,
-/// and a badge naming no live process changes nothing.
+/// when the main thread's rule would bind it; any other, one left under
+/// another process's badge included, is never bound to the crash endpoint,
+/// a debugger's binding on it unbound. Each upcall class a debugger bound is
+/// unbound, so no thread stays bound to a dead debugger's endpoint. A thread
+/// whose bind fails keeps the binding it has, as does every thread that
+/// needs a fresh crash badge when procmgr's heap cannot hold them. A
+/// declared process (`DECLARE_NO_DEBUG`) is never bound back, and a badge
+/// naming no live process changes nothing.
 pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
 {
     let Some(entry) = table.find_mut_by_badge(badge)
@@ -2283,11 +2282,7 @@ pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
                     0 => fresh.pop().unwrap_or(0),
                     b => b,
                 };
-                // A crash badge is recorded as the thread's; another
-                // process's badge stays that process's.
-                if under != 0
-                    && bind_exception_class(t.cap, under)
-                    && process_table::threads::is_crash_badge(under)
+                if under != 0 && bind_exception_class(t.cap, under)
                 {
                     t.crash_badge = under;
                 }

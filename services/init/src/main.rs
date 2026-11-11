@@ -72,8 +72,7 @@ fn query_thread_retype_pages() -> Option<u64>
     {
         return Some(cached);
     }
-    let bytes =
-        syscall::system_info(syscall_abi::SystemInfoType::ThreadRetypeBytes as u64).ok()?;
+    let bytes = syscall::system_info(syscall_abi::SystemInfoType::ThreadRetypeBytes as u64).ok()?;
     let pages = bytes.div_ceil(PAGE_SIZE);
     CACHED.store(pages, Ordering::Relaxed);
     Some(pages)

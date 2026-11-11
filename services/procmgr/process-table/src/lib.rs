@@ -467,7 +467,7 @@ impl ProcessTable
     ///   own registry lists on a thread recorded [`Origin::Own`], so the
     ///   origin carries through a thread's earlier registration;
     /// * [`Origin::Owner`] for another live process's badge, which procmgr
-    ///   leaves on the thread;
+    ///   leaves on the thread, and which no restore binds under;
     /// * [`Origin::Unknown`] otherwise: a crash badge another live registry
     ///   lists, or the sender's lists on a thread not recorded as its own,
     ///   another handler's badge, or no binding.
@@ -520,17 +520,16 @@ impl ProcessTable
     /// * [`Origin::Own`]: bound back under its crash badge, a fresh one when
     ///   it has none, when [`ProcessEntry::restores`] says so, as the main
     ///   thread is;
-    /// * [`Origin::Owner`]: bound back under that process's badge, the binding
-    ///   it had at the registration, from a debugger's binding while that
-    ///   process lives undeclared;
-    /// * any other: never bound to the crash endpoint.
+    /// * any other, [`Origin::Owner`] included: never bound to the crash
+    ///   endpoint. The badge an `Owner` record carries is a value any process
+    ///   can bind a thread of its own under, so procmgr binds nothing under
+    ///   it.
     ///
     /// A debugger's binding never stays: one the rules above do not bind over
-    /// is unbound. No other binding changes. So a restore binds a thread under
-    /// a crash badge of the sender's only when the thread is recorded as the
-    /// sender's own, and under another badge only the one it had when the
-    /// sender registered it. A badge that names no live process leaves every
-    /// thread.
+    /// is unbound. No other binding changes. So a restore binds a thread to
+    /// the crash endpoint only when the thread is recorded as the sender's
+    /// own, and only under a crash badge of the sender's. A badge that names
+    /// no live process leaves every thread.
     #[must_use]
     pub fn restore_action(
         &self,
@@ -550,11 +549,6 @@ impl ProcessTable
             Origin::Own if entry.restores(current, thread.crash_badge) =>
             {
                 RestoreAction::Bind(thread.crash_badge)
-            }
-            Origin::Owner(owner)
-                if from_debugger && self.find_by_badge(owner).is_some_and(|e| !e.no_debug) =>
-            {
-                RestoreAction::Bind(owner)
             }
             _ if from_debugger => RestoreAction::Unbind,
             _ => RestoreAction::Leave,
@@ -1420,8 +1414,8 @@ mod tests
     fn a_process_handle_names_its_child_and_sends_neither_declaration_nor_registration()
     {
         use ipc::procmgr_labels::{
-            DECLARE_NO_DEBUG, DESTROY_PROCESS, PROCESS_HANDLE_TAG, QUERY_PROCESS,
-            REGISTER_THREAD, START_PROCESS,
+            DECLARE_NO_DEBUG, DESTROY_PROCESS, PROCESS_HANDLE_TAG, QUERY_PROCESS, REGISTER_THREAD,
+            START_PROCESS,
         };
         // A child's own procmgr cap carries its process badge alone; its
         // process handle carries the tag too, which procmgr clears.
@@ -1503,14 +1497,7 @@ mod tests
     ) -> (RegisteredThread, u64)
     {
         let origin = table.origin_of(sender, Some(bound));
-        let crash = if rebound
-        {
-            table.mint_crash_badge()
-        }
-        else
-        {
-            0
-        };
+        let crash = if rebound { table.mint_crash_badge() } else { 0 };
         let record = RegisteredThread::new(9, crash, origin);
         let entry = table.find_mut_by_badge(sender).unwrap();
         entry.threads.reserve().unwrap();
@@ -1563,40 +1550,39 @@ mod tests
     }
 
     #[test]
-    fn a_restore_never_binds_a_declared_processs_thread_back()
+    fn a_restore_never_binds_a_thread_under_the_badge_its_registration_showed()
     {
-        // The creator 0x40 registered its child 0x50's main thread, left
-        // under the child's badge; the child then declared, which unbound
-        // that thread.
         let debugger = ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3;
         let (mut table, _) = two_processes();
-        let child_main = RegisteredThread::new(9, 0, table.origin_of(0x40, Some(0x50)));
-        assert_eq!(child_main.origin(), Origin::Owner(0x50));
-        // Until the child declares, a debugger's binding goes back to the
-        // child's own, and the child's own binding stays.
-        assert_eq!(
-            table.restore_action(0x40, &child_main, Some(debugger)),
-            RestoreAction::Bind(0x50)
-        );
-        assert_eq!(
-            table.restore_action(0x40, &child_main, Some(0x50)),
-            RestoreAction::Leave
-        );
-        let _ = table.declare_no_debug(0x50);
-        assert_eq!(
-            table.restore_action(0x40, &child_main, None),
-            RestoreAction::Leave
-        );
-        assert_eq!(
-            table.restore_action(0x40, &child_main, Some(debugger)),
-            RestoreAction::Unbind
-        );
-        // Nor once the child is gone.
+        // The creator 0x40 registered its child 0x50's main thread, left
+        // under the child's badge. The sender 0x40 could as well have bound a
+        // thread of its own under the badge value 0x50 on an endpoint of its
+        // own: procmgr reads the badge alone, so the two registrations make
+        // one record.
+        let left = RegisteredThread::new(9, 0, table.origin_of(0x40, Some(0x50)));
+        assert_eq!(left.origin(), Origin::Owner(0x50));
+        // A debugger's binding on it is taken off, never replaced by a
+        // binding under 0x50, whatever state 0x50 is in; any other binding
+        // stays.
+        let check = |table: &ProcessTable| {
+            assert_eq!(
+                table.restore_action(0x40, &left, Some(debugger)),
+                RestoreAction::Unbind
+            );
+            for current in [None, Some(0x50), Some(0x40), Some(0x99)]
+            {
+                assert_eq!(
+                    table.restore_action(0x40, &left, current),
+                    RestoreAction::Leave,
+                    "{current:?}"
+                );
+            }
+        };
+        check(&table);
+        assert!(table.declare_no_debug(0x50).is_some());
+        check(&table);
         let _ = table.take_by_badge(0x50);
-        assert_eq!(
-            table.restore_action(0x40, &child_main, Some(debugger)),
-            RestoreAction::Unbind
-        );
+        check(&table);
     }
 
     #[test]
@@ -1658,12 +1644,11 @@ mod tests
     /// binding a restore can find: the sender's own crash badge, another
     /// live registry's, an orphaned one, each process badge, a gone one, a
     /// debugger's, another handler's, and none. Its invariants: a thread is
-    /// bound under a crash badge only when recorded as the sender's own, and
-    /// then by the main thread's rule; under another badge only its recorded
-    /// owner's, live and undeclared, from a debugger's binding; a debugger's
-    /// binding never stays; and nothing else is touched.
+    /// bound to the crash endpoint only when recorded as the sender's own, by
+    /// the main thread's rule, and only under its own crash badge or a fresh
+    /// one; a debugger's binding never stays; and nothing else is touched.
     #[test]
-    fn a_restore_binds_back_only_the_senders_own_threads_and_an_owners_left_one()
+    fn a_restore_binds_back_only_the_senders_own_threads()
     {
         let debugger = ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3;
         let (mut table, [own, other, orphan]) = two_processes();
@@ -1706,21 +1691,15 @@ mod tests
                         {
                             RestoreAction::Bind(crash)
                         }
-                        Origin::Owner(0x50) if from_debugger => RestoreAction::Bind(0x50),
                         _ if from_debugger => RestoreAction::Unbind,
                         _ => RestoreAction::Leave,
                     };
                     assert_eq!(action, expected, "{case:?}");
                     match action
                     {
-                        RestoreAction::Bind(b) if origin == Origin::Own =>
-                        {
-                            assert_eq!(b, crash, "{case:?}");
-                        }
                         RestoreAction::Bind(b) =>
                         {
-                            assert!(b == 0x50 && origin == Origin::Owner(0x50), "{case:?}");
-                            assert!(from_debugger, "{case:?}");
+                            assert!(origin == Origin::Own && b == crash, "{case:?}");
                         }
                         RestoreAction::Unbind => assert!(from_debugger, "{case:?}"),
                         RestoreAction::Leave => assert!(!from_debugger, "{case:?}"),

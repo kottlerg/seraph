@@ -72,8 +72,10 @@ pub enum Origin
     /// the sender's.
     Own,
     /// Left under another live process's badge, the one it carries, which
-    /// procmgr never rebinds at a registration. A restore binds it back under
-    /// that badge alone.
+    /// procmgr never rebinds at a registration. A restore never binds it to
+    /// the crash endpoint: procmgr reads the binding's badge alone, and any
+    /// process can bind a thread of its own under that value on an endpoint
+    /// of its own.
     Owner(u64),
     /// Any other: a crash badge another registry lists, or the sender's
     /// registry lists on a thread not recorded as its own, another handler's

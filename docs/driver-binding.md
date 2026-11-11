@@ -11,12 +11,13 @@ not yet implemented.
 
 ## Status
 
-Implemented for PCI device records: every driver binary carries its declaration (§ Driver
-Declarations); devmgr reads the declarations of the boot modules it starts no fixed path for and
-of the drivers-directory entries, within § Declaration Bounds as far as they concern a PCI
-record; it matches them against the PCI records (§ Matching), binds each matched record through
-one path that delivers the resource list (§ Binding), and withdraws a bound driver in the order
-§ Binding gives. The rest is design intent; not yet implemented:
+Implemented for PCI device records: every driver binary but the test-only `test-fault` and
+`test-orphan` fixtures carries its declaration (§ Driver Declarations); devmgr reads the
+declarations of the boot modules it starts no fixed path for and of the drivers-directory
+entries, within § Declaration Bounds as far as they concern a PCI record; it matches them
+against the PCI records (§ Matching), binds each matched record through one path that delivers
+the resource list (§ Binding), and withdraws a bound driver in the order § Binding gives. The
+rest is design intent; not yet implemented:
 
 - every enumerator but PCI (§ Device Records): devmgr starts the serial, framebuffer, RTC, and
   IOMMU drivers on fixed paths of their own, and gives them their simple-device or IOMMU
@@ -27,7 +28,8 @@ one path that delivers the resource list (§ Binding), and withdraws a bound dri
 - device classes (§ Device Classes): the class files, the boot-only mark, `QUERY_DEVICE`, and
   the generic badge. devmgr serves each class under the class name its drivers declare, through
   one query label per class;
-- the retirement of the test-only labels (§ Test Fixtures).
+- the retirement of the test-only labels, and the declarations of the `test-fault` and
+  `test-orphan` fixtures, which devmgr starts only on those labels (§ Test Fixtures).
 
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
 § Responsibilities specifies the running system.

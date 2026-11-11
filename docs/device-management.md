@@ -537,7 +537,7 @@ devmgr loads driver binaries from one of two places:
   also live there; devmgr spawns them only on
   `devmgr_labels::TEST_SPAWN_ORPHAN` and `TEST_SPAWN_FAULT_DRIVERS`
   (gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only `devmgr.test` cap carries), so
-  a boot without svctest spawns neither. Every binary in a directory carries its declaration in
+  a boot without svctest spawns neither. Every other binary there carries its declaration in
   the ELF note section `.note.seraph.driver`; devmgr reads the declaration of each entry once
   `SET_DRIVERS_DIR` arrives and binds the PCI devices still unbound: virtio-input,
   virtio-console, and test-dma, none of which is on the read-the-disk critical path, ship only

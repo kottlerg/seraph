@@ -151,8 +151,9 @@ The full driver lifecycle is specified in
   capability types and rights.
 - **Spawning** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
   discovers devices (PCI enumeration, firmware tables), matches each PCI device to the most
-  specific driver declaration (every driver binary carries one in the ELF note section
-  `.note.seraph.driver`, emitted by `driver_binding::driver_declaration!`; see
+  specific driver declaration (every driver binary but the test-only `test-fault` and
+  `test-orphan` fixtures carries one in the ELF note section `.note.seraph.driver`, emitted by
+  `driver_binding::driver_declaration!`; see
   [docs/driver-binding.md](../../docs/driver-binding.md)), and requests procmgr to create driver
   processes. devmgr then delegates per-device capabilities to the new process.
 - **Communication** — drivers expose IPC endpoints for their clients (e.g. a

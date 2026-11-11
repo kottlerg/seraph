@@ -1987,7 +1987,8 @@ pub mod devmgr_labels
     /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = badged SEND on the
     /// `/services/drivers/` directory node, which svcmgr walks from its
     /// system root via `namespace_lookup_dir(root_dir_cap, …, LOOKUP |
-    /// READ)` (so the node is served by the root filesystem).
+    /// READ | READDIR)` (so the node is served by the root filesystem, and
+    /// devmgr can list it with `NS_READDIR`).
     /// Caller's badge MUST carry [`DRIVERS_DIR_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
     /// [`super::devmgr_errors::INVALID_REQUEST`] when `caps[0]` is
@@ -1996,11 +1997,13 @@ pub mod devmgr_labels
     ///
     /// Devmgr stashes the cap and replies
     /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
-    /// work, so svcmgr never blocks on driver bring-up. The actual walk,
-    /// the [`super::procmgr_labels::CREATE_FROM_FILE`] call, and the
-    /// bootstrap-round delivery for the on-disk drivers (the per-arch RTC,
-    /// virtio-input, and virtio-console; #165 will generalize), and the settle that waits
-    /// for each of them to report ready ([`DRIVER_READY`]), run after the
+    /// work, so svcmgr never blocks on driver bring-up. The spawn of the
+    /// per-arch RTC driver, the drivers-directory pass (the listing, the
+    /// read of each entry's driver declaration, and the bind of every PCI
+    /// device still unbound that a declaration matches), the
+    /// [`super::procmgr_labels::CREATE_FROM_FILE`] calls and bootstrap
+    /// rounds they make, and the settle that waits for each driver to
+    /// report ready ([`DRIVER_READY`]), run after the
     /// reply but before devmgr returns to its next `ipc_recv`. The nested
     /// IPC chain the spawn requires (procmgr → vfsd → block driver) cannot
     /// run inside a request-handler frame without clobbering the

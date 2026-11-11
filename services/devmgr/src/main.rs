@@ -2156,9 +2156,9 @@ fn spawn_rtc_from_disk(
         return;
     };
     // Request READ rights on the resolved file node. The cap svcmgr handed
-    // us in SET_DRIVERS_DIR is already attenuated to LOOKUP|READ at the
-    // /services/drivers/ subtree, so the namespace server will only ever
-    // mint a file cap with at most those bits set.
+    // us in SET_DRIVERS_DIR is already attenuated to LOOKUP|READ|READDIR at
+    // the /services/drivers/ subtree, so the namespace server will only
+    // ever mint a file cap with at most those bits set.
     let requested_rights = u64::from(namespace_protocol::rights::READ);
     // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
     // registered at startup), passed down unchanged.

@@ -20,8 +20,9 @@ use driver_binding::decl::ClassName;
 
 use crate::served::Served;
 
-/// The most device classes the table holds; a declaration naming a class
-/// past it is served under no class, and logged.
+/// The most device classes the table holds; past it [`Classes::intern`]
+/// finds no room, and devmgr withdraws the ready driver of a class that
+/// finds none, logged.
 pub const MAX_CLASSES: usize = 64;
 
 /// The served drivers of every class, by class name.

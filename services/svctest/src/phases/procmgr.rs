@@ -992,18 +992,16 @@ const SPAWNS_PER_THREAD: usize = 3;
 /// procmgr opens the file before it reads the size.
 const STALLED_FILE_SIZE: u64 = 4096;
 
-/// The reply label the stalled file server answers `FS_OPEN` with: any
-/// nonzero label is a failed open to procmgr.
-const STALLED_OPEN_REFUSAL: u64 = 1;
-
 /// procmgr serves a create on one request worker while others serve the
 /// rest (services/procmgr/README.md § Concurrency). A thread of svctest
 /// serves an endpoint whose SEND cap is the file cap of a `CREATE_FROM_FILE`
 /// another thread makes, and holds procmgr's `FS_OPEN` unanswered. While
 /// it is held, [`CONCURRENT_SPAWNERS`] threads each spawn `/programs/hello`
 /// [`SPAWNS_PER_THREAD`] times, at once, and every child must exit cleanly.
-/// The server then refuses the open, and the stalled create must fail with
-/// `IO_ERROR` (services/procmgr/docs/ipc-interface.md § Label 13).
+/// The server never answers, and the stalled create must fail with
+/// `IO_ERROR` once procmgr's bound on the call passes
+/// (`FILE_CAP_CALL_TIMEOUT_MS`, services/procmgr/docs/ipc-interface.md
+/// § Label 13).
 pub fn procmgr_concurrent_spawn_phase(_: &Caps)
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -1018,7 +1016,7 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
         .expect("procmgr_concurrent_spawn: deriving the file cap failed");
 
     // The stalled file server: receive procmgr's FS_OPEN, report its label,
-    // and answer only when told to.
+    // and never answer it; the thread ends when told to.
     let (opened_tx, opened_rx) = mpsc::channel::<u64>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let server = std::thread::Builder::new()
@@ -1038,10 +1036,6 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
             release_rx
                 .recv()
                 .expect("stalled file server: release failed");
-            let refusal = IpcMessage::new(STALLED_OPEN_REFUSAL);
-            // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
-            unsafe { ipc::ipc_reply(&refusal, ipc_buf) }
-                .expect("stalled file server: reply failed");
         })
         .expect("procmgr_concurrent_spawn: server thread spawn failed");
 
@@ -1103,20 +1097,20 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
             .expect("procmgr_concurrent_spawn: a spawner panicked");
     }
 
-    release_tx
-        .send(())
-        .expect("procmgr_concurrent_spawn: releasing the server failed");
-    server
-        .join()
-        .expect("procmgr_concurrent_spawn: the stalled server panicked");
     let code = stalled
         .join()
         .expect("procmgr_concurrent_spawn: the stalled create panicked");
     assert_eq!(
         code,
         procmgr_errors::IO_ERROR,
-        "a create whose FS_OPEN was refused replied {code}, not IO_ERROR"
+        "a create whose FS_OPEN went unanswered replied {code}, not IO_ERROR"
     );
+    release_tx
+        .send(())
+        .expect("procmgr_concurrent_spawn: releasing the server failed");
+    server
+        .join()
+        .expect("procmgr_concurrent_spawn: the stalled server panicked");
     let _ = syscall::cap_delete(endpoint);
 }
 

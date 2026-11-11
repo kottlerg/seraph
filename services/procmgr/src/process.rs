@@ -20,6 +20,25 @@ use syscall_abi::{
     EXIT_KILLED, FAULT_CLASS_EXCEPTION, FAULT_CLASS_UPCALL, FAULT_CLASS_VM, PAGE_SIZE, SyscallError,
 };
 
+/// How long procmgr waits, at most, on each call it makes on a
+/// caller-supplied file cap (`FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`,
+/// `FS_RELEASE_MEMORY`, `FS_CLOSE`): 10 s. The cap's server is untrusted, so
+/// a server that never answers fails the create with `IO_ERROR` once the
+/// bound passes instead of holding the request worker for good
+/// (services/procmgr/README.md § Concurrency).
+const FILE_CAP_CALL_TIMEOUT_MS: u32 = 10_000;
+
+/// Call the server of a caller-supplied file cap, bounded by
+/// [`FILE_CAP_CALL_TIMEOUT_MS`].
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+unsafe fn file_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
+{
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe { ipc::ipc_call_timeout(cap, msg, ipc_buf, FILE_CAP_CALL_TIMEOUT_MS) }
+}
+
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 /// The reply's `MSG_DATA_WORDS_MAX` words less the count word fix it, and
 /// `fill_exact` issues as many reads as a file needs.
@@ -2964,7 +2983,7 @@ fn vfs_read_memory(
         .build();
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { file_call(file_cap, &msg, ipc_buf) }.ok()?;
     let bytes_valid = reply.word(0) as usize;
     let (kept, surplus) =
         process_table::fs_reads::read_memory_reply_caps(reply.label, bytes_valid, reply.caps());
@@ -2993,7 +3012,7 @@ fn vfs_read(
         .build();
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { file_call(file_cap, &msg, ipc_buf) }.ok()?;
     // FS_READ replies carry no caps; the untrusted server's are deleted.
     crate::release_caps(reply.caps());
     if reply.label != 0
@@ -3023,7 +3042,7 @@ fn vfs_open(node_cap: u64, ipc_buf: *mut u64) -> Option<OpenedFile>
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_OPEN);
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) };
+    let reply = unsafe { file_call(node_cap, &msg, ipc_buf) };
     let _ = syscall::cap_delete(node_cap);
     let reply = reply.ok()?;
     let (opened, surplus) = match *reply.caps()
@@ -3054,7 +3073,7 @@ fn vfs_close(file: OpenedFile, ipc_buf: *mut u64)
     let file_cap = file.cap;
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if let Ok(reply) = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
+    if let Ok(reply) = unsafe { file_call(file_cap, &msg, ipc_buf) }
     {
         // FS_CLOSE replies carry no caps; the untrusted server's are deleted.
         crate::release_caps(reply.caps());
@@ -3467,7 +3486,7 @@ fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
         .word(0, cookie)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if let Ok(reply) = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
+    if let Ok(reply) = unsafe { file_call(file_cap, &msg, ipc_buf) }
     {
         // FS_RELEASE_MEMORY replies carry no caps; the untrusted server's
         // are deleted.

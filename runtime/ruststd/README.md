@@ -458,7 +458,9 @@ Two patterns would deadlock once they hold every one of procmgr's request worker
 process follows either: a spawner that waits on its new thread without bound while procmgr waits on
 that spawner; and a process that hands procmgr a cap which a newly spawned thread serves (a file or
 node for `CREATE_FROM_FILE`, say) before that thread's registration has been served, so procmgr's
-call on the cap waits on a thread that waits for a free worker.
+call on the cap waits on a thread that waits for a free worker. The second holds only until
+procmgr's bound on each call on a caller-supplied file cap passes (`FILE_CAP_CALL_TIMEOUT_MS`,
+10 s), which fails the create.
 
 ---
 

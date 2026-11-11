@@ -297,9 +297,12 @@ procmgr serves its service endpoint on a pool of four request workers (`RECV_WOR
 thread among them), on the [`shared/recv-pool`](../../shared/recv-pool/README.md) crate, and reaps
 on a thread of its own, the reaper (`procmgr-reaper`), the only thread that waits on the death
 queues' wait set. A create that waits on a slow file server, on memmgr, or on the kernel holds one
-worker; the others go on serving, and the reaper goes on reaping. A caller past the four workers
-waits in the endpoint's queue. procmgr's own `ProcessInfo` names no procmgr endpoint, so its threads
-send no `REGISTER_THREAD` and start without waiting on one
+worker; the others go on serving, and the reaper goes on reaping. A file server is the creator's to
+choose, so each call on a caller-supplied file cap is bounded at `FILE_CAP_CALL_TIMEOUT_MS` (10 s),
+past which the create fails with `IO_ERROR`
+([docs/ipc-interface.md](docs/ipc-interface.md) § Label 13: `CREATE_FROM_FILE`). A caller past the
+four workers waits in the endpoint's queue. procmgr's own `ProcessInfo` names no procmgr endpoint,
+so its threads send no `REGISTER_THREAD` and start without waiting on one
 ([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Thread registration).
 
 The shared state is behind these locks:

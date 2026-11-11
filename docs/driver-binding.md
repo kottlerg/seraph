@@ -325,7 +325,9 @@ One registry label, `QUERY_DEVICE`, serves every class. It carries an instance o
 never from the message; a registry SEND without a class slot gets `UNAUTHORIZED`. devmgr
 answers with the SEND on the served driver at that ordinal, stamped with the badge's verb mask,
 `WITHDRAWN` at a withdrawn driver's ordinal, and `NO_DEVICE` past the last served driver of the
-class or before the pass that binds it has settled. A class's
+class, which a class whose drivers the drivers-directory pass binds is at every ordinal before
+`SET_DRIVERS_DIR` arrives. A query received while that pass or its settle runs, whose answer
+would name no driver, waits until both are done and is answered from the settled drivers. A class's
 ordinals are assigned in the order its drivers are first served: within one pass in record
 order, and a later pass appends after every ordinal an earlier pass assigned. An ordinal never
 moves once its pass settles, and a withdrawn driver's ordinal stays as a tombstone. A

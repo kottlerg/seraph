@@ -115,12 +115,26 @@ pub unsafe fn populate_kernel_mmio(firmware: &FirmwareInfo, km: &mut KernelMmio)
     // what the firmware tables actually provided so a refusal is
     // diagnosable from the boot log.
     crate::bprintln!(
-        "[--------] boot: hart caps: timebase-frequency={} Hz, sstc={}, svpbmt={}, svinval={}, svnapot={}",
+        "[--------] boot: hart caps: timebase-frequency={} Hz, sstc={}, svpbmt={}, svinval={}, svnapot={}, ssaia={}",
         km.timebase_freq,
         km.hart_caps & boot_protocol::HART_CAP_SSTC != 0,
         km.hart_caps & boot_protocol::HART_CAP_SVPBMT != 0,
         km.hart_caps & boot_protocol::HART_CAP_SVINVAL != 0,
-        km.hart_caps & boot_protocol::HART_CAP_SVNAPOT != 0
+        km.hart_caps & boot_protocol::HART_CAP_SVNAPOT != 0,
+        km.hart_caps & boot_protocol::HART_CAP_SSAIA != 0
+    );
+    crate::bprintln!(
+        "[--------] boot: AIA: APLIC base={:#x} size={:#x} sources={}, IMSIC base={:#x} ids={} \
+         guest-bits={} hart-bits={} group-bits={} group-shift={}",
+        km.aplic.base,
+        km.aplic.size,
+        km.aplic.sources,
+        km.imsic.base,
+        km.imsic.ids,
+        km.imsic.guest_index_bits,
+        km.imsic.hart_index_bits,
+        km.imsic.group_index_bits,
+        km.imsic.group_index_shift
     );
 }
 

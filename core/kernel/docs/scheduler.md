@@ -484,22 +484,32 @@ idles. A thread queued behind a running thread that never blocks or yields to it
 strict priority) stays queued for as long as that thread runs. The threshold does not see
 one queued thread as an imbalance (a load of 2 with the linked idle thread), and
 `select_target_cpu` keeps a woken thread on its preferred CPU at that load. An idle CPU
-therefore pulls it within 2 + 2k + 2d idle ticks. k counts the CPUs ahead of it in the
-cursor's order whose queued threads no pull can take: each costs at most one tick to record
-and one to find nothing on, and the cursor then passes it. d counts the pulls a contended
-try-lock defers: each costs the tick it defers and, when it was a pull from the candidate,
-which every attempt clears, one more to record the candidate again. The heaviest CPU, when
-its load is past the threshold with nothing pullable on it, costs no tick: its pull moves
-nothing, and the confirmation rule then decides the same tick over the other CPUs (below).
-Any other CPU past the threshold with nothing pullable on it is recorded and costs its two
-ticks like any pinned backlog. The rule stays bounded: only an idle CPU pulls below the
-threshold, and a pull leaves it busy, so two busy CPUs never trade threads (the steady state
-the threshold protects); a busy CPU with nothing queued but its idle thread draws no attempt;
-a backlog that clears between two idle ticks stays with the CPU whose caches hold it; and a
-backlog of pinned threads, which no pull can take, draws at most one try-lock attempt per
-idle CPU every two ticks while its load reads at or below the threshold (above it, one per
-idle CPU every tick, and two in a tick whose pull above the threshold moves nothing while a
-candidate is confirmed).
+therefore pulls it, or another queued thread, within 2 + 2k + 2d + 2r idle ticks: one tick to
+record it and one to pull it, plus what each other outcome of an idle tick costs.
+
+- Recording a CPU ahead of it in the cursor's order whose queued threads no pull can take
+  (pinned, or mid-handoff) costs two ticks: one to record that CPU and one to find nothing
+  on it, after which the cursor passes it. k counts these CPUs.
+- A pull that a contended try-lock defers costs at most two ticks. A deferred pull from the
+  candidate costs the tick it defers and one more to record a candidate again, since every
+  attempt clears the candidate. A deferred pull above the threshold costs at most the tick
+  in which the rule keeps its victim as the candidate, or records it in the backlog's place.
+  d counts these pulls.
+- Recording a candidate whose backlog clears before the pull from it, the thread running on
+  its own CPU, costs at most two ticks: the one that recorded it, and the pull's when the
+  pull, rather than the next tick's check, finds it cleared. r counts these candidates.
+- A pull above the threshold that moves nothing for any other reason costs no tick, since
+  the confirmation rule decides the same tick (below). So the heaviest CPU, when its load is
+  past the threshold with nothing pullable on it, costs nothing; any other CPU past the
+  threshold with nothing pullable on it is recorded, and counts in k.
+
+The rule stays bounded: only an idle CPU pulls below the threshold, and a pull leaves it busy,
+so two busy CPUs never trade threads (the steady state the threshold protects); a busy CPU
+with nothing queued but its idle thread draws no attempt; a backlog that clears between two
+idle ticks stays with the CPU whose caches hold it; and a backlog of pinned threads, which no
+pull can take, draws at most one try-lock attempt per idle CPU every two ticks while its load
+reads at or below the threshold (above it, one per idle CPU every tick, and two in a tick
+whose pull above the threshold moves nothing while a candidate is confirmed).
 
 The loads that choose a pull are read without the CPUs' locks, and a CPU's `schedule()`
 raises its own load for a moment under its lock: it counts every requeue of the running

@@ -177,6 +177,75 @@ pub fn locate_table_by_sig(caps: &DevmgrCaps, sig: [u8; 4]) -> Option<u64>
         .find(|&tbl_phys| read_table_sig(caps, tbl_phys) == Some(sig))
 }
 
+/// The ACPI tables the platform enumerators read
+/// (docs/driver-binding.md § Device Records).
+#[derive(Default)]
+pub struct PlatformTables
+{
+    /// The XSDT's OEM table ID, which chooses the platform description
+    /// table.
+    pub oem_table_id: Option<[u8; 8]>,
+    /// The physical address of the DSDT, then of every SSDT, in XSDT order.
+    pub definition_blocks: Vec<u64>,
+    /// The physical address of the SPCR.
+    pub spcr: Option<u64>,
+}
+
+/// Walk the XSDT once for the tables the platform enumerators read: its OEM
+/// table ID, the DSDT the FADT names, every SSDT, and the SPCR. Empty when no
+/// RSDP was delivered or the XSDT cannot be read; a table whose header cannot
+/// be read is skipped.
+pub fn platform_tables(caps: &DevmgrCaps) -> PlatformTables
+{
+    let mut out = PlatformTables::default();
+    let Some(xsdt_phys) = read_xsdt_phys(caps)
+    else
+    {
+        return out;
+    };
+    out.oem_table_id = with_acpi_bytes(
+        caps,
+        xsdt_phys,
+        firmware::acpi::SDT_HDR_LEN as u64,
+        firmware::acpi::sdt_oem_table_id,
+    );
+    let Some(entries) = read_xsdt_entries(caps, xsdt_phys)
+    else
+    {
+        return out;
+    };
+    let mut ssdts = Vec::new();
+    for tbl_phys in entries
+    {
+        match read_table_sig(caps, tbl_phys).as_ref()
+        {
+            Some(b"FACP") =>
+            {
+                if let Some(dsdt) = with_acpi_table(caps, tbl_phys, firmware::acpi::fadt_dsdt_phys)
+                    && out.definition_blocks.try_reserve(1).is_ok()
+                {
+                    out.definition_blocks.insert(0, dsdt);
+                }
+            }
+            Some(b"SSDT") =>
+            {
+                if ssdts.try_reserve(1).is_ok()
+                {
+                    ssdts.push(tbl_phys);
+                }
+            }
+            Some(b"SPCR") => out.spcr = out.spcr.or(Some(tbl_phys)),
+            _ =>
+            {}
+        }
+    }
+    if out.definition_blocks.try_reserve(ssdts.len()).is_ok()
+    {
+        out.definition_blocks.extend(ssdts);
+    }
+    out
+}
+
 /// Resolve an ACPI-table request to `(region, table_phys)`, per the
 /// `QUERY_ACPI_TABLE` contract: a zero `sig_word` looks `phys` up directly
 /// (e.g. the DSDT, whose address the caller read from the FADT); otherwise

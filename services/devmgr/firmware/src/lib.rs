@@ -24,7 +24,10 @@
 //! mappings (`dma`), walks the DMA Remapping table for the VT-d units and
 //! the functions each translates (`dmar`), and walks the RISC-V IO Mapping
 //! Table for the RISC-V IOMMUs that are PCI functions and the functions each
-//! translates (`rimt`).
+//! translates (`rimt`), walks a DSDT or SSDT's AML namespace for the devices
+//! with a static identity and decodes their resource templates (`aml`), and
+//! parses the SPCR and the platform description table of devices no firmware
+//! table lists (`platform`).
 //! The functions read caller-mapped byte slices or values, or reach the
 //! platform only through a caller-supplied accessor or split operation, and
 //! touch no syscall, IPC, or `std::os::seraph` surface, so the crate is
@@ -37,6 +40,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod acpi;
+pub mod aml;
 pub mod binding;
 pub mod classes;
 pub mod dma;
@@ -45,6 +49,8 @@ pub mod dtb;
 pub mod image;
 pub mod lines;
 pub mod pci;
+pub mod platform;
+pub mod records;
 pub mod resource;
 pub mod rimt;
 pub mod roster;

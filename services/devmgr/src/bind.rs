@@ -25,12 +25,14 @@
 
 use driver_binding::decl::{DriverDecl, InterruptNeed, Reset, Tier};
 use driver_binding::resources::{InterruptKind, Resource};
+use firmware::aml::CrsResource;
 use firmware::binding::{
     Candidate, Choice, MatchTable, PciIdentity, RecordKeys, Source, class_admits,
 };
 use firmware::classes::Classes;
 use firmware::dma::Confinement;
 use firmware::lines::{HoldError, LineError};
+use firmware::records::{PlatformRecord, PlatformRecords};
 use firmware::resource::{CarveError, Span, SplitError};
 use firmware::roster::Roster;
 use syscall_abi::PAGE_SIZE;
@@ -81,6 +83,69 @@ impl PciRecords
     }
 }
 
+/// Every device record a bind pass walks, in record order: the PCI records,
+/// then the platform records ([`crate::platform`]), and which of them a
+/// driver has been started for.
+pub struct Records
+{
+    pub pci: PciRecords,
+    platform: PlatformRecords,
+    platform_bound: Vec<bool>,
+}
+
+impl Records
+{
+    /// The PCI and platform records, none bound; `None` when the bound flags
+    /// cannot be allocated.
+    pub fn new(pci: PciRecords, platform: PlatformRecords) -> Option<Self>
+    {
+        let mut platform_bound = Vec::new();
+        platform_bound
+            .try_reserve_exact(platform.records().len())
+            .ok()?;
+        platform_bound.resize(platform.records().len(), false);
+        Some(Self {
+            pci,
+            platform,
+            platform_bound,
+        })
+    }
+
+    /// The number of records, PCI and platform: the most drivers the bind
+    /// passes can start, each record being bound at most once.
+    pub fn count(&self) -> usize
+    {
+        self.pci.devices.len() + self.platform_bound.len()
+    }
+
+    /// Whether `decl`, from `source`, matches a record no driver is bound
+    /// to.
+    fn matches_unbound(&self, decl: &DriverDecl, source: Source) -> bool
+    {
+        self.pci.matches_unbound(decl, source)
+            || self
+                .platform
+                .records()
+                .iter()
+                .zip(&self.platform_bound)
+                .any(|(r, &bound)| {
+                    !bound
+                        && r.with_keys(|k| firmware::binding::decl_rank(decl, source, k))
+                            .is_some()
+                })
+    }
+
+    /// Whether every record has a driver.
+    fn all_bound(&self) -> bool
+    {
+        self.pci
+            .bound
+            .iter()
+            .chain(&self.platform_bound)
+            .all(|&b| b)
+    }
+}
+
 /// The identity keys of a PCI record.
 fn keys(pci_dev: &pci::PciDevice) -> RecordKeys<'static>
 {
@@ -114,30 +179,25 @@ pub struct Carve<'a>
     pub catalog: &'a mut DeviceCatalog,
 }
 
-/// The boot pass: read the declaration of every boot module devmgr holds
-/// apart from those started on fixed paths ([`caps::module_kind::FIXED_PATH`]),
-/// bind the unbound records to them, and release every module cap, which
-/// would otherwise pin the pool run init donated it from.
-pub fn boot_pass(records: &mut PciRecords, carve: &mut Carve, pass: &mut Pass, ipc_buf: *mut u64)
+/// The boot pass: bind the unbound records to the declarations of `modules`,
+/// the declared boot modules the IOMMU pass left ([`decls::BootModules`]),
+/// and release every module cap, which would otherwise pin the pool run init
+/// donated it from.
+pub fn boot_pass(
+    records: &mut Records,
+    modules: Vec<(DriverDecl, u64)>,
+    carve: &mut Carve,
+    pass: &mut Pass,
+    ipc_buf: *mut u64,
+)
 {
-    let mut held = [0u64; caps::module_kind::COUNT];
-    for (slot, module) in carve.caps.driver_modules.iter_mut().enumerate()
-    {
-        if !caps::module_kind::FIXED_PATH
-            .iter()
-            .any(|&kind| caps::module_kind::index(kind) == Some(slot))
-        {
-            held[slot] = core::mem::take(module);
-        }
-    }
     let mut table = MatchTable::new();
-    for &module in held.iter().filter(|&&m| m != 0)
+    for (decl, module) in modules
     {
-        let decl = decls::module_decl(carve.caps, module);
         collect(
             &mut table,
             records,
-            decl.as_ref(),
+            Some(&decl),
             Source::BootModule,
             Binary::Module(module),
         );
@@ -156,7 +216,7 @@ pub fn boot_pass(records: &mut PciRecords, carve: &mut Carve, pass: &mut Pass, i
 /// ([`firmware::binding::class_admits`]). Every file cap is released once
 /// the pass ends.
 pub fn drivers_dir_pass<T>(
-    records: &mut PciRecords,
+    records: &mut Records,
     dir_cap: u64,
     classes: &Classes<T>,
     carve: &mut Carve,
@@ -164,7 +224,7 @@ pub fn drivers_dir_pass<T>(
     ipc_buf: *mut u64,
 )
 {
-    if records.bound.iter().all(|&b| b)
+    if records.all_bound()
     {
         return;
     }
@@ -212,7 +272,7 @@ pub fn drivers_dir_pass<T>(
 /// driver is bound to; otherwise release `binary`.
 fn collect(
     table: &mut MatchTable<Binary>,
-    records: &PciRecords,
+    records: &Records,
     decl: Option<&DriverDecl>,
     source: Source,
     binary: Binary,
@@ -238,7 +298,7 @@ fn collect(
 /// Bind each record no driver is bound to, in record order, to the
 /// declaration `table` chooses for it.
 fn bind_records(
-    records: &mut PciRecords,
+    records: &mut Records,
     table: &mut MatchTable<Binary>,
     carve: &mut Carve,
     pass: &mut Pass,
@@ -249,6 +309,59 @@ fn bind_records(
     {
         return;
     }
+    bind_pci_records(&mut records.pci, table, carve, pass, ipc_buf);
+    let platform = records.platform.records();
+    for (index, (record, bound)) in platform
+        .iter()
+        .zip(records.platform_bound.iter_mut())
+        .enumerate()
+    {
+        if *bound
+        {
+            continue;
+        }
+        match record.with_keys(|k| table.choose(k))
+        {
+            Choice::Unmatched =>
+            {}
+            Choice::Conflict(first, second) =>
+            {
+                let candidates = table.candidates();
+                std::os::seraph::log!(
+                    "platform record {}: {} and {} match it equally; neither bound",
+                    index,
+                    candidates[first].decl.name.as_str(),
+                    candidates[second].decl.name.as_str()
+                );
+            }
+            Choice::Bind(chosen) =>
+            {
+                if bind_platform(
+                    index,
+                    record,
+                    &table.candidates()[chosen],
+                    carve,
+                    pass,
+                    ipc_buf,
+                )
+                {
+                    *bound = true;
+                    table.note_bound(chosen);
+                }
+            }
+        }
+    }
+}
+
+/// [`bind_records`] over the PCI records.
+fn bind_pci_records(
+    records: &mut PciRecords,
+    table: &mut MatchTable<Binary>,
+    carve: &mut Carve,
+    pass: &mut Pass,
+    ipc_buf: *mut u64,
+)
+{
     for (pci_dev, bound) in records.devices.iter().zip(records.bound.iter_mut())
     {
         if *bound
@@ -280,6 +393,329 @@ fn bind_records(
                     table.note_bound(index);
                 }
             }
+        }
+    }
+}
+
+// ── Binding one platform record ─────────────────────────────────────────────
+
+/// Bind platform record `index`, `record`, to the driver of `candidate`:
+/// carve its resources ([`carve_platform_device`]), start the driver from a
+/// copy of its binary at the tier its source allows, deliver it the
+/// resource list, and record it in the pass's roster to be served under its
+/// declared class. Returns whether the driver was started; `false`, logged,
+/// as for [`bind_pci`].
+fn bind_platform(
+    index: usize,
+    record: &PlatformRecord,
+    candidate: &Candidate<Binary>,
+    carve: &mut Carve,
+    pass: &mut Pass,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let decl = &candidate.decl;
+    let name = decl.name.as_str();
+    std::os::seraph::log!("{}: binds platform record {}", name, index);
+    let Some(class) = decl.class
+    else
+    {
+        std::os::seraph::log!("{}: declares no device class; not bound", name);
+        return false;
+    };
+    // No platform record is an IOMMU record, and none has a `Dma` resource:
+    // neither physical access nor a DMA capability is granted here.
+    let grants = firmware::binding::grants(decl, candidate.source, false);
+    if grants.tier_ignored
+    {
+        std::os::seraph::log!("{}: boot tier not granted from the drivers directory", name);
+    }
+    if grants.phys_access_ignored
+    {
+        std::os::seraph::log!("{}: physical access not granted", name);
+    }
+    if decl.dma
+    {
+        std::os::seraph::log!("{}: the record has no DMA resource; no DMA granted", name);
+    }
+    if pass.roster.try_reserve_one().is_err()
+    {
+        std::os::seraph::log!("{}: no memory to record the driver; not bound", name);
+        return false;
+    }
+    let Some(dev_caps) = carve_platform_device(name, record, decl, carve)
+    else
+    {
+        return false;
+    };
+    let Some(service_ep) = crate::create_service_endpoint()
+    else
+    {
+        std::os::seraph::log!("{}: no service endpoint; not bound", name);
+        dev_caps.release();
+        return false;
+    };
+    let Some(source) = candidate.binary.source_copy()
+    else
+    {
+        std::os::seraph::log!("{}: binary cap not copied; not bound", name);
+        let _ = syscall::cap_delete(service_ep);
+        dev_caps.release();
+        return false;
+    };
+    let config = spawn::BoundSpawnConfig {
+        procmgr_ep: carve.caps.procmgr_ep,
+        bootstrap_ep: carve.caps.self_bootstrap_ep,
+        source,
+        resources: dev_caps.resources(),
+        dma_cap: None,
+        service_ep,
+        query_ep: pass.batch.driver_ep(),
+        death_eq: pass.death_eq,
+        device_badge: dev_caps.device_badge,
+        priority: match grants.tier
+        {
+            Tier::Boot => ipc::sched_policy::BOOT_DRIVER_PRIORITY,
+            Tier::Auxiliary => ipc::sched_policy::AUX_DRIVER_PRIORITY,
+        },
+    };
+    match spawn::spawn_bound_driver(&config, ipc_buf)
+    {
+        spawn::DriverSpawn::Bootstrapped(child) =>
+        {
+            let spawned = SpawnedDriver {
+                name: decl.name,
+                serves: Serves::Class(class),
+                badge: dev_caps.device_badge,
+                driver: ServedDriver {
+                    ep: service_ep,
+                    dev_caps: None,
+                    platform_caps: Some(dev_caps),
+                    process_handle: child.process_handle,
+                },
+            };
+            crate::record_spawned(pass.roster, spawned, ipc_buf);
+        }
+        spawn::DriverSpawn::Unbootstrapped(child) =>
+        {
+            dev_caps.take_from_driver();
+            spawn::destroy_child(child.process_handle, ipc_buf);
+            let _ = syscall::cap_delete(service_ep);
+            dev_caps.release();
+        }
+        spawn::DriverSpawn::Failed =>
+        {
+            let _ = syscall::cap_delete(service_ep);
+            dev_caps.release();
+            return false;
+        }
+    }
+    true
+}
+
+/// Carve what the driver `decl` declares of the platform record `record`: a
+/// cap on each `Mmio` and `IoPort` resource, the record's first interrupt
+/// line, exclusive, for a driver that takes an interrupt
+/// (docs/driver-binding.md § Declaration Bounds: only a PCI function's line
+/// is shared), and the record's catalog entry, carrying its device info.
+/// `None`, logged under `name` and with what was carved released, on any
+/// failure, a required interrupt the record cannot give included.
+fn carve_platform_device(
+    name: &str,
+    record: &PlatformRecord,
+    decl: &DriverDecl,
+    carve: &mut Carve,
+) -> Option<PlatformDeviceCaps>
+{
+    let mut dev = PlatformDeviceCaps::empty();
+    for resource in record.resources()
+    {
+        let carved = match resource
+        {
+            CrsResource::Mmio { base, size } =>
+            {
+                crate::carve_subrange(carve.caps, base, size).map(|cap| Resource::Mmio {
+                    cap,
+                    bar: None,
+                    phys: base,
+                    bytes: size,
+                })
+            }
+            CrsResource::IoPort { base, count } =>
+            {
+                arch::current::carve_io_ports(carve.caps, base, count).map(|cap| Resource::IoPort {
+                    cap,
+                    base: u64::from(base),
+                    count: u64::from(count),
+                })
+            }
+            CrsResource::Interrupt { .. } => continue,
+        };
+        let Some(carved) = carved
+        else
+        {
+            std::os::seraph::log!(
+                "{}: a register range of the record not carved; not bound",
+                name
+            );
+            dev.release();
+            return None;
+        };
+        if !dev.push(carved)
+        {
+            std::os::seraph::log!(
+                "{}: more resources than a driver is delivered; not bound",
+                name
+            );
+            dev.release();
+            return None;
+        }
+    }
+    match platform_wired(name, record, decl, carve)
+    {
+        Some((cap, mode)) =>
+        {
+            if !dev.push(Resource::Interrupt {
+                cap,
+                kind: InterruptKind::Wired,
+                vector: 0,
+                mode,
+            })
+            {
+                std::os::seraph::log!("{}: no room for the interrupt; not bound", name);
+                dev.release();
+                return None;
+            }
+        }
+        None if decl.interrupt.need == InterruptNeed::Required =>
+        {
+            std::os::seraph::log!(
+                "{}: no interrupt line for the device, which the driver requires; not bound",
+                name
+            );
+            dev.release();
+            return None;
+        }
+        None =>
+        {}
+    }
+    let badge = match record.info()
+    {
+        Some(info) => carve.catalog.add(info.kind, info.version, info.bytes()),
+        None => carve.catalog.add_without_info(),
+    };
+    let Some(badge) = badge
+    else
+    {
+        std::os::seraph::log!("{}: catalog entry not added; not bound", name);
+        dev.release();
+        return None;
+    };
+    dev.device_badge = badge;
+    Some(dev)
+}
+
+/// The cap on the first interrupt line of `record`, carved exclusive, and
+/// the line's mode, for a driver `decl` that takes an interrupt; `None` when
+/// it takes none, the record has no line, or the line cannot be carved
+/// (logged under `name`).
+fn platform_wired(
+    name: &str,
+    record: &PlatformRecord,
+    decl: &DriverDecl,
+    carve: &mut Carve,
+) -> Option<(u64, u64)>
+{
+    if decl.interrupt.need == InterruptNeed::None
+    {
+        return None;
+    }
+    let (line, mode, isa) = record.resources().find_map(|r| match r
+    {
+        CrsResource::Interrupt {
+            line, mode, isa, ..
+        } => Some((line, mode, isa)),
+        _ => None,
+    })?;
+    let (gsi, mode) = arch::current::platform_line(carve.irq_range, line, mode, isa);
+    match carve.irq_range.exclusive_line(gsi)
+    {
+        Ok(cap) => Some((cap, mode)),
+        Err(e) =>
+        {
+            std::os::seraph::log!("{}: no IRQ cap for line {:#x} ({:?})", name, gsi, e);
+            None
+        }
+    }
+}
+
+/// The caps devmgr keeps for a platform record it bound a driver to: the
+/// resources it delivered, each the cap the driver's copy derives from, and
+/// the device's badge. A platform device has no configuration page, no DMA,
+/// and no reset: withdrawing its driver revokes the driver's copies.
+pub struct PlatformDeviceCaps
+{
+    resources: [Resource; MAX_BOUND_RESOURCES],
+    count: usize,
+    pub device_badge: u64,
+}
+
+impl PlatformDeviceCaps
+{
+    /// Nothing carved yet.
+    fn empty() -> Self
+    {
+        Self {
+            resources: [Resource::IoPort {
+                cap: 0,
+                base: 0,
+                count: 0,
+            }; MAX_BOUND_RESOURCES],
+            count: 0,
+            device_badge: 0,
+        }
+    }
+
+    /// Record a carved resource; `false`, the cap deleted, when
+    /// [`MAX_BOUND_RESOURCES`] are already held.
+    fn push(&mut self, resource: Resource) -> bool
+    {
+        if let Some(slot) = self.resources.get_mut(self.count)
+        {
+            *slot = resource;
+            self.count += 1;
+            true
+        }
+        else
+        {
+            let _ = syscall::cap_delete(resource.cap());
+            false
+        }
+    }
+
+    /// The delivered resources, in delivery order.
+    pub fn resources(&self) -> &[Resource]
+    {
+        &self.resources[..self.count]
+    }
+
+    /// Take the device from its driver, live or dead: revoke every copy
+    /// derived from the caps devmgr keeps, so the driver reaches its
+    /// registers and line no more.
+    pub fn take_from_driver(&self)
+    {
+        for resource in self.resources()
+        {
+            let _ = syscall::cap_revoke_all(resource.cap());
+        }
+    }
+
+    /// Release every cap devmgr keeps for the device.
+    pub fn release(&self)
+    {
+        for resource in self.resources()
+        {
+            let _ = syscall::cap_delete(resource.cap());
         }
     }
 }
@@ -389,6 +825,7 @@ fn bind_pci(
                 driver: ServedDriver {
                     ep: service_ep,
                     dev_caps: Some(dev_caps),
+                    platform_caps: None,
                     process_handle: child.process_handle,
                 },
             };

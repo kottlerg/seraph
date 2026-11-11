@@ -71,6 +71,7 @@ members = [
     "shared/gdb-rsp",
     "shared/riscv-step",
     "shared/shmem",
+    "shared/svc-grammar",
     "shared/text",
     "programs/demandpaged",
     "programs/capexhaust",

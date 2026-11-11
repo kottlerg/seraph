@@ -422,6 +422,59 @@ impl ResourceList
     }
 }
 
+/// What the driver of a platform device record takes from its resource list
+/// (docs/driver-binding.md § Device Records): the device's register window,
+/// its wired line if one was delivered, and the endpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlatformDelivery
+{
+    /// The first `Mmio` or `IoPort` resource of the list.
+    pub registers: Resource,
+    /// The first wired `Interrupt` resource's cap and `SYS_IRQ_REGISTER`
+    /// mode; `None` when the list delivers none.
+    pub wired: Option<(u64, u64)>,
+    /// The end round's endpoints, the service and devmgr query endpoints
+    /// both present.
+    pub endpoints: Endpoints,
+}
+
+impl PlatformDelivery
+{
+    /// Read a complete resource list. `None` when the list has no end round,
+    /// no service or devmgr query endpoint, or no `Mmio` or `IoPort`
+    /// resource. Resources past the first register window and the first
+    /// wired line are left in the list, unused.
+    #[must_use]
+    pub fn from_list(list: &ResourceList) -> Option<Self>
+    {
+        let endpoints = list.endpoints()?;
+        if endpoints.service == 0 || endpoints.devmgr_query == 0
+        {
+            return None;
+        }
+        let registers = list
+            .resources()
+            .iter()
+            .find(|r| matches!(r, Resource::Mmio { .. } | Resource::IoPort { .. }))
+            .copied()?;
+        let wired = list.resources().iter().find_map(|r| match *r
+        {
+            Resource::Interrupt {
+                cap,
+                kind: InterruptKind::Wired,
+                mode,
+                ..
+            } => Some((cap, mode)),
+            _ => None,
+        });
+        Some(Self {
+            registers,
+            wired,
+            endpoints,
+        })
+    }
+}
+
 /// Request rounds from `creator` until the end round, decoding each into a
 /// [`ResourceList`]. The rounds are bounded: each one either adds a resource
 /// or ends the list, and the list holds at most [`MAX_RESOURCES`].
@@ -735,5 +788,74 @@ mod tests
         }
         assert_eq!(list.absorb(&received(&mmio)), Err(ListError::TooMany));
         assert_eq!(list.resources().len(), MAX_RESOURCES);
+    }
+
+    fn ends(service: u64, devmgr_query: u64) -> Round
+    {
+        Round::end(&Endpoints {
+            service,
+            devmgr_query,
+            dma: 0,
+        })
+    }
+
+    #[test]
+    fn platform_delivery_takes_the_first_window_and_wired_line()
+    {
+        let mode = IRQ_MODE_LEVEL;
+        let rounds = [
+            Round::interrupts(InterruptKind::Msi, 0, 0, &[9]).expect("one MSI cap"),
+            Round::io_port(10, 0x70, 8),
+            Round::mmio(11, None, 0x1000_0000, 0x100),
+            Round::interrupts(InterruptKind::Wired, 0, mode, &[12]).expect("one wired cap"),
+            Round::interrupts(InterruptKind::Wired, 0, 0, &[13]).expect("one wired cap"),
+            ends(20, 21),
+        ];
+        let list = decoded(&rounds).expect("well-formed list");
+        let got = PlatformDelivery::from_list(&list).expect("a platform delivery");
+        assert_eq!(
+            got.registers,
+            Resource::IoPort {
+                cap: 10,
+                base: 0x70,
+                count: 8
+            }
+        );
+        assert_eq!(got.wired, Some((12, mode)));
+        assert_eq!(got.endpoints.service, 20);
+        assert_eq!(got.endpoints.devmgr_query, 21);
+    }
+
+    #[test]
+    fn platform_delivery_without_a_line_has_none()
+    {
+        let rounds = [Round::mmio(11, None, 0x101000, 0x1000), ends(20, 21)];
+        let list = decoded(&rounds).expect("well-formed list");
+        let got = PlatformDelivery::from_list(&list).expect("a platform delivery");
+        assert_eq!(got.wired, None);
+        assert!(matches!(got.registers, Resource::Mmio { cap: 11, .. }));
+    }
+
+    #[test]
+    fn platform_delivery_refuses_an_incomplete_list()
+    {
+        let wired = Round::interrupts(InterruptKind::Wired, 0, 0, &[12]).expect("one wired cap");
+        // No register window.
+        let list = decoded(&[wired, ends(20, 21)]).expect("well-formed list");
+        assert_eq!(PlatformDelivery::from_list(&list), None);
+        // No service endpoint, then no devmgr query endpoint.
+        for (service, query) in [(0, 21), (20, 0)]
+        {
+            let list = decoded(&[Round::io_port(10, 0x3F8, 8), ends(service, query)])
+                .expect("well-formed list");
+            assert_eq!(PlatformDelivery::from_list(&list), None);
+        }
+        // No end round yet.
+        let mut list = ResourceList::new();
+        assert_eq!(
+            list.absorb(&received(&Round::io_port(10, 0x3F8, 8))),
+            Ok(false)
+        );
+        assert_eq!(PlatformDelivery::from_list(&list), None);
     }
 }

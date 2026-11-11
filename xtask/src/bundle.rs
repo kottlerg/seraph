@@ -13,7 +13,9 @@
 //! - [`Harness::Init`] — default. Pulls `init`, `procmgr`, `memmgr`,
 //!   `devmgr`, `vfsd`, `virtio-blk`, `serial`, `framebuffer`, `fatfs`
 //!   into the bundle, and the IOMMU driver of the architecture's IOMMU
-//!   family: `iommu-vtd` on x86-64, `iommu-riscv` on riscv64.
+//!   family: `iommu-vtd` on x86-64, `iommu-riscv` on riscv64; and the
+//!   platform description tables of the architecture's machines
+//!   (`platform-qemu-virt` on riscv64), from `services/devmgr/platform/`.
 //!   `init` is named `"init"`; modules carry their service name. Sources span
 //!   `sysroot/services/`, `sysroot/services/drivers/`, and
 //!   `sysroot/services/fs/` per each component's install destination.
@@ -105,13 +107,25 @@ const ARCH_MODULES: &[(Arch, &str, &str)] = &[
     (Arch::Riscv64, "iommu-riscv", "services/drivers/iommu-riscv"),
 ];
 
+/// Platform description tables that ship in a default-init bundle on one
+/// architecture only, as `(architecture, bundle_entry_name,
+/// repository_relative_source_path)`: the text tables of the machines of that
+/// architecture, which list the devices no firmware table describes. init
+/// forwards them to devmgr with the driver modules; devmgr uses the one whose
+/// `oem_table_id` equals the XSDT's (`services/devmgr/platform/`).
+const ARCH_TABLES: &[(Arch, &str, &str)] = &[(
+    Arch::Riscv64,
+    "platform-qemu-virt",
+    "services/devmgr/platform/qemu-virt.platform",
+)];
+
 /// Compose a bundle for the chosen harness and write it to
 /// `sysroot/esp/EFI/seraph/bootstrap.bundle`, overwriting any existing
 /// file. Source binaries are read from per-component sysroot paths
 /// driven by each component's [`crate::commands::build::InstallDest`].
 ///
 /// `Harness::Init` bundles `init` plus every entry in [`MODULES`] and every
-/// entry of [`ARCH_MODULES`] for `arch`. `Harness::Ktest` bundles only
+/// entry of [`ARCH_MODULES`] and [`ARCH_TABLES`] for `arch`. `Harness::Ktest` bundles only
 /// `ktest` as the `init` entry.
 pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<()>
 {
@@ -144,6 +158,15 @@ pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<()>
                     "compose-bundle: module binary missing at {} (run `cargo xtask build` first)",
                     p.display()
                 );
+            }
+            entries.push(((*name).to_owned(), p));
+        }
+        for (_, name, source) in ARCH_TABLES.iter().filter(|(a, _, _)| *a == arch)
+        {
+            let p = ctx.root.join(source);
+            if !p.exists()
+            {
+                anyhow::bail!("compose-bundle: platform table missing at {}", p.display());
             }
             entries.push(((*name).to_owned(), p));
         }

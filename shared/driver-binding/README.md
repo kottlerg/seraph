@@ -26,7 +26,9 @@ for the driver and devmgr.
   `SLOT_DEVMGR_QUERY`, and `SLOT_DMA`, packed by `ipc::bootstrap::pack_slots`. devmgr builds
   each round with `Round` (`mmio`, `io_port`, `interrupts`, `end`); a driver receives the list
   with `receive`, which decodes each round into a `ResourceList` (`absorb`) and deletes every
-  delivered cap of a list it refuses.
+  delivered cap of a list it refuses. `PlatformDelivery::from_list` reads the list a platform
+  record's bind delivers: one register resource (`Mmio` or `IoPort`), an optional wired line,
+  and the endpoints.
 
 The crate names standards and the system's own structure only: no driver, device, or device
 class appears in it, so it does not grow with the drivers a deployment ships

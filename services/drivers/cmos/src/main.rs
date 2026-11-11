@@ -5,10 +5,13 @@
 
 //! Seraph x86-64 CMOS / MC146818-compatible RTC driver.
 //!
-//! Spawned by devmgr with a narrow `IoPort` cap covering CMOS
-//! index/data ports `0x70`–`0x71` plus a RECV cap on the driver's
-//! service endpoint in a first bootstrap round, and its devmgr query cap in
-//! a second, terminal one. Once its ports are bound it reports ready
+//! Bound by devmgr to the ACPI namespace device of `_HID` `PNP0B00`, it
+//! receives the resource list (`driver_binding::resources`): an `IoPort`
+//! cap on the range the device's `_CRS` names, which holds the CMOS
+//! index/data ports `0x70`–`0x71`, a RECV cap on the driver's service
+//! endpoint, and its devmgr query cap. It reads the century register's
+//! index, which devmgr attaches to the record from the FADT `CENTURY` field,
+//! with `QUERY_DEVICE_INFO`. Once its ports are bound it reports ready
 //! (`devmgr_labels::DRIVER_READY`) on the query cap, immediately before its
 //! service loop: devmgr serves the driver's endpoint only after that report.
 //! Implements the one-label RTC driver contract
@@ -16,7 +19,8 @@
 //! every request.
 
 use cmos_rtc::{CmosFields, CmosRegs};
-use ipc::{IpcMessage, rtc_errors, rtc_labels};
+use driver_binding::resources::{self, PlatformDelivery, Resource};
+use ipc::{IpcMessage, devmgr_labels, rtc_errors, rtc_labels};
 use std::os::seraph::startup_info;
 
 // ── CMOS port and register layout (MC146818) ───────────────────────────────
@@ -33,9 +37,7 @@ const HOUR_PM_BIT: u8 = 0x80;
 // ── Declaration ────────────────────────────────────────────────────────────
 
 // What devmgr binds this driver to and how it starts it
-// (docs/driver-binding.md § Driver Declarations). devmgr reads it but starts
-// this driver on its fixed path until platform device records carry the key
-// it matches (docs/driver-binding.md § Status).
+// (docs/driver-binding.md § Driver Declarations).
 driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     name: "cmos-rtc",
     class: Some("rtc"),
@@ -51,50 +53,51 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 
-struct BootCaps
-{
-    service_ep: u64,
-    ioport_cap: u64,
-    /// CMOS RAM index of the century register, from the FADT `CENTURY`
-    /// field devmgr sends as the round's data word; `None` when it names
-    /// none (0), names one the driver cannot read
-    /// ([`cmos_rtc::century_register`]), or sent no word.
-    century_reg: Option<u8>,
-    /// devmgr query cap: a SEND badged with this device's badge on its spawn
-    /// batch's private endpoint, for `DRIVER_READY`.
-    devmgr_query_ep: u64,
-}
-
-/// Request the two bootstrap rounds: round 1 (not terminal)
-/// `[service_ep, ioport_cap]` with the century index as its data word,
-/// round 2 (terminal) `[devmgr_query_ep]`.
-fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
+/// Receive the resource list (`driver_binding::resources`): the RTC's
+/// `IoPort` range, and the endpoints. `None` unless the range holds the
+/// index and data ports.
+fn bootstrap(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<(u64, PlatformDelivery)>
 {
     if creator_endpoint == 0
     {
         return None;
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let r1 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if r1.cap_count < 2 || r1.done
+    let list = unsafe { resources::receive(creator_endpoint, ipc_buf) }.ok()?;
+    let device = PlatformDelivery::from_list(&list)?;
+    let Resource::IoPort { cap, base, count } = device.registers
+    else
+    {
+        return None;
+    };
+    let covers = base <= u64::from(CMOS_INDEX) && base.checked_add(count)? > u64::from(CMOS_DATA);
+    covers.then_some((cap, device))
+}
+
+/// The CMOS RAM index of the century register, from the FADT `CENTURY`
+/// field devmgr attaches to the RTC's record as device info
+/// (`QUERY_DEVICE_INFO`, `ipc::device_info_kind::RTC_CENTURY`); `None` when
+/// the record carries none, or names a register the driver cannot read
+/// ([`cmos_rtc::century_from_payload`]).
+fn query_century(devmgr_ep: u64, ipc_buf: *mut u64) -> Option<u8>
+{
+    let request = IpcMessage::builder(devmgr_labels::QUERY_DEVICE_INFO)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(devmgr_ep, &request, ipc_buf) }.ok()?;
+    if reply.label != 0
     {
         return None;
     }
-    let century_reg = (r1.data_words >= 1)
-        .then(|| cmos_rtc::century_register(r1.data[0]))
-        .flatten();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let r2 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if r2.cap_count < 1 || !r2.done
+    let words = reply.words();
+    let (&[kind, version, byte_len, first], _) = words.split_first_chunk::<4>()?;
+    if kind != u64::from(ipc::device_info_kind::RTC_CENTURY)
+        || version != u64::from(ipc::device_info_kind::RTC_CENTURY_VERSION)
     {
         return None;
     }
-    Some(BootCaps {
-        service_ep: r1.caps[0],
-        ioport_cap: r1.caps[1],
-        century_reg,
-        devmgr_query_ep: r2.caps[0],
-    })
+    cmos_rtc::century_from_payload(byte_len, first)
 }
 
 // ── Port I/O ───────────────────────────────────────────────────────────────
@@ -347,30 +350,26 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(caps) = bootstrap_caps(info.creator_endpoint, ipc_buf)
+    let Some((ioport_cap, device)) = bootstrap(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!("bootstrap caps missing");
+        std::os::seraph::log!("resource list missing or without the CMOS ports");
         syscall::thread_exit();
     };
 
-    if syscall::ioport_bind(info.self_thread, caps.ioport_cap).is_err()
+    if syscall::ioport_bind(info.self_thread, ioport_cap).is_err()
     {
         std::os::seraph::log!("ioport_bind failed");
         syscall::thread_exit();
     }
 
-    if caps.service_ep == 0
-    {
-        std::os::seraph::log!("no service endpoint");
-        syscall::thread_exit();
-    }
+    let century_reg = query_century(device.endpoints.devmgr_query, ipc_buf);
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if let Err(e) = unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
+    if let Err(e) = unsafe { ipc::report_driver_ready(device.endpoints.devmgr_query, ipc_buf) }
     {
         std::os::seraph::log!("DRIVER_READY failed ({:?}); exiting", e);
         syscall::thread_exit();
     }
-    service_loop(caps.service_ep, caps.century_reg, ipc_buf);
+    service_loop(device.endpoints.service, century_reg, ipc_buf);
 }

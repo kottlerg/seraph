@@ -283,9 +283,11 @@ install and withdraw mappings, block a device, and take the faults the units rec
 see the same protocol whichever IOMMU, or none, sits behind it. The kernel does not read or write
 IOMMU registers and holds no per-IOMMU state.
 
-At boot devmgr spawns the IOMMU driver from its boot module before any DMA-capable driver, in a
-settle batch of its own (`CREATE_PROCESS` with `CREATE_PINNED`, since the units walk its table
-pages, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS`, since the units are programmed with physical
+At boot devmgr matches the IOMMU family record against the boot-module declarations and spawns
+the matched driver from its boot module (with its own bootstrap rounds, not the resource list)
+before any DMA-capable driver, in a settle batch of its own (`CREATE_PROCESS` with
+`CREATE_PINNED`, since the units walk its table pages, `CREATE_DMA_HOLD`, and
+`CREATE_PHYS_ACCESS`, since the units are programmed with physical
 addresses (§ Physical Addresses), at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it on
 every mapping). The driver programs each unit with empty tables and turns translation on, so from
 its ready report every function a unit translates reaches nothing until devmgr attaches it, the
@@ -390,8 +392,9 @@ binding of its own. devmgr splits each PCI device's line once from its range, th
 device on it needs it, holds that cap for the boot, and hands every driver on the line, the first
 included, a derivation of it, so PCI functions that share an `INTx` line are all served
 ([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md)
-§ Per-Device Capability Creation). The UART line is the exception: devmgr carves it exclusive,
-holds nothing, and moves the cap itself to the serial driver (devmgr's
+§ Per-Device Capability Creation). The line of a platform record is the exception: devmgr carves
+it exclusive, keeps it, and gives the record's driver, the serial driver for the UART's line, a
+derivation it revokes when it withdraws the driver (devmgr's
 [responsibilities.md § Responsibilities](../services/devmgr/docs/responsibilities.md#responsibilities)).
 
 - **Bind.** `SYS_IRQ_REGISTER` through an unbound object adds a binding; the line's first binding
@@ -496,9 +499,9 @@ devmgr binds each PCI device the most specific driver declaration matches
 ([driver-binding.md](driver-binding.md) § Matching), each driver with its own service endpoint; a
 declaration that requires an interrupt binds only a device devmgr can give a wired line (a device
 on a line another device already holds gets a derivation of that line, § Interrupt Delivery).
-devmgr serves any driver it spawns, those and the serial, framebuffer, and RTC drivers, only once
-it has reported its device set up (`devmgr_labels::DRIVER_READY`). A driver that dies first, its
-device setup failed, or that neither reports nor dies within devmgr's settle bound
+devmgr serves any driver it spawns, the platform drivers (serial, framebuffer, and RTC) included,
+only once it has reported its device set up (`devmgr_labels::DRIVER_READY`). A driver that dies
+first, its device setup failed, or that neither reports nor dies within devmgr's settle bound
 (`SETTLE_TIMEOUT`, 10 s: twice the VirtIO reset timeout, the longest bounded wait of a driver's
 setup) is withdrawn and never served; one still pending at the bound is destroyed. devmgr waits
 for every driver of a batch to report, die, or overrun the bound before it serves that batch's
@@ -534,12 +537,15 @@ devmgr loads driver binaries from one of two places:
   framebuffer, and the IOMMU driver of the architecture's family, `iommu-vtd`
   on x86-64 and `iommu-riscv` on riscv64, which must confine the disk before
   its driver maps a ring) ship in the bundle and
-  arrive as Memory caps in devmgr's MODULE bootstrap round. devmgr reads the declaration of each
-  module it holds apart from the serial, framebuffer and IOMMU modules, binds the PCI devices
-  those declarations match in the boot settle batch, and spawns every driver via
+  arrive untagged as Memory caps in devmgr's MODULE bootstrap rounds, with any platform
+  description table. devmgr tells a module by its content: it reads the declaration of each ELF
+  image, parses valid UTF-8 text as a platform description table, and logs and releases anything
+  else. It binds the PCI and platform records those declarations match in the boot settle batch
+  (the IOMMU family record in a batch of its own before it), and spawns every driver via
   `procmgr_labels::CREATE_PROCESS`.
-- **On-disk rootfs** — non-essentials (the per-arch RTC, the [virtio-input keyboard
-  driver](../services/drivers/virtio/input/README.md), the debug port's virtio-console
+- **On-disk rootfs** — non-essentials (the per-arch RTC, bound to its platform record, the
+  [virtio-input keyboard driver](../services/drivers/virtio/input/README.md), the debug port's
+  virtio-console
   driver, and the test-only `test-dma`) live at `/services/drivers/` and are loaded
   via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` and `test-fault` binaries
   also live there; devmgr spawns them only on

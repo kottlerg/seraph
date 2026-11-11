@@ -118,7 +118,9 @@ virtio-console device gets one (it is the debug port), and except a
 virtio-blk device that gets no IRQ cap (for instance, its line lies outside
 the Interrupt range devmgr holds): virtio-blk requires one. A
 device on a line another device already holds gets an IRQ cap too (step 4).
-Class-based matching is design intent (#165).
+Matching against the drivers' own declarations, class-based keys included, is design
+intent; not yet implemented ([docs/driver-binding.md](../../../docs/driver-binding.md#matching)
+§ Matching, #165).
 
 ---
 

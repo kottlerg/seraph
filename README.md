@@ -97,6 +97,8 @@ Overall project design documents live in [`docs/`](docs/):
   GPT role-GUID discovery; mount lifecycle
 - [Device Management](docs/device-management.md) — platform enumeration, devmgr,
   driver binding, DMA safety
+- [Driver Binding](docs/driver-binding.md) — data-driven device enumeration, driver
+  declarations, matching, and the device-class registry query (design intent)
 - [Platform Requirements](docs/platform-requirements.md) — per-arch
   required/opportunistic/unsupported CPU and platform feature baseline; boot-time feature-gate
 - [Limits](docs/limits.md) — catalogue of every in-tree bound, classified against

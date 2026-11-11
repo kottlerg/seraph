@@ -509,8 +509,9 @@ impl ProcessTable
     ///   class among them);
     /// * another process's that is live and undeclared: a thread procmgr
     ///   rebound under a crash badge of the sender's is restored as the
-    ///   sender's own; one it left is bound back under that process's badge
-    ///   from a debugger's binding alone;
+    ///   sender's own unless its class is unbound, which it leaves; one it
+    ///   left is bound back under that process's badge from a debugger's
+    ///   binding alone;
     /// * another process's that declared itself undebuggable or is gone, or
     ///   a thread unbound at its registration: never bound to the crash
     ///   endpoint, so no restore binds a thread recorded as a declared
@@ -547,7 +548,10 @@ impl ProcessTable
             Origin::Foreign(owner)
                 if self.find_by_badge(owner).is_some_and(|e| !e.no_debug) =>
             {
-                if thread.crash_badge != 0
+                // An unbound class of such a thread is left: the thread may
+                // be a declared process's, which neither its binding nor its
+                // origin shows.
+                if thread.crash_badge != 0 && current.is_some()
                 {
                     own_rule()
                 }
@@ -1553,11 +1557,17 @@ mod tests
         );
         // Another process's thread procmgr rebound into the sender's crash
         // binding is restored as the sender's own while that process lives
-        // undeclared.
+        // undeclared, unless its class is unbound: a declaration of the
+        // process the thread really is (one a third registry rebound) leaves
+        // it so.
         let rebound = RegisteredThread::new(10, own, Origin::Foreign(0x50));
         assert_eq!(
             table.restore_action(0x40, &rebound, Some(debugger)),
             RestoreAction::Bind(own)
+        );
+        assert_eq!(
+            table.restore_action(0x40, &rebound, None),
+            RestoreAction::Leave
         );
         // A thread unbound at its registration is never bound to the crash
         // endpoint; a debugger's binding on it is taken off.

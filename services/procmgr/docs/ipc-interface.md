@@ -906,10 +906,11 @@ has declared itself undebuggable (Label 21). Such a cap comes from the other pro
 debug-authority holder's attach, or, for the other process's main thread alone, from its creation
 (`CREATE_PROCESS` and `CREATE_FROM_FILE` give the creator that cap), whose binding is its process
 badge, which procmgr does not rebind and records as that process's, none once that process has
-declared itself undebuggable, or the debugger tag while a debugger attached to that process holds
-it. So no process gains this over a spawned thread it was not given, and no restore of the creator's
-binds a declared child's main thread back (Label 24) unless that thread carried the debugger tag
-when the creator registered it.
+declared itself undebuggable, the debugger tag while a debugger attached to that process holds it,
+or a crash badge another registry put on it. So no process gains this over a spawned thread it was
+not given, and no restore of the creator's binds a declared child's main thread back (Label 24)
+unless that thread carried the debugger tag, or a crash badge no live registry lists, when the
+creator registered it.
 
 Replies `SUCCESS`; refusals, in order: `INVALID_BADGE` when the badge names no live process, or the
 request came on a process handle (§ Messages);
@@ -968,8 +969,10 @@ debugger tag (Label 20), is unbound, or is bound by procmgr under another badge.
   under that crash badge, minting one for a thread that has none (one that registered while the
   debugger's binding was on it, which a registration leaves).
 - Another process's, while that process lives and has not declared itself undebuggable: one
-  procmgr rebound under a crash badge at the registration is restored as the target's own; any
-  other is bound back under that process's own badge from a debugger's binding alone.
+  procmgr rebound under a crash badge at the registration is restored as the target's own, unless
+  its class is unbound, which it leaves, since the thread may be a declared process's that a third
+  registry had rebound before the target registered it; any other is bound back under that
+  process's own badge from a debugger's binding alone.
 - Another process's once that process has declared itself undebuggable or is gone, or a thread
   whose class was unbound at its registration: never bound to the crash endpoint, and a debugger's
   binding on it is unbound, so no restore binds a thread procmgr recorded as a declared process's

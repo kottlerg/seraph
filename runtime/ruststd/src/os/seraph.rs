@@ -957,8 +957,9 @@ pub fn object_slab_retype_reclaimable<T>(
 /// succeeds and takes the run off the process's ledger at once, but memmgr
 /// holds it on its deferred list, granted to no one, until the object is
 /// deleted (`services/memmgr/docs/memory-pool.md` § Reclamation).
-/// Best-effort: a failed call leaves the run charged to the process until it
-/// dies.
+/// The release is made again for as long as the call is interrupted; only a
+/// call that memmgr never answers leaves the run charged to the process until
+/// it dies.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn object_slab_release(grant: ObjectGrant) {
     pal_alloc::slab_release_fresh(grant.region_id);
@@ -1054,8 +1055,9 @@ pub use pal_reserve::{ReserveError, ReservedRange, reserve_pages, unreserve_page
 /// thread.
 ///
 /// On any failure the reservation is released. On success the caller owns the
-/// range and must `mem_unmap` any backed pages, then `unreserve_pages`, when
-/// done.
+/// range and tears it down with [`unregister_demand_paged`] when done; neither
+/// `mem_unmap` nor `unreserve_pages` alone releases it, since memmgr keeps the
+/// region and every frame it backed there until the region is unregistered.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
     let ipc_buf = current_ipc_buf();
@@ -1086,6 +1088,53 @@ pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
         return Err(crate::io::Error::other("seraph: REGISTER_REGION rejected"));
     }
     Ok(range)
+}
+
+/// Tear down a range [`register_demand_paged`] returned: unregister it with
+/// memmgr (`UNREGISTER_REGION`, made again for as long as the call is
+/// interrupted), which unmaps every page it backed there and reclaims the
+/// frames, then release the reservation.
+///
+/// The reservation is released only once memmgr has answered. When no answer
+/// comes, memmgr may still hold the region, so the range stays reserved for
+/// the process's lifetime rather than handed to a later reservation whose
+/// pages memmgr would back, and the call returns an error.
+///
+/// # Safety
+/// No live Rust reference and no registered IPC buffer lies in `range`:
+/// memmgr unmaps every page of it, as `mem_unmap` would.
+///
+/// # Errors
+/// Returns an error when the calling thread has no IPC buffer, the process
+/// has no pager, or memmgr did not answer.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub unsafe fn unregister_demand_paged(range: ReservedRange) -> crate::io::Result<()> {
+    let len = range.page_count().saturating_mul(syscall_abi::PAGE_SIZE);
+    let va = range.va_start();
+    if unregister_then_unreserve(range, va, len) {
+        Ok(())
+    } else {
+        Err(crate::io::Error::other("seraph: UNREGISTER_REGION unanswered; range kept reserved"))
+    }
+}
+
+/// Unregister `[va, va + len)` with memmgr ([`unregister_rw_region`]), then
+/// release `range`, the reservation that holds it, once memmgr has answered.
+/// When there is no IPC buffer, no pager, or no answer, memmgr may still hold
+/// the region, so `range` stays reserved for the process's lifetime rather than
+/// handed to a later reservation whose pages memmgr would back. Returns whether
+/// memmgr answered.
+fn unregister_then_unreserve(range: ReservedRange, va: u64, len: u64) -> bool {
+    let ipc_buf = current_ipc_buf();
+    let memmgr_ep = startup_info().memmgr_endpoint;
+    let answered = !ipc_buf.is_null() && memmgr_ep != 0 && {
+        // SAFETY: current_ipc_buf returns the registered IPC buffer page.
+        unsafe { unregister_rw_region(memmgr_ep, ipc_buf, va, len) }
+    };
+    if answered {
+        unreserve_pages(range);
+    }
+    answered
 }
 
 /// `ipc::ipc_call`, made again for as long as it returns `Interrupted`, so the
@@ -1328,16 +1377,8 @@ pub(crate) fn reserve_guarded_stack(
 /// for the process's lifetime rather than handed to a later reservation whose
 /// pages memmgr would back.
 pub(crate) fn unregister_guarded_stack(stack: GuardedStack) {
-    let ipc_buf = current_ipc_buf();
-    let memmgr_ep = startup_info().memmgr_endpoint;
     let usable_len = stack.usable_pages.saturating_mul(syscall_abi::PAGE_SIZE);
-    let answered = !ipc_buf.is_null() && memmgr_ep != 0 && {
-        // SAFETY: current_ipc_buf returns the registered IPC buffer page.
-        unsafe { unregister_rw_region(memmgr_ep, ipc_buf, stack.usable_base, usable_len) }
-    };
-    if answered {
-        unreserve_pages(stack.range);
-    }
+    unregister_then_unreserve(stack.range, stack.usable_base, usable_len);
 }
 
 // ── System log macro surface ────────────────────────────────────────────────

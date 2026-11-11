@@ -4,7 +4,9 @@
 // runtime/ruststd/spin-wait/src/lib.rs
 
 //! Contended-wait policy of the seraph std overlay's `SpinMutex`, as pure
-//! host-tested logic.
+//! host-tested logic. The overlay's thread `Parker`, which every blocking
+//! `std::sync` type parks on, follows it too when it has no Notification to
+//! wait on (runtime/ruststd/README.md § Synchronization primitives).
 //!
 //! A waiter that finds the lock held spins through [`SPIN_ATTEMPTS`] failed
 //! acquisitions, then sleeps [`SLEEP_MS`] before each further attempt.

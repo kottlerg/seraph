@@ -1141,7 +1141,7 @@ fn apply_sync_mutex_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "sync/mutex/mod.rs",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Mutex;\n    }\n",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Mutex;\n    }\n    \
-         // seraph-overlay: seraph mutex via Notification caps\n    \
+         // seraph-overlay: seraph mutex is the queue rwlock's write side (per-thread parking)\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::Mutex;\n    }\n",
     )
@@ -1161,7 +1161,7 @@ fn apply_sync_rwlock_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "sync/rwlock/mod.rs",
         "    target_os = \"solid_asp3\" => {\n        mod solid;\n        pub use solid::RwLock;\n    }\n",
         "    target_os = \"solid_asp3\" => {\n        mod solid;\n        pub use solid::RwLock;\n    }\n    \
-         // seraph-overlay: seraph rwlock via Notification caps\n    \
+         // seraph-overlay: seraph rwlock is upstream queue.rs (per-thread parking)\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::RwLock;\n    }\n",
     )

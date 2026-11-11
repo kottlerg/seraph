@@ -151,6 +151,124 @@ fn a_thread_value_the_reader_does_not_know_requires_no_registers()
     assert_eq!(blocks[0].check(), Ok(()));
 }
 
+/// `log` without the field lines whose key `drop` selects, its end marker
+/// counting the field lines left.
+fn without(log: &str, drop: impl Fn(&str) -> bool) -> String
+{
+    let kept: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            line.split_once("CRASH id=")
+                .and_then(|(_, rest)| rest.split_once(' '))
+                .and_then(|(_, field)| field.split_once('='))
+                .is_none_or(|(key, _)| !drop(key))
+        })
+        .collect();
+    let fields = kept
+        .iter()
+        .filter(|line| line.contains("CRASH id="))
+        .count();
+    kept.iter()
+        .map(|line| match line.find("lines=")
+        {
+            Some(at) if line.contains("CRASH-END") =>
+            {
+                format!("{}lines={fields}\n", &line[..at])
+            }
+            _ => format!("{line}\n"),
+        })
+        .collect()
+}
+
+/// The complete main-thread block of a `fault`, with a register file and a
+/// walk, as logged; it passes the check.
+fn complete_main_log(fault: Fault) -> String
+{
+    let regs: Vec<u64> = (0..21).collect();
+    let frames = [0x7f00_0000_1234];
+    let mut report = main_vm_report(&regs, &[0x90], &frames);
+    report.fault = fault;
+    let log = logged(&report);
+    assert_eq!(parse(&log)[0].check(), Ok(()));
+    log
+}
+
+#[test]
+fn a_status_value_the_reader_does_not_know_requires_only_the_fault_message_fields()
+{
+    let mut report = main_vm_report(&[], &[], &[]);
+    report.status = Status::Unattached;
+    report.image = None;
+    let log = logged(&report).replace("status=unattached", "status=later-status");
+    let blocks = parse(&log);
+    assert_eq!(blocks[0].get("status"), Some("later-status"));
+    assert_eq!(blocks[0].check(), Ok(()));
+
+    // The fault message's fields are still required.
+    let log = without(&log, |key| key == "ip");
+    assert_eq!(parse(&log)[0].check(), Err(Defect::Missing("ip".into())));
+}
+
+#[test]
+fn a_kind_value_the_reader_does_not_know_requires_neither_kinds_fields()
+{
+    let log = complete_main_log(main_vm_report(&[], &[], &[]).fault);
+    let log = without(&log, |key| {
+        matches!(key, "access" | "addr" | "pager_reason")
+    })
+    .replace("kind=vm", "kind=later-kind");
+    let blocks = parse(&log);
+    assert_eq!(blocks[0].get("kind"), Some("later-kind"));
+    assert_eq!(blocks[0].check(), Ok(()));
+}
+
+#[test]
+fn an_access_exception_or_walk_value_the_reader_does_not_know_is_only_required_present()
+{
+    let vm = complete_main_log(main_vm_report(&[], &[], &[]).fault);
+    let exception = complete_main_log(Fault::Exception {
+        code: syscall_abi::FAULT_EXC_ILLEGAL_INSTRUCTION,
+        aux: 0,
+    });
+    let cases = [
+        (vm.replace("access=write", "access=later-access"), "access"),
+        (
+            exception.replace("exception=illegal-instruction", "exception=later-class"),
+            "exception",
+        ),
+        (vm.replace("walk=scan", "walk=later-walk"), "walk"),
+    ];
+    for (log, key) in cases
+    {
+        let blocks = parse(&log);
+        assert!(
+            blocks[0].get(key).is_some_and(|v| v.starts_with("later-")),
+            "{log}"
+        );
+        assert_eq!(blocks[0].check(), Ok(()), "{key}");
+        assert_eq!(
+            parse(&without(&log, |k| k == key))[0].check(),
+            Err(Defect::Missing(key.into()))
+        );
+    }
+}
+
+#[test]
+fn an_arch_value_the_reader_does_not_know_requires_no_registers()
+{
+    let log = complete_main_log(main_vm_report(&[], &[], &[]).fault);
+    let log =
+        without(&log, |key| key.starts_with("reg.")).replace("arch=x86_64", "arch=later-arch");
+    let blocks = parse(&log);
+    assert_eq!(blocks[0].get("arch"), Some("later-arch"));
+    assert_eq!(blocks[0].check(), Ok(()));
+    // The walk is still required of a main thread's complete block.
+    assert_eq!(
+        parse(&without(&log, |key| key == "frame.0"))[0].check(),
+        Err(Defect::Missing("frame.0".into()))
+    );
+}
+
 #[test]
 fn an_unattached_report_needs_only_the_fault_message_fields()
 {

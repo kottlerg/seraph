@@ -37,7 +37,8 @@ ruststd/
 │   └── src/lib.rs              #   of the byte heap (where a request lands in a free block,
 │                               #   what stays free); a rustc-dep-of-std dep of overlaid std
 ├── spin-wait/                  # `ruststd-spin-wait` crate: pure, host-tested contended-wait
-│   └── src/lib.rs              #   policy of the overlay's spin mutex (spin, then sleep); a
+│   └── src/lib.rs              #   policy of the overlay's spin mutex and of a parking wait
+│                               #   with no Notification (spin, then sleep); a
 │                               #   rustc-dep-of-std dep of overlaid std
 ├── patches/                    # upstream library/std patches applied during overlay assembly
 └── src/                        # std PAL overlay, copied into vendored library/std at build time
@@ -447,6 +448,44 @@ thread without bound while procmgr waits on that spawner; and a process that han
 which a newly spawned thread serves (a file or node for `CREATE_FROM_FILE`, say) before that
 thread's registration has been served, so procmgr's call on the cap waits on a thread that waits on
 procmgr.
+
+---
+
+## Synchronization primitives
+
+`std::sync::{Mutex, Condvar, RwLock, Once}` and `std::thread::{park, park_timeout}` all block
+through one mechanism, the per-thread `Parker`, on a kernel Notification
+(`SYS_NOTIFICATION_WAIT`, woken by `SYS_NOTIFICATION_SEND`,
+[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md)); none spins without bound
+under contention. The backends are under `src/sys/sync/`.
+
+- **Fast path.** An uncontended `lock`, `unlock`, `read`, `write`, `try_*`, a `park` whose token
+  is already set, an `unpark` of a thread that is not parked, a `notify_*` with no waiter, and a
+  completed `Once` are atomic operations only, with no syscall.
+- **Park and unpark.** Each thread's `Parker` holds one token (`EMPTY`, `NOTIFIED`, `PARKED`)
+  and a Notification of its own, retyped from the object slab on the thread's first blocking park
+  and deleted when the `Parker` drops with the thread's last `Thread` handle. `unpark` sets the
+  token and, when the thread is parked, sends on that Notification. `park` returns once it
+  consumes the token, and may return without one (a stale wake, an interrupted wait), so every
+  caller rechecks its condition and parks again. `park_timeout` waits on the same Notification
+  with a timeout of whole milliseconds, a non-zero duration below one millisecond rounded up to
+  one.
+- **Waiter queues.** Every blocking type queues a node on the waiting thread's stack and wakes
+  the node's thread by `unpark`, so a wake reaches the thread it names and no type holds a kernel
+  object of its own. `RwLock` is upstream's queue lock (`sys/sync/rwlock/queue.rs`): a waiter
+  spins a bounded number of times while no thread is queued, then queues and parks; an unlock
+  wakes the oldest waiter when it is a writer and every waiter otherwise. `Mutex` is that lock's
+  write side. `Condvar` keeps a FIFO of waiters under an internal `Mutex`, and `notify_all` wakes
+  every one of them. `Once` is upstream's queue (`sys/sync/once/queue.rs`), and completion wakes
+  every waiter.
+- **No Notification.** When the `Parker`'s retype fails, the parked thread has no cap to wait on,
+  and the next park retries the retype. Until one succeeds, `park` polls its token, stepping a
+  `ruststd-spin-wait` `Backoff` between polls as the byte heap's `SpinMutex` does
+  ([§ Byte heap](#byte-heap-system)): a bounded spin, then a sleep of `SLEEP_MS` before each
+  poll. A `park_timeout` without a cap sleeps that long, or less when its duration is shorter,
+  and returns. The sleep lets a thread that would `unpark` it, a lock holder among them, run on
+  the parked thread's CPU when it runs below a strict-priority parked thread there
+  ([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md) § Scheduling Classes).
 
 ---
 

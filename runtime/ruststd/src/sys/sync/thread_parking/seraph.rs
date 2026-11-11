@@ -51,11 +51,12 @@ impl Parker {
             self.state.store(EMPTY, Relaxed);
             return;
         }
+        let mut backoff = spin_wait::Backoff::new();
         loop {
             if sig != 0 {
                 let _ = syscall::notification_wait(sig);
             } else {
-                core::hint::spin_loop();
+                back_off(&mut backoff);
             }
             if self.state.compare_exchange(NOTIFIED, EMPTY, Acquire, Relaxed).is_ok() {
                 return;
@@ -89,12 +90,16 @@ impl Parker {
             ms = 1;
         }
         let ms = u64::try_from(ms).unwrap_or(u64::MAX);
-        if sig != 0 && ms != 0 {
-            let _ = syscall::notification_wait_timeout(sig, ms);
-        } else if ms == 0 {
+        if ms == 0 {
             // Zero-duration park — don't block.
+        } else if sig != 0 {
+            let _ = syscall::notification_wait_timeout(sig, ms);
         } else {
-            core::hint::spin_loop();
+            // No cap to wait on: sleep the shortest blocking sleep, or `dur`
+            // when shorter, and return early, which the park contract allows.
+            // A caller's deadline loop then blocks between its checks rather
+            // than spinning, so a holder below it on its CPU still runs.
+            let _ = syscall::thread_sleep(ms.min(spin_wait::SLEEP_MS));
         }
         // Consume any pending notification; either way, clear to EMPTY.
         let _ = self.state.swap(EMPTY, Acquire);
@@ -122,6 +127,23 @@ impl Drop for Parker {
     }
 }
 
+/// One step of a `park` that has no cap to wait on (its retype failed): spin,
+/// or, once the spin bound is spent, sleep, so the parked thread does not
+/// hold its CPU from a lower-level thread that would `unpark` it
+/// (runtime/ruststd/README.md § Synchronization primitives).
+fn back_off(backoff: &mut spin_wait::Backoff) {
+    match backoff.next_step() {
+        spin_wait::Step::Spin => core::hint::spin_loop(),
+        // An error (`Interrupted`) only ends the sleep early; `park` rechecks
+        // its state either way.
+        spin_wait::Step::Sleep(ms) => {
+            let _ = syscall::thread_sleep(ms);
+        }
+    }
+}
+
+/// Lazily allocate the Parker's Notification cap on its first blocking park.
+/// Returns 0 if allocation fails; the park then backs off instead of waiting.
 fn ensure_notification(slot: &AtomicU64) -> u64 {
     let existing = slot.load(Acquire);
     if existing != 0 {

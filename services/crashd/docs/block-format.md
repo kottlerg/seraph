@@ -20,9 +20,17 @@ CRASH-END id=<id> lines=<count>
 
 - The begin marker opens the block and names the format's `version`, today `1`. A change that
   renames or removes a field or changes a value's encoding bumps it; a new field, or a new value of
-  a field that names one of a set (`thread`, `status`, `kind`, `exception`), does not. A reader
-  skips a key it does not know, and reads a `thread` value it does not know as a thread whose
-  block carries no registers, as `unidentified`; `thread=spawned` was added so.
+  a field that names one of a set (`arch`, `thread`, `status`, `kind`, `access`, `exception`,
+  `walk`), does not; `thread=spawned` was added so. A reader skips a key it does not know, and
+  reads a value it does not know of such a field as follows:
+
+  | Field | A value the reader does not know |
+  |---|---|
+  | `arch` | requires no `reg.<name>` lines, since the reader cannot name them |
+  | `thread` | a thread whose block carries no registers or walk, as `unidentified` |
+  | `status` | requires only the fault message's fields, as `unattached` |
+  | `kind` | requires neither `vm`'s fields nor `exception`'s |
+  | `access`, `exception`, `walk` | is only required to be present |
 - Each field line carries one field. A reader keys the line to the open block whose `id` it
   carries, so the lines of two blocks, and lines of other senders, may interleave.
 - The end marker closes the block; `count` is the number of field lines. A block whose end marker

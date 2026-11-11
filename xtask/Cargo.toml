@@ -53,6 +53,9 @@ crash-report = { path = "../shared/crash-report" }
 # test-logd-reclaim's parser is tested against the line logd formats, not a
 # copy of its shape.
 logd-codec = { path = "../services/logd/codec" }
+# procmgr's thread crash badge (`threads::is_crash_badge`): `symbolize --log`
+# tells a block that carries one, which names no process, from a process's.
+procmgr-process-table = { path = "../services/procmgr/process-table" }
 
 [dev-dependencies]
 # `symbolize`'s tests write their ELF fixtures (a symbol table and DWARF

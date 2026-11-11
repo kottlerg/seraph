@@ -3,140 +3,48 @@
 
 // runtime/ruststd/src/sys/sync/mutex/seraph.rs
 
-//! Futex-style three-state Mutex backed by a lazily-allocated Notification cap.
-//! Uncontended lock/unlock is a single CAS on `state`. Contention allocates
-//! a Notification (once per Mutex, cached in `notification`) and blocks via
-//! `SYS_NOTIFICATION_WAIT`; the releasing thread wakes one waiter via
-//! `SYS_NOTIFICATION_SEND`. Matches the state machine of upstream
-//! `sync/mutex/futex.rs` with one structural deviation.
+//! `Mutex` for seraph: the write side of the overlay's `RwLock`, upstream's
+//! queue-based `sync/rwlock/queue.rs`.
 //!
-//! Seraph's Notification cap is a separately-allocated kernel object (unlike
-//! upstream futex where the state atom address IS the wait key), so the
-//! slot is populated lazily on first contention. The contender in
-//! `lock_contended` installs the Notification cap BEFORE publishing `CONTENDED`
-//! so that any concurrent `unlock` observing `CONTENDED` is guaranteed to
-//! see a non-zero slot and deliver the wake. Skipping this step allowed
-//! a lost-wakeup deadlock when the slot was populated after the unlock's
-//! check — `threading_phase` intermittently parked one worker on a cap
-//! nobody would ever notification.
-//!
-//! `swap` on `state` uses `AcqRel`: Release publishes the install (and
-//! any critical-section stores on unlock); Acquire synchronizes with the
-//! other side's Release so the subsequent `notification` load is guaranteed to
-//! observe the install on weak-memory architectures (RVWMO).
+//! Upstream ships no queue-based `Mutex`; its mutexes park on a futex or a
+//! platform lock. On seraph the write side of the queue lock is one: an
+//! uncontended `lock` and `unlock` are one atomic operation each, and a
+//! contended waiter queues a node and parks on its own `Parker`
+//! (`sys::sync::thread_parking`), so the lock holds no kernel object and
+//! every lock parks through the one per-thread mechanism. See
+//! runtime/ruststd/README.md § Synchronization primitives.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use crate::sync::atomic::{AtomicU32, AtomicU64};
-use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
-
-const UNLOCKED: u32 = 0;
-const LOCKED: u32 = 1;
-const CONTENDED: u32 = 2;
+use crate::sys::sync::RwLock;
 
 pub struct Mutex {
-    state: AtomicU32,
-    notification: AtomicU64,
+    lock: RwLock,
 }
 
 impl Mutex {
     #[inline]
     pub const fn new() -> Self {
-        Self { state: AtomicU32::new(UNLOCKED), notification: AtomicU64::new(0) }
+        Self { lock: RwLock::new() }
     }
 
     #[inline]
     pub fn try_lock(&self) -> bool {
-        self.state.compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed).is_ok()
+        self.lock.try_write()
     }
 
     #[inline]
     pub fn lock(&self) {
-        if self.state.compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed).is_err() {
-            self.lock_contended();
-        }
-    }
-
-    #[cold]
-    fn lock_contended(&self) {
-        let mut state = self.spin();
-        if state == UNLOCKED
-            && self.state.compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed).is_ok()
-        {
-            return;
-        }
-        // Install the Notification cap BEFORE publishing `CONTENDED` so a
-        // concurrent unlock that observes `CONTENDED` is guaranteed to see
-        // a non-zero slot and deliver the wake.
-        let sig = ensure_notification(&self.notification);
-        loop {
-            if state != CONTENDED && self.state.swap(CONTENDED, AcqRel) == UNLOCKED {
-                return;
-            }
-            if sig != 0 {
-                let _ = syscall::notification_wait(sig);
-            } else {
-                core::hint::spin_loop();
-            }
-            state = self.spin();
-        }
-    }
-
-    fn spin(&self) -> u32 {
-        // A tuning value that bounds no capacity: past it the waiter parks on
-        // the lock's notification instead of spinning.
-        let mut spin = 100;
-        loop {
-            let s = self.state.load(Relaxed);
-            if s != LOCKED || spin == 0 {
-                return s;
-            }
-            core::hint::spin_loop();
-            spin -= 1;
-        }
+        self.lock.write();
     }
 
     /// # Safety
-    /// The calling thread must hold the lock (i.e. a prior `lock` or
-    /// successful `try_lock` without a matching unlock).
+    /// The calling thread must hold the lock (a prior `lock`, or a successful
+    /// `try_lock`, with no matching unlock).
     #[inline]
     pub unsafe fn unlock(&self) {
-        if self.state.swap(UNLOCKED, AcqRel) == CONTENDED {
-            let sig = self.notification.load(Relaxed);
-            if sig != 0 {
-                let _ = syscall::notification_send(sig, 1);
-            }
-        }
-    }
-}
-
-impl Drop for Mutex {
-    fn drop(&mut self) {
-        let sig = *self.notification.get_mut();
-        if sig != 0 {
-            let _ = syscall::cap_delete(sig);
-        }
-    }
-}
-
-/// Lazily allocate a Notification cap on first contention. Returns 0 if allocation
-/// fails; callers fall back to busy-spinning.
-fn ensure_notification(slot: &AtomicU64) -> u64 {
-    let existing = slot.load(Acquire);
-    if existing != 0 {
-        return existing;
-    }
-    let bytes = syscall_abi::NOTIFICATION_RETYPE_BYTES;
-    let Some(fresh) = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
-        syscall::cap_create_notification(slab).ok()
-    }) else {
-        return 0;
-    };
-    match slot.compare_exchange(0, fresh, AcqRel, Acquire) {
-        Ok(_) => fresh,
-        Err(other) => {
-            let _ = syscall::cap_delete(fresh);
-            other
-        }
+        // SAFETY: the caller holds the lock, which is the write lock of
+        // `self.lock`.
+        unsafe { self.lock.write_unlock() };
     }
 }

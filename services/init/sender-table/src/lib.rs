@@ -20,9 +20,11 @@
 // sender, so a name or line survives the handover unclipped.
 pub use logd_codec::{LINE_BUF_SIZE, MAX_NAME_LEN};
 
+use ipc::stream_labels::LEVEL_INFO;
+
 /// One sender's state: its badge (opaque identity; `0` marks a free slot),
-/// its registered display name, and the bytes accumulated since its last
-/// newline.
+/// its registered display name, the bytes accumulated since its last
+/// newline, and the level of that line.
 #[derive(Clone, Copy)]
 pub struct SenderSlot
 {
@@ -31,6 +33,7 @@ pub struct SenderSlot
     name_used: usize,
     buf: [u8; LINE_BUF_SIZE],
     used: usize,
+    level: u64,
 }
 
 impl SenderSlot
@@ -43,6 +46,7 @@ impl SenderSlot
             name_used: 0,
             buf: [0u8; LINE_BUF_SIZE],
             used: 0,
+            level: LEVEL_INFO,
         }
     }
 
@@ -66,6 +70,26 @@ impl SenderSlot
     pub fn line(&self) -> &[u8]
     {
         &self.buf[..self.used]
+    }
+
+    /// The level of the buffered line: that of the message that carried its
+    /// first byte ([`Self::begin_byte`]).
+    #[must_use]
+    pub fn level(&self) -> u64
+    {
+        self.level
+    }
+
+    /// Note that the next byte, a line byte or the newline that ends the
+    /// line, arrived in a message at `level`. While no byte of the line is
+    /// buffered it is the line's first, so `level` becomes the line's level;
+    /// later bytes leave it as it is.
+    pub fn begin_byte(&mut self, level: u64)
+    {
+        if self.used == 0
+        {
+            self.level = level;
+        }
     }
 
     /// Append `b` to the line buffer. Returns `true` when the buffer is now
@@ -398,6 +422,25 @@ mod tests
         let b = t.register_name(2, &long).expect("stored");
         assert_eq!(t.slots()[a].name(), &long[..MAX_NAME_LEN]);
         assert_eq!(t.slots()[b].name(), &long[..MAX_NAME_LEN]);
+    }
+
+    #[test]
+    fn a_line_takes_the_level_of_the_message_carrying_its_first_byte()
+    {
+        use ipc::stream_labels::{LEVEL_DEBUG, LEVEL_WARN};
+        let mut t = SenderTable::<1>::new();
+        let i = t.find_or_alloc(1);
+        let slot = t.slot_mut(i);
+        slot.begin_byte(LEVEL_WARN);
+        slot.push_byte(b'a');
+        // A later message continues the line; the level stays.
+        slot.begin_byte(LEVEL_DEBUG);
+        slot.push_byte(b'b');
+        assert_eq!(slot.level(), LEVEL_WARN);
+        slot.clear_line();
+        // The next line starts at the level of its own first message.
+        slot.begin_byte(LEVEL_DEBUG);
+        assert_eq!(slot.level(), LEVEL_DEBUG);
     }
 
     #[test]

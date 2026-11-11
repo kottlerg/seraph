@@ -26,7 +26,7 @@ mod slot;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use ipc::stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME};
+use ipc::stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME, level_of};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use logd_codec::reclaim::{Cause, ReclaimLine};
 use std::os::seraph::startup_info;
@@ -647,7 +647,9 @@ fn reply_ack(ipc_buf: *mut u64)
 
 /// Append `byte_len` bytes from the IPC payload onto the slot for
 /// `badge`, flushing complete lines (`\n`-terminated) to the serial
-/// port AND recording them into the per-slot history ring.
+/// port AND recording them into the per-slot history ring. A line takes
+/// the level of the message carrying its first byte
+/// ([`crate::slot::Slot::begin_byte`]).
 ///
 /// Accepts up to `STREAM_CHUNK_SIZE = MSG_DATA_WORDS_MAX * 8` bytes
 /// per call (the maximum a single `STREAM_BYTES` IPC can carry); the
@@ -664,9 +666,11 @@ fn consume_bytes(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: 
     // mutably without aliasing the IPC buffer.
     let mut staged = [0u8; STREAM_CHUNK_SIZE];
     staged[..n].copy_from_slice(&bytes[..n]);
+    let level = level_of(msg.label);
     let slot = table.get_or_create(badge);
     for &b in &staged[..n]
     {
+        slot.begin_byte(level);
         if b == b'\n'
         {
             flush_partial(badge, slot);
@@ -690,9 +694,10 @@ fn flush_partial(badge: u64, slot: &mut crate::slot::Slot)
 {
     let name = slot.name.clone();
     let line = std::mem::take(&mut slot.partial);
-    emit_line(badge, &name, &line);
+    let level = slot.partial_level;
+    emit_line(badge, &name, level, &line);
     let us = elapsed_us();
-    slot.push_history(us, &line);
+    slot.push_history(us, level, &line);
 }
 
 /// Record / update the display name for `badge`. Lines emitted with
@@ -1009,10 +1014,11 @@ impl LineBuf
     }
 }
 
-/// Emit `[sec.usfrac] [name] <bytes>\r\n` to the serial driver. Mirrors
-/// init-logd's `flush_line` shape so the post-handover output stream looks
-/// identical to the pre-handover output.
-fn emit_line(_badge: u64, name: &[u8], line: &[u8])
+/// Emit `[sec.usfrac] [name] <bytes>\r\n` to the serial driver, with the
+/// line's level tag and a space after `[name] ` for any level but info
+/// (`logd_codec::level::tag`). Mirrors init-logd's `flush_line` shape so the
+/// post-handover output stream looks identical to the pre-handover output.
+fn emit_line(_badge: u64, name: &[u8], level: u64, line: &[u8])
 {
     let mut out = LineBuf::new();
     out.push_timestamp();
@@ -1033,6 +1039,14 @@ fn emit_line(_badge: u64, name: &[u8], line: &[u8])
     }
     out.push(b']');
     out.push(b' ');
+    if let Some(tag) = logd_codec::level::tag(level)
+    {
+        for &b in tag.as_bytes()
+        {
+            out.push(b);
+        }
+        out.push(b' ');
+    }
     for &b in line
     {
         out.push_escaped(b);

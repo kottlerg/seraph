@@ -428,8 +428,8 @@ Every entry here is `correct as is`; none is tracked.
 | `CSPACE_FUND_ROUNDS` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 2 | provably unreachable (record-page argument) | none | correct as is | None |
 | `SLAB_SHELF_SIZE` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 4 | tuning (overflow strands a run until exit, bounded) | 192 B static | correct as is | None |
 | `ALLOCATOR_METADATA_RESERVE` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 64 | tuning (slack) | none | correct as is | None |
-| `SPIN_ATTEMPTS` (`SpinMutex` contended wait) | `runtime/ruststd/spin-wait/src/lib.rs` | 1024 failed acquisitions spun before the first sleep | tuning (bounds no capacity: past the bound a waiter sleeps and retries without limit) | none | correct as is | None |
-| `SLEEP_MS` (`SpinMutex` contended wait) | `runtime/ruststd/spin-wait/src/lib.rs` | 1 ms before each attempt past `SPIN_ATTEMPTS` | tuning (the shortest `SYS_THREAD_SLEEP` that blocks; bounds no capacity) | none | correct as is | None |
+| `SPIN_ATTEMPTS` (`SpinMutex` contended wait; a `Parker` with no Notification) | `runtime/ruststd/spin-wait/src/lib.rs` | 1024 failed acquisitions spun before the first sleep | tuning (bounds no capacity: past the bound a waiter sleeps and retries without limit) | none | correct as is | None |
+| `SLEEP_MS` (`SpinMutex` contended wait; a `Parker` with no Notification) | `runtime/ruststd/spin-wait/src/lib.rs` | 1 ms before each attempt past `SPIN_ATTEMPTS` | tuning (the shortest `SYS_THREAD_SLEEP` that blocks; bounds no capacity) | none | correct as is | None |
 | reserve `INLINE_RUNS` (`Arena.inline`) | `runtime/ruststd/src/sys/reserve/seraph.rs` | 64 | tuning (the static run table before it grows into the byte heap) | 1 KiB static | correct as is | None; a process without a heap fails its 64th live reservation instead of losing freed VA |
 | Reaper slot table (`death_queues::slots::Registry`) | `runtime/ruststd/death-queues/src/slots.rs` | grows a slot at a time, on the byte heap; slot index `u32` | provably unreachable (2^32 slots exceed the threads a process can fund) | about 96 B per slot, grown on demand | correct as is | None; a spawn whose slot cannot be allocated leaks its thread on detach, as without a reaper |
 | Reaper `FIRST_POOL_OBSERVERS` (`DeathQueues`) | `runtime/ruststd/src/sys/thread/seraph.rs` | 99 nodes in the first queue (the most whose queue, with one entry more than its nodes, fits one 4 KiB retype class), each further queue twice the last up to `EVENT_QUEUE_MAX_CAPACITY` less one; a refused grant retried at half, down to 99; at most 1023 queues (`WAIT_SET_MAX_MEMBERS` less the member `DeathQueues` keeps for a service endpoint) | per-call bound (one node per bound thread; every queue is drained before each bind, in the same hold, so its pending posts never exceed its nodes plus the one thread bound in that same hold, which is its entries; RAM that refuses every grant above the first pool's leaves 1023 queues of 99 nodes, about 100 K bound threads per process: the set's floor) | a two-page grant at the first spawn; a further queue only when every pool is out | correct as is | None |
@@ -449,8 +449,6 @@ Every entry here is `correct as is`; none is tracked.
 | Path component limit | `runtime/ruststd/src/sys/fs/seraph.rs` | 255 (`MAX_NAME_LEN`) | ABI width (namespace protocol) | none | correct as is | None |
 | `READ_WAIT` | `runtime/ruststd/src/sys/fs/release_handler.rs` | 100 ms | ABI width (the driver's cooperative-release window) | none | correct as is | None |
 | `RESOLVE_WAIT_US` | `runtime/ruststd/src/sys/time/seraph.rs` | 100 ms | tuning (many registry round trips, on the kernel's clock) | none | correct as is | None |
-| `Mutex::spin` count | `runtime/ruststd/src/sys/sync/mutex/seraph.rs` | 100 | tuning (a backoff before parking) | none | correct as is | None |
-| `MAX_READERS` | `runtime/ruststd/src/sys/sync/rwlock/seraph.rs` | `2^30 - 2` | provably unreachable short of leaked guards (more than any thread count; past it readers wait) | 4 B per lock | correct as is | None |
 
 ### Shared IPC and protocol crates
 
@@ -639,6 +637,7 @@ The entries left open are tracked by the Issue each recommendation names.
 | `LINE_BUF_SIZE`, `MAX_NAME_LEN` | `services/logd/codec/src/lib.rs` | 256 / 48 | line and label length, one definition for init-logd and logd (an over-long line is split, a long name truncated) | per sender slot | correct as is | None |
 | `HistoryRing` record length | `services/logd/codec/src/history.rs` | `u16` | provably unreachable (at most `LINE_BUF_SIZE`, const-asserted) | 2 B per line | correct as is | None |
 | `HistoryRing.total`, `first_seq` | `services/logd/codec/src/history.rs` | `u64` sequence | ABI width | 16 B | correct as is | None |
+| log level field (`stream_labels::LEVEL_MASK`) | `shared/ipc/src/lib.rs` | 3 bits of the `STREAM_BYTES` and handover `LINE` labels; codes 1 to 5 assigned, 0, 6 and 7 read as info | ABI width | 1 B per `HistoryRing` record | correct as is | None |
 | `LOG_THREAD_STACK_PAGES` | `services/init/src/logging.rs` | 4 | BSS budget (the tables live in BSS, not on this stack) | 16 KiB | correct as is | None |
 | `STREAM_CHUNK_SIZE` | `services/init/src/logging.rs`, `services/logd/src/main.rs` | 512 | ABI width | 512 B stack | correct as is | None |
 | `MAX_ORPHAN_MEMORY_CAPS` | `services/init/src/main.rs` | `INIT_INFO_MAX_PAGES * PAGE_SIZE / size_of::<CapDescriptor>()` = 10,922 | provably unreachable (at most one orphan per usable-RAM cap, each of which has an `InitInfo` descriptor; `memory_count` is clamped to it) | about 43 KiB BSS, reclaimed at init's reap | correct as is | None |
@@ -658,7 +657,7 @@ The entries left open are tracked by the Issue each recommendation names.
 | `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | 128 | tuning (a drain of a full queue's worth starts a resync from procmgr's `QUERY_LIVE_PROCESSES`, which evicts the slots a dropped post left) | about 2.1 KiB | correct as is | None |
 | eviction by the death correlator (`drain_deaths`) | `services/logd/src/main.rs` | the full `u64` badge procmgr posts; no death-observer nodes | ABI width | none | correct as is | None |
 | death exit reason | `services/logd/src/main.rs` | full `u64` (`DeathEvent.exit_reason`, logged whole in the `reclaim:` line) | ABI width | none | correct as is | None |
-| handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 860 lines in its 16 KiB ring) | none | correct as is | Derive from those constants |
+| handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 820 lines in its 16 KiB ring) | none | correct as is | Derive from those constants |
 | `RELEASE_RETRY_BUDGET_US` (`send_release`) | `services/logd/codec/src/handover.rs` | 1 s of wall-clock time | tuning (bounds no capacity; time-based, so load does not shorten it) | none | correct as is | None |
 | `MAX_RELEASE_DEFERRALS` | `services/logd/codec/src/handover.rs` | 8 | tuning (liveness bound against name churn) | none | correct as is | None |
 | `NameResend.pending` | `services/logd/codec/src/handover.rs` | init `MAX_SENDERS` | encoding artefact (mirror) | 32 B | correct as is | None |

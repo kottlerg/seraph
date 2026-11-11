@@ -56,15 +56,16 @@ driver's write endpoint and, when a framebuffer driver is present, the framebuff
 
 ### `stream_labels::STREAM_BYTES` (10)
 
-Per-line byte stream. Sender packs the chunk byte length into the
-label's upper 16 bits (`label | ((len << 16))`). Inline bytes
+Per-line byte stream. Sender packs the chunk byte length into bits
+16-31 of the label (`label | (len << 16)`) and the chunk's log level into
+bits 32-34 (§ Levels). Inline bytes
 arrive in the IPC message's data words, packed at word 0. logd
 appends the bytes to the slot keyed by the kernel-delivered
 `msg.badge`; every `\n` flushes the slot's partial buffer as one
 line, emitted as `[sec.usfrac] [name] <line>\r\n` to the serial
 driver (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
 (`FB_WRITE_BYTES`) when one is present, then appended to the slot's
-history ring.
+history ring with its level.
 
 The history ring holds `PER_SLOT_HISTORY` (16) completed lines per slot (see
 [`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest line (FIFO). The ring
@@ -75,6 +76,54 @@ trailing `\n` to keep the per-line attribution visible. Senders
 that have not yet called `STREAM_REGISTER_NAME` render as `[?]`.
 
 Reply: `label = 0` (success), empty payload. Sender unblocks.
+
+#### Levels
+
+A log line carries one of five levels, from least to most verbose: error,
+warn, info, debug, trace. The level code rides bits 32-34 of every
+`STREAM_BYTES` label (`ipc::stream_labels::LEVEL_SHIFT`, `LEVEL_MASK`, and the
+`LEVEL_*` codes 1 to 5). Code 0 means no level was given and, like the
+unassigned codes 6 and 7, reads as info (`ipc::stream_labels::level_of`), so
+a sender that sets no level logs at info.
+
+- **Sender.** `seraph::log!("fmt", args…)` logs at info; a leading `error:`,
+  `warn:`, `info:`, `debug:`, or `trace:` sets the level
+  (`seraph::log!(warn: "fmt", args…)`). Every call site written before
+  levels existed logs at info and stays so. std's panic, allocation-error,
+  and precondition output, sent through the same cap, is at error. Bytes a
+  sender writes with `log::write_bytes` carry the level it passes.
+- **Filter.** A std process sends only lines at or less verbose than its
+  level, which std's `_start` reads once from the process's `SERAPH_LOG`
+  environment entry (`error`, `warn`, `info`, `debug`, or `trace`; absent
+  or any other value: info). A line above that level is neither formatted
+  nor sent, so it costs no IPC. A service sets the entry with the `.svc`
+  `env` key ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)
+  § `argv` / `env`), a spawner with `Command::env`. Neither receiver
+  filters: each renders every line it receives. An error line is sent at
+  every level.
+- **Line level.** The stream carries bytes, not lines, so a receiver gives a
+  line the level of the message that carried its first byte; later chunks
+  of the same line do not change it. A line split at `LINE_BUF_SIZE` keeps
+  that level for each part. Two threads of one process share the process's
+  badge and slot, so lines they interleave mix as their bytes do.
+- **Rendering.** Both init-logd and logd render an info line as
+  `[sec.usfrac] [name] <line>`, as every line rendered before levels
+  existed, so each line a harness matches (`[svctest] ALL TESTS PASSED`,
+  the `reclaim:` line below) is unchanged. A line of any other level carries
+  its tag and a space after `[name] `: `ERROR`, `WARN`, `DEBUG`, or `TRACE`
+  (`logd_codec::level::tag`): `[sec.usfrac] [name] WARN <line>`.
+- **History.** Each history line keeps its level, init-logd's across the
+  handover ([`handover-protocol.md`](handover-protocol.md) § `LINE`).
+
+#### Fields
+
+The stream provides no framing for structured fields here: a line is text.
+A line that reports values writes each as `key=value` text, separated from
+the next by a space, as the `reclaim:` line (§ Death-notification cascade)
+does; a reader that parses fields (an xtask harness, a log query) splits the
+text. Text does not delimit a value from a following key, so a value that
+holds ` key=` reads as a further field. Framed fields, which give logd each
+key and value apart from the text, are tracked by #879.
 
 ### `stream_labels::STREAM_REGISTER_NAME` (11)
 
@@ -209,4 +258,6 @@ ordering).
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [Crash Block Format](../../crashd/docs/block-format.md),
 [services/logd/README.md](../README.md),
-[services/logd/codec/README.md](../codec/README.md), [xtask/README.md](../../../xtask/README.md)
+[services/logd/codec/README.md](../codec/README.md),
+[`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md),
+[shared/log/README.md](../../../shared/log/README.md), [xtask/README.md](../../../xtask/README.md)

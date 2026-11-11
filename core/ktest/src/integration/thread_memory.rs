@@ -17,18 +17,25 @@
 //! - an unmapped page, a kernel-half address, a length of 0 or past
 //!   `MAX_THREAD_MEM_COPY`, an undefined flag, and a cap without `CONTROL`
 //!   are refused, the write all or nothing;
-//! - a text page (mapped executable, frame mapped once) refuses a write
-//!   without `THREAD_MEM_TEXT` and takes one with it, and a text page whose
-//!   frame ktest also maps refuses it;
+//! - a text page (mapped executable through an Execute-bearing, Write-less
+//!   derived cap, as a process loader maps text, frame mapped once) refuses a
+//!   write without `THREAD_MEM_TEXT` and takes one with it, and a text page
+//!   whose frame ktest also maps refuses it;
+//! - a page lent read-only (mapped through a Map-only derived cap) refuses a
+//!   `mem_protect` to writable or executable through the full-rights cap of
+//!   its own frame, and a text write, each `InsufficientRights`: a page goes
+//!   no further than the rights of the cap that mapped it, while the protect
+//!   page, mapped read-only through a full-rights cap, turns executable;
 //! - `SYS_SYSTEM_INFO(InstructionCacheSyncs)` rises across an executable
 //!   `mem_map`, a `mem_protect` to executable (of a read-only page, and of a
 //!   page already executable, the route for code written through a writable
 //!   alias), the text write, and a data write, whose frame could be mapped
 //!   executable elsewhere (the path-taken check: under QEMU a missing
 //!   synchronisation does not fail);
-//! - a device page (an `Mmio` page ktest maps into B) is refused
-//!   (`InvalidAddress`), and still refused after a `mem_protect` of it, when
-//!   the boot hands ktest an `Mmio`;
+//! - a device page (an `Mmio` page ktest maps into B through a Map-only copy)
+//!   is refused (`InvalidAddress`), and still refused after a `mem_protect` of
+//!   it to read-only; a `mem_protect` of it to writable or executable is
+//!   refused (`InsufficientRights`), when the boot hands ktest an `Mmio`;
 //! - once B is deleted, its thread is `Exited` and both calls refuse it.
 //!
 //! A thread in ktest's own address space reads and writes a ktest static the
@@ -40,8 +47,8 @@ use syscall::{
     mmio_split, system_info, thread_read_mem, thread_write_mem,
 };
 use syscall_abi::{
-    MAX_THREAD_MEM_COPY, RIGHTS_ALL, RIGHTS_THREAD_OBSERVE, SyscallError, SystemInfoType,
-    THREAD_MEM_TEXT,
+    MAX_THREAD_MEM_COPY, RIGHTS_MEM_MAP, RIGHTS_MEM_MAP_RX, RIGHTS_MMIO_MAP, RIGHTS_THREAD_OBSERVE,
+    SyscallError, SystemInfoType, THREAD_MEM_TEXT,
 };
 
 use crate::{TestContext, TestResult, spawn};
@@ -67,6 +74,8 @@ const B_PROTECT: u64 = 0x4030_0000;
 const B_UNMAPPED: u64 = 0x4040_0000;
 /// B's VA of the device page.
 const B_DEVICE: u64 = 0x4050_0000;
+/// B's VA of the page lent read-only (mapped through a Map-only cap).
+const B_LENT: u64 = 0x4060_0000;
 
 /// The bytes ktest stores in the text page, then the bytes the text write
 /// puts in their place; never executed.
@@ -102,14 +111,15 @@ pub fn run(ctx: &TestContext) -> TestResult
 }
 
 /// The frame-pool pages of the cross-space case: two data pages, the text
-/// page, the shared text page, and the page `mem_protect` turns executable.
-struct Frames([u64; 5]);
+/// page, the shared text page, the page `mem_protect` turns executable, and
+/// the page lent read-only. Each cap carries full rights.
+struct Frames([u64; 6]);
 
 impl Frames
 {
     fn alloc() -> Result<Self, &'static str>
     {
-        let mut caps = [0u64; 5];
+        let mut caps = [0u64; 6];
         for (i, c) in caps.iter_mut().enumerate()
         {
             let Some(f) = crate::frame_pool::alloc()
@@ -186,7 +196,7 @@ fn own_space(ctx: &TestContext) -> TestResult
 /// The cross-space checks against a thread of a fresh address space B.
 fn other_space(ctx: &TestContext, frames: &mut Frames) -> TestResult
 {
-    let [d0, d1, text, shared, protect] = frames.0;
+    let [d0, d1, text, shared, protect, lent] = frames.0;
     let b = cap_create_aspace(ctx.memory_base, 0, 8)
         .map_err(|_| "integration::thread_memory: cap_create_aspace failed")?;
     let Ok(cs) = cap_create_cspace(ctx.memory_base, 0, 4)
@@ -202,11 +212,12 @@ fn other_space(ctx: &TestContext, frames: &mut Frames) -> TestResult
         cap_delete(b).ok();
         return Err("integration::thread_memory: cap_create_thread failed");
     };
-    let result = map_all(ctx, b, [d0, d1, text, shared, protect])
+    let result = map_all(ctx, b, [d0, d1, text, shared, protect, lent])
         .and_then(|()| data_copies(th))
         .and_then(|()| refusals(th))
         .and_then(|()| text_write(th))
-        .and_then(|()| device_refused(ctx, b, th));
+        .and_then(|()| lent_page_refused(b, th, lent))
+        .and_then(|()| device_refused(ctx, b, th, lent));
     let deleted = cap_delete(b).is_ok();
     // B is gone: its thread is Exited and both calls refuse it.
     let mut buf = [0u8; 8];
@@ -231,9 +242,23 @@ fn other_space(ctx: &TestContext, frames: &mut Frames) -> TestResult
     Ok(())
 }
 
+/// Map one page of `cap`, attenuated to `rights`, at `va` of `b` with `prot`,
+/// then delete the attenuated copy, as a process loader does: the mapping
+/// outlives it.
+fn map_attenuated(cap: u64, rights: u64, b: u64, va: u64, prot: u64) -> TestResult
+{
+    let narrow = cap_derive(cap, rights)
+        .map_err(|_| "integration::thread_memory: cap_derive of a frame failed")?;
+    // SAFETY: `b` is an address space this test created, not ktest's own.
+    let mapped = unsafe { mem_map(narrow, b, va, 0, 1, prot) };
+    cap_delete(narrow).ok();
+    mapped.map_err(|_| "integration::thread_memory: a mem_map through a derived cap failed")
+}
+
 /// Map the pages both sides see, and count the synchronisations of the
 /// executable `mem_map` and the `mem_protect` to executable.
-fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect]: [u64; 5]) -> TestResult
+fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect, lent]: [u64; 6])
+-> TestResult
 {
     // SAFETY: KT_DATA and KT_DATA + PAGE are scratch VAs (crate docs § Scratch
     // VAs), so the spans hold no Rust object or IPC page of ktest.
@@ -272,9 +297,7 @@ fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect]: [u64; 5])
     unsafe { mem_unmap(ctx.aspace_cap, KT_TEXT, 1) }
         .map_err(|_| "integration::thread_memory: ktest text mem_unmap failed")?;
     let before = syncs()?;
-    // SAFETY: `b` is an address space this test created, not ktest's own.
-    unsafe { mem_map(text, b, B_TEXT, 0, 1, MAP_EXECUTABLE) }
-        .map_err(|_| "integration::thread_memory: B text mem_map failed")?;
+    map_attenuated(text, RIGHTS_MEM_MAP_RX, b, B_TEXT, MAP_EXECUTABLE)?;
     if syncs()? <= before
     {
         return Err("integration::thread_memory: an executable mem_map did not synchronise");
@@ -288,7 +311,11 @@ fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect]: [u64; 5])
     unsafe { mem_map(shared, ctx.aspace_cap, KT_SHARED, 0, 1, MAP_READ) }
         .map_err(|_| "integration::thread_memory: ktest shared mem_map failed")?;
 
-    // The protect page: read-only, then executable.
+    // The lent page: read-only through a Map-only cap.
+    map_attenuated(lent, RIGHTS_MEM_MAP, b, B_LENT, MAP_READ)?;
+
+    // The protect page: read-only through a full-rights cap, then executable,
+    // which that cap's Execute grants.
     // SAFETY: `b` is an address space this test created, not ktest's own.
     unsafe { mem_map(protect, b, B_PROTECT, 0, 1, MAP_READ) }
         .map_err(|_| "integration::thread_memory: B protect mem_map failed")?;
@@ -413,7 +440,8 @@ fn refusals(th: u64) -> TestResult
 }
 
 /// The text writes: refused without the flag, taken with it (and
-/// synchronised), refused on a frame mapped twice.
+/// synchronised) on a page mapped through a Write-less, Execute-bearing cap,
+/// refused on a frame mapped twice.
 fn text_write(th: u64) -> TestResult
 {
     let mut got = [0u8; 8];
@@ -448,15 +476,55 @@ fn text_write(th: u64) -> TestResult
     Ok(())
 }
 
-/// A device page of B is refused. ktest takes a copy of the first `Mmio` it
-/// holds (a copy, so no mapping of the original is withdrawn), carves one page
-/// off it, or uses it whole when it is one page, and maps the page into B;
-/// with no `Mmio`, the case is skipped.
-fn device_refused(ctx: &TestContext, b: u64, th: u64) -> TestResult
+/// The page lent read-only goes no further than its Map-only cap: a
+/// `mem_protect` to writable or to executable through `lent`, the
+/// full-rights cap of the same frame, is refused, and so is a text write,
+/// each leaving the page as it was.
+fn lent_page_refused(b: u64, th: u64, lent: u64) -> TestResult
+{
+    let refused = Err(err(SyscallError::InsufficientRights));
+    let mut before = [0u8; 8];
+    if thread_read_mem(th, B_LENT, &mut before) != Ok(8)
+    {
+        return Err("integration::thread_memory: the lent page did not read");
+    }
+    // SAFETY: `b` is an address space this test created, not ktest's own.
+    if unsafe { mem_protect(lent, b, B_LENT, 1, MAP_WRITABLE) } != refused
+    {
+        return Err("integration::thread_memory: a Map-only page was made writable");
+    }
+    // SAFETY: as above.
+    if unsafe { mem_protect(lent, b, B_LENT, 1, MAP_EXECUTABLE) } != refused
+    {
+        return Err("integration::thread_memory: a Map-only page was made executable");
+    }
+    let new = before.map(|byte| !byte);
+    // SAFETY: the thread's space is B, not ktest's.
+    if unsafe { thread_write_mem(th, B_LENT, &new, THREAD_MEM_TEXT) } != refused
+    {
+        return Err("integration::thread_memory: a text write to a Map-only page was taken");
+    }
+    let mut after = [0u8; 8];
+    if thread_read_mem(th, B_LENT, &mut after) != Ok(8) || after != before
+    {
+        return Err("integration::thread_memory: a refused change altered the lent page");
+    }
+    // The same cap still narrows the page, which its grant allows.
+    // SAFETY: as above.
+    unsafe { mem_protect(lent, b, B_LENT, 1, MAP_READ) }
+        .map_err(|_| "integration::thread_memory: a read-only protect of the lent page failed")
+}
+
+/// A device page of B is refused. ktest takes a Map-only copy of the first
+/// `Mmio` it holds (a copy, so no mapping of the original is withdrawn),
+/// carves one page off it, or uses it whole when it is one page, and maps the
+/// page into B; with no `Mmio`, the case is skipped. `memory` is a
+/// full-rights Memory cap for the protects.
+fn device_refused(ctx: &TestContext, b: u64, th: u64, memory: u64) -> TestResult
 {
     for slot in 1..=u64::from(crate::unit::hw::scan_bound(ctx))
     {
-        let Ok(copy) = cap_derive(slot, RIGHTS_ALL)
+        let Ok(copy) = cap_derive(slot, RIGHTS_MMIO_MAP)
         else
         {
             continue;
@@ -479,7 +547,7 @@ fn device_refused(ctx: &TestContext, b: u64, th: u64) -> TestResult
         };
         // SAFETY: `b` is an address space this test created, not ktest's own.
         let mapped = unsafe { mmio_map(b, lo, B_DEVICE, 0) };
-        let result = device_reads_refused(ctx, b, th, mapped);
+        let result = device_reads_refused(b, th, memory, mapped);
         // Deleting the page's cap withdraws its mapping from B.
         cap_delete(lo).ok();
         return result;
@@ -489,9 +557,11 @@ fn device_refused(ctx: &TestContext, b: u64, th: u64) -> TestResult
 }
 
 /// The reads of B's device page: refused as mapped, and refused again after a
-/// `mem_protect`, which any Memory cap with MAP authorises and which keeps the
-/// page device memory. `mapped` is the outcome of the page's `mmio_map`.
-fn device_reads_refused(ctx: &TestContext, b: u64, th: u64, mapped: Result<(), i64>) -> TestResult
+/// `mem_protect` to read-only, which keeps the page device memory; a
+/// `mem_protect` to writable or executable through `memory`, a full-rights
+/// Memory cap, is refused, since the page's Map-only `Mmio` cap grants
+/// neither. `mapped` is the outcome of the page's `mmio_map`.
+fn device_reads_refused(b: u64, th: u64, memory: u64, mapped: Result<(), i64>) -> TestResult
 {
     mapped.map_err(|_| "integration::thread_memory: mmio_map of the device page failed")?;
     let refused = Err(err(SyscallError::InvalidAddress));
@@ -500,8 +570,19 @@ fn device_reads_refused(ctx: &TestContext, b: u64, th: u64, mapped: Result<(), i
     {
         return Err("integration::thread_memory: a device page was not refused");
     }
+    let not_granted = Err(err(SyscallError::InsufficientRights));
     // SAFETY: `b` is an address space this test created, not ktest's own.
-    unsafe { mem_protect(ctx.memory_base, b, B_DEVICE, 1, MAP_READ) }
+    if unsafe { mem_protect(memory, b, B_DEVICE, 1, MAP_WRITABLE) } != not_granted
+    {
+        return Err("integration::thread_memory: a read-only device page was made writable");
+    }
+    // SAFETY: as above.
+    if unsafe { mem_protect(memory, b, B_DEVICE, 1, MAP_EXECUTABLE) } != not_granted
+    {
+        return Err("integration::thread_memory: a device page was made executable");
+    }
+    // SAFETY: as above.
+    unsafe { mem_protect(memory, b, B_DEVICE, 1, MAP_READ) }
         .map_err(|_| "integration::thread_memory: mem_protect of the device page failed")?;
     if thread_read_mem(th, B_DEVICE, &mut buf) != refused
     {

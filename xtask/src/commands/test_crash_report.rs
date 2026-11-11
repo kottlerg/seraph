@@ -23,7 +23,8 @@
 //! the process's death names. With
 //! `--expect none`, the log must hold no block: the boot of an image that
 //! does not stage crashd. A log whose `run-parallel` trailer records a
-//! `QEMU-CRASH` is skipped, as `test-logd-reclaim` skips it.
+//! `QEMU-CRASH` is skipped, not failed: that outcome is a host-emulator
+//! crash, which `run-parallel` itself tolerates.
 
 use std::collections::HashMap;
 

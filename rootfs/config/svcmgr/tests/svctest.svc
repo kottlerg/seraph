@@ -14,6 +14,8 @@
 # no-authority twin. The vfsd seeds ride in a second bootstrap round, so
 # every svctest boot exercises a seed list longer than one round; the
 # svcmgr_second_seed_round phase fails the run if they do not arrive.
+# logd.query is the LOG_QUERY_AUTHORITY SEND on the master log endpoint the
+# logd_death_forward phase reads its dead child's retired slot through.
 # svctest resolves the public pwrmgr.deny no-auth twin itself via
 # QUERY_ENDPOINT. debug_authority = yes delivers procmgr's
 # DEBUG_AUTHORITY SEND|GRANT in the slot after the seeds, and svctest,
@@ -40,5 +42,5 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount vfsd.deny
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount vfsd.deny logd.query
 debug_authority = yes

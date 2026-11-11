@@ -207,11 +207,6 @@ jobs:
             --parallel 1 --runs 1 --timeout "$budget" \
             --save-logs target/xtask/run-parallel-saved
           if [ "${{ matrix.tester }}" = "svctest" ]; then
-            # No extra boot: the logd death-forward test reads the log the
-            # svctest boot above saved (--save-logs) for logd's reclaim line
-            # naming svctest's logd_death_forward child.
-            cargo xtask test-logd-reclaim --arch ${{ matrix.arch }} \
-              --log target/xtask/run-parallel-saved/${{ matrix.arch }}-4cpu-1.log
             # No extra boot: the image staged no crashd, so the log must hold
             # no crash report.
             cargo xtask test-crash-report --expect none \

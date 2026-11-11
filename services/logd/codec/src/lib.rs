@@ -11,6 +11,7 @@
 //! deadline, and the receiver's chunk decoder; init-logd's captured-history
 //! byte ring ([`history`]); logd's death-queue resync decisions
 //! ([`resync`]); the line logd logs when it evicts a slot ([`reclaim`]);
+//! which entries a query page carries ([`query`]);
 //! the level tag both log receivers render ([`level`]); and the line and
 //! name widths both log receivers use ([`LINE_BUF_SIZE`], [`MAX_NAME_LEN`]).
 //! Also holds [`BoundedStr`], the fixed-capacity formatter logd uses for its
@@ -26,6 +27,7 @@
 pub mod handover;
 pub mod history;
 pub mod level;
+pub mod query;
 pub mod reclaim;
 pub mod record;
 pub mod resync;

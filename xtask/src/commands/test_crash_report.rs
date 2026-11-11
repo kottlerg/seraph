@@ -17,7 +17,8 @@
 //! block of its main thread and one `exception` block of a spawned thread,
 //! each complete, its walk starting at its instruction pointer, matched by
 //! the kernel's decline line naming the block's id, and carrying the stack
-//! pointer the kernel's register dump of that declined thread prints. A block
+//! pointer the kernel's register dump of that declined thread prints (and, in
+//! the `vm` block, the faulting address that dump prints). A block
 //! is tied to `crashme` through its `badge`, which logd's `reclaim:` line at
 //! the process's death names. With
 //! `--expect none`, the log must hold no block: the boot of an image that
@@ -117,7 +118,10 @@ fn dumped_register(log: &str, tid: u64, name: &str) -> Option<u64>
 /// Check one fixture block beyond its format: complete, of the thread
 /// `thread`, its walk starting at its instruction pointer, declined with its
 /// id, and its stack pointer the one the kernel's dump of the declined thread
-/// prints, so the block read the thread that faulted.
+/// prints, so the block read the thread that faulted. A `vm` block's `addr`,
+/// the fault message's address, must also be the faulting address that dump
+/// prints (`cr2` on x86-64, `stval` on RISC-V), so the dump names the access
+/// that faulted.
 fn check_fixture_block(block: &Block, thread: &str, log: &str) -> Result<()>
 {
     let id = block.id;
@@ -134,13 +138,13 @@ fn check_fixture_block(block: &Block, thread: &str, log: &str) -> Result<()>
     {
         bail!("no kernel decline line carries {FIXTURE}'s block id {id:016x}");
     };
-    let sp = if block.get("arch") == Some("riscv64")
+    let (sp, fault_addr) = if block.get("arch") == Some("riscv64")
     {
-        "sp"
+        ("sp", "stval")
     }
     else
     {
-        "rsp"
+        ("rsp", "cr2")
     };
     let reported = block.hex(&format!("reg.{sp}"));
     let dumped = dumped_register(log, tid, sp);
@@ -150,6 +154,18 @@ fn check_fixture_block(block: &Block, thread: &str, log: &str) -> Result<()>
             "{FIXTURE}'s block {id:016x}: its {sp} {reported:x?} is not the {dumped:x?} the \
              kernel dumped for the declined thread {tid}"
         );
+    }
+    if block.get("kind") == Some("vm")
+    {
+        let reported = block.hex("addr");
+        let dumped = dumped_register(log, tid, fault_addr);
+        if reported.is_none() || reported != dumped
+        {
+            bail!(
+                "{FIXTURE}'s block {id:016x}: its addr {reported:x?} is not the \
+                 {fault_addr} {dumped:x?} the kernel dumped for the declined thread {tid}"
+            );
+        }
     }
     Ok(())
 }
@@ -246,10 +262,14 @@ mod tests
     /// Index of `rsp` in the x86-64 register file the reports carry.
     const RSP: usize = 17;
 
+    /// The faulting address of the fixture's `vm` report.
+    const VM_ADDR: u64 = 0x7fff_eff8;
+
     /// The serial lines `report` and its death leave: the block as logd
     /// prints crashd's lines, the kernel's decline line and register dump of
     /// the declined thread (tid the report's id), its stack pointer the
-    /// report's, and logd's reclaim line naming `name`.
+    /// report's and its `cr2` a `vm` report's address, and logd's reclaim line
+    /// naming `name`.
     fn death(report: &Report<'_>, name: &str) -> String
     {
         let mut log = String::new();
@@ -259,9 +279,14 @@ mod tests
             "[2.4] fault unhandled: tid={tid} handler declined, reason={:#x}\n",
             report.id
         ));
+        let cr2 = match report.fault
+        {
+            Fault::Vm { addr, .. } => addr,
+            Fault::Exception { .. } => 0,
+        };
         log.push_str(&format!(
             "[2.4] USERSPACE FAULT: tid={tid} cpu=0 cause=#UD (vec=6 err=0x0)\n  rip=0x1  \
-             cr2=0x0  fs_base=0x0\n  rsi=0x0000000000000000  rbp=0x0  rsp={:#018x}\n",
+             cr2={cr2:#018x}  fs_base=0x0\n  rsi=0x0000000000000000  rbp=0x0  rsp={:#018x}\n",
             report.regs.get(RSP).copied().unwrap_or(0)
         ));
         log.push_str(&format!(
@@ -294,7 +319,7 @@ mod tests
             0xaa,
             Fault::Vm {
                 access: Access::Write,
-                addr: 0,
+                addr: VM_ADDR,
                 pager_reason: Some(3),
             },
             regs,
@@ -351,6 +376,21 @@ mod tests
         lines[last_dump] = lines[last_dump].replace("7ffff000", "7fffe000");
         let error = check_log(&lines.join("\n"), CrashReportExpect::Reports).unwrap_err();
         assert!(format!("{error:#}").contains("kernel dumped"));
+    }
+
+    #[test]
+    fn a_vm_report_whose_address_is_not_the_dumped_cr2_fails()
+    {
+        // The kernel's dump of the declined vm fault prints a stale CR2 (another
+        // fault's address) rather than the fault message's address.
+        let regs = [0u64; 21];
+        let log = fixture_reports(&regs).replacen(
+            &format!("cr2={VM_ADDR:#018x}"),
+            "cr2=0x0000402505e83ff0",
+            1,
+        );
+        let error = check_log(&log, CrashReportExpect::Reports).unwrap_err();
+        assert!(format!("{error:#}").contains("its addr"));
     }
 
     #[test]

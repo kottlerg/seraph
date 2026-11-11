@@ -763,7 +763,8 @@ fixture's main thread and one `exception` block of a `spawned` thread (its `work
 through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its
 instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying
 the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the
-block read the thread the kernel killed. `--expect none` requires the log to hold no block. A log
+block read the thread the kernel killed. The `vm` block's `addr` must also be the faulting address
+that dump prints (`cr2` on x86_64, `stval` on riscv64). `--expect none` requires the log to hold no block. A log
 whose `[run-parallel]` trailer records a `QEMU-CRASH` is reported skipped, which passes the
 command, as `test-logd-reclaim` reports it. The model is in
 [docs/testing.md](../docs/testing.md) § Crash reports.

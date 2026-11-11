@@ -328,7 +328,7 @@ const EMPTY_STATE: IoApicState = IoApicState {
 /// `kernel_mmio.ioapics[..]` (with a single-entry fallback when the bootloader
 /// reports none).
 ///
-/// SAFETY: written exactly once during Phase 5 `init`, single-threaded;
+/// Written exactly once during Phase 5 `init`, single-threaded;
 /// subsequent reads happen from IRQ paths after SMP is active and observe a
 /// fully-written value because the write precedes SMP bring-up.
 static mut IOAPICS: [IoApicState; MAX_IOAPICS] = [EMPTY_STATE; MAX_IOAPICS];

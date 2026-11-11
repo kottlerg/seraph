@@ -1721,7 +1721,7 @@ extern "C" fn ipi_tlb_shootdown_handler()
     }
 
     // Send EOI to local APIC.
-    // SAFETY: Vector 250 is the TLB shootdown vector.
+    // Vector 250 is the TLB shootdown vector.
     super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_TLB_SHOOTDOWN));
 }
 
@@ -1734,7 +1734,7 @@ extern "C" fn ipi_tlb_shootdown_handler()
 extern "C" fn ipi_wakeup_handler()
 {
     // Send EOI to local APIC. No other work needed; the interrupt wakes the CPU.
-    // SAFETY: Vector 251 is the wakeup IPI vector.
+    // Vector 251 is the wakeup IPI vector.
     super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_WAKEUP));
 }
 

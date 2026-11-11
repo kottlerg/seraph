@@ -137,7 +137,7 @@ static RETURNED: BadTally = BadTally::new();
 /// The child's IPC buffer page (its `ipc_recv` needs one registered).
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
-// SAFETY: used only by this cell's single child.
+// Used only by this cell's single child.
 static mut CHILD_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;

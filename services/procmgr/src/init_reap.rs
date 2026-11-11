@@ -341,7 +341,6 @@ fn do_reap(state: InitReapState, memmgr_ep: u64, ipc_buf: *mut u64)
         main_thread,
         logd_thread,
         donate_caps,
-        ..
     } = state;
 
     // 1. Reap init-logd's TCB. It is `Exited` (it released on real-logd's

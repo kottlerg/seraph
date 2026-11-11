@@ -29,7 +29,7 @@ const FB_VA: u64 = 0x1000_1000;
 /// Framebuffer state. The geometry fields (`ready`, `base`, `stride`, `max_cols`,
 /// `max_rows`) are set once during `init`; the cursor (`col`, `row`) and
 /// `decoder` change on every write.
-// SAFETY: ktest is single-threaded on the framebuffer output path.
+// ktest is single-threaded on the framebuffer output path.
 static mut STATE: FbState = FbState {
     ready: false,
     base: 0,

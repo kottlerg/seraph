@@ -123,7 +123,7 @@ impl IpcBufPage
     const ZERO: IpcBufPage = IpcBufPage([0u64; 512]);
 }
 
-// SAFETY: each child of the current run is the sole user of its own
+// Each child of the current run is the sole user of its own
 // `IPC_BUFS` index via its own (kernel-synchronous) IPC syscalls.
 static mut IPC_BUFS: [IpcBufPage; 2 * NUM_PAIRS] = [IpcBufPage::ZERO; 2 * NUM_PAIRS];
 

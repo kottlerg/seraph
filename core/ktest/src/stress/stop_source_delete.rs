@@ -227,10 +227,10 @@ static BAD_ACTIONS: BadTally = BadTally::new();
 /// starts).
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
-// SAFETY: used only by the live round's waiter (one at a time, see above).
+// Used only by the live round's waiter (one at a time, see above).
 static mut WAITER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 /// The served-call phases' server's IPC buffer (one server per phase).
-// SAFETY: used only by the live phase's server.
+// Used only by the live phase's server.
 static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
 /// What a phase's waiters park on.
@@ -1039,7 +1039,7 @@ extern "C" fn waiter_entry(arg: u64) -> !
 {
     let kind = Kind::decode(arg);
     let source = SOURCE.load(Ordering::Acquire);
-    // SAFETY: sole live user of WAITER_IPC_BUF (one waiter at a time).
+    // Sole live user of WAITER_IPC_BUF (one waiter at a time).
     let buf = core::ptr::addr_of_mut!(WAITER_IPC_BUF).cast::<u64>();
     if matches!(kind, Kind::Recv | Kind::Call | Kind::CallServed)
         // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
@@ -1139,7 +1139,7 @@ extern "C" fn racer_entry(arg: u64) -> !
 /// then acknowledge the round. Any other result is recorded as unaccepted.
 extern "C" fn server_entry(_arg: u64) -> !
 {
-    // SAFETY: sole live user of SERVER_IPC_BUF (one server per phase).
+    // Sole live user of SERVER_IPC_BUF (one server per phase).
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
     // registered by one thread at a time; no Rust object lives in it, and the

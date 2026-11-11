@@ -205,6 +205,8 @@ fn parse_hex_field(field: &str) -> Option<u64>
 pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
+    // Held until the command returns, after its last QEMU has exited.
+    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let qemu_binary = require_tool(args.arch.qemu_binary())?;
 
     // Resolve firmware once; riscv64 needs a writable vars pflash.

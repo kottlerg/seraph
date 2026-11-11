@@ -541,8 +541,9 @@ fn check_body_closing(pat: &Patterns, body: &str) -> Vec<Diag>
                 "pr-closes-and-refs",
                 format!("body:{}", found.line),
                 format!(
-                    "the body closes #{} here and also references it with `Refs`; confirm the \
+                    "the body closes {} here and also references #{} with `Refs`; confirm the \
                      PR means to close it",
+                    found.label(),
                     found.issue
                 ),
             ));
@@ -554,9 +555,9 @@ fn check_body_closing(pat: &Patterns, body: &str) -> Vec<Diag>
             "pr-closing-in-prose",
             format!("body:{}", found.line),
             format!(
-                "this sentence closes #{} when the PR merges; put `Fixes #{}` on its own line \
+                "this sentence closes {0} when the PR merges; put `Fixes {0}` on its own line \
                  if that is meant, or reword it",
-                found.issue, found.issue
+                found.label()
             ),
         ));
     }
@@ -1743,6 +1744,14 @@ mod tests
             ["o.w-n/r_e.po#6"]
         );
         assert_eq!(found("Fixes #7"), ["#7"]);
+        // A finding about the reference names its repository.
+        let diags = check_body(&p, &format!("{BODY}\nA test of `Fixes other/repo#5`.\n"));
+        assert_eq!(rules(&diags), ["pr-closing-in-prose"]);
+        assert!(
+            diags[0].message.contains("closes other/repo#5"),
+            "{}",
+            diags[0].message
+        );
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn request_one_page(memmgr: u64, ipc_buf: *mut u64) -> Option<usize>
     }
 }
 
-fn main()
+fn main() -> !
 {
     std::os::seraph::log::register_name(b"capexhaust");
     let info = std::os::seraph::startup_info();

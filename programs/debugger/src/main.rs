@@ -214,6 +214,9 @@ fn gdb_target() -> !
         };
     }
     let _worker = std::thread::spawn(|| {
+        // infinite_loop: the worker steps until the process exits, and a
+        // `thread::spawn` closure returns a value type, not `!`.
+        #[expect(clippy::infinite_loop)]
         loop
         {
             gdb_target_worker_step();

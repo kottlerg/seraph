@@ -833,7 +833,7 @@ fn bootstrap_from_init(
     {
         return None;
     }
-    // SAFETY: phys_table_va is mapped RO, one page, page-aligned (4 KiB), so
+    // phys_table_va is mapped RO, one page, page-aligned (4 KiB), so
     // u64 alignment is satisfied.
     #[allow(clippy::cast_ptr_alignment)]
     let phys_ptr = phys_table_va as *const u64;

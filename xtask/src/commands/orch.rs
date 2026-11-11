@@ -739,7 +739,7 @@ fn end(dir: &Path, secs: u64) -> Result<PathBuf>
     let stem = text(&state, "log").trim_end_matches(".md");
     // A second batch that starts on the same UTC day appends to the same log,
     // and its ended state takes the next free name beside the first one's.
-    let kept = (1..1_000_u32)
+    let kept = (1..1_000u32)
         .map(|number| match number
         {
             1 => dir.join(format!("{stem}.state.json")),

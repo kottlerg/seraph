@@ -156,7 +156,7 @@ pub unsafe fn setup_trampoline(trampoline_pa: u64)
     let code_end = core::ptr::addr_of!(_rv_ap_trampoline_end) as usize;
     let code_len = code_end - code_start;
 
-    // SAFETY: direct map active; dst is valid writable memory for the page.
+    // Direct map active; dst is valid writable memory for the page.
     let dst = phys_to_virt(trampoline_pa) as *mut u8;
     // SAFETY: code_start is valid linker symbol; dst is direct-mapped trampoline page; len fits.
     unsafe {

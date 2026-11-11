@@ -55,7 +55,7 @@ fn module_scratch_pages(module_size: u64) -> Option<u64>
 /// is seeded, which it is before init runs.
 fn draw_layout_entropy() -> Option<[u8; process_layout::LAYOUT_ENTROPY_BYTES]>
 {
-    let mut entropy = [0_u8; process_layout::LAYOUT_ENTROPY_BYTES];
+    let mut entropy = [0u8; process_layout::LAYOUT_ENTROPY_BYTES];
     let n = syscall::getrandom(&mut entropy).ok()?;
     (n == entropy.len() as u64).then_some(entropy)
 }

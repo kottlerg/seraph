@@ -303,8 +303,8 @@ pub mod procmgr_labels
     #[must_use]
     pub const fn create_sched_bits(priority: u8, band_max: u8) -> u64
     {
-        ((priority as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_PRIORITY_SHIFT
-            | ((band_max as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_BAND_MAX_SHIFT
+        (((priority as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_PRIORITY_SHIFT)
+            | (((band_max as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_BAND_MAX_SHIFT)
     }
 
     /// Release the held memory reclaim of a child created with

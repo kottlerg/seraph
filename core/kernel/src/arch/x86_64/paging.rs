@@ -592,7 +592,7 @@ pub unsafe fn enable_nx()
             out("edx") hi,
             options(nostack, nomem),
         );
-        let efer = (u64::from(hi) << 32 | u64::from(lo)) | NXE;
+        let efer = (u64::from(hi) << 32) | u64::from(lo) | NXE;
         core::arch::asm!(
             "wrmsr",
             in("ecx") IA32_EFER,

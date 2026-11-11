@@ -385,7 +385,7 @@ impl PoolState
     #[allow(clippy::similar_names)]
     pub fn new(info: &BootInfo) -> Self
     {
-        // SAFETY: BOOT_TABLE_POOL is in BSS; single-threaded boot access.
+        // BOOT_TABLE_POOL is in BSS; single-threaded boot access.
         let pool_va_base = core::ptr::addr_of!(BOOT_TABLE_POOL) as u64;
         let kv = info.kernel_virtual_base;
         let kp = info.kernel_physical_base;

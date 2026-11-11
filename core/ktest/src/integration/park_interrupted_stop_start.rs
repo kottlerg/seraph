@@ -113,7 +113,7 @@ static CHILD_ARGS: spawn::ArgBlock<ChildArgs, 1> =
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
 
-// SAFETY: used only by phase 4's single child (phases run sequentially).
+// Used only by phase 4's single child (phases run sequentially).
 static mut CHILD_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
 // too_many_lines: six flat sequential phases, one per parking surface; each
@@ -429,7 +429,7 @@ extern "C" fn event_entry(arg: u64) -> !
 extern "C" fn recv_entry(arg: u64) -> !
 {
     let (ep, done) = unpack(arg);
-    // SAFETY: sole live user of CHILD_IPC_BUF (phases run sequentially).
+    // Sole live user of CHILD_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(CHILD_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
     // registered by one thread at a time; no Rust object lives in it, and the

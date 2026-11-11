@@ -24,7 +24,7 @@ const UART_LSR: usize = 5; // line status register
 /// can return it across the Phase 3 page-table switch (when `BootInfo` is no
 /// longer accessible).
 ///
-/// SAFETY: written exactly once during Phase 1, single-threaded; subsequent
+/// Written exactly once during Phase 1, single-threaded; subsequent
 /// reads happen after SMP is active but observe a fully-written value because
 /// the write precedes SMP bring-up.
 static mut UART_PHYS: u64 = 0;
@@ -34,7 +34,7 @@ static mut UART_PHYS: u64 = 0;
 /// Initialized to the physical address (identity-mapped by the bootloader).
 /// Updated by [`rebase_serial`] after Phase 3 switches to the direct map.
 /// Single-threaded early boot: no locking required.
-// SAFETY: accessed only from the single kernel boot thread before SMP, then
+// Accessed only from the single kernel boot thread before SMP, then
 // read-only across all CPUs once SMP is active.
 static mut UART_BASE: u64 = 0;
 

@@ -452,10 +452,9 @@ fn parse_signal(digits: &[u8]) -> Result<u8, Error>
 {
     match digits
     {
-        [hi, lo] =>
-        {
-            Ok(nibble(*hi).ok_or(Error::Malformed)? << 4 | nibble(*lo).ok_or(Error::Malformed)?)
-        }
+        [hi, lo] => Ok(
+            (nibble(*hi).ok_or(Error::Malformed)? << 4) | nibble(*lo).ok_or(Error::Malformed)?
+        ),
         _ => Err(Error::Malformed),
     }
 }

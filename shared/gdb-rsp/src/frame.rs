@@ -149,7 +149,7 @@ impl<const N: usize> PacketReader<N>
                 self.state = State::Idle;
                 match nibble(byte)
                 {
-                    Some(lo) if hi << 4 | lo == self.sum =>
+                    Some(lo) if (hi << 4) | lo == self.sum =>
                     {
                         if self.overflowed
                         {

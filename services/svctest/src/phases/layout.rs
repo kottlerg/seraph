@@ -81,7 +81,7 @@ pub fn growth_zones_phase(_: &Caps)
     );
     let zones = process_layout::growth_zones(top);
 
-    let boxed = Box::new(0_u64);
+    let boxed = Box::new(0u64);
     let heap_va = (&raw const *boxed).addr() as u64;
     assert!(
         heap_va >= zones.heap.window.base && heap_va < zones.heap.end_bound(),
@@ -229,15 +229,15 @@ pub fn wide_main_tls_phase(_: &Caps)
 fn stack_note_pages_offset(image: &[u8]) -> usize
 {
     let mut needle: Vec<u8> = Vec::with_capacity(28);
-    needle.extend_from_slice(&7_u32.to_le_bytes());
-    needle.extend_from_slice(&8_u32.to_le_bytes());
+    needle.extend_from_slice(&7u32.to_le_bytes());
+    needle.extend_from_slice(&8u32.to_le_bytes());
     needle.extend_from_slice(&process_abi::NT_SERAPH_STACK.to_le_bytes());
     needle.extend_from_slice(&process_abi::SERAPH_NOTE_NAME);
     // Opaque to the optimiser, so no folded copy of the whole record can sit
     // in svctest's read-only data beside the real note.
     let pages = std::hint::black_box(crate::SVCTEST_STACK_PAGES);
     needle.extend_from_slice(&pages.to_le_bytes());
-    needle.extend_from_slice(&0_u32.to_le_bytes());
+    needle.extend_from_slice(&0u32.to_le_bytes());
     let hits: Vec<usize> = image
         .windows(needle.len())
         .enumerate()

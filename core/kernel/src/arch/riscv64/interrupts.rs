@@ -804,6 +804,9 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 crate::sched::schedule(crate::sched::Requeue::IfRunnable);
             }
             // Unreachable for an exited thread, but guard against schedule returning.
+            // infinite_loop: the other paths of `trap_dispatch` return to the
+            // trap stub, so the function cannot be `-> !`; this branch never does.
+            #[expect(clippy::infinite_loop)]
             loop
             {
                 // SAFETY: wfi is a RISC-V instruction; waits for interrupt.

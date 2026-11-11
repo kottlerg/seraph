@@ -158,7 +158,7 @@ fn read_tsc() -> u64
             options(nostack, nomem, preserves_flags),
         );
     }
-    (hi as u64) << 32 | lo as u64
+    ((hi as u64) << 32) | lo as u64
 }
 
 /// True when CPUID.01H:ECX[24] advertises the TSC-deadline timer mode.

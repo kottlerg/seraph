@@ -9,9 +9,8 @@
 //!
 //! The source's dealloc wake claims every queued waiter under the source lock
 //! and stamps its park episode `INTERRUPTED`; each waiter's resume consumes
-//! the stamp before reading `wakeup_value`. One phase per source, with two
-//! queued waiters on a notification or event queue and one on a wait set
-//! (which refuses a second):
+//! the stamp before reading `wakeup_value`. One phase per source, each with
+//! two queued waiters:
 //!
 //!   1. **`notification_wait`** (untimed).
 //!   2. **`notification_wait_timeout`** — a timed waiter is also on the sleep
@@ -110,11 +109,6 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// outcome.
 fn run_phase(ctx: &TestContext, source: Source) -> TestResult
 {
-    let count = match source
-    {
-        Source::WaitSet => 1,
-        _ => MAX_CHILDREN,
-    };
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::destroyed_source_interrupts: create done failed")?;
     let (object, member) = match create_source(ctx, source)
@@ -128,7 +122,7 @@ fn run_phase(ctx: &TestContext, source: Source) -> TestResult
     };
     let mut object = Some(object);
     let mut children: [Option<spawn::SpawnedChild>; MAX_CHILDREN] = [None, None];
-    let result = park_and_destroy(ctx, source, count, &mut object, done, &mut children);
+    let result = park_and_destroy(ctx, source, &mut object, done, &mut children);
 
     // Deleting a thread tears the child down wherever it is, so a failed
     // phase leaves no child parked on a stack the next phase reuses.
@@ -159,12 +153,11 @@ fn run_phase(ctx: &TestContext, source: Source) -> TestResult
     }
 }
 
-/// Start `count` children parked on `object`, destroy it (taking it out of
-/// `object`), and check every child's verdict.
+/// Start [`MAX_CHILDREN`] children parked on `object`, destroy it (taking it
+/// out of `object`), and check every child's verdict.
 fn park_and_destroy(
     ctx: &TestContext,
     source: Source,
-    count: usize,
     object: &mut Option<u64>,
     done: u64,
     children: &mut [Option<spawn::SpawnedChild>; MAX_CHILDREN],
@@ -172,7 +165,7 @@ fn park_and_destroy(
 {
     let obj = object.ok_or("integration::destroyed_source_interrupts: no source")?;
     let mut acc = 0;
-    for (index, slot) in children.iter_mut().enumerate().take(count)
+    for (index, slot) in children.iter_mut().enumerate()
     {
         start_child(ctx, source, obj, done, index, slot)?;
         acc = wait_for(done, acc, BIT_READY << shift(index))?;
@@ -186,11 +179,11 @@ fn park_and_destroy(
     cap_revoke(obj).map_err(|_| "integration::destroyed_source_interrupts: revoke failed")?;
     cap_delete(obj).map_err(|_| "integration::destroyed_source_interrupts: delete failed")?;
     *object = None;
-    for index in 0..count
+    for index in 0..MAX_CHILDREN
     {
         acc = wait_for(done, acc, (BIT_OK | BIT_BAD) << shift(index))?;
     }
-    if (0..count).any(|index| acc & (BIT_BAD << shift(index)) != 0)
+    if (0..MAX_CHILDREN).any(|index| acc & (BIT_BAD << shift(index)) != 0)
     {
         return Err(
             "integration::destroyed_source_interrupts: a wait on a destroyed source returned \

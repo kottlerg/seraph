@@ -355,7 +355,6 @@ pub unsafe fn endpoint_call(
     }
 
     // No server available — block caller on send queue.
-    let was_empty = ep.send_head.is_null();
     // Clear context_saved before enqueuing on the send queue.
     // See notification.rs notification_wait for the full rationale.
     // SAFETY: caller validated by syscall layer; context_saved is AtomicU32.
@@ -405,7 +404,11 @@ pub unsafe fn endpoint_call(
                 .store(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
-    if was_empty && committed == crate::sched::ParkCommit::Committed && !ep.wait_set.is_null()
+    // Notify a registered wait set of every call queued, not only the one
+    // that made the send queue non-empty: each arrival wakes one of the
+    // threads waiting on the set (core/kernel/docs/ipc-internals.md
+    // § Readiness Notification).
+    if committed == crate::sched::ParkCommit::Committed && !ep.wait_set.is_null()
     {
         // SAFETY: wait_set validated non-null.
         unsafe { crate::ipc::wait_set::waitset_notify(ep.wait_set, ep.wait_set_member_idx) };

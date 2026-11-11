@@ -4895,25 +4895,29 @@ enum PullOutcome
     /// lock-free reading that chose the pull no longer holds, being a transient
     /// or a load that has changed since.
     RuleFailed,
+    /// The rule held, but the source's queues hold no unpinned fully-saved
+    /// `Ready` thread: only pinned threads, which no pull takes, or threads
+    /// still mid-handoff (`context_saved == 0`).
+    NothingPullable,
     /// Nothing moved for another reason: CPU indices that are equal or out of
-    /// range, a contended try-lock, no unpinned fully-saved `Ready` thread on
-    /// the source, or a move the candidate's `sched_lock` re-check refused.
+    /// range, a contended try-lock, or a move the candidate's `sched_lock`
+    /// re-check refused.
     Deferred,
 }
 
-/// What an idle CPU's scan of the other CPUs found, folded one CPU at a time by
-/// [`IdleScan::note`] (see [`idle_scan`]).
+/// What an idle CPU's scan of the other CPUs found, folded one CPU at a time, in
+/// the scan's order, by [`IdleScan::note`] (see [`idle_scan`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct IdleScan
 {
     /// The most-loaded CPU noted and its `current_load`, or `None` when every
     /// one noted had a load of zero.
     heaviest: Option<(usize, u32)>,
-    /// The most-loaded CPU noted with a queued thread other than its idle
-    /// thread, and its load, or `None` when none had one: the load alone does
-    /// not tell a backlog, since it counts a linked idle thread
-    /// (core/kernel/docs/scheduler.md § Load Balancing).
-    backlogged: Option<(usize, u32)>,
+    /// The first CPU noted with a queued thread other than its idle thread, or
+    /// `None` when none had one: the load alone does not tell a backlog, since
+    /// it counts a linked idle thread (core/kernel/docs/scheduler.md § Load
+    /// Balancing).
+    backlogged: Option<usize>,
 }
 
 impl IdleScan
@@ -4926,10 +4930,11 @@ impl IdleScan
 
     /// Fold in `cpu`, whose `current_load` is `load`. `has_queued` tells
     /// whether it has a queued thread other than its idle thread, and is called
-    /// only for a non-zero load, the one case where the answer can matter, so
-    /// an idle CPU's scan reads no run-queue mask of an idle remote CPU. A CPU
-    /// replaces the recorded one only with a strictly greater load, so ties go
-    /// to the CPU noted first.
+    /// only for a non-zero load while no backlogged CPU is recorded, the one
+    /// case where the answer can matter, so an idle CPU's scan reads no
+    /// run-queue mask of an idle remote CPU, nor any past the first backlog. A
+    /// CPU replaces the recorded heaviest only with a strictly greater load, so
+    /// ties go to the CPU noted first.
     fn note(&mut self, cpu: usize, load: u32, has_queued: impl FnOnce() -> bool)
     {
         if load == 0
@@ -4940,16 +4945,15 @@ impl IdleScan
         {
             self.heaviest = Some((cpu, load));
         }
-        if self.backlogged.is_none_or(|(_, max)| load > max) && has_queued()
+        if self.backlogged.is_none() && has_queued()
         {
-            self.backlogged = Some((cpu, load));
+            self.backlogged = Some(cpu);
         }
     }
 
     /// The scan with its most-loaded CPU dropped, so that [`idle_pull_step`]
     /// decides by the confirmation rule alone: the step that follows a pull at
-    /// once whose re-check under the locks found the load past the threshold
-    /// no longer there.
+    /// once that moved nothing.
     fn without_heaviest(self) -> Self
     {
         Self {
@@ -4991,8 +4995,162 @@ fn idle_pull_step(scan: IdleScan, candidate: Option<(usize, bool)>) -> IdlePullS
     }
     match scan.backlogged
     {
-        Some((cpu, _)) => IdlePullStep::Remember(cpu),
+        Some(cpu) => IdlePullStep::Remember(cpu),
         None => IdlePullStep::Forget,
+    }
+}
+
+/// The other CPUs as an idle CPU's balance step reads and pulls them: the
+/// kernel's run queues (`KernelCpus`), or a host test's model of them.
+trait IdlePullView
+{
+    /// The `current_load` of `cpu`.
+    fn load(&self, cpu: usize) -> u32;
+    /// Whether `cpu` has a queued thread other than its idle thread
+    /// (`PerCpuScheduler::has_queued_thread`).
+    fn has_queued(&self, cpu: usize) -> bool;
+    /// Pull an unpinned `Ready` thread from `src` to the idle CPU under `rule`
+    /// (`pull_unpinned_ready`).
+    fn pull(&mut self, src: usize, rule: PullRule) -> PullOutcome;
+}
+
+/// What an idle CPU keeps from one idle tick to the next: the
+/// `idle_pull_candidate` and `idle_pull_cursor` fields of its
+/// `PerCpuScheduler`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct IdlePullMemory
+{
+    /// The CPU recorded as holding a backlog at the previous idle tick.
+    candidate: Option<usize>,
+    /// The CPU the scan starts at.
+    cursor: usize,
+}
+
+/// Scan every CPU but `this_cpu` and `skip` through [`IdleScan::note`], in index
+/// order starting at `start` and wrapping: one load per CPU, and one run-queue
+/// mask read per CPU whose load is non-zero up to the first with a queued
+/// thread.
+fn idle_scan(
+    view: &impl IdlePullView,
+    this_cpu: usize,
+    cpu_count: usize,
+    start: usize,
+    skip: Option<usize>,
+) -> IdleScan
+{
+    let mut scan = IdleScan::EMPTY;
+    for offset in 0..cpu_count
+    {
+        let cpu = (start + offset) % cpu_count;
+        if cpu == this_cpu || Some(cpu) == skip
+        {
+            continue;
+        }
+        scan.note(cpu, view.load(cpu), || view.has_queued(cpu));
+    }
+    scan
+}
+
+/// One idle tick's balance step of `this_cpu`, the rule
+/// core/kernel/docs/scheduler.md § Load Balancing states: scan from the cursor,
+/// decide by [`idle_pull_step`], pull, and return what the next idle tick
+/// starts from.
+///
+/// A pull above the threshold that moves nothing is followed in the same tick
+/// by the confirmation rule: over a scan and a candidate without its source
+/// when it found nothing pullable, so a CPU whose load stays past the threshold
+/// with nothing pullable on it does not hide the backlog behind it, and over
+/// the same scan and candidate when the re-check refused it or a lock was
+/// contended, so a transient load does not hide that CPU's own backlog.
+/// A pull from the confirmed candidate that finds nothing pullable moves the
+/// cursor past that CPU, so the next backlog recorded is another CPU's rather
+/// than the same pinned one again.
+fn idle_pull_tick(
+    view: &mut impl IdlePullView,
+    this_cpu: usize,
+    cpu_count: usize,
+    memory: IdlePullMemory,
+) -> IdlePullMemory
+{
+    let cursor = if memory.cursor < cpu_count
+    {
+        memory.cursor
+    }
+    else
+    {
+        0
+    };
+    let scan = idle_scan(view, this_cpu, cpu_count, cursor, None);
+    let candidate = memory
+        .candidate
+        .filter(|&cpu| cpu < cpu_count && cpu != this_cpu)
+        .map(|cpu| (cpu, view.has_queued(cpu)));
+
+    let mut step = idle_pull_step(scan, candidate);
+    if let IdlePullStep::Pull(src, PullRule::Imbalance) = step
+    {
+        let outcome = view.pull(src, PullRule::Imbalance);
+        if outcome == PullOutcome::Moved
+        {
+            return IdlePullMemory {
+                candidate: None,
+                cursor,
+            };
+        }
+        // The load past the threshold yielded nothing this tick, so the
+        // confirmation rule decides. Nothing pullable leaves that CPU out of
+        // the scan and the candidate. A re-check that refused the pull found a
+        // transient, and a contended lock says nothing of what the CPU holds,
+        // so the rule reads the same scan and candidate there; after a
+        // contended lock, a pull from that CPU itself waits for the next tick
+        // rather than try the lock again.
+        step = if outcome == PullOutcome::NothingPullable
+        {
+            let rest = idle_scan(view, this_cpu, cpu_count, cursor, Some(src));
+            idle_pull_step(
+                rest.without_heaviest(),
+                candidate.filter(|&(cpu, _)| cpu != src),
+            )
+        }
+        else
+        {
+            match idle_pull_step(scan.without_heaviest(), candidate)
+            {
+                IdlePullStep::Pull(cpu, PullRule::Backlog)
+                    if cpu == src && outcome == PullOutcome::Deferred =>
+                {
+                    IdlePullStep::Remember(cpu)
+                }
+                other => other,
+            }
+        };
+    }
+
+    match step
+    {
+        IdlePullStep::Pull(src, rule) =>
+        {
+            let cursor = if view.pull(src, rule) == PullOutcome::NothingPullable
+            {
+                (src + 1) % cpu_count
+            }
+            else
+            {
+                cursor
+            };
+            IdlePullMemory {
+                candidate: None,
+                cursor,
+            }
+        }
+        IdlePullStep::Remember(src) => IdlePullMemory {
+            candidate: Some(src),
+            cursor,
+        },
+        IdlePullStep::Forget => IdlePullMemory {
+            candidate: None,
+            cursor,
+        },
     }
 }
 
@@ -5026,29 +5184,66 @@ unsafe fn heaviest_other_cpu(this_cpu: usize, cpu_count: usize) -> Option<(usize
     heaviest
 }
 
-/// Scan every CPU but `this_cpu` in index order through [`IdleScan::note`]:
-/// one Relaxed load of `current_load` per CPU, and one of the run-queue mask
-/// per CPU whose load is non-zero.
-///
-/// # Safety
-/// `cpu_count` is `CPU_COUNT` and the scheduler slab is initialised.
+/// The kernel's run queues as [`idle_pull_tick`] reads and pulls them: one
+/// Relaxed load per read, and a pull through [`pull_unpinned_ready`] to
+/// `this_cpu`.
 #[cfg(not(test))]
-unsafe fn idle_scan(this_cpu: usize, cpu_count: usize) -> IdleScan
+struct KernelCpus
 {
-    let mut scan = IdleScan::EMPTY;
-    // needless_range_loop: scheduler_ptr requires raw indexing.
-    #[allow(clippy::needless_range_loop)]
-    for cpu in 0..cpu_count
+    /// The idle CPU that pulls.
+    this_cpu: usize,
+    /// `CPU_COUNT`, which bounds every index read.
+    cpu_count: usize,
+}
+
+#[cfg(not(test))]
+impl KernelCpus
+{
+    /// The view of idle CPU `this_cpu`.
+    ///
+    /// # Safety
+    /// `cpu_count` is `CPU_COUNT`, the scheduler slab is initialised, and no
+    /// scheduler lock is held while the view pulls.
+    unsafe fn new(this_cpu: usize, cpu_count: usize) -> Self
     {
-        if cpu == this_cpu
-        {
-            continue;
+        Self {
+            this_cpu,
+            cpu_count,
         }
-        // SAFETY: cpu < cpu_count; slab initialised (caller's contract).
-        let sched = unsafe { &*scheduler_ptr(cpu) };
-        scan.note(cpu, sched.current_load(), || sched.has_queued_thread());
     }
-    scan
+
+    /// `cpu`'s scheduler.
+    fn scheduler(&self, cpu: usize) -> &'static PerCpuScheduler
+    {
+        assert!(
+            cpu < self.cpu_count,
+            "idle pull reads cpu {cpu} past CPU_COUNT"
+        );
+        // SAFETY: cpu < CPU_COUNT (asserted) and the slab is initialised
+        // (`new`'s contract).
+        unsafe { &*scheduler_ptr(cpu) }
+    }
+}
+
+#[cfg(not(test))]
+impl IdlePullView for KernelCpus
+{
+    fn load(&self, cpu: usize) -> u32
+    {
+        self.scheduler(cpu).current_load()
+    }
+
+    fn has_queued(&self, cpu: usize) -> bool
+    {
+        self.scheduler(cpu).has_queued_thread()
+    }
+
+    fn pull(&mut self, src: usize, rule: PullRule) -> PullOutcome
+    {
+        // SAFETY: pull_unpinned_ready refuses an equal or out-of-range index
+        // itself, and no scheduler lock is held (`new`'s contract).
+        unsafe { pull_unpinned_ready(src, self.this_cpu, rule) }
+    }
 }
 
 /// Per-tick load-balance step of a CPU running a thread other than its idle
@@ -5122,7 +5317,7 @@ unsafe fn try_pull_balance(_this_cpu: usize) {}
 /// Per-tick load-balance step of a CPU running its idle thread, run from that
 /// CPU's `timer_tick`, which keeps firing while the CPU halts. It pulls an
 /// unpinned `Ready` thread queued behind another CPU's running thread as
-/// [`idle_pull_step`] decides, so such a thread is not starved while a CPU
+/// [`idle_pull_tick`] decides, so such a thread is not starved while a CPU
 /// idles; the rule, its bounds, and its hot-path cost are
 /// core/kernel/docs/scheduler.md § Load Balancing's.
 ///
@@ -5149,44 +5344,18 @@ unsafe fn try_pull_idle(this_cpu: usize)
         return;
     }
 
-    // SAFETY: cpu_count is CPU_COUNT; slab initialised.
-    let scan = unsafe { idle_scan(this_cpu, cpu_count) };
-    let candidate = sched
-        .idle_pull_candidate()
-        .filter(|&cpu| cpu < cpu_count && cpu != this_cpu)
-        .map(|cpu| {
-            // SAFETY: cpu < cpu_count; slab initialised.
-            (cpu, unsafe { (*scheduler_ptr(cpu)).has_queued_thread() })
-        });
-
-    let mut step = idle_pull_step(scan, candidate);
-    if let IdlePullStep::Pull(src, PullRule::Imbalance) = step
+    let memory = IdlePullMemory {
+        candidate: sched.idle_pull_candidate(),
+        cursor: sched.idle_pull_cursor(),
+    };
+    // SAFETY: cpu_count is CPU_COUNT; slab initialised; no scheduler lock held
+    // (this function's contract).
+    let mut cpus = unsafe { KernelCpus::new(this_cpu, cpu_count) };
+    let next = idle_pull_tick(&mut cpus, this_cpu, cpu_count, memory);
+    sched.set_idle_pull_candidate(next.candidate);
+    if next.cursor != memory.cursor
     {
-        // SAFETY: src < cpu_count and src != this_cpu (the scan names other
-        // CPUs only); no scheduler lock held.
-        if unsafe { pull_unpinned_ready(src, this_cpu, PullRule::Imbalance) }
-            != PullOutcome::RuleFailed
-        {
-            sched.set_idle_pull_candidate(None);
-            return;
-        }
-        // The load past the threshold no longer holds, so the confirmation
-        // rule decides this tick; otherwise a scan that kept reading a
-        // transient would never record the backlog behind it.
-        step = idle_pull_step(scan.without_heaviest(), candidate);
-    }
-
-    match step
-    {
-        IdlePullStep::Pull(src, rule) =>
-        {
-            sched.set_idle_pull_candidate(None);
-            // SAFETY: src < cpu_count and src != this_cpu (the scan and the
-            // candidate filter name other CPUs only); no scheduler lock held.
-            unsafe { pull_unpinned_ready(src, this_cpu, rule) };
-        }
-        IdlePullStep::Remember(src) => sched.set_idle_pull_candidate(Some(src)),
-        IdlePullStep::Forget => sched.set_idle_pull_candidate(None),
+        sched.set_idle_pull_cursor(next.cursor);
     }
 }
 
@@ -5327,7 +5496,7 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
     let Some((tcb, priority)) = pick
     else
     {
-        return PullOutcome::Deferred;
+        return PullOutcome::NothingPullable;
     };
 
     // Acquire the candidate's sched_lock so the Scheduling-field write below
@@ -7142,13 +7311,13 @@ mod class_tests
 mod idle_pull_tests
 {
     use super::{
-        IdlePullStep, IdleScan, LOAD_BALANCE_IMBALANCE_THRESHOLD, PullRule, exceeds_imbalance,
-        idle_pull_step,
+        IdlePullMemory, IdlePullStep, IdlePullView, IdleScan, LOAD_BALANCE_IMBALANCE_THRESHOLD,
+        PullOutcome, PullRule, exceeds_imbalance, idle_pull_step, idle_pull_tick, idle_scan,
     };
 
-    /// A scan whose most-loaded CPU is `heaviest` and whose most-loaded CPU with
-    /// a queued thread other than its idle thread is `backlogged`.
-    fn scan(heaviest: Option<(usize, u32)>, backlogged: Option<(usize, u32)>) -> IdleScan
+    /// A scan whose most-loaded CPU is `heaviest` and whose first CPU with a
+    /// queued thread other than its idle thread is `backlogged`.
+    fn scan(heaviest: Option<(usize, u32)>, backlogged: Option<usize>) -> IdleScan
     {
         IdleScan {
             heaviest,
@@ -7168,6 +7337,136 @@ mod idle_pull_tests
         scan
     }
 
+    /// One CPU of the model: whether its idle thread is linked (it runs
+    /// another thread), and the pinned and unpinned threads queued behind its
+    /// running one, none of which ever yields.
+    #[derive(Clone, Copy)]
+    struct Cpu
+    {
+        idle_linked: bool,
+        pinned: u32,
+        unpinned: u32,
+    }
+
+    /// A CPU running a thread with `pinned` pinned and `unpinned` unpinned
+    /// threads queued behind it, its idle thread linked.
+    const fn busy(pinned: u32, unpinned: u32) -> Cpu
+    {
+        Cpu {
+            idle_linked: true,
+            pinned,
+            unpinned,
+        }
+    }
+
+    /// A CPU running its idle thread with nothing queued.
+    const IDLE: Cpu = Cpu {
+        idle_linked: false,
+        pinned: 0,
+        unpinned: 0,
+    };
+
+    /// The other CPUs as `pull_unpinned_ready` treats them: it re-checks the
+    /// rule on the source's load against the idle puller's zero, and takes an
+    /// unpinned thread or reports that there is none.
+    struct Model
+    {
+        cpus: Vec<Cpu>,
+        /// A CPU whose lock-free load reads just past the threshold while its
+        /// settled load, which the pull re-checks, does not: the transient
+        /// `schedule()` raises by counting a requeue before its dequeue.
+        raised: Option<usize>,
+        /// A CPU whose run-queue lock another CPU holds, so a pull from it
+        /// defers.
+        contended: Option<usize>,
+        /// Every pull attempted, in order.
+        pulls: Vec<(usize, PullRule)>,
+        /// The CPU a thread moved from, once one has.
+        moved_from: Option<usize>,
+    }
+
+    impl Model
+    {
+        fn new(cpus: &[Cpu]) -> Self
+        {
+            Self {
+                cpus: cpus.to_vec(),
+                raised: None,
+                contended: None,
+                pulls: Vec::new(),
+                moved_from: None,
+            }
+        }
+
+        /// Run idle ticks of `this_cpu` until a thread moves or `ticks` have
+        /// passed; the tick (counted from 1) whose pull moved one, if any.
+        fn ticks_to_pull(&mut self, this_cpu: usize, ticks: usize) -> Option<usize>
+        {
+            let count = self.cpus.len();
+            let mut memory = IdlePullMemory {
+                candidate: None,
+                cursor: 0,
+            };
+            for tick in 1..=ticks
+            {
+                memory = idle_pull_tick(self, this_cpu, count, memory);
+                if self.moved_from.is_some()
+                {
+                    return Some(tick);
+                }
+            }
+            None
+        }
+
+        /// The load of `cpu` under its lock.
+        fn settled_load(&self, cpu: usize) -> u32
+        {
+            let c = self.cpus[cpu];
+            u32::from(c.idle_linked) + c.pinned + c.unpinned
+        }
+    }
+
+    impl IdlePullView for Model
+    {
+        fn load(&self, cpu: usize) -> u32
+        {
+            let settled = self.settled_load(cpu);
+            if self.raised == Some(cpu)
+            {
+                settled.max(LOAD_BALANCE_IMBALANCE_THRESHOLD + 1)
+            }
+            else
+            {
+                settled
+            }
+        }
+
+        fn has_queued(&self, cpu: usize) -> bool
+        {
+            self.cpus[cpu].pinned + self.cpus[cpu].unpinned != 0
+        }
+
+        fn pull(&mut self, src: usize, rule: PullRule) -> PullOutcome
+        {
+            self.pulls.push((src, rule));
+            if self.contended == Some(src)
+            {
+                return PullOutcome::Deferred;
+            }
+            if !rule.passes(self.settled_load(src), 0)
+            {
+                return PullOutcome::RuleFailed;
+            }
+            if self.cpus[src].unpinned == 0
+            {
+                return PullOutcome::NothingPullable;
+            }
+            self.cpus[src].unpinned -= 1;
+            self.moved_from = Some(src);
+            PullOutcome::Moved
+        }
+    }
+
     // The defect caught: a backlog at or below the threshold left on its CPU
     // for good once confirmed (the starvation of a thread queued behind a
     // running thread that never yields), or pulled from a CPU whose queue has
@@ -7176,7 +7475,7 @@ mod idle_pull_tests
     fn a_backlog_below_the_threshold_is_pulled_once_it_has_outlived_one_tick()
     {
         // A queued thread beside the idle thread: load 2, at the threshold.
-        let backlog = scan(Some((3, 2)), Some((3, 2)));
+        let backlog = scan(Some((3, 2)), Some(3));
         assert_eq!(idle_pull_step(backlog, None), IdlePullStep::Remember(3));
         assert_eq!(
             idle_pull_step(backlog, Some((3, true))),
@@ -7185,7 +7484,7 @@ mod idle_pull_tests
         // The candidate drained but another CPU holds a backlog: that one is
         // sampled afresh rather than pulled unconfirmed.
         assert_eq!(
-            idle_pull_step(scan(Some((5, 2)), Some((5, 2))), Some((3, false))),
+            idle_pull_step(scan(Some((5, 2)), Some(5)), Some((3, false))),
             IdlePullStep::Remember(5)
         );
     }
@@ -7214,7 +7513,7 @@ mod idle_pull_tests
     fn a_load_above_the_threshold_is_pulled_at_once()
     {
         let heavy = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
-        let past = scan(Some((2, heavy)), Some((2, heavy)));
+        let past = scan(Some((2, heavy)), Some(2));
         let at_once = IdlePullStep::Pull(2, PullRule::Imbalance);
         assert_eq!(idle_pull_step(past, None), at_once);
         assert_eq!(idle_pull_step(past, Some((4, true))), at_once);
@@ -7256,12 +7555,115 @@ mod idle_pull_tests
     fn a_refused_pull_at_once_falls_back_to_the_confirmation_rule()
     {
         let heavy = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
-        let past = scan(Some((2, heavy)), Some((2, heavy))).without_heaviest();
+        let past = scan(Some((2, heavy)), Some(2)).without_heaviest();
         assert_eq!(idle_pull_step(past, None), IdlePullStep::Remember(2));
         assert_eq!(
             idle_pull_step(past, Some((4, true))),
             IdlePullStep::Pull(4, PullRule::Backlog)
         );
+    }
+
+    // The defect caught: a tick whose pull at once the re-check refused leaving
+    // that CPU out of its fallback, so a backlog there whose load the scan
+    // keeps reading raised is never recorded or pulled (the starvation the
+    // confirmation fallback closes).
+    #[test]
+    fn a_transient_past_the_threshold_does_not_hide_its_own_backlog()
+    {
+        // CPU 0: one unpinned thread and its idle thread queued, load 2, read
+        // past the threshold on every tick. CPU 1 idles.
+        let mut model = Model::new(&[busy(0, 1), IDLE]);
+        model.raised = Some(0);
+        assert_eq!(model.ticks_to_pull(1, 2), Some(2));
+        assert_eq!(
+            model.pulls,
+            vec![
+                (0, PullRule::Imbalance),
+                (0, PullRule::Imbalance),
+                (0, PullRule::Backlog)
+            ]
+        );
+    }
+
+    // The defect caught: a tick whose pull at once found the lock contended
+    // (as a read of a transient often does, the CPU being inside `schedule()`
+    // under its lock) leaving that CPU out of its fallback, so its own backlog
+    // is neither recorded nor kept as the candidate; or one that tries that
+    // contended lock a second time in the same tick.
+    #[test]
+    fn a_contended_transient_keeps_its_own_backlog_for_the_next_tick()
+    {
+        let mut model = Model::new(&[busy(0, 1), IDLE]);
+        model.raised = Some(0);
+        model.contended = Some(0);
+        let mut memory = IdlePullMemory {
+            candidate: None,
+            cursor: 0,
+        };
+        let kept = IdlePullMemory {
+            candidate: Some(0),
+            cursor: 0,
+        };
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(memory, kept);
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(memory, kept);
+        model.contended = None;
+        idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(model.moved_from, Some(0));
+        assert_eq!(
+            model.pulls,
+            vec![
+                (0, PullRule::Imbalance),
+                (0, PullRule::Imbalance),
+                (0, PullRule::Imbalance),
+                (0, PullRule::Backlog)
+            ]
+        );
+    }
+
+    // The defect caught: a pull from the confirmed candidate that a contended
+    // lock defers costing more than the two ticks the bound counts for it: the
+    // tick it defers, and one to record the candidate again.
+    #[test]
+    fn a_deferred_pull_from_the_candidate_costs_at_most_two_ticks()
+    {
+        let mut model = Model::new(&[busy(0, 1), IDLE]);
+        let mut memory = IdlePullMemory {
+            candidate: None,
+            cursor: 0,
+        };
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        model.contended = Some(0);
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        model.contended = None;
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(memory.candidate, Some(0));
+        idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(model.moved_from, Some(0));
+        assert_eq!(
+            model.pulls,
+            vec![(0, PullRule::Backlog), (0, PullRule::Backlog)]
+        );
+    }
+
+    // The defect caught: a contended pull at once from a pinned-only CPU past
+    // the threshold that keeps the idle CPU from pulling a backlog it has
+    // confirmed on another CPU in the same tick.
+    #[test]
+    fn a_contended_pinned_load_does_not_hold_back_a_confirmed_backlog()
+    {
+        let heavy = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        let mut model = Model::new(&[busy(heavy, 0), busy(0, 1), IDLE]);
+        let memory = IdlePullMemory {
+            candidate: None,
+            cursor: 0,
+        };
+        let memory = idle_pull_tick(&mut model, 2, 3, memory);
+        assert_eq!(memory.candidate, Some(1));
+        model.contended = Some(0);
+        idle_pull_tick(&mut model, 2, 3, memory);
+        assert_eq!(model.moved_from, Some(1));
     }
 
     // The defect caught: a stale candidate kept across ticks on which no CPU
@@ -7277,26 +7679,125 @@ mod idle_pull_tests
         assert_eq!(idle_pull_step(scan(None, None), None), IdlePullStep::Forget);
     }
 
-    // The defect caught: the scan naming a less-loaded CPU, letting a later
-    // equal load displace the first (ties must go to the lowest index, the
-    // order the scan notes CPUs in), or reading the run-queue mask of a CPU
-    // with nothing linked.
+    // The defect caught: the scan naming a less-loaded CPU as the heaviest, or
+    // letting a later equal load displace the first; a backlog other than the
+    // first in the scan's order; or a read of the run-queue mask of a CPU with
+    // nothing linked, or of any CPU past the first backlog.
     #[test]
-    fn the_scan_keeps_the_first_most_loaded_cpu_and_skips_an_empty_one()
+    fn the_scan_keeps_the_first_most_loaded_cpu_and_the_first_backlog()
     {
         let mut empty = IdleScan::EMPTY;
         empty.note(1, 0, || panic!("the mask of an empty CPU is read"));
         assert_eq!(empty, IdleScan::EMPTY);
 
-        let scan = folded(&[
-            (0, 2, true),
-            (1, 3, false),
-            (2, 3, true),
-            (3, 2, true),
-            (4, 3, true),
-        ]);
-        assert_eq!(scan.heaviest, Some((1, 3)));
-        assert_eq!(scan.backlogged, Some((2, 3)));
+        let mut scan = folded(&[(0, 2, false), (1, 3, false), (2, 2, true), (3, 3, true)]);
+        scan.note(4, 4, || panic!("a mask past the first backlog is read"));
+        assert_eq!(scan.heaviest, Some((4, 4)));
+        assert_eq!(scan.backlogged, Some(2));
+    }
+
+    // The defect caught: a scan that does not start at the cursor and wrap, so
+    // a cursor moved past a CPU with nothing pullable still records that CPU
+    // first; or one that notes the idle CPU itself or the CPU it skips.
+    #[test]
+    fn the_scan_starts_at_the_cursor_and_wraps()
+    {
+        let model = Model::new(&[busy(1, 0), busy(0, 1), IDLE, busy(0, 1)]);
+        let from_three = idle_scan(&model, 2, 4, 3, None);
+        assert_eq!(from_three.backlogged, Some(3));
+        assert_eq!(from_three.heaviest, Some((3, 2)));
+        assert_eq!(idle_scan(&model, 2, 4, 3, Some(3)).backlogged, Some(0));
+        assert_eq!(idle_scan(&model, 2, 4, 2, None).backlogged, Some(3));
+        assert_eq!(idle_scan(&model, 3, 4, 3, Some(0)).backlogged, Some(1));
+    }
+
+    // The defect caught (#862): a CPU whose load stays past the threshold with
+    // only pinned threads queued is tried first every tick, and a fallback
+    // that keeps recording it as the backlog leaves a thread queued on another
+    // CPU there for as long as the pinned backlog lasts.
+    #[test]
+    fn a_pinned_load_past_the_threshold_does_not_hide_a_backlog_behind_it()
+    {
+        // CPU 0: two pinned threads and its idle thread queued, load 3. CPU 1:
+        // one unpinned thread and its idle thread queued, load 2. CPU 2 idles.
+        let mut model = Model::new(&[busy(2, 0), busy(0, 1), IDLE]);
+        assert_eq!(model.ticks_to_pull(2, 2), Some(2));
+        assert_eq!(model.moved_from, Some(1));
+    }
+
+    // The defect caught: a pinned-only backlog that the scan records first
+    // (more loaded, or first in its order) recorded again after its pull found
+    // nothing, so a backlog behind it at the same load starves.
+    #[test]
+    fn a_pinned_backlog_below_the_threshold_does_not_hide_one_behind_it()
+    {
+        let mut model = Model::new(&[busy(1, 0), busy(0, 1), IDLE]);
+        assert_eq!(model.ticks_to_pull(2, 4), Some(4));
+        assert_eq!(model.moved_from, Some(1));
+    }
+
+    // The defect caught: a bound that does not hold past one pinned-only CPU:
+    // two of them taking turns as the recorded backlog, so the one behind them
+    // is never reached. The bound is two ticks plus two per pinned-only
+    // backlog ahead of it in the cursor's order; the one whose load past the
+    // threshold makes it the heaviest adds none.
+    #[test]
+    fn a_backlog_behind_several_pinned_ones_is_pulled_within_the_bound()
+    {
+        let heavy = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        let mut model = Model::new(&[busy(heavy, 0), busy(1, 0), busy(1, 0), busy(0, 1), IDLE]);
+        assert_eq!(model.ticks_to_pull(4, 2 + 2 * 2), Some(2 + 2 * 2));
+        assert_eq!(model.moved_from, Some(3));
+    }
+
+    // The defect caught: a pinned-only CPU past the threshold that is not the
+    // heaviest costing more than the two ticks of any other pinned backlog
+    // ahead of the one pulled.
+    #[test]
+    fn a_second_pinned_load_past_the_threshold_costs_two_ticks()
+    {
+        let t = LOAD_BALANCE_IMBALANCE_THRESHOLD;
+        let mut model = Model::new(&[busy(t + 2, 0), busy(t + 1, 0), busy(0, 1), IDLE]);
+        assert_eq!(model.ticks_to_pull(3, 2 + 2), Some(2 + 2));
+        assert_eq!(model.moved_from, Some(2));
+    }
+
+    // The defect caught: a pinned-only backlog that draws more try-lock
+    // attempts than the documented cost: past the threshold, one per idle tick;
+    // at or below it, one every two ticks.
+    #[test]
+    fn a_lone_pinned_backlog_draws_the_documented_attempts()
+    {
+        let heavy = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        let mut past = Model::new(&[busy(heavy, 0), IDLE]);
+        assert_eq!(past.ticks_to_pull(1, 10), None);
+        assert_eq!(past.pulls.len(), 10);
+        assert!(past.pulls.iter().all(|&p| p == (0, PullRule::Imbalance)));
+
+        let mut below = Model::new(&[busy(1, 0), IDLE]);
+        assert_eq!(below.ticks_to_pull(1, 10), None);
+        assert_eq!(below.pulls, vec![(0, PullRule::Backlog); 5]);
+    }
+
+    // The defect caught: an idle pull that moves a thread but leaves its
+    // candidate recorded, or moves its cursor, so the next idle stretch starts
+    // from a stale sample.
+    #[test]
+    fn a_pull_that_moves_a_thread_clears_the_candidate_and_keeps_the_cursor()
+    {
+        let mut model = Model::new(&[IDLE, busy(0, 1), IDLE]);
+        let memory = IdlePullMemory {
+            candidate: Some(1),
+            cursor: 2,
+        };
+        assert_eq!(
+            idle_pull_tick(&mut model, 0, 3, memory),
+            IdlePullMemory {
+                candidate: None,
+                cursor: 2,
+            }
+        );
+        assert_eq!(model.pulls, vec![(1, PullRule::Backlog)]);
     }
 }
 

@@ -186,7 +186,7 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show six of the refused names are
+/// cap. svctest's own non-zero seeds show seven of the refused names are
 /// published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.debug`,
 /// which only the `debug-echo` fixture seeds, are published by the same loop
 /// as `devmgr.registry` and `devmgr.test`. A queryable seed-only name would
@@ -200,6 +200,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.devmgr_test, "devmgr.test"),
         (caps.vfsd_mount, "vfsd.mount"),
         (caps.vfsd_deny, "vfsd.deny"),
+        (caps.logd_query, "logd.query"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");
@@ -221,6 +222,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         ipc::published_names::DEVMGR_DEBUG,
         ipc::published_names::VFSD_MOUNT,
         ipc::published_names::VFSD_DENY,
+        ipc::published_names::LOGD_QUERY,
     ]
     {
         let reply = query(name);

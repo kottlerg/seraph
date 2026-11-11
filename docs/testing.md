@@ -320,45 +320,6 @@ In CI it runs as an extra boot inside each `ktest` cell (both arches, both
 profiles), after `test-kaslr`, on the ktest bundle the cell composed and under
 the cell's `run-parallel` budget.
 
-### Death forward to logd (`test-logd-reclaim`)
-
-Once logd has registered its death queue with procmgr, procmgr posts the death
-of every process it then tears down to that queue, and logd evicts the dead
-sender's slot (see
-[services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
-§ Death-notification cascade). No harness can observe the eviction from inside
-the guest, because logd has no read surface. svctest's `logd_death_forward` phase
-spawns a child that registers the log name `svctest-logd-reclaim exit_reason=0x0`
-and exits with code `0x17`, and logd logs the eviction as a serial line, which
-`cargo xtask test-logd-reclaim` checks host-side: the boot's log must hold
-svctest's pass marker and exactly one
-`[logd] reclaim: badge=<b> exit_reason=0x17 name="svctest-logd-reclaim exit_reason=0x0"`
-line, whose fields the check reads with logd's own parser
-(`logd_codec::record::fields`). No other process registers that name, so the
-line is the child's, and its exit reason shows the forward carries the reason as
-well as the badge. The name's forged ` exit_reason=0x0` stays inside the quoted
-name, since the line is a log record
-([services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
-§ `stream_labels::STREAM_RECORD`). The child also sends a text line in two
-halves around a malformed record, which logd must refuse, and a record with a
-`code` field: the check requires the record's line
-`logd-reclaim child exiting code=23` and, after it, the text line whole, so a
-record leaves a sender's pending text line as it was.
-
-The check reads a serial log and does not need its own boot. In CI it runs
-inside each `svctest` cell (both arches, both profiles), after the svctest
-`run-parallel` boot, against the log that boot's `--save-logs` saved
-(`--log`). A boot that `run-parallel` records as `QEMU-CRASH`, a host-emulator
-crash it does not count as a failure, is skipped: its log holds the guest's
-output only up to the crash and has no pass marker, so it cannot show whether
-the guest finished. Run with no `--log`, it boots the current sysroot once through
-`run-parallel` and checks that boot's log, so svctest must be staged as above
-(command reference:
-[xtask/README.md § test-logd-reclaim](../xtask/README.md#cargo-xtask-test-logd-reclaim)).
-
-logd's query API (#720), which gives a harness a read surface for its slots, is
-the planned successor to this serial-line check.
-
 ### Crash reports (`test-crash-report`)
 
 The crash service, crashd, is in the default service set
@@ -376,7 +337,9 @@ must be complete and hold the fields its kind, thread, and status require.
   instruction, each tied to `crashme` through the badge logd's `reclaim:` line names, complete, its
   walk starting at its instruction pointer, matched by the kernel's `handler declined` line
   carrying the block's id, and carrying the stack pointer the kernel's register dump of that line's
-  thread prints, so the block read the thread that faulted.
+  thread prints, so the block read the thread that faulted. The `vm` block's `addr`, the fault
+  message's address, must also be the faulting address that dump prints (`cr2` on x86_64, `stval`
+  on riscv64), so the dump names the access that faulted.
 - `--expect none` reads a boot of an image that stages no crashd: the log must hold no block, the
   check that the absent service changes nothing a fault does.
 

@@ -102,13 +102,6 @@ pub enum CliCommand
     /// sysroot with the ktest bundle composed (see xtask/README.md).
     TestKaslr(TestKaslrArgs),
 
-    /// Check that a child's death reaches logd and evicts its slot: read a
-    /// svctest boot's serial log for logd's `reclaim:` line naming svctest's
-    /// `svctest-logd-reclaim` child. `--log` reads a saved log and boots
-    /// nothing; with no log, boots the current sysroot once (svctest staged)
-    /// through `run-parallel` and reads the log it saves (see xtask/README.md).
-    TestLogdReclaim(TestLogdReclaimArgs),
-
     /// Check the crash service's report blocks in a boot's saved serial log:
     /// every block well-formed, and the `crashme` fixture's three reports
     /// present (`--expect reports`), or no block at all (`--expect none`)
@@ -561,48 +554,6 @@ pub struct TestCrashReportArgs
     /// What the log must hold beyond well-formed blocks.
     #[arg(long, value_enum, default_value = "reports")]
     pub expect: CrashReportExpect,
-}
-
-// ── TestLogdReclaim ───────────────────────────────────────────────────────────
-
-#[derive(Parser)]
-pub struct TestLogdReclaimArgs
-{
-    /// Target architecture (the boot's; with `--log`, unused).
-    #[arg(long, default_value = "x86_64")]
-    pub arch: Arch,
-
-    /// A svctest boot's saved serial log to check. With it, nothing boots.
-    #[arg(long, value_name = "FILE")]
-    pub log: Option<PathBuf>,
-
-    /// Boot timeout, in seconds, for HANG classification (ignored with
-    /// `--log`).
-    #[arg(long, default_value = "900")]
-    pub timeout: u64,
-
-    /// Number of vCPUs to expose to the guest (QEMU -smp; ignored with
-    /// `--log`).
-    #[arg(long, default_value = "4")]
-    pub cpus: u32,
-
-    /// Guest memory size in MiB (QEMU -m; ignored with `--log`).
-    #[arg(long, default_value = "512")]
-    pub mem: u32,
-
-    /// riscv64 paging mode to negotiate (ignored on x86-64 and with
-    /// `--log`).
-    #[arg(long, default_value = "sv48")]
-    pub riscv_mmu: RiscvMmu,
-
-    /// Guest x86-64 paging depth (`x86_64` only; ignored with `--log`).
-    #[arg(long, default_value = "4")]
-    pub x86_paging: X86Paging,
-
-    /// The shared host's launch rules (see xtask/README.md "Host launch
-    /// rules").
-    #[command(flatten)]
-    pub host: BootHostArgs,
 }
 
 // ── TestMapRedo ───────────────────────────────────────────────────────────────

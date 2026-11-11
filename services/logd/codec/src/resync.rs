@@ -20,13 +20,15 @@ use ipc::IpcMessage;
 use ipc::log_badges::LOG_BADGE_FIRST_CHILD;
 use ipc::procmgr_labels::LIVE_PROCESSES_PAGE;
 
-/// Whether a resync may evict the slot of `badge`: every badge at or above
-/// `LOG_BADGE_FIRST_CHILD`, which only procmgr-spawned children carry. The
-/// system specials below it (init, procmgr) have no procmgr table entry.
+/// Whether a resync may evict the slot of `badge`: a procmgr-spawned
+/// child's, at or above `LOG_BADGE_FIRST_CHILD` and with no
+/// `ipc::VERB_BIT_MASK` bit, which procmgr never draws for a process. The
+/// system specials below it (init, procmgr) and a verb-bit badge such as
+/// `log_labels::LOG_QUERY_AUTHORITY` have no procmgr table entry.
 #[must_use]
 pub const fn is_resync_candidate(badge: u64) -> bool
 {
-    badge >= LOG_BADGE_FIRST_CHILD
+    badge >= LOG_BADGE_FIRST_CHILD && badge & ipc::VERB_BIT_MASK == 0
 }
 
 /// Check one `QUERY_LIVE_PROCESSES` reply against the cursor `after` the
@@ -157,6 +159,11 @@ mod tests
         assert!(!is_resync_candidate(ipc::log_badges::LOG_BADGE_PROCMGR));
         assert!(!is_resync_candidate(LOG_BADGE_FIRST_CHILD - 1));
         assert!(is_resync_candidate(LOG_BADGE_FIRST_CHILD));
+        assert!(is_resync_candidate(!ipc::VERB_BIT_MASK));
+        assert!(!is_resync_candidate(ipc::log_labels::LOG_QUERY_AUTHORITY));
+        assert!(!is_resync_candidate(
+            LOG_BADGE_FIRST_CHILD | ipc::log_labels::LOG_QUERY_AUTHORITY
+        ));
     }
 
     #[test]

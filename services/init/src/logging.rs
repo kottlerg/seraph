@@ -287,9 +287,12 @@ pub unsafe fn spawn_log_thread(
 
     // Bind I/O ports to the log thread so it can write to the serial port.
     // On x86-64, I/O port access is per-thread via the TSS IOPB.
+    // A log thread without the binding writes no serial, so serial output
+    // stops for both threads rather than faulting the log thread.
     if ioport_cap != 0 && syscall::ioport_bind(thread_cap, ioport_cap).is_err()
     {
-        log("init: log thread: ioport_bind failed");
+        log("init: log thread: ioport_bind failed; serial output stops");
+        arch::current::serial_unbound();
     }
 
     let stack_top = LOG_THREAD_STACK_VA + LOG_THREAD_STACK_PAGES * PAGE_SIZE;
@@ -339,7 +342,7 @@ extern "C" fn log_thread_entry(arg: u64) -> !
 
     let log_ep = arg;
 
-    // SAFETY: LOG_THREAD_IPC_BUF_VA is the registered IPC buffer, page-aligned.
+    // LOG_THREAD_IPC_BUF_VA is the registered IPC buffer, page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = LOG_THREAD_IPC_BUF_VA as *mut u64;
 
@@ -365,7 +368,8 @@ static mut HISTORY: HistoryRing<HISTORY_RING_BYTES> = HistoryRing::new();
 
 /// Set when init-logd acknowledges real-logd's `HANDOVER_RELEASE`. The
 /// receive loop checks this on the next iteration and exits cleanly via
-/// `sys_thread_exit`, terminating the init-logd thread.
+/// `sys_thread_exit`, terminating the init-logd thread. It writes nothing to
+/// the UART on the way: its last line goes out before the acknowledgement.
 static HANDOVER_COMPLETE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -415,7 +419,6 @@ fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
     {
         if HANDOVER_COMPLETE.load(core::sync::atomic::Ordering::Acquire)
         {
-            flush_synthetic_logd_line(b"handover complete; init-logd thread exiting");
             arch::current::serial_release();
             syscall::thread_exit();
         }
@@ -468,8 +471,15 @@ fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
             // after its slot was sent defers it (a bounded number of times):
             // real-logd pulls again and the drain sends that slot. Otherwise
             // ack and set the flag; the next loop iteration self-terminates
-            // the thread.
+            // the thread. The last line goes out before the ack: real-logd
+            // writes its held self-log lines once acked
+            // (`services/logd/docs/handover-protocol.md` § Startup ordering),
+            // and a line of each written at once would interleave on the UART.
             let status = drain.name_resend.release_status();
+            if status == handover::RELEASE_ACK
+            {
+                flush_synthetic_logd_line(b"handover complete; init-logd thread exiting");
+            }
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(status), ipc_buf_raw) };
             if status == handover::RELEASE_ACK

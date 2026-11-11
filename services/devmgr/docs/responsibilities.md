@@ -384,12 +384,12 @@ devmgr's responsibilities are:
   the boot settle, before handover, that receiver is init-logd, which never
   calls devmgr; the serial and framebuffer drivers do not log at all. During
   the on-disk settle it may be logd. logd calls devmgr only to resolve the
-  serial and framebuffer drivers on its first emit. That emit comes before its
-  `HANDOVER_PULL`, while init-logd still drains the log endpoint, and logd
-  caches both outcomes. The precondition fails only when the serial driver
-  cannot be resolved: logd then queries the serial class again on later
-  emits, and devmgr's own logging in that handler, and the line it logs when
-  it withdraws a served driver, already have the same deadlock window.
+  serial and framebuffer drivers. It resolves both before its
+  `HANDOVER_PULL`, while init-logd still drains the log endpoint, and caches
+  both outcomes. The precondition fails only when the serial driver cannot be
+  resolved: logd then queries the `serial` class (`QUERY_DEVICE`) again on
+  later emits, and devmgr's own logging in that handler, and the line it logs
+  when it withdraws a served driver, already have the same deadlock window.
 
   Driver binaries are sourced from one of two places:
 

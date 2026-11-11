@@ -493,7 +493,7 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     debug_assert!(cpu_id < cpu_count);
 
     // Configure this AP's TSS slot in the dynamic per-CPU slab.
-    // SAFETY: cpu_id < CPU_COUNT asserted; AP_TSS_PTR slab covers cpu_count
+    // cpu_id < CPU_COUNT asserted; AP_TSS_PTR slab covers cpu_count
     // entries; this slot is exclusively owned by this AP during bringup.
     let tss_base = AP_TSS_PTR.load(core::sync::atomic::Ordering::Acquire);
     debug_assert!(!tss_base.is_null(), "init_ap: AP_TSS_PTR not initialised");
@@ -535,7 +535,7 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     }
 
     // Configure this AP's GDT slot in the dynamic per-CPU slab.
-    // SAFETY: cpu_id < CPU_COUNT asserted; AP_GDT_PTR slab covers cpu_count
+    // cpu_id < CPU_COUNT asserted; AP_GDT_PTR slab covers cpu_count
     // entries; this slot is exclusively owned by this AP during bringup.
     let gdt_base = AP_GDT_PTR.load(core::sync::atomic::Ordering::Acquire);
     debug_assert!(!gdt_base.is_null(), "init_ap: AP_GDT_PTR not initialised");

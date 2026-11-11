@@ -45,15 +45,37 @@ pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
 /// sizes). Sizes the retype reserve of init's and the tier-1 services'
 /// bootstrap arenas. init cannot size them without it, so a failed query
 /// ends init.
+///
+/// `run` makes the first query, through [`query_thread_retype_pages`], before
+/// serial output is up, and ends init itself when it fails; every later call
+/// reads the cached answer.
 pub(crate) fn thread_retype_pages() -> u64
 {
-    let Ok(bytes) = syscall::system_info(syscall_abi::SystemInfoType::ThreadRetypeBytes as u64)
+    let Some(pages) = query_thread_retype_pages()
     else
     {
         logging::log("init: FATAL: cannot query the Thread retype size");
         syscall::thread_exit();
     };
-    bytes.div_ceil(PAGE_SIZE)
+    pages
+}
+
+/// [`thread_retype_pages`] without the log: `None` when the query fails.
+/// The first successful answer is cached, since the size is fixed for the
+/// boot.
+fn query_thread_retype_pages() -> Option<u64>
+{
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != 0
+    {
+        return Some(cached);
+    }
+    let bytes = syscall::system_info(syscall_abi::SystemInfoType::ThreadRetypeBytes as u64).ok()?;
+    let pages = bytes.div_ceil(PAGE_SIZE);
+    CACHED.store(pages, Ordering::Relaxed);
+    Some(pages)
 }
 
 /// Pages init carves for memmgr/procmgr's `AddressSpace`, all reaching
@@ -440,14 +462,24 @@ fn run(info_ptr: u64) -> !
     // The carve and the fund come before serial output: the carve's split is
     // the one body init's `CSpace` backs from the kernel's seed, and the fund
     // pays for every later body and port-binding table, the serial port's
-    // binding on x86-64 among them (`bootstrap::fund_own_cspace`).
+    // binding on x86-64 among them (`bootstrap::fund_own_cspace`). Nothing
+    // before `serial_init` logs: the Thread retype size the reserve needs is
+    // queried without the log, and a failure is reported once serial is up.
     let backing_pages = 1 + logging::LOG_THREAD_STACK_PAGES + 1;
-    let init_arena = bootstrap::BootArena::carve_reserve(
-        &mut alloc,
-        info.aspace_cap,
-        bootstrap::init_retype_reserve_pages(info),
-        backing_pages,
-    );
+    let retype_known = query_thread_retype_pages().is_some();
+    let init_arena = if retype_known
+    {
+        bootstrap::BootArena::carve_reserve(
+            &mut alloc,
+            info.aspace_cap,
+            bootstrap::init_retype_reserve_pages(info),
+            backing_pages,
+        )
+    }
+    else
+    {
+        None
+    };
     let funded = init_arena
         .as_ref()
         .map(|arena| bootstrap::fund_own_cspace(info, arena.cap));
@@ -455,6 +487,11 @@ fn run(info_ptr: u64) -> !
     // Set up serial output (FATAL pre-IPC errors fall back to this).
     arch::current::serial_init(info, info.thread_cap);
 
+    if !retype_known
+    {
+        logging::log("init: FATAL: cannot query the Thread retype size");
+        syscall::thread_exit();
+    }
     let Some(mut init_arena) = init_arena
     else
     {
@@ -580,7 +617,7 @@ fn run(info_ptr: u64) -> !
         logging::log("init: FATAL: cannot derive badged log SEND");
         syscall::thread_exit();
     };
-    // SAFETY: INIT_IPC_BUF_VA is registered and page-aligned.
+    // INIT_IPC_BUF_VA is registered and page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = INIT_IPC_BUF_VA as *mut u64;
     logging::set_ipc_logging(init_log_send, ipc_buf);
@@ -694,7 +731,7 @@ fn run(info_ptr: u64) -> !
     // TEMP_MAP_BASE (the mapping outlives the move of its cap); memmgr reads
     // it back via the RO cap derived above. See
     // `bootstrap::write_memmgr_aux_memory`.
-    // SAFETY: TEMP_MAP_BASE is mapped writable, one page, page-aligned.
+    // TEMP_MAP_BASE is mapped writable, one page, page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let phys_dst = TEMP_MAP_BASE as *mut u64;
     // SAFETY: phys_dst points at the one mapped 4 KiB page.

@@ -333,6 +333,9 @@ fn drain(ep: u64)
         return;
     }
     let reply = IpcMessage::new(iommu_errors::HARDWARE_TIMEOUT);
+    // infinite_loop: the thread returns early when it has no IPC buffer, so
+    // `drain` cannot be `-> !`; the drain loop itself never ends.
+    #[expect(clippy::infinite_loop)]
     loop
     {
         // SAFETY: ipc_buf is this thread's registered IPC buffer.

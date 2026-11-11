@@ -256,7 +256,7 @@ impl Iterator for ValueBytes<'_>
                 let hi = hex_digit(*self.raw.first()?)?;
                 let lo = hex_digit(*self.raw.get(1)?)?;
                 self.raw = &self.raw[2..];
-                Some(hi << 4 | lo)
+                Some((hi << 4) | lo)
             }
             other => Some(other),
         }

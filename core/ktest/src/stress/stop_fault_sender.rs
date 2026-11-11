@@ -176,9 +176,9 @@ static BAD_RECVS: BadTally = BadTally::new();
 /// A child's IPC buffer page (one live user each).
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
-// SAFETY: used only by the handler, of which one runs per test.
+// Used only by the handler, of which one runs per test.
 static mut HANDLER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
-// SAFETY: used only by the syncer, of which one runs per test.
+// Used only by the syncer, of which one runs per test.
 static mut SYNCER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
 /// The handler's arguments, handed to its entry by address.
@@ -906,7 +906,7 @@ extern "C" fn handler_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `setup` published for the handler.
     let args: HandlerArgs = unsafe { spawn::child_args(arg) };
-    // SAFETY: sole user of HANDLER_IPC_BUF (one handler per test; stress
+    // Sole user of HANDLER_IPC_BUF (one handler per test; stress
     // tests run sequentially).
     let buf = core::ptr::addr_of_mut!(HANDLER_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
@@ -1028,7 +1028,7 @@ extern "C" fn syncer_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `spawn_syncer` published for the syncer.
     let SyncerArgs { ep, notif } = unsafe { spawn::child_args(arg) };
-    // SAFETY: sole user of SYNCER_IPC_BUF (one syncer per test; stress tests
+    // Sole user of SYNCER_IPC_BUF (one syncer per test; stress tests
     // run sequentially).
     let buf = core::ptr::addr_of_mut!(SYNCER_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),

@@ -44,7 +44,11 @@ targets; only the one-time init-logd history pull
   and logd deletes its procmgr-seeded `ProcessInfo.log_send_cap` at
   startup so no path can self-IPC. Until the driver is resolvable,
   serial output is dropped while history still accrues; early-boot
-  output is covered by init-logd's direct-UART fallback. See
+  output is covered by init-logd's direct-UART fallback. logd holds its
+  own diagnostics until init-logd, which writes the UART directly, has
+  acknowledged the handover release, so the two never write a line at
+  once (see [`docs/handover-protocol.md`](docs/handover-protocol.md)
+  § Startup ordering). See
   [docs/console-model.md](../../docs/console-model.md).
 
 * **Driver-mediated framebuffer mirror.** logd also mirrors each line

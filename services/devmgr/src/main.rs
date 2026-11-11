@@ -48,7 +48,7 @@ fn main() -> !
     std::os::seraph::log::register_name(b"devmgr");
     let info = startup_info();
 
-    // SAFETY: IPC buffer is registered by `std::os::seraph::_start` and
+    // IPC buffer is registered by `std::os::seraph::_start` and
     // page-aligned by the boot protocol.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();

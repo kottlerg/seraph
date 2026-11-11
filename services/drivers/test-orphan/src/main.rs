@@ -57,7 +57,7 @@ fn main() -> !
     // Reserve and touch a known block so the process's footprint is large
     // enough to observe in memmgr's free total. `vec!` writes every byte,
     // faulting the pages in; `reserved` stays live across the block below.
-    let reserved = std::vec![0xAB_u8; RESERVE_BYTES];
+    let reserved = std::vec![0xABu8; RESERVE_BYTES];
     // Defeat dead-store elimination with a volatile read of the first byte.
     // SAFETY: `reserved` owns RESERVE_BYTES bytes; offset 0 is in bounds.
     let probe = unsafe { core::ptr::read_volatile(reserved.as_ptr()) };

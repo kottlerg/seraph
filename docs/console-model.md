@@ -58,7 +58,11 @@ direct console paths remain as fallbacks for the life of the system.
    [logd handover protocol](../services/logd/docs/handover-protocol.md)). This direct path is a
    fixed part of the boot design, not a stopgap: together with init's main thread, which writes
    the UART directly until init-logd is spawned, it is the only userspace writer until real-logd
-   takes the endpoint. The handover is unconditional, so if the serial driver never
+   takes the endpoint. real-logd starts before that and holds its own diagnostics until init-logd
+   has acknowledged the release, since the two writers share no lock and their lines would
+   interleave on the UART byte by byte; init-logd writes its last line before that
+   acknowledgement ([logd handover protocol](../services/logd/docs/handover-protocol.md)
+   § Startup ordering). The handover is unconditional, so if the serial driver never
    comes up, userspace serial output after the handover is dropped (real-logd keeps the lines in
    its history ring). init-logd has no direct-framebuffer path; before the framebuffer driver is
    up, userspace output reaches only the UART.

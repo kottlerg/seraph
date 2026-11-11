@@ -1230,8 +1230,9 @@ pub unsafe fn thread_configure_with_tls(
 ///
 /// A `Stopped` thread whose fault episode a stop cancelled before any reply
 /// claimed it, or whose handler's claiming reply was `FAULT_REPLY_KILL` (or a
-/// `FAULT_REPLY_FORWARD` of a delivery other than a virtual-memory one, or of
-/// one with no exception handler bound), is not resumed: starting it kills it
+/// `FAULT_REPLY_FORWARD` of a delivery other than a virtual-memory one, of one
+/// with no exception handler bound, or of the fault of a restartable syscall's
+/// user copy), is not resumed: starting it kills it
 /// as an unhandled fault, which posts its death and address-space observers,
 /// or, for the fault of a restartable syscall's user copy, fails that syscall
 /// with `InvalidAddress` (docs/fault-handling.md § Delivery, Resume, and
@@ -2246,10 +2247,13 @@ pub fn ioport_bind(thread_cap: u64, ioport_cap: u64) -> Result<(), i64>
 /// that reply's outcome is kept; no syscall returns on the target, and the
 /// outcome takes effect at the next [`thread_start`], which kills the thread
 /// on a kill outcome (for the fault of a restartable syscall's user copy,
-/// fails that syscall with `InvalidAddress`) and resumes its faulting
-/// instruction on
-/// `FAULT_REPLY_RESUME` (docs/fault-handling.md § Delivery, Resume, and
-/// Kill). A thread blocked in an upcall delivery is never killed: whatever
+/// fails that syscall with `InvalidAddress`), resumes its faulting
+/// instruction on `FAULT_REPLY_RESUME`, and on `FAULT_REPLY_FORWARD` delivers
+/// the fault through the thread's exception-class handler when the reply
+/// answered the virtual-memory class's delivery of a fault other than a kernel
+/// copy's and an exception handler is bound, and otherwise takes the kill
+/// outcome, as [`thread_start`] says
+/// (docs/fault-handling.md § Delivery, Resume, and Kill). A thread blocked in an upcall delivery is never killed: whatever
 /// the outcome, the upcall is settled or dropped and the start resumes the
 /// thread at its registers (docs/fault-handling.md § Asynchronous Upcalls).
 ///
@@ -2441,9 +2445,20 @@ pub fn thread_inherit_fault_handler(
 /// Post an asynchronous upcall carrying `cookie` to `thread`
 /// (`SYS_THREAD_POST_UPCALL`). The thread's `FAULT_CLASS_UPCALL` handler
 /// receives a `FAULT_KIND_UPCALL` message at the thread's next syscall return,
-/// or, with `flags` = `UPCALL_ANY_INSTRUCTION`, at any return to user mode; a
-/// thread blocked in a syscall has it return `Interrupted` first. See
-/// `docs/fault-handling.md` § Asynchronous Upcalls.
+/// or, with `flags` = `UPCALL_ANY_INSTRUCTION`, at any return to user mode.
+///
+/// Unless the thread masks upcalls, a block of it in one of the blocking
+/// syscalls (`SYS_IPC_CALL`, `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`,
+/// `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`, `SYS_THREAD_SLEEP`) returns
+/// `Interrupted`, unless its wake (a delivery, or the elapsed deadline of a
+/// sleep or a timed wait) was claimed first, and the upcall is delivered at
+/// that return; a blocking syscall it enters with the upcall pending returns
+/// `Interrupted` at once instead of blocking, while a try-once
+/// (`WAIT_TRY_ONCE`), or a call whose result is already available, returns
+/// its own result. A fault or upcall delivery in progress is left to resolve,
+/// never cancelled for the post. See `docs/fault-handling.md`
+/// § Asynchronous Upcalls and `core/kernel/docs/syscalls.md`
+/// § Atomicity and Preemption Guarantees.
 ///
 /// Requires `UPCALL` on the thread cap, and `CONTROL` beside it for
 /// `UPCALL_ANY_INSTRUCTION`.
@@ -2674,9 +2689,14 @@ pub unsafe fn thread_read_mem_raw(
 ///
 /// # Safety
 /// When the thread executes in the calling program's own address space, the
-/// write changes the program's memory under any Rust object there: the range
-/// must hold no object a store of these bytes would make invalid, and no
-/// reference may be live to it.
+/// write changes the program's memory under whatever the range holds:
+/// - the range holds no Rust object a store of these bytes would make
+///   invalid, and no reference to it is live;
+/// - the range holds no code the program may execute, unless the bytes are
+///   code the program is entitled to run there and no thread executes the
+///   range during the write;
+/// - no other access to the range, through any pointer or atomic, runs
+///   concurrently with the call.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability`,

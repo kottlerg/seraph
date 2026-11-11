@@ -13,10 +13,11 @@
 //! badge or under any crash badge (`ProcessEntry::is_crash_binding`), as one that
 //! copied its spawner's bindings is, is rebound under a fresh crash badge
 //! ([`CrashBadges`]), so the badge of a fault message names the faulting
-//! thread. The registry holds slot indices
-//! only; procmgr reads each slot's liveness and passes the answer in, so this
-//! module is host-tested (`services/procmgr/docs/ipc-interface.md`
-//! § `REGISTER_THREAD`).
+//! thread. Each thread keeps the [`Origin`] its binding showed at the
+//! registration, which decides what a restore may bind it back to.
+//! The registry holds slot indices only; procmgr reads each slot's liveness
+//! and passes the answer in, so this module is host-tested
+//! (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`).
 
 extern crate alloc;
 
@@ -49,6 +50,75 @@ pub struct RegisteredThread
     /// endpoint with; `0` when procmgr did not bind it (a debugger's binding,
     /// or no binding, was there).
     pub crash_badge: u64,
+    /// The thread's [`Origin`], packed: `0` for [`Origin::Own`],
+    /// [`UNKNOWN_OWNER`] for [`Origin::Unknown`], and the other process's
+    /// badge for [`Origin::Owner`], which no process badge confuses with
+    /// either (`crate::badge_is_acceptable` refuses both).
+    owner: u64,
+}
+
+/// Whose thread a registration took, as its exception-class binding showed
+/// at the registration (`ProcessTable::origin_of`), and so what a restore may
+/// bind it back to (`ProcessTable::restore_action`). procmgr has no kernel
+/// query for the address space a thread runs in, so the binding is all it
+/// reads (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin
+{
+    /// The sender's own, as far as procmgr can tell: bound under its process
+    /// badge, a debugger's badge, a crash badge no live registry lists, or a
+    /// crash badge its own registry lists on a thread recorded as its own.
+    /// A restore binds it back to the crash endpoint under a crash badge of
+    /// the sender's.
+    Own,
+    /// Left under another live process's badge, the one it carries, which
+    /// procmgr never rebinds at a registration. A restore never binds it to
+    /// the crash endpoint: procmgr reads the binding's badge alone, and any
+    /// process can bind a thread of its own under that value on an endpoint
+    /// of its own.
+    Owner(u64),
+    /// Any other: a crash badge another registry lists, or the sender's
+    /// registry lists on a thread not recorded as its own, another handler's
+    /// badge, or no binding. A restore never binds it to the crash endpoint.
+    Unknown,
+}
+
+/// The packed owner of an [`Origin::Unknown`] thread: `u64::MAX`, the
+/// init-reap correlator, which no process badge equals.
+const UNKNOWN_OWNER: u64 = u64::MAX;
+const _: () = assert!(UNKNOWN_OWNER == ipc::procmgr_labels::INIT_REAP_CORRELATOR);
+
+impl RegisteredThread
+{
+    /// A registered thread with its cap, its crash badge (`0` with none), and
+    /// its origin.
+    #[must_use]
+    pub const fn new(cap: u64, crash_badge: u64, origin: Origin) -> Self
+    {
+        let owner = match origin
+        {
+            Origin::Own => 0,
+            Origin::Owner(badge) => badge,
+            Origin::Unknown => UNKNOWN_OWNER,
+        };
+        Self {
+            cap,
+            crash_badge,
+            owner,
+        }
+    }
+
+    /// Whose thread the registration took.
+    #[must_use]
+    pub const fn origin(&self) -> Origin
+    {
+        match self.owner
+        {
+            0 => Origin::Own,
+            UNKNOWN_OWNER => Origin::Unknown,
+            badge => Origin::Owner(badge),
+        }
+    }
 }
 
 /// Why [`ThreadRegistry::reserve`] refused a registration.
@@ -269,7 +339,16 @@ mod tests
 
     fn thread(cap: u64, crash_badge: u64) -> RegisteredThread
     {
-        RegisteredThread { cap, crash_badge }
+        RegisteredThread::new(cap, crash_badge, Origin::Own)
+    }
+
+    #[test]
+    fn an_origin_survives_its_packing()
+    {
+        for origin in [Origin::Own, Origin::Unknown, Origin::Owner(0x51)]
+        {
+            assert_eq!(RegisteredThread::new(5, 0, origin).origin(), origin);
+        }
     }
 
     #[test]

@@ -413,7 +413,11 @@ crash service, and binds the thread's exception class under a crash badge of its
 the thread names it (`register_with_procmgr` in `src/sys/thread/seraph.rs`). The registration costs
 one IPC per spawn and nothing on any path that does not spawn. A process procmgr did not create,
 whose `ProcessInfo` names no procmgr endpoint (procmgr and memmgr), sends none. A refusal or a
-failed call leaves the thread unregistered, its faults reported without registers; at a refusal
+failed call leaves the thread unregistered, its faults reported without registers, with one
+exception: a call the kernel cancels with `Interrupted` after procmgr received it has been carried
+out, so the thread is registered, or refused, though the runtime cannot tell which. The runtime
+does not repeat a failed call, since a repeat of one procmgr carried out registers the thread
+twice: two entries, each with its crash badge. At a refusal
 for the bound or the heap procmgr binds back a debugger's binding the thread copied, and at a
 `NOT_ATTACHABLE` refusal it unbinds the thread as the declaration unbinds the process's threads, so
 its faults go unreported. A `NOT_ATTACHABLE` refusal, from a process declared undebuggable

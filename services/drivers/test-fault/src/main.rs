@@ -91,7 +91,7 @@ fn hang() -> !
 {
     // `vec!` writes every byte, faulting the pages in; `black_box` below keeps
     // the buffer observable, so the stores are not elided.
-    let reserved = std::vec![0xA5_u8; test_fault_labels::NEVER_READY_RESERVE_BYTES];
+    let reserved = std::vec![0xA5u8; test_fault_labels::NEVER_READY_RESERVE_BYTES];
     std::os::seraph::log!(
         "test-fault: holding {} bytes, never reporting ready",
         test_fault_labels::NEVER_READY_RESERVE_BYTES

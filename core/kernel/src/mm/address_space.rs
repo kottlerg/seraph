@@ -111,7 +111,7 @@ static INIT_LAYOUT_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 /// itself stays unmapped below the stack base).
 fn init_layout_from_entropy(entropy: [u8; 16]) -> InitLayout
 {
-    let mut word = [0_u8; 8];
+    let mut word = [0u8; 8];
     word.copy_from_slice(&entropy[0..8]);
     let init_info_va = INIT_INFO_WINDOW.pick(u64::from_le_bytes(word));
     word.copy_from_slice(&entropy[8..16]);
@@ -133,7 +133,7 @@ fn draw_init_layout() -> InitLayout
 {
     if crate::entropy::is_seeded()
     {
-        let mut entropy = [0_u8; 16];
+        let mut entropy = [0u8; 16];
         crate::entropy::fill_bytes(&mut entropy);
         return init_layout_from_entropy(entropy);
     }
@@ -941,8 +941,8 @@ impl AddressSpace
         let page_count = (in_page_off + segment.size as usize)
             .div_ceil(PAGE_SIZE)
             .max(1);
-        let virt_base = segment.virt_addr & !0xFFF_u64; // page-aligned virtual
-        let phys_base = segment.phys_addr & !0xFFF_u64; // page-aligned physical frame
+        let virt_base = segment.virt_addr & !0xFFFu64; // page-aligned virtual
+        let phys_base = segment.phys_addr & !0xFFFu64; // page-aligned physical frame
         for i in 0..page_count
         {
             let virt = virt_base + (i * PAGE_SIZE) as u64;
@@ -1633,7 +1633,7 @@ impl AddressSpace
     /// active, so TLB shootdown sees a consistent view when it reads the set.
     pub fn mark_active_on_cpu(&self, cpu: u32)
     {
-        // SAFETY: Release ordering ensures prior address space setup (page
+        // Release ordering ensures prior address space setup (page
         // table modifications) is visible before we mark it active for TLB
         // shootdown purposes. The set_cpu is atomic; no data race on the mask.
         self.active_cpus.set_cpu(cpu as usize, Ordering::Release);
@@ -1650,7 +1650,7 @@ impl AddressSpace
     /// mask (a CPU remains active until it has fully switched away).
     pub fn mark_inactive_on_cpu(&self, cpu: u32)
     {
-        // SAFETY: Release ordering ensures all TLB-dependent operations
+        // Release ordering ensures all TLB-dependent operations
         // complete before we mark inactive, so TLB shootdowns see the correct
         // mask. The clear_cpu is atomic; no data race on the mask.
         self.active_cpus.clear_cpu(cpu as usize, Ordering::Release);

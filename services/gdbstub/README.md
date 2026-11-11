@@ -67,7 +67,9 @@ Framing, command parsing, and the target descriptions are `shared/gdb-rsp`
 
 1. The stub declares itself undebuggable (`DECLARE_NO_DEBUG`), as every debug-authority holder
    does before it spawns a thread, and takes its bootstrap round: `caps[0]` the
-   `devmgr.class.debug-port` seed, `caps[1]` the `DEBUG_AUTHORITY` SEND on procmgr.
+   `devmgr.class.debug-port` seed, `caps[1]` the `DEBUG_AUTHORITY` SEND on procmgr. A declaration
+   procmgr does not accept ends the stub, which logs why: the declaration is what makes procmgr
+   refuse an attach to the stub, so no memory write of the stub's lands in its own address space.
 2. It takes the debug port from devmgr (`QUERY_DEVICE`), retrying while devmgr replies
    `NO_DEVICE`, since the port's driver loads with devmgr's on-disk batch, and registers an RX
    notification on it. A boot without `--debug-port`, a missing seed or authority, or a missing
@@ -228,20 +230,22 @@ not served; GDB falls back or reports them unsupported.
 
 `D` (GDB's `detach`, and its quit while attached, since `qAttached` is `1`) and `k` restore the
 target as the attach found it, as far as procmgr's crash bindings go: the stub undoes a step in
-flight, refreshes its table, so a thread registered since the last all-stop has its stop come
-again under its own badge, writes every breakpoint's bytes back through a live thread when one is
-left, and resumes every held thread. It answers `FAULT_REPLY_RESUME` for `DRAIN_WAIT`
-([Limits](#limits)) to each stop that reaches its endpoint meanwhile, first setting a hit of a
-breakpoint it wrote back to the breakpoint's address, so the thread runs the restored bytes. It
-then sends procmgr `DETACH_PROCESS`, which binds each listed thread whose exception class is
-bound under the debugger tag, is unbound, or is bound by procmgr under another badge back to the
-crash endpoint, leaves a thread bound to any other handler, and unbinds each upcall class bound
-under the debugger tag, and does so as well when every thread has exited. The stub's own unbind of
-the upcall class after it changes nothing. The stub drops the thread caps and logs
-`detached from <name> (crash bindings restored: <bool>)`. The stub
+flight, refreshes its table, so a thread registered since the last all-stop has its stop come again
+under its own badge, writes every breakpoint's bytes back through a live thread when one is left,
+and resumes every held thread. It answers `FAULT_REPLY_RESUME` for `DRAIN_WAIT` ([Limits](#limits))
+to each stop that reaches its endpoint meanwhile, first setting a hit of a breakpoint it wrote back
+to the breakpoint's address, so the thread runs the restored bytes. It then sends procmgr
+`DETACH_PROCESS`, which binds the target's main thread, and each listed thread procmgr recorded as
+the target's own at its registration, back to the crash endpoint when its exception class is bound
+under the debugger tag, is unbound, or is bound by procmgr under another badge. Any other listed
+thread, one procmgr left under another process's badge among them, it never binds to the crash
+endpoint, and it unbinds the debugger's binding on it. It leaves a thread bound to any other
+handler, unbinds each upcall class bound under the debugger tag, and does so as well when every
+thread has exited. The stub's own unbind of the upcall class after it changes nothing. The stub
+drops the thread caps and logs `detached from <name> (crash bindings restored: <bool>)`. The stub
 cannot restore the crash bindings itself, since it holds no SEND on procmgr's crash endpoint. A
-handler the target had bound on a thread's exception or upcall class itself, which the attach's
-bind replaced, is not bound back: procmgr restores its own bindings, not the target's
+handler the target had bound on a thread's exception or upcall class itself, which the attach's bind
+replaced, is not bound back: procmgr restores its own bindings, not the target's
 ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md) § Label 24: `DETACH_PROCESS`).
 
 When the stub dies attached, procmgr restores the crash bindings the same way: the attach left it

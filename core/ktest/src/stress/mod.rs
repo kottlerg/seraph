@@ -71,7 +71,7 @@ const MAX_STRESS_THREADS: usize = 64;
 
 /// Shared child stacks for stress tests. Tests run sequentially so stacks
 /// are never aliased.
-// SAFETY: Only accessed by one stress test at a time (sequential execution).
+// Only accessed by one stress test at a time (sequential execution).
 // Each test uses distinct indices.
 static mut STRESS_STACKS: [ChildStack; MAX_STRESS_THREADS] = [ChildStack::ZERO; MAX_STRESS_THREADS];
 

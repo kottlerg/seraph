@@ -19,7 +19,7 @@ pub const UART_PHYS: u64 = 0x1000_0000;
 pub(crate) const SERIAL_VA: u64 = 0x3000_0000;
 
 /// Current UART virtual base (set after `mmio_map`).
-// SAFETY: ktest is single-threaded on the serial path.
+// ktest is single-threaded on the serial path.
 static mut UART_VA: u64 = 0;
 
 /// UART register offsets.

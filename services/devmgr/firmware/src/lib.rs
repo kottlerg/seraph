@@ -10,13 +10,16 @@
 //! (RSDP → XSDT → MCFG, plus the FADT's `PM1a_CNT_BLK` for the shutdown
 //! broker's check) and flattened device trees for the PCI ECAM windows,
 //! computes ECAM register offsets, a function's configuration-space page,
-//! BAR sizes, and the Command register's Bus Master Enable, walks PCI
-//! configuration space through a caller-supplied accessor, keeps the table of
-//! MMIO and interrupt range caps devmgr carves per-device caps from, holds the
-//! interrupt lines it has carved so every device on a line gets its own
-//! derivation, tracks which spawned drivers reported their device ready, and
-//! keeps each class's served drivers by instance ordinal, a withdrawn one's
-//! ordinal held by a tombstone, keeps each DMA-capable device's DMA
+//! BAR sizes, the Command register values devmgr writes, the capability-list
+//! walk, and the Function Level Reset fields, walks PCI configuration space
+//! through a caller-supplied accessor, chooses the driver declaration that
+//! binds each device record within the declaration bounds (`binding`), keeps
+//! the table of MMIO and interrupt range caps devmgr carves per-device caps
+//! from, holds the interrupt lines it has carved so every device on a line
+//! gets its own derivation, tracks which spawned drivers reported their
+//! device ready, and keeps each class's served drivers, by class name
+//! (`classes`) and instance ordinal, a withdrawn one's ordinal held by a
+//! tombstone, keeps each DMA-capable device's DMA
 //! mappings (`dma`), walks the DMA Remapping table for the VT-d units and
 //! the functions each translates (`dmar`), and walks the RISC-V IO Mapping
 //! Table for the RISC-V IOMMUs that are PCI functions and the functions each
@@ -33,6 +36,8 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod acpi;
+pub mod binding;
+pub mod classes;
 pub mod dma;
 pub mod dmar;
 pub mod dtb;

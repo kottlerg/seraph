@@ -5,9 +5,11 @@
 
 //! PCI configuration-space arithmetic for devmgr: ECAM register offsets, the
 //! physical page of a function's configuration space, BAR sizes from their
-//! sizing read-backs (PCI Local Bus Specification r3.0 § 6.2.5.1), and the
-//! Command register's Bus Master Enable (§ 6.2.2). devmgr performs the
-//! volatile accesses; these functions only compute.
+//! sizing read-backs (PCI Local Bus Specification r3.0 § 6.2.5.1), the
+//! Command register's Memory Space Enable, Bus Master Enable, and Interrupt
+//! Disable (§ 6.2.2), the capability-list walk, and the PCI Express Function
+//! Level Reset fields. devmgr performs the volatile accesses; these functions
+//! only compute.
 
 /// Bytes of one function's configuration space in an ECAM window (PCI
 /// Express Base Specification r4.0 § 7.2.2): one page.
@@ -47,6 +49,11 @@ pub const COMMAND_BUS_MASTER: u16 = 1 << 2;
 /// BARs.
 pub const COMMAND_MEMORY: u16 = 1 << 1;
 
+/// Command register: Interrupt Disable, bit 10. While it is set the function
+/// does not assert its wired interrupt line (PCI Local Bus Specification
+/// r3.0 § 6.2.2).
+pub const COMMAND_INTERRUPT_DISABLE: u16 = 1 << 10;
+
 /// The Command register value that turns on Memory Space Enable and Bus
 /// Master Enable and keeps every other bit of `command`: the function then
 /// decodes its MMIO BARs and issues DMA. devmgr writes it for a device the
@@ -55,6 +62,117 @@ pub const COMMAND_MEMORY: u16 = 1 << 1;
 pub const fn command_with_memory_and_bus_master(command: u16) -> u16
 {
     command | COMMAND_MEMORY | COMMAND_BUS_MASTER
+}
+
+/// The Command register value devmgr writes when it binds a driver to the
+/// function: Memory Space Enable on; Bus Master Enable on for a device that
+/// performs DMA (`dma`) and off for one that does not; Interrupt Disable
+/// clear when the driver is given the function's wired line (`wired`) and
+/// set when it is not, so a function whose driver takes no interrupt never
+/// asserts a line it may share. Every other bit of `command` is kept.
+#[must_use]
+pub const fn command_for_bind(command: u16, dma: bool, wired: bool) -> u16
+{
+    let mut value = command | COMMAND_MEMORY;
+    value = if dma
+    {
+        value | COMMAND_BUS_MASTER
+    }
+    else
+    {
+        value & !COMMAND_BUS_MASTER
+    };
+    if wired
+    {
+        value & !COMMAND_INTERRUPT_DISABLE
+    }
+    else
+    {
+        value | COMMAND_INTERRUPT_DISABLE
+    }
+}
+
+/// The Command register value that sets Interrupt Disable and keeps every
+/// other bit of `command`: the step of a withdrawal that stops the function
+/// asserting its wired line, whoever else shares it.
+#[must_use]
+pub const fn command_with_interrupt_disable(command: u16) -> u16
+{
+    command | COMMAND_INTERRUPT_DISABLE
+}
+
+/// Whether a Command register read back after setting Interrupt Disable
+/// confirms it set. An all-ones read-back is what a function that does not
+/// answer returns, so it confirms nothing.
+#[must_use]
+pub const fn interrupt_disable_confirmed(read_back: u16) -> bool
+{
+    read_back != u16::MAX && read_back & COMMAND_INTERRUPT_DISABLE != 0
+}
+
+/// Offset of the Status register; bit 4 is Capabilities List.
+pub const STATUS: u16 = 0x06;
+/// Status register: the function has a capability list at
+/// [`CAPABILITIES_POINTER`].
+pub const STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
+/// Offset of the capability list's head pointer in a type-0 header.
+pub const CAPABILITIES_POINTER: u16 = 0x34;
+/// Capability slots a function's capability list can hold: capabilities are
+/// dword-aligned in the 192 bytes above the 64-byte standard header, so a
+/// longer list loops, and the walk stops there.
+pub const MAX_CAPABILITIES: u32 = 48;
+/// Capability ID of the PCI Express capability.
+pub const CAP_ID_PCI_EXPRESS: u8 = 0x10;
+/// Offset of Device Capabilities in the PCI Express capability; bit 28 is
+/// Function Level Reset Capability (PCI Express Base Specification r4.0
+/// § 7.5.3.3).
+pub const PCIE_DEVICE_CAPABILITIES: u16 = 0x04;
+/// Device Capabilities: the function supports Function Level Reset.
+pub const PCIE_DEVCAP_FLR: u32 = 1 << 28;
+/// Offset of Device Control in the PCI Express capability; bit 15 is
+/// Initiate Function Level Reset (§ 7.5.3.4).
+pub const PCIE_DEVICE_CONTROL: u16 = 0x08;
+/// Device Control: Initiate Function Level Reset.
+pub const PCIE_DEVCTL_INITIATE_FLR: u16 = 1 << 15;
+/// The wait after initiating a Function Level Reset before software touches
+/// the function again (§ 6.6.2): 100 ms.
+pub const FLR_COMPLETION_MS: u64 = 100;
+
+/// Offset of the capability with ID `id` in a function's configuration
+/// header, which `read8` reads a byte of. Walks the capability list from
+/// [`CAPABILITIES_POINTER`] when the Status register's Capabilities List bit
+/// is set (`status`), at most [`MAX_CAPABILITIES`] entries, so a cyclic list
+/// ends; `None` when the function has no list or none of its entries has
+/// that ID.
+pub fn find_capability(status: u16, id: u8, read8: impl Fn(u16) -> u8) -> Option<u16>
+{
+    if status & STATUS_CAPABILITIES_LIST == 0
+    {
+        return None;
+    }
+    // The pointer's low 2 bits are reserved.
+    let mut ptr = read8(CAPABILITIES_POINTER) & !3;
+    let mut walked = 0u32;
+    while ptr != 0 && walked < MAX_CAPABILITIES
+    {
+        walked += 1;
+        let at = u16::from(ptr);
+        if read8(at) == id
+        {
+            return Some(at);
+        }
+        ptr = read8(at + 1) & !3;
+    }
+    None
+}
+
+/// Whether a function whose PCI Express Device Capabilities register reads
+/// `devcap` supports Function Level Reset. All ones, a function that does not
+/// answer, does not.
+#[must_use]
+pub const fn flr_capable(devcap: u32) -> bool
+{
+    devcap != u32::MAX && devcap & PCIE_DEVCAP_FLR != 0
 }
 
 /// The Command register value that clears Bus Master Enable and keeps every
@@ -204,6 +322,80 @@ mod tests
     {
         assert_eq!(command_with_memory_and_bus_master(0x0400), 0x0406);
         assert_eq!(command_with_memory_and_bus_master(0x0007), 0x0007);
+    }
+
+    #[test]
+    fn a_bind_enables_memory_and_sets_bus_master_and_interrupt_disable_by_need()
+    {
+        // DMA and a wired line: Bus Master on, Interrupt Disable cleared.
+        assert_eq!(command_for_bind(0x0400, true, true), 0x0006);
+        // No DMA, no line: Bus Master off, Interrupt Disable set.
+        assert_eq!(command_for_bind(0x0004, false, false), 0x0402);
+        // Other bits (I/O Space, SERR#) are kept.
+        assert_eq!(command_for_bind(0x0101, true, false), 0x0507);
+    }
+
+    #[test]
+    fn interrupt_disable_is_set_keeping_every_other_bit_and_confirmed_only_when_read_set()
+    {
+        assert_eq!(command_with_interrupt_disable(0x0006), 0x0406);
+        assert!(interrupt_disable_confirmed(0x0402));
+        assert!(!interrupt_disable_confirmed(0x0002));
+        assert!(!interrupt_disable_confirmed(0xFFFF));
+    }
+
+    /// A configuration header whose capability list is `caps`, each
+    /// `(offset, id, next)`.
+    fn header(caps: &[(u8, u8, u8)]) -> [u8; 256]
+    {
+        let mut cfg = [0u8; 256];
+        if let Some(&(first, _, _)) = caps.first()
+        {
+            cfg[usize::from(CAPABILITIES_POINTER)] = first;
+        }
+        for &(at, id, next) in caps
+        {
+            cfg[usize::from(at)] = id;
+            cfg[usize::from(at) + 1] = next;
+        }
+        cfg
+    }
+
+    #[test]
+    fn the_capability_walk_finds_an_id_down_the_list()
+    {
+        let cfg = header(&[(0x40, 0x05, 0x60), (0x60, 0x10, 0x00)]);
+        let read = |at: u16| cfg[usize::from(at)];
+        assert_eq!(
+            find_capability(STATUS_CAPABILITIES_LIST, CAP_ID_PCI_EXPRESS, read),
+            Some(0x60)
+        );
+        assert_eq!(find_capability(STATUS_CAPABILITIES_LIST, 0x11, read), None);
+    }
+
+    #[test]
+    fn the_capability_walk_needs_the_status_bit_and_ends_on_a_cycle()
+    {
+        let cfg = header(&[(0x40, 0x10, 0x00)]);
+        assert_eq!(
+            find_capability(0, CAP_ID_PCI_EXPRESS, |at| cfg[usize::from(at)]),
+            None
+        );
+        let cyclic = header(&[(0x40, 0x05, 0x50), (0x50, 0x09, 0x40)]);
+        assert_eq!(
+            find_capability(STATUS_CAPABILITIES_LIST, CAP_ID_PCI_EXPRESS, |at| {
+                cyclic[usize::from(at)]
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn flr_capability_is_bit_28_of_device_capabilities()
+    {
+        assert!(flr_capable(0x1000_8000));
+        assert!(!flr_capable(0x0000_8000));
+        assert!(!flr_capable(u32::MAX));
     }
 
     #[test]

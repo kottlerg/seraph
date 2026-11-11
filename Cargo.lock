@@ -404,6 +404,7 @@ dependencies = [
 name = "devmgr-firmware"
 version = "0.1.3"
 dependencies = [
+ "driver-binding",
  "ipc",
  "syscall-abi",
  "virtio-core",

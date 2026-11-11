@@ -146,7 +146,8 @@ supervisor, so the bootloader reports only the supervisor-level pair, in
   `interrupts-extended` position names: the entry whose phandle is that
   of the `riscv,cpu-intc` child of the hart's CPU node, counted in files
   of `2^(12 + guest-index-bits)` bytes across the node's `reg` windows in
-  order. A hart missing from `interrupts-extended`, or a file elsewhere,
+  order. A hart missing from `interrupts-extended` (a hart whose
+  `riscv,cpu-intc` is absent or has no `phandle` is), or a file elsewhere,
   leaves `kernel_mmio.imsic` zero, with one diagnostic naming the hart.
   The APLIC does not depend on that check.
 - The aperture seeds are the APLIC's first `reg` window and every `reg`

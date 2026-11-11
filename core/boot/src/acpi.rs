@@ -851,9 +851,9 @@ pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 /// - Each I/O APIC register window (x86-64, MADT type 1).
 /// - Each RISC-V PLIC register window (MADT type 0x1B, present on
 ///   RISC-V platforms that expose ACPI such as QEMU+EDK2 virt).
-/// - Each RISC-V APLIC register window (MADT type 0x1A), and one window
-///   spanning the supervisor-level IMSIC files the enabled RINTC structures
-///   (MADT type 0x18) name.
+/// - Each RISC-V APLIC register window (MADT type 0x1A), and each
+///   supervisor-level IMSIC file an enabled RINTC structure (MADT type 0x18)
+///   names, one seed per file.
 /// - Each MCFG ECAM window.
 /// - Each VT-d remapping unit's register set (DMAR DRHD), which no other
 ///   table names.
@@ -999,9 +999,6 @@ unsafe fn walk_aperture_seed(
             // LAPIC base from header; may be overridden by MADT type 5.
             // Zero on RISC-V (no LAPIC); emitted only when non-zero.
             let mut lapic = u64::from(read_u32(table, SDT_HDR_LEN));
-            // The span of the enabled harts' supervisor-level IMSIC files,
-            // seeded as one window rather than one per hart.
-            let mut imsic_span: Option<(u64, u64)> = None;
             let mut off = MADT_ENTRIES_OFF;
             while off + 2 <= table.len()
             {
@@ -1047,28 +1044,21 @@ unsafe fn walk_aperture_seed(
                         if entry_len >= madt_len::RINTC_IMSIC
                             && read_u32(table, off + 4) & 0x1 != 0 =>
                     {
-                        // Layout at `rintc_imsic_files`.
+                        // Layout at `rintc_imsic_files`. One seed per file:
+                        // `derive_mmio_apertures` merges abutting files into
+                        // one aperture per IMSIC group and leaves the gaps
+                        // between groups, which no table names, unseeded.
                         let base = read_u64(table, off + 24);
                         let size = u64::from(read_u32(table, off + 32));
-                        if let Some(end) = base.checked_add(size)
-                            && base != 0
-                            && size != 0
+                        if base != 0 && base.checked_add(size).is_some()
                         {
-                            imsic_span = Some(match imsic_span
-                            {
-                                Some((lo, hi)) => (lo.min(base), hi.max(end)),
-                                None => (base, end),
-                            });
+                            push!(base, size);
                         }
                     }
                     _ =>
                     {}
                 }
                 off += entry_len;
-            }
-            if let Some((lo, hi)) = imsic_span
-            {
-                push!(lo, hi - lo);
             }
             if lapic != 0
             {
@@ -1522,14 +1512,12 @@ mod tests
         assert_eq!(aia.off_layout_hart, None);
     }
 
-    // Defect caught: the APLIC or the IMSIC files missing from the aperture
-    // seeds, so devmgr has no aperture to carve them from; or one seed per
-    // hart instead of one span.
-    #[test]
-    fn the_qemu_virt_aia_madt_seeds_the_aplic_and_the_imsic_files()
+    /// The named seeds, sorted, that the ACPI walk finds in an XSDT holding
+    /// only `madt`, less the arch's platform defaults.
+    fn madt_named_seeds(madt: &[u8]) -> Vec<(u64, u64)>
     {
         let mut xsdt_body = Vec::new();
-        xsdt_body.extend_from_slice(&(QEMU_VIRT_AIA_MADT.as_ptr() as u64).to_le_bytes());
+        xsdt_body.extend_from_slice(&(madt.as_ptr() as u64).to_le_bytes());
         let xsdt = sdt(b"XSDT", &xsdt_body);
         let mut rsdp = vec![0u8; 36];
         rsdp[..8].copy_from_slice(RSDP_SIG);
@@ -1555,7 +1543,54 @@ mod tests
             .map(|a| (a.phys_base, a.size))
             .collect();
         seeds.sort_unstable();
-        assert_eq!(seeds, [(0xd00_0000, 0x8000), (0x2800_0000, 0x4000)]);
+        seeds
+    }
+
+    // Defect caught: the APLIC or the IMSIC files missing from the aperture
+    // seeds, so devmgr has no aperture to carve them from.
+    #[test]
+    fn the_qemu_virt_aia_madt_seeds_the_aplic_and_the_imsic_files()
+    {
+        assert_eq!(
+            madt_named_seeds(QEMU_VIRT_AIA_MADT),
+            [
+                (0xd00_0000, 0x8000),
+                (0x2800_0000, 0x1000),
+                (0x2800_1000, 0x1000),
+                (0x2800_2000, 0x1000),
+                (0x2800_3000, 0x1000),
+            ]
+        );
+    }
+
+    // Defect caught: one seed spanning every hart's file, which with two
+    // IMSIC groups covers the address space between the groups that no table
+    // names (QEMU `virt` with two sockets puts group 1 at `0x2900_0000`).
+    #[test]
+    fn the_imsic_seeds_leave_the_gap_between_groups_unseeded()
+    {
+        let mut madt = QEMU_VIRT_AIA_MADT.to_vec();
+        for (hart, file) in [(2, 0x2900_0000u64), (3, 0x2900_1000)]
+        {
+            let at = qemu_rintc_off(hart) + 24;
+            madt[at..at + 8].copy_from_slice(&file.to_le_bytes());
+        }
+        let seeds = madt_named_seeds(&madt);
+        assert_eq!(
+            seeds,
+            [
+                (0xd00_0000, 0x8000),
+                (0x2800_0000, 0x1000),
+                (0x2800_1000, 0x1000),
+                (0x2900_0000, 0x1000),
+                (0x2900_1000, 0x1000),
+            ]
+        );
+        assert!(
+            !seeds
+                .iter()
+                .any(|&(base, size)| base <= 0x2800_2000 && 0x2800_2000 < base + size)
+        );
     }
 
     // Defect caught: Ssaia missing from the extensions the RHCT ISA string is

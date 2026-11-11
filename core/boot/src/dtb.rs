@@ -789,14 +789,11 @@ impl Fdt
         report_walk_limits(too_deep, false);
     }
 
-    /// Walk the enabled CPU nodes' interrupt controllers and call
-    /// `callback(phandle, hart_id)` for each: a `riscv,cpu-intc` child, with
-    /// a `phandle`, of a CPU node `walk_cpu_nodes` reports (`compatible =
-    /// "riscv"`, a one-cell `reg`, not `status = "disabled"`).
-    ///
-    /// Relies on the devicetree rule that a node's properties precede its
-    /// child nodes, so the CPU node's own properties are known when its
-    /// controller child closes.
+    /// Call `callback(phandle, hart_id)` for each CPU node `walk_cpu_nodes`
+    /// reports (`compatible = "riscv"`, a one-cell `reg`, not `status =
+    /// "disabled"`), `phandle` being that of its first `riscv,cpu-intc` child
+    /// with a `phandle`, or 0 when it has none: dtc gives a node a `phandle`
+    /// only when something references it.
     ///
     /// `callback` returns `true` to continue or `false` to stop early.
     // too_many_lines: DTB traversal state machine; splitting would fragment the
@@ -814,6 +811,8 @@ impl Fdt
             hart_id: Option<u32>,
             is_cpu_intc: bool,
             phandle: u32,
+            /// Of a CPU node: its first `riscv,cpu-intc` child's `phandle`.
+            intc_phandle: u32,
         }
         const EMPTY: IntcState = IntcState {
             is_riscv_cpu: false,
@@ -821,6 +820,7 @@ impl Fdt
             hart_id: None,
             is_cpu_intc: false,
             phandle: 0,
+            intc_phandle: 0,
         };
 
         let mut states = [EMPTY; MAX_DEPTH];
@@ -858,18 +858,22 @@ impl Fdt
                         break;
                     }
                     depth -= 1;
-                    if depth == 0 || depth >= MAX_DEPTH
+                    if depth >= MAX_DEPTH
                     {
                         continue;
                     }
                     let s = states[depth];
-                    let cpu = states[depth - 1];
                     if s.is_cpu_intc
                         && s.phandle != 0
-                        && cpu.is_riscv_cpu
-                        && !cpu.disabled
-                        && let Some(hart_id) = cpu.hart_id
-                        && !callback(s.phandle, hart_id)
+                        && depth > 0
+                        && states[depth - 1].intc_phandle == 0
+                    {
+                        states[depth - 1].intc_phandle = s.phandle;
+                    }
+                    if s.is_riscv_cpu
+                        && !s.disabled
+                        && let Some(hart_id) = s.hart_id
+                        && !callback(s.intc_phandle, hart_id)
                     {
                         break;
                     }
@@ -1423,9 +1427,10 @@ fn discover_aia(fdt: &Fdt) -> DtbAia
         .0;
     let mut off_layout = None;
     fdt.walk_cpu_intc(|phandle, hart_id| {
+        // Phandle 0: the hart has no referenced controller, so no entry.
         let file = entries
             .iter()
-            .position(|e| read_be32(e) == phandle)
+            .position(|e| phandle != 0 && read_be32(e) == phandle)
             .and_then(|i| imsic_file_in_regs(&imsic, i as u64, stride));
         if file.is_none() || file != layout.s_file_address(u64::from(hart_id))
         {
@@ -2338,7 +2343,9 @@ mod tests
     /// is `aplic_parent`, the machine-level IMSIC (phandle `0x20`) and the
     /// supervisor-level IMSIC (phandle `0x21`, two files at `0x2800_0000`)
     /// whose `interrupts-extended` lists the harts in `ie_harts` order.
-    fn aia_tree(ie_harts: &[u32], aplic_parent: u32) -> Vec<u8>
+    /// `hart1_intc` shapes hart 1's controller: `Some(true)` as above,
+    /// `Some(false)` with no `phandle`, `None` absent.
+    fn aia_tree(ie_harts: &[u32], aplic_parent: u32, hart1_intc: Option<bool>) -> Vec<u8>
     {
         fn reg(base: u64, size: u64) -> Vec<u8>
         {
@@ -2361,10 +2368,17 @@ mod tests
             b.begin_node(b"cpu");
             b.prop(b"compatible", b"riscv\0");
             b.prop(b"reg", &hart.to_be_bytes());
-            b.begin_node(b"interrupt-controller");
-            b.prop(b"compatible", b"riscv,cpu-intc\0");
-            b.prop(b"phandle", &(0x10 + hart).to_be_bytes());
-            b.end_node();
+            let intc = if hart == 1 { hart1_intc } else { Some(true) };
+            if let Some(phandle) = intc
+            {
+                b.begin_node(b"interrupt-controller");
+                b.prop(b"compatible", b"riscv,cpu-intc\0");
+                if phandle
+                {
+                    b.prop(b"phandle", &(0x10 + hart).to_be_bytes());
+                }
+                b.end_node();
+            }
             b.end_node();
         }
         b.end_node();
@@ -2402,12 +2416,12 @@ mod tests
     #[test]
     fn an_imsic_listing_the_harts_out_of_id_order_is_refused()
     {
-        let in_order = aia(&aia_tree(&[0, 1], 0x21));
+        let in_order = aia(&aia_tree(&[0, 1], 0x21, Some(true)));
         assert_eq!(in_order.imsic.base, 0x2800_0000);
         assert_eq!(in_order.imsic.hart_index_bits, 1);
         assert_eq!(in_order.off_layout_hart, None);
 
-        let swapped = aia(&aia_tree(&[1, 0], 0x21));
+        let swapped = aia(&aia_tree(&[1, 0], 0x21, Some(true)));
         assert_eq!(swapped.imsic, ImsicLayout::zero());
         assert_eq!(swapped.off_layout_hart, Some(0));
     }
@@ -2417,9 +2431,24 @@ mod tests
     #[test]
     fn an_imsic_missing_a_hart_is_refused()
     {
-        let found = aia(&aia_tree(&[0], 0x21));
+        let found = aia(&aia_tree(&[0], 0x21, Some(true)));
         assert_eq!(found.imsic, ImsicLayout::zero());
         assert_eq!(found.off_layout_hart, Some(1));
+    }
+
+    // Defect caught: an enabled hart whose `riscv,cpu-intc` has no `phandle`
+    // (nothing references it, so dtc emits none), or that has no controller,
+    // skipped by the check, so the IMSIC is reported although the hart has no
+    // file in it.
+    #[test]
+    fn an_imsic_is_refused_when_a_hart_has_no_referenced_controller()
+    {
+        for hart1_intc in [Some(false), None]
+        {
+            let found = aia(&aia_tree(&[0], 0x21, hart1_intc));
+            assert_eq!(found.imsic, ImsicLayout::zero(), "{hart1_intc:?}");
+            assert_eq!(found.off_layout_hart, Some(1), "{hart1_intc:?}");
+        }
     }
 
     // Defect caught: the first `riscv,aplic` node in tree order taken as the
@@ -2428,7 +2457,13 @@ mod tests
     #[test]
     fn the_aplic_is_the_one_whose_msi_parent_is_the_supervisor_imsic()
     {
-        assert_eq!(aia(&aia_tree(&[0, 1], 0x21)).aplic.base, 0xd00_0000);
-        assert_eq!(aia(&aia_tree(&[0, 1], 0x20)).aplic, AplicDomain::zero());
+        assert_eq!(
+            aia(&aia_tree(&[0, 1], 0x21, Some(true))).aplic.base,
+            0xd00_0000
+        );
+        assert_eq!(
+            aia(&aia_tree(&[0, 1], 0x20, Some(true))).aplic,
+            AplicDomain::zero()
+        );
     }
 }

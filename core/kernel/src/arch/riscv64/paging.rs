@@ -23,6 +23,9 @@
 //! # PTE layout (identical in every mode)
 //! Bits \[53:10\]: PPN (physical page number, 44 bits).
 //! Bit 0: V (Valid). Bit 1: R (Read). Bit 2: W (Write). Bit 3: X (Execute).
+//! Bits \[9:8\]: RSW, ignored by hardware: a user leaf's grant
+//! (`encoding::PTE_GRANT_WRITE`, `encoding::PTE_GRANT_EXECUTE`), a table
+//! pointer's [`POOLED_TABLE`] mark.
 //! Bits \[62:61\]: PBMT (Svpbmt page-based memory type; 00=PMA, 01=NC,
 //! 10=IO). Bit 63: N (Svnapot naturally-aligned power-of-two contiguity).
 //! Non-leaf: V=1, R=0, W=0, X=0. Leaf: V=1, at least one of R/W/X set.
@@ -38,7 +41,7 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 pub use boot_protocol::riscv_paging::PagingMode;
 use boot_protocol::riscv_paging::{next_level_boundary, vpn_index};
 
-use crate::mm::paging::{PageFlags, PagingError, PoolState, UserAccess};
+use crate::mm::paging::{LeafGrant, PageFlags, PagingError, PoolState, UserAccess};
 
 // ── Active paging mode ────────────────────────────────────────────────────────
 
@@ -158,7 +161,9 @@ const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
 /// address space's own page-table pool (`rv_walk_or_alloc_pooled`). A
 /// reclaiming unmap frees an empty table to that pool only when its parent
 /// entry carries this bit; tables from `kernel_pt_pool` (the kernel-direct
-/// `map_page` path) do not.
+/// `map_page` path) do not. On a leaf, the same bit is the grant's write
+/// (`encoding::PTE_GRANT_WRITE`); every reader of this one first checks that
+/// the entry is a table pointer (no R, W or X).
 const POOLED_TABLE: u64 = 1 << 8;
 /// Svpbmt PBMT field, bits \[62:61\]: 00=PMA (defer to platform memory
 /// attributes), 01=NC (non-cacheable idempotent main memory), 10=IO.
@@ -730,7 +735,8 @@ pub unsafe fn read_root_phys() -> u64
 /// `root_virt`, allocating missing intermediate frames from the kernel PT
 /// pool.
 ///
-/// Sets U (user) bit so userspace can access the mapping.
+/// Sets U (user) bit so userspace can access the mapping, and records `grant`
+/// in the leaf's RSW bits.
 ///
 /// # Errors
 /// Returns `Err(())` if the pool is exhausted.
@@ -744,6 +750,7 @@ pub unsafe fn map_user_page(
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
+    grant: LeafGrant,
 ) -> Result<crate::mm::paging::MapOutcome, ()>
 {
     use crate::mm::paging::phys_to_virt;
@@ -761,13 +768,13 @@ pub unsafe fn map_user_page(
             rv_walk_or_alloc(e).map(phys_to_virt)
         })?
     };
-    Ok(install_user_leaf(l0, virt, phys, flags))
+    Ok(install_user_leaf(l0, virt, phys, flags, grant))
 }
 
 /// Shared leaf-install tail of [`map_user_page`] / [`map_user_page_pooled`]:
 /// demote any NAPOT group the slot belongs to (so the prior PTE read for
 /// classification is always a plain per-page leaf), install the new leaf
-/// with the U bit, classify the rewrite, and opportunistically promote the
+/// with the U bit and the RSW bits of `grant`, classify the rewrite, and opportunistically promote the
 /// containing group when the new mapping is uncacheable.
 #[cfg(not(test))]
 fn install_user_leaf(
@@ -775,6 +782,7 @@ fn install_user_leaf(
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
+    grant: LeafGrant,
 ) -> crate::mm::paging::MapOutcome
 {
     if l0[vpn_index(0, virt)].0 & NAPOT != 0
@@ -782,7 +790,7 @@ fn install_user_leaf(
         demote_napot_64k(l0, virt);
     }
     let mut pte = PageTableEntry::new_page(phys, flags);
-    pte.0 |= USER;
+    pte.0 |= USER | super::encoding::grant_bits(grant);
     let prior = l0[vpn_index(0, virt)].0;
     l0[vpn_index(0, virt)] = pte;
     let outcome = classify_user_map(prior, pte.0);
@@ -812,7 +820,7 @@ fn rv_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 
 /// Map a single 4 KiB user page, drawing intermediate page-table frames from
 /// an `AddressSpaceObject`'s growth pool instead of the kernel page-table
-/// pool.
+/// pool. The leaf records `grant` in its RSW bits.
 ///
 /// # Safety
 /// Same contract as [`map_user_page`]. `aso` must be the wrapper paired
@@ -823,6 +831,7 @@ pub unsafe fn map_user_page_pooled(
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
+    grant: LeafGrant,
     aso: &crate::cap::object::AddressSpaceObject,
 ) -> Result<crate::mm::paging::MapOutcome, ()>
 {
@@ -840,7 +849,7 @@ pub unsafe fn map_user_page_pooled(
         })?
     };
 
-    Ok(install_user_leaf(l0, virt, phys, flags))
+    Ok(install_user_leaf(l0, virt, phys, flags, grant))
 }
 
 /// Pooled equivalent of [`rv_walk_or_alloc`]: pulls a freshly-zeroed PT
@@ -1525,10 +1534,12 @@ pub unsafe fn flush_kernel_page(virt: u64)
 
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.
 ///
-/// Returns `Err(PagingError::NotMapped)` if any level is not present. On
-/// success, rewrites the leaf PTE with the rights of `flags` (preserving the
-/// physical address, the USER bit, and the leaf's memory type (PBMT),
-/// whatever `flags.uncacheable` says), calls `flush_page`, and returns the
+/// Returns `Err(PagingError::NotMapped)` if any level is not present, and
+/// `Err(PagingError::NotGranted)`, leaving the leaf's rights as they were, if
+/// `flags` asks for W or X the leaf's grant lacks. On success, rewrites the leaf PTE with the
+/// rights of `flags` (preserving the physical address, the USER bit, the
+/// grant, and the leaf's memory type (PBMT), whatever `flags.uncacheable`
+/// says; `encoding::protected_leaf`), calls `flush_page`, and returns the
 /// [`MapOutcome`](crate::mm::paging::MapOutcome) classifying the rights change
 /// (a same-frame rewrite, so never `Fresh`).
 ///
@@ -1565,10 +1576,10 @@ pub unsafe fn protect_user_page(
 
     let prior = leaf.0;
     let phys = leaf.phys_addr();
-    let new_pte = PageTableEntry(super::encoding::keep_memory_type(
-        PageTableEntry::new_page(phys, flags).0 | USER,
+    let new_pte = PageTableEntry(super::encoding::protected_leaf(
         prior,
-    ));
+        PageTableEntry::new_page(phys, flags).0 | USER,
+    )?);
     *leaf = new_pte;
 
     // SAFETY: virt is mapped; flush_page is safe for any VA (and kills any
@@ -1687,6 +1698,13 @@ fn pte_permits_user_access(pte: u64, access: UserAccess) -> bool
 pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>
 {
     super::encoding::user_leaf_flags(pte)
+}
+
+/// The [`LeafGrant`] a user leaf PTE (from [`translate_user_page`]) records
+/// in its RSW bits (the decoder is `encoding::user_leaf_grant`).
+pub fn user_leaf_grant(pte: u64) -> LeafGrant
+{
+    super::encoding::user_leaf_grant(pte)
 }
 
 /// Classify a userspace page fault at `va` as a spurious stale-TLB fault.

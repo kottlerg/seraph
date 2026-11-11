@@ -144,6 +144,9 @@ pub enum PagingError
     /// The target virtual address is not mapped (returned by the protect walk,
     /// `AddressSpace::protect_page`).
     NotMapped,
+    /// A permission change asked for write or execute that the leaf's
+    /// [`LeafGrant`] lacks (returned by the protect walk).
+    NotGranted,
 }
 
 /// Why [`init_kernel_page_tables`] could not build the kernel's tables.
@@ -193,6 +196,44 @@ pub struct PageFlags
     /// non-cacheable, non-idempotent, strongly ordered), making MMIO
     /// attributes explicit rather than dependent on platform PMAs.
     pub uncacheable: bool,
+}
+
+/// The most a user leaf may ever allow: the Write and Execute rights of the
+/// capability that installed it, kept in two software bits of the leaf.
+///
+/// `SYS_MEM_MAP` records the Memory capability's rights, whatever protection
+/// the call asks for; `SYS_MMIO_MAP` records the Mmio capability's Write and
+/// never Execute; the kernel's own mappings for init record the rights they
+/// install. A permission change keeps the grant and refuses write or execute
+/// beyond it, and a text write of `SYS_THREAD_WRITE_MEM` reaches a read-only
+/// leaf only when it grants one of them (core/kernel/docs/memory-internals.md
+/// § Leaf Grant).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LeafGrant
+{
+    /// The installing capability carries Write.
+    pub writable: bool,
+    /// The installing capability carries Execute.
+    pub executable: bool,
+}
+
+impl LeafGrant
+{
+    /// The grant of a leaf whose most is its own rights, `flags`.
+    pub fn of(flags: PageFlags) -> Self
+    {
+        Self {
+            writable: flags.writable,
+            executable: flags.executable,
+        }
+    }
+
+    /// Whether a leaf with this grant may take the rights `flags`: write only
+    /// when it grants write, execute only when it grants execute.
+    pub fn admits(self, flags: PageFlags) -> bool
+    {
+        (self.writable || !flags.writable) && (self.executable || !flags.executable)
+    }
 }
 
 /// How a leaf-PTE rewrite changed an existing mapping, used to decide whether a
@@ -1260,6 +1301,51 @@ mod tests
 {
     use super::*;
     use boot_protocol::{MemoryMapEntry, MemoryMapSlice, MemoryType};
+
+    // ── Leaf grant ────────────────────────────────────────────────────────────
+
+    // The defect caught: a grant test that let a leaf take write or execute
+    // its installing capability lacked, so SYS_MEM_PROTECT would widen a
+    // read-only Mmio or Memory mapping past that capability (#868); or one
+    // that refused a right the grant holds, or a narrowing, so a protect
+    // within the mapping's capability would fail.
+    #[test]
+    fn a_grant_admits_only_the_rights_it_holds()
+    {
+        let rights = |writable, executable| PageFlags {
+            readable: true,
+            writable,
+            executable,
+            uncacheable: false,
+        };
+        let none = LeafGrant::default();
+        let write = LeafGrant {
+            writable: true,
+            executable: false,
+        };
+        let exec = LeafGrant {
+            writable: false,
+            executable: true,
+        };
+        let both = LeafGrant {
+            writable: true,
+            executable: true,
+        };
+        for grant in [none, write, exec, both]
+        {
+            assert!(grant.admits(rights(false, false)), "{grant:?}");
+        }
+        assert!(!none.admits(rights(true, false)));
+        assert!(!none.admits(rights(false, true)));
+        assert!(write.admits(rights(true, false)));
+        assert!(!write.admits(rights(false, true)));
+        assert!(exec.admits(rights(false, true)));
+        assert!(!exec.admits(rights(true, false)));
+        assert!(both.admits(rights(true, false)) && both.admits(rights(false, true)));
+        assert_eq!(LeafGrant::of(rights(true, false)), write);
+        assert_eq!(LeafGrant::of(rights(false, true)), exec);
+        assert_eq!(LeafGrant::of(rights(false, false)), none);
+    }
 
     // ── User fault access ────────────────────────────────────────────────────
 

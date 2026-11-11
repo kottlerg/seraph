@@ -110,6 +110,14 @@ authorities over the same physical memory. W^X is enforced at mapping time: the
 kernel rejects any `mem_map` or `mem_protect` call that would make a page
 simultaneously writable and executable.
 
+A page also stays within the rights of the capability that mapped it, which the kernel records
+in the page (its leaf grant): `mem_protect` makes a page writable only if that capability carried
+Write, and executable only if it carried Execute, whatever the rights of the Memory capability
+the call names, so a page mapped through a Map-only capability stays read-only. A
+`thread_write_mem` text write reaches a read-only page only when that capability carried Write
+or Execute (§ Thread). See
+[memory-internals.md § Leaf Grant](../core/kernel/docs/memory-internals.md#leaf-grant).
+
 The kernel mints Memory caps for all usable RAM at boot with `Map | Write |
 Execute | Retype | Phys` and places them in init's CSpace. Boot-module, init-segment,
 and reclaimed boot-scratch Memory caps carry the same full rights: cap rights
@@ -227,7 +235,8 @@ A capability to a specific physical address range (an MMIO aperture) used for
 memory-mapped I/O. Rights:
 - **Map** — may map the region into an address space
 - **Write** — may map the region writable (`sys_mmio_map` gates mapping
-  writability on it; MMIO mappings are never executable)
+  writability on it, and `sys_mem_protect` never makes the page writable without it; MMIO
+  mappings are never executable)
 
 Without this capability a process cannot map physical addresses — it cannot
 name hardware it has not been granted access to.
@@ -270,8 +279,10 @@ doing, but its address space holds whatever the process keeps, its secrets inclu
 it is as much authority over the process as rewriting its registers, which already lets the holder
 make the thread load and disclose any of that memory. The access reaches only the thread's own
 address space, and needs no `AddressSpace` capability. A write to a page the thread's mapping makes
-read-only (its text) is refused unless asked for, and refused outright on a frame mapped more than
-once, which could be another process's.
+read-only (its text) is refused unless asked for; refused outright on a page mapped through a
+capability with neither Write nor Execute (a firmware table, a page lent read-only), whose
+contents no capability lets the holder change or run (§ Memory); and refused outright on a frame
+mapped more than once, which could be another process's.
 
 ### CSpace
 

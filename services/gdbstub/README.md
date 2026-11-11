@@ -192,9 +192,10 @@ stub's endpoint.
   continue passing it. A `vCont` whose actions name no live thread is answered `E01`; a resume with
   no target, or after which every thread has exited, is answered `W00`.
 - **Memory.** `m`, `M`, and `X` read and write the target's address space through any held
-  thread's cap; a write that a read-only page refuses goes through the text route. Only pages
-  present in the space are reached, so a demand-paged page the target has not touched reads as an
-  error.
+  thread's cap; a write that a read-only page refuses goes through the text route, which reaches
+  text, mapped through a capability that carries Execute, but not read-only data such as `.rodata`
+  or RELRO, mapped through a Map-only one, so such a write is answered `E01`. Only pages present in
+  the space are reached, so a demand-paged page the target has not touched reads as an error.
 
 ---
 

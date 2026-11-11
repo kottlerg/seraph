@@ -158,7 +158,8 @@ pub enum CliCommand
     ReviewCheck(ReviewCheckArgs),
 
     /// Build `ledger.json` from the saved run records of a pull request's
-    /// pre-merge review: the findings a later run must not re-raise (see
+    /// pre-merge review, or print a release review's ledger for the files
+    /// named: the findings a later run must not re-raise (see
     /// xtask/README.md).
     ReviewLedger(ReviewLedgerArgs),
 
@@ -942,8 +943,22 @@ pub struct ReviewCheckArgs
 #[derive(Parser)]
 pub struct ReviewLedgerArgs
 {
-    /// The pull request's number.
-    pub pr: u64,
+    /// The pull request's number: write `ledger.json` beside its records.
+    #[arg(conflicts_with = "release")]
+    pub pr: Option<u64>,
+
+    /// The target version `X.Y.Z` of a release review: print its ledger, the
+    /// entries of the range's pull requests and of the release's own runs.
+    #[arg(long, requires = "from")]
+    pub release: Option<String>,
+
+    /// The previous release tag, where the release's range starts.
+    #[arg(long, requires = "release")]
+    pub from: Option<String>,
+
+    /// With `--release`, print only the entries for this file; repeatable.
+    #[arg(long, requires = "release")]
+    pub file: Vec<String>,
 }
 
 // ── IssueEdit / IssueFile ─────────────────────────────────────────────────────

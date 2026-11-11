@@ -4,31 +4,46 @@
 // xtask/src/commands/review.rs
 
 //! `review-check` and `review-ledger`: the saved run records of a pull
-//! request's pre-merge review (`target/xtask/review/pr<N>/<mode>-<head>.json`).
+//! request's pre-merge review (`target/xtask/review/pr<N>/<mode>-<head>.json`)
+//! and of a release review (`target/xtask/review/release-v<X.Y.Z>/`).
 //!
 //! `review-check` validates each record against the record shape
 //! (xtask/README.md § `cargo xtask review-check`), so the ledger and the
-//! merge gate read what they expect. `review-ledger` builds `ledger.json`,
-//! the findings a later run of the same PR must not re-raise
-//! (docs/conventions.md § Branch and PR Workflow). The merge gate of
-//! `pr-check --gate` reads the records through `gate_diags`.
+//! merge gate read what they expect. A record states the defect form
+//! (`stats.form` `defects`); one without `stats.form` is of the earlier form,
+//! with its finding classes and buckets, and is still read. `review-ledger`
+//! builds the ledger, the findings a later run must not re-raise
+//! (docs/conventions.md § Ledger): `ledger.json` for a pull request, or, for a
+//! release review, the entries of the range's pull requests and of the
+//! release's own runs, printed for the files a reviewer names. The merge gate
+//! of `pr-check --gate` reads the records through `gate_diags`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 use crate::cli::{ReviewCheckArgs, ReviewLedgerArgs};
 use crate::context::Context as BuildContext;
 use crate::diag::{Diag, Strictness, report};
-use crate::util::step;
+use crate::util::{run_cmd_capture, step};
 
-const VERDICTS: &[&str] = &[
+/// The reviewer verdicts of a defect-form record.
+const VERDICTS: &[&str] = &["READY TO MERGE", "BLOCKING ISSUES"];
+
+/// The reviewer verdicts of an earlier-form record, which had a non-blocking
+/// track.
+const EARLIER_VERDICTS: &[&str] = &[
     "READY TO MERGE",
     "NON-BLOCKING ISSUES ONLY",
     "BLOCKING ISSUES",
 ];
+
+/// The verdict of an earlier-form run that left only non-blocking findings.
+const NON_BLOCKING: &str = "NON-BLOCKING ISSUES ONLY";
+
 const AUDIT_VERDICTS: &[&str] = &["AUDIT PASS", "AUDIT FAIL"];
 
 /// The `audit_verdict` of a run of the reviewer alone, whose audit is still
@@ -39,6 +54,10 @@ const NOT_RUN: &str = "NOT RUN";
 /// audit alone.
 const MODES: &[&str] = &["full", "delta", "audit"];
 
+/// The value of `stats.form` in a record of the defect form.
+const DEFECT_FORM: &str = "defects";
+
+/// The finding classes and buckets of the earlier form.
 const CLASSES: &[&str] = &[
     "correctness",
     "safety",
@@ -49,13 +68,22 @@ const CLASSES: &[&str] = &[
     "style",
 ];
 const BUCKETS: &[&str] = &["critical", "should", "nit"];
-const STATUSES: &[&str] = &["unverified", "nit", "contested"];
+
+/// The statuses of a finding, by form.
+const STATUSES: &[&str] = &["unverified", "contested"];
+const EARLIER_STATUSES: &[&str] = &["unverified", "nit", "contested"];
 
 /// The finding lists of a record.
 const LISTS: &[&str] = &["findings", "recorded", "ledgered", "dropped"];
 
-/// The fields a ledger entry copies from a finding.
-const LEDGER_FIELDS: &[&str] = &[
+/// The fields of a defect-form finding, which a ledger entry copies.
+const DEFECT_FIELDS: &[&str] = &["file", "line", "status", "issue", "claim", "fix"];
+
+/// The fields only an earlier-form finding has.
+const EARLIER_ONLY_FIELDS: &[&str] = &["class", "bucket", "must_violation"];
+
+/// The fields an earlier-form finding has, which a ledger entry copies.
+const EARLIER_FIELDS: &[&str] = &[
     "file",
     "line",
     "class",
@@ -70,13 +98,59 @@ const LEDGER_FIELDS: &[&str] = &[
 /// A record: its file name and its parsed content.
 pub type Record = (String, Value);
 
+/// The two record forms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form
+{
+    /// One class of finding, a defect (docs/conventions.md § Findings).
+    Defects,
+    /// Classes, buckets, and a non-blocking track, as records were written
+    /// before the defect form.
+    Earlier,
+}
+
+impl Form
+{
+    fn of(record: &Value) -> Self
+    {
+        if record["stats"]["form"] == DEFECT_FORM
+        {
+            Form::Defects
+        }
+        else
+        {
+            Form::Earlier
+        }
+    }
+
+    fn verdicts(self) -> &'static [&'static str]
+    {
+        match self
+        {
+            Form::Defects => VERDICTS,
+            Form::Earlier => EARLIER_VERDICTS,
+        }
+    }
+
+    fn fields(self) -> &'static [&'static str]
+    {
+        match self
+        {
+            Form::Defects => DEFECT_FIELDS,
+            Form::Earlier => EARLIER_FIELDS,
+        }
+    }
+}
+
 /// The directory that holds the run records of pull request `pr`.
 pub fn record_dir(ctx: &BuildContext, pr: u64) -> PathBuf
 {
-    ctx.target_dir
-        .join("xtask")
-        .join("review")
-        .join(format!("pr{pr}"))
+    review_dir(ctx).join(format!("pr{pr}"))
+}
+
+fn review_dir(ctx: &BuildContext) -> PathBuf
+{
+    ctx.target_dir.join("xtask").join("review")
 }
 
 /// The parts of a run record's file name, `<mode>-<head>[-<n>].json`: the
@@ -145,7 +219,7 @@ fn one_of(out: &mut Vec<Diag>, name: &str, field: &str, value: &Value, allowed: 
     }
 }
 
-fn check_finding(out: &mut Vec<Diag>, name: &str, at: &str, finding: &Value)
+fn check_finding(out: &mut Vec<Diag>, name: &str, at: &str, finding: &Value, form: Form)
 {
     let Some(fields) = finding.as_object()
     else
@@ -153,33 +227,58 @@ fn check_finding(out: &mut Vec<Diag>, name: &str, at: &str, finding: &Value)
         out.push(shape(name, at, "is not an object"));
         return;
     };
-    for field in LEDGER_FIELDS
+    for field in form.fields()
     {
         if !fields.contains_key(*field)
         {
             out.push(shape(name, at, format!("has no `{field}`")));
         }
     }
-    for (field, allowed) in [
-        ("class", CLASSES),
-        ("bucket", BUCKETS),
-        ("status", STATUSES),
-    ]
+    match form
     {
-        if let Some(value) = fields.get(field)
+        Form::Defects =>
         {
-            one_of(out, name, &format!("{at}.{field}"), value, allowed);
+            for field in EARLIER_ONLY_FIELDS
+            {
+                if fields.contains_key(*field)
+                {
+                    out.push(shape(
+                        name,
+                        &format!("{at}.{field}"),
+                        "belongs to the earlier record form; a defect-form finding has no \
+                         class, bucket, or MUST flag",
+                    ));
+                }
+            }
+            if let Some(value) = fields.get("status")
+            {
+                one_of(out, name, &format!("{at}.status"), value, STATUSES);
+            }
         }
-    }
-    if fields
-        .get("must_violation")
-        .is_some_and(|v| !v.is_boolean())
-    {
-        out.push(shape(
-            name,
-            &format!("{at}.must_violation"),
-            "is not a boolean",
-        ));
+        Form::Earlier =>
+        {
+            for (field, allowed) in [
+                ("class", CLASSES),
+                ("bucket", BUCKETS),
+                ("status", EARLIER_STATUSES),
+            ]
+            {
+                if let Some(value) = fields.get(field)
+                {
+                    one_of(out, name, &format!("{at}.{field}"), value, allowed);
+                }
+            }
+            if fields
+                .get("must_violation")
+                .is_some_and(|v| !v.is_boolean())
+            {
+                out.push(shape(
+                    name,
+                    &format!("{at}.must_violation"),
+                    "is not a boolean",
+                ));
+            }
+        }
     }
 }
 
@@ -188,7 +287,13 @@ fn check_finding(out: &mut Vec<Diag>, name: &str, at: &str, finding: &Value)
 /// any other record carries an audit verdict and its result.
 fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
 {
-    one_of(out, name, "verdict", &record["verdict"], VERDICTS);
+    one_of(
+        out,
+        name,
+        "verdict",
+        &record["verdict"],
+        Form::of(record).verdicts(),
+    );
     if record.get("audit").is_none()
     {
         out.push(shape(
@@ -259,6 +364,7 @@ fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
 /// The four finding lists and each finding in them.
 fn check_lists(out: &mut Vec<Diag>, name: &str, record: &Value)
 {
+    let form = Form::of(record);
     for list in LISTS
     {
         match record[*list].as_array()
@@ -267,7 +373,7 @@ fn check_lists(out: &mut Vec<Diag>, name: &str, record: &Value)
             {
                 for (index, finding) in findings.iter().enumerate()
                 {
-                    check_finding(out, name, &format!("{list}[{index}]"), finding);
+                    check_finding(out, name, &format!("{list}[{index}]"), finding, form);
                 }
             }
             None => out.push(shape(name, list, "is not a list")),
@@ -279,6 +385,10 @@ fn check_lists(out: &mut Vec<Diag>, name: &str, record: &Value)
 fn check_stats(out: &mut Vec<Diag>, name: &str, stats: &Value)
 {
     one_of(out, name, "stats.mode", &stats["mode"], MODES);
+    if let Some(form) = stats.get("form")
+    {
+        one_of(out, name, "stats.form", form, &[DEFECT_FORM]);
+    }
     if !stats["failed"].is_array()
     {
         out.push(shape(name, "stats.failed", "is not a list"));
@@ -351,26 +461,30 @@ fn run_number(record: &Value) -> u64
 }
 
 /// Whether a record's run passes: `AUDIT PASS`, no failed agent, and a
-/// reviewer verdict that is not `BLOCKING ISSUES`.
+/// reviewer verdict of `READY TO MERGE`, or, in an earlier-form record,
+/// `NON-BLOCKING ISSUES ONLY`.
 fn passes(record: &Value) -> bool
 {
+    let verdict_passes = match record["verdict"].as_str()
+    {
+        Some("READY TO MERGE") => true,
+        Some(NON_BLOCKING) => Form::of(record) == Form::Earlier,
+        _ => false,
+    };
     record["audit_verdict"] == "AUDIT PASS"
         && record["stats"]["failed"]
             .as_array()
             .is_some_and(Vec::is_empty)
-        && matches!(
-            record["verdict"].as_str(),
-            Some("READY TO MERGE" | "NON-BLOCKING ISSUES ONLY")
-        )
+        && verdict_passes
 }
 
-/// The last run at `head`: the record there with the greatest `stats.run`.
-/// An error when no record names the head, when one of them is malformed (it
-/// could be the last and cannot be placed), or when two carry one number.
-fn last_run<'a>(records: &'a [Record], head: &str) -> Result<&'a Record, Vec<Diag>>
+/// The runs at `head`, ordered by `stats.run`, the last run last. An error
+/// when no record names the head, when one of them is malformed (it could be
+/// the last and cannot be placed), or when two carry the last run's number.
+fn runs_at<'a>(records: &'a [Record], head: &str) -> Result<Vec<&'a Record>, Vec<Diag>>
 {
     let at = head.get(..8).unwrap_or(head);
-    let here: Vec<&Record> = records
+    let mut here: Vec<&Record> = records
         .iter()
         .filter(|(name, _)| names_head(name, head))
         .collect();
@@ -382,7 +496,8 @@ fn last_run<'a>(records: &'a [Record], head: &str) -> Result<&'a Record, Vec<Dia
     {
         return Err(malformed);
     }
-    let Some(last) = here.iter().max_by_key(|(_, record)| run_number(record))
+    here.sort_by_key(|(_, record)| run_number(record));
+    let Some(last) = here.last()
     else
     {
         return Err(vec![Diag::error(
@@ -400,19 +515,38 @@ fn last_run<'a>(records: &'a [Record], head: &str) -> Result<&'a Record, Vec<Dia
             format!("two run records at this head carry `stats.run` {number}"),
         )]);
     }
-    Ok(last)
+    Ok(here)
 }
 
-/// The merge condition's record part (docs/conventions.md § Branch
-/// and PR Workflow): the last run at `head` has no failed agent, `AUDIT
-/// PASS`, and a reviewer verdict that is not `BLOCKING ISSUES`. An earlier
-/// passing run at the same head does not count.
+/// The run of the reviewer alone that the last run at a head completes: the
+/// run before it at the head, when the last run is an `audit` record and that
+/// run has `audit_verdict` `NOT RUN` (docs/conventions.md § Pre-merge review).
+fn completed_run<'a>(runs: &[&'a Record]) -> Option<&'a Record>
+{
+    let [.., before, last] = runs
+    else
+    {
+        return None;
+    };
+    (last.1["stats"]["mode"] == "audit" && before.1["audit_verdict"] == NOT_RUN).then_some(*before)
+}
+
+/// The merge condition's record part (docs/conventions.md § Pre-merge
+/// review): the last run at `head` has no failed agent, `AUDIT PASS`, and a
+/// reviewer verdict of `READY TO MERGE` (or, in an earlier-form record,
+/// `NON-BLOCKING ISSUES ONLY`). An earlier passing run at the same head does
+/// not count.
 pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
 {
-    let (name, record) = match last_run(records, head)
+    let runs = match runs_at(records, head)
     {
-        Ok(last) => last,
+        Ok(runs) => runs,
         Err(diags) => return diags,
+    };
+    let Some((name, record)) = runs.last().copied()
+    else
+    {
+        return Vec::new();
     };
     if record["audit_verdict"] == NOT_RUN
     {
@@ -429,31 +563,43 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
             "gate-review-record",
             name.as_str(),
             "the last run at this head does not have AUDIT PASS, no failed agent, and a \
-             verdict of READY TO MERGE or NON-BLOCKING ISSUES ONLY",
+             verdict of READY TO MERGE (or, in an earlier-form record, NON-BLOCKING ISSUES \
+             ONLY)",
         )];
     }
-    let open = record["findings"].as_array().map_or(0, |findings| {
-        findings.iter().filter(|f| needs_reader(f)).count()
-    });
-    if record["verdict"] == "NON-BLOCKING ISSUES ONLY" && open > 0
+    // An audit that completes a run of the reviewer alone judges that run:
+    // its verdict and its findings are the run's as much as the audit's.
+    let judged: Vec<&Value> = std::iter::once(record)
+        .chain(completed_run(&runs).map(|(_, r)| r))
+        .collect();
+    let non_blocking = judged.iter().any(|r| r["verdict"] == NON_BLOCKING);
+    let mut open: Vec<&Value> = judged
+        .iter()
+        .flat_map(|r| r["findings"].as_array().into_iter().flatten())
+        .filter(|f| needs_reader(f))
+        .collect();
+    open.sort_by_key(|f| f.to_string());
+    open.dedup();
+    if non_blocking && !open.is_empty()
     {
         return vec![Diag::warning(
             "gate-findings-recorded",
             name.as_str(),
             format!(
-                "{open} finding(s) stay on the surface; confirm each is recorded and none is \
-                 contested"
+                "{} finding(s) stay on the surface; confirm each is recorded and none is \
+                 contested",
+                open.len()
             ),
         )];
     }
     Vec::new()
 }
 
-/// Whether the gate's reader must look at `finding`: one an Issue must
-/// record (docs/conventions.md § Recording findings: every finding but one
-/// of class `style` that is not a MUST violation, whose record is the run
-/// record), or one of any class that is contested, since the merge condition
-/// lets no contested finding stand unresolved.
+/// Whether the gate's reader must look at an earlier-form finding a
+/// `NON-BLOCKING ISSUES ONLY` run left: one an Issue had to record (every
+/// finding but one of class `style` that is not a MUST violation, whose
+/// record was the run record), or one of any class that is contested, since
+/// the merge condition lets no contested finding stand unresolved.
 fn needs_reader(finding: &Value) -> bool
 {
     finding["class"] != "style"
@@ -461,11 +607,11 @@ fn needs_reader(finding: &Value) -> bool
         || finding["status"] == "contested"
 }
 
-/// Build the ledger from every record of a PR: the findings each run
-/// recorded or dropped, its contested findings, and, after a `NON-BLOCKING
-/// ISSUES ONLY` run, its surface findings, each tagged with the run's head.
-/// Entries are unique and sorted.
-pub fn ledger(records: &[Record]) -> Value
+/// The ledger of a set of records: the findings each run recorded or
+/// dropped, its contested findings that `settled` admits, and, after an
+/// earlier-form `NON-BLOCKING ISSUES ONLY` run, its surface findings, each
+/// tagged with the run's head. Entries are unique and sorted.
+fn ledger_of(records: &[Record], settled: impl Fn(&Value) -> bool) -> Vec<Value>
 {
     let mut entries: Vec<Value> = Vec::new();
     for (_, record) in records
@@ -477,26 +623,82 @@ pub fn ledger(records: &[Record]) -> Value
             .take(8)
             .collect();
         let list = |key: &str| record[key].as_array().cloned().unwrap_or_default();
-        let non_blocking = record["verdict"] == "NON-BLOCKING ISSUES ONLY";
+        let non_blocking = record["verdict"] == NON_BLOCKING;
         let kept = list("recorded").into_iter().chain(list("dropped")).chain(
             list("findings")
                 .into_iter()
-                .filter(|f| non_blocking || f["status"] == "contested"),
+                .filter(|f| non_blocking || (f["status"] == "contested" && settled(f))),
         );
         for finding in kept
         {
             let mut entry = Map::new();
             entry.insert("run".to_owned(), json!(run));
-            for field in LEDGER_FIELDS
+            for field in EARLIER_FIELDS
             {
-                entry.insert((*field).to_owned(), finding[*field].clone());
+                if let Some(value) = finding.get(*field)
+                {
+                    entry.insert((*field).to_owned(), value.clone());
+                }
             }
             entries.push(Value::Object(entry));
         }
     }
     entries.sort_by_key(Value::to_string);
     entries.dedup();
-    Value::Array(entries)
+    entries
+}
+
+/// The ledger of a pull request's runs. A contested finding there is one
+/// its author disputed, which § Contested findings decides.
+pub fn ledger(records: &[Record]) -> Value
+{
+    Value::Array(ledger_of(records, |_| true))
+}
+
+/// The ledger part of a release review's own runs. The workflow marks a
+/// finding `contested` when its two refuters split, which settles nothing:
+/// such a finding enters the ledger only once the maintainer's decision is
+/// saved on it as `ruling`.
+fn release_ledger(records: &[Record]) -> Vec<Value>
+{
+    ledger_of(records, |f| {
+        f.get("ruling")
+            .is_some_and(|r| r.as_str().is_some_and(|s| !s.trim().is_empty()))
+    })
+}
+
+/// The pull requests whose merges `git log --first-parent --format=%s`
+/// lists, in its order: each subject `Merge pull request #N ...`.
+fn merged_prs(subjects: &str) -> Vec<u64>
+{
+    subjects
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("Merge pull request #")?;
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            let after = &rest[digits.len()..];
+            (after.is_empty() || after.starts_with(' '))
+                .then(|| digits.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// Keep the entries whose `file` is one of `files`; all when none is named.
+fn for_files(entries: Vec<Value>, files: &[String]) -> Vec<Value>
+{
+    if files.is_empty()
+    {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|e| {
+            e["file"]
+                .as_str()
+                .is_some_and(|f| files.iter().any(|w| w.trim_start_matches("./") == f))
+        })
+        .collect()
 }
 
 /// Entry point for `cargo xtask review-check`.
@@ -516,7 +718,18 @@ pub fn run_check(ctx: &BuildContext, args: &ReviewCheckArgs) -> Result<()>
 /// Entry point for `cargo xtask review-ledger`.
 pub fn run_ledger(ctx: &BuildContext, args: &ReviewLedgerArgs) -> Result<()>
 {
-    let dir = record_dir(ctx, args.pr);
+    match (args.pr, &args.release)
+    {
+        (Some(pr), None) => write_pr_ledger(ctx, pr),
+        (None, Some(version)) => print_release_ledger(ctx, version, args),
+        _ => bail!("name a pull request number, or --release <X.Y.Z> with --from <ref>"),
+    }
+}
+
+/// Write `ledger.json` beside a pull request's run records.
+fn write_pr_ledger(ctx: &BuildContext, pr: u64) -> Result<()>
+{
+    let dir = record_dir(ctx, pr);
     step(&format!("Building the ledger in {}", dir.display()));
     let records = read_records(&dir)?;
     let ledger = ledger(&records);
@@ -532,6 +745,68 @@ pub fn run_ledger(ctx: &BuildContext, args: &ReviewLedgerArgs) -> Result<()>
         records.len(),
         path.display()
     );
+    Ok(())
+}
+
+/// Print the release ledger as JSON on stdout: the ledger entries of every
+/// pull request merged in `<from>..HEAD` and of the release's own runs,
+/// limited to the files named. The account goes to stderr, so stdout holds
+/// the JSON alone.
+fn print_release_ledger(ctx: &BuildContext, version: &str, args: &ReviewLedgerArgs) -> Result<()>
+{
+    let valid = version.split('.').count() == 3
+        && version
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    if !valid
+    {
+        bail!("--release takes the target version X.Y.Z, not {version}");
+    }
+    let Some(from) = &args.from
+    else
+    {
+        bail!("--release needs --from <previous release tag>");
+    };
+    let subjects = run_cmd_capture(
+        Command::new("git")
+            .args([
+                "log",
+                "--first-parent",
+                "--format=%s",
+                &format!("{from}..HEAD"),
+            ])
+            .current_dir(&ctx.root),
+    )?;
+    let prs = merged_prs(&subjects);
+    let mut entries = Vec::new();
+    let mut read = 0;
+    for pr in &prs
+    {
+        let dir = record_dir(ctx, *pr);
+        if dir.is_dir()
+        {
+            let records = read_records(&dir)?;
+            read += records.len();
+            entries.extend(ledger_of(&records, |_| true));
+        }
+    }
+    let release_dir = review_dir(ctx).join(format!("release-v{version}"));
+    if release_dir.is_dir()
+    {
+        let records = read_records(&release_dir)?;
+        read += records.len();
+        entries.extend(release_ledger(&records));
+    }
+    let mut entries = for_files(entries, &args.file);
+    entries.sort_by_key(Value::to_string);
+    entries.dedup();
+    eprintln!(
+        "review-ledger: {} entries, from {read} record(s) of {} pull request(s) and \
+         release-v{version}",
+        entries.len(),
+        prs.len()
+    );
+    println!("{}", serde_json::to_string_pretty(&Value::Array(entries))?);
     Ok(())
 }
 
@@ -1015,5 +1290,173 @@ mod tests
         assert_eq!(claims, ["a nit", "disputed", "dropped", "off surface"]);
         assert_eq!(ledger[0]["run"], "0a82b0aa");
         assert!(ledger[0].get("stats").is_none());
+    }
+
+    /// A defect-form finding.
+    fn defect(claim: &str, status: &str) -> Value
+    {
+        json!({
+            "file": "core/kernel/src/a.rs", "line": 10, "status": status,
+            "issue": null, "claim": claim, "fix": "check the bound"
+        })
+    }
+
+    /// A defect-form record.
+    fn defect_record(verdict: &str, findings: Vec<Value>) -> Value
+    {
+        let mut r = record(verdict, "AUDIT PASS", findings);
+        r["stats"]["form"] = json!("defects");
+        r
+    }
+
+    #[test]
+    fn a_defect_form_record_is_well_formed()
+    {
+        for verdict in ["READY TO MERGE", "BLOCKING ISSUES"]
+        {
+            let r = defect_record(verdict, vec![defect("a", "unverified"), defect("b", "contested")]);
+            assert!(check_record(NAME, &r).is_empty(), "{verdict}");
+        }
+    }
+
+    #[test]
+    fn a_defect_form_record_has_no_non_blocking_verdict_nit_or_class()
+    {
+        let mut r = defect_record("NON-BLOCKING ISSUES ONLY", vec![defect("a", "nit")]);
+        r["recorded"] = json!([finding("earlier", "unverified")]);
+        assert_eq!(
+            fields(&r),
+            [
+                "verdict",
+                "findings[0].status",
+                "recorded[0].class",
+                "recorded[0].bucket",
+                "recorded[0].must_violation",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_record_form_is_reported()
+    {
+        let mut r = passing();
+        r["stats"]["form"] = json!("defect");
+        assert_eq!(fields(&r), ["stats.form"]);
+    }
+
+    #[test]
+    fn the_gate_passes_a_ready_defect_form_run_and_fails_a_blocking_one()
+    {
+        let ready = vec![(NAME.to_owned(), defect_record("READY TO MERGE", vec![]))];
+        assert!(gate_diags(&ready, HEAD).is_empty());
+        let blocking = vec![(
+            NAME.to_owned(),
+            defect_record("BLOCKING ISSUES", vec![defect("a", "unverified")]),
+        )];
+        assert_eq!(rules(&gate_diags(&blocking, HEAD)), ["gate-review-record"]);
+        // A non-blocking verdict passes only in the earlier form.
+        let mut late = defect_record("READY TO MERGE", vec![]);
+        late["verdict"] = json!("NON-BLOCKING ISSUES ONLY");
+        assert!(!passes(&late));
+        late["stats"].as_object_mut().unwrap().remove("form");
+        assert!(passes(&late));
+    }
+
+    #[test]
+    fn an_earlier_form_record_still_meets_the_gate()
+    {
+        let records = vec![(
+            NAME.to_owned(),
+            record("NON-BLOCKING ISSUES ONLY", "AUDIT PASS", vec![]),
+        )];
+        assert!(gate_diags(&records, HEAD).is_empty());
+    }
+
+    #[test]
+    fn the_gate_reads_the_findings_of_the_run_an_audit_completes()
+    {
+        // The audit record that completes a run of the reviewer alone lists
+        // no finding of its own; the run it completes left one on the surface.
+        let mut audit = run("audit", 3, "NON-BLOCKING ISSUES ONLY", "AUDIT PASS");
+        audit["findings"] = json!([]);
+        let records = vec![
+            (
+                NAME.to_owned(),
+                reviewer_alone(2, "NON-BLOCKING ISSUES ONLY", vec![finding("drift", "unverified")]),
+            ),
+            ("audit-0a82b0aa.json".to_owned(), audit.clone()),
+        ];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["gate-findings-recorded"]);
+        assert!(found[0].message.starts_with("1 finding"));
+        // An audit after an audited run completes nothing.
+        let records = vec![
+            (
+                NAME.to_owned(),
+                run("delta", 2, "READY TO MERGE", "AUDIT PASS"),
+            ),
+            ("audit-0a82b0aa.json".to_owned(), audit),
+        ];
+        assert!(gate_diags(&records, HEAD).is_empty());
+    }
+
+    #[test]
+    fn the_ledger_copies_the_fields_of_either_form()
+    {
+        let records = vec![(
+            NAME.to_owned(),
+            {
+                let mut r = defect_record("BLOCKING ISSUES", vec![]);
+                r["recorded"] = json!([defect("off surface", "unverified")]);
+                r
+            },
+        )];
+        let ledger = ledger(&records);
+        assert_eq!(ledger[0]["claim"], "off surface");
+        assert!(ledger[0].get("class").is_none());
+        assert_eq!(ledger[0]["run"], "0a82b0aa");
+    }
+
+    #[test]
+    fn a_release_run_contested_finding_enters_the_ledger_only_with_a_ruling()
+    {
+        let mut split = defect("refuters split", "contested");
+        let mut ruled = defect("ruled", "contested");
+        ruled["ruling"] = json!("a known issue, the maintainer decided");
+        let r = defect_record("BLOCKING ISSUES", vec![split.clone(), ruled]);
+        let records = vec![("full-0a82b0aa.json".to_owned(), r.clone())];
+        let claims: Vec<Value> = release_ledger(&records)
+            .iter()
+            .map(|e| e["claim"].clone())
+            .collect();
+        assert_eq!(claims, [json!("ruled")]);
+        // In a pull request's ledger the author's dispute is the contest.
+        assert_eq!(ledger(&records).as_array().map(Vec::len), Some(2));
+        split["ruling"] = json!("  ");
+        let blank = defect_record("BLOCKING ISSUES", vec![split]);
+        assert!(release_ledger(&[("full-0a82b0aa.json".to_owned(), blank)]).is_empty());
+    }
+
+    #[test]
+    fn the_merged_pull_requests_are_read_from_the_merge_subjects()
+    {
+        let subjects = "Merge pull request #871 from kottlerg/cleanup/x\n\
+                        docs: a direct commit\n\
+                        Merge pull request #12\n\
+                        Merge pull request #9x from y\n\
+                        Merge branch 'master' into z\n";
+        assert_eq!(merged_prs(subjects), [871, 12]);
+    }
+
+    #[test]
+    fn the_release_ledger_keeps_the_entries_for_the_files_named()
+    {
+        let mut other = defect("b", "unverified");
+        other["file"] = json!("docs/a.md");
+        let entries = vec![defect("a", "unverified"), other];
+        assert_eq!(for_files(entries.clone(), &[]).len(), 2);
+        let kept = for_files(entries, &["./docs/a.md".to_owned()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["claim"], "b");
     }
 }

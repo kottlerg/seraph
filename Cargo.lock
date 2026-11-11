@@ -391,10 +391,13 @@ version = "0.1.3"
 dependencies = [
  "boot-protocol",
  "devmgr-firmware",
+ "driver-binding",
+ "elf",
  "iommu-core",
  "ipc",
  "namespace-protocol",
  "ns-client",
+ "process-abi",
  "syscall",
  "syscall-abi",
  "virtio-core",

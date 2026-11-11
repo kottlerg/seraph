@@ -175,6 +175,23 @@ pub const fn flr_capable(devcap: u32) -> bool
     devcap != u32::MAX && devcap & PCIE_DEVCAP_FLR != 0
 }
 
+/// Offset of the Vendor ID register in a function's configuration header.
+pub const VENDOR_ID: u16 = 0x00;
+
+/// The Vendor ID a root port returns for a function still completing a
+/// reset when Configuration Request Retry Status Software Visibility is on
+/// (PCI Express Base Specification r4.0 § 2.3.2).
+const VENDOR_ID_RETRY: u16 = 0x0001;
+
+/// Whether a function whose Vendor ID reads `vendor` [`FLR_COMPLETION_MS`]
+/// after a Function Level Reset was initiated has completed it: it answers
+/// with a Vendor ID, neither all ones (no answer) nor the retry value.
+#[must_use]
+pub const fn flr_completed(vendor: u16) -> bool
+{
+    vendor != u16::MAX && vendor != VENDOR_ID_RETRY
+}
+
 /// The Command register value that clears Bus Master Enable and keeps every
 /// other bit of `command`, so the function still decodes its BARs.
 #[must_use]
@@ -396,6 +413,14 @@ mod tests
         assert!(flr_capable(0x1000_8000));
         assert!(!flr_capable(0x0000_8000));
         assert!(!flr_capable(u32::MAX));
+    }
+
+    #[test]
+    fn a_reset_completes_when_the_function_answers_with_a_vendor_id()
+    {
+        assert!(flr_completed(0x1AF4));
+        assert!(!flr_completed(u16::MAX));
+        assert!(!flr_completed(0x0001));
     }
 
     #[test]

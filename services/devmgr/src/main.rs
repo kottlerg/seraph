@@ -17,7 +17,9 @@
 //! design.
 
 mod arch;
+mod bind;
 mod caps;
+mod decls;
 mod dma;
 mod iommu;
 mod pci;
@@ -28,8 +30,9 @@ mod tables;
 
 use std::sync::Arc;
 
-use firmware::dma::Confinement;
-use firmware::lines::{HeldLines, HoldError, LineError};
+use driver_binding::decl::{ClassName, DriverName};
+use firmware::classes::Classes;
+use firmware::lines::{HeldLines, LineError};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
 use firmware::roster::{DeathPost, DriverState, Roster};
 use firmware::served::{Lookup, Served};
@@ -85,14 +88,20 @@ fn main() -> !
         std::os::seraph::log!("no PCI ECAM window located or enumerated via ACPI or DTB, halting");
         halt_loop();
     }
-    // Firmware lists windows in any segment order; the instance ordinals the
-    // registry serves are in segment, bus, device, function order.
-    devices.sort_unstable_by_key(|d| (d.segment, d.bus, d.dev, d.func));
     std::os::seraph::log!(
         "PCI functions found: {} in {} ECAM windows",
         devices.len() as u64,
         windows_scanned as u64
     );
+    // Firmware lists windows in any segment order; the records are bound, and
+    // the instance ordinals the registry serves counted, in segment, bus,
+    // device, function order.
+    let Some(mut records) = bind::PciRecords::new(devices)
+    else
+    {
+        std::os::seraph::log!("no memory for the PCI records, halting");
+        halt_loop();
+    };
 
     // IRQ allocator state: single-line caps carved out of devmgr's
     // Interrupt range cap, every remainder kept; each PCI device's line held
@@ -111,27 +120,20 @@ fn main() -> !
 
     // Generic device-info catalog: each entry carries a kind discriminant +
     // version + opaque payload bytes, and its index + 1 is the device badge
-    // of the driver spawned for it. virtio populates entries with kind
-    // VIRTIO_PCI, the framebuffer with kind FRAMEBUFFER; the serial and RTC
-    // entries, and those of the test-only `test-fault` fixtures, carry no
-    // startup info.
+    // of the driver spawned for it. A PCI function that presents the VirtIO
+    // register layout gets an entry of kind VIRTIO_PCI, the framebuffer one
+    // of kind FRAMEBUFFER; every other entry carries no startup info.
     let mut catalog = DeviceCatalog::default();
 
-    // Every driver this boot can spawn, each at most once: one per
-    // virtio-blk and virtio-input device, the debug port's virtio-console
-    // driver, the simple-device drivers, and the test-only fault batch
-    // (TODO(#165): drop it with that shim). The
-    // watch's death queue is sized to them, so every death observer is
-    // funded and no death is dropped.
-    let driver_count = devices
-        .iter()
-        .filter(|d| pci::is_virtio_blk(d) || pci::is_virtio_input(d))
-        .count()
-        + usize::from(devices.iter().any(pci::is_virtio_console))
+    // Every driver this boot can spawn, each at most once: one per PCI
+    // record (a record is bound at most once), the simple-device drivers,
+    // the IOMMU driver, and the test-only fault batch (TODO(#165): drop it
+    // with that shim). The watch's death queue is sized to them, so every
+    // death observer is funded and no death is dropped.
+    let driver_count = records.devices().len()
         + SIMPLE_DEVICE_DRIVERS
         + IOMMU_DRIVERS
-        + ipc::devmgr_labels::TEST_FAULT_DRIVERS
-        + TEST_DMA_DRIVERS;
+        + ipc::devmgr_labels::TEST_FAULT_DRIVERS;
     let Some(mut watch) = settle::DriverWatch::new(driver_count, caps.registry_ep)
     else
     {
@@ -156,10 +158,10 @@ fn main() -> !
 
     // The IOMMU driver, spawned and settled before any DMA-capable driver:
     // once it reports ready every device behind a remapping unit is blocked
-    // until devmgr attaches it, which `carve_virtio_device` does before each
-    // DMA grant. `None` runs every device unconfined, logged once.
+    // until devmgr attaches it, which a bind does before each DMA grant.
+    // `None` runs every device unconfined, logged once.
     caps.iommu = iommu::bring_up(
-        &devices,
+        records.devices(),
         caps.pooled.take(),
         &mut caps,
         &mut watch,
@@ -172,11 +174,11 @@ fn main() -> !
         d.set_iommu(Arc::clone(i.client()));
     }
 
-    // The boot batch: every virtio-blk driver, in BDF order, then the serial
+    // The boot batch: the boot pass over the PCI records, then the serial
     // and framebuffer drivers, from boot modules, settled before the
     // registry loop opens.
     spawn_boot_drivers(
-        &devices,
+        &mut records,
         &mut caps,
         &mut irq_range,
         uart_irq,
@@ -186,32 +188,12 @@ fn main() -> !
         ipc_buf,
     );
 
-    // Enumerate every virtio-input (keyboard) device now — catalog entry and
-    // carve of its BAR/IRQ caps — but defer the spawns. The driver binary
-    // lives on the rootfs, not the boot bundle (it is not
-    // bootstrap-essential), so it loads inside the SET_DRIVERS_DIR handler like
-    // the RTC. `pending_inputs` stashes the carved caps across the boot →
-    // registry-loop transition; `take()` in that handler makes the spawns
-    // at-most-once.
-    let mut pending_inputs =
-        enumerate_virtio_input(&devices, &mut caps, &mut irq_range, &mut catalog);
-    if !pending_inputs.is_empty()
-    {
-        std::os::seraph::log!(
-            "devmgr: {} virtio-input devices enumerated (deferred spawn)",
-            pending_inputs.len() as u64
-        );
-    }
-    // The debug port, likewise deferred: the first virtio-console device,
-    // when the machine presents one.
-    let mut pending_debug_port =
-        enumerate_debug_port(&devices, &mut caps, &mut irq_range, &mut catalog);
-
-    // On-disk driver state. The RTC, virtio-input, and virtio-console binaries live on the
-    // rootfs at `/services/drivers/<driver>`, not in the boot bundle.
-    // svcmgr delivers a `LOOKUP | READ`-attenuated `/services/drivers/`
-    // subtree cap via `SET_DRIVERS_DIR` at handover; the walks,
-    // `CREATE_FROM_FILE`s, bootstrap rounds, and the settle run inside the
+    // On-disk driver state. The drivers not in the boot bundle live on the
+    // rootfs at `/services/drivers/<driver>`. svcmgr delivers a
+    // `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` subtree cap
+    // via `SET_DRIVERS_DIR` at handover; the listing, the declaration reads,
+    // the walks, `CREATE_FROM_FILE`s, bootstrap rounds, and the settle run
+    // inside the
     // `SET_DRIVERS_DIR` handler, after its `ipc_reply` and before the
     // next receive (a nested ipc_call inside a request-handler frame would
     // clobber the implicit reply context, so the spawns must happen between
@@ -224,12 +206,6 @@ fn main() -> !
     // batch has been spawned: at most once per boot, so the death queue's
     // reservation for it holds.
     let mut fault_spawn_attempted: bool = false;
-
-    // TODO(#165): remove with the test labels. Whether the DMA test device
-    // has been bound, at most once per boot, and the requester ID of the one
-    // bound, for TEST_DMA_FAULTS.
-    let mut dma_test_attempted: bool = false;
-    let mut dma_test_rid: Option<u64> = None;
 
     // TODO(#165): remove with the devmgr enumeration redesign. Outcome of the
     // last TEST_SPAWN_ORPHAN trigger, reported by TEST_ORPHAN_RESULT. 0=not
@@ -322,7 +298,7 @@ fn main() -> !
                     // it can only use partition-badged caps the driver
                     // issues in response to a REGISTER_PARTITION call.
                     reply_served(
-                        lookup_ordinal(&served.block, &msg),
+                        served.lookup(class::BLOCK, instance_ordinal(&msg)),
                         ipc::blk_labels::MOUNT_AUTHORITY,
                         ipc::devmgr_errors::INVALID_REQUEST,
                         ipc_buf,
@@ -349,7 +325,7 @@ fn main() -> !
                     // also lets the holder pass its RX-notify notification
                     // cap to the driver.
                     reply_served(
-                        served.serial.get(0),
+                        served.lookup(class::SERIAL, Some(0)),
                         ipc::serial_labels::WRITE_AUTHORITY | ipc::serial_labels::READ_AUTHORITY,
                         ipc::devmgr_errors::INVALID_REQUEST,
                         ipc_buf,
@@ -373,7 +349,7 @@ fn main() -> !
                 else
                 {
                     reply_served(
-                        served.framebuffer.get(0),
+                        served.lookup(class::FRAMEBUFFER, Some(0)),
                         ipc::fb_labels::WRITE_AUTHORITY,
                         ipc::devmgr_errors::INVALID_REQUEST,
                         ipc_buf,
@@ -440,18 +416,17 @@ fn main() -> !
                 // After reply: the at-most-once spawn and settle of the
                 // on-disk drivers. Failure is sticky
                 // (`on_disk_spawn_attempted`) so subsequent SET_DRIVERS_DIR
-                // re-sends (idempotent path above) do not retry, and
-                // `take()` empties the stash: a driver not spawned, or not
-                // ready, is never served, so its query replies `NO_DEVICE`
-                // thereafter.
+                // re-sends (idempotent path above) do not retry: a driver not
+                // spawned, or not ready, is never served, so its query
+                // replies `NO_DEVICE` thereafter.
                 if should_attempt_spawn
                 {
                     on_disk_spawn_attempted = true;
                     spawn_on_disk_drivers(
+                        &mut records,
                         &mut caps,
+                        &mut irq_range,
                         drivers_dir_cap,
-                        core::mem::take(&mut pending_inputs),
-                        pending_debug_port.take(),
                         &mut watch,
                         &mut catalog,
                         &mut served,
@@ -482,7 +457,7 @@ fn main() -> !
                 else
                 {
                     reply_served(
-                        served.rtc.get(0),
+                        served.lookup(class::RTC, Some(0)),
                         ipc::rtc_labels::READ_AUTHORITY,
                         ipc::devmgr_errors::NO_DEVICE,
                         ipc_buf,
@@ -507,7 +482,7 @@ fn main() -> !
                 else
                 {
                     reply_served(
-                        lookup_ordinal(&served.input, &msg),
+                        served.lookup(class::INPUT, instance_ordinal(&msg)),
                         ipc::input_labels::READ_AUTHORITY,
                         ipc::devmgr_errors::NO_DEVICE,
                         ipc_buf,
@@ -532,7 +507,7 @@ fn main() -> !
                 else
                 {
                     reply_served(
-                        served.debug_port.get(0),
+                        served.lookup(class::DEBUG_PORT, Some(0)),
                         ipc::serial_labels::WRITE_AUTHORITY | ipc::serial_labels::READ_AUTHORITY,
                         ipc::devmgr_errors::NO_DEVICE,
                         ipc_buf,
@@ -615,7 +590,7 @@ fn main() -> !
                     continue;
                 }
                 reply_served(
-                    lookup_ordinal(&served.test_fault, &msg),
+                    served.lookup(class::TEST_FAULT, instance_ordinal(&msg)),
                     ipc::devmgr_labels::TEST_DENY_BADGE,
                     ipc::devmgr_errors::NO_DEVICE,
                     ipc_buf,
@@ -631,9 +606,12 @@ fn main() -> !
                 }
                 let driver = match msg.word(1)
                 {
-                    ipc::devmgr_labels::QUERY_SERIAL_DEVICE => served.serial.first_live(),
-                    ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE => served.framebuffer.first_live(),
-                    ipc::devmgr_labels::QUERY_INPUT_DEVICE => served.input.first_live(),
+                    ipc::devmgr_labels::QUERY_SERIAL_DEVICE => served.first_live(class::SERIAL),
+                    ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE =>
+                    {
+                        served.first_live(class::FRAMEBUFFER)
+                    }
+                    ipc::devmgr_labels::QUERY_INPUT_DEVICE => served.first_live(class::INPUT),
                     _ =>
                     {
                         reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
@@ -641,52 +619,6 @@ fn main() -> !
                     }
                 };
                 reply_deny_send(driver.map_or(0, |d| d.ep), ipc_buf);
-            }
-            // TODO(#165): remove with the test labels. Bind the DMA test
-            // device after the ack, as TEST_SPAWN_FAULT_DRIVERS spawns after
-            // its reply: the attach and the spawn are nested calls.
-            ipc::devmgr_labels::TEST_SPAWN_DMA_DRIVER =>
-            {
-                if !test_label_admitted(&msg, badge, ipc_buf)
-                {
-                    continue;
-                }
-                if dma_test_attempted || drivers_dir_cap == 0
-                {
-                    reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
-                    continue;
-                }
-                let Some(edu) = devices.iter().find(|d| iommu::is_edu(d))
-                else
-                {
-                    reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
-                    continue;
-                };
-                dma_test_attempted = true;
-                let confined = caps.iommu.as_ref().is_some_and(|i| i.would_confine(edu));
-                let mode = if confined
-                {
-                    ipc::devmgr_labels::TEST_DMA_CONFINED
-                }
-                else
-                {
-                    ipc::devmgr_labels::TEST_DMA_UNCONFINED
-                };
-                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-                    .word(0, mode)
-                    .build();
-                // SAFETY: ipc_buf is the registered IPC buffer.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-                dma_test_rid = Some(iommu::requester_id(edu));
-                spawn_test_dma_driver(
-                    edu,
-                    &mut caps,
-                    drivers_dir_cap,
-                    &mut watch,
-                    &mut catalog,
-                    &mut served,
-                    ipc_buf,
-                );
             }
             // TODO(#165): remove with the test labels. Do not `seraph::log!`
             // here, as in the device queries it mirrors.
@@ -696,10 +628,27 @@ fn main() -> !
                 {
                     continue;
                 }
-                reply_served(
-                    served.test_dma.get(0),
+                // The fixture is bound at SET_DRIVERS_DIR like any driver
+                // whose declaration matches; the reply says whether an IOMMU
+                // confines its device.
+                let fixture = served.lookup(class::TEST_DMA, Some(0));
+                let confined = matches!(
+                    fixture,
+                    Lookup::Live(d) if d.dev_caps.as_ref().is_some_and(bind::PciDeviceCaps::confined)
+                );
+                let mode = if confined
+                {
+                    ipc::devmgr_labels::TEST_DMA_CONFINED
+                }
+                else
+                {
+                    ipc::devmgr_labels::TEST_DMA_UNCONFINED
+                };
+                reply_served_words(
+                    fixture,
                     ipc::devmgr_labels::TEST_DENY_BADGE,
                     ipc::devmgr_errors::NO_DEVICE,
+                    &[mode],
                     ipc_buf,
                 );
             }
@@ -710,7 +659,11 @@ fn main() -> !
                 {
                     continue;
                 }
-                let Some(rid) = dma_test_rid
+                let rid = served
+                    .first_live(class::TEST_DMA)
+                    .and_then(|d| d.dev_caps.as_ref())
+                    .map(|c| c.requester_id);
+                let Some(rid) = rid
                 else
                 {
                     reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
@@ -731,23 +684,56 @@ fn main() -> !
     }
 }
 
-/// The simple-device drivers a boot can spawn beside the `VirtIO` PCI ones:
-/// serial, framebuffer, and the platform RTC.
+/// The simple-device drivers a boot can spawn beside those bound to PCI
+/// records: serial, framebuffer, and the platform RTC.
 const SIMPLE_DEVICE_DRIVERS: usize = 3;
 
 /// The IOMMU drivers a boot can spawn: one, of the architecture's family.
 const IOMMU_DRIVERS: usize = 1;
 
-/// TODO(#165): remove with the test labels. The `test-dma` fixtures a boot
-/// can spawn: one, for the DMA test device.
-const TEST_DMA_DRIVERS: usize = 1;
-
-/// What the `QUERY_BLOCK_DEVICE` or `QUERY_INPUT_DEVICE` request `msg`
-/// selects in `class` by its instance ordinal ([`instance_ordinal`]).
-fn lookup_ordinal<'a>(class: &'a Served<ServedDriver>, msg: &IpcMessage)
--> Lookup<'a, ServedDriver>
+/// The device classes the per-class registry queries serve
+/// (docs/driver-binding.md § Device Classes). A bound driver is served under
+/// the class its declaration names; each query looks its class up by name.
+mod class
 {
-    instance_ordinal(msg).map_or(Lookup::Absent, |i| class.get(i))
+    pub const BLOCK: &str = "block";
+    pub const INPUT: &str = "input";
+    pub const DEBUG_PORT: &str = "debug-port";
+    pub const SERIAL: &str = "serial";
+    pub const FRAMEBUFFER: &str = "framebuffer";
+    pub const RTC: &str = "rtc";
+    /// TODO(#165): remove with the test labels.
+    pub const TEST_FAULT: &str = "test-fault";
+    /// TODO(#165): remove with the test labels.
+    pub const TEST_DMA: &str = "test-dma";
+}
+
+/// The drivers devmgr starts on fixed paths, by name and the class each is
+/// served under, until platform device records bind them by declaration
+/// (docs/driver-binding.md § Status).
+mod fixed
+{
+    use driver_binding::decl::{ClassName, DriverName};
+
+    pub const SERIAL: (DriverName, ClassName) = (
+        DriverName::literal_key("serial"),
+        ClassName::literal_class(super::class::SERIAL),
+    );
+    pub const FRAMEBUFFER: (DriverName, ClassName) = (
+        DriverName::literal_key("framebuffer"),
+        ClassName::literal_class(super::class::FRAMEBUFFER),
+    );
+    pub const RTC: (DriverName, ClassName) = (
+        DriverName::literal_key("rtc"),
+        ClassName::literal_class(super::class::RTC),
+    );
+    /// TODO(#165): remove with the test labels.
+    pub const TEST_FAULT: (DriverName, ClassName) = (
+        DriverName::literal_key("test-fault"),
+        ClassName::literal_class(super::class::TEST_FAULT),
+    );
+    /// The IOMMU driver, served under no class.
+    pub const IOMMU: DriverName = DriverName::literal_key("iommu");
 }
 
 /// Reply to a device query with a `SEND_GRANT` badged `verb_bits` on the
@@ -755,6 +741,18 @@ fn lookup_ordinal<'a>(class: &'a Served<ServedDriver>, msg: &IpcMessage)
 /// that driver was withdrawn, `absent` when no driver is served there, and
 /// `INVALID_REQUEST` when the derivation fails.
 fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, ipc_buf: *mut u64)
+{
+    reply_served_words(lookup, verb_bits, absent, &[], ipc_buf);
+}
+
+/// [`reply_served`], the success reply also carrying `words`.
+fn reply_served_words(
+    lookup: Lookup<'_, ServedDriver>,
+    verb_bits: u64,
+    absent: u64,
+    words: &[u64],
+    ipc_buf: *mut u64,
+)
 {
     let driver = match lookup
     {
@@ -769,6 +767,7 @@ fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, i
         return reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
     };
     let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+        .words(0, words)
         .cap(derived)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -778,7 +777,7 @@ fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, i
 /// TODO(#165): remove with the test labels. Admit a request on a test label
 /// (`TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, `TEST_QUERY_DENY_DEVICE`,
 /// `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`,
-/// `TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, `TEST_DMA_FAULTS`): the badge
+/// `TEST_QUERY_DMA_DEVICE`, `TEST_DMA_FAULTS`): the badge
 /// carries `TEST_LABEL_AUTHORITY` and `data[0]` is `DEVMGR_LABELS_VERSION`.
 /// Otherwise reply the rejection and return `false`.
 fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
@@ -1089,10 +1088,10 @@ fn with_mmio_mapped<R>(
 }
 
 /// Keep a scanned ECAM window's cap and location in `caps.config_space` and
-/// `caps.ecam_windows`, from which each `VirtIO` function's configuration
-/// page is carved ([`carve_function_config`]). A window the tables cannot
-/// hold is logged; its cap stays held, and its `VirtIO` functions get no
-/// driver, since devmgr could not clear their Bus Master Enable.
+/// `caps.ecam_windows`, from which the configuration page of each function
+/// devmgr binds is carved ([`bind::carve_function_config`]). A window the
+/// tables cannot hold is logged; its cap stays held, and its functions get
+/// no driver, since devmgr could not clear their Bus Master Enable.
 fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap: u64)
 {
     let kept = caps.ecam_windows.try_reserve(1).is_ok()
@@ -1107,53 +1106,10 @@ fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap
     else
     {
         std::os::seraph::log!(
-            "ECAM segment {}: configuration space not kept; its VirtIO devices get no driver",
+            "ECAM segment {}: configuration space not kept; its devices get no driver",
             loc.segment
         );
     }
-}
-
-/// Carve the `Mmio` cap of `pci_dev`'s configuration page out of the kept
-/// ECAM windows. Returns `None`, logged under `name`, when no kept window
-/// decodes the function or the carve fails.
-fn carve_function_config(
-    name: &str,
-    pci_dev: &pci::PciDevice,
-    caps: &mut caps::DevmgrCaps,
-) -> Option<FunctionConfig>
-{
-    let carved = firmware::pci::function_config_phys(
-        &caps.ecam_windows,
-        pci_dev.segment,
-        pci_dev.bus,
-        pci_dev.dev,
-        pci_dev.func,
-    )
-    .and_then(|phys| {
-        caps.config_space
-            .carve(
-                phys,
-                firmware::pci::FUNCTION_CONFIG_BYTES,
-                PAGE_SIZE,
-                |span: &Span<u64>, at| {
-                    syscall::mmio_split(span.slot, at - span.base).map_err(|_| SplitError::Failed)
-                },
-            )
-            .ok()
-    });
-    let Some(cap) = carved
-    else
-    {
-        std::os::seraph::log!(
-            "{}: no configuration-space cap for the device; refused",
-            name
-        );
-        return None;
-    };
-    Some(FunctionConfig {
-        cap,
-        aspace: caps.self_aspace,
-    })
 }
 
 // ── Aperture splitting helper ───────────────────────────────────────────────
@@ -1413,492 +1369,42 @@ const _: () = assert!(
         && ipc::device_info_kind::FRAMEBUFFER != NO_INFO_KIND
 );
 
-/// The `Mmio` caps carved for every BAR a `VirtIO` device's register
-/// regions name, in ascending BAR index.
-struct VirtioBars
+/// What a spawned driver is served as: a device class, by the name its
+/// declaration gives, or the IOMMU driver, which no registry query serves
+/// (devmgr alone calls it, through its `iommu::IommuClient`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Serves
 {
-    bars: [spawn::BarSpec; virtio_core::MAX_VIRTIO_BARS],
-    count: usize,
-}
-
-impl VirtioBars
-{
-    fn as_slice(&self) -> &[spawn::BarSpec]
-    {
-        &self.bars[..self.count]
-    }
-
-    fn release(&self)
-    {
-        for bar in self.as_slice()
-        {
-            let _ = syscall::cap_delete(bar.cap);
-        }
-    }
-}
-
-/// Per-device caps carved for a `VirtIO` PCI driver: its BAR `Mmio` caps,
-/// its optional single-IRQ cap with the line's `SYS_IRQ_REGISTER` mode, the
-/// badge of its catalog entry, the device's DMA grant, the function's
-/// configuration page, and where devmgr resets the device when it withdraws
-/// its driver.
-struct VirtioDeviceCaps
-{
-    bars: VirtioBars,
-    /// The device's DMA capability, kept by devmgr, and its mappings
-    /// ([`dma::DmaGrant`]).
-    dma: dma::DmaGrant,
-    /// The function's configuration page, kept by devmgr alone, through
-    /// which it clears Bus Master Enable before it takes the device.
-    config: FunctionConfig,
-    irq_cap: Option<u64>,
-    /// The mode the driver registers `irq_cap` with; 0 without one.
-    irq_mode: u64,
-    device_badge: u64,
-    /// The device's `device_status` byte, through the BAR cap devmgr keeps;
-    /// `None` when the device's layout gives none ([`DeviceReset`]).
-    reset: Option<DeviceReset>,
-    /// The release token of the driver devmgr spawned for the device
-    /// ([`spawn::HeldChild`]), on which alone procmgr releases the driver's
-    /// held memory once the device is confirmed stopped; 0 before a spawn
-    /// bootstraps. [`withdraw_device`] consumes it.
-    release_token: u64,
-}
-
-/// Where devmgr writes a `VirtIO` device's `device_status` byte to reset it:
-/// the kept `Mmio` cap of the BAR holding it, the pages that cap spans, the
-/// byte's offset in the BAR, and devmgr's own address space to map it in.
-#[derive(Clone, Copy)]
-struct DeviceReset
-{
-    bar_cap: u64,
-    bar_pages: u64,
-    offset: u64,
-    aspace: u64,
-}
-
-impl DeviceReset
-{
-    /// The reset of the device `info` describes, through the cap in `bars`
-    /// of the BAR holding its `device_status` byte; `None` when the layout
-    /// gives no such byte, no delivered BAR holds it, or the byte lies past
-    /// the span that BAR's cap was carved to (a device whose common region
-    /// reaches past its BAR).
-    fn for_device(
-        info: &virtio_core::VirtioPciStartupInfo,
-        bars: &[spawn::BarSpec],
-        aspace: u64,
-    ) -> Option<Self>
-    {
-        let status = info.status_register()?;
-        let bar = bars.iter().find(|b| b.bar == status.bar)?;
-        if status.offset >= bar.bytes
-        {
-            return None;
-        }
-        Some(Self {
-            bar_cap: bar.cap,
-            bar_pages: bar.bytes.div_ceil(PAGE_SIZE),
-            offset: status.offset,
-            aspace,
-        })
-    }
-
-    /// Reset the device: map its status BAR into devmgr, store 0 to
-    /// `device_status`, wait for the status to read 0, which completes the
-    /// reset (`VirtIO` 1.2 §4.1.4.3.2), bounded by
-    /// `virtio_core::pci::RESET_TIMEOUT`, and unmap. A device whose reset
-    /// completed has stopped its DMA and dropped its pending interrupt, so a
-    /// driver that died while its device asserted a shared level-triggered
-    /// line leaves the line's other receivers no assertion to loop on
-    /// (docs/device-management.md § Interrupt Delivery). Returns whether the
-    /// reset completed; `false`, logged, when the mapping fails or the status
-    /// does not read 0 within the bound.
-    fn reset(&self) -> bool
-    {
-        let offset = self.offset;
-        let confirmed = with_mmio_mapped(
-            self.aspace,
-            self.bar_cap,
-            self.bar_pages,
-            "device reset",
-            |va| {
-                let status = (va + offset) as *mut u8;
-                // SAFETY: `offset` is below the bytes the BAR's cap was carved
-                // to (`for_device`), all of which are mapped from `va` for this
-                // closure ([`with_mmio_mapped`]), and `device_status` is a byte
-                // register.
-                unsafe { core::ptr::write_volatile(status, 0) };
-                // The reset completes when the device reads back 0 (`VirtIO`
-                // 1.2 §4.1.4.3.2); the status is device-written, so the wait is
-                // bounded.
-                let start = std::time::Instant::now();
-                virtio_core::pci::poll_until(
-                    virtio_core::pci::RESET_TIMEOUT,
-                    || start.elapsed(),
-                    // SAFETY: as for the write above.
-                    || unsafe { core::ptr::read_volatile(status) } == 0,
-                )
-            },
-        );
-        let Some(confirmed) = confirmed
-        else
-        {
-            std::os::seraph::log!("device reset: its status BAR not mapped; not reset");
-            return false;
-        };
-        if !confirmed
-        {
-            std::os::seraph::log!("device reset: not confirmed within its bound");
-        }
-        confirmed
-    }
-}
-
-/// The `Mmio` cap of one PCI function's configuration page, which devmgr
-/// keeps and delegates to no driver, and devmgr's own address space to map
-/// it in.
-#[derive(Clone, Copy)]
-struct FunctionConfig
-{
-    cap: u64,
-    aspace: u64,
-}
-
-impl FunctionConfig
-{
-    /// Turn on the function's Memory Space Enable and Bus Master Enable, so
-    /// it decodes its MMIO BARs and may issue DMA; for a function the firmware
-    /// left off that needs both: the DMA test device, for its driver, and the
-    /// RISC-V IOMMU, which reads its tables by DMA (`iommu::riscv_round`). Returns
-    /// whether the configuration page could be mapped.
-    fn enable_memory_and_bus_master(&self) -> bool
-    {
-        with_mmio_mapped(self.aspace, self.cap, 1, "bus master", |va| {
-            let command = (va + u64::from(firmware::pci::COMMAND)) as *mut u16;
-            // SAFETY: the Command register lies in the configuration page
-            // mapped from `va` for this closure ([`with_mmio_mapped`]), and is
-            // a 16-bit register.
-            let current = unsafe { core::ptr::read_volatile(command) };
-            // SAFETY: as for the read above.
-            unsafe {
-                core::ptr::write_volatile(
-                    command,
-                    firmware::pci::command_with_memory_and_bus_master(current),
-                );
-            }
-        })
-        .is_some()
-    }
-
-    /// Clear the function's Bus Master Enable and read the Command register
-    /// back: once the bit is clear the function issues no memory request of
-    /// its own, so it performs no DMA, and the read-back's completion arrives
-    /// only after every write the function posted before it
-    /// (docs/device-management.md § DMA-Safe Teardown). Returns whether the
-    /// read-back confirms the bit clear; `false`, logged, when the mapping
-    /// fails or it does not.
-    fn clear_bus_master(&self) -> bool
-    {
-        let read_back = with_mmio_mapped(self.aspace, self.cap, 1, "bus master", |va| {
-            let command = (va + u64::from(firmware::pci::COMMAND)) as *mut u16;
-            // SAFETY: the Command register lies in the configuration page
-            // mapped from `va` for this closure ([`with_mmio_mapped`]), and is a
-            // 16-bit register.
-            let current = unsafe { core::ptr::read_volatile(command) };
-            // SAFETY: as for the read above.
-            unsafe {
-                core::ptr::write_volatile(
-                    command,
-                    firmware::pci::command_without_bus_master(current),
-                );
-            }
-            // SAFETY: as for the read above.
-            unsafe { core::ptr::read_volatile(command) }
-        });
-        let Some(read_back) = read_back
-        else
-        {
-            std::os::seraph::log!("bus master: configuration page not mapped; not cleared");
-            return false;
-        };
-        let cleared = firmware::pci::bus_master_confirmed_clear(read_back);
-        if !cleared
-        {
-            std::os::seraph::log!(
-                "bus master: not confirmed clear (command={:#06x})",
-                read_back
-            );
-        }
-        cleared
-    }
-}
-
-impl VirtioDeviceCaps
-{
-    /// Release the BAR, DMA, configuration-page, and IRQ caps of the device.
-    fn release(&self)
-    {
-        self.bars.release();
-        self.dma.release();
-        let _ = syscall::cap_delete(self.config.cap);
-        if let Some(irq) = self.irq_cap
-        {
-            let _ = syscall::cap_delete(irq);
-        }
-    }
-
-    /// Take the device from its driver, live or dead, so its DMA is stopped
-    /// before the driver's frames, and the frames its mappings reach, are
-    /// freed: withdraw its DMA grant ([`dma::DmaGrant::withdraw`]), so the
-    /// driver maps nothing more and an IOMMU, where one confines the device,
-    /// blocks it; clear the function's Bus Master Enable
-    /// ([`FunctionConfig::clear_bus_master`]), so the device issues no
-    /// further DMA whatever its driver does; then revoke every cap derived
-    /// from the BAR caps devmgr keeps (the driver's copies, whose mappings
-    /// the revocation removes before it returns), so the driver can no longer
-    /// reach the device; then reset the device and wait, bounded by
-    /// `virtio_core::pci::RESET_TIMEOUT`, for it to confirm
-    /// ([`DeviceReset::reset`]). Returns whether the device can no longer
-    /// reach the driver's memory: an IOMMU blocks it, or it is known to be
-    /// quiet (Bus Master Enable read back clear, every BAR copy revoked, and
-    /// the reset confirmed). Only then does it delete the Memory caps it kept
-    /// for the device's mappings ([`dma::Withdrawal::release`];
-    /// `firmware::dma::settle_withdrawal` decides). `false`, logged, means
-    /// the device may still be accessing the driver's memory and the mapped
-    /// frames, and those caps stay for the boot
-    /// ([`dma::Withdrawal::quarantine`]).
-    fn take_from_driver(&self) -> bool
-    {
-        let withdrawal = self.dma.withdraw();
-        match firmware::dma::settle_withdrawal(withdrawal.block(), || self.stop_and_reset())
-        {
-            firmware::dma::WithdrawnMappings::Release =>
-            {
-                withdrawal.release();
-                true
-            }
-            firmware::dma::WithdrawnMappings::Quarantine =>
-            {
-                withdrawal.quarantine();
-                false
-            }
-        }
-    }
-
-    /// Clear the function's Bus Master Enable, revoke every cap derived from
-    /// the BAR caps devmgr keeps, and reset the device, in that order
-    /// ([`Self::take_from_driver`]). Returns whether all three are confirmed.
-    fn stop_and_reset(&self) -> bool
-    {
-        let bus_master_clear = self.config.clear_bus_master();
-        let mut revoked = true;
-        for bar in self.bars.as_slice()
-        {
-            if syscall::cap_revoke_all(bar.cap).is_err()
-            {
-                revoked = false;
-            }
-        }
-        if !revoked
-        {
-            std::os::seraph::log!("device reset: a BAR copy could not be revoked");
-        }
-        let reset = if let Some(reset) = self.reset
-        {
-            reset.reset()
-        }
-        else
-        {
-            std::os::seraph::log!("device reset: the device has no reset target; not reset");
-            false
-        };
-        bus_master_clear && revoked && reset
-    }
-}
-
-/// Carve a `VirtIO` device's BAR caps, its configuration-page cap, and its
-/// IRQ cap, and add its catalog entry. Returns `None`, logging why and
-/// releasing what it carved, when the device presents no complete set of
-/// register regions, a BAR they name is not an MMIO BAR or no aperture covers
-/// it, no kept ECAM window yields its configuration page
-/// ([`carve_function_config`]), or the catalog entry cannot be added. The IRQ
-/// is optional here; a driver that requires one checks.
-fn carve_virtio_device(
-    name: &str,
-    pci_dev: &pci::PciDevice,
-    caps: &mut caps::DevmgrCaps,
-    irq_range: &mut IrqRangeAllocator,
-    catalog: &mut DeviceCatalog,
-) -> Option<VirtioDeviceCaps>
-{
-    std::os::seraph::log!(
-        "devmgr: found {} PCI device {}:{}:{}.{} IRQ line={:#x} pin={:#x}",
-        name,
-        pci_dev.segment,
-        pci_dev.bus,
-        pci_dev.dev,
-        pci_dev.func,
-        pci_dev.irq_line,
-        pci_dev.irq_pin
-    );
-    let bars = carve_virtio_bars(name, pci_dev, caps)?;
-    let Some(config) = carve_function_config(name, pci_dev, caps)
-    else
-    {
-        bars.release();
-        return None;
-    };
-    // Serialise the virtio startup info into the generic catalog entry.
-    // Devmgr stores the bytes opaquely; the driver's `from_bytes` (verified
-    // via kind/version) deserialises on the QUERY_DEVICE_INFO reply.
-    let mut buf = [0u8; virtio_core::VirtioPciStartupInfo::SIZE];
-    let device_badge = pci_dev.virtio_info.to_bytes(&mut buf).and_then(|()| {
-        catalog.add(
-            ipc::device_info_kind::VIRTIO_PCI,
-            virtio_core::VIRTIO_PCI_INFO_VERSION,
-            &buf,
-        )
-    });
-    let Some(device_badge) = device_badge
-    else
-    {
-        std::os::seraph::log!(
-            "{}: catalog entry not added (payload or memory); not spawned",
-            name
-        );
-        bars.release();
-        let _ = syscall::cap_delete(config.cap);
-        return None;
-    };
-    let Some(dma) = grant_dma(name, pci_dev, caps, device_badge)
-    else
-    {
-        bars.release();
-        let _ = syscall::cap_delete(config.cap);
-        return None;
-    };
-    let irq_cap = acquire_single_irq_cap(pci_dev, irq_range);
-    let irq_mode = match (irq_cap, device_gsi(pci_dev))
-    {
-        (Some(_), Some(gsi)) => irq_range.line_mode(gsi),
-        _ => 0,
-    };
-    let reset = DeviceReset::for_device(&pci_dev.virtio_info, bars.as_slice(), caps.self_aspace);
-    Some(VirtioDeviceCaps {
-        bars,
-        dma,
-        config,
-        irq_cap,
-        irq_mode,
-        device_badge,
-        reset,
-        release_token: 0,
-    })
-}
-
-/// Give the device `pci_dev`, catalogued as `device_badge`, its DMA grant:
-/// first attach it to an IOMMU domain of its own when a remapping unit
-/// translates it ([`iommu::Iommu::confine`]), so it reaches nothing its
-/// driver has not mapped but the regions the firmware reserves for it, which
-/// the domain maps at their own addresses and no mapping's IOVA overlaps.
-/// `None`, logged under `name`, when the device is refused (its unit is
-/// not programmed, its reserved regions cannot be mapped, or its `ATTACH`
-/// fails) or the grant fails; an attached device is blocked again then.
-fn grant_dma(
-    name: &str,
-    pci_dev: &pci::PciDevice,
-    caps: &caps::DevmgrCaps,
-    device_badge: u64,
-) -> Option<dma::DmaGrant>
-{
-    let (confinement, reserved) = match caps.iommu.as_ref()
-    {
-        Some(i) => i.confine(name, pci_dev).ok()?,
-        None => (Confinement::Unconfined, Vec::new()),
-    };
-    let grant = caps
-        .dma
-        .as_ref()
-        .and_then(|d| d.grant(device_badge, confinement, &reserved));
-    if grant.is_none()
-    {
-        std::os::seraph::log!("{}: no DMA grant; not spawned", name);
-        if let (Confinement::Domain { handle, .. }, Some(i)) = (confinement, caps.iommu.as_ref())
-        {
-            i.client().block(handle);
-        }
-    }
-    grant
-}
-
-/// The registry class a driver serves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DriverClass
-{
-    Block,
-    Input,
-    /// The debug port: the virtio-console driver.
-    DebugPort,
-    Serial,
-    Framebuffer,
-    Rtc,
-    /// TODO(#165): remove with `TEST_SPAWN_FAULT_DRIVERS`. The `test-fault`
-    /// fixtures of the test-only fault batch.
-    TestFault,
-    /// The IOMMU driver, which no registry query serves: devmgr alone calls
-    /// it, through its `iommu::IommuClient`.
+    Class(ClassName),
     Iommu,
-    /// TODO(#165): remove with `TEST_SPAWN_DMA_DRIVER`. The `test-dma`
-    /// fixture bound to the DMA test device.
-    TestDma,
-}
-
-impl DriverClass
-{
-    /// The driver's name in log lines.
-    fn name(self) -> &'static str
-    {
-        match self
-        {
-            Self::Block => "virtio-blk",
-            Self::Input => "virtio-input",
-            Self::DebugPort => "virtio-console",
-            Self::Serial => "serial",
-            Self::Framebuffer => "framebuffer",
-            Self::Rtc => "rtc",
-            Self::TestFault => "test-fault",
-            Self::Iommu => "iommu",
-            Self::TestDma => "test-dma",
-        }
-    }
 }
 
 /// A driver the registry serves: its service endpoint, which devmgr owns,
-/// for a `VirtIO` PCI driver the device caps devmgr carved for it, and the
-/// driver's process handle while devmgr keeps it.
+/// for a driver bound to a PCI record the device caps devmgr carved for it,
+/// and the driver's process handle while devmgr keeps it.
 struct ServedDriver
 {
     ep: u64,
-    dev_caps: Option<VirtioDeviceCaps>,
+    dev_caps: Option<bind::PciDeviceCaps>,
     /// The driver's badged procmgr process handle: kept until its batch
-    /// settles, and for the rest of the boot for a driver with a `VirtIO`
-    /// device, whose memory procmgr holds after its death until devmgr
-    /// releases it (`CREATE_DMA_HOLD`); 0 once released.
+    /// settles, and for the rest of the boot for a driver bound to a PCI
+    /// record, which devmgr destroys when it withdraws it, and whose memory
+    /// procmgr holds after its death until devmgr releases it when the
+    /// driver performs DMA (`CREATE_DMA_HOLD`); 0 once released.
     process_handle: u64,
 }
 
 impl ServedDriver
 {
-    /// Withdraw the driver, live or dead: take a `VirtIO` device from it and
-    /// destroy it ([`withdraw_device`]), or destroy a driver with no such
-    /// device through its process handle when devmgr still keeps one (a no-op
-    /// for one procmgr has reaped); then [`Self::release`].
+    /// Withdraw the driver, live or dead: take its PCI device from it and
+    /// destroy it ([`bind::withdraw_device`]), or destroy a driver with no
+    /// such device through its process handle when devmgr still keeps one (a
+    /// no-op for one procmgr has reaped); then [`Self::release`].
     fn withdraw(&self, ipc_buf: *mut u64)
     {
         match &self.dev_caps
         {
-            Some(dev_caps) => withdraw_device(
+            Some(dev_caps) => bind::withdraw_device(
                 dev_caps,
                 spawn::HeldChild {
                     process_handle: self.process_handle,
@@ -1929,45 +1435,13 @@ impl ServedDriver
     }
 }
 
-/// Withdraw the `VirtIO` driver `child` names, live or dead, from the device
-/// `dev_caps` holds, in the order services/devmgr/docs/responsibilities.md
-/// § Responsibilities states: take the device from the driver
-/// ([`VirtioDeviceCaps::take_from_driver`]: Bus Master Enable cleared before
-/// the BAR caps are taken, then the reset), so it neither DMAs nor holds its
-/// line asserted with no driver to clear it; then destroy the driver, a no-op
-/// for one procmgr has reaped, and only when the device is confirmed quiet
-/// release the driver's held memory on its release token
-/// ([`spawn::destroy_and_release`]). A device not confirmed quiet leaves it
-/// held for the rest of the boot ([`spawn::destroy_held`]), since the device
-/// may still be writing it. One reset per withdrawal; both caps of `child`
-/// are consumed.
-fn withdraw_device(dev_caps: &VirtioDeviceCaps, child: spawn::HeldChild, ipc_buf: *mut u64)
-{
-    let quiet = dev_caps.take_from_driver();
-    if child.process_handle == 0
-    {
-        return;
-    }
-    if quiet
-    {
-        spawn::destroy_and_release(child, ipc_buf);
-    }
-    else
-    {
-        std::os::seraph::log!(
-            "device {} not confirmed quiet; its driver's memory stays held for the boot",
-            dev_caps.device_badge
-        );
-        spawn::destroy_held(child, ipc_buf);
-    }
-}
-
-/// A spawned driver its settle batch's roster records: its class, its device
-/// badge, and what the registry serves once it reports ready, its process
-/// handle included.
+/// A spawned driver its settle batch's roster records: its name, what it is
+/// served as, its device badge, and what the registry serves once it
+/// reports ready, its process handle included.
 struct SpawnedDriver
 {
-    class: DriverClass,
+    name: DriverName,
+    serves: Serves,
     badge: u64,
     driver: ServedDriver,
 }
@@ -1982,26 +1456,21 @@ fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ip
     {
         std::os::seraph::log!(
             "{}: driver not recorded; device not served",
-            spawned.class.name()
+            spawned.name.as_str()
         );
         spawned.driver.withdraw(ipc_buf);
     }
 }
 
-/// The drivers the registry serves, one [`Served`] list per class. A class's
-/// list is filled once, when its batch settles; a served driver that dies
-/// later is withdrawn and leaves a tombstone at its ordinal.
+/// The drivers the registry serves, one [`Served`] list per class, by the
+/// class name each driver's declaration gives
+/// ([`firmware::classes::Classes`]). A class's list is filled as its
+/// drivers' batches settle; a served driver that dies later is withdrawn and
+/// leaves a tombstone at its ordinal.
 #[derive(Default)]
 struct ServedDrivers
 {
-    block: Served<ServedDriver>,
-    input: Served<ServedDriver>,
-    debug_port: Served<ServedDriver>,
-    serial: Served<ServedDriver>,
-    framebuffer: Served<ServedDriver>,
-    rtc: Served<ServedDriver>,
-    test_fault: Served<ServedDriver>,
-    test_dma: Served<ServedDriver>,
+    classes: Classes<ServedDriver>,
     /// The IOMMU driver once its batch settles, at ordinal 0. Its service
     /// endpoint is the one the IOMMU client calls, so its record is never
     /// released: a death fails the client closed instead
@@ -2016,20 +1485,21 @@ struct ServedDrivers
 
 impl ServedDrivers
 {
-    fn class_mut(&mut self, class: DriverClass) -> &mut Served<ServedDriver>
+    /// The driver at `ordinal` of `class`; [`Lookup::Absent`] when no driver
+    /// of the class is served there or `ordinal` is `None`.
+    fn lookup(&self, class: &str, ordinal: Option<usize>) -> Lookup<'_, ServedDriver>
     {
-        match class
+        match (self.classes.get(class), ordinal)
         {
-            DriverClass::Block => &mut self.block,
-            DriverClass::Input => &mut self.input,
-            DriverClass::DebugPort => &mut self.debug_port,
-            DriverClass::Serial => &mut self.serial,
-            DriverClass::Framebuffer => &mut self.framebuffer,
-            DriverClass::Rtc => &mut self.rtc,
-            DriverClass::TestFault => &mut self.test_fault,
-            DriverClass::TestDma => &mut self.test_dma,
-            DriverClass::Iommu => &mut self.iommu,
+            (Some(served), Some(i)) => served.get(i),
+            _ => Lookup::Absent,
         }
+    }
+
+    /// The first live driver of `class`.
+    fn first_live(&self, class: &str) -> Option<&ServedDriver>
+    {
+        self.classes.get(class).and_then(Served::first_live)
     }
 
     /// Record the client the ready IOMMU driver is called through, so its
@@ -2068,16 +1538,15 @@ impl ServedDrivers
         {
             return;
         }
-        let confined = |d: &ServedDriver| d.dev_caps.as_ref().is_some_and(|c| c.dma.confined());
-        for class in [
-            DriverClass::Block,
-            DriverClass::Input,
-            DriverClass::DebugPort,
-            DriverClass::TestDma,
-        ]
+        let confined = |d: &ServedDriver| {
+            d.dev_caps
+                .as_ref()
+                .is_some_and(bind::PciDeviceCaps::confined)
+        };
+        for (class, served) in self.classes.iter_mut()
         {
-            self.class_mut(class).withdraw_matching(confined, |d| {
-                std::os::seraph::log!("{}: its device's IOMMU is gone; withdrawn", class.name());
+            served.withdraw_matching(confined, |d| {
+                std::os::seraph::log!("{}: its device's IOMMU is gone; withdrawn", class.as_str());
                 d.withdraw(ipc_buf);
             });
         }
@@ -2085,16 +1554,16 @@ impl ServedDrivers
 
     /// Serve a settled batch: append every driver that reported its device
     /// ready to its class, in spawn order, the order the registry's instance
-    /// ordinals count, releasing its process handle unless it drives a
-    /// `VirtIO` device; withdraw every other driver
-    /// ([`ServedDriver::withdraw`]), which destroys one still pending (the
-    /// settle's bound elapsed before it reported ready or died).
+    /// ordinals count, releasing its process handle unless it drives a PCI
+    /// device; withdraw every other driver ([`ServedDriver::withdraw`]),
+    /// which destroys one still pending (the settle's bound elapsed before it
+    /// reported ready or died).
     fn serve(&mut self, roster: Roster<SpawnedDriver>, ipc_buf: *mut u64)
     {
         for (state, mut spawned) in roster.into_outcomes()
         {
-            let name = spawned.class.name();
-            if spawned.class == DriverClass::Iommu && state != DriverState::Ready
+            let name = spawned.name.as_str();
+            if spawned.serves == Serves::Iommu && state != DriverState::Ready
             {
                 // Destroyed but not released: its service endpoint is the
                 // IOMMU client's, which is never deleted.
@@ -2113,29 +1582,41 @@ impl ServedDrivers
                             .driver
                             .dev_caps
                             .as_ref()
-                            .is_some_and(|c| c.dma.confined()) =>
+                            .is_some_and(bind::PciDeviceCaps::confined) =>
                 {
                     std::os::seraph::log!("{}: its device's IOMMU is gone; withdrawn", name);
                     spawned.driver.withdraw(ipc_buf);
                 }
                 DriverState::Ready =>
                 {
-                    let class = self.class_mut(spawned.class);
-                    if class.try_reserve(1).is_err()
+                    let list = match spawned.serves
                     {
-                        std::os::seraph::log!("{}: no memory to serve the driver; destroyed", name);
-                        spawned.driver.withdraw(ipc_buf);
-                    }
+                        Serves::Class(class) => self.classes.intern(&class),
+                        Serves::Iommu => Some(&mut self.iommu),
+                    };
+                    let Some(list) = list
                     else
                     {
-                        if spawned.driver.dev_caps.is_none()
-                        {
-                            let _ = syscall::cap_delete(spawned.driver.process_handle);
-                            spawned.driver.process_handle = 0;
-                        }
-                        // Room was reserved just above, so the push holds.
-                        let _ = class.push(spawned.badge, spawned.driver);
+                        std::os::seraph::log!(
+                            "{}: no room for the driver's class; destroyed",
+                            name
+                        );
+                        spawned.driver.withdraw(ipc_buf);
+                        continue;
+                    };
+                    if list.try_reserve(1).is_err()
+                    {
+                        std::os::seraph::log!("{}: no room to serve the driver; destroyed", name);
+                        spawned.driver.withdraw(ipc_buf);
+                        continue;
                     }
+                    if spawned.driver.dev_caps.is_none()
+                    {
+                        let _ = syscall::cap_delete(spawned.driver.process_handle);
+                        spawned.driver.process_handle = 0;
+                    }
+                    // Room was reserved just above, so the push holds.
+                    let _ = list.push(spawned.badge, spawned.driver);
                 }
                 DriverState::Dead =>
                 {
@@ -2175,22 +1656,13 @@ impl ServedDrivers
             self.fail_iommu(ipc_buf);
             return;
         }
-        for class in [
-            DriverClass::Block,
-            DriverClass::Input,
-            DriverClass::DebugPort,
-            DriverClass::Serial,
-            DriverClass::Framebuffer,
-            DriverClass::Rtc,
-            DriverClass::TestFault,
-            DriverClass::TestDma,
-        ]
+        for (class, served) in self.classes.iter_mut()
         {
-            if let Some(driver) = self.class_mut(class).withdraw(post.badge)
+            if let Some(driver) = served.withdraw(post.badge)
             {
                 std::os::seraph::log!(
                     "{}: served driver of device {} died (reason={:#x}); withdrawn",
-                    class.name(),
+                    class.as_str(),
                     post.badge,
                     post.reason
                 );
@@ -2244,15 +1716,15 @@ fn settle_batch(
     served.serve(roster, ipc_buf);
 }
 
-/// Spawn and settle the boot batch: a virtio-blk driver for every virtio-blk
-/// device that gets an IRQ cap, in BDF order, then the serial and
-/// framebuffer drivers, all from boot modules. The registry loop opens only
-/// after it, so every client sees the settled drivers.
-// too_many_arguments: the batch spans every device class the boot bundle
-// carries; each argument is state one of its spawns consumes.
+/// Spawn and settle the boot batch: the boot pass over the PCI records
+/// ([`bind::boot_pass`]), then the serial and framebuffer drivers, all from
+/// boot modules. The registry loop opens only after it, so every client sees
+/// the settled drivers.
+// too_many_arguments: the batch spans every PCI bind and the console pair;
+// each argument is state one of its spawns consumes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_boot_drivers(
-    devices: &[pci::PciDevice],
+    records: &mut bind::PciRecords,
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
     uart_irq: u64,
@@ -2266,26 +1738,31 @@ fn spawn_boot_drivers(
     else
     {
         std::os::seraph::log!("boot batch: no settle batch; no driver spawned");
-        for kind in [
-            caps::module_kind::VIRTIO_BLK,
-            caps::module_kind::SERIAL,
-            caps::module_kind::FRAMEBUFFER,
-        ]
+        // A retained module cap pins the pool run init donated it from. The
+        // IOMMU module was consumed or released by its bring-up.
+        for (slot, module) in caps.driver_modules.iter_mut().enumerate()
         {
-            drop(spawn::ModuleCapGuard::new(caps.module_cap_for_kind(kind)));
+            if caps::module_kind::index(caps::module_kind::IOMMU) != Some(slot)
+            {
+                drop(spawn::ModuleCapGuard::new(core::mem::take(module)));
+            }
         }
         return;
     };
     let mut roster = Roster::new();
     let death_eq = watch.death_eq();
-    spawn_virtio_blk_all(
-        devices,
-        caps,
-        irq_range,
-        &batch,
-        death_eq,
-        &mut roster,
-        catalog,
+    bind::boot_pass(
+        records,
+        &mut bind::Carve {
+            caps,
+            irq_range,
+            catalog,
+        },
+        &mut bind::Pass {
+            batch: &batch,
+            death_eq,
+            roster: &mut roster,
+        },
         ipc_buf,
     );
     spawn_serial(
@@ -2309,158 +1786,6 @@ fn spawn_boot_drivers(
     );
 }
 
-/// Spawn a `VirtIO` block driver for every virtio-blk device that gets an
-/// IRQ cap, in BDF order, each from a copy of the boot module and with its
-/// own service endpoint, into the settle `batch`, recording each in
-/// `roster`. A device is skipped, logged, when no module was delivered, its
-/// caps cannot be carved, it gets no IRQ cap (virtio-blk requires one; for
-/// instance, a line no held range covers gives none), or its spawn fails.
-// too_many_arguments: the carve state, the batch's objects, and the roster
-// are each consumed per device.
-#[allow(clippy::too_many_arguments)]
-fn spawn_virtio_blk_all(
-    devices: &[pci::PciDevice],
-    caps: &mut caps::DevmgrCaps,
-    irq_range: &mut IrqRangeAllocator,
-    batch: &settle::SettleBatch,
-    death_eq: u64,
-    roster: &mut Roster<SpawnedDriver>,
-    catalog: &mut DeviceCatalog,
-    ipc_buf: *mut u64,
-)
-{
-    // Guard the boot module across every exit. A retained module cap is a
-    // live derivation child of init's donated pool-run source and pins that
-    // run unsplittable; each spawn takes a derived copy, and the guard
-    // releases the original once every device is served.
-    let module_cap = caps.module_cap_for_kind(caps::module_kind::VIRTIO_BLK);
-    let _module_guard = spawn::ModuleCapGuard::new(module_cap);
-
-    if !devices.iter().any(pci::is_virtio_blk)
-    {
-        return;
-    }
-    if module_cap == 0
-    {
-        std::os::seraph::log!("no virtio-blk driver module available");
-        return;
-    }
-
-    for pci_dev in devices.iter().filter(|d| pci::is_virtio_blk(d))
-    {
-        if roster.try_reserve_one().is_err()
-        {
-            std::os::seraph::log!("virtio-blk: no memory to record a driver; not spawned");
-            break;
-        }
-        let Some(dev_caps) = carve_virtio_device("virtio-blk", pci_dev, caps, irq_range, catalog)
-        else
-        {
-            continue;
-        };
-        if let Some((ep, child)) =
-            spawn_one_virtio_blk(caps, module_cap, &dev_caps, batch, death_eq, ipc_buf)
-        {
-            let mut dev_caps = dev_caps;
-            dev_caps.release_token = child.release_token;
-            let spawned = SpawnedDriver {
-                class: DriverClass::Block,
-                badge: dev_caps.device_badge,
-                driver: ServedDriver {
-                    ep,
-                    dev_caps: Some(dev_caps),
-                    process_handle: child.process_handle,
-                },
-            };
-            record_spawned(roster, spawned, ipc_buf);
-        }
-        else
-        {
-            dev_caps.release();
-        }
-    }
-}
-
-/// Spawn one virtio-blk driver for the carved `dev_caps` from a copy of
-/// `module_cap`, with a fresh service endpoint, into the settle `batch`.
-/// Returns that endpoint and the driver's process handle and release token
-/// when the driver completed its bootstrap; on `None` the caller releases
-/// `dev_caps`.
-fn spawn_one_virtio_blk(
-    caps: &caps::DevmgrCaps,
-    module_cap: u64,
-    dev_caps: &VirtioDeviceCaps,
-    batch: &settle::SettleBatch,
-    death_eq: u64,
-    ipc_buf: *mut u64,
-) -> Option<(u64, spawn::HeldChild)>
-{
-    // virtio-blk requires an IRQ: delivered an absent IRQ slot, it exits
-    // after its bootstrap, which would leave the device registered with no
-    // driver serving it. Refuse the spawn instead. A disk on a line another
-    // device holds gets an IRQ cap too (a derivation of the held line).
-    let Some(irq_cap) = dev_caps.irq_cap
-    else
-    {
-        std::os::seraph::log!("virtio-blk: no IRQ cap for the device; not spawned");
-        return None;
-    };
-    let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
-    else
-    {
-        std::os::seraph::log!("virtio-blk: module cap derivation failed; not spawned");
-        return None;
-    };
-    let Some(blk_ep) = create_service_endpoint()
-    else
-    {
-        std::os::seraph::log!("virtio-blk: failed to create service endpoint; not spawned");
-        let _ = syscall::cap_delete(module_copy);
-        return None;
-    };
-    let config = spawn::DriverSpawnConfig {
-        procmgr_ep: caps.procmgr_ep,
-        bootstrap_ep: caps.self_bootstrap_ep,
-        source: spawn::CreateSource::Module(module_copy),
-        bars: dev_caps.bars.as_slice(),
-        dma_cap: dev_caps.dma.cap(),
-        irq_cap: Some(irq_cap),
-        irq_mode: dev_caps.irq_mode,
-        service_ep: blk_ep,
-        query_ep: batch.driver_ep(),
-        death_eq,
-        // Deliberately index-derived (not randomized like the
-        // cross-boundary service badges, #249): this badge names a specific
-        // device-catalog slot — the driver enforces its own badge per
-        // registered device — so it is a semantically-meaningful identity,
-        // not an enumerable correlator.
-        device_badge: dev_caps.device_badge,
-        // Boot-critical: the root-disk path.
-        priority: ipc::sched_policy::BOOT_DRIVER_PRIORITY,
-    };
-    // `spawn_driver` owns the module copy's lifecycle from here (consumed by
-    // CREATE_PROCESS, or released on failure).
-    match spawn::spawn_driver(&config, ipc_buf)
-    {
-        spawn::DriverSpawn::Bootstrapped(child) =>
-        {
-            std::os::seraph::log!("devmgr: virtio-blk driver spawned");
-            Some((blk_ep, child))
-        }
-        spawn::DriverSpawn::Unbootstrapped(child) =>
-        {
-            withdraw_device(dev_caps, child, ipc_buf);
-            let _ = syscall::cap_delete(blk_ep);
-            None
-        }
-        spawn::DriverSpawn::Failed =>
-        {
-            let _ = syscall::cap_delete(blk_ep);
-            None
-        }
-    }
-}
-
 /// Create a driver service endpoint devmgr owns; `None` when it cannot be
 /// created.
 fn create_service_endpoint() -> Option<u64>
@@ -2470,199 +1795,23 @@ fn create_service_endpoint() -> Option<u64>
     })
 }
 
-/// A PCI device's own single-line `Interrupt` cap: a derivation of the held
-/// cap of its GSI's line ([`IrqRangeAllocator::line_cap`]), so a device whose
-/// line another device already holds gets one too. `None`, logged, when the
-/// device names no line or no cap can be had for it.
-fn acquire_single_irq_cap(
-    pci_dev: &pci::PciDevice,
-    irq_range: &mut IrqRangeAllocator,
-) -> Option<u64>
-{
-    let gsi = device_gsi(pci_dev)?;
-    match irq_range.line_cap(gsi)
-    {
-        Ok(cap) =>
-        {
-            std::os::seraph::log!(
-                "IRQ cap for GSI {:#x}, mode {:#x}",
-                u64::from(gsi),
-                irq_range.line_mode(gsi)
-            );
-            Some(cap)
-        }
-        Err(LineError::Hold(HoldError::Split(CarveError::NotCovered))) =>
-        {
-            std::os::seraph::log!(
-                "GSI {:#x} not in the held IRQ range (or no range); no IRQ cap",
-                u64::from(gsi)
-            );
-            None
-        }
-        Err(e) =>
-        {
-            std::os::seraph::log!("no IRQ cap for GSI {:#x} ({:?})", u64::from(gsi), e);
-            None
-        }
-    }
-}
-
-/// Compute the GSI for a PCI device: the firmware-programmed config-space
-/// IRQ line when one is set, else the arch `INTx` routing fallback
-/// ([`arch::current::intx_fallback_gsi`]).
-fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
-{
-    if pci_dev.irq_line != 0 && pci_dev.irq_line != 0xFF
-    {
-        return Some(u32::from(pci_dev.irq_line));
-    }
-    arch::current::intx_fallback_gsi(pci_dev.irq_pin, pci_dev.dev)
-}
-
-/// Carve an `Mmio` cap for every BAR a `VirtIO` device's register regions
-/// name, in the order of its [`virtio_core::RegisterLayout::bars`].
-/// Returns `None`, logged and with every cap carved so far released, when
-/// the device presents no complete set of register regions, a BAR they name
-/// is not an MMIO BAR, or no aperture covers one.
-fn carve_virtio_bars(
-    name: &str,
-    pci_dev: &pci::PciDevice,
-    caps: &mut caps::DevmgrCaps,
-) -> Option<VirtioBars>
-{
-    let Some(layout) = pci_dev.virtio_info.register_layout()
-    else
-    {
-        std::os::seraph::log!(
-            "{}: device presents no complete set of VirtIO register regions; not spawned",
-            name
-        );
-        return None;
-    };
-    let mut bars = VirtioBars {
-        bars: [spawn::BarSpec::default(); virtio_core::MAX_VIRTIO_BARS],
-        count: 0,
-    };
-    for aperture in layout.bars()
-    {
-        let Some(b) = (0..pci_dev.bar_count)
-            .find(|&b| pci_dev.bar_pci_idx[b] == aperture.bar && pci_dev.bar_is_mmio[b])
-        else
-        {
-            std::os::seraph::log!(
-                "{}: VirtIO BAR {} is not an MMIO BAR; not spawned",
-                name,
-                aperture.bar
-            );
-            bars.release();
-            return None;
-        };
-        std::os::seraph::log!(
-            "{}: VirtIO BAR {} phys={:#018x} size={:#018x}",
-            name,
-            aperture.bar,
-            pci_dev.bar_phys[b],
-            pci_dev.bar_size[b]
-        );
-        // The driver maps the BAR into `aperture.pages` pages of its register
-        // window and `mmio_map` maps the whole cap region, so the cap covers
-        // no more of the BAR than the regions in it reach.
-        let size = pci_dev.bar_size[b].min(aperture.pages * PAGE_SIZE);
-        let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], size)
-        else
-        {
-            std::os::seraph::log!(
-                "{}: VirtIO BAR {} not covered by any aperture; not spawned",
-                name,
-                aperture.bar
-            );
-            bars.release();
-            return None;
-        };
-        bars.bars[bars.count] = spawn::BarSpec {
-            bar: aperture.bar,
-            cap,
-            bytes: size,
-        };
-        bars.count += 1;
-    }
-    Some(bars)
-}
-
-// ── VirtIO input and console drivers: deferred on-disk spawn ───────────────
-
-/// Discover every virtio-input device, in BDF order: fill its
-/// `DeviceCatalog` entry and carve its BAR + IRQ caps, returning the stash
-/// for a deferred on-disk spawn. Mirrors the discovery half of
-/// [`spawn_virtio_blk_all`] but does not spawn — the binary lives on the
-/// rootfs and is loaded later by the `SET_DRIVERS_DIR` handler (it is not
-/// bootstrap-essential).
-fn enumerate_virtio_input(
-    devices: &[pci::PciDevice],
-    caps: &mut caps::DevmgrCaps,
-    irq_range: &mut IrqRangeAllocator,
-    catalog: &mut DeviceCatalog,
-) -> Vec<VirtioDeviceCaps>
-{
-    let mut pending = Vec::new();
-    for pci_dev in devices.iter().filter(|d| pci::is_virtio_input(d))
-    {
-        if pending.try_reserve(1).is_err()
-        {
-            std::os::seraph::log!("virtio-input: no memory to record a device; not spawned");
-            break;
-        }
-        if let Some(dev_caps) =
-            carve_virtio_device("virtio-input", pci_dev, caps, irq_range, catalog)
-        {
-            pending.push(dev_caps);
-        }
-    }
-    pending
-}
-
-/// Discover the debug port: the first virtio-console device in BDF order,
-/// its catalog entry filled and its BAR + IRQ caps carved for a deferred
-/// on-disk spawn, as [`enumerate_virtio_input`] does for each keyboard.
-/// `None` when the machine presents no such device, which is every boot that
-/// does not ask for a debug port, or when its carve fails. A further console
-/// device is left unbound: one consumer owns the debug port.
-fn enumerate_debug_port(
-    devices: &[pci::PciDevice],
-    caps: &mut caps::DevmgrCaps,
-    irq_range: &mut IrqRangeAllocator,
-    catalog: &mut DeviceCatalog,
-) -> Option<VirtioDeviceCaps>
-{
-    let pci_dev = devices.iter().find(|d| pci::is_virtio_console(d))?;
-    let dev_caps = carve_virtio_device(
-        DriverClass::DebugPort.name(),
-        pci_dev,
-        caps,
-        irq_range,
-        catalog,
-    )?;
-    std::os::seraph::log!("devmgr: debug port enumerated (deferred spawn)");
-    Some(dev_caps)
-}
-
 /// Spawn and settle the on-disk batch, from inside the `SET_DRIVERS_DIR`
 /// registry-loop arm, after the handler's `ipc_reply` to svcmgr and before
-/// devmgr's next receive: the platform RTC driver, then the virtio-input
-/// driver of every stashed device, in BDF order, then the debug port's
-/// virtio-console driver, each walked through `drivers_dir_cap`, the
-/// `LOOKUP | READ`-attenuated `/services/drivers/` subtree cap svcmgr
-/// delivered (namespace-protocol rights, not kernel cap rights). A driver not
-/// spawned, or not ready when the batch settles, is never served, and its
-/// device's carved caps are released.
-// too_many_arguments: the batch spans every on-disk driver class; each
+/// devmgr's next receive: the platform RTC driver, then the
+/// drivers-directory pass over the PCI records no boot driver was bound to
+/// ([`bind::drivers_dir_pass`]), each binary read through `drivers_dir_cap`,
+/// the `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` subtree cap
+/// svcmgr delivered (namespace-protocol rights, not kernel cap rights). A
+/// driver not spawned, or not ready when the batch settles, is never served,
+/// and its device's carved caps are released.
+// too_many_arguments: the batch spans the RTC and every PCI bind; each
 // argument is state one of its spawns consumes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_on_disk_drivers(
+    records: &mut bind::PciRecords,
     caps: &mut caps::DevmgrCaps,
+    irq_range: &mut IrqRangeAllocator,
     drivers_dir_cap: u64,
-    pending_inputs: Vec<VirtioDeviceCaps>,
-    pending_debug_port: Option<VirtioDeviceCaps>,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
     served: &mut ServedDrivers,
@@ -2673,10 +1822,6 @@ fn spawn_on_disk_drivers(
     else
     {
         std::os::seraph::log!("on-disk batch: no settle batch; no driver spawned");
-        for dev_caps in pending_inputs.iter().chain(&pending_debug_port)
-        {
-            dev_caps.release();
-        }
         return;
     };
     let mut roster = Roster::new();
@@ -2690,45 +1835,21 @@ fn spawn_on_disk_drivers(
         catalog,
         ipc_buf,
     );
-    let pending = pending_inputs
-        .into_iter()
-        .map(|d| (DriverClass::Input, d))
-        .chain(pending_debug_port.map(|d| (DriverClass::DebugPort, d)));
-    for (class, dev_caps) in pending
-    {
-        if roster.try_reserve_one().is_err()
-        {
-            std::os::seraph::log!(
-                "{}: no memory to record a driver; not spawned",
-                class.name()
-            );
-            dev_caps.release();
-            continue;
-        }
-        if let Some((ep, child)) = spawn_virtio_from_disk(
-            class,
+    bind::drivers_dir_pass(
+        records,
+        drivers_dir_cap,
+        &mut bind::Carve {
             caps,
-            &dev_caps,
-            &batch,
+            irq_range,
+            catalog,
+        },
+        &mut bind::Pass {
+            batch: &batch,
             death_eq,
-            drivers_dir_cap,
-            ipc_buf,
-        )
-        {
-            let mut dev_caps = dev_caps;
-            dev_caps.release_token = child.release_token;
-            let spawned = SpawnedDriver {
-                class,
-                badge: dev_caps.device_badge,
-                driver: ServedDriver {
-                    ep,
-                    dev_caps: Some(dev_caps),
-                    process_handle: child.process_handle,
-                },
-            };
-            record_spawned(&mut roster, spawned, ipc_buf);
-        }
-    }
+            roster: &mut roster,
+        },
+        ipc_buf,
+    );
     settle_batch(
         batch,
         roster,
@@ -2738,93 +1859,6 @@ fn spawn_on_disk_drivers(
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
-}
-
-/// Spawn the on-disk `VirtIO` driver of `class` for one stashed device into
-/// the settle `batch`. Walks `/services/drivers/<name>`, the class's
-/// [`DriverClass::name`] (`virtio-input` or `virtio-console`), through the
-/// `SET_DRIVERS_DIR` subtree cap, then hands the carved BAR/IRQ caps (stashed
-/// at enumeration) to the file-source PCI spawn path. Returns the freshly
-/// created service endpoint and the driver's process handle and release token
-/// on success.
-/// Mirrors [`spawn_rtc_from_disk`], but uses [`spawn::spawn_driver`] (BAR +
-/// IRQ + device-info) rather than the simple-device path. On failure it
-/// returns `None` and releases the stashed BAR and IRQ caps.
-fn spawn_virtio_from_disk(
-    class: DriverClass,
-    caps: &mut caps::DevmgrCaps,
-    pending: &VirtioDeviceCaps,
-    batch: &settle::SettleBatch,
-    death_eq: u64,
-    drivers_dir_cap: u64,
-    ipc_buf: *mut u64,
-) -> Option<(u64, spawn::HeldChild)>
-{
-    let name = class.name();
-    let requested_rights = u64::from(namespace_protocol::rights::READ);
-    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
-    // registered at startup), passed down unchanged.
-    let walked = unsafe {
-        ns_client::walk_to_file(drivers_dir_cap, name.as_bytes(), requested_rights, ipc_buf)
-    };
-    let Some(walked) = walked
-    else
-    {
-        std::os::seraph::log!("{}: walk_to_file failed (binary missing on rootfs)", name);
-        pending.release();
-        return None;
-    };
-
-    let Some(service_ep) = create_service_endpoint()
-    else
-    {
-        std::os::seraph::log!("{}: failed to create service endpoint", name);
-        let _ = syscall::cap_delete(walked.file_cap);
-        pending.release();
-        return None;
-    };
-
-    let config = spawn::DriverSpawnConfig {
-        procmgr_ep: caps.procmgr_ep,
-        bootstrap_ep: caps.self_bootstrap_ep,
-        source: spawn::CreateSource::File {
-            file_cap: walked.file_cap,
-            size: walked.size,
-        },
-        bars: pending.bars.as_slice(),
-        dma_cap: pending.dma.cap(),
-        irq_cap: pending.irq_cap,
-        irq_mode: pending.irq_mode,
-        service_ep,
-        query_ep: batch.driver_ep(),
-        death_eq,
-        device_badge: pending.device_badge,
-        priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
-    };
-
-    // `spawn_driver` owns the file cap's lifecycle from here (consumed by
-    // CREATE_FROM_FILE, or released on failure).
-    match spawn::spawn_driver(&config, ipc_buf)
-    {
-        spawn::DriverSpawn::Bootstrapped(child) =>
-        {
-            std::os::seraph::log!("devmgr: {} driver spawned from disk", name);
-            Some((service_ep, child))
-        }
-        spawn::DriverSpawn::Unbootstrapped(child) =>
-        {
-            withdraw_device(pending, child, ipc_buf);
-            let _ = syscall::cap_delete(service_ep);
-            pending.release();
-            None
-        }
-        spawn::DriverSpawn::Failed =>
-        {
-            let _ = syscall::cap_delete(service_ep);
-            pending.release();
-            None
-        }
-    }
 }
 
 // ── Simple-device driver spawns ─────────────────────────────────────────────
@@ -2878,22 +1912,24 @@ impl SimpleDeviceSlots
 }
 
 /// Spawn one simple-device driver through `config` (whose service endpoint,
-/// query cap, and device badge are `slots`') and record it in `roster` under
-/// `class`. On a failed spawn the service endpoint is released; the spawn
-/// path released the rest.
+/// query cap, and device badge are `slots`') and record it in `roster` as
+/// `driver`, a name and the class it is served under. On a failed spawn the
+/// service endpoint is released; the spawn path released the rest.
 fn spawn_simple_into(
-    class: DriverClass,
+    driver: (DriverName, ClassName),
     config: &spawn::SimpleSpawnConfig,
     slots: &SimpleDeviceSlots,
     roster: &mut Roster<SpawnedDriver>,
     ipc_buf: *mut u64,
 )
 {
+    let (name, class) = driver;
     if let Some(process_handle) = spawn::spawn_simple_device(config, ipc_buf)
     {
-        std::os::seraph::log!("devmgr: {} driver spawned", class.name());
+        std::os::seraph::log!("devmgr: {} driver spawned", name.as_str());
         let spawned = SpawnedDriver {
-            class,
+            name,
+            serves: Serves::Class(class),
             badge: slots.device_badge,
             driver: ServedDriver {
                 ep: slots.service_ep,
@@ -2975,7 +2011,7 @@ fn spawn_serial(
         // Boot-critical: the console path.
         priority: ipc::sched_policy::BOOT_DRIVER_PRIORITY,
     };
-    spawn_simple_into(DriverClass::Serial, &config, &slots, roster, ipc_buf);
+    spawn_simple_into(fixed::SERIAL, &config, &slots, roster, ipc_buf);
 }
 
 /// Carve a narrow `Mmio` cap covering the linear framebuffer and spawn the
@@ -3085,7 +2121,7 @@ fn spawn_framebuffer(
         round1_words: &[],
         priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
     };
-    spawn_simple_into(DriverClass::Framebuffer, &config, &slots, roster, ipc_buf);
+    spawn_simple_into(fixed::FRAMEBUFFER, &config, &slots, roster, ipc_buf);
 }
 
 /// Spawn the platform RTC driver — CMOS on x86-64, goldfish-RTC on
@@ -3174,7 +2210,7 @@ fn spawn_rtc_from_disk(
         round1_words: word.as_slice(),
         priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
     };
-    spawn_simple_into(DriverClass::Rtc, &config, &slots, roster, ipc_buf);
+    spawn_simple_into(fixed::RTC, &config, &slots, roster, ipc_buf);
 }
 
 /// TODO(#165): remove with the devmgr enumeration redesign.
@@ -3182,7 +2218,7 @@ fn spawn_rtc_from_disk(
 /// Spawn and settle the test-only fault batch: three `test-fault` fixtures
 /// from `/services/drivers/`, two that report ready and one that never does,
 /// in one settle batch bounded by `TEST_FAULT_SETTLE_TIMEOUT_MS`, served as
-/// the `TestFault` class. svctest observes the never-ready fixture withdrawn
+/// the `test-fault` class. svctest observes the never-ready fixture withdrawn
 /// and destroyed at the bound, then makes a served one die and observes its
 /// withdrawal and tombstone.
 fn spawn_test_fault_drivers(
@@ -3219,194 +2255,6 @@ fn spawn_test_fault_drivers(
     }
     let bound = core::time::Duration::from_millis(ipc::devmgr_labels::TEST_FAULT_SETTLE_TIMEOUT_MS);
     settle_batch(batch, roster, watch, catalog, served, bound, ipc_buf);
-}
-
-/// TODO(#165): remove with the test labels. Bind the DMA test device `edu`
-/// (QEMU's `edu`) to the on-disk `test-dma` fixture in a settle batch of its
-/// own, served as the `TestDma` class: carve the first page of its BAR 0
-/// (its identification and DMA registers) and its configuration page, give
-/// it its DMA grant, attaching it to its IOMMU domain where a unit
-/// translates it ([`grant_dma`]), turn on its memory decode and bus
-/// mastering, which the firmware leaves off for a device no firmware driver
-/// binds, and spawn the fixture through the PCI spawn path. Logged, and
-/// nothing served, on any failure.
-fn spawn_test_dma_driver(
-    edu: &pci::PciDevice,
-    caps: &mut caps::DevmgrCaps,
-    drivers_dir_cap: u64,
-    watch: &mut settle::DriverWatch,
-    catalog: &mut DeviceCatalog,
-    served: &mut ServedDrivers,
-    ipc_buf: *mut u64,
-)
-{
-    let name = "test-dma";
-    let Some(dev_caps) = carve_test_dma_device(name, edu, caps, catalog)
-    else
-    {
-        return;
-    };
-    let Some(batch) = settle::SettleBatch::new()
-    else
-    {
-        std::os::seraph::log!("{}: no settle batch; not spawned", name);
-        dev_caps.release();
-        return;
-    };
-    let mut roster = Roster::new();
-    let requested_rights = u64::from(namespace_protocol::rights::READ);
-    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
-    // registered at startup), passed down unchanged.
-    let walked =
-        unsafe { ns_client::walk_to_file(drivers_dir_cap, b"test-dma", requested_rights, ipc_buf) };
-    let (Some(walked), Ok(())) = (walked, roster.try_reserve_one())
-    else
-    {
-        std::os::seraph::log!(
-            "{}: binary missing on rootfs or no roster room; not spawned",
-            name
-        );
-        dev_caps.release();
-        return;
-    };
-    let Some(ep) = create_service_endpoint()
-    else
-    {
-        std::os::seraph::log!("{}: no service endpoint; not spawned", name);
-        let _ = syscall::cap_delete(walked.file_cap);
-        dev_caps.release();
-        return;
-    };
-    let config = spawn::DriverSpawnConfig {
-        procmgr_ep: caps.procmgr_ep,
-        bootstrap_ep: caps.self_bootstrap_ep,
-        source: spawn::CreateSource::File {
-            file_cap: walked.file_cap,
-            size: walked.size,
-        },
-        bars: dev_caps.bars.as_slice(),
-        dma_cap: dev_caps.dma.cap(),
-        irq_cap: None,
-        irq_mode: 0,
-        service_ep: ep,
-        query_ep: batch.driver_ep(),
-        death_eq: watch.death_eq(),
-        device_badge: dev_caps.device_badge,
-        priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
-    };
-    match spawn::spawn_driver(&config, ipc_buf)
-    {
-        spawn::DriverSpawn::Bootstrapped(child) =>
-        {
-            let mut dev_caps = dev_caps;
-            dev_caps.release_token = child.release_token;
-            let spawned = SpawnedDriver {
-                class: DriverClass::TestDma,
-                badge: dev_caps.device_badge,
-                driver: ServedDriver {
-                    ep,
-                    dev_caps: Some(dev_caps),
-                    process_handle: child.process_handle,
-                },
-            };
-            record_spawned(&mut roster, spawned, ipc_buf);
-        }
-        spawn::DriverSpawn::Unbootstrapped(child) =>
-        {
-            withdraw_device(&dev_caps, child, ipc_buf);
-            let _ = syscall::cap_delete(ep);
-            dev_caps.release();
-        }
-        spawn::DriverSpawn::Failed =>
-        {
-            let _ = syscall::cap_delete(ep);
-            dev_caps.release();
-        }
-    }
-    settle_batch(
-        batch,
-        roster,
-        watch,
-        catalog,
-        served,
-        settle::SETTLE_TIMEOUT,
-        ipc_buf,
-    );
-}
-
-/// TODO(#165): remove with [`spawn_test_dma_driver`]. Carve the DMA test
-/// device's caps, add its catalog entry, give it its DMA grant, and turn on
-/// its memory decode and bus mastering; `None`, logged and with what it
-/// carved released, on any failure. The device has no reset target, so its
-/// withdrawal releases the fixture's memory only when the IOMMU blocks it.
-fn carve_test_dma_device(
-    name: &str,
-    edu: &pci::PciDevice,
-    caps: &mut caps::DevmgrCaps,
-    catalog: &mut DeviceCatalog,
-) -> Option<VirtioDeviceCaps>
-{
-    let Some(b) = (0..edu.bar_count).find(|&b| edu.bar_pci_idx[b] == 0 && edu.bar_is_mmio[b])
-    else
-    {
-        std::os::seraph::log!("{}: the device has no MMIO BAR 0; not spawned", name);
-        return None;
-    };
-    let Some(bar_cap) = carve_subrange(caps, edu.bar_phys[b], PAGE_SIZE)
-    else
-    {
-        std::os::seraph::log!("{}: BAR 0 not covered by any aperture; not spawned", name);
-        return None;
-    };
-    let mut bars = VirtioBars {
-        bars: [spawn::BarSpec::default(); virtio_core::MAX_VIRTIO_BARS],
-        count: 1,
-    };
-    bars.bars[0] = spawn::BarSpec {
-        bar: 0,
-        cap: bar_cap,
-        bytes: PAGE_SIZE,
-    };
-    let Some(config) = carve_function_config(name, edu, caps)
-    else
-    {
-        bars.release();
-        return None;
-    };
-    let release = |bars: &VirtioBars| {
-        bars.release();
-        let _ = syscall::cap_delete(config.cap);
-    };
-    let Some(device_badge) = catalog.add_without_info()
-    else
-    {
-        std::os::seraph::log!("{}: catalog entry not added; not spawned", name);
-        release(&bars);
-        return None;
-    };
-    let Some(dma) = grant_dma(name, edu, caps, device_badge)
-    else
-    {
-        release(&bars);
-        return None;
-    };
-    let dev_caps = VirtioDeviceCaps {
-        bars,
-        dma,
-        config,
-        irq_cap: None,
-        irq_mode: 0,
-        device_badge,
-        reset: None,
-        release_token: 0,
-    };
-    if !dev_caps.config.enable_memory_and_bus_master()
-    {
-        std::os::seraph::log!("{}: configuration page not mapped; not spawned", name);
-        dev_caps.release();
-        return None;
-    }
-    Some(dev_caps)
 }
 
 /// TODO(#165): remove with [`spawn_test_fault_drivers`]. Spawn one
@@ -3480,7 +2328,7 @@ fn spawn_one_test_fault(
         round1_words: &words,
         priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
     };
-    spawn_simple_into(DriverClass::TestFault, &config, &slots, roster, ipc_buf);
+    spawn_simple_into(fixed::TEST_FAULT, &config, &slots, roster, ipc_buf);
 }
 
 /// TODO(#165): remove with the devmgr enumeration redesign.

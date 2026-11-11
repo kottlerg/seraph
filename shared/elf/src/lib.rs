@@ -876,8 +876,7 @@ pub fn parse_stack_note(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<u32>
 /// Used by procmgr's VFS-streaming spawn path: the section header table
 /// and the matching note section are fetched on demand via the same
 /// `vfs_read` primitive that loads `PT_LOAD` pages.
-pub fn parse_stack_note_streaming<F>(ehdr: &Elf64Ehdr, file_size: u64, read_at: F)
--> Option<u32>
+pub fn parse_stack_note_streaming<F>(ehdr: &Elf64Ehdr, file_size: u64, read_at: F) -> Option<u32>
 where
     F: FnMut(u64, &mut [u8]) -> Option<usize>,
 {
@@ -2455,7 +2454,10 @@ mod tests
         let img = image_with_notes(DRIVER_NAME, &note_record(b"seraph", NT_DRIVER, &desc));
         let (in_memory, streaming) = located(&img, b"seraph", NT_DRIVER);
         assert_eq!(in_memory.as_deref(), Some(&desc[..]));
-        assert_eq!(streaming, None, "the 256-byte buffer cannot hold the section");
+        assert_eq!(
+            streaming, None,
+            "the 256-byte buffer cannot hold the section"
+        );
     }
 
     #[test]

@@ -138,7 +138,14 @@ pub fn grants(decl: &DriverDecl, source: Source, iommu_record: bool) -> Grants
     let tier_ignored = decl.tier == Tier::Boot && !boot;
     let phys_access = decl.phys_access && boot && iommu_record;
     Grants {
-        tier: if tier_ignored { Tier::Auxiliary } else { decl.tier },
+        tier: if tier_ignored
+        {
+            Tier::Auxiliary
+        }
+        else
+        {
+            decl.tier
+        },
         phys_access,
         tier_ignored,
         phys_access_ignored: decl.phys_access && !phys_access,
@@ -162,7 +169,9 @@ impl<T> Candidate<T>
     #[must_use]
     pub fn at_limit(&self) -> bool
     {
-        self.decl.instance_limit.is_some_and(|limit| self.bound >= limit)
+        self.decl
+            .instance_limit
+            .is_some_and(|limit| self.bound >= limit)
     }
 }
 
@@ -209,8 +218,12 @@ impl<T> MatchTable<T>
     ///
     /// # Errors
     /// Returns the allocation error when the table cannot grow.
-    pub fn add(&mut self, decl: DriverDecl, source: Source, binary: T)
-    -> Result<usize, TryReserveError>
+    pub fn add(
+        &mut self,
+        decl: DriverDecl,
+        source: Source,
+        binary: T,
+    ) -> Result<usize, TryReserveError>
     {
         self.candidates.try_reserve(1)?;
         self.candidates.push(Candidate {
@@ -306,8 +319,7 @@ mod tests
         decl_with(matches, limit, Tier::Auxiliary, false)
     }
 
-    fn decl_with(matches: &[Match<'_>], limit: Option<u16>, tier: Tier, phys: bool)
-    -> DriverDecl
+    fn decl_with(matches: &[Match<'_>], limit: Option<u16>, tier: Tier, phys: bool) -> DriverDecl
     {
         decode(
             encode(&Declaration {
@@ -468,8 +480,12 @@ mod tests
         table
             .add(decl(&[Match::Spcr(1)], None), Source::BootModule, ())
             .unwrap();
-        let a = table.add(decl(&[id], None), Source::BootModule, ()).unwrap();
-        let b = table.add(decl(&[id], None), Source::DriversDir, ()).unwrap();
+        let a = table
+            .add(decl(&[id], None), Source::BootModule, ())
+            .unwrap();
+        let b = table
+            .add(decl(&[id], None), Source::DriversDir, ())
+            .unwrap();
         // A less specific declaration does not stand in for the conflict.
         table
             .add(

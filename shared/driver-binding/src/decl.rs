@@ -112,6 +112,51 @@ impl<const N: usize> Text<N>
         valid_class(bytes, N).then(|| Self::copy(bytes))
     }
 
+    /// `text` as a key, for a constant: a text that breaks the key rule
+    /// fails the build.
+    ///
+    /// # Panics
+    /// When `text` is not 1 to `N` printable ASCII bytes without a space; in
+    /// a `const`, a compile error.
+    #[must_use]
+    pub const fn literal_key(text: &str) -> Self
+    {
+        assert!(valid_key(text.as_bytes(), N), "not a valid key");
+        Self::copy_const(text.as_bytes())
+    }
+
+    /// `text` as a class name, for a constant: a name that breaks the class
+    /// rule fails the build.
+    ///
+    /// # Panics
+    /// When `text` is not 1 to `N` lowercase ASCII letters, digits, `-`, and
+    /// `_`; in a `const`, a compile error.
+    #[must_use]
+    pub const fn literal_class(text: &str) -> Self
+    {
+        assert!(valid_class(text.as_bytes(), N), "not a valid class name");
+        Self::copy_const(text.as_bytes())
+    }
+
+    /// [`Self::copy`] in a constant.
+    // cast_possible_truncation: a checked text holds at most `N` bytes, and
+    // every `N` this crate uses fits a `u8`.
+    #[allow(clippy::cast_possible_truncation)]
+    const fn copy_const(bytes: &[u8]) -> Self
+    {
+        let mut out = [0u8; N];
+        let mut i = 0;
+        while i < bytes.len()
+        {
+            out[i] = bytes[i];
+            i += 1;
+        }
+        Self {
+            bytes: out,
+            len: bytes.len() as u8,
+        }
+    }
+
     /// Copy `bytes`, already checked to hold 1 to `N` bytes.
     fn copy(bytes: &[u8]) -> Self
     {
@@ -335,11 +380,13 @@ pub enum MatchKey
 {
     PciId
     {
-        vendor: u16, device: u16
+        vendor: u16,
+        device: u16,
     },
     PciClass
     {
-        code: u32, mask: u32
+        code: u32,
+        mask: u32,
     },
     AcpiHid(AcpiId),
     AcpiCid(AcpiId),
@@ -599,13 +646,10 @@ fn match_key(kind: u8, payload: &[u8]) -> Result<Option<MatchKey>, DeclError>
         (kind::PLATFORM, _) => MatchKey::Platform(PlatformKey::key(payload).ok_or(bad)?),
         (kind::IOMMU_FAMILY, _) => MatchKey::IommuFamily(IommuFamily::key(payload).ok_or(bad)?),
         (kind::BOOT_FRAMEBUFFER, []) => MatchKey::BootFramebuffer,
-        (
-            kind::PCI_ID
-            | kind::PCI_CLASS
-            | kind::SPCR
-            | kind::BOOT_FRAMEBUFFER,
-            _,
-        ) => return Err(bad),
+        (kind::PCI_ID | kind::PCI_CLASS | kind::SPCR | kind::BOOT_FRAMEBUFFER, _) =>
+        {
+            return Err(bad);
+        }
         _ => return Ok(None),
     };
     Ok(Some(key))
@@ -724,7 +768,8 @@ pub const fn encode(decl: &Declaration<'_>) -> EncodedDesc
         InterruptNeed::Required => 2,
     };
     assert!(
-        decl.interrupt.msi_vectors <= MAX_MSI_VECTORS && (need != 0 || decl.interrupt.msi_vectors == 0),
+        decl.interrupt.msi_vectors <= MAX_MSI_VECTORS
+            && (need != 0 || decl.interrupt.msi_vectors == 0),
         "driver declaration: vectors past MAX_MSI_VECTORS or without an interrupt need"
     );
     if need != 0
@@ -777,7 +822,10 @@ impl Writer
     #[allow(clippy::cast_possible_truncation)]
     const fn field(&mut self, kind: u8, payload: &[u8])
     {
-        assert!(payload.len() <= u8::MAX as usize, "driver declaration: field too long");
+        assert!(
+            payload.len() <= u8::MAX as usize,
+            "driver declaration: field too long"
+        );
         self.byte(kind);
         self.byte(payload.len() as u8);
         let mut i = 0;
@@ -910,7 +958,10 @@ mod tests
     {
         let d = decode(FULL_DESC.as_bytes()).expect("FULL decodes");
         assert_eq!(d.name.as_str(), "virtio-blk");
-        assert_eq!(d.class.map(|c| c.as_bytes().to_vec()), Some(b"block".to_vec()));
+        assert_eq!(
+            d.class.map(|c| c.as_bytes().to_vec()),
+            Some(b"block".to_vec())
+        );
         let keys: Vec<MatchKey> = d.matches().to_vec();
         assert_eq!(keys.len(), FULL.matches.len());
         assert_eq!(
@@ -1071,7 +1122,10 @@ mod tests
         fields.extend(core::iter::repeat_n(entry, MAX_MATCHES));
         assert!(decode(&with_fields(&fields)).is_ok());
         fields.push(entry);
-        assert_eq!(decode(&with_fields(&fields)), Err(DeclError::TooManyMatches));
+        assert_eq!(
+            decode(&with_fields(&fields)),
+            Err(DeclError::TooManyMatches)
+        );
     }
 
     #[test]
@@ -1129,5 +1183,21 @@ mod tests
             },
             ..MINIMAL
         });
+    }
+
+    #[test]
+    fn a_literal_text_equals_the_checked_one()
+    {
+        const BLOCK: ClassName = ClassName::literal_class("block");
+        const NAME: DriverName = DriverName::literal_key("virtio-blk");
+        assert!(BLOCK == ClassName::class(b"block").unwrap());
+        assert_eq!(NAME.as_str(), "virtio-blk");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a valid class name")]
+    fn a_literal_class_breaking_the_rule_is_refused()
+    {
+        let _ = ClassName::literal_class("Block");
     }
 }

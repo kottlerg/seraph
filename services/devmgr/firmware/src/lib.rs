@@ -13,7 +13,8 @@
 //! BAR sizes, the Command register values devmgr writes, the capability-list
 //! walk, and the Function Level Reset fields, walks PCI configuration space
 //! through a caller-supplied accessor, chooses the driver declaration that
-//! binds each device record within the declaration bounds (`binding`), keeps
+//! binds each device record within the declaration bounds (`binding`),
+//! bounds the reads of a candidate driver binary (`image`), keeps
 //! the table of MMIO and interrupt range caps devmgr carves per-device caps
 //! from, holds the interrupt lines it has carved so every device on a line
 //! gets its own derivation, tracks which spawned drivers reported their
@@ -41,6 +42,7 @@ pub mod classes;
 pub mod dma;
 pub mod dmar;
 pub mod dtb;
+pub mod image;
 pub mod lines;
 pub mod pci;
 pub mod resource;

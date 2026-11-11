@@ -54,20 +54,16 @@ impl<T> Classes<T>
     /// classes or cannot grow.
     pub fn intern(&mut self, name: &ClassName) -> Option<&mut Served<T>>
     {
-        let index = match self.entries.iter().position(|(n, _)| n == name)
+        if let Some(index) = self.entries.iter().position(|(n, _)| n == name)
         {
-            Some(index) => index,
-            None =>
-            {
-                if self.entries.len() >= MAX_CLASSES || self.entries.try_reserve(1).is_err()
-                {
-                    return None;
-                }
-                self.entries.push((*name, Served::new()));
-                self.entries.len() - 1
-            }
-        };
-        self.entries.get_mut(index).map(|(_, served)| served)
+            return self.entries.get_mut(index).map(|(_, served)| served);
+        }
+        if self.entries.len() >= MAX_CLASSES || self.entries.try_reserve(1).is_err()
+        {
+            return None;
+        }
+        self.entries.push((*name, Served::new()));
+        self.entries.last_mut().map(|(_, served)| served)
     }
 
     /// The served list of the class named `name`; `None` when no driver of

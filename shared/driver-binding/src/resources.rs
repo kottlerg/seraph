@@ -65,12 +65,8 @@ pub const END_SLOTS: usize = 3;
 
 const _: () = assert!(END_SLOTS <= MSG_CAP_SLOTS_MAX);
 
-/// Data words of each round kind, `data[0]` included.
-const MMIO_WORDS: usize = 4;
-const IO_PORT_WORDS: usize = 3;
-const INTERRUPT_WORDS: usize = 4;
-const END_WORDS: usize = 2;
-/// Most data words a round carries.
+/// Most data words a round carries, `data[0]` included: an `Mmio` or
+/// `Interrupt` round's four.
 const MAX_ROUND_WORDS: usize = 4;
 
 /// An interrupt resource's kind.
@@ -209,7 +205,12 @@ impl Round
         }
         Some(Self::new(
             caps,
-            &[kind::INTERRUPT, irq_kind as u64, u64::from(first_vector), mode],
+            &[
+                kind::INTERRUPT,
+                irq_kind as u64,
+                u64::from(first_vector),
+                mode,
+            ],
             false,
         ))
     }
@@ -342,7 +343,12 @@ impl ResourceList
                 let bar = match bar
                 {
                     NO_BAR => None,
-                    b => Some(u8::try_from(b).ok().filter(|&b| b < PCI_BAR_COUNT).ok_or(bad)?),
+                    b => Some(
+                        u8::try_from(b)
+                            .ok()
+                            .filter(|&b| b < PCI_BAR_COUNT)
+                            .ok_or(bad)?,
+                    ),
                 };
                 if bytes == 0 || phys.checked_add(bytes).is_none()
                 {
@@ -365,38 +371,13 @@ impl ResourceList
             }
             (kind::INTERRUPT, _, &[_, irq_kind, first, mode]) =>
             {
-                let irq_kind = InterruptKind::from_word(irq_kind).ok_or(bad)?;
-                let first = u8::try_from(first).map_err(|_| bad)?;
-                let end = usize::from(first) + caps.len();
-                let valid = !caps.is_empty()
-                    && mode & !IRQ_MODE_MASK == 0
-                    && match irq_kind
-                    {
-                        InterruptKind::Wired => caps.len() == 1 && first == 0,
-                        InterruptKind::Msi | InterruptKind::MsiX =>
-                        {
-                            end <= usize::from(MAX_MSI_VECTORS)
-                        }
-                    };
-                if !valid
-                {
-                    return Err(bad);
-                }
                 let mut batch = [Resource::IoPort {
                     cap: 0,
                     base: 0,
                     count: 0,
                 }; MSG_CAP_SLOTS_MAX];
-                for ((slot, &cap), vector) in batch.iter_mut().zip(caps).zip(first..)
-                {
-                    *slot = Resource::Interrupt {
-                        cap,
-                        kind: irq_kind,
-                        vector,
-                        mode,
-                    };
-                }
-                self.push(&batch[..caps.len()])
+                let decoded = decode_interrupts(caps, irq_kind, first, mode, &mut batch);
+                self.push(&batch[..decoded.ok_or(bad)?])
             }
             (kind::END | kind::MMIO | kind::IO_PORT | kind::INTERRUPT, _, _) => Err(bad),
             (other, _, _) => Err(ListError::UnknownKind(other)),
@@ -490,6 +471,46 @@ fn delete(caps: impl Iterator<Item = u64>)
     }
 }
 
+/// Decode an `Interrupt` round's `caps` and words into `batch`, one
+/// [`Resource::Interrupt`] per cap. Returns how many it wrote, or `None` for
+/// an unknown kind, a vector past [`MAX_MSI_VECTORS`], a mode outside the
+/// `SYS_IRQ_REGISTER` mask, no caps, or a wired round of more than one cap or
+/// a vector other than 0.
+fn decode_interrupts(
+    caps: &[u64],
+    irq_kind: u64,
+    first: u64,
+    mode: u64,
+    batch: &mut [Resource; MSG_CAP_SLOTS_MAX],
+) -> Option<usize>
+{
+    let irq_kind = InterruptKind::from_word(irq_kind)?;
+    let first = u8::try_from(first).ok()?;
+    let end = usize::from(first) + caps.len();
+    let valid = !caps.is_empty()
+        && caps.len() <= MSG_CAP_SLOTS_MAX
+        && mode & !IRQ_MODE_MASK == 0
+        && match irq_kind
+        {
+            InterruptKind::Wired => caps.len() == 1 && first == 0,
+            InterruptKind::Msi | InterruptKind::MsiX => end <= usize::from(MAX_MSI_VECTORS),
+        };
+    if !valid
+    {
+        return None;
+    }
+    for ((slot, &cap), vector) in batch.iter_mut().zip(caps).zip(first..)
+    {
+        *slot = Resource::Interrupt {
+            cap,
+            kind: irq_kind,
+            vector,
+            mode,
+        };
+    }
+    Some(caps.len())
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -523,7 +544,11 @@ mod tests
         for (i, round) in rounds.iter().enumerate()
         {
             let complete = list.absorb(&received(round))?;
-            assert_eq!(complete, i + 1 == rounds.len(), "only the last round ends the list");
+            assert_eq!(
+                complete,
+                i + 1 == rounds.len(),
+                "only the last round ends the list"
+            );
         }
         Ok(list)
     }
@@ -654,7 +679,12 @@ mod tests
             // wired round of two caps or vector 1, vectors past the bound.
             (false, &[], &[i, 1, 0, 0], ListError::Malformed(i)),
             (false, &[1], &[i, 4, 0, 0], ListError::Malformed(i)),
-            (false, &[1], &[i, 1, 0, IRQ_MODE_MASK + 1], ListError::Malformed(i)),
+            (
+                false,
+                &[1],
+                &[i, 1, 0, IRQ_MODE_MASK + 1],
+                ListError::Malformed(i),
+            ),
             (false, &[1, 2], &[i, 1, 0, 0], ListError::Malformed(i)),
             (false, &[1], &[i, 1, 1, 0], ListError::Malformed(i)),
             (

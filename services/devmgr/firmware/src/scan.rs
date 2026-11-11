@@ -627,7 +627,10 @@ mod tests
         let found = scan_all(&space, 0, 0);
         assert_eq!(found[0].class_code, 0x01_0000);
         assert_eq!(found[0].revision, 1);
-        assert_eq!((found[0].subsystem_vendor, found[0].subsystem_id), (0x1AF4, 2));
+        assert_eq!(
+            (found[0].subsystem_vendor, found[0].subsystem_id),
+            (0x1AF4, 2)
+        );
         assert_eq!(found[1].class_code, 0x06_0400);
         assert_eq!(found[1].revision, 2);
         assert_eq!((found[1].subsystem_vendor, found[1].subsystem_id), (0, 0));

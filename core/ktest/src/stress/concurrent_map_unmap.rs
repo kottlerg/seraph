@@ -82,6 +82,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     released
 }
 
+/// Log a failed copy into child `index`'s `CSpace`: the child, the source
+/// handle and the syscall error, so the failure's cause is in the log; then
+/// return `message`.
+fn copy_failed(index: usize, source: u64, error: i64, message: &'static str) -> &'static str
+{
+    crate::log_u64("ktest: concurrent_map_unmap copy child=", index as u64);
+    crate::log_u64("ktest: concurrent_map_unmap copy source=", source);
+    crate::tally::log_error("ktest: concurrent_map_unmap copy error=", error);
+    message
+}
+
 /// Allocate one pool frame per child, then start each child on its own
 /// frame and VA, recording each frame and child in `mappers` as soon as it
 /// exists.
@@ -103,12 +114,26 @@ fn start_mappers(ctx: &TestContext, done: u64, mappers: &mut Mappers) -> TestRes
         mappers.spawned = i + 1;
         let child = &mappers.children[i];
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
-            .map_err(|_| "concurrent_map_unmap: cap_copy done failed")?;
+            .map_err(|e| copy_failed(i, done, e, "concurrent_map_unmap: cap_copy done failed"))?;
         // Copy memory and aspace caps into child's CSpace with full rights.
-        let child_memory = cap_copy(mappers.frames[i], child.cs, syscall::RIGHTS_ALL)
-            .map_err(|_| "concurrent_map_unmap: cap_copy memory failed")?;
-        let child_aspace = cap_copy(ctx.aspace_cap, child.cs, syscall::RIGHTS_ALL)
-            .map_err(|_| "concurrent_map_unmap: cap_copy aspace failed")?;
+        let child_memory =
+            cap_copy(mappers.frames[i], child.cs, syscall::RIGHTS_ALL).map_err(|e| {
+                copy_failed(
+                    i,
+                    mappers.frames[i],
+                    e,
+                    "concurrent_map_unmap: cap_copy memory failed",
+                )
+            })?;
+        let child_aspace =
+            cap_copy(ctx.aspace_cap, child.cs, syscall::RIGHTS_ALL).map_err(|e| {
+                copy_failed(
+                    i,
+                    ctx.aspace_cap,
+                    e,
+                    "concurrent_map_unmap: cap_copy aspace failed",
+                )
+            })?;
 
         // SAFETY: child `i` has not been started yet; the block is reused
         // only after every child has been reaped.

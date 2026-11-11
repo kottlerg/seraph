@@ -233,19 +233,26 @@ fn dwarf_frames(dwarf: &DwarfContext<'_>, vaddr: u64) -> Result<Vec<Frame>>
 /// The unbiased bounds of `data`'s executable loadable segments: the lowest
 /// segment address to one past the highest segment end (address plus memory
 /// size), the span procmgr biases into a crash report's `text`. `None` for
-/// data that is not an ELF image or an image without an executable segment.
+/// data that is not an ELF image, an image without an executable segment, or
+/// one with an executable segment that ends past the 64-bit address space.
 pub fn text_span(data: &[u8]) -> Option<(u64, u64)>
 {
     let file = object::File::parse(data).ok()?;
-    file.segments()
-        .filter(|segment| match segment.flags()
+    let mut span: Option<(u64, u64)> = None;
+    for segment in file.segments().filter(|segment| match segment.flags()
+    {
+        SegmentFlags::Elf { p_flags, .. } => p_flags.contains(object::elf::PF_X),
+        _ => false,
+    })
+    {
+        let start = segment.address();
+        let end = start.checked_add(segment.size())?;
+        if start < end
         {
-            SegmentFlags::Elf { p_flags, .. } => p_flags.contains(object::elf::PF_X),
-            _ => false,
-        })
-        .map(|segment| (segment.address(), segment.address() + segment.size()))
-        .filter(|(start, end)| start < end)
-        .reduce(|(lo, hi), (start, end)| (lo.min(start), hi.max(end)))
+            span = Some(span.map_or((start, end), |(lo, hi)| (lo.min(start), hi.max(end))));
+        }
+    }
+    span
 }
 
 /// The image address of runtime address `addr` in an image loaded at
@@ -340,13 +347,19 @@ fn format_frame(frame: &Frame) -> String
 ///
 /// # Errors
 ///
-/// Fails on an empty string, a non-hex digit, or a value past 64 bits.
+/// Fails on an empty string, a non-hex digit (a sign included), or a value
+/// past 64 bits.
 pub fn parse_hex(text: &str) -> Result<u64>
 {
     let digits = text
         .strip_prefix("0x")
         .or_else(|| text.strip_prefix("0X"))
         .unwrap_or(text);
+    // `from_str_radix` accepts a leading `+`, which is no hex digit.
+    if !digits.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        bail!("not a hex address: {text:?}");
+    }
     u64::from_str_radix(digits, 16).with_context(|| format!("not a hex address: {text:?}"))
 }
 
@@ -847,6 +860,9 @@ mod tests
         assert!(parse_hex("").is_err());
         assert!(parse_hex("0x").is_err());
         assert!(parse_hex("12g").is_err());
+        assert!(parse_hex("+ff").is_err());
+        assert!(parse_hex("0x+ff").is_err());
+        assert!(parse_hex("-1").is_err());
         assert!(parse_hex("10000000000000000").is_err());
     }
 }

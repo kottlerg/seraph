@@ -953,10 +953,10 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 |---|---|---|
 | `pr-unticked-box` | error | The body has no unticked task-list item (§ PR-body checklist discipline): `[ ]` after a `-`, `*`, `+`, or numbered list marker, the forms GitHub renders as a checkbox. |
 | `pr-attribution` | error | The body carries no tool attribution line and no session link. |
-| `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`. A drain PR that closes a follow-up Issue of the earlier pattern carries both (§ Follow-up Issues); in any other body the pair usually means a sentence closes an Issue the PR only references. |
+| `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`; a closing reference that names a repository (`<owner>/<repo>#N`, or the Issue's URL) is not compared. A drain PR that closes a follow-up Issue of the earlier pattern carries both (§ Follow-up Issues); in any other body the pair usually means a sentence closes an Issue the PR only references. |
 | `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
 | `pr-validation` | error | The body has a `## Validation` section that names a validated head: the first word of that section that is a commit hash in the clone. |
-| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch (one the head holds and the base branch does not), the section says the delta since it is documentation or comments only, and `git diff <validated> <head>` alters, Markdown (`*.md` in any letter case) aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any non-blank line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. When a merge of the base branch lies between the two heads, the command compares the PR's own change at each, `git diff <merge base> <validated>` and `git diff <merge base> <head>`, as multisets of changed lines per file, whitespace included, instead of the delta: they must differ only in comment or Markdown lines and in no file a build embeds, two binary changes agree only when their `index` lines match (the same blobs before and after, and the same mode), a change to a final newline alone is a change, as is a different mode for a file the PR adds or deletes at both heads (an added or deleted file is otherwise judged by its lines, so a file of comments alone stays comment-only), each difference is reported with the head it stands at, and the section must say the delta is documentation or comments only when the two differ at all. |
+| `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch (one the head holds and the base branch does not), the section says the delta since it is documentation or comments only (a phrase that pairs `only` with comments, Markdown, or documentation, such as `comment-only`, `Markdown only`, or `only in comments`, not after a `not` within three words and outside a template placeholder `<…>`; whether the phrase is about the delta stays with the auditor), and `git diff <validated> <head>` alters, Markdown (`*.md` in any letter case) aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any non-blank line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. When a merge of the base branch lies between the two heads, the command compares the PR's own change at each, `git diff <merge base> <validated>` and `git diff <merge base> <head>`, as multisets of changed lines per file, whitespace included, instead of the delta: they must differ only in comment or Markdown lines and in no file a build embeds, two binary changes agree only when their `index` lines match (the same blobs before and after, and the same mode), a change to a final newline alone is a change, as is a different mode for a file the PR adds or deletes at both heads (an added or deleted file is otherwise judged by its lines, so a file of comments alone stays comment-only), each difference is reported with the head it stands at; a line the PR reordered or moved within its own files since the validated head, which the multisets cannot see, is read from `git diff <validated> <head>` over those files less the sync's incoming diff, and a code line of it in a file whose own change compares equal is reported as moved or reordered; and the section must say the delta is documentation or comments only when the two differ at all. |
 | `pr-validated-sync` | warning | No merge of the base branch lies between a validated head that passes `pr-validated-head` and the PR head. After one the body states whether the incoming diff overlaps the PR's files (§ Syncing with `master`); a reader decides the overlap, the command cannot. |
 | `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
 | `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Follow-up Issues). |
@@ -965,7 +965,9 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 | `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
 
 The command prints the Issues the body and the commits close and the ones the body references,
-so that a keyword in prose that closes an Issue by accident is seen.
+so that a keyword in prose that closes an Issue by accident is seen. A closing reference into
+another repository (`<owner>/<repo>#N`, or that Issue's URL, naming a repository other than this
+one) is printed apart and not checked, since the Issue rules read this repository's Issues.
 
 `--gate` adds the merge gate of § Branch and PR Workflow. It does not imply `--strict`: a
 warning is for the reader, who may confirm it or hold an acceptance of it, and only an error
@@ -977,7 +979,7 @@ fails the gate.
 | `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
-| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and the reviewer verdict `READY TO MERGE` (or, in a record of the earlier form, `NON-BLOCKING ISSUES ONLY`). The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. When that record is an `audit` record that completes a run of the reviewer alone (the latest `NOT RUN` record at the head with only `audit` records after it), that run must have no failed agent and a passing verdict too. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
+| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and the reviewer verdict `READY TO MERGE` (or, in a record of the earlier form, `NON-BLOCKING ISSUES ONLY`). The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. When that record is an `audit` record that completes a run of the reviewer alone (the latest `NOT RUN` record at the head with only `audit` records after it), that run must have no failed agent and a passing verdict too. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. A record is at the head when its name states the head's first digits; one whose `stats.head` names another commit is refused. |
 | `gate-added-files` | error | The files the PR adds can be read from the clone, which the next rule needs. |
 | `gate-release-approval` | warning | The PR adds no `docs/releases/v<X>.<Y>.<Z>.md`. One that does is the release PR of § Release Production, whose merge needs the maintainer's approval (§ Pre-merge review); the command cannot read an approval, so it names the PR for its reader. |
 | `gate-findings-recorded` | warning | A record of the earlier form with the verdict `NON-BLOCKING ISSUES ONLY` leaves no finding on the surface that needs a reader: one an Issue had to record (a class other than `style`, or a MUST violation), or one of any class whose `status` is `contested`. When the last record is an `audit` record that completes a run of the reviewer alone, that run's verdict and findings count too. The reader confirms each counted finding is recorded and none is contested; the command cannot. |
@@ -996,10 +998,10 @@ cargo xtask review-check <N>
 ```
 
 A run record is `target/xtask/review/pr<N>/<mode>-<head>.json`, where `<mode>` is `full`, `delta`,
-or `audit` and `<head>` is the head the run reviewed. A further run at a head that already has a
-record of that kind (a second run with the reviewer, a second audit) is `<mode>-<head>-<n>.json`,
-`<n>` counting from 2. The suffix only keeps the names apart: `stats.run` orders the runs. It is
-one JSON object:
+or `audit` and `<head>` is the head the run reviewed, at least its first 8 hexadecimal digits. A
+further run at a head that already has a record of that kind (a second run with the reviewer, a
+second audit) is `<mode>-<head>-<n>.json`, `<n>` counting from 2. The suffix only keeps the names
+apart: `stats.run` orders the runs. It is one JSON object:
 
 | Key | Value |
 |---|---|
@@ -1065,9 +1067,13 @@ destroying it.
 cargo xtask issue-edit <N> --body-file <path> [--allow-removal]
 ```
 
-The command refuses an empty body, and a body with fewer task-list items than the Issue has
-unless `--allow-removal` is given (an edit that drops items on purpose, as
-[docs/conventions.md](../docs/conventions.md) § Acceptance checklist discipline allows). It
+The command refuses an empty body. Unless `--allow-removal` is given (an edit that drops,
+rewords, or reopens items on purpose, as
+[docs/conventions.md](../docs/conventions.md) § Acceptance checklist discipline allows), it also
+refuses a body that lacks a task-list item the Issue holds, or that reopens one the Issue has
+ticked: what a copy fetched before another edit produces. An item is matched by its text, box
+aside, to one of the new body whose text starts with it, so a tick that appends
+`(fixed by PR #M)` keeps it. It
 writes the previous body to `target/xtask/issue-backup/<N>-<time>.md`, edits the Issue, reads
 it back, and restores the previous body when what GitHub holds is not what the file holds.
 

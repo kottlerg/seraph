@@ -60,6 +60,8 @@ pub struct Patterns
     subject_form: Regex,
     hex: Regex,
     delta_statement: Regex,
+    negation: Regex,
+    placeholder: Regex,
     embed: Regex,
     release_notes: Regex,
 }
@@ -68,9 +70,13 @@ impl Patterns
 {
     pub fn new() -> Result<Self>
     {
-        // An Issue reference: `#N`, `<owner>/<repo>#N`, or the Issue's URL.
+        // An Issue reference: `#N`, `<owner>/<repo>#N`, or the Issue's URL,
+        // each form capturing its repository (none for `#N`) and its number.
         let reference =
-            r"(?:[\w.-]+/[\w.-]+)?#(\d+)|https://github\.com/[\w.-]+/[\w.-]+/issues/(\d+)";
+            r"(?:([\w.-]+/[\w.-]+))?#(\d+)|https://github\.com/([\w.-]+/[\w.-]+)/issues/(\d+)";
+        // What a statement that the delta is documentation or comments only
+        // says of it: `only` paired with those words, before or after them.
+        let kind = r"(?:comments?|markdown|documentation|rustdoc|doc comments?)";
         Ok(Patterns {
             issue_ref: Regex::new(reference)?,
             // A closing keyword directly before a reference, with at most a
@@ -88,7 +94,16 @@ impl Patterns
             planning_label: Regex::new(r"(?i)\b(step|phase|tier|stage|round)\s+\d+\b")?,
             subject_form: Regex::new(r"^[^\s:][^:]*: \S")?,
             hex: Regex::new(r"\b[0-9a-f]{7,40}\b")?,
-            delta_statement: Regex::new(r"(?i)comment|markdown|documentation")?,
+            // `comment-only`, `documentation and comments only`, `Markdown
+            // only`, `only in comments`, `only a rustdoc comment`.
+            delta_statement: Regex::new(&format!(
+                r"(?i)\b{kind}(?:[- ]+(?:and|or)[- ]+{kind})?[- ]only\b|\bonly\s+(?:in\s+|an?\s+|the\s+)?{kind}\b"
+            ))?,
+            // A `not` among the three words before a statement turns it
+            // around: `the delta is not comment-only`.
+            negation: Regex::new(r"(?i)(?:\bnot|n't)\W+(?:\w+\W+){0,2}$")?,
+            // A template placeholder, `<…>`, which may span lines.
+            placeholder: Regex::new(r"<[^<>]*>")?,
             embed: Regex::new(r"include_str!|include_bytes!|global_asm!")?,
             release_notes: Regex::new(r"^docs/releases/v\d+\.\d+\.\d+\.md$")?,
         })
@@ -112,30 +127,60 @@ pub struct Commit
     pub signed: bool,
 }
 
-/// An Issue a text closes or references: its number and the 1-based line of
-/// the reference.
+/// An Issue a text closes or references: the repository the reference names
+/// (`None` for `#N`), the Issue's number, and the 1-based line of the
+/// reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueRef
 {
+    pub repo: Option<String>,
     pub issue: u64,
     pub line: usize,
 }
 
-fn refs_in(pattern: &Regex, text: &str, first_group: usize) -> Vec<IssueRef>
+impl IssueRef
+{
+    /// The reference as `#N` or `<owner>/<repo>#N`.
+    pub fn label(&self) -> String
+    {
+        match &self.repo
+        {
+            Some(repo) => format!("{repo}#{}", self.issue),
+            None => format!("#{}", self.issue),
+        }
+    }
+}
+
+/// The references `pattern` finds in `text`. `forms` gives, for each form of
+/// reference the pattern holds, the capture group of its repository (if the
+/// form has one) and that of its number.
+fn refs_in(pattern: &Regex, text: &str, forms: &[(Option<usize>, usize)]) -> Vec<IssueRef>
 {
     let mut out = Vec::new();
     for found in pattern.captures_iter(text)
     {
-        let number = (first_group..found.len())
-            .find_map(|i| found.get(i))
-            .and_then(|m| m.as_str().parse::<u64>().ok());
-        let (Some(issue), Some(whole)) = (number, found.get(0))
+        let Some((repo, number)) = forms.iter().find_map(|(repo, number)| {
+            let number = found.get(*number)?.as_str().parse::<u64>().ok()?;
+            let repo = repo
+                .and_then(|group| found.get(group))
+                .map(|m| m.as_str().to_owned());
+            Some((repo, number))
+        })
+        else
+        {
+            continue;
+        };
+        let Some(whole) = found.get(0)
         else
         {
             continue;
         };
         let line = text[..whole.start()].matches('\n').count() + 1;
-        out.push(IssueRef { issue, line });
+        out.push(IssueRef {
+            repo,
+            issue: number,
+            line,
+        });
     }
     out
 }
@@ -144,13 +189,13 @@ fn refs_in(pattern: &Regex, text: &str, first_group: usize) -> Vec<IssueRef>
 /// reaches the default branch.
 pub fn closing_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
 {
-    refs_in(&pat.closing_ref, text, 2)
+    refs_in(&pat.closing_ref, text, &[(Some(2), 3), (Some(4), 5)])
 }
 
 /// Every `Refs #N` in `text`.
 pub fn refs_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
 {
-    refs_in(&pat.refs_ref, text, 1)
+    refs_in(&pat.refs_ref, text, &[(None, 1)])
 }
 
 /// `line` without what may open it before its text: quote markers (`>`),
@@ -306,9 +351,9 @@ fn check_message(pat: &Patterns, at: &str, commit: &Commit) -> Vec<Diag>
             "commit-closing-keyword",
             at,
             format!(
-                "the message closes #{}; a closing keyword goes in the PR description only, \
+                "the message closes {}; a closing keyword goes in the PR description only, \
                  since a commit's cannot be withdrawn",
-                found.issue
+                found.label()
             ),
         ));
     }
@@ -488,9 +533,12 @@ fn check_body_closing(pat: &Patterns, body: &str) -> Vec<Diag>
 {
     let mut out = Vec::new();
     let referenced: Vec<u64> = refs_refs(pat, body).iter().map(|r| r.issue).collect();
+    // `Refs` names this repository's Issues only; a closing reference that
+    // names a repository is not compared, since the body cannot say whether
+    // that repository is this one.
     for found in closing_refs(pat, body)
     {
-        if referenced.contains(&found.issue)
+        if found.repo.is_none() && referenced.contains(&found.issue)
         {
             out.push(Diag::warning(
                 "pr-closes-and-refs",
@@ -509,9 +557,9 @@ fn check_body_closing(pat: &Patterns, body: &str) -> Vec<Diag>
             "pr-closing-in-prose",
             format!("body:{}", found.line),
             format!(
-                "this sentence closes #{} when the PR merges; put `Fixes #{}` on its own line \
+                "this sentence closes {0} when the PR merges; put `Fixes {0}` on its own line \
                  if that is meant, or reword it",
-                found.issue, found.issue
+                found.label()
             ),
         ));
     }
@@ -757,6 +805,30 @@ pub fn own_change_difference(own_validated: &str, own_head: &str) -> Vec<(Side, 
     out
 }
 
+/// The changes of `delta`, the diff from the validated head to the PR head
+/// over the PR's own files, that `incoming`, the sync's incoming diff over
+/// the same files, does not hold, counted as multisets: what the PR itself
+/// changed since the validated head, in place as well as in content. A line
+/// the PR reordered or moved shows here as a removal and an addition, which
+/// `own_change_difference` cannot see, since it counts lines wherever they
+/// stand.
+pub fn own_delta_changes(delta: &str, incoming: &str) -> Vec<Change>
+{
+    let mut brought = diff_changes(incoming);
+    diff_changes(delta)
+        .into_iter()
+        .filter(|change| match brought.iter().position(|c| c == change)
+        {
+            Some(index) =>
+            {
+                brought.swap_remove(index);
+                false
+            }
+            None => true,
+        })
+        .collect()
+}
+
 /// The changed paths (`names`, one per line) that a tracked source embeds
 /// with `include_str!`, `include_bytes!`, or `global_asm!` (`embeds`, the
 /// source lines that carry one of those macros): build input, not comment or
@@ -872,6 +944,29 @@ pub struct Delta
     pub synced: bool,
 }
 
+/// Whether the `## Validation` section says that something is documentation
+/// or comments only: a line pairs `only` with comments, Markdown, or
+/// documentation (`comment-only`, `Markdown only`, `only in comments`), not
+/// after a `not` within three words, and outside a template placeholder
+/// (`<…>`). A sentence that names those words without `only`, such as the
+/// statement that the PR's changes outside Markdown are inert, is not one.
+/// Whether the statement is about the delta stays with the auditor.
+pub fn states_documentation_only(pat: &Patterns, body: &str) -> bool
+{
+    let Some(lines) = section(body, "## Validation")
+    else
+    {
+        return false;
+    };
+    let text = lines.join("\n");
+    let text = pat.placeholder.replace_all(&text, "");
+    text.lines().any(|line| {
+        pat.delta_statement
+            .find_iter(line)
+            .any(|found| !pat.negation.is_match(&line[..found.start()]))
+    })
+}
+
 /// The findings about the delta from an earlier validated head to the PR
 /// head: when the PR's change moved, the body must say the delta is
 /// documentation or comments only; `changes` and `embedded` must both be
@@ -881,8 +976,7 @@ pub fn delta_diags(pat: &Patterns, body: &str, validated: &str, delta: &Delta) -
 {
     let at = format!("validated head {validated}");
     let mut out = Vec::new();
-    let stated = section(body, "## Validation")
-        .is_some_and(|lines| lines.iter().any(|l| pat.delta_statement.is_match(l)));
+    let stated = states_documentation_only(pat, body);
     if delta.moved && !stated
     {
         out.push(Diag::error(
@@ -1003,7 +1097,33 @@ fn read_synced_delta(
     let own_validated = diff_u0(root, validated_base, validated, &["."])?;
     let own_head = diff_u0(root, head_base, head, &["."])?;
     let difference = own_change_difference(&own_validated, &own_head);
-    let mut names: Vec<&str> = difference.iter().map(|(_, c)| c.path.as_str()).collect();
+    // The PR's own change since the validated head over its own files, the
+    // merge's lines aside, which shows a line the PR reordered or moved.
+    let mut own_files: Vec<String> = diff_changes(&own_validated)
+        .into_iter()
+        .chain(diff_changes(&own_head))
+        .map(|c| format!(":(literal){}", c.path))
+        .collect();
+    own_files.sort();
+    own_files.dedup();
+    let placed = if own_files.is_empty()
+    {
+        Vec::new()
+    }
+    else
+    {
+        let files: Vec<&str> = own_files.iter().map(String::as_str).collect();
+        own_delta_changes(
+            &diff_u0(root, validated, head, &files)?,
+            &diff_u0(root, validated_base, head_base, &files)?,
+        )
+    };
+    let mut names: Vec<&str> = difference
+        .iter()
+        .map(|(_, c)| c.path.as_str())
+        .chain(placed.iter().map(|c| c.path.as_str()))
+        .collect();
+    names.sort_unstable();
     names.dedup();
     let embedded = embedded_paths(pat, &names.join("\n"), &embed_lines(root, head)?);
     // The mode header of an added or a deleted file, by kind.
@@ -1033,11 +1153,24 @@ fn read_synced_delta(
         // in indentation alone, which a trimmed line would not show.
         .map(|(side, c)| format!("{} ({}): {}", c.path, side.label(), c.line))
         .collect();
+    // A code line of the PR's delta in a file whose own change compares
+    // equal: the PR moved or reordered its own lines there.
+    let compared = |path: &str| {
+        difference
+            .iter()
+            .any(|(_, c)| c.path == path && c.code && !is_markdown(&c.path))
+    };
+    changes.extend(
+        placed
+            .iter()
+            .filter(|c| c.code && !is_markdown(&c.path) && !compared(&c.path))
+            .map(|c| format!("{} (moved or reordered): {}", c.path, c.line)),
+    );
     changes.dedup();
     Ok(Delta {
         changes,
         embedded,
-        moved: !difference.is_empty(),
+        moved: !difference.is_empty() || !placed.is_empty(),
         synced: true,
     })
 }
@@ -1220,6 +1353,43 @@ fn sorted_issues(refs: impl Iterator<Item = IssueRef>) -> Vec<u64>
     issues
 }
 
+/// Split references into the Issues of this repository, `this_repo`
+/// (`<owner>/<repo>`, in any letter case, as GitHub compares it), sorted, and
+/// the references into another repository, whose Issues the checks cannot
+/// read, as their labels. A `#N` is this repository's; with `this_repo`
+/// unknown, a qualified reference counts as another repository's.
+pub fn split_by_repository(refs: Vec<IssueRef>, this_repo: Option<&str>)
+-> (Vec<u64>, Vec<String>)
+{
+    let (here, elsewhere): (Vec<IssueRef>, Vec<IssueRef>) = refs.into_iter().partition(|r| {
+        r.repo
+            .as_deref()
+            .is_none_or(|repo| this_repo.is_some_and(|this| repo.eq_ignore_ascii_case(this)))
+    });
+    let mut elsewhere: Vec<String> = elsewhere.iter().map(IssueRef::label).collect();
+    elsewhere.sort();
+    elsewhere.dedup();
+    (sorted_issues(here.into_iter()), elsewhere)
+}
+
+/// This repository as `<owner>/<repo>`, as `gh` resolves it from the clone.
+fn this_repository(root: &Path) -> Result<String>
+{
+    Ok(gh::run(
+        root,
+        &[
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ],
+    )?
+    .trim()
+    .to_owned())
+}
+
 /// Check the Issues the PR closes, by its body or by a commit message, and
 /// the ones its body references with `Refs`.
 fn check_issues(
@@ -1233,13 +1403,34 @@ fn check_issues(
     let commit_refs = commits
         .iter()
         .flat_map(|commit| closing_refs(pat, &format!("{}\n\n{}", commit.subject, commit.body)));
-    let closed = sorted_issues(closing_refs(pat, body).into_iter().chain(commit_refs));
+    let closing: Vec<IssueRef> = closing_refs(pat, body)
+        .into_iter()
+        .chain(commit_refs)
+        .collect();
+    // `gh` is asked for this repository's name only when a reference names
+    // a repository.
+    let this_repo = if closing.iter().any(|r| r.repo.is_some())
+    {
+        Some(this_repository(root)?)
+    }
+    else
+    {
+        None
+    };
+    let (closed, elsewhere) = split_by_repository(closing, this_repo.as_deref());
     let referenced = sorted_issues(refs_refs(pat, body).into_iter());
     println!(
         "    closes: {}; references: {}",
         list(&closed),
         list(&referenced)
     );
+    if !elsewhere.is_empty()
+    {
+        println!(
+            "    closes in another repository, not checked here: {}",
+            elsewhere.join(", ")
+        );
+    }
 
     let mut out = Vec::new();
     let current = if closed.is_empty()
@@ -1532,7 +1723,55 @@ mod tests
     fn a_closing_reference_reports_the_line_it_is_on()
     {
         let refs = closing_refs(&pat(), "Summary\n\nCloses #3\n");
-        assert_eq!(refs, [IssueRef { issue: 3, line: 3 }]);
+        assert_eq!(
+            refs,
+            [IssueRef {
+                repo: None,
+                issue: 3,
+                line: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn a_closing_reference_keeps_the_repository_it_names()
+    {
+        let p = pat();
+        let found = |text: &str| -> Vec<String> {
+            closing_refs(&p, text).iter().map(IssueRef::label).collect()
+        };
+        assert_eq!(found("Fixes other/repo#5"), ["other/repo#5"]);
+        assert_eq!(
+            found("closes https://github.com/o.w-n/r_e.po/issues/6"),
+            ["o.w-n/r_e.po#6"]
+        );
+        assert_eq!(found("Fixes #7"), ["#7"]);
+        // A finding about the reference names its repository.
+        let diags = check_body(&p, &format!("{BODY}\nA test of `Fixes other/repo#5`.\n"));
+        assert_eq!(rules(&diags), ["pr-closing-in-prose"]);
+        assert!(
+            diags[0].message.contains("closes other/repo#5"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn only_a_closing_reference_into_this_repository_is_checked()
+    {
+        let refs = closing_refs(
+            &pat(),
+            "Fixes #3\nFixes other/repo#5\nFixes Owner/Seraph#8\nFixes owner/seraph#3\n",
+        );
+        let (here, elsewhere) = split_by_repository(refs, Some("owner/seraph"));
+        assert_eq!(here, [3, 8]);
+        assert_eq!(elsewhere, ["other/repo#5"]);
+        // With this repository unknown, a qualified reference is checked
+        // nowhere and printed for the reader.
+        let refs = closing_refs(&pat(), "Fixes #3\nFixes owner/seraph#4\n");
+        let (here, elsewhere) = split_by_repository(refs, None);
+        assert_eq!(here, [3]);
+        assert_eq!(elsewhere, ["owner/seraph#4"]);
     }
 
     #[test]
@@ -1752,6 +1991,10 @@ mod tests
         let diags = check_body(&pat(), &body);
         assert_eq!(rules(&diags), ["pr-closes-and-refs", "pr-closing-in-prose"]);
         assert!(diags[0].message.contains("#11"));
+        // A closing reference into another repository is another Issue
+        // than this repository's `Refs #11`.
+        let other = BODY.replace("Fixes #10", "Fixes other/repo#11");
+        assert!(check_body(&pat(), &other).is_empty());
     }
 
     #[test]
@@ -1902,6 +2145,52 @@ mod tests
         assert_eq!(rules(&found), ["pr-validated-head", "pr-validated-head"]);
         assert!(found[0].message.contains("k/a.rs: let x = 1;"));
         assert!(found[1].message.contains("docs/help.md"));
+    }
+
+    #[test]
+    fn only_a_statement_that_something_is_documentation_or_comments_only_counts()
+    {
+        let p = pat();
+        let says = |text: &str| states_documentation_only(&p, &format!("## Validation\n{text}\n"));
+        for stated in [
+            "Validated at deadbeef; later commits are comment-only.",
+            "be84acec changes Markdown only.",
+            "Since 113c378a, the PR's own change differs only in Markdown.",
+            "7cd9af57 is documentation and comment only (scheduler.md).",
+            "0a82b0aa changes only a rustdoc comment and Markdown.",
+            "ebeeb808 adds a comment- and documentation-only commit.",
+            "It is not owed again. be84acec, between the two, changes Markdown only.",
+        ]
+        {
+            assert!(says(stated), "{stated}");
+        }
+        for unstated in [
+            "Validated at deadbeef. No local host run is owed: the PR's changes outside \
+             Markdown are all inert.",
+            "The delta since deadbeef is not comment-only.",
+            "The delta isn't Markdown-only.",
+            "<validated head; for a documentation-only or comment-only delta since it, say \
+             so;\neach local host run, or that none is owed and why>\nValidated at deadbeef.",
+        ]
+        {
+            assert!(!says(unstated), "{unstated}");
+        }
+        assert!(!states_documentation_only(&p, "## Summary\ncomment-only\n"));
+    }
+
+    #[test]
+    fn an_earlier_validated_head_with_only_an_inert_statement_is_an_error()
+    {
+        let moved = Delta {
+            moved: true,
+            ..Delta::default()
+        };
+        let inert = "## Validation\nValidated at deadbeef. None owed: the PR's changes \
+                     outside Markdown are all inert.\n";
+        assert_eq!(
+            rules(&delta_diags(&pat(), inert, "deadbeef", &moved)),
+            ["pr-validated-head"]
+        );
     }
 
     #[test]
@@ -2116,6 +2405,61 @@ mod tests
         let found = repo.check(&validated, ".");
         assert!(found.iter().any(|d| d.rule == "pr-validated-head"));
         assert!(found.iter().any(|d| d.message.contains("let x = 4;")));
+    }
+
+    #[test]
+    fn own_lines_reordered_after_a_sync_are_an_error()
+    {
+        let repo = Repo::new("sync-reorder");
+        let validated = synced_then_changed(
+            &repo,
+            "a.rs",
+            b"fn a() {}\nlet x = 1;\nlet y = 2;\nlet z = 3;\n",
+            b"fn a() {}\nlet x = 1;\nlet z = 3;\nlet y = 2;\n",
+        );
+        let found = repo.check(&validated, "; later commits are comment-only.");
+        assert!(!found.is_empty());
+        assert!(
+            found.iter().all(|d| d.rule == "pr-validated-head"),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|d| d.message.contains("moved or reordered"))
+        );
+    }
+
+    #[test]
+    fn an_own_line_moved_after_a_sync_is_an_error()
+    {
+        // The PR adds one line, then moves it past a line it did not add:
+        // its own change is the same line at both heads.
+        let repo = Repo::new("sync-move");
+        let validated = synced_then_changed(
+            &repo,
+            "a.rs",
+            b"fn a() {}\nlet q = 0;\nlet x = 1;\n",
+            b"fn a() {}\nlet x = 1;\nlet q = 0;\n",
+        );
+        let found = repo.check(&validated, "; later commits are comment-only.");
+        assert!(!found.is_empty());
+        assert!(
+            found.iter().all(|d| d.rule == "pr-validated-head"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_master_change_to_a_prs_file_is_not_the_prs_delta()
+    {
+        // master changes the PR's file away from the PR's lines; the PR's
+        // own change is untouched, so only the sync warning stands.
+        let repo = Repo::new("sync-same-file");
+        let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.on_master("a.rs", "fn z() {}\nfn a() {}\nlet x = 1;\n");
+        repo.merge_master(&[]);
+        assert_eq!(rules(&repo.check(&validated, ".")), ["pr-validated-sync"]);
     }
 
     /// A branch validated after its own change to `file`, then synced with

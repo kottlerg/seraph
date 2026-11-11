@@ -837,9 +837,25 @@ fn build_group(
 
 // ── Single component build ────────────────────────────────────────────────────
 
+/// Why `spec` may not be built for `arch`: it is an [`Spec::arch_only`]
+/// component of another architecture. `None` when it may.
+fn arch_refusal(spec: &Spec, arch: Arch) -> Option<String>
+{
+    spec.arch_only.filter(|only| *only != arch).map(|only| {
+        format!(
+            "{} is built only for {only}, and the build is for {arch}",
+            spec.name
+        )
+    })
+}
+
 /// Build a single component per its [`Spec`] and install to the sysroot.
 fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
 {
+    if let Some(reason) = arch_refusal(spec, args.arch)
+    {
+        bail!("{reason}");
+    }
     let (triple, build_std, needs_seraph_rustc) = profile_params(args.arch, spec.profile);
 
     step(&format!(
@@ -1119,4 +1135,33 @@ fn debug_config_flags(args: &BuildArgs, pkg: &str) -> Vec<String>
         "--config".into(),
         format!("profile.{profile}.package.\"{pkg}\".opt-level=1"),
     ]
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn an_arch_only_component_is_refused_on_another_arch()
+    {
+        let spec = |name: &str| SPECS.iter().find(|s| s.name == name).unwrap();
+        let refusal = arch_refusal(spec("iommu-vtd"), Arch::Riscv64).expect("a refusal");
+        assert!(refusal.contains("iommu-vtd"), "{refusal}");
+        assert!(refusal.contains(&Arch::X86_64.to_string()), "{refusal}");
+        assert_eq!(arch_refusal(spec("iommu-vtd"), Arch::X86_64), None);
+        assert_eq!(arch_refusal(spec("kernel"), Arch::Riscv64), None);
+        for s in SPECS
+        {
+            for arch in [Arch::X86_64, Arch::Riscv64]
+            {
+                assert_eq!(
+                    arch_refusal(s, arch).is_some(),
+                    s.arch_only.is_some_and(|only| only != arch),
+                    "{}",
+                    s.name
+                );
+            }
+        }
+    }
 }

@@ -6,7 +6,8 @@
 //! `issue-edit` and `issue-file`: guarded writes to GitHub Issues.
 //!
 //! `issue-edit` replaces an Issue's body from a file. It refuses a body that
-//! is empty or that lost task-list items, keeps the previous body as a backup
+//! is empty, that lost a task-list item, or that reopened a ticked one, keeps
+//! the previous body as a backup
 //! under `target/xtask/issue-backup/`, and reads the Issue back after the
 //! edit, restoring the backup when what GitHub holds is not what was sent.
 //! `issue-file` creates an Issue with the labels and milestone
@@ -23,7 +24,7 @@ use crate::cli::{IssueEditArgs, IssueFileArgs};
 use crate::commands::pr_check::{ROLLING_TITLE_SUFFIX, current_milestone};
 use crate::context::Context as BuildContext;
 use crate::gh;
-use crate::tasklist::task_item;
+use crate::tasklist::{TaskItem, task_item, task_item_text};
 use crate::util::step;
 
 /// The class labels (docs/conventions.md § Labels). Every Issue carries at
@@ -32,13 +33,14 @@ const CLASS_LABELS: &[&str] = &[
     "bug", "design", "cleanup", "feature", "perf", "security", "infra",
 ];
 
-/// Whether an edit may leave the Issue with fewer task-list items.
+/// Whether an edit may drop, reword, or reopen the Issue's task-list items.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemRemoval
 {
-    /// A body with fewer items is refused: it is what a stale copy produces.
+    /// A body that lacks an item the Issue holds, or that reopens one the
+    /// Issue has ticked, is refused: it is what a stale copy produces.
     Refuse,
-    /// The edit drops items on purpose.
+    /// The edit drops, rewords, or reopens items on purpose.
     Allow,
 }
 
@@ -106,21 +108,68 @@ fn normalized(body: &str) -> String
     body.replace("\r\n", "\n").trim_end().to_owned()
 }
 
+/// The task-list items of `body`, each with its state and its text.
+fn items_of(body: &str) -> Vec<(TaskItem, &str)>
+{
+    body.lines().filter_map(task_item_text).collect()
+}
+
+/// The items of `old` that `new` lost or reopened, each as the problem it
+/// is. An item is matched by its text, box aside, to an item of `new` whose
+/// text starts with it, so a tick that appends `(fixed by PR #M)` keeps it;
+/// each item of `new` matches one item of `old` at most.
+fn lost_items(old: &str, new: &str) -> Vec<String>
+{
+    let mut held = items_of(old);
+    // The longest texts claim their match first, so an item whose text is
+    // a prefix of another's cannot take that other's match.
+    held.sort_by_key(|(_, text)| std::cmp::Reverse(text.len()));
+    let mut unclaimed = items_of(new);
+    let mut out = Vec::new();
+    for (state, text) in held
+    {
+        match unclaimed.iter().position(|(_, t)| t.starts_with(text))
+        {
+            Some(index) =>
+            {
+                let (new_state, _) = unclaimed.remove(index);
+                if state == TaskItem::Ticked && new_state == TaskItem::Open
+                {
+                    out.push(format!("reopens `{text}`"));
+                }
+            }
+            None => out.push(format!("lacks `{text}`")),
+        }
+    }
+    out
+}
+
 /// Decide whether `new` may replace `old` as an Issue body. A body that is
-/// empty, or that has fewer task-list items than the one it replaces, is what
-/// a mis-directed fetch or a stale copy produces.
+/// empty, that lacks a task-list item of the one it replaces, or that reopens
+/// an item it has ticked, is what a mis-directed fetch or a stale copy
+/// produces: a copy fetched before another worker appended or ticked an item.
 pub fn guard_body(old: &str, new: &str, removal: ItemRemoval) -> Result<(), String>
 {
     if new.trim().is_empty()
     {
         return Err("the new body is empty".to_owned());
     }
-    let (before, after) = (task_items(old), task_items(new));
-    if after < before && removal == ItemRemoval::Refuse
+    if removal == ItemRemoval::Allow
     {
+        return Ok(());
+    }
+    let lost = lost_items(old, new);
+    if let Some(first) = lost.first()
+    {
+        let more = match lost.len()
+        {
+            1 => String::new(),
+            n => format!(" (and {} more)", n - 1),
+        };
         return Err(format!(
-            "the new body has {after} task-list item(s) and the Issue has {before}; re-fetch \
-             the body, or pass --allow-removal if the edit drops items on purpose"
+            "against the Issue's task-list items the new body {first}{more}; re-fetch the \
+             body, or pass --allow-removal if the edit drops, rewords, or reopens items on \
+             purpose"
         ));
     }
     Ok(())
@@ -164,19 +213,30 @@ pub fn run_edit(ctx: &BuildContext, args: &IssueEditArgs) -> Result<()>
     fs::write(&backup, &old).with_context(|| format!("cannot write {}", backup.display()))?;
     let number = args.issue.to_string();
     let body_file = args.body_file.to_string_lossy();
+    // From the edit on, the Issue may hold neither body, so every failure
+    // names the backup that holds the previous one.
+    let unexpected = || {
+        format!(
+            "Issue #{} may hold an unexpected body; its previous body is in {}",
+            args.issue,
+            backup.display()
+        )
+    };
     gh::run(
         &ctx.root,
         &["issue", "edit", &number, "--body-file", &body_file],
-    )?;
+    )
+    .with_context(unexpected)?;
 
-    let held = issue_body(&ctx.root, args.issue)?;
+    let held = issue_body(&ctx.root, args.issue).with_context(unexpected)?;
     if normalized(&held) != normalized(&new)
     {
         let backup_file = backup.to_string_lossy();
         gh::run(
             &ctx.root,
             &["issue", "edit", &number, "--body-file", &backup_file],
-        )?;
+        )
+        .with_context(unexpected)?;
         bail!(
             "Issue #{} did not hold the new body after the edit; the previous body is \
              restored from {}",
@@ -405,6 +465,44 @@ mod tests
         assert!(guard_body(OLD, fewer, ItemRemoval::Allow).is_ok());
         let ticked = "## Acceptance\n- [x] a\n* [X] b (fixed by PR #7)\n- [ ] c\n";
         assert!(guard_body(OLD, ticked, ItemRemoval::Refuse).is_ok());
+    }
+
+    #[test]
+    fn a_stale_copy_with_as_many_items_is_refused()
+    {
+        // Another worker appended `c` after this copy was fetched; the copy
+        // appends `d` and so has as many items as the Issue.
+        let held = "## Acceptance\n- [x] a\n- [ ] b\n- [ ] c\n";
+        let stale = "## Acceptance\n- [x] a\n- [ ] b\n- [ ] d\n";
+        let err = guard_body(held, stale, ItemRemoval::Refuse).expect_err("a stale copy");
+        assert!(err.contains("lacks `c`"), "{err}");
+        assert!(guard_body(held, stale, ItemRemoval::Allow).is_ok());
+    }
+
+    #[test]
+    fn a_body_that_reopens_a_ticked_item_is_refused()
+    {
+        // Another PR ticked `b`; a copy fetched before the tick un-ticks it.
+        let held = "## Acceptance\n- [x] a\n- [x] b (fixed by PR #7)\n";
+        let stale = "## Acceptance\n- [x] a\n- [ ] b (fixed by PR #7)\n";
+        let err = guard_body(held, stale, ItemRemoval::Refuse).expect_err("a reopened item");
+        assert!(err.contains("reopens `b (fixed by PR #7)`"), "{err}");
+        // A copy that drops the marker loses the item's text.
+        let unmarked = "## Acceptance\n- [x] a\n- [x] b\n";
+        assert!(guard_body(held, unmarked, ItemRemoval::Refuse).is_err());
+    }
+
+    #[test]
+    fn each_new_item_matches_one_held_item_by_its_text()
+    {
+        // Two items of one text need two items in the new body.
+        let twice = "- [ ] a\n- [ ] a\n";
+        assert!(guard_body(twice, "- [ ] a\n", ItemRemoval::Refuse).is_err());
+        // `a b` claims its match before `a`, which a prefix of it would
+        // otherwise take.
+        let prefixed = "- [ ] a\n- [ ] a b\n";
+        let ticked = "- [x] a b\n- [x] a (fixed by PR #7)\n";
+        assert!(guard_body(prefixed, ticked, ItemRemoval::Refuse).is_ok());
     }
 
     #[test]

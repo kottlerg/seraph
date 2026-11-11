@@ -67,9 +67,9 @@ the maintainer take the place of all of this, and there the verdict lines and re
 in the reply.
 
 Hand back in two cases only: a question the orchestrator must answer (a host request is one),
-or the gate report. A pending CI run or review is not a reason, and neither is a refused launch
-check: wait with the Monitor tool and re-check for up to 30 minutes (§ Host runs). A check
-still refused after that is a question.
+or the gate report. A pending CI run or review is not a reason, and neither is a launch the
+host's rules refuse: run the command again with `--wait-host 1800`, which waits up to 30 minutes
+(§ Host runs). A launch still refused after that is a question.
 
 Some decisions are not yours: widening the task beyond § Scope and branches, a contested review
 finding, a design choice an Issue leaves open, filing an Issue. Put each to the orchestrator as
@@ -210,24 +210,24 @@ The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a deleg
 
 ## Host runs
 
-Local validation uses one shared host. Immediately before each launch, as a separate step that
-stops on failure, run the launch check for its kind, and state the result for each run the PR
-body's `## Validation` section reports:
+Local validation uses one shared host. The commands that load it apply its launch rules
+themselves (`xtask/README.md` § Host launch rules): a build or a boot the rules refuse fails
+before it starts, naming the load read and its limit or what is in the way. State, for each run
+the PR body's `## Validation` section reports, that its command was admitted. Tell the command
+what the run is:
 
-- A build (`cargo xtask build`, `cargo xtask clean`): the 1-minute load average
-  (`cat /proc/loadavg`) under 32. No grant.
-- A boot of 4 vCPUs or fewer: fewer than 2 QEMUs running (`pgrep -c qemu-system`), none with
-  more than 4 vCPUs (`pgrep -af qemu-system` shows no `-smp` above 4), and the load under 16. No
-  grant.
+- A build (`cargo xtask build`, `cargo xtask clean`), and a boot of 4 vCPUs or fewer: no
+  option, and no grant. The command admits a build under a load of 32, and a boot under a load
+  of 16 with fewer than 2 QEMUs running and none of more than 4 vCPUs.
 - A boot of more than 4 vCPUs, and any timing-sensitive measurement: the exclusive grant
-  (orchestrated) and, under it, no QEMU running and the load under 10.
-- A run docs/testing.md § Coverage tiers owes: no other QEMU running, whatever its vCPU count,
-  since its hang or failure blocks as that section says.
+  (orchestrated), passed as `--grant <holder>` with the holder the grant names, and `--timing`
+  for a measurement. The command admits it only with no QEMU running and the load under 10.
+- A run docs/testing.md § Coverage tiers owes: `--alone`, which admits it only with no other
+  QEMU running, whatever its vCPU count, since its hang or failure blocks as that section says.
 
-While the orchestrator holds the host for another worker's grant, launch no boot, and during a
-timing-sensitive measurement no build either, until it says the grant ended. Run one QEMU of
-your own at a time. A timeout or timing failure of a boot that ran beside another QEMU, and that
-§ Coverage tiers does not owe, is re-run once alone before it counts.
+`--host-override` is the maintainer's, for interactive use; a worker does not pass it. Run one
+QEMU of your own at a time. A timeout or timing failure of a boot that ran beside another QEMU,
+and that § Coverage tiers does not owe, is re-run once alone before it counts.
 
 A boot that fails, hangs, or shows a kill you did not expect is evidence. Before any re-run,
 copy its saved log, and its `.crash.txt` when there is one, to a name that says what it is (the
@@ -255,8 +255,8 @@ Orchestrated:
   stands, and the body says that the incoming diff touches none of the PR's files. The gate
   needs the head to include `master` either way.
 
-Standalone, there is no grant: the launch checks are the whole protocol, and you sync yourself
-before the validation runs.
+Standalone, there is no grant: the commands' launch rules are the whole protocol, and you sync
+yourself before the validation runs.
 
 The validation set is `cargo xtask test`, `cargo xtask lint-docs`, then on both architectures
 `cargo xtask build` and the boots the change sits on: ktest for `core/` and `shared/`, svctest

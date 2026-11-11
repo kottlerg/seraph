@@ -143,6 +143,7 @@ fn boot(ctx: &Context, args: &TestMapRedoArgs, dir: &Path) -> Result<()>
         second_disk: None,
         second_disk_block_size: None,
         second_disk_shared_line: false,
+        host: args.host.clone(),
     };
     step("map redo test: booting the current sysroot with the mapredo knob staged");
     crate::commands::run_parallel::run(ctx, &run)

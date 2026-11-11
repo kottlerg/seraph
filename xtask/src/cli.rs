@@ -180,10 +180,74 @@ pub enum CliCommand
     /// xtask/README.md).
     Orch(OrchArgs),
 
+    /// Show the shared host's state as the launch rules read it: the load,
+    /// the exclusive grant, the commands holding the host, and the QEMUs
+    /// running (see xtask/README.md "Host launch rules").
+    Host(HostCommandArgs),
+
     /// Answer a hook of the assistant's harness: read the event's JSON on
     /// stdin and print the answer the harness reads. `.claude/settings.json`
     /// names these commands (see xtask/README.md).
     Hook(HookArgs),
+}
+
+// ── Host launch rules ─────────────────────────────────────────────────────────
+
+/// The host launch rules' options every command that loads the host takes
+/// (`crate::host_lock`).
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct HostArgs
+{
+    /// When the host refuses this command, wait up to SECS for it to admit
+    /// it, asking again every 10 s, instead of failing at once; at the bound
+    /// the command fails with the last refusal.
+    #[arg(long, value_name = "SECS")]
+    pub wait_host: Option<u64>,
+
+    /// Start even when the host's rules refuse, printing the refusal: for
+    /// the maintainer's interactive use. A boot still registers, so other
+    /// commands see it.
+    #[arg(long)]
+    pub host_override: bool,
+}
+
+/// The host launch rules' options of a command that boots QEMU.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct BootHostArgs
+{
+    #[command(flatten)]
+    pub common: HostArgs,
+
+    /// Run beside no other QEMU, and keep every other boot off the host
+    /// while it runs: a run docs/testing.md "Coverage tiers" owes.
+    #[arg(long, conflicts_with = "timing")]
+    pub alone: bool,
+
+    /// A timing-sensitive measurement: run beside no other QEMU, under the
+    /// large-boot load limit, and refuse builds while it runs.
+    #[arg(long)]
+    pub timing: bool,
+
+    /// Boot under the exclusive grant `cargo xtask orch grant set` gave
+    /// HOLDER. While a grant is outstanding, a boot that does not name its
+    /// holder is refused.
+    #[arg(long, value_name = "HOLDER")]
+    pub grant: Option<String>,
+}
+
+#[derive(Parser)]
+pub struct HostCommandArgs
+{
+    #[command(subcommand)]
+    pub command: HostCommand,
+}
+
+#[derive(Subcommand)]
+pub enum HostCommand
+{
+    /// Print the host's state: the 1-minute load and its limits, the
+    /// exclusive grant, the live holders, and the QEMUs running.
+    Status,
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -218,6 +282,11 @@ pub struct BuildArgs
     /// re-run. Use `cargo xtask build` when you want the full lint pass.
     #[arg(long, hide = true)]
     pub skip_lints: bool,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: HostArgs,
 }
 
 /// A component `cargo xtask build` builds: the bootloader, every component,
@@ -348,6 +417,11 @@ pub struct RunArgs
     /// it; the stub is unstaged when QEMU exits. Requires `--debug-port`.
     #[arg(long, value_name = "NAME", requires = "debug_port")]
     pub debug_target: Option<String>,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -403,6 +477,11 @@ pub struct TestTerminalArgs
     /// Guest memory size in MiB (QEMU -m).
     #[arg(long, default_value = "512")]
     pub mem: u32,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
 }
 
 // ── TestVmgenid ───────────────────────────────────────────────────────────────
@@ -417,6 +496,11 @@ pub struct TestVmgenidArgs
     /// Guest memory size in MiB (QEMU -m).
     #[arg(long, default_value = "512")]
     pub mem: u32,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
 }
 
 // ── TestKaslr ─────────────────────────────────────────────────────────────────
@@ -445,6 +529,11 @@ pub struct TestKaslrArgs
     /// when CPUID reports LA57, so this selects the depth a run exercises.
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
 }
 
 // ── TestCrashReport ───────────────────────────────────────────────────────────
@@ -509,6 +598,11 @@ pub struct TestLogdReclaimArgs
     /// Guest x86-64 paging depth (`x86_64` only; ignored with `--log`).
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
 }
 
 // ── TestMapRedo ───────────────────────────────────────────────────────────────
@@ -539,6 +633,11 @@ pub struct TestMapRedoArgs
     /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64).
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
 }
 
 // ── TestDebugPort ─────────────────────────────────────────────────────────────
@@ -561,6 +660,11 @@ pub struct TestDebugPortArgs
     /// Guest memory size in MiB (QEMU -m).
     #[arg(long, default_value = "512")]
     pub mem: u32,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
 }
 
 // ── TestGdb ──────────────────────────────────────────────────────────────────
@@ -587,6 +691,11 @@ pub struct TestGdbArgs
     /// Guest memory size in MiB (QEMU -m).
     #[arg(long, default_value = "512")]
     pub mem: u32,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
 }
 
 // ── ComposeBundle ────────────────────────────────────────────────────────────
@@ -611,6 +720,11 @@ pub struct CleanArgs
     /// Also remove the cargo target/ directory (full clean).
     #[arg(long)]
     pub all: bool,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: HostArgs,
 }
 
 // ── Test ──────────────────────────────────────────────────────────────────────
@@ -805,6 +919,11 @@ pub struct RunParallelArgs
     /// `--debug-port`.
     #[arg(long, value_name = "NAME", requires = "debug_port")]
     pub debug_target: Option<String>,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
 }
 
 // ── KtestTiming ───────────────────────────────────────────────────────────────

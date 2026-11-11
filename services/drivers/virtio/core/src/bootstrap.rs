@@ -3,157 +3,142 @@
 
 // services/drivers/virtio/core/src/bootstrap.rs
 
-//! The bootstrap rounds devmgr serves a `VirtIO` PCI driver, and their
-//! driver-side decoding.
+//! A `VirtIO` PCI driver's reading of the resource list devmgr delivers it
+//! (`driver_binding::resources`; docs/driver-binding.md § Binding).
 //!
-//! Two rounds over `ipc::bootstrap`:
-//!
-//! - Round 1 (not terminal) carries one `Mmio` cap per distinct BAR the
-//!   device's register regions name, in ascending BAR index (the order of
-//!   [`RegisterLayout::bars`](crate::RegisterLayout::bars)), and one data
-//!   word per cap: `data[i]` is the PCI BAR index of `caps[i]`.
-//! - Round 2 (terminal) carries the positional slots [`SLOT_SERVICE`],
-//!   [`SLOT_IRQ`], [`SLOT_DEVMGR_QUERY`], and [`SLOT_DMA`], packed with
-//!   [`ipc::bootstrap::pack_slots`] and its presence word in `data[0]`
-//!   ([`DATA_PRESENCE`]), and the IRQ line's mode in `data[1]`
-//!   ([`DATA_IRQ_MODE`]): the trigger and polarity word the driver passes to
-//!   `SYS_IRQ_REGISTER` (`IRQ_MODE_*` in `abi/syscall`), which devmgr derives
-//!   for the line (services/devmgr/docs/pci-enumeration.md). The IRQ slot is
-//!   absent when devmgr could give the device no IRQ cap, and the mode word is
-//!   then 0.
-//!
-//! The protocol carries no version constant; a round of another shape fails
-//! the checks here and the driver exits.
+//! For a function that presents the `VirtIO` register layout, devmgr delivers
+//! one `Mmio` resource per distinct BAR the layout's register regions name,
+//! in ascending BAR index (the order of
+//! [`RegisterLayout::bars`](crate::RegisterLayout::bars)), each naming its
+//! PCI BAR; then the function's wired interrupt line when it has one, with
+//! the mode the driver passes to `SYS_IRQ_REGISTER`; then the end round's
+//! service endpoint, devmgr query cap, and DMA capability. [`DeliveredDevice`]
+//! reads that list into the shape the transport maps, and refuses any other.
 
-use ipc::bootstrap::BootstrapRound;
-use syscall_abi::MSG_CAP_SLOTS_MAX;
+use driver_binding::resources::{self, InterruptKind, Resource, ResourceList};
 
 use crate::MAX_VIRTIO_BARS;
 
-// devmgr delivers every BAR a device names in round 1, one cap each.
-const _: () = assert!(MAX_VIRTIO_BARS <= MSG_CAP_SLOTS_MAX);
-
-/// Round-2 slot of the driver's service endpoint.
-pub const SLOT_SERVICE: usize = 0;
-/// Round-2 slot of the device's single-IRQ `Interrupt` cap.
-pub const SLOT_IRQ: usize = 1;
-/// Round-2 slot of the per-device badged SEND on the private driver endpoint
-/// of the driver's devmgr spawn batch, for `QUERY_DEVICE_INFO` and, once the
-/// device is set up, `DRIVER_READY` (`ipc::devmgr_labels`). devmgr serves the
-/// driver's service endpoint only after that report, and revokes this cap
-/// once its batch has settled.
-pub const SLOT_DEVMGR_QUERY: usize = 2;
-/// Round-2 slot of the device's DMA capability: a SEND on devmgr's DMA
-/// endpoint badged with the device's badge, for `DMA_MAP` and `DMA_UNMAP`
-/// (`ipc::devmgr_dma_labels`). It lives as long as the driver serves the
-/// device; devmgr revokes it when it withdraws the driver.
-pub const SLOT_DMA: usize = 3;
-/// Slots round 2 carries.
-pub const ROUND2_SLOTS: usize = 4;
-/// Round-2 data word holding the presence word of the slots.
-pub const DATA_PRESENCE: usize = 0;
-/// Round-2 data word holding the IRQ line's `SYS_IRQ_REGISTER` mode.
-pub const DATA_IRQ_MODE: usize = 1;
-/// Data words round 2 carries.
-pub const ROUND2_DATA_WORDS: usize = 2;
-
-// Round 2 is one positional-slot round, and its slots fill every cap slot a
-// message has, so `spread_slots` refuses a presence bit past them.
-const _: () = assert!(ROUND2_SLOTS == MSG_CAP_SLOTS_MAX);
-
-/// The BAR caps a driver received in round 1, each with its PCI BAR index.
-pub struct DeliveredBars
+/// What devmgr delivered a `VirtIO` PCI driver: its BAR caps, its interrupt
+/// line, and its endpoints; `0` marks an absent cap.
+pub struct DeliveredDevice
 {
-    caps: [u64; MAX_VIRTIO_BARS],
+    bar_caps: [u64; MAX_VIRTIO_BARS],
     bar_indices: [u64; MAX_VIRTIO_BARS],
-    count: usize,
+    bar_count: usize,
+    /// The device's wired-line `Interrupt` cap, `0` when devmgr delivered
+    /// none.
+    pub irq: u64,
+    /// The mode the driver passes to `SYS_IRQ_REGISTER` for [`Self::irq`];
+    /// 0 with no line.
+    pub irq_mode: u64,
+    /// The driver's service endpoint.
+    pub service: u64,
+    /// The per-device badged SEND on the private driver endpoint of the
+    /// driver's devmgr spawn batch, for `QUERY_DEVICE_INFO` and, once the
+    /// device is set up, `DRIVER_READY` (`ipc::devmgr_labels`). devmgr serves
+    /// the driver's service endpoint only after that report, and revokes this
+    /// cap once its batch has settled.
+    pub devmgr_query: u64,
+    /// The device's DMA capability: a SEND on devmgr's DMA endpoint badged
+    /// with the device's badge, for `DMA_MAP` and `DMA_UNMAP`
+    /// (`ipc::devmgr_dma_labels`). It lives as long as the driver serves the
+    /// device; devmgr revokes it when it withdraws the driver.
+    pub dma: u64,
 }
 
-impl DeliveredBars
+impl DeliveredDevice
 {
-    /// Decode round 1. Returns `None` when the round is terminal, carries no
-    /// cap or more than [`MAX_VIRTIO_BARS`], or does not carry one BAR-index
-    /// word per cap.
+    /// Read a complete resource list. Returns `None` when the list has no
+    /// end round or no service endpoint, delivers no BAR or more than
+    /// [`MAX_VIRTIO_BARS`], an `Mmio` range that is no PCI BAR, an `IoPort`,
+    /// more than one interrupt, or an interrupt other than a wired line.
     #[must_use]
-    pub fn from_round(round: &BootstrapRound) -> Option<Self>
+    pub fn from_list(list: &ResourceList) -> Option<Self>
     {
-        let count = round.cap_count;
-        if round.done || count == 0 || count > MAX_VIRTIO_BARS || round.data_words != count
+        let endpoints = list.endpoints()?;
+        if endpoints.service == 0
         {
             return None;
         }
-        let mut bars = Self {
-            caps: [0; MAX_VIRTIO_BARS],
+        let mut device = Self {
+            bar_caps: [0; MAX_VIRTIO_BARS],
             bar_indices: [0; MAX_VIRTIO_BARS],
-            count,
+            bar_count: 0,
+            irq: 0,
+            irq_mode: 0,
+            service: endpoints.service,
+            devmgr_query: endpoints.devmgr_query,
+            dma: endpoints.dma,
         };
-        bars.caps[..count].copy_from_slice(&round.caps[..count]);
-        bars.bar_indices[..count].copy_from_slice(&round.data[..count]);
-        Some(bars)
+        for resource in list.resources()
+        {
+            match *resource
+            {
+                Resource::Mmio {
+                    cap,
+                    bar: Some(bar),
+                    ..
+                } if device.bar_count < MAX_VIRTIO_BARS =>
+                {
+                    device.bar_caps[device.bar_count] = cap;
+                    device.bar_indices[device.bar_count] = u64::from(bar);
+                    device.bar_count += 1;
+                }
+                Resource::Interrupt {
+                    cap,
+                    kind: InterruptKind::Wired,
+                    mode,
+                    ..
+                } if device.irq == 0 =>
+                {
+                    device.irq = cap;
+                    device.irq_mode = mode;
+                }
+                _ => return None,
+            }
+        }
+        (device.bar_count > 0).then_some(device)
+    }
+
+    /// Request and read the resource list from `creator`, the driver's
+    /// creator endpoint. `None` when a round fails, the list does not decode
+    /// ([`resources::receive`]), or it is not a `VirtIO` device's
+    /// ([`Self::from_list`]); every cap received is then deleted.
+    ///
+    /// # Safety
+    /// `ipc_buf` must point to the calling thread's registered IPC buffer
+    /// page.
+    #[must_use]
+    pub unsafe fn receive(creator: u64, ipc_buf: *mut u64) -> Option<Self>
+    {
+        // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+        let list = unsafe { resources::receive(creator, ipc_buf) }.ok()?;
+        let device = Self::from_list(&list);
+        if device.is_none()
+        {
+            for cap in list.caps()
+            {
+                let _ = syscall::cap_delete(cap);
+            }
+        }
+        device
     }
 
     /// The BAR caps, in delivery order.
     #[must_use]
-    pub fn caps(&self) -> &[u64]
+    pub fn bar_caps(&self) -> &[u64]
     {
-        &self.caps[..self.count]
+        &self.bar_caps[..self.bar_count]
     }
 
-    /// The PCI BAR index of each cap, parallel to [`caps`](Self::caps); a
-    /// driver checks it with
+    /// The PCI BAR index of each cap, parallel to
+    /// [`bar_caps`](Self::bar_caps); a driver checks it with
     /// [`RegisterLayout::matches_delivered`](crate::RegisterLayout::matches_delivered).
     #[must_use]
     pub fn bar_indices(&self) -> &[u64]
     {
-        &self.bar_indices[..self.count]
-    }
-}
-
-/// The caps a driver received in round 2; `0` marks an absent slot.
-pub struct DriverEndpoints
-{
-    /// The driver's service endpoint ([`SLOT_SERVICE`]).
-    pub service: u64,
-    /// The device's IRQ cap ([`SLOT_IRQ`]), `0` when devmgr delivered none.
-    pub irq: u64,
-    /// The mode the driver passes to `SYS_IRQ_REGISTER` for [`Self::irq`]
-    /// ([`DATA_IRQ_MODE`]).
-    pub irq_mode: u64,
-    /// devmgr's per-device query and ready-report endpoint
-    /// ([`SLOT_DEVMGR_QUERY`]).
-    pub devmgr_query: u64,
-    /// The device's DMA capability ([`SLOT_DMA`]).
-    pub dma: u64,
-}
-
-impl DriverEndpoints
-{
-    /// Decode round 2. Returns `None` when the round is not terminal, it
-    /// carries other than [`ROUND2_DATA_WORDS`] data words, its presence word
-    /// disagrees with its caps ([`ipc::bootstrap::spread_slots`]), or its mode
-    /// word sets a bit outside `IRQ_MODE_MASK`.
-    #[must_use]
-    pub fn from_round(round: &BootstrapRound) -> Option<Self>
-    {
-        if !round.done || round.data_words != ROUND2_DATA_WORDS
-        {
-            return None;
-        }
-        let slots =
-            ipc::bootstrap::spread_slots(&round.caps[..round.cap_count], round.data[DATA_PRESENCE])
-                .ok()?;
-        let irq_mode = round.data[DATA_IRQ_MODE];
-        if irq_mode & !syscall_abi::IRQ_MODE_MASK != 0
-        {
-            return None;
-        }
-        Some(Self {
-            service: slots[SLOT_SERVICE],
-            irq: slots[SLOT_IRQ],
-            irq_mode,
-            devmgr_query: slots[SLOT_DEVMGR_QUERY],
-            dma: slots[SLOT_DMA],
-        })
+        &self.bar_indices[..self.bar_count]
     }
 }
 
@@ -162,76 +147,101 @@ mod tests
 {
     use super::*;
 
-    use syscall_abi::MSG_DATA_WORDS_MAX;
+    use driver_binding::resources::{Endpoints, Round};
+    use ipc::bootstrap::BootstrapRound;
+    use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
-    fn round(done: bool, caps: &[u64], data: &[u64]) -> BootstrapRound
+    fn list(rounds: &[Round]) -> ResourceList
     {
-        let mut r = BootstrapRound {
-            caps: [0; MSG_CAP_SLOTS_MAX],
-            cap_count: caps.len(),
-            data: [0; MSG_DATA_WORDS_MAX],
-            data_words: data.len(),
-            done,
-        };
-        r.caps[..caps.len()].copy_from_slice(caps);
-        r.data[..data.len()].copy_from_slice(data);
-        r
+        let mut list = ResourceList::new();
+        for r in rounds
+        {
+            let mut round = BootstrapRound {
+                caps: [0; MSG_CAP_SLOTS_MAX],
+                cap_count: r.caps().len(),
+                data: [0; MSG_DATA_WORDS_MAX],
+                data_words: r.data().len(),
+                done: r.done(),
+            };
+            round.caps[..r.caps().len()].copy_from_slice(r.caps());
+            round.data[..r.data().len()].copy_from_slice(r.data());
+            list.absorb(&round).expect("well-formed round");
+        }
+        list
+    }
+
+    fn end(service: u64) -> Round
+    {
+        Round::end(&Endpoints {
+            service,
+            devmgr_query: 21,
+            dma: 22,
+        })
     }
 
     #[test]
-    fn round_one_pairs_each_bar_cap_with_its_bar_index()
+    fn bars_line_and_endpoints_are_read_in_delivery_order()
     {
-        let bars = DeliveredBars::from_round(&round(false, &[10, 11], &[2, 4]))
-            .expect("well-formed round 1");
-        assert_eq!(bars.caps(), &[10, 11]);
-        assert_eq!(bars.bar_indices(), &[2, 4]);
-    }
-
-    #[test]
-    fn round_one_of_another_shape_is_refused()
-    {
-        // The single-BAR shape this protocol replaced: three caps, no words.
-        assert!(DeliveredBars::from_round(&round(false, &[10, 11, 12], &[])).is_none());
-        // One index word short.
-        assert!(DeliveredBars::from_round(&round(false, &[10, 11], &[2])).is_none());
-        // No BAR at all.
-        assert!(DeliveredBars::from_round(&round(false, &[], &[])).is_none());
-        // Terminal: the driver would never receive round 2.
-        assert!(DeliveredBars::from_round(&round(true, &[10], &[0])).is_none());
-    }
-
-    #[test]
-    fn round_two_spreads_present_caps_over_their_slots()
-    {
-        // No IRQ: service, devmgr query, and DMA present (slots 0, 2, 3).
-        let eps = DriverEndpoints::from_round(&round(true, &[20, 22, 23], &[0b1101, 0]))
-            .expect("well-formed round 2");
+        let mode = syscall_abi::IRQ_MODE_LEVEL | syscall_abi::IRQ_MODE_ACTIVE_LOW;
+        let device = DeliveredDevice::from_list(&list(&[
+            Round::mmio(10, Some(1), 0x1000, 0x1000),
+            Round::mmio(11, Some(4), 0x8000, 0x4000),
+            Round::interrupts(InterruptKind::Wired, 0, mode, &[12]).expect("one line"),
+            end(20),
+        ]))
+        .expect("a VirtIO device's list");
+        assert_eq!(device.bar_caps(), &[10, 11]);
+        assert_eq!(device.bar_indices(), &[1, 4]);
+        assert_eq!((device.irq, device.irq_mode), (12, mode));
         assert_eq!(
-            (eps.service, eps.irq, eps.devmgr_query, eps.dma),
-            (20, 0, 22, 23)
+            (device.service, device.devmgr_query, device.dma),
+            (20, 21, 22)
         );
     }
 
     #[test]
-    fn round_two_carries_the_irq_lines_mode()
+    fn a_device_with_no_line_has_no_irq()
     {
-        let mode = syscall_abi::IRQ_MODE_LEVEL | syscall_abi::IRQ_MODE_ACTIVE_LOW;
-        let eps = DriverEndpoints::from_round(&round(true, &[20, 21, 22], &[0b111, mode]))
-            .expect("well-formed round 2");
-        assert_eq!((eps.irq, eps.irq_mode), (21, mode));
+        let device =
+            DeliveredDevice::from_list(&list(&[Round::mmio(10, Some(0), 0, 0x1000), end(20)]))
+                .expect("a VirtIO device's list");
+        assert_eq!((device.irq, device.irq_mode), (0, 0));
     }
 
     #[test]
-    fn round_two_of_another_shape_is_refused()
+    fn a_list_of_another_shape_is_refused()
     {
-        // Not terminal.
-        assert!(DriverEndpoints::from_round(&round(false, &[20, 21, 22], &[0b111, 0])).is_none());
-        // No presence word.
-        assert!(DriverEndpoints::from_round(&round(true, &[20], &[])).is_none());
-        // No mode word: the shape before the mode word.
-        assert!(DriverEndpoints::from_round(&round(true, &[20, 21, 22], &[0b111])).is_none());
-        // A mode bit outside IRQ_MODE_MASK.
-        let bad = syscall_abi::IRQ_MODE_MASK + 1;
-        assert!(DriverEndpoints::from_round(&round(true, &[20, 21, 22], &[0b111, bad])).is_none());
+        let bar = || Round::mmio(10, Some(0), 0, 0x1000);
+        let line = || Round::interrupts(InterruptKind::Wired, 0, 0, &[12]).expect("one line");
+        // Incomplete: no end round.
+        assert!(DeliveredDevice::from_list(&list(&[bar()])).is_none());
+        // No service endpoint.
+        assert!(DeliveredDevice::from_list(&list(&[bar(), end(0)])).is_none());
+        // No BAR.
+        assert!(DeliveredDevice::from_list(&list(&[line(), end(20)])).is_none());
+        // A range of no BAR.
+        assert!(
+            DeliveredDevice::from_list(&list(&[Round::mmio(10, None, 0, 0x1000), end(20)]))
+                .is_none()
+        );
+        // An I/O port range.
+        assert!(
+            DeliveredDevice::from_list(&list(&[bar(), Round::io_port(13, 0x60, 1), end(20)]))
+                .is_none()
+        );
+        // Two lines.
+        assert!(DeliveredDevice::from_list(&list(&[bar(), line(), line(), end(20)])).is_none());
+        // A message-signaled vector.
+        let msi = Round::interrupts(InterruptKind::Msi, 0, 0, &[14]).expect("one vector");
+        assert!(DeliveredDevice::from_list(&list(&[bar(), msi, end(20)])).is_none());
+        // More BARs than the layout names.
+        let many: Vec<Round> = (0..=MAX_VIRTIO_BARS)
+            .map(|i| {
+                let bar = u8::try_from(i).expect("a BAR index");
+                Round::mmio(30 + u64::from(bar), Some(bar), 0, 0x1000)
+            })
+            .chain([end(20)])
+            .collect();
+        assert!(DeliveredDevice::from_list(&list(&many)).is_none());
     }
 }

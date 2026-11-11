@@ -1881,7 +1881,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 15;
+pub const DEVMGR_LABELS_VERSION: u32 = 16;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -2198,33 +2198,21 @@ pub mod devmgr_labels
     /// one fault batch spawns, which devmgr's driver death queue reserves
     /// room for.
     pub const TEST_FAULT_DRIVERS: usize = 3;
-    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    /// label: bind the DMA test device (QEMU's `edu`, PCI `1234:11e8`) to
-    /// the `test-dma` fixture driver from `/services/drivers/` in a settle
-    /// batch of its own: devmgr attaches the device to its IOMMU domain where
-    /// an IOMMU confines it, grants it DMA, turns on its memory decode and
-    /// bus mastering, and spawns the driver, which reports ready once it has
-    /// found the device. The handler replies before it binds (the bind does
-    /// nested `ipc_call`s), and the driver is then queried with
-    /// [`TEST_QUERY_DMA_DEVICE`], which waits in the registry queue until the
-    /// settle has ended. Reply: `SUCCESS` with `data[0]` =
+    /// TODO(#165): remove with the test labels. Test-only label: mint a
+    /// `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the service endpoint
+    /// of the served `test-dma` fixture, the driver devmgr binds to the DMA
+    /// test device (QEMU's `edu`, PCI `1234:11e8`) at [`SET_DRIVERS_DIR`]
+    /// by its declaration, like any driver (the fixture checks no badge).
+    /// devmgr serves it once that settle batch ends; until then the query
+    /// replies `NO_DEVICE`, as it does on a machine with no such device.
+    /// Reply: `SUCCESS` with the cap in `caps[0]` and `data[0]` =
     /// [`TEST_DMA_CONFINED`] when an IOMMU confines the device or
-    /// [`TEST_DMA_UNCONFINED`] when none does; `NO_DEVICE` when the machine
-    /// has no such device; `INVALID_REQUEST` for a repeated request (at most
-    /// once per boot) or one before [`SET_DRIVERS_DIR`]. Request: `data[0]` =
-    /// caller's compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
-    /// [`TEST_SPAWN_ORPHAN`].
-    pub const TEST_SPAWN_DMA_DRIVER: u64 = 16;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Test-only label:
-    /// mint a `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the served
-    /// `test-dma` driver's service endpoint (the driver checks no badge).
-    /// Reply: `SUCCESS` with the cap in `caps[0]`; `WITHDRAWN` once the
-    /// driver is withdrawn; `NO_DEVICE` when none is served;
-    /// `INVALID_REQUEST` for a failed derive. Request: `data[0]` = caller's
-    /// compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
-    /// [`TEST_SPAWN_ORPHAN`].
+    /// [`TEST_DMA_UNCONFINED`] when none does; `WITHDRAWN` once the fixture
+    /// is withdrawn; `NO_DEVICE` when none is served; `INVALID_REQUEST` for a
+    /// failed derive. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
     pub const TEST_QUERY_DMA_DEVICE: u64 = 17;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Test-only label:
+    /// TODO(#165): remove with the test labels. Test-only label:
     /// the IOMMU faults devmgr has taken for the DMA test device, after it
     /// takes the IOMMU driver's pending ones (`iommu_labels::TAKE_FAULTS`)
     /// and logs them. Reply: `SUCCESS` with `data[0]` = the faults taken for
@@ -2233,10 +2221,10 @@ pub mod devmgr_labels
     /// Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
     pub const TEST_DMA_FAULTS: u64 = 18;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Its reply word: an
+    /// TODO(#165): remove with [`TEST_QUERY_DMA_DEVICE`]. Its reply word: an
     /// IOMMU confines the DMA test device.
     pub const TEST_DMA_CONFINED: u64 = 1;
-    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Its reply word: no
+    /// TODO(#165): remove with [`TEST_QUERY_DMA_DEVICE`]. Its reply word: no
     /// IOMMU confines the DMA test device, so its device addresses are
     /// physical.
     pub const TEST_DMA_UNCONFINED: u64 = 2;
@@ -2244,10 +2232,10 @@ pub mod devmgr_labels
     /// Driver-only: report that the driver has set its device up and is
     /// entering its service loop, so devmgr may serve its endpoint.
     ///
-    /// Sent by every driver devmgr spawns (the `VirtIO` PCI drivers
-    /// virtio-blk, virtio-input, and virtio-console, and the serial, framebuffer, and RTC
-    /// drivers) on its round-2 devmgr query cap, a SEND badged with its
-    /// device badge on the private driver endpoint of its spawn batch; the
+    /// Sent by every driver devmgr spawns (a driver bound to a PCI device by
+    /// its declaration, and the serial, framebuffer, and RTC drivers) on its
+    /// devmgr query cap, a SEND badged with its device badge on the private
+    /// driver endpoint of its spawn batch; the
     /// registry endpoint replies `UNKNOWN_OPCODE` to it. Request: `data[0]` =
     /// caller's compiled [`super::DEVMGR_LABELS_VERSION`]. Reply: `SUCCESS`
     /// when the badge names a driver of the batch that has not died (a
@@ -2287,8 +2275,8 @@ pub mod devmgr_labels
     /// TODO(#165): remove with the test labels. Authority bit gating
     /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`],
     /// [`TEST_QUERY_DENY_DEVICE`], [`TEST_SPAWN_FAULT_DRIVERS`],
-    /// [`TEST_QUERY_FAULT_DEVICE`], [`TEST_SPAWN_DMA_DRIVER`],
-    /// [`TEST_QUERY_DMA_DEVICE`], and [`TEST_DMA_FAULTS`]. svcmgr mints it,
+    /// [`TEST_QUERY_FAULT_DEVICE`], [`TEST_QUERY_DMA_DEVICE`], and
+    /// [`TEST_DMA_FAULTS`]. svcmgr mints it,
     /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
@@ -2340,7 +2328,7 @@ pub mod test_fault_labels
     pub const FAULT_EXIT_DELAY_MS: u64 = 200;
 }
 
-/// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_DMA_DRIVER`. The
+/// TODO(#165): remove with `devmgr_labels::TEST_QUERY_DMA_DEVICE`. The
 /// `test-dma` fixture driver's service label.
 ///
 /// The fixture drives QEMU's `edu` device, whose DMA engine copies between
@@ -2385,7 +2373,7 @@ pub enum ReadyError
 }
 
 /// Report a driver's device set up to devmgr: [`devmgr_labels::DRIVER_READY`]
-/// on `devmgr_ep`, the driver's round-2 devmgr query cap. A driver calls it
+/// on `devmgr_ep`, the devmgr query cap of the driver's bootstrap. A driver calls it
 /// immediately before its service loop, since devmgr serves the driver's
 /// endpoint only after the report. It logs nothing, so the serial and
 /// framebuffer drivers, which must not log, call it too.

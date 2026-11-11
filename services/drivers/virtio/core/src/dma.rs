@@ -4,7 +4,8 @@
 // services/drivers/virtio/core/src/dma.rs
 
 //! Driver-side mapping of a Memory cap's frames for the driver's device,
-//! through the device's DMA capability (`bootstrap::SLOT_DMA`).
+//! through the device's DMA capability
+//! ([`DeliveredDevice::dma`](crate::bootstrap::DeliveredDevice::dma)).
 //!
 //! A driver programs its device only with the device addresses these calls
 //! return, never with a physical address: devmgr chooses the address

@@ -255,9 +255,10 @@ fn publish_devmgr_registry_send(
     }
 }
 
-/// Hand devmgr a `LOOKUP | READ`-attenuated `/services/drivers/` subtree
-/// cap via `SET_DRIVERS_DIR`, so devmgr can lazily walk + spawn its on-disk
-/// driver binaries (the per-arch RTC and virtio-input). svcmgr walks its universal
+/// Hand devmgr a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
+/// subtree cap via `SET_DRIVERS_DIR`, so devmgr can list the directory, read
+/// the declaration of each driver binary in it, and spawn the drivers that
+/// match its devices (the per-arch RTC among them). svcmgr walks its universal
 /// root for the dir and mints a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from
 /// the endowed devmgr-registry source.
 ///
@@ -278,10 +279,14 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
         return;
     }
 
-    // Attenuated rights: only what devmgr needs to walk into the subtree
-    // and read driver-binary contents; the namespace server intersects
-    // per hop.
-    let rights = u64::from(namespace_protocol::rights::LOOKUP | namespace_protocol::rights::READ);
+    // Attenuated rights: only what devmgr needs to list the subtree, walk
+    // into it, and read driver-binary contents; the namespace server
+    // intersects per hop.
+    let rights = u64::from(
+        namespace_protocol::rights::LOOKUP
+            | namespace_protocol::rights::READ
+            | namespace_protocol::rights::READDIR,
+    );
     let drivers_dir =
         match std::os::seraph::namespace_lookup_dir(root_cap, "/services/drivers", rights)
         {

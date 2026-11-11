@@ -48,6 +48,24 @@ use text::{DecodeOutcome, Utf8Decoder};
 
 const REPLACEMENT_CODEPOINT: u32 = 0xFFFD;
 
+// ── Declaration ────────────────────────────────────────────────────────────
+
+// What devmgr binds this driver to and how it starts it
+// (docs/driver-binding.md § Driver Declarations). devmgr reads it but starts
+// this driver on its fixed path until platform device records carry the key
+// it matches (docs/driver-binding.md § Status).
+driver_binding::driver_declaration!(driver_binding::decl::Declaration {
+    name: "framebuffer",
+    class: Some("framebuffer"),
+    matches: &[driver_binding::decl::Match::BootFramebuffer],
+    instance_limit: Some(1),
+    interrupt: driver_binding::decl::Interrupt::NONE,
+    dma: false,
+    phys_access: false,
+    reset: driver_binding::decl::Reset::None,
+    tier: driver_binding::decl::Tier::Auxiliary,
+});
+
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 
 struct BootCaps

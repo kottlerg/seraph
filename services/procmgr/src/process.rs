@@ -2407,8 +2407,12 @@ pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
 
 /// Restore the crash bindings of every process whose attached debugger
 /// (`ATTACH_PROCESS` `caps[0]`) is gone: its thread exited, or its cap went
-/// with its process's teardown. procmgr's loop calls it on every pass, which
-/// a process's death, the debugger's among them, wakes.
+/// with its process's teardown. procmgr's reaper calls it on every pass,
+/// which a process's death, the debugger's among them, wakes; a request
+/// worker calls it before it serves each request, since a watch thread other
+/// than its process's main thread posts no death when it exits; and the
+/// worker that serves a `DESTROY_PROCESS` calls it after the teardown. Each
+/// caller holds the table lock.
 pub fn check_debuggers(table: &mut ProcessTable)
 {
     let mut gone: Vec<u64> = Vec::new();
@@ -3963,7 +3967,7 @@ pub fn destroy_process(
     record: bool,
 ) -> Option<u64>
 {
-    let (entry, exit_reason) = {
+    let (tail, exit_reason) = {
         let mut state = tables.lock();
         let entry = state.table.take_by_badge(badge)?;
         let exit_reason =
@@ -3979,10 +3983,33 @@ pub fn destroy_process(
         {
             state.recent.record(badge, exit_reason, crate::now_ns());
         }
-        (entry, exit_reason)
+        (
+            teardown_entry(entry, exit_reason, &mut state.table),
+            exit_reason,
+        )
     };
-    teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf, tables);
+    tail.finish(memmgr_ep, ipc_buf);
     Some(exit_reason)
+}
+
+/// Reap the process `badge` names after its death, with `exit_reason`, as
+/// [`destroy_process`] tears down a destroyed one: take its entry, record
+/// the exit in the recent-exits ring, and tear it down, under one hold of the
+/// table lock, then tell memmgr after it. Nothing when the badge is unknown
+/// (a destroy or an earlier event already reaped it).
+pub fn reap_dead(badge: u64, exit_reason: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables)
+{
+    let tail = {
+        let mut state = tables.lock();
+        let Some(entry) = state.table.take_by_badge(badge)
+        else
+        {
+            return;
+        };
+        state.recent.record(badge, exit_reason, crate::now_ns());
+        teardown_entry(entry, exit_reason, &mut state.table)
+    };
+    tail.finish(memmgr_ep, ipc_buf);
 }
 
 /// Send memmgr the held-back `PROCESS_DIED` of the torn-down
@@ -4025,15 +4052,22 @@ fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
 }
 
-/// Shared cleanup for both the explicit-IPC reap path (`destroy_process`)
-/// and the auto-reap paths (`dispatch_death` and `resync_deaths` in
-/// `main.rs`). Revokes and deletes every kernel object procmgr held on
-/// behalf of the child, then forwards the death, with `exit_reason`, to
-/// logd ([`forward_death_to_logd`]).
+/// Shared cleanup for both the explicit-IPC reap path ([`destroy_process`])
+/// and the auto-reap path ([`reap_dead`], from `dispatch_death` and
+/// `resync_deaths` in `main.rs`). Revokes and deletes every kernel object
+/// procmgr held on behalf of the child, and returns the steps left for
+/// after the table lock ([`TeardownTail::finish`]): the memmgr reclaim and
+/// the death forward, with `exit_reason`, to logd
+/// ([`forward_death_to_logd`]).
+///
+/// The caller holds the table lock from the entry's take to the return, and
+/// the steps here are syscalls that wait on no other process. So the
+/// teardown is one step to every other thread: a `DESTROY_PROCESS` that
+/// finds no entry finds it torn down, and a `RELEASE_HOLD` after it finds
+/// its reclaim parked.
 ///
 /// The memmgr reclaim of a started child created with `CREATE_DMA_HOLD` is
-/// parked in the table's held reclaims instead of sent, under the table lock,
-/// which no other step here takes: a device the child drove may still be
+/// parked in the table's held reclaims instead of sent: a device the child drove may still be
 /// writing its frames, so they return to memmgr only on the creator's
 /// `RELEASE_HOLD` on the child's release token ([`release_hold`];
 /// docs/process-lifecycle.md § Process Death). Its `CSpace` goes as any
@@ -4050,10 +4084,8 @@ fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
 pub fn teardown_entry(
     mut entry: ProcessEntry,
     exit_reason: u64,
-    memmgr_ep: u64,
-    ipc_buf: *mut u64,
-    tables: &Tables,
-)
+    table: &mut ProcessTable,
+) -> TeardownTail
 {
     // Order: threads first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables: the main thread, then
@@ -4104,20 +4136,45 @@ pub fn teardown_entry(
         let _ = syscall::cap_delete(entry.cwd_override);
     }
 
-    // Notify memmgr to reclaim every memory cap attributed to this child's
-    // memmgr badge, then drop procmgr's badged SEND copy, unless the reclaim
-    // is held for the creator's `RELEASE_HOLD`.
-    let parked = tables.lock().table.holds_mut().park(&entry);
-    if !parked
-    {
-        notify_memmgr_died(memmgr_ep, entry.memmgr_badge, ipc_buf);
-        if entry.memmgr_send_cap != 0
-        {
-            let _ = syscall::cap_delete(entry.memmgr_send_cap);
-        }
+    // memmgr reclaims every memory cap attributed to this child's memmgr
+    // badge after the lock, unless the reclaim is held for the creator's
+    // `RELEASE_HOLD`.
+    let parked = table.holds_mut().park(&entry);
+    TeardownTail {
+        badge: entry.badge,
+        exit_reason,
+        reclaim: (!parked).then_some((entry.memmgr_badge, entry.memmgr_send_cap)),
     }
+}
 
-    forward_death_to_logd(entry.badge, exit_reason);
+/// What a teardown ([`teardown_entry`]) leaves for after the table lock.
+#[must_use]
+pub struct TeardownTail
+{
+    badge: u64,
+    exit_reason: u64,
+    /// The child's memmgr badge and procmgr's badged memmgr SEND for it,
+    /// unless its reclaim was parked.
+    reclaim: Option<(u64, u64)>,
+}
+
+impl TeardownTail
+{
+    /// Notify memmgr to reclaim the child's memory, then drop procmgr's
+    /// badged SEND copy, unless the reclaim was parked; then forward the
+    /// death to logd. Called with no lock held.
+    pub fn finish(self, memmgr_ep: u64, ipc_buf: *mut u64)
+    {
+        if let Some((memmgr_badge, memmgr_send_cap)) = self.reclaim
+        {
+            notify_memmgr_died(memmgr_ep, memmgr_badge, ipc_buf);
+            if memmgr_send_cap != 0
+            {
+                let _ = syscall::cap_delete(memmgr_send_cap);
+            }
+        }
+        forward_death_to_logd(self.badge, self.exit_reason);
+    }
 }
 
 // ── Process start ───────────────────────────────────────────────────────────

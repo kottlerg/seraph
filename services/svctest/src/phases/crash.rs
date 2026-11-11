@@ -93,8 +93,8 @@ impl Registrant
     }
 
     /// End the helper and wait until its watch cap shows it gone, exited or
-    /// the cap revoked, so procmgr's next pass, which any following request
-    /// wakes, finds it gone and takes the endpoint back. The join's reclaim
+    /// the cap revoked, so procmgr's check before it serves any following
+    /// request finds it gone and takes the endpoint back. The join's reclaim
     /// revokes every cap derived from the helper's, the watch cap and the
     /// one procmgr keeps among them (runtime/ruststd/README.md § Thread
     /// capability).
@@ -431,9 +431,10 @@ fn find_listed(authority: u64, matches: impl Fn(u64, &[u8]) -> bool) -> Option<(
 /// upcall classes to an endpoint of its own, and hands the thread back
 /// (`DETACH_PROCESS`), which restores the crash binding and unbinds the
 /// upcall class; then it attaches with a watch, binds the thread again, and
-/// dies, its watch thread exiting, after which procmgr's next pass does the
-/// same unasked. procmgr leaves the main thread, whose binding is already
-/// its own, so the fault stays svctest's to decline.
+/// dies, its watch thread exiting, after which procmgr's check before its
+/// next request does the same unasked. procmgr leaves the main thread,
+/// whose binding is already its own, so the fault stays svctest's to
+/// decline.
 fn debugger_session(authority: u64, process: u64, threads: &[u64])
 {
     assert_eq!(
@@ -510,8 +511,7 @@ fn debugger_session(authority: u64, process: u64, threads: &[u64])
     }
     bind();
     debugger.end();
-    // The request wakes procmgr's loop, whose pass finds the watch gone
-    // before it serves the request.
+    // procmgr's check before it serves the request finds the watch gone.
     let _ = listed_name(authority, process);
     assert_eq!(
         exception_badge(parked, "after the watch's exit"),
@@ -614,8 +614,8 @@ fn debugger_tag_check(authority: u64)
         let _ = syscall::thread_yield();
     }
     debugger.end();
-    // The request wakes procmgr's loop, whose pass finds the watch gone,
-    // had the declaration left it, before it serves the request.
+    // procmgr's check before it serves the request finds the watch gone,
+    // had the declaration left it.
     let _ = listed_name(authority, process);
     assert_eq!(
         exception_badge(main, "after the watch's end"),
@@ -754,7 +754,7 @@ pub fn crash_endpoint_phase(caps: &Caps)
         let _ = syscall::cap_delete(cap);
     }
     again.end();
-    // A request for procmgr's next pass, which takes the endpoint back.
+    // A request, before which procmgr's check takes the endpoint back.
     let reply = call(
         authority,
         &IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)

@@ -72,16 +72,14 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 
 /// Per-process resource record. Fields read when teardown is implemented.
 ///
-/// All fields are non-atomic. Concurrent access is precluded by
-/// procmgr's structurally single-threaded dispatch: every mutating
-/// path (`configure_namespace`, `start_process`, `teardown_entry`,
-/// memmgr reclaim handlers) runs sequentially under the lone
-/// `service_ep` recv loop in `main.rs`. If procmgr is ever made
-/// multi-threaded — as vfsd was, for spawn-deadlock avoidance — the
-/// `started` bool (read by `configure_namespace`, read+written by
-/// `start_process`) must become `AtomicBool` with compare-and-swap
-/// transitions, and the namespace/cwd-override slots need per-entry
-/// serialisation to keep the install-once contract.
+/// All fields are non-atomic. procmgr's request workers and its reaper
+/// reach an entry only through the table, which sits behind procmgr's one
+/// table lock (`process::Tables`, services/procmgr/README.md
+/// § Concurrency): every read and every mutating path
+/// (`configure_namespace`, `start_process`, the take that precedes a
+/// teardown) holds that lock throughout, so the `started` check and its
+/// transition, and the install-once namespace and cwd-override slots, are
+/// each one step no other thread interleaves.
 pub struct ProcessEntry
 {
     /// The child's process badge: the table key, the correlator of its death

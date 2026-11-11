@@ -203,10 +203,11 @@ fn reap_loop(ctx: &ProcmgrCtx) -> !
     }
 }
 
-/// The checks a death calls for, which the reaper makes on every pass and a
-/// worker makes after a teardown it ran itself, since a teardown's stop of a
-/// process posts no death to wake the reaper (docs/process-lifecycle.md,
-/// `EXIT_KILLED`): take the crash endpoint's receive side back from a crash
+/// The checks a death calls for, which the reaper makes on every pass, a
+/// worker before it serves each request, and a worker again after a
+/// teardown it ran itself, since a teardown's stop of a process posts no
+/// death to wake the reaper (docs/process-lifecycle.md, `EXIT_KILLED`):
+/// take the crash endpoint's receive side back from a crash
 /// service that is gone, and restore the crash bindings of every process
 /// whose debugger is gone.
 fn reap_checks(ctx: &ProcmgrCtx)
@@ -530,6 +531,10 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 {
     hold_cspace_headroom(ctx.self_cspace);
+    // A crash service or a debugger watch that is a thread other than its
+    // process's main thread posts no death when it exits, so every request
+    // makes the checks before it is served, as the reaper does on a death.
+    reap_checks(ctx);
     let mut req = *req;
     let label = req.label;
     // A process handle carries `PROCESS_HANDLE_TAG` beside its child's
@@ -1231,21 +1236,13 @@ fn dispatch_death(ctx: &ProcmgrCtx, ipc_buf: *mut u64, batch: &mut Vec<syscall::
             init_reap::run_reap(memmgr_ep, ipc_buf);
             continue;
         }
-        let taken = {
-            let mut state = ctx.tables.lock();
-            let entry = state.table.take_by_badge(death.correlator);
-            if entry.is_some()
-            {
-                state
-                    .recent
-                    .record(death.correlator, death.exit_reason, now_ns());
-            }
-            entry
-        };
-        if let Some(entry) = taken
-        {
-            process::teardown_entry(entry, death.exit_reason, memmgr_ep, ipc_buf, &ctx.tables);
-        }
+        process::reap_dead(
+            death.correlator,
+            death.exit_reason,
+            memmgr_ep,
+            ipc_buf,
+            &ctx.tables,
+        );
     }
     if full || dropped
     {
@@ -1304,19 +1301,7 @@ fn resync_deaths(memmgr_ep: u64, ipc_buf: *mut u64, tables: &process::Tables)
     }
     for (badge, exit_reason) in dead
     {
-        let taken = {
-            let mut state = tables.lock();
-            let entry = state.table.take_by_badge(badge);
-            if entry.is_some()
-            {
-                state.recent.record(badge, exit_reason, now_ns());
-            }
-            entry
-        };
-        if let Some(entry) = taken
-        {
-            process::teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf, tables);
-        }
+        process::reap_dead(badge, exit_reason, memmgr_ep, ipc_buf, tables);
     }
 }
 

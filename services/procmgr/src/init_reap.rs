@@ -23,8 +23,10 @@
 //! counts the two init-thread deaths, and reaps on the last one, whether or
 //! not `INIT_TEARDOWN_DONE` armed it (a threadless init can send nothing
 //! more). The handoff is one-shot: after the reap every request is refused.
-//! This module performs the syscalls and IPC around it, serialised under
-//! procmgr's single-threaded `service_ep` recv loop.
+//! This module performs the syscalls and IPC around it: the rounds and
+//! `INIT_TEARDOWN_DONE` on procmgr's request workers, the death count and
+//! the reap on its reaper, each step's state change under the `STATE` lock
+//! (services/procmgr/README.md § Concurrency).
 //!
 //! The reap is purely death-driven, and a handover that never completes
 //! leaves init's caps held, a benign hold
@@ -32,11 +34,11 @@
 //! `do_reap` tears init's objects down in the order
 //! `docs/process-lifecycle.md` § Init reap specifies.
 
-// Procmgr's dispatch runs single-threaded under its lone `service_ep` recv
-// loop, the only thread that reaches this state (its crash decliner never
-// does); the `Mutex` here is only the `Sync` shell required for a `static`.
-// `expect` on `.lock()` therefore cannot fire in practice (no contention
-// → no poisoning), and a Vec inside the state avoids any unsafe statics.
+// procmgr's request workers and its reaper share this state behind the
+// `STATE` lock (its crash decliner never reaches it). `expect` on `.lock()`
+// cannot fire: procmgr is built with `panic = "abort"`, so no holder unwinds
+// and the lock is never poisoned. A Vec inside the state avoids any unsafe
+// statics.
 #![allow(clippy::expect_used)]
 
 use std::sync::Mutex;

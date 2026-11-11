@@ -219,8 +219,10 @@ pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<u64, RegisterRefus
 /// Take the receive side back when the registered crash service is gone:
 /// its thread cap revoked (procmgr's teardown of the service revokes every
 /// cap derived from its main thread) or its thread exited. procmgr's reaper
-/// calls it on every pass, which the service's death wakes, and the worker
-/// that destroys a process calls it after the teardown.
+/// calls it on every pass, which the service's death wakes; a request
+/// worker calls it before it serves each request, since a registered thread
+/// other than its process's main thread posts no death when it exits; and
+/// the worker that destroys a process calls it after the teardown.
 pub fn check_registrant()
 {
     let _registration = lock_registration();

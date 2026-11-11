@@ -391,10 +391,9 @@ logd's main thread waits on a 2-member `WaitSet`:
 | `WS_BADGE_DEATH` (1) | RECV on logd's death-notification `EventQueue` | drained on the wake |
 | `WS_BADGE_RESYNC` (2) | logd's resync `Notification` | bit `RESYNC_WALK_DONE` (1): the resync helper thread's walk has ended; bit `RESYNC_REQUESTED` (2): a drain asks for a resync (§ Death-queue resync) |
 
-Each receive worker drains the death queue before it serves a request, mirroring procmgr's
-drain-deaths-first pattern. The main thread drains the queue when it is ready, so deaths no request
-follows are drained too. Each take from the queue is made, with its eviction, under the state lock
-(§ Receive pool).
+Each receive worker drains the death queue before it serves a request. The main thread drains the
+queue when it is ready, so deaths no request follows are drained too. Each take from the queue is
+made, with its eviction, under the state lock (§ Receive pool).
 
 A worker can still serve a request after its sender's eviction: the request was received before
 the sender's death, and the death was taken, by this worker or another thread, before the worker

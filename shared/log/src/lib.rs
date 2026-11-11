@@ -37,7 +37,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::{
     IpcMessage,
-    stream_labels::{LEVEL_MASK, LEVEL_SHIFT, STREAM_BYTES, STREAM_REGISTER_NAME},
+    stream_labels::{
+        LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_MASK, LEVEL_SHIFT, LEVEL_TRACE, LEVEL_WARN,
+        STREAM_BYTES, STREAM_REGISTER_NAME,
+    },
 };
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
@@ -74,6 +77,62 @@ pub fn install_badged_cap(cap: u64)
 pub fn ensure_badged_cap(_ipc_buf: *mut u64) -> u64
 {
     BADGEED_CAP.load(Ordering::Acquire)
+}
+
+// ── Process-global level filter ─────────────────────────────────────────────
+
+/// The most verbose level [`emit`] sends, an `ipc::stream_labels::LEVEL_*`
+/// code; a message at a more verbose level is neither formatted nor sent.
+/// [`LEVEL_INFO`] until std's `_start` installs the level the process's
+/// `SERAPH_LOG` environment entry names ([`set_max_level`]).
+static MAX_LEVEL: AtomicU64 = AtomicU64::new(LEVEL_INFO);
+
+/// The environment entry std's `_start` reads, once, for the process's
+/// [`MAX_LEVEL`]; its value is a [`parse_level`] name.
+pub const LEVEL_ENV_KEY: &[u8] = b"SERAPH_LOG";
+
+/// Set the most verbose level [`emit`] sends. Called by std's `_start`.
+pub fn set_max_level(level: u64)
+{
+    MAX_LEVEL.store(rank(level), Ordering::Relaxed);
+}
+
+/// Whether [`emit`] sends a message at `level`.
+#[must_use]
+pub fn enabled(level: u64) -> bool
+{
+    rank(level) <= MAX_LEVEL.load(Ordering::Relaxed)
+}
+
+/// The level a `SERAPH_LOG` value names: `error`, `warn`, `info`, `debug`,
+/// or `trace`; `None` for any other value.
+#[must_use]
+pub fn parse_level(name: &[u8]) -> Option<u64>
+{
+    match name
+    {
+        b"error" => Some(LEVEL_ERROR),
+        b"warn" => Some(LEVEL_WARN),
+        b"info" => Some(LEVEL_INFO),
+        b"debug" => Some(LEVEL_DEBUG),
+        b"trace" => Some(LEVEL_TRACE),
+        _ => None,
+    }
+}
+
+/// `level` as an order of verbosity: the codes [`LEVEL_ERROR`] to
+/// [`LEVEL_TRACE`] are already in that order, and any other code reads as
+/// [`LEVEL_INFO`], as a receiver reads it.
+fn rank(level: u64) -> u64
+{
+    if (LEVEL_ERROR..=LEVEL_TRACE).contains(&level)
+    {
+        level
+    }
+    else
+    {
+        LEVEL_INFO
+    }
 }
 
 // ── Wire-format primitives ──────────────────────────────────────────────────
@@ -167,12 +226,7 @@ pub unsafe fn register_name(cap: u64, ipc_buf: *mut u64, name: &[u8])
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
 /// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
 /// `ipc::ipc_call`).
-pub unsafe fn write_args(
-    cap: u64,
-    ipc_buf: *mut u64,
-    level: u64,
-    args: core::fmt::Arguments<'_>,
-)
+pub unsafe fn write_args(cap: u64, ipc_buf: *mut u64, level: u64, args: core::fmt::Arguments<'_>)
 {
     // SAFETY: the caller's contract covers `ipc_buf`.
     let send = |chunk: &[u8]| unsafe { send_bytes(cap, ipc_buf, level, chunk) };
@@ -237,9 +291,10 @@ fn format_line(args: core::fmt::Arguments<'_>, send: impl FnMut(&[u8]) -> bool)
 
 /// One-shot emit: format `args` and send it at `level` (an
 /// `ipc::stream_labels::LEVEL_*` code) on the pre-installed badged SEND cap.
-/// Drops, in every build, when no cap is installed: a process
-/// spawned before the log endpoint existed, or one given no log cap, logs
-/// nowhere.
+/// Drops a message more verbose than the process's level ([`enabled`])
+/// before formatting it. Drops, in every build, when no cap is installed: a
+/// process spawned before the log endpoint existed, or one given no log cap,
+/// logs nowhere.
 ///
 /// # Safety
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
@@ -248,7 +303,7 @@ fn format_line(args: core::fmt::Arguments<'_>, send: impl FnMut(&[u8]) -> bool)
 pub unsafe fn emit(ipc_buf: *mut u64, level: u64, args: core::fmt::Arguments<'_>)
 {
     let cap = ensure_badged_cap(ipc_buf);
-    if cap == 0
+    if cap == 0 || !enabled(level)
     {
         return;
     }
@@ -309,6 +364,36 @@ mod tests
         // A code wider than the level field cannot reach the bits above it.
         assert_eq!(stream_label(1, u64::MAX) >> (LEVEL_SHIFT + 3), 0);
         assert_eq!(level_of(stream_label(1, LEVEL_INFO)), LEVEL_INFO);
+    }
+
+    #[test]
+    fn a_level_name_parses_and_anything_else_does_not()
+    {
+        assert_eq!(parse_level(b"error"), Some(LEVEL_ERROR));
+        assert_eq!(parse_level(b"warn"), Some(LEVEL_WARN));
+        assert_eq!(parse_level(b"info"), Some(LEVEL_INFO));
+        assert_eq!(parse_level(b"debug"), Some(LEVEL_DEBUG));
+        assert_eq!(parse_level(b"trace"), Some(LEVEL_TRACE));
+        assert_eq!(parse_level(b"WARN"), None);
+        assert_eq!(parse_level(b""), None);
+    }
+
+    /// The one test that sets the process-global level, so no other test
+    /// races it.
+    #[test]
+    fn the_filter_sends_its_level_and_every_less_verbose_one()
+    {
+        // The default is info.
+        assert!(enabled(LEVEL_INFO) && enabled(LEVEL_ERROR));
+        assert!(!enabled(LEVEL_DEBUG));
+        set_max_level(LEVEL_WARN);
+        assert!(enabled(LEVEL_ERROR) && enabled(LEVEL_WARN));
+        assert!(!enabled(LEVEL_INFO) && !enabled(LEVEL_TRACE));
+        // An unassigned code reads as info, as the receivers read it.
+        assert!(!enabled(0) && !enabled(7));
+        set_max_level(LEVEL_TRACE);
+        assert!(enabled(LEVEL_TRACE) && enabled(0));
+        set_max_level(LEVEL_INFO);
     }
 
     #[test]

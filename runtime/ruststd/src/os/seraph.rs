@@ -551,6 +551,13 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     // roundtrip. Zero is tolerated (the macro silently drops in
     // processes without a logger).
     ::log::install_badged_cap(info.log_send_cap);
+    // The most verbose level `seraph::log!` sends: the one the process's
+    // `SERAPH_LOG` environment entry names, read once here, else info.
+    if let Some(level) = argv_env::env_value(env_blob, info.env_count as usize, ::log::LEVEL_ENV_KEY)
+        .and_then(::log::parse_level)
+    {
+        ::log::set_max_level(level);
+    }
 
     // Install the per-process svcmgr SEND cap into the registry-client
     // cache. Zero is tolerated (processes spawned before svcmgr exists,

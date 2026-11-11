@@ -1,0 +1,6 @@
+# input: keyboard and other input drivers (virtio-input).
+#
+# A QUERY_DEVICE reply through the class SEND carries
+# input_labels::READ_AUTHORITY (bit 63). svcmgr publishes it seed-only as
+# `devmgr.class.input`; terminal's seed takes it.
+verbs = 63

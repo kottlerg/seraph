@@ -65,31 +65,17 @@ pub const MAX_RESERVED_RANGES_PER_DEVICE: usize = 4;
 /// instead of reaching a mapping.
 pub const IOVA_BASE: u64 = 0x10_0000;
 
-/// The IOVA limit of a device whose DMA reaches only 28 address bits:
-/// QEMU's `edu` test device (PCI `1234:11e8`), whose default DMA mask is 28
-/// bits.
-pub const EDU_IOVA_LIMIT: u64 = 1 << 28;
-
-/// PCI vendor and device ID of QEMU's `edu` test device.
-pub const EDU_ID: (u16, u16) = (0x1234, 0x11e8);
-
 /// The end of the IOVA space devmgr allocates a confined device's mappings
-/// in: the smaller of what its unit translates (`width_bits`, from the IOMMU
-/// driver's `QUERY_UNIT`) and what the device can address
-/// ([`EDU_IOVA_LIMIT`] for the `edu` device; no limit of its own for every
-/// other device).
+/// in: the smaller of what its unit translates (`unit_bits`, from the IOMMU
+/// driver's `QUERY_UNIT`) and what the device addresses (`device_bits`, the
+/// DMA address width its driver's declaration states; `None` for no limit of
+/// its own).
 #[must_use]
-pub fn iova_limit(width_bits: u8, vendor: u16, device: u16) -> u64
+pub fn iova_limit(unit_bits: u8, device_bits: Option<u8>) -> u64
 {
-    let unit = 1u64.checked_shl(u32::from(width_bits)).unwrap_or(u64::MAX);
-    if (vendor, device) == EDU_ID
-    {
-        unit.min(EDU_IOVA_LIMIT)
-    }
-    else
-    {
-        unit
-    }
+    let end = |bits: u8| 1u64.checked_shl(u32::from(bits)).unwrap_or(u64::MAX);
+    let unit = end(unit_bits);
+    device_bits.map_or(unit, |bits| unit.min(end(bits)))
 }
 
 /// How a registered device reaches its frames.
@@ -1098,11 +1084,13 @@ mod tests
     }
 
     #[test]
-    fn the_iova_limit_is_the_unit_width_narrowed_for_the_edu_device()
+    fn the_iova_limit_is_the_smaller_of_the_unit_and_device_widths()
     {
-        assert_eq!(iova_limit(48, 0x1af4, 0x1042), 1 << 48);
-        assert_eq!(iova_limit(48, EDU_ID.0, EDU_ID.1), EDU_IOVA_LIMIT);
-        assert_eq!(iova_limit(20, EDU_ID.0, EDU_ID.1), 1 << 20);
-        assert_eq!(iova_limit(64, 0, 0), u64::MAX);
+        assert_eq!(iova_limit(48, None), 1 << 48);
+        assert_eq!(iova_limit(48, Some(28)), 1 << 28);
+        assert_eq!(iova_limit(20, Some(28)), 1 << 20);
+        assert_eq!(iova_limit(48, Some(64)), 1 << 48);
+        assert_eq!(iova_limit(64, None), u64::MAX);
+        assert_eq!(iova_limit(64, Some(64)), u64::MAX);
     }
 }

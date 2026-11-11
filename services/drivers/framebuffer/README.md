@@ -57,10 +57,10 @@ it when the driver dies.
 Clients obtain a write cap through
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities), not svcmgr: a framebuffer
 is a device, not a service. Devmgr answers
-`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE` by minting a
+`devmgr_labels::QUERY_DEVICE` by minting a
 `fb_labels::WRITE_AUTHORITY`-badged `SEND_GRANT` cap on the driver's
-service endpoint, mirroring the `QUERY_SERIAL_DEVICE` flow. The caller's
-devmgr-registry badge must carry `REGISTRY_QUERY_AUTHORITY`. Both labels below
+service endpoint. The caller sends it on the `framebuffer` class SEND, whose
+badge carries the `WRITE` verb. Both labels below
 are gated by `WRITE_AUTHORITY`: a request whose badge lacks it is answered
 `UNAUTHORIZED` and has no effect.
 

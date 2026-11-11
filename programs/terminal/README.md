@@ -31,7 +31,7 @@ terminal/
 - **Input**: two sources feeding one channel — the virtio-input keyboard
   ([#110], key-down events decoded to a byte stream, key-up and modifier-key
   events dropped) and serial RX ([#291], received UART bytes forwarded
-  verbatim). The keyboard is required: when `QUERY_INPUT_DEVICE` fails the
+  verbatim). The keyboard is required: when `QUERY_DEVICE` on the `input` class fails the
   terminal logs and exits, so a boot with no input device has no terminal.
   `cargo xtask run` attaches a virtio keyboard on every boot (see
   [xtask/README.md](../../xtask/README.md#attached-devices)), so a headless run still has a

@@ -60,11 +60,11 @@ no change to the encoding.
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
 svcmgr mints the `devmgr.registry` publish cap
-(`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown`, `devmgr.test`, and
-`devmgr.debug` publish caps (`REGISTRY_QUERY_AUTHORITY` plus
-`SHUTDOWN_DEVICE_AUTHORITY`, `TEST_LABEL_AUTHORITY`, or
-`DEBUG_PORT_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
-(`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source, and publishes
+(`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown` and `devmgr.test` publish caps
+(`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY` or `TEST_LABEL_AUTHORITY`), the
+`MINT_CLASS_SEND` cap (`CLASS_AUTHORITY`) with which it configures devmgr's device classes
+([service-definitions.md § Device class files](service-definitions.md#device-class-files)), and
+the `SET_DRIVERS_DIR` cap (`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source, and publishes
 the two vfsd SENDs as they arrive (their badges ride through to the
 seeding recipe unchanged). A version
 mismatch in `data[1]`, or a malformed `CAPS` round (including one past the
@@ -111,8 +111,9 @@ bind death-notification at endowment time — the matching `.svc`
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
-`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, `devmgr.debug`,
-`vfsd.mount`, `vfsd.deny`, `logd.query`) into its own registry and installs devmgr's
+`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`,
+`vfsd.mount`, `vfsd.deny`, `logd.query`) into its own registry, configures devmgr's device
+classes and publishes each as `devmgr.class.<class>`, and installs devmgr's
 `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering the event
 loop.
 

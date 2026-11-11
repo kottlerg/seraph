@@ -33,9 +33,8 @@ subtree cap, in the same drivers-directory pass as the virtio-input drivers (see
 is left unbound. The driver reports `DRIVER_READY` on its devmgr query endpoint once its device
 is set up, immediately before its service loop, and devmgr serves its endpoint only after that
 report. Devmgr owns the service endpoint and mints a `WRITE_AUTHORITY | READ_AUTHORITY`-badged
-SEND cap on it only through `devmgr_labels::QUERY_DEBUG_PORT_DEVICE`, which only a caller
-holding `DEBUG_PORT_AUTHORITY` reaches: the seed-only `devmgr.debug` name, which only a service
-whose definition seeds it holds (see
+SEND cap on it only through `devmgr_labels::QUERY_DEVICE` on the `debug-port` class SEND, which
+only a service whose definition seeds the seed-only `devmgr.class.debug-port` name holds (see
 [devmgr Responsibilities](../../../devmgr/docs/responsibilities.md#responsibilities)). A boot
 whose machine presents no console device, every boot that does not ask for the debug port, has
 no debug port.

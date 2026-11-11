@@ -71,7 +71,7 @@ fn reserve_str(s: &mut String, additional: usize) -> Result<(), ParseError>
 }
 
 /// Copy `s` into a new `String`, or [`ParseError::OutOfMemory`].
-fn owned(s: &str) -> Result<String, ParseError>
+pub(crate) fn owned(s: &str) -> Result<String, ParseError>
 {
     let mut out = String::new();
     reserve_str(&mut out, s.len())?;

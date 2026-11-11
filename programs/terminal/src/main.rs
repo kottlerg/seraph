@@ -32,7 +32,6 @@ use std::os::seraph::process::CommandExt;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use ipc::IpcMessage;
 use output::Sink;
 
 /// Child spawned when the recipe passes no `argv[1]`. `terminal.svc` sets it
@@ -61,33 +60,30 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(registry) = bootstrap_devmgr_registry(info.creator_endpoint, ipc_buf)
+    let Some([input_class, fb_class, serial_class]) =
+        bootstrap_class_sends(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!("terminal: no devmgr.registry seed; exiting");
+        std::os::seraph::log!("terminal: a devmgr.class seed is missing; exiting");
         syscall::thread_exit();
     };
-    let Some(input_cap) = query_device(registry, ipc::devmgr_labels::QUERY_INPUT_DEVICE, ipc_buf)
+    let Some(input_cap) = query_device(input_class, ipc_buf)
     else
     {
-        std::os::seraph::log!("terminal: QUERY_INPUT_DEVICE failed; exiting");
+        std::os::seraph::log!("terminal: no input device; exiting");
         syscall::thread_exit();
     };
     // The framebuffer is the primary output but optional: a headless boot has
     // none, and the terminal then mirrors to serial only.
-    let fb_cap = query_device(
-        registry,
-        ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE,
-        ipc_buf,
-    );
+    let fb_cap = query_device(fb_class, ipc_buf);
     if fb_cap.is_none()
     {
         std::os::seraph::log!("terminal: framebuffer unavailable; serial-only output");
     }
-    let Some(serial_cap) = query_device(registry, ipc::devmgr_labels::QUERY_SERIAL_DEVICE, ipc_buf)
+    let Some(serial_cap) = query_device(serial_class, ipc_buf)
     else
     {
-        std::os::seraph::log!("terminal: QUERY_SERIAL_DEVICE failed; exiting");
+        std::os::seraph::log!("terminal: no serial device; exiting");
         syscall::thread_exit();
     };
 
@@ -246,9 +242,10 @@ fn relay_stderr<R: std::io::Read>(reader: R, tx: &Sender<Msg>)
     pump_stream(reader, tx);
 }
 
-/// Pull the bootstrap rounds; expect slot 0 from the recipe's
-/// `seed = devmgr.registry`.
-fn bootstrap_devmgr_registry(creator_ep: u64, ipc_buf: *mut u64) -> Option<u64>
+/// Pull the bootstrap rounds; expect slots 0, 1 and 2 from the recipe's
+/// `seed = devmgr.class.input devmgr.class.framebuffer devmgr.class.serial`,
+/// in that order. `None` when any is absent.
+fn bootstrap_class_sends(creator_ep: u64, ipc_buf: *mut u64) -> Option<[u64; 3]>
 {
     if creator_ep == 0
     {
@@ -257,25 +254,19 @@ fn bootstrap_devmgr_registry(creator_ep: u64, ipc_buf: *mut u64) -> Option<u64>
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`.
-    let [cap] = unsafe { ipc::bootstrap::request_slots::<1>(creator_ep, ipc_buf) }.ok()?;
-    (cap != 0).then_some(cap)
+    let caps = unsafe { ipc::bootstrap::request_slots::<3>(creator_ep, ipc_buf) }.ok()?;
+    caps.iter().all(|&cap| cap != 0).then_some(caps)
 }
 
-/// Query devmgr for a device endpoint cap, retrying briefly while the driver's
+/// The first driver of the class whose class SEND is `class_send`
+/// (`QUERY_DEVICE` at ordinal 0), retrying briefly while the driver's
 /// on-disk spawn completes.
-fn query_device(registry: u64, label: u64, ipc_buf: *mut u64) -> Option<u64>
+fn query_device(class_send: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     for _ in 0..100
     {
-        let req = IpcMessage::builder(label)
-            .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-            .build();
         // SAFETY: ipc_buf is the registered IPC buffer.
-        let reply = unsafe { ipc::ipc_call(registry, &req, ipc_buf) };
-        if let Ok(reply) = reply
-            && reply.label == ipc::devmgr_errors::SUCCESS
-            && let Some(&cap) = reply.caps().first()
-            && cap != 0
+        if let Ok(cap) = unsafe { ipc::query_device(class_send, 0, ipc_buf) }
         {
             return Some(cap);
         }

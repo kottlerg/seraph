@@ -867,6 +867,38 @@ pub struct VfsdSpawnCaps
     pub vfsd_service_ep: u64,
 }
 
+/// vfsd's `block` class SEND, whose `QUERY_DEVICE` replies are whole-disk
+/// (`MOUNT_AUTHORITY`) caps on the block drivers. init asks devmgr for it
+/// with a `CLASS_AUTHORITY` SEND it derives from `registry_ep`, its own
+/// badge-0 registry source, and deletes that SEND, so vfsd holds the class
+/// SEND alone and no registry authority bit. Not boot-only here: the
+/// `block` class file sets that.
+fn request_block_class(registry_ep: u64, ipc_buf: *mut u64) -> Option<u64>
+{
+    let minter = syscall::cap_derive_badge(
+        registry_ep,
+        syscall::RIGHTS_EP_SEND,
+        ipc::devmgr_labels::CLASS_AUTHORITY,
+    )
+    .ok()?;
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let block_class = unsafe {
+        ipc::mint_class_send(
+            minter,
+            b"block",
+            ipc::blk_labels::MOUNT_AUTHORITY,
+            0,
+            ipc_buf,
+        )
+    };
+    let _ = syscall::cap_delete(minter);
+    if block_class.is_err()
+    {
+        log("vfsd: devmgr refused the block class SEND");
+    }
+    block_class.ok()
+}
+
 /// Create vfsd via procmgr and serve its bootstrap.
 pub fn create_vfsd_with_caps(
     info: &InitInfo,
@@ -918,21 +950,7 @@ pub fn create_vfsd_with_caps(
     {
         return None;
     };
-    // vfsd is the sole devmgr `QUERY_BLOCK_DEVICE` consumer, and this is
-    // the only registry cap carrying `BLOCK_DEVICE_AUTHORITY`, the bit
-    // devmgr's gate on that label requires: the reply is whole-disk
-    // authority, which no svcmgr-published registry cap may obtain.
-    // `REGISTRY_QUERY_AUTHORITY` rides beside it, as on every consumer query
-    // cap.
-    let Ok(registry_copy) = syscall::cap_derive_badge(
-        spawn.registry_ep,
-        syscall::RIGHTS_EP_SEND,
-        ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY | ipc::devmgr_labels::BLOCK_DEVICE_AUTHORITY,
-    )
-    else
-    {
-        return None;
-    };
+    let block_class = request_block_class(spawn.registry_ep, ipc_buf)?;
 
     if !start_process(
         process_handle,
@@ -944,14 +962,14 @@ pub fn create_vfsd_with_caps(
         return None;
     }
 
-    // Round 1: [service, registry]
+    // Round 1: [service, block class]
     // (log + procmgr auto-delivered via ProcessInfo.)
     if !serve(
         bootstrap_ep,
         child_badge,
         ipc_buf,
         false,
-        &[service_copy, registry_copy],
+        &[service_copy, block_class],
         &[],
         "vfsd: bootstrap round 1 failed",
     )
@@ -1111,8 +1129,9 @@ pub struct SvcmgrEndowment
 /// rights) and the publish-role source caps: a `SEND` on the root
 /// filesystem namespace endpoint (svcmgr publishes it as `rootfs.root`) and
 /// a badge-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
-/// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.test` / `devmgr.debug` publish caps and
-/// the `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it), plus two SENDs on
+/// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.test` publish caps, the
+/// `devmgr.class.*` class SENDs, and the `DRIVERS_DIR_AUTHORITY`
+/// `SET_DRIVERS_DIR` cap from it), plus two SENDs on
 /// vfsd's service endpoint svcmgr publishes seed-only: `MOUNT_AUTHORITY`-badged
 /// (`vfsd.mount`) and `DENY_BADGE`-badged (`vfsd.deny`). An absent source
 /// cap is left off its round and its presence bit clear (the

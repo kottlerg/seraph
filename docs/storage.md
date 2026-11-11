@@ -35,11 +35,14 @@ Four system-scope invariants govern the stack:
   `blk_labels::MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr for
   each block driver, and fs drivers hold partition-identity-badged caps
   the block driver mints on `REGISTER_PARTITION`; unbadged callers are
-  rejected. vfsd is the sole holder of the whole-disk caps: devmgr
-  mints one on `QUERY_BLOCK_DEVICE` only for a caller whose registry
-  cap carries `BLOCK_DEVICE_AUTHORITY`, which init sets on vfsd's
-  registry cap alone. Out-of-bounds LBAs are rejected by the block
-  driver on every request. See
+  rejected. vfsd is the sole holder of the whole-disk caps while no
+  service definition seeds `devmgr.class.block`, and no shipped one
+  does: devmgr mints one on `QUERY_DEVICE` only for a caller whose SEND
+  is a `block` class SEND, which init requests for vfsd and svcmgr
+  publishes seed-only as `devmgr.class.block`. A definition that seeds
+  that name gives its service whole-disk authority, `REGISTER_PARTITION`
+  included. Out-of-bounds LBAs are rejected by
+  the block driver on every request. See
   [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
 - **System root is delivered, never discovered.** Every process
   spawned with a namespace receives its authority as
@@ -84,10 +87,11 @@ Distribution". Badge semantics, derivation, and revocation are owned by
 
 `REGISTER_PARTITION` is rejected unless the caller's badge carries
 `blk_labels::MOUNT_AUTHORITY`: only the holder of the devmgr-minted whole-disk cap
-can mint a partition binding. vfsd is the only such holder: devmgr
-mints a whole-disk cap on `QUERY_BLOCK_DEVICE` only for a caller
-whose registry cap carries `BLOCK_DEVICE_AUTHORITY`, which init sets on
-vfsd's registry cap alone. The block driver
+can mint a partition binding. vfsd is the only such holder while no
+service definition seeds `devmgr.class.block` (§ Invariants): devmgr
+mints a whole-disk cap on `QUERY_DEVICE` only for a caller
+whose SEND is a `block` class SEND, which init requests for
+vfsd and svcmgr publishes seed-only as `devmgr.class.block`. The block driver
 enforces the LBA bound on every read and write against the caller's
 badge. See
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
@@ -125,7 +129,7 @@ or on-disk UUID. The model is:
   therefore a disk-authoring choice, not a vfsd concern; the in-tree
   image (see [build-system.md](build-system.md)) carries the tree on the
   partition only.
-- **Every disk is searched.** At startup vfsd sends `QUERY_BLOCK_DEVICE`
+- **Every disk is searched.** At startup vfsd sends `QUERY_DEVICE` on the block class SEND
   at instance ordinals 0, 1, …, passing a `WITHDRAWN` one (a disk whose
   driver devmgr withdrew when it died), until another reply is not
   `SUCCESS`, holds the whole-disk cap of every block driver devmgr
@@ -214,8 +218,8 @@ by structure. See
 The contract between fs drivers and the block driver has three
 elements:
 
-- **Two-tier endpoint.** Whole-disk `blk_labels::MOUNT_AUTHORITY`-badged (vfsd
-  only) versus
+- **Two-tier endpoint.** Whole-disk `blk_labels::MOUNT_AUTHORITY`-badged (vfsd;
+  § Invariants) versus
   per-partition badged (fs drivers); unbadged callers
   are rejected. The block driver distinguishes by the
   kernel-supplied caller badge.

@@ -1372,15 +1372,22 @@ pub mod published_names
     pub const SVCMGR: &[u8] = b"svcmgr";
 
     /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
-    /// endpoint. Consumers needing to resolve a device driver
-    /// themselves seed this name: today `programs/terminal` (frame buffer,
-    /// input, and serial queries), `timed` (`QUERY_RTC_DEVICE`), and
-    /// `svctest`; logd instead receives a SEND svcmgr mints for it at
-    /// launch. svcmgr publishes it
-    /// post-handover from the devmgr-registry source cap init endows it
-    /// with; the `REGISTRY_QUERY_AUTHORITY` badge bit is preserved
-    /// through svcmgr's plain `cap_derive` in `registry_lookup_derived`.
+    /// endpoint: the `QUERY_ACPI_TABLE` surface, which reaches no device
+    /// driver (a driver is reached through its class's
+    /// [`DEVMGR_CLASS_PREFIX`] publication). svcmgr publishes it seed-only,
+    /// post-handover, from the devmgr-registry source cap init endows it
+    /// with; the `REGISTRY_QUERY_AUTHORITY` badge bit is preserved through
+    /// svcmgr's plain `cap_derive` in `registry_lookup_derived`.
     pub const DEVMGR_REGISTRY: &[u8] = b"devmgr.registry";
+
+    /// Prefix of the names svcmgr publishes devmgr's class SENDs under:
+    /// `devmgr.class.<class>`, one for each class file of
+    /// `/config/devmgr/classes/`, each the SEND
+    /// `devmgr_labels::MINT_CLASS_SEND` returns for the class with the verb
+    /// mask its file sets. Seed-only: a service reaches a class's drivers
+    /// only when its definition seeds the class's name, or, for logd, when
+    /// svcmgr fills its bootstrap slots from them.
+    pub const DEVMGR_CLASS_PREFIX: &[u8] = b"devmgr.class.";
 
     /// SEND on devmgr's registry endpoint badged
     /// `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`: the
@@ -1396,13 +1403,6 @@ pub mod published_names
     /// `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` fault-injection shim and
     /// `TEST_QUERY_DENY_DEVICE`. Seed-only and seeded only by svctest.
     pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
-
-    /// SEND on devmgr's registry endpoint badged
-    /// `REGISTRY_QUERY_AUTHORITY | DEBUG_PORT_AUTHORITY`: the
-    /// `devmgr.registry` surface plus `QUERY_DEBUG_PORT_DEVICE`, the debug
-    /// port. Seed-only; seeded only by the services that own the debug port
-    /// on a boot that stages them.
-    pub const DEVMGR_DEBUG: &[u8] = b"devmgr.debug";
 
     /// SEND on vfsd's service endpoint badged
     /// `vfsd_labels::MOUNT_AUTHORITY` alone: the `MOUNT` surface, without
@@ -1433,7 +1433,7 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// wall-clock time, as `u64` microseconds since the Unix epoch. devmgr
 /// owns the per-board RTC and hands clients a
 /// [`READ_AUTHORITY`](rtc_labels::READ_AUTHORITY)-badged SEND via
-/// [`devmgr_labels::QUERY_RTC_DEVICE`]. `timed` is the sole client
+/// [`devmgr_labels::QUERY_DEVICE`] on the `rtc` class. `timed` is the sole client
 /// today: it resolves the SEND once at startup, computes
 /// `offset = rtc_us - kernel_monotonic_us`, and serves
 /// [`timed_labels::GET_WALL_TIME`] thereafter without further driver IPC.
@@ -1458,8 +1458,8 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 ///
 /// Adding a new RTC chip is a matter of writing a driver crate that
 /// answers this single label and binding it through devmgr's per-board
-/// discovery path; clients reach it via the same `QUERY_RTC_DEVICE`
-/// name. `timed` itself never sees the chip-specific details.
+/// discovery path under the `rtc` class; clients reach it via the same
+/// `rtc` class SEND. `timed` itself never sees the chip-specific details.
 pub mod rtc_labels
 {
     /// Request the current wall-clock time.
@@ -1468,20 +1468,19 @@ pub mod rtc_labels
     /// `data[0]` is `u64` microseconds since the Unix epoch. Reply
     /// label carries a status code in the lower 16 bits. Caller's
     /// badge must carry [`READ_AUTHORITY`] (devmgr stamps it on every
-    /// SEND it mints from `QUERY_RTC_DEVICE`); the driver replies
+    /// SEND its `rtc` class `QUERY_DEVICE` replies carry); the driver replies
     /// [`rtc_errors::UNAUTHORIZED`] otherwise.
     pub const RTC_GET_EPOCH_TIME: u64 = 1;
 
     /// Authority bit in the RTC-service-endpoint badge's high u64 bit.
-    /// Set on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_RTC_DEVICE`]; gates [`RTC_GET_EPOCH_TIME`].
+    /// Set on caps devmgr mints in response to [`devmgr_labels::QUERY_DEVICE`]
+    /// on the `rtc` class; gates [`RTC_GET_EPOCH_TIME`].
     /// A verb ("may read"), not an identity. Shares the same `1 << 63`
     /// bit position as [`serial_labels::WRITE_AUTHORITY`] and
     /// [`fb_labels::WRITE_AUTHORITY`]. The cmos / goldfish-rtc drivers
     /// enforce the bit at the service loop, as the serial driver enforces
-    /// its bits (defence-in-depth alongside the upstream
-    /// [`REGISTRY_QUERY_AUTHORITY`](devmgr_labels::REGISTRY_QUERY_AUTHORITY)
-    /// gate at devmgr's `QUERY_RTC_DEVICE` handler).
+    /// its bits (defence-in-depth alongside the upstream gate: only a
+    /// holder of the `rtc` class SEND reaches the driver through devmgr).
     pub const READ_AUTHORITY: u64 = 1u64 << 63;
 }
 
@@ -1501,7 +1500,7 @@ pub mod rtc_errors
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
     /// Caller's badge lacked [`rtc_labels::READ_AUTHORITY`]. Backstops
-    /// the upstream gate at [`devmgr_labels::QUERY_RTC_DEVICE`]: a
+    /// the upstream gate at the `rtc` class SEND: a
     /// well-behaved client only ever sees this if a SEND cap leaked
     /// without the verb bit (or a future verb-set partition refuses
     /// reads with a more restrictive badge).
@@ -1514,7 +1513,7 @@ pub const TIMED_LABELS_VERSION: u32 = 1;
 /// IPC labels for the wall-clock service (`services/timed`).
 ///
 /// `timed` is RTC-source-agnostic: it resolves the RTC SEND once at
-/// startup via [`devmgr_labels::QUERY_RTC_DEVICE`], queries the driver
+/// startup via [`devmgr_labels::QUERY_DEVICE`] on the `rtc` class, queries the driver
 /// via [`rtc_labels::RTC_GET_EPOCH_TIME`], computes a stable offset
 /// against the kernel's monotonic clock, and serves wall-clock queries
 /// from `offset + system_info(ElapsedUs)`. New RTC chip support never
@@ -1535,7 +1534,7 @@ pub mod timed_errors
 {
     /// Request handled.
     pub const SUCCESS: u64 = 0;
-    /// No RTC was reachable through devmgr's [`devmgr_labels::QUERY_RTC_DEVICE`]
+    /// No RTC was reachable through the `rtc` class ([`devmgr_labels::QUERY_DEVICE`])
     /// at timed's startup; the offset was never computed. Boards without
     /// an RTC (some real RISC-V hardware) stay in this state: seeding the
     /// offset out of band (an operator or NTP path) is design intent; not
@@ -1907,7 +1906,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 16;
+pub const DEVMGR_LABELS_VERSION: u32 = 17;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1915,31 +1914,36 @@ pub const DEVMGR_LABELS_VERSION: u32 = 16;
 /// [`devmgr_errors::LABEL_VERSION_MISMATCH`] when it differs.
 pub mod devmgr_labels
 {
-    /// Query for a block device endpoint.
+    /// Query the served driver of a device class: the one class SEND
+    /// ([`MINT_CLASS_SEND`]) reaches.
     ///
-    /// Mints a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap on the
-    /// service endpoint of one block driver to the caller. devmgr spawns a
-    /// driver for every block device it enumerates and can give an IRQ cap,
-    /// a line another device already holds included; `data[1]`, when sent,
-    /// selects which: an ordinal over the
-    /// served block drivers in PCI segment, bus, device, function order,
-    /// not stable across boots. A driver is served once it has reported its
-    /// device ready ([`DRIVER_READY`]); one whose spawn failed, that died
-    /// before reporting (its device setup failed), or that did not report
-    /// within devmgr's settle bound is not, and counts in no ordinal, so a
-    /// device added, removed, or failing either way shifts the ones after
-    /// it. devmgr settles every block driver before it serves this label,
-    /// and the ordinals are fixed from then on: a served driver that dies
-    /// later is withdrawn, its ordinal replies
+    /// The class and the verb bits of the reply come from the caller's badge
+    /// ([`class_badge`]), not from the message: a SEND badged otherwise (a
+    /// registry SEND of an authority bit included) gets
+    /// [`super::devmgr_errors::UNAUTHORIZED`]. Request: `data[0]` = caller's
+    /// compiled [`super::DEVMGR_LABELS_VERSION`]; `data[1]`, when sent, the
+    /// instance ordinal, an absent one being 0, the first. Reply
+    /// ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a `SEND_GRANT` cap on
+    /// the driver's service endpoint badged with the class SEND's verb bits.
+    ///
+    /// An ordinal counts the class's served drivers in the order devmgr
+    /// served them (a settle batch's drivers in spawn order, PCI drivers in
+    /// PCI segment, bus, device, function order), not stable across boots. A
+    /// driver is served once it has reported its device ready
+    /// ([`DRIVER_READY`]); one whose spawn failed, or that died or did not
+    /// report within devmgr's settle bound, counts in no ordinal. A served
+    /// driver that dies later is withdrawn, its ordinal replies
     /// [`super::devmgr_errors::WITHDRAWN`] for the rest of the boot, and the
     /// ordinals after it keep their drivers, so a client probing ordinals 0,
     /// 1, ... passes a `WITHDRAWN` reply and stops at the first other reply
-    /// that is not `SUCCESS`. An absent `data[1]` is 0, the first. Caller's
-    /// badge must have [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies
-    /// `UNAUTHORIZED` otherwise, `WITHDRAWN` at a withdrawn driver's
-    /// ordinal, and `INVALID_REQUEST` past the last served driver or when
-    /// the derivation fails.
-    pub const QUERY_BLOCK_DEVICE: u64 = 1;
+    /// that is not `SUCCESS`. Replies [`super::devmgr_errors::NO_DEVICE`]
+    /// past the last served driver, which includes every ordinal of a class
+    /// whose drivers are not yet spawned and settled ([`SET_DRIVERS_DIR`]),
+    /// and `INVALID_REQUEST` when the derivation fails.
+    ///
+    /// The handler logs nothing: logd is a caller, blocked in this call
+    /// outside its log loop, so a log line here would deadlock.
+    pub const QUERY_DEVICE: u64 = 20;
     /// Query a device's startup-info payload from devmgr's catalog.
     ///
     /// Served only while a driver's spawn batch settles, on that batch's
@@ -1966,44 +1970,6 @@ pub mod devmgr_labels
     /// The driver verifies `kind` and `version` before deserialising
     /// the payload. Devmgr does not interpret payload bytes.
     pub const QUERY_DEVICE_INFO: u64 = 2;
-    /// Query for the serial (UART) device endpoint.
-    ///
-    /// Mints a `serial_labels::WRITE_AUTHORITY |
-    /// serial_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on the
-    /// serial driver's service endpoint to the caller, once the driver has
-    /// reported its device ready ([`DRIVER_READY`]); devmgr settles it
-    /// before the registry opens. Caller's badge must have
-    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
-    /// otherwise, [`super::devmgr_errors::WITHDRAWN`] once the served driver
-    /// has died, and `INVALID_REQUEST` when the driver is not served (not
-    /// spawned, or it died or did not report ready within devmgr's settle
-    /// bound) or the derivation fails. Mirrors [`QUERY_BLOCK_DEVICE`]'s reply
-    /// shape.
-    pub const QUERY_SERIAL_DEVICE: u64 = 3;
-    /// Query for the framebuffer device endpoint.
-    ///
-    /// Mints a `fb_labels::WRITE_AUTHORITY`-badged `SEND_GRANT` cap
-    /// on the framebuffer driver's service endpoint to the caller.
-    /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
-    /// handler replies `UNAUTHORIZED` otherwise. Mirrors
-    /// [`QUERY_SERIAL_DEVICE`], including its readiness rule and its
-    /// `WITHDRAWN` and `INVALID_REQUEST` cases.
-    pub const QUERY_FRAMEBUFFER_DEVICE: u64 = 4;
-    /// Query for the platform real-time-clock device endpoint.
-    ///
-    /// Mints a `rtc_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap
-    /// on the RTC driver's service endpoint to the caller. Caller's
-    /// badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler
-    /// replies `UNAUTHORIZED` otherwise. Replies `NO_DEVICE` until the
-    /// driver is spawned and has reported its device ready
-    /// ([`DRIVER_READY`]; see [`SET_DRIVERS_DIR`]), and for the rest of the
-    /// boot if that spawn failed or the driver died or did not report ready
-    /// within devmgr's settle bound; [`super::devmgr_errors::WITHDRAWN`] once
-    /// the served driver has died; `INVALID_REQUEST` when the derivation
-    /// fails. Today's sole consumer is `timed`, which seeds its wall-clock
-    /// offset from one `RTC_GET_EPOCH_TIME` round-trip and serves
-    /// `GET_WALL_TIME` thereafter.
-    pub const QUERY_RTC_DEVICE: u64 = 5;
     /// svcmgr-only handshake: install the
     /// `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` namespace
     /// cap from which devmgr lists, reads the declarations of, and walks to
@@ -2034,19 +2000,19 @@ pub mod devmgr_labels
     /// IPC chain the spawn requires (procmgr → vfsd → block driver) cannot
     /// run inside a request-handler frame without clobbering the
     /// implicit reply context, so it must happen between `ipc_reply`
-    /// and the next `ipc_recv`. Clients querying `QUERY_RTC_DEVICE`
-    /// before the settle completes block in the kernel's send queue
-    /// until devmgr returns to `ipc_recv`; once devmgr returns, those
-    /// queries see the served driver (or the sticky-failure state) and
-    /// reply normally.
+    /// and the next `ipc_recv`. Clients sending [`QUERY_DEVICE`] before
+    /// the settle completes block in the kernel's send queue until devmgr
+    /// returns to `ipc_recv`; once devmgr returns, those queries see the
+    /// served drivers (or the sticky-failure state) and reply normally.
     ///
     /// Each spawn is attempted at most once per boot. On failure
     /// (missing binary, ELF corrupt, carve failure, OOM, a driver that
     /// died or did not report ready within the settle bound, etc.),
     /// devmgr marks the driver permanently unavailable for this boot
-    /// and replies [`super::devmgr_errors::NO_DEVICE`] to subsequent
-    /// [`QUERY_RTC_DEVICE`] / [`QUERY_INPUT_DEVICE`] queries; the retry
-    /// rule is [`super::devmgr_errors::NO_DEVICE`]'s.
+    /// and replies [`super::devmgr_errors::NO_DEVICE`] to a subsequent
+    /// [`QUERY_DEVICE`] for it; the retry rule is
+    /// [`super::devmgr_errors::NO_DEVICE`]'s. The pass refuses a
+    /// declaration of a boot-only class ([`MINT_CLASS_SEND`]), logged.
     pub const SET_DRIVERS_DIR: u64 = 6;
 
     /// Locate an ACPI table and serve a read-only view of it.
@@ -2112,48 +2078,37 @@ pub mod devmgr_labels
     /// `data[0]` is not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
-    /// Query for the keyboard/input device endpoint.
+    /// Mint a class SEND: a SEND on the registry endpoint whose badge names
+    /// a device class and the verb bits its [`QUERY_DEVICE`] replies carry
+    /// ([`class_badge`]), and nothing else, so its holder reaches that
+    /// class's drivers and no other registry label.
     ///
-    /// Mints an `input_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on
-    /// the service endpoint of one input driver to the caller. devmgr spawns
-    /// a driver for every input device it enumerates; `data[1]`, when sent,
-    /// selects which: an ordinal over the served input drivers in PCI
-    /// segment, bus, device, function order, not stable across boots. A
-    /// driver is served once it has reported its device ready
-    /// ([`DRIVER_READY`]); one whose spawn failed, or that died or did not
-    /// report within devmgr's settle bound, counts in no ordinal. The
-    /// ordinals are fixed once the input drivers settle; a served driver that
-    /// dies later is withdrawn and its ordinal replies
-    /// [`super::devmgr_errors::WITHDRAWN`], as for [`QUERY_BLOCK_DEVICE`].
-    /// An absent `data[1]` is 0, the first. Caller's badge must have
-    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
-    /// otherwise. Like [`QUERY_RTC_DEVICE`], it replies `NO_DEVICE` until the
-    /// on-disk drivers are spawned and settled, and for the rest of the boot
-    /// past the last served input driver (none enumerated there, its spawn
-    /// failed, or it died or did not report ready before the settle ended);
-    /// `WITHDRAWN` at a withdrawn driver's ordinal; `INVALID_REQUEST` when
-    /// the derivation fails. The verb
-    /// is transport-agnostic: any keyboard backend (virtio-input today,
-    /// USB HID / PS-2 later) registers this one slot, so consumers never
-    /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test
-    /// labels below.
-    pub const QUERY_INPUT_DEVICE: u64 = 11;
-    /// Query for the debug port: the byte transport a debugger stub speaks
-    /// to a host debugger over, apart from the console's UART.
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = the verb mask, a non-empty subset of
+    /// [`super::VERB_BIT_MASK`] (an empty one would yield a SEND whose
+    /// queries return un-badged caps, which their holder could badge at
+    /// will); `data[2]` = flags ([`CLASS_BOOT_ONLY`]); `data[3]` = the class
+    /// name's length, 1 to [`MAX_CLASS_NAME_BYTES`]; `data[4..]` = the name's
+    /// bytes, packed little-endian, lowercase ASCII letters, digits, `-`, and
+    /// `_` (docs/driver-binding.md § Device Classes). Caller's badge MUST
+    /// carry [`CLASS_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
-    /// Mints a `serial_labels::WRITE_AUTHORITY | serial_labels::READ_AUTHORITY`-badged
-    /// `SEND_GRANT` cap on the debug port driver's service endpoint, which
-    /// serves the `serial_labels` protocol. The driver is the virtio-console
-    /// driver, spawned for the first `VirtIO` console device devmgr
-    /// enumerates; a boot whose machine presents none has no debug port.
-    /// Caller's badge must have [`DEBUG_PORT_AUTHORITY`] set; the handler
-    /// replies `UNAUTHORIZED` otherwise. Like [`QUERY_INPUT_DEVICE`], it
-    /// replies `NO_DEVICE` until the on-disk drivers are spawned and settled,
-    /// and for the rest of the boot when no debug port driver is served;
-    /// `WITHDRAWN` once the served driver has died; `INVALID_REQUEST` when the
-    /// derivation fails. Request: `data[0]` = caller's compiled
-    /// [`super::DEVMGR_LABELS_VERSION`].
-    pub const QUERY_DEBUG_PORT_DEVICE: u64 = 19;
+    /// devmgr interns the name in its class table, which only grows, marks
+    /// the class configured, and boot-only when the flag is set (sticky).
+    /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = the class SEND.
+    /// `INVALID_REQUEST` for an empty or out-of-mask verb mask, an unknown
+    /// flag, a bad name, a boot-only mark once the drivers-directory pass
+    /// has begun ([`SET_DRIVERS_DIR`]), a full class table, or a failed
+    /// derivation. The handler logs nothing, as [`QUERY_DEVICE`]'s does not.
+    pub const MINT_CLASS_SEND: u64 = 21;
+    /// [`MINT_CLASS_SEND`] flag: the class's drivers come from the boot
+    /// bundle only. devmgr refuses a drivers-directory declaration of the
+    /// class, logged.
+    pub const CLASS_BOOT_ONLY: u64 = 1;
+    /// Longest class name [`MINT_CLASS_SEND`] and [`TEST_QUERY_DENY_DEVICE`]
+    /// carry: the declaration format's class-name bound.
+    pub const MAX_CLASS_NAME_BYTES: usize = 32;
 
     /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
     /// label: trigger devmgr's spawn-orphan fault-injection shim (#176). The
@@ -2179,16 +2134,17 @@ pub mod devmgr_labels
     /// a harness can assert the driver's `UNAUTHORIZED` reply. No other
     /// path mints a SEND on these endpoints without the bit, and a holder
     /// cannot strip a bit from a badged cap. Request: `data[0]` = caller's
-    /// compiled [`super::DEVMGR_LABELS_VERSION`]; `data[1]` = the query label
-    /// naming the driver ([`QUERY_SERIAL_DEVICE`], [`QUERY_INPUT_DEVICE`], or
-    /// [`QUERY_FRAMEBUFFER_DEVICE`]; for input, the first input driver still
-    /// served). Gate as [`TEST_SPAWN_ORPHAN`]. Reply: `SUCCESS` with the SEND
-    /// in `caps[0]`; `NO_DEVICE` when no such driver is served;
-    /// `INVALID_REQUEST` for any other `data[1]` or a failed derive.
+    /// compiled [`super::DEVMGR_LABELS_VERSION`]; `data[1]` = the length of
+    /// a class name, 1 to [`MAX_CLASS_NAME_BYTES`]; `data[2..]` = its bytes,
+    /// packed little-endian as [`MINT_CLASS_SEND`] carries them; the driver
+    /// is the class's first one still served. Gate as [`TEST_SPAWN_ORPHAN`].
+    /// Reply: `SUCCESS` with the SEND in `caps[0]`; `NO_DEVICE` when no
+    /// driver of the class is served; `INVALID_REQUEST` for a bad name or a
+    /// failed derive.
     pub const TEST_QUERY_DENY_DEVICE: u64 = 12;
     /// TODO(#165): remove with [`TEST_QUERY_DENY_DEVICE`]. The badge devmgr
-    /// stamps on a [`TEST_QUERY_DENY_DEVICE`] SEND: no verb bit of the
-    /// serial, input, or framebuffer driver, and non-zero, since a holder
+    /// stamps on a [`TEST_QUERY_DENY_DEVICE`] SEND: no verb bit of any
+    /// driver, and non-zero, since a holder
     /// may badge an un-badged SEND itself
     /// (docs/capability-model.md § Verb-bit authority pattern).
     pub const TEST_DENY_BADGE: u64 = 1;
@@ -2212,7 +2168,7 @@ pub mod devmgr_labels
     /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. Test-only label:
     /// mint a `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the service
     /// endpoint of the served fault fixture at instance ordinal `data[1]`
-    /// (absent means 0), counted as [`QUERY_BLOCK_DEVICE`]'s ordinals are.
+    /// (absent means 0), counted as [`QUERY_DEVICE`]'s ordinals are.
     /// Reply: `SUCCESS` with the cap in `caps[0]`; `WITHDRAWN` at a withdrawn fixture's
     /// ordinal; `NO_DEVICE` past the served fixtures; `INVALID_REQUEST` for a
     /// failed derive. Request: `data[0]` = caller's compiled
@@ -2278,15 +2234,12 @@ pub mod devmgr_labels
     /// sends it.
     pub const DRIVER_READY: u64 = 13;
 
-    /// Authority bit in the devmgr-registry-endpoint badge's high
-    /// u64 bit, gating the device-endpoint queries ([`QUERY_SERIAL_DEVICE`],
-    /// [`QUERY_FRAMEBUFFER_DEVICE`], [`QUERY_RTC_DEVICE`],
-    /// [`QUERY_INPUT_DEVICE`]) and [`QUERY_ACPI_TABLE`]. Set on every
-    /// consumer query cap: svcmgr's `devmgr.*` publications, the SEND
-    /// svcmgr mints for logd at launch, and the SEND init hands vfsd (the
-    /// per-device SENDs drivers hold for [`QUERY_DEVICE_INFO`] lack it).
-    /// Without it those handlers reply `UNAUTHORIZED`. It does not admit
-    /// [`QUERY_BLOCK_DEVICE`], which [`BLOCK_DEVICE_AUTHORITY`] gates.
+    /// Authority bit gating [`QUERY_ACPI_TABLE`]. Set on svcmgr's
+    /// `devmgr.registry`, `devmgr.shutdown`, and `devmgr.test`
+    /// publications; a class SEND ([`MINT_CLASS_SEND`]) and the per-device
+    /// SENDs drivers hold for [`QUERY_DEVICE_INFO`] lack it. Without it the
+    /// handler replies `UNAUTHORIZED`. It admits no device query: a device
+    /// is reached through its class SEND alone.
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
     /// Authority bit gating [`SET_DRIVERS_DIR`]. svcmgr mints a SEND
     /// cap carrying this bit from the devmgr-registry source cap init
@@ -2311,21 +2264,67 @@ pub mod devmgr_labels
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
     pub const TEST_LABEL_AUTHORITY: u64 = 1u64 << 60;
-    /// Authority bit gating [`QUERY_BLOCK_DEVICE`], whose reply is a
-    /// `MOUNT_AUTHORITY`-badged whole-disk cap. init mints it, beside
-    /// [`REGISTRY_QUERY_AUTHORITY`], only onto the registry SEND it hands
-    /// vfsd; svcmgr mints it onto none of its `devmgr.*` publications, so
-    /// no other process holds the bit. Gating upstream of virtio-blk keeps
-    /// `MOUNT_AUTHORITY` caps with the one consumer devmgr authorises.
-    /// Disjoint position from the other authority bits.
-    pub const BLOCK_DEVICE_AUTHORITY: u64 = 1u64 << 59;
-    /// Authority bit gating [`QUERY_DEBUG_PORT_DEVICE`], whose reply reads and
-    /// writes the debug port. svcmgr mints it, beside
-    /// [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
-    /// seed-only as [`crate::published_names::DEVMGR_DEBUG`], so only a
-    /// service whose definition seeds that name holds the bit. Disjoint
+    /// Authority bit gating [`MINT_CLASS_SEND`], which decides which
+    /// classes' drivers a SEND reaches. init and svcmgr mint it from the
+    /// devmgr-registry sources they hold, only onto a SEND they call
+    /// `MINT_CLASS_SEND` on and then delete; no consumer holds it. Disjoint
     /// position from the other authority bits.
-    pub const DEBUG_PORT_AUTHORITY: u64 = 1u64 << 58;
+    pub const CLASS_AUTHORITY: u64 = 1u64 << 59;
+
+    /// The badge of a class SEND ([`MINT_CLASS_SEND`]): the class's slot in
+    /// devmgr's class table plus one in bits 0..=15, and the verb bits its
+    /// [`QUERY_DEVICE`] replies carry, moved down from
+    /// [`crate::VERB_BIT_MASK`] into bits 16..=21. No other bit is set, so a
+    /// class badge carries none of the registry's authority bits and reaches
+    /// `QUERY_DEVICE` alone, and no registry SEND of an authority bit reads
+    /// as a class badge.
+    pub mod class_badge
+    {
+        use core::prelude::rust_2024::*;
+
+        /// Bits holding the class slot plus one; 0 is no class.
+        pub const SLOT_MASK: u64 = 0xFFFF;
+        /// How far the verb bits move down from their place in
+        /// [`crate::VERB_BIT_MASK`].
+        const VERB_SHIFT: u32 = 42;
+        /// Bits holding the verb bits.
+        pub const VERBS_MASK: u64 = crate::VERB_BIT_MASK >> VERB_SHIFT;
+        /// Slots a class badge can name.
+        pub const MAX_SLOTS: usize = 0xFFFF;
+        const _: () = assert!(
+            SLOT_MASK & VERBS_MASK == 0
+                && VERBS_MASK & crate::VERB_BIT_MASK == 0
+                && VERBS_MASK << VERB_SHIFT == crate::VERB_BIT_MASK
+        );
+
+        /// The badge naming class slot `slot` with verb bits `verbs`; `None`
+        /// when `slot` is past [`MAX_SLOTS`] or `verbs` is empty or not a
+        /// subset of [`crate::VERB_BIT_MASK`].
+        #[must_use]
+        pub fn encode(slot: usize, verbs: u64) -> Option<u64>
+        {
+            if slot >= MAX_SLOTS || verbs == 0 || verbs & !crate::VERB_BIT_MASK != 0
+            {
+                return None;
+            }
+            let slot = u64::try_from(slot).ok()?;
+            Some((slot + 1) | (verbs >> VERB_SHIFT))
+        }
+
+        /// The class slot and verb bits `badge` names; `None` for a badge
+        /// [`encode`] does not produce.
+        #[must_use]
+        pub fn decode(badge: u64) -> Option<(usize, u64)>
+        {
+            let slot = badge & SLOT_MASK;
+            let verbs = (badge & VERBS_MASK) << VERB_SHIFT;
+            if slot == 0 || verbs == 0 || badge & !(SLOT_MASK | VERBS_MASK) != 0
+            {
+                return None;
+            }
+            usize::try_from(slot - 1).ok().map(|s| (s, verbs))
+        }
+    }
 }
 
 /// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_FAULT_DRIVERS`. The
@@ -2430,6 +2429,109 @@ pub unsafe fn report_driver_ready(devmgr_ep: u64, ipc_buf: *mut u64) -> Result<(
     {
         Err(ReadyError::Refused(reply.label))
     }
+}
+
+/// Why a [`query_device`] or [`mint_class_send`] call returned no cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassCallError
+{
+    /// The `ipc_call` itself failed, with this syscall error.
+    Call(i64),
+    /// devmgr replied this non-`SUCCESS` label ([`devmgr_errors`]).
+    Refused(u64),
+    /// devmgr replied `SUCCESS` with no cap.
+    NoCap,
+}
+
+/// Send [`devmgr_labels::QUERY_DEVICE`] on the class SEND `class_send` for
+/// instance ordinal `ordinal`, and return the `SEND_GRANT` cap on the
+/// driver's service endpoint. Logs nothing, so logd calls it too.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`ClassCallError`]: [`devmgr_errors::NO_DEVICE`] past the last served
+/// driver of the class, [`devmgr_errors::WITHDRAWN`] at a withdrawn one's
+/// ordinal, and the other refusals [`devmgr_labels::QUERY_DEVICE`] names.
+pub unsafe fn query_device(
+    class_send: u64,
+    ordinal: u64,
+    ipc_buf: *mut u64,
+) -> Result<u64, ClassCallError>
+{
+    let request = IpcMessage::builder(devmgr_labels::QUERY_DEVICE)
+        .word(0, u64::from(DEVMGR_LABELS_VERSION))
+        .word(1, ordinal)
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { ipc_call(class_send, &request, ipc_buf) }.map_err(ClassCallError::Call)?;
+    class_call_cap(&reply)
+}
+
+/// Send [`devmgr_labels::MINT_CLASS_SEND`] on `registry`, a registry SEND
+/// carrying [`devmgr_labels::CLASS_AUTHORITY`], for the class named `class`
+/// with verb mask `verbs` and flags `flags`, and return the class SEND.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`ClassCallError`]; [`ClassCallError::Refused`] with
+/// [`devmgr_errors::INVALID_REQUEST`], unsent, for a name longer than
+/// [`devmgr_labels::MAX_CLASS_NAME_BYTES`].
+pub unsafe fn mint_class_send(
+    registry: u64,
+    class: &[u8],
+    verbs: u64,
+    flags: u64,
+    ipc_buf: *mut u64,
+) -> Result<u64, ClassCallError>
+{
+    if class.len() > devmgr_labels::MAX_CLASS_NAME_BYTES
+    {
+        return Err(ClassCallError::Refused(devmgr_errors::INVALID_REQUEST));
+    }
+    let request = IpcMessage::builder(devmgr_labels::MINT_CLASS_SEND)
+        .word(0, u64::from(DEVMGR_LABELS_VERSION))
+        .word(1, verbs)
+        .word(2, flags)
+        .word(3, u64::try_from(class.len()).unwrap_or(u64::MAX))
+        .bytes(4, class)
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { ipc_call(registry, &request, ipc_buf) }.map_err(ClassCallError::Call)?;
+    class_call_cap(&reply)
+}
+
+/// The class name a [`devmgr_labels::MINT_CLASS_SEND`] or
+/// [`devmgr_labels::TEST_QUERY_DENY_DEVICE`] request carries: `data[at]` its
+/// length, `data[at + 1..]` its bytes. `None` when the length is 0, past
+/// [`devmgr_labels::MAX_CLASS_NAME_BYTES`], or past the words sent.
+#[must_use]
+pub fn class_name_of(msg: &IpcMessage, at: usize) -> Option<&[u8]>
+{
+    let len = usize::try_from(*msg.words().get(at)?).ok()?;
+    if len == 0 || len > devmgr_labels::MAX_CLASS_NAME_BYTES
+    {
+        return None;
+    }
+    msg.data_bytes().get((at + 1) * 8..)?.get(..len)
+}
+
+/// The cap of a class call's `SUCCESS` reply.
+fn class_call_cap(reply: &IpcMessage) -> Result<u64, ClassCallError>
+{
+    if reply.label != devmgr_errors::SUCCESS
+    {
+        return Err(ClassCallError::Refused(reply.label));
+    }
+    reply
+        .caps()
+        .first()
+        .copied()
+        .filter(|&cap| cap != 0)
+        .ok_or(ClassCallError::NoCap)
 }
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]
@@ -2818,9 +2920,9 @@ pub const SERIAL_LABELS_VERSION: u32 = 2;
 /// RISC-V) and is the sole driver-mediated path for userspace console serial
 /// bytes in both directions; devmgr hands clients a cap on it badged with
 /// [`serial_labels::WRITE_AUTHORITY`] | [`serial_labels::READ_AUTHORITY`] via
-/// [`devmgr_labels::QUERY_SERIAL_DEVICE`]. The virtio-console driver
-/// (`services/drivers/virtio/console`) serves the debug port, handed out the
-/// same way via [`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`]. Line-control and flow-control
+/// [`devmgr_labels::QUERY_DEVICE`] on the `serial` class. The virtio-console
+/// driver (`services/drivers/virtio/console`) serves the debug port, handed
+/// out the same way on the `debug-port` class. Line-control and flow-control
 /// surfaces are planned but unimplemented (see the driver `README.md`); they
 /// are not on the wire.
 pub mod serial_labels
@@ -2874,16 +2976,15 @@ pub mod serial_labels
     pub const SERIAL_REGISTER_RX_NOTIFY: u64 = 3;
 
     /// Authority bit in the serial-service-endpoint badge's high u64 bit.
-    /// Set on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_SERIAL_DEVICE`] and
-    /// [`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`]; gates [`SERIAL_WRITE_BYTES`].
+    /// Set on caps devmgr mints in response to [`devmgr_labels::QUERY_DEVICE`]
+    /// on the `serial` and `debug-port` classes; gates [`SERIAL_WRITE_BYTES`].
     /// A verb ("may write"), not an identity.
     pub const WRITE_AUTHORITY: u64 = 1u64 << 63;
 
     /// Authority bit gating [`SERIAL_READ_BYTES`] and
     /// [`SERIAL_REGISTER_RX_NOTIFY`]. Set alongside [`WRITE_AUTHORITY`] on caps
-    /// devmgr mints for [`devmgr_labels::QUERY_SERIAL_DEVICE`] and
-    /// [`devmgr_labels::QUERY_DEBUG_PORT_DEVICE`]. A verb ("may
+    /// devmgr mints for [`devmgr_labels::QUERY_DEVICE`] on the `serial` and
+    /// `debug-port` classes. A verb ("may
     /// read"), not an identity.
     pub const READ_AUTHORITY: u64 = 1u64 << 62;
 }
@@ -2920,7 +3021,7 @@ pub const FB_LABELS_VERSION: u32 = 2;
 /// bootloader-handed GOP linear-framebuffer MMIO end-to-end and is the
 /// sole driver-mediated sink for userspace framebuffer bytes. devmgr
 /// spawns it and hands clients a [`fb_labels::WRITE_AUTHORITY`]-badged
-/// SEND via [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. Graphical
+/// SEND via [`devmgr_labels::QUERY_DEVICE`] on the `framebuffer` class. Graphical
 /// primitives, cursor control, mode set, and multi-head dispatch are
 /// planned but unimplemented (see the driver `README.md`); they are not
 /// on the wire.
@@ -2969,7 +3070,7 @@ pub mod fb_labels
 
     /// Authority bit in the framebuffer-service-endpoint badge's high
     /// u64 bit. Set on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. It gates
+    /// [`devmgr_labels::QUERY_DEVICE`] on the `framebuffer` class. It gates
     /// [`FB_WRITE_BYTES`] and [`FB_SET_ATTRS`]: the driver answers either
     /// label with [`super::fb_errors::UNAUTHORIZED`] when the caller's
     /// badge lacks it. A verb ("may write"), not an identity.
@@ -3005,7 +3106,7 @@ pub const INPUT_LABELS_VERSION: u32 = 1;
 /// (virtio-input PCI today) and is the sole driver-mediated source of
 /// keyboard input. devmgr spawns it and hands clients an
 /// [`input_labels::READ_AUTHORITY`]-badged SEND via
-/// [`devmgr_labels::QUERY_INPUT_DEVICE`]. Key-repeat configuration, layout
+/// [`devmgr_labels::QUERY_DEVICE`] on the `input` class. Key-repeat configuration, layout
 /// switching, pointer/mouse events, and multi-device fan-out are out of
 /// scope (see the driver `README.md`); they are not on the wire.
 pub mod input_labels
@@ -3028,8 +3129,8 @@ pub mod input_labels
     pub const INPUT_READ_EVENTS: u64 = 1;
 
     /// Authority bit in the input-service-endpoint badge's high u64 bit. Set
-    /// on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_INPUT_DEVICE`]. It gates [`INPUT_READ_EVENTS`]:
+    /// on caps devmgr mints in response to [`devmgr_labels::QUERY_DEVICE`] on
+    /// the `input` class. It gates [`INPUT_READ_EVENTS`]:
     /// the driver answers the label with [`super::input_errors::UNAUTHORIZED`]
     /// when the caller's badge lacks it. A verb ("may read"), not an identity.
     pub const READ_AUTHORITY: u64 = 1u64 << 63;
@@ -3255,9 +3356,8 @@ pub const VERB_BIT_MASK: u64 =
     (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59) | (1u64 << 58);
 const _: () = core::assert!(
     devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
-        && devmgr_labels::DEBUG_PORT_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::TEST_LABEL_AUTHORITY & VERB_BIT_MASK != 0
-        && devmgr_labels::BLOCK_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::CLASS_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::DENY_BADGE & VERB_BIT_MASK == 0
@@ -3578,48 +3678,45 @@ pub mod devmgr_errors
     /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// The request cannot be served: a reply-cap derivation failed, the
-    /// requested driver is not served (`QUERY_BLOCK_DEVICE` past the last
-    /// served driver, `QUERY_SERIAL_DEVICE`, `QUERY_FRAMEBUFFER_DEVICE`), the
     /// badge indexes no catalog entry with startup info
     /// (`QUERY_DEVICE_INFO`), a `DRIVER_READY` badge names no live driver of
     /// the batch, `SET_DRIVERS_DIR` carried no cap, or a label-specific
-    /// argument was rejected (see `QUERY_ACPI_TABLE` and
+    /// argument was rejected (see `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, and
     /// `QUERY_SHUTDOWN_DEVICE`).
     pub const INVALID_REQUEST: u64 = 1;
-    /// Caller's badge lacks the verb bit required by the handler
-    /// (e.g. `BLOCK_DEVICE_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
+    /// Caller's badge lacks what the handler requires: an authority bit
+    /// (e.g. `CLASS_AUTHORITY` for `MINT_CLASS_SEND`), or, for
+    /// `QUERY_DEVICE`, a class slot (`devmgr_labels::class_badge`).
     pub const UNAUTHORIZED: u64 = 2;
     /// Caller's compiled `DEVMGR_LABELS_VERSION`, carried in `data[0]` of
     /// every devmgr request, does not match the receiver's: the caller was
     /// built against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
-    /// Requested device or table is unavailable. Returned by
-    /// `QUERY_RTC_DEVICE` and `QUERY_INPUT_DEVICE` when devmgr either (a)
-    /// has not yet spawned the on-disk driver (no
-    /// [`super::devmgr_labels::SET_DRIVERS_DIR`] yet), or (b) attempted the
-    /// lazy disk-walked spawn and failed (missing binary, ELF corrupt,
-    /// hardware carve failed, OOM, the driver died or did not report ready
-    /// within the settle bound, etc.), or, for `QUERY_INPUT_DEVICE`, the
-    /// requested instance ordinal is past the last input driver the settle
-    /// served. Case (a) is transient: it ends once the `SET_DRIVERS_DIR`
-    /// spawns and the input settle complete, so a
+    /// Requested device or table is unavailable. Returned by `QUERY_DEVICE`
+    /// when the requested instance ordinal is past the last served driver
+    /// of the class, which it is for every ordinal while devmgr either (a)
+    /// has not yet spawned and settled the class's on-disk drivers (no
+    /// [`super::devmgr_labels::SET_DRIVERS_DIR`] yet, or its settle still
+    /// running), or (b) attempted the disk-walked spawn and failed (missing
+    /// binary, ELF corrupt, hardware carve failed, OOM, the driver died or
+    /// did not report ready within the settle bound, etc.), or (c) binds no
+    /// driver of the class on this machine. Case (a) is transient: it ends
+    /// once the `SET_DRIVERS_DIR` spawns and their settle complete, so a
     /// client that cannot proceed without the device MAY retry with a
-    /// bounded number of attempts. Case (b) is sticky for the boot, since a
-    /// single attempt is made, and a client cannot tell (a) from (b): a
-    /// client with a no-device path (timed) MUST treat the reply as
-    /// terminal and take that path, and no client MAY retry without a
-    /// bound. Also returned by `QUERY_ACPI_TABLE` (table not found) and
-    /// `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
+    /// bounded number of attempts. Cases (b) and (c) are sticky for the
+    /// boot, since a single attempt is made, and a client cannot tell (a)
+    /// from them: a client with a no-device path (timed) MUST treat the
+    /// reply as terminal and take that path, and no client MAY retry
+    /// without a bound. Also returned by `QUERY_ACPI_TABLE` (table not
+    /// found) and `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
     pub const NO_DEVICE: u64 = 4;
     /// The driver the query names was served and has since died, so devmgr
     /// withdrew it: its service endpoint is revoked, and callers queued on
-    /// it returned. Returned by `QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE`
-    /// at the withdrawn driver's instance ordinal, which stays held for the
-    /// rest of the boot so the ordinals after it keep their drivers (a client
-    /// probing ordinals continues at the next one), and by
-    /// `QUERY_SERIAL_DEVICE`, `QUERY_FRAMEBUFFER_DEVICE`, and
-    /// `QUERY_RTC_DEVICE` once their driver is withdrawn. Sticky for the
-    /// boot: devmgr restarts no driver.
+    /// it returned. Returned by `QUERY_DEVICE` at the withdrawn driver's
+    /// instance ordinal, which stays held for the rest of the boot so the
+    /// ordinals after it keep their drivers (a client probing ordinals
+    /// continues at the next one). Sticky for the boot: devmgr restarts no
+    /// driver.
     pub const WITHDRAWN: u64 = 5;
     /// Unknown opcode on devmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
@@ -4278,6 +4375,91 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_class_badge_round_trips_and_carries_no_authority_bit()
+    {
+        use devmgr_labels::class_badge::{MAX_SLOTS, decode, encode};
+        let verbs = serial_labels::WRITE_AUTHORITY | serial_labels::READ_AUTHORITY;
+        for slot in [0, 1, 63, MAX_SLOTS - 1]
+        {
+            let badge = encode(slot, verbs).unwrap();
+            assert_eq!(badge & VERB_BIT_MASK, 0, "slot {slot}");
+            assert_eq!(decode(badge), Some((slot, verbs)));
+        }
+        assert_eq!(
+            decode(encode(5, VERB_BIT_MASK).unwrap()),
+            Some((5, VERB_BIT_MASK))
+        );
+    }
+
+    #[test]
+    fn a_class_badge_refuses_what_it_cannot_name()
+    {
+        use devmgr_labels::class_badge::{MAX_SLOTS, decode, encode};
+        assert_eq!(encode(MAX_SLOTS, blk_labels::MOUNT_AUTHORITY), None);
+        assert_eq!(encode(0, 0), None);
+        assert_eq!(encode(0, 1), None);
+        // No registry SEND of an authority bit reads as a class badge.
+        for badge in [
+            0,
+            devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+            devmgr_labels::REGISTRY_QUERY_AUTHORITY | devmgr_labels::TEST_LABEL_AUTHORITY,
+            devmgr_labels::CLASS_AUTHORITY,
+            devmgr_labels::DRIVERS_DIR_AUTHORITY,
+        ]
+        {
+            assert_eq!(decode(badge), None, "badge {badge:#x}");
+        }
+        // A slot without verbs, verbs without a slot, and a class badge with
+        // an authority bit added are refused.
+        assert_eq!(decode(1), None);
+        let good = encode(2, blk_labels::MOUNT_AUTHORITY).unwrap();
+        assert_eq!(decode(good & !devmgr_labels::class_badge::SLOT_MASK), None);
+        assert_eq!(decode(good | devmgr_labels::REGISTRY_QUERY_AUTHORITY), None);
+        assert_eq!(decode(good | 1 << 30), None);
+    }
+
+    #[test]
+    fn a_class_name_reads_back_from_its_words()
+    {
+        let msg = IpcMessage::builder(devmgr_labels::MINT_CLASS_SEND)
+            .word(0, 17)
+            .word(1, 1 << 63)
+            .word(2, 0)
+            .word(3, 11)
+            .bytes(4, b"debug-port!")
+            .build();
+        assert_eq!(class_name_of(&msg, 3), Some(&b"debug-port!"[..]));
+        let short = IpcMessage::builder(0).word(1, 4).bytes(2, b"rtc").build();
+        assert_eq!(class_name_of(&short, 1), Some(&b"rtc\0"[..]));
+        let long = IpcMessage::builder(0).word(1, 9).bytes(2, b"rtc").build();
+        assert_eq!(class_name_of(&long, 1), None);
+        let empty = IpcMessage::builder(0).word(1, 0).build();
+        assert_eq!(class_name_of(&empty, 1), None);
+        let over = IpcMessage::builder(0)
+            .word(1, devmgr_labels::MAX_CLASS_NAME_BYTES as u64 + 1)
+            .bytes(2, &[b'a'; 40])
+            .build();
+        assert_eq!(class_name_of(&over, 1), None);
+        assert_eq!(class_name_of(&empty, 5), None);
+    }
+
+    #[test]
+    fn a_class_call_reply_yields_its_cap_or_why_not()
+    {
+        let granted = IpcMessage::builder(devmgr_errors::SUCCESS).cap(7).build();
+        assert_eq!(class_call_cap(&granted), Ok(7));
+        let refused = IpcMessage::builder(devmgr_errors::WITHDRAWN).cap(7).build();
+        assert_eq!(
+            class_call_cap(&refused),
+            Err(ClassCallError::Refused(devmgr_errors::WITHDRAWN))
+        );
+        let empty = IpcMessage::new(devmgr_errors::SUCCESS);
+        assert_eq!(class_call_cap(&empty), Err(ClassCallError::NoCap));
+        let null = IpcMessage::builder(devmgr_errors::SUCCESS).cap(0).build();
+        assert_eq!(class_call_cap(&null), Err(ClassCallError::NoCap));
+    }
 
     #[test]
     fn a_stream_label_level_reads_back_and_an_absent_one_reads_as_info()

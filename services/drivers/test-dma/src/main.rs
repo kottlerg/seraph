@@ -40,6 +40,8 @@ driver_binding::driver_declaration!(Declaration {
     instance_limit: Some(1),
     interrupt: Interrupt::NONE,
     dma: true,
+    // The edu device's default DMA mask is 28 bits.
+    dma_width: Some(28),
     phys_access: false,
     reset: Reset::None,
     tier: Tier::Auxiliary,

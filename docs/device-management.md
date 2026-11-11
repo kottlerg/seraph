@@ -223,9 +223,9 @@ buffer for the duration of the one request that uses it.
 
 devmgr returns every device address; no driver chooses one. With an IOMMU confining the device,
 the address is an IOVA in the device's domain, which devmgr allocates first fit from 1 MiB below
-the device's limit (the width the device's remapping unit translates, narrowed for a device whose
-DMA reaches fewer address bits; [limits.md](limits.md)), outside every firmware-reserved range the
-domain maps at its own address, and the mapping is installed in the IOMMU's tables, through the
+the device's limit (the width the device's remapping unit translates, narrowed to the DMA address
+width the device's driver declares; [limits.md](limits.md)), outside every firmware-reserved range
+the domain maps at its own address, and the mapping is installed in the IOMMU's tables, through the
 IOMMU driver (§ IOMMU Discovery and Programming), before devmgr replies, and withdrawn from them
 before devmgr deletes its cap at `DMA_UNMAP`, so the device reaches exactly the frames mapped for
 it and its reserved ranges. With none, the device can reach memory only at physical
@@ -465,24 +465,30 @@ init
  ├── devmgr  (platform caps + firmware table caps)
  │    ├── driver/iommu-vtd         (VT-d unit MMIO caps; iommu_labels, devmgr only; x86-64)
  │    ├── driver/iommu-riscv       (IOMMU BAR 0 MMIO caps; iommu_labels, devmgr only; riscv64)
- │    ├── driver/virtio-blk        (MMIO + IRQ caps; QUERY_BLOCK_DEVICE)
- │    ├── driver/virtio-input      (MMIO + opt. IRQ; QUERY_INPUT_DEVICE; on-disk)
- │    ├── driver/virtio-console    (MMIO + opt. IRQ; QUERY_DEBUG_PORT_DEVICE; on-disk)
- │    ├── driver/serial            (UART hw + IRQ caps; QUERY_SERIAL_DEVICE)
- │    ├── driver/framebuffer       (MMIO cap; QUERY_FRAMEBUFFER_DEVICE)
- │    └── driver/{cmos-rtc,goldfish-rtc} (RTC hw cap; QUERY_RTC_DEVICE)
- ├── vfsd  (receives storage endpoint via QUERY_BLOCK_DEVICE)
+ │    ├── driver/virtio-blk        (MMIO + IRQ caps; block class)
+ │    ├── driver/virtio-input      (MMIO + opt. IRQ; input class; on-disk)
+ │    ├── driver/virtio-console    (MMIO + opt. IRQ; debug-port class; on-disk)
+ │    ├── driver/serial            (UART hw + IRQ caps; serial class)
+ │    ├── driver/framebuffer       (MMIO cap; framebuffer class)
+ │    └── driver/{cmos-rtc,goldfish-rtc} (RTC hw cap; rtc class)
+ ├── vfsd  (receives storage endpoint via QUERY_DEVICE on the block class SEND)
  ├── ...
  └── svcmgr
-      ├── logd     (serial, framebuffer endpoints via QUERY_*_DEVICE)
+      ├── logd     (serial, framebuffer endpoints via QUERY_DEVICE on class SENDs)
       ├── pwrmgr   (ACPI tables + shutdown hw via QUERY_ACPI_TABLE / QUERY_SHUTDOWN_DEVICE)
-      ├── timed    (RTC endpoint via QUERY_RTC_DEVICE)
-      └── terminal (input, framebuffer, serial endpoints via QUERY_*_DEVICE)
+      ├── timed    (RTC endpoint via QUERY_DEVICE on the rtc class SEND)
+      └── terminal (input, framebuffer, serial endpoints via QUERY_DEVICE on class SENDs)
 ```
 
 vfsd and the consumers svcmgr launches after handover (logd, pwrmgr, timed, terminal)
 query devmgr's registry for their device endpoints and hardware caps, which devmgr serves
-only after initial enumeration and binding complete. The dependency ordering is fixed by
+only after initial enumeration and binding complete. A device endpoint is queried with one
+label, `devmgr_labels::QUERY_DEVICE`, sent on a class SEND: a SEND on devmgr's registry endpoint
+whose badge names a class and the verb bits the reply carries. The class and the verbs come from
+the badge, never the message, and a registry SEND without a class slot gets `UNAUTHORIZED`.
+svcmgr mints each class SEND (`devmgr_labels::MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`) from
+a class file and publishes it seed-only as `devmgr.class.<class>`
+([driver-binding.md](driver-binding.md) § Device Classes). The dependency ordering is fixed by
 init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
 after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
@@ -498,14 +504,15 @@ setup) is withdrawn and never served; one still pending at the bound is destroye
 for every driver of a batch to report, die, or overrun the bound before it serves that batch's
 classes (devmgr's
 [responsibilities.md § Responsibilities](../services/devmgr/docs/responsibilities.md#responsibilities)
-gives the settle, the bound's derivation, and the serving order). `QUERY_BLOCK_DEVICE` and
-`QUERY_INPUT_DEVICE` select one of those drivers by an optional instance ordinal in `data[1]`
-(absent means the first): the ordinal counts the served drivers of that class in PCI segment, bus,
-device, function order, is not stable across boots, and is fixed once the class settles. devmgr
+gives the settle, the bound's derivation, and the serving order). `QUERY_DEVICE` selects one of a
+class's drivers by an optional instance ordinal in `data[1]` (absent means the first): the
+ordinal counts the served drivers of that class in PCI segment, bus, device, function order, is
+not stable across boots, and is fixed once the class settles. devmgr
 observes every driver's death for the rest of the boot: a served driver that dies is withdrawn, its
 service endpoint revoked so callers queued on it return, and a tombstone holds its ordinal, whose
 query replies `devmgr_errors::WITHDRAWN` while the ordinals after it keep their drivers; a
-withdrawn serial, framebuffer, or RTC driver's query replies `WITHDRAWN` too. vfsd queries every
+withdrawn serial, framebuffer, or RTC driver's query replies `WITHDRAWN` too. Past the last
+served driver of a class the reply is `devmgr_errors::NO_DEVICE`. vfsd queries every
 block ordinal from 0, passing a `WITHDRAWN` one, until another reply is not `SUCCESS`, and holds
 every live disk; the terminal sends none, so it binds the first input instance.
 
@@ -513,9 +520,9 @@ The debug port is a byte transport apart from the console's UART, which a debugg
 [GDB stub](../services/gdbstub/README.md), owns to speak to a host debugger: the first
 virtio-console device in PCI order (its declaration's instance limit is 1), driven by the
 [virtio-console driver](../services/drivers/virtio/console/README.md), which serves the serial
-protocol. devmgr hands it out only on `devmgr_labels::QUERY_DEBUG_PORT_DEVICE`, gated on
-`DEBUG_PORT_AUTHORITY`, which svcmgr mints only onto the seed-only `devmgr.debug` name, so only a
-service whose definition seeds that name reaches the port. A machine presents the device only
+protocol. devmgr hands it out only on `QUERY_DEVICE` sent on the `debug-port` class SEND, which
+svcmgr publishes seed-only as `devmgr.class.debug-port`, so only a service whose definition
+seeds that name reaches the port. A machine presents the device only
 when a launch asks for it (`--debug-port`); a boot without it has no debug port, and the query
 replies `NO_DEVICE`. A further console device is left unbound.
 
@@ -558,9 +565,9 @@ devmgr loads driver binaries from one of two places:
   `ipc_reply` and before devmgr returns to its next `ipc_recv`. The spawn is at-most-once per boot;
   on failure (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did
   not report ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on
-  subsequent `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` / `QUERY_DEBUG_PORT_DEVICE` calls and clients
+  subsequent `QUERY_DEVICE` calls on the rtc, input, and debug-port classes and clients
   ([timed](../services/timed/README.md) degrades to its no-RTC path; the terminal, today's only
-  `QUERY_INPUT_DEVICE` consumer, logs and exits). Before the spawn has run the reply is the same
+  input class consumer, logs and exits). Before the spawn has run the reply is the same
   `NO_DEVICE`, so a client that cannot proceed without the device MAY retry a bounded number of
   times (the terminal does), while a client with a no-device path treats the first `NO_DEVICE` as
   terminal; no client retries without a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the

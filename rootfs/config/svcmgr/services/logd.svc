@@ -4,10 +4,11 @@
 # round from the reserved log-sink sources init endows: the master log
 # endpoint RECV, a first-launch SEND for the HANDOVER_PULL of init-logd's
 # boot history, a DEATH_EQ_AUTHORITY SEND|GRANT on procmgr (for sender slot
-# reclaim), and a devmgr.registry query cap (logd resolves the serial driver
-# via QUERY_SERIAL_DEVICE and routes output through it — it holds no UART
-# hardware). `log_sink = yes` selects this svcmgr-minted round in place of
-# seed / provides.
+# reclaim), and the devmgr.class.serial and devmgr.class.framebuffer class
+# SENDs (logd resolves the serial and framebuffer drivers via QUERY_DEVICE
+# and routes output through them — it holds no UART hardware).
+# `log_sink = yes` selects this svcmgr-minted round in place of seed /
+# provides.
 #
 # `restart = on_failure`: svcmgr holds the master-log source for the system's
 # life, so a fresh logd would re-attach to the same endpoint object every log

@@ -11,13 +11,13 @@ endowment to either supervise the running instance or launch a fresh
 one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliation).
 
 svcmgr also owns the system-wide discovery registry: it publishes the well-known names it owns
-(`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, `devmgr.debug`,
-`vfsd.mount`, `vfsd.deny`, `logd.query`, and each provider's `provides` names like
-`pwrmgr.shutdown` / `timed`) into the registry itself — from the source caps init endows it
-with at handover, and from each provider's launch. Consumers resolve any name through their
-`.svc` `seed = ...` line at launch time, and the public names (`svcmgr`, `pwrmgr.deny`,
-`timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority is seed-only, so
-`QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. The
+(`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`,
+`vfsd.mount`, `vfsd.deny`, `logd.query`, a `devmgr.class.<class>` per device class file, and each
+provider's `provides` names like `pwrmgr.shutdown` / `timed`) into the registry itself — from the
+source caps init endows it with at handover, and from each provider's launch. Consumers resolve
+any name through their `.svc` `seed = ...` line at launch time, and the public names
+(`svcmgr`, `pwrmgr.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority
+is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. The
 endowment and registry wire format are in [docs/ipc-interface.md](docs/ipc-interface.md).
 
 A raw-syscall fallback that lets svcmgr recreate procmgr if procmgr
@@ -212,7 +212,7 @@ column). The handover endowment and
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
 | `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| TEST_LABEL_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
-| `devmgr.debug` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| DEBUG_PORT_AUTHORITY`-badged SEND on devmgr's registry endpoint: the debug port (seeded only by the debug-port fixture `debug-echo`, staged by `test-debug-port`, and the GDB stub `gdbstub`, staged by `--debug-target` of `run` and `run-parallel`, and by `test-gdb`) | no |
+| `devmgr.class.<class>` | svcmgr (a `MINT_CLASS_SEND` reply, one per class file) | class SEND on devmgr's registry endpoint: the badge names the class's slot and the class file's verbs ([Device class files](docs/service-definitions.md#device-class-files)) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |

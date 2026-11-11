@@ -14,8 +14,8 @@
 //!
 //! This is the virtio-input *backend*; a future USB-HID or PS-2 keyboard
 //! driver is a sibling that decodes its own raw codes into the same keysym
-//! ABI and registers the same devmgr slot ([`devmgr_labels::QUERY_INPUT_DEVICE`]),
-//! so consumers never learn the transport.
+//! ABI and declares the same `input` class, which consumers query with
+//! [`devmgr_labels::QUERY_DEVICE`], so they never learn the transport.
 
 mod decode;
 mod input;
@@ -57,6 +57,7 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     instance_limit: None,
     interrupt: driver_binding::decl::Interrupt::OPTIONAL,
     dma: true,
+    dma_width: None,
     phys_access: false,
     reset: driver_binding::decl::Reset::VirtioStatus,
     tier: driver_binding::decl::Tier::Auxiliary,

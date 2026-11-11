@@ -287,7 +287,7 @@ or by relocating the spawn entirely into svcmgr.
 `timed`, `pwrmgr`, and `logd` are *not* in that set: they are
 svcmgr-launched. `timed` and `pwrmgr` are genuinely restartable: they hold no
 unique source cap — each re-acquires its authority on (re)start by
-querying devmgr (`QUERY_RTC_DEVICE` for timed, per
+querying devmgr (`QUERY_DEVICE` on the rtc class SEND for timed, per
 [timed/README.md](../../timed/README.md); `QUERY_ACPI_TABLE` +
 `QUERY_SHUTDOWN_DEVICE` for pwrmgr, per
 [pwrmgr/README.md](../../pwrmgr/README.md)), and svcmgr re-serves a fresh

@@ -577,8 +577,11 @@ impl Iommu
 
     /// Attach `pci_dev` to a domain of its own before its DMA grant, so its
     /// driver's mappings are confined to it, and map there, at their own
-    /// addresses, the regions the firmware reserves for it: its confinement
-    /// and those ranges, unconfined with none when no unit translates it.
+    /// addresses, the regions the firmware reserves for it: its confinement,
+    /// whose IOVA limit is the smaller of the unit's width and `dma_width`
+    /// (the device's DMA address width its driver declares; `None` for no
+    /// limit of its own), and those ranges, unconfined with none when no unit
+    /// translates it.
     /// Logged `Err` when it is refused: the RIMT renames its device ID, its
     /// unit is not programmed, the driver has failed, its reserved regions
     /// overlap pooled memory, pass the unit's width, or are too many, or the
@@ -588,6 +591,7 @@ impl Iommu
         &self,
         name: &str,
         pci_dev: &pci::PciDevice,
+        dma_width: Option<u8>,
     ) -> Result<(Confinement, Vec<ReservedRange>), Refused>
     {
         let Some(unit) = self.unit_of(name, pci_dev)?
@@ -628,11 +632,7 @@ impl Iommu
                 r.base + r.len
             );
         }
-        let limit = iova_limit(
-            self.client.width(unit),
-            pci_dev.vendor_id,
-            pci_dev.device_id,
-        );
+        let limit = iova_limit(self.client.width(unit), dma_width);
         Ok((Confinement::Domain { handle, limit }, reserved))
     }
 

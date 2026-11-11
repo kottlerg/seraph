@@ -33,11 +33,13 @@
 //! | `0x23` | Physical access | none |
 //! | `0x24` | Withdrawal reset | 1 `VirtIO` status, 2 PCI Express Function Level Reset |
 //! | `0x25` | Priority tier | 0 auxiliary, 1 boot |
+//! | `0x26` | DMA address width | one byte, [`MIN_DMA_WIDTH_BITS`] to [`MAX_DMA_WIDTH_BITS`]; only beside DMA |
 //!
 //! Name is required, and at least one and at most [`MAX_MATCHES`] match
 //! fields; every other field appears at most once, and an absent one takes
-//! its default (no class, no instance limit, no interrupt, no DMA, no
-//! physical access, no reset, the auxiliary tier). Key bytes are printable
+//! its default (no class, no instance limit, no interrupt, no DMA, no DMA
+//! address width of the device's own, no physical access, no reset, the
+//! auxiliary tier). Key bytes are printable
 //! ASCII without a space; a class name is lowercase ASCII letters, digits,
 //! `-`, and `_`. A descriptor that breaks any of this is rejected whole
 //! ([`DeclError`]).
@@ -60,6 +62,11 @@ pub const MAX_PLATFORM_KEY_BYTES: usize = 32;
 pub const MAX_IOMMU_FAMILY_BYTES: usize = 8;
 /// Most message-signaled vectors a declaration requests.
 pub const MAX_MSI_VECTORS: u8 = 64;
+/// Narrowest DMA address width a declaration states: below it a device
+/// cannot address one page.
+pub const MIN_DMA_WIDTH_BITS: u8 = 12;
+/// Widest DMA address width a declaration states.
+pub const MAX_DMA_WIDTH_BITS: u8 = 64;
 
 /// Bytes of the descriptor header: version and reserved word.
 const HEADER_BYTES: usize = 4;
@@ -83,6 +90,7 @@ mod kind
     pub const PHYS_ACCESS: u8 = 0x23;
     pub const RESET: u8 = 0x24;
     pub const TIER: u8 = 0x25;
+    pub const DMA_WIDTH: u8 = 0x26;
 }
 
 // ── Bounded text ────────────────────────────────────────────────────────────
@@ -366,6 +374,11 @@ pub struct Declaration<'a>
     pub interrupt: Interrupt,
     /// Whether the device performs DMA.
     pub dma: bool,
+    /// The address bits the device's DMA reaches, [`MIN_DMA_WIDTH_BITS`] to
+    /// [`MAX_DMA_WIDTH_BITS`], for a device that cannot address all its
+    /// IOMMU unit translates; `None` for no limit of its own. Only with
+    /// [`dma`](Self::dma).
+    pub dma_width: Option<u8>,
     /// Whether the driver programs hardware with physical addresses.
     pub phys_access: bool,
     pub reset: Reset,
@@ -407,6 +420,9 @@ pub struct DriverDecl
     pub instance_limit: Option<u16>,
     pub interrupt: Interrupt,
     pub dma: bool,
+    /// The address bits the device's DMA reaches; `None` for no limit of
+    /// its own. `Some` only with [`dma`](Self::dma).
+    pub dma_width: Option<u8>,
     pub phys_access: bool,
     pub reset: Reset,
     pub tier: Tier,
@@ -521,6 +537,7 @@ impl Builder
                 instance_limit: None,
                 interrupt: Interrupt::NONE,
                 dma: false,
+                dma_width: None,
                 phys_access: false,
                 reset: Reset::None,
                 tier: Tier::Auxiliary,
@@ -583,6 +600,11 @@ impl Builder
                 d.interrupt = Interrupt { need, msi_vectors };
             }
             (kind::DMA, []) => d.dma = true,
+            (kind::DMA_WIDTH, &[bits])
+                if (MIN_DMA_WIDTH_BITS..=MAX_DMA_WIDTH_BITS).contains(&bits) =>
+            {
+                d.dma_width = Some(bits);
+            }
             (kind::PHYS_ACCESS, []) => d.phys_access = true,
             (kind::RESET, &[1]) => d.reset = Reset::VirtioStatus,
             (kind::RESET, &[2]) => d.reset = Reset::PcieFlr,
@@ -603,6 +625,10 @@ impl Builder
         {
             return Err(DeclError::NoMatch);
         }
+        if self.decl.dma_width.is_some() && !self.decl.dma
+        {
+            return Err(DeclError::BadField(kind::DMA_WIDTH));
+        }
         Ok(self.decl)
     }
 }
@@ -621,6 +647,7 @@ fn singleton_bit(kind: u8) -> Option<u32>
         kind::PHYS_ACCESS => 5,
         kind::RESET => 6,
         kind::TIER => 7,
+        kind::DMA_WIDTH => 8,
         _ => return None,
     };
     Some(1 << index)
@@ -713,7 +740,8 @@ impl EncodedDesc
 /// When `decl` breaks a bound of the format (the module documentation): an
 /// invalid name, class, or key, no or too many match entries, an instance
 /// limit of 0, a vector count past [`MAX_MSI_VECTORS`] or with no interrupt
-/// need, or more than [`MAX_DESC_BYTES`] encoded. In a `const` context the
+/// need, a DMA address width outside its bound or without DMA, or more than
+/// [`MAX_DESC_BYTES`] encoded. In a `const` context the
 /// panic is a compile error.
 #[must_use]
 pub const fn encode(decl: &Declaration<'_>) -> EncodedDesc
@@ -779,6 +807,14 @@ pub const fn encode(decl: &Declaration<'_>) -> EncodedDesc
     if decl.dma
     {
         w.field(kind::DMA, &[]);
+    }
+    if let Some(bits) = decl.dma_width
+    {
+        assert!(
+            decl.dma && bits >= MIN_DMA_WIDTH_BITS && bits <= MAX_DMA_WIDTH_BITS,
+            "driver declaration: a DMA address width outside its bound or without DMA"
+        );
+        w.field(kind::DMA_WIDTH, &[bits]);
     }
     if decl.phys_access
     {
@@ -906,6 +942,7 @@ mod tests
             msi_vectors: 4,
         },
         dma: true,
+        dma_width: Some(28),
         phys_access: true,
         reset: Reset::PcieFlr,
         tier: Tier::Boot,
@@ -918,6 +955,7 @@ mod tests
         instance_limit: None,
         interrupt: Interrupt::NONE,
         dma: false,
+        dma_width: None,
         phys_access: false,
         reset: Reset::None,
         tier: Tier::Auxiliary,
@@ -993,6 +1031,7 @@ mod tests
             }
         );
         assert!(d.dma && d.phys_access);
+        assert_eq!(d.dma_width, Some(28));
         assert_eq!(d.reset, Reset::PcieFlr);
         assert_eq!(d.tier, Tier::Boot);
     }
@@ -1007,6 +1046,7 @@ mod tests
         assert_eq!(d.instance_limit, None);
         assert_eq!(d.interrupt, Interrupt::NONE);
         assert!(!d.dma && !d.phys_access);
+        assert_eq!(d.dma_width, None);
         assert_eq!(d.reset, Reset::None);
         assert_eq!(d.tier, Tier::Auxiliary);
     }
@@ -1091,6 +1131,11 @@ mod tests
             (kind::RESET, &[0]),
             (kind::RESET, &[3]),
             (kind::TIER, &[2]),
+            (kind::DMA_WIDTH, &[]),
+            (kind::DMA_WIDTH, &[0]),
+            (kind::DMA_WIDTH, &[MIN_DMA_WIDTH_BITS - 1]),
+            (kind::DMA_WIDTH, &[MAX_DMA_WIDTH_BITS + 1]),
+            (kind::DMA_WIDTH, &[32, 0]),
             (kind::PCI_ID, &[1, 2, 3]),
             (kind::PCI_CLASS, &[1, 2, 3, 4, 5]),
             (kind::ACPI_HID, b"PNP 0501"),
@@ -1112,6 +1157,50 @@ mod tests
             decode(&with_fields(&[(kind::NAME, &long), (kind::SPCR, &[1])])),
             Err(DeclError::BadField(kind::NAME))
         );
+    }
+
+    #[test]
+    fn a_dma_address_width_is_bounded_and_needs_dma()
+    {
+        for bits in [MIN_DMA_WIDTH_BITS, 28, MAX_DMA_WIDTH_BITS]
+        {
+            let d = decode(&named(&[(kind::DMA, &[]), (kind::DMA_WIDTH, &[bits])]))
+                .expect("a width within its bound decodes");
+            assert_eq!(d.dma_width, Some(bits));
+        }
+        assert_eq!(
+            decode(&named(&[(kind::DMA_WIDTH, &[32])])),
+            Err(DeclError::BadField(kind::DMA_WIDTH))
+        );
+        assert_eq!(
+            decode(&named(&[
+                (kind::DMA, &[]),
+                (kind::DMA_WIDTH, &[32]),
+                (kind::DMA_WIDTH, &[32])
+            ])),
+            Err(DeclError::Duplicate(kind::DMA_WIDTH))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "DMA address width")]
+    fn the_encoder_refuses_a_dma_width_without_dma()
+    {
+        let _ = encode(&Declaration {
+            dma_width: Some(32),
+            ..MINIMAL
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "DMA address width")]
+    fn the_encoder_refuses_a_dma_width_past_its_bound()
+    {
+        let _ = encode(&Declaration {
+            dma: true,
+            dma_width: Some(MIN_DMA_WIDTH_BITS - 1),
+            ..MINIMAL
+        });
     }
 
     #[test]

@@ -24,7 +24,7 @@
 //! hygiene: a cap a request carries that the driver does not keep is
 //! deleted, not left in the driver's `CSpace`, and an accepted serial RX
 //! registration deletes the notification it replaces. It takes granted SENDs
-//! from `devmgr.registry`. Under a staged terminal its input case skips, as
+//! through the `devmgr.class.serial` and `devmgr.class.input` class SENDs. Under a staged terminal its input case skips, as
 //! the deny phase's does, and so do its serial cases that read the UART or
 //! rebind its interrupt, which would take the terminal's input.
 
@@ -69,15 +69,16 @@ fn terminal_staged() -> bool
     std::fs::metadata(TERMINAL_RECIPE).is_ok()
 }
 
-/// A no-authority SEND on the driver `query_label` names, from devmgr's
+/// A no-authority SEND on the first driver of class `class`, from devmgr's
 /// `TEST_QUERY_DENY_DEVICE`, or `None` when devmgr still reports
 /// `NO_DEVICE` after `attempts` tries.
-fn deny_send(devmgr_test: u64, query_label: u64, name: &str, attempts: u32) -> Option<u64>
+fn deny_send(devmgr_test: u64, class: &[u8], name: &str, attempts: u32) -> Option<u64>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let req = ipc::IpcMessage::builder(ipc::devmgr_labels::TEST_QUERY_DENY_DEVICE)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .word(1, query_label)
+        .word(1, class.len() as u64)
+        .bytes(2, class)
         .build();
     for _ in 0..attempts
     {
@@ -122,8 +123,7 @@ fn verb_bit_deny_phase(caps: &Caps)
     let devmgr = caps.devmgr_test;
     assert!(devmgr != 0, "drivers deny: no devmgr.test cap seeded");
 
-    let serial = deny_send(devmgr, ipc::devmgr_labels::QUERY_SERIAL_DEVICE, "serial", 1)
-        .expect("drivers deny: no serial driver");
+    let serial = deny_send(devmgr, b"serial", "serial", 1).expect("drivers deny: no serial driver");
     let unauth = ipc::serial_errors::UNAUTHORIZED;
     // A one-byte write; a granted write would emit it on the console.
     let write = ipc::IpcMessage::builder(ipc::serial_labels::SERIAL_WRITE_BYTES | (1 << 16))
@@ -142,13 +142,8 @@ fn verb_bit_deny_phase(caps: &Caps)
     }
     else
     {
-        let input = deny_send(
-            devmgr,
-            ipc::devmgr_labels::QUERY_INPUT_DEVICE,
-            "input",
-            INPUT_ATTEMPTS,
-        )
-        .expect("drivers deny: no input driver");
+        let input = deny_send(devmgr, b"input", "input", INPUT_ATTEMPTS)
+            .expect("drivers deny: no input driver");
         // A granted read blocks until a key arrives; the deny must not.
         let read = ipc::IpcMessage::new(ipc::input_labels::INPUT_READ_EVENTS);
         assert_denied(
@@ -160,12 +155,7 @@ fn verb_bit_deny_phase(caps: &Caps)
         let _ = syscall::cap_delete(input);
     }
 
-    let Some(fb) = deny_send(
-        devmgr,
-        ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE,
-        "fb",
-        1,
-    )
+    let Some(fb) = deny_send(devmgr, b"framebuffer", "fb", 1)
     else
     {
         std::os::seraph::log!("drivers deny: framebuffer case skipped: no framebuffer driver");
@@ -271,32 +261,24 @@ const INPUT_CASE: StrayCapCase = StrayCapCase {
     what: "input unknown label",
 };
 
-/// A granted SEND on the driver `query_label` names, from `devmgr.registry`,
-/// or `None` when devmgr still reports `NO_DEVICE` after `attempts` tries.
-fn granted_send(devmgr: u64, query_label: u64, name: &str, attempts: u32) -> Option<u64>
+/// A granted SEND on the first driver of the class whose class SEND is
+/// `class_send` (`QUERY_DEVICE` at ordinal 0), or `None` when devmgr still
+/// reports `NO_DEVICE` after `attempts` tries.
+fn granted_send(class_send: u64, name: &str, attempts: u32) -> Option<u64>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    let req = ipc::IpcMessage::builder(query_label)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .build();
     for _ in 0..attempts
     {
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call(devmgr, &req, ipc_buf) }
-            .unwrap_or_else(|_| panic!("{name} device query ipc_call failed"));
-        if reply.label == ipc::devmgr_errors::NO_DEVICE
+        match unsafe { ipc::query_device(class_send, 0, ipc_buf) }
         {
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
+            Ok(cap) => return Some(cap),
+            Err(ipc::ClassCallError::Refused(ipc::devmgr_errors::NO_DEVICE)) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{name} QUERY_DEVICE failed: {e:?}"),
         }
-        assert_eq!(
-            reply.label,
-            ipc::devmgr_errors::SUCCESS,
-            "{name} device query status"
-        );
-        let cap = reply.caps().first().copied().unwrap_or(0);
-        assert!(cap != 0, "{name} device query carried no cap");
-        return Some(cap);
     }
     None
 }
@@ -376,15 +358,14 @@ fn flood(driver: u64, case: &StrayCapCase)
 
 fn stray_cap_flood_phase(caps: &Caps)
 {
-    let devmgr = caps.devmgr_registry;
     assert!(
-        devmgr != 0,
-        "drivers stray caps: no devmgr.registry cap seeded"
+        caps.serial_class != 0 && caps.input_class != 0,
+        "drivers stray caps: no devmgr.class.serial or devmgr.class.input cap seeded"
     );
     let staged = terminal_staged();
 
-    let serial = granted_send(devmgr, ipc::devmgr_labels::QUERY_SERIAL_DEVICE, "serial", 1)
-        .expect("drivers stray caps: no serial driver");
+    let serial =
+        granted_send(caps.serial_class, "serial", 1).expect("drivers stray caps: no serial driver");
     for case in &SERIAL_CASES
     {
         if staged && case.uart
@@ -406,13 +387,8 @@ fn stray_cap_flood_phase(caps: &Caps)
         );
         return;
     }
-    let input = granted_send(
-        devmgr,
-        ipc::devmgr_labels::QUERY_INPUT_DEVICE,
-        "input",
-        INPUT_ATTEMPTS,
-    )
-    .expect("drivers stray caps: no input driver");
+    let input = granted_send(caps.input_class, "input", INPUT_ATTEMPTS)
+        .expect("drivers stray caps: no input driver");
     flood(input, &INPUT_CASE);
     let _ = syscall::cap_delete(input);
 }

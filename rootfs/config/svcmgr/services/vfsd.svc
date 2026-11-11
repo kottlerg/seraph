@@ -2,7 +2,7 @@
 #
 # Init spawns vfsd in Phase 1 via procmgr CREATE_PROCESS with the
 # vfsd module + INGEST_AUTHORITY / SEED_AUTHORITY tokened caps and
-# a SEND on devmgr's registry for QUERY_BLOCK_DEVICE. Those caps
+# the block class SEND init requests from devmgr. Those caps
 # cannot be re-minted by svcmgr today, so `restart = never`. vfsd
 # being dead means the namespace surface is gone (every absolute
 # `std::fs` op fails); `critical = yes` triggers graceful shutdown.

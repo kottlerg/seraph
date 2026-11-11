@@ -1,0 +1,12 @@
+# block: whole-disk block drivers (virtio-blk, nvme).
+#
+# A QUERY_DEVICE reply through the class SEND carries
+# blk_labels::MOUNT_AUTHORITY (bit 63), which gates REGISTER_PARTITION.
+# init requests vfsd's block class SEND itself; svcmgr publishes this one
+# seed-only as `devmgr.class.block` for a service that seeds it.
+#
+# `boot_only = yes`: a block driver comes from the boot bundle only, so a
+# drivers-directory declaration of this class is refused; the root
+# filesystem the drivers directory is read from sits on a block driver.
+verbs     = 63
+boot_only = yes

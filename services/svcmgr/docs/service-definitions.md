@@ -253,7 +253,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
 | `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| TEST_LABEL_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
-| `devmgr.debug` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| DEBUG_PORT_AUTHORITY`-badged SEND on devmgr's registry endpoint: the debug port (seeded only by the debug-port fixture `debug-echo`, staged by `test-debug-port`, and the GDB stub `gdbstub`, staged by `--debug-target` of `run` and `run-parallel`, and by `test-gdb`) | no |
+| `devmgr.class.<class>` | svcmgr (a `MINT_CLASS_SEND` reply, one per class file) | class SEND on devmgr's registry endpoint: the badge names the class's slot and the class file's verbs ([Device class files](service-definitions.md#device-class-files)) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
@@ -295,8 +295,9 @@ A log-sink service's bootstrap round is **not** assembled from `seed` or
 `provides`. svcmgr mints it from the reserved log-sink sources init endows
 at handover (the master-log endpoint source and the procmgr `SEND|GRANT`
 death-auth source — see
-[`process-lifecycle.md`](../../../docs/process-lifecycle.md)) plus the
-`devmgr.registry` source. The round has four positional slots, carried with a presence word as
+[`process-lifecycle.md`](../../../docs/process-lifecycle.md)) and from
+its `devmgr.class.serial` and `devmgr.class.framebuffer` publications. The round has five
+positional slots, carried with a presence word as
 [`seed`](#seed) describes, so an absent slot rides as no cap:
 
 | Index | Cap |
@@ -304,14 +305,16 @@ death-auth source — see
 | 0 | `RECV` on the master log endpoint |
 | 1 | `SEND` on the master log endpoint (single-use; the `HANDOVER_PULL` drain then the terminal `HANDOVER_RELEASE`, then deleted; see the [logd handover protocol](../../logd/docs/handover-protocol.md#call-shape)). Absent on a restart — no init-logd remains to pull from |
 | 2 | badged `SEND\|GRANT` on procmgr carrying `DEATH_EQ_AUTHORITY` (logd registers per-sender death-notifications for slot reclaim; see [logd README](../../logd/README.md#bootstrap-caps)) |
-| 3 | badged `SEND` on devmgr's registry carrying `REGISTRY_QUERY_AUTHORITY` (logd resolves the serial driver via `QUERY_SERIAL_DEVICE`; see [logd README](../../logd/README.md#bootstrap-caps)) |
+| 3 | the `serial` class SEND, derived from the `devmgr.class.serial` publication (logd resolves the serial driver via `QUERY_DEVICE`; see [logd README](../../logd/README.md#bootstrap-caps)) |
+| 4 | the `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (logd resolves the framebuffer driver via `QUERY_DEVICE`) |
 
 Because these slots are svcmgr-minted, `seed` and `provides` have no
 position in the round; declaring either alongside `log_sink = yes` is a
 parser error. The same svcmgr-minted round drives the first launch (`cap[1]`
 present, history pulled from init-logd per the
 [logd handover protocol](../../logd/docs/handover-protocol.md)). A slot whose source is absent
-from the endowment, or whose derive fails, is absent from the round; logd requires only `cap[0]`.
+from the endowment or not published (slots 3 and 4 when no class file configured the class), or
+whose derive fails, is absent from the round; logd requires only `cap[0]`.
 svcmgr holds the master-log source for the system's life, so the round is designed to also
 drive every restart (`cap[1]` absent, history pull skipped), each relaunched logd
 re-attaching a fresh RECV to the same endpoint object every sender already
@@ -396,6 +399,39 @@ critical        = no
 namespace       = none
 debug_authority = yes
 ```
+
+## Device class files
+
+devmgr's device classes are configured from class files, not from source. svcmgr reads every
+`/config/devmgr/classes/<class>.class` file, shipped from `rootfs/config/devmgr/classes/`, before
+it sends `SET_DRIVERS_DIR`. For each file it sends devmgr `devmgr_labels::MINT_CLASS_SEND`, on a
+`CLASS_AUTHORITY`-badged derivation of its endowed badge-0 devmgr-registry source, and publishes
+the class SEND devmgr replies with seed-only as `devmgr.class.<class>`
+(`ipc::published_names::DEVMGR_CLASS_PREFIX`). A service reaches a class only when its `seed`
+line names that publication. A file that cannot be read or parsed, or whose class devmgr refuses,
+is logged and skipped.
+
+The grammar is the `.svc` grammar: line-oriented `key = value`, `#` comments, an unknown or
+repeated key an error. The class name is the file name without `.class`: 1 to
+`ipc::devmgr_labels::MAX_CLASS_NAME_BYTES` (32) bytes of `[a-z0-9_-]`. The keys:
+
+| Key | Required | Value |
+|---|---|---|
+| `verbs` | yes | Space-separated bit positions, each in `ipc::VERB_BIT_MASK` (58 to 63), none repeated: the verb bits a `QUERY_DEVICE` reply through the class SEND carries |
+| `boot_only` | no | `yes` or `no` (default `no`): the class's drivers come from the boot bundle only, and devmgr refuses a drivers-directory declaration of the class |
+
+The shipped classes:
+
+| Class | `verbs` | `boot_only` |
+|---|---|---|
+| `block` | 63 (`blk_labels::MOUNT_AUTHORITY`) | `yes` |
+| `serial` | 63 62 (serial `WRITE`, `READ`) | `no` |
+| `framebuffer` | 63 (framebuffer `WRITE`) | `no` |
+| `rtc` | 63 (rtc `READ`) | `no` |
+| `input` | 63 (input `READ`) | `no` |
+| `debug-port` | 63 62 (serial `WRITE`, `READ`) | `no` |
+
+init requests the `block` class SEND itself, for vfsd's root mount.
 
 ## Reconciliation
 

@@ -3,22 +3,25 @@
 
 // services/svctest/src/phases/devmgr.rs
 
-//! devmgr surface — the `QUERY_BLOCK_DEVICE`, `QUERY_SHUTDOWN_DEVICE`,
-//! `QUERY_DEBUG_PORT_DEVICE`, and test-label authority gates, the instance
-//! ordinal of `QUERY_INPUT_DEVICE`, and driver-spawn orphan teardown (#176).
+//! devmgr surface — the class, `QUERY_SHUTDOWN_DEVICE`, and test-label
+//! authority gates, the instance ordinal of `QUERY_DEVICE`, and driver-spawn
+//! orphan teardown (#176).
 //!
 //! The deny phases send the gated labels on `devmgr.registry`, a cap
-//! carrying `REGISTRY_QUERY_AUTHORITY` but none of `BLOCK_DEVICE_AUTHORITY`,
-//! `SHUTDOWN_DEVICE_AUTHORITY`, `DEBUG_PORT_AUTHORITY`, and
-//! `TEST_LABEL_AUTHORITY`, and assert `UNAUTHORIZED`: such a holder cannot
-//! acquire the whole-disk block cap, the platform shutdown actuators, or the
-//! debug port, or drive devmgr's test labels (the `TEST_SPAWN_ORPHAN` shim
-//! and `TEST_QUERY_DENY_DEVICE`). The debug-port gate is checked before any
-//! device lookup, so it holds on a boot with no debug port too.
+//! carrying `REGISTRY_QUERY_AUTHORITY` but none of `CLASS_AUTHORITY`,
+//! `SHUTDOWN_DEVICE_AUTHORITY`, and `TEST_LABEL_AUTHORITY` and no class
+//! slot, and assert `UNAUTHORIZED`: such a holder cannot reach any class's
+//! drivers (the whole-disk block cap and the debug port among them), mint a
+//! class SEND, acquire the platform shutdown actuators, or drive devmgr's
+//! test labels (the `TEST_SPAWN_ORPHAN` shim and `TEST_QUERY_DENY_DEVICE`).
+//! The class gates are also checked on `devmgr.test`, whose badge carries
+//! `TEST_LABEL_AUTHORITY` and no class slot. They are checked before any
+//! device lookup, so they hold on a boot with no driver of a class too.
 //!
-//! The ordinal phase asks `devmgr.registry` for the input driver at ordinal 0,
-//! absent and explicit, and past the one keyboard every boot's device set
-//! carries, and asserts a cap for the first and `NO_DEVICE` for the second.
+//! The ordinal phase asks the `input` class (`devmgr.class.input`) for the
+//! input driver at ordinal 0, absent and explicit, and past the one keyboard
+//! every boot's device set carries, and asserts a cap for the first and
+//! `NO_DEVICE` for the second.
 //!
 //! The teardown phase drives devmgr's temporary `TEST_SPAWN_ORPHAN` shim to
 //! force a round-2 bootstrap failure in a fault-injection driver that hangs
@@ -63,16 +66,12 @@ pub fn phases() -> &'static [Phase]
 {
     &[
         Phase {
-            name: "devmgr_block_device_deny",
-            run: block_device_deny_phase,
+            name: "devmgr_class_deny",
+            run: class_deny_phase,
         },
         Phase {
             name: "devmgr_shutdown_device_deny",
             run: shutdown_device_deny_phase,
-        },
-        Phase {
-            name: "devmgr_debug_port_device_deny",
-            run: debug_port_device_deny_phase,
         },
         Phase {
             name: "devmgr_input_instance_ordinal",
@@ -114,7 +113,14 @@ fn assert_registry_denies(caps: &Caps, label: u64, label_name: &str, bit_name: &
         devmgr != 0,
         "{label_name} deny: no devmgr.registry cap seeded"
     );
+    assert_denies(devmgr, label, label_name, bit_name);
+}
 
+/// `label` sent on `devmgr`, a SEND on devmgr's registry endpoint whose
+/// badge lacks what the label needs (`bit_name`), replies `UNAUTHORIZED` and
+/// carries no cap.
+fn assert_denies(devmgr: u64, label: u64, label_name: &str, bit_name: &str)
+{
     let ipc_buf = std::os::seraph::current_ipc_buf();
 
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
@@ -131,14 +137,34 @@ fn assert_registry_denies(caps: &Caps, label: u64, label_name: &str, bit_name: &
     );
 }
 
-fn block_device_deny_phase(caps: &Caps)
+/// `QUERY_DEVICE` and `MINT_CLASS_SEND` on `devmgr.registry` and on
+/// `devmgr.test`, neither of whose badges carries a class slot or
+/// `CLASS_AUTHORITY`, reply `UNAUTHORIZED`.
+fn class_deny_phase(caps: &Caps)
 {
-    assert_registry_denies(
-        caps,
-        ipc::devmgr_labels::QUERY_BLOCK_DEVICE,
-        "QUERY_BLOCK_DEVICE",
-        "BLOCK_DEVICE_AUTHORITY",
+    assert!(
+        caps.devmgr_test != 0,
+        "class deny: no devmgr.test cap seeded"
     );
+    for (cap, shown) in [
+        (caps.devmgr_registry, "devmgr.registry"),
+        (caps.devmgr_test, "devmgr.test"),
+    ]
+    {
+        assert!(cap != 0, "class deny: no {shown} cap seeded");
+        assert_denies(
+            cap,
+            ipc::devmgr_labels::QUERY_DEVICE,
+            "QUERY_DEVICE",
+            "a class slot",
+        );
+        assert_denies(
+            cap,
+            ipc::devmgr_labels::MINT_CLASS_SEND,
+            "MINT_CLASS_SEND",
+            "CLASS_AUTHORITY",
+        );
+    }
 }
 
 fn shutdown_device_deny_phase(caps: &Caps)
@@ -151,21 +177,11 @@ fn shutdown_device_deny_phase(caps: &Caps)
     );
 }
 
-fn debug_port_device_deny_phase(caps: &Caps)
-{
-    assert_registry_denies(
-        caps,
-        ipc::devmgr_labels::QUERY_DEBUG_PORT_DEVICE,
-        "QUERY_DEBUG_PORT_DEVICE",
-        "DEBUG_PORT_AUTHORITY",
-    );
-}
-
-/// `QUERY_INPUT_DEVICE` on `devmgr.registry` selecting `ordinal` in
+/// `QUERY_DEVICE` on the `input` class SEND selecting `ordinal` in
 /// `data[1]`, or sending no `data[1]` for `None`.
-fn query_input(devmgr: u64, ordinal: Option<u64>) -> ipc::IpcMessage
+fn query_input(input_class: u64, ordinal: Option<u64>) -> ipc::IpcMessage
 {
-    let mut req = ipc::IpcMessage::builder(ipc::devmgr_labels::QUERY_INPUT_DEVICE)
+    let mut req = ipc::IpcMessage::builder(ipc::devmgr_labels::QUERY_DEVICE)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION));
     if let Some(o) = ordinal
     {
@@ -173,8 +189,8 @@ fn query_input(devmgr: u64, ordinal: Option<u64>) -> ipc::IpcMessage
     }
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    unsafe { ipc::ipc_call(devmgr, &req.build(), ipc_buf) }
-        .unwrap_or_else(|_| panic!("QUERY_INPUT_DEVICE ordinal {ordinal:?} ipc_call failed"))
+    unsafe { ipc::ipc_call(input_class, &req.build(), ipc_buf) }
+        .unwrap_or_else(|_| panic!("input QUERY_DEVICE ordinal {ordinal:?} ipc_call failed"))
 }
 
 /// `reply` is a `SUCCESS` carrying one cap, which is released.
@@ -188,8 +204,11 @@ fn assert_granted(reply: &ipc::IpcMessage, what: &str)
 
 fn input_instance_ordinal_phase(caps: &Caps)
 {
-    let devmgr = caps.devmgr_registry;
-    assert!(devmgr != 0, "input ordinal: no devmgr.registry cap seeded");
+    let devmgr = caps.input_class;
+    assert!(
+        devmgr != 0,
+        "input ordinal: no devmgr.class.input cap seeded"
+    );
 
     let mut first = query_input(devmgr, None);
     for _ in 1..INPUT_ATTEMPTS
@@ -201,10 +220,10 @@ fn input_instance_ordinal_phase(caps: &Caps)
         std::thread::sleep(Duration::from_millis(10));
         first = query_input(devmgr, None);
     }
-    assert_granted(&first, "QUERY_INPUT_DEVICE without an ordinal");
+    assert_granted(&first, "input QUERY_DEVICE without an ordinal");
     assert_granted(
         &query_input(devmgr, Some(0)),
-        "QUERY_INPUT_DEVICE ordinal 0",
+        "input QUERY_DEVICE ordinal 0",
     );
     for ordinal in [1, u64::MAX]
     {
@@ -212,7 +231,7 @@ fn input_instance_ordinal_phase(caps: &Caps)
         assert_eq!(
             reply.label,
             ipc::devmgr_errors::NO_DEVICE,
-            "QUERY_INPUT_DEVICE ordinal {ordinal} past the one keyboard must reply NO_DEVICE"
+            "input QUERY_DEVICE ordinal {ordinal} past the one keyboard must reply NO_DEVICE"
         );
         assert!(
             reply.caps().is_empty(),

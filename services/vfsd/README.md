@@ -87,7 +87,7 @@ vfsd/
   See [`docs/namespace-composition.md`](docs/namespace-composition.md)
   and [`docs/storage.md`](../../docs/storage.md).
 - **GPT enumeration + mount discovery** — at startup, queries devmgr
-  for every block device (`QUERY_BLOCK_DEVICE` at instance ordinals 0,
+  for every block device (`QUERY_DEVICE` on the `block` class SEND at instance ordinals 0,
   1, …, passing a `WITHDRAWN` one, until another reply is not
   `SUCCESS`) and parses each disk's GPT partition table through one
   scratch memory cap reused across the reads (replaced from memmgr

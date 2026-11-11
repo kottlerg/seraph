@@ -13,7 +13,7 @@ the ELF note section `.note.seraph.driver` (ACPI `PNP0B00`) that no device recor
 matches yet, so devmgr starts it on its fixed path.
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities) owns
 the driver's service endpoint and mints client SEND caps on
-`devmgr_labels::QUERY_RTC_DEVICE`, each badged with
+`devmgr_labels::QUERY_DEVICE` on the `rtc` class SEND, each badged with
 `rtc_labels::READ_AUTHORITY`. The [`timed`](../../timed/README.md) service
 resolves the SEND once at startup to seed its wall-clock offset.
 
@@ -66,7 +66,7 @@ report, and withdraws it when the driver dies.
   re-reads the CMOS hardware on every request (no caching). Caller's
   badge must carry `rtc_labels::READ_AUTHORITY`
   ([devmgr](../../devmgr/docs/responsibilities.md#responsibilities) stamps it
-  on every SEND minted from `QUERY_RTC_DEVICE`); the driver replies
+  on every SEND minted from `QUERY_DEVICE` on the `rtc` class); the driver replies
   `rtc_errors::UNAUTHORIZED` otherwise. Reply label is a
   [`rtc_errors`](../../../shared/ipc/src/lib.rs) status code; on
   `SUCCESS`, `data[0]` is `u64` microseconds since the Unix epoch.
@@ -106,7 +106,7 @@ value, the year is interpreted as `2000 + yy`, which holds through the year
 | Document | Content |
 |---|---|
 | [docs/device-management.md](../../../docs/device-management.md) | Driver binary sources; devmgr spawn and RTC query flow |
-| [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md) | Per-driver capability carve and `QUERY_RTC_DEVICE` |
+| [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md) | Per-driver capability carve and `QUERY_DEVICE` |
 | [services/timed/README.md](../../timed/README.md) | The sole client of this driver |
 
 ---

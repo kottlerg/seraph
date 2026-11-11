@@ -57,7 +57,9 @@ pub struct VfsdCaps
 {
     pub procmgr_ep: u64,
     pub memmgr_ep: u64,
-    pub registry_ep: u64,
+    /// The `block` class SEND init requested from devmgr; `QUERY_DEVICE` on
+    /// it yields each disk's whole-disk cap.
+    pub block_class: u64,
     pub service_ep: u64,
     pub fatfs_module_cap: u64,
     pub self_aspace: u64,
@@ -72,7 +74,7 @@ pub struct VfsdCaps
 // init → vfsd bootstrap plan:
 //   Round 1 (2 caps, 0 data words):
 //     caps[0]: service endpoint (vfsd receives on this)
-//     caps[1]: devmgr registry endpoint
+//     caps[1]: the `block` class SEND on devmgr's registry endpoint
 //   Round 2 (1 cap, 0 data words):
 //     caps[0]: fatfs module memory cap
 //
@@ -100,7 +102,7 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
 
     Some(VfsdCaps {
         service_ep: round1.caps[0],
-        registry_ep: round1.caps[1],
+        block_class: round1.caps[1],
         procmgr_ep: info.procmgr_endpoint,
         memmgr_ep: info.memmgr_endpoint,
         fatfs_module_cap: round2.caps[0],
@@ -138,7 +140,7 @@ fn main() -> !
 
     std::os::seraph::log!("starting");
 
-    if caps.service_ep == 0 || caps.registry_ep == 0
+    if caps.service_ep == 0 || caps.block_class == 0
     {
         std::os::seraph::log!("missing required endpoints");
         idle_loop();
@@ -171,7 +173,7 @@ fn main() -> !
     // lookups on MOUNT consider the partitions of all of them.
     std::os::seraph::log!("querying devmgr for block devices");
     let disks = partition::discover_disks(
-        caps.registry_ep,
+        caps.block_class,
         caps.memmgr_ep,
         caps.self_aspace,
         ipc_buf,

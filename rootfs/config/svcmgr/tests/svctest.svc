@@ -16,6 +16,8 @@
 # svcmgr_second_seed_round phase fails the run if they do not arrive.
 # logd.query is the LOG_QUERY_AUTHORITY SEND on the master log endpoint the
 # logd_death_forward phase reads its dead child's retired slot through.
+# devmgr.class.serial and devmgr.class.input are the class SENDs the
+# drivers stray-cap phase and the devmgr ordinal phase query devices on.
 # svctest resolves the public pwrmgr.deny no-auth twin itself via
 # QUERY_ENDPOINT. debug_authority = yes delivers procmgr's
 # DEBUG_AUTHORITY SEND|GRANT in the slot after the seeds, and svctest,
@@ -42,5 +44,5 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount vfsd.deny logd.query
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input
 debug_authority = yes

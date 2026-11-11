@@ -186,10 +186,12 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show seven of the refused names are
-/// published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.debug`,
-/// which only the `debug-echo` fixture seeds, are published by the same loop
-/// as `devmgr.registry` and `devmgr.test`. A queryable seed-only name would
+/// cap. svctest's own non-zero seeds show nine of the refused names are
+/// published; `devmgr.shutdown`, which only pwrmgr seeds, is published by
+/// the same loop as `devmgr.registry` and `devmgr.test`, and the other
+/// `devmgr.class.*` names by the same class loop as `devmgr.class.serial` and
+/// `devmgr.class.input`, among them `devmgr.class.debug-port`, which only the
+/// `debug-echo` fixture and `gdbstub` seed. A queryable seed-only name would
 /// hand its authority to every process.
 fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
 {
@@ -201,6 +203,8 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.vfsd_mount, "vfsd.mount"),
         (caps.vfsd_deny, "vfsd.deny"),
         (caps.logd_query, "logd.query"),
+        (caps.serial_class, "devmgr.class.serial"),
+        (caps.input_class, "devmgr.class.input"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");
@@ -219,10 +223,15 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         ipc::published_names::DEVMGR_REGISTRY,
         ipc::published_names::DEVMGR_SHUTDOWN,
         ipc::published_names::DEVMGR_TEST,
-        ipc::published_names::DEVMGR_DEBUG,
         ipc::published_names::VFSD_MOUNT,
         ipc::published_names::VFSD_DENY,
         ipc::published_names::LOGD_QUERY,
+        b"devmgr.class.block",
+        b"devmgr.class.serial",
+        b"devmgr.class.framebuffer",
+        b"devmgr.class.rtc",
+        b"devmgr.class.input",
+        b"devmgr.class.debug-port",
     ]
     {
         let reply = query(name);

@@ -1,9 +1,9 @@
 # test-dma
 
-Test-only driver for QEMU's `edu` device (PCI `1234:11e8`), which xtask attaches to every
-launch, behind the IOMMU when one is attached. The driver carries a declaration (PCI
-`1234:11e8`, class `test-dma`, DMA, no reset, instance limit 1, auxiliary tier) in the ELF note
-section `.note.seraph.driver`, and devmgr binds it to the `edu` device in its drivers-directory
+Test-only driver for QEMU's `edu` device (PCI `1234:11e8`), which xtask attaches to every launch,
+behind the IOMMU when one is attached. The driver carries a declaration (PCI `1234:11e8`, class
+`test-dma`, DMA with a 28-bit address width, no reset, instance limit 1, auxiliary tier) in the ELF
+note section `.note.seraph.driver`, and devmgr binds it to the `edu` device in its drivers-directory
 pass at `SET_DRIVERS_DIR` (see [driver-binding.md](../../../docs/driver-binding.md)). devmgr gives
 the device its DMA grant, attaching it to its IOMMU domain where a remapping unit translates it,
 turns on its memory decode and bus mastering, and spawns this driver with the resource list of

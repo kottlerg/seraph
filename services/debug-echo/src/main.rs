@@ -15,7 +15,7 @@ use std::time::Duration;
 use gdb_rsp::command::Command;
 use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
 use gdb_rsp::{Error, PACKET_SIZE};
-use ipc::{IpcMessage, devmgr_errors, devmgr_labels, serial_errors, serial_labels};
+use ipc::{ClassCallError, IpcMessage, devmgr_errors, serial_errors, serial_labels};
 
 /// Logged once the fixture holds the debug port and waits for packets: the
 /// host test connects on seeing it. Kept in sync with
@@ -46,13 +46,13 @@ fn main()
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(registry) = bootstrap_seed(info.creator_endpoint, ipc_buf)
+    let Some(debug_port_class) = bootstrap_seed(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!("no devmgr.debug seed; exiting");
+        std::os::seraph::log!("no devmgr.class.debug-port seed; exiting");
         return;
     };
-    let Some(port) = query_debug_port(registry, ipc_buf)
+    let Some(port) = query_debug_port(debug_port_class, ipc_buf)
     else
     {
         std::os::seraph::log!("no debug port served; exiting");
@@ -63,7 +63,8 @@ fn main()
     serve(port, rx_notify, ipc_buf);
 }
 
-/// Pull the bootstrap round; slot 0 is the recipe's `seed = devmgr.debug`.
+/// Pull the bootstrap round; slot 0 is the recipe's
+/// `seed = devmgr.class.debug-port`.
 fn bootstrap_seed(creator_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     if creator_ep == 0
@@ -75,24 +76,25 @@ fn bootstrap_seed(creator_ep: u64, ipc_buf: *mut u64) -> Option<u64>
     (cap != 0).then_some(cap)
 }
 
-/// Ask devmgr for the debug port, waiting out its driver's on-disk spawn:
-/// devmgr replies `NO_DEVICE` until that batch settles.
-fn query_debug_port(registry: u64, ipc_buf: *mut u64) -> Option<u64>
+/// Ask devmgr for the debug port through `debug_port_class`, the
+/// `debug-port` class SEND (`QUERY_DEVICE` at ordinal 0), waiting out its
+/// driver's on-disk spawn: devmgr replies `NO_DEVICE` until that batch
+/// settles.
+fn query_debug_port(debug_port_class: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     for _ in 0..QUERY_ATTEMPTS
     {
-        let req = IpcMessage::builder(devmgr_labels::QUERY_DEBUG_PORT_DEVICE)
-            .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-            .build();
         // SAFETY: ipc_buf is the registered IPC buffer.
-        let reply = unsafe { ipc::ipc_call(registry, &req, ipc_buf) }.ok()?;
-        match (reply.label, reply.caps().first())
+        match unsafe { ipc::query_device(debug_port_class, 0, ipc_buf) }
         {
-            (devmgr_errors::SUCCESS, Some(&cap)) if cap != 0 => return Some(cap),
-            (devmgr_errors::NO_DEVICE, _) => std::thread::sleep(QUERY_INTERVAL),
-            (label, _) =>
+            Ok(cap) => return Some(cap),
+            Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE)) =>
             {
-                std::os::seraph::log!("QUERY_DEBUG_PORT_DEVICE refused (label={label:#x})");
+                std::thread::sleep(QUERY_INTERVAL);
+            }
+            Err(e) =>
+            {
+                std::os::seraph::log!("QUERY_DEVICE on the debug-port class refused ({e:?})");
                 return None;
             }
         }

@@ -29,7 +29,7 @@ use std::os::seraph::process::ArgvEnvCap;
 
 /// Outcome of [`handle_death`], routed by the caller (`dispatch_deaths`
 /// in `main.rs`) to either continue, log degradation, or initiate a
-/// graceful system shutdown via pwrmgr.
+/// graceful system shutdown through the shutdown actuator.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeathOutcome
 {
@@ -39,7 +39,7 @@ pub enum DeathOutcome
     Degraded,
     /// Service was `system_critical` and svcmgr cannot recover it
     /// (restart not attempted, budget exhausted, or restart failed).
-    /// Caller must initiate `pwrmgr_labels::SHUTDOWN`.
+    /// Caller must ask the shutdown actuator to power the system off.
     Unrecoverable,
 }
 
@@ -311,8 +311,8 @@ pub struct RestartCtx
 /// * `Degraded` — service is permanently down but `system_critical` is
 ///   false; the system continues without it.
 /// * `Unrecoverable` — `system_critical` service that restart cannot
-///   recover. Caller must initiate the graceful-shutdown path
-///   (`pwrmgr_labels::SHUTDOWN` via the `pwrmgr.shutdown` cap).
+///   recover. Caller must initiate the graceful-shutdown path (the
+///   shutdown request through the shutdown actuator's declared name).
 pub fn handle_death(
     svc: &mut ServiceEntry,
     exit_reason: u64,

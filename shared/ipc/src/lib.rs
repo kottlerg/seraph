@@ -3151,7 +3151,8 @@ pub mod stream_labels
     pub const LEVEL_SHIFT: u32 = 32;
     /// Mask of the level field, applied after [`LEVEL_SHIFT`].
     pub const LEVEL_MASK: u64 = 0x7;
-    /// No level given (std's raw-byte writers): read as [`LEVEL_INFO`].
+    /// No level given (a sender that sets none, such as init's own log
+    /// writer): read as [`LEVEL_INFO`].
     pub const LEVEL_UNSPECIFIED: u64 = 0;
     /// A failure: work was lost or the process cannot go on.
     pub const LEVEL_ERROR: u64 = 1;

@@ -139,7 +139,8 @@ impl VirtioPciStartupInfo
     /// window (see [`RegisterLayout`]).
     ///
     /// Returns `None` when a region is absent (zero length) or names a BAR
-    /// index outside 0-5. `VirtIO` 1.2 § 4.1.4 requires a modern PCI device
+    /// index outside 0-5, or when the common region is shorter than the
+    /// [`COMMON_CFG_LEN`] bytes of registers the transport addresses in it. `VirtIO` 1.2 § 4.1.4 requires a modern PCI device
     /// to present the common, notification, and ISR regions, and a device
     /// type with device-specific configuration (block and input both have
     /// one) to present that region too, each in a BAR of the device's
@@ -158,6 +159,7 @@ impl VirtioPciStartupInfo
         if regions
             .iter()
             .any(|r| r.length == 0 || r.bar >= PCI_BAR_COUNT)
+            || self.common_cfg.length < COMMON_CFG_LEN
         {
             return None;
         }
@@ -189,6 +191,7 @@ impl VirtioPciStartupInfo
             isr: 0,
             device: 0,
             notify_len: u64::from(self.notify_cfg.length),
+            device_len: u64::from(self.device_cfg.length),
             notify_off_multiplier: self.notify_off_multiplier,
         };
         layout.common = layout.region_offset(&self.common_cfg);
@@ -245,6 +248,9 @@ pub struct RegisterLayout
     /// Length in bytes of the notification region; every queue's doorbell
     /// must lie inside it ([`pci::doorbell_fits`]).
     pub notify_len: u64,
+    /// Length in bytes of the device-specific configuration region; every
+    /// read of it must lie inside it ([`pci::config_fits`]).
+    pub device_len: u64,
     /// Multiplier for queue-specific notification offsets.
     pub notify_off_multiplier: u32,
 }
@@ -300,6 +306,14 @@ impl RegisterLayout
 /// DMA and drops a pending interrupt (§2.4).
 pub const COMMON_DEVICE_STATUS: u32 = 0x14;
 
+/// Bytes of the common configuration region the transport addresses: the
+/// registers from `device_feature_select` at 0 through `queue_device` at
+/// 0x30..0x38 (`VirtIO` 1.2 §4.1.4.3). A device whose common region is
+/// shorter presents no register layout
+/// ([`VirtioPciStartupInfo::register_layout`]), so no register access in it
+/// reaches past the region into the rest of the register window.
+pub const COMMON_CFG_LEN: u32 = 0x38;
+
 /// Where a reset writes a device's `device_status` byte: its PCI BAR index
 /// and the byte's offset in the BAR. A holder of that BAR's `Mmio` cap checks
 /// the offset against the span its cap covers before it writes.
@@ -315,16 +329,12 @@ impl VirtioPciStartupInfo
     /// The device-status byte's place ([`StatusRegister`]): in the common
     /// configuration region's BAR, at the region's offset plus
     /// [`COMMON_DEVICE_STATUS`]. `None` when the device presents no complete
-    /// register layout ([`Self::register_layout`]) or the region is too short
-    /// to hold the byte.
+    /// register layout ([`Self::register_layout`]), whose common region
+    /// always holds the byte ([`COMMON_CFG_LEN`]).
     #[must_use]
     pub fn status_register(&self) -> Option<StatusRegister>
     {
         self.register_layout()?;
-        if self.common_cfg.length <= COMMON_DEVICE_STATUS
-        {
-            return None;
-        }
         let bar = self.common_cfg.bar;
         Some(StatusRegister {
             bar,
@@ -480,6 +490,24 @@ mod tests
         // The doorbell bound is the notification region's own length, not
         // the span of the page its BAR maps.
         assert_eq!(layout.notify_len, 0x100);
+    }
+
+    #[test]
+    fn a_common_region_shorter_than_the_addressed_registers_has_no_layout()
+    {
+        // The queue_device pair ends at 0x38: one byte short, and its last
+        // register would reach past the region.
+        let mut regions = [
+            cap(0, 0, COMMON_CFG_LEN - 1),
+            cap(0, 0x1000, 0x1000),
+            cap(0, 0x2000, 4),
+            cap(0, 0x3000, 8),
+        ];
+        assert!(layout_of(regions).is_none());
+        regions[0].length = COMMON_CFG_LEN;
+        let layout = layout_of(regions).expect("every region long enough");
+        // The device region's own length bounds its reads.
+        assert_eq!(layout.device_len, 8);
     }
 
     #[test]

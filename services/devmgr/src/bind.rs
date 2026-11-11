@@ -870,8 +870,9 @@ fn carve_pci_device(
 {
     // A driver that declares the VirtIO status reset drives the VirtIO
     // register layout; a function that presents no complete layout (one of
-    // the four regions missing, VirtIO 1.2 § 4.1.4) could neither be set up
-    // by it nor reset when it is withdrawn.
+    // the four regions missing, VirtIO 1.2 § 4.1.4, or a common region too
+    // short for the registers the transport addresses) could neither be set
+    // up by it nor reset when it is withdrawn.
     if decl.reset == Reset::VirtioStatus && pci_dev.virtio_info.register_layout().is_none()
     {
         std::os::seraph::log!(

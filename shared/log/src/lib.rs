@@ -37,7 +37,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::{
     IpcMessage,
-    stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME},
+    stream_labels::{LEVEL_MASK, LEVEL_SHIFT, STREAM_BYTES, STREAM_REGISTER_NAME},
 };
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
@@ -78,19 +78,28 @@ pub fn ensure_badged_cap(_ipc_buf: *mut u64) -> u64
 
 // ── Wire-format primitives ──────────────────────────────────────────────────
 
-/// Send `bytes` as one or more `STREAM_BYTES` messages on `cap`. Splits
-/// across IPC calls when the payload exceeds [`CHUNK_SIZE`]; the receiver
-/// concatenates per-call bytes in order. Silently drops on a zero `cap`,
-/// null `ipc_buf`, empty `bytes`, or mid-chunk IPC failure.
+/// The `STREAM_BYTES` label of a chunk of `len` bytes at `level`, a
+/// `ipc::stream_labels::LEVEL_*` code (bits above the level field dropped).
+fn stream_label(len: usize, level: u64) -> u64
+{
+    STREAM_BYTES | ((len as u64 & 0xFFFF) << 16) | ((level & LEVEL_MASK) << LEVEL_SHIFT)
+}
+
+/// Send `bytes` at `level` (an `ipc::stream_labels::LEVEL_*` code) as one or
+/// more `STREAM_BYTES` messages on `cap`. Splits across IPC calls when the
+/// payload exceeds [`CHUNK_SIZE`]; the receiver concatenates per-call bytes
+/// in order, and a line takes the level of the chunk carrying its first byte.
+/// Silently drops on a zero `cap`, null `ipc_buf`, empty `bytes`, or
+/// mid-chunk IPC failure.
 ///
 /// # Safety
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
 /// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
 /// `ipc::ipc_call`).
-pub unsafe fn write_bytes(cap: u64, ipc_buf: *mut u64, bytes: &[u8])
+pub unsafe fn write_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8])
 {
     // SAFETY: the caller's contract covers `ipc_buf`.
-    let _ = unsafe { send_bytes(cap, ipc_buf, bytes) };
+    let _ = unsafe { send_bytes(cap, ipc_buf, level, bytes) };
 }
 
 /// [`write_bytes`], reporting whether every chunk was delivered: `false` on a
@@ -99,7 +108,7 @@ pub unsafe fn write_bytes(cap: u64, ipc_buf: *mut u64, bytes: &[u8])
 ///
 /// # Safety
 /// As for [`write_bytes`].
-unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, bytes: &[u8]) -> bool
+unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8]) -> bool
 {
     if cap == 0 || ipc_buf.is_null()
     {
@@ -109,8 +118,7 @@ unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, bytes: &[u8]) -> bool
     while offset < bytes.len()
     {
         let chunk_len = (bytes.len() - offset).min(CHUNK_SIZE);
-        let label = STREAM_BYTES | ((chunk_len as u64 & 0xFFFF) << 16);
-        let msg = IpcMessage::builder(label)
+        let msg = IpcMessage::builder(stream_label(chunk_len, level))
             .bytes(0, &bytes[offset..offset + chunk_len])
             .build();
         // SAFETY: ipc_buf is non-null (checked above), so the caller's
@@ -147,7 +155,8 @@ pub unsafe fn register_name(cap: u64, ipc_buf: *mut u64, name: &[u8])
     let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
 }
 
-/// Format `args` followed by a newline and emit it through [`write_bytes`],
+/// Format `args` followed by a newline and emit it at `level` through
+/// [`write_bytes`],
 /// staging the text in a [`CHUNK_SIZE`]-byte stack buffer that is sent each
 /// time it fills, so a message of any length is sent in full, newline
 /// included; a failed send drops the chunks after it, and the receiver may
@@ -158,10 +167,15 @@ pub unsafe fn register_name(cap: u64, ipc_buf: *mut u64, name: &[u8])
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
 /// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
 /// `ipc::ipc_call`).
-pub unsafe fn write_args(cap: u64, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
+pub unsafe fn write_args(
+    cap: u64,
+    ipc_buf: *mut u64,
+    level: u64,
+    args: core::fmt::Arguments<'_>,
+)
 {
     // SAFETY: the caller's contract covers `ipc_buf`.
-    let send = |chunk: &[u8]| unsafe { send_bytes(cap, ipc_buf, chunk) };
+    let send = |chunk: &[u8]| unsafe { send_bytes(cap, ipc_buf, level, chunk) };
     format_line(args, send);
 }
 
@@ -221,8 +235,9 @@ fn format_line(args: core::fmt::Arguments<'_>, send: impl FnMut(&[u8]) -> bool)
     }
 }
 
-/// One-shot emit: format `args` and send on the pre-installed badged
-/// SEND cap. Drops, in every build, when no cap is installed: a process
+/// One-shot emit: format `args` and send it at `level` (an
+/// `ipc::stream_labels::LEVEL_*` code) on the pre-installed badged SEND cap.
+/// Drops, in every build, when no cap is installed: a process
 /// spawned before the log endpoint existed, or one given no log cap, logs
 /// nowhere.
 ///
@@ -230,7 +245,7 @@ fn format_line(args: core::fmt::Arguments<'_>, send: impl FnMut(&[u8]) -> bool)
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
 /// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
 /// `ipc::ipc_call`).
-pub unsafe fn emit(ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
+pub unsafe fn emit(ipc_buf: *mut u64, level: u64, args: core::fmt::Arguments<'_>)
 {
     let cap = ensure_badged_cap(ipc_buf);
     if cap == 0
@@ -238,7 +253,7 @@ pub unsafe fn emit(ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
         return;
     }
     // SAFETY: the caller's contract covers `ipc_buf`.
-    unsafe { write_args(cap, ipc_buf, args) };
+    unsafe { write_args(cap, ipc_buf, level, args) };
 }
 
 #[cfg(test)]
@@ -281,6 +296,19 @@ mod tests
         let sent = chunks_of(format_args!("{exact}"), None);
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[1], b"\n");
+    }
+
+    #[test]
+    fn a_chunk_label_carries_its_length_and_level()
+    {
+        use ipc::stream_labels::{LEVEL_INFO, LEVEL_WARN, level_of};
+        let label = stream_label(CHUNK_SIZE, LEVEL_WARN);
+        assert_eq!(label & 0xFFFF, STREAM_BYTES);
+        assert_eq!((label >> 16) & 0xFFFF, CHUNK_SIZE as u64);
+        assert_eq!(level_of(label), LEVEL_WARN);
+        // A code wider than the level field cannot reach the bits above it.
+        assert_eq!(stream_label(1, u64::MAX) >> (LEVEL_SHIFT + 3), 0);
+        assert_eq!(level_of(stream_label(1, LEVEL_INFO)), LEVEL_INFO);
     }
 
     #[test]

@@ -3117,13 +3117,14 @@ pub mod keysym
 
 /// Wire-protocol version of [`stream_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const STREAM_LABELS_VERSION: u32 = 1;
-/// IPC labels for byte-stream endpoints (stdin/stdout/stderr backing).
+pub const STREAM_LABELS_VERSION: u32 = 2;
+/// IPC labels for the system log stream: the badged SEND cap on the master
+/// log endpoint each process holds (`ProcessInfo.log_send_cap`).
 ///
 /// One label, one direction, bytes inline. The producer issues
-/// `ipc_call(cap, label=STREAM_BYTES | (byte_len << 16), …)` per write
-/// (chunked at `MSG_DATA_WORDS_MAX * 8` per call). The receiver reads
-/// `byte_len.div_ceil(8)` data words from its IPC buffer and unpacks
+/// `ipc_call(cap, label=STREAM_BYTES | (byte_len << 16) | (level << 32), …)`
+/// per write (chunked at `MSG_DATA_WORDS_MAX * 8` per call). The receiver
+/// reads `byte_len.div_ceil(8)` data words from its IPC buffer and unpacks
 /// `byte_len` bytes. The receiver replies empty to unblock the writer.
 ///
 /// No multi-chunk reassembly framing on the wire — line buffering
@@ -3132,10 +3133,49 @@ pub const STREAM_LABELS_VERSION: u32 = 1;
 /// # Label encoding
 /// - Bits 0-15: label ID ([`STREAM_BYTES`])
 /// - Bits 16-31: byte length of the payload in this call (0..=512).
+/// - Bits 32-34 ([`LEVEL_SHIFT`], [`LEVEL_MASK`]): the log level of the
+///   bytes, a `LEVEL_*` code. A line takes the level of the message that
+///   carries its first byte (`services/logd/docs/ipc-interface.md`
+///   § `stream_labels::STREAM_BYTES`).
 pub mod stream_labels
 {
+    // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
+    // defines a function, imports the prelude the crate root imports.
+    #[cfg(feature = "rustc-dep-of-std")]
+    #[allow(unused_imports)]
+    use core::prelude::rust_2024::*;
+
     /// Base label ID for stream-bytes messages (bits 0-15).
     pub const STREAM_BYTES: u64 = 10;
+    /// Shift of the level field in a [`STREAM_BYTES`] label.
+    pub const LEVEL_SHIFT: u32 = 32;
+    /// Mask of the level field, applied after [`LEVEL_SHIFT`].
+    pub const LEVEL_MASK: u64 = 0x7;
+    /// No level given (std's raw-byte writers): read as [`LEVEL_INFO`].
+    pub const LEVEL_UNSPECIFIED: u64 = 0;
+    /// A failure: work was lost or the process cannot go on.
+    pub const LEVEL_ERROR: u64 = 1;
+    /// An unexpected condition the process handles.
+    pub const LEVEL_WARN: u64 = 2;
+    /// Normal operation: the level of a bare `seraph::log!`.
+    pub const LEVEL_INFO: u64 = 3;
+    /// Detail for diagnosing a component.
+    pub const LEVEL_DEBUG: u64 = 4;
+    /// Step-by-step detail.
+    pub const LEVEL_TRACE: u64 = 5;
+
+    /// The level a [`STREAM_BYTES`] label carries: [`LEVEL_ERROR`] to
+    /// [`LEVEL_TRACE`], with [`LEVEL_UNSPECIFIED`] and the unassigned codes
+    /// 6 and 7 read as [`LEVEL_INFO`].
+    #[must_use]
+    pub const fn level_of(label: u64) -> u64
+    {
+        match (label >> LEVEL_SHIFT) & LEVEL_MASK
+        {
+            code @ LEVEL_ERROR..=LEVEL_TRACE => code,
+            _ => LEVEL_INFO,
+        }
+    }
     /// Register (or update) the display name for the sender's log stream.
     ///
     /// Payload: name bytes via `.bytes(0, name)` with byte length in bits
@@ -3200,7 +3240,7 @@ pub mod log_badges
 
 /// Wire-protocol version of [`log_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const LOG_LABELS_VERSION: u32 = 2;
+pub const LOG_LABELS_VERSION: u32 = 3;
 /// IPC labels for the system log endpoint's legacy discovery interface
 /// and the one-shot init-logd → real-logd handover.
 ///
@@ -4086,6 +4126,27 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_stream_label_level_reads_back_and_an_absent_one_reads_as_info()
+    {
+        use stream_labels::{
+            LEVEL_ERROR, LEVEL_INFO, LEVEL_MASK, LEVEL_SHIFT, LEVEL_TRACE, LEVEL_WARN,
+            STREAM_BYTES, level_of,
+        };
+        let label = |level: u64| STREAM_BYTES | (40 << 16) | (level << LEVEL_SHIFT);
+        assert_eq!(level_of(label(LEVEL_WARN)), LEVEL_WARN);
+        assert_eq!(level_of(label(LEVEL_ERROR)), LEVEL_ERROR);
+        assert_eq!(level_of(label(LEVEL_TRACE)), LEVEL_TRACE);
+        // A sender that sets no level (the pre-level encoding) logs at info.
+        assert_eq!(level_of(STREAM_BYTES | (40 << 16)), LEVEL_INFO);
+        // The unassigned codes read as info too.
+        assert_eq!(level_of(label(6)), LEVEL_INFO);
+        assert_eq!(level_of(label(LEVEL_MASK)), LEVEL_INFO);
+        // The level field leaves the id and the length intact.
+        assert_eq!(label(LEVEL_TRACE) & 0xFFFF, STREAM_BYTES);
+        assert_eq!((label(LEVEL_TRACE) >> 16) & 0xFFFF, 40);
+    }
 
     #[test]
     fn a_process_list_page_round_trips_names_of_every_length()

@@ -98,7 +98,12 @@ unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTa
         match wire::decode(&reply)
         {
             Chunk::Slot { badge, name } => table.install_from_handover(badge, name),
-            Chunk::Line { badge, us, bytes } => table.install_history_line(badge, us, bytes),
+            Chunk::Line {
+                badge,
+                us,
+                level,
+                bytes,
+            } => table.install_history_line(badge, us, level, bytes),
             // The header is informational; an unknown kind is skipped.
             Chunk::Header | Chunk::Skip =>
             {}

@@ -14,6 +14,7 @@
 //! [handover-protocol.md](../../docs/handover-protocol.md).
 
 use ipc::IpcMessage;
+use ipc::stream_labels::{LEVEL_MASK, LEVEL_SHIFT, level_of};
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
 /// `HANDOVER_PULL` reply status: more chunks follow.
@@ -29,7 +30,8 @@ pub const KIND_HEADER: u64 = 1;
 pub const KIND_SLOT: u64 = 2;
 /// Chunk kind in `word(0)`: one history line (`word(1)` = badge, `word(2)` =
 /// receipt microseconds, `word(3)` = byte length, line bytes from word
-/// [`LINE_BYTES_WORD`]).
+/// [`LINE_BYTES_WORD`]; the line's level rides the reply label's level field,
+/// as on a `STREAM_BYTES` label).
 pub const KIND_LINE: u64 = 3;
 
 /// First data word of a `SLOT` chunk's inline name bytes.
@@ -68,13 +70,17 @@ pub enum Chunk<'a>
         /// Display name, clipped to the carried payload.
         name: &'a [u8],
     },
-    /// One history line: its sender badge, receipt microseconds, and bytes.
+    /// One history line: its sender badge, receipt microseconds, level, and
+    /// bytes.
     Line
     {
         /// Sender badge at receipt time.
         badge: u64,
         /// Receipt time in microseconds since boot.
         us: u64,
+        /// The line's level, an `ipc::stream_labels::LEVEL_*` code
+        /// (`level_of` the reply label).
+        level: u64,
         /// Line bytes (no trailing `\n`), clipped to the carried payload.
         bytes: &'a [u8],
     },
@@ -109,6 +115,7 @@ pub fn decode(reply: &IpcMessage) -> Chunk<'_>
                 Chunk::Line {
                     badge: reply.word(1),
                     us: reply.word(2),
+                    level: level_of(reply.label),
                     bytes,
                 }
             })
@@ -144,14 +151,16 @@ pub fn encode_slot(badge: u64, name: &[u8]) -> IpcMessage
         .build()
 }
 
-/// Encode one `LINE` chunk. Line bytes past the message's payload area after
-/// [`LINE_BYTES_WORD`] are clipped, and the declared length is the clipped
-/// length.
+/// Encode one `LINE` chunk of a line at `level` (an
+/// `ipc::stream_labels::LEVEL_*` code). Line bytes past the message's payload
+/// area after [`LINE_BYTES_WORD`] are clipped, and the declared length is the
+/// clipped length.
 #[must_use]
-pub fn encode_line(badge: u64, us: u64, line: &[u8]) -> IpcMessage
+pub fn encode_line(badge: u64, us: u64, level: u64, line: &[u8]) -> IpcMessage
 {
     let line = clip_to_payload(line, LINE_BYTES_WORD);
-    IpcMessage::builder(with_length(REPLY_MORE, line.len()))
+    let label = with_length(REPLY_MORE, line.len()) | ((level & LEVEL_MASK) << LEVEL_SHIFT);
+    IpcMessage::builder(label)
         .word(0, KIND_LINE)
         .word(1, badge)
         .word(2, us)
@@ -337,6 +346,7 @@ impl<const N: usize> Default for NameResend<N>
 mod tests
 {
     use super::*;
+    use ipc::stream_labels::{LEVEL_INFO, LEVEL_WARN};
 
     /// A `SLOT` chunk whose declared length the test chooses freely, unlike
     /// [`encode_slot`]'s (a malformed or hostile peer).
@@ -379,13 +389,15 @@ mod tests
     #[test]
     fn line_chunk_round_trips_badge_timestamp_and_bytes()
     {
-        let reply = encode_line(9, 2_742_215, b"phase=start");
-        assert_eq!(reply.label >> 16, 11);
+        let reply = encode_line(9, 2_742_215, LEVEL_WARN, b"phase=start");
+        assert_eq!((reply.label >> 16) & 0xFFFF, 11);
+        assert!(!is_done(reply.label));
         assert_eq!(
             decode(&reply),
             Chunk::Line {
                 badge: 9,
                 us: 2_742_215,
+                level: LEVEL_WARN,
                 bytes: b"phase=start",
             }
         );
@@ -412,7 +424,7 @@ mod tests
     fn line_longer_than_the_payload_area_is_clipped_when_encoded()
     {
         let long = [b'x'; 600];
-        let reply = encode_line(1, 0, &long);
+        let reply = encode_line(1, 0, LEVEL_INFO, &long);
         let Chunk::Line { bytes, .. } = decode(&reply)
         else
         {
@@ -420,6 +432,18 @@ mod tests
         };
         assert_eq!(bytes.len(), (MSG_DATA_WORDS_MAX - LINE_BYTES_WORD) * 8);
         assert_eq!(reply.word(3), bytes.len() as u64);
+    }
+
+    #[test]
+    fn a_line_chunk_without_a_level_decodes_at_info()
+    {
+        let reply = malformed_line(1, 0, 2, b"ok");
+        let Chunk::Line { level, .. } = decode(&reply)
+        else
+        {
+            panic!("expected a line chunk");
+        };
+        assert_eq!(level, LEVEL_INFO);
     }
 
     #[test]

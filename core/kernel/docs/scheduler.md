@@ -484,20 +484,20 @@ idles. A thread queued behind a running thread that never blocks or yields to it
 strict priority) stays queued for as long as that thread runs. The threshold does not see
 one queued thread as an imbalance (a load of 2 with the linked idle thread), and
 `select_target_cpu` keeps a woken thread on its preferred CPU at that load. An idle CPU
-therefore pulls it within 2 + 2k idle ticks, where k counts the CPUs ahead of it in the
-cursor's order whose queued threads no pull can take: each costs at most one tick to record
-and one to find nothing on, and the cursor then passes it. The heaviest CPU, when its load is
-past the threshold with nothing pullable on it, costs no tick: its pull moves nothing, and the
-confirmation rule then decides the same tick over the other CPUs (below). Any other CPU past
-the threshold with nothing pullable on it is recorded and costs its two ticks like any pinned
-backlog. The rule stays bounded: only an idle CPU pulls below the threshold, and a pull
-leaves it busy, so two busy CPUs never trade threads (the steady state the threshold
-protects); a busy CPU with nothing queued but its idle thread draws no attempt; a backlog
-that clears between two idle ticks stays with the CPU whose caches hold it; and a backlog of
-pinned threads, which no pull can take, draws at most one try-lock attempt per idle CPU every
-two ticks while its load reads at or below the threshold (above it, one per idle CPU every
-tick, and two in a tick whose pull above the threshold moves nothing while a candidate is
-confirmed).
+therefore pulls it within 2 + 2k idle ticks, not counting a tick a contended try-lock
+defers, where k counts the CPUs ahead of it in the cursor's order whose queued threads no
+pull can take: each costs at most one tick to record and one to find nothing on, and the
+cursor then passes it. The heaviest CPU, when its load is past the threshold with nothing
+pullable on it, costs no tick: its pull moves nothing, and the confirmation rule then decides
+the same tick over the other CPUs (below). Any other CPU past the threshold with nothing
+pullable on it is recorded and costs its two ticks like any pinned backlog. The rule stays
+bounded: only an idle CPU pulls below the threshold, and a pull leaves it busy, so two busy
+CPUs never trade threads (the steady state the threshold protects); a busy CPU with nothing
+queued but its idle thread draws no attempt; a backlog that clears between two idle ticks
+stays with the CPU whose caches hold it; and a backlog of pinned threads, which no pull can
+take, draws at most one try-lock attempt per idle CPU every two ticks while its load reads at
+or below the threshold (above it, one per idle CPU every tick, and two in a tick whose pull
+above the threshold moves nothing while a candidate is confirmed).
 
 The loads that choose a pull are read without the CPUs' locks, and a CPU's `schedule()`
 raises its own load for a moment under its lock: it counts every requeue of the running
@@ -513,12 +513,16 @@ the victim's load exceeds the puller's by more than `LOAD_BALANCE_IMBALANCE_THRE
 CPU's pull from its confirmed candidate re-checks no load, since the locked pick of a queued
 unpinned thread is the backlog it confirmed. An idle CPU whose pull above the threshold
 moves nothing applies the confirmation rule in the same tick: it records or pulls its
-candidate as if the scan had seen no load past the threshold. When the re-check refused the
-pull, the load it read was a transient and that victim may hold the backlog its candidate
-confirmed, so the rule reads the same scan and candidate. When the victim had no thread a
-pull can take, or a try-lock was contended, the rule reads a second scan that leaves that
-victim out, and a candidate other than it. So neither a scan that keeps reading a transient
-nor a CPU whose pinned threads keep its load past the threshold hides a backlog.
+candidate as if the scan had seen no load past the threshold. When the victim had no thread a
+pull can take, the rule reads a second scan that leaves that victim out, and a candidate other
+than it. When the re-check refused the pull, the load it read was a transient, and a
+contended try-lock (the usual outcome of a read taken while the victim's `schedule()` holds
+its lock) says nothing of what the victim holds; in both cases the victim may hold a backlog
+of its own, so the rule reads the same scan and candidate. After a contended try-lock, a pull
+the rule would make from the victim itself waits for the next tick, which keeps the victim as
+the candidate, rather than try its lock a second time. So neither a scan that keeps reading a
+transient nor a CPU whose pinned threads keep its load past the threshold hides a backlog,
+beyond the ticks a contended try-lock defers (below).
 
 Migration goes through `pull_unpinned_ready(src_cpu, dst_cpu, rule)`, which shares the
 validate-then-move core `relocate_ready_thread` with `migrate_ready_thread`:
@@ -576,8 +580,8 @@ Hot-path cost per CPU per tick:
   load is non-zero up to the first with a queued thread, one Relaxed load each of its own
   candidate and cursor and one of the candidate's run-queue mask, and a Relaxed store of its
   own candidate (and of its cursor when a pull from the candidate found nothing pullable),
-  fields only this CPU writes. A pull above the threshold that finds nothing pullable, or a
-  contended try-lock, adds a second scan of the same cost.
+  fields only this CPU writes. A pull above the threshold that finds nothing pullable adds a
+  second scan of the same cost.
 - Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick
   after an idle one) and one of its own load, plus, with an empty queue, one Relaxed load
   per remote CPU, or, with queued threads, one Relaxed increment + one Relaxed load for the

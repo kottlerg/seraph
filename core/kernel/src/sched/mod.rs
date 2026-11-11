@@ -5057,10 +5057,11 @@ fn idle_scan(
 /// starts from.
 ///
 /// A pull above the threshold that moves nothing is followed in the same tick
-/// by the confirmation rule: over the same scan and candidate when the re-check
-/// refused it, so a transient load does not hide a confirmed backlog, and over
-/// a scan without its source otherwise, so a CPU whose load stays past the
-/// threshold with nothing pullable on it does not hide the backlog behind it.
+/// by the confirmation rule: over a scan and a candidate without its source
+/// when it found nothing pullable, so a CPU whose load stays past the threshold
+/// with nothing pullable on it does not hide the backlog behind it, and over
+/// the same scan and candidate when the re-check refused it or a lock was
+/// contended, so a transient load does not hide that CPU's own backlog.
 /// A pull from the confirmed candidate that finds nothing pullable moves the
 /// cursor past that CPU, so the next backlog recorded is another CPU's rather
 /// than the same pinned one again.
@@ -5097,21 +5098,31 @@ fn idle_pull_tick(
             };
         }
         // The load past the threshold yielded nothing this tick, so the
-        // confirmation rule decides. A re-check that refused the pull found a
-        // transient, and that CPU may still hold the backlog the candidate
-        // confirmed, so the rule reads the same scan and candidate. Nothing
-        // pullable, or a contended lock, leaves that CPU out of both.
-        step = if outcome == PullOutcome::RuleFailed
-        {
-            idle_pull_step(scan.without_heaviest(), candidate)
-        }
-        else
+        // confirmation rule decides. Nothing pullable leaves that CPU out of
+        // the scan and the candidate. A re-check that refused the pull found a
+        // transient, and a contended lock says nothing of what the CPU holds,
+        // so the rule reads the same scan and candidate there; after a
+        // contended lock, a pull from that CPU itself waits for the next tick
+        // rather than try the lock again.
+        step = if outcome == PullOutcome::NothingPullable
         {
             let rest = idle_scan(view, this_cpu, cpu_count, cursor, Some(src));
             idle_pull_step(
                 rest.without_heaviest(),
                 candidate.filter(|&(cpu, _)| cpu != src),
             )
+        }
+        else
+        {
+            match idle_pull_step(scan.without_heaviest(), candidate)
+            {
+                IdlePullStep::Pull(cpu, PullRule::Backlog)
+                    if cpu == src && outcome == PullOutcome::Deferred =>
+                {
+                    IdlePullStep::Remember(cpu)
+                }
+                other => other,
+            }
         };
     }
 
@@ -7365,6 +7376,9 @@ mod idle_pull_tests
         /// settled load, which the pull re-checks, does not: the transient
         /// `schedule()` raises by counting a requeue before its dequeue.
         raised: Option<usize>,
+        /// A CPU whose run-queue lock another CPU holds, so a pull from it
+        /// defers.
+        contended: Option<usize>,
         /// Every pull attempted, in order.
         pulls: Vec<(usize, PullRule)>,
         /// The CPU a thread moved from, once one has.
@@ -7378,6 +7392,7 @@ mod idle_pull_tests
             Self {
                 cpus: cpus.to_vec(),
                 raised: None,
+                contended: None,
                 pulls: Vec::new(),
                 moved_from: None,
             }
@@ -7434,6 +7449,10 @@ mod idle_pull_tests
         fn pull(&mut self, src: usize, rule: PullRule) -> PullOutcome
         {
             self.pulls.push((src, rule));
+            if self.contended == Some(src)
+            {
+                return PullOutcome::Deferred;
+            }
             if !rule.passes(self.settled_load(src), 0)
             {
                 return PullOutcome::RuleFailed;
@@ -7564,6 +7583,62 @@ mod idle_pull_tests
                 (0, PullRule::Backlog)
             ]
         );
+    }
+
+    // The defect caught: a tick whose pull at once found the lock contended
+    // (as a read of a transient often does, the CPU being inside `schedule()`
+    // under its lock) leaving that CPU out of its fallback, so its own backlog
+    // is neither recorded nor kept as the candidate; or one that tries that
+    // contended lock a second time in the same tick.
+    #[test]
+    fn a_contended_transient_keeps_its_own_backlog_for_the_next_tick()
+    {
+        let mut model = Model::new(&[busy(0, 1), IDLE]);
+        model.raised = Some(0);
+        model.contended = Some(0);
+        let mut memory = IdlePullMemory {
+            candidate: None,
+            cursor: 0,
+        };
+        let kept = IdlePullMemory {
+            candidate: Some(0),
+            cursor: 0,
+        };
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(memory, kept);
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(memory, kept);
+        model.contended = None;
+        idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(model.moved_from, Some(0));
+        assert_eq!(
+            model.pulls,
+            vec![
+                (0, PullRule::Imbalance),
+                (0, PullRule::Imbalance),
+                (0, PullRule::Imbalance),
+                (0, PullRule::Backlog)
+            ]
+        );
+    }
+
+    // The defect caught: a contended pull at once from a pinned-only CPU past
+    // the threshold that keeps the idle CPU from pulling a backlog it has
+    // confirmed on another CPU in the same tick.
+    #[test]
+    fn a_contended_pinned_load_does_not_hold_back_a_confirmed_backlog()
+    {
+        let heavy = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        let mut model = Model::new(&[busy(heavy, 0), busy(0, 1), IDLE]);
+        let memory = IdlePullMemory {
+            candidate: None,
+            cursor: 0,
+        };
+        let memory = idle_pull_tick(&mut model, 2, 3, memory);
+        assert_eq!(memory.candidate, Some(1));
+        model.contended = Some(0);
+        idle_pull_tick(&mut model, 2, 3, memory);
+        assert_eq!(model.moved_from, Some(1));
     }
 
     // The defect caught: a stale candidate kept across ticks on which no CPU

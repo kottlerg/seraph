@@ -50,11 +50,18 @@ knows its bus or firmware standard and no driver.
 | ACPI SPCR | The Serial Port Console Redirection table | The console UART's interface type |
 | Boot framebuffer | The bootloader's framebuffer description | One fixed key, `boot-framebuffer` |
 | Platform description | A per-machine data table in the boot bundle, chosen by the ACPI OEM table ID | The key each entry names |
+| IOMMU | The ACPI DMAR's remapping units (x86-64) or the RIMT's IOMMUs (riscv64) | One record per IOMMU family, keyed `dmar` or `rimt`, holding every unit's register range and scope |
 
 devmgr runs no AML: the namespace enumerator reads only `Device` objects whose identifying and
 resource objects are static `Name` objects, and skips one that defines any of them as a
 `Method`. The platform description covers a device the machine's tables do not describe in
 that form; it is data, so a new machine adds a table, not devmgr code.
+
+One device has one record. Records are merged by resource identity: a record whose `Mmio` base
+or `IoPort` base an earlier record already holds adds its identity keys to that record rather
+than standing alone. The console UART that the namespace describes as `PNP0501` and the SPCR
+names is therefore one record carrying both keys. A PCI function the RIMT names as an IOMMU
+belongs to the IOMMU record and has no record of its own.
 
 A record carries the device's resources, typed:
 
@@ -86,12 +93,13 @@ describes, and a signature over the binary would cover its declaration with it.
 | Field | Meaning |
 |---|---|
 | Name | The driver's name in log lines |
-| Match entries | One or more keys of § Device Records: a PCI vendor and device, or a PCI class, subclass, and programming interface under a mask; an ACPI `_HID` or `_CID`; an SPCR interface type; a platform key |
+| Match entries | One or more keys of § Device Records: a PCI vendor and device, or a PCI class, subclass, and programming interface under a mask; an ACPI `_HID` or `_CID`; an SPCR interface type; a platform key; an IOMMU family key |
 | Class | The name of the device class the driver serves (§ Device Classes) |
 | Instance limit | The most devices of its match the driver is bound to; absent means every one |
 | Interrupt need | None, optional, or required, and for a message-signaled capable driver the vector count it requests |
 | DMA | Whether the device performs DMA: the driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD` and given a DMA capability ([device-management.md](device-management.md#dma-authorisation) § DMA Authorisation) |
-| Withdrawal reset | How devmgr stops the device when it withdraws the driver: the VirtIO `device_status` reset, a PCI Express Function Level Reset, or none |
+| Physical access | Whether the driver programs hardware with physical addresses: it is then created `CREATE_PHYS_ACCESS` ([device-management.md](device-management.md#physical-addresses) § Physical Addresses). Accepted only for an IOMMU record (§ Declaration Bounds) |
+| Withdrawal reset | How devmgr stops the device when it withdraws the driver: the VirtIO `device_status` reset, a PCI Express Function Level Reset, or none, beside the interrupt disable every PCI function gets (§ Binding) |
 | Priority tier | Boot (`sched_policy::BOOT_DRIVER_PRIORITY`) or auxiliary (`AUX_DRIVER_PRIORITY`) |
 
 A declaration names standards only: the withdrawal reset and the interrupt kind are methods
@@ -99,9 +107,11 @@ devmgr implements once, for every driver that declares them.
 
 devmgr collects declarations from two places:
 
-- **Boot modules.** init forwards every boot module outside the bootstrap set to devmgr
-  untagged, and devmgr reads each module's note. A module without a valid note is logged and
-  released.
+- **Boot modules.** init forwards to devmgr, untagged, every boot module that carries a
+  `.note.seraph.driver` note, and devmgr decodes each one. A module that carries none (the
+  bootstrap set's own modules, and `fatfs`, which init delivers to vfsd until filesystem
+  drivers declare themselves) goes where the bootstrap protocols deliver it today. A forwarded
+  module whose note does not decode is logged and released.
 - **The drivers directory.** On `SET_DRIVERS_DIR` devmgr lists `/services/drivers/`
   (`NS_READDIR`, so svcmgr sends the subtree cap with `READDIR` beside `LOOKUP | READ`) and
   reads the note of each entry. A binary whose declaration matches no recorded device is not
@@ -118,13 +128,17 @@ never claims more than its device and the system's policy give it:
   record's resources; it cannot name an address, a port, an interrupt, or a DMA right the
   record lacks, so a DMA declaration for a record with no `Dma` resource gets no DMA
   capability.
-- **No preemption.** A bind pass binds only unbound records, and the boot pass runs first. A
-  drivers-directory declaration cannot take a device a boot driver holds, however specific
-  its key.
-- **Source.** The boot priority tier, and a class whose class file marks it boot-only
-  (§ Device Classes), are accepted only from a boot-bundle declaration. A drivers-directory
-  declaration of a boot-only class is logged and ignored, and a drivers-directory driver runs
-  at the auxiliary tier.
+- **No preemption.** A bind pass binds only unbound records, and the passes over boot-bundle
+  declarations run first. A drivers-directory declaration cannot take a device a boot driver
+  holds, however specific its key.
+- **Source.** The boot priority tier, an IOMMU family key, and a class whose class file marks
+  it boot-only (§ Device Classes) are accepted only from a boot-bundle declaration. Physical
+  access is accepted only from a boot-bundle declaration that matches an IOMMU record. A
+  drivers-directory declaration of any of them is logged and ignored, and a drivers-directory
+  driver runs at the auxiliary tier.
+- **Withdrawal.** Whatever reset a declaration names, withdrawing the driver of a PCI function
+  disables the function's wired interrupt (§ Binding). A reset of none therefore cannot leave
+  a shared line asserting for the other drivers on it.
 - **Class.** Declaring a class decides which of that class's consumers talk to the driver; it
   grants no access, since the class's policy is configuration (§ Device Classes). Consumers
   treat a driver's data as untrusted.
@@ -138,18 +152,36 @@ never claims more than its device and the system's policy give it:
 ## Matching
 
 devmgr builds one match table from the declarations it has collected, and extends it when the
-drivers directory arrives. For each unbound device record it takes the most specific match:
-an exact PCI vendor and device over a PCI class, an ACPI `_HID` over a `_CID`. Two
-declarations equally specific for one device are a conflict: devmgr logs it and binds neither.
+drivers directory arrives. For each unbound device record it takes the most specific match
+over all the record's keys, ranked from most to least specific:
+
+1. an exact PCI vendor and device, an IOMMU family key, or a platform key;
+2. an SPCR interface type;
+3. an ACPI `_HID`;
+4. a PCI class;
+5. an ACPI `_CID`.
+
+Two declarations equally specific for one device are a conflict: devmgr logs it and binds
+neither.
 A driver's instance limit counts its devices in record order (PCI segment, bus, device,
 function; then the firmware's table order). A device no declaration matches stays recorded
 and unbound, and a later declaration (a driver installed afterwards, or a hotplug pass) can
 still match it.
 
-The IOMMU driver is matched like any other, by its declaration's key for the remapping
-hardware devmgr found (the DMAR's units, the RIMT's IOMMUs), and is bound before any device
-that declares DMA, as [device-management.md](device-management.md#iommu-discovery-and-programming)
-§ IOMMU Discovery and Programming orders.
+The IOMMU driver is matched by its family key against the IOMMU record, so one driver process
+serves every unit of its family. Its binding keeps what
+[device-management.md](device-management.md#iommu-discovery-and-programming) § IOMMU Discovery
+and Programming specifies:
+
+- it is bound in a pass and settle batch of its own, before the boot pass over every other
+  boot-module driver;
+- every unit's register `Mmio` capability moves to it, and devmgr keeps no copy;
+- it is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS` at the boot tier,
+  from its declaration's DMA and physical-access fields;
+- it is given no DMA capability;
+- devmgr deletes its hold's release token at the spawn.
+
+devmgr is its only consumer, over `ipc::iommu_labels`; it serves no device class.
 
 ---
 
@@ -174,9 +206,14 @@ and for a hot-added device:
    ([responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
    § Responsibilities).
 
-Each bind pass (the boot pass over boot-module drivers, the pass at `SET_DRIVERS_DIR`, a
-hotplug pass) is one settle batch. Withdrawal applies the reset the declaration names, after
-the DMA and Bus Master Enable steps that apply to every DMA-capable device.
+Each bind pass is one settle batch: the IOMMU pass, the boot pass over boot-module drivers,
+the pass at `SET_DRIVERS_DIR`, and a hotplug pass. Withdrawing a driver runs three steps in
+order:
+
+1. the DMA and Bus Master Enable steps that apply to every DMA-capable device;
+2. for a PCI function, setting the Interrupt Disable bit of its Command register through the
+   kept `Config` page, so the function stops asserting its wired line whoever else shares it;
+3. the reset the declaration names.
 
 ---
 
@@ -196,10 +233,15 @@ driver:
   the class is boot-only (§ Declaration Bounds).
 - **Publication.** For each class file, svcmgr asks devmgr, over a privileged label that only
   svcmgr and init hold, for a registry SEND whose badge carries the class's slot and its verb
-  mask, and publishes it seed-only as `devmgr.class.<name>`. A service reaches a class only
-  when its `.svc` `seed` line names that publication. init mints the classes the bootstrap set
-  needs before svcmgr runs (block for vfsd, serial for logd) the same way, from the boot
-  bundle's copies of their class files.
+  mask, and publishes it seed-only as `devmgr.class.<name>`. svcmgr does this before it sends
+  `SET_DRIVERS_DIR`, so devmgr knows which classes are boot-only before it reads any
+  drivers-directory declaration. A service reaches a class only when its `.svc` `seed` line
+  names that publication.
+- **Bootstrap.** The one class a bootstrap service needs before svcmgr runs is block, for
+  vfsd's root mount. init requests it over the same label, with the block protocol's mount
+  verb, as part of the fixed bootstrap structure (§ Principle), and reads no class file for
+  it. Every other consumer, logd included, is launched by svcmgr and reaches its classes
+  through svcmgr's publications.
 - **Badge.** One generic badge layout, defined once beside the registry protocol, carries the
   slot and the mask. It replaces the per-class authority bits (`BLOCK_DEVICE_AUTHORITY`,
   `DEBUG_PORT_AUTHORITY`, `TEST_LABEL_AUTHORITY`).
@@ -212,8 +254,10 @@ One registry label, `QUERY_DEVICE`, replaces the per-class `QUERY_*_DEVICE` labe
 an instance ordinal and takes the class from the caller's badge; devmgr answers as the
 per-class queries answer today: the SEND on the served driver at that ordinal, stamped with
 the badge's verb mask, `WITHDRAWN` at a withdrawn driver's ordinal, and `NO_DEVICE` past the
-last served driver of the class or before the pass that binds it has settled. Ordinals count
-the served drivers of the class in record order and are fixed once its pass settles. A
+last served driver of the class or before the pass that binds it has settled. A class's
+ordinals are assigned in the order its drivers are first served: within one pass in record
+order, and a later pass appends after every ordinal an earlier pass assigned. An ordinal never
+moves once its pass settles, and a withdrawn driver's ordinal stays as a tombstone. A
 declared class with no class file, and a class file no declaration serves, are logged at
 `SET_DRIVERS_DIR`.
 
@@ -239,8 +283,8 @@ driver, which leaves a tombstone at its ordinal. The event sources are specified
 No test-only spawn label survives the binding redesign: a fixture driver is bound through
 `bind(device, driver)` against a device the test launch attaches, like any driver, and a test
 reaches it through `QUERY_DEVICE` on the test class, whose class file only a test deployment
-installs. The fixtures and labels it
-retires are listed on [#165](https://github.com/kottlerg/seraph/issues/165).
+installs. The fixtures and labels it retires are listed on
+[#165](https://github.com/kottlerg/seraph/issues/165).
 
 ---
 

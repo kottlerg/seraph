@@ -344,6 +344,9 @@ impl PciTransport
 
         let driver_features = negotiate(device_features);
 
+        // cast_possible_truncation: the two `driver_feature_select` values take
+        // the low and the high 32 feature bits, so keeping the low half is the
+        // point, and the shift leaves the high half at 32 bits.
         #[allow(clippy::cast_possible_truncation)]
         {
             self.write_driver_features(0, driver_features as u32);

@@ -11,8 +11,6 @@
 //! clock, and serves [`timed_labels::GET_WALL_TIME`] from `offset +
 //! system_info(ElapsedUs)` thereafter.
 
-#![allow(clippy::cast_possible_truncation)]
-
 use ipc::{IpcMessage, rtc_errors, rtc_labels, timed_errors, timed_labels};
 use std::os::seraph::startup_info;
 use syscall_abi::SystemInfoType;
@@ -182,6 +180,7 @@ fn main() -> !
     std::os::seraph::log::register_name(b"timed");
     let info = startup_info();
 
+    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned, stricter than u64.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 

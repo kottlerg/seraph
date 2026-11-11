@@ -14,7 +14,7 @@
 //! whole. The parsing is in the host-tested `devmgr-firmware` crate.
 
 use crate::arch;
-use crate::caps::{AcpiRegion, DevmgrCaps};
+use crate::caps::{AcpiRegion, Firmware};
 use firmware::EcamLocation;
 use std::os::seraph::{reserve_pages, unreserve_pages};
 use syscall_abi::PAGE_SIZE;
@@ -24,7 +24,7 @@ use syscall_abi::PAGE_SIZE;
 /// `None`, logging why, when the VA reservation or the mapping fails, and
 /// otherwise what `read` returns.
 fn with_mapped<R>(
-    caps: &DevmgrCaps,
+    firmware: &Firmware,
     cap: u64,
     first_page: u64,
     page_count: u64,
@@ -44,7 +44,7 @@ fn with_mapped<R>(
     let mapped = unsafe {
         syscall::mem_map(
             cap,
-            caps.self_aspace,
+            firmware.self_aspace,
             va,
             first_page,
             page_count,
@@ -66,15 +66,16 @@ fn with_mapped<R>(
     let out = read(bytes);
     // SAFETY: the span is this call's own reservation, and `bytes`, the only
     // reference into it, is not used past the line above.
-    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, page_count) };
+    let _ = unsafe { syscall::mem_unmap(firmware.self_aspace, va, page_count) };
     unreserve_pages(range);
     out
 }
 
 /// Find which ACPI region's Memory cap covers `phys`.
-fn find_region_for(caps: &DevmgrCaps, phys: u64) -> Option<AcpiRegion>
+fn find_region_for(firmware: &Firmware, phys: u64) -> Option<AcpiRegion>
 {
-    caps.acpi_regions
+    firmware
+        .acpi_regions
         .iter()
         .find(|r| phys >= r.base && phys - r.base < r.size)
         .copied()
@@ -84,15 +85,15 @@ fn find_region_for(caps: &DevmgrCaps, phys: u64) -> Option<AcpiRegion>
 /// ACPI region that holds them) and run `read` on them. Returns `None` if no
 /// region covers `phys`, the mapping fails, or `read` does.
 fn with_acpi_bytes<R>(
-    caps: &DevmgrCaps,
+    firmware: &Firmware,
     phys: u64,
     len: u64,
     read: impl FnOnce(&[u8]) -> Option<R>,
 ) -> Option<R>
 {
-    let region = find_region_for(caps, phys)?;
+    let region = find_region_for(firmware, phys)?;
     let w = firmware::acpi::table_window(region.base, region.size, phys, len, PAGE_SIZE)?;
-    with_mapped(caps, region.slot, w.first_page, w.page_count, |bytes| {
+    with_mapped(firmware, region.slot, w.first_page, w.page_count, |bytes| {
         read(bytes.get(w.offset..w.offset + w.len)?)
     })
 }
@@ -102,23 +103,23 @@ fn with_acpi_bytes<R>(
 /// Returns `None` if no region covers the address, the header is
 /// unreadable, the mapping fails, or `read` does.
 pub fn with_acpi_table<R>(
-    caps: &DevmgrCaps,
+    firmware: &Firmware,
     tbl_phys: u64,
     read: impl FnOnce(&[u8]) -> Option<R>,
 ) -> Option<R>
 {
     let header_len = firmware::acpi::SDT_HDR_LEN as u64;
-    let len = with_acpi_bytes(caps, tbl_phys, header_len, firmware::acpi::sdt_length)?;
-    with_acpi_bytes(caps, tbl_phys, u64::from(len), read)
+    let len = with_acpi_bytes(firmware, tbl_phys, header_len, firmware::acpi::sdt_length)?;
+    with_acpi_bytes(firmware, tbl_phys, u64::from(len), read)
 }
 
 /// Read the 4-byte signature of the ACPI table at physical address
 /// `tbl_phys`. Returns `None` if no region covers the address or the
 /// header is unreadable. devmgr reads only the header signature here —
 /// never a table body.
-fn read_table_sig(caps: &DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
+fn read_table_sig(firmware: &Firmware, tbl_phys: u64) -> Option<[u8; 4]>
 {
-    with_acpi_bytes(caps, tbl_phys, 4, |table| {
+    with_acpi_bytes(firmware, tbl_phys, 4, |table| {
         (table.len() >= 4).then(|| firmware::acpi::sdt_signature(table))
     })
 }
@@ -128,22 +129,22 @@ fn read_table_sig(caps: &DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
 /// Shared by ECAM discovery and the `QUERY_ACPI_TABLE` broker so the RSDP →
 /// XSDT step exists exactly once. Returns `None` when no RSDP was delivered,
 /// it straddles the end of its page, or the table is pre-ACPI-2.0.
-fn read_xsdt_phys(caps: &DevmgrCaps) -> Option<u64>
+fn read_xsdt_phys(firmware: &Firmware) -> Option<u64>
 {
-    if caps.rsdp_memory_cap == 0
+    if firmware.rsdp_memory_cap == 0
     {
         return None;
     }
     // `rsdp_page_base` carries the exact RSDP physical address (see
     // init-protocol v5 docs); the backing Memory cap covers that one page,
     // so an RSDP straddling the page end is unreadable.
-    let rsdp_page_offset = usize::try_from(caps.rsdp_page_base & (PAGE_SIZE - 1)).ok()?;
+    let rsdp_page_offset = usize::try_from(firmware.rsdp_page_base & (PAGE_SIZE - 1)).ok()?;
     if rsdp_page_offset + firmware::acpi::RSDP_LEN > usize::try_from(PAGE_SIZE).ok()?
     {
         std::os::seraph::log!("RSDP straddles its page; ACPI unavailable");
         return None;
     }
-    with_mapped(caps, caps.rsdp_memory_cap, 0, 1, |page| {
+    with_mapped(firmware, firmware.rsdp_memory_cap, 0, 1, |page| {
         firmware::acpi::rsdp_xsdt_phys(&page[rsdp_page_offset..])
     })
 }
@@ -151,9 +152,9 @@ fn read_xsdt_phys(caps: &DevmgrCaps) -> Option<u64>
 /// Read the XSDT at `xsdt_phys` and copy its entry pointers out, so each
 /// table can be mapped on its own: a table may live in a different ACPI
 /// region than the XSDT (e.g. EDK2 on RISC-V virt: many tiny regions).
-fn read_xsdt_entries(caps: &DevmgrCaps, xsdt_phys: u64) -> Option<Vec<u64>>
+fn read_xsdt_entries(firmware: &Firmware, xsdt_phys: u64) -> Option<Vec<u64>>
 {
-    with_acpi_table(caps, xsdt_phys, |xsdt| {
+    with_acpi_table(firmware, xsdt_phys, |xsdt| {
         let mut entries = Vec::new();
         if entries.try_reserve(xsdt.len() / 8).is_err()
         {
@@ -168,13 +169,13 @@ fn read_xsdt_entries(caps: &DevmgrCaps, xsdt_phys: u64) -> Option<Vec<u64>>
 /// Locate an ACPI table by 4-byte `sig` via an XSDT walk. Returns the
 /// table's physical address. Reuses the same RSDP/XSDT directory read as
 /// ECAM discovery, so there is one XSDT walk in the whole system.
-pub fn locate_table_by_sig(caps: &DevmgrCaps, sig: [u8; 4]) -> Option<u64>
+pub fn locate_table_by_sig(firmware: &Firmware, sig: [u8; 4]) -> Option<u64>
 {
-    let xsdt_phys = read_xsdt_phys(caps)?;
-    let entries = read_xsdt_entries(caps, xsdt_phys)?;
+    let xsdt_phys = read_xsdt_phys(firmware)?;
+    let entries = read_xsdt_entries(firmware, xsdt_phys)?;
     entries
         .into_iter()
-        .find(|&tbl_phys| read_table_sig(caps, tbl_phys) == Some(sig))
+        .find(|&tbl_phys| read_table_sig(firmware, tbl_phys) == Some(sig))
 }
 
 /// The ACPI tables the platform enumerators read
@@ -195,21 +196,21 @@ pub struct PlatformTables
 /// table ID, the DSDT the FADT names, every SSDT, and the SPCR. Empty when no
 /// RSDP was delivered or the XSDT cannot be read; a table whose header cannot
 /// be read is skipped.
-pub fn platform_tables(caps: &DevmgrCaps) -> PlatformTables
+pub fn platform_tables(firmware: &Firmware) -> PlatformTables
 {
     let mut out = PlatformTables::default();
-    let Some(xsdt_phys) = read_xsdt_phys(caps)
+    let Some(xsdt_phys) = read_xsdt_phys(firmware)
     else
     {
         return out;
     };
     out.oem_table_id = with_acpi_bytes(
-        caps,
+        firmware,
         xsdt_phys,
         firmware::acpi::SDT_HDR_LEN as u64,
         firmware::acpi::sdt_oem_table_id,
     );
-    let Some(entries) = read_xsdt_entries(caps, xsdt_phys)
+    let Some(entries) = read_xsdt_entries(firmware, xsdt_phys)
     else
     {
         return out;
@@ -217,11 +218,12 @@ pub fn platform_tables(caps: &DevmgrCaps) -> PlatformTables
     let mut ssdts = Vec::new();
     for tbl_phys in entries
     {
-        match read_table_sig(caps, tbl_phys).as_ref()
+        match read_table_sig(firmware, tbl_phys).as_ref()
         {
             Some(b"FACP") =>
             {
-                if let Some(dsdt) = with_acpi_table(caps, tbl_phys, firmware::acpi::fadt_dsdt_phys)
+                if let Some(dsdt) =
+                    with_acpi_table(firmware, tbl_phys, firmware::acpi::fadt_dsdt_phys)
                     && out.definition_blocks.try_reserve(1).is_ok()
                 {
                     out.definition_blocks.insert(0, dsdt);
@@ -252,7 +254,8 @@ pub fn platform_tables(caps: &DevmgrCaps) -> PlatformTables
 /// `sig_word` is a 4-byte signature found via the XSDT. Returns `None` when
 /// both are zero, `sig_word` has bits above its low 32, or the table is not
 /// found.
-pub fn locate_acpi_table(caps: &DevmgrCaps, sig_word: u64, phys: u64) -> Option<(AcpiRegion, u64)>
+pub fn locate_acpi_table(firmware: &Firmware, sig_word: u64, phys: u64)
+-> Option<(AcpiRegion, u64)>
 {
     let table_phys = if sig_word == 0
     {
@@ -265,9 +268,9 @@ pub fn locate_acpi_table(caps: &DevmgrCaps, sig_word: u64, phys: u64) -> Option<
     else
     {
         let sig = u32::try_from(sig_word).ok()?.to_le_bytes();
-        locate_table_by_sig(caps, sig)?
+        locate_table_by_sig(firmware, sig)?
     };
-    let region = find_region_for(caps, table_phys)?;
+    let region = find_region_for(firmware, table_phys)?;
     Some((region, table_phys))
 }
 
@@ -277,19 +280,19 @@ pub fn locate_acpi_table(caps: &DevmgrCaps, sig_word: u64, phys: u64) -> Option<
 /// when an RSDP is present and yields any, else those of every DTB
 /// `pci-host-ecam-generic` node, else the arch platform default. Empty when
 /// none of them yields a window.
-pub fn discover_ecams(caps: &DevmgrCaps) -> Vec<EcamLocation>
+pub fn discover_ecams(firmware: &Firmware) -> Vec<EcamLocation>
 {
-    if caps.rsdp_memory_cap != 0
+    if firmware.rsdp_memory_cap != 0
     {
-        let found = discover_ecams_acpi(caps);
+        let found = discover_ecams_acpi(firmware);
         if !found.is_empty()
         {
             return found;
         }
     }
-    if caps.dtb_memory_cap != 0
+    if firmware.dtb_memory_cap != 0
     {
-        let found = discover_ecams_dtb(caps);
+        let found = discover_ecams_dtb(firmware);
         if !found.is_empty()
         {
             return found;
@@ -299,21 +302,21 @@ pub fn discover_ecams(caps: &DevmgrCaps) -> Vec<EcamLocation>
 }
 
 /// The ECAM windows of every entry of every MCFG table the XSDT lists.
-fn discover_ecams_acpi(caps: &DevmgrCaps) -> Vec<EcamLocation>
+fn discover_ecams_acpi(firmware: &Firmware) -> Vec<EcamLocation>
 {
     let mut found = Vec::new();
-    let Some(entries) = read_xsdt_phys(caps).and_then(|x| read_xsdt_entries(caps, x))
+    let Some(entries) = read_xsdt_phys(firmware).and_then(|x| read_xsdt_entries(firmware, x))
     else
     {
         return found;
     };
     for tbl_phys in entries
     {
-        if read_table_sig(caps, tbl_phys) != Some(*b"MCFG")
+        if read_table_sig(firmware, tbl_phys) != Some(*b"MCFG")
         {
             continue;
         }
-        let read = with_acpi_table(caps, tbl_phys, |mcfg| {
+        let read = with_acpi_table(firmware, tbl_phys, |mcfg| {
             for loc in firmware::acpi::mcfg_ecams(mcfg)
             {
                 if found.try_reserve(1).is_err()
@@ -342,15 +345,15 @@ fn discover_ecams_acpi(caps: &DevmgrCaps) -> Vec<EcamLocation>
 /// The ECAM windows of every DTB `pci-host-ecam-generic` node. The blob is
 /// mapped whole: the DTB Memory cap's page-rounded `dtb_size` from its page
 /// `dtb_page_base`.
-fn discover_ecams_dtb(caps: &DevmgrCaps) -> Vec<EcamLocation>
+fn discover_ecams_dtb(firmware: &Firmware) -> Vec<EcamLocation>
 {
-    let pages = caps.dtb_size.div_ceil(PAGE_SIZE).max(1);
-    let Ok(in_page_off) = usize::try_from(caps.dtb_page_base & (PAGE_SIZE - 1))
+    let pages = firmware.dtb_size.div_ceil(PAGE_SIZE).max(1);
+    let Ok(in_page_off) = usize::try_from(firmware.dtb_page_base & (PAGE_SIZE - 1))
     else
     {
         return Vec::new();
     };
-    let found = with_mapped(caps, caps.dtb_memory_cap, 0, pages, |blob| {
+    let found = with_mapped(firmware, firmware.dtb_memory_cap, 0, pages, |blob| {
         let fdt = firmware::dtb::Fdt::new(blob.get(in_page_off..)?)?;
         let found = fdt.find_pci_ecams().ok();
         if found.is_none()

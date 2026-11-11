@@ -68,15 +68,55 @@ mod present
     pub const DTB: u64 = 1 << 2;
 }
 
-pub struct DevmgrCaps
+/// The firmware-table authority devmgr reads after bootstrap and never changes:
+/// the RSDP and DTB Memory caps and their locations, the ACPI reclaimable
+/// regions, devmgr's own address space cap the tables are mapped into, and the
+/// arch authority caps. Shared by `Arc` with the registry's worker threads,
+/// which serve `QUERY_ACPI_TABLE` and `QUERY_SHUTDOWN_DEVICE` from it.
+pub struct Firmware
 {
-    // Authority caps from init.
-    pub irq_range_cap: u64,
     pub rsdp_memory_cap: u64,
     pub rsdp_page_base: u64,
     pub dtb_memory_cap: u64,
     pub dtb_page_base: u64,
     pub dtb_size: u64,
+
+    // ACPI reclaimable-region Memory caps.
+    pub acpi_regions: Vec<AcpiRegion>,
+
+    /// Arch authority caps from the `SVCMGR_BUNDLE` round: the full-rights
+    /// `IoPort` on x86-64, the Reset + Suspend `SbiControl` on RISC-V (see
+    /// `arch::current::ArchCaps`).
+    pub arch: crate::arch::current::ArchCaps,
+
+    /// devmgr's own address space cap, a copy of [`DevmgrCaps::self_aspace`].
+    pub self_aspace: u64,
+}
+
+impl Firmware
+{
+    fn new(self_aspace: u64) -> Self
+    {
+        Self {
+            rsdp_memory_cap: 0,
+            rsdp_page_base: 0,
+            dtb_memory_cap: 0,
+            dtb_page_base: 0,
+            dtb_size: 0,
+            acpi_regions: Vec::new(),
+            arch: crate::arch::current::ArchCaps::empty(),
+            self_aspace,
+        }
+    }
+}
+
+pub struct DevmgrCaps
+{
+    // Authority caps from init.
+    pub irq_range_cap: u64,
+
+    /// The firmware-table state, set once bootstrap ends.
+    pub firmware: std::sync::Arc<Firmware>,
 
     // MMIO aperture caps — devmgr owns these and carves per-device caps
     // out of them, keeping every remainder.
@@ -92,9 +132,6 @@ pub struct DevmgrCaps
     /// The ECAM windows `config_space` holds, to locate a function's
     /// configuration page (`firmware::pci::function_config_phys`).
     pub ecam_windows: Vec<firmware::EcamLocation>,
-
-    // ACPI reclaimable-region Memory caps.
-    pub acpi_regions: Vec<AcpiRegion>,
 
     /// The `(base, size)` of every extent of RAM memmgr pools, from init's
     /// [`kind::RAM_EXTENT`] rounds, against which a device's firmware-reserved
@@ -122,11 +159,6 @@ pub struct DevmgrCaps
     // § Init → remaining services).
     pub svcmgr_publish_cap: u64,
 
-    /// Arch authority caps from the `SVCMGR_BUNDLE` round: the full-rights
-    /// `IoPort` on x86-64, the Reset + Suspend `SbiControl` on RISC-V (see
-    /// `arch::current::ArchCaps`).
-    pub arch: crate::arch::current::ArchCaps,
-
     /// Bootloader-discovered framebuffer geometry, or `None` when no
     /// framebuffer is present. Populated from init's
     /// [`kind::FRAMEBUFFER_INFO`] bootstrap round.
@@ -140,7 +172,7 @@ pub struct DevmgrCaps
     /// The remapping units the IOMMU driver programs and the client devmgr
     /// calls it through; `None` when DMA runs unconfined (no unit, no driver
     /// module, or a driver that did not report ready).
-    pub iommu: Option<crate::iommu::Iommu>,
+    pub iommu: Option<std::sync::Arc<crate::iommu::Iommu>>,
 }
 
 impl DevmgrCaps
@@ -149,15 +181,10 @@ impl DevmgrCaps
     {
         Self {
             irq_range_cap: 0,
-            rsdp_memory_cap: 0,
-            rsdp_page_base: 0,
-            dtb_memory_cap: 0,
-            dtb_page_base: 0,
-            dtb_size: 0,
+            firmware: std::sync::Arc::new(Firmware::new(info.self_aspace)),
             apertures: SpanTable::new(),
             config_space: SpanTable::new(),
             ecam_windows: Vec::new(),
-            acpi_regions: Vec::new(),
             pooled: Some(Vec::new()),
             procmgr_ep: info.procmgr_endpoint,
             registry_ep: 0,
@@ -165,7 +192,6 @@ impl DevmgrCaps
             self_aspace: info.self_aspace,
             modules: Vec::new(),
             svcmgr_publish_cap: 0,
-            arch: crate::arch::current::ArchCaps::empty(),
             fb_info: None,
             dma: None,
             iommu: None,
@@ -206,7 +232,12 @@ impl DevmgrCaps
 /// Round 1: the authority-cap handshake. Caps after `registry_ep` appear
 /// in the order `IRQ_RANGE`, `RSDP`, `DTB`, restricted to those present
 /// in the bitmap at `data[0]`.
-fn bootstrap_round1(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> Option<()>
+fn bootstrap_round1(
+    creator: u64,
+    ipc_buf: *mut u64,
+    caps: &mut DevmgrCaps,
+    firmware: &mut Firmware,
+) -> Option<()>
 {
     // SAFETY: `ipc_buf` is the caller-supplied kernel-registered per-thread IPC buffer page.
     let round1 = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
@@ -217,9 +248,9 @@ fn bootstrap_round1(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
     caps.registry_ep = round1.caps[0];
 
     let presence = round1.data[0];
-    caps.rsdp_page_base = round1.data[1];
-    caps.dtb_page_base = round1.data[2];
-    caps.dtb_size = round1.data[3];
+    firmware.rsdp_page_base = round1.data[1];
+    firmware.dtb_page_base = round1.data[2];
+    firmware.dtb_size = round1.data[3];
 
     let mut idx = 1usize;
     if presence & present::IRQ_RANGE != 0 && idx < round1.cap_count
@@ -229,12 +260,12 @@ fn bootstrap_round1(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
     }
     if presence & present::RSDP != 0 && idx < round1.cap_count
     {
-        caps.rsdp_memory_cap = round1.caps[idx];
+        firmware.rsdp_memory_cap = round1.caps[idx];
         idx += 1;
     }
     if presence & present::DTB != 0 && idx < round1.cap_count
     {
-        caps.dtb_memory_cap = round1.caps[idx];
+        firmware.dtb_memory_cap = round1.caps[idx];
         idx += 1;
     }
     let _ = idx;
@@ -281,7 +312,7 @@ fn absorb_acpi_region_round(
     round_caps: &[u64],
     round_cap_count: usize,
     round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
-    caps: &mut DevmgrCaps,
+    firmware: &mut Firmware,
 )
 {
     let batch_count = usize::try_from(round_data[1]).unwrap_or(usize::MAX);
@@ -294,7 +325,7 @@ fn absorb_acpi_region_round(
         }
         let base = round_data[2 + i * 2];
         let size = round_data[3 + i * 2];
-        if caps.acpi_regions.try_reserve(1).is_err()
+        if firmware.acpi_regions.try_reserve(1).is_err()
         {
             std::os::seraph::log!(
                 "ACPI region {:#x}+{:#x} not recorded (no memory); released",
@@ -304,7 +335,7 @@ fn absorb_acpi_region_round(
             let _ = syscall::cap_delete(slot);
             continue;
         }
-        caps.acpi_regions.push(AcpiRegion { slot, base, size });
+        firmware.acpi_regions.push(AcpiRegion { slot, base, size });
     }
 }
 
@@ -404,7 +435,12 @@ fn absorb_framebuffer_info_round(
 }
 
 /// Drive the post-R1 bootstrap rounds until init marks the stream done.
-fn bootstrap_rounds(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> Option<()>
+fn bootstrap_rounds(
+    creator: u64,
+    ipc_buf: *mut u64,
+    caps: &mut DevmgrCaps,
+    firmware: &mut Firmware,
+) -> Option<()>
 {
     loop
     {
@@ -419,7 +455,7 @@ fn bootstrap_rounds(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
             }
             kind::ACPI_REGION =>
             {
-                absorb_acpi_region_round(&round.caps, round.cap_count, &round.data, caps);
+                absorb_acpi_region_round(&round.caps, round.cap_count, &round.data, firmware);
             }
             kind::RAM_EXTENT =>
             {
@@ -456,7 +492,7 @@ fn bootstrap_rounds(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
                 caps.svcmgr_publish_cap = round.caps[0];
                 if round.cap_count >= 2 && round.caps[1] != 0
                 {
-                    caps.arch.absorb_shutdown_authority(round.caps[1]);
+                    firmware.arch.absorb_shutdown_authority(round.caps[1]);
                 }
             }
             _ =>
@@ -473,19 +509,22 @@ fn bootstrap_rounds(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
 pub fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DevmgrCaps>
 {
     let mut caps = DevmgrCaps::new(info);
+    let mut firmware = Firmware::new(info.self_aspace);
     let creator = info.creator_endpoint;
     if creator == 0
     {
         return None;
     }
 
-    bootstrap_round1(creator, ipc_buf, &mut caps)?;
-    bootstrap_rounds(creator, ipc_buf, &mut caps)?;
+    bootstrap_round1(creator, ipc_buf, &mut caps, &mut firmware)?;
+    bootstrap_rounds(creator, ipc_buf, &mut caps, &mut firmware)?;
 
     caps.self_bootstrap_ep =
         std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
             syscall::cap_create_endpoint(slab).ok()
         })?;
+
+    caps.firmware = std::sync::Arc::new(firmware);
 
     Some(caps)
 }

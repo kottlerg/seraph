@@ -60,7 +60,7 @@ use iommu_core::Scope;
 use ipc::{IpcMessage, iommu_errors, iommu_labels};
 use syscall_abi::PAGE_SIZE;
 
-use crate::{DeviceCatalog, ServedDriver, ServedDrivers, Serves, SpawnedDriver};
+use crate::{DeviceCatalog, Registry, ServedDriver, Serves, SpawnedDriver};
 use crate::{arch, caps, pci, settle, spawn};
 
 /// The IOMMU family an architecture's platforms carry, which decides the
@@ -769,8 +769,8 @@ fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
 /// when there is none.
 fn read_acpi(caps: &caps::DevmgrCaps, sig: [u8; 4]) -> Option<Vec<u8>>
 {
-    let phys = crate::tables::locate_table_by_sig(caps, sig)?;
-    crate::tables::with_acpi_table(caps, phys, |t| {
+    let phys = crate::tables::locate_table_by_sig(&caps.firmware, sig)?;
+    crate::tables::with_acpi_table(&caps.firmware, phys, |t| {
         let mut v = Vec::new();
         v.try_reserve(t.len()).ok()?;
         v.extend_from_slice(t);
@@ -978,7 +978,7 @@ pub fn bring_up(
     caps: &mut caps::DevmgrCaps,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
-    served: &mut ServedDrivers,
+    registry: &Registry,
     ipc_buf: *mut u64,
 ) -> Option<Iommu>
 {
@@ -1038,7 +1038,7 @@ pub fn bring_up(
         death_eq,
         watch,
         catalog,
-        served,
+        registry,
         ipc_buf,
     );
     match settled
@@ -1070,7 +1070,7 @@ pub fn bring_up(
     client.mark_ready();
     let handed = rounds.len();
     let _ = client.widths.set(query_widths(&client, handed));
-    served.set_iommu(Arc::clone(&client));
+    registry.set_iommu(Arc::clone(&client));
     let faults = Arc::new(Mutex::new(FaultCounts::default()));
     start_fault_log(&client, &faults);
     std::os::seraph::log!("IOMMU: {} {} translating", handed as u64, family.units());
@@ -1275,7 +1275,7 @@ enum Settled
 /// watched on `death_eq` as well as devmgr's death queue, and settle it.
 // too_many_arguments: the spawn and its settle consume the declaration, the
 // client, the death watch, the batch's death queue, the catalog, and the
-// served classes.
+// registry.
 #[allow(clippy::too_many_arguments)]
 fn spawn_and_settle(
     caps: &caps::DevmgrCaps,
@@ -1287,7 +1287,7 @@ fn spawn_and_settle(
     death_eq: u64,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
-    served: &mut ServedDrivers,
+    registry: &Registry,
     ipc_buf: *mut u64,
 ) -> Settled
 {
@@ -1353,11 +1353,11 @@ fn spawn_and_settle(
         roster,
         watch,
         catalog,
-        served,
+        registry,
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
-    if served.iommu_served()
+    if registry.iommu_served()
     {
         Settled::Ready
     }

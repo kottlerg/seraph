@@ -209,8 +209,9 @@ What the boots exercise of this order is stated in
 ## DMA Authorisation
 
 A DMA-capable driver programs its device only with device addresses devmgr hands it, never with
-a physical address. devmgr gives the driver of each DMA-capable device it binds (a PCI function
-with a BAR and an IRQ) a DMA capability: a SEND on devmgr's DMA endpoint badged with the device's
+a physical address. devmgr gives each PCI-bound driver whose declaration declares DMA
+([driver-binding.md](driver-binding.md#driver-declarations) § Driver Declarations) a DMA
+capability, and no other driver one: a SEND on devmgr's DMA endpoint badged with the device's
 badge, delivered with the driver's other per-device caps at spawn. On it the driver sends
 `DMA_MAP` (`ipc::devmgr_dma_labels`) with a Memory cap over the frames the device must reach and
 the access it needs (the device reads, or reads and writes); the cap must carry `MAP` rights,

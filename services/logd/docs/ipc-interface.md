@@ -274,7 +274,8 @@ more entries follow this page:
 A refused query's reply carries no entries. A page is a snapshot of the moment
 logd answers it; a caller walks the pages by resuming after the last entry it
 read, so an entry added or dropped between two pages shifts no other entry's
-place.
+place. A walk is not a snapshot: a slot retired between two pages of a
+`QUERY_SLOTS` walk can be read live on the first and retired on a later one.
 
 init-logd, which holds the endpoint's RECV until the handover, answers every
 label it does not serve with an empty `label = 0` reply, which reads as an empty

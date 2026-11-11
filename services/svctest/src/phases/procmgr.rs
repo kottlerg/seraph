@@ -206,22 +206,26 @@ fn logd_await_retired(query: u64) -> u64
     // its teardown, and logd drains it on its next wake.
     const MAX_POLLS: u32 = 3000;
 
-    let mut retired = None;
+    let mut retired = false;
     for _ in 0..MAX_POLLS
     {
-        let found = logd_named_slots(query);
-        if found
+        if logd_named_slots(query)
             .iter()
             .any(|&(_, state, _)| state == SLOT_EVICTED_DEATH)
         {
-            retired = Some(found);
+            retired = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
     }
-    let found = retired.unwrap_or_else(|| {
-        panic!("logd_death_forward: child's slot not evicted within the poll budget")
-    });
+    assert!(
+        retired,
+        "logd_death_forward: child's slot not evicted within the poll budget"
+    );
+    // A walk is no snapshot: the one that saw the retired slot may have read
+    // the live slot on an earlier page, before logd retired it. Once retired,
+    // the dead child's badge sends nothing more, so a fresh walk is stable.
+    let found = logd_named_slots(query);
     let [(badge, _, exit_reason)] = found[..]
     else
     {

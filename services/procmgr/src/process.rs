@@ -3630,9 +3630,11 @@ pub fn create_process_from_file(
     // header page.
     let header_len =
         vfs_read_exact(file_cap.cap(), ipc_buf, 0, hdr_page).ok_or(procmgr_errors::IO_ERROR)?;
-    // Every later read goes through `reads`: the parsers it feeds report a
-    // failed read as a malformed image or as no stack note, and a failed
-    // read, an unanswered one included, fails the create with `IO_ERROR`.
+    // Every later read goes through `reads`, which makes none once one has
+    // failed, so an unanswering server costs the create one bounded wait.
+    // The parsers it feeds report a failed read as a malformed image or as
+    // no stack note, and a failed read, an unanswered one included, fails
+    // the create with `IO_ERROR`.
     let reads = process_table::fs_reads::ReadFailures::new();
 
     // Parse ELF headers from the header page.
@@ -3669,7 +3671,7 @@ pub fn create_process_from_file(
     let rela = if kind == elf::ElfKind::Dyn
     {
         elf::rela_table_metadata(ehdr, header_data, file_size, |off, dst| {
-            reads.note(vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
+            reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
         })
         .map_err(|_| reads.code(procmgr_errors::INVALID_ELF))?
     }
@@ -3685,7 +3687,7 @@ pub fn create_process_from_file(
             let count = walk_relocs_streaming(
                 t,
                 machine,
-                |off, dst| reads.note(vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
+                |off, dst| reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
                 |r| in_span &= elf::reloc_target_in_span(r, span_min, span_end),
             )
             .ok_or_else(|| reads.code(procmgr_errors::INVALID_ELF))?;
@@ -3713,7 +3715,7 @@ pub fn create_process_from_file(
     let stack_pages = resolve_stack_pages(elf::parse_stack_note_streaming(
         ehdr,
         file_size,
-        |off, dst| reads.note(vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
+        |off, dst| reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
     ))
     .ok_or_else(|| reads.code(procmgr_errors::INVALID_ELF))?;
     if reads.failed()
@@ -3774,24 +3776,24 @@ pub fn create_process_from_file(
                     streamed = stream_segment_bytes(buf, dest_offset, &seg, &load_ctx);
                     // Writable segments only, matching the kernel's init
                     // applier: a target in text/rodata goes unapplied and the
-                    // applied-count check below rejects the image.
+                    // applied-count check below rejects the image. A segment
+                    // whose bytes did not all arrive fails the spawn below,
+                    // so its walk would only add reads of the file.
                     if seg.writable
+                        && streamed.is_ok()
                         && let Some(t) = &rela
                     {
                         let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
                         // A read failure mid-walk leaves records unapplied;
-                        // `reads` notes it, and the check after the loop fails
-                        // the spawn.
+                        // `reads` notes it, and the check after the segment
+                        // fails the spawn.
                         let _ = walk_relocs_streaming(
                             t,
                             machine,
                             |off, dst| {
-                                reads.note(vfs_read_exact(
-                                    load_ctx.file_cap,
-                                    load_ctx.ipc_buf,
-                                    off,
-                                    dst,
-                                ))
+                                reads.read(|| {
+                                    vfs_read_exact(load_ctx.file_cap, load_ctx.ipc_buf, off, dst)
+                                })
                             },
                             |r| {
                                 applied_relocs +=
@@ -3803,12 +3805,13 @@ pub fn create_process_from_file(
             )
         }?;
         // A segment whose file bytes did not all arrive would run with a
-        // zeroed tail; the spawn fails instead.
+        // zeroed tail; the spawn fails instead. So does a failed read in the
+        // segment's relocation walk, before the next segment reads the file.
         streamed?;
-    }
-    if reads.failed()
-    {
-        return Err(procmgr_errors::IO_ERROR);
+        if reads.failed()
+        {
+            return Err(procmgr_errors::IO_ERROR);
+        }
     }
     // Every pre-validated record must have landed in exactly one segment;
     // a shortfall means a target in a gap between segments or a lost read.
@@ -3860,7 +3863,7 @@ pub fn create_process_from_file(
                             t,
                             machine,
                             |off, dst| {
-                                reads.note(vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
+                                reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
                             },
                             |r| {
                                 let _ = elf::apply_reloc_in_span(r, bias, seg.vaddr, template);

@@ -444,7 +444,9 @@ cap and on its open (`FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`
 `FILE_CAP_CALL_TIMEOUT_MS` (10 s): an `FS_OPEN` or a read the server has not answered by then fails
 the create with `IO_ERROR`, as a refused one does, whichever read it is (the ELF header, the
 relocation table, the stack-size note, a segment, or the `.tdata` template), and an unanswered
-release or close is given up as a failed one is.
+release or close is given up as a failed one is. procmgr makes no further read of the file once one
+has failed or gone unanswered, so a server that stops answering costs the create one such wait on
+its reads, however many reads the image's headers would still call for.
 
 **Reply (success):** as for `CREATE_PROCESS` (cap[0] process handle, cap[1]
 child `Thread` cap, and, with `CREATE_DMA_HOLD`, cap[2] the release token),

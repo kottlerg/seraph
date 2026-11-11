@@ -780,7 +780,8 @@ pub fn find_note<'a>(
 /// string table (at most [`MAX_STREAMING_STRTAB`] bytes), and the one note
 /// section, into `buf`; a note section larger than `buf` is refused. Returns
 /// the descriptor's byte range within `buf`, or `None` as [`find_note`] does,
-/// and also when a read fails, comes back short, or reaches past `file_size`.
+/// and also when a read fails, comes back short, or reaches past `file_size`;
+/// no read follows the first that fails or comes back short.
 pub fn find_note_streaming<F>(
     ehdr: &Elf64Ehdr,
     file_size: u64,
@@ -824,11 +825,9 @@ where
 
     for i in 0..shnum
     {
-        let Some(shdr) = read_shdr_streaming(shoff, shentsize, i, &mut read_at)
-        else
-        {
-            continue;
-        };
+        // A failed header read ends the search: each read can cost the
+        // caller a bounded wait on its file server, so none follows it.
+        let shdr = read_shdr_streaming(shoff, shentsize, i, &mut read_at)?;
         if shdr.sh_type != SHT_NOTE
             || !section_name_eq(strtab_bytes, shdr.sh_name as usize, section)
         {
@@ -2497,6 +2496,43 @@ mod tests
             streamed(&img),
         );
         assert_eq!(truncated, None);
+    }
+
+    #[test]
+    fn a_failed_section_header_read_ends_the_streamed_search()
+    {
+        // The string table arrives, then the read of section header 0
+        // fails: the search stops there, with no further read, rather than
+        // going on to the note section in header 2.
+        let img = image_with_notes(DRIVER_NAME, &note_record(b"seraph", NT_DRIVER, b"d"));
+        let (ehdr, _) = valid_executable(&img);
+        let first_shdr = ehdr.e_shoff;
+        let mut buf = [0u8; 256];
+        let mut serve = streamed(&img);
+        let mut failed = false;
+        let mut reads_after_failure = 0usize;
+        let found = find_note_streaming(
+            &ehdr,
+            img.len() as u64,
+            DRIVER_SECTION,
+            b"seraph",
+            NT_DRIVER,
+            &mut buf,
+            |off, dst| {
+                if failed
+                {
+                    reads_after_failure += 1;
+                }
+                if off == first_shdr
+                {
+                    failed = true;
+                    return None;
+                }
+                serve(off, dst)
+            },
+        );
+        assert_eq!(found, None);
+        assert_eq!(reads_after_failure, 0);
     }
 
     #[test]

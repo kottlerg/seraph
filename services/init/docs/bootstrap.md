@@ -228,6 +228,10 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   - `vfsd.mount` / `vfsd.deny` — the endowed `MOUNT_AUTHORITY`-badged and
     `DENY_BADGE`-badged SENDs on vfsd's service endpoint, published as
     they arrive; svctest is the only recipe seeding them.
+  - `logd.query` — `LOG_QUERY_AUTHORITY`-badged SEND minted from the
+    endowed master-log source, gating logd's `QUERY_SLOTS` and
+    `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md#queries));
+    svctest is the only recipe seeding it.
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
     `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
     cap on a `DRIVERS_DIR_AUTHORITY`-badged copy of the
@@ -239,8 +243,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     a failure leaves the system without a wallclock — timed degrades to
     `WALL_CLOCK_UNAVAILABLE` (see [timed](../../timed/README.md)).
 
-  All four `devmgr.*` names and both `vfsd.*` names are seed-only: svcmgr's `QUERY_ENDPOINT`
-  refuses them, so each badge reaches only the recipes that seed the name
+  All four `devmgr.*` names, both `vfsd.*` names, and `logd.query` are seed-only: svcmgr's
+  `QUERY_ENDPOINT` refuses them, so each badge reaches only the recipes that seed the name
   ([svcmgr IPC interface § Label 4](../../svcmgr/docs/ipc-interface.md#label-4-query_endpoint)).
 
   `pwrmgr.shutdown`, `pwrmgr.deny`, and `timed` are published by

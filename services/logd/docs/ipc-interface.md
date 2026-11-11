@@ -277,12 +277,16 @@ read, so an entry added or dropped between two pages shifts no other entry's
 place. A walk of several pages is not a snapshot, and a client assumes only
 this across its pages:
 
-- `QUERY_SLOTS` reads each (badge, state) pair at most once. A slot retired
-  between two pages is read twice, live and then retired, only when its live
-  entry was the last one the earlier page carried; a slot retired after the walk
-  has passed its badge is read once, as live, and one retired before the walk
-  reaches it once, as retired. A slot created below the walk's cursor, or a
-  retired slot dropped before the walk reaches it, is missed.
+- `QUERY_SLOTS` reads each (badge, state) pair at most once, each page above
+  the last pair read. A slot retired between two pages is read twice, live and
+  then retired, only when the earlier page ended at its badge below its new
+  retired entry: on its live entry, or, when a resync retires it, on the
+  death-retired entry of an earlier holder of the badge, which the retire
+  replaces, so the walk reads two retired entries for that badge. Otherwise a
+  slot retired after the walk has passed its badge is read once, as live, and
+  one retired before the walk reaches its badge once, as retired. A slot
+  created below the walk's cursor, or a retired slot dropped before the walk
+  reaches it, is missed.
 - `QUERY_HISTORY` reads each entry at most once, since `seq` is unique and the
   walk moves to older `seq` only; a retire keeps an entry's `seq`. An entry
   retained after the walk began is newer than every entry it read and is

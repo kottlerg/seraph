@@ -417,14 +417,24 @@ fn check_stats(out: &mut Vec<Diag>, name: &str, stats: &Value)
         return;
     };
     let stated = name_parts(name);
-    if !stated.is_some_and(|(m, h)| m == mode && !h.is_empty() && head.starts_with(h))
+    if !stated.is_some_and(|(m, h)| m == mode && names_a_commit(h) && head.starts_with(h))
     {
         out.push(Diag::error(
             "record-name",
             name,
-            format!("the name does not state the record's mode `{mode}` and head {head}"),
+            format!(
+                "the name does not state the record's mode `{mode}` and head {head}, at least \
+                 its first 8 hexadecimal digits"
+            ),
         ));
     }
+}
+
+/// Whether the head a record's name states is long enough to name one
+/// commit: 8 or more hexadecimal digits, as `stats.head` must be.
+fn names_a_commit(stated: &str) -> bool
+{
+    stated.len() >= 8 && stated.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Check one record against the record shape.
@@ -448,10 +458,21 @@ pub fn check_record(name: &str, record: &Value) -> Vec<Diag>
 
 /// Whether the record file `name` is a run at `head`, by the head its name
 /// states. The name decides, not the content: a record that does not parse
-/// is still a run at the head, and every run there must be well-formed.
+/// is still a run at the head, and every run there must be well-formed. A
+/// name that states fewer than 8 digits of the head is a run there too, so
+/// that `check_record` refuses it rather than the gate passing it over.
 fn names_head(name: &str, head: &str) -> bool
 {
     name_parts(name).is_some_and(|(_, stated)| !stated.is_empty() && head.starts_with(stated))
+}
+
+/// Whether a record's `stats.head` is the commit `head` names: one of the two
+/// is a prefix of the other, since either may be abbreviated.
+fn reviewed(record: &Value, head: &str) -> bool
+{
+    record["stats"]["head"]
+        .as_str()
+        .is_some_and(|reviewed| head.starts_with(reviewed) || reviewed.starts_with(head))
 }
 
 /// A record's place in the PR's sequence of runs: `stats.run`.
@@ -486,7 +507,8 @@ fn verdict_passes(record: &Value) -> bool
 
 /// The runs at `head`, ordered by `stats.run`, the last run last. An error
 /// when no record names the head, when one of them is malformed (it could be
-/// the last and cannot be placed), or when two carry the last run's number.
+/// the last and cannot be placed), when one reviewed another commit than the
+/// head (its `stats.head`), or when two carry the last run's number.
 fn runs_at<'a>(records: &'a [Record], head: &str) -> Result<Vec<&'a Record>, Vec<Diag>>
 {
     let at = head.get(..8).unwrap_or(head);
@@ -501,6 +523,26 @@ fn runs_at<'a>(records: &'a [Record], head: &str) -> Result<Vec<&'a Record>, Vec
     if !malformed.is_empty()
     {
         return Err(malformed);
+    }
+    // The name's head is a prefix that another commit can share; the
+    // record's own `stats.head` says which commit the run reviewed.
+    let elsewhere: Vec<Diag> = here
+        .iter()
+        .filter(|(_, record)| !reviewed(record, head))
+        .map(|(name, record)| {
+            Diag::error(
+                "gate-review-record",
+                name.as_str(),
+                format!(
+                    "the record's name puts it at this head, but it reviewed {}",
+                    record["stats"]["head"].as_str().unwrap_or("")
+                ),
+            )
+        })
+        .collect();
+    if !elsewhere.is_empty()
+    {
+        return Err(elsewhere);
     }
     here.sort_by_key(|(_, record)| run_number(record));
     let Some(last) = here.last()
@@ -1231,6 +1273,54 @@ mod tests
         assert_eq!(
             rules(&gate_diags(&other_head, "ffffffff00000000")),
             ["gate-review-record"]
+        );
+    }
+
+    #[test]
+    fn a_name_states_at_least_eight_digits_of_the_head()
+    {
+        let r = passing();
+        assert_eq!(rules(&check_record("delta-0.json", &r)), ["record-name"]);
+        assert_eq!(
+            rules(&check_record("delta-0a82b0a.json", &r)),
+            ["record-name"]
+        );
+        // A short-named record of the head is still a run there, which the
+        // gate refuses, even beside a passing record of a full name.
+        let short = vec![
+            (NAME.to_owned(), run("delta", 2, PASS.0, PASS.1)),
+            (
+                "delta-0a82b0a.json".to_owned(),
+                run("delta", 3, "BLOCKING ISSUES", "AUDIT PASS"),
+            ),
+        ];
+        let found = gate_diags(&short, HEAD);
+        assert_eq!(rules(&found), ["record-name"]);
+        assert_eq!(found[0].at, "delta-0a82b0a.json");
+    }
+
+    #[test]
+    fn a_record_of_another_commit_with_the_heads_prefix_is_no_run_at_the_head()
+    {
+        // The passing record's name shares the head's first 8 digits, but it
+        // reviewed another commit; it must not stand in for the head's own
+        // blocking run.
+        let mut other = run("delta", 3, PASS.0, PASS.1);
+        other["stats"]["head"] = json!("0a82b0aaffffffffffffffffffffffffffffffff");
+        let records = vec![
+            (
+                NAME.to_owned(),
+                run("delta", 2, "BLOCKING ISSUES", "AUDIT PASS"),
+            ),
+            ("delta-0a82b0aa-2.json".to_owned(), other),
+        ];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["gate-review-record"]);
+        assert_eq!(found[0].at, "delta-0a82b0aa-2.json");
+        assert!(
+            found[0].message.contains("0a82b0aaffff"),
+            "{}",
+            found[0].message
         );
     }
 

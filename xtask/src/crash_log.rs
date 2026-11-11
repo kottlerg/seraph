@@ -1053,6 +1053,14 @@ mod tests
             Some((0x1000, 0x3010))
         );
         assert_eq!(text_span(&segments_only(&[(R, 0, 0x1000)])), None);
+        // An executable segment whose end wraps makes the image unusable.
+        assert_eq!(
+            text_span(&segments_only(&[
+                (RX, 0x1000, 0x500),
+                (RX, u64::MAX - 0xf, 0x20)
+            ])),
+            None
+        );
         assert_eq!(text_span(b"not an ELF image"), None);
     }
 

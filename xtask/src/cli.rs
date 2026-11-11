@@ -1044,7 +1044,8 @@ pub struct IssueEditArgs
     #[arg(long)]
     pub body_file: PathBuf,
 
-    /// Allow a body with fewer task-list items than the Issue has.
+    /// Allow a body that drops, rewords, or reopens the Issue's task-list
+    /// items.
     #[arg(long)]
     pub allow_removal: bool,
 }

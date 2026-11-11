@@ -61,6 +61,7 @@ members = [
     "shared/mmio",
     "shared/namespace-protocol",
     "shared/process-layout",
+    "shared/recv-pool",
     "shared/syscall",
     "shared/ipc",
     "shared/log",

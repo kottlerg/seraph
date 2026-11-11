@@ -50,7 +50,8 @@ svcmgr/
 │   │   └── reconcile.rs           # PendingRegistration + reconcile_and_launch
 │   └── arch/                      # Per-arch halt() entry
 ├── svc-defs/                      # `svcmgr-defs` crate: host-tested `.svc`
-│                                  # Definition types, parser, argv/env
+│                                  # Definition types, parser (over the line
+│                                  # grammar of `shared/svc-grammar`), argv/env
 │                                  # wire-blob encoder (`build_blob`), the
 │                                  # `cwd_rights` / `handover_permitted`
 │                                  # decisions, the windowed

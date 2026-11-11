@@ -37,3 +37,10 @@ parser, which keeps its own error type over this one.
 |---|---|
 | [`services/svcmgr/svc-defs`](../../services/svcmgr/README.md) | The `.svc` service definitions and the device class files (`/config/devmgr/classes/<class>.class`) |
 | [`services/devmgr/firmware`](../../services/devmgr/README.md) | The platform description tables of the boot bundle (`firmware::platform::parse_table`) |
+
+---
+
+## Summarized By
+
+[Driver Binding](../../docs/driver-binding.md),
+[`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)

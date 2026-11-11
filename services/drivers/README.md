@@ -150,7 +150,8 @@ The full driver lifecycle is specified in
   settles). See [docs/capability-model.md](../../docs/capability-model.md) for
   capability types and rights.
 - **Spawning** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
-  discovers devices (PCI enumeration, firmware tables), matches each PCI device to the most
+  discovers devices (PCI enumeration, firmware tables, the boot framebuffer, a platform
+  description table), matches each device record to the most
   specific driver declaration (every driver binary but the test-only `test-fault` and
   `test-orphan` fixtures carries one in the ELF note section `.note.seraph.driver`, emitted by
   `driver_binding::driver_declaration!`; see
@@ -190,8 +191,8 @@ The full driver lifecycle is specified in
 | [`virtio/console/`](virtio/console/README.md) | Binary + library | VirtIO console device driver — the debug port; serves the serial protocol behind devmgr's `QUERY_DEVICE` on the `debug-port` class |
 | [`serial/`](serial/README.md) | Binary | Serial (UART) device driver — COM1 (x86-64) / NS16550 (RISC-V); sole driver-mediated serial-byte sink |
 | [`framebuffer/`](framebuffer/README.md) | Binary + library | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
-| [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_DEVICE` on the `rtc` class |
-| [`goldfish-rtc/`](goldfish-rtc/README.md) | Binary | RISC-V Goldfish RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_DEVICE` on the `rtc` class |
+| [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — bound by devmgr to the `PNP0B00` record; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_DEVICE` on the `rtc` class |
+| [`goldfish-rtc/`](goldfish-rtc/README.md) | Binary | RISC-V Goldfish RTC driver — bound by devmgr to the `google,goldfish-rtc` platform record; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_DEVICE` on the `rtc` class |
 | [`iommu/core/`](iommu/core/README.md) | Library | Family-independent IOMMU driver logic: the bootstrap devmgr serves, the `iommu_labels` service and its per-domain checks, the polled fault queue, and the `Backend` trait |
 | [`iommu/riscv/`](iommu/riscv/README.md) | Binary + library | RISC-V IOMMU driver (riscv64) — devmgr-spawned at boot; programs each IOMMU's queues, device directory, and first-stage tables and confines each DMA-capable device to its own domain |
 | [`iommu/store/`](iommu/store/README.md) | Library | The table-page store both IOMMU drivers build their translation structures in: zeroed pages from memmgr, mapped, with their physical addresses |

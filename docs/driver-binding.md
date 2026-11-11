@@ -11,23 +11,23 @@ not yet implemented.
 
 ## Status
 
-Implemented for PCI device records: every driver binary but the test-only `test-fault` and
-`test-orphan` fixtures carries its declaration (§ Driver Declarations); devmgr reads the
-declarations of the boot modules it starts no fixed path for and of the drivers-directory
-entries, within § Declaration Bounds as far as they concern a PCI record; it matches them
-against the PCI records (§ Matching), binds each matched record through one path that delivers
-the resource list (§ Binding), and withdraws a bound driver in the order § Binding gives. The
-rest is design intent; not yet implemented:
+Implemented: every driver binary but the test-only `test-fault` and `test-orphan` fixtures
+carries its declaration (§ Driver Declarations); init forwards every boot module outside its
+bootstrap set to devmgr untagged; devmgr reads the declarations of the boot modules and of the
+drivers-directory entries, within § Declaration Bounds; it enumerates every kind of device
+record of § Device Records (PCI, the ACPI namespace, the SPCR, the boot framebuffer, a platform
+description table, the IOMMU family), matches the declarations against the records (§ Matching),
+binds each matched PCI and platform record through one path that delivers the resource list
+(§ Binding), and withdraws a bound driver in the order § Binding gives. The rest is design
+intent; not yet implemented:
 
-- every enumerator but PCI (§ Device Records): devmgr starts the serial, framebuffer, RTC, and
-  IOMMU drivers on fixed paths of their own, and gives them their simple-device or IOMMU
-  bootstrap rounds rather than the resource list, though each of them carries its declaration;
-- init's untagged forwarding of the modules that carry a declaration: init tags each boot
-  module with its module class, as it delivers them today;
+- the IOMMU driver's delivery: devmgr binds it by its family record but gives it its own
+  bootstrap rounds rather than the resource list;
 - message-signaled vectors: a PCI function's driver is given its wired line only;
 - the retirement of the test-only labels and of `TEST_LABEL_AUTHORITY`, and the declarations of
-  the `test-fault` and `test-orphan` fixtures, which devmgr starts only on those labels
-  (§ Test Fixtures).
+  the `test-fault` and `test-orphan` fixtures, which devmgr still starts on the simple-device
+  path only on those labels (§ Test Fixtures,
+  [#165](https://github.com/kottlerg/seraph/issues/165)).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
 `MINT_CLASS_SEND`, the class files, and the boot-only mark.
@@ -79,8 +79,10 @@ knows its bus or firmware standard and no driver.
 
 devmgr runs no AML: the namespace enumerator reads only `Device` objects whose identifying and
 resource objects are static `Name` objects, and skips one that defines any of them as a
-`Method`. The platform description covers a device the machine's tables do not describe in
-that form; it is data, so a new machine adds a table, not devmgr code.
+`Method`. It does not evaluate `_STA`: a `Device` whose `_STA` is a `Name` with bit 0 clear is
+not reported, and one whose `_STA` is a `Method` is reported. The platform description covers a
+device the machine's tables do not describe in that form; it is data, so a new machine adds a
+table, not devmgr code.
 
 One device has one record. Records are merged by resource identity: a record whose `Mmio` base
 or `IoPort` base an earlier record already holds adds its identity keys to that record rather
@@ -102,6 +104,30 @@ The interrupt resource is never one GSI: a record states its kind and a count, s
 that offers several message-signaled vectors is described as such, and the binding delivers one
 capability per vector it grants. The kernel's minting of message-signaled targets is
 [#325](https://github.com/kottlerg/seraph/issues/325).
+
+### Platform Description Tables
+
+A platform description table is a per-machine text file in the `.svc` grammar of the device
+class files (line-oriented `key = value`; a line starting `#` is a comment; blank lines are
+skipped), parsed by the one grammar parser of
+[`shared/svc-grammar`](../shared/svc-grammar/README.md). It carries:
+
+- `oem_table_id = <id>`: at most 8 bytes, compared with the OEM table ID of the XSDT header,
+  space padded;
+- one `device = <key> <resource>...` line per device, `<key>` being the platform key a driver's
+  declaration matches, and each resource one of `mmio <base> <size>`, `io <base> <count>`, or
+  `wired <line> <mode>`, with mode `level-high`, `level-low`, `edge-high`, or `edge-low`.
+
+A table holds at most `MAX_TABLE_BYTES` = 8192 bytes, `MAX_PLATFORM_DEVICES` = 16 devices,
+`MAX_PLATFORM_KEY_BYTES` = 32 bytes per key, and `MAX_PLATFORM_RESOURCES` = 4 resources per
+device; a table past a bound is rejected whole and logged.
+
+Tables live in the tree at `services/devmgr/platform/<machine>.platform`. `xtask/src/bundle.rs`
+(`ARCH_TABLES`) bundles them per architecture as boot modules (riscv64:
+`platform-qemu-virt`, from `services/devmgr/platform/qemu-virt.platform`; x86-64: none), init
+forwards them to devmgr with the driver modules, and devmgr tells one from a driver image by
+its content. devmgr uses the table whose `oem_table_id` equals the XSDT's OEM table ID. With no
+such table there are no platform-table records, and devmgr logs that once.
 
 ---
 
@@ -133,11 +159,13 @@ devmgr implements once, for every driver that declares them.
 
 devmgr collects declarations from two places:
 
-- **Boot modules.** init forwards to devmgr, untagged, every boot module that carries a
-  `.note.seraph.driver` note, and devmgr decodes each one. A module that carries none (the
-  bootstrap set's own modules, and `fatfs`, which init delivers to vfsd until filesystem
-  drivers declare themselves) goes where the bootstrap protocols deliver it today. A forwarded
-  module whose note does not decode is logged and released.
+- **Boot modules.** init forwards to devmgr, untagged, a copy of every boot module outside the
+  bootstrap set (init, procmgr, memmgr, devmgr, vfsd, and `fatfs`, which init delivers to vfsd
+  until filesystem drivers declare themselves), and devmgr tells them apart by content: an ELF
+  image is a driver, whose `.note.seraph.driver` note devmgr decodes; valid UTF-8 text is a
+  platform description table (§ Platform Description Tables). A driver image whose note is
+  missing or does not decode, a table that is rejected, and any other module are logged and
+  released.
 - **The drivers directory.** On `SET_DRIVERS_DIR` devmgr lists `/services/drivers/`
   (`NS_READDIR`, so svcmgr sends the subtree cap with `READDIR` beside `LOOKUP | READ`) and
   reads the note of each entry. A binary whose declaration matches no recorded device is not
@@ -163,7 +191,7 @@ never claims more than its device and the system's policy give it:
   drivers-directory declaration of any of them is logged and ignored, and a drivers-directory
   driver runs at the auxiliary tier.
 - **Withdrawal.** devmgr shares a wired line only among PCI functions; it carves the line of
-  any other record exclusive, as it carves the UART's today. Whatever reset a declaration
+  any other record exclusive, as it carves the console UART's. Whatever reset a declaration
   names, withdrawing the driver of a PCI function disables the function's wired interrupt
   (§ Binding). A reset of none therefore cannot leave a shared line asserting for the other
   drivers on it.
@@ -201,8 +229,10 @@ function; then the firmware's table order). A device no declaration matches stay
 and unbound, and a later declaration (a driver installed afterwards, or a hotplug pass) can
 still match it.
 
-The IOMMU driver is matched by its family key against the IOMMU record, so one driver process
-serves every unit of its family. Its binding keeps what
+The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
+`IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process
+serves every unit of its family. It is spawned with its own IOMMU bootstrap rounds
+(`iommu_core::bootstrap`), not the resource list. Its binding keeps what
 [device-management.md](device-management.md#iommu-discovery-and-programming) § IOMMU Discovery
 and Programming specifies:
 
@@ -232,8 +262,9 @@ and for a hot-added device:
    within § Declaration Bounds, from its boot module or its file.
 4. Deliver the capabilities over the bootstrap protocol as a self-describing resource list:
    each capability with its resource kind and its fields, then the service endpoint, the
-   devmgr query capability, and the DMA capability. One delivery shape serves every driver,
-   in place of today's VirtIO and simple-device round shapes.
+   devmgr query capability, and the DMA capability. One delivery shape serves every driver
+   that binds to a PCI or platform record; the IOMMU driver takes its own bootstrap rounds, and
+   the test-only fixtures the simple-device rounds.
 5. Record the driver in the pass's settle batch; the settle, the serving of ready drivers, and
    the withdrawal of the rest are unchanged
    ([responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)

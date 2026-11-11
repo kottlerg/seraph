@@ -46,3 +46,8 @@ At the gate, give both verdict lines verbatim and say that the PR meets the merg
 (docs/conventions.md § Pre-merge review). The maintainer's instruction to merge is the one
 decision left; merge only on it. For the release PR, which the gate names with
 `gate-release-approval`, that instruction is also the approval its merge needs.
+
+After the merge, when it shares a file with another merge since the previous release tag, run
+the composition check of docs/conventions.md § Composition check as
+`.claude/agents/worker.md` § Composition check describes, and give its verdict line to the
+maintainer. A defect it finds is the next PR, with the maintainer's agreement.

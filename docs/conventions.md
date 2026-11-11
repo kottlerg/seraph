@@ -347,7 +347,7 @@ of a `## Summarized By` list, a document that could read better, and a test the 
 pattern would add are not defects: what a script can decide of them, `cargo xtask` checks in CI
 (`lint-docs`, `commit-check`, `pr-check`), and what it cannot is not enforced by review. A
 defect on the review surface blocks the merge and is fixed in the PR. A defect off the surface
-is recorded (§ Recording findings), not fixed.
+is recorded (§ Recording findings) before the merge, not fixed.
 
 ### Review surface
 
@@ -377,8 +377,12 @@ the reviewer reviewed, and judges only:
   changes. The incoming diff of a sync is not the PR's change.
 
 A delta run raises no new finding on code an earlier round passed: a defect outside the delta's
-own change that an earlier run did not report is not reported, whatever its anchor. It is
-recorded (§ Recording findings) when the reviewer meets it.
+own change that an earlier run did not report does not affect the verdict, whatever its anchor:
+the reviewer reports it as out of bound, and it is recorded (§ Recording findings).
+
+A run with the reviewer that a sync owes (§ Syncing with `master`) also judges the sync: how
+the incoming change composes with the PR's own change in the files both touch, and any conflict
+the merge resolved.
 
 ### Follow-up Issues
 
@@ -549,9 +553,10 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    defect the maintainer decides to ship gets an open Issue that names it.
    The defects the maintainer decides to fix go into one fix PR through
    the normal PR workflow, and each audit failure into its fix. The fix
-   PR's review checks only that each listed defect is fixed and that its
-   fix has a test ([coding-standards.md](coding-standards.md) § D. Testing
-   Invariants); it raises no new finding on the surrounding code. The
+   PR's review checks that each listed defect is fixed and that its fix
+   has a test ([coding-standards.md](coding-standards.md) § D. Testing
+   Invariants), and judges the fix's own hunks as § Rounds judges a delta
+   run's own change; it raises no new finding on the surrounding code. The
    release review is not run again over the fix. A refuted, contested, or
    unverified finding goes to the maintainer with the list, and is
    recorded only as they decide.

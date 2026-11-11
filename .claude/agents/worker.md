@@ -315,7 +315,8 @@ merge; say so in the gate report.
 
 ## Composition check
 
-After your PR merges, the orchestrator may send you `composition check <merge>`: run one
+After your PR merges, the orchestrator sends you `composition check <merge>` when the merge
+shares a file with another merge since the previous release tag: run one
 `pr-reviewer` as docs/conventions.md § Composition check describes, giving it the merge, the
 previous release tag, and that it is a composition check, and save its prose as
 `target/xtask/review/pr<N>/composition-<merge>.md`. Send the orchestrator its verdict line. A

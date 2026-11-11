@@ -136,8 +136,8 @@ pub enum CliCommand
     /// Check the mechanical documentation and source-header rules: Markdown
     /// column limit, file-header layout, `## Summarized By` shape, forward
     /// links, order, and labels, and document reachability from the root
-    /// README. Runs in CI's
-    /// host-tests job; see xtask/README.md for the rule list and levels.
+    /// README. Runs in CI's host-tests job; see xtask/README.md for the rule
+    /// list and levels.
     LintDocs(LintDocsArgs),
 
     /// Check the commits of a range against the commit-message rules of

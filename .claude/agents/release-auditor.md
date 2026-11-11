@@ -63,7 +63,9 @@ Production requires before its tag, not code quality: the reviewers own that.
    bump from which the change to the candidate head is documentation or
    comments only (`git diff --name-only <run head> <head>` names only
    Markdown, and `git diff <run head> <head>` alters only comment lines of
-   any other file; § Release Production step 4).
+   any other file, text a build embeds such as an `include_str!`,
+   `include_bytes!`, or `global_asm!` input counting as build input, as
+   `docs/testing.md` § Coverage tiers says; § Release Production step 4).
 
 ## Output
 

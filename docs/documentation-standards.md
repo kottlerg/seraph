@@ -87,8 +87,8 @@ summarizes a child doc, the parent MUST appear in the child's `## Summarized By`
 [Title](relative/path.md), [Title](relative/path.md)
 ```
 
-Entries are sorted by the path they link, byte by byte (`README.md` before a lowercase name),
-and wrapped to the column limit; an entry for a `README.md` is
+Entries are sorted by the repository path each link resolves to, byte by byte (`README.md`
+before a lowercase name), and wrapped to the column limit; an entry for a `README.md` is
 labelled with its repository path, any other entry with the document's `# Title`.
 
 If no document summarizes this document:

@@ -60,7 +60,10 @@ better, or a test the surrounding pattern would add.
     or reverse dependency they break. Raise no new finding on code an
     earlier round passed: a defect outside the delta's own change that no
     earlier run reported is listed under `Out of bound (recorded)`, naming
-    the Issue that records it, and does not affect the verdict.
+    the Issue that records it, and does not affect the verdict. When the
+    parent says the run is owed by a sync, also judge how the incoming
+    change composes with the PR's own change in the files both touch, and
+    any conflict the merge resolved (`docs/conventions.md` § Rounds).
 
     A composition check (`docs/conventions.md` § Composition check) names a
     merge and the previous release tag instead of a PR. Its files are those
@@ -73,10 +76,11 @@ better, or a test the surrounding pattern would add.
     naming both merges.
 
     A release fix verification (`docs/conventions.md` § Release Production
-    step 2) names the list of defects the PR fixes. Report only a listed
-    defect the head does not fix and a listed fix without the test
-    `docs/coding-standards.md` § D. Testing Invariants requires; raise no
-    other finding.
+    step 2) names the list of defects the PR fixes. Report a listed defect
+    the head does not fix, a listed fix without the test
+    `docs/coding-standards.md` § D. Testing Invariants requires, and a
+    defect in the fix's own hunks or in a caller they break, as a `delta`
+    run judges its own change; raise no finding on the surrounding code.
 
     Per `docs/conventions.md` § Ledger, when the parent names a ledger file
     or a ledger command, read its entries for the files you report on (a

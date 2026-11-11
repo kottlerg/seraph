@@ -36,7 +36,8 @@ Give the reviewer, in addition:
 - for a `delta` run (every run after the first), the `since` head, which is the head the last
   run with the reviewer reviewed, the path of that run's record, the fixes the round claims,
   and the merge bases at `since` and at the head (`git merge-base <sha> origin/master` for
-  each). It judges only those fixes and the delta's own change (docs/conventions.md § Rounds);
+  each). It judges only those fixes and the delta's own change (docs/conventions.md § Rounds),
+  and, when a sync owes the run, how the sync composes with the PR's change: say so;
 - for the fix PR of a release review (docs/conventions.md § Release Production step 2), the
   list of defects it fixes, and that this run is the release fix verification.
 
@@ -62,7 +63,6 @@ defines the record. Six points it leaves to you:
 
 - `stats.form` is `defects`, and each finding carries `file`, `line`, `status`, `issue`,
   `claim`, and `fix`, with no class or bucket.
-
 - `stats.run` is the run's number among the PR's runs of every mode, counting from 1: one more
   than the highest `run` among the records already saved. It orders the runs, and the gate
   reads the highest one at the head; the `-<n>` suffix only keeps two file names apart.
@@ -130,11 +130,16 @@ reviewer.
 ## The merge condition
 
 The PR meets the merge condition of docs/conventions.md § Pre-merge review when
-`cargo xtask pr-check <N> --gate` passes. For a PR whose records are of the earlier form, read
-its `gate-findings-recorded` warning, when it prints one, and confirm that each finding it
-counts is recorded and none is contested. For the
+`cargo xtask pr-check <N> --gate` passes. When it prints `gate-defects-recorded`, confirm that
+each defect a run recorded off the surface is on its Issue before the merge. For a PR whose
+records are of the earlier form, read its `gate-findings-recorded` warning, when it prints one,
+and confirm that each finding it counts is recorded and none is contested. For the
 release PR the command prints `gate-release-approval`: that PR meets the condition only once the
 maintainer has approved its merge. A worker then hands its gate report to the orchestrator,
 which verifies the gate and merges. A standalone session tells the maintainer that the PR meets
 the condition and merges on their instruction. The merge command is
 `gh pr merge <N> --merge --delete-branch` (docs/conventions.md § Merge method).
+
+After the merge, the composition check of docs/conventions.md § Composition check is owed when
+the merge shares a file with another merge since the previous release tag: the orchestrator
+asks the PR's worker for it, and a standalone session runs it itself.

@@ -16,7 +16,8 @@
 // Scope (one agent) lists the range, its first-parent units (one per merged
 // PR), and each unit's files. Review runs one `pr-reviewer` per shard of the
 // code files two or more units touched (no other code file is reviewed line by
-// line), one lens over every document and instruction file the range touched,
+// line), one lens over every Markdown document and instruction file the range
+// touched,
 // and the whole-range lenses, in parallel. Verify puts every defect that can
 // block (one no open Issue names) to two independent refuters as soon as its
 // reviewer completes; the reality refuter also judges whether the defect was
@@ -504,7 +505,8 @@ const open_issue_numbers = new Set(scope.open_issues.map((i) => i.number))
 // ─── The audit (every mode but scope) ───
 
 // The known-issue candidates: in a full run, the defects an open Issue names
-// and those that predate the range with an Issue; in audit mode, the Known
+// (a defect that predates the range has no Issue yet, so it is not one); in
+// audit mode, the Known
 // Issues the release notes at the head list, which record the maintainer's
 // decision on the full run's list.
 const audit_prompt = (candidates) => [
@@ -583,9 +585,11 @@ if (MODE === 'audit') {
 
 // The shard rule: a code file is reviewed line by line only when two or more
 // units of the range touched it. The units of a file are the first-parent
-// commits whose own diff (`<sha>^1..<sha>`) names it. Documents and
-// instruction files are read by the documents lens instead.
-const is_document = (f) => f.kind === 'markdown' || f.kind === 'rules'
+// commits whose own diff (`<sha>^1..<sha>`) names it. A Markdown file, a
+// document or an instruction file under `.claude/` or `.github/`, is read by
+// the documents lens instead; a rules file that is not Markdown (a CI
+// workflow, this script, the settings) is code and is sharded.
+const is_document = (f) => f.path.toLowerCase().endsWith('.md')
 const touched_by = new Map()
 for (const u of scope.units) {
     for (const p of u.files) {
@@ -867,6 +871,11 @@ phase('Review')
 const seen = []
 const ledgered = []
 let ceiling_reached = false
+// The agents the run has committed to: every one the plan counts (scope, the
+// reviewers whether started or not, and those after Verify), and each pair of
+// refuters as it is granted, so the ceiling holds however the runtime orders
+// the reviewers and the refuters.
+let committed_agents = fixed_agents
 
 // A later finding from another agent in the same file within DEDUP_LINE_SLACK
 // lines is the same defect: the nearest such record keeps its claim and
@@ -944,12 +953,13 @@ function verify_one(f) {
         return Promise.resolve(f)
     }
     if (f.verification) return f.verification
-    if (agent_calls + VERIFY_LENSES.length + AFTER_VERIFY > MAX_AGENTS) {
+    if (committed_agents + VERIFY_LENSES.length > MAX_AGENTS) {
         ceiling_reached = true
         f.status = 'unverified'
         f.annotations.push('not verified: the run reached its ceiling of ' + MAX_AGENTS)
         return Promise.resolve(f)
     }
+    committed_agents += VERIFY_LENSES.length
     f.verify_started = true
     f.verification = parallel(
         VERIFY_LENSES.map((lens) => () => {

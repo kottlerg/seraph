@@ -465,17 +465,23 @@ fn run_number(record: &Value) -> u64
 /// `NON-BLOCKING ISSUES ONLY`.
 fn passes(record: &Value) -> bool
 {
-    let verdict_passes = match record["verdict"].as_str()
-    {
-        Some("READY TO MERGE") => true,
-        Some(NON_BLOCKING) => Form::of(record) == Form::Earlier,
-        _ => false,
-    };
     record["audit_verdict"] == "AUDIT PASS"
         && record["stats"]["failed"]
             .as_array()
             .is_some_and(Vec::is_empty)
-        && verdict_passes
+        && verdict_passes(record)
+}
+
+/// Whether a record's reviewer verdict lets the PR merge: `READY TO MERGE`,
+/// or, in an earlier-form record, `NON-BLOCKING ISSUES ONLY`.
+fn verdict_passes(record: &Value) -> bool
+{
+    match record["verdict"].as_str()
+    {
+        Some("READY TO MERGE") => true,
+        Some(NON_BLOCKING) => Form::of(record) == Form::Earlier,
+        _ => false,
+    }
 }
 
 /// The runs at `head`, ordered by `stats.run`, the last run last. An error
@@ -568,9 +574,21 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
         )];
     }
     // An audit that completes a run of the reviewer alone judges that run:
-    // its verdict and its findings are the run's as much as the audit's.
+    // its verdict and its findings are the run's as much as the audit's, so
+    // a blocking verdict of the run blocks whatever the audit record states.
+    let completed = completed_run(&runs);
+    if let Some((run_name, run)) = completed
+        && !verdict_passes(run)
+    {
+        return vec![Diag::error(
+            "gate-review-record",
+            run_name.as_str(),
+            "the run of the reviewer alone that the last audit at this head completes has a \
+             verdict that does not pass",
+        )];
+    }
     let judged: Vec<&Value> = std::iter::once(record)
-        .chain(completed_run(&runs).map(|(_, r)| r))
+        .chain(completed.map(|(_, r)| r))
         .collect();
     let non_blocking = judged.iter().any(|r| r["verdict"] == NON_BLOCKING);
     let mut open: Vec<&Value> = judged
@@ -580,9 +598,10 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
         .collect();
     open.sort_by_key(ToString::to_string);
     open.dedup();
+    let mut out = Vec::new();
     if non_blocking && !open.is_empty()
     {
-        return vec![Diag::warning(
+        out.push(Diag::warning(
             "gate-findings-recorded",
             name.as_str(),
             format!(
@@ -590,9 +609,37 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
                  contested",
                 open.len()
             ),
-        )];
+        ));
     }
-    Vec::new()
+    let off_surface = recorded_defects(records);
+    if off_surface > 0
+    {
+        out.push(Diag::warning(
+            "gate-defects-recorded",
+            name.as_str(),
+            format!(
+                "the PR's runs reported {off_surface} defect(s) off the surface; confirm each \
+                 is recorded on its Issue before the merge"
+            ),
+        ));
+    }
+    out
+}
+
+/// The defects the PR's defect-form runs reported off the surface (their
+/// `recorded` lists, each defect once), which docs/conventions.md § Findings
+/// has recorded before the merge.
+fn recorded_defects(records: &[Record]) -> usize
+{
+    let mut claims: Vec<String> = records
+        .iter()
+        .filter(|(_, r)| Form::of(r) == Form::Defects)
+        .flat_map(|(_, r)| r["recorded"].as_array().into_iter().flatten())
+        .map(|f| format!("{}:{}:{}", f["file"], f["line"], f["claim"]))
+        .collect();
+    claims.sort();
+    claims.dedup();
+    claims.len()
 }
 
 /// Whether the gate's reader must look at an earlier-form finding a
@@ -742,12 +789,59 @@ pub fn run_check(ctx: &BuildContext, args: &ReviewCheckArgs) -> Result<()>
 /// Entry point for `cargo xtask review-ledger`.
 pub fn run_ledger(ctx: &BuildContext, args: &ReviewLedgerArgs) -> Result<()>
 {
-    match (args.pr, &args.release)
+    match ledger_target(args)?
     {
-        (Some(pr), None) => write_pr_ledger(ctx, pr),
-        (None, Some(version)) => print_release_ledger(ctx, version, args),
-        _ => bail!("name a pull request number, or --release <X.Y.Z> with --from <ref>"),
+        LedgerTarget::Pr(pr) => write_pr_ledger(ctx, pr),
+        LedgerTarget::Release { version, from } =>
+        {
+            print_release_ledger(ctx, &version, &from, &args.file)
+        }
     }
+}
+
+/// What `review-ledger` builds the ledger of.
+#[derive(Debug, PartialEq, Eq)]
+enum LedgerTarget
+{
+    /// A pull request's records, into its `ledger.json`.
+    Pr(u64),
+    /// A release review's ledger, printed: the target version and the
+    /// previous release tag the range starts at.
+    Release
+    {
+        version: String, from: String
+    },
+}
+
+/// The ledger the arguments name. Clap already refuses a number beside
+/// `--release` and either of `--release` and `--from` without the other;
+/// this refuses what is left: no target at all, and a malformed version.
+fn ledger_target(args: &ReviewLedgerArgs) -> Result<LedgerTarget>
+{
+    match (args.pr, &args.release, &args.from)
+    {
+        (Some(pr), None, None) => Ok(LedgerTarget::Pr(pr)),
+        (None, Some(version), Some(from)) => Ok(LedgerTarget::Release {
+            version: release_version(version)?,
+            from: from.clone(),
+        }),
+        _ => bail!("name a pull request number, or --release <X.Y.Z> with --from <tag>"),
+    }
+}
+
+/// The target version `X.Y.Z` of `--release`: three non-empty runs of
+/// digits.
+fn release_version(version: &str) -> Result<String>
+{
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()))
+    {
+        bail!("--release takes the target version X.Y.Z, not {version}");
+    }
+    Ok(version.to_owned())
 }
 
 /// Write `ledger.json` beside a pull request's run records.
@@ -776,21 +870,13 @@ fn write_pr_ledger(ctx: &BuildContext, pr: u64) -> Result<()>
 /// pull request merged in `<from>..HEAD` and of the release's own runs,
 /// limited to the files named. The account goes to stderr, so stdout holds
 /// the JSON alone.
-fn print_release_ledger(ctx: &BuildContext, version: &str, args: &ReviewLedgerArgs) -> Result<()>
+fn print_release_ledger(
+    ctx: &BuildContext,
+    version: &str,
+    from: &str,
+    files: &[String],
+) -> Result<()>
 {
-    let valid = version.split('.').count() == 3
-        && version
-            .split('.')
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
-    if !valid
-    {
-        bail!("--release takes the target version X.Y.Z, not {version}");
-    }
-    let Some(from) = &args.from
-    else
-    {
-        bail!("--release needs --from <previous release tag>");
-    };
     let subjects = run_cmd_capture(
         Command::new("git")
             .args([
@@ -821,7 +907,7 @@ fn print_release_ledger(ctx: &BuildContext, version: &str, args: &ReviewLedgerAr
         read += records.len();
         entries.extend(release_ledger(&records));
     }
-    let mut entries = for_files(entries, &args.file);
+    let mut entries = for_files(entries, files);
     entries.sort_by_key(Value::to_string);
     entries.dedup();
     eprintln!(
@@ -1372,6 +1458,27 @@ mod tests
     }
 
     #[test]
+    fn the_gate_asks_for_the_recording_of_defects_off_the_surface()
+    {
+        // An earlier run at another head recorded one defect, the last run
+        // the same one again and another.
+        let mut first = defect_record("BLOCKING ISSUES", vec![defect("a", "unverified")]);
+        first["recorded"] = json!([defect("off", "unverified")]);
+        first["stats"]["head"] = json!("1111aaaa22223333");
+        let mut last = defect_record("READY TO MERGE", vec![]);
+        let mut other = defect("off two", "unverified");
+        other["line"] = json!(20);
+        last["recorded"] = json!([defect("off", "unverified"), other]);
+        let records = vec![
+            ("full-1111aaaa.json".to_owned(), first),
+            (NAME.to_owned(), last),
+        ];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["gate-defects-recorded"]);
+        assert!(found[0].message.contains("reported 2 defect(s)"));
+    }
+
+    #[test]
     fn the_gate_passes_a_ready_defect_form_run_and_fails_a_blocking_one()
     {
         let ready = vec![(NAME.to_owned(), defect_record("READY TO MERGE", vec![]))];
@@ -1485,6 +1592,72 @@ mod tests
                         Merge pull request #9x from y\n\
                         Merge branch 'master' into z\n";
         assert_eq!(merged_prs(subjects), [871, 12]);
+    }
+
+    fn ledger_args(pr: Option<u64>, release: Option<&str>, from: Option<&str>) -> ReviewLedgerArgs
+    {
+        ReviewLedgerArgs {
+            pr,
+            release: release.map(str::to_owned),
+            from: from.map(str::to_owned),
+            file: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_ledger_target_is_a_pull_request_or_a_release()
+    {
+        assert_eq!(
+            ledger_target(&ledger_args(Some(872), None, None)).unwrap(),
+            LedgerTarget::Pr(872)
+        );
+        assert_eq!(
+            ledger_target(&ledger_args(None, Some("0.1.4"), Some("v0.1.3"))).unwrap(),
+            LedgerTarget::Release {
+                version: "0.1.4".to_owned(),
+                from: "v0.1.3".to_owned()
+            }
+        );
+        for bad in [
+            ledger_args(None, None, None),
+            ledger_args(None, Some("0.1.4"), None),
+            ledger_args(Some(1), Some("0.1.4"), Some("v0.1.3")),
+        ]
+        {
+            let err = ledger_target(&bad).unwrap_err().to_string();
+            assert!(err.starts_with("name a pull request number"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_release_version_is_three_runs_of_digits()
+    {
+        assert_eq!(release_version("10.0.12").unwrap(), "10.0.12");
+        for bad in ["0.1", "0.1.4.1", "v0.1.4", "0..4", "0.1.x", ""]
+        {
+            let err = release_version(bad).unwrap_err().to_string();
+            assert!(err.starts_with("--release takes"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_gate_fails_an_audit_that_completes_a_blocking_reviewer_run()
+    {
+        // The audit record wrongly states READY TO MERGE; the run it completes
+        // blocked.
+        let records = vec![
+            (
+                NAME.to_owned(),
+                reviewer_alone(2, "BLOCKING ISSUES", vec![finding("a", "unverified")]),
+            ),
+            (
+                "audit-0a82b0aa.json".to_owned(),
+                run("audit", 3, "READY TO MERGE", "AUDIT PASS"),
+            ),
+        ];
+        let found = gate_diags(&records, HEAD);
+        assert_eq!(rules(&found), ["gate-review-record"]);
+        assert_eq!(found[0].at, NAME);
     }
 
     #[test]

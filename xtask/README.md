@@ -881,7 +881,7 @@ pre-merge review's.
 | `src-header` | error | Every tracked `.rs`, `.ld`, `.S`, `.sh`, `.yml`: the SPDX line first (after a shebang in `.sh`; on line 2, after `/*`, in a block-comment `.ld`); exactly one blank line, then the path line; for Rust, exactly one blank line, then the `//!` block before any `#![` attribute, per [docs/coding-standards.md](../docs/coding-standards.md) § File Headers. |
 | `md-summarized-by` | error | Every authoritative document ends with `---` and a `## Summarized By` section holding `None` or a non-empty list of links, each resolving to a path inside the repository (no external URL, in-page-only anchor, or `..` past the root), per [docs/documentation-standards.md](../docs/documentation-standards.md) § Backlinks and Change Propagation. |
 | `md-backlink-forward` | error | Every `## Summarized By` entry names a tracked document that links this one. |
-| `md-summarized-by-order` | error | The `## Summarized By` entries are sorted by the path they link, byte by byte, and none is listed twice. |
+| `md-summarized-by-order` | error | The `## Summarized By` entries are sorted by the repository path each link resolves to, byte by byte, and none is listed twice. |
 | `md-summarized-by-label` | error | Each `## Summarized By` entry for a `README.md` is labelled with its repository path, and each other entry with the linked document's `# Title`. |
 | `md-reachable` | error | Every authoritative document is reachable by links from the root `README.md`; the root README links every `docs/*.md` and every other README links each document in its own `docs/`, per [docs/documentation-standards.md](../docs/documentation-standards.md) § Discoverability and Linking. |
 | `md-coverage-symbols` | error | Every name the surface list of [docs/testing.md](../docs/testing.md) § Coverage tiers states resolves: from the paragraph starting `**Boundary surface.**` up to the one starting `**Repeat count.**`, each code span naming an item, field path, or `_*` family, and each alternative of the `S`, `M`, and `D` screen variables (groups expanded, character classes kept), matches as a whole word in the code of a tracked Rust source outside `xtask/` with `//` comments stripped, or, from the paragraph starting `**Device surfaces.**` on, in that of one inside `xtask/` other than the rule's own `lint_docs.rs`; each listed `.rs` path (`*` within one component; a bare file name in any directory) names a tracked file; and each listed directory, written with a trailing `/` (`*` within one component), has a tracked file beneath it. |
@@ -966,10 +966,11 @@ fails the gate.
 | `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
 | `gate-includes-master` | error | The base branch is an ancestor of the PR head. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
-| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and the reviewer verdict `READY TO MERGE` (or, in a record of the earlier form, `NON-BLOCKING ISSUES ONLY`). The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
+| `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and the reviewer verdict `READY TO MERGE` (or, in a record of the earlier form, `NON-BLOCKING ISSUES ONLY`). The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. When that record is an `audit` record that completes a run of the reviewer alone, that run's verdict must pass too. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. |
 | `gate-added-files` | error | The files the PR adds can be read from the clone, which the next rule needs. |
 | `gate-release-approval` | warning | The PR adds no `docs/releases/v<X>.<Y>.<Z>.md`. One that does is the release PR of § Release Production, whose merge needs the maintainer's approval (§ Pre-merge review); the command cannot read an approval, so it names the PR for its reader. |
 | `gate-findings-recorded` | warning | A record of the earlier form with the verdict `NON-BLOCKING ISSUES ONLY` leaves no finding on the surface that needs a reader: one an Issue had to record (a class other than `style`, or a MUST violation), or one of any class whose `status` is `contested`. When the last record is an `audit` record that completes a run of the reviewer alone, that run's verdict and findings count too. The reader confirms each counted finding is recorded and none is contested; the command cannot. |
+| `gate-defects-recorded` | warning | No defect-form record of the PR lists a defect off the surface (`recorded`). The reader confirms that each one it counts is recorded on its Issue before the merge (§ Findings); the command cannot. |
 
 The command does not judge what needs a reader: whether the body's claims match the diff, whether
 an acceptance item is delivered, and which local host runs the change owes. Those stay with the
@@ -1008,8 +1009,9 @@ form use, and is checked as it was written: its reviewer verdict may also be
 `NON-BLOCKING ISSUES ONLY`, and each finding also carries `class` (`correctness`, `safety`,
 `contract`, `standards`, `doc-drift`, `coverage`, or `style`), `bucket` (`critical`, `should`, or
 `nit`), and `must_violation` (a boolean), with the `status` `nit` allowed. Such a record still
-meets the gate as it did. A defect-form finding that carries `class`, `bucket`, or
-`must_violation` is a shape error.
+meets the gate as it did. The command cannot tell a new record that omits `stats.form` from an
+earlier one, so the `pr-review` skill writes it on every new record. A defect-form finding that
+carries `class`, `bucket`, or `must_violation` is a shape error.
 
 The command reports each departure as `error record-shape` or, for a file name that
 does not state its record's mode and head, `error record-name`. A record with `audit_verdict`

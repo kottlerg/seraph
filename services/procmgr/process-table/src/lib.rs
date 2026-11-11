@@ -1586,6 +1586,95 @@ mod tests
         );
     }
 
+    /// The restore rule over every origin a registration records, with and
+    /// without a crash badge, and every binding a restore can find: the
+    /// sender's own crash badge, another live registry's, an orphaned one,
+    /// each process badge, a debugger's, another handler's, and none. Its
+    /// invariants: a thread recorded as the sender's own follows the main
+    /// thread's rule; any other is bound to the crash endpoint only under its
+    /// live, undeclared owner's badge, from a debugger's binding, and only
+    /// when procmgr left it under that badge at the registration; a
+    /// debugger's binding never stays; and nothing else is touched.
+    #[test]
+    fn a_restore_binds_back_only_the_senders_own_threads_and_an_owners_left_one()
+    {
+        let debugger = ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3;
+        let (mut table, [own, other, orphan]) = two_processes();
+        table.insert(entry_with_badge(0x60)).unwrap();
+        assert!(table.declare_no_debug(0x60).is_some());
+        let gone = 0x70;
+        let origins = [
+            Origin::Own,
+            Origin::Foreign(0x50),
+            Origin::Foreign(0x60),
+            Origin::Foreign(gone),
+            Origin::Unbound,
+        ];
+        let currents = [
+            None,
+            Some(debugger),
+            Some(own),
+            Some(other),
+            Some(orphan),
+            Some(0x40),
+            Some(0x50),
+            Some(0x60),
+            Some(gone),
+            Some(0x99),
+        ];
+        let sender = table.find_by_badge(0x40).unwrap();
+        for origin in origins
+        {
+            for crash in [0, own]
+            {
+                for current in currents
+                {
+                    let thread = RegisteredThread::new(9, crash, origin);
+                    let action = table.restore_action(0x40, &thread, current);
+                    let from_debugger = current == Some(debugger);
+                    let case = (origin, crash, current);
+                    if origin == Origin::Own
+                    {
+                        let expected = if sender.restores(current, crash)
+                        {
+                            RestoreAction::Bind(crash)
+                        }
+                        else
+                        {
+                            RestoreAction::Leave
+                        };
+                        assert_eq!(action, expected, "{case:?}");
+                    }
+                    else if from_debugger
+                    {
+                        let expected = if origin == Origin::Foreign(0x50) && crash == 0
+                        {
+                            RestoreAction::Bind(0x50)
+                        }
+                        else
+                        {
+                            RestoreAction::Unbind
+                        };
+                        assert_eq!(action, expected, "{case:?}");
+                    }
+                    else
+                    {
+                        assert_eq!(action, RestoreAction::Leave, "{case:?}");
+                    }
+                    if from_debugger
+                    {
+                        assert_ne!(action, RestoreAction::Leave, "{case:?}");
+                    }
+                    assert_eq!(
+                        table.restore_action(0x41, &thread, current),
+                        RestoreAction::Leave,
+                        "{case:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_declaration_from_a_badge_with_no_live_process_marks_nothing()
     {

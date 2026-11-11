@@ -8,7 +8,7 @@
 use ipc::IpcMessage;
 
 use crate::IrqRangeAllocator;
-use crate::caps::DevmgrCaps;
+use crate::caps::{DevmgrCaps, Firmware};
 use crate::reply_status;
 use crate::tables::{locate_table_by_sig, with_acpi_table};
 use firmware::EcamLocation;
@@ -76,7 +76,7 @@ pub fn intx_fallback_gsi(_pin: u8, _dev: u8) -> Option<u32>
 /// fails.
 pub fn carve_io_ports(caps: &mut DevmgrCaps, base: u16, count: u16) -> Option<u64>
 {
-    ioport_carve(caps.arch.ioport_cap, base, count)
+    ioport_carve(caps.firmware.arch.ioport_cap, base, count)
 }
 
 /// The line and `SYS_IRQ_REGISTER` mode of a platform record's interrupt
@@ -98,10 +98,10 @@ pub fn platform_line(irq_range: &IrqRangeAllocator, line: u32, mode: u64, isa: b
 /// then takes the PCI default, level-triggered, active-low. A structure
 /// malformed partway through ends the walk after the overrides before it,
 /// logged once; a line a later override would have named takes the default.
-pub fn pci_line_overrides(caps: &DevmgrCaps) -> Vec<SourceOverride>
+pub fn pci_line_overrides(firmware: &Firmware) -> Vec<SourceOverride>
 {
-    let read = locate_table_by_sig(caps, *b"APIC").and_then(|madt| {
-        with_acpi_table(caps, madt, |bytes| {
+    let read = locate_table_by_sig(firmware, *b"APIC").and_then(|madt| {
+        with_acpi_table(firmware, madt, |bytes| {
             let overrides =
                 firmware::acpi::madt_source_overrides(bytes).map(Iterator::collect::<Vec<_>>)?;
             Some((overrides, firmware::acpi::madt_well_formed(bytes)))
@@ -146,7 +146,7 @@ pub fn pci_line_mode(overrides: &[SourceOverride], gsi: u32) -> u64
 /// port. Replies `INVALID_REQUEST` when word 1 is not the FADT's
 /// `PM1a_CNT_BLK`, and `NO_DEVICE` when the FADT field cannot be read or
 /// either carve fails.
-pub fn reply_shutdown_device(caps: &DevmgrCaps, msg: &IpcMessage, ipc_buf: *mut u64)
+pub fn reply_shutdown_device(firmware: &Firmware, msg: &IpcMessage, ipc_buf: *mut u64)
 {
     // 8042 KBC command port — the 1-byte reset register pwrmgr pulses
     // for reboot.
@@ -154,8 +154,8 @@ pub fn reply_shutdown_device(caps: &DevmgrCaps, msg: &IpcMessage, ipc_buf: *mut 
     // pwrmgr computes the PM1a control port from the FADT; devmgr checks
     // it against its own read of the same field so the request cannot
     // name any other port.
-    let Some(pm1a) = locate_table_by_sig(caps, *b"FACP")
-        .and_then(|fadt| with_acpi_table(caps, fadt, firmware::acpi::fadt_pm1a_cnt_blk))
+    let Some(pm1a) = locate_table_by_sig(firmware, *b"FACP")
+        .and_then(|fadt| with_acpi_table(firmware, fadt, firmware::acpi::fadt_pm1a_cnt_blk))
     else
     {
         reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
@@ -166,13 +166,13 @@ pub fn reply_shutdown_device(caps: &DevmgrCaps, msg: &IpcMessage, ipc_buf: *mut 
         reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
         return;
     }
-    let Some(pm1a_cap) = ioport_carve(caps.arch.ioport_cap, pm1a, 2)
+    let Some(pm1a_cap) = ioport_carve(firmware.arch.ioport_cap, pm1a, 2)
     else
     {
         reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
         return;
     };
-    let Some(kbc_cap) = ioport_carve(caps.arch.ioport_cap, KBC_COMMAND_PORT, 1)
+    let Some(kbc_cap) = ioport_carve(firmware.arch.ioport_cap, KBC_COMMAND_PORT, 1)
     else
     {
         let _ = syscall::cap_delete(pm1a_cap);

@@ -1995,15 +1995,12 @@ pub mod devmgr_labels
     /// device still unbound that a declaration matches), the
     /// [`super::procmgr_labels::CREATE_FROM_FILE`] calls and bootstrap
     /// rounds they make, and the settle that waits for each driver to
-    /// report ready ([`DRIVER_READY`]), run after the
-    /// reply but before devmgr returns to its next `ipc_recv`. The nested
-    /// IPC chain the spawn requires (procmgr → vfsd → block driver) cannot
-    /// run inside a request-handler frame without clobbering the
-    /// implicit reply context, so it must happen between `ipc_reply`
-    /// and the next `ipc_recv`. Clients sending [`QUERY_DEVICE`] before
-    /// the settle completes block in the kernel's send queue until devmgr
-    /// returns to `ipc_recv`; once devmgr returns, those queries see the
-    /// served drivers (or the sticky-failure state) and reply normally.
+    /// report ready ([`DRIVER_READY`]), run on devmgr's control thread
+    /// after the reply, while its registry workers go on serving. A
+    /// [`QUERY_DEVICE`] whose answer would name no driver waits until that
+    /// work is done, and then sees the served drivers (or the
+    /// sticky-failure state); one that names a driver is answered at
+    /// once.
     ///
     /// Each spawn is attempted at most once per boot. On failure
     /// (missing binary, ELF corrupt, carve failure, OOM, a driver that
@@ -2112,10 +2109,9 @@ pub mod devmgr_labels
 
     /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
     /// label: trigger devmgr's spawn-orphan fault-injection shim (#176). The
-    /// handler replies `SUCCESS` immediately (the forced-failure spawn does
-    /// nested `ipc_call`s that would clobber the reply context), then forces a
-    /// round-2 bootstrap failure and stashes the outcome for
-    /// [`TEST_ORPHAN_RESULT`]. Request: `data[0]` = caller's compiled
+    /// handler replies `SUCCESS` immediately, and devmgr's control thread
+    /// then forces a round-2 bootstrap failure and stashes the outcome for
+    /// [`TEST_ORPHAN_RESULT`], which waits until it is stashed. Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]. Caller's badge MUST carry
     /// [`TEST_LABEL_AUTHORITY`]; the handler replies
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
@@ -2156,10 +2152,10 @@ pub mod devmgr_labels
     /// a settle that ends at its bound and the withdrawal of a served driver
     /// that dies. The batch's bound is [`TEST_FAULT_SETTLE_TIMEOUT_MS`], not
     /// the production settle bound, so the fault batch costs a test boot
-    /// little time. The handler replies `SUCCESS` before it spawns (the
-    /// spawns do nested `ipc_call`s), then spawns and settles; the served
-    /// fixtures are queried with [`TEST_QUERY_FAULT_DEVICE`], which waits in
-    /// the registry queue until the settle has ended. At most once per boot:
+    /// little time. The handler replies `SUCCESS`, and devmgr's control
+    /// thread then spawns and settles the batch; the served fixtures are
+    /// queried with [`TEST_QUERY_FAULT_DEVICE`], which, finding no fixture,
+    /// waits until the settle has ended. At most once per boot:
     /// a repeated request, or one before [`SET_DRIVERS_DIR`], replies
     /// `INVALID_REQUEST` and spawns nothing. Request: `data[0]` = caller's
     /// compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as

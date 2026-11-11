@@ -138,7 +138,9 @@ For each matched device, devmgr:
    located, one in an I/O BAR, one naming a reserved BAR index, and one
    reaching past its BAR's end. A function left with no
    region of one of the four types (VirtIO 1.2 § 4.1.4 requires all four of a
-   block or input device) presents no layout; it is refused, logged, when
+   block or input device), or with a common region shorter than the 0x38
+   bytes of registers the transport addresses in it (`COMMON_CFG_LEN`),
+   presents no layout; it is refused, logged, when
    its driver declares the VirtIO status reset, and bound as any other
    function otherwise.
 2. Carves an `Mmio` sub-cap for each of those BARs out of the boot-provided

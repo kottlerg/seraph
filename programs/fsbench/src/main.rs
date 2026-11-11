@@ -101,8 +101,7 @@ fn read_inline(f: &mut File, size: u64, buf: &mut [u8]) -> u64
         let remaining = size - consumed;
         let page_off = consumed % PAGE_SIZE;
         let chunk = remaining.min(INLINE_CHUNK).min(PAGE_SIZE - page_off);
-        #[allow(clippy::cast_possible_truncation)]
-        let chunk_usz = chunk as usize;
+        let chunk_usz = usize::try_from(chunk).expect("chunk is at most INLINE_CHUNK");
         let n = f.read(&mut buf[..chunk_usz]).expect("inline read failed");
         if n == 0
         {
@@ -204,6 +203,7 @@ fn verify_fixture(f: &mut File)
     assert_eq!(n, buf.len(), "verify: short read at offset 0");
     for (i, &b) in buf.iter().enumerate()
     {
+        // cast_possible_truncation: the mask keeps the value within a byte.
         #[allow(clippy::cast_possible_truncation)]
         let expected = (i & 0xFF) as u8;
         assert_eq!(

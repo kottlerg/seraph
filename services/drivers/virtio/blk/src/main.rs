@@ -333,9 +333,26 @@ fn init_device(transport: &PciTransport) -> Geometry
         syscall::thread_exit();
     };
 
-    let blk_size = (features & virtio_blk::VIRTIO_BLK_F_BLK_SIZE != 0)
-        .then(|| transport.config_read_u32(virtio_blk::CONFIG_BLK_SIZE_OFFSET));
-    let Some(geometry) = Geometry::new(transport.config_read_u64(0), blk_size)
+    // Both fields lie in the device configuration region the device reports;
+    // a region too short for one is refused, never read past.
+    let config = || {
+        let blk_size = if features & virtio_blk::VIRTIO_BLK_F_BLK_SIZE == 0
+        {
+            None
+        }
+        else
+        {
+            Some(transport.config_read_u32(virtio_blk::CONFIG_BLK_SIZE_OFFSET)?)
+        };
+        Some((transport.config_read_u64(0)?, blk_size))
+    };
+    let Some((capacity, blk_size)) = config()
+    else
+    {
+        std::os::seraph::log!("device configuration region too short for the geometry");
+        syscall::thread_exit();
+    };
+    let Some(geometry) = Geometry::new(capacity, blk_size)
     else
     {
         std::os::seraph::log!("unsupported logical block size {blk_size:?}");

@@ -10,7 +10,7 @@
 
 use core::time::Duration;
 
-use crate::{RegisterLayout, STATUS_FEATURES_OK};
+use crate::{COMMON_CFG_LEN, RegisterLayout, STATUS_FEATURES_OK};
 
 /// How long a reset is waited for, on the caller's clock: by
 /// [`PciTransport::try_reset`] in a driver, and by devmgr when it resets a
@@ -78,6 +78,9 @@ pub struct PciTransport
     device_off: u64,
     /// Length of the notification region, which bounds every doorbell.
     notify_len: u64,
+    /// Length of the device-specific configuration region, which bounds
+    /// every read of it.
+    device_len: u64,
     notify_off_multiplier: u32,
 }
 
@@ -108,6 +111,16 @@ pub fn doorbell_fits(queue_notify_off: u16, notify_off_multiplier: u32, notify_l
     u64::from(queue_notify_off) * u64::from(notify_off_multiplier) + 2 <= notify_len
 }
 
+/// Whether a `width`-byte read at `offset` into the device-specific
+/// configuration region lies inside the region's `device_len` bytes and is
+/// naturally aligned there. In the multi-BAR register window a read past the
+/// region could otherwise reach another region or another BAR's mapping.
+#[must_use]
+pub fn config_fits(offset: u32, width: u32, device_len: u64) -> bool
+{
+    offset.is_multiple_of(width) && u64::from(offset) + u64::from(width) <= device_len
+}
+
 impl PciTransport
 {
     /// Create a PCI transport over a register window mapped as `layout`
@@ -125,14 +138,19 @@ impl PciTransport
             isr_off: layout.isr,
             device_off: layout.device,
             notify_len: layout.notify_len,
+            device_len: layout.device_len,
             notify_off_multiplier: layout.notify_off_multiplier,
         }
     }
 
     // ── Common configuration registers (`VirtIO` 1.2 §4.1.4.3) ─────────
 
+    /// Window address of the common-configuration register at `offset`.
+    /// Every caller passes a register that ends within [`COMMON_CFG_LEN`],
+    /// which [`RegisterLayout`] guarantees the common region holds.
     fn common_addr(&self, offset: u32) -> u64
     {
+        debug_assert!(offset < COMMON_CFG_LEN);
         self.window_va + self.common_off + u64::from(offset)
     }
 
@@ -155,7 +173,8 @@ impl PciTransport
     #[must_use]
     pub fn get_status(&self) -> u8
     {
-        // SAFETY: common cfg region is mapped and `device_status` (0x14) is within bounds.
+        // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
+        // (RegisterLayout), so `device_status` (0x14) is within it.
         unsafe {
             core::ptr::read_volatile(self.common_addr(crate::COMMON_DEVICE_STATUS) as *const u8)
         }
@@ -164,7 +183,8 @@ impl PciTransport
     /// Write device status.
     pub fn set_status(&self, status: u8)
     {
-        // SAFETY: common cfg region is mapped and `device_status` (0x14) is within bounds.
+        // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
+        // (RegisterLayout), so `device_status` (0x14) is within it.
         unsafe {
             core::ptr::write_volatile(
                 self.common_addr(crate::COMMON_DEVICE_STATUS) as *mut u8,
@@ -265,6 +285,7 @@ impl PciTransport
         // above), which is within its BAR's mapping; addr is
         // naturally aligned (notify_off and multiplier are set by the device
         // to maintain u16 alignment per VirtIO 1.2 §4.1.4.4).
+        // cast_ptr_alignment: the doorbell is u16-aligned, as stated above.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             core::ptr::write_volatile(addr, queue_idx);
@@ -285,26 +306,35 @@ impl PciTransport
 
     // ── Device-specific config (`VirtIO` 1.2 §4.1.4.6) ─────────────────
 
-    /// Read a u32 from device-specific configuration space.
+    /// Read a u32 from device-specific configuration space. `None` when the
+    /// read does not lie inside the region or is not naturally aligned
+    /// ([`config_fits`]), or its address is not 4-byte aligned in the window.
     #[must_use]
-    pub fn config_read_u32(&self, offset: u32) -> u32
+    pub fn config_read_u32(&self, offset: u32) -> Option<u32>
     {
         let addr = self.window_va + self.device_off + u64::from(offset);
-        // SAFETY: device cfg region is within its BAR's mapping; offset is
-        // caller-provided and must be u32-aligned.
-        #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            core::ptr::read_volatile(addr as *const u32)
+        if !config_fits(offset, 4, self.device_len) || !addr.is_multiple_of(4)
+        {
+            return None;
         }
+        // cast_ptr_alignment: addr is checked 4-byte aligned above.
+        #[allow(clippy::cast_ptr_alignment)]
+        // SAFETY: the four bytes lie inside the device cfg region (checked
+        // above), which is within its BAR's mapping, and addr is 4-byte
+        // aligned (checked above).
+        let value = unsafe { core::ptr::read_volatile(addr as *const u32) };
+        Some(value)
     }
 
-    /// Read a u64 from device-specific configuration space.
+    /// Read a u64 from device-specific configuration space, as two u32
+    /// reads, low half first. `None` when either read is
+    /// ([`config_read_u32`](Self::config_read_u32)).
     #[must_use]
-    pub fn config_read_u64(&self, offset: u32) -> u64
+    pub fn config_read_u64(&self, offset: u32) -> Option<u64>
     {
-        let lo = self.config_read_u32(offset);
-        let hi = self.config_read_u32(offset + 4);
-        u64::from(lo) | (u64::from(hi) << 32)
+        let lo = self.config_read_u32(offset)?;
+        let hi = self.config_read_u32(offset.checked_add(4)?)?;
+        Some(u64::from(lo) | (u64::from(hi) << 32))
     }
 
     // ── Device negotiation (`VirtIO` 1.2 §3.1.1) ───────────────────────
@@ -344,6 +374,9 @@ impl PciTransport
 
         let driver_features = negotiate(device_features);
 
+        // cast_possible_truncation: the two `driver_feature_select` values take
+        // the low and the high 32 feature bits, so keeping the low half is the
+        // point, and the shift leaves the high half at 32 bits.
         #[allow(clippy::cast_possible_truncation)]
         {
             self.write_driver_features(0, driver_features as u32);
@@ -367,8 +400,11 @@ impl PciTransport
     fn read_common_u16(&self, offset: u32) -> u16
     {
         let addr = self.common_addr(offset);
-        // SAFETY: common cfg region is mapped; VirtIO PCI common cfg registers
-        // are naturally aligned within the BAR.
+        // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
+        // (RegisterLayout), past every register this file addresses in it;
+        // VirtIO PCI common cfg registers are naturally aligned within the BAR.
+        // cast_ptr_alignment: as the SAFETY comment says, and the window maps
+        // the BAR page-aligned.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             core::ptr::read_volatile(addr as *const u16)
@@ -378,8 +414,11 @@ impl PciTransport
     fn write_common_u16(&self, offset: u32, val: u16)
     {
         let addr = self.common_addr(offset);
-        // SAFETY: common cfg region is mapped; VirtIO PCI common cfg registers
-        // are naturally aligned within the BAR.
+        // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
+        // (RegisterLayout), past every register this file addresses in it;
+        // VirtIO PCI common cfg registers are naturally aligned within the BAR.
+        // cast_ptr_alignment: as the SAFETY comment says, and the window maps
+        // the BAR page-aligned.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             core::ptr::write_volatile(addr as *mut u16, val);
@@ -390,8 +429,11 @@ impl PciTransport
     fn read_common_u32(&self, offset: u32) -> u32
     {
         let addr = self.common_addr(offset);
-        // SAFETY: common cfg region is mapped; VirtIO PCI common cfg registers
-        // are naturally aligned within the BAR.
+        // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
+        // (RegisterLayout), past every register this file addresses in it;
+        // VirtIO PCI common cfg registers are naturally aligned within the BAR.
+        // cast_ptr_alignment: as the SAFETY comment says, and the window maps
+        // the BAR page-aligned.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             core::ptr::read_volatile(addr as *const u32)
@@ -401,8 +443,11 @@ impl PciTransport
     fn write_common_u32(&self, offset: u32, val: u32)
     {
         let addr = self.common_addr(offset);
-        // SAFETY: common cfg region is mapped; VirtIO PCI common cfg registers
-        // are naturally aligned within the BAR.
+        // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
+        // (RegisterLayout), past every register this file addresses in it;
+        // VirtIO PCI common cfg registers are naturally aligned within the BAR.
+        // cast_ptr_alignment: as the SAFETY comment says, and the window maps
+        // the BAR page-aligned.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             core::ptr::write_volatile(addr as *mut u32, val);
@@ -520,6 +565,51 @@ mod tests
         transport.notify(9, 0x40);
         assert_eq!(window[0x900 / 2], 0);
         assert_eq!(window.iter().filter(|&&w| w != 0).count(), 1);
+    }
+
+    #[test]
+    fn a_config_read_fits_only_aligned_and_inside_the_region()
+    {
+        // The last u32 of an 8-byte region fits; one past it does not.
+        assert!(config_fits(4, 4, 8));
+        assert!(!config_fits(8, 4, 8));
+        // Unaligned, though inside.
+        assert!(!config_fits(2, 4, 8));
+        // An offset near u32::MAX does not wrap into the region.
+        assert!(!config_fits(u32::MAX - 3, 4, 8));
+    }
+
+    #[test]
+    fn config_reads_return_nothing_past_the_device_region()
+    {
+        let cap = |offset, length| crate::VirtioCapLocation {
+            bar: 0,
+            pad: [0; 3],
+            offset,
+            length,
+        };
+        let layout = crate::VirtioPciStartupInfo {
+            common_cfg: cap(0, 0x38),
+            notify_cfg: cap(0x800, 0x100),
+            isr_cfg: cap(0x900, 4),
+            device_cfg: cap(0xA00, 12),
+            notify_off_multiplier: 4,
+            pad: 0,
+        }
+        .register_layout()
+        .expect("every region present");
+        // A host buffer stands in for the one-page register window, with
+        // the device region's 12 bytes, and the word after them, filled.
+        let mut window = vec![0u32; 0x400];
+        window[0xA00 / 4..0xA00 / 4 + 4].copy_from_slice(&[1, 2, 3, 0xDEAD]);
+        let transport = PciTransport::new(window.as_mut_ptr() as u64, &layout);
+
+        assert_eq!(transport.config_read_u32(8), Some(3));
+        assert_eq!(transport.config_read_u32(12), None);
+        assert_eq!(transport.config_read_u32(2), None);
+        assert_eq!(transport.config_read_u64(0), Some(2 << 32 | 1));
+        // The high half would be the word past the region.
+        assert_eq!(transport.config_read_u64(8), None);
     }
 
     #[test]

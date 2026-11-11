@@ -320,11 +320,15 @@ from the PR's merge base with `master` before the sync to its merge base after i
 
 - Every sync owes a passing CI run on the synced head, which builds and boots both
   architectures there.
-- A sync whose incoming diff touches a file the PR's own diff touches, or whose merge resolves
-  a conflict, also owes the PR's own validation again at the synced head (the builds and boots
-  its `## Test plan` reports) and a run with the reviewer over the sync.
+- A sync whose incoming diff touches a file the PR's own diff touches and is not comment-only,
+  or whose merge resolves a conflict, also owes the PR's own validation again at the synced
+  head (the builds and boots its `## Test plan` reports) and a run with the reviewer over the
+  sync. An incoming diff is comment-only as [testing.md](testing.md#coverage-tiers)
+  § Coverage tiers defines a comment-only change: Markdown aside, it alters only comment
+  lines, and no file a build embeds.
 - Any other sync owes nothing more. The validated head before it stands, and the PR body's
-  `## Validation` section states that the incoming diff touches none of the PR's files.
+  `## Validation` section states that the incoming diff touches none of the PR's files, or
+  that it is comment-only.
 
 The local host runs of [testing.md](testing.md#coverage-tiers) § Coverage tiers keep their own
 rule (When the runs are owed): a sync that leaves the PR's own changes to a run's surface as
@@ -493,7 +497,8 @@ gives the PR-level linear view.
   section; for a documentation-only or comment-only delta since that head,
   it MUST say so (see [testing.md](testing.md#coverage-tiers)), and for a
   sync since that head that leaves it standing, it MUST say that the
-  incoming diff touches none of the PR's files (§ Syncing with `master`).
+  incoming diff touches none of the PR's files, or that it is comment-only
+  (§ Syncing with `master`).
 - Every PR body MUST report, in its `## Validation` section, each local host
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes (each
   boundary run, the memory variation, and each device cell: the storage cells,

@@ -214,6 +214,25 @@ pub(crate) unsafe fn claim_waiter(tcb: *mut ThreadControlBlock, value: u64)
             .wake_in_flight
             .store(1, core::sync::atomic::Ordering::Release);
         (*tcb).wakeup_value = value;
+        cancel_timed_entry(tcb);
+    }
+}
+
+/// Remove the sleep-list entry of a timed park whose episode the caller just
+/// claimed, after the claim and before the wake; a park with no deadline (an
+/// untimed one, or one the timer already popped) has none to remove
+/// (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants,
+/// invariant 7).
+///
+/// # Safety
+/// `tcb` is a valid TCB whose park episode the caller has just claimed (by a
+/// removal from a source queue under the source lock, or by a claim of the
+/// server's `reply_tcb`), and has not yet woken; no sleep-list lock is held.
+#[cfg(not(test))]
+pub(crate) unsafe fn cancel_timed_entry(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: tcb is valid per the caller contract; SLEEP_LIST_LOCK is a leaf.
+    unsafe {
         if (*tcb)
             .sleep_deadline
             .load(core::sync::atomic::Ordering::Relaxed)
@@ -336,7 +355,9 @@ impl BoundSource
 /// sleep timer through `sched::sleep_wakeups_quiesce`, `waitset_notify` through
 /// the notifying source's lock that the wait set's teardown must take, and a
 /// canceller or a drain through the `sched_lock` it holds across its claim
-/// and its binding clear, and `endpoint_recv`'s refused reply rebind through
+/// and its binding clear (the sleep timer's expiry of an endpoint or wait-set park
+/// is such a canceller, `syscall::thread::cancel_for_timeout`), and a receive's
+/// refused reply rebind (`endpoint::bind_next_sender`) through
 /// the same hold (`sched::commit_reply_rebind_under_local_lock`), device IRQ
 /// delivery through its line's in-flight count that the Notification teardown
 /// waits out (`irq::unregister_notification`), fault delivery through its pin

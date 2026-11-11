@@ -359,6 +359,14 @@ pub fn run_all(ctx: &TestContext)
         notification::wait_timeout_returns_bits_first(ctx)
     );
     run_test!(
+        "notification::try_wait_empty_would_block",
+        notification::try_wait_empty_would_block(ctx)
+    );
+    run_test!(
+        "notification::try_wait_takes_pending_bits",
+        notification::try_wait_takes_pending_bits(ctx)
+    );
+    run_test!(
         "notification::wait_high_bit_roundtrip",
         notification::wait_high_bit_roundtrip(ctx)
     );
@@ -442,6 +450,22 @@ pub fn run_all(ctx: &TestContext)
         "wait_set::stale_endpoint_entry_skipped",
         wait_set::stale_endpoint_entry_skipped(ctx)
     );
+    run_test!(
+        "wait_set::try_wait_empty_would_block",
+        wait_set::try_wait_empty_would_block(ctx)
+    );
+    run_test!(
+        "wait_set::try_wait_returns_ready_badge",
+        wait_set::try_wait_returns_ready_badge(ctx)
+    );
+    run_test!(
+        "wait_set::wait_timeout_expires",
+        wait_set::wait_timeout_expires(ctx)
+    );
+    run_test!(
+        "wait_set::wait_timeout_woken_before_expiry",
+        wait_set::wait_timeout_woken_before_expiry(ctx)
+    );
     run_test!("wait_set::remove", wait_set::remove(ctx));
     run_test!(
         "wait_set::source_notification_pinned_by_member",
@@ -461,6 +485,24 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "ipc::recv_finds_queued_caller",
         ipc::recv_finds_queued_caller(ctx)
+    );
+    run_test!("ipc::recv_try_once_empty", ipc::recv_try_once_empty(ctx));
+    run_test!("ipc::recv_timeout_expires", ipc::recv_timeout_expires(ctx));
+    run_test!(
+        "ipc::recv_try_once_takes_queued_caller",
+        ipc::recv_try_once_takes_queued_caller(ctx)
+    );
+    run_test!(
+        "ipc::recv_try_once_keeps_reply_binding",
+        ipc::recv_try_once_keeps_reply_binding(ctx)
+    );
+    run_test!(
+        "ipc::call_timeout_no_receiver",
+        ipc::call_timeout_no_receiver(ctx)
+    );
+    run_test!(
+        "ipc::call_timeout_late_reply_refused",
+        ipc::call_timeout_late_reply_refused(ctx)
     );
     run_test!(
         "ipc::ipc_buffer_misaligned_err",

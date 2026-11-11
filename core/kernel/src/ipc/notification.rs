@@ -323,3 +323,24 @@ pub unsafe fn notification_wait(
     unsafe { sig.lock.unlock_raw(saved) };
     Err(())
 }
+
+/// Take `sig`'s pending bits without waiting (`SYS_NOTIFICATION_WAIT`
+/// try-once): read and clear the bitmask under `sig.lock`, as
+/// [`notification_wait`]'s harvest does, and return them, `0` when none were
+/// pending. The caller is never queued, parked, or listed on the sleep list.
+///
+/// # Safety
+/// `sig` must be a valid pointer to a live `NotificationState`.
+#[cfg(not(test))]
+pub unsafe fn notification_try_wait(sig: *mut NotificationState) -> u64
+{
+    // SAFETY: caller guarantees sig is valid.
+    let sig = unsafe { &*sig };
+    // SAFETY: lock serialises the harvest with the send slow path; paired
+    // with unlock_raw below.
+    let saved = unsafe { sig.lock.lock_raw() };
+    let bits = sig.bits.swap(0, Ordering::Relaxed);
+    // SAFETY: paired with lock_raw above.
+    unsafe { sig.lock.unlock_raw(saved) };
+    bits
+}

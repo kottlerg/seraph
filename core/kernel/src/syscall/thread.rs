@@ -845,7 +845,7 @@ unsafe fn clear_park_binding(tcb: *mut crate::sched::thread::ThreadControlBlock)
 pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
     // SAFETY: this fn's contract is cancel_park's.
-    let _ = unsafe { cancel_park(tcb, false) };
+    let _ = unsafe { cancel_park(tcb, CancelMode::Stop) };
 }
 
 /// Cancel the block of `tcb` for a posted upcall
@@ -867,7 +867,127 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 pub(crate) unsafe fn cancel_for_upcall(tcb: *mut crate::sched::thread::ThreadControlBlock) -> bool
 {
     // SAFETY: this fn's contract is cancel_park's.
-    unsafe { cancel_park(tcb, true) }
+    unsafe { cancel_park(tcb, CancelMode::Upcall) }
+}
+
+/// Expire the timed park the sleep-list timer popped, as [`cancel_for_upcall`]
+/// cancels a park for an upcall: the park is claimed and stamped
+/// [`PARK_DISPOSITION_TIMED_OUT`], its binding cleared, and `wake_in_flight`
+/// set inside the claim's hold; returns true on a win, and the caller (the
+/// timer) MUST then wake the thread (`enqueue_and_wake`), whose syscall
+/// returns `WouldBlock`.
+///
+/// `popped` and `park_seq` are the pop's snapshot of the park. Only that park
+/// is claimed: for a `SYS_IPC_RECV` or `SYS_WAIT_SET_WAIT` park, while
+/// `ipc_state` and `park_seq` still equal the snapshot; for a `SYS_IPC_CALL`,
+/// while the thread is still in the call's send or reply park of the same
+/// [`call_episode`], since the timeout bounds both. Nothing is claimed for a
+/// thread no longer `Blocked` in that park, or in a fault delivery (no fault
+/// park is timed). A lost claim leaves the episode to its claimant, which
+/// removed the entry or found it popped
+/// (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants).
+///
+/// [`PARK_DISPOSITION_TIMED_OUT`]: crate::sched::thread::PARK_DISPOSITION_TIMED_OUT
+/// [`call_episode`]: crate::sched::thread::call_episode
+///
+/// # Safety
+/// As for [`cancel_ipc_block`]; `tcb` is kept allocated by the timer batch
+/// that popped it (`sched::sleep_wakeups_quiesce`).
+#[cfg(not(test))]
+pub(crate) unsafe fn cancel_for_timeout(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    popped: crate::sched::thread::IpcThreadState,
+    park_seq: u32,
+) -> bool
+{
+    // A call's send park can turn into its reply park between the first hold
+    // and the source lock (a receive rebinds it under ep.lock), which loses
+    // the send arm's unlink while the episode goes on; the second pass claims
+    // the reply park. A call rebinds once, so two passes suffice; any other
+    // loss means another claimant ended the episode, and the second pass
+    // loses too.
+    for _ in 0..2
+    {
+        // SAFETY: this fn's contract is cancel_park's.
+        if unsafe { cancel_park(tcb, CancelMode::Timeout { popped, park_seq }) }
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the timer's expiry of the popped park (`popped`, `popped_seq`) may
+/// claim `tcb`'s current park `(live, live_seq)`: the same receive or wait-set
+/// park, or the same call episode, and no fault delivery.
+///
+/// # Safety
+/// `tcb` must be a valid TCB whose `sched_lock` the caller holds.
+#[cfg(not(test))]
+unsafe fn timeout_may_cancel(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    (live, live_seq): (crate::sched::thread::IpcThreadState, u32),
+    popped: crate::sched::thread::IpcThreadState,
+    popped_seq: u32,
+) -> bool
+{
+    use crate::sched::thread::{IpcThreadState, call_episode};
+    // SAFETY: caller holds tcb.sched_lock, under which in_fault_delivery is
+    // written.
+    if unsafe { (*tcb).in_fault_delivery }
+    {
+        return false;
+    }
+    match popped
+    {
+        IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnReply =>
+        {
+            matches!(
+                live,
+                IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnReply
+            ) && call_episode(live_seq) == call_episode(popped_seq)
+        }
+        IpcThreadState::BlockedOnRecv | IpcThreadState::BlockedOnWaitSet =>
+        {
+            live == popped && live_seq == popped_seq
+        }
+        _ => false,
+    }
+}
+
+/// Who cancels a park through [`cancel_park`].
+#[cfg(not(test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CancelMode
+{
+    /// A stop or an object teardown: the park is stamped INTERRUPTED and no
+    /// wake is kept (the stop's commit decides the thread's state).
+    Stop,
+    /// A posted upcall ([`cancel_for_upcall`]): stamped INTERRUPTED, and the
+    /// wake is kept for the poster.
+    Upcall,
+    /// The sleep-list timer's expiry of the popped park
+    /// ([`cancel_for_timeout`]): stamped `TIMED_OUT`, and the wake is kept for
+    /// the timer.
+    Timeout
+    {
+        popped: crate::sched::thread::IpcThreadState,
+        park_seq: u32,
+    },
+}
+
+#[cfg(not(test))]
+impl CancelMode
+{
+    /// The disposition a won claim stamps on a non-fault park.
+    fn disposition(self) -> u8
+    {
+        match self
+        {
+            Self::Timeout { .. } => crate::sched::thread::PARK_DISPOSITION_TIMED_OUT,
+            Self::Stop | Self::Upcall => crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+        }
+    }
 }
 
 /// Whether a posted upcall may cancel `tcb`'s block now: one is pending, the
@@ -892,22 +1012,21 @@ pub(crate) unsafe fn upcall_may_cancel(tcb: *mut crate::sched::thread::ThreadCon
     }
 }
 
-/// Keep the wake a won cancel claim owes when the cancel is an upcall's: set
-/// `wake_in_flight` inside the claim's `sched_lock` hold, as every waker's
-/// claim does, so a restart waits for the wake ([`cancel_for_upcall`]'s
-/// caller makes it) rather than starting the thread under it, and return
-/// whether the claim was won for an upcall.
+/// Keep the wake a won cancel claim owes when the cancel is an upcall's or
+/// the timer's: set `wake_in_flight` inside the claim's `sched_lock` hold, as
+/// every waker's claim does, so a restart waits for the wake (the caller of
+/// [`cancel_for_upcall`] or [`cancel_for_timeout`] makes it) rather than
+/// starting the thread under it, and return whether the claim was won for a
+/// wake.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB whose `sched_lock` the caller holds, inside the
 /// hold of a claim it just won.
 #[cfg(not(test))]
-unsafe fn keep_upcall_wake(
-    tcb: *mut crate::sched::thread::ThreadControlBlock,
-    for_upcall: bool,
-) -> bool
+unsafe fn keep_wake(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: CancelMode) -> bool
 {
-    if for_upcall
+    let keep = mode != CancelMode::Stop;
+    if keep
     {
         // SAFETY: caller holds tcb.sched_lock inside the won claim.
         unsafe {
@@ -916,11 +1035,12 @@ unsafe fn keep_upcall_wake(
                 .store(1, core::sync::atomic::Ordering::Release);
         }
     }
-    for_upcall
+    keep
 }
 
-/// The cancel of [`cancel_ipc_block`] and [`cancel_for_upcall`]; returns
-/// whether an upcall's cancel won the park's claim (always false for a stop's).
+/// The cancel of [`cancel_ipc_block`], [`cancel_for_upcall`], and
+/// [`cancel_for_timeout`]; returns whether an upcall's or the timer's cancel
+/// won the park's claim (always false for a stop's).
 ///
 /// # Safety
 /// As for [`cancel_ipc_block`].
@@ -928,7 +1048,7 @@ unsafe fn keep_upcall_wake(
 // adds no clarity (each arm is independent and short).
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_upcall: bool)
+unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: CancelMode)
 -> bool
 {
     use crate::ipc::endpoint::{EndpointState, unlink_from_wait_queue};
@@ -959,7 +1079,9 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
     // mask, and no fault or upcall delivery: a fault park is never cancelled
     // for an upcall, which waits for the fault to resolve, and the mask is
     // written under this lock, so a thread that masked before it parked keeps
-    // its block.
+    // its block. The timer's expiry requires the park it popped (for a call,
+    // the call episode it popped) and no fault delivery; it never targets a
+    // plain sleeper, which the timer claims at its pop.
     let mut claimed = false;
     // SAFETY: tcb validated by caller; fields read/written under sched_lock;
     // SLEEP_LIST_LOCK is a leaf, nested under sched_lock.
@@ -971,7 +1093,15 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
             (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed),
         );
         let blocked = (*tcb).state == crate::sched::thread::ThreadState::Blocked;
-        let refused = for_upcall && !upcall_may_cancel(tcb);
+        let refused = match mode
+        {
+            CancelMode::Stop => false,
+            CancelMode::Upcall => !upcall_may_cancel(tcb),
+            CancelMode::Timeout { popped, park_seq } =>
+            {
+                !timeout_may_cancel(tcb, (snap.0, snap.2), popped, park_seq)
+            }
+        };
         if blocked
             && !refused
             && snap.0 == IpcThreadState::None
@@ -981,7 +1111,7 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                 tcb,
                 crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
             );
-            claimed = keep_upcall_wake(tcb, for_upcall);
+            claimed = keep_wake(tcb, mode);
         }
         (*tcb).sched_lock.unlock_raw(saved);
         if !blocked || refused
@@ -1041,7 +1171,7 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                     // the won unlink, the claim that orders it after the
                     // faulter's own write. A stopped sys_ipc_call caller
                     // resumes via the disposition. A lost unlink hands the
-                    // episode to a racing endpoint_recv's rebind chain (a
+                    // episode to a racing receive's rebind chain (a
                     // handler reply, or its teardown, which owns the
                     // disposition; a KILL stored here would overwrite a
                     // handler's RESUME), the endpoint's dealloc drain, or a
@@ -1060,13 +1190,12 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                         }
                         else
                         {
-                            crate::sched::thread::stamp_park_deposit(
-                                tcb,
-                                crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                            );
+                            // A timed call's entry ends with its episode.
+                            crate::ipc::cancel_timed_entry(tcb);
+                            crate::sched::thread::stamp_park_deposit(tcb, mode.disposition());
                         }
                         clear_park_binding(tcb);
-                        claimed = keep_upcall_wake(tcb, for_upcall);
+                        claimed = keep_wake(tcb, mode);
                     }
                     held.unlock();
                 }
@@ -1097,12 +1226,11 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                     // it as it dies.
                     if unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail)
                     {
-                        crate::sched::thread::stamp_park_deposit(
-                            tcb,
-                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                        );
+                        // A timed receive's entry goes with the waiter.
+                        crate::ipc::cancel_timed_entry(tcb);
+                        crate::sched::thread::stamp_park_deposit(tcb, mode.disposition());
                         clear_park_binding(tcb);
-                        claimed = keep_upcall_wake(tcb, for_upcall);
+                        claimed = keep_wake(tcb, mode);
                     }
                     held.unlock();
                 }
@@ -1128,13 +1256,20 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                     // only while the upcall may still cancel it: the thread
                     // may since have run, taken the upcall, masked, and called
                     // the same server again, a park this cancel must leave.
+                    // The timer's expiry, too, claims only the snapshotted
+                    // park, which its first hold matched to the popped call.
+                    let same_park =
+                        (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq;
+                    let may_cancel = match mode
+                    {
+                        CancelMode::Stop => true,
+                        CancelMode::Upcall => same_park && upcall_may_cancel(tcb),
+                        CancelMode::Timeout { .. } => same_park && !(*tcb).in_fault_delivery,
+                    };
                     if (*tcb).state == crate::sched::thread::ThreadState::Blocked
                         && (*tcb).ipc_state == IpcThreadState::BlockedOnReply
                         && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
-                        && (!for_upcall
-                            || ((*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed)
-                                == park_seq
-                                && upcall_may_cancel(tcb)))
+                        && may_cancel
                     {
                         let cancelled = (*server)
                             .reply_tcb
@@ -1154,15 +1289,15 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                         // the error path instead of reading a stale ipc_msg.
                         if cancelled
                         {
-                            crate::sched::thread::stamp_park_deposit(
-                                tcb,
-                                crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                            );
+                            // A timed call's entry ends with its episode.
+                            crate::ipc::cancel_timed_entry(tcb);
+                            crate::sched::thread::stamp_park_deposit(tcb, mode.disposition());
                             clear_park_binding(tcb);
-                            // An upcall's cancel keeps the claim the reply
-                            // binding set, for the wake its caller makes.
-                            claimed = for_upcall;
-                            if !for_upcall
+                            // An upcall's or the timer's cancel keeps the
+                            // claim the reply binding set, for the wake its
+                            // caller makes.
+                            claimed = mode != CancelMode::Stop;
+                            if !claimed
                             {
                                 (*tcb)
                                     .wake_in_flight
@@ -1269,7 +1404,7 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                         );
                         clear_park_binding(tcb);
-                        claimed = keep_upcall_wake(tcb, for_upcall);
+                        claimed = keep_wake(tcb, mode);
                     }
                     held.unlock();
                 }
@@ -1312,7 +1447,7 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                         );
                         clear_park_binding(tcb);
-                        claimed = keep_upcall_wake(tcb, for_upcall);
+                        claimed = keep_wake(tcb, mode);
                     }
                     held.unlock();
                 }
@@ -1340,12 +1475,12 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_up
                     // unlinked it as it dies.
                     if (*ws).waiters.remove(tcb)
                     {
-                        crate::sched::thread::stamp_park_deposit(
-                            tcb,
-                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                        );
+                        // A timed wait's entry goes with the waiter, under
+                        // ws.lock, as at every waiter claim.
+                        crate::ipc::cancel_timed_entry(tcb);
+                        crate::sched::thread::stamp_park_deposit(tcb, mode.disposition());
                         clear_park_binding(tcb);
-                        claimed = keep_upcall_wake(tcb, for_upcall);
+                        claimed = keep_wake(tcb, mode);
                     }
                     held.unlock();
                 }

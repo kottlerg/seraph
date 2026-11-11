@@ -246,7 +246,9 @@ Two mechanisms make the condition diagnosable:
   `virtio_core::isr::serve_interrupts`, does, so `EXIT_RECV_WEDGE` also ends a driver whose
   interrupt wait wedged. `Interrupted` receives are exempt — expected during thread stop/start, they
   neither extend nor reset the streak. Non-blocking drain loops (`event_try_recv`) do not use the
-  guard.
+  guard, nor do loops over the other try-once or bounded waits (`ipc_try_recv`,
+  `ipc_recv_timeout`, `notification_try_wait`, `wait_set_wait_timeout`, and the rest), for which
+  `WouldBlock` is an expected outcome, not a failure.
 
 A wedged service supervised by svcmgr under `restart = always` is relaunched with a fresh
 CSpace — bounded self-recovery. Unsupervised processes die loudly instead of spinning.

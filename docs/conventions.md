@@ -325,7 +325,8 @@ from the PR's merge base with `master` before the sync to its merge base after i
   head (the builds and boots its `## Test plan` reports) and a run with the reviewer over the
   sync. An incoming diff is comment-only as [testing.md](testing.md#coverage-tiers)
   § Coverage tiers defines a comment-only change: Markdown aside, it alters only comment
-  lines, and no file a build embeds.
+  lines, and no file a build embeds. An incoming diff that changes only Markdown is
+  comment-only, even in a file the PR's own diff touches.
 - Any other sync owes nothing more. The validated head before it stands, and the PR body's
   `## Validation` section states that the incoming diff touches none of the PR's files, or
   that it is comment-only.

@@ -401,6 +401,7 @@ with `cargo xtask orch end`.
 - A turn woken by a worker's message can run in that worker's worktree (a harness defect): `pwd`
   shows it, and the harness then refuses git on the main checkout. In such a turn run no git,
   gate, merge or spawn. Record and answer by absolute path
-  (`cd /home/kottlerg/seraph && cargo xtask orch ...`), send the supervisor the one line
-  "drift: wake me", and do the deferred work in the turn its reply starts. Do not park.
+  (`cd <checkout> && cargo xtask orch ...`, `<checkout>` being the part of `pwd` before
+  `/.claude/worktrees/`), send the supervisor the one line "drift: wake me", and do the
+  deferred work in the turn its reply starts. Do not park.
 - A boundary run that finishes late is not a hang. Judge PASS or HANG against the budget.

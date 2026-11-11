@@ -1498,10 +1498,10 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
 // where a worker makes the call. Every probe the call overlaps must be
 // acknowledged within `LATENCY_BOUND_US`, and a probe issued once the call
 // was under way must be acknowledged before the call returned (for the
-// seeding, which is short, before one of `SEED_ATTEMPTS` calls returned). A
-// kernel that masks interrupts for the whole call fails both on the teardown,
-// whose returns each walk the source's page free list, and the second on the
-// seeding.
+// seeding, which is short, before one of several calls returned, as
+// `SEED_ATTEMPTS` says). A kernel that masks interrupts for the whole call
+// fails both on the teardown, whose returns each walk the source's page free
+// list, and the second on the seeding.
 
 /// One-page holes the teardown cases leave on the source's page free list
 /// below every donation of the target: a teardown that returns each donation
@@ -1521,12 +1521,33 @@ const LATENCY_BOUND_US: u64 = 250_000;
 /// Bound on the whole measured call and on the worker's readiness, in
 /// microseconds (stretched by `scaled_bound`).
 const LAT_CALL_DEADLINE_US: u64 = 60_000_000;
-/// Seeding calls of one kind the seeding case makes, each into a fresh pool,
-/// until a probe is acknowledged inside one. A seeding call lasts about a
-/// millisecond, shorter than one probe's scheduling delay on a contended host,
-/// so one call can see no probe land inside it with interrupts taken; a
-/// kernel that masks them for the whole call lets no probe land inside any.
+/// Conclusive seeding calls of one kind the seeding case makes, each into a
+/// fresh pool, until a probe is acknowledged inside one. A seeding call lasts
+/// about a millisecond, shorter than one probe's scheduling delay on a
+/// contended host, so one call can see no probe land inside it with
+/// interrupts taken; a kernel that masks them for the whole call lets no probe
+/// land inside any.
+///
+/// A call is conclusive when the first probe issued inside it (at least the
+/// margin after its start and before its end) waited no longer than the whole
+/// call. A call is inconclusive, and does not count here, when no probe was
+/// issued inside it (the probe's CPU was off the host for the call) or when
+/// that probe outwaited the whole call (a CPU was off the host for longer than
+/// the call: a kernel that masks interrupts for the call holds a probe issued
+/// inside it for at most the rest of the call, less than the call's span).
+/// Only an acknowledgement inside a call passes the case, so an inconclusive
+/// call cannot hide a masked stretch: under a kernel that masks the whole
+/// call, the probe in flight is acknowledged only at the call's end, and the
+/// call either counts here, when that probe was issued inside it, or is
+/// inconclusive, when it was issued before; either way no call passes, and the
+/// case fails once `SEED_ATTEMPTS` calls were conclusive or
+/// [`SEED_ATTEMPT_LIMIT`] calls were made.
 const SEED_ATTEMPTS: u32 = 4;
+/// Seeding calls of one kind the seeding case makes at most, conclusive or
+/// not: the bound that fails the case when the host keeps every call
+/// inconclusive, or when a kernel that masks interrupts for the whole call
+/// leaves every call inconclusive.
+const SEED_ATTEMPT_LIMIT: u32 = 16;
 /// The probe's page (crate docs § Scratch VAs).
 const PROBE_VA: u64 = 0x1_6600_0000;
 const PROBE_CPU: u32 = 0;
@@ -1600,6 +1621,10 @@ struct Measured
     /// Whether a probe issued once the call was under way was acknowledged
     /// before it returned.
     acked_inside: bool,
+    /// Whether the call, unacknowledged, tells nothing about the kernel: no
+    /// probe was issued inside it, or the first one issued inside it waited
+    /// longer than the whole call (`SEED_ATTEMPTS`).
+    inconclusive: bool,
     /// The call's result (`LAT_RESULT`).
     result: u64,
 }
@@ -1677,7 +1702,10 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
     let margin = 8 * LAT_GAP_US.load(Ordering::Relaxed) + 10;
 
     let mut max_wait = 0u64;
-    let mut first_after_start = u64::MAX;
+    // The issue and acknowledgement times of the first probe issued `margin`
+    // after the call's start. Probes run one at a time, so it is also the
+    // first of them acknowledged.
+    let mut first_after_start: Option<(u64, u64)> = None;
     let mut probe = || -> TestResult {
         // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so
         // the page holds no Rust object or IPC page of ktest.
@@ -1693,9 +1721,9 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
         {
             max_wait = max_wait.max(t1 - t0);
         }
-        if start != 0 && t0 >= start + margin
+        if start != 0 && t0 >= start + margin && first_after_start.is_none()
         {
-            first_after_start = first_after_start.min(t1);
+            first_after_start = Some((t0, t1));
         }
         Ok(())
     };
@@ -1724,10 +1752,17 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
         LAT_START.load(Ordering::Acquire),
         LAT_END.load(Ordering::Acquire),
     );
+    let span_us = end.saturating_sub(start);
+    let acked_inside = first_after_start.is_some_and(|(_, t1)| t1.saturating_add(margin) <= end);
+    let inconclusive = !acked_inside
+        && first_after_start.is_none_or(|(t0, t1)| {
+            t0.saturating_add(margin) > end || t1.saturating_sub(t0) > span_us
+        });
     Ok(Measured {
-        span_us: end.saturating_sub(start),
+        span_us,
         max_wait_us: max_wait,
-        acked_inside: first_after_start.saturating_add(margin) <= end,
+        acked_inside,
+        inconclusive,
         result: LAT_RESULT.load(Ordering::Relaxed),
     })
 }
@@ -1752,6 +1787,10 @@ fn check_measured(call: &'static str, m: &Measured) -> TestResult
     crate::log_u64(
         "ktest: pool_latency acked_inside=",
         u64::from(m.acked_inside),
+    );
+    crate::log_u64(
+        "ktest: pool_latency inconclusive=",
+        u64::from(m.inconclusive),
     );
     if m.max_wait_us > crate::scaled_bound(LATENCY_BOUND_US)
     {
@@ -1963,10 +2002,25 @@ fn seed_once(ctx: &TestContext, frame: u64, op: u64, source: u64)
     Ok(m)
 }
 
+/// Log one seeding attempt's own measure, before the attempts' longest probe
+/// wait is folded into it.
+fn log_seed_attempt(m: &Measured)
+{
+    crate::log_u64("ktest: pool_latency seed_attempt span_us=", m.span_us);
+    crate::log_u64(
+        "ktest: pool_latency seed_attempt max_probe_wait_us=",
+        m.max_wait_us,
+    );
+    crate::log_u64(
+        "ktest: pool_latency seed_attempt inconclusive=",
+        u64::from(m.inconclusive),
+    );
+}
+
 /// Creating a `CSpace`, then an address space, whose one donation seeds the
 /// whole latency source takes interrupts throughout: of up to
-/// [`SEED_ATTEMPTS`] calls of each kind, one sees a probe acknowledged inside
-/// it.
+/// [`SEED_ATTEMPTS`] conclusive calls of each kind, and at most
+/// [`SEED_ATTEMPT_LIMIT`] calls, one sees a probe acknowledged inside it.
 pub fn pool_seeding_takes_interrupts(ctx: &TestContext) -> TestResult
 {
     const CALLS: [(u64, &str); 2] = [
@@ -1991,17 +2045,28 @@ pub fn pool_seeding_takes_interrupts(ctx: &TestContext) -> TestResult
         {
             // Every attempt's probes count against LATENCY_BOUND_US; the
             // attempt that saw one acknowledged inside it, or the last, is the
-            // one reported.
+            // one reported. Only a conclusive attempt counts against
+            // SEED_ATTEMPTS.
             let mut max_wait_us = 0;
-            for _ in 0..SEED_ATTEMPTS
+            let mut conclusive = 0;
+            for _ in 0..SEED_ATTEMPT_LIMIT
             {
                 let m = seed_once(ctx, frame.0, op, source)?;
+                log_seed_attempt(&m);
                 max_wait_us = max_wait_us.max(m.max_wait_us);
-                let acked = m.acked_inside;
+                let (acked, inconclusive) = (m.acked_inside, m.inconclusive);
                 *slot = Some(Measured { max_wait_us, ..m });
                 if acked
                 {
                     break;
+                }
+                if !inconclusive
+                {
+                    conclusive += 1;
+                    if conclusive == SEED_ATTEMPTS
+                    {
+                        break;
+                    }
                 }
             }
         }

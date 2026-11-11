@@ -92,6 +92,43 @@ static mut POOL_SLOTS: [u64; POOL_SIZE] = [0; POOL_SIZE];
 /// Number of frames in the pool (set during init).
 static POOL_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// `POOL_SLOTS` as `init` left it, or as the last [`check_slots`] that found
+/// a change re-baselined it: the reference a stray write into `POOL_SLOTS`
+/// is detected against.
+static mut POOL_SHADOW: [u64; POOL_SIZE] = [0; POOL_SIZE];
+
+/// Log every pool entry that differs from its shadow, with its index, value
+/// and expected value, then re-baseline the shadow. The pool's entries never
+/// change after `init`, so a difference is a stray write into ktest's memory;
+/// the harness calls this after each cell, so the cell logged just before it
+/// is the first suspect.
+pub fn check_slots()
+{
+    let count = POOL_COUNT.load(Ordering::Acquire) as usize;
+    for i in 0..count.min(POOL_SIZE)
+    {
+        // SAFETY: i < POOL_SIZE; both arrays are written only by `init` and
+        // here, on the harness thread, and read by value.
+        let (now, then) = unsafe { (POOL_SLOTS[i], POOL_SHADOW[i]) };
+        if now != then
+        {
+            crate::log_u64("ktest: BUG frame pool entry changed, index=", i as u64);
+            crate::log_u64("ktest: BUG frame pool entry value=", now);
+            crate::log_u64("ktest: BUG frame pool entry expected=", then);
+            // SAFETY: as above.
+            unsafe { POOL_SHADOW[i] = now };
+        }
+    }
+}
+
+/// Whether `cap` is one of the pool's entries.
+pub fn is_pool_frame(cap: u64) -> bool
+{
+    let count = POOL_COUNT.load(Ordering::Acquire) as usize;
+    // SAFETY: i < POOL_SIZE; the entries are read by value.
+    (0..count.min(POOL_SIZE)).any(|i| unsafe { POOL_SLOTS[i] } == cap)
+}
+
 /// Recursively split a frame into single-page frames and add them to the pool.
 ///
 /// Splits `memory_cap` at `PAGE_SIZE`, stores the single-page first half (A)
@@ -227,6 +264,8 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
     #[allow(clippy::cast_possible_truncation)]
     let count_u32 = count as u32;
     POOL_COUNT.store(count_u32, Ordering::Release);
+    // SAFETY: init phase, before any other access to either array.
+    unsafe { POOL_SHADOW = POOL_SLOTS };
 
     let mut msg = [0u8; 64];
     let prefix = b"frame pool: initialized with ";

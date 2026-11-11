@@ -1,0 +1,6 @@
+# framebuffer: the boot framebuffer driver.
+#
+# A QUERY_DEVICE reply through the class SEND carries
+# fb_labels::WRITE_AUTHORITY (bit 63). svcmgr publishes it seed-only as
+# `devmgr.class.framebuffer`; logd's slot 4 and terminal's seed take it.
+verbs = 63

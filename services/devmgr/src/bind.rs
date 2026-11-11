@@ -25,7 +25,10 @@
 
 use driver_binding::decl::{DriverDecl, InterruptNeed, Reset, Tier};
 use driver_binding::resources::{InterruptKind, Resource};
-use firmware::binding::{Candidate, Choice, MatchTable, PciIdentity, RecordKeys, Source};
+use firmware::binding::{
+    Candidate, Choice, MatchTable, PciIdentity, RecordKeys, Source, class_admits,
+};
+use firmware::classes::Classes;
 use firmware::dma::Confinement;
 use firmware::lines::{HoldError, LineError};
 use firmware::resource::{CarveError, Span, SplitError};
@@ -148,11 +151,14 @@ pub fn boot_pass(records: &mut PciRecords, carve: &mut Carve, pass: &mut Pass, i
 
 /// The drivers-directory pass: list `dir_cap`, the `/services/drivers/`
 /// directory svcmgr handed devmgr, read the declaration of each entry, and
-/// bind the records still unbound to them. Every file cap is released once
+/// bind the records still unbound to them. A declaration of a class
+/// `classes` marks boot-only is not considered, logged
+/// ([`firmware::binding::class_admits`]). Every file cap is released once
 /// the pass ends.
-pub fn drivers_dir_pass(
+pub fn drivers_dir_pass<T>(
     records: &mut PciRecords,
     dir_cap: u64,
+    classes: &Classes<T>,
     carve: &mut Carve,
     pass: &mut Pass,
     ipc_buf: *mut u64,
@@ -173,7 +179,16 @@ pub fn drivers_dir_pass(
             return;
         };
         let label = core::str::from_utf8(name).unwrap_or("drivers-directory entry");
-        let decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
+        let mut decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
+        if let Some(d) = decl.filter(|d| !class_admits(classes, d, Source::DriversDir))
+        {
+            std::os::seraph::log!(
+                "{}: declares boot-only class {}; not considered",
+                d.name.as_str(),
+                d.class.as_ref().map_or("", |c| c.as_str())
+            );
+            decl = None;
+        }
         let binary = Binary::File {
             cap: walked.file_cap,
             size: walked.size,

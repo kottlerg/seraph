@@ -151,7 +151,7 @@ their `/config/svcmgr/services/*.svc` recipes. Nor is the per-arch RTC
 chip driver: devmgr spawns it from `/services/drivers/` once svcmgr installs
 the drivers-dir cap (`devmgr_labels::SET_DRIVERS_DIR`), and
 [timed](../services/timed/README.md) resolves it via
-`devmgr_labels::QUERY_RTC_DEVICE` at startup. For each
+`devmgr_labels::QUERY_DEVICE` on its rtc class SEND at startup. For each
 service init starts, it delegates the appropriate capability subset (see
 [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution"). svcmgr is configured with the universal
@@ -176,8 +176,8 @@ yet implemented (#262), per
 § Supervision hierarchy). svcmgr — not init — then publishes the
 well-known names it owns into its own registry
 (`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`,
-`DEVMGR_SHUTDOWN`, `DEVMGR_TEST`, `DEVMGR_DEBUG`, `VFSD_MOUNT`, `VFSD_DENY`, `LOGD_QUERY`, minted
-from the endowed sources) and
+`DEVMGR_SHUTDOWN`, `DEVMGR_TEST`, the `DEVMGR_CLASS_PREFIX` class names, `VFSD_MOUNT`,
+`VFSD_DENY`, `LOGD_QUERY`, minted from the endowed sources) and
 installs devmgr's `/services/drivers/` cap via
 `devmgr_labels::SET_DRIVERS_DIR`.
 The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are

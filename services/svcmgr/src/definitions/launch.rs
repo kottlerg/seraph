@@ -12,8 +12,9 @@
 //! the [`Launched`] handles; for a supervised launch [`launch`] binds
 //! death-notification itself, before `START_PROCESS`.
 
-use ipc::{devmgr_labels, procmgr_labels};
+use ipc::procmgr_labels;
 use registry::{Resolver, Visibility};
+use svcmgr_defs::class::class_publication;
 
 use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::registry_lookup_derived;
@@ -111,8 +112,9 @@ pub(crate) enum LaunchKind
     Restart,
 }
 
-/// Mint the four bootstrap caps real-logd expects, from the reserved
-/// log-sink sources svcmgr holds for the system's life:
+/// Mint the five bootstrap caps real-logd expects, from the reserved
+/// log-sink sources svcmgr holds for the system's life and from the
+/// `devmgr.class.*` publications ([`crate::classes`]):
 ///   * `[0]` master-log endpoint RECV (svcmgr's source stays valid, so a
 ///     fresh RECV reattaches each (re)launched logd to the same object that
 ///     every sender's `log_send_cap` targets);
@@ -122,15 +124,23 @@ pub(crate) enum LaunchKind
 ///   * `[2]` a `DEATH_EQ_AUTHORITY` `SEND|GRANT` on procmgr (logd registers sender
 ///     death-notifications for slot reclaim) — `SEND|GRANT` because that
 ///     registration transfers a cap;
-///   * `[3]` a `REGISTRY_QUERY_AUTHORITY` SEND on devmgr's registry (logd
-///     resolves the serial driver via `QUERY_SERIAL_DEVICE`).
+///   * `[3]` the `serial` class SEND (`devmgr.class.serial`), through which
+///     logd resolves the serial driver with `QUERY_DEVICE`;
+///   * `[4]` the `framebuffer` class SEND (`devmgr.class.framebuffer`), the
+///     same for the framebuffer driver.
 ///
-/// A source absent from the endowment, or a derive that fails, yields `0`
-/// in its slot. The slots are positional; [`serve_boot_slots`] transfers
+/// logd's recipe declares `log_sink`, which excludes `seed`, so svcmgr
+/// resolves these two publications for it here.
+/// A source absent from the endowment, an unpublished class, or a derive
+/// that fails, yields `0` in its slot. The slots are positional; [`serve_boot_slots`] transfers
 /// only the present caps and names the slot each fills in the round's
 /// presence word, so a round with an absent slot, such as every
 /// [`LaunchKind::Restart`] round, still reaches logd.
-pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u64>
+pub(crate) fn mint_logd_boot_caps(
+    ctx: &RestartCtx,
+    kind: LaunchKind,
+    registry: &mut registry::Registry,
+) -> Vec<u64>
 {
     let recv = if ctx.master_log_source != 0
     {
@@ -161,20 +171,14 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u64
     {
         0
     };
-    let registry_query = if ctx.devmgr_registry != 0
-    {
-        syscall::cap_derive_badge(
-            ctx.devmgr_registry,
-            syscall::RIGHTS_EP_SEND,
-            devmgr_labels::REGISTRY_QUERY_AUTHORITY,
-        )
-        .unwrap_or(0)
-    }
-    else
-    {
-        0
+    let mut class_send = |class: &[u8]| {
+        class_publication(class)
+            .and_then(|name| registry_lookup_derived(registry, &name, Resolver::Seed).ok())
+            .unwrap_or(0)
     };
-    std::vec![recv, handover_send, death_auth, registry_query]
+    let serial = class_send(b"serial");
+    let framebuffer = class_send(b"framebuffer");
+    std::vec![recv, handover_send, death_auth, serial, framebuffer]
 }
 
 /// Publish each name in a provider's `provides` list under the discovery
@@ -378,7 +382,7 @@ pub fn launch(
     // `provides` nor `seed`, so it never enters the provider/seed path.
     let (provided_endpoint, boot_caps) = if def.log_sink
     {
-        (0, mint_logd_boot_caps(ctx, LaunchKind::First))
+        (0, mint_logd_boot_caps(ctx, LaunchKind::First, registry))
     }
     else
     {

@@ -36,10 +36,9 @@ Four system-scope invariants govern the stack:
   each block driver, and fs drivers hold partition-identity-badged caps
   the block driver mints on `REGISTER_PARTITION`; unbadged callers are
   rejected. vfsd is the sole holder of the whole-disk caps: devmgr
-  mints one on `QUERY_BLOCK_DEVICE` only for a caller whose registry
-  cap carries `BLOCK_DEVICE_AUTHORITY`, which init sets on vfsd's
-  registry cap alone. Out-of-bounds LBAs are rejected by the block
-  driver on every request. See
+  mints one on `QUERY_DEVICE` only for a caller whose SEND is the
+  `block` class SEND, which init requests for vfsd alone. Out-of-bounds LBAs are rejected by
+  the block driver on every request. See
   [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
 - **System root is delivered, never discovered.** Every process
   spawned with a namespace receives its authority as
@@ -85,9 +84,9 @@ Distribution". Badge semantics, derivation, and revocation are owned by
 `REGISTER_PARTITION` is rejected unless the caller's badge carries
 `blk_labels::MOUNT_AUTHORITY`: only the holder of the devmgr-minted whole-disk cap
 can mint a partition binding. vfsd is the only such holder: devmgr
-mints a whole-disk cap on `QUERY_BLOCK_DEVICE` only for a caller
-whose registry cap carries `BLOCK_DEVICE_AUTHORITY`, which init sets on
-vfsd's registry cap alone. The block driver
+mints a whole-disk cap on `QUERY_DEVICE` only for a caller
+whose SEND is the `block` class SEND, which init requests for
+vfsd alone. The block driver
 enforces the LBA bound on every read and write against the caller's
 badge. See
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
@@ -125,7 +124,7 @@ or on-disk UUID. The model is:
   therefore a disk-authoring choice, not a vfsd concern; the in-tree
   image (see [build-system.md](build-system.md)) carries the tree on the
   partition only.
-- **Every disk is searched.** At startup vfsd sends `QUERY_BLOCK_DEVICE`
+- **Every disk is searched.** At startup vfsd sends `QUERY_DEVICE` on the block class SEND
   at instance ordinals 0, 1, …, passing a `WITHDRAWN` one (a disk whose
   driver devmgr withdrew when it died), until another reply is not
   `SUCCESS`, holds the whole-disk cap of every block driver devmgr

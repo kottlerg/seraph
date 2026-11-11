@@ -17,9 +17,9 @@ once during its own startup; see that document for the wire format.
 ## Bootstrap caps
 
 svcmgr launches and supervises real-logd, minting its bootstrap round —
-one round for its four positional slots, `done = true`, of which only the present
+rounds for its five positional slots, the last `done = true`, of which only the present
 caps ride, named by a presence word (an absent slot reads as `0`) — from the reserved
-log-sink sources init endows it (see
+log-sink sources init endows it and the `devmgr.class.*` publications (see
 [`services/svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md)).
 The shape mirrors the README's "Bootstrap caps" table:
 
@@ -28,7 +28,8 @@ The shape mirrors the README's "Bootstrap caps" table:
 | 0 | `RECV` on the master log endpoint |
 | 1 | `SEND` on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); a release init-logd defers is repeated after a further drain; if no attempt is delivered init-logd keeps serving), then `cap_delete` whatever the outcome; see [`handover-protocol.md`](handover-protocol.md)). Absent on a restart — no init-logd remains to pull from, so logd skips the history pull (restart: design intent; not yet implemented (#262)) |
 | 2 | badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
-| 3 | badged `SEND` on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (resolves the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
+| 3 | the `serial` class `SEND`, derived from the `devmgr.class.serial` publication (resolves the serial driver via `QUERY_DEVICE`) |
+| 4 | the `framebuffer` class `SEND`, derived from the `devmgr.class.framebuffer` publication (resolves the framebuffer driver via `QUERY_DEVICE`) |
 
 Every (re)launch mints `cap[0]` fresh from svcmgr's persistent master-log
 source, so a restarted logd re-attaches its RECV to the same endpoint
@@ -39,9 +40,9 @@ logd restart is design intent; not yet implemented (#262), per svcmgr's
 [`restart-protocol.md`](../../svcmgr/docs/restart-protocol.md#supervision-hierarchy)
 § Supervision hierarchy.
 
-logd keeps `cap[0]`, the procmgr `cap[2]` (retained after `REGISTER_DEATH_EQ`), and the
-devmgr-registry `cap[3]` for its lifetime, using `cap[3]` to resolve and cache the serial
-driver's write endpoint and, when a framebuffer driver is present, the framebuffer driver's;
+logd keeps `cap[0]`, the procmgr `cap[2]` (retained after `REGISTER_DEATH_EQ`), and the class SENDs
+`cap[3]` and `cap[4]` for its lifetime, using `cap[3]` to resolve and cache the serial driver's
+write endpoint and, when a framebuffer driver is present, `cap[4]` the framebuffer driver's;
 `cap[1]` is deleted after the handover release.
 
 ## Endpoint

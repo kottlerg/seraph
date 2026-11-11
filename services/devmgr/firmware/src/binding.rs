@@ -25,6 +25,8 @@ use alloc::vec::Vec;
 
 use driver_binding::decl::{DriverDecl, MatchKey, Tier};
 
+use crate::classes::Classes;
+
 /// Where a declaration came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source
@@ -109,6 +111,19 @@ pub fn decl_rank(decl: &DriverDecl, source: Source, record: &RecordKeys<'_>) -> 
         .filter(|key| source == Source::BootModule || !matches!(key, MatchKey::IommuFamily(_)))
         .filter_map(|key| rank(key, record))
         .min()
+}
+
+/// Whether `decl`, from `source`, may be considered at all: a declaration of
+/// a class a class request marked boot-only is accepted only from a boot
+/// module (docs/driver-binding.md § Declaration Bounds), so a
+/// drivers-directory binary cannot claim a boot-only class's devices.
+#[must_use]
+pub fn class_admits<T>(classes: &Classes<T>, decl: &DriverDecl, source: Source) -> bool
+{
+    source == Source::BootModule
+        || decl
+            .class
+            .is_none_or(|class| !classes.is_boot_only(class.as_str()))
 }
 
 /// What a declaration from `source` is given, within the source bounds, and
@@ -630,5 +645,27 @@ mod tests
                 phys_access_ignored: false,
             }
         );
+    }
+
+    #[test]
+    fn a_boot_only_class_admits_a_boot_module_declaration_alone()
+    {
+        let m = [Match::PciId {
+            vendor: 1,
+            device: 2,
+        }];
+        // `decl_with` declares class `c`.
+        let declared = decl_with(&m, None, Tier::Auxiliary, false);
+        let mut classless = declared;
+        classless.class = None;
+        let mut classes = Classes::<()>::new();
+        assert!(class_admits(&classes, &declared, Source::DriversDir));
+        let c = driver_binding::decl::ClassName::class(b"c").unwrap();
+        classes.configure(&c, false, false).unwrap();
+        assert!(class_admits(&classes, &declared, Source::DriversDir));
+        classes.configure(&c, true, false).unwrap();
+        assert!(!class_admits(&classes, &declared, Source::DriversDir));
+        assert!(class_admits(&classes, &declared, Source::BootModule));
+        assert!(class_admits(&classes, &classless, Source::DriversDir));
     }
 }

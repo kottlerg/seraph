@@ -6,19 +6,21 @@
 //! Pure `.svc` service-definition types and parser for svcmgr.
 //!
 //! Holds the plain-data recipe record ([`Definition`] and its component
-//! enums), the `key = value` parser ([`parse`]), the argv/env wire-blob
-//! encoder ([`build_blob`]) whose output the parser bounds by the child's
-//! argv/env region, and the policies svcmgr applies at runtime:
-//! the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
+//! enums), the `key = value` parser ([`parse`]) and that of the device
+//! class files svcmgr configures devmgr's classes from ([`class`]), the
+//! argv/env wire-blob encoder ([`build_blob`]) whose output the parser
+//! bounds by the child's argv/env region, and the policies svcmgr applies at
+//! runtime: the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
 //! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), and the windowed restart
 //! budget ([`RestartBudget`]). Nothing here touches a syscall, IPC, or
 //! `std::os::seraph` surface, so the whole crate is host-reachable and
-//! host-tested — the `.svc` files are external input and their parser
-//! carries unit tests per
+//! host-tested — the `.svc` and class files are external input and their
+//! parsers carry unit tests per
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 //! The impure launch/restart machinery that consumes a parsed [`Definition`]
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
+pub mod class;
 pub mod parse;
 pub mod restart_budget;
 

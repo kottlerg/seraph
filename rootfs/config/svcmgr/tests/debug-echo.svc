@@ -5,11 +5,11 @@
 # one boot with `--debug-port`, which attaches the virtio-console device
 # devmgr binds as the debug port. See services/debug-echo/README.md.
 #
-# seed = devmgr.debug is the DEBUG_PORT_AUTHORITY SEND used for
-# QUERY_DEBUG_PORT_DEVICE. It invokes no shutdown: the host test kills QEMU.
+# seed = devmgr.class.debug-port is the debug-port class SEND it sends
+# QUERY_DEVICE on. It invokes no shutdown: the host test kills QEMU.
 binary    = /tests/debug-echo
 argv      = debug-echo
 restart   = never
 critical  = no
 namespace = none
-seed      = devmgr.debug
+seed      = devmgr.class.debug-port

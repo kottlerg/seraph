@@ -27,6 +27,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
+mod classes;
 mod death_queues;
 mod definitions;
 mod restart;
@@ -125,11 +126,14 @@ fn main() -> !
         halt_loop();
     };
 
-    // Publish the well-known names svcmgr owns and hand devmgr its
-    // drivers dir — both from the handover endowment caps — before the
-    // event loop, so they are in place before `HANDOVER_COMPLETE` drives
-    // reconciliation and any launched consumer resolves them.
+    // Publish the well-known names svcmgr owns, configure devmgr's device
+    // classes and publish their SENDs, and hand devmgr its drivers dir — all
+    // from the handover endowment caps — before the event loop, so they are
+    // in place before `HANDOVER_COMPLETE` drives reconciliation and any
+    // launched consumer resolves them. The classes go first: a class file's
+    // boot-only mark must reach devmgr before its drivers-directory pass.
     publish_well_known(&mut state.registry, &caps);
+    classes::configure(&mut state.registry, caps.devmgr_registry, ipc_buf);
     install_drivers_dir(&caps, ipc_buf);
 
     std::os::seraph::log!("endowed; waiting for handover");
@@ -180,7 +184,7 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
         Err(_) => std::os::seraph::log!("derive svcmgr SEND failed"),
     }
 
-    // devmgr.registry / devmgr.shutdown / devmgr.test / devmgr.debug — badged SENDs minted
+    // devmgr.registry / devmgr.shutdown / devmgr.test — badged SENDs minted
     // from the endowed badge-0 `SEND|GRANT` source. The badge bits ride
     // through `registry_lookup_derived`'s plain `cap_derive` to consumers.
     // Each carries verb-bit authority, so each is seed-only: `QUERY_ENDPOINT`
@@ -195,10 +199,6 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
         (
             ipc::published_names::DEVMGR_TEST,
             query | ipc::devmgr_labels::TEST_LABEL_AUTHORITY,
-        ),
-        (
-            ipc::published_names::DEVMGR_DEBUG,
-            query | ipc::devmgr_labels::DEBUG_PORT_AUTHORITY,
         ),
     ]
     {
@@ -281,8 +281,8 @@ fn publish_minted_send(
 /// the endowed devmgr-registry source.
 ///
 /// Best-effort: any failure leaves devmgr without a drivers dir, so timed
-/// sees `NO_DEVICE` on its first `QUERY_RTC_DEVICE` and degrades to its
-/// no-RTC path; the rest of startup proceeds.
+/// sees `NO_DEVICE` on its first `QUERY_DEVICE` through the `rtc` class and
+/// degrades to its no-RTC path; the rest of startup proceeds.
 fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
 {
     if caps.devmgr_registry == 0
@@ -402,7 +402,6 @@ fn event_loop(
         deaths,
         master_log_source: caps.master_log_source,
         procmgr_death_auth_source: caps.procmgr_death_auth_source,
-        devmgr_registry: caps.devmgr_registry,
     };
 
     // One guard covers both spin shapes: a failing wait_set_wait, and a

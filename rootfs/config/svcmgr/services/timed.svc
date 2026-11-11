@@ -4,10 +4,10 @@
 # `provides = timed` makes svcmgr create the endpoint, serve its RECV as
 # bootstrap cap[0], and publish a SEND under the name `timed` so consumers
 # resolve `SystemTime::now()` through the discovery registry.
-# `seed = devmgr.registry` delivers the REGISTRY_QUERY_AUTHORITY-tokened
-# SEND on devmgr's registry that timed uses for `QUERY_RTC_DEVICE`. The two
-# together are timed's bootstrap round (caps[0] = own service endpoint,
-# caps[1] = devmgr registry). As a provider, timed launches ahead of pure
+# `seed = devmgr.class.rtc` delivers the rtc class SEND on devmgr's
+# registry that timed sends `QUERY_DEVICE` on. The two together are timed's
+# bootstrap round (caps[0] = own service endpoint, caps[1] = the rtc class
+# SEND). As a provider, timed launches ahead of pure
 # consumers during reconciliation so its name is published before any
 # consumer resolves it.
 #
@@ -23,4 +23,4 @@ restart   = on_failure
 critical  = no
 namespace = none
 provides  = timed
-seed      = devmgr.registry
+seed      = devmgr.class.rtc

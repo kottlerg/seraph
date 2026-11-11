@@ -43,14 +43,14 @@ endpoint only after that report, so a driver that exits in its device setup
 is never handed to a client (see [devmgr
 Responsibilities](../../../devmgr/docs/responsibilities.md#responsibilities)). vfsd
 obtains a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap through
-devmgr's `QUERY_BLOCK_DEVICE`. The delegation chain is owned by
+devmgr's `QUERY_DEVICE` on the `block` class SEND. The delegation chain is owned by
 [docs/storage.md](../../../../docs/storage.md) § Capability Delegation Chain.
 
 Two access tiers exist on this endpoint, distinguished by the kernel-supplied
 caller badge; unbadged callers are rejected:
 
 1. **Whole-disk (`MOUNT_AUTHORITY`-badged)** — minted by devmgr on
-   `QUERY_BLOCK_DEVICE` and held by vfsd. Reads and writes are bounded only
+   `QUERY_DEVICE` on the `block` class and held by vfsd. Reads and writes are bounded only
    by device capacity. Permitted to issue `REGISTER_PARTITION`.
 2. **Per-partition (partition badge, `MOUNT_AUTHORITY` clear)** — minted by
    the driver and returned in the `REGISTER_PARTITION` reply; vfsd hands them

@@ -25,11 +25,12 @@ rest is design intent; not yet implemented:
 - init's untagged forwarding of the modules that carry a declaration: init tags each boot
   module with its module class, as it delivers them today;
 - message-signaled vectors: a PCI function's driver is given its wired line only;
-- device classes (§ Device Classes): the class files, the boot-only mark, `QUERY_DEVICE`, and
-  the generic badge. devmgr serves each class under the class name its drivers declare, through
-  one query label per class;
-- the retirement of the test-only labels, and the declarations of the `test-fault` and
-  `test-orphan` fixtures, which devmgr starts only on those labels (§ Test Fixtures).
+- the retirement of the test-only labels and of `TEST_LABEL_AUTHORITY`, and the declarations of
+  the `test-fault` and `test-orphan` fixtures, which devmgr starts only on those labels
+  (§ Test Fixtures).
+
+Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
+`MINT_CLASS_SEND`, the class files, and the boot-only mark.
 
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
 § Responsibilities specifies the running system.
@@ -263,35 +264,40 @@ driver:
   ([service-definitions.md](../services/svcmgr/docs/service-definitions.md#grammar)), gives
   the class's name, the client verb mask devmgr stamps on the SEND it hands out, and whether
   the class is boot-only (§ Declaration Bounds).
-- **Publication.** For each class file, svcmgr asks devmgr, over a privileged label that only
-  svcmgr and init hold, for a registry SEND whose badge carries the class's slot and its verb
-  mask, and publishes it seed-only as `devmgr.class.<name>`. svcmgr does this before it sends
-  `SET_DRIVERS_DIR`, so devmgr knows which classes are boot-only before it reads any
-  drivers-directory declaration. A service reaches a class only when its `.svc` `seed` line
-  names that publication.
+- **Publication.** For each class file, svcmgr sends devmgr `MINT_CLASS_SEND`, a label gated on
+  `CLASS_AUTHORITY` that only svcmgr and init hold, and receives a class SEND: a SEND on
+  devmgr's registry endpoint whose badge carries the class's slot and its verb mask. The
+  request carries the verbs, the boot-only flag, and the class name (at most
+  `MAX_CLASS_NAME_BYTES` = 32 bytes). svcmgr publishes the class SEND seed-only as
+  `devmgr.class.<name>` before it sends `SET_DRIVERS_DIR`, so devmgr knows which classes are
+  boot-only before it reads any drivers-directory declaration. A service reaches a class only
+  when its `.svc` `seed` line names that publication.
 - **Bootstrap.** The one class a bootstrap service needs before svcmgr runs is block, for
   vfsd's root mount. init requests it over the same label, with the block protocol's mount
   verb, as part of the fixed bootstrap structure (§ Principle), and reads no class file for
   it. Every other consumer, logd included, is launched by svcmgr and reaches its classes
   through svcmgr's publications.
-- **Badge.** One generic badge layout, defined once beside the registry protocol, carries the
-  slot and the mask. It replaces the per-class authority bits (`BLOCK_DEVICE_AUTHORITY`,
-  `DEBUG_PORT_AUTHORITY`, `TEST_LABEL_AUTHORITY`).
+- **Badge.** One generic badge layout (`devmgr_labels::class_badge`), defined once beside the
+  registry protocol, carries the slot and the mask. No class has an authority bit of its own;
+  `TEST_LABEL_AUTHORITY` gates only the test labels.
 
 Every driver of a class is served under its class file's policy, so no declaration can widen
 access to its class, and a deployment that installs no class file for a class serves it to no
 one.
 
-One registry label, `QUERY_DEVICE`, replaces the per-class `QUERY_*_DEVICE` labels. It carries
-an instance ordinal and takes the class from the caller's badge; devmgr answers as the
-per-class queries answer today: the SEND on the served driver at that ordinal, stamped with
-the badge's verb mask, `WITHDRAWN` at a withdrawn driver's ordinal, and `NO_DEVICE` past the
-last served driver of the class or before the pass that binds it has settled. A class's
+One registry label, `QUERY_DEVICE`, serves every class. It carries an instance ordinal in
+`data[1]` (absent is 0) and takes the class and the verb mask from the caller's class SEND,
+never from the message; a registry SEND without a class slot gets `UNAUTHORIZED`. devmgr
+answers with the SEND on the served driver at that ordinal, stamped with the badge's verb mask,
+`WITHDRAWN` at a withdrawn driver's ordinal, and `NO_DEVICE` past the last served driver of the
+class or before the pass that binds it has settled. A class's
 ordinals are assigned in the order its drivers are first served: within one pass in record
 order, and a later pass appends after every ordinal an earlier pass assigned. An ordinal never
 moves once its pass settles, and a withdrawn driver's ordinal stays as a tombstone. A
-declared class with no class file, and a class file no declaration serves, are logged at
-`SET_DRIVERS_DIR`.
+class configured with no served driver, and a served class no class file configured, are
+logged after the drivers-directory settle. A drivers-directory declaration whose class a class
+request marked boot-only is logged and not bound; a boot-only mark after the drivers-directory
+pass began is refused `INVALID_REQUEST`. devmgr's class table holds at most 64 classes.
 
 The class's protocol (its labels, message layouts, and verb bit positions) is the contract
 between its drivers and its consumers, and is the one artefact both compile against. It is

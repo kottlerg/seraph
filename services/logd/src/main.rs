@@ -65,12 +65,15 @@ struct BootCaps
     /// call `REGISTER_DEATH_EQ` at startup and, from the resync helper
     /// thread, `QUERY_LIVE_PROCESSES`. Kept across the lifetime of real-logd.
     procmgr_death_auth_send: u64,
-    /// SEND cap on devmgr's registry endpoint carrying
-    /// `REGISTRY_QUERY_AUTHORITY`. logd resolves the serial driver's
-    /// write endpoint through it via `QUERY_SERIAL_DEVICE`. Zero
-    /// disables serial output (logd then buffers received log lines in
-    /// memory only).
-    devmgr_registry_ep: u64,
+    /// The `serial` class SEND (svcmgr's `devmgr.class.serial`
+    /// publication). logd resolves the serial driver's write endpoint
+    /// through it via `QUERY_DEVICE`. Zero disables serial output (logd
+    /// then buffers received log lines in memory only).
+    serial_class: u64,
+    /// The `framebuffer` class SEND (svcmgr's `devmgr.class.framebuffer`
+    /// publication), through which logd resolves the framebuffer driver
+    /// the same way. Zero disables the framebuffer mirror.
+    fb_class: u64,
 }
 
 fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
@@ -87,8 +90,9 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
         log_ep_recv,
         log_ep_handover_send,
         procmgr_death_auth_send,
-        devmgr_registry_ep,
-    ] = unsafe { ipc::bootstrap::request_slots::<4>(creator_endpoint, ipc_buf) }.ok()?;
+        serial_class,
+        fb_class,
+    ] = unsafe { ipc::bootstrap::request_slots::<5>(creator_endpoint, ipc_buf) }.ok()?;
     if log_ep_recv == 0
     {
         return None;
@@ -97,7 +101,8 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
         log_ep_recv,
         log_ep_handover_send,
         procmgr_death_auth_send,
-        devmgr_registry_ep,
+        serial_class,
+        fb_class,
     })
 }
 
@@ -128,11 +133,11 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    // Record the devmgr-registry cap for the emit path. The
-    // serial driver is resolved lazily on first emit via
-    // `QUERY_SERIAL_DEVICE`; until then serial output is dropped (init-logd
-    // covered the pre-driver window) while history still accrues.
-    serial_init(caps.devmgr_registry_ep);
+    // Record the class SENDs for the emit path. The serial driver is
+    // resolved lazily on first emit via `QUERY_DEVICE`; until then serial
+    // output is dropped (init-logd covered the pre-driver window) while
+    // history still accrues.
+    serial_init(caps.serial_class, caps.fb_class);
 
     // logd serves the log endpoint, so it must never emit through it. Route
     // panic / alloc-error / precondition output to the serial driver (the
@@ -806,10 +811,13 @@ fn register_name(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: 
 
 // ── Serial output (driver-mediated) ────────────────────────────────────────
 
-/// SEND cap on devmgr's registry endpoint (`REGISTRY_QUERY_AUTHORITY`).
-static DEVMGR_REGISTRY_EP: AtomicU64 = AtomicU64::new(0);
+/// The `serial` class SEND on devmgr's registry endpoint.
+static SERIAL_CLASS: AtomicU64 = AtomicU64::new(0);
+/// The `framebuffer` class SEND on devmgr's registry endpoint.
+static FB_CLASS: AtomicU64 = AtomicU64::new(0);
 /// Resolved SEND cap on the serial driver's service endpoint, cached after
-/// the first successful `QUERY_SERIAL_DEVICE`. Zero = unresolved.
+/// the first successful `QUERY_DEVICE` on [`SERIAL_CLASS`]. Zero =
+/// unresolved.
 static SERIAL_CAP: AtomicU64 = AtomicU64::new(0);
 /// Resolved SEND cap on the framebuffer driver's service endpoint. `0` =
 /// not yet attempted; [`FB_UNAVAILABLE`] = attempted and no driver present
@@ -819,7 +827,7 @@ static SERIAL_CAP: AtomicU64 = AtomicU64::new(0);
 static FB_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Sentinel stored in [`FB_CAP`] once a resolution attempt finds no
-/// framebuffer driver. Repeating the `QUERY_FRAMEBUFFER_DEVICE` per log line
+/// framebuffer driver. Repeating the `QUERY_DEVICE` per log line
 /// would open a deadlock window against devmgr's own logging — devmgr →
 /// `log_ep` → logd, while logd blocks here on devmgr's reply — so the attempt
 /// is made exactly once. `u64::MAX` names no cap: no handle sets bit 63.
@@ -827,10 +835,11 @@ const FB_UNAVAILABLE: u64 = u64::MAX;
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` (one full IPC data area).
 const SERIAL_CHUNK: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
-/// Record the devmgr-registry cap for the emit path.
-fn serial_init(devmgr_registry_ep: u64)
+/// Record the class SENDs for the emit path.
+fn serial_init(serial_class: u64, fb_class: u64)
 {
-    DEVMGR_REGISTRY_EP.store(devmgr_registry_ep, Ordering::Release);
+    SERIAL_CLASS.store(serial_class, Ordering::Release);
+    FB_CLASS.store(fb_class, Ordering::Release);
 }
 
 /// The calling thread's registered IPC buffer, for the emit path's
@@ -842,8 +851,8 @@ fn emit_ipc_buf() -> *mut u64
     std::os::seraph::current_ipc_buf()
 }
 
-/// Resolve (and cache) the serial driver's SEND cap via devmgr's
-/// `QUERY_SERIAL_DEVICE`. Returns 0 while the driver is not yet resolvable
+/// Resolve (and cache) the serial driver's SEND cap via `QUERY_DEVICE` at
+/// ordinal 0 on the `serial` class. Returns 0 while the driver is not yet resolvable
 /// (devmgr not reachable, or driver not spawned); the caller then drops the
 /// bytes.
 fn resolve_serial_cap(ipc_buf: *mut u64) -> u64
@@ -853,30 +862,17 @@ fn resolve_serial_cap(ipc_buf: *mut u64) -> u64
     {
         return cached;
     }
-    let registry = DEVMGR_REGISTRY_EP.load(Ordering::Acquire);
-    if registry == 0
+    let class = SERIAL_CLASS.load(Ordering::Acquire);
+    if class == 0
     {
         return 0;
     }
-    let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_SERIAL_DEVICE)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
+    let Ok(cap) = (unsafe { ipc::query_device(class, 0, ipc_buf) })
     else
     {
         return 0;
     };
-    if reply.label != ipc::devmgr_errors::SUCCESS
-    {
-        return 0;
-    }
-    let reply_caps = reply.caps();
-    if reply_caps.is_empty()
-    {
-        return 0;
-    }
-    let cap = reply_caps[0];
     SERIAL_CAP.store(cap, Ordering::Release);
     cap
 }
@@ -912,11 +908,11 @@ fn serial_write(bytes: &[u8])
     }
 }
 
-/// Resolve (and cache) the framebuffer driver's SEND cap via devmgr's
-/// `QUERY_FRAMEBUFFER_DEVICE`. Returns 0 while the driver is not yet
-/// resolvable (devmgr unreachable, headless boot, or driver not spawned);
-/// the caller then skips the framebuffer mirror. Reuses the same registry
-/// cap and IPC buffer the serial path resolved through.
+/// Resolve (and cache) the framebuffer driver's SEND cap via `QUERY_DEVICE`
+/// at ordinal 0 on the `framebuffer` class. Returns 0 while the driver is
+/// not yet resolvable (devmgr unreachable, headless boot, or driver not
+/// spawned); the caller then skips the framebuffer mirror. Uses the same
+/// IPC buffer the serial path resolved through.
 fn resolve_fb_cap(ipc_buf: *mut u64) -> u64
 {
     let cached = FB_CAP.load(Ordering::Acquire);
@@ -928,42 +924,34 @@ fn resolve_fb_cap(ipc_buf: *mut u64) -> u64
     {
         return cached;
     }
-    let registry = DEVMGR_REGISTRY_EP.load(Ordering::Acquire);
-    if registry == 0
+    let class = FB_CLASS.load(Ordering::Acquire);
+    if class == 0
     {
-        // Registry not recorded yet (serial_init sets it before the drain
-        // loop); retry once it is.
+        // No class SEND recorded (serial_init sets it before the drain
+        // loop, and a boot without the framebuffer class has none): no IPC,
+        // so nothing to latch.
         return 0;
     }
-    let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
-    else
+    let cap = match unsafe { ipc::query_device(class, 0, ipc_buf) }
     {
+        Ok(cap) => cap,
         // Could not complete the query (transient — the call returned rather
         // than blocking, so this is not the logd↔devmgr deadlock path). Leave
         // the cache unset and retry on the next line, matching
-        // resolve_serial_cap; the serial cap resolves on this same registry
+        // resolve_serial_cap; the serial class resolves on the same devmgr
         // endpoint, so a hard failure here does not recur in practice.
-        return 0;
+        Err(ipc::ClassCallError::Call(_)) => return 0,
+        // devmgr answered with no driver.
+        Err(_) => 0,
     };
     // devmgr answered. Latch the outcome so the drain loop issues at most one
-    // more QUERY_FRAMEBUFFER_DEVICE: the resolved cap, or FB_UNAVAILABLE when
-    // devmgr reports no framebuffer driver (headless boot). The driver, when
+    // more QUERY_DEVICE: the resolved cap, or FB_UNAVAILABLE when devmgr
+    // reports no framebuffer driver (headless boot). The driver, when
     // present, is spawned before svcmgr launches logd, so this resolves it.
     // Latching the no-driver answer is what prevents a per-line re-query, which
     // would open a deadlock window against devmgr's own logging (devmgr →
     // log_ep → logd, while logd blocks here on devmgr's reply).
-    let cap = if reply.label == ipc::devmgr_errors::SUCCESS
-    {
-        reply.caps().first().copied().unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
     FB_CAP.store(
         if cap == 0 { FB_UNAVAILABLE } else { cap },
         Ordering::Release,

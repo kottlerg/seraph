@@ -43,8 +43,14 @@ pub struct Caps
     /// `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint
     /// (`logd.query`), in slot 6.
     pub logd_query: u64,
+    /// The `serial` class SEND on devmgr's registry endpoint
+    /// (`devmgr.class.serial`), in slot 7.
+    pub serial_class: u64,
+    /// The `input` class SEND on devmgr's registry endpoint
+    /// (`devmgr.class.input`), in slot 8.
+    pub input_class: u64,
     /// `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which the recipe's
-    /// `debug_authority = yes` delivers in slot 7, after the seeds.
+    /// `debug_authority = yes` delivers in slot 9, after the seeds.
     pub debug_authority: u64,
 }
 
@@ -73,8 +79,8 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Seven seeds and the debug-authority slot take two rounds; an absent slot decodes as `0`, and a
-    // round that does not decode leaves every slot `0`.
+    // Nine seeds and the debug-authority slot take three rounds; an absent slot decodes as `0`,
+    // and a round that does not decode leaves every slot `0`.
     let Ok(
         [
             root_fs,
@@ -84,9 +90,11 @@ fn request_round() -> Caps
             vfsd_mount,
             vfsd_deny,
             logd_query,
+            serial_class,
+            input_class,
             debug_authority,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<8>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<10>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -98,6 +106,8 @@ fn request_round() -> Caps
     caps.vfsd_mount = vfsd_mount;
     caps.vfsd_deny = vfsd_deny;
     caps.logd_query = logd_query;
+    caps.serial_class = serial_class;
+    caps.input_class = input_class;
     caps.debug_authority = debug_authority;
 
     caps

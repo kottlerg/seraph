@@ -31,7 +31,7 @@ mod tables;
 use std::sync::Arc;
 
 use driver_binding::decl::{ClassName, DriverName};
-use firmware::classes::Classes;
+use firmware::classes::{Classes, Mismatch};
 use firmware::lines::{HeldLines, LineError};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
 use firmware::roster::{DeathPost, DriverState, Roster};
@@ -269,91 +269,58 @@ fn main() -> !
 
         match label
         {
-            ipc::devmgr_labels::QUERY_BLOCK_DEVICE =>
+            ipc::devmgr_labels::QUERY_DEVICE =>
             {
-                // The reply is whole-disk authority, so the gate is
-                // BLOCK_DEVICE_AUTHORITY, which only vfsd's init-minted
-                // registry cap carries, not the REGISTRY_QUERY_AUTHORITY
-                // every svcmgr-published registry cap carries.
-                if badge & ipc::devmgr_labels::BLOCK_DEVICE_AUTHORITY == 0
-                {
-                    std::os::seraph::log!(
-                        "QUERY_BLOCK_DEVICE rejected: badge lacks BLOCK_DEVICE_AUTHORITY"
-                    );
-                    reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
-                }
-                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
-                {
-                    std::os::seraph::log!(
-                        "QUERY_BLOCK_DEVICE rejected: caller DEVMGR_LABELS_VERSION={} expected {}",
-                        msg.word(0),
-                        ipc::DEVMGR_LABELS_VERSION
-                    );
-                    reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-                }
+                // Do not `seraph::log!` here: logd is a caller, blocked in
+                // this call outside its log loop, so a log line would
+                // deadlock (devmgr → log_ep → logd waiting on this reply).
+                // The class and the reply's verb bits are the badge's, so a
+                // SEND not minted by MINT_CLASS_SEND reaches no driver.
+                let class = ipc::devmgr_labels::class_badge::decode(badge)
+                    .and_then(|(slot, verbs)| Some((served.classes.get_slot(slot)?, verbs)));
+                let Some((class, verbs)) = class
                 else
                 {
-                    // The MOUNT_AUTHORITY verb bit gates REGISTER_PARTITION
-                    // and whole-disk reads at virtio-blk; consumers without
-                    // it can only use partition-badged caps the driver
-                    // issues in response to a REGISTER_PARTITION call.
-                    reply_served(
-                        served.lookup(class::BLOCK, instance_ordinal(&msg)),
-                        ipc::blk_labels::MOUNT_AUTHORITY,
-                        ipc::devmgr_errors::INVALID_REQUEST,
-                        ipc_buf,
-                    );
+                    reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+                    continue;
+                };
+                if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+                    continue;
                 }
+                let lookup = instance_ordinal(&msg).map_or(Lookup::Absent, |i| class.get(i));
+                reply_served(lookup, verbs, ipc::devmgr_errors::NO_DEVICE, ipc_buf);
             }
-            ipc::devmgr_labels::QUERY_SERIAL_DEVICE =>
+            ipc::devmgr_labels::MINT_CLASS_SEND =>
             {
-                // This handler must not `seraph::log!`: its caller is logd
-                // (the log sink), which blocks in this synchronous call
-                // outside its log-recv loop. A log here would deadlock
-                // (devmgr → log_ep → logd, which is waiting on this reply).
-                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                // Logs nothing, as QUERY_DEVICE does not.
+                if badge & ipc::devmgr_labels::CLASS_AUTHORITY == 0
                 {
                     reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+                    continue;
                 }
-                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
                 {
                     reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+                    continue;
                 }
-                else
+                match mint_class_send(
+                    &mut served.classes,
+                    caps.registry_ep,
+                    &msg,
+                    on_disk_spawn_attempted,
+                )
                 {
-                    // Both verb bits, mirroring QUERY_BLOCK_DEVICE. SEND_GRANT
-                    // also lets the holder pass its RX-notify notification
-                    // cap to the driver.
-                    reply_served(
-                        served.lookup(class::SERIAL, Some(0)),
-                        ipc::serial_labels::WRITE_AUTHORITY | ipc::serial_labels::READ_AUTHORITY,
-                        ipc::devmgr_errors::INVALID_REQUEST,
-                        ipc_buf,
-                    );
-                }
-            }
-            ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE =>
-            {
-                // Like QUERY_SERIAL_DEVICE: do not `seraph::log!` here.
-                // If logd ever fans framebuffer output here, a log call
-                // would deadlock (devmgr → log_ep → logd waiting on
-                // this reply).
-                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
-                {
-                    reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
-                }
-                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
-                {
-                    reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-                }
-                else
-                {
-                    reply_served(
-                        served.lookup(class::FRAMEBUFFER, Some(0)),
-                        ipc::fb_labels::WRITE_AUTHORITY,
-                        ipc::devmgr_errors::INVALID_REQUEST,
-                        ipc_buf,
-                    );
+                    Ok(send) =>
+                    {
+                        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                            .cap(send)
+                            .build();
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                    Err(code) => reply_status(code, ipc_buf),
                 }
             }
             ipc::devmgr_labels::SET_DRIVERS_DIR =>
@@ -430,86 +397,6 @@ fn main() -> !
                         &mut watch,
                         &mut catalog,
                         &mut served,
-                        ipc_buf,
-                    );
-                }
-            }
-            ipc::devmgr_labels::QUERY_RTC_DEVICE =>
-            {
-                // Like QUERY_SERIAL_DEVICE: do not `seraph::log!` here.
-                // timed is the synchronous caller and a log inside this
-                // handler can deadlock if logd ever fans through devmgr.
-                //
-                // No nested IPC, no spawn: the RTC was spawned and settled
-                // by the SET_DRIVERS_DIR handler. When none is served, the
-                // spawn either has not happened yet (handshake not received)
-                // or failed permanently for this boot — reply NO_DEVICE
-                // either way and the client (timed) degrades to its no-RTC
-                // path.
-                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
-                {
-                    reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
-                }
-                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
-                {
-                    reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-                }
-                else
-                {
-                    reply_served(
-                        served.lookup(class::RTC, Some(0)),
-                        ipc::rtc_labels::READ_AUTHORITY,
-                        ipc::devmgr_errors::NO_DEVICE,
-                        ipc_buf,
-                    );
-                }
-            }
-            ipc::devmgr_labels::QUERY_INPUT_DEVICE =>
-            {
-                // Like QUERY_RTC_DEVICE: the drivers are spawned on-disk by
-                // the SET_DRIVERS_DIR handler, so no input driver is served
-                // until then — reply NO_DEVICE for an ordinal past the served
-                // drivers. Do not `seraph::log!` here (deadlock risk if logd
-                // ever fans input queries through devmgr).
-                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
-                {
-                    reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
-                }
-                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
-                {
-                    reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-                }
-                else
-                {
-                    reply_served(
-                        served.lookup(class::INPUT, instance_ordinal(&msg)),
-                        ipc::input_labels::READ_AUTHORITY,
-                        ipc::devmgr_errors::NO_DEVICE,
-                        ipc_buf,
-                    );
-                }
-            }
-            ipc::devmgr_labels::QUERY_DEBUG_PORT_DEVICE =>
-            {
-                // Like QUERY_INPUT_DEVICE: the driver is spawned on-disk by
-                // the SET_DRIVERS_DIR handler, so none is served until then.
-                // Gated on DEBUG_PORT_AUTHORITY, which only the seed-only
-                // devmgr.debug cap carries. Do not `seraph::log!` here, as
-                // in the device queries it mirrors.
-                if badge & ipc::devmgr_labels::DEBUG_PORT_AUTHORITY == 0
-                {
-                    reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
-                }
-                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
-                {
-                    reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-                }
-                else
-                {
-                    reply_served(
-                        served.lookup(class::DEBUG_PORT, Some(0)),
-                        ipc::serial_labels::WRITE_AUTHORITY | ipc::serial_labels::READ_AUTHORITY,
-                        ipc::devmgr_errors::NO_DEVICE,
                         ipc_buf,
                     );
                 }
@@ -604,20 +491,14 @@ fn main() -> !
                 {
                     continue;
                 }
-                let driver = match msg.word(1)
+                let Some(class) =
+                    ipc::class_name_of(&msg, 1).and_then(|name| core::str::from_utf8(name).ok())
+                else
                 {
-                    ipc::devmgr_labels::QUERY_SERIAL_DEVICE => served.first_live(class::SERIAL),
-                    ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE =>
-                    {
-                        served.first_live(class::FRAMEBUFFER)
-                    }
-                    ipc::devmgr_labels::QUERY_INPUT_DEVICE => served.first_live(class::INPUT),
-                    _ =>
-                    {
-                        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
-                        continue;
-                    }
+                    reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+                    continue;
                 };
+                let driver = served.first_live(class);
                 reply_deny_send(driver.map_or(0, |d| d.ep), ipc_buf);
             }
             // TODO(#165): remove with the test labels. Do not `seraph::log!`
@@ -691,14 +572,12 @@ const SIMPLE_DEVICE_DRIVERS: usize = 3;
 /// The IOMMU drivers a boot can spawn: one, of the architecture's family.
 const IOMMU_DRIVERS: usize = 1;
 
-/// The device classes the per-class registry queries serve
-/// (docs/driver-binding.md § Device Classes). A bound driver is served under
-/// the class its declaration names; each query looks its class up by name.
+/// The class names devmgr itself names: those of the drivers it starts on
+/// fixed paths ([`fixed`]) and those its test labels look up. A driver bound
+/// by declaration is served under the class its declaration names, which
+/// devmgr does not interpret (docs/driver-binding.md § Device Classes).
 mod class
 {
-    pub const BLOCK: &str = "block";
-    pub const INPUT: &str = "input";
-    pub const DEBUG_PORT: &str = "debug-port";
     pub const SERIAL: &str = "serial";
     pub const FRAMEBUFFER: &str = "framebuffer";
     pub const RTC: &str = "rtc";
@@ -774,6 +653,47 @@ fn reply_served_words(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+// A class name a `MINT_CLASS_SEND` request can carry is one a declaration
+// can name: devmgr interns both into the same `ClassName`.
+const _: () =
+    assert!(ipc::devmgr_labels::MAX_CLASS_NAME_BYTES == driver_binding::decl::MAX_CLASS_BYTES);
+
+/// `MINT_CLASS_SEND` handler, past its gate and version check: intern the
+/// class `msg` names in `classes` and mark it configured, and boot-only when
+/// asked and `pass_begun` is not set, the drivers-directory pass not having
+/// begun; then derive from `registry_ep` the SEND badged with the class's
+/// slot and the request's verb bits. `Err` with the reply label otherwise:
+/// `INVALID_REQUEST` for a bad verb mask, flag, or name, a late boot-only
+/// mark, a full class table, or a failed derivation.
+fn mint_class_send(
+    classes: &mut Classes<ServedDriver>,
+    registry_ep: u64,
+    msg: &IpcMessage,
+    pass_begun: bool,
+) -> Result<u64, u64>
+{
+    let invalid = ipc::devmgr_errors::INVALID_REQUEST;
+    let verbs = msg.word(1);
+    let flags = msg.word(2);
+    // Checked before the class is interned, so a refused request leaves the
+    // table as it was.
+    if verbs == 0
+        || verbs & !ipc::VERB_BIT_MASK != 0
+        || flags & !ipc::devmgr_labels::CLASS_BOOT_ONLY != 0
+    {
+        return Err(invalid);
+    }
+    let name = ipc::class_name_of(msg, 3)
+        .and_then(ClassName::class)
+        .ok_or(invalid)?;
+    let boot_only = flags & ipc::devmgr_labels::CLASS_BOOT_ONLY != 0;
+    let slot = classes
+        .configure(&name, boot_only, pass_begun)
+        .map_err(|_| invalid)?;
+    let badge = ipc::devmgr_labels::class_badge::encode(slot, verbs).ok_or(invalid)?;
+    syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_EP_SEND, badge).map_err(|_| invalid)
+}
+
 /// TODO(#165): remove with the test labels. Admit a request on a test label
 /// (`TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, `TEST_QUERY_DENY_DEVICE`,
 /// `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`,
@@ -795,7 +715,7 @@ fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
     true
 }
 
-/// The instance ordinal a `QUERY_BLOCK_DEVICE` or `QUERY_INPUT_DEVICE`
+/// The instance ordinal a `QUERY_DEVICE` or `TEST_QUERY_FAULT_DEVICE`
 /// request selects: `data[1]` when sent, else 0, the first instance.
 /// `None` for an ordinal no `usize` holds, which no instance has.
 fn instance_ordinal(msg: &IpcMessage) -> Option<usize>
@@ -1838,6 +1758,7 @@ fn spawn_on_disk_drivers(
     bind::drivers_dir_pass(
         records,
         drivers_dir_cap,
+        &served.classes,
         &mut bind::Carve {
             caps,
             irq_range,
@@ -1859,6 +1780,20 @@ fn spawn_on_disk_drivers(
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
+    for (class, mismatch) in served.classes.mismatches()
+    {
+        match mismatch
+        {
+            Mismatch::NoDriver => std::os::seraph::log!(
+                "class {}: configured; no driver of it is served",
+                class.as_str()
+            ),
+            Mismatch::NotConfigured => std::os::seraph::log!(
+                "class {}: a driver of it is served; no class file configures it",
+                class.as_str()
+            ),
+        }
+    }
 }
 
 // ── Simple-device driver spawns ─────────────────────────────────────────────
@@ -1948,9 +1883,9 @@ fn spawn_simple_into(
 /// Carve the platform UART arch authority cap and spawn the serial driver
 /// via the non-PCI simple-device path into the settle `batch`, recording it
 /// in `roster`. devmgr keeps the driver's service endpoint to mint client
-/// SEND caps on `QUERY_SERIAL_DEVICE`, and retains no UART-specific
-/// authority after a successful spawn — the carved cap and `uart_irq` are
-/// moved to the driver.
+/// SEND caps on `QUERY_DEVICE` through a `serial` class SEND, and retains
+/// no UART-specific authority after a successful spawn — the carved cap and
+/// `uart_irq` are moved to the driver.
 fn spawn_serial(
     caps: &mut caps::DevmgrCaps,
     uart_irq: u64,
@@ -2018,8 +1953,8 @@ fn spawn_serial(
 /// framebuffer driver into the settle `batch`, recording it in `roster`.
 /// Registers the geometry in `catalog` so the driver can fetch it via
 /// `QUERY_DEVICE_INFO` on its query cap. devmgr keeps the driver's service
-/// endpoint to mint client SEND caps on
-/// [`ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`], and retains no
+/// endpoint to mint client SEND caps on [`ipc::devmgr_labels::QUERY_DEVICE`]
+/// through a `framebuffer` class SEND, and retains no
 /// framebuffer-MMIO authority after a successful spawn — the carved cap is
 /// moved to the driver.
 fn spawn_framebuffer(

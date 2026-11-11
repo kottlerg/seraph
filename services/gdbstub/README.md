@@ -27,7 +27,7 @@ again after QEMU exits;
 `cargo xtask run-parallel --parallel 1 --debug-port <PORT> --debug-target <NAME>` does the same
 around its runs, and `cargo xtask test-gdb` stages it the same way
 ([xtask/README.md](../../xtask/README.md)). The
-recipe sets `debug_authority = yes` and seeds `devmgr.debug`
+recipe sets `debug_authority = yes` and seeds `devmgr.class.debug-port`
 ([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)).
 
 ---
@@ -66,9 +66,9 @@ Framing, command parsing, and the target descriptions are `shared/gdb-rsp`
 ## Startup and Attach
 
 1. The stub declares itself undebuggable (`DECLARE_NO_DEBUG`), as every debug-authority holder
-   does before it spawns a thread, and takes its bootstrap round: `caps[0]` the `devmgr.debug`
-   seed, `caps[1]` the `DEBUG_AUTHORITY` SEND on procmgr.
-2. It takes the debug port from devmgr (`QUERY_DEBUG_PORT_DEVICE`), retrying while devmgr replies
+   does before it spawns a thread, and takes its bootstrap round: `caps[0]` the
+   `devmgr.class.debug-port` seed, `caps[1]` the `DEBUG_AUTHORITY` SEND on procmgr.
+2. It takes the debug port from devmgr (`QUERY_DEVICE`), retrying while devmgr replies
    `NO_DEVICE`, since the port's driver loads with devmgr's on-disk batch, and registers an RX
    notification on it. A boot without `--debug-port`, a missing seed or authority, or a missing
    target name ends the stub, which logs why.
@@ -320,7 +320,7 @@ restore after a watch thread's exit.
 | [docs/fault-handling.md](../../docs/fault-handling.md) | § Debugging, § Asynchronous Upcalls, § Liveness |
 | [services/procmgr/docs/ipc-interface.md](../procmgr/docs/ipc-interface.md) | `LIST_PROCESSES`, `ATTACH_PROCESS`, `DETACH_PROCESS`, `DECLARE_NO_DEBUG`, `REGISTER_THREAD` |
 | [services/drivers/virtio/console/README.md](../drivers/virtio/console/README.md) | The debug port's driver and the serial protocol it serves |
-| [docs/device-management.md](../../docs/device-management.md) | The debug port and `QUERY_DEBUG_PORT_DEVICE` |
+| [docs/device-management.md](../../docs/device-management.md) | The debug port and `QUERY_DEVICE` |
 
 ---
 

@@ -490,18 +490,22 @@ record it and one to pull it, plus what each other outcome of an idle tick costs
 - Recording a CPU ahead of it in the cursor's order whose queued threads no pull can take
   (pinned, or mid-handoff) costs two ticks: one to record that CPU and one to find nothing
   on it, after which the cursor passes it. k counts these CPUs.
-- A pull that a contended try-lock defers costs at most two ticks. A deferred pull from the
-  candidate costs the tick it defers and one more to record a candidate again, since every
-  attempt clears the candidate. A deferred pull above the threshold costs at most the tick
-  in which the rule keeps its victim as the candidate, or records it in the backlog's place.
-  d counts these pulls.
+- A deferred pull (`sched::PullOutcome::Deferred`) costs at most two ticks. A pull is
+  deferred when a try-lock is contended, or when the revalidation under the thread's
+  `sched_lock` refuses a thread that `sys_thread_set_affinity` pinned after the pick (below).
+  A deferred pull from the candidate costs the tick it defers and one more to record a
+  candidate again, since every attempt clears the candidate. A deferred pull above the
+  threshold costs at most the tick in which the rule keeps its victim as the candidate, or
+  records it in the backlog's place. d counts these pulls.
 - Recording a candidate whose backlog clears before the pull from it, the thread running on
   its own CPU, costs at most two ticks: the one that recorded it, and the pull's when the
   pull, rather than the next tick's check, finds it cleared. r counts these candidates.
-- A pull above the threshold that moves nothing for any other reason costs no tick, since
-  the confirmation rule decides the same tick (below). So the heaviest CPU, when its load is
-  past the threshold with nothing pullable on it, costs nothing; any other CPU past the
-  threshold with nothing pullable on it is recorded, and counts in k.
+- A pull above the threshold that the re-check of its rule refuses
+  (`sched::PullOutcome::RuleFailed`) or that finds nothing pullable
+  (`sched::PullOutcome::NothingPullable`) costs no tick, since the confirmation rule decides
+  the same tick (below). So the heaviest CPU, when its load is past the threshold with
+  nothing pullable on it, costs nothing; any other CPU past the threshold with nothing
+  pullable on it is recorded, and counts in k.
 
 The rule stays bounded: only an idle CPU pulls below the threshold, and a pull leaves it busy,
 so two busy CPUs never trade threads (the steady state the threshold protects); a busy CPU
@@ -527,14 +531,14 @@ unpinned thread is the backlog it confirmed. An idle CPU whose pull above the th
 moves nothing applies the confirmation rule in the same tick: it records or pulls its
 candidate as if the scan had seen no load past the threshold. When the victim had no thread a
 pull can take, the rule reads a second scan that leaves that victim out, and a candidate other
-than it. When the re-check refused the pull, the load it read was a transient, and a
-contended try-lock (the usual outcome of a read taken while the victim's `schedule()` holds
-its lock) says nothing of what the victim holds; in both cases the victim may hold a backlog
-of its own, so the rule reads the same scan and candidate. After a contended try-lock, a pull
-the rule would make from the victim itself waits for the next tick, which keeps the victim as
-the candidate, rather than try its lock a second time. So neither a scan that keeps reading a
-transient nor a CPU whose pinned threads keep its load past the threshold hides a backlog
-beyond the ticks the bound above counts for contended try-locks (below).
+than it. When the re-check refused the pull, the load it read was a transient, and a deferred
+pull (most often a contended try-lock, the outcome of a read taken while the victim's
+`schedule()` holds its lock) says nothing of what the victim holds; in both cases the victim
+may hold a backlog of its own, so the rule reads the same scan and candidate. After a deferred
+pull, a pull the rule would make from the victim itself waits for the next tick, which keeps
+the victim as the candidate, rather than try its locks a second time. So neither a scan that
+keeps reading a transient nor a CPU whose pinned threads keep its load past the threshold
+hides a backlog beyond the ticks the bound above counts for deferred pulls.
 
 Migration goes through `pull_unpinned_ready(src_cpu, dst_cpu, rule)`, which shares the
 validate-then-move core `relocate_ready_thread` with `migrate_ready_thread`:

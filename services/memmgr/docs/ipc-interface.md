@@ -555,8 +555,13 @@ fault on the same chunk, delivered before the mapping) is resumed without
 backing. Backing a chunk rather than a single page keeps cap-slot consumption
 to one cap per chunk, so a deep demand stack cannot exhaust memmgr's CSpace;
 stacks grow contiguously, so a chunk's pages are consumed as the stack
-descends. A non-VM fault replies `FAULT_REPLY_KILL`, and every other case — unknown process, address
-outside every region, a write to a region without `MAP_WRITABLE` or an instruction fetch from one
+descends. The page tables the map needs come from the process address space's own page-table
+pool. When the kernel reports that pool exhausted, memmgr funds it from its free pool, accounted
+to the process, and maps the chunk again, at most four times
+([`memory-pool.md`](memory-pool.md#client-page-table-funding) § Client page-table funding). So a
+fault in a region does not depend on the process having funded the pool beforehand. A non-VM
+fault replies `FAULT_REPLY_KILL`, and every other case — unknown process, address outside every
+region, a write to a region without `MAP_WRITABLE` or an instruction fetch from one
 without `MAP_EXECUTABLE` (which no backing satisfies), no delegated AS, or any allocation/map
 failure — replies `FAULT_REPLY_FORWARD`; each carries data word 0 the decline reason: the code below
 in its low 32 bits, and in its high 32 the magnitude of the failed syscall's error for code 9, else
@@ -578,12 +583,13 @@ forwards to.
 | 6 | The metadata arena cannot grow for the chunk's frame descriptor |
 | 7 | No contiguous free run of the chunk's size |
 | 8 | The chunk's frame descriptor cannot be recorded |
-| 9 | `mem_map` of the chunk into the process failed |
+| 9 | `mem_map` of the chunk into the process failed, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the chunk the failed map left mapped |
 
 Demand chunks are tracked exactly like `REQUEST_MEMORY_CAPS` allocations, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim them and the all-RAM-accounted
 identity is unaffected (the pages move from a free run to the process record;
-they were already owned).
+they were already owned). The runs memmgr donates to the process's page-table
+pool are tracked the same way and reclaimed by `PROCESS_DIED` only.
 
 ---
 

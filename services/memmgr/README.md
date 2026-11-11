@@ -136,7 +136,10 @@ until RAM is exhausted or its address-space zones are spent; the high zone,
 above the shared 2^38 layout ceiling, exists on paging modes whose user half
 is wider. memmgr funds its own `CSpace` and page-table growth from its pool,
 so neither init-seeded budget bounds it. A failed growth surfaces as `QUOTA`
-(or `TOO_MANY_PROCESSES` from `REGISTER_PROCESS`).
+(or `TOO_MANY_PROCESSES` from `REGISTER_PROCESS`). It also funds a
+demand-paged process's page-table pool when a fault's map finds it exhausted,
+accounted to that process (see [`docs/memory-pool.md`](docs/memory-pool.md)
+§"Client page-table funding").
 
 The remaining constants are tuning values that bound no capacity:
 
@@ -144,7 +147,7 @@ The remaining constants are tuning values that bound no capacity:
 |---|---|---|
 | `DEMAND_CHUNK_PAGES` | 16 | Pages one demand fault backs |
 | `CSPACE_LOW_WATER`, `CSPACE_TOPUP_PAGES` | 256 slots, 16 pages | `CSpace` self-funding mark and step |
-| `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | 4 pages, 4 rounds | Page-table self-funding step and retries per map |
+| `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | 4 pages, 4 rounds | Page-table funding step and retries per map, for memmgr's own maps and a demand chunk's map into a process |
 | `MAX_LOAD` | 2 | Mean index chain length before a bucket split |
 | `ARENA_RETURN_RESERVE` | 1 slot | Arena slot kept for last-resort returns of a run to the pool |
 | `DEFERRED_RECHECK_BATCH` | 64 runs | Deferred runs one recheck checks; a run not pooled goes to the back |

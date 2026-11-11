@@ -56,6 +56,21 @@ that window, which would deadlock against procmgr blocking on the unread log end
 release, logd has no further procmgr dependency before its receive loop, so it drains the reap's
 log line itself (see [`main.rs`](../src/main.rs)).
 
+Until init-logd acknowledges the release, it writes each line it forwards to the UART directly, byte
+by byte, and logd's serial writes go through the serial driver to the same UART; the two share no
+lock, so a line of each written at once interleaves byte by byte, and a reader of the serial stream
+sees neither line whole. logd therefore writes nothing to the serial driver of its own before the
+release. It resolves the serial and framebuffer drivers through devmgr before the pull, writing
+nothing, so that its first write after the release does not call devmgr while the log endpoint has
+no reader; and it holds each line it self-logs, at most `SELF_LOG_HELD_MAX` (8) of them, and writes
+them in order, with the time each was logged, once `handover::transfer` returns. A line past that
+bound is dropped and counted, and logd writes the count in one line after the held ones. Init-logd
+writes its last line, `handover complete; init-logd thread exiting`, before it acknowledges the
+release, and nothing after it. Two writes are not held: logd's panic sink, and a `FATAL` line on the
+way to a halt, which writes the held lines first. A restarted logd, with no init-logd, holds
+nothing. When no release reaches init-logd (§ Failure modes), logd writes the held lines when the
+attempts end, and its serial writes can then interleave with init-logd's.
+
 ## Call shape
 
 * Request: `IpcMessage::new(HANDOVER_PULL)`. Empty payload, no caps.
@@ -194,8 +209,8 @@ drain and issues `HANDOVER_RELEASE`, retrying a call that fails for up to
 `RELEASE_RETRY_BUDGET_US` (1 s) of wall-clock time until one is delivered (both
 steps run in [`handover::transfer`](../src/handover.rs)). The budget is time, not
 an attempt count, so load that slows each attempt does not shorten the window.
-On `RELEASE_ACK` init-logd sets `HANDOVER_COMPLETE` and its next loop iteration
-calls `sys_thread_exit`; on `RELEASE_PENDING` real-logd drains again and repeats
+On `RELEASE_ACK` init-logd writes its last line, replies, sets `HANDOVER_COMPLETE`, and its
+next loop iteration calls `sys_thread_exit`; on `RELEASE_PENDING` real-logd drains again and repeats
 the release, as the previous section describes.
 
 In-flight `STREAM_BYTES` and `STREAM_RECORD` sends from other processes queue at the kernel

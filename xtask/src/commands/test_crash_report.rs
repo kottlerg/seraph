@@ -377,13 +377,15 @@ mod tests
     fn a_malformed_block_fails_whatever_the_expectation()
     {
         let regs = [0u64; 21];
-        let log = fixture_reports(&regs).replace("arch=x86_64", "arch=pdp11");
+        // A `text` that is not two hexadecimal words is malformed; a value of
+        // a set-valued field the reader does not know would not be.
+        let log = fixture_reports(&regs).replace(" text=0x", " text=0y");
         assert!(check_log(&log, CrashReportExpect::Reports).is_err());
         let one = death(
             &fixture_report(0xdd, Fault::Exception { code: 1, aux: 0 }, &regs),
             "other",
         )
-        .replace("arch=x86_64", "arch=pdp11");
+        .replace(" text=0x", " text=0y");
         assert!(check_log(&one, CrashReportExpect::None).is_err());
     }
 

@@ -96,6 +96,14 @@ impl Block
     /// fetch fault's pointer are often unmapped. Keys it does not know are
     /// not checked.
     ///
+    /// A value this reader does not know of a field that names one of a set
+    /// is not a defect, since a value a later writer adds does not bump the
+    /// format's version (block-format.md § Lines). It requires what the
+    /// block-format document says: an `arch` or `thread` value no register
+    /// lines, a `status` value only the fault message's fields, as for
+    /// `unattached`, and a `kind` value neither kind's fields; an `access`,
+    /// `exception`, or `walk` value is only required to be present.
+    ///
     /// # Errors
     /// The first [`Defect`] found.
     pub fn check(&self) -> Result<(), Defect>
@@ -105,22 +113,22 @@ impl Block
             return Err(Defect::Incomplete);
         }
         self.require_dec("badge")?;
-        let arch = Arch::from_name(self.require("arch")?)
-            .ok_or_else(|| Defect::Malformed("arch".to_string()))?;
-        // A `thread` value this reader does not know is a thread it requires
-        // no registers of, as for `unidentified`: a value a later writer adds
-        // does not bump the format's version (block-format.md § Lines).
+        let arch = Arch::from_name(self.require("arch")?);
         let thread = self.require("thread")?;
-        let status = self.require_one_of("status", &["complete", "unattached", "timeout"])?;
-        if self.require_one_of("kind", &["vm", "exception"])? == "vm"
+        let status = self.require("status")?;
+        match self.require("kind")?
         {
-            self.require_one_of("access", &["read", "write", "fetch"])?;
-            self.require_hex("addr")?;
-        }
-        else
-        {
-            self.require("exception")?;
-            self.require_hex("aux")?;
+            "vm" =>
+            {
+                self.require("access")?;
+                self.require_hex("addr")?;
+            }
+            "exception" =>
+            {
+                self.require("exception")?;
+                self.require_hex("aux")?;
+            }
+            _ => (),
         }
         self.require_hex("ip")?;
         if status == "complete"
@@ -132,11 +140,11 @@ impl Block
                 .ok_or_else(|| Defect::Malformed("text".to_string()))?;
             if matches!(thread, "main" | "spawned")
             {
-                for name in arch.register_names()
+                for name in arch.map_or(&[][..], Arch::register_names)
                 {
                     self.require_hex(&alloc::format!("reg.{name}"))?;
                 }
-                self.require_one_of("walk", &["scan"])?;
+                self.require("walk")?;
                 self.require_hex("frame.0")?;
             }
         }
@@ -159,19 +167,6 @@ impl Block
         self.require(key)?
             .parse()
             .map_err(|_| Defect::Malformed(key.to_string()))
-    }
-
-    fn require_one_of<'s>(&'s self, key: &str, allowed: &[&str]) -> Result<&'s str, Defect>
-    {
-        let value = self.require(key)?;
-        if allowed.contains(&value)
-        {
-            Ok(value)
-        }
-        else
-        {
-            Err(Defect::Malformed(key.to_string()))
-        }
     }
 }
 

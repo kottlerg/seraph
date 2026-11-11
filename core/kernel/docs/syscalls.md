@@ -3065,6 +3065,7 @@ source of truth.
 [Device Management](../../../docs/device-management.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Testing](../../../docs/testing.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [services/drivers/serial/README.md](../../../services/drivers/serial/README.md),
 [memmgr Memory Pool](../../../services/memmgr/docs/memory-pool.md),
 [Restart Protocol](../../../services/svcmgr/docs/restart-protocol.md),

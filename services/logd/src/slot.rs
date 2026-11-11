@@ -4,8 +4,9 @@
 // services/logd/src/slot.rs
 
 //! Per-sender state: display name, partial-line buffer, and the bounded
-//! history ring of completed lines retained for future query/disk/syslog
-//! sinks.
+//! history ring of completed text lines and records retained for future
+//! query/disk/syslog sinks (the stored form is
+//! `services/logd/docs/ipc-interface.md` § History).
 //!
 //! Slots are keyed by the kernel-delivered badge on every IPC message —
 //! the same `u64` procmgr uses as the child's process badge and posts as
@@ -14,37 +15,65 @@
 
 use std::collections::HashMap;
 
+use ipc::log_record::{FieldSpan, Record, Span};
 pub use logd_codec::{LINE_BUF_SIZE, MAX_NAME_LEN};
 
-/// Number of completed log lines retained per slot for future query
-/// surfaces. Bounded to keep total memory predictable at ~10k senders
-/// (10k * 16 * 256 ≈ 40 MiB worst case if every sender saturates;
-/// in practice most slots stay near empty). A retention tuning value that
-/// bounds no capacity: `push_history` drops the oldest line, never a sender.
+/// Number of completed log entries retained per slot for future query
+/// surfaces. Bounded to keep total memory predictable at ~10k senders. The
+/// largest entry is a 480-byte record of 119 fields, each a one-byte key and
+/// an empty value (four payload bytes), whose field table adds 119 * 8
+/// bytes: about 1.5 KiB with the entry itself, so 10k * 16 * 1.5 KiB ≈
+/// 230 MiB worst case if every sender saturates with such records; in
+/// practice most slots stay near empty.
+/// A retention tuning value that bounds no capacity: `push_entry` drops the
+/// oldest entry, never a sender.
 pub const PER_SLOT_HISTORY: usize = 16;
 
-/// One retained completed line. Fields are written at line-flush
-/// time and read by future query / disk-persistence / network-syslog
-/// sinks — those sinks land in follow-up PRs (see issue #1 scope
-/// out-of-scope items), so the fields are dead-code-flagged today
-/// but the storage is part of this PR's deliverable.
+/// What a retained entry holds.
+// The spans are read by the history query surface (#720), which has no
+// caller yet.
 #[allow(dead_code)]
 #[derive(Clone)]
-pub struct LineRecord
+pub enum EntryKind
+{
+    /// A text line from `STREAM_BYTES`.
+    Text,
+    /// A log record from `STREAM_RECORD`: the entry's bytes are its payload
+    /// (`ipc::log_record`), and these spans into them its field table.
+    Record
+    {
+        /// The message text.
+        message: Span,
+        /// Each field's key and value, in the sender's order. At most one
+        /// per four payload bytes, so bounded by the record limit.
+        fields: Vec<FieldSpan>,
+    },
+}
+
+/// One retained completed entry. Fields are written when the line flushes or
+/// the record arrives, and read by the history query surface (#720) and
+/// future disk-persistence / network-syslog sinks, none of which has a
+/// caller yet, so they are dead-code-flagged.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct HistoryEntry
 {
     /// Receipt microseconds since boot
     /// (`system_info(ElapsedUs)`-derived).
     pub us: u64,
-    /// The line's level, an `ipc::stream_labels::LEVEL_*` code.
+    /// The entry's level, an `ipc::stream_labels::LEVEL_*` code.
     pub level: u64,
-    /// Line bytes, no trailing `\n`. Length bounded by
-    /// [`LINE_BUF_SIZE`].
+    /// Whether the entry is a text line or a record, with a record's field
+    /// table.
+    pub kind: EntryKind,
+    /// A text line's bytes, no trailing `\n`, at most [`LINE_BUF_SIZE`];
+    /// or a record's payload, at most `ipc::log_record::RECORD_MAX_BYTES`.
     pub bytes: Vec<u8>,
 }
 
 /// Per-sender bucket. Stores the display name registered via
 /// `STREAM_REGISTER_NAME`, the in-progress line buffer and its level, and
-/// the bounded ring of completed lines.
+/// the bounded ring of completed entries.
 #[derive(Default)]
 pub struct Slot
 {
@@ -54,7 +83,7 @@ pub struct Slot
     /// that carried its first byte. Meaningful only once that byte has
     /// arrived ([`Self::begin_byte`]).
     pub partial_level: u64,
-    pub history: std::collections::VecDeque<LineRecord>,
+    pub history: std::collections::VecDeque<HistoryEntry>,
 }
 
 impl Slot
@@ -70,17 +99,39 @@ impl Slot
         }
     }
 
+    /// Retain a completed text line.
     pub fn push_history(&mut self, us: u64, level: u64, bytes: &[u8])
+    {
+        self.push_entry(HistoryEntry {
+            us,
+            level,
+            kind: EntryKind::Text,
+            bytes: bytes.to_vec(),
+        });
+    }
+
+    /// Retain a record, with its field table.
+    pub fn push_record(&mut self, us: u64, level: u64, record: &Record<'_>)
+    {
+        self.push_entry(HistoryEntry {
+            us,
+            level,
+            kind: EntryKind::Record {
+                message: record.message_span(),
+                fields: record.fields().map(|f| f.spans).collect(),
+            },
+            bytes: record.payload().to_vec(),
+        });
+    }
+
+    /// Append `entry`, dropping the oldest one when the ring is full.
+    fn push_entry(&mut self, entry: HistoryEntry)
     {
         if self.history.len() == PER_SLOT_HISTORY
         {
             self.history.pop_front();
         }
-        self.history.push_back(LineRecord {
-            us,
-            level,
-            bytes: bytes.to_vec(),
-        });
+        self.history.push_back(entry);
     }
 }
 
@@ -138,5 +189,13 @@ impl SlotTable
     pub fn install_history_line(&mut self, badge: u64, us: u64, level: u64, bytes: &[u8])
     {
         self.get_or_create(badge).push_history(us, level, bytes);
+    }
+
+    /// Append one history record from the init-logd handover into the
+    /// matching slot's ring, creating the slot if absent, as
+    /// [`Self::install_history_line`] does.
+    pub fn install_history_record(&mut self, badge: u64, us: u64, level: u64, record: &Record<'_>)
+    {
+        self.get_or_create(badge).push_record(us, level, record);
     }
 }

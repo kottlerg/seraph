@@ -9,8 +9,11 @@ the `keysym` codes and event packing, the `memmgr_bootstrap`, `device_info_kind`
 `procmgr_process_state` constants, the create requests' argv/env header codec
 (`procmgr_labels::ArgvEnvHeader`), the crate-level limits and masks (`VERB_BIT_MASK`,
 `MAX_PATH_LEN`), the svcmgr name limit and codec (`svcmgr_labels::NAME_MAX`, `pack_name`,
-`unpack_name`), reply-shape decoders (today `memmgr_grant_layout`), and the driver-side
-`DMA_MAP` and `DMA_UNMAP` calls (`dma_map`, `dma_unmap`).
+`unpack_name`), reply-shape decoders (today `memmgr_grant_layout`), the driver-side
+`DMA_MAP` and `DMA_UNMAP` calls (`dma_map`, `dma_unmap`), and the log record codec
+(`log_record`: the `STREAM_RECORD` payload's encoder `RecordWriter`, decoder `Record`, limits, and
+key alphabet; [logd IPC interface](../../services/logd/docs/ipc-interface.md)
+§ `stream_labels::STREAM_RECORD`).
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 
@@ -25,6 +28,7 @@ shared/ipc/
 └── src/
     ├── lib.rs                  # IpcMessage, call/recv/reply wrappers, labels, errors, decoders
     ├── bootstrap.rs            # Creator-to-child bootstrap rounds; multi-round slot codec
+    ├── log_record.rs           # Log record codec: RecordWriter, Record, key alphabet
     └── recv_guard.rs           # RecvGuard backoff and EXIT_RECV_WEDGE policy
 ```
 

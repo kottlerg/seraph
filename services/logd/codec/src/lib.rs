@@ -27,6 +27,7 @@ pub mod handover;
 pub mod history;
 pub mod level;
 pub mod reclaim;
+pub mod record;
 pub mod resync;
 
 mod bounded_str;

@@ -1,18 +1,21 @@
 # shared/log
 
 System log primitives for Seraph userspace. Three parts: no-allocation wire-format helpers
-(`write_bytes`, `write_args`, `register_name`) over the labels in `ipc::stream_labels`, with the
-caller supplying its badged SEND cap, IPC buffer, and the line's level; a process-global cache
+(`write_bytes`, `write_args`, `write_record`, `register_name`) over the labels in
+`ipc::stream_labels`, with the caller supplying its badged SEND cap, IPC buffer, and the line's
+level, and `build_record`, which stages a log record (`ipc::log_record`); a process-global cache
 (`install_badged_cap`, `ensure_badged_cap`) for the pre-installed badged log cap; and the
 process-global level filter (`set_max_level`, `enabled`, `parse_level`, `LEVEL_ENV_KEY`). The only
 installer of either is std's `_start`, which installs the cap procmgr seeds in
 `ProcessInfo.log_send_cap` and the level the process's `SERAPH_LOG` environment entry names; init
 does not use this crate and logs through its own path in `services/init/src/logging.rs`. `emit` is
 the entry point the std overlay's `seraph::log!` macro reaches through
-`std::os::seraph::log::__emit_at`, and drops a line more verbose than the filter's level; the
-levels, the filter, and the wire encoding are specified in
-[logd IPC interface](../../services/logd/docs/ipc-interface.md) § Levels. The crate's only
-consumer is std.
+`std::os::seraph::log::__emit_at`, and drops a line more verbose than the filter's level;
+`emit_record` is the entry point of its form with fields, through
+`std::os::seraph::log::__emit_record`, and drops a record as `emit` drops a line. The levels, the
+filter, and the wire encodings are specified in
+[logd IPC interface](../../services/logd/docs/ipc-interface.md) § Levels and
+§ `stream_labels::STREAM_RECORD`. The crate's only consumer is std.
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 
@@ -25,7 +28,7 @@ shared/log/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── lib.rs                  # Wire helpers, badged-cap cache, level filter, emit
+    └── lib.rs                  # Wire helpers, badged-cap cache, level filter, emit, emit_record
 ```
 
 ---
@@ -37,7 +40,7 @@ shared/log/
 | [docs/console-model.md](../../docs/console-model.md) | Console and log output ownership across boot |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | `ProcessInfo` handover that seeds the log cap |
 | [services/logd/README.md](../../services/logd/README.md) | Log daemon that receives this crate's stream |
-| [services/logd/docs/ipc-interface.md](../../services/logd/docs/ipc-interface.md) | The `STREAM_BYTES` wire format, levels, and filter |
+| [services/logd/docs/ipc-interface.md](../../services/logd/docs/ipc-interface.md) | The `STREAM_BYTES` and `STREAM_RECORD` wire formats, levels, and filter |
 
 ---
 

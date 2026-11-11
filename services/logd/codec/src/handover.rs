@@ -14,6 +14,7 @@
 //! [handover-protocol.md](../../docs/handover-protocol.md).
 
 use ipc::IpcMessage;
+use ipc::log_record::RECORD_MAX_BYTES;
 use ipc::stream_labels::{LEVEL_MASK, LEVEL_SHIFT, level_of};
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
@@ -22,7 +23,7 @@ pub const REPLY_MORE: u64 = 0;
 /// `HANDOVER_PULL` reply status: no more data. Does not end init-logd.
 pub const REPLY_DONE: u64 = 1;
 
-/// Chunk kind in `word(0)`: header (`word(1)` = total history lines pushed,
+/// Chunk kind in `word(0)`: header (`word(1)` = total history entries pushed,
 /// `word(2)` = active slot count).
 pub const KIND_HEADER: u64 = 1;
 /// Chunk kind in `word(0)`: one slot (`word(1)` = badge, `word(2)` = name
@@ -33,11 +34,22 @@ pub const KIND_SLOT: u64 = 2;
 /// [`LINE_BYTES_WORD`]; the line's level rides the reply label's level field,
 /// as on a `STREAM_BYTES` label).
 pub const KIND_LINE: u64 = 3;
+/// Chunk kind in `word(0)`: one history record (`word(1)` = badge, `word(2)`
+/// = receipt microseconds, `word(3)` = byte length, the record's payload
+/// (`ipc::log_record`) from word [`RECORD_BYTES_WORD`]; the record's level
+/// rides the reply label's level field, as on a `STREAM_RECORD` label).
+pub const KIND_RECORD: u64 = 4;
 
 /// First data word of a `SLOT` chunk's inline name bytes.
 pub const SLOT_NAME_WORD: usize = 3;
 /// First data word of a `LINE` chunk's inline line bytes.
 pub const LINE_BYTES_WORD: usize = 4;
+/// First data word of a `RECORD` chunk's payload.
+pub const RECORD_BYTES_WORD: usize = 4;
+
+// A record of the longest length fits a `RECORD` chunk whole, so the handover
+// never clips one.
+const _: () = assert!(RECORD_MAX_BYTES <= (MSG_DATA_WORDS_MAX - RECORD_BYTES_WORD) * 8);
 
 /// `HANDOVER_RELEASE` reply status: released; init-logd exits.
 pub const RELEASE_ACK: u64 = 0;
@@ -53,7 +65,7 @@ pub const RELEASE_PENDING: u64 = 1;
 pub const MAX_RELEASE_DEFERRALS: u32 = 8;
 
 /// Mask selecting a reply's status code; the bits above carry an inline byte
-/// length on `SLOT` and `LINE` chunks.
+/// length on `SLOT`, `LINE`, and `RECORD` chunks.
 const STATUS_MASK: u64 = 0xFFFF;
 
 /// One decoded `HANDOVER_PULL` reply chunk.
@@ -84,8 +96,23 @@ pub enum Chunk<'a>
         /// Line bytes (no trailing `\n`), clipped to the carried payload.
         bytes: &'a [u8],
     },
-    /// An unknown kind, or a `SLOT` / `LINE` chunk with no inline payload
-    /// words; the receiver skips it.
+    /// One history record: its sender badge, receipt microseconds, level, and
+    /// payload. The payload is the peer's: the receiver checks it with
+    /// `ipc::log_record::Record::decode` before it stores it.
+    Record
+    {
+        /// Sender badge at receipt time.
+        badge: u64,
+        /// Receipt time in microseconds since boot.
+        us: u64,
+        /// The record's level, an `ipc::stream_labels::LEVEL_*` code
+        /// (`level_of` the reply label).
+        level: u64,
+        /// The record's payload, clipped to the carried payload.
+        bytes: &'a [u8],
+    },
+    /// An unknown kind, or a `SLOT`, `LINE`, or `RECORD` chunk with no inline
+    /// payload words; the receiver skips it.
     Skip,
 }
 
@@ -120,12 +147,23 @@ pub fn decode(reply: &IpcMessage) -> Chunk<'_>
                 }
             })
         }
+        KIND_RECORD =>
+        {
+            inline_bytes(reply, RECORD_BYTES_WORD, reply.word(3)).map_or(Chunk::Skip, |bytes| {
+                Chunk::Record {
+                    badge: reply.word(1),
+                    us: reply.word(2),
+                    level: level_of(reply.label),
+                    bytes,
+                }
+            })
+        }
         _ => Chunk::Skip,
     }
 }
 
-/// Encode the `HEADER` chunk: `total` history lines ever pushed and `active`
-/// occupied slots.
+/// Encode the `HEADER` chunk: `total` history entries ever pushed and
+/// `active` occupied slots.
 #[must_use]
 pub fn encode_header(total: u64, active: u64) -> IpcMessage
 {
@@ -166,6 +204,25 @@ pub fn encode_line(badge: u64, us: u64, level: u64, line: &[u8]) -> IpcMessage
         .word(2, us)
         .word(3, line.len() as u64)
         .bytes(LINE_BYTES_WORD, line)
+        .build()
+}
+
+/// Encode one `RECORD` chunk of a record at `level` (an
+/// `ipc::stream_labels::LEVEL_*` code). `record` is a payload
+/// `ipc::log_record` accepted, which the payload area after
+/// [`RECORD_BYTES_WORD`] holds whole; a longer one is clipped, and the
+/// receiver then refuses it.
+#[must_use]
+pub fn encode_record(badge: u64, us: u64, level: u64, record: &[u8]) -> IpcMessage
+{
+    let record = clip_to_payload(record, RECORD_BYTES_WORD);
+    let label = with_length(REPLY_MORE, record.len()) | ((level & LEVEL_MASK) << LEVEL_SHIFT);
+    IpcMessage::builder(label)
+        .word(0, KIND_RECORD)
+        .word(1, badge)
+        .word(2, us)
+        .word(3, record.len() as u64)
+        .bytes(RECORD_BYTES_WORD, record)
         .build()
 }
 
@@ -267,7 +324,7 @@ fn inline_bytes(reply: &IpcMessage, start_word: usize, declared_len: u64) -> Opt
 /// init-logd's record of slots whose display name changed after the handover
 /// began, which it must send again before it releases.
 ///
-/// The handover sends every slot once, before the history lines; a sender that
+/// The handover sends every slot once, before the history entries; a sender that
 /// registers or changes its name after that (during the history drain, or
 /// between `DONE` and `HANDOVER_RELEASE`) would otherwise reach real-logd with
 /// no name. `N` is init-logd's slot-table size.
@@ -401,6 +458,51 @@ mod tests
                 bytes: b"phase=start",
             }
         );
+    }
+
+    #[test]
+    fn record_chunk_round_trips_a_record_of_the_longest_length()
+    {
+        use ipc::log_record::{Record, RecordWriter};
+        let mut w = RecordWriter::new(format_args!("reclaim:"));
+        w.field_bytes(b"name", &[b'n'; RECORD_MAX_BYTES]);
+        assert_eq!(w.as_bytes().len(), RECORD_MAX_BYTES);
+        let reply = encode_record(9, 77, LEVEL_WARN, w.as_bytes());
+        assert!(!is_done(reply.label));
+        let Chunk::Record {
+            badge,
+            us,
+            level,
+            bytes,
+        } = decode(&reply)
+        else
+        {
+            panic!("expected a record chunk");
+        };
+        assert_eq!((badge, us, level), (9, 77, LEVEL_WARN));
+        assert_eq!(bytes, w.as_bytes());
+        let rec = Record::decode(bytes).expect("the record survives the chunk");
+        assert_eq!(rec.message(), b"reclaim:");
+        let field = rec.fields().next().expect("its field");
+        assert_eq!(field.key, b"name");
+    }
+
+    #[test]
+    fn record_length_past_the_address_space_is_clipped_to_the_payload()
+    {
+        let reply = IpcMessage::builder(REPLY_MORE)
+            .word(0, KIND_RECORD)
+            .word(3, u64::MAX)
+            .bytes(RECORD_BYTES_WORD, &[0, 0])
+            .build();
+        let Chunk::Record { bytes, .. } = decode(&reply)
+        else
+        {
+            panic!("expected a record chunk");
+        };
+        // The zero-padded word is not a record, so the receiver refuses it.
+        assert_eq!(bytes.len(), 8);
+        assert!(ipc::log_record::Record::decode(bytes).is_err());
     }
 
     #[test]

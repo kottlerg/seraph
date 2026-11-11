@@ -499,6 +499,8 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | `REGISTRY_CAP`, `BADGEED_CAP` | `shared/registry-client`, `shared/log` | `AtomicU64` | ABI width (cap handle) | 8 B | correct as is | None (#74) |
 | log `CHUNK_SIZE` | `shared/log/src/lib.rs` | 512 | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | None |
 | log `STACK_BUF_LEN` | `shared/log/src/lib.rs` | 512 | ABI width (one `STREAM_BYTES` payload; a longer message is sent in chunks as the buffer fills) | 512 B stack per call | correct as is | None |
+| log record `RECORD_MAX_BYTES` | `shared/ipc/src/log_record.rs` | 480 | ABI width (one `STREAM_RECORD` payload, and one handover `RECORD` chunk after its 4 header words, const-asserted; the sender cuts a longer record's message, then its values, and drops the fields with no room) | 480 B stack per record sent | correct as is | None |
+| log record `KEY_MAX_LEN` | `shared/ipc/src/log_record.rs` | 32 | wire format (a field key of `[a-z0-9_]`, one length byte; `seraph::log!` checks each key at compile time) | none | correct as is | None |
 | `SharedBuffer.page_count` | `shared/shmem/src/lib.rs` | `u64` | ABI width (`mem_map` page count) | 8 B | correct as is | None |
 | `SpscHeader.head`, `tail` | `shared/shmem/src/lib.rs` | `u32`, free-running | provably unreachable (modular index, correct across wrap for capacity up to 2^31) | 16 B per ring | correct as is | None |
 | `SpscHeader.capacity` | `shared/shmem/src/lib.rs` | `u32` power of two | ABI width (shared header layout) | none | correct as is | None |
@@ -632,12 +634,13 @@ The entries left open are tracked by the Issue each recommendation names.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `HISTORY_RING_BYTES` (`HISTORY`) | `services/init/src/logging.rs` | 16 KiB, lines packed by length (about 160 boot lines; peak about 50) | tuning (boot-history retention: a full ring drops its oldest lines, never a sender) | 16 KiB BSS | correct as is | None |
+| `HISTORY_RING_BYTES` (`HISTORY`) | `services/init/src/logging.rs` | 16 KiB, entries (text lines and records) packed by length (about 160 boot lines; peak about 50) | tuning (boot-history retention: a full ring drops its oldest entries, never a sender) | 16 KiB BSS | correct as is | None |
 | `MAX_SENDERS` (`SENDERS`) | `services/init/src/logging.rs` | 32 | provably unreachable as a ceiling (boot window; slots are evicted, not refused) | about 10.5 KiB BSS | correct as is | None |
 | `LINE_BUF_SIZE`, `MAX_NAME_LEN` | `services/logd/codec/src/lib.rs` | 256 / 48 | line and label length, one definition for init-logd and logd (an over-long line is split, a long name truncated) | per sender slot | correct as is | None |
-| `HistoryRing` record length | `services/logd/codec/src/history.rs` | `u16` | provably unreachable (at most `LINE_BUF_SIZE`, const-asserted) | 2 B per line | correct as is | None |
+| `HistoryRing` record length | `services/logd/codec/src/history.rs` | `u16` | provably unreachable (at most `ENTRY_MAX_BYTES`, the longer of `LINE_BUF_SIZE` and `RECORD_MAX_BYTES`, const-asserted) | 2 B per entry | correct as is | None |
 | `HistoryRing.total`, `first_seq` | `services/logd/codec/src/history.rs` | `u64` sequence | ABI width | 16 B | correct as is | None |
-| log level field (`stream_labels::LEVEL_MASK`) | `shared/ipc/src/lib.rs` | 3 bits of the `STREAM_BYTES` and handover `LINE` labels; codes 1 to 5 assigned, 0, 6 and 7 read as info | ABI width | 1 B per `HistoryRing` record | correct as is | None |
+| log level field (`stream_labels::LEVEL_MASK`) | `shared/ipc/src/lib.rs` | 3 bits of the `STREAM_BYTES` and `STREAM_RECORD` labels and the handover `LINE` and `RECORD` labels; codes 1 to 5 assigned, 0, 6 and 7 read as info | ABI width | 1 B per `HistoryRing` record | correct as is | None |
+| record rendering `RENDERED_MAX_BYTES` | `services/logd/codec/src/record.rs` | `4 * RECORD_MAX_BYTES` = 1920 | encoding artefact (each payload byte renders as at most four: a value byte as `\xNN`) | sizes logd's `LineBuf`; init-logd writes byte by byte | correct as is | None |
 | `LOG_THREAD_STACK_PAGES` | `services/init/src/logging.rs` | 4 | BSS budget (the tables live in BSS, not on this stack) | 16 KiB | correct as is | None |
 | `STREAM_CHUNK_SIZE` | `services/init/src/logging.rs`, `services/logd/src/main.rs` | 512 | ABI width | 512 B stack | correct as is | None |
 | `MAX_ORPHAN_MEMORY_CAPS` | `services/init/src/main.rs` | `INIT_INFO_MAX_PAGES * PAGE_SIZE / size_of::<CapDescriptor>()` = 10,922 | provably unreachable (at most one orphan per usable-RAM cap, each of which has an `InitInfo` descriptor; `memory_count` is clamped to it) | about 43 KiB BSS, reclaimed at init's reap | correct as is | None |
@@ -654,15 +657,15 @@ The entries left open are tracked by the Issue each recommendation names.
 | `mm_boot_data` | `services/init/src/main.rs` | literal 64 | ABI width (`MSG_DATA_WORDS_MAX`) | 512 B stack | correct as is | Use the constant |
 | `log_hex` buffer | `services/init/src/bootstrap.rs` | 96 B | diagnostic output cap | 96 B stack | correct as is | None |
 | `SlotTable.slots` | `services/logd/src/slot.rs` | unbounded map | none | none | correct as is | Already pay-as-you-go |
-| `PER_SLOT_HISTORY` | `services/logd/src/slot.rs` | 16 lines | tuning (per-sender retention) | none up front | correct as is | None |
+| `PER_SLOT_HISTORY` | `services/logd/src/slot.rs` | 16 entries | tuning (per-sender retention) | none up front | correct as is | None |
 | `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | 128 | tuning (a drain of a full queue's worth starts a resync from procmgr's `QUERY_LIVE_PROCESSES`, which evicts the slots a dropped post left) | about 2.1 KiB | correct as is | None |
 | eviction by the death correlator (`drain_deaths`) | `services/logd/src/main.rs` | the full `u64` badge procmgr posts; no death-observer nodes | ABI width | none | correct as is | None |
 | death exit reason | `services/logd/src/main.rs` | full `u64` (`DeathEvent.exit_reason`, logged whole in the `reclaim:` line) | ABI width | none | correct as is | None |
-| handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 820 lines in its 16 KiB ring) | none | correct as is | Derive from those constants |
+| handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 780 entries in its 16 KiB ring) | none | correct as is | Derive from those constants |
 | `RELEASE_RETRY_BUDGET_US` (`send_release`) | `services/logd/codec/src/handover.rs` | 1 s of wall-clock time | tuning (bounds no capacity; time-based, so load does not shorten it) | none | correct as is | None |
 | `MAX_RELEASE_DEFERRALS` | `services/logd/codec/src/handover.rs` | 8 | tuning (liveness bound against name churn) | none | correct as is | None |
 | `NameResend.pending` | `services/logd/codec/src/handover.rs` | init `MAX_SENDERS` | encoding artefact (mirror) | 32 B | correct as is | None |
-| `LineBuf.buf`, `SerialFmt` | `services/logd/src/main.rs` | 512 / 256 | ABI width; line length | stack | correct as is | Use `SERIAL_CHUNK` |
+| `LineBuf.buf` (`LINE_OUT_BYTES`), `SerialFmt` | `services/logd/src/main.rs` | 2009 (a line's frame and `RENDERED_MAX_BYTES`) / 256 | line length (`LineBuf` holds the longest rendered record, written in `SERIAL_CHUNK` calls; `SerialFmt` a self-log payload of `LINE_BUF_SIZE`) | about 2 KiB stack | correct as is | None |
 
 ### Other services
 

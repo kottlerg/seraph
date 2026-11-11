@@ -578,8 +578,9 @@ is refused.
 ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)) with
 `shared/crash-report`'s parser. A block names its process by badge; logd's
 `reclaim: badge=<badge> … name=<log name>` line for that badge (or its resync form,
-`reclaim (resync): badge=<badge> name=<log name>`) gives the log name, and the image is the sysroot
-binary named by the log name's first word, searched in `services/`, `services/drivers/`,
+`reclaim (resync): badge=<badge> name=<log name>`) gives the log name, read with
+`logd_codec::record::fields` (a quoted name is read whole and unescaped), and the image is the
+sysroot binary named by the log name's first word, searched in `services/`, `services/drivers/`,
 `services/fs/`, `programs/`, `tests/`, and `tests/programs/`, in that order. The binary is used only
 when its executable segments span exactly the block's `text` less its `load_bias`, the span
 procmgr records at spawn, so a binary rebuilt since the boot is refused rather than resolved
@@ -709,9 +710,14 @@ See [docs/testing.md](../docs/testing.md) for the harness model and
 
 Check that a child's death reaches logd and evicts its slot, on either arch. Reads a svctest
 boot's serial log and passes when the log holds svctest's pass marker and exactly one logd line
-`reclaim: badge=<b> exit_reason=0x17 name=svctest-logd-reclaim`: the slot of the child svctest's
-`logd_death_forward` phase spawns, evicted on its exit with code `0x17`. The line's shape is
-stated in [services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
+`reclaim: badge=<b> exit_reason=0x17 name="svctest-logd-reclaim exit_reason=0x0"`: the slot of
+the child svctest's `logd_death_forward` phase spawns, evicted on its exit with code `0x17`. The
+line's fields are read with `logd_codec::record::fields`, so the forged ` exit_reason=0x0` in the
+child's name stays inside the name, and the line must be exactly the rendering of the record they
+give. The check also requires the child's record line `logd-reclaim child exiting code=23` and,
+after it, the child's text line `partial text line resumed`, which the child sends in two halves
+around its records, whole. The line's shape is stated in
+[services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
 § Death-notification cascade.
 
 ```sh

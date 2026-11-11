@@ -328,13 +328,22 @@ sender's slot (see
 [services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
 § Death-notification cascade). No harness can observe the eviction from inside
 the guest, because logd has no read surface. svctest's `logd_death_forward` phase
-spawns a child that registers the log name `svctest-logd-reclaim` and exits
-with code `0x17`, and logd logs the eviction as a serial line, which
+spawns a child that registers the log name `svctest-logd-reclaim exit_reason=0x0`
+and exits with code `0x17`, and logd logs the eviction as a serial line, which
 `cargo xtask test-logd-reclaim` checks host-side: the boot's log must hold
 svctest's pass marker and exactly one
-`[logd] reclaim: badge=<b> exit_reason=0x17 name=svctest-logd-reclaim` line. No
-other process registers that name, so the line is the child's, and its exit
-reason shows the forward carries the reason as well as the badge.
+`[logd] reclaim: badge=<b> exit_reason=0x17 name="svctest-logd-reclaim exit_reason=0x0"`
+line, whose fields the check reads with logd's own parser
+(`logd_codec::record::fields`). No other process registers that name, so the
+line is the child's, and its exit reason shows the forward carries the reason as
+well as the badge. The name's forged ` exit_reason=0x0` stays inside the quoted
+name, since the line is a log record
+([services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
+§ `stream_labels::STREAM_RECORD`). The child also sends a text line in two
+halves around a malformed record, which logd must refuse, and a record with a
+`code` field: the check requires the record's line
+`logd-reclaim child exiting code=23` and, after it, the text line whole, so a
+record leaves a sender's pending text line as it was.
 
 The check reads a serial log and does not need its own boot. In CI it runs
 inside each `svctest` cell (both arches, both profiles), after the svctest

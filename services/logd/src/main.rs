@@ -26,9 +26,14 @@ mod slot;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use ipc::stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME, level_of};
+use ipc::log_record::{RECORD_MAX_BYTES, Record};
+use ipc::stream_labels::{
+    LEVEL_INFO, RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD,
+    STREAM_REGISTER_NAME, level_of,
+};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use logd_codec::reclaim::{Cause, ReclaimLine};
+use logd_codec::record::RENDERED_MAX_BYTES;
 use std::os::seraph::startup_info;
 use syscall::RIGHTS_EQ_POST;
 
@@ -183,7 +188,7 @@ fn main() -> !
         let mut buf = SerialFmt::new();
         let _ = write!(
             buf,
-            "handover complete: {} slots, {} history lines",
+            "handover complete: {} slots, {} history entries",
             table.slots.len(),
             table.slots.values().map(|s| s.history.len()).sum::<usize>(),
         );
@@ -505,13 +510,22 @@ fn evict_missing(snapshot: &[u64], live: &[u64], table: &mut SlotTable)
     }
 }
 
-/// Log the reclaim line for the evicted slot of `badge`, named `name`
-/// (`logd_codec::reclaim`).
+/// Log the reclaim line for the evicted slot of `badge`, named `name`, as a
+/// record (`logd_codec::reclaim`), so the name cannot read as a further
+/// field.
 fn log_reclaim(badge: u64, cause: Cause, name: &[u8])
 {
-    let mut buf = SerialFmt::new();
-    let _ = write!(buf, "{}", ReclaimLine { badge, cause, name });
-    self_log(buf.as_str());
+    let w = ReclaimLine { badge, cause, name }.record();
+    // A record `RecordWriter` built decodes.
+    if let Ok(record) = Record::decode(w.as_bytes())
+    {
+        let mut out = LineBuf::new();
+        out.push_prefix(b"logd", LEVEL_INFO);
+        logd_codec::record::render(&record, |b| out.push(b));
+        out.push(b'\r');
+        out.push(b'\n');
+        out.flush();
+    }
 }
 
 /// Walk procmgr's live badges (`QUERY_LIVE_PROCESSES`) page by page on the
@@ -626,6 +640,12 @@ fn dispatch_log(
         consume_bytes(table, recv.badge, &recv, byte_len);
         reply_ack(ipc_buf);
     }
+    else if label_id == STREAM_RECORD
+    {
+        let status = consume_record(table, recv.badge, &recv, byte_len);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), ipc_buf) };
+    }
     else if label_id == STREAM_REGISTER_NAME
     {
         register_name(table, recv.badge, &recv, byte_len);
@@ -684,6 +704,35 @@ fn consume_bytes(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: 
             }
         }
     }
+}
+
+/// Render one `STREAM_RECORD` message's record as one line and retain it in
+/// the slot's history, with its field table. The record does not touch the
+/// slot's partial text line. Returns the reply label: `RECORD_ACCEPTED`, or
+/// `RECORD_REJECTED` for a payload longer than a record or than the message,
+/// or one `ipc::log_record` refuses, which is neither rendered nor retained.
+fn consume_record(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: usize) -> u64
+{
+    let bytes = msg.data_bytes();
+    if byte_len > RECORD_MAX_BYTES || byte_len > bytes.len()
+    {
+        return RECORD_REJECTED;
+    }
+    let Ok(record) = Record::decode(&bytes[..byte_len])
+    else
+    {
+        return RECORD_REJECTED;
+    };
+    let level = level_of(msg.label);
+    let slot = table.get_or_create(badge);
+    let mut out = LineBuf::new();
+    out.push_prefix(&slot.name, level);
+    logd_codec::record::render(&record, |b| out.push(b));
+    out.push(b'\r');
+    out.push(b'\n');
+    out.flush();
+    slot.push_record(elapsed_us(), level, &record);
+    RECORD_ACCEPTED
 }
 
 /// Snapshot the slot's in-progress line, emit it to serial, append
@@ -914,12 +963,26 @@ fn fb_write(bytes: &[u8])
     }
 }
 
-/// Fixed-capacity line builder. 512 bytes holds any logd line
-/// (`LINE_BUF_SIZE` content plus timestamp and name framing) in a single
-/// `SERIAL_WRITE_BYTES`; over-long lines truncate rather than allocate.
+/// Longest prefix [`LineBuf::push_prefix`] writes, CRLF included: the
+/// `[sec.usfrac] ` timestamp (at most 20 + 1 + 6 digits and 3 more bytes), a
+/// `[name] ` of at most [`MAX_NAME_LEN`] bytes, the longest level tag and its
+/// space (`ERROR `), and the line's `\r\n`.
+const LINE_FRAME_MAX: usize = 30 + (MAX_NAME_LEN + 3) + 6 + 2;
+
+/// Bytes of a [`LineBuf`]: the frame of any logd line with its longest body,
+/// a rendered record ([`RENDERED_MAX_BYTES`]), which is longer than any text
+/// line (`LINE_BUF_SIZE`), so no line is cut.
+const LINE_OUT_BYTES: usize = LINE_FRAME_MAX + RENDERED_MAX_BYTES;
+
+const _: () = assert!(RENDERED_MAX_BYTES >= LINE_BUF_SIZE);
+
+/// Fixed-capacity line builder, sized to hold any logd line
+/// ([`LINE_OUT_BYTES`]); the serial and framebuffer writes split it into
+/// `SERIAL_CHUNK`-byte calls. A push past the capacity is dropped rather
+/// than allocated for.
 struct LineBuf
 {
-    buf: [u8; 512],
+    buf: [u8; LINE_OUT_BYTES],
     len: usize,
 }
 
@@ -928,7 +991,7 @@ impl LineBuf
     fn new() -> Self
     {
         Self {
-            buf: [0u8; 512],
+            buf: [0u8; LINE_OUT_BYTES],
             len: 0,
         }
     }
@@ -1007,6 +1070,37 @@ impl LineBuf
         self.push(b' ');
     }
 
+    /// Push a line's `[sec.usfrac] [name] ` prefix, `[?]` for an empty
+    /// `name`, then the level's tag and a space for any level but info
+    /// (`logd_codec::level::tag`).
+    fn push_prefix(&mut self, name: &[u8], level: u64)
+    {
+        self.push_timestamp();
+        self.push(b'[');
+        let name = if name.is_empty()
+        {
+            logd_codec::reclaim::UNNAMED.as_bytes()
+        }
+        else
+        {
+            name
+        };
+        for &b in name
+        {
+            self.push(b);
+        }
+        self.push(b']');
+        self.push(b' ');
+        if let Some(tag) = logd_codec::level::tag(level)
+        {
+            for &b in tag.as_bytes()
+            {
+                self.push(b);
+            }
+            self.push(b' ');
+        }
+    }
+
     fn flush(&self)
     {
         serial_write(&self.buf[..self.len]);
@@ -1021,32 +1115,7 @@ impl LineBuf
 fn emit_line(_badge: u64, name: &[u8], level: u64, line: &[u8])
 {
     let mut out = LineBuf::new();
-    out.push_timestamp();
-    out.push(b'[');
-    if name.is_empty()
-    {
-        for &b in logd_codec::reclaim::UNNAMED.as_bytes()
-        {
-            out.push(b);
-        }
-    }
-    else
-    {
-        for &b in name
-        {
-            out.push(b);
-        }
-    }
-    out.push(b']');
-    out.push(b' ');
-    if let Some(tag) = logd_codec::level::tag(level)
-    {
-        for &b in tag.as_bytes()
-        {
-            out.push(b);
-        }
-        out.push(b' ');
-    }
+    out.push_prefix(name, level);
     for &b in line
     {
         out.push_escaped(b);
@@ -1075,14 +1144,7 @@ fn panic_to_serial(bytes: &[u8])
 fn self_log(payload: &str)
 {
     let mut out = LineBuf::new();
-    out.push_timestamp();
-    out.push(b'[');
-    for &b in b"logd"
-    {
-        out.push(b);
-    }
-    out.push(b']');
-    out.push(b' ');
+    out.push_prefix(b"logd", LEVEL_INFO);
     for b in payload.bytes()
     {
         out.push_escaped(b);

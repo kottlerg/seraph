@@ -8,9 +8,9 @@
 //! Three parts:
 //!
 //! * **Wire-format helpers ([`write_bytes`], [`write_args`],
-//!   [`register_name`]):** thin no-allocation wrappers over the IPC
-//!   labels defined in `ipc::stream_labels`. Callers supply their
-//!   badged SEND cap, IPC buffer pointer, and line level explicitly.
+//!   [`write_record`], [`register_name`]):** thin no-allocation wrappers
+//!   over the IPC labels defined in `ipc::stream_labels`. Callers supply
+//!   their badged SEND cap, IPC buffer pointer, and line level explicitly.
 //! * **Process-global cap cache ([`install_badged_cap`],
 //!   [`ensure_badged_cap`]):** holds the pre-installed badged SEND
 //!   cap. Std's `_start` installs the cap procmgr seeded in
@@ -22,8 +22,9 @@
 //!   (`services/logd/docs/ipc-interface.md` § Levels).
 //!
 //! The user-facing macro lives in the std overlay (it needs thread-
-//! local IPC-buffer access) and reaches [`emit`]; std is the crate's only
-//! consumer (`shared/log/README.md`).
+//! local IPC-buffer access) and reaches [`emit`], or [`emit_record`] for a
+//! line with fields; std is the crate's only consumer
+//! (`shared/log/README.md`).
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
@@ -41,9 +42,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::{
     IpcMessage,
+    log_record::RecordWriter,
     stream_labels::{
         LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_MASK, LEVEL_SHIFT, LEVEL_TRACE, LEVEL_WARN,
-        STREAM_BYTES, STREAM_REGISTER_NAME,
+        STREAM_BYTES, STREAM_RECORD, STREAM_REGISTER_NAME,
     },
 };
 use syscall_abi::MSG_DATA_WORDS_MAX;
@@ -145,7 +147,19 @@ fn rank(level: u64) -> u64
 /// `ipc::stream_labels::LEVEL_*` code (bits above the level field dropped).
 fn stream_label(len: usize, level: u64) -> u64
 {
-    STREAM_BYTES | ((len as u64 & 0xFFFF) << 16) | ((level & LEVEL_MASK) << LEVEL_SHIFT)
+    labelled(STREAM_BYTES, len, level)
+}
+
+/// The `STREAM_RECORD` label of a record of `len` bytes at `level`.
+fn record_label(len: usize, level: u64) -> u64
+{
+    labelled(STREAM_RECORD, len, level)
+}
+
+/// `id` with a payload length in bits 16-31 and `level` in the level field.
+fn labelled(id: u64, len: usize, level: u64) -> u64
+{
+    id | ((len as u64 & 0xFFFF) << 16) | ((level & LEVEL_MASK) << LEVEL_SHIFT)
 }
 
 /// Send `bytes` at `level` (an `ipc::stream_labels::LEVEL_*` code) as one or
@@ -193,6 +207,49 @@ unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8]) -> b
         offset += chunk_len;
     }
     true
+}
+
+/// Send `record`, a record's payload (`ipc::log_record`), at `level` as one
+/// `STREAM_RECORD` message on `cap`. A record fits one message, so nothing
+/// is split. Silently drops on a zero `cap`, a null `ipc_buf`, or an IPC
+/// failure; the receiver's reply, `RECORD_REJECTED` for a payload that is
+/// not a record, is not reported.
+///
+/// # Safety
+/// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
+/// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
+/// `ipc::ipc_call`).
+pub unsafe fn write_record(cap: u64, ipc_buf: *mut u64, level: u64, record: &[u8])
+{
+    if cap == 0 || ipc_buf.is_null()
+    {
+        return;
+    }
+    let record = &record[..record.len().min(CHUNK_SIZE)];
+    let msg = IpcMessage::builder(record_label(record.len(), level))
+        .bytes(0, record)
+        .build();
+    // SAFETY: ipc_buf is non-null (checked above), so the caller's contract
+    // makes it this thread's registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
+}
+
+/// The record of `message` and `fields`, each field's value formatted with
+/// `Display`. A record that does not fit is clipped as
+/// `ipc::log_record::RecordWriter` describes, and a field whose key is not
+/// a valid key is skipped (`seraph::log!` rejects one at compile time).
+#[must_use]
+pub fn build_record(
+    message: core::fmt::Arguments<'_>,
+    fields: &[(&str, &dyn core::fmt::Display)],
+) -> RecordWriter
+{
+    let mut w = RecordWriter::new(message);
+    for (key, value) in fields
+    {
+        w.field(key, format_args!("{value}"));
+    }
+    w
 }
 
 /// Send a `STREAM_REGISTER_NAME` message on `cap`. Names longer than
@@ -315,10 +372,63 @@ pub unsafe fn emit(ipc_buf: *mut u64, level: u64, args: core::fmt::Arguments<'_>
     unsafe { write_args(cap, ipc_buf, level, args) };
 }
 
+/// One-shot emit of a record: build it from `message` and `fields`
+/// ([`build_record`]) and send it at `level` on the pre-installed badged
+/// SEND cap. Drops a record more verbose than the process's level
+/// ([`enabled`]) before formatting it, and drops, in every build, when no
+/// cap is installed, as [`emit`] does. Non-allocating: the record is staged
+/// in a `RECORD_MAX_BYTES` stack buffer.
+///
+/// # Safety
+/// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
+/// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
+/// `ipc::ipc_call`).
+pub unsafe fn emit_record(
+    ipc_buf: *mut u64,
+    level: u64,
+    message: core::fmt::Arguments<'_>,
+    fields: &[(&str, &dyn core::fmt::Display)],
+)
+{
+    let cap = ensure_badged_cap(ipc_buf);
+    if cap == 0 || !enabled(level)
+    {
+        return;
+    }
+    let record = build_record(message, fields);
+    // SAFETY: the caller's contract covers `ipc_buf`.
+    unsafe { write_record(cap, ipc_buf, level, record.as_bytes()) };
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_record_is_built_from_its_message_and_displayed_fields()
+    {
+        use ipc::log_record::Record;
+        let reason = 0x17u64;
+        let record = build_record(
+            format_args!("child {} exiting", 3),
+            &[("code", &reason), ("name", &"a b=c")],
+        );
+        let rec = Record::decode(record.as_bytes()).expect("a record");
+        assert_eq!(rec.message(), b"child 3 exiting");
+        let fields: Vec<(&[u8], &[u8])> = rec.fields().map(|f| (f.key, f.value)).collect();
+        assert_eq!(fields, [(&b"code"[..], &b"23"[..]), (b"name", b"a b=c")]);
+    }
+
+    #[test]
+    fn a_record_label_carries_its_length_and_level()
+    {
+        use ipc::stream_labels::{LEVEL_ERROR, level_of};
+        let label = record_label(37, LEVEL_ERROR);
+        assert_eq!(label & 0xFFFF, STREAM_RECORD);
+        assert_eq!((label >> 16) & 0xFFFF, 37);
+        assert_eq!(level_of(label), LEVEL_ERROR);
+    }
 
     /// Format `args` through [`format_line`], recording each chunk sent;
     /// `fail_at` makes that send (0-based) fail.

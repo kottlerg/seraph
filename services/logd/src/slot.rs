@@ -11,7 +11,8 @@
 //! Slots are keyed by the kernel-delivered badge on every IPC message —
 //! the same `u64` procmgr uses as the child's process badge and posts as
 //! the correlator of the child's death to logd's death queue. Slot
-//! eviction is driven by the death event drained inside logd's main loop.
+//! eviction is driven by the death events logd drains
+//! (`services/logd/docs/ipc-interface.md` § Wait-set).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -37,6 +38,14 @@ pub const PER_SLOT_HISTORY: usize = 16;
 /// slot into a full set drops the oldest retired slot, never a live one. At
 /// most 64 * [`PER_SLOT_HISTORY`] * 1.5 KiB ≈ 1.5 MiB worst case.
 pub const RETIRED_SLOTS: usize = 64;
+
+/// Number of evicted badges logd remembers, with or without a slot, so a
+/// sender's message a receive worker received before the sender's eviction
+/// and serves after it does not create its slot again
+/// ([`SlotTable::sender_slot`]). A tuning value that bounds no capacity: past
+/// it, such a message creates a live slot, which the next resync evicts. Its
+/// cost, 1 KiB, is paid as evictions occur.
+pub const EVICTED_BADGES: usize = 128;
 
 /// What a retained entry holds.
 #[derive(Clone)]
@@ -180,7 +189,8 @@ struct Retired
     slot: Slot,
 }
 
-/// Badge-keyed slot map, with the retired slots eviction leaves.
+/// Badge-keyed slot map, with the retired slots eviction leaves and the
+/// badges it recently evicted.
 /// `Default::default()` is the empty state at boot; the ingested handover
 /// state from init-logd is merged in via [`Self::install_from_handover`].
 #[derive(Default)]
@@ -191,6 +201,10 @@ pub struct SlotTable
     /// Evicted slots, oldest first, at most [`RETIRED_SLOTS`], each badge at
     /// most once.
     retired: VecDeque<Retired>,
+    /// The badges of the most recent evictions, oldest first, at most
+    /// [`EVICTED_BADGES`], each at most once; a badge evicted with no live slot
+    /// is among them.
+    evicted: VecDeque<u64>,
     /// The `seq` the next retained entry takes.
     seq: u64,
 }
@@ -210,6 +224,25 @@ impl SlotTable
         (self.slots.entry(badge).or_default(), &mut self.seq)
     }
 
+    /// The live slot of the sender `badge`, created when absent, and the
+    /// table's sequence, as [`Self::get_or_create_with_seq`] lends them; `None`
+    /// when the badge has no live slot and is among the recent evictions
+    /// ([`EVICTED_BADGES`]). A receive worker may serve a sender's message
+    /// after another thread evicted the sender, its death having been taken
+    /// between the message's receipt and the worker's turn at the state lock;
+    /// the message is then the dead sender's, and logd drops it rather than
+    /// give the badge a live slot again (`services/logd/docs/ipc-interface.md`
+    /// § Wait-set). procmgr draws process badges at random, so a new process
+    /// takes a recently evicted badge only by chance.
+    pub fn sender_slot(&mut self, badge: u64) -> Option<(&mut Slot, &mut u64)>
+    {
+        if !self.slots.contains_key(&badge) && self.evicted.contains(&badge)
+        {
+            return None;
+        }
+        Some(self.get_or_create_with_seq(badge))
+    }
+
     /// Take the next entry sequence from `seq`, the table's counter as
     /// [`Self::get_or_create_with_seq`] lends it. A `u64` counting one per
     /// retained entry does not wrap.
@@ -222,11 +255,18 @@ impl SlotTable
 
     /// Evict the slot for `badge` into the retired slots and return it, for
     /// the reclaim line to name. Called with each death event's correlator,
-    /// and by the resync. Idempotent on unknown badges, which return `None`.
-    /// A retired slot of the same badge is replaced; a full set drops its
-    /// oldest.
+    /// and by the resync. The badge joins the recent evictions
+    /// ([`Self::sender_slot`]) whether or not it has a slot; an unknown badge
+    /// returns `None`. A retired slot of the same badge is replaced; a full
+    /// set drops its oldest.
     pub fn retire(&mut self, badge: u64, cause: Eviction) -> Option<&Slot>
     {
+        self.evicted.retain(|&b| b != badge);
+        if self.evicted.len() == EVICTED_BADGES
+        {
+            self.evicted.pop_front();
+        }
+        self.evicted.push_back(badge);
         let mut slot = self.slots.remove(&badge)?;
         // An unfinished line is never retained; free its buffer.
         slot.partial = Vec::new();

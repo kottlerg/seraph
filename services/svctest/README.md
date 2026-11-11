@@ -42,6 +42,8 @@ services/svctest/
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
+        ├── recv_pool.rs       # Worker-pool receive helper under concurrent nested IPC;
+        │                      #   concurrent logging through logd
         ├── devmgr.rs          # Block, shutdown, debug-port, label deny; input ordinal; orphan,
         │                      #   withdrawal, DMA confinement
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
@@ -106,9 +108,8 @@ input-ordinal phase (`caps[8]`), the drivers stray-cap phases (`caps[7]` and `ca
 orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`),
 the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names
 it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd phases
-(`caps[4]`, `caps[5]`), the `logd_death_forward` phase (`caps[6]`), and the `crash_endpoint` phase
-(`caps[9]`) instead fail their
-assertions. The seed-only phase thus
+(`caps[4]`, `caps[5]`), the `logd_death_forward` and `logd_concurrent` phases (`caps[6]`), and
+the `crash_endpoint` phase (`caps[9]`) instead fail their assertions. The seed-only phase thus
 fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
 zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and
 the run ends idle.
@@ -135,7 +136,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, driver withdrawal, DMA confinement, drivers deny |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases          |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase                |
-| `caps[6]` | `logd.query`      | `logd_death_forward` phase: reads logd's slots and history |
+| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | (`debug_authority`) | `crash_endpoint` phase; svctest declares itself undebuggable at startup |

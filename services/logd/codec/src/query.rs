@@ -7,8 +7,8 @@
 //! § Queries): [`slot_page`] for `QUERY_SLOTS`, [`history_page`] for
 //! `QUERY_HISTORY`. Both take a closure that walks logd's state afresh, in
 //! any order, and select from it the page after the request's resume point,
-//! without allocating, so logd's main thread answers a query from the state
-//! it owns. The pages are built with `ipc::log_query`, the wire format the
+//! without allocating, so a logd receive worker answers a query from the state
+//! logd owns. The pages are built with `ipc::log_query`, the wire format the
 //! client reads.
 
 use ipc::log_query::{

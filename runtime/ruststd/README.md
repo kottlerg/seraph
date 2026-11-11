@@ -443,9 +443,13 @@ since procmgr's request does not wait on the new thread:
 - **logd's resync helper.** procmgr writes its log through logd, and logd's main thread spawns the
   helper that walks `QUERY_LIVE_PROCESSES` after its death queue may have dropped a post
   ([services/logd/docs/ipc-interface.md](../../services/logd/docs/ipc-interface.md) § Death-queue
-  resync). logd declared itself undebuggable, so only its first spawned thread sends a registration,
-  and the helper exists to call procmgr: its registration waits on procmgr exactly as its query
-  would, while logd's main thread, which serves procmgr's write, goes on without it.
+  resync). logd declared itself undebuggable, so once procmgr has refused one of its registrations
+  it sends no more. Its first spawned threads are its receive workers, spawned before its handover
+  pull while init-logd still serves the log endpoint, and logd waits for each to start before the
+  pull (§ Receive pool there), so procmgr serves their registrations without waiting on logd, and
+  the helper normally sends none. The helper exists to call procmgr: a registration it does send
+  waits on procmgr exactly as its query would, while logd's receive workers, which serve procmgr's
+  write, go on without it.
 
 Two patterns would deadlock, and no in-tree process follows either: a spawner that waits on its new
 thread without bound while procmgr waits on that spawner; and a process that hands procmgr a cap
@@ -528,5 +532,7 @@ primitives.
 [programs/threadstack/README.md](../../programs/threadstack/README.md),
 [runtime/libc/README.md](../libc/README.md),
 [Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
+[logd IPC interface](../../services/logd/docs/ipc-interface.md),
 [procmgr IPC Interface](../../services/procmgr/docs/ipc-interface.md),
-[`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)
+[`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md),
+[shared/recv-pool/README.md](../../shared/recv-pool/README.md)

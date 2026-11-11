@@ -29,7 +29,10 @@ targets; only the one-time init-logd history pull
   object is unchanged — only the holder of the RECV cap changes —
   so every pre-existing badged SEND cap continues to work without
   re-derivation or re-registration (see
-  [`docs/handover-protocol.md`](docs/handover-protocol.md)).
+  [`docs/handover-protocol.md`](docs/handover-protocol.md)). logd
+  receives on it from a pool of worker threads, each on its own IPC
+  buffer page, spawned before the handover pull and receiving after it
+  (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § Receive pool).
 
 * **Driver-mediated serial writer.** logd emits received log lines
   and its own diagnostics through the userspace serial driver
@@ -85,7 +88,7 @@ targets; only the one-time init-logd history pull
   history of every slot or of one badge, newest first, a reply's worth per
   call. Both are served only on a SEND badged `LOG_QUERY_AUTHORITY`, which
   svcmgr mints from its master-log source and publishes seed-only as
-  `logd.query`. logd's main thread answers them from the state it owns and
+  `logd.query`. A receive worker answers them from the state logd owns and
   calls no other service to do so (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Queries).
 
@@ -106,9 +109,9 @@ targets; only the one-time init-logd history pull
   tuning capacity. A death posted to a full EQ is dropped, so a drain that
   took a full queue's worth starts a resync: a helper thread walks procmgr's
   live badges (`QUERY_LIVE_PROCESSES`) and logd evicts the slots it snapshotted
-  before the walk that the walk did not list. The walk runs off the main thread,
-  which never calls procmgr after startup, since procmgr's own synchronous log
-  calls would deadlock against it (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
+  before the walk that the walk did not list. The walk runs on its own thread:
+  no receive worker calls procmgr after startup, since procmgr's own synchronous
+  log calls would deadlock against it (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   § Death-queue resync).
 
 * **Undebuggable.** At startup logd declares itself undebuggable to procmgr
@@ -140,9 +143,9 @@ logd/
 │   ├── handover-protocol.md    # init-logd → logd wire format
 │   └── ipc-interface.md        # IPC labels logd handles
 └── src/
-    ├── main.rs                 # entry, bootstrap, event loop,
-    │                           # driver-mediated serial + framebuffer
-    │                           # emit, self_log
+    ├── main.rs                 # entry, bootstrap, receive-pool
+    │                           # handler, control loop, driver-mediated
+    │                           # serial + framebuffer emit, self_log
     ├── handover.rs             # HANDOVER_PULL / HANDOVER_RELEASE caller
     └── slot.rs                 # SlotTable: HashMap<badge, Slot>
                                 # with per-sender history ring, and
@@ -178,7 +181,8 @@ the two class SENDs for its lifetime (see
 | [docs/architecture.md](../../docs/architecture.md) | logd's role in the userspace component map |
 | [docs/bootstrap.md](../../docs/bootstrap.md) | init-logd's boot role and the init → svcmgr handover that precedes logd's launch |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Death-notification cascade logd subscribes to |
-| [docs/ipc-design.md](../../docs/ipc-design.md) | Endpoint identity, cap transfer semantics that make the init-logd handover possible |
+| [docs/ipc-design.md](../../docs/ipc-design.md) | Endpoint identity, cap transfer semantics that make the init-logd handover possible, and the rules of multi-threaded servers |
+| [shared/recv-pool/README.md](../../shared/recv-pool/README.md) | The worker pool logd receives on the master log endpoint with |
 | [docs/console-model.md](../../docs/console-model.md) | Console output ownership; logd as the serial driver's primary client and a framebuffer-driver consumer |
 | [services/init/README.md](../init/README.md) | init-logd's role + termination, and the reserved log-sink sources init endows svcmgr |
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |

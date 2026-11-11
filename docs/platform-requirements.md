@@ -187,7 +187,9 @@ Each feature is classified per architecture as one of:
   supervisor-level IMSIC file per hart at the layout the firmware tables report (both from
   `BootInfo.kernel_mmio`). The kernel halts the boot without them (see
   [initialization.md](../core/kernel/docs/initialization.md) § Phase 5: Architecture Hardware
-  Initialisation).
+  Initialisation). Under emulation this needs QEMU ≥ 9.0, the first release whose `ssaia` and
+  `smaia` CPU properties are not experimental, and `-machine virt,aia=aplic-imsic`
+  ([build-system.md](build-system.md) § QEMU and Firmware).
 - **Sstc — `stimecmp`** — the supervisor timer.
 - **Svpbmt, Svinval, Svnapot** — page-based memory types, fine-grained fence invalidation, and
   NAPOT page encodings; asserted by `paging::verify_paging_extensions`, before the first

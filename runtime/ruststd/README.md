@@ -424,10 +424,13 @@ its faults go unreported. A `NOT_ATTACHABLE` refusal, from a process declared un
 (`DECLARE_NO_DEBUG`), stops every later registration of the process, since the declaration is
 one-way, so a declared process registers nothing.
 
-The new thread makes the call, not its spawner, so a spawner never waits on procmgr. A thread
-spawned while procmgr is blocked on a request to the same process waits in its registration until
-procmgr returns, before running any of its code. Two such spawns exist, and neither can deadlock,
-since procmgr's request does not wait on the new thread:
+The new thread makes the call, not its spawner, so a spawner never waits on procmgr. Any of
+procmgr's request workers serves a registration
+([services/procmgr/README.md](../../services/procmgr/README.md) § Concurrency), so a request of
+procmgr's blocked on the same process holds one worker and the registration goes to another. Only
+while every worker is blocked does a new thread wait in its registration until one returns, before
+running any of its code. Two spawns can meet a procmgr request blocked on their process, and
+neither can deadlock, since that request does not wait on the new thread:
 
 - **fatfs's release watchdog.** procmgr reads a binary through fatfs (`CREATE_FROM_FILE`), and
   fatfs's eviction worker spawns a watchdog thread to send a client `FS_RELEASE_MEMORY` and waits
@@ -451,11 +454,11 @@ since procmgr's request does not wait on the new thread:
   waits on procmgr exactly as its query would, while logd's receive workers, which serve procmgr's
   write, go on without it.
 
-Two patterns would deadlock, and no in-tree process follows either: a spawner that waits on its new
-thread without bound while procmgr waits on that spawner; and a process that hands procmgr a cap
-which a newly spawned thread serves (a file or node for `CREATE_FROM_FILE`, say) before that
-thread's registration has been served, so procmgr's call on the cap waits on a thread that waits on
-procmgr.
+Two patterns would deadlock once they hold every one of procmgr's request workers, and no in-tree
+process follows either: a spawner that waits on its new thread without bound while procmgr waits on
+that spawner; and a process that hands procmgr a cap which a newly spawned thread serves (a file or
+node for `CREATE_FROM_FILE`, say) before that thread's registration has been served, so procmgr's
+call on the cap waits on a thread that waits for a free worker.
 
 ---
 

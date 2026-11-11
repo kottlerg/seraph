@@ -50,6 +50,7 @@ shared/recv-pool/
 |---|---|
 | [docs/ipc-design.md](../../docs/ipc-design.md) | Multi-threaded servers, the call/reply binding, and the receive-failure policy |
 | [services/logd/docs/ipc-interface.md](../../services/logd/docs/ipc-interface.md) | logd's receive pool |
+| [services/procmgr/README.md](../../services/procmgr/README.md) | procmgr's request workers (§ Concurrency) |
 
 ---
 

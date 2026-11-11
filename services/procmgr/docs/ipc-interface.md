@@ -683,7 +683,7 @@ While no crash service is registered, a procmgr thread of its own, the **decline
 the endpoint and declines each fault with `FAULT_REPLY_KILL`, carrying the forwarder's reason for a
 forwarded page fault (data word 4) and no reason for an exception: the fault takes the outcome it
 has with no handler bound, and the kernel's decline line for a forwarded fault is the one the
-pager's own decline printed. The decliner shares nothing with the request loop but a wake
+pager's own decline printed. The decliner shares nothing with procmgr's request workers but a wake
 notification, so a receive on the endpoint never waits behind a request.
 
 Labels 19–21, 23, and 24 are the **debug authority**, and label 22 the **thread registry** it
@@ -704,21 +704,22 @@ service ([services/crashd/README.md](../../crashd/README.md)) and the GDB stub
 | `caps[0]` | A Thread cap of the service's main thread (any rights); further caps are deleted |
 
 procmgr parks the decliner, keeps the thread cap, and replies `SUCCESS` with one cap, `RECV` on the
-crash endpoint. The park is a message on the endpoint itself: procmgr's request loop calls the
-endpoint, un-badged and with a label no fault carries, and the decliner, which receives it only
-after every fault queued ahead of it and declines those, answers it and waits on its wake
-notification. The service then receives every fault on the endpoint. procmgr checks the kept cap on
-every pass of its loop, which the service's own death, or any request, wakes: once the cap is gone
-(procmgr's teardown of the service revokes every cap derived from its main thread) or its thread
-has exited, procmgr deletes the cap and signals the decliner, which receives again, declining the
-faults already queued. Replies: `UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` without a
-thread cap, or when procmgr has no crash endpoint; `CRASH_SERVICE_PRESENT` while a registered
-service lives; `OUT_OF_MEMORY` when the `RECV` cap cannot be derived or the park fails. A refused
-request's caps are deleted. A `SUCCESS` reply that cannot deliver the `RECV` cap (the caller's
-`CSpace` cannot take it, or the caller is gone) registers nothing: procmgr deletes the `RECV` cap
-and the kept thread cap and signals the decliner, as at the take-back. svctest's `crash_endpoint`
-phase drives the registration, the refusal of a second one, the handover, the take-back, and a
-registration after it.
+crash endpoint. The park is a message on the endpoint itself: the request worker serving the
+registration calls the endpoint, un-badged and with a label no fault carries, and the decliner,
+which receives it only after every fault queued ahead of it and declines those, answers it and waits
+on its wake notification. The service then receives every fault on the endpoint. procmgr checks the
+kept cap on every pass of its reaper, which the service's own death wakes, before it serves any
+request, and after the teardown of a `DESTROY_PROCESS`, which posts no death ([README](../README.md)
+§ Concurrency): once the cap is gone (procmgr's teardown of the service revokes every cap derived
+from its main thread) or its thread has exited, procmgr deletes the cap and signals the decliner,
+which receives again, declining the faults already queued. Replies: `UNAUTHORIZED` without the
+authority; `INVALID_ARGUMENT` without a thread cap, or when procmgr has no crash endpoint;
+`CRASH_SERVICE_PRESENT` while a registered service lives; `OUT_OF_MEMORY` when the `RECV` cap cannot
+be derived or the park fails. A refused request's caps are deleted. A `SUCCESS` reply that cannot
+deliver the `RECV` cap (the caller's `CSpace` cannot take it, or the caller is gone) registers
+nothing: procmgr deletes the `RECV` cap and the kept thread cap and signals the decliner, as at the
+take-back. svctest's `crash_endpoint` phase drives the registration, the refusal of a second one,
+the handover, the take-back, and a registration after it.
 
 ### Label 20: `ATTACH_PROCESS`
 
@@ -763,9 +764,10 @@ earlier attach left; a watch that is not a Thread cap, or that a refused attach 
 An attach whose reply cannot deliver its caps (the caller's `CSpace` cannot take them, or the caller
 is gone) has not succeeded: procmgr deletes the caps derived for it and the watch, and keeps the
 earlier one.
-procmgr reads the watched thread's state on every pass of its loop, which a process's death wakes:
-once the thread has exited, or its cap went with its process's teardown, procmgr logs `debugger
-gone; crash bindings restored` and restores the target's crash bindings as `DETACH_PROCESS` does
+procmgr reads the watched thread's state on every pass of its reaper, which a process's death
+wakes, before it serves any request, and after every `DESTROY_PROCESS`: once the thread has exited,
+or its cap went with its process's teardown, procmgr logs `debugger gone; crash bindings restored`
+and restores the target's crash bindings as `DETACH_PROCESS` does
 (Label 24). So a debugger that dies attached leaves no thread of its target bound to an endpoint no
 one receives on: a fault the target takes meanwhile waits there, and the restore delivers it again
 to the crash endpoint ([docs/fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume,

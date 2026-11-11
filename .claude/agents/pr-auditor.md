@@ -107,15 +107,13 @@ claims.
    - Diff: surface only multi-word deferral phrases — `out of scope`,
      `follow-up`, `deferred to`, `for a future PR`, `for now`,
      `will come later`. Do **not** flag bare `TODO` tokens in the diff.
-   Per the Completeness rule in `.claude/CLAUDE.md`, blocking work on the
-   review surface cannot be deferred, and a non-blocking surface finding
-   is recorded on the follow-up Issue of its scope only as
-   `docs/conventions.md` § Branch and PR Workflow allows; surface every
-   hit matching the criteria above. A hit is reconciled when the same text
-   names the Issue filed for the deferral under the Completeness rule (the
-   scope's follow-up Issue for a recorded non-blocking finding), or when
-   it is not a deferral of this PR's work (a rule's wording, a quotation,
-   a description of past work).
+   Per the Completeness rule in `.claude/CLAUDE.md`, a defect on the review
+   surface cannot be deferred; surface every hit matching the criteria
+   above. A hit is reconciled when the same text names the Issue filed for
+   the deferral under the Completeness rule (the scope's follow-up Issue
+   for a defect recorded off the surface), or when it is not a deferral of
+   this PR's work (a rule's wording, a quotation, a description of past
+   work).
 
 7. Test-plan honesty: every `- [x]` under `## Test plan` in the PR body
    should have plausible basis (cited tool output, file presence, commit
@@ -237,26 +235,31 @@ claims.
     describes, citing `path:line` on both sides, and FAIL each one the
     code contradicts. Confirm that the range makes each fix the commits
     since `since` or the PR body claim for a finding of that run, and FAIL
-    a claimed fix the range does not make. FAIL each finding in the
+    a claimed fix the range does not make. FAIL each defect in the
     record's `findings` that the range does not fix, and each entry of its
-    `recorded`, that no open Issue records as that section says: an item
-    stating it, either the one this PR recorded or the one an open
-    follow-up Issue of its scope already held. A finding of class `style`
-    that is not a MUST violation needs no item: the run record is its
-    record (`docs/conventions.md` § Recording findings). List each finding of the
-    record's `findings` that the range leaves unfixed, as the record states
-    it, so the parent's record of this run carries it, and the ledger takes
-    it when the run's reviewer verdict is `NON-BLOCKING ISSUES ONLY`. End
-    the section with the line `Reviewer verdict: <verdict>`, the verdict
-    that section gives the run, derived from the record and the range.
+    `recorded` that no open Issue records as `docs/conventions.md`
+    § Recording findings says: an item stating it, either the one this PR
+    recorded or the one an open follow-up Issue of its scope already held.
+    List each defect of the record's `findings` that the range leaves
+    unfixed, as the record states it, so the parent's record of this run
+    carries it. End the section with the line `Reviewer verdict:
+    <verdict>`, the verdict that section gives the run, derived from the
+    record and the range: `READY TO MERGE` when the range fixes every
+    defect of the record's `findings`, `BLOCKING ISSUES` otherwise.
+
+12. Completing audit: when the parent names this audit as the one that
+    completes a run of the reviewer alone at the same head, read that
+    run's record and FAIL each entry of its `recorded` that no open Issue
+    records as step 11 says.
 
 ## Output
 
 A per-section verdict, each PASS or FAIL: PR-body checklist; per-issue
 closure with per-criterion lines; silent-deferral scan (FAIL on any
 unreconciled hit); test-plan honesty (FAIL on any bare tick);
-commit-message compliance; validation claim; PR-body claims; and, in an
-auditor-only run, auditor-only checks.
+commit-message compliance; validation claim; PR-body claims; in an
+auditor-only run, auditor-only checks; and, in an audit that completes a
+run of the reviewer alone, completing-audit checks.
 
 **The final line MUST be exactly one of:** `AUDIT PASS`, `AUDIT FAIL`.
 Any FAIL section forces `AUDIT FAIL`.

@@ -5,8 +5,9 @@ description: Run the pre-merge review of a pull request once its CI is green (th
 
 # The pre-merge review
 
-docs/conventions.md § Branch and PR Workflow owns the rules: the review surface, the two tracks,
-where a finding is recorded, the ledger, the auditor-only run, and the merge condition.
+docs/conventions.md § Branch and PR Workflow owns the rules: what a finding is (a defect), the
+review surface, the rounds, where a defect is recorded, the ledger, the auditor-only run, and the
+merge condition.
 This skill is the procedure that applies them. `.claude/CLAUDE.md` carries the maintainer's
 standing request to run it on every PR once CI is green.
 
@@ -33,14 +34,18 @@ Give the reviewer, in addition:
   and not as this PR's ledger: a finding it lists that stands on this PR's surface is still
   reported and counted;
 - for a `delta` run (every run after the first), the `since` head, which is the head the last
-  run with the reviewer reviewed, and the merge bases at `since` and at the head
-  (`git merge-base <sha> origin/master` for each).
+  run with the reviewer reviewed, the path of that run's record, the fixes the round claims,
+  and the merge bases at `since` and at the head (`git merge-base <sha> origin/master` for
+  each). It judges only those fixes and the delta's own change (docs/conventions.md § Rounds);
+- for the fix PR of a release review (docs/conventions.md § Release Production step 2), the
+  list of defects it fixes, and that this run is the release fix verification.
 
 While the PR body's `## Validation` section reports a run as pending, make the run with
 `pr-reviewer` alone (docs/conventions.md § Pre-merge review): the audit would fail on that item
 alone. Once the runs are reported, the audit is owed. When a fix round has moved the head, it
 runs with the next run. When the head is the one the reviewer reviewed, run `pr-auditor` alone
-on it as an ordinary audit, not as the auditor-only run below, and save it as an `audit` record.
+on it as the audit that completes that run, not as the auditor-only run below: give it the path
+of the reviewer-alone record, and save it as an `audit` record.
 
 When docs/conventions.md § Auditor-only run allows it, the next run may be `pr-auditor` alone.
 Tell it that it is that run, and give it the PR number, the `since` head, the path of the last
@@ -50,19 +55,25 @@ reviewer run's record, the fixes the round claims, and the open Issue list.
 
 Save both agents' prose as `target/xtask/review/pr<N>/<mode>-<head>.md` and the run record as
 `<mode>-<head>.json` beside it. `<mode>` is `full` for the first run, `delta` for a later run
-with the reviewer, and `audit` for an auditor-only run or a re-audit; a further run at the same
+with the reviewer, and `audit` for an auditor-only run, the audit that completes a run of the
+reviewer alone, or a re-audit; a further run at the same
 head takes the suffix `-<n>`, counting from 2. `xtask/README.md` § `cargo xtask review-check`
-defines the record. Five points it leaves to you:
+defines the record. Six points it leaves to you:
+
+- `stats.form` is `defects`, and each finding carries `file`, `line`, `status`, `issue`,
+  `claim`, and `fix`, with no class or bucket.
 
 - `stats.run` is the run's number among the PR's runs of every mode, counting from 1: one more
   than the highest `run` among the records already saved. It orders the runs, and the gate
   reads the highest one at the head; the `-<n>` suffix only keeps two file names apart.
-- A finding's `status` is `unverified`, or `nit` for a nit that cannot block, or `contested`
-  once the author disputes it.
-- `ledgered` holds the findings the reviewer lists under its `Ledger (not re-raised)` heading.
-- In an `audit` record, `verdict` is the reviewer verdict the audit states, `findings` holds the
-  surface findings of the last reviewer run that the audit lists as unfixed, each as that run's
-  record states it, and `recorded`, `ledgered` and `dropped` are empty.
+- A finding's `status` is `unverified`, or `contested` once the author disputes it.
+- `findings` holds the reviewer's defect list, `recorded` its `Out of bound (recorded)` list,
+  and `ledgered` its `Ledger (not re-raised)` list.
+- In an auditor-only `audit` record, `verdict` is the reviewer verdict the audit states and
+  `findings` holds the defects of the last reviewer run that the audit lists as unfixed, each as
+  that run's record states it. In the `audit` record that completes a run of the reviewer alone,
+  `verdict` and `findings` are that run's, as its record states them. In both, `recorded`,
+  `ledgered` and `dropped` are empty.
 - A run of the reviewer alone, made while the PR body reports a run as pending, is a `full` or
   `delta` record with `audit_verdict` `NOT RUN` and `audit` `null`. The gate still needs
   `AUDIT PASS` in the last record at the head, so the audit it leaves owed is a later `audit`
@@ -76,19 +87,15 @@ its orchestrator, a standalone session to the maintainer.
 
 Handle a run's findings in one pass.
 
-- `BLOCKING ISSUES`: fix every finding on the surface in one batch of commits, the non-blocking
-  ones included.
-- `NON-BLOCKING ISSUES ONLY`: record every finding on the surface on the Issue
-  docs/conventions.md § Recording findings names; a finding of class `style` that is not a MUST
-  violation goes on no Issue, since the run record is its record. Then take one fix round when
-  the run has a `should` finding and the PR has had no such round, fixing a nit in it only as
-  `.claude/agents/orchestrator.md` § Rulings allows; otherwise go to the gate. A PR takes at
-  most one such round (docs/conventions.md § Pre-merge review).
-- A finding off the surface is recorded in the same pass, the same way, and not fixed.
-- Before recording a finding, and after fixing one, search the open follow-up Issues of its
+- `BLOCKING ISSUES`: fix every defect on the surface in one batch of commits, then run a
+  `delta` run (§ After a fix round).
+- `READY TO MERGE`: go to the gate.
+- A defect off the surface (the `Out of bound (recorded)` list) is recorded in the same pass
+  on the Issue docs/conventions.md § Recording findings names, and not fixed.
+- Before recording a defect, and after fixing one, search the open follow-up Issues of its
   scope for an item that states it (`gh issue list --state open --limit 500 --search
   '"defects found by" in:title' --json number,title`, then the titles beginning `<scope>:`).
-  A finding one of them holds is recorded nowhere else, and its fix ticks that item.
+  A defect one of them holds is recorded nowhere else, and its fix ticks that item.
 - Record with `cargo xtask issue-edit <N> --body-file <file>`, from a body fetched in the same
   step. An item is a `- [ ]` line under `## Acceptance` carrying file, line, authority, fix, and
   the PR and head that reported it.
@@ -104,7 +111,8 @@ Handle a run's findings in one pass.
   re-run the audit.
 - A finding you dispute is contested: put it to the one docs/conventions.md § Contested
   findings names (a worker to its orchestrator, a standalone session to the maintainer), and
-  resolve it as that section says. Never waive one.
+  resolve it as that section says. Never waive one. A finding that is not a defect as
+  docs/conventions.md § Findings defines one is disputed on that rule.
 
 Before pushing a fix, for every fact it changes (a symbol, a constant, a rule sentence, a
 section name) walk the `## Summarized By` lists (docs/documentation-standards.md § Change
@@ -122,8 +130,9 @@ reviewer.
 ## The merge condition
 
 The PR meets the merge condition of docs/conventions.md § Pre-merge review when
-`cargo xtask pr-check <N> --gate` passes. After a `NON-BLOCKING ISSUES ONLY` run, read its
-warning and confirm that each finding it counts is recorded and none is contested. For the
+`cargo xtask pr-check <N> --gate` passes. For a PR whose records are of the earlier form, read
+its `gate-findings-recorded` warning, when it prints one, and confirm that each finding it
+counts is recorded and none is contested. For the
 release PR the command prints `gate-release-approval`: that PR meets the condition only once the
 maintainer has approved its merge. A worker then hands its gate report to the orchestrator,
 which verifies the gate and merges. A standalone session tells the maintainer that the PR meets

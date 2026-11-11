@@ -545,12 +545,21 @@ memory size, or device set, and owes no local host run, whatever file it is in:
 - lint attributes: `#[allow(...)]`, `#[expect(...)]`, `#[warn(...)]`, `#[deny(...)]`, their inner
   `#![...]` forms, and a `#[cfg_attr(<predicate>, <lint attribute>)]`;
 - code compiled only for host tests: a `#[cfg(test)]` module or item, or a `#[test]` function;
-- the deletion of a named function, constant, static, or type (not a module, an `impl` block, or
-  a trait-method implementation) that nothing names at the PR head outside comments and Markdown
-  (`git grep -w <name> <head>` finds no other use) and that carries no attribute making it
-  reachable without its name (`no_mangle`, `export_name`, `used`, `link_section`,
-  `global_allocator`, or `panic_handler`, in any form: plain, `unsafe(...)`, or under
-  `cfg_attr`).
+- the deletion of a named function, constant, static, or type (not an `impl` block or a
+  trait-method implementation; a module is the next item) that nothing names at the PR head
+  outside comments and Markdown (`git grep -w <name> <head>` finds no other use) and that carries
+  no attribute making it reachable without its name (`no_mangle`, `export_name`, `used`,
+  `link_section`, `global_allocator`, or `panic_handler`, in any form: plain, `unsafe(...)`, or
+  under `cfg_attr`);
+- the deletion of a whole module, its source file or its inline `mod` block, that nothing names
+  at the PR head outside comments and Markdown (`git grep -w <module> <head>` finds no other use),
+  when its lines name an item the surfaces below list only to use it (pass, match, or construct
+  its value) and define none of them, no surface below lists its file or a directory that holds
+  it, none of its items carries one of the attributes the item above lists, it defines every type
+  an `impl` block in it implements for, and it holds no `global_asm!` or `naked_asm!` invocation.
+  A crate root and a build script, which Cargo reaches without a name, are not such a module, and
+  any other changed line in a file that remains, the declaration that named the module included,
+  is judged on its own.
 
 A PR whose changes outside Markdown are all inert owes no local host run, whatever purpose it
 states. The surfaces below, and Repeat count, are judged on the non-inert lines only.

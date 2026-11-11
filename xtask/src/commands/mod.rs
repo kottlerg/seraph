@@ -9,6 +9,7 @@ pub mod build;
 pub mod clean;
 pub mod compose_bundle;
 pub mod hook;
+pub mod host;
 pub mod issue;
 pub mod ktest_timing;
 pub mod lint_docs;

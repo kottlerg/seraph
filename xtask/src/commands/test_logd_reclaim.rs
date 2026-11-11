@@ -208,6 +208,7 @@ fn boot(ctx: &Context, args: &TestLogdReclaimArgs) -> Result<PathBuf>
         second_disk: None,
         second_disk_block_size: None,
         second_disk_shared_line: false,
+        host: args.host.clone(),
     };
     step("logd reclaim test: booting the current sysroot (svctest staged)");
     crate::commands::run_parallel::run(ctx, &run)?;

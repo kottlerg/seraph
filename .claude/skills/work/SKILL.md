@@ -17,8 +17,8 @@ Read `.claude/agents/worker.md` and follow it in **standalone** mode, with these
 - The session's own model and effort do the work. The tiers of
   `.claude/agents/orchestrator.md` § Spawn say which fit the task; when the session runs
   above the tier the task needs, say so before starting, so the maintainer can restart it lower.
-- There is no exclusive grant. The launch checks of the worker file's § Host runs are the whole
-  protocol, and `nice` is optional.
+- There is no exclusive grant. The commands' launch rules (the worker file's § Host runs) are
+  the whole protocol, and `nice` is optional.
 - Reports and hand-backs are replies to the maintainer in this conversation: the plan before
   coding, the host-run results, each review's verdict lines verbatim, and the gate.
 - A decision the worker file routes to the orchestrator is the maintainer's: ask in the

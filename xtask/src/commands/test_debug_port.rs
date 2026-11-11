@@ -55,6 +55,8 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 pub fn run(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
+    // Held until the command returns, after its last QEMU has exited.
+    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let staged = ctx
         .sysroot
         .join("config")

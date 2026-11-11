@@ -167,8 +167,8 @@ Do not poll. Two things have no notification, and each has its own watch:
   to schedule one tick every two hours and forward it to you. A background task dies with the
   agent that owns it, so you own no tick and no CI watch: a tick is the supervisor's, a CI
   watch the worker's. The tick's prompt, for the supervisor: "Send the orchestrator the words
-  `grant watch`. Do nothing else." On it, run `cargo xtask orch state`, `cat /proc/loadavg`
-  and `pgrep -af qemu-system`. If the host is idle and the holder has not reported for longer
+  `grant watch`. Do nothing else." On it, run `cargo xtask orch state` and
+  `cargo xtask host status`. If the host is idle and the holder has not reported for longer
   than its runs should take, ask the holder for a status line. Log one line and take no other
   action. Ask the supervisor to cancel the tick when the grant ends.
 - **A worker that is gone.** When a worker's notification says its session ended without a
@@ -220,16 +220,18 @@ push over its replacement.
 
 The host is one machine. A boot at the boundary CPU counts (docs/testing.md § Coverage tiers)
 saturates it, and a second QEMU beside it produces hangs that then need classifying; two 4-CPU
-boots side by side do not. Builds and 4-CPU boots therefore take no grant: each worker launches
-them on the launch checks of `.claude/agents/worker.md` § Host runs. A boot of more than 4 vCPUs
-and any timing-sensitive measurement take the exclusive grant:
+boots side by side do not. Builds and 4-CPU boots therefore take no grant: the commands apply the
+host's launch rules themselves (`xtask/README.md` § Host launch rules). A boot of more than 4
+vCPUs and any timing-sensitive measurement take the exclusive grant:
 
 - A worker hands back the exact command list of its exclusive runs with an estimate. Answer
-  `host free` when no other grant is outstanding and the host is quiet (`cat /proc/loadavg`,
-  `pgrep -af qemu-system`), or queue it. Grant nothing beside an exclusive grant, and tell the
-  other workers to launch no boot until it ends. Never grant on an idle observation while a
-  grant is outstanding: the holder may be between steps. A grant ends when the holder reports
-  its results.
+  `host free`, naming the holder, when no other grant is outstanding and the host is quiet
+  (`cargo xtask host status`), or queue it. `cargo xtask orch grant set` also writes the grant
+  to the host lock, which then refuses every boot not passed `--grant <holder>`, and
+  `orch grant clear` removes it. Grant nothing beside an exclusive grant, and for a
+  timing-sensitive measurement tell the other workers to launch no build until it ends. Never
+  grant on an idle observation while a grant is outstanding: the holder may be between steps. A
+  grant ends when the holder reports its results.
 - Grant a speculative set (a run at a head that a sync still owed will change) only when the
   host is otherwise idle.
 - `master quiet` tells a worker to sync now, right before its validation runs, so one run

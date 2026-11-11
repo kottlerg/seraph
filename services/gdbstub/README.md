@@ -238,13 +238,14 @@ to the breakpoint's address, so the thread runs the restored bytes. It then send
 `DETACH_PROCESS`, which binds each listed thread of the target's whose exception class is bound
 under the debugger tag, is unbound, or is bound by procmgr under another badge back to the crash
 endpoint, leaves a thread bound to any other handler, binds no thread of a process declared
-undebuggable back but unbinds the debugger's binding on it, and unbinds each upcall class bound
-under the debugger tag, and does so as well when every thread has exited. The stub's own unbind of
-the upcall class after it changes nothing. The stub drops the thread caps and logs
-`detached from <name> (crash bindings restored: <bool>)`. The stub cannot restore the crash bindings
-itself, since it holds no SEND on procmgr's crash endpoint. A handler the target had bound on a
-thread's exception or upcall class itself, which the attach's bind replaced, is not bound back:
-procmgr restores its own bindings, not the target's
+undebuggable back but unbinds the debugger's binding on it, unless procmgr recorded that thread as
+the target's own at its registration ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md)
+§ Label 21), and unbinds each upcall class bound under the debugger tag, and does so as well when
+every thread has exited. The stub's own unbind of the upcall class after it changes nothing. The
+stub drops the thread caps and logs `detached from <name> (crash bindings restored: <bool>)`. The
+stub cannot restore the crash bindings itself, since it holds no SEND on procmgr's crash endpoint. A
+handler the target had bound on a thread's exception or upcall class itself, which the attach's bind
+replaced, is not bound back: procmgr restores its own bindings, not the target's
 ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md) § Label 24: `DETACH_PROCESS`).
 
 When the stub dies attached, procmgr restores the crash bindings the same way: the attach left it

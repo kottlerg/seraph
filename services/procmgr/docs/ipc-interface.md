@@ -892,22 +892,24 @@ rebinds it: another live process's when the binding is that process's badge, or 
 process's registry lists; unknown when the class is unbound; the sender's own otherwise (its process
 badge, a crash badge its own registry or no registry lists, the debugger tag, or another handler's
 badge). A restore reads it (Label 24). Another process's thread bound under its own process badge
-(that process's main thread, or a thread that copied it and has not registered yet) is listed in
-the sender's registry but not rebound. One bound under a crash badge is rebound into the sender's
-registry: that thread's faults then reach the crash service under a crash badge the sender's
-process holds, and are reported against the sender's image; the other process's `DECLARE_NO_DEBUG`
-still unbinds it while that process's registry holds it, since the declaration unbinds any crash
-badge (Label 21). So is one bound under the debugger tag while the sender has no debugger watch,
-whichever process's debugger bound it, since procmgr cannot tell; the sender's declaration
-(Label 21) and restore (Label 24) likewise treat a debugger's binding on such a thread as one on
-the sender's own, and procmgr records the thread as the sender's, as it does one under a crash
-badge no live registry lists. Such a cap comes
-from the other process itself, from a debug-authority holder's attach, or, for the other process's
-main thread alone, from its creation (`CREATE_PROCESS` and `CREATE_FROM_FILE` give the creator that
-cap), whose binding is its process badge, which procmgr does not rebind and records as that
-process's, or none once that process has declared itself undebuggable; so no process gains this
-over a spawned thread it was not given, and no restore of the creator's binds a declared child's
-main thread back (Label 24).
+(that process's main thread, or a thread that copied it and has not registered yet) is listed in the
+sender's registry but not rebound. One bound under a crash badge is rebound into the sender's
+registry: that thread's faults then reach the crash service under a crash badge the sender's process
+holds, and are reported against the sender's image; the other process's `DECLARE_NO_DEBUG` still
+unbinds it while that process's registry holds it, since the declaration unbinds any crash badge
+(Label 21). So is one bound under the debugger tag while the sender has no debugger watch, whichever
+process's debugger bound it, since procmgr cannot tell; the sender's declaration (Label 21) and
+restore (Label 24) likewise treat a debugger's binding on such a thread as one on the sender's own,
+and procmgr records the thread as the sender's, as it does one under a crash badge no live registry
+lists, so a restore of the sender's binds it back to the crash endpoint even once its own process
+has declared itself undebuggable (Label 21). Such a cap comes from the other process itself, from a
+debug-authority holder's attach, or, for the other process's main thread alone, from its creation
+(`CREATE_PROCESS` and `CREATE_FROM_FILE` give the creator that cap), whose binding is its process
+badge, which procmgr does not rebind and records as that process's, none once that process has
+declared itself undebuggable, or the debugger tag while a debugger attached to that process holds
+it. So no process gains this over a spawned thread it was not given, and no restore of the creator's
+binds a declared child's main thread back (Label 24) unless that thread carried the debugger tag
+when the creator registered it.
 
 Replies `SUCCESS`; refusals, in order: `INVALID_BADGE` when the badge names no live process, or the
 request came on a process handle (§ Messages);
@@ -970,7 +972,8 @@ debugger tag (Label 20), is unbound, or is bound by procmgr under another badge.
   other is bound back under that process's own badge from a debugger's binding alone.
 - Another process's once that process has declared itself undebuggable or is gone, or a thread
   whose class was unbound at its registration: never bound to the crash endpoint, and a debugger's
-  binding on it is unbound, so no restore makes a declared process debuggable again.
+  binding on it is unbound, so no restore binds a thread procmgr recorded as a declared process's
+  back.
 
 A thread bound to any other handler is left: one the target bound itself, or another process's
 thread bound under that process's own badge. Since procmgr tells whose a thread is by its binding at

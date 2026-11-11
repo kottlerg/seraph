@@ -513,8 +513,8 @@ impl ProcessTable
     ///   from a debugger's binding alone;
     /// * another process's that declared itself undebuggable or is gone, or
     ///   a thread unbound at its registration: never bound to the crash
-    ///   endpoint, so no restore makes a declared process debuggable again;
-    ///   a debugger's binding on it is unbound.
+    ///   endpoint, so no restore binds a thread recorded as a declared
+    ///   process's back; a debugger's binding on it is unbound.
     ///
     /// A badge that names no live process leaves every thread.
     #[must_use]

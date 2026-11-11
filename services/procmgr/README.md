@@ -308,8 +308,9 @@ so its threads send no `REGISTER_THREAD` and start without waiting on one
 The shared state is behind these locks:
 
 - The table lock guards the process table and the recent-exits ring (`process::Tables`). Its holder
-  makes only syscalls that do not block on another process; every IPC call, to memmgr, to a file
-  server, or to the crash decliner, is made after it is released.
+  makes syscalls that do not block on another process, and no IPC call but the two below; every
+  other call, to memmgr for a child, to a file server, or to the crash decliner, is made after it
+  is released.
 - The death-set lock guards the death queues and their wait set. A bind that grows the set funds
   the new queue or wait set from memmgr while it holds the lock; memmgr calls no procmgr label, so
   that call cannot wait on a lock procmgr holds.
@@ -320,6 +321,17 @@ The shared state is behind these locks:
   gone, so two registrations cannot both find no registrant. A registration holds it across its
   park call to the crash decliner, which answers without taking any lock.
 - The `CSpace` top-up lock (§ CSpace headroom) is only tried, never waited on.
+
+Under any of these locks, two IPC calls can still happen, each a departure from holding no lock
+across a call ([docs/ipc-design.md](../../docs/ipc-design.md) § Multi-threaded servers), stated
+where each lock is defined. A growth of procmgr's heap calls memmgr. A log line calls logd, bounded
+at `LOG_CALL_TIMEOUT_MS` (5 s), and at `LOG_CALL_UNANSWERED_TIMEOUT_MS` (10 ms) once a log call of
+procmgr's has gone unanswered ([docs/limits.md](../../docs/limits.md)). Neither memmgr nor logd
+calls a procmgr label, so neither call can wait on a lock procmgr holds. A wedged logd can still
+stall a lock's holder, and every worker that waits on the lock, for one 5 s call. So the log lines
+of the checks every worker makes before each request (a crash service gone, a debugger gone) are
+written after their locks are released, and the locks are held across a log line only on paths
+that are not taken on every request.
 
 The init-reap lock, then the death-set lock, is the only order in which two of them are held. The
 table lock is never held with the death-set lock: the reaper copies each pass's death events out

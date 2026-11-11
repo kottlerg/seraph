@@ -293,9 +293,12 @@ however the child granted a copy onward before it died, is refused
 be minted by a holder of an un-badged SEND on procmgr's endpoint, which only
 init and svcmgr hold (§ `REGISTER_INIT_TEARDOWN`).
 
-procmgr serves its requests in order, so a `DESTROY_PROCESS` the creator sends
-first has torn the child down, and parked its record, before the release is
-served, whether or not procmgr had reaped the child already. A release that
+procmgr replies to a `DESTROY_PROCESS` only once the child is torn down and its
+record parked, by whichever of its threads tore the child down, since a
+teardown takes the child's entry and parks its record in one hold of the table
+lock ([README.md](../README.md) § Concurrency). So a release the creator sends
+after the destroy's reply finds the record parked, whether or not procmgr had
+reaped the child already. A release that
 finds no held record changes nothing: the child is live, was never started or
 never held, or was released already. procmgr never hands a held record's badge
 to a new child.
@@ -439,7 +442,9 @@ unbound. `CREATE_PROCESS` ignores bit 17.
 The file cap's server is the caller's to choose, so procmgr bounds each call it makes on the file
 cap and on its open (`FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, `FS_CLOSE`) at
 `FILE_CAP_CALL_TIMEOUT_MS` (10 s): an `FS_OPEN` or a read the server has not answered by then fails
-the create with `IO_ERROR`, and an unanswered release or close is given up as a failed one is.
+the create with `IO_ERROR`, as a refused one does, whichever read it is (the ELF header, the
+relocation table, the stack-size note, a segment, or the `.tdata` template), and an unanswered
+release or close is given up as a failed one is.
 
 **Reply (success):** as for `CREATE_PROCESS` (cap[0] process handle, cap[1]
 child `Thread` cap, and, with `CREATE_DMA_HOLD`, cap[2] the release token),
@@ -451,10 +456,10 @@ included, as for `CREATE_PROCESS`.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed (the TLS block's checks aside; see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the main thread's TLS block could not be built (whatever the cause: an oversized or overaligned `PT_TLS`, a short `.tdata` read, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed (a failed read aside, see `IO_ERROR`; the TLS block's checks aside, see `OUT_OF_MEMORY`) |
+| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the main thread's TLS block could not be built (whatever the cause but a failed read: an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[31..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
-| 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
+| 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`; an `FS_READ` against procmgr's open (of the ELF header, the relocation table, the stack-size note, a segment's relocations, or the `.tdata` template and its relocations) failed or went unanswered for that long, or the `.tdata` template ended short; or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |

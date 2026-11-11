@@ -190,6 +190,10 @@ pub struct InitReapState
 /// The handoff: `Empty` until init's first `REGISTER_INIT_TEARDOWN`,
 /// `Collecting` while rounds arrive and the two init-thread deaths are
 /// counted, and `Reaped` (terminal) once `run_reap` has torn init down.
+/// A holder can make two IPC calls, departures from holding no lock across
+/// a call: a growth of procmgr's heap calls memmgr, and the log line of a
+/// refused round calls logd, bounded at `LOG_CALL_TIMEOUT_MS`. Neither
+/// memmgr nor logd calls procmgr, so neither call waits on the lock.
 static STATE: Mutex<InitReap<InitReapState>> = Mutex::new(InitReap::Empty);
 
 /// Reply to a refused handoff request and dispose of the caps it moved into
@@ -283,8 +287,10 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &Mutex<Death
     };
     if !bound
     {
-        std::os::seraph::log!("init-reap: thread_bind_notification failed; refusing handoff");
+        // The refusal and its log line follow the lock's release.
+        drop(guard);
         refuse(Refusal::Invalid(CapDisposition::Keep), caps, ipc_buf);
+        std::os::seraph::log!("init-reap: thread_bind_notification failed; refusing handoff");
         return;
     }
     guard.open(InitReapState {

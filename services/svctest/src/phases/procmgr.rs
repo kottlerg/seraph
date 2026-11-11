@@ -1001,7 +1001,12 @@ const STALLED_FILE_SIZE: u64 = 4096;
 /// The server never answers, and the stalled create must fail with
 /// `IO_ERROR` once procmgr's bound on the call passes
 /// (`FILE_CAP_CALL_TIMEOUT_MS`, services/procmgr/docs/ipc-interface.md
-/// § Label 13).
+/// § Label 13). A second stalled create runs beside it: its file server
+/// answers `FS_OPEN` and every `FS_READ` through the ELF header of
+/// `/programs/hello`, then leaves the next request unanswered, and that
+/// create must also fail with `IO_ERROR` under the same bound. After the
+/// stall a closer thread answers procmgr's `FS_CLOSE`, so the close does not
+/// wait out a second bound.
 pub fn procmgr_concurrent_spawn_phase(_: &Caps)
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -1060,6 +1065,8 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
         })
         .expect("procmgr_concurrent_spawn: create thread spawn failed");
 
+    let read_stall = ReadStall::start();
+
     let label = opened_rx
         .recv()
         .expect("procmgr_concurrent_spawn: the stalled server never reported");
@@ -1068,6 +1075,7 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
         ipc::fs_labels::FS_OPEN,
         "the stalled file server received label {label}, not FS_OPEN"
     );
+    let read_stall = read_stall.await_stall();
 
     let spawners: Vec<_> = (0..CONCURRENT_SPAWNERS)
         .map(|i| {
@@ -1105,6 +1113,7 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
         procmgr_errors::IO_ERROR,
         "a create whose FS_OPEN went unanswered replied {code}, not IO_ERROR"
     );
+    read_stall.finish();
     release_tx
         .send(())
         .expect("procmgr_concurrent_spawn: releasing the server failed");
@@ -1112,6 +1121,223 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
         .join()
         .expect("procmgr_concurrent_spawn: the stalled server panicked");
     let _ = syscall::cap_delete(endpoint);
+}
+
+/// The second stalled create of [`procmgr_concurrent_spawn_phase`]: a file
+/// server that serves `/programs/hello` through its ELF header and then
+/// leaves the next request unanswered.
+struct ReadStall
+{
+    endpoint: u64,
+    stalled_rx: std::sync::mpsc::Receiver<(u64, u64)>,
+    release_tx: std::sync::mpsc::Sender<()>,
+    server: std::thread::JoinHandle<()>,
+    create: std::thread::JoinHandle<u64>,
+}
+
+/// A [`ReadStall`] whose stalled request has been seen and whose closer runs.
+struct ReadStallHeld
+{
+    endpoint: u64,
+    release_tx: std::sync::mpsc::Sender<()>,
+    server: std::thread::JoinHandle<()>,
+    create: std::thread::JoinHandle<u64>,
+    closer: std::thread::JoinHandle<u64>,
+}
+
+impl ReadStall
+{
+    /// Start the file server and the create against it.
+    fn start() -> Self
+    {
+        use ipc::{IpcMessage, procmgr_labels};
+        use std::sync::mpsc;
+
+        let data = std::fs::read("/programs/hello")
+            .expect("procmgr_concurrent_spawn: reading /programs/hello failed");
+        let len = data.len() as u64;
+        let header = data.len().min(4096);
+
+        let endpoint =
+            std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+                syscall::cap_create_endpoint(slab).ok()
+            })
+            .expect("procmgr_concurrent_spawn: read-stall endpoint creation failed");
+        let derive = || {
+            syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND)
+                .expect("procmgr_concurrent_spawn: deriving a read-stall cap failed")
+        };
+        let node = derive();
+        let open = derive();
+        let liveness = derive();
+
+        let (stalled_tx, stalled_rx) = mpsc::channel::<(u64, u64)>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let server = std::thread::Builder::new()
+            .name("read-stall-fs".into())
+            .spawn(move || {
+                let ipc_buf = std::os::seraph::current_ipc_buf();
+                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+                    .expect("read-stall file server: FS_OPEN receive failed");
+                for &cap in req.caps()
+                {
+                    let _ = syscall::cap_delete(cap);
+                }
+                let opened = IpcMessage::builder(0).cap(open).cap(liveness).build();
+                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                unsafe { ipc::ipc_reply(&opened, ipc_buf) }
+                    .expect("read-stall file server: FS_OPEN reply failed");
+
+                let mut served = 0usize;
+                while served < header
+                {
+                    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                    let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+                        .expect("read-stall file server: FS_READ receive failed");
+                    assert_eq!(
+                        req.label,
+                        ipc::fs_labels::FS_READ,
+                        "read-stall file server received label {} before the header was served",
+                        req.label
+                    );
+                    let size = data.len();
+                    let start = usize::try_from(req.word(0)).map_or(size, |o| o.min(size));
+                    let n = usize::try_from(req.word(1))
+                        .unwrap_or(usize::MAX)
+                        .min(504)
+                        .min(size - start);
+                    let reply = IpcMessage::builder(0)
+                        .word(0, n as u64)
+                        .bytes(1, &data[start..start + n])
+                        .build();
+                    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                    unsafe { ipc::ipc_reply(&reply, ipc_buf) }
+                        .expect("read-stall file server: FS_READ reply failed");
+                    if n == 0
+                    {
+                        // A read at the end of the file: the header is all
+                        // procmgr reads before its next request.
+                        break;
+                    }
+                    served += n;
+                }
+
+                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+                    .expect("read-stall file server: stalled receive failed");
+                stalled_tx
+                    .send((req.label, req.word(0)))
+                    .expect("read-stall file server: report failed");
+                release_rx
+                    .recv()
+                    .expect("read-stall file server: release failed");
+            })
+            .expect("procmgr_concurrent_spawn: read-stall server thread spawn failed");
+
+        let create = std::thread::Builder::new()
+            .name("read-stall-create".into())
+            .spawn(move || {
+                let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+                    .word(0, len)
+                    .cap(node)
+                    .build();
+                // SAFETY: `current_ipc_buf` is this thread's registered IPC
+                // buffer page.
+                unsafe {
+                    ipc::ipc_call(
+                        startup_info().procmgr_endpoint,
+                        &create,
+                        std::os::seraph::current_ipc_buf(),
+                    )
+                }
+                .expect("read-stall CREATE_FROM_FILE call failed")
+                .label
+            })
+            .expect("procmgr_concurrent_spawn: read-stall create thread spawn failed");
+
+        Self {
+            endpoint,
+            stalled_rx,
+            release_tx,
+            server,
+            create,
+        }
+    }
+
+    /// Wait for the stalled request, check it, and start the closer that
+    /// answers procmgr's `FS_CLOSE`.
+    fn await_stall(self) -> ReadStallHeld
+    {
+        let (label, offset) = self
+            .stalled_rx
+            .recv()
+            .expect("procmgr_concurrent_spawn: the read-stall server never reported");
+        assert_eq!(
+            label,
+            ipc::fs_labels::FS_READ,
+            "the read-stall file server held label {label} at offset {offset}, not FS_READ"
+        );
+        let endpoint = self.endpoint;
+        let closer = std::thread::Builder::new()
+            .name("read-stall-closer".into())
+            .spawn(move || {
+                let ipc_buf = std::os::seraph::current_ipc_buf();
+                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+                    .expect("read-stall closer: receive failed");
+                for &cap in req.caps()
+                {
+                    let _ = syscall::cap_delete(cap);
+                }
+                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf) }
+                    .expect("read-stall closer: reply failed");
+                req.label
+            })
+            .expect("procmgr_concurrent_spawn: read-stall closer thread spawn failed");
+        ReadStallHeld {
+            endpoint,
+            release_tx: self.release_tx,
+            server: self.server,
+            create: self.create,
+            closer,
+        }
+    }
+}
+
+impl ReadStallHeld
+{
+    /// Check the create's reply and the close, release the server, join every
+    /// thread, and delete the endpoint.
+    fn finish(self)
+    {
+        let code = self
+            .create
+            .join()
+            .expect("procmgr_concurrent_spawn: the read-stall create panicked");
+        assert_eq!(
+            code,
+            ipc::procmgr_errors::IO_ERROR,
+            "a create whose FS_READ after the header went unanswered replied {code}, not IO_ERROR"
+        );
+        let closed = self
+            .closer
+            .join()
+            .expect("procmgr_concurrent_spawn: the read-stall closer panicked");
+        assert_eq!(
+            closed,
+            ipc::fs_labels::FS_CLOSE,
+            "the read-stall closer received label {closed}, not FS_CLOSE"
+        );
+        self.release_tx
+            .send(())
+            .expect("procmgr_concurrent_spawn: releasing the read-stall server failed");
+        self.server
+            .join()
+            .expect("procmgr_concurrent_spawn: the read-stall server panicked");
+        let _ = syscall::cap_delete(self.endpoint);
+    }
 }
 
 /// A cap to attach to a request: a SEND copy of svctest's own procmgr cap,

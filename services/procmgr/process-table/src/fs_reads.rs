@@ -16,7 +16,70 @@
 //! [`read_memory_reply_caps`] splits an `FS_READ_MEMORY` reply's caps into
 //! the cache-page cap procmgr keeps and the surplus it deletes.
 
+use core::cell::Cell;
 use core::ops::Range;
+
+use ipc::procmgr_errors;
+
+/// Whether any read of a create's file failed: the server refused it, or
+/// did not answer within procmgr's bound on a file-cap call.
+///
+/// procmgr passes every `FS_READ` it makes past the ELF header through
+/// [`ReadFailures::note`]. The parsers those reads feed report a failed read
+/// as they report a malformed image, or, for the stack note, as no note, so
+/// [`ReadFailures::code`] turns the reply code of a create that fails after
+/// a failed read into `IO_ERROR`, and [`ReadFailures::failed`] fails a
+/// create a failed read did not otherwise stop
+/// (`services/procmgr/docs/ipc-interface.md` § Label 13).
+#[derive(Default)]
+pub struct ReadFailures
+{
+    failed: Cell<bool>,
+}
+
+impl ReadFailures
+{
+    /// No read has failed yet.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            failed: Cell::new(false),
+        }
+    }
+
+    /// Pass a read's result through, noting a failure (`None`).
+    pub fn note<T>(&self, read: Option<T>) -> Option<T>
+    {
+        if read.is_none()
+        {
+            self.failed.set(true);
+        }
+        read
+    }
+
+    /// Whether a read noted so far failed.
+    #[must_use]
+    pub fn failed(&self) -> bool
+    {
+        self.failed.get()
+    }
+
+    /// The reply code for a create that fails with `code` after the reads
+    /// noted so far: `IO_ERROR` when one of them failed, `code` otherwise.
+    #[must_use]
+    pub fn code(&self, code: u64) -> u64
+    {
+        if self.failed()
+        {
+            procmgr_errors::IO_ERROR
+        }
+        else
+        {
+            code
+        }
+    }
+}
 
 /// Fill `dst` from file offset `off` through `read`, one request at a time.
 ///
@@ -148,6 +211,52 @@ mod tests
     {
         let mut dst = [0u8; 10];
         assert_eq!(fill_exact(&mut dst, 0, 4, |_, _| None), None);
+    }
+
+    #[test]
+    fn read_failures_keeps_the_code_while_every_read_succeeds()
+    {
+        let reads = ReadFailures::new();
+        assert_eq!(reads.note(Some(4)), Some(4));
+        assert!(!reads.failed());
+        assert_eq!(
+            reads.code(procmgr_errors::INVALID_ELF),
+            procmgr_errors::INVALID_ELF
+        );
+    }
+
+    #[test]
+    fn read_failures_answers_io_error_once_a_read_failed()
+    {
+        let reads = ReadFailures::new();
+        assert_eq!(reads.note::<usize>(None), None);
+        // A later read that succeeds does not clear the failure.
+        assert_eq!(reads.note(Some(1)), Some(1));
+        assert!(reads.failed());
+        assert_eq!(
+            reads.code(procmgr_errors::INVALID_ELF),
+            procmgr_errors::IO_ERROR
+        );
+        assert_eq!(
+            reads.code(procmgr_errors::OUT_OF_MEMORY),
+            procmgr_errors::IO_ERROR
+        );
+    }
+
+    #[test]
+    fn read_failures_notes_a_failure_inside_fill_exact()
+    {
+        // The reader procmgr hands a parser: fill_exact over a server that
+        // answers one chunk and then fails.
+        let reads = ReadFailures::new();
+        let mut dst = [0u8; 16];
+        let mut calls = 0usize;
+        let got = reads.note(fill_exact(&mut dst, 0, 8, |_, buf| {
+            calls += 1;
+            (calls == 1).then_some(buf.len())
+        }));
+        assert_eq!(got, None);
+        assert!(reads.failed());
     }
 
     #[test]

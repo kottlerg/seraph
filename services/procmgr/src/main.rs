@@ -215,7 +215,13 @@ fn reap_loop(ctx: &ProcmgrCtx) -> !
 fn reap_checks(ctx: &ProcmgrCtx)
 {
     crash::check_registrant();
-    process::check_debuggers(&mut ctx.tables.lock().table);
+    // The guard drops at the end of the statement, so the log lines below
+    // follow the lock's release.
+    let restored = process::check_debuggers(&mut ctx.tables.lock().table);
+    for _ in 0..restored
+    {
+        std::os::seraph::log!("debugger gone; crash bindings restored");
+    }
 }
 
 /// Lock `mutex`, taking a poisoned lock as it is: procmgr is built with
@@ -491,8 +497,9 @@ static HEADROOM_WARNED: Mutex<bool> = Mutex::new(false);
 /// names only the first failure of a streak.
 fn hold_cspace_headroom(self_cspace: u64)
 {
-    // The top-up is an IPC call to memmgr made under this lock, which no
-    // other lock nests and no thread waits on (`try_lock`).
+    // The top-up (a call to memmgr) and the failure's log line (a call to
+    // logd) are IPC calls made under this lock, which no other lock nests
+    // and no thread waits on (`try_lock`).
     let Ok(mut warned) = HEADROOM_WARNED.try_lock()
     else
     {
@@ -645,7 +652,8 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         procmgr_labels::CONFIGURE_PIPE =>
         {
             // Maps the child's ProcessInfo page and copies caps into its
-            // CSpace: syscalls only, under the table lock.
+            // CSpace: syscalls, and a failed copy's log line, under the
+            // table lock (services/procmgr/README.md § Concurrency).
             handle_configure_pipe(&req, ipc_buf, ctx.self_aspace, &mut ctx.tables.lock().table);
         }
 
@@ -757,7 +765,8 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 /// and `REGISTER_THREAD`, and answer any other opcode `UNKNOWN_OPCODE`,
 /// deleting the caps it carried. Every label but `REGISTER_CRASH_SERVICE`,
 /// which reads no table and calls the crash decliner, is served under the
-/// table lock: each makes syscalls only, its reply among them.
+/// table lock: each makes syscalls, its reply among them, and a failed
+/// rebind's log line (services/procmgr/README.md § Concurrency).
 fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables)
 {
     let label = req.label & 0xFFFF;
@@ -857,18 +866,18 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
     release_caps(extra);
     match crash::register(thread, ipc_buf)
     {
-        Ok(recv) =>
+        Ok(registered) =>
         {
             let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
-                .cap(recv)
+                .cap(registered.recv)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer page.
             if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
             {
                 // The caller holds no RECV cap, so the registration is
                 // undone and the decliner receives again.
-                let _ = syscall::cap_delete(recv);
-                crash::unregister();
+                let _ = syscall::cap_delete(registered.recv);
+                crash::unregister(&registered);
                 std::os::seraph::log!("crash service reply undeliverable; registration undone");
                 return;
             }

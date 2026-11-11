@@ -28,12 +28,15 @@
 //! run on procmgr's request workers and on its reaper thread, so each holds
 //! [`REGISTRATION`] throughout: two registrations cannot both find no
 //! registrant, and a check cannot take back a registration whose park call
-//! is still in flight.
+//! is still in flight. An undoing runs after its registration released the
+//! lock, so it names the registration by its generation ([`Registered`]) and
+//! undoes nothing once a check has taken that one back.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use ipc::IpcMessage;
+use process_table::crash_registrant::Registrant;
 use syscall_abi::{FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL};
 
 /// The label of the handover message a procmgr request worker sends the
@@ -49,18 +52,16 @@ static ENDPOINT: AtomicU64 = AtomicU64::new(0);
 /// The notification the parked decliner waits on.
 static WAKE: AtomicU64 = AtomicU64::new(0);
 
-/// The registered crash service's Thread cap, in procmgr's `CSpace`; 0 while
-/// none is registered. Written only under [`REGISTRATION`].
-static REGISTRANT: AtomicU64 = AtomicU64::new(0);
+/// The registered crash service: its Thread cap in procmgr's `CSpace` and
+/// its registration's generation ([`Registrant`]). Held by [`register`],
+/// [`unregister`] and [`check_registrant`] for their whole run, apart from
+/// their log lines, which follow its release. [`register`] holds it across
+/// its park call to the decliner, a lock held across an IPC call: the
+/// decliner, procmgr's own thread, answers that call without taking any
+/// lock, so the call cannot wait on the lock's holder.
+static REGISTRATION: Mutex<Registrant> = Mutex::new(Registrant::new());
 
-/// Held by [`register`], [`unregister`] and [`check_registrant`] for their
-/// whole run. [`register`] holds it across its park call to the decliner,
-/// a lock held across an IPC call: the decliner, procmgr's own thread,
-/// answers that call without taking any lock, so the call cannot wait on
-/// the lock's holder.
-static REGISTRATION: Mutex<()> = Mutex::new(());
-
-fn lock_registration() -> MutexGuard<'static, ()>
+fn lock_registration() -> MutexGuard<'static, Registrant>
 {
     REGISTRATION.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -172,6 +173,15 @@ pub enum RegisterRefusal
     OutOfSlots,
 }
 
+/// A registration [`register`] made: the `RECV` cap to reply with, and the
+/// generation [`unregister`] undoes it by.
+pub struct Registered
+{
+    /// The `RECV` cap on the crash endpoint, in procmgr's `CSpace`.
+    pub recv: u64,
+    generation: u64,
+}
+
 /// Register the crash service whose main thread `thread_cap` names (moved
 /// into procmgr's `CSpace` by the request): park the decliner, then return
 /// the `RECV` cap on the crash endpoint to reply with. `thread_cap` is kept
@@ -182,7 +192,7 @@ pub enum RegisterRefusal
 ///
 /// # Errors
 /// The [`RegisterRefusal`] that refuses it.
-pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<u64, RegisterRefusal>
+pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<Registered, RegisterRefusal>
 {
     let ep = endpoint();
     if ep == 0 || thread_cap == 0
@@ -190,9 +200,27 @@ pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<u64, RegisterRefus
         delete_nonzero(thread_cap);
         return Err(RegisterRefusal::NoEndpointOrThread);
     }
-    let _registration = lock_registration();
-    take_back_if_gone();
-    if REGISTRANT.load(Ordering::Acquire) != 0
+    let mut registration = lock_registration();
+    let took_back = take_back_if_gone(&mut registration);
+    let registered = register_locked(&mut registration, ep, thread_cap, ipc_buf);
+    drop(registration);
+    if took_back
+    {
+        log_taken_back();
+    }
+    registered
+}
+
+/// [`register`]'s registration, on the [`REGISTRATION`] record the caller
+/// holds locked, once the endpoint is known to exist.
+fn register_locked(
+    registrant: &mut Registrant,
+    ep: u64,
+    thread_cap: u64,
+    ipc_buf: *mut u64,
+) -> Result<Registered, RegisterRefusal>
+{
+    if registrant.thread() != 0
     {
         delete_nonzero(thread_cap);
         return Err(RegisterRefusal::Present);
@@ -212,8 +240,8 @@ pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<u64, RegisterRefus
         delete_nonzero(thread_cap);
         return Err(RegisterRefusal::OutOfSlots);
     }
-    REGISTRANT.store(thread_cap, Ordering::Release);
-    Ok(recv)
+    let generation = registrant.register(thread_cap);
+    Ok(Registered { recv, generation })
 }
 
 /// Take the receive side back when the registered crash service is gone:
@@ -225,18 +253,24 @@ pub fn register(thread_cap: u64, ipc_buf: *mut u64) -> Result<u64, RegisterRefus
 /// the worker that destroys a process calls it after the teardown.
 pub fn check_registrant()
 {
-    let _registration = lock_registration();
-    take_back_if_gone();
+    let mut registration = lock_registration();
+    let took_back = take_back_if_gone(&mut registration);
+    drop(registration);
+    if took_back
+    {
+        log_taken_back();
+    }
 }
 
-/// [`check_registrant`]'s check, under [`REGISTRATION`], which the caller
-/// holds.
-fn take_back_if_gone()
+/// [`check_registrant`]'s check, on the [`REGISTRATION`] record the caller
+/// holds locked. Returns whether it took the endpoint back, which the caller
+/// logs ([`log_taken_back`]) once it releases the lock.
+fn take_back_if_gone(registrant: &mut Registrant) -> bool
 {
-    let thread = REGISTRANT.load(Ordering::Acquire);
+    let thread = registrant.thread();
     if thread == 0
     {
-        return;
+        return false;
     }
     let gone = match syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
     {
@@ -245,30 +279,38 @@ fn take_back_if_gone()
     };
     if gone
     {
-        take_back(thread);
-        std::os::seraph::log!("crash service gone; declining faults again");
+        release(registrant.take_back());
     }
+    gone
 }
 
-/// Undo a registration whose `RECV` cap never reached the service (the
-/// reply carrying it failed): forget the registrant and give the endpoint
-/// back to the decliner, so no fault waits on a receiver that holds nothing.
-pub fn unregister()
+/// The log line of a take-back [`take_back_if_gone`] made, logged after
+/// [`REGISTRATION`] is released.
+fn log_taken_back()
 {
-    let _registration = lock_registration();
-    let thread = REGISTRANT.load(Ordering::Acquire);
+    std::os::seraph::log!("crash service gone; declining faults again");
+}
+
+/// Undo `registered`, whose `RECV` cap never reached the service (the reply
+/// carrying it failed): forget the registrant and give the endpoint back to
+/// the decliner, so no fault waits on a receiver that holds nothing. A
+/// registration a check has already taken back, and any registration made
+/// after it, is left as it is.
+pub fn unregister(registered: &Registered)
+{
+    let mut registration = lock_registration();
+    let thread = registration.take_back_generation(registered.generation);
     if thread != 0
     {
-        take_back(thread);
+        release(thread);
     }
 }
 
-/// Forget the registrant `thread`, delete its cap, and wake the parked
-/// decliner, which receives again, the faults queued for the service first.
-/// The caller holds [`REGISTRATION`].
-fn take_back(thread: u64)
+/// Delete `thread`, the cap of a registrant just taken back, and wake the
+/// parked decliner, which receives again, the faults queued for the service
+/// first. The caller holds [`REGISTRATION`], under which it took it back.
+fn release(thread: u64)
 {
-    REGISTRANT.store(0, Ordering::Release);
     let _ = syscall::cap_delete(thread);
     let _ = syscall::notification_send(WAKE.load(Ordering::Acquire), 1);
 }

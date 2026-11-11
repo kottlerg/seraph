@@ -130,7 +130,11 @@ impl Drop for BadgeReservation<'_>
 /// procmgr's process table and recent-exits ring, behind the one lock its
 /// request workers and its reaper share (`services/procmgr/README.md`
 /// § Concurrency). Every holder of the lock makes only syscalls that do not
-/// block on another process; an IPC call is made after the lock is released.
+/// block on another process, and an IPC call is made after the lock is
+/// released, with two departures: a growth of procmgr's heap calls memmgr,
+/// and a log line calls logd, bounded at `LOG_CALL_TIMEOUT_MS`. Neither
+/// memmgr nor logd calls procmgr, so neither call waits on the lock; the
+/// checks every worker makes before each request log after the release.
 pub struct Tables
 {
     state: Mutex<TableState>,
@@ -2431,8 +2435,10 @@ pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
 /// worker calls it before it serves each request, since a watch thread other
 /// than its process's main thread posts no death when it exits; and the
 /// worker that serves a `DESTROY_PROCESS` calls it after the teardown. Each
-/// caller holds the table lock.
-pub fn check_debuggers(table: &mut ProcessTable)
+/// caller holds the table lock, and logs a line for each process restored,
+/// whose count this returns, once it releases the lock.
+#[must_use]
+pub fn check_debuggers(table: &mut ProcessTable) -> usize
 {
     let mut gone: Vec<u64> = Vec::new();
     table.for_each(|e| {
@@ -2441,11 +2447,11 @@ pub fn check_debuggers(table: &mut ProcessTable)
             gone.push(e.badge);
         }
     });
-    for badge in gone
+    for &badge in &gone
     {
-        std::os::seraph::log!("debugger gone; crash bindings restored");
         restore_crash_bindings(table, badge);
     }
+    gone.len()
 }
 
 /// Keep `debugger`, the main-thread cap of the debugger an `ATTACH_PROCESS`
@@ -3512,14 +3518,17 @@ fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
 /// # Errors
 /// The `CREATE_FROM_FILE` reply code § Label 13 of
 /// `services/procmgr/docs/ipc-interface.md` names for the failure:
-/// - `procmgr_errors::IO_ERROR` (10) — the `FS_OPEN` of `file_cap` failed, the
-///   ELF header could not be read, or a segment's file bytes did not all
-///   arrive;
+/// - `procmgr_errors::IO_ERROR` (10) — the `FS_OPEN` of `file_cap` failed, an
+///   `FS_READ` of the file failed (a refused or an unanswered one: the ELF
+///   header, the relocation table, the stack-size note, a segment's
+///   relocations, or the `.tdata` template and its relocations), or a
+///   segment's file bytes did not all arrive;
 /// - `procmgr_errors::INVALID_ELF` (1) — `file_size` is zero, or ELF
-///   validation or relocation failed;
+///   validation or relocation failed with every read answered;
 /// - `procmgr_errors::OUT_OF_MEMORY` (2) — a memory-cap, kernel-object, or
-///   badge allocation failed, the main thread's TLS block could not be built,
-///   or the stack or IPC-buffer pages could not be mapped;
+///   badge allocation failed, the main thread's TLS block could not be built
+///   for a cause other than a failed read, or the stack or IPC-buffer pages
+///   could not be mapped;
 /// - `procmgr_errors::MAP_FAILED` (11) — mapping failed during segment load;
 /// - `procmgr_errors::INSUFFICIENT_RIGHTS` (12) — a rights derivation failed
 ///   during segment load;
@@ -3621,6 +3630,10 @@ pub fn create_process_from_file(
     // header page.
     let header_len =
         vfs_read_exact(file_cap.cap(), ipc_buf, 0, hdr_page).ok_or(procmgr_errors::IO_ERROR)?;
+    // Every later read goes through `reads`: the parsers it feeds report a
+    // failed read as a malformed image or as no stack note, and a failed
+    // read, an unanswered one included, fails the create with `IO_ERROR`.
+    let reads = process_table::fs_reads::ReadFailures::new();
 
     // Parse ELF headers from the header page.
     let header_data: &[u8] = &hdr_page[..header_len];
@@ -3656,9 +3669,9 @@ pub fn create_process_from_file(
     let rela = if kind == elf::ElfKind::Dyn
     {
         elf::rela_table_metadata(ehdr, header_data, file_size, |off, dst| {
-            vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)
+            reads.note(vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
         })
-        .map_err(|_| procmgr_errors::INVALID_ELF)?
+        .map_err(|_| reads.code(procmgr_errors::INVALID_ELF))?
     }
     else
     {
@@ -3672,10 +3685,10 @@ pub fn create_process_from_file(
             let count = walk_relocs_streaming(
                 t,
                 machine,
-                |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+                |off, dst| reads.note(vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
                 |r| in_span &= elf::reloc_target_in_span(r, span_min, span_end),
             )
-            .ok_or(procmgr_errors::INVALID_ELF)?;
+            .ok_or_else(|| reads.code(procmgr_errors::INVALID_ELF))?;
             if !in_span
             {
                 return Err(procmgr_errors::INVALID_ELF);
@@ -3695,13 +3708,18 @@ pub fn create_process_from_file(
     // section are fetched on demand via `vfs_read`; the helper hands a
     // closure that drives the same primitive used to stream `PT_LOAD`
     // pages, so no extra IPC machinery is involved.
-    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
+    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary. A
+    // failed read reads as no note, so it is checked apart.
     let stack_pages = resolve_stack_pages(elf::parse_stack_note_streaming(
         ehdr,
         file_size,
-        |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+        |off, dst| reads.note(vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
     ))
-    .ok_or(procmgr_errors::INVALID_ELF)?;
+    .ok_or_else(|| reads.code(procmgr_errors::INVALID_ELF))?;
+    if reads.failed()
+    {
+        return Err(procmgr_errors::IO_ERROR);
+    }
     let layout = choose_child_layout();
 
     // The three child kernel-object caps, guarded from creation so
@@ -3761,13 +3779,19 @@ pub fn create_process_from_file(
                         && let Some(t) = &rela
                     {
                         let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
-                        // A read failure mid-walk leaves records unapplied; the
-                        // applied-count check below then rejects the spawn.
+                        // A read failure mid-walk leaves records unapplied;
+                        // `reads` notes it, and the check after the loop fails
+                        // the spawn.
                         let _ = walk_relocs_streaming(
                             t,
                             machine,
                             |off, dst| {
-                                vfs_read_exact(load_ctx.file_cap, load_ctx.ipc_buf, off, dst)
+                                reads.note(vfs_read_exact(
+                                    load_ctx.file_cap,
+                                    load_ctx.ipc_buf,
+                                    off,
+                                    dst,
+                                ))
                             },
                             |r| {
                                 applied_relocs +=
@@ -3781,6 +3805,10 @@ pub fn create_process_from_file(
         // A segment whose file bytes did not all arrive would run with a
         // zeroed tail; the spawn fails instead.
         streamed?;
+    }
+    if reads.failed()
+    {
+        return Err(procmgr_errors::IO_ERROR);
     }
     // Every pre-validated record must have landed in exactly one segment;
     // a shortfall means a target in a gap between segments or a lost read.
@@ -3831,7 +3859,9 @@ pub fn create_process_from_file(
                         let _ = walk_relocs_streaming(
                             t,
                             machine,
-                            |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+                            |off, dst| {
+                                reads.note(vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
+                            },
                             |r| {
                                 let _ = elf::apply_reloc_in_span(r, bias, seg.vaddr, template);
                             },
@@ -3840,15 +3870,31 @@ pub fn create_process_from_file(
                 },
             )
         }
-        // § Label 13 answers every failure of the main thread's TLS block
-        // `OUT_OF_MEMORY`, whatever cause the helper reports.
-        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
+        // § Label 13 answers a failure of the main thread's TLS block
+        // `IO_ERROR` when a read of the file failed, and `OUT_OF_MEMORY`
+        // whatever other cause the helper reports.
+        .map_err(|e| {
+            if e == procmgr_errors::IO_ERROR
+            {
+                e
+            }
+            else
+            {
+                reads.code(procmgr_errors::OUT_OF_MEMORY)
+            }
+        })?
     }
     else
     {
         MainTls::default()
     };
     let main_tls_memory_guard = CapGuard::new(main_tls.memory_cap);
+    // A failed read in the template's relocation walk leaves `.tdata`
+    // records unapplied, which the walk does not report.
+    if reads.failed()
+    {
+        return Err(procmgr_errors::IO_ERROR);
+    }
 
     // Disarm and consume the file cap: success-path `vfs_close` issues
     // FS_CLOSE and deletes the slots. From here on `file_cap` is no longer

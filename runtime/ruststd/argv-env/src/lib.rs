@@ -15,7 +15,9 @@
 //! [`fill_window`] (one chunk of the packed run),
 //! [`next_field`] and [`prev_field`] (one NUL-terminated field, from the
 //! front or the back), [`bounded_fields`] (the span of a declared field
-//! count), and [`split_key_value`] (a `KEY=VALUE` split on the first `=`) —
+//! count), [`split_key_value`] (a `KEY=VALUE` split on the first `=`), and
+//! [`env_value`] (one key's value, which `_start` reads before the heap
+//! exists) —
 //! so the
 //! parse of spawner-supplied bytes is host-testable rather than entangled
 //! with the overlay's `OsString` glue. The crate performs no I/O and
@@ -163,6 +165,31 @@ pub fn split_key_value(entry: &[u8]) -> Option<(&[u8], &[u8])>
 {
     let eq = entry.iter().position(|&b| b == b'=')?;
     Some((&entry[..eq], &entry[eq + 1..]))
+}
+
+/// The value of `key` among the first `count` entries of an env blob, or
+/// None when no entry names it. When several do, the last wins, as it does
+/// in the map `std::env` seeds from the same walk.
+#[must_use]
+pub fn env_value<'a>(blob: &'a [u8], count: usize, key: &[u8]) -> Option<&'a [u8]>
+{
+    let mut cursor = 0;
+    let mut found = None;
+    for _ in 0..count
+    {
+        let Some((entry, next)) = next_field(blob, cursor)
+        else
+        {
+            break;
+        };
+        if let Some((k, v)) = split_key_value(entry)
+            && k == key
+        {
+            found = Some(v);
+        }
+        cursor = next;
+    }
+    found
 }
 
 #[cfg(test)]
@@ -409,5 +436,22 @@ mod tests
         let (k, v) = split_key_value(b"=V").expect("split");
         assert_eq!(k, b"");
         assert_eq!(v, b"V");
+    }
+
+    #[test]
+    fn env_value_finds_a_key_and_the_last_entry_wins()
+    {
+        let blob = b"A=1\0SERAPH_LOG=warn\0B\0SERAPH_LOG=debug\0";
+        assert_eq!(env_value(blob, 4, b"SERAPH_LOG"), Some(&b"debug"[..]));
+        assert_eq!(env_value(blob, 4, b"A"), Some(&b"1"[..]));
+        assert_eq!(env_value(blob, 4, b"C"), None);
+    }
+
+    #[test]
+    fn env_value_reads_only_the_declared_entries()
+    {
+        let blob = b"A=1\0SERAPH_LOG=warn\0";
+        assert_eq!(env_value(blob, 1, b"SERAPH_LOG"), None);
+        assert_eq!(env_value(blob, 9, b"SERAPH_LOG"), Some(&b"warn"[..]));
     }
 }

@@ -103,7 +103,10 @@ pub static FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 ///
 /// Prints `ktest: RUN <name>` before the body, then one line per test:
 /// `ktest: PASS <name>` or `ktest: FAIL <name>` followed by the failure
-/// reason. Tests always continue past failures. The RUN line means a test
+/// reason. Tests always continue past failures. Before that line it checks
+/// the frame pool's entries (`frame_pool::check_slots`), which logs a
+/// `ktest: BUG frame pool entry changed` line for each entry the test, or a
+/// stray write during it, changed. The RUN line means a test
 /// that hangs identifies itself in the serial log instead of leaving only
 /// the previous test's PASS line as the last output.
 ///
@@ -116,6 +119,7 @@ macro_rules! run_test {
     ($name:literal, $body:expr) => {{
         $crate::log(concat!("ktest: RUN ", $name));
         let result: $crate::TestResult = { $body };
+        $crate::frame_pool::check_slots();
         match result
         {
             Ok(()) =>
@@ -135,8 +139,8 @@ macro_rules! run_test {
 
 /// Run a named integration test and update the global pass/fail counters.
 ///
-/// Like [`run_test!`] but emits a `"ktest: <name> starting"` line before
-/// running the test body. Integration tests typically emit step-by-step
+/// Like [`run_test!`] (the frame-pool check included) but emits a
+/// `"ktest: <name> starting"` line before running the test body. Integration tests typically emit step-by-step
 /// progress logs from within their body; the starting line marks their
 /// beginning and the PASS/FAIL line marks their end.
 ///
@@ -149,6 +153,7 @@ macro_rules! run_integration_test {
     ($name:literal, $body:expr) => {{
         $crate::log(concat!("ktest: ", $name, " starting"));
         let result: $crate::TestResult = { $body };
+        $crate::frame_pool::check_slots();
         match result
         {
             Ok(()) =>

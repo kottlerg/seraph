@@ -2779,6 +2779,9 @@ fn create_process_from_bytes(
 /// cannot be mapped, else `create_process_from_bytes`'s. The `CREATE_PROCESS`
 /// handler answers every one `OUT_OF_MEMORY`, as § Label 1 of
 /// `services/procmgr/docs/ipc-interface.md` names it.
+// too_many_arguments: each argument is a distinct capability, table or child
+// parameter the caller already holds separately; a struct bundling them would
+// serve this one call only.
 #[allow(clippy::too_many_arguments)]
 pub fn create_process(
     module_memory_cap: u64,

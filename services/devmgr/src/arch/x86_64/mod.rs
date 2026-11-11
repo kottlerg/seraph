@@ -7,6 +7,7 @@
 
 use ipc::IpcMessage;
 
+use crate::IrqRangeAllocator;
 use crate::caps::DevmgrCaps;
 use crate::reply_status;
 use crate::tables::{locate_table_by_sig, with_acpi_table};
@@ -18,8 +19,8 @@ pub struct ArchCaps
 {
     // Full-rights derivation of init's root `IoPort` cap, delivered as the
     // `SVCMGR_BUNDLE` round's shutdown-authority cap. devmgr derives
-    // per-driver narrow copies for ISA peripherals (CMOS RTC at ports
-    // 0x70-0x71; COM1 at 0x3F8-0x3FF for serial) and, on
+    // the narrow copy of each `IoPort` resource of a platform record it
+    // binds and, on
     // `QUERY_SHUTDOWN_DEVICE`, the PM1a + 8042-reset ports for pwrmgr.
     ioport_cap: u64,
 }
@@ -51,22 +52,12 @@ pub fn platform_default_ecam() -> Option<EcamLocation>
     None
 }
 
-/// On-rootfs name of the platform RTC driver (legacy MC146818 CMOS),
-/// relative to the `/services/drivers/` subtree cap. Hardcoded pending
-/// #165 (manifest-driven discovery).
-pub const RTC_DRIVER_NAME: &[u8] = b"cmos-rtc";
-
 /// The ELF machine of a driver binary devmgr reads a declaration from.
 pub const ELF_MACHINE: u16 = elf::EM_X86_64;
 
 /// The IOMMU family of x86-64 platforms: Intel VT-d, its units described by
 /// the ACPI DMAR and programmed by `iommu-vtd`.
 pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Vtd;
-
-/// ISA IRQ line of COM1, the serial driver's UART. Platform-static and
-/// hardcoded on the same basis as [`carve_uart_authority`], pending #165
-/// (data-driven device binding).
-pub const UART_IRQ: u32 = 4;
 
 /// GSI for a PCI function whose config-space IRQ line is unset, from its
 /// `INTx` pin and device number.
@@ -79,22 +70,26 @@ pub fn intx_fallback_gsi(_pin: u8, _dev: u8) -> Option<u32>
     None
 }
 
-/// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of devmgr's
-/// full-rights `IoPort` cap. Returns `None` when devmgr holds no `IoPort`
-/// cap or a derive or split fails.
-pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u64>
+/// Carve an `IoPort` cap over ports `base..base + count` out of devmgr's
+/// full-rights `IoPort` cap, for a platform record's `IoPort` resource.
+/// Returns `None` when devmgr holds no `IoPort` cap or a derive or split
+/// fails.
+pub fn carve_io_ports(caps: &mut DevmgrCaps, base: u16, count: u16) -> Option<u64>
 {
-    ioport_carve(caps.arch.ioport_cap, 0x3F8, 8)
+    ioport_carve(caps.arch.ioport_cap, base, count)
 }
 
-/// Carve the platform RTC's hardware-authority cap: the legacy MC146818
-/// ports at ISA `0x70`..=`0x71`. The base is platform-static and hardcoded
-/// pending #165, which replaces all such hardcoded per-driver knowledge
-/// with ACPI `_HID` (`PNP0B00`) driven discovery. Returns `None` when
-/// devmgr holds no `IoPort` cap or a derive or split fails.
-pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u64>
+/// The line and `SYS_IRQ_REGISTER` mode of a platform record's interrupt
+/// `line`, described with `mode`: for an ISA IRQ (`isa`), the GSI and mode
+/// the MADT's overrides route it to ([`firmware::acpi::isa_line`]); any other
+/// line is a GSI already.
+pub fn platform_line(irq_range: &IrqRangeAllocator, line: u32, mode: u64, isa: bool) -> (u32, u64)
 {
-    ioport_carve(caps.arch.ioport_cap, 0x70, 2)
+    match u8::try_from(line)
+    {
+        Ok(irq) if isa => firmware::acpi::isa_line(irq_range.overrides.iter().copied(), irq, mode),
+        _ => (line, mode),
+    }
 }
 
 /// The MADT's Interrupt Source Overrides, which give the PCI `INTx` lines'
@@ -143,21 +138,6 @@ pub fn pci_line_overrides(caps: &DevmgrCaps) -> Vec<SourceOverride>
 pub fn pci_line_mode(overrides: &[SourceOverride], gsi: u32) -> u64
 {
     firmware::acpi::line_mode(overrides.iter().copied(), gsi)
-}
-
-/// The data word the RTC driver's bootstrap round carries: the CMOS RAM
-/// index of the century register the FADT's `CENTURY` field names, or 0
-/// when the FADT names none or cannot be read. The cmos driver reads the
-/// century from that register, and with 0 falls back to its fixed
-/// century.
-// unnecessary_wraps: the arch-dispatch signature is shared with riscv64,
-// whose RTC takes no bootstrap word and returns `None`.
-#[allow(clippy::unnecessary_wraps)]
-pub fn rtc_bootstrap_word(caps: &DevmgrCaps) -> Option<u64>
-{
-    let index = locate_table_by_sig(caps, *b"FACP")
-        .and_then(|fadt| with_acpi_table(caps, fadt, firmware::acpi::fadt_century_index));
-    Some(index.map_or(0, u64::from))
 }
 
 /// Reply to an authorised, version-checked `QUERY_SHUTDOWN_DEVICE` with

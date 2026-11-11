@@ -8,7 +8,7 @@
 use ipc::IpcMessage;
 
 use crate::caps::DevmgrCaps;
-use crate::{carve_subrange, reply_status};
+use crate::{IrqRangeAllocator, reply_status};
 use firmware::EcamLocation;
 
 /// Arch-specific authority caps devmgr holds after bootstrap.
@@ -64,11 +64,6 @@ pub fn platform_default_ecam() -> Option<EcamLocation>
     })
 }
 
-/// On-rootfs name of the platform RTC driver (QEMU `virt` goldfish-RTC),
-/// relative to the `/services/drivers/` subtree cap. Hardcoded pending
-/// #165 (manifest-driven discovery).
-pub const RTC_DRIVER_NAME: &[u8] = b"goldfish-rtc";
-
 /// The ELF machine of a driver binary devmgr reads a declaration from.
 pub const ELF_MACHINE: u16 = elf::EM_RISCV;
 
@@ -76,11 +71,6 @@ pub const ELF_MACHINE: u16 = elf::EM_RISCV;
 /// function, its units described by the ACPI RIMT and programmed by
 /// `iommu-riscv`.
 pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Riscv;
-
-/// PLIC source of the QEMU `virt` NS16550, the serial driver's UART.
-/// Platform-static and hardcoded on the same basis as
-/// [`carve_uart_authority`], pending #165 (data-driven device binding).
-pub const UART_IRQ: u32 = 10;
 
 /// GSI for a PCI function whose config-space IRQ line is unset, from its
 /// `INTx` pin and device number: the QEMU `virt` PCI host's swizzle onto
@@ -93,21 +83,6 @@ pub fn intx_fallback_gsi(pin: u8, dev: u8) -> Option<u32>
         return Some(32 + ((u32::from(pin) - 1 + u32::from(dev)) % 4));
     }
     None
-}
-
-/// Carve the NS16550 `Mmio` out of the aperture covering the UART
-/// MMIO window.
-///
-/// The window is the QEMU `virt` NS16550 at `[0x1000_0000, 0x1000_1000)` —
-/// a fixed part of the QEMU virt machine model, the same basis on which
-/// [`platform_default_ecam`] and the seeded goldfish-RTC aperture are
-/// identified. The bootloader independently discovers this base via ACPI
-/// SPCR for its early console; replacing this constant with forwarded
-/// SPCR/`_CRS` discovery is #165. Returns `None` when no aperture covers
-/// the window or the split fails.
-pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u64>
-{
-    carve_subrange(caps, 0x1000_0000, 0x1000)
 }
 
 /// The overrides the PCI `INTx` lines' modes come from: none on riscv64,
@@ -125,23 +100,19 @@ pub fn pci_line_mode(_overrides: &[firmware::acpi::SourceOverride], _gsi: u32) -
     syscall::IRQ_MODE_LEVEL
 }
 
-/// The data word the RTC driver's bootstrap round carries: none. No-op on
-/// riscv64: the goldfish RTC counts nanoseconds since the epoch, so it has
-/// no century register for firmware to name.
-pub fn rtc_bootstrap_word(_caps: &DevmgrCaps) -> Option<u64>
+/// No `IoPort` space on riscv64: a platform record's `IoPort` resource is
+/// never carved.
+pub fn carve_io_ports(_caps: &mut DevmgrCaps, _base: u16, _count: u16) -> Option<u64>
 {
     None
 }
 
-/// Carve the platform RTC's hardware-authority cap: the QEMU `virt`
-/// goldfish-RTC page at `0x101000`. The base is platform-static and
-/// hardcoded pending #165, which replaces all such hardcoded per-driver
-/// knowledge with DTB `compatible = "google,goldfish-rtc"` driven
-/// discovery. Returns `None` when no aperture covers the page or the split
-/// fails.
-pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u64>
+/// The line and `SYS_IRQ_REGISTER` mode of a platform record's interrupt
+/// `line`: the PLIC or APLIC source and the mode its description gives; no
+/// ISA routing exists on riscv64.
+pub fn platform_line(_irq_range: &IrqRangeAllocator, line: u32, mode: u64, _isa: bool) -> (u32, u64)
 {
-    carve_subrange(caps, 0x0010_1000, 0x1000)
+    (line, mode)
 }
 
 /// Reply to an authorised, version-checked `QUERY_SHUTDOWN_DEVICE` with

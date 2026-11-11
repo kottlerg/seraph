@@ -24,6 +24,7 @@ mod dma;
 mod iommu;
 mod pci;
 mod phys;
+mod platform;
 mod settle;
 mod spawn;
 mod tables;
@@ -95,28 +96,26 @@ fn main() -> !
     );
     // Firmware lists windows in any segment order; the records are bound, and
     // the instance ordinals the registry serves counted, in segment, bus,
-    // device, function order.
-    let Some(mut records) = bind::PciRecords::new(devices)
+    // device, function order, then the platform records in firmware table
+    // order.
+    let modules = decls::classify_modules(&mut caps);
+    let platform_records = platform::enumerate(&caps, &modules.tables);
+    let records = bind::PciRecords::new(devices)
+        .and_then(|pci| bind::Records::new(pci, platform_records));
+    let Some(mut records) = records
     else
     {
-        std::os::seraph::log!("no memory for the PCI records, halting");
+        std::os::seraph::log!("no memory for the device records, halting");
         halt_loop();
     };
 
     // IRQ allocator state: single-line caps carved out of devmgr's
     // Interrupt range cap, every remainder kept; each PCI device's line held
-    // once carved, every device on it given a derivation, and the UART line
-    // carved exclusive. The firmware's overrides give each PCI line's mode.
+    // once carved, every device on it given a derivation, and a platform
+    // record's line carved exclusive. The firmware's overrides give each
+    // line's mode.
     let mut irq_range =
         IrqRangeAllocator::new(caps.irq_range_cap, arch::current::pci_line_overrides(&caps));
-
-    // The UART line (`arch::current::UART_IRQ`), kept exclusive: the serial
-    // driver acknowledges a delivery only when its client reads, so no other
-    // device may share its line. Zero on failure, and the serial driver then
-    // degrades to client-side timeout polling for RX.
-    let uart_irq = irq_range
-        .exclusive_line(arch::current::UART_IRQ)
-        .unwrap_or(0);
 
     // Generic device-info catalog: each entry carries a kind discriminant +
     // version + opaque payload bytes, and its index + 1 is the device badge
@@ -125,13 +124,11 @@ fn main() -> !
     // of kind FRAMEBUFFER; every other entry carries no startup info.
     let mut catalog = DeviceCatalog::default();
 
-    // Every driver this boot can spawn, each at most once: one per PCI
-    // record (a record is bound at most once), the simple-device drivers,
-    // the IOMMU driver, and the test-only fault batch (TODO(#165): drop it
+    // Every driver this boot can spawn, each at most once: one per device
+    // record (a record is bound at most once), the IOMMU driver, and the test-only fault batch (TODO(#165): drop it
     // with that shim). The watch's death queue is sized to them, so every
     // death observer is funded and no death is dropped.
-    let driver_count = records.devices().len()
-        + SIMPLE_DEVICE_DRIVERS
+    let driver_count = records.count()
         + IOMMU_DRIVERS
         + ipc::devmgr_labels::TEST_FAULT_DRIVERS;
     let Some(mut watch) = settle::DriverWatch::new(driver_count, caps.registry_ep)
@@ -160,8 +157,10 @@ fn main() -> !
     // once it reports ready every device behind a remapping unit is blocked
     // until devmgr attaches it, which a bind does before each DMA grant.
     // `None` runs every device unconfined, logged once.
+    let (iommu_module, mut boot_modules) = iommu::take_module(modules.drivers);
     caps.iommu = iommu::bring_up(
-        records.devices(),
+        records.pci.devices(),
+        iommu_module,
         caps.pooled.take(),
         &mut caps,
         &mut watch,
@@ -174,14 +173,13 @@ fn main() -> !
         d.set_iommu(Arc::clone(i.client()));
     }
 
-    // The boot batch: the boot pass over the PCI records, then the serial
-    // and framebuffer drivers, from boot modules, settled before the
-    // registry loop opens.
+    // The boot batch: the boot pass over every record, from the boot
+    // modules, settled before the registry loop opens.
     spawn_boot_drivers(
         &mut records,
+        core::mem::take(&mut boot_modules),
         &mut caps,
         &mut irq_range,
-        uart_irq,
         &mut watch,
         &mut catalog,
         &mut served,
@@ -565,22 +563,14 @@ fn main() -> !
     }
 }
 
-/// The simple-device drivers a boot can spawn beside those bound to PCI
-/// records: serial, framebuffer, and the platform RTC.
-const SIMPLE_DEVICE_DRIVERS: usize = 3;
-
 /// The IOMMU drivers a boot can spawn: one, of the architecture's family.
 const IOMMU_DRIVERS: usize = 1;
 
-/// The class names devmgr itself names: those of the drivers it starts on
-/// fixed paths ([`fixed`]) and those its test labels look up. A driver bound
+/// The class names devmgr itself names: those its test labels look up. A driver bound
 /// by declaration is served under the class its declaration names, which
 /// devmgr does not interpret (docs/driver-binding.md § Device Classes).
 mod class
 {
-    pub const SERIAL: &str = "serial";
-    pub const FRAMEBUFFER: &str = "framebuffer";
-    pub const RTC: &str = "rtc";
     /// TODO(#165): remove with the test labels.
     pub const TEST_FAULT: &str = "test-fault";
     /// TODO(#165): remove with the test labels.
@@ -588,24 +578,12 @@ mod class
 }
 
 /// The drivers devmgr starts on fixed paths, by name and the class each is
-/// served under, until platform device records bind them by declaration
-/// (docs/driver-binding.md § Status).
+/// served under: the test-only fault fixtures until P5 of #165 binds them by
+/// declaration (docs/driver-binding.md § Status), and the IOMMU driver.
 mod fixed
 {
     use driver_binding::decl::{ClassName, DriverName};
 
-    pub const SERIAL: (DriverName, ClassName) = (
-        DriverName::literal_key("serial"),
-        ClassName::literal_class(super::class::SERIAL),
-    );
-    pub const FRAMEBUFFER: (DriverName, ClassName) = (
-        DriverName::literal_key("framebuffer"),
-        ClassName::literal_class(super::class::FRAMEBUFFER),
-    );
-    pub const RTC: (DriverName, ClassName) = (
-        DriverName::literal_key("rtc"),
-        ClassName::literal_class(super::class::RTC),
-    );
     /// TODO(#165): remove with the test labels.
     pub const TEST_FAULT: (DriverName, ClassName) = (
         DriverName::literal_key("test-fault"),
@@ -1306,6 +1284,9 @@ struct ServedDriver
 {
     ep: u64,
     dev_caps: Option<bind::PciDeviceCaps>,
+    /// For a driver bound to a platform record, the caps devmgr carved for
+    /// it.
+    platform_caps: Option<bind::PlatformDeviceCaps>,
     /// The driver's badged procmgr process handle: kept until its batch
     /// settles, and for the rest of the boot for a driver bound to a PCI
     /// record, which devmgr destroys when it withdraws it, and whose memory
@@ -1332,9 +1313,17 @@ impl ServedDriver
                 },
                 ipc_buf,
             ),
-            None if self.process_handle != 0 => spawn::destroy_child(self.process_handle, ipc_buf),
             None =>
-            {}
+            {
+                if let Some(platform) = &self.platform_caps
+                {
+                    platform.take_from_driver();
+                }
+                if self.process_handle != 0
+                {
+                    spawn::destroy_child(self.process_handle, ipc_buf);
+                }
+            }
         }
         self.release();
     }
@@ -1351,6 +1340,10 @@ impl ServedDriver
         if let Some(dev_caps) = &self.dev_caps
         {
             dev_caps.release();
+        }
+        if let Some(platform) = &self.platform_caps
+        {
+            platform.release();
         }
     }
 }
@@ -1636,18 +1629,15 @@ fn settle_batch(
     served.serve(roster, ipc_buf);
 }
 
-/// Spawn and settle the boot batch: the boot pass over the PCI records
-/// ([`bind::boot_pass`]), then the serial and framebuffer drivers, all from
-/// boot modules. The registry loop opens only after it, so every client sees
-/// the settled drivers.
-// too_many_arguments: the batch spans every PCI bind and the console pair;
-// each argument is state one of its spawns consumes.
-#[allow(clippy::too_many_arguments)]
+/// Spawn and settle the boot batch: the boot pass over every record
+/// ([`bind::boot_pass`]), from the declared boot modules `modules`. The
+/// registry loop opens only after it, so every client sees the settled
+/// drivers.
 fn spawn_boot_drivers(
-    records: &mut bind::PciRecords,
+    records: &mut bind::Records,
+    modules: Vec<(driver_binding::decl::DriverDecl, u64)>,
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
-    uart_irq: u64,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
     served: &mut ServedDrivers,
@@ -1658,14 +1648,10 @@ fn spawn_boot_drivers(
     else
     {
         std::os::seraph::log!("boot batch: no settle batch; no driver spawned");
-        // A retained module cap pins the pool run init donated it from. The
-        // IOMMU module was consumed or released by its bring-up.
-        for (slot, module) in caps.driver_modules.iter_mut().enumerate()
+        // A retained module cap pins the pool run init donated it from.
+        for (_, module) in modules
         {
-            if caps::module_kind::index(caps::module_kind::IOMMU) != Some(slot)
-            {
-                drop(spawn::ModuleCapGuard::new(core::mem::take(module)));
-            }
+            drop(spawn::ModuleCapGuard::new(module));
         }
         return;
     };
@@ -1673,6 +1659,7 @@ fn spawn_boot_drivers(
     let death_eq = watch.death_eq();
     bind::boot_pass(
         records,
+        modules,
         &mut bind::Carve {
             caps,
             irq_range,
@@ -1685,16 +1672,6 @@ fn spawn_boot_drivers(
         },
         ipc_buf,
     );
-    spawn_serial(
-        caps,
-        uart_irq,
-        &batch,
-        death_eq,
-        &mut roster,
-        catalog,
-        ipc_buf,
-    );
-    spawn_framebuffer(caps, &batch, death_eq, &mut roster, catalog, ipc_buf);
     settle_batch(
         batch,
         roster,
@@ -1717,18 +1694,18 @@ fn create_service_endpoint() -> Option<u64>
 
 /// Spawn and settle the on-disk batch, from inside the `SET_DRIVERS_DIR`
 /// registry-loop arm, after the handler's `ipc_reply` to svcmgr and before
-/// devmgr's next receive: the platform RTC driver, then the
-/// drivers-directory pass over the PCI records no boot driver was bound to
+/// devmgr's next receive: the drivers-directory pass over the records no
+/// boot driver was bound to
 /// ([`bind::drivers_dir_pass`]), each binary read through `drivers_dir_cap`,
 /// the `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` subtree cap
 /// svcmgr delivered (namespace-protocol rights, not kernel cap rights). A
 /// driver not spawned, or not ready when the batch settles, is never served,
 /// and its device's carved caps are released.
-// too_many_arguments: the batch spans the RTC and every PCI bind; each
-// argument is state one of its spawns consumes.
+// too_many_arguments: the batch spans every bind of the pass; each argument
+// is state one of its spawns consumes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_on_disk_drivers(
-    records: &mut bind::PciRecords,
+    records: &mut bind::Records,
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
     drivers_dir_cap: u64,
@@ -1746,15 +1723,6 @@ fn spawn_on_disk_drivers(
     };
     let mut roster = Roster::new();
     let death_eq = watch.death_eq();
-    spawn_rtc_from_disk(
-        caps,
-        drivers_dir_cap,
-        &batch,
-        death_eq,
-        &mut roster,
-        catalog,
-        ipc_buf,
-    );
     bind::drivers_dir_pass(
         records,
         drivers_dir_cap,
@@ -1796,7 +1764,7 @@ fn spawn_on_disk_drivers(
     }
 }
 
-// ── Simple-device driver spawns ─────────────────────────────────────────────
+// ── Test-only simple-device spawns ──────────────────────────────────────────
 
 /// The per-driver objects of one simple-device spawn: the device badge of
 /// its catalog entry, the service endpoint devmgr owns, and the driver's
@@ -1878,274 +1846,6 @@ fn spawn_simple_into(
     {
         let _ = syscall::cap_delete(slots.service_ep);
     }
-}
-
-/// Carve the platform UART arch authority cap and spawn the serial driver
-/// via the non-PCI simple-device path into the settle `batch`, recording it
-/// in `roster`. devmgr keeps the driver's service endpoint to mint client
-/// SEND caps on `QUERY_DEVICE` through a `serial` class SEND, and retains
-/// no UART-specific authority after a successful spawn — the carved cap and
-/// `uart_irq` are moved to the driver.
-fn spawn_serial(
-    caps: &mut caps::DevmgrCaps,
-    uart_irq: u64,
-    batch: &settle::SettleBatch,
-    death_eq: u64,
-    roster: &mut Roster<SpawnedDriver>,
-    catalog: &mut DeviceCatalog,
-    ipc_buf: *mut u64,
-)
-{
-    let module_cap = caps.module_cap_for_kind(caps::module_kind::SERIAL);
-    if module_cap == 0
-    {
-        std::os::seraph::log!("serial: no serial driver module delivered");
-        return;
-    }
-    // Release the module cap on any exit before it is handed to the spawn (which
-    // then owns its lifecycle); a retained cap pins its donated pool run.
-    let mut module_guard = spawn::ModuleCapGuard::new(module_cap);
-
-    if roster.try_reserve_one().is_err()
-    {
-        std::os::seraph::log!("serial: no memory to record the driver; not spawned");
-        return;
-    }
-    let Some(device_badge) = catalog.add_without_info()
-    else
-    {
-        std::os::seraph::log!("serial: catalog entry not added; not spawned");
-        return;
-    };
-    let Some(slots) = SimpleDeviceSlots::new("serial", device_badge, batch)
-    else
-    {
-        return;
-    };
-    let Some(hw_cap) = arch::current::carve_uart_authority(caps)
-    else
-    {
-        std::os::seraph::log!("serial: failed to carve UART authority cap");
-        slots.release();
-        return;
-    };
-
-    module_guard.disarm();
-    let config = spawn::SimpleSpawnConfig {
-        procmgr_ep: caps.procmgr_ep,
-        bootstrap_ep: caps.self_bootstrap_ep,
-        source: spawn::CreateSource::Module(module_cap),
-        service_ep: slots.service_ep,
-        hw_cap,
-        // UART interrupt; 0 falls back to client-side RX polling.
-        irq_cap: uart_irq,
-        query_ep: slots.query_ep,
-        death_eq: Some(death_eq),
-        device_badge,
-        round1_words: &[],
-        // Boot-critical: the console path.
-        priority: ipc::sched_policy::BOOT_DRIVER_PRIORITY,
-    };
-    spawn_simple_into(fixed::SERIAL, &config, &slots, roster, ipc_buf);
-}
-
-/// Carve a narrow `Mmio` cap covering the linear framebuffer and spawn the
-/// framebuffer driver into the settle `batch`, recording it in `roster`.
-/// Registers the geometry in `catalog` so the driver can fetch it via
-/// `QUERY_DEVICE_INFO` on its query cap. devmgr keeps the driver's service
-/// endpoint to mint client SEND caps on [`ipc::devmgr_labels::QUERY_DEVICE`]
-/// through a `framebuffer` class SEND, and retains no
-/// framebuffer-MMIO authority after a successful spawn — the carved cap is
-/// moved to the driver.
-fn spawn_framebuffer(
-    caps: &mut caps::DevmgrCaps,
-    batch: &settle::SettleBatch,
-    death_eq: u64,
-    roster: &mut Roster<SpawnedDriver>,
-    catalog: &mut DeviceCatalog,
-    ipc_buf: *mut u64,
-)
-{
-    // Resolve and guard the module cap before the headless check: on a headless
-    // boot (`fb_info == None`) the framebuffer driver is never spawned, so its
-    // module cap would otherwise stay held — a live derivation child pinning
-    // init's donated pool-run source unsplittable. The guard releases it on
-    // every early exit until it is handed to the spawn.
-    let module_cap = caps.module_cap_for_kind(caps::module_kind::FRAMEBUFFER);
-    let mut module_guard = spawn::ModuleCapGuard::new(module_cap);
-
-    let Some(fb) = caps.fb_info
-    else
-    {
-        // No framebuffer present (e.g. headless QEMU).
-        return;
-    };
-
-    if module_cap == 0
-    {
-        std::os::seraph::log!("framebuffer: no framebuffer driver module delivered");
-        return;
-    }
-    if roster.try_reserve_one().is_err()
-    {
-        std::os::seraph::log!("framebuffer: no memory to record the driver; not spawned");
-        return;
-    }
-
-    // Register a catalog entry so the driver can fetch its geometry via
-    // QUERY_DEVICE_INFO. Badge == catalog-index + 1, mirroring virtio.
-    let fb_info_serial = boot_protocol::FramebufferInfo {
-        physical_base: fb.physical_base,
-        width: fb.width,
-        height: fb.height,
-        stride: fb.stride,
-        pixel_format: match fb.pixel_format
-        {
-            0 => boot_protocol::PixelFormat::Rgbx8,
-            _ => boot_protocol::PixelFormat::Bgrx8,
-        },
-    };
-    let mut buf = [0u8; boot_protocol::FramebufferInfo::SIZE];
-    if fb_info_serial.to_bytes(&mut buf).is_none()
-    {
-        std::os::seraph::log!("framebuffer: to_bytes overflow");
-        return;
-    }
-    let Some(device_badge) = catalog.add(
-        ipc::device_info_kind::FRAMEBUFFER,
-        boot_protocol::FRAMEBUFFER_INFO_VERSION,
-        &buf,
-    )
-    else
-    {
-        std::os::seraph::log!("framebuffer: catalog entry not added (payload or memory)");
-        return;
-    };
-    let Some(slots) = SimpleDeviceSlots::new("framebuffer", device_badge, batch)
-    else
-    {
-        return;
-    };
-
-    // Page-aligned aperture range covering [physical_base, physical_base
-    // + stride*height) — same math the bootloader seeded into
-    // `mmio_apertures` so `carve_subrange` will find the covering window.
-    let base_aligned = fb.physical_base & !0xFFF;
-    let span = fb.physical_base + u64::from(fb.stride) * u64::from(fb.height);
-    let end_aligned = (span + 0xFFF) & !0xFFF;
-    let Some(hw_cap) = carve_subrange(caps, base_aligned, end_aligned - base_aligned)
-    else
-    {
-        std::os::seraph::log!("framebuffer: failed to carve MMIO cap");
-        slots.release();
-        return;
-    };
-
-    module_guard.disarm();
-    let config = spawn::SimpleSpawnConfig {
-        procmgr_ep: caps.procmgr_ep,
-        bootstrap_ep: caps.self_bootstrap_ep,
-        source: spawn::CreateSource::Module(module_cap),
-        service_ep: slots.service_ep,
-        hw_cap,
-        // No interrupt-driven path.
-        irq_cap: 0,
-        query_ep: slots.query_ep,
-        death_eq: Some(death_eq),
-        device_badge,
-        round1_words: &[],
-        priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
-    };
-    spawn_simple_into(fixed::FRAMEBUFFER, &config, &slots, roster, ipc_buf);
-}
-
-/// Spawn the platform RTC driver — CMOS on x86-64, goldfish-RTC on
-/// RISC-V — from the on-disk rootfs into the settle `batch`, recording it in
-/// `roster`. Walks `drivers_dir_cap` to the per-arch chip name, carves the
-/// per-arch hardware authority, and goes through the file-cap branch of
-/// [`spawn::spawn_simple_device`].
-///
-/// devmgr does not retain RTC-specific hardware authority after a
-/// successful spawn — the carved cap is moved to the driver. The
-/// walked file cap is owned by procmgr after a successful
-/// `CREATE_FROM_FILE` and closed by procmgr after the ELF load.
-fn spawn_rtc_from_disk(
-    caps: &mut caps::DevmgrCaps,
-    drivers_dir_cap: u64,
-    batch: &settle::SettleBatch,
-    death_eq: u64,
-    roster: &mut Roster<SpawnedDriver>,
-    catalog: &mut DeviceCatalog,
-    ipc_buf: *mut u64,
-)
-{
-    if roster.try_reserve_one().is_err()
-    {
-        std::os::seraph::log!("rtc: no memory to record the driver; not spawned");
-        return;
-    }
-    let Some(device_badge) = catalog.add_without_info()
-    else
-    {
-        std::os::seraph::log!("rtc: catalog entry not added; not spawned");
-        return;
-    };
-    // Request READ rights on the resolved file node. The cap svcmgr handed
-    // us in SET_DRIVERS_DIR is already attenuated to LOOKUP|READ|READDIR at
-    // the /services/drivers/ subtree, so the namespace server will only
-    // ever mint a file cap with at most those bits set.
-    let requested_rights = u64::from(namespace_protocol::rights::READ);
-    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
-    // registered at startup), passed down unchanged.
-    let Some(walked) = (unsafe {
-        ns_client::walk_to_file(
-            drivers_dir_cap,
-            arch::current::RTC_DRIVER_NAME,
-            requested_rights,
-            ipc_buf,
-        )
-    })
-    else
-    {
-        std::os::seraph::log!("rtc: walk_to_file failed (binary missing on rootfs)");
-        return;
-    };
-
-    let Some(slots) = SimpleDeviceSlots::new("rtc", device_badge, batch)
-    else
-    {
-        let _ = syscall::cap_delete(walked.file_cap);
-        return;
-    };
-    let Some(hw_cap) = arch::current::carve_rtc_authority(caps)
-    else
-    {
-        std::os::seraph::log!("rtc: failed to carve RTC authority cap");
-        let _ = syscall::cap_delete(walked.file_cap);
-        slots.release();
-        return;
-    };
-
-    let word = arch::current::rtc_bootstrap_word(caps);
-    let config = spawn::SimpleSpawnConfig {
-        procmgr_ep: caps.procmgr_ep,
-        bootstrap_ep: caps.self_bootstrap_ep,
-        source: spawn::CreateSource::File {
-            file_cap: walked.file_cap,
-            size: walked.size,
-        },
-        service_ep: slots.service_ep,
-        hw_cap,
-        // RTC is polled.
-        irq_cap: 0,
-        query_ep: slots.query_ep,
-        death_eq: Some(death_eq),
-        device_badge,
-        // The RTC's one platform datum rides round 1.
-        round1_words: word.as_slice(),
-        priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
-    };
-    spawn_simple_into(fixed::RTC, &config, &slots, roster, ipc_buf);
 }
 
 /// TODO(#165): remove with the devmgr enumeration redesign.

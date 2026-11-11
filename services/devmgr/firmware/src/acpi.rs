@@ -38,6 +38,13 @@ const FADT_OFF_PM1A_CNT_BLK: usize = 64;
 /// FADT `CENTURY` (ACPI 6.x section 5.2.9): the CMOS RAM index of the RTC's
 /// century-of-year register, a byte; 0 means the RTC has none.
 const FADT_OFF_CENTURY: usize = 108;
+/// FADT `DSDT` (ACPI 6.x section 5.2.9): the DSDT's 32-bit physical address.
+const FADT_OFF_DSDT: usize = 40;
+/// FADT `X_DSDT`: the DSDT's 64-bit physical address, which a non-zero value
+/// gives in place of `DSDT`.
+const FADT_OFF_X_DSDT: usize = 140;
+/// SDT header `OEM Table ID`: 8 bytes, space-padded.
+const SDT_OFF_OEM_TABLE_ID: usize = 16;
 
 /// First MADT interrupt-controller structure (ACPI 6.x section 5.2.12): after
 /// the header, the local interrupt controller address (u32) and the flags
@@ -195,6 +202,49 @@ pub fn fadt_century_index(fadt_bytes: &[u8]) -> Option<u8>
     }
     let index = fadt_bytes[FADT_OFF_CENTURY];
     if index == 0 { None } else { Some(index) }
+}
+
+// ── FADT → DSDT ────────────────────────────────────────────────────────
+
+/// Read the physical address of the DSDT from the FADT: `X_DSDT` when the
+/// table reaches it and it is non-zero, else the 32-bit `DSDT` field (ACPI
+/// 6.x section 5.2.9).
+///
+/// Returns `None` if the signature isn't `FACP`, the table (bounded by its
+/// reported length and the slice) reaches neither field, or both are zero.
+#[must_use]
+pub fn fadt_dsdt_phys(fadt_bytes: &[u8]) -> Option<u64>
+{
+    if sdt_signature(fadt_bytes) != *b"FACP"
+    {
+        return None;
+    }
+    let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
+    if total_len >= FADT_OFF_X_DSDT + 8
+    {
+        let x_dsdt = read_u64(fadt_bytes, FADT_OFF_X_DSDT);
+        if x_dsdt != 0
+        {
+            return Some(x_dsdt);
+        }
+    }
+    if total_len < FADT_OFF_DSDT + 4
+    {
+        return None;
+    }
+    let dsdt = u64::from(read_u32(fadt_bytes, FADT_OFF_DSDT));
+    if dsdt == 0 { None } else { Some(dsdt) }
+}
+
+/// The OEM table ID field of an SDT header (8 bytes, space-padded), or
+/// `None` when the slice is shorter than the header.
+#[must_use]
+pub fn sdt_oem_table_id(sdt_header: &[u8]) -> Option<[u8; 8]>
+{
+    sdt_header
+        .get(SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + 8)?
+        .try_into()
+        .ok()
 }
 
 // ── MCFG → ECAM ────────────────────────────────────────────────────────
@@ -383,6 +433,40 @@ pub fn line_mode(overrides: impl IntoIterator<Item = SourceOverride>, gsi: u32) 
         _ => PCI_INTX_MODE & IRQ_MODE_LEVEL,
     };
     polarity | trigger
+}
+
+/// The GSI and `SYS_IRQ_REGISTER` mode of ISA IRQ `irq`, whose device
+/// describes it with mode `described` (an ACPI IRQ descriptor's trigger and
+/// polarity, edge and active-high when it gives none): the GSI of the first
+/// override in `overrides` whose source is `irq`, with that override's trigger
+/// and polarity, field by field, `described`'s for a field it leaves
+/// "conforms to bus" (0) or reserved (2); `irq` itself and `described` when
+/// no override names it (ACPI 6.x section 5.2.12.5).
+#[must_use]
+pub fn isa_line(
+    overrides: impl IntoIterator<Item = SourceOverride>,
+    irq: u8,
+    described: u64,
+) -> (u32, u64)
+{
+    let Some(found) = overrides.into_iter().find(|o| o.source == irq)
+    else
+    {
+        return (u32::from(irq), described);
+    };
+    let polarity = match found.flags & 0b11
+    {
+        1 => 0,
+        3 => IRQ_MODE_ACTIVE_LOW,
+        _ => described & IRQ_MODE_ACTIVE_LOW,
+    };
+    let trigger = match (found.flags >> 2) & 0b11
+    {
+        1 => 0,
+        3 => IRQ_MODE_LEVEL,
+        _ => described & IRQ_MODE_LEVEL,
+    };
+    (found.gsi, polarity | trigger)
 }
 
 // ── Table mapping window ─────────────────────────────────────────────

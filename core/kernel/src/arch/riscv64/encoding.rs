@@ -476,10 +476,7 @@ mod tests
         let protected = protected_leaf(device, read_only).unwrap();
         let flags = user_leaf_flags(protected).unwrap();
         assert!(flags.uncacheable && !flags.writable);
-        assert_eq!(
-            protected & !(PTE_PBMT_MASK | PTE_GRANT_WRITE),
-            read_only
-        );
+        assert_eq!(protected & !(PTE_PBMT_MASK | PTE_GRANT_WRITE), read_only);
 
         let ram = PTE_VALID | PTE_USER | PTE_READ | ppn;
         let protected = protected_leaf(ram, read_only | (0b10 << 61)).unwrap();
@@ -540,6 +537,9 @@ mod tests
             executable: true,
         });
         assert_eq!(both, 0b11 << 8);
-        assert_eq!(both & (0xFF | (0xFFF_FFFF_FFFF << 10) | PTE_PBMT_MASK | (1 << 63)), 0);
+        assert_eq!(
+            both & (0xFF | (0xFFF_FFFF_FFFF << 10) | PTE_PBMT_MASK | (1 << 63)),
+            0
+        );
     }
 }

@@ -784,9 +784,9 @@ impl AddressSpace
         // `mm::kernel_pt_pool` (seeded once at Phase 7 with `POOL_SEED_PAGES`
         // from the pristine buddy). No buddy lock is taken on this path; the
         // pool lock nests under `pt_lock` (see the module's Concurrency note).
+        let grant = crate::mm::paging::LeafGrant::of(flags);
         // SAFETY: contract passed to caller; root_virt is valid; virt is
         // in user range; phys is a valid 4 KiB-aligned physical address.
-        let grant = crate::mm::paging::LeafGrant::of(flags);
         let Ok(outcome) = (unsafe { map_user_page(self.root_virt, virt, phys, flags, grant) })
         else
         {
@@ -1797,8 +1797,9 @@ mod thread_mem_tests
             writable: false,
             executable: true,
         };
-        let check =
-            |writable, text, mappings: u64| thread_mem_write_check(leaf(writable), rx, text, || mappings);
+        let check = |writable, text, mappings: u64| {
+            thread_mem_write_check(leaf(writable), rx, text, || mappings)
+        };
         assert!(
             thread_mem_write_check(leaf(true), rx, TextWrite::Refused, || unreachable!()).is_ok()
         );

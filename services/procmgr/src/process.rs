@@ -2093,12 +2093,13 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// `SYS_THREAD_GET_FAULT_HANDLER` returns, so a debugger binds under
 /// `procmgr_labels::DEBUGGER_BADGE_TAG`
 /// (`services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`). The entry
-/// records whose thread the binding showed before any rebind
-/// (`ProcessTable::origin_of`), which a restore reads. A thread
-/// refused at the bound or for the heap runs unregistered, so a debugger's
-/// binding on it is taken back then, under the process badge; one
-/// refused because its process declared itself undebuggable is unbound as the
-/// declaration unbinds its threads.
+/// records whose thread the binding showed before any rebind, carried
+/// through a thread procmgr already lists under that binding
+/// (`ProcessTable::origin_of`), which decides what a restore binds back. A
+/// thread refused at the bound or for the heap runs unregistered, so a
+/// debugger's binding on it is taken back then, under the process badge; one
+/// refused because its process declared itself undebuggable is unbound as
+/// the declaration unbinds its threads.
 ///
 /// # Errors
 /// The reply code: `INVALID_BADGE` when no live process carries `badge`,
@@ -2223,17 +2224,17 @@ pub fn release_registered_thread(thread: process_table::RegisteredThread)
 /// process badge when its exception class is unbound, or bound by a debugger
 /// or by procmgr under another badge (`ProcessEntry::restores`). Each
 /// registered thread takes the action `ProcessTable::restore_action` names
-/// by its origin: the process's own is bound again under its crash badge,
-/// minted for one that has none, when the main thread's rule would bind it;
-/// another process's that procmgr left under that process's badge is bound
-/// back under it from a debugger's binding while that process lives
-/// undeclared; and any other thread is never bound to the crash endpoint, a
-/// debugger's binding on it unbound.
-/// Each upcall class a debugger bound is unbound, so no thread stays
-/// bound to a dead debugger's endpoint. A thread whose bind fails keeps the
-/// binding it has, as does every thread that needs a fresh crash badge when
-/// procmgr's heap cannot hold them. A declared process (`DECLARE_NO_DEBUG`)
-/// is never bound back, and a badge naming no live process changes nothing.
+/// by the origin its registration recorded: one recorded as the process's
+/// own is bound again under its crash badge, minted for one that has none,
+/// when the main thread's rule would bind it; one left under another
+/// process's badge is bound back under that badge from a debugger's binding
+/// while that process lives undeclared; and any other is never bound to the
+/// crash endpoint, a debugger's binding on it unbound. Each upcall class a
+/// debugger bound is unbound, so no thread stays bound to a dead debugger's
+/// endpoint. A thread whose bind fails keeps the binding it has, as does
+/// every thread that needs a fresh crash badge when procmgr's heap cannot
+/// hold them. A declared process (`DECLARE_NO_DEBUG`) is never bound back,
+/// and a badge naming no live process changes nothing.
 pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
 {
     let Some(entry) = table.find_mut_by_badge(badge)

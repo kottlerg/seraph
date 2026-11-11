@@ -1556,9 +1556,9 @@ with a kill outcome (no syscall returns) and the thread is left `Stopped`; the n
 user copy, fails that syscall with `InvalidAddress`). A thread whose handler's reply claimed the
 fault first keeps that reply's outcome: when next started it resumes its faulting instruction on
 `FAULT_REPLY_RESUME`, takes the unhandled outcome on `FAULT_REPLY_KILL`, and on
-`FAULT_REPLY_FORWARD` delivers the fault through its exception class when it is a virtual-memory
-fault other than a kernel copy's and an exception handler is bound, and otherwise takes the
-unhandled outcome (see
+`FAULT_REPLY_FORWARD` delivers the fault through its exception class when the reply answered the
+virtual-memory class's delivery of a fault other than a kernel copy's and an exception handler is
+bound, and otherwise takes the unhandled outcome (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). A target blocked in an upcall delivery (`FAULT_KIND_UPCALL`) is killed in
 neither case: a stop that cancels the delivery drops the upcall, any reply that claimed it first

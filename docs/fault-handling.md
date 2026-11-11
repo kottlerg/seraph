@@ -308,11 +308,12 @@ syscall point, past the `ecall` its reported pointer names.
   handler's reply claimed the fault leaves that reply's disposition: when next started, the thread
   resumes on a `FAULT_REPLY_RESUME` reply, the fault is unhandled on a `FAULT_REPLY_KILL` reply,
   and a `FAULT_REPLY_FORWARD` reply is acted on as at any forward ([Reply](#reply)): the fault is
-  delivered through the exception class when it is a virtual-memory fault other than a kernel
-  copy's and an exception handler is bound, and is otherwise unhandled. Destroying it while
-  stopped ends it as for any stopped thread. A cancelled fault-blocked thread is never resumed at
-  its faulting instruction: a thread whose own access faulted is killed (a stopped one when next
-  started), and one whose kernel copy faulted has that syscall fail.
+  delivered through the exception class when the reply answered the `FAULT_CLASS_VM` delivery of
+  a fault other than a kernel copy's and an exception handler is bound, and is otherwise
+  unhandled. Destroying it while stopped ends it as for any stopped thread. A cancelled
+  fault-blocked thread is never resumed at its faulting instruction: a thread whose own access
+  faulted is killed (a stopped one when next started), and one whose kernel copy faulted has that
+  syscall fail.
 - **Rebind (redelivery).** A change of the binding of the fault's class, by
   `SYS_THREAD_SET_FAULT_HANDLER` or `SYS_THREAD_INHERIT_FAULT_HANDLER` (an unbind, or a bind to
   another endpoint or with another badge), while a fault is in flight, before any reply or other

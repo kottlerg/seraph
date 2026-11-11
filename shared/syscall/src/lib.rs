@@ -2249,9 +2249,10 @@ pub fn ioport_bind(thread_cap: u64, ioport_cap: u64) -> Result<(), i64>
 /// on a kill outcome (for the fault of a restartable syscall's user copy,
 /// fails that syscall with `InvalidAddress`), resumes its faulting
 /// instruction on `FAULT_REPLY_RESUME`, and on `FAULT_REPLY_FORWARD` delivers
-/// the fault through the thread's exception-class handler when it is a
-/// virtual-memory fault other than a kernel copy's and an exception handler is
-/// bound, and otherwise takes the kill outcome, as [`thread_start`] says
+/// the fault through the thread's exception-class handler when the reply
+/// answered the virtual-memory class's delivery of a fault other than a kernel
+/// copy's and an exception handler is bound, and otherwise takes the kill
+/// outcome, as [`thread_start`] says
 /// (docs/fault-handling.md § Delivery, Resume, and Kill). A thread blocked in an upcall delivery is never killed: whatever
 /// the outcome, the upcall is settled or dropped and the start resumes the
 /// thread at its registers (docs/fault-handling.md § Asynchronous Upcalls).

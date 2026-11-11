@@ -6,7 +6,7 @@
 //! Binding PCI records to the drivers whose declarations match them, and
 //! taking a device back from its driver
 //! ([docs/driver-binding.md](../../../docs/driver-binding.md) § Matching,
-//! § Binding, § Withdrawal).
+//! § Binding).
 //!
 //! Two passes bind: the boot pass, over the declarations of the boot modules
 //! devmgr holds, in the boot settle batch; and the drivers-directory pass,
@@ -416,6 +416,18 @@ fn carve_pci_device(
     carve: &mut Carve,
 ) -> Option<PciDeviceCaps>
 {
+    // A driver that declares the VirtIO status reset drives the VirtIO
+    // register layout; a function that presents no complete layout (one of
+    // the four regions missing, VirtIO 1.2 § 4.1.4) could neither be set up
+    // by it nor reset when it is withdrawn.
+    if decl.reset == Reset::VirtioStatus && pci_dev.virtio_info.register_layout().is_none()
+    {
+        std::os::seraph::log!(
+            "{}: the device presents no complete VirtIO register layout; not bound",
+            name
+        );
+        return None;
+    }
     let mut dev = PciDeviceCaps::empty(carve.caps.self_aspace, crate::iommu::requester_id(pci_dev));
     if carve_bars(name, pci_dev, carve.caps, &mut dev).is_none()
     {
@@ -456,24 +468,7 @@ fn carve_pci_device(
         return None;
     };
     dev.config = config;
-    let badge = if pci_dev.virtio_info.register_layout().is_some()
-    {
-        // The startup info is stored opaquely; the driver deserialises it from
-        // its `QUERY_DEVICE_INFO` reply after checking its kind and version.
-        let mut buf = [0u8; virtio_core::VirtioPciStartupInfo::SIZE];
-        pci_dev.virtio_info.to_bytes(&mut buf).and_then(|()| {
-            carve.catalog.add(
-                ipc::device_info_kind::VIRTIO_PCI,
-                virtio_core::VIRTIO_PCI_INFO_VERSION,
-                &buf,
-            )
-        })
-    }
-    else
-    {
-        carve.catalog.add_without_info()
-    };
-    let Some(badge) = badge
+    let Some(badge) = catalog_entry(pci_dev, carve.catalog)
     else
     {
         std::os::seraph::log!("{}: catalog entry not added; not bound", name);
@@ -516,6 +511,27 @@ fn carve_pci_device(
         return None;
     }
     Some(dev)
+}
+
+/// Add `pci_dev`'s catalog entry and return its device badge: the `VirtIO`
+/// startup info for a function that presents the `VirtIO` register layout,
+/// no startup info otherwise. `None` when the catalog cannot hold it.
+fn catalog_entry(pci_dev: &pci::PciDevice, catalog: &mut DeviceCatalog) -> Option<u64>
+{
+    if pci_dev.virtio_info.register_layout().is_none()
+    {
+        return catalog.add_without_info();
+    }
+    // The startup info is stored opaquely; the driver deserialises it from
+    // its `QUERY_DEVICE_INFO` reply after checking its kind and version.
+    let mut buf = [0u8; virtio_core::VirtioPciStartupInfo::SIZE];
+    pci_dev.virtio_info.to_bytes(&mut buf).and_then(|()| {
+        catalog.add(
+            ipc::device_info_kind::VIRTIO_PCI,
+            virtio_core::VIRTIO_PCI_INFO_VERSION,
+            &buf,
+        )
+    })
 }
 
 /// Carve a cap on each MMIO BAR of `pci_dev` the bind delivers into `dev`

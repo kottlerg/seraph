@@ -865,7 +865,9 @@ The default MUST exempt only the narrow set that cannot depend on the fault path
   demand fault could back it, so DMA-capable drivers must be eager-mapped. The creator opts a
   process out with `procmgr_labels::CREATE_PINNED` (see
   [services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md));
-  devmgr sets it for the DMA-capable driver class (PCI devices with BAR + IRQ). The exemption
+  devmgr sets it for every PCI-bound driver whose declaration declares DMA
+  ([driver-binding.md](driver-binding.md#driver-declarations) § Driver Declarations), and for
+  the IOMMU driver, whose units walk its table pages. The exemption
   is a creation-request flag, never a badge-range test.
 
 A userspace fault round-trip is costlier than a kernel-internal fill; this cost is accepted

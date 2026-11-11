@@ -801,9 +801,15 @@ Under it, `waitset_add` takes the wait set lock (inner) and fills the first vaca
 `WaitSetMember` slot. The handler then registers the wait set back-pointer on the
 source object and `inc_ref`s the source's `KernelObjectHeader`: wait-set membership
 is a +1 cap-level reference on the source. Holding the source lock makes the
-registration atomic from the source's side, so no readiness notification is lost.
-If the source is already ready at add time, `waitset_add` queues the member and
-wakes the longest-waiting thread, if any, immediately.
+registration atomic from the source's side for every path that raises the level under
+that lock. A notification's bits rise outside it (§ Send Path step 1), so the Notification
+arm also stores `has_observer = 1` and runs a SeqCst fence before `waitset_add` reads the
+bits, and recomputes `has_observer` if the add fails. That fence pairs with the send's
+(§ Send Path step 2): a send that overlaps the add either has its bits seen by the add's
+readiness check, or reads `has_observer == 1`, waits on the lock until the
+registration is complete, and reaches `waitset_notify`. No readiness notification is
+therefore lost. If the source is already ready at add time, `waitset_add` queues the
+member and wakes the longest-waiting thread, if any, immediately.
 
 `SYS_WAIT_SET_REMOVE` acquires both the wait set lock and the source object lock,
 removes the member and its ring entry, if it has one (so a member later added at the
@@ -845,12 +851,18 @@ member's next arrival queues it again.
 ### Wait Set Readiness Model
 
 A member's source has a level, `ready(m)`: a queued call, a posted entry, or pending
-bits. The level rises under the source's lock just before the source calls
-`waitset_notify`, and it falls when a thread receives from the source, which the set
-does not observe. Every rise reaches `waitset_notify`. An endpoint's send queue grows
-only in `endpoint_call`, which kernel-synthesized fault messages also go through. An
-event queue's count rises only in `event_queue_post`. A notification's bits rise only in
-`notification_send`, which notifies the set on every send that no direct waiter takes.
+bits. The level rises just before the source calls `waitset_notify`, and it falls when a
+thread receives from the source, which the set does not observe. Every rise reaches
+`waitset_notify`. An endpoint's send queue grows only in `endpoint_call`, which
+kernel-synthesized fault messages also go through. An event queue's count rises only in
+`event_queue_post`. Both raise the level under the source's lock. A notification's bits
+rise only in `notification_send`, by a lock-free `fetch_or` before it takes the lock, and
+it notifies the set on every send that no direct waiter takes. A send skips the lock, and
+the notify, only when it reads `has_observer` as 0 after its SeqCst fence. The Notification
+arm of `SYS_WAIT_SET_ADD` stores `has_observer = 1` and runs a SeqCst fence before
+`waitset_add` reads `bits`, the add half of that Dekker pair (§ Wait Set Add/Remove). A
+send that overlaps the add is therefore either seen by the add's readiness check or takes
+the slow path, which waits on the lock until the registration is complete.
 A post or call handed straight to a blocked receiver, and bits a direct waiter takes,
 leave the level where it was. The set's own state, under `ws.lock`, is the ring of
 queued members and the FIFO queue of parked threads.
@@ -885,8 +897,8 @@ at the head.
   ring names occupied members only, so it holds at most `member_count` entries, within
   its `capacity`, and a push always fits.
 - **I2, coverage:** a member whose source is ready is Queued, except between the level's
-  rise and the source's `waitset_notify`, which the source's lock spans. A member is
-  queued by every arrival, and it leaves the ring only when a wait finds it drained.
+  rise and the `waitset_notify` of the same arrival. A member is queued by every arrival,
+  and it leaves the ring only when a wait finds it drained.
 - **I3, bounded turns:** a ready Queued member is returned by one of the next `L`
   successful waits, where `L` is the ring's length, at most `member_count`. Each
   successful wait returns the head entry and queues it behind the rest, or drops a

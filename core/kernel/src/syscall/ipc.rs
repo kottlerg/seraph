@@ -1806,19 +1806,33 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
                 let saved = (*sig).lock.lock_raw();
                 let res = if (*sig).wait_set.is_null()
                 {
+                    // Publish the observer before waitset_add reads `bits`
+                    // (Dekker add half, pairing with the fence in
+                    // notification_send; core/kernel/docs/scheduling-internals.md
+                    // § Atomic Ordering Invariants). Either the add's readiness
+                    // check sees a concurrent send's bits, or that send sees
+                    // has_observer == 1, waits on sig.lock until this
+                    // registration is complete, and reaches waitset_notify.
+                    (*sig)
+                        .has_observer
+                        .store(1, core::sync::atomic::Ordering::Relaxed);
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                     match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
                     {
                         Ok(idx) =>
                         {
                             (*sig).wait_set = ws_state.cast::<u8>();
                             (*sig).wait_set_member_idx = idx;
-                            (*sig)
-                                .has_observer
-                                .store(1, core::sync::atomic::Ordering::Relaxed);
                             (*source_header).inc_ref();
                             Ok(idx)
                         }
-                        Err(()) => Err(SyscallError::InvalidArgument),
+                        Err(()) =>
+                        {
+                            // No member was installed: has_observer again
+                            // reflects the direct waiters alone.
+                            (*sig).refresh_observer();
+                            Err(SyscallError::InvalidArgument)
+                        }
                     }
                 }
                 else

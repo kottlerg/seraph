@@ -14,8 +14,9 @@
 //! # Versioning
 //!
 //! [`INIT_PROTOCOL_VERSION`] is incremented on any breaking change to the
-//! `InitInfo` layout, field semantics, or `CSpace` population order. Init MUST
-//! check `info.version == INIT_PROTOCOL_VERSION` before accessing any fields.
+//! `InitInfo` layout, field semantics, `CSpace` population order, or the
+//! capacity the root `CSpace` carries for init. Init MUST check
+//! `info.version == INIT_PROTOCOL_VERSION` before accessing any fields.
 //!
 //! # Rules
 //! - `no_std`; builds in `no_std`.
@@ -97,7 +98,13 @@
 ///     move up beside the other `u32` header fields so the header has no
 ///     implicit padding. Every field after [`InitInfo::cap_descriptor_count`]
 ///     moves.
-pub const INIT_PROTOCOL_VERSION: u32 = 16;
+/// v17: The root `CSpace` carries one body page, enough for init's first split,
+///     not sixteen (#801). Init funds its own `CSpace` body arena from its RAM
+///     with an augment-mode `cap_create_cspace` before it splits further; an
+///     init that does not fund fails its later splits with `OutOfMemory`.
+///     Field layout unchanged; semantic change to what the root `CSpace`
+///     carries.
+pub const INIT_PROTOCOL_VERSION: u32 = 17;
 
 /// Length of [`InitModuleName::name`], matching
 /// `boot_protocol::BOOT_MODULE_NAME_LEN` so the kernel copies the bundle

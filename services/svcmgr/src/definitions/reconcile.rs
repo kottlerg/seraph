@@ -28,7 +28,7 @@ use std::os::seraph::fs::DirEntryExt;
 use std::os::seraph::log;
 
 use super::parse::parse;
-use super::{Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch};
+use super::{Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch, shutdown_actuator};
 use crate::restart::RestartCtx;
 use crate::service::{
     POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry, try_string,
@@ -64,7 +64,19 @@ impl PendingRegistration
     }
 }
 
-/// The service table and its index-aligned restart recipes, grown together.
+/// The service its recipe declares the system's shutdown actuator
+/// (`shutdown_actuator = <name>`), recorded once its supervised entry is in
+/// the table.
+pub struct ShutdownActuator
+{
+    /// The actuator's slot in [`ServiceTable::services`].
+    pub slot: usize,
+    /// The `:auth` provided name svcmgr resolves to call the shutdown request.
+    pub name: String,
+}
+
+/// The service table and its index-aligned restart recipes, grown together,
+/// and the shutdown actuator among them.
 ///
 /// A slot is never reused, so its index is a stable death correlator for
 /// every instance the slot supervises; a launch that fails leaves its
@@ -74,6 +86,9 @@ pub struct ServiceTable
     pub services: Vec<ServiceEntry>,
     /// `None` for a slot with no recipe (a reserved slot whose launch failed).
     pub recipes: Vec<Option<RestartRecipe>>,
+    /// `None` when no recipe declares one, or the declaring service's
+    /// supervised entry did not land; graceful shutdown is then impossible.
+    pub shutdown_actuator: Option<ShutdownActuator>,
 }
 
 impl ServiceTable
@@ -83,6 +98,7 @@ impl ServiceTable
         Self {
             services: Vec::new(),
             recipes: Vec::new(),
+            shutdown_actuator: None,
         }
     }
 
@@ -225,22 +241,67 @@ pub fn reconcile_and_launch(
         (a.provides.is_empty(), &a.name).cmp(&(b.provides.is_empty(), &b.name))
     });
 
-    for def in &defs
+    // One actuator, the first declaration in launch order; any later one is
+    // a configuration error, launched as an ordinary service.
+    let actuator = shutdown_actuator(&defs);
+    for (i, def) in defs.iter().enumerate()
     {
-        handle_definition(def, pending, table, ctx, registry);
+        let slot = handle_definition(def, pending, table, ctx, registry);
+        if let Some(name) = &def.shutdown_actuator
+        {
+            if Some(i) == actuator
+            {
+                record_shutdown_actuator(table, &def.name, name, slot);
+            }
+            else
+            {
+                log!(
+                    "svcmgr: {} also declares shutdown_actuator; not recognised",
+                    def.name
+                );
+            }
+        }
     }
 
     report_orphans(pending);
 }
 
-/// Route one parsed `Definition` to the bind-only or launch path.
+/// Record the shutdown actuator `service` at its supervised `slot`, with the
+/// provided `name` svcmgr calls through. A `slot` of `None` (its launch or
+/// bind did not land) or a heap that cannot copy `name` leaves no actuator
+/// recorded, logged.
+fn record_shutdown_actuator(
+    table: &mut ServiceTable,
+    service: &str,
+    name: &str,
+    slot: Option<usize>,
+)
+{
+    let Some(slot) = slot
+    else
+    {
+        log!("svcmgr: shutdown actuator {service} not supervised; graceful shutdown unavailable");
+        return;
+    };
+    let Some(name) = try_string(name)
+    else
+    {
+        log!("svcmgr: no memory to record shutdown actuator {service}");
+        return;
+    };
+    table.shutdown_actuator = Some(ShutdownActuator { slot, name });
+}
+
+/// Route one parsed `Definition` to the bind-only or launch path. Returns
+/// the service-table slot of the supervised entry it recorded, or `None`
+/// for a one-shot launch or one that did not land.
 fn handle_definition(
     def: &Definition,
     pending: &mut [PendingRegistration],
     table: &mut ServiceTable,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
-)
+) -> Option<usize>
 {
     // Match against pending registrations parked from init's
     // handover endowment.
@@ -255,8 +316,7 @@ fn handle_definition(
         // `restart::restart_process`. Bind happens after the fact (the
         // thread has been running since its bootstrap spawn); `bind_only`
         // states why a death in that window is still delivered.
-        bind_only(def, slot.thread_cap, table, &ctx.deaths);
-        return;
+        return bind_only(def, slot.thread_cap, table, &ctx.deaths);
     }
 
     // Not registered by init → svcmgr launches it.
@@ -270,7 +330,7 @@ fn handle_definition(
         else
         {
             log!("svcmgr: launch failed: {}", def.name);
-            return;
+            return None;
         };
         log!("svcmgr: launched ephemeral: {}", def.name);
         let _ = syscall::cap_delete(launched.thread_cap);
@@ -279,7 +339,7 @@ fn handle_definition(
         {
             let _ = syscall::cap_delete(launched.provided_endpoint);
         }
-        return;
+        return None;
     }
 
     // Supervised launch: reserve the service-table slot BEFORE
@@ -305,7 +365,7 @@ fn handle_definition(
             "svcmgr: no memory for a service-table slot; dropping {}",
             def.name
         );
-        return;
+        return None;
     };
 
     // Build the entry before launching, so a heap that cannot hold its name
@@ -315,14 +375,14 @@ fn handle_definition(
     else
     {
         log!("svcmgr: no memory for {}'s entry; not launched", def.name);
-        return;
+        return None;
     };
 
     let Some(launched) = launch::launch(def, ctx, registry, Some(correlator))
     else
     {
         log!("svcmgr: launch failed: {}", def.name);
-        return;
+        return None;
     };
 
     entry.thread_cap = launched.thread_cap;
@@ -330,6 +390,7 @@ fn handle_definition(
     entry.provided_endpoint = launched.provided_endpoint;
     table.services[idx] = entry;
     table.recipes[idx] = Some(recipe);
+    Some(idx)
 }
 
 /// Bind-only path: bind death-notification on a thread init already
@@ -342,12 +403,14 @@ fn handle_definition(
 /// serialises on the thread's `sched_lock`. A death in the window between
 /// init's spawn and this bind is therefore delivered to the death queues when the
 /// bind lands on the already-exited thread, not dropped (#106 Window 2).
+///
+/// Returns the slot of the recorded entry, or `None` when none is recorded.
 fn bind_only(
     def: &Definition,
     thread_cap: u64,
     table: &mut ServiceTable,
     deaths: &death_set::DeathSet,
-)
+) -> Option<usize>
 {
     let Some((idx, correlator)) = table.reserve()
     else
@@ -357,7 +420,7 @@ fn bind_only(
             def.name
         );
         let _ = syscall::cap_delete(thread_cap);
-        return;
+        return None;
     };
     let (Some(mut entry), Some(recipe)) = (build_entry(def), recipe_from(def))
     else
@@ -367,19 +430,20 @@ fn bind_only(
             def.name
         );
         let _ = syscall::cap_delete(thread_cap);
-        return;
+        return None;
     };
     if deaths.bind_thread(thread_cap, correlator).is_err()
     {
         log!("svcmgr: bind death-notification failed for {}", def.name);
         let _ = syscall::cap_delete(thread_cap);
-        return;
+        return None;
     }
     // `process_handle` stays 0: init created this instance and kept its
     // handle (see `restart::restart_process`).
     entry.thread_cap = thread_cap;
     table.services[idx] = entry;
     table.recipes[idx] = Some(recipe);
+    Some(idx)
 }
 
 /// Clone the launch surfaces the restart path replays from a parsed

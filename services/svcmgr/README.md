@@ -128,8 +128,10 @@ svcmgr/
   `ProcessInfo.service_registry_cap` ([docs/ipc-interface.md](docs/ipc-interface.md) § Messages).
 - **Graceful shutdown** — when a `critical = yes` service is permanently
   down (restart not attempted, budget exhausted, or restart failed), resolve
-  `ipc::published_names::PWRMGR_SHUTDOWN` from the registry and issue
-  `pwrmgr_labels::SHUTDOWN` ([docs/restart-protocol.md](docs/restart-protocol.md) § Decision tree).
+  the name the shutdown actuator's recipe declares
+  ([`shutdown_actuator`](docs/service-definitions.md#shutdown_actuator)) from the
+  registry and issue `pwrmgr_labels::SHUTDOWN` through it
+  ([docs/restart-protocol.md](docs/restart-protocol.md) § Decision tree).
 
 ---
 
@@ -175,8 +177,9 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount v
 
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
 (required), `critical` (required), `namespace` (required), `cwd`,
-`seed`, `provides`, `log_sink`, `debug_authority`, `priority`, `sched_max`. Unknown keys
-are hard errors. Restart values: `never | on_failure | always`.
+`seed`, `provides`, `log_sink`, `shutdown_actuator`, `debug_authority`,
+`priority`, `sched_max`. Unknown keys are hard errors. Restart values:
+`never | on_failure | always`.
 Critical values: `yes | no`. Namespace forms:
 `none | universal | subtree:<path>:<rights>`. `priority` / `sched_max`
 are the service's scheduling placement (level and `SchedControl` band
@@ -224,10 +227,11 @@ Centralised name constants live in `ipc::published_names`.
 governs only what happens once a service is permanently down, not
 whether it restarts ([docs/service-definitions.md](docs/service-definitions.md)
 § `critical`). A `critical = yes` service triggers a graceful
-shutdown via pwrmgr on permanent death (restart not attempted, budget
+shutdown through the shutdown actuator, the service whose recipe declares
+`shutdown_actuator`, on permanent death (restart not attempted, budget
 exhausted, or restart failed); a `critical = no` service is logged and
-the system continues degraded. Edge case: pwrmgr itself cannot trigger
-shutdown on its own death (the shutdown source is gone); svcmgr logs the
+the system continues degraded. Edge case: with the actuator itself down,
+its own death included, nothing can power the system off; svcmgr logs the
 degraded state. See
 [docs/restart-protocol.md](docs/restart-protocol.md) for the decision
 tree.

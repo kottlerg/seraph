@@ -76,6 +76,17 @@ pub fn build_blob(tokens: &[String]) -> (Vec<u8>, u64)
     (blob, tokens.len() as u64)
 }
 
+/// The index in `defs` of the system's shutdown actuator: the first
+/// definition, in `defs`' order, that declares
+/// [`Definition::shutdown_actuator`]. `None` when none declares it. svcmgr
+/// passes its scan in launch order, and reports every later declaration as
+/// a configuration error and recognises only this one.
+#[must_use]
+pub fn shutdown_actuator(defs: &[Definition]) -> Option<usize>
+{
+    defs.iter().position(|d| d.shutdown_actuator.is_some())
+}
+
 /// Restart-policy values parsed from the `restart = ...` line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RestartPolicy
@@ -133,8 +144,9 @@ pub struct Definition
     /// Whether the system is viable without this service once it is
     /// permanently down (restart not attempted, budget exhausted, or
     /// restart failed).
-    /// `true` (`critical = yes`) → svcmgr issues `pwrmgr_labels::SHUTDOWN`
-    /// on unrecoverable death; `false` (`critical = no`) → the system
+    /// `true` (`critical = yes`) → svcmgr asks the shutdown actuator
+    /// ([`Definition::shutdown_actuator`]) to power the system off on
+    /// unrecoverable death; `false` (`critical = no`) → the system
     /// continues degraded. Orthogonal to [`Definition::restart`], which
     /// alone decides whether/when to respawn.
     pub system_critical: bool,
@@ -176,6 +188,13 @@ pub struct Definition
     /// procmgr and delivers it in the bootstrap slot after the `seed` caps.
     /// Exclusive of `log_sink`.
     pub debug_authority: bool,
+    /// `shutdown_actuator = <name>` marks the service as the system's shutdown
+    /// actuator: when a `critical = yes` service is permanently down, svcmgr
+    /// resolves `<name>`, one of this recipe's `:auth` [`Definition::provides`]
+    /// entries, and calls the shutdown request through it. The parser requires
+    /// a supervised service (`restart` other than `never`). `None` for every
+    /// other service; [`shutdown_actuator`] picks one actuator from a scan.
+    pub shutdown_actuator: Option<String>,
     /// Priority level the service's initial thread is created at
     /// (`priority = ...`, range `1..=30`). `None` = unspecified: procmgr
     /// applies its default (`sched_policy::DEFAULT_SPAWN_PRIORITY` clamped
@@ -229,6 +248,29 @@ mod tests
     fn no_tokens_pack_to_the_empty_blob_and_zero_count()
     {
         assert_eq!(build_blob(&[]), (Vec::new(), 0));
+    }
+
+    /// A recipe named `name`, declaring a shutdown actuator when `actuator`.
+    fn recipe(name: &str, actuator: bool) -> Definition
+    {
+        let mut contents = String::from(
+            "binary = /services/x\nrestart = on_failure\ncritical = no\nnamespace = none\n\
+             provides = p:auth\n",
+        );
+        if actuator
+        {
+            contents.push_str("shutdown_actuator = p\n");
+        }
+        parse::parse(name, &contents).expect("valid recipe")
+    }
+
+    #[test]
+    fn the_first_declared_shutdown_actuator_is_the_one_recognised()
+    {
+        let defs = [recipe("a", false), recipe("b", true), recipe("c", true)];
+        assert_eq!(shutdown_actuator(&defs), Some(1));
+        assert_eq!(shutdown_actuator(&[recipe("a", false)]), None);
+        assert_eq!(shutdown_actuator(&[]), None);
     }
 
     #[test]

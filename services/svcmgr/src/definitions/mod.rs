@@ -17,8 +17,9 @@
 //! launch (for services init did not bootstrap) and every restart.
 //!
 //! The plain-data recipe types, the `.svc` parser, the argv/env wire-blob
-//! encoder `build_blob`, and the cwd-cap rights (`cwd_rights`) and
-//! `HANDOVER_COMPLETE` gate (`handover_permitted`) decisions live in the
+//! encoder `build_blob`, and the cwd-cap rights (`cwd_rights`),
+//! `HANDOVER_COMPLETE` gate (`handover_permitted`), and shutdown-actuator
+//! choice (`shutdown_actuator`) decisions live in the
 //! host-tested `svcmgr-defs` crate (re-exported here); this module keeps the
 //! impure halves:
 //!
@@ -35,5 +36,5 @@ pub mod reconcile;
 
 pub use svcmgr_defs::{
     Definition, NamespaceShape, ProvidedName, RestartPolicy, SERVICES_DIR, build_blob, cwd_rights,
-    handover_permitted, parse,
+    handover_permitted, parse, shutdown_actuator,
 };

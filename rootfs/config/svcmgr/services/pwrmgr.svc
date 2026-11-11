@@ -19,13 +19,17 @@
 # re-serves a fresh RECV on the persistent endpoint, so a SHUTDOWN_AUTHORITY
 # cap cached against `pwrmgr.shutdown` survives a crash-restart. pwrmgr
 # re-acquires its actuator caps from devmgr on each (re)start.
-# `critical = no`: a permanently-dead pwrmgr cannot self-shutdown, so the
-# graceful-shutdown-via-pwrmgr path would be circular; the honest terminal
+# `shutdown_actuator = pwrmgr.shutdown` declares pwrmgr the system's
+# shutdown actuator: when a `critical = yes` service is permanently down,
+# svcmgr calls SHUTDOWN through its own `pwrmgr.shutdown` SEND.
+# `critical = no`: a permanently-dead pwrmgr cannot power the system off,
+# so a graceful shutdown on its death is impossible; the honest terminal
 # state is logged-and-continue, matching timed.
-binary    = /services/pwrmgr
-priority  = 16
-restart   = on_failure
-critical  = no
-namespace = none
-provides  = pwrmgr.shutdown:auth pwrmgr.deny:deny
-seed      = devmgr.shutdown
+binary            = /services/pwrmgr
+priority          = 16
+restart           = on_failure
+critical          = no
+namespace         = none
+provides          = pwrmgr.shutdown:auth pwrmgr.deny:deny
+seed              = devmgr.shutdown
+shutdown_actuator = pwrmgr.shutdown

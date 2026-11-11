@@ -315,7 +315,7 @@ policy + budget):
 | `system_critical` | Behaviour once permanently down |
 |---|---|
 | `false` (`critical = no`) | Logged; service marked inactive; system continues degraded |
-| `true` (`critical = yes`) | Initiate graceful shutdown via `published_names::PWRMGR_SHUTDOWN` |
+| `true` (`critical = yes`) | Initiate graceful shutdown through the [`shutdown_actuator`](service-definitions.md#shutdown_actuator) name |
 
 ---
 

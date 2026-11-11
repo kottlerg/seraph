@@ -131,12 +131,14 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      § Label 1), on first launch and on restart alike.
 
 `dispatch_deaths` reacts to `Unrecoverable` by calling
-`initiate_graceful_shutdown`, which resolves
-`ipc::published_names::PWRMGR_SHUTDOWN` from svcmgr's discovery
-registry and issues `pwrmgr_labels::SHUTDOWN`. Edge case: a
-`system_critical` pwrmgr death cannot trigger graceful shutdown
-(the shutdown source is itself gone); svcmgr logs the degraded
-state and returns (see
+`initiate_graceful_shutdown`, which resolves the name the shutdown
+actuator's recipe declares
+([`shutdown_actuator`](service-definitions.md#shutdown_actuator)) from
+svcmgr's discovery registry and issues `pwrmgr_labels::SHUTDOWN` through
+it. Edge case: with no actuator recorded, or the actuator not running (its
+entry inactive, its own permanent death included, or its thread exited),
+graceful shutdown is impossible; svcmgr logs the degraded state and returns
+without calling (see
 [service-definitions.md](service-definitions.md#critical)).
 
 ---

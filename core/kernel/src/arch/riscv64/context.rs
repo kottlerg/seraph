@@ -180,7 +180,7 @@ pub unsafe extern "C" fn switch(
     // a0 = current (*mut SavedState)
     // a1 = next (*const SavedState)
     // a2 = save_flag (*const AtomicU32) — context_saved flag on current TCB
-    // SAFETY: `switch` saves and restores every callee-saved register the ABI requires;
+    // `switch` saves and restores every callee-saved register the ABI requires;
     // the caller guarantees `current` and `next` are valid, aligned `SavedState`
     // pointers and `save_flag` is a valid `AtomicU32` or null.
     core::arch::naked_asm!(

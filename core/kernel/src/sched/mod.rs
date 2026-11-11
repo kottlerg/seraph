@@ -2242,7 +2242,7 @@ pub fn sleep_check_wakeups()
             crate::sched::thread::IpcThreadState::BlockedOnNotification
                 if !blocked_on.is_null() =>
             {
-                // SAFETY: BlockedOnNotification implies blocked_on_object is a
+                // BlockedOnNotification implies blocked_on_object is a
                 // *mut NotificationState (see `ipc::notification::notification_wait`).
                 // The kernel allocator guarantees NotificationState alignment;
                 // the cast_ptr_alignment lint is suppressed here because
@@ -2289,7 +2289,7 @@ pub fn sleep_check_wakeups()
 
             crate::sched::thread::IpcThreadState::BlockedOnEventQueue if !blocked_on.is_null() =>
             {
-                // SAFETY: BlockedOnEventQueue implies blocked_on_object is
+                // BlockedOnEventQueue implies blocked_on_object is
                 // a *mut EventQueueState (see
                 // `ipc::event_queue::event_queue_recv`). cast_ptr_alignment
                 // suppressed for the same reason as the notification arm above.
@@ -5769,7 +5769,6 @@ pub unsafe fn select_target_cpu_excluding(
     // (degenerate: cpu_count == 1 and that CPU excluded).
     let mut min_load = u32::MAX;
     let mut min_cpu = usize::MAX;
-    // SAFETY: scheduler slab covers cpu_count slots, all initialised by sched::init.
     for cpu in 0..cpu_count
     {
         if !eligible(cpu)
@@ -5936,7 +5935,6 @@ pub unsafe fn schedule(requeue: Requeue)
     // `sched_lock` across the requeue serialises those writes with those readers
     // (no data race). The returned flags carry the caller's true interrupt state
     // and govern the final `restore_interrupts_from`.
-    // SAFETY: current is valid when non-null; paired with the release below.
     let cur_sched_saved: Option<u64> = if current.is_null()
     {
         None
@@ -7047,7 +7045,7 @@ pub unsafe fn enter() -> !
     // Build the initial user-mode TrapFrame on the init thread's kernel stack.
     // The frame sits just below kernel_stack_top.
     let tf_size = core::mem::size_of::<TrapFrame>() as u64;
-    let tf_ptr: *mut TrapFrame = (kernel_stack_top - tf_size) as *mut _;
+    let tf_ptr: *mut TrapFrame = (kernel_stack_top - tf_size) as *mut TrapFrame;
 
     // Zero the frame then populate the user-mode entry fields via TrapFrame
     // methods (arch-specific field names are hidden inside

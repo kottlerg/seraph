@@ -1041,7 +1041,7 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Consume tail: clear owns_memory (parent now owns the merged range)
     //    and release the tail's slot. ──────────────────────────────────────────
-    // SAFETY: tail's write_lock held; this is the only mutator.
+    // tail's write_lock held; this is the only mutator.
     tail_ref
         .owns_memory
         .store(false, core::sync::atomic::Ordering::Release);

@@ -1636,7 +1636,7 @@ unsafe fn kernel_entry_post_rebase(
 /// Initialises per-CPU hardware state, announces the AP as ready, then enters
 /// the idle loop via [`sched::ap_enter`].
 ///
-/// # Safety
+/// # Preconditions
 /// Runs on a fresh kernel stack. All Phase 3–8 globals (direct map, per-CPU
 /// storage, scheduler, IDT) must have been set up by the BSP before this is called.
 #[cfg(not(test))]
@@ -1816,7 +1816,7 @@ fn pie_rebase_init_image(mut image: boot_protocol::InitImage) -> boot_protocol::
 }
 
 // Kernel `.text` bounds (linker-provided) for the panic backtrace scan.
-// SAFETY: provided by the linker script; only their addresses are taken.
+// Provided by the linker script; only their addresses are taken.
 #[cfg(not(test))]
 unsafe extern "C" {
     static __text_start: u8;

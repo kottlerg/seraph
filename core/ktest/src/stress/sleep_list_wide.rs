@@ -78,7 +78,7 @@ struct SmallStack([u8; 4096]);
 /// Every child's stack, holders first.
 const CHILDREN: usize = HOLDERS + WAKERS;
 
-// SAFETY: each child uses only its own element; children are deleted before
+// Each child uses only its own element; children are deleted before
 // this cell returns and stress cells run sequentially.
 static mut STACKS: [SmallStack; CHILDREN] = [const { SmallStack([0; 4096]) }; CHILDREN];
 

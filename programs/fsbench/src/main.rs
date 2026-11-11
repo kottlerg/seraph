@@ -59,7 +59,7 @@ fn cycles_now() -> u64
                 options(nostack, nomem, preserves_flags),
             );
         }
-        u64::from(hi) << 32 | u64::from(lo)
+        (u64::from(hi) << 32) | u64::from(lo)
     }
     #[cfg(target_arch = "riscv64")]
     {

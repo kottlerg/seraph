@@ -115,9 +115,9 @@ static ACKED: AtomicU32 = AtomicU32::new(0);
 /// IPC buffers for the call peer and the server (one live user each).
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
-// SAFETY: used only by the IPC phase's peer, which runs alone.
+// Used only by the IPC phase's peer, which runs alone.
 static mut PEER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
-// SAFETY: used only by the IPC phase's server, which runs alone.
+// Used only by the IPC phase's server, which runs alone.
 static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
 /// Which park a phase's peer races.
@@ -438,7 +438,7 @@ extern "C" fn notif_peer(arg: u64) -> !
 extern "C" fn call_peer(arg: u64) -> !
 {
     let ep = arg;
-    // SAFETY: sole live user of PEER_IPC_BUF (phases run sequentially).
+    // Sole live user of PEER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(PEER_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
     // registered by one thread at a time; no Rust object lives in it, and the
@@ -475,7 +475,7 @@ extern "C" fn sleep_peer(_arg: u64) -> !
 extern "C" fn server_entry(arg: u64) -> !
 {
     let ep = arg;
-    // SAFETY: sole live user of SERVER_IPC_BUF (phases run sequentially).
+    // Sole live user of SERVER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
     // registered by one thread at a time; no Rust object lives in it, and the

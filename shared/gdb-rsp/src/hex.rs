@@ -61,7 +61,7 @@ pub fn decode(hex: &[u8], out: &mut [u8]) -> Result<usize, Error>
     {
         let hi = nibble(hi).ok_or(Error::Malformed)?;
         let lo = nibble(lo).ok_or(Error::Malformed)?;
-        *byte = hi << 4 | lo;
+        *byte = (hi << 4) | lo;
     }
     Ok(n)
 }

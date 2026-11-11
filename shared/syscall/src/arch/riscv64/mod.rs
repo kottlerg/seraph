@@ -153,7 +153,7 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 /// # Safety
 ///
 /// The `# Safety` contract of `crate::raw_syscall4`, its only caller, which
-/// replaces the raw-wrapper contract in [`crate::arch`] § Safety: the call must
+/// replaces the raw-wrapper contract in [`crate::arch`] § Safety. The call must
 /// leave untouched everything the calling program runs on (see that contract's
 /// four conditions). Under it any argument value is admissible, and `nr` need
 /// not be a defined syscall.

@@ -22,7 +22,7 @@ use crate::arch::serial as uart;
 /// Whether serial has been successfully initialised.
 ///
 /// `write_byte` / `write_str` silently no-op when false.
-// SAFETY: ktest is single-threaded on the serial output path.
+// ktest is single-threaded on the serial output path.
 static mut SERIAL_READY: bool = false;
 
 /// Initialise the serial port using capabilities from the init protocol.

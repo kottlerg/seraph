@@ -255,7 +255,7 @@ pub fn cycles_now() -> u64
             options(nostack, nomem, preserves_flags),
         );
     }
-    u64::from(hi) << 32 | u64::from(lo)
+    (u64::from(hi) << 32) | u64::from(lo)
 }
 
 /// Run every x86-64-specific Tier 1 test.

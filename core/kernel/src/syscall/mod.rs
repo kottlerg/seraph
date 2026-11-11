@@ -776,7 +776,6 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     let thread_slot = unsafe { lookup_cap(cspace, thread_cap_idx, ThreadRights::CONTROL) }?;
 
     // Extract target TCB from the Thread cap.
-    // SAFETY: slot validated as Thread cap; header at offset 0.
     let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
     // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
@@ -928,7 +927,6 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     let aspace_slot = unsafe { lookup_cap(cspace, aspace_cap_idx, AsRights::CONTROL) }?;
 
     // Extract the inner AddressSpace from the AddressSpace cap.
-    // SAFETY: slot validated as AddressSpace cap; header at offset 0.
     let aspace_obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: the header pointer names an AddressSpaceObject
     // constructed in place at the start of its page-aligned wrapper page, so

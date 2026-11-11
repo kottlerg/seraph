@@ -2106,9 +2106,9 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
 /// `SYS_WAIT_SET_ADD` time is returned in the secondary return register
 /// (rdx on x86-64, a1 on RISC-V). The caller then reads from the identified
 /// source normally. A stop of the caller, or the destruction of the wait set
-/// while the caller is parked, returns `Interrupted`. A wait set takes one
-/// waiter: a wait while another thread waits on the set returns `InvalidState`
-/// at once.
+/// while the caller is parked, returns `Interrupted`. Any number of threads
+/// may wait on one set; they queue in arrival order, and each readiness
+/// notification wakes the longest-waiting one.
 #[cfg(not(test))]
 pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -2144,21 +2144,11 @@ pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: ws_state valid; scheduler lock not held.
     let result = unsafe { crate::ipc::wait_set::waitset_wait(ws_state, tcb) };
 
-    match result
+    if let Some(badge) = result
     {
-        Ok(badge) =>
-        {
-            // A source was already ready; return its badge.
-            tf.set_ipc_return(0, badge);
-            return Ok(0);
-        }
-        // Another thread waits on this set; this caller never parked.
-        Err(crate::ipc::wait_set::WaitSetPending::Occupied) =>
-        {
-            return Err(SyscallError::InvalidState);
-        }
-        Err(crate::ipc::wait_set::WaitSetPending::Parked) =>
-        {}
+        // A source was already ready; return its badge.
+        tf.set_ipc_return(0, badge);
+        return Ok(0);
     }
 
     // Release the wait-set pin before parking (the pin-before-park rule of

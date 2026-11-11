@@ -175,9 +175,11 @@ A **wait set** aggregates any combination of endpoints, notifications, and event
 member capacity its creator chose and paid for. A thread waits on the set and is woken when any
 member becomes ready; the result identifies a source that was ready when the wait returned, or
 when its readiness woke the waiter. That readiness can lapse before the thread's receive on the
-source (a queued sender stopped, say), so the receive can find nothing. A wait set takes one
-waiting thread at a time: a second thread's wait on the same set is refused with `InvalidState`.
-Destroying the set wakes its waiter with `Interrupted`.
+source (a queued sender stopped, say), so the receive can find nothing. Several threads may wait
+on one set, as a pool of workers sharing its sources: they queue in arrival order, and each
+readiness of a member wakes the one that has waited longest. A returned source reserves nothing
+for the thread it was returned to, so another thread of the pool can take what made it ready, and
+that thread's receive finds nothing. Destroying the set wakes every waiter with `Interrupted`.
 See [syscalls.md § `SYS_WAIT_SET_WAIT`](../core/kernel/docs/syscalls.md#sys_wait_set_wait-28).
 
 ---

@@ -2251,19 +2251,23 @@ Only one ready source is returned per call (wake-one semantics). If multiple sou
 are ready simultaneously, subsequent calls return them without blocking (see
 [ipc-internals.md](ipc-internals.md) § Multiple Ready Sources).
 
+Any number of threads may wait on one wait set. They queue in arrival order, and each
+readiness notification of a member wakes the longest-waiting one with that member's badge;
+the others stay parked.
+
 The badge names a source that was ready when the wait returned, or when its readiness
 woke the caller; a source whose readiness lapsed before the call (an endpoint whose
 queued sender was stopped or destroyed, a notification a direct wait drained) is not
 returned for it. Readiness can still lapse between the return and the caller's receive
-on the source, so that receive can find nothing (see
+on the source, so that receive can find nothing: the badge reserves nothing, and another
+thread waiting on the same set can take what made the source ready (see
 [ipc-internals.md](ipc-internals.md) § Wait Path).
 
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `InvalidState` (another
-thread already waits on the set; the caller does not wait — a wait set takes one waiter at a
-time), `Interrupted` (the caller was stopped or interrupted by an upcall, or the wait set was
-destroyed while the caller waited).
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `Interrupted` (the
+caller was stopped or interrupted by an upcall, or the wait set was destroyed while the caller
+waited).
 
 ---
 

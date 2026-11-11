@@ -10,10 +10,11 @@
 //!
 //! Tests cover immediate return (source signalled before the wait),
 //! cross-thread return (a child thread signals the source; the parent blocks
-//! unless the unpinned child signals first), and the refusal of a second
-//! concurrent waiter. The remove test verifies that only the remaining member
-//! can wake the wait set after removal, and the stale-entry test that a member
-//! whose source stopped being ready after it was queued is not returned.
+//! unless the unpinned child signals first), and two threads waiting on one
+//! set at once, each arrival waking one. The remove test verifies that only
+//! the remaining member can wake the wait set after removal, and the
+//! stale-entry test that a member whose source stopped being ready after it
+//! was queued is not returned.
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
@@ -31,26 +32,26 @@ const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 // Child stack for the blocking_wait test.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-// Child stacks for occupied_wait_refused's two waiters. The test deletes both
+// Child stacks for shared_set_waiters' two waiters. The test deletes both
 // children on every path, so a failed run leaves no thread on either stack.
-static mut OCCUPIED_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
+static mut SHARED_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
 
-/// `(ws, done)` for each of `occupied_wait_refused`'s two waiters, indexed like
-/// [`OCCUPIED_STACKS`]: each handle fills a word, so the pair goes by address.
-static OCCUPIED_ARGS: crate::spawn::ArgBlock<(u64, u64), 2> = crate::spawn::ArgBlock::new((0, 0));
+/// `(ws, done)` for each of `shared_set_waiters`' two waiters, indexed like
+/// [`SHARED_STACKS`]: each handle fills a word, so the pair goes by address.
+static SHARED_ARGS: crate::spawn::ArgBlock<(u64, u64), 2> = crate::spawn::ArgBlock::new((0, 0));
 
-/// `occupied_wait_refused`'s `done` bits for waiter 0; waiter 1 reports the
-/// same verdicts shifted by [`WAITER_SHIFT`]. Each waiter waits once on the
-/// set and reports one verdict: refused with `InvalidState`, returned with the
+/// `shared_set_waiters`' `done` bits for waiter 0; waiter 1 reports the same
+/// bits shifted by [`WAITER_SHIFT`]. Each waiter announces that it is about
+/// to wait, waits once on the set, and reports one verdict: returned with the
 /// member's badge, or returned otherwise.
-const BIT_REFUSED: u64 = 1 << 0;
+const BIT_READY: u64 = 1 << 0;
 const BIT_OK: u64 = 1 << 1;
 const BIT_BAD: u64 = 1 << 2;
 const WAITER_SHIFT: u32 = 3;
-const OCCUPIED_BADGE: u64 = 9;
-/// After the refusal, how long to look for a wake it wrongly caused, so that
-/// such a wake fails under its own message; a wrong wake after this window
-/// still fails the final badge check.
+const SHARED_BADGE: u64 = 9;
+/// Wall-clock settle: after both waiters announce themselves, so that each has,
+/// in practice, parked before the first arrival; and after a wake, to look for
+/// a second wake the same arrival wrongly caused.
 const SETTLE_SLEEP_MS: u64 = 20;
 /// Bound on each report. Applied through [`crate::scaled_bound`], which
 /// stretches it past [`crate::UNSCALED_CPUS`] CPUs, where a waiter's CPU
@@ -243,105 +244,142 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── wait_set_wait (occupied set) ──────────────────────────────────────────────
+// ── wait_set_wait (several waiters) ───────────────────────────────────────────
 
-/// The caps and children `occupied_wait_refused` creates; each is deleted on
-/// every path.
+/// The kind of member `shared_set_waiters` makes ready, and how it arrives.
+#[derive(Clone, Copy)]
+enum SharedMember
+{
+    /// A notification; each arrival is a `notification_send`.
+    Notification,
+}
+
+/// The caps and children one `shared_set_waiters` phase creates; each is
+/// deleted on every path.
 #[derive(Default)]
-struct Occupied
+struct Shared
 {
     ws: Option<u64>,
-    sig: Option<u64>,
+    member: Option<u64>,
     done: Option<u64>,
     waiters: [Option<crate::spawn::SpawnedChild>; 2],
 }
 
-/// Of two children waiting on one wait set, whichever enters second is refused
-/// with `InvalidState` at once, and the other's wait is unaffected: it does not
-/// return, and a member fire still reaches it. The refusal itself shows the
-/// other child is parked, so the test does not depend on which runs first.
-pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
+/// Two threads wait on one wait set at once, and each arrival of work on its
+/// member wakes one of them: the first arrival wakes exactly one waiter with
+/// the member's badge and leaves the other parked, and the second arrival
+/// wakes the other. One phase per member kind. Fails if the set refuses or
+/// fails the second wait, if one arrival wakes both waiters, or if an
+/// arrival while the member is still ready wakes no one.
+pub fn shared_set_waiters(ctx: &TestContext) -> TestResult
 {
-    let mut o = Occupied::default();
-    let result = occupied_run(ctx, &mut o);
-    // Deleting a thread tears the child down wherever it is, so the stacks
-    // are free even when the test failed with a child still parked.
-    let mut ok = true;
-    for child in o.waiters.iter_mut().flatten()
+    for member in [SharedMember::Notification]
     {
-        ok &= child.delete_thread().is_ok();
-        ok &= child.delete_cspace().is_ok();
-    }
-    for cap in [o.ws, o.sig, o.done].into_iter().flatten()
-    {
-        ok &= cap_delete(cap).is_ok();
-    }
-    result?;
-    if ok
-    {
-        Ok(())
-    }
-    else
-    {
-        Err("cap_delete after occupied test failed")
-    }
-}
-
-/// Create the set, its member, and `done`; start both waiters; wait for one
-/// refusal; then fire the member and require the other waiter's badge.
-fn occupied_run(ctx: &TestContext, o: &mut Occupied) -> TestResult
-{
-    let ws = *o.ws.insert(
-        wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
-            .map_err(|_| "wait_set_create for occupied failed")?,
-    );
-    let sig = *o.sig.insert(
-        cap_create_notification(ctx.memory_base)
-            .map_err(|_| "cap_create_notification (member) for occupied failed")?,
-    );
-    let done = *o.done.insert(
-        cap_create_notification(ctx.memory_base)
-            .map_err(|_| "cap_create_notification (done) for occupied failed")?,
-    );
-    wait_set_add(ws, sig, OCCUPIED_BADGE).map_err(|_| "wait_set_add for occupied failed")?;
-
-    let entries: [extern "C" fn(u64) -> !; 2] = [occupied_waiter_0, occupied_waiter_1];
-    for (k, entry) in entries.into_iter().enumerate()
-    {
-        let spawned =
-            crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for occupied failed")?;
-        let child = o.waiters[k].insert(spawned);
-        start_occupied_child(child, k, entry, ws, done)?;
-    }
-
-    let refused_any = waiter_bits(0, BIT_REFUSED) | waiter_bits(1, BIT_REFUSED);
-    let returned_any = waiter_bits(0, BIT_OK | BIT_BAD) | waiter_bits(1, BIT_OK | BIT_BAD);
-    let mut acc = collect(done, 0, refused_any | returned_any)?;
-    acc |= notification_wait_timeout(done, SETTLE_SLEEP_MS)
-        .map_err(|_| "notification_wait_timeout on done for occupied failed")?;
-    if acc & returned_any != 0
-    {
-        return Err("a wait set waiter returned before any member fired");
-    }
-    let parked: u32 = match acc & refused_any
-    {
-        b if b == waiter_bits(0, BIT_REFUSED) => 1,
-        b if b == waiter_bits(1, BIT_REFUSED) => 0,
-        _ => return Err("both waits on the wait set were refused with InvalidState"),
-    };
-
-    notification_send(sig, 0x1).map_err(|_| "notification_send for occupied failed")?;
-    acc = collect(done, acc, returned_any)?;
-    if acc & waiter_bits(parked, BIT_OK) == 0
-    {
-        return Err("the parked wait set waiter did not receive the member's badge");
+        let mut sh = Shared::default();
+        let result = shared_run(ctx, member, &mut sh);
+        // Deleting a thread tears the child down wherever it is, so the
+        // stacks are free even when the phase failed with a child parked.
+        let mut ok = true;
+        for child in sh.waiters.iter_mut().flatten()
+        {
+            ok &= child.delete_thread().is_ok();
+            ok &= child.delete_cspace().is_ok();
+        }
+        for cap in [sh.ws, sh.member, sh.done].into_iter().flatten()
+        {
+            ok &= cap_delete(cap).is_ok();
+        }
+        result?;
+        if !ok
+        {
+            return Err("wait_set::shared_set_waiters: cap_delete in cleanup failed");
+        }
     }
     Ok(())
 }
 
-/// Start `child` at `entry` on occupied stack `stack`, passing it copies of
-/// `ws` and `done` through entry `stack` of [`OCCUPIED_ARGS`].
-fn start_occupied_child(
+/// Create the set, its `member`, and `done`; park both waiters; then make two
+/// arrivals on the member, requiring one wake for each.
+fn shared_run(ctx: &TestContext, member: SharedMember, sh: &mut Shared) -> TestResult
+{
+    let ws = *sh.ws.insert(
+        wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+            .map_err(|_| "wait_set::shared_set_waiters: wait_set_create failed")?,
+    );
+    let source = *sh.member.insert(
+        match member
+        {
+            SharedMember::Notification => cap_create_notification(ctx.memory_base),
+        }
+        .map_err(|_| "wait_set::shared_set_waiters: creating the member failed")?,
+    );
+    let done = *sh.done.insert(
+        cap_create_notification(ctx.memory_base)
+            .map_err(|_| "wait_set::shared_set_waiters: cap_create_notification (done) failed")?,
+    );
+    wait_set_add(ws, source, SHARED_BADGE)
+        .map_err(|_| "wait_set::shared_set_waiters: wait_set_add failed")?;
+
+    let entries: [extern "C" fn(u64) -> !; 2] = [shared_waiter_0, shared_waiter_1];
+    let mut acc = 0;
+    for (k, entry) in entries.into_iter().enumerate()
+    {
+        let spawned = crate::spawn::new_child(ctx)
+            .map_err(|_| "wait_set::shared_set_waiters: spawn::new_child failed")?;
+        let child = sh.waiters[k].insert(spawned);
+        start_shared_child(child, k, entry, ws, done)?;
+        // cast_possible_truncation: k < 2.
+        #[allow(clippy::cast_possible_truncation)]
+        let mask = waiter_bits(k as u32, BIT_READY);
+        acc = collect(done, acc, mask)?;
+    }
+    let _ = thread_sleep(crate::scaled_bound(SETTLE_SLEEP_MS));
+
+    let returned = |k: u32| waiter_bits(k, BIT_OK | BIT_BAD);
+    let returned_any = returned(0) | returned(1);
+    acc |= notification_wait_timeout(done, SETTLE_SLEEP_MS)
+        .map_err(|_| "wait_set::shared_set_waiters: waiting on done failed")?;
+    if acc & returned_any != 0
+    {
+        return Err("wait_set::shared_set_waiters: a waiter returned before any arrival");
+    }
+
+    arrive(member, source)?;
+    acc = collect(done, acc, returned_any)?;
+    acc |= notification_wait_timeout(done, SETTLE_SLEEP_MS)
+        .map_err(|_| "wait_set::shared_set_waiters: waiting on done failed")?;
+    let parked: u32 = match (acc & returned(0) != 0, acc & returned(1) != 0)
+    {
+        (true, false) => 1,
+        (false, true) => 0,
+        _ => return Err("wait_set::shared_set_waiters: one arrival woke both waiters"),
+    };
+
+    arrive(member, source)?;
+    acc = collect(done, acc, returned(parked)).map_err(|_| {
+        "wait_set::shared_set_waiters: a second arrival on a still-ready member did not wake \
+         the second waiter"
+    })?;
+    if acc & (waiter_bits(0, BIT_BAD) | waiter_bits(1, BIT_BAD)) != 0
+    {
+        return Err("wait_set::shared_set_waiters: a waiter returned without the member's badge");
+    }
+    Ok(())
+}
+
+/// Make one arrival of work on `source`, a `member` kind of source.
+fn arrive(member: SharedMember, source: u64) -> TestResult
+{
+    match member
+    {
+        SharedMember::Notification => notification_send(source, 0x1),
+    }
+    .map_err(|_| "wait_set::shared_set_waiters: an arrival on the member failed")
+}
+
+/// Start `child` at `entry` on shared stack `stack`, passing it copies of
+/// `ws` and `done` through entry `stack` of [`SHARED_ARGS`].
+fn start_shared_child(
     child: &crate::spawn::SpawnedChild,
     stack: usize,
     entry: extern "C" fn(u64) -> !,
@@ -349,20 +387,21 @@ fn start_occupied_child(
     done: u64,
 ) -> TestResult
 {
-    let c_ws = cap_copy(ws, child.cs, RIGHTS_ALL).map_err(|_| "cap_copy ws for occupied failed")?;
-    let c_done =
-        cap_copy(done, child.cs, RIGHTS_NOTIFY).map_err(|_| "cap_copy done for occupied failed")?;
-    // SAFETY: each occupied stack belongs to one of this test's two children,
+    let c_ws = cap_copy(ws, child.cs, RIGHTS_ALL)
+        .map_err(|_| "wait_set::shared_set_waiters: cap_copy(ws) failed")?;
+    let c_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
+        .map_err(|_| "wait_set::shared_set_waiters: cap_copy(done) failed")?;
+    // SAFETY: each shared stack belongs to one of this test's two children,
     // which the test deletes before returning; unit tests run sequentially.
-    let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(OCCUPIED_STACKS[stack]) });
+    let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(SHARED_STACKS[stack]) });
     // SAFETY: `stack` < 2; the entry's previous child (one of an earlier
-    // run's waiters, deleted before that run returned) has exited, and this
-    // one has not started.
-    let arg = unsafe { OCCUPIED_ARGS.publish(stack, (c_ws, c_done)) };
-    // SAFETY: the stack is `OCCUPIED_STACKS[stack]`, this test's own `ChildStack`,
+    // phase's or run's waiters, deleted before it returned) has exited, and
+    // this one has not started.
+    let arg = unsafe { SHARED_ARGS.publish(stack, (c_ws, c_done)) };
+    // SAFETY: the stack is `SHARED_STACKS[stack]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(child, entry, stack_top, arg) }
-        .map_err(|_| "configure_and_start for occupied failed")
+        .map_err(|_| "wait_set::shared_set_waiters: configure_and_start failed")
 }
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
@@ -372,10 +411,10 @@ fn collect(done: u64, mut acc: u64, mask: u64) -> Result<u64, &'static str>
     while acc & mask == 0
     {
         let bits = notification_wait_timeout(done, crate::scaled_bound(REPORT_MS))
-            .map_err(|_| "notification_wait_timeout on done for occupied failed")?;
+            .map_err(|_| "wait_set::shared_set_waiters: waiting on done failed")?;
         if bits == 0
         {
-            return Err("the wait set waiter did not report in time");
+            return Err("wait_set::shared_set_waiters: a waiter did not report in time");
         }
         acc |= bits;
     }
@@ -692,17 +731,18 @@ extern "C" fn sender_entry(sig_slot: u64) -> !
     thread_exit()
 }
 
-/// Wait once on the occupied set and report waiter `k`'s verdict; `arg` is
-/// the waiter's [`OCCUPIED_ARGS`] entry.
-fn occupied_waiter(arg: u64, k: u32) -> !
+/// Announce, wait once on the shared set, and report waiter `k`'s verdict;
+/// `arg` is the waiter's [`SHARED_ARGS`] entry. The waiter does not receive on
+/// the member, so the member stays ready after its wake.
+fn shared_waiter(arg: u64, k: u32) -> !
 {
-    // SAFETY: `arg` is the `OCCUPIED_ARGS` entry `start_occupied_child`
-    // published for this waiter.
+    // SAFETY: `arg` is the `SHARED_ARGS` entry `start_shared_child` published
+    // for this waiter.
     let (ws, done): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
+    notification_send(done, waiter_bits(k, BIT_READY)).ok();
     let bit = match wait_set_wait(ws)
     {
-        Err(e) if e == SyscallError::InvalidState as i64 => BIT_REFUSED,
-        Ok(OCCUPIED_BADGE) => BIT_OK,
+        Ok(SHARED_BADGE) => BIT_OK,
         _ => BIT_BAD,
     };
     notification_send(done, waiter_bits(k, bit)).ok();
@@ -710,13 +750,13 @@ fn occupied_waiter(arg: u64, k: u32) -> !
 }
 
 /// Waiter 0's entry.
-extern "C" fn occupied_waiter_0(arg: u64) -> !
+extern "C" fn shared_waiter_0(arg: u64) -> !
 {
-    occupied_waiter(arg, 0)
+    shared_waiter(arg, 0)
 }
 
 /// Waiter 1's entry.
-extern "C" fn occupied_waiter_1(arg: u64) -> !
+extern "C" fn shared_waiter_1(arg: u64) -> !
 {
-    occupied_waiter(arg, 1)
+    shared_waiter(arg, 1)
 }

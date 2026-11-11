@@ -60,8 +60,7 @@ one set of links suffices). No separate allocation. Threads are served in arriva
   list through `tcb.ipc_wait_next` and `tcb.ipc_wait_prev` storing only its tail (the head is the
   tail's successor), so it is pointer-sized. Each queued TCB's `ipc_wait_queue` tag names the
   queue, so push, pop, removal of any waiter, and the membership test are O(1) and touch only the
-  TCBs they link or unlink. A wait set holds at most one waiter (§ Wait Set, Wait Path
-  step 1).
+  TCBs they link or unlink.
 
 ### Call Path (Sender)
 
@@ -625,8 +624,8 @@ pub struct WaitSetState
     ready_head: u16,
     ready_tail: u16,
 
-    /// The thread blocked in SYS_WAIT_SET_WAIT, if any (at most one; a second
-    /// wait is refused). A WaitQueue so its claims share the source code.
+    /// Threads blocked in SYS_WAIT_SET_WAIT, in arrival order. A WaitQueue,
+    /// so its claims share the source code.
     waiters: WaitQueue,
 }
 
@@ -690,8 +689,7 @@ waitset_notify(wait_set, member_idx):
 `SYS_WAIT_SET_WAIT`:
 
 ```
-1. Acquire lock; if a thread already waits, Release lock and return
-   InvalidState (a wait set takes one waiter)
+1. Acquire lock
 2. while ready_ring is non-empty:
    a. member_idx = ready_ring.pop()
    b. if members[member_idx] is vacant (removed), or its source is not
@@ -700,7 +698,8 @@ waitset_notify(wait_set, member_idx):
 3. Level-readiness self-heal: for each member, if source_is_ready(source)
    right now, Release lock and return its badge.
 4. else, still under the lock:
-   a. context_saved = 0; waiters.push(current_tcb)
+   a. context_saved = 0; waiters.push(current_tcb) (the tail, behind any
+      threads already waiting)
    b. commit_blocked_under_local_lock(current_tcb, BlockedOnWaitSet, ws);
       on a refusal, remove current_tcb from waiters, and stamp INTERRUPTED
       if the refusal was a stop or a pending upcall (RefusedStop)
@@ -723,6 +722,18 @@ never drops a live edge. A returned badge names a source that was ready when the
 returned (step 2 or 3), or when its readiness woke the waiter. That readiness can
 still lapse before the caller's own receive on the source, for the same reasons,
 so that receive can find nothing to take.
+
+**Several waiters.** Any number of threads may wait on one set, queued in arrival
+order on `waiters`. Each `waitset_notify` wakes the head and leaves the rest
+parked, and the set's destruction wakes them all. A thread parks only after steps 2
+and 3 found nothing ready under the lock, so no member's readiness is stranded
+while a thread waits: every readiness after that point reaches `waitset_notify`.
+The badge a wake deposits reserves nothing. A thread that enters the wait before
+the woken one receives can be returned the same member by step 2 or 3 and take what
+made it ready, and the woken thread's receive then finds nothing. A thread that
+shares a set with others therefore receives without blocking where the source
+offers that (`SYS_EVENT_RECV`'s try-once mode), or accepts that its blocking
+receive waits for the source's next arrival.
 
 **Why step 3 exists, and its memory-ordering requirement.** Readiness
 notifications (`waitset_notify`) are *edge-triggered*: `event_queue_post` fires
@@ -761,7 +772,7 @@ source object and `inc_ref`s the source's `KernelObjectHeader`: wait-set members
 is a +1 cap-level reference on the source. Holding the source lock makes the
 registration atomic from the source's side, so no readiness notification is lost.
 If the source is already ready at add time, `waitset_add` queues the member and
-wakes any waiter immediately.
+wakes the longest-waiting thread, if any, immediately.
 
 `SYS_WAIT_SET_REMOVE` acquires both the wait set lock and the source object lock,
 removes the member, clears the back-pointer, and `dec_ref`s the source's

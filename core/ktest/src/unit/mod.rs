@@ -423,8 +423,8 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("wait_set::blocking_wait", wait_set::blocking_wait(ctx));
     run_test!(
-        "wait_set::occupied_wait_refused",
-        wait_set::occupied_wait_refused(ctx)
+        "wait_set::shared_set_waiters",
+        wait_set::shared_set_waiters(ctx)
     );
     run_test!(
         "wait_set::stale_endpoint_entry_skipped",

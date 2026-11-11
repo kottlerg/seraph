@@ -204,9 +204,9 @@ pub struct WaitSetState
     ready_head: u16,
     /// Write pointer into the ready ring (next index to push).
     ready_tail: u16,
-    /// The thread blocked on `sys_wait_set_wait`, if any. At most one: a wait
-    /// while another thread waits is refused (`WaitSetPending::Occupied`).
-    /// Held as a [`WaitQueue`](crate::ipc::WaitQueue) so its claims share the
+    /// The threads blocked in `sys_wait_set_wait`, in arrival order. Any
+    /// number may wait; each readiness notification wakes the head. A
+    /// [`WaitQueue`](crate::ipc::WaitQueue), so its claims share the
     /// notification and event-queue code.
     pub waiters: crate::ipc::WaitQueue,
 }
@@ -342,8 +342,9 @@ impl WaitSetState
 /// transitions, and from `notification_send` on every send that finds no
 /// blocked waiter while a wait set is registered.
 ///
-/// If a thread is blocked in `waitset_wait`, it is woken immediately.
-/// Otherwise the member index is pushed to the ready ring for the next caller.
+/// If threads are blocked in `waitset_wait`, the longest-waiting one is woken
+/// with the member's badge and the others stay parked. Otherwise the member
+/// index is pushed to the ready ring for the next caller.
 ///
 /// # Safety
 /// `ws_opaque` must be a valid `*mut WaitSetState` cast to `*mut u8`.
@@ -394,39 +395,23 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u16)
     unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
 }
 
-/// Why [`waitset_wait`] returned without a badge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitSetPending
-{
-    /// The caller went through the park commit (committed, or refused and
-    /// rolled back); it must reach `schedule()` and then read its deposit.
-    Parked,
-    /// Another thread already waits on the set; the caller did not park and
-    /// the syscall returns `InvalidState`.
-    Occupied,
-}
-
 /// Block `caller` until any member becomes ready, or return the next pending badge.
 ///
-/// - If another thread already waits on the set, returns
-///   `Err(WaitSetPending::Occupied)` without parking: a wait set takes one
-///   waiter (any number of member sources).
-/// - If the ready ring is non-empty, pops and returns `Ok(badge)` without blocking.
+/// - If the ready ring is non-empty, pops and returns `Some(badge)` without
+///   blocking.
 /// - Else, if a registered member's source is level-ready, returns
-///   `Ok(badge)` for it without blocking (core/kernel/docs/ipc-internals.md
+///   `Some(badge)` for it without blocking (core/kernel/docs/ipc-internals.md
 ///   § Wait Path, Wait Set, step 3).
-/// - Otherwise makes `caller` the waiter, commits the park (a refused commit
-///   rolls the waiter back), and returns `Err(WaitSetPending::Parked)`.
-///   The syscall handler calls `schedule()`, then reads `caller.wakeup_value`.
+/// - Otherwise queues `caller` behind any threads already waiting, commits
+///   the park (a refused commit dequeues it again), and returns `None`: the
+///   caller went through the park commit and must reach `schedule()`, then
+///   read `caller.wakeup_value`.
 ///
 /// # Safety
 /// `ws` must be a valid pointer. Acquires the wait set's internal
 /// `Spinlock` for the duration; no caller-side locks are required.
 #[cfg(not(test))]
-pub unsafe fn waitset_wait(
-    ws: *mut WaitSetState,
-    caller: *mut ThreadControlBlock,
-) -> Result<u64, WaitSetPending>
+pub unsafe fn waitset_wait(ws: *mut WaitSetState, caller: *mut ThreadControlBlock) -> Option<u64>
 {
     // SAFETY: caller guarantees ws is valid for &mut access for the
     // duration of this call (the cap holding ws remains alive).
@@ -434,13 +419,6 @@ pub unsafe fn waitset_wait(
 
     // SAFETY: lock is owned by ws; matched unlock_raw on every return path.
     let saved = unsafe { ws.lock.lock_raw() };
-
-    if !ws.waiters.is_empty()
-    {
-        // SAFETY: paired with lock_raw above.
-        unsafe { ws.lock.unlock_raw(saved) };
-        return Err(WaitSetPending::Occupied);
-    }
 
     // An entry is a hint: the member's source is re-checked as it is popped,
     // so a readiness that lapsed since the push is skipped; see
@@ -452,7 +430,7 @@ pub unsafe fn waitset_wait(
     {
         // SAFETY: paired with lock_raw above.
         unsafe { ws.lock.unlock_raw(saved) };
-        return Ok(badge);
+        return Some(badge);
     }
 
     // Level-state self-heal: return the first member whose source is
@@ -474,7 +452,7 @@ pub unsafe fn waitset_wait(
         {
             // SAFETY: paired with lock_raw above.
             unsafe { ws.lock.unlock_raw(saved) };
-            return Ok(badge);
+            return Some(badge);
         }
     }
 
@@ -526,7 +504,7 @@ pub unsafe fn waitset_wait(
     }
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
-    Err(WaitSetPending::Parked)
+    None
 }
 
 /// Register a source in the wait set.
@@ -714,7 +692,7 @@ pub unsafe fn wait_set_drop(
         }
     }
 
-    // Under ws.lock, claim and wake the blocked waiter with its park stamped
+    // Under ws.lock, claim and wake every blocked waiter with its park stamped
     // INTERRUPTED (the destroyed wait set cancels the wait;
     // `SYS_WAIT_SET_WAIT` returns Interrupted).
     // SAFETY: lock owned by ws; matched unlock_raw below.

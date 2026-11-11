@@ -2010,14 +2010,15 @@ pub fn wait_set_remove(ws_cap: u64, source_cap: u64) -> Result<(), i64>
 /// was ready when the call returned, or when its readiness woke the caller.
 /// The badge is delivered in the secondary return register (rdx / a1). If
 /// multiple sources are ready, each call returns one badge without
-/// re-blocking. The source's readiness can lapse before the caller receives on
-/// it (a queued sender stopped or destroyed), so that receive can find
-/// nothing.
+/// re-blocking. Several threads may wait on one set; they queue in arrival
+/// order and each readiness notification wakes the longest-waiting one. The
+/// source's readiness can lapse before the caller receives on it (a queued
+/// sender stopped or destroyed, or another thread waiting on the set took
+/// what made it ready), so that receive can find nothing.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the wait set cap is invalid or lacks
-/// Wait rights; `-15` (`InvalidState`) if another thread already waits on the
-/// set (a wait set takes one waiter); `-16` (`Interrupted`) if the caller is
+/// Wait rights; `-16` (`Interrupted`) if the caller is
 /// stopped or interrupted by an upcall while waiting or the wait set is
 /// destroyed under it.
 #[inline]

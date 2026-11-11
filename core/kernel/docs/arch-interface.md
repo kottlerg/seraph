@@ -569,9 +569,12 @@ identity in the chosen hart's supervisor-level IMSIC file, so exactly one hart t
 claims it. The line's first binding chooses the CPU, and the line keeps it while any binding
 remains; a line bound again after its last binding went takes the next CPU in turn.
 
-Per-CPU table allocation that exists only on x86-64 (GDT/TSS, AP IST stacks, NMI-backtrace
-storage) is reached through the `init_ap_percpu_storage` module-level surface function (a
-no-op on RISC-V), not a `cfg(target_arch)`-gated call.
+Per-CPU table allocation that exists on one architecture only (on x86-64 the GDT/TSS, AP IST
+stacks, and NMI-backtrace storage; on RISC-V each CPU's IMSIC identity row, which Phase 5's AIA
+bring-up and every route read, and whose allocation halts the boot when the bootloader reported
+no valid IMSIC) is reached through the `init_ap_percpu_storage` module-level surface function,
+not a `cfg(target_arch)`-gated call. It runs in Phase 4, before Phase 5's interrupt
+initialisation.
 
 ---
 
@@ -930,7 +933,9 @@ pub const IOPB_PARTS: usize;
 pub fn sbi_forward(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> Result<u64, ()>;
 
 /// Allocate architecture-specific per-CPU tables during SMP bring-up: x86-64
-/// per-AP GDT/TSS, AP IST stacks, and NMI-backtrace storage; a no-op on RISC-V.
+/// per-AP GDT/TSS, AP IST stacks, and NMI-backtrace storage; RISC-V each CPU's
+/// IMSIC identity row, halting when no valid IMSIC was reported. Phase 4, before
+/// Phase 5's interrupt initialisation.
 pub fn init_ap_percpu_storage(cpu_count: usize, allocator: &mut mm::BuddyAllocator);
 ```
 

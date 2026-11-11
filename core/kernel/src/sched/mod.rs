@@ -2810,7 +2810,8 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     crate::percpu::init_storage(n, allocator);
 
     // Arch-specific per-CPU tables (x86-64 per-AP GDT/TSS, AP IST stacks, and
-    // NMI-backtrace storage; a no-op on RISC-V).
+    // NMI-backtrace storage; riscv64 each CPU's IMSIC identity row, which
+    // Phase 5's AIA bring-up needs, halting without a valid IMSIC).
     crate::arch::current::init_ap_percpu_storage(n, allocator);
 }
 

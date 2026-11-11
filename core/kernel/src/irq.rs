@@ -262,7 +262,8 @@ pub enum RouteError
     /// No discovered interrupt controller implements the line.
     NoSuchLine,
     /// The controller has no free delivery resource left for the line (on
-    /// x86-64, every device IDT vector is assigned).
+    /// x86-64, every device IDT vector is assigned; on riscv64, no CPU's IMSIC
+    /// file has a free identity).
     Exhausted,
     /// The line already holds [`MAX_IRQ_BINDINGS`] bindings.
     TooManyBindings,

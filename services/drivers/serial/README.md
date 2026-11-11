@@ -157,13 +157,16 @@ UART interrupt to a client notification via `SERIAL_REGISTER_RX_NOTIFY`. The
 kernel masks the line on each fire; the next `SERIAL_READ_BYTES` re-arms it
 after draining, via
 [`SYS_IRQ_ACK`](../../../core/kernel/docs/syscalls.md#sys_irq_ack-29). The
-driver registers the line with mode 0, edge-triggered and active-high (x86-64
-COM1 is ISA IRQ 4, which no MADT override reroutes). Because the x86 IOAPIC
-then delivers edge-triggered, a client must wait with a bounded
-timeout (the terminal uses 20 ms) so a byte racing the re-arm is recovered on
-the next drain; this also degrades gracefully to polling when no IRQ cap was
-delivered. The riscv64 APLIC source is programmed from the same mode, and the
-same bounded wait covers it.
+driver registers the line with the mode devmgr gives the SPCR record. On x86-64
+that is mode 0, edge-triggered and active-high (COM1 is ISA IRQ 4, which no
+MADT override reroutes). Because the x86 IOAPIC then delivers edge-triggered, a
+client must wait with a bounded timeout (the terminal uses 20 ms) so a byte
+racing the re-arm is recovered on the next drain; this also degrades gracefully
+to polling when no IRQ cap was delivered. On riscv64 the SPCR names an APLIC
+source, which devmgr gives level-triggered and active-high: the kernel programs
+the source Level1 and pends it again at the re-arm while the UART still
+asserts it, so a byte racing the re-arm is delivered, and the bounded wait
+remains the fallback for a boot without an IRQ cap.
 
 ---
 

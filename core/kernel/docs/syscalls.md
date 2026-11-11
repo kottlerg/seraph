@@ -2454,8 +2454,9 @@ Interrupt cap spans 32768 GSIs; on RISC-V a source outside the APLIC's reported
 sets a bit outside `IRQ_MODE_MASK`, or differs from the mode the line's bindings recorded),
 `QuotaExceeded` (the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; or,
 for the line's first binding on x86-64, every device IDT vector, 217 of them, is assigned to
-another routed GSI; a vector is freed when its line's last binding is removed). Nothing changes on
-an error.
+another routed GSI; a vector is freed when its line's last binding is removed; or, for the line's
+first binding on RISC-V, no CPU's IMSIC file has a free interrupt identity; an identity is freed
+when its line's last binding is removed). Nothing changes on an error.
 
 ---
 

@@ -10,6 +10,21 @@
 //! threads to its own endpoint, and serves the GDB remote serial protocol
 //! (`shared/gdb-rsp`) on the debug port. The protocol coverage, the stop
 //! model, and the detach are specified in `services/gdbstub/README.md`.
+//!
+//! # The target is never the stub
+//!
+//! The stub writes memory only through a thread cap procmgr's
+//! `ATTACH_PROCESS` listed, and serves only once its own
+//! `DECLARE_NO_DEBUG` was accepted. From then on procmgr refuses an attach
+//! to the stub, under its process badge or a crash badge, and refuses the
+//! registration of every thread it spawns, so no list holds a thread of the
+//! stub's through the stub's own entry (`services/procmgr/docs/ipc-interface.md`
+//! § Label 21). Another process's list could hold one only if a holder of
+//! `CONTROL` on that thread registered it there: the stub hands out no
+//! thread cap of its own but the watch, which procmgr keeps and never lists,
+//! and its creator, svcmgr, which holds its main thread's, registers only its
+//! own threads. So a `SYS_THREAD_WRITE_MEM` of the stub's writes another
+//! address space, which its `# Safety` contract does not constrain.
 
 mod arch;
 
@@ -62,15 +77,24 @@ fn main()
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // A debug-authority holder declares itself undebuggable before it spawns
-    // a thread, so no other holder stops it while it stops a target.
+    // a thread, so no other holder stops it while it stops a target. The
+    // declaration is also what keeps the stub's own address space out of
+    // its target: procmgr refuses an attach to a declared process
+    // (`NOT_ATTACHABLE`), so a stub whose declaration failed does not serve.
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let _ = unsafe {
+    let declared = unsafe {
         ipc::ipc_call(
             info.procmgr_endpoint,
             &IpcMessage::new(procmgr_labels::DECLARE_NO_DEBUG),
             ipc_buf,
         )
-    };
+    }
+    .is_ok_and(|r| r.label == procmgr_errors::SUCCESS);
+    if !declared
+    {
+        std::os::seraph::log!("DECLARE_NO_DEBUG not accepted; exiting");
+        return;
+    }
     // The recipe's seed is `devmgr.debug`; `debug_authority = yes` delivers
     // the authority cap in the slot after it.
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -1095,7 +1119,8 @@ impl Stub
             .all(|(i, chunk)| {
                 let at = addr + (i * syscall_abi::MAX_THREAD_MEM_COPY) as u64;
                 // SAFETY: the write lands in the target's address space, not
-                // the stub's own; every thread of the target is held.
+                // the stub's own (module doc, § The target is never the
+                // stub); every thread of the target is held.
                 unsafe { syscall::thread_write_mem(cap, at, chunk, 0) }.is_ok()
                     || write_text(cap, at, chunk)
             })
@@ -1169,7 +1194,8 @@ enum EventKind
 fn write_text(cap: u64, addr: u64, bytes: &[u8]) -> bool
 {
     // SAFETY: the write lands in the target's address space, not the stub's
-    // own, and every thread of the target is held, as a text write requires
+    // own (module doc, § The target is never the stub), and every thread of
+    // the target is held, as a text write requires
     // (docs/fault-handling.md § Debugging).
     unsafe { syscall::thread_write_mem(cap, addr, bytes, syscall_abi::THREAD_MEM_TEXT) }.is_ok()
 }

@@ -81,7 +81,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 12;
+pub const PROCMGR_LABELS_VERSION: u32 = 13;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -517,9 +517,10 @@ pub mod procmgr_labels
     /// badge of the thread's own when the thread's binding is the process's,
     /// or a debugger's ([`DEBUGGER_BADGE_TAG`]) while the process has no
     /// debugger watched ([`ATTACH_PROCESS`] `caps[0]`). Replies `SUCCESS`;
-    /// `INVALID_BADGE` when the badge names no live process; `NOT_ATTACHABLE`
-    /// when the process sent [`DECLARE_NO_DEBUG`], after unbinding the thread
-    /// as the declaration does when the cap carries the rights above;
+    /// `INVALID_BADGE` when the badge names no live process or carries
+    /// [`PROCESS_HANDLE_TAG`]; `NOT_ATTACHABLE` when the process sent
+    /// [`DECLARE_NO_DEBUG`], after unbinding the thread as the declaration
+    /// does when the cap carries the rights above;
     /// `INVALID_ARGUMENT` without a Thread cap carrying those rights;
     /// `THREAD_LIMIT` at [`REGISTERED_THREADS_MAX`]; `OUT_OF_MEMORY` when the
     /// heap cannot hold the entry. At those two
@@ -549,9 +550,26 @@ pub mod procmgr_labels
     /// debug-authority holder: the log sink, the serial and framebuffer
     /// drivers, the debug port's driver, and every debug-authority holder. No
     /// data, no caps. Replies `SUCCESS`, or
-    /// `INVALID_BADGE` when the badge names no live process. Specified in
+    /// `INVALID_BADGE` when the badge names no live process or carries
+    /// [`PROCESS_HANDLE_TAG`]. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_DEBUG`.
     pub const DECLARE_NO_DEBUG: u64 = 21;
+
+    /// Badge bit of a process handle, the SEND on procmgr's endpoint a
+    /// create reply carries as its first cap: badged with the child's process
+    /// badge and this bit. procmgr clears it before it serves any label, so
+    /// the handle names the child as before, and refuses [`DECLARE_NO_DEBUG`]
+    /// and [`REGISTER_THREAD`] on a badge carrying it, since those name the
+    /// sender itself: only the child's own procmgr cap, badged with the
+    /// process badge alone, sends them. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Messages.
+    pub const PROCESS_HANDLE_TAG: u64 = 1u64 << 59;
+    const _: () = core::assert!(
+        PROCESS_HANDLE_TAG & crate::VERB_BIT_MASK != 0
+            && PROCESS_HANDLE_TAG != DEBUG_AUTHORITY
+            && PROCESS_HANDLE_TAG != DEATH_EQ_AUTHORITY
+            && PROCESS_HANDLE_TAG != HOLD_RELEASE_AUTHORITY
+    );
 
     /// Thread caps one [`ATTACH_PROCESS`] reply carries at most.
     pub const ATTACH_THREADS_PAGE: usize = super::MSG_CAP_SLOTS_MAX;

@@ -102,6 +102,11 @@ pub fn serial_release()
     }
 }
 
+/// Nothing to drop on riscv64: the UART is reached through init's own
+/// address space, not a per-thread binding, so init-logd writes it as the
+/// main thread does.
+pub fn serial_unbound() {}
+
 /// Write one byte to the UART, spinning until the transmit register is ready.
 pub fn serial_write_byte(byte: u8)
 {

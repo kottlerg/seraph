@@ -259,9 +259,10 @@ mod tests
     #[test]
     fn a_release_without_the_token_bit_is_refused_and_the_hold_stays()
     {
-        // The process handle and the child's own procmgr cap carry the plain
-        // process badge; logd's cap carries another verb bit; an un-badged
-        // SEND carries 0. None of them may release the hold.
+        // procmgr serves the process handle (its tag cleared) and the child's
+        // own procmgr cap under the plain process badge; logd's cap carries
+        // another verb bit; an un-badged SEND carries 0. None of them may
+        // release the hold.
         let badge = 0x0000_0123_0000_0040;
         let mut holds = DmaHolds::new();
         holds.arm().unwrap();

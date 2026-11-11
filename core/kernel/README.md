@@ -54,16 +54,17 @@ core/kernel/
 │   │   │   └── speculation.rs  # Branchless bound mask (cmp/sbb) and opaque identity
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
+│   │       ├── aia.rs          # APLIC (MSI delivery mode) and IMSIC interrupt files
 │   │       ├── paging.rs       # Page table management (mode-parameterized)
 │   │       ├── context.rs      # Thread context save/restore, context switch
 │   │       ├── trap_frame.rs   # Trap frame: user register snapshot
-│   │       ├── interrupts.rs   # stvec, trap handler, PLIC
+│   │       ├── interrupts.rs   # stvec, trap handler, external-interrupt dispatch
 │   │       ├── idt.rs          # IDT stub
 │   │       ├── sbi.rs          # Generic SBI ecall forwarding
 │   │       ├── timer.rs        # Sstc (stimecmp) timer for preemption
 │   │       ├── syscall.rs      # No-op syscall init; ecall is routed by interrupts.rs trap_dispatch
 │   │       ├── cpu.rs          # Baseline gate, ASID probe, tp per-hart pointer, user copy
-│   │       ├── encoding.rs     # PLIC, SBI mask, F/D/V, page rounding, PTE permissions; host-tested
+│   │       ├── encoding.rs     # AIA encodings, SBI mask, F/D/V, PTE permissions; host-tested
 │   │       ├── gdt.rs          # GDT stub
 │   │       ├── fpu.rs          # Extended-state (F/D/V) control
 │   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)

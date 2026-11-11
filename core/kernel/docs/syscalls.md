@@ -2435,9 +2435,12 @@ On x86-64 the line's I/O APIC redirection entry is programmed with the recorded 
 for level-triggered, bit 13 for active-low. A level-triggered entry whose device still asserts at
 the unmask delivers again, so an assertion while the line is masked is not lost (see
 [docs/device-management.md](../../../docs/device-management.md) § Interrupt Delivery for what an
-edge-triggered entry loses on a shared level-triggered line). On RISC-V the PLIC gateway is
-level-sensitive and has no trigger or polarity setting: the mode is validated and recorded, and
-programs nothing.
+edge-triggered entry loses on a shared level-triggered line). On RISC-V the line's APLIC
+source mode is programmed with it: Edge1 (rising edge), Edge0 (falling edge), Level1
+(active-high) or Level0 (active-low). The APLIC in MSI delivery mode clears a source's pending
+bit when it forwards it, so the unmask of a level-sensitive source pends it again through
+`setipnum_le`, which takes only while the source is still asserted: an assertion held across
+the acknowledgements is delivered again, as on x86-64.
 
 **Capability requirements:** `irq_cap` (Notify rights; single-line), `notification_cap`
 (Notify rights).
@@ -2445,8 +2448,8 @@ programs nothing.
 **Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
 `InvalidArgument` (IRQ cap covers more than one line, or names an id no discovered
 interrupt controller implements: on x86-64 a GSI no I/O APIC reports, where the root
-Interrupt cap spans 32768 GSIs; on RISC-V a source outside the PLIC's reported
-`1..=riscv,ndev`, where the root Interrupt cap spans the PLIC's 1024-id space; see
+Interrupt cap spans 32768 GSIs; on RISC-V a source outside the APLIC's reported
+`1..=riscv,num-sources`, where the root Interrupt cap spans the APLIC's 1024-id space; see
 [arch-interface.md](arch-interface.md) § Module-level constants and free functions; or `mode`
 sets a bit outside `IRQ_MODE_MASK`, or differs from the mode the line's bindings recorded),
 `QuotaExceeded` (the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; or,
@@ -3105,7 +3108,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
 | `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM` or `SYS_THREAD_WRITE_MEM` copies |
-| `BOOT_PROTOCOL_VERSION` | 20 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 21 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
 [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the

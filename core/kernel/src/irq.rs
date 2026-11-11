@@ -18,7 +18,7 @@
 //! # Sizing
 //! The table has one entry per line the discovered interrupt controllers
 //! implement (`arch::current::interrupts::irq_line_count`: on x86-64 the GSIs the
-//! I/O APICs cover, on riscv64 the PLIC's sources), allocated once at Phase 5 by
+//! I/O APICs cover, on riscv64 the APLIC's sources), allocated once at Phase 5 by
 //! [`init_table`]. A line at or above that count is refused by [`register`].
 //!
 //! # Sharing
@@ -392,8 +392,9 @@ impl<T> Locked<T>
 }
 
 /// The routing state, serialised by its lock. Lock order: this lock, then the
-/// controller's leaf locks (x86-64 `IOAPIC_LOCK`, riscv64 `PLIC_LOCK`), which the
-/// controller routing calls take. It is never taken in interrupt context.
+/// controller's leaf lock (x86-64 `IOAPIC_LOCK`), which the controller routing
+/// calls take; the riscv64 APLIC accesses take none, each being a single register
+/// write. It is never taken in interrupt context.
 #[cfg(not(test))]
 static ROUTING: Locked<Routing> = Locked::new(Routing {
     routes: &[],
@@ -833,8 +834,9 @@ pub fn next_target_cpu(eligible: impl Fn(usize) -> bool) -> Option<usize>
 /// Dispatch a hardware interrupt for `irq` to every notification bound to it.
 ///
 /// Called from the arch-specific device IRQ path (x86-64: `idt::irq_dispatch`,
-/// with the GSI its device vector is assigned to; RISC-V: the PLIC external
-/// interrupt handler) with interrupts disabled.
+/// with the GSI its device vector is assigned to; RISC-V: the supervisor
+/// external interrupt handler, with the APLIC source its IMSIC claim names) with
+/// interrupts disabled.
 ///
 /// Flow ([`deliver`]):
 /// 1. Mask the line at the controller (no further delivery until every
@@ -842,7 +844,8 @@ pub fn next_target_cpu(eligible: impl Fn(usize) -> bool) -> Option<usize>
 /// 2. Mark every bound binding as owing an acknowledgement.
 /// 3. OR notification bit 0 into each binding's notification and enqueue the
 ///    waiter it woke.
-/// 4. Acknowledge at the controller (send EOI / PLIC complete).
+/// 4. Acknowledge at the controller (the x86-64 EOI; nothing on RISC-V, whose
+///    IMSIC claim cleared the identity).
 ///
 /// If no binding is linked, or the line is past the table, the IRQ is masked,
 /// acknowledged at the controller, and dropped.
@@ -900,9 +903,9 @@ unsafe fn deliver(irq: u32, route: &IrqRoute)
 
     // Mask before delivering, so the line stays quiet until every receiver
     // has acknowledged. With no binding the IRQ is dropped; it must still be
-    // acknowledged at the controller: without that, the PLIC keeps it
-    // "in-service" indefinitely, blocking all future external IRQs at the same
-    // priority (all sources share priority 1 by default).
+    // acknowledged at the controller: without the EOI, the x86-64 local APIC
+    // keeps its vector in service, blocking every interrupt of its priority
+    // class and below.
     crate::arch::current::interrupts::mask(irq);
     if !cur.is_null()
     {
@@ -922,7 +925,7 @@ unsafe fn deliver(irq: u32, route: &IrqRoute)
         cur = binding.next.load(Ordering::SeqCst);
     }
 
-    // Acknowledge at the interrupt controller (EOI / PLIC complete).
+    // Acknowledge at the interrupt controller (the x86-64 EOI).
     crate::arch::current::interrupts::acknowledge(irq);
 }
 

@@ -182,8 +182,12 @@ Each feature is classified per architecture as one of:
   memory, not user pages.
 - **ASID-tagged TLBs** — the `satp` ASID field, the RISC-V counterpart of PCID; see
   [memory-model.md](memory-model.md).
-- **PLIC** — the interrupt controller the kernel drives (base from `BootInfo.kernel_mmio`). AIA
-  (Ssaia, APLIC, IMSIC) is not yet supported.
+- **AIA (Ssaia, APLIC, IMSIC)** — the only external-interrupt path the kernel drives: Ssaia on
+  every hart, a supervisor-level APLIC domain that supports MSI delivery mode, and a
+  supervisor-level IMSIC file per hart at the layout the firmware tables report (both from
+  `BootInfo.kernel_mmio`). The kernel halts the boot without them (see
+  [initialization.md](../core/kernel/docs/initialization.md) § Phase 5: Architecture Hardware
+  Initialisation).
 - **Sstc — `stimecmp`** — the supervisor timer.
 - **Svpbmt, Svinval, Svnapot** — page-based memory types, fine-grained fence invalidation, and
   NAPOT page encodings; asserted by `paging::verify_paging_extensions`, before the first
@@ -217,7 +221,8 @@ Each feature is classified per architecture as one of:
 
 ### Unsupported
 
-- **AIA (Ssaia, APLIC, IMSIC)** — not yet supported; the kernel drives a PLIC.
+- **PLIC** — not driven: the kernel has no PLIC path, and a platform that presents only a PLIC
+  does not boot.
 - **Ssstateen / Smstateen** — not used, although the RVA23 floor mandates Ssstateen: the kernel
   does not program the state-enable CSRs.
 - **Legacy / embedded RISC-V profiles** — outside the RVA23 floor.
@@ -272,9 +277,11 @@ feature it halts with a message naming the specific feature, rather than failing
   this is gated). A hart without V, the boot hart or a secondary one, is stopped by the kernel's
   fatal illegal-instruction trap at its `vlenb` read rather than by a message naming V; the boot
   hart's named message covers a malformed `vlenb`. Extension requirements introduced by a subsystem
-  (the timer, the paging extensions) are asserted by that subsystem during boot — the timer, for
-  example, refuses to boot unless the bootloader confirmed Sstc (and a timebase frequency) for every
-  hart from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes).
+  (the timer, the paging extensions, AIA) are asserted by that subsystem during boot — the timer,
+  for example, refuses to boot unless the bootloader confirmed Sstc (and a timebase frequency) for
+  every hart from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes), and the interrupt
+  initialisation unless it confirmed Ssaia for every hart and reported a supervisor-level APLIC
+  domain and IMSIC layout.
 
 Platform features that are not CPU-detectable (the PIT, UEFI, ACPI/DTB, the UART) are not probed by
 the gate; their absence manifests as a boot failure on the discovery path they feed. A missing or

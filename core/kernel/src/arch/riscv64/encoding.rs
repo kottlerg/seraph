@@ -6,12 +6,15 @@
 //! RISC-V register-map and instruction-encoding arithmetic: the PLIC context
 //! layout, the PLIC source-count clamp, the SBI hart-mask window, page
 //! rounding, the F/D/V opcode decode the lazy extended-state trap uses, the
-//! PTE permission bits, and their test in the kernel's spurious-fault retry.
+//! PTE permission bits and their test in the kernel's spurious-fault retry,
+//! and the user leaf's grant bits and the permission change they bound.
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
 //! arch module. `arch/mod.rs` also compiles this file into host test builds
 //! of the other architectures, so `cargo xtask test` (run on an `x86_64`
 //! host) runs its tests.
+
+use crate::mm::paging::{LeafGrant, PagingError};
 
 /// Largest PLIC source id the RISC-V PLIC specification allows (sources 1..=1023;
 /// source 0 is reserved).
@@ -207,15 +210,62 @@ pub(super) const PTE_USER: u64 = 1 << 4;
 /// type, which every RAM mapping uses; NC and IO are the non-cacheable types.
 pub(super) const PTE_PBMT_MASK: u64 = 0b11 << 61;
 
-/// The leaf `new` with the memory type (PBMT) of the leaf `prior` it replaces.
+/// RSW bit 8 of a user leaf: its [`LeafGrant`] holds write. The RSW field,
+/// bits \[9:8\], is the only one the privileged specification leaves to
+/// supervisor software (bits \[60:54\] are reserved and must be zero); bit 8
+/// of a table-pointer entry is `paging::POOLED_TABLE` instead, which every
+/// reader checks only on an entry with no R, W or X. See
+/// core/kernel/docs/memory-internals.md § Leaf Grant.
+pub(super) const PTE_GRANT_WRITE: u64 = 1 << 8;
+/// RSW bit 9 of a user leaf: its [`LeafGrant`] holds execute.
+pub(super) const PTE_GRANT_EXECUTE: u64 = 1 << 9;
+
+/// The software bits that record `grant` in a user leaf.
+pub(super) fn grant_bits(grant: LeafGrant) -> u64
+{
+    let mut bits = 0;
+    if grant.writable
+    {
+        bits |= PTE_GRANT_WRITE;
+    }
+    if grant.executable
+    {
+        bits |= PTE_GRANT_EXECUTE;
+    }
+    bits
+}
+
+/// The [`LeafGrant`] the user leaf `pte` records (`paging::user_leaf_grant`).
+pub(super) fn user_leaf_grant(pte: u64) -> LeafGrant
+{
+    LeafGrant {
+        writable: pte & PTE_GRANT_WRITE != 0,
+        executable: pte & PTE_GRANT_EXECUTE != 0,
+    }
+}
+
+/// The bits a permission change keeps from the leaf it rewrites: the memory
+/// type (PBMT) and the grant.
+const KEPT_BY_PROTECT: u64 = PTE_PBMT_MASK | PTE_GRANT_WRITE | PTE_GRANT_EXECUTE;
+
+/// The leaf a permission change installs in place of the present user leaf
+/// `prior`, given `new`, a fresh user leaf of the same frame with the new
+/// rights; or [`PagingError::NotGranted`] when `new` holds W or X that
+/// `prior`'s grant lacks.
 ///
-/// A permission change keeps a page's memory type, so an IO device leaf of
+/// The result keeps `prior`'s memory type and grant: an IO device leaf of
 /// `SYS_MMIO_MAP` stays IO, which `SYS_THREAD_READ_MEM` and
 /// `SYS_THREAD_WRITE_MEM` rely on to refuse device memory
-/// (`AddressSpace::copy_user_bytes`).
-pub(super) fn keep_memory_type(new: u64, prior: u64) -> u64
+/// (`AddressSpace::copy_user_bytes`), and the grant stays what the installing
+/// capability carried.
+pub(super) fn protected_leaf(prior: u64, new: u64) -> Result<u64, PagingError>
 {
-    (new & !PTE_PBMT_MASK) | (prior & PTE_PBMT_MASK)
+    let grant = user_leaf_grant(prior);
+    if (new & PTE_WRITE != 0 && !grant.writable) || (new & PTE_EXECUTE != 0 && !grant.executable)
+    {
+        return Err(PagingError::NotGranted);
+    }
+    Ok((new & !KEPT_BY_PROTECT) | (prior & KEPT_BY_PROTECT))
 }
 
 /// The access the user leaf PTE `pte` grants, or `None` when it is not valid
@@ -420,15 +470,76 @@ mod tests
     fn a_rights_change_keeps_the_leaf_memory_type()
     {
         let ppn = 0x200 << 10;
-        let device = PTE_VALID | PTE_USER | PTE_READ | PTE_WRITE | (0b10 << 61) | ppn;
+        let device =
+            PTE_VALID | PTE_USER | PTE_READ | PTE_WRITE | PTE_GRANT_WRITE | (0b10 << 61) | ppn;
         let read_only = PTE_VALID | PTE_USER | PTE_READ | ppn;
-        let protected = keep_memory_type(read_only, device);
+        let protected = protected_leaf(device, read_only).unwrap();
         let flags = user_leaf_flags(protected).unwrap();
         assert!(flags.uncacheable && !flags.writable);
-        assert_eq!(protected & !PTE_PBMT_MASK, read_only);
+        assert_eq!(
+            protected & !(PTE_PBMT_MASK | PTE_GRANT_WRITE),
+            read_only
+        );
 
         let ram = PTE_VALID | PTE_USER | PTE_READ | ppn;
-        let protected = keep_memory_type(read_only | (0b10 << 61), ram);
+        let protected = protected_leaf(ram, read_only | (0b10 << 61)).unwrap();
         assert!(!user_leaf_flags(protected).unwrap().uncacheable);
+    }
+
+    // Defect caught (#868): a permission change that let a leaf take W or X
+    // its installing capability lacked, so a read-only Mmio or Memory mapping
+    // turned writable or executable through any other Memory capability; one
+    // that dropped the grant, so a narrowing lost the rights a later protect
+    // may take back; or grant bits that overlap a field the hart reads.
+    #[test]
+    fn a_rights_change_stays_within_the_leaf_grant_and_keeps_it()
+    {
+        let ppn = 0x300 << 10;
+        let base = PTE_VALID | PTE_USER | PTE_READ | ppn;
+        let rw = base | PTE_WRITE;
+        let rx = base | PTE_EXECUTE;
+        let write = LeafGrant {
+            writable: true,
+            executable: false,
+        };
+        let exec = LeafGrant {
+            writable: false,
+            executable: true,
+        };
+
+        // A Map-only leaf: no widening at all, a read-only rewrite taken.
+        let map_only = base | grant_bits(LeafGrant::default());
+        assert_eq!(map_only, base);
+        assert_eq!(protected_leaf(map_only, rw), Err(PagingError::NotGranted));
+        assert_eq!(protected_leaf(map_only, rx), Err(PagingError::NotGranted));
+        assert_eq!(protected_leaf(map_only, base), Ok(base));
+
+        // A read-only leaf of a Write-bearing capability widens to W, not to
+        // X, and keeps its grant across a narrowing and back.
+        let rw_cap = base | grant_bits(write);
+        assert_eq!(user_leaf_grant(rw_cap), write);
+        let widened = protected_leaf(rw_cap, rw).unwrap();
+        assert!(user_leaf_flags(widened).unwrap().writable);
+        assert_eq!(user_leaf_grant(widened), write);
+        assert_eq!(protected_leaf(rw_cap, rx), Err(PagingError::NotGranted));
+        assert_eq!(protected_leaf(widened, base), Ok(rw_cap));
+
+        // An Execute-bearing one widens to X only.
+        let rx_cap = base | grant_bits(exec);
+        assert!(
+            user_leaf_flags(protected_leaf(rx_cap, rx).unwrap())
+                .unwrap()
+                .executable
+        );
+        assert_eq!(protected_leaf(rx_cap, rw), Err(PagingError::NotGranted));
+
+        // The grant sits in RSW alone: clear of V/R/W/X/U/G/A/D (bits 7:0),
+        // the PPN (53:10), PBMT (62:61) and N (63).
+        let both = grant_bits(LeafGrant {
+            writable: true,
+            executable: true,
+        });
+        assert_eq!(both, 0b11 << 8);
+        assert_eq!(both & (0xFF | (0xFFF_FFFF_FFFF << 10) | PTE_PBMT_MASK | (1 << 63)), 0);
     }
 }

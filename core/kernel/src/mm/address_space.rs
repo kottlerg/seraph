@@ -283,8 +283,8 @@ unsafe impl Sync for AddressSpace {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextWrite
 {
-    /// `THREAD_MEM_TEXT` set: a read-only page whose frame is mapped once
-    /// takes the write.
+    /// `THREAD_MEM_TEXT` set: a read-only page whose leaf grants write or
+    /// execute and whose frame is mapped once takes the write.
     Permitted,
     /// `THREAD_MEM_TEXT` clear: a read-only page refuses the write.
     Refused,
@@ -375,21 +375,25 @@ pub fn thread_mem_page_check(
 }
 
 /// Whether `SYS_THREAD_WRITE_MEM` may write a page whose user leaf grants
-/// `leaf`, with `text` as the call's flag gives it; `mappings` counts the
-/// frame's user leaf mappings and is read only for a read-only leaf.
+/// `leaf` and records `grant`, with `text` as the call's flag gives it;
+/// `mappings` counts the frame's user leaf mappings and is read only for a
+/// read-only leaf.
 ///
 /// A writable leaf takes any write, as a store of the thread would. A
-/// read-only one, such as text, needs `text`, and its frame mapped exactly
-/// once: the frame of a read-only page mapped elsewhere too may be another
-/// process's text or data, which the write would change through this
-/// thread's capability.
+/// read-only one, such as text, needs `text`; a grant of write or execute,
+/// so that the capability that mapped it let its holder change or run what
+/// it holds, which a Map-only capability (a firmware table, a page lent
+/// read-only) does not; and its frame mapped exactly once: the frame of a
+/// read-only page mapped elsewhere too may be another process's text or
+/// data, which the write would change through this thread's capability.
 ///
 /// # Errors
 /// - `InsufficientRights`: the leaf is read-only and `text` is
-///   [`TextWrite::Refused`].
+///   [`TextWrite::Refused`], or its grant holds neither write nor execute.
 /// - `InvalidState`: the leaf is read-only and the frame has another mapping.
 pub fn thread_mem_write_check(
     leaf: crate::mm::paging::PageFlags,
+    grant: crate::mm::paging::LeafGrant,
     text: TextWrite,
     mappings: impl FnOnce() -> u64,
 ) -> Result<(), SyscallError>
@@ -398,7 +402,7 @@ pub fn thread_mem_write_check(
     {
         return Ok(());
     }
-    if text == TextWrite::Refused
+    if text == TextWrite::Refused || !(grant.writable || grant.executable)
     {
         return Err(SyscallError::InsufficientRights);
     }
@@ -735,7 +739,9 @@ impl AddressSpace
         }
     }
 
-    /// Map `virt` → `phys` as a 4 KiB page with the given permission flags.
+    /// Map `virt` → `phys` as a 4 KiB page with the given permission flags,
+    /// whose [`LeafGrant`](crate::mm::paging::LeafGrant) is those flags: no
+    /// capability installed the leaf, so no permission change widens it.
     ///
     /// Acquires `pt_lock`, draws missing intermediate page-table frames
     /// from [`crate::mm::kernel_pt_pool`] (seeded at Phase 7), flushes the local
@@ -780,7 +786,8 @@ impl AddressSpace
         // pool lock nests under `pt_lock` (see the module's Concurrency note).
         // SAFETY: contract passed to caller; root_virt is valid; virt is
         // in user range; phys is a valid 4 KiB-aligned physical address.
-        let Ok(outcome) = (unsafe { map_user_page(self.root_virt, virt, phys, flags) })
+        let grant = crate::mm::paging::LeafGrant::of(flags);
+        let Ok(outcome) = (unsafe { map_user_page(self.root_virt, virt, phys, flags, grant) })
         else
         {
             self.pt_unlock();
@@ -819,7 +826,9 @@ impl AddressSpace
 
     /// Pooled variant of [`map_page`]: draws intermediate PT frames from
     /// the supplied [`AddressSpaceObject`](crate::cap::object::AddressSpaceObject)'s
-    /// growth pool instead of the kernel page-table pool.
+    /// growth pool instead of the kernel page-table pool, and records `grant`,
+    /// the Write and Execute rights of the capability the map syscall named,
+    /// in the leaf.
     ///
     /// The `aso` MUST wrap *this* `AddressSpace`. `sys_mem_map` enforces this
     /// implicitly because it resolves both via the same capability.
@@ -832,6 +841,7 @@ impl AddressSpace
         virt: u64,
         phys: u64,
         flags: crate::mm::paging::PageFlags,
+        grant: crate::mm::paging::LeafGrant,
         aso: &crate::cap::object::AddressSpaceObject,
     ) -> Result<(), ()>
     {
@@ -845,7 +855,8 @@ impl AddressSpace
         // SAFETY: as in `map_page`.
         let prior = unsafe { translate_user_page(self.root_virt, virt) }.map(|(p, _)| p);
         // SAFETY: caller's contract; aso pairs with this AS.
-        let Ok(outcome) = (unsafe { map_user_page_pooled(self.root_virt, virt, phys, flags, aso) })
+        let Ok(outcome) =
+            (unsafe { map_user_page_pooled(self.root_virt, virt, phys, flags, grant, aso) })
         else
         {
             self.pt_unlock();
@@ -1329,8 +1340,12 @@ impl AddressSpace
 
     /// Change the permission flags on an existing 4 KiB leaf mapping at `virt`.
     ///
-    /// Returns `Err(PagingError::NotMapped)` if `virt` is not mapped.
-    /// Caller is responsible for W^X and rights validation before calling.
+    /// Returns `Err(PagingError::NotMapped)` if `virt` is not mapped, and
+    /// `Err(PagingError::NotGranted)`, changing nothing, if `flags` asks for
+    /// write or execute beyond the leaf's
+    /// [`LeafGrant`](crate::mm::paging::LeafGrant); the check and the rewrite
+    /// run under `pt_lock`. Caller is responsible for W^X and the rights of
+    /// the capability the call names.
     /// Flushes the local TLB; a permission narrow also shoots down every other
     /// CPU where this address space is active, while a widen skips the remote
     /// shootdown (`core/kernel/docs/memory-internals.md` § SMP TLB Shootdown).
@@ -1412,8 +1427,9 @@ impl AddressSpace
     ///
     /// Each page must be mapped by a 4 KiB user leaf of normal memory below
     /// the top of RAM ([`thread_mem_page_check`]); a
-    /// write needs the leaf writable, or [`TextWrite::Permitted`] with the
-    /// frame mapped once ([`thread_mem_write_check`]). The thread's own access
+    /// write needs the leaf writable, or [`TextWrite::Permitted`] with a
+    /// grant of write or execute and the frame mapped once
+    /// ([`thread_mem_write_check`]). The thread's own access
     /// rights do not gate a read, so an execute-only page reads. A write's
     /// caller synchronises instruction fetch afterwards, whatever the leaves
     /// grant: a writable page's frame may be mapped executable elsewhere.
@@ -1437,7 +1453,7 @@ impl AddressSpace
         mut copy: UserCopy<'_>,
     ) -> Result<(), SyscallError>
     {
-        use crate::arch::current::paging::{translate_user_page, user_leaf_flags};
+        use crate::arch::current::paging::{translate_user_page, user_leaf_flags, user_leaf_grant};
 
         let (len, write) = match &copy
         {
@@ -1458,7 +1474,7 @@ impl AddressSpace
                 thread_mem_page_check(flags, phys, ram_top)?;
                 if let Some(text) = write
                 {
-                    thread_mem_write_check(flags, text, || {
+                    thread_mem_write_check(flags, user_leaf_grant(pte), text, || {
                         crate::mm::frame_map::mappings_in(phys, PAGE_SIZE as u64)
                     })?;
                 }
@@ -1777,19 +1793,93 @@ mod thread_mem_tests
             executable: !writable,
             uncacheable: false,
         };
-        assert!(thread_mem_write_check(leaf(true), TextWrite::Refused, || unreachable!()).is_ok());
+        let rx = crate::mm::paging::LeafGrant {
+            writable: false,
+            executable: true,
+        };
+        let check =
+            |writable, text, mappings: u64| thread_mem_write_check(leaf(writable), rx, text, || mappings);
+        assert!(
+            thread_mem_write_check(leaf(true), rx, TextWrite::Refused, || unreachable!()).is_ok()
+        );
         assert_eq!(
-            thread_mem_write_check(leaf(false), TextWrite::Refused, || 1),
+            check(false, TextWrite::Refused, 1),
             Err(SyscallError::InsufficientRights)
         );
-        assert!(thread_mem_write_check(leaf(false), TextWrite::Permitted, || 1).is_ok());
+        assert!(check(false, TextWrite::Permitted, 1).is_ok());
         assert_eq!(
-            thread_mem_write_check(leaf(false), TextWrite::Permitted, || 2),
+            check(false, TextWrite::Permitted, 2),
             Err(SyscallError::InvalidState)
         );
         assert_eq!(
-            thread_mem_write_check(leaf(false), TextWrite::Permitted, || 0),
+            check(false, TextWrite::Permitted, 0),
             Err(SyscallError::InvalidState)
+        );
+    }
+
+    // Defect caught (#869): a text write that took any read-only page mapped
+    // once would let a holder of a thread's CONTROL rewrite a firmware table
+    // (ACPI, the RSDP, the DTB) that its process maps through a Map-only
+    // capability, though no capability grants a write to it; and one that
+    // asked for write alone would refuse every breakpoint in text a process
+    // loader mapped through an Execute-bearing, Write-less capability.
+    #[test]
+    fn a_text_write_needs_a_grant_of_write_or_execute()
+    {
+        use crate::mm::paging::LeafGrant;
+        let read_only = crate::mm::paging::PageFlags {
+            readable: true,
+            writable: false,
+            executable: false,
+            uncacheable: false,
+        };
+        let check = |grant| thread_mem_write_check(read_only, grant, TextWrite::Permitted, || 1);
+        assert_eq!(
+            check(LeafGrant::default()),
+            Err(SyscallError::InsufficientRights)
+        );
+        for grant in [
+            LeafGrant {
+                writable: true,
+                executable: false,
+            },
+            LeafGrant {
+                writable: false,
+                executable: true,
+            },
+            LeafGrant {
+                writable: true,
+                executable: true,
+            },
+        ]
+        {
+            assert!(check(grant).is_ok(), "{grant:?}");
+        }
+        // The grant is read before the mapping count, as the flag is, so a
+        // Map-only page mapped elsewhere too reports the missing right.
+        assert_eq!(
+            thread_mem_write_check(
+                read_only,
+                LeafGrant::default(),
+                TextWrite::Permitted,
+                || unreachable!()
+            ),
+            Err(SyscallError::InsufficientRights)
+        );
+        // A writable leaf needs no grant: its own rights let the thread
+        // store there.
+        let writable = crate::mm::paging::PageFlags {
+            writable: true,
+            ..read_only
+        };
+        assert!(
+            thread_mem_write_check(
+                writable,
+                LeafGrant::default(),
+                TextWrite::Refused,
+                || unreachable!()
+            )
+            .is_ok()
         );
     }
 

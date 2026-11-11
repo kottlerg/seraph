@@ -65,14 +65,19 @@ impl PendingRegistration
 }
 
 /// The service its recipe declares the system's shutdown actuator
-/// (`shutdown_actuator = <name>`), recorded once its supervised entry is in
-/// the table.
+/// (`shutdown_actuator = <name>`), recorded once its supervised entry, and
+/// the service endpoint that entry holds, are in the table.
+#[derive(Clone, Copy)]
 pub struct ShutdownActuator
 {
     /// The actuator's slot in [`ServiceTable::services`].
     pub slot: usize,
-    /// The `:auth` provided name svcmgr resolves to call the shutdown request.
-    pub name: String,
+    /// The badge of the `:auth` `provides` entry `<name>` names, which svcmgr
+    /// stamps on the SEND it derives from the actuator's own endpoint to call
+    /// the shutdown request. Derived from the endpoint, not resolved by name
+    /// from the registry, whose entry for the name may be another
+    /// publisher's.
+    pub badge: u64,
 }
 
 /// The service table and its index-aligned restart recipes, grown together,
@@ -247,11 +252,11 @@ pub fn reconcile_and_launch(
     for (i, def) in defs.iter().enumerate()
     {
         let slot = handle_definition(def, pending, table, ctx, registry);
-        if let Some(name) = &def.shutdown_actuator
+        if let Some(provided) = &def.shutdown_actuator
         {
             if Some(i) == actuator
             {
-                record_shutdown_actuator(table, &def.name, name, slot);
+                record_shutdown_actuator(table, &def.name, provided.badge, slot);
             }
             else
             {
@@ -267,29 +272,28 @@ pub fn reconcile_and_launch(
 }
 
 /// Record the shutdown actuator `service` at its supervised `slot`, with the
-/// provided `name` svcmgr calls through. A `slot` of `None` (its launch or
-/// bind did not land) or a heap that cannot copy `name` leaves no actuator
+/// `badge` of the provided name it declares. A `slot` of `None` (its launch or
+/// bind did not land), or an entry that holds no service endpoint (a
+/// bind-only entry, for which svcmgr creates none), leaves no actuator
 /// recorded, logged.
 fn record_shutdown_actuator(
     table: &mut ServiceTable,
     service: &str,
-    name: &str,
+    badge: u64,
     slot: Option<usize>,
 )
 {
-    let Some(slot) = slot
-    else
+    match slot
     {
-        log!("svcmgr: shutdown actuator {service} not supervised; graceful shutdown unavailable");
-        return;
-    };
-    let Some(name) = try_string(name)
-    else
-    {
-        log!("svcmgr: no memory to record shutdown actuator {service}");
-        return;
-    };
-    table.shutdown_actuator = Some(ShutdownActuator { slot, name });
+        Some(slot) if table.services[slot].provided_endpoint != 0 =>
+        {
+            table.shutdown_actuator = Some(ShutdownActuator { slot, badge });
+        }
+        _ => log!(
+            "svcmgr: shutdown actuator {service} has no supervised endpoint; \
+             graceful shutdown unavailable"
+        ),
+    }
 }
 
 /// Route one parsed `Definition` to the bind-only or launch path. Returns

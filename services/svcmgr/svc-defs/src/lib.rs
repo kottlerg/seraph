@@ -189,12 +189,14 @@ pub struct Definition
     /// Exclusive of `log_sink`.
     pub debug_authority: bool,
     /// `shutdown_actuator = <name>` marks the service as the system's shutdown
-    /// actuator: when a `critical = yes` service is permanently down, svcmgr
-    /// resolves `<name>`, one of this recipe's `:auth` [`Definition::provides`]
-    /// entries, and calls the shutdown request through it. The parser requires
-    /// a supervised service (`restart` other than `never`). `None` for every
-    /// other service; [`shutdown_actuator`] picks one actuator from a scan.
-    pub shutdown_actuator: Option<String>,
+    /// actuator; this holds the `:auth` [`Definition::provides`] entry `<name>`
+    /// names. When a `critical = yes` service is permanently down, svcmgr
+    /// derives a SEND stamped with that entry's badge from the actuator's own
+    /// service endpoint and calls the shutdown request through it. The parser
+    /// requires a supervised service (`restart` other than `never`). `None`
+    /// for every other service; [`shutdown_actuator`] picks one actuator from
+    /// a scan.
+    pub shutdown_actuator: Option<ProvidedName>,
     /// Priority level the service's initial thread is created at
     /// (`priority = ...`, range `1..=30`). `None` = unspecified: procmgr
     /// applies its default (`sched_policy::DEFAULT_SPAWN_PRIORITY` clamped

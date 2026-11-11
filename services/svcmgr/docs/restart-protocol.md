@@ -130,15 +130,17 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      (see the [procmgr IPC interface](../../procmgr/docs/ipc-interface.md)
      § Label 1), on first launch and on restart alike.
 
-`dispatch_deaths` reacts to `Unrecoverable` by calling
-`initiate_graceful_shutdown`, which resolves the name the shutdown
-actuator's recipe declares
-([`shutdown_actuator`](service-definitions.md#shutdown_actuator)) from
-svcmgr's discovery registry and issues `pwrmgr_labels::SHUTDOWN` through
-it. Edge case: with no actuator recorded, or the actuator not running (its
-entry inactive, its own permanent death included, or its thread exited),
-graceful shutdown is impossible; svcmgr logs the degraded state and returns
-without calling (see
+`route_death` reacts to `Unrecoverable` by calling
+`initiate_graceful_shutdown`, which derives a SEND from the service
+endpoint of the shutdown actuator, the service whose recipe declares
+[`shutdown_actuator`](service-definitions.md#shutdown_actuator), stamped
+with the badge of the `:auth` name it declares, and issues
+`pwrmgr_labels::SHUTDOWN` through it. An actuator whose entry is active but
+whose thread has exited has its own death routed first, so it restarts or
+ends down before svcmgr calls it. Edge case: with no actuator recorded, or
+the actuator not running (its entry inactive, its own permanent death
+included), graceful shutdown is impossible; svcmgr logs the degraded state
+and returns without calling (see
 [service-definitions.md](service-definitions.md#critical)).
 
 ---

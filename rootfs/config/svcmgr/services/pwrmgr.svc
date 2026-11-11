@@ -21,7 +21,8 @@
 # re-acquires its actuator caps from devmgr on each (re)start.
 # `shutdown_actuator = pwrmgr.shutdown` declares pwrmgr the system's
 # shutdown actuator: when a `critical = yes` service is permanently down,
-# svcmgr calls SHUTDOWN through its own `pwrmgr.shutdown` SEND.
+# svcmgr calls SHUTDOWN through a SEND it derives from pwrmgr's endpoint
+# with the `pwrmgr.shutdown` entry's SHUTDOWN_AUTHORITY badge.
 # `critical = no`: a permanently-dead pwrmgr cannot power the system off,
 # so a graceful shutdown on its death is impossible; the honest terminal
 # state is logged-and-continue, matching timed.

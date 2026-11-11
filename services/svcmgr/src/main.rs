@@ -561,8 +561,7 @@ fn handle_publish_endpoint(msg: &IpcMessage, registry: &mut registry::Registry) 
 ///
 /// Shared by `QUERY_ENDPOINT` (IPC, [`Resolver::Query`]: seed-only names
 /// answer `UNKNOWN_NAME`) and svcmgr's own resolution ([`Resolver::Seed`]:
-/// each `.svc` `seed = ...` name on the launch and restart paths, and the
-/// shutdown actuator's provided name in a graceful shutdown).
+/// each `.svc` `seed = ...` name on the launch and restart paths).
 pub(crate) fn registry_lookup_derived(
     registry: &mut registry::Registry,
     name: &[u8],
@@ -735,21 +734,26 @@ fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
     }
 }
 
-/// Ask the shutdown actuator to power the system off: resolve the provided
-/// name its recipe declares (`shutdown_actuator = <name>`) from the discovery
-/// registry and call `pwrmgr_labels::SHUTDOWN`, the actuator's request label,
-/// through it. Called from [`route_death`] when a `system_critical` service
+/// Ask the shutdown actuator to power the system off: derive a SEND stamped
+/// with the badge of the `:auth` provided name its recipe declares
+/// (`shutdown_actuator = <name>`) from the actuator's own service endpoint,
+/// and call `pwrmgr_labels::SHUTDOWN`, the actuator's request label, through
+/// it. The registry is not consulted: its entry for the name may be another
+/// publisher's. Called from [`route_death`] when a `system_critical` service
 /// dies unrecoverably.
 ///
-/// With no actuator recorded, or with the actuator not running (its entry
-/// inactive, which covers its own unrecoverable death, or its thread exited
-/// before its death is routed), svcmgr logs the degraded state and returns:
-/// the actuator's endpoint outlives it, so a call would block svcmgr with no
-/// receiver to answer. An actuator that dies after this check, during the
-/// call, still leaves svcmgr blocked. No fallback raw-shutdown path exists.
+/// An actuator whose entry is active but whose thread has exited has a death
+/// not yet routed; that death is routed first, so the actuator restarts under
+/// its own policy or ends down. svcmgr then calls only a running actuator
+/// (entry active, thread not exited). With no actuator recorded, or the
+/// actuator down (its own permanent death included), svcmgr logs the
+/// degraded state and returns: the actuator's endpoint outlives it, so a call
+/// would block svcmgr with no receiver to answer. An actuator that dies
+/// during the call still leaves svcmgr blocked. No fallback raw-shutdown path
+/// exists.
 fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
-    let Some(actuator) = &state.table.shutdown_actuator
+    let Some(actuator) = state.table.shutdown_actuator
     else
     {
         std::os::seraph::log!(
@@ -757,6 +761,16 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
         );
         return;
     };
+    let entry = &state.table.services[actuator.slot];
+    if entry.active
+        && entry.thread_cap != 0
+        && !service_running(entry)
+        && let Ok(correlator) = u64::try_from(actuator.slot)
+    {
+        // `route_death` reads the exit reason the kernel recorded for the
+        // thread; the `0` stands only when that read fails.
+        route_death(correlator, 0, state, ctx);
+    }
     let entry = &state.table.services[actuator.slot];
     if !service_running(entry)
     {
@@ -768,21 +782,18 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
         return;
     }
 
-    let shutdown_cap = match registry_lookup_derived(
-        &mut state.registry,
-        actuator.name.as_bytes(),
-        Resolver::Seed,
+    let Ok(shutdown_cap) = syscall::cap_derive_badge(
+        entry.provided_endpoint,
+        syscall::RIGHTS_EP_SEND,
+        actuator.badge,
     )
+    else
     {
-        Ok(c) => c,
-        Err(code) =>
-        {
-            std::os::seraph::log!(
-                "graceful shutdown: cannot resolve {} (code={code})",
-                actuator.name
-            );
-            return;
-        }
+        std::os::seraph::log!(
+            "graceful shutdown: cannot derive a SEND on shutdown actuator {}",
+            entry.name_str()
+        );
+        return;
     };
 
     let shutdown_msg = IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);

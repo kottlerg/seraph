@@ -209,7 +209,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut provides: Vec<ProvidedName> = Vec::new();
     let mut log_sink: Option<bool> = None;
     let mut debug_authority: Option<bool> = None;
-    let mut shutdown_actuator: Option<String> = None;
+    let mut shutdown_name: Option<String> = None;
     let mut priority: Option<u8> = None;
     let mut sched_max: Option<u8> = None;
 
@@ -436,7 +436,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
             }
             "shutdown_actuator" =>
             {
-                if shutdown_actuator.is_some()
+                if shutdown_name.is_some()
                 {
                     return Err(ParseError::DuplicateKey(lineno, "shutdown_actuator"));
                 }
@@ -447,7 +447,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                         "shutdown_actuator must be one provided name",
                     ));
                 }
-                shutdown_actuator = Some(owned(value)?);
+                shutdown_name = Some(owned(value)?);
             }
             "priority" =>
             {
@@ -543,10 +543,11 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         ));
     }
 
-    if let Some(name) = &shutdown_actuator
+    let shutdown_actuator = match &shutdown_name
     {
-        check_shutdown_actuator(name, restart, &provides)?;
-    }
+        Some(name) => Some(check_shutdown_actuator(name, restart, &provides)?),
+        None => None,
+    };
 
     // The service's own band must cover its starting level, so it can
     // always restore its initial priority. procmgr enforces the same
@@ -580,26 +581,29 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
 }
 
 /// Check a `shutdown_actuator = <name>` declaration against the rest of its
-/// recipe: `name` is one of the recipe's own `provides` entries and carries
-/// `:auth`, since svcmgr calls the shutdown request through it and the
-/// actuator's gate tests the authority bit; and the service is supervised
-/// (`restart` other than `never`), since svcmgr reads the liveness of the
-/// actuator's supervised entry before it calls.
+/// recipe and return a copy of the `provides` entry it names: `name` is one
+/// of the recipe's own `provides` entries and carries `:auth`, since svcmgr
+/// stamps that entry's badge on the SEND it calls the shutdown request
+/// through and the actuator's gate tests the authority bit; and the service
+/// is supervised (`restart` other than `never`), since svcmgr reads the
+/// liveness of the actuator's supervised entry, and derives the SEND from
+/// the endpoint that entry holds, before it calls.
 fn check_shutdown_actuator(
     name: &str,
     restart: RestartPolicy,
     provides: &[ProvidedName],
-) -> Result<(), ParseError>
+) -> Result<ProvidedName, ParseError>
 {
-    if !provides
+    let Some(entry) = provides
         .iter()
-        .any(|p| p.name == name && p.badge == PROVIDES_AUTH_BADGE)
+        .find(|p| p.name == name && p.badge == PROVIDES_AUTH_BADGE)
+    else
     {
         return Err(ParseError::InvalidValue(
             0,
             "shutdown_actuator must name one of the recipe's :auth provides entries",
         ));
-    }
+    };
     if matches!(restart, RestartPolicy::Never)
     {
         return Err(ParseError::InvalidValue(
@@ -607,7 +611,10 @@ fn check_shutdown_actuator(
             "shutdown_actuator needs a supervised service (restart other than never)",
         ));
     }
-    Ok(())
+    Ok(ProvidedName {
+        name: owned(&entry.name)?,
+        badge: entry.badge,
+    })
 }
 
 /// Parse the `namespace = …` value. Accepts the three documented
@@ -906,12 +913,29 @@ sched_max = 12\n";
         )
     }
 
+    // Defect guarded: an actuator carrying the badge of a `:deny` entry that
+    // shares its name, which svcmgr would stamp on the SEND it calls through.
+    #[test]
+    fn a_shutdown_actuator_takes_the_auth_badge_of_a_name_also_denied()
+    {
+        let def = parse("x", &actuator_recipe("x.off:deny x.off:auth", "x.off"))
+            .expect("actuator recipe");
+        assert_eq!(
+            def.shutdown_actuator.expect("declared actuator").badge,
+            PROVIDES_AUTH_BADGE
+        );
+    }
+
     #[test]
     fn a_shutdown_actuator_names_its_own_auth_provided_name()
     {
         let def = parse("x", &actuator_recipe("x.off:auth x.deny:deny", "x.off"))
             .expect("actuator recipe");
-        assert_eq!(def.shutdown_actuator.as_deref(), Some("x.off"));
+        let actuator = def.shutdown_actuator.expect("declared actuator");
+        assert_eq!(
+            (actuator.name.as_str(), actuator.badge),
+            ("x.off", PROVIDES_AUTH_BADGE)
+        );
         assert!(parse_with("").expect("no key").shutdown_actuator.is_none());
     }
 

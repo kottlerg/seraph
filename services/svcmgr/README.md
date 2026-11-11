@@ -127,10 +127,11 @@ svcmgr/
   the lookup, served on the per-process SEND seeded into
   `ProcessInfo.service_registry_cap` ([docs/ipc-interface.md](docs/ipc-interface.md) § Messages).
 - **Graceful shutdown** — when a `critical = yes` service is permanently
-  down (restart not attempted, budget exhausted, or restart failed), resolve
-  the name the shutdown actuator's recipe declares
-  ([`shutdown_actuator`](docs/service-definitions.md#shutdown_actuator)) from the
-  registry and issue `pwrmgr_labels::SHUTDOWN` through it
+  down (restart not attempted, budget exhausted, or restart failed), derive a
+  SEND from the shutdown actuator's own service endpoint, stamped with the
+  badge of the `:auth` name its recipe declares
+  ([`shutdown_actuator`](docs/service-definitions.md#shutdown_actuator)), and
+  issue `pwrmgr_labels::SHUTDOWN` through it
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Decision tree).
 
 ---

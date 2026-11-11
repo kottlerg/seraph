@@ -79,12 +79,13 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
    never holds a platform cap longer than it needs — the served ACPI Memory
    caps are mapped read-only and dropped after parsing.
 3. Consumers permitted to power the platform off seed `pwrmgr.shutdown`
-   (e.g. svctest). svcmgr's own critical-service-death escalation resolves it
-   because `pwrmgr.svc` declares `shutdown_actuator = pwrmgr.shutdown`
-   ([`shutdown_actuator`](../svcmgr/docs/service-definitions.md#shutdown_actuator)). The
-   badge rides through the registry lookup unchanged, and the name is
-   seed-only, so `QUERY_ENDPOINT` does not hand it out
-   ([`provides`](../svcmgr/docs/service-definitions.md#provides)). svctest
+   (e.g. svctest); the badge rides through the registry lookup unchanged,
+   and the name is seed-only, so `QUERY_ENDPOINT` does not hand it out
+   ([`provides`](../svcmgr/docs/service-definitions.md#provides)). svcmgr's
+   own critical-service-death escalation derives an equally badged SEND from
+   pwrmgr's endpoint, because `pwrmgr.svc` declares
+   `shutdown_actuator = pwrmgr.shutdown`
+   ([`shutdown_actuator`](../svcmgr/docs/service-definitions.md#shutdown_actuator)). svctest
    also resolves the public `pwrmgr.deny`, the negative-test twin, to
    assert the gate rejects an unauthorised cap
    ([`provides`](../svcmgr/docs/service-definitions.md#provides);

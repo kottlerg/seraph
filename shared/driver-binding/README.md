@@ -11,7 +11,8 @@ for the driver and devmgr.
   `decode`). The descriptor is a version header and a list of kind, length, and payload fields:
   name, class, match keys (a PCI vendor and device, a PCI class under a mask, an ACPI `_HID` or
   `_CID`, an SPCR interface type, a platform key, an IOMMU family key, `boot-framebuffer`),
-  instance limit, interrupt need, DMA, physical access, withdrawal reset, and priority tier.
+  instance limit, interrupt need, DMA, DMA address width, physical access, withdrawal reset, and
+  priority tier.
   Every field has a fixed bound, and a descriptor that breaks one, repeats a field, or carries an
   unknown kind is rejected whole (`DeclError`). The wire format is specified in `src/decl.rs`.
 - **The note** (`note`): the `driver_declaration!` macro, which places one `seraph`-owned note in

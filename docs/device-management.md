@@ -223,9 +223,9 @@ buffer for the duration of the one request that uses it.
 
 devmgr returns every device address; no driver chooses one. With an IOMMU confining the device,
 the address is an IOVA in the device's domain, which devmgr allocates first fit from 1 MiB below
-the device's limit (the width the device's remapping unit translates, narrowed for a device whose
-DMA reaches fewer address bits; [limits.md](limits.md)), outside every firmware-reserved range the
-domain maps at its own address, and the mapping is installed in the IOMMU's tables, through the
+the device's limit (the width the device's remapping unit translates, narrowed to the DMA address
+width the device's driver declares; [limits.md](limits.md)), outside every firmware-reserved range
+the domain maps at its own address, and the mapping is installed in the IOMMU's tables, through the
 IOMMU driver (§ IOMMU Discovery and Programming), before devmgr replies, and withdrawn from them
 before devmgr deletes its cap at `DMA_UNMAP`, so the device reaches exactly the frames mapped for
 it and its reserved ranges. With none, the device can reach memory only at physical

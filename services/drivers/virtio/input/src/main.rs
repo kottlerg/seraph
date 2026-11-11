@@ -57,6 +57,7 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     instance_limit: None,
     interrupt: driver_binding::decl::Interrupt::OPTIONAL,
     dma: true,
+    dma_width: None,
     phys_access: false,
     reset: driver_binding::decl::Reset::VirtioStatus,
     tier: driver_binding::decl::Tier::Auxiliary,

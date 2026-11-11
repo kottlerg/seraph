@@ -152,9 +152,10 @@ devmgr's responsibilities are:
   records a mapping of the Memory cap a driver sends, which devmgr keeps while
   the mapping stands, and replies its device address, and `DMA_UNMAP` removes
   one (`ipc::devmgr_dma_labels`). For a confined device the address is an IOVA
-  devmgr allocates in the device's own IOVA space
-  (`devmgr_firmware::dma::iova_limit`), and the thread has the IOMMU driver
-  install the mapping (`MAP`, moving it a derivation of the cap) before it
+  devmgr allocates in the device's own IOVA space, below the smaller of the
+  unit's translated width and the DMA address width the bound declaration
+  states (`devmgr_firmware::dma::iova_limit`), and the thread has the IOMMU
+  driver install the mapping (`MAP`, moving it a derivation of the cap) before it
   replies, and remove it (`UNMAP`) before it deletes the cap; a refused or
   failed IOMMU call replies `IOMMU_FAILED`. The thread serves it apart from the registry
   loop because that loop makes nested calls and settles batches during which

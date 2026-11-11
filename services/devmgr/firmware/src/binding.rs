@@ -329,6 +329,7 @@ mod tests
                 instance_limit: limit,
                 interrupt: Interrupt::NONE,
                 dma: false,
+                dma_width: None,
                 phys_access: phys,
                 reset: Reset::None,
                 tier,

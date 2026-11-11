@@ -478,7 +478,7 @@ fn carve_pci_device(
     dev.device_badge = badge;
     if decl.dma
     {
-        let Some(grant) = grant_dma(name, pci_dev, carve.caps, badge)
+        let Some(grant) = grant_dma(name, pci_dev, decl.dma_width, carve.caps, badge)
         else
         {
             dev.release();
@@ -608,7 +608,8 @@ fn carve_bars(
 
 /// Give the device `pci_dev`, catalogued as `device_badge`, its DMA grant:
 /// first attach it to an IOMMU domain of its own when a remapping unit
-/// translates it ([`crate::iommu::Iommu::confine`]), so it reaches nothing
+/// translates it ([`crate::iommu::Iommu::confine`]), within the DMA address
+/// width `dma_width` its driver declares, so it reaches nothing
 /// its driver has not mapped but the regions the firmware reserves for it,
 /// which the domain maps at their own addresses and no mapping's IOVA
 /// overlaps. `None`, logged under `name`, when the device is refused (its
@@ -618,13 +619,14 @@ fn carve_bars(
 fn grant_dma(
     name: &str,
     pci_dev: &pci::PciDevice,
+    dma_width: Option<u8>,
     caps: &caps::DevmgrCaps,
     device_badge: u64,
 ) -> Option<dma::DmaGrant>
 {
     let (confinement, reserved) = match caps.iommu.as_ref()
     {
-        Some(i) => i.confine(name, pci_dev).ok()?,
+        Some(i) => i.confine(name, pci_dev, dma_width).ok()?,
         None => (Confinement::Unconfined, Vec::new()),
     };
     let grant = caps

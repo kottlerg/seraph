@@ -122,6 +122,7 @@ describes, and a signature over the binary would cover its declaration with it.
 | Instance limit | The most devices of its match the driver is bound to; absent means every one |
 | Interrupt need | None, optional, or required, and for a message-signaled capable driver the vector count it requests |
 | DMA | Whether the device performs DMA: the driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD` and given a DMA capability ([device-management.md](device-management.md#dma-authorisation) § DMA Authorisation) |
+| DMA address width | Optional, valid only beside DMA: the address bits the device's DMA reaches, 12 to 64; absent means the device has no limit of its own. devmgr limits the device's IOVA space to the smaller of this and its unit's width (§ Declaration Bounds) |
 | Physical access | Whether the driver programs hardware with physical addresses: it is then created `CREATE_PHYS_ACCESS` ([device-management.md](device-management.md#physical-addresses) § Physical Addresses). Accepted only for an IOMMU record (§ Declaration Bounds) |
 | Withdrawal reset | How devmgr stops the device when it withdraws the driver: the VirtIO `device_status` reset, a PCI Express Function Level Reset, or none, beside the interrupt disable every PCI function gets (§ Binding) |
 | Priority tier | Boot (`sched_policy::BOOT_DRIVER_PRIORITY`) or auxiliary (`AUX_DRIVER_PRIORITY`) |
@@ -168,6 +169,9 @@ never claims more than its device and the system's policy give it:
 - **Class.** Declaring a class decides which of that class's consumers talk to the driver; it
   grants no access, since the class's policy is configuration (§ Device Classes). Consumers
   treat a driver's data as untrusted.
+- **DMA width.** The width limits the device's IOVA space and never widens it past what its
+  remapping unit translates; devmgr knows no device's DMA width, so a driver declares its own.
+  A width without DMA, outside 12 to 64 bits, or repeated rejects the declaration whole.
 - **Form.** Every field has a fixed bound (the match entries, the name's length, the vector
   count). A declaration that exceeds one, carries an unknown field kind, or fails to decode is
   rejected whole and logged. devmgr's reads of a candidate binary are bounded too: the ELF

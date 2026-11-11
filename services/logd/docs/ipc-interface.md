@@ -274,8 +274,20 @@ more entries follow this page:
 A refused query's reply carries no entries. A page is a snapshot of the moment
 logd answers it; a caller walks the pages by resuming after the last entry it
 read, so an entry added or dropped between two pages shifts no other entry's
-place. A walk is not a snapshot: a slot retired between two pages of a
-`QUERY_SLOTS` walk can be read live on the first and retired on a later one.
+place. A walk of several pages is not a snapshot, and a client assumes only
+this across its pages:
+
+- `QUERY_SLOTS` reads each (badge, state) pair at most once. A slot retired
+  between two pages is read twice, live and then retired, when the walk passed
+  its badge before the retire. A slot created below the walk's cursor, or a
+  retired slot dropped before the walk reaches it, is missed.
+- `QUERY_HISTORY` reads each entry at most once, since `seq` is unique and the
+  walk moves to older `seq` only; a retire keeps an entry's `seq`. An entry
+  retained after the walk began is newer than every entry it read and is
+  missed, as is one a full ring drops before the walk reaches it.
+
+A client that needs one consistent view walks again once the state it waits
+for is reached.
 
 init-logd, which holds the endpoint's RECV until the handover, answers every
 label it does not serve with an empty `label = 0` reply, which reads as an empty

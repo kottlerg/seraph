@@ -290,7 +290,12 @@ impl<'a> Command<'a>
             }
             b'H' => parse_set_thread(rest),
             b'T' => Ok(Self::ThreadAlive(parse_thread(rest)?)),
-            b'D' if rest.is_empty() || rest.starts_with(b";") => Ok(Self::Detach),
+            b'D' if rest.is_empty() => Ok(Self::Detach),
+            b'D' if rest.starts_with(b";") =>
+            {
+                parse_u64(&rest[1..])?;
+                Ok(Self::Detach)
+            }
             b'k' if rest.is_empty() => Ok(Self::Kill),
             b'q' | b'Q' => parse_query(body),
             b'v' => parse_v(body),
@@ -313,7 +318,11 @@ fn parse_query(body: &[u8]) -> Result<Command<'_>, Error>
         b"qSupported" => Command::Supported(b""),
         _ if body.starts_with(b"qSupported:") => Command::Supported(&body[b"qSupported:".len()..]),
         b"qAttached" => Command::Attached,
-        _ if body.starts_with(b"qAttached:") => Command::Attached,
+        _ if body.starts_with(b"qAttached:") =>
+        {
+            parse_u64(&body[b"qAttached:".len()..])?;
+            Command::Attached
+        }
         _ if body.starts_with(FEATURES_READ) =>
         {
             let (annex, range) = split_once(&body[FEATURES_READ.len()..], b':')?;
@@ -708,6 +717,8 @@ mod tests
         assert_eq!(parse(b"qSupported"), Ok(Command::Supported(b"")));
         assert_eq!(parse(b"qAttached:1"), Ok(Command::Attached));
         assert_eq!(parse(b"qAttached"), Ok(Command::Attached));
+        assert_eq!(parse(b"qAttached:"), Err(Error::Malformed));
+        assert_eq!(parse(b"qAttached:zz"), Err(Error::Malformed));
         assert_eq!(parse(b"qOffsets"), Ok(Command::Offsets));
         assert_eq!(parse(b"QStartNoAckMode"), Ok(Command::StartNoAckMode));
         assert_eq!(parse(b"qfThreadInfo"), Ok(Command::ThreadInfoFirst));
@@ -740,6 +751,8 @@ mod tests
         assert_eq!(parse(b"vAttach;"), Err(Error::Malformed));
         assert_eq!(parse(b"D"), Ok(Command::Detach));
         assert_eq!(parse(b"D;2a"), Ok(Command::Detach));
+        assert_eq!(parse(b"D;"), Err(Error::Malformed));
+        assert_eq!(parse(b"D;zz"), Err(Error::Malformed));
         assert_eq!(parse(b"k"), Ok(Command::Kill));
     }
 

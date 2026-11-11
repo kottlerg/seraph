@@ -500,7 +500,7 @@ fn dispatch_ipc(
 )
 {
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let req = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+    let mut req = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
     {
         Ok(req) => req,
         Err(e) =>
@@ -511,7 +511,19 @@ fn dispatch_ipc(
     };
     guard.on_success();
     let label = req.label;
-    let badge = req.badge;
+    // A process handle carries `PROCESS_HANDLE_TAG` beside its child's
+    // badge. Every label is served under the child's badge alone, but the
+    // two that name their sender, `DECLARE_NO_DEBUG` and `REGISTER_THREAD`,
+    // are refused on a handle, so its holder can neither declare the child
+    // nor register a thread into the child's registry.
+    let (badge, on_handle) = process_table::request_badge(req.badge);
+    req.badge = badge;
+    if on_handle && !process_table::served_on_handle(label & 0xFFFF)
+    {
+        release_caps(req.caps());
+        reply_empty(ipc_buf, procmgr_errors::INVALID_BADGE);
+        return;
+    }
 
     // Every cap a request transfers has already moved into procmgr's
     // CSpace. Each arm releases the caps its wire layout does not name, and
@@ -797,7 +809,12 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
             // SAFETY: ipc_buf is the registered IPC buffer page.
             if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
             {
+                // The caller holds no RECV cap, so the registration is
+                // undone and the decliner receives again.
                 let _ = syscall::cap_delete(recv);
+                crash::unregister();
+                std::os::seraph::log!("crash service reply undeliverable; registration undone");
+                return;
             }
             std::os::seraph::log!("crash service registered");
         }
@@ -822,8 +839,8 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
 /// registration order, those that are gone swept out first, so no exited
 /// thread is listed. The request's badge may be a thread crash badge, which
 /// names its process and, in the reply's named-thread word, that thread.
-/// Returns the target's process badge when the attach succeeded, for the
-/// caller to keep the debugger watch `caps[0]` carried.
+/// Returns the target's process badge when the attach succeeded, the reply
+/// delivered, for the caller to keep the debugger watch `caps[0]` carried.
 fn handle_attach_process(
     req: &IpcMessage,
     ipc_buf: *mut u64,
@@ -884,7 +901,10 @@ fn handle_attach_process(
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) }.is_err()
     {
+        // The caller holds none of the caps, so the attach did not succeed
+        // and its watch is not kept.
         release_caps(&derived[..n]);
+        return None;
     }
     Some(badge)
 }

@@ -49,7 +49,7 @@ pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within
 pub use names::ProcessName;
 pub use request_caps::{CreateCaps, CreateTailCaps, split_create_caps};
 pub use threads::{
-    CrashBadges, RegisterRefusal, RegisteredThread, ThreadRegistry, is_debugger_badge,
+    CrashBadges, Origin, RegisterRefusal, RegisteredThread, ThreadRegistry, is_debugger_badge,
 };
 
 extern crate alloc;
@@ -85,10 +85,11 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 pub struct ProcessEntry
 {
     /// The child's process badge: the table key, the correlator of its death
-    /// observers, the badge of its process handle and of the procmgr,
-    /// registry, and log SENDs procmgr mints for it, and the source badge
-    /// logd keys its stream by. Minted at random and accepted only by
-    /// [`badge_is_acceptable`], so it carries no verb bit.
+    /// observers, the badge of its process handle (with
+    /// `procmgr_labels::PROCESS_HANDLE_TAG`, [`request_badge`]) and of the
+    /// procmgr, registry, and log SENDs procmgr mints for it, and the
+    /// source badge logd keys its stream by. Minted at random and accepted
+    /// only by [`badge_is_acceptable`], so it carries no verb bit.
     pub badge: u64,
     /// Slot in procmgr's `CSpace` of the child's `AddressSpace` cap, the
     /// root its self-cap and memmgr's delegation derive from.
@@ -282,6 +283,22 @@ impl ProcessEntry
     }
 }
 
+/// What a restore of a process's crash bindings (`DETACH_PROCESS`, or its
+/// watched debugger's death) does to the exception class of one of its
+/// registered threads ([`ProcessTable::restore_action`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreAction
+{
+    /// Leave the binding as it is.
+    Leave,
+    /// Bind the class to the crash endpoint under this badge; `0` asks for a
+    /// fresh crash badge, recorded as the thread's.
+    Bind(u64),
+    /// Unbind the class: a debugger's binding on a thread procmgr does not
+    /// bind back.
+    Unbind,
+}
+
 /// What [`ProcessTable::declare_no_debug`] takes from the entry it marks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Declared
@@ -439,6 +456,113 @@ impl ProcessTable
         self.entries
             .iter()
             .position(|e| e.threads.position_of_crash_badge(crash_badge).is_some())
+    }
+
+    /// Whose thread a `REGISTER_THREAD` from the process `sender` takes,
+    /// its exception class bound under `current` (`None`: unbound): another
+    /// live process's when the binding is that process's badge, or a crash
+    /// badge that process's registry lists; unbound when there is no
+    /// binding; the sender's own otherwise, as far as procmgr can tell (its
+    /// process badge, a crash badge its own registry or no registry lists, a
+    /// debugger's badge, or another handler's).
+    #[must_use]
+    pub fn origin_of(&self, sender: u64, current: Option<u64>) -> Origin
+    {
+        let Some(bound) = current
+        else
+        {
+            return Origin::Unbound;
+        };
+        if bound == sender
+        {
+            return Origin::Own;
+        }
+        let owner = if threads::is_crash_badge(bound)
+        {
+            let in_sender = self
+                .find_by_badge(sender)
+                .is_some_and(|e| e.threads.position_of_crash_badge(bound).is_some());
+            if in_sender
+            {
+                return Origin::Own;
+            }
+            self.index_of_crash_badge(bound)
+                .map(|idx| self.entries[idx].badge)
+        }
+        else
+        {
+            self.index_of_badge(bound).map(|idx| self.entries[idx].badge)
+        };
+        match owner
+        {
+            Some(badge) if badge != sender => Origin::Foreign(badge),
+            _ => Origin::Own,
+        }
+    }
+
+    /// What a restore of the crash bindings of the process `badge` does to
+    /// `thread`, one of its registered threads, whose exception class is
+    /// bound under `current` (`None`: unbound). By the thread's origin:
+    ///
+    /// * the sender's own: bound back under its crash badge, a fresh one when
+    ///   it has none, when [`ProcessEntry::restores`] says so (an unbound
+    ///   class among them);
+    /// * another process's that is live and undeclared: a thread procmgr
+    ///   rebound under a crash badge of the sender's is restored as the
+    ///   sender's own; one it left is bound back under that process's badge
+    ///   from a debugger's binding alone;
+    /// * another process's that declared itself undebuggable or is gone, or
+    ///   a thread unbound at its registration: never bound to the crash
+    ///   endpoint, so no restore makes a declared process debuggable again;
+    ///   a debugger's binding on it is unbound.
+    ///
+    /// A badge that names no live process leaves every thread.
+    #[must_use]
+    pub fn restore_action(
+        &self,
+        badge: u64,
+        thread: &RegisteredThread,
+        current: Option<u64>,
+    ) -> RestoreAction
+    {
+        let Some(entry) = self.find_by_badge(badge)
+        else
+        {
+            return RestoreAction::Leave;
+        };
+        let own_rule = || {
+            if entry.restores(current, thread.crash_badge)
+            {
+                RestoreAction::Bind(thread.crash_badge)
+            }
+            else
+            {
+                RestoreAction::Leave
+            }
+        };
+        let from_debugger = current.is_some_and(threads::is_debugger_badge);
+        match thread.origin()
+        {
+            Origin::Own => own_rule(),
+            Origin::Foreign(owner)
+                if self.find_by_badge(owner).is_some_and(|e| !e.no_debug) =>
+            {
+                if thread.crash_badge != 0
+                {
+                    own_rule()
+                }
+                else if from_debugger
+                {
+                    RestoreAction::Bind(owner)
+                }
+                else
+                {
+                    RestoreAction::Leave
+                }
+            }
+            Origin::Foreign(_) | Origin::Unbound if from_debugger => RestoreAction::Unbind,
+            Origin::Foreign(_) | Origin::Unbound => RestoreAction::Leave,
+        }
     }
 
     /// Index of the entry whose badge is `badge`, or where one would go.
@@ -692,6 +816,29 @@ pub enum AttachRefusal
     NotAttachable,
 }
 
+/// The badge procmgr serves a request badged `badge` under, with
+/// `procmgr_labels::PROCESS_HANDLE_TAG` cleared, and whether the request
+/// came on a process handle, whose badge carries the tag.
+#[must_use]
+pub fn request_badge(badge: u64) -> (u64, bool)
+{
+    let tag = ipc::procmgr_labels::PROCESS_HANDLE_TAG;
+    (badge & !tag, badge & tag != 0)
+}
+
+/// Whether procmgr serves `opcode` (a label's low 16 bits) on a process
+/// handle: every label but `DECLARE_NO_DEBUG` and `REGISTER_THREAD`, which
+/// name their sender itself and are served on the child's own procmgr cap
+/// alone.
+#[must_use]
+pub fn served_on_handle(opcode: u64) -> bool
+{
+    !matches!(
+        opcode,
+        ipc::procmgr_labels::DECLARE_NO_DEBUG | ipc::procmgr_labels::REGISTER_THREAD
+    )
+}
+
 /// Whether a request on procmgr's endpoint badged `caller_badge` carries
 /// `procmgr_labels::DEBUG_AUTHORITY`.
 #[must_use]
@@ -917,7 +1064,9 @@ pub fn resync_exit_reason(
 /// and no bit of `verb_bits` may be set: the badge rides every SEND procmgr
 /// mints for the child (its procmgr, svcmgr-registry, and log SENDs) and its
 /// process handle, where a verb bit (`ipc::VERB_BIT_MASK`) would grant the
-/// child an authority its servers reserve to trusted minters.
+/// child an authority its servers reserve to trusted minters. The handle's
+/// own verb bit, `procmgr_labels::PROCESS_HANDLE_TAG`, is procmgr's to set,
+/// beside the badge ([`request_badge`]).
 ///
 /// All are reachable under random badge minting; the old monotonic counter
 /// started at `LOG_BADGE_FIRST_CHILD` and so upheld the floor structurally.
@@ -1063,10 +1212,9 @@ mod tests
         for (cap, badge) in [(7, first), (8, 0), (9, second)]
         {
             entry.threads.reserve().unwrap();
-            entry.threads.push(RegisteredThread {
-                cap,
-                crash_badge: badge,
-            });
+            entry
+                .threads
+                .push(RegisteredThread::new(cap, badge, Origin::Own));
         }
         // The list is the main thread, then the registered ones in order.
         assert_eq!(attached(&mut table, DEBUG_AUTHORITY, first), Ok((0x50, 1)));
@@ -1270,6 +1418,167 @@ mod tests
         assert!(!entry.declare_unbinds(Some(0)));
         assert!(!entry.declare_unbinds(Some(0x51)));
         assert!(!entry.declare_unbinds(None));
+    }
+
+    #[test]
+    fn a_process_handle_names_its_child_and_sends_neither_declaration_nor_registration()
+    {
+        use ipc::procmgr_labels::{
+            DECLARE_NO_DEBUG, DESTROY_PROCESS, PROCESS_HANDLE_TAG, QUERY_PROCESS,
+            REGISTER_THREAD, START_PROCESS,
+        };
+        // A child's own procmgr cap carries its process badge alone; its
+        // process handle carries the tag too, which procmgr clears.
+        assert_eq!(request_badge(0x50), (0x50, false));
+        assert_eq!(request_badge(0x50 | PROCESS_HANDLE_TAG), (0x50, true));
+        // The tag is no process badge's: none carries a verb bit.
+        assert!(!badge_is_acceptable(
+            0x50 | PROCESS_HANDLE_TAG,
+            ipc::log_badges::LOG_BADGE_FIRST_CHILD,
+            ipc::procmgr_labels::INIT_REAP_CORRELATOR,
+            ipc::VERB_BIT_MASK
+        ));
+        for opcode in [DECLARE_NO_DEBUG, REGISTER_THREAD]
+        {
+            assert!(!served_on_handle(opcode));
+        }
+        for opcode in [START_PROCESS, DESTROY_PROCESS, QUERY_PROCESS]
+        {
+            assert!(served_on_handle(opcode));
+        }
+    }
+
+    /// A table holding the sender `0x40` and another process `0x50`, each
+    /// with one registered thread bound under a crash badge, and those two
+    /// badges and one no registry lists.
+    fn two_processes() -> (ProcessTable, [u64; 3])
+    {
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(0x40)).unwrap();
+        table.insert(entry_with_badge(0x50)).unwrap();
+        let badges = [
+            table.mint_crash_badge(),
+            table.mint_crash_badge(),
+            table.mint_crash_badge(),
+        ];
+        for (badge, crash) in [(0x40, badges[0]), (0x50, badges[1])]
+        {
+            let entry = table.find_mut_by_badge(badge).unwrap();
+            entry.threads.reserve().unwrap();
+            entry
+                .threads
+                .push(RegisteredThread::new(7, crash, Origin::Own));
+        }
+        (table, badges)
+    }
+
+    #[test]
+    fn a_registration_records_another_live_processs_thread_as_its()
+    {
+        let debugger = ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3;
+        let (table, [own, other, orphan]) = two_processes();
+        assert_eq!(table.origin_of(0x40, None), Origin::Unbound);
+        assert_eq!(table.origin_of(0x40, Some(0x50)), Origin::Foreign(0x50));
+        assert_eq!(table.origin_of(0x40, Some(other)), Origin::Foreign(0x50));
+        for own_binding in [0x40, own, orphan, debugger, 0x99]
+        {
+            assert_eq!(table.origin_of(0x40, Some(own_binding)), Origin::Own);
+        }
+    }
+
+    #[test]
+    fn a_restore_never_binds_a_declared_processs_thread_back()
+    {
+        // The creator 0x40 registered its child 0x50's main thread, which
+        // its binding showed was 0x50's; the child then declared, which
+        // unbound that thread.
+        let debugger = ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3;
+        let (mut table, _) = two_processes();
+        let child_main = RegisteredThread::new(9, 0, table.origin_of(0x40, Some(0x50)));
+        // Until the child declares, a debugger's binding goes back to the
+        // child's own, and the child's own binding stays.
+        assert_eq!(
+            table.restore_action(0x40, &child_main, Some(debugger)),
+            RestoreAction::Bind(0x50)
+        );
+        assert_eq!(
+            table.restore_action(0x40, &child_main, Some(0x50)),
+            RestoreAction::Leave
+        );
+        let _ = table.declare_no_debug(0x50);
+        assert_eq!(
+            table.restore_action(0x40, &child_main, None),
+            RestoreAction::Leave
+        );
+        assert_eq!(
+            table.restore_action(0x40, &child_main, Some(debugger)),
+            RestoreAction::Unbind
+        );
+        // Nor once the child is gone.
+        let _ = table.take_by_badge(0x50);
+        assert_eq!(
+            table.restore_action(0x40, &child_main, Some(debugger)),
+            RestoreAction::Unbind
+        );
+    }
+
+    #[test]
+    fn a_restore_binds_the_senders_own_threads_back_and_never_an_unbound_registration()
+    {
+        let debugger = ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3;
+        let (table, [own, other, _]) = two_processes();
+        let badged = RegisteredThread::new(7, own, Origin::Own);
+        let unbadged = RegisteredThread::new(8, 0, Origin::Own);
+        assert_eq!(
+            table.restore_action(0x40, &badged, Some(debugger)),
+            RestoreAction::Bind(own)
+        );
+        assert_eq!(
+            table.restore_action(0x40, &badged, Some(own)),
+            RestoreAction::Leave
+        );
+        assert_eq!(
+            table.restore_action(0x40, &unbadged, Some(debugger)),
+            RestoreAction::Bind(0)
+        );
+        // An unbound class of the sender's own thread is bound back, as the
+        // main thread's is.
+        assert_eq!(
+            table.restore_action(0x40, &badged, None),
+            RestoreAction::Bind(own)
+        );
+        assert_eq!(
+            table.restore_action(0x40, &unbadged, None),
+            RestoreAction::Bind(0)
+        );
+        // Another process's thread procmgr rebound into the sender's crash
+        // binding is restored as the sender's own while that process lives
+        // undeclared.
+        let rebound = RegisteredThread::new(10, own, Origin::Foreign(0x50));
+        assert_eq!(
+            table.restore_action(0x40, &rebound, Some(debugger)),
+            RestoreAction::Bind(own)
+        );
+        // A thread unbound at its registration is never bound to the crash
+        // endpoint; a debugger's binding on it is taken off.
+        let unknown = RegisteredThread::new(11, 0, Origin::Unbound);
+        assert_eq!(
+            table.restore_action(0x40, &unknown, Some(debugger)),
+            RestoreAction::Unbind
+        );
+        assert_eq!(
+            table.restore_action(0x40, &unknown, Some(other)),
+            RestoreAction::Leave
+        );
+        assert_eq!(
+            table.restore_action(0x40, &unknown, None),
+            RestoreAction::Leave
+        );
+        // A badge naming no live process changes nothing.
+        assert_eq!(
+            table.restore_action(0x41, &badged, Some(debugger)),
+            RestoreAction::Leave
+        );
     }
 
     #[test]

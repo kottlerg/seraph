@@ -2595,9 +2595,14 @@ pub unsafe fn thread_read_mem_raw(
 ///
 /// # Safety
 /// When the thread executes in the calling program's own address space, the
-/// write changes the program's memory under any Rust object there: the range
-/// must hold no object a store of these bytes would make invalid, and no
-/// reference may be live to it.
+/// write changes the program's memory under whatever the range holds:
+/// - the range holds no Rust object a store of these bytes would make
+///   invalid, and no reference to it is live;
+/// - the range holds no code the program may execute, unless the bytes are
+///   code the program is entitled to run there and no thread executes the
+///   range during the write;
+/// - no other access to the range, through any pointer or atomic, runs
+///   concurrently with the call.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability`,

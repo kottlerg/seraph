@@ -214,13 +214,30 @@ pub fn check_registrant()
     };
     if gone
     {
-        REGISTRANT.store(0, Ordering::Release);
-        let _ = syscall::cap_delete(thread);
-        // The parked decliner receives again, the faults queued for the
-        // service that is gone first.
-        let _ = syscall::notification_send(WAKE.load(Ordering::Acquire), 1);
+        take_back(thread);
         std::os::seraph::log!("crash service gone; declining faults again");
     }
+}
+
+/// Undo a registration whose `RECV` cap never reached the service (the
+/// reply carrying it failed): forget the registrant and give the endpoint
+/// back to the decliner, so no fault waits on a receiver that holds nothing.
+pub fn unregister()
+{
+    let thread = REGISTRANT.load(Ordering::Acquire);
+    if thread != 0
+    {
+        take_back(thread);
+    }
+}
+
+/// Forget the registrant `thread`, delete its cap, and wake the parked
+/// decliner, which receives again, the faults queued for the service first.
+fn take_back(thread: u64)
+{
+    REGISTRANT.store(0, Ordering::Release);
+    let _ = syscall::cap_delete(thread);
+    let _ = syscall::notification_send(WAKE.load(Ordering::Acquire), 1);
 }
 
 fn delete_nonzero(cap: u64)

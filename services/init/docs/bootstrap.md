@@ -43,8 +43,11 @@ process creation to procmgr IPC.
   § Phase 7). The fund's pages stay accounted with the arena, parked in
   memmgr's pool after init's reap returns them.
 - Initialise the per-arch serial path used for FATAL pre-IPC errors
-  (`arch::current::serial_init`, `../src/main.rs`); a carve or fund
-  failure is reported FATAL once it is up.
+  (`arch::current::serial_init`, `../src/main.rs`); a failure of the
+  Thread retype size query the arena's reserve needs, or of the carve or
+  the fund, is reported FATAL once it is up. Serial writes before it, and
+  on x86-64 every write once init-logd could not bind COM1's ports, are
+  dropped, as a port access without the thread's binding faults.
 - Register the arena-backed IPC buffer page at `INIT_IPC_BUF_VA` with
   the kernel (`syscall::ipc_buffer_set`, `../src/main.rs`).
 - Mint endpoint objects: init's bootstrap endpoint, procmgr's

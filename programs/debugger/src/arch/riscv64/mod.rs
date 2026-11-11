@@ -93,9 +93,13 @@ fn plant_successor(th: u64, regs: &[u8]) -> Step
     .expect("the instruction has a successor");
     let mut saved = [0u8; 2];
     syscall::thread_read_mem(th, next, &mut saved).expect("save the successor's bytes");
-    // SAFETY: the debuggee shares this program's address space; the two
-    // bytes are instruction bytes of its code, which no Rust object
-    // occupies, and they are restored before the debuggee runs them.
+    // SAFETY: the debuggee shares this program's address space. The two
+    // bytes are instruction bytes inside `breakpoint`'s block, which no Rust
+    // object occupies and only the debuggee runs; the debuggee is
+    // fault-blocked on this program's endpoint for the write, so no thread
+    // executes or otherwise accesses them during it. The bytes written are a
+    // `c.ebreak`, code the program runs there to stop the debuggee, and they
+    // are restored before the debuggee runs past them.
     unsafe {
         syscall::thread_write_mem(
             th,
@@ -111,8 +115,9 @@ fn plant_successor(th: u64, regs: &[u8]) -> Step
 /// Write back the bytes `step`'s `c.ebreak` displaced; returns where.
 fn restore(th: u64, step: Step) -> u64
 {
-    // SAFETY: as in plant_successor; the bytes written are the original
-    // instruction bytes.
+    // SAFETY: as in plant_successor, the debuggee being fault-blocked at the
+    // step's `c.ebreak`; the bytes written are the original instruction
+    // bytes, the program's own code.
     unsafe { syscall::thread_write_mem(th, step.at, &step.saved, syscall_abi::THREAD_MEM_TEXT) }
         .expect("restore the debuggee's instruction");
     step.at

@@ -66,8 +66,9 @@ pub fn prepare_step(thread: u64, regs: &mut [u8]) -> Result<StepUndo, StepError>
     let mut saved = [0u8; 2];
     read(thread, next, &mut saved)?;
     // SAFETY: the write lands in the target's address space, not the stub's
-    // own, through the kernel's text route; every other thread of the target
-    // is stopped, as the route requires (docs/fault-handling.md § Debugging).
+    // own (the crate's main module doc, § The target is never the stub),
+    // through the kernel's text route; every other thread of the target is
+    // stopped, as the route requires (docs/fault-handling.md § Debugging).
     unsafe {
         syscall::thread_write_mem(
             thread,

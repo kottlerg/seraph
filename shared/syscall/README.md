@@ -34,7 +34,9 @@ into the mapping, which any ancestor holder can withdraw, so `cap_delete`, `cap_
 `thread_configure_with_tls` and `thread_write_regs` (a thread of the caller's address space
 starts or resumes only on code, a stack, and a TLS block dedicated to it), and `thread_write_mem`
 (when the thread runs in the caller's address space, the range holds no object the written bytes
-invalidate, and no reference into it is live).
+invalidate and no reference into it is live, holds no code the program may execute unless the
+bytes are code it is entitled to run there and no thread executes the range during the write,
+and no other access to the range, through any pointer or atomic, runs concurrently).
 
 No stability obligation. Not used by the kernel.
 

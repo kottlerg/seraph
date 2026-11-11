@@ -1894,6 +1894,7 @@ dependencies = [
  "libc",
  "logd-codec",
  "object",
+ "procmgr-process-table",
  "regex",
  "serde_json",
  "syscall-abi",

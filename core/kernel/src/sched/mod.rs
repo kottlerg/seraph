@@ -2185,10 +2185,12 @@ pub fn sleep_check_wakeups()
             }
             // The pop consumes the deadline with the entry, so a
             // sleep_list_remove racing this claim sees 0 and leaves the
-            // episode to the timer.
+            // episode to the timer. Release: a reply rebind that reads this 0
+            // writes the binding pair without SLEEP_LIST_LOCK, after the
+            // snapshot above.
             (*tcb)
                 .sleep_deadline
-                .store(0, core::sync::atomic::Ordering::Relaxed);
+                .store(0, core::sync::atomic::Ordering::Release);
             (*tcb).sleep_expiry = thread::SleepExpiry {
                 next: core::ptr::null_mut(),
                 ipc_state,
@@ -4424,7 +4426,11 @@ pub unsafe fn commit_blocked_under_local_lock(
 ///
 /// The rebind sets `park_seq`'s low bit rather than starting a new even value,
 /// so the reply park stays in the send park's call episode
-/// (`thread::call_episode`), which a timed call's expiry claims.
+/// (`thread::call_episode`), which a timed call's expiry claims. A timed
+/// caller stays on the sleep list across the rebind, so its binding pair is
+/// written under `SLEEP_LIST_LOCK`, which the timer pop snapshots it under
+/// (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants,
+/// invariant 6).
 ///
 /// # Safety
 /// `tcb` must be a valid, send-queue-dequeued `Blocked` TCB whose
@@ -4460,8 +4466,32 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
                 let displaced = (*server)
                     .reply_tcb
                     .swap(tcb, core::sync::atomic::Ordering::AcqRel);
+                // A timed call stays listed across the rebind, and the timer
+                // pop reads this pair under SLEEP_LIST_LOCK alone, so a listed
+                // caller's pair is written under it too (a leaf under
+                // sched_lock). The deadline is stable here but for the pop's
+                // clear: the caller was armed under ep.lock, which the dequeue
+                // holds. A zero read is an untimed call or one the pop already
+                // consumed; the Acquire pairs with the pop's Release clear,
+                // ordering its snapshot before these writes.
+                let listed = (*tcb)
+                    .sleep_deadline
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    != 0;
+                let sleep_saved = if listed
+                {
+                    Some(SLEEP_LIST_LOCK.lock_raw())
+                }
+                else
+                {
+                    None
+                };
                 (*tcb).ipc_state = ipc;
                 (*tcb).blocked_on_object = server.cast::<u8>();
+                if let Some(s) = sleep_saved
+                {
+                    SLEEP_LIST_LOCK.unlock_raw(s);
+                }
                 (*tcb)
                     .park_seq
                     .fetch_or(1, core::sync::atomic::Ordering::Relaxed);

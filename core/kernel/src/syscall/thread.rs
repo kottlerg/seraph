@@ -1392,13 +1392,7 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                         (*sig).refresh_observer();
                         // A timed wait's entry goes with the waiter, under
                         // sig.lock, as at every waiter claim.
-                        if (*tcb)
-                            .sleep_deadline
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                            != 0
-                        {
-                            crate::sched::sleep_list_remove(tcb);
-                        }
+                        crate::ipc::cancel_timed_entry(tcb);
                         crate::sched::thread::stamp_park_deposit(
                             tcb,
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
@@ -1435,13 +1429,7 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                     {
                         // A timed wait's entry goes with the waiter, under
                         // eq.lock, as at every waiter claim.
-                        if (*tcb)
-                            .sleep_deadline
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                            != 0
-                        {
-                            crate::sched::sleep_list_remove(tcb);
-                        }
+                        crate::ipc::cancel_timed_entry(tcb);
                         crate::sched::thread::stamp_park_deposit(
                             tcb,
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,

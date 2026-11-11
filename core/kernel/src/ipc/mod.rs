@@ -233,9 +233,11 @@ pub(crate) unsafe fn cancel_timed_entry(tcb: *mut ThreadControlBlock)
 {
     // SAFETY: tcb is valid per the caller contract; SLEEP_LIST_LOCK is a leaf.
     unsafe {
+        // Acquire: a 0 the timer pop stored (Release) orders its snapshot of
+        // the binding before the caller's later writes to it.
         if (*tcb)
             .sleep_deadline
-            .load(core::sync::atomic::Ordering::Relaxed)
+            .load(core::sync::atomic::Ordering::Acquire)
             != 0
         {
             crate::sched::sleep_list_remove(tcb);

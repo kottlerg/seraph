@@ -15,7 +15,9 @@
 //! try-once receive on the endpoint finds no queued caller.
 //!
 //! Needs no SMP: the child is unpinned, and on a single CPU it runs as a
-//! timer-preempted peer.
+//! timer-preempted peer. The call timeout, the sleep past it, and the report
+//! bound go through `crate::scaled_bound`, so at a wide CPU count the stop
+//! still lands inside the call's bound.
 
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
@@ -31,14 +33,15 @@ const BIT_READY: u64 = 1 << 0;
 const BIT_OK: u64 = 1 << 1;
 const BIT_BAD: u64 = 1 << 2;
 
-/// The client's call timeout.
-const CALL_TIMEOUT_MS: u32 = 200;
+/// The client's call timeout, before `crate::scaled_bound`.
+const CALL_TIMEOUT_MS: u64 = 200;
 /// Wall-clock settle after the READY signal so the client has, in practice,
 /// reached its park before the stop lands.
 const SETTLE_SLEEP_MS: u64 = 20;
-/// Sleep while the client is stopped, past its call deadline.
+/// Sleep while the client is stopped, past its call deadline, before
+/// `crate::scaled_bound`.
 const PAST_DEADLINE_MS: u64 = 400;
-/// Bound on each wait for the client's report.
+/// Bound on each wait for the client's report, before `crate::scaled_bound`.
 const REPORT_MS: u64 = 5000;
 
 static mut CLIENT_STACK: ChildStack = ChildStack::ZERO;
@@ -50,10 +53,15 @@ struct ClientArgs
 {
     ep: u64,
     done: u64,
+    /// The call timeout, scaled.
+    timeout_ms: u32,
 }
 
-static CLIENT_ARGS: spawn::ArgBlock<ClientArgs, 1> =
-    spawn::ArgBlock::new(ClientArgs { ep: 0, done: 0 });
+static CLIENT_ARGS: spawn::ArgBlock<ClientArgs, 1> = spawn::ArgBlock::new(ClientArgs {
+    ep: 0,
+    done: 0,
+    timeout_ms: 0,
+});
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -74,6 +82,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             ClientArgs {
                 ep: c_ep,
                 done: c_done,
+                timeout_ms: u32::try_from(crate::scaled_bound(CALL_TIMEOUT_MS)).unwrap_or(u32::MAX),
             },
         )
     };
@@ -86,7 +95,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     wait_for(done, BIT_READY)?;
     let _ = thread_sleep(SETTLE_SLEEP_MS);
     thread_stop(client.th).map_err(|_| "integration::ipc_call_timeout_stop: thread_stop failed")?;
-    let _ = thread_sleep(PAST_DEADLINE_MS);
+    let _ = thread_sleep(crate::scaled_bound(PAST_DEADLINE_MS));
     thread_start(client.th)
         .map_err(|_| "integration::ipc_call_timeout_stop: thread_start failed")?;
     let acc = wait_for(done, BIT_OK | BIT_BAD)?;
@@ -119,7 +128,7 @@ fn wait_for(done: u64, mask: u64) -> Result<u64, &'static str>
     let mut acc = 0u64;
     while acc & mask == 0
     {
-        let bits = notification_wait_timeout(done, REPORT_MS)
+        let bits = notification_wait_timeout(done, crate::scaled_bound(REPORT_MS))
             .map_err(|_| "integration::ipc_call_timeout_stop: notification_wait failed")?;
         if bits == 0
         {
@@ -136,7 +145,11 @@ fn wait_for(done: u64, mask: u64) -> Result<u64, &'static str>
 extern "C" fn client_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this client.
-    let ClientArgs { ep, done } = unsafe { spawn::child_args(arg) };
+    let ClientArgs {
+        ep,
+        done,
+        timeout_ms,
+    } = unsafe { spawn::child_args(arg) };
 
     let buf = IpcPage::addr(core::ptr::addr_of_mut!(CLIENT_IPC_PAGE));
     // SAFETY: `CLIENT_IPC_PAGE` is this child's own IPC page, used by one thread at a time
@@ -147,7 +160,7 @@ extern "C" fn client_entry(arg: u64) -> !
         thread_exit()
     }
     notification_send(done, BIT_READY).ok();
-    let bit = match raw_ipc_call_timeout(ep, 0x7002, 0, 0, CALL_TIMEOUT_MS)
+    let bit = match raw_ipc_call_timeout(ep, 0x7002, 0, 0, timeout_ms)
     {
         Err(e) if e == SyscallError::Interrupted as i64 => BIT_OK,
         _ => BIT_BAD,

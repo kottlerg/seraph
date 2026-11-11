@@ -1886,27 +1886,40 @@ const WAIT_SLOT_KEEP: usize = 1;
 /// `WaitArgs` slot of `call_timeout_late_reply_refused`.
 const WAIT_SLOT_LATE: usize = 2;
 
-/// Bound on each wait for a child's report.
+/// Bound on each wait for a child's report, before `crate::scaled_bound`.
 const WAIT_REPORT_MS: u64 = 5000;
 /// Report bits of a child whose setup or call failed.
 const WAIT_BAD: u64 = 0xBAD;
+/// Report bit of `wait_late_server_entry`: it has received a call.
+const WAIT_RECEIVED: u64 = 1 << 40;
+/// Report bits of `wait_late_server_entry`: its late reply was refused with
+/// `InvalidCapability`.
+const WAIT_REFUSED: u64 = 0xD00D;
+/// Bound of each call `call_timeout_late_reply_refused` makes.
+const LATE_CALL_TIMEOUT_MS: u32 = 50;
+/// Calls `call_timeout_late_reply_refused` makes, before `crate::scaled_bound`,
+/// until the server has received one.
+const LATE_CALL_ATTEMPTS: u64 = 50;
 
 /// Label the timed-wait callers send.
 const WAIT_CALL_LABEL: u64 = 0x7001;
 
 /// Arguments of the timed-wait children, handed to their entries by address;
-/// `page` is the address of the child's own IPC page.
+/// `page` is the address of the child's own IPC page, and `go` a notification
+/// the child waits on (0 for a child that waits on none).
 #[derive(Clone, Copy)]
 struct WaitArgs
 {
     ep: u64,
     done: u64,
+    go: u64,
     page: u64,
 }
 
 static WAIT_ARGS: ArgBlock<WaitArgs, 3> = ArgBlock::new(WaitArgs {
     ep: 0,
     done: 0,
+    go: 0,
     page: 0,
 });
 static mut WAIT_STACKS: [ChildStack; 3] = [ChildStack::ZERO; 3];
@@ -1919,13 +1932,15 @@ fn now_us() -> Result<u64, &'static str>
         .map_err(|_| "system_info(ElapsedUs) failed")
 }
 
-/// Create a child holding `ep` with `ep_rights` and `done` (NOTIFY), and
-/// start it at `entry` on slot `slot` of the timed-wait stacks and pages.
+/// Create a child holding `ep` with `ep_rights`, `done` (NOTIFY), and, when
+/// non-zero, `go` (WAIT), and start it at `entry` on slot `slot` of the
+/// timed-wait stacks and pages.
 fn start_wait_child(
     ctx: &TestContext,
     ep: u64,
     ep_rights: u64,
     done: u64,
+    go: u64,
     slot: usize,
     entry: extern "C" fn(u64) -> !,
 ) -> Result<crate::spawn::SpawnedChild, &'static str>
@@ -1935,6 +1950,15 @@ fn start_wait_child(
         cap_copy(ep, child.cs, ep_rights).map_err(|_| "ipc wait child: cap_copy ep failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "ipc wait child: cap_copy done failed")?;
+    let child_go = if go == 0
+    {
+        0
+    }
+    else
+    {
+        cap_copy(go, child.cs, syscall_abi::RIGHTS_NTF_WAIT)
+            .map_err(|_| "ipc wait child: cap_copy go failed")?
+    };
     // SAFETY: only the address of the slot's page is taken.
     let page = crate::IpcPage::addr(unsafe { core::ptr::addr_of_mut!(WAIT_PAGES[slot]) });
     // SAFETY: the slot's child has not been started yet.
@@ -1944,6 +1968,7 @@ fn start_wait_child(
             WaitArgs {
                 ep: child_ep,
                 done: child_done,
+                go: child_go,
                 page,
             },
         )
@@ -1957,10 +1982,10 @@ fn start_wait_child(
     Ok(child)
 }
 
-/// Wait up to [`WAIT_REPORT_MS`] for a child's report bits on `done`.
+/// Wait up to [`WAIT_REPORT_MS`], scaled, for a child's report bits on `done`.
 fn wait_report(done: u64) -> Result<u64, &'static str>
 {
-    let bits = syscall::notification_wait_timeout(done, WAIT_REPORT_MS)
+    let bits = syscall::notification_wait_timeout(done, crate::scaled_bound(WAIT_REPORT_MS))
         .map_err(|_| "ipc wait child: notification_wait_timeout failed")?;
     if bits == 0
     {
@@ -2019,13 +2044,15 @@ pub fn recv_try_once_takes_queued_caller(ctx: &TestContext) -> TestResult
         ep,
         RIGHTS_EP_SEND_GRANT,
         done,
+        0,
         WAIT_SLOT_TAKE,
         wait_caller_entry,
     )?;
 
-    // Give the child time to queue, then retry the try-once a bounded number of times.
+    // Give the child time to queue, then retry the try-once a bounded number
+    // of times, scaled.
     let mut got = None;
-    for _ in 0..50
+    for _ in 0..crate::scaled_bound(50)
     {
         thread_sleep(20).map_err(|_| "ipc::recv_try_once_takes_queued_caller: sleep failed")?;
         match syscall::raw_ipc_recv_timeout(ep, syscall_abi::WAIT_TRY_ONCE)
@@ -2076,6 +2103,7 @@ pub fn recv_try_once_keeps_reply_binding(ctx: &TestContext) -> TestResult
         ep,
         RIGHTS_EP_SEND_GRANT,
         done,
+        0,
         WAIT_SLOT_KEEP,
         wait_caller_entry,
     )?;
@@ -2137,30 +2165,59 @@ pub fn call_timeout_no_receiver(ctx: &TestContext) -> TestResult
 
 /// A caller whose timeout expired in the reply phase is unbound: the server's
 /// later reply returns `InvalidCapability`.
+///
+/// The server replies only once the test tells it to, after the call has
+/// returned, so no timing window decides the outcome. A call that expires
+/// before the server receives it is retried; the server reports
+/// [`WAIT_RECEIVED`] once it has received one, whose reply phase that call's
+/// expiry then ended.
 pub fn call_timeout_late_reply_refused(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "ipc::call_timeout_late_reply_refused: cap_create_endpoint failed")?;
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "ipc::call_timeout_late_reply_refused: create done failed")?;
+    let go = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "ipc::call_timeout_late_reply_refused: create go failed")?;
     let mut child = start_wait_child(
         ctx,
         ep,
         syscall_abi::RIGHTS_EP_RECEIVE,
         done,
+        go,
         WAIT_SLOT_LATE,
         wait_late_server_entry,
     )?;
 
-    // Let the server reach its receive, so the call is in its reply phase when it expires.
-    thread_sleep(20).map_err(|_| "ipc::call_timeout_late_reply_refused: sleep failed")?;
-    let r = syscall::raw_ipc_call_timeout(ep, WAIT_CALL_LABEL, 0, 0, 50);
-    if r != Err(syscall_abi::SyscallError::WouldBlock as i64)
+    let mut received = false;
+    for _ in 0..crate::scaled_bound(LATE_CALL_ATTEMPTS)
     {
-        return Err("ipc::call_timeout_late_reply_refused: call did not time out");
+        let r = syscall::raw_ipc_call_timeout(ep, WAIT_CALL_LABEL, 0, 0, LATE_CALL_TIMEOUT_MS);
+        if r != Err(syscall_abi::SyscallError::WouldBlock as i64)
+        {
+            return Err("ipc::call_timeout_late_reply_refused: call did not time out");
+        }
+        match syscall::notification_try_wait(done)
+        {
+            Ok(bits) if bits & WAIT_RECEIVED != 0 =>
+            {
+                received = true;
+                break;
+            }
+            Ok(_) => return Err("ipc::call_timeout_late_reply_refused: server failed"),
+            Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 =>
+            {}
+            Err(_) => return Err("ipc::call_timeout_late_reply_refused: try-wait failed"),
+        }
     }
+    if !received
+    {
+        return Err("ipc::call_timeout_late_reply_refused: server never received a call");
+    }
+    notification_send(go, 1)
+        .map_err(|_| "ipc::call_timeout_late_reply_refused: notify go failed")?;
     let report = wait_report(done)?;
-    if report != 0xD00D
+    if report != WAIT_REFUSED
     {
         return Err("ipc::call_timeout_late_reply_refused: late reply was not refused");
     }
@@ -2170,6 +2227,7 @@ pub fn call_timeout_late_reply_refused(ctx: &TestContext) -> TestResult
         .map_err(|_| "ipc::call_timeout_late_reply_refused: delete child failed")?;
     cap_delete(ep).ok();
     cap_delete(done).ok();
+    cap_delete(go).ok();
     child.delete_cspace().ok();
     Ok(())
 }
@@ -2203,8 +2261,9 @@ extern "C" fn wait_caller_entry(arg: u64) -> !
     thread_exit()
 }
 
-/// Child server: receives one call, sleeps past the caller's timeout, replies,
-/// and reports `0xD00D` if the reply returned `InvalidCapability`, [`WAIT_BAD`]
+/// Child server: receives one call (within [`WAIT_REPORT_MS`], scaled),
+/// reports [`WAIT_RECEIVED`], waits on `go` (as long), replies, and reports
+/// [`WAIT_REFUSED`] if the reply returned `InvalidCapability`, [`WAIT_BAD`]
 /// otherwise.
 extern "C" fn wait_late_server_entry(arg: u64) -> !
 {
@@ -2217,14 +2276,19 @@ extern "C" fn wait_late_server_entry(arg: u64) -> !
     {
         wait_child_fail(args)
     }
-    if syscall::raw_ipc_recv(args.ep).is_err()
+    let bound = crate::scaled_bound(WAIT_REPORT_MS);
+    if syscall::raw_ipc_recv_timeout(args.ep, bound).is_err()
     {
         wait_child_fail(args)
     }
-    thread_sleep(200).ok();
+    notification_send(args.done, WAIT_RECEIVED).ok();
+    if !matches!(syscall::notification_wait_timeout(args.go, bound), Ok(bits) if bits != 0)
+    {
+        wait_child_fail(args)
+    }
     let bits = match syscall::raw_ipc_reply(1, 0, 0)
     {
-        Err(e) if e == syscall_abi::SyscallError::InvalidCapability as i64 => 0xD00D,
+        Err(e) if e == syscall_abi::SyscallError::InvalidCapability as i64 => WAIT_REFUSED,
         _ => WAIT_BAD,
     };
     notification_send(args.done, bits).ok();

@@ -43,7 +43,9 @@ identity dies with UEFI `ExitBootServices` (only GOP knows it pre-exit),
 so the bootloader is the only entity that can carry this information to
 userspace (see [docs/console-model.md](../../../docs/console-model.md)).
 
-Devmgr spawns the driver via the `simple-device` path with a round-2
+The driver carries a declaration in the ELF note section `.note.seraph.driver` (`boot-framebuffer`)
+that no device record devmgr builds matches yet. Devmgr spawns the driver via the `simple-device`
+path with a round-2
 devmgr query cap, a badged SEND on the private endpoint of the driver's
 spawn batch, so the driver can fetch its geometry via `QUERY_DEVICE_INFO`
 (generic kind/version/bytes payload schema, shared with virtio). Once the

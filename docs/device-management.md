@@ -143,8 +143,12 @@ its own or devmgr withdrew it:
    posted before it. Conventional PCI orders a read's
    completion behind earlier posted writes the same way (PCI Local Bus Specification r3.0
    Appendix E).
-2. **Device taken and reset.** devmgr then revokes the driver's BAR capabilities and resets the
-   device, waiting for the reset to be confirmed for at most `RESET_TIMEOUT` (5 s).
+2. **Device taken and reset.** devmgr then revokes the driver's BAR capabilities, sets the
+   function's Command Interrupt Disable bit through the configuration page it keeps, and runs the
+   reset the driver's declaration names (the VirtIO status reset, a PCI Express Function Level
+   Reset, or none), waiting for a VirtIO reset to be confirmed for at most `RESET_TIMEOUT` (5 s)
+   and for a Function Level Reset `FLR_COMPLETION_MS` (100 ms). A device whose declaration names
+   no reset is never confirmed quiet.
 3. **Memory freed.** procmgr holds back the `PROCESS_DIED` of a driver devmgr created with
    `CREATE_DMA_HOLD`, however the driver died, so memmgr keeps its frames on the driver's record,
    out of the pool. devmgr releases the hold (`RELEASE_HOLD`) only when the IOMMU blocked the
@@ -196,7 +200,7 @@ reclaim), and
 § Label 4 (`PROCESS_DIED`). As an observation, not a guarantee the order relies on, QEMU's
 virtio-pci devices also stop processing their queues when Bus Master Enable is cleared.
 
-What the boots exercise of this order, and why none withdraws a `VirtIO` driver, is stated in
+What the boots exercise of this order is stated in
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
 § Responsibilities.
 
@@ -341,9 +345,10 @@ two IPC hops per mapping; batching it is
 message-signalled interrupts exist ([#325](https://github.com/kottlerg/seraph/issues/325)), and
 devmgr logs each one against its device.
 
-When devmgr binds a DMA-capable (PCI BAR + IRQ) driver, it spawns the driver
+When devmgr binds a DMA-capable driver, it spawns the driver
 with `procmgr_labels::CREATE_PINNED`, so the driver's memory is eager-mapped,
-and delivers its BAR `Mmio` caps, optional IRQ, endpoint caps, and DMA
+and delivers its resource list (BAR `Mmio` caps, the wired line when the declaration takes an
+interrupt), endpoint caps, and DMA
 capability (§ DMA Authorisation). With no IOMMU confining the device the physical
 isolation is absent, and devmgr runs the device unconfined (§ DMA Safety
 Model); the kernel is agnostic to both outcomes.
@@ -419,7 +424,8 @@ holds nothing, and moves the cap itself to the serial driver (devmgr's
   remaining bindings owe nothing, and released at its controller when none remains. A driver that
   dies while its device asserts a level-triggered line leaves the device asserting with no
   receiver to clear it, so the line's other receivers are signalled again on each unmask; devmgr
-  ends that by resetting a `VirtIO` device when it withdraws the device's driver
+  ends that by setting the function's Interrupt Disable bit, and running its declared reset, when it
+  withdraws the device's driver
   ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md#withdrawal)
   § Withdrawal).
 
@@ -479,10 +485,10 @@ only after initial enumeration and binding complete. The dependency ordering is 
 init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
 after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
-devmgr spawns one driver for every virtio-input device it enumerates, for the first
-virtio-console device (the debug port, below), and for every virtio-blk
-device it can give an IRQ cap (virtio-blk requires one; a device on a line another device already
-holds gets a derivation of that line, § Interrupt Delivery), each with its own service endpoint.
+devmgr binds each PCI device the most specific driver declaration matches
+([driver-binding.md](driver-binding.md) § Matching), each driver with its own service endpoint; a
+declaration that requires an interrupt binds only a device devmgr can give a wired line (a device
+on a line another device already holds gets a derivation of that line, § Interrupt Delivery).
 devmgr serves any driver it spawns, those and the serial, framebuffer, and RTC drivers, only once
 it has reported its device set up (`devmgr_labels::DRIVER_READY`). A driver that dies first, its
 device setup failed, or that neither reports nor dies within devmgr's settle bound
@@ -504,7 +510,7 @@ every live disk; the terminal sends none, so it binds the first input instance.
 
 The debug port is a byte transport apart from the console's UART, which a debugger stub, the
 [GDB stub](../services/gdbstub/README.md), owns to speak to a host debugger: the first
-virtio-console device devmgr enumerates, driven by the
+virtio-console device in PCI order (its declaration's instance limit is 1), driven by the
 [virtio-console driver](../services/drivers/virtio/console/README.md), which serves the serial
 protocol. devmgr hands it out only on `devmgr_labels::QUERY_DEBUG_PORT_DEVICE`, gated on
 `DEBUG_PORT_AUTHORITY`, which svcmgr mints only onto the seed-only `devmgr.debug` name, so only a
@@ -520,25 +526,30 @@ devmgr loads driver binaries from one of two places:
   framebuffer, and the IOMMU driver of the architecture's family, `iommu-vtd`
   on x86-64 and `iommu-riscv` on riscv64, which must confine the disk before
   its driver maps a ring) ship in the bundle and
-  arrive as Memory caps in devmgr's MODULE bootstrap round. devmgr spawns
-  them via `procmgr_labels::CREATE_PROCESS` during initial enumeration.
+  arrive as Memory caps in devmgr's MODULE bootstrap round. devmgr reads the declaration of each
+  module it holds apart from the serial, framebuffer and IOMMU modules, binds the PCI devices
+  those declarations match in the boot settle batch, and spawns every driver via
+  `procmgr_labels::CREATE_PROCESS`.
 - **On-disk rootfs** — non-essentials (the per-arch RTC, the [virtio-input keyboard
-  driver](../services/drivers/virtio/input/README.md), and the debug port's virtio-console
-  driver) live at `/services/drivers/` and are loaded
-  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan`, `test-fault`, and
-  `test-dma` binaries also live there; devmgr spawns them only on
-  `devmgr_labels::TEST_SPAWN_ORPHAN`, `TEST_SPAWN_FAULT_DRIVERS`, and `TEST_SPAWN_DMA_DRIVER`
+  driver](../services/drivers/virtio/input/README.md), the debug port's virtio-console
+  driver, and the test-only `test-dma`) live at `/services/drivers/` and are loaded
+  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` and `test-fault` binaries
+  also live there; devmgr spawns them only on
+  `devmgr_labels::TEST_SPAWN_ORPHAN` and `TEST_SPAWN_FAULT_DRIVERS`
   (gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only `devmgr.test` cap carries), so
-  a boot without svctest spawns none. virtio-input and virtio-console are
-  PCI-enumerated during the initial scan — their BAR/IRQ caps are carved and stashed then — but
-  their spawns are deferred to this path, since neither a keyboard nor the debug port is on the
-  read-the-disk critical path. A PCI
-  device devmgr can give no IRQ cap (for instance, its line lies outside the Interrupt range devmgr
-  holds) is delivered a bootstrap that names its IRQ slot absent, and its driver polls its queue.
+  a boot without svctest spawns neither. Every binary in a directory carries its declaration in
+  the ELF note section `.note.seraph.driver`; devmgr reads the declaration of each entry once
+  `SET_DRIVERS_DIR` arrives and binds the PCI devices still unbound: virtio-input,
+  virtio-console, and test-dma, none of which is on the read-the-disk critical path, ship only
+  there and are bound there. A device whose declaration takes its interrupt as optional
+  and for which devmgr can give no wired line (for instance, its line lies outside the Interrupt
+  range devmgr holds) is delivered a resource list with no `Interrupt` resource, and its driver
+  polls its queue.
   Post-handover, svcmgr walks its universal root to `/services/drivers/` and hands devmgr that
   subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from
-  the devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr
-  cannot reach outside the drivers subtree). The handshake is specified in
+  the devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ | READDIR` rights
+  only — devmgr lists the directory and cannot reach outside the drivers subtree). The handshake
+  is specified in
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
   [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md). Devmgr
   replies SUCCESS before doing any spawn work so svcmgr never blocks on driver bring-up; the actual

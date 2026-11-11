@@ -1415,7 +1415,7 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// **Acquisition path**: the RTC driver binary lives on the rootfs disk
 /// at `/services/drivers/<chip>` and is loaded by devmgr from there.
 /// svcmgr walks its system root to `/services/drivers/` and hands devmgr a
-/// `LOOKUP | READ`-attenuated subtree cap via
+/// `LOOKUP | READ | READDIR`-attenuated subtree cap via
 /// [`devmgr_labels::SET_DRIVERS_DIR`]. Devmgr replies SUCCESS to that
 /// handshake *before* doing any spawn work (so svcmgr never blocks on
 /// driver bring-up); it then walks the per-arch driver name
@@ -1979,8 +1979,9 @@ pub mod devmgr_labels
     /// `GET_WALL_TIME` thereafter.
     pub const QUERY_RTC_DEVICE: u64 = 5;
     /// svcmgr-only handshake: install the
-    /// `LOOKUP | READ`-attenuated `/services/drivers/` namespace cap from
-    /// which devmgr walks its on-disk driver binaries.
+    /// `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` namespace
+    /// cap from which devmgr lists, reads the declarations of, and walks to
+    /// its on-disk driver binaries.
     ///
     /// Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = badged SEND on the

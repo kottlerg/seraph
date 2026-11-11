@@ -6,7 +6,9 @@ register range to this driver, and drives it over `ipc::iommu_labels` from behin
 endpoint, so device drivers keep the `devmgr_dma_labels` contract whichever IOMMU sits behind it
 ([docs/device-management.md](../../../../docs/device-management.md#iommu-discovery-and-programming)
 § IOMMU Discovery and Programming). It is x86-64 only, and ships as a boot module, since it must
-confine the root disk before the disk's driver maps a ring. The bootstrap, the request checks,
+confine the root disk before the disk's driver maps a ring; it carries a declaration in the ELF
+note section `.note.seraph.driver` (IOMMU family `dmar`) that no device record devmgr builds
+matches yet, so devmgr starts it on its fixed path. The bootstrap, the request checks,
 and the fault queue are [`iommu-core`](../core/README.md)'s; this crate is the VT-d `Backend`.
 
 The driver runs the units in legacy translation mode:

@@ -25,7 +25,9 @@ virtio/input/
 
 ## Endpoint
 
-Devmgr enumerates the virtio-input PCI device, carves its per-device capabilities (an
+The driver carries a declaration in the ELF note section `.note.seraph.driver` (PCI `1AF4:1012`
+and `1AF4:1052`, class `input`, interrupt optional, DMA, auxiliary tier). Devmgr binds it to each
+matching virtio-input PCI device, carves the device's per-device capabilities (an
 `Mmio` cap for every BAR its VirtIO register regions name, its own derivation of its
 line's `Interrupt` cap, a line another device shares included, and the device's DMA
 capability), and spawns this driver from

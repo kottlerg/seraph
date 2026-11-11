@@ -178,9 +178,12 @@ when its readiness woke the waiter. That readiness can lapse before the thread's
 source (a queued sender stopped, say), so the receive can find nothing. Several threads may wait
 on one set, as a pool of workers sharing its sources: they queue in arrival order, and each
 arrival of work on a member (a queued call, a posted entry, a send) wakes the one that has
-waited longest, so a burst of arrivals wakes as many waiters. A returned source reserves nothing
+waited longest, so a burst of arrivals wakes as many waiters. Ready sources are returned in turn,
+so one that keeps receiving work does not hold back another. A returned source reserves nothing
 for the thread it was returned to, so another thread of the pool can take what made it ready, and
-that thread's receive finds nothing. Destroying the set wakes every waiter with `Interrupted`.
+that thread's receive finds nothing. A wake hands one arrival to one thread: if that thread does
+not take the work, it stays ready on the set for the next wait, and no parked thread is woken for
+it. Destroying the set wakes every waiter with `Interrupted`.
 See [syscalls.md § `SYS_WAIT_SET_WAIT`](../core/kernel/docs/syscalls.md#sys_wait_set_wait-28).
 
 ---

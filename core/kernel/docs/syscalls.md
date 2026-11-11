@@ -2276,15 +2276,23 @@ source that stays ready again after the others (see
 Any number of threads may wait on one wait set. They queue in arrival order, and each
 arrival of work on a member (a call queued on an endpoint, an entry posted to an event queue,
 a send to a notification that wakes no direct waiter) wakes the longest-waiting one with that
-member's badge; the others stay parked.
+member's badge; the others stay parked. A wake hands that one arrival to that one thread, and
+no other thread is woken for it: if the woken thread does not take the work (it is stopped or
+destroyed after the wake, or receives from another source first), the work stays ready on
+the set, and the next thread to enter the wait, or the thread the next arrival on any member
+wakes, is returned it. A pool whose other threads are all parked leaves that work untaken
+until one of those happens (see [ipc-internals.md](ipc-internals.md) § Wait Set Readiness
+Model, P1).
 
 The badge names a source that was ready when the wait returned, or when its readiness
 woke the caller; a source whose readiness lapsed before the call (an endpoint whose
 queued sender was stopped or destroyed, a notification a direct wait drained) is not
 returned for it. Readiness can still lapse between the return and the caller's receive
 on the source, so that receive can find nothing: the badge reserves nothing, and another
-thread waiting on the same set can take what made the source ready (see
-[ipc-internals.md](ipc-internals.md) § Wait Path).
+thread waiting on the same set can take what made the source ready. A source stays queued on
+the set while it is ready, so a wait by another thread before the first one receives returns
+the same source (see [ipc-internals.md](ipc-internals.md) § Wait Path and § Wait Set
+Readiness Model, P2).
 
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 

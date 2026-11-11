@@ -12,10 +12,11 @@
 //! cross-thread return (a child thread signals the source; the parent blocks
 //! unless the unpinned child signals first), two threads waiting on one set
 //! at once, each arrival waking one, a member that takes several arrivals
-//! holding one ready-ring entry, and ready members returned in turn. The
-//! remove test verifies that only the remaining member can wake the wait set
-//! after removal, and the stale-entry test that a member whose source stopped
-//! being ready after it was queued is not returned.
+//! holding one ready-ring entry, ready members returned in turn, and work a
+//! woken waiter leaves returned by a later wait. The remove test verifies
+//! that only the remaining member can wake the wait set after removal, and
+//! the stale-entry test that a member whose source stopped being ready after
+//! it was queued is not returned.
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
@@ -33,11 +34,12 @@ const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 // Child stack for the blocking_wait test.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-// Child stacks for shared_set_waiters' two waiters. The test deletes both
+// Child stacks for the waiters of shared_set_waiters (two) and
+// woken_member_stays_queued (one, on the first). Each test deletes its
 // children on every path, so a failed run leaves no thread on either stack.
 static mut SHARED_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
 
-/// `(ws, done)` for each of `shared_set_waiters`' two waiters, indexed like
+/// `(ws, done)` for each waiter on [`SHARED_STACKS`], indexed like
 /// [`SHARED_STACKS`]: each handle fills a word, so the pair goes by address.
 static SHARED_ARGS: crate::spawn::ArgBlock<(u64, u64), 2> = crate::spawn::ArgBlock::new((0, 0));
 
@@ -292,9 +294,113 @@ fn backlog_run(ws: u64, low: u64, high: u64) -> TestResult
     }
     if returned != [QUIET_BADGE, BUSY_BADGE, QUIET_BADGE, BUSY_BADGE]
     {
-        return Err("wait_set::backlog_served: a member's backlog waited behind arrivals elsewhere");
+        return Err(
+            "wait_set::backlog_served: a member's backlog waited behind arrivals elsewhere",
+        );
     }
     Ok(())
+}
+
+/// The caps and child `woken_member_stays_queued` creates; each is deleted on
+/// every path.
+#[derive(Default)]
+struct Woken
+{
+    ws: Option<u64>,
+    busy: Option<u64>,
+    member: Option<u64>,
+    done: Option<u64>,
+    waiter: Option<crate::spawn::SpawnedChild>,
+}
+
+/// An arrival that wakes a parked thread queues its member too, so work the
+/// woken thread leaves is returned by a later wait while another member stays
+/// busy: a child parks on a two-member set, a post to the higher-indexed queue
+/// wakes it, and it exits without receiving; the parent then posts a backlog
+/// to the lower-indexed queue, reposting after each entry it takes, and
+/// requires the left entry's member within two waits. Fails if the waking
+/// arrival queued no entry, which left that member to the level walk, which
+/// runs only when the ring holds no ready member (ipc-internals.md § Wait Set
+/// Readiness Model, I2).
+pub fn woken_member_stays_queued(ctx: &TestContext) -> TestResult
+{
+    let mut w = Woken::default();
+    let result = woken_run(ctx, &mut w);
+    let mut ok = true;
+    if let Some(mut child) = w.waiter.take()
+    {
+        ok &= child.delete_thread().is_ok();
+        ok &= child.delete_cspace().is_ok();
+    }
+    for cap in [w.ws, w.busy, w.member, w.done].into_iter().flatten()
+    {
+        ok &= cap_delete(cap).is_ok();
+    }
+    result?;
+    if ok
+    {
+        Ok(())
+    }
+    else
+    {
+        Err("wait_set::woken_member_stays_queued: cap_delete in cleanup failed")
+    }
+}
+
+/// Body of [`woken_member_stays_queued`].
+fn woken_run(ctx: &TestContext, w: &mut Woken) -> TestResult
+{
+    let err = "wait_set::woken_member_stays_queued: setup failed";
+    let ws = *w
+        .ws
+        .insert(wait_set_create(ctx.memory_base, 2).map_err(|_| err)?);
+    let busy = *w
+        .busy
+        .insert(event_queue_create(ctx.memory_base, 4).map_err(|_| err)?);
+    let member = *w
+        .member
+        .insert(event_queue_create(ctx.memory_base, 4).map_err(|_| err)?);
+    let done = *w
+        .done
+        .insert(cap_create_notification(ctx.memory_base).map_err(|_| err)?);
+    wait_set_add(ws, busy, BUSY_BADGE).map_err(|_| err)?;
+    wait_set_add(ws, member, SHARED_BADGE).map_err(|_| err)?;
+
+    let child = w
+        .waiter
+        .insert(crate::spawn::new_child(ctx).map_err(|_| err)?);
+    start_shared_child(child, 0, shared_waiter_0, ws, done)?;
+    let acc = collect(done, 0, waiter_bits(0, BIT_READY))
+        .map_err(|_| "wait_set::woken_member_stays_queued: the waiter did not start")?;
+    // In practice the waiter has parked by now; if it has not, the post below
+    // queues the member and its wait returns it, which leaves the member
+    // queued too, so the check below cannot fail on that interleaving.
+    let _ = thread_sleep(crate::scaled_bound(SETTLE_SLEEP_MS));
+
+    event_post(member, 0).map_err(|_| err)?;
+    let acc = collect(done, acc, waiter_bits(0, BIT_OK | BIT_BAD))
+        .map_err(|_| "wait_set::woken_member_stays_queued: the post woke no waiter")?;
+    if acc & waiter_bits(0, BIT_BAD) != 0
+    {
+        return Err("wait_set::woken_member_stays_queued: the waiter got another badge");
+    }
+
+    for n in 0..3
+    {
+        event_post(busy, n).map_err(|_| err)?;
+    }
+    for _ in 0..2
+    {
+        let badge =
+            wait_set_wait(ws).map_err(|_| "wait_set::woken_member_stays_queued: wait failed")?;
+        if badge == SHARED_BADGE
+        {
+            return Ok(());
+        }
+        event_recv(busy).map_err(|_| err)?;
+        event_post(busy, 0).map_err(|_| err)?;
+    }
+    Err("wait_set::woken_member_stays_queued: work a woken waiter left was not returned")
 }
 
 // ── wait_set_wait (blocking) ──────────────────────────────────────────────────
@@ -536,20 +642,21 @@ fn start_shared_child(
 ) -> TestResult
 {
     let c_ws = cap_copy(ws, child.cs, RIGHTS_ALL)
-        .map_err(|_| "wait_set::shared_set_waiters: cap_copy(ws) failed")?;
+        .map_err(|_| "wait_set: cap_copy(ws) for a waiter failed")?;
     let c_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
-        .map_err(|_| "wait_set::shared_set_waiters: cap_copy(done) failed")?;
-    // SAFETY: each shared stack belongs to one of this test's two children,
-    // which the test deletes before returning; unit tests run sequentially.
+        .map_err(|_| "wait_set: cap_copy(done) for a waiter failed")?;
+    // SAFETY: each shared stack belongs to one child of the running test,
+    // which deletes it before returning; unit tests run sequentially.
     let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(SHARED_STACKS[stack]) });
-    // SAFETY: `stack` < 2; the entry's previous child (one of an earlier
-    // phase's or run's waiters, deleted before it returned) has exited, and
-    // this one has not started.
+    // SAFETY: `stack` < 2; the entry's previous child (a waiter of an earlier
+    // test, phase, or run, deleted before it returned) has exited, and this
+    // one has not started.
     let arg = unsafe { SHARED_ARGS.publish(stack, (c_ws, c_done)) };
-    // SAFETY: the stack is `SHARED_STACKS[stack]`, this test's own `ChildStack`,
-    // on which no other live thread runs (`ChildStack`'s rule).
+    // SAFETY: the stack is `SHARED_STACKS[stack]`, a `ChildStack` of this
+    // module's waiters, on which no other live thread runs (`ChildStack`'s
+    // rule).
     unsafe { crate::spawn::configure_and_start(child, entry, stack_top, arg) }
-        .map_err(|_| "wait_set::shared_set_waiters: configure_and_start failed")
+        .map_err(|_| "wait_set: configure_and_start of a waiter failed")
 }
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,

@@ -429,6 +429,10 @@ pub fn run_all(ctx: &TestContext)
         "wait_set::backlog_served_beside_arrivals",
         wait_set::backlog_served_beside_arrivals(ctx)
     );
+    run_test!(
+        "wait_set::woken_member_stays_queued",
+        wait_set::woken_member_stays_queued(ctx)
+    );
     run_test!("wait_set::blocking_wait", wait_set::blocking_wait(ctx));
     run_test!(
         "wait_set::shared_set_waiters",

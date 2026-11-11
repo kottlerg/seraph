@@ -677,28 +677,30 @@ Each IPC object type is extended with a "wait set registration" — a pointer ba
 the `WaitSetState` and the member index. On every arrival of work on the object (a call
 queued on an endpoint, a send to a notification that wakes no direct waiter, an entry rung
 on an event queue), not only on the one that makes it ready, it calls into the wait set, so
-that each arrival wakes one of the threads waiting on the set:
+that each arrival queues the member and wakes one of the threads waiting on the set:
 
 ```
 waitset_notify(wait_set, member_idx):
     Acquire wait_set.lock
+    if members[member_idx] is occupied and not queued:
+        ready_ring.push(member_idx)
+        members[member_idx].queued = true
     if waiters is non-empty:
         tcb = waiters.pop()            // the longest-waiting thread
         claim_waiter(tcb, members[member_idx].badge)
         Release lock
         enqueue_and_wake(tcb)
     else:
-        if members[member_idx] is occupied and not queued:
-            ready_ring.push(member_idx)
-            members[member_idx].queued = true
         Release lock
 ```
 
-A member holds at most one ring entry, however many arrivals it takes while no thread
-waits, so the ring never holds more entries than the set has members and never fills,
-and a member that keeps receiving work cannot crowd another member's entry out of it. A
-member a wait returns keeps its entry, queued again behind the others (§ Wait Path step
-2c).
+A member holds at most one ring entry, however many arrivals it takes, so the ring never
+holds more entries than the set has members and never fills, and a member that keeps
+receiving work cannot crowd another member's entry out of it. An arrival that wakes a
+thread queues the member too, so work that the woken thread does not take stays visible to
+later waits. A member a wait returns keeps its entry, queued again behind the others
+(§ Wait Path step 2c). § Wait Set Readiness Model states the states and invariants these
+rules keep.
 
 ### Wait Path
 
@@ -712,8 +714,9 @@ member a wait returns keeps its entry, queued again behind the others (§ Wait P
       source_is_ready right now: members[member_idx].queued = false; skip it
    c. ready_ring.push(member_idx) (queued stays set: the member is queued
       again behind the others); Release lock; return members[member_idx].badge
-3. Level-readiness self-heal: for each member, if source_is_ready(source)
-   right now, Release lock and return its badge.
+3. Level-readiness self-heal (the ring is now empty): for each member, if
+   source_is_ready(source) right now, queue it (ready_ring.push, queued =
+   true), Release lock, and return its badge.
 4. else, still under the lock:
    a. context_saved = 0; waiters.push(current_tcb) (the tail, behind any
       threads already waiting)
@@ -745,34 +748,44 @@ order on `waiters`. Each `waitset_notify` wakes the head and leaves the rest
 parked, and the set's destruction wakes them all. A thread parks only after steps 2
 and 3 found nothing ready under the lock, so no member's readiness is stranded
 while a thread waits: every readiness after that point reaches `waitset_notify`.
-The badge a wake deposits reserves nothing. A thread that enters the wait before
-the woken one receives can be returned the same member by step 2 or 3 and take what
-made it ready, and the woken thread's receive then finds nothing. A thread that
-shares a set with others therefore receives without blocking where the source
-offers that (`SYS_EVENT_RECV`'s try-once mode), or accepts that its blocking
-receive waits for the source's next arrival.
+The badge a wake deposits reserves nothing. A member handed to one thread, by a wake or
+by a wait's return, stays queued while its source is ready, so any thread that enters
+the wait before the first one receives can be returned the same member by step 2 (or,
+should its entry be missing, step 3) and take what made it ready; the first thread's
+receive then finds nothing. A thread that shares a set with others therefore receives
+without blocking where the source offers that (`SYS_EVENT_RECV`'s try-once mode), or
+accepts that its blocking receive waits for the source's next arrival.
+
+A wake hands one arrival to one thread, and the set does not wake another for it. If the
+woken thread does not take the work (it is stopped or destroyed after the wake, or it
+receives from another source first), the work stays queued: the next thread to enter the
+wait is returned it, and so is the thread the next arrival on any member wakes. A pool
+whose every other thread is parked therefore leaves that work untaken until a thread
+enters the wait or another arrival wakes one; § Wait Set Readiness Model states this as
+property P1.
 
 **Why step 3 exists, and its memory-ordering requirement.** Every arrival of work
-on a member reaches `waitset_notify` (§ Readiness Notification), and a member a wait
-returns keeps its entry while its source stays ready (step 2c), but an arrival that
-finds a thread waiting wakes that thread and queues no entry. A member whose woken
-thread does not take the work (a thread stopped or destroyed after the wake, or one
-that receives from another source first) then holds work that no entry names, and it
-would stay invisible to later waits without the level re-check in step 3.
+on a member queues it (§ Readiness Notification), a member leaves the ring only when a
+wait finds it drained at the head (step 2b), and a member ready when it is added is
+queued at the add (§ Wait Set Add/Remove), so a ready member always has an entry
+(invariant I2 of § Wait Set Readiness Model). The self-heal of step 3 is the backstop
+behind that bookkeeping: before a thread parks, a ready member that no entry names is returned and
+queued rather than left beside the parked thread. Run only when the ring is empty, it
+costs one walk over the members per park.
 
-The self-heal reads source readiness **without taking the source lock**: taking
+Steps 2b and 3 read source readiness **without taking the source lock**: taking
 it here would acquire `source.lock` while holding `ws.lock`, inverting the
 `source.lock → ws.lock` order `waitset_notify` uses (it runs under the source
 lock and acquires `ws.lock`) and deadlocking (rule 2 of
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)).
-Because the read is lockless, each source's readiness signal is an atomic that the
-self-heal reads with `Acquire`. `EventQueueState::count` and
+Because the read is lockless, each source's readiness signal is an atomic that
+they read with `Acquire`. `EventQueueState::count` and
 `EndpointState::send_nonempty` MUST be mutated with `Release` under the source lock,
 and the `Acquire` load pairs with those stores. Without that pairing, a weak-memory
 target (riscv64) can observe a stale not-ready and strand a queued sender or event
 that no ring entry names (lost wakeup). `NotificationState::bits` is the
 exception. `notification_send` sets it with a lock-free `Relaxed` `fetch_or` that
-the SeqCst Dekker fence pair orders against `notification_wait`, so the self-heal's
+the SeqCst Dekker fence pair orders against `notification_wait`, so their
 `Acquire` load of `bits` has no `Release` partner (`bits` carries no dependent
 payload). The readiness signals are: `NotificationState::bits`
 (`AtomicU64`), `EventQueueState::count` (`AtomicU32`), and
@@ -828,6 +841,81 @@ blocking, and a member whose arrivals keep landing does not hold back another me
 backlog, per [syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28). An
 entry whose source is no longer ready is skipped and dropped (§ Wait Path step 2b); the
 member's next arrival queues it again.
+
+### Wait Set Readiness Model
+
+A member's source has a level, `ready(m)`: a queued call, a posted entry, or pending
+bits. The level rises under the source's lock just before the source calls
+`waitset_notify`, and it falls when a thread receives from the source, which the set
+does not observe. Every rise reaches `waitset_notify`. An endpoint's send queue grows
+only in `endpoint_call`, which kernel-synthesized fault messages also go through. An
+event queue's count rises only in `event_queue_post`. A notification's bits rise only in
+`notification_send`, which notifies the set on every send that no direct waiter takes.
+A post or call handed straight to a blocked receiver, and bits a direct waiter takes,
+leave the level where it was. The set's own state, under `ws.lock`, is the ring of
+queued members and the FIFO queue of parked threads.
+
+**Member states.**
+
+- **Vacant**: the slot holds no source.
+- **Idle**: occupied, with no ring entry (`queued` clear).
+- **Queued**: occupied, with exactly one ring entry (`queued` set). The source may be
+  ready, a live entry, or drained, a stale entry dropped when it reaches the head.
+
+A member handed to a thread, by a wake or by a wait's return, is Queued. It stays
+Queued while its source is ready, and becomes Idle when a later wait finds it drained
+at the head.
+
+**Transitions**, each under `ws.lock`, as `WaitSetState`'s methods implement them:
+
+| Event | Transition | Method |
+|---|---|---|
+| add | Vacant to Idle; to Queued at the tail if the source is ready at the add, then the longest-parked thread, if any, is woken with the member's badge | `install` |
+| arrival | Idle to Queued at the tail; a Queued member keeps its place; then the longest-parked thread, if any, is woken with the member's badge | `on_arrival` |
+| wait, step 2 | the head entry is popped; a ready member is Queued again at the tail and returned; a drained one becomes Idle and the next entry is popped | `pop_ready` |
+| wait, step 3 | with the ring empty, the first ready Idle member is Queued at the tail and returned | `next_ready` |
+| park | with no member returned by steps 2 and 3, the thread joins the tail of `waiters` | `waitset_wait` |
+| remove | any state to Vacant, the member's entry leaving the ring | `remove_member` |
+| destroy | every parked thread is woken with `Interrupted` | `wait_set_drop` |
+| drain | outside the set: the level falls, and the member's state is unchanged | none |
+
+**Invariants.**
+
+- **I1, one entry:** a member is Queued exactly when the ring holds its index, once. The
+  ring names occupied members only, so it holds at most `member_count` entries, within
+  its `capacity`, and a push always fits.
+- **I2, coverage:** a member whose source is ready is Queued, except between the level's
+  rise and the source's `waitset_notify`, which the source's lock spans. A member is
+  queued by every arrival, and it leaves the ring only when a wait finds it drained.
+- **I3, bounded turns:** a ready Queued member is returned by one of the next `L`
+  successful waits, where `L` is the ring's length, at most `member_count`. Each
+  successful wait returns the head entry and queues it behind the rest, or drops a
+  drained head. An arrival never moves a Queued member, and a newly queued member joins
+  behind it.
+- **I4, no lost wake:** a thread parks only when steps 2 and 3, under `ws.lock`, found
+  no ready member. Every later arrival takes `ws.lock` and wakes the longest-parked
+  thread, so while threads are parked each arrival wakes exactly one of them, in arrival
+  order. Arrivals beyond the number parked leave the member Queued for the next wait.
+  With the whole pool parked, no work waits.
+
+**Properties of the contract** (`SYS_WAIT_SET_WAIT` states both):
+
+- **P1, a wake hands one arrival to one thread.** The set wakes no other thread for that
+  arrival. If the woken thread does not take the work (it is stopped or destroyed after
+  the wake, or receives from another source first), the work stays Queued (I2). The next
+  thread to enter the wait is returned it, and so is the thread the next arrival on any
+  member wakes. A pool whose other threads are all parked leaves the work untaken until
+  one of those events, so a pool that can lose a woken thread runs a thread that keeps
+  waiting, or re-arms the pool when it loses one.
+- **P2, a badge reserves nothing.** A member handed to one thread stays Queued while its
+  source is ready, so another thread's wait can be returned the same member before the
+  first thread receives, through the ring (step 2) and not only through the self-heal
+  (step 3). One of the two then finds nothing to take.
+
+The host test `generated_sequences_keep_the_readiness_invariants` in `wait_set.rs`
+drives these methods through generated sequences of arrivals, waits, takes, abandoned
+handouts, removes and adds, over capacities of 1 to 6 members and pools of 1 to 4
+threads. It checks I1 to I4 after every step.
 
 ---
 

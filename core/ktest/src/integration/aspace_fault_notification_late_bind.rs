@@ -100,19 +100,55 @@ pub fn run(ctx: &TestContext) -> TestResult
     restore
 }
 
+/// The caps one round holds, deleted on drop in the order a passing round
+/// deletes them, so a round that fails part-way leaves no thread, queue, or
+/// space behind for a later test; 0 holds none.
+struct RoundCaps
+{
+    eq: u64,
+    thread_eq: u64,
+    thread: u64,
+    cspace: u64,
+    aspace: u64,
+}
+
+impl Drop for RoundCaps
+{
+    fn drop(&mut self)
+    {
+        for cap in [self.eq, self.thread_eq, self.thread, self.cspace, self.aspace]
+        {
+            if cap != 0
+            {
+                cap_delete(cap).ok();
+            }
+        }
+    }
+}
+
 /// One fault in a fresh address space, its read-back, and a late bind.
 /// `pinned`: the controller runs on [`CONTROLLER_CPU`]; the thread is pinned
 /// to [`FAULT_CPU`] and polled densely.
 fn round(ctx: &TestContext, pinned: bool) -> TestResult
 {
+    let mut caps = RoundCaps {
+        eq: 0,
+        thread_eq: 0,
+        thread: 0,
+        cspace: 0,
+        aspace: 0,
+    };
     // Dedicated address space + cspace + thread, so the recorded terminal fault
     // is isolated from the test's own address space.
     let aspace = cap_create_aspace(ctx.memory_base, 0, 8)
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_aspace failed")?;
+    caps.aspace = aspace;
     let cspace = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_cspace failed")?;
+    caps.cspace = cspace;
     let thread = cap_create_thread(ctx.memory_base, aspace, cspace, 0, 0)
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_thread failed")?;
+    caps.thread = thread;
 
     // No thread of the fresh space has faulted, so nothing is retained.
     if cap_info(aspace, CAP_INFO_ASPACE_TERMINAL_FAULT) != Ok(0)
@@ -124,6 +160,7 @@ fn round(ctx: &TestContext, pinned: bool) -> TestResult
         event_queue_create_observed(ctx.memory_base, THREAD_OBSERVERS, THREAD_OBSERVERS).map_err(
             |_| "aspace_fault_notification_late_bind: thread observer queue create failed",
         )?;
+    caps.thread_eq = thread_eq;
     for _ in 0..THREAD_OBSERVERS
     {
         thread_bind_notification(thread, thread_eq, CORR)
@@ -164,6 +201,7 @@ fn round(ctx: &TestContext, pinned: bool) -> TestResult
     // § `SYS_ASPACE_BIND_NOTIFICATION`).
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "aspace_fault_notification_late_bind: event_queue_create failed")?;
+    caps.eq = eq;
     aspace_bind_notification(aspace, eq, CORR)
         .map_err(|_| "aspace_fault_notification_late_bind: bind onto faulted aspace failed")?;
 
@@ -182,11 +220,7 @@ fn round(ctx: &TestContext, pinned: bool) -> TestResult
         );
     }
 
-    cap_delete(eq).ok();
-    cap_delete(thread_eq).ok();
-    cap_delete(thread).ok();
-    cap_delete(cspace).ok();
-    cap_delete(aspace).ok();
+    // `caps` deletes the round's caps on return.
     Ok(())
 }
 

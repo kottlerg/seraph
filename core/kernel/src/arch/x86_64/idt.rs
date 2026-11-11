@@ -479,6 +479,21 @@ pub(super) unsafe extern "C" fn common_exception_handler(
             // `dealloc_object(Thread)` committed `Exited`); the posts below
             // still carry the fault class (no death walk posts `EXIT_KILLED`).
             let reason = syscall::EXIT_FAULT_BASE + vector;
+
+            // Terminal fault (no handler bound, or a Kill outcome: the handler
+            // replied KILL or the episode was cancelled; see docs/fault-handling.md
+            // § Delivery, Resume, and Kill): record it on the faulting thread's
+            // address space before the `Exited` commit, so a holder that reads
+            // the thread `Exited` also reads the space's terminal fault
+            // (core/kernel/docs/syscalls.md § `SYS_CAP_INFO`); its observers are
+            // posted below. Reached only on the terminal path; normal
+            // thread_exit never lands here.
+            // SAFETY: tcb validated non-null; address_space may be null for
+            // kernel threads, which record_aspace_terminal_fault handles; no
+            // death_lock is held.
+            let aspace_post =
+                unsafe { crate::sched::record_aspace_terminal_fault((*tcb).address_space, reason) };
+
             // SAFETY: tcb validated non-null.
             let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 
@@ -488,16 +503,13 @@ pub(super) unsafe extern "C" fn common_exception_handler(
                 crate::sched::post_death_notification(tcb, reason);
             }
 
-            // Terminal fault (no handler bound, or a Kill outcome: the handler
-            // replied KILL or the episode was cancelled; see docs/fault-handling.md
-            // § Delivery, Resume, and Kill): notify the faulting thread's
-            // address-space observers with the fault class so procmgr can tear the
-            // whole process down. Reached only on the terminal path; normal
-            // thread_exit never lands here.
-            // SAFETY: tcb validated non-null; address_space may be null for
-            // kernel threads, which post_aspace_death_notification handles.
+            // Notify the address-space observers recorded above with the fault
+            // class so procmgr can tear the whole process down.
+            // SAFETY: aspace_post comes from this path's record, and the
+            // thread has stayed on this CPU since; it is now Exited and no
+            // lock is held.
             unsafe {
-                crate::sched::post_aspace_death_notification((*tcb).address_space, reason);
+                crate::sched::post_aspace_death_notification(&aspace_post);
             }
         }
 

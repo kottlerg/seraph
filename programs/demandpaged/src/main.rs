@@ -8,7 +8,7 @@
 //! Demand paging is the system-wide default, so when spawned normally procmgr
 //! binds this process's fault handler to memmgr (the pager). The pager phase
 //! also spawns it `pinned(true)` to prove the opt-out leaves it with no pager.
-//! Two modes, selected by argv:
+//! Four modes, selected by argv:
 //!
 //!   * default — reserve an unbacked region, register it as demand-paged, and
 //!     write a per-page pattern across it. Each first touch faults to memmgr,
@@ -27,10 +27,19 @@
 //!     The pager finds the pool empty when it maps the block's chunk, and
 //!     must fund the pool itself rather than decline. Exits `SUCCESS` when
 //!     the touch is backed and reads back.
+//!   * `teardown` — register and fill a region as the default mode does, tear
+//!     it down with `unregister_demand_paged`, then register a region of the
+//!     same size again. The reservation allocator takes the lowest-address
+//!     first fit, so the second region lands on the first one's VA, which
+//!     memmgr accepts only if the teardown removed the first registration.
+//!     The second region is filled, read back and torn down the same way.
+//!     Exits `SUCCESS` when both rounds pass.
 //!
 //! Driven by `services/svctest`'s pager phase.
 
-use std::os::seraph::{register_demand_paged, reserve_pages, startup_info};
+use std::os::seraph::{
+    register_demand_paged, reserve_pages, startup_info, unregister_demand_paged,
+};
 use std::process::ExitCode;
 
 use syscall_abi::{CAP_INFO_ASPACE_PT_BUDGET, MAP_READ, PAGE_SIZE, SyscallError};
@@ -57,6 +66,10 @@ fn main() -> ExitCode
     {
         page_table_drain()
     }
+    else if std::env::args().any(|a| a == "teardown")
+    {
+        teardown()
+    }
     else
     {
         in_region()
@@ -78,8 +91,26 @@ fn in_region() -> ExitCode
     {
         return ExitCode::from(2);
     };
-    let base = range.va_start() as *mut u8;
+    // SAFETY: the range is a demand region this process registered and holds
+    // no Rust object.
+    if unsafe { fill_and_verify(range.va_start() as *mut u8) }
+    {
+        ExitCode::SUCCESS
+    }
+    else
+    {
+        ExitCode::from(3)
+    }
+}
 
+/// Write the per-(page, byte) pattern across the `PAGES`-page demand region at
+/// `base`, then read it back. Returns whether every byte matched.
+///
+/// # Safety
+/// `[base, base + PAGES * PAGE)` is a read-write demand region this process
+/// registered with the pager, and no Rust object lies in it.
+unsafe fn fill_and_verify(base: *mut u8) -> bool
+{
     // First pass: write. The first store into each page faults; memmgr backs it
     // and the store retries against the now-mapped page.
     for p in 0..PAGES
@@ -106,8 +137,42 @@ fn in_region() -> ExitCode
             let got = unsafe { *base.add(off + i) };
             if got != pattern(p, i)
             {
-                return ExitCode::from(3);
+                return false;
             }
+        }
+    }
+    true
+}
+
+fn teardown() -> ExitCode
+{
+    let mut first_va = None;
+    for _ in 0..2
+    {
+        let Ok(range) = register_demand_paged(PAGES as u64)
+        else
+        {
+            return ExitCode::from(2);
+        };
+        let va = range.va_start();
+        // The second round's reservation is the lowest-address first fit, as
+        // the first round's was, over the same free space once the first
+        // round's teardown released it.
+        if *first_va.get_or_insert(va) != va
+        {
+            return ExitCode::from(5);
+        }
+        // SAFETY: the range is a demand region this process registered and
+        // holds no Rust object.
+        if !unsafe { fill_and_verify(va as *mut u8) }
+        {
+            return ExitCode::from(3);
+        }
+        // SAFETY: no reference into the range outlives `fill_and_verify`, and
+        // the IPC buffer lies outside it.
+        if unsafe { unregister_demand_paged(range) }.is_err()
+        {
+            return ExitCode::from(4);
         }
     }
     ExitCode::SUCCESS

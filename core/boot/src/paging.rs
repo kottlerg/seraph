@@ -39,7 +39,7 @@ pub enum MapError
 /// construct the minimal initial mapping needed for kernel handoff. All
 /// allocation must occur before `ExitBootServices`.
 ///
-/// # Safety
+/// # Implementor requirements
 /// All implementations must enforce W^X: any call to [`map`] with
 /// `flags.writable && flags.executable` must return [`MapError::WxViolation`]
 /// without modifying any table.

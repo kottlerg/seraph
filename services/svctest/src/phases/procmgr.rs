@@ -1485,10 +1485,11 @@ fn run_held_child_to_teardown(handle: u64)
 /// child that was started keeps its pages out of memmgr's free pool after its
 /// teardown, until its creator's `RELEASE_HOLD` on the release token, which
 /// returns them, and a second release finds nothing; `RELEASE_HOLD` on the
-/// process handle, a plain-badge SEND as every copy of the child's own
-/// procmgr cap is, is refused and the hold stays; `RELEASE_HOLD` on a live
-/// child, or on one never started, finds nothing to release; and a held child
-/// destroyed before its start is reclaimed at once. This is the procmgr
+/// process handle, whose badge lacks `HOLD_RELEASE_AUTHORITY` as every copy
+/// of the child's own procmgr cap's does, is refused and the hold stays;
+/// `RELEASE_HOLD` on a live child, or on one never started, finds nothing to
+/// release; and a held child destroyed before its start is reclaimed at
+/// once. This is the procmgr
 /// side of devmgr's order for a DMA-capable driver (docs/process-lifecycle.md
 /// § Process Death); no boot can kill a `VirtIO` driver with a request in
 /// flight and observe its frames reused

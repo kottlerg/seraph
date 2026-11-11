@@ -287,9 +287,12 @@ pub unsafe fn spawn_log_thread(
 
     // Bind I/O ports to the log thread so it can write to the serial port.
     // On x86-64, I/O port access is per-thread via the TSS IOPB.
+    // A log thread without the binding writes no serial, so serial output
+    // stops for both threads rather than faulting the log thread.
     if ioport_cap != 0 && syscall::ioport_bind(thread_cap, ioport_cap).is_err()
     {
-        log("init: log thread: ioport_bind failed");
+        log("init: log thread: ioport_bind failed; serial output stops");
+        arch::current::serial_unbound();
     }
 
     let stack_top = LOG_THREAD_STACK_VA + LOG_THREAD_STACK_PAGES * PAGE_SIZE;
@@ -339,7 +342,7 @@ extern "C" fn log_thread_entry(arg: u64) -> !
 
     let log_ep = arg;
 
-    // SAFETY: LOG_THREAD_IPC_BUF_VA is the registered IPC buffer, page-aligned.
+    // LOG_THREAD_IPC_BUF_VA is the registered IPC buffer, page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = LOG_THREAD_IPC_BUF_VA as *mut u64;
 

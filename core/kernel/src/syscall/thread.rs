@@ -387,8 +387,8 @@ unsafe fn commit_stopped(
 /// killed (for the fault of a restartable syscall's user copy, that syscall
 /// fails with `InvalidAddress`), and a thread blocked in an upcall delivery
 /// has the upcall dropped and resumes (see `core/kernel/docs/syscalls.md`
-/// § `SYS_THREAD_STOP`), unless
-/// a genuine waker, the sleep timer, or a handler's reply claimed it first.
+/// § `SYS_THREAD_STOP`), unless a genuine waker, the elapsed deadline of a
+/// sleep or a timed wait, or a handler's reply claimed it first.
 /// A target parked on an endpoint, notification, event queue, or wait set
 /// whose last capability is deleted concurrently is claimed by the stop or by
 /// the source's teardown, which stamps the same `Interrupted`. A thread may
@@ -1164,8 +1164,10 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                     // Claim = the send-queue unlink under ep.lock (recv
                     // dequeues under the same lock, so winning it makes this
                     // the episode's sole depositor). A fault sender (queued
-                    // for delivery) whose fault this cancel claimed must kill,
-                    // not resume, when next scheduled: its resume runs the
+                    // for delivery) whose fault this cancel claimed takes the
+                    // kill outcome, not a resume, when next scheduled (its
+                    // copy fault fails the syscall, its upcall is dropped,
+                    // docs/fault-handling.md § Reply): its resume runs the
                     // fault helper, which has no syscall to return
                     // `Interrupted` to; `in_fault_delivery` is read only behind
                     // the won unlink, the claim that orders it after the

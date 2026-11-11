@@ -234,11 +234,11 @@ const SERVER_ARG: usize = 1;
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
 
-// SAFETY: written only by the single server child of the current cycle via its
+// Written only by the single server child of the current cycle via its
 // own IPC syscalls (kernel-synchronous), never aliased across cycles.
 static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
-// SAFETY: written only by the single client child of the current cycle via its
+// Written only by the single client child of the current cycle via its
 // own IPC syscalls (kernel-synchronous), never aliased across cycles.
 static mut CLIENT_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
@@ -778,7 +778,7 @@ fn decode(arg: u64) -> (u64, u64)
 extern "C" fn server_entry(arg: u64) -> !
 {
     let (ep_slot, done_slot) = decode(arg);
-    // SAFETY: the server child of the current cycle is the sole user of
+    // The server child of the current cycle is the sole user of
     // SERVER_IPC_BUF; sequential cycles never alias it.
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
 
@@ -858,7 +858,7 @@ extern "C" fn stopper_entry(arg: u64) -> !
 extern "C" fn client_entry(arg: u64) -> !
 {
     let (ep_slot, done_slot) = decode(arg);
-    // SAFETY: the client child of the current cycle is the sole user of
+    // The client child of the current cycle is the sole user of
     // CLIENT_IPC_BUF; sequential cycles never alias it.
     let buf = core::ptr::addr_of_mut!(CLIENT_IPC_BUF).cast::<u64>();
 

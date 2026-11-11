@@ -4653,9 +4653,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                         (*tcb).ipc_wait_next = None;
                         // The whole-queue detach under ep.lock is the episode
                         // claim. A queued fault sender (its handler never
-                        // received) must kill, not resume, when woken: its
-                        // resume runs the fault helper, which reads
-                        // `fault_outcome`. A normal caller gets INTERRUPTED so
+                        // received) takes the kill outcome, not a resume, when
+                        // woken (its copy fault fails the syscall, its upcall
+                        // is dropped): its resume runs the fault helper, which
+                        // reads `fault_outcome`. A normal caller gets INTERRUPTED so
                         // its `sys_ipc_call` resume takes the error path
                         // instead of failing the no-deposit episode tripwire.
                         // Covers the unbind-drops-last-ref liveness case

@@ -261,7 +261,7 @@ mod glue
     use crate::mm::address_space::AddressSpace;
 
     /// The global tag pool. Accessed only through [`with_tag_pool`].
-    // SAFETY: all access is serialised by TAG_POOL_LOCK via with_tag_pool.
+    // All access is serialised by TAG_POOL_LOCK via with_tag_pool.
     static mut TAG_POOL: TagPool = TagPool::new();
 
     /// Spin-lock protecting [`TAG_POOL`].

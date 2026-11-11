@@ -679,9 +679,11 @@ extern "C" fn caller_entry(arg: u64) -> !
         {
             let target = core::ptr::addr_of_mut!(MEM_TARGET).cast::<u8>();
             // SAFETY: the buffer is a scratch page the handler backs; the
-            // write lands in MEM_TARGET, a static of ktest's own address space
-            // (the helper's), to which no reference is live and for which any
-            // byte value is valid.
+            // write lands in MEM_TARGET, a data static of ktest's own address
+            // space (the helper's), which holds no code, to which no reference
+            // is live, and for which any byte value is valid. Only this thread
+            // accesses it, after the call returns: the harness runs one case's
+            // child at a time.
             let r = unsafe {
                 syscall::thread_write_mem_raw(a.helper, target as u64, a.buf as *const u8, a.len, 0)
             };

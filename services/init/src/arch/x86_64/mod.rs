@@ -5,12 +5,22 @@
 
 //! x86-64 serial output via COM1 and architecture constants.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use init_protocol::InitInfo;
 
 /// ELF machine type for x86-64.
 pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_X86_64;
 
 const COM1: u16 = 0x3F8;
+
+/// Whether every thread of init that writes serial holds COM1's port
+/// binding: set by `serial_init` once the main thread's bind succeeded and
+/// the port is programmed, and cleared by [`serial_unbound`] when init-logd's
+/// bind fails. Until it is set, and after it is cleared, serial writes are
+/// dropped, as riscv64 drops them before its UART is mapped: a port access
+/// without the binding raises #GP under the all-denied I/O bitmap.
+static PORTS_BOUND: AtomicBool = AtomicBool::new(false);
 
 /// Initialise COM1 serial output at 115200 8N1.
 pub fn serial_init(info: &InitInfo, thread_cap: u64)
@@ -35,6 +45,14 @@ pub fn serial_init(info: &InitInfo, thread_cap: u64)
         outb(COM1 + 2, 0xC7); // FIFO enable
         outb(COM1 + 4, 0x0B); // DTR + RTS + OUT2
     }
+    PORTS_BOUND.store(true, Ordering::Release);
+}
+
+/// Drop every later serial write: init-logd, which writes serial beside the
+/// main thread, could not take COM1's port binding.
+pub fn serial_unbound()
+{
+    PORTS_BOUND.store(false, Ordering::Release);
 }
 
 /// Release init's serial mapping: a no-op on x86-64, where COM1 is reached
@@ -42,10 +60,18 @@ pub fn serial_init(info: &InitInfo, thread_cap: u64)
 /// hold init's address space live past its reap.
 pub fn serial_release() {}
 
-/// Write one byte to COM1, spinning until the transmit register is ready.
+/// Write one byte to COM1, spinning until the transmit register is ready;
+/// dropped while [`PORTS_BOUND`] is clear.
 pub fn serial_write_byte(byte: u8)
 {
-    // SAFETY: reading LSR is a side-effect-free I/O port read on COM1.
+    if !PORTS_BOUND.load(Ordering::Acquire)
+    {
+        return;
+    }
+    // SAFETY: PORTS_BOUND is set only once the main thread holds COM1's
+    // binding, and init-logd, the only other thread that writes, binds the
+    // same ports before it starts or clears the flag (`serial_unbound`);
+    // reading LSR is a side-effect-free I/O port read on COM1.
     while unsafe { inb(COM1 + 5) } & 0x20 == 0
     {}
     // SAFETY: writing one byte to the COM1 data register.

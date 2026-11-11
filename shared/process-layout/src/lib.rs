@@ -333,7 +333,7 @@ pub const fn growth_zones(user_va_top: u64) -> AddressSpaceZones
     {
         return SV39_ZONES;
     };
-    let half = 1_u64 << top.ilog2();
+    let half = 1u64 << top.ilog2();
     if half < SCALED_MIN_HALF
     {
         return SV39_ZONES;
@@ -465,7 +465,7 @@ pub struct ProcessLayout
 
 fn entropy_word(entropy: &[u8; LAYOUT_ENTROPY_BYTES], index: usize) -> u64
 {
-    let mut bytes = [0_u8; 8];
+    let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&entropy[index * 8..index * 8 + 8]);
     u64::from_le_bytes(bytes)
 }

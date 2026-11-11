@@ -852,8 +852,9 @@ pub fn slab_request_pages(memmgr_ep: u64, min_pages: u64) -> Option<(u64, u64, u
 /// [`ipc::memmgr_grant_layout`] split them, or empty for a reply it refused.
 /// A deleted cap without an id still has its slot freed, and its run stays
 /// accounted to this process until it dies.
-/// The release is best-effort: memmgr ignores an id that matches no
-/// outstanding grant, and a failed IPC leaves the runs accounted the same way.
+/// The release is made again for as long as the call is interrupted, which is
+/// safe because memmgr ignores an id that matches no outstanding grant. Only a
+/// call that memmgr never answers leaves the runs accounted the same way.
 fn release_reply_caps(
     memmgr_ep: u64,
     ipc_buf: *mut u64,
@@ -883,7 +884,7 @@ fn release_reply_caps(
         .words(1, &released[..n])
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
+    let _ = unsafe { ipc_call_until_answered(memmgr_ep, &msg, ipc_buf) };
 }
 
 /// Bytes withheld from a fresh grant's local ledger as slack against any
@@ -1080,8 +1081,10 @@ fn slab_acquire_fresh(need: u64, want_pages: u64, withheld: u64) -> Option<SlabG
 }
 
 /// Return a fresh slab's backing run to memmgr's pool, naming it by the
-/// `region_id` recorded in its [`SlabGrant`]. Best-effort: a failed IPC just leaves
-/// the run accounted to this process until it dies.
+/// `region_id` recorded in its [`SlabGrant`]. The release is made again for as
+/// long as the call is interrupted, which is safe because memmgr ignores an id
+/// that matches no outstanding grant. Only a call that memmgr never answers
+/// leaves the run accounted to this process until it dies.
 ///
 /// The caller MUST have already deleted its capability to the slab and every
 /// kernel object retyped from it; a release while either remains still
@@ -1099,7 +1102,7 @@ pub fn slab_release_fresh(region_id: u64) {
     }
     let msg = ipc::IpcMessage::builder(RELEASE_MEMORY_CAPS).word(0, 1).word(1, region_id).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let _ = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
+    let _ = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) };
 }
 
 /// Retype one kernel object out of the slab machinery.
@@ -1187,8 +1190,9 @@ pub fn object_slab_acquire_fresh(min_bytes: u64) -> Option<SlabGrant> {
 }
 
 /// memmgr's current free-pool size in bytes (`QUERY_POOL_STATUS`, reply
-/// `data[3]`). `None` if memmgr is unreachable. A read-only aggregate query;
-/// used by the threadchurn regression to assert a bounded pool footprint.
+/// `data[3]`). `None` if memmgr is unreachable. A read-only aggregate query,
+/// made again for as long as the call is interrupted; used by the threadchurn
+/// regression to assert a bounded pool footprint.
 pub fn memmgr_query_free_bytes() -> Option<u64> {
     let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
     if ep == 0 {
@@ -1200,7 +1204,7 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
     }
     let msg = ipc::IpcMessage::builder(QUERY_POOL_STATUS).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
     if reply.label != 0 {
         return None;
     }

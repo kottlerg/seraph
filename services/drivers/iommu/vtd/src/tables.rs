@@ -64,7 +64,7 @@ pub const fn context_entry(table_phys: u64, levels: u32, did: u16) -> [u64; 2]
 #[must_use]
 pub const fn context_index(device: u8, function: u8) -> usize
 {
-    (((device & 0x1f) as usize) << 3 | (function & 0x7) as usize) * 2
+    ((((device & 0x1f) as usize) << 3) | (function & 0x7) as usize) * 2
 }
 
 /// How [`SecondLevel`]'s walk treats a missing intermediate table.

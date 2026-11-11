@@ -809,7 +809,9 @@ pub struct ThreadControlBlock
     /// Bound fault-handler endpoint object per fault class (`null` = none).
     /// Kernel-unresolvable faults of a class on this thread are delivered to
     /// that class's endpoint's receiver; with no handler bound for its class a
-    /// fault is terminal. Stored as the `EndpointObject`
+    /// fault takes its unhandled outcome (the thread is killed, or a
+    /// restartable syscall's copy fails with `InvalidAddress`), and an upcall
+    /// is not posted or is dropped. Stored as the `EndpointObject`
     /// (not the bare `EndpointState`) so the binding can hold an `inc_ref` on
     /// the object for its lifetime — closing the liveness gap where a
     /// fault-blocked thread (queued on neither the endpoint's send nor receive

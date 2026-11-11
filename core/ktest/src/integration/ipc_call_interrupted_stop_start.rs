@@ -62,11 +62,11 @@ static mut SERVER_STACK: ChildStack = ChildStack::ZERO;
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
 
-// SAFETY: used by at most one live client child at a time (phase 1's client
+// Used by at most one live client child at a time (phase 1's client
 // is reaped before phase 2's is spawned).
 static mut CLIENT_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
-// SAFETY: used only by phase 2's single server child.
+// Used only by phase 2's single server child.
 static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
 /// The client's arguments, handed to `client_entry` by address. The phases
@@ -284,7 +284,7 @@ extern "C" fn client_entry(arg: u64) -> !
         bad,
     } = unsafe { spawn::child_args(arg) };
 
-    // SAFETY: sole live user of CLIENT_IPC_BUF (phases run sequentially).
+    // Sole live user of CLIENT_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(CLIENT_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
     // registered by one thread at a time; no Rust object lives in it, and the
@@ -314,7 +314,7 @@ extern "C" fn server_entry(arg: u64) -> !
     // SAFETY: `arg` is the entry `run` published for the server.
     let ServerArgs { ep, done, block } = unsafe { spawn::child_args(arg) };
 
-    // SAFETY: sole user of SERVER_IPC_BUF.
+    // Sole user of SERVER_IPC_BUF.
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
     // registered by one thread at a time; no Rust object lives in it, and the

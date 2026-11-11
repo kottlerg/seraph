@@ -964,7 +964,7 @@ fn parse_hex_arg(text: &str) -> Result<u64, String>
 // ── LintDocs ──────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-pub struct LintDocsArgs {}
+pub struct LintDocsArgs;
 
 // ── CommitCheck ───────────────────────────────────────────────────────────────
 

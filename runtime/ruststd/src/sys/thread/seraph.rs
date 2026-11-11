@@ -901,8 +901,11 @@ static REGISTRY_REFUSED: crate::sync::atomic::AtomicBool =
 /// bind its exception class under a badge of its own. Runs on the new
 /// thread before its code, so the spawner never waits on procmgr; a thread
 /// that procmgr cannot serve yet waits here alone. Best-effort: a refusal or
-/// a failed call leaves the thread unregistered, and it runs as before. A
-/// process procmgr did not create (no procmgr endpoint) sends nothing.
+/// a failed call leaves the thread unregistered, and it runs as before,
+/// apart from a call cancelled `Interrupted` after procmgr received it,
+/// which procmgr carried out. A failed call is not repeated, since a repeat
+/// of one procmgr carried out would register the thread twice. A process
+/// procmgr did not create (no procmgr endpoint) sends nothing.
 fn register_with_procmgr(self_thread_cap: u64, ipc_buf: *mut u64) {
     use crate::sync::atomic::Ordering;
     use ipc::{procmgr_errors, procmgr_labels};

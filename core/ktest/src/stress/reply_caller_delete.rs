@@ -187,9 +187,9 @@ static BAD_CALLER: BadTally = BadTally::new();
 /// A child's IPC buffer page (one live user each).
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
-// SAFETY: used only by the round's server, of which one runs at a time.
+// Used only by the round's server, of which one runs at a time.
 static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
-// SAFETY: used only by the round's caller, of which one runs at a time.
+// Used only by the round's caller, of which one runs at a time.
 static mut CALLER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
 /// The server's arguments, handed to its entry by address.

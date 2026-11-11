@@ -545,9 +545,13 @@ replies `UNAUTHORIZED` otherwise. The verb-bits in use are bits 58 through 63
 minter that hands out badges carrying other information keeps them clear:
 procmgr's random per-process badge, stamped on every SEND procmgr mints
 for a child (its procmgr, registry, and log SENDs) and on its process
-handle, is redrawn until none of them is set. An un-badged SEND on such an
-endpoint stays with the server and its trusted minters, since its holder
-could badge it with any verb-bit. svcmgr's `QUERY_ENDPOINT` answers every
+handle, is redrawn until none of them is set; the handle alone also
+carries a verb-bit procmgr sets itself,
+`procmgr_labels::PROCESS_HANDLE_TAG`, which tells it from the child's own
+procmgr SEND ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
+§ Messages). An un-badged SEND on such an endpoint stays with the server
+and its trusted minters, since its holder could badge it with any
+verb-bit. svcmgr's `QUERY_ENDPOINT` answers every
 process, so a queryable verb-bit cap would be ambient: a verb-bit cap
 svcmgr publishes itself (its well-known names and each provider's
 `provides` names) is seed-only, reaching only the recipes that seed it,

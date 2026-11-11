@@ -172,8 +172,9 @@ fn own_space(ctx: &TestContext) -> TestResult
     let mut got = [0u8; 16];
     let read = thread_read_mem(child.th, va, &mut got);
     let new = *b"written by cap!!";
-    // SAFETY: the range is OWN, which no reference names while the call runs;
-    // any bytes are a valid [u8; 16].
+    // SAFETY: the range is OWN, a data static that holds no code and that no
+    // reference names while the call runs; any bytes are a valid [u8; 16].
+    // Only this thread accesses OWN, and the child is never started.
     let write = unsafe { thread_write_mem(child.th, va, &new, 0) };
     // SAFETY: OWN is read through a raw pointer, no reference outlives it.
     let after = unsafe { core::ptr::addr_of!(OWN).read_volatile() };

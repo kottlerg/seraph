@@ -48,6 +48,12 @@
 //! a region, empties its own pool with mappings of its own, then touches a
 //! block of the region that needs a fresh page table. memmgr funds the pool
 //! itself and resumes rather than declining the fault.
+//!
+//! A seventh phase, **teardown**, shows `unregister_demand_paged` releases a
+//! demand region whole: the child registers and fills a region, tears it
+//! down, and registers one of the same size again, which the reservation
+//! allocator places on the same VA. memmgr accepts that registration only if
+//! the teardown removed the first one.
 
 use std::os::seraph::process::CommandExt;
 use std::os::seraph::startup_info;
@@ -81,6 +87,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "demand_paging_pt_drain",
             run: demand_paging_pt_drain_phase,
+        },
+        Phase {
+            name: "demand_paging_teardown",
+            run: demand_paging_teardown_phase,
         },
     ]
 }
@@ -267,6 +277,33 @@ fn demand_paging_pt_drain_phase(_: &Caps)
     // its record and reclaimed with it; the identity must hold.
     assert_ram_identity();
     std::os::seraph::log!("demand_paging_pt_drain phase passed");
+}
+
+/// The child registers, fills and tears down a demand region twice, the second
+/// region on the first one's VA. A clean exit proves the teardown removed
+/// memmgr's registration and released the reservation; exit `2` is memmgr
+/// refusing the second registration as an overlap, `4` an unanswered
+/// teardown, `5` a second reservation at another VA. The exit codes are the
+/// fixture's (programs/demandpaged/README.md).
+fn demand_paging_teardown_phase(_: &Caps)
+{
+    use std::process::Command;
+
+    let mut child = Command::new("/programs/demandpaged")
+        .arg("teardown")
+        .spawn()
+        .expect("spawn /programs/demandpaged teardown failed");
+    let status = child.wait().expect("demandpaged teardown wait failed");
+    std::os::seraph::log!("demandpaged teardown exited: {status}");
+    assert!(
+        status.success(),
+        "a torn-down demand region must leave its VA free to register again: {status}"
+    );
+
+    // The frames memmgr reclaimed at the teardown went back to its pool; the
+    // identity must hold.
+    assert_ram_identity();
+    std::os::seraph::log!("demand_paging_teardown phase passed");
 }
 
 // cast_sign_loss: ExitStatus::code() is i32 but exit reasons are non-negative

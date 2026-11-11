@@ -56,6 +56,9 @@ pub fn platform_default_ecam() -> Option<EcamLocation>
 /// #165 (manifest-driven discovery).
 pub const RTC_DRIVER_NAME: &[u8] = b"cmos-rtc";
 
+/// The ELF machine of a driver binary devmgr reads a declaration from.
+pub const ELF_MACHINE: u16 = elf::EM_X86_64;
+
 /// The IOMMU family of x86-64 platforms: Intel VT-d, its units described by
 /// the ACPI DMAR and programmed by `iommu-vtd`.
 pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Vtd;

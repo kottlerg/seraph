@@ -26,7 +26,7 @@ use ipc::{
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
-use virtio_core::bootstrap::{DeliveredBars, DriverEndpoints};
+use virtio_core::bootstrap::DeliveredDevice;
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
 use virtio_core::{
@@ -36,6 +36,33 @@ use virtio_core::{
 
 use crate::decode::ModifierState;
 use crate::input::EventRing;
+
+// ── Declaration ────────────────────────────────────────────────────────────
+
+// What devmgr binds this driver to and how it starts it
+// (docs/driver-binding.md § Driver Declarations).
+driver_binding::driver_declaration!(driver_binding::decl::Declaration {
+    name: "virtio-input",
+    class: Some("input"),
+    matches: &[
+        driver_binding::decl::Match::PciId {
+            vendor: 0x1AF4,
+            device: 0x1012
+        },
+        driver_binding::decl::Match::PciId {
+            vendor: 0x1AF4,
+            device: 0x1052
+        }
+    ],
+    instance_limit: None,
+    interrupt: driver_binding::decl::Interrupt::OPTIONAL,
+    dma: true,
+    phys_access: false,
+    reset: driver_binding::decl::Reset::VirtioStatus,
+    tier: driver_binding::decl::Tier::Auxiliary,
+});
+
+// ── Constants ──────────────────────────────────────────────────────────────
 
 /// Per-iteration timeout on the read-path wait, in milliseconds. When an IRQ is
 /// bound the wait wakes when the interrupt-service thread signals `wake`; the
@@ -52,23 +79,24 @@ const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
-// devmgr serves the two rounds `virtio_core::bootstrap` specifies, as for
-// virtio-blk: the BAR caps with their BAR indices, then the service
-// endpoint, the IRQ (absent when devmgr could give the device no IRQ cap)
-// with its line's mode word, the per-device devmgr query endpoint, and the
+// devmgr delivers the resource list `virtio_core::bootstrap` reads, as for
+// virtio-blk: the BAR caps with their BAR indices, the wired interrupt line
+// (absent when devmgr could give the device none) with its mode word, then
+// the service endpoint, the per-device devmgr query endpoint, and the
 // device's DMA capability. log_ep and procmgr_ep arrive via
 // `ProcessInfo`/`StartupInfo`.
 
 struct DriverCaps
 {
-    bars: DeliveredBars,
+    /// What devmgr delivered; its BAR caps are mapped from here.
+    bars: DeliveredDevice,
     irq_slot: u64,
     /// The `SYS_IRQ_REGISTER` mode devmgr derived for the IRQ line.
     irq_mode: u64,
     memmgr_ep: u64,
     service_ep: u64,
     devmgr_ep: u64,
-    /// The device's DMA capability (`virtio_core::bootstrap::SLOT_DMA`),
+    /// The device's DMA capability (`driver_binding::resources::SLOT_DMA`),
     /// through which the rings and event buffers are mapped for the device.
     dma_ep: u64,
     self_aspace: u64,
@@ -83,27 +111,22 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     }
 
     // SAFETY: `ipc_buf` is the registered IPC buffer for this thread.
-    let round1 = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
-    let bars = DeliveredBars::from_round(&round1)?;
-
-    // SAFETY: same invariant.
-    let round2 = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
-    let endpoints = DriverEndpoints::from_round(&round2)?;
-    if endpoints.dma == 0
+    let device = unsafe { DeliveredDevice::receive(creator, ipc_buf) }?;
+    if device.dma == 0
     {
         std::os::seraph::log!("no DMA capability delivered");
         return None;
     }
 
     Some(DriverCaps {
-        bars,
-        irq_slot: endpoints.irq,
-        irq_mode: endpoints.irq_mode,
-        service_ep: endpoints.service,
+        irq_slot: device.irq,
+        irq_mode: device.irq_mode,
+        service_ep: device.service,
         memmgr_ep: info.memmgr_endpoint,
-        devmgr_ep: endpoints.devmgr_query,
-        dma_ep: endpoints.dma,
+        devmgr_ep: device.devmgr_query,
+        dma_ep: device.dma,
         self_aspace: info.self_aspace,
+        bars: device,
     })
 }
 
@@ -135,12 +158,12 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         syscall::thread_exit();
     }
     let mut bar_va = window_va;
-    for (&bar_cap, aperture) in caps.bars.caps().iter().zip(layout.bars())
+    for (&bar_cap, aperture) in caps.bars.bar_caps().iter().zip(layout.bars())
     {
         // SAFETY: `window` is a fresh reservation of `window_pages` pages
         // from the per-process arena, and `bar_va` starts this BAR's
         // `aperture.pages`-page share of it. devmgr carves each BAR cap to at
-        // most the same `pages` (`carve_virtio_bars`), so the whole-region
+        // most the same `pages` (devmgr's `bind::carve_bars`), so the whole-region
         // mapping stays inside that share: VA no Rust object or IPC page
         // occupies. `PciTransport` reaches the BARs only through its raw
         // volatile accessors, never a reference, and the reservation is

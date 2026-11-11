@@ -156,8 +156,20 @@ pub const fn resolve_stack_pages(note: Option<u32>) -> Option<u32>
 /// alignment.
 pub const SERAPH_NOTE_NAME: [u8; 8] = *b"seraph\0\0";
 
+/// The owner of every Seraph-specific ELF note: [`SERAPH_NOTE_NAME`] without
+/// its NUL and padding, as a note locator (`shared/elf`'s `find_note`) takes
+/// it.
+pub const SERAPH_NOTE_OWNER: &[u8] = b"seraph";
+
 /// Note type for the main-thread stack-size declaration.
 pub const NT_SERAPH_STACK: u32 = 1;
+
+/// Note type for a driver's declaration, in `.note.seraph.driver`. Its
+/// descriptor format and the macro that emits it are `shared/driver-binding`'s
+/// (docs/driver-binding.md § Driver Declarations); the type is allocated here,
+/// beside [`NT_SERAPH_STACK`], so the `seraph` owner's note types stay
+/// distinct.
+pub const NT_SERAPH_DRIVER: u32 = 2;
 
 /// Section name carrying the stack-size note.
 pub const SERAPH_STACK_NOTE_SECTION: &str = ".note.seraph.stack";

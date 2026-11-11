@@ -217,7 +217,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   - `devmgr.test` — the same SEND with `TEST_LABEL_AUTHORITY` added,
     gating devmgr's test labels, the `TEST_SPAWN_ORPHAN` /
     `TEST_ORPHAN_RESULT` shim, the `TEST_SPAWN_FAULT_DRIVERS` /
-    `TEST_QUERY_FAULT_DEVICE` shim, the `TEST_SPAWN_DMA_DRIVER` /
+    `TEST_QUERY_FAULT_DEVICE` shim, the
     `TEST_QUERY_DMA_DEVICE` / `TEST_DMA_FAULTS` shim, and
     `TEST_QUERY_DENY_DEVICE` (TODO(#165)); svctest is the only recipe seeding it.
   - `devmgr.debug` — the same SEND with `DEBUG_PORT_AUTHORITY` added, gating
@@ -233,12 +233,13 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md#queries));
     svctest is the only recipe seeding it.
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
-    `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
+    `/services/drivers/` at `LOOKUP | READ | READDIR` and hands devmgr the subtree
     cap on a `DRIVERS_DIR_AUTHORITY`-badged copy of the
     devmgr-registry source. Devmgr replies SUCCESS *before* any spawn
-    work, then walks the per-arch RTC name and spawns the driver between
+    work, then lists the directory, reads each entry's driver declaration, binds the PCI
+    devices still unbound, and spawns the per-arch RTC driver between
     its `ipc_reply` and next `ipc_recv` (procmgr `CREATE_FROM_FILE` —
-    the binary lives on the rootfs, not in the boot bundle; see
+    the binaries live on the rootfs, not in the boot bundle; see
     [Driver binary sources](../../../docs/device-management.md#driver-binary-sources)). Best-effort:
     a failure leaves the system without a wallclock — timed degrades to
     `WALL_CLOCK_UNAVAILABLE` (see [timed](../../timed/README.md)).

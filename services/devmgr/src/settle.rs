@@ -11,13 +11,14 @@
 //! devmgr keeps one [`DriverWatch`] for the boot: a death event queue every
 //! driver's death observer posts to, with its device badge as the
 //! correlator, and a wait set over that queue and, once the registry opens,
-//! the registry endpoint. devmgr spawns its drivers in two batches (the
-//! virtio-blk, serial, and framebuffer drivers at boot; the RTC and
-//! virtio-input drivers after `SET_DRIVERS_DIR`), and, on svctest's
-//! test-only `TEST_SPAWN_FAULT_DRIVERS`, a third of `test-fault` fixtures
-//! (TODO(#165)), each against a [`SettleBatch`]: a private driver endpoint
-//! on which each driver's round-2 devmgr query cap is a SEND badged with
-//! its device badge.
+//! the registry endpoint. devmgr spawns its drivers in two batches (at boot,
+//! the drivers bound to PCI records by the boot modules' declarations and
+//! the serial and framebuffer drivers; after `SET_DRIVERS_DIR`, the RTC
+//! driver and the drivers bound by the drivers directory's declarations),
+//! and, on svctest's test-only `TEST_SPAWN_FAULT_DRIVERS`, a third of
+//! `test-fault` fixtures (TODO(#165)), each against a [`SettleBatch`]: a
+//! private driver endpoint on which each driver's devmgr query cap is a SEND
+//! badged with its device badge.
 //! [`SettleBatch::settle`] takes the registry endpoint out of the wait set,
 //! adds the private endpoint and a timer notification, and runs the
 //! host-tested [`roster::settle`] loop: it serves the drivers'

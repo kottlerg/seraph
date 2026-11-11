@@ -19,11 +19,11 @@
 // line), one lens over every Markdown document and instruction file the range
 // touched, and the whole-range lenses, in parallel. Verify puts every defect
 // that can block (one no open Issue names) to two independent refuters as
-// soon as its reviewer completes; the reality refuter also judges whether the defect was
-// already present at the previous release, which sets it apart as predating
-// the range. A defect an open Issue names is a known issue and takes no
-// refuters. Audit runs the `release-auditor` with the known-issue candidates.
-// Synthesize renders one report and drafts the release notes from
+// soon as its reviewer completes; the reality refuter also judges whether the
+// defect was already present at the previous release, which sets it apart as
+// predating the range. A defect an open Issue names is a known issue and
+// takes no refuters. Audit runs the `release-auditor` with the known-issue
+// candidates. Synthesize renders one report and drafts the release notes from
 // docs/releases/TEMPLATE.md. The script computes the verdict line itself:
 // `RELEASE BLOCKED` when a reviewer failed, the run reached its agent ceiling,
 // a confirmed defect stands that no open Issue names and that does not predate

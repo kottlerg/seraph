@@ -7622,6 +7622,31 @@ mod idle_pull_tests
         );
     }
 
+    // The defect caught: a pull from the confirmed candidate that a contended
+    // lock defers costing more than the two ticks the bound counts for it: the
+    // tick it defers, and one to record the candidate again.
+    #[test]
+    fn a_deferred_pull_from_the_candidate_costs_at_most_two_ticks()
+    {
+        let mut model = Model::new(&[busy(0, 1), IDLE]);
+        let mut memory = IdlePullMemory {
+            candidate: None,
+            cursor: 0,
+        };
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        model.contended = Some(0);
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        model.contended = None;
+        memory = idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(memory.candidate, Some(0));
+        idle_pull_tick(&mut model, 1, 2, memory);
+        assert_eq!(model.moved_from, Some(0));
+        assert_eq!(
+            model.pulls,
+            vec![(0, PullRule::Backlog), (0, PullRule::Backlog)]
+        );
+    }
+
     // The defect caught: a contended pull at once from a pinned-only CPU past
     // the threshold that keeps the idle CPU from pulling a backlog it has
     // confirmed on another CPU in the same tick.

@@ -8,7 +8,7 @@ spawn time, per [`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md
 itself / procmgr-self, per
 [`services/init/docs/bootstrap.md`](../../init/docs/bootstrap.md) § Raw
 bootstrap). The labels documented below are the ones logd's receive
-loop dispatches on.
+workers dispatch on (§ Receive pool).
 
 logd additionally calls procmgr's
 [`procmgr_labels::REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md)
@@ -49,7 +49,7 @@ write endpoint and, when a framebuffer driver is present, `cap[4]` the framebuff
 
 | Cap holder | Right | Purpose |
 |---|---|---|
-| logd's main thread | `RECV` | drains the endpoint via `ipc_recv` inside the wait-set loop |
+| logd's receive workers | `RECV` | each receives on the endpoint with `ipc_recv` (§ Receive pool) |
 | every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_RECORD`, `STREAM_REGISTER_NAME` |
 | a service that seeds `logd.query` | `SEND` badged `LOG_QUERY_AUTHORITY` | `QUERY_SLOTS`, `QUERY_HISTORY` (§ Queries) |
 | real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); repeated after a further drain while init-logd defers it), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1]` reads as `0`) on a restart (design intent; not yet implemented (#262)) |
@@ -194,7 +194,7 @@ Reply: `label = 0`. Sender unblocks.
 
 One-shot init-logd → real-logd state transfer. Documented in
 [`handover-protocol.md`](handover-protocol.md). real-logd is the caller,
-not a handler: its receive loop dispatches only `STREAM_BYTES`,
+not a handler: its receive workers dispatch only `STREAM_BYTES`,
 `STREAM_RECORD`, `STREAM_REGISTER_NAME`, `QUERY_SLOTS`, and `QUERY_HISTORY`,
 and any other label, this one included, gets an empty reply. init-logd is the
 only receiver of the label.
@@ -256,10 +256,10 @@ bit: procmgr redraws a process badge that does
 `LOG_BADGE_PROCMGR` carry none. A query on any other badge is refused with
 `QUERY_DENIED`.
 
-logd's main thread answers a query from the table and the rings it owns, in the
-same receive loop that drains the stream labels, and calls no other service to
-answer it, so a query cannot block the receive path (§ Death-queue resync gives
-the deadlock a call to procmgr would risk). The wire format is defined in
+A receive worker answers a query from the table and the rings logd owns, as it
+serves the stream labels (§ Receive pool), and calls no other service to answer
+it, so a query never waits on another service (§ Death-queue resync gives the
+deadlock a call to procmgr would risk). The wire format is defined in
 `ipc::log_query`. Every request carries `ipc::LOG_LABELS_VERSION` (5) in
 `data[0]`, which logd checks on every query. The reply's label carries the
 status in bits 0-15, the reply's entry count in bits 16-31, and in bit 32 whether
@@ -350,20 +350,51 @@ Every entry fits one reply: the longest, a `RECORD_MAX_BYTES` (480) record,
 takes 4 + 60 words. A record's bytes are its `STREAM_RECORD` payload, which
 `ipc::log_record::Record::decode` reads back to its message and fields.
 
+## Receive pool
+
+logd serves the master log endpoint from `RECV_WORKERS` (4) receive workers, a `shared/recv-pool`
+pool ([shared/recv-pool/README.md](../../../shared/recv-pool/README.md)). The count is a
+concurrency setting, not a capacity: senders beyond it queue on the endpoint. Each worker receives
+on its own IPC buffer page and keeps [IPC Design](../../../docs/ipc-design.md) § Multi-threaded
+servers: it drains the death queue (§ Wait-set), serves the request, and replies before it receives
+again.
+
+- **Start.** logd spawns the workers before the handover pull, while init-logd still serves the
+  endpoint, and they receive once logd opens the pool's gate after the release
+  ([handover-protocol.md](handover-protocol.md) § Startup ordering). A spawned thread's start waits
+  on procmgr's thread registration
+  ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Thread registration): spawned
+  after the pull, every worker could be waiting on procmgr while procmgr waits on the unread log
+  endpoint to log its reap of init.
+- **State.** The badge table, the retired slots, the history rings, and the death drain's count are
+  under one lock. A worker takes it to complete, render, and retain a line or a record, to record a
+  name, or to answer a query, and releases it before it writes the line to the drivers. No thread
+  holds it across an IPC call.
+- **Output.** A rendered line is written whole: the serial driver's calls for one line are made
+  under one output lock and the framebuffer driver's under another, so a line longer than one call
+  (a record) is not split by another worker's. Each output lock is held across its driver's calls,
+  which is safe because neither driver calls logd; resolving a driver through devmgr, which logs,
+  happens before either lock is taken, by one thread at a time. The panic sink takes no lock.
+- **Order.** A line is retained, and its `seq` taken (§ History), under the state lock, and is
+  written after it, so the lines of different workers reach the serial driver in the order the
+  workers take the output lock, which can differ from their `seq` order. One sender thread's lines
+  keep their order, since its call returns only once its line is written. Two threads of one
+  process share a slot (§ Levels).
+
 ## Wait-set
 
-logd's main loop waits on a 3-member `WaitSet`:
+logd's main thread waits on a 2-member `WaitSet`:
 
 | Badge | Source | Purpose |
 |---|---|---|
-| `WS_BADGE_LOG` (0) | RECV on the master log endpoint | `STREAM_BYTES` / `STREAM_RECORD` / `STREAM_REGISTER_NAME` / `QUERY_SLOTS` / `QUERY_HISTORY` arrivals |
-| `WS_BADGE_DEATH` (1) | RECV on logd's death-notification `EventQueue` | drained per loop iteration before service dispatch |
-| `WS_BADGE_RESYNC` (2) | logd's resync `Notification` | the resync helper thread's walk has ended (§ Death-queue resync) |
+| `WS_BADGE_DEATH` (1) | RECV on logd's death-notification `EventQueue` | drained on the wake |
+| `WS_BADGE_RESYNC` (2) | logd's resync `Notification` | bit `RESYNC_WALK_DONE` (1): the resync helper thread's walk has ended; bit `RESYNC_REQUESTED` (2): a drain asks for a resync (§ Death-queue resync) |
 
-Death events are drained inside every loop iteration (before
-servicing the log endpoint) so a recently-died sender's slot is
-evicted before logd processes any of its still-queued
-`STREAM_BYTES` or `STREAM_RECORD`. Mirrors procmgr's drain-deaths-first pattern.
+Each receive worker drains the death queue before it serves a request, so a sender whose death
+procmgr posted before the request is served has its slot evicted before logd processes any of its
+still-queued `STREAM_BYTES` or `STREAM_RECORD`. Mirrors procmgr's drain-deaths-first pattern. The
+main thread drains the queue when it is ready, so deaths no request follows are drained too. Each
+take from the queue is made, with its eviction, under the state lock (§ Receive pool).
 
 ## Death-notification cascade
 
@@ -412,10 +443,12 @@ badge, and a reader finds the process's log name in this line for that badge
 
 logd's death `EventQueue` has a fixed tuning capacity (`DEATH_EQ_CAPACITY`,
 128), not one sized from any process count. procmgr drops a post the full
-queue refuses, which would leave that sender's slot unevicted. A drain that takes a full
-queue's worth of events or more may have followed such a drop (a dropped post
-leaves a full queue of events behind it for that drain or the next), so it starts
-a resync:
+queue refuses, which would leave that sender's slot unevicted. The takes since one
+last found the queue empty, by any thread, are counted; when they reach a full
+queue's worth, as one drain from a full queue would take, the drain may have
+followed such a drop (a dropped post leaves a full queue of events behind it for
+that drain or the next), so it asks the main thread for a resync
+(`RESYNC_REQUESTED`), counts again from zero, and the main thread starts it:
 
 1. logd snapshots the badges of its child slots: every badge at or above
    `log_badges::LOG_BADGE_FIRST_CHILD` with no `ipc::VERB_BIT_MASK` bit, which
@@ -433,18 +466,19 @@ a resync:
    snapshot is no candidate, so a sender that starts during the walk keeps its
    slot. A failed walk evicts nothing.
 
-One walk runs at a time. A drain that crosses the capacity while one is in
-flight marks another due, and it starts as soon as the current walk ends, so the
-deaths dropped during a walk are covered by the next one.
+One walk runs at a time. A request for a resync while one is in flight marks
+another due, and it starts as soon as the current walk ends, so the deaths
+dropped during a walk are covered by the next one.
 
-logd's main thread never calls procmgr after startup. `seraph::log!` is a
-synchronous `ipc_call` on the master log endpoint, so while procmgr logs it is
-blocked until logd's main thread receives; a call from that thread to procmgr at
-the same moment would leave each blocked on the other, with no receiver on
-either endpoint. The walk therefore runs on the helper thread, and the main
-thread keeps receiving procmgr's log calls throughout; procmgr answers the walk
-whether or not it logs meanwhile. The one call the main thread makes,
-`REGISTER_DEATH_EQ`, precedes the handover pull, before procmgr has a reason to
+No receive worker and not the main thread calls procmgr after startup.
+`seraph::log!` is a synchronous `ipc_call` on the master log endpoint, so while
+procmgr logs it is blocked until a worker receives; a worker's call to procmgr
+at the same moment would leave each blocked on the other, and the main thread,
+which drains deaths and runs the resync, waits on no other service. The walk
+therefore runs on the helper thread, and the workers keep receiving procmgr's
+log calls throughout; procmgr answers the walk whether or not it logs meanwhile.
+The one call the main thread makes, `REGISTER_DEATH_EQ`, and the workers'
+thread registrations precede the handover pull, before procmgr has a reason to
 log to real-logd (see [handover-protocol.md](handover-protocol.md) § Startup
 ordering).
 

@@ -856,6 +856,7 @@ version = "0.1.3"
 dependencies = [
  "ipc",
  "logd-codec",
+ "recv-pool",
  "syscall",
  "syscall-abi",
 ]

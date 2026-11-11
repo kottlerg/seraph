@@ -14,9 +14,11 @@
 //! diagnostics and panic output to the serial driver, in the README's
 //! § Role and `docs/console-model.md`. `main` follows that order: bootstrap
 //! caps, the serial sink and panic sink, the dropped `log_send_cap`, the
-//! death EQ and its registration, the wait set, the handover pull, the
-//! release of the self-log lines held until init-logd stops writing the UART
-//! ([`SELF_LOG_HOLD`]), then the event loop.
+//! death EQ and its registration, the wait set, the receive pool's workers
+//! (spawned behind its gate, `services/logd/docs/ipc-interface.md`
+//! § Receive pool), the handover pull, the release of the self-log lines held
+//! until init-logd stops writing the UART ([`SELF_LOG_HOLD`]), then the
+//! gate's opening and the control loop.
 
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
@@ -25,8 +27,8 @@ mod handover;
 mod slot;
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
 use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
@@ -39,19 +41,28 @@ use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use logd_codec::hold::HeldLines;
 use logd_codec::reclaim::{Cause, ReclaimLine};
 use logd_codec::record::RENDERED_MAX_BYTES;
+use recv_pool::{IpcBuf, RecvPool, SpawnError};
 use std::os::seraph::startup_info;
 use syscall::RIGHTS_EQ_POST;
 
-use crate::slot::{Eviction, LINE_BUF_SIZE, MAX_NAME_LEN, SlotTable};
+use crate::slot::{Eviction, LINE_BUF_SIZE, MAX_NAME_LEN, Slot, SlotTable};
 
-/// `WaitSet` badge for logd's resync notification, signalled by the resync
-/// helper thread when its walk of procmgr's live badges ends.
-const WS_BADGE_RESYNC: u64 = 2;
-
-/// `WaitSet` badge for the master log endpoint.
-const WS_BADGE_LOG: u64 = 0;
 /// `WaitSet` badge for the death-notification event queue.
 const WS_BADGE_DEATH: u64 = 1;
+/// `WaitSet` badge for logd's resync notification ([`RESYNC_WALK_DONE`],
+/// [`RESYNC_REQUESTED`]).
+const WS_BADGE_RESYNC: u64 = 2;
+
+/// Resync-notification bit the resync helper thread signals when its walk of
+/// procmgr's live badges ends.
+const RESYNC_WALK_DONE: u64 = 1;
+/// Resync-notification bit a death drain signals when it may have followed a
+/// dropped post: the main thread then starts a [`Resync`].
+const RESYNC_REQUESTED: u64 = 2;
+
+/// Workers receiving on the master log endpoint: a concurrency setting, not
+/// a capacity. Senders beyond it queue on the endpoint.
+const RECV_WORKERS: usize = 4;
 
 /// Caps real-logd receives from svcmgr's bootstrap round; an absent slot is `0`.
 struct BootCaps
@@ -155,13 +166,14 @@ fn main() -> !
 
     // Set up the death-notification queue + wait set and register with procmgr
     // BEFORE pulling the handover. The pull causes init-logd to exit, which
-    // triggers procmgr's init-reap; that reap logs, and until logd reaches its
-    // draining loop there is no other reader on the log endpoint. Registering
+    // triggers procmgr's init-reap; that reap logs, and until logd's receive
+    // workers receive there is no other reader on the log endpoint. Registering
     // here — while init's main has already exited but init-logd is still
     // serving, so procmgr is not yet reaping init — keeps logd from blocking on
     // procmgr in that window, which would deadlock against procmgr blocking on
-    // the unmanned log endpoint. After the pull, logd reaches `event_loop` with
-    // no further procmgr dependency, so it drains the reap's log line itself.
+    // the unmanned log endpoint. After the pull, logd opens the receive pool's
+    // gate with no further procmgr dependency, so its workers drain the reap's
+    // log line.
     let Some(death_eq) = create_death_eq()
     else
     {
@@ -172,7 +184,7 @@ fn main() -> !
     // Resolve the serial and framebuffer drivers through devmgr now, while
     // init-logd still drains the log endpoint: the first write that would
     // resolve them is held until after the release, when the endpoint has no
-    // reader until the event loop, and devmgr may then be logging
+    // reader until the receive pool's gate opens, and devmgr may then be logging
     // (`services/devmgr/docs/responsibilities.md`, the on-disk settle).
     resolve_output_drivers(ipc_buf);
     let Some(resync_note) = create_resync_note()
@@ -181,12 +193,48 @@ fn main() -> !
         fatal("FATAL: resync notification create failed; halting");
         syscall::thread_exit();
     };
-    let Some(ws_cap) = create_wait_set(caps.log_ep_recv, death_eq, resync_note)
+    let Some(ws_cap) = create_wait_set(death_eq, resync_note)
     else
     {
         fatal("FATAL: wait_set create failed; halting");
         syscall::thread_exit();
     };
+    let logd: &'static Logd = Box::leak(Box::new(Logd {
+        state: Mutex::new(LogdState::default()),
+        death_eq,
+        resync_note,
+    }));
+
+    // Spawn the receive workers now, while init-logd still serves the log
+    // endpoint: each one's start in the runtime waits on procmgr, which may
+    // be waiting on the log endpoint once the pull below ends
+    // (`services/logd/docs/ipc-interface.md` § Receive pool). They receive
+    // once the gate opens, after the pull.
+    let pool = RecvPool::new(
+        caps.log_ep_recv,
+        recv_diag,
+        move |msg: &IpcMessage, buf: IpcBuf| {
+            serve_request(logd, msg, buf);
+        },
+    );
+    match pool.spawn("logd-recv", RECV_WORKERS)
+    {
+        Ok(_) => (),
+        Err(SpawnError { running: 0, .. }) =>
+        {
+            fatal("FATAL: no receive worker could be spawned; halting");
+            syscall::thread_exit();
+        }
+        Err(SpawnError { running, .. }) =>
+        {
+            let mut buf = SerialFmt::new();
+            let _ = write!(
+                buf,
+                "{running} of {RECV_WORKERS} receive workers spawned; serving with them"
+            );
+            self_log(buf.as_str());
+        }
+    }
 
     if caps.log_ep_handover_send != 0
     {
@@ -225,15 +273,43 @@ fn main() -> !
         self_log("started (restart); no handover source, serving fresh");
     }
 
+    logd.lock().table = table;
+    pool.open();
     let mut resync = Resync::new(caps.procmgr_death_auth_send, resync_note);
-    event_loop(
-        ws_cap,
-        death_eq,
-        caps.log_ep_recv,
-        ipc_buf,
-        &mut table,
-        &mut resync,
-    );
+    control_loop(ws_cap, logd, &mut resync);
+}
+
+/// The state logd's receive workers and its main thread share.
+struct Logd
+{
+    /// The badge table and the death-drain count, under one lock: every
+    /// worker's request and every drain step takes it, and none holds it
+    /// across an IPC call (`services/logd/docs/ipc-interface.md` § Receive
+    /// pool).
+    state: Mutex<LogdState>,
+    /// RECV on the death-notification `EventQueue`.
+    death_eq: u64,
+    /// The resync notification ([`RESYNC_WALK_DONE`], [`RESYNC_REQUESTED`]).
+    resync_note: u64,
+}
+
+/// What [`Logd::state`] guards.
+#[derive(Default)]
+struct LogdState
+{
+    table: SlotTable,
+    /// Death events taken since a take last found the queue empty, by any
+    /// thread: a drain's count, as one thread's drain from a ready queue to an
+    /// empty one would take them ([`drain_deaths`]).
+    drain_run: u32,
+}
+
+impl Logd
+{
+    fn lock(&self) -> MutexGuard<'_, LogdState>
+    {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Capacity of logd's death-notification `EventQueue`: a tuning value, not
@@ -265,13 +341,13 @@ fn create_resync_note() -> Option<u64>
     })
 }
 
-/// Build a 3-member wait set: the log endpoint (`WS_BADGE_LOG`), the death
-/// event queue (`WS_BADGE_DEATH`), and the resync notification
-/// (`WS_BADGE_RESYNC`).
-fn create_wait_set(log_ep_recv: u64, death_eq: u64, resync_note: u64) -> Option<u64>
+/// Build the main thread's 2-member wait set: the death event queue
+/// (`WS_BADGE_DEATH`) and the resync notification (`WS_BADGE_RESYNC`). The
+/// log endpoint is the receive workers', outside the set.
+fn create_wait_set(death_eq: u64, resync_note: u64) -> Option<u64>
 {
-    // The set's member capacity: the three members above.
-    const WS_MEMBERS: u32 = 3;
+    // The set's member capacity: the two members above.
+    const WS_MEMBERS: u32 = 2;
     let Some(ws) = std::os::seraph::object_slab_retype(
         std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
         |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
@@ -283,13 +359,6 @@ fn create_wait_set(log_ep_recv: u64, death_eq: u64, resync_note: u64) -> Option<
         self_log(buf.as_str());
         return None;
     };
-    if let Err(e) = syscall::wait_set_add(ws, log_ep_recv, WS_BADGE_LOG)
-    {
-        let mut buf = SerialFmt::new();
-        let _ = write!(buf, "wait_set_add(log) err={e}");
-        self_log(buf.as_str());
-        return None;
-    }
     if let Err(e) = syscall::wait_set_add(ws, death_eq, WS_BADGE_DEATH)
     {
         let mut buf = SerialFmt::new();
@@ -352,22 +421,11 @@ fn register_with_procmgr(procmgr_send: u64, death_eq: u64, ipc_buf: *mut u64)
     }
 }
 
-/// Main wait loop. Drains death notifications before each log-EP
-/// dispatch so a recently-died sender's slot is evicted before we
-/// process its in-flight messages (matches procmgr's drain-deaths-
-/// first pattern).
-fn event_loop(
-    ws_cap: u64,
-    death_eq: u64,
-    log_ep_recv: u64,
-    ipc_buf: *mut u64,
-    table: &mut SlotTable,
-    resync: &mut Resync,
-) -> !
+/// The main thread's loop: drain deaths when the death queue is ready, so a
+/// queue no request wakes a worker for still empties, and run the
+/// [`Resync`] on its notification's bits.
+fn control_loop(ws_cap: u64, logd: &Logd, resync: &mut Resync) -> !
 {
-    // One guard covers both spin shapes: a failing wait_set_wait, and a
-    // level-triggered wait set that keeps reporting ready while the recv in
-    // dispatch_log keeps failing. Only a successful recv counts as progress.
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
@@ -380,16 +438,25 @@ fn event_loop(
                 continue;
             }
         };
-        if drain_deaths(death_eq, table)
-        {
-            resync.start(table);
-        }
+        guard.on_success();
         match badge
         {
-            WS_BADGE_LOG => dispatch_log(log_ep_recv, ipc_buf, table, &mut guard),
-            WS_BADGE_RESYNC => resync.finish(table),
-            // Deaths were already drained above; an unknown badge has no
-            // action.
+            WS_BADGE_DEATH => drain_deaths(logd),
+            WS_BADGE_RESYNC =>
+            {
+                // Take and clear the signalled bits: the wait set reports the
+                // notification ready while any are set. The wake means they
+                // are, so this returns at once.
+                let bits = syscall::notification_wait_timeout(logd.resync_note, 1).unwrap_or(0);
+                if bits & RESYNC_WALK_DONE != 0
+                {
+                    resync.finish(logd);
+                }
+                if bits & RESYNC_REQUESTED != 0
+                {
+                    resync.start(logd);
+                }
+            }
             _ => (),
         }
     }
@@ -399,13 +466,12 @@ fn event_loop(
 /// § Death-queue resync): after a drain that may have followed a full queue,
 /// evict the slots of children procmgr no longer lists as live.
 ///
-/// The walk of procmgr's live badges (`QUERY_LIVE_PROCESSES`) runs on a
-/// helper thread, never on the main thread. A synchronous call from the main
-/// thread to procmgr deadlocks whenever procmgr is itself blocked in a
-/// `seraph::log!` call to logd, since then neither receives; with the walk on
-/// a helper, the main thread keeps serving procmgr's log calls. The helper
-/// sends its result over a channel and signals the resync notification, and
-/// the main thread evicts from the snapshot it took before the walk began.
+/// The main thread owns it. The walk of procmgr's live badges
+/// (`QUERY_LIVE_PROCESSES`) runs on a helper thread, which sends its result
+/// over a channel and signals [`RESYNC_WALK_DONE`]; the main thread then
+/// evicts from the snapshot it took before the walk began. Why neither the
+/// main thread nor a receive worker calls procmgr is
+/// `services/logd/docs/ipc-interface.md` § Death-queue resync.
 struct Resync
 {
     /// `DEATH_EQ_AUTHORITY` SEND on procmgr the helper walks through; zero
@@ -439,38 +505,47 @@ impl Resync
     /// Ask for a resync: start the helper's walk now, or, with one already
     /// in flight, mark another due, which [`Self::finish`] starts once the
     /// current walk ends.
-    fn start(&mut self, table: &SlotTable)
+    fn start(&mut self, logd: &Logd)
     {
         if self.procmgr_send != 0 && self.gate.request()
         {
-            self.begin(table);
+            self.begin(logd);
         }
     }
 
     /// Snapshot the child slots and spawn the helper's walk; the gate has
     /// already counted it in flight, and is told when it cannot begin.
-    fn begin(&mut self, table: &SlotTable)
+    fn begin(&mut self, logd: &Logd)
     {
         let mut snapshot: Vec<u64> = Vec::new();
-        if snapshot.try_reserve(table.slots.len()).is_err()
+        let reserved = {
+            let state = logd.lock();
+            let reserved = snapshot.try_reserve(state.table.slots.len()).is_ok();
+            if reserved
+            {
+                snapshot.extend(
+                    state
+                        .table
+                        .slots
+                        .keys()
+                        .copied()
+                        .filter(|&b| logd_codec::resync::is_resync_candidate(b)),
+                );
+            }
+            reserved
+        };
+        if !reserved
         {
             self_log("resync skipped: no memory for the slot snapshot");
             self.gate.abandon();
             return;
         }
-        snapshot.extend(
-            table
-                .slots
-                .keys()
-                .copied()
-                .filter(|&b| logd_codec::resync::is_resync_candidate(b)),
-        );
         snapshot.sort_unstable();
         let (tx, rx) = std::sync::mpsc::channel();
         let (procmgr_send, note) = (self.procmgr_send, self.note);
         let spawned = std::thread::Builder::new().spawn(move || {
             let _ = tx.send(walk_live_processes(procmgr_send));
-            let _ = syscall::notification_send(note, 1);
+            let _ = syscall::notification_send(note, RESYNC_WALK_DONE);
         });
         if spawned.is_ok()
         {
@@ -483,15 +558,11 @@ impl Resync
         }
     }
 
-    /// Consume the helper's signal and, once its result is in, evict every
-    /// snapshot slot the walk did not list, then start the walk a drain
-    /// marked due meanwhile.
-    fn finish(&mut self, table: &mut SlotTable)
+    /// On the helper's signal, once its result is in, evict every snapshot
+    /// slot the walk did not list, then start the walk a drain marked due
+    /// meanwhile.
+    fn finish(&mut self, logd: &Logd)
     {
-        // Clear the signalled bits: the wait set reports the notification
-        // ready while any are set. The wake means they are, so this returns
-        // at once.
-        let _ = syscall::notification_wait_timeout(self.note, 1);
         let Some((snapshot, rx)) = self.in_flight.take()
         else
         {
@@ -510,25 +581,30 @@ impl Resync
         };
         match live
         {
-            Some(live) => evict_missing(&snapshot, &live, table),
+            Some(live) => evict_missing(&snapshot, &live, logd),
             None => self_log("resync: live-process walk failed; slots kept"),
         }
         if self.gate.finished()
         {
-            self.begin(table);
+            self.begin(logd);
         }
     }
 }
 
 /// Evict every `snapshot` slot whose badge the walk's ascending `live` list
-/// lacks.
-fn evict_missing(snapshot: &[u64], live: &[u64], table: &mut SlotTable)
+/// lacks, logging each reclaim line once the lock is released.
+fn evict_missing(snapshot: &[u64], live: &[u64], logd: &Logd)
 {
     for badge in logd_codec::resync::evictable(snapshot, live)
     {
-        if let Some(slot) = table.retire(badge, Eviction::Resync)
+        let evicted = logd
+            .lock()
+            .table
+            .retire(badge, Eviction::Resync)
+            .map(|slot| slot.name.clone());
+        if let Some(name) = evicted
         {
-            log_reclaim(badge, Cause::Resync, &slot.name);
+            log_reclaim(badge, Cause::Resync, &name);
         }
     }
 }
@@ -601,78 +677,90 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     self_log(buf.as_str());
 }
 
-/// Non-blocking drain of the death event queue. Each death event procmgr
-/// posts carries the exit reason and the dead process's full badge as the
-/// correlator (`syscall::DeathEvent`). We evict the slot of exactly that
-/// badge. Returns whether the drain took a full queue's worth of events: the
-/// queue may then have filled, and a post to a full queue is dropped, so the
-/// caller starts a [`Resync`].
-fn drain_deaths(death_eq: u64, table: &mut SlotTable) -> bool
+/// Non-blocking drain of the death event queue, run by a receive worker
+/// before each request and by the main thread when the queue is ready. Each
+/// death event procmgr posts carries the exit reason and the dead process's
+/// full badge as the correlator (`syscall::DeathEvent`); the drain evicts the
+/// slot of exactly that badge.
+///
+/// Each take is made under the state lock, with its eviction, and the reclaim
+/// line is written after the lock is released. [`LogdState::drain_run`] counts
+/// the takes since one last found the queue empty, whichever thread made them.
+/// When it reaches a full queue's worth, the queue may have filled, and a post
+/// to a full queue is dropped, so the drain asks the main thread for a
+/// [`Resync`] ([`RESYNC_REQUESTED`]) and counts again from zero.
+fn drain_deaths(logd: &Logd)
 {
-    let mut drained: u32 = 0;
-    while let Ok(death) = syscall::event_try_recv_death(death_eq)
+    loop
     {
-        drained = drained.saturating_add(1);
-        let badge = death.correlator;
-        let exit_reason = death.exit_reason;
-        if let Some(slot) = table.retire(badge, Eviction::Death { exit_reason })
+        let (badge, exit_reason, evicted, full) = {
+            let mut state = logd.lock();
+            let Ok(death) = syscall::event_try_recv_death(logd.death_eq)
+            else
+            {
+                state.drain_run = 0;
+                return;
+            };
+            state.drain_run = state.drain_run.saturating_add(1);
+            let full = state.drain_run >= DEATH_EQ_CAPACITY;
+            if full
+            {
+                state.drain_run = 0;
+            }
+            let exit_reason = death.exit_reason;
+            let evicted = state
+                .table
+                .retire(death.correlator, Eviction::Death { exit_reason })
+                .map(|slot| slot.name.clone());
+            (death.correlator, exit_reason, evicted, full)
+        };
+        if let Some(name) = evicted
         {
-            log_reclaim(badge, Cause::Death { exit_reason }, &slot.name);
+            log_reclaim(badge, Cause::Death { exit_reason }, &name);
+        }
+        if full
+        {
+            let mut buf = SerialFmt::new();
+            let _ = write!(
+                buf,
+                "death queue gave up {DEATH_EQ_CAPACITY} events (its capacity) since it was last \
+                 empty; resyncing"
+            );
+            self_log(buf.as_str());
+            let _ = syscall::notification_send(logd.resync_note, RESYNC_REQUESTED);
         }
     }
-    if drained < DEATH_EQ_CAPACITY
-    {
-        return false;
-    }
-    let mut buf = SerialFmt::new();
-    let _ = write!(
-        buf,
-        "death queue drained {drained} events (capacity {DEATH_EQ_CAPACITY}); resyncing"
-    );
-    self_log(buf.as_str());
-    true
 }
 
-fn dispatch_log(
-    log_ep_recv: u64,
-    ipc_buf: *mut u64,
-    table: &mut SlotTable,
-    guard: &mut ipc::recv_guard::RecvGuard,
-)
+/// The receive workers' handler (`services/logd/docs/ipc-interface.md`
+/// § Receive pool): drain the death queue, then serve `msg` and reply on
+/// `buf`, the worker's own IPC buffer page.
+fn serve_request(logd: &Logd, msg: &IpcMessage, buf: IpcBuf)
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let recv = match unsafe { ipc::ipc_recv(log_ep_recv, ipc_buf) }
-    {
-        Ok(recv) => recv,
-        Err(e) =>
-        {
-            guard.on_failure(e);
-            return;
-        }
-    };
-    guard.on_success();
-    let label_id = recv.label & 0xFFFF;
-    let byte_len = ((recv.label >> 16) & 0xFFFF) as usize;
+    drain_deaths(logd);
+    let ipc_buf = buf.as_ptr();
+    let label_id = msg.label & 0xFFFF;
+    let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
     if label_id == STREAM_BYTES
     {
-        consume_bytes(table, recv.badge, &recv, byte_len);
+        consume_bytes(logd, msg.badge, msg, byte_len);
         reply_ack(ipc_buf);
     }
     else if label_id == STREAM_RECORD
     {
-        let status = consume_record(table, recv.badge, &recv, byte_len);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let status = consume_record(logd, msg.badge, msg, byte_len);
+        // SAFETY: ipc_buf is this worker's registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), ipc_buf) };
     }
     else if label_id == STREAM_REGISTER_NAME
     {
-        register_name(table, recv.badge, &recv, byte_len);
+        register_name(logd, msg.badge, msg, byte_len);
         reply_ack(ipc_buf);
     }
     else if label_id == QUERY_SLOTS || label_id == QUERY_HISTORY
     {
-        let reply = answer_query(table, &recv);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let reply = answer_query(&logd.lock().table, msg);
+        // SAFETY: ipc_buf is this worker's registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     }
     else
@@ -684,10 +772,10 @@ fn dispatch_log(
 }
 
 /// Answer a `QUERY_SLOTS` or `QUERY_HISTORY` request from the slot table
-/// and history logd owns (`services/logd/docs/ipc-interface.md` § Queries).
-/// It reads only that state and calls no other service, so a query never
-/// blocks the receive loop. `QUERY_DENIED` for a badge without
-/// `LOG_QUERY_AUTHORITY`.
+/// and history logd owns (`services/logd/docs/ipc-interface.md` § Queries),
+/// under the state lock the caller holds. It reads only that state and calls
+/// no other service, so a query never waits on one. `QUERY_DENIED` for a badge
+/// without `LOG_QUERY_AUTHORITY`.
 fn answer_query(table: &SlotTable, msg: &IpcMessage) -> IpcMessage
 {
     if msg.badge & LOG_QUERY_AUTHORITY == 0
@@ -722,7 +810,7 @@ fn answer_query(table: &SlotTable, msg: &IpcMessage) -> IpcMessage
 
 fn reply_ack(ipc_buf: *mut u64)
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page.
+    // SAFETY: ipc_buf is the calling worker's registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(0), ipc_buf) };
 }
 
@@ -737,42 +825,62 @@ fn reply_ack(ipc_buf: *mut u64)
 /// per-line buffer is `LINE_BUF_SIZE` and force-flushes when full,
 /// so a chunk longer than `LINE_BUF_SIZE` produces multiple emitted
 /// lines rather than truncated output (matches init-logd's behaviour).
-fn consume_bytes(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: usize)
+///
+/// Each line is completed, rendered, and retained under the state lock, and
+/// written once the lock is released; the bytes after it are taken under the
+/// lock again.
+fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
 {
     const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
     let bytes = msg.data_bytes();
     let n = byte_len.min(bytes.len()).min(STREAM_CHUNK_SIZE);
-    // Stage the bytes in a stack buffer so we can borrow the slot
-    // mutably without aliasing the IPC buffer.
-    let mut staged = [0u8; STREAM_CHUNK_SIZE];
-    staged[..n].copy_from_slice(&bytes[..n]);
     let level = level_of(msg.label);
-    let (slot, seq) = table.get_or_create_with_seq(badge);
-    for &b in &staged[..n]
+    let mut rest = &bytes[..n];
+    while !rest.is_empty()
     {
-        slot.begin_byte(level);
-        if b == b'\n'
-        {
-            flush_partial(badge, slot, seq);
-        }
-        else if slot.partial.len() < LINE_BUF_SIZE
-        {
-            slot.partial.push(b);
-            if slot.partial.len() == LINE_BUF_SIZE
+        let mut out = LineBuf::new();
+        let line_done = {
+            let mut state = logd.lock();
+            let (slot, seq) = state.table.get_or_create_with_seq(badge);
+            let mut done = false;
+            while let Some((&b, tail)) = rest.split_first()
             {
-                flush_partial(badge, slot, seq);
+                rest = tail;
+                slot.begin_byte(level);
+                if b == b'\n'
+                {
+                    flush_partial(slot, seq, &mut out);
+                    done = true;
+                    break;
+                }
+                if slot.partial.len() < LINE_BUF_SIZE
+                {
+                    slot.partial.push(b);
+                    if slot.partial.len() == LINE_BUF_SIZE
+                    {
+                        flush_partial(slot, seq, &mut out);
+                        done = true;
+                        break;
+                    }
+                }
             }
+            done
+        };
+        if line_done
+        {
+            out.flush();
         }
     }
 }
 
 /// Render one `STREAM_RECORD` message's record as one line and retain it in
-/// the slot's history, with its field table. The record does not touch the
-/// slot's partial text line. Returns the reply label: `RECORD_ACCEPTED`, or
-/// `RECORD_REJECTED` for a payload longer than a record or than the message,
-/// or one `ipc::log_record` refuses, which is neither rendered nor retained.
-fn consume_record(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: usize) -> u64
+/// the slot's history, with its field table, under the state lock, then write
+/// the line. The record does not touch the slot's partial text line. Returns
+/// the reply label: `RECORD_ACCEPTED`, or `RECORD_REJECTED` for a payload
+/// longer than a record or than the message, or one `ipc::log_record` refuses,
+/// which is neither rendered nor retained.
+fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> u64
 {
     let bytes = msg.data_bytes();
     if byte_len > RECORD_MAX_BYTES || byte_len > bytes.len()
@@ -785,28 +893,29 @@ fn consume_record(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len:
         return RECORD_REJECTED;
     };
     let level = level_of(msg.label);
-    let (slot, seq) = table.get_or_create_with_seq(badge);
     let mut out = LineBuf::new();
-    out.push_prefix(&slot.name, level);
-    logd_codec::record::render(&record, |b| out.push(b));
-    out.push(b'\r');
-    out.push(b'\n');
+    {
+        let mut state = logd.lock();
+        let (slot, seq) = state.table.get_or_create_with_seq(badge);
+        let us = elapsed_us();
+        out.push_prefix_at(&slot.name, level, us);
+        logd_codec::record::render(&record, |b| out.push(b));
+        out.push(b'\r');
+        out.push(b'\n');
+        slot.push_record(SlotTable::next_seq(seq), us, level, &record);
+    }
     out.flush();
-    slot.push_record(SlotTable::next_seq(seq), elapsed_us(), level, &record);
     RECORD_ACCEPTED
 }
 
-/// Snapshot the slot's in-progress line, emit it to serial, append
-/// it to the history ring as the next entry of `seq`, clear the partial
-/// buffer. Separated so the `&slot.name`/`&slot.partial` borrows don't alias
-/// the subsequent `&mut slot` calls.
-fn flush_partial(badge: u64, slot: &mut crate::slot::Slot, seq: &mut u64)
+/// Render the slot's in-progress line into `out`, append it to the history
+/// ring as the next entry of `seq`, and clear the partial buffer.
+fn flush_partial(slot: &mut Slot, seq: &mut u64, out: &mut LineBuf)
 {
-    let name = slot.name.clone();
     let line = std::mem::take(&mut slot.partial);
     let level = slot.partial_level;
-    emit_line(badge, &name, level, &line);
     let us = elapsed_us();
+    out.push_text_line(&slot.name, level, us, &line);
     slot.push_history(SlotTable::next_seq(seq), us, level, &line);
 }
 
@@ -816,11 +925,12 @@ fn flush_partial(badge: u64, slot: &mut crate::slot::Slot, seq: &mut u64)
 /// Long names truncated. No collision-suffix policy (procmgr's
 /// process badge is unique, so name collisions only happen if two
 /// processes intentionally pick the same display name).
-fn register_name(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: usize)
+fn register_name(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
 {
     let bytes = msg.data_bytes();
     let n = byte_len.min(bytes.len()).min(MAX_NAME_LEN);
-    let slot = table.get_or_create(badge);
+    let mut state = logd.lock();
+    let slot = state.table.get_or_create(badge);
     slot.name.clear();
     slot.name.extend_from_slice(&bytes[..n]);
 }
@@ -837,18 +947,40 @@ static FB_CLASS: AtomicU64 = AtomicU64::new(0);
 static SERIAL_CAP: AtomicU64 = AtomicU64::new(0);
 /// Resolved SEND cap on the framebuffer driver's service endpoint. `0` =
 /// not yet attempted; [`FB_UNAVAILABLE`] = attempted and no driver present
-/// (headless boot); any other value = the resolved cap. The resolve runs at
-/// most once, caching its outcome either way so framebuffer mirroring stays a
-/// no-op on a headless boot without re-querying devmgr.
+/// (headless boot); any other value = the resolved cap. Once devmgr has
+/// answered, the outcome is cached either way, so framebuffer mirroring
+/// stays a no-op on a headless boot without re-querying devmgr.
 static FB_CAP: AtomicU64 = AtomicU64::new(0);
+/// Set while one thread queries devmgr for the serial driver. Another
+/// thread that finds it set does not query (its bytes are dropped, as while
+/// the driver is not resolvable), so threads never query devmgr at once and
+/// no second cap is resolved.
+static SERIAL_RESOLVING: AtomicBool = AtomicBool::new(false);
+/// [`SERIAL_RESOLVING`] for the framebuffer driver.
+static FB_RESOLVING: AtomicBool = AtomicBool::new(false);
+/// Held across the `SERIAL_WRITE_BYTES` calls of one line, so a line longer
+/// than one call (a record renders to up to `RENDERED_MAX_BYTES`) is not
+/// split by another thread's. A lock held across an IPC call departs from
+/// `docs/coding-standards.md` § Concurrency: the serial driver never calls
+/// logd (it MUST NOT log, `services/drivers/serial/src/main.rs`), so no
+/// thread waiting on this lock is one the driver waits on
+/// (`docs/ipc-design.md` § Multi-threaded servers). Nothing that calls devmgr
+/// runs under it. The panic sink takes no lock ([`panic_to_serial`]).
+static SERIAL_EMIT: Mutex<()> = Mutex::new(());
+/// [`SERIAL_EMIT`] for the `FB_WRITE_BYTES` calls of one line; the
+/// framebuffer driver MUST NOT log either
+/// (`services/drivers/framebuffer/src/main.rs`).
+static FB_EMIT: Mutex<()> = Mutex::new(());
 
 /// Sentinel stored in [`FB_CAP`] once a resolution attempt finds no
 /// framebuffer driver. Repeating the `QUERY_DEVICE` per log line
 /// would open a deadlock window against devmgr's own logging — devmgr →
-/// `log_ep` → logd, while logd blocks here on devmgr's reply — so the attempt
-/// is made exactly once. `u64::MAX` names no cap: no handle sets bit 63.
+/// `log_ep` → logd, while a logd thread blocks here on devmgr's reply — so
+/// the no-driver answer is cached. `u64::MAX` names no cap: no handle sets
+/// bit 63.
 const FB_UNAVAILABLE: u64 = u64::MAX;
-/// Maximum payload bytes per `SERIAL_WRITE_BYTES` (one full IPC data area).
+/// Maximum payload bytes per `SERIAL_WRITE_BYTES` or `FB_WRITE_BYTES` (one
+/// full IPC data area).
 const SERIAL_CHUNK: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
 /// Record the class SENDs for the emit path.
@@ -859,17 +991,19 @@ fn serial_init(serial_class: u64, fb_class: u64)
 }
 
 /// The calling thread's registered IPC buffer, for the emit path's
-/// `ipc_call`s: the main thread's and the resync helper's each own one, so
-/// output from either thread (the panic sink included) uses its own page.
-/// Null before the thread has one; the emit path then drops the bytes.
+/// `ipc_call`s: the main thread, each receive worker, and the resync helper
+/// each own one, so output from any thread (the panic sink included) uses
+/// its own page (`docs/ipc-design.md` § Multi-threaded servers). Null before
+/// the thread has one; the emit path then drops the bytes.
 fn emit_ipc_buf() -> *mut u64
 {
     std::os::seraph::current_ipc_buf()
 }
 
 /// Resolve (and cache) the serial driver's SEND cap via `QUERY_DEVICE` at
-/// ordinal 0 on the `serial` class. Returns 0 while the driver is not yet resolvable
-/// (devmgr not reachable, or driver not spawned); the caller then drops the
+/// ordinal 0 on the `serial` class. Returns 0 while the driver is not yet
+/// resolvable (devmgr not reachable, or driver not spawned) or while another
+/// thread resolves it ([`SERIAL_RESOLVING`]); the caller then drops the
 /// bytes.
 fn resolve_serial_cap(ipc_buf: *mut u64) -> u64
 {
@@ -880,16 +1014,24 @@ fn resolve_serial_cap(ipc_buf: *mut u64) -> u64
     }
     let class = SERIAL_CLASS.load(Ordering::Acquire);
     if class == 0
+        || SERIAL_RESOLVING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
     {
         return 0;
     }
-    // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-    let Ok(cap) = (unsafe { ipc::query_device(class, 0, ipc_buf) })
-    else
+    // A thread that resolved it may have finished since the load above.
+    let mut cap = SERIAL_CAP.load(Ordering::Acquire);
+    if cap == 0
     {
-        return 0;
-    };
-    SERIAL_CAP.store(cap, Ordering::Release);
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+        if let Ok(resolved) = unsafe { ipc::query_device(class, 0, ipc_buf) }
+        {
+            SERIAL_CAP.store(resolved, Ordering::Release);
+            cap = resolved;
+        }
+    }
+    SERIAL_RESOLVING.store(false, Ordering::Release);
     cap
 }
 
@@ -902,8 +1044,29 @@ fn resolve_output_drivers(ipc_buf: *mut u64)
     let _ = resolve_fb_cap(ipc_buf);
 }
 
-/// Write a fully-formatted line to the serial driver via one or more
-/// `SERIAL_WRITE_BYTES` calls. Silently drops the bytes if the driver is
+/// Write `bytes` to the driver behind `cap` with one `op` call per
+/// [`SERIAL_CHUNK`] bytes, on the calling thread's page `ipc_buf`.
+fn write_chunks(cap: u64, op: u64, bytes: &[u8], ipc_buf: *mut u64)
+{
+    let mut off = 0;
+    while off < bytes.len()
+    {
+        let end = (off + SERIAL_CHUNK).min(bytes.len());
+        let chunk = &bytes[off..end];
+        let label = op | ((chunk.len() as u64) << 16);
+        let msg = IpcMessage::builder(label).bytes(0, chunk).build();
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+        // A worker calls here while it serves a request, which was copied
+        // out of the page as it was received, and its pending reply stays
+        // bound across this call (`docs/ipc-design.md` § Multi-threaded
+        // servers).
+        let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
+        off = end;
+    }
+}
+
+/// Write one fully-formatted line to the serial driver under
+/// [`SERIAL_EMIT`]. Silently drops the bytes if the driver is
 /// not yet resolvable.
 fn serial_write(bytes: &[u8])
 {
@@ -917,27 +1080,16 @@ fn serial_write(bytes: &[u8])
     {
         return;
     }
-    let mut off = 0;
-    while off < bytes.len()
-    {
-        let end = (off + SERIAL_CHUNK).min(bytes.len());
-        let chunk = &bytes[off..end];
-        let label = ipc::serial_labels::SERIAL_WRITE_BYTES | ((chunk.len() as u64) << 16);
-        let msg = IpcMessage::builder(label).bytes(0, chunk).build();
-        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page. Nested IPC is
-        // safe here: a received `STREAM_BYTES` is already snapshotted into a
-        // stack `IpcMessage`, and the kernel preserves the pending reply to
-        // the log sender across this call (same pattern as vfsd → blk).
-        let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
-        off = end;
-    }
+    let _whole = SERIAL_EMIT.lock().unwrap_or_else(PoisonError::into_inner);
+    write_chunks(cap, ipc::serial_labels::SERIAL_WRITE_BYTES, bytes, ipc_buf);
 }
 
 /// Resolve (and cache) the framebuffer driver's SEND cap via `QUERY_DEVICE`
 /// at ordinal 0 on the `framebuffer` class. Returns 0 while the driver is
 /// not yet resolvable (devmgr unreachable, headless boot, or driver not
-/// spawned); the caller then skips the framebuffer mirror. Uses the same
-/// IPC buffer the serial path resolved through.
+/// spawned) or while another thread resolves it ([`FB_RESOLVING`]); the
+/// caller then skips the framebuffer mirror. Uses the same IPC buffer the
+/// serial path resolved through.
 fn resolve_fb_cap(ipc_buf: *mut u64) -> u64
 {
     let cached = FB_CAP.load(Ordering::Acquire);
@@ -950,44 +1102,73 @@ fn resolve_fb_cap(ipc_buf: *mut u64) -> u64
         return cached;
     }
     let class = FB_CLASS.load(Ordering::Acquire);
+    // No class SEND recorded (serial_init sets it before any output, and
+    // a boot without the framebuffer class has none): no IPC, so nothing to
+    // latch.
     if class == 0
+        || FB_RESOLVING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
     {
-        // No class SEND recorded (serial_init sets it before the drain
-        // loop, and a boot without the framebuffer class has none): no IPC,
-        // so nothing to latch.
         return 0;
     }
-    // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-    let cap = match unsafe { ipc::query_device(class, 0, ipc_buf) }
+    // A thread that resolved it may have finished since the load above.
+    let latched = FB_CAP.load(Ordering::Acquire);
+    let cap = if latched != 0
     {
-        Ok(cap) => cap,
-        // Could not complete the query (transient — the call returned rather
-        // than blocking, so this is not the logd↔devmgr deadlock path). Leave
-        // the cache unset and retry on the next line, matching
-        // resolve_serial_cap; the serial class resolves on the same devmgr
-        // endpoint, so a hard failure here does not recur in practice.
-        Err(ipc::ClassCallError::Call(_)) => return 0,
-        // devmgr answered with no driver.
-        Err(_) => 0,
+        if latched == FB_UNAVAILABLE
+        {
+            0
+        }
+        else
+        {
+            latched
+        }
+    }
+    else
+    {
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+        match unsafe { ipc::query_device(class, 0, ipc_buf) }
+        {
+            // devmgr answered. Latch the outcome so the threads issue no
+            // more QUERY_DEVICE: the resolved cap, or FB_UNAVAILABLE when
+            // devmgr reports no framebuffer driver (headless boot). The
+            // driver, when present, is spawned before svcmgr launches logd,
+            // so this resolves it. Latching the no-driver answer is what
+            // prevents a per-line re-query, which would open a deadlock
+            // window against devmgr's own logging (devmgr → log_ep → logd,
+            // while a logd thread blocks here on devmgr's reply).
+            Ok(cap) =>
+            {
+                FB_CAP.store(
+                    if cap == 0 { FB_UNAVAILABLE } else { cap },
+                    Ordering::Release,
+                );
+                cap
+            }
+            // Could not complete the query (transient — the call returned
+            // rather than blocking, so this is not the logd↔devmgr deadlock
+            // path). Leave the cache unset and retry on the next line,
+            // matching resolve_serial_cap; the serial class resolves on the
+            // same devmgr endpoint, so a hard failure here does not recur in
+            // practice.
+            Err(ipc::ClassCallError::Call(_)) => 0,
+            // devmgr answered with no driver.
+            Err(_) =>
+            {
+                FB_CAP.store(FB_UNAVAILABLE, Ordering::Release);
+                0
+            }
+        }
     };
-    // devmgr answered. Latch the outcome so the drain loop issues at most one
-    // more QUERY_DEVICE: the resolved cap, or FB_UNAVAILABLE when devmgr
-    // reports no framebuffer driver (headless boot). The driver, when
-    // present, is spawned before svcmgr launches logd, so this resolves it.
-    // Latching the no-driver answer is what prevents a per-line re-query, which
-    // would open a deadlock window against devmgr's own logging (devmgr →
-    // log_ep → logd, while logd blocks here on devmgr's reply).
-    FB_CAP.store(
-        if cap == 0 { FB_UNAVAILABLE } else { cap },
-        Ordering::Release,
-    );
+    FB_RESOLVING.store(false, Ordering::Release);
     cap
 }
 
-/// Mirror a fully-formatted line to the framebuffer driver via one or more
-/// `FB_WRITE_BYTES` calls. Silently skips the mirror if the driver is not
-/// resolvable, so serial remains the always-present, authoritative channel
-/// (CI scrapes serial; the framebuffer is an on-screen convenience).
+/// Mirror a fully-formatted line to the framebuffer driver under [`FB_EMIT`].
+/// Silently skips the mirror if the driver is not resolvable, so serial
+/// remains the always-present, authoritative channel (CI scrapes serial; the
+/// framebuffer is an on-screen convenience).
 fn fb_write(bytes: &[u8])
 {
     let ipc_buf = emit_ipc_buf();
@@ -1000,20 +1181,8 @@ fn fb_write(bytes: &[u8])
     {
         return;
     }
-    let mut off = 0;
-    while off < bytes.len()
-    {
-        let end = (off + SERIAL_CHUNK).min(bytes.len());
-        let chunk = &bytes[off..end];
-        let label = ipc::fb_labels::FB_WRITE_BYTES | ((chunk.len() as u64) << 16);
-        let msg = IpcMessage::builder(label).bytes(0, chunk).build();
-        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page. Same nested-IPC
-        // reasoning as serial_write: the received STREAM_BYTES is already
-        // snapshotted and the kernel preserves the pending reply to the log
-        // sender across this call.
-        let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
-        off = end;
-    }
+    let _whole = FB_EMIT.lock().unwrap_or_else(PoisonError::into_inner);
+    write_chunks(cap, ipc::fb_labels::FB_WRITE_BYTES, bytes, ipc_buf);
 }
 
 /// Longest prefix [`LineBuf::push_prefix`] writes, CRLF included: the
@@ -1160,6 +1329,21 @@ impl LineBuf
         }
     }
 
+    /// Push a text line: the prefix stamped `us`, the line's bytes with each
+    /// `\n` written `\r\n`, and the closing `\r\n`.
+    fn push_text_line(&mut self, name: &[u8], level: u64, us: u64, line: &[u8])
+    {
+        self.push_prefix_at(name, level, us);
+        for &b in line
+        {
+            self.push_escaped(b);
+        }
+        self.push(b'\r');
+        self.push(b'\n');
+    }
+
+    /// Write the line to the serial driver and mirror it to the framebuffer
+    /// driver, each whole ([`SERIAL_EMIT`], [`FB_EMIT`]).
     fn flush(&self)
     {
         serial_write(&self.buf[..self.len]);
@@ -1167,34 +1351,27 @@ impl LineBuf
     }
 }
 
-/// Emit `[sec.usfrac] [name] <bytes>\r\n` to the serial driver, with the
-/// line's level tag and a space after `[name] ` for any level but info
-/// (`logd_codec::level::tag`). Mirrors init-logd's `flush_line` shape so the
-/// post-handover output stream looks identical to the pre-handover output.
-fn emit_line(_badge: u64, name: &[u8], level: u64, line: &[u8])
-{
-    let mut out = LineBuf::new();
-    out.push_prefix(name, level);
-    for &b in line
-    {
-        out.push_escaped(b);
-    }
-    out.push(b'\r');
-    out.push(b'\n');
-    out.flush();
-}
-
 /// Panic-output sink registered with std via `set_panic_sink`. Routes
 /// logd's own panic / alloc-error / precondition output to the serial
 /// driver — never through the log endpoint logd serves. Forwards raw bytes
-/// (std frames the panic message); `serial_write` silent-drops until the
-/// driver is resolvable. Must stay non-allocating and panic-free: it runs
-/// from the panic path. `serial_write` issues its `ipc_call` on the calling
-/// thread's own IPC buffer ([`emit_ipc_buf`]), so a panic or allocation
-/// failure on the resync helper thread never touches the main thread's.
+/// (std frames the panic message), and drops them until the driver is
+/// resolvable. Must stay non-allocating and panic-free: it runs
+/// from the panic path, and takes no lock, so a panic on a thread that holds
+/// [`SERIAL_EMIT`] or the state lock still reaches the driver. Its calls use
+/// the calling thread's own IPC buffer ([`emit_ipc_buf`]), so a panic or
+/// allocation failure on any thread never touches another's.
 fn panic_to_serial(bytes: &[u8])
 {
-    serial_write(bytes);
+    let ipc_buf = emit_ipc_buf();
+    if ipc_buf.is_null()
+    {
+        return;
+    }
+    let cap = resolve_serial_cap(ipc_buf);
+    if cap != 0
+    {
+        write_chunks(cap, ipc::serial_labels::SERIAL_WRITE_BYTES, bytes, ipc_buf);
+    }
 }
 
 /// Emit `[sec.usfrac] [logd] <payload>\r\n` to the serial driver, stamped
@@ -1246,13 +1423,12 @@ static SELF_LOG_HOLD: Mutex<HeldLines<HeldLine, SELF_LOG_HELD_MAX>> = Mutex::new
 fn write_self_log(line: &HeldLine)
 {
     let mut out = LineBuf::new();
-    out.push_prefix_at(b"logd", LEVEL_INFO, line.us);
-    for b in line.payload.as_str().bytes()
-    {
-        out.push_escaped(b);
-    }
-    out.push(b'\r');
-    out.push(b'\n');
+    out.push_text_line(
+        b"logd",
+        LEVEL_INFO,
+        line.us,
+        line.payload.as_str().as_bytes(),
+    );
     out.flush();
 }
 

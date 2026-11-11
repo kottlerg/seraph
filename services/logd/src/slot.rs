@@ -11,7 +11,8 @@
 //! Slots are keyed by the kernel-delivered badge on every IPC message —
 //! the same `u64` procmgr uses as the child's process badge and posts as
 //! the correlator of the child's death to logd's death queue. Slot
-//! eviction is driven by the death event drained inside logd's main loop.
+//! eviction is driven by the death events logd drains
+//! (`services/logd/docs/ipc-interface.md` § Wait-set).
 
 use std::collections::{HashMap, VecDeque};
 

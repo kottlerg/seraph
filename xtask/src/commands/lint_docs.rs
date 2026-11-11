@@ -1705,9 +1705,18 @@ mod tests
         );
         let others = [
             md("README.md", "# Seraph\n\n[A](docs/a.md)\n"),
-            md("docs/b.md", "# Bee Doc\n\n[A](a.md)\n\n---\n\n## Summarized By\n\nNone\n"),
-            md("core/README.md", "# core\n\n[A](../docs/a.md)\n\n---\n\n## Summarized By\n\nNone\n"),
-            md("core/x/README.md", "# x\n\n[A](../../docs/a.md)\n\n---\n\n## Summarized By\n\nNone\n"),
+            md(
+                "docs/b.md",
+                "# Bee Doc\n\n[A](a.md)\n\n---\n\n## Summarized By\n\nNone\n",
+            ),
+            md(
+                "core/README.md",
+                "# core\n\n[A](../docs/a.md)\n\n---\n\n## Summarized By\n\nNone\n",
+            ),
+            md(
+                "core/x/README.md",
+                "# x\n\n[A](../../docs/a.md)\n\n---\n\n## Summarized By\n\nNone\n",
+            ),
         ];
         let mut all: Vec<&SourceFile> = vec![&doc];
         all.extend(others.iter());
@@ -1735,7 +1744,8 @@ mod tests
     #[test]
     fn summarized_by_entries_carry_the_readme_path_or_the_document_title()
     {
-        let good = "[README.md](../README.md), [core/README.md](../core/README.md), [Bee Doc](b.md)";
+        let good =
+            "[README.md](../README.md), [core/README.md](../core/README.md), [Bee Doc](b.md)";
         assert!(entry_form(good, "md-summarized-by-label").is_empty());
         let bad = "[Seraph](../README.md), [core](../core/README.md), [B](b.md)";
         assert_eq!(entry_form(bad, "md-summarized-by-label").len(), 3);

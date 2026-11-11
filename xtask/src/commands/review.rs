@@ -578,7 +578,7 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
         .flat_map(|r| r["findings"].as_array().into_iter().flatten())
         .filter(|f| needs_reader(f))
         .collect();
-    open.sort_by_key(|f| f.to_string());
+    open.sort_by_key(ToString::to_string);
     open.dedup();
     if non_blocking && !open.is_empty()
     {
@@ -1338,7 +1338,10 @@ mod tests
     {
         for verdict in ["READY TO MERGE", "BLOCKING ISSUES"]
         {
-            let r = defect_record(verdict, vec![defect("a", "unverified"), defect("b", "contested")]);
+            let r = defect_record(
+                verdict,
+                vec![defect("a", "unverified"), defect("b", "contested")],
+            );
             assert!(check_record(NAME, &r).is_empty(), "{verdict}");
         }
     }
@@ -1406,7 +1409,11 @@ mod tests
         let records = vec![
             (
                 NAME.to_owned(),
-                reviewer_alone(2, "NON-BLOCKING ISSUES ONLY", vec![finding("drift", "unverified")]),
+                reviewer_alone(
+                    2,
+                    "NON-BLOCKING ISSUES ONLY",
+                    vec![finding("drift", "unverified")],
+                ),
             ),
             ("audit-0a82b0aa.json".to_owned(), audit.clone()),
         ];
@@ -1427,14 +1434,11 @@ mod tests
     #[test]
     fn the_ledger_copies_the_fields_of_either_form()
     {
-        let records = vec![(
-            NAME.to_owned(),
-            {
-                let mut r = defect_record("BLOCKING ISSUES", vec![]);
-                r["recorded"] = json!([defect("off surface", "unverified")]);
-                r
-            },
-        )];
+        let records = vec![(NAME.to_owned(), {
+            let mut r = defect_record("BLOCKING ISSUES", vec![]);
+            r["recorded"] = json!([defect("off surface", "unverified")]);
+            r
+        })];
         let ledger = ledger(&records);
         assert_eq!(ledger[0]["claim"], "off surface");
         assert!(ledger[0].get("class").is_none());

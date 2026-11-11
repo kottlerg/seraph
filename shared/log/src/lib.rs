@@ -51,8 +51,8 @@ use ipc::{
 use syscall_abi::{MSG_DATA_WORDS_MAX, SyscallError};
 
 /// Maximum bytes per `STREAM_BYTES` chunk. Lines longer than this are
-/// chunked across multiple `ipc_call`s; the receiver concatenates per-call
-/// bytes in order.
+/// chunked across multiple `ipc_call`s; the receiver concatenates the bytes
+/// of answered calls in order.
 pub const CHUNK_SIZE: usize = MSG_DATA_WORDS_MAX * 8;
 
 /// Stack-buffer size used by [`write_args`]: one `STREAM_BYTES` payload. A
@@ -62,9 +62,12 @@ const STACK_BUF_LEN: usize = CHUNK_SIZE;
 
 /// The bound, in milliseconds, on a log call (`ipc::ipc_call_timeout`) while
 /// the log receiver answers: a call it does not answer in time fails with
-/// `WouldBlock`, and its line is dropped, so a receiver that is wedged, or
-/// stopped while holding the endpoint, stalls a sender for this long once
-/// rather than for good (docs/limits.md § Shared IPC and protocol crates).
+/// `WouldBlock`. Its line is dropped, unless the receiver had already
+/// received it, in which case it may still be written, even after a later
+/// line of the same thread (`services/logd/docs/ipc-interface.md` § Receive
+/// pool). A receiver that is wedged, or stopped while holding the endpoint,
+/// thus stalls a sender for this long once rather than for good
+/// (docs/limits.md § Shared IPC and protocol crates).
 /// Long enough that a receiver merely slowed by load still takes every line.
 pub const LOG_CALL_TIMEOUT_MS: u32 = 5000;
 
@@ -228,8 +231,9 @@ fn labelled(id: u64, len: usize, level: u64) -> u64
 
 /// Send `bytes` at `level` (an `ipc::stream_labels::LEVEL_*` code) as one or
 /// more `STREAM_BYTES` messages on `cap`. Splits across IPC calls when the
-/// payload exceeds [`CHUNK_SIZE`]; the receiver concatenates per-call bytes
-/// in order, and a line takes the level of the chunk carrying its first byte.
+/// payload exceeds [`CHUNK_SIZE`]; the receiver concatenates the bytes of
+/// answered calls in order, and a line takes the level of the chunk carrying
+/// its first byte.
 /// Silently drops on a zero `cap`, null `ipc_buf`, empty `bytes`, or
 /// mid-chunk IPC failure, a call the receiver leaves unanswered for
 /// its bound ([`LOG_CALL_TIMEOUT_MS`]) among them.

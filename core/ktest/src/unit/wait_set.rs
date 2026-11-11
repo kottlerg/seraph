@@ -10,8 +10,9 @@
 //!
 //! Tests cover immediate return (source signalled before the wait),
 //! cross-thread return (a child thread signals the source; the parent blocks
-//! unless the unpinned child signals first), and two threads waiting on one
-//! set at once, each arrival waking one. The remove test verifies that only
+//! unless the unpinned child signals first), two threads waiting on one set
+//! at once, each arrival waking one, and a member that takes several
+//! arrivals holding one ready-ring entry. The remove test verifies that only
 //! the remaining member can wake the wait set after removal, and the
 //! stale-entry test that a member whose source stopped being ready after it
 //! was queued is not returned.
@@ -189,6 +190,57 @@ pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 
     cap_delete(eq).map_err(|_| "cap_delete eq after ws-queue test failed")?;
     cap_delete(ws).map_err(|_| "cap_delete ws after ws-queue test failed")?;
+    Ok(())
+}
+
+// ── Ready ring: one entry per member ──────────────────────────────────────────
+
+const BUSY_BADGE: u64 = 0xB0;
+const QUIET_BADGE: u64 = 0xB1;
+
+/// A member that takes several arrivals while no thread waits does not crowd
+/// another member out of the ready ring: in a two-member set, three posts to
+/// an event queue and then one send to a notification leave both members
+/// queued, so two waits, neither of which consumes anything, return both
+/// badges in that order. Fails if each post queued its own entry, which
+/// filled the two-entry ring, dropped the notification's, and returned the
+/// still-ready queue to both waits.
+pub fn busy_member_does_not_crowd_out(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_base, 2)
+        .map_err(|_| "wait_set::busy_member: wait_set_create failed")?;
+    let eq = event_queue_create(ctx.memory_base, 4);
+    let sig = cap_create_notification(ctx.memory_base);
+    let result = match (eq, sig)
+    {
+        (Ok(eq), Ok(sig)) => busy_run(ws, eq, sig),
+        _ => Err("wait_set::busy_member: creating a member failed"),
+    };
+    for cap in [eq.ok(), sig.ok(), Some(ws)].into_iter().flatten()
+    {
+        cap_delete(cap).ok();
+    }
+    result
+}
+
+/// Body of [`busy_member_does_not_crowd_out`].
+fn busy_run(ws: u64, eq: u64, sig: u64) -> TestResult
+{
+    wait_set_add(ws, eq, BUSY_BADGE)
+        .map_err(|_| "wait_set::busy_member: wait_set_add(eq) failed")?;
+    wait_set_add(ws, sig, QUIET_BADGE)
+        .map_err(|_| "wait_set::busy_member: wait_set_add(sig) failed")?;
+    for n in 0..3
+    {
+        event_post(eq, n).map_err(|_| "wait_set::busy_member: event_post failed")?;
+    }
+    notification_send(sig, 0x1).map_err(|_| "wait_set::busy_member: notification_send failed")?;
+    let first = wait_set_wait(ws).map_err(|_| "wait_set::busy_member: first wait failed")?;
+    let second = wait_set_wait(ws).map_err(|_| "wait_set::busy_member: second wait failed")?;
+    if (first, second) != (BUSY_BADGE, QUIET_BADGE)
+    {
+        return Err("wait_set::busy_member: the busy member crowded the other out of the ring");
+    }
     Ok(())
 }
 

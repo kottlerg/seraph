@@ -616,7 +616,7 @@ pub struct WaitSetState
 
     /// Ring buffer of pending member indices, `capacity + 1` slots inline
     /// after the members. One slot stays empty to tell full from empty, so it
-    /// holds at most `capacity` entries.
+    /// holds at most `capacity` entries; each names a distinct member.
     ready_ring: *mut u16,
 
     /// Member capacity, fixed at creation; occupied member slots.
@@ -640,6 +640,9 @@ struct WaitSetMember
     /// Kind of source; meaningful only when `source_ptr` is non-null.
     source_tag: WaitSetSourceTag,
 
+    /// Whether `ready_ring` holds an entry for this member (at most one).
+    queued: bool,
+
     /// Opaque badge returned to the caller when this source is ready.
     badge: u64,
 }
@@ -653,8 +656,9 @@ enum WaitSetSourceTag
 }
 ```
 
-Folding vacancy into a null `source_ptr` keeps each `WaitSetMember` at 24 B, the
-per-member debit of `wait_set_retype_bytes`; `wait_set.rs` asserts the member and state
+Folding vacancy into a null `source_ptr`, and placing `queued` in the padding after
+`source_tag`, keeps each `WaitSetMember` at 24 B, the per-member debit of
+`wait_set_retype_bytes`; `wait_set.rs` asserts the member and state
 sizes at compile time, and `cap/retype.rs` pins the layout to the ABI formula.
 
 The member array and the ready ring are sized by the capacity the creator passes to
@@ -684,9 +688,15 @@ waitset_notify(wait_set, member_idx):
         Release lock
         enqueue_and_wake(tcb)
     else:
-        ready_ring.push(member_idx)   // dropped if the ring is full
+        if members[member_idx] is occupied and not queued:
+            ready_ring.push(member_idx)
+            members[member_idx].queued = true
         Release lock
 ```
+
+A member holds at most one ring entry, however many arrivals it takes while no thread
+waits, so the ring never holds more entries than the set has members and never fills,
+and a member that keeps receiving work cannot crowd another member's entry out of it.
 
 ### Wait Path
 
@@ -695,8 +705,8 @@ waitset_notify(wait_set, member_idx):
 ```
 1. Acquire lock
 2. while ready_ring is non-empty:
-   a. member_idx = ready_ring.pop()
-   b. if members[member_idx] is vacant (removed), or its source is not
+   a. member_idx = ready_ring.pop(); members[member_idx].queued = false
+   b. if members[member_idx] is vacant, or its source is not
       source_is_ready right now: skip it
    c. Release lock; return members[member_idx].badge
 3. Level-readiness self-heal: for each member, if source_is_ready(source)
@@ -742,10 +752,11 @@ receive waits for the source's next arrival.
 **Why step 3 exists, and its memory-ordering requirement.** Every arrival of work
 on a member reaches `waitset_notify` (§ Readiness Notification), but an arrival
 that finds no thread waiting leaves only a ring entry, and the ring does not name
-every unit of work a member holds: a push to a full ring is dropped (§ Multiple
-Ready Sources), and a member already ready when it is added gets one entry however
-many senders or entries it holds. For a consumer that handles one item per wakeup,
-the items no entry names would be invisible without the level re-check in step 3.
+every unit of work a member holds: a member holds at most one entry however many
+arrivals it takes (§ Readiness Notification), and a member already ready when it is
+added gets one entry however many senders or entries it holds. For a consumer that
+handles one item per wakeup, the items no entry names would be invisible without the
+level re-check in step 3.
 
 The self-heal reads source readiness **without taking the source lock**: taking
 it here would acquire `source.lock` while holding `ws.lock`, inverting the
@@ -780,7 +791,8 @@ If the source is already ready at add time, `waitset_add` queues the member and
 wakes the longest-waiting thread, if any, immediately.
 
 `SYS_WAIT_SET_REMOVE` acquires both the wait set lock and the source object lock,
-removes the member, clears the back-pointer, and `dec_ref`s the source's
+removes the member and its ring entry, if it has one (so a member later added at the
+same index starts with none), clears the back-pointer, and `dec_ref`s the source's
 `KernelObjectHeader` to release the +1 held by membership. The lock pairing
 prevents a concurrent notification from referencing a removed member. Both handlers
 resolve the source capability through `syscall::pin_slot`, which pins the source for
@@ -806,14 +818,15 @@ returns `Interrupted`.
 ### Multiple Ready Sources
 
 If multiple members become ready before `SYS_WAIT_SET_WAIT` is called, `ready_ring`
-buffers their member indices in arrival order, up to the set's capacity in
-entries; it does not deduplicate (a member gets one entry per arrival), and a push
-to a full ring is dropped.
-Subsequent `SYS_WAIT_SET_WAIT` calls drain the ring without blocking until it is
-empty, skipping an entry whose source is no longer ready (§ Wait Path step 2b), per
+buffers their member indices in the order they were queued, one entry per member
+(§ Readiness Notification), so it holds every ready member and never fills. A member
+popped from the ring is queued again, behind the members already queued, by its next
+arrival. Subsequent `SYS_WAIT_SET_WAIT` calls drain the ring without blocking until it
+is empty, skipping an entry whose source is no longer ready (§ Wait Path step 2b), per
 [syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28).
-An entry lost to a full ring is recovered by the level-readiness self-heal
-(§ Wait Path step 3), which returns any member whose source is still ready.
+Work a member still holds after its entry is popped, with no arrival since, is
+returned by the level-readiness self-heal (§ Wait Path step 3) once the ring holds no
+ready entry.
 
 ---
 

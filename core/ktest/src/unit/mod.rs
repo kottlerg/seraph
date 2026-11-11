@@ -421,6 +421,10 @@ pub fn run_all(ctx: &TestContext)
         "wait_set::add_queue_immediate",
         wait_set::add_queue_immediate(ctx)
     );
+    run_test!(
+        "wait_set::busy_member_does_not_crowd_out",
+        wait_set::busy_member_does_not_crowd_out(ctx)
+    );
     run_test!("wait_set::blocking_wait", wait_set::blocking_wait(ctx));
     run_test!(
         "wait_set::shared_set_waiters",

@@ -154,8 +154,10 @@ claims.
    X and the head, `docs/conventions.md` § Syncing with `master` decides
    whether X stands: `cargo xtask pr-check` compares the PR's own change at
    X and at the head in place of that delta, and you check what it cannot:
-   judge each merge M of the base branch in `git log --merges X..<head>`
-   on its own incoming diff (`git diff $(git merge-base M^1 M^2) M^2`).
+   judge each sync, a merge M of the base branch on the PR branch's own
+   line (`git log --merges --first-parent X..<head>`; a merge the base
+   branch brought in is another branch's), on its own incoming diff
+   (`git diff $(git merge-base M^1 M^2) M^2`).
    For each, the body MUST state that its incoming diff touches none of
    the PR's files or that it is comment-only, no file of that incoming
    diff (the same command with `--name-only`) may be one the PR's own diff
@@ -229,7 +231,8 @@ claims.
     (`stats.failed`), when the PR's own change in `<since>..<head>` alters,
     Markdown aside, anything but comment lines (judged as step 9 judges a
     validation delta, a sync in the range included), or when a commit in
-    `git log --merges <since>..<head>` merges the base branch and that sync
+    `git log --merges --first-parent <since>..<head>` merges the base
+    branch and that sync
     owes a run with the reviewer as `docs/conventions.md` § Syncing with
     `master` says (its incoming diff names a file the PR's own diff names
     and is not comment-only, or the merge resolved a conflict; step 9 gives

@@ -69,7 +69,7 @@ A record carries the device's resources, typed:
 |---|---|
 | `Mmio` | PCI BAR index (PCI only), physical base, size |
 | `IoPort` (x86-64) | Base port, count |
-| `Interrupt` | Kind and vector count: `Wired` (one line: its GSI or PLIC/APLIC source, its trigger and polarity mode, whether devmgr may share it) or `MessageSignaled` (`Msi` or `MsiX`, the vectors the function supports) |
+| `Interrupt` | Kind and vector count: `Wired` (one line: its GSI or PLIC/APLIC source, its trigger and polarity mode, whether devmgr may share it, which only a PCI function's line may be) or `MessageSignaled` (`Msi` or `MsiX`, the vectors the function supports) |
 | `Dma` | The requester ID the IOMMU scope is resolved against |
 | `Config` (PCI) | The function's configuration page, which devmgr keeps and delegates to no driver |
 
@@ -93,7 +93,7 @@ describes, and a signature over the binary would cover its declaration with it.
 | Field | Meaning |
 |---|---|
 | Name | The driver's name in log lines |
-| Match entries | One or more keys of § Device Records: a PCI vendor and device, or a PCI class, subclass, and programming interface under a mask; an ACPI `_HID` or `_CID`; an SPCR interface type; a platform key; an IOMMU family key |
+| Match entries | One or more keys of § Device Records: a PCI vendor and device, or a PCI class, subclass, and programming interface under a mask; an ACPI `_HID` or `_CID`; an SPCR interface type; a platform key; an IOMMU family key; the `boot-framebuffer` key |
 | Class | The name of the device class the driver serves (§ Device Classes) |
 | Instance limit | The most devices of its match the driver is bound to; absent means every one |
 | Interrupt need | None, optional, or required, and for a message-signaled capable driver the vector count it requests |
@@ -136,9 +136,11 @@ never claims more than its device and the system's policy give it:
   access is accepted only from a boot-bundle declaration that matches an IOMMU record. A
   drivers-directory declaration of any of them is logged and ignored, and a drivers-directory
   driver runs at the auxiliary tier.
-- **Withdrawal.** Whatever reset a declaration names, withdrawing the driver of a PCI function
-  disables the function's wired interrupt (§ Binding). A reset of none therefore cannot leave
-  a shared line asserting for the other drivers on it.
+- **Withdrawal.** devmgr shares a wired line only among PCI functions; it carves the line of
+  any other record exclusive, as it carves the UART's today. Whatever reset a declaration
+  names, withdrawing the driver of a PCI function disables the function's wired interrupt
+  (§ Binding). A reset of none therefore cannot leave a shared line asserting for the other
+  drivers on it.
 - **Class.** Declaring a class decides which of that class's consumers talk to the driver; it
   grants no access, since the class's policy is configuration (§ Device Classes). Consumers
   treat a driver's data as untrusted.
@@ -159,7 +161,9 @@ over all the record's keys, ranked from most to least specific:
 2. an SPCR interface type;
 3. an ACPI `_HID`;
 4. a PCI class;
-5. an ACPI `_CID`.
+5. an ACPI `_CID`;
+6. the `boot-framebuffer` key. It is the generic fallback for the framebuffer the firmware set
+   up, so a driver that matches the display device by any other key binds in its place.
 
 Two declarations equally specific for one device are a conflict: devmgr logs it and binds
 neither.

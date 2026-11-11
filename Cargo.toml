@@ -55,6 +55,7 @@ members = [
     "shared/crash-report",
     "shared/crypto",
     "shared/death-set",
+    "shared/driver-binding",
     "shared/elf",
     "shared/font",
     "shared/mmio",

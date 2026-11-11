@@ -22,11 +22,13 @@ virtio/console/
 
 ## Endpoint
 
-Devmgr binds the first `virtio-console` PCI device it enumerates as the debug port: it carves
+The driver carries a declaration in the ELF note section `.note.seraph.driver` (PCI `1AF4:1003`
+and `1AF4:1043`, class `debug-port`, instance limit 1, auxiliary tier). Devmgr binds the first
+`virtio-console` PCI device in PCI order as the debug port: it carves
 the device's capabilities (an `Mmio` cap for every BAR its VirtIO register regions name, its
 own derivation of its line's `Interrupt` cap, and the device's DMA capability) and spawns this
 driver from the rootfs (`/services/drivers/virtio-console`) through its `SET_DRIVERS_DIR`
-subtree cap, in the same on-disk batch as the virtio-input drivers (see
+subtree cap, in the same drivers-directory pass as the virtio-input drivers (see
 [docs/device-management.md](../../../../docs/device-management.md)). A further console device
 is left unbound. The driver reports `DRIVER_READY` on its devmgr query endpoint once its device
 is set up, immediately before its service loop, and devmgr serves its endpoint only after that

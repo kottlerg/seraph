@@ -22,22 +22,19 @@ use virtio_core::{
     VIRTIO_PCI_CAP_NOTIFY_CFG, VirtioCapLocation, VirtioPciStartupInfo,
 };
 
-use crate::pci::{COMMAND, io_bar_size, mmio_bar_size};
+use crate::pci::{COMMAND, MAX_CAPABILITIES, io_bar_size, mmio_bar_size};
 
 /// BAR registers in a PCI type-0 configuration header (offsets 0x10 to 0x24).
 pub const MAX_BARS: usize = 6;
 
-/// Capability slots a function's capability list can hold: capabilities are
-/// dword-aligned in the 192 bytes above the 64-byte standard header, so a
-/// list longer than (256 - 64) / 4 entries must loop.
-const MAX_CAPABILITIES: u32 = 48;
-
 /// The Command register's I/O- and Memory-space decode enables
 /// ([`crate::pci::COMMAND`] is the register's offset).
 const PCI_COMMAND_DECODE: u16 = 0x3;
-/// Class-code register offsets (base class at 0x0B, subclass at 0x0A).
-const PCI_CLASS: u16 = 0x0B;
-const PCI_SUBCLASS: u16 = 0x0A;
+/// The revision ID and class code register: revision in bits 7:0, then
+/// programming interface, subclass, and base class.
+const PCI_REVISION_CLASS: u16 = 0x08;
+/// A type-0 header's subsystem vendor ID, then subsystem ID at 0x2E.
+const PCI_SUBSYSTEM: u16 = 0x2C;
 /// A type-1 (bridge) header's secondary and subordinate bus numbers.
 const PCI_SECONDARY_BUS: u16 = 0x19;
 const PCI_SUBORDINATE_BUS: u16 = 0x1A;
@@ -72,6 +69,14 @@ pub struct PciDevice
     pub func: u8,
     pub vendor_id: u16,
     pub device_id: u16,
+    /// Class code: base class `<< 16 |` subclass `<< 8 |` programming
+    /// interface.
+    pub class_code: u32,
+    pub revision: u8,
+    /// Subsystem vendor and subsystem ID of a type-0 header; 0 for every
+    /// other header layout.
+    pub subsystem_vendor: u16,
+    pub subsystem_id: u16,
     pub bar_phys: [u64; MAX_BARS],
     pub bar_size: [u64; MAX_BARS],
     pub bar_is_mmio: [bool; MAX_BARS],
@@ -149,8 +154,8 @@ pub fn scan(
     Ok(())
 }
 
-/// Read one present function's identity, interrupt registers, BARs (type-0
-/// headers only), and `VirtIO` capabilities.
+/// Read one present function's identity, interrupt registers, BARs and
+/// subsystem IDs (type-0 headers only), and `VirtIO` capabilities.
 fn read_function(
     cfg: &impl ConfigSpace,
     segment: u16,
@@ -160,6 +165,8 @@ fn read_function(
     vendor_id: u16,
 ) -> PciDevice
 {
+    let revision_class = cfg.read32(bus, dev, func, PCI_REVISION_CLASS);
+    let [revision, ..] = revision_class.to_le_bytes();
     let mut pci_dev = PciDevice {
         segment,
         bus,
@@ -167,6 +174,10 @@ fn read_function(
         func,
         vendor_id,
         device_id: cfg.read16(bus, dev, func, 0x02),
+        class_code: revision_class >> 8,
+        revision,
+        subsystem_vendor: 0,
+        subsystem_id: 0,
         bar_phys: [0; MAX_BARS],
         bar_size: [0; MAX_BARS],
         bar_is_mmio: [false; MAX_BARS],
@@ -182,6 +193,8 @@ fn read_function(
     let header_layout = cfg.read8(bus, dev, func, 0x0E) & 0x7F;
     if header_layout == 0
     {
+        pci_dev.subsystem_vendor = cfg.read16(bus, dev, func, PCI_SUBSYSTEM);
+        pci_dev.subsystem_id = cfg.read16(bus, dev, func, PCI_SUBSYSTEM + 2);
         probe_bars(cfg, &mut pci_dev);
     }
     else if header_layout == 1
@@ -208,8 +221,7 @@ fn read_function(
 fn probe_bars(cfg: &impl ConfigSpace, dev: &mut PciDevice)
 {
     let (b, d, f) = (dev.bus, dev.dev, dev.func);
-    let host_bridge =
-        cfg.read8(b, d, f, PCI_CLASS) == 0x06 && cfg.read8(b, d, f, PCI_SUBCLASS) == 0;
+    let host_bridge = dev.class_code >> 8 == 0x0600;
     let command = cfg.read16(b, d, f, COMMAND);
     let toggle = !host_bridge && command & PCI_COMMAND_DECODE != 0;
     if toggle
@@ -373,35 +385,6 @@ fn fits_mmio_bar(dev: &PciDevice, loc: &VirtioCapLocation) -> bool
     let reach = u64::from(loc.offset) + u64::from(loc.length);
     (0..dev.bar_count)
         .any(|i| dev.bar_pci_idx[i] == loc.bar && dev.bar_is_mmio[i] && reach <= dev.bar_size[i])
-}
-
-/// Check if a PCI device is a `VirtIO` block device.
-#[must_use]
-pub fn is_virtio_blk(dev: &PciDevice) -> bool
-{
-    dev.vendor_id == VIRTIO_VENDOR && (dev.device_id == 0x1001 || dev.device_id == 0x1042)
-}
-
-/// Check if a PCI device is a `VirtIO` input device (keyboard / pointer).
-///
-/// virtio-input is virtio device type 18: modern PCI device ID `0x1052`,
-/// legacy/transitional `0x1012`. QEMU's `virtio-keyboard-pci` with
-/// `disable-legacy=on` presents as `0x1052`.
-#[must_use]
-pub fn is_virtio_input(dev: &PciDevice) -> bool
-{
-    dev.vendor_id == VIRTIO_VENDOR && (dev.device_id == 0x1012 || dev.device_id == 0x1052)
-}
-
-/// Check if a PCI device is a `VirtIO` console device.
-///
-/// virtio-console is virtio device type 3: modern PCI device ID `0x1043`,
-/// legacy/transitional `0x1003`. QEMU's `virtio-serial-pci` with
-/// `disable-legacy=on` presents as `0x1043`.
-#[must_use]
-pub fn is_virtio_console(dev: &PciDevice) -> bool
-{
-    dev.vendor_id == VIRTIO_VENDOR && (dev.device_id == 0x1003 || dev.device_id == 0x1043)
 }
 
 #[cfg(test)]
@@ -624,6 +607,33 @@ mod tests
         let found = scan_all(&space, 0, 0);
         assert_eq!(found[0].bridge_buses, Some((3, 5)));
         assert_eq!(found[1].bridge_buses, None);
+    }
+
+    #[test]
+    fn a_function_records_its_class_revision_and_subsystem()
+    {
+        let space = FakeSpace::default();
+        let endpoint = (0, 2, 0);
+        space.add(endpoint, 0x1AF4, 0x1042, 0x00);
+        // Base class 0x01, subclass 0x00, programming interface 0x00,
+        // revision 0x01.
+        space.set32(endpoint, 0x08, 0x0100_0001);
+        space.set32(endpoint, 0x2C, 0x0002_1AF4);
+        let bridge = (0, 3, 0);
+        space.add(bridge, 0x8086, 1, 0x01);
+        space.set32(bridge, 0x08, 0x0604_0002);
+        // A type-1 header holds no subsystem IDs at 0x2C.
+        space.set32(bridge, 0x2C, 0xDEAD_BEEF);
+        let found = scan_all(&space, 0, 0);
+        assert_eq!(found[0].class_code, 0x01_0000);
+        assert_eq!(found[0].revision, 1);
+        assert_eq!(
+            (found[0].subsystem_vendor, found[0].subsystem_id),
+            (0x1AF4, 2)
+        );
+        assert_eq!(found[1].class_code, 0x06_0400);
+        assert_eq!(found[1].revision, 2);
+        assert_eq!((found[1].subsystem_vendor, found[1].subsystem_id), (0, 0));
     }
 
     /// Add a VirtIO function whose capability list holds the given

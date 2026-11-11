@@ -276,9 +276,9 @@ pub unsafe fn syscall2_ret3(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64)
     (ret, secondary, tertiary)
 }
 
-/// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
+/// Issue a syscall with 2 arguments. Returns (primary, secondary, tertiary, quaternary).
 ///
-/// Used by `raw_ipc_recv` to retrieve `(ret, label, badge, word_count)`.
+/// Used by `raw_ipc_recv_timeout` to retrieve `(ret, label, badge, word_count)`.
 ///
 /// # Safety
 ///
@@ -287,7 +287,7 @@ pub unsafe fn syscall2_ret3(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64)
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
 #[allow(clippy::inline_always, clippy::cast_possible_wrap)]
 #[inline(always)]
-pub unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
+pub unsafe fn syscall2_ret4(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64, u64)
 {
     let ret: i64;
     let secondary: u64;
@@ -295,8 +295,9 @@ pub unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
     let quaternary: u64;
     let nr = nr as i64;
     // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
-    // arg in rdi; clobbers rcx/r11; reads secondary from rdx, tertiary from rsi, quaternary
-    // from r8 (all lateout, caller-saved; kernel writes them in the trap frame before SYSRET).
+    // args in rdi and rsi; clobbers rcx/r11; reads secondary from rdx, tertiary from rsi
+    // (inout: it carries a1 in), quaternary from r8 (lateout, caller-saved; kernel writes
+    // them in the trap frame before SYSRET).
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -305,7 +306,7 @@ pub unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
             out("rcx") _,
             out("r11") _,
             lateout("rdx") secondary,
-            lateout("rsi") tertiary,
+            inout("rsi") a1 => tertiary,
             lateout("r8")  quaternary,
             options(nostack),
         );

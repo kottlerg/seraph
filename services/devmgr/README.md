@@ -17,20 +17,26 @@ devmgr/
 │                                   #   held interrupt-line table, DMA mapping table and
 │                                   #   IOVA allocator, DMA Remapping table (VT-d units,
 │                                   #   scopes, RMRRs), RISC-V IO Mapping Table (PCI
-│                                   #   IOMMUs, ID mappings)
+│                                   #   IOMMUs, ID mappings), driver-declaration binding
+│                                   #   (PCI identity keys, match ranking, declaration
+│                                   #   bounds), the served-class table, bounded image reads
 ├── src/
 │   ├── main.rs                     # Bootstrap, registry loop, QUERY_* handlers, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, UART/RTC carves, shutdown
 │   │   ├── mod.rs                  # `arch::current` re-export (the only cfg(target_arch) site)
 │   │   ├── x86_64/mod.rs           # IoPort carves (COM1, CMOS, PM1a + 8042); no ECAM default
 │   │   └── riscv64/mod.rs          # QEMU virt windows (ECAM, NS16550, goldfish-RTC); SbiControl
+│   ├── bind.rs                     # Binding PCI records to matching driver declarations;
+│   │                               #   withdrawal of a bound driver
 │   ├── caps.rs                     # Bootstrap-round capability absorbers and DevmgrCaps
+│   ├── decls.rs                    # Driver declarations read from boot modules and the drivers
+│   │                               #   directory
 │   ├── dma.rs                      # DMA endpoint and its thread: per-device DMA caps, map/unmap
 │   ├── iommu.rs                    # IOMMU units, driver spawn, device attach, fail-closed client
 │   ├── pci.rs                      # ECAM configuration-space accessor for the PCI scan
 │   ├── phys.rs                     # Physical-address credential (a memmgr page with `Phys`)
 │   ├── settle.rs                   # Driver death watch; batch settle: ready, deaths, bound
-│   ├── spawn.rs                    # Driver-process spawn helpers (simple-device, virtio-blk, ...)
+│   ├── spawn.rs                    # Driver-process spawn helpers (bound, simple, IOMMU)
 │   └── tables.rs                   # Firmware-table mapping: ECAM discovery, ACPI table lookup
 └── docs/
     ├── responsibilities.md         # Responsibilities, bootstrap capabilities, driver authority

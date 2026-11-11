@@ -1,8 +1,9 @@
 # shared/ipc
 
 Shared IPC helpers for Seraph userspace: the stack-owned `IpcMessage` snapshot type, the
-`ipc_call` / `ipc_recv` / `ipc_reply` wrappers that keep the kernel's per-thread IPC buffer as
-scratch at the syscall boundary, the generic bootstrap protocol, the `RecvGuard`
+`ipc_call` / `ipc_recv` / `ipc_reply` wrappers, with the bounded and try-once forms
+`ipc_call_timeout`, `ipc_recv_timeout`, and `ipc_try_recv`, that keep the kernel's per-thread IPC
+buffer as scratch at the syscall boundary, the generic bootstrap protocol, the `RecvGuard`
 receive-failure policy for blocking receive loops, the per-service IPC label and
 error-code modules, the shared policy tables (`sched_policy`, `published_names`, `log_badges`),
 the `keysym` codes and event packing, the `memmgr_bootstrap`, `device_info_kind`, and
@@ -44,12 +45,13 @@ added, removed, or repurposed, or a payload shape changed. The constants fall in
 Handshake-checked namespaces carry the version in their first-contact handshake, and the receiver
 rejects a mismatch; `devmgr_labels` and `devmgr_dma_labels` instead carry it in `data[0]` of every
 request, which devmgr checks each time, and `iommu_labels` does the same, checked by the IOMMU
-driver. Only `ns_labels` is implicitly covered: its caps descend
+driver, as does `log_labels` for its two query labels, `QUERY_SLOTS` and `QUERY_HISTORY`, checked by
+logd. Only `ns_labels` is implicitly covered: its caps descend
 from the `vfsd_labels::GET_SYSTEM_ROOT_CAP` and `fs_labels::FS_MOUNT` handshakes, so the parent
 channel stands in for the version check. The remaining constants are markers that exist for the bump
-discipline. `STREAM_LABELS_VERSION` and `LOG_LABELS_VERSION` are in practice marker-only: no caller
-issues the `log_labels::GET_LOG_CAP` handshake. Every process that holds a stream cap has it
-pre-installed instead, in `ProcessInfo.log_send_cap` or, for init, derived by init itself. The block
+discipline. `STREAM_LABELS_VERSION` is in practice marker-only: every process that holds a stream
+cap has it pre-installed, in `ProcessInfo.log_send_cap` or, for init, derived by init itself, and no
+caller issues the `log_labels::GET_LOG_CAP` handshake. The block
 comment above the label modules in `src/lib.rs` lists which namespace falls in which category.
 
 ---

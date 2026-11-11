@@ -256,6 +256,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name
 | `devmgr.debug` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| DEBUG_PORT_AUTHORITY`-badged SEND on devmgr's registry endpoint: the debug port (seeded only by the debug-port fixture `debug-echo`, staged by `test-debug-port`, and the GDB stub `gdbstub`, staged by `--debug-target` of `run` and `run-parallel`, and by `test-gdb`) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
+| `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
 
 ## `provides`
 
@@ -316,9 +317,10 @@ drive every restart (`cap[1]` absent, history pull skipped), each relaunched log
 re-attaching a fresh RECV to the same endpoint object every sender already
 targets, with `restart` and `critical` behaving as for any other service;
 design intent; not yet implemented (#262). Today, on a logd death svcmgr's
-death handler blocks in `log!` on the master-log endpoint with no logd
-receiving, so it reaches neither the restart nor the critical
-graceful-shutdown path (per
+death handler makes `log!` calls on the master-log endpoint with no logd
+receiving; each is dropped once its bound expires
+([shared/log](../../../shared/log/README.md)), so the handler reaches the
+restart and the critical graceful-shutdown path late, not never (per
 [restart-protocol.md](restart-protocol.md#supervision-hierarchy)).
 
 ```

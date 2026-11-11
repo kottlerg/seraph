@@ -644,9 +644,10 @@ unsafe fn deliver_once(
     // live); tcb is the current CPU's running thread (this fn's contract); no
     // scheduler or IPC lock is held (# Preconditions). The BlockedOnFault
     // parked-state diverges from a normal call only in the committed
-    // IpcThreadState; the reply linkage is identical.
+    // IpcThreadState; the reply linkage is identical. A fault delivery is
+    // never timed (deadline 0).
     let result = unsafe {
-        crate::ipc::endpoint::endpoint_call(ep_state, tcb, &msg, IpcThreadState::BlockedOnFault)
+        crate::ipc::endpoint::endpoint_call(ep_state, tcb, &msg, IpcThreadState::BlockedOnFault, 0)
     };
 
     if let Ok(woken_handler) = result

@@ -52,8 +52,15 @@ unless it is blocked in an upcall delivery, which drops the upcall and resumes t
 ([fault-handling.md](fault-handling.md#asynchronous-upcalls)), or on the fault of a restartable
 syscall's user copy, which fails that syscall with `InvalidAddress`
 ([fault-handling.md](fault-handling.md#kernel-copies)). A receive refused by those checks
-leaves the binding in place (the mechanism is in
+leaves the binding in place, and so does a try-once receive that finds no caller, so the reply
+is still owed; a try-once receive that finds a caller releases the pending one as it binds the
+new one (the mechanism is in
 [ipc-internals.md](../core/kernel/docs/ipc-internals.md#receive-path-server)).
+
+A call may carry a timeout, which bounds its wait for a receiver and its wait for the reply
+together. A call that times out after a server received it ends that server's binding: the
+server's later reply fails with `InvalidCapability`, and the request may already have been acted
+on ([syscalls.md § `SYS_IPC_CALL`](../core/kernel/docs/syscalls.md#sys_ipc_call-0)).
 
 ### Message Format
 
@@ -246,7 +253,9 @@ Two mechanisms make the condition diagnosable:
   `virtio_core::isr::serve_interrupts`, does, so `EXIT_RECV_WEDGE` also ends a driver whose
   interrupt wait wedged. `Interrupted` receives are exempt — expected during thread stop/start, they
   neither extend nor reset the streak. Non-blocking drain loops (`event_try_recv`) do not use the
-  guard.
+  guard, nor do loops over the other try-once or bounded waits (`ipc_try_recv`,
+  `ipc_recv_timeout`, `notification_try_wait`, `wait_set_wait_timeout`, and the rest), for which
+  `WouldBlock` is an expected outcome, not a failure.
 
 A wedged service supervised by svcmgr under `restart = always` is relaunched with a fresh
 CSpace — bounded self-recovery. Unsupervised processes die loudly instead of spinning.

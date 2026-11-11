@@ -7,8 +7,7 @@ capability delegation, service-endpoint delivery, and driver teardown.
 devmgr's discovery, binding, delegation, and withdrawal are specified in
 [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md).
 TODO: specify a driver's own teardown: how a driver stops its device and releases what it holds
-when it exits on its own, and what devmgr does for a non-`VirtIO` device whose driver is
-withdrawn.
+when it exits on its own.
 
 ---
 
@@ -19,9 +18,13 @@ withdrawn.
 2. A driver is a std binary crate (ruststd) built for the std-userspace Seraph target; see
    [docs/build-system.md](../../../docs/build-system.md#custom-targets) § Custom Targets.
 3. A driver receives its device capabilities from [devmgr](../../devmgr/README.md) at spawn.
-   It MUST NOT assume any capabilities beyond what devmgr delegates.
+   It MUST NOT assume any capabilities beyond what devmgr delegates. A driver devmgr binds to a
+   PCI device carries a declaration in the ELF note section `.note.seraph.driver`
+   (`driver_binding::driver_declaration!`) and receives the resource list of
+   `driver_binding::resources`; [docs/driver-binding.md](../../../docs/driver-binding.md) is the
+   design.
 4. A driver serves client requests on the service endpoint devmgr creates and delivers in its
-   bootstrap round; devmgr keeps the endpoint and mints client SEND caps from its device
+   bootstrap; devmgr keeps the endpoint and mints client SEND caps from its device
    registry (`QUERY_*_DEVICE`). A driver MUST report `DRIVER_READY` on its devmgr query cap once
    its device is set up, immediately before its service loop (`ipc::report_driver_ready`), and
    exit when devmgr refuses the report: devmgr serves its endpoint only after that report, and
@@ -53,15 +56,18 @@ withdrawn.
 ## Withdrawal
 
 devmgr withdraws every driver it does not, or no longer, serves: one that dies, fails its device
-setup, overruns its settle bound, or that devmgr cannot record or serve. For a `VirtIO` PCI driver
-it takes the device from the driver in an order that frees the driver's memory only once the
+setup, overruns its settle bound, or that devmgr cannot record or serve. For a driver bound to a PCI
+device it takes the device from the driver in an order that frees the driver's memory only once the
 device's DMA is confirmed stopped or blocked: it first withdraws the device's DMA capability,
 revoking every copy and dropping the device's mappings, which also blocks the device where an
 IOMMU confines it (the IOMMU driver's `BLOCK`); then it clears the function's Bus Master
 Enable through a configuration-page cap it keeps and no driver holds, so the device issues no
-further DMA; revokes the driver's mappings of its BARs; resets the device through a BAR cap it
-keeps (`device_status` 0, complete once the status reads back 0, bounded by `RESET_TIMEOUT`),
-which drops its pending interrupt; and destroys the driver. Every `VirtIO` driver is created
+further DMA; revokes the driver's mappings of its BARs; sets the function's Command Interrupt
+Disable bit through the same cap; runs the reset the driver's declaration names (the VirtIO status
+reset, `device_status` 0 complete once the status reads back 0 within `RESET_TIMEOUT`, or a PCI
+Express Function Level Reset, complete once the function answers after `FLR_COMPLETION_MS`; or
+none, and a device with none is never confirmed quiet); and destroys the driver. Every driver of
+a DMA declaration is created
 `CREATE_DMA_HOLD`, so procmgr holds its memory after its death, however it died, until devmgr
 releases it, which devmgr does only when the IOMMU blocked the device, or when the Bus Master
 Enable read-back is clear, every BAR copy is revoked and the reset is confirmed; otherwise the

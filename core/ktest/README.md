@@ -301,8 +301,12 @@ polls of `thread::load_balancer_redistributes_skewed`, the exit wait of
 `configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
 `stop_target_vanishes` and `split_delete_race`, the final-delivery polls of `stop_repark`, the
 controller polls of `sleep_list_wide`, the first-fault and death polls of `fault_bind_race`, and the
-delivery probe, keeper wait, delete and exit polls of `irq_route_delete_race`. Every other bound
-applies as written.
+delivery probe, keeper wait, delete and exit polls of `irq_route_delete_race`; the report waits
+of the timed-wait IPC cells (`ipc::recv_try_once_takes_queued_caller`, whose try-once retries
+are scaled too, `ipc::recv_try_once_keeps_reply_binding` and
+`ipc::call_timeout_late_reply_refused`, whose call attempts and server receive and go waits are
+scaled too); and the call timeout, the stopped wait past it, and the report waits of
+`integration::ipc_call_timeout_stop`. Every other bound applies as written.
 
 The boundary runs measure the scaling rather than assume it: they save their logs, and
 `cargo xtask ktest-timing` reports each cell's wall time between its start line and its `PASS` or

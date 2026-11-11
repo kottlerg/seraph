@@ -1409,12 +1409,13 @@ already waiting, in `SYS_IPC_RECV` when the caller is, or in kernel fault delive
 `SYS_IPC_REPLY` claims it by compare-exchange in `endpoint_reply`, before it reads the caller,
 validates the payload, or moves a capability (a failure after the claim wakes the caller with the
 transfer-failed reply), at the
-thread's next `SYS_IPC_RECV` that passes its capability check and cap-slot pre-allocation, which
-releases the unreplied caller, when a stop (`cancel_ipc_block`) or a teardown claims the bound
-caller, when a change of a fault-blocked caller's fault-handler binding claims it
-(`ipc::fault::claim_fault_park`), or when the rendezvous is rolled back because the caller's park or
-rebind commit was refused (`rollback_uncommitted_call` in `endpoint_call`, or the rebind rollback in
-`endpoint_recv`) (see
+thread's next `SYS_IPC_RECV` that passes its capability check and cap-slot pre-allocation and
+either waits or finds a caller (a try-once that finds none leaves the binding), which releases the
+unreplied caller, when a stop (`cancel_ipc_block`) or a teardown claims the bound caller, when a
+timed call's timeout expires (`cancel_for_timeout`), when a change of a fault-blocked caller's
+fault-handler binding claims it (`ipc::fault::claim_fault_park`), or when `endpoint_call` rolls the
+rendezvous back because the caller's park commit was refused (`rollback_uncommitted_call`); a
+refused receive rebind never publishes the binding (see
 [ipc-internals.md](ipc-internals.md) § Call Path (Sender), § Receive Path (Server), and § Reply
 Path, and
 [thread-lifecycle-and-sleep.md § BlockedOnReply Edge — Symmetry Rules](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules)).

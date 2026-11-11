@@ -3920,6 +3920,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     // above), so there is no two-TCB-sched_lock nesting.
                     // SAFETY: bound kept valid by wake_in_flight = 1 above.
                     unsafe {
+                        // The reply_tcb CAS above ended a timed call's
+                        // episode; its sleep-list entry goes first, so no pop
+                        // finds the binding this nulls.
+                        crate::ipc::cancel_timed_entry(bound);
                         let bs = (*bound).sched_lock.lock_raw();
                         if core::ptr::eq((*bound).blocked_on_object, tcb.cast::<u8>())
                         {
@@ -4660,6 +4664,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                             tcb,
                             crate::sched::thread::ParkKind::of_sender(tcb),
                         );
+                        // A timed call's entry ends with its episode.
+                        crate::ipc::cancel_timed_entry(tcb);
                         // Claim for wake under ep.lock (#160). Cleared by
                         // enqueue_and_wake.
                         (*tcb)
@@ -4688,6 +4694,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                             tcb,
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                         );
+                        // A timed receive's entry goes with the waiter.
+                        crate::ipc::cancel_timed_entry(tcb);
                         // Claim for wake under ep.lock (#160). Cleared by
                         // enqueue_and_wake.
                         (*tcb)

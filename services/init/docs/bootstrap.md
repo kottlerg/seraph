@@ -186,7 +186,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     implemented (#262)): `master_log_source`, a `RIGHTS_ALL` derive of init's master log
     endpoint (svcmgr mints real-logd's master-log RECV from it on every
     (re)launch, plus the one-shot `HANDOVER_PULL` SEND on the first
-    launch; see [`log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)), and
+    launch; see [`log_sink`](../../svcmgr/docs/service-definitions.md#log_sink); and the
+    `LOG_QUERY_AUTHORITY` SEND it publishes as `logd.query`), and
     `procmgr_death_auth_source`, a badge-0
     `RIGHTS_EP_SEND_GRANT` derive of procmgr's service endpoint (svcmgr
     mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it for per-sender
@@ -216,7 +217,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   - `devmgr.test` — the same SEND with `TEST_LABEL_AUTHORITY` added,
     gating devmgr's test labels, the `TEST_SPAWN_ORPHAN` /
     `TEST_ORPHAN_RESULT` shim, the `TEST_SPAWN_FAULT_DRIVERS` /
-    `TEST_QUERY_FAULT_DEVICE` shim, the `TEST_SPAWN_DMA_DRIVER` /
+    `TEST_QUERY_FAULT_DEVICE` shim, the
     `TEST_QUERY_DMA_DEVICE` / `TEST_DMA_FAULTS` shim, and
     `TEST_QUERY_DENY_DEVICE` (TODO(#165)); svctest is the only recipe seeding it.
   - `devmgr.debug` — the same SEND with `DEBUG_PORT_AUTHORITY` added, gating
@@ -227,19 +228,24 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   - `vfsd.mount` / `vfsd.deny` — the endowed `MOUNT_AUTHORITY`-badged and
     `DENY_BADGE`-badged SENDs on vfsd's service endpoint, published as
     they arrive; svctest is the only recipe seeding them.
+  - `logd.query` — `LOG_QUERY_AUTHORITY`-badged SEND minted from the
+    endowed master-log source, gating logd's `QUERY_SLOTS` and
+    `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md#queries));
+    svctest is the only recipe seeding it.
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
-    `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
+    `/services/drivers/` at `LOOKUP | READ | READDIR` and hands devmgr the subtree
     cap on a `DRIVERS_DIR_AUTHORITY`-badged copy of the
     devmgr-registry source. Devmgr replies SUCCESS *before* any spawn
-    work, then walks the per-arch RTC name and spawns the driver between
+    work, then lists the directory, reads each entry's driver declaration, binds the PCI
+    devices still unbound, and spawns the per-arch RTC driver between
     its `ipc_reply` and next `ipc_recv` (procmgr `CREATE_FROM_FILE` —
-    the binary lives on the rootfs, not in the boot bundle; see
+    the binaries live on the rootfs, not in the boot bundle; see
     [Driver binary sources](../../../docs/device-management.md#driver-binary-sources)). Best-effort:
     a failure leaves the system without a wallclock — timed degrades to
     `WALL_CLOCK_UNAVAILABLE` (see [timed](../../timed/README.md)).
 
-  All four `devmgr.*` names and both `vfsd.*` names are seed-only: svcmgr's `QUERY_ENDPOINT`
-  refuses them, so each badge reaches only the recipes that seed the name
+  All four `devmgr.*` names, both `vfsd.*` names, and `logd.query` are seed-only: svcmgr's
+  `QUERY_ENDPOINT` refuses them, so each badge reaches only the recipes that seed the name
   ([svcmgr IPC interface § Label 4](../../svcmgr/docs/ipc-interface.md#label-4-query_endpoint)).
 
   `pwrmgr.shutdown`, `pwrmgr.deny`, and `timed` are published by
@@ -364,7 +370,7 @@ enumerates init's side of it.
 | Raw bootstrap | procmgr | memmgr SEND cap, log endpoint SEND, svcmgr service endpoint SEND, boot-module `Memory` caps for downstream `CREATE_PROCESS` |
 | Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Memory caps; cap-less rounds with the physical extent of every Memory cap init holds but the firmware tables' (usable RAM, boot modules, reclaim ranges, init's own segment, stack, and `InitInfo` pages), the RAM memmgr pools now or at init's reap; a full-rights `IoPort` derivation (x86-64) or an `SbiControl` derivation narrowed to Reset and Suspend (RISC-V) via the terminal `SVCMGR_BUNDLE` round, the roots staying with init — the hardware + shutdown authority [devmgr](../../devmgr/docs/responsibilities.md#capabilities-received) brokers to drivers and to pwrmgr |
 | Raw bootstrap | vfsd | Round 1: a full-rights copy of vfsd's own service endpoint and a `REGISTRY_QUERY_AUTHORITY \| BLOCK_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint, the only cap devmgr serves `QUERY_BLOCK_DEVICE` (the whole-disk cap) on; round 2: the fatfs module `Memory` cap. Init keeps a `SEED_AUTHORITY`-badged SEND on vfsd's endpoint for its own `GET_SYSTEM_ROOT_CAP` call. vfsd self-mounts root, so init issues no `MOUNT` and keeps no FS access of its own. |
-| Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — the `CAPS` rounds: full-rights (`RIGHTS_ALL`, incl. RECV) caps on its own service + bootstrap endpoints, a `SEND` on the root filesystem namespace endpoint (svcmgr publishes as `rootfs.root`) and a badge-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, and `devmgr.debug` publish caps and the `SET_DRIVERS_DIR` cap), and a `MOUNT_AUTHORITY`-badged and a `DENY_BADGE`-badged SEND on vfsd's service endpoint (svcmgr publishes as `vfsd.mount` and `vfsd.deny`); then the `SUBSTRATE` rounds: one `(name, thread_cap)` per substrate service for death-supervision binding; terminal round (`LOGD_SOURCES`): a `RIGHTS_ALL` master-log endpoint source and a badge-0 `SEND\|GRANT` procmgr source, both reserved for the system's lifetime so svcmgr can launch and supervise real-logd, minting its master-log RECV, first-launch `HANDOVER_PULL` SEND, and `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap per launch (restart: design intent; not yet implemented, #262), and minting from the procmgr source a `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND\|GRANT` cap per launch. svcmgr publishes all well-known names itself, sends `SET_DRIVERS_DIR` from these sources, and launches real-logd; init publishes nothing and does not talk to devmgr (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)). |
+| Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — the `CAPS` rounds: full-rights (`RIGHTS_ALL`, incl. RECV) caps on its own service + bootstrap endpoints, a `SEND` on the root filesystem namespace endpoint (svcmgr publishes as `rootfs.root`) and a badge-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, and `devmgr.debug` publish caps and the `SET_DRIVERS_DIR` cap), and a `MOUNT_AUTHORITY`-badged and a `DENY_BADGE`-badged SEND on vfsd's service endpoint (svcmgr publishes as `vfsd.mount` and `vfsd.deny`); then the `SUBSTRATE` rounds: one `(name, thread_cap)` per substrate service for death-supervision binding; terminal round (`LOGD_SOURCES`): a `RIGHTS_ALL` master-log endpoint source and a badge-0 `SEND\|GRANT` procmgr source, both reserved for the system's lifetime so svcmgr can launch and supervise real-logd, minting its master-log RECV, first-launch `HANDOVER_PULL` SEND, and `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap per launch (restart: design intent; not yet implemented, #262), minting from the master-log source the `LOG_QUERY_AUTHORITY` SEND it publishes as `logd.query`, and minting from the procmgr source a `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND\|GRANT` cap per launch. svcmgr publishes all well-known names itself, sends `SET_DRIVERS_DIR` from these sources, and launches real-logd; init publishes nothing and does not talk to devmgr (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)). |
 | Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Memory cap it solely owns (ELF segments, user stack, `InitInfo` pages, bootloader/bundle reclaim ranges, AP-trampoline memory cap, boot-module ELF sources) |
 
 ---

@@ -50,16 +50,14 @@ use std::os::seraph::thread::BuilderExt;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use firmware::dma::{
-    Confinement, EDU_ID, ReservedError, ReservedRange, iova_limit, reserved_ranges,
-};
+use firmware::dma::{Confinement, ReservedError, ReservedRange, iova_limit, reserved_ranges};
 use firmware::dmar::{self, Bdf, Resolved};
 use firmware::rimt;
 use iommu_core::Scope;
 use ipc::{IpcMessage, iommu_errors, iommu_labels};
 use syscall_abi::PAGE_SIZE;
 
-use crate::{DeviceCatalog, DriverClass, ServedDriver, ServedDrivers, SpawnedDriver};
+use crate::{DeviceCatalog, ServedDriver, ServedDrivers, Serves, SpawnedDriver};
 use crate::{arch, caps, pci, settle, spawn};
 
 /// The IOMMU family an architecture's platforms carry, which decides the
@@ -935,7 +933,7 @@ fn riscv_round(
         }
     });
     let words = iommu_core::bootstrap::unit_round_words(iommu.segment, false, 1, &scopes)?;
-    let config = crate::carve_function_config("RISC-V IOMMU", dev, caps)?;
+    let config = crate::bind::carve_function_config("RISC-V IOMMU", dev, caps)?;
     let enabled = config.enable_memory_and_bus_master();
     // devmgr needs the function's configuration no further.
     let _ = syscall::cap_delete(config.cap);
@@ -1236,7 +1234,8 @@ fn spawn_and_settle(
         spawn::DriverSpawn::Failed => return Settled::NotStarted,
     };
     let spawned = SpawnedDriver {
-        class: DriverClass::Iommu,
+        name: crate::fixed::IOMMU,
+        serves: Serves::Iommu,
         badge: device_badge,
         driver: ServedDriver {
             ep: client.ep,
@@ -1283,12 +1282,6 @@ fn start_fault_log(client: &Arc<IommuClient>, faults: &Arc<Mutex<FaultCounts>>)
     {
         std::os::seraph::log!("IOMMU fault-log thread not started; faults are logged on request");
     }
-}
-
-/// Whether `pci_dev` is QEMU's `edu` DMA test device.
-pub fn is_edu(pci_dev: &pci::PciDevice) -> bool
-{
-    (pci_dev.vendor_id, pci_dev.device_id) == EDU_ID
 }
 
 /// The requester ID of `pci_dev`.

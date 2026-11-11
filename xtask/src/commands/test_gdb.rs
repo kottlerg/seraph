@@ -100,6 +100,8 @@ const SCRIPT: &[&str] = &[
 pub fn run(ctx: &Context, args: &TestGdbArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
+    // Held until the command returns, after its last QEMU has exited.
+    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let gdb = require_tool(&args.gdb)?;
     let target_staged = ctx
         .sysroot

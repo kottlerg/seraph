@@ -1806,19 +1806,31 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
                 let saved = (*sig).lock.lock_raw();
                 let res = if (*sig).wait_set.is_null()
                 {
-                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
+                    // Publish the observer before waitset_add reads `bits`
+                    // (Dekker add half, pairing with the fence in
+                    // notification_send; core/kernel/docs/scheduling-internals.md
+                    // § Atomic Ordering Invariants). Either the add's readiness
+                    // check sees a concurrent send's bits, or that send sees
+                    // has_observer == 1, waits on sig.lock until this
+                    // registration is complete, and reaches waitset_notify.
+                    (*sig)
+                        .has_observer
+                        .store(1, core::sync::atomic::Ordering::Relaxed);
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                    if let Ok(idx) =
+                        crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
                     {
-                        Ok(idx) =>
-                        {
-                            (*sig).wait_set = ws_state.cast::<u8>();
-                            (*sig).wait_set_member_idx = idx;
-                            (*sig)
-                                .has_observer
-                                .store(1, core::sync::atomic::Ordering::Relaxed);
-                            (*source_header).inc_ref();
-                            Ok(idx)
-                        }
-                        Err(()) => Err(SyscallError::InvalidArgument),
+                        (*sig).wait_set = ws_state.cast::<u8>();
+                        (*sig).wait_set_member_idx = idx;
+                        (*source_header).inc_ref();
+                        Ok(idx)
+                    }
+                    else
+                    {
+                        // No member was installed: has_observer again
+                        // reflects the direct waiters alone.
+                        (*sig).refresh_observer();
+                        Err(SyscallError::InvalidArgument)
                     }
                 }
                 else
@@ -2106,9 +2118,9 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
 /// `SYS_WAIT_SET_ADD` time is returned in the secondary return register
 /// (rdx on x86-64, a1 on RISC-V). The caller then reads from the identified
 /// source normally. A stop of the caller, or the destruction of the wait set
-/// while the caller is parked, returns `Interrupted`. A wait set takes one
-/// waiter: a wait while another thread waits on the set returns `InvalidState`
-/// at once.
+/// while the caller is parked, returns `Interrupted`. Any number of threads
+/// may wait on one set; they queue in arrival order, and each readiness
+/// notification wakes the longest-waiting one.
 #[cfg(not(test))]
 pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -2144,21 +2156,11 @@ pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: ws_state valid; scheduler lock not held.
     let result = unsafe { crate::ipc::wait_set::waitset_wait(ws_state, tcb) };
 
-    match result
+    if let Some(badge) = result
     {
-        Ok(badge) =>
-        {
-            // A source was already ready; return its badge.
-            tf.set_ipc_return(0, badge);
-            return Ok(0);
-        }
-        // Another thread waits on this set; this caller never parked.
-        Err(crate::ipc::wait_set::WaitSetPending::Occupied) =>
-        {
-            return Err(SyscallError::InvalidState);
-        }
-        Err(crate::ipc::wait_set::WaitSetPending::Parked) =>
-        {}
+        // A source was already ready; return its badge.
+        tf.set_ipc_return(0, badge);
+        return Ok(0);
     }
 
     // Release the wait-set pin before parking (the pin-before-park rule of

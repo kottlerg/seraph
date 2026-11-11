@@ -13,7 +13,8 @@
 //! open, and the rulings in force. Every change also appends one timestamped
 //! line to the batch's log beside it, so the log is a by-product of the
 //! changes. `orch state` prints the state as text short enough for a hook to
-//! put into a session's context.
+//! put into a session's context. The exclusive grant is also written to the
+//! host lock (`crate::host_lock`), which refuses every boot not under it.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -28,6 +29,7 @@ use crate::cli::{
     OrchArgs, OrchCommand, OrchGrantCommand, OrchQuestionCommand, OrchRulingCommand, OrchWorkerArgs,
 };
 use crate::context::Context as BuildContext;
+use crate::host_lock;
 use crate::util::step;
 
 const STATE_FILE: &str = "state.json";
@@ -893,16 +895,37 @@ pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
         OrchCommand::End =>
         {
             let kept = end(&dir, secs)?;
+            // A grant the batch left outstanding would refuse every boot.
+            host_lock::clear_grant(&host_lock::lock_dir(ctx))?;
             step(&format!("Ended the batch; its state is {}", kept.display()));
         }
         OrchCommand::Orchestrator { id: None } => println!("{}", orchestrator_id(&load(&dir)?)?),
         command =>
         {
-            let line = change(&dir, &state_change(command)?, secs)?;
+            let change_asked = state_change(command)?;
+            let line = change(&dir, &change_asked, secs)?;
+            apply_to_host(ctx, &change_asked)?;
             println!("{line}");
         }
     }
     Ok(())
+}
+
+/// Carry a change of the exclusive grant to the host lock, whose boots it
+/// admits (`crate::host_lock`): `grant set` records the holder there, and
+/// `grant clear` removes it.
+fn apply_to_host(ctx: &BuildContext, change: &Change) -> Result<()>
+{
+    match change
+    {
+        Change::GrantSet { holder, commands } =>
+        {
+            let holder = one_line("the grant's holder", holder)?;
+            host_lock::write_grant(&host_lock::lock_dir(ctx), &holder, commands)
+        }
+        Change::GrantClear => host_lock::clear_grant(&host_lock::lock_dir(ctx)),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]

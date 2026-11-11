@@ -26,6 +26,7 @@ xtask/
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
+│   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
@@ -39,7 +40,7 @@ xtask/
 │   │                           #   test, test_crash_report, test_debug_port, test_gdb, test_kaslr,
 │   │                           #   test_logd_reclaim, test_map_redo, test_terminal,
 │   │                           #   test_vmgenid, lint_docs, pr_check, review, issue, orch,
-│   │                           #   hook)
+│   │                           #   hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -1119,17 +1120,30 @@ appends a line for an event that changes no state.
 | `state` | Prints the state as text: goal, log, orchestrator, grant and queue, each worker, merge order, open questions, rulings. It warns on stderr when the text passes 10,000 bytes, which keeps it within the 10,000 characters a hook may add to a session's context; `worker --remove` and `question close` shorten it. `--json` prints the stored file. |
 | `orchestrator` | Records the agent id workers report to. Without an id, prints the recorded one and changes nothing. |
 | `worker` | Sets the named fields of a worker, creating the worker when it is new, and with `--status` the time of that report, which `state` prints beside it; fields it does not name keep their value. A phase is one of `planning`, `coding`, `review`, `gate`, `merged`, `retired`, `dead`. `--remove` drops the worker. |
-| `grant set` | Records the exclusive grant and takes its holder out of the queue. Refuses while a grant is outstanding. |
-| `grant clear` | Ends the grant. |
+| `grant set` | Records the exclusive grant and takes its holder out of the queue, and writes the grant to the host lock, where every boot not under it is refused ([Host launch rules](#host-launch-rules)). Refuses while a grant is outstanding. |
+| `grant clear` | Ends the grant, in the state and in the host lock. |
 | `grant queue`, `grant unqueue` | Add or drop a request for the grant; a holder has at most one. |
 | `order` | Replaces the merge order; no argument clears it. |
 | `question add`, `question close` | Record a question the maintainer has open, with the file that holds its detail, or close it. An id is open at most once. |
 | `ruling add`, `ruling drop` | Record a ruling in force, or drop one by the number `state` prints. |
-| `end` | Logs the end and renames the state to `<date>.state.json` (`<date>-<n>.state.json` when that name is taken), so the next `start` begins clean. |
+| `end` | Logs the end, removes any grant from the host lock, and renames the state to `<date>.state.json` (`<date>-<n>.state.json` when that name is taken), so the next `start` begins clean. |
 
 Every stored field is one line of at most 300 characters; longer detail belongs in a file the
 field names. Text arguments take the rest of the command line, flags included, so a grant's
 command list needs no quoting.
+
+### `cargo xtask host`
+
+Print the shared host's state as the launch rules read it ([Host launch rules](#host-launch-rules)).
+
+```
+cargo xtask host status
+```
+
+It prints the lock directory, the 1-minute load average beside each limit, the exclusive grant's
+holder, each live holder (its pid, QEMU count and vCPUs, whether it runs alone or measures
+timing, its checkout and command line), and the vCPU count of each QEMU running. It changes
+nothing and removes no record.
 
 ### `cargo xtask hook`
 
@@ -1170,6 +1184,60 @@ with success: an event it cannot read, and a check it cannot make, is let throug
 on stderr. The harness reads a hook's exit code 2 as a refusal, and a checkout whose `xtask`
 has no `hook` command exits with that code, so `.claude/settings.json` writes each command as
 `cargo xtask hook <event> || true`.
+
+---
+
+## Host launch rules
+
+The worktrees of one checkout share one host. The commands that load it apply its launch rules
+themselves, from `src/host_lock.rs`, before they start: `build` and `clean` as builds; `run`,
+`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-logd-reclaim` (when it
+boots), `test-map-redo`, `test-debug-port` and `test-gdb` as boots.
+
+A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 2 side by
+side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
+to itself, and so does a boot started with `--alone` or `--timing`.
+
+| Command | Admitted when | Load limit (1-minute average, below) |
+|---|---|---|
+| Build | No `--timing` boot runs | 32 (`BUILD_LOAD_MAX`) |
+| Small boot | No boot that needs the host to itself runs, no QEMU of more than 4 vCPUs runs, and the QEMUs running plus its own are at most 2 (`SMALL_BOOTS_MAX`) | 16 (`SMALL_BOOT_LOAD_MAX`) |
+| Small boot, `--alone` | No QEMU runs | 16 (`SMALL_BOOT_LOAD_MAX`) |
+| More than 4 vCPUs (`SMALL_BOOT_VCPUS_MAX`), more than 2 QEMUs, or `--timing` | No QEMU runs | 10 (`LARGE_BOOT_LOAD_MAX`) |
+
+While a boot that needs the host to itself runs, every other boot is refused, and while a
+`--timing` boot runs, every build is too. The QEMUs running are counted two ways, and the
+larger count holds: from the holder records below, and on Linux from `/proc`, by the whole
+program name `qemu-system-*` and its `-smp` value, so a QEMU no `xtask` command started counts
+too. A refusal names what is in the way: the holder, the count, or the load read and its limit.
+
+The lock lives in `seraph-host/` in the checkout's git common directory, which every worktree
+shares (in `target/xtask/host/` outside a git checkout):
+
+- `admission.lock`: held for the length of one admission. Two commands started at the same
+  moment decide one after the other, and the second sees the first's record.
+- `holders/<pid>-<nanos>.json`: one record per admitted boot, held under a file lock by the
+  command and by every QEMU it starts, which inherits the descriptor. A record whose lock can be
+  taken belongs to no live process, and the next admission removes it, so a killed command
+  leaves nothing to clean up, and its QEMUs keep the host held while they run.
+- `grant.json`: the exclusive grant. `cargo xtask orch grant set` writes it, `orch grant clear`
+  and `orch end` remove it. While it exists, a boot is refused unless it passes `--grant
+  <holder>` naming its holder, and the holder's boots still meet the rules above. Builds are not
+  affected.
+
+The options:
+
+| Option | Commands | Effect |
+|---|---|---|
+| `--wait-host <SECS>` | Builds and boots | On a refusal, ask again every 10 s until admitted, for at most SECS; at the bound, fail with the last refusal. Without it a refusal fails at once. |
+| `--host-override` | Builds and boots | Start even when the rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers its record, so other commands see it. |
+| `--alone` | Boots | Run beside no other QEMU, and keep every other boot off the host: a run [docs/testing.md](../docs/testing.md) § Coverage tiers owes. |
+| `--timing` | Boots | A timing-sensitive measurement: beside no other QEMU, under the 10 load limit, with builds refused while it runs. |
+| `--grant <HOLDER>` | Boots | Boot under the exclusive grant of HOLDER. |
+
+The load is the host's `getloadavg` (`/proc/loadavg` on Linux); a host that reports none is not
+refused on it. On a GitHub Actions runner (`GITHUB_ACTIONS=true`) the checks are skipped with one
+printed line: each CI job is its own host.
 
 ---
 

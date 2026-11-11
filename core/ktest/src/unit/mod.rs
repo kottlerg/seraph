@@ -421,10 +421,22 @@ pub fn run_all(ctx: &TestContext)
         "wait_set::add_queue_immediate",
         wait_set::add_queue_immediate(ctx)
     );
+    run_test!(
+        "wait_set::busy_member_does_not_crowd_out",
+        wait_set::busy_member_does_not_crowd_out(ctx)
+    );
+    run_test!(
+        "wait_set::backlog_served_beside_arrivals",
+        wait_set::backlog_served_beside_arrivals(ctx)
+    );
+    run_test!(
+        "wait_set::woken_member_stays_queued",
+        wait_set::woken_member_stays_queued(ctx)
+    );
     run_test!("wait_set::blocking_wait", wait_set::blocking_wait(ctx));
     run_test!(
-        "wait_set::occupied_wait_refused",
-        wait_set::occupied_wait_refused(ctx)
+        "wait_set::shared_set_waiters",
+        wait_set::shared_set_waiters(ctx)
     );
     run_test!(
         "wait_set::stale_endpoint_entry_skipped",

@@ -40,6 +40,8 @@ const BOOT_MARKER: &[u8] = b"[--------] boot:";
 pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
+    // Held until the command returns, after its last QEMU has exited.
+    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
 
     if args.gdb
     {

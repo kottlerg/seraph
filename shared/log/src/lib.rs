@@ -23,7 +23,7 @@
 //!
 //! The user-facing macro lives in the std overlay (it needs thread-
 //! local IPC-buffer access) and reaches [`emit`], or [`emit_record`] for a
-//! line with fields; std is the crate's only consumer
+//! line with fields; std and svctest are the crate's consumers
 //! (`shared/log/README.md`).
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
@@ -38,7 +38,7 @@ extern crate rustc_std_workspace_core as core;
 #[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ipc::{
     IpcMessage,
@@ -48,7 +48,7 @@ use ipc::{
         STREAM_BYTES, STREAM_RECORD, STREAM_REGISTER_NAME,
     },
 };
-use syscall_abi::MSG_DATA_WORDS_MAX;
+use syscall_abi::{MSG_DATA_WORDS_MAX, SyscallError};
 
 /// Maximum bytes per `STREAM_BYTES` chunk. Lines longer than this are
 /// chunked across multiple `ipc_call`s; the receiver concatenates per-call
@@ -59,6 +59,70 @@ pub const CHUNK_SIZE: usize = MSG_DATA_WORDS_MAX * 8;
 /// formatted message longer than this is sent in several chunks as the
 /// buffer fills, so the size bounds the stack cost, not the message.
 const STACK_BUF_LEN: usize = CHUNK_SIZE;
+
+/// The bound, in milliseconds, on a log call (`ipc::ipc_call_timeout`) while
+/// the log receiver answers: a call it does not answer in time fails with
+/// `WouldBlock`, and its line is dropped, so a receiver that is wedged, or
+/// stopped while holding the endpoint, stalls a sender for this long once
+/// rather than for good (docs/limits.md § Shared IPC and protocol crates).
+/// Long enough that a receiver merely slowed by load still takes every line.
+pub const LOG_CALL_TIMEOUT_MS: u32 = 5000;
+
+/// The bound, in milliseconds, on each later log call of the process once
+/// one has timed out, until a call is answered again ([`RECEIVER_UNANSWERED`]):
+/// what a sender pays per line while the log receiver stays wedged.
+pub const LOG_CALL_UNANSWERED_TIMEOUT_MS: u32 = 10;
+
+/// Whether the log receiver has left a log call of this process unanswered:
+/// set when a call times out (`WouldBlock`), cleared when a call is answered,
+/// and left as it is by any other failure, which says nothing of the
+/// receiver ([`unanswered_after`]). While set, log calls are bounded by
+/// [`LOG_CALL_UNANSWERED_TIMEOUT_MS`] instead of [`LOG_CALL_TIMEOUT_MS`]
+/// ([`call_bound`]). Process-wide because every thread of a process logs on
+/// the same badged endpoint, so one thread's timeout says the receiver is
+/// answering none of them.
+static RECEIVER_UNANSWERED: AtomicBool = AtomicBool::new(false);
+
+/// The bound on a log call while [`RECEIVER_UNANSWERED`] reads `unanswered`.
+fn call_bound(unanswered: bool) -> u32
+{
+    if unanswered
+    {
+        LOG_CALL_UNANSWERED_TIMEOUT_MS
+    }
+    else
+    {
+        LOG_CALL_TIMEOUT_MS
+    }
+}
+
+/// [`RECEIVER_UNANSWERED`] after a log call with `outcome`, from `unanswered`
+/// before it: cleared by an answer, set by a timeout, kept by any other error.
+fn unanswered_after<T>(unanswered: bool, outcome: &Result<T, i64>) -> bool
+{
+    match outcome
+    {
+        Ok(_) => false,
+        Err(code) if *code == SyscallError::WouldBlock as i64 => true,
+        Err(_) => unanswered,
+    }
+}
+
+/// One log call of `msg` on `cap`, bounded as [`RECEIVER_UNANSWERED`]
+/// selects, which it then updates from the outcome. `true` when the call was
+/// answered.
+///
+/// # Safety
+/// `ipc_buf` must be this thread's registered IPC buffer page (the contract
+/// of `ipc::ipc_call`).
+unsafe fn log_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> bool
+{
+    let unanswered = RECEIVER_UNANSWERED.load(Ordering::Relaxed);
+    // SAFETY: the caller's contract covers `ipc_buf`.
+    let outcome = unsafe { ipc::ipc_call_timeout(cap, msg, ipc_buf, call_bound(unanswered)) };
+    RECEIVER_UNANSWERED.store(unanswered_after(unanswered, &outcome), Ordering::Relaxed);
+    outcome.is_ok()
+}
 
 // ── Process-global cap cache ────────────────────────────────────────────────
 
@@ -167,7 +231,8 @@ fn labelled(id: u64, len: usize, level: u64) -> u64
 /// payload exceeds [`CHUNK_SIZE`]; the receiver concatenates per-call bytes
 /// in order, and a line takes the level of the chunk carrying its first byte.
 /// Silently drops on a zero `cap`, null `ipc_buf`, empty `bytes`, or
-/// mid-chunk IPC failure.
+/// mid-chunk IPC failure, a call the receiver leaves unanswered for
+/// its bound ([`LOG_CALL_TIMEOUT_MS`]) among them.
 ///
 /// # Safety
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
@@ -200,7 +265,7 @@ unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8]) -> b
             .build();
         // SAFETY: ipc_buf is non-null (checked above), so the caller's
         // contract makes it this thread's registered IPC buffer page.
-        if unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }.is_err()
+        if !unsafe { log_call(cap, &msg, ipc_buf) }
         {
             return false;
         }
@@ -212,8 +277,9 @@ unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8]) -> b
 /// Send `record`, a record's payload (`ipc::log_record`), at `level` as one
 /// `STREAM_RECORD` message on `cap`. A record fits one message, so nothing
 /// is split. Silently drops on a zero `cap`, a null `ipc_buf`, or an IPC
-/// failure; the receiver's reply, `RECORD_REJECTED` for a payload that is
-/// not a record, is not reported.
+/// failure (a call unanswered within its bound ([`LOG_CALL_TIMEOUT_MS`]) among them); the
+/// receiver's reply, `RECORD_REJECTED` for a payload that is not a record, is
+/// not reported.
 ///
 /// # Safety
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
@@ -231,7 +297,7 @@ pub unsafe fn write_record(cap: u64, ipc_buf: *mut u64, level: u64, record: &[u8
         .build();
     // SAFETY: ipc_buf is non-null (checked above), so the caller's contract
     // makes it this thread's registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
+    let _ = unsafe { log_call(cap, &msg, ipc_buf) };
 }
 
 /// The record of `message` and `fields`, each field's value formatted with
@@ -272,7 +338,7 @@ pub unsafe fn register_name(cap: u64, ipc_buf: *mut u64, name: &[u8])
     let msg = IpcMessage::builder(label).bytes(0, &name[..len]).build();
     // SAFETY: ipc_buf is non-null (checked above), so the caller's contract
     // makes it this thread's registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
+    let _ = unsafe { log_call(cap, &msg, ipc_buf) };
 }
 
 /// Format `args` followed by a newline and emit it at `level` through
@@ -418,6 +484,27 @@ mod tests
         assert_eq!(rec.message(), b"child 3 exiting");
         let fields: Vec<(&[u8], &[u8])> = rec.fields().map(|f| (f.key, f.value)).collect();
         assert_eq!(fields, [(&b"code"[..], &b"23"[..]), (b"name", b"a b=c")]);
+    }
+
+    #[test]
+    fn a_timeout_shortens_later_log_calls_until_one_is_answered()
+    {
+        let timeout: Result<(), i64> = Err(SyscallError::WouldBlock as i64);
+        let other: Result<(), i64> = Err(SyscallError::InvalidCapability as i64);
+        let answered: Result<(), i64> = Ok(());
+
+        assert_eq!(call_bound(false), LOG_CALL_TIMEOUT_MS);
+        assert_eq!(call_bound(true), LOG_CALL_UNANSWERED_TIMEOUT_MS);
+
+        // A timeout sets the flag, from either state.
+        assert!(unanswered_after(false, &timeout));
+        assert!(unanswered_after(true, &timeout));
+        // An answer clears it, from either state.
+        assert!(!unanswered_after(true, &answered));
+        assert!(!unanswered_after(false, &answered));
+        // Any other failure leaves it as it was.
+        assert!(unanswered_after(true, &other));
+        assert!(!unanswered_after(false, &other));
     }
 
     #[test]

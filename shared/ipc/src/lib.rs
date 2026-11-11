@@ -4097,12 +4097,40 @@ impl IpcMessageBuilder
 #[inline]
 pub unsafe fn ipc_call(ep: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
+    // SAFETY: this fn's contract is ipc_call_timeout's.
+    unsafe { ipc_call_timeout(ep, msg, ipc_buf, 0) }
+}
+
+/// [`ipc_call`] bounded by `timeout_ms` milliseconds over the whole call: the
+/// wait for a receiver and the wait for its reply. `0` waits without bound,
+/// as [`ipc_call`] does.
+///
+/// # Safety
+/// As [`ipc_call`].
+///
+/// # Errors
+/// As [`ipc_call`], and `WouldBlock` when the timeout expired first. The
+/// request may then have been received: a server that replies after the
+/// expiry finds no pending caller.
+#[inline]
+pub unsafe fn ipc_call_timeout(
+    ep: u64,
+    msg: &IpcMessage,
+    ipc_buf: *mut u64,
+    timeout_ms: u32,
+) -> Result<IpcMessage, i64>
+{
     // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
     unsafe {
         msg.write_to_ipc_buf(ipc_buf);
     }
-    let (reply_label, reply_word_count) =
-        syscall::raw_ipc_call(ep, msg.label, msg.word_count(), msg.caps().len())?;
+    let (reply_label, reply_word_count) = syscall::raw_ipc_call_timeout(
+        ep,
+        msg.label,
+        msg.word_count(),
+        msg.caps().len(),
+        timeout_ms,
+    )?;
     // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote the
     // reply (data + cap metadata) into it before return. `reply_word_count`
     // is already clamped to MSG_DATA_WORDS_MAX by `raw_ipc_call`.
@@ -4145,11 +4173,49 @@ pub unsafe fn ipc_call(ep: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 #[inline]
 pub unsafe fn ipc_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
-    let (label, badge, word_count) = syscall::raw_ipc_recv(ep)?;
+    // SAFETY: this fn's contract is ipc_recv_timeout's.
+    unsafe { ipc_recv_timeout(ep, ipc_buf, 0) }
+}
+
+/// [`ipc_recv`] under `SYS_IPC_RECV`'s `timeout_ms` policy: `0` waits without
+/// bound (as [`ipc_recv`]), `u64::MAX` (`syscall::WAIT_TRY_ONCE`) never
+/// waits ([`ipc_try_recv`]), and any other value waits up to `timeout_ms`
+/// milliseconds. A try-once that finds no caller keeps a reply still pending
+/// from an earlier receive; one that finds a caller releases it as
+/// [`ipc_recv`] does.
+///
+/// # Safety
+/// As [`ipc_recv`].
+///
+/// # Errors
+/// As [`ipc_recv`], and `WouldBlock` on an empty try-once or an expiry.
+#[inline]
+pub unsafe fn ipc_recv_timeout(
+    ep: u64,
+    ipc_buf: *mut u64,
+    timeout_ms: u64,
+) -> Result<IpcMessage, i64>
+{
+    let (label, badge, word_count) = syscall::raw_ipc_recv_timeout(ep, timeout_ms)?;
     // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote data +
     // cap metadata there before return. `word_count` is already clamped to
-    // MSG_DATA_WORDS_MAX by `raw_ipc_recv`.
+    // MSG_DATA_WORDS_MAX by `raw_ipc_recv_timeout`.
     Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, label, badge, word_count) })
+}
+
+/// Receive a call already waiting on `ep` without blocking
+/// ([`ipc_recv_timeout`] with `syscall::WAIT_TRY_ONCE`).
+///
+/// # Safety
+/// As [`ipc_recv`].
+///
+/// # Errors
+/// As [`ipc_recv`], and `WouldBlock` when no caller is waiting.
+#[inline]
+pub unsafe fn ipc_try_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
+{
+    // SAFETY: this fn's contract is ipc_recv_timeout's.
+    unsafe { ipc_recv_timeout(ep, ipc_buf, syscall::WAIT_TRY_ONCE) }
 }
 
 /// Reply to the current thread's pending caller with `msg`.

@@ -2095,16 +2095,18 @@ pub fn sleep_wakeups_quiesce()
 /// claims them after releasing it.
 ///
 /// A popped entry is a plain sleeper (`ipc_state == None`), claimed at the
-/// pop, or a timed notification / event-queue waiter, which the timer
+/// pop; a timed notification / event-queue waiter, which the timer
 /// arbitrates against the source's other wakers under the source lock: it
-/// claims only while the thread is still queued there in the popped park.
-/// Every other waiter claimer removes the entry under that source lock, so no
-/// other binding can be popped (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep
+/// claims only while the thread is still queued there in the popped park; or
+/// a timed endpoint call or receive or wait-set wait, which it expires as a
+/// cancel of the popped park (`syscall::thread::cancel_for_timeout`).
+/// Every other claimer of a listed park removes its entry, so no other
+/// binding can be popped (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep
 /// List Invariants).
 // too_many_lines: flat dispatch over every claimable `IpcThreadState`
-// (notification, event queue, plain sleep); each arm is independent and
-// short, and splitting would require duplicating the batch snapshot
-// plumbing.
+// (notification, event queue, the timed-cancel parks, plain sleep); each arm
+// is independent and short, and splitting would require duplicating the
+// batch snapshot plumbing.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sleep_check_wakeups()
@@ -2158,6 +2160,10 @@ pub fn sleep_check_wakeups()
                         ipc_state,
                         thread::IpcThreadState::BlockedOnNotification
                             | thread::IpcThreadState::BlockedOnEventQueue
+                            | thread::IpcThreadState::BlockedOnSend
+                            | thread::IpcThreadState::BlockedOnRecv
+                            | thread::IpcThreadState::BlockedOnReply
+                            | thread::IpcThreadState::BlockedOnWaitSet
                     ) && !blocked_on.is_null()),
                 "sleep_check_wakeups: tid={} popped with binding {:?}/{:p}",
                 (*tcb).thread_id,
@@ -2179,10 +2185,12 @@ pub fn sleep_check_wakeups()
             }
             // The pop consumes the deadline with the entry, so a
             // sleep_list_remove racing this claim sees 0 and leaves the
-            // episode to the timer.
+            // episode to the timer. Release: a reply rebind that reads this 0
+            // writes the binding pair without SLEEP_LIST_LOCK, after the
+            // snapshot above.
             (*tcb)
                 .sleep_deadline
-                .store(0, core::sync::atomic::Ordering::Relaxed);
+                .store(0, core::sync::atomic::Ordering::Release);
             (*tcb).sleep_expiry = thread::SleepExpiry {
                 next: core::ptr::null_mut(),
                 ipc_state,
@@ -2333,10 +2341,25 @@ pub fn sleep_check_wakeups()
             // dealloc(tcb) is gated and tcb stays valid until enqueue_and_wake.
             crate::sched::thread::IpcThreadState::None => true,
 
-            // No other binding is ever listed (asserted at pop): the parks that
-            // arm a timeout are the three above, and every claimer of their
-            // source removes the entry under the source lock. Never claim
-            // here: no wake_in_flight pin and no source lock arbitrates such a
+            // A timed endpoint call or receive, or a timed wait-set wait:
+            // expired as a cancel of the popped park (or, for a call, of its
+            // episode), which reaches the source or the server only through
+            // the binding it re-reads under tcb's sched_lock, so it holds no
+            // pop-time source pointer; on a win it sets wake_in_flight inside
+            // the claim, for the wake below.
+            crate::sched::thread::IpcThreadState::BlockedOnSend
+            | crate::sched::thread::IpcThreadState::BlockedOnRecv
+            | crate::sched::thread::IpcThreadState::BlockedOnReply
+            | crate::sched::thread::IpcThreadState::BlockedOnWaitSet =>
+            {
+                // SAFETY: tcb is kept alive by the dispatch sequence; no lock
+                // held.
+                unsafe { crate::syscall::thread::cancel_for_timeout(tcb, ipc_state, park_seq) }
+            }
+
+            // No other binding is ever listed (asserted at pop): every claimer
+            // of a listed park removes its entry. Never claim here: no
+            // wake_in_flight pin and no source lock arbitrates such a
             // binding, so a claim could race its real waker.
             _ => false,
         };
@@ -4321,9 +4344,13 @@ pub unsafe fn commit_blocked_under_local_lock(
                     (*tcb).state = thread::ThreadState::Blocked;
                     (*tcb).ipc_state = ipc;
                     (*tcb).blocked_on_object = blocked_on;
-                    (*tcb)
-                        .park_seq
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // The next even value: a new park, and a new call
+                    // episode (`thread::call_episode`), whichever it follows.
+                    let seq = (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed);
+                    (*tcb).park_seq.store(
+                        (seq | 1).wrapping_add(1),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
                     // Diagnostic stamp for the owed-wake detector; written
                     // under sched_lock like the rest of the Scheduling group.
                     (*tcb).park_started_tick = crate::arch::current::timer::current_tick();
@@ -4380,25 +4407,41 @@ pub unsafe fn commit_blocked_under_local_lock(
 /// leaving a dangling binding that later fires against the freed/reused slot
 /// (#289 use-after-free / double-enqueue; #284 TCB-field corruption).
 ///
-/// Returns `true` if the rebind committed (caller still `Blocked`); `false` if a
-/// concurrent stop/exit already won, in which case this function has retired
-/// the sender's stale `BlockedOnSend` binding under its `sched_lock` (no
-/// endpoint teardown reaches a dequeued sender to null it) and the caller MUST
-/// tear down the
-/// reply binding it published: CAS the server's `reply_tcb` from the caller back
-/// to null and, on a win, stamp the cancelled deposit (`stamp_cancelled_deposit`:
-/// INTERRUPTED, or KILL for a fault sender) before clearing the caller's
-/// `wake_in_flight`; then skip this dead sender.
+/// The rebind also publishes the reply binding, inside the same `sched_lock`
+/// hold: it swaps `tcb` into the server's `reply_tcb` and returns the binding it
+/// displaced (null when the slot was empty), whose episode the swap claimed and
+/// whose release the caller owes (`endpoint::release_displaced_caller`). So a
+/// receive releases an unreplied caller only once it has bound the next one,
+/// and a refused rebind leaves the server's binding untouched.
+///
+/// Returns `Some(displaced)` if the rebind committed (caller still `Blocked`);
+/// `None` if a concurrent stop/exit already won, in which case nothing was
+/// published, this function has removed a timed call's sleep-list entry and
+/// then retired the sender's stale `BlockedOnSend` binding under its
+/// `sched_lock` (no endpoint teardown reaches a dequeued sender to null it),
+/// and the caller, whose send-queue dequeue claimed the episode, MUST stamp
+/// the cancelled deposit (`stamp_cancelled_deposit`: INTERRUPTED, or KILL for
+/// a fault sender) and clear the caller's `wake_in_flight`; then skip this
+/// dead sender.
+///
+/// The rebind sets `park_seq`'s low bit rather than starting a new even value,
+/// so the reply park stays in the send park's call episode
+/// (`thread::call_episode`), which a timed call's expiry claims. A timed
+/// caller stays on the sleep list across the rebind, so its binding pair is
+/// written under `SLEEP_LIST_LOCK`, which the timer pop snapshots it under
+/// (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants,
+/// invariant 6).
 ///
 /// # Safety
-/// `tcb` must be a valid, send-queue-dequeued `Blocked` TCB; `blocked_on` must be
-/// the replying server's TCB pointer.
+/// `tcb` must be a valid, send-queue-dequeued `Blocked` TCB whose
+/// `wake_in_flight` the caller set; `server` must be the replying server's
+/// valid TCB, the running thread.
 #[cfg(not(test))]
 pub unsafe fn commit_reply_rebind_under_local_lock(
     tcb: *mut ThreadControlBlock,
     ipc: thread::IpcThreadState,
-    blocked_on: *mut u8,
-) -> bool
+    server: *mut ThreadControlBlock,
+) -> Option<*mut ThreadControlBlock>
 {
     // SAFETY: tcb validated by caller; `sched_lock` serializes the Scheduling
     // field group. lock_raw paired with unlock_raw below.
@@ -4410,15 +4453,50 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
         thread::ThreadState::Blocked =>
         {
             // SAFETY: under sched_lock; cross-CPU stop/dealloc writers serialise
-            // here on this same per-TCB lock.
+            // here on this same per-TCB lock. server is the running thread.
             unsafe {
+                debug_assert!(
+                    (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) & 1 == 0,
+                    "reply rebind of a park that was already rebound"
+                );
+                // The swap publishes the binding (Release: the caller's
+                // wake_in_flight pin, set before this call, is visible to any
+                // claimant that Acquires reply_tcb) and claims the binding it
+                // displaces.
+                let displaced = (*server)
+                    .reply_tcb
+                    .swap(tcb, core::sync::atomic::Ordering::AcqRel);
+                // A timed call stays listed across the rebind, and the timer
+                // pop reads this pair under SLEEP_LIST_LOCK alone, so a listed
+                // caller's pair is written under it too (a leaf under
+                // sched_lock). The deadline is stable here but for the pop's
+                // clear: the caller was armed under ep.lock, which the dequeue
+                // holds. A zero read is an untimed call or one the pop already
+                // consumed; the Acquire pairs with the pop's Release clear,
+                // ordering its snapshot before these writes.
+                let listed = (*tcb)
+                    .sleep_deadline
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    != 0;
+                let sleep_saved = if listed
+                {
+                    Some(SLEEP_LIST_LOCK.lock_raw())
+                }
+                else
+                {
+                    None
+                };
                 (*tcb).ipc_state = ipc;
-                (*tcb).blocked_on_object = blocked_on;
+                (*tcb).blocked_on_object = server.cast::<u8>();
+                if let Some(s) = sleep_saved
+                {
+                    SLEEP_LIST_LOCK.unlock_raw(s);
+                }
                 (*tcb)
                     .park_seq
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    .fetch_or(1, core::sync::atomic::Ordering::Relaxed);
+                Some(displaced)
             }
-            true
         }
         // A stop or teardown won: the sender is dequeued, so its
         // `BlockedOnSend` binding to the endpoint no longer names a queue that
@@ -4430,16 +4508,20 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
         // drain pass `ipc::lock_bound_source`'s re-read against a freed endpoint.
         thread::ThreadState::Stopped | thread::ThreadState::Exited =>
         {
-            // SAFETY: under sched_lock, the pair's serializer.
+            // SAFETY: under sched_lock, the pair's serializer; SLEEP_LIST_LOCK
+            // nests under it as a leaf.
             unsafe {
+                // A timed call's entry goes before its binding, so no pop
+                // finds the retired binding and takes it for a plain sleep.
+                crate::ipc::cancel_timed_entry(tcb);
                 (*tcb).ipc_state = thread::IpcThreadState::None;
                 (*tcb).blocked_on_object = core::ptr::null_mut();
             }
-            false
+            None
         }
         thread::ThreadState::Running
         | thread::ThreadState::Ready
-        | thread::ThreadState::Created => false,
+        | thread::ThreadState::Created => None,
     };
 
     // SAFETY: paired with lock_raw above.
@@ -4452,10 +4534,10 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 pub unsafe fn commit_reply_rebind_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
-    _blocked_on: *mut u8,
-) -> bool
+    _server: *mut ThreadControlBlock,
+) -> Option<*mut ThreadControlBlock>
 {
-    true
+    Some(core::ptr::null_mut())
 }
 
 /// Send a wakeup IPI to `target_cpu` without enqueueing anything.

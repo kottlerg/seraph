@@ -39,6 +39,7 @@ pub mod fault_syscall_buffer;
 pub mod fpu_survives_ipc_call;
 pub mod idle_pull_starved_ready;
 pub mod ipc_call_interrupted_stop_start;
+pub mod ipc_call_timeout_stop;
 pub mod irq_preserves_user_regs;
 pub mod irq_shared_line;
 pub mod mem_map_retyped_refused;
@@ -105,6 +106,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::ipc_call_interrupted_stop_start",
         ipc_call_interrupted_stop_start::run(ctx)
+    );
+    run_integration_test!(
+        "integration::ipc_call_timeout_stop",
+        ipc_call_timeout_stop::run(ctx)
     );
     run_integration_test!(
         "integration::park_interrupted_stop_start",

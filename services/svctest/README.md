@@ -32,6 +32,7 @@ services/svctest/
         │                      # object-slab release; deferred reclaim; identity;
         │                      # physical base withheld
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
+        ├── log_client.rs      # Log-call bounds against a log receiver that never answers
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;

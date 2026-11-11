@@ -89,7 +89,9 @@ impl Parker {
         if ms == 0 && !dur.is_zero() {
             ms = 1;
         }
-        let ms = u64::try_from(ms).unwrap_or(u64::MAX);
+        // `u64::MAX` is the syscall's try-once sentinel, which never blocks:
+        // the longest timed park stops one short of it.
+        let ms = u64::try_from(ms).unwrap_or(u64::MAX).min(syscall::WAIT_TRY_ONCE - 1);
         if ms == 0 {
             // Zero-duration park — don't block.
         } else if sig != 0 {

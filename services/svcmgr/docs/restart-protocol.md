@@ -298,10 +298,12 @@ on that persistent endpoint, so log senders' caps survive the restart (per
 [service-definitions.md](service-definitions.md#log_sink)). A working logd
 restart is design intent; not yet implemented (#262). procmgr's
 `REGISTER_DEATH_EQ` is first-wins, so a restarted logd's registration is
-rejected and it receives no death events for slot eviction; and svcmgr's
-death handler emits blocking `log!` calls on the master-log endpoint before
-it respawns logd, so with no logd receiving, svcmgr blocks and the restart
-never happens.
+rejected and it receives no death events for slot eviction. svcmgr's
+death handler emits `log!` calls on the master-log endpoint before it
+respawns logd; with no logd receiving, each is dropped once its bound
+expires (the first after `LOG_CALL_TIMEOUT_MS`, the rest after
+`LOG_CALL_UNANSWERED_TIMEOUT_MS`, per [shared/log](../../../shared/log/README.md)),
+so the respawn is delayed, not prevented.
 
 ---
 

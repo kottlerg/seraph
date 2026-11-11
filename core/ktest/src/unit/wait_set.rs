@@ -22,7 +22,7 @@ use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
     event_queue_create, event_recv, ipc_buffer_set, notification_send, notification_wait,
     notification_wait_timeout, thread_exit, thread_sleep, thread_start, thread_stop, wait_set_add,
-    wait_set_create, wait_set_remove, wait_set_wait,
+    wait_set_create, wait_set_remove, wait_set_try_wait, wait_set_wait, wait_set_wait_timeout,
 };
 use syscall_abi::{RIGHTS_EP_SEND_GRANT, SyscallError};
 
@@ -452,6 +452,149 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
         .delete_cspace()
         .map_err(|_| "cap_delete cs after blocking test failed")?;
     cap_delete(ws).map_err(|_| "cap_delete ws after blocking test failed")?;
+    Ok(())
+}
+
+// ── wait_set_wait (try-once and timed) ────────────────────────────────────────
+
+// Child stack for the delayed signaller of wait_timeout_woken_before_expiry.
+static mut DELAYED_STACK: ChildStack = ChildStack::ZERO;
+
+/// Microseconds since boot.
+fn now_us() -> Result<u64, &'static str>
+{
+    syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "wait_set: system_info(ElapsedUs) failed")
+}
+
+/// `wait_set_try_wait` on a set whose member has nothing pending returns
+/// `WouldBlock` at once.
+pub fn try_wait_empty_would_block(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create for try_wait_empty_would_block failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification for try_wait_empty_would_block failed")?;
+    wait_set_add(ws, sig, 5).map_err(|_| "wait_set_add for try_wait_empty_would_block failed")?;
+
+    let r = wait_set_try_wait(ws);
+    cap_delete(sig).map_err(|_| "cap_delete sig after try_wait_empty_would_block failed")?;
+    cap_delete(ws).map_err(|_| "cap_delete ws after try_wait_empty_would_block failed")?;
+    if r != Err(SyscallError::WouldBlock as i64)
+    {
+        return Err("wait_set_try_wait on an idle set did not return WouldBlock");
+    }
+    Ok(())
+}
+
+/// `wait_set_try_wait` returns the badge of a member signalled beforehand.
+pub fn try_wait_returns_ready_badge(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create for try_wait_returns_ready_badge failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification for try_wait_returns_ready_badge failed")?;
+    wait_set_add(ws, sig, 77)
+        .map_err(|_| "wait_set_add for try_wait_returns_ready_badge failed")?;
+    notification_send(sig, 0x1)
+        .map_err(|_| "notification_send for try_wait_returns_ready_badge failed")?;
+
+    let r = wait_set_try_wait(ws);
+    notification_wait(sig).ok();
+    cap_delete(sig).map_err(|_| "cap_delete sig after try_wait_returns_ready_badge failed")?;
+    cap_delete(ws).map_err(|_| "cap_delete ws after try_wait_returns_ready_badge failed")?;
+    if r != Ok(77)
+    {
+        return Err("wait_set_try_wait did not return the ready member's badge (expected 77)");
+    }
+    Ok(())
+}
+
+/// `wait_set_wait_timeout` with nothing ready returns `WouldBlock` once the
+/// timeout has elapsed.
+pub fn wait_timeout_expires(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create for wait_timeout_expires failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification for wait_timeout_expires failed")?;
+    wait_set_add(ws, sig, 5).map_err(|_| "wait_set_add for wait_timeout_expires failed")?;
+
+    let t0 = now_us()?;
+    let r = wait_set_wait_timeout(ws, 50);
+    let t1 = now_us()?;
+    cap_delete(sig).map_err(|_| "cap_delete sig after wait_timeout_expires failed")?;
+    cap_delete(ws).map_err(|_| "cap_delete ws after wait_timeout_expires failed")?;
+    if r != Err(SyscallError::WouldBlock as i64)
+    {
+        return Err("wait_set_wait_timeout on an idle set did not return WouldBlock");
+    }
+    // Allow ~10 ms slack for timer granularity on slow VMs.
+    if t1.wrapping_sub(t0) < 40_000
+    {
+        return Err("wait_set_wait_timeout returned earlier than the requested timeout");
+    }
+    Ok(())
+}
+
+/// A member signalled while the main thread waits with a long timeout wakes
+/// the wait well before the timeout, and the woken wait leaves nothing behind
+/// that ends a later timed wait early.
+pub fn wait_timeout_woken_before_expiry(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create for wait_timeout_woken_before_expiry failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification for wait_timeout_woken_before_expiry failed")?;
+    wait_set_add(ws, sig, 31)
+        .map_err(|_| "wait_set_add for wait_timeout_woken_before_expiry failed")?;
+
+    let mut child = crate::spawn::new_child(ctx)
+        .map_err(|_| "spawn::new_child for wait_timeout_woken_before_expiry failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
+        .map_err(|_| "cap_copy sig for wait_timeout_woken_before_expiry failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(DELAYED_STACK));
+    // SAFETY: the stack is `DELAYED_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, delayed_sender_entry, stack_top, child_sig)
+    }
+    .map_err(|_| "configure_and_start for wait_timeout_woken_before_expiry failed")?;
+
+    let t0 = now_us()?;
+    let woken = wait_set_wait_timeout(ws, 5000);
+    let t1 = now_us()?;
+    if woken != Ok(31)
+    {
+        return Err("wait_set_wait_timeout was not woken with the member's badge (expected 31)");
+    }
+    if t1.wrapping_sub(t0) >= 2_000_000
+    {
+        return Err("wait_set_wait_timeout woken by a signal returned only near its timeout");
+    }
+
+    // Drain the member, then a second timed wait must run its full timeout.
+    notification_wait(sig).map_err(|_| "notification_wait to drain failed")?;
+    let t2 = now_us()?;
+    let again = wait_set_wait_timeout(ws, 50);
+    let t3 = now_us()?;
+    if again != Err(SyscallError::WouldBlock as i64)
+    {
+        return Err("second wait_set_wait_timeout on an idle set did not return WouldBlock");
+    }
+    if t3.wrapping_sub(t2) < 40_000
+    {
+        return Err("second wait_set_wait_timeout ended early (stale entry from the first wait)");
+    }
+
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after wait_timeout_woken_before_expiry failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete sig after wait_timeout_woken_before_expiry failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after wait_timeout_woken_before_expiry failed")?;
+    cap_delete(ws).map_err(|_| "cap_delete ws after wait_timeout_woken_before_expiry failed")?;
     Ok(())
 }
 
@@ -983,6 +1126,14 @@ pub fn source_endpoint_pinned_by_member(ctx: &TestContext) -> TestResult
 extern "C" fn sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot, 0xBEEF).ok();
+    thread_exit()
+}
+
+/// Sleep 20 ms, then signal `sig_slot` and exit.
+extern "C" fn delayed_sender_entry(sig_slot: u64) -> !
+{
+    thread_sleep(20).ok();
+    notification_send(sig_slot, 0x1).ok();
     thread_exit()
 }
 

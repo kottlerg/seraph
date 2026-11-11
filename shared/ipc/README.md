@@ -1,8 +1,9 @@
 # shared/ipc
 
 Shared IPC helpers for Seraph userspace: the stack-owned `IpcMessage` snapshot type, the
-`ipc_call` / `ipc_recv` / `ipc_reply` wrappers that keep the kernel's per-thread IPC buffer as
-scratch at the syscall boundary, the generic bootstrap protocol, the `RecvGuard`
+`ipc_call` / `ipc_recv` / `ipc_reply` wrappers, with the bounded and try-once forms
+`ipc_call_timeout`, `ipc_recv_timeout`, and `ipc_try_recv`, that keep the kernel's per-thread IPC
+buffer as scratch at the syscall boundary, the generic bootstrap protocol, the `RecvGuard`
 receive-failure policy for blocking receive loops, the per-service IPC label and
 error-code modules, the shared policy tables (`sched_policy`, `published_names`, `log_badges`),
 the `keysym` codes and event packing, the `memmgr_bootstrap`, `device_info_kind`, and

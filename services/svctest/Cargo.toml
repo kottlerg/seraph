@@ -14,6 +14,10 @@ test = false
 # fatfs's cache bounds against the definitions fatfs uses.
 fat_parse = { path = "../fs/fat/fat-parse", package = "fatfs-parse" }
 ipc = { path = "../../shared/ipc" }
+# `write_bytes` and the log-call bounds: the log_client phase logs to an
+# endpoint of its own that never answers, through this copy of the crate, so
+# std's copy and svctest's real log stream are untouched.
+log = { path = "../../shared/log" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 process-abi = { workspace = true }
 process-layout = { path = "../../shared/process-layout" }

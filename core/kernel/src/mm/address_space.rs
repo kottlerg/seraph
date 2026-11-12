@@ -104,6 +104,16 @@ pub struct InitLayout
 static INIT_LAYOUT_INFO_VA: AtomicU64 = AtomicU64::new(0);
 static INIT_LAYOUT_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 
+/// Bytes from init's stack guard page to its stack top: the guard and the
+/// `INIT_STACK_PAGES` stack pages above it.
+const INIT_STACK_RESERVE: u64 = (1 + INIT_STACK_PAGES as u64) * PAGE_SIZE as u64;
+
+// The highest guard's stack top stays below the layout ceiling, so the stack
+// top `init_layout_from_entropy` derives never saturates.
+const _: () = assert!(
+    INIT_STACK_GUARD_WINDOW.end() <= process_layout::LAYOUT_VA_CEILING - INIT_STACK_RESERVE
+);
+
 /// Build init's layout from 16 bytes of entropy: the LE `u64` at `[0..8]`
 /// draws the `InitInfo` base from `INIT_INFO_WINDOW`, the one at `[8..16]`
 /// draws the stack guard page from `INIT_STACK_GUARD_WINDOW`, and the stack
@@ -118,7 +128,7 @@ fn init_layout_from_entropy(entropy: [u8; 16]) -> InitLayout
     let guard = INIT_STACK_GUARD_WINDOW.pick(u64::from_le_bytes(word));
     InitLayout {
         init_info_va,
-        init_stack_top: guard + (1 + INIT_STACK_PAGES as u64) * PAGE_SIZE as u64,
+        init_stack_top: guard.saturating_add(INIT_STACK_RESERVE),
     }
 }
 
@@ -321,30 +331,43 @@ pub struct PageSpan
 }
 
 /// The pages `[va, va + len)` covers, in order, each with its share of the
-/// range. The caller has checked that the range does not wrap.
+/// range. The caller has checked that the range does not wrap; one that would
+/// is cut at the end of the address space.
 pub fn page_spans(va: u64, len: usize) -> impl Iterator<Item = PageSpan>
 {
-    let page = PAGE_SIZE as u64;
+    const OFFSET_MASK: u64 = PAGE_SIZE as u64 - 1;
     let mut cursor = va;
-    let end = va + len as u64;
+    let end = va.saturating_add(len as u64);
     core::iter::from_fn(move || {
         if cursor >= end
         {
             return None;
         }
-        let base = cursor & !(page - 1);
-        let next = (base + page).min(end);
+        let base = cursor & !OFFSET_MASK;
+        // A saturated page end is past `end`, so the minimum is `end`.
+        let next = base.saturating_add(PAGE_SIZE as u64).min(end);
         // cast_possible_truncation: each value is below PAGE_SIZE or len.
+        // `va <= cursor < next`, so neither difference wraps.
         #[allow(clippy::cast_possible_truncation)]
         let span = PageSpan {
             page: base,
-            in_page: (cursor - base) as usize,
-            offset: (cursor - va) as usize,
-            len: (next - cursor) as usize,
+            in_page: (cursor & OFFSET_MASK) as usize,
+            offset: cursor.wrapping_sub(va) as usize,
+            len: next.wrapping_sub(cursor) as usize,
         };
         cursor = next;
         Some(span)
     })
+}
+
+/// The addresses of the `page_count` pages from page-aligned `base`, in order;
+/// `None` when the span passes the end of the address space.
+fn span_pages(base: u64, page_count: usize) -> Option<core::iter::StepBy<core::ops::Range<u64>>>
+{
+    let end = (page_count as u64)
+        .checked_mul(PAGE_SIZE as u64)
+        .and_then(|bytes| base.checked_add(bytes))?;
+    Some((base..end).step_by(PAGE_SIZE))
 }
 
 /// Whether `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM` may copy a page
@@ -586,9 +609,9 @@ impl AddressSpace
         let current_root_phys = unsafe { read_root_phys() };
         let current_root_virt = phys_to_virt(current_root_phys);
 
-        // Each entry is 8 bytes; entries 256–511 start at byte offset 2048.
-        let src = (current_root_virt + 2048) as *const u64;
-        let dst = (new_root_virt + 2048) as *mut u64;
+        // Entries 256–511 are the upper half of each root's 512 entries.
+        let src = (current_root_virt as *const u64).wrapping_add(256);
+        let dst = (new_root_virt as *mut u64).wrapping_add(256);
 
         // SAFETY: both src and dst are valid kernel virtual addresses within
         // 4 KiB page table frames; the 256 u64 copy (2048 bytes) stays within bounds.
@@ -897,6 +920,10 @@ impl AddressSpace
     /// Physical addresses come from `segment.phys_addr`, mapped sequentially
     /// in 4 KiB increments across `segment.size` bytes (rounded up to pages).
     ///
+    /// # Errors
+    /// `Err` when a page fails to map, or when the segment's virtual or
+    /// physical pages pass the end of the address space.
+    ///
     /// # Safety
     /// `segment` must be a valid, bootloader-provided `InitSegment`.
     #[cfg(not(test))]
@@ -938,16 +965,20 @@ impl AddressSpace
         //
         // page_count includes the in-page offset so a segment that crosses a
         // page boundary gets enough pages mapped.
+        // A segment whose pages pass the end of the address space is
+        // malformed, and fails.
         let in_page_off = (segment.virt_addr & 0xFFF) as usize;
-        let page_count = (in_page_off + segment.size as usize)
+        let page_count = in_page_off
+            .checked_add(segment.size as usize)
+            .ok_or(())?
             .div_ceil(PAGE_SIZE)
             .max(1);
         let virt_base = segment.virt_addr & !0xFFFu64; // page-aligned virtual
         let phys_base = segment.phys_addr & !0xFFFu64; // page-aligned physical frame
-        for i in 0..page_count
+        let virts = span_pages(virt_base, page_count).ok_or(())?;
+        let physes = span_pages(phys_base, page_count).ok_or(())?;
+        for (virt, phys) in virts.zip(physes)
         {
-            let virt = virt_base + (i * PAGE_SIZE) as u64;
-            let phys = phys_base + (i * PAGE_SIZE) as u64;
             // SAFETY: segment is bootloader-provided; caller's safety contract.
             unsafe {
                 self.map_page(virt, phys, flags)?;
@@ -1033,8 +1064,17 @@ impl AddressSpace
     ) -> usize
     {
         use crate::arch::current::paging::{translate_user_page, unmap_user_page};
-        use crate::mm::PAGE_SIZE;
 
+        // A physical span past the end of the address space maps nowhere; the
+        // virtual one is in the user half (contract).
+        let (Some(virts), Some(physes)) = (
+            span_pages(virt_base, page_count),
+            span_pages(phys_base, page_count),
+        )
+        else
+        {
+            return 0;
+        };
         if page_count == 0
         {
             return 0;
@@ -1042,12 +1082,10 @@ impl AddressSpace
 
         crate::percpu::preempt_disable();
         self.pt_lock();
-        let mut unmapped = 0;
+        let mut unmapped = 0usize;
         let mut batch = crate::mm::frame_map::ReleaseBatch::new();
-        for i in 0..page_count
+        for (virt, phys) in virts.zip(physes)
         {
-            let virt = virt_base + (i * PAGE_SIZE) as u64;
-            let phys = phys_base + (i * PAGE_SIZE) as u64;
             // SAFETY: root_virt is valid; virt is in user range (caller's
             // contract); pt_lock is held, so the translation and the unmap see
             // the same entry.
@@ -1055,7 +1093,8 @@ impl AddressSpace
                 if translate_user_page(self.root_virt, virt).is_some_and(|(p, _)| p == phys)
                 {
                     unmap_user_page(self.root_virt, virt);
-                    unmapped += 1;
+                    // At most page_count, so the count never saturates.
+                    unmapped = unmapped.saturating_add(1);
                     self.batch_cleared_frame(&mut batch, phys, virt_base, page_count);
                 }
             }
@@ -1142,7 +1181,11 @@ impl AddressSpace
             self.tlb_gen.fetch_add(1, Ordering::Release);
             core::sync::atomic::fence(Ordering::SeqCst);
         }
-        let ranged = page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES;
+        // The span's pages when it is flushed page by page; a span that passes
+        // the end of the address space, which no caller passes, takes the full
+        // flush.
+        let ranged = span_pages(virt_base, page_count)
+            .filter(|_| page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES);
         let current = crate::arch::current::cpu::current_cpu() as usize;
         if self.active_cpus.test_cpu(current, Ordering::Acquire)
         {
@@ -1151,12 +1194,12 @@ impl AddressSpace
             // translations, and a caller that freed page tables flushes the
             // paging-structure caches itself (rustdoc above).
             unsafe {
-                if ranged
+                if let Some(pages) = ranged.clone()
                 {
                     inval_batch_begin();
-                    for i in 0..page_count
+                    for virt in pages
                     {
-                        inval_page(virt_base + (i * crate::mm::PAGE_SIZE) as u64);
+                        inval_page(virt);
                     }
                     inval_batch_end();
                 }
@@ -1173,7 +1216,7 @@ impl AddressSpace
         // the full-flush sentinel ignores the tag, both correct cross-AS (see
         // the Dekker exclusion above).
         unsafe {
-            if ranged
+            if ranged.is_some()
             {
                 crate::mm::tlb_shootdown::shootdown_range(
                     self.root_phys,
@@ -1269,15 +1312,20 @@ impl AddressSpace
             core::sync::atomic::fence(Ordering::SeqCst);
         }
         let current = crate::arch::current::cpu::current_cpu() as usize;
-        let ranged = page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES
-            && (freed == 0 || crate::arch::current::paging::VA_INVAL_DROPS_TABLE_CACHES);
+        // The span's pages when it is flushed page by page; a span that passes
+        // the end of the address space, outside the contract, takes the full
+        // flush.
+        let ranged = span_pages(virt_base, page_count).filter(|_| {
+            page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES
+                && (freed == 0 || crate::arch::current::paging::VA_INVAL_DROPS_TABLE_CACHES)
+        });
         // Only CPUs that run this AS cache its translations — the kernel edits
         // these page tables through the direct map, never by loading this root.
         // The caller is normally memmgr, which does not run the target AS, so
         // the local flush is usually skipped.
         if self.active_cpus.test_cpu(current, Ordering::Acquire)
         {
-            if ranged
+            if let Some(pages) = ranged.clone()
             {
                 use crate::arch::current::paging::{
                     inval_batch_begin, inval_batch_end, inval_page,
@@ -1289,9 +1337,9 @@ impl AddressSpace
                 // table was freed.
                 unsafe {
                     inval_batch_begin();
-                    for i in 0..page_count
+                    for virt in pages
                     {
-                        inval_page(virt_base + (i * crate::mm::PAGE_SIZE) as u64);
+                        inval_page(virt);
                     }
                     inval_batch_end();
                 }
@@ -1303,7 +1351,7 @@ impl AddressSpace
             }
         }
         let remote = MaskSource::Mask(&self.active_cpus, Ordering::Acquire);
-        if ranged
+        if ranged.is_some()
         {
             // SAFETY: root_phys is a valid root; the shootdown leaves
             // current out of remote and returns at once when nothing else
@@ -1779,6 +1827,30 @@ mod thread_mem_tests
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].len, PAGE_SIZE);
         assert_eq!(page_spans(page, 0).count(), 0);
+        // A range past the end of the address space stops at its end.
+        let spans: Vec<PageSpan> = page_spans(u64::MAX - 1, 4).collect();
+        assert_eq!(
+            spans,
+            [PageSpan {
+                page: u64::MAX & !(page - 1),
+                in_page: PAGE_SIZE - 2,
+                offset: 0,
+                len: 1
+            }]
+        );
+    }
+
+    // Defect caught: a page list that misses or repeats a page, or one that
+    // wraps past the end of the address space into low addresses.
+    #[test]
+    fn span_pages_lists_each_page_once_and_refuses_a_wrapping_span()
+    {
+        let page = PAGE_SIZE as u64;
+        let pages: Vec<u64> = span_pages(4 * page, 3).unwrap().collect();
+        assert_eq!(pages, [4 * page, 5 * page, 6 * page]);
+        assert_eq!(span_pages(page, 0).unwrap().count(), 0);
+        assert!(span_pages(u64::MAX & !(page - 1), 1).is_none());
+        assert!(span_pages(0, usize::MAX).is_none());
     }
 
     // Defect caught: a text write that skips the flag or the shared-frame

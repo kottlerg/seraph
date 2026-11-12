@@ -231,20 +231,10 @@ impl FrameMap
     #[must_use]
     pub fn any_mapped(&self, phys: u64, len: u64) -> bool
     {
-        let p = PAGE_SIZE as u64;
-        let mut frame = phys & !(p - 1);
-        let end = phys.saturating_add(len);
-        while frame < end
-        {
-            if self
-                .counter(frame)
+        frames_of(phys, len).any(|frame| {
+            self.counter(frame)
                 .is_some_and(|c| c.load(Ordering::SeqCst) != 0)
-            {
-                return true;
-            }
-            frame += p;
-        }
-        false
+        })
     }
 
     /// The sum of the counts of every frame of `[phys, phys + len)`,
@@ -252,20 +242,20 @@ impl FrameMap
     #[must_use]
     pub fn mappings_in(&self, phys: u64, len: u64) -> u64
     {
-        let p = PAGE_SIZE as u64;
-        let mut frame = phys & !(p - 1);
-        let end = phys.saturating_add(len);
-        let mut total: u64 = 0;
-        while frame < end
-        {
-            if let Some(c) = self.counter(frame)
-            {
-                total = total.saturating_add(u64::from(c.load(Ordering::SeqCst)));
-            }
-            frame += p;
-        }
-        total
+        frames_of(phys, len)
+            .filter_map(|frame| self.counter(frame))
+            .fold(0, |total, c| {
+                total.saturating_add(u64::from(c.load(Ordering::SeqCst)))
+            })
     }
+}
+
+/// The base of every frame `[phys, phys + len)` touches, in order; a range
+/// past the end of the address space is cut at its end.
+fn frames_of(phys: u64, len: u64) -> core::iter::StepBy<core::ops::Range<u64>>
+{
+    const OFFSET_MASK: u64 = PAGE_SIZE as u64 - 1;
+    (phys & !OFFSET_MASK..phys.saturating_add(len)).step_by(PAGE_SIZE)
 }
 
 #[cfg(not(test))]
@@ -315,11 +305,11 @@ pub unsafe fn init(
     {
         return;
     }
-    let table = crate::sched::alloc_zeroed_slab::<AtomicPtr<AtomicU32>>(
-        slots * core::mem::size_of::<AtomicPtr<AtomicU32>>(),
-        alloc,
-        "FRAME_MAP_TABLE",
-    );
+    let bytes = slots
+        .checked_mul(core::mem::size_of::<AtomicPtr<AtomicU32>>())
+        .unwrap_or_else(|| crate::fatal("frame_map::init: FRAME_MAP_TABLE overflows"));
+    let table =
+        crate::sched::alloc_zeroed_slab::<AtomicPtr<AtomicU32>>(bytes, alloc, "FRAME_MAP_TABLE");
     // SAFETY: the slab holds `slots` zeroed (null) pointers owned by the map
     // for the kernel's life; the boot thread is alone.
     unsafe { FRAME_MAP.install_table(table, slots) };
@@ -413,18 +403,26 @@ impl ReleaseBatch
     pub fn push(&mut self, phys: u64) -> bool
     {
         let p = PAGE_SIZE as u64;
-        if let Some(last) = self.len.checked_sub(1).map(|i| &mut self.runs[i])
-            && last.0 + last.1 * p == phys
+        if let Some(last) = self.len.checked_sub(1).and_then(|i| self.runs.get_mut(i))
+            && last
+                .1
+                .checked_mul(p)
+                .and_then(|bytes| last.0.checked_add(bytes))
+                == Some(phys)
         {
-            last.1 += 1;
+            // A run counts frames of the address space, far below the
+            // saturation point.
+            last.1 = last.1.saturating_add(1);
             return true;
         }
-        if self.len == RELEASE_RUNS
+        let Some(run) = self.runs.get_mut(self.len)
+        else
         {
             return false;
-        }
-        self.runs[self.len] = (phys, 1);
-        self.len += 1;
+        };
+        *run = (phys, 1);
+        // The slot was below RELEASE_RUNS, so the length stays within it.
+        self.len = self.len.saturating_add(1);
         true
     }
 
@@ -432,11 +430,13 @@ impl ReleaseBatch
     pub fn release_into(&mut self, map: &FrameMap)
     {
         let p = PAGE_SIZE as u64;
-        for &(first, count) in &self.runs[..self.len]
+        for &(first, count) in self.runs.iter().take(self.len)
         {
+            // `push` extends a run only to a frame whose address it computed
+            // without overflow, so no frame of a run wraps.
             for i in 0..count
             {
-                map.lower(first + i * p);
+                map.lower(first.wrapping_add(i.wrapping_mul(p)));
             }
         }
         self.len = 0;
@@ -520,6 +520,19 @@ mod tests
         );
         map.raise(300 * GIB).unwrap();
         assert!(!map.any_mapped(300 * GIB, P), "a hole GiB is untracked");
+    }
+
+    // Defect caught: a frame walk that misses the frame a range starts in, or
+    // steps past the end of the address space and wraps to frame 0.
+    #[test]
+    fn frames_of_lists_each_touched_frame_and_stops_at_the_end()
+    {
+        let frames: Vec<u64> = frames_of(P + 10, P).collect();
+        assert_eq!(frames, [P, 2 * P]);
+        assert_eq!(frames_of(P, 0).count(), 0);
+        let last = u64::MAX & !(P - 1);
+        let frames: Vec<u64> = frames_of(last + 10, 4 * P).collect();
+        assert_eq!(frames, [last]);
     }
 
     #[test]

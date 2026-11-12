@@ -146,11 +146,14 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
     for cpu in 0..cpu_count
     {
         let mut req = TlbShootdownRequest::new();
+        // The run's first word is inside the slab of cpu_count * words_per_cpu
+        // words, so the product never wraps.
         // SAFETY: the words slab holds `words_per_cpu` words per CPU, so this
         // CPU's run lies inside it and belongs to this request alone, for the
         // kernel's life.
-        req.pending_cpus =
-            unsafe { AtomicCpuMask::attach(words.add(cpu * words_per_cpu), words_per_cpu) };
+        req.pending_cpus = unsafe {
+            AtomicCpuMask::attach(words.add(cpu.wrapping_mul(words_per_cpu)), words_per_cpu)
+        };
         // SAFETY: the slab covers cpu_count slots and nothing reads it before
         // the Release publication below.
         unsafe { core::ptr::write(base.add(cpu), req) };
@@ -265,7 +268,9 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
                 }
                 for p in 0..pages
                 {
-                    let pva = va + p * crate::mm::PAGE_SIZE as u64;
+                    // The initiator's range lies in the address space
+                    // (`shootdown_range`), so no page's address wraps.
+                    let pva = va.wrapping_add(p.wrapping_mul(crate::mm::PAGE_SIZE as u64));
                     if tag != 0
                     {
                         crate::arch::current::paging::inval_page_tagged(pva, tag);
@@ -277,12 +282,16 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
                 }
             }
         }
-        // cast_possible_truncation: slot < cpu_count <= MAX_CPUS, which fits u32.
-        #[allow(clippy::cast_possible_truncation)]
+        // serviced_len < ACK_BATCH here: it is reset on reaching it below.
+        if let Some(entry) = serviced.get_mut(serviced_len)
         {
-            serviced[serviced_len] = slot as u32;
+            // cast_possible_truncation: slot < cpu_count <= MAX_CPUS, which fits u32.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                *entry = slot as u32;
+            }
+            serviced_len = serviced_len.saturating_add(1);
         }
-        serviced_len += 1;
         if serviced_len == ACK_BATCH
         {
             // SAFETY: IPI-handler context (caller contract).
@@ -290,8 +299,10 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
             serviced_len = 0;
         }
     }
+    // serviced_len <= ACK_BATCH, so the prefix always exists.
+    let pending = serviced.get(..serviced_len).unwrap_or(&[]);
     // SAFETY: IPI-handler context (caller contract).
-    unsafe { acknowledge(slots, &serviced[..serviced_len], my_cpu, &mut batch_open) };
+    unsafe { acknowledge(slots, pending, my_cpu, &mut batch_open) };
 }
 
 /// Slots [`service_shootdowns`] services before it acknowledges them.
@@ -318,11 +329,10 @@ unsafe fn acknowledge(
     }
     // Release: every flush before this call — including the just-closed batch
     // window — is visible before any initiator observes its acknowledgement.
-    for &slot in serviced
+    // Every serviced value is the index of a slot of `slots`.
+    for req in serviced.iter().filter_map(|&slot| slots.get(slot as usize))
     {
-        slots[slot as usize]
-            .pending_cpus
-            .clear_cpu(my_cpu, Ordering::Release);
+        req.pending_cpus.clear_cpu(my_cpu, Ordering::Release);
     }
 }
 

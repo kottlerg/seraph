@@ -404,8 +404,10 @@ derivation it revokes when it withdraws the driver (devmgr's
   with `InvalidArgument`. Through a bound object it rebinds that binding to the new notification.
   A binding past the bound is refused with `QuotaExceeded`.
 - **Deliver.** Each assertion masks the line, marks every binding as owing an acknowledgement,
-  signals every bound notification, and completes at the controller. A receiver whose device did
-  not assert reads its device's interrupt status and finds nothing. Every receiver on a line
+  signals every bound notification, and completes at the controller; an assertion the controller
+  forwarded before the mask took effect is delivered too, so a receiver can be signalled again
+  before it acknowledges. A receiver whose device did not assert reads its device's interrupt
+  status and finds nothing. Every receiver on a line
   devmgr may share MUST acknowledge each delivery promptly, whether or not it has a request in
   flight: the line stays masked until every binding has acknowledged, so a receiver that
   acknowledges only while it serves a request of its own holds the line masked for the others on

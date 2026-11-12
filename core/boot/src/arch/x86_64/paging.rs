@@ -219,13 +219,20 @@ impl PageTableBuilder for BootPageTable
 
         // Round size up to a page boundary: kernel segments arrive with their
         // unaligned ELF p_memsz (`build_initial_tables` in core/boot/src/paging.rs).
-        let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let aligned_size = size
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(MapError::AddressRange)?
+            & !(PAGE_SIZE - 1);
 
         let mut offset: u64 = 0;
         while offset < aligned_size
         {
-            self.map_4k_page(virt + offset, phys + offset, &flags)?;
-            offset += PAGE_SIZE;
+            let page_virt = virt.checked_add(offset).ok_or(MapError::AddressRange)?;
+            let page_phys = phys.checked_add(offset).ok_or(MapError::AddressRange)?;
+            self.map_4k_page(page_virt, page_phys, &flags)?;
+            // `aligned_size` is a multiple of `PAGE_SIZE`, so `offset` stays at or
+            // below it and the sum cannot overflow.
+            offset = offset.saturating_add(PAGE_SIZE);
         }
 
         Ok(())
@@ -238,7 +245,7 @@ impl PageTableBuilder for BootPageTable
 
     fn reclaim_spans(&self) -> &[(u64, u64)]
     {
-        &self.reclaim[..self.reclaim_len]
+        self.reclaim.get(..self.reclaim_len).unwrap_or(&[])
     }
 
     fn pool_span(&self) -> (u64, u64)
@@ -264,7 +271,10 @@ impl BootPageTable
             // table. The index is within [0, 511].
             let table =
                 unsafe { core::slice::from_raw_parts_mut(table_phys as *mut u64, TABLE_ENTRIES) };
-            table_phys = self.ensure_table(&mut table[table_index(level, virt)])?;
+            let entry = table
+                .get_mut(table_index(level, virt))
+                .ok_or(MapError::AddressRange)?;
+            table_phys = self.ensure_table(entry)?;
         }
 
         // ── Level 0 (PT) — leaf PTE ───────────────────────────────────────────
@@ -283,7 +293,8 @@ impl BootPageTable
             pte |= PTE_NO_EXECUTE;
         }
 
-        pt[table_index(0, virt)] = pte;
+        *pt.get_mut(table_index(0, virt))
+            .ok_or(MapError::AddressRange)? = pte;
 
         Ok(())
     }
@@ -322,8 +333,12 @@ impl BootPageTable
         {
             return None;
         }
-        let frame = self.pool_phys + self.pool_used * PAGE_SIZE;
-        self.pool_used += 1;
+        let frame = self
+            .pool_used
+            .checked_mul(PAGE_SIZE)
+            .and_then(|offset| self.pool_phys.checked_add(offset))?;
+        // `pool_used` is below `pool_frames`, so it is far below `u64::MAX`.
+        self.pool_used = self.pool_used.saturating_add(1);
         // SAFETY: frame is a page of the pool `new` allocated, below its end,
         // identity-mapped under UEFI and not yet handed out. Zeroing ensures
         // all entries have P=0 (not present); absent entries are never walked

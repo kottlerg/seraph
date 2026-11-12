@@ -200,6 +200,17 @@ Keep your own reads out of your context the same way:
    review rounds. These lines are how the maintainer judges the rules a batch ran under, among
    them the rule that a review reports defects only, in bounded rounds (docs/conventions.md
    § Findings, § Rounds).
+7. Keep the state to what is in force, within the 10,000 bytes past which
+   `cargo xtask orch state` warns: every orchestrator that takes the batch over reads all of it.
+   Drop a ruling (`orch ruling drop <n>`) when the PR it concerns has merged or the Issue it
+   concerns has closed, when a later ruling supersedes it, or when a tracked document now states
+   it; a drop renumbers the rulings after it, so drop several from the highest number down. A
+   standing answer of the maintainer stays, and so does a ruling that later work of the batch
+   still depends on. Remove a worker's entry (`orch worker <name> --remove`) once the worker is
+   retired and its worktree removed (§ Worktree removal), and close a question
+   (`orch question close <id>`) once it is answered. The log keeps every line, so a drop loses
+   nothing. Prune at each merge, beside its cost line, and in the state update before a
+   hand-over.
 
 An instruction-file merge (`.claude/`, or a document the agent files cite) changes what the next
 worker should read, but this session and the agents it spawns keep the copies loaded at its
@@ -319,9 +330,10 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
    worker's worktree sits on its branch (`git -C <worktree> status -sb`).
 
 Then merge with `gh pr merge <N> --merge --delete-branch`, and tell the maintainer in a line
-(§ Reporting to the maintainer). Fast-forward your own checkout, record the merge, and
-tell every open PR's worker what moved and which files the merge touched. That message is
-information: `master quiet` is the only instruction to sync.
+(§ Reporting to the maintainer). Fast-forward your own checkout, record the merge and its
+cost, prune the state (§ Plan, steps 6 and 7), and tell every open PR's worker what moved and
+which files the merge touched. That message is information: `master quiet` is the only
+instruction to sync.
 
 After each merge that shares a file with another merge since the previous release tag, send the
 merged PR's worker `composition check <merge>` (docs/conventions.md § Composition check;
@@ -427,8 +439,8 @@ notifications. Ask for it yourself, in one line, when you are between steps and 
 - Then bring the state up to date with `cargo xtask orch`, since anything that exists only
   in your context is lost: the grant and its queue; every worker with its agent id, PR, branch,
   worktree, phase and last report; the merge order and what each PR waits for; each question
-  the maintainer has open and the file that holds it; the rulings in force for the batch.
-  Answer `parked` and hand back.
+  the maintainer has open and the file that holds it; the rulings in force for the batch. Prune
+  what is no longer in force (§ Plan, step 7). Answer `parked` and hand back.
 - Started with "resume from the record": read this file's supporting files only as needed, run
   `cargo xtask orch state`, record your id with `cargo xtask orch orchestrator <id>`, and send
   each live worker one line with your agent id as its

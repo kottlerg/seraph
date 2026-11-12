@@ -39,6 +39,9 @@ const HANDOFF_UNLOCATED: u64 = u64::MAX;
 /// address inside the handoff stack. Written once by [`note_boot_entry`].
 static BOOT_ENTRY_SP: AtomicU64 = AtomicU64::new(0);
 
+/// Bytes of one stack word.
+const WORD: usize = core::mem::size_of::<u64>();
+
 /// Fill `bytes` bytes at `base` with [`STACK_PAINT`].
 ///
 /// # Safety
@@ -46,7 +49,7 @@ static BOOT_ENTRY_SP: AtomicU64 = AtomicU64::new(0);
 /// by the caller (a stack no thread runs on yet).
 pub unsafe fn paint(base: u64, bytes: usize)
 {
-    let words = bytes / core::mem::size_of::<u64>();
+    let words = bytes / WORD;
     let p = base as *mut u64;
     for i in 0..words
     {
@@ -60,12 +63,10 @@ pub unsafe fn paint(base: u64, bytes: usize)
 /// counted from the low end.
 fn used_bytes_with(words: usize, mut word: impl FnMut(usize) -> u64) -> u64
 {
-    let mut untouched = 0usize;
-    while untouched < words && word(untouched) == STACK_PAINT
-    {
-        untouched += 1;
-    }
-    ((words - untouched) * core::mem::size_of::<u64>()) as u64
+    let untouched = (0..words).take_while(|&i| word(i) == STACK_PAINT).count();
+    // `untouched <= words`, and the stack's `words * WORD` bytes fit a `usize`,
+    // so neither step saturates.
+    words.saturating_sub(untouched).saturating_mul(WORD) as u64
 }
 
 /// Bytes used of the stack `[base, base + bytes)`, which no other CPU writes
@@ -79,18 +80,24 @@ pub unsafe fn used_bytes(base: u64, bytes: usize) -> u64
 {
     let p = base as *const u64;
     // SAFETY: each index is below `bytes / 8`, inside the caller's span.
-    used_bytes_with(bytes / core::mem::size_of::<u64>(), |i| unsafe {
-        p.add(i).read()
-    })
+    used_bytes_with(bytes / WORD, |i| unsafe { p.add(i).read() })
 }
 
 /// The handoff stack's base for an entry stack pointer: its top is `entry_sp`
 /// rounded up to a page, and it spans `stack_bytes` below that top. The
 /// kernel's Phase 3 identity window over the stack starts here too
 /// (`mm::paging::handoff_stack_window`).
+///
+/// No stack has its top past the last page of the address space or holds more
+/// bytes than lie below its top; for such an `entry_sp` the top is cut at the
+/// end of the address space and the base at zero, so the base mark check that
+/// follows finds no stack there.
 pub fn handoff_base(entry_sp: u64, page: u64, stack_bytes: u64) -> u64
 {
-    entry_sp.next_multiple_of(page) - stack_bytes
+    entry_sp
+        .checked_next_multiple_of(page)
+        .unwrap_or(u64::MAX)
+        .saturating_sub(stack_bytes)
 }
 
 /// The handoff class's answer for a recorded value: the depth, or
@@ -179,11 +186,11 @@ pub fn record_handoff_stack()
     // SAFETY: base is the direct-map view of the handoff stack's lowest page,
     // which the bootloader allocated in RAM the direct map covers.
     let mark = unsafe { (base as *const u64).read() };
-    let word = core::mem::size_of::<u64>();
     let recorded = handoff_record(mark, || {
         // SAFETY: as above; the words above the mark are the painted stack,
-        // and only this CPU, running on it, writes it.
-        unsafe { used_bytes(base + word as u64, HANDOFF_STACK_BYTES - word) }
+        // and only this CPU, running on it, writes it. The mark confirmed the
+        // stack at `base`, so the word above it does not wrap.
+        unsafe { used_bytes(base.wrapping_add(WORD as u64), HANDOFF_STACK_BYTES - WORD) }
     });
     HANDOFF_HIGH_WATER.store(recorded, Ordering::Relaxed);
 }
@@ -210,7 +217,9 @@ fn idle_used_bytes(cpu: usize) -> u64
     // SAFETY: cpu < CPU_COUNT (the caller's loop bound), and the scheduler is
     // initialised before any syscall runs.
     let top = unsafe { crate::sched::idle_stack_top_for(cpu) };
-    let p = (top - bytes as u64) as *const u64;
+    // The idle stack is the `bytes` bytes below its top, so its base does not
+    // wrap.
+    let p = top.wrapping_sub(bytes as u64) as *const u64;
     crate::percpu::preempt_disable();
     // SAFETY: ring 0; restored below.
     let saved = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
@@ -218,7 +227,7 @@ fn idle_used_bytes(cpu: usize) -> u64
     unsafe { crate::arch::current::interrupts::enable() };
     // SAFETY: an idle stack is the `bytes` bytes below its top, mapped through
     // the direct map for the kernel's lifetime and 8-byte aligned.
-    let used = used_bytes_with(bytes / core::mem::size_of::<u64>(), |i| unsafe {
+    let used = used_bytes_with(bytes / WORD, |i| unsafe {
         crate::arch::current::cpu::load_word_racy(p.add(i))
     });
     // SAFETY: saved came from save_and_disable_interrupts above.
@@ -266,8 +275,9 @@ pub fn high_water(class: u64) -> Result<u64, SyscallError>
                 // `bytes` bytes below `kernel_stack_top`, written during the
                 // call only by this CPU, above the scan's stack pointer.
                 let top = unsafe { (*tcb).kernel_stack_top };
-                // SAFETY: as above.
-                unsafe { used_bytes(top - bytes as u64, bytes) }
+                // SAFETY: as above; the stack's base, `bytes` below its top,
+                // does not wrap.
+                unsafe { used_bytes(top.wrapping_sub(bytes as u64), bytes) }
             };
             Ok(own.max(THREAD_HIGH_WATER.load(Ordering::Relaxed)))
         }
@@ -334,6 +344,22 @@ mod tests
         assert_eq!(handoff_base(0x7_F001, PAGE, STACK), 0x8_0000 - STACK);
         // An entry stack pointer on a page boundary is that page's top.
         assert_eq!(handoff_base(0x7_F000, PAGE, STACK), 0x7_F000 - STACK);
+    }
+
+    // Defect caught: a base derived by wrapping, for an entry stack pointer no
+    // stack can have, so the base-mark read and the Phase 3 identity window
+    // land near the top of the address space instead of finding no stack.
+    #[test]
+    fn a_handoff_base_past_either_end_of_the_address_space_is_cut_at_it()
+    {
+        const PAGE: u64 = 4096;
+        const STACK: u64 = 64 * 1024;
+        // A top below the stack's size: the base is cut at zero.
+        assert_eq!(handoff_base(0x9000, PAGE, STACK), 0);
+        // A top exactly the stack's size is a stack based at zero.
+        assert_eq!(handoff_base(STACK, PAGE, STACK), 0);
+        // A pointer in the last page: the top is cut at the end.
+        assert_eq!(handoff_base(u64::MAX - 5, PAGE, STACK), u64::MAX - STACK);
     }
 
     #[test]

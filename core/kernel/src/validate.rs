@@ -86,8 +86,9 @@ pub unsafe fn validate_boot_info(boot_info: *const BootInfo) -> bool
     //    wrapping. The arch layer separately checks the mode-dependent
     //    direct-map floor (`init_paging_mode`).
     let kvb = info.kernel_virtual_base;
-    if kvb < layout::KERNEL_LINK_BASE
-        || !(kvb - layout::KERNEL_LINK_BASE).is_multiple_of(layout::IMAGE_SLIDE_ALIGN)
+    if kvb
+        .checked_sub(layout::KERNEL_LINK_BASE)
+        .is_none_or(|slide| !slide.is_multiple_of(layout::IMAGE_SLIDE_ALIGN))
         || kvb.checked_add(info.kernel_size).is_none()
     {
         return false;
@@ -141,8 +142,9 @@ fn cpu_ids_in_ram(ids_phys: u64, count: u32, ram_top: u64) -> bool
 {
     let len = (count as usize).clamp(1, boot_protocol::MAX_CPUS) as u64;
     ids_phys != 0
-        && ids_phys
-            .checked_add(len * core::mem::size_of::<u32>() as u64)
+        && len
+            .checked_mul(core::mem::size_of::<u32>() as u64)
+            .and_then(|bytes| ids_phys.checked_add(bytes))
             .is_some_and(|end| end <= ram_top)
 }
 

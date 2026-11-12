@@ -166,7 +166,6 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | `backtrace_scan` `MAX_HITS` | `core/kernel/src/main.rs` | 24 | diagnostic output cap | none | correct as is | None |
 | `APS_READY` wait (`AP_ONLINE_BUDGET_US`) | `core/kernel/src/main.rs` | 10 s per AP, then fatal naming the CPU | tuning (bounds no capacity) | none | correct as is | None |
 | `timer::init(1_000)` tick period | `core/kernel/src/main.rs` | 1000 us | tuning (bounds no capacity) | none | correct as is | None |
-| `print_timestamp` `sec_buf` | `core/kernel/src/console.rs` | 20 B | ABI width (`u64::MAX` has 20 digits) | 20 B stack | correct as is | None |
 | `FramebufferWriter` geometry fields | `core/kernel/src/framebuffer.rs` | `u32` | ABI width (boot-protocol `FramebufferInfo`) | embedded | correct as is | None |
 | `platform::ValidatedApertures` | `core/kernel/src/platform.rs` | none: a filtered view of `BootInfo`'s aperture list | provable unreachability (nothing is copied) | none | correct as is | None |
 

@@ -148,9 +148,12 @@ impl AtomicCpuMask
     fn slot(&self, cpu: usize) -> (&AtomicU64, u64)
     {
         let (w, b) = word_bit(cpu);
-        let words = self.words();
-        debug_assert!(w < words.len(), "AtomicCpuMask: CPU index past the mask");
-        (&words[w], b)
+        let Some(word) = self.words().get(w)
+        else
+        {
+            cpu_past_mask()
+        };
+        (word, b)
     }
 
     /// Add `cpu` to the set.
@@ -251,21 +254,35 @@ impl MaskSource<'_>
     }
 }
 
+/// Halt for a CPU index past the mask's words. Host test builds panic instead,
+/// so a test can observe the stop.
+#[cold]
+fn cpu_past_mask() -> !
+{
+    #[cfg(not(test))]
+    crate::fatal("AtomicCpuMask: CPU index past the mask");
+    #[cfg(test)]
+    panic!("AtomicCpuMask: CPU index past the mask");
+}
+
 /// Word `i` of the set of every CPU index below `n`.
 const fn below_word(n: usize, i: usize) -> u64
 {
-    let start = i * 64;
-    if n <= start
+    // A word whose first index does not fit a `usize` lies past every `n`.
+    let Some(start) = i.checked_mul(64)
+    else
     {
-        0
-    }
-    else if n - start >= 64
+        return 0;
+    };
+    let below = n.saturating_sub(start);
+    if below >= 64
     {
         u64::MAX
     }
     else
     {
-        (1u64 << (n - start)) - 1
+        // `below` < 64; a zero `below` gives the empty word.
+        (1u64 << below).wrapping_sub(1)
     }
 }
 
@@ -286,21 +303,24 @@ impl Iterator for AtomicCpuMaskIter<'_>
 
     fn next(&mut self) -> Option<usize>
     {
-        while self.word < self.words.len()
+        // `self.word` stays below the mask's word count, at most
+        // `MAX_MASK_WORDS`, so the index arithmetic below does not wrap.
+        while let Some(word) = self.words.get(self.word)
         {
             if !self.loaded
             {
-                self.bits = self.words[self.word].load(self.order);
+                self.bits = word.load(self.order);
                 self.loaded = true;
             }
             if self.bits != 0
             {
                 let bit = self.bits.trailing_zeros() as usize;
-                // Clear the lowest set bit so the next call advances.
-                self.bits &= self.bits - 1;
-                return Some(self.word * 64 + bit);
+                // Clear the lowest set bit so the next call advances; `bits`
+                // is non-zero, so the subtraction does not wrap.
+                self.bits &= self.bits.wrapping_sub(1);
+                return Some(self.word.wrapping_mul(64).wrapping_add(bit));
             }
-            self.word += 1;
+            self.word = self.word.wrapping_add(1);
             self.loaded = false;
         }
         None

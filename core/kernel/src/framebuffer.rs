@@ -165,7 +165,8 @@ impl FramebufferWriter
     unsafe fn newline(&mut self)
     {
         self.col = 0;
-        self.row += 1;
+        // The cursor row stays below `max_rows`, so the step cannot saturate.
+        self.row = self.row.saturating_add(1);
         if self.row >= self.max_rows
         {
             // SAFETY: framebuffer pointer is valid per struct invariant.
@@ -197,7 +198,7 @@ impl FramebufferWriter
     /// Framebuffer pointer must be valid and writable.
     unsafe fn clear(&mut self)
     {
-        let total = (self.stride * self.height) as usize;
+        let total = bytes_of(self.stride, self.height);
         let mut p = self.base;
         for _ in 0..total
         {
@@ -219,23 +220,26 @@ impl FramebufferWriter
     /// Framebuffer pointer must be valid; cursor must be within bounds.
     unsafe fn draw_glyph_bitmap(&mut self, bitmap: &[u16])
     {
-        let pixel_x = self.col * GLYPH_WIDTH;
-        let pixel_y = self.row * GLYPH_HEIGHT;
+        // The cursor cell lies inside the framebuffer (`new` sizes the cell
+        // grid to it), and every factor below is a `u32` widened to the 64-bit
+        // `usize`, so no offset into the cell wraps.
+        let stride = self.stride as usize;
+        let pixel_x = (self.col as usize).wrapping_mul(GLYPH_WIDTH as usize);
+        let pixel_y = (self.row as usize).wrapping_mul(GLYPH_HEIGHT as usize);
 
         for (row_idx, &bits) in bitmap.iter().enumerate().take(GLYPH_HEIGHT as usize)
         {
-            let scan_y = pixel_y as usize + row_idx;
-            let row_base = scan_y * self.stride as usize;
+            let row_base = pixel_y.wrapping_add(row_idx).wrapping_mul(stride);
 
-            for col_idx in 0..(GLYPH_WIDTH as usize)
+            for col_idx in 0..GLYPH_WIDTH
             {
-                // Bit 15 is leftmost pixel; shift down for each column.
-                let lit = (bits >> (15 - col_idx)) & 1 != 0;
+                // Bit 15 is the leftmost pixel; shift each column's bit up to it.
+                let lit = bits.wrapping_shl(col_idx) & 0x8000 != 0;
                 // White (0xFF) if lit, black (0x00) if not.
                 let intensity: u8 = if lit { 0xFF } else { 0x00 };
 
-                let px = (pixel_x as usize + col_idx) * 4;
-                let offset = row_base + px;
+                let px = pixel_x.wrapping_add(col_idx as usize).wrapping_mul(4);
+                let offset = row_base.wrapping_add(px);
 
                 // SAFETY: pixel is within the framebuffer; offset is bounded
                 // by stride * height (caller ensures valid mapping).
@@ -262,7 +266,8 @@ impl FramebufferWriter
             }
         }
 
-        self.col += 1;
+        // The cursor column stays below `max_cols`, so the step cannot saturate.
+        self.col = self.col.saturating_add(1);
         if self.col >= self.max_cols
         {
             // SAFETY: framebuffer pointer is valid per struct invariant.
@@ -281,33 +286,41 @@ impl FramebufferWriter
     /// Framebuffer pointer must be valid.
     unsafe fn scroll(&mut self)
     {
-        let row_bytes = (GLYPH_HEIGHT * self.stride) as usize;
-        let total_rows = self.max_rows as usize;
+        let row_bytes = bytes_of(GLYPH_HEIGHT, self.stride);
+        // `new` refuses a framebuffer with no cell row, so `max_rows >= 1`.
+        let last_row = self.max_rows.saturating_sub(1);
+        // The bytes of the rows above the last one, inside the framebuffer's
+        // `stride * height` bytes, so the product does not wrap.
+        let last_row_start = (last_row as usize).wrapping_mul(row_bytes);
 
-        // Copy rows 1..total_rows → 0..total_rows-1.
+        // Copy rows 1..max_rows → 0..max_rows-1.
         // SAFETY: src and dst are both within the framebuffer allocation; the
-        // copy is a single forward memmove of (total_rows-1)*row_bytes bytes.
+        // copy is a single forward memmove of (max_rows-1)*row_bytes bytes.
         unsafe {
-            core::ptr::copy(
-                self.base.add(row_bytes),
-                self.base,
-                (total_rows - 1) * row_bytes,
-            );
+            core::ptr::copy(self.base.add(row_bytes), self.base, last_row_start);
         }
 
         // Zero the last row.
-        let last_row_start = (total_rows - 1) * row_bytes;
+        // SAFETY: the last row starts inside the framebuffer.
+        let last = unsafe { self.base.add(last_row_start) };
         for i in 0..row_bytes
         {
-            // SAFETY: last_row_start + i is within the framebuffer.
+            // SAFETY: the last row's `row_bytes` bytes lie within the framebuffer.
             unsafe {
-                core::ptr::write_volatile(self.base.add(last_row_start + i), 0);
+                core::ptr::write_volatile(last.add(i), 0);
             }
         }
 
         // Park cursor on the last row.
-        self.row = self.max_rows - 1;
+        self.row = last_row;
     }
+}
+
+/// The bytes of `count` units of `size` bytes each. Two `u32` factors cannot
+/// overflow the 64-bit `usize` of every target, so the product is exact.
+const fn bytes_of(count: u32, size: u32) -> usize
+{
+    (count as usize).saturating_mul(size as usize)
 }
 
 #[cfg(test)]
@@ -368,5 +381,39 @@ mod tests
         let info = info_over(&mut buf, w, h, w * 4);
         // SAFETY: buf is writable for stride * height bytes.
         assert!(unsafe { FramebufferWriter::new(&info) }.is_some());
+    }
+
+    // Defect caught: a byte count taken as a `u32` product, which truncates the
+    // size of a framebuffer past 4 GiB, so `clear` and `scroll` cover only a
+    // fraction of it.
+    #[test]
+    fn byte_counts_past_four_gib_are_exact()
+    {
+        assert_eq!(bytes_of(1 << 16, 1 << 16), 1 << 32);
+        assert_eq!(
+            bytes_of(u32::MAX, u32::MAX),
+            u32::MAX as usize * u32::MAX as usize
+        );
+    }
+
+    // Boundary: a framebuffer of one cell row scrolls on every newline, so the
+    // last row is also the first; the cursor must park on it and the row be
+    // cleared without reaching past the framebuffer.
+    #[test]
+    fn a_single_row_framebuffer_scrolls_in_place()
+    {
+        let (w, h) = (GLYPH_WIDTH * 2, GLYPH_HEIGHT);
+        let mut buf = vec![0u8; (w * 4 * h) as usize];
+        let info = info_over(&mut buf, w, h, w * 4);
+        // SAFETY: buf is writable for stride * height bytes.
+        let mut fb = unsafe { FramebufferWriter::new(&info) }.expect("one cell row is usable");
+        // SAFETY: as above.
+        unsafe {
+            fb.write_byte(b'#');
+            fb.write_byte(b'\n');
+            fb.write_byte(b'\n');
+        }
+        assert_eq!((fb.row, fb.col), (0, 0));
+        assert!(buf.iter().all(|&b| b == 0));
     }
 }

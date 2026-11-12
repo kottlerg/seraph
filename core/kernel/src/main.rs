@@ -40,6 +40,18 @@ static APS_READY: AtomicU32 = AtomicU32::new(0);
 #[cfg(not(test))]
 const AP_ONLINE_BUDGET_US: u64 = 10_000_000;
 
+/// [`mm::PAGE_SIZE`] as a `u64`, for physical and virtual address arithmetic.
+#[cfg(not(test))]
+const PAGE_BYTES: u64 = mm::PAGE_SIZE as u64;
+
+/// The in-page offset bits of an address.
+#[cfg(not(test))]
+const PAGE_MASK: u64 = PAGE_BYTES - 1;
+
+/// Bytes of one kernel stack, [`sched::KERNEL_STACK_PAGES`] pages.
+#[cfg(not(test))]
+const KERNEL_STACK_BYTES: u64 = (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE) as u64;
+
 use boot_protocol::BootInfo;
 
 mod arch;
@@ -634,8 +646,8 @@ unsafe fn kernel_entry_post_rebase(
         // the scrub below writes through `bi`.
         unsafe {
             let seed: &[u8; 32] = &*core::ptr::addr_of!((*bi).boot_entropy_seed);
-            let n = ((*bi).boot_entropy_len as usize).min(seed.len());
-            entropy::init(&seed[..n], vmgenid_paddr);
+            let len = (*bi).boot_entropy_len as usize;
+            entropy::init(seed.get(..len).unwrap_or(seed), vmgenid_paddr);
         }
 
         // Scrub the boot seed, its length, and the two KASLR bases once consumed:
@@ -697,7 +709,8 @@ unsafe fn kernel_entry_post_rebase(
     // in core/kernel/docs/initialization.md § Phase 8.
     #[cfg(not(test))]
     {
-        let ap_count = (boot_cpu_count - 1) as usize;
+        // `kernel_entry` raised a zero count to one.
+        let ap_count = boot_cpu_count.saturating_sub(1) as usize;
         if ap_count > 0
         {
             if trampoline_pa == 0
@@ -723,7 +736,13 @@ unsafe fn kernel_entry_post_rebase(
 
             for cpu_idx in 1..=ap_count
             {
-                let hw_id = hw_ids[cpu_idx];
+                // `boot_cpu_ids` clamps the ids to `MAX_CPUS`; a count past
+                // it lists a CPU with no id, which cannot be started.
+                let Some(&hw_id) = hw_ids.get(cpu_idx)
+                else
+                {
+                    fatal("smp: a listed CPU has no hardware id; it cannot be brought online");
+                };
                 // SAFETY: the idle stacks and their tops slab come from
                 // Phase 4 storage (sched::init_storage), and the idle TCBs
                 // were initialised in Phase 8 (sched::init);
@@ -865,9 +884,8 @@ unsafe fn kernel_entry_post_rebase(
         // `map_page`, whose intermediate PT pages come from `kernel_pt_pool`
         // (the kernel-direct path). The wrapper's growth pool is
         // reserved for init's later userspace pooled maps.
-        for i in 0..init_image.segment_count as usize
+        for seg in init_segments(&init_image)
         {
-            let seg = &init_image.segments[i];
             // SAFETY: init_as_ptr is freshly retyped above; segment data
             // lives in bootloader-loaded memory accessible via the direct
             // physical map (Phase 3).
@@ -907,11 +925,11 @@ unsafe fn kernel_entry_post_rebase(
             // `total_pages` ledger. memmgr holds the cap from then
             // on; the post-handoff buddy is sealed, so the `dealloc_object` →
             // `free_range` path is a tripwire, not an expected reclaim.
-            let seg_count = init_image.segment_count as usize;
+            let segments = init_segments(&init_image);
+            let seg_count = segments.len();
             let mut seg_base: u32 = 0;
-            for i in 0..seg_count
+            for (i, seg) in segments.iter().enumerate()
             {
-                let seg = &init_image.segments[i];
                 // Full rights regardless of the segment's protection. This cap
                 // is held only to donate the frame into memmgr's pool at init's
                 // reap, where it becomes general anonymous RAM any consumer may
@@ -929,11 +947,14 @@ unsafe fn kernel_entry_post_rebase(
                 // to userspace describes whole pages, so mask the base
                 // down and ceil-round the size to PAGE_SIZE — upholds
                 // MemoryObject's alignment invariant for downstream
-                // sys_mem_map / sys_memory_split.
-                let page_mask = mm::PAGE_SIZE as u64 - 1;
-                let phys_aligned = seg.phys_addr & !page_mask;
-                let in_page_off = seg.phys_addr & page_mask;
-                let size_aligned = (in_page_off + seg.size + page_mask) & !page_mask;
+                // sys_mem_map / sys_memory_split. A segment whose rounded
+                // size wraps describes no RAM.
+                let phys_aligned = seg.phys_addr & !PAGE_MASK;
+                let in_page_off = seg.phys_addr & PAGE_MASK;
+                let size_aligned = in_page_off
+                    .checked_add(seg.size)
+                    .and_then(|bytes| bytes.checked_next_multiple_of(PAGE_BYTES))
+                    .unwrap_or_else(|| fatal("Phase 9: an init segment's size wraps"));
                 // SAFETY: segment phys range is disjoint from buddy
                 // free list (excluded in `core/kernel/src/mm/init.rs` `collect_exclusions`)
                 // and from boot module ranges; single-threaded boot.
@@ -1043,14 +1064,18 @@ unsafe fn kernel_entry_post_rebase(
             // the region was zeroed then, before they were written into it.
             let (block_phys, info_pages) = cap::take_init_info_block();
             debug_assert!(
-                core::mem::size_of::<InitInfo>() + core::mem::size_of_val(desc_slice)
-                    <= info_pages * mm::PAGE_SIZE,
+                core::mem::size_of::<InitInfo>().saturating_add(core::mem::size_of_val(desc_slice))
+                    <= info_pages.saturating_mul(mm::PAGE_SIZE),
                 "Phase 9: {desc_count} descriptors overrun the {info_pages}-page InitInfo region"
             );
             for pg in 0..info_pages
             {
-                let phys = block_phys + (pg as u64) * mm::PAGE_SIZE as u64;
-                let map_va = init_layout.init_info_va + (pg as u64) * mm::PAGE_SIZE as u64;
+                let phys = pages_above(block_phys, pg, "Phase 9: InitInfo extent wraps");
+                let map_va = pages_above(
+                    init_layout.init_info_va,
+                    pg,
+                    "Phase 9: InitInfo window wraps",
+                );
                 // SAFETY: init_as_ptr valid; phys is part of the contiguous extent.
                 unsafe { (*init_as_ptr).map_page(map_va, phys, flags) }
                     .unwrap_or_else(|()| fatal("Phase 9: failed to map InitInfo page"));
@@ -1107,7 +1132,7 @@ unsafe fn kernel_entry_post_rebase(
             let mut info_memory_base_slot: u32 = 0;
             for pg in 0..info_pages
             {
-                let phys = block_phys + (pg as u64) * mm::PAGE_SIZE as u64;
+                let phys = pages_above(block_phys, pg, "Phase 9: InitInfo extent wraps");
                 // No register_owned_range: these pages came from the buddy
                 // (reserved at Phase 7), so they are already in `total_pages`.
                 // `register_owned_range` would double-count.
@@ -1192,6 +1217,8 @@ unsafe fn kernel_entry_post_rebase(
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing for stack mint"));
 
             let mut base_slot: u32 = 0;
+            // Page `i` lies `i + 1` pages below the stack top.
+            let mut virt = stack_top;
             for i in 0..STACK_PAGES
             {
                 // Page reserved from the pristine buddy at Phase 7; the
@@ -1201,11 +1228,13 @@ unsafe fn kernel_entry_post_rebase(
                 // Zero the page through the kernel direct map.
                 // SAFETY: phys_to_virt yields a valid kernel virtual address.
                 unsafe {
-                    let virt = mm::paging::phys_to_virt(phys);
-                    core::ptr::write_bytes(virt as *mut u8, 0, mm::PAGE_SIZE);
+                    let direct = mm::paging::phys_to_virt(phys);
+                    core::ptr::write_bytes(direct as *mut u8, 0, mm::PAGE_SIZE);
                 }
 
-                let virt = stack_top - ((i + 1) * mm::PAGE_SIZE) as u64;
+                virt = virt
+                    .checked_sub(PAGE_BYTES)
+                    .unwrap_or_else(|| fatal("Phase 9: init stack window wraps"));
                 // SAFETY: virt in user range; phys freshly allocated.
                 unsafe {
                     (*init_as_ptr)
@@ -1315,7 +1344,9 @@ unsafe fn kernel_entry_post_rebase(
             let seed = cap::seed_memory_ref();
             let offset = cap::retype::retype_allocate(seed, bytes)
                 .unwrap_or_else(|_| fatal("Phase 9: SEED too small for init Thread slab"));
-            let block_phys = seed.base + offset;
+            // The slab's `bytes` lie inside SEED's range, so neither its base
+            // nor any offset into it below wraps.
+            let block_phys = seed.base.wrapping_add(offset);
             let block_virt = mm::paging::phys_to_virt(block_phys);
             // Unmap the guard page below init's stack, as thread creation
             // does (`mm::stack_guard`).
@@ -1328,22 +1359,22 @@ unsafe fn kernel_entry_post_rebase(
             {
                 fatal("Phase 9: cannot unmap init's kernel stack guard page");
             };
-            let kstack_top = block_virt + sched::thread_slot::WRAPPER_OFFSET;
+            let kstack_top = block_virt.wrapping_add(sched::thread_slot::WRAPPER_OFFSET);
+            let stack_floor = block_virt.wrapping_add(sched::thread_slot::STACK_OFFSET);
             // Paint init's kernel stack for the depth report (stack_depth).
             // SAFETY: the slab's KERNEL_STACK_PAGES pages above the guard are
             // init's stack, owned here; no thread runs on them yet.
             unsafe {
-                stack_depth::paint(
-                    block_virt + sched::thread_slot::STACK_OFFSET,
-                    sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE,
-                );
+                stack_depth::paint(stack_floor, sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE);
             }
             let thread_obj_ptr = kstack_top as *mut ThreadObject;
             let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
-            let tcb_ptr = (kstack_top + tcb_offset) as *mut sched::thread::ThreadControlBlock;
+            let tcb_ptr =
+                kstack_top.wrapping_add(tcb_offset) as *mut sched::thread::ThreadControlBlock;
             // Per-thread FPU/SIMD/V save area: its pages directly after the
             // wrapper page in the retyped slab.
-            let init_extended_area = (block_virt + sched::thread_slot::EXTENDED_OFFSET) as *mut u8;
+            let init_extended_area =
+                block_virt.wrapping_add(sched::thread_slot::EXTENDED_OFFSET) as *mut u8;
             // SAFETY: init_extended_area starts on page 6 of the freshly-retyped
             // slab, and its `extended_area_bytes` end the slab, exclusively
             // owned by this init bootstrap.
@@ -1362,10 +1393,7 @@ unsafe fn kernel_entry_post_rebase(
                 init_layout.init_info_va, // forwarded to init's a0/rdi on first entry
                 arch::ThreadKind::User,
             );
-            arch::current::context::set_stack_floor(
-                &mut init_saved,
-                block_virt + sched::thread_slot::STACK_OFFSET,
-            );
+            arch::current::context::set_stack_floor(&mut init_saved, stack_floor);
 
             // SAFETY: tcb_ptr lies on page 5 of the freshly-retyped slab,
             // exclusively owned. CSpace is wired below (after take_root_cspace).
@@ -1597,8 +1625,7 @@ unsafe fn kernel_entry_post_rebase(
         let seed_available_bytes = cap::seed_memory_ref()
             .available_bytes
             .load(core::sync::atomic::Ordering::Acquire);
-        let kstack_bytes =
-            u64::from(boot_cpu_count) * (sched::KERNEL_STACK_PAGES as u64) * (mm::PAGE_SIZE as u64);
+        let kstack_bytes = u64::from(boot_cpu_count).saturating_mul(KERNEL_STACK_BYTES);
         kprintln!(
             "ledger: caps_available={} KiB, seed_available={} KiB, kstack_total={} KiB ({} CPUs × {} KiB)",
             cap_available_bytes / 1024,
@@ -1672,11 +1699,10 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     // This AP runs on its idle stack until its first context switch, which
     // installs each incoming thread's floor itself.
     // SAFETY: init_ap installed this AP's per-CPU pointer above; the idle
-    // stack is the one this AP runs on.
+    // stack is the one this AP runs on, and its pages lie below its top, so
+    // the floor does not wrap.
     unsafe {
-        percpu::set_kernel_stack_floor(
-            idle_stack_top - (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE) as u64,
-        );
+        percpu::set_kernel_stack_floor(idle_stack_top.wrapping_sub(KERNEL_STACK_BYTES));
     }
 
     // 3. Load the BSP's shared IDT on this AP.
@@ -1751,6 +1777,28 @@ pub(crate) fn fatal(msg: &str) -> !
     arch::current::cpu::halt_loop();
 }
 
+/// The init image's valid segments, `segments[..segment_count]`. A count past
+/// the table is a bootloader defect the boot cannot recover from.
+#[cfg(not(test))]
+fn init_segments(image: &boot_protocol::InitImage) -> &[boot_protocol::InitSegment]
+{
+    image
+        .segments
+        .get(..image.segment_count as usize)
+        .unwrap_or_else(|| fatal("Phase 9: init segment count exceeds the segment table"))
+}
+
+/// The address `pages` pages above `base`, inside a span the kernel reserved;
+/// halts naming `what` if the sum wraps, which no reserved span reaches.
+#[cfg(not(test))]
+fn pages_above(base: u64, pages: usize, what: &str) -> u64
+{
+    (pages as u64)
+        .checked_mul(PAGE_BYTES)
+        .and_then(|offset| base.checked_add(offset))
+        .unwrap_or_else(|| fatal(what))
+}
+
 /// PIE init support (#39): when the bootloader flags init as `ET_DYN`, draw
 /// a load bias from the entropy pool (window-base fallback when unseeded —
 /// unreachable in practice, the pool seeds in Phase 5), validate the biased
@@ -1778,13 +1826,18 @@ fn pie_rebase_init_image(mut image: boot_protocol::InitImage) -> boot_protocol::
         process_layout::IMAGE_WINDOW.base
     };
 
-    let segments = &image.segments[..image.segment_count as usize];
+    let segments = init_segments(&image);
     let mut span_min = u64::MAX;
     let mut span_end = 0u64;
     for seg in segments
     {
+        let Some(seg_end) = seg.virt_addr.checked_add(seg.size)
+        else
+        {
+            fatal("Phase 9: PIE init segment wraps the address space");
+        };
         span_min = span_min.min(seg.virt_addr);
-        span_end = span_end.max(seg.virt_addr + seg.size);
+        span_end = span_end.max(seg_end);
     }
     if !process_layout::validate_image_placement(bias, span_min, span_end)
     {
@@ -1797,11 +1850,23 @@ fn pie_rebase_init_image(mut image: boot_protocol::InitImage) -> boot_protocol::
         Err(msg) => fatal(msg),
     }
 
-    for seg in &mut image.segments[..image.segment_count as usize]
+    // The placement check above keeps every biased segment below the end of
+    // the image zone, so no segment's sum wraps; the entry point is not
+    // placement-checked, so its sum can. Every sum is checked, and a wrap
+    // halts the boot.
+    let overflow = "Phase 9: PIE init bias wraps the address space";
+    let count = segments.len();
+    for seg in image.segments.iter_mut().take(count)
     {
-        seg.virt_addr += bias;
+        seg.virt_addr = seg
+            .virt_addr
+            .checked_add(bias)
+            .unwrap_or_else(|| fatal(overflow));
     }
-    image.entry_point += bias;
+    image.entry_point = image
+        .entry_point
+        .checked_add(bias)
+        .unwrap_or_else(|| fatal(overflow));
 
     // PT_GNU_RELRO: seal the relocated GOT / .data.rel.ro pages read-only.
     if let Err(msg) = mm::init_reloc::apply_relro(
@@ -1940,8 +2005,11 @@ fn check_stack_guards(cpu_count: usize)
     {
         // SAFETY: cpu < CPU_COUNT, and sched::init built the idle TCBs.
         let top = unsafe { sched::idle_stack_top_for(cpu) };
+        // The guard page lies directly below the stack's pages, inside the
+        // slab Phase 4 allocated, so the subtraction does not wrap.
         let guard = mm::paging::virt_to_phys(top)
-            - ((sched::KERNEL_STACK_PAGES + 1) * mm::PAGE_SIZE) as u64;
+            .wrapping_sub(KERNEL_STACK_BYTES)
+            .wrapping_sub(PAGE_BYTES);
         if mm::stack_guard::is_mapped(guard)
         {
             fatal("Phase 8: an idle stack's guard page is mapped");
@@ -1983,31 +2051,32 @@ unsafe fn backtrace_scan(stack_top: u64)
     // A panic taken on another stack (an IST stack, or the boot stack before
     // the first thread runs) has no frames between `sp` and this thread's
     // stack top; scanning that gap could read unmapped memory.
-    if sp >= top || top - sp > sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE
+    let on_stack = top
+        .checked_sub(sp)
+        .is_some_and(|depth| depth != 0 && depth <= sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE);
+    let Some(start) = sp.checked_next_multiple_of(8).filter(|_| on_stack)
+    else
     {
         return;
-    }
+    };
     // SAFETY: panic path; lock-bypassing serial write.
     unsafe {
         console::panic_write_fmt(format_args!(
             "  backtrace (kernel-text words on stack; addr2line offline):\n"
         ));
     }
-    let mut addr = (sp + 7) & !7usize;
-    let mut hits = 0usize;
-    while addr < top && hits < MAX_HITS
-    {
+    let text_words = (start..top)
+        .step_by(8)
         // SAFETY: addr in [sp, stack_top) is mapped kernel stack; 8-byte aligned.
-        let val = unsafe { *(addr as *const usize) };
-        if val >= text_start && val < text_end
-        {
-            // SAFETY: panic path; lock-bypassing serial write.
-            unsafe {
-                console::panic_write_fmt(format_args!("    {val:#018x}\n"));
-            }
-            hits += 1;
+        .map(|addr| unsafe { *(addr as *const usize) })
+        .filter(|val| (text_start..text_end).contains(val))
+        .take(MAX_HITS);
+    for val in text_words
+    {
+        // SAFETY: panic path; lock-bypassing serial write.
+        unsafe {
+            console::panic_write_fmt(format_args!("    {val:#018x}\n"));
         }
-        addr += 8;
     }
 }
 

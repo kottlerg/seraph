@@ -176,10 +176,9 @@ fn validate_apertures_inner(info: &'static BootInfo) -> ValidatedApertures
     };
 
     let entries_phys = ap.entries as u64;
-    let slice_bytes = ap.count * core::mem::size_of::<MmioAperture>() as u64;
-    let slice_end = entries_phys + slice_bytes;
-
-    if !slice_in_boot_memory(entries_phys, slice_end, mmap)
+    // A slice whose end wraps lies in no memory.
+    if aperture_slice_end(entries_phys, ap.count)
+        .is_none_or(|slice_end| !slice_in_boot_memory(entries_phys, slice_end, mmap))
     {
         crate::fatal("Phase 6: mmio_apertures slice falls outside Usable/Loaded memory");
     }
@@ -202,6 +201,15 @@ fn validate_apertures_inner(info: &'static BootInfo) -> ValidatedApertures
     ValidatedApertures { raw, mmap }
 }
 
+/// The end of the `count`-entry aperture slice at `entries_phys`, or `None`
+/// when its byte length or its end wraps `u64`.
+fn aperture_slice_end(entries_phys: u64, count: u64) -> Option<u64>
+{
+    count
+        .checked_mul(core::mem::size_of::<MmioAperture>() as u64)
+        .and_then(|bytes| entries_phys.checked_add(bytes))
+}
+
 /// Outcome of [`report_apertures`]: entries accepted and entries skipped as
 /// invalid or RAM-overlapping.
 struct ApertureCounts
@@ -221,12 +229,13 @@ fn report_apertures(raw: &[MmioAperture], mmap: &[MemoryMapEntry]) -> ApertureCo
         skipped: 0,
     };
 
+    // Both counts stay at most `raw.len()`, so neither step saturates.
     for (i, entry) in raw.iter().enumerate()
     {
         if let Some(fault) = aperture_fault(entry)
         {
             report_fault(i, entry, fault);
-            counts.skipped += 1;
+            counts.skipped = counts.skipped.saturating_add(1);
             continue;
         }
         if let Some(ram) = ram_overlap(entry, mmap)
@@ -240,10 +249,10 @@ fn report_apertures(raw: &[MmioAperture], mmap: &[MemoryMapEntry]) -> ApertureCo
                 ram.physical_base,
                 ram.size
             );
-            counts.skipped += 1;
+            counts.skipped = counts.skipped.saturating_add(1);
             continue;
         }
-        counts.accepted += 1;
+        counts.accepted = counts.accepted.saturating_add(1);
     }
 
     counts
@@ -257,7 +266,7 @@ fn report_apertures(raw: &[MmioAperture], mmap: &[MemoryMapEntry]) -> ApertureCo
 /// [`aperture_fault`] accepts, so its end does not wrap.
 fn ram_overlap<'a>(ap: &MmioAperture, map: &'a [MemoryMapEntry]) -> Option<&'a MemoryMapEntry>
 {
-    let ap_end = ap.phys_base + ap.size;
+    let ap_end = ap.phys_base.saturating_add(ap.size);
     map.iter().find(|e| {
         matches!(
             e.memory_type,
@@ -351,15 +360,15 @@ fn report_fault(index: usize, ap: &MmioAperture, fault: ApertureFault)
 ///
 /// Coverage is computed by summing the intersection of each qualifying region
 /// with the slice interval. An empty slice (`slice_start >= slice_end`) is
-/// trivially covered.
+/// trivially covered. A region whose end would wrap `u64` reaches the end of
+/// the address space.
 fn slice_in_boot_memory(slice_start: u64, slice_end: u64, map: &[MemoryMapEntry]) -> bool
 {
-    if slice_start >= slice_end
+    let Some(needed) = slice_end.checked_sub(slice_start).filter(|&n| n != 0)
+    else
     {
         return true;
-    }
-
-    let needed = slice_end - slice_start;
+    };
     let mut covered: u64 = 0;
 
     for entry in map
@@ -368,12 +377,12 @@ fn slice_in_boot_memory(slice_start: u64, slice_end: u64, map: &[MemoryMapEntry]
         {
             continue;
         }
-        let region_end = entry.physical_base + entry.size;
+        let region_end = entry.physical_base.saturating_add(entry.size);
         let overlap_start = entry.physical_base.max(slice_start);
         let overlap_end = region_end.min(slice_end);
-        if overlap_end > overlap_start
+        if let Some(overlap) = overlap_end.checked_sub(overlap_start)
         {
-            covered += overlap_end - overlap_start;
+            covered = covered.saturating_add(overlap);
         }
     }
 
@@ -571,5 +580,27 @@ mod tests
             memory_type: MemoryType::Reserved,
         }];
         assert!(!slice_in_boot_memory(0x1000, 0x2000, &map));
+    }
+
+    // Defect caught: an aperture count whose byte length wraps to a short or
+    // empty slice, which the coverage check then accepts, so Phase 6 builds a
+    // slice of that count over memory it never checked.
+    #[test]
+    fn an_aperture_slice_whose_length_or_end_wraps_has_no_end()
+    {
+        assert_eq!(aperture_slice_end(0x1000, 2), Some(0x1000 + 32));
+        assert_eq!(aperture_slice_end(0x1000, 1 << 60), None);
+        assert_eq!(aperture_slice_end(u64::MAX - 8, 1), None);
+    }
+
+    // Defect caught: a Usable region whose end wraps `u64`, which overflowed
+    // the coverage sum's region end (a panic in a debug build, a region that
+    // covers nothing in a release one).
+    #[test]
+    fn a_region_whose_end_wraps_covers_to_the_end_of_the_address_space()
+    {
+        let map = [usable(u64::MAX - 0xFFF, 0x2000)];
+        assert!(slice_in_boot_memory(u64::MAX - 0x800, u64::MAX, &map));
+        assert!(!slice_in_boot_memory(u64::MAX - 0x2000, u64::MAX, &map));
     }
 }

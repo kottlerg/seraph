@@ -15,7 +15,6 @@
 
 // Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
 #![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 // When built as a std dep via `rustc-dep-of-std`, we switch to `no_core`
 // and rebind `core` to the `rustc_std_workspace_core` facade — same dance
 // as abi/syscall and shared/syscall.
@@ -4640,6 +4639,21 @@ mod tests
         );
         words[2] = svcmgr_labels::NAME_MAX as u64 + 1;
         assert!(unpack_list_entry(&words, 0, &mut out).is_none());
+    }
+
+    // The defect caught: an entry index whose word offset overflows `usize`,
+    // which wrapped to a small offset and wrote or read another entry.
+    #[test]
+    fn a_process_list_index_whose_offset_overflows_is_refused()
+    {
+        use procmgr_labels::{LIST_PROCESSES_WORDS_PER_ENTRY, pack_list_entry, unpack_list_entry};
+        let index = usize::MAX / LIST_PROCESSES_WORDS_PER_ENTRY + 1;
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_list_entry(&mut words, index, 7, b"a"));
+        assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
+        words[0] = u64::MAX;
+        let mut out = [0u8; svcmgr_labels::NAME_MAX];
+        assert!(unpack_list_entry(&words, index, &mut out).is_none());
     }
 
     #[test]

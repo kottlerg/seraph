@@ -23,12 +23,18 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for cycle in 0..CYCLES
     {
-        let base = (cycle as u64) * 100;
+        let base = (cycle as u64)
+            .checked_mul(100)
+            .ok_or("event_fill_drain: base overflows")?;
+        let value = |i: u32| {
+            base.checked_add(u64::from(i))
+                .ok_or("event_fill_drain: value overflows")
+        };
 
         // Fill to capacity.
         for i in 0..CAPACITY
         {
-            event_post(eq, base + u64::from(i))
+            event_post(eq, value(i)?)
                 .map_err(|_| "event_fill_drain: event_post during fill failed")?;
         }
 
@@ -44,7 +50,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             let val =
                 event_recv(eq).map_err(|_| "event_fill_drain: event_recv during drain failed")?;
-            let expected = base + u64::from(i);
+            let expected = value(i)?;
             if val != expected
             {
                 return Err("event_fill_drain: FIFO order violation");

@@ -157,7 +157,14 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, 1)
         .map_err(|_| "stress::timed_wait_reuse: pin controller failed")?;
-    let result = with_waiter(ctx, u32::try_from(2 % cpus).unwrap_or(0));
+    let result = with_waiter(
+        ctx,
+        u32::try_from(
+            2u64.checked_rem(cpus)
+                .ok_or("stress::timed_wait_reuse: CpuCount is zero")?,
+        )
+        .unwrap_or(0),
+    );
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::timed_wait_reuse: restore controller affinity failed");
     let tally = result?;
@@ -313,14 +320,16 @@ fn cycles(sig: u64, eq: u64) -> Result<Tally, &'static str>
         let timed = check(source, timed, untimed)?;
         if late
         {
-            if timed == TIMED_DELIVERY
+            let counts = if timed == TIMED_DELIVERY
             {
-                tally.delivered[source] += 1;
+                tally.delivered.get_mut(source)
             }
             else
             {
-                tally.timed_out[source] += 1;
-            }
+                tally.timed_out.get_mut(source)
+            };
+            let count = counts.ok_or("stress::timed_wait_reuse: source index out of range")?;
+            *count = count.saturating_add(1);
         }
     }
     Ok(tally)
@@ -330,8 +339,12 @@ fn cycles(sig: u64, eq: u64) -> Result<Tally, &'static str>
 /// deadline.
 fn late_delay(cycle: u32) -> TestResult
 {
-    let delay_us = LATE_MIN_US + u64::from(cycle.wrapping_mul(2_654_435_761)) % LATE_SPAN_US;
-    let until = elapsed_us()? + delay_us;
+    let delay_us = LATE_MIN_US
+        .checked_add(u64::from(cycle.wrapping_mul(2_654_435_761)) % LATE_SPAN_US)
+        .ok_or("stress::timed_wait_reuse: late delay overflows")?;
+    let until = elapsed_us()?
+        .checked_add(delay_us)
+        .ok_or("stress::timed_wait_reuse: late deadline overflows")?;
     while elapsed_us()? < until
     {
         core::hint::spin_loop();
@@ -343,7 +356,9 @@ fn late_delay(cycle: u32) -> TestResult
 /// [`ENTER_TIMEOUT_US`].
 fn await_timed_wait(cycle: u32) -> TestResult
 {
-    let until = elapsed_us()? + crate::scaled_bound(ENTER_TIMEOUT_US);
+    let until = elapsed_us()?
+        .checked_add(crate::scaled_bound(ENTER_TIMEOUT_US))
+        .ok_or("stress::timed_wait_reuse: enter deadline overflows")?;
     while TIMED.load(Ordering::Acquire) != cycle
     {
         if elapsed_us()? >= until
@@ -378,7 +393,7 @@ fn await_results(
     {
         if spins < RESULT_SPINS
         {
-            spins += 1;
+            spins = spins.saturating_add(1);
             core::hint::spin_loop();
             continue;
         }
@@ -395,7 +410,7 @@ fn await_results(
             Err(e) if e == SyscallError::QueueFull as i64 => released = true,
             Err(_) => return Err("stress::timed_wait_reuse: release failed"),
         }
-        sleeps += 1;
+        sleeps = sleeps.saturating_add(1);
         thread_sleep(1).map_err(|_| "stress::timed_wait_reuse: release poll sleep failed")?;
     }
     if released { drain() } else { Ok(()) }
@@ -472,7 +487,7 @@ extern "C" fn waiter_entry(arg: u64) -> !
     let WaiterArgs { sig, eq } = unsafe { spawn::child_args(arg) };
     for cycle in 1..=CYCLES
     {
-        while ACKED.load(Ordering::Acquire) != cycle - 1
+        while ACKED.load(Ordering::Acquire) != cycle.saturating_sub(1)
         {
             core::hint::spin_loop();
         }

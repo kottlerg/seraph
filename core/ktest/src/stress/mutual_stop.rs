@@ -243,15 +243,23 @@ fn report(tally: &Tally) -> TestResult
         "stress::mutual_stop: a start by a child failed other than with InvalidArgument or \
          Interrupted",
     )?;
-    for (index, progress) in tally.progress_in_rounds.iter().enumerate()
+    let [first_controller, second_controller] = tally.controller_starts_ok;
+    let peer_controller_starts = [second_controller, first_controller];
+    for (((progress, stops_ok), starts_ok), peer_controller) in tally
+        .progress_in_rounds
+        .iter()
+        .zip(&STOPS_OK)
+        .zip(&STARTS_OK)
+        .zip(peer_controller_starts)
     {
         if *progress == 0
         {
             return Err("stress::mutual_stop: a child counted no loop during the rounds");
         }
-        let peer = 1 - index;
-        let stops = STOPS_OK[index].load(Ordering::Acquire);
-        let starts = STARTS_OK[index].load(Ordering::Acquire) + tally.controller_starts_ok[peer];
+        let stops = stops_ok.load(Ordering::Acquire);
+        let starts = starts_ok
+            .load(Ordering::Acquire)
+            .saturating_add(peer_controller);
         if stops != starts
         {
             return Err(
@@ -273,20 +281,24 @@ fn report(tally: &Tally) -> TestResult
 /// Log each child's tallies, then the controller's.
 fn log_tallies(tally: &Tally)
 {
-    for (index, labels) in CHILD_LABELS.iter().enumerate()
+    for (((((labels, progress), stops_ok), starts_ok), starts_interrupted), controller_starts_ok) in
+        CHILD_LABELS
+            .iter()
+            .zip(tally.progress_in_rounds)
+            .zip(&STOPS_OK)
+            .zip(&STARTS_OK)
+            .zip(&STARTS_INTERRUPTED)
+            .zip(tally.controller_starts_ok)
     {
         for (label, value) in [
-            (labels.progress, tally.progress_in_rounds[index]),
-            (labels.stops_ok, STOPS_OK[index].load(Ordering::Acquire)),
-            (labels.starts_ok, STARTS_OK[index].load(Ordering::Acquire)),
+            (labels.progress, progress),
+            (labels.stops_ok, stops_ok.load(Ordering::Acquire)),
+            (labels.starts_ok, starts_ok.load(Ordering::Acquire)),
             (
                 labels.starts_interrupted,
-                STARTS_INTERRUPTED[index].load(Ordering::Acquire),
+                starts_interrupted.load(Ordering::Acquire),
             ),
-            (
-                labels.controller_starts_ok,
-                tally.controller_starts_ok[index],
-            ),
+            (labels.controller_starts_ok, controller_starts_ok),
         ]
         {
             crate::log_u64(label, u64::from(value));
@@ -355,22 +367,24 @@ fn start(
         return Err("stress::mutual_stop: a child is missing");
     };
     let th = [first, second];
-    for (index, &own) in th.iter().enumerate()
+    for (index, ((own, peer), cpu)) in th
+        .into_iter()
+        .zip([second, first])
+        .zip(CHILD_CPUS)
+        .enumerate()
     {
-        let peer = th[1 - index];
         // SAFETY: entry `index` is published once, before its child starts.
         let arg = unsafe { CHILD_ARGS.publish(index, ChildArgs { peer, index }) };
-        // SAFETY: stress stacks 0 and 1 belong to this test's two children;
+        // stress stacks 0 and 1 belong to this test's two children;
         // stress tests run sequentially and both are deleted before this
         // test returns.
-        let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[index]) });
+        let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), index)?;
         // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
         // stack is this child's own, on which no other live thread runs (`ChildStack`'s
         // rule, as noted where the stack is chosen).
         unsafe { thread_configure(own, child_entry as *const () as u64, top, arg) }
             .map_err(|_| "stress::mutual_stop: thread_configure failed")?;
-        thread_set_affinity(own, CHILD_CPUS[index])
-            .map_err(|_| "stress::mutual_stop: pin child failed")?;
+        thread_set_affinity(own, cpu).map_err(|_| "stress::mutual_stop: pin child failed")?;
     }
     for &own in &th
     {
@@ -388,18 +402,18 @@ fn rounds(th: [u64; CHILDREN], tally: &mut Tally) -> TestResult
     for cycle in 0..CYCLES
     {
         let before = PROGRESS.each_ref().map(|p| p.load(Ordering::Acquire));
-        let mut restarted = 0;
-        for (index, &child) in th.iter().enumerate()
+        let mut restarted = 0usize;
+        for (&child, controller_starts_ok) in th.iter().zip(tally.controller_starts_ok.iter_mut())
         {
             if restart(child)?
             {
-                tally.controller_starts_ok[index] += 1;
-                restarted += 1;
+                *controller_starts_ok = controller_starts_ok.saturating_add(1);
+                restarted = restarted.saturating_add(1);
             }
         }
         if restarted == CHILDREN
         {
-            tally.both_restarted += 1;
+            tally.both_restarted = tally.both_restarted.saturating_add(1);
         }
         await_progress(before, tally)?;
         // 0 to 4095 spins (a multiplicative hash of the round).
@@ -448,7 +462,7 @@ fn await_progress(before: [u32; CHILDREN], tally: &mut Tally) -> TestResult
         }
         if elapsed_us()?.saturating_sub(start) > ROUND_WAIT_US
         {
-            tally.starved += 1;
+            tally.starved = tally.starved.saturating_add(1);
             return Ok(());
         }
         core::hint::spin_loop();
@@ -469,19 +483,19 @@ fn finish(th: [u64; CHILDREN], tally: &mut Tally) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
     let max_polls = crate::scaled_polls(EXIT_POLLS);
-    let mut polls = 0;
+    let mut polls = 0u32;
     while EXITED.load(Ordering::Acquire) as usize != CHILDREN
     {
         if polls == max_polls
         {
             return Err("stress::mutual_stop: a child did not exit");
         }
-        polls += 1;
-        for (index, &child) in th.iter().enumerate()
+        polls = polls.saturating_add(1);
+        for (&child, controller_starts_ok) in th.iter().zip(tally.controller_starts_ok.iter_mut())
         {
             if restart(child)?
             {
-                tally.controller_starts_ok[index] += 1;
+                *controller_starts_ok = controller_starts_ok.saturating_add(1);
             }
         }
         thread_sleep(1).map_err(|_| "stress::mutual_stop: exit poll sleep failed")?;
@@ -509,18 +523,29 @@ extern "C" fn child_entry(arg: u64) -> !
     {
         core::hint::spin_loop();
     }
+    let (Some(progress), Some(stops_ok), Some(starts_ok), Some(starts_interrupted)) = (
+        PROGRESS.get(index),
+        STOPS_OK.get(index),
+        STARTS_OK.get(index),
+        STARTS_INTERRUPTED.get(index),
+    )
+    else
+    {
+        // The parent's bounded exit wait reports a child that never exits.
+        thread_exit()
+    };
     let mut loops = 0u32;
     while QUIT.load(Ordering::Acquire) == 0
     {
         loops = loops.wrapping_add(1);
-        stop_peer(peer, index);
+        stop_peer(peer, stops_ok);
         // 0 to 4095 spins (a multiplicative hash of the loop count).
         for _ in 0..(loops.wrapping_mul(2_654_435_761) >> 20)
         {
             core::hint::spin_loop();
         }
-        start_peer(peer, index);
-        PROGRESS[index].fetch_add(1, Ordering::AcqRel);
+        start_peer(peer, starts_ok, starts_interrupted);
+        progress.fetch_add(1, Ordering::AcqRel);
     }
     QUIESCED.fetch_add(1, Ordering::AcqRel);
     while (QUIESCED.load(Ordering::Acquire) as usize) < CHILDREN
@@ -533,13 +558,13 @@ extern "C" fn child_entry(arg: u64) -> !
 
 /// Stop the peer: `Ok` is tallied, `InvalidState` (the peer is already
 /// stopped, or exited) accepted, anything else recorded as bad.
-fn stop_peer(peer: u64, index: usize)
+fn stop_peer(peer: u64, stops_ok: &AtomicU32)
 {
     match thread_stop(peer)
     {
         Ok(()) =>
         {
-            STOPS_OK[index].fetch_add(1, Ordering::AcqRel);
+            stops_ok.fetch_add(1, Ordering::AcqRel);
         }
         Err(e) if e == SyscallError::InvalidState as i64 =>
         {}
@@ -550,19 +575,19 @@ fn stop_peer(peer: u64, index: usize)
 /// Start the peer: `Ok` is tallied, `InvalidArgument` (the peer is running,
 /// or exited) accepted, `Interrupted` (this child was stopped while the
 /// start waited) tallied, anything else recorded as bad.
-fn start_peer(peer: u64, index: usize)
+fn start_peer(peer: u64, starts_ok: &AtomicU32, starts_interrupted: &AtomicU32)
 {
     match thread_start(peer)
     {
         Ok(()) =>
         {
-            STARTS_OK[index].fetch_add(1, Ordering::AcqRel);
+            starts_ok.fetch_add(1, Ordering::AcqRel);
         }
         Err(e) if e == SyscallError::InvalidArgument as i64 =>
         {}
         Err(e) if e == SyscallError::Interrupted as i64 =>
         {
-            STARTS_INTERRUPTED[index].fetch_add(1, Ordering::AcqRel);
+            starts_interrupted.fetch_add(1, Ordering::AcqRel);
         }
         Err(e) => BAD_STARTS.record_error(e),
     }

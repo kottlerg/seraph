@@ -312,12 +312,15 @@ fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
             // after the delete the ack fails.
             irq_ack(copy).ok();
             raise_tx_interrupt();
-            raises += 1;
+            raises = raises.saturating_add(1);
             overlapped |= during;
         }
         if overlapped
         {
-            armed[usize::from(rebound(round))] += 1;
+            let slot = armed
+                .get_mut(usize::from(rebound(round)))
+                .ok_or("stress::irq_route_delete_race: rebind index out of range")?;
+            *slot = slot.saturating_add(1);
         }
         if DELETED.load(Ordering::Acquire) == round
         {
@@ -337,10 +340,10 @@ fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
 /// the deleter still holds it.
 fn await_delete(round: u32) -> TestResult
 {
-    let mut polls = 0;
+    let mut polls = 0u32;
     while DELETED.load(Ordering::Acquire) != round
     {
-        polls += 1;
+        polls = polls.saturating_add(1);
         if polls > crate::scaled_polls(EXIT_POLLS)
         {
             return Err("stress::irq_route_delete_race: deleter never deleted");
@@ -354,14 +357,18 @@ fn await_delete(round: u32) -> TestResult
 /// armed the race.
 fn binding_rounds(ctx: &TestContext, line: u64, first: u32) -> Result<u32, &'static str>
 {
+    let last = first
+        .checked_add(BINDING_CYCLES)
+        .ok_or("stress::irq_route_delete_race: binding round numbers overflow")?;
     let keeper = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::irq_route_delete_race: create keeper notification failed")?;
     let victim = cap_create_notification(ctx.memory_base);
     let result = victim
         .map_err(|_| "stress::irq_route_delete_race: create victim notification failed")
         .and_then(|victim| {
-            (first..first + BINDING_CYCLES).try_fold(0u32, |armed, round| {
-                binding_round(line, round, [keeper, victim]).map(|hit| armed + u32::from(hit))
+            (first..last).try_fold(0u32, |armed, round| {
+                binding_round(line, round, [keeper, victim])
+                    .map(|hit| armed.saturating_add(u32::from(hit)))
             })
         });
     if let Ok(victim) = victim
@@ -422,7 +429,7 @@ fn race_binding_delete(
         irq_ack(kept).ok();
         irq_ack(doomed).ok();
         raise_tx_interrupt();
-        raises += 1;
+        raises = raises.saturating_add(1);
         overlapped |= during;
     }
     if DELETED.load(Ordering::Acquire) == round

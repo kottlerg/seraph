@@ -206,14 +206,9 @@ fn phases(ctx: &TestContext) -> TestResult
 /// landed inside a call.
 fn report(landed: &[u32; 4]) -> TestResult
 {
-    for call in (0..CALLS).map(|offset| FIRST + offset)
+    for (label, oks) in OK_LABELS.iter().zip(&OKS).skip(FIRST as usize)
     {
-        let i = call as usize;
-        log_cell_u64(
-            CELL,
-            OK_LABELS[i],
-            u64::from(OKS[i].load(Ordering::Acquire)),
-        );
+        log_cell_u64(CELL, label, u64::from(oks.load(Ordering::Acquire)));
     }
     for (label, &count) in LANDED_LABELS.iter().zip(landed)
     {
@@ -230,11 +225,14 @@ fn report(landed: &[u32; 4]) -> TestResult
     {
         return Err("stress::copy_source_delete: the caller missed a round's free");
     }
-    if (0..CALLS).any(|offset| OKS[(FIRST + offset) as usize].load(Ordering::Acquire) == 0)
+    if OKS
+        .iter()
+        .skip(FIRST as usize)
+        .any(|oks| oks.load(Ordering::Acquire) == 0)
     {
         return Err("stress::copy_source_delete: a copy or derive call never returned Ok");
     }
-    if landed[FIRST as usize..].iter().all(|&n| n == 0)
+    if landed.iter().skip(FIRST as usize).all(|&n| n == 0)
     {
         return Err(
             "stress::copy_source_delete: no free landed while the caller was inside a call \
@@ -294,10 +292,10 @@ fn start_caller(ctx: &TestContext, done: u64, slot: &mut Option<u64>) -> TestRes
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::copy_source_delete: create caller failed")?,
     );
-    // SAFETY: stress stack 0 belongs to this test's caller. Stress tests run
+    // Stress stack 0 belongs to this test's caller. Stress tests run
     // sequentially, and a phase's caller has exited before the next phase's
     // caller reuses the stack.
-    let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[CALLER_STACK]) });
+    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), CALLER_STACK)?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).
@@ -335,7 +333,10 @@ fn round(ctx: &TestContext, free: Free, cycle: u32, done: u64, landed: &mut [u32
 
     HANDLE.store(handle, Ordering::Release);
     ROUND.fetch_add(1, Ordering::AcqRel);
-    let aim = FIRST + cycle % CALLS;
+    let aim = cycle
+        .checked_rem(CALLS)
+        .and_then(|call| FIRST.checked_add(call))
+        .ok_or("stress::copy_source_delete: aim out of range")?;
     // A round whose aim never shows up frees the source anyway; only the
     // clock failing fails the wait.
     let _ = await_within(crate::scaled_bound(ROUND_WAIT_US), || {
@@ -361,7 +362,11 @@ fn round(ctx: &TestContext, free: Free, cycle: u32, done: u64, landed: &mut [u32
         let _ = cap_delete(original);
         return Err("stress::copy_source_delete: freeing the source failed");
     }
-    landed[(inside as usize).min(landed.len() - 1)] += 1;
+    let last = landed.len().saturating_sub(1);
+    let tally = landed
+        .get_mut((inside as usize).min(last))
+        .ok_or("stress::copy_source_delete: landed tally out of range")?;
+    *tally = tally.saturating_add(1);
 
     let mut acc = 0u64;
     await_report(
@@ -388,7 +393,7 @@ fn await_within(bound_us: u64, mut reached: impl FnMut() -> bool) -> Result<bool
         }
         if polls < BUSY_POLLS
         {
-            polls += 1;
+            polls = polls.saturating_add(1);
             core::hint::spin_loop();
         }
         else
@@ -483,7 +488,14 @@ fn call(kind: u32, issue: impl FnOnce() -> Result<u64, i64>) -> Result<(), Handl
     {
         Ok(made) =>
         {
-            OKS[kind as usize].fetch_add(1, Ordering::AcqRel);
+            match OKS.get(kind as usize)
+            {
+                Some(oks) =>
+                {
+                    oks.fetch_add(1, Ordering::AcqRel);
+                }
+                None => BAD.record(u64::from(kind)),
+            }
             // A capability the revoke already cleared deletes as a no-op
             // `Ok` (a Null slot), so any failure is a defect.
             if let Err(e) = cap_delete(made)

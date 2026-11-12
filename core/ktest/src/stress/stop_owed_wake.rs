@@ -207,7 +207,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     };
     // Without the racing phase the starter only waits for QUIT, so it may
     // share CPU 0.
-    let waiter_cpu = u32::try_from(2 % cpus).unwrap_or(0);
+    let waiter_cpu = u32::try_from(
+        2u64.checked_rem(cpus)
+            .ok_or("stress::stop_owed_wake: CpuCount is zero")?,
+    )
+    .unwrap_or(0);
     let starter_cpu = match phases
     {
         Phases::AloneThenRacing => STARTER_CPU,
@@ -343,9 +347,11 @@ fn start(
 ) -> TestResult
 {
     let entries: [extern "C" fn(u64) -> !; CHILDREN] = [waiter_entry, sender_entry, starter_entry];
-    for (index, entry) in entries.into_iter().enumerate()
+    for (index, (entry, cpu)) in entries.into_iter().zip(cpus).enumerate()
     {
-        children[index] =
+        *children
+            .get_mut(index)
+            .ok_or("stress::stop_owed_wake: child index out of range")? =
             Some(spawn::new_child(ctx).map_err(|_| "stress::stop_owed_wake: spawn child failed")?);
         let source = if index == 2
         {
@@ -358,18 +364,19 @@ fn start(
         {
             sig
         };
-        let child = children[index]
-            .as_ref()
+        let child = children
+            .get(index)
+            .and_then(Option::as_ref)
             .ok_or("stress::stop_owed_wake: no child")?;
         let arg = cap_copy(source, child.cs, RIGHTS_ALL)
             .map_err(|_| "stress::stop_owed_wake: cap_copy into child failed")?;
-        // SAFETY: stress stacks 0 to 2 belong to this test's three children;
+        // stress stacks 0 to 2 belong to this test's three children;
         // stress tests run sequentially and every child is deleted before
         // this test returns.
-        let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[index]) });
+        let stack = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), index)?;
         // SAFETY: the stack is `super::STRESS_STACKS[index]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
-        unsafe { spawn::configure_and_start_pinned(child, entry, stack, arg, cpus[index]) }
+        unsafe { spawn::configure_and_start_pinned(child, entry, stack, arg, cpu) }
             .map_err(|_| "stress::stop_owed_wake: start child failed")?;
     }
     Ok(())
@@ -430,7 +437,7 @@ fn run_phases(waiter_th: u64, starter_th: u64, phases: Phases) -> Result<Armed, 
 /// starter's).
 fn rounds(waiter_th: u64, starter_th: Option<u64>) -> Result<u32, &'static str>
 {
-    let mut lost = 0;
+    let mut lost = 0u32;
     for cycle in 0..CYCLES
     {
         stop(
@@ -456,7 +463,7 @@ fn rounds(waiter_th: u64, starter_th: Option<u64>) -> Result<u32, &'static str>
         }
         if restarted?
         {
-            lost += 1;
+            lost = lost.saturating_add(1);
         }
         await_waiter_entry(entered);
         for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 22)

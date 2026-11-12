@@ -123,7 +123,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // is now about to wait on.
     PHASE2_SIG.store(child_ready, Ordering::Release);
     let phase2_ptr = phase2_entry as *const () as u64;
-    crate::spawn::redirect_to_entry(&mut reg_buf[..], phase2_ptr);
+    crate::spawn::redirect_to_entry(&mut reg_buf[..], phase2_ptr)?;
     // SAFETY: the frame was read from this child, so its stack pointer lies on
     // the child's own `ChildStack`; `redirect_to_entry` pointed it at `phase2_entry`,
     // an `extern "C"` entry that never returns and needs nothing of the

@@ -139,7 +139,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
         if dt > OUTLIER_US
         {
-            outlier_count += 1;
+            outlier_count = outlier_count.saturating_add(1);
         }
     }
 

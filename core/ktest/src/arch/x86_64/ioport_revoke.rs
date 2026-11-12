@@ -90,10 +90,10 @@ fn check(ctx: &TestContext, held: u64) -> TestResult
     }
 
     let polls = crate::scaled_polls(MAX_POLLS);
-    let mut waited = 0;
+    let mut waited = 0u32;
     while READS.load(Ordering::Acquire) == 0
     {
-        waited += 1;
+        waited = waited.saturating_add(1);
         if waited >= polls
         {
             return abandon("integration::ioport_revoke: the reader never read the port");

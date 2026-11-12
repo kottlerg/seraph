@@ -184,7 +184,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// The blocking syscall of `round` (rounds count from 1).
 fn kind_of(round: u32) -> u32
 {
-    (round - 1) % KINDS
+    round.saturating_sub(1) % KINDS
 }
 
 /// The syscall number the child's frame carries while it blocks in `kind`.
@@ -340,7 +340,7 @@ fn stop_in_syscall(child: &SpawnedChild, kind: u32) -> Result<[u8; BUF], &'stati
             );
             "integration::write_regs_blocked_syscall: thread_read_regs refused the stopped child"
         })?;
-        if read_word(&regs, SYSCALL_NR_OFFSET) == want
+        if read_word(&regs, SYSCALL_NR_OFFSET)? == want
         {
             return Ok(regs);
         }
@@ -357,12 +357,15 @@ fn stop_in_syscall(child: &SpawnedChild, kind: u32) -> Result<[u8; BUF], &'stati
 fn edit_and_restart(child: &SpawnedChild, round: u32, regs: &mut [u8; BUF]) -> TestResult
 {
     ROUND.store(round, Ordering::Release);
-    KIND.store(kind_of(round + 1), Ordering::Release);
+    let next_round = round
+        .checked_add(1)
+        .ok_or("integration::write_regs_blocked_syscall: round count overflows")?;
+    KIND.store(kind_of(next_round), Ordering::Release);
     let target = redirected_entry as *const () as u64;
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::redirect_to_entry_at(&mut regs[..], target, stack_top);
+    crate::spawn::redirect_to_entry_at(&mut regs[..], target, stack_top)?;
     let token = TOKEN_TAG | u64::from(round);
-    regs[ARG1_OFFSET..ARG1_OFFSET + 8].copy_from_slice(&token.to_le_bytes());
+    crate::spawn::set_reg_word(&mut regs[..], ARG1_OFFSET, token)?;
     // SAFETY: `redirect_to_entry_at` pointed the frame at `redirected_entry`,
     // an `extern "C"` entry that never returns and needs nothing of the
     // abandoned frames, with the stack pointer at the entry ABI's alignment
@@ -411,9 +414,9 @@ fn await_redirect(child: &SpawnedChild, round: u32) -> TestResult
 }
 
 /// Read the little-endian word at `offset` of a register file.
-fn read_word(regs: &[u8; BUF], offset: usize) -> u64
+fn read_word(regs: &[u8; BUF], offset: usize) -> Result<u64, &'static str>
 {
-    u64::from_le_bytes(regs[offset..offset + 8].try_into().unwrap_or([0u8; 8]))
+    crate::spawn::reg_word(regs, offset)
 }
 
 /// Stop the child, so its deletion tears down a thread off its CPU, then

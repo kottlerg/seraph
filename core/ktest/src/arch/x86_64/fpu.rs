@@ -79,7 +79,7 @@ pub fn preempt_capture(pattern: u64, iters: u64) -> u64
     {
         if lane[0] != pattern || lane[1] != pattern
         {
-            mismatches += 1;
+            mismatches = mismatches.saturating_add(1);
         }
     }
     mismatches
@@ -174,7 +174,7 @@ pub fn notification_rendezvous_capture(
     {
         if lane[0] != pattern || lane[1] != pattern
         {
-            mismatches += 1;
+            mismatches = mismatches.saturating_add(1);
         }
     }
     mismatches
@@ -269,7 +269,7 @@ pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u64, msg_label: u64) -> u64
     {
         if lane[0] != pattern || lane[1] != pattern
         {
-            mismatches += 1;
+            mismatches = mismatches.saturating_add(1);
         }
     }
     mismatches

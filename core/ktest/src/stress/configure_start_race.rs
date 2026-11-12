@@ -226,8 +226,8 @@ fn with_helper(ctx: &TestContext, target_cpu: u32) -> Result<Tally, &'static str
     {
         tally.reset();
     }
-    A_TOP.store(stack_top(A_STACK), Ordering::Release);
-    B_TOP.store(stack_top(B_STACK), Ordering::Release);
+    A_TOP.store(stack_top(A_STACK)?, Ordering::Release);
+    B_TOP.store(stack_top(B_STACK)?, Ordering::Release);
     let mut helper = None;
     let result = start_helper(ctx, &mut helper).and_then(|th| {
         let mut tally = Tally::default();
@@ -252,13 +252,13 @@ fn with_helper(ctx: &TestContext, target_cpu: u32) -> Result<Tally, &'static str
 }
 
 /// The top of stress stack `index`.
-fn stack_top(index: usize) -> u64
+fn stack_top(index: usize) -> Result<u64, &'static str>
 {
-    // SAFETY: stress stacks 0 to 2 belong to this test's helper and raced
+    // Stress stacks 0 to 2 belong to this test's helper and raced
     // threads; stress tests run sequentially, and every thread on them
     // exits or is deleted before this test returns. Only the address is
     // taken here.
-    ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[index]) })
+    ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), index)
 }
 
 /// Create the helper in ktest's own `CSpace` (so the round handles the
@@ -271,18 +271,12 @@ fn start_helper(ctx: &TestContext, slot: &mut Option<u64>) -> Result<u64, &'stat
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::configure_start_race: create helper failed")?,
     );
+    let helper_top = stack_top(HELPER_STACK)?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).
-    unsafe {
-        thread_configure(
-            th,
-            helper_entry as *const () as u64,
-            stack_top(HELPER_STACK),
-            0,
-        )
-    }
-    .map_err(|_| "stress::configure_start_race: configure helper failed")?;
+    unsafe { thread_configure(th, helper_entry as *const () as u64, helper_top, 0) }
+        .map_err(|_| "stress::configure_start_race: configure helper failed")?;
     thread_set_affinity(th, HELPER_CPU)
         .map_err(|_| "stress::configure_start_race: pin helper failed")?;
     thread_start(th).map_err(|_| "stress::configure_start_race: start helper failed")?;
@@ -297,11 +291,11 @@ fn rounds(ctx: &TestContext, target_cpu: u32, tally: &mut Tally) -> TestResult
     {
         if round(ctx, seq, target_cpu)? == OUTCOME_CONFIGURED
         {
-            tally.configured += 1;
+            tally.configured = tally.configured.saturating_add(1);
         }
         else
         {
-            tally.refused += 1;
+            tally.refused = tally.refused.saturating_add(1);
         }
     }
     Ok(())
@@ -519,7 +513,7 @@ fn await_within(bound_us: u64, mut done: impl FnMut() -> bool) -> Result<bool, &
         }
         if polls < BUSY_POLLS
         {
-            polls += 1;
+            polls = polls.saturating_add(1);
             core::hint::spin_loop();
         }
         else
@@ -639,7 +633,9 @@ fn ran(mark: &AtomicU64, stack_top: &AtomicU64, arg: u64) -> !
     let local = 0u8;
     let sp = core::ptr::addr_of!(local) as u64;
     let top = stack_top.load(Ordering::Acquire);
-    if !(top - STACK_BYTES..top).contains(&sp)
+    if !top
+        .checked_sub(STACK_BYTES)
+        .is_some_and(|bottom| (bottom..top).contains(&sp))
     {
         BAD_FRAMES.record(arg);
     }

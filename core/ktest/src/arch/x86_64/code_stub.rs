@@ -4,31 +4,37 @@
 // core/ktest/src/arch/x86_64/code_stub.rs
 
 //! x86-64 machine-code encoders for the stubs `crate::unit::retype` maps
-//! executable in a fresh address space and runs a child thread from.
+//! executable in a fresh address space and runs a child thread from. Each
+//! returns the stub's bytes.
 
 use syscall_abi::SYS_CAP_DELETE;
 
-/// Encode `loop {}` into `buf`; returns the byte count.
-pub fn emit_spin(buf: &mut [u8]) -> usize
+/// `loop {}`: `jmp rel8 -2` (to itself).
+const SPIN: [u8; 2] = [0xEB, 0xFE];
+
+/// Encode `loop {}`.
+#[must_use]
+pub fn spin() -> [u8; 2]
 {
-    // jmp rel8 -2 (to itself)
-    buf[..2].copy_from_slice(&[0xEB, 0xFE]);
-    2
+    SPIN
 }
 
-/// Encode `cap_delete(handle); loop {}` into `buf`; returns the byte count.
-pub fn emit_self_delete(buf: &mut [u8], handle: u64) -> usize
+/// Encode `cap_delete(handle); loop {}`.
+#[must_use]
+pub fn self_delete(handle: u64) -> [u8; 19]
 {
     // mov eax, SYS_CAP_DELETE ; movabs rdi, handle ; syscall ; jmp .
     // The handle takes the full 64-bit immediate: its generation sits above
     // the 32-bit index.
     // cast_possible_truncation: syscall numbers fit 32 bits.
     #[allow(clippy::cast_possible_truncation)]
-    let nr = SYS_CAP_DELETE as u32;
-    buf[0] = 0xB8;
-    buf[1..5].copy_from_slice(&nr.to_le_bytes());
-    buf[5..7].copy_from_slice(&[0x48, 0xBF]);
-    buf[7..15].copy_from_slice(&handle.to_le_bytes());
-    buf[15..17].copy_from_slice(&[0x0F, 0x05]);
-    17 + emit_spin(&mut buf[17..])
+    let [n0, n1, n2, n3] = (SYS_CAP_DELETE as u32).to_le_bytes();
+    let [h0, h1, h2, h3, h4, h5, h6, h7] = handle.to_le_bytes();
+    let [s0, s1] = SPIN;
+    [
+        0xB8, n0, n1, n2, n3, // mov eax, imm32
+        0x48, 0xBF, h0, h1, h2, h3, h4, h5, h6, h7, // movabs rdi, imm64
+        0x0F, 0x05, // syscall
+        s0, s1, // jmp .
+    ]
 }

@@ -41,7 +41,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait_timeout,
-    system_info, thread_set_affinity, thread_yield,
+    system_info, thread_exit, thread_set_affinity, thread_yield,
 };
 use syscall_abi::SystemInfoType;
 
@@ -130,14 +130,23 @@ fn swap_rounds(
 
     // Worker 2p starts on its pair's first CPU and 2p + 1 on the next one:
     // two distinct CPUs whenever there are two.
+    let width = pairs.saturating_mul(2);
     let mut target = [0u32; 2 * MAX_PAIRS];
-    for i in 0..2 * pairs
+    for (i, (slot, worker)) in target
+        .iter_mut()
+        .zip(workers.iter_mut())
+        .enumerate()
+        .take(width)
     {
         // i < 2 * MAX_PAIRS, so the conversion is lossless.
-        target[i] = (u32::try_from(i).unwrap_or(0) + 1) % cpu_mod;
-        workers[i] = spawn::new_child_at(ctx, ctx.sched_control_cap, WORKER_PRIORITY)
+        *slot = u32::try_from(i)
+            .unwrap_or(0)
+            .saturating_add(1)
+            .checked_rem(cpu_mod)
+            .ok_or("stress::affinity_swap_handoff: no CPUs")?;
+        *worker = spawn::new_child_at(ctx, ctx.sched_control_cap, WORKER_PRIORITY)
             .map_err(|_| "stress::affinity_swap_handoff: spawn worker failed")?;
-        let child = &workers[i];
+        let child = &*worker;
         let child_moved = cap_copy(moved, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "stress::affinity_swap_handoff: cap_copy moved failed")?;
         // SAFETY: i < 2 * MAX_PAIRS; worker i has not started, and its
@@ -151,34 +160,45 @@ fn swap_rounds(
                 },
             )
         };
-        // SAFETY: stress tests run sequentially; only this test uses these
+        // Stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots during its run.
-        let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        let stack = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own
         // `ChildStack`, on which no other live thread runs (`ChildStack`'s rule).
-        unsafe { spawn::configure_and_start_pinned(child, worker_entry, stack, arg, target[i]) }
+        unsafe { spawn::configure_and_start_pinned(child, worker_entry, stack, arg, *slot) }
             .map_err(|_| "stress::affinity_swap_handoff: start worker failed")?;
     }
-    await_workers_on(moved, &target[..2 * pairs])?;
+    let wanted = target
+        .get(..width)
+        .ok_or("stress::affinity_swap_handoff: pair count out of range")?;
+    await_workers_on(moved, wanted)?;
 
     // Each round moves every worker to its partner's CPU; the next round
     // moves it back.
     for _ in 0..ROUNDS
     {
-        for p in 0..pairs
+        for (pair_workers, pair_targets) in workers
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(target.as_chunks_mut::<2>().0.iter_mut())
+            .take(pairs)
         {
-            target.swap(2 * p, 2 * p + 1);
-            for i in [2 * p, 2 * p + 1]
+            pair_targets.swap(0, 1);
+            for (worker, &cpu) in pair_workers.iter().zip(pair_targets.iter())
             {
-                thread_set_affinity(workers[i].th, target[i])
+                thread_set_affinity(worker.th, cpu)
                     .map_err(|_| "stress::affinity_swap_handoff: thread_set_affinity failed")?;
             }
         }
-        await_workers_on(moved, &target[..2 * pairs])?;
+        let wanted = target
+            .get(..width)
+            .ok_or("stress::affinity_swap_handoff: pair count out of range")?;
+        await_workers_on(moved, wanted)?;
     }
     crate::log_u64(
         "ktest: stress::affinity_swap_handoff swaps=",
-        u64::from(ROUNDS) * (pairs as u64),
+        u64::from(ROUNDS).saturating_mul(pairs as u64),
     );
     Ok(())
 }
@@ -221,12 +241,19 @@ extern "C" fn worker_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `swap_rounds` published for this worker.
     let WorkerArgs { moved, index } = unsafe { spawn::child_args(arg) };
+    let Some(slot) = WORKER_CPU.get(index)
+    else
+    {
+        // An index past the array is a defect the controller's bounded wait
+        // reports: this worker never publishes its CPU.
+        thread_exit()
+    };
     loop
     {
         if let Ok(cpu) = system_info(SystemInfoType::CurrentCpu as u64)
         {
             let cpu = cpu as u32;
-            if WORKER_CPU[index].swap(cpu, Ordering::AcqRel) != cpu
+            if slot.swap(cpu, Ordering::AcqRel) != cpu
             {
                 notification_send(moved, 1u64 << index).ok();
             }

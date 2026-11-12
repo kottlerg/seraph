@@ -273,7 +273,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         ctx,
         Placement {
             base: CONTROLLER_CPU + 1,
-            span: cpu_count - 1,
+            span: cpu_count
+                .checked_sub(1)
+                .ok_or("stress::stop_reply_race: CpuCount is zero")?,
         },
         Stops::Double,
     );
@@ -296,9 +298,12 @@ struct Placement
 
 impl Placement
 {
-    fn cpu(self, slot: u32, k: u32) -> u32
+    fn cpu(self, slot: u32, k: u32) -> Result<u32, &'static str>
     {
-        self.base + (slot + k) % self.span
+        slot.saturating_add(k)
+            .checked_rem(self.span)
+            .and_then(|offset| self.base.checked_add(offset))
+            .ok_or("stress::stop_reply_race: placement out of range")
     }
 }
 
@@ -369,10 +374,10 @@ fn arm_and_race(
 ) -> TestResult
 {
     let (cycle, slot) = at;
-    let server_cpu = place.cpu(slot, 0);
+    let server_cpu = place.cpu(slot, 0)?;
     // Different CPU from the server: the cancel-CAS and the dealloc-free
     // must run on different cores to actually race (see `Placement`).
-    let client_cpu = place.cpu(slot, 1);
+    let client_cpu = place.cpu(slot, 1)?;
 
     let ep = *parts.ep.insert(
         cap_create_endpoint(ctx.memory_base)
@@ -391,9 +396,9 @@ fn arm_and_race(
             StopperArgs {
                 target: client_th,
                 done,
-                round: cycle + 1,
+                round: cycle.saturating_add(1),
             },
-            place.cpu(slot, 2),
+            place.cpu(slot, 2)?,
             &mut parts.stopper,
         )?;
     }
@@ -570,7 +575,7 @@ fn check_second_stops() -> TestResult
 /// `server`, its guard.
 fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild, stops: Stops) -> TestResult
 {
-    STOPPER_GO.store(cycle + 1, Ordering::Release);
+    STOPPER_GO.store(cycle.saturating_add(1), Ordering::Release);
     if stops == Stops::Double
     {
         controller_lead_in(cycle);
@@ -604,13 +609,13 @@ fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild, stops: Sto
 fn offset_spins(cycle: u32) -> (u32, u32)
 {
     let step = (cycle / 2) % (2 * OFFSET_SPAN);
-    if step >= OFFSET_SPAN
+    if let Some(delay) = step.checked_sub(OFFSET_SPAN)
     {
-        (step - OFFSET_SPAN, 0)
+        (delay, 0)
     }
     else
     {
-        (0, OFFSET_SPAN - step)
+        (0, OFFSET_SPAN.saturating_sub(step))
     }
 }
 
@@ -621,7 +626,7 @@ fn controller_lead_in(cycle: u32)
 {
     for _ in 0..SEEN_PROBES
     {
-        if STOPPER_SEEN.load(Ordering::Acquire) == cycle + 1
+        if STOPPER_SEEN.load(Ordering::Acquire) == cycle.saturating_add(1)
         {
             break;
         }
@@ -826,7 +831,7 @@ extern "C" fn stopper_entry(arg: u64) -> !
     }
     STOPPER_SEEN.store(round, Ordering::Release);
     // `round` counts the cycle from 1.
-    let (stopper_spin, _) = offset_spins(round - 1);
+    let (stopper_spin, _) = offset_spins(round.saturating_sub(1));
     for _ in 0..stopper_spin
     {
         core::hint::spin_loop();

@@ -186,14 +186,14 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
 fn poll_event(eq: u64) -> Result<DeathEvent, &'static str>
 {
     let bound = crate::scaled_polls(MAX_POLLS);
-    let mut polls = 0;
+    let mut polls = 0u32;
     loop
     {
         if let Ok(death) = event_try_recv_death(eq)
         {
             return Ok(death);
         }
-        polls += 1;
+        polls = polls.saturating_add(1);
         if polls >= bound
         {
             return Err("death_notification_late_bind: death event never arrived");

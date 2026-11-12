@@ -87,7 +87,7 @@ extern "C" fn hog_entry(done_slot: u64) -> !
         // observe whether preemption fires" — depends on the loop
         // body actually consuming wall-clock time.
         core::hint::black_box(n);
-        n -= 1;
+        n = n.saturating_sub(1);
     }
     notification_send(done_slot, HOG_BIT).ok();
     thread_exit();

@@ -344,9 +344,10 @@ withdraws the driver of every confined device; it restarts nothing, restartabili
 [#262](https://github.com/kottlerg/seraph/issues/262). Invalidation is synchronous, through VT-d's
 invalidation registers and through the RISC-V IOMMU's command queue, each polled to completion,
 two IPC hops per mapping; batching it is
-[#772](https://github.com/kottlerg/seraph/issues/772). Faults are polled, not signalled, until
-message-signalled interrupts exist ([#325](https://github.com/kottlerg/seraph/issues/325)), and
-devmgr logs each one against its device.
+[#772](https://github.com/kottlerg/seraph/issues/772). Faults are polled, not signalled, because
+no IOMMU driver programs a message-signaled interrupt for fault events
+([#325](https://github.com/kottlerg/seraph/issues/325)), and devmgr logs each one against its
+device.
 
 When devmgr binds a DMA-capable driver, it spawns the driver
 with `procmgr_labels::CREATE_PINNED`, so the driver's memory is eager-mapped,
@@ -381,8 +382,9 @@ address).
 ## Interrupt Delivery
 
 Implementation status: the kernel's binding mechanism below, its trigger and polarity mode, and
-devmgr's sharing of a line among the devices on it are implemented; message-signaled interrupts
-are design intent (below).
+devmgr's sharing of a line among the devices on it, and the kernel's minting of message-signaled
+targets are implemented; devmgr's allocation of those targets to drivers is design intent
+(below).
 
 A driver receives a wired interrupt line as a single-line `Interrupt` cap and binds it to a
 Notification with `SYS_IRQ_REGISTER`. The kernel models each wired line as a source with up to
@@ -451,11 +453,19 @@ so no later assertion on the line raises one either. The VirtIO interrupt-servic
 read (`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the driver's timed poll
 finds its completion meanwhile (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
 `POLL_INTERVAL_MS`, virtio-console's `TX_POLL_MS`), so the loss is latency, not a hang. Devices
-that need several interrupts are to get message-signaled ones (design intent, not yet implemented;
-[#325](https://github.com/kottlerg/seraph/issues/325)), as further sources beside the wired ones.
+that need several interrupts are to get message-signaled ones as further sources beside the wired
+ones. The kernel half exists: `SYS_IRQ_MSG_ALLOC` mints an unbound message-signaled Interrupt cap
+through a cap carrying `RIGHTS_IRQ_MINT`, and its holder reads the message address and data with
+`SYS_CAP_INFO` and programs them into the device's MSI or MSI-X entry. devmgr does not yet allocate
+message targets for drivers or program a device's MSI capability, and interrupt remapping (VT-d)
+and riscv64 IOMMU MSI translation are not done
+([#325](https://github.com/kottlerg/seraph/issues/325)). Drivers still use wired lines.
 The kernel delivers each routed line to one CPU, chosen when the line is first bound by taking the
 CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 only CPUs whose
-APIC id an I/O APIC can name (below `0xFF`, the broadcast id) take part. The mechanism is specified
+APIC id an I/O APIC can name (below `0xFF`, the broadcast id) take part. Each x86-64 CPU has its
+own 217 device vectors, shared by the routed lines and the message targets on that CPU, and a route
+or mint fails only when no eligible CPU has a free vector; on riscv64 a hart's IMSIC identities are
+shared the same way by routed APLIC sources and message targets. The mechanism is specified
 in [core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md) § `interrupts`.
 
 ---

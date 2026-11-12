@@ -128,10 +128,11 @@ devmgr's responsibilities are:
     regions reach, and for any other function every MMIO BAR, whole. I/O BARs
     are not delivered;
   - for a declaration that takes an interrupt, its own derivation of its
-    line's held `Interrupt` cap, so devices that share an `INTx` line are all
-    served; a device with no line is not bound when its declaration requires
-    one. No message-signaled vector is delivered, whatever the declaration
-    requests ([#325](https://github.com/kottlerg/seraph/issues/325));
+    line's held `Interrupt` cap with `RIGHTS_IRQ_NOTIFY` only, so devices that
+    share an `INTx` line are all served and no driver holds Mint; a device with
+    no line is not bound when its declaration requires one. No message-signaled
+    vector is delivered, whatever the declaration requests
+    ([#325](https://github.com/kottlerg/seraph/issues/325));
   - for a DMA declaration, the device's DMA capability, after its grant
     attaches it to its IOMMU domain where a unit translates it (above); the
     driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD`;

@@ -517,7 +517,7 @@ Phase 7.
       priorities within that band. Init splits it into a baseline band and an
       elevated remainder and delegates copies per policy (see
       [capability-model.md § SchedControl](../../../docs/capability-model.md))
-   d. One root Interrupt range capability (Notify rights) covering every valid
+   d. One root Interrupt range capability (Notify and Mint rights) covering every valid
       IRQ id on the architecture (ROOT_IRQ_COUNT: 32768 on x86-64, 1024 on RISC-V);
       userspace narrows it to single-IRQ children via SYS_IRQ_SPLIT.
    e. Map-only Memory capabilities over firmware tables (not retypable, not

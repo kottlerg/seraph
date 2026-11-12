@@ -433,7 +433,7 @@ mod tests
     {
         let mut t = vec![0u8; 80];
         t[..4].copy_from_slice(b"SPCR");
-        t[4..8].copy_from_slice(&80_u32.to_le_bytes());
+        t[4..8].copy_from_slice(&80u32.to_le_bytes());
         t[36] = 3;
         t
     }
@@ -443,7 +443,7 @@ mod tests
     {
         let mut t = spcr_bytes();
         t[40] = 0;
-        t[44..52].copy_from_slice(&0x1000_0000_u64.to_le_bytes());
+        t[44..52].copy_from_slice(&0x1000_0000u64.to_le_bytes());
         assert_eq!(
             spcr(&t),
             Some(Spcr {
@@ -458,10 +458,10 @@ mod tests
             spcr(&t).and_then(|s| s.interrupt),
             Some(SpcrInterrupt { line: 4, isa: true })
         );
-        for ty in [2_u8, 4, 8, 16]
+        for ty in [2u8, 4, 8, 16]
         {
             t[52] = ty;
-            t[54..58].copy_from_slice(&33_u32.to_le_bytes());
+            t[54..58].copy_from_slice(&33u32.to_le_bytes());
             assert_eq!(
                 spcr(&t).and_then(|s| s.interrupt),
                 Some(SpcrInterrupt {
@@ -478,9 +478,9 @@ mod tests
     {
         let mut t = spcr_bytes();
         t[40] = 1;
-        t[44..52].copy_from_slice(&0x3F8_u64.to_le_bytes());
+        t[44..52].copy_from_slice(&0x3F8u64.to_le_bytes());
         assert_eq!(spcr(&t).map(|s| s.base), Some(SpcrBase::IoPort(0x3F8)));
-        t[44..52].copy_from_slice(&0x1_0000_u64.to_le_bytes());
+        t[44..52].copy_from_slice(&0x1_0000u64.to_le_bytes());
         assert_eq!(spcr(&t), None);
         t[44..52].copy_from_slice(&0u64.to_le_bytes());
         assert_eq!(spcr(&t), None);

@@ -173,8 +173,8 @@ mod tests
     #[test]
     fn slot_walk_of_an_empty_table_is_one_empty_page()
     {
-        assert!(walk_slots(&[]).is_empty());
-        let (page, more) = slot_page(|| core::iter::empty(), None);
+        assert_eq!(walk_slots(&[]), [] as [(u64, u8, u64, Vec<u8>); 0]);
+        let (page, more) = slot_page(core::iter::empty, None);
         assert!(!more);
         assert_eq!(reply_count(page.reply(more).label), 0);
     }
@@ -222,7 +222,7 @@ mod tests
                     seq,
                     badge,
                     kind: if seq == 9 { ENTRY_RECORD } else { ENTRY_TEXT },
-                    bytes: vec![seq as u8; len],
+                    bytes: vec![u8::try_from(seq).unwrap(); len],
                 });
             }
         }
@@ -289,7 +289,10 @@ mod tests
         let seqs: Vec<u64> = out.iter().map(|e| e.0).collect();
         assert_eq!(seqs, [8, 6, 3, 2]);
         assert!(out.iter().all(|e| e.1 == 8));
-        assert!(walk_history(&history(), Some(99)).is_empty());
+        assert_eq!(
+            walk_history(&history(), Some(99)),
+            [] as [(u64, u64, u8, usize); 0]
+        );
     }
 
     #[test]

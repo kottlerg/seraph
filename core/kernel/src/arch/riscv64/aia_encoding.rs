@@ -170,8 +170,8 @@ mod tests
     #[test]
     fn source_mode_follows_trigger_and_polarity()
     {
-        let level = syscall::IRQ_MODE_LEVEL as u32;
-        let low = syscall::IRQ_MODE_ACTIVE_LOW as u32;
+        let level = u32::try_from(syscall::IRQ_MODE_LEVEL).unwrap();
+        let low = u32::try_from(syscall::IRQ_MODE_ACTIVE_LOW).unwrap();
         assert_eq!(aplic_source_mode(0), 4);
         assert_eq!(aplic_source_mode(low), 5);
         assert_eq!(aplic_source_mode(level), 6);

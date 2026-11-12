@@ -215,11 +215,11 @@ mod tests
         let recipe = recipe_for(template, "gdb-target").unwrap();
         assert!(recipe.contains("argv   = gdbstub gdb-target\n"));
         assert!(recipe.contains("binary = /services/gdbstub\n"));
-        assert!(recipe_for(template, "two words").is_err());
-        assert!(recipe_for("binary = /x\n", "t").is_err());
+        recipe_for(template, "two words").unwrap_err();
+        recipe_for("binary = /x\n", "t").unwrap_err();
         // A name procmgr would truncate can never match.
-        assert!(recipe_for(template, &"n".repeat(NAME_MAX)).is_ok());
-        assert!(recipe_for(template, &"n".repeat(NAME_MAX + 1)).is_err());
+        recipe_for(template, &"n".repeat(NAME_MAX)).unwrap();
+        recipe_for(template, &"n".repeat(NAME_MAX + 1)).unwrap_err();
     }
 
     // Defect caught: staging repacked a 4Kn image at 512-byte blocks.
@@ -228,7 +228,7 @@ mod tests
     {
         assert_eq!(layout_block_size(512).unwrap(), BlockSize::B512);
         assert_eq!(layout_block_size(4096).unwrap(), BlockSize::B4096);
-        assert!(layout_block_size(8192).is_err());
+        layout_block_size(8192).unwrap_err();
     }
 
     #[test]

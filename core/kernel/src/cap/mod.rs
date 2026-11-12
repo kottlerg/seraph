@@ -1949,8 +1949,8 @@ fn populate_cspace(
             continue;
         }
         // MemoryObject invariant: page-aligned base, whole-page size.
-        let aligned_base = entry.physical_base & !0xFFF_u64;
-        let aligned_size = (entry.physical_base - aligned_base + entry.size + 0xFFF) & !0xFFF_u64;
+        let aligned_base = entry.physical_base & !0xFFFu64;
+        let aligned_size = (entry.physical_base - aligned_base + entry.size + 0xFFF) & !0xFFFu64;
         let obj = Box::new(MemoryObject {
             header: KernelObjectHeader::new(ObjectType::Memory),
             base: aligned_base,
@@ -2945,6 +2945,13 @@ fn extends_slot_run(base: u32, count: u32, slot: u32) -> bool
 /// `[base, base + count)` ranges, so a gap would name a slot outside the run;
 /// the free list's ascending order keeps boot inserts consecutive
 /// (core/kernel/docs/capability-internals.md § Free Slot Tracking).
+#[cfg_attr(
+    test,
+    expect(
+        clippy::manual_assert,
+        reason = "the test build keeps only the panic arm; the target build calls `fatal`"
+    )
+)]
 pub(crate) fn extend_slot_run_or_fatal(base: &mut u32, count: u32, slot: u32, msg: &'static str)
 {
     if !extends_slot_run(*base, count, slot)
@@ -2989,7 +2996,7 @@ fn insert_or_fatal<K: slot::CapKind>(
         Err(_) => crate::fatal(msg),
         // In test mode, panic with the message instead of halting the CPU.
         #[cfg(test)]
-        Err(e) => panic!("{}: {:?}", msg, e),
+        Err(e) => panic!("{msg}: {e:?}"),
     }
 }
 
@@ -3090,7 +3097,7 @@ mod tests
     #[test]
     fn an_acpi_region_past_the_end_of_the_address_space_is_skipped()
     {
-        let top_page = u64::MAX & !(PAGE_BYTES - 1);
+        let top_page = !(PAGE_BYTES - 1);
         let mmap = [
             MemoryMapEntry {
                 physical_base: 0x1000_0000,
@@ -3125,7 +3132,7 @@ mod tests
         assert_eq!(page_span(0x1234, 0x10), Some((0x1000, 0x1000)));
         assert_eq!(page_span(0x1FFF, 2), Some((0x1000, 0x2000)));
         assert_eq!(page_span(0x3000, 0), Some((0x3000, 0)));
-        let top_page = u64::MAX & !(PAGE_BYTES - 1);
+        let top_page = !(PAGE_BYTES - 1);
         // The last page itself ends exactly at 2^64, which no u64 end holds.
         assert_eq!(page_span(top_page, 1), None);
         assert_eq!(
@@ -3209,7 +3216,7 @@ mod tests
         // The most any build mints (IoPort and SbiControl are exclusive, no
         // architecture has both), with the two spare slots, is what the
         // constant holds.
-        assert!(!(crate::arch::current::HAS_IO_PORTS && crate::arch::current::HAS_SBI));
+        const { assert!(!(crate::arch::current::HAS_IO_PORTS && crate::arch::current::HAS_SBI)) };
         assert_eq!(fixed.len() - 1 + 2, FIXED_BOOT_DESCRIPTORS);
     }
 

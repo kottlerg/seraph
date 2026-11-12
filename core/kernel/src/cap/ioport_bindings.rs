@@ -330,6 +330,10 @@ mod tests
         // SAFETY: a fresh allocation of the table's layout and fresh parts,
         // initialised in place before use; the parts outlive the table.
         let table = unsafe {
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "`alloc` returns a block aligned for `layout`, which is the table's own"
+            )]
             let p = std::alloc::alloc(layout).cast::<IoPortBindings>();
             assert!(!p.is_null());
             IoPortBindings::init_in_place(p, parts, 0x5000, [0; TABLE_PAGES]);
@@ -344,10 +348,10 @@ mod tests
     fn permitted(t: &IoPortBindings, port: u32) -> bool
     {
         let bits = (IOPB_PART_BYTES * 8) as u32;
-        let part = t.bitmap.parts[(port / bits) as usize];
+        let page = t.bitmap.parts[(port / bits) as usize];
         let rel = port % bits;
         // SAFETY: the part is live for the table's life.
-        unsafe { (*part)[(rel / 8) as usize] & (1 << (rel % 8)) == 0 }
+        unsafe { (*page)[(rel / 8) as usize] & (1 << (rel % 8)) == 0 }
     }
 
     #[test]

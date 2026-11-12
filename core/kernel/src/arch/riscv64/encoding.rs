@@ -513,13 +513,13 @@ mod tests
         assert_eq!(protected_leaf(widened, base), Ok(rw_cap));
 
         // An Execute-bearing one widens to X only.
-        let rx_cap = base | grant_bits(exec);
+        let exec_cap = base | grant_bits(exec);
         assert!(
-            user_leaf_flags(protected_leaf(rx_cap, rx).unwrap())
+            user_leaf_flags(protected_leaf(exec_cap, rx).unwrap())
                 .unwrap()
                 .executable
         );
-        assert_eq!(protected_leaf(rx_cap, rw), Err(PagingError::NotGranted));
+        assert_eq!(protected_leaf(exec_cap, rw), Err(PagingError::NotGranted));
 
         // The grant sits in RSW alone: clear of V/R/W/X/U/G/A/D (bits 7:0),
         // the PPN (53:10), PBMT (62:61) and N (63).

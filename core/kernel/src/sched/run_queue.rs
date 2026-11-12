@@ -1044,10 +1044,22 @@ impl PerCpuScheduler
 
     // Test stubs for host-side unit tests
     #[cfg(test)]
+    #[expect(
+        clippy::unused_self,
+        reason = "the stub keeps the signature of the non-test method, which reads `self`"
+    )]
     pub fn increment_load(&self) {}
     #[cfg(test)]
+    #[expect(
+        clippy::unused_self,
+        reason = "the stub keeps the signature of the non-test method, which reads `self`"
+    )]
     pub fn decrement_load(&self) {}
     #[cfg(test)]
+    #[expect(
+        clippy::unused_self,
+        reason = "the stub keeps the signature of the non-test method, which reads `self`"
+    )]
     pub fn current_load(&self) -> u32
     {
         0
@@ -1064,15 +1076,16 @@ mod tests
 
     /// Allocate a zero-initialized TCB for tests with magic cookie set.
     ///
-    /// SAFETY: only `run_queue_next`, `queued_on`, `last_enqueue`, `ipc_state`,
-    /// `preferred_cpu`, `thread_id`, and `magic` are accessed by RunQueue/PerCpuScheduler;
-    /// all other TCB fields remain zero/null. The debug-only `last_enqueue:
-    /// Option<EnqueueBreadcrumb>` field zeroes to `None` via the null-pointer
-    /// niche of its `&'static Location`, so the tripwire reads a valid `None`.
-    /// `queued_on` zeroes to `0` ("linked at prio 0"), so it must be reset to the
+    /// `queued_on` zeroes to `0` ("linked at prio 0"), so it is reset to the
     /// `-1` unlinked sentinel the single-link guard expects.
     fn make_tcb() -> Box<ThreadControlBlock>
     {
+        // SAFETY: only `run_queue_next`, `queued_on`, `last_enqueue`, `ipc_state`,
+        // `preferred_cpu`, `thread_id`, and `magic` are accessed by
+        // RunQueue/PerCpuScheduler; all other TCB fields remain zero/null. The
+        // debug-only `last_enqueue: Option<EnqueueBreadcrumb>` field zeroes to `None`
+        // via the null-pointer niche of its `&'static Location`, so the tripwire
+        // reads a valid `None`.
         let mut tcb: ThreadControlBlock = unsafe { core::mem::zeroed() };
         tcb.magic = crate::sched::thread::TCB_MAGIC;
         tcb.queued_on = core::sync::atomic::AtomicI16::new(-1);
@@ -1149,10 +1162,10 @@ mod tests
         let mut b = make_tcb();
         let mut c = make_tcb();
         let mut idle_tcb = make_tcb();
-        let pa = &mut *a as *mut _;
-        let pb = &mut *b as *mut _;
-        let pc = &mut *c as *mut _;
-        sched.set_idle(&mut *idle_tcb);
+        let pa = &raw mut *a;
+        let pb = &raw mut *b;
+        let pc = &raw mut *c;
+        sched.set_idle(&raw mut *idle_tcb);
 
         assert!(enq(&sched, pa, RT_PRIORITY_MIN - 1));
         assert!(enq(&sched, pb, syscall::PRIORITY_MIN));
@@ -1171,9 +1184,9 @@ mod tests
         let mut fair = make_tcb();
         let mut rt = make_tcb();
         let mut idle_tcb = make_tcb();
-        let pf = &mut *fair as *mut _;
-        let pr = &mut *rt as *mut _;
-        sched.set_idle(&mut *idle_tcb);
+        let pf = &raw mut *fair;
+        let pr = &raw mut *rt;
+        sched.set_idle(&raw mut *idle_tcb);
 
         assert!(enq(&sched, pf, RT_PRIORITY_MIN - 1));
         assert!(enq(&sched, pr, RT_PRIORITY_MIN));
@@ -1190,8 +1203,8 @@ mod tests
         let sched = PerCpuScheduler::new();
         let mut fair = make_tcb();
         let mut rt = make_tcb();
-        let pf = &mut *fair as *mut _;
-        let pr = &mut *rt as *mut _;
+        let pf = &raw mut *fair;
+        let pr = &raw mut *rt;
 
         assert!(enq(&sched, pf, 12));
         assert!(enq(&sched, pr, 23));
@@ -1313,7 +1326,7 @@ mod tests
     {
         let sched = PerCpuScheduler::new();
         let mut rt = make_tcb();
-        let pr = &mut *rt as *mut _;
+        let pr = &raw mut *rt;
         sched.set_current_level(RT_PRIORITY_MIN - 1);
         assert_eq!(
             sched.tick_outcome(5),
@@ -1335,8 +1348,8 @@ mod tests
         let sched = PerCpuScheduler::new();
         let mut rt = make_tcb();
         let mut fair = make_tcb();
-        let pr = &mut *rt as *mut _;
-        let pf = &mut *fair as *mut _;
+        let pr = &raw mut *rt;
+        let pf = &raw mut *fair;
         assert!(enq(&sched, pf, RT_PRIORITY_MIN - 1));
         sched.set_current_level(10);
         assert_eq!(
@@ -1360,9 +1373,9 @@ mod tests
         let mut a = make_tcb();
         let mut b = make_tcb();
         let mut c = make_tcb();
-        let pa = &mut *a as *mut _;
-        let pb = &mut *b as *mut _;
-        let pc = &mut *c as *mut _;
+        let pa = &raw mut *a;
+        let pb = &raw mut *b;
+        let pc = &raw mut *c;
 
         assert!(enq(&sched, pa, 0));
         assert!(enq(&sched, pb, 0));
@@ -1386,10 +1399,10 @@ mod tests
         let mut b = make_tcb();
         let mut c = make_tcb();
         let mut idle_tcb = make_tcb();
-        let pa = &mut *a as *mut _;
-        let pb = &mut *b as *mut _;
-        let pc = &mut *c as *mut _;
-        sched.set_idle(&mut *idle_tcb);
+        let pa = &raw mut *a;
+        let pb = &raw mut *b;
+        let pc = &raw mut *c;
+        sched.set_idle(&raw mut *idle_tcb);
 
         assert!(enq(&sched, pa, 4));
         assert!(enq(&sched, pb, 4));
@@ -1413,7 +1426,7 @@ mod tests
     {
         let sched = PerCpuScheduler::new();
         let mut idle_tcb = make_tcb();
-        let idle = &mut *idle_tcb as *mut _;
+        let idle = &raw mut *idle_tcb;
         sched.set_idle(idle);
         assert_eq!(deq(&sched), idle);
     }
@@ -1423,7 +1436,7 @@ mod tests
     {
         let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
-        let pa = &mut *a as *mut _;
+        let pa = &raw mut *a;
 
         assert!(!sched.has_runnable());
         assert!(enq(&sched, pa, 5));
@@ -1443,8 +1456,8 @@ mod tests
         let sched = PerCpuScheduler::new();
         let mut idle = make_tcb();
         let mut fair = make_tcb();
-        let p_idle = &mut *idle as *mut _;
-        let p_fair = &mut *fair as *mut _;
+        let p_idle = &raw mut *idle;
+        let p_fair = &raw mut *fair;
 
         assert!(enq(&sched, p_idle, IDLE_PRIORITY));
         assert!(sched.has_runnable());
@@ -1463,8 +1476,8 @@ mod tests
         let sched = PerCpuScheduler::new();
         let mut idle = make_tcb();
         let mut user = make_tcb();
-        let p_idle = &mut *idle as *mut _;
-        let p_user = &mut *user as *mut _;
+        let p_idle = &raw mut *idle;
+        let p_user = &raw mut *user;
         sched.set_idle(p_idle);
 
         sched.set_current(p_idle);
@@ -1493,8 +1506,8 @@ mod tests
         // once is a double-link the single-link guard (`queued_on`) rejects.
         let mut a = make_tcb();
         let mut b = make_tcb();
-        let pa = &mut *a as *mut _;
-        let pb = &mut *b as *mut _;
+        let pa = &raw mut *a;
+        let pb = &raw mut *b;
 
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 0);
         assert!(enq(&sched, pa, 7));
@@ -1510,9 +1523,9 @@ mod tests
         let mut a = make_tcb();
         let mut b = make_tcb();
         let mut c = make_tcb();
-        let pa = &mut *a as *mut _;
-        let pb = &mut *b as *mut _;
-        let pc = &mut *c as *mut _;
+        let pa = &raw mut *a;
+        let pb = &raw mut *b;
+        let pc = &raw mut *c;
 
         // Enqueue at priorities 0, 22, 28 — expect 28 first, then 22, then 0.
         assert!(enq(&sched, pa, 0));
@@ -1530,7 +1543,7 @@ mod tests
     {
         let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
-        let pa = &mut *a as *mut _;
+        let pa = &raw mut *a;
 
         assert!(enq(&sched, pa, 3));
         assert_ne!(sched.non_empty.load(Ordering::Relaxed) & bit(3), 0);
@@ -1545,7 +1558,7 @@ mod tests
     {
         let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
-        let pa = &mut *a as *mut _;
+        let pa = &raw mut *a;
 
         assert!(enq(&sched, pa, 10));
         assert_ne!(sched.non_empty.load(Ordering::Relaxed) & bit(10), 0);
@@ -1558,7 +1571,7 @@ mod tests
     {
         let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
-        let pa = &mut *a as *mut _;
+        let pa = &raw mut *a;
         // remove on a TCB that was never enqueued must not panic.
         rm(&sched, pa, 5);
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 0);
@@ -1571,9 +1584,9 @@ mod tests
         let mut a = make_tcb();
         let mut b = make_tcb();
         let mut c = make_tcb();
-        let pa = &mut *a as *mut _;
-        let pb = &mut *b as *mut _;
-        let pc = &mut *c as *mut _;
+        let pa = &raw mut *a;
+        let pb = &raw mut *b;
+        let pc = &raw mut *c;
 
         assert!(enq(&sched, pa, 1));
         assert!(enq(&sched, pb, 1));
@@ -1592,8 +1605,7 @@ mod tests
         // Enqueue 5 TCBs at the same priority and verify FIFO dequeue order.
         let sched = PerCpuScheduler::new();
         let mut tcbs: Vec<Box<ThreadControlBlock>> = (0..5).map(|_| make_tcb()).collect();
-        let ptrs: Vec<*mut ThreadControlBlock> =
-            tcbs.iter_mut().map(|t| &mut **t as *mut _).collect();
+        let ptrs: Vec<*mut ThreadControlBlock> = tcbs.iter_mut().map(|t| &raw mut **t).collect();
 
         for &p in &ptrs
         {
@@ -1619,10 +1631,10 @@ mod tests
         let mut b = make_tcb();
         let mut c = make_tcb();
         let mut d = make_tcb();
-        let pa = &mut *a as *mut _;
-        let pb = &mut *b as *mut _;
-        let pc = &mut *c as *mut _;
-        let pd = &mut *d as *mut _;
+        let pa = &raw mut *a;
+        let pb = &raw mut *b;
+        let pc = &raw mut *c;
+        let pd = &raw mut *d;
 
         assert!(enq(&sched, pa, 22));
         assert!(enq(&sched, pb, 27));
@@ -1651,7 +1663,7 @@ mod tests
         // queued_on, so the follow-up enqueue must create the link.
         let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
-        let pa = &mut *a as *mut _;
+        let pa = &raw mut *a;
 
         assert!(enq(&sched, pa, 4));
         assert!(rm(&sched, pa, 4));
@@ -1667,7 +1679,7 @@ mod tests
         // stays linked, leaving this one Ready on no queue: the link stops.
         let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
-        let pa = &mut *a as *mut _;
+        let pa = &raw mut *a;
         let _ = enq(&sched, pa, NUM_PRIORITY_LEVELS as u8);
     }
 
@@ -1702,11 +1714,11 @@ mod tests
             assert!(enq(&scheds[hint], tcb, new));
             return Some(hint);
         }
-        for cpu in 0..scheds.len()
+        for (cpu, sched) in scheds.iter().enumerate()
         {
-            if rm(&scheds[cpu], tcb, old)
+            if rm(sched, tcb, old)
             {
-                assert!(enq(&scheds[cpu], tcb, new));
+                assert!(enq(sched, tcb, new));
                 // SAFETY: tcb valid for the test's lifetime.
                 unsafe { (*tcb).preferred_cpu = cpu as u32 };
                 return Some(cpu);
@@ -1720,7 +1732,7 @@ mod tests
     {
         let scheds = [PerCpuScheduler::new(), PerCpuScheduler::new()];
         let mut t = make_tcb();
-        let pt = &mut *t as *mut _;
+        let pt = &raw mut *t;
 
         // Linked on cpu 1 at prio 4; the hint names cpu 1 (the common case).
         assert!(enq(&scheds[1], pt, 4));
@@ -1741,7 +1753,7 @@ mod tests
             PerCpuScheduler::new(),
         ];
         let mut t = make_tcb();
-        let pt = &mut *t as *mut _;
+        let pt = &raw mut *t;
 
         // Linked on cpu 2, but the (stale) hint names cpu 0: the hint remove
         // misses and the ascending walk must locate it on cpu 2.
@@ -1763,7 +1775,7 @@ mod tests
         // both the hint and the walk miss and the relocate is a no-op.
         let scheds = [PerCpuScheduler::new(), PerCpuScheduler::new()];
         let mut t = make_tcb();
-        let pt = &mut *t as *mut _;
+        let pt = &raw mut *t;
 
         assert_eq!(locate_relocate(&scheds, pt, 6, 3, 0), None);
         assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);

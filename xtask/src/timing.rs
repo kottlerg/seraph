@@ -1342,10 +1342,10 @@ mod tests
     {
         let base = parse_log("[1.000000] ktest: starting\n").unwrap();
         let wide = parse_log(&log(128, &[])).unwrap();
-        assert!(cross_width_report(&base, &wide, RULE).is_err());
+        cross_width_report(&base, &wide, RULE).unwrap_err();
         let mut other = parse_log(&log(16, &[])).unwrap();
         other.arch = Some("riscv64".to_string());
-        assert!(cross_width_report(&other, &wide, RULE).is_err());
+        cross_width_report(&other, &wide, RULE).unwrap_err();
     }
 
     #[test]
@@ -1403,9 +1403,9 @@ mod tests
     {
         assert!(parse_baseline("arch\tx86_64\n").is_err(), "no format line");
         assert!(parse_baseline("format\t2\n").is_err(), "unknown format");
-        assert!(parse_baseline("format\t1\ncell\tTier S\tx\tabc\tPASS\n").is_err());
-        assert!(parse_baseline("format\t1\ncell\tTier S\tx\t1.0\tMAYBE\n").is_err());
-        assert!(parse_baseline("format\t1\njust some words\n").is_err());
+        parse_baseline("format\t1\ncell\tTier S\tx\tabc\tPASS\n").unwrap_err();
+        parse_baseline("format\t1\ncell\tTier S\tx\t1.0\tMAYBE\n").unwrap_err();
+        parse_baseline("format\t1\njust some words\n").unwrap_err();
     }
 
     #[test]
@@ -1419,7 +1419,7 @@ mod tests
         assert!(line("stress::b").starts_with("FLAG"));
         assert!(!line("stress::a").starts_with("FLAG"));
         let other = parse_log(&log(16, &[])).unwrap();
-        assert!(baseline_report(&baseline, &other, RULE, &[]).is_err());
+        baseline_report(&baseline, &other, RULE, &[]).unwrap_err();
     }
 
     #[test]
@@ -1439,7 +1439,10 @@ mod tests
         let warnings = host_differences(&baseline, &now);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].starts_with("qemu differs"));
-        assert!(host_differences(&baseline, &baseline.headers).is_empty());
+        assert_eq!(
+            host_differences(&baseline, &baseline.headers),
+            [] as [String; 0]
+        );
     }
 
     #[test]

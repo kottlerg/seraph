@@ -1441,16 +1441,16 @@ mod tests
         s
     }
 
-    /// A FAT16 volume: 4085 <= total_clusters < 65525.
-    /// data_start = 1 + 2*32 + 32 = 97; clusters = (8192-97)/1 = 8095,
+    /// A FAT16 volume: 4085 <= `total_clusters` < 65525.
+    /// `data_start` = 1 + 2*32 + 32 = 97; clusters = (8192-97)/1 = 8095,
     /// within the 32 * 256 = 8192 entries one FAT holds.
     fn fat16_sector() -> [u8; 512]
     {
         bpb_sector(512, 1, 1, 2, 512, 8192, 32, 0, 0, 0, 0)
     }
 
-    /// A FAT32 volume: large enough that total_clusters >= 65525.
-    /// data_start = 32 + 2*2400 = 4832; clusters = (300000-4832)/1 = 295168,
+    /// A FAT32 volume: large enough that `total_clusters` >= 65525.
+    /// `data_start` = 32 + 2*2400 = 4832; clusters = (300000-4832)/1 = 295168,
     /// within the 2400 * 128 = 307200 entries one FAT holds.
     fn fat32_sector(fsinfo: u16) -> [u8; 512]
     {

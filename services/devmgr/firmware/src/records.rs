@@ -442,7 +442,7 @@ mod tests
         {
             assert_eq!(
                 set.add(hid("X"), [mmio(i * 0x1000)]),
-                Added::New(i as usize)
+                Added::New(usize::try_from(i).unwrap())
             );
         }
         assert_eq!(set.add(hid("X"), [mmio(0x1000_0000)]), Added::Full);

@@ -907,7 +907,7 @@ mod tests
         let mut iopb = [0xFFu8; IOPB_SIZE];
         // Port 65535 is the last valid port.
         permit_port_range(&mut iopb, 0, 65535, 1);
-        assert_eq!(iopb[IOPB_SIZE - 1], 0xFF & !(1 << 7));
+        assert_eq!(iopb[IOPB_SIZE - 1], !(1 << 7));
         assert!(iopb[..IOPB_SIZE - 1].iter().all(|&b| b == 0xFF));
     }
 

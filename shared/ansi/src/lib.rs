@@ -347,7 +347,7 @@ mod tests
     use super::*;
 
     /// Owned, fixed-capacity event for assertions (no allocation, matching
-    /// the workspace's no_std test convention). Test strings stay short.
+    /// the workspace's `no_std` test convention). Test strings stay short.
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Ev
     {

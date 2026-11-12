@@ -90,7 +90,7 @@ mod tests
     #[test]
     fn glyph_past_the_table_yields_no_rows()
     {
-        assert!(glyph(&FONT_9X20, 256).is_empty());
-        assert!(glyph(&FONT_9X20_EXT, usize::MAX).is_empty());
+        assert_eq!(glyph(&FONT_9X20, 256), []);
+        assert_eq!(glyph(&FONT_9X20_EXT, usize::MAX), []);
     }
 }

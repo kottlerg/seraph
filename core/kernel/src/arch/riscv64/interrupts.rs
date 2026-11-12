@@ -980,6 +980,10 @@ pub unsafe fn route_device_irq(
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the stub keeps the signature of the non-test item, which can fail"
+)]
 pub unsafe fn route_device_irq(
     _irq: u32,
     _mode: u32,

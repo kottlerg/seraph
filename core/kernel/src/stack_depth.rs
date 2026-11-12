@@ -325,10 +325,8 @@ mod tests
         }
         v[300] = 7;
         // SAFETY: v is 512 readable words.
-        assert_eq!(
-            unsafe { used_bytes(v.as_ptr() as u64, 512 * 8) },
-            (512 - 300) * 8
-        );
+        let used = unsafe { used_bytes(v.as_ptr() as u64, 512 * 8) };
+        assert_eq!(used, (512 - 300) * 8);
     }
 
     #[test]

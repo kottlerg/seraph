@@ -682,8 +682,7 @@ impl CSpace
                 // heap.
                 // SAFETY: the caller's T is zero-valid per the contract.
                 let boxed = Box::new(unsafe { core::mem::zeroed::<T>() });
-                // SAFETY: Box::into_raw is non-null.
-                Ok(unsafe { NonNull::new_unchecked(Box::into_raw(boxed)) })
+                Ok(Box::into_non_null(boxed))
             }
             else
             {
@@ -1699,7 +1698,7 @@ mod tests
     use crate::cap::slot::MemRights;
     use core::ptr::NonNull;
 
-    /// Construct a dummy NonNull<KernelObjectHeader> backed by a leaked Box
+    /// Construct a dummy `NonNull`<KernelObjectHeader> backed by a leaked Box
     /// so tests don't need unsafe pointer arithmetic.
     fn dummy_object() -> NonNull<KernelObjectHeader>
     {
@@ -1713,7 +1712,7 @@ mod tests
             lock: core::sync::atomic::AtomicU32::new(0),
             slot_count: core::sync::atomic::AtomicU32::new(0),
         });
-        let raw = Box::into_raw(obj) as *mut KernelObjectHeader;
+        let raw = Box::into_raw(obj).cast::<KernelObjectHeader>();
         // SAFETY: Box::into_raw never returns null.
         unsafe { NonNull::new_unchecked(raw) }
     }
@@ -1867,9 +1866,7 @@ mod tests
             assert_eq!(
                 cs.populated_count(),
                 expected,
-                "populated_count should be {} after {} inserts",
-                expected,
-                expected
+                "populated_count should be {expected} after {expected} inserts"
             );
         }
     }
@@ -2070,14 +2067,14 @@ mod tests
         let mut cs = CSpace::new(0);
         // Target leaf 9 with a 4-leaf batch: two partial calls, then done.
         let target = (9 * L2_SIZE) as u32;
-        assert_eq!(cs.grow_toward(target, 4).unwrap(), false);
+        assert!(!cs.grow_toward(target, 4).unwrap());
         assert_eq!(cs.leaf_count(), 4);
-        assert_eq!(cs.grow_toward(target, 4).unwrap(), false);
+        assert!(!cs.grow_toward(target, 4).unwrap());
         assert_eq!(cs.leaf_count(), 8);
-        assert_eq!(cs.grow_toward(target, 4).unwrap(), true);
+        assert!(cs.grow_toward(target, 4).unwrap());
         assert_eq!(cs.leaf_count(), 10);
         // Covered target: immediate true, no growth.
-        assert_eq!(cs.grow_toward(target, 0).unwrap(), true);
+        assert!(cs.grow_toward(target, 0).unwrap());
         assert_eq!(cs.leaf_count(), 10);
     }
 

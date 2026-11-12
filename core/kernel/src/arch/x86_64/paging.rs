@@ -1878,7 +1878,7 @@ mod tests
     fn new_table_clears_no_execute()
     {
         let pte = PageTableEntry::new_table(0x1000);
-        assert!(pte.0 & NO_EXECUTE == 0);
+        assert_eq!(pte.0 & NO_EXECUTE, 0);
     }
 
     #[test]
@@ -2245,8 +2245,8 @@ mod tests
     {
         match depth
         {
-            PagingDepth::Four => 0x7F_4060_3000_u64,
-            PagingDepth::Five => 0x00F0_7F40_6060_3000_u64,
+            PagingDepth::Four => 0x7F_4060_3000u64,
+            PagingDepth::Five => 0x00F0_7F40_6060_3000u64,
         }
     }
 

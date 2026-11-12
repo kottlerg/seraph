@@ -660,7 +660,7 @@ mod tests
         id: CSpaceId,
         kids: usize,
         obj: NonNull<KernelObjectHeader>,
-    ) -> (SlotId, SlotId, SlotId, std::vec::Vec<SlotId>, u64)
+    ) -> (SlotId, SlotId, SlotId, Vec<SlotId>, u64)
     {
         let root = occupy(cs, id);
         let src = occupy(cs, id);
@@ -699,7 +699,7 @@ mod tests
         object: Option<NonNull<KernelObjectHeader>>,
     }
 
-    /// `None` when the slot is Null or its CSpace is gone.
+    /// `None` when the slot is Null or its `CSpace` is gone.
     fn snap(id: SlotId) -> Option<Snap>
     {
         DERIVATION_LOCK.write_lock();
@@ -731,8 +731,8 @@ mod tests
         )
     }
 
-    /// Run `move_cap_begin` under the lock (the harness holds no CSpace
-    /// locks; the test CSpaces are single-threaded).
+    /// Run `move_cap_begin` under the lock (the harness holds no `CSpace`
+    /// locks; the test `CSpaces` are single-threaded).
     fn begin(
         src_cs: *mut CSpace,
         src_handle: u64,
@@ -1191,7 +1191,7 @@ mod tests
         // SAFETY: single-threaded test CSpace; every slot's object is leaked.
         let cs = unsafe { &*a };
         // SAFETY: as above.
-        assert!(unsafe { check_transfer_ref_limits(cs, &[free_handle]) }.is_ok());
+        unsafe { check_transfer_ref_limits(cs, &[free_handle]) }.unwrap();
         assert!(matches!(
             // SAFETY: as above.
             unsafe { check_transfer_ref_limits(cs, &[free_handle, full_handle]) },
@@ -1241,7 +1241,7 @@ mod tests
         let taken = occupy(b, ID_B);
         let before = refcount(obj);
 
-        assert!(begin(a, handle, b, Placement::At(taken.index)).is_err());
+        begin(a, handle, b, Placement::At(taken.index)).unwrap_err();
         assert_eq!(refcount(obj), before);
         crate::cap::unregister_cspace(ID_A);
         crate::cap::unregister_cspace(ID_B);

@@ -565,7 +565,7 @@ mod tests
         let (low, high) = split_address(0x8765_4321_89AB_CDEF);
         assert_eq!((low, high), (0x89AB_CDEF, 0x8765_4321));
         assert_eq!(
-            u64::from(high) << 32 | u64::from(low),
+            (u64::from(high) << 32) | u64::from(low),
             0x8765_4321_89AB_CDEF
         );
     }
@@ -695,22 +695,22 @@ mod tests
         let transport = PciTransport::new(window.as_mut_ptr() as u64, &layout);
         assert!(transport.set_config_vector(NO_VECTOR));
         assert!(transport.queue_set_vector(0));
-        assert_eq!(window[(0x100 + 0x10) / 2], NO_VECTOR);
-        assert_eq!(window[(0x100 + 0x1A) / 2], 0);
+        assert_eq!(window[usize::midpoint(0x100, 0x10)], NO_VECTOR);
+        assert_eq!(window[usize::midpoint(0x100, 0x1A)], 0);
         assert!(transport.queue_set_vector(3));
-        assert_eq!(window[(0x100 + 0x1A) / 2], 3);
+        assert_eq!(window[usize::midpoint(0x100, 0x1A)], 3);
 
         // Routing writes only under MSI-X: vector 0 for the queue, none for
         // configuration changes.
         let wired = Some(DeviceInterrupt::Wired { cap: 1, mode: 0 });
         assert!(transport.route_queue(wired) && transport.route_queue(None));
         assert!(transport.route_config(wired) && transport.route_config(None));
-        assert_eq!(window[(0x100 + 0x1A) / 2], 3);
-        window[(0x100 + 0x10) / 2] = 0;
+        assert_eq!(window[usize::midpoint(0x100, 0x1A)], 3);
+        window[usize::midpoint(0x100, 0x10)] = 0;
         let msix = Some(DeviceInterrupt::MsiX { cap: 2 });
         assert!(transport.route_queue(msix) && transport.route_config(msix));
-        assert_eq!(window[(0x100 + 0x1A) / 2], 0);
-        assert_eq!(window[(0x100 + 0x10) / 2], NO_VECTOR);
+        assert_eq!(window[usize::midpoint(0x100, 0x1A)], 0);
+        assert_eq!(window[usize::midpoint(0x100, 0x10)], NO_VECTOR);
     }
 
     #[test]
@@ -753,7 +753,7 @@ mod tests
         assert_eq!(transport.config_read_u32(8), Some(3));
         assert_eq!(transport.config_read_u32(12), None);
         assert_eq!(transport.config_read_u32(2), None);
-        assert_eq!(transport.config_read_u64(0), Some(2 << 32 | 1));
+        assert_eq!(transport.config_read_u64(0), Some((2 << 32) | 1));
         // The high half would be the word past the region.
         assert_eq!(transport.config_read_u64(8), None);
     }

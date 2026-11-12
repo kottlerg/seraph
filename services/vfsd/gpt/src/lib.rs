@@ -405,16 +405,16 @@ mod tests
 
     /// A 512-byte header block whose first usable LBA is 34, where a default
     /// 128-entry, 128-byte array from LBA 2 ends.
-    fn header_sector(sig: &[u8; 8], part_lba: u64, num: u32, esize: u32) -> Vec<u8>
+    fn header_sector(sig: [u8; 8], part_lba: u64, num: u32, esize: u32) -> Vec<u8>
     {
         header_block(512, sig, part_lba, num, esize)
     }
 
     /// A `size`-byte header block whose first usable LBA is 34.
-    fn header_block(size: usize, sig: &[u8; 8], part_lba: u64, num: u32, esize: u32) -> Vec<u8>
+    fn header_block(size: usize, sig: [u8; 8], part_lba: u64, num: u32, esize: u32) -> Vec<u8>
     {
         let mut s = vec![0u8; size];
-        s[0..8].copy_from_slice(sig);
+        s[0..8].copy_from_slice(&sig);
         s[40..48].copy_from_slice(&34u64.to_le_bytes());
         s[72..80].copy_from_slice(&part_lba.to_le_bytes());
         s[80..84].copy_from_slice(&num.to_le_bytes());
@@ -436,7 +436,7 @@ mod tests
     #[test]
     fn parse_header_accepts_valid_header()
     {
-        let s = header_sector(b"EFI PART", 2, 128, 128);
+        let s = header_sector(*b"EFI PART", 2, 128, 128);
         let h = parse_header(&s).ok().expect("valid header");
         assert_eq!(h.part_entry_lba, 2);
         assert_eq!(h.num_parts, 128);
@@ -450,7 +450,7 @@ mod tests
         // 128 entries of 128 bytes fill four 4 KiB blocks (LBAs 2..6), so an
         // array ending at LBA 6 fits; read as 512-byte blocks it would need
         // 32 and be refused against the same first usable LBA.
-        let mut s = header_block(4096, b"EFI PART", 2, 128, 128);
+        let mut s = header_block(4096, *b"EFI PART", 2, 128, 128);
         s[40..48].copy_from_slice(&6u64.to_le_bytes());
         let h = parse_header(&s).ok().expect("4Kn header");
         assert_eq!(h.block_size, 4096);
@@ -461,9 +461,9 @@ mod tests
     #[test]
     fn parse_header_accepts_an_entry_as_large_as_a_4kn_block()
     {
-        assert!(parse_header(&header_block(4096, b"EFI PART", 2, 1, 4096)).is_ok());
+        assert!(parse_header(&header_block(4096, *b"EFI PART", 2, 1, 4096)).is_ok());
         assert!(matches!(
-            parse_header(&header_block(4096, b"EFI PART", 2, 1, 8192)),
+            parse_header(&header_block(4096, *b"EFI PART", 2, 1, 8192)),
             Err(GptError::InvalidEntrySize)
         ));
     }
@@ -475,7 +475,7 @@ mod tests
         {
             assert!(
                 matches!(
-                    parse_header(&header_block(size, b"EFI PART", 2, 1, 128)),
+                    parse_header(&header_block(size, *b"EFI PART", 2, 1, 128)),
                     Err(GptError::InvalidBlockSize)
                 ),
                 "block size {size}"
@@ -486,30 +486,30 @@ mod tests
     #[test]
     fn parse_header_rejects_bad_signature()
     {
-        let s = header_sector(b"NOT PART", 2, 128, 128);
+        let s = header_sector(*b"NOT PART", 2, 128, 128);
         assert!(matches!(parse_header(&s), Err(GptError::InvalidSignature)));
     }
 
     #[test]
     fn parse_header_rejects_entry_size_below_spec_minimum()
     {
-        let s = header_sector(b"EFI PART", 2, 128, 64);
+        let s = header_sector(*b"EFI PART", 2, 128, 64);
         assert!(matches!(parse_header(&s), Err(GptError::InvalidEntrySize)));
     }
 
     #[test]
     fn parse_header_rejects_entry_size_above_sector()
     {
-        let s = header_sector(b"EFI PART", 2, 128, 513);
+        let s = header_sector(*b"EFI PART", 2, 128, 513);
         assert!(matches!(parse_header(&s), Err(GptError::InvalidEntrySize)));
     }
 
     #[test]
     fn parse_header_accepts_every_spec_entry_size()
     {
-        assert!(parse_header(&header_sector(b"EFI PART", 2, 1, 128)).is_ok());
-        assert!(parse_header(&header_sector(b"EFI PART", 2, 1, 256)).is_ok());
-        assert!(parse_header(&header_sector(b"EFI PART", 2, 1, 512)).is_ok());
+        assert!(parse_header(&header_sector(*b"EFI PART", 2, 1, 128)).is_ok());
+        assert!(parse_header(&header_sector(*b"EFI PART", 2, 1, 256)).is_ok());
+        assert!(parse_header(&header_sector(*b"EFI PART", 2, 1, 512)).is_ok());
     }
 
     #[test]
@@ -517,7 +517,7 @@ mod tests
     {
         // 200 lies inside 128..=512 but does not divide the sector, so the
         // per-sector entry walk would read entries at the wrong offsets.
-        let s = header_sector(b"EFI PART", 2, 128, 200);
+        let s = header_sector(*b"EFI PART", 2, 128, 200);
         assert!(matches!(parse_header(&s), Err(GptError::InvalidEntrySize)));
     }
 
@@ -525,31 +525,31 @@ mod tests
     fn parse_header_accepts_an_array_ending_at_the_first_usable_lba()
     {
         // 128 entries of 128 bytes from LBA 2 fill LBAs 2..34 exactly.
-        assert!(parse_header(&header_sector(b"EFI PART", 2, 128, 128)).is_ok());
+        assert!(parse_header(&header_sector(*b"EFI PART", 2, 128, 128)).is_ok());
     }
 
     #[test]
     fn parse_header_rejects_an_array_past_the_first_usable_lba()
     {
         // One entry more needs LBA 34, the first usable LBA.
-        let s = header_sector(b"EFI PART", 2, 129, 128);
+        let s = header_sector(*b"EFI PART", 2, 129, 128);
         assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
         // A `num_parts` near `u32::MAX` is refused rather than walked.
-        let s = header_sector(b"EFI PART", 2, u32::MAX, 128);
+        let s = header_sector(*b"EFI PART", 2, u32::MAX, 128);
         assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
     }
 
     #[test]
     fn parse_header_rejects_an_array_before_lba_2()
     {
-        let s = header_sector(b"EFI PART", 1, 4, 128);
+        let s = header_sector(*b"EFI PART", 1, 4, 128);
         assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
     }
 
     #[test]
     fn parse_header_rejects_an_array_whose_end_overflows()
     {
-        let mut s = header_sector(b"EFI PART", u64::MAX, 8, 128);
+        let mut s = header_sector(*b"EFI PART", u64::MAX, 8, 128);
         s[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
     }
@@ -618,7 +618,7 @@ mod tests
     {
         move |lba, buf| {
             reads.push(lba);
-            let off = (lba - 2) as usize * buf.len();
+            let off = usize::try_from(lba - 2).unwrap() * buf.len();
             if Some(lba) == fail_lba || off + buf.len() > disk.len()
             {
                 return false;
@@ -645,8 +645,8 @@ mod tests
         {
             let mut reads = Vec::new();
             let h = GptHeader {
-                block_size,
                 entry_size,
+                block_size,
                 ..header(4, 128)
             };
             let scan = collect_partitions(&h, reader(&[], None, &mut reads));
@@ -655,7 +655,7 @@ mod tests
                 Some(ScanStop::ReadFailed { lba: 2 }),
                 "{block_size}/{entry_size}"
             );
-            assert!(reads.is_empty());
+            assert_eq!(reads, [] as [u64; 0]);
         }
     }
 
@@ -736,7 +736,7 @@ mod tests
             true
         });
         assert_eq!(scan.stop, Some(ScanStop::ReadFailed { lba: u64::MAX }));
-        assert!(scan.entries.is_empty());
+        assert_eq!(scan.entries, [] as [GptEntry; 0]);
         assert_eq!(reads, vec![u64::MAX]);
     }
 
@@ -746,8 +746,8 @@ mod tests
         let mut reads = Vec::new();
         let scan = collect_partitions(&header(0, 128), reader(&[], None, &mut reads));
         assert_eq!(scan.stop, None);
-        assert!(scan.entries.is_empty());
-        assert!(reads.is_empty());
+        assert_eq!(scan.entries, [] as [GptEntry; 0]);
+        assert_eq!(reads, [] as [u64; 0]);
     }
 
     /// A partition of type GUID `[tg; 16]` with DPS priority `priority`.
@@ -880,7 +880,7 @@ mod tests
     fn disk_image(parts: &[(u8, u64, u64, u64)]) -> Vec<u8>
     {
         let mut disk = vec![0u8; 512 * 34];
-        disk[512..1024].copy_from_slice(&header_sector(b"EFI PART", 2, 128, 128));
+        disk[512..1024].copy_from_slice(&header_sector(*b"EFI PART", 2, 128, 128));
         for (i, &(tg, first, last, priority)) in parts.iter().enumerate()
         {
             let off = 1024 + i * 128;
@@ -895,7 +895,7 @@ mod tests
     {
         let header = parse_header(&disk[512..1024]).ok().expect("header");
         let scan = collect_partitions(&header, |lba, buf| {
-            let off = lba as usize * buf.len();
+            let off = usize::try_from(lba).unwrap() * buf.len();
             buf.copy_from_slice(&disk[off..off + buf.len()]);
             true
         });

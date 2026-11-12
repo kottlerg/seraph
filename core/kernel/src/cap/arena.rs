@@ -279,11 +279,8 @@ mod tests
             assert!(off < crate::mm::PAGE_SIZE);
             assert_eq!(page_of(c as usize), p as usize);
             // SAFETY: c is a popped chunk of CHUNK_BYTES.
-            assert!(
-                unsafe { core::slice::from_raw_parts(c, CHUNK_BYTES) }
-                    .iter()
-                    .all(|&b| b == 0)
-            );
+            let chunk = unsafe { core::slice::from_raw_parts(c, CHUNK_BYTES) };
+            assert!(chunk.iter().all(|&b| b == 0));
             seen.push(off);
         }
         seen.sort_unstable();

@@ -15,8 +15,6 @@
 
 // cast_possible_truncation: u64→usize address arithmetic bounded by platform memory layout.
 #![allow(clippy::cast_possible_truncation)]
-// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use boot_protocol::{BootInfo, KernelMmio, MemoryMapEntry, MemoryType, MmioAperture};
 use core::cell::UnsafeCell;

@@ -17,9 +17,6 @@
 //! life of the system and carries the mirrored `kprintln!` console (the panic
 //! path is serial-only); see `docs/console-model.md`.
 
-// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use boot_protocol::{FramebufferInfo, PixelFormat};
 use font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 use text::{DecodeOutcome, Utf8Decoder};

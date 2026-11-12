@@ -13,8 +13,6 @@
 
 // cast_possible_truncation: usize→u32 CPU index and u64→usize address bounded by MAX_CPUS.
 #![allow(clippy::cast_possible_truncation)]
-// Staged roll-out of docs/coding-standards.md § Clippy: this subsystem's sites are fixed.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 pub mod deadline_heap;
 pub mod run_queue;

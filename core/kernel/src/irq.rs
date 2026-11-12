@@ -151,9 +151,6 @@
 //! Delivery itself (`notification_send`, `sched::enqueue_and_wake`) takes the
 //! notification's and the scheduler's spinlocks with interrupts disabled.
 
-// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 

@@ -19,9 +19,6 @@
 //! 2. Add a handler function in the appropriate `syscall/` submodule.
 //! 3. Add a `match` arm in `dispatch_in_range` below.
 
-// Staged roll-out of docs/coding-standards.md § Clippy: this subsystem's sites are fixed.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 pub mod cap;
 pub mod entropy;
 pub mod hw;

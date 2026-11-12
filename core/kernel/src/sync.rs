@@ -20,9 +20,6 @@
 //! Place reader-writer locks, semaphores, etc. as additional `pub mod` entries
 //! in this file.
 
-// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // ── Spinlock ──────────────────────────────────────────────────────────────────

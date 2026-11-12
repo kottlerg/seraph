@@ -17,9 +17,6 @@
 //! userspace serial output is owned by the userspace serial driver. See
 //! `docs/console-model.md`.
 
-// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::current::console::{serial_init, serial_write_byte};

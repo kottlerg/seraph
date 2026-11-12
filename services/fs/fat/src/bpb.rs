@@ -130,7 +130,9 @@ impl FatState
 
     /// The sector of the first FAT copy holding `cluster`'s entry, and the
     /// entry's byte offset in it ([`fat_parse::fat_entry_location`]). `None`
-    /// only for a cluster past the data region, whose entry the FAT lacks.
+    /// only when the location overflows `u32` or the sector size is zero,
+    /// which mount refuses. The caller bounds `cluster` to the data region
+    /// ([`Self::is_data_cluster`]): the method does not.
     pub fn fat_entry_location(&self, cluster: u32) -> Option<(u32, usize)>
     {
         fat_parse::fat_entry_location(

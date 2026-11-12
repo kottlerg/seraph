@@ -50,16 +50,23 @@ pub fn sys_getrandom(tf: UserFrame) -> Result<u64, RestartableError>
         return Ok(0);
     }
     // The per-call length is capped so the kernel-side draw runs in a bounded
-    // window; userspace loops for larger buffers.
-    if len > MAX_GETRANDOM_LEN
+    // window; userspace loops for larger buffers. The draw goes into the first
+    // `len` bytes of a `MAX_GETRANDOM_LEN`-byte buffer, so that slice's bound is
+    // the cap check.
+    let mut scratch = [0u8; MAX_GETRANDOM_LEN];
+    let Some(dst) = scratch.get_mut(..len)
+    else
     {
         return Err(SyscallError::InvalidArgument.into());
-    }
+    };
     // The whole span must be non-null and lie within the user half (no wrap
-    // into kernel/non-canonical territory). `len <= MAX_GETRANDOM_LEN` and
-    // `user_va_top() <= 1 << 56`, so `buf_ptr + len` cannot overflow u64.
+    // into kernel/non-canonical territory).
     let user_va_top = crate::mm::user_va_top();
-    if buf_ptr == 0 || buf_ptr >= user_va_top || buf_ptr + len as u64 > user_va_top
+    if buf_ptr == 0
+        || buf_ptr >= user_va_top
+        || buf_ptr
+            .checked_add(len as u64)
+            .is_none_or(|end| end > user_va_top)
     {
         return Err(SyscallError::InvalidAddress.into());
     }
@@ -74,15 +81,14 @@ pub fn sys_getrandom(tf: UserFrame) -> Result<u64, RestartableError>
     // Draw into a kernel buffer *before* the user copy: the draw disables/
     // re-enables interrupts internally, which must not happen inside the SMAP/SUM
     // access window that `copy_to_user_restartable` opens.
-    let mut scratch = [0u8; MAX_GETRANDOM_LEN];
-    crate::entropy::fill_bytes(&mut scratch[..len]);
+    crate::entropy::fill_bytes(dst);
 
     // The span was range-validated above; the copy is additionally fault-recovered,
     // so an in-range-but-unbacked or read-only buffer reaches the dispatcher as a
     // restartable fault rather than faulting the kernel.
-    // SAFETY: scratch is valid for `len` reads; buf_ptr is the validated user span.
+    // SAFETY: dst is valid for `len` reads; buf_ptr is the validated user span.
     unsafe {
-        crate::uaccess::copy_to_user_restartable(buf_ptr, scratch.as_ptr(), len)?;
+        crate::uaccess::copy_to_user_restartable(buf_ptr, dst.as_ptr(), len)?;
     }
 
     Ok(len as u64)

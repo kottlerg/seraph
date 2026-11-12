@@ -37,6 +37,26 @@ use syscall::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 // ── IPC buffer helpers ────────────────────────────────────────────────────────
 
+/// Byte offset in the IPC buffer of the capability handles a sender places
+/// (word [`syscall::MSG_CAP_HANDLES_WORD`] on).
+#[cfg(not(test))]
+const CAP_HANDLES_OFFSET: u64 =
+    (syscall::MSG_CAP_HANDLES_WORD * core::mem::size_of::<u64>()) as u64;
+
+/// Byte offset in the IPC buffer of the capability results a delivery writes
+/// (word `MSG_DATA_WORDS_MAX` on).
+#[cfg(not(test))]
+const CAP_RESULTS_OFFSET: u64 = (MSG_DATA_WORDS_MAX * core::mem::size_of::<u64>()) as u64;
+
+/// The first `count` entries of `items`, or all of them when `count` exceeds
+/// their number: the clamp a message's data and capability counts take to
+/// `MSG_DATA_WORDS_MAX` and `MSG_CAP_SLOTS_MAX`.
+#[cfg(not(test))]
+fn leading<T>(items: &[T], count: usize) -> &[T]
+{
+    items.get(..count).unwrap_or(items)
+}
+
 /// Read up to `count` data words from the thread's IPC buffer into `dst`.
 ///
 /// Returns `Err(InvalidArgument)` if the buffer is not registered, or
@@ -57,19 +77,15 @@ unsafe fn read_ipc_buf(
     {
         return Err(SyscallError::InvalidArgument);
     }
-    let n = count.min(MSG_DATA_WORDS_MAX);
-    // Read the first `n` words from the user IPC buffer with fault recovery: a
-    // buffer unmapped after SYS_IPC_BUFFER_SET returns InvalidAddress instead of
-    // faulting the kernel.
-    // SAFETY: dst holds MSG_DATA_WORDS_MAX words, so it is valid for n*8 bytes; buf
+    let bytes = core::mem::size_of_val(leading(dst.as_slice(), count));
+    // Read the first `count` words (at most MSG_DATA_WORDS_MAX) from the user IPC
+    // buffer with fault recovery: a buffer unmapped after SYS_IPC_BUFFER_SET
+    // returns InvalidAddress instead of faulting the kernel.
+    // SAFETY: `bytes` is the size of a prefix of dst, so dst is valid for it; buf
     //         is the user source span (non-zero per the check above; page-aligned
     //         and in the user half per SYS_IPC_BUFFER_SET).
     unsafe {
-        crate::uaccess::copy_from_user(
-            dst.as_mut_ptr().cast::<u8>(),
-            buf,
-            n * core::mem::size_of::<u64>(),
-        )?;
+        crate::uaccess::copy_from_user(dst.as_mut_ptr().cast::<u8>(), buf, bytes)?;
     }
     Ok(())
 }
@@ -91,19 +107,20 @@ unsafe fn write_ipc_buf(buf: u64, count: usize, src: &[u64; MSG_DATA_WORDS_MAX])
     {
         return;
     }
-    let n = count.min(MSG_DATA_WORDS_MAX);
-    // Write the first `n` words to the user IPC buffer with fault recovery. A fault
-    // (the owner unmapped its own buffer) is swallowed rather than propagated: this
-    // runs during reply delivery in the owner's address space where the IPC has
-    // already committed, so the only consequence is that the owner reads stale
-    // words from a buffer it broke — never a kernel panic.
-    // SAFETY: src holds MSG_DATA_WORDS_MAX words, valid for n*8 bytes; buf is the
-    //         user destination span.
+    let words = leading(src.as_slice(), count);
+    // Write the first `count` words (at most MSG_DATA_WORDS_MAX) to the user IPC
+    // buffer with fault recovery. A fault (the owner unmapped its own buffer) is
+    // swallowed rather than propagated: this runs during reply delivery in the
+    // owner's address space where the IPC has already committed, so the only
+    // consequence is that the owner reads stale words from a buffer it broke —
+    // never a kernel panic.
+    // SAFETY: words is a prefix of src, valid for its own size; buf is the user
+    //         destination span.
     unsafe {
         let _ = crate::uaccess::copy_to_user(
             buf,
-            src.as_ptr().cast::<u8>(),
-            n * core::mem::size_of::<u64>(),
+            words.as_ptr().cast::<u8>(),
+            core::mem::size_of_val(words),
         );
     }
 }
@@ -127,19 +144,19 @@ unsafe fn read_cap_handles(buf: u64, count: usize)
     {
         return Err(SyscallError::InvalidArgument);
     }
-    let n = count.min(MSG_CAP_SLOTS_MAX);
     let mut handles = [0u64; MSG_CAP_SLOTS_MAX];
-    let src = buf + (syscall::MSG_CAP_HANDLES_WORD * core::mem::size_of::<u64>()) as u64;
-    // SAFETY: handles holds MSG_CAP_SLOTS_MAX words, valid for n*8 bytes; src
-    //         is the user span inside the registered IPC buffer page (non-zero
-    //         per the check above; the abi const assert keeps the cap block
-    //         inside the page), read with fault recovery.
+    let bytes = core::mem::size_of_val(leading(handles.as_slice(), count));
+    // The registered buffer is a page-aligned user-half page, so the cap block's
+    // address cannot overflow; the check refuses one that would rather than wrap.
+    let src = buf
+        .checked_add(CAP_HANDLES_OFFSET)
+        .ok_or(SyscallError::InvalidAddress)?;
+    // SAFETY: `bytes` is the size of a prefix of handles, so handles is valid
+    //         for it; src is the user span inside the registered IPC buffer page
+    //         (non-zero per the check above; the abi const assert keeps the cap
+    //         block inside the page), read with fault recovery.
     unsafe {
-        crate::uaccess::copy_from_user(
-            handles.as_mut_ptr().cast::<u8>(),
-            src,
-            n * core::mem::size_of::<u64>(),
-        )?;
+        crate::uaccess::copy_from_user(handles.as_mut_ptr().cast::<u8>(), src, bytes)?;
     }
     Ok(handles)
 }
@@ -171,22 +188,36 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u64; MSG_CAP_
     // surface as this delivery's cap results to handlers that loop over
     // `req.caps()`, and trip `shared/ipc`'s bootstrap `debug_assert_eq!`
     // against the label-declared cap count.
-    let n = cap_count.min(MSG_CAP_SLOTS_MAX);
+    let handles = leading(handles.as_slice(), cap_count);
     // Assemble the result block [cap_count, handle0, handle1, ...] in a
     // kernel buffer, then copy it to the user IPC buffer at word offset
     // MSG_DATA_WORDS_MAX.
     let mut block = [0u64; MSG_CAP_SLOTS_MAX + 1];
-    block[0] = cap_count as u64;
-    block[1..=n].copy_from_slice(&handles[..n]);
-    let dst = buf + (MSG_DATA_WORDS_MAX * core::mem::size_of::<u64>()) as u64;
-    // SAFETY: block is valid for (n+1)*8 bytes; the IPC buffer is page-sized, far
-    //         larger than MSG_DATA_WORDS_MAX + 1 + MSG_CAP_SLOTS_MAX words. A fault
-    //         is swallowed (see write_ipc_buf) rather than panicking.
+    let [count_word, handle_words @ ..] = &mut block;
+    *count_word = cap_count as u64;
+    for (word, &handle) in handle_words.iter_mut().zip(handles)
+    {
+        *word = handle;
+    }
+    // The count word and the handles after it; at most the whole block.
+    let used = block.get(..=handles.len()).unwrap_or(&block);
+    // The registered buffer is a page-aligned user-half page, so the result
+    // block's address cannot overflow; one that would is skipped like an
+    // unregistered buffer.
+    let Some(dst) = buf.checked_add(CAP_RESULTS_OFFSET)
+    else
+    {
+        return;
+    };
+    // SAFETY: used is a prefix of block, valid for its own size; the IPC buffer
+    //         is page-sized, far larger than MSG_DATA_WORDS_MAX + 1 +
+    //         MSG_CAP_SLOTS_MAX words. A fault is swallowed (see write_ipc_buf)
+    //         rather than panicking.
     unsafe {
         let _ = crate::uaccess::copy_to_user(
             dst,
-            block.as_ptr().cast::<u8>(),
-            (n + 1) * core::mem::size_of::<u64>(),
+            used.as_ptr().cast::<u8>(),
+            core::mem::size_of_val(used),
         );
     }
 }
@@ -211,8 +242,9 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u64]) -> Result<(), Syscal
         let idx = syscall::cap_handle_index(handle);
         // Distinctness is by decoded index: two handles naming the same
         // slot are a repeat regardless of their generation bits.
-        if handles[..i]
+        if handles
             .iter()
+            .take(i)
             .any(|&h| syscall::cap_handle_index(h) == idx)
         {
             return Err(SyscallError::InvalidArgument);
@@ -307,7 +339,8 @@ unsafe fn transfer_caps(
         CapMove, DestRef, MoveStep, Placement, move_cap_begin, move_cap_drive, release_moved_object,
     };
 
-    let cap_count = src_handles.len().min(MSG_CAP_SLOTS_MAX);
+    let src_handles = leading(src_handles, MSG_CAP_SLOTS_MAX);
+    let cap_count = src_handles.len();
     if cap_count == 0
     {
         return Ok(0);
@@ -344,12 +377,9 @@ unsafe fn transfer_caps(
     // moved yet) and the per-move failure branch below genuinely unreachable.
     // SAFETY: both pointers registry-resolved under the lock; both locks held.
     let prepared = unsafe {
-        prevalidate_transfer_slots(&*src_cspace, &src_handles[..cap_count])
+        prevalidate_transfer_slots(&*src_cspace, src_handles)
             .and_then(|()| {
-                crate::cap::transfer::check_transfer_ref_limits(
-                    &*src_cspace,
-                    &src_handles[..cap_count],
-                )
+                crate::cap::transfer::check_transfer_ref_limits(&*src_cspace, src_handles)
             })
             .and_then(|()| {
                 (*dst_cspace)
@@ -368,7 +398,13 @@ unsafe fn transfer_caps(
     let mut pending: [Option<CapMove>; MSG_CAP_SLOTS_MAX] = [None; MSG_CAP_SLOTS_MAX];
     let mut releases: [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>;
         MSG_CAP_SLOTS_MAX] = [None; MSG_CAP_SLOTS_MAX];
-    for (i, &src_handle) in src_handles[..cap_count].iter().enumerate()
+    // `src_handles` holds at most MSG_CAP_SLOTS_MAX handles, so each has its
+    // entry in the three per-cap arrays.
+    let per_cap = dst_handles_out
+        .iter_mut()
+        .zip(releases.iter_mut())
+        .zip(pending.iter_mut());
+    for (&src_handle, ((out, release_entry), pending_entry)) in src_handles.iter().zip(per_cap)
     {
         // SAFETY: DERIVATION_LOCK and both CSpace locks held; pointers valid.
         match unsafe {
@@ -383,13 +419,13 @@ unsafe fn transfer_caps(
         {
             Ok(MoveStep::Done { handle, release }) =>
             {
-                dst_handles_out[i] = handle;
-                releases[i] = release;
+                *out = handle;
+                *release_entry = release;
             }
             Ok(MoveStep::Pending(mv)) =>
             {
-                dst_handles_out[i] = mv.handle();
-                pending[i] = Some(mv);
+                *out = mv.handle();
+                *pending_entry = Some(mv);
             }
             Ok(MoveStep::Lost(_) | MoveStep::Abandoned { .. }) | Err(_) =>
             {
@@ -400,7 +436,7 @@ unsafe fn transfer_caps(
                     false,
                     "transfer_caps: unexpected move failure after locked validation"
                 );
-                dst_handles_out[i] = 0;
+                *out = 0;
             }
         }
     }
@@ -419,11 +455,11 @@ unsafe fn transfer_caps(
         unsafe { release_moved_object(*obj) };
     }
     // Still no lock held, as `move_cap_drive` requires.
-    for (i, mv) in pending.iter().enumerate()
+    for (out, mv) in dst_handles_out.iter_mut().zip(&pending)
     {
         if let Some(mv) = mv
         {
-            dst_handles_out[i] = match move_cap_drive(*mv)
+            *out = match move_cap_drive(*mv)
             {
                 MoveStep::Done { handle, .. } | MoveStep::Abandoned { handle } => handle,
                 MoveStep::Lost(_) | MoveStep::Pending(_) => 0,
@@ -475,7 +511,7 @@ unsafe fn deliver_call_caps(
     let transferred = unsafe {
         transfer_caps(
             caller_tcb,
-            &msg.cap_slots[..msg.cap_count],
+            leading(&msg.cap_slots, msg.cap_count),
             server_tcb,
             &mut dst_handles,
         )
@@ -671,7 +707,7 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
         let handles = unsafe { read_cap_handles(buf, cap_count) }?;
         // Fail-fast reject before blocking (see prevalidate_sender_caps).
         // SAFETY: cspace_ptr validated above; no CSpace lock is held.
-        unsafe { prevalidate_sender_caps(cspace_ptr, &handles[..cap_count]) }?;
+        unsafe { prevalidate_sender_caps(cspace_ptr, leading(&handles, cap_count)) }?;
         msg.cap_slots = handles;
         msg.cap_count = cap_count;
     }
@@ -944,7 +980,7 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
             transferred = unsafe {
                 transfer_caps(
                     caller,
-                    &msg.cap_slots[..msg.cap_count],
+                    leading(&msg.cap_slots, msg.cap_count),
                     tcb,
                     &mut dst_handles,
                 )
@@ -1251,8 +1287,14 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     {
         // SAFETY: tcb is the running server; caller is pinned by the claim
         // and parked BlockedOnReply; no lock is held.
-        let transfer =
-            unsafe { transfer_caps(tcb, &msg.cap_slots[..cap_count], caller, &mut dst_handles) };
+        let transfer = unsafe {
+            transfer_caps(
+                tcb,
+                leading(&msg.cap_slots, cap_count),
+                caller,
+                &mut dst_handles,
+            )
+        };
         transferred = match transfer
         {
             Ok(n) => n,
@@ -1329,7 +1371,7 @@ unsafe fn stage_reply_payload(
         let handles = unsafe { read_cap_handles(buf, cap_count) }?;
         // SAFETY: server is the running thread; its bound CSpace outlives the
         // syscall, and no CSpace lock is held.
-        unsafe { prevalidate_sender_caps((*server).cspace, &handles[..cap_count]) }?;
+        unsafe { prevalidate_sender_caps((*server).cspace, leading(&handles, cap_count)) }?;
         msg.cap_slots = handles;
         msg.cap_count = cap_count;
     }

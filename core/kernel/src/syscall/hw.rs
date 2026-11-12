@@ -637,7 +637,6 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidArgument);
     }
-    let page_count = (mmio_size / PAGE_SIZE as u64) as usize;
 
     // Guard against virtual range overflow.
     let virt_end = virt_base
@@ -647,6 +646,12 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidAddress);
     }
+    // The region's physical end. A device region the kernel provisioned
+    // cannot pass the end of the address space; the check refuses one that
+    // would rather than wrap it.
+    let mmio_end = mmio_phys
+        .checked_add(mmio_size)
+        .ok_or(SyscallError::InvalidArgument)?;
 
     // Resolve AddressSpace cap.
     // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
@@ -697,11 +702,10 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     }?;
 
     // Map each page.
-    for i in 0..page_count
+    let virts = (virt_base..virt_end).step_by(PAGE_SIZE);
+    let frames = (mmio_phys..mmio_end).step_by(PAGE_SIZE);
+    for (virt, phys) in virts.zip(frames)
     {
-        let virt = virt_base + (i * PAGE_SIZE) as u64;
-        let phys = mmio_phys + (i * PAGE_SIZE) as u64;
-
         // SAFETY: virt in user range (validated above); phys from a
         // kernel-provisioned Mmio boot object; aso_raw is valid and wraps
         // as_ptr.
@@ -966,16 +970,16 @@ pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
         )
     };
 
-    // split_offset must be strictly within [1, mmio_size).
-    if split_offset >= mmio_size
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
-    // At least one page must remain on each side.
-    if mmio_size - split_offset < PAGE_SIZE as u64
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
+    // split_offset must be strictly within [1, mmio_size), with at least one
+    // page on each side. The upper child's base lies inside the region, which
+    // cannot pass the end of the address space; the check refuses a base that
+    // would rather than wrap it.
+    let (upper_base, upper_size) = mmio_size
+        .checked_sub(split_offset)
+        .filter(|&rest| rest >= PAGE_SIZE as u64)
+        .zip(mmio_phys.checked_add(split_offset))
+        .map(|(rest, base)| (base, rest))
+        .ok_or(SyscallError::InvalidArgument)?;
 
     // ── Create two child MmioObjects ────────────────────────────────────
     //
@@ -990,11 +994,8 @@ pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
         funder.alloc_body(MmioObject::new_root(mmio_phys, split_offset, mmio_flags))?;
 
     // child2: [base + split_offset, end).
-    let child2_ptr = match funder.alloc_body(MmioObject::new_root(
-        mmio_phys + split_offset,
-        mmio_size - split_offset,
-        mmio_flags,
-    ))
+    let child2_ptr = match funder
+        .alloc_body(MmioObject::new_root(upper_base, upper_size, mmio_flags))
     {
         Ok(p) => p,
         Err(e) =>
@@ -1100,15 +1101,10 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
     // ── Validation ────────────────────────────────────────────────────────────
 
     // split_at must lie strictly inside the cap's range.
-    if split_at <= start || split_at >= start.saturating_add(count)
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
+    let (lower_count, upper_count) =
+        split_counts(start, count, split_at).ok_or(SyscallError::InvalidArgument)?;
 
     // ── Create two child InterruptObjects ─────────────────────────────────────
-
-    let lower_count = split_at - start;
-    let upper_count = count - lower_count;
 
     // The caller's CSpace, which receives both children, funds their
     // bodies from its arena (core/kernel/docs/capability-internals.md
@@ -1253,24 +1249,18 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
         {
             u32::from(size_u16)
         };
-        let base_u32 = u32::from(base);
-        let end = base_u32 + effective_size;
-
         // split_at must lie strictly inside the cap's range.
-        if split_at <= base_u32 || split_at >= end
-        {
-            return Err(SyscallError::InvalidArgument);
-        }
+        let (lower_count, upper_count) = split_counts(u32::from(base), effective_size, split_at)
+            .ok_or(SyscallError::InvalidArgument)?;
 
         // ── Create two child IoPortObjects ─────────────────────────────
         //
-        // Both halves are guaranteed u16-representable because:
-        //   lower_count = split_at - base_u32, where 1 <= split_at - base_u32 < 65536
-        //   upper_count = end - split_at,     where 1 <= end - split_at      <= 65535
-        // (Neither half can be the full 65536; the split is strict.)
+        // Both halves are guaranteed u16-representable because each holds at
+        // least one port and the range at most 65536: neither half can be the
+        // full 65536, since the split is strict.
 
-        let lower_count: u16 = (split_at - base_u32) as u16;
-        let upper_count: u16 = (end - split_at) as u16;
+        let lower_count: u16 = lower_count as u16;
+        let upper_count: u16 = upper_count as u16;
         let split_at_u16: u16 = split_at as u16;
 
         // The caller's CSpace, which receives both children, funds their
@@ -1321,4 +1311,59 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
 pub fn sys_ioport_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
+}
+
+// ── Range splits ─────────────────────────────────────────────────────────────
+
+/// The counts of the two halves of the id range `[start, start + count)` split
+/// at `split_at`, lower half first, or `None` unless `split_at` lies strictly
+/// inside the range, so that each half holds at least one id. Shared by
+/// `SYS_IRQ_SPLIT` and `SYS_IOPORT_SPLIT`.
+const fn split_counts(start: u32, count: u32, split_at: u32) -> Option<(u32, u32)>
+{
+    let Some(lower) = split_at.checked_sub(start)
+    else
+    {
+        return None;
+    };
+    match count.checked_sub(lower)
+    {
+        Some(upper) if lower > 0 && upper > 0 => Some((lower, upper)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::split_counts;
+
+    // Defect guarded: halves computed from the wrong end, or a full-port-space
+    // range whose end passes the u16 ports, would mint children that do not
+    // cover the parent exactly.
+    #[test]
+    fn split_counts_divides_a_range_at_an_inner_id()
+    {
+        assert_eq!(split_counts(32, 16, 33), Some((1, 15)));
+        assert_eq!(split_counts(32, 16, 47), Some((15, 1)));
+        // The full I/O port space, as `SYS_IOPORT_SPLIT` passes it.
+        assert_eq!(split_counts(0, 65536, 0xFFFF), Some((0xFFFF, 1)));
+    }
+
+    // Defect guarded: a split point on or outside the range accepted, which
+    // would mint an empty child or one whose count wrapped.
+    #[test]
+    fn split_counts_refuses_a_split_on_or_outside_the_range()
+    {
+        // At the start or the end: one half would be empty.
+        assert_eq!(split_counts(32, 16, 32), None);
+        assert_eq!(split_counts(32, 16, 48), None);
+        // Below the start, where the lower count would underflow.
+        assert_eq!(split_counts(32, 16, 0), None);
+        // Past the end, where the upper count would underflow.
+        assert_eq!(split_counts(32, 16, u32::MAX), None);
+        // A single id has no inner split point.
+        assert_eq!(split_counts(7, 1, 7), None);
+        assert_eq!(split_counts(7, 1, 8), None);
+    }
 }

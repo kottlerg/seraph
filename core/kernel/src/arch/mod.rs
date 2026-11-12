@@ -11,9 +11,6 @@
 //! other architectures also compile riscv64's `encoding` module, which
 //! depends on nothing else in its arch module, so its tests run on the host.
 
-// Staged roll-out of docs/coding-standards.md § Clippy: this subsystem's sites are fixed.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]
 pub mod current;

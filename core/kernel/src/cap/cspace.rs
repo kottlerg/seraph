@@ -44,7 +44,7 @@ extern crate alloc;
 
 #[cfg(test)]
 use alloc::boxed::Box;
-use core::num::NonZeroU32;
+use core::num::{NonZeroU32, NonZeroUsize};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -293,16 +293,66 @@ const fn sentinel_dir3() -> *mut DirLevel3
     (&raw const SENTINEL_DIR3).cast_mut()
 }
 
+/// A page type a root or directory entry names, with the sentinel an entry
+/// names while the page is unallocated.
+trait Unallocated
+{
+    /// The sentinel of this level.
+    fn sentinel() -> *mut Self;
+}
+
+impl Unallocated for CSpacePage
+{
+    fn sentinel() -> *mut Self
+    {
+        sentinel_leaf()
+    }
+}
+
+impl Unallocated for DirLeaves
+{
+    fn sentinel() -> *mut Self
+    {
+        sentinel_dir()
+    }
+}
+
+impl Unallocated for DirLevel2
+{
+    fn sentinel() -> *mut Self
+    {
+        sentinel_dir2()
+    }
+}
+
+impl Unallocated for DirLevel3
+{
+    fn sentinel() -> *mut Self
+    {
+        sentinel_dir3()
+    }
+}
+
+/// Load entry `i` of the root region or directory page `entries` with
+/// `order`; an index past the entries, which no caller passes (each reduces
+/// its index below the entries' count), reads as unallocated: the level's
+/// sentinel.
+fn load_at<T: Unallocated>(entries: &[AtomicPtr<T>], i: usize, order: Ordering) -> *mut T
+{
+    entries
+        .get(i)
+        .map_or_else(T::sentinel, |entry| entry.load(order))
+}
+
 /// Load entry `i` of directory page `dir` with Acquire, pairing with the
-/// Release publication in [`CSpace::grow`].
+/// Release publication in [`CSpace::grow`]; see [`load_at`].
 ///
 /// # Safety
-/// `dir` names a live directory page of a `CSpace` or a static sentinel, and
-/// `i < DIR_FANOUT`.
-unsafe fn load_entry<T>(dir: *mut DirPage<T>, i: usize) -> *mut T
+/// `dir` names a live directory page of a `CSpace` or a static sentinel.
+unsafe fn load_entry<T: Unallocated>(dir: *mut DirPage<T>, i: usize) -> *mut T
 {
     // SAFETY: the caller's contract.
-    unsafe { (*dir).entries[i].load(Ordering::Acquire) }
+    load_at(unsafe { &(*dir).entries }, i, Ordering::Acquire)
 }
 
 /// The regions of a `CSpace` root, in leaf order.
@@ -324,21 +374,21 @@ enum Region
 /// bound it by `MAX_LEAVES`.
 const fn region_of(leaf: usize) -> (Region, usize)
 {
-    if leaf < INDIRECT_BASE
+    if let Some(rel) = leaf.checked_sub(TRIPLE_BASE)
     {
-        (Region::Direct, leaf)
+        (Region::Triple, rel)
     }
-    else if leaf < DOUBLE_BASE
+    else if let Some(rel) = leaf.checked_sub(DOUBLE_BASE)
     {
-        (Region::Indirect, leaf - INDIRECT_BASE)
+        (Region::Double, rel)
     }
-    else if leaf < TRIPLE_BASE
+    else if let Some(rel) = leaf.checked_sub(INDIRECT_BASE)
     {
-        (Region::Double, leaf - DOUBLE_BASE)
+        (Region::Indirect, rel)
     }
     else
     {
-        (Region::Triple, leaf - TRIPLE_BASE)
+        (Region::Direct, leaf)
     }
 }
 
@@ -561,7 +611,8 @@ impl CSpace
         // generation matches the slot the recipient will resolve (#349).
         let slot = self.slot_mut(idx.get()).ok_or(CapError::InvalidIndex)?;
         slot.clear_keep_generation();
-        self.free_count -= 1;
+        // The popped slot was counted free, so the count does not saturate.
+        self.free_count = self.free_count.saturating_sub(1);
         Ok(idx)
     }
 
@@ -659,30 +710,42 @@ impl CSpace
     /// materialised and published first when the entry names `sentinel`.
     /// The Release publication pairs with the lookup path's Acquire, so a
     /// lock-free reader never observes an entry before its initialisation.
+    /// An index past the region, which `ensure_leaf_dir` never passes (it
+    /// reduces each below its region's root entries), is
+    /// [`CapError::InvalidIndex`].
     fn root_dir<T>(
         &mut self,
-        root: fn(&Self, usize) -> &AtomicPtr<DirPage<T>>,
+        root: fn(&Self) -> &[AtomicPtr<DirPage<T>>],
         i: usize,
         sentinel: *mut DirPage<T>,
         child: *mut T,
     ) -> Result<*mut DirPage<T>, CapError>
     {
-        let current = root(self, i).load(Ordering::Relaxed);
+        let current = root(self)
+            .get(i)
+            .ok_or(CapError::InvalidIndex)?
+            .load(Ordering::Relaxed);
         if current != sentinel
         {
             return Ok(current);
         }
         let dir = self.new_dir(child)?;
-        root(self, i).store(dir, Ordering::Release);
+        if let Some(entry) = root(self).get(i)
+        {
+            entry.store(dir, Ordering::Release);
+        }
         Ok(dir)
     }
 
     /// The directory page entry `i` of `parent` names, materialised and
     /// published first when the entry names `sentinel`, as [`Self::root_dir`].
     ///
+    /// An index past the page, which no caller passes (each reduces it below
+    /// `DIR_FANOUT`), is [`CapError::InvalidIndex`].
+    ///
     /// # Safety
     /// `parent` is a live, published directory page of this `CSpace` (never a
-    /// sentinel), `i < DIR_FANOUT`, and the caller holds this `CSpace`'s lock.
+    /// sentinel), and the caller holds this `CSpace`'s lock.
     unsafe fn child_dir<T>(
         &mut self,
         parent: *mut DirPage<DirPage<T>>,
@@ -693,7 +756,9 @@ impl CSpace
     {
         // SAFETY: the caller's contract; the page is pool memory, not part of
         // `self`, so the borrow of `self` below does not alias it.
-        let entry = unsafe { &(*parent).entries[i] };
+        let entry = unsafe { &(*parent).entries }
+            .get(i)
+            .ok_or(CapError::InvalidIndex)?;
         let current = entry.load(Ordering::Relaxed);
         if current != sentinel
         {
@@ -718,19 +783,15 @@ impl CSpace
         {
             Region::Direct => Err(CapError::InvalidIndex),
             Region::Indirect => self.root_dir(
-                |cs, i| &cs.indirect[i],
+                |cs| &cs.indirect,
                 rel / DIR_FANOUT,
                 sentinel_dir(),
                 sentinel_leaf(),
             ),
             Region::Double =>
             {
-                let dir2 = self.root_dir(
-                    |cs, i| &cs.double[i],
-                    rel / F2,
-                    sentinel_dir2(),
-                    sentinel_dir(),
-                )?;
+                let dir2 =
+                    self.root_dir(|cs| &cs.double, rel / F2, sentinel_dir2(), sentinel_dir())?;
                 // SAFETY: dir2 is the live level-2 page just ensured, under
                 // this CSpace's lock (grow's caller holds it).
                 unsafe {
@@ -744,12 +805,8 @@ impl CSpace
             }
             Region::Triple =>
             {
-                let dir3 = self.root_dir(
-                    |cs, i| &cs.triple[i],
-                    rel / F3,
-                    sentinel_dir3(),
-                    sentinel_dir2(),
-                )?;
+                let dir3 =
+                    self.root_dir(|cs| &cs.triple, rel / F3, sentinel_dir3(), sentinel_dir2())?;
                 // SAFETY: dir3, then dir2, are the live pages just ensured,
                 // under this CSpace's lock (grow's caller holds it).
                 unsafe {
@@ -787,11 +844,11 @@ impl CSpace
             Region::Direct => false,
             Region::Indirect =>
             {
-                self.indirect[rel / DIR_FANOUT].load(Ordering::Relaxed) != sentinel_dir()
+                load_at(&self.indirect, rel / DIR_FANOUT, Ordering::Relaxed) != sentinel_dir()
             }
             Region::Double =>
             {
-                let dir2 = self.double[rel / F2].load(Ordering::Relaxed);
+                let dir2 = load_at(&self.double, rel / F2, Ordering::Relaxed);
                 if level >= 2
                 {
                     return dir2 != sentinel_dir2();
@@ -801,7 +858,7 @@ impl CSpace
             }
             Region::Triple =>
             {
-                let dir3 = self.triple[rel / F3].load(Ordering::Relaxed);
+                let dir3 = load_at(&self.triple, rel / F3, Ordering::Relaxed);
                 if level >= 3
                 {
                     return dir3 != sentinel_dir3();
@@ -851,8 +908,9 @@ impl CSpace
 
         // Thread the leaf's slots onto the free list BEFORE publication so
         // the Release store below orders the initialised slot bytes ahead
-        // of pointer visibility.
-        let base = leaf_idx * L2_SIZE;
+        // of pointer visibility. The leaf is below `MAX_LEAVES`, so its slot
+        // indices are below `MAX_SLOTS_STRUCTURAL` and nothing here saturates.
+        let base = leaf_idx.saturating_mul(L2_SIZE);
         let start_slot = usize::from(leaf_idx == 0);
         // Append the leaf's slots, ascending, after the current tail. The
         // free slots a general allocation leaves for the IPC receive reserve
@@ -865,30 +923,31 @@ impl CSpace
         let mut prev = old_tail;
         let mut first: Option<NonZeroU32> = None;
         let mut new_free = 0usize;
-        for (i, slot) in page.slots.iter_mut().enumerate().skip(start_slot)
+        let mut slots = page
+            .slots
+            .iter_mut()
+            .zip(base..)
+            .skip(start_slot)
+            .peekable();
+        while let Some((slot, index)) = slots.next()
         {
-            // `base + i >= 1`: `start_slot` skips slot 0 of the first leaf. A
+            // `index >= 1`: `start_slot` skips slot 0 of the first leaf. A
             // zero index (unreachable) is left off the list — fail closed —
             // rather than threaded as some other slot.
-            debug_assert!(base + i >= 1, "grow: slot 0 must not be threaded");
-            let Some(idx) = NonZeroU32::new((base + i) as u32)
+            debug_assert!(index >= 1, "grow: slot 0 must not be threaded");
+            let Some(idx) = NonZeroU32::new(index as u32)
             else
             {
                 continue;
             };
-            let next = if i + 1 < L2_SIZE
-            {
-                NonZeroU32::new((base + i + 1) as u32)
-            }
-            else
-            {
-                None
-            };
+            let next = slots
+                .peek()
+                .and_then(|&(_, next)| NonZeroU32::new(next as u32));
             slot.set_next_free(next);
             slot.set_prev_free_link(prev);
             prev = Some(idx);
             first.get_or_insert(idx);
-            new_free += 1;
+            new_free = new_free.saturating_add(1);
         }
         match old_tail
         {
@@ -905,27 +964,32 @@ impl CSpace
         }
         self.free_tail = prev;
 
-        // Publish.
-        match leaf_dir
+        // Publish. The entry exists: a leaf with no level-1 page is below
+        // `INDIRECT_BASE`, the direct region's length, and a leaf's entry in
+        // its level-1 page is its region-relative index modulo the fan-out
+        // (`region_of`).
+        let entry = match leaf_dir
         {
-            None => self.direct[leaf_idx].store(page_nn.as_ptr(), Ordering::Release),
+            None => self.direct.get(leaf_idx),
             Some(dir) =>
             {
-                // The leaf's entry in its level-1 page is its region-relative
-                // index modulo the fan-out (`region_of`).
                 let (_, rel) = region_of(leaf_idx);
                 // SAFETY: a real level-1 directory page, ensured above under
                 // the same lock (never a sentinel); directory pages are
                 // write-once and never freed while the CSpace lives.
-                unsafe {
-                    (*dir).entries[rel % DIR_FANOUT].store(page_nn.as_ptr(), Ordering::Release);
-                }
+                unsafe { (*dir).entries.get(rel % DIR_FANOUT) }
             }
+        };
+        if let Some(entry) = entry
+        {
+            entry.store(page_nn.as_ptr(), Ordering::Release);
         }
 
-        self.next_leaf += 1;
-        self.allocated_slots += new_free;
-        self.free_count += new_free;
+        // The cursor stays at most `MAX_LEAVES`, which fits a u32, and the
+        // slot counts at most `MAX_SLOTS_STRUCTURAL`: none saturates.
+        self.next_leaf = self.next_leaf.saturating_add(1);
+        self.allocated_slots = self.allocated_slots.saturating_add(new_free);
+        self.free_count = self.free_count.saturating_add(new_free);
         Ok(())
     }
 
@@ -958,7 +1022,7 @@ impl CSpace
         if leaf_idx < INDIRECT_BASE
         {
             let in_range = nospec::index_mask(leaf_idx, L1_DIRECT);
-            let page = self.direct[leaf_idx & in_range].load(Ordering::Acquire);
+            let page = load_at(&self.direct, leaf_idx & in_range, Ordering::Acquire);
             nospec::select_ptr(in_range, page, sentinel_leaf())
         }
         else if leaf_idx < DOUBLE_BASE
@@ -966,7 +1030,7 @@ impl CSpace
             let rel = leaf_idx.wrapping_sub(INDIRECT_BASE);
             let in_range = nospec::index_mask(rel, L1_INDIRECT * DIR_FANOUT);
             let rel = rel & in_range;
-            let dir = self.indirect[rel / DIR_FANOUT].load(Ordering::Acquire);
+            let dir = load_at(&self.indirect, rel / DIR_FANOUT, Ordering::Acquire);
             // SAFETY: see above.
             let page = unsafe { load_entry(dir, rel % DIR_FANOUT) };
             nospec::select_ptr(in_range, page, sentinel_leaf())
@@ -976,7 +1040,7 @@ impl CSpace
             let rel = leaf_idx.wrapping_sub(DOUBLE_BASE);
             let in_range = nospec::index_mask(rel, L1_DOUBLE * F2);
             let rel = rel & in_range;
-            let dir2 = self.double[rel / F2].load(Ordering::Acquire);
+            let dir2 = load_at(&self.double, rel / F2, Ordering::Acquire);
             // SAFETY: see above.
             let page = unsafe {
                 let dir = load_entry(dir2, (rel / DIR_FANOUT) % DIR_FANOUT);
@@ -992,7 +1056,7 @@ impl CSpace
             let rel = leaf_idx.wrapping_sub(TRIPLE_BASE);
             let in_range = nospec::index_mask(rel, MAX_LEAVES - TRIPLE_BASE);
             let rel = rel & in_range;
-            let dir3 = self.triple[rel / F3].load(Ordering::Acquire);
+            let dir3 = load_at(&self.triple, rel / F3, Ordering::Acquire);
             // SAFETY: see above.
             let page = unsafe {
                 let dir2 = load_entry(dir3, (rel / F2) % DIR_FANOUT);
@@ -1023,7 +1087,7 @@ impl CSpace
         // Content races are defended by tag/generation checks at every
         // resolution site.
         let page = unsafe { &*page };
-        Some(&page.slots[idx % L2_SIZE])
+        page.slots.get(idx % L2_SIZE)
     }
 
     /// Mutable variant of [`slot`][Self::slot]. Never returns a slot of the
@@ -1041,7 +1105,7 @@ impl CSpace
         // struct's concurrency contract). The sentinel, which is shared and
         // read-only, is refused above.
         let page = unsafe { &mut *page };
-        Some(&mut page.slots[idx % L2_SIZE])
+        page.slots.get_mut(idx % L2_SIZE)
     }
 
     /// Number of allocated leaf pages; leaves `0..leaf_count()` are exactly
@@ -1073,21 +1137,32 @@ impl CSpace
         {
             return 0;
         }
-        let mut pages = (target_leaf + 1 - next) as u64;
+        // Every count below is of leaves or directory pages under
+        // `MAX_LEAVES`, with `next <= target_leaf` and `base <= first <= last`
+        // in each region: none saturates.
+        let mut pages = (target_leaf.saturating_sub(next) as u64).saturating_add(1);
         for (base, end, depth) in DEEP_REGIONS
         {
             let first = next.max(base);
-            let last = target_leaf.min(end - 1);
+            let last = target_leaf.min(end.saturating_sub(1));
             if first > last
             {
                 continue;
             }
             for level in 1..=depth
             {
-                let span = DIR_FANOUT.pow(level);
-                let spanned = (last - base) / span - (first - base) / span + 1;
+                // The leaves one directory page of this level spans; never
+                // zero.
+                let Some(span) = NonZeroUsize::new(DIR_FANOUT.pow(level))
+                else
+                {
+                    continue;
+                };
+                let spanned = (last.saturating_sub(base) / span)
+                    .saturating_sub(first.saturating_sub(base) / span)
+                    .saturating_add(1);
                 let present = usize::from(self.dir_exists(first, level));
-                pages += (spanned - present) as u64;
+                pages = pages.saturating_add(spanned.saturating_sub(present) as u64);
             }
         }
         pages
@@ -1112,7 +1187,8 @@ impl CSpace
                 return Ok(false);
             }
             self.grow()?;
-            grown += 1;
+            // Below `max_leaves`, checked above: does not saturate.
+            grown = grown.saturating_add(1);
         }
         Ok(true)
     }
@@ -1175,7 +1251,8 @@ impl CSpace
         {
             old_head_slot.set_prev_free_link(Some(nz_index));
         }
-        self.free_count += 1;
+        // At most the allocated slots: does not saturate.
+        self.free_count = self.free_count.saturating_add(1);
     }
 
     /// Allocate a slot, populate it with the given capability, and return the
@@ -1370,7 +1447,8 @@ impl CSpace
         {
             self.free_tail = prev;
         }
-        self.free_count -= 1;
+        // The slot was counted free: does not saturate.
+        self.free_count = self.free_count.saturating_sub(1);
         // Drop the free-list marker so the unlinked slot is canonical
         // off-list (same state as an `allocate_slot` pop). Keep the
         // generation so a cap later placed here via insert_cap_at carries
@@ -1458,7 +1536,8 @@ impl CSpace
     /// O(1): derived from `allocated_slots - free_count`.
     pub fn populated_count(&self) -> usize
     {
-        self.allocated_slots - self.free_count
+        // Every free slot is an allocated one.
+        self.allocated_slots.saturating_sub(self.free_count)
     }
 
     /// Total usable slots allocated across all pages (excludes slot 0).
@@ -1489,7 +1568,7 @@ impl CSpace
                 // sentinel, checked above) and not aliased outside the lock.
                 let page = unsafe { &*page };
                 let start = usize::from(leaf_idx == 0);
-                for slot in &page.slots[start..]
+                for slot in page.slots.iter().skip(start)
                 {
                     if slot.tag != CapTag::Null
                         && let Some(obj) = slot.object

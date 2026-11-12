@@ -121,6 +121,28 @@ unsafe fn release_src_ref(object: core::ptr::NonNull<crate::cap::object::KernelO
     unsafe { crate::cap::object::release_ref(object) };
 }
 
+/// Physical address of byte `offset` of `memory`'s region.
+///
+/// `offset` lies inside the region (a `retype_allocate` return, or a window
+/// `mappings_window` checked against `memory.size`), and a Memory object's
+/// region lies inside the physical address space, so the sum never wraps.
+#[cfg(not(test))]
+fn region_phys(memory: &crate::cap::object::MemoryObject, offset: u64) -> u64
+{
+    memory.base.wrapping_add(offset)
+}
+
+/// Pointer to byte `offset` of the retype slot whose direct-map address is
+/// `block_virt`.
+///
+/// `offset` lies inside the slot, which lies in the kernel direct map, so the
+/// sum never wraps.
+#[cfg(not(test))]
+fn slot_field<T>(block_virt: u64, offset: u64) -> *mut T
+{
+    block_virt.wrapping_add(offset) as *mut T
+}
+
 /// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Memory cap into a new Endpoint.
 ///
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The Memory cap
@@ -174,14 +196,14 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
     let offset = retype_allocate(memory, entry.raw_bytes)?;
 
     // Compute the kernel direct-map virtual address of the new object.
-    let block_phys = memory.base + offset;
+    let block_phys = region_phys(memory, offset);
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout: EndpointObject at offset 0; EndpointState at offset
     // size_of::<EndpointObject>() (24). Total 24 + 56 = 80 B, rounds to 128 B.
     let ep_obj_ptr = block_virt as *mut EndpointObject;
     let state_offset = core::mem::size_of::<EndpointObject>() as u64;
-    let ep_state_ptr = (block_virt + state_offset) as *mut EndpointState;
+    let ep_state_ptr = slot_field::<EndpointState>(block_virt, state_offset);
 
     let ancestor = memory_obj_nn;
 
@@ -297,14 +319,14 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     let offset = retype_allocate(memory, entry.raw_bytes)?;
 
-    let block_phys = memory.base + offset;
+    let block_phys = region_phys(memory, offset);
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout: NotificationObject at offset 0; NotificationState at offset
     // size_of::<NotificationObject>() (24).
     let sig_obj_ptr = block_virt as *mut NotificationObject;
     let state_offset = core::mem::size_of::<NotificationObject>() as u64;
-    let sig_state_ptr = (block_virt + state_offset) as *mut NotificationState;
+    let sig_state_ptr = slot_field::<NotificationState>(block_virt, state_offset);
 
     let ancestor = memory_obj_nn;
 
@@ -511,17 +533,20 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     }
 
     // Create-mode: slab layout is [wrapper page, root PT, pool pages...].
-    // Requires `init_pages >= 2`.
-    if init_pages < 2
+    // Requires `init_pages >= 2`: the lower 2 pages (wrapper + root PT) are
+    // reserved, the remainder seeds the pool.
+    let Some(pool_pages) = init_pages.checked_sub(2)
+    else
     {
         // SAFETY: this call's own `retype_allocate` return, holding no live
         // object (none placed yet, or dropped above) and published nowhere.
         unsafe { retype_free(memory, offset, entry.raw_bytes) };
         return Err(SyscallError::InvalidArgument);
-    }
+    };
 
-    let wrapper_phys = memory_base + offset;
-    let root_pt_phys = wrapper_phys + PAGE_SIZE as u64;
+    let wrapper_phys = region_phys(memory, offset);
+    // Page 1 of the slab, inside the region (see `region_phys`).
+    let root_pt_phys = wrapper_phys.wrapping_add(PAGE_SIZE as u64);
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
     // Wrapper page layout: AddressSpaceObject at offset 0 (header at 0),
@@ -532,8 +557,16 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     #[allow(clippy::cast_ptr_alignment)]
     let aso_ptr = wrapper_virt.cast::<AddressSpaceObject>();
     let as_offset = core::mem::size_of::<AddressSpaceObject>();
-    debug_assert_eq!(as_offset % core::mem::align_of::<AddressSpace>(), 0);
-    debug_assert!(as_offset + core::mem::size_of::<AddressSpace>() <= PAGE_SIZE);
+    const {
+        assert!(
+            core::mem::size_of::<AddressSpaceObject>()
+                .is_multiple_of(core::mem::align_of::<AddressSpace>())
+        );
+        assert!(
+            core::mem::size_of::<AddressSpaceObject>() + core::mem::size_of::<AddressSpace>()
+                <= PAGE_SIZE
+        );
+    }
     // cast_ptr_alignment: as_offset is a multiple of align_of::<AddressSpace>()
     // (asserted above) and wrapper_virt is page-aligned.
     // similar_names: aso_ptr / aspace_ptr both name pointers in the same
@@ -578,8 +611,7 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     unsafe { memory_obj_nn.as_ref().inc_ref() };
 
     // Record the donation covering all `init_pages`; the lower 2 pages
-    // (wrapper + root PT) are reserved, the remainder seeds the pool.
-    let pool_pages = init_pages - 2;
+    // (wrapper + root PT) are reserved, `pool_pages` seed the pool.
     // SAFETY: aso just constructed; offset/init_pages from a successful
     // retype against `memory`.
     let res = unsafe {
@@ -693,10 +725,17 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     let augment_idx = tf.arg(1);
     let init_pages = tf.arg(2);
 
-    if init_pages == 0 || tf.arg(3) != 0
+    if tf.arg(3) != 0
     {
         return Err(SyscallError::InvalidArgument);
     }
+    // Both modes refuse `init_pages == 0`. Create-mode reserves page 0 (the
+    // wrapper) and seeds the slot-page pool with the remaining `pool_pages`.
+    let Some(pool_pages) = init_pages.checked_sub(1)
+    else
+    {
+        return Err(SyscallError::InvalidArgument);
+    };
     // Reject overflow on `init_pages * PAGE_SIZE` — caller-controlled, must
     // not wrap into a small target size.
     let init_bytes = init_pages
@@ -784,7 +823,7 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     // Page 0 holds CSpaceKernelObject at offset 0 followed by CSpace at
     // offset size_of::<CSpaceKernelObject>(). Pages 1..init_pages seed the
     // slot-page pool; CSpace::grow pops one when the directory needs a leaf.
-    let wrapper_phys = memory_base + offset;
+    let wrapper_phys = region_phys(memory, offset);
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
     // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
@@ -792,8 +831,16 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     #[allow(clippy::cast_ptr_alignment)]
     let cs_kobj_ptr = wrapper_virt.cast::<CSpaceKernelObject>();
     let cs_offset = core::mem::size_of::<CSpaceKernelObject>();
-    debug_assert_eq!(cs_offset % core::mem::align_of::<CSpace>(), 0);
-    debug_assert!(cs_offset + core::mem::size_of::<CSpace>() <= PAGE_SIZE);
+    const {
+        assert!(
+            core::mem::size_of::<CSpaceKernelObject>()
+                .is_multiple_of(core::mem::align_of::<CSpace>())
+        );
+        assert!(
+            core::mem::size_of::<CSpaceKernelObject>() + core::mem::size_of::<CSpace>()
+                <= PAGE_SIZE
+        );
+    }
     // cast_ptr_alignment: cs_offset is a multiple of align_of::<CSpace>()
     // (asserted above) and wrapper_virt is page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
@@ -860,8 +907,7 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     unsafe { memory_obj_nn.as_ref().inc_ref() };
 
     // Record the donation covering all init_pages; reserve page 0 (wrapper),
-    // pool seeds pages 1..init_pages.
-    let pool_pages = init_pages - 1;
+    // pool seeds pages 1..init_pages (`pool_pages`).
     // SAFETY: wrapper just constructed; offset/init_pages from a successful
     // retype against `memory`.
     let res = unsafe {
@@ -1096,9 +1142,12 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     //   pages 6..           — per-thread FPU/SIMD/V save area, one page or more
     let entry = dispatch_for(ObjectType::Thread, 0).ok_or(SyscallError::InvalidArgument)?;
     let extended_bytes = crate::sched::thread_slot::extended_area_bytes();
-    debug_assert_eq!(entry.raw_bytes, EXTENDED_OFFSET + extended_bytes);
+    debug_assert_eq!(
+        Some(entry.raw_bytes),
+        EXTENDED_OFFSET.checked_add(extended_bytes)
+    );
     let offset = retype_allocate(memory, entry.raw_bytes)?;
-    let block_phys = memory.base + offset;
+    let block_phys = region_phys(memory, offset);
     let block_virt = phys_to_virt(block_phys);
 
     // Unmap the guard page below the stack from the direct map, so an
@@ -1115,8 +1164,9 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::OutOfMemory);
     };
 
-    let kstack_virt = block_virt + STACK_OFFSET;
-    let kstack_top = block_virt + WRAPPER_OFFSET;
+    // Offsets inside the slot, which lies in the kernel direct map.
+    let kstack_virt = block_virt.wrapping_add(STACK_OFFSET);
+    let kstack_top = block_virt.wrapping_add(WRAPPER_OFFSET);
     // Paint the kernel stack for the depth report (crate::stack_depth): a full
     // overwrite of the stack pages, so their previous content never reaches
     // the thread.
@@ -1126,13 +1176,14 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     unsafe { crate::stack_depth::paint(kstack_virt, KERNEL_STACK_PAGES * PAGE_SIZE) };
     let thread_obj_ptr = kstack_top as *mut ThreadObject;
     let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
-    let tcb_ptr = (kstack_top + tcb_offset) as *mut ThreadControlBlock;
+    // Inside the wrapper page, so inside the slot.
+    let tcb_ptr = kstack_top.wrapping_add(tcb_offset) as *mut ThreadControlBlock;
     // Per-thread FPU/SIMD/V save area: its pages directly after the wrapper
     // page. Zero-initialised so the first XRSTOR / F-D restore sees the
     // architected initial state. The area's lifecycle is the Thread retype
     // slot's; `retype_free` reclaims it wholesale, so no separate free
     // path is needed.
-    let extended_area = (block_virt + EXTENDED_OFFSET) as *mut u8;
+    let extended_area = slot_field::<u8>(block_virt, EXTENDED_OFFSET);
     // SAFETY: extended_area points at the freshly-retyped save-area pages,
     // `extended_bytes` of them at the end of the slot, exclusively owned by
     // this TCB construction.
@@ -1149,7 +1200,10 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // SYS_THREAD_CONFIGURE. Set the trampoline's initial RSP BELOW the TrapFrame
     // so the trampoline's C stack frame cannot overwrite TrapFrame fields.
     let tf_size = core::mem::size_of::<ArchTF>() as u64;
-    let trampoline_rsp = kstack_top - tf_size - TRAMPOLINE_FRAME_SIZE;
+    // Below the kernel-half `kstack_top` by less than the stack's size.
+    let trampoline_rsp = kstack_top
+        .wrapping_sub(tf_size)
+        .wrapping_sub(TRAMPOLINE_FRAME_SIZE);
     let mut saved = crate::arch::current::context::new_state(
         crate::sched::user_thread_trampoline as *const () as u64,
         trampoline_rsp,
@@ -1358,6 +1412,7 @@ fn pre_grow_for_explicit_slot(
 ) -> Result<(), SyscallError>
 {
     use core::sync::atomic::Ordering;
+    const PAGE: u64 = crate::mm::PAGE_SIZE as u64;
     loop
     {
         // SAFETY: cs_ptr validated by the caller; lock_raw/unlock_raw paired.
@@ -1371,8 +1426,7 @@ fn pre_grow_for_explicit_slot(
             else
             {
                 let budget_pages = (*cs_ptr).kobj_ptr().map_or(0, |k| {
-                    (*k).cspace_growth_budget_bytes.load(Ordering::Acquire)
-                        / crate::mm::PAGE_SIZE as u64
+                    (*k).cspace_growth_budget_bytes.load(Ordering::Acquire) / PAGE
                 });
                 if budget_pages < needed
                 {
@@ -2076,7 +2130,8 @@ pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
                 crate::cap::derivation::MAX_REPARENT_EDITS,
             )
         };
-        batches += 1;
+        // At most MAX_REPARENT_BATCHES: the loop returns on reaching it.
+        batches = batches.saturating_add(1);
         if !done
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
@@ -2241,16 +2296,22 @@ pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
 
         // SAFETY: DERIVATION_LOCK held; root is a valid SlotId.
         let (objects, status) = unsafe { crate::cap::derivation::revoke_subtree_batch(root) };
-        let snapshot_count = objects.len();
-        debug_assert!(snapshot_count <= crate::cap::derivation::MAX_REVOKE_EDITS);
-        snapshot[..snapshot_count].copy_from_slice(objects);
+        // `objects` is a prefix of derivation's MAX_REVOKE_EDITS-entry output
+        // buffer, so it fits the snapshot whole.
+        debug_assert!(objects.len() <= crate::cap::derivation::MAX_REVOKE_EDITS);
+        for (dst, &obj) in snapshot.iter_mut().zip(objects)
+        {
+            *dst = obj;
+        }
+        let snapshot_count = objects.len().min(snapshot.len());
 
         // Liveness backstop: MoreWork batches beyond this bound mean a
         // concurrent deriver is extending the subtree at least as fast as
         // revocation reclaims it. Give the CPU back instead of looping
         // in-kernel forever; everything revoked so far stays revoked and a
         // retry continues from the surviving subtree.
-        batches += 1;
+        // At most MAX_REVOKE_BATCHES: the backstop returns on reaching it.
+        batches = batches.saturating_add(1);
         let backstop = batches >= MAX_REVOKE_BATCHES
             && status == crate::cap::derivation::BatchStatus::MoreWork;
 
@@ -2264,7 +2325,7 @@ pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
         }
         crate::cap::DERIVATION_LOCK.write_unlock();
 
-        dealloc_revoked(&snapshot[..snapshot_count]);
+        dealloc_revoked(snapshot.get(..snapshot_count).unwrap_or(&[]));
 
         if backstop
         {
@@ -2565,7 +2626,7 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
 
     let offset = retype_allocate(memory, entry.raw_bytes)?;
 
-    let block_phys = memory.base + offset;
+    let block_phys = region_phys(memory, offset);
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout (matches `cap::retype::event_queue_raw_bytes`):
@@ -2575,12 +2636,15 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
     //   then:      observer node pool (observers * 24 B)
     let eq_obj_ptr = block_virt as *mut EventQueueObject;
     let state_offset = core::mem::size_of::<EventQueueObject>() as u64;
-    let eq_state_ptr = (block_virt + state_offset) as *mut EventQueueState;
+    let eq_state_ptr = slot_field::<EventQueueState>(block_virt, state_offset);
     let ring_ptr =
-        (block_virt + EVENT_QUEUE_RING_OFFSET) as *mut crate::ipc::event_queue::EventEntry;
-    let ring_len = (capacity as usize) + 1;
-    let nodes_ptr = (block_virt + event_queue_observer_offset(u64::from(capacity)))
-        as *mut crate::sched::thread::DeathObserver;
+        slot_field::<crate::ipc::event_queue::EventEntry>(block_virt, EVENT_QUEUE_RING_OFFSET);
+    // `capacity` is at most EVENT_QUEUE_MAX_CAPACITY, so the sum is exact.
+    let ring_len = (capacity as usize).saturating_add(1);
+    let nodes_ptr = slot_field::<crate::sched::thread::DeathObserver>(
+        block_virt,
+        event_queue_observer_offset(u64::from(capacity)),
+    );
 
     let ancestor = memory_obj_nn;
 
@@ -2691,7 +2755,7 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
 
     let offset = retype_allocate(memory, entry.raw_bytes)?;
 
-    let block_phys = memory.base + offset;
+    let block_phys = region_phys(memory, offset);
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout (matches `cap::retype::wait_set_raw_bytes`): WaitSetObject at
@@ -2699,9 +2763,9 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
     // WAIT_SET_MEMBERS_OFFSET, then the `capacity + 1` u16 ready ring.
     let ws_obj_ptr = block_virt as *mut WaitSetObject;
     let state_offset = core::mem::size_of::<WaitSetObject>() as u64;
-    let ws_state_ptr = (block_virt + state_offset) as *mut WaitSetState;
-    let members_ptr = (block_virt + WAIT_SET_MEMBERS_OFFSET) as *mut WaitSetMember;
-    let ring_ptr = (block_virt + wait_set_ring_offset(u64::from(capacity))) as *mut u16;
+    let ws_state_ptr = slot_field::<WaitSetState>(block_virt, state_offset);
+    let members_ptr = slot_field::<WaitSetMember>(block_virt, WAIT_SET_MEMBERS_OFFSET);
+    let ring_ptr = slot_field::<u16>(block_virt, wait_set_ring_offset(u64::from(capacity)));
 
     let ancestor = memory_obj_nn;
 
@@ -2974,7 +3038,10 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // `sys_mem_map`'s second handle lookup closes
             // (core/kernel/docs/memory-internals.md § Frame Map Table).
             core::sync::atomic::fence(Ordering::SeqCst);
-            Ok(crate::mm::frame_map::mappings_in(memory.base + offset, len))
+            Ok(crate::mm::frame_map::mappings_in(
+                region_phys(memory, offset),
+                len,
+            ))
         }
         CAP_INFO_THREAD_STATE =>
         {
@@ -3120,6 +3187,9 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
         }
         CAP_INFO_CSPACE_CAPACITY =>
         {
+            const PAGE: u64 = crate::mm::PAGE_SIZE as u64;
+            const LEAF_SLOTS: u64 = crate::cap::cspace::L2_SIZE as u64;
+            const REACHABLE: u64 = crate::cap::cspace::MAX_SLOTS_STRUCTURAL as u64 - 1;
             if tag != CapTag::CSpace
             {
                 return Err(SyscallError::InvalidArgument);
@@ -3155,9 +3225,11 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
                 a
             } as u64;
             let budget = cs_obj.cspace_growth_budget_bytes.load(Ordering::Acquire);
-            let backed = allocated
-                + (budget / crate::mm::PAGE_SIZE as u64) * crate::cap::cspace::L2_SIZE as u64;
-            Ok(backed.min(crate::cap::cspace::MAX_SLOTS_STRUCTURAL as u64 - 1))
+            // Saturating, as the clamp to REACHABLE below makes exact.
+            let backed = (budget / PAGE)
+                .saturating_mul(LEAF_SLOTS)
+                .saturating_add(allocated);
+            Ok(backed.min(REACHABLE))
         }
         CAP_INFO_CSPACE_USED =>
         {

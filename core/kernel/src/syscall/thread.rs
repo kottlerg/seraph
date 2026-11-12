@@ -105,9 +105,11 @@ pub fn sys_thread_configure(tf: UserFrame) -> Result<u64, SyscallError>
     let kstack_top = unsafe { (*target_tcb).kernel_stack_top };
 
     // Build the initial TrapFrame on the thread's kernel stack, just below
-    // the stack top. This mirrors the setup in `sched::enter()`.
+    // the stack top. This mirrors the setup in `sched::enter()`. A kernel stack
+    // top lies in the kernel half, far above one frame, so the subtraction
+    // cannot wrap.
     let tf_size = size_of::<ArchTrapFrame>() as u64;
-    let tf_ptr = (kstack_top - tf_size) as *mut ArchTrapFrame;
+    let tf_ptr = kstack_top.wrapping_sub(tf_size) as *mut ArchTrapFrame;
 
     // The thread must be `Created`, decided under its sched_lock and held for
     // the writes below: a concurrent SYS_THREAD_START's commit takes the same
@@ -1597,9 +1599,9 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
     // cannot be freed between publish and a faulter's load: each class's
     // binding holds its own.
     let mut new = [(core::ptr::null_mut(), 0); crate::ipc::fault::FAULT_CLASSES];
-    for (class, binding) in new.iter_mut().enumerate()
+    for (binding, &chosen) in new.iter_mut().zip(&selected)
     {
-        if selected[class]
+        if chosen
         {
             if !new_ep.is_null()
             {
@@ -1755,16 +1757,25 @@ pub fn sys_thread_get_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_tcb validated non-null; cspace set at thread creation;
     // no lock is held.
     let (_pin, tcb) = unsafe { control_thread((*caller_tcb).cspace, tf.arg(0)) }?;
+    // `class_of_bit` returns a class below FAULT_CLASSES, the length of both
+    // binding arrays.
+    // SAFETY: tcb is pinned by `_pin`; the binding entries are atomics, read
+    // through shared references.
+    let (handler, badge_word) = unsafe {
+        (*tcb)
+            .fault_handlers
+            .get(class)
+            .zip((*tcb).fault_badges.get(class))
+    }
+    .ok_or(SyscallError::InvalidArgument)?;
     // SAFETY: tcb is pinned by `_pin`; lock_raw paired with unlock_raw; the
     // binding pair is published under this lock.
     let (bound, badge) = unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
-        let bound = !(*tcb).fault_handlers[class]
-            .load(Ordering::Acquire)
-            .is_null();
+        let bound = !handler.load(Ordering::Acquire).is_null();
         let badge = if bound
         {
-            (*tcb).fault_badges[class].load(Ordering::Relaxed)
+            badge_word.load(Ordering::Relaxed)
         }
         else
         {
@@ -2098,10 +2109,10 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
 
     // split_at is the first level of the upper child; both halves must be
     // non-empty: lower = [min, split_at - 1], upper = [split_at, max].
-    if split_at <= min || split_at > max
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
+    let lower_max = split_at
+        .checked_sub(1)
+        .filter(|&lower_max| lower_max >= min && split_at <= max)
+        .ok_or(SyscallError::InvalidArgument)?;
 
     // ── Create two child SchedControlObjects ───────────────────────────────────
 
@@ -2114,7 +2125,7 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
     let child1_ptr = funder.alloc_body(SchedControlObject {
         header: KernelObjectHeader::new(ObjectType::SchedControl),
         min,
-        max: split_at - 1,
+        max: lower_max,
     })?;
 
     let child2_ptr = match funder.alloc_body(SchedControlObject {
@@ -2477,20 +2488,22 @@ pub fn sys_thread_read_mem(tf: UserFrame) -> Result<u64, RestartableError>
 
     let (va, buf, len) = thread_mem_args(tf)?;
     let mut bounce = [0u8; syscall::MAX_THREAD_MEM_COPY];
+    // `thread_mem_args` bounds `len` by the bounce buffer's size.
+    let staged = bounce.get_mut(..len).ok_or(SyscallError::InvalidArgument)?;
     {
         let pin = AspacePin::of_thread(tf.arg(0))?;
         // SAFETY: pin keeps the space allocated; [va, va + len) is in the
         // user half (thread_mem_args); no lock is held.
         unsafe {
             pin.aspace()
-                .copy_user_bytes(va, UserCopy::Read(&mut bounce[..len]))
+                .copy_user_bytes(va, UserCopy::Read(&mut *staged))
         }?;
     }
     // Nothing before this copy changed anything visible outside the call,
     // so a fault re-executes it from the start.
-    // SAFETY: bounce holds len initialised bytes; buf is the validated user
+    // SAFETY: staged holds len initialised bytes; buf is the validated user
     // destination span.
-    unsafe { crate::uaccess::copy_to_user_restartable(buf, bounce.as_ptr(), len)? };
+    unsafe { crate::uaccess::copy_to_user_restartable(buf, staged.as_ptr(), len)? };
     Ok(len as u64)
 }
 
@@ -2535,11 +2548,13 @@ pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
         TextWrite::Refused
     };
     let mut bounce = [0u8; syscall::MAX_THREAD_MEM_COPY];
+    // `thread_mem_args` bounds `len` by the bounce buffer's size.
+    let staged = bounce.get_mut(..len).ok_or(SyscallError::InvalidArgument)?;
     // Copy in before the target is touched, so a fault re-executes a call
     // that has changed nothing.
-    // SAFETY: bounce is valid for len writes; buf is the validated user
+    // SAFETY: staged is valid for len writes; buf is the validated user
     // source span.
-    unsafe { crate::uaccess::copy_from_user_restartable(bounce.as_mut_ptr(), buf, len)? };
+    unsafe { crate::uaccess::copy_from_user_restartable(staged.as_mut_ptr(), buf, len)? };
     {
         let pin = AspacePin::of_thread(tf.arg(0))?;
         // SAFETY: pin keeps the space allocated; [va, va + len) is in the
@@ -2548,7 +2563,7 @@ pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
             pin.aspace().copy_user_bytes(
                 va,
                 UserCopy::Write {
-                    src: &bounce[..len],
+                    src: &*staged,
                     text,
                 },
             )
@@ -2665,10 +2680,8 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, RestartableError>
     // The destination must lie wholly in the user half: SMAP/SUM gate only
     // accesses to user pages, so without this a kernel-half buf_ptr would let the
     // copy write the target's register frame into kernel memory at an
-    // attacker-chosen VA. (`buf_ptr >= user_va_top` short-circuits before the
-    // sum, so `buf_ptr + copy_size` cannot overflow.)
-    let user_va_top = crate::mm::user_va_top();
-    if buf_ptr >= user_va_top || buf_ptr + copy_size as u64 > user_va_top
+    // attacker-chosen VA.
+    if !user_range(buf_ptr, copy_size)
     {
         return Err(SyscallError::InvalidAddress.into());
     }
@@ -2765,8 +2778,7 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, RestartableError>
     // The source must lie wholly in the user half: SMAP/SUM gate only accesses to
     // user pages, so without this a kernel-half buf_ptr would let the copy read
     // kernel memory at an attacker-chosen VA into the register frame.
-    let user_va_top = crate::mm::user_va_top();
-    if buf_ptr >= user_va_top || buf_ptr + copy_size as u64 > user_va_top
+    if !user_range(buf_ptr, copy_size)
     {
         return Err(SyscallError::InvalidAddress.into());
     }

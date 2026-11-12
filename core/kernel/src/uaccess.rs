@@ -61,10 +61,13 @@ impl From<SyscallError> for RestartableError
 }
 
 /// The faulting VA of a copy of `len` bytes at user address `user` that the
-/// arch primitive left with `left` bytes (at least 1) not copied.
+/// arch primitive left with `left` bytes (at least 1, at most `len`) not copied.
+///
+/// The caller range-validated the span `user..user + len` into the user half,
+/// so the sum cannot wrap.
 fn fault_va(user: u64, len: usize, left: usize) -> u64
 {
-    user + (len - left) as u64
+    user.wrapping_add(len.saturating_sub(left) as u64)
 }
 
 /// Copy `len` bytes from kernel `src` into user `dst`. Returns

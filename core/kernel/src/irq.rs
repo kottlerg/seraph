@@ -732,7 +732,9 @@ pub const fn message_id(target: Target) -> Option<u32>
 {
     match target.pack()
     {
-        Some(word) => Some(MESSAGE_ID_BASE + (word & !TARGET_PRESENT)),
+        // The base plus any offset below `TARGET_PRESENT` fits a `u32` (the
+        // assert above), so the sum does not wrap.
+        Some(word) => Some(MESSAGE_ID_BASE.wrapping_add(word & !TARGET_PRESENT)),
         None => None,
     }
 }
@@ -742,11 +744,12 @@ pub const fn message_id(target: Target) -> Option<u32>
 #[must_use]
 pub const fn message_target(id: u32) -> Option<Target>
 {
-    if !is_message(id)
+    // An id below the base is a wired line, not a message target.
+    let Some(offset) = id.checked_sub(MESSAGE_ID_BASE)
+    else
     {
         return None;
-    }
-    let offset = id - MESSAGE_ID_BASE;
+    };
     if offset & TARGET_PRESENT != 0
     {
         return None;
@@ -765,7 +768,8 @@ struct Routing
     routes: &'static [IrqRoute],
     /// The sources that hold a delivery slot: routed lines and minted message
     /// targets. Interrupt remapping is switched only while it is zero
-    /// ([`set_remap`]).
+    /// ([`set_remap`]). The lines and slots bound it, so its saturating
+    /// steps never clamp.
     sources: u32,
 }
 
@@ -876,11 +880,12 @@ pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
     let lines = line_count as usize;
     // A slab is page-aligned, so the routes at its base are aligned; a table of
     // no lines still takes one zeroed entry, which no id reaches.
-    let routes_base = crate::sched::alloc_zeroed_slab::<IrqRoute>(
-        lines.max(1) * core::mem::size_of::<IrqRoute>(),
-        allocator,
-        "IRQ_ROUTING_TABLE",
-    );
+    let bytes = lines
+        .max(1)
+        .checked_mul(core::mem::size_of::<IrqRoute>())
+        .unwrap_or_else(|| crate::fatal("init_table: IRQ_ROUTING_TABLE overflows"));
+    let routes_base =
+        crate::sched::alloc_zeroed_slab::<IrqRoute>(bytes, allocator, "IRQ_ROUTING_TABLE");
     let gates = crate::sched::alloc_per_cpu_slab::<DeliveryGate>(
         GATE_SLAB,
         crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize,
@@ -1431,7 +1436,7 @@ pub unsafe fn route(irq: u32, held: &AtomicBool, mode: u32) -> Result<(), RouteE
                 route.mode.store(mode, Ordering::Relaxed);
                 route.holders.store(1, Ordering::Relaxed);
                 held.store(true, Ordering::Relaxed);
-                routing.sources += 1;
+                routing.sources = routing.sources.saturating_add(1);
                 Ok(())
             }
         }
@@ -1465,7 +1470,7 @@ pub unsafe fn drop_route_holder(irq: u32)
         {
             // SAFETY: the routing lock is held.
             unsafe { release_line(&Hardware, irq, route) };
-            routing.sources -= 1;
+            routing.sources = routing.sources.saturating_sub(1);
         }
     });
 }
@@ -1548,7 +1553,7 @@ pub unsafe fn unregister(irq: u32, binding: &IrqBinding) -> Option<NonNull<Kerne
             // `route`.
             if unsafe { unbind_line(&Hardware, irq, route, binding) } == Settle::Release
             {
-                routing.sources -= 1;
+                routing.sources = routing.sources.saturating_sub(1);
             }
         }
         binding.notification.store(null_mut(), Ordering::Relaxed);
@@ -1582,7 +1587,7 @@ pub fn alloc_message() -> Result<u32, RouteError>
             crate::arch::current::interrupts::free_message_target(target);
             return Err(RouteError::Exhausted);
         };
-        routing.sources += 1;
+        routing.sources = routing.sources.saturating_add(1);
         Ok(id)
     })
 }
@@ -1631,7 +1636,7 @@ pub unsafe fn free_message(id: u32)
             Slot::Free | Slot::Line(_) => return,
         }
         crate::arch::current::interrupts::free_message_target(target);
-        routing.sources -= 1;
+        routing.sources = routing.sources.saturating_sub(1);
     });
 }
 
@@ -1761,8 +1766,9 @@ fn first_eligible_cpu(
     eligible: impl Fn(usize) -> bool,
 ) -> Option<usize>
 {
+    // `offset` < `cpu_count`, so the remainder is taken of a non-zero count.
     (0..cpu_count)
-        .map(|offset| (start + offset) % cpu_count)
+        .filter_map(|offset| start.wrapping_add(offset).checked_rem(cpu_count))
         .find(|&cpu| eligible(cpu))
 }
 
@@ -1780,7 +1786,10 @@ pub fn next_target_cpu(eligible: impl Fn(usize) -> bool) -> Option<usize>
     let cpu = first_eligible_cpu(start, cpu_count.max(1), eligible)?;
     // The successor is below the CPU count, which fits u32.
     #[allow(clippy::cast_possible_truncation)]
-    NEXT_TARGET_CPU.store(((cpu + 1) % cpu_count.max(1)) as u32, Ordering::Relaxed);
+    NEXT_TARGET_CPU.store(
+        cpu.wrapping_add(1).checked_rem(cpu_count).unwrap_or(0) as u32,
+        Ordering::Relaxed,
+    );
     Some(cpu)
 }
 

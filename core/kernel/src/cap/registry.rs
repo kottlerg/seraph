@@ -238,7 +238,9 @@ impl CSpaceRegistry
             let next = self.high_water.load(Ordering::Relaxed);
             if next < self.capacity.load(Ordering::Acquire)
             {
-                self.high_water.store(next + 1, Ordering::Relaxed);
+                // Below the `u32` capacity, so the bump cannot saturate.
+                self.high_water
+                    .store(next.saturating_add(1), Ordering::Relaxed);
                 Some(next)
             }
             else
@@ -258,9 +260,11 @@ impl CSpaceRegistry
         };
         if id.is_some()
         {
-            // At most `capacity` ids are live, so the count cannot overflow.
-            self.live
-                .store(self.live.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+            // At most `capacity` ids are live, so the count cannot saturate.
+            self.live.store(
+                self.live.load(Ordering::Relaxed).saturating_add(1),
+                Ordering::Relaxed,
+            );
         }
         // SAFETY: paired with lock_raw above.
         unsafe { self.free_lock.unlock_raw(saved) };

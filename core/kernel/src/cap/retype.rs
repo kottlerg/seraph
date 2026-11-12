@@ -81,6 +81,12 @@ const BIN_512: u64 = 512;
 /// Number of sub-page free-list bins.
 const NUM_SUBPAGE_BINS: usize = 2;
 
+/// `PAGE_SIZE` as a region offset.
+const PAGE_BYTES: u64 = PAGE_SIZE as u64;
+
+/// The bits of a region offset below its page.
+const PAGE_OFFSET_MASK: u64 = PAGE_BYTES - 1;
+
 /// Sentinel value for an empty free list. Real offsets are bounded by
 /// `memory.size` (well below `u64::MAX`).
 const FREE_LIST_END: u64 = u64::MAX;
@@ -161,7 +167,9 @@ impl RetypeAllocator
 ///
 /// Sub-page sizes round to `BIN_128` or `BIN_512`. Larger sizes round up to
 /// `PAGE_SIZE`. The returned value is the actual bytes consumed from the
-/// cap's `available_bytes`.
+/// cap's `available_bytes`. A size within a page of `u64::MAX`, which no page
+/// multiple holds, gives `u64::MAX`: more than any region holds, so its
+/// retype fails as too large.
 pub fn round_to_class(bytes: u64) -> u64
 {
     if bytes == 0
@@ -178,22 +186,47 @@ pub fn round_to_class(bytes: u64) -> u64
     }
     else
     {
-        // Page-aligned. PAGE_SIZE is a constant power of two; align upward.
-        let p = PAGE_SIZE as u64;
-        (bytes + p - 1) & !(p - 1)
+        bytes
+            .checked_next_multiple_of(PAGE_SIZE as u64)
+            .unwrap_or(u64::MAX)
     }
 }
 
-/// Map a sub-page rounded size to its bin index.
-fn subpage_bin_for(rounded: u64) -> Option<usize>
+/// A sub-page size class, naming the free list of
+/// [`RetypeAllocator::subpage_free_lists`] that holds its freed slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubpageBin
+{
+    /// `BIN_128` slots.
+    Bin128,
+    /// `BIN_512` slots.
+    Bin512,
+}
+
+impl SubpageBin
+{
+    /// The bin's free-list head in `alloc`.
+    fn head(self, alloc: &RetypeAllocator) -> &AtomicU64
+    {
+        let [bin_128, bin_512] = &alloc.subpage_free_lists;
+        match self
+        {
+            Self::Bin128 => bin_128,
+            Self::Bin512 => bin_512,
+        }
+    }
+}
+
+/// Map a sub-page rounded size to its bin.
+fn subpage_bin_for(rounded: u64) -> Option<SubpageBin>
 {
     if rounded == BIN_128
     {
-        Some(0)
+        Some(SubpageBin::Bin128)
     }
     else if rounded == BIN_512
     {
-        Some(1)
+        Some(SubpageBin::Bin512)
     }
     else
     {
@@ -201,12 +234,21 @@ fn subpage_bin_for(rounded: u64) -> Option<usize>
     }
 }
 
-/// Page-aligned allocations require the bump offset to be page-aligned too.
-///
-/// Returns the smallest offset `>= bump` that's `align`-aligned.
-fn align_up(value: u64, align: u64) -> u64
+/// Where a bump allocation of `need` bytes goes when the bump cursor is at
+/// `bump`: its start, page-aligned for a page-class request, and the cursor
+/// after it. `None` when either passes the end of the address space, which
+/// places nothing, as a cursor past the region's end does.
+fn bump_placement(bump: u64, need: u64) -> Option<(u64, u64)>
 {
-    (value + align - 1) & !(align - 1)
+    let start = if need >= PAGE_SIZE as u64
+    {
+        bump.checked_next_multiple_of(PAGE_SIZE as u64)?
+    }
+    else
+    {
+        bump
+    };
+    Some((start, start.checked_add(need)?))
 }
 
 /// Read a u64 from `phys + offset` via the kernel direct map.
@@ -219,7 +261,9 @@ fn align_up(value: u64, align: u64) -> u64
 #[cfg(not(test))]
 unsafe fn read_u64_at(phys: u64, offset: u64) -> u64
 {
-    let virt = crate::mm::paging::phys_to_virt(phys + offset);
+    // An offset inside the region keeps the sum inside RAM, far below the
+    // wrap; it wraps as `phys_to_virt` does.
+    let virt = crate::mm::paging::phys_to_virt(phys.wrapping_add(offset));
     // SAFETY: caller guarantees the address is in the kernel direct map and
     // that the slot is not concurrently written.
     unsafe { core::ptr::read_volatile(virt as *const u64) }
@@ -234,7 +278,8 @@ unsafe fn read_u64_at(phys: u64, offset: u64) -> u64
 #[cfg(not(test))]
 unsafe fn write_u64_at(phys: u64, offset: u64, value: u64)
 {
-    let virt = crate::mm::paging::phys_to_virt(phys + offset);
+    // As in `read_u64_at`.
+    let virt = crate::mm::paging::phys_to_virt(phys.wrapping_add(offset));
     // SAFETY: caller guarantees the address is in the kernel direct map and
     // not aliased.
     unsafe { core::ptr::write_volatile(virt as *mut u64, value) };
@@ -285,10 +330,14 @@ fn subpage_link_ok(link: u64, memory_size: u64) -> bool
 /// # Safety
 ///
 /// `memory.base + head_offset` must be a valid kernel direct-map address.
-unsafe fn try_pop_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: usize)
--> Option<u64>
+unsafe fn try_pop_subpage(
+    alloc: &RetypeAllocator,
+    memory: &MemoryObject,
+    bin: SubpageBin,
+) -> Option<u64>
 {
-    let head = alloc.subpage_free_lists[bin].load(Ordering::Acquire);
+    let list = bin.head(alloc);
+    let head = list.load(Ordering::Acquire);
     if head == FREE_LIST_END
     {
         return None;
@@ -302,13 +351,13 @@ unsafe fn try_pop_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: u
     if !subpage_link_ok(head, memory.size)
     {
         crate::kprintln!(
-            "RETYPE SUBPAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} bin={} head=0x{:x}",
+            "RETYPE SUBPAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} bin={:?} head=0x{:x}",
             memory.base,
             memory.size,
             bin,
             head
         );
-        alloc.subpage_free_lists[bin].store(FREE_LIST_END, Ordering::Release);
+        list.store(FREE_LIST_END, Ordering::Release);
         return None;
     }
     // Read next-offset stored at offset `head` within the cap region.
@@ -319,7 +368,7 @@ unsafe fn try_pop_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: u
     if !subpage_link_ok(next, memory.size)
     {
         crate::kprintln!(
-            "RETYPE SUBPAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} bin={} next=0x{:x}",
+            "RETYPE SUBPAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} bin={:?} next=0x{:x}",
             memory.base,
             memory.size,
             bin,
@@ -327,10 +376,10 @@ unsafe fn try_pop_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: u
         );
         // `head` itself is valid and returned; truncate the list at the bad
         // successor.
-        alloc.subpage_free_lists[bin].store(FREE_LIST_END, Ordering::Release);
+        list.store(FREE_LIST_END, Ordering::Release);
         return Some(head);
     }
-    alloc.subpage_free_lists[bin].store(next, Ordering::Release);
+    list.store(next, Ordering::Release);
     Some(head)
 }
 
@@ -343,13 +392,14 @@ unsafe fn try_pop_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: u
 ///
 /// `memory.base + offset` must be a valid kernel direct-map address; the
 /// slot must not be concurrently aliased.
-unsafe fn push_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: usize, offset: u64)
+unsafe fn push_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: SubpageBin, offset: u64)
 {
-    let prev_head = alloc.subpage_free_lists[bin].load(Ordering::Acquire);
+    let list = bin.head(alloc);
+    let prev_head = list.load(Ordering::Acquire);
     // Write next-offset at the start of the freed slot.
     // SAFETY: caller guarantees the slot is no longer in use.
     unsafe { write_u64_at(memory.base, offset, prev_head) };
-    alloc.subpage_free_lists[bin].store(offset, Ordering::Release);
+    list.store(offset, Ordering::Release);
 }
 
 /// Predecessor pointer for the page-aligned free-list walk.
@@ -388,22 +438,29 @@ fn report_page_list_corrupt(memory: &MemoryObject, cur: u64, prev_end: u64)
     }
 }
 
-/// True if a page free-list node at `cur` holding `block_pages` pages is
-/// well formed for a region of `memory_size` bytes, reached from a predecessor
-/// that ends at `prev_end` (0 for the list head): page-aligned, non-empty,
-/// inside the region, and at or above the predecessor's end. The list is kept
+/// The end offset of a page free-list node at `cur` holding `block_pages`
+/// pages, if the node is well formed for a region of `memory_size` bytes,
+/// reached from a predecessor that ends at `prev_end` (0 for the list head):
+/// page-aligned, non-empty, inside the region, and at or above the
+/// predecessor's end. `None` for a malformed node. The list is kept
 /// address-ordered and coalesced, so every node starts strictly above the
 /// previous one; a walk that follows only well-formed nodes therefore visits at
 /// most `memory_size / PAGE_SIZE` of them, and a cycle shows up as a node that
 /// is not above its predecessor.
-fn page_node_ok(cur: u64, block_pages: u64, prev_end: u64, memory_size: u64) -> bool
+fn page_node_ok(cur: u64, block_pages: u64, prev_end: u64, memory_size: u64) -> Option<u64>
 {
     let p = PAGE_SIZE as u64;
-    cur.is_multiple_of(p)
-        && cur >= prev_end
-        && cur < memory_size
-        && block_pages != 0
-        && block_pages <= (memory_size - cur) / p
+    let end = cur.checked_add(block_pages.checked_mul(p)?)?;
+    (cur.is_multiple_of(p) && cur >= prev_end && block_pages != 0 && end <= memory_size)
+        .then_some(end)
+}
+
+/// Offset of the next-pointer word of the page free-list node at `node`, the
+/// node's second `u64`. A node lies page-aligned inside the region, so the
+/// word lies in its first page and the sum cannot wrap.
+const fn node_next_word(node: u64) -> u64
+{
+    node.wrapping_add(8)
 }
 
 /// Point `prev` (the list head, or a node's next-pointer) at `value`.
@@ -422,7 +479,7 @@ unsafe fn set_page_link(alloc: &RetypeAllocator, memory: &MemoryObject, prev: &P
         PagePrev::InCap(prev_off) =>
         {
             // SAFETY: caller contract; the next-pointer is at offset + 8.
-            unsafe { write_u64_at(memory.base, prev_off + 8, value) };
+            unsafe { write_u64_at(memory.base, node_next_word(prev_off), value) };
         }
     }
 }
@@ -461,28 +518,32 @@ unsafe fn try_alloc_page_block(
         // SAFETY: cur lies inside the cap (checked above) and was placed by a
         // push; the size word is at offset 0.
         let block_pages = unsafe { read_u64_at(memory.base, cur) };
-        if !page_node_ok(cur, block_pages, prev_end, memory.size)
+        let Some(block_end) = page_node_ok(cur, block_pages, prev_end, memory.size)
+        else
         {
             report_page_list_corrupt(memory, cur, prev_end);
             return None;
-        }
+        };
         // SAFETY: same node; next is at offset cur+8.
-        let block_next = unsafe { read_u64_at(memory.base, cur + 8) };
+        let block_next = unsafe { read_u64_at(memory.base, node_next_word(cur)) };
 
-        if block_pages >= pages
+        if let Some(rest_pages) = block_pages.checked_sub(pages)
         {
-            let replacement = if block_pages == pages
+            let replacement = if rest_pages == 0
             {
                 block_next
             }
             else
             {
-                let remainder = cur + pages * p;
+                // The rest of the block is its last `rest_pages` pages, inside
+                // the block `page_node_ok` validated, so neither product nor
+                // difference can wrap.
+                let remainder = block_end.wrapping_sub(rest_pages.wrapping_mul(p));
                 // SAFETY: remainder is page-aligned and inside the block being
                 // unlinked, which no object occupies.
                 unsafe {
-                    write_u64_at(memory.base, remainder, block_pages - pages);
-                    write_u64_at(memory.base, remainder + 8, block_next);
+                    write_u64_at(memory.base, remainder, rest_pages);
+                    write_u64_at(memory.base, node_next_word(remainder), block_next);
                 }
                 remainder
             };
@@ -493,7 +554,7 @@ unsafe fn try_alloc_page_block(
         }
 
         prev = PagePrev::InCap(cur);
-        prev_end = cur + block_pages * p;
+        prev_end = block_end;
         cur = block_next;
     }
 
@@ -555,35 +616,44 @@ impl PageCursor
         pages: u64,
     )
     {
-        let p = PAGE_SIZE as u64;
-        let end = offset + pages * p;
+        // The caller's block lies inside the region, so its end does not
+        // saturate; a saturated end would only match no node above it.
+        let end = offset.saturating_add(pages.saturating_mul(PAGE_SIZE as u64));
         let mut cur_pages = 0;
+        let mut cur_end = 0;
         let mut cur_next = FREE_LIST_END;
 
         // Advance to the first node above `offset`; `prev` is the node below it.
         while !self.corrupt && self.cur != FREE_LIST_END
         {
             let cur = self.cur;
-            if cur < memory.size
+            let node_end = if cur < memory.size
             {
                 // SAFETY: cur lies inside the cap; the size word is at offset 0.
                 cur_pages = unsafe { read_u64_at(memory.base, cur) };
+                page_node_ok(cur, cur_pages, self.prev_end, memory.size)
             }
-            if cur >= memory.size || !page_node_ok(cur, cur_pages, self.prev_end, memory.size)
+            else
+            {
+                None
+            };
+            let Some(node_end) = node_end
+            else
             {
                 report_page_list_corrupt(memory, cur, self.prev_end);
                 self.corrupt = true;
                 break;
-            }
+            };
+            cur_end = node_end;
             // SAFETY: the node was validated above; next is at offset cur+8.
-            cur_next = unsafe { read_u64_at(memory.base, cur + 8) };
+            cur_next = unsafe { read_u64_at(memory.base, node_next_word(cur)) };
             if cur > offset
             {
                 break;
             }
             self.prev = PagePrev::InCap(cur);
             self.prev_pages = cur_pages;
-            self.prev_end = cur + cur_pages * p;
+            self.prev_end = node_end;
             self.cur = cur_next;
         }
         if self.corrupt
@@ -592,7 +662,7 @@ impl PageCursor
             // SAFETY: caller contract: offset is ours and page-aligned.
             unsafe {
                 write_u64_at(memory.base, offset, pages);
-                write_u64_at(memory.base, offset + 8, head);
+                write_u64_at(memory.base, node_next_word(offset), head);
             }
             alloc.page_free_head.store(offset, Ordering::Release);
             return;
@@ -603,43 +673,49 @@ impl PageCursor
         );
 
         let merge_next = self.cur != FREE_LIST_END && self.cur == end;
-        let (after_pages, after_next) = if merge_next
+        let (after_pages, after_end, after_next) = if merge_next
         {
-            (cur_pages, cur_next)
+            (cur_pages, cur_end, cur_next)
         }
         else
         {
-            (0, self.cur)
+            (0, end, self.cur)
         };
+        // The merged blocks are disjoint and inside the region, so their page
+        // count is at most the region's and the sums cannot saturate.
         match self.prev
         {
             PagePrev::InCap(prev_off) if self.prev_end == offset =>
             {
                 // Grow the block below over the freed pages (and the block above).
-                let total = self.prev_pages + pages + after_pages;
+                let total = self
+                    .prev_pages
+                    .saturating_add(pages)
+                    .saturating_add(after_pages);
                 // SAFETY: prev_off is a node this walk validated; lock held.
                 unsafe {
                     write_u64_at(memory.base, prev_off, total);
-                    write_u64_at(memory.base, prev_off + 8, after_next);
+                    write_u64_at(memory.base, node_next_word(prev_off), after_next);
                 }
                 self.prev_pages = total;
-                self.prev_end = prev_off + total * p;
             }
             _ =>
             {
-                let total = pages + after_pages;
+                let total = pages.saturating_add(after_pages);
                 // SAFETY: caller contract: offset is ours and page-aligned.
                 unsafe {
                     write_u64_at(memory.base, offset, total);
-                    write_u64_at(memory.base, offset + 8, after_next);
+                    write_u64_at(memory.base, node_next_word(offset), after_next);
                 }
                 // SAFETY: lock held; prev is the head or a validated node.
                 unsafe { set_page_link(alloc, memory, &self.prev, offset) };
                 self.prev = PagePrev::InCap(offset);
                 self.prev_pages = total;
-                self.prev_end = offset + total * p;
             }
         }
+        // Either way the block now ends where the freed block, or the free
+        // block above it that the freed block joined, ends.
+        self.prev_end = after_end;
         self.cur = after_next;
     }
 }
@@ -663,17 +739,18 @@ impl PageCursor
 unsafe fn carve_page_into_bin(
     alloc: &RetypeAllocator,
     memory: &MemoryObject,
-    bin: usize,
+    bin: SubpageBin,
     class: u64,
 ) -> Option<u64>
 {
     // SAFETY: caller holds the allocator lock; memory.base is direct-map.
     let page = unsafe { try_alloc_page_block(alloc, memory, 1) }?;
     // Push from the top down so later pops hand the slots out in ascending order.
-    let mut slot = page + PAGE_SIZE as u64;
-    while slot - class > page
+    // The page lies inside the region, so its end cannot wrap.
+    let mut slot = page.wrapping_add(PAGE_SIZE as u64);
+    while let Some(below) = slot.checked_sub(class).filter(|&below| below > page)
     {
-        slot -= class;
+        slot = below;
         // SAFETY: lock held; `slot` lies in the page just unlinked from the
         // page free list, which no object occupies.
         unsafe { push_subpage(alloc, memory, bin, slot) };
@@ -765,7 +842,7 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
     else
     {
         // Page-aligned: walk the page free list.
-        let pages = need / PAGE_SIZE as u64;
+        let pages = need / PAGE_BYTES;
         // SAFETY: alloc lock held.
         if let Some(off) = unsafe { try_alloc_page_block(alloc, memory, pages) }
         {
@@ -777,18 +854,9 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
 
     // Fall through to bump.
     let bump = alloc.bump_offset.load(Ordering::Relaxed);
-    let aligned_bump = if need >= PAGE_SIZE as u64
-    {
-        align_up(bump, PAGE_SIZE as u64)
-    }
+    let placement = bump_placement(bump, need).filter(|&(_, new_bump)| new_bump <= memory.size);
+    let Some((aligned_bump, new_bump)) = placement
     else
-    {
-        bump
-    };
-    let alignment_pad = aligned_bump - bump;
-    let new_bump = aligned_bump + need;
-
-    if new_bump > memory.size
     {
         // The bump frontier cannot fit the request. A sub-page request can
         // still be served from a freed page block, whose bytes
@@ -806,7 +874,7 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
         }
         alloc.unlock();
         return carved.ok_or(SyscallError::OutOfMemory);
-    }
+    };
 
     // Retype/map boundary (docs/capability-model.md § Typed Memory): publish
     // the new cursor, then refuse if any frame the advance covers is mapped.
@@ -819,8 +887,13 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
     // lists, and the cap's bytes as they were.
     alloc.bump_offset.store(new_bump, Ordering::SeqCst);
     core::sync::atomic::fence(Ordering::SeqCst);
-    let advance_start = bump & !(PAGE_SIZE as u64 - 1);
-    if crate::mm::frame_map::any_mapped(memory.base + advance_start, new_bump - advance_start)
+    // `advance_start <= bump <= new_bump <= memory.size`, so the length cannot
+    // wrap, and the start is a physical address inside the region.
+    let advance_start = bump & !PAGE_OFFSET_MASK;
+    if crate::mm::frame_map::any_mapped(
+        memory.base.wrapping_add(advance_start),
+        new_bump.wrapping_sub(advance_start),
+    )
     {
         alloc.bump_offset.store(bump, Ordering::Release);
         alloc.unlock();
@@ -841,28 +914,27 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
         return Err(SyscallError::OutOfMemory);
     }
 
-    // Chop the alignment pad into the largest sub-page bins that fit. Each
-    // pushed slot is reusable by future sub-page retypes.
-    if alignment_pad > 0
+    // Chop the alignment pad `[bump, aligned_bump)` into the largest sub-page
+    // bins that fit. Each pushed slot is reusable by future sub-page retypes.
+    // The bump cursor is always a `BIN_128` multiple (every class size and
+    // every rollback target is), so the pad divides exactly into bins.
+    let mut cursor = bump;
+    while let Some(remaining) = aligned_bump
+        .checked_sub(cursor)
+        .filter(|&remaining| remaining >= BIN_128)
     {
-        let mut cursor = bump;
-        let mut remaining = alignment_pad;
-        while remaining >= BIN_512
+        let (bin, class) = if remaining >= BIN_512
         {
-            // SAFETY: alloc lock held; cursor is within the cap region.
-            unsafe { push_subpage(alloc, memory, 1, cursor) };
-            cursor += BIN_512;
-            remaining -= BIN_512;
+            (SubpageBin::Bin512, BIN_512)
         }
-        while remaining >= BIN_128
+        else
         {
-            // SAFETY: alloc lock held.
-            unsafe { push_subpage(alloc, memory, 0, cursor) };
-            cursor += BIN_128;
-            remaining -= BIN_128;
-        }
-        // The bump cursor is always a `BIN_128` multiple (every class size and
-        // every rollback target is), so the pad divides exactly into bins.
+            (SubpageBin::Bin128, BIN_128)
+        };
+        // SAFETY: alloc lock held; cursor is within the cap region.
+        unsafe { push_subpage(alloc, memory, bin, cursor) };
+        // The slot ends at or below `aligned_bump`, so the sum cannot wrap.
+        cursor = cursor.wrapping_add(class);
     }
 
     alloc.unlock();
@@ -937,7 +1009,7 @@ pub unsafe fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
     // The rollback does not cascade past freed slots below the new frontier;
     // those stay on the free lists.
     let bump = alloc.bump_offset.load(Ordering::Relaxed);
-    if offset + need == bump
+    if offset.checked_add(need) == Some(bump)
     {
         alloc.bump_offset.store(offset, Ordering::Release);
     }
@@ -948,7 +1020,7 @@ pub unsafe fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
     }
     else
     {
-        let pages = need / PAGE_SIZE as u64;
+        let pages = need / PAGE_BYTES;
         // SAFETY: lock held; offset is page-aligned (was returned by
         // retype_allocate's page-aligned path).
         unsafe { PageCursor::new(alloc).insert(alloc, memory, offset, pages) };
@@ -988,40 +1060,43 @@ pub unsafe fn retype_free_runs(
     produce: impl FnOnce(&mut dyn FnMut(u64, u64)),
 )
 {
-    let p = PAGE_SIZE as u64;
+    let p = PAGE_BYTES;
     // Read-locked as in retype_free, for the drain reset's size comparison.
     let _memory_guard = crate::cap::object::MemoryReadGuard::acquire(memory);
     let alloc = &memory.allocator;
     alloc.lock();
     let mut cursor = PageCursor::new(alloc);
-    let mut freed = 0;
+    let mut freed: u64 = 0;
     let mut last_end = 0;
     // The span `[start, end)` of the contiguous runs since the last gap, held
     // off the list until a run past a gap shows it does not end at the bump
     // frontier: only the span the last run closes can.
     let mut held: Option<(u64, u64)> = None;
     produce(&mut |offset, bytes| {
+        // The contract keeps every run inside the region, so neither its end
+        // nor the sum of the runs, at most the region's size, saturates.
+        let run_end = offset.saturating_add(bytes);
         debug_assert!(
             offset.is_multiple_of(p)
                 && bytes.is_multiple_of(p)
                 && bytes != 0
                 && offset >= last_end
-                && offset + bytes <= memory.size,
+                && run_end <= memory.size,
             "retype_free_runs: run 0x{offset:x}+0x{bytes:x} is not an ascending page run in range"
         );
-        last_end = offset + bytes;
-        freed += bytes;
+        last_end = run_end;
+        freed = freed.saturating_add(bytes);
         match held
         {
-            Some((start, end)) if end == offset => held = Some((start, offset + bytes)),
+            Some((start, end)) if end == offset => held = Some((start, run_end)),
             _ =>
             {
-                if let Some((start, end)) = held.replace((offset, offset + bytes))
+                if let Some((start, end)) = held.replace((offset, run_end))
                 {
                     // SAFETY: lock held for the cursor's life; the span is
                     // page-aligned, ours (the contract above), and above every
                     // span inserted before.
-                    unsafe { cursor.insert(alloc, memory, start, (end - start) / p) };
+                    unsafe { cursor.insert(alloc, memory, start, span_pages(start, end)) };
                 }
             }
         }
@@ -1037,11 +1112,18 @@ pub unsafe fn retype_free_runs(
         else
         {
             // SAFETY: as for the spans inserted above.
-            unsafe { cursor.insert(alloc, memory, start, (end - start) / p) };
+            unsafe { cursor.insert(alloc, memory, start, span_pages(start, end)) };
         }
     }
     credit_freed(memory, freed);
     alloc.unlock();
+}
+
+/// Pages in the held span `[start, end)` of [`retype_free_runs`], whose end is
+/// never below its start.
+fn span_pages(start: u64, end: u64) -> u64
+{
+    end.saturating_sub(start) / PAGE_BYTES
 }
 
 /// Credit `need` freed bytes to `memory`, resetting its allocator to virgin
@@ -1052,7 +1134,7 @@ fn credit_freed(memory: &MemoryObject, need: u64)
 {
     let alloc = &memory.allocator;
     let prev_avail = memory.available_bytes.fetch_add(need, Ordering::Release);
-    if prev_avail + need == memory.size
+    if prev_avail.checked_add(need) == Some(memory.size)
     {
         // Memory cap fully drained — no live retyped object remains. Reset the
         // allocator to virgin so a recycled Memory cap carries no bump/free-list
@@ -1104,7 +1186,9 @@ pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObject
     {
         crate::fatal("Phase 7: seed Memory cap too small for boot mint");
     };
-    let virt = crate::mm::paging::phys_to_virt(seed.base + offset) as *mut T;
+    // An offset `retype_allocate` returned lies inside the seed's RAM region,
+    // so the sum cannot wrap.
+    let virt = crate::mm::paging::phys_to_virt(seed.base.wrapping_add(offset)) as *mut T;
     // SAFETY: `virt` is in the kernel direct map, freshly carved out by
     // `retype_allocate`, and not aliased.
     unsafe { core::ptr::write(virt, body) };
@@ -1163,17 +1247,23 @@ pub const WAIT_SET_MEMBERS_OFFSET: u64 = 24 + WAIT_SET_STATE_BYTES;
 
 /// Offset of a `WaitSet`'s inline ready ring from the start of its retype
 /// slot: directly after the `capacity` member slots.
+///
+/// The `WaitSet` layout functions saturate: a capacity is at most
+/// `WAIT_SET_MAX_MEMBERS` (the const assertions below evaluate them there), so
+/// a saturated size names no slot any capacity takes.
 pub const fn wait_set_ring_offset(capacity: u64) -> u64
 {
-    WAIT_SET_MEMBERS_OFFSET
-        + capacity * core::mem::size_of::<crate::ipc::wait_set::WaitSetMember>() as u64
+    WAIT_SET_MEMBERS_OFFSET.saturating_add(
+        capacity.saturating_mul(core::mem::size_of::<crate::ipc::wait_set::WaitSetMember>() as u64),
+    )
 }
 
 /// Inline byte cost of a `WaitSet` retype slot of `capacity` members: wrapper
 /// + state + members + the `capacity + 1` `u16` ready ring, padded to 8 bytes.
 pub const fn wait_set_raw_bytes(capacity: u64) -> u64
 {
-    wait_set_ring_offset(capacity) + ((capacity + 1) * 2).div_ceil(8) * 8
+    let ring_bytes = capacity.saturating_add(1).saturating_mul(2);
+    wait_set_ring_offset(capacity).saturating_add(ring_bytes.div_ceil(8).saturating_mul(8))
 }
 
 /// Byte cost and allocation mode of a `WaitSet` of `capacity` members:
@@ -1198,9 +1288,14 @@ const EVENT_QUEUE_OBSERVER_BYTES: u64 =
 /// user-visible `capacity` and `observers` death-observer nodes: wrapper +
 /// state + (capacity + 1) two-word ring slots + the node pool. Every part is
 /// an 8-byte multiple, so the ring and the pool start at `u64` boundaries.
+///
+/// The `EventQueue` layout functions saturate: a capacity and an observer
+/// count are at most `EVENT_QUEUE_MAX_CAPACITY` (the const assertions below
+/// evaluate them there), so a saturated size names no slot any queue takes.
 pub const fn event_queue_raw_bytes(capacity: u64, observers: u64) -> u64
 {
-    event_queue_observer_offset(capacity) + observers * EVENT_QUEUE_OBSERVER_BYTES
+    event_queue_observer_offset(capacity)
+        .saturating_add(observers.saturating_mul(EVENT_QUEUE_OBSERVER_BYTES))
 }
 
 /// Offset of the inline ring buffer from the start of an `EventQueue`
@@ -1212,8 +1307,11 @@ pub const EVENT_QUEUE_RING_OFFSET: u64 = EVENT_QUEUE_WRAPPER_BYTES + EVENT_QUEUE
 /// retype slot of `capacity`: directly after the ring.
 pub const fn event_queue_observer_offset(capacity: u64) -> u64
 {
-    EVENT_QUEUE_RING_OFFSET
-        + (capacity + 1) * core::mem::size_of::<crate::ipc::event_queue::EventEntry>() as u64
+    EVENT_QUEUE_RING_OFFSET.saturating_add(
+        capacity
+            .saturating_add(1)
+            .saturating_mul(core::mem::size_of::<crate::ipc::event_queue::EventEntry>() as u64),
+    )
 }
 
 /// Byte cost and allocation mode of an `EventQueue` of `capacity` entries and
@@ -1389,14 +1487,55 @@ mod tests
         assert_eq!(round_to_class(5 * p), 5 * p);
     }
 
+    // Defect guarded: a size within a page of `u64::MAX` wraps to 0 when
+    // rounded up to a page, which reads as no size at all.
     #[test]
-    fn align_up_basic()
+    fn round_to_class_saturates_a_size_no_page_multiple_holds()
     {
-        assert_eq!(align_up(0, 8), 0);
-        assert_eq!(align_up(1, 8), 8);
-        assert_eq!(align_up(8, 8), 8);
-        assert_eq!(align_up(9, 8), 16);
-        assert_eq!(align_up(0x1234, 0x1000), 0x2000);
+        let p = PAGE_SIZE as u64;
+        assert_eq!(round_to_class(u64::MAX - p + 1), u64::MAX - p + 1);
+        assert_eq!(round_to_class(u64::MAX - p + 2), u64::MAX);
+        assert_eq!(round_to_class(u64::MAX), u64::MAX);
+        let (_buf, memory) = host_region(1);
+        assert_eq!(
+            retype_allocate(&memory, u64::MAX),
+            Err(SyscallError::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn bump_placement_aligns_page_requests_only()
+    {
+        let p = PAGE_SIZE as u64;
+        assert_eq!(bump_placement(0, BIN_128), Some((0, BIN_128)));
+        assert_eq!(
+            bump_placement(BIN_128, BIN_512),
+            Some((BIN_128, BIN_128 + BIN_512))
+        );
+        assert_eq!(bump_placement(BIN_128, p), Some((p, 2 * p)));
+        assert_eq!(bump_placement(p, 2 * p), Some((p, 3 * p)));
+    }
+
+    // Defect guarded: a bump cursor or request near the end of the address
+    // space wraps the placement to a small offset that passes the region
+    // check.
+    #[test]
+    fn bump_placement_past_the_end_of_the_address_space_places_nothing()
+    {
+        let p = PAGE_SIZE as u64;
+        let last_slot = u64::MAX - BIN_128;
+        assert_eq!(
+            bump_placement(last_slot, BIN_128),
+            Some((last_slot, u64::MAX))
+        );
+        assert_eq!(bump_placement(last_slot + 1, BIN_128), None);
+        // The page alignment itself passes the end.
+        assert_eq!(bump_placement(u64::MAX - p + 2, p), None);
+        assert_eq!(
+            bump_placement(0, u64::MAX - p + 1),
+            Some((0, u64::MAX - p + 1))
+        );
+        assert_eq!(bump_placement(p, u64::MAX - p + 1), None);
     }
 
     #[test]
@@ -1426,8 +1565,8 @@ mod tests
     #[test]
     fn subpage_bin_lookup()
     {
-        assert_eq!(subpage_bin_for(BIN_128), Some(0));
-        assert_eq!(subpage_bin_for(BIN_512), Some(1));
+        assert_eq!(subpage_bin_for(BIN_128), Some(SubpageBin::Bin128));
+        assert_eq!(subpage_bin_for(BIN_512), Some(SubpageBin::Bin512));
         assert_eq!(subpage_bin_for(PAGE_SIZE as u64), None);
         assert_eq!(subpage_bin_for(0), None);
     }

@@ -528,7 +528,8 @@ pub fn record_ctxsw_flush(elided: bool)
 
 /// Sum the tagged-TLB flush counters across all online CPUs as
 /// `(elided, performed)`. Read-only diagnostic; monotonic counters, so a
-/// lock-free `Relaxed` sum is fine.
+/// lock-free `Relaxed` sum is fine. The counters are free-running (they wrap,
+/// as `fetch_add` does), and so is their sum.
 #[cfg(not(test))]
 pub fn ctxsw_flush_totals() -> (u64, u64)
 {
@@ -539,8 +540,8 @@ pub fn ctxsw_flush_totals() -> (u64, u64)
     {
         // SAFETY: cpu < CPU_COUNT; the PER_CPU slab covers CPU_COUNT entries.
         let pc = unsafe { &*per_cpu_ptr(cpu) };
-        elided += pc.ctxsw_flush_elided.load(Ordering::Relaxed);
-        performed += pc.ctxsw_flush_performed.load(Ordering::Relaxed);
+        elided = elided.wrapping_add(pc.ctxsw_flush_elided.load(Ordering::Relaxed));
+        performed = performed.wrapping_add(pc.ctxsw_flush_performed.load(Ordering::Relaxed));
     }
     (elided, performed)
 }

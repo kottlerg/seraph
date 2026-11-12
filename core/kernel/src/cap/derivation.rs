@@ -132,11 +132,12 @@ impl DerivationLock
         loop
         {
             let cur = self.state.load(Ordering::Relaxed);
-            // Refuse to increment if a writer holds the lock.
-            if cur != WRITE_LOCKED
+            // Refuse to increment if a writer holds the lock: `WRITE_LOCKED`
+            // is `u32::MAX`, the one count with no successor.
+            if let Some(next) = cur.checked_add(1)
                 && self
                     .state
-                    .compare_exchange_weak(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .compare_exchange_weak(cur, next, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
             {
                 break;
@@ -477,7 +478,8 @@ pub unsafe fn reparent_children(node: SlotId, new_parent: Option<SlotId>, max_ed
             // `truncate_dead_link`); head then stays a clean root.
             let _ = unsafe { link_child(np, head) };
         }
-        edits += 1;
+        // Below `max_edits`, checked above: does not saturate.
+        edits = edits.saturating_add(1);
     }
 }
 
@@ -566,7 +568,7 @@ pub unsafe fn revoke_subtree_batch(
             // Childless root: subtree cleared. (An unresolvable root lands
             // here too; the caller's per-batch revalidation is what tells a
             // vanished root apart from a cleared subtree.)
-            return (&out[..out_count], BatchStatus::Cleared);
+            return (collected(out, out_count), BatchStatus::Cleared);
         };
 
         // SAFETY: DERIVATION_LOCK held; ensures exclusive access to the tree.
@@ -575,7 +577,7 @@ pub unsafe fn revoke_subtree_batch(
         {
             // SAFETY: DERIVATION_LOCK held (see Safety: corruption path).
             unsafe { truncate_dead_link(root, head, "root child list") };
-            return (&out[..out_count], BatchStatus::DeadLink);
+            return (collected(out, out_count), BatchStatus::DeadLink);
         };
         let grandchild = head_slot.deriv_first_child;
 
@@ -586,7 +588,7 @@ pub unsafe fn revoke_subtree_batch(
             {
                 // SAFETY: DERIVATION_LOCK held (see Safety: corruption path).
                 unsafe { truncate_dead_link(head, g, "child chain") };
-                return (&out[..out_count], BatchStatus::DeadLink);
+                return (collected(out, out_count), BatchStatus::DeadLink);
             }
             // Hoist: g leaves head's child list and becomes root's first
             // child (head keeps its own list position).
@@ -601,19 +603,36 @@ pub unsafe fn revoke_subtree_batch(
         {
             // Head is childless: unlink, free its slot, collect its object.
             // SAFETY: DERIVATION_LOCK held; head is a valid, live SlotId.
+            // At most one object per step, and the batch ends before
+            // `MAX_REVOKE_EDITS` steps, so the buffer always has the entry.
+            // Were it full, the object would keep the reference its slot
+            // held: leaked, never freed while referenced.
             if let Some(ptr) = unsafe { unlink_free_collect(head) }
+                && let Some(entry) = out.get_mut(out_count)
             {
-                out[out_count] = Some(ptr);
-                out_count += 1;
+                *entry = Some(ptr);
+                out_count = out_count.saturating_add(1);
             }
         }
 
-        steps += 1;
+        // Below `MAX_REVOKE_EDITS`, checked below: does not saturate.
+        steps = steps.saturating_add(1);
         if steps >= MAX_REVOKE_EDITS
         {
-            return (&out[..out_count], BatchStatus::MoreWork);
+            return (collected(out, out_count), BatchStatus::MoreWork);
         }
     }
+}
+
+/// The first `count` entries of the revoke output buffer, the objects one
+/// [`revoke_subtree_batch`] call collected. `count` counts the entries
+/// written, so it never passes the buffer's end.
+fn collected(
+    out: &'static [Option<NonNull<KernelObjectHeader>>],
+    count: usize,
+) -> &'static [Option<NonNull<KernelObjectHeader>>]
+{
+    out.get(..count).unwrap_or_default()
 }
 
 /// Containment for a dead derivation link: log it and cut `owner`'s

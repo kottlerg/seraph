@@ -392,34 +392,10 @@ pub fn print_timestamp()
     let sec = us / 1_000_000;
     let us_frac = us % 1_000_000;
 
-    // Format seconds into a small stack buffer (no heap, no float).
-    // Handles up to u64::MAX seconds without overflow.
-    let mut sec_buf = [0u8; 20]; // 20 ASCII digits covers u64::MAX
-    let sec_str = {
-        let mut n = sec;
-        let mut len = 0usize;
-        if n == 0
-        {
-            sec_buf[0] = b'0';
-            len = 1;
-        }
-        else
-        {
-            while n > 0
-            {
-                sec_buf[len] = b'0' + (n % 10) as u8;
-                n /= 10;
-                len += 1;
-            }
-            sec_buf[..len].reverse();
-        }
-        // SAFETY: buf contains only ASCII digit bytes.
-        unsafe { core::str::from_utf8_unchecked(&sec_buf[..len]) }
-    };
-
+    // `core::fmt` formats the integers in place: no heap, no float.
     // SAFETY: console is initialised before kprintln! is used.
     unsafe {
-        console_write_fmt(format_args!("[{sec_str}.{us_frac:06}] "));
+        console_write_fmt(format_args!("[{sec}.{us_frac:06}] "));
     }
 }
 
@@ -446,32 +422,9 @@ pub fn print_serial_timestamp()
     let sec = us / 1_000_000;
     let us_frac = us % 1_000_000;
 
-    let mut sec_buf = [0u8; 20];
-    let sec_str = {
-        let mut n = sec;
-        let mut len = 0usize;
-        if n == 0
-        {
-            sec_buf[0] = b'0';
-            len = 1;
-        }
-        else
-        {
-            while n > 0
-            {
-                sec_buf[len] = b'0' + (n % 10) as u8;
-                n /= 10;
-                len += 1;
-            }
-            sec_buf[..len].reverse();
-        }
-        // SAFETY: buf contains only ASCII digit bytes.
-        unsafe { core::str::from_utf8_unchecked(&sec_buf[..len]) }
-    };
-
     // SAFETY: console is initialised.
     unsafe {
-        serial_write_fmt(format_args!("[{sec_str}.{us_frac:06}] "));
+        serial_write_fmt(format_args!("[{sec}.{us_frac:06}] "));
     }
 }
 

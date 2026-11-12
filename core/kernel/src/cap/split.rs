@@ -143,7 +143,8 @@ pub(crate) unsafe fn install_split_children(
     {
         // SAFETY: DERIVATION_LOCK held; the original revalidated in this hold.
         let done = unsafe { reparent_children(orig_node, parent, MAX_REPARENT_EDITS) };
-        batches += 1;
+        // MAX_REPARENT_BATCHES below ends the loop once the count reaches it.
+        batches = batches.saturating_add(1);
         if done
         {
             break;

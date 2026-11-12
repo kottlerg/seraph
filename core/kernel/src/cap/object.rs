@@ -238,9 +238,10 @@ impl KernelObjectHeader
             {
                 return Err(syscall::SyscallError::QuotaExceeded);
             }
+            // Below REF_COUNT_LIMIT (checked above), so the add never saturates.
             match self.ref_count.compare_exchange_weak(
                 cur,
-                cur + 1,
+                cur.saturating_add(1),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             )
@@ -270,9 +271,11 @@ impl KernelObjectHeader
             {
                 return false;
             }
+            // Slot references stop at REF_COUNT_LIMIT and pins are one per
+            // thread in a syscall, so the add never saturates.
             match self.ref_count.compare_exchange_weak(
                 cur,
-                cur + 1,
+                cur.saturating_add(1),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             )
@@ -315,7 +318,10 @@ impl KernelObjectHeader
             // observes every write those owners made before releasing.
             core::sync::atomic::fence(Ordering::Acquire);
         }
-        prev - 1
+        // Wrapping, as the atomic did: an underflow (caught by the assert
+        // above in debug) returns u32::MAX, never 0, so no caller frees the
+        // object a second time.
+        prev.wrapping_sub(1)
     }
 }
 
@@ -464,10 +470,16 @@ impl MemoryObject
         loop
         {
             let cur = self.lock.load(Ordering::Relaxed);
+            // Readers are at most one per CPU, so the add never saturates.
             if cur != FRAME_WRITE_LOCKED
                 && self
                     .lock
-                    .compare_exchange_weak(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .compare_exchange_weak(
+                        cur,
+                        cur.saturating_add(1),
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
                     .is_ok()
             {
                 break;
@@ -638,7 +650,14 @@ impl RangeLineage
             {
                 return Err(syscall::SyscallError::QuotaExceeded);
             }
-            match live.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+            // The copy count is below RANGE_COPY_LIMIT (checked above), so
+            // the add stays below ROOT_SHARE and never saturates.
+            match live.compare_exchange_weak(
+                cur,
+                cur.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
             {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
@@ -933,7 +952,7 @@ impl MmioObject
     #[cfg(not(test))]
     unsafe fn withdraw_mappings(&self, stack: &mut CascadeStack)
     {
-        let pages = (self.size / crate::mm::PAGE_SIZE as u64) as usize;
+        let pages = (self.size / super::PAGE_BYTES) as usize;
         for m in self.records()
         {
             let Some(aso) = NonNull::new(m.aso.swap(core::ptr::null_mut(), Ordering::Acquire))
@@ -1264,6 +1283,16 @@ fn interrupt_window()
     crate::percpu::preempt_enable();
 }
 
+/// Physical address, or region offset, of page `i` of the block at `base`.
+/// Callers pass a page inside a retyped block, or its end, whose span fits
+/// the address space, so the arithmetic wraps as the release build did and
+/// never actually wraps.
+#[cfg(not(test))]
+fn block_page(base: u64, i: u64) -> u64
+{
+    base.wrapping_add(i.wrapping_mul(super::PAGE_BYTES))
+}
+
 /// Bytes of `RecordPage` ahead of its records: `next_phys` and `used`.
 #[cfg(not(test))]
 const RECORD_PAGE_HEADER: usize = core::mem::size_of::<u64>() + core::mem::size_of::<usize>();
@@ -1396,7 +1425,8 @@ impl PagePool
     /// seeded, or credited then. No current caller can provoke it — an
     /// augment always carries a pool page and a create finds record 0
     /// vacant — so the callers' rollbacks are the contract for a future
-    /// caller, not a reachable path. The record is written under the first lock
+    /// caller, not a reachable path. A `pool_pages` above `total_pages`, a
+    /// caller error, is refused the same way. The record is written under the first lock
     /// hold, before any page is published, so every seeded page belongs to
     /// a recorded, reclaimable donation; the pages then go onto the free list
     /// in batches of `SEED_BATCH_PAGES` under separate holds, each batch
@@ -1426,9 +1456,13 @@ impl PagePool
     ) -> Result<(), ()>
     {
         debug_assert!(pool_pages <= total_pages);
-        let p = crate::mm::PAGE_SIZE as u64;
-        let donation_phys = ancestor_memory_base + base_offset;
-        let mut first_pool = total_pages - pool_pages;
+        let Some(mut first_pool) = total_pages.checked_sub(pool_pages)
+        else
+        {
+            return Err(());
+        };
+        // Inside the retyped donation (caller's contract).
+        let donation_phys = ancestor_memory_base.wrapping_add(base_offset);
         let record = DonationRecord {
             ancestor: ancestor.as_ptr(),
             base_offset,
@@ -1469,8 +1503,10 @@ impl PagePool
             }
             // SAFETY: lock held; the page is the donation's first pool page,
             // freshly retyped from `ancestor` and not yet published.
-            let cell = unsafe { self.open_record_page(donation_phys + first_pool * p, record) };
-            first_pool += 1;
+            let cell =
+                unsafe { self.open_record_page(block_page(donation_phys, first_pool), record) };
+            // Below total_pages here (checked above), so it never saturates.
+            first_pool = first_pool.saturating_add(1);
             cell
         };
         pool_unlock(&self.lock);
@@ -1504,7 +1540,6 @@ impl PagePool
         cell: HolesCell,
     )
     {
-        let p = crate::mm::PAGE_SIZE as u64;
         let mut end = total;
         while end > first
         {
@@ -1514,9 +1549,13 @@ impl PagePool
             {
                 // SAFETY: lock held; the caller's contract makes the page
                 // exclusively owned and recorded at `cell`.
-                unsafe { pool_push_tagged(&self.head_phys, donation_phys + i * p, cell) };
+                unsafe { pool_push_tagged(&self.head_phys, block_page(donation_phys, i), cell) };
             }
-            budget.fetch_add((end - start) * p, Ordering::AcqRel);
+            // At most SEED_BATCH_PAGES pages, so neither step saturates.
+            budget.fetch_add(
+                end.saturating_sub(start).saturating_mul(super::PAGE_BYTES),
+                Ordering::AcqRel,
+            );
             pool_unlock(&self.lock);
             end = start;
             if end > first
@@ -1544,13 +1583,14 @@ impl PagePool
         // direct map and exclusively owned by this pool until teardown.
         let cell = unsafe {
             let used = (*page).used;
-            if used >= RECORDS_PER_PAGE
-            {
-                return None;
-            }
-            (*page).records[used] = record;
-            (*page).used = used + 1;
-            core::ptr::addr_of_mut!((*page).records[used].holes)
+            // A full page has no record at `used`.
+            let records = &mut (*page).records;
+            let slot = records.get_mut(used)?;
+            *slot = record;
+            let cell = core::ptr::addr_of_mut!(slot.holes);
+            // Below RECORDS_PER_PAGE (the slot exists), so it never saturates.
+            (*page).used = used.saturating_add(1);
+            cell
         };
         // Re-publish the head with Release so the appended record and the
         // new `used` are visible to a reader that Acquire-loads the head
@@ -1615,12 +1655,11 @@ impl PagePool
         F: FnMut(&mut [DonationRecord]),
     {
         let mut inline_snapshot = [DonationRecord::VACANT; INLINE_RECORDS];
-        let mut count = 0;
-        for record in self.inline.iter().filter_map(InlineRecord::load)
-        {
-            inline_snapshot[count] = record;
-            count += 1;
-        }
+        let count = inline_snapshot
+            .iter_mut()
+            .zip(self.inline.iter().filter_map(InlineRecord::load))
+            .map(|(slot, record)| *slot = record)
+            .count();
 
         let mut page_phys = self.record_head_phys.load(Ordering::Acquire);
         while page_phys != 0
@@ -1634,8 +1673,10 @@ impl PagePool
             // survivable; the clamp only keeps the access inside the page.
             let used = used.min(RECORDS_PER_PAGE);
             // SAFETY: as above, and the dead pool's page is this walk's alone
-            // to reorder; `used` is within it.
-            let records = unsafe { &mut (&mut (*page).records)[..used] };
+            // to reorder. `used` is within it, so the empty fallback is never
+            // taken.
+            let records = unsafe { &mut (*page).records };
+            let records = records.get_mut(..used).unwrap_or_default();
             if let Some((own, others)) = records.split_first_mut()
             {
                 // Record 0 is copied out first: its return releases the page.
@@ -1647,7 +1688,11 @@ impl PagePool
             page_phys = next;
         }
 
-        if let Some((slab, others)) = inline_snapshot[..count].split_first_mut()
+        // `count` is at most INLINE_RECORDS (the zip above), so the slice is
+        // always there.
+        if let Some((slab, others)) = inline_snapshot
+            .get_mut(..count)
+            .and_then(<[DonationRecord]>::split_first_mut)
         {
             free_in_groups(others, &mut free);
             free(core::slice::from_mut(slab));
@@ -2384,20 +2429,26 @@ pub fn alloc_port_binding_table(
 
     let mut pages = [0u64; TABLE_PAGES];
     let mut cells = [0usize; TABLE_PAGES];
-    for i in 0..TABLE_PAGES
+    // Fill the arrays in order, stopping at the first page the pool cannot
+    // supply.
+    let taken = pages
+        .iter_mut()
+        .zip(cells.iter_mut())
+        .map_while(|(page, cell)| {
+            let (phys, c) = funder.alloc_pool_page()?;
+            *page = phys;
+            *cell = c as usize;
+            Some(())
+        })
+        .count();
+    if taken < TABLE_PAGES
     {
-        let Some((phys, cell)) = funder.alloc_pool_page()
-        else
+        for (&phys, &cell) in pages.iter().zip(&cells).take(taken)
         {
-            for (&phys, &cell) in pages[..i].iter().zip(&cells[..i])
-            {
-                // SAFETY: a page taken above and never used, with its cell.
-                unsafe { funder.free_pool_page(phys, cell as HolesCell) };
-            }
-            return Err(syscall::SyscallError::OutOfMemory);
-        };
-        pages[i] = phys;
-        cells[i] = cell as usize;
+            // SAFETY: a page taken above and never used, with its cell.
+            unsafe { funder.free_pool_page(phys, cell as HolesCell) };
+        }
+        return Err(syscall::SyscallError::OutOfMemory);
     }
     let mut parts = [core::ptr::null_mut::<[u8; IOPB_PART_BYTES]>(); IOPB_PARTS];
     for (part, &phys) in parts.iter_mut().zip(&pages[1..])
@@ -3173,7 +3224,8 @@ unsafe fn free_body<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStac
     // SAFETY: as above.
     let ancestor_memory = unsafe { &*ancestor.as_ptr().cast::<MemoryObject>() };
     let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-    let offset = body_phys - ancestor_memory.base;
+    // The body lies inside its ancestor's region.
+    let offset = body_phys.wrapping_sub(ancestor_memory.base);
     // SAFETY: exclusively owned body of type T (caller contract).
     unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<T>()) };
     // SAFETY: the body was retyped from its ancestor at this offset with this
@@ -3453,7 +3505,8 @@ unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeS
     // SAFETY: the records' references keep their Memory object live until the
     // releases at the end.
     let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
-    let offset_of = |page: *mut ArenaPage| virt_to_phys(page as u64) - anc_memory.base;
+    // A kept page lies inside its donation, inside the Memory object's region.
+    let offset_of = |page: *mut ArenaPage| virt_to_phys(page as u64).wrapping_sub(anc_memory.base);
     for record in group.iter_mut()
     {
         // SAFETY: every page on the list is held (contract) and lies in this
@@ -3480,7 +3533,6 @@ unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeS
             Some(offset_of(core::ptr::from_ref(page).cast_mut()))
         })
     };
-    let p = crate::mm::PAGE_SIZE as u64;
     // SAFETY: the runs are the parts of the records' page-class retypes that
     // no kept page covers, in ascending order (the records are sorted by
     // offset and their spans disjoint); the dead pool uses none of them.
@@ -3489,9 +3541,11 @@ unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeS
             for record in &*group
             {
                 let start = record.base_offset;
-                let end = start + record.page_count * p;
+                let end = block_page(start, record.page_count);
+                // A run is never empty (`for_each_run`), so the length does not
+                // saturate.
                 crate::cap::arena::for_each_run(start, end, kept(record.holes), |from, to| {
-                    free_run(from, to - from);
+                    free_run(from, to.saturating_sub(from));
                 });
             }
         });
@@ -3723,8 +3777,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: the page's lease keeps its Memory object live until the
             // release below.
             let ancestor_memory = unsafe { &*ancestor.as_ptr().cast::<MemoryObject>() };
-            let offset =
-                crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64) - ancestor_memory.base;
+            // The page lies inside the Memory object's region.
+            let offset = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64)
+                .wrapping_sub(ancestor_memory.base);
             // SAFETY: the page lies in a donation retyped from this Memory object
             // and was left out of its return; its last chunk and its CSpace have
             // gone, so nothing uses it.
@@ -4314,15 +4369,16 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // The wrapper sits at the slot's `WRAPPER_OFFSET`, immediately
             // after the guard and the kstack pages (`sched::thread_slot`).
             let wrapper_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let block_phys = wrapper_phys - crate::sched::thread_slot::WRAPPER_OFFSET;
-            let offset = block_phys - ancestor_memory.base;
+            // Offsets inside the slot, which lies inside its ancestor's region.
+            let block_phys = wrapper_phys.wrapping_sub(crate::sched::thread_slot::WRAPPER_OFFSET);
+            let offset = block_phys.wrapping_sub(ancestor_memory.base);
             // Count this thread's stack depth before the slot is freed.
             // SAFETY: the kstack pages lie above the guard in the retype
             // slot, mapped through the direct map; the thread is dead, so
             // nothing runs on them.
             unsafe {
                 crate::stack_depth::record_thread_stack(crate::mm::paging::phys_to_virt(
-                    block_phys + crate::sched::thread_slot::STACK_OFFSET,
+                    block_phys.wrapping_add(crate::sched::thread_slot::STACK_OFFSET),
                 ));
             }
 
@@ -4791,7 +4847,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
 
             let header_virt = ptr.as_ptr() as u64;
             let header_phys = crate::mm::paging::virt_to_phys(header_virt);
-            let offset = header_phys - ancestor_memory.base;
+            // The object lies inside its ancestor's region.
+            let offset = header_phys.wrapping_sub(ancestor_memory.base);
 
             // Drop in place. EndpointObject and EndpointState contain only
             // primitive fields and Spinlock; no Drop impl, but the call is
@@ -4899,7 +4956,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
 
             let header_virt = ptr.as_ptr() as u64;
             let header_phys = crate::mm::paging::virt_to_phys(header_virt);
-            let offset = header_phys - ancestor_memory.base;
+            // The object lies inside its ancestor's region.
+            let offset = header_phys.wrapping_sub(ancestor_memory.base);
 
             if !state.is_null()
             {
@@ -4989,7 +5047,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: ancestor_ptr non-null.
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let offset = header_phys - ancestor_memory.base;
+            // The object lies inside its ancestor's region.
+            let offset = header_phys.wrapping_sub(ancestor_memory.base);
 
             if !state.is_null()
             {
@@ -5061,7 +5120,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: ancestor_ptr non-null.
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let offset = header_phys - ancestor_memory.base;
+            // The object lies inside its ancestor's region.
+            let offset = header_phys.wrapping_sub(ancestor_memory.base);
 
             if !state.is_null()
             {
@@ -5181,8 +5241,11 @@ unsafe fn drain_dying_cspace_batch(
 
     // Leaves are contiguous behind the grow cursor; leaf_count bounds the
     // slot range exactly.
+    // A CSpace's slots are indexed by u32, so the product never saturates.
     // SAFETY: cs_ptr is uniquely owned (refcount = 0).
-    let slot_count = (unsafe { (*cs_ptr).leaf_count() } * L2_SIZE) as u32;
+    let slot_count = (unsafe { (*cs_ptr).leaf_count() }.saturating_mul(L2_SIZE)) as u32;
+    // `edits` is below MAX_DRAIN_EDITS before every step (checked) and the
+    // cursor below `slot_count`, so their increments never saturate.
     let mut edits = 0usize;
 
     while *cursor < slot_count
@@ -5198,8 +5261,8 @@ unsafe fn drain_dying_cspace_batch(
         else
         {
             // Slot 0 is permanently null.
-            *cursor += 1;
-            edits += 1;
+            *cursor = cursor.saturating_add(1);
+            edits = edits.saturating_add(1);
             continue;
         };
         // SAFETY: brief immutable borrow; dropped at the end of the call.
@@ -5207,8 +5270,8 @@ unsafe fn drain_dying_cspace_batch(
             unsafe { (*cs_ptr).slot(global_idx) }.is_some_and(|s| s.tag != CapTag::Null);
         if !populated
         {
-            *cursor += 1;
-            edits += 1;
+            *cursor = cursor.saturating_add(1);
+            edits = edits.saturating_add(1);
             continue;
         }
         let self_id = SlotId::with_epoch(dying_id, dying_epoch, idx_nz);
@@ -5236,7 +5299,7 @@ unsafe fn drain_dying_cspace_batch(
             // it touches via fresh registry lookups (occupancy-gated) and
             // clears the child's parent link.
             unsafe { unlink_node(head) };
-            edits += 1;
+            edits = edits.saturating_add(1);
             // No-progress containment: an unresolvable head (dead link, or
             // a stale/cyclic chain) makes unlink_node a no-op and would
             // otherwise pin the pop loop forever. Truncate the chain
@@ -5264,9 +5327,9 @@ unsafe fn drain_dying_cspace_batch(
         //    left its child pointer at None.
         // SAFETY: DERIVATION_LOCK held (see above).
         unsafe { unlink_node(self_id) };
-        edits += 1;
+        edits = edits.saturating_add(1);
 
-        *cursor += 1;
+        *cursor = cursor.saturating_add(1);
     }
     true
 }

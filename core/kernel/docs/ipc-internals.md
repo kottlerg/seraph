@@ -418,7 +418,7 @@ notification. A bound binding holds a reference on its notification's object, ta
 rebind to another notification, or the binding's removal when its Interrupt object is freed). A
 notification a binding names is therefore never freed, and the Notification teardown
 (`dealloc_object`, Notification arm) makes no IRQ change: deleting a notification's capabilities
-leaves its bindings in place until their Interrupt capabilities unbind, rebind or go.
+leaves its bindings in place until their Interrupt objects rebind or are freed.
 
 Every delivery runs under its CPU's delivery gate (`irq::DeliveryGate`, one per CPU): a count the
 delivery raises to odd before its first read of the slot's entry and drops to even after its last

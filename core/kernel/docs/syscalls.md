@@ -2388,8 +2388,9 @@ last unmask has acknowledged. A new binding owes from the start, so the driver's
 idempotent: a repeated one, or one with no delivery since the last (a driver's timeout-wake
 acknowledgement), clears nothing and unmasks only when no binding owes; with a single binding
 on the line it unmasks whether or not an interrupt has been delivered since. Through an object
-with no binding (never registered, or its binding removed with its Notification) the call
-changes nothing and returns 0. A message-signaled target (§ `SYS_IRQ_MSG_ALLOC`) is never masked,
+with no binding (never registered) the call changes nothing and returns 0: deleting a bound
+Notification's capabilities leaves the binding, which still owes its acknowledgements
+(§ `SYS_IRQ_REGISTER`, Unbind). A message-signaled target (§ `SYS_IRQ_MSG_ALLOC`) is never masked,
 so through its capability the call changes nothing and returns 0.
 
 **Capability requirement:** `irq_cap` MUST be a valid interrupt capability for the
@@ -2447,7 +2448,7 @@ through their own capability.
   consumed by a split, revoked through an ancestor, or torn down with its holder's CSpace); the
   removal gives up the binding's reference on its notification's object and waits out the delivery
   running on the line's CPU. Deleting a Notification's capabilities removes no binding: the bindings
-  stay, and keep the Notification, until their Interrupt capabilities unbind, rebind or go. The line
+  stay, and keep the Notification, until their Interrupt objects rebind or are freed. The line
   is then unmasked if bindings remain and none owes, so a receiver that goes cannot hold a shared
   line masked, and released at its controller when no binding remains; the release forgets the mode,
   so the line's next first binding records its own.

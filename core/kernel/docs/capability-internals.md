@@ -908,7 +908,7 @@ line stay. A bound binding holds a counted reference on its Notification's objec
 `SYS_IRQ_REGISTER` and given up only by the change that takes the notification from the binding (a
 rebind to another notification, or this removal), so a Notification is freed only once no binding
 names it: its teardown makes no IRQ change, and deleting a Notification's capabilities leaves its
-bindings in place until their Interrupt capabilities unbind, rebind or go. A range capability (more
+bindings in place until their Interrupt objects rebind or are freed. A range capability (more
 than one line) never binds, and its arm finds nothing to remove.
 
 A message-signaled target's capability (`SYS_IRQ_MSG_ALLOC`) is the root of a lineage of its own

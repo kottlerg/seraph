@@ -754,13 +754,14 @@ repacks `disk.img`, boots the current sysroot once, and always removes the knob 
 afterwards. It passes when the boot reaches its pass marker and its log holds the bootloader's
 line `boot: memory map: mapredo knob present; redoing steps 6 and 7` exactly once.
 
-A pure runner; requires a harness staged (CI runs it on the ktest bundle):
+A pure runner; requires a harness staged (CI runs it on the ktest bundle), and `--test-devices`
+when that harness is svctest, whose devmgr phases drive the test devices (as for `run`):
 
 ```sh
 cargo xtask build [--arch x86_64|riscv64]
 cargo xtask compose-bundle --harness ktest [--arch x86_64|riscv64]
 cargo xtask test-map-redo [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [--mem MIB] \
-    [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5]
+    [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] [--test-devices]
 ```
 
 The boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass and fail markers,

@@ -706,6 +706,18 @@ impl Registry
     fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64)
     {
         let badge = msg.badge;
+        // A client whose SEND carries GRANT (`devmgr.bind`, svcmgr, init) can
+        // move caps here with any label. `SET_DRIVERS_DIR` and `BIND_DRIVERS`
+        // take `caps[0]` and own its release; every other cap a request
+        // carries is released here, so none stays in devmgr's CSpace.
+        let kept = usize::from(matches!(
+            msg.label,
+            ipc::devmgr_labels::SET_DRIVERS_DIR | ipc::devmgr_labels::BIND_DRIVERS
+        ));
+        for &cap in msg.caps().iter().skip(kept)
+        {
+            let _ = syscall::cap_delete(cap);
+        }
         match msg.label
         {
             ipc::devmgr_labels::QUERY_DEVICE =>

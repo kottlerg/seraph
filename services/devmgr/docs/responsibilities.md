@@ -295,15 +295,20 @@ devmgr's responsibilities are:
   withdrawn driver of a platform record has its copies of the record's caps
   revoked, the `Mmio`, `IoPort`, and wired-line caps devmgr carved and keeps,
   and is destroyed through its process handle while devmgr still keeps it (until
-  its batch settles), as a withdrawn test-fault fixture is; none of them drives
-  a DMA-capable device, and none is created `CREATE_DMA_HOLD`.
+  its batch settles); none of them drives a DMA-capable device, and none is
+  created `CREATE_DMA_HOLD`.
 
-  No boot withdraws a PCI-bound driver, so none runs this order. A boot serves
-  every PCI-bound driver that reports ready, and devmgr withdraws one only on
-  its death or a failed settle. A test boot cannot cause either without a
-  test-only label to kill a PCI-bound driver, which the enumeration redesign
-  removes ([#165](https://github.com/kottlerg/seraph/issues/165)): only devmgr
-  holds a PCI-bound driver's process handle, and the only virtio-blk driver of a
+  Every svctest boot runs this order on PCI functions without DMA: its
+  `devmgr_on_demand_bind` phase has devmgr withdraw three `test-fault`
+  fixtures bound to QEMU `pci-testdev` functions, one on its death after
+  `FAULT_EXIT`, one still pending at its settle's bound, and one whose
+  bootstrap fails, so the Bus Master Enable and Interrupt Disable writes, the
+  endpoint revocation, and the BAR and configuration-page releases run; the
+  fixture declares no reset and no DMA, so neither a reset nor a DMA release
+  runs there. No boot withdraws a DMA-capable PCI-bound driver. A boot serves
+  every such driver that reports ready, and devmgr withdraws one only on its
+  death or a failed settle, which a test boot cannot cause: only devmgr holds
+  a PCI-bound driver's process handle, and the only virtio-blk driver of a
   test boot serves its root filesystem. Nor could a boot place a late device
   write after a free, since the emulated devices complete a request on their
   own event loop, with nothing a guest can hold in flight. What every boot does

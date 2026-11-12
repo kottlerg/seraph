@@ -592,6 +592,11 @@ pub struct TestMapRedoArgs
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
 
+    /// Attach the test devices, as `run --test-devices` does: a staged
+    /// svctest needs them to reach its pass marker.
+    #[arg(long)]
+    pub test_devices: bool,
+
     /// The shared host's launch rules (see xtask/README.md "Host launch
     /// rules").
     #[command(flatten)]

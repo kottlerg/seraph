@@ -28,6 +28,8 @@
 
 // cast_possible_truncation: u64→usize/u32/u16 capability field extractions bounded by capability space.
 #![allow(clippy::cast_possible_truncation)]
+// Staged roll-out of docs/coding-standards.md § Clippy: this subsystem's sites are fixed.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 // `alloc` is only required by the test build (heap-backed CSpace stub +
 // `nonnull_from_box` test helper). Production has no `GlobalAlloc`.

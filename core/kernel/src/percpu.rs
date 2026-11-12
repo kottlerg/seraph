@@ -49,6 +49,9 @@
 //! operand), and update that assembly; otherwise update only the size
 //! assertion in that test.
 
+// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::sched::MAX_CPUS;

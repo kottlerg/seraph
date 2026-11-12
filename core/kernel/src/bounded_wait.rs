@@ -16,6 +16,9 @@
 //! time on any plausible CPU, so the fallback can wait longer than the budget but never
 //! times out early.
 
+// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 /// Upper bound on spin iterations per clock unit, used to estimate elapsed time when the
 /// clock gives no reading. One iteration is at least one cycle, and 10 000 cycles per
 /// microsecond is a 10 GHz clock, above any shipping CPU, so `spins / MAX_SPINS_PER_UNIT`

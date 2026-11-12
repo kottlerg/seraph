@@ -24,6 +24,9 @@
 //! re-execute the syscall on its resume (docs/fault-handling.md § Kernel
 //! Copies). Only a syscall with no visible effect before its copy uses them.
 
+// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 #[cfg(not(test))]
 use syscall::SyscallError;
 

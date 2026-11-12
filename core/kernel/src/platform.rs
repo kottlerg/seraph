@@ -15,6 +15,8 @@
 
 // cast_possible_truncation: u64→usize address arithmetic bounded by platform memory layout.
 #![allow(clippy::cast_possible_truncation)]
+// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use boot_protocol::{BootInfo, KernelMmio, MemoryMapEntry, MemoryType, MmioAperture};
 use core::cell::UnsafeCell;
@@ -620,7 +622,11 @@ mod tests
     #[test]
     fn unordered_adjacent_regions_cover_a_slice_across_them()
     {
-        let map = [usable(0x3000, 0x1000), usable(0x1000, 0x1000), usable(0x2000, 0x1000)];
+        let map = [
+            usable(0x3000, 0x1000),
+            usable(0x1000, 0x1000),
+            usable(0x2000, 0x1000),
+        ];
         assert!(slice_in_boot_memory(0x1800, 0x3800, &map));
         let gap = [usable(0x3000, 0x1000), usable(0x1000, 0x1000)];
         assert!(!slice_in_boot_memory(0x1800, 0x3800, &gap));

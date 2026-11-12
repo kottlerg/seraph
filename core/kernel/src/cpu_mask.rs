@@ -19,6 +19,9 @@
 //! mask. A hierarchical mask is not the design: it still fixes a maximum, and
 //! adds a level to every bit test on the shootdown and context-switch paths.
 
+// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sched::MAX_CPUS;

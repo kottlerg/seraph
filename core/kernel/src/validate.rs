@@ -9,6 +9,9 @@
 //! are silent on failure — the caller halts the CPU immediately. No output is
 //! produced here because the serial port has not been initialized yet.
 
+// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use boot_protocol::{BOOT_PROTOCOL_VERSION, BootInfo, KASLR_IMAGE_RANDOMIZED, layout};
 
 /// Validate the boot info pointer received from the bootloader.

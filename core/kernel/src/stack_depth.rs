@@ -13,6 +13,9 @@
 //! `SYS_SYSTEM_INFO(StackHighWater)`. The mechanism and its limits are in
 //! core/kernel/docs/memory-internals.md § Kernel Stack Depth.
 
+// Staged roll-out of docs/coding-standards.md § Clippy: this module's sites are fixed.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(not(test))]

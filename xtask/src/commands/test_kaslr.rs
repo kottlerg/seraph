@@ -109,6 +109,7 @@ impl Guest
             x86_paging: args.x86_paging,
             iommu: Iommu::Attached,
             debug_port: None,
+            test_devices: false,
         };
         let qemu_args = build_qemu_argv(&spec)?;
 

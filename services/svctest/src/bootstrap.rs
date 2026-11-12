@@ -29,11 +29,9 @@ pub struct Caps
     /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
     /// endpoint (`devmgr.registry`).
     pub devmgr_registry: u64,
-    /// `REGISTRY_QUERY_AUTHORITY | TEST_LABEL_AUTHORITY`-badged SEND on
-    /// devmgr's registry endpoint (`devmgr.test`), for the
-    /// `TEST_SPAWN_ORPHAN` shim and `TEST_QUERY_DENY_DEVICE`. TODO(#165):
-    /// retire with those labels.
-    pub devmgr_test: u64,
+    /// `REGISTRY_QUERY_AUTHORITY | BIND_AUTHORITY`-badged `SEND|GRANT` on
+    /// devmgr's registry endpoint (`devmgr.bind`), for `BIND_DRIVERS`.
+    pub devmgr_bind: u64,
     /// `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint
     /// (`vfsd.mount`), in slot 4.
     pub vfsd_mount: u64,
@@ -49,8 +47,21 @@ pub struct Caps
     /// The `input` class SEND on devmgr's registry endpoint
     /// (`devmgr.class.input`), in slot 8.
     pub input_class: u64,
+    /// The `test-dma` class SEND (`devmgr.class.test-dma`), in slot 9, from
+    /// a test class file the svctest recipe stages.
+    pub test_dma_class: u64,
+    /// The `test-fault` class SEND (`devmgr.class.test-fault`), in slot 10,
+    /// from a test class file the svctest recipe stages.
+    pub test_fault_class: u64,
+    /// SENDs on the `serial`, `input`, and `framebuffer` classes whose verb
+    /// mask holds only bit 58, which none of those drivers checks
+    /// (`devmgr.class.serial-deny`, `input-deny`, `framebuffer-deny`), in
+    /// slots 11 to 13, from test class files the svctest recipe stages.
+    pub serial_deny_class: u64,
+    pub input_deny_class: u64,
+    pub framebuffer_deny_class: u64,
     /// `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which the recipe's
-    /// `debug_authority = yes` delivers in slot 9, after the seeds.
+    /// `debug_authority = yes` delivers in slot 14, after the seeds.
     pub debug_authority: u64,
 }
 
@@ -79,22 +90,27 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Nine seeds and the debug-authority slot take three rounds; an absent slot decodes as `0`,
-    // and a round that does not decode leaves every slot `0`.
+    // Fourteen seeds and the debug-authority slot take four rounds; an absent slot decodes as
+    // `0`, and a round that does not decode leaves every slot `0`.
     let Ok(
         [
             root_fs,
             pwrmgr_auth,
             devmgr_registry,
-            devmgr_test,
+            devmgr_bind,
             vfsd_mount,
             vfsd_deny,
             logd_query,
             serial_class,
             input_class,
+            test_dma_class,
+            test_fault_class,
+            serial_deny_class,
+            input_deny_class,
+            framebuffer_deny_class,
             debug_authority,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<10>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<15>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -102,12 +118,17 @@ fn request_round() -> Caps
     caps.root_fs = root_fs;
     caps.pwrmgr_auth = pwrmgr_auth;
     caps.devmgr_registry = devmgr_registry;
-    caps.devmgr_test = devmgr_test;
+    caps.devmgr_bind = devmgr_bind;
     caps.vfsd_mount = vfsd_mount;
     caps.vfsd_deny = vfsd_deny;
     caps.logd_query = logd_query;
     caps.serial_class = serial_class;
     caps.input_class = input_class;
+    caps.test_dma_class = test_dma_class;
+    caps.test_fault_class = test_fault_class;
+    caps.serial_deny_class = serial_deny_class;
+    caps.input_deny_class = input_deny_class;
+    caps.framebuffer_deny_class = framebuffer_deny_class;
     caps.debug_authority = debug_authority;
 
     caps

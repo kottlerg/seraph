@@ -243,6 +243,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let x86_paging = args.x86_paging;
             let iommu = args.iommu;
             let debug_port = args.debug_port;
+            let test_devices = args.test_devices;
             let display = QemuDisplay::from(args.display);
             let debug_listen = args.debug_listen;
             let hold_on_hang = args.hold_on_hang;
@@ -323,6 +324,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     x86_paging,
                     iommu,
                     debug_port,
+                    test_devices,
                 };
                 let qemu_args = build_qemu_argv(&spec)?;
 

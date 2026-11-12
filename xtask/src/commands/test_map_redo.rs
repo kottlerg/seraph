@@ -20,7 +20,9 @@
 //! `run-parallel` itself tolerates it.
 //!
 //! A pure runner: requires a populated sysroot with a harness staged (CI runs
-//! it in each `ktest` cell, on the ktest bundle that cell composed).
+//! it in each `ktest` cell, on the ktest bundle that cell composed), and
+//! `--test-devices` when that harness is svctest, whose devmgr phases drive
+//! the test devices.
 
 use std::path::Path;
 
@@ -120,7 +122,16 @@ pub fn run(ctx: &Context, args: &TestMapRedoArgs) -> Result<()>
 /// into `dir`.
 fn boot(ctx: &Context, args: &TestMapRedoArgs, dir: &Path) -> Result<()>
 {
-    let run = RunParallelArgs {
+    let run = run_args(args, dir);
+    step("map redo test: booting the current sysroot with the mapredo knob staged");
+    crate::commands::run_parallel::run(ctx, &run)
+}
+
+/// The `run-parallel` arguments of the boot: one run of `args`'s machine,
+/// its log saved into `dir`.
+fn run_args(args: &TestMapRedoArgs, dir: &Path) -> RunParallelArgs
+{
+    RunParallelArgs {
         arch: args.arch,
         parallel: 1,
         runs: 1,
@@ -132,6 +143,7 @@ fn boot(ctx: &Context, args: &TestMapRedoArgs, dir: &Path) -> Result<()>
         iommu: crate::qemu::Iommu::Attached,
         debug_port: None,
         debug_target: None,
+        test_devices: args.test_devices,
         display: crate::qemu::BatchDisplay::Headless,
         pass: DEFAULT_PASS_REGEX.to_string(),
         fail: DEFAULT_FAIL_REGEX.to_string(),
@@ -144,9 +156,7 @@ fn boot(ctx: &Context, args: &TestMapRedoArgs, dir: &Path) -> Result<()>
         second_disk_block_size: None,
         second_disk_shared_line: false,
         host: args.host.clone(),
-    };
-    step("map redo test: booting the current sysroot with the mapredo knob staged");
-    crate::commands::run_parallel::run(ctx, &run)
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +196,20 @@ mod tests
              redoing steps 6 and 7\n{PASS}\n{TRAILER}\n"
         );
         assert!(check_log(&log).is_err());
+    }
+
+    // Defect caught: a staged svctest failing its devmgr phases because the
+    // boot left out the test devices `--test-devices` asks for.
+    #[test]
+    fn the_test_devices_reach_the_boot_only_when_asked()
+    {
+        use clap::Parser as _;
+
+        let dir = Path::new("target/xtask/test-map-redo");
+        let plain = TestMapRedoArgs::try_parse_from(["test-map-redo"]).unwrap();
+        assert!(!run_args(&plain, dir).test_devices);
+        let asked = TestMapRedoArgs::try_parse_from(["test-map-redo", "--test-devices"]).unwrap();
+        assert!(run_args(&asked, dir).test_devices);
     }
 
     // Defect caught: a knob that redoes a later attempt too passing the test.

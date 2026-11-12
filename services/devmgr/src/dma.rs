@@ -11,8 +11,8 @@
 //! registers the device in the shared [`DmaTable`] with its confinement and
 //! derives a SEND on the endpoint badged with the device's badge, which
 //! devmgr keeps and from which it derives the driver's copy
-//! (`driver_binding::resources::SLOT_DMA`). The thread serves `DMA_MAP` and
-//! `DMA_UNMAP` (`ipc::devmgr_dma_labels`) on its own, at the boot drivers'
+//! (`driver_binding::resources::SLOT_DMA`). The thread serves `DMA_MAP`,
+//! `DMA_UNMAP`, and `DMA_FAULTS` (`ipc::devmgr_dma_labels`) on its own, at the boot drivers'
 //! level (`BOOT_DRIVER_PRIORITY`, above devmgr's), so a driver's mapping never
 //! waits for the control thread: that thread makes nested calls (a
 //! `CREATE_FROM_FILE` reads the driver binary through virtio-blk, which maps
@@ -43,7 +43,7 @@ use firmware::dma::{
 use ipc::recv_guard::RecvGuard;
 use ipc::{IpcMessage, devmgr_dma_errors, devmgr_dma_labels, iommu_errors};
 
-use crate::iommu::IommuClient;
+use crate::iommu::{Iommu, IommuClient};
 
 /// The shared table, locked. A poisoned lock means the other thread panicked
 /// mid-operation; every table operation leaves the table consistent before it
@@ -53,12 +53,48 @@ fn lock(table: &Mutex<DmaTable>) -> MutexGuard<'_, DmaTable>
     table.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// What the DMA thread and the grants share: the table and, once the IOMMU
-/// driver reports ready, the client it is called through.
+/// What the DMA thread and the grants share: the table, the requester ID of
+/// each device given DMA, and, once the IOMMU driver reports ready, the
+/// IOMMU devmgr calls it through.
+///
+/// Each lock is a leaf, held only around a table operation: neither is held
+/// while the other is taken or across an IPC.
 struct Shared
 {
     table: Mutex<DmaTable>,
-    iommu: OnceLock<Arc<IommuClient>>,
+    /// `(device badge, requester ID)` of each device given DMA and not
+    /// withdrawn, for `DMA_FAULTS`.
+    requesters: Mutex<Vec<(u64, u64)>>,
+    iommu: OnceLock<Arc<Iommu>>,
+}
+
+impl Shared
+{
+    /// The client the IOMMU driver is called through, once it is ready.
+    fn client(&self) -> Option<&Arc<IommuClient>>
+    {
+        self.iommu.get().map(|i| i.client())
+    }
+
+    /// Drop the requester ID of the device `badge`, given DMA no longer.
+    fn forget(&self, badge: u64)
+    {
+        self.requesters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|e| e.0 != badge);
+    }
+
+    /// The requester ID of the device given DMA as `badge`.
+    fn requester(&self, badge: u64) -> Option<u64>
+    {
+        self.requesters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|e| e.0 == badge)
+            .map(|e| e.1)
+    }
 }
 
 /// devmgr's DMA endpoint, its serving thread, and the state it shares with
@@ -83,6 +119,7 @@ impl DmaService
         };
         let shared = Arc::new(Shared {
             table: Mutex::new(DmaTable::new()),
+            requesters: Mutex::new(Vec::new()),
             iommu: OnceLock::new(),
         });
         let served = Arc::clone(&shared);
@@ -111,30 +148,47 @@ impl DmaService
     }
 
     /// Route every confined device's mappings through the IOMMU driver
-    /// `client` from now on. Set once, before the first confined grant.
-    pub fn set_iommu(&self, client: Arc<IommuClient>)
+    /// `iommu` calls, and answer `DMA_FAULTS` from the faults it takes, from
+    /// now on. Set once, before the first confined grant.
+    pub fn set_iommu(&self, iommu: Arc<Iommu>)
     {
-        let _ = self.shared.iommu.set(client);
+        let _ = self.shared.iommu.set(iommu);
     }
 
-    /// Give the device `device_badge` DMA with `confinement` and the
+    /// Give the device `device_badge`, of requester ID `requester_id`
+    /// (`crate::iommu::requester_id`), DMA with `confinement` and the
     /// firmware-reserved ranges its domain maps (`reserved`): register it in
     /// the table, so no mapping's IOVA overlaps a reserved range, and derive
     /// its DMA capability, a SEND on the DMA endpoint badged `device_badge`,
-    /// which the returned grant keeps. `None`, logged, when the table cannot
+    /// which the returned grant keeps. `None`, logged, when the tables cannot
     /// grow or the derivation fails; nothing is registered then.
     pub fn grant(
         &self,
         device_badge: u64,
+        requester_id: u64,
         confinement: Confinement,
         reserved: &[ReservedRange],
     ) -> Option<DmaGrant>
     {
+        {
+            let mut requesters = self
+                .shared
+                .requesters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if requesters.try_reserve(1).is_err()
+            {
+                std::os::seraph::log!(warn: "DMA table full; device {} not given DMA", device_badge);
+                return None;
+            }
+            requesters.push((device_badge, requester_id));
+        }
         if lock(&self.shared.table)
             .register(device_badge, confinement, reserved)
             .is_err()
         {
             std::os::seraph::log!(warn: "DMA table full; device {} not given DMA", device_badge);
+            self.shared.forget(device_badge);
             return None;
         }
         let Ok(cap) =
@@ -143,6 +197,7 @@ impl DmaService
         {
             std::os::seraph::log!(warn: "DMA capability not derived for device {}", device_badge);
             lock(&self.shared.table).withdraw(device_badge);
+            self.shared.forget(device_badge);
             return None;
         };
         Some(DmaGrant {
@@ -199,7 +254,9 @@ impl DmaGrant
                 self.device_badge
             );
         }
-        let Some(withdrawn) = lock(&self.shared.table).withdraw(self.device_badge)
+        let withdrawn = lock(&self.shared.table).withdraw(self.device_badge);
+        self.shared.forget(self.device_badge);
+        let Some(withdrawn) = withdrawn
         else
         {
             return Withdrawal {
@@ -208,7 +265,7 @@ impl DmaGrant
                 mappings: Vec::new(),
             };
         };
-        let blocked = match (withdrawn.confinement, self.shared.iommu.get())
+        let blocked = match (withdrawn.confinement, self.shared.client())
         {
             (Confinement::Domain { handle, .. }, Some(client)) => client.block(handle),
             _ => false,
@@ -319,6 +376,19 @@ fn serve(ep: u64, shared: &Shared)
         match msg.label
         {
             devmgr_dma_labels::DMA_MAP => handle_map(&msg, shared, ipc_buf),
+            devmgr_dma_labels::DMA_FAULTS =>
+            {
+                release_caps(msg.caps());
+                let reply_msg = if msg.word(0) == u64::from(ipc::DEVMGR_DMA_LABELS_VERSION)
+                {
+                    faults(shared, msg.badge)
+                }
+                else
+                {
+                    IpcMessage::new(devmgr_dma_errors::LABEL_VERSION_MISMATCH)
+                };
+                reply(&reply_msg, ipc_buf);
+            }
             devmgr_dma_labels::DMA_UNMAP =>
             {
                 release_caps(msg.caps());
@@ -435,12 +505,43 @@ fn map(msg: &IpcMessage, cap: u64, shared: &Shared) -> Result<u64, u64>
     Ok(mapping.device_addr)
 }
 
+/// The `DMA_FAULTS` reply for the device `badge`: whether an IOMMU confines
+/// it, and for a confined one the faults devmgr has taken for it and the
+/// latest's IOVA, after a take of the IOMMU driver's recorded faults
+/// ([`Iommu::log_faults`]), made with no lock of [`Shared`] held.
+fn faults(shared: &Shared, badge: u64) -> IpcMessage
+{
+    let Some(confinement) = lock(&shared.table).confinement(badge)
+    else
+    {
+        return IpcMessage::new(devmgr_dma_errors::UNAUTHORIZED);
+    };
+    let (confined, count, last) = match (confinement, shared.iommu.get())
+    {
+        (Confinement::Unconfined, _) => (0, 0, 0),
+        (Confinement::Domain { .. }, iommu) =>
+        {
+            let (count, last) = match (shared.requester(badge), iommu)
+            {
+                (Some(rid), Some(i)) => i.log_faults(rid),
+                _ => (0, 0),
+            };
+            (devmgr_dma_labels::DMA_CONFINED, count, last)
+        }
+    };
+    IpcMessage::builder(devmgr_dma_errors::SUCCESS)
+        .word(0, confined)
+        .word(1, count)
+        .word(2, last)
+        .build()
+}
+
 /// Have the IOMMU driver install `mapping` in the domain `handle`, moving it
 /// a derivation of the mapping's cap; the `devmgr_dma_errors` code when it
 /// does not.
 fn install(shared: &Shared, handle: u64, mapping: &Mapping) -> Result<(), u64>
 {
-    let Some(client) = shared.iommu.get()
+    let Some(client) = shared.client()
     else
     {
         return Err(devmgr_dma_errors::IOMMU_FAILED);
@@ -475,8 +576,7 @@ fn unmap(shared: &Shared, badge: u64, device_addr: u64) -> u64
     if let Confinement::Domain { handle, .. } = confinement
     {
         let removed = shared
-            .iommu
-            .get()
+            .client()
             .is_some_and(|c| c.unmap(handle, device_addr).is_ok());
         if !removed
         {

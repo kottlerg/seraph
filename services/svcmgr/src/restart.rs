@@ -236,7 +236,8 @@ pub fn walk_and_create_from_file(
         return None;
     }
     let reply_caps = reply.caps();
-    if reply_caps.len() < 2
+    let &[process_handle, thread_cap, ..] = reply_caps
+    else
     {
         std::os::seraph::log!(warn: "create: reply missing caps");
         // A label-0 reply means procmgr created the child; destroy it
@@ -247,10 +248,10 @@ pub fn walk_and_create_from_file(
             destroy_partial_child(process_handle, 0, ipc_buf);
         }
         return None;
-    }
+    };
     Some(CreatedProcess {
-        process_handle: reply_caps[0],
-        thread_cap: reply_caps[1],
+        process_handle,
+        thread_cap,
         child_badge,
     })
 }
@@ -330,7 +331,7 @@ pub fn handle_death(
 
     std::os::seraph::log!(
         "restarting (attempt {:#018x})",
-        u64::from(svc.restart_count + 1)
+        u64::from(svc.restart_count.saturating_add(1))
     );
 
     if !restart_process(svc, ctx, correlator, recipe, registry)
@@ -339,7 +340,8 @@ pub fn handle_death(
         return permanent_death_outcome(svc);
     }
 
-    svc.restart_count += 1;
+    // A restart count cannot meaningfully exceed its type, so it saturates.
+    svc.restart_count = svc.restart_count.saturating_add(1);
     std::os::seraph::log!("service restarted: {}", svc.name_str());
     DeathOutcome::Restarted
 }

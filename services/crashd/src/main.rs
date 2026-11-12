@@ -14,6 +14,9 @@
 //! declines the fault with the report's id as the reason. The mechanism and
 //! its limits are in services/crashd/docs/operation.md.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod arch;
 
 use std::sync::mpsc;
@@ -134,10 +137,12 @@ fn register(authority: u64, ipc_buf: *mut u64) -> Option<u64>
     match reply
     {
         Ok(r)
-            if r.label == procmgr_errors::SUCCESS && r.caps().first().is_some_and(|&c| c != 0) =>
+            if r.label == procmgr_errors::SUCCESS
+                && r.caps().split_first().is_some_and(|(&c, _)| c != 0) =>
         {
-            delete_caps(&r.caps()[1..]);
-            Some(r.caps()[0])
+            let (first, rest) = r.caps().split_first()?;
+            delete_caps(rest);
+            Some(*first)
         }
         Ok(r) =>
         {
@@ -200,11 +205,16 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
     };
     let mut lines: Vec<String> = Vec::new();
     report.emit(|line| lines.push(line.to_string()));
-    let mut logged = 0;
-    while logged < lines.len() && !fired(generation)
+    let mut logged = 0usize;
+    for line in &lines
     {
-        std::os::seraph::log!("{}", lines[logged]);
-        logged += 1;
+        if fired(generation)
+        {
+            break;
+        }
+        std::os::seraph::log!("{}", line);
+        // `line` came from `lines`, so `logged` stays at most `lines.len()`.
+        logged = logged.saturating_add(1);
     }
     let cancelled = BOUND.end(generation);
 
@@ -226,7 +236,7 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
     {
         lines.len()
     };
-    for line in &lines[resume..]
+    for line in lines.iter().skip(resume)
     {
         std::os::seraph::log!("{line}");
     }
@@ -481,11 +491,13 @@ fn read_code(thread: u64, ip: u64) -> Vec<u8>
     {
         return buf.to_vec();
     }
-    let to_page_end = usize::try_from(PAGE_SIZE - (ip % PAGE_SIZE)).unwrap_or(buf.len());
+    let to_page_end =
+        usize::try_from(PAGE_SIZE.saturating_sub(ip % PAGE_SIZE)).unwrap_or(buf.len());
     let len = to_page_end.min(buf.len());
-    if syscall::thread_read_mem(thread, ip, &mut buf[..len]).is_ok()
+    if let Some(head) = buf.get_mut(..len)
+        && syscall::thread_read_mem(thread, ip, head).is_ok()
     {
-        return buf[..len].to_vec();
+        return head.to_vec();
     }
     Vec::new()
 }
@@ -502,17 +514,23 @@ fn read_stack(thread: u64, sp: u64) -> Vec<u8>
     {
         let page_end = (at | (PAGE_SIZE - 1)).saturating_add(1);
         // At most one page: a page's bytes fit `chunk` and a `usize`.
-        let Ok(len) = usize::try_from(page_end.min(end) - at)
+        let span = page_end.min(end).saturating_sub(at);
+        let Ok(len) = usize::try_from(span)
         else
         {
             break;
         };
-        if syscall::thread_read_mem(thread, at, &mut chunk[..len]).is_err()
+        let Some(part) = chunk.get_mut(..len)
+        else
+        {
+            break;
+        };
+        if syscall::thread_read_mem(thread, at, part).is_err()
         {
             break;
         }
-        stack.extend_from_slice(&chunk[..len]);
-        at = at.saturating_add(page_end.min(end) - at);
+        stack.extend_from_slice(part);
+        at = at.saturating_add(span);
     }
     stack
 }
@@ -520,7 +538,10 @@ fn read_stack(thread: u64, sp: u64) -> Vec<u8>
 /// The register-file word at byte `offset`.
 fn word_at(file: &[u8], offset: usize) -> u64
 {
-    le_word(&file[offset..offset + 8])
+    offset
+        .checked_add(8)
+        .and_then(|end| file.get(offset..end))
+        .map_or(0, le_word)
 }
 
 /// A little-endian word from 8 bytes.

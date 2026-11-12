@@ -20,6 +20,9 @@
 //! The impure launch/restart machinery that consumes a parsed [`Definition`]
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 pub mod class;
 pub mod parse;
 pub mod restart_budget;
@@ -56,7 +59,7 @@ pub fn handover_permitted(badge: u64, handover_done: bool) -> bool
 #[must_use]
 pub fn blob_len(tokens: &[String]) -> usize
 {
-    tokens.iter().map(|t| t.len() + 1).sum()
+    tokens.iter().map(|t| t.len().saturating_add(1)).sum()
 }
 
 /// Build the NUL-separated, NUL-terminated wire blob procmgr's create

@@ -60,7 +60,8 @@ impl RestartBudget
         {
             return false;
         }
-        self.used += 1;
+        // `used` is below `RESTART_BURST`, so it cannot saturate.
+        self.used = self.used.saturating_add(1);
         true
     }
 }

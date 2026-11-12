@@ -45,6 +45,9 @@
 //! Idiomatic `std` only — no direct Seraph cap awareness. The demand-paged
 //! stack machinery lives entirely in `std::sys::thread` / `std::os::seraph`.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -135,7 +138,7 @@ fn recurse(depth: u64, direction: Direction) -> u64
     }
     let next = match direction
     {
-        Direction::Down => depth - 1,
+        Direction::Down => depth.saturating_sub(1),
         Direction::Up => depth.wrapping_add(1),
     };
     // Coerce to a fn pointer first, THEN black_box the pointer value — a

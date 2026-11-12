@@ -73,7 +73,11 @@ pub fn fs_remove(parent_cap: u64, name: &[u8], ipc_buf: *mut u64) -> Result<(), 
 /// `FS_RENAME` within a single directory. Returns `Ok(())` on success.
 pub fn fs_rename(dir_cap: u64, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
 {
-    let mut combined = Vec::with_capacity(src.len() + dst.len());
+    let mut combined = Vec::with_capacity(
+        src.len()
+            .checked_add(dst.len())
+            .expect("fs rename: combined name length overflowed"),
+    );
     combined.extend_from_slice(src);
     combined.extend_from_slice(dst);
     let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RENAME)
@@ -134,7 +138,13 @@ pub fn fs_read_bytes(
     // holds every u64 byte count.
     #[allow(clippy::cast_possible_truncation)]
     let n = reply.word(0) as usize;
-    Ok(reply.data_bytes()[8..8 + n].to_vec())
+    // A reply shorter than its length word is a server defect, not an error
+    // status: it panics rather than reach a caller that tolerates an `Err`.
+    let data = n
+        .checked_add(8)
+        .and_then(|end| reply.data_bytes().get(8..end))
+        .expect("fs read: reply shorter than its length word");
+    Ok(data.to_vec())
 }
 
 /// `FS_OPEN` on file node cap `node_cap`, carrying `release` (a release

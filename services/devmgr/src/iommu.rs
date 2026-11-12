@@ -623,8 +623,9 @@ impl Iommu
     /// addresses, the regions the firmware reserves for it: its confinement,
     /// whose IOVA limit is the smaller of the unit's width and `dma_width`
     /// (the device's DMA address width its driver declares; `None` for no
-    /// limit of its own), and those ranges, unconfined with none when no unit
-    /// translates it.
+    /// limit of its own) and which, behind a VT-d unit, keeps the interrupt
+    /// address range out of its IOVAs (`firmware::dma::INTERRUPT_RANGE`),
+    /// and those ranges, unconfined with none when no unit translates it.
     /// Logged `Err` when it is refused: the RIMT renames its device ID, its
     /// unit is not programmed, the driver has failed, its reserved regions
     /// overlap pooled memory, pass the unit's width, or are too many, or the
@@ -680,7 +681,15 @@ impl Iommu
             );
         }
         let limit = iova_limit(self.client.width(unit), dma_width);
-        Ok((Confinement::Domain { handle, limit }, reserved))
+        let interrupt_range = matches!(self.topology, Topology::Dmar { .. });
+        Ok((
+            Confinement::Domain {
+                handle,
+                limit,
+                interrupt_range,
+            },
+            reserved,
+        ))
     }
 
     /// The ranges the domain of `pci_dev`, which unit `unit` translates,

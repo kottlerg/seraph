@@ -187,7 +187,11 @@ pub fn fs_release_on_close_phase(_: &Caps)
             assert!(
                 buf.starts_with(prefix),
                 "fs_release_on_close: first-page content mismatch (got {:?})",
-                core::str::from_utf8(&buf[..prefix.len()]).unwrap_or("<non-utf8>"),
+                core::str::from_utf8(
+                    buf.get(..prefix.len())
+                        .expect("fs_release_on_close: buffer shorter than the page prefix")
+                )
+                .unwrap_or("<non-utf8>"),
             );
         }
     }
@@ -556,12 +560,14 @@ pub fn fs_request_bounds_phase(_: &Caps)
     let _ = fs_remove(svctest, name, ipc_buf);
     let (cap, _) = fs_create(svctest, name, ipc_buf).expect("FS_CREATE bounds failed");
     let pattern: Vec<u8> = (0..1024u32)
-        .map(|i| u8::try_from((i * 7 + 3) & 0xFF).unwrap_or(0))
+        .map(|i| u8::try_from(i.wrapping_mul(7).wrapping_add(3) & 0xFF).unwrap_or(0))
         .collect();
     for (i, chunk) in pattern.chunks(INLINE_MAX).enumerate()
     {
-        fs_write_inline(cap, (i * INLINE_MAX) as u64, chunk, ipc_buf)
-            .expect("FS_WRITE bounds failed");
+        let offset = i
+            .checked_mul(INLINE_MAX)
+            .expect("fs_request_bounds: write offset overflowed");
+        fs_write_inline(cap, offset as u64, chunk, ipc_buf).expect("FS_WRITE bounds failed");
     }
 
     // A sector-aligned read of a whole sector or more filled 65 reply words.
@@ -577,7 +583,9 @@ pub fn fs_request_bounds_phase(_: &Caps)
         );
         assert_eq!(
             &got[..],
-            &pattern[..INLINE_MAX],
+            pattern
+                .get(..INLINE_MAX)
+                .expect("fs_request_bounds: pattern shorter than one inline read"),
             "fs_request_bounds: FS_READ bytes"
         );
     }
@@ -604,7 +612,9 @@ pub fn fs_request_bounds_phase(_: &Caps)
     let got = fs_read_bytes(cap, 0, 16, ipc_buf).expect("fs_request_bounds: FS_READ after");
     assert_eq!(
         &got[..],
-        &pattern[..16],
+        pattern
+            .get(..16)
+            .expect("fs_request_bounds: pattern shorter than 16 bytes"),
         "fs_request_bounds: fatfs still serves reads"
     );
 
@@ -657,7 +667,10 @@ pub fn fs_write_memory_phase(_: &Caps)
     unsafe {
         for i in 0..WRITE_LEN
         {
-            *((va + i as u64) as *mut u8) = u8::try_from(i & 0xFF).unwrap_or(0);
+            let addr = va
+                .checked_add(i as u64)
+                .expect("fs_write_memory: source page address overflowed");
+            *(addr as *mut u8) = u8::try_from(i & 0xFF).unwrap_or(0);
         }
     }
 
@@ -694,9 +707,14 @@ pub fn fs_write_memory_phase(_: &Caps)
     let mut total = 0;
     while total < WRITE_LEN
     {
-        let n = read_retrying(&mut f, &mut buf[total..]).expect("read wrtf.bin");
+        let rest = buf
+            .get_mut(total..)
+            .expect("fs_write_memory: read offset past the buffer");
+        let n = read_retrying(&mut f, rest).expect("read wrtf.bin");
         assert!(n > 0, "short read at offset {total}");
-        total += n;
+        total = total
+            .checked_add(n)
+            .expect("fs_write_memory: read total overflowed");
     }
     for (i, &b) in buf.iter().enumerate()
     {
@@ -826,7 +844,10 @@ pub fn fs_write_invariants_phase(_: &Caps)
             1,
             "a refused FS_WRITE_MEMORY must return its source cap"
         );
-        let tag = syscall::cap_info(returned[0], syscall::CAP_INFO_TAG_RIGHTS)
+        let returned_cap = *returned
+            .first()
+            .expect("a refused FS_WRITE_MEMORY must return its source cap");
+        let tag = syscall::cap_info(returned_cap, syscall::CAP_INFO_TAG_RIGHTS)
             .map(|tr| u8::try_from(tr >> 32).unwrap_or(0))
             .expect("cap_info on the returned source cap failed");
         assert_eq!(
@@ -834,7 +855,7 @@ pub fn fs_write_invariants_phase(_: &Caps)
             syscall::CAP_TAG_MEMORY,
             "the cap a refused FS_WRITE_MEMORY returns must be the Memory cap"
         );
-        let _ = syscall::cap_delete(returned[0]);
+        let _ = syscall::cap_delete(returned_cap);
 
         let _ = syscall::cap_delete(child_cap);
         let _ = syscall::cap_delete(parent_attenuated);
@@ -889,18 +910,13 @@ pub fn fs_write_invariants_phase(_: &Caps)
         let pattern_a = vec![0xA5u8; CLUSTER];
         let pattern_b = vec![0x5Au8; CLUSTER];
         let write_pattern = |cap: u64, base: usize, src: &[u8]| {
-            let mut written = 0usize;
-            while written < src.len()
+            for (k, chunk) in src.chunks(INLINE_CHUNK).enumerate()
             {
-                let n = (src.len() - written).min(INLINE_CHUNK);
-                fs_write_inline(
-                    cap,
-                    (base + written) as u64,
-                    &src[written..written + n],
-                    ipc_buf,
-                )
-                .expect("inline write chunk");
-                written += n;
+                let offset = k
+                    .checked_mul(INLINE_CHUNK)
+                    .and_then(|written| base.checked_add(written))
+                    .expect("fs_write_invariants: inline write offset overflowed");
+                fs_write_inline(cap, offset as u64, chunk, ipc_buf).expect("inline write chunk");
             }
         };
         write_pattern(cap, 0, &pattern_a);
@@ -908,7 +924,7 @@ pub fn fs_write_invariants_phase(_: &Caps)
 
         let _ = syscall::cap_delete(cap);
         let (cap, _, size) = ns_lookup(svctest, name, 0xFFFF, ipc_buf).expect("lookup inv_chain");
-        assert_eq!(size, 2 * CLUSTER as u64, "expected 8 KiB after AB writes");
+        assert_eq!(size, (2 * CLUSTER) as u64, "expected 8 KiB after AB writes");
 
         fs_write_inline(cap, (4 * CLUSTER) as u64, b"Z", ipc_buf).expect("write Z past EOC");
 
@@ -1017,7 +1033,7 @@ pub fn fs_long_name_insert_phase(_: &Caps)
         crate::ipc_util::ns::ns_readdir(dir, idx, ipc_buf).expect("NS_READDIR lfnd failed")
     {
         listed |= entry == name;
-        idx += 1;
+        idx = idx.checked_add(1).expect("fs lfn: readdir index overflow");
     }
     assert!(listed, "NS_READDIR of lfnd does not list {name:?}");
 
@@ -1103,7 +1119,7 @@ pub fn fs_write_size_bound_phase(_: &Caps)
     let _ = fs_remove(svctest, name, ipc_buf);
     let (cap, _) = fs_create(svctest, name, ipc_buf).expect("FS_CREATE bigoff failed");
 
-    for offset in [u64::from(u32::MAX) - 3, 1u64 << 32]
+    for offset in [u64::from(u32::MAX - 3), 1u64 << 32]
     {
         assert_eq!(
             fs_write_inline(cap, offset, &[0x33; 8], ipc_buf).err(),
@@ -1144,7 +1160,10 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     // held and closed (2 x (`fs_opens::HELD_FILES` + 2): the eviction phase
     // holds two openers beside its Files). Four times the ceiling and 512
     // more clears that at every RAM size.
-    let requests = 4 * fatfs_slot_ceiling(ipc_buf) + 512;
+    let requests = fatfs_slot_ceiling(ipc_buf)
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(512))
+        .expect("fs_cap_drop: request count overflowed");
 
     let svctest = svctest_dir_cap(ipc_buf);
 
@@ -1251,9 +1270,14 @@ impl HeldPage
     /// finding no slot it may reuse.
     fn take(open: u64, index: usize, ipc_buf: *mut u64) -> Option<Self>
     {
-        let cookie = 0x5107_0000 + index as u64;
+        let cookie = 0x5107_0000u64
+            .checked_add(index as u64)
+            .expect("slot reuse: page cookie overflowed");
+        let offset = index
+            .checked_mul(SLOT_REUSE_PAGE)
+            .expect("slot reuse: page offset overflowed");
         let read = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
-            .word(0, (index * SLOT_REUSE_PAGE) as u64)
+            .word(0, offset as u64)
             .word(1, cookie)
             .build();
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
@@ -1314,16 +1338,25 @@ impl HeldPage
     /// Assert the mapped page still shows its own page's tag.
     fn check(&self, when: &str)
     {
-        let va = self.range.va_start() + self.data_offset;
+        let va = self
+            .range
+            .va_start()
+            .checked_add(self.data_offset)
+            .expect("slot reuse: held page address overflowed");
         for g in 0..8u64
         {
             let mut group = [0u8; 8];
             for (i, b) in group.iter_mut().enumerate()
             {
+                let addr = g
+                    .checked_mul(8)
+                    .and_then(|off| va.checked_add(off))
+                    .and_then(|a| a.checked_add(i as u64))
+                    .expect("slot reuse: held page byte address overflowed");
                 // SAFETY: the range maps one readable page and data_offset + 64
                 // lies in it (the reply's bytes_valid of at least 64 is bounded
                 // by the page).
-                *b = unsafe { core::ptr::read_volatile((va + g * 8 + i as u64) as *const u8) };
+                *b = unsafe { core::ptr::read_volatile(addr as *const u8) };
             }
             assert_eq!(
                 group,
@@ -1359,8 +1392,13 @@ pub(crate) fn slot_reuse_file(ipc_buf: *mut u64) -> usize
 {
     use std::io::Write;
 
-    let pages = fatfs_slot_ceiling(ipc_buf) + FATFS_QUARANTINE_MAX + SLOT_REUSE_MARGIN;
-    let size = (pages * SLOT_REUSE_PAGE) as u64;
+    let pages = fatfs_slot_ceiling(ipc_buf)
+        .checked_add(FATFS_QUARANTINE_MAX)
+        .and_then(|n| n.checked_add(SLOT_REUSE_MARGIN))
+        .expect("slot reuse: page count overflowed");
+    let size = pages
+        .checked_mul(SLOT_REUSE_PAGE)
+        .expect("slot reuse: file size overflowed") as u64;
     if std::fs::metadata(SLOT_REUSE_PATH).is_ok_and(|m| m.len() == size)
     {
         return pages;
@@ -1385,7 +1423,10 @@ fn read_slot_reuse_file(path: &str, skip: usize, pages: usize)
     use std::io::{Seek, SeekFrom};
 
     let mut f = std::fs::File::open(path).expect("slot reuse: reopen");
-    f.seek(SeekFrom::Start((skip * SLOT_REUSE_PAGE) as u64))
+    let start = skip
+        .checked_mul(SLOT_REUSE_PAGE)
+        .expect("slot reuse: seek offset overflowed");
+    f.seek(SeekFrom::Start(start as u64))
         .expect("slot reuse: seek");
     let mut page = vec![0u8; SLOT_REUSE_PAGE];
     for i in skip..pages
@@ -1393,11 +1434,21 @@ fn read_slot_reuse_file(path: &str, skip: usize, pages: usize)
         let mut got = 0;
         while got < SLOT_REUSE_PAGE
         {
-            let n = read_retrying(&mut f, &mut page[got..]).expect("slot reuse: read a page");
+            let rest = page
+                .get_mut(got..)
+                .expect("slot reuse: read offset past the page");
+            let n = read_retrying(&mut f, rest).expect("slot reuse: read a page");
             assert_ne!(n, 0, "slot reuse: early end of file");
-            got += n;
+            got = got
+                .checked_add(n)
+                .expect("slot reuse: read total overflowed");
         }
-        assert_eq!(page[..8], page_tag(i), "slot reuse: page {i}");
+        assert_eq!(
+            page.get(..8)
+                .expect("slot reuse: page shorter than its tag"),
+            page_tag(i),
+            "slot reuse: page {i}"
+        );
     }
 }
 
@@ -1461,7 +1512,10 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
         "slot reuse: fatfs refused after {count} held pages; spares never replaced a slot"
     );
     assert!(
-        count <= slots + FATFS_QUARANTINE_MAX,
+        count
+            <= slots
+                .checked_add(FATFS_QUARANTINE_MAX)
+                .expect("slot reuse: slot limit overflowed"),
         "slot reuse: fatfs held {count} pages without refusing; the quarantine is unbounded"
     );
     for page in &held

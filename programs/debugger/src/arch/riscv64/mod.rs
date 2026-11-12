@@ -72,7 +72,10 @@ fn read_instruction(th: u64, pc: u64) -> u32
     {
         return u32::from(low);
     }
-    syscall::thread_read_mem(th, pc + 2, &mut parcel).expect("read the debuggee's instruction");
+    let high = pc
+        .checked_add(2)
+        .expect("the instruction's second parcel has an address");
+    syscall::thread_read_mem(th, high, &mut parcel).expect("read the debuggee's instruction");
     u32::from(low) | (u32::from(u16::from_le_bytes(parcel)) << 16)
 }
 
@@ -85,10 +88,13 @@ fn plant_successor(th: u64, regs: &[u8]) -> Step
 {
     let pc = read_word(regs, IP);
     let next = riscv_step::successor(pc, read_instruction(th, pc), |n| {
-        read_word(
-            regs,
-            syscall_abi::REGS_RISCV64_X1_OFFSET + (n as usize - 1) * 8,
-        )
+        // `xN` for `N` in 1..=31 lies at `X1_OFFSET + (N - 1) * 8`.
+        let offset = (n as usize)
+            .checked_sub(1)
+            .and_then(|i| i.checked_mul(8))
+            .and_then(|o| o.checked_add(syscall_abi::REGS_RISCV64_X1_OFFSET))
+            .expect("riscv_step reads x1..=x31 only");
+        read_word(regs, offset)
     })
     .expect("the instruction has a successor");
     let mut saved = [0u8; 2];
@@ -135,16 +141,17 @@ pub fn arm_step(th: u64, regs: &mut [u8]) -> Step
 /// restoring the text and planting the next step's.
 pub fn single_step(ep: u64, ipc_buf: *mut u64, th: u64, reported: u64, mut step: Step)
 {
-    for k in 1..=3
+    for k in 1..=3u64
     {
         let ip = recv_exception(ep, ipc_buf, syscall_abi::FAULT_EXC_BREAKPOINT);
         let at = restore(th, step);
         assert_eq!(ip, at, "a step stopped away from its breakpoint");
-        assert_eq!(
-            ip,
-            reported + RESUME_ADVANCE + 4 * k,
-            "a step reported the wrong instruction"
-        );
+        let expected = k
+            .checked_mul(4)
+            .and_then(|d| d.checked_add(RESUME_ADVANCE))
+            .and_then(|d| reported.checked_add(d))
+            .expect("the stepped instruction has an address");
+        assert_eq!(ip, expected, "a step reported the wrong instruction");
         if k < 3
         {
             let mut regs = [0u8; REGS_BYTES];

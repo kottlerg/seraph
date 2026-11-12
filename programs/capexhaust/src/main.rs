@@ -30,6 +30,9 @@
 //! Driven by `services/svctest`'s `recv_wedge` phase, which spawns this
 //! binary, waits for exit, and asserts the exit code.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 /// `RecvGuard` diagnostic hook. The `First` line doubles as evidence that
 /// logging still works from a fully exhausted `CSpace` (`STREAM_BYTES`
 /// messages and their replies carry no caps).
@@ -112,7 +115,7 @@ fn main() -> !
     {
         match syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND)
         {
-            Ok(_) => derived += 1,
+            Ok(_) => derived = derived.saturating_add(1),
             Err(e) => break e,
         }
     };
@@ -129,7 +132,7 @@ fn main() -> !
     let mut landed: u64 = 0;
     while request_one_page(info.memmgr_endpoint, ipc_buf).is_some()
     {
-        landed += 1;
+        landed = landed.saturating_add(1);
         assert!(
             landed <= RESERVE_GRANTS_MAX,
             "more grants landed than the IPC receive reserve holds"

@@ -225,7 +225,9 @@ devmgr returns every device address; no driver chooses one. With an IOMMU confin
 the address is an IOVA in the device's domain, which devmgr allocates first fit from 1 MiB below
 the device's limit (the width the device's remapping unit translates, narrowed to the DMA address
 width the device's driver declares; [limits.md](limits.md)), outside every firmware-reserved range
-the domain maps at its own address, and the mapping is installed in the IOMMU's tables, through the
+the domain maps at its own address and, behind a VT-d unit, outside the interrupt address range
+`0xFEE0_0000` to `0xFEEF_FFFF`, whose writes VT-d takes as interrupt requests and never translates
+(Intel VT-d specification § 3.14), and the mapping is installed in the IOMMU's tables, through the
 IOMMU driver (§ IOMMU Discovery and Programming), before devmgr replies, and withdrawn from them
 before devmgr deletes its cap at `DMA_UNMAP`, so the device reaches exactly the frames mapped for
 it and its reserved ranges. With none, the device can reach memory only at physical
@@ -331,13 +333,14 @@ emulation) stops when the driver reports ready.
 
 A device's message-signalled interrupt is a write to an interrupt address. On x86-64 VT-d does not
 translate a write to the interrupt range through a domain's tables (interrupt remapping governs
-it), so `iommu-vtd` refuses `MAP_MSI`. On riscv64 the write goes to a hart's IMSIC interrupt file
-and the RISC-V IOMMU translates it as any other DMA, so a confined device reaches only the files
-its domain maps: `MAP_MSI` maps one file's page at its own address, with no cap, for the domain's
-life, as `MAP_RESERVED` does a reserved range. devmgr maps the file of each hart a device's
-message-signalled targets sit on before it enables the device's MSI or MSI-X, and keeps the file's
-page out of the IOVAs it gives the device's mappings (§ Message-Signaled Interrupts). Why the RISC-V
-IOMMU's MSI page tables stay off is specified in
+it), so `iommu-vtd` refuses `MAP_MSI`, and devmgr gives no mapping of a device a VT-d unit
+confines an IOVA in that range, where the device's DMA would never reach it. On riscv64 the write
+goes to a hart's IMSIC interrupt file and the RISC-V IOMMU translates it as any other DMA, so a
+confined device reaches only the files its domain maps: `MAP_MSI` maps one file's page at its own
+address, with no cap, for the domain's life, as `MAP_RESERVED` does a reserved range. devmgr maps
+the file of each hart a device's message-signalled targets sit on before it enables the device's
+MSI or MSI-X, and keeps the file's page out of the IOVAs it gives the device's mappings
+(§ Message-Signaled Interrupts). Why the RISC-V IOMMU's MSI page tables stay off is specified in
 [services/drivers/iommu/riscv/README.md](../services/drivers/iommu/riscv/README.md#msi-confinement)
 § MSI Confinement.
 
@@ -530,11 +533,11 @@ the declared reset; it deletes its cap on the table's pages, and a target is fre
 remains. The table's entries keep their messages until the next bind masks and rewrites them before
 it enables MSI-X again.
 
-devmgr is the one writer of every message: no driver is delivered the pages holding its function's
-MSI-X table or Pending Bit Array. devmgr withholds each structure's pages, its span rounded out to
-the 4 KiB a function keeps it apart from other registers in (PCI Local Bus Specification r3.0
-§ 6.8.2), from every driver of a function it may give MSI-X, and delivers the rest of each BAR as
-up to three `Mmio` ranges, each naming its offset in its BAR
+devmgr is the one writer of every message: no driver of a function devmgr may give MSI-X is
+delivered the pages holding that function's MSI-X table or Pending Bit Array. devmgr withholds each
+structure's pages, its span rounded out to the 4 KiB a function keeps it apart from other registers
+in (PCI Local Bus Specification r3.0 § 6.8.2), from every such driver, and delivers the rest of
+each BAR as up to three `Mmio` ranges, each naming its offset in its BAR
 ([driver-binding.md](driver-binding.md#binding) § Binding). A driver therefore neither retargets
 nor masks a vector: it names its vectors in its device's own registers and suppresses its device's
 interrupts at the device (VirtIO's `NO_VECTOR` and event suppression; NVMe's and a NIC's per-queue
@@ -542,7 +545,11 @@ interrupt enables). A VirtIO function is given MSI-X only when every one of its 
 lies clear of those pages, since its driver needs them; otherwise devmgr delivers them and the
 function falls back to its wired line. A VirtIO function is given no MSI, since VirtIO over PCI
 signals by MSI-X vectors or its wired line alone (VirtIO 1.2 § 4.1.4.5, § 4.1.5.1.2;
-`firmware::pci::deliverable_messages`).
+`firmware::pci::deliverable_messages`). The RISC-V IOMMU driver is delivered the first page of its
+unit's BAR 0, the unit's registers (§ IOMMU Discovery and Programming), which hold the unit's MSI
+configuration table (`msi_cfg_tbl`, RISC-V IOMMU specification); devmgr gives the unit no vectors,
+and the driver keeps the unit's interrupts off and polls its queues, so no message is written
+there.
 
 On x86-64, until VT-d interrupt remapping is programmed
 ([#325](https://github.com/kottlerg/seraph/issues/325)), a device whose DMA engine writes to the

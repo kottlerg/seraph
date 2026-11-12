@@ -1065,11 +1065,21 @@ fn clippy_check_ext(
     run_cmd(&mut cmd)
 }
 
-/// Construct a `cargo` Command with the working directory set to the workspace root.
+/// The environment every cargo command of the build runs with, so a local
+/// build compiles what CI's jobs compile: the Rust cache action of
+/// `.github/workflows/build-test.yml` writes `CARGO_INCREMENTAL=0` to the job
+/// environment, and an incremental `dev` build partitions codegen units, and
+/// so orders a binary's statics, differently from a non-incremental one
+/// (`docs/build-system.md` § Build Profiles).
+const CI_CARGO_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
+
+/// Construct a `cargo` Command with the working directory set to the workspace
+/// root and [`CI_CARGO_ENV`] applied.
 fn cargo(root: &Path) -> Command
 {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root);
+    cmd.envs(CI_CARGO_ENV);
     cmd
 }
 
@@ -1135,6 +1145,17 @@ fn debug_config_flags(args: &BuildArgs, pkg: &str) -> Vec<String>
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn every_cargo_command_builds_without_incremental_compilation()
+    {
+        let cmd = cargo(Path::new("."));
+        let incremental = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "CARGO_INCREMENTAL")
+            .and_then(|(_, value)| value);
+        assert_eq!(incremental, Some(std::ffi::OsStr::new("0")));
+    }
 
     #[test]
     fn an_arch_only_component_is_refused_on_another_arch()

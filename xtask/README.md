@@ -70,6 +70,10 @@ The sysroot is architecture-specific. Building for a different arch than the
 existing sysroot is an error — run `cargo xtask clean` first (per
 [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
 
+Every cargo command of the build runs with `CARGO_INCREMENTAL=0`, as CI's jobs build, so a local
+build of a commit lays out its binaries as CI's does (see
+[Build Profiles](../docs/build-system.md#build-profiles)).
+
 ---
 
 ### `cargo xtask run`

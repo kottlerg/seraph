@@ -167,6 +167,14 @@ and `release` but writes their output to `target/<triple>/debug/` and
 `target/<triple>/release/`; the CI cells and branch-protection status checks
 use the directory names `debug`/`release`.
 
+`cargo xtask build` runs every cargo command with `CARGO_INCREMENTAL=0`, the
+value the Rust cache action of CI's jobs writes to their environment
+(Continuous Integration below). Incremental compilation, which Cargo enables by
+default for `dev`, partitions a crate's codegen units differently, and so
+orders a binary's statics differently; with it off, a local `dev` build of a
+commit lays out its binaries as CI's build of that commit does. `release`
+builds no crate incrementally either way.
+
 ### Debuginfo is opt-in
 
 `debug = 0` means a plain `cargo xtask build` (or `--release`) emits no

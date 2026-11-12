@@ -2345,6 +2345,32 @@ pub mod test_dma_labels
     pub const INTERRUPT_PROBE: u64 = 2;
     /// How long the [`INTERRUPT_PROBE`] waits for the interrupt it raised.
     pub const INTERRUPT_WAIT_MS: u64 = 2000;
+    /// Run the interrupt churn: while a thread of the fixture has the device
+    /// raise its interrupt in a loop, delete the bound `Interrupt` cap (case
+    /// [`CHURN_BOUND_CAP`]), then the bound notification's last cap and the
+    /// binding's cap (case [`CHURN_NOTIFICATION`]); after each case, bind a
+    /// copy of the interrupt, derived before the case, to a new notification
+    /// and run the [`INTERRUPT_PROBE`] through it, which the binding left
+    /// after the churn then serves. Request: no data. Reply: `SUCCESS` with
+    /// `data[0]` = the cases whose next binding received the device's
+    /// interrupt, one bit each, `data[1]` = the kind of interrupt held (as
+    /// for [`INTERRUPT_PROBE`]), and `data[2]` = the raises the loop made.
+    /// Any other reply label is a setup failure.
+    pub const INTERRUPT_CHURN: u64 = 3;
+    /// [`INTERRUPT_CHURN`] case bit: the bound `Interrupt` cap deleted.
+    pub const CHURN_BOUND_CAP: u64 = 1 << 0;
+    /// [`INTERRUPT_CHURN`] case bit: the bound notification's last cap
+    /// deleted, then the binding's cap.
+    pub const CHURN_NOTIFICATION: u64 = 1 << 1;
+    /// Reply `SUCCESS`, have the device raise its interrupt and leave it
+    /// raised, and exit after [`EXIT_DELAY_MS`] without receiving again, so
+    /// devmgr releases the device and frees its message-signaled target.
+    /// Request: no data. No fixture serves the class for the rest of the
+    /// boot.
+    pub const FIXTURE_EXIT: u64 = 4;
+    /// How long the fixture waits between its [`FIXTURE_EXIT`] reply and its
+    /// exit.
+    pub const EXIT_DELAY_MS: u64 = 100;
 }
 
 /// Why [`report_driver_ready`] failed.

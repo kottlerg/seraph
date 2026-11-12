@@ -689,7 +689,8 @@ to refuse an object another slot names
 ([syscalls.md](syscalls.md#sys_memory_split-33) § `SYS_MEMORY_SPLIT`).
 
 The count is 32 bits wide and cannot wrap. The references userspace can multiply without a bound of
-their own, new capability slots, retype leases, and death-observer bindings, are refused at
+their own, new capability slots, retype leases, death-observer bindings, and interrupt bindings, are
+refused at
 `REF_COUNT_LIMIT` (2^31) with `QuotaExceeded`: a copy, derivation, badged derivation, or move takes
 its new slot's reference through `KernelObjectHeader::try_inc_ref`, the one checked increment (a
 move's destination counts because a move its liveness backstop abandons leaves both slots live; an
@@ -697,7 +698,8 @@ IPC transfer instead checks every cap of its message before its first move, so i
 none, and its moves take their references unchecked), and `retype_allocate` refuses a retype from a
 Memory object whose count is at the limit, before the new object takes its lease; a death-observer
 bind takes its reference on the queue through `try_inc_ref` too, since the queue's creator funds any
-number of observer nodes. The limit is correct as is, not one a workload meets: each such reference
+number of observer nodes, and `SYS_IRQ_REGISTER` takes a binding's reference on its Notification
+the same way. The limit is correct as is, not one a workload meets: each such reference
 costs a 72-byte slot, a retype child of at least 128 bytes, or a 24-byte observer node, so 2^31 of
 them hold at least 48 GiB against one object, and reaching it refuses instead of corrupting. Every
 other reference is taken unchecked, in the 2^31 of headroom between the limit and `u32::MAX`,
@@ -758,6 +760,12 @@ The principal kernel-internal owners:
   thread or on a faulting thread of the live address space, so the owner, and with it every observer
   reference, outlives every post. A bind after the death posts at once under the binder's
   syscall pin and takes no reference.
+- **Interrupt bindings.** A bound `Interrupt` binding holds a reference on its Notification's
+  object, taken by `SYS_IRQ_REGISTER` through `try_inc_ref` and released only by the change that
+  takes the notification from the binding (a rebind to another notification, or the binding's
+  removal when its Interrupt object is freed, `irq::unregister`), once no delivery can still hold
+  the notification. A Notification a binding names is therefore not freed
+  ([§ Interrupt Bindings](#interrupt-bindings)).
 - **Syscall pins.** Every syscall that resolves a handle to use the object it names
   holds a reference on that object for as long as it uses it: `syscall::pin_slot` (and
   `lookup_cap` through it) takes it under the slot's CSpace lock and returns it as a
@@ -889,23 +897,28 @@ after the rebuild.
 ### Interrupt Bindings
 
 An `InterruptObject` carries one binding (`irq::IrqBinding`): unbound until `SYS_IRQ_REGISTER`
-through it, and then linked in its line's binding list in the IRQ routing table with one bit of
-the line's bound and owing masks (`core/kernel/src/irq.rs`, module doc § Sharing). Since a copy is a
+through it, and then linked in its line's binding list in the IRQ routing table with one bit of the
+line's bound and owing masks (`core/kernel/src/irq.rs`, module doc § Sharing). Since a copy is a
 fresh object, each capability to a line is a binding of its own, and a line holds at most
 `irq::MAX_IRQ_BINDINGS` (64). The object's `dealloc_object` arm removes its binding
-(`irq::unregister`) before the body goes: under the IRQ routing lock it unlinks the binding,
-clears its bits, waits out the deliveries in flight on the line, and unmasks or releases the line,
-so no delivery reaches the freed body and the other bindings on the line stay. A Notification's
-teardown removes every binding naming it the same way (`irq::unregister_notification`), leaving
-those Interrupt objects unbound. A range capability (more than one line) never binds, and its arm
-finds nothing to remove.
+(`irq::unregister`) before the body goes: under the IRQ routing lock it unlinks the binding, clears
+its bits, waits out the delivery running on the line's CPU (`irq::DeliveryGate`, one per CPU), and
+unmasks or releases the line, so no delivery reaches the freed body and the other bindings on the
+line stay. A bound binding holds a counted reference on its Notification's object, taken by
+`SYS_IRQ_REGISTER` and given up only by the change that takes the notification from the binding (a
+rebind to another notification, or this removal), so a Notification is freed only once no binding
+names it: its teardown makes no IRQ change, and deleting a Notification's capabilities leaves its
+bindings in place until their Interrupt objects rebind or are freed. A range capability (more
+than one line) never binds, and its arm finds nothing to remove.
 
 A message-signaled target's capability (`SYS_IRQ_MSG_ALLOC`) is the root of a lineage of its own
 over its one id (`irq::is_message`), and every copy or derivation of it is a member of that
-lineage. Its target outlives any one object: the `dealloc_object` arm frees it
-(`irq::free_message`, which releases the CPU's slot and returns the id to the pool) only when
-the release frees the lineage's root body, once no object of the lineage is left, so no capability
-can name an id a later mint reuses.
+lineage. The root body, funded from the minting CSpace's pool, is the target's state: the slot's
+entry on the target's CPU (`irq::SlotEntry`) anchors its binding, and the id is computed from the
+CPU and slot (`irq::message_id`). The target outlives any one object: the `dealloc_object` arm
+frees it (`irq::free_message`, which releases the CPU's slot) only when the release frees the
+lineage's root body, once no object of the lineage is left, and the body's funding returns to the
+minting CSpace's pool, so no capability can name an id a later mint reuses.
 
 ---
 
@@ -1093,8 +1106,9 @@ was parked on only through its binding, re-read under the thread's `sched_lock`,
 source not yet freed (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
 § `dealloc_object(Thread)` Drain Protocol, step 11). A waker that claimed the thread holds the
-source live until its wake nulls the binding: device IRQ delivery through its line's in-flight
-count, which the Notification teardown waits out (`irq::unregister_notification`), fault delivery
+source live until its wake nulls the binding: device IRQ delivery through the reference its
+binding holds on the Notification, which a change gives up only after waiting out the CPU's
+delivery gate (`irq::DeliveryGate`), fault delivery
 through the reference it pins on the handler endpoint, and the death post through the observer
 binding's reference on its `EventQueue` (§ Kernel Object Reference Counting).
 

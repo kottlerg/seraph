@@ -526,7 +526,8 @@ unsafe fn kernel_entry_post_rebase(
     kprintln!("interrupts ok");
     // Size the IRQ routing table from the interrupt controllers the init above
     // discovered (x86-64: the I/O APICs' GSIs; riscv64: the APLIC's sources),
-    // before any line is routed (Phase 9 on).
+    // and allocate one delivery gate per boot CPU, before any line is routed or
+    // message target minted (Phase 9 on).
     #[cfg(not(test))]
     irq::init_table(arch::current::interrupts::irq_line_count(), allocator);
     // Install per-CPU GS-base (x86-64) / tp (RISC-V) for the BSP.

@@ -44,13 +44,13 @@
 //! has nothing latched before it, so its one raise is forwarded once, and
 //! step 2's quiet check needs no emptying.
 //!
-//! Then the line and 63 of its copies, bound to one notification, fill the
-//! line's `MAX_IRQ_BINDINGS` (64) bindings: one more copy's registration
-//! returns `QuotaExceeded`, and succeeds once a binding goes. Deleting that
-//! notification removes every binding naming it: none having acknowledged,
-//! any binding left would keep the line masked, yet once a fresh copy binds a
-//! fresh notification and acknowledges, a raise signals it; the 64 caps then
-//! bind again.
+//! Then 64 copies of the line, bound to one notification, fill the line's
+//! `MAX_IRQ_BINDINGS` (64) bindings: one more copy's registration returns
+//! `QuotaExceeded`, and succeeds once a binding goes. Deleting that
+//! notification's only capability removes no binding, since each holds a
+//! reference on it, so a further copy is still refused; once the 64 are
+//! rebound to a fresh notification, which frees the first, and all
+//! acknowledge, a raise signals the fresh one.
 //!
 //! Last, the line's mode (`IRQ_MODE_*` in `abi/syscall`): a first binding
 //! records level-triggered, active-high; a second binding passing another mode
@@ -181,17 +181,16 @@ fn shared_line(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 }
 
 /// The line's binding bound: [`MAX_IRQ_BINDINGS`] bindings fit, one more is
-/// refused, and a freed binding makes room; then the teardown of the one
-/// notification every binding names removes them all, and the line binds and
-/// delivers again.
+/// refused, and a freed binding makes room; then deleting the capability of
+/// the one notification every binding names leaves every binding in place,
+/// and once they are rebound to a fresh notification and acknowledged, the
+/// line delivers to it. Every binding is a copy's, so the scenario's release
+/// leaves the line unbound for the next.
 fn binding_bound(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
     let ntf = held.push(notification(ctx)?);
-    // `bound[0]` is the line's own cap; the rest are its copies.
-    let mut bound = [line; MAX_IRQ_BINDINGS];
-    irq_register(line, ntf, 0)
-        .map_err(|_| "integration::irq_shared_line: binding the line refused")?;
-    for slot in &mut bound[1..]
+    let mut bound = [0; MAX_IRQ_BINDINGS];
+    for slot in &mut bound
     {
         *slot = held.push(derive(line)?);
         irq_register(*slot, ntf, 0)
@@ -207,28 +206,30 @@ fn binding_bound(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
         .map_err(|_| "integration::irq_shared_line: a freed binding did not make room")?;
     bound[1] = extra;
 
-    // Every binding has owed since it was taken, none having acknowledged, so
-    // one the teardown left in place would keep the line masked below. The
-    // probe is a fresh copy, so no binding left in place is rebound or
-    // acknowledged by it (a registration through a binding still in place
-    // succeeds as a rebind).
+    // The bindings hold the notification: deleting its only capability
+    // removes none of them, so the line is still full.
     cap_delete(ntf).map_err(|_| "integration::irq_shared_line: cap_delete(notification) failed")?;
     let fresh = held.push(notification(ctx)?);
     let probe = held.push(derive(line)?);
-    irq_register(probe, fresh, 0)
-        .map_err(|_| "integration::irq_shared_line: binding a probe after the teardown refused")?;
-    acknowledge(&[probe])?;
-    raise_expect(
-        &[fresh],
-        &[],
-        "a binding outlived its notification's teardown",
-    )?;
-    cap_delete(probe).map_err(|_| "integration::irq_shared_line: cap_delete(probe) failed")?;
-    // The 64 caps bind again, filling the line.
+    if irq_register(probe, fresh, 0) != Err(SyscallError::QuotaExceeded as i64)
+    {
+        return Err(
+            "integration::irq_shared_line: deleting the notification's capability removed a binding",
+        );
+    }
+    // Each rebind gives up its reference on the old notification, and the last
+    // frees it. Every binding has owed since it was taken and a rebind keeps
+    // the debt, so the line is unmasked only once all 64 acknowledge.
     bound
         .iter()
         .try_for_each(|&cap| irq_register(cap, fresh, 0))
-        .map_err(|_| "integration::irq_shared_line: refilling the line after the teardown failed")
+        .map_err(|_| "integration::irq_shared_line: rebinding the full line failed")?;
+    acknowledge(&bound)?;
+    raise_expect(
+        &[fresh],
+        &[],
+        "the bindings rebound from a deleted notification were not served",
+    )
 }
 
 /// The line's mode: the last scenario of the module doc. Runs once no binding

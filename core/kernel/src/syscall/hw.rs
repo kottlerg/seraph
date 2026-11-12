@@ -141,8 +141,14 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// the one the line's bindings recorded, or a mode other than 0 for a
 /// message-signaled target; `QuotaExceeded` when the controller has no delivery
 /// resource left (no CPU with a free device vector on x86-64, or a free IMSIC
-/// identity on RISC-V), the line already holds `MAX_IRQ_BINDINGS` bindings, or
-/// the message-signaled target is already bound.
+/// identity on RISC-V), the line already holds `MAX_IRQ_BINDINGS` bindings,
+/// the message-signaled target is already bound, or the Notification holds as
+/// many references as it may.
+///
+/// A bound binding holds a reference on its Notification, so the Notification
+/// lives as long as a binding names it: deleting its capabilities does not
+/// unbind it. A binding lasts until its Interrupt capability rebinds or is
+/// deleted.
 #[cfg(not(test))]
 pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -202,35 +208,41 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
     // rejects a null cspace and checks tag and rights.
     let sig_slot = unsafe { super::lookup_cap(cspace, sig_cap_idx, NtfRights::NOTIFY) }?;
-    let sig_state = {
-        let obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Notification; the object is a NotificationObject
-        // constructed in place at a size-class-aligned retype offset.
-        #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            (*obj.as_ptr().cast::<NotificationObject>()).state
-        }
-    };
+    let sig_obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: tag confirmed Notification; the object is a NotificationObject
+    // constructed in place at a size-class-aligned retype offset.
+    #[allow(clippy::cast_ptr_alignment)]
+    let sig_state = unsafe { (*sig_obj.as_ptr().cast::<NotificationObject>()).state };
 
     // Bind the cap's object to the notification, routing the line at its
     // controller for its first binding (left masked: the x86_64 IOAPIC
     // redirection entry, the RISC-V APLIC source; the driver unmasks via
-    // SYS_IRQ_ACK after registering), under the table's routing lock.
+    // SYS_IRQ_ACK after registering), under the table's routing lock. The
+    // binding takes a reference on the Notification object.
     // SAFETY: syscall context, no IPC source, scheduler, or sleep-list lock held;
-    // sig_state is the live state of the Notification cap resolved above; `io`
-    // is live, its line is `irq_id`, and its dealloc arm unbinds it
-    // (`irq::unregister`) before it is freed.
-    unsafe { crate::irq::register(irq_id, &io.binding, sig_state, mode) }.map_err(|e| match e
+    // sig_state is the live state of `sig_obj`, which `sig_slot`'s pin keeps
+    // live for the call; `io` is live, its line is `irq_id`, and its dealloc
+    // arm unbinds it (`irq::unregister`) before it is freed.
+    let replaced = unsafe { crate::irq::register(irq_id, &io.binding, sig_state, sig_obj, mode) }
+        .map_err(|e| match e
     {
         crate::irq::RouteError::NoSuchLine | crate::irq::RouteError::ModeMismatch =>
         {
             SyscallError::InvalidArgument
         }
-        crate::irq::RouteError::Exhausted | crate::irq::RouteError::TooManyBindings =>
-        {
-            SyscallError::QuotaExceeded
-        }
+        crate::irq::RouteError::Exhausted
+        | crate::irq::RouteError::TooManyBindings
+        | crate::irq::RouteError::ReferenceLimit => SyscallError::QuotaExceeded,
     })?;
+
+    // A rebind gave up the reference its binding held on the Notification it
+    // replaced; no delivery can reach that Notification any more.
+    if let Some(old) = replaced
+    {
+        // SAFETY: the binding's reference, handed over by `register`; syscall
+        // context with no lock held.
+        unsafe { crate::cap::object::release_ref(old) };
+    }
 
     Ok(0)
 }
@@ -247,24 +259,27 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = `Interrupt` cap handle carrying `RIGHTS_IRQ_MINT` (the authority).
 ///
-/// Takes a free message-signaled target (`irq::alloc_message`): an id past
-/// every wired line and a slot (an x86-64 device vector, a RISC-V IMSIC
-/// identity) of the next CPU in turn with a free one. Inserts into the caller's
-/// `CSpace` an `Interrupt` capability over that one id, unbound, carrying
-/// `RIGHTS_IRQ_NOTIFY` only, as a derivation child of the authority, so a
-/// revoke of the authority reaches it. The holder reads the message its device
-/// writes through `SYS_CAP_INFO` (`CAP_INFO_IRQ_MSG_ADDRESS`,
-/// `CAP_INFO_IRQ_MSG_DATA`), programs it into the device, and binds the
-/// capability with `SYS_IRQ_REGISTER` (mode 0). The target is freed, for a
-/// later mint, once neither the capability nor any copy of it remains.
+/// Takes a free slot (an x86-64 device vector, a RISC-V IMSIC identity) of the
+/// next CPU in turn with one (`irq::alloc_message`), whose entry anchors the new
+/// target, and whose CPU and slot give the target's id, past every wired line.
+/// The target's state is the lineage root of the new capability's `Interrupt`
+/// object, which the caller's `CSpace` funds; the kernel keeps nothing else per
+/// target. Inserts into the caller's `CSpace` an `Interrupt` capability over
+/// that one id, unbound, carrying `RIGHTS_IRQ_NOTIFY` only, as a derivation
+/// child of the authority, so a revoke of the authority reaches it. The holder
+/// reads the message its device writes through `SYS_CAP_INFO`
+/// (`CAP_INFO_IRQ_MSG_ADDRESS`, `CAP_INFO_IRQ_MSG_DATA`), programs it into the
+/// device, and binds the capability with `SYS_IRQ_REGISTER` (mode 0). The
+/// target's slot is freed, and its object's bytes returned, once neither the
+/// capability nor any copy of it remains.
 ///
 /// One target per call; a caller needing K targets calls K times.
 ///
 /// Returns the new cap handle; `InvalidCapability` for a handle that names no
 /// `Interrupt` cap; `InsufficientRights` when it lacks `RIGHTS_IRQ_MINT`;
-/// `QuotaExceeded` when no target is free (no CPU has a free slot; the routing
-/// table holds a target per slot); `OutOfMemory` when the caller's
-/// arena cannot fund the object; `InvalidState` when the authority's slot is
+/// `QuotaExceeded` when no CPU a message can reach has a free slot;
+/// `OutOfMemory` when the caller's arena cannot fund the object, which a
+/// refill of its pool cures; `InvalidState` when the authority's slot is
 /// pinned by an in-flight revoke, move, or transfer; and the error of a full
 /// `CSpace`.
 #[cfg(not(test))]

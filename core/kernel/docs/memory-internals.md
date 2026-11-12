@@ -65,7 +65,7 @@ through `alloc_contiguous`, which serves a boot-time request larger than one blo
 address-adjacent `MAX_ORDER` blocks, found by sorting that order's free list, and returns the
 run's unused tail to the free lists. The per-CPU boot slabs (`sched::alloc_per_cpu_slab`, which
 sizes each from its `sched::PerCpuSlab` descriptor), the IRQ routing table (`irq::init_table`,
-whose message-signaled targets take one entry per delivery slot of every CPU), and the RAM-sized
+which holds the wired lines and one delivery gate per CPU), and the RAM-sized
 tables (the frame map's and the `CSpace` registry's chunk tables, the tag pool) are allocated
 through it by `sched::alloc_zeroed_slab`, so neither a CPU count nor a RAM size is capped by the
 largest block; a boot that finds no long enough run halts naming the slab.

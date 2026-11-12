@@ -975,8 +975,11 @@ impl MmioObject
 /// range authorities: narrow them with `sys_irq_split` before use.
 ///
 /// A message-signaled target's cap (`SYS_IRQ_MSG_ALLOC`) is a lineage root over
-/// its one id (`irq::is_message`); freeing the lineage's root body, once no copy
-/// of it is live, frees the target (`irq::free_message`).
+/// its one id (`irq::is_message`), and that root, funded by the minting
+/// `CSpace`, is the target's state: the kernel keeps nothing else per target
+/// beyond its slot's entry on its CPU (`irq::SlotEntry`). Freeing the lineage's
+/// root body, once no copy of it is live, frees the target's slot
+/// (`irq::free_message`).
 ///
 /// Each capability references an object of its own (a copy is a fresh object
 /// in its lineage, [`object_for_new_slot`]), so each carries its own binding of
@@ -2622,20 +2625,20 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`), of
 /// the fault-handler binding a rebind or unbind replaces
 /// (`sys_thread_set_fault_handler` and `sys_thread_inherit_fault_handler`,
-/// through `ipc::fault::release_endpoints`), of the endpoint pin a fault
-/// delivery holds until before its park (`ipc::fault::fault_dispatch`), and of
-/// the address-space pin a thread-memory syscall takes on the space a thread
-/// executes in (`sched::pin_thread_aspace`, released when the syscall's
-/// `AspacePin` drops). Pins, moves, and mapping records may name an object
-/// bound to the running thread, so a `Thread`, `CSpace`, or `AddressSpace`
-/// whose last reference goes here is queued for this CPU's deferred reclaim
-/// (drained at the next syscall epilogue or idle loop) rather than torn down in
-/// place. Every other type frees in place through [`dealloc_object`], which may
-/// take `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
+/// through `ipc::fault::release_endpoints`), of the Notification reference an
+/// interrupt binding a rebind replaces (`sys_irq_register`), of the endpoint
+/// pin a fault delivery holds until before its park
+/// (`ipc::fault::fault_dispatch`), and of the address-space pin a
+/// thread-memory syscall takes on the space a thread executes in
+/// (`sched::pin_thread_aspace`, released when the syscall's `AspacePin`
+/// drops). Pins, moves, and mapping records may name an object bound to the
+/// running thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last
+/// reference goes here is queued for this CPU's deferred reclaim (drained at
+/// the next syscall epilogue or idle loop) rather than torn down in place.
+/// Every other type frees in place through [`dealloc_object`], which may take
+/// `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
 /// `EventQueue`, or an Endpoint, wakes the waiters it drains (the running
 /// thread among them, when it is parked on the object it released), for a
-/// Notification first removes its IRQ bindings and waits out the device-IRQ
-/// deliveries in flight on their lines (`irq::unregister_notification`), for a
 /// Notification or `EventQueue` waits for the timer's in-flight wakeup batch
 /// (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object waits
 /// for the TLB shootdown or takes the thread registry lock its withdrawal needs
@@ -3377,9 +3380,8 @@ pub unsafe fn object_for_new_slot(
 ///   `EventQueue`, and Interrupt arms spin until work on other CPUs that takes
 ///   those locks finishes (with interrupts enabled: the Thread drain gates and
 ///   `sched::sleep_wakeups_quiesce`; with interrupts disabled under the IRQ
-///   routing lock: the Notification and Interrupt arms' wait for in-flight
-///   device-IRQ deliveries, `irq::unregister_notification` and
-///   `irq::unregister`).
+///   routing lock: the Interrupt arm's wait for in-flight device-IRQ
+///   deliveries, `irq::unregister`).
 ///
 /// # Cascade handling
 ///
@@ -3387,9 +3389,9 @@ pub unsafe fn object_for_new_slot(
 /// `MemoryObject`'s retype lease, a pool donation's lease on its Memory
 /// object, the references a dying `CSpace`'s slots hold, a wait set's
 /// member references, a thread's fault-handler binding, death-observer
-/// nodes' queue references. Each object one of those releases leaves
-/// unreferenced is pushed onto a [`CascadeStack`] local to this call (and a
-/// `CSpace` wrapper's first run re-pushes the wrapper beneath its slots'
+/// nodes' queue references, an interrupt binding's Notification reference.
+/// Each object one of those releases leaves unreferenced is pushed onto a
+/// [`CascadeStack`] local to this call (and a `CSpace` wrapper's first run re-pushes the wrapper beneath its slots'
 /// objects, for the second run that returns its pool), linked through the
 /// objects' own headers, and this function tears the stack down, most recent
 /// first, until it is empty. No arm recurses into `dealloc_object`, so the
@@ -3641,13 +3643,28 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // sleep-list lock is held (this function's contract), as
             // `irq::unregister` requires; the object stays live until the
             // release below.
-            unsafe { crate::irq::unregister(start, &obj.binding) };
+            let notification = unsafe { crate::irq::unregister(start, &obj.binding) };
+            // Release the reference the binding held on its Notification, now
+            // that no delivery can reach it; a Notification whose last
+            // reference this was is torn down from the cascade stack.
+            if let Some(notification) = notification
+            {
+                // SAFETY: the binding's reference, which `unregister` handed
+                // over, keeps the object live until this decrement; at zero
+                // nothing else references it.
+                unsafe {
+                    if notification.as_ref().dec_ref() == 0
+                    {
+                        stack.push(notification);
+                    }
+                }
+            }
             // SAFETY: a refcount-0 Interrupt object whose binding is removed; no
             // lock held.
             let lineage_gone = unsafe { release_range_object::<InterruptObject>(ptr, stack) };
             // A message-signaled target lives as long as its lineage: once the
             // root body is freed no object names its id (only the mint makes an
-            // object over a fresh one), so the target is freed for reuse.
+            // object over a fresh one), so the target's slot is freed for reuse.
             if lineage_gone && crate::irq::is_message(start)
             {
                 // SAFETY: the context `irq::unregister` required above; no live
@@ -4809,14 +4826,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
 
             if !state.is_null()
             {
-                // Remove the IRQ bindings that name this NotificationState and
-                // wait out the device-IRQ deliveries in flight on their lines on
-                // any CPU; a binding an earlier rebind or unbind took it from
-                // was drained by that change, so none reaches the state after
-                // the free below (irq::unregister_notification).
-                // SAFETY: state is live; no IPC source, scheduler, or
-                // sleep-list lock is held, and this is not interrupt context.
-                unsafe { crate::irq::unregister_notification(state) };
+                // An IRQ binding holds a reference on the Notification it
+                // names, released only once no device-IRQ delivery can reach
+                // it (`irq` module doc § Notification references), so at zero
+                // no binding names this state.
 
                 // Wait-set membership holds a +1 cap-level ref on the source
                 // (see `sys_wait_set_add` / `wait_set_drop`); reaching dealloc

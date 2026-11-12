@@ -1019,21 +1019,20 @@ Delete a single capability from the caller's CSpace. Does not affect derived cap
 
 If this is the last reference to the underlying object, the object is freed. Every `Mmio` and
 `IoPort` capability references an object of its own, so deleting one frees it, which unmaps the
-mappings and withdraws the port bindings made through it (see § `SYS_MMIO_MAP` and
-§ `SYS_IOPORT_BIND`). Freeing a `CSpace` or
-an `AddressSpace` first stops every thread bound to it (each becomes `Exited` with retained exit
-reason `EXIT_KILLED`; its Thread object is freed when its own last capability goes), so a process's
-threads never outlive either object (see [scheduling-internals.md](scheduling-internals.md) § Thread
-Registry). **The stop includes the caller**: a thread deleting the last capability to its own
-`CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
-is stopped by that delete and the call does not return; the object is reclaimed once the thread is
-off its CPU. When another thread's syscall holds a pin on the object at the delete (see below), the
-delete is not the last release: it returns 0, and the stop and the free happen when that syscall
-drops its pin, through the deferred reclaim of the dropping thread's CPU. An `AddressSpace` an Mmio
-capability's object has recorded a mapping into (§ `SYS_MMIO_MAP`) is likewise not released by the
-delete of its last capability: the delete returns 0, and the stop and the free happen when that Mmio
-object is freed and its record releases the space. A teardown of a Thread
-left `current` on a CPU that `fatal` halted never completes (see
+mappings and withdraws the port bindings made through it (see § `SYS_MMIO_MAP` and §
+`SYS_IOPORT_BIND`). Freeing a `CSpace` or an `AddressSpace` first stops every thread bound to it
+(each becomes `Exited` with retained exit reason `EXIT_KILLED`; its Thread object is freed when its
+own last capability goes), so a process's threads never outlive either object (see
+[scheduling-internals.md](scheduling-internals.md) § Thread Registry). **The stop includes the
+caller**: a thread deleting the last capability to its own `CSpace` or `AddressSpace` — directly, or
+because the deleted object's teardown cascades into it — is stopped by that delete and the call does
+not return; the object is reclaimed once the thread is off its CPU. When another thread's syscall
+holds a pin on the object at the delete (see below), the delete is not the last release: it returns
+0, and the stop and the free happen when that syscall drops its pin, through the deferred reclaim of
+the dropping thread's CPU. An `AddressSpace` an Mmio capability's object has recorded a mapping into
+(§ `SYS_MMIO_MAP`) is likewise not released by the delete of its last capability: the delete returns
+0, and the stop and the free happen when that Mmio object is freed and its record releases the
+space. A teardown of a Thread left `current` on a CPU that `fatal` halted never completes (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
 `dealloc_object(Thread)` Drain Protocol, invariant 3), nor does one of a `CSpace` or `AddressSpace`
 with such a thread bound (see [scheduling-internals.md](scheduling-internals.md) § Thread Registry):
@@ -1045,10 +1044,11 @@ Radix Directory), and a stopped thread's teardown reaches the IPC source it was 
 through a binding that proves the source live (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
 `dealloc_object(Thread)` Drain Protocol, step 11); a waker that claimed the thread holds the source
-live until its wake completes (device IRQ delivery through its line's in-flight count, fault
-delivery through its pin on the endpoint, the death post through the observer binding's reference;
-see [capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
-Object Reference Counting). The caller's own `Thread` object is treated differently, as below.
+live until its wake completes (device IRQ delivery through the reference its binding holds on the
+Notification, fault delivery through its pin on the endpoint, the death post through the observer
+binding's reference; see
+[capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel Object
+Reference Counting). The caller's own `Thread` object is treated differently, as below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in
 place: a thread may not delete any capability to its **own running**
@@ -2390,8 +2390,9 @@ last unmask has acknowledged. A new binding owes from the start, so the driver's
 idempotent: a repeated one, or one with no delivery since the last (a driver's timeout-wake
 acknowledgement), clears nothing and unmasks only when no binding owes; with a single binding
 on the line it unmasks whether or not an interrupt has been delivered since. Through an object
-with no binding (never registered, or its binding removed with its Notification) the call
-changes nothing and returns 0. A message-signaled target (§ `SYS_IRQ_MSG_ALLOC`) is never masked,
+with no binding (never registered) the call changes nothing and returns 0: deleting a bound
+Notification's capabilities leaves the binding, which still owes its acknowledgements
+(§ `SYS_IRQ_REGISTER`, Unbind). A message-signaled target (§ `SYS_IRQ_MSG_ALLOC`) is never masked,
 so through its capability the call changes nothing and returns 0.
 
 **Capability requirement:** `irq_cap` MUST be a valid interrupt capability for the
@@ -2426,16 +2427,18 @@ through their own capability.
 
 - **Bind.** Through an object with no binding the call adds one. The line's first binding records
   `mode` and routes the line at its controller in it, to one CPU, the next in turn
-  ([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked; the routing and
-  the mode are kept while any binding remains, so every receiver on the line is signalled from
-  that CPU. The call returns once no delivery that found the line unbound is still in flight, so
-  its mask cannot land after the receiver's first `SYS_IRQ_ACK`. A later binding must pass the
-  recorded mode, and masks the line. Every new binding owes an acknowledgement, so the line stays
-  masked until its receiver's first `SYS_IRQ_ACK`.
+  ([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked; the routing and the
+  mode are kept while any binding remains, so every receiver on the line is signalled from that CPU.
+  The binding holds a counted reference on the notification's object, which keeps the Notification
+  from being freed while the binding names it. The call returns once the delivery running on the
+  line's CPU, if any, has finished, so its mask cannot land after the receiver's first
+  `SYS_IRQ_ACK`. A later binding must pass the recorded mode, and masks the line. Every new binding
+  owes an acknowledgement, so the line stays masked until its receiver's first `SYS_IRQ_ACK`.
 - **Rebind.** Through an object already bound, the call, which must pass the line's recorded mode,
   rebinds that binding to `notification_cap`'s notification, keeping whether it owes an
-  acknowledgement and leaving the line's mask as it is, and returns once no delivery to the
-  replaced notification is still in flight.
+  acknowledgement and leaving the line's mask as it is. The binding's reference moves to the new
+  notification's object and the replaced notification's is given up, once no delivery can still
+  hold it: the call returns once the delivery running on the line's CPU, if any, has finished.
 - **Deliver.** Each interrupt masks the line, marks every binding on it as owing an
   acknowledgement, ORs bit 0 into each bound notification, and completes at the controller. An
   interrupt the controller forwarded before the mask took effect is delivered too, so a receiver
@@ -2443,12 +2446,14 @@ through their own capability.
   interrupt finds nothing in its device's status and acknowledges. The driver MUST call
   `SYS_IRQ_ACK` (see [architecture.md](../../../docs/architecture.md) § Driver Model); the line is
   unmasked once no binding owes.
-- **Unbind.** A binding is removed when its Interrupt object is freed (its last capability
-  deleted, consumed by a split, revoked through an ancestor, or torn down with its holder's
-  CSpace) or when its Notification is freed; the removal waits out the deliveries in flight on
-  the line. The line is then unmasked if bindings remain and none owes, so a receiver that goes
-  cannot hold a shared line masked, and released at its controller when no binding remains; the
-  release forgets the mode, so the line's next first binding records its own.
+- **Unbind.** A binding is removed when its Interrupt object is freed (its last capability deleted,
+  consumed by a split, revoked through an ancestor, or torn down with its holder's CSpace); the
+  removal gives up the binding's reference on its notification's object and waits out the delivery
+  running on the line's CPU. Deleting a Notification's capabilities removes no binding: the bindings
+  stay, and keep the Notification, until their Interrupt objects rebind or are freed. The line
+  is then unmasked if bindings remain and none owes, so a receiver that goes cannot hold a shared
+  line masked, and released at its controller when no binding remains; the release forgets the mode,
+  so the line's next first binding records its own.
 
 A message-signaled target (§ `SYS_IRQ_MSG_ALLOC`) binds through the same call with three
 differences. Its CPU and slot were taken at its mint, so its first binding routes nothing. It
@@ -2483,7 +2488,8 @@ Interrupt cap spans 32768 GSIs; on RISC-V a source outside the APLIC's reported
 [arch-interface.md](arch-interface.md) § Module-level constants and free functions; or `mode`
 sets a bit outside `IRQ_MODE_MASK`, differs from the mode the line's bindings recorded, or is
 not 0 for a message-signaled target),
-`QuotaExceeded` (the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; a
+`QuotaExceeded` (the notification's object holds as many references as it may
+(`REF_COUNT_LIMIT`); the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; a
 message-signaled target already holds its one binding, through another object; or, for the
 line's first binding on x86-64, no CPU whose APIC id an I/O APIC can name has a free device IDT
 vector, each CPU having 217, shared with the message-signaled targets on it; a vector is freed
@@ -2619,8 +2625,9 @@ message (MSI or MSI-X) rather than by asserting a wired line.
 
 **Return:** `rax`/`a0`: the new capability's handle on success; `SyscallError` on failure.
 
-The kernel takes a free message-signaled target: a source id past every wired line, and a slot of
-the next CPU in turn that has a free one ([arch-interface.md](arch-interface.md) § `interrupts`).
+The kernel takes a free slot of the next CPU in turn that has one
+([arch-interface.md](arch-interface.md) § `interrupts`); the target's id, past every wired line, is
+computed from its CPU and slot.
 On x86-64 the slot is a device IDT vector of a CPU whose APIC id is below `0xFF`, the widest a
 compatibility-format message address names (interrupt remapping is not implemented); on RISC-V it
 is an interrupt identity in the hart's supervisor-level IMSIC file. Wired lines take their slots
@@ -2636,8 +2643,10 @@ the capability nor any copy of it remains, whether or not it is bound, and is th
 later mint.
 
 One call mints one target; a caller needing K targets (a device with K MSI-X vectors) calls K
-times. The table holds `message_capacity` targets, one per slot of every CPU's delivery space
-([docs/limits.md](../../../docs/limits.md)), so its targets run out only with the CPUs' slots.
+times. The target's state is the lineage root of the capability the call creates, funded from the
+caller's `CSpace` pool and returned there when the last capability to the target is gone; the
+kernel reserves nothing per target at boot beyond the CPUs' slot rows
+([docs/limits.md](../../../docs/limits.md)), so targets run out only with the CPUs' slots.
 
 The kernel mints the root Interrupt capability with `RIGHTS_IRQ_MINT`
 ([capability-model.md](../../../docs/capability-model.md) § Interrupt); a minted capability does
@@ -2646,11 +2655,10 @@ not carry it.
 **Capability requirement:** `authority_cap` must be an Interrupt capability with Mint rights.
 
 **Errors:** `InvalidCapability` (`authority_cap` names no Interrupt capability),
-`InsufficientRights` (it lacks Mint), `QuotaExceeded` (no target is free: no eligible CPU has a free
-slot; or the caller's `CSpace` directory is structurally
-full), `OutOfMemory` (the caller's `CSpace` pool cannot back the capability's body or slot),
-`InvalidState` (the authority's slot is held by an in-flight revoke, move, or transfer). Nothing
-changes on an error.
+`InsufficientRights` (it lacks Mint), `QuotaExceeded` (no CPU a message can reach has a free slot;
+or the caller's `CSpace` directory is structurally full), `OutOfMemory` (the caller's `CSpace` pool
+cannot fund the capability's body or slot; a refill cures it), `InvalidState` (the authority's slot
+is held by an in-flight revoke, move, or transfer). Nothing changes on an error.
 
 ---
 

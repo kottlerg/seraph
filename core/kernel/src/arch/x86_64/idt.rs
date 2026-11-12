@@ -901,12 +901,12 @@ pub(super) unsafe fn publish_user_frame(frame: *mut TrapFrame)
 /// it publishes as the thread's `trap_frame` first ([`publish_user_frame`]).
 /// Each handler performs its own EOI; this only dispatches, then, for an
 /// interrupt from user mode, makes the interrupt delivery point of a pending
-/// upcall (`ipc::upcall::deliver_at_interrupt`). A device vector is
-/// mapped, through this CPU's vector row, to the source assigned it there
-/// (`ioapic::source_for_vector`): a GSI the I/O APIC routes or a message-signaled
-/// target, which indexes the `irq` routing table. A device vector with no source
-/// (an interrupt latched before its route was cleared or its target freed) is
-/// acknowledged and dropped.
+/// upcall (`ipc::upcall::deliver_at_interrupt`). A device vector's slot entry
+/// in this CPU's vector row (`ioapic::slot_for_vector`), which names a GSI the
+/// I/O APIC routes, a message-signaled target, or no source, is passed to
+/// `irq::dispatch_device_irq`; an entry with no source (an interrupt latched
+/// before its route was cleared or its target freed) is acknowledged and
+/// dropped there.
 #[cfg(not(test))]
 extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
 {
@@ -925,13 +925,14 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
             .contains(&v) =>
         {
             // The range check above bounds `v` below 256.
-            match super::ioapic::source_for_vector(v as u8)
+            match super::ioapic::slot_for_vector(v as u8)
             {
-                Some(source) =>
+                Some(entry) =>
                 {
-                    // SAFETY: IRQ-handler context at ring 0; `dispatch_device_irq`
-                    // masks a line and EOIs internally.
-                    unsafe { crate::irq::dispatch_device_irq(source) };
+                    // SAFETY: IRQ-handler context at ring 0 with interrupts
+                    // disabled, and `entry` is a slot of this CPU's row;
+                    // `dispatch_device_irq` masks a line and EOIs internally.
+                    unsafe { crate::irq::dispatch_device_irq(entry) };
                 }
                 None => super::interrupts::acknowledge(0),
             }
@@ -1037,8 +1038,8 @@ const DEVICE_STUB_STRIDE: usize = 16;
 ///
 /// Each stub pushes the two-word `placeholder + vector` prologue and jumps to
 /// [`common_irq_trampoline`], which builds the [`TrapFrame`] (ring-3 origin) and
-/// routes to `irq::dispatch_device_irq` via [`irq_dispatch`], which maps the
-/// vector to its GSI. `dispatch_device_irq` handles masking, notification
+/// routes to `irq::dispatch_device_irq` via [`irq_dispatch`], which passes it
+/// the vector's slot entry. `dispatch_device_irq` handles masking, notification
 /// delivery, and EOI. Nothing calls the function itself; `init` installs the
 /// stubs' addresses as gates.
 #[cfg(not(test))]

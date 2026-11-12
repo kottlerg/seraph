@@ -442,8 +442,10 @@ derivation it revokes when it withdraws the driver (devmgr's
 - **Acknowledge.** `SYS_IRQ_ACK` clears its own binding's debt and unmasks the line only when no
   binding owes one; a repeated acknowledgement changes nothing.
 - **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,
-  or torn down with its holder's CSpace) or its Notification is; the line is unmasked when the
-  remaining bindings owe nothing, and released at its controller when none remains. A driver that
+  or torn down with its holder's CSpace); the line is unmasked when the remaining bindings owe
+  nothing, and released at its controller when none remains. A bound binding holds a reference on
+  its Notification, so deleting the Notification's capabilities leaves the binding in place until
+  its Interrupt object rebinds or is freed. A driver that
   dies while its device asserts a level-triggered line leaves the device asserting with no
   receiver to clear it, so the line's other receivers are signalled again on each unmask; devmgr
   ends that by setting the function's Interrupt Disable bit, and running its declared reset, when it

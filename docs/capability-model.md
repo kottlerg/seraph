@@ -216,13 +216,14 @@ into that Notification, and the holder re-enables the line with `SYS_IRQ_ACK`.
 Every Interrupt capability references an object of its own, as for [Mmio](#mmio): a copy or
 derivation references a fresh object over the same range, bounded the same way, and that object
 carries the capability's binding of its line. Register and acknowledge act on the binding of the
-capability's own object, so several capabilities to one line are each a binding: every
-interrupt signals each bound Notification, and the line is re-enabled only once every binding has
-acknowledged. A line holds at most 64 bindings, and a further registration returns
-`QuotaExceeded`. When an Interrupt capability goes (deleted, consumed by a split, or revoked
-through an ancestor), its object is freed and its binding removed, while the other capabilities'
-bindings to the line stay; a line whose remaining bindings owe no acknowledgement is re-enabled
-then, so a receiver that goes cannot hold a shared line masked. The binding semantics are
+capability's own object, so several capabilities to one line are each a binding: every interrupt
+signals each bound Notification, and the line is re-enabled only once every binding has
+acknowledged. A line holds at most 64 bindings, and a further registration returns `QuotaExceeded`.
+When an Interrupt capability goes (deleted, consumed by a split, or revoked through an ancestor),
+its object is freed and its binding removed, while the other capabilities' bindings to the line
+stay; a binding holds a reference on its Notification, so a Notification whose capabilities are all
+deleted lives on while a binding names it; a line whose remaining bindings owe no acknowledgement is
+re-enabled then, so a receiver that goes cannot hold a shared line masked. The binding semantics are
 specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_IRQ_REGISTER`
 and § `SYS_IRQ_ACK`.
 
@@ -236,7 +237,9 @@ only, so no driver holds Mint.
 message-signaled Interrupt capability. It names one source id past every wired line and carries
 Notify only, never Mint. It is a derivation child of the authority, so revoking the authority
 deletes it. Its target is a delivery slot of one CPU: a device vector on x86-64, an interrupt
-identity in a hart's IMSIC file on riscv64. The holder reads the message address and data with
+identity in a hart's IMSIC file on riscv64. The target's state is the lineage root of that
+capability, funded from the minting CSpace's pool and returned there when the last capability to
+the target is gone. The holder reads the message address and data with
 `SYS_CAP_INFO` (`CAP_INFO_IRQ_MSG_ADDRESS`, `CAP_INFO_IRQ_MSG_DATA`), programs them into the
 device's MSI or MSI-X entry, and binds with `SYS_IRQ_REGISTER` (mode 0, one binding only). The
 kernel never masks a message target, and `SYS_IRQ_ACK` on it changes nothing: masking is the
@@ -740,7 +743,7 @@ which deallocates every kernel object only the child referenced, which
 credits each object's bytes back to the Memory cap it was retyped from.
 An object the child created that another process still references (a
 capability to it, or a kernel-internal reference such as a wait-set
-membership) is not destroyed: it lives on until its last reference goes,
+membership or an interrupt binding) is not destroyed: it lives on until its last reference goes,
 its bytes stay debited from its source Memory object, and a capability to
 it keeps working as before. memmgr returns the child's frames to its pool
 when procmgr sends `PROCESS_DIED`, except a frame such an object still

@@ -30,16 +30,17 @@
 //! source is forwarded as a message to one hart's IMSIC file, its target, chosen at
 //! route time ([`route_device_irq`], through `irq::next_target_cpu`): the harts in
 //! turn, so device interrupts spread over the harts. The hart that takes the
-//! external-interrupt trap claims the identity and dispatches the source it maps
-//! to; masking and unmasking are APLIC register writes any hart can make.
+//! external-interrupt trap claims the identity and dispatches the source its entry
+//! names; masking and unmasking are APLIC register writes any hart can make.
 //!
 //! # Modification notes
 //! - Device IRQs need no per-device code here: `route_device_irq` picks the source's
-//!   target and leaves it masked, and `dispatch_external` forwards every claimed source
-//!   to `crate::irq::dispatch_device_irq`.
+//!   target and leaves it masked, and `dispatch_external` forwards every claimed
+//!   identity's entry to `crate::irq::dispatch_device_irq`.
 //! - Message-signaled targets (`SYS_IRQ_MSG_ALLOC`, `irq::alloc_message`) take an
 //!   identity of a hart's file through `alloc_message_target`, with no APLIC source;
-//!   their claim dispatches them like a routed source.
+//!   the identity's entry (`slot_entry`) anchors the target, and its claim dispatches
+//!   it like a routed source.
 
 use super::encoding::sbi_hart_mask;
 use super::trap_frame::TrapFrame;
@@ -1005,34 +1006,35 @@ pub unsafe fn unroute_device_irq(irq: u32, _target: crate::irq::Target)
 #[cfg(test)]
 pub unsafe fn unroute_device_irq(_irq: u32, _target: crate::irq::Target) {}
 
-/// Slots of one hart's delivery space a message target can take: its IMSIC file's
-/// identities (`aia::identities_per_cpu`). Sizes the routing table's message
-/// targets (`irq::init_table`). Valid after Phase 4 (`aia::init_eid_storage`).
-#[cfg(not(test))]
-#[must_use]
-pub fn message_slots_per_cpu() -> u32
-{
-    super::aia::identities_per_cpu()
-}
-
-/// Mint message target `id` an identity in the next hart's IMSIC file in turn with
-/// a free one (`aia::alloc_message`). Called by `irq::alloc_message` under `irq`'s
-/// routing lock.
+/// Take an identity for a new message target in the next hart's IMSIC file in turn
+/// with a free one, its row entry left `irq::Slot::Unbound` (`aia::alloc_message`).
+/// Called by `irq::alloc_message` under `irq`'s routing lock.
 ///
 /// # Errors
 /// `Exhausted` when no hart's file has a free identity.
 #[cfg(not(test))]
-pub fn alloc_message_target(id: u32) -> Result<crate::irq::Target, crate::irq::RouteError>
+pub fn alloc_message_target() -> Result<crate::irq::Target, crate::irq::RouteError>
 {
-    super::aia::alloc_message(id)
+    super::aia::alloc_message()
 }
 
-/// Free message target `id`'s identity `target` (`aia::free_message`). Called by
-/// `irq::free_message` under `irq`'s routing lock.
+/// Free the identity of the message target on `target`, whose row entry no binding
+/// holds (`aia::free_message`). Called by `irq::free_message` under `irq`'s routing
+/// lock.
 #[cfg(not(test))]
-pub fn free_message_target(id: u32, target: crate::irq::Target)
+pub fn free_message_target(target: crate::irq::Target)
 {
-    super::aia::free_message(id, target);
+    super::aia::free_message(target);
+}
+
+/// The slot entry of `target` (`irq::SlotEntry`): the entry of its identity in its
+/// hart's EID row (`aia::slot_entry`), or `None` when the hart is past the boot CPUs
+/// or the identity is not one its file implements.
+#[cfg(not(test))]
+#[must_use]
+pub fn slot_entry(target: crate::irq::Target) -> Option<&'static crate::irq::SlotEntry>
+{
+    super::aia::slot_entry(target)
 }
 
 /// The physical address a device writes to raise `target`: its hart's
@@ -1062,23 +1064,23 @@ pub fn irq_line_count() -> u32
     super::aia::source_count() + 1
 }
 
-/// Claim this hart's top pending IMSIC identity and dispatch the APLIC source
-/// routed to it to its registered notifications.
+/// Claim this hart's top pending IMSIC identity and dispatch it to the source its
+/// entry in this hart's EID row names.
 ///
 /// Called from `trap_dispatch` on a supervisor external interrupt. The claim
-/// (`aia::claim`) clears the identity's pending bit and maps it to the source
-/// through this hart's EID row; a claim that finds nothing pending, or a free
-/// identity, dispatches nothing. A further pending identity keeps SEIP set and
-/// traps again. Routing is handled by [`crate::irq::dispatch_device_irq`],
-/// which masks the source and calls [`acknowledge`].
+/// (`aia::claim`) clears the identity's pending bit and returns its entry; a claim
+/// that finds nothing pending dispatches nothing, and a free identity's entry
+/// signals nothing. A further pending identity keeps SEIP set and traps again.
+/// Routing is handled by [`crate::irq::dispatch_device_irq`], which masks a wired
+/// source and calls [`acknowledge`].
 #[cfg(not(test))]
 fn dispatch_external()
 {
-    if let Some(irq) = super::aia::claim()
+    if let Some(entry) = super::aia::claim()
     {
         // SAFETY: called from trap_dispatch in interrupt context with
-        // sstatus.SIE clear; irq is the source the claimed identity maps to.
-        unsafe { crate::irq::dispatch_device_irq(irq) };
+        // sstatus.SIE clear; `entry` is a slot of this hart's row.
+        unsafe { crate::irq::dispatch_device_irq(entry) };
     }
 }
 

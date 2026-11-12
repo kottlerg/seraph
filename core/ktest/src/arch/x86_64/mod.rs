@@ -60,6 +60,12 @@ use crate::TestContext;
 /// exercise a port binding run only where it is true.
 pub const HAS_IO_PORTS: bool = true;
 
+/// Whether a user-mode CPU write raises a message-signaled target, as
+/// `stress::msg_inject_delete_race` needs: false, since an MSI is a write to
+/// the local APIC's message window that only a device's bus write reaches, and
+/// a CPU raises a device vector only from ring 0, through the ICR.
+pub const MSG_INJECTABLE: bool = false;
+
 /// Exception vector a not-present user store faults with (`#PF`), as recorded
 /// in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
 pub const PAGE_FAULT_STORE_VECTOR: u64 = 14;

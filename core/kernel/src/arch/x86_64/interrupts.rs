@@ -44,8 +44,9 @@
 //!   (`syscall::hw::sys_irq_ack`) calls [`unmask`].
 //! - Message-signaled targets (`SYS_IRQ_MSG_ALLOC`, `irq::alloc_message`) take a device
 //!   vector of a CPU through [`alloc_message_target`] and release it through
-//!   [`free_message_target`]; [`message_address`] and [`message_data`] give the message a
-//!   device writes to raise one.
+//!   [`free_message_target`]; the vector's slot entry ([`slot_entry`]) anchors the target,
+//!   and [`message_address`] and [`message_data`] give the message a device writes to
+//!   raise one.
 
 // cast_possible_truncation: u64→usize/u8 APIC address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector casts are always widening.
@@ -826,8 +827,8 @@ pub unsafe fn route_device_irq(
     // fit eight bits.
     let apic_id = unsafe { crate::percpu::apic_id_for(destination) };
     let apic_id = u8::try_from(apic_id).map_err(|_| crate::irq::RouteError::Exhausted)?;
-    let vector =
-        super::ioapic::assign_vector(destination, irq).ok_or(crate::irq::RouteError::Exhausted)?;
+    let vector = super::ioapic::assign_vector(destination, crate::irq::Slot::Line(irq))
+        .ok_or(crate::irq::RouteError::Exhausted)?;
     // SAFETY: post-Phase-5 IOAPIC; route() installs the redirection entry masked, after
     // the vector assignment is published, and the driver unmasks via SYS_IRQ_ACK.
     unsafe {
@@ -856,11 +857,13 @@ pub unsafe fn route_device_irq(
 }
 
 /// Release GSI `irq`'s route to `target` (the CPU and vector [`route_device_irq`]
-/// returned): mask its redirection entry, then free its device vector on that CPU. An
-/// interrupt already latched on the vector reaches `idt::irq_dispatch` and finds no source
-/// and is dropped, unless the vector was reassigned before it was serviced: it then reaches
-/// the new owner as one spurious delivery, which a driver tolerates as it does any
-/// interrupt its device did not raise. A CPU's vectors are assigned in turn and the cursor
+/// returned): mask its redirection entry, then free its device vector on that CPU, whose
+/// slot entry is cleared with a `SeqCst` store (`irq::SlotEntry`), so `irq` can then wait
+/// out a delivery on that CPU that read the line from it. An interrupt already latched on
+/// the vector reaches `idt::irq_dispatch` later, finds the entry free and is dropped,
+/// unless the vector was reassigned before it was serviced: it then reaches the new owner
+/// as one spurious delivery, which a driver tolerates as it does any interrupt its device
+/// did not raise. A CPU's vectors are assigned in turn and the cursor
 /// moves past a released one (`ioapic::assign_vector`), so the next route to that CPU does
 /// not take it while other vectors are free. On a level-triggered line such a latched
 /// delivery also leaves the entry's Remote IRR set, which stays set when the line is routed
@@ -874,7 +877,18 @@ pub unsafe fn unroute_device_irq(irq: u32, target: crate::irq::Target)
 {
     // SAFETY: post-Phase-5 IOAPIC.
     unsafe { super::ioapic::mask(irq) };
-    super::ioapic::release_vector(target.cpu as usize, irq);
+    release_slot(target);
+}
+
+/// Free `target`'s device vector on its CPU, leaving its slot entry free. A slot past
+/// the device vectors names none and is left alone.
+#[cfg(not(test))]
+fn release_slot(target: crate::irq::Target)
+{
+    if let Ok(vector) = u8::try_from(target.slot)
+    {
+        super::ioapic::release_vector(target.cpu as usize, vector);
+    }
 }
 
 /// No-op test stub.
@@ -884,34 +898,22 @@ pub unsafe fn unroute_device_irq(irq: u32, target: crate::irq::Target)
 #[cfg(test)]
 pub unsafe fn unroute_device_irq(_irq: u32, _target: crate::irq::Target) {}
 
-/// Slots of one CPU's delivery space a message target can take: its device vectors
-/// ([`super::ioapic::DEVICE_VECTOR_COUNT`], 217). Sizes the routing table's message
-/// targets (`irq::init_table`).
-#[cfg(not(test))]
-#[must_use]
-pub const fn message_slots_per_cpu() -> u32
-{
-    // DEVICE_VECTOR_COUNT is 217, which fits u32.
-    #[allow(clippy::cast_possible_truncation)]
-    let slots = super::ioapic::DEVICE_VECTOR_COUNT as u32;
-    slots
-}
-
-/// Assign message target `id` a device vector: the next free vector of the next CPU in
-/// turn (`irq::next_target_cpu`) whose APIC id a compatibility-format message address can
-/// name and that has a free one ([`super::msi`]). Every device vector is enabled at its
-/// local APIC from boot, so the target is deliverable once the device writes the message
-/// [`message_address`] and [`message_data`] give. Called by `irq::alloc_message` under
-/// `irq`'s routing lock.
+/// Take a device vector for a new message target: the next free vector of the next CPU
+/// in turn (`irq::next_target_cpu`) whose APIC id a compatibility-format message address
+/// can name and that has a free one ([`super::msi`]), its slot entry left
+/// `irq::Slot::Unbound`. Every device vector is enabled at its local APIC from boot, so
+/// the target is deliverable once the device writes the message [`message_address`] and
+/// [`message_data`] give. Called by `irq::alloc_message` under `irq`'s routing lock.
 ///
 /// # Errors
 /// `Exhausted` when no such CPU has a free device vector.
 #[cfg(not(test))]
-pub fn alloc_message_target(id: u32) -> Result<crate::irq::Target, crate::irq::RouteError>
+pub fn alloc_message_target() -> Result<crate::irq::Target, crate::irq::RouteError>
 {
     let cpu =
         crate::irq::next_target_cpu(can_take_source).ok_or(crate::irq::RouteError::Exhausted)?;
-    let vector = super::ioapic::assign_vector(cpu, id).ok_or(crate::irq::RouteError::Exhausted)?;
+    let vector = super::ioapic::assign_vector(cpu, crate::irq::Slot::Unbound)
+        .ok_or(crate::irq::RouteError::Exhausted)?;
     // The CPU is below CPU_COUNT, which fits u32.
     #[allow(clippy::cast_possible_truncation)]
     let cpu = cpu as u32;
@@ -921,14 +923,26 @@ pub fn alloc_message_target(id: u32) -> Result<crate::irq::Target, crate::irq::R
     })
 }
 
-/// Free message target `id`'s device vector on `target`'s CPU. A message the device sends
-/// after this reaches `idt::irq_dispatch`, finds the vector free and is dropped, or reaches
-/// a later owner of the vector once, as for an unrouted line ([`unroute_device_irq`]).
-/// Called by `irq::free_message` under `irq`'s routing lock.
+/// Free the device vector of the message target on `target`, whose slot entry no binding
+/// holds. A message the device sends after this reaches `idt::irq_dispatch`, finds the
+/// entry free and is dropped, or reaches a later owner of the vector once, as for an
+/// unrouted line ([`unroute_device_irq`]). Called by `irq::free_message` under `irq`'s
+/// routing lock.
 #[cfg(not(test))]
-pub fn free_message_target(id: u32, target: crate::irq::Target)
+pub fn free_message_target(target: crate::irq::Target)
 {
-    super::ioapic::release_vector(target.cpu as usize, id);
+    release_slot(target);
+}
+
+/// The slot entry of `target` (`irq::SlotEntry`): the entry of its device vector in its
+/// CPU's row, or `None` when the CPU is past the boot CPUs or the slot is not a device
+/// vector.
+#[cfg(not(test))]
+#[must_use]
+pub fn slot_entry(target: crate::irq::Target) -> Option<&'static crate::irq::SlotEntry>
+{
+    let vector = u8::try_from(target.slot).ok()?;
+    super::ioapic::slot_of(target.cpu as usize, vector)
 }
 
 /// The compatibility-format message address that delivers to `target`'s CPU

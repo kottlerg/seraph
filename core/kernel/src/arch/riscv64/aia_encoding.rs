@@ -97,16 +97,16 @@ pub(super) const fn imsic_reg_words(ids: u32) -> u32
     (ids + 1).div_ceil(64)
 }
 
-/// The lowest free identity in an EID row (`row[eid]` is 0 when identity
-/// `eid` is free; entry 0, the reserved identity 0, is never taken), or `None`
-/// when every identity is taken.
-pub(super) fn lowest_free_eid(row: &[core::sync::atomic::AtomicU32]) -> Option<u32>
+/// The lowest free identity in an EID row (`row[eid]` is free when identity
+/// `eid` is; entry 0, the reserved identity 0, is never taken), or `None` when
+/// every identity is taken.
+pub(super) fn lowest_free_eid(row: &[crate::irq::SlotEntry]) -> Option<u32>
 {
     let (index, _) = row
         .iter()
         .enumerate()
         .skip(1)
-        .find(|(_, entry)| entry.load(core::sync::atomic::Ordering::Relaxed) == 0)?;
+        .find(|(_, entry)| entry.is_free())?;
     u32::try_from(index).ok()
 }
 
@@ -224,14 +224,16 @@ mod tests
     #[test]
     fn lowest_free_eid_skips_identity_zero_and_taken_ones()
     {
-        use core::sync::atomic::AtomicU32;
-        let row: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+        use crate::irq::{Slot, SlotEntry};
+        let row: [SlotEntry; 4] = [const { SlotEntry::free() }; 4];
         assert_eq!(lowest_free_eid(&row), Some(1));
-        row[1].store(10, core::sync::atomic::Ordering::Relaxed);
-        row[3].store(11, core::sync::atomic::Ordering::Relaxed);
+        row[1].store(Slot::Line(10));
+        row[3].store(Slot::Unbound);
         assert_eq!(lowest_free_eid(&row), Some(2));
-        row[2].store(12, core::sync::atomic::Ordering::Relaxed);
+        row[2].store(Slot::Line(0));
         assert_eq!(lowest_free_eid(&row), None);
+        row[3].store(Slot::Free);
+        assert_eq!(lowest_free_eid(&row), Some(3));
     }
 
     // Defect caught: a field lost or bled into another in the packed word, so

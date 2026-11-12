@@ -80,7 +80,7 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    completes leaves init-logd serving and init's memory caps held until
    shutdown (a benign hold, not a wedge).
    svcmgr publishes the well-known names it now owns (`rootfs.root`,
-   `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`,
+   `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
    `vfsd.mount`, `vfsd.deny`, `logd.query`), configures devmgr's device classes and publishes
    each as `devmgr.class.<class>`, and installs devmgr's `/services/drivers/` cap via
    `SET_DRIVERS_DIR` from the endowment (see

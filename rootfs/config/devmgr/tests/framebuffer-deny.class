@@ -1,0 +1,10 @@
+# framebuffer-deny: a SEND on the `framebuffer` class without the class's verb bits.
+#
+# Its only verb bit, 58, is one the framebuffer drivers do not check, so every
+# gated label sent through a driver SEND it yields replies the driver's
+# UNAUTHORIZED; svctest's drivers deny phase asserts that. svcmgr publishes
+# it seed-only as `devmgr.class.framebuffer-deny`, which only svctest seeds.
+# Test-only: this directory is not scanned; the svctest recipe copies the
+# file into /config/devmgr/classes/ (docs/testing.md).
+class = framebuffer
+verbs = 58

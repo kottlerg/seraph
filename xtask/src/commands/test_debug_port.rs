@@ -121,6 +121,7 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
         x86_paging: X86Paging::Four,
         iommu: Iommu::Attached,
         debug_port: Some(args.port),
+        test_devices: false,
     };
     let qemu_args = build_qemu_argv(&spec)?;
     let qemu_binary = require_tool(args.arch.qemu_binary())?;

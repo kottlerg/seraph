@@ -83,7 +83,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
     [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] \
     [--iommu attached|absent] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
-    [--debug-port PORT [--debug-target NAME]]
+    [--debug-port PORT [--debug-target NAME]] [--test-devices]
 ```
 
 | Option | Description |
@@ -102,6 +102,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
 | `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the process's sysroot binary for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
+| `--test-devices` | Attach the test devices (see Attached devices): `edu` and four `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -133,9 +134,13 @@ absent`, the machine's IOMMU: `intel-iommu` (interrupt remapping off) on x86-64 
 (`iommu_platform=on`); the RNG, which only the firmware drives, stays outside it. The riscv64 IOMMU
 is the first device of the command line, pinned at 00:01.0, so every auto-placed device takes a
 slot above it: QEMU's ACPI RIMT describes the IOMMU as translating only the requester IDs above its
-own. Both architectures also attach `-device edu`, QEMU's DMA test device, behind the IOMMU when one
-is attached, which only svctest's DMA confinement phase drives
-([services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md)). On x86-64 it also
+own. `--test-devices` adds, on both architectures, `-device edu`, QEMU's DMA test device (PCI
+`1234:11e8`), behind the IOMMU when one is attached, which only svctest's DMA confinement phase
+drives ([services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md)), and four
+QEMU `pci-testdev` functions (PCI `1b36:0005`) at pinned slots 0x15, 0x16, 0x17 (`membar=4K`) and
+0x18 (`membar=8K`), which the test-only `test-fault` driver binds
+([services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md)). No other launch
+attaches them, and no production driver binds them. On x86-64 a launch also
 attaches `-device vmgenid,guid=auto`, the VMGENID generation-ID device
 ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Whole-VM-snapshot detection
 (VMGENID)); QEMU's riscv64 `virt` machine has no VMGENID. A non-headless run adds QEMU std VGA:
@@ -253,8 +258,9 @@ recipe; a plain repack would prune it):
 
 ```sh
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
+cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 cargo xtask mkdisk --repack-only --arch x86_64
-cargo xtask run --arch x86_64
+cargo xtask run --arch x86_64 --test-devices
 ```
 
 Example — boot the staged svctest set from a 4Kn disk, then with the data
@@ -374,6 +380,7 @@ cargo xtask run-parallel \
     [--display headless|framebuffer] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
     [--debug-port PORT [--debug-target NAME]] \
+    [--test-devices] \
     [--pass REGEX] \
     [--fail REGEX] \
     [--fail-also REGEX] \
@@ -400,6 +407,7 @@ cargo xtask run-parallel \
 | `--second-disk-shared-line` | off | Place the second disk on the first disk's `INTx` line; same semantics as `cargo xtask run --second-disk-shared-line` |
 | `--debug-port` | (none) | Attach the debug port, served on `127.0.0.1:PORT`; same semantics as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host port) |
 | `--debug-target` | (none) | Stage the GDB stub for these boots, attached to the process named `NAME`, and print the host GDB command line; same semantics as `cargo xtask run --debug-target`. The stub is staged, and the images repacked in the layout they have, before the runs copy them, and removed after the last run. Requires `--debug-port` |
+| `--test-devices` | off | Attach the test devices to each guest; same semantics as `cargo xtask run --test-devices` |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
@@ -747,13 +755,14 @@ repacks `disk.img`, boots the current sysroot once, and always removes the knob 
 afterwards. It passes when the boot reaches its pass marker and its log holds the bootloader's
 line `boot: memory map: mapredo knob present; redoing steps 6 and 7` exactly once.
 
-A pure runner; requires a harness staged (CI runs it on the ktest bundle):
+A pure runner; requires a harness staged (CI runs it on the ktest bundle), and `--test-devices`
+when that harness is svctest, whose devmgr phases drive the test devices (as for `run`):
 
 ```sh
 cargo xtask build [--arch x86_64|riscv64]
 cargo xtask compose-bundle --harness ktest [--arch x86_64|riscv64]
 cargo xtask test-map-redo [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [--mem MIB] \
-    [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5]
+    [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] [--test-devices]
 ```
 
 The boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass and fail markers,
@@ -1178,16 +1187,16 @@ themselves, from `src/host_lock.rs`, before they start: `build` and `clean` as b
 `run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port`
 and `test-gdb` as boots.
 
-A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 2 side by
+A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
 to itself, and so does a boot started with `--alone` or `--timing`.
 
 | Command | Admitted when | Load limit (1-minute average, below) |
 |---|---|---|
 | Build | No `--timing` boot runs | 32 (`BUILD_LOAD_MAX`) |
-| Small boot | No boot that needs the host to itself runs, no QEMU of more than 4 vCPUs runs, and the QEMUs running plus its own are at most 2 (`SMALL_BOOTS_MAX`) | 16 (`SMALL_BOOT_LOAD_MAX`) |
+| Small boot | No boot that needs the host to itself runs, no QEMU of more than 4 vCPUs runs, and the QEMUs running plus its own are at most 3 (`SMALL_BOOTS_MAX`) | 16 (`SMALL_BOOT_LOAD_MAX`) |
 | Small boot, `--alone` | No QEMU runs | 16 (`SMALL_BOOT_LOAD_MAX`) |
-| More than 4 vCPUs (`SMALL_BOOT_VCPUS_MAX`), more than 2 QEMUs, or `--timing` | No QEMU runs | 10 (`LARGE_BOOT_LOAD_MAX`) |
+| More than 4 vCPUs (`SMALL_BOOT_VCPUS_MAX`), more than 3 QEMUs, or `--timing` | No QEMU runs | 10 (`LARGE_BOOT_LOAD_MAX`) |
 
 While a boot that needs the host to itself runs, every other boot is refused, and while a
 `--timing` boot runs, every build is too. The QEMUs running are counted two ways, and the
@@ -1215,7 +1224,7 @@ The options:
 |---|---|---|
 | `--wait-host <SECS>` | Builds and boots | On a refusal, ask again every 10 s until admitted, for at most SECS; at the bound, fail with the last refusal. Without it a refusal fails at once. |
 | `--host-override` | Builds and boots | Start even when the rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers its record, so other commands see it. |
-| `--alone` | Boots | Run beside no other QEMU, and keep every other boot off the host: a run [docs/testing.md](../docs/testing.md) § Coverage tiers owes. |
+| `--alone` | Boots | Run beside no other QEMU, and keep every other boot off the host: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts (`.claude/agents/worker.md` § Host runs). |
 | `--timing` | Boots | A timing-sensitive measurement: beside no other QEMU, under the 10 load limit, with builds refused while it runs. |
 | `--grant <HOLDER>` | Boots | Boot under the exclusive grant of HOLDER. |
 

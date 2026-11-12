@@ -101,11 +101,12 @@ only diagnostics report surplus entries (more than `MAX_CPUS` enabled
 CPUs, on x86-64 more than `MAX_IOAPICS` IOAPICs, or aperture seeds past
 the seed buffers) and, on RISC-V, an IMSIC file off its layout. The
 bootloader proceeds with whatever it successfully extracted. The kernel
-falls back to its compile-time defaults
-for any zero MMIO base field, but a zero riscv64 `timebase_freq` or a missing `hart_caps`
-bit (filled by the RHCT walk; the DTB `/cpus` walk then supplies `timebase_freq` when ACPI
-left it zero and ORs in further `hart_caps` bits) halts the kernel at Phase 5 (see
-[boot-flow.md](boot-flow.md) §"Step 9").
+falls back to its compile-time defaults for any zero MMIO base field but the riscv64 `aplic`
+and `imsic`, which it requires: a zero `imsic` halts it at Phase 4 and a zero `aplic` at
+Phase 5. A zero riscv64 `timebase_freq` or a missing `hart_caps` bit (filled by the RHCT
+walk; the DTB `/cpus` walk then supplies `timebase_freq` when ACPI left it zero and ORs in
+further `hart_caps` bits) halts the kernel at Phase 5 (see [boot-flow.md](boot-flow.md)
+§"Step 9").
 
 ---
 

@@ -62,6 +62,9 @@ object = { version = "0.40", default-features = false, features = ["write"] }
 gimli = { version = "0.34", default-features = false, features = ["write"] }
 # The normalized exception codes test-crash-report's tests build reports with.
 syscall-abi = { path = "../abi/syscall" }
+# The `test-fault` fixture's role BAR lengths, which the qemu tests check the
+# test launch's `pci-testdev` functions against.
+ipc = { path = "../shared/ipc" }
 
 # Windows console-mode bindings for TerminalGuard. Only pulled in for
 # Windows builds; Linux/macOS/BSD builds skip this crate entirely.

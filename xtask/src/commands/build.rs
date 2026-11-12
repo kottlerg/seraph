@@ -86,6 +86,11 @@ enum InstallDest
     /// per-program tester binaries discovered by the `usertest`
     /// orchestrator. See docs/testing.md § Sysroot layout.
     TestsPrograms,
+    /// Installed under `sysroot/tests/drivers/<install_name>` — test-only
+    /// drivers no drivers-directory pass of the boot lists, which devmgr
+    /// binds only on svctest's `BIND_DRIVERS` with a cap on that directory.
+    /// See docs/testing.md § Sysroot layout.
+    TestsDrivers,
 }
 
 /// Static description of a single buildable component (other than boot).
@@ -220,31 +225,19 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::ServicesDrivers,
         arch_only: Some(Arch::Riscv64),
     },
-    // TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    // fault-injection driver exercising devmgr's #176 orphan teardown; it
-    // ships on the rootfs and is spawned only by devmgr's TEST_SPAWN_ORPHAN
-    // shim under svctest.
-    Spec {
-        name: "test-orphan",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::ServicesDrivers,
-        arch_only: None,
-    },
-    // TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    // fault-injection driver exercising devmgr's settle bound and driver
-    // withdrawal; it ships on the rootfs and is spawned only by devmgr's
-    // TEST_SPAWN_FAULT_DRIVERS shim under svctest.
+    // Test-only fault-injection driver for QEMU's `pci-testdev`, which a
+    // launch attaches only with `--test-devices`, exercising devmgr's
+    // on-demand bind, settle bound, mid-bootstrap teardown, and driver
+    // withdrawal; devmgr binds it only on svctest's `BIND_DRIVERS`.
     Spec {
         name: "test-fault",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::ServicesDrivers,
+        dest: InstallDest::TestsDrivers,
         arch_only: None,
     },
-    // TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    // driver for QEMU's `edu` DMA device, which every launch attaches; it
-    // ships on the rootfs, and devmgr binds it to that device by its
+    // Test-only driver for QEMU's `edu` DMA device, which a launch attaches
+    // only with `--test-devices`; devmgr binds it to that device by its
     // declaration at SET_DRIVERS_DIR.
     Spec {
         name: "test-dma",
@@ -988,6 +981,7 @@ fn install_paths(ctx: &BuildContext, spec: &Spec) -> Vec<PathBuf>
         {
             vec![ctx.sysroot.join("tests").join("programs").join(n)]
         }
+        InstallDest::TestsDrivers => vec![ctx.sysroot.join("tests").join("drivers").join(n)],
     }
 }
 

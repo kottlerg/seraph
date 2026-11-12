@@ -18,9 +18,9 @@
 //! to the page's second half, unmaps the page, and copies the buffer to the
 //! same device address once more, reporting whether the mapped copies arrived
 //! and whether the copy after the unmap reached the page. Behind an IOMMU it
-//! does not, and the IOMMU records a fault for it.
-//!
-//! TODO(#165): remove with the devmgr enumeration redesign.
+//! does not, and the IOMMU records a fault for it, which the driver waits to
+//! see counted by devmgr (`devmgr_dma_labels::DMA_FAULTS`) and reports with
+//! the probe.
 
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,8 @@ const BACK_OFFSET: usize = 0x800;
 /// How long one transfer may take: the device starts a transfer on a 100 ms
 /// timer, so a transfer that has not completed in 2 s never will.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long to wait between two `DMA_FAULTS` requests.
+const FAULT_POLL: Duration = Duration::from_millis(50);
 
 struct Driver
 {
@@ -211,6 +213,28 @@ impl Driver
     }
 }
 
+/// The IOMMU faults devmgr has taken for the device once the copy after the
+/// unmap at `iova` is counted: `DMA_FAULTS` asked until its latest fault is
+/// in the probe page, for at most `test_dma_labels::FAULT_WAIT_MS`. An
+/// unconfined device's reply comes at once. `None` when devmgr refuses.
+fn faults_after(dma_ep: u64, iova: u64, ipc_buf: *mut u64) -> Option<ipc::DmaFaults>
+{
+    let start = Instant::now();
+    loop
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let f = unsafe { ipc::dma_faults(dma_ep, ipc_buf) }.ok()?;
+        let counted = f.count != 0 && f.last_iova == iova & !(PAGE_SIZE - 1);
+        if !f.confined
+            || counted
+            || start.elapsed() >= Duration::from_millis(test_dma_labels::FAULT_WAIT_MS)
+        {
+            return Some(f);
+        }
+        std::thread::sleep(FAULT_POLL);
+    }
+}
+
 /// The probe pattern's byte at `i`: none zero.
 fn pattern(i: usize) -> u8
 {
@@ -312,20 +336,35 @@ fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
         }
         let reply = match msg.label
         {
-            test_dma_labels::DMA_PROBE => match driver.probe(ipc_buf)
+            test_dma_labels::DMA_PROBE => match driver.probe(ipc_buf).and_then(|(o, l, iova)| {
+                faults_after(driver.dma_ep, iova, ipc_buf).map(|f| (o, l, iova, f))
+            })
             {
-                Some((outcome, landed, iova)) =>
+                Some((outcome, landed, iova, faults)) =>
                 {
                     std::os::seraph::log!(
-                        "test-dma: probe outcome {} at device address {:#x}, copy after unmap landed={}",
+                        "test-dma: probe outcome {} at device address {:#x}, copy after unmap landed={}, confined={}, faults={}",
                         outcome,
                         iova,
-                        landed
+                        landed,
+                        faults.confined,
+                        faults.count
                     );
+                    let confined = if faults.confined
+                    {
+                        ipc::devmgr_dma_labels::DMA_CONFINED
+                    }
+                    else
+                    {
+                        0
+                    };
                     IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
                         .word(0, outcome)
                         .word(1, landed)
                         .word(2, iova)
+                        .word(3, confined)
+                        .word(4, faults.count)
+                        .word(5, faults.last_iova)
                         .build()
                 }
                 None => IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST),

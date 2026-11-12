@@ -150,11 +150,18 @@ jobs:
         # crasher's among them, must kill as with no handler and leave no crash
         # report (test-crash-report --expect none, below). The usertest cell keeps
         # crashd and checks the crashme fixture's reports.
+        #
+        # The svctest cell also stages the test-only device class files of
+        # `sysroot/config/devmgr/tests/` (svcmgr does not scan that directory)
+        # into `classes/`, and its boot attaches the test devices
+        # (`--test-devices`, below) the test-only drivers bind.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
               cp sysroot/config/svcmgr/tests/svctest.svc \
                  sysroot/config/svcmgr/services/
+              cp sysroot/config/devmgr/tests/*.class \
+                 sysroot/config/devmgr/classes/
               cp sysroot/config/svcmgr/tests/crasher.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
@@ -199,13 +206,18 @@ jobs:
             x86_64-release-ktest)     budget=360 ;;  # worst pass 116.3 s
             *) echo "no budget for this cell" >&2; exit 1 ;;
           esac
+          # The svctest boot attaches the test devices its devmgr phases drive.
+          test_devices=
+          if [ "${{ matrix.tester }}" = "svctest" ]; then
+            test_devices=--test-devices
+          fi
           # --save-logs keeps every run's log, a PASS included, for the
           # run-parallel-saved artifact below, so a cell's per-phase timings
           # can be compared across heads.
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
             --parallel 1 --runs 1 --timeout "$budget" \
-            --save-logs target/xtask/run-parallel-saved
+            --save-logs target/xtask/run-parallel-saved $test_devices
           if [ "${{ matrix.tester }}" = "svctest" ]; then
             # No extra boot: the image staged no crashd, so the log must hold
             # no crash report.

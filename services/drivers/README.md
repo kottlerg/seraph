@@ -80,11 +80,6 @@ services/drivers/
 │   ├── README.md
 │   └── src/
 │       └── main.rs
-├── test-orphan/                    # Test-only fault-injection driver for devmgr (binary)
-│   ├── Cargo.toml
-│   ├── README.md
-│   └── src/
-│       └── main.rs
 ├── virtio/
 │   ├── core/                       # Shared VirtIO transport and queue primitives (library)
 │   │   ├── Cargo.toml
@@ -152,9 +147,8 @@ The full driver lifecycle is specified in
 - **Spawning** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
   discovers devices (PCI enumeration, firmware tables, the boot framebuffer, a platform
   description table), matches each device record to the most
-  specific driver declaration (every driver binary but the test-only `test-fault` and
-  `test-orphan` fixtures carries one in the ELF note section `.note.seraph.driver`, emitted by
-  `driver_binding::driver_declaration!`; see
+  specific driver declaration (every driver binary carries one in the ELF note section
+  `.note.seraph.driver`, emitted by `driver_binding::driver_declaration!`; see
   [docs/driver-binding.md](../../docs/driver-binding.md)), and requests procmgr to create driver
   processes. devmgr then delegates per-device capabilities to the new process.
 - **Communication** — drivers expose IPC endpoints for their clients (e.g. a
@@ -198,8 +192,7 @@ The full driver lifecycle is specified in
 | [`iommu/store/`](iommu/store/README.md) | Library | The table-page store both IOMMU drivers build their translation structures in: zeroed pages from memmgr, mapped, with their physical addresses |
 | [`iommu/vtd/`](iommu/vtd/README.md) | Binary + library | VT-d IOMMU driver (x86-64) — devmgr-spawned at boot; programs the remapping units' tables and confines each DMA-capable device to its own domain |
 | [`test-dma/`](test-dma/README.md) | Binary | Test-only driver for QEMU's `edu` device — svctest checks a mapped DMA copy arrives and one to an unmapped IOVA is stopped |
-| [`test-fault/`](test-fault/README.md) | Binary | Test-only fault-injection driver — reports ready and dies on request, or never reports ready, so svctest exercises devmgr's settle bound and driver withdrawal |
-| [`test-orphan/`](test-orphan/README.md) | Binary | Test-only fault-injection driver — forces a mid-bootstrap spawn failure so svctest exercises devmgr's orphan-teardown path |
+| [`test-fault/`](test-fault/README.md) | Binary | Test-only fault-injection driver, installed in `/tests/drivers/` and bound through `BIND_DRIVERS` — serves and dies on request, never reports ready, or fails its bootstrap, so svctest exercises devmgr's settle bound, orphan teardown, and driver withdrawal |
 
 ---
 

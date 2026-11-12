@@ -11,13 +11,14 @@ endowment to either supervise the running instance or launch a fresh
 one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliation).
 
 svcmgr also owns the system-wide discovery registry: it publishes the well-known names it owns
-(`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`,
+(`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
 `vfsd.mount`, `vfsd.deny`, `logd.query`, a `devmgr.class.<class>` per device class file, and each
 provider's `provides` names like `pwrmgr.shutdown` / `timed`) into the registry itself — from the
 source caps init endows it with at handover, and from each provider's launch. Consumers resolve
 any name through their `.svc` `seed = ...` line at launch time, and the public names
 (`svcmgr`, `pwrmgr.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority
-is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. The
+is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields
+`GRANT`; a seed is `SEND` except `devmgr.bind`, which is `SEND|GRANT`. The
 endowment and registry wire format are in [docs/ipc-interface.md](docs/ipc-interface.md).
 
 A raw-syscall fallback that lets svcmgr recreate procmgr if procmgr
@@ -175,7 +176,7 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount vfsd.deny
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny
 ```
 
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
@@ -212,7 +213,7 @@ column). The handover endowment and
 | `svcmgr` | svcmgr (its own service ep) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
-| `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| TEST_LABEL_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
+| `devmgr.bind` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| BIND_AUTHORITY`-badged `SEND\|GRANT` on devmgr's registry endpoint, gating `BIND_DRIVERS`, which moves a directory cap (seeded by svctest only) | no |
 | `devmgr.class.<class>` | svcmgr (a `MINT_CLASS_SEND` reply, one per class file) | class SEND on devmgr's registry endpoint: the badge names the class's slot and the class file's verbs ([Device class files](docs/service-definitions.md#device-class-files)) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |

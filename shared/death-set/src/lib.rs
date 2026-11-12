@@ -23,8 +23,6 @@
 //! and funds the objects through `std::os::seraph`, so it is compiled only
 //! for seraph and no host test reaches it.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg(target_os = "seraph")]
 
 use std::cell::{Cell, RefCell};

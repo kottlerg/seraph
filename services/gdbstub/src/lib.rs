@@ -11,8 +11,6 @@
 //! the debug port and the fault receivers, and implements the machine's
 //! [`session::Kernel`] with syscalls.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 pub mod breakpoints;

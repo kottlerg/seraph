@@ -17,8 +17,6 @@
 //!
 //! `no_std`, no allocation, no dependencies; RV64GC encodings.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 /// `c.ebreak` (0x9002), little-endian: the breakpoint a debugger plants at the

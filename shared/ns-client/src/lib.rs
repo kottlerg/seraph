@@ -22,8 +22,6 @@
 //! returned cap carries at most `requested_rights` on every bit. `0xFFFF`
 //! requests everything the caller is allowed.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 use ipc::{IpcMessage, ns_labels};

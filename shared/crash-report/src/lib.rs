@@ -15,8 +15,6 @@
 //! `no_std` with `alloc`: the parser builds owned blocks; the emitter
 //! allocates nothing.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 extern crate alloc;

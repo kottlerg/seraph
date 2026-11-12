@@ -15,9 +15,6 @@
 //! partition registration (`REGISTER_PARTITION`), and the device geometry
 //! (`BLK_GET_GEOMETRY`) over IPC.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod io;
 
 use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};

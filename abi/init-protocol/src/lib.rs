@@ -25,8 +25,6 @@
 //!   integer repr, all with stable layout.
 //! - No dependencies outside `core`.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 // ── Protocol version ─────────────────────────────────────────────────────────

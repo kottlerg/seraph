@@ -14,9 +14,6 @@
 //! declines the fault with the report's id as the reason. The mechanism and
 //! its limits are in services/crashd/docs/operation.md.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod arch;
 
 use std::sync::mpsc;

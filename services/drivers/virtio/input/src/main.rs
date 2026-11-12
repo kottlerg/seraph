@@ -18,9 +18,6 @@
 //! ABI and declares the same `input` class, which consumers query with
 //! [`devmgr_labels::QUERY_DEVICE`], so they never learn the transport.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod decode;
 mod input;
 

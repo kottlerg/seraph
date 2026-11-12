@@ -24,8 +24,6 @@
 //! Output goes to stdout only: the usertest orchestrator drains stdout to
 //! EOF before stderr, so unbounded stderr would deadlock against it.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // A per-program tester is test code, where unwrap and expect are permitted
 // (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait
 // must abort the tester, and the panic's non-zero exit is its FAIL verdict.

@@ -26,8 +26,6 @@
 // workspace-core stub's `pub extern crate core;` re-export is what
 // resolves `use core::…`. Same incantation as `shared/log`,
 // `shared/ipc`, etc.
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]

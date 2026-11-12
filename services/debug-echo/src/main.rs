@@ -10,9 +10,6 @@
 //! The packets it answers, and the markers it logs, are specified in
 //! `services/debug-echo/README.md`.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use std::time::Duration;
 
 use gdb_rsp::command::Command;

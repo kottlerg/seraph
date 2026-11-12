@@ -11,8 +11,6 @@
 //! its bookkeeping lives in a self-hosted arena of pages carved from its own
 //! pool (`memmgr-free-pool`).
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 #![no_main]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.

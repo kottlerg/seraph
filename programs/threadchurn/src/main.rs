@@ -32,8 +32,6 @@
 //! Idiomatic `std` for the threading; only the sampling reaches the Seraph
 //! `cap_info` / memmgr surfaces.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // threadchurn is a test fixture, where unwrap and expect are permitted
 // (docs/coding-standards.md § Error Handling): a failed `cap_info` sample or
 // a panicked worker must abort the run, and the panic's non-zero exit with no

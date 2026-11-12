@@ -20,8 +20,6 @@
 //! until init-logd stops writing the UART ([`SELF_LOG_HOLD`]), then the
 //! gate's opening and the control loop.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 

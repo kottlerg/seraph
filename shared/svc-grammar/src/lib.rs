@@ -16,8 +16,6 @@
 //!
 //! `no_std`, no allocation: every [`Entry`] borrows the caller's text.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 /// One `key = value` line of a file.

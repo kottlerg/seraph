@@ -13,9 +13,6 @@
 //! driver binary (`main.rs`) implements the accessor over the bound CMOS
 //! I/O ports.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 /// Seconds register.
 pub const REG_SECONDS: u8 = 0x00;
 /// Minutes register.

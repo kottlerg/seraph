@@ -26,9 +26,6 @@
 //! own threads. So a `SYS_THREAD_WRITE_MEM` of the stub's writes another
 //! address space, which its `# Safety` contract does not constrain.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod arch;
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};

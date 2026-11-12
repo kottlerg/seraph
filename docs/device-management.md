@@ -445,7 +445,7 @@ derivation it revokes when it withdraws the driver (devmgr's
   or torn down with its holder's CSpace); the line is unmasked when the remaining bindings owe
   nothing, and released at its controller when none remains. A bound binding holds a reference on
   its Notification, so deleting the Notification's capabilities leaves the binding in place until
-  its Interrupt capability unbinds, rebinds or goes. A driver that
+  its Interrupt object rebinds or is freed. A driver that
   dies while its device asserts a level-triggered line leaves the device asserting with no
   receiver to clear it, so the line's other receivers are signalled again on each unmask; devmgr
   ends that by setting the function's Interrupt Disable bit, and running its declared reset, when it

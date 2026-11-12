@@ -23,9 +23,9 @@
 //! closures, so the policy is host-tested here. Every user's queue sizes are
 //! its own (`DeathQueues::new`).
 
-// When this crate is compiled as a std dep via rustc-dep-of-std, the
-// crate root is `no_core` and the prelude reaches only the root module;
-// submodules import it themselves. Harmless no-op otherwise.
+// When this crate is compiled as a std dep via rustc-dep-of-std, it is
+// `no_core`, so no module gets the prelude implicitly; this one imports it
+// by hand. The import is absent otherwise.
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 

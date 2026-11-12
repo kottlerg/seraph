@@ -339,9 +339,10 @@ After each merge that shares a file with another merge since the previous releas
 merged PR's worker `composition check <merge>` (docs/conventions.md § Composition check;
 `.claude/agents/worker.md` § Composition check), its worktree parked first; a worker already
 retired is respawned for it. A merge that shares no file owes no check. A defect the check
-finds is the worker's next PR, which you schedule like any other. Once the check hands back with
-no defect, or that PR has merged, nothing is left for the worker: remove its parked worktree
-(§ Worktree removal).
+finds is the worker's next PR, which you schedule like any other; a defect in work an open Issue
+names is recorded there and leads to no PR. Once a check hands back and leaves the worker no PR,
+nothing is left for it: remove its parked worktree (§ Worktree removal). A defect PR's own merge
+owes a check on the same terms as any other, and the worktree then waits for that check.
 
 Order merges to minimize re-validation. A PR whose merge touches only Markdown or comments, or
 no file another open PR touches, costs the others a CI run and nothing else, so merge it as

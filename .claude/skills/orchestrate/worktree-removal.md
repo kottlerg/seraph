@@ -10,7 +10,9 @@ batch spawned and the record lists (the state, or the log for a worker that
 - **At a worker's retirement:** after its last PR merges (or its gate report, when it has no PR
   left to merge) and nothing is left for it. A worktree parked on a `park/<name>` branch for a
   composition check is removed once nothing is left for its worker: the check has handed back
-  with no defect, or the PR its defect led to has merged.
+  and leaves it no PR, having found no defect or recorded each on an open Issue. A defect that
+  becomes the worker's next PR keeps the worktree until that PR merges and the composition
+  check its merge owes, when it owes one, hands back the same way.
 - **At wind-down:** every worktree the record lists that is still present, after confirming no
   active worker owns it.
 

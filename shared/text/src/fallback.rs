@@ -21,7 +21,8 @@ pub fn ascii_fallback(cp: u32) -> Option<&'static [u8]>
     TABLE
         .binary_search_by_key(&cp, |&(c, _)| c)
         .ok()
-        .map(|i| TABLE[i].1)
+        .and_then(|i| TABLE.get(i))
+        .map(|&(_, sub)| sub)
 }
 
 /// Sorted Unicode → ASCII substitute table. Restricted to codepoints

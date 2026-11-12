@@ -26,6 +26,8 @@
 //! [`Utf8Decoder`] and resolves the same glyph set through
 //! [`render_codepoint`].
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 pub mod cp437;

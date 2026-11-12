@@ -10,7 +10,10 @@
 //! sector bytes, locates every slot an entry occupies for its removal
 //! ([`RemoveRunScan`]), finds a run of free slots for a new entry
 //! ([`FreeRunScan`]), bounds cluster numbers to the data region
-//! ([`is_data_cluster`]), encodes long names ([`encode_lfn`]), picks
+//! ([`is_data_cluster`]), locates, reads and writes FAT entries
+//! ([`fat_entry_location`], [`read_fat_entry`], [`write_fat_entry`]),
+//! places a file offset in its cluster chain ([`file_position`]), encodes
+//! long names ([`encode_lfn`]) and packs their slots ([`pack_lfn_slot`]), picks
 //! short-name numeric tails ([`TailSet`]), and keeps the node table's
 //! recycling identifiers ([`node_slab::NodeSlab`]) and the open-instance
 //! table's ([`open_slab::OpenSlab`]), with the schedule of its sweeps for
@@ -23,9 +26,13 @@
 //! the point — see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+use core::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 
 pub mod node_slab;
 pub mod open_slab;
@@ -196,10 +203,12 @@ fn decode_bpb(sector_data: &[u8; MIN_SECTOR_SIZE]) -> Result<BpbGeometry, BpbErr
     let root_entry_count = u16::from_le_bytes([sector_data[17], sector_data[18]]);
 
     // Validate fields used as divisors to prevent division by zero.
-    if bytes_per_sector == 0 || sectors_per_cluster == 0
+    let Some(cluster_divisor) =
+        NonZeroU32::new(u32::from(sectors_per_cluster)).filter(|_| bytes_per_sector != 0)
+    else
     {
         return Err(BpbError::ZeroDivisor);
-    }
+    };
     if !is_sector_size(usize::from(bytes_per_sector))
     {
         return Err(BpbError::UnsupportedSectorSize);
@@ -262,7 +271,7 @@ fn decode_bpb(sector_data: &[u8; MIN_SECTOR_SIZE]) -> Result<BpbGeometry, BpbErr
         .ok_or(BpbError::BadGeometry)?;
 
     let data_sectors = total_sectors.saturating_sub(data_start_sector);
-    let total_clusters = data_sectors / u32::from(sectors_per_cluster);
+    let total_clusters = data_sectors / cluster_divisor;
 
     // FAT type determination per the Microsoft specification. FAT12 is
     // refused: the driver reads only 16- and 32-bit FAT entries.
@@ -314,7 +323,7 @@ fn decode_bpb(sector_data: &[u8; MIN_SECTOR_SIZE]) -> Result<BpbGeometry, BpbErr
 /// region; one named past it lies in a FAT copy or the data region, where
 /// writing the hints back would corrupt the volume, so it is treated as
 /// absent too.
-fn named_fsinfo_sector(sector_data: &[u8], reserved_sectors: u16) -> Option<u32>
+fn named_fsinfo_sector(sector_data: &[u8; MIN_SECTOR_SIZE], reserved_sectors: u16) -> Option<u32>
 {
     let fsinfo = u16::from_le_bytes([sector_data[48], sector_data[49]]);
     (fsinfo != 0 && fsinfo != 0xFFFF && fsinfo < reserved_sectors).then_some(u32::from(fsinfo))
@@ -342,14 +351,17 @@ fn check_fat_capacity(
     total_clusters: u32,
 ) -> Result<(), BpbError>
 {
-    let (entry_bytes, max_clusters) = match fat_type
+    // A `u32` by `u16` product fits a `u64`, so this never saturates.
+    let fat_bytes = u64::from(fat_size).saturating_mul(u64::from(bytes_per_sector));
+    let (fat_entries, max_clusters) = match fat_type
     {
-        FatType::Fat16 => (2u64, 0xFFF5u64),
-        FatType::Fat32 => (4u64, 0x0FFF_FFF5u64),
+        FatType::Fat16 => (fat_bytes / 2, 0xFFF5u64),
+        FatType::Fat32 => (fat_bytes / 4, 0x0FFF_FFF5u64),
     };
-    let fat_entries = u64::from(fat_size) * u64::from(bytes_per_sector) / entry_bytes;
+    // A `u32` count plus the two reserved entries fits a `u64`, so this
+    // never saturates.
     let clusters = u64::from(total_clusters);
-    if clusters + 2 > fat_entries || clusters > max_clusters
+    if clusters.saturating_add(2) > fat_entries || clusters > max_clusters
     {
         return Err(BpbError::BadGeometry);
     }
@@ -369,11 +381,12 @@ fn check_fat_capacity(
 #[must_use]
 pub fn cluster_to_sector(data_start_sector: u32, sectors_per_cluster: u8, cluster: u32) -> u32
 {
-    if cluster < 2
+    let Some(index) = cluster.checked_sub(2)
+    else
     {
         return data_start_sector;
-    }
-    data_start_sector.saturating_add((cluster - 2).saturating_mul(u32::from(sectors_per_cluster)))
+    };
+    data_start_sector.saturating_add(index.saturating_mul(u32::from(sectors_per_cluster)))
 }
 
 /// Whether `cluster` names a cluster of the data region of a volume with
@@ -384,7 +397,137 @@ pub fn cluster_to_sector(data_start_sector: u32, sectors_per_cluster: u8, cluste
 #[must_use]
 pub fn is_data_cluster(cluster: u32, total_clusters: u32) -> bool
 {
-    cluster >= 2 && cluster - 2 < total_clusters
+    cluster
+        .checked_sub(2)
+        .is_some_and(|index| index < total_clusters)
+}
+
+// ── FAT entries ─────────────────────────────────────────────────────────────
+
+/// The bits of a FAT32 entry that hold a cluster number; the top four are
+/// reserved (Microsoft FAT specification §4) and kept on a write.
+const FAT32_ENTRY_MASK: u32 = 0x0FFF_FFFF;
+
+impl FatType
+{
+    /// Bytes of one FAT entry.
+    const fn entry_bytes(self) -> u32
+    {
+        match self
+        {
+            Self::Fat16 => 2,
+            Self::Fat32 => 4,
+        }
+    }
+}
+
+/// Where the first FAT copy holds the entry of `cluster`: the sector, counted
+/// from the volume start past `reserved_sectors`, and the entry's byte offset
+/// in that sector of `bytes_per_sector` bytes.
+///
+/// `None` when `bytes_per_sector` is 0 or the sector number overflows, which
+/// no cluster of the data region of a mounted volume reaches: the caller
+/// bounds `cluster` to the data region ([`is_data_cluster`]) first.
+#[must_use]
+pub fn fat_entry_location(
+    fat_type: FatType,
+    reserved_sectors: u16,
+    bytes_per_sector: u16,
+    cluster: u32,
+) -> Option<(u32, usize)>
+{
+    let bps = NonZeroU32::new(u32::from(bytes_per_sector))?;
+    let offset = cluster.checked_mul(fat_type.entry_bytes())?;
+    let sector = u32::from(reserved_sectors).checked_add(offset / bps)?;
+    Some((sector, usize::try_from(offset % bps).ok()?))
+}
+
+/// The FAT entry at byte `offset` of the FAT sector `sector`: a FAT16 entry
+/// widened, a FAT32 entry without its four reserved bits. `None` when the
+/// entry does not lie inside `sector`.
+#[must_use]
+pub fn read_fat_entry(sector: &[u8], fat_type: FatType, offset: usize) -> Option<u32>
+{
+    let bytes = sector.get(offset..)?;
+    match fat_type
+    {
+        FatType::Fat16 => bytes
+            .first_chunk::<2>()
+            .map(|&entry| u32::from(u16::from_le_bytes(entry))),
+        FatType::Fat32 => bytes
+            .first_chunk::<4>()
+            .map(|&entry| u32::from_le_bytes(entry) & FAT32_ENTRY_MASK),
+    }
+}
+
+/// Store `value` as the FAT entry at byte `offset` of the FAT sector
+/// `sector`: the low 16 bits for FAT16, the low 28 bits for FAT32 with the
+/// entry's four reserved bits kept. `None`, with `sector` unchanged, when the
+/// entry does not lie inside `sector`.
+pub fn write_fat_entry(
+    sector: &mut [u8],
+    fat_type: FatType,
+    offset: usize,
+    value: u32,
+) -> Option<()>
+{
+    let bytes = sector.get_mut(offset..)?;
+    match fat_type
+    {
+        FatType::Fat16 =>
+        {
+            let [low, high, ..] = value.to_le_bytes();
+            *bytes.first_chunk_mut::<2>()? = [low, high];
+        }
+        FatType::Fat32 =>
+        {
+            let entry = bytes.first_chunk_mut::<4>()?;
+            let reserved = u32::from_le_bytes(*entry) & !FAT32_ENTRY_MASK;
+            *entry = (reserved | (value & FAT32_ENTRY_MASK)).to_le_bytes();
+        }
+    }
+    Some(())
+}
+
+// ── File positions ──────────────────────────────────────────────────────────
+
+/// Where a byte of a file lies in its cluster chain ([`file_position`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilePosition
+{
+    /// Clusters of the chain before the one holding the byte.
+    pub cluster_index: u64,
+    /// Bytes from the byte to the end of its cluster, at least 1.
+    pub left_in_cluster: u64,
+    /// The sector holding the byte, counted from its cluster's first.
+    pub sector_in_cluster: u32,
+    /// The byte's offset in that sector.
+    pub offset_in_sector: usize,
+    /// Bytes from the byte to the end of its sector, at least 1.
+    pub left_in_sector: usize,
+}
+
+/// Where byte `offset` of a file lies, on a volume of `sectors_per_cluster`
+/// sectors of `bytes_per_sector` bytes per cluster. `None` when either is 0,
+/// which mount refuses ([`BpbError::ZeroDivisor`]).
+#[must_use]
+pub fn file_position(
+    offset: u64,
+    sectors_per_cluster: u8,
+    bytes_per_sector: u16,
+) -> Option<FilePosition>
+{
+    let bps = NonZeroU64::new(u64::from(bytes_per_sector))?;
+    let cluster_bytes = bps.checked_mul(NonZeroU64::from(NonZeroU8::new(sectors_per_cluster)?))?;
+    let offset_in_cluster = offset % cluster_bytes;
+    let offset_in_sector = offset_in_cluster % bps;
+    Some(FilePosition {
+        cluster_index: offset / cluster_bytes,
+        left_in_cluster: cluster_bytes.get().checked_sub(offset_in_cluster)?,
+        sector_in_cluster: u32::try_from(offset_in_cluster / bps).ok()?,
+        offset_in_sector: usize::try_from(offset_in_sector).ok()?,
+        left_in_sector: usize::try_from(bps.get().checked_sub(offset_in_sector)?).ok()?,
+    })
 }
 
 // ── Directory entry ─────────────────────────────────────────────────────────
@@ -449,9 +592,8 @@ impl DirEntry
     {
         if self.lfn_len > 0
         {
-            let len = usize::from(self.lfn_len).min(out.len());
-            out[..len].copy_from_slice(&self.lfn[..len]);
-            return len;
+            let lfn = self.lfn.iter().take(usize::from(self.lfn_len)).copied();
+            return fill(out, lfn);
         }
         write_83_with_case(&self.name, self.nt_case, out)
     }
@@ -524,7 +666,7 @@ impl LfnAccum
     /// documented on [`LfnAccum`]; rejects the in-flight run on any
     /// violation so a malformed run cannot poison a subsequent valid
     /// one.
-    pub fn add_lfn_entry(&mut self, raw: &[u8])
+    pub fn add_lfn_entry(&mut self, raw: &[u8; 32])
     {
         // Deleted-LFN-slot sentinel — discard the run; the trailing 8.3
         // entry (if any) is also deleted and will be skipped.
@@ -537,12 +679,17 @@ impl LfnAccum
         let is_last = raw[0] & 0x40 != 0;
         let seq = raw[0] & 0x3F;
         // Per the FAT spec, seq is in 1..=20 (20 slots × 13 chars =
-        // 260, capped to 255 by the protocol).
-        if seq == 0 || seq as usize > MAX_LFN_CHARS.div_ceil(13)
+        // 260, capped to 255 by the protocol). The slot holds name
+        // positions from `(seq - 1) * 13`.
+        let Some(base) = usize::from(seq)
+            .checked_sub(1)
+            .filter(|&slot| slot < MAX_LFN_CHARS.div_ceil(13))
+            .and_then(|slot| slot.checked_mul(13))
+        else
         {
             self.reset();
             return;
-        }
+        };
         let chksum = raw[13];
 
         if is_last
@@ -560,7 +707,7 @@ impl LfnAccum
         }
         else
         {
-            if !self.saw_last || chksum != self.chksum || seq + 1 != self.last_seq
+            if !self.saw_last || chksum != self.chksum || self.last_seq.checked_sub(1) != Some(seq)
             {
                 self.reset();
                 return;
@@ -568,18 +715,23 @@ impl LfnAccum
             self.last_seq = seq;
         }
 
-        // Character byte offsets within the 32-byte entry: 5 + 6 + 2.
-        let offsets: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
-        let base = (seq as usize - 1) * 13;
+        // The slot's 13 UCS-2 characters, in three runs of the 32-byte
+        // entry: 5 at byte 1, 6 at byte 14, 2 at byte 28.
+        let units = raw[1..11]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .chain(raw[14..26].as_chunks::<2>().0)
+            .chain(raw[28..32].as_chunks::<2>().0)
+            .map(|&pair| u16::from_le_bytes(pair));
         let mut saw_terminator = false;
-        for (i, &off) in offsets.iter().enumerate()
+        for (pos, ch) in (base..).zip(units)
         {
-            let pos = base + i;
-            if pos >= MAX_LFN_CHARS
+            let Some(slot) = self.chars.get_mut(pos)
+            else
             {
                 break;
-            }
-            let ch = u16::from_le_bytes([raw[off], raw[off + 1]]);
+            };
             if ch == 0x0000 || ch == 0xFFFF
             {
                 if !saw_terminator
@@ -592,7 +744,7 @@ impl LfnAccum
                 }
                 continue;
             }
-            self.chars[pos] = ch;
+            *slot = ch;
         }
     }
 
@@ -616,84 +768,14 @@ impl LfnAccum
     #[must_use]
     pub fn assemble_utf8(&self, out: &mut [u8]) -> Option<usize>
     {
-        let mut pos = 0;
-        let mut i = 0;
-        while i < self.len
+        let units = self.chars.iter().take(self.len).copied();
+        let mut pos = 0usize;
+        for unit in char::decode_utf16(units)
         {
-            let ch = self.chars[i];
-            if (0xD800..=0xDBFF).contains(&ch)
-            {
-                if i + 1 >= self.len
-                {
-                    return None;
-                }
-                let low = self.chars[i + 1];
-                if !(0xDC00..=0xDFFF).contains(&low)
-                {
-                    return None;
-                }
-                let cp = 0x1_0000 + (u32::from(ch - 0xD800) << 10) + u32::from(low - 0xDC00);
-                if pos + 4 > out.len()
-                {
-                    return None;
-                }
-                // Casts are range-safe: cp is a Unicode scalar value
-                // ≤ 0x10_FFFF; each byte mask narrows to ≤ 0xFF.
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    out[pos] = 0xF0 | (cp >> 18) as u8;
-                    out[pos + 1] = 0x80 | ((cp >> 12) & 0x3F) as u8;
-                    out[pos + 2] = 0x80 | ((cp >> 6) & 0x3F) as u8;
-                    out[pos + 3] = 0x80 | (cp & 0x3F) as u8;
-                }
-                pos += 4;
-                i += 2;
-            }
-            else if (0xDC00..=0xDFFF).contains(&ch)
-            {
-                return None;
-            }
-            else if ch < 0x80
-            {
-                if pos + 1 > out.len()
-                {
-                    return None;
-                }
-                // Cast is range-safe: ch < 0x80 fits in a u8.
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    out[pos] = ch as u8;
-                }
-                pos += 1;
-                i += 1;
-            }
-            else if ch < 0x800
-            {
-                if pos + 2 > out.len()
-                {
-                    return None;
-                }
-                // Casts are range-safe: ch < 0x800 fits in 11 bits.
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    out[pos] = 0xC0 | (ch >> 6) as u8;
-                    out[pos + 1] = 0x80 | (ch & 0x3F) as u8;
-                }
-                pos += 2;
-                i += 1;
-            }
-            else
-            {
-                if pos + 3 > out.len()
-                {
-                    return None;
-                }
-                out[pos] = 0xE0 | (ch >> 12) as u8;
-                out[pos + 1] = 0x80 | ((ch >> 6) & 0x3F) as u8;
-                out[pos + 2] = 0x80 | (ch & 0x3F) as u8;
-                pos += 3;
-                i += 1;
-            }
+            let ch = unit.ok()?;
+            let end = pos.checked_add(ch.len_utf8())?;
+            ch.encode_utf8(out.get_mut(pos..end)?);
+            pos = end;
         }
         Some(pos)
     }
@@ -716,18 +798,8 @@ impl LfnAccum
         {
             return false;
         };
-        if len != name.len()
-        {
-            return false;
-        }
-        for (a, b) in buf[..len].iter().zip(name.iter())
-        {
-            if to_upper(*a) != to_upper(*b)
-            {
-                return false;
-            }
-        }
-        true
+        buf.get(..len)
+            .is_some_and(|assembled| assembled.eq_ignore_ascii_case(name))
     }
 }
 
@@ -769,7 +841,7 @@ pub fn lfn_checksum(name: &[u8; 11]) -> u8
 /// have accumulated an LFN run via [`LfnAccum`] populate `lfn` / `lfn_len`
 /// themselves.
 #[must_use]
-pub fn parse_dir_entry(raw: &[u8]) -> Option<DirEntry>
+pub fn parse_dir_entry(raw: &[u8; 32]) -> Option<DirEntry>
 {
     if raw[0] == 0x00
     {
@@ -805,22 +877,19 @@ pub fn parse_dir_entry(raw: &[u8]) -> Option<DirEntry>
 pub fn name_matches(entry_name: &[u8; 11], component: &[u8]) -> bool
 {
     let mut padded = [b' '; 11];
-    let dot_pos = component.iter().position(|&b| b == b'.');
-    let (base, ext) = if let Some(dp) = dot_pos
+    // The base is the component up to its first dot, the extension what
+    // follows that dot. `splitn` always yields the base, so its fallback is
+    // never taken.
+    let mut parts = component.splitn(2, |&b| b == b'.');
+    let base = parts.next().unwrap_or_default();
+    let ext = parts.next().unwrap_or_default();
+    for (dst, &b) in padded[..8].iter_mut().zip(base)
     {
-        (&component[..dp], &component[dp + 1..])
+        *dst = to_upper(b);
     }
-    else
+    for (dst, &b) in padded[8..].iter_mut().zip(ext)
     {
-        (component, &[] as &[u8])
-    };
-    for (i, &b) in base.iter().take(8).enumerate()
-    {
-        padded[i] = to_upper(b);
-    }
-    for (i, &b) in ext.iter().take(3).enumerate()
-    {
-        padded[8 + i] = to_upper(b);
+        *dst = to_upper(b);
     }
     *entry_name == padded
 }
@@ -829,12 +898,31 @@ pub fn name_matches(entry_name: &[u8; 11], component: &[u8]) -> bool
 #[must_use]
 pub fn to_upper(b: u8) -> u8
 {
-    if b.is_ascii_lowercase() { b - 32 } else { b }
+    b.to_ascii_uppercase()
 }
 
-fn to_lower(b: u8) -> u8
+/// `bytes` without its trailing space padding.
+fn trim_spaces(mut bytes: &[u8]) -> &[u8]
 {
-    if b.is_ascii_uppercase() { b + 32 } else { b }
+    while let [rest @ .., b' '] = bytes
+    {
+        bytes = rest;
+    }
+    bytes
+}
+
+/// Copy `src` into the front of `out` until either runs out; returns the
+/// bytes written.
+fn fill(out: &mut [u8], src: impl Iterator<Item = u8>) -> usize
+{
+    let mut written = 0usize;
+    for (dst, b) in out.iter_mut().zip(src)
+    {
+        *dst = b;
+        // At most `out.len()` bytes are written, so this never saturates.
+        written = written.saturating_add(1);
+    }
+    written
 }
 
 /// Format an 8.3 entry honouring NT case-flag bits.
@@ -848,47 +936,12 @@ fn write_83_with_case(raw: &[u8; 11], nt_case: u8, out: &mut [u8]) -> usize
 {
     let lower_base = nt_case & 0x08 != 0;
     let lower_ext = nt_case & 0x10 != 0;
+    let fold = |lower: bool| move |&b: &u8| if lower { b.to_ascii_lowercase() } else { b };
 
-    let mut pos = 0;
-    let mut base_end = 8;
-    while base_end > 0 && raw[base_end - 1] == b' '
-    {
-        base_end -= 1;
-    }
-    for &b in &raw[..base_end]
-    {
-        if pos >= out.len()
-        {
-            return pos;
-        }
-        out[pos] = if lower_base { to_lower(b) } else { b };
-        pos += 1;
-    }
-
-    let mut ext_end = 11;
-    while ext_end > 8 && raw[ext_end - 1] == b' '
-    {
-        ext_end -= 1;
-    }
-    if ext_end > 8
-    {
-        if pos >= out.len()
-        {
-            return pos;
-        }
-        out[pos] = b'.';
-        pos += 1;
-        for &b in &raw[8..ext_end]
-        {
-            if pos >= out.len()
-            {
-                return pos;
-            }
-            out[pos] = if lower_ext { to_lower(b) } else { b };
-            pos += 1;
-        }
-    }
-    pos
+    let base = trim_spaces(&raw[..8]).iter().map(fold(lower_base));
+    let ext = trim_spaces(&raw[8..]);
+    let dot = (!ext.is_empty()).then_some(b'.');
+    fill(out, base.chain(dot).chain(ext.iter().map(fold(lower_ext))))
 }
 
 // ── Removal slot run ────────────────────────────────────────────────────────
@@ -896,6 +949,52 @@ fn write_83_with_case(raw: &[u8; 11], nt_case: u8, out: &mut [u8]) -> usize
 /// Maximum directory slots one entry occupies: a 20-slot LFN run
 /// (255 chars / 13 chars per slot) plus the trailing 8.3 entry.
 pub const MAX_SLOT_RUN: usize = MAX_LFN_CHARS.div_ceil(13) + 1;
+
+/// Up to [`MAX_SLOT_RUN`] slot positions, in the order they were pushed.
+struct SlotRun<L>
+{
+    slots: [L; MAX_SLOT_RUN],
+    len: usize,
+}
+
+impl<L: Copy + Default> SlotRun<L>
+{
+    fn new() -> Self
+    {
+        Self {
+            slots: [L::default(); MAX_SLOT_RUN],
+            len: 0,
+        }
+    }
+
+    fn clear(&mut self)
+    {
+        self.len = 0;
+    }
+
+    fn len(&self) -> usize
+    {
+        self.len
+    }
+
+    /// Append `loc`; a push to a full run is dropped.
+    fn push(&mut self, loc: L)
+    {
+        if let Some(slot) = self.slots.get_mut(self.len)
+        {
+            *slot = loc;
+            // `len` is below `MAX_SLOT_RUN` here, so this never saturates.
+            self.len = self.len.saturating_add(1);
+        }
+    }
+
+    fn as_slice(&self) -> &[L]
+    {
+        // `push` keeps `len` at most `MAX_SLOT_RUN`, so the fallback is never
+        // taken.
+        self.slots.get(..self.len).unwrap_or_default()
+    }
+}
 
 /// Outcome of feeding one directory slot to [`RemoveRunScan::step`].
 pub enum RemoveStep
@@ -927,8 +1026,7 @@ pub struct RemoveRunScan<L>
     lfn: LfnAccum,
     /// Positions of the LFN slots since the last run start (`0x40` flag);
     /// after a match, the matched entry's run.
-    slots: [L; MAX_SLOT_RUN],
-    len: usize,
+    slots: SlotRun<L>,
 }
 
 impl<L: Copy + Default> RemoveRunScan<L>
@@ -939,15 +1037,14 @@ impl<L: Copy + Default> RemoveRunScan<L>
     {
         Self {
             lfn: LfnAccum::new(),
-            slots: [L::default(); MAX_SLOT_RUN],
-            len: 0,
+            slots: SlotRun::new(),
         }
     }
 
     fn reset(&mut self)
     {
         self.lfn.reset();
-        self.len = 0;
+        self.slots.clear();
     }
 
     /// Every slot the entry the last [`RemoveStep::Found`] reported
@@ -956,7 +1053,7 @@ impl<L: Copy + Default> RemoveRunScan<L>
     #[must_use]
     pub fn run(&self) -> &[L]
     {
-        &self.slots[..self.len]
+        self.slots.as_slice()
     }
 
     /// Feed the directory slot `raw`, found at `loc`, to the scan for the
@@ -984,14 +1081,13 @@ impl<L: Copy + Default> RemoveRunScan<L>
             // validated run's positions are exactly its own (at most 20).
             if raw[0] & 0x40 != 0
             {
-                self.len = 0;
+                self.slots.clear();
             }
             self.lfn.add_lfn_entry(raw);
             // The last slot stays free for the 8.3 entry.
-            if self.len < MAX_SLOT_RUN - 1
+            if self.slots.len() < MAX_SLOT_RUN - 1
             {
-                self.slots[self.len] = loc;
-                self.len += 1;
+                self.slots.push(loc);
             }
             return RemoveStep::Continue;
         }
@@ -1002,10 +1098,9 @@ impl<L: Copy + Default> RemoveRunScan<L>
             {
                 if !lfn_valid
                 {
-                    self.len = 0;
+                    self.slots.clear();
                 }
-                self.slots[self.len] = loc;
-                self.len += 1;
+                self.slots.push(loc);
                 return RemoveStep::Found {
                     cluster: entry.cluster,
                 };
@@ -1038,8 +1133,7 @@ impl<L: Copy + Default> Default for RemoveRunScan<L>
 /// across sector and cluster boundaries.
 pub struct FreeRunScan<L>
 {
-    slots: [L; MAX_SLOT_RUN],
-    len: usize,
+    slots: SlotRun<L>,
     count: usize,
     past_end: bool,
 }
@@ -1051,8 +1145,7 @@ impl<L: Copy + Default> FreeRunScan<L>
     pub fn new(count: usize) -> Self
     {
         Self {
-            slots: [L::default(); MAX_SLOT_RUN],
-            len: 0,
+            slots: SlotRun::new(),
             count: count.clamp(1, MAX_SLOT_RUN),
             past_end: false,
         }
@@ -1071,7 +1164,7 @@ impl<L: Copy + Default> FreeRunScan<L>
     #[must_use]
     pub fn run(&self) -> &[L]
     {
-        &self.slots[..self.len]
+        self.slots.as_slice()
     }
 
     /// Feed the slot at `loc` whose first byte is `first`; once the scan is
@@ -1080,7 +1173,7 @@ impl<L: Copy + Default> FreeRunScan<L>
     /// and returns `true` again.
     pub fn step(&mut self, first: u8, loc: L) -> bool
     {
-        if self.len >= self.count
+        if self.slots.len() >= self.count
         {
             return true;
         }
@@ -1090,14 +1183,13 @@ impl<L: Copy + Default> FreeRunScan<L>
         }
         if self.past_end || first == 0xE5
         {
-            self.slots[self.len] = loc;
-            self.len += 1;
+            self.slots.push(loc);
         }
         else
         {
-            self.len = 0;
+            self.slots.clear();
         }
-        self.len >= self.count
+        self.slots.len() >= self.count
     }
 }
 
@@ -1114,17 +1206,66 @@ impl<L: Copy + Default> FreeRunScan<L>
 pub fn encode_lfn(name: &[u8], out: &mut [u16; MAX_LFN_CHARS]) -> Option<usize>
 {
     let text = core::str::from_utf8(name).ok()?;
-    let mut len = 0;
+    let mut len = 0usize;
     for ch in text.chars()
     {
         let mut units = [0u16; 2];
         for &unit in ch.encode_utf16(&mut units).iter()
         {
             *out.get_mut(len)? = unit;
-            len += 1;
+            // `len` indexes `out`, so this never saturates.
+            len = len.saturating_add(1);
         }
     }
     Some(len)
+}
+
+/// Attribute byte of a long-name directory slot.
+pub const ATTR_LFN: u8 = 0x0F;
+
+/// Flag `OR`ed into the sequence number of a long-name run's last slot, the
+/// one written first on disk.
+const LFN_LAST_FLAG: u8 = 0x40;
+
+/// The long-name slot `seq` (from 1) of the name `units`, its UTF-16 code
+/// units ([`encode_lfn`]), carrying the 8.3 checksum `chksum`
+/// ([`lfn_checksum`]); `is_last` marks the run's last slot. The slot holds
+/// units `(seq - 1) * 13` onward; a position past the name holds a single
+/// `0x0000` terminator, then `0xFFFF` padding. The form
+/// [`LfnAccum::add_lfn_entry`] decodes.
+///
+/// `None` when `seq` is 0 or past the slots of a [`MAX_LFN_CHARS`] name.
+#[must_use]
+pub fn pack_lfn_slot(seq: u8, is_last: bool, chksum: u8, units: &[u16]) -> Option<[u8; 32]>
+{
+    let base = usize::from(seq)
+        .checked_sub(1)
+        .filter(|&slot| slot < MAX_LFN_CHARS.div_ceil(13))?
+        .checked_mul(13)?;
+    let mut chars = [0xFFFFu16; 13];
+    for (pos, ch) in (base..).zip(chars.iter_mut())
+    {
+        *ch = match units.get(pos)
+        {
+            Some(&unit) => unit,
+            None if pos == units.len() => 0x0000,
+            None => 0xFFFF,
+        };
+    }
+    let bytes = chars.map(u16::to_le_bytes);
+    // The 13 characters lie in three runs of the slot: 5 at byte 1, 6 at
+    // byte 14, 2 at byte 28.
+    let (first, rest) = bytes.as_flattened().split_at_checked(10)?;
+    let (second, third) = rest.split_at_checked(12)?;
+    let mut slot = [0u8; 32];
+    slot[0] = if is_last { seq | LFN_LAST_FLAG } else { seq };
+    slot[1..11].copy_from_slice(first);
+    slot[11] = ATTR_LFN;
+    slot[13] = chksum;
+    slot[14..26].copy_from_slice(second);
+    // FirstClusLO, bytes 26 and 27, is zero in a long-name slot.
+    slot[28..32].copy_from_slice(third);
+    Some(slot)
 }
 
 // ── Short-name numeric tails ────────────────────────────────────────────────
@@ -1152,29 +1293,40 @@ pub fn compose_tailed_name(basis: &[u8; 11], tail: u32) -> Option<[u8; 11]>
     {
         return None;
     }
-    let mut digits = [0u8; 6];
+    // The tail's decimal digits, right-aligned in a space-filled buffer.
+    let mut digits = [b' '; 6];
     let mut n = tail;
-    let mut ndigits = 0;
-    while n > 0
+    for slot in digits.iter_mut().rev()
     {
-        // Cast is range-safe: n % 10 < 10.
-        #[allow(clippy::cast_possible_truncation)]
-        let d = (n % 10) as u8;
-        digits[5 - ndigits] = b'0' + d;
-        ndigits += 1;
+        if n == 0
+        {
+            break;
+        }
+        *slot = ascii_digit(n % 10)?;
         n /= 10;
     }
-    let base_len = basis[..8]
+    let digits = digits.trim_ascii_start();
+    let base = trim_spaces(&basis[..8]);
+    // At most six digits, so the subtraction never saturates.
+    let keep = base.len().min((8 - 1usize).saturating_sub(digits.len()));
+    let tailed = base
         .iter()
-        .rposition(|&b| b != b' ')
-        .map_or(0, |p| p + 1);
-    let keep = base_len.min(8 - 1 - ndigits);
+        .take(keep)
+        .chain(core::iter::once(&b'~'))
+        .chain(digits);
     let mut out = [b' '; 11];
-    out[..keep].copy_from_slice(&basis[..keep]);
-    out[keep] = b'~';
-    out[keep + 1..keep + 1 + ndigits].copy_from_slice(&digits[6 - ndigits..]);
+    for (dst, &b) in out[..8].iter_mut().zip(tailed)
+    {
+        *dst = b;
+    }
     out[8..].copy_from_slice(&basis[8..]);
     Some(out)
+}
+
+/// The ASCII digit for `d`, or `None` when `d` is not a decimal digit.
+fn ascii_digit(d: u32) -> Option<u8>
+{
+    char::from_digit(d, 10).and_then(|c| u8::try_from(c).ok())
 }
 
 /// The numeric tail `sfn` carries as a [`compose_tailed_name`] of `basis`,
@@ -1186,21 +1338,20 @@ pub fn tail_of(sfn: &[u8; 11], basis: &[u8; 11]) -> Option<u32>
     {
         return None;
     }
-    let base_end = sfn[..8].iter().rposition(|&b| b != b' ')? + 1;
-    let tilde = sfn[..base_end].iter().rposition(|&b| b == b'~')?;
-    let digits = &sfn[tilde + 1..base_end];
-    if digits.is_empty() || digits.len() > 6 || digits[0] == b'0'
+    // The digits after the base's last `~`; `None` when it has no `~`.
+    let mut parts = trim_spaces(&sfn[..8]).rsplitn(2, |&b| b == b'~');
+    let digits = parts.next()?;
+    parts.next()?;
+    if digits.len() > 6 || matches!(digits.first(), None | Some(&b'0'))
     {
         return None;
     }
     let mut tail = 0u32;
     for &d in digits
     {
-        if !d.is_ascii_digit()
-        {
-            return None;
-        }
-        tail = tail * 10 + u32::from(d - b'0');
+        let digit = char::from(d).to_digit(10)?;
+        // Six decimal digits fit a `u32`, so neither operation fails.
+        tail = tail.checked_mul(10)?.checked_add(digit)?;
     }
     (compose_tailed_name(basis, tail)? == *sfn).then_some(tail)
 }
@@ -1244,7 +1395,11 @@ impl TailSet
     #[must_use]
     pub fn lowest_free(&self) -> Option<u32>
     {
-        (1..=DIR_ENTRIES_MAX + 1).find(|&t| self.bits[t as usize / 64] & (1 << (t % 64)) == 0)
+        (1..=DIR_ENTRIES_MAX + 1).find(|&t| {
+            self.bits
+                .get(t as usize / 64)
+                .is_some_and(|word| word & (1 << (t % 64)) == 0)
+        })
     }
 }
 
@@ -1705,6 +1860,156 @@ mod tests
     }
 
     #[test]
+    fn fat_entry_location_finds_the_sector_and_offset_of_each_width()
+    {
+        // FAT16: cluster 300 is byte 600, sector 1 offset 88 of 512-byte sectors.
+        assert_eq!(
+            fat_entry_location(FatType::Fat16, 4, 512, 300),
+            Some((5, 88))
+        );
+        // FAT32: cluster 300 is byte 1200, sector 2 offset 176.
+        assert_eq!(
+            fat_entry_location(FatType::Fat32, 32, 512, 300),
+            Some((34, 176))
+        );
+        assert_eq!(
+            fat_entry_location(FatType::Fat32, 32, 4096, 1025),
+            Some((33, 4))
+        );
+    }
+
+    #[test]
+    fn fat_entry_location_refuses_overflow_and_a_zero_sector_size()
+    {
+        assert_eq!(fat_entry_location(FatType::Fat32, 32, 512, u32::MAX), None);
+        assert_eq!(fat_entry_location(FatType::Fat16, 4, 0, 2), None);
+        // The entry's byte offset fits, the sector number does not.
+        assert_eq!(
+            fat_entry_location(FatType::Fat32, u16::MAX, 1, 0x3FFF_FFFF),
+            None
+        );
+    }
+
+    #[test]
+    fn fat_entries_round_trip_and_fat32_keeps_its_reserved_bits()
+    {
+        let mut sector = [0u8; 512];
+        sector[8..12].copy_from_slice(&0xA000_0005u32.to_le_bytes());
+        assert_eq!(read_fat_entry(&sector, FatType::Fat32, 8), Some(5));
+        assert_eq!(
+            write_fat_entry(&mut sector, FatType::Fat32, 8, 0xFFFF_FFFF),
+            Some(())
+        );
+        assert_eq!(sector[8..12], 0xAFFF_FFFFu32.to_le_bytes());
+        assert_eq!(
+            read_fat_entry(&sector, FatType::Fat32, 8),
+            Some(0x0FFF_FFFF)
+        );
+
+        assert_eq!(
+            write_fat_entry(&mut sector, FatType::Fat16, 2, 0x1_FFF7),
+            Some(())
+        );
+        assert_eq!(sector[2..4], [0xF7, 0xFF]);
+        assert_eq!(read_fat_entry(&sector, FatType::Fat16, 2), Some(0xFFF7));
+    }
+
+    #[test]
+    fn a_fat_entry_past_its_sector_is_neither_read_nor_written()
+    {
+        let mut sector = [0xAAu8; 512];
+        assert_eq!(read_fat_entry(&sector, FatType::Fat32, 510), None);
+        assert_eq!(read_fat_entry(&sector, FatType::Fat16, 512), None);
+        assert_eq!(read_fat_entry(&sector, FatType::Fat16, usize::MAX), None);
+        assert_eq!(write_fat_entry(&mut sector, FatType::Fat32, 509, 0), None);
+        assert_eq!(write_fat_entry(&mut sector, FatType::Fat16, 511, 0), None);
+        assert!(sector.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn file_position_splits_an_offset_into_cluster_sector_and_byte()
+    {
+        // 4 sectors of 512 bytes per cluster: byte 5000 is in cluster 2
+        // (bytes 4096..6144), sector 1 of it (4608..5120), byte 392.
+        assert_eq!(
+            file_position(5000, 4, 512),
+            Some(FilePosition {
+                cluster_index: 2,
+                left_in_cluster: 1144,
+                sector_in_cluster: 1,
+                offset_in_sector: 392,
+                left_in_sector: 120,
+            })
+        );
+        assert_eq!(
+            file_position(0, 1, 4096),
+            Some(FilePosition {
+                cluster_index: 0,
+                left_in_cluster: 4096,
+                sector_in_cluster: 0,
+                offset_in_sector: 0,
+                left_in_sector: 4096,
+            })
+        );
+        // The largest offset a FAT file reaches, on the largest cluster.
+        assert_eq!(
+            file_position(u64::from(u32::MAX), 255, 4096),
+            Some(FilePosition {
+                cluster_index: 4112,
+                left_in_cluster: 978_945,
+                sector_in_cluster: 15,
+                offset_in_sector: 4095,
+                left_in_sector: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn file_position_refuses_a_zero_geometry()
+    {
+        assert_eq!(file_position(10, 0, 512), None);
+        assert_eq!(file_position(10, 8, 0), None);
+    }
+
+    #[test]
+    fn packed_lfn_slots_decode_back_to_the_name()
+    {
+        // 27 units: two full slots and one holding a single unit, its
+        // terminator, and padding.
+        let name = "abcdefghijklmnopqrstuvw.txt";
+        let sfn = *b"ABCDEF~1TXT";
+        let chksum = lfn_checksum(&sfn);
+        let mut units = [0u16; MAX_LFN_CHARS];
+        let n = encode_lfn(name.as_bytes(), &mut units).expect("valid");
+        let count = u8::try_from(n.div_ceil(13)).expect("fits");
+        let mut acc = LfnAccum::new();
+        for seq in (1..=count).rev()
+        {
+            let slot = pack_lfn_slot(seq, seq == count, chksum, &units[..n]).expect("in range");
+            assert_eq!(slot[11], ATTR_LFN);
+            acc.add_lfn_entry(&slot);
+        }
+        assert!(acc.validate(&sfn));
+        let mut out = [0u8; MAX_LFN_UTF8];
+        let len = acc.assemble_utf8(&mut out).expect("decodes");
+        assert_eq!(&out[..len], name.as_bytes());
+
+        let last = pack_lfn_slot(count, true, chksum, &units[..n]).expect("in range");
+        assert_eq!(last[0], count | 0x40);
+        // Unit 26 (`t`), then the terminator, then padding.
+        assert_eq!(last[1..7], [b't', 0, 0, 0, 0xFF, 0xFF]);
+        assert_eq!(last[30..32], [0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn pack_lfn_slot_refuses_a_sequence_outside_the_run()
+    {
+        assert_eq!(pack_lfn_slot(0, true, 0, &[0x41]), None);
+        assert!(pack_lfn_slot(20, true, 0, &[0x41]).is_some());
+        assert_eq!(pack_lfn_slot(21, true, 0, &[0x41]), None);
+    }
+
+    #[test]
     fn lfn_checksum_computes_rotate_carry_over_known_8_3_name()
     {
         // The 8.3 form of README.TXT. The carry-rotate (>>1 with the lsb
@@ -1732,6 +2037,41 @@ mod tests
         assert_eq!(e.cluster, 0x0012_3456);
         assert_eq!(e.size, 4096);
         assert_eq!(e.lfn_len, 0);
+    }
+
+    #[test]
+    fn display_name_of_an_8_3_entry_honours_nt_case_bits_and_drops_padding()
+    {
+        let mut out = [0u8; MAX_LFN_UTF8];
+        let both = DirEntry::from_83(*b"BOOT    CNF", 0x18, 0, 0, 0);
+        let len = both.write_display_name(&mut out);
+        assert_eq!(&out[..len], b"boot.cnf");
+        let ext_only = DirEntry::from_83(*b"BOOT    CNF", 0x10, 0, 0, 0);
+        let len = ext_only.write_display_name(&mut out);
+        assert_eq!(&out[..len], b"BOOT.cnf");
+        let no_ext = DirEntry::from_83(*b"README     ", 0, 0, 0, 0);
+        let len = no_ext.write_display_name(&mut out);
+        assert_eq!(&out[..len], b"README");
+    }
+
+    #[test]
+    fn display_name_stops_at_the_end_of_a_short_buffer()
+    {
+        let entry = DirEntry::from_83(*b"BOOT    CNF", 0, 0, 0, 0);
+        let mut out = [0u8; 5];
+        assert_eq!(entry.write_display_name(&mut out), 5);
+        assert_eq!(&out, b"BOOT.");
+    }
+
+    #[test]
+    fn display_name_with_a_long_name_length_past_its_buffer_writes_the_buffer()
+    {
+        let mut entry = DirEntry::from_83(*b"X          ", 0, 0, 0, 0);
+        entry.lfn = [b'a'; MAX_LFN_UTF8];
+        entry.lfn_len = u16::MAX;
+        let mut out = [0u8; MAX_LFN_UTF8 + 1];
+        assert_eq!(entry.write_display_name(&mut out), MAX_LFN_UTF8);
+        assert!(out[..MAX_LFN_UTF8].iter().all(|&b| b == b'a'));
     }
 
     #[test]

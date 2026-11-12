@@ -93,12 +93,12 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     /// heap cannot grow the table.
     pub fn acquire(&mut self, key: K, make: impl FnOnce() -> T) -> Option<u64>
     {
-        if let Some(bucket) = self.find(&key)
+        if let Some((_, idx)) = self.find(&key)
         {
-            let idx = self.buckets[bucket];
-            return Some(identifier(idx, self.slots[idx as usize].generation));
+            return self.live_identifier(idx);
         }
-        if (self.len + 1) * 2 > self.buckets.len()
+        // The key index stays at least twice the live entries.
+        if self.len >= self.buckets.len() / 2
         {
             self.grow()?;
         }
@@ -108,26 +108,23 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
         }
         else
         {
-            if self.slots.len() >= MAX_ENTRIES
-            {
-                return None;
-            }
+            let (idx, new_len) = new_index(self.slots.len(), MAX_ENTRIES)?;
             self.slots.try_reserve(1).ok()?;
-            self.free.try_reserve(self.slots.len() + 1).ok()?;
+            self.free.try_reserve(new_len).ok()?;
             self.slots.push(Slot {
                 entry: None,
                 generation: 0,
             });
-            // Cast is range-safe: the length is at most MAX_ENTRIES < 2^24.
-            #[allow(clippy::cast_possible_truncation)]
-            let idx = (self.slots.len() - 1) as u32;
             idx
         };
-        let slot = &mut self.slots[idx as usize];
+        // `idx` is a freed or a just-pushed slot, so the slot exists.
+        let slot = self.slots.get_mut(idx as usize)?;
         slot.entry = Some((key, make()));
         let generation = slot.generation;
         self.place(&key, idx);
-        self.len += 1;
+        // At most one live entry per slot, and at most `MAX_ENTRIES` slots, so
+        // this never saturates.
+        self.len = self.len.saturating_add(1);
         Some(identifier(idx, generation))
     }
 
@@ -135,8 +132,8 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     #[must_use]
     pub fn id_of(&self, key: &K) -> Option<u64>
     {
-        let idx = self.buckets[self.find(key)?];
-        Some(identifier(idx, self.slots[idx as usize].generation))
+        let (_, idx) = self.find(key)?;
+        self.live_identifier(idx)
     }
 
     /// The value `id` names, while the entry it was issued for is live.
@@ -144,25 +141,25 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     pub fn get(&self, id: u64) -> Option<&T>
     {
         let idx = self.live_index(id)?;
-        self.slots[idx].entry.as_ref().map(|(_, v)| v)
+        self.slots.get(idx)?.entry.as_ref().map(|(_, v)| v)
     }
 
     /// Mutable access to the value `id` names; `None` as [`Self::get`].
     pub fn get_mut(&mut self, id: u64) -> Option<&mut T>
     {
         let idx = self.live_index(id)?;
-        self.slots[idx].entry.as_mut().map(|(_, v)| v)
+        self.slots.get_mut(idx)?.entry.as_mut().map(|(_, v)| v)
     }
 
     /// Free the entry for `key`, returning its value: every identifier
     /// issued for it stops resolving.
     pub fn remove_key(&mut self, key: &K) -> Option<T>
     {
-        let bucket = self.find(key)?;
-        let idx = self.buckets[bucket];
+        let (bucket, idx) = self.find(key)?;
         self.unplace(bucket);
-        self.len -= 1;
-        let slot = &mut self.slots[idx as usize];
+        // A key the index finds is live, so `len` is at least 1.
+        self.len = self.len.saturating_sub(1);
+        let slot = self.slots.get_mut(idx as usize)?;
         let (_, value) = slot.entry.take()?;
         // Retire an index whose generation would wrap: reissuing generation 0
         // would let an identifier from the first lifetime resolve again.
@@ -192,7 +189,14 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     /// The key of the live slot `idx`.
     fn key_of(&self, idx: u32) -> Option<&K>
     {
-        self.slots[idx as usize].entry.as_ref().map(|(k, _)| k)
+        self.slots.get(idx as usize)?.entry.as_ref().map(|(k, _)| k)
+    }
+
+    /// The identifier of slot `idx` at its current generation.
+    fn live_identifier(&self, idx: u32) -> Option<u64>
+    {
+        let slot = self.slots.get(idx as usize)?;
+        Some(identifier(idx, slot.generation))
     }
 
     /// The bucket `key` hashes to in a table of `mask + 1` buckets.
@@ -206,27 +210,24 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
         home
     }
 
-    /// The bucket holding `key`'s slot index, if `key` is live.
-    fn find(&self, key: &K) -> Option<usize>
+    /// The bucket holding `key`'s slot index, and that index, if `key` is
+    /// live.
+    fn find(&self, key: &K) -> Option<(usize, u32)>
     {
-        if self.buckets.is_empty()
-        {
-            return None;
-        }
-        let mask = self.buckets.len() - 1;
+        let mask = self.buckets.len().checked_sub(1)?;
         let mut b = Self::home(key, mask);
         loop
         {
-            let idx = self.buckets[b];
+            let idx = *self.buckets.get(b)?;
             if idx == EMPTY
             {
                 return None;
             }
             if self.key_of(idx) == Some(key)
             {
-                return Some(b);
+                return Some((b, idx));
             }
-            b = (b + 1) & mask;
+            b = next_bucket(b, mask);
         }
     }
 
@@ -234,13 +235,21 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     /// probe run. The table has room: it is at least twice the live entries.
     fn place(&mut self, key: &K, idx: u32)
     {
-        let mask = self.buckets.len() - 1;
-        let mut b = Self::home(key, mask);
-        while self.buckets[b] != EMPTY
+        let Some(mask) = self.buckets.len().checked_sub(1)
+        else
         {
-            b = (b + 1) & mask;
+            return;
+        };
+        let mut b = Self::home(key, mask);
+        while let Some(bucket) = self.buckets.get_mut(b)
+        {
+            if *bucket == EMPTY
+            {
+                *bucket = idx;
+                return;
+            }
+            b = next_bucket(b, mask);
         }
-        self.buckets[b] = idx;
     }
 
     /// Empty bucket `hole`, shifting each later entry of its probe run back
@@ -248,12 +257,15 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     /// every live key stays reachable from its home without tombstones.
     fn unplace(&mut self, mut hole: usize)
     {
-        let mask = self.buckets.len() - 1;
-        self.buckets[hole] = EMPTY;
-        let mut b = (hole + 1) & mask;
-        loop
+        let Some(mask) = self.buckets.len().checked_sub(1)
+        else
         {
-            let idx = self.buckets[b];
+            return;
+        };
+        self.set_bucket(hole, EMPTY);
+        let mut b = next_bucket(hole, mask);
+        while let Some(&idx) = self.buckets.get(b)
+        {
             if idx == EMPTY
             {
                 return;
@@ -265,11 +277,20 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
             let to_hole = hole.wrapping_sub(start) & mask;
             if to_hole <= from_home
             {
-                self.buckets[hole] = idx;
-                self.buckets[b] = EMPTY;
+                self.set_bucket(hole, idx);
+                self.set_bucket(b, EMPTY);
                 hole = b;
             }
-            b = (b + 1) & mask;
+            b = next_bucket(b, mask);
+        }
+    }
+
+    /// Store `idx` in bucket `b`, a bucket of the table.
+    fn set_bucket(&mut self, b: usize, idx: u32)
+    {
+        if let Some(bucket) = self.buckets.get_mut(b)
+        {
+            *bucket = idx;
         }
     }
 
@@ -277,7 +298,7 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     /// rehash the live entries into it; `None` when the heap cannot hold it.
     fn grow(&mut self) -> Option<()>
     {
-        let size = (self.buckets.len() * 2).max(MIN_BUCKETS);
+        let size = self.buckets.len().checked_mul(2)?.max(MIN_BUCKETS);
         let mut table = Vec::new();
         table.try_reserve_exact(size).ok()?;
         table.resize(size, EMPTY);
@@ -328,6 +349,22 @@ impl Hasher for Fnv1a
             self.0 = (self.0 ^ u64::from(b)).wrapping_mul(FNV_PRIME);
         }
     }
+}
+
+/// The bucket after `b` in the probe order of a table of `mask + 1` buckets,
+/// wrapping to the first.
+fn next_bucket(b: usize, mask: usize) -> usize
+{
+    b.wrapping_add(1) & mask
+}
+
+/// The index of the slot a slab of `len` slots pushes next, and its length
+/// after that push; `None` when the push would take it past `max` slots.
+/// [`crate::open_slab::OpenSlab`] grows the same way.
+pub(crate) fn new_index(len: usize, max: usize) -> Option<(u32, usize)>
+{
+    let new_len = len.checked_add(1).filter(|&n| n <= max)?;
+    Some((u32::try_from(len).ok()?, new_len))
 }
 
 /// The identifier of slab index `idx` at `generation`: never 0, the root's.

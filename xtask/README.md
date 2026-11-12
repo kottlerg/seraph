@@ -596,10 +596,10 @@ is refused.
 `reclaim (resync): badge=<badge> name=<log name>`) gives the log name, read with
 `logd_codec::record::fields` (a quoted name is read whole and unescaped), and the image is the
 sysroot binary named by the log name's first word, searched in `services/`, `services/drivers/`,
-`services/fs/`, `programs/`, `tests/`, and `tests/programs/`, in that order. The binary is used only
-when its executable segments span exactly the block's `text` less its `load_bias`, the span
-procmgr records at spawn, so a binary rebuilt since the boot is refused rather than resolved
-against. Each block prints as:
+`services/fs/`, `programs/`, `tests/`, `tests/drivers/`, and `tests/programs/`, in that order. The
+binary is used only when its executable segments span exactly the block's `text` less its
+`load_bias`, the span procmgr records at spawn, so a binary rebuilt since the boot is refused
+rather than resolved against. Each block prints as:
 
 ```
 crash report <id> (format version <v>): process <log name>

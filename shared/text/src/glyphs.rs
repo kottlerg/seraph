@@ -54,14 +54,43 @@ pub fn render_codepoint(cp: u32, sink: &mut impl FnMut(&[u16]))
 
 fn byte_glyph(byte: u8) -> &'static [u16]
 {
-    let h = GLYPH_HEIGHT as usize;
-    let i = byte as usize * h;
-    &FONT_9X20[i..i + h]
+    glyph(&FONT_9X20, usize::from(byte))
 }
 
 fn ext_glyph(slot: usize) -> &'static [u16]
 {
-    let h = GLYPH_HEIGHT as usize;
-    let i = slot * h;
-    &FONT_9X20_EXT[i..i + h]
+    glyph(&FONT_9X20_EXT, slot)
+}
+
+/// Glyph `index` of `font`, `GLYPH_HEIGHT` rows per glyph. Every index
+/// passed here names a glyph of its font (a byte of the 256-glyph CP437
+/// table, or a slot the extension map lists); an index past the table
+/// yields no rows rather than a panic.
+fn glyph(font: &'static [u16], index: usize) -> &'static [u16]
+{
+    font.as_chunks::<{ GLYPH_HEIGHT as usize }>()
+        .0
+        .get(index)
+        .map_or(&[], |rows| rows.as_slice())
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn glyph_returns_the_rows_of_the_indexed_glyph()
+    {
+        let h = GLYPH_HEIGHT as usize;
+        assert_eq!(glyph(&FONT_9X20, 0x41), &FONT_9X20[0x41 * h..0x42 * h]);
+        assert_eq!(glyph(&FONT_9X20, 255).len(), h);
+    }
+
+    #[test]
+    fn glyph_past_the_table_yields_no_rows()
+    {
+        assert!(glyph(&FONT_9X20, 256).is_empty());
+        assert!(glyph(&FONT_9X20_EXT, usize::MAX).is_empty());
+    }
 }

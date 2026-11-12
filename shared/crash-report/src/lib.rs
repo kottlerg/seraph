@@ -15,6 +15,8 @@
 //! `no_std` with `alloc`: the parser builds owned blocks; the emitter
 //! allocates nothing.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 extern crate alloc;
@@ -399,10 +401,10 @@ impl Report<'_>
         let mut fields = 0usize;
         self.emit_fields(&mut |key, value| {
             out(&Line::Field(id, key, value));
-            fields += 1;
+            fields = fields.saturating_add(1);
         });
         out(&Line::End(id, fields));
-        fields + 2
+        fields.saturating_add(2)
     }
 
     fn emit_fields(&self, field: &mut dyn FnMut(Key, Value<'_>))
@@ -453,8 +455,8 @@ impl Report<'_>
         }
         if !self.code.is_empty()
         {
-            let len = self.code.len().min(MAX_CODE_BYTES);
-            field(Key::Plain("code"), Value::Bytes(&self.code[..len]));
+            let code = self.code.get(..MAX_CODE_BYTES).unwrap_or(self.code);
+            field(Key::Plain("code"), Value::Bytes(code));
         }
         if !self.frames.is_empty()
         {

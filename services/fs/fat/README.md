@@ -11,7 +11,8 @@ fat/
 ├── Cargo.toml
 ├── README.md
 ├── fat-parse/                  # `fatfs-parse`: BPB/dir decoders, slot scans, cluster bounds,
-│                               #   name encoding and tails, node slab, cache bounds
+│                               #   FAT entries, file positions, name encoding, LFN slots
+│                               #   and tails, node slab, cache bounds
 ├── docs/
 │   ├── crash-safety.md         # Per-op write ordering and post-crash visible states
 │   └── storage-layout.md       # Allocator, directory mutation, page cache, NodeTable, eviction

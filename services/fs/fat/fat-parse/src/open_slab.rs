@@ -21,7 +21,7 @@
 
 use alloc::vec::Vec;
 
-use crate::node_slab::{INDEX_BITS, INDEX_MASK, MAX_ENTRIES, identifier};
+use crate::node_slab::{INDEX_BITS, INDEX_MASK, MAX_ENTRIES, identifier, new_index};
 
 struct Slot<T>
 {
@@ -92,24 +92,21 @@ impl<T> OpenSlab<T>
         }
         else
         {
-            if self.slots.len() >= self.max
-            {
-                return None;
-            }
+            let (idx, new_len) = new_index(self.slots.len(), self.max)?;
             self.slots.try_reserve(1).ok()?;
-            self.free.try_reserve(self.slots.len() + 1).ok()?;
+            self.free.try_reserve(new_len).ok()?;
             self.slots.push(Slot {
                 entry: None,
                 generation: 0,
             });
-            // Cast is range-safe: the length is at most MAX_ENTRIES < 2^24.
-            #[allow(clippy::cast_possible_truncation)]
-            let idx = (self.slots.len() - 1) as u32;
             idx
         };
-        let slot = &mut self.slots[idx as usize];
+        // `idx` is a freed or a just-pushed slot, so the slot exists.
+        let slot = self.slots.get_mut(idx as usize)?;
         slot.entry = Some(value);
-        self.len += 1;
+        // At most one live entry per slot, and at most `max` slots, so this
+        // never saturates.
+        self.len = self.len.saturating_add(1);
         Some(identifier(idx, slot.generation))
     }
 
@@ -118,14 +115,14 @@ impl<T> OpenSlab<T>
     pub fn get(&self, id: u64) -> Option<&T>
     {
         let idx = self.live_index(id)?;
-        self.slots[idx].entry.as_ref()
+        self.slots.get(idx)?.entry.as_ref()
     }
 
     /// Mutable access to the entry `id` names; `None` as [`Self::get`].
     pub fn get_mut(&mut self, id: u64) -> Option<&mut T>
     {
         let idx = self.live_index(id)?;
-        self.slots[idx].entry.as_mut()
+        self.slots.get_mut(idx)?.entry.as_mut()
     }
 
     /// Remove the entry `id` names and return it: `id` stops resolving.
@@ -141,7 +138,11 @@ impl<T> OpenSlab<T>
     {
         for idx in 0..self.slots.len()
         {
-            if self.slots[idx].entry.as_ref().is_some_and(&mut pred)
+            if self
+                .slots
+                .get(idx)
+                .and_then(|slot| slot.entry.as_ref())
+                .is_some_and(&mut pred)
                 && let Some(value) = self.take_at(idx)
             {
                 release(value);
@@ -179,9 +180,10 @@ impl<T> OpenSlab<T>
     /// its entry.
     fn take_at(&mut self, idx: usize) -> Option<T>
     {
-        let slot = &mut self.slots[idx];
+        let slot = self.slots.get_mut(idx)?;
         let value = slot.entry.take()?;
-        self.len -= 1;
+        // The slot was live, so `len` is at least 1.
+        self.len = self.len.saturating_sub(1);
         // Retire an index whose generation would wrap: reissuing generation 0
         // would let an identifier from the first lifetime resolve again.
         if let Some(next) = slot.generation.checked_add(1)

@@ -28,6 +28,22 @@
 //! 5. rebinding B to N3 keeps one binding: one acknowledgement unmasks the
 //!    line, a raise signals N3 alone, and it does so again after the next.
 //!
+//! A raise can signal a notification twice. The step 2 raise, made while the
+//! line is masked, is latched at the controller as pending (QEMU's APLIC and
+//! I/O APIC both latch an edge on a disabled source), and B's acknowledgement
+//! in step 3 forwards it at once; step 3's own raise can then reach the
+//! controller after the target CPU took that interrupt and before its
+//! delivery masked the line, so it is forwarded too and delivered after the
+//! first, to the same bindings (core/kernel/docs/syscalls.md
+//! § `SYS_IRQ_REGISTER`, Deliver). Steps 4 and 5 latch and race the same way.
+//! The extra bit can land after the wait that expected the first took it, so
+//! the notification a step expects quiet is emptied once its binding is gone
+//! (N1 after A's deletion, N2 after B's rebind): those removals wait out every
+//! delivery in flight on the line, and any later delivery walks a line without
+//! that binding, so a bit the notification takes after it is a defect. Step 1
+//! has nothing latched before it, so its one raise is forwarded once, and
+//! step 2's quiet check needs no emptying.
+//!
 //! Then the line and 63 of its copies, bound to one notification, fill the
 //! line's `MAX_IRQ_BINDINGS` (64) bindings: one more copy's registration
 //! returns `QuotaExceeded`, and succeeds once a binding goes. Deleting that
@@ -50,7 +66,7 @@
 
 use syscall::{
     IRQ_MODE_LEVEL, IRQ_MODE_MASK, RIGHTS_ALL, cap_create_notification, cap_delete, cap_derive,
-    irq_ack, irq_register, notification_wait_timeout,
+    irq_ack, irq_register, notification_try_wait, notification_wait_timeout,
 };
 use syscall_abi::SyscallError;
 
@@ -153,9 +169,11 @@ fn shared_line(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 
     acknowledge(&[b])?;
     cap_delete(a).map_err(|_| "integration::irq_shared_line: cap_delete(A) failed")?;
+    empty(&[n1]);
     raise_expect(&[n2], &[n1], "deleting the owing A did not leave B served")?;
 
     irq_register(b, n3, 0).map_err(|_| "integration::irq_shared_line: rebinding B refused")?;
+    empty(&[n2]);
     acknowledge(&[b])?;
     raise_expect(&[n3], &[n1, n2], "a rebind left more than one binding")?;
     acknowledge(&[b])?;
@@ -290,6 +308,16 @@ fn acknowledge(caps: &[u64]) -> TestResult
     caps.iter()
         .try_for_each(|&cap| irq_ack(cap))
         .map_err(|_| "integration::irq_shared_line: irq_ack failed")
+}
+
+/// Take the bits a notification holds, so that a quiet check after it sees
+/// only what is delivered from here on (module doc on the double delivery).
+fn empty(notifications: &[u64])
+{
+    for &ntf in notifications
+    {
+        notification_try_wait(ntf).ok();
+    }
 }
 
 /// Raise the line once and require every notification in `signalled` to see

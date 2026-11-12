@@ -11,7 +11,7 @@
 
 // MAX_SECTOR_SIZE and FatType are defined by the pure, host-testable fat_parse
 // crate; the geometry/state machine and block I/O below consume them.
-pub use fat_parse::{FatType, MAX_SECTOR_SIZE};
+pub use fat_parse::{FatType, FilePosition, MAX_SECTOR_SIZE};
 
 use crate::alloc::FatError;
 
@@ -24,13 +24,15 @@ use crate::alloc::FatError;
 /// # Errors
 /// [`FatError::Io`] when the heap cannot hold the buffer; the request fails
 /// as an I/O error would.
-pub fn sector_buffer() -> Result<Box<[u8]>, FatError>
+pub fn sector_buffer() -> Result<Box<[u8; MAX_SECTOR_SIZE]>, FatError>
 {
     let mut buf = Vec::new();
     buf.try_reserve_exact(MAX_SECTOR_SIZE)
         .map_err(|_| FatError::Io)?;
     buf.resize(MAX_SECTOR_SIZE, 0);
-    Ok(buf.into_boxed_slice())
+    // The vector holds exactly MAX_SECTOR_SIZE bytes, so the conversion
+    // never fails.
+    buf.into_boxed_slice().try_into().map_err(|_| FatError::Io)
 }
 
 /// Parsed FAT filesystem geometry and cached FAT sector.
@@ -126,10 +128,19 @@ impl FatState
         fat_parse::is_data_cluster(cluster, self.total_clusters)
     }
 
-    /// Bytes per cluster.
-    pub fn cluster_size(&self) -> u32
+    /// The sector of the first FAT copy holding `cluster`'s entry, and the
+    /// entry's byte offset in it ([`fat_parse::fat_entry_location`]). `None`
+    /// only when the location overflows `u32` or the sector size is zero,
+    /// which mount refuses. The caller bounds `cluster` to the data region
+    /// ([`Self::is_data_cluster`]): the method does not.
+    pub fn fat_entry_location(&self, cluster: u32) -> Option<(u32, usize)>
     {
-        u32::from(self.sectors_per_cluster) * u32::from(self.bytes_per_sector)
+        fat_parse::fat_entry_location(
+            self.fat_type,
+            self.reserved_sectors,
+            self.bytes_per_sector,
+            cluster,
+        )
     }
 
     /// Bytes per sector, as a buffer length: the volume's `BPB_BytsPerSec`,
@@ -139,11 +150,60 @@ impl FatState
         usize::from(self.bytes_per_sector)
     }
 
+    /// The sector a [`sector_buffer`] holds: its first [`Self::sector_bytes`]
+    /// bytes. Mount refuses a sector size past [`MAX_SECTOR_SIZE`]; were the
+    /// state to carry one, the slice is empty, and the block I/O given it
+    /// fails as a read or write error.
+    pub fn sector<'b>(&self, buf: &'b [u8; MAX_SECTOR_SIZE]) -> &'b [u8]
+    {
+        buf.get(..self.sector_bytes()).unwrap_or_default()
+    }
+
+    /// [`Self::sector`], writable.
+    pub fn sector_mut<'b>(&self, buf: &'b mut [u8; MAX_SECTOR_SIZE]) -> &'b mut [u8]
+    {
+        buf.get_mut(..self.sector_bytes()).unwrap_or_default()
+    }
+
+    /// Where byte `offset` of a file lies in its cluster chain
+    /// ([`fat_parse::file_position`]). `None` only for a zero sector or
+    /// cluster size, which mount refuses.
+    pub fn file_position(&self, offset: u64) -> Option<FilePosition>
+    {
+        fat_parse::file_position(offset, self.sectors_per_cluster, self.bytes_per_sector)
+    }
+
+    /// The sectors of `cluster`, in order, from [`Self::cluster_to_sector`].
+    /// A sector number past `u32::MAX` saturates there, past every partition
+    /// bound, so the block driver refuses it, as for `cluster_to_sector`.
+    pub fn cluster_sectors(&self, cluster: u32) -> impl Iterator<Item = u32> + use<>
+    {
+        let base = self.cluster_to_sector(cluster);
+        (0..u32::from(self.sectors_per_cluster)).map(move |s| base.saturating_add(s))
+    }
+
+    /// First sector of the FAT16 fixed root directory: past the reserved
+    /// sectors and every FAT copy. Mount checked the data region, which
+    /// follows the root, starts within `u32`, so this never saturates.
+    pub fn root_dir_start(&self) -> u32
+    {
+        u32::from(self.reserved_sectors)
+            .saturating_add(u32::from(self.num_fats).saturating_mul(self.fat_size))
+    }
+
     /// Sectors of the FAT16 fixed root directory: `root_entry_count` 32-byte
     /// entries, rounded up to whole sectors (0 on FAT32).
     pub fn root_dir_sectors(&self) -> u32
     {
         (u32::from(self.root_entry_count) * 32).div_ceil(u32::from(self.bytes_per_sector))
+    }
+
+    /// The sectors of the FAT16 fixed root directory, in order (none on
+    /// FAT32). They end before the data region, so the sum never saturates.
+    pub fn root_sectors(&self) -> impl Iterator<Item = u32> + use<>
+    {
+        let start = self.root_dir_start();
+        (0..self.root_dir_sectors()).map(move |s| start.saturating_add(s))
     }
 }
 

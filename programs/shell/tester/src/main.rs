@@ -18,6 +18,8 @@
 //! prompt is written without a trailing newline, so it prefixes the next output
 //! line — [`strip_prompts`] removes it for exact-line checks.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // A per-program tester is test code, where unwrap and expect are permitted
 // (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait
 // must abort the tester, and the panic's non-zero exit is its FAIL verdict.

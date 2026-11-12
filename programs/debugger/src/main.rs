@@ -32,6 +32,8 @@
 //! memory writes. Driven by its per-program tester (`tester/`), which
 //! `usertest` runs.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // A test fixture, where unwrap and expect are permitted
 // (docs/coding-standards.md § Error Handling): a failed step must abort the
 // fixture, and the panic's non-zero exit is its FAIL verdict for the tester.
@@ -133,7 +135,10 @@ fn main()
         "the debuggee's memory read back wrong"
     );
     PEEK.store(POKED, Ordering::Release);
-    write_word(&mut regs, arch::IP, reported + arch::RESUME_ADVANCE);
+    let resume = reported
+        .checked_add(arch::RESUME_ADVANCE)
+        .expect("the instruction after the breakpoint has an address");
+    write_word(&mut regs, arch::IP, resume);
     let step = arch::arm_step(th, &mut regs);
     // SAFETY: the frame was read from the debuggee, fault-blocked at its
     // breakpoint; only its instruction pointer (to the next instruction) and,
@@ -418,13 +423,19 @@ fn reply(ipc_buf: *mut u64)
 /// The register-file word at `offset`.
 fn read_word(regs: &[u8], offset: usize) -> u64
 {
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&regs[offset..offset + 8]);
-    u64::from_le_bytes(word)
+    let word = regs
+        .get(offset..)
+        .and_then(<[u8]>::first_chunk::<8>)
+        .expect("a register-file word inside the buffer");
+    u64::from_le_bytes(*word)
 }
 
 /// Set the register-file word at `offset` to `value`.
 fn write_word(regs: &mut [u8], offset: usize, value: u64)
 {
-    regs[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    let word = regs
+        .get_mut(offset..)
+        .and_then(<[u8]>::first_chunk_mut::<8>)
+        .expect("a register-file word inside the buffer");
+    *word = value.to_le_bytes();
 }

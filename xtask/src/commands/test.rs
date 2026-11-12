@@ -123,7 +123,10 @@ mod tests
     #[test]
     fn lint_pass_checks_the_test_configuration_of_the_tested_packages_for_its_target()
     {
-        let args = lint_args(packages(TestComponent::Kernel), "riscv64gc-unknown-linux-gnu");
+        let args = lint_args(
+            packages(TestComponent::Kernel),
+            "riscv64gc-unknown-linux-gnu",
+        );
         let split = args.iter().position(|a| *a == "--").unwrap();
         assert_eq!(
             &args[..split],

@@ -149,12 +149,7 @@ fn synthesise_svctest_large_bin(ctx: &BuildContext) -> Result<PathBuf>
     {
         let tag = format!("PAGE_{page:02}_");
         let tag_bytes = tag.as_bytes();
-        let mut written = 0usize;
-        while written < SVCTEST_LARGE_BIN_PAGE_SIZE
-        {
-            buf.extend_from_slice(tag_bytes);
-            written += tag_bytes.len();
-        }
+        buf.extend(tag_bytes.iter().cycle().take(SVCTEST_LARGE_BIN_PAGE_SIZE));
     }
     buf.truncate(total);
     fs::write(&dst, &buf).with_context(|| format!("writing {}", dst.display()))?;

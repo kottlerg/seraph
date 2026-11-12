@@ -868,8 +868,8 @@ fn preferred_display_backend(qemu_binary: &str) -> Option<String>
         .output()
         .ok()?;
 
-    let text = String::from_utf8_lossy(&output.stdout).into_owned()
-        + &String::from_utf8_lossy(&output.stderr);
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
 
     for backend in ["gtk", "sdl"]
     {
@@ -918,7 +918,7 @@ fn pad_file_to(path: &Path, target_size: u64) -> Result<()>
     {
         let padding = vec![
             0u8;
-            usize::try_from(target_size - current)
+            usize::try_from(target_size.saturating_sub(current))
                 .context("firmware padding size exceeds usize")?
         ];
         file.write_all(&padding)

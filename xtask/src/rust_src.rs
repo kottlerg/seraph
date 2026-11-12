@@ -771,15 +771,13 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
     {
         return Ok(());
     }
-    let patched = if let Some(start) = text.find(marker)
+    let patched = if let Some((before_marker, _)) = text.split_once(marker)
     {
         // Old block present but stale — locate the start of the comment
         // line that contains the marker (one '\n' before the marker, or
         // the file head) and truncate from there. The block extends to
         // EOF in our format.
-        let block_start = text[..start].rfind('\n').map_or(0, |p| p + 1);
-        let mut head = String::with_capacity(block_start + block.len());
-        head.push_str(&text[..block_start]);
+        let mut head = String::from(before_marker.trim_end_matches(|c| c != '\n'));
         head.push_str(&block);
         head
     }

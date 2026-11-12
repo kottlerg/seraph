@@ -219,7 +219,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     let mut dispatched: u32 = 0;
     while dispatched < total_runs
     {
-        let wave_size = std::cmp::min(args.parallel, total_runs - dispatched);
+        let wave_size = std::cmp::min(args.parallel, total_runs.saturating_sub(dispatched));
         let mut handles: Vec<JoinHandle<Result<RunOutcome>>> =
             Vec::with_capacity(wave_size as usize);
 
@@ -421,7 +421,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                 Err(_) => bail!("worker thread panicked"),
             }
         }
-        dispatched += wave_size;
+        dispatched = dispatched.saturating_add(wave_size);
     }
 
     let summary = print_summary(args, &workdir, &outcomes);
@@ -430,7 +430,11 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     // not a regression in the OS under test, so it does NOT fail the gate (it
     // is still tallied and reported by print_summary). Everything else that is
     // not a clean PASS does fail.
-    let real_failures = summary.ok + summary.fail + summary.hang + summary.err;
+    let real_failures = summary
+        .ok
+        .saturating_add(summary.fail)
+        .saturating_add(summary.hang)
+        .saturating_add(summary.err);
     if real_failures > 0
     {
         bail!(
@@ -647,7 +651,9 @@ fn wait_with_timeout(
     hold_on_hang: bool,
 ) -> Result<(i32, bool)>
 {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("run timeout overflows Instant")?;
     let mut grace_deadline: Option<Instant> = None;
     let mut last_log_len: u64 = 0;
     loop
@@ -661,7 +667,11 @@ fn wait_with_timeout(
         // Arm the grace window on the first --fail match in the live log.
         if grace_deadline.is_none() && fail_marker_present(log_path, &mut last_log_len, fail_re)
         {
-            grace_deadline = Some(Instant::now() + fail_grace);
+            grace_deadline = Some(
+                Instant::now()
+                    .checked_add(fail_grace)
+                    .context("fail grace overflows Instant")?,
+            );
         }
         let effective = grace_deadline.map_or(deadline, |g| g.min(deadline));
         if Instant::now() >= effective
@@ -745,7 +755,7 @@ fn exit_status_rc(status: std::process::ExitStatus) -> i32
         use std::os::unix::process::ExitStatusExt;
         if let Some(sig) = status.signal()
         {
-            return 128 + sig;
+            return 128i32.saturating_add(sig);
         }
     }
     -1
@@ -814,11 +824,19 @@ fn classify(
 
 fn line_containing(text: &str, byte_offset: usize) -> String
 {
-    let start = text[..byte_offset].rfind('\n').map_or(0, |i| i + 1);
-    let end = text[byte_offset..]
+    let (Some(before), Some(after)) = (text.get(..byte_offset), text.get(byte_offset..))
+    else
+    {
+        return String::new();
+    };
+    let start = before.rfind('\n').map_or(0, |i| i.saturating_add(1));
+    let end = after
         .find('\n')
-        .map_or(text.len(), |i| byte_offset + i);
-    text[start..end].trim_end_matches(['\r', '\n']).to_string()
+        .map_or(text.len(), |i| byte_offset.saturating_add(i));
+    text.get(start..end)
+        .unwrap_or("")
+        .trim_end_matches(['\r', '\n'])
+        .to_string()
 }
 
 /// What `--save-logs` records of a run beside its outcome.
@@ -999,12 +1017,12 @@ fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]
     {
         match o.status
         {
-            Status::Pass => summary.pass += 1,
-            Status::Ok => summary.ok += 1,
-            Status::Fail => summary.fail += 1,
-            Status::Hang => summary.hang += 1,
-            Status::Err(_) => summary.err += 1,
-            Status::QemuCrash(_) => summary.qemu_crash += 1,
+            Status::Pass => summary.pass = summary.pass.saturating_add(1),
+            Status::Ok => summary.ok = summary.ok.saturating_add(1),
+            Status::Fail => summary.fail = summary.fail.saturating_add(1),
+            Status::Hang => summary.hang = summary.hang.saturating_add(1),
+            Status::Err(_) => summary.err = summary.err.saturating_add(1),
+            Status::QemuCrash(_) => summary.qemu_crash = summary.qemu_crash.saturating_add(1),
         }
         if !matches!(o.status, Status::Hang)
         {
@@ -1035,9 +1053,12 @@ fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]
             summary.qemu_crash,
         );
     }
-    if let (Some(&min_us), Some(&max_us)) = (non_hang_us.first(), non_hang_us.last())
+    if let (Some(&min_us), Some(&median_us), Some(&max_us)) = (
+        non_hang_us.first(),
+        non_hang_us.get(non_hang_us.len() / 2),
+        non_hang_us.last(),
+    )
     {
-        let median_us = non_hang_us[non_hang_us.len() / 2];
         println!(
             "elapsed: min={:.2}s  median={:.2}s  max={:.2}s",
             us_to_s(min_us),
@@ -1097,17 +1118,17 @@ fn print_failing_tails(workdir: &Path, outcomes: &[RunOutcome])
 
 fn tail_text(body: &str, max_lines: usize, max_bytes: usize) -> String
 {
-    let lines: Vec<&str> = body.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    let mut tail: String = lines[start..].join("\n");
-    if tail.len() > max_bytes
+    let skip = body.lines().count().saturating_sub(max_lines);
+    let mut tail: String = body.lines().skip(skip).collect::<Vec<_>>().join("\n");
+    let drop = tail.len().saturating_sub(max_bytes);
+    if drop > 0
     {
-        let drop = tail.len() - max_bytes;
-        let mut cut = drop;
-        while !tail.is_char_boundary(cut) && cut < tail.len()
-        {
-            cut += 1;
-        }
+        // The first character boundary at or after `drop`.
+        let cut = tail
+            .char_indices()
+            .map(|(at, _)| at)
+            .find(|&at| at >= drop)
+            .unwrap_or(tail.len());
         tail = tail.split_off(cut);
     }
     tail
@@ -1126,6 +1147,13 @@ mod tests
 {
     use super::*;
     use crate::cli::DEFAULT_FAIL_REGEX;
+
+    #[test]
+    fn line_containing_out_of_range_offset_is_empty()
+    {
+        assert_eq!(line_containing("abc\ndef", 99), "");
+        assert_eq!(line_containing("abc\ndef", 5), "def");
+    }
 
     fn default_regexes() -> (Regex, Regex)
     {

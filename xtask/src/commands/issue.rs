@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 
 use crate::cli::{IssueEditArgs, IssueFileArgs};
 use crate::commands::pr_check::{ROLLING_TITLE_SUFFIX, current_milestone};
@@ -164,7 +165,7 @@ pub fn guard_body(old: &str, new: &str, removal: ItemRemoval) -> Result<(), Stri
         let more = match lost.len()
         {
             1 => String::new(),
-            n => format!(" (and {} more)", n - 1),
+            n => format!(" (and {} more)", n.saturating_sub(1)),
         };
         return Err(format!(
             "against the Issue's task-list items the new body {first}{more}; re-fetch the \
@@ -178,7 +179,11 @@ pub fn guard_body(old: &str, new: &str, removal: ItemRemoval) -> Result<(), Stri
 fn issue_body(root: &Path, number: u64) -> Result<String>
 {
     let issue = gh::issue(root, number)?;
-    Ok(issue["body"].as_str().unwrap_or("").to_owned())
+    Ok(issue
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned())
 }
 
 fn backup_path(ctx: &BuildContext, number: u64) -> Result<PathBuf>
@@ -428,7 +433,7 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
     let held_labels = label_names(&issue);
     let missing = missing_metadata(
         &held_labels,
-        issue["milestone"]["title"].as_str(),
+        issue.pointer("/milestone/title").and_then(Value::as_str),
         &args.label,
         choice.title(),
     );

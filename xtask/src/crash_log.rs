@@ -59,7 +59,7 @@ pub fn reclaimed_names(log: &str) -> HashMap<u64, String>
     {
         let Some(rest) = RECLAIM_TAGS
             .iter()
-            .find_map(|tag| line.find(tag).map(|at| &line[at + tag.len()..]))
+            .find_map(|tag| line.split_once(tag).map(|(_, after)| after))
         else
         {
             continue;
@@ -360,12 +360,15 @@ fn write_fields(out: &mut String, block: &Block, resolver: Option<&Resolver<'_, 
 {
     for (key, value) in block.fields()
     {
-        match resolver.and_then(|r| r.resolve(key, value))
+        let lines = resolver
+            .and_then(|r| r.resolve(key, value))
+            .unwrap_or_default();
+        match lines.split_first()
         {
-            Some(lines) =>
+            Some((first, rest)) =>
             {
-                let _ = writeln!(out, "  {key}={value}  {}", lines[0]);
-                for line in &lines[1..]
+                let _ = writeln!(out, "  {key}={value}  {first}");
+                for line in rest
                 {
                     let _ = writeln!(out, "  {line}");
                 }

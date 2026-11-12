@@ -255,7 +255,7 @@ impl Scan
     {
         self.lose_open_cells(at);
         let count = self.seen.entry(name.to_string()).or_insert(0);
-        *count += 1;
+        *count = count.saturating_add(1);
         let name = if *count == 1
         {
             name.to_string()
@@ -438,18 +438,24 @@ fn locate_ktest_message<'a>(
 ) -> Option<(LineKind, f64, &'a str)>
 {
     let stamped = stamps.iter().enumerate().rev().find_map(|(i, s)| {
-        ktest_prefix(&line[s.end..]).map(|(kind, len)| (i, kind, s.at, s.end + len))
+        let (kind, len) = ktest_prefix(line.get(s.end..)?)?;
+        Some((i, kind, s.at, s.end.checked_add(len)?))
     });
     let (kind, at, start, end) = if let Some((i, kind, at, start)) = stamped
     {
-        (kind, at, start, stamps.get(i + 1).map(|s| s.start))
+        (
+            kind,
+            at,
+            start,
+            stamps.iter().skip(i).nth(1).map(|s| s.start),
+        )
     }
     else
     {
         let (kind, len) = ktest_prefix(line)?;
         (kind, before?, len, stamps.first().map(|s| s.start))
     };
-    let msg = line[start..end.unwrap_or(line.len())].trim_end();
+    let msg = line.get(start..end.unwrap_or(line.len()))?.trim_end();
     Some((kind, at, msg))
 }
 
@@ -992,9 +998,8 @@ pub fn parse_baseline(text: &str) -> Result<Baseline>
     let mut timing = Timing::default();
     let mut headers = Vec::new();
     let mut format_seen = false;
-    for (i, raw) in text.lines().enumerate()
+    for (line, raw) in (1usize..).zip(text.lines())
     {
-        let line = i + 1;
         if raw.is_empty() || raw.starts_with('#')
         {
             continue;
@@ -1062,15 +1067,36 @@ pub fn civil_date(days: u64) -> String
 {
     // Howard Hinnant's days-to-civil algorithm, over unsigned values since
     // the input is never before the epoch.
-    let z = days + 719_468;
+    // Every intermediate is bounded by the algorithm, so the saturating
+    // operations never clamp.
+    let z = days.saturating_add(719_468);
     let era = z / 146_097;
     let doe = z % 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
+    let yoe = (doe
+        .saturating_sub(doe / 1460)
+        .saturating_add(doe / 36_524)
+        .saturating_sub(doe / 146_096))
+        / 365;
+    let year_days = 365u64
+        .saturating_mul(yoe)
+        .saturating_add(yoe / 4)
+        .saturating_sub(yoe / 100);
+    let doy = doe.saturating_sub(year_days);
+    let mp = (5u64.saturating_mul(doy).saturating_add(2)) / 153;
+    let day = doy
+        .saturating_sub(153u64.saturating_mul(mp).saturating_add(2) / 5)
+        .saturating_add(1);
+    let month = if mp < 10
+    {
+        mp.saturating_add(3)
+    }
+    else
+    {
+        mp.saturating_sub(9)
+    };
+    let year = yoe
+        .saturating_add(era.saturating_mul(400))
+        .saturating_add(u64::from(month <= 2));
     format!("{year:04}-{month:02}-{day:02}")
 }
 

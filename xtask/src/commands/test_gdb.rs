@@ -325,13 +325,12 @@ fn scratch_register(arch: Arch) -> &'static str
 /// The part of `output` after `mark` up to the next `@@` mark.
 fn section<'a>(output: &'a str, mark: &str) -> &'a str
 {
-    let Some(start) = output.find(mark)
+    let Some((_, rest)) = output.split_once(mark)
     else
     {
         return "";
     };
-    let rest = &output[start + mark.len()..];
-    rest.find("@@").map_or(rest, |end| &rest[..end])
+    rest.split_once("@@").map_or(rest, |(section, _)| section)
 }
 
 /// The `$N = 0x...` values a section printed, in order.

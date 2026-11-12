@@ -50,7 +50,7 @@
 //!    any send deposited bits: the premature-resume (spawn-failure) shape of
 //!    #352.
 //! 3. Payload-conservation or drain/empty assert — a lost or duplicated wake.
-//! 4. Hang — softlockup watchdog / harness timeout (kernel-raised).
+//! 4. Hang — the harness's timeout.
 //!
 //! A preemption tick on CPU 0 while the poller runs userspace Ready+linked can
 //! consume the stale entry via that same next==current re-mark and silently
@@ -257,7 +257,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Wait for both children. A child that fails an assert still raises its
     // done bit (after recording FAILURE); a kernel-level detonation instead
-    // hangs here and the softlockup watchdog raises the FAIL.
+    // hangs here, and the harness's timeout raises the FAIL.
     let mut acc = 0u64;
     while acc & (BIT_POLLER_DONE | BIT_POSTER_DONE) != (BIT_POLLER_DONE | BIT_POSTER_DONE)
     {
@@ -498,8 +498,8 @@ extern "C" fn poster_entry(arg: u64) -> !
 
     // On a failure exit the poller may be blocked in its gate wait (a failed
     // post/gate-send never signals it); release it so it observes FAILURE and
-    // terminates with the stored code instead of hanging to the watchdog. Its
-    // subsequent assert no-ops (fail() keeps the first code).
+    // terminates with the stored code instead of hanging. Its subsequent
+    // assert no-ops (fail() keeps the first code).
     if FAILURE.load(Ordering::Acquire) != 0
     {
         notification_send(gate, 1).ok();

@@ -36,6 +36,9 @@
 //! constraint on the serial and framebuffer drivers. Diagnostics are dropped;
 //! fatal bootstrap failures `thread_exit` silently.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod arch;
 
 use boot_protocol::FramebufferInfo;
@@ -95,13 +98,10 @@ fn query_framebuffer_info(devmgr_ep: u64, ipc_buf: *mut u64) -> Option<Framebuff
         return None;
     }
     let words = reply.words();
-    if words.len() < 3
-    {
-        return None;
-    }
-    let kind = u32::try_from(words[0]).ok()?;
-    let version = u32::try_from(words[1]).ok()?;
-    let byte_len = usize::try_from(words[2]).ok()?;
+    let (&[kind, version, byte_len], payload) = words.split_first_chunk::<3>()?;
+    let kind = u32::try_from(kind).ok()?;
+    let version = u32::try_from(version).ok()?;
+    let byte_len = usize::try_from(byte_len).ok()?;
     if kind != ipc::device_info_kind::FRAMEBUFFER
         || version != boot_protocol::FRAMEBUFFER_INFO_VERSION
     {
@@ -111,16 +111,14 @@ fn query_framebuffer_info(devmgr_ep: u64, ipc_buf: *mut u64) -> Option<Framebuff
     {
         return None;
     }
-    let payload_words = byte_len.div_ceil(8);
-    if words.len() < 3 + payload_words
-    {
-        return None;
-    }
+    let payload = payload.get(..byte_len.div_ceil(8))?;
     let mut buf = [0u8; FramebufferInfo::SIZE];
-    for (i, chunk) in buf.chunks_mut(8).enumerate()
+    for (chunk, word) in buf.chunks_mut(8).zip(payload)
     {
-        let bytes = words[3 + i].to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
+        for (dst, src) in chunk.iter_mut().zip(word.to_le_bytes())
+        {
+            *dst = src;
+        }
     }
     FramebufferInfo::from_bytes(&buf)
 }
@@ -145,11 +143,9 @@ fn handle_request(
     {
         // The mask bounds the length to 16 bits, so the conversion cannot fail.
         // 16 label bits exceed the 512 bytes one message's data words carry,
-        // and `n` clamps to those bytes.
+        // and the loop stops at those bytes.
         let byte_len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
-        let bytes = msg.data_bytes();
-        let n = byte_len.min(bytes.len());
-        for &b in &bytes[..n]
+        for &b in msg.data_bytes().iter().take(byte_len)
         {
             // SAFETY: writer.base is a valid MMIO mapping for the
             // framebuffer's geometry; the FramebufferWriter advances
@@ -206,13 +202,9 @@ fn handle_request(
     {
         // Sticky fg/bg for subsequent glyph blits. Payload is six bytes:
         // [fg_r, fg_g, fg_b, bg_r, bg_g, bg_b].
-        let bytes = msg.data_bytes();
-        if bytes.len() >= 6
+        if let &[fg_r, fg_g, fg_b, bg_r, bg_g, bg_b, ..] = msg.data_bytes()
         {
-            writer.set_attrs(
-                [bytes[0], bytes[1], bytes[2]],
-                [bytes[3], bytes[4], bytes[5]],
-            );
+            writer.set_attrs([fg_r, fg_g, fg_b], [bg_r, bg_g, bg_b]);
         }
         IpcMessage::new(fb_errors::SUCCESS)
     }
@@ -316,10 +308,18 @@ fn main() -> !
     // range must be exactly that aperture, the range devmgr's record of the
     // boot framebuffer carves its `Mmio` cap over, so the whole-region
     // mapping fits the reservation.
-    let span = u64::from(fb_info.stride) * u64::from(fb_info.height);
     let in_page = fb_info.physical_base & 0xFFF;
-    let total_pages = (in_page + span).div_ceil(0x1000);
-    if span == 0 || phys != fb_info.physical_base - in_page || bytes != total_pages * 0x1000
+    let Some((span, total_pages, aperture_bytes)) = u64::from(fb_info.stride)
+        .checked_mul(u64::from(fb_info.height))
+        .and_then(|span| {
+            let total_pages = in_page.checked_add(span)?.div_ceil(0x1000);
+            Some((span, total_pages, total_pages.checked_mul(0x1000)?))
+        })
+    else
+    {
+        syscall::thread_exit();
+    };
+    if span == 0 || phys != fb_info.physical_base & !0xFFF || bytes != aperture_bytes
     {
         syscall::thread_exit();
     }

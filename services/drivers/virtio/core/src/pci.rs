@@ -102,12 +102,17 @@ pub struct PciTransport
 /// by `notify_off_multiplier` and adding the notification region's own
 /// offset `notify_off` yields the doorbell's offset. Operands widen to `u64`
 /// before the multiply, matching the address arithmetic in
-/// [`PciTransport::notify`].
+/// [`PciTransport::notify`]. `None` when the offset does not fit a `u64`.
 #[must_use]
-pub fn notify_addr_offset(notify_off: u64, queue_notify_off: u16, notify_off_multiplier: u32)
--> u64
+pub fn notify_addr_offset(
+    notify_off: u64,
+    queue_notify_off: u16,
+    notify_off_multiplier: u32,
+) -> Option<u64>
 {
-    notify_off + u64::from(queue_notify_off) * u64::from(notify_off_multiplier)
+    u64::from(queue_notify_off)
+        .checked_mul(u64::from(notify_off_multiplier))
+        .and_then(|scaled| notify_off.checked_add(scaled))
 }
 
 /// Whether a queue's 16-bit doorbell, `queue_notify_off` scaled by
@@ -119,7 +124,10 @@ pub fn notify_addr_offset(notify_off: u64, queue_notify_off: u16, notify_off_mul
 #[must_use]
 pub fn doorbell_fits(queue_notify_off: u16, notify_off_multiplier: u32, notify_len: u64) -> bool
 {
-    u64::from(queue_notify_off) * u64::from(notify_off_multiplier) + 2 <= notify_len
+    u64::from(queue_notify_off)
+        .checked_mul(u64::from(notify_off_multiplier))
+        .and_then(|scaled| scaled.checked_add(2))
+        .is_some_and(|end| end <= notify_len)
 }
 
 /// Whether a `width`-byte read at `offset` into the device-specific
@@ -129,7 +137,10 @@ pub fn doorbell_fits(queue_notify_off: u16, notify_off_multiplier: u32, notify_l
 #[must_use]
 pub fn config_fits(offset: u32, width: u32, device_len: u64) -> bool
 {
-    offset.is_multiple_of(width) && u64::from(offset) + u64::from(width) <= device_len
+    offset.is_multiple_of(width)
+        && u64::from(offset)
+            .checked_add(u64::from(width))
+            .is_some_and(|end| end <= device_len)
 }
 
 impl PciTransport
@@ -162,7 +173,16 @@ impl PciTransport
     fn common_addr(&self, offset: u32) -> u64
     {
         debug_assert!(offset < COMMON_CFG_LEN);
-        self.window_va + self.common_off + u64::from(offset)
+        self.window_addr(self.common_off.wrapping_add(u64::from(offset)))
+    }
+
+    /// Virtual address of window offset `offset`. Wrapping: the window is
+    /// mapped, so an offset inside it addresses no wrapped address, and a
+    /// caller checks an offset that may lie outside before it dereferences
+    /// the address.
+    fn window_addr(&self, offset: u64) -> u64
+    {
+        self.window_va.wrapping_add(offset)
     }
 
     /// Read device feature bits (selected by `device_feature_select`).
@@ -250,11 +270,12 @@ impl PciTransport
     /// takes its address in 32-bit halves ([`split_address`]).
     pub fn queue_set_rings(&self, desc: u64, avail: u64, used: u64)
     {
-        for (offset, addr) in [(0x20, desc), (0x28, avail), (0x30, used)]
+        for (low_offset, high_offset, addr) in
+            [(0x20, 0x24, desc), (0x28, 0x2C, avail), (0x30, 0x34, used)]
         {
             let (low, high) = split_address(addr);
-            self.write_common_u32(offset, low);
-            self.write_common_u32(offset + 4, high);
+            self.write_common_u32(low_offset, low);
+            self.write_common_u32(high_offset, high);
         }
     }
 
@@ -337,14 +358,18 @@ impl PciTransport
         {
             return;
         }
-        mmio::dma_to_mmio_barrier();
-
-        let offset = notify_addr_offset(
+        let Some(offset) = notify_addr_offset(
             self.notify_off,
             queue_notify_off,
             self.notify_off_multiplier,
-        );
-        let addr = (self.window_va + offset) as *mut u16;
+        )
+        else
+        {
+            return;
+        };
+        mmio::dma_to_mmio_barrier();
+
+        let addr = self.window_addr(offset) as *mut u16;
         // SAFETY: the doorbell lies inside the notification region (checked
         // above), which is within its BAR's mapping; addr is naturally
         // aligned, since RegisterLayout holds the region's offset and the
@@ -364,7 +389,7 @@ impl PciTransport
     #[must_use]
     pub fn read_isr(&self) -> u8
     {
-        let addr = (self.window_va + self.isr_off) as *const u8;
+        let addr = self.window_addr(self.isr_off) as *const u8;
         // SAFETY: ISR region is within its BAR's mapping.
         unsafe { core::ptr::read_volatile(addr) }
     }
@@ -377,7 +402,7 @@ impl PciTransport
     #[must_use]
     pub fn config_read_u32(&self, offset: u32) -> Option<u32>
     {
-        let addr = self.window_va + self.device_off + u64::from(offset);
+        let addr = self.window_addr(self.device_off.wrapping_add(u64::from(offset)));
         if !config_fits(offset, 4, self.device_len) || !addr.is_multiple_of(4)
         {
             return None;
@@ -587,7 +612,7 @@ mod tests
     fn notify_addr_offset_scales_queue_offset_by_multiplier()
     {
         // notify_off + queue_notify_off * notify_off_multiplier, all in u64.
-        assert_eq!(notify_addr_offset(0x3000, 2, 4), 0x3008);
+        assert_eq!(notify_addr_offset(0x3000, 2, 4), Some(0x3008));
     }
 
     #[test]
@@ -595,7 +620,16 @@ mod tests
     {
         // A zero multiplier collapses every queue onto notify_off: the queue
         // term must be multiplied, not added.
-        assert_eq!(notify_addr_offset(0x3000, 2, 0), 0x3000);
+        assert_eq!(notify_addr_offset(0x3000, 2, 0), Some(0x3000));
+    }
+
+    #[test]
+    fn notify_addr_offset_past_u64_is_none()
+    {
+        // A region offset near the top of the window's range: the doorbell
+        // offset would wrap to a low address.
+        assert_eq!(notify_addr_offset(u64::MAX - 3, 2, 4), None);
+        assert_eq!(notify_addr_offset(u64::MAX - 8, 2, 4), Some(u64::MAX));
     }
 
     #[test]

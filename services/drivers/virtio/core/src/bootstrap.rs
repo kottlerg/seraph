@@ -134,15 +134,17 @@ impl DeliveredDevice
                     bytes,
                     offset,
                     ..
-                } if device.range_count < MAX_VIRTIO_RANGES =>
+                } =>
                 {
-                    device.ranges[device.range_count] = BarRange {
+                    // A range past the MAX_VIRTIO_RANGES slots refuses the list.
+                    *device.ranges.get_mut(device.range_count)? = BarRange {
                         cap,
                         bar,
                         offset,
                         bytes,
                     };
-                    device.range_count += 1;
+                    // Below MAX_VIRTIO_RANGES before the increment: no saturation.
+                    device.range_count = device.range_count.saturating_add(1);
                     continue;
                 }
                 Resource::Interrupt {
@@ -197,7 +199,8 @@ impl DeliveredDevice
     #[must_use]
     pub fn ranges(&self) -> &[BarRange]
     {
-        &self.ranges[..self.range_count]
+        // `range_count` never exceeds the array (`from_list`).
+        self.ranges.get(..self.range_count).unwrap_or_default()
     }
 }
 

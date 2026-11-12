@@ -26,6 +26,14 @@ pub const EVENT_QUEUE_SIZE: u16 = 64;
 /// Bytes per virtio-input event buffer (`size_of::<VirtioInputEvent>()`).
 const EVENT_SIZE: u32 = 8;
 
+/// Buffer `slot`'s offset in the event page.
+fn slot_offset(slot: u16) -> u64
+{
+    // `slot` is below EVENT_QUEUE_SIZE, whose buffers fit one page: no
+    // saturation.
+    u64::from(slot).saturating_mul(u64::from(EVENT_SIZE))
+}
+
 /// A virtio-input event (`VirtIO` 1.2 §5.8.6.2). Both target arches are
 /// little-endian and the device runs modern (`VIRTIO_F_VERSION_1`), so the
 /// little-endian fields are read directly.
@@ -94,8 +102,13 @@ impl EventRing
                 Ok(Some((head, _len))) =>
                 {
                     // poll_used returns only outstanding heads, which add_chain
-                    // handed out below queue_size <= EVENT_QUEUE_SIZE.
-                    let slot = self.slot_for_head[usize::from(head)];
+                    // handed out below queue_size <= EVENT_QUEUE_SIZE, so the
+                    // entry exists.
+                    let Some(&slot) = self.slot_for_head.get(usize::from(head))
+                    else
+                    {
+                        continue;
+                    };
                     let event = self.read_event(slot);
                     self.post(vq, slot);
                     return Some(event);
@@ -112,16 +125,21 @@ impl EventRing
     /// device serviceable.
     fn post(&mut self, vq: &mut SplitVirtqueue, slot: u16)
     {
-        let addr = self.base_addr + u64::from(slot) * u64::from(EVENT_SIZE);
+        // The page's device range holds every buffer: no saturation.
+        let addr = self.base_addr.saturating_add(slot_offset(slot));
         if let Some(head) = vq.add_chain(&[(addr, EVENT_SIZE, true)])
+            && let Some(entry) = self.slot_for_head.get_mut(usize::from(head))
         {
-            self.slot_for_head[head as usize] = slot;
+            // add_chain returns a head below queue_size <= EVENT_QUEUE_SIZE,
+            // so the entry exists.
+            *entry = slot;
         }
     }
 
     fn read_event(&self, slot: u16) -> VirtioInputEvent
     {
-        let addr = self.base_va + u64::from(slot) * u64::from(EVENT_SIZE);
+        // The page's mapping holds every buffer: no saturation.
+        let addr = self.base_va.saturating_add(slot_offset(slot));
         // SAFETY: slot < buf_count, so addr is within the mapped DMA page and
         // 8-byte aligned (page-aligned base + 8-byte stride). Volatile: the
         // buffer was written by the device; poll_used's acquire fence ordered

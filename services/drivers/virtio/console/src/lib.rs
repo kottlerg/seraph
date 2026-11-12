@@ -11,6 +11,8 @@
 //! bytes wait in between the device's receive buffers and a client's read
 //! ([`RxQueue`]).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 use ipc::serial_labels;
@@ -49,7 +51,9 @@ pub fn authorized(label: u64, badge: u64) -> bool
 pub struct RxQueue<const N: usize>
 {
     bytes: [u8; N],
+    /// Slot of the oldest byte; below `N` (0 when `N` is 0).
     head: usize,
+    /// Bytes held; at most `N`.
     len: usize,
 }
 
@@ -92,18 +96,37 @@ impl<const N: usize> RxQueue<N>
     #[must_use]
     pub fn free(&self) -> usize
     {
-        N - self.len
+        // `len` is at most `N`: no saturation.
+        N.saturating_sub(self.len)
+    }
+
+    /// The slot `offset` bytes past the oldest one, wrapped around the
+    /// storage; `offset` is at most `N`.
+    fn slot(&self, offset: usize) -> usize
+    {
+        // `head` is below `N` and `offset` at most `N`, so the sum does not
+        // saturate; `N` of 0 holds no slot, and every offset names slot 0.
+        self.head.saturating_add(offset).checked_rem(N).unwrap_or(0)
     }
 
     /// Append as much of `src` as fits, in order; returns the count appended.
     pub fn push(&mut self, src: &[u8]) -> usize
     {
         let n = src.len().min(self.free());
-        for (i, &b) in src[..n].iter().enumerate()
+        let tail = self.slot(self.len);
+        let Some((front, back)) = self.bytes.split_at_mut_checked(tail)
+        else
         {
-            self.bytes[(self.head + self.len + i) % N] = b;
+            return 0;
+        };
+        // The free slots in ring order: from the tail to the end of the
+        // storage, then from its start.
+        for (slot, &b) in back.iter_mut().chain(front).zip(src.iter().take(n))
+        {
+            *slot = b;
         }
-        self.len += n;
+        // `n` is at most `free()`: no saturation.
+        self.len = self.len.saturating_add(n);
         n
     }
 
@@ -112,15 +135,20 @@ impl<const N: usize> RxQueue<N>
     pub fn pop(&mut self, dst: &mut [u8]) -> usize
     {
         let n = dst.len().min(self.len);
-        for (i, slot) in dst[..n].iter_mut().enumerate()
+        let Some((front, back)) = self.bytes.split_at_checked(self.head)
+        else
         {
-            *slot = self.bytes[(self.head + i) % N];
-        }
-        if n > 0
+            return 0;
+        };
+        // The held bytes in ring order: from the head to the end of the
+        // storage, then from its start.
+        for (slot, &b) in dst.iter_mut().zip(back.iter().chain(front)).take(n)
         {
-            self.head = (self.head + n) % N;
+            *slot = b;
         }
-        self.len -= n;
+        self.head = self.slot(n);
+        // `n` is at most `len`: no saturation.
+        self.len = self.len.saturating_sub(n);
         n
     }
 }
@@ -181,6 +209,30 @@ mod tests
         let mut out = [0u8; 8];
         assert_eq!(q.pop(&mut out), 4);
         assert_eq!(&out[..4], b"abcd");
+    }
+
+    #[test]
+    fn a_queue_of_no_bytes_takes_and_gives_none()
+    {
+        let mut q = RxQueue::<0>::new();
+        assert_eq!(q.free(), 0);
+        assert_eq!(q.push(b"ab"), 0);
+        let mut out = [0u8; 2];
+        assert_eq!(q.pop(&mut out), 0);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn a_full_queue_wraps_its_head_back_to_the_first_slot()
+    {
+        let mut q = RxQueue::<4>::new();
+        assert_eq!(q.push(b"abcd"), 4);
+        let mut out = [0u8; 4];
+        assert_eq!(q.pop(&mut out), 4);
+        assert_eq!(&out, b"abcd");
+        assert_eq!(q.push(b"efgh"), 4);
+        assert_eq!(q.pop(&mut out), 4);
+        assert_eq!(&out, b"efgh");
     }
 
     #[test]

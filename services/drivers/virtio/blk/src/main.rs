@@ -15,6 +15,9 @@
 //! partition registration (`REGISTER_PARTITION`), and the device geometry
 //! (`BLK_GET_GEOMETRY`) over IPC.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod io;
 
 use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};
@@ -164,6 +167,12 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
     }
     for (range, &offset) in ranges.iter().zip(&placed)
     {
+        let Some(range_va) = window_va.checked_add(offset)
+        else
+        {
+            std::os::seraph::log!(error: "BAR range past the address space");
+            syscall::thread_exit();
+        };
         // SAFETY: `window` is a fresh reservation of `window_pages` pages
         // from the per-process arena, and `place` put this range's pages at
         // `offset` inside its BAR's share of it, overlapping no other
@@ -172,7 +181,7 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         // volatile accessors, never a reference, and the reservation is
         // never returned, so the VA stays reserved for the driver's lifetime
         // (`mmio_map` § Safety).
-        if unsafe { syscall::mmio_map(caps.self_aspace, range.cap, window_va + offset, 0) }.is_err()
+        if unsafe { syscall::mmio_map(caps.self_aspace, range.cap, range_va, 0) }.is_err()
         {
             std::os::seraph::log!(error: "BAR mmio_map failed");
             syscall::thread_exit();
@@ -207,47 +216,15 @@ fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
         std::os::seraph::log!(error: "QUERY_DEVICE_INFO returned error");
         syscall::thread_exit();
     }
-    let words = reply.words();
-    if words.len() < 3
+    match VirtioPciStartupInfo::from_device_info(reply.words())
     {
-        std::os::seraph::log!(error: "QUERY_DEVICE_INFO reply truncated (header)");
-        syscall::thread_exit();
+        Ok(info) => info,
+        Err(e) =>
+        {
+            std::os::seraph::log!(error: "{}", e.describe());
+            syscall::thread_exit();
+        }
     }
-    // A word past the field's width is a mismatch, not a value to truncate.
-    let kind = u32::try_from(words[0]).ok();
-    let version = u32::try_from(words[1]).ok();
-    let byte_len = usize::try_from(words[2]).unwrap_or(usize::MAX);
-    if kind != Some(ipc::device_info_kind::VIRTIO_PCI)
-        || version != Some(virtio_core::VIRTIO_PCI_INFO_VERSION)
-    {
-        std::os::seraph::log!(error: "QUERY_DEVICE_INFO reply kind/version mismatch");
-        syscall::thread_exit();
-    }
-    if byte_len != VirtioPciStartupInfo::SIZE
-    {
-        std::os::seraph::log!(error: "QUERY_DEVICE_INFO reply byte_len mismatch");
-        syscall::thread_exit();
-    }
-    // Unpack payload words into a byte buffer, then deserialise.
-    let mut buf = [0u8; VirtioPciStartupInfo::SIZE];
-    let payload_words = byte_len.div_ceil(8);
-    if words.len() < 3 + payload_words
-    {
-        std::os::seraph::log!(error: "QUERY_DEVICE_INFO reply truncated (payload)");
-        syscall::thread_exit();
-    }
-    for (i, chunk) in buf.chunks_mut(8).enumerate()
-    {
-        let bytes = words[3 + i].to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
-    let Some(info) = VirtioPciStartupInfo::from_bytes(&buf)
-    else
-    {
-        std::os::seraph::log!(error: "QUERY_DEVICE_INFO from_bytes failed");
-        syscall::thread_exit();
-    };
-    info
 }
 
 /// Report the device set up to devmgr (`ipc::report_driver_ready` on the
@@ -422,7 +399,9 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
         std::os::seraph::log!(error: "ring mem_map failed");
         syscall::thread_exit();
     }
-    let Ok(ring_bytes) = usize::try_from(ring_pages * PAGE_SIZE)
+    let Some(ring_bytes) = ring_pages
+        .checked_mul(PAGE_SIZE)
+        .and_then(|bytes| usize::try_from(bytes).ok())
     else
     {
         std::os::seraph::log!(error: "{ring_pages} ring pages past the address width");
@@ -453,12 +432,12 @@ fn program_transport_rings(
     interrupt: Option<DeviceInterrupt>,
 )
 {
-    let desc_size = virtqueue::desc_table_size(queue_size);
-    let used_off = virtqueue::used_ring_offset(queue_size);
-
-    let desc_addr = ring_addr;
-    let avail_addr = ring_addr + desc_size as u64;
-    let used_addr = ring_addr + used_off as u64;
+    let Some((desc_addr, avail_addr, used_addr)) = virtqueue::ring_addresses(ring_addr, queue_size)
+    else
+    {
+        std::os::seraph::log!(error: "ring device addresses past the address width");
+        syscall::thread_exit();
+    };
 
     transport.queue_set_rings(desc_addr, avail_addr, used_addr);
     if !transport.route_queue(interrupt)
@@ -494,11 +473,12 @@ fn setup_virtqueue(
         syscall::thread_exit();
     }
 
-    let desc_size = virtqueue::desc_table_size(queue_size);
-    let used_off = virtqueue::used_ring_offset(queue_size);
-    let desc_va = ring_va;
-    let avail_va = ring_va + desc_size as u64;
-    let used_va = ring_va + used_off as u64;
+    let Some((desc_va, avail_va, used_va)) = virtqueue::ring_addresses(ring_va, queue_size)
+    else
+    {
+        std::os::seraph::log!(error: "ring virtual addresses past the address space");
+        syscall::thread_exit();
+    };
 
     // SAFETY: ring memory is zeroed, properly sized, and exclusively owned.
     // Pointers are aligned: desc_va is page-aligned; avail_va is at desc_va +
@@ -571,7 +551,13 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
             std::os::seraph::log!(error: "data page not mapped for the device ({e:?})");
         })
     };
-    IoLayout { data_va, data_addr }
+    let Some(layout) = IoLayout::new(data_va, data_addr)
+    else
+    {
+        std::os::seraph::log!(error: "data page addresses past the address width");
+        syscall::thread_exit();
+    };
+    layout
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────
@@ -811,7 +797,13 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
         reply_with(code, ipc_buf);
         return;
     }
-    let absolute_lba = match resolve_run(msg.badge, lba, block_count, rt)
+    // The run's first LBA is below the capacity, so its sector fits.
+    let sector = resolve_run(msg.badge, lba, block_count, rt).and_then(|absolute| {
+        rt.geometry
+            .device_sector(absolute)
+            .ok_or(ipc::blk_errors::OUT_OF_BOUNDS)
+    });
+    let sector = match sector
     {
         Ok(s) => s,
         Err(code) =>
@@ -843,7 +835,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
     let outcome = io::submit_and_wait(
         rt.layout,
         dir,
-        rt.geometry.device_sector(absolute_lba),
+        sector,
         data_addr,
         data_len,
         rt.vq,

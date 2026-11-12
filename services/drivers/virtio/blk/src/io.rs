@@ -59,21 +59,35 @@ pub struct VirtioBlkReqHeader
 pub struct IoLayout
 {
     /// Virtual address of the mapped page.
-    pub data_va: u64,
+    data_va: u64,
     /// Device address of the mapped page, as devmgr returned it.
-    pub data_addr: u64,
+    data_addr: u64,
+    /// Virtual address of the status byte.
+    status_va: u64,
+    /// Device address of the status byte.
+    status_addr: u64,
 }
+
+/// Offset of the status byte in the driver's DMA page.
+const STATUS_OFFSET: u64 = 1024;
 
 impl IoLayout
 {
+    /// The layout of the page mapped at `data_va` and, for the device, at
+    /// `data_addr`. `None` when the status byte's address is past `u64`.
+    pub fn new(data_va: u64, data_addr: u64) -> Option<Self>
+    {
+        Some(Self {
+            data_va,
+            data_addr,
+            status_va: data_va.checked_add(STATUS_OFFSET)?,
+            status_addr: data_addr.checked_add(STATUS_OFFSET)?,
+        })
+    }
+
     fn header_va(&self) -> *mut VirtioBlkReqHeader
     {
         self.data_va as *mut VirtioBlkReqHeader
-    }
-
-    fn status_va(&self) -> u64
-    {
-        self.data_va + 1024
     }
 
     /// Descriptor chain for a block read request whose data segment lands at
@@ -85,13 +99,10 @@ impl IoLayout
     /// status segments stay in the driver's own DMA page.
     pub fn read_chain(&self, data_addr: u64, data_len: u32) -> [(u64, u32, bool); 3]
     {
-        let header_addr = self.data_addr;
-        let status_addr = self.data_addr + 1024;
-
         [
-            (header_addr, 16, false),    // request header
+            (self.data_addr, 16, false), // request header
             (data_addr, data_len, true), // data buffer (device writes)
-            (status_addr, 1, true),      // status byte (device writes)
+            (self.status_addr, 1, true), // status byte (device writes)
         ]
     }
 
@@ -104,13 +115,10 @@ impl IoLayout
     /// writes only the completion status byte in the driver's page.
     pub fn write_chain(&self, data_addr: u64, data_len: u32) -> [(u64, u32, bool); 3]
     {
-        let header_addr = self.data_addr;
-        let status_addr = self.data_addr + 1024;
-
         [
-            (header_addr, 16, false),     // request header
+            (self.data_addr, 16, false),  // request header
             (data_addr, data_len, false), // data buffer (device reads)
-            (status_addr, 1, true),       // status byte (device writes)
+            (self.status_addr, 1, true),  // status byte (device writes)
         ]
     }
 
@@ -135,7 +143,7 @@ impl IoLayout
         // or 2 (unsupp). 0xFF is outside this range and serves as a "not yet
         // completed" sentinel. A spec-conformant device never writes 0xFF.
         // SAFETY: status_va is within the mapped data page.
-        unsafe { core::ptr::write_volatile(self.status_va() as *mut u8, 0xFF) };
+        unsafe { core::ptr::write_volatile(self.status_va as *mut u8, 0xFF) };
     }
 
     /// Read the device status byte after request completion: a `VirtIO`
@@ -144,7 +152,7 @@ impl IoLayout
     pub fn read_status(&self) -> u8
     {
         // SAFETY: status_va is within the mapped data page.
-        unsafe { core::ptr::read_volatile(self.status_va() as *const u8) }
+        unsafe { core::ptr::read_volatile(self.status_va as *const u8) }
     }
 }
 

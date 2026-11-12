@@ -232,7 +232,10 @@ impl Opener
     fn hold(&mut self, index: usize, ipc_buf: *mut u64) -> bool
     {
         let cookie = self.tag | index as u64;
-        match fs_read_memory(self.open, (index * PAGE) as u64, cookie, ipc_buf)
+        let offset = index
+            .checked_mul(PAGE)
+            .expect("fs_eviction: page offset overflowed");
+        match fs_read_memory(self.open, offset as u64, cookie, ipc_buf)
         {
             Ok((page, _)) =>
             {
@@ -343,7 +346,10 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
     assert!(
         std::os::seraph::fund_cspace_slot_budget(
             startup_info().self_cspace,
-            (2 * HELD_FILES + crate::phases::fs_ipc::fatfs_slot_ceiling(ipc_buf) + 64) as u64,
+            (2 * HELD_FILES)
+                .checked_add(crate::phases::fs_ipc::fatfs_slot_ceiling(ipc_buf))
+                .and_then(|n| n.checked_add(64))
+                .expect("fs_eviction: CSpace slot budget overflowed") as u64,
         ),
         "fs_eviction: funding svctest's CSpace failed"
     );
@@ -371,13 +377,17 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
     let mut next = 1;
     while next < file_pages && x.hold(next, ipc_buf)
     {
-        next += 1;
+        next = next
+            .checked_add(1)
+            .expect("fs_eviction: page counter overflow");
     }
     assert!(
         next < file_pages,
         "fs_eviction: {next} pages held, cache never filled"
     );
-    let first = wait_for_releases(&log, 1)[0];
+    let first = *wait_for_releases(&log, 1)
+        .first()
+        .expect("fs_eviction: release log empty after wait");
     assert_eq!(
         first.0,
         first.1 & TAG_MASK,
@@ -409,7 +419,11 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
         );
     }
     assert_eq!(
-        releases[1].0, other.tag,
+        releases
+            .get(1)
+            .expect("fs_eviction: fewer than two releases logged")
+            .0,
+        other.tag,
         "fs_eviction: the second eviction did not reach the open still holding pages"
     );
 

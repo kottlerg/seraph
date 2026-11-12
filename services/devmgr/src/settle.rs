@@ -114,7 +114,7 @@ impl DriverWatch
         if usize::try_from(capacity).is_ok_and(|c| c < drivers)
         {
             std::os::seraph::log!(
-                "watch: {} drivers past the death queue's capacity {}",
+                warn: "watch: {} drivers past the death queue's capacity {}",
                 drivers as u64,
                 capacity
             );
@@ -126,7 +126,7 @@ impl DriverWatch
         })
         else
         {
-            std::os::seraph::log!("watch: death event queue not created");
+            std::os::seraph::log!(warn: "watch: death event queue not created");
             return None;
         };
         let Some(wait_set) = std::os::seraph::object_slab_retype(
@@ -135,7 +135,7 @@ impl DriverWatch
         )
         else
         {
-            std::os::seraph::log!("watch: wait set not created");
+            std::os::seraph::log!(warn: "watch: wait set not created");
             let _ = syscall::cap_delete(death_eq);
             return None;
         };
@@ -145,7 +145,7 @@ impl DriverWatch
         )
         else
         {
-            std::os::seraph::log!("watch: job notification not created");
+            std::os::seraph::log!(warn: "watch: job notification not created");
             let _ = syscall::cap_delete(wait_set);
             let _ = syscall::cap_delete(death_eq);
             return None;
@@ -153,7 +153,7 @@ impl DriverWatch
         if syscall::wait_set_add(wait_set, death_eq, WS_BADGE_DEATH).is_err()
             || syscall::wait_set_add(wait_set, job_note, WS_BADGE_JOB).is_err()
         {
-            std::os::seraph::log!("watch: wait set registration failed");
+            std::os::seraph::log!(warn: "watch: wait set registration failed");
             let _ = syscall::cap_delete(job_note);
             let _ = syscall::cap_delete(wait_set);
             let _ = syscall::cap_delete(death_eq);
@@ -250,7 +250,7 @@ impl SettleBatch
             })
         else
         {
-            std::os::seraph::log!("settle: driver endpoint not created");
+            std::os::seraph::log!(warn: "settle: driver endpoint not created");
             return None;
         };
         Some(Self { driver_ep })
@@ -306,19 +306,21 @@ impl SettleBatch
             let _ = syscall::wait_set_remove(watch.wait_set, self.driver_ep);
             drop(timer);
             end.unwrap_or_else(|e| {
-                std::os::seraph::log!("settle: wait set failed (err={e}); pending not served");
+                std::os::seraph::log!(
+                    warn: "settle: wait set failed (err={e}); pending not served"
+                );
                 SettleEnd::Settled
             })
         }
         else
         {
-            std::os::seraph::log!("settle: driver endpoint not added to the wait set");
+            std::os::seraph::log!(warn: "settle: driver endpoint not added to the wait set");
             SettleEnd::Settled
         };
         if reopen && let Err(e) = watch.open_jobs()
         {
             std::os::seraph::log!(
-                "settle: job notification not re-added to the wait set (err={e}); \
+                warn: "settle: job notification not re-added to the wait set (err={e}); \
                  jobs wait for a death to wake the control thread"
             );
         }
@@ -359,12 +361,14 @@ impl Timer
         )
         else
         {
-            std::os::seraph::log!("settle: timer notification not created; settle unbounded");
+            std::os::seraph::log!(warn: "settle: timer notification not created; settle unbounded");
             return None;
         };
         if syscall::wait_set_add(wait_set, sig, WS_BADGE_TIMER).is_err()
         {
-            std::os::seraph::log!("settle: timer not added to the wait set; settle unbounded");
+            std::os::seraph::log!(
+                warn: "settle: timer not added to the wait set; settle unbounded"
+            );
             let _ = syscall::cap_delete(sig);
             return None;
         }
@@ -372,7 +376,7 @@ impl Timer
         let Ok(copy) = syscall::cap_derive(sig, syscall::RIGHTS_ALL)
         else
         {
-            std::os::seraph::log!("settle: timer cap not derived; settle unbounded");
+            std::os::seraph::log!(warn: "settle: timer cap not derived; settle unbounded");
             return None;
         };
         let spawned = std::thread::Builder::new().spawn(move || {
@@ -382,7 +386,7 @@ impl Timer
         });
         if spawned.is_err()
         {
-            std::os::seraph::log!("settle: timer thread not started; settle unbounded");
+            std::os::seraph::log!(warn: "settle: timer thread not started; settle unbounded");
             let _ = syscall::cap_delete(copy);
             return None;
         }
@@ -447,7 +451,7 @@ impl<T> SettleEvents<T> for BatchEvents<'_>
     fn on_death(&mut self, badge: u64, reason: u64)
     {
         std::os::seraph::log!(
-            "settle: driver of device {} died before the batch settled (reason={:#x})",
+            warn: "settle: driver of device {} died before the batch settled (reason={:#x})",
             badge,
             reason
         );

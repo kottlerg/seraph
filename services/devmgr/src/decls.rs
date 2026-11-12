@@ -130,7 +130,7 @@ fn read_decl(
         Ok(decl) => Some(decl),
         Err(e) =>
         {
-            std::os::seraph::log!("{}: driver declaration rejected ({:?})", name, e);
+            std::os::seraph::log!(warn: "{}: driver declaration rejected ({:?})", name, e);
             None
         }
     }
@@ -174,7 +174,7 @@ pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
             }
             Some(Classified::Driver(_) | Classified::Table(_)) =>
             {
-                std::os::seraph::log!("boot module: no memory to record it; released");
+                std::os::seraph::log!(warn: "boot module: no memory to record it; released");
             }
             Some(Classified::Neither) | None =>
             {}
@@ -214,13 +214,15 @@ fn classify(bytes: &[u8]) -> Classified
         {
             return Classified::Driver(decl);
         }
-        std::os::seraph::log!("boot module: an executable with no declaration; released");
+        std::os::seraph::log!(warn: "boot module: an executable with no declaration; released");
         return Classified::Neither;
     }
     let Ok(text) = core::str::from_utf8(bytes)
     else
     {
-        std::os::seraph::log!("boot module: neither an executable nor a text table; released");
+        std::os::seraph::log!(
+            warn: "boot module: neither an executable nor a text table; released"
+        );
         return Classified::Neither;
     };
     match firmware::platform::parse_table(text)
@@ -228,7 +230,7 @@ fn classify(bytes: &[u8]) -> Classified
         Ok(table) => Classified::Table(table),
         Err(e) =>
         {
-            std::os::seraph::log!("boot module: platform table rejected ({:?}); released", e);
+            std::os::seraph::log!(warn: "boot module: platform table rejected ({:?}); released", e);
             Classified::Neither
         }
     }
@@ -255,13 +257,13 @@ fn with_module<R>(
     let Ok(range) = reserve_pages(pages)
     else
     {
-        std::os::seraph::log!("boot module: no VA to read it");
+        std::os::seraph::log!(warn: "boot module: no VA to read it");
         return None;
     };
     let va = range.va_start();
     if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, pages)
     {
-        std::os::seraph::log!("boot module: page-table budget not funded; not read");
+        std::os::seraph::log!(warn: "boot module: page-table budget not funded; not read");
         unreserve_pages(range);
         return None;
     }
@@ -279,7 +281,7 @@ fn with_module<R>(
     };
     if mapped.is_err()
     {
-        std::os::seraph::log!("boot module: not mapped; not read");
+        std::os::seraph::log!(warn: "boot module: not mapped; not read");
         unreserve_pages(range);
         return None;
     }

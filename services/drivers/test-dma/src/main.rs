@@ -228,7 +228,7 @@ fn main() -> !
     let Some((bar_cap, bar_pages, eps)) = receive(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!("test-dma: bootstrap caps missing");
+        std::os::seraph::log!(error: "test-dma: bootstrap caps missing");
         syscall::thread_exit();
     };
     let Ok(range) = reserve_pages(bar_pages)
@@ -244,7 +244,7 @@ fn main() -> !
     // through raw volatile accesses (`mmio_map` § Safety).
     if !funded || unsafe { syscall::mmio_map(info.self_aspace, bar_cap, regs, 0) }.is_err()
     {
-        std::os::seraph::log!("test-dma: BAR 0 not mapped");
+        std::os::seraph::log!(error: "test-dma: BAR 0 not mapped");
         syscall::thread_exit();
     }
     let driver = Driver {
@@ -255,7 +255,7 @@ fn main() -> !
     };
     if driver.read32(IDENT) != IDENT_EDU
     {
-        std::os::seraph::log!("test-dma: the device is not an edu device");
+        std::os::seraph::log!(error: "test-dma: the device is not an edu device");
         syscall::thread_exit();
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.

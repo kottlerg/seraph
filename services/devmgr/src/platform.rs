@@ -43,7 +43,7 @@ pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable]) -> Pla
         });
         if read.is_none()
         {
-            std::os::seraph::log!("ACPI definition block at {:#x} not read", block);
+            std::os::seraph::log!(warn: "ACPI definition block at {:#x} not read", block);
         }
     }
     attach_century(caps, &mut records);
@@ -207,7 +207,7 @@ fn platform_table(
     else
     {
         std::os::seraph::log!(
-            "no platform description table for this machine; no platform-table records"
+            warn: "no platform description table for this machine; no platform-table records"
         );
         return;
     };
@@ -249,7 +249,7 @@ fn add(
     if added == Added::Full
     {
         std::os::seraph::log!(
-            "platform record set full ({} records); a device is not recorded",
+            warn: "platform record set full ({} records); a device is not recorded",
             firmware::records::MAX_PLATFORM_RECORDS
         );
     }
@@ -280,24 +280,24 @@ fn log_record(index: usize, record: &firmware::records::PlatformRecord)
         (name, n)
     });
     let name = core::str::from_utf8(&key.0[..key.1]).unwrap_or("?");
-    std::os::seraph::log!("platform record {}: {}", index, name);
+    std::os::seraph::log!(debug: "platform record {}: {}", index, name);
     for r in record.resources()
     {
         match r
         {
             CrsResource::Mmio { base, size } =>
             {
-                std::os::seraph::log!("  mmio {:#x}+{:#x}", base, size);
+                std::os::seraph::log!(debug: "  mmio {:#x}+{:#x}", base, size);
             }
             CrsResource::IoPort { base, count } =>
             {
-                std::os::seraph::log!("  io {:#x}+{}", base, count);
+                std::os::seraph::log!(debug: "  io {:#x}+{}", base, count);
             }
             CrsResource::Interrupt {
                 line, mode, isa, ..
             } =>
             {
-                std::os::seraph::log!("  irq {} mode {:#x} isa {}", line, mode, isa);
+                std::os::seraph::log!(debug: "  irq {} mode {:#x} isa {}", line, mode, isa);
             }
         }
     }

@@ -166,7 +166,7 @@ impl IommuClient
     fn log_failed()
     {
         std::os::seraph::log!(
-            "IOMMU driver died with translation enabled: every later DMA_MAP refused, \
+            warn: "IOMMU driver died with translation enabled: every later DMA_MAP refused, \
              confined devices withdrawn, no restart (#262)"
         );
     }
@@ -330,7 +330,9 @@ impl IommuClient
             .spawn(move || drain(ep))
             .is_err()
         {
-            std::os::seraph::log!("IOMMU drain thread not started; a queued IOMMU call may hang");
+            std::os::seraph::log!(
+                warn: "IOMMU drain thread not started; a queued IOMMU call may hang"
+            );
         }
         true
     }
@@ -559,7 +561,7 @@ impl Iommu
             Placement::Untranslated =>
             {
                 std::os::seraph::log!(
-                    "{}: no remapping unit translates the device; unconfined",
+                    warn: "{}: no remapping unit translates the device; unconfined",
                     name
                 );
                 Ok(None)
@@ -567,14 +569,17 @@ impl Iommu
             Placement::Renamed =>
             {
                 std::os::seraph::log!(
-                    "{}: the firmware gives the device another IOMMU device ID; refused",
+                    warn: "{}: the firmware gives the device another IOMMU device ID; refused",
                     name
                 );
                 Err(Refused)
             }
             Placement::NotProgrammed =>
             {
-                std::os::seraph::log!("{}: its remapping unit is not programmed; refused", name);
+                std::os::seraph::log!(
+                    warn: "{}: its remapping unit is not programmed; refused",
+                    name
+                );
                 Err(Refused)
             }
         }
@@ -621,7 +626,11 @@ impl Iommu
             Ok(handle) => handle,
             Err(code) =>
             {
-                std::os::seraph::log!("{}: IOMMU ATTACH refused ({}); not spawned", name, code);
+                std::os::seraph::log!(
+                    warn: "{}: IOMMU ATTACH refused ({}); not spawned",
+                    name,
+                    code
+                );
                 return Err(Refused);
             }
         };
@@ -630,7 +639,7 @@ impl Iommu
             if let Err(code) = self.client.map_reserved(handle, r.base, r.len)
             {
                 std::os::seraph::log!(
-                    "{}: firmware-reserved range {:#x}..{:#x} not mapped ({}); refused",
+                    warn: "{}: firmware-reserved range {:#x}..{:#x} not mapped ({}); refused",
                     name,
                     r.base,
                     r.base + r.len,
@@ -640,7 +649,7 @@ impl Iommu
                 return Err(Refused);
             }
             std::os::seraph::log!(
-                "{}: firmware-reserved range {:#x}..{:#x} identity-mapped",
+                debug: "{}: firmware-reserved range {:#x}..{:#x} identity-mapped",
                 name,
                 r.base,
                 r.base + r.len
@@ -668,7 +677,7 @@ impl Iommu
         let Some(regions) = self.topology.reserved_regions(pci_dev.segment, target)
         else
         {
-            std::os::seraph::log!("{}: reserved regions not read (no memory); refused", name);
+            std::os::seraph::log!(warn: "{}: reserved regions not read (no memory); refused", name);
             return Err(Refused);
         };
         if regions.is_empty()
@@ -679,7 +688,8 @@ impl Iommu
         else
         {
             std::os::seraph::log!(
-                "{}: firmware-reserved regions not checked (pooled memory not known); refused",
+                warn: "{}: firmware-reserved regions not checked \
+                       (pooled memory not known); refused",
                 name
             );
             return Err(Refused);
@@ -688,25 +698,26 @@ impl Iommu
             match e
             {
                 ReservedError::Pooled(r) => std::os::seraph::log!(
-                    "{}: firmware-reserved range {:#x}..{:#x} overlaps pooled memory; \
+                    warn: "{}: firmware-reserved range {:#x}..{:#x} overlaps pooled memory; \
                      refused (platform error)",
                     name,
                     r.base,
                     r.base + r.len
                 ),
                 ReservedError::PastWidth { base, last } => std::os::seraph::log!(
-                    "{}: firmware-reserved region {:#x}..={:#x} past the unit's width; refused",
+                    warn: "{}: firmware-reserved region {:#x}..={:#x} \
+                           past the unit's width; refused",
                     name,
                     base,
                     last
                 ),
                 ReservedError::TooMany => std::os::seraph::log!(
-                    "{}: more than {} firmware-reserved ranges; refused",
+                    warn: "{}: more than {} firmware-reserved ranges; refused",
                     name,
                     firmware::dma::MAX_RESERVED_RANGES_PER_DEVICE as u64
                 ),
                 ReservedError::OutOfMemory => std::os::seraph::log!(
-                    "{}: reserved ranges not built (no memory); refused",
+                    warn: "{}: reserved ranges not built (no memory); refused",
                     name
                 ),
             }
@@ -754,7 +765,7 @@ fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
     for (rid, reason, iova) in taken
     {
         std::os::seraph::log!(
-            "IOMMU fault: device {}:{}:{}.{} reason {:#x} IOVA {:#x}",
+            warn: "IOMMU fault: device {}:{}:{}.{} reason {:#x} IOVA {:#x}",
             rid >> 16,
             (rid >> 8) & 0xff,
             (rid >> 3) & 0x1f,
@@ -852,7 +863,7 @@ fn vtd_rounds(
         else
         {
             std::os::seraph::log!(
-                "VT-d unit at {:#x} not handed over; its devices are refused",
+                warn: "VT-d unit at {:#x} not handed over; its devices are refused",
                 unit.register_base
             );
             unit_index.push(None);
@@ -898,7 +909,7 @@ fn riscv_rounds(
         {
             let f = iommu.function;
             std::os::seraph::log!(
-                "RISC-V IOMMU {}:{}:{}.{} not handed over; its devices are refused",
+                warn: "RISC-V IOMMU {}:{}:{}.{} not handed over; its devices are refused",
                 iommu.segment,
                 f.bus,
                 f.device,
@@ -984,7 +995,7 @@ pub fn bring_up(
 ) -> Option<Iommu>
 {
     let unconfined = |why: &str| {
-        std::os::seraph::log!("{}: DMA-capable devices run unconfined", why);
+        std::os::seraph::log!(warn: "{}: DMA-capable devices run unconfined", why);
     };
     let family = arch::current::IOMMU_FAMILY;
     let Some(table) = read_units_table(caps, family)
@@ -1006,7 +1017,8 @@ pub fn bring_up(
     if !decl.dma || !grants.phys_access
     {
         std::os::seraph::log!(
-            "{}: declares no DMA or no physical access, which the IOMMU driver needs; not bound",
+            warn: "{}: declares no DMA or no physical access, \
+                   which the IOMMU driver needs; not bound",
             decl.name.as_str()
         );
         unconfined("IOMMU driver not started");
@@ -1061,7 +1073,7 @@ pub fn bring_up(
             // first, ends it all the same.
             let _ = syscall::event_post(death_eq, 0);
             std::os::seraph::log!(
-                "IOMMU driver not ready after its bootstrap: DMA-capable devices run \
+                warn: "IOMMU driver not ready after its bootstrap: DMA-capable devices run \
                  unconfined, except those behind a unit it turned translation on for \
                  before it failed, which that unit blocks"
             );
@@ -1110,7 +1122,7 @@ fn take_family_driver(
         if table.add(decl, Source::BootModule, cap).is_err()
         {
             std::os::seraph::log!(
-                "{}: no memory to consider the driver; not bound",
+                warn: "{}: no memory to consider the driver; not bound",
                 decl.name.as_str()
             );
             let _ = syscall::cap_delete(cap);
@@ -1123,7 +1135,7 @@ fn take_family_driver(
         {
             let candidates = table.candidates();
             std::os::seraph::log!(
-                "IOMMU record: {} and {} match it equally; neither bound",
+                warn: "IOMMU record: {} and {} match it equally; neither bound",
                 candidates[first].decl.name.as_str(),
                 candidates[second].decl.name.as_str()
             );
@@ -1298,7 +1310,7 @@ fn spawn_and_settle(
     let (Some(batch), Some(device_badge), Ok(())) = (batch, badge, roster.try_reserve_one())
     else
     {
-        std::os::seraph::log!("IOMMU driver: no settle batch or badge; not spawned");
+        std::os::seraph::log!(warn: "IOMMU driver: no settle batch or badge; not spawned");
         release_rounds(rounds);
         return Settled::NotStarted;
     };
@@ -1385,7 +1397,9 @@ fn start_fault_log(client: &Arc<IommuClient>, faults: &Arc<Mutex<FaultCounts>>)
         });
     if started.is_err()
     {
-        std::os::seraph::log!("IOMMU fault-log thread not started; faults are logged on request");
+        std::os::seraph::log!(
+            warn: "IOMMU fault-log thread not started; faults are logged on request"
+        );
     }
 }
 

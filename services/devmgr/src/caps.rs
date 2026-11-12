@@ -296,7 +296,7 @@ fn absorb_aperture_round(
         if caps.apertures.insert(slot, base, size) != Ok(true)
         {
             std::os::seraph::log!(
-                "aperture {:#x}+{:#x} not recorded (empty range or no memory); released",
+                warn: "aperture {:#x}+{:#x} not recorded (empty range or no memory); released",
                 base,
                 size
             );
@@ -328,7 +328,7 @@ fn absorb_acpi_region_round(
         if firmware.acpi_regions.try_reserve(1).is_err()
         {
             std::os::seraph::log!(
-                "ACPI region {:#x}+{:#x} not recorded (no memory); released",
+                warn: "ACPI region {:#x}+{:#x} not recorded (no memory); released",
                 base,
                 size
             );
@@ -359,7 +359,7 @@ fn absorb_ram_extent_round(
     };
     if pooled.try_reserve(n).is_err()
     {
-        std::os::seraph::log!("pooled RAM extents not recorded (no memory)");
+        std::os::seraph::log!(warn: "pooled RAM extents not recorded (no memory)");
         caps.pooled = None;
         return;
     }
@@ -393,13 +393,13 @@ fn absorb_module_round(
         let Some(&bytes) = sizes.get(2 + i)
         else
         {
-            std::os::seraph::log!("boot module without its size; released");
+            std::os::seraph::log!(warn: "boot module without its size; released");
             let _ = syscall::cap_delete(slot);
             continue;
         };
         if caps.modules.try_reserve(1).is_err()
         {
-            std::os::seraph::log!("boot module not recorded (no memory); released");
+            std::os::seraph::log!(warn: "boot module not recorded (no memory); released");
             let _ = syscall::cap_delete(slot);
             continue;
         }

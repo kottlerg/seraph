@@ -37,7 +37,7 @@ fn main() -> !
     let creator = info.creator_endpoint;
     if creator == 0
     {
-        std::os::seraph::log!("test-orphan: no creator endpoint");
+        std::os::seraph::log!(error: "test-orphan: no creator endpoint");
         syscall::thread_exit();
     }
 
@@ -49,7 +49,7 @@ fn main() -> !
         Ok(round) if round.cap_count >= 1 => round.caps[0],
         _ =>
         {
-            std::os::seraph::log!("test-orphan: round 1 did not deliver a service endpoint");
+            std::os::seraph::log!(error: "test-orphan: round 1 did not deliver a service endpoint");
             syscall::thread_exit();
         }
     };

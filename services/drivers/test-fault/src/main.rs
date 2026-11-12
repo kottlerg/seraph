@@ -65,7 +65,7 @@ fn main() -> !
     let Some(caps) = bootstrap_caps(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!("test-fault: bootstrap caps missing");
+        std::os::seraph::log!(error: "test-fault: bootstrap caps missing");
         syscall::thread_exit();
     };
 
@@ -77,7 +77,7 @@ fn main() -> !
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if let Err(e) = unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
     {
-        std::os::seraph::log!("test-fault: DRIVER_READY failed ({:?}); exiting", e);
+        std::os::seraph::log!(error: "test-fault: DRIVER_READY failed ({:?}); exiting", e);
         syscall::thread_exit();
     }
     serve(caps.service_ep, ipc_buf);

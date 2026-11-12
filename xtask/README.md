@@ -1089,10 +1089,14 @@ cargo xtask orch end
 
 The state is `target/xtask/orchestration/state.json`, and the batch's log is `<date>.md`
 beside it, named for the UTC date of `orch start`; a second batch started on the same UTC day
-appends to the same log. Nothing else writes either file. A change is
-made under a lock file (`state.lock`), written through a temporary file, and followed by one
-line in the log, `- <UTC time> <what changed>`, so the log needs no separate upkeep; `orch log`
-appends a line for an event that changes no state.
+appends to the same log. Both are the main checkout's: the command finds that checkout through
+the git common directory, as the [host lock](#host-launch-rules) does, so run in a linked
+worktree it reads and writes the same files, and a worker records its status there from its own
+worktree (`.claude/agents/worker.md` § Reporting). Outside a git checkout, and in one whose git
+common directory is not a `.git` directory, it uses the checkout's own `target/`. Nothing else
+writes either file. A change is made under a lock file (`state.lock`), written through a
+temporary file, and followed by one line in the log, `- <UTC time> <what changed>`, so the log
+needs no separate upkeep; `orch log` appends a line for an event that changes no state.
 
 | Subcommand | Effect |
 |---|---|

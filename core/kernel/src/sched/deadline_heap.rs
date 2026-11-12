@@ -450,10 +450,9 @@ mod tests
                 break;
             }
             // SAFETY: n was linked and is still a live boxed node.
-            unsafe {
-                assert!(!(*n).is_linked());
-                out.push((*n).key());
-            }
+            assert!(!unsafe { (*n).is_linked() });
+            // SAFETY: as above.
+            out.push(unsafe { (*n).key() });
         }
         out
     }
@@ -496,13 +495,12 @@ mod tests
         for i in (0..nodes.len()).step_by(3)
         {
             let n: *mut DeadlineNode = &raw mut *nodes[i];
-            // SAFETY: n is a live boxed node; the test owns the heap.
-            unsafe {
-                if (*n).is_linked()
-                {
-                    heap.remove(n);
-                    removed[i] = true;
-                }
+            // SAFETY: n is a live boxed node.
+            if unsafe { (*n).is_linked() }
+            {
+                // SAFETY: n is linked in this heap, which the test owns.
+                unsafe { heap.remove(n) };
+                removed[i] = true;
             }
         }
         let mut expect: Vec<u64> = nodes
@@ -523,12 +521,12 @@ mod tests
     {
         let (mut heap, mut nodes) = filled(&[50, 40, 30]);
         let n: *mut DeadlineNode = &raw mut *nodes[0];
-        // SAFETY: test owns the heap and the node.
-        unsafe {
-            heap.remove(n);
-            heap.insert(n, 5);
-            assert_eq!((*heap.min()).key(), 5);
-        }
+        // SAFETY: n is linked in this heap, which the test owns.
+        unsafe { heap.remove(n) };
+        // SAFETY: n is a live boxed node, unlinked by the remove above.
+        unsafe { heap.insert(n, 5) };
+        // SAFETY: the heap holds n, so its minimum is a live boxed node.
+        assert_eq!(unsafe { (*heap.min()).key() }, 5);
         assert_eq!(drain(&mut heap), [5, 30, 40]);
     }
 
@@ -542,8 +540,12 @@ mod tests
         // SAFETY: test owns the heap; reshape it into a deeper tree.
         let popped = unsafe { heap.pop_min() };
         let mut seen = Vec::new();
+        let record = |n: *mut DeadlineNode| {
+            // SAFETY: every node the walk visits is a live boxed node.
+            seen.push(unsafe { (*n).key() });
+        };
         // SAFETY: test owns the heap; the closure only reads.
-        unsafe { heap.visit(usize::MAX, |n| seen.push((*n).key())) };
+        unsafe { heap.visit(usize::MAX, record) };
         assert_eq!(seen.len(), 63);
         // SAFETY: as above.
         assert_eq!(seen[0], unsafe { (*heap.min()).key() });

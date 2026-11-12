@@ -1250,8 +1250,13 @@ mod tests
     fn walk(first: *mut DeathObserver) -> Vec<u64>
     {
         let mut seen = Vec::new();
-        // SAFETY: every node is a live local of the calling test.
-        unsafe { for_each_observer(first, |n| seen.push((*n).correlator)) };
+        let record = |n: *mut DeathObserver| {
+            // SAFETY: every node is a live local of the calling test.
+            seen.push(unsafe { (*n).correlator });
+        };
+        // SAFETY: every node is a live local of the calling test, and the
+        // callback only reads.
+        unsafe { for_each_observer(first, record) };
         seen
     }
 
@@ -1289,15 +1294,15 @@ mod tests
 
         let mut free: *mut DeathObserver = core::ptr::null_mut();
         let mut visited = 0;
+        let relink = |n: *mut DeathObserver| {
+            // SAFETY: n is a live local node the walk hands over.
+            unsafe { (*n).next = free };
+            free = n;
+            visited += 1;
+        };
         // SAFETY: the nodes are live locals; the callback relinks only the
         // node it is given.
-        unsafe {
-            for_each_observer(first, |n| {
-                (*n).next = free;
-                free = n;
-                visited += 1;
-            });
-        }
+        unsafe { for_each_observer(first, relink) };
         assert_eq!(visited, 3);
         assert_eq!(walk(free), [10, 20, 30]);
     }

@@ -252,23 +252,23 @@ fn bootstrap_round1(
     firmware.dtb_page_base = round1.data[2];
     firmware.dtb_size = round1.data[3];
 
-    let mut idx = 1usize;
-    if presence & present::IRQ_RANGE != 0 && idx < round1.cap_count
+    // Caps after the registry endpoint arrive in presence-bit order.
+    let mut rest = round1.caps.iter().take(round1.cap_count).skip(1);
+    if presence & present::IRQ_RANGE != 0
+        && let Some(&cap) = rest.next()
     {
-        caps.irq_range_cap = round1.caps[idx];
-        idx += 1;
+        caps.irq_range_cap = cap;
     }
-    if presence & present::RSDP != 0 && idx < round1.cap_count
+    if presence & present::RSDP != 0
+        && let Some(&cap) = rest.next()
     {
-        firmware.rsdp_memory_cap = round1.caps[idx];
-        idx += 1;
+        firmware.rsdp_memory_cap = cap;
     }
-    if presence & present::DTB != 0 && idx < round1.cap_count
+    if presence & present::DTB != 0
+        && let Some(&cap) = rest.next()
     {
-        firmware.dtb_memory_cap = round1.caps[idx];
-        idx += 1;
+        firmware.dtb_memory_cap = cap;
     }
-    let _ = idx;
     Some(())
 }
 
@@ -285,14 +285,15 @@ fn absorb_aperture_round(
 {
     let batch_count = usize::try_from(round_data[1]).unwrap_or(usize::MAX);
     let n = batch_count.min(round_cap_count).min(4);
-    for (i, &slot) in round_caps.iter().take(n).enumerate()
+    // Pair `i` of the round (words `2 + 2i` and `3 + 2i`) describes cap `i`.
+    let pairs = round_data.as_chunks::<2>().0.iter().skip(1);
+    for (&slot, pair) in round_caps.iter().take(n).zip(pairs)
     {
         if slot == 0
         {
             continue;
         }
-        let base = round_data[2 + i * 2];
-        let size = round_data[3 + i * 2];
+        let &[base, size] = pair;
         if caps.apertures.insert(slot, base, size) != Ok(true)
         {
             std::os::seraph::log!(
@@ -317,14 +318,15 @@ fn absorb_acpi_region_round(
 {
     let batch_count = usize::try_from(round_data[1]).unwrap_or(usize::MAX);
     let n = batch_count.min(round_cap_count).min(4);
-    for (i, &slot) in round_caps.iter().take(n).enumerate()
+    // Pair `i` of the round (words `2 + 2i` and `3 + 2i`) describes cap `i`.
+    let pairs = round_data.as_chunks::<2>().0.iter().skip(1);
+    for (&slot, pair) in round_caps.iter().take(n).zip(pairs)
     {
         if slot == 0
         {
             continue;
         }
-        let base = round_data[2 + i * 2];
-        let size = round_data[3 + i * 2];
+        let &[base, size] = pair;
         if firmware.acpi_regions.try_reserve(1).is_err()
         {
             std::os::seraph::log!(
@@ -363,9 +365,9 @@ fn absorb_ram_extent_round(
         caps.pooled = None;
         return;
     }
-    for i in 0..n
+    for &[base, size] in round_data.as_chunks::<2>().0.iter().skip(1).take(n)
     {
-        pooled.push((round_data[2 + i * 2], round_data[3 + i * 2]));
+        pooled.push((base, size));
     }
 }
 
@@ -383,14 +385,14 @@ fn absorb_module_round(
 )
 {
     let n = round_cap_count.min(4);
-    let sizes = &round_data[..round_data_words.min(round_data.len())];
+    let sizes = round_data.get(..round_data_words).unwrap_or(round_data);
     for (i, &slot) in round_caps.iter().take(n).enumerate()
     {
         if slot == 0
         {
             continue;
         }
-        let Some(&bytes) = sizes.get(2 + i)
+        let Some(&bytes) = sizes.get(i.saturating_add(2))
         else
         {
             std::os::seraph::log!(warn: "boot module without its size; released");

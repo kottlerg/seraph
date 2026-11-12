@@ -48,7 +48,13 @@ impl Ecam
         {
             return None;
         }
-        Some(self.va + firmware::pci::config_offset(self.start_bus, bus, dev, func, reg)?)
+        self.va.checked_add(firmware::pci::config_offset(
+            self.start_bus,
+            bus,
+            dev,
+            func,
+            reg,
+        )?)
     }
 }
 

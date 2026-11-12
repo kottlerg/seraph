@@ -77,7 +77,7 @@ fn find_region_for(firmware: &Firmware, phys: u64) -> Option<AcpiRegion>
     firmware
         .acpi_regions
         .iter()
-        .find(|r| phys >= r.base && phys - r.base < r.size)
+        .find(|r| phys.checked_sub(r.base).is_some_and(|off| off < r.size))
         .copied()
 }
 
@@ -94,7 +94,7 @@ fn with_acpi_bytes<R>(
     let region = find_region_for(firmware, phys)?;
     let w = firmware::acpi::table_window(region.base, region.size, phys, len, PAGE_SIZE)?;
     with_mapped(firmware, region.slot, w.first_page, w.page_count, |bytes| {
-        read(bytes.get(w.offset..w.offset + w.len)?)
+        read(bytes.get(w.offset..w.offset.checked_add(w.len)?)?)
     })
 }
 
@@ -139,13 +139,16 @@ fn read_xsdt_phys(firmware: &Firmware) -> Option<u64>
     // init-protocol v5 docs); the backing Memory cap covers that one page,
     // so an RSDP straddling the page end is unreadable.
     let rsdp_page_offset = usize::try_from(firmware.rsdp_page_base & (PAGE_SIZE - 1)).ok()?;
-    if rsdp_page_offset + firmware::acpi::RSDP_LEN > usize::try_from(PAGE_SIZE).ok()?
+    let page_bytes = usize::try_from(PAGE_SIZE).ok()?;
+    if rsdp_page_offset
+        .checked_add(firmware::acpi::RSDP_LEN)
+        .is_none_or(|end| end > page_bytes)
     {
         std::os::seraph::log!(warn: "RSDP straddles its page; ACPI unavailable");
         return None;
     }
     with_mapped(firmware, firmware.rsdp_memory_cap, 0, 1, |page| {
-        firmware::acpi::rsdp_xsdt_phys(&page[rsdp_page_offset..])
+        firmware::acpi::rsdp_xsdt_phys(page.get(rsdp_page_offset..)?)
     })
 }
 

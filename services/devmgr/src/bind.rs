@@ -118,7 +118,10 @@ impl Records
     /// passes can start, each record being bound at most once.
     pub fn count(&self) -> usize
     {
-        self.pci.devices.len() + self.platform_bound.len()
+        self.pci
+            .devices
+            .len()
+            .saturating_add(self.platform_bound.len())
     }
 
     /// Whether `decl`, from `source`, matches a record no driver is bound
@@ -341,29 +344,31 @@ fn bind_records(
             Choice::Conflict(first, second) =>
             {
                 let candidates = table.candidates();
-                std::os::seraph::log!(
-                    warn: "platform record {}: {} and {} match it equally; neither bound",
-                    index,
-                    candidates[first].decl.name.as_str(),
-                    candidates[second].decl.name.as_str()
-                );
+                if let (Some(a), Some(b)) = (candidates.get(first), candidates.get(second))
+                {
+                    std::os::seraph::log!(
+                        warn: "platform record {}: {} and {} match it equally; neither bound",
+                        index,
+                        a.decl.name.as_str(),
+                        b.decl.name.as_str()
+                    );
+                }
             }
             Choice::Bind(chosen) =>
             {
-                if bind_platform(
-                    index,
-                    record,
-                    &table.candidates()[chosen],
-                    carve,
-                    pass,
-                    ipc_buf,
-                )
+                let Some(candidate) = table.candidates().get(chosen)
+                else
+                {
+                    continue;
+                };
+                if bind_platform(index, record, candidate, carve, pass, ipc_buf)
                 {
                     *bound = true;
                     table.note_bound(chosen);
-                    records
-                        .bound_counts
-                        .note(&table.candidates()[chosen].decl.name);
+                    if let Some(candidate) = table.candidates().get(chosen)
+                    {
+                        records.bound_counts.note(&candidate.decl.name);
+                    }
                 }
             }
         }
@@ -393,23 +398,34 @@ fn bind_pci_records(
             Choice::Conflict(first, second) =>
             {
                 let candidates = table.candidates();
-                std::os::seraph::log!(
-                    warn: "PCI {}:{}:{}.{}: {} and {} match it equally; neither bound",
-                    pci_dev.segment,
-                    pci_dev.bus,
-                    pci_dev.dev,
-                    pci_dev.func,
-                    candidates[first].decl.name.as_str(),
-                    candidates[second].decl.name.as_str()
-                );
+                if let (Some(a), Some(b)) = (candidates.get(first), candidates.get(second))
+                {
+                    std::os::seraph::log!(
+                        warn: "PCI {}:{}:{}.{}: {} and {} match it equally; neither bound",
+                        pci_dev.segment,
+                        pci_dev.bus,
+                        pci_dev.dev,
+                        pci_dev.func,
+                        a.decl.name.as_str(),
+                        b.decl.name.as_str()
+                    );
+                }
             }
             Choice::Bind(index) =>
             {
-                if bind_pci(pci_dev, &table.candidates()[index], carve, pass, ipc_buf)
+                let Some(candidate) = table.candidates().get(index)
+                else
+                {
+                    continue;
+                };
+                if bind_pci(pci_dev, candidate, carve, pass, ipc_buf)
                 {
                     *bound = true;
                     table.note_bound(index);
-                    bound_counts.note(&table.candidates()[index].decl.name);
+                    if let Some(candidate) = table.candidates().get(index)
+                    {
+                        bound_counts.note(&candidate.decl.name);
+                    }
                 }
             }
         }
@@ -708,7 +724,7 @@ impl PlatformDeviceCaps
         if let Some(slot) = self.resources.get_mut(self.count)
         {
             *slot = resource;
-            self.count += 1;
+            self.count = self.count.saturating_add(1);
             true
         }
         else
@@ -721,7 +737,7 @@ impl PlatformDeviceCaps
     /// The delivered resources, in delivery order.
     pub fn resources(&self) -> &[Resource]
     {
-        &self.resources[..self.count]
+        self.resources.get(..self.count).unwrap_or(&[])
     }
 
     /// Take the device from its driver, live or dead: revoke every copy
@@ -1029,11 +1045,15 @@ fn carve_bars(
 ) -> Option<()>
 {
     let mut carve_one = |b: usize, bytes: u64| {
-        let index = pci_dev.bar_pci_idx[b];
+        let (Some(&index), Some(&bar_phys)) = (pci_dev.bar_pci_idx.get(b), pci_dev.bar_phys.get(b))
+        else
+        {
+            return None;
+        };
         let (ranges, count) = firmware::pci::delivered_ranges(index, bytes, withheld);
         for &(offset, bytes) in ranges.get(..count).unwrap_or(&[])
         {
-            let phys = pci_dev.bar_phys[b] + offset;
+            let phys = bar_phys.checked_add(offset)?;
             std::os::seraph::log!(
                 debug: "{}: BAR {} +{:#x} phys={:#018x} size={:#018x}",
                 name,
@@ -1062,14 +1082,14 @@ fn carve_bars(
         }
         Some(())
     };
-    let mmio = |b: &usize| pci_dev.bar_is_mmio[*b];
+    let mmio = |b: &usize| pci_dev.bar_is_mmio.get(*b).copied().unwrap_or(false);
     if let Some(layout) = pci_dev.virtio_info.register_layout()
     {
         for aperture in layout.bars()
         {
             let Some(b) = (0..pci_dev.bar_count)
                 .filter(mmio)
-                .find(|&b| pci_dev.bar_pci_idx[b] == aperture.bar)
+                .find(|&b| pci_dev.bar_pci_idx.get(b) == Some(&aperture.bar))
             else
             {
                 std::os::seraph::log!(
@@ -1082,14 +1102,16 @@ fn carve_bars(
             // The driver maps the BAR into `aperture.pages` pages of its
             // register window and `mmio_map` maps the whole cap, so the cap
             // covers no more of the BAR than the regions in it reach.
-            carve_one(b, pci_dev.bar_size[b].min(aperture.pages * PAGE_SIZE))?;
+            let size = *pci_dev.bar_size.get(b)?;
+            carve_one(b, size.min(aperture.pages.saturating_mul(PAGE_SIZE)))?;
         }
     }
     else
     {
         for b in (0..pci_dev.bar_count).filter(mmio)
         {
-            carve_one(b, pci_dev.bar_size[b])?;
+            let size = *pci_dev.bar_size.get(b)?;
+            carve_one(b, size)?;
         }
     }
     Some(())
@@ -1358,7 +1380,7 @@ fn mint_messages(
                 std::os::seraph::log!(
                     warn: "{}: interrupt target {} of {} not minted ({})",
                     name,
-                    messages.len() + 1,
+                    messages.len().saturating_add(1),
                     count,
                     e
                 );
@@ -1534,9 +1556,16 @@ fn msix_table(
 ) -> Option<MsixTable>
 {
     let bar = (0..pci_dev.bar_count)
-        .find(|&b| pci_dev.bar_pci_idx[b] == msix.table_bar && pci_dev.bar_is_mmio[b])
-        .filter(|&b| msix.table_end() <= pci_dev.bar_size[b]);
-    let Some(b) = bar
+        .find(|&b| {
+            pci_dev.bar_pci_idx.get(b) == Some(&msix.table_bar)
+                && pci_dev.bar_is_mmio.get(b) == Some(&true)
+        })
+        .and_then(|b| {
+            let size = *pci_dev.bar_size.get(b)?;
+            let phys = *pci_dev.bar_phys.get(b)?;
+            (msix.table_end() <= size).then_some((size, phys))
+        });
+    let Some((bar_size, bar_phys)) = bar
     else
     {
         std::os::seraph::log!(
@@ -1548,8 +1577,12 @@ fn msix_table(
     };
     let (span, offset) = msix.table_span();
     // A BAR smaller than a page ends before the table's page does.
-    let bytes = span.end.min(pci_dev.bar_size[b]) - span.start;
-    let Some(cap) = crate::carve_subrange(caps, pci_dev.bar_phys[b] + span.start, bytes)
+    // `table_end() <= bar_size` bounds `span.start`, so the subtraction does
+    // not saturate.
+    let bytes = span.end.min(bar_size).saturating_sub(span.start);
+    let Some(cap) = bar_phys
+        .checked_add(span.start)
+        .and_then(|at| crate::carve_subrange(caps, at, bytes))
     else
     {
         std::os::seraph::log!(
@@ -1638,7 +1671,8 @@ pub fn carve_function_config(
                 firmware::pci::FUNCTION_CONFIG_BYTES,
                 PAGE_SIZE,
                 |span: &Span<u64>, at| {
-                    syscall::mmio_split(span.slot, at - span.base).map_err(|_| SplitError::Failed)
+                    let offset = at.checked_sub(span.base).ok_or(SplitError::Failed)?;
+                    syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
                 },
             )
             .ok()
@@ -1739,7 +1773,7 @@ impl PciDeviceCaps
         if let Some(slot) = self.resources.get_mut(self.count)
         {
             *slot = resource;
-            self.count += 1;
+            self.count = self.count.saturating_add(1);
         }
         else
         {
@@ -1751,7 +1785,7 @@ impl PciDeviceCaps
     /// interrupt's vectors.
     pub fn resources(&self) -> &[Resource]
     {
-        &self.resources[..self.count]
+        self.resources.get(..self.count).unwrap_or(&[])
     }
 
     /// Whether the device was given message-signaled vectors.
@@ -1964,24 +1998,25 @@ impl DeviceReset
     ) -> Option<Self>
     {
         let status = info.status_register()?;
-        resources.iter().find_map(|r| match *r
-        {
-            Resource::Mmio {
+        resources.iter().find_map(|r| {
+            let Resource::Mmio {
                 cap,
                 bar: Some(bar),
                 bytes,
                 offset,
                 ..
-            } if bar == status.bar && status.offset >= offset && status.offset - offset < bytes =>
+            } = *r
+            else
             {
-                Some(Self {
-                    bar_cap: cap,
-                    bar_pages: bytes.div_ceil(PAGE_SIZE),
-                    offset: status.offset - offset,
-                    aspace,
-                })
-            }
-            _ => None,
+                return None;
+            };
+            let within = status.offset.checked_sub(offset).filter(|&d| d < bytes)?;
+            (bar == status.bar).then(|| Self {
+                bar_cap: cap,
+                bar_pages: bytes.div_ceil(PAGE_SIZE),
+                offset: within,
+                aspace,
+            })
         })
     }
 
@@ -2004,7 +2039,7 @@ impl DeviceReset
             self.bar_pages,
             "device reset",
             |va| {
-                let status = (va + offset) as *mut u8;
+                let status = va.wrapping_add(offset) as *mut u8;
                 // SAFETY: `offset` is below the bytes the range's cap was
                 // carved to (`for_device`), all of which are mapped from `va`
                 // for this closure (`with_mmio_mapped`), and `device_status` is
@@ -2064,9 +2099,9 @@ impl ConfigRegs
     /// within the page and is aligned to its width.
     fn at(&self, offset: u16, width: u16) -> Option<u64>
     {
-        let end = u64::from(offset) + u64::from(width);
+        let end = u64::from(offset).saturating_add(u64::from(width));
         (end <= firmware::pci::FUNCTION_CONFIG_BYTES && offset.is_multiple_of(width))
-            .then(|| self.va + u64::from(offset))
+            .then(|| self.va.wrapping_add(u64::from(offset)))
     }
 
     fn read8(&self, offset: u16) -> u8
@@ -2148,7 +2183,7 @@ impl FunctionConfig
     fn prepare_for_bind(&self, dma: bool, wired: bool) -> bool
     {
         self.mapped("bind", |va| {
-            let command = (va + u64::from(firmware::pci::COMMAND)) as *mut u16;
+            let command = va.wrapping_add(u64::from(firmware::pci::COMMAND)) as *mut u16;
             // SAFETY: the Command register lies in the configuration page
             // mapped from `va` for this closure, and is a 16-bit register.
             let current = unsafe { core::ptr::read_volatile(command) };
@@ -2178,13 +2213,13 @@ impl FunctionConfig
             // SAFETY: `va` is the configuration page mapped for this closure.
             let regs = unsafe { ConfigRegs::new(va) };
             regs.write32(
-                msi.offset + firmware::pci::MSI_ADDRESS,
+                msi.offset.saturating_add(firmware::pci::MSI_ADDRESS),
                 u32::from_le_bytes([lo0, lo1, lo2, lo3]),
             );
             if msi.address_64
             {
                 regs.write32(
-                    msi.offset + firmware::pci::MSI_ADDRESS_HIGH,
+                    msi.offset.saturating_add(firmware::pci::MSI_ADDRESS_HIGH),
                     u32::from_le_bytes([hi0, hi1, hi2, hi3]),
                 );
             }
@@ -2194,7 +2229,7 @@ impl FunctionConfig
                 regs.write32(mask, regs.read32(mask) & !1);
             }
             regs.update16(
-                msi.offset + firmware::pci::MESSAGE_CONTROL,
+                msi.offset.saturating_add(firmware::pci::MESSAGE_CONTROL),
                 firmware::pci::msi_control_enable_one,
             );
         });
@@ -2216,7 +2251,7 @@ impl FunctionConfig
     /// MSI-X then disabled again.
     fn enable_msix(&self, msix: Msix, table: &MsixTable, messages: &[Message]) -> bool
     {
-        let control = msix.offset + firmware::pci::MESSAGE_CONTROL;
+        let control = msix.offset.saturating_add(firmware::pci::MESSAGE_CONTROL);
         let enabled = self.mapped("MSI-X", |va| {
             // SAFETY: `va` is the configuration page mapped for this closure.
             let regs = unsafe { ConfigRegs::new(va) };
@@ -2234,8 +2269,9 @@ impl FunctionConfig
         let programmed =
             crate::with_mmio_mapped(self.aspace, table.cap, table.pages, "MSI-X table", |va| {
                 let register = |entry: u64, field: u64| {
-                    (va + table.offset + entry * firmware::pci::MSIX_ENTRY_BYTES + field)
-                        as *mut u32
+                    va.wrapping_add(table.offset)
+                        .wrapping_add(entry.wrapping_mul(firmware::pci::MSIX_ENTRY_BYTES))
+                        .wrapping_add(field) as *mut u32
                 };
                 // SAFETY (each access below): the table, `table_size` entries
                 // from `table.offset`, lies within the pages the cap spans
@@ -2335,7 +2371,7 @@ impl FunctionConfig
                 firmware::pci::find_capability(status, firmware::pci::CAP_ID_MSI, read8)
             {
                 regs.update16(
-                    at + firmware::pci::MESSAGE_CONTROL,
+                    at.saturating_add(firmware::pci::MESSAGE_CONTROL),
                     firmware::pci::msi_control_disable,
                 );
             }
@@ -2343,7 +2379,7 @@ impl FunctionConfig
                 firmware::pci::find_capability(status, firmware::pci::CAP_ID_MSIX, read8)
             {
                 regs.update16(
-                    at + firmware::pci::MESSAGE_CONTROL,
+                    at.saturating_add(firmware::pci::MESSAGE_CONTROL),
                     firmware::pci::msix_control_disable,
                 );
             }
@@ -2358,7 +2394,7 @@ impl FunctionConfig
     pub fn enable_memory_and_bus_master(&self) -> bool
     {
         self.mapped("bus master", |va| {
-            let command = (va + u64::from(firmware::pci::COMMAND)) as *mut u16;
+            let command = va.wrapping_add(u64::from(firmware::pci::COMMAND)) as *mut u16;
             // SAFETY: the Command register lies in the configuration page
             // mapped from `va` for this closure, and is a 16-bit register.
             let current = unsafe { core::ptr::read_volatile(command) };
@@ -2383,7 +2419,7 @@ impl FunctionConfig
     fn clear_bus_master(&self) -> bool
     {
         let read_back = self.mapped("bus master", |va| {
-            let command = (va + u64::from(firmware::pci::COMMAND)) as *mut u16;
+            let command = va.wrapping_add(u64::from(firmware::pci::COMMAND)) as *mut u16;
             // SAFETY: the Command register lies in the configuration page
             // mapped from `va` for this closure, and is a 16-bit register.
             let current = unsafe { core::ptr::read_volatile(command) };
@@ -2423,7 +2459,7 @@ impl FunctionConfig
     fn disable_interrupt(&self) -> bool
     {
         let read_back = self.mapped("interrupt disable", |va| {
-            let command = (va + u64::from(firmware::pci::COMMAND)) as *mut u16;
+            let command = va.wrapping_add(u64::from(firmware::pci::COMMAND)) as *mut u16;
             // SAFETY: the Command register lies in the configuration page
             // mapped from `va` for this closure, and is a 16-bit register.
             let current = unsafe { core::ptr::read_volatile(command) };
@@ -2463,27 +2499,30 @@ impl FunctionConfig
                 // capability header (`find_capability` reads pointers that a
                 // byte holds), inside the page mapped from `va` for this
                 // closure.
-                unsafe { core::ptr::read_volatile((va + u64::from(at)) as *const u8) }
+                unsafe { core::ptr::read_volatile(va.wrapping_add(u64::from(at)) as *const u8) }
             };
             // SAFETY: the Status register lies in the configuration page
             // mapped from `va` for this closure, and is a 16-bit register.
             let status = unsafe {
-                core::ptr::read_volatile((va + u64::from(firmware::pci::STATUS)) as *const u16)
+                core::ptr::read_volatile(
+                    va.wrapping_add(u64::from(firmware::pci::STATUS)) as *const u16
+                )
             };
             let express =
                 firmware::pci::find_capability(status, firmware::pci::CAP_ID_PCI_EXPRESS, read8)?;
-            let devcap_at = express + firmware::pci::PCIE_DEVICE_CAPABILITIES;
+            let devcap_at = express.checked_add(firmware::pci::PCIE_DEVICE_CAPABILITIES)?;
             // SAFETY: the capability's Device Capabilities register lies in
             // the mapped page (a capability starts below byte 256 and the
             // register 4 bytes into it), dword-aligned, a 32-bit register.
-            let devcap =
-                unsafe { core::ptr::read_volatile((va + u64::from(devcap_at)) as *const u32) };
+            let devcap = unsafe {
+                core::ptr::read_volatile(va.wrapping_add(u64::from(devcap_at)) as *const u32)
+            };
             if !firmware::pci::flr_capable(devcap)
             {
                 return None;
             }
-            let control =
-                (va + u64::from(express + firmware::pci::PCIE_DEVICE_CONTROL)) as *mut u16;
+            let control_at = express.checked_add(firmware::pci::PCIE_DEVICE_CONTROL)?;
+            let control = va.wrapping_add(u64::from(control_at)) as *mut u16;
             // SAFETY: Device Control lies 8 bytes into the capability, in the
             // mapped page, and is a 16-bit register.
             let current = unsafe { core::ptr::read_volatile(control) };
@@ -2508,7 +2547,9 @@ impl FunctionConfig
             // SAFETY: the Vendor ID register lies in the configuration page
             // mapped from `va` for this closure, and is a 16-bit register.
             unsafe {
-                core::ptr::read_volatile((va + u64::from(firmware::pci::VENDOR_ID)) as *const u16)
+                core::ptr::read_volatile(
+                    va.wrapping_add(u64::from(firmware::pci::VENDOR_ID)) as *const u16
+                )
             }
         });
         let completed = vendor.is_some_and(firmware::pci::flr_completed);

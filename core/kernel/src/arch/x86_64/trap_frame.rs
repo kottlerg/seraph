@@ -230,7 +230,8 @@ impl TrapFrame
     /// and `syscall` is two bytes (`0F 05`).
     pub fn rewind_syscall(&mut self) -> u64
     {
-        self.rip -= SYSCALL_INSN_BYTES;
+        // Address arithmetic: wraps, as the instruction pointer does.
+        self.rip = self.rip.wrapping_sub(SYSCALL_INSN_BYTES);
         self.rip
     }
 
@@ -243,7 +244,7 @@ impl TrapFrame
     {
         if self.rip == at
         {
-            self.rip = at + SYSCALL_INSN_BYTES;
+            self.rip = at.wrapping_add(SYSCALL_INSN_BYTES);
         }
     }
 

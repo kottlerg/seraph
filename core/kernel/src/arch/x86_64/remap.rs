@@ -76,18 +76,20 @@ pub const MESSAGE_DATA: u32 = 0;
 #[must_use]
 pub const fn handle(cpu: usize, vector: u8) -> Option<u16>
 {
-    if cpu >= REMAP_CPU_LIMIT || vector < DEVICE_VECTOR_BASE
+    let Some(offset) = vector.checked_sub(DEVICE_VECTOR_BASE)
+    else
+    {
+        return None;
+    };
+    let offset = offset as usize;
+    if cpu >= REMAP_CPU_LIMIT || offset >= DEVICE_VECTOR_COUNT
     {
         return None;
     }
-    let offset = (vector - DEVICE_VECTOR_BASE) as usize;
-    if offset >= DEVICE_VECTOR_COUNT
-    {
-        return None;
-    }
-    // Below HANDLE_COUNT by the const assertion on REMAP_CPU_LIMIT, so it fits 16 bits.
+    // Below HANDLE_COUNT by the bounds above and the const assertion on REMAP_CPU_LIMIT, so
+    // neither operation wraps and the handle fits 16 bits.
     #[allow(clippy::cast_possible_truncation)]
-    Some((cpu * DEVICE_VECTOR_COUNT + offset) as u16)
+    Some(cpu.wrapping_mul(DEVICE_VECTOR_COUNT).wrapping_add(offset) as u16)
 }
 
 /// The number of handles `cpu_count` CPUs use: every device vector of each CPU below
@@ -103,7 +105,9 @@ pub const fn handle_count(cpu_count: usize) -> usize
     {
         REMAP_CPU_LIMIT
     };
-    cpus * DEVICE_VECTOR_COUNT
+    // At most REMAP_CPU_LIMIT * DEVICE_VECTOR_COUNT, which the const assertion keeps
+    // within HANDLE_COUNT.
+    cpus.saturating_mul(DEVICE_VECTOR_COUNT)
 }
 
 /// The remappable message address naming `handle`, with the subhandle valid.

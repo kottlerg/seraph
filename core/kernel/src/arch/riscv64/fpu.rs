@@ -486,7 +486,9 @@ unsafe fn cache_vlenb()
     }
     VLENB.store(v, core::sync::atomic::Ordering::Relaxed);
     // At most 304 + 32 * 8192 bytes: the bound above keeps it in range.
-    crate::sched::thread_slot::set_extended_bytes(V_REGS_OFFSET + 32 * v);
+    crate::sched::thread_slot::set_extended_bytes(
+        V_REGS_OFFSET.saturating_add(v.saturating_mul(32)),
+    );
 }
 
 /// Read the boot hart's `vlenb` and report the per-thread save area it

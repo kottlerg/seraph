@@ -84,7 +84,8 @@ pub fn uart_size() -> u64
     {
         DEFAULT_UART_SIZE
     };
-    let v = page_round_up(raw);
+    // A size whose rounding passes the end of the address space is not a UART's.
+    let v = page_round_up(raw).unwrap_or(DEFAULT_UART_SIZE);
     CACHED_UART_SIZE.store(v, Ordering::Relaxed);
     v
 }

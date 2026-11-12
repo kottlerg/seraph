@@ -18,14 +18,16 @@ const LINE: u64 = 64;
 /// `va..va + len` must be mapped in the calling process.
 pub unsafe fn flush(va: u64, len: u64)
 {
+    // A mapped range ends below `u64::MAX`, so neither sum saturates.
+    let end = va.saturating_add(len);
     let mut line = va & !(LINE - 1);
-    while line < va + len
+    while line < end
     {
         // SAFETY: the caller guarantees the range is mapped, and `line` lies
         // in it or in the line that holds its first byte, which is mapped
         // with it; `CLFLUSH` reads and writes no Rust object.
         unsafe { core::arch::x86_64::_mm_clflush(line as *const u8) };
-        line += LINE;
+        line = line.saturating_add(LINE);
     }
     // SAFETY: `MFENCE` has no operands and orders the flushes above before
     // every later load and store, the register writes that start the

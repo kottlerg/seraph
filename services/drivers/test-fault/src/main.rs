@@ -28,6 +28,9 @@
 //!
 //! svctest watches the held memory return to memmgr in both fault cases.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use driver_binding::decl::{Declaration, Interrupt, Match, Reset, Tier};
 use driver_binding::resources::{Resource, ResourceList};
 use ipc::{IpcMessage, test_fault_labels};

@@ -51,7 +51,7 @@ core/kernel/src/arch/
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
     ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
-    └── encoding.rs # SBI mask, F/D/V, page rounding, PTE permissions; no arch-module deps
+    └── encoding.rs # SBI mask, F/D/V, page/tick math, PTE permissions; no arch-module deps
 ```
 
 `arch/mod.rs` performs the conditional compilation, and also defines the one type it holds

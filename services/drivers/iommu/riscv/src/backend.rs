@@ -82,13 +82,21 @@ impl Unit
         }
     }
 
+    /// The address of the register at `off`, one of the `regs` offsets.
+    /// Every one lies inside the register page mapped from `regs`, which
+    /// ends below `u64::MAX`, so the sum does not saturate.
+    fn register(&self, off: usize) -> u64
+    {
+        self.regs.saturating_add(off as u64)
+    }
+
     fn read32(&self, off: usize) -> u32
     {
         // SAFETY: `off` is one of the `regs` offsets, every one inside the
         // register page mapped from `regs` for the driver's life and reached
         // only through raw volatile accesses; every register is naturally
         // aligned.
-        unsafe { core::ptr::read_volatile((self.regs + off as u64) as *const u32) }
+        unsafe { core::ptr::read_volatile(self.register(off) as *const u32) }
     }
 
     /// Write a 32-bit register. A write starts or configures an IOMMU
@@ -102,14 +110,14 @@ impl Unit
     {
         mmio::dma_to_mmio_barrier();
         // SAFETY: as in `read32`.
-        unsafe { core::ptr::write_volatile((self.regs + off as u64) as *mut u32, value) };
+        unsafe { core::ptr::write_volatile(self.register(off) as *mut u32, value) };
         mmio::mmio_to_mmio_barrier();
     }
 
     fn read64(&self, off: usize) -> u64
     {
         // SAFETY: as in `read32`.
-        unsafe { core::ptr::read_volatile((self.regs + off as u64) as *const u64) }
+        unsafe { core::ptr::read_volatile(self.register(off) as *const u64) }
     }
 
     /// Write a 64-bit register, ordered as [`Self::write32`] is.
@@ -117,7 +125,7 @@ impl Unit
     {
         mmio::dma_to_mmio_barrier();
         // SAFETY: as in `read32`.
-        unsafe { core::ptr::write_volatile((self.regs + off as u64) as *mut u64, value) };
+        unsafe { core::ptr::write_volatile(self.register(off) as *mut u64, value) };
         mmio::mmio_to_mmio_barrier();
     }
 
@@ -226,12 +234,34 @@ impl Riscv
     /// Store `value` volatile at word `index` of the table page `page`, then
     /// order it before every later store ([`TableStore::written`]); the
     /// register write that follows orders it before itself ([`Unit::write32`]).
-    fn write_word(&mut self, page: u64, index: usize, value: u64)
+    /// Every `index` passed lies in the page (a command-queue slot, or a
+    /// device context's word from [`DeviceDirectory::context`]), so the
+    /// [`BackendError::Invalid`] is never returned.
+    fn write_word(&mut self, page: u64, index: usize, value: u64) -> Result<(), BackendError>
     {
-        let t = self.store.table(page);
-        // SAFETY: the word lies in the table page `t` borrows exclusively.
-        unsafe { core::ptr::write_volatile(&raw mut t[index], value) };
+        let word = self
+            .store
+            .table(page)
+            .get_mut(index)
+            .ok_or(BackendError::Invalid)?;
+        // SAFETY: `word` lies in the table page the store lends exclusively.
+        unsafe { core::ptr::write_volatile(&raw mut *word, value) };
         self.store.written(page, index);
+        Ok(())
+    }
+
+    /// Unit `unit`. [`Service`](iommu_core::Service) passes only a unit the
+    /// bootstrap delivered, so the [`BackendError::Invalid`] is never
+    /// returned.
+    fn unit(&self, unit: usize) -> Result<&Unit, BackendError>
+    {
+        self.units.get(unit).ok_or(BackendError::Invalid)
+    }
+
+    /// Unit `unit`, as [`Self::unit`].
+    fn unit_mut(&mut self, unit: usize) -> Result<&mut Unit, BackendError>
+    {
+        self.units.get_mut(unit).ok_or(BackendError::Invalid)
     }
 
     /// Queue `commands` on unit `unit`'s command queue, the last of them an
@@ -240,20 +270,21 @@ impl Riscv
     /// fails the unit as a timeout does.
     fn submit(&mut self, unit: usize, commands: &[Command]) -> Result<(), BackendError>
     {
-        let cq = self.units[unit].cq;
-        let mut tail = self.units[unit].cq_tail;
+        let u = self.unit(unit)?;
+        let (cq, mut tail) = (u.cq, u.cq_tail);
         for command in commands
         {
             // The IOMMU reads no command past the tail, which is written
-            // after them.
-            let at = tail as usize * COMMAND_WORDS;
+            // after them. `tail` stays below `CQ_ENTRIES`, whose slots fill
+            // the page, so no step saturates.
+            let at = (tail as usize).saturating_mul(COMMAND_WORDS);
             for (i, &word) in command.iter().enumerate()
             {
-                self.write_word(cq, at + i, word);
+                self.write_word(cq, at.saturating_add(i), word)?;
             }
-            tail = (tail + 1) % CQ_ENTRIES;
+            tail = tail.saturating_add(1) % CQ_ENTRIES;
         }
-        let u = &mut self.units[unit];
+        let u = self.unit_mut(unit)?;
         u.cq_tail = tail;
         u.write32(regs::CQT, tail);
         u.wait(|u| u.read32(regs::CQCSR) & regs::CQCSR_ERRORS != 0 || u.read32(regs::CQH) == tail)?;
@@ -268,7 +299,7 @@ impl Riscv
     /// then turn translation on.
     fn setup(&mut self, unit: usize) -> Result<(), BackendError>
     {
-        let u = &mut self.units[unit];
+        let u = self.unit_mut(unit)?;
         u.cap = Capability::decode(u.read64(regs::CAPABILITIES));
         if !u.cap.version_supported()
         {
@@ -279,7 +310,7 @@ impl Riscv
         let cq = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
         let fq = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
         let root = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
-        self.units[unit].start_queues(cq, fq)?;
+        self.unit_mut(unit)?.start_queues(cq, fq)?;
         // Whatever the IOMMU cached under an earlier mode is dropped before
         // the new directory is used.
         self.submit(
@@ -290,7 +321,7 @@ impl Riscv
                 regs::iofence_c(Fence::Commands),
             ],
         )?;
-        self.units[unit].select_directory(root)
+        self.unit_mut(unit)?.select_directory(root)
     }
 }
 
@@ -373,9 +404,10 @@ impl Backend for Riscv
     {
         let set_up = self.setup(unit);
         if set_up.is_err()
+            && let Ok(u) = self.unit_mut(unit)
         {
-            self.units[unit].ddt = None;
-            self.units[unit].restore_bare();
+            u.ddt = None;
+            u.restore_bare();
         }
         set_up
     }
@@ -398,7 +430,7 @@ impl Backend for Riscv
             return Err(BackendError::Invalid);
         }
         let device_id = u32::from(bdf);
-        let u = &self.units[unit];
+        let u = self.unit(unit)?;
         let (ddt, mode) = (u.ddt.ok_or(BackendError::Invalid)?, u.mode);
         let (page, first) = ddt
             .context(&mut self.store, device_id)
@@ -408,12 +440,17 @@ impl Backend for Riscv
         // The context's other words are written first, highest first, and
         // `tc`, which holds the valid bit, last, so the IOMMU never reads a
         // valid context beside stale words; each store is volatile and
-        // fenced before the next ([`Self::write_word`]).
+        // fenced before the next ([`Self::write_word`]). The context's words
+        // lie in its leaf page, so no index below saturates.
         for i in (1..ddt.context_words()).rev()
         {
-            self.write_word(page, first + i, words.get(i).copied().unwrap_or(0));
+            self.write_word(
+                page,
+                first.saturating_add(i),
+                words.get(i).copied().unwrap_or(0),
+            )?;
         }
-        self.write_word(page, first, words[0]);
+        self.write_word(page, first, words[0])?;
         self.submit(
             unit,
             &[
@@ -498,7 +535,7 @@ impl Backend for Riscv
         let (page, first) = domain.context;
         // Clearing `tc` clears the valid bit; the other words are then
         // don't-care.
-        self.write_word(page, first, 0);
+        self.write_word(page, first, 0)?;
         self.submit(
             domain.unit,
             &[
@@ -509,12 +546,21 @@ impl Backend for Riscv
         )
     }
 
+    /// The unit's address width and domain IDs; zero widths and IDs for a
+    /// unit the backend does not hold, which [`Service`](iommu_core::Service)
+    /// never asks for.
     fn query(&self, unit: usize) -> UnitInfo
     {
-        UnitInfo {
-            width_bits: self.units[unit].mode.width_bits(),
-            domain_ids: PSCIDS,
-        }
+        self.units.get(unit).map_or(
+            UnitInfo {
+                width_bits: 0,
+                domain_ids: 0,
+            },
+            |u| UnitInfo {
+                width_bits: u.mode.width_bits(),
+                domain_ids: PSCIDS,
+            },
+        )
     }
 
     fn poll_faults(&mut self, record: &mut dyn FnMut(Fault))
@@ -538,7 +584,9 @@ impl Backend for Riscv
             mmio::mmio_to_dma_barrier();
             while head != tail
             {
-                let at = head as usize * FAULT_RECORD_WORDS;
+                // `head` stays below `FQ_ENTRIES`, whose records fill the
+                // page, so no step saturates.
+                let at = (head as usize).saturating_mul(FAULT_RECORD_WORDS);
                 let mut words = [0u64; FAULT_RECORD_WORDS];
                 for (i, w) in words.iter_mut().enumerate()
                 {
@@ -547,7 +595,7 @@ impl Backend for Riscv
                     // record's words lie in the page's 512. The IOMMU writes
                     // the page, so it is read through the raw pointer alone,
                     // with no reference to it formed.
-                    *w = unsafe { core::ptr::read_volatile(queue.add(at + i)) };
+                    *w = unsafe { core::ptr::read_volatile(queue.add(at.saturating_add(i))) };
                 }
                 if let Some(f) = regs::decode_fault(words)
                     && let Ok(bdf) = u16::try_from(f.device_id)
@@ -559,7 +607,7 @@ impl Backend for Riscv
                         iova: f.iova & !(PAGE - 1),
                     });
                 }
-                head = (head + 1) % FQ_ENTRIES;
+                head = head.saturating_add(1) % FQ_ENTRIES;
             }
             // The records are read before the head hands their slots back.
             mmio::dma_read_to_mmio_barrier();

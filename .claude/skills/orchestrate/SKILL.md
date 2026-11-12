@@ -40,16 +40,18 @@ only if that does not cure it.
    spawn a new one with "resume from the record" and give it its id. Stop the old one only if it
    does not hand back.
 4. **Forward what orphans send you.** A worker spawned by an earlier orchestrator stays alive,
-   but its hand-back and task notifications arrive here. Forward each to the current
-   orchestrator in one line (the worker, and "handed back" or the notification's status); drop
-   it when the worker's own message to the orchestrator already said so.
+   but its hand-back and task notifications arrive here. Forward a hand-back to the current
+   orchestrator verbatim: it is the worker's only copy of its report (a gate report, a question
+   that blocks it, a composition check's verdict, a stand-down line). Forward a notification
+   that carries no hand-back in one line: the worker and the notification's status.
 5. **Do for the orchestrator what only the top session can**: stop an agent it names, schedule
    or cancel a tick it asks for, apply a `.claude/CLAUDE.md`, settings or hook patch on the
    maintainer's direct word in this conversation, and make a `release-review` workflow call it
    gives you: save the report and the returned object to the paths it names, show the
    maintainer both verdict lines, and answer the orchestrator with those lines and the paths.
-6. **Wake a drifted orchestrator.** On "drift: wake me" from the orchestrator, reply "resume"
-   at once and show the maintainer nothing.
+6. **Wake a drifted orchestrator.** A turn of the orchestrator that ran in a worker's worktree
+   and deferred work sends "drift: wake me" as its last action (`.claude/agents/orchestrator.md`
+   § Failure modes). On it, reply "resume" at once and show the maintainer nothing.
 
 ## What you do not do
 

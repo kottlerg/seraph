@@ -82,8 +82,9 @@ defines the record. Six points it leaves to you:
   record there.
 
 Run `cargo xtask review-check <N>` and fix the record until it passes: the ledger and the gate
-read these files. Then give both verdict lines verbatim to the one you report to: a worker to
-its orchestrator, a standalone session to the maintainer.
+read these files. Then give both verdict lines verbatim to the one you report to: a worker
+records them in its status line for its orchestrator (`.claude/agents/worker.md` § Reporting),
+and a standalone session gives them to the maintainer.
 
 ## Handling the findings
 

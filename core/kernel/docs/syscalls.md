@@ -1143,14 +1143,16 @@ the outcome back here. The kernel records the reason before it commits the fault
 
 `CAP_INFO_IRQ_MSG_ADDRESS` (15) and `CAP_INFO_IRQ_MSG_DATA` (16) return, for an Interrupt cap
 naming a message-signaled target (§ `SYS_IRQ_MSG_ALLOC`), the message a device writes to raise it:
-the physical address and the 32-bit data word a driver programs into the device's MSI capability
-or MSI-X table entry. On x86-64 the address is the target CPU's compatibility-format local APIC
-address (`0xFEE0_0000 | apic_id << 12`, physical destination, no redirection hint) and the data
+the physical address and the 32-bit data word devmgr programs into the device's MSI capability or
+MSI-X table entry before it delivers the driver a copy of the cap, which the driver only binds
+([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
+§ Message-Signaled Interrupts). On x86-64 the address is the target CPU's compatibility-format local
+APIC address (`0xFEE0_0000 | apic_id << 12`, physical destination, no redirection hint) and the data
 its vector (fixed delivery, edge-triggered); on RISC-V the address is the target hart's
 supervisor-level IMSIC interrupt file and the data the interrupt identity, written to the file's
 `seteipnum_le` register. The address is an interrupt controller's, never RAM
-([cross-boundary-disclosure.md](cross-boundary-disclosure.md)), so holding the cap answers it.
-An Interrupt cap naming a wired line, or a range, answers `InvalidArgument`.
+([cross-boundary-disclosure.md](cross-boundary-disclosure.md)), so holding the cap answers it. An
+Interrupt cap naming a wired line, or a range, answers `InvalidArgument`.
 
 **Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which
 needs the Memory `Phys` right on the queried cap or the credential; `cap_info` otherwise reads
@@ -2453,7 +2455,10 @@ differences. Its CPU and slot were taken at its mint, so its first binding route
 takes one binding, in mode 0 (a device's message is an edge). It is never masked: each message
 ORs bit 0 into the bound notification and completes at the local APIC (x86-64) or needs no
 completion (the IMSIC claim, RISC-V), and its `SYS_IRQ_ACK` changes nothing; a driver that must
-hold its device's messages off masks them at the device (the MSI-X vector control bit). Removing
+hold its device's messages off does so at the device, through the device's own interrupt controls,
+since devmgr alone writes the MSI-X table and its per-vector masks
+([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
+§ Message-Signaled Interrupts). Removing
 its binding frees no slot: the target stays the capability's until the capability is gone.
 
 On x86-64 the line's I/O APIC redirection entry is programmed with the recorded mode: bit 15 set

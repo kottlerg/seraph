@@ -975,10 +975,11 @@ timing report is neither a HANG nor a failure.
 --block-size 4096`), booted from a 4096-byte-block ESP with its root and data partitions at
 4096-byte blocks; the data partition alone on a second disk (`mkdisk --split-data`, booted with
 `--second-disk disk-data.img`), so `/data` lives only there; the same second disk on the first
-disk's `INTx` line (`--second-disk-shared-line`), so the svctest phases that read `/data` pass only
-when devmgr serves both virtio-blk devices on one line (a lost interrupt costs a disk request its
-driver's timed poll, not the boot, so the boot's time, not its outcome, shows whether both drivers
-acknowledge every delivery); and a second disk at 8192-byte blocks (`--second-disk-block-size
+disk's `INTx` line (`--second-disk-shared-line`, which launches both disks with no MSI-X), so the
+svctest phases that read `/data` pass only when devmgr serves both virtio-blk devices on one line (a
+lost interrupt costs a disk request up to its interrupt-service thread's timed read, `ISR_POLL_MS`,
+not the boot, so the boot's time, not its outcome, shows whether both drivers acknowledge every
+delivery); and a second disk at 8192-byte blocks (`--second-disk-block-size
 8192`), above virtio-blk's `MAX_BLOCK_SIZE` (4096), which the boot goes on without. The storage and
 device documents own what each boot exercises ([storage.md](storage.md) § GPT Role-GUID Discovery,
 [device-management.md](device-management.md) § Relationship to Other Services and § Interrupt

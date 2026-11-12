@@ -25,8 +25,9 @@ virtio/console/
 The driver carries a declaration in the ELF note section `.note.seraph.driver` (PCI `1AF4:1003`
 and `1AF4:1043`, class `debug-port`, instance limit 1, auxiliary tier). Devmgr binds the first
 `virtio-console` PCI device in PCI order as the debug port: it carves
-the device's capabilities (an `Mmio` cap for every BAR its VirtIO register regions name, its
-own derivation of its line's `Interrupt` cap, and the device's DMA capability) and spawns this
+the device's capabilities (an `Mmio` cap for every range of the BARs its VirtIO register regions
+name, its interrupt: one MSI-X vector, which the declaration asks for, else its own derivation of
+its line's `Interrupt` cap; and the device's DMA capability) and spawns this
 driver from the rootfs (`/services/drivers/virtio-console`) through its `SET_DRIVERS_DIR`
 subtree cap, in the same drivers-directory pass as the virtio-input drivers (see
 [docs/device-management.md](../../../../docs/device-management.md)). A further console device
@@ -71,7 +72,7 @@ The three operations of the serial protocol, with the labels, wire shapes, and v
   possibly none.
 - `SERIAL_REGISTER_RX_NOTIFY` has the interrupt-service thread signal the client's notification
   on each interrupt of the device from then on, replacing an earlier registration. It replies
-  `REGISTER_FAILED` when devmgr delivered no IRQ cap or no notification came; the client's
+  `REGISTER_FAILED` when the driver has no interrupt or no notification came; the client's
   bounded wait then polls.
 
 ---
@@ -95,12 +96,15 @@ devmgr returns, never with a physical address
 - **Transmit.** One write is in flight at a time, through a one-entry transmit queue; a write
   waits for its completion before it replies.
 
-With an IRQ cap, an interrupt-service thread is the only waiter on the notification bound to
-the device's line. It reads the ISR and acknowledges every delivery at once, as a driver on a
-shared line must ([driver-model.md](../../docs/driver-model.md) rule 5), reads the ISR on a
-bounded timeout too, as virtio-core's `isr::serve_interrupts` does, and signals both the
-driver's own notification, which a write waits on with a bounded timeout, and the client's RX
-notification. Without an IRQ cap the write's wait is a timed poll.
+With an interrupt, an interrupt-service thread is the only waiter on the notification bound to
+it. It runs virtio-core's `isr::serve_interrupts`: on the wired line it reads the ISR and
+acknowledges every delivery at once, as a driver on a shared line must
+([driver-model.md](../../docs/driver-model.md) rule 5), and reads the ISR on a bounded timeout
+too; on an MSI-X vector it relays each delivery. Either way it signals both the driver's own
+notification, which a write waits on with a bounded timeout, and the client's RX notification.
+Under MSI-X the driver routes both queues to vector 0 and configuration changes to `NO_VECTOR`;
+a device that refuses either leaves the driver with no interrupt. Without an interrupt the
+write's wait is a timed poll.
 
 ---
 

@@ -228,7 +228,8 @@ pub struct SecondDisk<'a>
     pub block_size: u32,
     /// Place the device at `SHARED_LINE_SECOND_DISK_SLOT`, on the first
     /// disk's `INTx` line on both machines, rather than at
-    /// `SECOND_DISK_SLOT`, on a line of its own.
+    /// `SECOND_DISK_SLOT`, on a line of its own, and launch both disks with
+    /// no MSI-X capability, so their driver is given the shared wired line.
     pub shared_line: bool,
 }
 
@@ -343,6 +344,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             spec.disk_block_size,
             spec.second_disk.as_ref().map(|_| FIRST_DISK_SLOT),
             spec.iommu,
+            spec.second_disk.as_ref().is_some_and(|s| s.shared_line),
         ),
     ]);
 
@@ -356,17 +358,9 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             blk_device(
                 "hd1",
                 second.block_size,
-                Some(
-                    if second.shared_line
-                    {
-                        SHARED_LINE_SECOND_DISK_SLOT
-                    }
-                    else
-                    {
-                        SECOND_DISK_SLOT
-                    },
-                ),
+                Some(second_disk_slot(second.shared_line)),
                 spec.iommu,
+                second.shared_line,
             ),
         ]);
     }
@@ -448,16 +442,37 @@ const FIRST_DISK_SLOT: u8 = 0x10;
 const SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 2;
 const SHARED_LINE_SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 4;
 
+/// The second disk's PCI slot: on the first disk's line when `shared_line`.
+const fn second_disk_slot(shared_line: bool) -> u8
+{
+    if shared_line
+    {
+        SHARED_LINE_SECOND_DISK_SLOT
+    }
+    else
+    {
+        SECOND_DISK_SLOT
+    }
+}
+
 /// The `virtio-blk-pci` device for `drive`, presenting `block_size`-byte
 /// logical and physical blocks (QEMU requires the physical size to be at
 /// least the logical), at PCI slot `slot` when one is given, behind the
-/// IOMMU when `iommu` attaches one.
-fn blk_device(drive: &str, block_size: u32, slot: Option<u8>, iommu: Iommu) -> String
+/// IOMMU when `iommu` attaches one, and with no MSI-X capability
+/// (`vectors=0`) when `wired_only`, so it signals on its `INTx` line alone.
+fn blk_device(
+    drive: &str,
+    block_size: u32,
+    slot: Option<u8>,
+    iommu: Iommu,
+    wired_only: bool,
+) -> String
 {
     let addr = slot.map_or_else(String::new, |slot| format!(",addr={slot:#04x}"));
+    let vectors = if wired_only { ",vectors=0" } else { "" };
     format!(
         "virtio-blk-pci,drive={drive},disable-legacy=on{},logical_block_size={block_size},\
-         physical_block_size={block_size}{addr}",
+         physical_block_size={block_size}{addr}{vectors}",
         iommu.virtio_property()
     )
 }
@@ -1176,6 +1191,7 @@ mod tests
     fn slot_of(device: &str) -> u8
     {
         let addr = device.split(",addr=").nth(1).unwrap();
+        let addr = addr.split(',').next().unwrap();
         u8::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap()
     }
 
@@ -1228,6 +1244,28 @@ mod tests
         // Below q35's every-slot-one-line range, so the share is the
         // swizzle's, not q35's fallback.
         assert!(first <= 24 && second <= 24);
+    }
+
+    #[test]
+    fn only_shared_line_disks_drop_msix()
+    {
+        for shared_line in [false, true]
+        {
+            let mut spec = riscv_spec(1, 512);
+            spec.second_disk = Some(SecondDisk {
+                path: Path::new("disk-data.img"),
+                block_size: 512,
+                shared_line,
+            });
+            let argv = build_qemu_argv(&spec).unwrap();
+            for drive in ["hd0", "hd1"]
+            {
+                let dev = blk_device_arg(&argv, drive).unwrap();
+                assert_eq!(dev.ends_with(",vectors=0"), shared_line, "{dev}");
+            }
+        }
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        assert!(!blk_device_arg(&argv, "hd0").unwrap().contains("vectors"));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 
 use core::time::Duration;
 
+use crate::bootstrap::DeviceInterrupt;
 use crate::{COMMON_CFG_LEN, RegisterLayout, STATUS_FEATURES_OK};
 
 /// How long a reset is waited for, on the caller's clock: by
@@ -23,6 +24,16 @@ use crate::{COMMON_CFG_LEN, RegisterLayout, STATUS_FEATURES_OK};
 /// tuning value that bounds no capacity: it decides only when an
 /// unacknowledged reset is given up on.
 pub const RESET_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The MSI-X vector value that routes an event to no vector (`VirtIO` 1.2
+/// § 4.1.5.1.2).
+pub const NO_VECTOR: u16 = 0xFFFF;
+
+/// Offset of `config_msix_vector` in the common configuration region
+/// (`VirtIO` 1.2 § 4.1.4.3).
+const COMMON_CONFIG_MSIX_VECTOR: u32 = 0x10;
+/// Offset of `queue_msix_vector` in the common configuration region.
+const COMMON_QUEUE_MSIX_VECTOR: u32 = 0x1A;
 
 /// Poll `done` until it holds or `elapsed` reaches `timeout`, returning
 /// whether it held.
@@ -251,6 +262,59 @@ impl PciTransport
     pub fn queue_set_ready(&self, ready: u16)
     {
         self.write_common_u16(0x1C, ready);
+    }
+
+    // ── MSI-X vectors (`VirtIO` 1.2 § 4.1.5.1.2) ───────────────────────
+
+    /// Route configuration-change events to MSI-X `vector`, or to none with
+    /// [`NO_VECTOR`]. Returns whether the device took it: it reads back
+    /// [`NO_VECTOR`] for a vector it cannot use (`VirtIO` 1.2 § 4.1.5.1.2).
+    /// Meaningful only while MSI-X is enabled for the function.
+    #[must_use]
+    pub fn set_config_vector(&self, vector: u16) -> bool
+    {
+        self.write_common_u16(COMMON_CONFIG_MSIX_VECTOR, vector);
+        self.read_common_u16(COMMON_CONFIG_MSIX_VECTOR) == vector
+    }
+
+    /// Route the selected queue's used-buffer events to MSI-X `vector`, or to
+    /// none with [`NO_VECTOR`]; written before the queue is enabled. Returns
+    /// whether the device took it, as [`set_config_vector`](Self::set_config_vector)
+    /// does.
+    #[must_use]
+    pub fn queue_set_vector(&self, vector: u16) -> bool
+    {
+        self.write_common_u16(COMMON_QUEUE_MSIX_VECTOR, vector);
+        self.read_common_u16(COMMON_QUEUE_MSIX_VECTOR) == vector
+    }
+
+    /// Route configuration-change events for a driver whose interrupt is
+    /// `interrupt`: to no vector under MSI-X, since no driver waits on them;
+    /// nothing to route for a wired line or none. Returns whether the device
+    /// took the routing.
+    #[must_use]
+    pub fn route_config(&self, interrupt: Option<DeviceInterrupt>) -> bool
+    {
+        match interrupt
+        {
+            Some(DeviceInterrupt::MsiX { .. }) => self.set_config_vector(NO_VECTOR),
+            Some(DeviceInterrupt::Wired { .. }) | None => true,
+        }
+    }
+
+    /// Route the selected queue's used-buffer events to `interrupt`: to MSI-X
+    /// vector 0, the driver's only vector, under MSI-X; nothing to route for
+    /// a wired line or none. Written before the queue is enabled. Returns
+    /// whether the device took the routing; while MSI-X is enabled a queue
+    /// the device refuses a vector for signals no interrupt at all.
+    #[must_use]
+    pub fn route_queue(&self, interrupt: Option<DeviceInterrupt>) -> bool
+    {
+        match interrupt
+        {
+            Some(DeviceInterrupt::MsiX { .. }) => self.queue_set_vector(0),
+            Some(DeviceInterrupt::Wired { .. }) | None => true,
+        }
     }
 
     // ── Notification (`VirtIO` 1.2 §4.1.4.4) ───────────────────────────
@@ -570,6 +634,49 @@ mod tests
         transport.notify(9, 0x40);
         assert_eq!(window[0x900 / 2], 0);
         assert_eq!(window.iter().filter(|&&w| w != 0).count(), 1);
+    }
+
+    #[test]
+    fn vectors_are_written_to_their_common_registers_and_read_back()
+    {
+        let cap = |offset, length| crate::VirtioCapLocation {
+            bar: 0,
+            pad: [0; 3],
+            offset,
+            length,
+        };
+        let layout = crate::VirtioPciStartupInfo {
+            common_cfg: cap(0x100, 0x38),
+            notify_cfg: cap(0x800, 0x100),
+            isr_cfg: cap(0x900, 4),
+            device_cfg: cap(0xA00, 8),
+            notify_off_multiplier: 4,
+            pad: 0,
+        }
+        .register_layout()
+        .expect("every region present");
+        // A host buffer stands in for the register window: it keeps what is
+        // written, as a device that takes the vector does.
+        let mut window = vec![0u16; 0x800];
+        let transport = PciTransport::new(window.as_mut_ptr() as u64, &layout);
+        assert!(transport.set_config_vector(NO_VECTOR));
+        assert!(transport.queue_set_vector(0));
+        assert_eq!(window[(0x100 + 0x10) / 2], NO_VECTOR);
+        assert_eq!(window[(0x100 + 0x1A) / 2], 0);
+        assert!(transport.queue_set_vector(3));
+        assert_eq!(window[(0x100 + 0x1A) / 2], 3);
+
+        // Routing writes only under MSI-X: vector 0 for the queue, none for
+        // configuration changes.
+        let wired = Some(DeviceInterrupt::Wired { cap: 1, mode: 0 });
+        assert!(transport.route_queue(wired) && transport.route_queue(None));
+        assert!(transport.route_config(wired) && transport.route_config(None));
+        assert_eq!(window[(0x100 + 0x1A) / 2], 3);
+        window[(0x100 + 0x10) / 2] = 0;
+        let msix = Some(DeviceInterrupt::MsiX { cap: 2 });
+        assert!(transport.route_queue(msix) && transport.route_config(msix));
+        assert_eq!(window[(0x100 + 0x1A) / 2], 0);
+        assert_eq!(window[(0x100 + 0x10) / 2], NO_VECTOR);
     }
 
     #[test]

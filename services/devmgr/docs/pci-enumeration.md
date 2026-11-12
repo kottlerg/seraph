@@ -159,8 +159,16 @@ For each matched device, devmgr:
    register window, and `SYS_MMIO_MAP` maps a cap's whole region, so a
    larger cap would map past the BAR's share of the window. For any other
    function it carves a sub-cap for every MMIO BAR, whole; I/O BARs are not
-   delivered. A BAR the layout names that is
-   not an MMIO BAR, or a BAR no aperture covers, refuses the device, logged,
+   delivered. For a function devmgr may give MSI-X
+   (`firmware::pci::deliverable_messages`) it leaves out of each BAR the
+   pages holding the MSI-X table and Pending Bit Array, which no driver is
+   delivered (docs/device-management.md § Message-Signaled Interrupts), and
+   carves the rest as up to three sub-caps (`firmware::pci::delivered_ranges`),
+   each recording its offset in its BAR; a BAR those pages cover whole is
+   not delivered. A VirtIO function whose register regions share a page with
+   them may not be given MSI-X, and its BARs are carved without the cut. A
+   BAR the layout names that is
+   not an MMIO BAR, or a range no aperture covers, refuses the device, logged,
    with the caps already carved released. The aperture's lower and upper
    remainders stay in devmgr's growable aperture table
    (`firmware::resource::SpanTable`) as caps of their own.
@@ -192,9 +200,11 @@ For each matched device, devmgr:
    message-signaled vectors or its wired line by the rule of
    [docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
    § Message-Signaled Interrupts, after the DMA grant of step 3: for MSI-X
-   a minted `Interrupt` cap per vector, the BARs holding the table and the
-   Pending Bit Array carved whole when step 2 carved neither, and MSI-X
-   enabled with every table entry masked; for MSI one minted cap, its
+   a minted `Interrupt` cap per vector, devmgr's own cap on the pages
+   holding the table, kept until the driver is withdrawn, Memory Space
+   Enable set so the table decodes, each vector's message written into its
+   table entry, entry 0 onwards, read back, and unmasked, and MSI-X enabled
+   with every other entry masked; for MSI one minted cap, its
    message, once checked to fit the capability, written into it and MSI
    enabled with one vector. On riscv64 behind the RISC-V IOMMU each
    target's interrupt file is then mapped into the device's domain
@@ -242,19 +252,21 @@ For each matched device, devmgr:
    `driver_binding::resources`
    ([shared/driver-binding/README.md](../../../shared/driver-binding/README.md)):
    one round per resource, each naming its kind in `data[0]`: an `Mmio`
-   round per BAR cap of step 2, in carve order, with its PCI BAR index,
-   physical base, and size, then one per BAR step 4 carved for an MSI-X
-   table or Pending Bit Array, then the `Interrupt` rounds of step 4: one
+   round per sub-cap of step 2, in carve order, with its PCI BAR index,
+   physical base, size, and offset in its BAR, then the `Interrupt` rounds
+   of step 4: one
    of kind `Wired` with the line's mode, which the driver passes to
    `SYS_IRQ_REGISTER`, or one per vector of kind `Msi` or `MsiX` with its
    vector index and mode 0. The terminal round carries the
    service endpoint, a SEND badged with the device's badge on the private
    driver endpoint of the driver's settle batch, and, for a DMA declaration,
    a copy of the device's DMA capability. With no `Interrupt` resource
-   virtio-input and virtio-console poll. A VirtIO driver checks the delivered
-   BAR indices against the layout it computes from its `QUERY_DEVICE_INFO`
-   reply and exits on a mismatch; no VirtIO driver asks for vectors, so none
-   is delivered a BAR step 4 carved for MSI-X.
+   virtio-input and virtio-console poll. A VirtIO driver places the
+   delivered ranges in the layout it computes from its `QUERY_DEVICE_INFO`
+   reply, each at its BAR's share of its register window plus its offset,
+   and exits unless every range lies inside its BAR's share, no two
+   overlap, and every register region lies inside a range
+   (`RegisterLayout::place`).
 8. Binds a death observer on the driver's thread to devmgr's driver death
    queue, with the device badge as the correlator, and keeps the driver's
    process handle for the rest of the boot.

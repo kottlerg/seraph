@@ -31,7 +31,8 @@
 //! riscv64), which a device raises by writing the message address and data
 //! ([`message`]) the slot implies. It is never masked: a delivery
 //! signals its binding and nothing else, and its `SYS_IRQ_ACK` does nothing
-//! (masking, where a driver needs it, is the device's: MSI-X vector control).
+//! (a driver holds its device's messages off through the device's own
+//! interrupt controls; the MSI-X table and its masks are devmgr's).
 //! It takes one binding, in mode 0 (edge). Its slot is held from the mint until
 //! the last capability to it is gone ([`free_message`]), whether or not a
 //! binding is linked.

@@ -149,29 +149,11 @@ impl IoLayout
 }
 
 /// How long a request may take before it is treated as timed out, measured
-/// on the monotonic clock: a per-iteration wait that returns early (a stop
-/// and restart interrupts it) costs a re-poll, not part of the budget. A
-/// tuning value that bounds no capacity: it decides only when a lost request
-/// is given up on.
+/// on the monotonic clock: a wait that returns early (a stop and restart
+/// interrupts it) costs a re-poll, not part of the budget. A tuning value
+/// that bounds no capacity: it decides only when a lost request is given up
+/// on.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
-
-/// Per-iteration timeout on the completion-notification wait, in milliseconds.
-///
-/// Bounded so that a lost PLIC external interrupt on QEMU virt RISC-V (see
-/// the wait loop comment) cannot park this thread indefinitely: the next
-/// iteration's poll-burst will observe completion regardless of whether the
-/// IRQ ever fires. The actual completion time of a virtio-blk request on
-/// QEMU is sub-millisecond, so a 50 ms ceiling is two orders of magnitude
-/// over the expected wake and three orders under [`REQUEST_TIMEOUT`].
-const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
-
-/// How long each iteration polls the used ring before parking on the
-/// completion notification, on the monotonic clock. A wall-clock window, so
-/// the time it spans does not depend on the cost of a poll; QEMU completes a
-/// request in well under it, so the fast path never parks. A tuning value
-/// that bounds no capacity: a completion it misses is seen after the next
-/// wait.
-const POLL_BURST: Duration = Duration::from_micros(500);
 
 /// Submit a read or write request and wait for its completion via the
 /// completion notification, returning how the request ended.
@@ -190,12 +172,12 @@ const POLL_BURST: Duration = Duration::from_micros(500);
 /// for `count` consecutive logical blocks starting at `VirtIO` sector
 /// `sector`; the device transfers the entire run in one descriptor chain.
 ///
-/// Blocks on a bounded `notification_wait_timeout` on `completion` per
-/// iteration until the interrupt-service thread signals an interrupt (it has
-/// already read the ISR, and acknowledged any delivery) or the per-iteration
-/// timeout elapses, then re-polls the used ring. The bounded wait ensures
-/// that a lost PLIC external interrupt on QEMU virt RISC-V cannot park this
-/// thread indefinitely — see the wait loop body for details.
+/// Polls the used ring, then waits on `completion` for what is left of
+/// [`REQUEST_TIMEOUT`] ([`virtio_blk::completion_wait_ms`]) until the
+/// interrupt-service thread signals an interrupt (it has already read the
+/// ISR and acknowledged a wired line's delivery), and polls again. The
+/// notification keeps a signal sent before the wait, so a completion that
+/// lands between the poll and the wait ends the wait at once.
 // too_many_arguments: layout + direction + sector + data_addr + data_len
 // + three hardware handles (virtqueue, transport, completion notification) is
 // the minimal set this path needs; bundling for the lint would obscure
@@ -238,53 +220,25 @@ pub fn submit_and_wait(
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     transport.notify(0, queue_notify_off);
 
-    // Wait for completion. VirtIO-PCI INTx delivery on QEMU virt (RISC-V
-    // PLIC) is occasionally not observed by any hart even though the device
-    // processes the request — we have confirmed via instrumentation that
-    // completion happens but the PLIC-delivered external interrupt never
-    // fires. Two defenses against a lost IRQ: each iteration does a short
-    // poll burst, and the per-iteration notification wait carries a bounded
-    // timeout so a completion that lands between the poll burst and the
-    // kernel parking the thread is recovered on the next iteration's burst
-    // rather than wedging the driver forever.
     let start = Instant::now();
-    while start.elapsed() < REQUEST_TIMEOUT
+    loop
     {
-        // Poll burst before blocking. VirtIO devices typically complete in
-        // microseconds; spinning for a few thousand cycles is still cheap
-        // and catches the fast path without a scheduling round trip. On
-        // RISC-V QEMU virt we also occasionally see IRQs that are delivered
-        // to the PLIC but never picked up by the kernel (suspected TCG/PLIC
-        // behaviour with concurrent claim from multiple harts); this burst
-        // makes the driver tolerant of those lost IRQs.
-        let burst = Instant::now();
-        while burst.elapsed() < POLL_BURST
-        {
-            if let Some(outcome) = completed(vq, head, layout)
-            {
-                return outcome;
-            }
-            core::hint::spin_loop();
-        }
-
-        // No completion yet — block on the completion notification with a
-        // bounded timeout. The interrupt-service thread signals it after each
-        // delivery, and after a timed ISR read that finds an interrupt no
-        // delivery reported, having read the ISR and acknowledged any
-        // delivery.
-        // Ok(0) means timeout (notification_send rejects zero-bit sends, so 0
-        // is unambiguous); Ok(_) means a real wake; Err means the cap path
-        // failed and there's nothing useful to do but fall through and poll.
-        let _ = syscall::notification_wait_timeout(completion, IRQ_WAIT_TIMEOUT_MS);
-
         if let Some(outcome) = completed(vq, head, layout)
         {
             return outcome;
         }
+        let Some(wait_ms) = virtio_blk::completion_wait_ms(REQUEST_TIMEOUT, start.elapsed())
+        else
+        {
+            // No completion within the bound: the request may still be in
+            // flight.
+            return IoOutcome::Lost;
+        };
+        // Ok(0) is a timeout, after which the next poll and the bound decide;
+        // Err means the cap path failed, and polling until the bound is all
+        // that is left.
+        let _ = syscall::notification_wait_timeout(completion, wait_ms);
     }
-
-    // No completion within the bound: the request may still be in flight.
-    IoOutcome::Lost
 }
 
 /// Poll the used ring once for the completion of the chain at `head`.

@@ -365,9 +365,11 @@ uncertain.
   simulated kernel under test, is the pattern.
 - **A contested finding** is yours to decide (docs/conventions.md § Contested findings). First
   have the worker run one delta run in which the reviewer re-reads the finding against the
-  worker's argument, then decide, record the decision, and tell the maintainer in one line. It
-  goes to the maintainer instead when it turns on an open design question, when resolving it
-  would materially expand the PR, or when you and the worker disagree. It is never waived.
+  worker's argument, then decide, record the decision, and tell the maintainer in one line. That
+  holds when it turns on an open design question, when resolving it would materially expand the
+  PR, and when you and the worker disagree: read what it turns on and decide (§ Ownership). When
+  the decision is a major change it waits for the maintainer's approval like any other. It is
+  never waived.
 - **A finding the worker cannot fix within its task** (a pre-existing code defect in a file a
   documentation-only PR touches) goes to the maintainer with the worker's recommendation and
   yours.

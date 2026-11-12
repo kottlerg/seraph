@@ -274,9 +274,13 @@ NOT be waived, and it is decided, not left open:
   re-read the finding against the author's argument in one delta run, since the author and the
   orchestrator both want the PR merged and the reviewer does not; the re-read informs the
   decision, which stays the orchestrator's.
-- It is put to the maintainer when it turns on a design question no document settles, when
-  resolving it would materially expand the PR's scope, when the author and the orchestrator
-  disagree, and always in a session working alone with the maintainer.
+- The orchestrator's decision is put to the maintainer for approval when it is a major change: a
+  major design decision, a change to a standard, or a change to what a rule in `docs/` or an
+  instruction file requires. A design question no document settles, a resolution that expands the
+  PR's scope, and a disagreement between the author and the orchestrator are not reasons to pass
+  the decision on: the orchestrator reads what the finding turns on and decides. In a session
+  working alone with the maintainer the finding is put to the maintainer, since the author would
+  otherwise decide its own dispute.
 
 The decision resolves the finding:
 

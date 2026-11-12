@@ -336,8 +336,9 @@ After every run:
   the same pass. A fix round ticks the recorded items it fixes.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `cargo xtask issue-edit`, or a commit) and re-run
   the audit.
-- A contested finding goes to the orchestrator, which decides it or takes it to the maintainer
-  (docs/conventions.md § Contested findings). Do not waive or rule on a finding yourself.
+- A contested finding goes to the orchestrator, which decides it, a major change waiting for the
+  maintainer's approval (docs/conventions.md § Contested findings). Do not waive or rule on a
+  finding yourself.
 
 The review records stay under `target/xtask/review/pr<N>/` in your worktree. The gate report
 names that path and each run's mode and head, and the orchestrator copies them: the harness

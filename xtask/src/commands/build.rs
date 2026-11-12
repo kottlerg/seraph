@@ -1065,11 +1065,13 @@ fn clippy_check_ext(
     run_cmd(&mut cmd)
 }
 
-/// Construct a `cargo` Command with the working directory set to the workspace root.
+/// Construct a `cargo` Command with the working directory set to the workspace
+/// root and [`crate::util::CI_CARGO_ENV`] applied.
 fn cargo(root: &Path) -> Command
 {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root);
+    cmd.envs(crate::util::CI_CARGO_ENV);
     cmd
 }
 
@@ -1135,6 +1137,17 @@ fn debug_config_flags(args: &BuildArgs, pkg: &str) -> Vec<String>
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn every_cargo_command_builds_without_incremental_compilation()
+    {
+        let cmd = cargo(Path::new("."));
+        let incremental = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "CARGO_INCREMENTAL")
+            .and_then(|(_, value)| value);
+        assert_eq!(incremental, Some(std::ffi::OsStr::new("0")));
+    }
 
     #[test]
     fn an_arch_only_component_is_refused_on_another_arch()

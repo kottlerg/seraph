@@ -70,6 +70,11 @@ The sysroot is architecture-specific. Building for a different arch than the
 existing sysroot is an error — run `cargo xtask clean` first (per
 [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
 
+Every cargo command of the build runs with `CARGO_INCREMENTAL=0`, as CI's jobs build, so a local
+build of a commit orders its binaries' statics as CI's does (see
+[Build Profiles](../docs/build-system.md#build-profiles)); its addresses can still be offset from
+CI's ([docs/testing.md](../docs/testing.md#troubleshooting) § Troubleshooting).
+
 ---
 
 ### `cargo xtask run`
@@ -799,12 +804,15 @@ cargo xtask test-debug-port [--arch x86_64|riscv64] [--port PORT] [--cpus N] [--
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture |
-| `--port` | `4560` | The host TCP port the debug port is served on |
+| `--port` | a free port | The host TCP port the debug port is served on; without it, a port free on `127.0.0.1` when the boot starts (below) |
 | `--cpus` | `4` | vCPUs of the guest |
 | `--mem` | `512` | Guest memory size in MiB |
 
-The boot to the fixture's line is bounded by five minutes and each answer by twenty seconds. The
-boot is one of the two of the debug-port device cell of the local and release host runs
+Without `--port` the command asks the host for a port free on `127.0.0.1` (a listener bound to port
+0, closed again) right before QEMU starts, so boots from several worktrees never meet on one
+port; a process that binds that port in the moment between leaves QEMU unable to start, and the
+boot fails. The boot to the fixture's line is bounded by five minutes and each answer by twenty
+seconds. The boot is one of the two of the debug-port device cell of the local and release host runs
 ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
 ---
@@ -836,13 +844,14 @@ cargo xtask test-gdb [--arch x86_64|riscv64] [--port PORT] [--gdb GDB] [--cpus N
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture |
-| `--port` | `4561` | The host TCP port the debug port is served on |
+| `--port` | a free port | The host TCP port the debug port is served on; without it, a port free on `127.0.0.1` when the boot starts (below) |
 | `--gdb` | `gdb` | The host GDB to run: one built with every target, or `gdb-multiarch` |
 | `--cpus` | `4` | vCPUs of the guest |
 | `--mem` | `512` | Guest memory size in MiB |
 
-The boot to the stub's line is bounded by five minutes and the GDB session by three. The boot is
-one of the two of the debug-port device cell of the local and release host runs
+Without `--port` the port is picked as `test-debug-port` picks it, and GDB connects to
+`127.0.0.1:<port>`. The boot to the stub's line is bounded by five minutes and the GDB session by
+three. The boot is one of the two of the debug-port device cell of the local and release host runs
 ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
 ---
@@ -934,7 +943,7 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 | `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
 | `pr-validation` | error | The body has a `## Validation` section that names a validated head: the first word of that section that is a commit hash in the clone. |
 | `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch (one the head holds and the base branch does not), the section says the delta since it is documentation or comments only (a phrase that pairs `only` with comments, Markdown, or documentation, such as `comment-only`, `Markdown only`, or `only in comments`, not after a `not` within three words and outside a template placeholder `<…>`; whether the phrase is about the delta stays with the auditor), and `git diff <validated> <head>` alters, Markdown (`*.md` in any letter case) aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any non-blank line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. When a merge of the base branch lies between the two heads, the command compares the PR's own change at each, `git diff <merge base> <validated>` and `git diff <merge base> <head>`, as multisets of changed lines per file, whitespace included, instead of the delta: they must differ only in comment or Markdown lines and in no file a build embeds, two binary changes agree only when their `index` lines match (the same blobs before and after, and the same mode), a change to a final newline alone is a change, as is a different mode for a file the PR adds or deletes at both heads (an added or deleted file is otherwise judged by its lines, so a file of comments alone stays comment-only), each difference is reported with the head it stands at; a line the PR reordered or moved within its own files since the validated head, which the multisets cannot see, is read from `git diff <validated> <head>` over those files less the sync's incoming diff, and a code line of it in a file whose own change compares equal is reported as moved or reordered; and the section must say the delta is documentation or comments only when the two differ at all. |
-| `pr-validated-sync` | warning | No merge of the base branch lies between a validated head that passes `pr-validated-head` and the PR head. After one the body states whether the incoming diff overlaps the PR's files, or that it is comment-only (§ Syncing with `master`); a reader decides the overlap and the incoming diff's kind, the command cannot. |
+| `pr-validated-sync` | warning | No merge of the base branch lies between a validated head that passes `pr-validated-head` and the PR head. After one the body states that the incoming diff touches none of the PR's files, or that it is comment-only (§ Syncing with `master`); a reader decides the overlap and the incoming diff's kind, the command cannot. |
 | `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
 | `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Follow-up Issues). |
 | `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |

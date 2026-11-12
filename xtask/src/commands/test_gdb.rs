@@ -151,6 +151,9 @@ enum Serial
 /// detach line, kill QEMU.
 fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path) -> Result<Session>
 {
+    // Picked here, right before QEMU binds it, to keep the window in which
+    // another process could take it short.
+    let port = crate::util::debug_port_or_free(args.port)?;
     let (firmware_code, firmware_vars) = match args.arch
     {
         Arch::X86_64 => (find_ovmf_code()?, None),
@@ -178,14 +181,13 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path) -> Result<Session>
         riscv_mmu: RiscvMmu::Sv48,
         x86_paging: X86Paging::Four,
         iommu: Iommu::Attached,
-        debug_port: Some(args.port),
+        debug_port: Some(port),
         test_devices: false,
     };
     let qemu_args = build_qemu_argv(&spec)?;
     let qemu_binary = require_tool(args.arch.qemu_binary())?;
     step(&format!(
-        "gdb stub test: booting with the debug port on 127.0.0.1:{}",
-        args.port
+        "gdb stub test: booting with the debug port on 127.0.0.1:{port}"
     ));
     let mut child = Command::new(&qemu_binary)
         .args(&qemu_args)
@@ -215,7 +217,7 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path) -> Result<Session>
         }
     };
     let result = ready
-        .and_then(|()| run_gdb(gdb, args.arch, args.port, &binary))
+        .and_then(|()| run_gdb(gdb, args.arch, port, &binary))
         .map(|output| Session {
             gdb: output,
             detached: loop
@@ -275,7 +277,7 @@ fn run_gdb(gdb: &Path, arch: Arch, port: u16, binary: &Path) -> Result<String>
             format!("set architecture {}", debug_stub::gdb_architecture(arch)),
         ])
         .args(["-ex".to_string(), format!("file {}", binary.display())])
-        .args(["-ex".to_string(), format!("target remote localhost:{port}")]);
+        .args(["-ex".to_string(), format!("target remote 127.0.0.1:{port}")]);
     for line in SCRIPT
     {
         cmd.args([

@@ -31,6 +31,7 @@ mod fpu_migration_churn;
 mod idle_wake_race;
 mod irq_route_delete_race;
 mod load_balance_handoff_steal;
+mod msg_inject_delete_race;
 mod mutual_stop;
 mod priority_dealloc_race;
 mod reply_caller_delete;
@@ -132,10 +133,7 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!("stress::stop_owed_wake", stop_owed_wake::run(ctx));
     run_integration_test!("stress::stop_fault_sender", stop_fault_sender::run(ctx));
     run_integration_test!("stress::fault_bind_race", fault_bind_race::run(ctx));
-    run_integration_test!(
-        "stress::irq_route_delete_race",
-        irq_route_delete_race::run(ctx)
-    );
+    run_irq(ctx);
     run_integration_test!("stress::mutual_stop", mutual_stop::run(ctx));
     run_integration_test!("stress::stop_repark", stop_repark::run(ctx));
     run_integration_test!("stress::stop_claimed_delete", stop_claimed_delete::run(ctx));
@@ -196,4 +194,18 @@ pub fn run_all(ctx: &TestContext)
     );
     // Last: reports the kernel stacks' deepest use after every other cell.
     run_integration_test!("stress::stack_depth", stack_depth::run(ctx));
+}
+
+/// The device-interrupt cells: a wired line's binding changes, then a
+/// message-signaled target's free, each raced against deliveries.
+fn run_irq(ctx: &TestContext)
+{
+    run_integration_test!(
+        "stress::irq_route_delete_race",
+        irq_route_delete_race::run(ctx)
+    );
+    run_integration_test!(
+        "stress::msg_inject_delete_race",
+        msg_inject_delete_race::run(ctx)
+    );
 }

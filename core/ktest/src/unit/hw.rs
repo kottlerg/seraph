@@ -328,7 +328,7 @@ fn msg_exhaustion_bounds() -> Result<(u64, u64), &'static str>
 /// A derived copy of the first cap in the test's `CSpace` that mints a
 /// message-signaled target, carrying every right of it, and nothing minted.
 /// The root Interrupt cap carries `RIGHTS_IRQ_MINT`, so one is always found.
-fn msg_authority(ctx: &TestContext) -> Result<u64, &'static str>
+pub fn msg_authority(ctx: &TestContext) -> Result<u64, &'static str>
 {
     let bound = scan_bound(ctx);
     for slot in 1..=u64::from(bound)
@@ -348,7 +348,7 @@ fn msg_authority(ctx: &TestContext) -> Result<u64, &'static str>
 }
 
 /// The message address and data `SYS_CAP_INFO` gives `cap`.
-fn msg_of(cap: u64) -> Result<(u64, u64), i64>
+pub fn msg_of(cap: u64) -> Result<(u64, u64), i64>
 {
     Ok((
         syscall::cap_info(cap, CAP_INFO_IRQ_MSG_ADDRESS)?,

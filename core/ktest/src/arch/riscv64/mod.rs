@@ -77,6 +77,12 @@ pub fn fresh_range_root(ctx: &TestContext) -> Option<u64>
 /// arch-neutral cells that exercise a port binding skip it.
 pub const HAS_IO_PORTS: bool = false;
 
+/// Whether a user-mode CPU write raises a message-signaled target, as
+/// `stress::msg_inject_delete_race` needs: true, since a message is a write of
+/// the target's identity to its hart's IMSIC file, which ktest can map through
+/// the file's boot `Mmio` aperture and write itself.
+pub const MSG_INJECTABLE: bool = true;
+
 /// Exception cause a not-present user store faults with (store/AMO page
 /// fault), as recorded in `EXIT_FAULT_BASE + <vector>` when the fault kills
 /// the thread.

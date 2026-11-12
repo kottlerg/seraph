@@ -1525,9 +1525,10 @@ it one), so its windows are these:
 
 **2. Owed-wake detector (BSP, every `DETECTOR_SCAN_INTERVAL_MS`, 0.5 s).** Detects a single
 `Blocked` thread whose wake is provably owed but never arrived — the lost-wakeup wedge signature
-(#375), invisible to the all-idle check whenever any other thread keeps any CPU busy. Walks the
-live-thread registry reading each thread's fields under its `sched_lock`, try-locked (a thread whose
-lock is held is skipped for that scan), with no IPC-object dereference. Three rules: expired
+(#375), which the all-idle check never reports: while other threads run some CPU still
+dispatches, and a system whose every thread is blocked is idle to it. Walks the live-thread
+registry reading each thread's fields under its `sched_lock`, try-locked (a thread whose lock is
+held is skipped for that scan), with no IPC-object dereference. Three rules: expired
 `sleep_deadline` past the 8 s grace window (`WEDGE_GRACE_SECONDS`, unscaled; rules 2 and 3 also
 require the park to be older than it; a healthy sleeper is claimed, and its deadline cleared, within
 one BSP tick); `wake_in_flight` stuck set (a waker claimed the thread but its `enqueue_and_wake`

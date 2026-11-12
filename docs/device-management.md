@@ -472,8 +472,10 @@ that need several interrupts are to get message-signaled ones as further sources
 ones. The kernel half exists: `SYS_IRQ_MSG_ALLOC` mints an unbound message-signaled Interrupt cap
 through a cap carrying `RIGHTS_IRQ_MINT`, and its holder reads the message address and data with
 `SYS_CAP_INFO` and programs them into the device's MSI or MSI-X entry. devmgr does not yet allocate
-message targets for drivers or program a device's MSI capability, and interrupt remapping (VT-d)
-and riscv64 IOMMU MSI translation are not done
+message targets for drivers, program a device's MSI capability, or map into a confined device's
+domain the IMSIC files of the harts its targets sit on (`MAP_MSI`,
+[IOMMU Discovery and Programming](#iommu-discovery-and-programming)), without which a device behind
+the RISC-V IOMMU reaches no interrupt file; VT-d interrupt remapping is not done
 ([#325](https://github.com/kottlerg/seraph/issues/325)). Drivers still use wired lines.
 The kernel delivers each routed line to one CPU, chosen when the line is first bound by taking the
 CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 only CPUs whose

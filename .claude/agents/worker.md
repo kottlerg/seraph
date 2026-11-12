@@ -325,8 +325,10 @@ After every run:
   (docs/conventions.md § Contested findings). Do not waive or rule on a finding yourself.
 
 The review records stay under `target/xtask/review/pr<N>/` in your worktree. The gate report
-names that path and each run's mode and head, and the orchestrator copies them: your worktree
-may not write outside itself.
+names that path and each run's mode and head, and the orchestrator copies them: the harness
+refuses your own file writes outside your worktree. The files `cargo xtask` writes for you
+outside it (the orchestration record in the main checkout, the host lock in the git common
+directory) are the exception, as § Reporting and § Host runs use them.
 
 ## Gate
 

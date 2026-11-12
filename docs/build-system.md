@@ -243,6 +243,10 @@ sysroot/
                           # programs-surface orchestrator (usertest),
                           # and the crasher restart-path fixture. Some
                           # test-only artifacts install outside it.
+  tests/drivers/          # Test-only drivers devmgr binds only on demand
+                          # (test-fault; the InstallDest::TestsDrivers
+                          # entries in xtask/src/commands/build.rs SPECS),
+                          # which no drivers-directory pass at boot reads.
   tests/programs/         # Per-program tester binaries discovered by
                           # the usertest orchestrator.
   config/                 # System configuration (from rootfs/)
@@ -259,7 +263,7 @@ within the EFI partition.
 
 `tests/` holds the test harnesses, per-program testers, and harness-only
 fixtures, but test-only artifacts also install under `services/drivers/`,
-`programs/`, `config/svcmgr/tests/`, and `data/`;
+`programs/`, `config/svcmgr/tests/`, `config/devmgr/tests/`, and `data/`;
 [testing.md § Sysroot layout](testing.md#sysroot-layout) lists them.
 
 Non-ESP, non-`data` directories (`services/`, `programs/`, `tests/`,
@@ -281,7 +285,8 @@ The `esp/` and root-partition trees are populated from two sources:
   `services/<name>`, `services/drivers/<name>`,
   `services/fs/<name>`, or `programs/<name>` for std-userspace
   binaries, `tests/<name>` or `tests/programs/<name>` for harness
-  binaries and per-program testers).
+  binaries and per-program testers, `tests/drivers/<name>` for the
+  test-only drivers bound on demand).
 - Static files in [`rootfs/`](../rootfs/) are mirrored directly into
   the sysroot — every file's path under `rootfs/` is its path under
   `sysroot/`. The mirror is authoritative over the subtrees it owns

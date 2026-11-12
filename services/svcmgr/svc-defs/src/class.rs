@@ -10,9 +10,10 @@
 //! § Device class files).
 //!
 //! The grammar is a `.svc` file's: line-oriented `key = value`, `#` starts a
-//! comment, and an unknown or repeated key is an error. The class name is
-//! the file name without its `.class` suffix, as a service's is its `.svc`
-//! file's.
+//! comment, and an unknown or repeated key is an error. The file's stem, its
+//! name without the `.class` suffix, names the publication; the class it
+//! configures is its `class` key, the stem by default, so two files can
+//! publish differently attenuated SENDs for one class.
 
 use crate::parse::{ParseError, owned};
 
@@ -20,7 +21,10 @@ use crate::parse::{ParseError, owned};
 #[derive(Debug, PartialEq, Eq)]
 pub struct ClassDefinition
 {
-    /// The class name, the file name without `.class`.
+    /// The file name without `.class`: svcmgr publishes the SEND as
+    /// `devmgr.class.<stem>`.
+    pub stem: String,
+    /// The class the file configures: its `class` key, the stem by default.
     pub name: String,
     /// The verb bits a `QUERY_DEVICE` reply through the class SEND carries,
     /// a non-empty subset of `ipc::VERB_BIT_MASK`.
@@ -53,27 +57,34 @@ pub fn class_publication(class: &[u8]) -> Option<Vec<u8>>
 /// The lowest bit position of `ipc::VERB_BIT_MASK`.
 const VERB_BIT_FIRST: u32 = ipc::VERB_BIT_MASK.trailing_zeros();
 
-/// Parse the contents of one class file; `name` is the file name without
+/// Whether `name` is 1 to `ipc::devmgr_labels::MAX_CLASS_NAME_BYTES`
+/// lowercase ASCII letters, digits, `-`, and `_`.
+fn valid_class_name(name: &str) -> bool
+{
+    !name.is_empty()
+        && name.len() <= ipc::devmgr_labels::MAX_CLASS_NAME_BYTES
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Parse the contents of one class file; `stem` is the file name without
 /// its `.class` suffix.
 ///
 /// Keys: `verbs` (required), the bit positions of the verb bits, separated
 /// by spaces, each in `ipc::VERB_BIT_MASK` (58 to 63) and none repeated;
-/// `boot_only`, `yes` or `no` (default `no`).
+/// `boot_only`, `yes` or `no` (default `no`); `class`, the class the file
+/// configures (default the stem).
 ///
 /// # Errors
-/// A [`ParseError`] naming the offending line: a name that is not 1 to
-/// `ipc::devmgr_labels::MAX_CLASS_NAME_BYTES` lowercase ASCII letters,
-/// digits, `-`, and `_` (line 0), a missing `=`, an unknown or repeated key,
-/// a missing or empty `verbs`, a bit position outside the mask or repeated,
-/// or a `boot_only` other than `yes` or `no`.
-pub fn parse_class(name: &str, contents: &str) -> Result<ClassDefinition, ParseError>
+/// A [`ParseError`] naming the offending line: a stem (line 0) or `class`
+/// that is not 1 to `ipc::devmgr_labels::MAX_CLASS_NAME_BYTES` lowercase
+/// ASCII letters, digits, `-`, and `_`, a missing `=`, an unknown or repeated
+/// key, a missing or empty `verbs`, a bit position outside the mask or
+/// repeated, or a `boot_only` other than `yes` or `no`.
+pub fn parse_class(stem: &str, contents: &str) -> Result<ClassDefinition, ParseError>
 {
-    let valid_name = !name.is_empty()
-        && name.len() <= ipc::devmgr_labels::MAX_CLASS_NAME_BYTES
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
-    if !valid_name
+    if !valid_class_name(stem)
     {
         return Err(ParseError::InvalidValue(
             0,
@@ -82,6 +93,7 @@ pub fn parse_class(name: &str, contents: &str) -> Result<ClassDefinition, ParseE
     }
     let mut verbs: Option<u64> = None;
     let mut boot_only: Option<bool> = None;
+    let mut class: Option<&str> = None;
     for entry in svc_grammar::entries(contents)
     {
         let svc_grammar::Entry {
@@ -118,11 +130,27 @@ pub fn parse_class(name: &str, contents: &str) -> Result<ClassDefinition, ParseE
                     }
                 });
             }
+            ("class", value) =>
+            {
+                if class.is_some()
+                {
+                    return Err(ParseError::DuplicateKey(lineno, "class"));
+                }
+                if !valid_class_name(value)
+                {
+                    return Err(ParseError::InvalidValue(
+                        lineno,
+                        "class is not a valid class name",
+                    ));
+                }
+                class = Some(value);
+            }
             (other, _) => return Err(ParseError::UnknownKey(lineno, owned(other)?)),
         }
     }
     Ok(ClassDefinition {
-        name: owned(name)?,
+        stem: owned(stem)?,
+        name: owned(class.unwrap_or(stem))?,
         verbs: verbs.ok_or(ParseError::MissingKey("verbs"))?,
         boot_only: boot_only.unwrap_or(false),
     })
@@ -182,6 +210,7 @@ mod tests
         assert_eq!(
             def,
             ClassDefinition {
+                stem: String::from("serial"),
                 name: String::from("serial"),
                 verbs: (1 << 63) | (1 << 62),
                 boot_only: false,
@@ -242,6 +271,36 @@ mod tests
             parse_class("rtc", "verbs 63"),
             Err(ParseError::MissingEquals(1))
         ));
+    }
+
+    #[test]
+    fn the_class_key_names_another_class_than_the_stem()
+    {
+        let def = parse_class("serial-deny", "class = serial\nverbs = 58").unwrap();
+        assert_eq!(
+            def,
+            ClassDefinition {
+                stem: String::from("serial-deny"),
+                name: String::from("serial"),
+                verbs: 1 << 58,
+                boot_only: false,
+            }
+        );
+        assert!(matches!(
+            parse_class("serial-deny", "class = serial\nclass = input\nverbs = 58"),
+            Err(ParseError::DuplicateKey(2, "class"))
+        ));
+        let too_long = "a".repeat(ipc::devmgr_labels::MAX_CLASS_NAME_BYTES + 1);
+        for bad in ["", "Serial", "dot.ted", too_long.as_str()]
+        {
+            assert!(
+                matches!(
+                    parse_class("serial-deny", &format!("verbs = 58\nclass = {bad}")),
+                    Err(ParseError::InvalidValue(2, _))
+                ),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

@@ -9,9 +9,10 @@
 //! short byte-string names to capability-slot indices in its own `CSpace`. Callers
 //! query via `QUERY_ENDPOINT` (reply semantics: `services/svcmgr/docs/ipc-interface.md`
 //! § Label 4); the supervisor resolves the name with [`Registry::lookup`]. Each
-//! entry carries a [`Visibility`]: a [`Visibility::SeedOnly`] entry resolves
-//! only for the supervisor's own resolution ([`Resolver::Seed`]), never for
-//! a `QUERY_ENDPOINT` caller ([`Resolver::Query`]).
+//! entry carries a [`Visibility`]: a [`Visibility::SeedOnly`] or
+//! [`Visibility::SeedOnlyGrant`] entry resolves only for the supervisor's own
+//! resolution ([`Resolver::Seed`]), never for a `QUERY_ENDPOINT` caller
+//! ([`Resolver::Query`]), and a `SeedOnlyGrant` entry's seeds keep `GRANT`.
 //!
 //! Entries live on the heap and the table grows with what is published, so
 //! it holds no fixed count; a publish fails only when the heap cannot grow
@@ -38,6 +39,31 @@ pub enum Visibility
     /// finds no entry. For names whose cap carries authority that only the
     /// recipes seeding the name may hold.
     SeedOnly,
+    /// Resolved as [`Visibility::SeedOnly`], and the supervisor derives each
+    /// seed with `GRANT` ([`Resolved::grant`]), for a seed-only name whose
+    /// labels move caps to the endpoint.
+    SeedOnlyGrant,
+}
+
+impl Visibility
+{
+    /// Whether a [`Resolver::Query`] lookup finds no entry.
+    const fn seed_only(self) -> bool
+    {
+        matches!(self, Self::SeedOnly | Self::SeedOnlyGrant)
+    }
+}
+
+/// What [`Registry::lookup`] resolves a name to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resolved
+{
+    /// The published cap in the supervisor's `CSpace`.
+    pub cap: u64,
+    /// The entry is [`Visibility::SeedOnlyGrant`]: the supervisor derives
+    /// the cap it hands on with `GRANT`. Never set for
+    /// [`Resolver::Query`].
+    pub grant: bool,
 }
 
 /// Who is resolving a name.
@@ -107,21 +133,24 @@ impl Registry
 
     /// Resolve `name` to its registered cap for `resolver`. Returns `None`
     /// if not found, if `name` is empty or exceeds `NAME_MAX` bytes, or if
-    /// the entry is [`Visibility::SeedOnly`] and `resolver` is
-    /// [`Resolver::Query`].
+    /// the entry is seed-only ([`Visibility::SeedOnly`],
+    /// [`Visibility::SeedOnlyGrant`]) and `resolver` is [`Resolver::Query`].
     #[must_use]
-    pub fn lookup(&self, name: &[u8], resolver: Resolver) -> Option<u64>
+    pub fn lookup(&self, name: &[u8], resolver: Resolver) -> Option<Resolved>
     {
         if name.is_empty() || name.len() > NAME_MAX
         {
             return None;
         }
         let entry = self.entries.iter().find(|e| e.name_matches(name))?;
-        if entry.visibility == Visibility::SeedOnly && resolver == Resolver::Query
+        if entry.visibility.seed_only() && resolver == Resolver::Query
         {
             return None;
         }
-        Some(entry.cap)
+        Some(Resolved {
+            cap: entry.cap,
+            grant: entry.visibility == Visibility::SeedOnlyGrant,
+        })
     }
 
     /// Publish `name → cap` with `visibility`.
@@ -180,15 +209,25 @@ impl Default for Registry
 #[cfg(test)]
 mod tests
 {
-    use super::{NAME_MAX, Registry, Resolver, Visibility};
+    use super::{NAME_MAX, Registry, Resolved, Resolver, Visibility};
+
+    /// The cap `name` resolves to for `resolver`.
+    fn cap(r: &Registry, name: &[u8], resolver: Resolver) -> Option<u64>
+    {
+        r.lookup(name, resolver).map(|e| e.cap)
+    }
 
     #[test]
     fn public_entry_resolves_for_query_and_seed()
     {
         let mut r = Registry::new();
         r.publish(b"timed", 7, Visibility::Public).unwrap();
-        assert_eq!(r.lookup(b"timed", Resolver::Query), Some(7));
-        assert_eq!(r.lookup(b"timed", Resolver::Seed), Some(7));
+        let plain = Some(Resolved {
+            cap: 7,
+            grant: false,
+        });
+        assert_eq!(r.lookup(b"timed", Resolver::Query), plain);
+        assert_eq!(r.lookup(b"timed", Resolver::Seed), plain);
     }
 
     #[test]
@@ -198,7 +237,30 @@ mod tests
         r.publish(b"devmgr.shutdown", 9, Visibility::SeedOnly)
             .unwrap();
         assert_eq!(r.lookup(b"devmgr.shutdown", Resolver::Query), None);
-        assert_eq!(r.lookup(b"devmgr.shutdown", Resolver::Seed), Some(9));
+        assert_eq!(
+            r.lookup(b"devmgr.shutdown", Resolver::Seed),
+            Some(Resolved {
+                cap: 9,
+                grant: false,
+            })
+        );
+    }
+
+    #[test]
+    fn seed_only_grant_entry_resolves_for_seed_with_grant_but_not_query()
+    {
+        let mut r = Registry::new();
+        r.publish(b"devmgr.bind", 4, Visibility::SeedOnlyGrant)
+            .unwrap();
+        assert_eq!(r.lookup(b"devmgr.bind", Resolver::Query), None);
+        assert_eq!(
+            r.lookup(b"devmgr.bind", Resolver::Seed),
+            Some(Resolved {
+                cap: 4,
+                grant: true,
+            })
+        );
+        assert!(r.publish(b"devmgr.bind", 5, Visibility::Public).is_err());
     }
 
     #[test]
@@ -206,9 +268,9 @@ mod tests
     {
         let mut r = Registry::new();
         r.publish(b"a", 1, Visibility::Public).unwrap();
-        assert_eq!(r.lookup(b"b", Resolver::Seed), None);
-        assert_eq!(r.lookup(b"", Resolver::Seed), None);
-        assert_eq!(r.lookup(&[b'a'; NAME_MAX + 1], Resolver::Seed), None);
+        assert_eq!(cap(&r, b"b", Resolver::Seed), None);
+        assert_eq!(cap(&r, b"", Resolver::Seed), None);
+        assert_eq!(cap(&r, &[b'a'; NAME_MAX + 1], Resolver::Seed), None);
     }
 
     #[test]
@@ -217,7 +279,7 @@ mod tests
         let name = [b'a'; NAME_MAX];
         let mut r = Registry::new();
         r.publish(&name, 7, Visibility::Public).unwrap();
-        assert_eq!(r.lookup(&name, Resolver::Query), Some(7));
+        assert_eq!(cap(&r, &name, Resolver::Query), Some(7));
         assert_eq!(r.remove(&name), Some(7));
         assert!(
             r.publish(&[b'a'; NAME_MAX + 1], 8, Visibility::Public)
@@ -260,7 +322,7 @@ mod tests
         }
         for (i, name) in names.iter().enumerate()
         {
-            assert_eq!(r.lookup(name, Resolver::Query), Some(i as u64 + 1));
+            assert_eq!(cap(&r, name, Resolver::Query), Some(i as u64 + 1));
         }
     }
 
@@ -272,8 +334,8 @@ mod tests
         assert_eq!(r.remove(b"a"), Some(5));
         assert_eq!(r.remove(b"a"), None);
         assert_eq!(r.remove(b""), None);
-        assert_eq!(r.lookup(b"a", Resolver::Seed), None);
+        assert_eq!(cap(&r, b"a", Resolver::Seed), None);
         r.publish(b"b", 6, Visibility::Public).unwrap();
-        assert_eq!(r.lookup(b"b", Resolver::Query), Some(6));
+        assert_eq!(cap(&r, b"b", Resolver::Query), Some(6));
     }
 }

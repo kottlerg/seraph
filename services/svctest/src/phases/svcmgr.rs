@@ -186,25 +186,31 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show nine of the refused names are
+/// cap. svctest's own non-zero seeds show fourteen of the refused names are
 /// published; `devmgr.shutdown`, which only pwrmgr seeds, is published by
-/// the same loop as `devmgr.registry` and `devmgr.test`, and the other
+/// the same loop as `devmgr.registry` and `devmgr.bind`, and the other
 /// `devmgr.class.*` names by the same class loop as `devmgr.class.serial` and
 /// `devmgr.class.input`, among them `devmgr.class.debug-port`, which only the
 /// `debug-echo` fixture and `gdbstub` seed. A queryable seed-only name would
-/// hand its authority to every process.
+/// hand its authority to every process, and `devmgr.bind`, whose seeds keep
+/// `GRANT`, its `GRANT` too.
 fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
 {
     for (cap, shown) in [
         (caps.root_fs, "rootfs.root"),
         (caps.pwrmgr_auth, "pwrmgr.shutdown"),
         (caps.devmgr_registry, "devmgr.registry"),
-        (caps.devmgr_test, "devmgr.test"),
+        (caps.devmgr_bind, "devmgr.bind"),
         (caps.vfsd_mount, "vfsd.mount"),
         (caps.vfsd_deny, "vfsd.deny"),
         (caps.logd_query, "logd.query"),
         (caps.serial_class, "devmgr.class.serial"),
         (caps.input_class, "devmgr.class.input"),
+        (caps.test_dma_class, "devmgr.class.test-dma"),
+        (caps.test_fault_class, "devmgr.class.test-fault"),
+        (caps.serial_deny_class, "devmgr.class.serial-deny"),
+        (caps.input_deny_class, "devmgr.class.input-deny"),
+        (caps.framebuffer_deny_class, "devmgr.class.framebuffer-deny"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");
@@ -222,7 +228,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         ipc::published_names::PWRMGR_SHUTDOWN,
         ipc::published_names::DEVMGR_REGISTRY,
         ipc::published_names::DEVMGR_SHUTDOWN,
-        ipc::published_names::DEVMGR_TEST,
+        ipc::published_names::DEVMGR_BIND,
         ipc::published_names::VFSD_MOUNT,
         ipc::published_names::VFSD_DENY,
         ipc::published_names::LOGD_QUERY,
@@ -232,6 +238,11 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         b"devmgr.class.rtc",
         b"devmgr.class.input",
         b"devmgr.class.debug-port",
+        b"devmgr.class.test-dma",
+        b"devmgr.class.test-fault",
+        b"devmgr.class.serial-deny",
+        b"devmgr.class.input-deny",
+        b"devmgr.class.framebuffer-deny",
     ]
     {
         let reply = query(name);
@@ -270,5 +281,5 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
             let _ = syscall::cap_delete(cap);
         }
     }
-    std::os::seraph::log!("svcmgr seed-only phase passed (7 refused, 2 public resolved)");
+    std::os::seraph::log!("svcmgr seed-only phase passed (19 refused, 2 public resolved)");
 }

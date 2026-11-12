@@ -105,9 +105,36 @@ impl X86Paging
     }
 }
 
-/// The DMA test device every launch attaches: QEMU's `edu` (PCI
-/// `1234:11e8`), with its default 28-bit DMA mask.
+/// The DMA test device a test launch attaches (`--test-devices`): QEMU's
+/// `edu` (PCI `1234:11e8`), with its default 28-bit DMA mask.
 const EDU_DEVICE: &str = "edu";
+
+/// The QEMU `pci-testdev` functions (PCI `1b36:0005`) a test launch attaches
+/// (`--test-devices`) for the test-only `test-fault` fixture, which takes its
+/// role from the function's BAR 2 (`ipc::test_fault_labels`): two with no
+/// BAR 2, which the fixture serves, one whose BAR 2 is `HANG_BAR_BYTES`
+/// (`membar=4K`), on which it never reports ready, and one whose BAR 2 is
+/// `ORPHAN_BAR_BYTES` (`membar=8K`), on which it refuses its bootstrap.
+/// Pinned past the disks' slots ([`FIRST_DISK_SLOT`]), below 25, where q35
+/// routes every slot to one line, and clear of q35's slot 0x1f; the fixture
+/// takes no interrupt, so the lines they share are unused.
+const TEST_FAULT_DEVICES: [&str; 4] = [
+    "pci-testdev,addr=0x15",
+    "pci-testdev,addr=0x16",
+    "pci-testdev,addr=0x17,membar=4K",
+    "pci-testdev,addr=0x18,membar=8K",
+];
+
+/// The arguments that attach the test devices of a test launch:
+/// [`EDU_DEVICE`] and [`TEST_FAULT_DEVICES`]. No production driver binds
+/// any of them.
+fn test_device_args() -> Vec<String>
+{
+    core::iter::once(EDU_DEVICE)
+        .chain(TEST_FAULT_DEVICES)
+        .flat_map(|d| ["-device".to_string(), d.to_string()])
+        .collect()
+}
 
 /// The RISC-V IOMMU as a PCI function, pinned at 00:01.0, the lowest slot
 /// past the host bridge. `off=off` leaves it in Bare mode out of reset,
@@ -252,6 +279,10 @@ pub struct QemuLaunchSpec<'a>
     /// device whose port QEMU exposes as a TCP server on `127.0.0.1` at this
     /// port ([`debug_port_args`]).
     pub debug_port: Option<u16>,
+    /// Whether the test devices are attached (`--test-devices`): `edu` and
+    /// the `pci-testdev` functions svctest's devmgr phases drive through the
+    /// test-only drivers ([`test_device_args`]).
+    pub test_devices: bool,
 }
 
 /// The device arguments a launch passes before every other device: the
@@ -524,10 +555,14 @@ fn extend_x86(
     {
         args.extend(["-device".into(), "intel-iommu,intremap=off".into()]);
     }
-    // QEMU's `edu` device, whose DMA engine svctest's DMA confinement phase
-    // drives through the test-only `test-dma` driver: behind the IOMMU when
-    // one is attached, unconfined otherwise. No production driver binds it.
-    args.extend(["-device".into(), EDU_DEVICE.into()]);
+    // The test devices: QEMU's `edu` device, whose DMA engine svctest's DMA
+    // confinement phase drives through the test-only `test-dma` driver,
+    // behind the IOMMU when one is attached and unconfined otherwise, and the
+    // `pci-testdev` functions of the `test-fault` fixture.
+    if spec.test_devices
+    {
+        args.extend(test_device_args());
+    }
 
     if let Some(guid) = spec.vmgenid_guid
     {
@@ -643,13 +678,17 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
         format!("if=pflash,format=raw,file={}", vars_path.display()),
     ]);
 
-    // QEMU's `edu` device, whose DMA engine svctest's DMA confinement phase
-    // drives through the test-only `test-dma` driver: behind the IOMMU when
-    // one is attached (`RISCV_IOMMU_DEVICE`, added first), unconfined
-    // otherwise. No production driver binds it.
-    args.extend(["-device".into(), EDU_DEVICE.into()]);
+    // The test devices: QEMU's `edu` device, whose DMA engine svctest's DMA
+    // confinement phase drives through the test-only `test-dma` driver,
+    // behind the IOMMU when one is attached (`RISCV_IOMMU_DEVICE`, added
+    // first) and unconfined otherwise, and the `pci-testdev` functions of the
+    // `test-fault` fixture.
+    if spec.test_devices
+    {
+        args.extend(test_device_args());
+    }
 
-    // After the `edu` device, so the adapter's auto-placed PCI slot follows
+    // After the test devices, so the adapter's auto-placed PCI slot follows
     // the devices above.
     args.extend(display_args(spec));
 
@@ -895,6 +934,7 @@ mod tests
             x86_paging: X86Paging::Four,
             iommu: Iommu::Attached,
             debug_port: None,
+            test_devices: false,
         }
     }
 
@@ -983,6 +1023,7 @@ mod tests
             x86_paging: X86Paging::Four,
             iommu: Iommu::Attached,
             debug_port: None,
+            test_devices: false,
         };
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(argv.iter().any(|a| a == "vmgenid,guid=auto"));
@@ -1010,6 +1051,7 @@ mod tests
             x86_paging,
             iommu: Iommu::Attached,
             debug_port: None,
+            test_devices: false,
         }
     }
 
@@ -1223,9 +1265,6 @@ mod tests
                 argv[first_device + 1] == RISCV_IOMMU_DEVICE,
                 iommu_device == RISCV_IOMMU_DEVICE
             );
-            // The DMA test device sits on both machines, with or without
-            // the IOMMU.
-            assert!(argv.iter().any(|a| a == EDU_DEVICE));
             // Both disks and the keyboard; the firmware-only RNG stays out.
             let devices = virtio(&argv);
             assert_eq!(devices.len(), 4);
@@ -1236,9 +1275,74 @@ mod tests
             spec.iommu = Iommu::Absent;
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(!argv.iter().any(|a| a.contains("iommu")));
-            assert!(argv.iter().any(|a| a == EDU_DEVICE));
             assert_eq!(virtio(&argv).len(), 4);
         }
+    }
+
+    /// The `-device` values of `argv`.
+    fn devices(argv: &[String]) -> Vec<&str>
+    {
+        argv.windows(2)
+            .filter(|w| w[0] == "-device")
+            .map(|w| w[1].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_test_devices_are_attached_only_when_asked_at_pinned_slots()
+    {
+        for mut spec in [riscv_spec(4, 512), x86_spec(X86Paging::Four)]
+        {
+            for iommu in [Iommu::Attached, Iommu::Absent]
+            {
+                spec.iommu = iommu;
+                spec.test_devices = false;
+                let argv = build_qemu_argv(&spec).unwrap();
+                assert!(
+                    !devices(&argv)
+                        .iter()
+                        .any(|d| *d == EDU_DEVICE || d.starts_with("pci-testdev"))
+                );
+
+                spec.test_devices = true;
+                let argv = build_qemu_argv(&spec).unwrap();
+                let attached = devices(&argv);
+                assert!(attached.contains(&EDU_DEVICE));
+                let testdevs: Vec<&str> = attached
+                    .iter()
+                    .copied()
+                    .filter(|d| d.starts_with("pci-testdev"))
+                    .collect();
+                assert_eq!(testdevs, TEST_FAULT_DEVICES);
+                // Every function is pinned past the disks' slots, below
+                // q35's one-line range.
+                for d in testdevs
+                {
+                    let addr = d
+                        .split(',')
+                        .find_map(|p| p.strip_prefix("addr=0x"))
+                        .unwrap();
+                    let slot = u8::from_str_radix(addr, 16).unwrap();
+                    assert!(slot > SHARED_LINE_SECOND_DISK_SLOT && slot < 25, "{d}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_test_fault_bars_match_the_fixture_roles()
+    {
+        use ipc::test_fault_labels::{HANG_BAR_BYTES, ORPHAN_BAR_BYTES};
+        let bar = |d: &str| {
+            d.split(',')
+                .find_map(|p| p.strip_prefix("membar="))
+                .map(|v| v.strip_suffix('K').unwrap().parse::<u64>().unwrap() << 10)
+        };
+        let bars: Vec<Option<u64>> = TEST_FAULT_DEVICES.iter().map(|d| bar(d)).collect();
+        assert_eq!(
+            bars,
+            [None, None, Some(HANG_BAR_BYTES), Some(ORPHAN_BAR_BYTES)]
+        );
     }
 
     #[test]

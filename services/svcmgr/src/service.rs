@@ -183,7 +183,7 @@ pub struct SvcmgrCaps
     pub rootfs_root: u64,
     /// `SEND|GRANT`, badge-0 source on devmgr's registry endpoint. svcmgr
     /// mints the seed-only `devmgr.registry`, `devmgr.shutdown`, and
-    /// `devmgr.test` publish caps, the `CLASS_AUTHORITY` SEND it requests the
+    /// `devmgr.bind` publish caps, the `CLASS_AUTHORITY` SEND it requests the
     /// `devmgr.class.*` class SENDs with, and the `SET_DRIVERS_DIR` cap
     /// (`DRIVERS_DIR_AUTHORITY`) from it. Zero if absent.
     pub devmgr_registry: u64,

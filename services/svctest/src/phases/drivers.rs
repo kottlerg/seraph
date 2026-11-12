@@ -6,27 +6,28 @@
 //! Device-driver verb-bit gates: the serial, virtio-input, and framebuffer
 //! drivers refuse a label whose verb bit the caller's badge lacks.
 //!
-//! devmgr mints every client SEND on these endpoints with the verb bits set,
-//! and a holder cannot strip a bit from a badged cap, so the phase takes its
-//! no-authority SENDs from devmgr's test-only `TEST_QUERY_DENY_DEVICE` label
-//! on `devmgr.test`. Each SEND carries `TEST_DENY_BADGE`, which holds none of
-//! the driver's verb bits; every gated label sent on it must reply the
-//! driver's `UNAUTHORIZED` at once, without blocking for input or consuming
-//! a byte. The serial and input drivers are part of every boot's device set;
-//! the framebuffer case skips on a headless boot (CI's), where devmgr runs no
-//! framebuffer driver. The input case also skips when the `terminal` recipe
-//! is staged: the input driver serves one request at a time, and the
-//! terminal keeps a blocking `INPUT_READ_EVENTS` pending, so svctest's call
-//! would wait behind it for a keypress. TODO(#165): retire the deny phase
-//! with the devmgr test labels.
+//! devmgr mints a client SEND on these endpoints with the verb bits of the
+//! class SEND it is asked through, and a holder cannot strip a bit from a
+//! badged cap, so the phase takes its no-authority SENDs through the
+//! test-only `devmgr.class.serial-deny`, `input-deny`, and
+//! `framebuffer-deny` class SENDs, whose verb mask holds only bit 58, which
+//! none of these drivers checks. Every gated label sent on such a SEND must
+//! reply the driver's `UNAUTHORIZED` at once, without blocking for input or
+//! consuming a byte. The serial and input drivers are part of every boot's
+//! device set; the framebuffer case skips on a headless boot (CI's), where
+//! devmgr runs no framebuffer driver. The input case also skips when the
+//! `terminal` recipe is staged: the input driver serves one request at a
+//! time, and the terminal keeps a blocking `INPUT_READ_EVENTS` pending, so
+//! svctest's call would wait behind it for a keypress.
 //!
 //! The stray-cap flood phase checks the serial and input drivers' cap
 //! hygiene: a cap a request carries that the driver does not keep is
 //! deleted, not left in the driver's `CSpace`, and an accepted serial RX
 //! registration deletes the notification it replaces. It takes granted SENDs
-//! through the `devmgr.class.serial` and `devmgr.class.input` class SENDs. Under a staged terminal its input case skips, as
-//! the deny phase's does, and so do its serial cases that read the UART or
-//! rebind its interrupt, which would take the terminal's input.
+//! through the `devmgr.class.serial` and `devmgr.class.input` class SENDs.
+//! Under a staged terminal its input case skips, as the deny phase's does,
+//! and so do its serial cases that read the UART or rebind its interrupt,
+//! which would take the terminal's input.
 
 use std::time::Duration;
 
@@ -69,39 +70,6 @@ fn terminal_staged() -> bool
     std::fs::metadata(TERMINAL_RECIPE).is_ok()
 }
 
-/// A no-authority SEND on the first driver of class `class`, from devmgr's
-/// `TEST_QUERY_DENY_DEVICE`, or `None` when devmgr still reports
-/// `NO_DEVICE` after `attempts` tries.
-fn deny_send(devmgr_test: u64, class: &[u8], name: &str, attempts: u32) -> Option<u64>
-{
-    let ipc_buf = std::os::seraph::current_ipc_buf();
-    let req = ipc::IpcMessage::builder(ipc::devmgr_labels::TEST_QUERY_DENY_DEVICE)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .word(1, class.len() as u64)
-        .bytes(2, class)
-        .build();
-    for _ in 0..attempts
-    {
-        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call(devmgr_test, &req, ipc_buf) }
-            .unwrap_or_else(|_| panic!("TEST_QUERY_DENY_DEVICE ({name}) ipc_call failed"));
-        if reply.label == ipc::devmgr_errors::NO_DEVICE
-        {
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
-        }
-        assert_eq!(
-            reply.label,
-            ipc::devmgr_errors::SUCCESS,
-            "TEST_QUERY_DENY_DEVICE ({name}) status"
-        );
-        let cap = reply.caps().first().copied().unwrap_or(0);
-        assert!(cap != 0, "TEST_QUERY_DENY_DEVICE ({name}) carried no cap");
-        return Some(cap);
-    }
-    None
-}
-
 /// `msg` sent on the no-authority `cap` replies `unauthorized` and carries
 /// no cap.
 fn assert_denied(cap: u64, msg: &ipc::IpcMessage, unauthorized: u64, what: &str)
@@ -120,10 +88,22 @@ fn assert_denied(cap: u64, msg: &ipc::IpcMessage, unauthorized: u64, what: &str)
 
 fn verb_bit_deny_phase(caps: &Caps)
 {
-    let devmgr = caps.devmgr_test;
-    assert!(devmgr != 0, "drivers deny: no devmgr.test cap seeded");
+    use crate::phases::devmgr::TEST_DEVICES_HINT;
 
-    let serial = deny_send(devmgr, b"serial", "serial", 1).expect("drivers deny: no serial driver");
+    for (cap, shown) in [
+        (caps.serial_deny_class, "devmgr.class.serial-deny"),
+        (caps.input_deny_class, "devmgr.class.input-deny"),
+        (caps.framebuffer_deny_class, "devmgr.class.framebuffer-deny"),
+    ]
+    {
+        assert!(
+            cap != 0,
+            "drivers deny: no {shown} cap seeded: {TEST_DEVICES_HINT}"
+        );
+    }
+
+    let serial = granted_send(caps.serial_deny_class, "serial-deny", 1)
+        .expect("drivers deny: no serial driver");
     let unauth = ipc::serial_errors::UNAUTHORIZED;
     // A one-byte write; a granted write would emit it on the console.
     let write = ipc::IpcMessage::builder(ipc::serial_labels::SERIAL_WRITE_BYTES | (1 << 16))
@@ -142,7 +122,7 @@ fn verb_bit_deny_phase(caps: &Caps)
     }
     else
     {
-        let input = deny_send(devmgr, b"input", "input", INPUT_ATTEMPTS)
+        let input = granted_send(caps.input_deny_class, "input-deny", INPUT_ATTEMPTS)
             .expect("drivers deny: no input driver");
         // A granted read blocks until a key arrives; the deny must not.
         let read = ipc::IpcMessage::new(ipc::input_labels::INPUT_READ_EVENTS);
@@ -155,7 +135,7 @@ fn verb_bit_deny_phase(caps: &Caps)
         let _ = syscall::cap_delete(input);
     }
 
-    let Some(fb) = deny_send(devmgr, b"framebuffer", "fb", 1)
+    let Some(fb) = granted_send(caps.framebuffer_deny_class, "framebuffer-deny", 1)
     else
     {
         std::os::seraph::log!("drivers deny: framebuffer case skipped: no framebuffer driver");
@@ -261,9 +241,10 @@ const INPUT_CASE: StrayCapCase = StrayCapCase {
     what: "input unknown label",
 };
 
-/// A granted SEND on the first driver of the class whose class SEND is
-/// `class_send` (`QUERY_DEVICE` at ordinal 0), or `None` when devmgr still
-/// reports `NO_DEVICE` after `attempts` tries.
+/// The SEND on the first driver of the class whose class SEND is
+/// `class_send` (`QUERY_DEVICE` at ordinal 0), carrying that class SEND's
+/// verb bits, or `None` when devmgr still reports `NO_DEVICE` after
+/// `attempts` tries.
 fn granted_send(class_send: u64, name: &str, attempts: u32) -> Option<u64>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();

@@ -139,6 +139,7 @@ fn launch(
         x86_paging: args.x86_paging,
         iommu: args.iommu,
         debug_port: args.debug_port,
+        test_devices: args.test_devices,
     };
     let qemu_args = build_qemu_argv(&spec)?;
 

@@ -132,6 +132,7 @@ fn boot(ctx: &Context, args: &TestMapRedoArgs, dir: &Path) -> Result<()>
         iommu: crate::qemu::Iommu::Attached,
         debug_port: None,
         debug_target: None,
+        test_devices: false,
         display: crate::qemu::BatchDisplay::Headless,
         pass: DEFAULT_PASS_REGEX.to_string(),
         fail: DEFAULT_FAIL_REGEX.to_string(),

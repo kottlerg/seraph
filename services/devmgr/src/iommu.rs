@@ -733,13 +733,13 @@ impl Iommu
 ///
 /// `counts` stays locked from before the take until every fault taken is
 /// recorded, so a caller that reads `counts` after its own take sees every
-/// fault another thread's take has handed devmgr (`TEST_DMA_FAULTS` reads
-/// it beside the fault-log thread). The lock is held across the
-/// `TAKE_FAULTS` IPC, which `docs/coding-standards.md` § Concurrency advises
-/// against: only the fault-log thread and `TEST_DMA_FAULTS`, on a registry
-/// worker, take it, so a waiter waits no longer than the holders' calls to
-/// the driver, each no longer than its own would, and a
-/// dead driver's calls are answered (`IommuClient::fail`), so the holder
+/// fault another thread's take has handed devmgr (the DMA thread's
+/// `DMA_FAULTS` reads it beside the fault-log thread). The lock is held
+/// across the `TAKE_FAULTS` IPC, which `docs/coding-standards.md`
+/// § Concurrency advises against: only the fault-log thread and the DMA
+/// thread, serving `DMA_FAULTS`, take it, so a waiter waits no longer than
+/// the holders' calls to the driver, each no longer than its own would, and
+/// a dead driver's calls are answered (`IommuClient::fail`), so the holder
 /// does not block for good.
 fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
 {
@@ -1107,7 +1107,8 @@ fn take_family_driver(
             continue;
         }
         let (decl, cap) = modules.remove(i);
-        if table.add(decl, Source::BootModule, cap).is_err()
+        // The IOMMU pass is the boot's first: no driver is bound yet.
+        if table.add(decl, Source::BootModule, cap, 0).is_err()
         {
             std::os::seraph::log!(
                 "{}: no memory to consider the driver; not bound",

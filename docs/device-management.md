@@ -547,13 +547,12 @@ devmgr loads driver binaries from one of two places:
   [virtio-input keyboard driver](../services/drivers/virtio/input/README.md), the debug port's
   virtio-console
   driver, and the test-only `test-dma`) live at `/services/drivers/` and are loaded
-  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` and `test-fault` binaries
-  also live there; devmgr spawns them only on
-  `devmgr_labels::TEST_SPAWN_ORPHAN` and `TEST_SPAWN_FAULT_DRIVERS`
-  (gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only `devmgr.test` cap carries), so
-  a boot without svctest spawns neither. Every other binary there carries its declaration in
-  the ELF note section `.note.seraph.driver`; devmgr reads the declaration of each entry once
-  `SET_DRIVERS_DIR` arrives and binds the PCI devices still unbound: virtio-input,
+  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-fault` binary lives in
+  `/tests/drivers/`, which no boot-time pass reads; devmgr binds it only on
+  `devmgr_labels::BIND_DRIVERS` (gated on `BIND_AUTHORITY`, which only svctest's seed-only
+  `devmgr.bind` cap carries), so a boot without svctest binds none. Every binary there carries its
+  declaration in the ELF note section `.note.seraph.driver`; devmgr reads the declaration of each
+  entry once `SET_DRIVERS_DIR` arrives and binds the PCI devices still unbound: virtio-input,
   virtio-console, and test-dma, none of which is on the read-the-disk critical path, ship only
   there and are bound there. A device whose declaration takes its interrupt as optional
   and for which devmgr can give no wired line (for instance, its line lies outside the Interrupt
@@ -608,7 +607,6 @@ specified in [`docs/storage.md`](storage.md).
 [services/drivers/iommu/vtd/README.md](../services/drivers/iommu/vtd/README.md),
 [services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md),
 [services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md),
-[services/drivers/test-orphan/README.md](../services/drivers/test-orphan/README.md),
 [services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),
 [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md),
 [services/drivers/virtio/core/README.md](../services/drivers/virtio/core/README.md),

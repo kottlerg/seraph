@@ -14,7 +14,9 @@
 //! over every key the record carries ([`rank`]); two declarations equally
 //! specific are a conflict, and a declaration at its instance limit is passed
 //! over. devmgr walks its records in record order, so a driver's instance
-//! limit counts its devices in that order. [`grants`] applies the source
+//! limit counts its devices in that order, and a limited driver's devices are
+//! counted over the boot ([`BoundCounts`]), so a later pass binds it only to
+//! the devices its limit leaves. [`grants`] applies the source
 //! bounds to what a declaration asks for. The table knows no driver: it
 //! compares the keys a declaration carries against the keys a record carries.
 
@@ -23,7 +25,7 @@ extern crate alloc;
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
-use driver_binding::decl::{DriverDecl, MatchKey, Tier};
+use driver_binding::decl::{DriverDecl, DriverName, MatchKey, Tier};
 
 use crate::classes::Classes;
 
@@ -172,7 +174,8 @@ pub struct Candidate<T>
 {
     pub decl: DriverDecl,
     pub source: Source,
-    /// Devices the declaration is bound to so far.
+    /// Devices a driver of the declaration's name is bound to so far this
+    /// boot, by this pass and every earlier one.
     pub bound: u16,
     /// What devmgr starts the driver from (its boot module or its file).
     pub binary: T,
@@ -228,8 +231,9 @@ impl<T> MatchTable<T>
         }
     }
 
-    /// Add `decl`, from `source`, started from `binary`, bound to no device
-    /// yet; returns its index.
+    /// Add `decl`, from `source`, started from `binary`, a driver of its
+    /// name being bound to `bound` devices by the earlier passes of the boot
+    /// ([`BoundCounts::track`]); returns its index.
     ///
     /// # Errors
     /// Returns the allocation error when the table cannot grow.
@@ -238,13 +242,14 @@ impl<T> MatchTable<T>
         decl: DriverDecl,
         source: Source,
         binary: T,
+        bound: u16,
     ) -> Result<usize, TryReserveError>
     {
         self.candidates.try_reserve(1)?;
         self.candidates.push(Candidate {
             decl,
             source,
-            bound: 0,
+            bound,
             binary,
         });
         Ok(self.candidates.len() - 1)
@@ -320,6 +325,60 @@ impl<T> MatchTable<T>
     pub fn drain_binaries(&mut self) -> impl Iterator<Item = T> + '_
     {
         self.candidates.drain(..).map(|c| c.binary)
+    }
+}
+
+/// The devices each driver with an instance limit is bound to over the boot,
+/// by driver name, so the limit holds across bind passes: a pass's
+/// [`MatchTable`] starts each limited declaration at the count the earlier
+/// passes left. A driver with no limit is not tracked, so the table grows
+/// only with the limited drivers a boot considers.
+#[derive(Default)]
+pub struct BoundCounts
+{
+    counts: Vec<(DriverName, u16)>,
+}
+
+impl BoundCounts
+{
+    /// No driver bound.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self { counts: Vec::new() }
+    }
+
+    /// The devices a driver named `decl.name` is bound to so far, tracking
+    /// the name from here on when `decl` declares an instance limit; 0 for a
+    /// declaration with no limit, which [`MatchTable::choose`] does not
+    /// count against.
+    ///
+    /// # Errors
+    /// Returns the allocation error when a limited name is not yet tracked
+    /// and the table cannot grow.
+    pub fn track(&mut self, decl: &DriverDecl) -> Result<u16, TryReserveError>
+    {
+        if decl.instance_limit.is_none()
+        {
+            return Ok(0);
+        }
+        if let Some(&(_, bound)) = self.counts.iter().find(|(n, _)| *n == decl.name)
+        {
+            return Ok(bound);
+        }
+        self.counts.try_reserve(1)?;
+        self.counts.push((decl.name, 0));
+        Ok(0)
+    }
+
+    /// Count one more device bound to the driver named `name`; a name not
+    /// tracked (one with no instance limit) is ignored.
+    pub fn note(&mut self, name: &DriverName)
+    {
+        if let Some((_, bound)) = self.counts.iter_mut().find(|(n, _)| n == name)
+        {
+            *bound = bound.saturating_add(1);
+        }
     }
 }
 
@@ -466,6 +525,7 @@ mod tests
                 ),
                 Source::BootModule,
                 "generic",
+                0,
             )
             .unwrap();
         let exact = table
@@ -479,6 +539,7 @@ mod tests
                 ),
                 Source::BootModule,
                 "exact",
+                0,
             )
             .unwrap();
         assert_eq!(table.choose(&record), Choice::Bind(exact));
@@ -494,13 +555,13 @@ mod tests
         };
         let mut table = MatchTable::new();
         table
-            .add(decl(&[Match::Spcr(1)], None), Source::BootModule, ())
+            .add(decl(&[Match::Spcr(1)], None), Source::BootModule, (), 0)
             .unwrap();
         let a = table
-            .add(decl(&[id], None), Source::BootModule, ())
+            .add(decl(&[id], None), Source::BootModule, (), 0)
             .unwrap();
         let b = table
-            .add(decl(&[id], None), Source::DriversDir, ())
+            .add(decl(&[id], None), Source::DriversDir, (), 0)
             .unwrap();
         // A less specific declaration does not stand in for the conflict.
         table
@@ -514,6 +575,7 @@ mod tests
                 ),
                 Source::BootModule,
                 (),
+                0,
             )
             .unwrap();
         assert_eq!(table.choose(&record), Choice::Conflict(a, b));
@@ -538,6 +600,7 @@ mod tests
                 ),
                 Source::BootModule,
                 (),
+                0,
             )
             .unwrap();
         let fallback = table
@@ -551,6 +614,7 @@ mod tests
                 ),
                 Source::BootModule,
                 (),
+                0,
             )
             .unwrap();
         let mut chosen = Vec::new();
@@ -568,6 +632,61 @@ mod tests
     }
 
     #[test]
+    fn an_instance_limit_counts_the_devices_earlier_passes_bound()
+    {
+        let limited = decl(
+            &[Match::PciId {
+                vendor: 1,
+                device: 2,
+            }],
+            Some(1),
+        );
+        let mut counts = BoundCounts::new();
+        // The first pass binds the limited driver to one device.
+        let mut first = MatchTable::new();
+        let index = first
+            .add(
+                limited,
+                Source::DriversDir,
+                (),
+                counts.track(&limited).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(first.choose(&pci(1, 2, 0)), Choice::Bind(index));
+        first.note_bound(index);
+        counts.note(&limited.name);
+        // A later pass, from another source too, starts at that count and
+        // binds the driver to no second device.
+        let mut later = MatchTable::new();
+        later
+            .add(
+                limited,
+                Source::BootModule,
+                (),
+                counts.track(&limited).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(later.choose(&pci(1, 2, 0)), Choice::Unmatched);
+    }
+
+    #[test]
+    fn an_unlimited_declaration_is_not_tracked()
+    {
+        let unlimited = decl(
+            &[Match::PciId {
+                vendor: 1,
+                device: 2,
+            }],
+            None,
+        );
+        let mut counts = BoundCounts::new();
+        assert_eq!(counts.track(&unlimited).unwrap(), 0);
+        counts.note(&unlimited.name);
+        assert_eq!(counts.track(&unlimited).unwrap(), 0);
+        assert!(counts.counts.is_empty());
+    }
+
+    #[test]
     fn a_limited_declaration_with_nothing_else_leaves_the_rest_unmatched()
     {
         let mut table = MatchTable::new();
@@ -582,6 +701,7 @@ mod tests
                 ),
                 Source::DriversDir,
                 (),
+                0,
             )
             .unwrap();
         table.note_bound(only);

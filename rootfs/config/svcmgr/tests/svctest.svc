@@ -5,10 +5,9 @@
 # QUERY_ENDPOINT reaches them): rootfs.root is the FS-driver-agnostic
 # root-mount cap; pwrmgr.shutdown is the SHUTDOWN_AUTHORITY-tokened SEND;
 # devmgr.registry is the REGISTRY_QUERY_AUTHORITY SEND the devmgr deny
-# phases send the gated labels on; devmgr.test is the
-# REGISTRY_QUERY_AUTHORITY | TEST_LABEL_AUTHORITY SEND that drives
-# devmgr's test labels: the orphan-teardown phase's TEST_SPAWN_ORPHAN shim
-# and the drivers deny phase's TEST_QUERY_DENY_DEVICE (TODO(#165));
+# phases send the gated labels on; devmgr.bind is the
+# REGISTRY_QUERY_AUTHORITY | BIND_AUTHORITY SEND|GRANT the devmgr
+# on-demand bind phase sends BIND_DRIVERS on, with a cap on /tests/drivers;
 # vfsd.mount is the MOUNT_AUTHORITY SEND on vfsd's service endpoint the
 # vfsd phases drive MOUNT's rejection paths with, and vfsd.deny its
 # no-authority twin. The vfsd seeds ride in a second bootstrap round, so
@@ -18,6 +17,13 @@
 # logd_death_forward phase reads its dead child's retired slot through.
 # devmgr.class.serial and devmgr.class.input are the class SENDs the
 # drivers stray-cap phase and the devmgr ordinal phase query devices on.
+# devmgr.class.test-dma and devmgr.class.test-fault reach the test-only
+# fixtures, and devmgr.class.{serial,input,framebuffer}-deny are SENDs on
+# those classes whose only verb bit (58) no such driver checks, which the
+# drivers deny phase sends the gated labels on. Their class files live in
+# /config/devmgr/tests/, which svcmgr does not scan, and are copied into
+# /config/devmgr/classes/ with this recipe; the fixtures' devices are
+# attached by `cargo xtask run --test-devices`.
 # svctest resolves the public pwrmgr.deny no-auth twin itself via
 # QUERY_ENDPOINT. debug_authority = yes delivers procmgr's
 # DEBUG_AUTHORITY SEND|GRANT in the slot after the seeds, and svctest,
@@ -28,8 +34,9 @@
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT
 # scan. To enable in a boot, copy this file into
-# /config/svcmgr/services/ between `cargo xtask build` and
-# `cargo xtask run`. See docs/testing.md.
+# /config/svcmgr/services/, and the test class files above into
+# /config/devmgr/classes/, between `cargo xtask build` and
+# `cargo xtask run --test-devices`. See docs/testing.md.
 #
 # svctest runs at 10, in the fair class. Its band reaches 21, the floor of
 # the strict-priority class and svcmgr's own ceiling, so the
@@ -44,5 +51,5 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny
 debug_authority = yes

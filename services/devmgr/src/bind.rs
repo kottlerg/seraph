@@ -26,7 +26,9 @@
 use driver_binding::decl::{DriverDecl, InterruptNeed, Reset, Tier};
 use driver_binding::resources::{InterruptKind, Resource};
 use firmware::aml::CrsResource;
-use firmware::binding::{Candidate, Choice, MatchTable, PciIdentity, RecordKeys, Source};
+use firmware::binding::{
+    BoundCounts, Candidate, Choice, MatchTable, PciIdentity, RecordKeys, Source,
+};
 use firmware::dma::Confinement;
 use firmware::lines::{HoldError, LineError};
 use firmware::records::{PlatformRecord, PlatformRecords};
@@ -81,13 +83,15 @@ impl PciRecords
 }
 
 /// Every device record a bind pass walks, in record order: the PCI records,
-/// then the platform records ([`crate::platform`]), and which of them a
-/// driver has been started for.
+/// then the platform records ([`crate::platform`]), which of them a driver
+/// has been started for, and how many devices each driver with an instance
+/// limit has been started for over the boot.
 pub struct Records
 {
     pub pci: PciRecords,
     platform: PlatformRecords,
     platform_bound: Vec<bool>,
+    bound_counts: BoundCounts,
 }
 
 impl Records
@@ -105,6 +109,7 @@ impl Records
             pci,
             platform,
             platform_bound,
+            bound_counts: BoundCounts::new(),
         })
     }
 
@@ -269,7 +274,7 @@ pub fn drivers_dir_pass(
 /// driver is bound to; otherwise release `binary`.
 fn collect(
     table: &mut MatchTable<Binary>,
-    records: &Records,
+    records: &mut Records,
     decl: Option<&DriverDecl>,
     source: Source,
     binary: Binary,
@@ -282,7 +287,11 @@ fn collect(
         return;
     };
     let name = decl.name;
-    if table.add(decl, source, binary).is_err()
+    let added = records
+        .bound_counts
+        .track(&decl)
+        .and_then(|bound| table.add(decl, source, binary, bound));
+    if added.is_err()
     {
         std::os::seraph::log!(
             "{}: no memory to consider the driver; not bound",
@@ -306,7 +315,14 @@ fn bind_records(
     {
         return;
     }
-    bind_pci_records(&mut records.pci, table, carve, pass, ipc_buf);
+    bind_pci_records(
+        &mut records.pci,
+        &mut records.bound_counts,
+        table,
+        carve,
+        pass,
+        ipc_buf,
+    );
     let platform = records.platform.records();
     for (index, (record, bound)) in platform
         .iter()
@@ -344,6 +360,9 @@ fn bind_records(
                 {
                     *bound = true;
                     table.note_bound(chosen);
+                    records
+                        .bound_counts
+                        .note(&table.candidates()[chosen].decl.name);
                 }
             }
         }
@@ -353,6 +372,7 @@ fn bind_records(
 /// [`bind_records`] over the PCI records.
 fn bind_pci_records(
     records: &mut PciRecords,
+    bound_counts: &mut BoundCounts,
     table: &mut MatchTable<Binary>,
     carve: &mut Carve,
     pass: &mut Pass,
@@ -388,6 +408,7 @@ fn bind_pci_records(
                 {
                     *bound = true;
                     table.note_bound(index);
+                    bound_counts.note(&table.candidates()[index].decl.name);
                 }
             }
         }
@@ -878,7 +899,7 @@ fn carve_pci_device(
         );
         return None;
     }
-    let mut dev = PciDeviceCaps::empty(carve.caps.self_aspace, crate::iommu::requester_id(pci_dev));
+    let mut dev = PciDeviceCaps::empty(carve.caps.self_aspace);
     if carve_bars(name, pci_dev, carve.caps, &mut dev).is_none()
     {
         dev.release();
@@ -1079,10 +1100,14 @@ fn grant_dma(
         Some(i) => i.confine(name, pci_dev, dma_width).ok()?,
         None => (Confinement::Unconfined, Vec::new()),
     };
-    let grant = caps
-        .dma
-        .as_ref()
-        .and_then(|d| d.grant(device_badge, confinement, &reserved));
+    let grant = caps.dma.as_ref().and_then(|d| {
+        d.grant(
+            device_badge,
+            crate::iommu::requester_id(pci_dev),
+            confinement,
+            &reserved,
+        )
+    });
     if grant.is_none()
     {
         std::os::seraph::log!("{}: no DMA grant; not bound", name);
@@ -1220,9 +1245,6 @@ pub struct PciDeviceCaps
     config: FunctionConfig,
     reset: StopReset,
     pub device_badge: u64,
-    /// The function's requester ID (`iommu_labels::requester_id`), which
-    /// names it in the IOMMU's fault records.
-    pub requester_id: u64,
     /// The release token of the driver devmgr started for the device
     /// ([`spawn::HeldChild`]), on which alone procmgr releases the driver's
     /// held memory once the device is confirmed stopped; 0 for a driver
@@ -1234,7 +1256,7 @@ pub struct PciDeviceCaps
 impl PciDeviceCaps
 {
     /// Nothing carved yet.
-    fn empty(aspace: u64, requester_id: u64) -> Self
+    fn empty(aspace: u64) -> Self
     {
         Self {
             resources: [Resource::IoPort {
@@ -1247,7 +1269,6 @@ impl PciDeviceCaps
             config: FunctionConfig { cap: 0, aspace },
             reset: StopReset::None,
             device_badge: 0,
-            requester_id,
             release_token: 0,
         }
     }

@@ -11,23 +11,18 @@ not yet implemented.
 
 ## Status
 
-Implemented: every driver binary but the test-only `test-fault` and `test-orphan` fixtures
-carries its declaration (§ Driver Declarations); init forwards every boot module outside its
-bootstrap set to devmgr untagged; devmgr reads the declarations of the boot modules and of the
-drivers-directory entries, within § Declaration Bounds; it enumerates every kind of device
-record of § Device Records (PCI, the ACPI namespace, the SPCR, the boot framebuffer, a platform
-description table, the IOMMU family), matches the declarations against the records (§ Matching),
-binds each matched PCI and platform record through one path that delivers the resource list
-(§ Binding), and withdraws a bound driver in the order § Binding gives. The rest is design
-intent; not yet implemented:
+Implemented: every driver binary carries its declaration (§ Driver Declarations); init forwards
+every boot module outside its bootstrap set to devmgr untagged; devmgr reads the declarations of
+the boot modules and of the drivers-directory entries, within § Declaration Bounds; it
+enumerates every kind of device record of § Device Records (PCI, the ACPI namespace, the SPCR,
+the boot framebuffer, a platform description table, the IOMMU family), matches the declarations
+against the records (§ Matching), binds each matched PCI and platform record through one path
+that delivers the resource list (§ Binding), and withdraws a bound driver in the order
+§ Binding gives. The rest is design intent; not yet implemented:
 
 - the IOMMU driver's delivery: devmgr binds it by its family record but gives it its own
   bootstrap rounds rather than the resource list;
-- message-signaled vectors: a PCI function's driver is given its wired line only;
-- the retirement of the test-only labels and of `TEST_LABEL_AUTHORITY`, and the declarations of
-  the `test-fault` and `test-orphan` fixtures, which devmgr still starts on the simple-device
-  path only on those labels (§ Test Fixtures,
-  [#165](https://github.com/kottlerg/seraph/issues/165)).
+- message-signaled vectors: a PCI function's driver is given its wired line only.
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
 `MINT_CLASS_SEND`, the class files, and the boot-only mark.
@@ -230,8 +225,9 @@ Two declarations equally specific for one device are a conflict: devmgr logs it 
 neither.
 A driver's instance limit counts its devices in record order (PCI segment, bus, device,
 function; then the firmware's table order). A device no declaration matches stays recorded
-and unbound, and a later declaration (a driver installed afterwards, or a hotplug pass) can
-still match it.
+and unbound, and a later declaration (a driver installed afterwards, through `BIND_DRIVERS`, or
+a hotplug pass) can still match it. A limited driver's bound devices are counted over the boot
+by driver name, so a later pass binds it only to the devices its limit leaves.
 
 The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
 `IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process
@@ -255,7 +251,7 @@ devmgr is its only consumer, over `ipc::iommu_labels`; it serves no device class
 ## Binding
 
 `bind(device, driver)` is the one path that starts a driver, at boot, at `SET_DRIVERS_DIR`,
-and for a hot-added device:
+at `BIND_DRIVERS`, and for a hot-added device:
 
 1. Carve one capability per resource of the record the declaration needs: each `Mmio` from
    the apertures, each `IoPort` from devmgr's port capability, the interrupt capabilities the
@@ -267,16 +263,20 @@ and for a hot-added device:
 4. Deliver the capabilities over the bootstrap protocol as a self-describing resource list:
    each capability with its resource kind and its fields, then the service endpoint, the
    devmgr query capability, and the DMA capability. One delivery shape serves every driver
-   that binds to a PCI or platform record; the IOMMU driver takes its own bootstrap rounds, and
-   the test-only fixtures the simple-device rounds.
+   that binds to a PCI or platform record; the IOMMU driver takes its own bootstrap rounds.
 5. Record the driver in the pass's settle batch; the settle, the serving of ready drivers, and
    the withdrawal of the rest are unchanged
    ([responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
    § Responsibilities).
 
+`BIND_DRIVERS` (gated on `BIND_AUTHORITY`) carries a directory cap; devmgr replies at once and
+its control thread runs a drivers-directory pass over it against the records still unbound,
+under the declaration bounds of the `SET_DRIVERS_DIR` pass, and settles the drivers it binds
+within the production settle bound. A record is bound at most once a boot.
+
 Each bind pass is one settle batch: the IOMMU pass, the boot pass over boot-module drivers,
-the pass at `SET_DRIVERS_DIR`, and a hotplug pass. Withdrawing a driver runs three steps in
-order:
+the pass at `SET_DRIVERS_DIR`, one pass per `BIND_DRIVERS`, and a hotplug pass. Withdrawing a
+driver runs three steps in order:
 
 1. the DMA and Bus Master Enable steps that apply to every DMA-capable device;
 2. for a PCI function, setting the Interrupt Disable bit of its Command register through the
@@ -297,14 +297,16 @@ driver:
 
 - **Class file.** `/config/devmgr/classes/<name>.class`, in the `.svc` grammar
   ([service-definitions.md](../services/svcmgr/docs/service-definitions.md#grammar)), gives
-  the class's name, the client verb mask devmgr stamps on the SEND it hands out, and whether
-  the class is boot-only (§ Declaration Bounds).
+  the class's name (an optional `class = <name>` key; the file's stem when absent), the client
+  verb mask devmgr stamps on the SEND it hands out, and whether the class is boot-only
+  (§ Declaration Bounds).
 - **Publication.** For each class file, svcmgr sends devmgr `MINT_CLASS_SEND`, a label gated on
   `CLASS_AUTHORITY` that only svcmgr and init hold, and receives a class SEND: a SEND on
   devmgr's registry endpoint whose badge carries the class's slot and its verb mask. The
   request carries the verbs, the boot-only flag, and the class name (at most
   `MAX_CLASS_NAME_BYTES` = 32 bytes). svcmgr publishes the class SEND seed-only as
-  `devmgr.class.<name>` before it sends `SET_DRIVERS_DIR`, so devmgr knows which classes are
+  `devmgr.class.<stem>` (the file's stem, so a second file publishes a differently attenuated
+  SEND on one class) before it sends `SET_DRIVERS_DIR`, so devmgr knows which classes are
   boot-only before it reads any drivers-directory declaration. A service reaches a class only
   when its `.svc` `seed` line names that publication.
 - **Bootstrap.** The one class a bootstrap service needs before svcmgr runs is block, for
@@ -314,7 +316,7 @@ driver:
   through svcmgr's publications.
 - **Badge.** One generic badge layout (`devmgr_labels::class_badge`), defined once beside the
   registry protocol, carries the slot and the mask. No class has an authority bit of its own;
-  `TEST_LABEL_AUTHORITY` gates only the test labels.
+  `BIND_AUTHORITY` gates only `BIND_DRIVERS`.
 
 Every driver of a class is served under its class file's policy, so no declaration can widen
 access to its class, and a deployment that installs no class file for a class serves it to no
@@ -355,11 +357,15 @@ driver, which leaves a tombstone at its ordinal. The event sources are specified
 
 ## Test Fixtures
 
-No test-only spawn label survives the binding redesign: a fixture driver is bound through
-`bind(device, driver)` against a device the test launch attaches, like any driver, and a test
-reaches it through `QUERY_DEVICE` on the test class, whose class file only a test deployment
-installs. The fixtures and labels it retires are listed on
-[#165](https://github.com/kottlerg/seraph/issues/165).
+A fixture driver is bound through `bind(device, driver)` against a device the test launch
+attaches (`cargo xtask run --test-devices`), like any driver, and a test reaches it through
+`QUERY_DEVICE` on the test class, whose class file only a test deployment installs.
+
+- `test-dma` binds QEMU's `edu` device (PCI `1234:11e8`) in the `SET_DRIVERS_DIR` pass.
+- `test-fault` is installed in `/tests/drivers/`, which no boot-time pass reads, and binds the
+  QEMU `pci-testdev` functions (PCI `1b36:0005`) only through `BIND_DRIVERS`. Each instance takes
+  its role from its resource list: no BAR 2 serves, a 4 KiB BAR 2 never reports ready, and an
+  8 KiB BAR 2 fails its bootstrap so devmgr destroys it mid-bootstrap.
 
 ---
 

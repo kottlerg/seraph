@@ -318,8 +318,9 @@ fn parse_build_component(text: &str) -> Result<BuildComponent, String>
 // ── Run ───────────────────────────────────────────────────────────────────────
 
 // struct_excessive_bools: each bool is an independent command-line switch
-// (`--gdb`, `--headless`, `--verbose`, `--second-disk-shared-line`) that clap
-// maps one-to-one; they are not states of one machine.
+// (`--gdb`, `--headless`, `--verbose`, `--second-disk-shared-line`,
+// `--test-devices`) that clap maps one-to-one; they are not states of one
+// machine.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser)]
 pub struct RunArgs
@@ -410,6 +411,12 @@ pub struct RunArgs
     /// it; the stub is unstaged when QEMU exits. Requires `--debug-port`.
     #[arg(long, value_name = "NAME", requires = "debug_port")]
     pub debug_target: Option<String>,
+
+    /// Attach the test devices svctest's devmgr phases drive through the
+    /// test-only drivers: QEMU's `edu` device and four `pci-testdev`
+    /// functions. A svctest boot needs them (docs/testing.md § Gating).
+    #[arg(long)]
+    pub test_devices: bool,
 
     /// The shared host's launch rules (see xtask/README.md "Host launch
     /// rules").
@@ -717,6 +724,11 @@ pub const DEFAULT_PASS_REGEX: &str = "ALL TESTS PASSED";
 /// Default `run-parallel --fail-grace-secs`.
 pub const DEFAULT_FAIL_GRACE_SECS: u64 = 10;
 
+// struct_excessive_bools: each bool is an independent command-line switch
+// (`--debug-listen`, `--hold-on-hang`, `--second-disk-shared-line`,
+// `--test-devices`) that clap maps one-to-one; they are not states of one
+// machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser)]
 pub struct RunParallelArgs
 {
@@ -870,6 +882,11 @@ pub struct RunParallelArgs
     /// `--debug-port`.
     #[arg(long, value_name = "NAME", requires = "debug_port")]
     pub debug_target: Option<String>,
+
+    /// Attach the test devices; same semantics as `cargo xtask run
+    /// --test-devices`.
+    #[arg(long)]
+    pub test_devices: bool,
 
     /// The shared host's launch rules (see xtask/README.md "Host launch
     /// rules").

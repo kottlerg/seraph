@@ -250,11 +250,12 @@ fn mint_bootstrap_badge() -> Option<u64>
     }
 }
 
-/// The most resources one bound driver is delivered: every BAR of a PCI
-/// function and either its wired line or the most message-signaled vectors a
-/// declaration requests, one `Interrupt` resource each.
-pub const MAX_BOUND_RESOURCES: usize = driver_binding::resources::PCI_BAR_COUNT as usize
-    + driver_binding::decl::MAX_MSI_VECTORS as usize;
+/// The most resources one bound driver is delivered: every range of a PCI
+/// function's BARs (`driver_binding::resources::MAX_PCI_RANGES`) and either
+/// its wired line or the most message-signaled vectors a declaration
+/// requests, one `Interrupt` resource each.
+pub const MAX_BOUND_RESOURCES: usize =
+    driver_binding::resources::MAX_PCI_RANGES + driver_binding::decl::MAX_MSI_VECTORS as usize;
 
 /// What devmgr needs to start a driver it has bound to a device and deliver
 /// it the device's resource list (docs/driver-binding.md § Binding).
@@ -325,8 +326,12 @@ fn resource_round(resource: &Resource, copy: u64) -> Option<Round>
     match *resource
     {
         Resource::Mmio {
-            bar, phys, bytes, ..
-        } => Some(Round::mmio(copy, bar, phys, bytes)),
+            bar,
+            phys,
+            bytes,
+            offset,
+            ..
+        } => Some(Round::mmio_at(copy, bar, phys, bytes, offset)),
         Resource::IoPort { base, count, .. } => Some(Round::io_port(copy, base, count)),
         Resource::Interrupt {
             kind, vector, mode, ..

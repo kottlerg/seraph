@@ -10,7 +10,7 @@
 //!
 //! | `data[0]` | Caps | Further data words | Terminal |
 //! |---|---|---|---|
-//! | [`kind::MMIO`] | 1 `Mmio` cap | PCI BAR index or [`NO_BAR`], physical base, bytes (non-zero) | no |
+//! | [`kind::MMIO`] | 1 `Mmio` cap | PCI BAR index or [`NO_BAR`], physical base, bytes (non-zero), offset in the BAR (0 with [`NO_BAR`]) | no |
 //! | [`kind::IO_PORT`] | 1 `IoPort` cap | base port, port count (non-zero) | no |
 //! | [`kind::INTERRUPT`] | 1 to `MSG_CAP_SLOTS_MAX` `Interrupt` caps, one per vector | [`InterruptKind`], first vector, `SYS_IRQ_REGISTER` mode | no |
 //! | [`kind::END`] | the present endpoint slots | presence word of the slots ([`SLOT_SERVICE`], [`SLOT_DEVMGR_QUERY`], [`SLOT_DMA`]), packed by `ipc::bootstrap::pack_slots` | yes |
@@ -44,9 +44,14 @@ pub mod kind
 pub const NO_BAR: u64 = u64::MAX;
 /// PCI BARs a type-0 function has; a BAR index is below this.
 pub const PCI_BAR_COUNT: u8 = 6;
-/// Most resources one list carries: every BAR of a function, every vector a
-/// declaration may request, and an `IoPort` and a wired line beside them.
-pub const MAX_RESOURCES: usize = PCI_BAR_COUNT as usize + MAX_MSI_VECTORS as usize + 2;
+/// Most `Mmio` ranges a PCI function's BARs are delivered as: one per BAR,
+/// and two more, since each of the two page spans devmgr withholds from the
+/// driver (those holding the function's MSI-X table and its Pending Bit
+/// Array) splits at most one range in two.
+pub const MAX_PCI_RANGES: usize = PCI_BAR_COUNT as usize + 2;
+/// Most resources one list carries: every range of a PCI function's BARs and
+/// every vector a declaration may request.
+pub const MAX_RESOURCES: usize = MAX_PCI_RANGES + MAX_MSI_VECTORS as usize;
 
 /// End-round slot of the driver's service endpoint.
 pub const SLOT_SERVICE: usize = 0;
@@ -65,9 +70,9 @@ pub const END_SLOTS: usize = 3;
 
 const _: () = assert!(END_SLOTS <= MSG_CAP_SLOTS_MAX);
 
-/// Most data words a round carries, `data[0]` included: an `Mmio` or
-/// `Interrupt` round's four.
-const MAX_ROUND_WORDS: usize = 4;
+/// Most data words a round carries, `data[0]` included: an `Mmio` round's
+/// five.
+const MAX_ROUND_WORDS: usize = 5;
 
 /// An interrupt resource's kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,10 +107,15 @@ pub enum Resource
     Mmio
     {
         cap: u64,
-        /// The PCI BAR the range is, `None` for a range of no BAR.
+        /// The PCI BAR the range is part of, `None` for a range of no BAR.
         bar: Option<u8>,
         phys: u64,
         bytes: u64,
+        /// The range's offset from the start of its BAR; 0 for a range of no
+        /// BAR. A BAR is delivered as more than one range when devmgr withholds
+        /// pages of it from the driver (the pages holding the function's MSI-X
+        /// table and Pending Bit Array), each range at its own offset.
+        offset: u64,
     },
     IoPort
     {
@@ -181,12 +191,21 @@ impl Round
         round
     }
 
-    /// An `Mmio` round: `cap` covers `bytes` at `phys`, PCI BAR `bar`.
+    /// An `Mmio` round: `cap` covers `bytes` at `phys`, the whole of a
+    /// range of no BAR or the start of PCI BAR `bar`.
     #[must_use]
     pub fn mmio(cap: u64, bar: Option<u8>, phys: u64, bytes: u64) -> Self
     {
+        Self::mmio_at(cap, bar, phys, bytes, 0)
+    }
+
+    /// An `Mmio` round: `cap` covers `bytes` at `phys`, `offset` bytes into
+    /// PCI BAR `bar` (`offset` is 0 for a range of no BAR).
+    #[must_use]
+    pub fn mmio_at(cap: u64, bar: Option<u8>, phys: u64, bytes: u64, offset: u64) -> Self
+    {
         let bar = bar.map_or(NO_BAR, u64::from);
-        Self::new(&[cap], &[kind::MMIO, bar, phys, bytes], false)
+        Self::new(&[cap], &[kind::MMIO, bar, phys, bytes, offset], false)
     }
 
     /// An `IoPort` round: `cap` covers `count` ports from `base`.
@@ -354,7 +373,7 @@ impl ResourceList
                 });
                 Ok(true)
             }
-            (kind::MMIO, &[cap], &[_, bar, phys, bytes]) =>
+            (kind::MMIO, &[cap], &[_, bar, phys, bytes, offset]) =>
             {
                 let bar = match bar
                 {
@@ -366,7 +385,10 @@ impl ResourceList
                             .ok_or(bad)?,
                     ),
                 };
-                if bytes == 0 || phys.checked_add(bytes).is_none()
+                if bytes == 0
+                    || phys.checked_add(bytes).is_none()
+                    || offset.checked_add(bytes).is_none()
+                    || (bar.is_none() && offset != 0)
                 {
                     return Err(bad);
                 }
@@ -375,6 +397,7 @@ impl ResourceList
                     bar,
                     phys,
                     bytes,
+                    offset,
                 }])
             }
             (kind::IO_PORT, &[cap], &[_, base, count]) =>
@@ -661,6 +684,7 @@ mod tests
             Round::mmio(11, None, 0x1000_0000, 0x1000),
             Round::io_port(12, 0x3F8, 8),
             Round::interrupts(InterruptKind::Wired, 0, mode, &[13]).expect("one wired cap"),
+            Round::mmio_at(14, Some(4), 0xFE00_6000, 0x2000, 0x6000),
             Round::end(&Endpoints {
                 service: 20,
                 devmgr_query: 21,
@@ -675,13 +699,15 @@ mod tests
                     cap: 10,
                     bar: Some(4),
                     phys: 0xFE00_0000,
-                    bytes: 0x4000
+                    bytes: 0x4000,
+                    offset: 0
                 },
                 Resource::Mmio {
                     cap: 11,
                     bar: None,
                     phys: 0x1000_0000,
-                    bytes: 0x1000
+                    bytes: 0x1000,
+                    offset: 0
                 },
                 Resource::IoPort {
                     cap: 12,
@@ -693,6 +719,13 @@ mod tests
                     kind: InterruptKind::Wired,
                     vector: 0,
                     mode
+                },
+                Resource::Mmio {
+                    cap: 14,
+                    bar: Some(4),
+                    phys: 0xFE00_6000,
+                    bytes: 0x2000,
+                    offset: 0x6000
                 },
             ]
         );
@@ -706,7 +739,7 @@ mod tests
         );
         assert_eq!(
             list.caps().collect::<Vec<_>>(),
-            [10, 11, 12, 13, 20, 21, 22]
+            [10, 11, 12, 13, 14, 20, 21, 22]
         );
     }
 
@@ -764,13 +797,30 @@ mod tests
             (false, &[1], &[], ListError::Malformed(0)),
             (false, &[1], &[99, 0, 0, 1], ListError::UnknownKind(99)),
             // MMIO: two caps, a word short, BAR 6, no bytes, wrapping range,
-            // terminal.
-            (false, &[1, 2], &[m, 0, 0, 1], ListError::Malformed(m)),
-            (false, &[1], &[m, 0, 0], ListError::Malformed(m)),
-            (false, &[1], &[m, 6, 0, 1], ListError::Malformed(m)),
-            (false, &[1], &[m, 0, 0, 0], ListError::Malformed(m)),
-            (false, &[1], &[m, 0, u64::MAX, 2], ListError::Malformed(m)),
-            (true, &[1], &[m, 0, 0, 1], ListError::Malformed(m)),
+            // wrapping offset, an offset into no BAR, terminal.
+            (false, &[1, 2], &[m, 0, 0, 1, 0], ListError::Malformed(m)),
+            (false, &[1], &[m, 0, 0, 1], ListError::Malformed(m)),
+            (false, &[1], &[m, 6, 0, 1, 0], ListError::Malformed(m)),
+            (false, &[1], &[m, 0, 0, 0, 0], ListError::Malformed(m)),
+            (
+                false,
+                &[1],
+                &[m, 0, u64::MAX, 2, 0],
+                ListError::Malformed(m),
+            ),
+            (
+                false,
+                &[1],
+                &[m, 0, 0, 2, u64::MAX],
+                ListError::Malformed(m),
+            ),
+            (
+                false,
+                &[1],
+                &[m, NO_BAR, 0, 1, 0x1000],
+                ListError::Malformed(m),
+            ),
+            (true, &[1], &[m, 0, 0, 1, 0], ListError::Malformed(m)),
             // IoPort: no ports, past port 0xFFFF.
             (false, &[1], &[p, 0x3F8, 0], ListError::Malformed(p)),
             (false, &[1], &[p, 0xFFFF, 2], ListError::Malformed(p)),

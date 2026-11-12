@@ -192,7 +192,9 @@ pub fn parse(log: &str) -> Vec<Block>
         {
             Record::Begin { id, version } =>
             {
-                if !open.iter().any(|&i| blocks[i].id == id)
+                if !open
+                    .iter()
+                    .any(|&i| blocks.get(i).is_some_and(|b| b.id == id))
                 {
                     open.push(blocks.len());
                     blocks.push(Block {
@@ -205,11 +207,15 @@ pub fn parse(log: &str) -> Vec<Block>
             }
             Record::Field { id, key, value } =>
             {
-                if let Some(&i) = open.iter().find(|&&i| blocks[i].id == id)
+                let i = open
+                    .iter()
+                    .copied()
+                    .find(|&i| blocks.get(i).is_some_and(|b| b.id == id));
+                if let Some(block) = i.and_then(|i| blocks.get_mut(i))
                 {
                     // A line written again after a cancelled write, which
                     // may have landed, counts once.
-                    let fields = &mut blocks[i].fields;
+                    let fields = &mut block.fields;
                     if !fields.iter().any(|(k, v)| k == key && v == value)
                     {
                         fields.push((key.to_string(), value.to_string()));
@@ -218,10 +224,12 @@ pub fn parse(log: &str) -> Vec<Block>
             }
             Record::End { id, count } =>
             {
-                if let Some(pos) = open.iter().position(|&i| blocks[i].id == id)
+                let pos = open
+                    .iter()
+                    .position(|&i| blocks.get(i).is_some_and(|b| b.id == id));
+                if let Some(block) = pos.and_then(|pos| blocks.get_mut(open.remove(pos)))
                 {
-                    let i = open.remove(pos);
-                    blocks[i].end = Some(count);
+                    block.end = Some(count);
                 }
             }
         }
@@ -253,22 +261,22 @@ fn record_of(line: &str) -> Option<Record<'_>>
 {
     // The end and begin tags both begin with the field tag, so they are tried
     // first.
-    if let Some(at) = line.find(BEGIN_TAG)
+    if let Some((_, rest)) = line.split_once(BEGIN_TAG)
     {
-        let rest = line[at + BEGIN_TAG.len()..].trim();
+        let rest = rest.trim();
         let (id, rest) = id_word(rest)?;
         let version = rest.trim().strip_prefix("version=")?.parse().ok()?;
         return Some(Record::Begin { id, version });
     }
-    if let Some(at) = line.find(END_TAG)
+    if let Some((_, rest)) = line.split_once(END_TAG)
     {
-        let rest = line[at + END_TAG.len()..].trim();
+        let rest = rest.trim();
         let (id, rest) = id_word(rest)?;
         let count = rest.trim().strip_prefix("lines=")?.parse().ok()?;
         return Some(Record::End { id, count });
     }
-    let at = line.find(FIELD_TAG)?;
-    let rest = line[at + FIELD_TAG.len()..].strip_prefix(' ')?;
+    let (_, rest) = line.split_once(FIELD_TAG)?;
+    let rest = rest.strip_prefix(' ')?;
     let (id, rest) = id_word(rest)?;
     let (key, value) = rest.trim().split_once('=')?;
     if key.is_empty() || key.contains(' ')

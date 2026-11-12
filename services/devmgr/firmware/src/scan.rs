@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 
 use virtio_core::{
     VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_DEVICE_CFG, VIRTIO_PCI_CAP_ISR_CFG,
-    VIRTIO_PCI_CAP_NOTIFY_CFG, VirtioCapLocation, VirtioPciStartupInfo,
+    VIRTIO_PCI_CAP_NOTIFY_CFG, VirtioCapLocation, VirtioPciStartupInfo, structure_usable,
 };
 
 use crate::pci::{COMMAND, MAX_CAPABILITIES, io_bar_size, mmio_bar_size};
@@ -320,11 +320,15 @@ fn record_bar(dev: &mut PciDevice, bar_idx: u8, phys: u64, size: u64, is_mmio: b
 ///
 /// A device may present several structures of one type. Each type takes the
 /// first one in list order that lies wholly inside one of the device's MMIO
-/// BARs, the only BARs a driver maps (`VirtIO` 1.2 § 4.1.4.1: the driver
+/// BARs, the only BARs a driver maps, and that the `VirtIO` transport can use
+/// ([`virtio_core::structure_usable`]) (`VirtIO` 1.2 § 4.1.4.1: the driver
 /// SHOULD use the first instance of each type it can support, and MUST
 /// ignore one naming a reserved BAR index). A later structure of a type
-/// already located, an I/O-BAR structure, one naming no probed BAR, and one
-/// reaching past its BAR's end are skipped.
+/// already located, an I/O-BAR structure, one naming no probed BAR, one
+/// reaching past its BAR's end, and one the transport cannot use (a common
+/// structure shorter than [`virtio_core::COMMON_CFG_LEN`] or not 4-aligned,
+/// a notification structure whose offset or multiplier is odd, a
+/// device-configuration structure not 4-aligned) are skipped.
 fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
 {
     let (b, d, f) = (dev.bus, dev.dev, dev.func);
@@ -351,7 +355,16 @@ fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
                 length: cfg.read32(b, d, f, ptr + 12),
             };
             let ty = cfg.read8(b, d, f, ptr + 3);
-            let usable = fits_mmio_bar(dev, &loc);
+            // The notify capability carries notify_off_multiplier at +16.
+            let multiplier = if ty == VIRTIO_PCI_CAP_NOTIFY_CFG
+            {
+                cfg.read32(b, d, f, ptr + 16)
+            }
+            else
+            {
+                0
+            };
+            let usable = fits_mmio_bar(dev, &loc) && structure_usable(ty, &loc, multiplier);
             let info = &mut dev.virtio_info;
             let slot = match ty
             {
@@ -368,8 +381,7 @@ fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
                 *slot = loc;
                 if ty == VIRTIO_PCI_CAP_NOTIFY_CFG
                 {
-                    // The notify capability carries notify_off_multiplier at +16.
-                    info.notify_off_multiplier = cfg.read32(b, d, f, ptr + 16);
+                    info.notify_off_multiplier = multiplier;
                 }
             }
         }
@@ -712,6 +724,48 @@ mod tests
         assert_eq!(at(info.isr_cfg), (4, 0x1000, 4));
         assert_eq!(at(info.device_cfg), (4, 0x2000, 8));
         assert_eq!(info.notify_off_multiplier, 4);
+    }
+
+    #[test]
+    fn a_virtio_structure_the_transport_cannot_use_yields_to_a_later_one()
+    {
+        let space = FakeSpace::default();
+        let bdf = (0, 6, 0);
+        virtio_with_caps(
+            &space,
+            bdf,
+            &[
+                // Common configuration one byte short of the registers the
+                // transport addresses, then one at an offset not 4-aligned:
+                // both skipped for the full, aligned one.
+                (1, 4, 0, virtio_core::COMMON_CFG_LEN - 1),
+                (1, 4, 0x102, 0x38),
+                (1, 4, 0x200, 0x38),
+                // Notify at an odd offset, then one with an odd multiplier:
+                // both skipped for the third.
+                (2, 4, 0x3001, 0x100),
+                (2, 4, 0x3100, 0x100),
+                (2, 4, 0x3200, 0x100),
+                (3, 4, 0x1000, 4),
+                // Device configuration at an offset not 4-aligned: skipped
+                // for the next one.
+                (4, 4, 0x2002, 8),
+                (4, 4, 0x2100, 8),
+            ],
+        );
+        // The fifth structure (at 0x90) carries multiplier 3, the sixth
+        // (at 0xA4) 2.
+        space.set32(bdf, 0x90 + 16, 3);
+        space.set32(bdf, 0xA4 + 16, 2);
+        mmio_bar(&space, bdf, 4, 0xFEC2_0000);
+        let info = scan_all(&space, 0, 0)[0].virtio_info;
+        let at = |c: VirtioCapLocation| (c.bar, c.offset, c.length);
+        assert_eq!(at(info.common_cfg), (4, 0x200, 0x38));
+        assert_eq!(at(info.notify_cfg), (4, 0x3200, 0x100));
+        assert_eq!(info.notify_off_multiplier, 2);
+        assert_eq!(at(info.device_cfg), (4, 0x2100, 8));
+        // The structures kept make a layout the transport can use.
+        assert!(info.register_layout().is_some());
     }
 
     #[test]

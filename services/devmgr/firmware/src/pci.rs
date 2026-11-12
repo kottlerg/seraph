@@ -55,6 +55,16 @@ pub const COMMAND_MEMORY: u16 = 1 << 1;
 /// r3.0 § 6.2.2).
 pub const COMMAND_INTERRUPT_DISABLE: u16 = 1 << 10;
 
+/// The Command register value that turns on Memory Space Enable and keeps
+/// every other bit of `command`, Bus Master Enable included: the function
+/// then decodes its MMIO BARs, so devmgr can write an MSI-X table through
+/// one before the bind's Command write ([`command_for_bind`]).
+#[must_use]
+pub const fn command_with_memory(command: u16) -> u16
+{
+    command | COMMAND_MEMORY
+}
+
 /// The Command register value that turns on Memory Space Enable and Bus
 /// Master Enable and keeps every other bit of `command`: the function then
 /// decodes its MMIO BARs and issues DMA. devmgr writes it for a device the

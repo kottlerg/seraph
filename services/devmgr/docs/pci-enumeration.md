@@ -201,9 +201,10 @@ For each matched device, devmgr:
    [docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
    § Message-Signaled Interrupts, after the DMA grant of step 3: for MSI-X
    a minted `Interrupt` cap per vector, devmgr's own cap on the pages
-   holding the table, kept until the driver is withdrawn, each vector's
-   message written into its table entry, entry 0 onwards, and unmasked, and
-   MSI-X enabled with every other entry masked; for MSI one minted cap, its
+   holding the table, kept until the driver is withdrawn, Memory Space
+   Enable set so the table decodes, each vector's message written into its
+   table entry, entry 0 onwards, read back, and unmasked, and MSI-X enabled
+   with every other entry masked; for MSI one minted cap, its
    message, once checked to fit the capability, written into it and MSI
    enabled with one vector. On riscv64 behind the RISC-V IOMMU each
    target's interrupt file is then mapped into the device's domain

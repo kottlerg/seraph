@@ -2160,21 +2160,29 @@ impl FunctionConfig
     }
 
     /// Program the function's MSI-X capability `msix` through devmgr's cap on
-    /// its table's pages `table`, and enable it: set MSI-X Enable under
-    /// Function Mask ([`firmware::pci::msix_control_enable_masked`]); set
-    /// every entry's Mask Bit; write each of `messages` into its entry, the
-    /// first into entry 0 ([`firmware::pci::msix_entry_message`]), and clear
-    /// that entry's Mask Bit; then clear Function Mask. Each entry is masked
-    /// while its message is written, and every entry past `messages` stays
-    /// masked. The function signals nothing until Bus Master Enable is set.
-    /// Returns whether every step's mapping succeeded and every message fit
-    /// its entry; `false`, logged, when not, MSI-X then disabled again.
+    /// its table's pages `table`, and enable it: set Memory Space Enable
+    /// ([`firmware::pci::command_with_memory`]), so the table's BAR decodes,
+    /// and MSI-X Enable under Function Mask
+    /// ([`firmware::pci::msix_control_enable_masked`]); set every entry's
+    /// Mask Bit; write each of `messages` into its entry, the first into
+    /// entry 0 ([`firmware::pci::msix_entry_message`]), read it back, and
+    /// clear that entry's Mask Bit; then clear Function Mask. Each entry is
+    /// masked while its message is written, and every entry past `messages`
+    /// stays masked. The function signals nothing until Bus Master Enable is
+    /// set. Returns whether every step's mapping succeeded and every message
+    /// fit its entry and read back as written; `false`, logged, when not,
+    /// MSI-X then disabled again.
     fn enable_msix(&self, msix: Msix, table: &MsixTable, messages: &[Message]) -> bool
     {
         let control = msix.offset + firmware::pci::MESSAGE_CONTROL;
         let enabled = self.mapped("MSI-X", |va| {
             // SAFETY: `va` is the configuration page mapped for this closure.
             let regs = unsafe { ConfigRegs::new(va) };
+            // The table is written through its BAR, which the function
+            // decodes only under Memory Space Enable; the bind's Command
+            // write (`prepare_for_bind`) comes after, and the firmware
+            // may have left decoding off.
+            regs.update16(firmware::pci::COMMAND, firmware::pci::command_with_memory);
             regs.update16(control, firmware::pci::msix_control_enable_masked);
         });
         if enabled.is_none()
@@ -2225,6 +2233,15 @@ impl FunctionConfig
                     {
                         // SAFETY: see above.
                         unsafe { core::ptr::write_volatile(register(entry, field), value) };
+                        // A table that does not decode its writes reads back
+                        // otherwise (all ones), and its entry would carry no
+                        // message: the step fails and MSI-X is disabled.
+                        // SAFETY: see above.
+                        let read = unsafe { core::ptr::read_volatile(register(entry, field)) };
+                        if read != value
+                        {
+                            written = false;
+                        }
                     }
                     let at = register(entry, firmware::pci::MSIX_ENTRY_VECTOR_CONTROL);
                     // SAFETY: see above.

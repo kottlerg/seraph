@@ -510,9 +510,11 @@ IOMMU translates the device's writes, it then maps the interrupt file each targe
 device's domain (`MAP_MSI`, § IOMMU Discovery and Programming); on x86-64 VT-d does not translate a
 write to the interrupt range (below). For MSI devmgr writes the message into the function's MSI
 capability, unmasks its vector where the function masks per vector, and enables MSI with one vector.
-For MSI-X it carves a cap of its own on the pages holding the function's table, sets MSI-X Enable
-under Function Mask, masks every table entry, writes each vector's message into its entry, entry 0
-onwards, and unmasks that entry, then clears Function Mask; every other entry stays masked. devmgr
+For MSI-X it carves a cap of its own on the pages holding the function's table, sets Memory Space
+Enable (so the table's BAR decodes, whatever the firmware left) and MSI-X Enable under Function
+Mask, masks every table entry, writes each vector's message into its entry, entry 0 onwards, reads
+it back, and unmasks that entry, then clears Function Mask; every other entry stays masked. An entry
+that reads back otherwise fails the step. devmgr
 sets the function's Interrupt Disable in both cases. Each vector is one `Interrupt` resource, whose
 copy carries `RIGHTS_IRQ_NOTIFY` only and which the driver binds with `SYS_IRQ_REGISTER` in mode 0.
 A step that fails at the bind (a mint, a message that does not fit, an interrupt file, the table's

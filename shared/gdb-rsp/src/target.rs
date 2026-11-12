@@ -91,8 +91,8 @@ impl Arch
     {
         let regs = self.registers();
         let reg = regs.get(regnum)?;
-        let start: usize = regs[..regnum].iter().map(|r| r.bytes).sum();
-        Some(start..start + reg.bytes)
+        let start: usize = regs.get(..regnum)?.iter().map(|r| r.bytes).sum();
+        Some(start..start.checked_add(reg.bytes)?)
     }
 }
 

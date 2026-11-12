@@ -173,7 +173,7 @@ impl<const BYTES: usize> HistoryRing<BYTES>
             us,
             level,
             EntryKind::Text,
-            &line[..line.len().min(LINE_BUF_SIZE)],
+            line.get(..LINE_BUF_SIZE).unwrap_or(line),
         );
     }
 
@@ -193,8 +193,10 @@ impl<const BYTES: usize> HistoryRing<BYTES>
     /// Append one entry of at most [`ENTRY_MAX_BYTES`].
     fn push_entry(&mut self, badge: u64, us: u64, level: u64, kind: EntryKind, line: &[u8])
     {
-        let need = RECORD_HEADER_BYTES + line.len();
-        while BYTES - self.used < need
+        // At most `RECORD_HEADER_BYTES + ENTRY_MAX_BYTES`, which the const
+        // assert in `new` keeps within `BYTES`, so the sum cannot overflow.
+        let need = RECORD_HEADER_BYTES.saturating_add(line.len());
+        while BYTES.saturating_sub(self.used) < need
         {
             self.evict_oldest();
         }
@@ -212,10 +214,12 @@ impl<const BYTES: usize> HistoryRing<BYTES>
         }
         header[19] = kind.byte();
         self.write_at(self.tail, &header);
-        self.write_at((self.tail + RECORD_HEADER_BYTES) % BYTES, line);
-        self.tail = (self.tail + need) % BYTES;
-        self.used += need;
-        self.total += 1;
+        self.write_at(Self::wrap(self.tail, RECORD_HEADER_BYTES), line);
+        self.tail = Self::wrap(self.tail, need);
+        // The loop above left room for `need`, so `used` stays within
+        // `BYTES`; `total` is a `u64` entry count.
+        self.used = self.used.saturating_add(need);
+        self.total = self.total.saturating_add(1);
     }
 
     /// Read the entry at `cursor` into `out` and advance the cursor past it.
@@ -238,7 +242,10 @@ impl<const BYTES: usize> HistoryRing<BYTES>
             return None;
         }
         let (badge, us, level, kind, len) = self.header_at(cursor.off);
-        self.read_at((cursor.off + RECORD_HEADER_BYTES) % BYTES, &mut out[..len]);
+        // `header_at` caps `len` at `ENTRY_MAX_BYTES`, the length of `out`.
+        let dst = out.get_mut(..len).unwrap_or_default();
+        let len = dst.len();
+        self.read_at(Self::wrap(cursor.off, RECORD_HEADER_BYTES), dst);
         let line = HistoryEntry {
             seq: cursor.seq,
             badge,
@@ -247,8 +254,9 @@ impl<const BYTES: usize> HistoryRing<BYTES>
             kind,
             len,
         };
-        cursor.seq += 1;
-        cursor.off = (cursor.off + RECORD_HEADER_BYTES + len) % BYTES;
+        // `seq` is below `total` here, so it cannot wrap.
+        cursor.seq = cursor.seq.saturating_add(1);
+        cursor.off = Self::wrap(cursor.off, RECORD_HEADER_BYTES.saturating_add(len));
         Some(line)
     }
 
@@ -258,10 +266,12 @@ impl<const BYTES: usize> HistoryRing<BYTES>
     fn evict_oldest(&mut self)
     {
         let (_, _, _, _, len) = self.header_at(self.head);
-        let size = RECORD_HEADER_BYTES + len;
-        self.head = (self.head + size) % BYTES;
-        self.used -= size;
-        self.first_seq += 1;
+        // A live record's size is part of `used`, and `first_seq` is below
+        // `total` while a record is live, so neither saturates.
+        let size = RECORD_HEADER_BYTES.saturating_add(len);
+        self.head = Self::wrap(self.head, size);
+        self.used = self.used.saturating_sub(size);
+        self.first_seq = self.first_seq.saturating_add(1);
     }
 
     /// Decode the ring record header at `off`: badge, microseconds, level,
@@ -285,21 +295,39 @@ impl<const BYTES: usize> HistoryRing<BYTES>
         )
     }
 
+    /// The ring offset `by` bytes past `off`, for `off < BYTES` and
+    /// `by <= BYTES`: `(off + by) % BYTES`.
+    fn wrap(off: usize, by: usize) -> usize
+    {
+        let to_end = BYTES.saturating_sub(off);
+        if by < to_end
+        {
+            off.saturating_add(by)
+        }
+        else
+        {
+            by.saturating_sub(to_end)
+        }
+    }
+
     /// Copy `bytes` into the buffer from `off`, wrapping at the end.
     fn write_at(&mut self, off: usize, bytes: &[u8])
     {
-        let first = bytes.len().min(BYTES - off);
-        self.buf[off..off + first].copy_from_slice(&bytes[..first]);
-        self.buf[..bytes.len() - first].copy_from_slice(&bytes[first..]);
+        let (front, back) = self.buf.split_at_mut(off.min(BYTES));
+        for (dst, src) in back.iter_mut().chain(front.iter_mut()).zip(bytes)
+        {
+            *dst = *src;
+        }
     }
 
     /// Fill `out` from the buffer at `off`, wrapping at the end.
     fn read_at(&self, off: usize, out: &mut [u8])
     {
-        let first = out.len().min(BYTES - off);
-        out[..first].copy_from_slice(&self.buf[off..off + first]);
-        let rest = out.len() - first;
-        out[first..].copy_from_slice(&self.buf[..rest]);
+        let (front, back) = self.buf.split_at(off.min(BYTES));
+        for (dst, src) in out.iter_mut().zip(back.iter().chain(front))
+        {
+            *dst = *src;
+        }
     }
 }
 

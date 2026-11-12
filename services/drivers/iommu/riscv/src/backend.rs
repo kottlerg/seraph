@@ -456,6 +456,17 @@ impl Backend for Riscv
         mapped.map_err(table_error)
     }
 
+    /// The device's MSI write to the IMSIC file is translated as any other
+    /// write of it, through its first stage, so the file's page is mapped
+    /// there at its own address, read-write, since a first-stage entry
+    /// cannot allow writes without reads. `msiptp` stays Off, as the
+    /// specification requires while the second stage is Bare (README § MSI
+    /// confinement).
+    fn map_msi(&mut self, domain: &mut RiscvDomain, file: u64) -> Result<(), BackendError>
+    {
+        self.map(domain, file, file, PAGE, Access::ReadWrite)
+    }
+
     fn unmap(&mut self, domain: &mut RiscvDomain, iova: u64, len: u64) -> Result<(), BackendError>
     {
         // A failed unmap cleared the pages before the one it failed on, so

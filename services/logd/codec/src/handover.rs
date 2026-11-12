@@ -280,8 +280,10 @@ pub fn retry_within<T>(
 /// end of the message.
 fn clip_to_payload(bytes: &[u8], start_word: usize) -> &[u8]
 {
-    let room = MSG_DATA_WORDS_MAX.saturating_sub(start_word) * 8;
-    &bytes[..bytes.len().min(room)]
+    let room = MSG_DATA_WORDS_MAX
+        .saturating_sub(start_word)
+        .saturating_mul(8);
+    bytes.get(..room).unwrap_or(bytes)
 }
 
 /// `status` with an inline byte length packed into the label's upper bits
@@ -311,14 +313,14 @@ pub fn is_release_pending(label: u64) -> bool
 fn inline_bytes(reply: &IpcMessage, start_word: usize, declared_len: u64) -> Option<&[u8]>
 {
     let bytes = reply.data_bytes();
-    let start = start_word * 8;
+    let start = start_word.checked_mul(8)?;
     if start >= bytes.len()
     {
         return None;
     }
     let len = usize::try_from(declared_len).unwrap_or(usize::MAX);
     let end = start.saturating_add(len).min(bytes.len());
-    Some(&bytes[start..end])
+    bytes.get(start..end)
 }
 
 /// init-logd's record of slots whose display name changed after the handover
@@ -369,8 +371,8 @@ impl<const N: usize> NameResend<N>
     /// Take the lowest-indexed slot still to be sent again.
     pub fn take_next(&mut self) -> Option<usize>
     {
-        let slot = self.pending.iter().position(|&p| p)?;
-        self.pending[slot] = false;
+        let (slot, pending) = self.pending.iter_mut().enumerate().find(|(_, p)| **p)?;
+        *pending = false;
         Some(slot)
     }
 
@@ -381,7 +383,8 @@ impl<const N: usize> NameResend<N>
     {
         if self.pending.contains(&true) && self.deferrals < MAX_RELEASE_DEFERRALS
         {
-            self.deferrals += 1;
+            // Below `MAX_RELEASE_DEFERRALS` here, so the count cannot wrap.
+            self.deferrals = self.deferrals.saturating_add(1);
             RELEASE_PENDING
         }
         else
@@ -427,6 +430,19 @@ mod tests
             .word(3, declared_len)
             .bytes(LINE_BYTES_WORD, line)
             .build()
+    }
+
+    #[test]
+    fn inline_bytes_from_a_word_past_the_message_is_none()
+    {
+        let reply = encode_slot(0x1234, b"svctest");
+        assert_eq!(
+            inline_bytes(&reply, SLOT_NAME_WORD, 7),
+            Some(&b"svctest"[..])
+        );
+        assert_eq!(inline_bytes(&reply, MSG_DATA_WORDS_MAX, 8), None);
+        // A word index whose byte offset does not fit a `usize`.
+        assert_eq!(inline_bytes(&reply, usize::MAX, 8), None);
     }
 
     #[test]

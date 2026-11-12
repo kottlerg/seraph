@@ -329,6 +329,19 @@ until then it reaches nothing, as every function a unit translates does, and a d
 binds is never attached, so the firmware's own use of its ranges (an SMM handler's USB legacy
 emulation) stops when the driver reports ready.
 
+A device's message-signalled interrupt is a write to an interrupt address. On x86-64 VT-d does not
+translate a write to the interrupt range through a domain's tables (interrupt remapping governs
+it), so `iommu-vtd` refuses `MAP_MSI`. On riscv64 the write goes to a hart's IMSIC interrupt file
+and the RISC-V IOMMU translates it as any other DMA, so a confined device reaches only the files
+its domain maps: `MAP_MSI` maps one file's page at its own address, with no cap, for the domain's
+life, as `MAP_RESERVED` does a reserved range. devmgr is to map the file of each hart a device's
+interrupt targets sit on (design intent; not yet implemented, since devmgr gives no driver a
+message-signalled interrupt yet,
+[#325](https://github.com/kottlerg/seraph/issues/325)). Why the RISC-V IOMMU's MSI page tables
+stay off is specified in
+[services/drivers/iommu/riscv/README.md](../services/drivers/iommu/riscv/README.md#msi-confinement)
+§ MSI Confinement.
+
 When no unit is found, no IOMMU driver module was delivered, or the driver does not report ready
 within the settle bound, devmgr logs once that DMA runs unconfined and every device runs so. A
 driver that fails its own setup turns translation off again before it exits, so it leaves no device
@@ -404,8 +417,10 @@ derivation it revokes when it withdraws the driver (devmgr's
   with `InvalidArgument`. Through a bound object it rebinds that binding to the new notification.
   A binding past the bound is refused with `QuotaExceeded`.
 - **Deliver.** Each assertion masks the line, marks every binding as owing an acknowledgement,
-  signals every bound notification, and completes at the controller. A receiver whose device did
-  not assert reads its device's interrupt status and finds nothing. Every receiver on a line
+  signals every bound notification, and completes at the controller; an assertion the controller
+  forwarded before the mask took effect is delivered too, so a receiver can be signalled again
+  before it acknowledges. A receiver whose device did not assert reads its device's interrupt
+  status and finds nothing. Every receiver on a line
   devmgr may share MUST acknowledge each delivery promptly, whether or not it has a request in
   flight: the line stays masked until every binding has acknowledged, so a receiver that
   acknowledges only while it serves a request of its own holds the line masked for the others on

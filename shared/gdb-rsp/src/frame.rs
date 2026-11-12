@@ -13,7 +13,7 @@
 //! covers the escaped bytes. Outside a packet `+` acknowledges a packet, `-`
 //! asks for it again, and `0x03` interrupts the target.
 
-use crate::hex::{DIGITS, nibble};
+use crate::hex::{digit, nibble};
 use crate::{Error, PACKET_SIZE};
 
 /// The escape byte of binary data.
@@ -121,7 +121,8 @@ impl<const N: usize> PacketReader<N>
                         if let Some(slot) = self.buf.get_mut(self.len)
                         {
                             *slot = byte;
-                            self.len += 1;
+                            // `len` indexed a slot, so it is below `usize::MAX`.
+                            self.len = self.len.saturating_add(1);
                         }
                         else
                         {
@@ -227,20 +228,16 @@ impl AckMode
 /// - `Malformed`: `escaped` ends with an escape byte.
 pub fn unescaped_len(escaped: &[u8]) -> Result<usize, Error>
 {
-    let mut n = 0;
-    let mut i = 0;
-    while i < escaped.len()
+    let mut n = 0usize;
+    let mut bytes = escaped.iter();
+    while let Some(&b) = bytes.next()
     {
-        if escaped[i] == ESCAPE
+        if b == ESCAPE && bytes.next().is_none()
         {
-            i += 1;
-            if i == escaped.len()
-            {
-                return Err(Error::Malformed);
-            }
+            return Err(Error::Malformed);
         }
-        n += 1;
-        i += 1;
+        // At most one count per byte of `escaped`, so it cannot overflow.
+        n = n.saturating_add(1);
     }
     Ok(n)
 }
@@ -266,7 +263,8 @@ pub fn unescape(escaped: &[u8], out: &mut [u8]) -> Result<usize, Error>
             b
         };
         *out.get_mut(n).ok_or(Error::Overflow)? = value;
-        n += 1;
+        // `n` indexed a byte of `out`, so it is below `usize::MAX`.
+        n = n.saturating_add(1);
     }
     Ok(n)
 }
@@ -331,8 +329,8 @@ impl<'a> PacketWriter<'a>
     /// Append `value` as exactly two hex digits.
     pub fn hex_u8(&mut self, value: u8) -> &mut Self
     {
-        self.body(DIGITS[usize::from(value >> 4)]);
-        self.body(DIGITS[usize::from(value & 0xF)]);
+        self.body(digit(value >> 4));
+        self.body(digit(value));
         self
     }
 
@@ -340,12 +338,14 @@ impl<'a> PacketWriter<'a>
     /// zeros (`0` for zero).
     pub fn hex_u64(&mut self, value: u64) -> &mut Self
     {
-        let digits = (64 - value.leading_zeros()).div_ceil(4).max(1);
-        for i in (0..digits).rev()
+        // The index of the most significant nonzero nibble; 0 for zero.
+        let top = value.checked_ilog(16).unwrap_or(0);
+        for i in (0..=top).rev()
         {
-            // The mask keeps one nibble, so the index is below 16.
-            let nib = usize::try_from((value >> (i * 4)) & 0xF).unwrap_or(0);
-            self.body(DIGITS[nib]);
+            // `i << 2` is the nibble's bit offset, and the mask keeps one
+            // nibble, so the conversion cannot fail.
+            let nib = u8::try_from((value >> (i << 2)) & 0xF).unwrap_or(0);
+            self.body(digit(nib));
         }
         self
     }
@@ -354,8 +354,9 @@ impl<'a> PacketWriter<'a>
     /// each: GDB shows those registers as unavailable.
     pub fn unavailable(&mut self, count: usize) -> &mut Self
     {
-        for _ in 0..count * 2
+        for _ in 0..count
         {
+            self.body(b'x');
             self.body(b'x');
         }
         self
@@ -369,8 +370,8 @@ impl<'a> PacketWriter<'a>
     {
         let sum = self.sum;
         self.put(b'#');
-        self.put(DIGITS[usize::from(sum >> 4)]);
-        self.put(DIGITS[usize::from(sum & 0xF)]);
+        self.put(digit(sum >> 4));
+        self.put(digit(sum));
         if self.overflowed
         {
             return Err(Error::Overflow);
@@ -487,11 +488,13 @@ impl<'a> PacketWriter<'a>
     pub fn xfer_chunk(&mut self, document: &[u8], offset: u64, len: u64) -> &mut Self
     {
         let start = usize::try_from(offset).map_or(document.len(), |o| o.min(document.len()));
-        let rest = &document[start..];
+        // `start` is at most the document's length, so the empty fallback is
+        // never taken.
+        let rest = document.get(start..).unwrap_or_default();
         let take = usize::try_from(len).map_or(rest.len(), |l| l.min(rest.len()));
-        let more = take < rest.len();
-        self.bytes(if more { b"m" } else { b"l" })
-            .bytes(&rest[..take])
+        let (chunk, after) = rest.split_at_checked(take).unwrap_or((rest, &[]));
+        self.bytes(if after.is_empty() { b"l" } else { b"m" })
+            .bytes(chunk)
     }
 
     fn body(&mut self, byte: u8)
@@ -505,7 +508,8 @@ impl<'a> PacketWriter<'a>
         if let Some(slot) = self.out.get_mut(self.len)
         {
             *slot = byte;
-            self.len += 1;
+            // `len` indexed a byte of `out`, so it is below `usize::MAX`.
+            self.len = self.len.saturating_add(1);
         }
         else
         {

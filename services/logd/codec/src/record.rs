@@ -130,10 +130,13 @@ fn render_value(value: &[u8], out: &mut impl FnMut(u8))
 fn hex_escape(b: u8, out: &mut impl FnMut(u8))
 {
     const HEX: &[u8; 16] = b"0123456789abcdef";
+    // The masks keep one nibble, so each index is below 16 and the fallback
+    // is never taken.
+    let digit = |n: u8| HEX.get(usize::from(n & 0xF)).copied().unwrap_or(b'0');
     out(b'\\');
     out(b'x');
-    out(HEX[usize::from(b >> 4)]);
-    out(HEX[usize::from(b & 0xF)]);
+    out(digit(b >> 4));
+    out(digit(b));
 }
 
 /// `Display` of a record's rendered body. An invalid UTF-8 sequence in the
@@ -151,10 +154,11 @@ impl fmt::Display for Rendered<'_>
             if let Some(slot) = buf.get_mut(len)
             {
                 *slot = b;
-                len += 1;
+                // `len` indexed a byte of `buf`, so it is below its length.
+                len = len.saturating_add(1);
             }
         });
-        for chunk in buf[..len].utf8_chunks()
+        for chunk in buf.get(..len).unwrap_or_default().utf8_chunks()
         {
             f.write_str(chunk.valid())?;
             if !chunk.invalid().is_empty()
@@ -255,7 +259,7 @@ impl Iterator for ValueBytes<'_>
             {
                 let hi = hex_digit(*self.raw.first()?)?;
                 let lo = hex_digit(*self.raw.get(1)?)?;
-                self.raw = &self.raw[2..];
+                self.raw = self.raw.get(2..)?;
                 Some((hi << 4) | lo)
             }
             other => Some(other),
@@ -268,8 +272,8 @@ fn hex_digit(b: u8) -> Option<u8>
 {
     match b
     {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'0'..=b'9' => b.checked_sub(b'0'),
+        b'a'..=b'f' => b.checked_sub(b'a' - 10),
         _ => None,
     }
 }
@@ -289,30 +293,24 @@ impl<'a> Iterator for RenderedFields<'a>
         }
         let (value, rest) = if let Some(quoted) = after.strip_prefix('"')
         {
-            let Some(end) = closing_quote(quoted)
+            let Some((raw, rest)) =
+                closing_quote(quoted).and_then(|end| quoted.split_at_checked(end))
             else
             {
                 self.rest = "";
                 return None;
             };
             (
-                RenderedValue {
-                    raw: &quoted[..end],
-                    quoted: true,
-                },
-                &quoted[end + 1..],
+                RenderedValue { raw, quoted: true },
+                // `rest` starts with the closing quote.
+                rest.strip_prefix('"').unwrap_or(rest),
             )
         }
         else
         {
             let end = after.find(' ').unwrap_or(after.len());
-            (
-                RenderedValue {
-                    raw: &after[..end],
-                    quoted: false,
-                },
-                &after[end..],
-            )
+            let (raw, rest) = after.split_at_checked(end).unwrap_or((after, ""));
+            (RenderedValue { raw, quoted: false }, rest)
         };
         // A field ends at a space or at the end of the text.
         if !(rest.is_empty() || rest.starts_with(' '))
@@ -330,25 +328,25 @@ impl<'a> Iterator for RenderedFields<'a>
 /// escape the renderer does not write.
 fn closing_quote(quoted: &str) -> Option<usize>
 {
-    let bytes = quoted.as_bytes();
-    let mut i = 0;
-    while i < bytes.len()
+    let mut bytes = quoted.bytes().enumerate();
+    while let Some((i, b)) = bytes.next()
     {
-        match bytes[i]
+        match b
         {
             b'"' => return Some(i),
-            b'\\' => match bytes.get(i + 1)?
+            b'\\' => match bytes.next()?.1
             {
-                b'"' | b'\\' | b'n' | b'r' | b't' => i += 2,
+                b'"' | b'\\' | b'n' | b'r' | b't' =>
+                {}
                 b'x' =>
                 {
-                    hex_digit(*bytes.get(i + 2)?)?;
-                    hex_digit(*bytes.get(i + 3)?)?;
-                    i += 4;
+                    hex_digit(bytes.next()?.1)?;
+                    hex_digit(bytes.next()?.1)?;
                 }
                 _ => return None,
             },
-            _ => i += 1,
+            _ =>
+            {}
         }
     }
     None

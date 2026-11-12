@@ -14,6 +14,9 @@
 //! Driven by `services/svctest`'s `relro_write_phase`, which spawns this
 //! binary, waits for exit, and asserts the non-zero fault reason.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 static MESSAGE: &str = "resident of .data.rel.ro";
 
 fn main()

@@ -24,6 +24,8 @@
 //! Output goes to stdout only: the usertest orchestrator drains stdout to
 //! EOF before stderr, so unbounded stderr would deadlock against it.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // A per-program tester is test code, where unwrap and expect are permitted
 // (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait
 // must abort the tester, and the panic's non-zero exit is its FAIL verdict.
@@ -69,7 +71,7 @@ fn main()
 {
     let mut baseline: u64 = 0;
     let mut peak: u64 = 0;
-    for i in 0..ITERATIONS
+    for (i, done) in (1..=ITERATIONS).enumerate()
     {
         let token = i.to_string();
         let mut child = Command::new("/programs/pipestress")
@@ -103,14 +105,14 @@ fn main()
             fail(&format!("iteration {i}: output line missing"), &out);
         }
 
-        if i + 1 == WARMUP
+        if done == WARMUP
         {
             baseline = used_slots();
         }
-        if (i + 1) % 50 == 0
+        if done % 50 == 0
         {
             peak = peak.max(used_slots());
-            println!("[pipestress-tester] {} / {ITERATIONS} iterations", i + 1);
+            println!("[pipestress-tester] {done} / {ITERATIONS} iterations");
         }
     }
 

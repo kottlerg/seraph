@@ -18,6 +18,8 @@
 //!
 //! Driven by its per-program tester (`tester/`), which `usertest` runs.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // A test fixture, where unwrap and expect are permitted
 // (docs/coding-standards.md § Error Handling): a failed step must abort the
 // fixture, and the panic's non-zero exit is its FAIL verdict for the tester.
@@ -60,7 +62,9 @@ mod arch
     /// before the return address the call would push.
     pub fn entry_sp(sp: u64) -> u64
     {
-        (sp & !0xF) - 8
+        (sp & !0xF)
+            .checked_sub(8)
+            .expect("the worker's stack pointer leaves room for a return address")
     }
 }
 

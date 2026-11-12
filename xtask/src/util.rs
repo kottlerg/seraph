@@ -188,14 +188,21 @@ mod tests
     }
 
     #[test]
-    fn a_picked_port_is_free_and_differs_from_a_held_one()
+    fn a_picked_port_is_never_a_held_one()
     {
-        let first = debug_port_or_free(None).unwrap();
-        assert_ne!(first, 0);
-        // Held here, as a running boot's QEMU holds its port.
-        let held = std::net::TcpListener::bind(("127.0.0.1", first)).expect("the port is free");
-        let second = debug_port_or_free(None).unwrap();
-        assert_ne!(second, first);
+        // Held here for the whole test, as a running boot's QEMU holds its
+        // port. The test binds it itself, so no other process on the host
+        // can take it, and the test asserts nothing about a port it does
+        // not hold: the picked port can be taken by anyone once the picker
+        // closes its listener, the race `debug_port_or_free` states.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("binding port 0");
+        let held_port = held.local_addr().expect("the held port's address").port();
+        for _ in 0..32
+        {
+            let picked = debug_port_or_free(None).unwrap();
+            assert_ne!(picked, 0);
+            assert_ne!(picked, held_port);
+        }
         drop(held);
     }
 }

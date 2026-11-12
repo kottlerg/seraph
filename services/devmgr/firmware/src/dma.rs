@@ -28,8 +28,9 @@
 //! firmware-reserved ranges its domain maps at their own addresses
 //! ([`reserved_ranges`]), and holds the interrupt files its domain maps at
 //! their own addresses ([`DmaTable::hold_interrupt_file`]); no mapping's IOVA
-//! overlaps either. The table never
-//! reads or writes IOMMU state. See `docs/device-management.md` § DMA
+//! overlaps either, nor, for a device a VT-d unit confines, the interrupt
+//! address range ([`INTERRUPT_RANGE`]). The table never reads or writes IOMMU
+//! state. See `docs/device-management.md` § DMA
 //! Authorisation and § IOMMU Discovery and Programming.
 
 extern crate alloc;
@@ -67,6 +68,14 @@ pub const MAX_RESERVED_RANGES_PER_DEVICE: usize = 4;
 /// instead of reaching a mapping.
 pub const IOVA_BASE: u64 = 0x10_0000;
 
+/// The x86 interrupt address range, `0xFEE0_0000` to `0xFEEF_FFFF`. VT-d
+/// takes a device's write in it as an interrupt request and never translates
+/// it through the device's domain (Intel VT-d specification § 3.14), so a
+/// mapping there would be unreachable by the device's DMA; no mapping of a
+/// device whose confinement keeps this range out
+/// ([`Confinement::Domain`]'s `interrupt_range`) is given an IOVA in it.
+pub const INTERRUPT_RANGE: core::ops::Range<u64> = 0xFEE0_0000..0xFF00_0000;
+
 /// The end of the IOVA space devmgr allocates a confined device's mappings
 /// in: the smaller of what its unit translates (`unit_bits`, from the IOMMU
 /// driver's `QUERY_UNIT`) and what the device addresses (`device_bits`, the
@@ -88,13 +97,18 @@ pub enum Confinement
     /// frames' physical address.
     Unconfined,
     /// The IOMMU driver confines the device in the domain `handle`; devmgr
-    /// allocates its IOVAs in `[IOVA_BASE, limit)`.
+    /// allocates its IOVAs in `[IOVA_BASE, limit)`, outside
+    /// [`INTERRUPT_RANGE`] when `interrupt_range` is set.
     Domain
     {
         /// The domain handle the IOMMU driver's `ATTACH` returned.
         handle: u64,
         /// The end of the device's IOVA space ([`iova_limit`]).
         limit: u64,
+        /// Whether the device's unit takes its writes in
+        /// [`INTERRUPT_RANGE`] as interrupt requests, untranslated: set for
+        /// a VT-d unit.
+        interrupt_range: bool,
     },
 }
 
@@ -367,9 +381,10 @@ impl Device
     }
 
     /// The lowest page-aligned address in `[IOVA_BASE, limit)` where `len`
-    /// bytes overlap none of the device's mappings and none of its reserved
-    /// ranges.
-    fn free_iova(&self, len: u64, limit: u64) -> Option<u64>
+    /// bytes overlap none of the device's mappings, none of its reserved
+    /// ranges, and, when `interrupt_range` is set, no byte of
+    /// [`INTERRUPT_RANGE`].
+    fn free_iova(&self, len: u64, limit: u64, interrupt_range: bool) -> Option<u64>
     {
         let len = len.checked_next_multiple_of(PAGE_SIZE)?;
         let mut start = IOVA_BASE;
@@ -383,6 +398,12 @@ impl Device
             else if let Some(r) = self.reserved.iter().find(|r| r.overlaps(start, len))
             {
                 r.base + r.len
+            }
+            else if interrupt_range
+                && INTERRUPT_RANGE.start < start.saturating_add(len)
+                && start < INTERRUPT_RANGE.end
+            {
+                INTERRUPT_RANGE.end
             }
             else
             {
@@ -519,7 +540,9 @@ impl DmaTable
     /// the device `badge`, pending until [`Self::commit`] or
     /// [`Self::abort`], and return it with its device address: `phys`, the
     /// frames' physical address, for an unconfined device, and the lowest
-    /// free IOVA of the device's space for a confined one (`phys` unused).
+    /// free IOVA of the device's space for a confined one (`phys` unused),
+    /// outside its reserved ranges, held interrupt files, and, behind a VT-d
+    /// unit, [`INTERRUPT_RANGE`].
     ///
     /// # Errors
     /// [`MapError::UnknownDevice`] for an unregistered badge;
@@ -564,8 +587,12 @@ impl DmaTable
                 }
                 addr
             }
-            Confinement::Domain { limit, .. } => device
-                .free_iova(len, limit)
+            Confinement::Domain {
+                limit,
+                interrupt_range,
+                ..
+            } => device
+                .free_iova(len, limit, interrupt_range)
                 .ok_or(MapError::NoAddressSpace)?,
         };
         device
@@ -799,6 +826,7 @@ mod tests
     const DOMAIN: Confinement = Confinement::Domain {
         handle: 3,
         limit: IOVA_BASE + 4 * PAGE_SIZE,
+        interrupt_range: false,
     };
 
     fn table_with(badge: u64, confinement: Confinement) -> DmaTable
@@ -1215,6 +1243,41 @@ mod tests
             Err(MapError::UnknownDevice)
         );
     }
+
+    #[test]
+    fn a_device_behind_vtd_is_given_no_iova_in_the_interrupt_range()
+    {
+        let vtd = Confinement::Domain {
+            handle: 3,
+            limit: 1 << 32,
+            interrupt_range: true,
+        };
+        let below = INTERRUPT_RANGE.start - PAGE_SIZE;
+        for (confinement, two_pages, one_page) in [
+            // Two pages do not fit below the range, so they go past it, and
+            // the page below it, ending at its first byte, is given after.
+            (vtd, INTERRUPT_RANGE.end, below),
+            // A unit that translates the range gives it out as any other.
+            (DOMAIN_4G, below, below + 2 * PAGE_SIZE),
+        ]
+        {
+            let mut t = table_with(7, confinement);
+            // Fill the space up to one page below the range.
+            assert_eq!(map_iova(&mut t, 7, below - IOVA_BASE), Ok(IOVA_BASE));
+            assert_eq!(map_iova(&mut t, 7, 2 * PAGE_SIZE), Ok(two_pages));
+            assert_eq!(map_iova(&mut t, 7, PAGE_SIZE), Ok(one_page));
+        }
+        // A mapping that would straddle the range is placed past it.
+        let mut t = table_with(7, vtd);
+        map_iova(&mut t, 7, INTERRUPT_RANGE.start - 2 * PAGE_SIZE - IOVA_BASE).unwrap();
+        assert_eq!(map_iova(&mut t, 7, 4 * PAGE_SIZE), Ok(INTERRUPT_RANGE.end));
+    }
+
+    const DOMAIN_4G: Confinement = Confinement::Domain {
+        handle: 3,
+        limit: 1 << 32,
+        interrupt_range: false,
+    };
 
     #[test]
     fn the_iova_limit_is_the_smaller_of_the_unit_and_device_widths()

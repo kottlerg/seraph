@@ -60,9 +60,10 @@ pub fn keyboard_loop(input_cap: u64, tx: &Sender<Msg>)
             .unwrap_or(0)
             .min(keysym::INPUT_MAX_EVENTS_PER_READ);
         let mut bytes = Vec::new();
-        for i in 0..count
+        // The events ride words 1..=count, after the count in word 0.
+        for word in 1..=count
         {
-            let (ks, _mods, pressed) = keysym::unpack_event(reply.word(1 + i));
+            let (ks, _mods, pressed) = keysym::unpack_event(reply.word(word));
             // Act on key-down only; the matching release would double every key.
             if !pressed || is_modifier(ks)
             {
@@ -142,12 +143,12 @@ pub fn serial_loop(serial_cap: u64, tx: &Sender<Msg>)
             // over-read.
             let count = ((reply.label >> 16) & 0xFFFF) as usize;
             let bytes = reply.data_bytes();
-            let n = count.min(bytes.len());
-            if n == 0
+            let run = bytes.get(..count).unwrap_or(bytes);
+            if run.is_empty()
             {
                 break;
             }
-            if tx.send(Msg::Input(bytes[..n].to_vec())).is_err()
+            if tx.send(Msg::Input(run.to_vec())).is_err()
             {
                 return;
             }

@@ -883,7 +883,9 @@ fn size_warning(rendered: &str) -> Option<String>
     (rendered.len() > STATE_TEXT_MAX).then(|| {
         format!(
             "warning: the state is {} bytes, over the {STATE_TEXT_MAX} this command keeps to; \
-             remove finished workers (`orch worker <name> --remove`) and close settled questions",
+             remove finished workers (`orch worker <name> --remove`), close settled questions \
+             (`orch question close <id>`) and drop rulings no longer in force \
+             (`orch ruling drop <n>`)",
             rendered.len()
         )
     })
@@ -1519,6 +1521,8 @@ mod tests
         let warning = size_warning(&"x".repeat(STATE_TEXT_MAX + 1)).expect("a warning");
         assert!(warning.contains(&format!("{} bytes", STATE_TEXT_MAX + 1)));
         assert!(warning.contains("--remove"));
+        assert!(warning.contains("question close"));
+        assert!(warning.contains("ruling drop"));
     }
 
     #[test]

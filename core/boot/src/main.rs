@@ -10,6 +10,8 @@
 //! firmware table addresses, exits UEFI boot services, populates `BootInfo`,
 //! and jumps to the kernel entry point. See `core/boot/docs/boot-flow.md` for the step-by-step design.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 
@@ -102,6 +104,9 @@ const KERNEL_STACK_PAGES: usize = boot_protocol::layout::HANDOFF_STACK_BYTES / 4
 /// tables leave unmapped so an overflow of the stack faults instead of
 /// overwriting another allocation ([`handoff_stack_span`]).
 const HANDOFF_STACK_ALLOC_PAGES: usize = KERNEL_STACK_PAGES + 1;
+
+/// 64-bit words in the handoff stack ([`KERNEL_STACK_PAGES`] pages).
+const KERNEL_STACK_WORDS: usize = (KERNEL_STACK_PAGES * 4096) / core::mem::size_of::<u64>();
 
 /// Descriptors of growth the translated `MemoryMapEntry` array allows for
 /// above the firmware's descriptor count, which step 6 reads before its first
@@ -651,6 +656,13 @@ unsafe fn step3_load_kernel(ctx: &UefiContext) -> Result<KernelLoad, BootError>
 
 // ── Step 4: Parse bundle, pre-parse init ELF, collect modules ────────────────
 
+/// The `len` bytes of `bytes` from `start`, or `None` when the body ends past
+/// the end of `bytes` or its end overflows `usize`.
+fn bundle_body(bytes: &[u8], start: usize, len: usize) -> Option<&[u8]>
+{
+    bytes.get(start..start.checked_add(len)?)
+}
+
 /// Walk the bundle header, ELF-load the entry named [`bundle::INIT_ENTRY_NAME`]
 /// into a fresh set of segment pages, and expose every other entry as a
 /// [`BootModule`] referencing the bundle allocation in place.
@@ -721,12 +733,12 @@ unsafe fn step4_parse_bundle(
         let body_start = entry.offset as usize;
         // usize is 64-bit on every UEFI target Seraph supports, so the size cast is exact.
         #[allow(clippy::cast_possible_truncation)]
-        let body_end = body_start + entry.size as usize;
-        if body_end > bytes.len()
+        let body_len = entry.size as usize;
+        let Some(body) = bundle_body(bytes, body_start, body_len)
+        else
         {
             return Err(BootError::InvalidBundle("bundle body past file end"));
-        }
-        let body = &bytes[body_start..body_end];
+        };
 
         if name == bundle::INIT_ENTRY_NAME
         {
@@ -747,21 +759,28 @@ unsafe fn step4_parse_bundle(
         }
         else
         {
-            if count >= MAX_MODULES
+            let Some(slot) = modules.get_mut(count)
+            else
             {
                 return Err(BootError::InvalidBundle(
                     "bundle exceeds MAX_MODULES entries",
                 ));
-            }
-            modules[count] = BootModule {
+            };
+            let Some(physical_base) = bundle_load.phys.checked_add(entry.offset)
+            else
+            {
+                return Err(BootError::InvalidBundle("bundle body past file end"));
+            };
+            *slot = BootModule {
                 name: entry.name,
                 // Bundle bodies are page-aligned (per `bundle::BODY_ALIGNMENT`),
                 // so this physical base is a valid 4 KiB-aligned address inside
                 // the bundle UEFI allocation.
-                physical_base: bundle_load.phys + entry.offset,
+                physical_base,
                 size: entry.size,
             };
-            count += 1;
+            // `count` indexed a slot of `modules`, so it is far below `usize::MAX`.
+            count = count.saturating_add(1);
         }
     }
 
@@ -870,7 +889,11 @@ unsafe fn step5_discover_cpu_topology(
         {
             bprintln!("[--------] boot: CPU topology: no firmware tables, defaulting to 1");
         }
-        ids[0] = bsp_id;
+        // `allocate_cpu_ids` returns at least one slot.
+        if let Some(slot) = ids.first_mut()
+        {
+            *slot = bsp_id;
+        }
         1
     };
     Ok(CpuTopology {
@@ -896,14 +919,20 @@ unsafe fn allocate_cpu_ids(
     capacity: usize,
 ) -> Result<(&'static mut [u32], u64, usize), BootError>
 {
-    let pages = (capacity.max(1) * core::mem::size_of::<u32>()).div_ceil(4096);
+    let bytes = capacity
+        .max(1)
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(BootError::OutOfMemory)?;
+    let pages = bytes.div_ceil(4096);
     // SAFETY: bs is valid.
     let phys = unsafe { allocate_pages(bs, pages)? };
     // SAFETY: allocate_pages returned `pages` identity-mapped pages this
     // allocation owns and nothing else references; they hold `capacity` u32s,
     // zeroed before the slice is formed.
     let ids = unsafe {
-        core::ptr::write_bytes(phys as *mut u8, 0, pages * 4096);
+        // `pages` came from `bytes`, which fit in `usize`, so the page span below
+        // stays within the allocation.
+        core::ptr::write_bytes(phys as *mut u8, 0, pages.saturating_mul(4096));
         core::slice::from_raw_parts_mut(phys as *mut u32, capacity.max(1))
     };
     Ok((ids, phys, pages))
@@ -1015,26 +1044,35 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out:
     let mut dtb_seed = [0u8; 32];
     // SAFETY: firm.device_tree is 0 or an identity-mapped writable FDT.
     let n = unsafe { dtb::parse_rng_seed(firm.device_tree, &mut dtb_seed) };
-    // n ≤ 32 (dtb_seed length), so every cast below is exact.
+    // n ≤ 32 (dtb_seed length), so `drawn` is the first n bytes and every cast
+    // below is exact.
+    let drawn = dtb_seed.get(..n).unwrap_or_default();
+    let split = drawn.split_at_checked(16).filter(|_| drawn.len() >= 24);
     #[allow(clippy::cast_possible_truncation)]
-    if n >= 24
+    if let Some((key, pool)) = split
     {
         let mut kb = [0u8; 16];
-        kb.copy_from_slice(&dtb_seed[0..16]);
+        kb.copy_from_slice(key);
         out.kaslr = kaslr_words(&kb);
         scrub(&mut kb);
         out.kaslr_available = true;
         out.kaslr_source_flag = boot_protocol::KASLR_ENTROPY_DTB_SEED;
-        let pool_len = n - 16;
-        out.seed[..pool_len].copy_from_slice(&dtb_seed[16..n]);
-        out.len = pool_len as u32;
+        // The pool part is at most 16 bytes, which `out.seed` holds.
+        if let Some(dst) = out.seed.get_mut(..pool.len())
+        {
+            dst.copy_from_slice(pool);
+            out.len = pool.len() as u32;
+        }
     }
-    else if n > 0
+    else if !drawn.is_empty()
     {
         // Too short to split: feed the whole draw to the pool; KASLR uses
         // its deterministic fallback.
-        out.seed[..n].copy_from_slice(&dtb_seed[..n]);
-        out.len = n as u32;
+        if let Some(dst) = out.seed.get_mut(..drawn.len())
+        {
+            dst.copy_from_slice(drawn);
+            out.len = drawn.len() as u32;
+        }
     }
     // No source at all leaves `out` as the caller zeroed it.
     scrub(&mut dtb_seed);
@@ -1045,7 +1083,13 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out:
 fn kaslr_words(bytes: &[u8; 16]) -> [u64; 2]
 {
     let (chunks, _) = bytes.as_chunks::<8>();
-    [u64::from_le_bytes(chunks[0]), u64::from_le_bytes(chunks[1])]
+    // 16 bytes are exactly two chunks of 8.
+    let [lo, hi] = chunks
+    else
+    {
+        return [0u64; 2];
+    };
+    [u64::from_le_bytes(*lo), u64::from_le_bytes(*hi)]
 }
 
 /// Zero a secret that is never read again. Volatile so the stores survive
@@ -1235,20 +1279,33 @@ unsafe fn step6_allocate_and_build_page_tables(
     let (acpi_named, heuristic_capacity) = unsafe { acpi::count_aperture_seed(firm.acpi_rsdp) };
     // SAFETY: as above.
     let dtb_named = unsafe { dtb::count_aperture_seed(firm.device_tree) };
-    let seeds_capacity = acpi_named + dtb_named + usize::from(ctx.framebuffer.physical_base != 0);
+    // A count too large to size saturates, and the allocation below then fails.
+    let seeds_capacity = acpi_named
+        .saturating_add(dtb_named)
+        .saturating_add(usize::from(ctx.framebuffer.physical_base != 0));
     let seed_bytes = core::mem::size_of::<MmioAperture>();
-    let seeds_pages = (seeds_capacity * seed_bytes).div_ceil(4096).max(1);
+    let seeds_pages = seeds_capacity
+        .saturating_mul(seed_bytes)
+        .div_ceil(4096)
+        .max(1);
     // SAFETY: bs is valid.
     let seeds_phys = unsafe { allocate_pages(ctx.bs, seeds_pages)? };
-    let heuristic_pages = (heuristic_capacity * seed_bytes).div_ceil(4096).max(1);
+    let heuristic_pages = heuristic_capacity
+        .saturating_mul(seed_bytes)
+        .div_ceil(4096)
+        .max(1);
     // SAFETY: bs is valid.
     let heuristic_phys = unsafe { allocate_pages(ctx.bs, heuristic_pages)? };
     // MMIO aperture array, sized from the entry array's capacity (the bound
     // step 7 checks the map buffer against) and the seed counts
     // (memory_map::aperture_capacity).
-    let aperture_capacity =
-        aperture_array_capacity(mem_entries_pages, seeds_capacity + heuristic_capacity);
-    let apertures_pages = (aperture_capacity * core::mem::size_of::<MmioAperture>()).div_ceil(4096);
+    let aperture_capacity = aperture_array_capacity(
+        mem_entries_pages,
+        seeds_capacity.saturating_add(heuristic_capacity),
+    );
+    let apertures_pages = aperture_capacity
+        .saturating_mul(core::mem::size_of::<MmioAperture>())
+        .div_ceil(4096);
     // SAFETY: bs is valid.
     let apertures_phys = unsafe { allocate_pages(ctx.bs, apertures_pages)? };
     // Kernel handoff stack, above its guard page.
@@ -1262,9 +1319,8 @@ unsafe fn step6_allocate_and_build_page_tables(
     // page-aligned pages owned by this allocation, and [stack_phys, stack_top)
     // is the KERNEL_STACK_PAGES of them above the guard; nothing uses them yet.
     unsafe {
-        let words = (KERNEL_STACK_PAGES * 4096) / core::mem::size_of::<u64>();
         let p = stack_phys as *mut u64;
-        for i in 1..words
+        for i in 1..KERNEL_STACK_WORDS
         {
             p.add(i).write(boot_protocol::layout::STACK_PAINT);
         }
@@ -1308,9 +1364,13 @@ unsafe fn step6_allocate_and_build_page_tables(
         &mut identity_regions,
     );
 
+    // `collect_identity_regions` returns at most `MAX_IDENTITY_REGIONS`.
+    let identity_regions_filled = identity_regions
+        .get(..region_count)
+        .ok_or(BootError::OutOfMemory)?;
+
     bprintln!("[--------] boot: step 6/10: allocate and build page tables");
-    let mut page_table =
-        build_initial_tables(ctx.bs, &kernel.info, &identity_regions[0..region_count])?;
+    let mut page_table = build_initial_tables(ctx.bs, &kernel.info, identity_regions_filled)?;
     install_handoff_trampoline_mapping(&mut page_table)?;
 
     Ok((allocs, page_table))
@@ -1322,8 +1382,13 @@ unsafe fn step6_allocate_and_build_page_tables(
 /// the allocation's end and page-aligned.
 fn handoff_stack_span(alloc_phys: u64) -> (u64, u64)
 {
-    let base = alloc_phys + 4096;
-    (base, base + (KERNEL_STACK_PAGES as u64) * 4096)
+    // The allocation is `HANDOFF_STACK_ALLOC_PAGES` pages of real memory, so
+    // its end is far below `u64::MAX`.
+    let base = alloc_phys.saturating_add(4096);
+    (
+        base,
+        base.saturating_add((KERNEL_STACK_PAGES as u64).saturating_mul(4096)),
+    )
 }
 
 /// Fill `out` with all physical regions that must be identity-mapped so the
@@ -1344,17 +1409,19 @@ fn collect_identity_regions(
 {
     let mut n: usize = 0;
     let mut push = |phys: u64, size: u64| {
-        if n < MAX_IDENTITY_REGIONS
+        if let Some(slot) = out.get_mut(n)
         {
-            out[n] = (phys, size);
-            n += 1;
+            *slot = (phys, size);
+            // `n` indexed a slot of `out`, so it is far below `usize::MAX`.
+            n = n.saturating_add(1);
         }
     };
 
     // Kernel ELF segments.
-    for seg in &kernel.info.segments[..kernel.info.segment_count]
+    for seg in kernel.info.segments.iter().take(kernel.info.segment_count)
     {
-        push(seg.phys_base, (seg.size + 4095) & !4095);
+        // A size too large to round up saturates, which the page builder refuses.
+        push(seg.phys_base, seg.size.saturating_add(4095) & !4095);
     }
     // Fixed boot allocations.
     for (phys, size) in allocation_regions(allocs)
@@ -1365,18 +1432,26 @@ fn collect_identity_regions(
     // produced by `load_init` against the bundle slice for the `init` entry.
     // `phys_addr` carries the `p_vaddr` in-page offset; `build_initial_tables`
     // maps every page the byte range touches.
-    for seg in &init.image.segments[..init.image.segment_count as usize]
+    for seg in init
+        .image
+        .segments
+        .iter()
+        .take(init.image.segment_count as usize)
     {
         push(seg.phys_addr, seg.size);
     }
     // Bundle blob: one allocation covers every module body and the init
     // ELF source bytes. Map once.
-    push(bundle.phys, (bundle.pages as u64) * 4096);
+    push(bundle.phys, (bundle.pages as u64).saturating_mul(4096));
     // Framebuffer (if present).
     if framebuffer.physical_base != 0
     {
-        let fb_size = u64::from(framebuffer.stride) * u64::from(framebuffer.height);
-        push(framebuffer.physical_base, (fb_size + 4095) & !4095);
+        // Two `u32` factors widened to `u64`, so the product fits.
+        let fb_size = u64::from(framebuffer.stride).saturating_mul(u64::from(framebuffer.height));
+        push(
+            framebuffer.physical_base,
+            fb_size.saturating_add(4095) & !4095,
+        );
     }
     // RISC-V MMIO UART (no-op on x86-64 where uart_base == 0).
     if uart_base != 0
@@ -1384,6 +1459,13 @@ fn collect_identity_regions(
         push(uart_base, 4096);
     }
     n
+}
+
+/// Bytes in `pages` 4 KiB pages; a count too large to size saturates, which the
+/// page builder refuses.
+fn pages_to_bytes(pages: usize) -> u64
+{
+    (pages as u64).saturating_mul(4096)
 }
 
 /// The identity-map regions of the fixed boot allocations: the `BootInfo`
@@ -1399,15 +1481,15 @@ fn allocation_regions(allocs: &BootAllocations) -> [(u64, u64); 7]
         (allocs.modules_phys, 4096),
         (
             allocs.mem_entries_phys,
-            (allocs.mem_entries_pages as u64) * 4096,
+            pages_to_bytes(allocs.mem_entries_pages),
         ),
-        (allocs.stack_phys, (KERNEL_STACK_PAGES as u64) * 4096),
+        (allocs.stack_phys, pages_to_bytes(KERNEL_STACK_PAGES)),
         (
             allocs.apertures_phys,
-            (allocs.apertures_pages as u64) * 4096,
+            pages_to_bytes(allocs.apertures_pages),
         ),
         (allocs.reclaim_array_phys, 4096),
-        (allocs.cpu_ids_phys, (allocs.cpu_ids_pages as u64) * 4096),
+        (allocs.cpu_ids_phys, pages_to_bytes(allocs.cpu_ids_pages)),
     ]
 }
 
@@ -1446,11 +1528,9 @@ fn map_trampoline_page(
     flags: paging::PageFlags,
 ) -> Result<(), BootError>
 {
-    page_table.map(phys, phys, 4096, flags).map_err(|e| match e
-    {
-        paging::MapError::OutOfMemory => BootError::OutOfMemory,
-        paging::MapError::WxViolation => BootError::WxViolation,
-    })
+    page_table
+        .map(phys, phys, 4096, flags)
+        .map_err(paging::map_err)
 }
 
 // ── Step 7: Query final memory map ───────────────────────────────────────────
@@ -1473,7 +1553,14 @@ unsafe fn step7_query_memory_map(ctx: &UefiContext) -> Result<uefi::MemoryMapRes
 /// ([`map_buffer_fits`]), and step 9 translates into.
 const fn entry_array_capacity(pages: usize) -> usize
 {
-    pages * 4096 / core::mem::size_of::<MemoryMapEntry>()
+    match pages
+        .saturating_mul(4096)
+        .checked_div(core::mem::size_of::<MemoryMapEntry>())
+    {
+        Some(capacity) => capacity,
+        // `MemoryMapEntry` is not zero-sized.
+        None => 0,
+    }
 }
 
 /// Pages of the `MemoryMapEntry` array for a map of `descriptors` descriptors
@@ -1482,11 +1569,14 @@ const fn entry_array_capacity(pages: usize) -> usize
 /// ([`uefi::map_buffer_descriptor_reach`] of [`uefi::map_buffer_bytes`]).
 fn entry_array_pages(descriptors: usize, slack: usize, stride: usize) -> usize
 {
+    // A map too large to size saturates, and the allocation of its array fails.
     let reach = uefi::map_buffer_descriptor_reach(uefi::map_buffer_bytes(
-        (descriptors + slack) * stride,
+        descriptors.saturating_add(slack).saturating_mul(stride),
         stride,
     ));
-    (reach * core::mem::size_of::<MemoryMapEntry>()).div_ceil(4096)
+    reach
+        .saturating_mul(core::mem::size_of::<MemoryMapEntry>())
+        .div_ceil(4096)
 }
 
 /// Apertures the `MmioAperture` array step 6 allocates holds, for an entry
@@ -1599,8 +1689,10 @@ unsafe fn steps6_and_7_sized_to_the_map(
         // SAFETY: bs is valid pre-exit; the spans are the allocations steps 6
         // and 7 just made, which nothing else references.
         unsafe { release_step6_and_7(ctx, &allocs, &page_table, &uefi_map)? };
-        slack *= 2;
-        attempt += 1;
+        // `attempt` is below `MEM_MAP_ATTEMPTS` here, so neither overflows in a
+        // few doublings of `MEM_MAP_SLACK_ENTRIES`.
+        slack = slack.saturating_mul(2);
+        attempt = attempt.saturating_add(1);
     }
 }
 
@@ -1646,7 +1738,10 @@ fn step6_and_7_spans(
         (allocs.apertures_phys, allocs.apertures_pages),
         (allocs.seeds_phys, allocs.seeds_pages),
         (allocs.heuristic_phys, allocs.heuristic_pages),
-        (allocs.stack_phys - 4096, HANDOFF_STACK_ALLOC_PAGES),
+        (
+            allocs.stack_phys.saturating_sub(4096),
+            HANDOFF_STACK_ALLOC_PAGES,
+        ),
         (allocs.reclaim_array_phys, 1),
         (pool.0, pool_pages),
         (map_buffer.0, map_buffer.1.div_ceil(4096)),
@@ -1775,11 +1870,15 @@ unsafe fn step9_populate_boot_info(
     // firmware's tables and owned by the bootloader, with room for their
     // capacities; they are zeroed before the slices are formed.
     let (aperture_seed, heuristic_seed): (&mut [MmioAperture], &mut [MmioAperture]) = unsafe {
-        core::ptr::write_bytes(allocs.seeds_phys as *mut u8, 0, allocs.seeds_pages * 4096);
+        core::ptr::write_bytes(
+            allocs.seeds_phys as *mut u8,
+            0,
+            allocs.seeds_pages.saturating_mul(4096),
+        );
         core::ptr::write_bytes(
             allocs.heuristic_phys as *mut u8,
             0,
-            allocs.heuristic_pages * 4096,
+            allocs.heuristic_pages.saturating_mul(4096),
         );
         (
             core::slice::from_raw_parts_mut(
@@ -1795,9 +1894,11 @@ unsafe fn step9_populate_boot_info(
     // SAFETY: acpi_rsdp is zero or identity-mapped; parse_aperture_seed validates.
     let (mut seed_count, heuristic_count) =
         unsafe { acpi::parse_aperture_seed(firm.acpi_rsdp, aperture_seed, heuristic_seed) };
+    // `seed_count` is at most the seed buffer's length; past it the DTB seeder gets none.
+    let dtb_room = aperture_seed.get_mut(seed_count..).unwrap_or_default();
     // SAFETY: device_tree is zero or identity-mapped; parse_aperture_seed validates.
-    seed_count +=
-        unsafe { dtb::parse_aperture_seed(firm.device_tree, &mut aperture_seed[seed_count..]) };
+    let dtb_seeds = unsafe { dtb::parse_aperture_seed(firm.device_tree, dtb_room) };
+    seed_count = seed_count.saturating_add(dtb_seeds);
     // GOP linear framebuffer: UEFI typically reports it as
     // `EfiReservedMemoryType` rather than `EfiMemoryMappedIO`, so
     // `derive_mmio_apertures` cannot recover it from the UEFI map alone.
@@ -1807,17 +1908,22 @@ unsafe fn step9_populate_boot_info(
     // through to userspace.
     if framebuffer.physical_base != 0
     {
-        if seed_count < aperture_seed.len()
+        if let Some(slot) = aperture_seed.get_mut(seed_count)
         {
-            let base_aligned = framebuffer.physical_base & !0xFFF;
-            let span = framebuffer.physical_base
-                + u64::from(framebuffer.stride) * u64::from(framebuffer.height);
-            let end_aligned = (span + 0xFFF) & !0xFFF;
-            aperture_seed[seed_count] = MmioAperture {
-                phys_base: base_aligned,
-                size: end_aligned - base_aligned,
-            };
-            seed_count += 1;
+            if let Some(aperture) = framebuffer_aperture(framebuffer)
+            {
+                *slot = aperture;
+                // `seed_count` indexed a slot of `aperture_seed`, so it is far
+                // below `usize::MAX`.
+                seed_count = seed_count.saturating_add(1);
+            }
+            else
+            {
+                bprintln!(
+                    "[--------] boot: MMIO apertures: framebuffer span out of range; \
+                     framebuffer seed dropped"
+                );
+            }
         }
         else
         {
@@ -1834,7 +1940,7 @@ unsafe fn step9_populate_boot_info(
         core::ptr::write_bytes(
             allocs.apertures_phys as *mut u8,
             0,
-            allocs.apertures_pages * 4096,
+            allocs.apertures_pages.saturating_mul(4096),
         );
         core::slice::from_raw_parts_mut(
             allocs.apertures_phys as *mut MmioAperture,
@@ -1845,8 +1951,8 @@ unsafe fn step9_populate_boot_info(
     let aperture_count = unsafe {
         memory_map::derive_mmio_apertures(
             uefi_map,
-            &aperture_seed[..seed_count],
-            &heuristic_seed[..heuristic_count],
+            aperture_seed.get(..seed_count).unwrap_or_default(),
+            heuristic_seed.get(..heuristic_count).unwrap_or_default(),
             apertures_buf,
         )
     };
@@ -1933,16 +2039,22 @@ unsafe fn step9_populate_boot_info(
     //
     // Module bodies are minted separately and are skipped here
     // (core/boot/docs/boot-flow.md § Step 9: Populate BootInfo, `reclaim_ranges`).
-    let bundle_end = bundle.phys + (bundle.pages as u64) * 4096;
+    let bundle_end = bundle
+        .phys
+        .saturating_add((bundle.pages as u64).saturating_mul(4096));
     let mut bundle_cursor = bundle.phys;
-    for module in &mods.modules[..mods.count]
+    for module in mods.modules.iter().take(mods.count)
     {
         // Bundle bodies are 4 KiB-aligned per `bundle::BODY_ALIGNMENT`,
         // already enforced (release-mode) by `bundle::parse_header`'s
         // `EntryMisaligned` check. Only the cursor-ordering invariant
         // needs an explicit debug guard.
         let module_base = module.physical_base;
-        let module_end = (module.physical_base + module.size + 0xFFF) & !0xFFF;
+        let module_end = module
+            .physical_base
+            .saturating_add(module.size)
+            .saturating_add(0xFFF)
+            & !0xFFF;
         debug_assert!(
             bundle_cursor <= module_base,
             "bundle modules not in ascending offset order",
@@ -1952,7 +2064,7 @@ unsafe fn step9_populate_boot_info(
             // The gap lies inside the bundle allocation, and no UEFI allocation
             // reaches u32::MAX pages (16 TiB), so the cast is exact.
             #[allow(clippy::cast_possible_truncation)]
-            let gap_pages = ((module_base - bundle_cursor) / 4096) as u32;
+            let gap_pages = (module_base.saturating_sub(bundle_cursor) / 4096) as u32;
             push_reclaim(bundle_cursor, gap_pages, 0)?;
         }
         bundle_cursor = module_end;
@@ -1961,7 +2073,7 @@ unsafe fn step9_populate_boot_info(
     {
         // The tail lies inside the bundle allocation (see the gap cast above).
         #[allow(clippy::cast_possible_truncation)]
-        let tail_pages = ((bundle_end - bundle_cursor) / 4096) as u32;
+        let tail_pages = (bundle_end.saturating_sub(bundle_cursor) / 4096) as u32;
         push_reclaim(bundle_cursor, tail_pages, 0)?;
     }
     // CPU-id pages: the kernel reads them through Phase 8 (SMP bringup), before
@@ -2097,6 +2209,21 @@ unsafe fn step9_populate_boot_info(
     Ok(())
 }
 
+/// The page-aligned MMIO aperture covering the framebuffer, or `None` when its
+/// span runs past the end of the address space.
+fn framebuffer_aperture(framebuffer: &FramebufferInfo) -> Option<MmioAperture>
+{
+    let base_aligned = framebuffer.physical_base & !0xFFF;
+    // Two `u32` factors widened to `u64`, so the product fits.
+    let len = u64::from(framebuffer.stride).saturating_mul(u64::from(framebuffer.height));
+    let span = framebuffer.physical_base.checked_add(len)?;
+    let end_aligned = span.checked_add(0xFFF)? & !0xFFF;
+    Some(MmioAperture {
+        phys_base: base_aligned,
+        size: end_aligned.checked_sub(base_aligned)?,
+    })
+}
+
 /// Append `range` to `ranges[..*len]`, skipping an empty range.
 ///
 /// # Errors
@@ -2113,12 +2240,14 @@ fn push_reclaim_range(
     {
         return Ok(());
     }
-    if *len >= ranges.len()
+    let Some(slot) = ranges.get_mut(*len)
+    else
     {
         return Err(BootError::ReclaimRangesOverflow);
-    }
-    ranges[*len] = range;
-    *len += 1;
+    };
+    *slot = range;
+    // `*len` indexed a slot of `ranges`, so it is far below `usize::MAX`.
+    *len = len.saturating_add(1);
     Ok(())
 }
 
@@ -2159,9 +2288,10 @@ mod tests
     use super::{
         BootAllocations, BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES,
         KERNEL_STACK_PAGES, KaslrOverride, MEM_MAP_ATTEMPTS, MapRedo, ReclaimRange,
-        allocation_regions, aperture_array_capacity, attempt_stands, choose_kaslr_layout,
-        entry_array_pages, handoff_stack_span, knob_redoes, map_buffer_fits, memory_map,
-        push_reclaim_range, scrub, step6_and_7_spans, uefi,
+        allocation_regions, aperture_array_capacity, attempt_stands, bundle_body,
+        choose_kaslr_layout, entry_array_pages, framebuffer_aperture, handoff_stack_span,
+        knob_redoes, map_buffer_fits, memory_map, push_reclaim_range, scrub, step6_and_7_spans,
+        uefi,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -2431,6 +2561,37 @@ mod tests
             Err(BootError::ReclaimRangesOverflow)
         ));
         assert_eq!(len, 2);
+    }
+
+    // Defect caught: a body whose offset plus size wraps `usize` or ends past
+    // the file passing as a slice of it (or panicking).
+    #[test]
+    fn a_bundle_body_past_the_file_or_overflowing_is_refused()
+    {
+        let bytes = [1u8, 2, 3, 4];
+        assert_eq!(bundle_body(&bytes, 1, 2), Some(&bytes[1..3]));
+        assert_eq!(bundle_body(&bytes, 4, 0), Some(&bytes[4..4]));
+        assert_eq!(bundle_body(&bytes, 2, 3), None);
+        assert_eq!(bundle_body(&bytes, 5, 0), None);
+        assert_eq!(bundle_body(&bytes, usize::MAX, 2), None);
+    }
+
+    // Defect caught: a framebuffer whose span wraps the address space seeding
+    // a wrapped aperture (or panicking in debug builds).
+    #[test]
+    fn a_framebuffer_span_past_the_address_space_seeds_no_aperture()
+    {
+        let fb = |physical_base, stride, height| boot_protocol::FramebufferInfo {
+            physical_base,
+            width: 0,
+            height,
+            stride,
+            pixel_format: boot_protocol::PixelFormat::Bgrx8,
+        };
+        let seeded = framebuffer_aperture(&fb(0x8000_0123, 4096, 3)).expect("in range");
+        assert_eq!(seeded.phys_base, 0x8000_0000);
+        assert_eq!(seeded.size, 0x4000);
+        assert!(framebuffer_aperture(&fb(u64::MAX - 0x10, 4096, 3)).is_none());
     }
 
     #[test]

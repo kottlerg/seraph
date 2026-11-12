@@ -159,10 +159,11 @@ fn validate_kernel_layout(segs: &[elf::LoadSegment], entry: u64) -> Result<Kerne
 
     // Pairwise physical non-overlap (≤ 8 segments; O(n²) is trivial).
     // Overlapping segments would corrupt the copy into the single span.
-    for (i, a) in segs.iter().enumerate()
+    let mut rest = segs;
+    while let Some((a, tail)) = rest.split_first()
     {
         let a_end = a.paddr.saturating_add(a.memsz);
-        for b in &segs[i + 1..]
+        for b in tail
         {
             let b_end = b.paddr.saturating_add(b.memsz);
             if a.paddr < b_end && b.paddr < a_end
@@ -172,6 +173,7 @@ fn validate_kernel_layout(segs: &[elf::LoadSegment], entry: u64) -> Result<Kerne
                 ));
             }
         }
+        rest = tail;
     }
 
     if !segs
@@ -193,6 +195,64 @@ fn validate_kernel_layout(segs: &[elf::LoadSegment], entry: u64) -> Result<Kerne
         link_virt,
         span_bytes: phys_end.saturating_sub(link_phys),
     })
+}
+
+/// Place `addr` in a region based at `base` whose link-time origin is `origin`:
+/// `base + (addr - origin)`. `None` when `addr` is below `origin` or the sum
+/// overflows.
+fn rebase(base: u64, addr: u64, origin: u64) -> Option<u64>
+{
+    base.checked_add(addr.checked_sub(origin)?)
+}
+
+/// Copy `seg`'s file bytes from `data` to `dst_phys` and zero its BSS tail,
+/// bytes `[filesz, memsz)`.
+///
+/// # Errors
+///
+/// `BootError::InvalidElf` when the file bytes lie outside `data`, `p_memsz`
+/// is below `p_filesz`, or the BSS address overflows; each is checked before
+/// any byte is written.
+///
+/// # Safety
+///
+/// `dst_phys` must be the start of `seg.memsz` writable, identity-mapped bytes
+/// disjoint from `data`.
+unsafe fn copy_segment(data: &[u8], seg: &elf::LoadSegment, dst_phys: u64)
+-> Result<(), BootError>
+{
+    // p_offset / p_filesz → usize: 64-bit targets only; cast is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let file_off = seg.offset as usize;
+    #[allow(clippy::cast_possible_truncation)]
+    let file_sz = seg.filesz as usize;
+    let src = file_off
+        .checked_add(file_sz)
+        .and_then(|end| data.get(file_off..end))
+        .ok_or(elf::ElfError::SegmentOverflow)?;
+    // Difference fits in usize: memsz ≤ allocated region; 64-bit only.
+    let bss_len = seg
+        .memsz
+        .checked_sub(seg.filesz)
+        .ok_or(BootError::InvalidElf("LOAD segment: p_memsz < p_filesz"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let bss_sz = bss_len as usize;
+    let bss_addr = dst_phys
+        .checked_add(seg.filesz)
+        .ok_or(BootError::InvalidElf(
+            "LOAD segment placement overflows the address space",
+        ))?;
+
+    // SAFETY: `src` is `filesz` bytes of `data`; `dst_phys` holds
+    // `memsz ≥ filesz` (checked above) writable bytes disjoint from `data` per
+    // the caller's contract.
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst_phys as *mut u8, src.len()) };
+    // SAFETY: `bss_addr` is `filesz` bytes into the segment's placed region,
+    // which spans `memsz` bytes per the caller's contract, so the `memsz -
+    // filesz` bytes from it are inside it. UEFI does not guarantee zeroed
+    // pages; we must zero BSS here.
+    unsafe { core::ptr::write_bytes(bss_addr as *mut u8, 0, bss_sz) };
+    Ok(())
 }
 
 /// Load the kernel ELF from `data` into physical memory allocated via UEFI.
@@ -219,8 +279,9 @@ fn validate_kernel_layout(segs: &[elf::LoadSegment], entry: u64) -> Result<Kerne
 ///
 /// - `BootError::InvalidElf` — header check failed (bridged from
 ///   `elf::ElfError`), the segment layout failed [`validate_kernel_layout`],
-///   or the relocation table is malformed, non-`RELATIVE`, or targets bytes
-///   outside the load span.
+///   a segment's placement or BSS address overflows the address space, or the
+///   relocation table is malformed, non-`RELATIVE`, or targets bytes outside
+///   the load span.
 /// - `BootError::OutOfMemory` — no free contiguous span of the required size
 ///   (below 4 GiB on x86-64).
 ///
@@ -257,15 +318,20 @@ pub unsafe fn load_kernel(
         {
             continue;
         }
-        if segment_count >= MAX_LOAD_SEGMENTS
+        let Some(slot) = raw.get_mut(segment_count)
+        else
         {
             return Err(BootError::InvalidElf("ELF has more than 8 LOAD segments"));
-        }
-        raw[segment_count] = seg;
-        segment_count += 1;
+        };
+        *slot = seg;
+        // `segment_count` indexed a slot of `raw`, so it is far below `usize::MAX`.
+        segment_count = segment_count.saturating_add(1);
     }
 
-    let span = validate_kernel_layout(&raw[..segment_count], elf::entry_point(&ehdr))?;
+    // `segment_count` is at most `MAX_LOAD_SEGMENTS`; were it not, the empty
+    // slice fails the layout check.
+    let used = raw.get(..segment_count).unwrap_or(&[]);
+    let span = validate_kernel_layout(used, elf::entry_point(&ehdr))?;
 
     // One contiguous allocation for the whole image, placed wherever the
     // firmware has free RAM within the arch's bound.
@@ -284,46 +350,21 @@ pub unsafe fn load_kernel(
             executable: false,
         });
 
-    for (i, seg) in raw[..segment_count].iter().enumerate()
+    for (slot, seg) in segments.iter_mut().zip(used)
     {
         // Destination preserves the ELF's relative physical offset. Page-aligned
         // because `span_base` and `(paddr - link_phys)` are both 4 KiB multiples
         // (the latter validated).
-        let dst_phys = span_base + (seg.paddr - span.link_phys);
+        let dst_phys = rebase(span_base, seg.paddr, span.link_phys).ok_or(
+            BootError::InvalidElf("LOAD segment placement overflows the address space"),
+        )?;
 
-        // Copy file data (filesz bytes) into the placed region.
-        // p_offset / p_filesz → usize: 64-bit targets only; cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
-        let file_off = seg.offset as usize;
-        #[allow(clippy::cast_possible_truncation)]
-        let file_sz = seg.filesz as usize;
-        if file_sz > 0
-        {
-            let src = data[file_off..].as_ptr();
-            let dst = dst_phys as *mut u8;
-            // SAFETY: `src` points into `data`; `elf::load_segments` already
-            // validated that `[file_off, file_off + file_sz)` is in bounds
-            // (yields SegmentOverflow otherwise). `dst` lies within the single
-            // span allocation (`page_count * 4096 ≥ span_bytes ≥ (paddr -
-            // link_phys) + memsz ≥ … + filesz`), identity-mapped in the
-            // bootloader address space and disjoint from the read buffer.
-            unsafe { core::ptr::copy_nonoverlapping(src, dst, file_sz) };
-        }
+        // SAFETY: `dst_phys` is the segment's place in the span allocated
+        // above (`page_count * 4096 ≥ span_bytes ≥ (paddr - link_phys) +
+        // memsz`), identity-mapped and disjoint from the read buffer.
+        unsafe { copy_segment(data, seg, dst_phys)? };
 
-        // Zero the BSS tail: bytes [filesz, memsz).
-        // Difference fits in usize: memsz ≤ allocated region; 64-bit only.
-        #[allow(clippy::cast_possible_truncation)]
-        let bss_sz = (seg.memsz - seg.filesz) as usize;
-        if bss_sz > 0
-        {
-            let bss_ptr = (dst_phys + seg.filesz) as *mut u8;
-            // SAFETY: `bss_ptr` is `filesz` bytes into the segment's placed
-            // region, which spans `memsz` bytes within the span allocation.
-            // UEFI does not guarantee zeroed pages; we must zero BSS here.
-            unsafe { core::ptr::write_bytes(bss_ptr, 0, bss_sz) };
-        }
-
-        segments[i] = LoadedSegment {
+        *slot = LoadedSegment {
             phys_base: dst_phys,
             virt_base: seg.vaddr,
             size: seg.memsz,
@@ -344,15 +385,19 @@ pub unsafe fn load_kernel(
             {
                 // rela_table guarantees the table bytes are inside `data`.
                 #[allow(clippy::cast_possible_truncation)]
-                let bytes =
-                    &data[table.file_offset as usize..(table.file_offset + table.size) as usize];
-                elf::validate_relative_relocs(
-                    bytes,
-                    expected_machine,
-                    span.link_virt,
-                    span.link_virt + span.span_bytes,
-                )?;
-                (span_base + (table.vaddr - span.link_virt), table.size)
+                let bytes = table
+                    .file_offset
+                    .checked_add(table.size)
+                    .and_then(|end| data.get(table.file_offset as usize..end as usize))
+                    .ok_or(elf::ElfError::MalformedDynamic)?;
+                let link_end = span
+                    .link_virt
+                    .checked_add(span.span_bytes)
+                    .ok_or(elf::ElfError::MalformedDynamic)?;
+                elf::validate_relative_relocs(bytes, expected_machine, span.link_virt, link_end)?;
+                let rela_phys = rebase(span_base, table.vaddr, span.link_virt)
+                    .ok_or(elf::ElfError::MalformedDynamic)?;
+                (rela_phys, table.size)
             }
             None => (0, 0),
         },
@@ -384,7 +429,8 @@ pub unsafe fn load_kernel(
 /// # Errors
 ///
 /// - `BootError::InvalidElf` — nonzero slide on an `ET_EXEC` kernel, a
-///   malformed record, or a target outside the span.
+///   malformed record, a target outside the span, or a slide that overflows a
+///   virtual address.
 ///
 /// # Safety
 ///
@@ -416,16 +462,17 @@ pub unsafe fn relocate_kernel(
         let table = unsafe {
             core::slice::from_raw_parts(info.rela_phys as *const u8, info.rela_size as usize)
         };
+        let outside = || BootError::InvalidElf("relocation target outside kernel span");
+        let link_end = link_virt.checked_add(info.size).ok_or_else(outside)?;
         for record in elf::relative_relocs(table, expected_machine)?
         {
             let rela = record?;
-            if !elf::reloc_target_in_span(&rela, link_virt, link_virt + info.size)
+            if !elf::reloc_target_in_span(&rela, link_virt, link_end)
             {
-                return Err(BootError::InvalidElf(
-                    "relocation target outside kernel span",
-                ));
+                return Err(outside());
             }
-            let target = (info.physical_base + (rela.offset - link_virt)) as *mut u64;
+            let target =
+                rebase(info.physical_base, rela.offset, link_virt).ok_or_else(outside)? as *mut u64;
             // SAFETY: target + 8 bytes lie inside the span allocation per the
             // bounds check above; the span is identity-mapped RAM. Unaligned
             // write because r_offset carries no alignment guarantee.
@@ -435,12 +482,21 @@ pub unsafe fn relocate_kernel(
         }
     }
 
-    info.virtual_base += slide;
-    info.entry_virtual += slide;
-    for seg in &mut info.segments[..info.segment_count]
+    let overflow = || BootError::InvalidElf("KASLR slide overflows a virtual address");
+    let virtual_base = info.virtual_base.checked_add(slide).ok_or_else(overflow)?;
+    let entry_virtual = info.entry_virtual.checked_add(slide).ok_or_else(overflow)?;
+    let loaded = info
+        .segments
+        .get_mut(..info.segment_count)
+        .ok_or(BootError::InvalidElf(
+            "kernel segment count exceeds the segment array",
+        ))?;
+    for seg in loaded
     {
-        seg.virt_base += slide;
+        seg.virt_base = seg.virt_base.checked_add(slide).ok_or_else(overflow)?;
     }
+    info.virtual_base = virtual_base;
+    info.entry_virtual = entry_virtual;
     Ok(())
 }
 
@@ -524,7 +580,16 @@ pub unsafe fn load_init(
         #[allow(clippy::cast_possible_truncation)]
         let in_page_off = (seg.vaddr & 0xFFF) as usize;
         #[allow(clippy::cast_possible_truncation)]
-        let page_count = (in_page_off + seg.memsz as usize).div_ceil(4096);
+        let memsz = seg.memsz as usize;
+        let page_count = in_page_off
+            .checked_add(memsz)
+            .ok_or(BootError::InvalidElf(
+                "LOAD segment size overflows the address space",
+            ))?
+            .div_ceil(4096);
+        let alloc_bytes = page_count.checked_mul(4096).ok_or(BootError::InvalidElf(
+            "LOAD segment size overflows the address space",
+        ))?;
         // SAFETY: `bs` is valid per the caller's contract.
         let phys_base = unsafe { crate::uefi::allocate_pages(bs, page_count)? };
 
@@ -535,7 +600,12 @@ pub unsafe fn load_init(
         // BSS tail `[p_filesz, p_memsz)`.
         // SAFETY: `phys_base` is a fresh, identity-mapped allocation of
         // `page_count` pages.
-        unsafe { core::ptr::write_bytes(phys_base as *mut u8, 0, page_count * 4096) };
+        unsafe { core::ptr::write_bytes(phys_base as *mut u8, 0, alloc_bytes) };
+        let phys_addr = phys_base
+            .checked_add(in_page_off as u64)
+            .ok_or(BootError::InvalidElf(
+                "LOAD segment placement overflows the address space",
+            ))?;
 
         // Copy file data at the correct in-page offset.
         // p_offset and p_filesz → usize: 64-bit targets only; cast is exact.
@@ -545,27 +615,39 @@ pub unsafe fn load_init(
         let file_sz = seg.filesz as usize;
         if file_sz > 0
         {
-            let src = data[file_off..].as_ptr();
+            let src = data
+                .get(file_off..)
+                .ok_or(elf::ElfError::SegmentOverflow)?
+                .as_ptr();
             // Destination: phys_base + in-page offset, so virtual virt_addr
             // maps to exactly this physical byte after the kernel activates
             // the page table entry (phys_base → virtual page of virt_addr).
-            let dst = (phys_base + in_page_off as u64) as *mut u8;
+            let dst = phys_addr as *mut u8;
             // SAFETY: `dst` is within the freshly allocated region (size =
             // page_count * 4096 ≥ in_page_off + file_sz). `src` is within
             // `data`, validated by `elf::load_segments`. Regions are disjoint.
             unsafe { core::ptr::copy_nonoverlapping(src, dst, file_sz) };
         }
 
-        segments[count] = InitSegment {
+        // `count` is below `INIT_MAX_SEGMENTS` by the check above.
+        let Some(slot) = segments.get_mut(count)
+        else
+        {
+            return Err(BootError::InvalidElf(
+                "init ELF has more than INIT_MAX_SEGMENTS LOAD segments",
+            ));
+        };
+        *slot = InitSegment {
             // Encode the in-page offset: phys_addr & 0xFFF = virt_addr & 0xFFF.
             // The kernel maps the physical PAGE (phys_addr & !0xFFF) to the
             // virtual PAGE (virt_addr & !0xFFF) for each page of the segment.
-            phys_addr: phys_base + in_page_off as u64,
+            phys_addr,
             virt_addr: seg.vaddr,
             size: seg.memsz,
             flags,
         };
-        count += 1;
+        // `count` indexed a slot of `segments`, so it is far below `usize::MAX`.
+        count = count.saturating_add(1);
     }
 
     if count == 0
@@ -589,9 +671,12 @@ pub unsafe fn load_init(
             {
                 Some(table) =>
                 {
-                    let phys = rela_phys_for(&segments[..count], &table).ok_or(
-                        BootError::InvalidElf(".rela.dyn not covered by a loaded segment"),
-                    )?;
+                    // `count` is at most `INIT_MAX_SEGMENTS`; were it not, the empty
+                    // slice leaves the table uncovered.
+                    let loaded = segments.get(..count).unwrap_or(&[]);
+                    let phys = rela_phys_for(loaded, &table).ok_or(BootError::InvalidElf(
+                        ".rela.dyn not covered by a loaded segment",
+                    ))?;
                     (phys, table.size)
                 }
                 None => (0, 0),
@@ -630,8 +715,17 @@ fn rela_phys_for(segments: &[boot_protocol::InitSegment], table: &elf::RelaTable
     let end = table.vaddr.checked_add(table.size)?;
     segments
         .iter()
-        .find(|seg| table.vaddr >= seg.virt_addr && end <= seg.virt_addr + seg.size)
-        .map(|seg| seg.phys_addr + (table.vaddr - seg.virt_addr))
+        .find(|seg| {
+            table.vaddr >= seg.virt_addr
+                && seg
+                    .virt_addr
+                    .checked_add(seg.size)
+                    .is_some_and(|seg_end| end <= seg_end)
+        })
+        .and_then(|seg| {
+            seg.phys_addr
+                .checked_add(table.vaddr.checked_sub(seg.virt_addr)?)
+        })
 }
 
 // Boot modules are exposed in place by referencing the single bundle UEFI
@@ -834,5 +928,114 @@ mod tests
             size: 0x30,
         };
         assert_eq!(rela_phys_for(&segs, &table), None);
+    }
+
+    fn load_seg(offset: u64, filesz: u64, memsz: u64) -> elf::LoadSegment
+    {
+        elf::LoadSegment {
+            vaddr: 0,
+            paddr: 0,
+            offset,
+            filesz,
+            memsz,
+            writable: false,
+            executable: false,
+        }
+    }
+
+    // Defect caught: file bytes past `data`, or a `p_memsz` below `p_filesz`,
+    // copied (reading past `data` or writing past `memsz`) before the error.
+    #[test]
+    fn copy_segment_refuses_bad_bounds_before_writing()
+    {
+        let data = [0xAAu8; 8];
+        let mut dst = [0x55u8; 16];
+        let dst_phys = dst.as_mut_ptr() as u64;
+        // SAFETY: `dst` holds 16 writable bytes, at least each case's `memsz`,
+        // disjoint from `data`.
+        let past_data = unsafe { copy_segment(&data, &load_seg(4, 8, 8), dst_phys) };
+        assert!(matches!(past_data, Err(BootError::InvalidElf(_))));
+        // SAFETY: as above.
+        let short_mem = unsafe { copy_segment(&data, &load_seg(0, 8, 4), dst_phys) };
+        assert!(matches!(short_mem, Err(BootError::InvalidElf(_))));
+        assert_eq!(dst, [0x55u8; 16]);
+    }
+
+    #[test]
+    fn copy_segment_copies_the_file_bytes_and_zeroes_the_tail()
+    {
+        let data = [1u8, 2, 3, 4, 5, 6];
+        let mut dst = [0x55u8; 8];
+        // SAFETY: `dst` holds `memsz` (6) writable bytes disjoint from `data`.
+        unsafe { copy_segment(&data, &load_seg(2, 3, 6), dst.as_mut_ptr() as u64) }
+            .expect("in bounds");
+        assert_eq!(dst, [3, 4, 5, 0, 0, 0, 0x55, 0x55]);
+    }
+
+    // Defect caught: a placement that wraps instead of failing, or one below
+    // the link origin that underflows.
+    #[test]
+    fn rebase_rejects_underflow_and_overflow()
+    {
+        assert_eq!(rebase(0x1000, 0x5000, 0x4000), Some(0x2000));
+        assert_eq!(rebase(0x1000, 0x3000, 0x4000), None);
+        assert_eq!(rebase(u64::MAX, 0x5000, 0x4000), None);
+    }
+
+    // Defect caught: a segment whose end wraps `u64` covers a table it does not.
+    #[test]
+    fn rela_table_in_a_segment_that_wraps_is_not_covered()
+    {
+        let wrapping = boot_protocol::InitSegment {
+            phys_addr: 0x9000,
+            virt_addr: u64::MAX - 0xFF,
+            size: 0x1000,
+            flags: SegmentFlags::Read,
+        };
+        let table = elf::RelaTable {
+            vaddr: u64::MAX - 0xFF,
+            file_offset: 0,
+            size: 0x18,
+        };
+        assert_eq!(rela_phys_for(&[wrapping], &table), None);
+        let sound = boot_protocol::InitSegment {
+            phys_addr: 0x9000,
+            virt_addr: 0x4000,
+            size: 0x1000,
+            flags: SegmentFlags::Read,
+        };
+        let table = elf::RelaTable {
+            vaddr: 0x4100,
+            file_offset: 0,
+            size: 0x18,
+        };
+        assert_eq!(rela_phys_for(&[sound], &table), Some(0x9100));
+    }
+
+    // Defect caught: a KASLR slide that wraps a virtual address instead of
+    // failing the boot.
+    #[test]
+    fn a_slide_that_overflows_a_virtual_address_is_rejected()
+    {
+        let mut info = KernelInfo {
+            physical_base: 0,
+            virtual_base: VBASE,
+            size: 0,
+            entry_virtual: VBASE,
+            segments: core::array::from_fn(|_| LoadedSegment {
+                phys_base: 0,
+                virt_base: VBASE,
+                size: 0,
+                writable: false,
+                executable: false,
+            }),
+            segment_count: 1,
+            kind: elf::ElfKind::Dyn,
+            rela_phys: 0,
+            rela_size: 0,
+        };
+        let r = unsafe { relocate_kernel(&mut info, 0x1_0000_0000, 0) };
+        assert!(matches!(r, Err(BootError::InvalidElf(_))));
+        assert_eq!(info.virtual_base, VBASE);
     }
 }

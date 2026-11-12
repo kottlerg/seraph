@@ -30,6 +30,9 @@ pub enum MapError
     OutOfMemory,
     /// The flags request both writable and executable permissions (W^X violation).
     WxViolation,
+    /// The range to map runs past the end of the address space, or an address
+    /// selects no slot of a translation table.
+    AddressRange,
 }
 
 /// Architecture-specific page table builder.
@@ -109,24 +112,38 @@ pub fn table_frame_bound(levels: usize, ranges: impl IntoIterator<Item = (u64, u
         {
             continue;
         }
-        let (base, span) = page_span(virt, size);
-        let last = base + (span - 1);
-        for level in 0..levels.saturating_sub(1)
+        // A range past the end of the address space maps nothing: `map`
+        // refuses it.
+        let Some((base, span)) = page_span(virt, size)
+        else
         {
-            let shift = 21 + 9 * level;
-            frames += (last >> shift) - (base >> shift) + 1;
+            continue;
+        };
+        // `size` is non-zero, so `span` is at least one page and `last` lies
+        // within the range.
+        let last = base.saturating_add(span.saturating_sub(1));
+        // One shift per level below the root: 21, 30, 39, ...
+        for shift in (21u32..).step_by(9).take(levels.saturating_sub(1))
+        {
+            // `last` is at least `base`, so the span count is exact; the
+            // count of tables a range needs is far below `u64::MAX`.
+            let tables = (last >> shift)
+                .saturating_sub(base >> shift)
+                .saturating_add(1);
+            frames = frames.saturating_add(tables);
         }
     }
     frames
 }
 
 /// Convert a [`MapError`] to a [`BootError`].
-fn map_err(e: MapError) -> BootError
+pub fn map_err(e: MapError) -> BootError
 {
     match e
     {
         MapError::OutOfMemory => BootError::OutOfMemory,
         MapError::WxViolation => BootError::WxViolation,
+        MapError::AddressRange => BootError::MapAddressRange,
     }
 }
 
@@ -138,7 +155,10 @@ fn map_err(e: MapError) -> BootError
 ///
 /// # Errors
 /// Returns [`BootError::OutOfMemory`] if page table frame allocation fails,
-/// or [`BootError::WxViolation`] if a kernel segment has both W and X; this
+/// [`BootError::MapAddressRange`] if a range to map runs past the end of the
+/// address space, [`BootError::InvalidElf`] if the kernel's segment count
+/// exceeds its segment array, or [`BootError::WxViolation`] if a kernel
+/// segment has both W and X; this
 /// is where kernel-image W^X is enforced (see
 /// `core/boot/docs/elf-loading.md` § LOAD Segment Processing).
 pub fn build_initial_tables(
@@ -154,9 +174,21 @@ pub fn build_initial_tables(
     let trampoline = [(tramp_first, 4096), (tramp_last, 4096)]
         .into_iter()
         .filter(|&(page, _)| page != 0);
-    let segments = kernel.segments[0..kernel.segment_count]
+    let loaded = kernel
+        .segments
+        .get(..kernel.segment_count)
+        .ok_or(BootError::InvalidElf(
+            "kernel segment count exceeds the segment array",
+        ))?;
+    // An identity region past the end of the address space has no page span;
+    // refuse it before the pool is allocated.
+    if identity_regions
         .iter()
-        .map(|seg| (seg.virt_base, seg.size));
+        .any(|&(phys, size)| size != 0 && page_span(phys, size).is_none())
+    {
+        return Err(BootError::MapAddressRange);
+    }
+    let segments = loaded.iter().map(|seg| (seg.virt_base, seg.size));
     let frames = table_frame_bound(
         arch::current::BootPageTable::translation_levels(),
         segments
@@ -166,7 +198,7 @@ pub fn build_initial_tables(
     let mut table = arch::current::BootPageTable::new(bs, frames).ok_or(BootError::OutOfMemory)?;
 
     // Map each kernel ELF segment at its ELF virtual address with segment permissions.
-    for seg in &kernel.segments[0..kernel.segment_count]
+    for seg in loaded
     {
         let flags = PageFlags {
             writable: seg.writable,
@@ -187,7 +219,7 @@ pub fn build_initial_tables(
             continue;
         }
 
-        let (base, span) = page_span(phys, size);
+        let (base, span) = page_span(phys, size).ok_or(BootError::MapAddressRange)?;
         let flags = PageFlags {
             writable: true,
             executable: false,
@@ -205,12 +237,14 @@ const PAGE_ALIGN_MASK: u64 = 4095;
 /// `[phys, phys + size)`: the base rounded down and the end rounded up to
 /// page boundaries, so a region that does not start on a page boundary
 /// keeps its last page (an init segment's `phys_addr` carries its
-/// `p_vaddr` in-page offset).
-fn page_span(phys: u64, size: u64) -> (u64, u64)
+/// `p_vaddr` in-page offset). `None` when the rounded-up end runs past the end
+/// of the address space.
+fn page_span(phys: u64, size: u64) -> Option<(u64, u64)>
 {
     let base = phys & !PAGE_ALIGN_MASK;
-    let end = (phys + size + PAGE_ALIGN_MASK) & !PAGE_ALIGN_MASK;
-    (base, end - base)
+    let end = phys.checked_add(size)?.checked_add(PAGE_ALIGN_MASK)? & !PAGE_ALIGN_MASK;
+    // `end` is at least `phys`, which is at least `base`.
+    Some((base, end.checked_sub(base)?))
 }
 
 #[cfg(test)]
@@ -231,7 +265,11 @@ mod tests
             {
                 continue;
             }
-            let (base, span) = page_span(virt, size);
+            let Some((base, span)) = page_span(virt, size)
+            else
+            {
+                continue;
+            };
             for page in (base..base + span).step_by(4096)
             {
                 for level in 0..levels - 1
@@ -293,20 +331,81 @@ mod tests
     fn offset_region_spans_the_page_its_tail_reaches()
     {
         // 0x1F00 + 0x200 ends at 0x2100: pages 0x1000 and 0x2000.
-        assert_eq!(page_span(0x1F00, 0x200), (0x1000, 0x2000));
+        assert_eq!(page_span(0x1F00, 0x200), Some((0x1000, 0x2000)));
     }
 
     /// A page-aligned region of whole pages maps exactly those pages.
     #[test]
     fn aligned_region_spans_exactly_its_pages()
     {
-        assert_eq!(page_span(0x4000, 0x2000), (0x4000, 0x2000));
+        assert_eq!(page_span(0x4000, 0x2000), Some((0x4000, 0x2000)));
     }
 
     /// A page-aligned region with a partial last page rounds up to it.
     #[test]
     fn partial_last_page_rounds_up()
     {
-        assert_eq!(page_span(0x4000, 0x1001), (0x4000, 0x2000));
+        assert_eq!(page_span(0x4000, 0x1001), Some((0x4000, 0x2000)));
+    }
+
+    /// Defect caught: a range running past the end of the address space
+    /// wrapping `phys + size` into a span below its base, or mapping nothing
+    /// without an error.
+    #[test]
+    fn a_range_past_the_address_space_end_is_refused()
+    {
+        assert_eq!(page_span(u64::MAX - 0x10, 0x1000), None);
+        assert_eq!(
+            page_span(0xFFFF_FFFF_FFFF_E000, 0x1000),
+            Some((0xFFFF_FFFF_FFFF_E000, 0x1000))
+        );
+        let kernel = KernelInfo {
+            physical_base: 0,
+            virtual_base: 0,
+            size: 0,
+            entry_virtual: 0,
+            segments: core::array::from_fn(|_| crate::elf::LoadedSegment {
+                phys_base: 0,
+                virt_base: 0,
+                size: 0,
+                writable: false,
+                executable: false,
+            }),
+            segment_count: 0,
+            kind: crate::elf::ElfKind::Exec,
+            rela_phys: 0,
+            rela_size: 0,
+        };
+        // The span check runs before the builder allocates, so no boot
+        // services are needed to reach it.
+        let r = build_initial_tables(core::ptr::null_mut(), &kernel, &[(u64::MAX - 0x10, 0x1000)]);
+        assert!(matches!(r, Err(BootError::MapAddressRange)));
+    }
+
+    /// Defect caught: a segment count above the segment array slices past it
+    /// instead of failing the build.
+    #[test]
+    fn a_segment_count_above_the_array_is_an_invalid_elf()
+    {
+        let seg = || crate::elf::LoadedSegment {
+            phys_base: 0,
+            virt_base: 0,
+            size: 0,
+            writable: false,
+            executable: false,
+        };
+        let kernel = KernelInfo {
+            physical_base: 0,
+            virtual_base: 0,
+            size: 0,
+            entry_virtual: 0,
+            segments: core::array::from_fn(|_| seg()),
+            segment_count: 9,
+            kind: crate::elf::ElfKind::Exec,
+            rela_phys: 0,
+            rela_size: 0,
+        };
+        let r = build_initial_tables(core::ptr::null_mut(), &kernel, &[]);
+        assert!(matches!(r, Err(BootError::InvalidElf(_))));
     }
 }

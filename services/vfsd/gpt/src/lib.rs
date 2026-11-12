@@ -179,8 +179,9 @@ fn is_entry_size(entry_size: u32, block_size: u32) -> bool
 /// Decode one partition entry from the first 56 bytes of `entry`.
 ///
 /// Returns `None` for an unused entry (all-zero type GUID, the GPT-spec
-/// marker), a malformed range (`last_lba < first_lba`), or a slice shorter
-/// than one entry. Otherwise returns the partition with its length in LBAs
+/// marker), a malformed range (`last_lba < first_lba`, or the whole-`u64`
+/// range, whose length does not fit a `u64`), or a slice shorter than one
+/// entry. Otherwise returns the partition with its length in LBAs
 /// (`last - first + 1`).
 #[must_use]
 pub fn parse_entry(entry: &[u8]) -> Option<GptEntry>

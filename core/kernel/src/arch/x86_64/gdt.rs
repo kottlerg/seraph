@@ -356,7 +356,8 @@ pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
 
     // Load GDTR.
     let gdtr = Gdtr {
-        limit: (core::mem::size_of_val(gdt) - 1) as u16,
+        // The table is not empty, so the limit does not saturate.
+        limit: core::mem::size_of_val(gdt).saturating_sub(1) as u16,
         base: gdt.as_ptr() as u64,
     };
     // SAFETY: lgdt is a privileged x86 instruction; GDT pointer is valid and
@@ -802,25 +803,34 @@ pub unsafe fn reload_invalidated_iopb() -> bool
 /// `base` and `count` are `u32` so the full 64K range (`base = 0`,
 /// `count = 65536`) is expressible. Ports not covered by this call remain 1
 /// (denied); existing permitted ranges are preserved, so multiple calls
-/// accumulate permissions.
+/// accumulate permissions. A range whose end does not fit a `u32` permits
+/// nothing.
 ///
 /// # Panics
-/// Panics in debug mode if `base + count > 65536`.
+/// Panics in debug mode if `base + count` fits a `u32` and is over 65536.
 // cast_possible_truncation: a port index within a part is below 65536.
 #[allow(clippy::cast_possible_truncation)]
 pub fn permit_port_range(part: &mut [u8], first_port: u32, base: u32, count: u32)
 {
+    let Some(end) = base.checked_add(count)
+    else
+    {
+        return;
+    };
     if count == 0
     {
         return;
     }
-    let end = base + count;
     debug_assert!(end <= 65536, "port range exceeds 0xFFFF");
-    let part_end = first_port.saturating_add((part.len() * 8) as u32);
+    let part_end = first_port.saturating_add(part.len().saturating_mul(8) as u32);
     for port in base.max(first_port)..end.min(part_end)
     {
-        let rel = port - first_port;
-        part[(rel / 8) as usize] &= !(1 << (rel % 8));
+        // At least first_port, the range's start.
+        let rel = port.wrapping_sub(first_port);
+        if let Some(byte) = part.get_mut((rel / 8) as usize)
+        {
+            *byte &= !(1 << (rel % 8));
+        }
     }
 }
 
@@ -925,6 +935,17 @@ mod tests
             0x3F,
             "the low part's last two ports"
         );
+    }
+
+    #[test]
+    fn permit_port_range_whose_end_overflows_permits_nothing()
+    {
+        // Defect caught: an end that wraps past u32::MAX, which panics in a debug
+        // build and permits a wrapped range in a release one.
+        let mut iopb = [0xFFu8; IOPB_SIZE];
+        permit_port_range(&mut iopb, 0, 1, u32::MAX);
+        permit_port_range(&mut iopb, 0, u32::MAX, 2);
+        assert!(iopb.iter().all(|&b| b == 0xFF));
     }
 
     #[test]

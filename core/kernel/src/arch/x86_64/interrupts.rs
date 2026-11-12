@@ -163,6 +163,23 @@ unsafe fn enable_x2apic_this_cpu()
 
 // ── APIC register access ──────────────────────────────────────────────────────
 
+/// The x2APIC MSR index of the local-APIC register at `offset` bytes from the
+/// xAPIC base. A register offset is below `0x1000`, so the sum does not wrap.
+#[cfg(not(test))]
+fn x2apic_msr(offset: usize) -> u32
+{
+    0x800u32.wrapping_add((offset >> 4) as u32)
+}
+
+/// The direct-map address of the local-APIC register at `offset` bytes from the
+/// xAPIC base. Address arithmetic: wraps, as a release build already did.
+#[cfg(not(test))]
+fn xapic_register(offset: usize) -> usize
+{
+    (super::paging::direct_map_base().wrapping_add(super::platform::lapic_base()) as usize)
+        .wrapping_add(offset)
+}
+
 /// Write `val` to the local-APIC register at `offset` bytes from the xAPIC
 /// base (an x2APIC MSR index of `0x800 + (offset >> 4)` in x2APIC mode).
 ///
@@ -177,11 +194,10 @@ pub(super) unsafe fn apic_write(offset: usize, val: u32)
     if x2apic_enabled()
     {
         // SAFETY: offset names a valid 16-byte-aligned APIC register; ring 0.
-        unsafe { cpu::write_msr(0x800 + (offset >> 4) as u32, u64::from(val)) };
+        unsafe { cpu::write_msr(x2apic_msr(offset), u64::from(val)) };
         return;
     }
-    let vaddr =
-        (super::paging::direct_map_base() + super::platform::lapic_base()) as usize + offset;
+    let vaddr = xapic_register(offset);
     // SAFETY: vaddr is within the direct-mapped APIC MMIO region.
     unsafe {
         core::ptr::write_volatile(vaddr as *mut u32, val);
@@ -196,10 +212,9 @@ pub(super) fn apic_read(offset: usize) -> u32
     if x2apic_enabled()
     {
         // SAFETY: offset names a valid 16-byte-aligned APIC register; ring 0.
-        return unsafe { cpu::read_msr(0x800 + (offset >> 4) as u32) as u32 };
+        return unsafe { cpu::read_msr(x2apic_msr(offset)) as u32 };
     }
-    let vaddr =
-        (super::paging::direct_map_base() + super::platform::lapic_base()) as usize + offset;
+    let vaddr = xapic_register(offset);
     // SAFETY: vaddr is within the direct-mapped APIC MMIO region.
     unsafe { core::ptr::read_volatile(vaddr as *const u32) }
 }
@@ -237,8 +252,8 @@ pub unsafe fn init()
 
     // 2. Carve the BSP IST stacks out of [`BSP_IST_STACKS`] (BSS).
     let ist_base = core::ptr::addr_of_mut!(BSP_IST_STACKS) as u64;
-    let ist1_top = ist_base + IST_STACK_SIZE as u64;
-    let ist2_top = ist_base + (IST_STACK_SIZE * 2) as u64;
+    let ist1_top = ist_base.wrapping_add(IST_STACK_SIZE as u64);
+    let ist2_top = ist_base.wrapping_add((IST_STACK_SIZE * 2) as u64);
 
     // Derive the current kernel stack top from RSP for the initial TSS RSP0.
     // This is updated on each context switch in later phases.

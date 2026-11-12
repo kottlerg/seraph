@@ -207,9 +207,23 @@ fn index_of(vector: u8) -> Option<usize>
 /// and [`release_vector_in`] predicts.
 fn first_free_from(table: &[SlotEntry], start: usize) -> Option<usize>
 {
-    (0..table.len())
-        .map(|offset| (start + offset) % table.len())
-        .find(|&index| table[index].is_free())
+    let start = start.checked_rem(table.len())?;
+    let (before, from) = table.split_at_checked(start)?;
+    let from = from
+        .iter()
+        .enumerate()
+        .map(|(offset, entry)| (start.wrapping_add(offset), entry));
+    from.chain(before.iter().enumerate())
+        .find(|(_, entry)| entry.is_free())
+        .map(|(index, _)| index)
+}
+
+/// The index after `index` in a table of `len` entries, wrapping round to the first
+/// after the last.
+fn index_after(index: usize, len: usize) -> usize
+{
+    let next = index.saturating_add(1);
+    if next >= len { 0 } else { next }
 }
 
 /// Assign the first free vector of `table` at or after index `start` (wrapping) to
@@ -219,19 +233,25 @@ fn assign_vector_in(table: &[SlotEntry], slot: Slot, start: usize) -> Option<(u8
 {
     let index = first_free_from(table, start)?;
     let vector = vector_at(index)?;
-    table[index].store(slot);
-    Some((vector, (index + 1) % table.len()))
+    table.get(index)?.store(slot);
+    Some((vector, index_after(index, table.len())))
 }
 
 /// Free the vector at `index` of `table`, and return the search cursor `cursor` moved
 /// past it when a search from the cursor would reach it before any other free vector, so
-/// the next search does not take a vector just released while another is free.
+/// the next search does not take a vector just released while another is free. An
+/// `index` past the table frees nothing and leaves the cursor.
 fn release_vector_in(table: &[SlotEntry], index: usize, cursor: usize) -> usize
 {
-    table[index].store(Slot::Free);
+    let Some(entry) = table.get(index)
+    else
+    {
+        return cursor;
+    };
+    entry.store(Slot::Free);
     if first_free_from(table, cursor) == Some(index)
     {
-        (index + 1) % table.len()
+        index_after(index, table.len())
     }
     else
     {
@@ -446,15 +466,24 @@ fn lookup_ioapic_for_gsi(gsi: u32) -> Option<(u64, u32)>
     {
         // SAFETY: i < count ≤ MAX_IOAPICS; entries [0..count) are initialized.
         let s = unsafe { *base.add(i) };
-        if gsi >= s.gsi_base && gsi - s.gsi_base < s.pin_count
+        if let Some(pin) = gsi.checked_sub(s.gsi_base)
+            && pin < s.pin_count
         {
-            return Some((s.phys_base, gsi - s.gsi_base));
+            return Some((s.phys_base, pin));
         }
     }
     None
 }
 
 // ── Register access ───────────────────────────────────────────────────────────
+
+/// The register indices of pin `pin`'s redirection entry: its low dword and its high
+/// dword. A pin is below [`IOAPIC_MAX_PINS`] (256), so neither wraps.
+const fn redirection_regs(pin: u32) -> (u32, u32)
+{
+    let low = pin.wrapping_mul(2).wrapping_add(0x10);
+    (low, low.wrapping_add(1))
+}
 
 /// Write `val` to register `reg` of the IOAPIC at `phys_base`.
 ///
@@ -464,13 +493,13 @@ fn lookup_ioapic_for_gsi(gsi: u32) -> Option<(u64, u32)>
 /// held across the caller's whole access sequence.
 unsafe fn ioapic_write(phys_base: u64, reg: u32, val: u32)
 {
-    let base = (super::paging::direct_map_base() + phys_base) as usize;
+    let base = super::paging::direct_map_base().wrapping_add(phys_base) as usize;
     // SAFETY: phys_base is a valid IOAPIC MMIO base mapped through the direct
     // map; IOREGSEL/IOWIN offsets are within IOAPIC register range; volatile
     // ensures proper ordering of register select and data writes.
     unsafe {
-        core::ptr::write_volatile((base + IOREGSEL) as *mut u32, reg);
-        core::ptr::write_volatile((base + IOWIN) as *mut u32, val);
+        core::ptr::write_volatile(base.wrapping_add(IOREGSEL) as *mut u32, reg);
+        core::ptr::write_volatile(base.wrapping_add(IOWIN) as *mut u32, val);
     }
 }
 
@@ -480,11 +509,11 @@ unsafe fn ioapic_write(phys_base: u64, reg: u32, val: u32)
 /// Same as [`ioapic_write`].
 unsafe fn ioapic_read(phys_base: u64, reg: u32) -> u32
 {
-    let base = (super::paging::direct_map_base() + phys_base) as usize;
+    let base = super::paging::direct_map_base().wrapping_add(phys_base) as usize;
     // SAFETY: see ioapic_write.
     unsafe {
-        core::ptr::write_volatile((base + IOREGSEL) as *mut u32, reg);
-        core::ptr::read_volatile((base + IOWIN) as *const u32)
+        core::ptr::write_volatile(base.wrapping_add(IOREGSEL) as *mut u32, reg);
+        core::ptr::read_volatile(base.wrapping_add(IOWIN) as *const u32)
     }
 }
 
@@ -503,24 +532,25 @@ pub unsafe fn init()
     let entries = super::platform::ioapics_into(&mut buf);
 
     let count = entries.len().min(MAX_IOAPICS);
-    for (i, entry) in entries.iter().take(count).enumerate()
+    // SAFETY: single-threaded init phase, before any reader of IOAPICS: no other
+    // reference to it exists while this one does.
+    let states = unsafe { &mut *core::ptr::addr_of_mut!(IOAPICS) };
+    for ((i, entry), state) in entries.iter().take(count).enumerate().zip(states)
     {
         // SAFETY: single-threaded init phase after Phase 3; direct map active.
         let ver = unsafe { ioapic_read(entry.phys_base, IOAPICVER) };
         let max_entry = (ver >> 16) & 0xFF;
-        let pin_count = max_entry + 1;
+        // At most 256: the field is eight bits wide.
+        let pin_count = max_entry.saturating_add(1);
 
         // SAFETY: single-threaded init phase; reading IOAPICID register.
         let ioapic_id = unsafe { ioapic_read(entry.phys_base, IOAPICID) };
 
-        // SAFETY: single-threaded init phase; pre-SMP write.
-        unsafe {
-            IOAPICS[i] = IoApicState {
-                phys_base: entry.phys_base,
-                gsi_base: entry.gsi_base,
-                pin_count,
-            };
-        }
+        *state = IoApicState {
+            phys_base: entry.phys_base,
+            gsi_base: entry.gsi_base,
+            pin_count,
+        };
 
         crate::kprintln!(
             "ioapic[{}]: base={:#x} id={:#x} gsi_base={} pins={}",
@@ -543,11 +573,12 @@ pub unsafe fn init()
         // Mask all entries on this IOAPIC (bit 16 = interrupt mask = 1).
         for pin in 0..pin_count
         {
+            let (low_reg, high_reg) = redirection_regs(pin);
             // SAFETY: single-threaded init phase; programming redirection
             // entries to masked state; no concurrent access or IRQ delivery.
             unsafe {
-                ioapic_write(entry.phys_base, 0x10 + 2 * pin, REDIR_MASK);
-                ioapic_write(entry.phys_base, 0x11 + 2 * pin, 0);
+                ioapic_write(entry.phys_base, low_reg, REDIR_MASK);
+                ioapic_write(entry.phys_base, high_reg, 0);
             }
         }
     }
@@ -605,17 +636,18 @@ pub unsafe fn route(gsi: u32, vector: u8, destination: Destination, mode: u32)
         return;
     };
     let (low, high) = redirection_entry(vector, mode, destination);
+    let (low_reg, high_reg) = redirection_regs(pin);
 
     // SAFETY: caller ensures init() has completed; entry remains masked
     // until unmask(). IOAPIC_LOCK covers every select/window pair below.
     unsafe {
         let saved = IOAPIC_LOCK.lock_raw();
-        if let Some(clear) = remote_irr_clear(ioapic_read(base, 0x10 + 2 * pin))
+        if let Some(clear) = remote_irr_clear(ioapic_read(base, low_reg))
         {
-            ioapic_write(base, 0x10 + 2 * pin, clear);
+            ioapic_write(base, low_reg, clear);
         }
-        ioapic_write(base, 0x10 + 2 * pin, low);
-        ioapic_write(base, 0x11 + 2 * pin, high);
+        ioapic_write(base, low_reg, low);
+        ioapic_write(base, high_reg, high);
         IOAPIC_LOCK.unlock_raw(saved);
     }
 }
@@ -632,7 +664,7 @@ pub unsafe fn mask(gsi: u32)
     {
         return;
     };
-    let reg = 0x10 + 2 * pin;
+    let (reg, _) = redirection_regs(pin);
     // SAFETY: caller ensures init() has completed; setting the mask bit is
     // architecture-defined. IOAPIC_LOCK covers the whole read-modify-write.
     unsafe {
@@ -655,7 +687,7 @@ pub unsafe fn unmask(gsi: u32)
     {
         return;
     };
-    let reg = 0x10 + 2 * pin;
+    let (reg, _) = redirection_regs(pin);
     // SAFETY: caller ensures init() and route() have completed; clearing the
     // mask bit enables IRQ delivery for a registered handler. IOAPIC_LOCK
     // covers the whole read-modify-write.
@@ -746,6 +778,38 @@ mod tests
         release_vector_in(&t, 1, 100);
         let (vector, _) = assign_vector_in(&t, Slot::Line(5000), 100).expect("vector");
         assert_eq!(vector, DEVICE_VECTOR_BASE + 1);
+    }
+
+    #[test]
+    fn a_release_past_the_table_frees_nothing_and_keeps_the_cursor()
+    {
+        // Defect caught: an index past the table indexing out of bounds, which
+        // halts the kernel, instead of freeing nothing.
+        let t = table();
+        let held = assign(&t, 7).expect("vector");
+        assert_eq!(release_vector_in(&t, DEVICE_VECTOR_COUNT, 3), 3);
+        assert_eq!(release_vector_in(&t, usize::MAX, 3), 3);
+        assert_eq!(t[index(held)].load(), Slot::Line(7));
+        assert!(t.iter().filter(|entry| !entry.is_free()).count() == 1);
+    }
+
+    #[test]
+    fn the_cursor_after_the_last_vector_is_the_first()
+    {
+        let t = table();
+        let last = DEVICE_VECTOR_COUNT - 1;
+        let (vector, cursor) = assign_vector_in(&t, Slot::Line(2), last).expect("vector");
+        assert_eq!(index(vector), last);
+        assert_eq!(cursor, 0);
+        assert_eq!(index_after(usize::MAX, DEVICE_VECTOR_COUNT), 0);
+    }
+
+    #[test]
+    fn a_search_from_past_the_table_starts_from_its_remainder()
+    {
+        let t = table();
+        assert_eq!(first_free_from(&t, DEVICE_VECTOR_COUNT + 4), Some(4));
+        assert_eq!(first_free_from(&[], 4), None);
     }
 
     #[test]

@@ -582,7 +582,7 @@ mod tests
         w.field_bytes(b"k", b"v");
         let rec = Record::decode(w.as_bytes()).expect("a record");
         assert_eq!(rec.message().len(), RECORD_MAX_BYTES - MESSAGE_LEN_BYTES);
-        assert!(core::str::from_utf8(rec.message()).is_ok());
+        core::str::from_utf8(rec.message()).unwrap();
         // Nothing fits after the message, so the field is dropped.
         assert_eq!(rec.fields().count(), 0);
         assert!(w.clipped());
@@ -597,7 +597,7 @@ mod tests
         assert!(w.clipped());
         let got = fields(w.as_bytes());
         assert_eq!(got.len(), 1);
-        assert!(core::str::from_utf8(&got[0].1).is_ok());
+        core::str::from_utf8(&got[0].1).unwrap();
         // The value takes all the room but at most two bytes ('€' is three).
         assert!(w.as_bytes().len() > RECORD_MAX_BYTES - 3);
     }

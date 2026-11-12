@@ -215,7 +215,7 @@ mod tests
         );
         assert_eq!(
             blob_span(REGION_END - 8, 8, 1, REGION, REGION_END),
-            Some(((REGION_END - 8) as usize, 8))
+            Some((usize::try_from(REGION_END - 8).unwrap(), 8))
         );
         assert_eq!(blob_span(REGION_END - 8, 9, 1, REGION, REGION_END), None);
         assert_eq!(blob_span(REGION - 8, 8, 1, REGION, REGION_END), None);

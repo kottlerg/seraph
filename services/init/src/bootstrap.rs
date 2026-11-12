@@ -92,30 +92,45 @@ fn choose_image_bias_or_default() -> u64
 pub(crate) fn log_hex(prefix: &str, value: u64)
 {
     let mut buf = [0u8; 96];
-    let prefix_len = prefix.len().min(buf.len() - 18);
-    buf[..prefix_len].copy_from_slice(&prefix.as_bytes()[..prefix_len]);
-    buf[prefix_len] = b'0';
-    buf[prefix_len + 1] = b'x';
-    let mut pos = prefix_len + 2;
-    let mut started = false;
-    for shift in (0..16).rev()
-    {
-        let digit = ((value >> (shift * 4)) & 0xF) as u8;
-        if digit != 0 || started || shift == 0
+    // The buffer is 96 bytes, so the prefix cap is positive.
+    let prefix_len = prefix.len().min(buf.len().saturating_sub(18));
+    let mut pos = 0usize;
+    let mut push = |b: u8| {
+        if let Some(slot) = buf.get_mut(pos)
         {
-            buf[pos] = if digit < 10
-            {
-                b'0' + digit
-            }
-            else
-            {
-                b'a' + digit - 10
-            };
-            pos += 1;
+            *slot = b;
+            // `pos` indexed a slot, so it is below the buffer length.
+            pos = pos.saturating_add(1);
+        }
+    };
+    for &b in prefix.as_bytes().iter().take(prefix_len)
+    {
+        push(b);
+    }
+    push(b'0');
+    push(b'x');
+    let mut started = false;
+    for nibble in (0..16u32).rev()
+    {
+        // `nibble` is below 16, so the shift is below 64 and `checked_shr` never refuses.
+        let digit = ((value.checked_shr(nibble.saturating_mul(4)).unwrap_or(0)) & 0xF) as u8;
+        if digit != 0 || started || nibble == 0
+        {
+            push(
+                if digit < 10
+                {
+                    b'0'.saturating_add(digit)
+                }
+                else
+                {
+                    // `digit` is at most 15.
+                    b'a'.saturating_add(digit.saturating_sub(10))
+                },
+            );
             started = true;
         }
     }
-    if let Ok(s) = core::str::from_utf8(&buf[..pos])
+    if let Ok(s) = core::str::from_utf8(buf.get(..pos).unwrap_or_default())
     {
         log(s);
     }
@@ -141,7 +156,10 @@ pub(crate) fn log_hex(prefix: &str, value: u64)
 /// retype slab.
 fn retype_reserve_pages() -> u64
 {
-    crate::ASPACE_RETYPE_PAGES + crate::CSPACE_RETYPE_PAGES + crate::thread_retype_pages()
+    // Three small page-count constants, far below `u64::MAX`.
+    crate::ASPACE_RETYPE_PAGES
+        .saturating_add(crate::CSPACE_RETYPE_PAGES)
+        .saturating_add(crate::thread_retype_pages())
 }
 
 /// Bodies init's own `CSpace` arena backs after [`fund_own_cspace`] besides
@@ -176,7 +194,10 @@ pub(crate) fn init_cspace_fund_pages(info: &InitInfo) -> u64
         .iter()
         .filter(|d| d.cap_type == init_protocol::CapType::Mmio)
         .count() as u64;
-    let body_pages = (apertures + INIT_FIXED_BODIES).div_ceil(syscall_abi::CSPACE_BODIES_PER_PAGE);
+    // `apertures` is a descriptor count from `InitInfo`, bounded by its page.
+    let body_pages = apertures
+        .saturating_add(INIT_FIXED_BODIES)
+        .div_ceil(syscall_abi::CSPACE_BODIES_PER_PAGE);
     let binding_pages = if crate::find_cap_by_type(info, init_protocol::CapType::IoPort).is_some()
     {
         2 * syscall_abi::IOPORT_BINDING_TABLE_PAGES
@@ -185,7 +206,8 @@ pub(crate) fn init_cspace_fund_pages(info: &InitInfo) -> u64
     {
         0
     };
-    body_pages + binding_pages + 1
+    // Page counts bounded by the descriptor count and small constants.
+    body_pages.saturating_add(binding_pages).saturating_add(1)
 }
 
 /// Donate [`init_cspace_fund_pages`] pages of `arena_cap`'s front to init's
@@ -229,7 +251,11 @@ pub(crate) fn fund_own_cspace(info: &InitInfo, arena_cap: u64) -> Result<(), i64
 /// never crossed this bound before forwarding the arena.
 pub(crate) fn init_retype_reserve_pages(info: &InitInfo) -> u64
 {
-    init_cspace_fund_pages(info) + 1 + crate::thread_retype_pages() + 1
+    // Small page-count constants, far below `u64::MAX`.
+    init_cspace_fund_pages(info)
+        .saturating_add(1)
+        .saturating_add(crate::thread_retype_pages())
+        .saturating_add(1)
 }
 
 /// A service's contiguous backing arena: one Memory cap plus a page cursor
@@ -269,7 +295,7 @@ impl BootArena
         backing_pages: u64,
     ) -> Option<Self>
     {
-        let cap = alloc.alloc_pages(reserve_pages + backing_pages)?;
+        let cap = alloc.alloc_pages(reserve_pages.checked_add(backing_pages)?)?;
         Some(Self {
             cap,
             init_aspace,
@@ -319,7 +345,8 @@ impl BootArena
         let _ = unsafe { syscall::mem_unmap(self.init_aspace, ELF_PAGE_TEMP_VA, 1) };
         // SAFETY: the caller's contract covers `target_va` in `target_aspace`.
         unsafe { syscall::mem_map(self.cap, target_aspace, target_va, offset, 1, prot) }.ok()?;
-        self.cursor += 1;
+        // `cursor` indexed a backing page of the arena, so it is far below `u64::MAX`.
+        self.cursor = self.cursor.saturating_add(1);
         Some(())
     }
 
@@ -371,7 +398,7 @@ impl BootArena
             )
         }
         .ok()?;
-        let len = (num_pages * PAGE_SIZE) as usize;
+        let len = num_pages.checked_mul(PAGE_SIZE)? as usize;
         // SAFETY: the span at ELF_PAGE_TEMP_VA was just mapped writable for
         // `num_pages` pages.
         let span = unsafe { core::slice::from_raw_parts_mut(ELF_PAGE_TEMP_VA as *mut u8, len) };
@@ -403,15 +430,18 @@ impl BootArena
                 syscall::mem_map(
                     self.cap,
                     target_aspace,
-                    target_va + ro * PAGE_SIZE,
-                    offset + ro,
-                    num_pages - ro,
+                    // `ro` is below `num_pages` here, and the span `[target_va,
+                    // target_va + num_pages * PAGE_SIZE)` is the caller's mapped span.
+                    target_va.saturating_add(ro.saturating_mul(PAGE_SIZE)),
+                    offset.saturating_add(ro),
+                    num_pages.saturating_sub(ro),
                     prot,
                 )
             }
             .ok()?;
         }
-        self.cursor += num_pages;
+        // `cursor` plus the run just mapped stays within the arena, far below `u64::MAX`.
+        self.cursor = self.cursor.saturating_add(num_pages);
         Some(())
     }
 }
@@ -430,8 +460,8 @@ fn elf_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> Option<u64>
             continue;
         }
         let first_page = seg.vaddr & !0xFFF;
-        let last_page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
-        total += (last_page_end - first_page) / PAGE_SIZE;
+        let last_page_end = seg.vaddr.checked_add(seg.memsz)?.checked_add(0xFFF)? & !0xFFF;
+        total = total.checked_add(last_page_end.checked_sub(first_page)? / PAGE_SIZE)?;
     }
     Some(total)
 }
@@ -461,6 +491,14 @@ pub struct ChildTlsMeta
     pub filesz: u64,
     pub memsz: u64,
     pub align: u64,
+}
+
+/// The `RELATIVE` relocation table's bytes within `module_bytes`, or `None`
+/// when `table` does not lie inside the image.
+fn rela_table_bytes<'a>(module_bytes: &'a [u8], table: &elf::RelaTable) -> Option<&'a [u8]>
+{
+    let end = table.file_offset.checked_add(table.size)?;
+    module_bytes.get(table.file_offset as usize..end as usize)
 }
 
 /// Place the main thread's TLS block in `arena`: populate it from the
@@ -503,7 +541,7 @@ unsafe fn place_main_tls(
         return Some((0, ChildTlsMeta::default()));
     }
     let meta = ChildTlsMeta {
-        vaddr: seg.vaddr + bias,
+        vaddr: seg.vaddr.checked_add(bias)?,
         filesz: seg.filesz,
         memsz: seg.memsz,
         align: seg.align,
@@ -521,20 +559,30 @@ unsafe fn place_main_tls(
     }
 
     let tdata_start = seg.offset as usize;
-    let tdata_end = tdata_start + seg.filesz as usize;
+    let tdata_end = tdata_start.checked_add(seg.filesz as usize)?;
     if tdata_end > module_bytes.len()
     {
         return None;
     }
 
-    let tls_base_va = tls_base + tls_base_offset;
+    let tls_base_va = tls_base.checked_add(tls_base_offset)?;
+    // Validated here so the populate closure below has no failure path.
+    let tdata = module_bytes.get(tdata_start..tdata_end)?;
+    let table = match rela
+    {
+        Some(t) => Some(rela_table_bytes(module_bytes, &t)?),
+        None => None,
+    };
     let populate = |span: &mut [u8]| {
         // `filesz <= memsz <= block_size <= span.len()`: the template fits.
-        let template = &mut span[..seg.filesz as usize];
-        template.copy_from_slice(&module_bytes[tdata_start..tdata_end]);
-        if let Some(t) = rela
+        let Some(template) = span.get_mut(..seg.filesz as usize)
+        else
         {
-            let table = &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
+            return;
+        };
+        template.copy_from_slice(tdata);
+        if let Some(table) = table
+        {
             let _ = elf::apply_relative_relocs(
                 table,
                 arch::current::EXPECTED_ELF_MACHINE,
@@ -594,7 +642,16 @@ unsafe fn load_elf_into_arena(
     // segments are mapped read-only after relocation.
     let ro_range = elf::relro_span(ehdr, module_bytes)
         .ok()?
-        .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
+        .and_then(|(va, sz)| {
+            let start = va.checked_add(bias)?;
+            let end = start.checked_add(sz)?.checked_add(0xFFF)?;
+            Some((start & !0xFFF, end & !0xFFF))
+        });
+    let table = match rela
+    {
+        Some(t) => Some(rela_table_bytes(module_bytes, &t)?),
+        None => None,
+    };
     let mut applied = 0u64;
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
@@ -617,12 +674,14 @@ unsafe fn load_elf_into_arena(
             syscall::MAP_READ
         };
 
-        let seg_vaddr = seg.vaddr + bias;
+        let seg_vaddr = seg.vaddr.checked_add(bias)?;
         let first_page = seg_vaddr & !0xFFF;
-        let last_page_end = (seg_vaddr + seg.memsz + 0xFFF) & !0xFFF;
-        let num_pages = (last_page_end - first_page) / PAGE_SIZE;
-        let file_data = &module_bytes[seg.offset as usize..(seg.offset + seg.filesz) as usize];
-        let dest_offset = (seg_vaddr - first_page) as usize;
+        let last_page_end = seg_vaddr.checked_add(seg.memsz)?.checked_add(0xFFF)? & !0xFFF;
+        let num_pages = last_page_end.checked_sub(first_page)? / PAGE_SIZE;
+        let file_end = seg.offset.checked_add(seg.filesz)?;
+        let file_data = module_bytes.get(seg.offset as usize..file_end as usize)?;
+        // `first_page` is `seg_vaddr` rounded down, so it is not above it.
+        let dest_offset = seg_vaddr.saturating_sub(first_page) as usize;
 
         // RELRO is a prefix of the writable region by link order; pages of
         // this segment fully inside the range map read-only.
@@ -631,7 +690,8 @@ unsafe fn load_elf_into_arena(
             Some((ro_start, ro_end))
                 if seg.writable && ro_start <= first_page && ro_end > first_page =>
             {
-                (ro_end.min(last_page_end) - first_page) / PAGE_SIZE
+                // `last_page_end` and `ro_end` both exceed `first_page` here.
+                ro_end.min(last_page_end).saturating_sub(first_page) / PAGE_SIZE
             }
             _ => 0,
         };
@@ -647,19 +707,28 @@ unsafe fn load_elf_into_arena(
                 ro_head_pages,
                 |span| {
                     let copy_len = file_data.len().min(seg.memsz as usize);
-                    span[dest_offset..dest_offset + copy_len]
-                        .copy_from_slice(&file_data[..copy_len]);
+                    // The span is `num_pages` pages from `first_page`, which holds
+                    // `dest_offset + memsz` bytes, so both slices exist.
+                    if let Some(dst) = span
+                        .get_mut(dest_offset..)
+                        .and_then(|rest| rest.get_mut(..copy_len))
+                        && let Some(src) = file_data.get(..copy_len)
+                    {
+                        dst.copy_from_slice(src);
+                    }
                     // Writable segments only, matching the kernel's init applier: a
                     // target in text/rodata goes unapplied and the caller's
                     // applied-count check rejects the image.
                     if seg.writable
-                        && let Some(t) = rela
+                        && let Some(table) = table
+                        && let Some(seg_span) = span
+                            .get_mut(dest_offset..)
+                            .and_then(|rest| rest.get_mut(..seg.memsz as usize))
                     {
-                        let table = &module_bytes
-                            [t.file_offset as usize..(t.file_offset + t.size) as usize];
-                        let seg_span = &mut span[dest_offset..dest_offset + seg.memsz as usize];
-                        applied +=
-                            elf::apply_relative_relocs(table, machine, bias, seg.vaddr, seg_span);
+                        // The count of applied relocations is bounded by the table size.
+                        applied = applied.saturating_add(elf::apply_relative_relocs(
+                            table, machine, bias, seg.vaddr, seg_span,
+                        ));
                     }
                 },
             )
@@ -938,8 +1007,7 @@ pub fn bootstrap_memmgr(
     {
         Some(t) =>
         {
-            let table =
-                module_bytes.get(t.file_offset as usize..(t.file_offset + t.size) as usize)?;
+            let table = rela_table_bytes(module_bytes, &t)?;
             elf::validate_relative_relocs(table, machine, span_min, span_end).ok()?
         }
         None => 0,
@@ -950,7 +1018,10 @@ pub fn bootstrap_memmgr(
 
     // memmgr's bespoke `_start` configures no TLS, so its arena reserves
     // only ELF segments + `ProcessInfo` + stack + IPC buffer.
-    let backing_pages = elf_backing_pages(ehdr, module_bytes)? + 1 + u64::from(stack_pages) + 1;
+    let backing_pages = elf_backing_pages(ehdr, module_bytes)?
+        .checked_add(1)?
+        .checked_add(u64::from(stack_pages))?
+        .checked_add(1)?;
     let mut arena = BootArena::carve(alloc, init_aspace, backing_pages)?;
 
     let mm_aspace = syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES).ok()?;
@@ -1087,7 +1158,8 @@ fn push_free_run(src_cap: u64, mm_cspace: u64, base: &mut u64, count: &mut u64)
         {
             *base = dst_slot;
         }
-        *count += 1;
+        // `count` tallies forwarded caps, far below `u64::MAX`.
+        *count = count.saturating_add(1);
     }
 }
 
@@ -1126,7 +1198,7 @@ fn assert_init_arena_front_bounded(info: &InitInfo, init_arena_cap: u64)
     {
         let front_bump = size.saturating_sub(available);
         assert!(
-            front_bump <= init_retype_reserve_pages(info) * PAGE_SIZE,
+            front_bump <= init_retype_reserve_pages(info).saturating_mul(PAGE_SIZE),
             "init: arena retype front overran its reserve into backing",
         );
     }
@@ -1191,7 +1263,11 @@ pub fn finalize_memmgr(
     let total_remaining = info.memory_count.saturating_sub(alloc.next_idx);
     for i in 0..total_remaining
     {
-        let src_slot = info.memory_base + alloc.next_idx + i;
+        // Slot indices lie within the root `CSpace`, far below `u64::MAX`.
+        let src_slot = info
+            .memory_base
+            .saturating_add(alloc.next_idx)
+            .saturating_add(i);
         // Keep the forwarded set a contiguous prefix: stop here and let the
         // reap route donate this memory cap and everything after it that has
         // an `InitInfo` descriptor (a cap with none is not donated).
@@ -1228,7 +1304,8 @@ pub fn finalize_memmgr(
         {
             mm_memory_base = dst_slot;
         }
-        mm_memory_count += 1;
+        // `mm_memory_count` is below `total_remaining`, so it cannot overflow.
+        mm_memory_count = mm_memory_count.saturating_add(1);
     }
     // Advance only past the memory caps actually forwarded this round (a
     // contiguous prefix — the loop breaks on the first memory cap it cannot
@@ -1237,7 +1314,8 @@ pub fn finalize_memmgr(
     // handed out by `MemoryAlloc` nor forwarded here, and every
     // descriptor-bearing one is donated to memmgr's pool via the reap route,
     // which has no per-round cap.
-    alloc.next_idx += mm_memory_count;
+    // `mm_memory_count` is at most `total_remaining`, the slots left past `next_idx`.
+    alloc.next_idx = alloc.next_idx.saturating_add(mm_memory_count);
 
     // Forward the partial tail left in `alloc.current`: the unallocated
     // remainder of the last memory cap `MemoryAlloc` split from. It is a
@@ -1287,9 +1365,11 @@ pub fn finalize_memmgr(
     ]
     {
         if let Some(arena) = forward_arena(cap, mm.mm_cspace, kind)
+            && let Some(slot) = in_use.get_mut(in_use_count)
         {
-            in_use[in_use_count] = arena;
-            in_use_count += 1;
+            *slot = arena;
+            // `in_use_count` indexed a slot, so it is below `MAX_IN_USE`.
+            in_use_count = in_use_count.saturating_add(1);
         }
     }
 
@@ -1349,15 +1429,26 @@ pub unsafe fn write_memmgr_aux_memory(
             mm_final.in_use_count as u64,
         );
     }
-    for (i, arena) in mm_final.in_use[..mm_final.in_use_count].iter().enumerate()
+    // `in_use_count` only advances past a slot of `in_use`, so it is within the array.
+    let in_use = mm_final
+        .in_use
+        .get(..mm_final.in_use_count)
+        .unwrap_or_default();
+    for (i, arena) in in_use.iter().enumerate()
     {
-        let base = mb::IN_USE_BASE_IDX + i * mb::IN_USE_WORDS;
+        // `i` is below `MAX_IN_USE`, so the word index stays within the page.
+        let base = i
+            .saturating_mul(mb::IN_USE_WORDS)
+            .saturating_add(mb::IN_USE_BASE_IDX);
         // SAFETY: base + 3 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the page.
         unsafe {
             core::ptr::write_volatile(phys_dst.add(base), arena.cap_slot);
-            core::ptr::write_volatile(phys_dst.add(base + 1), u64::from(arena.page_count));
-            core::ptr::write_volatile(phys_dst.add(base + 2), arena.phys_base);
-            core::ptr::write_volatile(phys_dst.add(base + 3), arena.kind);
+            core::ptr::write_volatile(
+                phys_dst.add(base.saturating_add(1)),
+                u64::from(arena.page_count),
+            );
+            core::ptr::write_volatile(phys_dst.add(base.saturating_add(2)), arena.phys_base);
+            core::ptr::write_volatile(phys_dst.add(base.saturating_add(3)), arena.kind);
         }
     }
 }
@@ -1514,19 +1605,13 @@ unsafe fn place_stack_and_ipc(
     stack_pages: u32,
 ) -> Option<()>
 {
-    let stack_base = stack_top - u64::from(stack_pages) * PAGE_SIZE;
+    let stack_base = stack_top.checked_sub(u64::from(stack_pages).checked_mul(PAGE_SIZE)?)?;
     for i in 0..stack_pages
     {
+        let page_va = stack_base.checked_add(u64::from(i).checked_mul(PAGE_SIZE)?)?;
         // SAFETY: the caller's contract: `target_aspace` is a child's address space,
         // never init's own.
-        unsafe {
-            arena.place_page(
-                target_aspace,
-                stack_base + u64::from(i) * PAGE_SIZE,
-                syscall::MAP_WRITABLE,
-                |_| {},
-            )
-        }?;
+        unsafe { arena.place_page(target_aspace, page_va, syscall::MAP_WRITABLE, |_| {}) }?;
     }
     // SAFETY: the caller's contract: `target_aspace` is a child's address space,
     // never init's own.
@@ -1691,8 +1776,7 @@ pub fn bootstrap_procmgr(
     {
         Some(t) =>
         {
-            let table =
-                module_bytes.get(t.file_offset as usize..(t.file_offset + t.size) as usize)?;
+            let table = rela_table_bytes(module_bytes, &t)?;
             elf::validate_relative_relocs(table, machine, span_min, span_end).ok()?
         }
         None => 0,
@@ -1704,10 +1788,10 @@ pub fn bootstrap_procmgr(
     // procmgr is std-using: its arena reserves ELF segments + the main TLS
     // block + `ProcessInfo` + stack + IPC buffer.
     let backing_pages = elf_backing_pages(ehdr, module_bytes)?
-        + tls_backing_pages(ehdr, module_bytes)
-        + 1
-        + u64::from(stack_pages)
-        + 1;
+        .checked_add(tls_backing_pages(ehdr, module_bytes))?
+        .checked_add(1)?
+        .checked_add(u64::from(stack_pages))?
+        .checked_add(1)?;
     let mut arena = BootArena::carve(alloc, init_aspace, backing_pages)?;
 
     let pm_aspace = syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES).ok()?;

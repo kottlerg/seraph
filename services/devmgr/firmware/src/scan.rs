@@ -3,8 +3,8 @@
 
 // services/devmgr/firmware/src/scan.rs
 
-//! PCI configuration-space walk: function discovery, BAR sizing, and
-//! `VirtIO` capability parsing.
+//! PCI configuration-space walk: function discovery, BAR sizing, the MSI
+//! and MSI-X capabilities, and `VirtIO` capability parsing.
 //!
 //! The walk reads and writes configuration space through [`ConfigSpace`],
 //! which devmgr implements over its ECAM mapping with volatile accesses, so
@@ -22,7 +22,10 @@ use virtio_core::{
     VIRTIO_PCI_CAP_NOTIFY_CFG, VirtioCapLocation, VirtioPciStartupInfo, structure_usable,
 };
 
-use crate::pci::{COMMAND, MAX_CAPABILITIES, io_bar_size, mmio_bar_size};
+use crate::pci::{
+    CAP_ID_MSI, CAP_ID_MSIX, COMMAND, MAX_CAPABILITIES, MESSAGE_CONTROL, MSIX_PBA, MSIX_TABLE, Msi,
+    Msix, STATUS, find_capability, io_bar_size, mmio_bar_size,
+};
 
 /// BAR registers in a PCI type-0 configuration header (offsets 0x10 to 0x24).
 pub const MAX_BARS: usize = 6;
@@ -91,6 +94,14 @@ pub struct PciDevice
     /// The secondary and subordinate bus of a PCI-to-PCI bridge (a type-1
     /// header): the buses behind it. `None` for every other function.
     pub bridge_buses: Option<(u8, u8)>,
+    /// The MSI capability of a type-0 header; `None` for a function without
+    /// one and every other header layout.
+    pub msi: Option<Msi>,
+    /// The MSI-X capability of a type-0 header whose table and Pending Bit
+    /// Array each lie wholly inside one of its probed MMIO BARs; `None` for a
+    /// function without one, one whose table or array lies elsewhere, and
+    /// every other header layout.
+    pub msix: Option<Msix>,
 }
 
 /// The walk stopped because the device list could not grow; the functions
@@ -154,8 +165,9 @@ pub fn scan(
     Ok(())
 }
 
-/// Read one present function's identity, interrupt registers, BARs and
-/// subsystem IDs (type-0 headers only), and `VirtIO` capabilities.
+/// Read one present function's identity, interrupt registers, BARs,
+/// subsystem IDs, and MSI and MSI-X capabilities (type-0 headers only), and
+/// `VirtIO` capabilities.
 fn read_function(
     cfg: &impl ConfigSpace,
     segment: u16,
@@ -187,6 +199,8 @@ fn read_function(
         irq_pin: cfg.read8(bus, dev, func, 0x3D),
         virtio_info: VirtioPciStartupInfo::default(),
         bridge_buses: None,
+        msi: None,
+        msix: None,
     };
     // Header layout (header type without its multi-function bit); BARs are
     // probed for a type-0 header only.
@@ -196,6 +210,7 @@ fn read_function(
         pci_dev.subsystem_vendor = cfg.read16(bus, dev, func, PCI_SUBSYSTEM);
         pci_dev.subsystem_id = cfg.read16(bus, dev, func, PCI_SUBSYSTEM + 2);
         probe_bars(cfg, &mut pci_dev);
+        read_message_caps(cfg, &mut pci_dev);
     }
     else if header_layout == 1
     {
@@ -315,6 +330,40 @@ fn record_bar(dev: &mut PciDevice, bar_idx: u8, phys: u64, size: u64, is_mmio: b
     }
 }
 
+/// Record the MSI and MSI-X capabilities of a type-0 function whose BARs are
+/// probed. An MSI-X capability whose table or Pending Bit Array does not lie
+/// wholly inside one of the function's probed MMIO BARs is not recorded: no
+/// driver could be given the table, nor devmgr mask its entries.
+fn read_message_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
+{
+    let (b, d, f) = (dev.bus, dev.dev, dev.func);
+    let status = cfg.read16(b, d, f, STATUS);
+    let read8 = |at: u16| cfg.read8(b, d, f, at);
+    dev.msi = find_capability(status, CAP_ID_MSI, read8)
+        .map(|at| Msi::decode(at, cfg.read16(b, d, f, at + MESSAGE_CONTROL)));
+    dev.msix = find_capability(status, CAP_ID_MSIX, read8)
+        .and_then(|at| {
+            Msix::decode(
+                at,
+                cfg.read16(b, d, f, at + MESSAGE_CONTROL),
+                cfg.read32(b, d, f, at + MSIX_TABLE),
+                cfg.read32(b, d, f, at + MSIX_PBA),
+            )
+        })
+        .filter(|m| {
+            mmio_bar_holds(dev, m.table_bar, m.table_end())
+                && mmio_bar_holds(dev, m.pba_bar, m.pba_end())
+        });
+}
+
+/// Whether BAR register `bar` of `dev` is a probed MMIO BAR of at least
+/// `reach` bytes.
+fn mmio_bar_holds(dev: &PciDevice, bar: u8, reach: u64) -> bool
+{
+    (0..dev.bar_count)
+        .any(|i| dev.bar_pci_idx[i] == bar && dev.bar_is_mmio[i] && reach <= dev.bar_size[i])
+}
+
 /// Walk the PCI capability list of a `VirtIO` function and record the
 /// locations of its four register regions.
 ///
@@ -394,9 +443,7 @@ fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
 /// names none) and its offset plus length is within that BAR's size.
 fn fits_mmio_bar(dev: &PciDevice, loc: &VirtioCapLocation) -> bool
 {
-    let reach = u64::from(loc.offset) + u64::from(loc.length);
-    (0..dev.bar_count)
-        .any(|i| dev.bar_pci_idx[i] == loc.bar && dev.bar_is_mmio[i] && reach <= dev.bar_size[i])
+    mmio_bar_holds(dev, loc.bar, u64::from(loc.offset) + u64::from(loc.length))
 }
 
 #[cfg(test)]
@@ -848,6 +895,86 @@ mod tests
         space.set32(bdf, 0x04, 0);
         let found = scan_all(&space, 0, 0);
         assert_eq!(found[0].virtio_info.common_cfg.length, 0);
+    }
+
+    /// Add a type-0 function with a 16 KiB MMIO BAR 1 and a capability list
+    /// of an MSI capability at 0x50 (Message Control `msi_control`) and an
+    /// MSI-X capability at 0x60 (Message Control `msix_control`, Table and
+    /// PBA registers `table` and `pba`).
+    fn message_function(
+        space: &FakeSpace,
+        bdf: (u8, u8, u8),
+        msi_control: u16,
+        msix: (u16, u32, u32),
+    )
+    {
+        space.add(bdf, 0x1B36, 0x0011, 0x00);
+        space.set32(bdf, 0x04, 0x0010_0000);
+        mmio_bar(space, bdf, 1, 0xFE80_0000);
+        space.set32(bdf, 0x34, 0x50);
+        space.set32(
+            bdf,
+            0x50,
+            (u32::from(msi_control) << 16) | (0x60 << 8) | 0x05,
+        );
+        space.set32(bdf, 0x60, (u32::from(msix.0) << 16) | 0x11);
+        space.set32(bdf, 0x64, msix.1);
+        space.set32(bdf, 0x68, msix.2);
+    }
+
+    #[test]
+    fn a_function_records_its_msi_and_msix_capabilities()
+    {
+        let space = FakeSpace::default();
+        let bdf = (0, 7, 0);
+        // MSI: 64-bit, 4 vectors. MSI-X: 8 entries, the table at 0x2000 and
+        // the array at 0x3000 of BAR 1.
+        message_function(&space, bdf, 0x0084, (0x0007, 0x2001, 0x3001));
+        let d = scan_all(&space, 0, 0)[0];
+        let msi = d.msi.unwrap();
+        assert_eq!((msi.offset, msi.vectors, msi.address_64), (0x50, 4, true));
+        let msix = d.msix.unwrap();
+        assert_eq!(
+            (
+                msix.offset,
+                msix.table_size,
+                msix.table_bar,
+                msix.table_offset
+            ),
+            (0x60, 8, 1, 0x2000)
+        );
+        assert_eq!((msix.pba_bar, msix.pba_offset), (1, 0x3000));
+    }
+
+    #[test]
+    fn an_msix_table_or_array_outside_a_probed_mmio_bar_is_not_recorded()
+    {
+        let space = FakeSpace::default();
+        // The table reaches one entry past the 16 KiB BAR 1.
+        message_function(&space, (0, 7, 0), 0, (0x0001, 0x3FF1, 0x1));
+        // The array names BAR 2, which is not probed.
+        message_function(&space, (0, 8, 0), 0, (0x0001, 0x1, 0x2));
+        // Both within BAR 1.
+        message_function(&space, (0, 9, 0), 0, (0x0001, 0x3FE1, 0x3FF9));
+        let found = scan_all(&space, 0, 0);
+        assert_eq!(found[0].msix, None);
+        assert_eq!(found[1].msix, None);
+        assert!(found[2].msix.is_some());
+        assert!(found.iter().all(|d| d.msi.is_some()));
+    }
+
+    #[test]
+    fn a_function_without_a_capability_list_or_a_type0_header_records_neither()
+    {
+        let space = FakeSpace::default();
+        message_function(&space, (0, 7, 0), 0, (0x0001, 0x2001, 0x3001));
+        // Status: no Capabilities List.
+        space.set32((0, 7, 0), 0x04, 0);
+        message_function(&space, (0, 8, 0), 0, (0x0001, 0x2001, 0x3001));
+        // A bridge header.
+        space.funcs.borrow_mut().get_mut(&(0, 8, 0)).unwrap().cfg[0x0E] = 0x01;
+        let found = scan_all(&space, 0, 0);
+        assert!(found.iter().all(|d| d.msi.is_none() && d.msix.is_none()));
     }
 
     #[test]

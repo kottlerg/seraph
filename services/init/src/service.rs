@@ -350,22 +350,30 @@ fn serve_extent_rounds(
     while extents.peek().is_some()
     {
         let mut data = [0u64; 2 + EXTENTS_PER_ROUND * 2];
+        let [kind_word, count_word, pairs @ ..] = &mut data;
         let mut n = 0usize;
-        for (base, size) in extents.by_ref().take(EXTENTS_PER_ROUND)
+        for ((base, size), pair) in extents
+            .by_ref()
+            .take(EXTENTS_PER_ROUND)
+            .zip(pairs.as_chunks_mut::<2>().0.iter_mut())
         {
-            data[2 + n * 2] = base;
-            data[3 + n * 2] = size;
-            n += 1;
+            let [base_word, size_word] = pair;
+            *base_word = base;
+            *size_word = size;
+            // At most `EXTENTS_PER_ROUND` pairs are taken.
+            n = n.saturating_add(1);
         }
-        data[0] = kind::RAM_EXTENT;
-        data[1] = n as u64;
+        *kind_word = kind::RAM_EXTENT;
+        *count_word = n as u64;
         if !serve(
             bootstrap_ep,
             child_badge,
             ipc_buf,
             false,
             &[],
-            &data[..2 + n * 2],
+            // `n` is at most `EXTENTS_PER_ROUND`, so the range is within `data`.
+            data.get(..n.saturating_mul(2).saturating_add(2))
+                .unwrap_or_default(),
             "devmgr: bootstrap RAM extent round failed",
         )
         {
@@ -402,7 +410,9 @@ fn serve_module_rounds(
 ) -> bool
 {
     let count = (info.module_name_count as usize).min(init_protocol::INIT_MAX_NAMED_MODULES);
-    let mut forwarded = info.module_names[..count].iter().filter(|entry| {
+    // `count` is at most the array length (`INIT_MAX_NAMED_MODULES`).
+    let names = info.module_names.get(..count).unwrap_or_default();
+    let mut forwarded = names.iter().filter(|entry| {
         let name = init_protocol::module_name_str(&entry.name);
         !BOOTSTRAP_MODULES.contains(&name)
     });
@@ -410,6 +420,7 @@ fn serve_module_rounds(
     {
         let mut caps = [0u64; MODULES_PER_ROUND];
         let mut data = [0u64; 2 + MODULES_PER_ROUND];
+        let [kind_word, count_word, sizes @ ..] = &mut data;
         let mut n = 0usize;
         for entry in forwarded.by_ref()
         {
@@ -428,9 +439,17 @@ fn serve_module_rounds(
                 log("devmgr: boot module cap derive failed; module skipped");
                 continue;
             };
-            caps[n] = copy;
-            data[2 + n] = bytes;
-            n += 1;
+            // The loop breaks once `n` reaches `MODULES_PER_ROUND`, so both slots exist.
+            let (Some(cap_slot), Some(size_word)) = (caps.get_mut(n), sizes.get_mut(n))
+            else
+            {
+                let _ = syscall::cap_delete(copy);
+                break;
+            };
+            *cap_slot = copy;
+            *size_word = bytes;
+            // `n` indexed a slot of `caps`, so it is below `MODULES_PER_ROUND`.
+            n = n.saturating_add(1);
             if n == MODULES_PER_ROUND
             {
                 break;
@@ -440,15 +459,16 @@ fn serve_module_rounds(
         {
             return true;
         }
-        data[0] = kind::MODULE;
-        data[1] = n as u64;
+        *kind_word = kind::MODULE;
+        *count_word = n as u64;
         if !serve(
             bootstrap_ep,
             child_badge,
             ipc_buf,
             false,
-            &caps[..n],
-            &data[..2 + n],
+            // `n` is at most `MODULES_PER_ROUND`, so both ranges are in bounds.
+            caps.get(..n).unwrap_or_default(),
+            data.get(..n.saturating_add(2)).unwrap_or_default(),
             "devmgr: bootstrap module round failed",
         )
         {
@@ -500,6 +520,9 @@ fn serve_region_rounds(
     {
         let mut caps = [0u64; 4];
         let mut data = [0u64; 2 + 4 * 2];
+        let [kind_word, count_word, pairs @ ..] = &mut data;
+        let mut cap_slots = caps.iter_mut();
+        let mut pair_slots = pairs.as_chunks_mut::<2>().0.iter_mut();
         let mut n = 0usize;
         for (slot, base, size) in regions.by_ref().take(4)
         {
@@ -509,20 +532,31 @@ fn serve_region_rounds(
                 log("devmgr: region cap derive failed; region skipped");
                 continue;
             };
-            caps[n] = c;
-            data[2 + n * 2] = base;
-            data[3 + n * 2] = size;
-            n += 1;
+            // At most four regions are taken, matching the four cap and pair slots.
+            if let (Some(cap_slot), Some([base_word, size_word])) =
+                (cap_slots.next(), pair_slots.next())
+            {
+                *cap_slot = c;
+                *base_word = base;
+                *size_word = size;
+                n = n.saturating_add(1);
+            }
+            else
+            {
+                let _ = syscall::cap_delete(c);
+            }
         }
-        data[0] = round_kind;
-        data[1] = n as u64;
+        *kind_word = round_kind;
+        *count_word = n as u64;
         if !serve(
             bootstrap_ep,
             child_badge,
             ipc_buf,
             false,
-            &caps[..n],
-            &data[..2 + n * 2],
+            // `n` is at most four, so both ranges are in bounds.
+            caps.get(..n).unwrap_or_default(),
+            data.get(..n.saturating_mul(2).saturating_add(2))
+                .unwrap_or_default(),
             context,
         )
         {
@@ -602,14 +636,12 @@ pub fn create_devmgr_with_caps(
         return None;
     }
 
-    let reply_caps = reply.caps();
-    if reply_caps.len() < 2
+    let &[process_handle, thread_cap, ..] = reply.caps()
+    else
     {
         log("devmgr: CREATE_PROCESS reply missing caps");
         return None;
-    }
-    let process_handle = reply_caps[0];
-    let thread_cap = reply_caps[1];
+    };
 
     let hw = collect_hw_caps(info);
 
@@ -667,34 +699,46 @@ pub fn create_devmgr_with_caps(
     // Round 1: [registry, ...present(irq,rsdp,dtb)].
     // data[0] = presence bitmap; data[1]=rsdp_base, data[2]=dtb_base,
     // data[3]=dtb_size (always written; bitmap indicates validity).
-    let mut r1_caps = [0u64; 4];
+    let mut r1_caps = [registry_copy, 0, 0, 0];
     let mut r1_cap_count: usize = 1;
-    r1_caps[0] = registry_copy;
     let mut presence: u64 = 0;
     if irq_copy != 0
     {
         presence |= present::IRQ_RANGE;
-        r1_caps[r1_cap_count] = irq_copy;
-        r1_cap_count += 1;
+        if let Some(slot) = r1_caps.get_mut(r1_cap_count)
+        {
+            *slot = irq_copy;
+            // `r1_cap_count` indexed a slot, so it is below the array length.
+            r1_cap_count = r1_cap_count.saturating_add(1);
+        }
     }
     if rsdp_copy != 0
     {
         presence |= present::RSDP;
-        r1_caps[r1_cap_count] = rsdp_copy;
-        r1_cap_count += 1;
+        if let Some(slot) = r1_caps.get_mut(r1_cap_count)
+        {
+            *slot = rsdp_copy;
+            // `r1_cap_count` indexed a slot, so it is below the array length.
+            r1_cap_count = r1_cap_count.saturating_add(1);
+        }
     }
     if dtb_copy != 0
     {
         presence |= present::DTB;
-        r1_caps[r1_cap_count] = dtb_copy;
-        r1_cap_count += 1;
+        if let Some(slot) = r1_caps.get_mut(r1_cap_count)
+        {
+            *slot = dtb_copy;
+            // `r1_cap_count` indexed a slot, so it is below the array length.
+            r1_cap_count = r1_cap_count.saturating_add(1);
+        }
     }
     if !serve(
         bootstrap_ep,
         child_badge,
         ipc_buf,
         false,
-        &r1_caps[..r1_cap_count],
+        // At most three optional caps follow the registry cap, so the count is at most four.
+        r1_caps.get(..r1_cap_count).unwrap_or_default(),
         &[presence, hw.rsdp_page_base, hw.dtb_page_base, hw.dtb_size],
         "devmgr: bootstrap round 1 failed",
     )
@@ -857,7 +901,8 @@ pub fn create_devmgr_with_caps(
         child_badge,
         ipc_buf,
         true,
-        &bundle_caps[..bundle_cap_count],
+        // `bundle_cap_count` is one or two, within the two-element array.
+        bundle_caps.get(..bundle_cap_count).unwrap_or_default(),
         &[kind::SVCMGR_BUNDLE, bundle_cap_count as u64],
         "devmgr: bootstrap SVCMGR_BUNDLE round failed",
     );
@@ -942,14 +987,12 @@ pub fn create_vfsd_with_caps(
         return None;
     }
 
-    let reply_caps = reply.caps();
-    if reply_caps.len() < 2
+    let &[process_handle, thread_cap, ..] = reply.caps()
+    else
     {
         log("vfsd: CREATE_PROCESS reply missing caps");
         return None;
-    }
-    let process_handle = reply_caps[0];
-    let thread_cap = reply_caps[1];
+    };
 
     let Ok(service_copy) = syscall::cap_derive(spawn.vfsd_service_ep, syscall::RIGHTS_ALL)
     else
@@ -1062,18 +1105,18 @@ pub fn create_svcmgr_from_file(
     }
 
     let reply_caps = reply.caps();
-    if reply_caps.is_empty()
+    let Some(&process_handle) = reply_caps.first()
+    else
     {
         log("phase 3: svcmgr reply missing caps");
         return None;
-    }
-    let process_handle = reply_caps[0];
+    };
     // CREATE_FROM_FILE returns (process_handle, thread_cap); this caller
     // path has no use for the thread cap. Release the slot so it does
     // not accumulate in init's CSpace.
-    if reply_caps.len() >= 2
+    if let Some(&thread_cap) = reply_caps.get(1)
     {
-        let _ = syscall::cap_delete(reply_caps[1]);
+        let _ = syscall::cap_delete(thread_cap);
     }
 
     // svcmgr is the supervisor and holds the universal root: it
@@ -1336,16 +1379,22 @@ fn serve_substrate_rounds(
             continue;
         };
         let mut data = [0u64; 2 + ipc::svcmgr_labels::NAME_WORDS];
-        data[0] = svcmgr_endowment::kind::SUBSTRATE;
-        data[1] = name.len() as u64;
-        data[2..2 + nw].copy_from_slice(&name_words[..nw]);
+        let [kind_word, len_word, words @ ..] = &mut data;
+        *kind_word = svcmgr_endowment::kind::SUBSTRATE;
+        *len_word = name.len() as u64;
+        // `pack_name` returns the count of words it wrote into `name_words`, which is
+        // at most `NAME_WORDS`, the length of both `words` and `name_words`.
+        if let (Some(dst), Some(src)) = (words.get_mut(..nw), name_words.get(..nw))
+        {
+            dst.copy_from_slice(src);
+        }
         serve_checked(
             bootstrap_ep,
             child_badge,
             ipc_buf,
             false,
             &[thread_cap],
-            &data[..2 + nw],
+            data.get(..nw.saturating_add(2)).unwrap_or_default(),
             "phase 3: svcmgr endowment SUBSTRATE round failed",
         )?;
     }
@@ -1682,10 +1731,19 @@ fn finish_init_reap_handoff(
     // every page of RAM reaches memmgr's pool. Boot-module Memory caps are also
     // included: init is their sole owner once every loader has copied the ELF
     // and dropped its borrowed read-only derivation.
-    let seg = info.segment_memory_base..info.segment_memory_base + info.segment_memory_count;
-    let stack =
-        info.init_stack_memory_base..info.init_stack_memory_base + info.init_stack_memory_count;
-    let inf = info.init_info_memory_base..info.init_info_memory_base + info.init_info_memory_count;
+    // The `InitInfo` slot ranges lie within the root `CSpace`, far below `u64::MAX`.
+    let seg = info.segment_memory_base
+        ..info
+            .segment_memory_base
+            .saturating_add(info.segment_memory_count);
+    let stack = info.init_stack_memory_base
+        ..info
+            .init_stack_memory_base
+            .saturating_add(info.init_stack_memory_count);
+    let inf = info.init_info_memory_base
+        ..info
+            .init_info_memory_base
+            .saturating_add(info.init_info_memory_count);
 
     let mem_lo = info.memory_base;
     let acpi_lo = info.acpi_region_memory_base;
@@ -1697,8 +1755,12 @@ fn finish_init_reap_handoff(
     let mut cn = 0usize;
     {
         let mut push = |slot: u64| {
-            chunk[cn] = slot;
-            cn += 1;
+            if let Some(entry) = chunk.get_mut(cn)
+            {
+                *entry = slot;
+                // `cn` indexed an entry, so it is below the chunk length.
+                cn = cn.saturating_add(1);
+            }
             if cn == chunk.len()
             {
                 // SAFETY: ipc_buf is registered; procmgr_ep carries SEND|GRANT.
@@ -1746,7 +1808,7 @@ fn finish_init_reap_handoff(
     if cn > 0
     {
         // SAFETY: ipc_buf is registered; procmgr_ep carries SEND|GRANT.
-        unsafe { send_teardown_round(procmgr_ep, &chunk[..cn], ipc_buf) };
+        unsafe { send_teardown_round(procmgr_ep, chunk.get(..cn).unwrap_or_default(), ipc_buf) };
     }
 
     // Notification the cap stream is closed. Procmgr arms the death-EQ

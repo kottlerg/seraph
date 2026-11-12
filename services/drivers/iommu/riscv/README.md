@@ -68,12 +68,12 @@ device request like any other: the device's first stage translates it, so a devi
 interrupt files its domain maps; an MSI to any other faults, reported as every other fault is.
 `MAP_MSI` maps one file's page into a domain at its own address, read-write (a first-stage entry
 cannot allow writes without reads), with no cap; `UNMAP` refuses it and the domain's `BLOCK`
-withdraws it with the rest. devmgr is to map the files of the harts a device's interrupt targets sit
+withdraws it with the rest. devmgr maps the files of the harts a device's interrupt targets sit
 on, so the device can write to those harts' supervisor-level files and to no other hart's, nor to
-any machine-level or guest file (design intent; not yet implemented: devmgr sends no `MAP_MSI`
-until it gives drivers message-signalled interrupts, and until then a device behind the IOMMU
-reaches no interrupt file). The confinement is per file: a device can write any interrupt identity
-into a file it reaches, so a forged identity can signal another receiver on that hart.
+any machine-level or guest file (devmgr sends `MAP_MSI` before it enables a device's vectors, and
+a device given none reaches no interrupt file). The confinement is per file: a device can write
+any interrupt identity into a file it reaches, so a forged identity can signal another receiver on
+that hart.
 
 The IOMMU's MSI page tables (`msiptp`, available where the IOMMU offers `MSI_FLAT` and uses the
 64-byte device context) stay Off. The specification requires `msiptp.MODE` Off whenever the second

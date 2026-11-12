@@ -26,7 +26,9 @@
 //! [`MAX_MAPPINGS_PER_DEVICE`] mappings, and no two of a device's mappings
 //! overlap in device-address space. A confined device registers with the
 //! firmware-reserved ranges its domain maps at their own addresses
-//! ([`reserved_ranges`]), which no mapping's IOVA overlaps. The table never
+//! ([`reserved_ranges`]), and holds the interrupt files its domain maps at
+//! their own addresses ([`DmaTable::hold_interrupt_file`]); no mapping's IOVA
+//! overlaps either. The table never
 //! reads or writes IOMMU state. See `docs/device-management.md` § DMA
 //! Authorisation and § IOMMU Discovery and Programming.
 
@@ -334,18 +336,29 @@ struct Entry
     state: State,
 }
 
-/// A registered device, its confinement, its firmware-reserved ranges, and
-/// its mappings.
+/// A registered device, its confinement, its firmware-reserved ranges and
+/// held interrupt files, and its mappings.
 struct Device
 {
     badge: u64,
     confinement: Confinement,
+    /// The firmware-reserved ranges, then each interrupt file's page held
+    /// since ([`DmaTable::hold_interrupt_file`]).
     reserved: Vec<ReservedRange>,
+    /// How many of `reserved` are firmware-reserved ranges; the rest are
+    /// held interrupt files.
+    firmware: usize,
     entries: Vec<Entry>,
 }
 
 impl Device
 {
+    /// The interrupt files' pages the device holds.
+    fn files(&self) -> &[ReservedRange]
+    {
+        self.reserved.get(self.firmware..).unwrap_or_default()
+    }
+
     fn entry(&mut self, device_addr: u64, state: State) -> Option<&mut Entry>
     {
         self.entries
@@ -485,6 +498,7 @@ impl DmaTable
             badge,
             confinement,
             reserved: kept,
+            firmware: reserved.len(),
             entries: Vec::new(),
         });
         Ok(())
@@ -647,6 +661,70 @@ impl DmaTable
         };
         entry.state = State::Standing;
         true
+    }
+
+    /// Hold the page of an interrupt file at `file` out of the IOVA space of
+    /// the confined device `badge`, beside its firmware-reserved ranges: its
+    /// domain is to map the page at its own address
+    /// (`iommu_labels::MAP_MSI`), so no mapping's IOVA may overlap it. Held
+    /// before the page is mapped, so no mapping takes its IOVA meanwhile, and
+    /// let go ([`Self::release_interrupt_file`]) when the mapping fails.
+    /// Returns whether the page is newly held; `false` when the device holds
+    /// it already, so its domain maps it already.
+    ///
+    /// # Errors
+    /// [`MapError::UnknownDevice`] for an unregistered badge;
+    /// [`MapError::InvalidRequest`] for an unconfined device or a `file` not
+    /// page-aligned; [`MapError::AddressInUse`] when the page overlaps a
+    /// mapping or a firmware-reserved range of the device;
+    /// [`MapError::OutOfMemory`] when the table cannot grow. Nothing is held
+    /// on any error.
+    pub fn hold_interrupt_file(&mut self, badge: u64, file: u64) -> Result<bool, MapError>
+    {
+        let device = self.device_mut(badge).ok_or(MapError::UnknownDevice)?;
+        if device.confinement == Confinement::Unconfined || !file.is_multiple_of(PAGE_SIZE)
+        {
+            return Err(MapError::InvalidRequest);
+        }
+        let page = ReservedRange {
+            base: file,
+            len: PAGE_SIZE,
+        };
+        if device.files().contains(&page)
+        {
+            return Ok(false);
+        }
+        if device.reserved.iter().any(|r| r.overlaps(file, PAGE_SIZE))
+            || device
+                .entries
+                .iter()
+                .any(|e| e.mapping.overlaps(file, PAGE_SIZE))
+        {
+            return Err(MapError::AddressInUse);
+        }
+        device
+            .reserved
+            .try_reserve(1)
+            .map_err(|_| MapError::OutOfMemory)?;
+        device.reserved.push(page);
+        Ok(true)
+    }
+
+    /// Let go of the interrupt file's page at `file` the device `badge` holds
+    /// ([`Self::hold_interrupt_file`]), its mapping having failed; nothing
+    /// for an unregistered badge or a page it does not hold.
+    pub fn release_interrupt_file(&mut self, badge: u64, file: u64)
+    {
+        let page = ReservedRange {
+            base: file,
+            len: PAGE_SIZE,
+        };
+        if let Some(d) = self.device_mut(badge)
+            && let Some(at) = d.files().iter().position(|r| *r == page)
+            && let Some(held) = d.firmware.checked_add(at)
+        {
+            d.reserved.remove(held);
+        }
     }
 
     /// Remove the device `badge`, so its driver's later requests are refused,
@@ -1081,6 +1159,61 @@ mod tests
         // carry no cap.
         let w = t.withdraw(7).unwrap();
         assert_eq!(w.mappings.len(), 2);
+    }
+
+    #[test]
+    fn a_held_interrupt_file_takes_no_mapping_iova_and_is_held_once()
+    {
+        let mut t = DmaTable::new();
+        t.register(7, DOMAIN, &[rr(IOVA_BASE + 3 * PAGE_SIZE, PAGE_SIZE)])
+            .unwrap();
+        let file = IOVA_BASE + PAGE_SIZE;
+        assert_eq!(t.hold_interrupt_file(7, file), Ok(true));
+        // A second vector on the same file needs no second mapping.
+        assert_eq!(t.hold_interrupt_file(7, file), Ok(false));
+        assert_eq!(map_iova(&mut t, 7, PAGE_SIZE), Ok(IOVA_BASE));
+        assert_eq!(
+            map_iova(&mut t, 7, PAGE_SIZE),
+            Ok(IOVA_BASE + 2 * PAGE_SIZE)
+        );
+        // A file on a mapping or a firmware-reserved range, the very page
+        // included, is refused.
+        assert_eq!(
+            t.hold_interrupt_file(7, IOVA_BASE),
+            Err(MapError::AddressInUse)
+        );
+        assert_eq!(
+            t.hold_interrupt_file(7, IOVA_BASE + 3 * PAGE_SIZE),
+            Err(MapError::AddressInUse)
+        );
+        // Letting go of a firmware-reserved page lets go of nothing.
+        t.release_interrupt_file(7, IOVA_BASE + 3 * PAGE_SIZE);
+        assert_eq!(
+            t.hold_interrupt_file(7, IOVA_BASE + 3 * PAGE_SIZE),
+            Err(MapError::AddressInUse)
+        );
+        // A file let go of frees its IOVA again.
+        t.release_interrupt_file(7, file);
+        assert_eq!(map_iova(&mut t, 7, PAGE_SIZE), Ok(file));
+    }
+
+    #[test]
+    fn an_interrupt_file_is_held_only_for_a_confined_registered_device_and_a_page()
+    {
+        let mut t = table_with(7, Confinement::Unconfined);
+        t.register(8, DOMAIN, &[]).unwrap();
+        assert_eq!(
+            t.hold_interrupt_file(7, 0x2800_0000),
+            Err(MapError::InvalidRequest)
+        );
+        assert_eq!(
+            t.hold_interrupt_file(8, 0x2800_0004),
+            Err(MapError::InvalidRequest)
+        );
+        assert_eq!(
+            t.hold_interrupt_file(9, 0x2800_0000),
+            Err(MapError::UnknownDevice)
+        );
     }
 
     #[test]

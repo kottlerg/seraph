@@ -135,9 +135,9 @@ The full driver lifecycle is specified in
   § DMA Safety Model and [docs/architecture.md](../../docs/architecture.md)).
 - **Per-device capabilities** —
   [devmgr](../devmgr/docs/responsibilities.md#responsibilities) delegates the
-  minimum capability set for each device: MMIO region, optional interrupt line, the
-  service endpoint, IoPort (x86-64) where applicable, the DMA capability of a
-  DMA-capable device (below), and a devmgr query cap: a badged SEND on the private
+  minimum capability set for each device: MMIO region, optional interrupt (wired line or
+  message-signaled vectors), the service endpoint, IoPort (x86-64) where applicable, the DMA
+  capability of a DMA-capable device (below), and a devmgr query cap: a badged SEND on the private
   endpoint of the driver's spawn batch, on which a driver that fetches runtime
   metadata (the framebuffer, the VirtIO PCI drivers) sends device-info queries, and
   every driver reports `DRIVER_READY` once its device is set up (devmgr serves a

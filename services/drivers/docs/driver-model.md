@@ -65,11 +65,11 @@ revoking every copy and dropping the device's mappings, which also blocks the de
 IOMMU confines it (the IOMMU driver's `BLOCK`); then it clears the function's Bus Master
 Enable through a configuration-page cap it keeps and no driver holds, so the device issues no
 further DMA; revokes the driver's mappings of its BARs; sets the function's Command Interrupt
-Disable bit through the same cap; runs the reset the driver's declaration names (the VirtIO status
-reset, `device_status` 0 complete once the status reads back 0 within `RESET_TIMEOUT`, or a PCI
-Express Function Level Reset, complete once the function answers after `FLR_COMPLETION_MS`; or
-none, and a device with none is never confirmed quiet); and destroys the driver. Every driver of
-a DMA declaration is created
+Disable bit and clears its MSI Enable and MSI-X Enable bits through the same cap; runs the reset
+the driver's declaration names (the VirtIO status reset, `device_status` 0 complete once the
+status reads back 0 within `RESET_TIMEOUT`, or a PCI Express Function Level Reset, complete once
+the function answers after `FLR_COMPLETION_MS`; or none, and a device with none is never confirmed
+quiet); and destroys the driver. Every driver of a DMA declaration is created
 `CREATE_DMA_HOLD`, so procmgr holds its memory after its death, however it died, until devmgr
 releases it, which devmgr does only when the IOMMU blocked the device, or when the Bus Master
 Enable read-back is clear, every BAR copy is revoked and the reset is confirmed; otherwise the

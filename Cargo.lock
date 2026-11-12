@@ -1372,6 +1372,7 @@ dependencies = [
 name = "svctest"
 version = "0.1.3"
 dependencies = [
+ "driver-binding",
  "fatfs-parse",
  "ipc",
  "log 0.1.3",

@@ -24,11 +24,14 @@
 //! controller, pinned to CPU 0, runs [`ROUNDS`] rounds: wait (bounded) for
 //! the child to progress, stop it, read its registers at once (required to
 //! succeed), check the saved instruction pointer lies in the child's spin
-//! code, point it at [`redirected_entry`], write the registers back, and
-//! restart the child. The redirected child records the round the controller
-//! published before the restart, which it can learn only by entering
-//! [`redirected_entry`] afresh, and spins on; the controller waits (bounded)
-//! for that record, which proves the write took effect.
+//! code, point it at [`redirected_entry`] with the stack pointer at the top
+//! of the child's stack, write the registers back, and restart the child.
+//! The redirected child records the round the controller published before
+//! the restart, which it can learn only by entering [`redirected_entry`]
+//! afresh, and spins on; the controller waits (bounded) for that record,
+//! which proves the write took effect. Once the child is deleted, it must
+//! have used at most half its `ChildStack`: a redirect that left the
+//! abandoned frames in place would grow the stack a call chain a round.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -129,7 +132,33 @@ fn scenario(ctx: &TestContext) -> TestResult
             .and_then(|()| rounds(&child));
     let released = release(child);
     ran?;
-    released
+    released?;
+    check_stack_use()
+}
+
+/// Fail when the deleted child used more than half its `CHILD_STACK`, logging
+/// the bytes it used. Each redirect starts the child at the stack's top, so
+/// one call chain is all it uses; a use past half the stack is chains left
+/// behind round after round, which past the whole stack overwrite the statics
+/// below it.
+fn check_stack_use() -> TestResult
+{
+    // SAFETY: `CHILD_STACK` was zero at the boot's start, this cell is its
+    // only user and runs once a boot, and `release` deleted the child, its one
+    // thread.
+    let used = unsafe { ChildStack::used_bytes(core::ptr::addr_of!(CHILD_STACK)) };
+    if used > ChildStack::BYTES / 2
+    {
+        crate::log_u64(
+            "ktest: integration::stop_read_regs_remote stack_used=",
+            used as u64,
+        );
+        return Err(
+            "integration::stop_read_regs_remote: the redirected child's frames accumulated on its \
+             stack",
+        );
+    }
+    Ok(())
 }
 
 /// Run [`ROUNDS`] rounds, stopping at the first that fails.
@@ -186,13 +215,14 @@ fn redirect(child: &SpawnedChild, round: u32) -> TestResult
     }
     ROUND.store(round, Ordering::Release);
     let target = redirected_entry as *const () as u64;
-    crate::spawn::redirect_to_entry(&mut regs[..], target);
-    // SAFETY: the frame was read from this child, so its stack pointer lies on
-    // the child's own `ChildStack`; `redirect_to_entry` pointed it at `redirected_entry`,
+    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    crate::spawn::redirect_to_entry_at(&mut regs[..], target, stack_top);
+    // SAFETY: `redirect_to_entry_at` pointed the frame at `redirected_entry`,
     // an `extern "C"` entry that never returns and needs nothing of the
-    // abandoned frame, with the stack pointer moved down to the entry ABI's
-    // alignment on that same stack, so the child resumes on code and a stack
-    // it owns.
+    // abandoned frames, with the stack pointer at the entry ABI's alignment
+    // below the top of `CHILD_STACK`, the child's own `ChildStack`; the child
+    // is stopped, so no code runs on those frames again, and it resumes on code
+    // and a stack it owns.
     unsafe { thread_write_regs(child.th, &regs[..BUF]) }.map_err(|e| {
         log_error(
             "ktest: integration::stop_read_regs_remote thread_write_regs error=",
@@ -306,9 +336,10 @@ extern "C" fn spin_entry(_arg: u64) -> !
 }
 
 /// Redirect target: record the round the controller published before the
-/// restart, then spin on. Each redirect enters this on the stack the child
-/// was stopped on, which grows by a few frames a round, far inside a
-/// `ChildStack` across [`ROUNDS`] rounds.
+/// restart, then spin on. Each redirect enters this at the top of
+/// `CHILD_STACK` (`spawn::redirect_to_entry_at`), abandoning the frames the
+/// child was stopped in, so the child's stack holds one call chain whatever
+/// the round count, as the cell checks once the child is deleted.
 extern "C" fn redirected_entry(_arg: u64) -> !
 {
     REDIRECTED.store(ROUND.load(Ordering::Acquire), Ordering::Release);

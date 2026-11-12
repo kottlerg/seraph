@@ -125,19 +125,25 @@ impl IoPortBindings
     }
 
     /// Permit `count` ports from `base` in every part of the bitmap.
-    // cast_possible_truncation: a part's first port is below 65536.
-    #[allow(clippy::cast_possible_truncation)]
     fn permit(&mut self, base: u32, count: u32)
     {
-        for (i, &part) in self.bitmap.parts.iter().enumerate()
+        // Each part covers the ports of its bytes' bits, from port 0 on.
+        let first_ports = (0u32..).step_by(IOPB_PART_BYTES * 8);
+        for (&part, first_port) in self.bitmap.parts.iter().zip(first_ports)
         {
             // SAFETY: each part is a live block the table owns
             // (init_in_place's contract), and `&mut self` excludes every
             // other use of it.
             let part = unsafe { &mut *part };
-            let first_port = (i * IOPB_PART_BYTES * 8) as u32;
             crate::arch::current::gdt::permit_port_range(part, first_port, base, count);
         }
+    }
+
+    /// The recorded bindings. `count` never passes `MAX_IOPORT_BINDINGS`
+    /// (`bind` records into a free entry only), so none is cut off.
+    fn records(&self) -> &[IoPortBinding]
+    {
+        self.records.get(..self.count).unwrap_or_default()
     }
 
     /// Record a binding of `count` ports from `base` through `object` and
@@ -148,22 +154,23 @@ impl IoPortBindings
     /// [`TableFull`] when [`MAX_IOPORT_BINDINGS`] bindings are already recorded.
     pub fn bind(&mut self, object: usize, base: u32, count: u32) -> Result<(), TableFull>
     {
-        if self.records[..self.count]
-            .iter()
-            .any(|r| r.object == object)
+        if self.records().iter().any(|r| r.object == object)
         {
             return Ok(());
         }
-        if self.count == MAX_IOPORT_BINDINGS
+        let Some(record) = self.records.get_mut(self.count)
+        else
         {
             return Err(TableFull);
-        }
-        self.records[self.count] = IoPortBinding {
+        };
+        *record = IoPortBinding {
             object,
             base,
             count,
         };
-        self.count += 1;
+        // An entry was free, so the count stays at most
+        // `MAX_IOPORT_BINDINGS`.
+        self.count = self.count.saturating_add(1);
         self.permit(base, count);
         Ok(())
     }
@@ -173,13 +180,23 @@ impl IoPortBindings
     pub fn withdraw(&mut self, object: usize) -> bool
     {
         let before = self.count;
-        let mut kept = 0;
+        let mut kept = 0usize;
         for i in 0..before
         {
-            if self.records[i].object != object
+            let Some(&record) = self.records.get(i)
+            else
             {
-                self.records[kept] = self.records[i];
-                kept += 1;
+                break;
+            };
+            if record.object != object
+            {
+                // `kept <= i`: the entry exists and the count does not
+                // saturate.
+                if let Some(entry) = self.records.get_mut(kept)
+                {
+                    *entry = record;
+                }
+                kept = kept.saturating_add(1);
             }
         }
         self.count = kept;
@@ -194,8 +211,10 @@ impl IoPortBindings
         }
         for i in 0..kept
         {
-            let r = self.records[i];
-            self.permit(r.base, r.count);
+            if let Some(&r) = self.records.get(i)
+            {
+                self.permit(r.base, r.count);
+            }
         }
         true
     }

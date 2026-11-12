@@ -176,7 +176,7 @@ fn run_round_trips(
             max = delta;
         }
         total = total.saturating_add(delta);
-        completed += 1;
+        completed = completed.saturating_add(1);
     }
 
     // After every round trip the child's last call has returned and it is on

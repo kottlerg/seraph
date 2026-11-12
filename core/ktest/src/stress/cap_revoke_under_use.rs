@@ -79,7 +79,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     else
     {
-        (1u64 << NUM_CHILDREN) - 1
+        (1u64 << NUM_CHILDREN).saturating_sub(1)
     };
 
     // Spawn NUM_CHILDREN threads, each sending on its derived cap, then
@@ -106,7 +106,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         // Senders whose caps were not revoked loop forever; delete them so
         // none spins on into the following cells.
-        for child in &mut senders.children[..senders.spawned]
+        for child in senders.children.iter_mut().take(senders.spawned)
         {
             child.delete_thread().ok();
             child.delete_cspace().ok();
@@ -161,12 +161,12 @@ fn start_senders(
 ) -> TestResult
 {
     let (done, sending) = reports;
-    for (i, &derived_cap) in derived.iter().enumerate()
+    for (i, (&derived_cap, slot)) in derived.iter().zip(senders.children.iter_mut()).enumerate()
     {
-        senders.children[i] =
+        *slot =
             spawn::new_child(ctx).map_err(|_| "cap_revoke_under_use: spawn::new_child failed")?;
-        senders.spawned = i + 1;
-        let child = &senders.children[i];
+        senders.spawned = i.saturating_add(1);
+        let child = &*slot;
         let child_sig = cap_copy(derived_cap, child.cs, RIGHTS_NOTIFY)
             .map_err(|_| "cap_revoke_under_use: cap_copy sig failed")?;
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -187,8 +187,8 @@ fn start_senders(
                 },
             )
         };
-        // SAFETY: Each child uses a distinct stack index.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        // Each child uses a distinct stack index.
+        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(child, sender_loop_entry, stack_top, arg) }

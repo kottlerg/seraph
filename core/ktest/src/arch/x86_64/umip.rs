@@ -104,7 +104,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "integration::umip_descriptor_reads_fault: cap_create_endpoint failed")?;
     let result = (0..cpus.min(EVERY_CPU_MAX)).try_for_each(|k| {
-        let cpu = checked_cpu(k, cpus);
+        let cpu = checked_cpu(k, cpus)?;
         expect_gp(ctx, ep, READ_IDTR, cpu)?;
         expect_gp(ctx, ep, READ_GDTR, cpu)
     });
@@ -115,18 +115,31 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// The `k`th CPU checked of `cpus` (`k < cpus.min(EVERY_CPU_MAX)`): `k` itself
 /// up to [`EVERY_CPU_MAX`] CPUs; past it, CPU `k` for the first [`LOW_CPUS`],
 /// then [`SAMPLED_CPUS`] CPUs evenly spaced from `LOW_CPUS` to `cpus - 1`.
-fn checked_cpu(k: u32, cpus: u32) -> u32
+fn checked_cpu(k: u32, cpus: u32) -> Result<u32, &'static str>
 {
     if cpus <= EVERY_CPU_MAX || k < LOW_CPUS
     {
-        return k;
+        return Ok(k);
     }
     // `cpus - 1 - LOW_CPUS` >= SAMPLED_CPUS - 1 here, so the samples are
     // distinct; the last is `cpus - 1`.
-    let j = u64::from(k - LOW_CPUS);
-    let span = u64::from(cpus - 1 - LOW_CPUS);
-    let offset = j * span / u64::from(SAMPLED_CPUS - 1);
-    LOW_CPUS + u32::try_from(offset).unwrap_or(0)
+    let j = u64::from(
+        k.checked_sub(LOW_CPUS)
+            .ok_or("integration::umip_descriptor_reads_fault: sampled CPU index out of range")?,
+    );
+    let span = u64::from(
+        cpus.checked_sub(1)
+            .and_then(|last| last.checked_sub(LOW_CPUS))
+            .ok_or("integration::umip_descriptor_reads_fault: CPU span out of range")?,
+    );
+    let offset = j
+        .checked_mul(span)
+        .and_then(|spaced| spaced.checked_div(u64::from(SAMPLED_CPUS - 1)))
+        .ok_or("integration::umip_descriptor_reads_fault: CPU offset overflows")?;
+    u32::try_from(offset)
+        .ok()
+        .and_then(|o| LOW_CPUS.checked_add(o))
+        .ok_or("integration::umip_descriptor_reads_fault: sampled CPU out of range")
 }
 
 /// Run one child, pinned to `cpu` with this thread as its fault handler on
@@ -182,7 +195,7 @@ fn expect_gp(ctx: &TestContext, ep: u64, which: u64, cpu: u32) -> TestResult
     let mut regs = [0u8; BUF];
     thread_read_regs(child.th, &mut regs[..BUF])
         .map_err(|_| "integration::umip_descriptor_reads_fault: thread_read_regs failed")?;
-    crate::spawn::redirect_to_entry(&mut regs[..], exit_entry as *const () as u64);
+    crate::spawn::redirect_to_entry(&mut regs[..], exit_entry as *const () as u64)?;
     // SAFETY: the frame was read from this fault-blocked child, so its stack
     // pointer lies on the child's own `ChildStack`; `redirect_to_entry` pointed it
     // at `exit_entry`, an `extern "C"` entry that never returns and needs nothing

@@ -64,6 +64,9 @@ pub(crate) const POOL_SIZE: usize = 64;
 /// Size of one page.
 const PAGE_SIZE: u64 = 0x1000;
 
+/// Bytes the pool carves off the first RAM cap when it is large enough.
+const POOL_BYTES: u64 = POOL_SIZE as u64 * PAGE_SIZE;
+
 /// Return the byte size of the Memory cap occupying `slot`, or `None` if no
 /// Memory descriptor matches.
 fn find_frame_size(info: &InitInfo, slot: u64) -> Option<u64>
@@ -86,8 +89,10 @@ static POOL_AVAILABLE: AtomicU64 = AtomicU64::new(0);
 /// Memory capability slots (indices into init's `CSpace`).
 ///
 /// Initialized once at startup by splitting the tail carved off the first RAM
-/// Memory cap into single-page caps.
-static mut POOL_SLOTS: [u64; POOL_SIZE] = [0; POOL_SIZE];
+/// Memory cap into single-page caps. Atomics so that every access is a safe,
+/// bounds-checked one; `init` writes the entries before any test runs, and
+/// each is read by value.
+static POOL_SLOTS: [AtomicU64; POOL_SIZE] = [const { AtomicU64::new(0) }; POOL_SIZE];
 
 /// Number of frames in the pool (set during init).
 static POOL_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -95,7 +100,15 @@ static POOL_COUNT: AtomicU32 = AtomicU32::new(0);
 /// `POOL_SLOTS` as `init` left it, or as the last [`check_slots`] that found
 /// a change re-baselined it: the reference a stray write into `POOL_SLOTS`
 /// is detected against.
-static mut POOL_SHADOW: [u64; POOL_SIZE] = [0; POOL_SIZE];
+static POOL_SHADOW: [AtomicU64; POOL_SIZE] = [const { AtomicU64::new(0) }; POOL_SIZE];
+
+/// The pool's entries in use: the first `POOL_COUNT` of `POOL_SLOTS`.
+fn live_slots() -> impl Iterator<Item = &'static AtomicU64>
+{
+    POOL_SLOTS
+        .iter()
+        .take(POOL_COUNT.load(Ordering::Acquire) as usize)
+}
 
 /// Log every pool entry that differs from its shadow, with its index, value
 /// and expected value, then re-baseline the shadow. The pool's entries never
@@ -104,19 +117,16 @@ static mut POOL_SHADOW: [u64; POOL_SIZE] = [0; POOL_SIZE];
 /// is the first suspect.
 pub fn check_slots()
 {
-    let count = POOL_COUNT.load(Ordering::Acquire) as usize;
-    for i in 0..count.min(POOL_SIZE)
+    for (i, (slot, shadow)) in live_slots().zip(POOL_SHADOW.iter()).enumerate()
     {
-        // SAFETY: i < POOL_SIZE; both arrays are written only by `init` and
-        // here, on the harness thread, and read by value.
-        let (now, then) = unsafe { (POOL_SLOTS[i], POOL_SHADOW[i]) };
+        let now = slot.load(Ordering::Relaxed);
+        let then = shadow.load(Ordering::Relaxed);
         if now != then
         {
             crate::log_u64("ktest: BUG frame pool entry changed, index=", i as u64);
             crate::log_u64("ktest: BUG frame pool entry value=", now);
             crate::log_u64("ktest: BUG frame pool entry expected=", then);
-            // SAFETY: as above.
-            unsafe { POOL_SHADOW[i] = now };
+            shadow.store(now, Ordering::Relaxed);
         }
     }
 }
@@ -124,9 +134,7 @@ pub fn check_slots()
 /// Whether `cap` is one of the pool's entries.
 pub fn is_pool_frame(cap: u64) -> bool
 {
-    let count = POOL_COUNT.load(Ordering::Acquire) as usize;
-    // SAFETY: i < POOL_SIZE; the entries are read by value.
-    (0..count.min(POOL_SIZE)).any(|i| unsafe { POOL_SLOTS[i] } == cap)
+    live_slots().any(|slot| slot.load(Ordering::Relaxed) == cap)
 }
 
 /// Recursively split a frame into single-page frames and add them to the pool.
@@ -140,41 +148,25 @@ pub fn is_pool_frame(cap: u64) -> bool
 /// Must be called only during `init()`, before any concurrent access.
 unsafe fn split_frame_recursive(memory_cap: u64, count: &mut usize)
 {
-    if *count >= POOL_SIZE
+    let Some(entry) = POOL_SLOTS.get(*count)
+    else
     {
         return;
-    }
+    };
 
     // memory_split: `memory_cap` shrinks in place to one page; the
-    // returned slot is the new tail covering the remainder. Store the
-    // (now-single-page) original in the pool, then recurse on the tail.
-    match syscall::memory_split(memory_cap, PAGE_SIZE)
-    {
-        Ok(tail) =>
-        {
-            // SAFETY: count < POOL_SIZE, checked above.
-            unsafe {
-                POOL_SLOTS[*count] = memory_cap;
-            }
-            *count += 1;
+    // returned slot is the new tail covering the remainder. The
+    // (now-single-page) original goes in the pool either way: a frame too
+    // small to split (single page), or one whose split failed, as it is.
+    let split = syscall::memory_split(memory_cap, PAGE_SIZE);
+    entry.store(memory_cap, Ordering::Relaxed);
+    *count = count.saturating_add(1);
 
-            // Recursively split the tail to extract more pages.
-            // SAFETY: same preconditions as the outer unsafe fn (init phase only).
-            unsafe { split_frame_recursive(tail, count) };
-        }
-        Err(_) =>
-        {
-            // Frame is too small to split (single page) or split failed.
-            // Store it as-is in the pool.
-            if *count < POOL_SIZE
-            {
-                // SAFETY: count < POOL_SIZE, checked above.
-                unsafe {
-                    POOL_SLOTS[*count] = memory_cap;
-                }
-                *count += 1;
-            }
-        }
+    if let Ok(tail) = split
+    {
+        // Recursively split the tail to extract more pages.
+        // SAFETY: same preconditions as the outer unsafe fn (init phase only).
+        unsafe { split_frame_recursive(tail, count) };
     }
 }
 
@@ -212,16 +204,15 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
         return;
     };
 
-    let pool_bytes = (POOL_SIZE as u64) * PAGE_SIZE;
     // Leave at least one page in the head so retype callers keep a usable
     // cap. If the cap is small, take whatever fits.
-    let pool_chunk = if ram_size > pool_bytes + PAGE_SIZE
+    let pool_chunk = if ram_size > POOL_BYTES + PAGE_SIZE
     {
-        pool_bytes
+        POOL_BYTES
     }
     else if ram_size > 2 * PAGE_SIZE
     {
-        ram_size - PAGE_SIZE
+        ram_size.saturating_sub(PAGE_SIZE)
     }
     else
     {
@@ -230,7 +221,8 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
         POOL_COUNT.store(0, Ordering::Release);
         return;
     };
-    let split_at = ram_size - pool_chunk;
+    // `pool_chunk` is below `ram_size` on both branches above.
+    let split_at = ram_size.saturating_sub(pool_chunk);
 
     // ram_frame validated above; single-threaded boot.
     let Ok(pool_tail) = syscall::memory_split(ram_frame, split_at)
@@ -250,64 +242,22 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
     // SAFETY: called from init() which is documented as single-threaded boot-time only.
     unsafe { split_frame_recursive(pool_tail, &mut count) };
 
-    // Mark all slots as available
-    let mask = if count >= 64
-    {
-        u64::MAX
-    }
-    else
-    {
-        (1u64 << count) - 1
-    };
-    POOL_AVAILABLE.store(mask, Ordering::Release);
     // count is bounded by POOL_SIZE (64), so cast is safe.
     #[allow(clippy::cast_possible_truncation)]
     let count_u32 = count as u32;
+    // Mark all slots as available: the low `count` bits, none for a count of
+    // zero (a shift by the full width).
+    let mask = u64::MAX
+        .checked_shr(u64::BITS.saturating_sub(count_u32))
+        .unwrap_or(0);
+    POOL_AVAILABLE.store(mask, Ordering::Release);
     POOL_COUNT.store(count_u32, Ordering::Release);
-    // SAFETY: init phase, before any other access to either array.
-    unsafe { POOL_SHADOW = POOL_SLOTS };
-
-    let mut msg = [0u8; 64];
-    let prefix = b"frame pool: initialized with ";
-    let plen = prefix.len().min(msg.len());
-    msg[..plen].copy_from_slice(&prefix[..plen]);
-
-    // Write count as decimal
-    let mut n = count;
-    let mut digits = [0u8; 10];
-    let mut dlen = 0usize;
-    if n == 0
+    for (slot, shadow) in POOL_SLOTS.iter().zip(POOL_SHADOW.iter())
     {
-        digits[0] = b'0';
-        dlen = 1;
-    }
-    else
-    {
-        while n > 0
-        {
-            // n % 10 is always 0..=9, so cast to u8 is safe.
-            #[allow(clippy::cast_possible_truncation)]
-            let digit = (n % 10) as u8;
-            digits[dlen] = b'0' + digit;
-            n /= 10;
-            dlen += 1;
-        }
-        digits[..dlen].reverse();
+        shadow.store(slot.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
-    let nlen = dlen.min(msg.len() - plen);
-    msg[plen..plen + nlen].copy_from_slice(&digits[..nlen]);
-    let mut pos = plen + nlen;
-
-    let suffix = b" frames";
-    let slen = suffix.len().min(msg.len() - pos);
-    msg[pos..pos + slen].copy_from_slice(&suffix[..slen]);
-    pos += slen;
-
-    if let Ok(s) = core::str::from_utf8(&msg[..pos])
-    {
-        crate::log(s);
-    }
+    crate::log_args(format_args!("frame pool: initialized with {count} frames"));
 }
 
 /// Allocate a frame from the pool.
@@ -326,16 +276,17 @@ pub fn alloc() -> Option<u64>
         }
 
         // Find first set bit (lowest available slot)
-        let slot_idx = available.trailing_zeros() as usize;
-        let mask = 1u64 << slot_idx;
+        let slot_idx = available.trailing_zeros();
+        let mask = 1u64.checked_shl(slot_idx).unwrap_or(0);
 
         // Try to claim it atomically
         let prev = POOL_AVAILABLE.fetch_and(!mask, Ordering::AcqRel);
         if prev & mask != 0
         {
-            // Successfully claimed
-            // SAFETY: slot_idx is within bounds (< trailing_zeros result < 64).
-            unsafe { return Some(POOL_SLOTS[slot_idx]) }
+            // Successfully claimed: a set bit is below POOL_SIZE.
+            return POOL_SLOTS
+                .get(slot_idx as usize)
+                .map(|slot| slot.load(Ordering::Relaxed));
         }
         // Race lost, retry
     }
@@ -353,19 +304,14 @@ pub fn alloc() -> Option<u64>
 pub unsafe fn free(memory_cap: u64)
 {
     // Find the slot index
-    let count = POOL_COUNT.load(Ordering::Acquire) as usize;
-    // needless_range_loop: must index directly to avoid creating shared ref to mutable static.
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..count
+    if let Some(i) = live_slots().position(|slot| slot.load(Ordering::Relaxed) == memory_cap)
     {
-        // SAFETY: i < count, and count <= POOL_SIZE.
-        let slot = unsafe { POOL_SLOTS[i] };
-        if slot == memory_cap
-        {
-            let mask = 1u64 << i;
-            POOL_AVAILABLE.fetch_or(mask, Ordering::Release);
-            return;
-        }
+        let mask = u32::try_from(i)
+            .ok()
+            .and_then(|i| 1u64.checked_shl(i))
+            .unwrap_or(0);
+        POOL_AVAILABLE.fetch_or(mask, Ordering::Release);
+        return;
     }
 
     // Frame not in pool - this is a bug

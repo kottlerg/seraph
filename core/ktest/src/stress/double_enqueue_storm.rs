@@ -96,7 +96,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Parent-side notification caps used to wake each worker.
     let mut p2c = [0u64; NUM_WORKERS];
 
-    for i in 0..NUM_WORKERS
+    for (i, (child_slot, p2c_slot)) in children.iter_mut().zip(p2c.iter_mut()).enumerate()
     {
         let notif = cap_create_notification(ctx.memory_base)
             .map_err(|_| "stress::double_enqueue_storm: cap_create_notification failed")?;
@@ -117,15 +117,15 @@ pub fn run(ctx: &TestContext) -> TestResult
                 },
             )
         };
-        // SAFETY: stress tests run sequentially; only this test uses these
+        // Stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots during its run.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(&child, worker_entry, stack_top, arg) }
             .map_err(|_| "stress::double_enqueue_storm: configure_and_start failed")?;
-        children[i] = child;
-        p2c[i] = notif;
+        *child_slot = child;
+        *p2c_slot = notif;
     }
 
     // Start the storm once every worker is entering its first
@@ -138,7 +138,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     else
     {
-        (1u64 << NUM_WORKERS) - 1
+        (1u64 << NUM_WORKERS).saturating_sub(1)
     };
     let mut ready_bits = 0u64;
     if let Err(e) = crate::tally::await_all(
@@ -150,11 +150,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         // Delete the workers, so none is left on a stack the following
         // cells reuse.
-        for i in 0..NUM_WORKERS
+        for (child, &cap) in children.iter_mut().zip(p2c.iter())
         {
-            children[i].delete_thread().ok();
-            children[i].delete_cspace().ok();
-            cap_delete(p2c[i]).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
+            cap_delete(cap).ok();
         }
         cap_delete(ready).ok();
         return Err(e);
@@ -170,18 +170,28 @@ pub fn run(ctx: &TestContext) -> TestResult
     // on a TCB mid-relocation, the transient window the #244 class lives in.
     for cycle in 0..CYCLES
     {
-        for i in 0..NUM_WORKERS
+        for (i, (child, &cap)) in children.iter().zip(p2c.iter()).enumerate()
         {
             // NUM_WORKERS is a compile-time constant well below u32::MAX;
             // `try_from` keeps the narrow cast clippy-clean.
             let i_u32 = u32::try_from(i).unwrap_or(0);
-            let _ = notification_send(p2c[i], BIT_GO);
-            let prio: u8 = if (cycle + i_u32) & 1 == 0 { 3 } else { 9 };
-            let _ = thread_set_priority(children[i].th, prio, ctx.sched_control_cap);
+            let _ = notification_send(cap, BIT_GO);
+            let prio: u8 = if cycle.wrapping_add(i_u32) & 1 == 0
+            {
+                3
+            }
+            else
+            {
+                9
+            };
+            let _ = thread_set_priority(child.th, prio, ctx.sched_control_cap);
             if cycle % 4 == 0
             {
-                let target_cpu = (i_u32 + cycle) % cpu_mod;
-                let _ = thread_set_affinity(children[i].th, target_cpu);
+                let target_cpu = i_u32
+                    .saturating_add(cycle)
+                    .checked_rem(cpu_mod)
+                    .ok_or("stress::double_enqueue_storm: no CPUs")?;
+                let _ = thread_set_affinity(child.th, target_cpu);
             }
         }
         // Periodically sleep so workers actually run and re-park (on the
@@ -193,6 +203,21 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
     }
 
+    wake_racing_dealloc(ctx, &mut children, &p2c, cpu_mod)?;
+    cap_delete(ready).map_err(|_| "stress::double_enqueue_storm: cap_delete ready failed")?;
+
+    Ok(())
+}
+
+/// Phase 2: for each worker, wake it and delete it, its `CSpace` and its
+/// notification with no intervening yield.
+fn wake_racing_dealloc(
+    ctx: &TestContext,
+    children: &mut [spawn::SpawnedChild; NUM_WORKERS],
+    p2c: &[u64; NUM_WORKERS],
+    cpu_mod: u32,
+) -> TestResult
+{
     // ── Phase 2: wake racing dealloc. ────────────────────────────────────────
     //
     // Wake the worker and immediately delete it with no intervening yield, so
@@ -200,23 +225,25 @@ pub fn run(ctx: &TestContext) -> TestResult
     // all-CPU-locks Exited commit, the Stopped|Exited wake-abort in
     // enqueue_and_wake, and the BlockedOnNotification waiter-unlink + the
     // wake-in-flight gate. An affinity flip first spreads the target CPU.
-    for i in 0..NUM_WORKERS
+    for (i, (child, &cap)) in children.iter_mut().zip(p2c.iter()).enumerate()
     {
         let i_u32 = u32::try_from(i).unwrap_or(0);
-        let _ = thread_set_affinity(children[i].th, (i_u32 + 1) % cpu_mod);
-        let _ = notification_send(p2c[i], BIT_GO);
-        let _ = thread_set_priority(children[i].th, 5, ctx.sched_control_cap);
-        children[i]
+        let flip_cpu = i_u32
+            .saturating_add(1)
+            .checked_rem(cpu_mod)
+            .ok_or("stress::double_enqueue_storm: no CPUs")?;
+        let _ = thread_set_affinity(child.th, flip_cpu);
+        let _ = notification_send(cap, BIT_GO);
+        let _ = thread_set_priority(child.th, 5, ctx.sched_control_cap);
+        child
             .delete_thread()
             .map_err(|_| "stress::double_enqueue_storm: cap_delete thread failed")?;
-        children[i]
+        child
             .delete_cspace()
             .map_err(|_| "stress::double_enqueue_storm: cap_delete cspace failed")?;
-        cap_delete(p2c[i])
+        cap_delete(cap)
             .map_err(|_| "stress::double_enqueue_storm: cap_delete notification failed")?;
     }
-    cap_delete(ready).map_err(|_| "stress::double_enqueue_storm: cap_delete ready failed")?;
-
     Ok(())
 }
 

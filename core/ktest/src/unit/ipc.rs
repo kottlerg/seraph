@@ -439,7 +439,11 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
     }
 
     // The transferred cap should be a valid notification — try sending on it.
-    let transferred_sig = msg.caps()[0];
+    let transferred_sig = msg
+        .caps()
+        .first()
+        .copied()
+        .ok_or("expected 1 transferred cap, got different count")?;
     let send_result = syscall::notification_send(transferred_sig, 0x1);
 
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -1420,7 +1424,8 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
     let occupant = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification(occupant) for reply_stale test failed")?;
     if syscall_abi::cap_handle_index(occupant) != syscall_abi::cap_handle_index(victim)
-        || syscall_abi::cap_handle_gen(occupant) != syscall_abi::cap_handle_gen(victim) + 256
+        || Some(syscall_abi::cap_handle_gen(occupant))
+            != syscall_abi::cap_handle_gen(victim).checked_add(256)
     {
         cap_delete(occupant).ok();
         cap_delete(done).ok();
@@ -1548,8 +1553,10 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
     // Each delivered handle must name a distinct, usable notification.
     for (i, &h) in msg.caps().iter().enumerate()
     {
-        if msg.caps()[..i]
+        if msg
+            .caps()
             .iter()
+            .take(i)
             .any(|&o| syscall_abi::cap_handle_index(o) == syscall_abi::cap_handle_index(h))
         {
             return Err("four_caps: duplicate destination slot delivered");
@@ -1805,7 +1812,7 @@ extern "C" fn recv_reserve_victim_entry(arg: u64) -> !
         {
             Ok(msg) if rounds < 8 =>
             {
-                rounds += 1;
+                rounds = rounds.saturating_add(1);
                 let reply = IpcMessage::new(msg.caps().len() as u64);
                 // SAFETY: buf_addr was registered as this thread's IPC buffer above.
                 if unsafe { ipc::ipc_reply(&reply, buf_addr as *mut u64) }.is_err()
@@ -1959,8 +1966,7 @@ fn start_wait_child(
         cap_copy(go, child.cs, syscall_abi::RIGHTS_NTF_WAIT)
             .map_err(|_| "ipc wait child: cap_copy go failed")?
     };
-    // SAFETY: only the address of the slot's page is taken.
-    let page = crate::IpcPage::addr(unsafe { core::ptr::addr_of_mut!(WAIT_PAGES[slot]) });
+    let page = crate::IpcPage::addr_at(core::ptr::addr_of_mut!(WAIT_PAGES), slot)?;
     // SAFETY: the slot's child has not been started yet.
     let arg = unsafe {
         WAIT_ARGS.publish(
@@ -1973,8 +1979,7 @@ fn start_wait_child(
             },
         )
     };
-    // SAFETY: only the address of the slot's stack is taken.
-    let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(WAIT_STACKS[slot]) });
+    let stack_top = ChildStack::top_at(core::ptr::addr_of!(WAIT_STACKS), slot)?;
     // SAFETY: the stack is `WAIT_STACKS[slot]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, entry, stack_top, arg) }

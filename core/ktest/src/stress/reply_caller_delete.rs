@@ -308,7 +308,11 @@ struct Round
 fn one_round(ctx: &TestContext, cycle: u32, outcomes: &mut Outcomes) -> TestResult
 {
     let kind = cycle % KINDS;
-    let order = ORDERS[(cycle / KINDS) as usize % ORDERS.len()];
+    let order = ((cycle / KINDS) as usize)
+        .checked_rem(ORDERS.len())
+        .and_then(|i| ORDERS.get(i))
+        .copied()
+        .ok_or("stress::reply_caller_delete: order index out of range")?;
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "stress::reply_caller_delete: create endpoint failed")?;
     let Ok(done) = cap_create_notification(ctx.memory_base)
@@ -557,11 +561,11 @@ fn classify(acc: u64, order: Order, outcomes: &mut Outcomes) -> TestResult
         {
             if acc & BIT_REPLY_OK != 0
             {
-                outcomes.replied += 1;
+                outcomes.replied = outcomes.replied.saturating_add(1);
             }
             if acc & BIT_REPLY_GONE != 0
             {
-                outcomes.gone += 1;
+                outcomes.gone = outcomes.gone.saturating_add(1);
             }
             Ok(())
         }

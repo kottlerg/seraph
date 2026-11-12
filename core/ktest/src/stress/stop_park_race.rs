@@ -140,7 +140,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, 0)
         .map_err(|_| "stress::stop_park_race: pin controller failed")?;
-    let server_cpu = u32::try_from(2 % cpus).unwrap_or(0);
+    let server_cpu = u32::try_from(
+        2u64.checked_rem(cpus)
+            .ok_or("stress::stop_park_race: CpuCount is zero")?,
+    )
+    .unwrap_or(0);
     let result = all_phases(ctx, server_cpu);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_park_race: restore controller affinity failed");
@@ -207,7 +211,7 @@ fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> Result<u64, &'static
         {
             if race_once(kind, peer_th, objects.source, cycle)?
             {
-                interrupted += 1;
+                interrupted = interrupted.saturating_add(1);
             }
         }
         Ok(interrupted)
@@ -366,7 +370,7 @@ fn await_result(kind: Kind, source: Option<u64>, cycle: u32) -> TestResult
     {
         if spins < RESULT_SPINS
         {
-            spins += 1;
+            spins = spins.saturating_add(1);
             core::hint::spin_loop();
             continue;
         }
@@ -400,7 +404,7 @@ fn peer_loop(mut park: impl FnMut() -> u32) -> !
 {
     for cycle in 1..=CYCLES
     {
-        while ACKED.load(Ordering::Acquire) != cycle - 1
+        while ACKED.load(Ordering::Acquire) != cycle.saturating_sub(1)
         {
             core::hint::spin_loop();
         }

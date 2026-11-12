@@ -325,7 +325,11 @@ fn call_and_receive(
     acc: u64,
 ) -> Result<u64, &'static str>
 {
-    start_caller(ctx, &mut parts.callers[caller.index], caller, objects)?;
+    let slot = parts
+        .callers
+        .get_mut(caller.index)
+        .ok_or("integration::reply_binding_displaced: caller index out of range")?;
+    start_caller(ctx, slot, caller, objects)?;
     let acc = wait_for(objects.done, acc, caller.ready)?;
     thread_sleep(SETTLE_SLEEP_MS)
         .map_err(|_| "integration::reply_binding_displaced: settle sleep failed")?;
@@ -395,8 +399,7 @@ fn start_caller(
             },
         )
     };
-    // SAFETY: stack `caller.index` belongs to this caller (see above).
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CALLER_STACKS[caller.index]) });
+    let stack = ChildStack::top_at(core::ptr::addr_of!(CALLER_STACKS), caller.index)?;
     // SAFETY: the stack is `CALLER_STACKS[caller.index]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, caller.entry, stack, arg) }
@@ -425,8 +428,9 @@ fn wait_for(done: u64, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 /// not be registered.
 fn call(args: &CallerArgs) -> Option<Result<IpcMessage, i64>>
 {
-    // SAFETY: buffer `index` belongs to this caller alone.
-    let buf = unsafe { core::ptr::addr_of_mut!(CALLER_IPC_BUFS[args.index]) }.cast::<u64>();
+    // Buffer `index` belongs to this caller alone.
+    let buf =
+        crate::elem_ptr_mut(core::ptr::addr_of_mut!(CALLER_IPC_BUFS), args.index)?.cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
     // registered by one thread at a time; no Rust object lives in it, and the
     // thread reaches it only through the raw `buf` pointer.

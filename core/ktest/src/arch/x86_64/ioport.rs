@@ -84,7 +84,8 @@ pub fn carve_port_range(port: u16, count: u16) -> Option<u64>
         return None;
     }
     let port_start = u32::from(port);
-    let port_end = port_start + u32::from(count);
+    // Two `u16` values: the sum fits a `u32`.
+    let port_end = port_start.saturating_add(u32::from(count));
     // SAFETY: ktest is single-threaded.
     let WideCap {
         mut slot,
@@ -171,7 +172,8 @@ fn find_root(info: &InitInfo) -> Option<(u64, u32, u32)>
             // count, at most 0x10000.
             #[allow(clippy::cast_possible_truncation)]
             let size_u32 = if d.aux1 == 0 { 0x10000 } else { d.aux1 as u32 };
-            return Some((d.slot, base_u32, base_u32 + size_u32));
+            // At most 0xFFFF + 0x10000: the sum fits a `u32`.
+            return Some((d.slot, base_u32, base_u32.saturating_add(size_u32)));
         }
     }
     None

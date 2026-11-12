@@ -48,8 +48,10 @@ pub const SLOT_CEILING: u64 = (1 << CAP_INDEX_BITS) / CSPACE_SLOTS_PER_PAGE * CS
 /// kernel's `CSpace::pages_to_cover` from leaf 0.
 pub const fn pages_to_cover(index: u64) -> u64
 {
+    // Every count here is a page count below `SLOT_CEILING`'s, far from the
+    // `u64` range, so no saturating step clamps.
     let leaf = index / CSPACE_SLOTS_PER_PAGE;
-    let mut pages = leaf + 1;
+    let mut pages = leaf.saturating_add(1);
     if leaf >= DIRECT_LEAVES
     {
         let last = if leaf < DOUBLE_BASE
@@ -60,12 +62,17 @@ pub const fn pages_to_cover(index: u64) -> u64
         {
             DOUBLE_BASE - 1
         };
-        pages += (last - DIRECT_LEAVES) / DIR_FANOUT + 1;
+        let dirs = last.saturating_sub(DIRECT_LEAVES) / DIR_FANOUT;
+        pages = pages.saturating_add(dirs).saturating_add(1);
     }
     if leaf >= DOUBLE_BASE
     {
-        let rel = leaf - DOUBLE_BASE;
-        pages += rel / DIR_FANOUT + 1 + rel / (DIR_FANOUT * DIR_FANOUT) + 1;
+        let rel = leaf.saturating_sub(DOUBLE_BASE);
+        pages = pages
+            .saturating_add(rel / DIR_FANOUT)
+            .saturating_add(1)
+            .saturating_add(rel / (DIR_FANOUT * DIR_FANOUT))
+            .saturating_add(1);
     }
     pages
 }

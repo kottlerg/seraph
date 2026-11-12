@@ -249,14 +249,13 @@ fn phases(ctx: &TestContext) -> TestResult
 /// and some free landed inside a call.
 fn report(landed: &[u32; 8]) -> TestResult
 {
-    for call in (0..CALLS).map(|offset| FIRST + offset)
+    for (label, oks) in OK_LABELS
+        .iter()
+        .zip(&OKS)
+        .skip(FIRST as usize)
+        .take(CALLS as usize)
     {
-        let i = call as usize;
-        log_cell_u64(
-            CELL,
-            OK_LABELS[i],
-            u64::from(OKS[i].load(Ordering::Acquire)),
-        );
+        log_cell_u64(CELL, label, u64::from(oks.load(Ordering::Acquire)));
     }
     for (label, &count) in LANDED_LABELS.iter().zip(landed)
     {
@@ -275,7 +274,10 @@ fn report(landed: &[u32; 8]) -> TestResult
     }
     for call in [STOP, READ_REGS, WRITE_REGS]
     {
-        if OKS[call as usize].load(Ordering::Acquire) == 0
+        let oks = OKS
+            .get(call as usize)
+            .ok_or("stress::thread_cap_delete_under_use: call index out of range")?;
+        if oks.load(Ordering::Acquire) == 0
         {
             return Err(
                 "stress::thread_cap_delete_under_use: the stop or a register call never \
@@ -283,7 +285,7 @@ fn report(landed: &[u32; 8]) -> TestResult
             );
         }
     }
-    if landed[FIRST as usize..].iter().all(|&n| n == 0)
+    if landed.iter().skip(FIRST as usize).all(|&n| n == 0)
     {
         return Err(
             "stress::thread_cap_delete_under_use: no free landed while the caller was inside a \
@@ -366,13 +368,13 @@ fn create_thread(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::thread_cap_delete_under_use: create thread failed")?,
     );
-    // SAFETY: stress stacks 0 to 2 belong to this test: 0 to the caller, 1
+    // stress stacks 0 to 2 belong to this test: 0 to the caller, 1
     // and 2 to the targets, which alternate between them. Stress tests run
     // sequentially; a round's target is freed, and so ended wherever it was,
     // before the controller sees the caller's report that ends the round, so
     // a stack is never reused while its previous target runs; the caller's is
     // reused only by the next phase's caller, after this one has exited.
-    let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
+    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack)?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).
@@ -392,7 +394,10 @@ fn round(ctx: &TestContext, free: Free, cycle: u32, done: u64, landed: &mut [u32
 -> TestResult
 {
     let mut target = None;
-    let stack = TARGET_STACKS[(cycle & 1) as usize];
+    let stack = TARGET_STACKS
+        .get((cycle & 1) as usize)
+        .copied()
+        .ok_or("stress::thread_cap_delete_under_use: target stack index out of range")?;
     let created =
         create_thread(ctx, &mut target, target_entry, stack, TARGET_CPU, 0).and_then(|th| {
             thread_start(th)
@@ -422,7 +427,7 @@ fn round(ctx: &TestContext, free: Free, cycle: u32, done: u64, landed: &mut [u32
 
     HANDLE.store(handle, Ordering::Release);
     ROUND.fetch_add(1, Ordering::AcqRel);
-    let aim = FIRST + cycle % CALLS;
+    let aim = FIRST.saturating_add(cycle % CALLS);
     // A round whose aim never shows up frees the target anyway; only the
     // clock failing fails the wait.
     let _ = await_within(crate::scaled_bound(ROUND_WAIT_US), || {
@@ -448,7 +453,11 @@ fn round(ctx: &TestContext, free: Free, cycle: u32, done: u64, landed: &mut [u32
         let _ = cap_delete(original);
         return Err("stress::thread_cap_delete_under_use: freeing the target failed");
     }
-    landed[(inside as usize).min(landed.len() - 1)] += 1;
+    let last = landed.len().saturating_sub(1);
+    let slot = landed
+        .get_mut((inside as usize).min(last))
+        .ok_or("stress::thread_cap_delete_under_use: landed index out of range")?;
+    *slot = slot.saturating_add(1);
 
     let mut acc = 0u64;
     await_report(
@@ -475,7 +484,7 @@ fn await_within(bound_us: u64, mut reached: impl FnMut() -> bool) -> Result<bool
         }
         if polls < BUSY_POLLS
         {
-            polls += 1;
+            polls = polls.saturating_add(1);
             core::hint::spin_loop();
         }
         else
@@ -585,10 +594,15 @@ fn group(handle: u64, regs: &mut [u8; REGS_BUF]) -> bool
             #[allow(clippy::cast_possible_truncation)]
             let len = len as usize;
             if call(WRITE_REGS, Some(refused), || {
+                // A read longer than the buffer is no accepted result: it is
+                // recorded as bad.
+                let frame = regs
+                    .get(..len)
+                    .ok_or(SyscallError::InvalidArgument as i64)?;
                 // SAFETY: `regs` holds the frame just read from this stopped thread,
                 // written back unchanged, so it resumes where it stopped, on its own
                 // stack; a handle the delete already invalidated is refused.
-                unsafe { thread_write_regs(handle, &regs[..len]) }.map(|()| 0)
+                unsafe { thread_write_regs(handle, frame) }.map(|()| 0)
             })
             .is_err()
             {
@@ -623,7 +637,14 @@ fn call(
     {
         Ok(value) =>
         {
-            OKS[kind as usize].fetch_add(1, Ordering::AcqRel);
+            match OKS.get(kind as usize)
+            {
+                Some(oks) =>
+                {
+                    oks.fetch_add(1, Ordering::AcqRel);
+                }
+                None => BAD.record(u64::from(kind)),
+            }
             Ok(Some(value))
         }
         Err(e) if e == SyscallError::InvalidCapability as i64 => Err(HandleGone),

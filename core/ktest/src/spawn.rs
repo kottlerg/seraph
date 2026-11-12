@@ -298,6 +298,37 @@ pub unsafe fn configure_and_start_pinned(
     Ok(())
 }
 
+/// The little-endian 8-byte register word at byte offset `at` of the register
+/// file `regs` (as `thread_read_regs` returns it).
+///
+/// # Errors
+///
+/// A fixed message when `regs` ends before `at + 8`.
+pub fn reg_word(regs: &[u8], at: usize) -> Result<u64, &'static str>
+{
+    at.checked_add(8)
+        .and_then(|end| regs.get(at..end))
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        .map(u64::from_le_bytes)
+        .ok_or("ktest: register offset past the register file")
+}
+
+/// Store `value` as the little-endian 8-byte register word at byte offset `at`
+/// of the register file `regs`.
+///
+/// # Errors
+///
+/// A fixed message when `regs` ends before `at + 8`.
+pub fn set_reg_word(regs: &mut [u8], at: usize, value: u64) -> Result<(), &'static str>
+{
+    let bytes = at
+        .checked_add(8)
+        .and_then(|end| regs.get_mut(at..end))
+        .ok_or("ktest: register offset past the register file")?;
+    bytes.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
 /// Point the register file `regs`, read from a stopped or fault-blocked
 /// child, at the `extern "C"` entry at `entry`: the instruction pointer
 /// becomes `entry` and the stack pointer moves down, on the child's own stack,
@@ -305,18 +336,18 @@ pub unsafe fn configure_and_start_pinned(
 /// child resumed with the frame then runs `entry` as if called, with the
 /// frame's other registers as its arguments.
 ///
-/// Panics if `regs` is shorter than `max(SP_OFFSET, IP_OFFSET) + 8` bytes,
-/// the end of the last register it touches; a shorter buffer than the full
-/// register file (`arch::TRAP_FRAME_BYTES`) that still reaches past both is
-/// accepted.
-pub fn redirect_to_entry(regs: &mut [u8], entry: u64)
+/// A buffer shorter than the full register file (`arch::TRAP_FRAME_BYTES`)
+/// that still holds both registers is accepted.
+///
+/// # Errors
+///
+/// A fixed message, with `regs` unchanged, when `regs` ends before
+/// `max(SP_OFFSET, IP_OFFSET) + 8` bytes, the end of the last register it
+/// touches.
+pub fn redirect_to_entry(regs: &mut [u8], entry: u64) -> Result<(), &'static str>
 {
-    use crate::arch::{IP_OFFSET, SP_OFFSET, entry_stack_pointer};
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&regs[SP_OFFSET..SP_OFFSET + 8]);
-    let sp = u64::from_le_bytes(word);
-    regs[SP_OFFSET..SP_OFFSET + 8].copy_from_slice(&entry_stack_pointer(sp).to_le_bytes());
-    regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&entry.to_le_bytes());
+    let sp = reg_word(regs, crate::arch::SP_OFFSET)?;
+    redirect_to_entry_at(regs, entry, sp)
 }
 
 /// [`redirect_to_entry`] onto the top of the child's stack: the stack
@@ -330,12 +361,18 @@ pub fn redirect_to_entry(regs: &mut [u8], entry: u64)
 /// chains pass the `ChildStack`'s size, the child writes into the statics
 /// below it.
 ///
-/// Panics as [`redirect_to_entry`] does when `regs` is too short.
+/// # Errors
+///
+/// As [`redirect_to_entry`], with `regs` unchanged, when `regs` is too short.
 pub fn redirect_to_entry_at(regs: &mut [u8], entry: u64, stack_top: u64)
+-> Result<(), &'static str>
 {
     use crate::arch::{IP_OFFSET, SP_OFFSET, entry_stack_pointer};
-    regs[SP_OFFSET..SP_OFFSET + 8].copy_from_slice(&entry_stack_pointer(stack_top).to_le_bytes());
-    regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&entry.to_le_bytes());
+    // Both reads first, so a short buffer is refused before either write.
+    reg_word(regs, SP_OFFSET)?;
+    reg_word(regs, IP_OFFSET)?;
+    set_reg_word(regs, SP_OFFSET, entry_stack_pointer(stack_top))?;
+    set_reg_word(regs, IP_OFFSET, entry)
 }
 
 /// One `cap_info(CAP_INFO_THREAD_STATE)` on `thread`, decoded into its
@@ -383,7 +420,7 @@ pub fn is_exited(thread: u64) -> Result<bool, &'static str>
 ///   fail instead of hang when its child never dies.
 pub fn wait_until_exited(thread: u64, max_polls: u32) -> Result<u64, &'static str>
 {
-    let mut polls = 0;
+    let mut polls = 0u32;
     loop
     {
         let (state, reason) = thread_state(thread)?;
@@ -391,7 +428,7 @@ pub fn wait_until_exited(thread: u64, max_polls: u32) -> Result<u64, &'static st
         {
             return Ok(reason);
         }
-        polls += 1;
+        polls = polls.saturating_add(1);
         if polls >= max_polls
         {
             return Err("spawn::wait_until_exited: thread never reached Exited");
@@ -406,7 +443,7 @@ pub fn wait_until_exited(thread: u64, max_polls: u32) -> Result<u64, &'static st
 pub fn wait_memory_baseline(memory: u64, baseline: u64, max_polls: u32)
 -> Result<(), &'static str>
 {
-    let mut polls = 0;
+    let mut polls = 0u32;
     loop
     {
         let now = syscall::cap_info(memory, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
@@ -415,7 +452,7 @@ pub fn wait_memory_baseline(memory: u64, baseline: u64, max_polls: u32)
         {
             return Ok(());
         }
-        polls += 1;
+        polls = polls.saturating_add(1);
         if polls >= max_polls
         {
             return Err("spawn::wait_memory_baseline: memory did not return to baseline");

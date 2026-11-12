@@ -127,9 +127,9 @@ fn spawn_workers(ctx: &TestContext, moved: u64, workers: &mut Workers) -> TestRe
                 },
             )
         };
-        // SAFETY: stress tests run sequentially; only this test uses these
+        // stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots during its run.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(child, spinner_entry, stack_top, arg) }
@@ -169,12 +169,15 @@ fn churn_and_delete(
         let cycle_u32 = u32::try_from(cycle).unwrap_or(0);
         for (i, th) in workers.children.iter().map(|w| w.th).enumerate()
         {
-            let prio: u8 = if (cycle + i) & 1 == 0 { 3 } else { 9 };
+            let prio: u8 = if cycle.wrapping_add(i) & 1 == 0 { 3 } else { 9 };
             let _ = thread_set_priority(th, prio, ctx.sched_control_cap);
             if cycle % 4 == 0
             {
                 let i_u32 = u32::try_from(i).unwrap_or(0);
-                let target_cpu = (i_u32 + cycle_u32) % cpu_mod;
+                let target_cpu = i_u32
+                    .saturating_add(cycle_u32)
+                    .checked_rem(cpu_mod)
+                    .ok_or("stress::priority_dealloc_race: cpu modulus is zero")?;
                 let _ = thread_set_affinity(th, target_cpu);
             }
         }
@@ -204,7 +207,10 @@ fn churn_and_delete(
     for (i, (worker, reported_cpu)) in workers.children.iter_mut().zip(&WORKER_CPU).enumerate()
     {
         let i_u32 = u32::try_from(i).unwrap_or(0);
-        let target_cpu = (i_u32 + 1) % cpu_mod;
+        let target_cpu = i_u32
+            .saturating_add(1)
+            .checked_rem(cpu_mod)
+            .ok_or("stress::priority_dealloc_race: cpu modulus is zero")?;
         // Forget the CPU the worker reported in Phase 1, which may equal
         // the target, so only a report it makes from here satisfies the
         // wait below. Phase 1 left the workers spinning at levels 3 and 9;
@@ -233,16 +239,19 @@ fn churn_and_delete(
 /// thread's CPU runs meanwhile.
 fn await_worker_on(moved: u64, index: usize, cpu: u32) -> TestResult
 {
+    let worker_cpu = WORKER_CPU
+        .get(index)
+        .ok_or("stress::priority_dealloc_race: worker index out of range")?;
     for _ in 0..crate::scaled_bound(CPU_WAIT_SLICES)
     {
-        if WORKER_CPU[index].load(Ordering::Acquire) == cpu
+        if worker_cpu.load(Ordering::Acquire) == cpu
         {
             return Ok(());
         }
         notification_wait_timeout(moved, CPU_WAIT_SLICE_MS)
             .map_err(|_| "stress::priority_dealloc_race: wait on moved failed")?;
     }
-    if WORKER_CPU[index].load(Ordering::Acquire) == cpu
+    if worker_cpu.load(Ordering::Acquire) == cpu
     {
         Ok(())
     }
@@ -262,12 +271,18 @@ extern "C" fn spinner_entry(arg: u64) -> !
     // SAFETY: `arg` is the `SPINNER_ARGS.publish` value for this worker;
     // the entry is not rewritten while the worker lives.
     let SpinnerArgs { moved, index } = unsafe { spawn::child_args(arg) };
+    let Some(worker_cpu) = WORKER_CPU.get(index)
+    else
+    {
+        // The parent's bounded wait reports a worker that never ran.
+        syscall::thread_exit()
+    };
     loop
     {
         if let Ok(cpu) = system_info(SystemInfoType::CurrentCpu as u64)
         {
             let cpu = cpu as u32;
-            if WORKER_CPU[index].swap(cpu, Ordering::AcqRel) != cpu
+            if worker_cpu.swap(cpu, Ordering::AcqRel) != cpu
             {
                 notification_send(moved, 1u64 << index).ok();
             }

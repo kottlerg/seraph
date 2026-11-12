@@ -150,7 +150,15 @@ fn start_waiter(child: &spawn::SpawnedChild, cycle: u32, cpus: u32, sig: u64, eq
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
     // The waiter alternates between CPU 0, which runs the timer, and a CPU
     // other than the controller's 1 (CPU 0 again on a 2-CPU run).
-    let waiter_cpu = if (cycle / 3) & 1 == 0 { 0 } else { 2 % cpus };
+    let waiter_cpu = if (cycle / 3) & 1 == 0
+    {
+        0
+    }
+    else
+    {
+        2u32.checked_rem(cpus)
+            .ok_or("stress::timed_waiter_thread_delete: CpuCount is zero")?
+    };
     // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(child, entry, stack, c_source, waiter_cpu) }

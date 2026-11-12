@@ -84,15 +84,14 @@ pub fn run(ctx: &TestContext) -> TestResult
                     CallerArgs {
                         ep: child_ep,
                         done: child_done,
-                        label: (i + 1) as u64,
+                        label: (i as u64).saturating_add(1),
                         bit_index: i as u64,
                     },
                 )
             };
 
-            // SAFETY: Each caller uses a distinct stack index.
-            let stack_top =
-                ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+            // Each caller uses a distinct stack index.
+            let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
             // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
             // on which no other live thread runs (`ChildStack`'s rule).
             unsafe { spawn::configure_and_start(&child, caller_entry, stack_top, arg) }
@@ -115,11 +114,14 @@ pub fn run(ctx: &TestContext) -> TestResult
             // check follows.
             #[allow(clippy::cast_possible_truncation)]
             let idx_us = idx as usize;
-            if idx == 0 || idx_us > NUM_CALLERS
+            if idx_us > NUM_CALLERS
             {
                 return Err("concurrent_ipc: received out-of-range label");
             }
-            let bit = 1u64 << (idx - 1);
+            let label_index = idx
+                .checked_sub(1)
+                .ok_or("concurrent_ipc: received out-of-range label")?;
+            let bit = 1u64 << label_index;
             if received_bitmap & bit != 0
             {
                 return Err("concurrent_ipc: duplicate label received");
@@ -138,7 +140,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
         else
         {
-            (1u64 << NUM_CALLERS) - 1
+            (1u64 << NUM_CALLERS).saturating_sub(1)
         };
         if received_bitmap != expected
         {
@@ -186,9 +188,12 @@ extern "C" fn caller_entry(arg: u64) -> !
     // cast_possible_truncation: `bit_index` is below `NUM_CALLERS`.
     #[allow(clippy::cast_possible_truncation)]
     let page = bit_index as usize;
-    // SAFETY: takes the element's raw address without forming a reference to
-    // the `static mut`.
-    let buf_addr = crate::IpcPage::addr(unsafe { core::ptr::addr_of_mut!(CALLER_IPC_PAGES[page]) });
+    let Ok(buf_addr) = crate::IpcPage::addr_at(core::ptr::addr_of_mut!(CALLER_IPC_PAGES), page)
+    else
+    {
+        notification_send(done_slot, done_bit).ok();
+        thread_exit()
+    };
     // SAFETY: `CALLER_IPC_PAGES[page]` is this caller's own IPC page, used by one
     // thread at a time (`IpcPage`'s rule); no Rust object lives in it, and the
     // child reaches it only through the raw `buf_addr` pointer.

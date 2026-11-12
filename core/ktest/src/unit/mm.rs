@@ -77,7 +77,10 @@ pub fn memory_split_merge(ctx: &TestContext) -> TestResult
 {
     const PAGE: u64 = 0x1000;
 
-    let rodata_cap = ctx.aspace_cap + 2;
+    let rodata_cap = ctx
+        .aspace_cap
+        .checked_add(2)
+        .ok_or("memory_split_merge: RODATA slot out of range")?;
     let tail =
         syscall::memory_split(rodata_cap, PAGE).map_err(|_| "memory_split on RODATA failed")?;
     if tail == rodata_cap
@@ -115,7 +118,10 @@ const SHARED_PIECE_PAGES: u64 = 4;
 fn split_shared_piece(ctx: &TestContext, case: &'static str) -> Result<u64, &'static str>
 {
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE).map_err(|_| case)?;
-    syscall::memory_split(ctx.memory_base, size - SHARED_PIECE_PAGES * PAGE_SIZE).map_err(|_| case)
+    let keep = size
+        .checked_sub(SHARED_PIECE_PAGES * PAGE_SIZE)
+        .ok_or(case)?;
+    syscall::memory_split(ctx.memory_base, keep).map_err(|_| case)
 }
 
 /// The size of the Memory object `cap` names, or 0 when the query fails.
@@ -735,7 +741,11 @@ pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
 
     for i in 0..SEG_COUNT
     {
-        let seg_cap = ctx.aspace_cap + 1 + i;
+        let seg_cap = ctx
+            .aspace_cap
+            .checked_add(1)
+            .and_then(|first| first.checked_add(i))
+            .ok_or("segment cap slot out of range")?;
         // Map read-only via explicit prot (not prot=0): segment caps are now
         // full-rights, so deriving perms from cap rights would request W+X and
         // trip W^X. Explicit MAP_READ maps read-only regardless of cap rights;

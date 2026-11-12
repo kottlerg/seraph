@@ -71,7 +71,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // the children it started the same way, so none spins on into the
     // following cells.
     let mut deleted = Ok(());
-    for child in &mut children.guards[..children.spawned]
+    for child in children.guards.iter_mut().take(children.spawned)
     {
         if child.delete_thread().is_err()
         {
@@ -92,12 +92,12 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// in `children` as soon as it exists.
 fn spawn_children(ctx: &TestContext, running: u64, children: &mut Children) -> TestResult
 {
-    for i in 0..NUM_CHILDREN
+    for (i, guard) in children.guards.iter_mut().enumerate()
     {
-        children.guards[i] =
+        *guard =
             spawn::new_child(ctx).map_err(|_| "cap_delete_running: spawn::new_child failed")?;
-        children.spawned = i + 1;
-        let child = &children.guards[i];
+        children.spawned = i.saturating_add(1);
+        let child = &*guard;
         let child_running = cap_copy(running, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "cap_delete_running: cap_copy running failed")?;
         // SAFETY: i < NUM_CHILDREN; child i has not started, and the entry's
@@ -111,9 +111,9 @@ fn spawn_children(ctx: &TestContext, running: u64, children: &mut Children) -> T
                 },
             )
         };
-        // SAFETY: stress tests run sequentially; only this test uses these
+        // Stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(child, spinner_entry, stack_top, arg) }

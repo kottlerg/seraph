@@ -232,7 +232,7 @@ fn shift(index: usize) -> u32
     // cast_possible_truncation: index < MAX_CHILDREN.
     #[allow(clippy::cast_possible_truncation)]
     let index = index as u32;
-    index * CHILD_SHIFT
+    index.saturating_mul(CHILD_SHIFT)
 }
 
 /// Start child `index` waiting on a copy of `object`, storing it in `slot`
@@ -274,8 +274,7 @@ fn start_child(
             },
         )
     };
-    // SAFETY: stack `index` is this child's; reaped before the next phase.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CHILD_STACKS[index]) });
+    let stack = ChildStack::top_at(core::ptr::addr_of!(CHILD_STACKS), index)?;
     // SAFETY: the stack is `CHILD_STACKS[index]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, entry, stack, arg) }

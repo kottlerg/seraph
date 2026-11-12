@@ -819,8 +819,8 @@ pub const MEM_UNMAP_RECLAIM_PTS: u64 = 0x1;
 /// Every binding on a line passes the same mode: the line's first binding
 /// records it, and a binding with another mode is refused with
 /// `InvalidArgument` until the line's last binding goes. x86-64 programs the
-/// line's I/O APIC redirection entry from it; riscv64 validates it and ignores
-/// it (the PLIC gateway is level-sensitive). See
+/// line's I/O APIC redirection entry from it, riscv64 the line's APLIC source
+/// mode. See
 /// `core/kernel/docs/syscalls.md` § `SYS_IRQ_REGISTER`.
 pub const IRQ_MODE_LEVEL: u64 = 1 << 0;
 

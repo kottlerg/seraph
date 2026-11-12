@@ -20,7 +20,7 @@
 //!   claim for mode negotiation.
 //! - [`count_aperture_seed`]: count the seeds [`parse_aperture_seed`]
 //!   writes, which sizes the seed buffer.
-//! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
+//! - [`parse_aperture_seed`]: collect MMIO extents (CLINT, UART, PCI
 //!   ECAM + ranges, `virtio,mmio` transports, the supervisor-level APLIC and
 //!   IMSIC) as seeds for [`super::memory_map::derive_mmio_apertures`].
 //! - [`parse_aia`]: find the supervisor-level APLIC domain and IMSIC layout,
@@ -29,8 +29,8 @@
 //! - [`parse_rng_seed`]: extract and scrub the `/chosen/rng-seed` boot-entropy
 //!   fallback.
 //!
-//! The arch-specific `kernel_mmio` extractor for RISC-V (PLIC + UART
-//! from compatible nodes, APLIC + IMSIC from [`parse_aia`]) lives under [`crate::arch::riscv64`] and
+//! The arch-specific `kernel_mmio` extractor for RISC-V (UART from
+//! compatible nodes, APLIC + IMSIC from [`parse_aia`]) lives under [`crate::arch::riscv64`] and
 //! consumes the [`Fdt`] surface exposed here.
 
 use crate::bprintln;
@@ -126,9 +126,6 @@ pub struct FdtNode
     /// `(offset, length)`; `(0, 0)` when it has none. [`Fdt::pci_ranges`]
     /// reads its entries in place, so no entry bound applies.
     pub ranges: (u32, u32),
-    /// The `riscv,ndev` property (a PLIC's interrupt-source count), or 0
-    /// when the node has none.
-    pub riscv_ndev: u32,
     /// The AIA properties of an APLIC or IMSIC node; all zero or `None` on
     /// any other node.
     pub aia: AiaProps,
@@ -214,7 +211,6 @@ struct NodeState
     irq_entries: [u32; MAX_IRQ_ENTRIES],
     irq_count: usize,
     ranges: (u32, u32),
-    riscv_ndev: u32,
     aia: AiaProps,
 }
 
@@ -229,7 +225,6 @@ impl NodeState
             irq_entries: [0; MAX_IRQ_ENTRIES],
             irq_count: 0,
             ranges: (0, 0),
-            riscv_ndev: 0,
             aia: AiaProps::new(),
         }
     }
@@ -450,7 +445,6 @@ impl Fdt
                             irq_entries: s.irq_entries,
                             irq_count: s.irq_count,
                             ranges: s.ranges,
-                            riscv_ndev: s.riscv_ndev,
                             aia: s.aia,
                         };
                         if !callback(node)
@@ -516,7 +510,9 @@ impl Fdt
                     }
                     else if name == b"interrupts"
                     {
-                        // #interrupt-cells=1 (typical for PLIC): each entry = 4 bytes.
+                        // Each 4-byte cell is one entry; the parent's
+                        // `#interrupt-cells` is not resolved, so a 2-cell APLIC
+                        // specifier fills two entries.
                         let data = self.struct_slice(data_off, prop_len);
                         let mut i = 0;
                         while i + 4 <= data.len() && state.irq_count < MAX_IRQ_ENTRIES
@@ -526,14 +522,6 @@ impl Fdt
                             i += 4;
                         }
                         truncated |= i + 4 <= data.len();
-                    }
-                    else if name == b"riscv,ndev"
-                    {
-                        let data = self.struct_slice(data_off, prop_len);
-                        if data.len() >= 4
-                        {
-                            state.riscv_ndev = read_be32(data);
-                        }
                     }
                     else if name == b"ranges"
                     {
@@ -1498,7 +1486,6 @@ pub unsafe fn parse_aia(dtb_addr: u64) -> DtbAia
 /// Walk the DTB and collect MMIO extents into `out` for aperture seeding.
 ///
 /// Writes up to `out.len()` [`MmioAperture`] entries covering:
-/// - PLIC register window (`sifive,plic-1.0.0` / `riscv,plic0`).
 /// - CLINT register window (`riscv,clint0` / `sifive,clint0`).
 /// - UART register window (`ns16550a`).
 /// - PCI host bridge ECAM window (`pci-host-ecam-generic`, from `reg`).
@@ -1576,8 +1563,6 @@ unsafe fn walk_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> (usize,
         };
 
     for compat in [
-        &b"sifive,plic-1.0.0"[..],
-        &b"riscv,plic0"[..],
         &b"riscv,clint0"[..],
         &b"sifive,clint0"[..],
         &b"ns16550a"[..],
@@ -1955,38 +1940,6 @@ mod tests
         ];
         // SAFETY: as above.
         assert_eq!(unsafe { parse_aperture_seed(addr, &mut exact) }, counted);
-    }
-
-    // Defect caught: a PLIC's `riscv,ndev` not reaching the walker's node, so the
-    // kernel would fall back to the specification maximum on every platform.
-    #[test]
-    fn plic_node_reports_its_riscv_ndev()
-    {
-        let mut b = FdtBuilder::new();
-        b.begin_node(b"");
-        b.begin_node(b"plic@c000000");
-        b.prop(b"compatible", b"sifive,plic-1.0.0\0riscv,plic0\0");
-        b.prop(b"riscv,ndev", &95u32.to_be_bytes());
-        b.end_node();
-        b.begin_node(b"uart@10000000");
-        b.prop(b"compatible", b"ns16550a\0");
-        b.end_node();
-        b.end_node();
-        let blob = b.finish();
-        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
-        let fdt = unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.expect("valid FDT");
-        let mut plic = None;
-        fdt.walk_compatible(b"riscv,plic0", |node| {
-            plic = Some(node.riscv_ndev);
-            false
-        });
-        assert_eq!(plic, Some(95));
-        let mut uart = None;
-        fdt.walk_compatible(b"ns16550a", |node| {
-            uart = Some(node.riscv_ndev);
-            false
-        });
-        assert_eq!(uart, Some(0));
     }
 
     #[test]

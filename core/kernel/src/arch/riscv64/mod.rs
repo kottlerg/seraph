@@ -5,6 +5,9 @@
 
 //! RISC-V 64-bit architecture module for the kernel.
 
+#[cfg(not(test))]
+pub mod aia;
+pub mod aia_encoding;
 pub mod ap_trampoline;
 pub mod console;
 pub mod context;
@@ -31,14 +34,14 @@ pub const ARCH_NAME: &str = "riscv64";
 /// type when Phase 9 applies init's `.rela.dyn` fix-ups (`mm::init_reloc`).
 pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_RISCV;
 
-/// Maximum PLIC source number the IRQ id range admits: the PLIC specification's last
-/// source, 1023 (`encoding::PLIC_MAX_SOURCES`); source 0 is reserved by the spec.
+/// Maximum APLIC source number the IRQ id range admits: the AIA specification's last
+/// source, 1023 (`aia_encoding::APLIC_MAX_SOURCES`); source 0 is reserved by the spec.
 /// `SYS_IRQ_REGISTER` refuses an id outside `MIN_IRQ_ID..=MAX_IRQ_ID`; within it,
-/// `irq::register` refuses a source past the PLIC's reported count
-/// (`platform::plic_ndev`).
-pub const MAX_IRQ_ID: u32 = encoding::PLIC_MAX_SOURCES;
+/// `irq::register` refuses a source past the APLIC domain's reported count
+/// (`aia::source_count`).
+pub const MAX_IRQ_ID: u32 = aia_encoding::APLIC_MAX_SOURCES;
 
-/// Minimum valid PLIC source number. PLIC source 0 is reserved and never
+/// Minimum valid APLIC source number. APLIC source 0 is reserved and never
 /// wired to a real device.
 // dead_code: host test builds compile out its readers (`sys_irq_register`,
 // `dealloc_object_one`).
@@ -53,10 +56,11 @@ pub const HAS_IO_PORTS: bool = false;
 pub const HAS_SBI: bool = true;
 
 /// Width of the root `Interrupt` range capability minted at Phase 7: the
-/// PLIC's 1024-entry id space (id 0 reserved, sources 1–1023); most platforms
-/// expose far fewer. The cap spans ids the PLIC does not implement; a split can
-/// name them, `SYS_IRQ_REGISTER` refuses them with `InvalidArgument`, and the
-/// teardown of a cap naming one leaves the routing table and the PLIC untouched.
+/// APLIC's 1024-entry source space (source 0 reserved, sources 1–1023); most
+/// platforms expose far fewer. The cap spans sources the APLIC domain does not
+/// implement; a split can name them, `SYS_IRQ_REGISTER` refuses them with
+/// `InvalidArgument`, and the teardown of a cap naming one leaves the routing table
+/// and the APLIC untouched.
 pub const ROOT_IRQ_COUNT: u32 = 1024;
 
 /// A thread's I/O permission bitmap and its page-sized parts (re-exported from
@@ -78,14 +82,18 @@ pub fn sbi_forward(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> 
     Ok(ret.value)
 }
 
-/// No-op on RISC-V: there are no per-CPU GDT/TSS/IST tables or NMI-backtrace
-/// slab — those are x86-64 concepts. Present so the SMP bring-up path calls it
-/// unconditionally on both arches.
+/// Allocate the riscv64 per-CPU tables sized to `cpu_count`: each CPU's IMSIC
+/// EID row (`aia::init_eid_storage`), which halts the boot when the bootloader
+/// reported no IMSIC. Called from `sched::init_per_cpu_storage` in Phase 4, after
+/// `kernel_mmio` is captured and before Phase 5 brings up AIA.
 #[cfg(not(test))]
-pub fn init_ap_percpu_storage(_cpu_count: usize, _allocator: &mut crate::mm::BuddyAllocator) {}
+pub fn init_ap_percpu_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
+{
+    aia::init_eid_storage(cpu_count, allocator);
+}
 
 // MMIO regions that must be direct-mapped during Phase 3 page-table setup
 // are supplied by [`platform::collect_mmio_direct_map_regions`], which always
-// returns 0 entries on RISC-V: the PLIC and UART on the QEMU `virt` machine
-// sit below the RAM ceiling, inside the [0, ceiling) span the large-page
-// direct map already covers.
+// returns 0 entries on RISC-V: the APLIC, the IMSIC and the UART on the QEMU
+// `virt` machine sit below the RAM ceiling, inside the [0, ceiling) span the
+// large-page direct map already covers.

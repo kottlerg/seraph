@@ -117,7 +117,8 @@ FreeBSD `pkg install edk2-qemu-x64`).
 **RISC-V** always uses TCG with edk2 UEFI firmware and OpenSBI (loaded
 automatically by QEMU's `virt` machine). Requires edk2 RISC-V firmware
 (`dnf install edk2-riscv64` / `apt install qemu-efi-riscv64`) and
-QEMU ≥ 8.0 (V extension). `xtask` passes the explicit feature string on
+QEMU ≥ 9.0 (the V extension, and the `ssaia`/`smaia` CPU properties). `xtask`
+passes the explicit feature string, and `-machine virt,aia=aplic-imsic`, on
 every riscv64 QEMU launch and every supported QEMU; the named `-cpu rva23s64` model
 is a superset that `xtask` does not expose (see
 [docs/build-system.md](../docs/build-system.md) § QEMU and Firmware).
@@ -1088,10 +1089,14 @@ cargo xtask orch end
 
 The state is `target/xtask/orchestration/state.json`, and the batch's log is `<date>.md`
 beside it, named for the UTC date of `orch start`; a second batch started on the same UTC day
-appends to the same log. Nothing else writes either file. A change is
-made under a lock file (`state.lock`), written through a temporary file, and followed by one
-line in the log, `- <UTC time> <what changed>`, so the log needs no separate upkeep; `orch log`
-appends a line for an event that changes no state.
+appends to the same log. Both are the main checkout's: the command finds that checkout through
+the git common directory, as the [host lock](#host-launch-rules) does, so run in a linked
+worktree it reads and writes the same files, and a worker records its status there from its own
+worktree (`.claude/agents/worker.md` § Reporting). Outside a git checkout, and in one whose git
+common directory is not a `.git` directory, it uses the checkout's own `target/`. Nothing else
+writes either file. A change is made under a lock file (`state.lock`), written through a
+temporary file, and followed by one line in the log, `- <UTC time> <what changed>`, so the log
+needs no separate upkeep; `orch log` appends a line for an event that changes no state.
 
 | Subcommand | Effect |
 |---|---|

@@ -3,21 +3,21 @@
 
 // core/kernel/src/arch/riscv64/interrupts.rs
 
-//! RISC-V trap handling and PLIC initialisation.
+//! RISC-V trap handling and the external-interrupt controller's arch interface.
 //!
 //! Sets up the supervisor-mode trap infrastructure:
 //! 1. Installs `trap_entry` in `stvec` (direct mode).
 //! 2. Clears `sstatus.SIE`, `sstatus.SPP`, `sstatus.SUM` for a clean initial state.
 //! 3. Enables `sie.SSIP` (IPIs), `sie.STIP` (timer), and `sie.SEIP` (external) bits.
-//! 4. Initialises the PLIC: sets all source priorities to 1 and the boot hart's
-//!    S-mode threshold to 0 (accept all above-threshold interrupts).
+//! 4. Brings up AIA ([`super::aia`]): the APLIC domain in MSI delivery mode and
+//!    each hart's IMSIC interrupt file.
 //!
 //! The trap vector dispatches:
 //! - Software interrupt (scause = 1 | MSB) → `handle_software_interrupt` (TLB shootdown /
 //!   wakeup)
 //! - Timer interrupt (scause = 5 | MSB) → `timer::handle_tick()`
-//! - External interrupt (scause = 9 | MSB) → PLIC claim → `dispatch_external` (completes
-//!   via `acknowledge`)
+//! - External interrupt (scause = 9 | MSB) → IMSIC claim (`aia::claim`) →
+//!   `dispatch_external`
 //! - U-mode illegal instruction on an F/D/V opcode (scause = 2) → lazy FP/V restore
 //! - U-mode ecall (scause = 8) → `crate::syscall::dispatch`
 //! - Other U-mode exceptions → spurious-TLB retry, the bound fault handler, or thread
@@ -25,86 +25,22 @@
 //! - Other S-mode exceptions → the kernel spurious-TLB retry (load/store), the
 //!   `copy_user` fixup, else diagnostics + `fatal()`
 //!
-//! # PLIC layout
-//! Base physical address is supplied by the bootloader through
-//! `BootInfo.kernel_mmio.plic_base` (see [`super::platform::plic_base`]) and
-//! accessed via the direct map. Register offsets follow the RISC-V PLIC spec:
-//! - Priority registers: base + 4*source (sources `1..=platform::plic_ndev()`).
-//! - Enable registers:  base + 0x2000 + 0x80*context + 4*word.
-//! - Threshold:         base + `0x20_0000` + 0x1000*context.
-//! - Claim/Complete:    the threshold register + 4.
-//!
-//! A hart's S-mode context is taken to be `hart*2 + 1`, numbered by the hardware
-//! hart id (`percpu::apic_id_for`), never by the kernel's logical CPU index: the
-//! boot hart need not be hart 0, and the two numberings differ wherever firmware
-//! enumerates harts sparsely. The PLIC specification leaves the context-to-hart
-//! mapping to the platform (a device tree states it in the PLIC's
-//! `interrupts-extended`); `hart*2 + 1` is the layout of the platforms the kernel
-//! targets (QEMU `virt` and SiFive-style PLICs), an assumption the kernel does
-//! not read from firmware. `init` and `init_ap` halt the boot when a hart's
-//! context registers would fall outside the PLIC window
-//! (`super::platform::plic_size`).
-//!
-//! # Routing
-//! Each routed source is enabled on one hart's S-mode context, its target, chosen at
-//! route time ([`route_device_irq`], through `irq::next_target_cpu`): the harts in turn,
-//! so device interrupts spread over the harts. One context per source avoids the PLIC
-//! thundering herd, in which every enabled hart traps and all but one lose the claim.
-//! The target is recorded per source (`SOURCE_TARGET`), so mask and unmask act on that
-//! context, and the claim and complete run on the hart that took the trap.
-//!
-//! # Locking
-//! [`plic_enable`] and [`plic_disable`] read-modify-write a 32-source enable word of
-//! the source's target context, and [`acknowledge`] one of the claiming hart's own
-//! context around its completion; all run on any hart (`SYS_IRQ_ACK`, the device-IRQ
-//! dispatch in interrupt context, and the route changes `irq` makes), so each holds
-//! `PLIC_LOCK`, a leaf lock taken with interrupts disabled, across its read and write;
-//! otherwise two updates to sources sharing a word could lose one. `SOURCE_TARGET` is
-//! written only by the route changes, which `irq` serialises under its routing lock.
-//! [`init`] and [`init_ap`] write only the boot hart's or their own hart's context
-//! before any IRQ is routed and take no lock; the claim register is per-context and
-//! needs none.
+//! # Device interrupts
+//! The controller is AIA, whose mechanism [`super::aia`] holds: each routed APLIC
+//! source is forwarded as a message to one hart's IMSIC file, its target, chosen at
+//! route time ([`route_device_irq`], through `irq::next_target_cpu`): the harts in
+//! turn, so device interrupts spread over the harts. The hart that takes the
+//! external-interrupt trap claims the identity and dispatches the source it maps
+//! to; masking and unmasking are APLIC register writes any hart can make.
 //!
 //! # Modification notes
 //! - Device IRQs need no per-device code here: `route_device_irq` picks the source's
 //!   target and leaves it masked, and `dispatch_external` forwards every claimed source
 //!   to `crate::irq::dispatch_device_irq`.
 
-use super::encoding::{
-    PLIC_MAX_SOURCES, enable_words, plic_context_in_window, plic_enable_base_for,
-    plic_threshold_offset_for, sbi_hart_mask,
-};
+use super::encoding::sbi_hart_mask;
 use super::trap_frame::TrapFrame;
-use crate::mm::paging::{UserAccess, phys_to_virt};
-
-// ── PLIC constants ────────────────────────────────────────────────────────────
-
-/// PLIC priority register base: base + 4 * `source_id` (source 1..=`plic_ndev`).
-const PLIC_PRIORITY_BASE: u64 = 0x0000;
-
-/// Target hart of each PLIC source, plus one; 0 for an unrouted source, so the zeroed
-/// table routes none. Indexed by source id over the specification's id space. Written
-/// only by [`route_device_irq`] and [`unroute_device_irq`], which `irq` serialises under
-/// its routing lock; read by [`plic_enable`] and [`plic_disable`].
-#[cfg(not(test))]
-static SOURCE_TARGET: [core::sync::atomic::AtomicU32; PLIC_MAX_SOURCES as usize + 1] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; PLIC_MAX_SOURCES as usize + 1];
-
-/// Serialises the enable-word read-modify-writes of [`plic_enable`], [`plic_disable`]
-/// and [`acknowledge`] (see the module doc's § Locking). A leaf lock: nothing is acquired
-/// while it is held.
-#[cfg(not(test))]
-static PLIC_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
-
-/// The hart id `source` is routed to, or `None` when it is unrouted (or out of range).
-#[cfg(not(test))]
-fn source_target(source: u32) -> Option<u32>
-{
-    SOURCE_TARGET
-        .get(source as usize)?
-        .load(core::sync::atomic::Ordering::Relaxed)
-        .checked_sub(1)
-}
+use crate::mm::paging::UserAccess;
 
 /// Hardware hart id of the executing hart.
 #[cfg(not(test))]
@@ -112,60 +48,9 @@ fn current_hart() -> u32
 {
     let cpu = super::cpu::current_cpu() as usize;
     // SAFETY: `current_cpu()` is this hart's logical index, below `CPU_COUNT`;
-    // `percpu::init_apic_ids` runs before Phase 5 (`kernel_entry`), ahead of every
-    // caller (`init_ap` and the external-interrupt claim and complete).
+    // `percpu::init_apic_ids` runs before Phase 5 (`kernel_entry`), ahead of its
+    // caller (`init_ap`).
     unsafe { crate::percpu::apic_id_for(cpu) }
-}
-
-/// Host-test stub: no hart identity exists off-target.
-#[cfg(test)]
-fn current_hart() -> u32
-{
-    0
-}
-
-/// Halt the boot unless hart `hart`'s PLIC context lies inside the PLIC window.
-#[cfg(not(test))]
-fn require_plic_context(hart: u32)
-{
-    if !plic_context_in_window(hart, super::platform::plic_size())
-    {
-        crate::fatal("riscv64: a hart's PLIC S-mode context lies outside the PLIC window");
-    }
-}
-
-/// PLIC claim/complete register offset for the executing hart's S-mode context.
-fn plic_claim_complete_offset() -> u64
-{
-    plic_threshold_offset_for(current_hart()) + 4
-}
-
-// ── PLIC access helpers ───────────────────────────────────────────────────────
-
-fn plic_read(offset: u64) -> u32
-{
-    let vaddr = phys_to_virt(super::platform::plic_base() + offset);
-    // SAFETY: PLIC base mapped via direct map; offset within PLIC MMIO range;
-    // volatile read ensures ordering and prevents compiler reordering.
-    unsafe { core::ptr::read_volatile(vaddr as *const u32) }
-}
-
-/// Write `val` to the PLIC register at `offset`, then order it before later MMIO stores.
-///
-/// # Safety
-/// The direct physical map must be active and `offset` must lie inside the PLIC register
-/// window.
-unsafe fn plic_write(offset: u64, val: u32)
-{
-    let vaddr = phys_to_virt(super::platform::plic_base() + offset);
-    // SAFETY: PLIC base mapped via direct map; offset within PLIC MMIO range;
-    // volatile write ensures the access is not elided or reordered by the
-    // compiler.
-    unsafe { core::ptr::write_volatile(vaddr as *mut u32, val) };
-    // RVWMO allows I/O-region writes to be reordered; a sequence of per-hart
-    // enable-bit writes must be observed by the PLIC in program order, so we
-    // emit an MMIO→MMIO fence after every store.
-    mmio::mmio_to_mmio_barrier();
 }
 
 // ── Trap vector ───────────────────────────────────────────────────────────────
@@ -573,21 +458,9 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
             5 => super::timer::handle_tick(), // Supervisor timer interrupt
             9 =>
             {
-                // Supervisor external interrupt: claim, then dispatch.
-                // dispatch_external -> dispatch_device_irq calls acknowledge(irq),
-                // which writes the PLIC claim/complete register. Do NOT write it
-                // again here.
-                //
-                // `plic_enable` enables each source only on its routed target
-                // hart's S-mode context (`irq::next_target_cpu` picks the target
-                // at route time), so the hart taking this trap claims the sources
-                // routed to it; a claim that reads 0 (no source pending for this
-                // context) dispatches nothing.
-                let irq = plic_read(plic_claim_complete_offset());
-                if irq != 0
-                {
-                    dispatch_external(irq);
-                }
+                // Supervisor external interrupt: this hart's IMSIC file has a
+                // pending identity.
+                dispatch_external();
             }
             _ =>
             {
@@ -1053,106 +926,45 @@ unsafe fn redirect_user_fault(
     }
 }
 
-/// Enable PLIC `source` on its target hart's S-mode context; an unrouted source is left
-/// disabled. Reached from `SYS_IRQ_ACK` through `irq::ack`, under `irq`'s routing lock,
-/// so the target cannot be cleared between its read here and the enable.
-#[cfg(not(test))]
-pub fn plic_enable(source: u32)
-{
-    if let Some(hart) = source_target(source)
-    {
-        plic_update_enable_word(source, hart, |word, bit| word | bit);
-    }
-}
-
-/// Disable PLIC `source` on its target hart's S-mode context (a no-op for an unrouted
-/// source, which is enabled on no context).
-#[cfg(not(test))]
-pub fn plic_disable(source: u32)
-{
-    if let Some(hart) = source_target(source)
-    {
-        plic_update_enable_word(source, hart, |word, bit| word & !bit);
-    }
-}
-
-/// Rewrite the enable word holding PLIC `source` in hart `hart`'s S-mode context to
-/// `update(word, bit)`, where `bit` is the source's mask in that word, under
-/// `PLIC_LOCK` (module doc § Locking). A source outside `1..=plic_ndev()` is ignored;
-/// `irq::register` refuses such an id.
-#[cfg(not(test))]
-fn plic_update_enable_word(source: u32, hart: u32, update: impl FnOnce(u32, u32) -> u32)
-{
-    if source == 0 || source > super::platform::plic_ndev()
-    {
-        return;
-    }
-    let word_idx = source / 32;
-    let bit = 1u32 << (source % 32);
-    let offset = plic_enable_base_for(hart) + (u64::from(word_idx) * 4);
-    // SAFETY: PLIC_LOCK is a leaf lock; lock_raw disables interrupts and is
-    // paired with unlock_raw below on the only path out.
-    let saved = unsafe { PLIC_LOCK.lock_raw() };
-    let current = plic_read(offset);
-    let updated = update(current, bit);
-    // SAFETY: direct map active; PLIC MMIO is accessible; `offset` is an enable
-    // word of a context `init` or `init_ap` checked to lie inside the window.
-    unsafe { plic_write(offset, updated) };
-    // SAFETY: paired with lock_raw above.
-    unsafe { PLIC_LOCK.unlock_raw(saved) };
-}
-
-/// Mask (disable) PLIC source `irq`.
+/// Mask (disable) APLIC source `irq` (`aia::mask`).
 pub fn mask(irq: u32)
 {
     #[cfg(not(test))]
-    plic_disable(irq);
+    super::aia::mask(irq);
     #[cfg(test)]
     let _ = irq;
 }
 
-/// Unmask (enable) PLIC source `irq`.
+/// Unmask (enable) routed APLIC source `irq`, pending a level-sensitive source again
+/// while it is still asserted (`aia::unmask`).
 pub fn unmask(irq: u32)
 {
     #[cfg(not(test))]
-    plic_enable(irq);
+    super::aia::unmask(irq);
     #[cfg(test)]
     let _ = irq;
 }
 
-/// Route device IRQ (PLIC source) `irq`, leaving it masked at the controller: pick
-/// its target hart (the next in turn, `irq::next_target_cpu`) and record it. The
-/// driver unmasks via `SYS_IRQ_ACK` once it has registered a handler. Called by
-/// `irq::register` for the source's first binding; the route is kept while any binding
-/// remains, and released (`unroute_device_irq`) when the last goes, so the source is not
-/// routed when this runs; the leading disable is defensive.
-///
-/// `_mode` (the `SYS_IRQ_REGISTER` trigger and polarity word, which `irq::register`
-/// validated and recorded) programs nothing: the PLIC gateway is level-sensitive and has
-/// no trigger or polarity setting.
+/// Route device IRQ (APLIC source) `irq`, leaving it masked at the controller: pick
+/// its target hart (the next in turn with a free IMSIC identity,
+/// `irq::next_target_cpu`), take an identity in that hart's file, and program the
+/// source's trigger and polarity from `mode` (the `SYS_IRQ_REGISTER` word, which
+/// `irq::register` validated and recorded) and its target (`aia::route`). The driver
+/// unmasks via `SYS_IRQ_ACK` once it has registered a handler. Called by
+/// `irq::register` for the source's first binding; the route is kept while any
+/// binding remains, and released (`unroute_device_irq`) when the last goes, so the
+/// source is not routed when this runs.
 ///
 /// # Errors
-/// `NoSuchLine` for a source outside `1..=plic_ndev()`.
+/// `NoSuchLine` for a source outside `1..=aia::source_count()`; `Exhausted` when no
+/// hart's file has a free identity.
 ///
 /// # Safety
-/// Must be called after PLIC init, under `irq`'s routing lock.
+/// Must be called after `init`, under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn route_device_irq(irq: u32, _mode: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<(), crate::irq::RouteError>
 {
-    if irq == 0 || irq > super::platform::plic_ndev()
-    {
-        return Err(crate::irq::RouteError::NoSuchLine);
-    }
-    let cpu = crate::irq::next_target_cpu(|_| true).ok_or(crate::irq::RouteError::Exhausted)?;
-    // SAFETY: `next_target_cpu` returns an index below CPU_COUNT; the hart id slab
-    // is read-only after boot.
-    let hart = unsafe { crate::percpu::apic_id_for(cpu) };
-    plic_disable(irq);
-    SOURCE_TARGET[irq as usize].store(hart + 1, core::sync::atomic::Ordering::Relaxed);
-    // Left disabled on the new target: unmask (SYS_IRQ_ACK) enables it, as the
-    // x86-64 I/O APIC path leaves its entry masked.
-    plic_disable(irq);
-    Ok(())
+    super::aia::route(irq, mode)
 }
 
 /// No-op test stub.
@@ -1165,18 +977,15 @@ pub unsafe fn route_device_irq(_irq: u32, _mode: u32) -> Result<(), crate::irq::
     Ok(())
 }
 
-/// Release PLIC source `irq`'s route: disable it on its target and forget the target.
+/// Release APLIC source `irq`'s route: disable it, make it inactive, and free its
+/// identity in its target hart's file (`aia::unroute`).
 ///
 /// # Safety
-/// Must be called after PLIC init, under `irq`'s routing lock.
+/// Must be called after `init`, under `irq`'s routing lock.
 #[cfg(not(test))]
 pub unsafe fn unroute_device_irq(irq: u32)
 {
-    plic_disable(irq);
-    if let Some(entry) = SOURCE_TARGET.get(irq as usize)
-    {
-        entry.store(0, core::sync::atomic::Ordering::Relaxed);
-    }
+    super::aia::unroute(irq);
 }
 
 /// No-op test stub.
@@ -1186,30 +995,33 @@ pub unsafe fn unroute_device_irq(irq: u32)
 #[cfg(test)]
 pub unsafe fn unroute_device_irq(_irq: u32) {}
 
-/// Number of interrupt lines the routing table covers: PLIC ids `0..=plic_ndev()` (id 0
-/// reserved).
+/// Number of interrupt lines the routing table covers: APLIC sources
+/// `0..=aia::source_count()` (source 0 reserved).
 #[cfg(not(test))]
 #[must_use]
 pub fn irq_line_count() -> u32
 {
-    super::platform::plic_ndev() + 1
+    super::aia::source_count() + 1
 }
 
-/// Dispatch an external interrupt from the PLIC to its registered notification.
+/// Claim this hart's top pending IMSIC identity and dispatch the APLIC source
+/// routed to it to its registered notifications.
 ///
-/// Called from `trap_dispatch` after claiming the interrupt. Routing is
-/// handled by [`crate::irq::dispatch_device_irq`], which masks the source
-/// and sends EOI via [`acknowledge`].
-///
-/// Note: the PLIC complete write (EOI) is performed inside
-/// `dispatch_device_irq` via `acknowledge(irq)`, so the caller (`trap_dispatch`)
-/// must NOT also write the complete register.
+/// Called from `trap_dispatch` on a supervisor external interrupt. The claim
+/// (`aia::claim`) clears the identity's pending bit and maps it to the source
+/// through this hart's EID row; a claim that finds nothing pending, or a free
+/// identity, dispatches nothing. A further pending identity keeps SEIP set and
+/// traps again. Routing is handled by [`crate::irq::dispatch_device_irq`],
+/// which masks the source and calls [`acknowledge`].
 #[cfg(not(test))]
-fn dispatch_external(irq: u32)
+fn dispatch_external()
 {
-    // SAFETY: called from trap_dispatch in interrupt context with sstatus.SIE clear;
-    // irq claimed from PLIC; dispatcher will mask source and perform EOI via acknowledge().
-    unsafe { crate::irq::dispatch_device_irq(irq) };
+    if let Some(irq) = super::aia::claim()
+    {
+        // SAFETY: called from trap_dispatch in interrupt context with
+        // sstatus.SIE clear; irq is the source the claimed identity maps to.
+        unsafe { crate::irq::dispatch_device_irq(irq) };
+    }
 }
 
 // ── Public interface ──────────────────────────────────────────────────────────
@@ -1248,8 +1060,9 @@ pub unsafe fn install_trap_vector() {}
 ///
 /// # Safety
 /// Must execute in supervisor mode with the direct physical map active, once,
-/// on the BSP, after `percpu::init_apic_ids` (the BSP's PLIC context is that of
-/// its hart id, `percpu::apic_id_for(0)`).
+/// on the BSP, after `percpu::init_apic_ids` (the BSP's IMSIC file is that of its
+/// hart id, `percpu::apic_id_for(0)`) and after Phase 4's per-CPU storage (the EID
+/// rows, `aia::init_eid_storage`).
 #[cfg(not(test))]
 pub unsafe fn init()
 {
@@ -1302,7 +1115,8 @@ pub unsafe fn init()
     // SSIP: supervisor software interrupts — used for wakeup IPIs and TLB
     //   shootdown IPIs (both delivered via SBI IPI extension).
     // STIP: supervisor timer interrupts — scheduler preemption.
-    // SEIP: supervisor external interrupts — PLIC device interrupts.
+    // SEIP: supervisor external interrupts — this hart's IMSIC file (device
+    //   interrupts, forwarded by the APLIC).
     // SAFETY: csrs sie is a privileged S-mode instruction; caller ensures S-mode.
     unsafe {
         core::arch::asm!(
@@ -1325,46 +1139,24 @@ pub unsafe fn init()
         );
     }
 
-    // Initialise PLIC:
-    // - Set priority 1 for all sources (0 = disabled, 1 = lowest priority).
-    // - Disable all source enables for BSP context (firmware may have enabled UART etc.).
-    // - Set threshold to 0 for BSP S-mode context (accept all sources ≥ 1).
-    //
-    // The BSP's context is numbered by its hart id, which the boot protocol
-    // does not fix at 0 (`BootInfo.cpu_ids[0]`, copied into the per-CPU id slab
-    // before Phase 5). `current_cpu()` is not yet usable here (`tp` is installed
-    // after this function), so the id is read for logical CPU 0 directly.
+    // Bring up AIA: the APLIC domain (every source inactive and disabled,
+    // whatever firmware left enabled) and the BSP's IMSIC file. The BSP's
+    // file is that of its hart id, which the boot protocol does not fix at 0
+    // (`BootInfo.cpu_ids[0]`, copied into the per-CPU id slab before Phase 5).
+    // `current_cpu()` is not yet usable here (`tp` is installed after this
+    // function), so the id is read for logical CPU 0 directly.
     // SAFETY: logical CPU 0 (the BSP) is below CPU_COUNT, and the caller ran
     // percpu::init_apic_ids first.
     let bsp_hart = unsafe { crate::percpu::apic_id_for(0) };
-    require_plic_context(bsp_hart);
-    let ndev = super::platform::plic_ndev();
-    crate::kprintln!(
-        "plic: {} sources (firmware reported {})",
-        ndev,
-        crate::platform::kernel_mmio().plic_ndev
-    );
-    // SAFETY: direct map active; PLIC MMIO region accessible; plic_write performs
-    // volatile stores to valid PLIC register offsets (the BSP's context was
-    // checked above to lie inside the PLIC window).
-    unsafe {
-        for src in 1..=ndev
-        {
-            plic_write(PLIC_PRIORITY_BASE + (u64::from(src) * 4), 1);
-        }
-        let bsp_enable_base = plic_enable_base_for(bsp_hart);
-        for w in 0..enable_words(ndev)
-        {
-            plic_write(bsp_enable_base + u64::from(w) * 4, 0);
-        }
-        plic_write(plic_threshold_offset_for(bsp_hart), 0);
-    }
+    // SAFETY: the BSP in S-mode, once, with the direct map active and SIE clear
+    // (above); Phase 4's init_ap_percpu_storage allocated the EID rows.
+    unsafe { super::aia::init_bsp(bsp_hart) };
 }
 
 /// Initialise supervisor trap infrastructure for an AP hart.
 ///
 /// Called from `kernel_entry_ap` on each secondary hart. Mirrors the
-/// per-hart subset of `init()` (no PLIC global setup — that is BSP-only).
+/// per-hart subset of `init()` (no APLIC setup — that is BSP-only).
 ///
 /// # Safety
 /// Must execute in supervisor mode on the AP being initialised.
@@ -1424,24 +1216,12 @@ pub unsafe fn init_ap()
         );
     }
 
-    // Set PLIC threshold to 0 for this hart's S-mode context and disable
-    // all sources. Firmware may have left sources enabled (e.g. UART),
-    // which would cause unhandled interrupt storms on secondary harts. The
-    // context is this hart's (by hart id); percpu::init_ap installed `tp`
-    // before this call, so current_cpu() is valid.
-    let hart = current_hart();
-    require_plic_context(hart);
-    // SAFETY: direct map active; PLIC MMIO accessible; this hart's context,
-    // checked above to lie inside the PLIC window.
-    unsafe {
-        plic_write(plic_threshold_offset_for(hart), 0);
-        // Disable all source enable words for this hart's context.
-        let enable_base = plic_enable_base_for(hart);
-        for w in 0..enable_words(super::platform::plic_ndev())
-        {
-            plic_write(enable_base + u64::from(w) * 4, 0);
-        }
-    }
+    // Initialise this hart's IMSIC file (by hart id; percpu::init_ap installed
+    // `tp` before this call, so current_cpu() is valid). Firmware may have left
+    // identities pending; the init clears them before enabling delivery.
+    // SAFETY: this hart in S-mode with SIE clear (above); the EID rows were
+    // allocated in Phase 4, before any AP started.
+    unsafe { super::aia::init_hart(current_hart()) };
 }
 
 /// No-op stub for host tests.
@@ -1504,53 +1284,11 @@ pub fn are_enabled() -> bool
     sstatus & (1 << 1) != 0
 }
 
-/// Complete a PLIC external interrupt for `irq` on the executing hart's context,
-/// the one that claimed it.
-///
-/// The PLIC ignores a completion for a source not enabled on the completing
-/// context, and the dispatch masks (disables) the source before it completes
-/// (`irq::deliver`), as a route change may also have done. So a disabled source
-/// is enabled on this context for the completion and disabled again after it,
-/// under `PLIC_LOCK`; without that the gateway never sees the completion and the
-/// source never interrupts again.
-#[cfg(not(test))]
-pub fn acknowledge(irq: u32)
-{
-    let complete = plic_claim_complete_offset();
-    if irq == 0 || irq > super::platform::plic_ndev()
-    {
-        // SAFETY: plic_write performs a volatile store to this context's
-        // claim/complete register, inside the window init_ap checked.
-        unsafe { plic_write(complete, irq) };
-        return;
-    }
-    let word = plic_enable_base_for(current_hart()) + u64::from(irq / 32) * 4;
-    let bit = 1u32 << (irq % 32);
-    // SAFETY: PLIC_LOCK is a leaf lock; lock_raw disables interrupts and is
-    // paired with unlock_raw below on the only path out.
-    let saved = unsafe { PLIC_LOCK.lock_raw() };
-    let enables = plic_read(word);
-    // SAFETY: `word` is an enable word and `complete` the claim/complete register
-    // of this hart's context, both inside the window init_ap checked; the
-    // completion writes back the claimed id, as the PLIC protocol requires.
-    unsafe {
-        if enables & bit == 0
-        {
-            plic_write(word, enables | bit);
-            plic_write(complete, irq);
-            plic_write(word, enables);
-        }
-        else
-        {
-            plic_write(complete, irq);
-        }
-    }
-    // SAFETY: paired with lock_raw above.
-    unsafe { PLIC_LOCK.unlock_raw(saved) };
-}
-
-/// No-op test stub.
-#[cfg(test)]
+/// Acknowledge APLIC source `irq` at the controller after its dispatch: a no-op on
+/// AIA. The claim (`aia::claim`) already cleared the identity's pending bit in the
+/// hart's IMSIC file, which needs no completion, and the APLIC cleared the source's
+/// pending bit when it forwarded it; a level-sensitive source still asserted is
+/// pended again at its unmask ([`unmask`]), once its receivers have acknowledged.
 pub fn acknowledge(_irq: u32) {}
 
 // ── IPI infrastructure ────────────────────────────────────────────────────────

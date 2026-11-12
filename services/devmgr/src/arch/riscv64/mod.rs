@@ -74,7 +74,7 @@ pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Riscv;
 
 /// GSI for a PCI function whose config-space IRQ line is unset, from its
 /// `INTx` pin and device number: the QEMU `virt` PCI host's swizzle onto
-/// PLIC sources 32..=35 (firmware leaves the IRQ line 0 there). Returns
+/// APLIC sources 32..=35 (firmware leaves the IRQ line 0 there). Returns
 /// `None` for a pin outside `INTA`..=`INTD` (1..=4).
 pub fn intx_fallback_gsi(pin: u8, dev: u8) -> Option<u32>
 {
@@ -93,8 +93,8 @@ pub fn pci_line_overrides(_firmware: &Firmware) -> Vec<firmware::acpi::SourceOve
 }
 
 /// The `SYS_IRQ_REGISTER` mode of a PCI `INTx` line: level-triggered,
-/// active-high, the PLIC's own sense of the swizzled `INTx` sources. The
-/// kernel validates and records it, and programs nothing from it.
+/// active-high, the sense the QEMU `virt` device tree gives the swizzled `INTx`
+/// sources. The kernel programs the APLIC source mode from it.
 pub fn pci_line_mode(_overrides: &[firmware::acpi::SourceOverride], _gsi: u32) -> u64
 {
     syscall::IRQ_MODE_LEVEL
@@ -108,7 +108,7 @@ pub fn carve_io_ports(_caps: &mut DevmgrCaps, _base: u16, _count: u16) -> Option
 }
 
 /// The line and `SYS_IRQ_REGISTER` mode of a platform record's interrupt
-/// `line`: the PLIC or APLIC source and the mode its description gives; no
+/// `line`: the APLIC source and the mode its description gives; no
 /// ISA routing exists on riscv64.
 pub fn platform_line(_irq_range: &IrqRangeAllocator, line: u32, mode: u64, _isa: bool)
 -> (u32, u64)

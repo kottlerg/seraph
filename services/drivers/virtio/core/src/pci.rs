@@ -282,9 +282,10 @@ impl PciTransport
         );
         let addr = (self.window_va + offset) as *mut u16;
         // SAFETY: the doorbell lies inside the notification region (checked
-        // above), which is within its BAR's mapping; addr is
-        // naturally aligned (notify_off and multiplier are set by the device
-        // to maintain u16 alignment per VirtIO 1.2 §4.1.4.4).
+        // above), which is within its BAR's mapping; addr is naturally
+        // aligned, since RegisterLayout holds the region's offset and the
+        // multiplier 2-aligned (structure_usable) and the window maps the BAR
+        // page-aligned.
         // cast_ptr_alignment: the doorbell is u16-aligned, as stated above.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
@@ -402,7 +403,8 @@ impl PciTransport
         let addr = self.common_addr(offset);
         // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
         // (RegisterLayout), past every register this file addresses in it;
-        // VirtIO PCI common cfg registers are naturally aligned within the BAR.
+        // each register sits at a multiple of its width from the region's
+        // start, which RegisterLayout holds 4-aligned (structure_usable).
         // cast_ptr_alignment: as the SAFETY comment says, and the window maps
         // the BAR page-aligned.
         #[allow(clippy::cast_ptr_alignment)]
@@ -416,7 +418,8 @@ impl PciTransport
         let addr = self.common_addr(offset);
         // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
         // (RegisterLayout), past every register this file addresses in it;
-        // VirtIO PCI common cfg registers are naturally aligned within the BAR.
+        // each register sits at a multiple of its width from the region's
+        // start, which RegisterLayout holds 4-aligned (structure_usable).
         // cast_ptr_alignment: as the SAFETY comment says, and the window maps
         // the BAR page-aligned.
         #[allow(clippy::cast_ptr_alignment)]
@@ -431,7 +434,8 @@ impl PciTransport
         let addr = self.common_addr(offset);
         // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
         // (RegisterLayout), past every register this file addresses in it;
-        // VirtIO PCI common cfg registers are naturally aligned within the BAR.
+        // each register sits at a multiple of its width from the region's
+        // start, which RegisterLayout holds 4-aligned (structure_usable).
         // cast_ptr_alignment: as the SAFETY comment says, and the window maps
         // the BAR page-aligned.
         #[allow(clippy::cast_ptr_alignment)]
@@ -445,7 +449,8 @@ impl PciTransport
         let addr = self.common_addr(offset);
         // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
         // (RegisterLayout), past every register this file addresses in it;
-        // VirtIO PCI common cfg registers are naturally aligned within the BAR.
+        // each register sits at a multiple of its width from the region's
+        // start, which RegisterLayout holds 4-aligned (structure_usable).
         // cast_ptr_alignment: as the SAFETY comment says, and the window maps
         // the BAR page-aligned.
         #[allow(clippy::cast_ptr_alignment)]

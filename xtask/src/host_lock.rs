@@ -373,19 +373,26 @@ pub fn probe_host() -> Probe
 /// `target/xtask/host/` outside a git checkout.
 pub fn lock_dir(ctx: &Context) -> PathBuf
 {
-    let common = Command::new("git")
+    match git_common_dir(&ctx.root)
+    {
+        Some(common) => common.join(LOCK_DIR_NAME),
+        None => ctx.target_dir.join("xtask").join("host"),
+    }
+}
+
+/// The absolute git common directory of the checkout at `root`, which every
+/// worktree of that checkout shares, or `None` outside a git checkout.
+pub fn git_common_dir(root: &Path) -> Option<PathBuf>
+{
+    Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .current_dir(&ctx.root)
+        .current_dir(root)
         .output()
         .ok()
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .filter(|path| !path.is_empty());
-    match common
-    {
-        Some(common) => PathBuf::from(common).join(LOCK_DIR_NAME),
-        None => ctx.target_dir.join("xtask").join("host"),
-    }
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The holder of the exclusive grant recorded in `dir`, if any.

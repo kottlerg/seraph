@@ -35,7 +35,7 @@ NS16550 at `0x1000_0000` on RISC-V). The driver carries a declaration in the ELF
 `.note.seraph.driver` (SPCR interface types `0x00` and `0x12` and ACPI `PNP0501`) and is a boot
 module, bound in the boot pass. devmgr spawns it via procmgr and delegates the record's
 resources — an `IoPort` on x86-64, an `Mmio` on RISC-V — plus the UART interrupt cap, carved
-exclusive (COM1 is ISA IRQ 4; the QEMU `virt` NS16550 is PLIC source 10). The driver owns those
+exclusive (COM1 is ISA IRQ 4; the QEMU `virt` NS16550 is APLIC source 10). The driver owns those
 caps end-to-end. Outside the driver, UART authority
 is held only by init (used by its init-logd thread, the direct-UART path until the real-logd
 handover) and by devmgr (the `IoPort` / `Mmio` caps it carves the driver's cap
@@ -157,14 +157,16 @@ UART interrupt to a client notification via `SERIAL_REGISTER_RX_NOTIFY`. The
 kernel masks the line on each fire; the next `SERIAL_READ_BYTES` re-arms it
 after draining, via
 [`SYS_IRQ_ACK`](../../../core/kernel/docs/syscalls.md#sys_irq_ack-29). The
-driver registers the line with mode 0, edge-triggered and active-high (x86-64
-COM1 is ISA IRQ 4, which no MADT override reroutes). Because the x86 IOAPIC
-then delivers edge-triggered, a client must wait with a bounded
-timeout (the terminal uses 20 ms) so a byte racing the re-arm is recovered on
-the next drain; this also degrades gracefully to polling when no IRQ cap was
-delivered. The riscv PLIC is level-sensitive, but QEMU's PLIC model does not
-pend the UART's source again while it stays asserted across its claim and
-completion, so the same bounded wait also recovers a byte that arrives then.
+driver registers the line with the mode devmgr gives the SPCR record. On x86-64
+that is mode 0, edge-triggered and active-high (COM1 is ISA IRQ 4, which no
+MADT override reroutes). Because the x86 IOAPIC then delivers edge-triggered, a
+client must wait with a bounded timeout (the terminal uses 20 ms) so a byte
+racing the re-arm is recovered on the next drain; this also degrades gracefully
+to polling when no IRQ cap was delivered. On riscv64 the SPCR names an APLIC
+source, which devmgr gives level-triggered and active-high: the kernel programs
+the source Level1 and pends it again at the re-arm while the UART still
+asserts it, so a byte racing the re-arm is delivered, and the bounded wait
+remains the fallback for a boot without an IRQ cap.
 
 ---
 

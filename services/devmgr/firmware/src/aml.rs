@@ -614,7 +614,7 @@ pub enum CrsResource
     },
     /// An interrupt line. `isa` is true for a small IRQ descriptor (an ISA
     /// IRQ number, which devmgr routes through the MADT overrides on x86-64),
-    /// false for an Extended Interrupt descriptor (a GSI / PLIC-APLIC
+    /// false for an Extended Interrupt descriptor (a GSI / APLIC
     /// source). `mode` uses `syscall_abi::IRQ_MODE_LEVEL` and
     /// `syscall_abi::IRQ_MODE_ACTIVE_LOW`.
     Interrupt

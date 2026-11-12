@@ -6,14 +6,16 @@
 //! RISC-V bootloader-discovered hardware accessors.
 //!
 //! Reads `BootInfo.kernel_mmio` (cached at boot by
-//! [`crate::platform::capture_kernel_mmio`]) and falls back to the `SiFive`
-//! PLIC / ns16550 conventions when the bootloader did not populate a value.
+//! [`crate::platform::capture_kernel_mmio`]) and falls back to the ns16550
+//! conventions when the bootloader did not populate a UART. The AIA
+//! controllers have no fallback: `aia` reads `kernel_mmio` itself and halts the
+//! boot when the bootloader reported none.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use boot_protocol::KernelMmio;
 
-use super::encoding::{DEFAULT_PLIC_SIZE, ndev_for, page_round_up};
+use super::encoding::page_round_up;
 
 /// Default ns16550-compatible UART physical base. Matches the QEMU `virt`
 /// machine layout and every UEFI-on-RISC-V firmware observed in this
@@ -23,15 +25,8 @@ const DEFAULT_UART_BASE: u64 = 0x1000_0000;
 /// Default UART MMIO window size when the bootloader did not report one.
 const DEFAULT_UART_SIZE: u64 = 0x1000;
 
-/// Default PLIC physical base. The `SiFive` PLIC reference layout places it
-/// here; most UEFI-on-RISC-V firmwares match.
-const DEFAULT_PLIC_BASE: u64 = 0x0C00_0000;
-
 static CACHED_UART_BASE: AtomicU64 = AtomicU64::new(0);
 static CACHED_UART_SIZE: AtomicU64 = AtomicU64::new(0);
-static CACHED_PLIC_BASE: AtomicU64 = AtomicU64::new(0);
-static CACHED_PLIC_SIZE: AtomicU64 = AtomicU64::new(0);
-static CACHED_PLIC_NDEV: AtomicU64 = AtomicU64::new(0);
 
 /// Physical `(base, size)` of the boot console UART that needs a dedicated
 /// `Mmio` capability minted at Phase 7. On RISC-V the `ns16550` UART is reported
@@ -94,72 +89,6 @@ pub fn uart_size() -> u64
     v
 }
 
-/// PLIC physical base.
-#[must_use]
-pub fn plic_base() -> u64
-{
-    let cached = CACHED_PLIC_BASE.load(Ordering::Relaxed);
-    if cached != 0
-    {
-        return cached;
-    }
-    let km = crate::platform::kernel_mmio();
-    let v = if km.plic_base != 0
-    {
-        km.plic_base
-    }
-    else
-    {
-        DEFAULT_PLIC_BASE
-    };
-    CACHED_PLIC_BASE.store(v, Ordering::Relaxed);
-    v
-}
-
-/// PLIC MMIO window size, page-rounded. Bounds the per-hart context registers
-/// `interrupts::init` and `interrupts::init_ap` program.
-// dead_code: host test builds compile out its only readers (interrupts::init
-// and init_ap).
-#[cfg_attr(test, allow(dead_code))]
-#[must_use]
-pub fn plic_size() -> u64
-{
-    let cached = CACHED_PLIC_SIZE.load(Ordering::Relaxed);
-    if cached != 0
-    {
-        return cached;
-    }
-    let km = crate::platform::kernel_mmio();
-    let raw = if km.plic_size != 0
-    {
-        km.plic_size
-    }
-    else
-    {
-        DEFAULT_PLIC_SIZE
-    };
-    let v = page_round_up(raw);
-    CACHED_PLIC_SIZE.store(v, Ordering::Relaxed);
-    v
-}
-
-/// Number of PLIC interrupt sources the kernel programs (sources `1..=plic_ndev()`), from
-/// `BootInfo.kernel_mmio.plic_ndev` (the firmware's `riscv,ndev`; see [`ndev_for`]).
-#[must_use]
-pub fn plic_ndev() -> u32
-{
-    let cached = CACHED_PLIC_NDEV.load(Ordering::Relaxed);
-    if cached != 0
-    {
-        // The cache holds a value `ndev_for` returned, at most 1023.
-        #[allow(clippy::cast_possible_truncation)]
-        return cached as u32;
-    }
-    let v = ndev_for(crate::platform::kernel_mmio().plic_ndev);
-    CACHED_PLIC_NDEV.store(u64::from(v), Ordering::Relaxed);
-    v
-}
-
 /// UART physical base for Phase 1 console init.
 ///
 /// Reads `km` directly because Phase 1 runs before the `kernel_mmio` cache
@@ -180,7 +109,7 @@ pub fn uart_base_for_boot_info(km: &KernelMmio) -> u64
 
 // The direct-map region derivation is shared with the bootloader's KASLR
 // window selection through `boot_protocol::layout`; the riscv64 variant
-// always returns 0 (PLIC + UART lie inside the RAM direct map).
+// always returns 0 (APLIC, IMSIC and UART lie inside the RAM direct map).
 pub use boot_protocol::layout::collect_mmio_direct_map_regions;
 
 /// The most entries [`collect_mmio_direct_map_regions`] writes, which sizes
@@ -196,7 +125,7 @@ mod tests
     fn riscv_direct_map_always_empty()
     {
         let mut km = KernelMmio::zero();
-        km.plic_base = 0xC000_0000;
+        km.aplic.base = 0xC000_0000;
         km.uart_base = 0x1000_0000;
         let mut out = [(0u64, 0u64); 4];
         assert_eq!(collect_mmio_direct_map_regions(&km, &mut out), 0);

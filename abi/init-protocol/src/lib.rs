@@ -237,7 +237,7 @@ pub struct InitInfo
     /// Handle of the root `Interrupt` range capability.
     ///
     /// Covers the full valid IRQ range for the target arch (x86-64: GSI
-    /// 0..256; RISC-V: PLIC sources 0..N). Userspace splits this cap
+    /// 0..256; RISC-V: APLIC sources 0..N). Userspace splits this cap
     /// with `SYS_IRQ_SPLIT` to produce single-IRQ sub-caps for device
     /// drivers.
     pub irq_range_cap: u64,

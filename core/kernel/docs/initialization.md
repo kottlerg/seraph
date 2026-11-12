@@ -186,7 +186,7 @@ again from the recorded BootInfo address.
    the kernel image base; overlap is fatal.
    Then map the remaining boot-time windows: the framebuffer at direct_map_base() + phys
    when it lies above the RAM ceiling; the arch kernel MMIO regions above that ceiling,
-   uncacheable (xAPIC and I/O APIC on x86-64; none on RISC-V, whose PLIC and UART take
+   uncacheable (xAPIC and I/O APIC on x86-64; none on RISC-V, whose APLIC, IMSIC and UART take
    their memory type from the platform PMAs); and the AP trampoline page as a 4 KiB RWX
    identity page, retired in Phase 8. BootInfo and boot modules are not mapped: after
    activation the kernel reaches them through the direct map.
@@ -276,7 +276,9 @@ address, the reason, and the span's end.
    TCBs, idle-stack tops plus one idle kernel stack per CPU, above a guard page the direct
    map leaves unmapped, watchdog ticks and breadcrumbs), the PerCpuData, APIC-ID,
    TLB-shootdown request and TLB acknowledgement-set slabs, and on x86-64 the per-AP
-   GDT/TSS, IST stacks, and NMI-backtrace storage (`sched::init_storage`); then the entropy
+   GDT/TSS, IST stacks, and NMI-backtrace storage, on riscv64 each CPU's IMSIC identity
+   row, sized from the IMSIC's identity count, halting when the bootloader reported no
+   supervisor-level IMSIC or a count outside 63..=2047 (`sched::init_storage`); then the entropy
    subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and self-test sample slab
    (`entropy::init_storage`)
 5. Allocate the frame map table: a chunk table with one slot per GiB of the DRAM span,
@@ -286,7 +288,7 @@ address, the reason, and the span's end.
    of 65,536 registry entries per 65,536 pages of DRAM (`cap::init_cspace_registry`; see
    [capability-internals.md](capability-internals.md) § CSpace Registry)
 7. Copy `BootInfo.cpu_ids` into the APIC-ID slab (`percpu::init_apic_ids`), so Phase 5
-   can name the BSP by its hardware id (the riscv64 PLIC context)
+   can name the BSP by its hardware id (the riscv64 IMSIC file the APLIC targets)
 ```
 
 Retype-based kernel object memory, which replaces a kernel heap, is specified in
@@ -359,11 +361,15 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Set FS and VS Off for lazy FPU/vector save-restore
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Grant U-mode the cycle counter (scounteren.CY)
-5. Initialise the PLIC for the BSP's S-mode context, the one numbered by the BSP's hart
-   id (`BootInfo.cpu_ids[0]`, which need not be 0): priority 1 for every source the PLIC
-   reports (`BootInfo.kernel_mmio.plic_ndev`, the specification's 1023 when unreported), all
-   enables cleared, threshold 0; halts if that context lies outside the PLIC window (the
-   reported size, or the specification's 64 MiB register map when unreported)
+5. Initialise AIA (`aia::init_bsp`): halt unless every hart advertises Ssaia
+   (`HART_CAP_SSAIA`) and the bootloader reported a supervisor-level APLIC domain
+   (`BootInfo.kernel_mmio.aplic`) of 1..=1023 sources with a register window of at least
+   16 KiB; put the domain in MSI delivery mode with every source disabled and inactive,
+   enable it, and halt if it does not read back MSI delivery mode. Then initialise the
+   BSP's supervisor-level IMSIC file, the one the layout places at the BSP's hart id
+   (`BootInfo.cpu_ids[0]`, which need not be 0; halts when that id is past the APLIC
+   target's 14-bit hart index or outside the IMSIC layout): delivery off, threshold 0,
+   every identity's pending bit cleared and enable bit set, then delivery on
 6. Arm stimecmp (Sstc) for the initial tick, using the bootloader-discovered
    timebase; halts if Sstc or the timebase was not discovered
 7. Enable interrupts (set sstatus.SIE)
@@ -372,7 +378,7 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
 On both architectures, right after the interrupt-controller step, the BSP allocates the IRQ
 routing table from the buddy allocator, one entry per line the discovered controllers
 implement (`irq::init_table` with `interrupts::irq_line_count`: the I/O APICs' GSIs on x86-64,
-the PLIC's sources on RISC-V), before any line is routed; its failure is fatal.
+the APLIC's sources on RISC-V), before any line is routed; its failure is fatal.
 
 Right after its per-CPU install, the BSP reports its extended-state save-area size
 (`fpu::report_save_area`), which sizes every Thread slot (`sched::thread_slot`) and the
@@ -660,11 +666,11 @@ index and hardware id; on x86-64 that wait is the only signal, since SIPI delive
 unacknowledged and `start_ap` cannot report a delivery failure. An AP that provides fewer
 hardware TLB tags than the BSP configured halts itself with
 "AP provides fewer hardware TLB tags than the BSP configured" before announcing itself, so
-the BSP's wait then expires the same way. On riscv64 an AP whose PLIC S-mode context
-registers lie outside the PLIC window (a firmware hart id too large for the window
-`plic_size` reports) halts itself the same way, before announcing itself, as does an AP whose
-`vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot hart's"),
-one without the Vector extension, which takes a fatal illegal-instruction trap at its
+the BSP's wait then expires the same way. On riscv64 an AP that cannot be an APLIC MSI target (a
+firmware hart id past the target's hart index, or outside the reported IMSIC layout) halts
+itself the same way at its IMSIC file's initialisation, before announcing itself, as does an
+AP whose `vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot
+hart's"), one without the Vector extension, which takes a fatal illegal-instruction trap at its
 `vlenb` read, or one without an ASID-tagged TLB ("RISC-V ASID-tagged TLB unsupported",
 from `paging::enable_tagged_tlb` in `kernel_entry_ap`).
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
@@ -866,7 +872,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; boot descriptors exceed the InitInfo region ceiling; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window; a riscv64 `vlenb` other than the boot hart's, no Vector extension, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 hart id no APLIC MSI can target; a riscv64 `vlenb` other than the boot hart's, no Vector extension, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, init's kernel stack guard page not unmapped, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---

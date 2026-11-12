@@ -503,8 +503,9 @@ unsafe fn kernel_entry_post_rebase(
     unsafe { cap::init_cspace_registry(allocator) };
 
     // Initialize the CPU-to-hardware-id mapping (wakeup and shootdown IPI
-    // targets, and the riscv64 PLIC context of each hart). Before Phase 5:
-    // riscv64 `interrupts::init` routes the PLIC to the BSP's hart id.
+    // targets, and the riscv64 hart an APLIC route targets). Before Phase 5:
+    // riscv64 `interrupts::init` checks the BSP's hart id against the IMSIC
+    // layout.
     #[cfg(not(test))]
     // SAFETY: single-threaded boot; the ids are read through the direct map
     // from the CPU-id pages the validated BootInfo names, unscrubbed until
@@ -524,7 +525,7 @@ unsafe fn kernel_entry_post_rebase(
     }
     kprintln!("interrupts ok");
     // Size the IRQ routing table from the interrupt controllers the init above
-    // discovered (x86-64: the I/O APICs' GSIs; riscv64: the PLIC's sources),
+    // discovered (x86-64: the I/O APICs' GSIs; riscv64: the APLIC's sources),
     // before any line is routed (Phase 9 on).
     #[cfg(not(test))]
     irq::init_table(arch::current::interrupts::irq_line_count(), allocator);

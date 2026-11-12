@@ -108,7 +108,9 @@ impl DmaHolds
     /// is armed then.
     pub fn arm(&mut self) -> Result<(), TryReserveError>
     {
-        let armed = self.armed + 1;
+        // A count of `usize::MAX` armed children cannot be reserved for, so
+        // the saturated count fails the reservation below.
+        let armed = self.armed.saturating_add(1);
         self.held.try_reserve(armed)?;
         self.armed = armed;
         Ok(())

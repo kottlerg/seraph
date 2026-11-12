@@ -268,10 +268,14 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &Mutex<Death
         refuse(refusal, caps, ipc_buf);
         return;
     }
-    let aspace = caps[0];
-    let cspace = caps[1];
-    let main_thread = caps[2];
-    let logd_thread = caps[3];
+    // `check_first_round` accepted exactly `FIRST_ROUND_CAPS` caps; any other
+    // count takes its refusal path (the caps are kept).
+    let &[aspace, cspace, main_thread, logd_thread] = caps
+    else
+    {
+        refuse(Refusal::Invalid(CapDisposition::Keep), caps, ipc_buf);
+        return;
+    };
     // Bind a death-EQ observer on both init threads under the same
     // correlator. Both are alive at this point (init's main is mid-handoff;
     // init-logd is still serving the log endpoint), so neither bind lands
@@ -412,7 +416,8 @@ fn do_reap(state: InitReapState, memmgr_ep: u64, ipc_buf: *mut u64)
          pool reclaim total {} pages",
         donated_caps,
         donated_pages,
-        donated_pages * 4,
+        // `donated_pages` is a sum of memmgr-reported page counts.
+        donated_pages.saturating_mul(4),
         pool_total,
     );
 }
@@ -432,9 +437,10 @@ fn donate_to_memmgr(memmgr_ep: u64, caps: &[u64], ipc_buf: *mut u64) -> (u32, u6
     let mut i = 0;
     while i < caps.len()
     {
-        let end = (i + chunk_size).min(caps.len());
+        // `i` is below `caps.len()`, so the sum is bounded by the length.
+        let end = i.saturating_add(chunk_size).min(caps.len());
         let mut builder = IpcMessage::builder(memmgr_labels::DONATE_MEMORY_CAPS);
-        for &slot in &caps[i..end]
+        for &slot in caps.get(i..end).unwrap_or_default()
         {
             builder = builder.cap(slot);
         }
@@ -443,7 +449,7 @@ fn donate_to_memmgr(memmgr_ep: u64, caps: &[u64], ipc_buf: *mut u64) -> (u32, u6
         if let Ok(reply) = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }
             && reply.label == memmgr_errors::SUCCESS
         {
-            total_caps += reply.word(0) as u32;
+            total_caps = total_caps.saturating_add(reply.word(0) as u32);
             total_pages = total_pages.saturating_add(reply.word(1));
             pool_total = reply.word(2);
         }

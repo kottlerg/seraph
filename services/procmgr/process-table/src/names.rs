@@ -40,7 +40,7 @@ impl ProcessName
     #[must_use]
     pub fn as_bytes(&self) -> &[u8]
     {
-        &self.bytes[..self.len]
+        self.bytes.get(..self.len).unwrap_or_default()
     }
 }
 
@@ -63,12 +63,16 @@ impl NameCapture
         {
             return;
         }
-        let end = chunk.iter().position(|&b| b == 0);
-        let string = &chunk[..end.unwrap_or(chunk.len())];
-        let take = string.len().min(NAME_MAX - self.name.len);
-        self.name.bytes[self.name.len..self.name.len + take].copy_from_slice(&string[..take]);
-        self.name.len += take;
-        self.done = end.is_some();
+        let string = chunk.split(|&b| b == 0).next().unwrap_or_default();
+        let free = self.name.bytes.get_mut(self.name.len..).unwrap_or_default();
+        let take = string.len().min(free.len());
+        for (dst, &src) in free.iter_mut().zip(string)
+        {
+            *dst = src;
+        }
+        // `take` is at most the free room, so `len` stays at most `NAME_MAX`.
+        self.name.len = self.name.len.saturating_add(take);
+        self.done = string.len() < chunk.len();
     }
 
     /// The name captured.

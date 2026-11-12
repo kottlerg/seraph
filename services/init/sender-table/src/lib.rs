@@ -14,6 +14,8 @@
 //! keeps the serial output, the history ring, and the handover drain. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 // The receivers' shared line and name widths: real-logd keeps the same per
@@ -62,14 +64,14 @@ impl SenderSlot
     #[must_use]
     pub fn name(&self) -> &[u8]
     {
-        &self.name[..self.name_used]
+        self.name.get(..self.name_used).unwrap_or_default()
     }
 
     /// The bytes buffered since the last newline.
     #[must_use]
     pub fn line(&self) -> &[u8]
     {
-        &self.buf[..self.used]
+        self.buf.get(..self.used).unwrap_or_default()
     }
 
     /// The level of the buffered line: that of the message that carried its
@@ -97,10 +99,11 @@ impl SenderSlot
     /// flushed and cleared by the caller, never appended to.
     pub fn push_byte(&mut self, b: u8) -> bool
     {
-        if self.used < LINE_BUF_SIZE
+        if let Some(slot) = self.buf.get_mut(self.used)
         {
-            self.buf[self.used] = b;
-            self.used += 1;
+            *slot = b;
+            // `used` indexed a byte of the buffer, so it is below its length.
+            self.used = self.used.saturating_add(1);
         }
         self.used == LINE_BUF_SIZE
     }
@@ -155,13 +158,11 @@ impl<const N: usize> SenderTable<N>
         &self.slots
     }
 
-    /// The slot at `idx` (an index [`Self::find_or_alloc`] returned).
-    ///
-    /// # Panics
-    /// When `idx >= N`.
-    pub fn slot_mut(&mut self, idx: usize) -> &mut SenderSlot
+    /// The slot at `idx` (an index [`Self::find_or_alloc`] returned);
+    /// `None` when `idx >= N`.
+    pub fn slot_mut(&mut self, idx: usize) -> Option<&mut SenderSlot>
     {
-        &mut self.slots[idx]
+        self.slots.get_mut(idx)
     }
 
     /// The index of the slot for `badge`: its existing slot, else a free
@@ -173,18 +174,26 @@ impl<const N: usize> SenderTable<N>
         {
             return i;
         }
-        if let Some(i) = self.slots.iter().position(|s| s.badge == 0)
+        if let Some((i, slot)) = self
+            .slots
+            .iter_mut()
+            .enumerate()
+            .find(|(_, s)| s.badge == 0)
         {
-            self.slots[i].claim(badge);
+            slot.claim(badge);
             return i;
         }
-        let start = self.next_evict % N;
-        let victim = (0..N)
-            .map(|k| (start + k) % N)
-            .find(|&i| self.slots[i].name_used == 0)
+        // `next_evict` is always below `N`.
+        let start = self.next_evict;
+        let victim = (start..N)
+            .chain(0..start)
+            .find(|&i| self.slots.get(i).is_some_and(|s| s.name_used == 0))
             .unwrap_or(start);
-        self.next_evict = (victim + 1) % N;
-        self.slots[victim].claim(badge);
+        self.next_evict = victim.checked_add(1).filter(|&next| next < N).unwrap_or(0);
+        if let Some(slot) = self.slots.get_mut(victim)
+        {
+            slot.claim(badge);
+        }
         victim
     }
 
@@ -201,26 +210,27 @@ impl<const N: usize> SenderTable<N>
     /// changed; [`SenderSlot::name`] gives the stored form.
     pub fn register_name(&mut self, badge: u64, requested: &[u8]) -> Option<usize>
     {
-        let requested = &requested[..requested.len().min(MAX_NAME_LEN)];
+        let requested = requested.get(..MAX_NAME_LEN).unwrap_or(requested);
         if requested.is_empty()
         {
             return None;
         }
         let idx = self.find_or_alloc(badge);
-        if self.slots[idx].name() == requested
+        let slot = self.slots.get_mut(idx)?;
+        if slot.name() == requested
         {
             return None;
         }
 
         // Release this sender's current name before resolving collisions, so
         // a rename frees the previous name for the new applicant.
-        self.slots[idx].name_used = 0;
-        self.slots[idx].name = [0u8; MAX_NAME_LEN];
+        slot.name_used = 0;
+        slot.name = [0u8; MAX_NAME_LEN];
 
         let mut stored = [0u8; MAX_NAME_LEN];
         let stored_len = self.resolve_unique_name(requested, &mut stored);
-        self.slots[idx].name[..stored_len].copy_from_slice(&stored[..stored_len]);
-        self.slots[idx].name_used = stored_len;
+        let slot = self.slots.get_mut(idx)?;
+        slot.name_used = copy_prefix(&mut slot.name, stored.get(..stored_len).unwrap_or_default());
         Some(idx)
     }
 
@@ -233,19 +243,18 @@ impl<const N: usize> SenderTable<N>
     {
         if !self.name_in_use(requested)
         {
-            out[..requested.len()].copy_from_slice(requested);
-            return requested.len();
+            return copy_prefix(out, requested);
         }
-        for suffix in 2..=N + 1
+        // `N` is an array length, so `N + 1` does not overflow.
+        for suffix in 2..=N.saturating_add(1)
         {
             let n = compose_suffixed(requested, suffix, out);
-            if !self.name_in_use(&out[..n])
+            if !self.name_in_use(out.get(..n).unwrap_or_default())
             {
                 return n;
             }
         }
-        out[..requested.len()].copy_from_slice(requested);
-        requested.len()
+        copy_prefix(out, requested)
     }
 
     /// Whether an occupied slot stores `name` verbatim.
@@ -267,34 +276,53 @@ impl<const N: usize> Default for SenderTable<N>
 /// truncating whatever does not fit in [`MAX_NAME_LEN`].
 fn compose_suffixed(name: &[u8], n: usize, out: &mut [u8; MAX_NAME_LEN]) -> usize
 {
-    let copy_len = name.len().min(out.len());
-    out[..copy_len].copy_from_slice(&name[..copy_len]);
-    let mut idx = copy_len;
-    if idx < out.len()
+    // Every increment below follows a write at `idx`, so `idx` stays at most
+    // `MAX_NAME_LEN`.
+    let mut idx = copy_prefix(out, name);
+    if let Some(dot) = out.get_mut(idx)
     {
-        out[idx] = b'.';
-        idx += 1;
+        *dot = b'.';
+        idx = idx.saturating_add(1);
     }
+    // A `usize` has at most 20 decimal digits.
     let mut digits = [0u8; 20];
-    let mut dlen = 0;
+    let mut dlen = 0usize;
     let mut value = n;
     loop
     {
-        digits[dlen] = b"0123456789"[value % 10];
-        dlen += 1;
+        if let Some(digit) = digits.get_mut(dlen)
+        {
+            *digit = b"0123456789".get(value % 10).copied().unwrap_or(b'0');
+        }
+        dlen = dlen.saturating_add(1);
         value /= 10;
         if value == 0
         {
             break;
         }
     }
-    while dlen > 0 && idx < out.len()
+    for &digit in digits.get(..dlen).unwrap_or_default().iter().rev()
     {
-        dlen -= 1;
-        out[idx] = digits[dlen];
-        idx += 1;
+        let Some(byte) = out.get_mut(idx)
+        else
+        {
+            break;
+        };
+        *byte = digit;
+        idx = idx.saturating_add(1);
     }
     idx
+}
+
+/// Copy as much of `src` as fits into the front of `out`; return the count.
+fn copy_prefix(out: &mut [u8], src: &[u8]) -> usize
+{
+    let n = src.len().min(out.len());
+    for (dst, &byte) in out.iter_mut().zip(src)
+    {
+        *dst = byte;
+    }
+    n
 }
 
 #[cfg(test)]
@@ -351,7 +379,7 @@ mod tests
     {
         let mut t = SenderTable::<1>::new();
         let slot = t.register_name(1, b"a").expect("name stored");
-        t.slot_mut(slot).push_byte(b'x');
+        t.slot_mut(slot).unwrap().push_byte(b'x');
 
         assert_eq!(t.find_or_alloc(2), slot);
         assert_eq!(t.slots()[slot].badge(), 2);
@@ -430,7 +458,7 @@ mod tests
         use ipc::stream_labels::{LEVEL_DEBUG, LEVEL_WARN};
         let mut t = SenderTable::<1>::new();
         let i = t.find_or_alloc(1);
-        let slot = t.slot_mut(i);
+        let slot = t.slot_mut(i).unwrap();
         slot.begin_byte(LEVEL_WARN);
         slot.push_byte(b'a');
         // A later message continues the line; the level stays.
@@ -448,7 +476,7 @@ mod tests
     {
         let mut t = SenderTable::<1>::new();
         let i = t.find_or_alloc(1);
-        let slot = t.slot_mut(i);
+        let slot = t.slot_mut(i).unwrap();
         for _ in 0..LINE_BUF_SIZE - 1
         {
             assert!(!slot.push_byte(b'x'));

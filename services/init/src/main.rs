@@ -9,6 +9,8 @@
 //! directly via raw syscalls, then requests procmgr to create devmgr via IPC.
 //! Exits after bootstrap is complete.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 #![no_main]
 // cast_possible_truncation: init targets 64-bit only; u64/usize conversions
@@ -152,8 +154,16 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     // The region is the `init_info_memory_count` pages the kernel mapped, at
     // most INIT_INFO_MAX_PAGES (kernel-enforced).
     let pages = (info.init_info_memory_count as usize).min(INIT_INFO_MAX_PAGES);
-    let max_bytes = pages * PAGE_SIZE as usize;
-    if count == 0 || offset + count * desc_size > max_bytes
+    // `pages` is at most `INIT_INFO_MAX_PAGES`, so the product cannot overflow.
+    let max_bytes = pages.saturating_mul(PAGE_SIZE as usize);
+    let Some(end) = count
+        .checked_mul(desc_size)
+        .and_then(|table_bytes| offset.checked_add(table_bytes))
+    else
+    {
+        return &[];
+    };
+    if count == 0 || end > max_bytes
     {
         return &[];
     }
@@ -165,7 +175,13 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     // bounded by the narrower `&InitInfo` provenance — descriptors may span
     // pages beyond the first one, and a pointer derived from the header's
     // allocation would let the optimiser assume out-of-bounds reads.
-    let base_addr = core::ptr::from_ref::<InitInfo>(info).addr() + offset;
+    let Some(base_addr) = core::ptr::from_ref::<InitInfo>(info)
+        .addr()
+        .checked_add(offset)
+    else
+    {
+        return &[];
+    };
     let ptr = core::ptr::with_exposed_provenance::<CapDescriptor>(base_addr);
     // SAFETY: kernel has mapped `count * desc_size` valid CapDescriptor bytes
     // starting at the InitInfo page + offset. The exposed-provenance pointer
@@ -272,7 +288,10 @@ impl MemoryAlloc
     /// reap so every page of RAM reaches the pool.
     pub(crate) fn orphan_memory_caps(&self) -> &[u64]
     {
-        &self.orphan_slots[..self.orphan_count]
+        // `record_orphan` keeps `orphan_count` within the table.
+        self.orphan_slots
+            .get(..self.orphan_count)
+            .unwrap_or_default()
     }
 
     /// Record a Memory cap `advance_cap` is moving off while it still holds at
@@ -288,8 +307,12 @@ impl MemoryAlloc
             self.orphan_count < MAX_ORPHAN_MEMORY_CAPS,
             "init: MemoryAlloc orphan table overflow"
         );
-        self.orphan_slots[self.orphan_count] = slot;
-        self.orphan_count += 1;
+        if let Some(entry) = self.orphan_slots.get_mut(self.orphan_count)
+        {
+            *entry = slot;
+            // `orphan_count` indexed an entry, so it is below the table length.
+            self.orphan_count = self.orphan_count.saturating_add(1);
+        }
     }
 
     /// Advance `self.current` to the next memory-pool Memory cap and read its
@@ -308,8 +331,9 @@ impl MemoryAlloc
         {
             self.record_orphan(self.current);
         }
-        self.current = self.memory_base + self.next_idx;
-        self.next_idx += 1;
+        // `next_idx` is below the clamped `memory_count`, a slot index within the `CSpace`.
+        self.current = self.memory_base.saturating_add(self.next_idx);
+        self.next_idx = self.next_idx.saturating_add(1);
         // cap_info on a live Memory cap slot returns the cap's current size; we
         // track it locally and decrement on each split/take so subsequent
         // `alloc_pages` requests correctly detect when this cap is too
@@ -347,7 +371,8 @@ impl MemoryAlloc
             let rest_cap = syscall::memory_split(self.current, PAGE_SIZE).ok()?;
             let page_cap = self.current;
             self.current = rest_cap;
-            self.remaining -= PAGE_SIZE;
+            // `remaining` exceeds `PAGE_SIZE` in this branch.
+            self.remaining = self.remaining.saturating_sub(PAGE_SIZE);
             Some(page_cap)
         }
     }
@@ -381,7 +406,7 @@ impl MemoryAlloc
         {
             return None;
         }
-        let need = pages * PAGE_SIZE;
+        let need = pages.checked_mul(PAGE_SIZE)?;
         // Bootstrap is single-threaded; the simplest correct behaviour is
         // to scan forward to the first cap large enough for the request.
         // Memory caps skipped here (the current leftover, or whole memory caps too
@@ -406,7 +431,8 @@ impl MemoryAlloc
         let rest_cap = syscall::memory_split(self.current, need).ok()?;
         let slab_cap = self.current;
         self.current = rest_cap;
-        self.remaining -= need;
+        // `remaining` exceeds `need` here.
+        self.remaining = self.remaining.saturating_sub(need);
         Some(slab_cap)
     }
 }
@@ -941,7 +967,7 @@ fn run(info_ptr: u64) -> !
     // bootstrap round remain solely init's, at slots at or above this floor.
     // The reap walk donates them to memmgr's pool; below the floor are the
     // memory caps MemoryAlloc consumed or finalize already forwarded.
-    let mem_reap_floor = info.memory_base + alloc.next_idx;
+    let mem_reap_floor = info.memory_base.saturating_add(alloc.next_idx);
     service::phase3_svcmgr_handover(
         info,
         endpoint_cap,

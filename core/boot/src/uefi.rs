@@ -886,7 +886,11 @@ pub const MAP_BUFFER_SLACK_DESCRIPTORS: usize = 16;
 /// [`MAP_BUFFER_SLACK_DESCRIPTORS`] descriptors, rounded up to whole pages.
 pub const fn map_buffer_bytes(map_bytes: usize, descriptor_size: usize) -> usize
 {
-    (map_bytes + MAP_BUFFER_SLACK_DESCRIPTORS * descriptor_size).div_ceil(4096) * 4096
+    // A map too large to size saturates, which no allocation satisfies.
+    map_bytes
+        .saturating_add(MAP_BUFFER_SLACK_DESCRIPTORS.saturating_mul(descriptor_size))
+        .div_ceil(4096)
+        .saturating_mul(4096)
 }
 
 /// Most descriptors a map buffer of `buffer_bytes` can hold at any stride
@@ -896,7 +900,12 @@ pub const fn map_buffer_bytes(map_bytes: usize, descriptor_size: usize) -> usize
 /// the same buffer.
 pub const fn map_buffer_descriptor_reach(buffer_bytes: usize) -> usize
 {
-    buffer_bytes / core::mem::size_of::<EfiMemoryDescriptor>()
+    match buffer_bytes.checked_div(core::mem::size_of::<EfiMemoryDescriptor>())
+    {
+        Some(reach) => reach,
+        // `EfiMemoryDescriptor` is not zero-sized; no descriptor fits a zero size.
+        None => 0,
+    }
 }
 
 /// The firmware's memory map now, as `(descriptor count, descriptor size)`
@@ -914,7 +923,10 @@ pub unsafe fn memory_map_shape(bs: *mut EfiBootServices) -> Result<(usize, usize
     // SAFETY: forwarded caller contract.
     let (map_size, descriptor_size) = unsafe { query_memory_map_size(bs)? };
     check_descriptor_size(descriptor_size)?;
-    Ok((map_size / descriptor_size, descriptor_size))
+    let count = map_size
+        .checked_div(descriptor_size)
+        .ok_or(BootError::InvalidMemoryMap("descriptor size is zero"))?;
+    Ok((count, descriptor_size))
 }
 
 /// Query the UEFI memory map into a freshly allocated buffer sized with
@@ -1028,7 +1040,8 @@ pub unsafe fn exit_boot_services(
         {
             return Err(BootError::ExitBootServicesFailed);
         }
-        attempt += 1;
+        // `attempt` is below `EXIT_BOOT_SERVICES_MAX_ATTEMPTS` here, so it cannot overflow.
+        attempt = attempt.saturating_add(1);
         if attempt >= EXIT_BOOT_SERVICES_MAX_ATTEMPTS
         {
             return Err(BootError::ExitBootServicesFailed);
@@ -1253,11 +1266,18 @@ pub unsafe fn query_gop(bs: *mut EfiBootServices) -> Option<FramebufferInfo>
             continue;
         }
 
+        // Four bytes per pixel; a scan line too wide for `u32` bytes is no usable mode.
+        let Some(stride) = info.pixels_per_scan_line.checked_mul(4)
+        else
+        {
+            continue;
+        };
+
         result = Some(FramebufferInfo {
             physical_base: mode.frame_buffer_base,
             width: info.horizontal_resolution,
             height: info.vertical_resolution,
-            stride: info.pixels_per_scan_line * 4,
+            stride,
             pixel_format,
         });
         break;

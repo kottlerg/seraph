@@ -14,8 +14,8 @@
 //! SPCR-specific Generic Address Structure read.
 
 use crate::acpi::{
-    RSDP_OFF_REVISION, RSDP_OFF_XSDT, RSDP_SIG, SDT_HDR_LEN, SDT_OFF_LENGTH, SDT_OFF_SIGNATURE,
-    phys_slice, read_u8, read_u32, read_u64,
+    RSDP_OFF_REVISION, RSDP_OFF_XSDT, RSDP_SIG, SDT_HDR_LEN, SDT_OFF_LENGTH, phys_slice, read_u8,
+    read_u32, read_u64, sdt_sig, xsdt_entry_addr,
 };
 
 // SPCR GAS base_address field offset from table start:
@@ -46,7 +46,7 @@ pub unsafe fn find_spcr_base(rsdp_addr: u64) -> Option<u64>
     }
     // SAFETY: caller guarantees rsdp_addr is valid and identity-mapped.
     let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
-    if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
+    if !rsdp.starts_with(RSDP_SIG) || read_u8(rsdp, RSDP_OFF_REVISION) < 2
     {
         return None;
     }
@@ -58,7 +58,7 @@ pub unsafe fn find_spcr_base(rsdp_addr: u64) -> Option<u64>
 
     // SAFETY: xsdt_addr read from validated RSDP.
     let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
-    if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
+    if sdt_sig(xsdt_hdr) != Some(*b"XSDT")
     {
         return None;
     }
@@ -69,19 +69,19 @@ pub unsafe fn find_spcr_base(rsdp_addr: u64) -> Option<u64>
     }
     // SAFETY: length validated above.
     let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
-    let entries_bytes = &xsdt[SDT_HDR_LEN..];
+    let entries_bytes = xsdt.get(SDT_HDR_LEN..)?;
     let entry_count = entries_bytes.len() / 8;
 
     for i in 0..entry_count
     {
-        let table_addr = read_u64(entries_bytes, i * 8);
+        let table_addr = xsdt_entry_addr(entries_bytes, i);
         if table_addr == 0
         {
             continue;
         }
         // SAFETY: table_addr read from validated XSDT.
         let hdr = unsafe { phys_slice(table_addr, SDT_HDR_LEN) };
-        if &hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"SPCR"
+        if sdt_sig(hdr) != Some(*b"SPCR")
         {
             continue;
         }

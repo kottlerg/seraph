@@ -73,6 +73,11 @@ pub enum BootError
     /// (`MAX_RECLAIM_RANGES`); the bootloader's compile-time count of the
     /// entries it records (`MAX_RECLAIM_ENTRIES`) is wrong.
     ReclaimRangesOverflow,
+
+    /// A range the initial page tables map runs past the end of the address
+    /// space, or an address selects no slot of a translation table
+    /// (`paging::MapError::AddressRange`).
+    MapAddressRange,
 }
 
 impl From<elf::ElfError> for BootError
@@ -145,6 +150,7 @@ impl BootError
             }
             BootError::InvalidMemoryMap(_) => "UEFI memory map violates the UEFI contract",
             BootError::ReclaimRangesOverflow => "reclaim_ranges overflow (MAX_RECLAIM_ENTRIES)",
+            BootError::MapAddressRange => "a range to map runs past the end of the address space",
         }
     }
 }
@@ -196,6 +202,7 @@ mod tests
             BootError::MemoryMapKeptGrowing(1),
             BootError::InvalidMemoryMap("m"),
             BootError::ReclaimRangesOverflow,
+            BootError::MapAddressRange,
         ];
         for v in variants
         {
@@ -260,6 +267,7 @@ mod tests
             BootError::OutOfMemory,
             BootError::ExitBootServicesFailed,
             BootError::PagingModeUnsupported,
+            BootError::MapAddressRange,
         ];
         for v in no_detail
         {

@@ -215,10 +215,16 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     let frames = (phys_base..phys_end).step_by(PAGE_SIZE);
     for (virt, phys) in virts.zip(frames)
     {
-        // SAFETY: virt is in user range (validated above); phys is from a
-        // Memory cap confirmed by the kernel at capability creation.
-        // as_ptr validated non-null; aso_raw is valid and wraps as_ptr.
-        unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, grant, &*aso_raw) }
+        // SAFETY: as_ptr is the AddressSpace of the AddressSpaceObject
+        // `aspace_slot` pins for the call.
+        let aspace = unsafe { &*as_ptr };
+        // SAFETY: aso_raw is the AddressSpaceObject `aspace_slot` pins for the
+        // call.
+        let aso = unsafe { &*aso_raw };
+        // SAFETY: virt is in user range (validated above); phys is a 4 KiB-aligned
+        // frame of a Memory cap confirmed by the kernel at capability creation;
+        // aso wraps aspace, both resolved from the same capability.
+        unsafe { aspace.map_page_pooled(virt, phys, page_flags, grant, aso) }
             .map_err(|()| SyscallError::OutOfMemory)?;
     }
 
@@ -410,16 +416,26 @@ pub fn sys_mem_unmap(tf: UserFrame) -> Result<u64, SyscallError>
         // Region teardown: clear the whole span and reclaim each now-empty
         // intermediate page table to the AS's pool, with one coarse shootdown
         // (plus the span invalidations of the frame-map release batch).
-        // SAFETY: as_ptr is valid; aso_raw wraps it; the span is user-range
-        // (validated above).
-        unsafe { (*as_ptr).unmap_region_pooled(virt_base, page_count, &*aso_raw) };
+        // SAFETY: as_ptr is the AddressSpace of the AddressSpaceObject
+        // `aspace_slot` pins for the call.
+        let aspace = unsafe { &*as_ptr };
+        // SAFETY: aso_raw is the AddressSpaceObject `aspace_slot` pins for the
+        // call.
+        let aso = unsafe { &*aso_raw };
+        // SAFETY: aso wraps aspace, both resolved from the same capability;
+        // virt_base is page-aligned and the span is user-range (validated
+        // above).
+        unsafe { aspace.unmap_region_pooled(virt_base, page_count, aso) };
     }
     else
     {
         for virt in (virt_base..virt_end).step_by(PAGE_SIZE)
         {
-            // SAFETY: virt is in user range (validated above); as_ptr is valid.
-            unsafe { (*as_ptr).unmap_page(virt) };
+            // SAFETY: as_ptr is the AddressSpace of the AddressSpaceObject
+            // `aspace_slot` pins for the call.
+            let aspace = unsafe { &*as_ptr };
+            // SAFETY: virt is in user range (validated above).
+            unsafe { aspace.unmap_page(virt) };
         }
     }
 
@@ -558,8 +574,13 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
     // loop with the pages before it already changed.
     for virt in (virt_base..virt_end).step_by(PAGE_SIZE)
     {
-        // SAFETY: virt is in user range (validated above); as_ptr is valid.
-        unsafe { (*as_ptr).protect_page(virt, page_flags) }.map_err(|e| match e
+        // SAFETY: as_ptr is the AddressSpace of the AddressSpaceObject
+        // `aspace_slot` pins for the call.
+        let aspace = unsafe { &*as_ptr };
+        // SAFETY: virt is in user range (validated above). Whether it is
+        // mapped is checked by protect_page itself under pt_lock, which
+        // refuses an unmapped page with NotMapped.
+        unsafe { aspace.protect_page(virt, page_flags) }.map_err(|e| match e
         {
             PagingError::NotMapped => SyscallError::InvalidAddress,
             PagingError::NotGranted => SyscallError::InsufficientRights,
@@ -742,14 +763,20 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
     // concurrent SYS_CAP_CREATE_* on the same cspace (lock order:
     // `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy).
     // `insert_cap_slot_and_handle` mints the returned handle in the same hold.
-    // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
+    // SAFETY: caller_cspace validated non-null; it is the running thread's own
+    // CSpace, live while the thread runs.
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: caller_cspace is live (as above), and its held lock serialises
+    // the slot freelist and tags.
     let insert_res = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let r =
-            (*caller_cspace).insert_cap_slot_and_handle(CapTag::Memory, parent_rights, tail_ptr);
-        (*caller_cspace).lock.unlock_raw(saved);
-        r
+        (*caller_cspace).insert_cap_slot_and_handle(CapTag::Memory, parent_rights, tail_ptr)
     };
+    // SAFETY: caller_cspace is live (as above).
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     let (tail_slot_nz, tail_handle) = match insert_res
     {
         Ok(inserted) => inserted,
@@ -904,10 +931,12 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
     // (`core/kernel/docs/capability-internals.md` § Global Derivation Lock).
     // SAFETY: caller_cspace validated non-null; DERIVATION_LOCK held.
     let pinned = unsafe {
-        super::cap::revalidate_src_under_lock(caller_cspace, parent_handle, parent_obj_nn).and_then(
-            |()| super::cap::revalidate_src_under_lock(caller_cspace, tail_handle, tail_obj_nn),
-        )
-    };
+        super::cap::revalidate_src_under_lock(caller_cspace, parent_handle, parent_obj_nn)
+    }
+    .and_then(|()| {
+        // SAFETY: caller_cspace validated non-null; DERIVATION_LOCK held.
+        unsafe { super::cap::revalidate_src_under_lock(caller_cspace, tail_handle, tail_obj_nn) }
+    });
     if let Err(e) = pinned
     {
         DERIVATION_LOCK.write_unlock();
@@ -1075,12 +1104,18 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
     // Free the tail slot under cspace.lock so the freelist mutation cannot
     // tear against a concurrent SYS_CAP_CREATE_* on the same cspace (lock
     // order: `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy).
-    // SAFETY: caller_cspace validated; tail_idx within CSpace bounds.
-    unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        (*caller_cspace).free_slot(tail_idx);
-        (*caller_cspace).lock.unlock_raw(saved);
-    }
+    // SAFETY: caller_cspace validated non-null; it is the running thread's own
+    // CSpace, live while the thread runs.
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: caller_cspace is live (as above), and its held lock serialises
+    // the freelist; tail_idx is within CSpace bounds.
+    unsafe { (*caller_cspace).free_slot(tail_idx) };
+    // SAFETY: caller_cspace is live (as above).
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
 
     // Drop both write locks before releasing the tail's reference (the
     // release can free the tail, which takes other locks).

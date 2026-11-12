@@ -138,3 +138,52 @@ pub fn find_llvm_objcopy() -> Result<PathBuf>
         )
     }
 }
+
+// ── Host ports ────────────────────────────────────────────────────────────────
+
+/// The host TCP port a debug-port boot serves on: `requested` when the
+/// command was given one, and otherwise a port free on `127.0.0.1` now.
+///
+/// The free port is the one the kernel assigns a listener bound to port 0,
+/// which is closed again before the port is returned. A port another boot's
+/// QEMU serves on is never picked, so boots from several worktrees do not
+/// meet on one fixed port. A process that binds the port between its close
+/// and QEMU's own bind takes it, and QEMU then fails to start.
+pub fn debug_port_or_free(requested: Option<u16>) -> Result<u16>
+{
+    if let Some(port) = requested
+    {
+        return Ok(port);
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .context("binding a listener on 127.0.0.1 to pick a free port")?;
+    let port = listener
+        .local_addr()
+        .context("reading the free port's address")?
+        .port();
+    Ok(port)
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn a_requested_port_is_kept()
+    {
+        assert_eq!(debug_port_or_free(Some(4560)).unwrap(), 4560);
+    }
+
+    #[test]
+    fn a_picked_port_is_free_and_differs_from_a_held_one()
+    {
+        let first = debug_port_or_free(None).unwrap();
+        assert_ne!(first, 0);
+        // Held here, as a running boot's QEMU holds its port.
+        let held = std::net::TcpListener::bind(("127.0.0.1", first)).expect("the port is free");
+        let second = debug_port_or_free(None).unwrap();
+        assert_ne!(second, first);
+        drop(held);
+    }
+}

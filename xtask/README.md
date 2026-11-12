@@ -803,12 +803,15 @@ cargo xtask test-debug-port [--arch x86_64|riscv64] [--port PORT] [--cpus N] [--
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture |
-| `--port` | `4560` | The host TCP port the debug port is served on |
+| `--port` | a free port | The host TCP port the debug port is served on; without it, a port free on `127.0.0.1` when the boot starts (below) |
 | `--cpus` | `4` | vCPUs of the guest |
 | `--mem` | `512` | Guest memory size in MiB |
 
-The boot to the fixture's line is bounded by five minutes and each answer by twenty seconds. The
-boot is one of the two of the debug-port device cell of the local and release host runs
+Without `--port` the command asks the host for a port free on `127.0.0.1` (a listener bound to port
+0, closed again) right before QEMU starts, so boots from several worktrees never meet on one
+port; a process that binds that port in the moment between leaves QEMU unable to start, and the
+boot fails. The boot to the fixture's line is bounded by five minutes and each answer by twenty
+seconds. The boot is one of the two of the debug-port device cell of the local and release host runs
 ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
 ---
@@ -840,13 +843,14 @@ cargo xtask test-gdb [--arch x86_64|riscv64] [--port PORT] [--gdb GDB] [--cpus N
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture |
-| `--port` | `4561` | The host TCP port the debug port is served on |
+| `--port` | a free port | The host TCP port the debug port is served on; without it, a port free on `127.0.0.1` when the boot starts (below) |
 | `--gdb` | `gdb` | The host GDB to run: one built with every target, or `gdb-multiarch` |
 | `--cpus` | `4` | vCPUs of the guest |
 | `--mem` | `512` | Guest memory size in MiB |
 
-The boot to the stub's line is bounded by five minutes and the GDB session by three. The boot is
-one of the two of the debug-port device cell of the local and release host runs
+Without `--port` the port is picked as `test-debug-port` picks it, and GDB connects to
+`127.0.0.1:<port>`. The boot to the stub's line is bounded by five minutes and the GDB session by
+three. The boot is one of the two of the debug-port device cell of the local and release host runs
 ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
 ---

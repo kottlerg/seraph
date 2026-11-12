@@ -16,6 +16,9 @@
 //!   structs, fixed-width integer-repr enums).
 //! - No dependencies outside `core`.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 // When pulled into std's dep graph via build-std (feature
 // `rustc-dep-of-std` on), `core` isn't yet a conventional crate — we
 // import the `rustc-std-workspace-core` facade and alias it so
@@ -147,11 +150,20 @@ pub const WAIT_SET_MAX_MEMBERS: u32 = 1024;
 /// 24-byte wrapper, the 40-byte wait-set state, one 24-byte member slot per
 /// member, and the ready ring of `capacity + 1` two-byte member indices
 /// rounded up to eight bytes, all inline in the retype slot. `capacity` is
-/// one the kernel accepts, `1..=WAIT_SET_MAX_MEMBERS`.
+/// one the kernel accepts, `1..=WAIT_SET_MAX_MEMBERS`; a larger one whose debit
+/// does not fit a `u64` yields `u64::MAX`, which no retype budget funds.
 #[must_use]
 pub const fn wait_set_retype_bytes(capacity: u64) -> u64
 {
-    24 + 40 + capacity * 24 + ((capacity + 1) * 2).div_ceil(8) * 8
+    // The wrapper and the wait-set state.
+    const FIXED: u64 = 24 + 40;
+    let members = capacity.saturating_mul(24);
+    let ring = capacity
+        .saturating_add(1)
+        .saturating_mul(2)
+        .div_ceil(8)
+        .saturating_mul(8);
+    FIXED.saturating_add(members).saturating_add(ring)
 }
 
 /// Raw retype debit of one `EventQueue` of user-visible `capacity` entries and
@@ -160,11 +172,16 @@ pub const fn wait_set_retype_bytes(capacity: u64) -> u64
 /// each), and one 24-byte node per observer, all inline in the retype slot.
 /// Both counts are ones the kernel accepts (`capacity` in
 /// `1..=EVENT_QUEUE_MAX_CAPACITY`, `observers` in
-/// `0..=EVENT_QUEUE_MAX_CAPACITY`); larger values can overflow.
+/// `0..=EVENT_QUEUE_MAX_CAPACITY`); larger ones whose debit does not fit a
+/// `u64` yield `u64::MAX`, which no retype budget funds.
 #[must_use]
 pub const fn event_queue_retype_bytes(capacity: u64, observers: u64) -> u64
 {
-    24 + 64 + (capacity + 1) * 16 + observers * 24
+    // The wrapper and the queue state.
+    const FIXED: u64 = 24 + 64;
+    let ring = capacity.saturating_add(1).saturating_mul(16);
+    let nodes = observers.saturating_mul(24);
+    FIXED.saturating_add(ring).saturating_add(nodes)
 }
 
 // ── Syscall numbers ───────────────────────────────────────────────────────────
@@ -759,7 +776,9 @@ pub const IOPORT_BINDING_TABLE_PAGES: u64 = 3;
 #[must_use]
 pub const fn cspace_topup_pages(headroom: u64, budget_bytes: u64, slots: u64) -> u64
 {
-    let slot_short = (slots + CSPACE_SLOTS_PER_PAGE).saturating_sub(headroom);
+    let slot_short = slots
+        .saturating_add(CSPACE_SLOTS_PER_PAGE)
+        .saturating_sub(headroom);
     let budget_short = budget_bytes < PAGE_SIZE;
     if slot_short == 0 && !budget_short
     {
@@ -767,7 +786,9 @@ pub const fn cspace_topup_pages(headroom: u64, budget_bytes: u64, slots: u64) ->
     }
     let pages = slot_short.div_ceil(CSPACE_SLOTS_PER_PAGE);
     let pages = if pages == 0 { 1 } else { pages };
-    pages + 1
+    // `pages` is at most `u64::MAX / CSPACE_SLOTS_PER_PAGE + 1`, so this
+    // cannot saturate.
+    pages.saturating_add(1)
 }
 
 // The cap block (count word plus the handles) must stay inside the one IPC
@@ -1376,24 +1397,36 @@ pub const THREAD_MEM_TEXT: u64 = 1 << 0;
 ///
 /// Reads the three leading numeric components, stopping at the first byte that
 /// is neither a digit nor a `.`, so any semver pre-release/build suffix is
-/// ignored. `const` so the value is fixed at compile time.
+/// ignored. A component too large for a `u64` saturates. `const` so the value
+/// is fixed at compile time.
 const fn pack_project_version(s: &str) -> u64
 {
-    let b = s.as_bytes();
-    let mut parts = [0u64; 3]; // major, minor, patch
-    let mut i = 0;
-    let mut part = 0;
-    while i < b.len() && part < 3
+    let (mut major, mut minor, mut patch) = (0u64, 0u64, 0u64);
+    let mut part = 0u8;
+    let mut rest = s.as_bytes();
+    while let [byte, tail @ ..] = rest
     {
-        match b[i]
+        let field = match part
         {
-            d @ b'0'..=b'9' => parts[part] = parts[part] * 10 + (d - b'0') as u64,
-            b'.' => part += 1,
+            0 => &mut major,
+            1 => &mut minor,
+            2 => &mut patch,
+            _ => break,
+        };
+        match *byte
+        {
+            d @ b'0'..=b'9' =>
+            {
+                // `d` is an ASCII digit, so the subtraction cannot wrap.
+                let digit = d.wrapping_sub(b'0') as u64;
+                *field = field.saturating_mul(10).saturating_add(digit);
+            }
+            b'.' => part = part.saturating_add(1),
             _ => break,
         }
-        i += 1;
+        rest = tail;
     }
-    (parts[0] << 32) | (parts[1] << 16) | parts[2]
+    (major << 32) | (minor << 16) | patch
 }
 
 /// Kernel version packed as a single `u64`.
@@ -1527,6 +1560,52 @@ mod tests
             ipc_call_timeout_ms(wide),
             9,
             "count bits never reach the timeout"
+        );
+    }
+
+    // Defects guarded: a version parse that drops a component, reads past the
+    // patch number, or keeps a pre-release suffix's digits.
+    #[test]
+    fn a_dotted_version_packs_its_three_leading_components()
+    {
+        assert_eq!(pack_project_version("1.2.3"), (1 << 32) | (2 << 16) | 3);
+        assert_eq!(pack_project_version("0.1.4-rc.7"), (1 << 16) | 4);
+        assert_eq!(
+            pack_project_version("10.20.30.40"),
+            (10 << 32) | (20 << 16) | 30
+        );
+        assert_eq!(pack_project_version(""), 0);
+    }
+
+    // The defect caught: a component past `u64::MAX` that wraps to a small
+    // value instead of saturating.
+    #[test]
+    fn a_version_component_past_u64_saturates()
+    {
+        assert_eq!(pack_project_version("0.0.99999999999999999999"), u64::MAX);
+    }
+
+    // Defects guarded: a retype debit that drifts from the kernel's (pinned
+    // there by const assertions at these capacities), and one that wraps to a
+    // small, fundable debit for a capacity past the kernel's bound.
+    #[test]
+    fn retype_debits_match_their_layouts_and_saturate_past_u64()
+    {
+        assert_eq!(wait_set_retype_bytes(1), 24 + 40 + 24 + 8);
+        assert_eq!(wait_set_retype_bytes(4), 24 + 40 + 4 * 24 + 16);
+        assert_eq!(event_queue_retype_bytes(1, 1), 24 + 64 + 2 * 16 + 24);
+        assert_eq!(wait_set_retype_bytes(u64::MAX / 24 + 1), u64::MAX);
+        assert_eq!(event_queue_retype_bytes(u64::MAX, 0), u64::MAX);
+        assert_eq!(event_queue_retype_bytes(1, u64::MAX / 24 + 1), u64::MAX);
+    }
+
+    // The defect caught: a top-up whose slot count overflows to a small one.
+    #[test]
+    fn a_cspace_top_up_for_an_impossible_slot_count_does_not_wrap()
+    {
+        assert_eq!(
+            cspace_topup_pages(0, PAGE_SIZE, u64::MAX),
+            u64::MAX.div_ceil(CSPACE_SLOTS_PER_PAGE) + 1
         );
     }
 

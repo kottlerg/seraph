@@ -18,6 +18,9 @@
 //! argument widths (`u64` cap handles, narrower `u16` and `u8` fields) are
 //! the syscall ABI's, not limits of this crate.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 // When pulled into std's dep graph via build-std (feature
 // `rustc-dep-of-std` on), `core` isn't yet a conventional crate — we
 // import the `rustc-std-workspace-core` facade and alias it so

@@ -14,10 +14,13 @@
 //!
 //! See [docs/testing.md](../../../docs/testing.md) for the protocol.
 
-// A per-program tester is test code, where unwrap and expect are permitted
-// (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait
-// must abort the tester, and the panic's non-zero exit is its FAIL verdict.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "a per-program tester is test code, where unwrap and expect are permitted \
+              (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait must \
+              abort the tester, and the panic's non-zero exit is its FAIL verdict"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -36,9 +39,11 @@ fn fail(msg: &str) -> !
 
 /// Run `/programs/crashme <mode>` and check it reached its fault and died of
 /// it.
-// cast_sign_loss: ExitStatus::code() is i32, but exit reasons are
-// non-negative (fault 0x1000+vector); the u64 cast preserves the value.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ExitStatus::code() is i32, but exit reasons are non-negative (fault 0x1000+vector); \
+              the u64 cast preserves the value"
+)]
 fn check(mode: &str)
 {
     let mut child = Command::new("/programs/crashme")

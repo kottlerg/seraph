@@ -184,11 +184,13 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// `argv` and `env` that together would not fit the child's argv/env region
 /// ([`ParseError::TooLarge`]). Every copy it makes is fallible: a heap that
 /// cannot hold one returns [`ParseError::OutOfMemory`].
-// too_many_lines: one pass over the `key = value` grammar whose per-key
-// `match` is a flat table of short arms sharing the duplicate-key and
-// mandatory-key bookkeeping locals; moving arms into helpers would thread
-// those locals through every helper without buying structural clarity.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass over the `key = value` grammar whose per-key `match` is a flat table of \
+              short arms sharing the duplicate-key and mandatory-key bookkeeping locals; moving \
+              arms into helpers would thread those locals through every helper without buying \
+              structural clarity"
+)]
 pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
 {
     if name.is_empty() || name.len() > ipc::svcmgr_labels::NAME_MAX

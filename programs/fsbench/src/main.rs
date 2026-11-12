@@ -27,9 +27,12 @@
 //! fsbench: arch=x86_64 size=4096 path=frame  iters=256 cycles_min=...
 //! ```
 
-// fsbench is a benchmark harness: panics on failure so faults surface
-// in the log. `expect`/`unwrap` are the intended idiom here.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "fsbench is a benchmark harness that panics on failure so faults surface in the \
+              log; `expect` is its intended idiom"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -212,8 +215,10 @@ fn verify_fixture(f: &mut File)
     assert_eq!(n, buf.len(), "verify: short read at offset 0");
     for (i, &b) in buf.iter().enumerate()
     {
-        // cast_possible_truncation: the mask keeps the value within a byte.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the mask keeps the value within a byte"
+        )]
         let expected = (i & 0xFF) as u8;
         assert_eq!(
             b, expected,

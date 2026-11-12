@@ -12,6 +12,7 @@
 //! ([`RxQueue`]).
 
 #![no_std]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use ipc::serial_labels;
 

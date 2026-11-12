@@ -32,11 +32,14 @@
 //! Idiomatic `std` for the threading; only the sampling reaches the Seraph
 //! `cap_info` / memmgr surfaces.
 
-// threadchurn is a test fixture, where unwrap and expect are permitted
-// (docs/coding-standards.md § Error Handling): a failed `cap_info` sample or
-// a panicked worker must abort the run, and the panic's non-zero exit with no
-// PASS marker is the failure its tester reports.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "threadchurn is a test fixture, where unwrap and expect are permitted \
+              (docs/coding-standards.md § Error Handling): a failed `cap_info` sample or a \
+              panicked worker must abort the run, and the panic's non-zero exit with no PASS \
+              marker is the failure its tester reports"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use std::os::seraph::log;
 use std::process::ExitCode;

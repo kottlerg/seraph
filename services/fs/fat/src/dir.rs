@@ -19,18 +19,21 @@
 //! `BOOT    CON`.
 
 use crate::alloc::{FatError, allocate_cluster, free_cluster_chain};
-use crate::bpb::{FatState, FatType, sector_buffer};
+use crate::bpb::{FatState, FatType, MAX_SECTOR_SIZE, sector_buffer};
 use crate::cache::PageCache;
 use crate::fat::chain_next;
 
 // The pure 8.3/LFN decoders, checksum, case folding, entry parse, and removal
 // slot-run scan live in the host-testable `fat_parse` crate; the directory
 // search and mutation engine below consumes them over block I/O.
+use fat_parse::{
+    ATTR_LFN, FreeRunScan, RemoveRunScan, RemoveStep, TailSet, compose_tailed_name, encode_lfn,
+    pack_lfn_slot,
+};
 pub use fat_parse::{
     DirEntry, LfnAccum, MAX_LFN_CHARS, MAX_LFN_UTF8, lfn_checksum, name_matches, parse_dir_entry,
     to_upper,
 };
-use fat_parse::{FreeRunScan, RemoveRunScan, RemoveStep, TailSet, compose_tailed_name, encode_lfn};
 
 // ── Chain walking ─────────────────────────────────────────────────────────
 
@@ -136,21 +139,15 @@ pub fn find_in_directory(
     let mut steps = 0;
     loop
     {
-        let base_sector = state.cluster_to_sector(cluster);
-        for s in 0..u32::from(state.sectors_per_cluster)
+        for lba in state.cluster_sectors(cluster)
         {
-            if !cache.read_sector(
-                u64::from(base_sector + s),
-                block_dev,
-                &mut sector_buf,
-                ipc_buf,
-            )
+            if !cache.read_sector(u64::from(lba), block_dev, &mut *sector_buf, ipc_buf)
             {
                 return Err(FatError::Io);
             }
-            match scan_sector_for_name(&sector_buf[..state.sector_bytes()], name, &mut lfn)
+            match scan_sector_for_name(state.sector(&sector_buf), name, &mut lfn)
             {
-                SectorScan::Found(entry) => return Ok(Some(entry)),
+                SectorScan::Found((entry, _)) => return Ok(Some(entry)),
                 SectorScan::EndOfDir => return Ok(None),
                 SectorScan::Continue =>
                 {}
@@ -175,25 +172,18 @@ fn find_in_fat16_root(
     ipc_buf: *mut u64,
 ) -> Result<Option<DirEntry>, FatError>
 {
-    let root_start = u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-    let root_sectors = state.root_dir_sectors();
     let mut sector_buf = sector_buffer()?;
     let mut lfn = LfnAccum::new();
 
-    for s in 0..root_sectors
+    for lba in state.root_sectors()
     {
-        if !cache.read_sector(
-            u64::from(root_start + s),
-            block_dev,
-            &mut sector_buf,
-            ipc_buf,
-        )
+        if !cache.read_sector(u64::from(lba), block_dev, &mut *sector_buf, ipc_buf)
         {
             return Err(FatError::Io);
         }
-        match scan_sector_for_name(&sector_buf[..state.sector_bytes()], name, &mut lfn)
+        match scan_sector_for_name(state.sector(&sector_buf), name, &mut lfn)
         {
-            SectorScan::Found(entry) => return Ok(Some(entry)),
+            SectorScan::Found((entry, _)) => return Ok(Some(entry)),
             SectorScan::EndOfDir => return Ok(None),
             SectorScan::Continue =>
             {}
@@ -220,21 +210,16 @@ pub fn find_in_directory_with_location(
 {
     let mut sector_buf = sector_buffer().ok()?;
     let mut lfn = LfnAccum::new();
-    let entries_per_sector = state.sector_bytes() / 32;
 
     if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
-        let root_start =
-            u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = state.root_dir_sectors();
-        for s in 0..root_sectors
+        for sector_lba in state.root_sectors()
         {
-            let sector_lba = root_start + s;
-            if !cache.read_sector(u64::from(sector_lba), block_dev, &mut sector_buf, ipc_buf)
+            if !cache.read_sector(u64::from(sector_lba), block_dev, &mut *sector_buf, ipc_buf)
             {
                 return None;
             }
-            match scan_sector_for_name_with_offset(&sector_buf, name, &mut lfn, entries_per_sector)
+            match scan_sector_for_name(state.sector(&sector_buf), name, &mut lfn)
             {
                 SectorScan::Found((entry, off)) =>
                 {
@@ -258,15 +243,13 @@ pub fn find_in_directory_with_location(
     let mut steps = 0;
     loop
     {
-        let base_sector = state.cluster_to_sector(cluster);
-        for s in 0..u32::from(state.sectors_per_cluster)
+        for sector_lba in state.cluster_sectors(cluster)
         {
-            let sector_lba = base_sector + s;
-            if !cache.read_sector(u64::from(sector_lba), block_dev, &mut sector_buf, ipc_buf)
+            if !cache.read_sector(u64::from(sector_lba), block_dev, &mut *sector_buf, ipc_buf)
             {
                 return None;
             }
-            match scan_sector_for_name_with_offset(&sector_buf, name, &mut lfn, entries_per_sector)
+            match scan_sector_for_name(state.sector(&sector_buf), name, &mut lfn)
             {
                 SectorScan::Found((entry, off)) =>
                 {
@@ -289,17 +272,26 @@ pub fn find_in_directory_with_location(
     }
 }
 
-fn scan_sector_for_name_with_offset(
+/// The 32-byte directory slots of `sector`, each with its byte offset.
+fn sector_slots(sector: &[u8]) -> impl Iterator<Item = (usize, &[u8; 32])>
+{
+    (0..).step_by(32).zip(sector.as_chunks::<32>().0)
+}
+
+/// Scan a sector's 32-byte directory entries for a name match, returning
+/// the entry and its byte offset in the sector.
+///
+/// Supports both 8.3 and LFN matching. The `lfn` accumulator carries
+/// LFN state across sector boundaries.
+/// `sector` is one sector's bytes, `bytes_per_sector` long.
+fn scan_sector_for_name(
     sector: &[u8],
     name: &[u8],
     lfn: &mut LfnAccum,
-    entries_per_sector: usize,
 ) -> SectorScan<(DirEntry, usize)>
 {
-    for i in 0..entries_per_sector
+    for (offset, raw) in sector_slots(sector)
     {
-        let offset = i * 32;
-        let raw = &sector[offset..offset + 32];
         if raw[0] == 0x00
         {
             return SectorScan::EndOfDir;
@@ -309,7 +301,7 @@ fn scan_sector_for_name_with_offset(
             lfn.reset();
             continue;
         }
-        if raw[11] == 0x0F
+        if raw[11] == ATTR_LFN
         {
             lfn.add_lfn_entry(raw);
             continue;
@@ -331,18 +323,18 @@ fn scan_sector_for_name_with_offset(
     SectorScan::Continue
 }
 
-/// Scan a sector's 32-byte directory entries for a name match.
-///
-/// Supports both 8.3 and LFN matching. The `lfn` accumulator carries
-/// LFN state across sector boundaries.
-/// `sector` is one sector's bytes, `bytes_per_sector` long.
-fn scan_sector_for_name(sector: &[u8], name: &[u8], lfn: &mut LfnAccum) -> SectorScan<DirEntry>
+/// Scan a sector's 32-byte directory entries for the listed entry `index`,
+/// counting in `listed` the entries earlier sectors listed. The `lfn`
+/// accumulator carries LFN state across sector boundaries.
+fn scan_sector_for_index(
+    sector: &[u8],
+    index: u64,
+    listed: &mut u64,
+    lfn: &mut LfnAccum,
+) -> SectorScan<DirEntry>
 {
-    let entries_per_sector = sector.len() / 32;
-    for i in 0..entries_per_sector
+    for (_, raw) in sector_slots(sector)
     {
-        let offset = i * 32;
-        let raw = &sector[offset..offset + 32];
         if raw[0] == 0x00
         {
             return SectorScan::EndOfDir;
@@ -352,22 +344,24 @@ fn scan_sector_for_name(sector: &[u8], name: &[u8], lfn: &mut LfnAccum) -> Secto
             lfn.reset();
             continue;
         }
-        if raw[11] == 0x0F
+        if raw[11] == ATTR_LFN
         {
             lfn.add_lfn_entry(raw);
             continue;
         }
         if let Some(mut entry) = parse_dir_entry(raw)
         {
-            let lfn_match = lfn.validate(&entry.name) && lfn.matches(name);
-            if lfn_match || name_matches(&entry.name, name)
+            if lfn.validate(&entry.name)
             {
-                if lfn.validate(&entry.name)
-                {
-                    populate_lfn(&mut entry, lfn);
-                }
+                populate_lfn(&mut entry, lfn);
+            }
+            if *listed == index
+            {
                 return SectorScan::Found(entry);
             }
+            // A directory holds at most `fat_parse::DIR_ENTRIES_MAX` entries,
+            // so this never saturates.
+            *listed = listed.saturating_add(1);
         }
         lfn.reset();
     }
@@ -382,15 +376,6 @@ fn scan_sector_for_name(sector: &[u8], name: &[u8], lfn: &mut LfnAccum) -> Secto
 /// attached to the returned [`DirEntry`] for the readdir wire reply;
 /// otherwise callers fall back to the 8.3 form via
 /// [`DirEntry::write_display_name`].
-// clippy::too_many_lines: read_dir_entry_at_index folds two iteration
-// shapes — FAT16 fixed root (contiguous sectors) and FAT32 clustered
-// directory (cluster-chain walk) — into one procedure because they
-// share the "scan 32-byte entries, accumulate LFN, count valid 8.3
-// entries, return the Nth" post-processing loop. Splitting would
-// require duplicating that post-processing loop or passing the
-// shared buffer + counters across a helper boundary, neither of
-// which clarifies the code.
-#[allow(clippy::too_many_lines)]
 pub fn read_dir_entry_at_index(
     dir_cluster: u32,
     index: u64,
@@ -402,57 +387,22 @@ pub fn read_dir_entry_at_index(
 {
     let mut sector_buf = sector_buffer().ok()?;
     let mut lfn = LfnAccum::new();
-    let entries_per_sector = state.sector_bytes() / 32;
-    let mut current_idx: u64 = 0;
+    let mut listed: u64 = 0;
 
     if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
-        let root_start =
-            u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = state.root_dir_sectors();
-
-        for s in 0..root_sectors
+        for lba in state.root_sectors()
         {
-            if !cache.read_sector(
-                u64::from(root_start + s),
-                block_dev,
-                &mut sector_buf,
-                ipc_buf,
-            )
+            if !cache.read_sector(u64::from(lba), block_dev, &mut *sector_buf, ipc_buf)
             {
                 return None;
             }
-            for e in 0..entries_per_sector
+            match scan_sector_for_index(state.sector(&sector_buf), index, &mut listed, &mut lfn)
             {
-                let offset = e * 32;
-                let raw = &sector_buf[offset..offset + 32];
-                if raw[0] == 0x00
-                {
-                    return None;
-                }
-                if raw[0] == 0xE5
-                {
-                    lfn.reset();
-                    continue;
-                }
-                if raw[11] == 0x0F
-                {
-                    lfn.add_lfn_entry(raw);
-                    continue;
-                }
-                if let Some(mut entry) = parse_dir_entry(raw)
-                {
-                    if lfn.validate(&entry.name)
-                    {
-                        populate_lfn(&mut entry, &lfn);
-                    }
-                    if current_idx == index
-                    {
-                        return Some(entry);
-                    }
-                    current_idx += 1;
-                }
-                lfn.reset();
+                SectorScan::Found(entry) => return Some(entry),
+                SectorScan::EndOfDir => return None,
+                SectorScan::Continue =>
+                {}
             }
         }
         return None;
@@ -462,49 +412,18 @@ pub fn read_dir_entry_at_index(
     let mut steps = 0;
     loop
     {
-        let base_sector = state.cluster_to_sector(cluster);
-        for s in 0..u32::from(state.sectors_per_cluster)
+        for lba in state.cluster_sectors(cluster)
         {
-            if !cache.read_sector(
-                u64::from(base_sector + s),
-                block_dev,
-                &mut sector_buf,
-                ipc_buf,
-            )
+            if !cache.read_sector(u64::from(lba), block_dev, &mut *sector_buf, ipc_buf)
             {
                 return None;
             }
-            for e in 0..entries_per_sector
+            match scan_sector_for_index(state.sector(&sector_buf), index, &mut listed, &mut lfn)
             {
-                let offset = e * 32;
-                let raw = &sector_buf[offset..offset + 32];
-                if raw[0] == 0x00
-                {
-                    return None;
-                }
-                if raw[0] == 0xE5
-                {
-                    lfn.reset();
-                    continue;
-                }
-                if raw[11] == 0x0F
-                {
-                    lfn.add_lfn_entry(raw);
-                    continue;
-                }
-                if let Some(mut entry) = parse_dir_entry(raw)
-                {
-                    if lfn.validate(&entry.name)
-                    {
-                        populate_lfn(&mut entry, &lfn);
-                    }
-                    if current_idx == index
-                    {
-                        return Some(entry);
-                    }
-                    current_idx += 1;
-                }
-                lfn.reset();
+                SectorScan::Found(entry) => return Some(entry),
+                SectorScan::EndOfDir => return None,
+                SectorScan::Continue =>
+                {}
             }
         }
 
@@ -548,11 +467,6 @@ pub enum NewEntryKind
 const ATTR_ARCHIVE: u8 = 0x20;
 /// 8.3 attribute byte for a directory.
 const ATTR_DIRECTORY: u8 = 0x10;
-/// 8.3 attribute byte for an LFN slot.
-const ATTR_LFN: u8 = 0x0F;
-/// LFN sequence flag: `0x40` `OR`ed into the highest-seq slot marks
-/// "last entry in the LFN run" (per the FAT spec).
-const LFN_LAST_FLAG: u8 = 0x40;
 
 /// Physical location of a 32-byte directory entry on disk.
 ///
@@ -638,15 +552,16 @@ pub fn insert_entry(
     let chksum = lfn_checksum(&sfn);
 
     let needs_lfn = !is_strict_83_match(&sfn, name);
+    // At most ceil(255 / 13) = 20 slots: `encode_lfn` bounds the units.
     let lfn_slot_count = if needs_lfn
     {
-        unit_count.div_ceil(13)
+        u8::try_from(unit_count.div_ceil(13)).map_err(|_| FatError::Corrupt)?
     }
     else
     {
         0
     };
-    let total_slots = lfn_slot_count + 1;
+    let total_slots = usize::from(lfn_slot_count).saturating_add(1);
 
     let scan = find_free_slot_run(
         state,
@@ -656,24 +571,22 @@ pub fn insert_entry(
         block_dev,
         ipc_buf,
     )?;
-    let slots = scan.run();
-
-    // Emit LFN slots in reverse-seq order (high seq with LFN_LAST_FLAG
-    // first on disk, seq counts down to 1). The slots iterator gives
-    // them in disk order; we pack starting at slot[0] with the highest
-    // sequence number.
-    if needs_lfn
+    // The run holds `total_slots` slots, so it is never empty: the LFN
+    // slots, then the 8.3 slot.
+    let Some((&entry_slot, lfn_slots)) = scan.run().split_last()
+    else
     {
-        // cast_possible_truncation: lfn_slot_count ≤ ceil(255 / 13) = 20
-        #[allow(clippy::cast_possible_truncation)]
-        for (i, slot) in slots.iter().take(lfn_slot_count).enumerate()
-        {
-            let seq = (lfn_slot_count - i) as u8;
-            let is_last = i == 0;
-            let slot_chars = lfn_chars_for_seq(&chars, unit_count, seq);
-            let raw = pack_lfn_slot(seq, is_last, chksum, &slot_chars);
-            write_dir_slot(*slot, &raw, cache, block_dev, ipc_buf)?;
-        }
+        return Err(FatError::NoSpace);
+    };
+
+    // Emit LFN slots in reverse-seq order: the highest seq, flagged as the
+    // run's last slot, first on disk, then seq counting down to 1.
+    let units = chars.get(..unit_count).unwrap_or_default();
+    for (seq, &slot) in (1..=lfn_slot_count).rev().zip(lfn_slots)
+    {
+        let raw =
+            pack_lfn_slot(seq, seq == lfn_slot_count, chksum, units).ok_or(FatError::Corrupt)?;
+        write_dir_slot(slot, &raw, cache, block_dev, ipc_buf)?;
     }
 
     let attr = match kind
@@ -682,9 +595,9 @@ pub fn insert_entry(
         NewEntryKind::Dir => ATTR_DIRECTORY,
     };
     let raw_83 = pack_83_entry(&sfn, attr, start_cluster, size);
-    write_dir_slot(slots[total_slots - 1], &raw_83, cache, block_dev, ipc_buf)?;
+    write_dir_slot(entry_slot, &raw_83, cache, block_dev, ipc_buf)?;
 
-    Ok(slots[total_slots - 1])
+    Ok(entry_slot)
 }
 
 /// A directory slot and its first byte before a removal marked it.
@@ -756,19 +669,24 @@ pub fn remove_entry(
                 touched,
             });
         };
-        if !cache.read_sector(u64::from(slot.sector_lba), block_dev, &mut buf, ipc_buf)
+        if !cache.read_sector(u64::from(slot.sector_lba), block_dev, &mut *buf, ipc_buf)
         {
             return Err(RemoveFailure {
                 error: FatError::Io,
                 touched,
             });
         }
+        let raw = match slot_mut(&mut buf, slot.offset_in_sector)
+        {
+            Ok(raw) => raw,
+            Err(error) => return Err(RemoveFailure { error, touched }),
+        };
         touched.push(SlotFirstByte {
             loc: *slot,
-            first_byte: buf[slot.offset_in_sector],
+            first_byte: raw[0],
         });
-        buf[slot.offset_in_sector] = 0xE5;
-        if !cache.write_sector(u64::from(slot.sector_lba), block_dev, &buf, ipc_buf)
+        raw[0] = 0xE5;
+        if !cache.write_sector(u64::from(slot.sector_lba), block_dev, &*buf, ipc_buf)
         {
             return Err(RemoveFailure {
                 error: FatError::Io,
@@ -801,13 +719,24 @@ pub fn restore_slot_first_bytes(
             result = Err(FatError::Io);
             continue;
         };
-        if !cache.read_sector(u64::from(slot.loc.sector_lba), block_dev, &mut buf, ipc_buf)
+        if !cache.read_sector(
+            u64::from(slot.loc.sector_lba),
+            block_dev,
+            &mut *buf,
+            ipc_buf,
+        )
         {
             result = Err(FatError::Io);
             continue;
         }
-        buf[slot.loc.offset_in_sector] = slot.first_byte;
-        if !cache.write_sector(u64::from(slot.loc.sector_lba), block_dev, &buf, ipc_buf)
+        let Ok(raw) = slot_mut(&mut buf, slot.loc.offset_in_sector)
+        else
+        {
+            result = Err(FatError::Io);
+            continue;
+        };
+        raw[0] = slot.first_byte;
+        if !cache.write_sector(u64::from(slot.loc.sector_lba), block_dev, &*buf, ipc_buf)
         {
             result = Err(FatError::Io);
         }
@@ -845,17 +774,15 @@ pub fn device_slot_state(
     {
         return DeviceSlotState::Unreadable;
     };
-    if !cache.reload_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
+    if !cache.reload_sector(u64::from(loc.sector_lba), block_dev, &mut *buf, ipc_buf)
     {
         return DeviceSlotState::Unreadable;
     }
-    if buf[loc.offset_in_sector] == 0xE5
+    match slot_mut(&mut buf, loc.offset_in_sector)
     {
-        DeviceSlotState::Deleted
-    }
-    else
-    {
-        DeviceSlotState::Live
+        Ok(raw) if raw[0] == 0xE5 => DeviceSlotState::Deleted,
+        Ok(_) => DeviceSlotState::Live,
+        Err(_) => DeviceSlotState::Unreadable,
     }
 }
 
@@ -871,18 +798,18 @@ pub fn update_entry_metadata(
 ) -> Result<(), FatError>
 {
     let mut buf = sector_buffer()?;
-    if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
+    if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut *buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
-    let off = loc.offset_in_sector;
+    let raw = slot_mut(&mut buf, loc.offset_in_sector)?;
     // DIR_FstClusHI holds the high half of the little-endian cluster number,
     // DIR_FstClusLO the low half.
     let cluster = new_first_cluster.to_le_bytes();
-    buf[off + 20..off + 22].copy_from_slice(&cluster[2..4]);
-    buf[off + 26..off + 28].copy_from_slice(&cluster[0..2]);
-    buf[off + 28..off + 32].copy_from_slice(&new_size.to_le_bytes());
-    if !cache.write_sector(u64::from(loc.sector_lba), block_dev, &buf, ipc_buf)
+    raw[20..22].copy_from_slice(&cluster[2..4]);
+    raw[26..28].copy_from_slice(&cluster[0..2]);
+    raw[28..32].copy_from_slice(&new_size.to_le_bytes());
+    if !cache.write_sector(u64::from(loc.sector_lba), block_dev, &*buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
@@ -910,22 +837,19 @@ pub fn directory_is_empty(
 ) -> Result<bool, FatError>
 {
     let mut buf = sector_buffer()?;
-    let entries_per_sector = state.sector_bytes() / 32;
 
     let mut cluster = dir_start_cluster(state, dir_cluster)?;
     let mut steps = 0;
     loop
     {
-        let base_sector = state.cluster_to_sector(cluster);
-        for s in 0..u32::from(state.sectors_per_cluster)
+        for lba in state.cluster_sectors(cluster)
         {
-            if !cache.read_sector(u64::from(base_sector + s), block_dev, &mut buf, ipc_buf)
+            if !cache.read_sector(u64::from(lba), block_dev, &mut *buf, ipc_buf)
             {
                 return Err(FatError::Io);
             }
-            for e in 0..entries_per_sector
+            for (_, raw) in sector_slots(state.sector(&buf))
             {
-                let raw = &buf[e * 32..e * 32 + 32];
                 if raw[0] == 0x00
                 {
                     return Ok(true);
@@ -960,7 +884,7 @@ pub fn write_dot_entries(
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
-    let base_sector = state.cluster_to_sector(new_dir_cluster);
+    let mut sectors = state.cluster_sectors(new_dir_cluster);
     let mut buf = sector_buffer()?;
     // First sector: "." and ".." entries packed at offsets 0 and 32;
     // remaining slots zeroed (== "end of directory" sentinel for every
@@ -977,9 +901,11 @@ pub fn write_dot_entries(
         parent_cluster
     };
     let dotdot = pack_83_entry(b"..         ", ATTR_DIRECTORY, dotdot_cluster, 0);
-    buf[..32].copy_from_slice(&dot);
-    buf[32..64].copy_from_slice(&dotdot);
-    if !cache.write_sector(u64::from(base_sector), block_dev, &buf, ipc_buf)
+    *slot_mut(&mut buf, 0)? = dot;
+    *slot_mut(&mut buf, 32)? = dotdot;
+    // A cluster holds at least one sector.
+    let first = sectors.next().ok_or(FatError::Corrupt)?;
+    if !cache.write_sector(u64::from(first), block_dev, &*buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
@@ -987,9 +913,9 @@ pub fn write_dot_entries(
     // (allocate_cluster reuses freed clusters) does not surface as
     // ghost entries.
     let zeros = sector_buffer()?;
-    for s in 1..u32::from(state.sectors_per_cluster)
+    for lba in sectors
     {
-        if !cache.write_sector(u64::from(base_sector + s), block_dev, &zeros, ipc_buf)
+        if !cache.write_sector(u64::from(lba), block_dev, &*zeros, ipc_buf)
         {
             return Err(FatError::Io);
         }
@@ -1031,17 +957,14 @@ fn find_free_slot_run(
     // FAT16 fixed root.
     if parent_dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
-        let root_start =
-            u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = state.root_dir_sectors();
-        for s in 0..root_sectors
+        for lba in state.root_sectors()
         {
             if scan_sector_free_run(
-                root_start + s,
+                lba,
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf[..state.sector_bytes()],
+                state.sector_mut(&mut buf),
                 &mut scan,
             )?
             {
@@ -1056,15 +979,14 @@ fn find_free_slot_run(
     let mut steps = 0;
     loop
     {
-        let base_sector = state.cluster_to_sector(cluster);
-        for s in 0..u32::from(state.sectors_per_cluster)
+        for lba in state.cluster_sectors(cluster)
         {
             if scan_sector_free_run(
-                base_sector + s,
+                lba,
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf[..state.sector_bytes()],
+                state.sector_mut(&mut buf),
                 &mut scan,
             )?
             {
@@ -1105,9 +1027,9 @@ fn scan_sector_free_run(
     {
         return Err(FatError::Io);
     }
-    for off in (0..buf.len()).step_by(32)
+    for (off, raw) in sector_slots(buf)
     {
-        let first = if read { buf[off] } else { 0x00 };
+        let first = if read { raw[0] } else { 0x00 };
         let loc = DirEntryLocation {
             sector_lba,
             offset_in_sector: off,
@@ -1129,10 +1051,9 @@ fn zero_cluster(
 ) -> Result<(), FatError>
 {
     let zeros = sector_buffer()?;
-    let base = state.cluster_to_sector(cluster);
-    for s in 0..u32::from(state.sectors_per_cluster)
+    for lba in state.cluster_sectors(cluster)
     {
-        if !cache.write_sector(u64::from(base + s), block_dev, &zeros, ipc_buf)
+        if !cache.write_sector(u64::from(lba), block_dev, &*zeros, ipc_buf)
         {
             return Err(FatError::Io);
         }
@@ -1149,16 +1070,28 @@ fn write_dir_slot(
 ) -> Result<(), FatError>
 {
     let mut buf = sector_buffer()?;
-    if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
+    if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut *buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
-    buf[loc.offset_in_sector..loc.offset_in_sector + 32].copy_from_slice(raw);
-    if !cache.write_sector(u64::from(loc.sector_lba), block_dev, &buf, ipc_buf)
+    *slot_mut(&mut buf, loc.offset_in_sector)? = *raw;
+    if !cache.write_sector(u64::from(loc.sector_lba), block_dev, &*buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
     Ok(())
+}
+
+/// The 32-byte directory slot at byte `offset` of the sector in `buf`.
+///
+/// # Errors
+/// [`FatError::Corrupt`] when the slot does not lie inside the buffer. The
+/// offsets passed come from a scan of the sector, so this is never taken.
+fn slot_mut(buf: &mut [u8; MAX_SECTOR_SIZE], offset: usize) -> Result<&mut [u8; 32], FatError>
+{
+    buf.get_mut(offset..)
+        .and_then(<[u8]>::first_chunk_mut::<32>)
+        .ok_or(FatError::Corrupt)
 }
 
 fn pack_83_entry(name: &[u8; 11], attr: u8, cluster: u32, size: u32) -> [u8; 32]
@@ -1176,44 +1109,6 @@ fn pack_83_entry(name: &[u8; 11], attr: u8, cluster: u32, size: u32) -> [u8; 32]
     e[26..28].copy_from_slice(&cluster_bytes[0..2]);
     e[28..32].copy_from_slice(&size.to_le_bytes());
     e
-}
-
-fn pack_lfn_slot(seq: u8, is_last: bool, chksum: u8, chars: &[u16; 13]) -> [u8; 32]
-{
-    let mut e = [0u8; 32];
-    e[0] = if is_last { seq | LFN_LAST_FLAG } else { seq };
-    e[11] = ATTR_LFN;
-    e[12] = 0;
-    e[13] = chksum;
-    // FirstClusLO at bytes 26-27 is zero for LFN slots.
-    let offsets: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
-    for (i, &off) in offsets.iter().enumerate()
-    {
-        let bytes = chars[i].to_le_bytes();
-        e[off] = bytes[0];
-        e[off + 1] = bytes[1];
-    }
-    e
-}
-
-fn lfn_chars_for_seq(chars: &[u16; MAX_LFN_CHARS], name_len: usize, seq: u8) -> [u16; 13]
-{
-    let base = (usize::from(seq) - 1) * 13;
-    let mut slot = [0xFFFFu16; 13];
-    for (i, slot_ch) in slot.iter_mut().enumerate()
-    {
-        let pos = base + i;
-        // Per spec: characters past the name are 0xFFFF padding, with
-        // a single 0x0000 terminator at the first past-the-end
-        // position (matters when name_len is not a multiple of 13).
-        *slot_ch = match pos.cmp(&name_len)
-        {
-            core::cmp::Ordering::Less => chars[pos],
-            core::cmp::Ordering::Equal => 0x0000,
-            core::cmp::Ordering::Greater => 0xFFFF,
-        };
-    }
-    slot
 }
 
 /// Generate a short (8.3) filename for `name`, unique in the parent
@@ -1265,39 +1160,28 @@ fn generate_sfn(
 
 fn try_strict_83(name: &[u8]) -> Option<[u8; 11]>
 {
-    let dot_pos = name.iter().position(|&b| b == b'.');
-    let (base, ext) = match dot_pos
-    {
-        Some(p) =>
-        {
-            // Reject multiple dots and leading dot.
-            if name[p + 1..].contains(&b'.') || p == 0
-            {
-                return None;
-            }
-            (&name[..p], &name[p + 1..])
-        }
-        None => (name, &[] as &[u8]),
-    };
-    if base.is_empty() || base.len() > 8 || ext.len() > 3
+    // Split at the first dot: a second dot, or a leading one (an empty
+    // base), makes the name not strict 8.3.
+    let mut parts = name.splitn(2, |&b| b == b'.');
+    let base = parts.next().unwrap_or_default();
+    let ext = parts.next().unwrap_or_default();
+    if base.is_empty()
+        || base.len() > 8
+        || ext.len() > 3
+        || ext.contains(&b'.')
+        || !base.iter().chain(ext).all(|&b| is_strict_83_char(b))
     {
         return None;
     }
-    for &b in base.iter().chain(ext.iter())
-    {
-        if !is_strict_83_char(b)
-        {
-            return None;
-        }
-    }
     let mut out = [b' '; 11];
-    for (i, &b) in base.iter().enumerate()
+    let (out_base, out_ext) = out.split_at_mut(8);
+    for (o, &b) in out_base.iter_mut().zip(base)
     {
-        out[i] = to_upper(b);
+        *o = to_upper(b);
     }
-    for (i, &b) in ext.iter().enumerate()
+    for (o, &b) in out_ext.iter_mut().zip(ext)
     {
-        out[8 + i] = to_upper(b);
+        *o = to_upper(b);
     }
     Some(out)
 }
@@ -1330,33 +1214,37 @@ fn is_strict_83_match(sfn: &[u8; 11], name: &[u8]) -> bool
 fn basis_name(name: &[u8]) -> [u8; 11]
 {
     let mut basis = [b' '; 11];
-    let dot_pos = name.iter().rposition(|&b| b == b'.');
-    let (base_src, ext_src) = match dot_pos
+    // Split at the last dot.
+    let mut parts = name.rsplitn(2, |&b| b == b'.');
+    let last = parts.next().unwrap_or_default();
+    let (base_src, ext_src) = match parts.next()
     {
-        Some(p) => (&name[..p], &name[p + 1..]),
-        None => (name, &[] as &[u8]),
+        Some(base) => (base, last),
+        None => (name, &[][..]),
     };
+    // Fill `out` with the valid characters of `src`, uppercased; whether
+    // there was any.
     let valid = |src: &[u8], out: &mut [u8]| {
-        let mut n = 0;
-        for &b in src.iter().filter(|&&b| is_strict_83_char(b))
+        let mut any = false;
+        for (o, &b) in out
+            .iter_mut()
+            .zip(src.iter().filter(|&&b| is_strict_83_char(b)))
         {
-            if n == out.len()
-            {
-                break;
-            }
-            out[n] = to_upper(b);
-            n += 1;
+            *o = to_upper(b);
+            any = true;
         }
-        n
+        any
     };
+    let (base_out, ext_out) = basis.split_at_mut(8);
+    let base_valid = valid(base_src, base_out);
+    valid(ext_src, ext_out);
     // FAT spec: every SFN basis must have at least one valid base
     // character; fall back to a single underscore if upstream gave us
     // a name with no usable chars in the base portion.
-    if valid(base_src, &mut basis[..8]) == 0
+    if !base_valid
     {
         basis[0] = b'_';
     }
-    valid(ext_src, &mut basis[8..]);
     basis
 }
 
@@ -1376,23 +1264,13 @@ fn for_each_short_name(
 ) -> Result<(), FatError>
 {
     let mut buf = sector_buffer()?;
-    let sector_bytes = state.sector_bytes();
 
     if parent_dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
-        let root_start =
-            u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        for s in 0..state.root_dir_sectors()
+        for lba in state.root_sectors()
         {
-            let sector = &mut buf[..sector_bytes];
-            if !visit_sector_short_names(
-                root_start + s,
-                cache,
-                block_dev,
-                ipc_buf,
-                sector,
-                &mut visit,
-            )?
+            let sector = state.sector_mut(&mut buf);
+            if !visit_sector_short_names(lba, cache, block_dev, ipc_buf, sector, &mut visit)?
             {
                 return Ok(());
             }
@@ -1404,18 +1282,10 @@ fn for_each_short_name(
     let mut steps = 0;
     loop
     {
-        let base_sector = state.cluster_to_sector(cluster);
-        for s in 0..u32::from(state.sectors_per_cluster)
+        for lba in state.cluster_sectors(cluster)
         {
-            let sector = &mut buf[..sector_bytes];
-            if !visit_sector_short_names(
-                base_sector + s,
-                cache,
-                block_dev,
-                ipc_buf,
-                sector,
-                &mut visit,
-            )?
+            let sector = state.sector_mut(&mut buf);
+            if !visit_sector_short_names(lba, cache, block_dev, ipc_buf, sector, &mut visit)?
             {
                 return Ok(());
             }
@@ -1482,18 +1352,15 @@ fn locate_entry_with_lfn_run(
 
     if parent_dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
-        let root_start =
-            u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = state.root_dir_sectors();
-        for s in 0..root_sectors
+        for lba in state.root_sectors()
         {
             if let Some(entry) = scan_sector_for_remove(
-                root_start + s,
+                lba,
                 name,
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf[..state.sector_bytes()],
+                state.sector_mut(&mut buf),
                 &mut scan,
             )?
             {
@@ -1511,16 +1378,15 @@ fn locate_entry_with_lfn_run(
     let mut steps = 0;
     loop
     {
-        let base_sector = state.cluster_to_sector(cluster);
-        for s in 0..u32::from(state.sectors_per_cluster)
+        for lba in state.cluster_sectors(cluster)
         {
             if let Some(entry) = scan_sector_for_remove(
-                base_sector + s,
+                lba,
                 name,
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf[..state.sector_bytes()],
+                state.sector_mut(&mut buf),
                 &mut scan,
             )?
             {
@@ -1559,12 +1425,11 @@ fn scan_sector_for_remove(
     {
         return Err(FatError::Io);
     }
-    let (slots, _) = buf.as_chunks::<32>();
-    for (e, raw) in slots.iter().enumerate()
+    for (offset_in_sector, raw) in sector_slots(buf)
     {
         let loc = DirEntryLocation {
             sector_lba,
-            offset_in_sector: e * 32,
+            offset_in_sector,
         };
         match scan.step(raw, loc, name)
         {

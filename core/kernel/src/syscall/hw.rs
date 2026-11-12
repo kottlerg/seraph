@@ -14,6 +14,7 @@
 //! - `SYS_IRQ_SPLIT` (49): split an `Interrupt` range cap into two sub-ranges.
 //! - `SYS_IOPORT_SPLIT` (51): split an `IoPort` cap into two sub-ranges
 //!   (`x86_64` only).
+//! - `SYS_IRQ_MSG_ALLOC` (62): mint a message-signaled `Interrupt` cap.
 //!
 //! # Adding new hardware syscalls
 //! 1. Define the `SYS_*` number in `abi/syscall/src/lib.rs`.
@@ -101,14 +102,16 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // ── SYS_IRQ_REGISTER ─────────────────────────────────────────────────────────
 
-/// `SYS_IRQ_REGISTER` (30): bind a Notification to an interrupt line.
+/// `SYS_IRQ_REGISTER` (30): bind a Notification to an interrupt line or a
+/// message-signaled target.
 ///
 /// arg0 = Interrupt cap index (must have NOTIFY right).
 /// arg1 = Notification cap index (must have NOTIFY right).
 /// arg2 = the line's mode (`IRQ_MODE_LEVEL`, `IRQ_MODE_ACTIVE_LOW`; 0 is
 ///        edge-triggered, active-high). The line's first binding records it and
 ///        routes the line in it; every later binding must pass the same mode
-///        (`irq` module doc § Mode).
+///        (`irq` module doc § Mode). A message-signaled target takes mode 0
+///        only.
 ///
 /// Binds the cap's own object (each copy of an Interrupt cap is an object of
 /// its own) to the Notification; a line holds one binding per bound object, up
@@ -129,11 +132,17 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// mode, masked until the first ACK in both cases. A later binding masks the
 /// line, which stays masked until that binding's first ACK.
 ///
+/// A message-signaled target (`SYS_IRQ_MSG_ALLOC`) was given its CPU and slot
+/// at its mint and is never masked: it takes one binding, which receives every
+/// message the device sends, and `SYS_IRQ_ACK` on it changes nothing.
+///
 /// Returns 0 on success; `InvalidArgument` for an id no discovered controller
-/// implements, a mode with a bit outside `IRQ_MODE_MASK`, or a mode other than
-/// the one the line's bindings recorded; `QuotaExceeded` when the controller has
-/// no delivery resource left (x86-64: every device vector assigned) or the line
-/// already holds `MAX_IRQ_BINDINGS` bindings.
+/// implements, a mode with a bit outside `IRQ_MODE_MASK`, a mode other than
+/// the one the line's bindings recorded, or a mode other than 0 for a
+/// message-signaled target; `QuotaExceeded` when the controller has no delivery
+/// resource left (no CPU with a free device vector on x86-64, or a free IMSIC
+/// identity on RISC-V), the line already holds `MAX_IRQ_BINDINGS` bindings, or
+/// the message-signaled target is already bound.
 #[cfg(not(test))]
 pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -180,8 +189,11 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     let irq_id = io.start;
     // The root Interrupt cap spans the controller's whole id space
     // (`ROOT_IRQ_COUNT`); refuse an id outside the routable range here, and
-    // `irq::register` refuses a line no discovered controller implements.
-    if !(crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID).contains(&irq_id)
+    // `irq::register` refuses a line no discovered controller implements. A
+    // message-signaled target's id lies past that space (`irq::MESSAGE_ID_BASE`)
+    // and only `SYS_IRQ_MSG_ALLOC` makes a cap naming one.
+    if !crate::irq::is_message(irq_id)
+        && !(crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID).contains(&irq_id)
     {
         return Err(SyscallError::InvalidArgument);
     }
@@ -225,6 +237,140 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 
 #[cfg(test)]
 pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+// ── SYS_IRQ_MSG_ALLOC ────────────────────────────────────────────────────────
+
+/// `SYS_IRQ_MSG_ALLOC` (62): mint one message-signaled `Interrupt` capability.
+///
+/// arg0 = `Interrupt` cap handle carrying `RIGHTS_IRQ_MINT` (the authority).
+///
+/// Takes a free message-signaled target (`irq::alloc_message`): an id past
+/// every wired line and a slot (an x86-64 device vector, a RISC-V IMSIC
+/// identity) of the next CPU in turn with a free one. Inserts into the caller's
+/// `CSpace` an `Interrupt` capability over that one id, unbound, carrying
+/// `RIGHTS_IRQ_NOTIFY` only, as a derivation child of the authority, so a
+/// revoke of the authority reaches it. The holder reads the message its device
+/// writes through `SYS_CAP_INFO` (`CAP_INFO_IRQ_MSG_ADDRESS`,
+/// `CAP_INFO_IRQ_MSG_DATA`), programs it into the device, and binds the
+/// capability with `SYS_IRQ_REGISTER` (mode 0). The target is freed, for a
+/// later mint, once neither the capability nor any copy of it remains.
+///
+/// One target per call; a caller needing K targets calls K times.
+///
+/// Returns the new cap handle; `InvalidCapability` for a handle that names no
+/// `Interrupt` cap; `InsufficientRights` when it lacks `RIGHTS_IRQ_MINT`;
+/// `QuotaExceeded` when no target is free (every target the routing table
+/// holds is minted, or no CPU has a free slot); `OutOfMemory` when the caller's
+/// arena cannot fund the object; `InvalidState` when the authority's slot is
+/// pinned by an in-flight revoke, move, or transfer; and the error of a full
+/// `CSpace`.
+#[cfg(not(test))]
+pub fn sys_irq_msg_alloc(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::object::{InterruptObject, arena_of, release_ref};
+    use crate::cap::slot::{CapTag, IrqRights, SlotId};
+    use crate::syscall::current_tcb;
+
+    let authority_handle = tf.arg(0);
+
+    // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+    // CPU's current thread.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*tcb).cspace };
+    if caller_cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: caller_cspace validated non-null above.
+    let cspace_id = unsafe { (*caller_cspace).id() };
+
+    // `authority` pins the authority's object for the call, so the object the
+    // revalidation below compares against stays live.
+    // SAFETY: caller_cspace is the running thread's bound CSpace; lookup_cap
+    // checks tag and rights; no lock held.
+    let authority = unsafe { super::lookup_cap(caller_cspace, authority_handle, IrqRights::MINT) }?;
+    let authority_object = authority.object.ok_or(SyscallError::InvalidCapability)?;
+    let authority_idx = core::num::NonZeroU32::new(syscall::cap_handle_index(authority_handle))
+        .ok_or(SyscallError::InvalidCapability)?;
+
+    // The caller's CSpace funds the object from its arena
+    // (core/kernel/docs/capability-internals.md § Body Arena).
+    // SAFETY: caller_cspace is the running thread's own CSpace, live while the
+    // thread runs.
+    let funder = unsafe { arena_of(caller_cspace) }?;
+    let id = crate::irq::alloc_message().map_err(|_| SyscallError::QuotaExceeded)?;
+    let object = match funder.alloc_body(InterruptObject::new_root(id, 1))
+    {
+        Ok(object) => object,
+        Err(e) =>
+        {
+            // SAFETY: syscall context with no lock held; no object names `id`.
+            unsafe { crate::irq::free_message(id) };
+            return Err(e);
+        }
+    };
+    // From here the object owns the target: its release frees it (the
+    // Interrupt arm of `dealloc_object`).
+
+    // Revalidate the authority, then insert and link, under one
+    // DERIVATION_LOCK hold, as `SYS_CAP_DERIVE` does: a link under a parent a
+    // concurrent delete, move, or revoke freed would leave the new cap outside
+    // every ancestor's revoke reach.
+    crate::cap::DERIVATION_LOCK.write_lock();
+    // SAFETY: caller_cspace validated non-null above; DERIVATION_LOCK held.
+    if let Err(e) = unsafe {
+        super::cap::revalidate_src_under_lock(caller_cspace, authority_handle, authority_object)
+    }
+    {
+        crate::cap::DERIVATION_LOCK.write_unlock();
+        // SAFETY: the object's only reference, published nowhere; syscall
+        // context with no lock held.
+        unsafe { release_ref(object) };
+        return Err(e);
+    }
+    // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
+    let insert_res = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let r = (*caller_cspace).insert_cap_slot_and_handle(
+            CapTag::Interrupt,
+            IrqRights::NOTIFY.erase(),
+            object,
+        );
+        (*caller_cspace).lock.unlock_raw(saved);
+        r
+    };
+    let (new_idx, new_handle) = match insert_res
+    {
+        Ok(v) => v,
+        Err(e) =>
+        {
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            // SAFETY: as above.
+            unsafe { release_ref(object) };
+            return Err(SyscallError::from(e));
+        }
+    };
+    let parent = SlotId::current(cspace_id, authority_idx);
+    let child = SlotId::current(cspace_id, new_idx);
+    // SAFETY: DERIVATION_LOCK held; the parent revalidated and the child was
+    // inserted under this hold, so both ends resolve.
+    let linked = unsafe { crate::cap::derivation::link_child(parent, child) };
+    debug_assert!(linked, "derivation link dropped under DERIVATION_LOCK");
+    crate::cap::DERIVATION_LOCK.write_unlock();
+    drop(authority);
+    Ok(new_handle)
+}
+
+#[cfg(test)]
+pub fn sys_irq_msg_alloc(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

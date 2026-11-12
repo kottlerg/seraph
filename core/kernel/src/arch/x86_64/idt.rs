@@ -902,9 +902,11 @@ pub(super) unsafe fn publish_user_frame(frame: *mut TrapFrame)
 /// Each handler performs its own EOI; this only dispatches, then, for an
 /// interrupt from user mode, makes the interrupt delivery point of a pending
 /// upcall (`ipc::upcall::deliver_at_interrupt`). A device vector is
-/// mapped to the GSI the I/O APIC routing assigned it (`ioapic::gsi_for_vector`),
-/// which indexes the `irq` routing table; a device vector with no GSI (an
-/// interrupt latched before its route was cleared) is acknowledged and dropped.
+/// mapped, through this CPU's vector row, to the source assigned it there
+/// (`ioapic::source_for_vector`): a GSI the I/O APIC routes or a message-signaled
+/// target, which indexes the `irq` routing table. A device vector with no source
+/// (an interrupt latched before its route was cleared or its target freed) is
+/// acknowledged and dropped.
 #[cfg(not(test))]
 extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
 {
@@ -923,13 +925,13 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
             .contains(&v) =>
         {
             // The range check above bounds `v` below 256.
-            match super::ioapic::gsi_for_vector(v as u8)
+            match super::ioapic::source_for_vector(v as u8)
             {
-                Some(gsi) =>
+                Some(source) =>
                 {
                     // SAFETY: IRQ-handler context at ring 0; `dispatch_device_irq`
-                    // masks and EOIs internally.
-                    unsafe { crate::irq::dispatch_device_irq(gsi) };
+                    // masks a line and EOIs internally.
+                    unsafe { crate::irq::dispatch_device_irq(source) };
                 }
                 None => super::interrupts::acknowledge(0),
             }

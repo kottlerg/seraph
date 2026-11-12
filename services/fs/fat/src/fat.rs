@@ -10,7 +10,7 @@
 //! [`PageCache::read_sector`] directly; partition-scoping is enforced by
 //! the block driver per the per-badge bound vfsd registered at mount.
 
-use crate::alloc::FatError;
+use crate::alloc::{FatError, read_fat_entry};
 use crate::bpb::{FatState, FatType, MAX_SECTOR_SIZE};
 use crate::cache::PageCache;
 
@@ -59,79 +59,20 @@ pub fn chain_next(
         return Err(FatError::Corrupt);
     }
 
-    let (fat_offset, fat_sector, entry_offset) = match state.fat_type
+    let (end_of_chain, bad_cluster) = match state.fat_type
     {
-        FatType::Fat16 =>
-        {
-            let offset = cluster * 2;
-            let sector =
-                u32::from(state.reserved_sectors) + offset / u32::from(state.bytes_per_sector);
-            let ent_off = (offset % u32::from(state.bytes_per_sector)) as usize;
-            (offset, sector, ent_off)
-        }
-        FatType::Fat32 =>
-        {
-            let offset = cluster * 4;
-            let sector =
-                u32::from(state.reserved_sectors) + offset / u32::from(state.bytes_per_sector);
-            let ent_off = (offset % u32::from(state.bytes_per_sector)) as usize;
-            (offset, sector, ent_off)
-        }
+        FatType::Fat16 => (0xFFF8, 0xFFF7),
+        FatType::Fat32 => (0x0FFF_FFF8, 0x0FFF_FFF7),
     };
-    let _ = fat_offset; // Used only to compute sector and entry_offset.
-
-    // Read the FAT sector (with caching).
-    if state.cached_fat_sector != fat_sector
+    let val = read_fat_entry(state, cluster, cache, block_dev, ipc_buf)?;
+    if val >= end_of_chain
     {
-        if !cache.read_sector(
-            u64::from(fat_sector),
-            block_dev,
-            &mut state.cached_fat_data,
-            ipc_buf,
-        )
-        {
-            return Err(FatError::Io);
-        }
-        state.cached_fat_sector = fat_sector;
+        return Ok(None);
     }
-
-    let val = match state.fat_type
+    if val == bad_cluster
     {
-        FatType::Fat16 =>
-        {
-            let raw = u16::from_le_bytes([
-                state.cached_fat_data[entry_offset],
-                state.cached_fat_data[entry_offset + 1],
-            ]);
-            if raw >= 0xFFF8
-            {
-                return Ok(None); // End of chain.
-            }
-            if raw == 0xFFF7
-            {
-                return Err(FatError::Corrupt); // Bad cluster in a chain.
-            }
-            u32::from(raw)
-        }
-        FatType::Fat32 =>
-        {
-            let raw = u32::from_le_bytes([
-                state.cached_fat_data[entry_offset],
-                state.cached_fat_data[entry_offset + 1],
-                state.cached_fat_data[entry_offset + 2],
-                state.cached_fat_data[entry_offset + 3],
-            ]) & 0x0FFF_FFFF;
-            if raw >= 0x0FFF_FFF8
-            {
-                return Ok(None); // End of chain.
-            }
-            if raw == 0x0FFF_FFF7
-            {
-                return Err(FatError::Corrupt); // Bad cluster in a chain.
-            }
-            raw
-        }
-    };
+        return Err(FatError::Corrupt); // Bad cluster in a chain.
+    }
 
     // Clusters 0 and 1 are reserved, and a cluster at or past
     // 2 + total_clusters lies outside the data region; a FAT entry
@@ -141,6 +82,7 @@ pub fn chain_next(
     // sectors outside the data region.
     if !state.is_data_cluster(val)
     {
+        let (fat_sector, entry_offset) = state.fat_entry_location(cluster).unwrap_or_default();
         std::os::seraph::log!(
             warn: "FAT chain at cluster {cluster} points to cluster {val} outside \
              the data region (fat_sector={fat_sector}, entry_offset={entry_offset}) \
@@ -161,14 +103,13 @@ pub struct FileRead
     pub max_len: u64,
 }
 
-/// Read up to one sector (and at most `MAX_SECTOR_SIZE` bytes) from a file at
-/// a given byte offset.
+/// Read up to the end of one sector from a file at a given byte offset.
 ///
 /// Walks the cluster chain to find the correct cluster, reads the
 /// relevant sector, and extracts the requested bytes.
 ///
-/// Returns the number of bytes read (written to `out`); 0 at or past
-/// end of file.
+/// Returns the number of bytes read (written to `out`, at most its length);
+/// 0 at or past end of file.
 ///
 /// # Errors
 /// [`FatError::Corrupt`] when the file's start cluster lies outside the
@@ -184,49 +125,50 @@ pub fn read_file_data(
     out: &mut [u8],
 ) -> Result<usize, FatError>
 {
-    if req.offset >= u64::from(req.file_size)
+    let Some(remaining) = u64::from(req.file_size)
+        .checked_sub(req.offset)
+        .filter(|&n| n > 0)
+    else
     {
-        return Ok(0); // Past EOF.
-    }
+        return Ok(0); // At or past EOF.
+    };
     if !state.is_data_cluster(req.start_cluster)
     {
         return Err(FatError::Corrupt);
     }
-
-    let remaining = u64::from(req.file_size) - req.offset;
-    // cast_possible_truncation: `to_read` is at most MAX_SECTOR_SIZE.
-    #[allow(clippy::cast_possible_truncation)]
-    let to_read = req.max_len.min(remaining).min(MAX_SECTOR_SIZE as u64) as usize;
-
-    let cluster_size = state.cluster_size();
-    let cluster_idx = req.offset / u64::from(cluster_size);
-    // cast_possible_truncation: the remainder is below the `u32` cluster size.
-    #[allow(clippy::cast_possible_truncation)]
-    let offset_in_cluster = (req.offset % u64::from(cluster_size)) as u32;
-    let sector_in_cluster = offset_in_cluster / u32::from(state.bytes_per_sector);
-    let offset_in_sector = (offset_in_cluster % u32::from(state.bytes_per_sector)) as usize;
+    let to_read = usize::try_from(req.max_len.min(remaining)).unwrap_or(usize::MAX);
+    let pos = state.file_position(req.offset).ok_or(FatError::Corrupt)?;
 
     // Walk the cluster chain to the target cluster. `offset` is below the
     // `u32` file size, so the walk ends within `u32::MAX / cluster_size`
     // steps even on a cyclic chain.
     let mut cluster = req.start_cluster;
-    for _ in 0..cluster_idx
+    for _ in 0..pos.cluster_index
     {
         cluster =
             chain_next(state, cluster, cache, block_dev, ipc_buf)?.ok_or(FatError::Corrupt)?;
     }
 
-    let sector = state.cluster_to_sector(cluster) + sector_in_cluster;
+    let sector = state
+        .cluster_to_sector(cluster)
+        .saturating_add(pos.sector_in_cluster);
     let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
     if !cache.read_sector(u64::from(sector), block_dev, &mut sector_buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
 
-    // Extract bytes from the sector.
-    let available = state.sector_bytes() - offset_in_sector;
-    let copy_len = to_read.min(available);
-    out[..copy_len].copy_from_slice(&sector_buf[offset_in_sector..offset_in_sector + copy_len]);
+    // Copy the bytes from `offset` to the end of its sector, the file, the
+    // request, or `out`, whichever comes first.
+    let available = state
+        .sector(&sector_buf)
+        .get(pos.offset_in_sector..)
+        .unwrap_or_default();
+    let copy_len = to_read.min(available.len()).min(out.len());
+    for (dst, &src) in out.iter_mut().zip(available).take(copy_len)
+    {
+        *dst = src;
+    }
 
     Ok(copy_len)
 }

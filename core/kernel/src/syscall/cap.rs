@@ -2774,7 +2774,10 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
 /// Holding the slot is sufficient to inspect its state, except for
 /// `CAP_INFO_MEMORY_PHYS_BASE`, which answers only a holder of
 /// `MemRights::PHYS` (the queried cap's, or a credential cap's named in
-/// arg2). No mutation occurs.
+/// arg2). The message address `CAP_INFO_IRQ_MSG_ADDRESS` gives is an interrupt
+/// controller's (the local APIC's message window on `x86_64`, a hart's IMSIC
+/// file on RISC-V), never RAM, so holding the message-signaled cap answers
+/// it. No mutation occurs.
 // too_many_lines: a single flat dispatch on the field selector is the clearest
 // shape for this read-only inquiry handler. Splitting it adds only indirection.
 #[allow(clippy::too_many_lines)]
@@ -2785,14 +2788,17 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
 
     use syscall::{
         CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_ASPACE_TERMINAL_FAULT, CAP_INFO_CSPACE_BUDGET,
-        CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE,
-        CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES,
-        CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE,
-        CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE, CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED,
-        THREAD_STATE_ALIVE, THREAD_STATE_CREATED, THREAD_STATE_EXITED,
+        CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_IRQ_MSG_ADDRESS,
+        CAP_INFO_IRQ_MSG_DATA, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
+        CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
+        CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE,
+        CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED,
+        THREAD_STATE_EXITED,
     };
 
-    use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, MemoryObject, ThreadObject};
+    use crate::cap::object::{
+        AddressSpaceObject, CSpaceKernelObject, InterruptObject, MemoryObject, ThreadObject,
+    };
     use crate::cap::slot::{CapTag, MemRights};
     use crate::sched::thread::ThreadState;
 
@@ -3032,6 +3038,33 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
                     .cast::<AddressSpaceObject>())
             };
             Ok(as_obj.pt_growth_budget_bytes.load(Ordering::Acquire))
+        }
+        CAP_INFO_IRQ_MSG_ADDRESS | CAP_INFO_IRQ_MSG_DATA =>
+        {
+            if tag != CapTag::Interrupt
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed Interrupt.
+            // cast_ptr_alignment: the InterruptObject is constructed in place at a
+            // size-class-aligned retype offset; header at offset 0.
+            #[allow(clippy::cast_ptr_alignment)]
+            let io = unsafe { &*(slot.object_of(CapTag::Interrupt).cast::<InterruptObject>()) };
+            if io.count != 1
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // A wired line's id names no message target, so it answers None.
+            let (address, data) =
+                crate::irq::message(io.start).ok_or(SyscallError::InvalidArgument)?;
+            if field == CAP_INFO_IRQ_MSG_ADDRESS
+            {
+                Ok(address)
+            }
+            else
+            {
+                Ok(u64::from(data))
+            }
         }
         CAP_INFO_ASPACE_TERMINAL_FAULT =>
         {

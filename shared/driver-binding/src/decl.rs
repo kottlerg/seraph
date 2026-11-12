@@ -153,11 +153,13 @@ impl<const N: usize> Text<N>
     const fn copy_const(bytes: &[u8]) -> Self
     {
         let mut out = [0u8; N];
-        let mut i = 0;
-        while i < bytes.len()
+        let mut src = bytes;
+        let mut dst: &mut [u8] = &mut out;
+        while let ([b, src_rest @ ..], [d, dst_rest @ ..]) = (src, dst)
         {
-            out[i] = bytes[i];
-            i += 1;
+            *d = *b;
+            src = src_rest;
+            dst = dst_rest;
         }
         Self {
             bytes: out,
@@ -169,7 +171,10 @@ impl<const N: usize> Text<N>
     fn copy(bytes: &[u8]) -> Self
     {
         let mut out = [0u8; N];
-        out[..bytes.len()].copy_from_slice(bytes);
+        if let Some(dst) = out.get_mut(..bytes.len())
+        {
+            dst.copy_from_slice(bytes);
+        }
         Self {
             bytes: out,
             // A checked text holds at most `N` bytes, and every `N` this
@@ -220,14 +225,14 @@ const fn valid_key(bytes: &[u8], max: usize) -> bool
     {
         return false;
     }
-    let mut i = 0;
-    while i < bytes.len()
+    let mut rest = bytes;
+    while let [b, tail @ ..] = rest
     {
-        if bytes[i] < 0x21 || bytes[i] > 0x7E
+        if *b < 0x21 || *b > 0x7E
         {
             return false;
         }
-        i += 1;
+        rest = tail;
     }
     true
 }
@@ -240,15 +245,15 @@ const fn valid_class(bytes: &[u8], max: usize) -> bool
     {
         return false;
     }
-    let mut i = 0;
-    while i < bytes.len()
+    let mut rest = bytes;
+    while let [b, tail @ ..] = rest
     {
-        let b = bytes[i];
+        let b = *b;
         if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
         {
             return false;
         }
-        i += 1;
+        rest = tail;
     }
     true
 }
@@ -434,7 +439,9 @@ impl DriverDecl
     #[must_use]
     pub fn matches(&self) -> &[MatchKey]
     {
-        &self.matches[..self.match_count]
+        // `match_count` is 0 in `Builder::new` and grows only in
+        // `Builder::field`, which stops at `MAX_MATCHES`.
+        self.matches.get(..self.match_count).unwrap_or(&[])
     }
 }
 
@@ -476,37 +483,35 @@ pub fn decode(desc: &[u8]) -> Result<DriverDecl, DeclError>
     {
         return Err(DeclError::TooLarge);
     }
-    let (Some(version), Some(reserved)) = (desc.get(0..2), desc.get(2..4))
+    let Some((&[v0, v1, r0, r1], mut rest)) = desc.split_first_chunk::<HEADER_BYTES>()
     else
     {
         return Err(DeclError::BadHeader);
     };
-    if reserved != [0, 0]
+    if [r0, r1] != [0, 0]
     {
         return Err(DeclError::BadHeader);
     }
-    let version = u16::from_le_bytes([version[0], version[1]]);
+    let version = u16::from_le_bytes([v0, v1]);
     if version != DECL_VERSION
     {
         return Err(DeclError::UnknownVersion(version));
     }
     let mut builder = Builder::new();
-    let mut at = HEADER_BYTES;
-    while at < desc.len()
+    while let Some((&kind, after_kind)) = rest.split_first()
     {
-        let (Some(&kind), Some(&len)) = (desc.get(at), desc.get(at + 1))
+        let Some((&len, after_len)) = after_kind.split_first()
         else
         {
             return Err(DeclError::Truncated);
         };
-        let start = at + 2;
-        let Some(payload) = desc.get(start..start + usize::from(len))
+        let Some((payload, after_payload)) = after_len.split_at_checked(usize::from(len))
         else
         {
             return Err(DeclError::Truncated);
         };
         builder.field(kind, payload)?;
-        at = start + usize::from(len);
+        rest = after_payload;
     }
     builder.finish()
 }
@@ -553,12 +558,15 @@ impl Builder
         let bad = DeclError::BadField(kind);
         if let Some(key) = match_key(kind, payload)?
         {
-            if self.decl.match_count == MAX_MATCHES
-            {
-                return Err(DeclError::TooManyMatches);
-            }
-            self.decl.matches[self.decl.match_count] = key;
-            self.decl.match_count += 1;
+            let slot = self
+                .decl
+                .matches
+                .get_mut(self.decl.match_count)
+                .ok_or(DeclError::TooManyMatches)?;
+            *slot = key;
+            // The slot exists, so the count is below `MAX_MATCHES` and cannot
+            // saturate.
+            self.decl.match_count = self.decl.match_count.saturating_add(1);
             return Ok(());
         }
         let bit = singleton_bit(kind).ok_or(DeclError::UnknownKind(kind))?;
@@ -714,21 +722,28 @@ impl EncodedDesc
     #[must_use]
     pub const fn padded_len(&self) -> usize
     {
-        (self.len + 3) & !3
+        // `len` is at most `MAX_DESC_BYTES`, so the sum cannot saturate.
+        self.len.saturating_add(3) & !3
     }
 
     /// Byte `i` of the descriptor, 0 past its end.
     #[must_use]
     pub const fn byte(&self, i: usize) -> u8
     {
-        if i < self.len { self.bytes[i] } else { 0 }
+        match self.bytes.split_at_checked(i)
+        {
+            Some((_, [b, ..])) if i < self.len => *b,
+            _ => 0,
+        }
     }
 
     /// The descriptor.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8]
     {
-        &self.bytes[..self.len]
+        // `len` is 0 at construction and grows only in `Writer::byte`, which
+        // stops at `MAX_DESC_BYTES`.
+        self.bytes.get(..self.len).unwrap_or(&[])
     }
 }
 
@@ -777,11 +792,11 @@ pub const fn encode(decl: &Declaration<'_>) -> EncodedDesc
         !decl.matches.is_empty() && decl.matches.len() <= MAX_MATCHES,
         "driver declaration: 1 to MAX_MATCHES match entries"
     );
-    let mut i = 0;
-    while i < decl.matches.len()
+    let mut remaining = decl.matches;
+    while let [entry, rest @ ..] = remaining
     {
-        w.match_entry(&decl.matches[i]);
-        i += 1;
+        w.match_entry(entry);
+        remaining = rest;
     }
     if let Some(limit) = decl.instance_limit
     {
@@ -848,8 +863,13 @@ impl Writer
             self.out.len < MAX_DESC_BYTES,
             "driver declaration: encodes to more than MAX_DESC_BYTES"
         );
-        self.out.bytes[self.out.len] = b;
-        self.out.len += 1;
+        if let Some((_, [slot, ..])) = self.out.bytes.split_at_mut_checked(self.out.len)
+        {
+            *slot = b;
+        }
+        // The assert above keeps `len` below `MAX_DESC_BYTES`, so it cannot
+        // saturate.
+        self.out.len = self.out.len.saturating_add(1);
     }
 
     /// One field: kind, length, payload. Every payload the encoder writes is
@@ -864,11 +884,11 @@ impl Writer
         );
         self.byte(kind);
         self.byte(payload.len() as u8);
-        let mut i = 0;
-        while i < payload.len()
+        let mut rest = payload;
+        while let [b, tail @ ..] = rest
         {
-            self.byte(payload[i]);
-            i += 1;
+            self.byte(*b);
+            rest = tail;
         }
     }
 

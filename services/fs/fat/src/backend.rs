@@ -338,8 +338,13 @@ impl NamespaceBackend for FatfsBackend<'_>
         let kind = Self::entry_kind(&entry);
         // No FAT entry is hidden: `lookup` reports `visible_requires`
         // NONE for every entry, and readdir MUST agree with it.
-        EntryName::new(&name_buf[..len], kind, NamespaceRights::NONE)
-            .map_or(Err(NsError::IoError), |name| Ok(Some(name)))
+        // `write_display_name` writes at most the buffer.
+        EntryName::new(
+            name_buf.get(..len).unwrap_or_default(),
+            kind,
+            NamespaceRights::NONE,
+        )
+        .map_or(Err(NsError::IoError), |name| Ok(Some(name)))
     }
 
     fn may_hide_entries(&mut self, _dir: NodeId) -> bool

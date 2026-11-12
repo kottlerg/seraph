@@ -137,15 +137,14 @@ pub fn parse_header(bytes: &[u8]) -> Result<BundleHeader, BundleError>
     let entries_end = entries_off
         .checked_add(entries_byte_len)
         .ok_or(BundleError::TooSmall)?;
-    if bytes.len() < entries_end
-    {
-        return Err(BundleError::TooSmall);
-    }
 
-    for i in 0..entry_count as usize
+    let entries = bytes
+        .get(entries_off..entries_end)
+        .ok_or(BundleError::TooSmall)?;
+    let (headers, _) = entries.as_chunks::<ENTRY_HEADER_SIZE>();
+    for raw in headers
     {
-        let off = entries_off + i * ENTRY_HEADER_SIZE;
-        let entry = read_entry_header(&bytes[off..off + ENTRY_HEADER_SIZE]);
+        let entry = read_entry_header(raw);
         if !entry.offset.is_multiple_of(BODY_ALIGNMENT)
         {
             return Err(BundleError::EntryMisaligned);
@@ -167,22 +166,22 @@ pub fn parse_header(bytes: &[u8]) -> Result<BundleHeader, BundleError>
 /// any per-entry bounds. Returns the header and the validated entry count.
 fn parse_file_header(bytes: &[u8]) -> Result<(BundleHeader, u32), BundleError>
 {
-    if bytes.len() < HEADER_SIZE
+    let Some((head, _)) = bytes.split_first_chunk::<HEADER_SIZE>()
+    else
     {
         return Err(BundleError::TooSmall);
-    }
-    let mut magic = [0u8; 8];
-    magic.copy_from_slice(&bytes[0..8]);
+    };
+    let [magic @ .., v0, v1, v2, v3, c0, c1, c2, c3] = *head;
     if magic != MAGIC
     {
         return Err(BundleError::BadMagic);
     }
-    let version = read_u32_le(&bytes[8..12]);
+    let version = u32::from_le_bytes([v0, v1, v2, v3]);
     if version != VERSION
     {
         return Err(BundleError::BadVersion);
     }
-    let entry_count = read_u32_le(&bytes[12..16]);
+    let entry_count = u32::from_le_bytes([c0, c1, c2, c3]);
     Ok((
         BundleHeader {
             magic,
@@ -193,55 +192,64 @@ fn parse_file_header(bytes: &[u8]) -> Result<(BundleHeader, u32), BundleError>
     ))
 }
 
-/// Decode one entry header from a 48-byte slice.
-///
-/// The slice MUST be at least [`ENTRY_HEADER_SIZE`] bytes; callers
-/// (including [`parse_header`]) bounds-check before calling.
+/// Decode one entry header from its [`ENTRY_HEADER_SIZE`] on-disk bytes.
 #[must_use]
-pub fn read_entry_header(bytes: &[u8]) -> BundleEntryHeader
+pub fn read_entry_header(bytes: &[u8; ENTRY_HEADER_SIZE]) -> BundleEntryHeader
 {
-    debug_assert!(bytes.len() >= ENTRY_HEADER_SIZE);
-    let mut name = [0u8; ENTRY_NAME_LEN];
-    name.copy_from_slice(&bytes[0..ENTRY_NAME_LEN]);
-    let offset = read_u64_le(&bytes[ENTRY_NAME_LEN..ENTRY_NAME_LEN + 8]);
-    let size = read_u64_le(&bytes[ENTRY_NAME_LEN + 8..ENTRY_NAME_LEN + 16]);
-    BundleEntryHeader { name, offset, size }
+    let [
+        name @ ..,
+        o0,
+        o1,
+        o2,
+        o3,
+        o4,
+        o5,
+        o6,
+        o7,
+        s0,
+        s1,
+        s2,
+        s3,
+        s4,
+        s5,
+        s6,
+        s7,
+    ] = *bytes;
+    BundleEntryHeader {
+        name,
+        offset: u64::from_le_bytes([o0, o1, o2, o3, o4, o5, o6, o7]),
+        size: u64::from_le_bytes([s0, s1, s2, s3, s4, s5, s6, s7]),
+    }
 }
 
-/// Read one entry header by index from a validated bundle slice.
+/// Read one entry header by index from a bundle slice [`parse_header`]
+/// accepted.
 ///
-/// `index` MUST be less than the `entry_count` returned by
-/// [`parse_header`]; an out-of-bounds index panics deterministically via
-/// the inner slice bound (both debug and release).
+/// Returns `None` when the slice holds no valid file header, when `index` is
+/// not below its `entry_count`, or when the slice is too short to hold that
+/// entry header.
 #[must_use]
-pub fn entry_at(bytes: &[u8], index: u32) -> BundleEntryHeader
+pub fn entry_at(bytes: &[u8], index: u32) -> Option<BundleEntryHeader>
 {
-    let off = HEADER_SIZE + (index as usize) * ENTRY_HEADER_SIZE;
-    read_entry_header(&bytes[off..off + ENTRY_HEADER_SIZE])
+    let (_, entry_count) = parse_file_header(bytes).ok()?;
+    if index >= entry_count
+    {
+        return None;
+    }
+    let off = (index as usize)
+        .checked_mul(ENTRY_HEADER_SIZE)?
+        .checked_add(HEADER_SIZE)?;
+    let raw = bytes.get(off..)?.first_chunk::<ENTRY_HEADER_SIZE>()?;
+    Some(read_entry_header(raw))
 }
 
 /// Trim a NUL-padded name to its non-NUL prefix.
 #[must_use]
 pub fn name_str(name: &[u8; ENTRY_NAME_LEN]) -> &[u8]
 {
-    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-    &name[..end]
-}
-
-// ── Internals ────────────────────────────────────────────────────────────────
-
-fn read_u32_le(bytes: &[u8]) -> u32
-{
-    debug_assert!(bytes.len() >= 4);
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-fn read_u64_le(bytes: &[u8]) -> u64
-{
-    debug_assert!(bytes.len() >= 8);
-    u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ])
+    // `split` always yields a first item: the bytes before the first NUL, or
+    // the whole name when it holds none.
+    name.split(|&b| b == 0).next().unwrap_or(name)
 }
 
 #[cfg(test)]
@@ -334,10 +342,42 @@ mod tests
     fn entry_at_decodes_name_offset_size()
     {
         let buf = fixture();
-        let entry = entry_at(&buf, 0);
+        let entry = entry_at(&buf, 0).expect("entry 0");
         assert_eq!(&entry.name[..4], b"init");
         assert_eq!(entry.offset, BODY_ALIGNMENT);
         assert_eq!(entry.size, 5);
+    }
+
+    #[test]
+    fn entry_at_refuses_index_past_entry_count()
+    {
+        let buf = fixture();
+        assert!(entry_at(&buf, 1).is_none());
+        assert!(entry_at(&buf, u32::MAX).is_none());
+    }
+
+    #[test]
+    fn entry_at_refuses_truncated_slice()
+    {
+        let buf = fixture();
+        assert!(entry_at(&buf[..HEADER_SIZE + ENTRY_HEADER_SIZE - 1], 0).is_none());
+        assert!(entry_at(&buf[..HEADER_SIZE - 1], 0).is_none());
+    }
+
+    #[test]
+    fn parse_header_rejects_truncated_entry_table()
+    {
+        let mut buf = fixture();
+        buf[12..16].copy_from_slice(&2u32.to_le_bytes());
+        let short = &buf[..HEADER_SIZE + ENTRY_HEADER_SIZE + 10];
+        assert_eq!(parse_header(short).unwrap_err(), BundleError::TooSmall);
+    }
+
+    #[test]
+    fn name_str_without_nul_is_whole_name()
+    {
+        let name = [b'a'; ENTRY_NAME_LEN];
+        assert_eq!(name_str(&name), &name[..]);
     }
 
     #[test]

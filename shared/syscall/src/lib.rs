@@ -45,28 +45,30 @@ use syscall_abi::{
     SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
     SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
     SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
-    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
-    SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
-    SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
-    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_MEM,
-    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
-    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
-    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT,
+    SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
+    SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
+    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
+    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL,
+    SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK,
+    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
     CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_ASPACE_TERMINAL_FAULT, CAP_INFO_CSPACE_BUDGET,
-    CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE,
-    CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES,
-    CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS,
-    CAP_TAG_MEMORY, EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED,
-    IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL, IRQ_MODE_MASK, MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ,
-    MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ,
-    RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE,
-    RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST,
-    RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
+    CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_IRQ_MSG_ADDRESS,
+    CAP_INFO_IRQ_MSG_DATA, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
+    CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
+    CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
+    EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, IRQ_MODE_ACTIVE_LOW,
+    IRQ_MODE_LEVEL, IRQ_MODE_MASK, MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ, MAP_WRITABLE,
+    MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL,
+    RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE, RIGHTS_EP_GRANT,
+    RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV,
+    RIGHTS_IOPORT_USE, RIGHTS_IRQ_MINT, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
     RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE,
     RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE,
     RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND,
@@ -2126,17 +2128,19 @@ pub fn wait_set_try_wait(ws_cap: u64) -> Result<u64, i64>
 ///
 /// `mode` is the line's trigger and polarity (`IRQ_MODE_LEVEL`,
 /// `IRQ_MODE_ACTIVE_LOW`; 0 is edge-triggered, active-high). Every binding on a
-/// line passes the same mode: the line's first binding records it.
+/// line passes the same mode: the line's first binding records it. A
+/// message-signaled target ([`irq_msg_alloc`]) takes one binding, in mode 0.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid or lacks
 /// Notify rights, `InvalidArgument` if `irq_cap` covers more than one line or
 /// names an id no discovered interrupt controller implements (a GSI no I/O APIC
 /// reports on x86-64, a source past the APLIC's `riscv,num-sources` on RISC-V), if
-/// `mode` sets a bit outside `IRQ_MODE_MASK`, or if it differs from the mode
-/// the line's bindings recorded, or `QuotaExceeded` when the line already holds
-/// 64 bindings or, for its first binding, the controller has no delivery
-/// resource left (x86-64: every device vector is assigned; RISC-V: no CPU's
+/// `mode` sets a bit outside `IRQ_MODE_MASK`, if it differs from the mode
+/// the line's bindings recorded, or if it is not 0 for a message-signaled
+/// target, or `QuotaExceeded` when the line already holds 64 bindings, the
+/// message-signaled target is already bound, or, for its first binding, the controller has no delivery
+/// resource left (x86-64: no CPU has a free device vector; RISC-V: no CPU's
 /// IMSIC file has a free identity).
 #[inline]
 pub fn irq_register(irq_cap: u64, notification_cap: u64, mode: u64) -> Result<(), i64>
@@ -2166,6 +2170,34 @@ pub fn irq_ack(irq_cap: u64) -> Result<(), i64>
     // kernel validates cap and acknowledges its binding, unmasking once none owes.
     let ret = unsafe { syscall2(SYS_IRQ_ACK, irq_cap, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Mint one unbound message-signaled Interrupt capability through `authority`,
+/// an Interrupt capability carrying `RIGHTS_IRQ_MINT`, and return its handle.
+///
+/// The kernel assigns the new capability a delivery target of its own (a CPU
+/// and a vector on `x86_64`, a hart and an IMSIC identity on riscv64), which
+/// is released when the last capability to it is gone. Bind it with
+/// [`irq_register`] (mode 0) and read the address and data its device writes
+/// with [`cap_info`] (`CAP_INFO_IRQ_MSG_ADDRESS`, `CAP_INFO_IRQ_MSG_DATA`). A
+/// caller needing several targets calls once for each.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (`authority` lacks Mint), `QuotaExceeded` (no free
+/// target is left), or an error of the caller's `CSpace` (`OutOfMemory`, a
+/// full `CSpace`).
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub fn irq_msg_alloc(authority: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; authority is a cap handle
+    // as u64; the kernel validates it and inserts the new cap in the caller's
+    // CSpace.
+    let ret = unsafe { syscall2(SYS_IRQ_MSG_ALLOC, authority, 0) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Map `mmio_cap` into `aspace_cap` at virtual address `virt`.

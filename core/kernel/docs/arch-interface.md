@@ -519,9 +519,12 @@ pub unsafe fn init_ap();
 /// when a delivery that raced the unmask marked a binding owing. A delivery marks
 /// its bindings owing and then calls `mask`. So `unmask` must leave its
 /// controller write ordered before the caller's later read, and `mask` must leave
-/// the caller's earlier memory writes ordered before its controller write. On
-/// RISC-V every APLIC write is preceded by `fence w,o`, and `unmask` ends with
-/// `fence o,r`. On x86-64, `mask` and `unmask` both hold `IOAPIC_LOCK`.
+/// the caller's earlier memory writes ordered before its controller write, and
+/// that write before the caller's later memory writes (a delivery's signals and
+/// the drop of its in-flight count), so an unmask that follows them cannot reach
+/// the controller first. On RISC-V every APLIC write is preceded by `fence w,o`,
+/// `mask` ends with `fence o,w`, and `unmask` ends with `fence o,r`. On x86-64,
+/// `mask` and `unmask` both hold `IOAPIC_LOCK`.
 pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);
@@ -529,19 +532,43 @@ pub fn unmask(irq: u32);
 /// Route a device IRQ to a destination CPU in `mode` (the `SYS_IRQ_REGISTER`
 /// trigger and polarity word) and leave it masked at the controller; the
 /// driver unmasks via `SYS_IRQ_ACK`. x86-64 assigns the GSI a device IDT vector
-/// and installs its IOAPIC redirection entry with `mode`'s trigger and polarity
-/// bits; RISC-V assigns the source a target hart and the lowest free identity in
-/// that hart's IMSIC file, and programs its APLIC source mode from `mode` and its
-/// target register from the two. Fails with `irq::RouteError::NoSuchLine` for a
-/// line no discovered controller implements, `Exhausted` when the controller has
-/// no delivery resource left (x86-64: every device vector assigned; RISC-V: no
-/// CPU's IMSIC file has a free identity). Called by
-/// `irq::register` for a line's first binding, under its routing lock.
-pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<(), irq::RouteError>;
-/// Release a routed line: mask it and free what `route_device_irq` assigned (the
-/// x86-64 device vector; the RISC-V IMSIC identity). Called by `irq` when a line's
-/// last binding is removed, under its routing lock.
-pub unsafe fn unroute_device_irq(irq: u32);
+/// of the chosen CPU and installs its IOAPIC redirection entry with `mode`'s
+/// trigger and polarity bits; RISC-V assigns the source a target hart and the
+/// lowest free identity in that hart's IMSIC file, and programs its APLIC source
+/// mode from `mode` and its target register from the two. Returns the CPU and
+/// slot (`irq::Target`), which `irq` keeps for `unroute_device_irq`. Fails with
+/// `irq::RouteError::NoSuchLine` for a line no discovered controller implements,
+/// `Exhausted` when no eligible CPU has a free slot (x86-64: a free device
+/// vector; RISC-V: a free IMSIC identity). Called by `irq::register` for a
+/// line's first binding, under its routing lock.
+pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<irq::Target, irq::RouteError>;
+/// Release a routed line: mask it and free what `route_device_irq` assigned at
+/// `target` (the x86-64 device vector of that CPU; the RISC-V IMSIC identity).
+/// Called by `irq` when a line's last binding is removed, under its routing lock.
+pub unsafe fn unroute_device_irq(irq: u32, target: irq::Target);
+
+/// Slots of one CPU's delivery space a message-signaled target can take (x86-64:
+/// the 217 device vectors; RISC-V: the IMSIC file's identities). Sizes the
+/// routing table's message targets at Phase 5 (`irq::message_capacity`).
+pub fn message_slots_per_cpu() -> u32;
+/// Give message target `id` a slot: the next free one of the next CPU in turn
+/// (`irq::next_target_cpu`) that has one, tagged with `id` so the CPU's dispatch
+/// finds it. On x86-64 only CPUs whose APIC id a compatibility-format message
+/// address names (below `0xFF`) take part. Every slot is enabled at its
+/// controller from boot, so nothing else is programmed. Fails with `Exhausted`
+/// when no eligible CPU has a free slot. Called by `irq::alloc_message` under the
+/// routing lock.
+pub fn alloc_message_target(id: u32) -> Result<irq::Target, irq::RouteError>;
+/// Free message target `id`'s slot `target`. Called by `irq::free_message` under
+/// the routing lock, once no binding and no capability names the target.
+pub fn free_message_target(id: u32, target: irq::Target);
+/// The message a device writes to raise `target`: the physical address (x86-64:
+/// `0xFEE0_0000 | apic_id << 12`, compatibility format; RISC-V: the hart's
+/// supervisor-level IMSIC file, `None` when it has none) and the data (x86-64:
+/// the vector, fixed delivery, edge; RISC-V: the identity). Read by
+/// `SYS_CAP_INFO` (`CAP_INFO_IRQ_MSG_ADDRESS`, `CAP_INFO_IRQ_MSG_DATA`).
+pub fn message_address(target: irq::Target) -> Option<u64>;
+pub fn message_data(target: irq::Target) -> u32;
 /// Number of interrupt lines the discovered controllers implement, which sizes
 /// the `irq` routing table at Phase 5: one past the highest I/O APIC GSI on
 /// x86-64 (capped at `ROOT_IRQ_COUNT`), the APLIC's `riscv,num-sources` plus one on RISC-V.
@@ -561,27 +588,33 @@ pub unsafe fn wait_for_ack(cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>);
 The `wait_for_ack` phases and their windows are specified in
 [scheduling-internals.md](scheduling-internals.md) § IPI Watchdog Ladder.
 
-External-IRQ routing is reached through the `route_device_irq` surface function above; the
-underlying controller programming (`ioapic::route` and the device-vector table on x86-64; the
-APLIC and IMSIC programming of `arch/riscv64/aia.rs` on RISC-V) remains arch-private.
+External-IRQ routing is reached through the `route_device_irq` and message-target surface
+functions above; the underlying controller programming (`ioapic::route` and the per-CPU
+device-vector rows on x86-64; the APLIC and IMSIC programming of `arch/riscv64/aia.rs` on RISC-V)
+remains arch-private. A CPU's slots are shared by the lines routed to it and the message targets
+placed on it, and a device interrupt is resolved to its source against the slots of the CPU that
+takes it (x86-64: `ioapic::source_for_vector` over the current CPU's row; RISC-V: the hart's
+IMSIC identity row).
 
 **Delivery destination.** Each routed line is delivered to one CPU, chosen when the line is
 routed: the boot CPUs in turn, by logical index (`irq::next_target_cpu`), so device
-interrupts spread over the CPUs rather than all landing on the boot CPU. On x86-64 the turn
-skips CPUs whose APIC id is `0xFF` or above: an I/O APIC redirection entry cannot name a wider
+interrupts spread over the CPUs rather than all landing on the boot CPU. A message-signaled
+target takes its CPU the same way at its mint. On x86-64 the turn skips CPUs with no free device
+vector, and CPUs whose APIC id is `0xFF` or above: an I/O APIC redirection entry cannot name a wider
 id in physical destination mode (the kernel programs no interrupt remapping), and `0xFF` is the
-broadcast id, which delivers to every CPU. On RISC-V the turn
+broadcast id, which delivers to every CPU; a compatibility-format message address has the same
+8-bit destination field. On RISC-V the turn
 skips CPUs whose IMSIC file has no free identity, and the line's APLIC source targets an
 identity in the chosen hart's supervisor-level IMSIC file, so exactly one hart takes and
 claims it. The line's first binding chooses the CPU, and the line keeps it while any binding
 remains; a line bound again after its last binding went takes the next CPU in turn.
 
 Per-CPU table allocation that exists on one architecture only (on x86-64 the GDT/TSS, AP IST
-stacks, and NMI-backtrace storage; on RISC-V each CPU's IMSIC identity row, which Phase 5's AIA
-bring-up and every route read, and whose allocation halts the boot when the bootloader reported
-no valid IMSIC) is reached through the `init_ap_percpu_storage` module-level surface function,
-not a `cfg(target_arch)`-gated call. It runs in Phase 4, before Phase 5's interrupt
-initialisation.
+stacks, NMI-backtrace storage, and the device-vector rows; on RISC-V each CPU's IMSIC identity
+row, which Phase 5's AIA bring-up and every route read, and whose allocation halts the boot when
+the bootloader reported no valid IMSIC) is reached through the `init_ap_percpu_storage`
+module-level surface function, not a `cfg(target_arch)`-gated call. It runs in Phase 4, before
+Phase 5's interrupt initialisation.
 
 ---
 

@@ -19,6 +19,8 @@
 //! See [`README.md`](../README.md) for the compliant-bootloader policy and
 //! `core/boot/docs/kernel-handoff.md` for the CPU-state contract at kernel entry.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 pub mod bundle;
@@ -482,11 +484,11 @@ impl FramebufferInfo
         // Parse field-by-field. Constructing a `PixelFormat` whose
         // discriminant is outside its declared variants is UB; validate
         // before materialising the enum.
-        let physical_base = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-        let width = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-        let height = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
-        let stride = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
-        let pf_raw = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
+        let physical_base = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
+        let width = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+        let height = u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?);
+        let stride = u32::from_le_bytes(bytes.get(16..20)?.try_into().ok()?);
+        let pf_raw = u32::from_le_bytes(bytes.get(20..24)?.try_into().ok()?);
         let pixel_format = match pf_raw
         {
             0 => PixelFormat::Rgbx8,
@@ -776,11 +778,12 @@ impl ImsicLayout
         {
             return None;
         }
-        if group > 0 && (!(24..=55).contains(&shift) || shift < 12 + guest + hart)
+        let index_shift = 12u32.checked_add(guest)?;
+        if group > 0 && (!(24..=55).contains(&shift) || shift < index_shift.checked_add(hart)?)
         {
             return None;
         }
-        let index = hart_id & ((1u64 << hart) - 1);
+        let index = hart_id & (1u64 << hart).checked_sub(1)?;
         let group_index = hart_id >> hart;
         if group_index >> group != 0
         {
@@ -789,7 +792,7 @@ impl ImsicLayout
         // At most 7 group bits at a shift of at most 55, and at most 15 index
         // bits at 18 or below: neither term nor their sum overflows.
         let group_offset = if group == 0 { 0 } else { group_index << shift };
-        Some(group_offset + (index << (12 + guest)))
+        group_offset.checked_add(index << index_shift)
     }
 }
 

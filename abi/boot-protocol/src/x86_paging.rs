@@ -126,7 +126,8 @@ impl PagingDepth
     #[must_use]
     pub const fn canonical_user_limit(self) -> u64
     {
-        1 << (self.va_bits() - 1)
+        // `va_bits` is at least 48, so the subtraction cannot saturate.
+        1 << self.va_bits().saturating_sub(1)
     }
 
     /// Exclusive upper bound of user-mappable virtual addresses: the lower
@@ -135,8 +136,18 @@ impl PagingDepth
     #[must_use]
     pub const fn user_va_top(self) -> u64
     {
-        self.canonical_user_limit() - 4096
+        // The limit is at least 2^47, so the subtraction cannot saturate.
+        self.canonical_user_limit().saturating_sub(4096)
     }
+}
+
+/// Lowest VA bit the entries at translation level `level` index: the 12-bit
+/// page offset plus 9 bits per tier below `level`. Every supported level
+/// gives at most 48; a `level` past any paging depth saturates, and a shift
+/// by the result is then out of range as it would be unsaturated.
+const fn level_shift(level: usize) -> usize
+{
+    level.saturating_mul(9).saturating_add(12)
 }
 
 /// Page-table index of `va` at translation level `level`.
@@ -147,7 +158,7 @@ impl PagingDepth
 #[must_use]
 pub const fn table_index(level: usize, va: u64) -> usize
 {
-    ((va >> (12 + 9 * level)) & 0x1FF) as usize
+    ((va >> level_shift(level)) & 0x1FF) as usize
 }
 
 /// Bytes of VA covered by one entry at translation level `level`
@@ -155,7 +166,7 @@ pub const fn table_index(level: usize, va: u64) -> usize
 #[must_use]
 pub const fn level_stride(level: usize) -> u64
 {
-    1 << (12 + 9 * level)
+    1 << level_shift(level)
 }
 
 /// First VA above `va` whose `table_index(level, ..)` differs: the start of
@@ -163,8 +174,10 @@ pub const fn level_stride(level: usize) -> u64
 #[must_use]
 pub const fn next_level_boundary(level: usize, va: u64) -> u64
 {
-    let shift = 12 + 9 * level;
-    ((va >> shift) + 1) << shift
+    // `va >> shift` is below `2^(64 - shift)`, so adding one cannot wrap; the
+    // shift back drops the carry past bit 63 for the last span, giving 0.
+    let shift = level_shift(level);
+    (va >> shift).wrapping_add(1) << shift
 }
 
 #[cfg(test)]

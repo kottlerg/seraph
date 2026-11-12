@@ -613,9 +613,10 @@ pub struct TestDebugPortArgs
     #[arg(long, default_value = "x86_64")]
     pub arch: Arch,
 
-    /// The host TCP port the debug port is served on.
-    #[arg(long, default_value = "4560")]
-    pub port: u16,
+    /// The host TCP port the debug port is served on; without it, a port
+    /// free on `127.0.0.1` when the boot starts.
+    #[arg(long)]
+    pub port: Option<u16>,
 
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
@@ -640,9 +641,10 @@ pub struct TestGdbArgs
     #[arg(long, default_value = "x86_64")]
     pub arch: Arch,
 
-    /// The host TCP port the debug port is served on.
-    #[arg(long, default_value = "4561")]
-    pub port: u16,
+    /// The host TCP port the debug port is served on; without it, a port
+    /// free on `127.0.0.1` when the boot starts.
+    #[arg(long)]
+    pub port: Option<u16>,
 
     /// The host GDB to run (it must debug the architecture).
     #[arg(long, default_value = "gdb")]

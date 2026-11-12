@@ -38,10 +38,14 @@
 //!
 //! # Modification notes
 //! - Device IRQs are routed generically: `SYS_IRQ_REGISTER` (`syscall::hw::sys_irq_register`)
-//!   calls `irq::register`, which calls [`route_device_irq`] (assign a device vector and a
-//!   destination CPU, install the I/O APIC entry masked) and records the Notification;
-//!   clearing the route calls [`unroute_device_irq`]. `SYS_IRQ_ACK`
+//!   calls `irq::register`, which calls [`route_device_irq`] (choose a destination CPU,
+//!   assign a device vector of it, install the I/O APIC entry masked) and records the
+//!   Notification; clearing the route calls [`unroute_device_irq`]. `SYS_IRQ_ACK`
 //!   (`syscall::hw::sys_irq_ack`) calls [`unmask`].
+//! - Message-signaled targets (`SYS_IRQ_MSG_ALLOC`, `irq::alloc_message`) take a device
+//!   vector of a CPU through [`alloc_message_target`] and release it through
+//!   [`free_message_target`]; [`message_address`] and [`message_data`] give the message a
+//!   device writes to raise one.
 
 // cast_possible_truncation: u64→usize/u8 APIC address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector casts are always widening.
@@ -774,76 +778,103 @@ pub fn unmask(irq: u32)
 #[cfg(test)]
 pub fn unmask(_irq: u32) {}
 
-/// Route device IRQ (GSI) `irq`, leaving the line masked at the I/O APIC: assign it a
-/// device vector ([`super::ioapic::assign_vector`]) and a destination CPU, and program its
-/// redirection entry with `mode`'s trigger and polarity (the `SYS_IRQ_REGISTER` word,
-/// validated by the syscall). The driver unmasks via `SYS_IRQ_ACK` once it has registered
-/// a handler. Called by `irq::register` for the GSI's first binding; the route is kept
-/// while any binding remains.
+/// Whether CPU `cpu` (a logical index below `CPU_COUNT`) can take a source: an APIC id
+/// the 8-bit physical destination field of a redirection entry or a compatibility-format
+/// message names (below `0xFF`, the broadcast id; module doc of [`super::ioapic`]
+/// § Destination), and a free device vector.
+#[cfg(not(test))]
+fn can_take_source(cpu: usize) -> bool
+{
+    // SAFETY: `next_target_cpu` passes only indices below CPU_COUNT; the APIC id slab is
+    // read-only after boot.
+    let apic_id = unsafe { crate::percpu::apic_id_for(cpu) };
+    apic_id < super::ioapic::BROADCAST_APIC_ID && super::ioapic::has_free_vector(cpu)
+}
+
+/// Route device IRQ (GSI) `irq`, leaving the line masked at the I/O APIC: choose a
+/// destination CPU, assign the GSI a device vector of that CPU
+/// ([`super::ioapic::assign_vector`]), and program its redirection entry with `mode`'s
+/// trigger and polarity (the `SYS_IRQ_REGISTER` word, validated by the syscall). Returns
+/// the CPU and vector, which `irq` keeps for [`unroute_device_irq`]. The driver unmasks via
+/// `SYS_IRQ_ACK` once it has registered a handler. Called by `irq::register` for the GSI's
+/// first binding; the route is kept while any binding remains.
 ///
 /// The destination is the next CPU in turn (`irq::next_target_cpu`) whose APIC id the
-/// redirection entry's 8-bit physical destination field can name: below `0xFF`, which is
-/// the broadcast id (module doc of [`super::ioapic`] § Destination).
+/// redirection entry's 8-bit physical destination field can name (below `0xFF`, which is
+/// the broadcast id; module doc of [`super::ioapic`] § Destination) and that has a free
+/// device vector.
 ///
 /// # Errors
-/// `NoSuchLine` when no discovered I/O APIC implements the GSI; `Exhausted` when every
-/// device vector is assigned, or no CPU has an APIC id an I/O APIC can name.
+/// `NoSuchLine` when no discovered I/O APIC implements the GSI; `Exhausted` when no CPU
+/// with an APIC id an I/O APIC can name has a free device vector.
 ///
 /// # Safety
 /// Must be called after Phase 5 init (IOAPIC initialised), under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(
+    irq: u32,
+    mode: u32,
+) -> Result<crate::irq::Target, crate::irq::RouteError>
 {
     if !super::ioapic::owns(irq)
     {
         return Err(crate::irq::RouteError::NoSuchLine);
     }
-    let destination = crate::irq::next_target_cpu(|cpu| {
-        // SAFETY: `next_target_cpu` passes only indices below CPU_COUNT; the APIC id
-        // slab is read-only after boot.
-        unsafe { crate::percpu::apic_id_for(cpu) < super::ioapic::BROADCAST_APIC_ID }
-    })
-    .ok_or(crate::irq::RouteError::Exhausted)?;
-    // SAFETY: as above; the id was checked to fit eight bits.
+    let destination =
+        crate::irq::next_target_cpu(can_take_source).ok_or(crate::irq::RouteError::Exhausted)?;
+    // SAFETY: `destination` is below CPU_COUNT (`next_target_cpu`); the id was checked to
+    // fit eight bits.
     let apic_id = unsafe { crate::percpu::apic_id_for(destination) };
     let apic_id = u8::try_from(apic_id).map_err(|_| crate::irq::RouteError::Exhausted)?;
-    let vector = super::ioapic::assign_vector(irq).ok_or(crate::irq::RouteError::Exhausted)?;
+    let vector =
+        super::ioapic::assign_vector(destination, irq).ok_or(crate::irq::RouteError::Exhausted)?;
     // SAFETY: post-Phase-5 IOAPIC; route() installs the redirection entry masked, after
     // the vector assignment is published, and the driver unmasks via SYS_IRQ_ACK.
     unsafe {
         super::ioapic::route(irq, vector, apic_id, mode);
     }
-    Ok(())
+    // The destination is below CPU_COUNT, which fits u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let cpu = destination as u32;
+    Ok(crate::irq::Target {
+        cpu,
+        slot: u32::from(vector),
+    })
 }
 
-/// No-op test stub.
+/// Test stub: routes every line to vector 0 of CPU 0.
 ///
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn route_device_irq(_irq: u32, _mode: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(
+    _irq: u32,
+    _mode: u32,
+) -> Result<crate::irq::Target, crate::irq::RouteError>
 {
-    Ok(())
+    Ok(crate::irq::Target { cpu: 0, slot: 0 })
 }
 
-/// Release GSI `irq`'s route: mask its redirection entry, then free its device vector. An
-/// interrupt already latched on the vector reaches `idt::irq_dispatch` and finds no GSI and
-/// is dropped, unless the vector was reassigned before it was serviced: it then reaches the
-/// new owner as one spurious delivery, which a driver tolerates as it does any interrupt
-/// its device did not raise. Vectors are assigned in turn and the cursor moves past a
-/// released one (`ioapic::assign_vector`), so the next route does not take it while other
-/// vectors are free. On a level-triggered line such a latched delivery also leaves the
-/// entry's Remote IRR set, which stays set when the line is routed again before that
-/// delivery's EOI; `ioapic::route` clears it before the line is programmed again.
+/// Release GSI `irq`'s route to `target` (the CPU and vector [`route_device_irq`]
+/// returned): mask its redirection entry, then free its device vector on that CPU. An
+/// interrupt already latched on the vector reaches `idt::irq_dispatch` and finds no source
+/// and is dropped, unless the vector was reassigned before it was serviced: it then reaches
+/// the new owner as one spurious delivery, which a driver tolerates as it does any
+/// interrupt its device did not raise. A CPU's vectors are assigned in turn and the cursor
+/// moves past a released one (`ioapic::assign_vector`), so the next route to that CPU does
+/// not take it while other vectors are free. On a level-triggered line such a latched
+/// delivery also leaves the entry's Remote IRR set, which stays set when the line is routed
+/// again before that delivery's EOI; `ioapic::route` clears it before the line is
+/// programmed again.
 ///
 /// # Safety
 /// Must be called after Phase 5 init, under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn unroute_device_irq(irq: u32)
+pub unsafe fn unroute_device_irq(irq: u32, target: crate::irq::Target)
 {
     // SAFETY: post-Phase-5 IOAPIC.
     unsafe { super::ioapic::mask(irq) };
-    super::ioapic::release_vector(irq);
+    super::ioapic::release_vector(target.cpu as usize, irq);
 }
 
 /// No-op test stub.
@@ -851,7 +882,82 @@ pub unsafe fn unroute_device_irq(irq: u32)
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn unroute_device_irq(_irq: u32) {}
+pub unsafe fn unroute_device_irq(_irq: u32, _target: crate::irq::Target) {}
+
+/// Slots of one CPU's delivery space a message target can take: its device vectors
+/// ([`super::ioapic::DEVICE_VECTOR_COUNT`], 217). Sizes the routing table's message
+/// targets (`irq::init_table`).
+#[cfg(not(test))]
+#[must_use]
+pub const fn message_slots_per_cpu() -> u32
+{
+    // DEVICE_VECTOR_COUNT is 217, which fits u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let slots = super::ioapic::DEVICE_VECTOR_COUNT as u32;
+    slots
+}
+
+/// Assign message target `id` a device vector: the next free vector of the next CPU in
+/// turn (`irq::next_target_cpu`) whose APIC id a compatibility-format message address can
+/// name and that has a free one ([`super::msi`]). Every device vector is enabled at its
+/// local APIC from boot, so the target is deliverable once the device writes the message
+/// [`message_address`] and [`message_data`] give. Called by `irq::alloc_message` under
+/// `irq`'s routing lock.
+///
+/// # Errors
+/// `Exhausted` when no such CPU has a free device vector.
+#[cfg(not(test))]
+pub fn alloc_message_target(id: u32) -> Result<crate::irq::Target, crate::irq::RouteError>
+{
+    let cpu =
+        crate::irq::next_target_cpu(can_take_source).ok_or(crate::irq::RouteError::Exhausted)?;
+    let vector = super::ioapic::assign_vector(cpu, id).ok_or(crate::irq::RouteError::Exhausted)?;
+    // The CPU is below CPU_COUNT, which fits u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let cpu = cpu as u32;
+    Ok(crate::irq::Target {
+        cpu,
+        slot: u32::from(vector),
+    })
+}
+
+/// Free message target `id`'s device vector on `target`'s CPU. A message the device sends
+/// after this reaches `idt::irq_dispatch`, finds the vector free and is dropped, or reaches
+/// a later owner of the vector once, as for an unrouted line ([`unroute_device_irq`]).
+/// Called by `irq::free_message` under `irq`'s routing lock.
+#[cfg(not(test))]
+pub fn free_message_target(id: u32, target: crate::irq::Target)
+{
+    super::ioapic::release_vector(target.cpu as usize, id);
+}
+
+/// The compatibility-format message address that delivers to `target`'s CPU
+/// ([`super::msi::address`]), or `None` when the CPU index is past the boot CPUs or its APIC
+/// id has no such address.
+#[cfg(not(test))]
+#[must_use]
+pub fn message_address(target: crate::irq::Target) -> Option<u64>
+{
+    let cpu = target.cpu as usize;
+    if cpu >= crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
+    {
+        return None;
+    }
+    // SAFETY: `cpu` is below CPU_COUNT; the APIC id slab is read-only after boot.
+    let apic_id = unsafe { crate::percpu::apic_id_for(cpu) };
+    super::msi::address(apic_id)
+}
+
+/// The message data that raises `target`'s vector ([`super::msi::data`]).
+#[cfg(not(test))]
+#[must_use]
+pub fn message_data(target: crate::irq::Target) -> u32
+{
+    // A device vector is below 256 (`ioapic::DEVICE_VECTOR_LAST`).
+    #[allow(clippy::cast_possible_truncation)]
+    let vector = target.slot as u8;
+    super::msi::data(vector)
+}
 
 /// Number of interrupt lines the routing table covers: one past the highest GSI the
 /// discovered I/O APICs implement (`ioapic::gsi_limit`). Valid after [`init`].

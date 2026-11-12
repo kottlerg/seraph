@@ -204,9 +204,10 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  59  SYS_THREAD_SET_UPCALL_MASK
                                  60  SYS_THREAD_READ_MEM
                                  61  SYS_THREAD_WRITE_MEM
+                                 62  SYS_IRQ_MSG_ALLOC
 ```
 
-**Implementation status.** Every number 0–61 has a handler; unallocated numbers
+**Implementation status.** Every number 0–62 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -1140,6 +1141,17 @@ the outcome back here. The kernel records the reason before it commits the fault
 `Exited` state, and posts it to the observers after, so a holder that has read a thread of the space
 `Exited` by a terminal fault (`CAP_INFO_THREAD_STATE`) reads a non-zero reason here.
 
+`CAP_INFO_IRQ_MSG_ADDRESS` (15) and `CAP_INFO_IRQ_MSG_DATA` (16) return, for an Interrupt cap
+naming a message-signaled target (§ `SYS_IRQ_MSG_ALLOC`), the message a device writes to raise it:
+the physical address and the 32-bit data word a driver programs into the device's MSI capability
+or MSI-X table entry. On x86-64 the address is the target CPU's compatibility-format local APIC
+address (`0xFEE0_0000 | apic_id << 12`, physical destination, no redirection hint) and the data
+its vector (fixed delivery, edge-triggered); on RISC-V the address is the target hart's
+supervisor-level IMSIC interrupt file and the data the interrupt identity, written to the file's
+`seteipnum_le` register. The address is an interrupt controller's, never RAM
+([cross-boundary-disclosure.md](cross-boundary-disclosure.md)), so holding the cap answers it.
+An Interrupt cap naming a wired line, or a range, answers `InvalidArgument`.
+
 **Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which
 needs the Memory `Phys` right on the queried cap or the credential; `cap_info` otherwise reads
 the slot without a rights check.
@@ -1148,8 +1160,9 @@ the slot without a rights check.
 object is gone, or a `CAP_INFO_MEMORY_PHYS_BASE` credential that is not a live Memory cap),
 `InsufficientRights` (`CAP_INFO_MEMORY_PHYS_BASE` with neither the queried cap nor the
 credential carrying `Phys`), `InvalidArgument` (field requires a different capability type, the
-selector is unknown, or a `CAP_INFO_MEMORY_MAPPINGS` window is empty, longer than
-`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages, or runs past the region).
+selector is unknown, a `CAP_INFO_MEMORY_MAPPINGS` window is empty, longer than
+`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages, or runs past the region, or a
+`CAP_INFO_IRQ_MSG_ADDRESS` or `CAP_INFO_IRQ_MSG_DATA` cap names no message-signaled target).
 
 ---
 
@@ -2376,7 +2389,8 @@ idempotent: a repeated one, or one with no delivery since the last (a driver's t
 acknowledgement), clears nothing and unmasks only when no binding owes; with a single binding
 on the line it unmasks whether or not an interrupt has been delivered since. Through an object
 with no binding (never registered, or its binding removed with its Notification) the call
-changes nothing and returns 0.
+changes nothing and returns 0. A message-signaled target (§ `SYS_IRQ_MSG_ALLOC`) is never masked,
+so through its capability the call changes nothing and returns 0.
 
 **Capability requirement:** `irq_cap` MUST be a valid interrupt capability for the
 specific line.
@@ -2412,8 +2426,10 @@ through their own capability.
   `mode` and routes the line at its controller in it, to one CPU, the next in turn
   ([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked; the routing and
   the mode are kept while any binding remains, so every receiver on the line is signalled from
-  that CPU. A later binding must pass the recorded mode, and masks the line. Every new binding
-  owes an acknowledgement, so the line stays masked until its receiver's first `SYS_IRQ_ACK`.
+  that CPU. The call returns once no delivery that found the line unbound is still in flight, so
+  its mask cannot land after the receiver's first `SYS_IRQ_ACK`. A later binding must pass the
+  recorded mode, and masks the line. Every new binding owes an acknowledgement, so the line stays
+  masked until its receiver's first `SYS_IRQ_ACK`.
 - **Rebind.** Through an object already bound, the call, which must pass the line's recorded mode,
   rebinds that binding to `notification_cap`'s notification, keeping whether it owes an
   acknowledgement and leaving the line's mask as it is, and returns once no delivery to the
@@ -2431,6 +2447,14 @@ through their own capability.
   the line. The line is then unmasked if bindings remain and none owes, so a receiver that goes
   cannot hold a shared line masked, and released at its controller when no binding remains; the
   release forgets the mode, so the line's next first binding records its own.
+
+A message-signaled target (§ `SYS_IRQ_MSG_ALLOC`) binds through the same call with three
+differences. Its CPU and slot were taken at its mint, so its first binding routes nothing. It
+takes one binding, in mode 0 (a device's message is an edge). It is never masked: each message
+ORs bit 0 into the bound notification and completes at the local APIC (x86-64) or needs no
+completion (the IMSIC claim, RISC-V), and its `SYS_IRQ_ACK` changes nothing; a driver that must
+hold its device's messages off masks them at the device (the MSI-X vector control bit). Removing
+its binding frees no slot: the target stays the capability's until the capability is gone.
 
 On x86-64 the line's I/O APIC redirection entry is programmed with the recorded mode: bit 15 set
 for level-triggered, bit 13 for active-low. A level-triggered entry whose device still asserts at
@@ -2452,12 +2476,15 @@ interrupt controller implements: on x86-64 a GSI no I/O APIC reports, where the 
 Interrupt cap spans 32768 GSIs; on RISC-V a source outside the APLIC's reported
 `1..=riscv,num-sources`, where the root Interrupt cap spans the APLIC's 1024-id space; see
 [arch-interface.md](arch-interface.md) § Module-level constants and free functions; or `mode`
-sets a bit outside `IRQ_MODE_MASK`, or differs from the mode the line's bindings recorded),
-`QuotaExceeded` (the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; or,
-for the line's first binding on x86-64, every device IDT vector, 217 of them, is assigned to
-another routed GSI; a vector is freed when its line's last binding is removed; or, for the line's
-first binding on RISC-V, no CPU's IMSIC file has a free interrupt identity; an identity is freed
-when its line's last binding is removed). Nothing changes on an error.
+sets a bit outside `IRQ_MODE_MASK`, differs from the mode the line's bindings recorded, or is
+not 0 for a message-signaled target),
+`QuotaExceeded` (the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; a
+message-signaled target already holds its one binding, through another object; or, for the
+line's first binding on x86-64, no CPU whose APIC id an I/O APIC can name has a free device IDT
+vector, each CPU having 217, shared with the message-signaled targets on it; a vector is freed
+when its line's last binding is removed; or, for the line's first binding on RISC-V, no CPU's
+IMSIC file has a free interrupt identity; an identity is freed when its line's last binding is
+removed). Nothing changes on an error.
 
 ---
 
@@ -2571,6 +2598,54 @@ Original revalidation, batched re-linking, `InvalidState`, and `Interrupted`: as
 `InvalidArgument` (`split_at` 0, `> 0xFFFF`, or outside `(base, base+size)`), `InvalidCapability`,
 `InsufficientRights` (cap lacks Use), `OutOfMemory` (the caller's `CSpace` pool cannot back the
 children's bodies or slots), `QuotaExceeded` (caller's CSpace directory structurally full).
+
+---
+
+### `SYS_IRQ_MSG_ALLOC` (62)
+
+Mint one message-signaled Interrupt capability: a delivery target a device raises by writing a
+message (MSI or MSI-X) rather than by asserting a wired line.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `authority_cap` | Interrupt capability carrying `RIGHTS_IRQ_MINT` |
+
+**Return:** `rax`/`a0`: the new capability's handle on success; `SyscallError` on failure.
+
+The kernel takes a free message-signaled target: a source id past every wired line, and a slot of
+the next CPU in turn that has a free one ([arch-interface.md](arch-interface.md) § `interrupts`).
+On x86-64 the slot is a device IDT vector of a CPU whose APIC id is below `0xFF`, the widest a
+compatibility-format message address names (interrupt remapping is not implemented); on RISC-V it
+is an interrupt identity in the hart's supervisor-level IMSIC file. Wired lines take their slots
+from the same spaces. The call inserts into the caller's `CSpace` an Interrupt capability over
+that one id, unbound, carrying `RIGHTS_IRQ_NOTIFY` only, as a derivation child of
+`authority_cap`, so revoking the authority deletes it.
+
+The holder reads the message through `SYS_CAP_INFO` (`CAP_INFO_IRQ_MSG_ADDRESS`,
+`CAP_INFO_IRQ_MSG_DATA`), programs it into its device, and binds the capability with
+`SYS_IRQ_REGISTER` in mode 0 (§ `SYS_IRQ_REGISTER` for how a message-signaled target delivers).
+A copy of the capability names the same target. The target is held from the mint until neither
+the capability nor any copy of it remains, whether or not it is bound, and is then free for a
+later mint.
+
+One call mints one target; a caller needing K targets (a device with K MSI-X vectors) calls K
+times. The table holds at most `message_capacity` targets: one per slot of every CPU's delivery
+space, capped at `MAX_MESSAGE_TARGETS` (16384; [docs/limits.md](../../../docs/limits.md)).
+
+The kernel mints the root Interrupt capability with `RIGHTS_IRQ_MINT`
+([capability-model.md](../../../docs/capability-model.md) § Interrupt); a minted capability does
+not carry it.
+
+**Capability requirement:** `authority_cap` must be an Interrupt capability with Mint rights.
+
+**Errors:** `InvalidCapability` (`authority_cap` names no Interrupt capability),
+`InsufficientRights` (it lacks Mint), `QuotaExceeded` (no target is free: the table's targets are
+all minted, or no eligible CPU has a free slot; or the caller's `CSpace` directory is structurally
+full), `OutOfMemory` (the caller's `CSpace` pool cannot back the capability's body or slot),
+`InvalidState` (the authority's slot is held by an in-flight revoke, move, or transfer). Nothing
+changes on an error.
 
 ---
 

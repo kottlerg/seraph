@@ -17,6 +17,8 @@
 //!
 //! `no_std`, no allocation, no dependencies; RV64GC encodings.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 /// `c.ebreak` (0x9002), little-endian: the breakpoint a debugger plants at the
@@ -118,13 +120,20 @@ fn read(reg: &impl Fn(u32) -> u64, n: u32) -> u64
 /// Bits `hi..=lo` of `x`, shifted down.
 fn bits(x: u32, hi: u32, lo: u32) -> u32
 {
-    (x >> lo) & ((1 << (hi - lo + 1)) - 1)
+    // Every caller passes a constant field with `lo <= hi < 32`; a 32-bit
+    // field takes the whole word.
+    let width = hi.saturating_sub(lo).saturating_add(1);
+    let mask = 1u32
+        .checked_shl(width)
+        .map_or(u32::MAX, |bit| bit.saturating_sub(1));
+    (x >> lo) & mask
 }
 
 /// `value`, a `width`-bit two's-complement number, sign-extended.
 fn sext(value: u32, width: u32) -> i64
 {
-    let shift = 64 - width;
+    // Every caller passes a width of at most 64.
+    let shift = 64u32.saturating_sub(width);
     (i64::from(value) << shift) >> shift
 }
 
@@ -229,7 +238,8 @@ fn compressed_successor(pc: u64, h: u16, reg: &impl Fn(u32) -> u64) -> Result<u6
                 | (bits(h, 6, 5) << 6)
                 | (bits(h, 4, 3) << 1)
                 | (bits(h, 2, 2) << 5);
-            let zero = read(reg, 8 + bits(h, 9, 7)) == 0;
+            // The 3-bit field names x8..=x15: bit 3 set, the field below it.
+            let zero = read(reg, 8 | bits(h, 9, 7)) == 0;
             let taken = if funct3 == 0b110 { zero } else { !zero };
             Ok(
                 if taken

@@ -1969,11 +1969,13 @@ fn populate_cspace(
     // 96). Sizing the root at the id space is safe because
     // `SYS_IRQ_REGISTER` refuses an id no discovered controller implements and
     // the routing table ignores one past its discovered size (see
-    // `ROOT_IRQ_COUNT` above).
+    // `ROOT_IRQ_COUNT` above). It also carries MINT, the authority to mint
+    // message-signaled targets (`SYS_IRQ_MSG_ALLOC`), whose ids lie past the
+    // range.
     let irq_ptr = mint_phase7_body(InterruptObject::new_root(0, ROOT_IRQ_COUNT));
     let irq_range_slot = insert_or_fatal(
         cspace,
-        IrqRights::NOTIFY,
+        IrqRights::NOTIFY | IrqRights::MINT,
         irq_ptr,
         "Phase 7: cannot allocate root Interrupt range capability",
     );

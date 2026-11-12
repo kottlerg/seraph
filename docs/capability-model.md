@@ -207,6 +207,7 @@ A capability to a contiguous range of hardware interrupt lines (a range authorit
 narrowed with `SYS_IRQ_SPLIT`). Rights:
 - **Notify** — may register, acknowledge, and split (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`,
   `SYS_IRQ_SPLIT`); register and acknowledge require a single-line cap
+- **Mint** — may mint a message-signaled Interrupt capability (`SYS_IRQ_MSG_ALLOC`)
 
 The holder binds a Notification to the line with `SYS_IRQ_REGISTER`, passing the line's
 trigger and polarity mode, which every binding on the line shares; each interrupt ORs bit 0
@@ -226,8 +227,22 @@ specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § 
 and § `SYS_IRQ_ACK`.
 
 The kernel mints one root Interrupt range capability at boot that covers every IRQ id on the
-architecture and places it in init's CSpace. Init keeps the root and hands devmgr a full-rights
-derivation, from which devmgr splits single-line children with `SYS_IRQ_SPLIT` for the drivers.
+architecture, with Notify and Mint rights, and places it in init's CSpace. Init keeps the root and
+hands devmgr a full-rights derivation, from which devmgr splits single-line children with
+`SYS_IRQ_SPLIT` for the drivers. devmgr attenuates the capabilities it gives drivers to Notify
+only, so no driver holds Mint.
+
+`SYS_IRQ_MSG_ALLOC` mints, through an Interrupt capability carrying Mint, one unbound
+message-signaled Interrupt capability. It names one source id past every wired line and carries
+Notify only, never Mint. It is a derivation child of the authority, so revoking the authority
+deletes it. Its target is a delivery slot of one CPU: a device vector on x86-64, an interrupt
+identity in a hart's IMSIC file on riscv64. The holder reads the message address and data with
+`SYS_CAP_INFO` (`CAP_INFO_IRQ_MSG_ADDRESS`, `CAP_INFO_IRQ_MSG_DATA`), programs them into the
+device's MSI or MSI-X entry, and binds with `SYS_IRQ_REGISTER` (mode 0, one binding only). The
+kernel never masks a message target, and `SYS_IRQ_ACK` on it changes nothing: masking is the
+device's. The target is freed for a later mint once neither the capability nor any copy of it
+remains. The call's semantics are specified in
+[core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_IRQ_MSG_ALLOC`.
 
 ### Mmio
 
@@ -845,7 +860,8 @@ The kernel mints these during Phases 7–9 of
 - Memory capabilities for all usable physical memory
 - Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry Phase 6 validates,
   plus one over the kernel console UART on RISC-V
-- One root Interrupt range capability covering every valid IRQ id on the architecture
+- One root Interrupt range capability (Notify and Mint) covering every valid IRQ id on the
+  architecture
 - Map-only Memory capabilities over each `AcpiReclaimable` memory-map region, the page
   holding `BootInfo.acpi_rsdp`, and the `BootInfo.device_tree` blob, allowing userspace
   to parse ACPI or Device Tree data

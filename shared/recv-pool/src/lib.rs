@@ -18,6 +18,8 @@
 //!
 //! The crate spawns `std` threads, so it compiles only for seraph.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg(target_os = "seraph")]
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -170,7 +172,7 @@ where
     pub fn spawn(&self, name: &str, count: usize) -> Result<usize, SpawnError>
     {
         let mut failed = None;
-        let mut running = 0;
+        let mut running: usize = 0;
         for i in 0..count
         {
             let shared = Arc::clone(&self.shared);
@@ -180,8 +182,11 @@ where
             {
                 Ok(_) =>
                 {
-                    running += 1;
-                    self.lock_gate().spawned += 1;
+                    // Both count threads of this one spawn loop, so neither
+                    // saturates.
+                    running = running.saturating_add(1);
+                    let mut gate = self.lock_gate();
+                    gate.spawned = gate.spawned.saturating_add(1);
                 }
                 Err(error) =>
                 {
@@ -237,7 +242,9 @@ where
     H: Fn(&IpcMessage, IpcBuf),
 {
     let mut gate = shared.gate.lock().unwrap_or_else(PoisonError::into_inner);
-    gate.started += 1;
+    // `started` counts the threads of one spawn loop, so it does not
+    // saturate.
+    gate.started = gate.started.saturating_add(1);
     shared.changed.notify_all();
     while !gate.open
     {

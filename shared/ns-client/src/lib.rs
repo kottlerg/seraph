@@ -22,6 +22,8 @@
 //! returned cap carries at most `requested_rights` on every bit. `0xFFFF`
 //! requests everything the caller is allowed.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 use ipc::{IpcMessage, ns_labels};
@@ -140,10 +142,10 @@ unsafe fn walk(
     let mut size_hint: u64 = 0;
     // Counts hops only to detect an empty path; it cannot exceed the number
     // of components in `path`.
-    let mut hop_count: usize = 0;
+    let mut walked = false;
 
-    let mut iter = PathComponents::new(path);
-    while let Some(name) = iter.next_component()
+    // Components split on `/`, skipping empty segments.
+    for name in path.split(|&b| b == b'/').filter(|c| !c.is_empty())
     {
         // 255 is `namespace_protocol::MAX_NAME_LEN`, the per-component limit
         // the server enforces; a longer name cannot resolve.
@@ -208,10 +210,10 @@ unsafe fn walk(
         }
         current_cap = next_cap;
         current_owns = true;
-        hop_count += 1;
+        walked = true;
     }
 
-    if hop_count == 0
+    if !walked
     {
         // Empty path — `current_cap` is still the input `root_cap` and
         // not owned. Refuse rather than handing the caller someone
@@ -224,37 +226,4 @@ unsafe fn walk(
         kind: last_kind,
         size: size_hint,
     })
-}
-
-/// Lazy iterator over path components (split on `/`, skipping empty segments).
-struct PathComponents<'a>
-{
-    bytes: &'a [u8],
-    cursor: usize,
-}
-
-impl<'a> PathComponents<'a>
-{
-    fn new(bytes: &'a [u8]) -> Self
-    {
-        Self { bytes, cursor: 0 }
-    }
-
-    fn next_component(&mut self) -> Option<&'a [u8]>
-    {
-        while self.cursor < self.bytes.len() && self.bytes[self.cursor] == b'/'
-        {
-            self.cursor += 1;
-        }
-        if self.cursor >= self.bytes.len()
-        {
-            return None;
-        }
-        let start = self.cursor;
-        while self.cursor < self.bytes.len() && self.bytes[self.cursor] != b'/'
-        {
-            self.cursor += 1;
-        }
-        Some(&self.bytes[start..self.cursor])
-    }
 }

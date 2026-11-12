@@ -23,9 +23,6 @@ that delivers the resource list (§ Binding), and withdraws a bound driver in th
 - the IOMMU driver's delivery: devmgr binds it by its family record but gives it its own
   bootstrap rounds rather than the resource list
   ([#938](https://github.com/kottlerg/seraph/issues/938));
-- message-signaled vectors: a PCI function's driver is given its wired line only, though the
-  kernel mints message-signaled targets
-  ([#325](https://github.com/kottlerg/seraph/issues/325));
 - the hotplug event path (§ Hotplug, [#939](https://github.com/kottlerg/seraph/issues/939)).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
@@ -105,9 +102,11 @@ A record carries the device's resources, typed:
 
 The interrupt resource is never one GSI: a record states its kind and a count, so a function
 that offers several message-signaled vectors is described as such, and the binding delivers one
-capability per vector it grants. The kernel mints message-signaled targets
-(`SYS_IRQ_MSG_ALLOC`); devmgr's allocation of them to drivers and its programming of a device's
-MSI capability are [#325](https://github.com/kottlerg/seraph/issues/325).
+capability per vector it grants. devmgr mints a message-signaled target per vector
+(`SYS_IRQ_MSG_ALLOC`) and programs the function's MSI or MSI-X capability, for a declaration that
+asks for vectors and for DMA
+([device-management.md](device-management.md#message-signaled-interrupts) § Message-Signaled
+Interrupts).
 
 ### Platform Description Tables
 
@@ -151,7 +150,7 @@ describes, and a signature over the binary would cover its declaration with it.
 | Match entries | One or more keys of § Device Records: a PCI vendor and device, or a PCI class, subclass, and programming interface under a mask; an ACPI `_HID` or `_CID`; an SPCR interface type; a platform key; an IOMMU family key; the `boot-framebuffer` key |
 | Class | The name of the device class the driver serves (§ Device Classes) |
 | Instance limit | The most devices of its match the driver is bound to; absent means every one |
-| Interrupt need | None, optional, or required, and for a message-signaled capable driver the vector count it requests |
+| Interrupt need | None, optional, or required, and for a message-signaled capable driver the vector count it requests, given only beside DMA ([device-management.md](device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
 | DMA | Whether the device performs DMA: the driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD` and given a DMA capability ([device-management.md](device-management.md#dma-authorisation) § DMA Authorisation) |
 | DMA address width | Optional, valid only beside DMA: the address bits the device's DMA reaches, 12 to 64; absent means the device has no limit of its own. devmgr limits the device's IOVA space to the smaller of this and its unit's width (§ Declaration Bounds) |
 | Physical access | Whether the driver programs hardware with physical addresses: it is then created `CREATE_PHYS_ACCESS` ([device-management.md](device-management.md#physical-addresses) § Physical Addresses). Accepted only for an IOMMU record (§ Declaration Bounds) |
@@ -259,17 +258,21 @@ devmgr is its only consumer, over `ipc::iommu_labels`; it serves no device class
 at `BIND_DRIVERS`, and for a hot-added device:
 
 1. Carve one capability per resource of the record the declaration needs: each `Mmio` from
-   the apertures, each `IoPort` from devmgr's port capability, the interrupt capabilities the
-   declaration's need and the record's kind allow, and keep the `Config` page.
+   the apertures and each `IoPort` from devmgr's port capability, and keep the `Config` page.
 2. For a DMA declaration, give the device its DMA grant, confining it where an IOMMU unit
    translates it.
-3. Create the driver through procmgr with the flags and priority its declaration implies,
+3. Give the interrupt capabilities the declaration's need and the record's kind allow: a PCI
+   function's message-signaled vectors or its wired line
+   ([device-management.md](device-management.md#message-signaled-interrupts) § Message-Signaled
+   Interrupts), after the DMA grant, since on riscv64 a vector's interrupt file is mapped into the
+   device's IOMMU domain before the function may signal it.
+4. Create the driver through procmgr with the flags and priority its declaration implies,
    within § Declaration Bounds, from its boot module or its file.
-4. Deliver the capabilities over the bootstrap protocol as a self-describing resource list:
+5. Deliver the capabilities over the bootstrap protocol as a self-describing resource list:
    each capability with its resource kind and its fields, then the service endpoint, the
    devmgr query capability, and the DMA capability. One delivery shape serves every driver
    that binds to a PCI or platform record; the IOMMU driver takes its own bootstrap rounds.
-5. Record the driver in the pass's settle batch; the settle, the serving of ready drivers, and
+6. Record the driver in the pass's settle batch; the settle, the serving of ready drivers, and
    the withdrawal of the rest are unchanged
    ([responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
    § Responsibilities).
@@ -285,7 +288,9 @@ driver runs three steps in order:
 
 1. the DMA and Bus Master Enable steps that apply to every DMA-capable device;
 2. for a PCI function, setting the Interrupt Disable bit of its Command register through the
-   kept `Config` page, so the function stops asserting its wired line whoever else shares it;
+   kept `Config` page, so the function stops asserting its wired line whoever else shares it,
+   and clearing its MSI Enable and MSI-X Enable, so it signals none of its message-signaled
+   targets;
 3. the reset the declaration names.
 
 ---

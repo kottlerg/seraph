@@ -334,11 +334,10 @@ translate a write to the interrupt range through a domain's tables (interrupt re
 it), so `iommu-vtd` refuses `MAP_MSI`. On riscv64 the write goes to a hart's IMSIC interrupt file
 and the RISC-V IOMMU translates it as any other DMA, so a confined device reaches only the files
 its domain maps: `MAP_MSI` maps one file's page at its own address, with no cap, for the domain's
-life, as `MAP_RESERVED` does a reserved range. devmgr is to map the file of each hart a device's
-interrupt targets sit on (design intent; not yet implemented, since devmgr gives no driver a
-message-signalled interrupt yet,
-[#325](https://github.com/kottlerg/seraph/issues/325)). Why the RISC-V IOMMU's MSI page tables
-stay off is specified in
+life, as `MAP_RESERVED` does a reserved range. devmgr maps the file of each hart a device's
+message-signalled targets sit on before it enables the device's MSI or MSI-X, and keeps the file's
+page out of the IOVAs it gives the device's mappings (§ Message-Signaled Interrupts). Why the RISC-V
+IOMMU's MSI page tables stay off is specified in
 [services/drivers/iommu/riscv/README.md](../services/drivers/iommu/riscv/README.md#msi-confinement)
 § MSI Confinement.
 
@@ -364,8 +363,9 @@ device.
 
 When devmgr binds a DMA-capable driver, it spawns the driver
 with `procmgr_labels::CREATE_PINNED`, so the driver's memory is eager-mapped,
-and delivers its resource list (BAR `Mmio` caps, the wired line when the declaration takes an
-interrupt), endpoint caps, and DMA
+and delivers its resource list (BAR `Mmio` caps and, when the declaration takes an interrupt,
+its message-signaled vectors or its wired line, § Message-Signaled Interrupts), endpoint caps, and
+DMA
 capability (§ DMA Authorisation). With no IOMMU confining the device the physical
 isolation is absent, and devmgr runs the device unconfined (§ DMA Safety
 Model); the kernel is agnostic to both outcomes.
@@ -394,10 +394,11 @@ address).
 
 ## Interrupt Delivery
 
-Implementation status: the kernel's binding mechanism below, its trigger and polarity mode, and
-devmgr's sharing of a line among the devices on it, and the kernel's minting of message-signaled
-targets are implemented; devmgr's allocation of those targets to drivers is design intent
-(below).
+Implementation status: the kernel's binding mechanism below, its trigger and polarity mode,
+devmgr's sharing of a line among the devices on it, the kernel's minting of message-signaled
+targets, and devmgr's giving of them to drivers (§ Message-Signaled Interrupts) are implemented;
+VT-d interrupt remapping is design intent
+([#325](https://github.com/kottlerg/seraph/issues/325)).
 
 A driver receives a wired interrupt line as a single-line `Interrupt` cap and binds it to a
 Notification with `SYS_IRQ_REGISTER`. The kernel models each wired line as a source with up to
@@ -467,16 +468,8 @@ holds it high raises no new edge, and the device stays asserted until its interr
 so no later assertion on the line raises one either. The VirtIO interrupt-service thread's timed
 read (`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the driver's timed poll
 finds its completion meanwhile (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
-`POLL_INTERVAL_MS`, virtio-console's `TX_POLL_MS`), so the loss is latency, not a hang. Devices
-that need several interrupts are to get message-signaled ones as further sources beside the wired
-ones. The kernel half exists: `SYS_IRQ_MSG_ALLOC` mints an unbound message-signaled Interrupt cap
-through a cap carrying `RIGHTS_IRQ_MINT`, and its holder reads the message address and data with
-`SYS_CAP_INFO` and programs them into the device's MSI or MSI-X entry. devmgr does not yet allocate
-message targets for drivers, program a device's MSI capability, or map into a confined device's
-domain the IMSIC files of the harts its targets sit on (`MAP_MSI`,
-[IOMMU Discovery and Programming](#iommu-discovery-and-programming)), without which a device behind
-the RISC-V IOMMU reaches no interrupt file; VT-d interrupt remapping is not done
-([#325](https://github.com/kottlerg/seraph/issues/325)). Drivers still use wired lines.
+`POLL_INTERVAL_MS`, virtio-console's `TX_POLL_MS`), so the loss is latency, not a hang. A device
+whose driver asks for message-signaled vectors gets them in place of its wired line (below).
 The kernel delivers each routed line to one CPU, chosen when the line is first bound by taking the
 CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 only CPUs whose
 APIC id an I/O APIC can name (below `0xFF`, the broadcast id) take part. Each x86-64 CPU has its
@@ -484,6 +477,60 @@ own 217 device vectors, shared by the routed lines and the message targets on th
 or mint fails only when no eligible CPU has a free vector; on riscv64 a hart's IMSIC identities are
 shared the same way by routed APLIC sources and message targets. The mechanism is specified
 in [core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md) § `interrupts`.
+
+### Message-Signaled Interrupts
+
+A PCI function signals a message-signaled interrupt by writing its message, an address and a data
+value, to memory as a bus master, and devmgr sets a function's Bus Master Enable only for a
+declaration that asks for DMA
+([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md) step 3).
+devmgr therefore gives a driver's function its interrupt by this rule
+(`firmware::pci::interrupt_plan`):
+
+- A declaration that asks for message-signaled vectors (an interrupt need with a nonzero vector
+  count, [driver-binding.md](driver-binding.md#driver-declarations) § Driver Declarations) and for
+  DMA gets MSI-X when the function has the capability, as many vectors as it asks for up to the
+  function's table size, table entries 0 onwards; else MSI, one vector; else the function's wired
+  line.
+- A declaration that asks for no vectors, or does not ask for DMA, gets the function's wired line
+  whatever capabilities the function has.
+- A function with neither a wired line (its Interrupt Pin is 0, or devmgr finds no line for it)
+  nor a message-signaled vector it can be given gets no interrupt: its driver is bound without one
+  when its need is optional and not bound when its need is required. A declaration that does not
+  ask for DMA is always such a case on a function with no wired line.
+
+MSI is given one vector whatever the function supports: the kernel mints each target on a CPU of
+its own choosing, and the several vectors of multi-message MSI need consecutive data values to
+one address, which separate targets do not have.
+
+For each vector devmgr mints a target with `SYS_IRQ_MSG_ALLOC`, through a copy of its interrupt
+range cap carrying `RIGHTS_IRQ_MINT`, and reads the target's message with `SYS_CAP_INFO`. For MSI it
+checks that the message fits the function's capability (an address below 4 GiB for a 32-bit
+capability, and 16 bits of data) before any interrupt file is mapped. On riscv64, where the RISC-V
+IOMMU translates the device's writes, it then maps the interrupt file each target sits on into the
+device's domain (`MAP_MSI`, § IOMMU Discovery and Programming); on x86-64 VT-d does not translate a
+write to the interrupt range (below). For MSI devmgr writes the message into the function's MSI
+capability, unmasks its vector where the function masks per vector, and enables MSI with one vector.
+For MSI-X it delivers the BARs that hold the function's table and Pending Bit Array, whole when no
+BAR the driver is already given covers them, sets MSI-X Enable with every table entry masked, and
+leaves the driver to write each entry's message, read from the entry's `Interrupt` cap with
+`SYS_CAP_INFO`, and unmask it. devmgr sets the function's Interrupt Disable in both cases. Each
+vector is one `Interrupt` resource, whose copy carries `RIGHTS_IRQ_NOTIFY` only and which the driver
+binds with `SYS_IRQ_REGISTER` in mode 0. A step that fails at the bind (a mint, a message that does
+not fit, an interrupt file, a table BAR, the configuration page) falls back: MSI-X to MSI when the
+function has it, else to the wired line, and MSI to the wired line. A step that fails after it
+mapped an interrupt file is the exception: the domain keeps the file until it is blocked (`UNMAP`
+refuses it), so a fallback would leave the device reaching a hart's file no target of its own sits
+on, and devmgr refuses the bind instead, which blocks the domain. When it withdraws the driver
+devmgr clears MSI Enable and MSI-X Enable beside Interrupt Disable, before the declared reset, and a
+target is freed once no cap to it remains.
+
+On x86-64, until VT-d interrupt remapping is programmed
+([#325](https://github.com/kottlerg/seraph/issues/325)), a device that writes to the interrupt
+range, through an MSI-X table its driver programs or through its DMA engine, can raise any vector
+on any CPU whose APIC id is below `0xFF`, the exception vectors 16 to 31 included, behind an IOMMU
+or not. On riscv64 behind the RISC-V IOMMU a device's writes reach only the interrupt files its
+domain maps.
 
 ---
 

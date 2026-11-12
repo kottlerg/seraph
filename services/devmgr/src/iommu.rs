@@ -33,8 +33,16 @@
 //! behind it, which devmgr, holding no register cap, cannot undo, and logs
 //! as such.
 //!
+//! On riscv64 a confined device's message-signaled interrupts are writes its
+//! domain translates, so before devmgr enables them it has the driver map the
+//! page of each interrupt file they target in the device's domain
+//! (`MAP_MSI`, `crate::dma::DmaGrant::reach_interrupt_file`). VT-d does
+//! not translate them: its interrupt remapping governs them, and while that
+//! is off a device's messages reach the local APICs unchecked
+//! (`docs/device-management.md` § Interrupt Delivery).
+//!
 //! The [`IommuClient`] is shared by devmgr's control thread (`ATTACH`,
-//! `BLOCK`), its DMA thread (`MAP`, `UNMAP`), and its fault-log thread
+//! `MAP_MSI`, `BLOCK`), its DMA thread (`MAP`, `UNMAP`), and its fault-log thread
 //! (`TAKE_FAULTS`), each call made with no devmgr lock held. When the driver
 //! dies after it reported ready, the hardware goes on translating, so devmgr
 //! cannot fall back to unconfined DMA. A death watch thread of its own sees
@@ -243,6 +251,22 @@ impl IommuClient
             .word(1, handle)
             .word(2, base)
             .word(3, len)
+            .build();
+        self.call(&msg).map(|_| ())
+    }
+
+    /// Install the page of the interrupt file at `file` in the domain
+    /// `handle` at its own address (`MAP_MSI`), so the domain's function
+    /// reaches that file with its message-signaled interrupts.
+    ///
+    /// # Errors
+    /// The driver's error label (`INVALID_REQUEST` from a family whose
+    /// messages its DMA translation does not carry); nothing is installed.
+    pub fn map_msi(&self, handle: u64, file: u64) -> Result<(), u64>
+    {
+        let msg = Self::request(iommu_labels::MAP_MSI)
+            .word(1, handle)
+            .word(2, file)
             .build();
         self.call(&msg).map(|_| ())
     }

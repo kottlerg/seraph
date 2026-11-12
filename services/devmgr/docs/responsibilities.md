@@ -130,9 +130,19 @@ devmgr's responsibilities are:
   - for a declaration that takes an interrupt, its own derivation of its
     line's held `Interrupt` cap with `RIGHTS_IRQ_NOTIFY` only, so devices that
     share an `INTx` line are all served and no driver holds Mint; a device with
-    no line is not bound when its declaration requires one. No message-signaled
-    vector is delivered, whatever the declaration requests
-    ([#325](https://github.com/kottlerg/seraph/issues/325));
+    no line is not bound when its declaration requires one. A declaration that
+    asks for vectors (nonzero `msi_vectors`) and for DMA gets message-signaled
+    vectors in place of the line: MSI-X (`min(requested, table size)` vectors,
+    table entries 0 onwards, with the table and PBA BARs delivered), else MSI
+    (one vector), else the line. Each vector is one `Interrupt` resource
+    (kind `Msi` or `MsiX`, mode 0) devmgr mints with `SYS_IRQ_MSG_ALLOC`; a
+    bind delivers at most 70 resources (`MAX_BOUND_RESOURCES`, 6 BARs and 64
+    vectors). On riscv64 behind the RISC-V IOMMU devmgr maps each target's
+    IMSIC interrupt file into the device's domain with `MAP_MSI` before it
+    enables the vectors; VT-d refuses `MAP_MSI`, and VT-d interrupt remapping
+    is design intent ([#325](https://github.com/kottlerg/seraph/issues/325)).
+    [docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
+    § Message-Signaled Interrupts owns the rule;
   - for a DMA declaration, the device's DMA capability, after its grant
     attaches it to its IOMMU domain where a unit translates it (above); the
     driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD`;
@@ -142,7 +152,8 @@ devmgr's responsibilities are:
   devmgr keeps the function's configuration page, which it carves at the bind
   and delegates to no driver, and writes the Command register through it:
   Memory Space Enable on, Bus Master Enable on only for a DMA declaration, and
-  Interrupt Disable clear only for a driver given the line. It creates the
+  Interrupt Disable clear only for a driver given the line (MSI Enable or
+  MSI-X Enable set for one given vectors). It creates the
   driver at `BOOT_DRIVER_PRIORITY` for a declaration of the boot tier from a
   boot module and at `AUX_DRIVER_PRIORITY` otherwise, a drivers-directory
   declaration's boot tier logged and ignored, and grants no PCI-bound driver
@@ -232,8 +243,9 @@ devmgr's responsibilities are:
      removes the driver's mappings of the device before the revocation
      returns. A live driver's next register access faults; its death is held
      at step 5 like any other.
-  3. devmgr sets the function's Interrupt Disable bit through the same page
-     and reads it back, so the function no longer asserts its wired line,
+  3. devmgr clears the function's MSI Enable and MSI-X Enable bits and sets its
+     Interrupt Disable bit through the same page and reads the latter back, so
+     the function no longer signals a message or asserts its wired line,
      whoever else shares it; a bit that does not read back set is logged, and
      does not decide whether the device is quiet, which concerns its DMA
      alone.
@@ -573,7 +585,7 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 |---|---|---|
 | Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
 | Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr moves to the IOMMU driver; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
-| Interrupt (full-rights derivation of init's root IRQ range) | Notify | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps delegated to drivers |
+| Interrupt (full-rights derivation of init's root IRQ range) | Notify, Mint | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps delegated to drivers; mint message-signaled targets with `SYS_IRQ_MSG_ALLOC` through a copy carrying `RIGHTS_IRQ_MINT` alone, derived at startup ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and pwrmgr's PM1a + 8042 reset ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE`; read the DMAR's VT-d units, scopes, and RMRRs on x86-64, and the RIMT's PCI IOMMUs and ID mappings on riscv64 |

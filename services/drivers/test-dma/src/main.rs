@@ -36,9 +36,6 @@
 //! entry for the forged handle, and the probe can observe only that the write
 //! is not delivered, since QEMU records no requester for the fault.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

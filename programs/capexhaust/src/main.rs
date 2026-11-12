@@ -30,9 +30,6 @@
 //! Driven by `services/svctest`'s `recv_wedge` phase, which spawns this
 //! binary, waits for exit, and asserts the exit code.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 /// `RecvGuard` diagnostic hook. The `First` line doubles as evidence that
 /// logging still works from a fully exhausted `CSpace` (`STREAM_BYTES`
 /// messages and their replies carry no caps).

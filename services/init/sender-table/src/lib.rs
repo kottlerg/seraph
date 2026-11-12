@@ -14,8 +14,6 @@
 //! keeps the serial output, the history ring, and the handover drain. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 // The receivers' shared line and name widths: real-logd keeps the same per

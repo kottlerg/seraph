@@ -18,8 +18,6 @@
 //! service: the stub maps the parsed commands onto the system's debugging
 //! mechanism (docs/fault-handling.md § Debugging).
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 pub mod command;

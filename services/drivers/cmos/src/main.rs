@@ -18,9 +18,6 @@
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]) by re-reading hardware on
 //! every request.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use cmos_rtc::{Calendar, CmosRegs, epoch_us};
 use driver_binding::resources::{self, PlatformDelivery, Resource};
 use ipc::{IpcMessage, devmgr_labels, rtc_errors, rtc_labels};

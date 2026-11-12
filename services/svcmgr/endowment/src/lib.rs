@@ -20,8 +20,6 @@
 //! codec are host-tested (see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants)).
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 use ipc::bootstrap::{PackedSlots, SlotAccumulator, slot_round_count, slot_rounds};

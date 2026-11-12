@@ -19,8 +19,6 @@
 //! See [`README.md`](../README.md) for the compliant-bootloader policy and
 //! `core/boot/docs/kernel-handoff.md` for the CPU-state contract at kernel entry.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 pub mod bundle;

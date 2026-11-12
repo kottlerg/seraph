@@ -36,9 +36,6 @@
 //! constraint on the serial and framebuffer drivers. Diagnostics are dropped;
 //! fatal bootstrap failures `thread_exit` silently.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod arch;
 
 use boot_protocol::FramebufferInfo;

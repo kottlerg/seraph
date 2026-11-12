@@ -35,9 +35,6 @@
 //! Crash window discussion lives in
 //! `services/fs/fat/docs/crash-safety.md`.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod alloc;
 mod backend;
 mod bpb;

@@ -22,9 +22,6 @@
 //! `/programs/fb-charset` invoked manually. Pure `std`: no driver or cap
 //! awareness; with no stdout attached the output silently drops.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use std::io::Write;
 
 fn main()

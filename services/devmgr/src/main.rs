@@ -16,9 +16,6 @@
 //! and driver authority, and `docs/device-management.md` for the system-scope
 //! design.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod arch;
 mod bind;
 mod caps;

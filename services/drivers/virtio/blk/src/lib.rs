@@ -14,9 +14,6 @@
 //! decision (`shared/ipc::blk_labels`, `shared/ipc::blk_errors`), so they
 //! live where a host test can pin them.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use ipc::blk_errors;
 
 /// Bytes per `VirtIO` block sector: the unit of a request header's `sector`

@@ -18,8 +18,6 @@
 //!
 //! Driven by its per-program tester (`tester/`), which `usertest` runs.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // A test fixture, where unwrap and expect are permitted
 // (docs/coding-standards.md § Error Handling): a failed step must abort the
 // fixture, and the panic's non-zero exit is its FAIL verdict for the tester.

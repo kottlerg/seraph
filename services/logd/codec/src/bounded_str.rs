@@ -39,14 +39,19 @@ impl<const N: usize> BoundedStr<N>
     #[must_use]
     pub fn as_str(&self) -> &str
     {
-        let bytes = &self.buf[..self.len];
+        // `len` is at most `N` (`write_str`), so the empty fallback is never
+        // taken.
+        let bytes = self.buf.get(..self.len).unwrap_or_default();
         // `write_str` copies only whole characters, so the prefix is valid
         // UTF-8 and the first arm is always taken; the second keeps the
         // longest valid prefix rather than failing if that ever stops holding.
         match core::str::from_utf8(bytes)
         {
             Ok(s) => s,
-            Err(e) => core::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
+            Err(e) => bytes
+                .get(..e.valid_up_to())
+                .and_then(|valid| core::str::from_utf8(valid).ok())
+                .unwrap_or_default(),
         }
     }
 }
@@ -67,17 +72,19 @@ impl<const N: usize> fmt::Write for BoundedStr<N>
         {
             return Ok(());
         }
-        let mut n = s.len().min(N - self.len);
+        let room = self.buf.get_mut(self.len..).unwrap_or_default();
+        let mut n = s.len().min(room.len());
         if n < s.len()
         {
             self.truncated = true;
-            while !s.is_char_boundary(n)
-            {
-                n -= 1;
-            }
+            n = s.floor_char_boundary(n);
         }
-        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
-        self.len += n;
+        if let (Some(dst), Some(src)) = (room.get_mut(..n), s.as_bytes().get(..n))
+        {
+            dst.copy_from_slice(src);
+            // `n` fits the room after `len`, so the sum is at most `N`.
+            self.len = self.len.saturating_add(n);
+        }
         Ok(())
     }
 }

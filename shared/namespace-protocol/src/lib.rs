@@ -16,6 +16,8 @@
 //! or access checks. The model is documented in
 //! `docs/namespace-model.md`.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
@@ -102,12 +104,9 @@ impl EntryName
     #[must_use]
     pub fn new(name: &[u8], kind: NodeKind, visible_requires: NamespaceRights) -> Option<Self>
     {
-        if name.len() > MAX_NAME_LEN
-        {
-            return None;
-        }
         let mut bytes = [0u8; MAX_NAME_LEN];
-        bytes[..name.len()].copy_from_slice(name);
+        // `None` when `name` is longer than the `MAX_NAME_LEN`-byte buffer.
+        bytes.get_mut(..name.len())?.copy_from_slice(name);
         // Cast is range-safe: `name.len() <= MAX_NAME_LEN` (255), fits u8.
         #[allow(clippy::cast_possible_truncation)]
         let len = name.len() as u8;
@@ -123,7 +122,9 @@ impl EntryName
     #[must_use]
     pub fn as_bytes(&self) -> &[u8]
     {
-        &self.bytes[..usize::from(self.len)]
+        // `len` is at most `MAX_NAME_LEN` by construction (`new`), so the
+        // empty fallback is never taken.
+        self.bytes.get(..usize::from(self.len)).unwrap_or_default()
     }
 }
 
@@ -405,11 +406,15 @@ fn handle_lookup<B: NamespaceBackend>(
     let data_bytes = msg.data_bytes();
     // First data word carries caller-requested rights; name bytes start
     // at byte 8.
-    if name_len == 0 || name_len > MAX_NAME_LEN || data_bytes.len() < 8 + name_len
+    let name = data_bytes
+        .get(8..)
+        .and_then(|rest| rest.get(..name_len))
+        .filter(|_| name_len != 0 && name_len <= MAX_NAME_LEN);
+    let Some(name) = name
+    else
     {
         return ipc::IpcMessage::new(NsError::InvalidName.as_label());
-    }
-    let name = &data_bytes[8..8 + name_len];
+    };
     if validate_name(name).is_err()
     {
         return ipc::IpcMessage::new(NsError::InvalidName.as_label());
@@ -606,7 +611,8 @@ fn nth_visible_entry<B: NamespaceBackend>(
             {
                 return Ok(Some(entry));
             }
-            visible += 1;
+            // `visible < idx` here, so the count cannot pass `u32::MAX`.
+            visible = visible.saturating_add(1);
         }
         let Some(next) = backend_idx.checked_add(1)
         else

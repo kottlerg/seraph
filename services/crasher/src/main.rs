@@ -8,6 +8,9 @@
 //! Gating, the surface checks, the fail rules, and the capability slots are
 //! defined in `services/crasher/README.md`.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::os::seraph::startup_info;
 use std::thread;
 use std::time::Duration;
@@ -59,7 +62,9 @@ fn main()
 fn check_argv()
 {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() == 2 && args[0] == "crasher" && args[1] == "selftest"
+    if let [program, mode] = args.as_slice()
+        && program == "crasher"
+        && mode == "selftest"
     {
         std::os::seraph::log!("argv ok ({args:?})");
     }

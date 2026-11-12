@@ -276,7 +276,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             if f.va != unmapped
                 && page_base >= f.va
-                && page_base < f.va + u64::from(f.page_count) * PAGE_SIZE
+                && page_base
+                    < f.va
+                        .saturating_add(u64::from(f.page_count).saturating_mul(PAGE_SIZE))
             {
                 return true;
             }
@@ -333,7 +335,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return 0;
         };
-        let mut moved = 0;
+        let mut moved: u64 = 0;
         let mut prev = NODE_NULL;
         let mut cur = r.frame_head;
         while let Node::Frame(f) = self.arena.get(cur).node
@@ -373,7 +375,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             {
                 self.deferred.park(&mut self.arena, cur);
             }
-            moved += 1;
+            // Each pass moves one frame descriptor, so `moved` is below the slot count.
+            moved = moved.saturating_add(1);
             if take == Take::First
             {
                 break;

@@ -14,6 +14,8 @@
 //! Embedded 9×20 bitmap font. The layout, indexing, and extension table are
 //! described in `shared/font/README.md` and on each item below.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 /// Glyph width in pixels.

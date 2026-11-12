@@ -23,6 +23,8 @@
 //!
 //! See `svcmgr/docs/ipc-interface.md` and `svcmgr/docs/restart-protocol.md`.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 
@@ -576,7 +578,8 @@ fn handle_publish_endpoint(msg: &IpcMessage, registry: &mut registry::Registry) 
         return reject(ipc::svcmgr_errors::UNAUTHORIZED);
     }
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    let Some(name) = read_name_from_msg(msg, name_len)
+    let name_buf = read_name_from_msg(msg, name_len);
+    let Some(name) = name_buf.as_ref().and_then(|buf| buf.get(..name_len))
     else
     {
         return reject(ipc::svcmgr_errors::INVALID_NAME);
@@ -586,7 +589,7 @@ fn handle_publish_endpoint(msg: &IpcMessage, registry: &mut registry::Registry) 
         return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
     }
     if registry
-        .publish(&name[..name_len], delivered_cap, Visibility::Public)
+        .publish(name, delivered_cap, Visibility::Public)
         .is_err()
     {
         return reject(ipc::svcmgr_errors::REGISTER_REJECTED);
@@ -640,7 +643,8 @@ pub(crate) fn registry_lookup_derived(
 fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ipc_buf: *mut u64)
 {
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    let Some(name) = read_name_from_msg(msg, name_len)
+    let name_buf = read_name_from_msg(msg, name_len);
+    let Some(name) = name_buf.as_ref().and_then(|buf| buf.get(..name_len))
     else
     {
         let reply = IpcMessage::new(ipc::svcmgr_errors::INVALID_NAME);
@@ -648,7 +652,7 @@ fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ip
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
-    match registry_lookup_derived(registry, &name[..name_len], Resolver::Query)
+    match registry_lookup_derived(registry, name, Resolver::Query)
     {
         Ok(derived) =>
         {
@@ -705,15 +709,14 @@ fn route_death(
     ctx: &restart::RestartCtx,
 )
 {
-    let Some(idx) = usize::try_from(correlator)
+    let Some((idx, svc)) = usize::try_from(correlator)
         .ok()
-        .filter(|&idx| idx < state.table.services.len())
+        .and_then(|idx| state.table.services.get(idx).map(|svc| (idx, svc)))
     else
     {
         std::os::seraph::log!(warn: "death notification with unknown correlator");
         return;
     };
-    let svc = &state.table.services[idx];
     if !svc.active
     {
         return;
@@ -736,12 +739,17 @@ fn route_death(
     let SvcmgrState {
         table, registry, ..
     } = state;
+    let Some(entry) = table.services.get_mut(idx)
+    else
+    {
+        return;
+    };
     let outcome = restart::handle_death(
-        &mut table.services[idx],
+        entry,
         exit_reason,
         ctx,
         correlator,
-        table.recipes[idx].as_ref(),
+        table.recipes.get(idx).and_then(Option::as_ref),
         registry,
     );
     if matches!(outcome, restart::DeathOutcome::Unrecoverable)
@@ -761,7 +769,11 @@ fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
     for idx in 0..state.table.services.len()
     {
-        let svc = &state.table.services[idx];
+        let Some(svc) = state.table.services.get(idx)
+        else
+        {
+            continue;
+        };
         if !svc.active || svc.thread_cap == 0
         {
             continue;
@@ -813,7 +825,15 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
         );
         return;
     };
-    let entry = &state.table.services[actuator.slot];
+    let Some(entry) = state.table.services.get(actuator.slot)
+    else
+    {
+        std::os::seraph::log!(
+            error: "graceful shutdown impossible: shutdown actuator is not in the service table; \
+             system in degraded state"
+        );
+        return;
+    };
     if entry.active
         && entry.thread_cap != 0
         && !service_running(entry)
@@ -823,7 +843,11 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
         // thread; the `0` stands only when that read fails.
         route_death(correlator, 0, state, ctx);
     }
-    let entry = &state.table.services[actuator.slot];
+    let Some(entry) = state.table.services.get(actuator.slot)
+    else
+    {
+        return;
+    };
     if !service_running(entry)
     {
         std::os::seraph::log!(

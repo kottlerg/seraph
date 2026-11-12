@@ -183,17 +183,29 @@ impl<T> Registry<T>
                 .try_reserve(1)
                 .map_err(|_| ReserveError::NoMemory)?;
             // Room for this slot's index in `free`, so freeing it never
-            // allocates.
+            // allocates. `free` never holds more indices than there are
+            // slots, and `slots.len()` is below `max_slots`, so neither
+            // operation saturates.
             self.free
-                .try_reserve(self.slots.len() + 1 - self.free.len())
+                .try_reserve(
+                    self.slots
+                        .len()
+                        .saturating_add(1)
+                        .saturating_sub(self.free.len()),
+                )
                 .map_err(|_| ReserveError::NoMemory)?;
             self.slots.push(Slot::vacant());
             slot
         };
-        let index = slot as usize;
+        // A slot from `free` was vacated in place, and a new one was just
+        // pushed, so the index is in range.
+        let entry = self
+            .slots
+            .get_mut(slot as usize)
+            .ok_or(ReserveError::IndexExhausted)?;
         let generation = self.next_gen;
         self.next_gen = self.next_gen.wrapping_add(1);
-        self.slots[index] = Slot {
+        *entry = Slot {
             state: State::Reserved,
             generation,
             died: false,
@@ -205,7 +217,13 @@ impl<T> Registry<T>
     /// Make slot `slot` vacant and record it as free.
     fn vacate(&mut self, slot: u32)
     {
-        self.slots[slot as usize] = Slot::vacant();
+        // Every caller found `slot` through `slot_mut`, so it is in range.
+        let Some(entry) = self.slots.get_mut(slot as usize)
+        else
+        {
+            return;
+        };
+        *entry = Slot::vacant();
         // `free`'s capacity covers every slot (`reserve`), so this does not
         // allocate.
         self.free.push(slot);

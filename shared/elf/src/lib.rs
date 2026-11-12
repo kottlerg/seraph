@@ -1245,31 +1245,25 @@ pub const fn relative_reloc_type(machine: u16) -> Option<u32>
     }
 }
 
-/// Decode one `Elf64_Rela` record from the front of `bytes`; `None` when
-/// `bytes` is shorter than [`RELA_ENTRY_SIZE`].
+/// Decode one `Elf64_Rela` record from its 24 raw bytes.
 #[must_use]
-pub fn decode_rela(bytes: &[u8]) -> Option<Rela>
+pub fn decode_rela(bytes: &[u8; RELA_ENTRY_SIZE]) -> Rela
 {
-    decode_rela_record(bytes).map(|(rela, _)| rela)
+    decode_rela_record(bytes).0
 }
 
 /// Decode one `Elf64_Rela` record and the symbol index of its `r_info` (the
-/// high half), from the front of `bytes`.
-fn decode_rela_record(bytes: &[u8]) -> Option<(Rela, u32)>
+/// high half). The ranges are constant and within the record, so each
+/// conversion succeeds.
+fn decode_rela_record(bytes: &[u8; RELA_ENTRY_SIZE]) -> (Rela, u32)
 {
-    let mut b = Fields(bytes);
-    let offset = b.u64()?;
-    let rtype = b.u32()?;
-    let sym = b.u32()?;
-    let addend = b.i64()?;
-    Some((
-        Rela {
-            offset,
-            rtype,
-            addend,
-        },
-        sym,
-    ))
+    let rela = Rela {
+        offset: u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])),
+        rtype: u32::from_le_bytes(bytes[8..12].try_into().unwrap_or([0; 4])),
+        addend: i64::from_le_bytes(bytes[16..24].try_into().unwrap_or([0; 8])),
+    };
+    let sym = u32::from_le_bytes(bytes[12..16].try_into().unwrap_or([0; 4]));
+    (rela, sym)
 }
 
 /// Tags gathered from one walk of a `PT_DYNAMIC` segment.
@@ -1494,7 +1488,7 @@ impl Iterator for RelativeRelocIter<'_>
     {
         let (bytes, rest) = self.table.split_first_chunk::<RELA_ENTRY_SIZE>()?;
         self.table = rest;
-        let (rela, sym) = decode_rela_record(bytes)?;
+        let (rela, sym) = decode_rela_record(bytes);
         // r_info's high half is the symbol index; RELATIVE records must not
         // reference a symbol.
         if rela.rtype != self.expected_rtype || sym != 0

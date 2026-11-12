@@ -436,7 +436,10 @@ mod tests
     fn inline_bytes_from_a_word_past_the_message_is_none()
     {
         let reply = encode_slot(0x1234, b"svctest");
-        assert_eq!(inline_bytes(&reply, SLOT_NAME_WORD, 7), Some(&b"svctest"[..]));
+        assert_eq!(
+            inline_bytes(&reply, SLOT_NAME_WORD, 7),
+            Some(&b"svctest"[..])
+        );
         assert_eq!(inline_bytes(&reply, MSG_DATA_WORDS_MAX, 8), None);
         // A word index whose byte offset does not fit a `usize`.
         assert_eq!(inline_bytes(&reply, usize::MAX, 8), None);

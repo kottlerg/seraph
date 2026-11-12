@@ -58,7 +58,7 @@ impl Health
         // RCT (§4.4.1): consecutive identical values.
         if self.rct_run != 0 && byte == self.rct_last
         {
-            self.rct_run += 1;
+            self.rct_run = self.rct_run.saturating_add(1);
             if self.rct_run >= RCT_CUTOFF
             {
                 self.failed = true;
@@ -81,19 +81,16 @@ impl Health
         {
             if byte == self.apt_first
             {
-                self.apt_count += 1;
+                self.apt_count = self.apt_count.saturating_add(1);
                 if self.apt_count > APT_CUTOFF
                 {
                     self.failed = true;
                 }
             }
-            self.apt_pos += 1;
+            self.apt_pos = self.apt_pos.saturating_add(1);
         }
 
-        if self.startup_remaining > 0
-        {
-            self.startup_remaining -= 1;
-        }
+        self.startup_remaining = self.startup_remaining.saturating_sub(1);
     }
 
     /// Feed all 8 bytes of a 64-bit sample.

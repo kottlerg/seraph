@@ -118,9 +118,13 @@ pub fn large_single_allocation_phase(_: &Caps)
 
     let mut fresh: Vec<u8> = Vec::with_capacity(16 * PAGE);
     let spare = fresh.spare_capacity_mut();
-    for page in 0..16
+    for page in 0..16usize
     {
-        let at = spare[page * PAGE..].as_mut_ptr().cast::<u8>();
+        let at = spare
+            .get_mut(page.checked_mul(PAGE).expect("fresh heap page offset")..)
+            .expect("fresh heap page inside the spare capacity")
+            .as_mut_ptr()
+            .cast::<u8>();
         // SAFETY: `at` is the start of a page-sized span of the Vec's spare
         // capacity, writable for 64 bytes, and any byte value is a valid u8.
         let n = unsafe { syscall::getrandom_raw(at, 64) }
@@ -133,10 +137,10 @@ pub fn large_single_allocation_phase(_: &Caps)
     big.try_reserve_exact(LARGE)
         .expect("one 8 MiB allocation refused");
     big.resize(LARGE, 0xA5);
-    big[LARGE - 1] = 0x5A;
-    assert_eq!(big[0], 0xA5);
-    assert_eq!(big[LARGE / 2], 0xA5);
-    assert_eq!(big[LARGE - 1], 0x5A);
+    *big.last_mut().expect("the 8 MiB allocation is empty") = 0x5A;
+    assert_eq!(big.first().copied(), Some(0xA5));
+    assert_eq!(big.get(LARGE / 2).copied(), Some(0xA5));
+    assert_eq!(big.last().copied(), Some(0x5A));
     drop(big);
     std::os::seraph::log!("large single allocation passed ({LARGE} bytes)");
 }
@@ -249,7 +253,9 @@ fn stack_note_pages_offset(image: &[u8]) -> usize
         "svctest's stack note found {} times",
         hits.len()
     );
-    hits[0] + 20
+    hits.first()
+        .and_then(|hit| hit.checked_add(20))
+        .expect("stack note offset overflowed")
 }
 
 /// A binary whose stack note declares more than `MAX_PROCESS_STACK_PAGES` is
@@ -263,7 +269,10 @@ pub fn stack_note_refused_phase(_: &Caps)
     let mut image = std::fs::read("/tests/svctest").expect("read /tests/svctest");
     let at = stack_note_pages_offset(&image);
     let oversize = process_abi::MAX_PROCESS_STACK_PAGES + 1;
-    image[at..at + 4].copy_from_slice(&oversize.to_le_bytes());
+    image
+        .get_mut(at..at.checked_add(4).expect("stack note offset overflowed"))
+        .expect("stack note lies inside the image")
+        .copy_from_slice(&oversize.to_le_bytes());
     std::fs::write(path, &image).expect("write the patched image");
 
     let refused = Command::new(path).arg("exit-code-zero").spawn();

@@ -15,6 +15,8 @@
 // so faults surface in the log. `expect`/`unwrap` are the intended idiom
 // here (coding-standards §D permits them in test code).
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use std::os::seraph::startup_info;
 use std::path::{Path, PathBuf};
@@ -36,31 +38,32 @@ fn main()
         std::os::seraph::log!("no testers found under {TESTERS_DIR}");
     }
 
-    let mut passed: usize = 0;
-    let mut failed: usize = 0;
+    let outcomes: Vec<bool> = testers
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unnamed>");
+            std::os::seraph::log!("running {}", path.display());
 
-    for path in &testers
-    {
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("<unnamed>");
-        std::os::seraph::log!("running {}", path.display());
-
-        match run_one(path)
-        {
-            Ok(()) =>
+            match run_one(path)
             {
-                std::os::seraph::log!("  {name}: PASS");
-                passed += 1;
+                Ok(()) =>
+                {
+                    std::os::seraph::log!("  {name}: PASS");
+                    true
+                }
+                Err(reason) =>
+                {
+                    std::os::seraph::log!("  {name}: FAIL ({reason})");
+                    false
+                }
             }
-            Err(reason) =>
-            {
-                std::os::seraph::log!("  {name}: FAIL ({reason})");
-                failed += 1;
-            }
-        }
-    }
+        })
+        .collect();
+    let passed = outcomes.iter().filter(|&&ok| ok).count();
+    let failed = outcomes.iter().filter(|&&ok| !ok).count();
 
     std::os::seraph::log!("passed={passed} failed={failed}");
     if failed == 0
@@ -154,7 +157,11 @@ fn forward_lines<R: std::io::Read>(tester: &str, stream: &str, mut r: R)
             Ok(0) | Err(_) => break,
             Ok(n) =>
             {
-                for &b in &buf[..n]
+                // `Read::read` reports at most the buffer's length.
+                let chunk = buf
+                    .get(..n)
+                    .expect("read reported more bytes than its buffer");
+                for &b in chunk
                 {
                     if b == b'\n'
                     {

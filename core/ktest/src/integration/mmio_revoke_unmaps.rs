@@ -111,10 +111,10 @@ fn check(ctx: &TestContext, held: u64) -> TestResult
     }
 
     let polls = crate::scaled_polls(MAX_POLLS);
-    let mut waited = 0;
+    let mut waited = 0u32;
     while READS.load(Ordering::Acquire) == 0
     {
-        waited += 1;
+        waited = waited.saturating_add(1);
         if waited >= polls
         {
             return abandon("integration::mmio_revoke_unmaps: the reader never read the page");
@@ -146,7 +146,8 @@ fn check(ctx: &TestContext, held: u64) -> TestResult
 /// Child entry: read the probe register until the read faults.
 extern "C" fn reader(_arg: u64) -> !
 {
-    let reg = (PROBE_VA + crate::arch::MMIO_PROBE_OFFSET as u64) as *const u8;
+    const REG_VA: u64 = PROBE_VA + crate::arch::MMIO_PROBE_OFFSET as u64;
+    let reg = REG_VA as *const u8;
     loop
     {
         // SAFETY: PROBE_VA maps the probe page until the parent's revoke; the

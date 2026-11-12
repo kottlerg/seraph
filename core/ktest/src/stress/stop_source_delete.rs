@@ -671,10 +671,10 @@ fn round(
         core::hint::spin_loop();
     }
     WAITER.store(waiter, Ordering::Release);
-    ARMED.store(cycle + 1, Ordering::Release);
+    ARMED.store(cycle.saturating_add(1), Ordering::Release);
     if kind == Kind::CallServed
     {
-        SERVER_ARMED.store(cycle + 1, Ordering::Release);
+        SERVER_ARMED.store(cycle.saturating_add(1), Ordering::Release);
     }
     // 0 to 1023 spins of the controller's own, against the racer's 0 to
     // 1023 (a different hash), so the delete and the action land in both
@@ -714,7 +714,7 @@ fn start_waiter(
         WAITS_ENTERED.load(Ordering::Acquire) != entered_before
     })?
     {
-        seen.starved += 1;
+        seen.starved = seen.starved.saturating_add(1);
     }
     Ok(waiter)
 }
@@ -735,14 +735,14 @@ fn settle_round(
 ) -> TestResult
 {
     if !await_within(crate::scaled_bound(ACK_WAIT_US), || {
-        RACER_DONE.load(Ordering::Acquire) == cycle + 1
+        RACER_DONE.load(Ordering::Acquire) == cycle.saturating_add(1)
     })?
     {
         return Err("stress::stop_source_delete: the racer did not finish its action");
     }
     if kind == Kind::CallServed
         && !await_within(crate::scaled_bound(ACK_WAIT_US), || {
-            SERVER_DONE.load(Ordering::Acquire) == cycle + 1
+            SERVER_DONE.load(Ordering::Acquire) == cycle.saturating_add(1)
         })?
     {
         return Err("stress::stop_source_delete: the server's receives did not end");
@@ -795,7 +795,7 @@ fn settle_stopped(
                 && e == SyscallError::InvalidArgument as i64
                 && matches!(spawn::is_exited(waiter), Ok(true)) =>
         {
-            seen.stops_into_exit += 1;
+            seen.stops_into_exit = seen.stops_into_exit.saturating_add(1);
         }
         Err(e) => BAD_ACTIONS.record_error(e),
     }
@@ -821,16 +821,16 @@ fn classify_stop(action: u64, entered_before: u32, done_before: u32, seen: &mut 
     {
         if waiter_in_wait(entered_before, done_before)?
         {
-            seen.stopped_in_wait += 1;
+            seen.stopped_in_wait = seen.stopped_in_wait.saturating_add(1);
         }
         else
         {
-            seen.stopped_between += 1;
+            seen.stopped_between = seen.stopped_between.saturating_add(1);
         }
     }
     else if action == error_word(SyscallError::InvalidState)
     {
-        seen.stops_after_exit += 1;
+        seen.stops_after_exit = seen.stops_after_exit.saturating_add(1);
     }
     else
     {
@@ -858,11 +858,11 @@ fn settle_deleted(
     parts.waiter = None;
     if waiter_in_wait(entered_before, done_before)?
     {
-        seen.died_in_wait += 1;
+        seen.died_in_wait = seen.died_in_wait.saturating_add(1);
     }
     else
     {
-        seen.died_between += 1;
+        seen.died_between = seen.died_between.saturating_add(1);
     }
     Ok(())
 }
@@ -951,12 +951,12 @@ fn create_thread(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::stop_source_delete: create thread failed")?,
     );
-    // SAFETY: stress stacks 0, 1 and 2 belong to this test's waiter, racer
+    // stress stacks 0, 1 and 2 belong to this test's waiter, racer
     // and served-call server; stress tests run sequentially, each round's
     // waiter has exited or been deleted (and so is off its CPU) before the
     // next is created, and a phase's racer and server exit and are deleted
     // before the next phase's are created.
-    let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
+    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack)?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).
@@ -983,7 +983,7 @@ fn await_within(bound_us: u64, mut done: impl FnMut() -> bool) -> Result<bool, &
         }
         if polls < BUSY_POLLS
         {
-            polls += 1;
+            polls = polls.saturating_add(1);
             core::hint::spin_loop();
         }
         else

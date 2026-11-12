@@ -91,6 +91,29 @@ fn frames_at(frames: [u64; 2], expected: [u64; 2]) -> Result<bool, &'static str>
     Ok(available(frames[0])? == expected[0] && available(frames[1])? == expected[1])
 }
 
+/// Take a frame from the pool into `frame_slot`, create an observed event
+/// queue in it into `queue_slot`, and return the frame, its available bytes
+/// before the queue, the queue, and the frame's available bytes after it.
+fn create_queue(
+    frame_slot: &mut Option<u64>,
+    queue_slot: &mut Option<u64>,
+) -> Result<(u64, u64, u64, u64), &'static str>
+{
+    let frame = crate::frame_pool::alloc()
+        .ok_or("death_observer_outlives_queue_caps: frame pool exhausted")?;
+    *frame_slot = Some(frame);
+    let empty = available(frame)?;
+    let queue = event_queue_create_observed(frame, CAPACITY, 1)
+        .map_err(|_| "death_observer_outlives_queue_caps: event_queue_create failed")?;
+    *queue_slot = Some(queue);
+    let occupied = available(frame)?;
+    if occupied >= empty
+    {
+        return Err("death_observer_outlives_queue_caps: queue took no frame bytes");
+    }
+    Ok((frame, empty, queue, occupied))
+}
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let mut parts = Parts::default();
@@ -101,25 +124,16 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 fn run_with(ctx: &TestContext, parts: &mut Parts) -> TestResult
 {
-    let mut frames = [0u64; 2];
-    let mut empty = [0u64; 2];
-    let mut occupied = [0u64; 2];
-    let mut queues = [0u64; 2];
-    for i in 0..2
-    {
-        frames[i] = crate::frame_pool::alloc()
-            .ok_or("death_observer_outlives_queue_caps: frame pool exhausted")?;
-        parts.frames[i] = Some(frames[i]);
-        empty[i] = available(frames[i])?;
-        queues[i] = event_queue_create_observed(frames[i], CAPACITY, 1)
-            .map_err(|_| "death_observer_outlives_queue_caps: event_queue_create failed")?;
-        parts.queues[i] = Some(queues[i]);
-        occupied[i] = available(frames[i])?;
-        if occupied[i] >= empty[i]
-        {
-            return Err("death_observer_outlives_queue_caps: queue took no frame bytes");
-        }
-    }
+    let [frame_slot0, frame_slot1] = &mut parts.frames;
+    let [queue_slot0, queue_slot1] = &mut parts.queues;
+    let made = [
+        create_queue(frame_slot0, queue_slot0)?,
+        create_queue(frame_slot1, queue_slot1)?,
+    ];
+    let frames = made.map(|m| m.0);
+    let empty = made.map(|m| m.1);
+    let queues = made.map(|m| m.2);
+    let occupied = made.map(|m| m.3);
 
     let aspace = cap_create_aspace(ctx.memory_base, 0, 8)
         .map_err(|_| "death_observer_outlives_queue_caps: cap_create_aspace failed")?;

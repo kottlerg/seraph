@@ -60,7 +60,8 @@ fn compute_dram_bounds(entries: &[boot_protocol::MemoryMapEntry]) -> (u64, u64)
         if is_dram(entry.memory_type)
         {
             let start = entry.physical_base;
-            let end = start + entry.size;
+            // An entry past the end of the address space is cut at it.
+            let end = start.saturating_add(entry.size);
             if start < dram_bottom
             {
                 dram_bottom = start;
@@ -84,7 +85,7 @@ fn compute_dram_bounds(entries: &[boot_protocol::MemoryMapEntry]) -> (u64, u64)
 /// Print one merged memory map line.
 fn print_memory_line(idx: usize, start: u64, end: u64, ty: MemoryType)
 {
-    let size_kib = (end - start) / 1024;
+    let size_kib = end.saturating_sub(start) / 1024;
     kprintln!(
         "  [{:3}]  {:#018x} - {:#018x}  {:8} KiB  {}",
         idx,
@@ -178,7 +179,8 @@ pub fn print_memory_map(info: &BootInfo)
         }
 
         let start = entry.physical_base;
-        let end = start + entry.size;
+        // An entry past the end of the address space is cut at it.
+        let end = start.saturating_add(entry.size);
 
         match entry.memory_type
         {
@@ -186,7 +188,7 @@ pub fn print_memory_map(info: &BootInfo)
             MemoryType::Loaded => loaded_bytes = loaded_bytes.saturating_add(entry.size),
             MemoryType::Reserved =>
             {
-                let entry_end = entry.physical_base + entry.size;
+                let entry_end = end;
                 let outside_dram = entry.physical_base >= dram_top || entry_end <= dram_bottom;
                 if outside_dram
                 {
@@ -214,7 +216,8 @@ pub fn print_memory_map(info: &BootInfo)
             }
             // Emit previous run.
             print_memory_line(line_idx, run_start, run_end, rt);
-            line_idx += 1;
+            // At most the entry count.
+            line_idx = line_idx.saturating_add(1);
         }
 
         // Start new run.
@@ -233,8 +236,11 @@ pub fn print_memory_map(info: &BootInfo)
     // space windows that the firmware reports as `Reserved` (PCIe MMCFG,
     // LAPIC, etc.). The latter are not memory; they are split off as
     // `mmio` here so the DRAM sum is accurate.
-    let dram_total_bytes =
-        usable_bytes + loaded_bytes + reserved_bytes + acpi_bytes + persistent_bytes;
+    let dram_total_bytes = usable_bytes
+        .saturating_add(loaded_bytes)
+        .saturating_add(reserved_bytes)
+        .saturating_add(acpi_bytes)
+        .saturating_add(persistent_bytes);
     SYSTEM_RAM_BYTES.store(dram_total_bytes, core::sync::atomic::Ordering::Relaxed);
     let (dram_v, dram_u) = scaled_unit(dram_total_bytes);
     let (use_v, use_u) = scaled_unit(usable_bytes);
@@ -414,7 +420,8 @@ pub fn init_physical_memory(info: &BootInfo)
 #[must_use]
 pub fn find_boot_table_carve(info: &BootInfo, frames: u64) -> Option<u64>
 {
-    let want = frames * PAGE_SIZE as u64;
+    // A request too large to address saturates, and no piece holds it.
+    let want = frames.saturating_mul(PAGE_SIZE as u64);
     // SAFETY: Phase 0 validated the memory map; the bootloader's identity map
     // covers it at this point (the caller's contract).
     let entries = unsafe {
@@ -430,7 +437,7 @@ pub fn find_boot_table_carve(info: &BootInfo, frames: u64) -> Option<u64>
         |s, e| {
             // Frame 0 is never handed out (it is the buddy's list end marker).
             let s = s.max(PAGE_SIZE as u64);
-            if found.is_none() && e > s && e - s >= want
+            if found.is_none() && e.checked_sub(s).is_some_and(|len| len != 0 && len >= want)
             {
                 found = Some(s);
             }
@@ -458,7 +465,7 @@ fn dtb_tail(dtb: u64, entries: &[MemoryMapEntry]) -> (u64, u64)
         return (0, 0);
     };
     let mut end = 0;
-    for e in &entries[first..]
+    for e in entries.iter().skip(first)
     {
         if end != 0 && e.physical_base != end
         {
@@ -474,7 +481,8 @@ fn dtb_tail(dtb: u64, entries: &[MemoryMapEntry]) -> (u64, u64)
 pub fn record_boot_table_carve(base: u64, frames: u64)
 {
     BOOT_TABLE_CARVE[0].store(base, Ordering::Relaxed);
-    BOOT_TABLE_CARVE[1].store(frames * PAGE_SIZE as u64, Ordering::Relaxed);
+    // A carve is RAM Phase 3 found, far below the saturation point.
+    BOOT_TABLE_CARVE[1].store(frames.saturating_mul(PAGE_SIZE as u64), Ordering::Relaxed);
 }
 
 /// First act of Phase 3 after the page-table switch: populate `alloc` with the
@@ -513,12 +521,14 @@ pub unsafe fn populate_buddy(alloc: &mut BuddyAllocator)
         .unwrap_or_else(|e| dtb_fatal(dtb_phys, &e));
         DTB_EXTENT[0].store(extent.0, Ordering::Relaxed);
         DTB_EXTENT[1].store(extent.1, Ordering::Relaxed);
-        dtb = (extent.0, extent.0 + extent.1);
+        // The extent lies below the direct map's top (`fdt_extent`).
+        dtb = (extent.0, extent.0.saturating_add(extent.1));
     }
     let carve_base = BOOT_TABLE_CARVE[0].load(Ordering::Relaxed);
+    // The carve is RAM, so its end does not saturate.
     let carve = (
         carve_base,
-        carve_base + BOOT_TABLE_CARVE[1].load(Ordering::Relaxed),
+        carve_base.saturating_add(BOOT_TABLE_CARVE[1].load(Ordering::Relaxed)),
     );
 
     let to_ptr = |phys: u64| super::paging::phys_to_virt(phys);
@@ -593,8 +603,13 @@ fn for_each_payload_free_piece(
             )
         }
     };
-    let seg_count = (info.init_image.segment_count as usize).min(info.init_image.segments.len());
-    let segments = &info.init_image.segments[..seg_count];
+    let segments = info
+        .init_image
+        .segments
+        .iter()
+        .take(info.init_image.segment_count as usize);
+    // Each exclusion's end saturates: one past the end of the address space
+    // is cut at it, which only widens the exclusion.
     let trampoline = if info.ap_trampoline_page == 0
     {
         (0, 0)
@@ -603,15 +618,18 @@ fn for_each_payload_free_piece(
     {
         (
             info.ap_trampoline_page,
-            info.ap_trampoline_page + PAGE_SIZE as u64,
+            info.ap_trampoline_page.saturating_add(PAGE_SIZE as u64),
         )
     };
     let fixed = [
         (
             info.kernel_physical_base,
-            info.kernel_physical_base + info.kernel_size,
+            info.kernel_physical_base.saturating_add(info.kernel_size),
         ),
-        (info_phys, info_phys + size_of::<BootInfo>() as u64),
+        (
+            info_phys,
+            info_phys.saturating_add(size_of::<BootInfo>() as u64),
+        ),
         trampoline,
     ];
     let page = PAGE_SIZE as u64;
@@ -619,11 +637,15 @@ fn for_each_payload_free_piece(
         fixed
             .iter()
             .copied()
-            .chain(segments.iter().map(|s| (s.phys_addr, s.phys_addr + s.size)))
+            .chain(
+                segments
+                    .clone()
+                    .map(|s| (s.phys_addr, s.phys_addr.saturating_add(s.size))),
+            )
             .chain(
                 modules
                     .iter()
-                    .map(|m| (m.physical_base, m.physical_base + m.size)),
+                    .map(|m| (m.physical_base, m.physical_base.saturating_add(m.size))),
             )
             .chain(extra.iter().copied())
             .map(move |(s, e)| (align_down(s, page), align_up_saturating(e, page)))
@@ -746,7 +768,8 @@ fn fdt_extent(
     }
     let page = PAGE_SIZE as u64;
     let first = align_down(base, page);
-    Ok((first, align_up(end, page) - first))
+    // first <= base <= end, so the size does not saturate.
+    Ok((first, align_up_saturating(end, page).saturating_sub(first)))
 }
 
 /// Halt the boot on a `BootInfo.device_tree` that names no usable blob.
@@ -780,24 +803,20 @@ fn dtb_fatal(phys: u64, err: &DtbError) -> !
 
 // ── Alignment utilities ───────────────────────────────────────────────────────
 
-/// Round `val` up to the next multiple of `align`. `align` must be a power of two.
-fn align_up(val: u64, align: u64) -> u64
-{
-    (val + align - 1) & !(align - 1)
-}
-
 /// Round `val` up to the next multiple of `align`, saturating at the highest
-/// multiple below `u64::MAX`. `align` must be a power of two.
+/// multiple below `u64::MAX`. `align` must be a power of two; 0 leaves `val`
+/// as it is.
 fn align_up_saturating(val: u64, align: u64) -> u64
 {
-    val.checked_add(align - 1)
-        .map_or(!(align - 1), |v| v & !(align - 1))
+    let mask = align.saturating_sub(1);
+    val.checked_add(mask).map_or(!mask, |v| v & !mask)
 }
 
-/// Round `val` down to the nearest multiple of `align`. `align` must be a power of two.
+/// Round `val` down to the nearest multiple of `align`. `align` must be a
+/// power of two; 0 leaves `val` as it is.
 fn align_down(val: u64, align: u64) -> u64
 {
-    val & !(align - 1)
+    val & !align.saturating_sub(1)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -826,7 +845,10 @@ mod tests
         let size: u32 = 3 << 20;
         let top = BLOB + u64::from(size);
         let extent = fdt_extent(BLOB, top, || header(FDT_MAGIC, size));
-        assert_eq!(extent, Ok((0x8000_1000, align_up(top, 4096) - 0x8000_1000)));
+        assert_eq!(
+            extent,
+            Ok((0x8000_1000, align_up_saturating(top, 4096) - 0x8000_1000))
+        );
     }
 
     #[test]
@@ -1061,6 +1083,25 @@ mod tests
     {
         let map = [usable(0x10_0000, 0x4000)];
         assert_eq!(find_boot_table_carve(&boot_info(&map, &[]), 5), None);
+    }
+
+    // Defect caught: a frame count whose byte size wraps to a small request
+    // that some piece then appears to hold.
+    #[test]
+    fn a_carve_too_large_to_address_is_not_found()
+    {
+        let map = [usable(0x10_0000, 0x4000)];
+        let frames = (u64::MAX / PAGE_SIZE as u64) + 2;
+        assert_eq!(find_boot_table_carve(&boot_info(&map, &[]), frames), None);
+    }
+
+    // Defect caught: a DRAM entry past the end of the address space whose end
+    // wraps below its base, dropping it from the DRAM span.
+    #[test]
+    fn a_dram_entry_past_the_address_space_end_reaches_its_end()
+    {
+        let map = [usable(0x10_0000, 0x1000), usable(u64::MAX - 0xFFF, 0x2000)];
+        assert_eq!(compute_dram_bounds(&map), (0x10_0000, u64::MAX));
     }
 
     #[test]

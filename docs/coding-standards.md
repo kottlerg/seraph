@@ -61,12 +61,15 @@ exception is the staged roll-out below.
 `clippy::indexing_slicing` and `clippy::arithmetic_side_effects` are being made mandatory by a
 staged roll-out, crate by crate. A crate whose sites are fixed enables both at its crate root,
 `#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]`, which the build's
-warnings-as-errors makes binding for that crate. The crates are taken in this order: those that
-parse external input, the remaining `abi/`, `shared/` and `runtime/` crates, the userspace
-services, drivers and programs, `core/boot` and `core/kernel` by subsystem, and the harness and
-host crates. The roll-out ends by moving both lints to `[workspace.lints]` and removing every
-crate-root level for them. A crate-root level that enables a lint is permitted for these two
-lints only, and only until then. A site is fixed by a checked, wrapping or saturating operation
+warnings-as-errors makes binding for that crate. `core/kernel` is taken by subsystem: the same
+inner attribute at the root module of a subsystem (`core/kernel/src/<subsystem>/mod.rs`) binds
+that subsystem until every subsystem is fixed and the line moves to the kernel's crate root. The
+crates are taken in this order: those that parse external input, the remaining `abi/`, `shared/`
+and `runtime/` crates, the userspace services, drivers and programs, `core/boot` and
+`core/kernel` by subsystem, and the harness and host crates. The roll-out ends by moving both
+lints to `[workspace.lints]` and removing every crate-root and module-root level for them. A
+crate-root or module-root level that enables a lint is permitted for these two lints only, and
+only until then. A site is fixed by a checked, wrapping or saturating operation
 chosen for the meaning the code already has, a `get` with an error path the function already
 returns, or a restructuring that removes the index; a fix that sends an out-of-range input down a
 different path carries a host test of that input (§ D). A site none of these can express is a

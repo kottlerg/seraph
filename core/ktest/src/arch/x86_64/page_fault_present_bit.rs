@@ -136,7 +136,7 @@ fn handle_child(ctx: &TestContext) -> TestResult
         .and_then(|()| expect_fault(ctx, ep, child.th, RO_VA, Access::UserStore))
         .and_then(|()| {
             (0..PROBES)
-                .try_for_each(|k| expect_fault(ctx, ep, child.th, probe_va(k), Access::KernelLoad))
+                .try_for_each(|k| expect_fault(ctx, ep, child.th, probe_va(k)?, Access::KernelLoad))
         })
         .and_then(|()| {
             crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS)).map(|_| ())
@@ -228,7 +228,10 @@ fn expect_fault(ctx: &TestContext, ep: u64, child_th: u64, va: u64, access: Acce
     let mut regs = [0u8; BUF];
     thread_read_regs(child_th, &mut regs[..BUF])
         .map_err(|_| "page_fault_present_bit: thread_read_regs failed")?;
-    regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&(ip + 2).to_le_bytes());
+    let next_ip = ip
+        .checked_add(2)
+        .ok_or("page_fault_present_bit: fault IP overflows")?;
+    crate::spawn::set_reg_word(&mut regs, IP_OFFSET, next_ip)?;
     // SAFETY: the frame was read from this fault-blocked child and only its IP
     // moves, past the two-byte probe instruction to the next one in the same
     // function, on the child's own stack.
@@ -241,9 +244,11 @@ fn expect_fault(ctx: &TestContext, ep: u64, child_th: u64, va: u64, access: Acce
 
 /// The `k`th kernel-half probe address: the start of the `k`th 2 MiB slot of
 /// the image window.
-fn probe_va(k: u64) -> u64
+fn probe_va(k: u64) -> Result<u64, &'static str>
 {
-    PROBE_FLOOR + k * IMAGE_SLIDE_ALIGN
+    k.checked_mul(IMAGE_SLIDE_ALIGN)
+        .and_then(|off| PROBE_FLOOR.checked_add(off))
+        .ok_or("page_fault_present_bit: probe address overflows")
 }
 
 /// Child entry: store to the read-only user page, then load from every probe
@@ -254,7 +259,12 @@ extern "C" fn probe_child(_arg: u64) -> !
     probe_store(RO_VA);
     for k in 0..PROBES
     {
-        probe_load(probe_va(k));
+        let Ok(va) = probe_va(k)
+        else
+        {
+            syscall::thread_exit()
+        };
+        probe_load(va);
     }
     syscall::thread_exit()
 }

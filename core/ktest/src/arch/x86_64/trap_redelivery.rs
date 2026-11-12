@@ -148,8 +148,8 @@ fn resume_into_recovery(ctx: &TestContext, th: u64, sig: u64) -> TestResult
     let mut regs = [0u8; BUF];
     thread_read_regs(th, &mut regs[..BUF])
         .map_err(|_| "integration::trap_redelivery: thread_read_regs failed")?;
-    super::edit_rflags(&mut regs, |rflags| rflags & !X86_64_RFLAGS_TF);
-    spawn::redirect_to_entry(&mut regs[..], recovery_entry as *const () as u64);
+    super::edit_rflags(&mut regs, |rflags| rflags & !X86_64_RFLAGS_TF)?;
+    spawn::redirect_to_entry(&mut regs[..], recovery_entry as *const () as u64)?;
     // SAFETY: the frame was read from this child, so its stack pointer lies on
     // the child's own `ChildStack`; `redirect_to_entry` pointed it at
     // `recovery_entry`, an `extern "C"` entry that never returns, with the

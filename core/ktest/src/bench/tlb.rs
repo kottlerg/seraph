@@ -162,12 +162,23 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
             child.delete_cspace().ok();
             break;
         };
-        // SAFETY: bench tier runs sequentially; this is the only use of
+        // Bench tier runs sequentially; this is the only use of
         // SHOOTDOWN_STACKS[i].
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(SHOOTDOWN_STACKS[i]) });
+        let Ok(stack_top) = ChildStack::top_at(core::ptr::addr_of!(SHOOTDOWN_STACKS), i)
+        else
+        {
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
+            break;
+        };
         // i runs 0..pin_count ≤ MAX_PINNED ≤ 7; fits in u32.
-        #[allow(clippy::cast_possible_truncation)]
-        let cpu = (i + 1) as u32;
+        let Some(cpu) = i.checked_add(1).and_then(|c| u32::try_from(c).ok())
+        else
+        {
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
+            break;
+        };
         // SAFETY: worker `i` has not been started yet; each is started once.
         let arg = unsafe {
             SPINNER_ARGS.publish(
@@ -190,8 +201,15 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
             child.delete_cspace().ok();
             break;
         }
-        workers[i] = child;
-        spawned += 1;
+        let Some(slot) = workers.get_mut(i)
+        else
+        {
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
+            break;
+        };
+        *slot = child;
+        spawned = spawned.saturating_add(1);
     }
 
     crate::log_u64("ktest: bench  pinned_workers=", spawned as u64);
@@ -261,7 +279,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
             max = delta;
         }
         total = total.saturating_add(delta);
-        completed += 1;
+        completed = completed.saturating_add(1);
     }
 
     // A frame still mapped stays out of the pool rather than alias the next
@@ -301,7 +319,7 @@ fn teardown(workers: &mut [spawn::SpawnedChild; MAX_PINNED], spawned: usize, rea
         spawned,
         "ktest: bench  tlb: a worker never reported done",
     );
-    for worker in &mut workers[..spawned]
+    for worker in workers.iter_mut().take(spawned)
     {
         worker.delete_thread().ok();
         worker.delete_cspace().ok();
@@ -322,7 +340,15 @@ fn await_worker_bits(notif: u64, spawned: usize, label: &'static str)
     }
     // `1u64 << spawned` would overflow at `spawned == 64`, but MAX_PINNED
     // caps it well below that.
-    let all = (1u64 << spawned) - 1;
+    let Some(all) = u32::try_from(spawned)
+        .ok()
+        .and_then(|n| 1u64.checked_shl(n))
+        .and_then(|bit| bit.checked_sub(1))
+    else
+    {
+        crate::log(label);
+        return;
+    };
     let mut acc = 0u64;
     if crate::tally::await_all(notif, &mut acc, all, label).is_err()
     {
@@ -441,7 +467,14 @@ extern "C" fn conc_worker_entry(arg: u64) -> !
     } = unsafe { spawn::child_args(arg) };
     let bit = 1u64 << bit_index;
 
-    let va = CONC_VA_BASE + (bit_index as u64) * CONC_VA_STRIDE;
+    let Some(va) = (bit_index as u64)
+        .checked_mul(CONC_VA_STRIDE)
+        .and_then(|off| CONC_VA_BASE.checked_add(off))
+    else
+    {
+        notification_send(done_slot, bit).ok();
+        thread_exit();
+    };
 
     // Ready, then wait for the common GO so all initiators contend together.
     notification_send(ready_slot, bit).ok();
@@ -535,7 +568,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
             Some(fr) =>
             {
                 *f = fr;
-                allocated += 1;
+                allocated = allocated.saturating_add(1);
             }
             None => break,
         }
@@ -564,7 +597,14 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
             child.delete_cspace().ok();
             break;
         };
-        let Ok(child_memory) = syscall::cap_copy(memory_caps[i], child.cs, syscall::RIGHTS_ALL)
+        let Some(&memory_cap) = memory_caps.get(i)
+        else
+        {
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
+            break;
+        };
+        let Ok(child_memory) = syscall::cap_copy(memory_cap, child.cs, syscall::RIGHTS_ALL)
         else
         {
             child.delete_thread().ok();
@@ -579,13 +619,24 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
             break;
         };
 
-        // SAFETY: bench tier runs sequentially; this is the only use of
+        // Bench tier runs sequentially; this is the only use of
         // CONC_STACKS[i].
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(CONC_STACKS[i]) });
-        // cast_possible_truncation: i < allocated ≤ MAX_PINNED (7), so i + 1 fits in
-        // u32; i < want ≤ cpus-1, so CPU index i+1 is online.
-        #[allow(clippy::cast_possible_truncation)]
-        let cpu = (i + 1) as u32;
+        let Ok(stack_top) = ChildStack::top_at(core::ptr::addr_of!(CONC_STACKS), i)
+        else
+        {
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
+            break;
+        };
+        // i < allocated ≤ MAX_PINNED (7), so i + 1 fits in u32; i < want ≤ cpus-1,
+        // so CPU index i+1 is online.
+        let Some(cpu) = i.checked_add(1).and_then(|c| u32::try_from(c).ok())
+        else
+        {
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
+            break;
+        };
         // SAFETY: worker `i` has not been started yet; each is started once.
         let arg = unsafe {
             CONC_ARGS.publish(
@@ -611,8 +662,15 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
             child.delete_cspace().ok();
             break;
         }
-        workers[i] = child;
-        spawned += 1;
+        let Some(slot) = workers.get_mut(i)
+        else
+        {
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
+            break;
+        };
+        *slot = child;
+        spawned = spawned.saturating_add(1);
     }
 
     crate::log_u64("ktest: bench  conc_workers=", spawned as u64);
@@ -638,7 +696,14 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         // mem_unmap is idempotent, so this is a no-op for the normal path and
         // for frames whose worker never spawned. A frame whose unmap fails
         // stays out of the pool rather than alias the next test's mapping.
-        let va = CONC_VA_BASE + (i as u64) * CONC_VA_STRIDE;
+        let Some(va) = (i as u64)
+            .checked_mul(CONC_VA_STRIDE)
+            .and_then(|off| CONC_VA_BASE.checked_add(off))
+        else
+        {
+            // The frame stays out of the pool, as when its unmap fails.
+            continue;
+        };
         // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
         if unsafe { syscall::mem_unmap(ctx.aspace_cap, va, 1) }.is_ok()

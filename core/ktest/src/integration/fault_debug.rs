@@ -114,14 +114,14 @@ fn breakpoint(ctx: &TestContext, child: &spawn::SpawnedChild, ep: u64, sig: u64)
     let mut regs = [0u8; BUF];
     thread_read_regs(child.th, &mut regs[..BUF])
         .map_err(|_| "integration::fault_debug: thread_read_regs failed")?;
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&regs[IP_OFFSET..IP_OFFSET + 8]);
-    if u64::from_le_bytes(word) != reported
+    if crate::spawn::reg_word(&regs, IP_OFFSET)? != reported
     {
         return Err("integration::fault_debug: register IP does not match the message's");
     }
-    regs[IP_OFFSET..IP_OFFSET + 8]
-        .copy_from_slice(&(reported + BREAKPOINT_RESUME_ADVANCE).to_le_bytes());
+    let resume = reported
+        .checked_add(BREAKPOINT_RESUME_ADVANCE)
+        .ok_or("integration::fault_debug: the resume pointer overflows")?;
+    crate::spawn::set_reg_word(&mut regs, IP_OFFSET, resume)?;
     // SAFETY: the frame was read from this child, fault-blocked at its
     // breakpoint; only its instruction pointer changes, to the instruction
     // after the breakpoint in the same function, which it resumes as if the

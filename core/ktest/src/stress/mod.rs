@@ -86,11 +86,16 @@ fn rotation_slot(cycle: u32, cycles: u32, span: u32) -> u32
     let span = span.max(1);
     let slot = if cycles < span
     {
-        u64::from(cycle) * u64::from(span) / u64::from(cycles.max(1)) % u64::from(span)
+        // The product of two u32 values fits a u64, so it never saturates.
+        u64::from(cycle)
+            .saturating_mul(u64::from(span))
+            .checked_div(u64::from(cycles.max(1)))
+            .and_then(|spaced| spaced.checked_rem(u64::from(span)))
+            .unwrap_or(0)
     }
     else
     {
-        u64::from(cycle % span)
+        u64::from(cycle.checked_rem(span).unwrap_or(0))
     };
     // slot < span, a u32.
     u32::try_from(slot).unwrap_or(0)

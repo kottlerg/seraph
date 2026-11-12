@@ -67,14 +67,17 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "integration::retype_over_mapped_refused: cap_info(MEMORY_SIZE) failed")?;
-    if size < 2 * GRANT_PAGES * PAGE
-    {
-        return Err("integration::retype_over_mapped_refused: memory_base too small");
-    }
-    let grant_at = size - GRANT_PAGES * PAGE;
+    let (grant_at, other_at) = size
+        .checked_sub(GRANT_PAGES * PAGE)
+        .and_then(|grant_at| {
+            grant_at
+                .checked_sub(GRANT_PAGES * PAGE)
+                .map(|other_at| (grant_at, other_at))
+        })
+        .ok_or("integration::retype_over_mapped_refused: memory_base too small")?;
     let grant = memory_split(ctx.memory_base, grant_at)
         .map_err(|_| "integration::retype_over_mapped_refused: memory_split (grant) failed")?;
-    let result = match memory_split(ctx.memory_base, grant_at - GRANT_PAGES * PAGE)
+    let result = match memory_split(ctx.memory_base, other_at)
     {
         Ok(other) =>
         {
@@ -248,9 +251,21 @@ fn span_phase(ctx: &TestContext, wide: u64) -> TestResult
     let mut mapped = Ok(());
     for i in 0..SPAN_PAGES
     {
-        // SAFETY: the span lies in ktest's scratch band (crate docs § Scratch
-        // VAs), so it holds no Rust object or IPC page of ktest.
-        mapped = unsafe { map_one(wide, ctx.aspace_cap, SPAN_VA + i * PAGE, 2 * i) };
+        mapped = match (
+            i.checked_mul(PAGE)
+                .and_then(|offset| SPAN_VA.checked_add(offset)),
+            i.checked_mul(2),
+        )
+        {
+            (Some(va), Some(page)) =>
+            {
+                // SAFETY: the span lies in ktest's scratch band (crate docs
+                // § Scratch VAs), so it holds no Rust object or IPC page of
+                // ktest.
+                unsafe { map_one(wide, ctx.aspace_cap, va, page) }
+            }
+            _ => Err("integration::retype_over_mapped_refused: span address overflows"),
+        };
         if mapped.is_err()
         {
             break;

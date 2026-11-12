@@ -21,18 +21,7 @@ const SEND_ITERATIONS: u64 = 5000;
 
 /// Each sender ORs its unique bit (`1 << i`) once per iteration. The
 /// notification's bit width is 64; one sender per bit saturates the bitmask.
-const fn sender_bits() -> [u64; NUM_SENDERS]
-{
-    let mut bits = [0u64; NUM_SENDERS];
-    let mut i = 0;
-    while i < NUM_SENDERS
-    {
-        bits[i] = 1u64 << i;
-        i += 1;
-    }
-    bits
-}
-const SENDER_BITS: [u64; NUM_SENDERS] = sender_bits();
+const _: () = assert!(NUM_SENDERS <= 64);
 const ALL_BITS: u64 = u64::MAX;
 
 /// Per-sender arguments, handed to `sender_entry` by address.
@@ -83,8 +72,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             )
         };
 
-        // SAFETY: Sequential setup; each child gets a unique stack index.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        // Sequential setup; each child gets a unique stack index.
+        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(&child, sender_entry, stack_top, arg) }
@@ -135,7 +124,7 @@ extern "C" fn sender_entry(arg: u64) -> !
         bit_index,
     } = unsafe { spawn::child_args(arg) };
 
-    let bits = SENDER_BITS[bit_index.min(NUM_SENDERS - 1)];
+    let bits = 1u64 << bit_index.min(NUM_SENDERS - 1);
 
     for _ in 0..SEND_ITERATIONS
     {

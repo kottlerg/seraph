@@ -52,12 +52,16 @@ pub fn reserve_frames(entries: &[MemoryMapEntry]) -> usize
             continue;
         }
         let first = e.physical_base / LARGE_PAGE_SIZE;
-        let end = (e.physical_base + e.size).div_ceil(LARGE_PAGE_SIZE);
+        // An entry past the end of the address space is cut at it, which can
+        // only count one chunk more.
+        let end = e
+            .physical_base
+            .saturating_add(e.size)
+            .div_ceil(LARGE_PAGE_SIZE);
         let from = first.max(counted_end);
-        if end > from
-        {
-            frames += end - from;
-        }
+        // The chunks a 64-bit address space holds, far below the saturation
+        // point; none when an earlier entry counted them.
+        frames = frames.saturating_add(end.saturating_sub(from));
         counted_end = counted_end.max(end);
     }
     // The chunk count of any memory map the 64-bit kernel can map fits usize.
@@ -264,7 +268,8 @@ mod live
         debug_assert!(!is_mapped(phys), "stack_guard: a holed guard is mapped");
         // After the edit, which the reserve lock's release published: a CPU
         // that reads this epoch or a later one sees the hole.
-        Ok(GUARD_EPOCH.fetch_add(1, Ordering::AcqRel) + 1)
+        // The epoch wraps, as `fetch_add` does.
+        Ok(GUARD_EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1))
     }
 
     /// Flush this CPU's whole TLB, in every address space, when `stamp`, the

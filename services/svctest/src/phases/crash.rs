@@ -412,9 +412,12 @@ fn find_listed(authority: u64, matches: impl Fn(u64, &[u8]) -> bool) -> Option<(
         {
             let (badge, len) = procmgr_labels::unpack_list_entry(words, i, &mut name)
                 .expect("crash_endpoint: a LIST_PROCESSES entry");
-            if matches(badge, &name[..len])
+            let entry_name = name
+                .get(..len)
+                .expect("crash_endpoint: a LIST_PROCESSES name length within NAME_MAX");
+            if matches(badge, entry_name)
             {
-                return Some((badge, name[..len].to_vec()));
+                return Some((badge, entry_name.to_vec()));
             }
             cursor = Some(badge);
         }

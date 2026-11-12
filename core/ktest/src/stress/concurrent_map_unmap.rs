@@ -59,9 +59,12 @@ struct Mappers
 }
 
 /// Child `index`'s stress VA.
-fn child_va(index: usize) -> u64
+fn child_va(index: usize) -> Result<u64, &'static str>
 {
-    STRESS_MAP_BASE + (index as u64) * VA_STRIDE
+    (index as u64)
+        .checked_mul(VA_STRIDE)
+        .and_then(|offset| STRESS_MAP_BASE.checked_add(offset))
+        .ok_or("concurrent_map_unmap: child VA overflows")
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -103,33 +106,30 @@ fn copy_failed(index: usize, source: u64, error: i64, message: &'static str) -> 
 /// exists.
 fn start_mappers(ctx: &TestContext, done: u64, mappers: &mut Mappers) -> TestResult
 {
-    for i in 0..NUM_CHILDREN
+    for (i, frame_slot) in mappers.frames.iter_mut().enumerate()
     {
-        mappers.frames[i] =
+        *frame_slot =
             crate::frame_pool::alloc().ok_or("concurrent_map_unmap: frame pool exhausted")?;
-        mappers.allocated = i + 1;
+        mappers.allocated = i.saturating_add(1);
     }
 
     // Each child gets copies of its Memory cap and the aspace cap in its own
     // CSpace.
-    for (i, va_slot) in VA_PER_CHILD.iter().enumerate()
+    for (i, (va_slot, (child_slot, &frame))) in VA_PER_CHILD
+        .iter()
+        .zip(mappers.children.iter_mut().zip(mappers.frames.iter()))
+        .enumerate()
     {
-        mappers.children[i] =
+        *child_slot =
             spawn::new_child(ctx).map_err(|_| "concurrent_map_unmap: spawn::new_child failed")?;
-        mappers.spawned = i + 1;
-        let child = &mappers.children[i];
+        mappers.spawned = i.saturating_add(1);
+        let child = &*child_slot;
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|e| copy_failed(i, done, e, "concurrent_map_unmap: cap_copy done failed"))?;
         // Copy memory and aspace caps into child's CSpace with full rights.
-        let child_memory =
-            cap_copy(mappers.frames[i], child.cs, syscall::RIGHTS_ALL).map_err(|e| {
-                copy_failed(
-                    i,
-                    mappers.frames[i],
-                    e,
-                    "concurrent_map_unmap: cap_copy memory failed",
-                )
-            })?;
+        let child_memory = cap_copy(frame, child.cs, syscall::RIGHTS_ALL).map_err(|e| {
+            copy_failed(i, frame, e, "concurrent_map_unmap: cap_copy memory failed")
+        })?;
         let child_aspace =
             cap_copy(ctx.aspace_cap, child.cs, syscall::RIGHTS_ALL).map_err(|e| {
                 copy_failed(
@@ -156,10 +156,10 @@ fn start_mappers(ctx: &TestContext, done: u64, mappers: &mut Mappers) -> TestRes
 
         // Publish this child's VA in its VA_PER_CHILD slot; the child recovers `i`
         // from its done_bit (`trailing_zeros`).
-        va_slot.store(child_va(i), core::sync::atomic::Ordering::Release);
+        va_slot.store(child_va(i)?, core::sync::atomic::Ordering::Release);
 
-        // SAFETY: Each child uses a distinct stack index.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        // Each child uses a distinct stack index.
+        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(child, mapper_entry, stack_top, arg) }
@@ -197,15 +197,15 @@ fn await_mappers(done: u64) -> TestResult
 /// again.
 fn release(ctx: &TestContext, mappers: &mut Mappers) -> TestResult
 {
-    for child in &mut mappers.children[..mappers.spawned]
+    for child in mappers.children.iter_mut().take(mappers.spawned)
     {
         child.delete_thread().ok();
         child.delete_cspace().ok();
     }
     let mut result = Ok(());
-    for (i, &frame) in mappers.frames[..mappers.allocated].iter().enumerate()
+    for (i, &frame) in mappers.frames.iter().take(mappers.allocated).enumerate()
     {
-        let va = child_va(i);
+        let va = child_va(i)?;
         // A VA its child left unmapped refuses the unmap; either way the
         // query below decides.
         // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
@@ -242,7 +242,14 @@ extern "C" fn mapper_entry(arg: u64) -> !
 
     // Determine our child index from done_bit (1<<i → i).
     let child_idx = done_bit.trailing_zeros() as usize;
-    let va = VA_PER_CHILD[child_idx].load(core::sync::atomic::Ordering::Acquire);
+    let Some(va_slot) = VA_PER_CHILD.get(child_idx)
+    else
+    {
+        // The bounded wait reports the failure bit.
+        notification_send(done_slot, done_bit | ERROR_BIT).ok();
+        thread_exit();
+    };
+    let va = va_slot.load(core::sync::atomic::Ordering::Acquire);
 
     for _ in 0..MAP_ITERATIONS
     {

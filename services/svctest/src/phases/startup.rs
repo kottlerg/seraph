@@ -75,8 +75,13 @@ pub fn args_phase(_: &Caps)
         "expected 2 args, got {}",
         collected.len()
     );
-    assert_eq!(collected[0], "svctest", "argv[0] mismatch");
-    assert_eq!(collected[1], "run", "argv[1] mismatch");
+    let [argv0, argv1] = collected.as_slice()
+    else
+    {
+        panic!("expected 2 args, got {}", collected.len());
+    };
+    assert_eq!(argv0, "svctest", "argv[0] mismatch");
+    assert_eq!(argv1, "run", "argv[1] mismatch");
 
     // The back walk yields the same entries reversed, and the two ends
     // consume disjoint entries with `len` exact throughout.
@@ -164,8 +169,11 @@ pub fn stack_envelope_phase(_: &Caps)
         "stack_top_vaddr {:#x} is not page-aligned",
         info.stack_top_vaddr
     );
-    let stack_guard =
-        info.stack_top_vaddr - (1 + u64::from(process_abi::MAX_PROCESS_STACK_PAGES)) * 4096;
+    let stack_guard = u64::from(process_abi::MAX_PROCESS_STACK_PAGES)
+        .checked_add(1)
+        .and_then(|pages| pages.checked_mul(4096))
+        .and_then(|span| info.stack_top_vaddr.checked_sub(span))
+        .expect("stack_top_vaddr below the guard and maximum stack span");
     assert!(
         process_layout::STACK_GUARD_WINDOW.contains(stack_guard),
         "stack guard {stack_guard:#x} (top {top:#x}) outside the stack-guard window",
@@ -174,7 +182,10 @@ pub fn stack_envelope_phase(_: &Caps)
 
     let sp_probe = 0u64;
     let sp = core::ptr::addr_of!(sp_probe) as u64;
-    let stack_base = info.stack_top_vaddr - u64::from(info.stack_pages) * 4096;
+    let stack_base = u64::from(info.stack_pages)
+        .checked_mul(4096)
+        .and_then(|span| info.stack_top_vaddr.checked_sub(span))
+        .expect("reported stack_pages span exceeds stack_top_vaddr");
     assert!(
         (stack_base..info.stack_top_vaddr).contains(&sp),
         "SP {sp:#x} outside reported stack range \

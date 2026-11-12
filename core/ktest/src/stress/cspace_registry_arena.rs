@@ -44,7 +44,10 @@ static mut HANDLES: [u64; LIVE] = [0; LIVE];
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let needed = (LIVE as u64 + FUND_PAGES) * PAGE;
+    let needed = (LIVE as u64)
+        .checked_add(FUND_PAGES)
+        .and_then(|pages| pages.checked_mul(PAGE))
+        .ok_or("cspace_registry_arena: needed bytes overflow")?;
     let had = available(ctx)?;
     log_budget(needed, had);
     if had < needed
@@ -75,10 +78,10 @@ pub fn run(ctx: &TestContext) -> TestResult
             break;
         };
         *slot = cs;
-        created += 1;
+        created = created.saturating_add(1);
     }
 
-    for &cs in &handles[..created]
+    for &cs in handles.iter().take(created)
     {
         if cap_delete(cs).is_err() && outcome.is_ok()
         {
@@ -105,43 +108,7 @@ fn available(ctx: &TestContext) -> Result<u64, &'static str>
 /// Log `needed bytes <needed> available bytes <had>` on one line.
 fn log_budget(needed: u64, had: u64)
 {
-    const PREFIX: &[u8] = b"ktest: stress::cspace_registry_arena needed bytes ";
-    const MIDDLE: &[u8] = b" available bytes ";
-    let (needed_digits, needed_len) = decimal(needed);
-    let (had_digits, had_len) = decimal(had);
-    let mut line = [0u8; 128];
-    let mut len = 0;
-    for part in [
-        PREFIX,
-        &needed_digits[..needed_len],
-        MIDDLE,
-        &had_digits[..had_len],
-    ]
-    {
-        line[len..len + part.len()].copy_from_slice(part);
-        len += part.len();
-    }
-    crate::log(core::str::from_utf8(&line[..len]).unwrap_or("?"));
-}
-
-/// The decimal digits of `value` and their count.
-fn decimal(mut value: u64) -> ([u8; 20], usize)
-{
-    let mut digits = [0u8; 20];
-    let mut n = 0;
-    loop
-    {
-        // Lossless: a decimal digit.
-        #[allow(clippy::cast_possible_truncation)]
-        let digit = (value % 10) as u8;
-        digits[n] = b'0' + digit;
-        n += 1;
-        value /= 10;
-        if value == 0
-        {
-            break;
-        }
-    }
-    digits[..n].reverse();
-    (digits, n)
+    crate::log_args(format_args!(
+        "ktest: stress::cspace_registry_arena needed bytes {needed} available bytes {had}"
+    ));
 }

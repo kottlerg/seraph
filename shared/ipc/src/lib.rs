@@ -13,6 +13,8 @@
 //! creator), typed error-code constants, label modules, and the shared
 //! policy and code tables listed in `shared/ipc/README.md`.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // When built as a std dep via `rustc-dep-of-std`, we switch to `no_core`
 // and rebind `core` to the `rustc_std_workspace_core` facade — same dance
 // as abi/syscall and shared/syscall.
@@ -608,21 +610,23 @@ pub mod procmgr_labels
     /// fit `words`.
     pub fn pack_list_entry(words: &mut [u64], index: usize, badge: u64, name: &[u8]) -> bool
     {
-        let base = 1 + index * LIST_PROCESSES_WORDS_PER_ENTRY;
-        let Some(entry) = words.get_mut(base..base + LIST_PROCESSES_WORDS_PER_ENTRY)
+        let Some([badge_word, len_word, name_words @ ..]) =
+            list_entry_base(index).and_then(|base| {
+                words
+                    .get_mut(base..)?
+                    .get_mut(..LIST_PROCESSES_WORDS_PER_ENTRY)
+            })
         else
         {
             return false;
         };
-        let name = &name[..name.len().min(super::svcmgr_labels::NAME_MAX)];
-        entry.fill(0);
-        entry[0] = badge;
-        entry[1] = name.len() as u64;
-        for (word, chunk) in entry[2..].iter_mut().zip(name.chunks(8))
+        let name = name.get(..super::svcmgr_labels::NAME_MAX).unwrap_or(name);
+        *badge_word = badge;
+        *len_word = name.len() as u64;
+        name_words.fill(0);
+        for (word, chunk) in name_words.iter_mut().zip(name.chunks(8))
         {
-            let mut bytes = [0u8; 8];
-            bytes[..chunk.len()].copy_from_slice(chunk);
-            *word = u64::from_le_bytes(bytes);
+            *word = u64::from_le_bytes(crate::padded_word(chunk));
         }
         true
     }
@@ -644,16 +648,33 @@ pub mod procmgr_labels
         {
             return None;
         }
-        let base = 1 + index * LIST_PROCESSES_WORDS_PER_ENTRY;
-        let entry = words.get(base..base + LIST_PROCESSES_WORDS_PER_ENTRY)?;
-        let len = usize::try_from(entry[1])
+        let [badge, len_word, name_words @ ..] = words
+            .get(list_entry_base(index)?..)?
+            .get(..LIST_PROCESSES_WORDS_PER_ENTRY)?
+        else
+        {
+            return None;
+        };
+        let len = usize::try_from(*len_word)
             .ok()
             .filter(|&l| l <= super::svcmgr_labels::NAME_MAX)?;
-        for (chunk, word) in name[..len].chunks_mut(8).zip(&entry[2..])
+        for (chunk, word) in name.get_mut(..len)?.chunks_mut(8).zip(name_words)
         {
-            chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
+            for (byte, src) in chunk.iter_mut().zip(word.to_le_bytes())
+            {
+                *byte = src;
+            }
         }
-        Some((entry[0], len))
+        Some((*badge, len))
+    }
+
+    /// The first data word of entry `index` of a [`LIST_PROCESSES`] reply,
+    /// past the count in word 0; `None` when it does not fit a `usize`.
+    fn list_entry_base(index: usize) -> Option<usize>
+    {
+        index
+            .checked_mul(LIST_PROCESSES_WORDS_PER_ENTRY)?
+            .checked_add(1)
     }
 
     /// Hand a process's crash bindings back after a debugger's attach:
@@ -985,17 +1006,13 @@ pub fn memmgr_grant_layout(reply: &IpcMessage) -> Option<(&[u64], &[u64])>
 {
     let words = reply.words();
     let count = reply.caps().len();
-    let declared = *words.first()?;
-    // `count` is bounded by `MSG_CAP_SLOTS_MAX`, so `1 + 2 * count` cannot
-    // overflow.
-    if reply.label != memmgr_errors::SUCCESS
-        || count == 0
-        || declared != count as u64
-        || words.len() < 1 + 2 * count
+    let (&declared, rest) = words.split_first()?;
+    if reply.label != memmgr_errors::SUCCESS || count == 0 || declared != count as u64
     {
         return None;
     }
-    Some((&words[1..=count], &words[(1 + count)..=(2 * count)]))
+    let (counts, rest) = rest.split_at_checked(count)?;
+    Some((counts, rest.get(..count)?))
 }
 
 /// Error replies from memmgr.
@@ -1168,9 +1185,9 @@ pub mod svcmgr_labels
         {
             return None;
         }
-        for (i, &b) in name.iter().enumerate()
+        for (word, chunk) in out.iter_mut().zip(name.chunks(8))
         {
-            out[i / 8] |= u64::from(b) << ((i % 8) * 8);
+            *word = u64::from_le_bytes(crate::padded_word(chunk));
         }
         Some(name.len().div_ceil(8))
     }
@@ -1187,12 +1204,12 @@ pub mod svcmgr_labels
             return None;
         }
         let mut out = [0u8; NAME_MAX];
-        for (i, byte) in out.iter_mut().take(len).enumerate()
+        for (chunk, word) in out.get_mut(..len)?.chunks_mut(8).zip(words)
         {
-            // Truncation to the addressed byte is the decoding.
-            #[allow(clippy::cast_possible_truncation)]
-            let b = (words[i / 8] >> ((i % 8) * 8)) as u8;
-            *byte = b;
+            for (byte, src) in chunk.iter_mut().zip(word.to_le_bytes())
+            {
+                *byte = src;
+            }
         }
         Some(out)
     }
@@ -2236,8 +2253,8 @@ pub mod devmgr_labels
             {
                 return None;
             }
-            let slot = u64::try_from(slot).ok()?;
-            Some((slot + 1) | (verbs >> VERB_SHIFT))
+            let slot = u64::try_from(slot).ok()?.checked_add(1)?;
+            Some(slot | (verbs >> VERB_SHIFT))
         }
 
         /// The class slot and verb bits `badge` names; `None` for a badge
@@ -2251,7 +2268,9 @@ pub mod devmgr_labels
             {
                 return None;
             }
-            usize::try_from(slot - 1).ok().map(|s| (s, verbs))
+            usize::try_from(slot.checked_sub(1)?)
+                .ok()
+                .map(|s| (s, verbs))
         }
     }
 }
@@ -2500,7 +2519,8 @@ pub fn class_name_of(msg: &IpcMessage, at: usize) -> Option<&[u8]>
     {
         return None;
     }
-    msg.data_bytes().get((at + 1) * 8..)?.get(..len)
+    let start = at.checked_add(1)?.checked_mul(8)?;
+    msg.data_bytes().get(start..)?.get(..len)
 }
 
 /// The cap of a class call's `SUCCESS` reply.
@@ -3942,20 +3962,26 @@ impl IpcMessage
     /// words at fixed offsets keep working.
     ///
     /// # Panics
-    /// Panics in every build if `idx >= MSG_DATA_WORDS_MAX` (the array
-    /// bounds check); the index is a protocol constant, so an overrun is a
-    /// programmer error.
+    /// Panics in every build if `idx >= MSG_DATA_WORDS_MAX`; the index is a
+    /// protocol constant, so an overrun is a programmer error.
     #[must_use]
     pub fn word(&self, idx: usize) -> u64
     {
-        self.data[idx]
+        match self.data.get(idx)
+        {
+            Some(&word) => word,
+            None => panic!("IpcMessage::word: idx exceeds MSG_DATA_WORDS_MAX"),
+        }
     }
 
     /// Slice view of the populated data words: `&data[..word_count()]`.
     #[must_use]
     pub fn words(&self) -> &[u64]
     {
-        &self.data[..self.data_len as usize]
+        // `data_len <= MSG_DATA_WORDS_MAX`, so `get` always finds the range.
+        self.data
+            .get(..usize::from(self.data_len))
+            .unwrap_or_default()
     }
 
     /// Number of populated data words.
@@ -3990,7 +4016,10 @@ impl IpcMessage
     #[must_use]
     pub fn caps(&self) -> &[u64]
     {
-        &self.cap_slots[..self.cap_count as usize]
+        // `cap_count <= MSG_CAP_SLOTS_MAX`, so `get` always finds the range.
+        self.cap_slots
+            .get(..usize::from(self.cap_count))
+            .unwrap_or_default()
     }
 
     /// Snapshot the IPC buffer into an owned `IpcMessage`.
@@ -4031,7 +4060,7 @@ impl IpcMessage
         for (i, slot) in cap_slots.iter_mut().take(cap_count).enumerate()
         {
             // SAFETY: offset bounded as above.
-            *slot = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_CAP_HANDLES_WORD + i)) };
+            *slot = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_CAP_HANDLES_WORD).add(i)) };
         }
         Self {
             label,
@@ -4071,9 +4100,21 @@ impl IpcMessage
             // SAFETY: `caps()` holds at most MSG_CAP_SLOTS_MAX handles, and
             // `syscall_abi` asserts the cap block ends inside the 4 KiB
             // buffer. Caller guarantees pointer validity.
-            unsafe { core::ptr::write_volatile(ipc_buf.add(MSG_CAP_HANDLES_WORD + i), handle) };
+            unsafe { core::ptr::write_volatile(ipc_buf.add(MSG_CAP_HANDLES_WORD).add(i), handle) };
         }
     }
+}
+
+/// Up to eight bytes of `chunk`, zero-padded to the eight bytes of one data
+/// word in little-endian order; bytes past the eighth are not read.
+pub(crate) fn padded_word(chunk: &[u8]) -> [u8; 8]
+{
+    let mut bytes = [0u8; 8];
+    for (byte, &src) in bytes.iter_mut().zip(chunk)
+    {
+        *byte = src;
+    }
+    bytes
 }
 
 // ── IpcMessageBuilder ──────────────────────────────────────────────────────
@@ -4109,16 +4150,22 @@ impl IpcMessageBuilder
     /// Set data word `idx`; grow `word_count` to cover it if needed.
     ///
     /// # Panics
-    /// Panics in every build if `idx >= MSG_DATA_WORDS_MAX` (the array
-    /// bounds check on the `MSG_DATA_WORDS_MAX`-word data array, which
-    /// fires before `word_count` can grow past the bound); see
+    /// Panics in every build if `idx >= MSG_DATA_WORDS_MAX`, before
+    /// `word_count` can grow past the bound; see
     /// [`IpcMessageBuilder::word_count`] for why an overrun is treated as
     /// a programmer error.
     #[must_use]
     pub fn word(mut self, idx: usize, val: u64) -> Self
     {
-        self.msg.data[idx] = val;
-        let needed = (idx as u8) + 1;
+        let Some(slot) = self.msg.data.get_mut(idx)
+        else
+        {
+            panic!("IpcMessageBuilder::word: idx exceeds MSG_DATA_WORDS_MAX");
+        };
+        *slot = val;
+        // `idx < MSG_DATA_WORDS_MAX`, far below `u8::MAX`, so neither the
+        // cast nor the addition loses the count.
+        let needed = (idx as u8).saturating_add(1);
         if self.msg.data_len < needed
         {
             self.msg.data_len = needed;
@@ -4137,15 +4184,16 @@ impl IpcMessageBuilder
     #[must_use]
     pub fn words(mut self, start: usize, src: &[u64]) -> Self
     {
-        assert!(
-            start + src.len() <= MSG_DATA_WORDS_MAX,
-            "IpcMessageBuilder::words: range exceeds MSG_DATA_WORDS_MAX"
-        );
-        for (i, &val) in src.iter().enumerate()
+        let Some((end, dst)) = start
+            .checked_add(src.len())
+            .filter(|&end| end <= MSG_DATA_WORDS_MAX)
+            .and_then(|end| Some((end, self.msg.data.get_mut(start..end)?)))
+        else
         {
-            self.msg.data[start + i] = val;
-        }
-        let needed = (start + src.len()) as u8;
+            panic!("IpcMessageBuilder::words: range exceeds MSG_DATA_WORDS_MAX");
+        };
+        dst.copy_from_slice(src);
+        let needed = end as u8;
         if self.msg.data_len < needed
         {
             self.msg.data_len = needed;
@@ -4166,24 +4214,19 @@ impl IpcMessageBuilder
     pub fn bytes(mut self, start_word: usize, src: &[u8]) -> Self
     {
         let word_count = src.len().div_ceil(8);
-        assert!(
-            start_word + word_count <= MSG_DATA_WORDS_MAX,
-            "IpcMessageBuilder::bytes: range exceeds MSG_DATA_WORDS_MAX"
-        );
-        for i in 0..word_count
+        let Some((end, dst)) = start_word
+            .checked_add(word_count)
+            .filter(|&end| end <= MSG_DATA_WORDS_MAX)
+            .and_then(|end| Some((end, self.msg.data.get_mut(start_word..end)?)))
+        else
         {
-            let base = i * 8;
-            let mut w: u64 = 0;
-            for j in 0..8
-            {
-                if base + j < src.len()
-                {
-                    w |= u64::from(src[base + j]) << (j * 8);
-                }
-            }
-            self.msg.data[start_word + i] = w;
+            panic!("IpcMessageBuilder::bytes: range exceeds MSG_DATA_WORDS_MAX");
+        };
+        for (word, chunk) in dst.iter_mut().zip(src.chunks(8))
+        {
+            *word = u64::from_le_bytes(padded_word(chunk));
         }
-        let needed = (start_word + word_count) as u8;
+        let needed = end as u8;
         if self.msg.data_len < needed
         {
             self.msg.data_len = needed;
@@ -4198,14 +4241,19 @@ impl IpcMessageBuilder
     ///
     /// # Panics
     /// Panics in every build if `MSG_CAP_SLOTS_MAX` caps are already
-    /// appended (the slot array bounds check); a message's cap count is a
-    /// protocol constant, so an overrun is a programmer error.
+    /// appended; a message's cap count is a protocol constant, so an overrun
+    /// is a programmer error.
     #[must_use]
     pub fn cap(mut self, handle: u64) -> Self
     {
-        let i = self.msg.cap_count as usize;
-        self.msg.cap_slots[i] = handle;
-        self.msg.cap_count += 1;
+        let Some(slot) = self.msg.cap_slots.get_mut(usize::from(self.msg.cap_count))
+        else
+        {
+            panic!("IpcMessageBuilder::cap: MSG_CAP_SLOTS_MAX caps already appended");
+        };
+        *slot = handle;
+        // The count is below `MSG_CAP_SLOTS_MAX`, so this cannot saturate.
+        self.msg.cap_count = self.msg.cap_count.saturating_add(1);
         self
     }
 
@@ -4591,6 +4639,21 @@ mod tests
         );
         words[2] = svcmgr_labels::NAME_MAX as u64 + 1;
         assert!(unpack_list_entry(&words, 0, &mut out).is_none());
+    }
+
+    // The defect caught: an entry index whose word offset overflows `usize`,
+    // which wrapped to a small offset and wrote or read another entry.
+    #[test]
+    fn a_process_list_index_whose_offset_overflows_is_refused()
+    {
+        use procmgr_labels::{LIST_PROCESSES_WORDS_PER_ENTRY, pack_list_entry, unpack_list_entry};
+        let index = usize::MAX / LIST_PROCESSES_WORDS_PER_ENTRY + 1;
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_list_entry(&mut words, index, 7, b"a"));
+        assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
+        words[0] = u64::MAX;
+        let mut out = [0u8; svcmgr_labels::NAME_MAX];
+        assert!(unpack_list_entry(&words, index, &mut out).is_none());
     }
 
     #[test]

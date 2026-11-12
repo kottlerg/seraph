@@ -61,15 +61,14 @@ pub const fn is_valid_key(key: &[u8]) -> bool
     {
         return false;
     }
-    let mut i = 0;
-    while i < key.len()
+    let mut rest = key;
+    while let [b, tail @ ..] = rest
     {
-        let b = key[i];
-        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
         {
             return false;
         }
-        i += 1;
+        rest = tail;
     }
     true
 }
@@ -92,9 +91,9 @@ impl Span
     #[must_use]
     pub fn of(self, payload: &[u8]) -> &[u8]
     {
-        let start = usize::from(self.start);
         payload
-            .get(start..start + usize::from(self.len))
+            .get(usize::from(self.start)..)
+            .and_then(|rest| rest.get(..usize::from(self.len)))
             .unwrap_or(&[])
     }
 }
@@ -180,7 +179,8 @@ impl<'a> Record<'a>
     {
         Fields {
             payload: self.payload,
-            off: MESSAGE_LEN_BYTES + usize::from(self.message.len),
+            // A `u16` length past two bytes cannot overflow a `usize`.
+            off: MESSAGE_LEN_BYTES.saturating_add(usize::from(self.message.len)),
         }
     }
 }
@@ -231,14 +231,16 @@ impl<'a> Iterator for Fields<'a>
 /// counts; returns their span and the offset past them.
 fn read_len_prefixed(payload: &[u8], off: usize, width: usize) -> Result<(Span, usize), Malformed>
 {
-    let len_bytes = payload.get(off..off + width).ok_or(Malformed::Overrun)?;
-    let mut len = 0usize;
-    for (i, &b) in len_bytes.iter().enumerate()
-    {
-        len |= usize::from(b) << (8 * i);
-    }
-    let start = off + width;
-    let end = start + len;
+    let len_bytes = payload
+        .get(off..)
+        .and_then(|rest| rest.get(..width))
+        .ok_or(Malformed::Overrun)?;
+    let len = len_bytes
+        .iter()
+        .rev()
+        .fold(0usize, |len, &b| (len << 8) | usize::from(b));
+    let start = off.checked_add(width).ok_or(Malformed::Overrun)?;
+    let end = start.checked_add(len).ok_or(Malformed::Overrun)?;
     if end > payload.len()
     {
         return Err(Malformed::Overrun);
@@ -317,7 +319,8 @@ impl RecordWriter
     {
         if let Some(value_at) = self.begin_field(key.as_bytes())
         {
-            let end = self.write_text(value_at + VALUE_LEN_BYTES, value);
+            // `begin_field` placed the value length inside the buffer.
+            let end = self.write_text(value_at.saturating_add(VALUE_LEN_BYTES), value);
             self.finish_len_prefixed(value_at, VALUE_LEN_BYTES, end);
         }
         self
@@ -328,7 +331,8 @@ impl RecordWriter
     {
         if let Some(value_at) = self.begin_field(key)
         {
-            let end = self.write_bytes(value_at + VALUE_LEN_BYTES, value);
+            // `begin_field` placed the value length inside the buffer.
+            let end = self.write_bytes(value_at.saturating_add(VALUE_LEN_BYTES), value);
             self.finish_len_prefixed(value_at, VALUE_LEN_BYTES, end);
         }
         self
@@ -338,7 +342,8 @@ impl RecordWriter
     #[must_use]
     pub fn as_bytes(&self) -> &[u8]
     {
-        &self.buf[..self.len]
+        // `len <= RECORD_MAX_BYTES`, so `get` always finds the range.
+        self.buf.get(..self.len).unwrap_or_default()
     }
 
     /// Whether anything was clipped or dropped for room.
@@ -356,30 +361,37 @@ impl RecordWriter
         {
             return None;
         }
-        let need = KEY_LEN_BYTES + key.len() + VALUE_LEN_BYTES;
-        if RECORD_MAX_BYTES - self.len < need
+        // A valid key is at most `KEY_MAX_LEN` bytes, so this cannot
+        // saturate.
+        let need = (KEY_LEN_BYTES + VALUE_LEN_BYTES).saturating_add(key.len());
+        let Some([key_len, key_bytes @ .., _, _]) = self
+            .buf
+            .get_mut(self.len..)
+            .and_then(|rest| rest.get_mut(..need))
+        else
         {
             self.clipped = true;
             return None;
-        }
+        };
         // At most KEY_MAX_LEN, which the const assert above fits in a u8.
         #[allow(clippy::cast_possible_truncation)]
         {
-            self.buf[self.len] = key.len() as u8;
+            *key_len = key.len() as u8;
         }
-        let key_at = self.len + KEY_LEN_BYTES;
-        self.buf[key_at..key_at + key.len()].copy_from_slice(key);
-        let value_at = key_at + key.len();
-        self.len = value_at + VALUE_LEN_BYTES;
-        Some(value_at)
+        key_bytes.copy_from_slice(key);
+        // The field's bytes were found inside the buffer, so its end is too.
+        let end = self.len.saturating_add(need);
+        self.len = end;
+        Some(end.saturating_sub(VALUE_LEN_BYTES))
     }
 
     /// Format `args` into the buffer from `start`, clipping at a character
     /// boundary; returns the end offset.
     fn write_text(&mut self, start: usize, args: fmt::Arguments<'_>) -> usize
     {
+        // Every caller's `start` is inside the buffer.
         let mut clip = Clip {
-            buf: &mut self.buf[start..],
+            buf: self.buf.get_mut(start..).unwrap_or_default(),
             len: 0,
             clipped: false,
         };
@@ -388,30 +400,40 @@ impl RecordWriter
         let _ = fmt::write(&mut clip, args);
         let (len, clipped) = (clip.len, clip.clipped);
         self.clipped |= clipped;
-        start + len
+        // The text ends inside the buffer.
+        start.saturating_add(len)
     }
 
     /// Copy `bytes` into the buffer from `start`, clipping at the end;
     /// returns the end offset.
     fn write_bytes(&mut self, start: usize, bytes: &[u8]) -> usize
     {
-        let n = bytes.len().min(RECORD_MAX_BYTES - start);
+        // Every caller's `start` is inside the buffer.
+        let dst = self.buf.get_mut(start..).unwrap_or_default();
+        let n = bytes.len().min(dst.len());
         self.clipped |= n < bytes.len();
-        self.buf[start..start + n].copy_from_slice(&bytes[..n]);
-        start + n
+        for (byte, &src) in dst.iter_mut().zip(bytes)
+        {
+            *byte = src;
+        }
+        // The bytes end inside the buffer.
+        start.saturating_add(n)
     }
 
     /// Store the length of the bytes from `len_at + width` to `end` in the
     /// `width`-byte length at `len_at`, and end the record at `end`.
     fn finish_len_prefixed(&mut self, len_at: usize, width: usize, end: usize)
     {
-        let len = end - (len_at + width);
-        for i in 0..width
+        // `end` is at or past the end of the length field, inside the buffer.
+        let len = end.saturating_sub(len_at.saturating_add(width));
+        if let Some(field) = self
+            .buf
+            .get_mut(len_at..)
+            .and_then(|rest| rest.get_mut(..width))
         {
-            // A byte of a length below RECORD_MAX_BYTES.
-            #[allow(clippy::cast_possible_truncation)]
+            for (byte, src) in field.iter_mut().zip(len.to_le_bytes())
             {
-                self.buf[len_at + i] = (len >> (8 * i)) as u8;
+                *byte = src;
             }
         }
         self.len = end;
@@ -435,19 +457,22 @@ impl fmt::Write for Clip<'_>
         {
             return Ok(());
         }
-        let room = self.buf.len() - self.len;
+        // `len` never passes `buf.len()`.
+        let dst = self.buf.get_mut(self.len..).unwrap_or_default();
         let mut n = s.len();
-        if n > room
+        if n > dst.len()
         {
             self.clipped = true;
-            n = room;
-            while !s.is_char_boundary(n)
-            {
-                n -= 1;
-            }
+            n = s.floor_char_boundary(dst.len());
         }
-        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
-        self.len += n;
+        for (byte, &src) in dst
+            .iter_mut()
+            .zip(s.as_bytes().get(..n).unwrap_or_default())
+        {
+            *byte = src;
+        }
+        // `n` bytes fit after `len`, so this cannot saturate.
+        self.len = self.len.saturating_add(n);
         Ok(())
     }
 }

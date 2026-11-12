@@ -13,6 +13,8 @@
 
 // cast_possible_truncation: usize→u32 CPU index and u64→usize address bounded by MAX_CPUS.
 #![allow(clippy::cast_possible_truncation)]
+// Staged roll-out of docs/coding-standards.md § Clippy: this subsystem's sites are fixed.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 pub mod deadline_heap;
 pub mod run_queue;
@@ -98,6 +100,17 @@ pub fn quantum_ticks(level: u8) -> u32
 /// `SYS_THREAD_WRITE_MEM` stage their bytes in. The report gives the depth, not
 /// the path that reached it.
 pub const KERNEL_STACK_PAGES: usize = 4;
+
+/// A kernel stack's size in bytes.
+const KERNEL_STACK_BYTES: u64 = (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+
+/// The lowest address of the kernel stack whose top is `top`. A stack top is a
+/// direct-map address at least a stack above the map's base, so the
+/// subtraction never wraps.
+const fn kernel_stack_floor(top: u64) -> u64
+{
+    top.wrapping_sub(KERNEL_STACK_BYTES)
+}
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's
 /// sanity ceiling ([`boot_protocol::MAX_CPUS`], 8192). No structure is sized
@@ -210,24 +223,52 @@ unsafe fn idle_stack_top_slot(cpu: usize) -> *mut u64
 #[cfg(not(test))]
 const fn idle_block_order() -> usize
 {
-    let mut o = 0;
-    while (1usize << o) < KERNEL_STACK_PAGES + 1
-    {
-        o += 1;
-    }
-    o
+    (KERNEL_STACK_PAGES + 1)
+        .next_power_of_two()
+        .trailing_zeros() as usize
 }
 
 /// An idle stack's place in its buddy block of `2^order` pages at `block`:
 /// `(guard, stack_base, spare_bytes)`. The stack is the block's top
 /// `KERNEL_STACK_PAGES` pages, the guard the page below it, and the
-/// `spare_bytes` below the guard, from `block`, go back to the buddy.
-const fn idle_block_layout(block: u64, order: usize) -> (u64, u64, u64)
+/// `spare_bytes` below the guard, from `block`, go back to the buddy. `None`
+/// when the block has no room for the stack and its guard, or its end passes
+/// the physical address space.
+const fn idle_block_layout(block: u64, order: usize) -> Option<(u64, u64, u64)>
 {
     let page = PAGE_SIZE as u64;
-    let stack_base = block + ((1u64 << order) - KERNEL_STACK_PAGES as u64) * page;
-    let guard = stack_base - page;
-    (guard, stack_base, guard - block)
+    // The guard's page index within the block: every page below the stack and
+    // the guard is spare.
+    let Some(block_pages) = 1u64.checked_shl(order as u32)
+    else
+    {
+        return None;
+    };
+    let Some(spare_pages) = block_pages.checked_sub((KERNEL_STACK_PAGES + 1) as u64)
+    else
+    {
+        return None;
+    };
+    let Some(spare) = spare_pages.checked_mul(page)
+    else
+    {
+        return None;
+    };
+    let Some(guard) = block.checked_add(spare)
+    else
+    {
+        return None;
+    };
+    let Some(stack_base) = guard.checked_add(page)
+    else
+    {
+        return None;
+    };
+    if stack_base.checked_add(KERNEL_STACK_BYTES).is_none()
+    {
+        return None;
+    }
+    Some((guard, stack_base, spare))
 }
 
 /// Number of CPUs, published once during boot by `init_storage` (Phase 4) and read lock-free
@@ -992,7 +1033,10 @@ fn system_has_no_work(cpu_count: usize) -> bool
 fn watchdog_tick_and_check()
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let now = WATCHDOG_TICK_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    // The counter wraps, as `fetch_add` does.
+    let now = WATCHDOG_TICK_COUNTER
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1);
 
     // Only fire once per stall to avoid log flood.
     if WATCHDOG_FIRED.load(core::sync::atomic::Ordering::Relaxed)
@@ -1068,10 +1112,11 @@ fn owed_wake_scan()
     let mut suspects = [(core::ptr::null_mut::<ThreadControlBlock>(), 0u32, 0u8); OWED_WAKE_MAX];
     let mut count = 0usize;
     let collect = |t: *mut ThreadControlBlock| {
-        if count >= OWED_WAKE_MAX
+        let Some(slot) = suspects.get_mut(count)
+        else
         {
             return;
-        }
+        };
         // SAFETY: t is a registry-walked TCB kept allocated by the registry
         // lock, which orders before every `sched_lock`. The `sched_lock`-owned
         // fields are read under that lock, try-locked so a wedged holder cannot
@@ -1128,8 +1173,9 @@ fn owed_wake_scan()
         {
             return;
         };
-        suspects[count] = (t, tid, rule);
-        count += 1;
+        *slot = (t, tid, rule);
+        // `slot` was below OWED_WAKE_MAX, so the count stays within it.
+        count = count.saturating_add(1);
     };
     // SAFETY: the closure registers and unregisters no thread, and the only
     // lock it takes, each walked TCB's `sched_lock`, it only try-locks, as
@@ -1141,24 +1187,21 @@ fn owed_wake_scan()
         return;
     }
 
-    let mut fire: Option<(u32, u8)> = None;
-    for &(t, tid, rule) in suspects.iter().take(count)
-    {
-        // SAFETY: CPU0-static idiom — single writer/reader (this function, on
-        // the BSP, behind an interrupt gate).
-        let persistent = rule == OWED_RULE_EXPIRED_DEADLINE
-            || unsafe { OWED_WAKE_LAST[..OWED_WAKE_LAST_COUNT].contains(&(t, rule)) };
-        if persistent
-        {
-            fire = Some((tid, rule));
-            break;
-        }
-    }
+    // The previous scan's suspects, `OWED_WAKE_LAST_COUNT <= OWED_WAKE_MAX`.
+    // SAFETY: CPU0-static idiom — single writer/reader (this function, on
+    // the BSP, behind an interrupt gate).
+    let seen = unsafe { (*core::ptr::addr_of!(OWED_WAKE_LAST)).get(..OWED_WAKE_LAST_COUNT) }
+        .unwrap_or(&[]);
+    let fire = suspects
+        .iter()
+        .take(count)
+        .find(|&&(t, _, rule)| rule == OWED_RULE_EXPIRED_DEADLINE || seen.contains(&(t, rule)))
+        .map(|&(_, tid, rule)| (tid, rule));
 
     // SAFETY: CPU0-static idiom as above.
     unsafe {
         let last = &mut *core::ptr::addr_of_mut!(OWED_WAKE_LAST);
-        for (entry, &(t, _, rule)) in last.iter_mut().zip(&suspects[..count])
+        for (entry, &(t, _, rule)) in last.iter_mut().zip(suspects.iter().take(count))
         {
             *entry = (t, rule);
         }
@@ -1299,7 +1342,9 @@ fn watchdog_dump(reason: &str)
     // thread, syscall, and call site: a wedged holder or a leaked hold shows
     // here as a held state word whose last acquirer is not spinning.
     let deriv = crate::cap::DERIVATION_LOCK.debug_snapshot();
-    let holder_cpu = i64::from(deriv.holder) - 1;
+    // `holder` is the holding CPU plus one, 0 for none (printed as -1); an
+    // `i64` holds every `u32` value less one.
+    let holder_cpu = i64::from(deriv.holder).saturating_sub(1);
     let (site_file, site_line) = deriv
         .site
         .map_or(("none", 0), |loc| (loc.file(), loc.line()));
@@ -1558,13 +1603,15 @@ fn watchdog_dump_sleep_list()
     let count = unsafe {
         SLEEP_LIST_LOCK.try_lock_raw().map(|saved| {
             let list = &*core::ptr::addr_of!(SLEEP_LIST);
-            let mut slot = 0;
+            let mut slots = entries.iter_mut();
             list.visit(WATCHDOG_SLEEP_ENTRIES, |node| {
-                entries[slot] = SleepEntrySnapshot {
-                    tid: (*tcb_of_sleep_node(node)).thread_id,
-                    deadline: (*node).key(),
-                };
-                slot += 1;
+                if let Some(slot) = slots.next()
+                {
+                    *slot = SleepEntrySnapshot {
+                        tid: (*tcb_of_sleep_node(node)).thread_id,
+                        deadline: (*node).key(),
+                    };
+                }
             });
             let count = list.len();
             SLEEP_LIST_LOCK.unlock_raw(saved);
@@ -2192,7 +2239,6 @@ pub fn sleep_check_wakeups()
     // lock first.
     let mut first: *mut ThreadControlBlock = core::ptr::null_mut();
     let mut last: *mut ThreadControlBlock = core::ptr::null_mut();
-    let mut n = 0usize;
 
     // SAFETY: lock serialises all sleep list access.
     let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
@@ -2279,13 +2325,12 @@ pub fn sleep_check_wakeups()
                 (*last).sleep_expiry.next = tcb;
             }
             last = tcb;
-            n += 1;
         }
     }
 
     // A batch is in flight: the claims below lock sources through pop-time
     // pointers that hold no reference (see sleep_wakeups_quiesce).
-    if n != 0
+    if !first.is_null()
     {
         TIMER_DISPATCH_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
@@ -2458,7 +2503,7 @@ pub fn sleep_check_wakeups()
         }
     }
 
-    if n != 0
+    if !first.is_null()
     {
         // Release: orders this batch's last source access before a
         // sleep_wakeups_quiesce caller's Acquire observes the even value.
@@ -2610,10 +2655,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
             cpu as u64,
             crate::arch::ThreadKind::Kernel,
         );
-        crate::arch::current::context::set_stack_floor(
-            &mut saved,
-            stack_top - (KERNEL_STACK_PAGES * PAGE_SIZE) as u64,
-        );
+        crate::arch::current::context::set_stack_floor(&mut saved, kernel_stack_floor(stack_top));
 
         // Initialise this CPU's idle TCB in place inside the dynamic slab.
         // SAFETY: single-threaded boot init; the slot for this cpu is
@@ -2747,11 +2789,11 @@ pub unsafe fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     // Every CPU set is this boot's width from here on.
     crate::cpu_mask::set_boot_cpu_count(cpu_count as usize);
     // One CPU set, not a per-CPU slab: at most MAX_MASK_WORDS words (1 KiB).
-    let words = alloc_zeroed_slab::<core::sync::atomic::AtomicU64>(
-        crate::cpu_mask::mask_words() * core::mem::size_of::<core::sync::atomic::AtomicU64>(),
-        allocator,
-        "RESCHEDULE_PENDING",
-    );
+    let bytes = crate::cpu_mask::mask_words()
+        .checked_mul(core::mem::size_of::<core::sync::atomic::AtomicU64>())
+        .unwrap_or_else(|| crate::fatal("init_storage: RESCHEDULE_PENDING overflows"));
+    let words =
+        alloc_zeroed_slab::<core::sync::atomic::AtomicU64>(bytes, allocator, "RESCHEDULE_PENDING");
     RESCHEDULE_PENDING.store(words, core::sync::atomic::Ordering::Release);
     BOOT_TRANSIENT_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
     init_per_cpu_storage(cpu_count, allocator);
@@ -2838,7 +2880,8 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
         let block = allocator
             .alloc(block_order)
             .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: out of memory for idle stack"));
-        let (guard, stack_phys, spare) = idle_block_layout(block, block_order);
+        let (guard, stack_phys, spare) = idle_block_layout(block, block_order)
+            .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: idle stack block too small"));
         // SAFETY: the pages below the guard are this fresh block's, never
         // reached, and the buddy is unsealed until Phase 7.
         unsafe { allocator.free_range(block, spare) };
@@ -2848,8 +2891,10 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
         {
             crate::fatal("init_per_cpu_storage: cannot unmap an idle stack's guard page");
         }
-        // Stack grows downward; top = base + size (direct map).
-        let stack_top = phys_to_virt(stack_phys) + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+        // Stack grows downward; top = base + size (direct map). The stack is
+        // the block's top pages, so the top is the block's end, a direct-map
+        // address.
+        let stack_top = phys_to_virt(stack_phys).wrapping_add(KERNEL_STACK_BYTES);
         // Paint it for the depth report (crate::stack_depth).
         // SAFETY: the stack pages are this CPU's idle stack alone, mapped
         // through the direct map; no thread runs on it yet.
@@ -2978,14 +3023,14 @@ impl PerCpuSlab
     /// of its architecture.
     pub(crate) const fn sized_at_every_width(self) -> bool
     {
-        let mut i = 0;
-        while i < SLAB_CHECK_WIDTHS.len()
+        let mut widths = SLAB_CHECK_WIDTHS.as_slice();
+        while let [width, rest @ ..] = widths
         {
-            if !self.sized_at(SLAB_CHECK_WIDTHS[i])
+            if !self.sized_at(*width)
             {
                 return false;
             }
-            i += 1;
+            widths = rest;
         }
         true
     }
@@ -3050,8 +3095,9 @@ pub(crate) fn alloc_zeroed_slab<T>(
         crate::fatal("alloc_zeroed_slab: buddy exhausted")
     });
     let virt = phys_to_virt(phys) as *mut T;
-    // SAFETY: virt covers `pages` pages (>= bytes) of mapped, kernel-owned RAM.
-    unsafe { core::ptr::write_bytes(virt.cast::<u8>(), 0, pages * PAGE_SIZE) };
+    // SAFETY: virt covers `pages` pages (>= bytes) of mapped, kernel-owned RAM,
+    // which the count of page-sized elements spans.
+    unsafe { core::ptr::write_bytes(virt.cast::<[u8; PAGE_SIZE]>(), 0, pages) };
     virt
 }
 
@@ -5182,6 +5228,17 @@ struct IdlePullMemory
     cursor: usize,
 }
 
+/// The CPU after `cpu` in index order, wrapping to 0 after the last of
+/// `cpu_count`; 0 when `cpu_count` is 0.
+const fn cpu_after(cpu: usize, cpu_count: usize) -> usize
+{
+    match cpu.wrapping_add(1).checked_rem(cpu_count)
+    {
+        Some(next) => next,
+        None => 0,
+    }
+}
+
 /// Scan every CPU but `this_cpu` and `skip` through [`IdleScan::note`], in index
 /// order starting at `start` and wrapping: one load per CPU, and one run-queue
 /// mask read per CPU whose load is non-zero up to the first with a queued
@@ -5195,9 +5252,10 @@ fn idle_scan(
 ) -> IdleScan
 {
     let mut scan = IdleScan::EMPTY;
-    for offset in 0..cpu_count
+    // Every CPU once, from `start` (taken modulo the count) up, then from 0.
+    let start = start.checked_rem(cpu_count).unwrap_or(0);
+    for cpu in (start..cpu_count).chain(0..start)
     {
-        let cpu = (start + offset) % cpu_count;
         if cpu == this_cpu || Some(cpu) == skip
         {
             continue;
@@ -5288,7 +5346,7 @@ fn idle_pull_tick(
         {
             let cursor = if view.pull(src, rule) == PullOutcome::NothingPullable
             {
-                (src + 1) % cpu_count
+                cpu_after(src, cpu_count)
             }
             else
             {
@@ -5448,10 +5506,11 @@ unsafe fn try_pull_balance(this_cpu: usize)
         let tick = LOAD_BALANCE_TICK.fetch_add(1, Ordering::Relaxed);
         let mix = tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (this_cpu as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        let mut v = (mix as usize) % cpu_count;
+        // cpu_count >= 2 (checked above), so neither remainder is by zero.
+        let mut v = (mix as usize).checked_rem(cpu_count).unwrap_or(0);
         if v == this_cpu
         {
-            v = (v + 1) % cpu_count;
+            v = cpu_after(v, cpu_count);
         }
         // SAFETY: v < cpu_count; slab initialised.
         let their_load = unsafe { (*scheduler_ptr(v)).current_load() };
@@ -6903,7 +6962,8 @@ pub unsafe fn schedule(requeue: Requeue)
         } == 0
         {
             core::hint::spin_loop();
-            spins += 1;
+            // Only its multiples of 1024 matter, which wrapping keeps.
+            spins = spins.wrapping_add(1);
             // Single-shot diagnostic when the publication barrier stalls;
             // healthy is <100 iterations. The time check is throttled so the
             // spin body stays a cache-local load.
@@ -7409,7 +7469,8 @@ pub unsafe fn enter() -> !
     // Build the initial user-mode TrapFrame on the init thread's kernel stack.
     // The frame sits just below kernel_stack_top.
     let tf_size = core::mem::size_of::<TrapFrame>() as u64;
-    let tf_ptr: *mut TrapFrame = (kernel_stack_top - tf_size) as *mut TrapFrame;
+    // The frame is far smaller than the stack below kernel_stack_top.
+    let tf_ptr: *mut TrapFrame = kernel_stack_top.wrapping_sub(tf_size) as *mut TrapFrame;
 
     // Zero the frame then populate the user-mode entry fields via TrapFrame
     // methods (arch-specific field names are hidden inside
@@ -7465,9 +7526,7 @@ pub unsafe fn enter() -> !
     // SAFETY: the BSP's per-CPU pointer is installed (Phase 5); the floor is
     // the base of the stack this CPU runs on from the `sret` on.
     unsafe {
-        crate::percpu::set_kernel_stack_floor(
-            kernel_stack_top - (KERNEL_STACK_PAGES * PAGE_SIZE) as u64,
-        );
+        crate::percpu::set_kernel_stack_floor(kernel_stack_floor(kernel_stack_top));
     }
 
     // Activate init's address space (tagged when tagging is enabled) and enter
@@ -8098,7 +8157,7 @@ mod idle_pull_tests
 #[cfg(test)]
 mod idle_block_tests
 {
-    use super::{KERNEL_STACK_PAGES, idle_block_layout};
+    use super::{KERNEL_STACK_PAGES, cpu_after, idle_block_layout};
     use crate::mm::PAGE_SIZE;
 
     // The defect caught: a stack that does not end at the block's top, a guard
@@ -8109,10 +8168,34 @@ mod idle_block_tests
     {
         let page = PAGE_SIZE as u64;
         let block = 0x8_0000u64;
-        let (guard, stack, spare) = idle_block_layout(block, 3);
+        let (guard, stack, spare) = idle_block_layout(block, 3).unwrap();
         assert_eq!(stack + KERNEL_STACK_PAGES as u64 * page, block + 8 * page);
         assert_eq!(guard, stack - page);
         assert_eq!(block + spare, guard);
+    }
+
+    // The defect caught: a block with no room for the stack and its guard, or
+    // one that ends past the address space, laid out by wrapped arithmetic into
+    // a stack outside the block.
+    #[test]
+    fn a_block_too_small_or_past_the_address_space_has_no_layout()
+    {
+        assert_eq!(idle_block_layout(0x8_0000, 2), None);
+        assert_eq!(idle_block_layout(u64::MAX - PAGE_SIZE as u64, 3), None);
+        // The guard and the stack base fit; the stack's end does not.
+        let block = 0u64.wrapping_sub(8 * PAGE_SIZE as u64);
+        assert_eq!(idle_block_layout(block, 3), None);
+        assert_eq!(idle_block_layout(0, 64), None);
+    }
+
+    // The defect caught: a cursor that steps past the last CPU, or a division
+    // by a zero count.
+    #[test]
+    fn the_cpu_after_the_last_is_the_first()
+    {
+        assert_eq!([0, 1, 2].map(|cpu| cpu_after(cpu, 3)), [1, 2, 0]);
+        assert_eq!(cpu_after(usize::MAX, 3), 0);
+        assert_eq!(cpu_after(5, 0), 0);
     }
 }
 

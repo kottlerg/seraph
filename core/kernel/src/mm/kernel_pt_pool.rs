@@ -112,7 +112,8 @@ pub(crate) unsafe fn init(seed_pages: usize)
             *(phys_to_virt(pa) as *mut u64) = head;
             FREE_LIST_HEAD = pa;
         }
-        installed += 1;
+        // At most seed_pages, so the count never saturates.
+        installed = installed.saturating_add(1);
     }
     REMAINING.store(installed, Ordering::Release);
 }

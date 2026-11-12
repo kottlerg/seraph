@@ -70,7 +70,7 @@ fn recycle_past_one_byte(ctx: &TestContext) -> Result<(u64, u64), &'static str>
             return Err("cap_generation_wide: freed slot was not recycled (index differs)");
         }
     }
-    if cap_handle_gen(live) != cap_handle_gen(stale) + RECYCLES
+    if Some(cap_handle_gen(live)) != cap_handle_gen(stale).checked_add(RECYCLES)
     {
         cap_delete(live).ok();
         return Err("cap_generation_wide: generation did not advance once per recycle");

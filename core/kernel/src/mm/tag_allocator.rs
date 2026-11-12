@@ -58,11 +58,15 @@ pub const MAX_HW_TAGS: usize = 1 << 16;
 pub const TAG_STATE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
 /// Bytes of pool storage [`TagPool::over`] needs for `num_tags` tags: the
-/// in-use bitmap, then the owner and claim-generation arrays.
+/// in-use bitmap, then the owner and claim-generation arrays. A count too
+/// large to address saturates at `usize::MAX`, which no storage holds.
 #[must_use]
 pub const fn pool_storage_bytes(num_tags: usize) -> usize
 {
-    num_tags.div_ceil(64) * 8 + num_tags * 8 + num_tags * 8
+    num_tags
+        .div_ceil(64)
+        .saturating_mul(8)
+        .saturating_add(num_tags.saturating_mul(16))
 }
 
 // ── Pure pool state ────────────────────────────────────────────────────────────
@@ -108,7 +112,7 @@ impl TagPool
     fn over(storage: &'static mut [u64], num_tags: usize) -> Option<Self>
     {
         let n = num_tags.min(MAX_HW_TAGS);
-        if storage.len() * 8 < pool_storage_bytes(n)
+        if core::mem::size_of_val(storage) < pool_storage_bytes(n)
         {
             return None;
         }
@@ -132,7 +136,8 @@ impl TagPool
     /// Allocate the next unique claim generation.
     fn next_gen(&mut self) -> u64
     {
-        self.alloc_gen += 1;
+        // Never wraps in practice (`alloc_gen`).
+        self.alloc_gen = self.alloc_gen.wrapping_add(1);
         self.alloc_gen
     }
 
@@ -141,7 +146,11 @@ impl TagPool
     fn is_used(&self, tag: u16) -> bool
     {
         let t = tag as usize;
-        t < self.num_tags && self.in_use[t / 64] & (1u64 << (t % 64)) != 0
+        t < self.num_tags
+            && self
+                .in_use
+                .get(t / 64)
+                .is_some_and(|&word| word & tag_bit(t) != 0)
     }
 
     /// First free tag in `1..num_tags`, or `None` if the pool is full. Scans the
@@ -154,7 +163,10 @@ impl TagPool
         self.in_use.iter().enumerate().find_map(|(w, &word)| {
             // Tag 0 is reserved: its bit always reads as used.
             let word = if w == 0 { word | 1 } else { word };
-            let t = w * 64 + (!word).trailing_zeros() as usize;
+            // w < MAX_HW_TAGS / 64, far below the saturation point.
+            let t = w
+                .saturating_mul(64)
+                .saturating_add((!word).trailing_zeros() as usize);
             (word != u64::MAX && t < self.num_tags).then_some(t as u16)
         })
     }
@@ -167,14 +179,18 @@ impl TagPool
     fn oldest_used_above(&self, floor: u64) -> Option<(u16, u64)>
     {
         let mut best: Option<(u16, u64)> = None;
-        for t in 1..self.num_tags
+        for (t, &at) in self
+            .claimed_at
+            .iter()
+            .enumerate()
+            .take(self.num_tags)
+            .skip(1)
         {
             let tag = t as u16;
             if !self.is_used(tag)
             {
                 continue;
             }
-            let at = self.claimed_at[t];
             if at <= floor
             {
                 continue;
@@ -187,13 +203,21 @@ impl TagPool
         best
     }
 
-    /// Record `tag` as claimed by `owner` at generation `claim_gen`.
+    /// Record `tag` as claimed by `owner` at generation `claim_gen`. A tag
+    /// past the pool, which no claim draws, records nothing.
     fn record(&mut self, tag: u16, owner: usize, claim_gen: u64)
     {
         let t = tag as usize;
-        self.in_use[t / 64] |= 1u64 << (t % 64);
-        self.owners[t] = owner;
-        self.claimed_at[t] = claim_gen;
+        if let (Some(word), Some(owner_slot), Some(at)) = (
+            self.in_use.get_mut(t / 64),
+            self.owners.get_mut(t),
+            self.claimed_at.get_mut(t),
+        )
+        {
+            *word |= tag_bit(t);
+            *owner_slot = owner;
+            *at = claim_gen;
+        }
     }
 
     /// Return `tag` to the free pool if `owner` still holds it, and report
@@ -204,15 +228,28 @@ impl TagPool
     fn release(&mut self, tag: u16, owner: usize) -> bool
     {
         let t = tag as usize;
-        if !self.is_used(tag) || self.owners[t] != owner
+        if !self.is_used(tag) || self.owners.get(t) != Some(&owner)
         {
             return false;
         }
-        self.in_use[t / 64] &= !(1u64 << (t % 64));
-        self.owners[t] = 0;
-        self.claimed_at[t] = 0;
+        if let (Some(word), Some(owner_slot), Some(at)) = (
+            self.in_use.get_mut(t / 64),
+            self.owners.get_mut(t),
+            self.claimed_at.get_mut(t),
+        )
+        {
+            *word &= !tag_bit(t);
+            *owner_slot = 0;
+            *at = 0;
+        }
         true
     }
+}
+
+/// Tag `t`'s bit in its word of the in-use bitmap, word `t / 64`.
+const fn tag_bit(t: usize) -> u64
+{
+    1u64 << (t % 64)
 }
 
 /// The tag count [`enable`](glue::enable) configures for `hw_tags` hardware
@@ -228,12 +265,16 @@ pub fn tag_count(hw_tags: usize, cpu_count: usize) -> Option<usize>
 {
     let cpus = cpu_count.max(1);
     let hw = hw_tags.min(MAX_HW_TAGS);
-    let gate = cpus + 2;
+    // cpus is a CPU count, far below either saturation point; a saturated
+    // divisor only leaves `fit` 0, and the gate then sets the count.
+    let gate = cpus.saturating_add(2);
     if hw < gate
     {
         return None;
     }
-    let fit = TAG_STATE_BUDGET_BYTES / (cpus * TAG_STATE_BYTES);
+    let fit = TAG_STATE_BUDGET_BYTES
+        .checked_div(cpus.saturating_mul(TAG_STATE_BYTES))
+        .unwrap_or(0);
     Some(hw.min(fit).max(gate))
 }
 
@@ -364,9 +405,12 @@ mod glue
         let base = PER_CPU_TAG_STATE.load(Ordering::Acquire);
         debug_assert!(!base.is_null(), "tag_state_ptr: slab not initialised");
         let stride = NUM_TAGS.load(Ordering::Relaxed);
+        // The index is within the cpu_count * stride slab (contract), whose
+        // size fits the address space, so the wrapping operations never wrap.
+        let index = cpu.wrapping_mul(stride).wrapping_add(tag as usize);
         // SAFETY: caller guarantees cpu < cpu_count and tag < num_tags, so the
         // index is within the cpu_count * stride slab.
-        unsafe { base.add(cpu * stride + tag as usize) }
+        unsafe { base.add(index) }
     }
 
     /// Read `(cpu, tag)`'s synchronisation record as `(owner_gen, synced)`.
@@ -500,7 +544,16 @@ mod glue
                 let mut floor = 0u64;
                 while let Some((victim_tag, victim_at)) = pool.oldest_used_above(floor)
                 {
-                    let victim = pool.owners[victim_tag as usize] as *const AddressSpace;
+                    // oldest_used_above draws a tag below num_tags, the owners'
+                    // length; a tag past it is skipped.
+                    let Some(&victim) = pool.owners.get(victim_tag as usize)
+                    else
+                    {
+                        floor = victim_at;
+                        continue;
+                    };
+                    let victim = victim as *const AddressSpace;
+
                     // Under the pool lock this path is the sole writer of any space's `tag`.
                     // SAFETY: the victim is a live AddressSpace — the pool
                     // records an owner only while that space holds the tag, and
@@ -700,6 +753,28 @@ mod tests
     {
         let storage: &'static mut [u64] = Vec::leak(vec![0u64; 4]);
         assert!(TagPool::over(storage, 4096).is_none());
+    }
+
+    // Defect caught: a storage size that wraps to a small value for a huge tag
+    // count, so a pool is laid over storage too small for it, or a record
+    // that writes past the pool's arrays.
+    #[test]
+    fn a_tag_count_too_large_to_address_and_a_tag_past_the_pool_hold_nothing()
+    {
+        assert_eq!(pool_storage_bytes(usize::MAX), usize::MAX);
+        let mut pool = pool_of(4);
+        pool.record(70, 0x1000, 1);
+        assert!(!pool.is_used(70));
+        assert_eq!(pool.oldest_used_above(0), None);
+        assert!(!pool.release(70, 0x1000));
+    }
+
+    // Defect caught: a gate or a budget divisor that overflows at a huge CPU
+    // count.
+    #[test]
+    fn tag_count_at_a_huge_cpu_count_needs_the_gate()
+    {
+        assert_eq!(tag_count(1 << 16, usize::MAX), None);
     }
 
     #[test]

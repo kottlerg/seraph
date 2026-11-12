@@ -173,7 +173,7 @@ fn logd_named_slots(query: u64) -> Vec<(u64, u8, u64)>
             "logd_death_forward: QUERY_SLOTS refused ({:#x})",
             reply.label
         );
-        let mut index = 0;
+        let mut index = 0usize;
         while let Some(entry) = slot_entry(&reply, index)
         {
             if entry.name() == LOGD_RECLAIM_NAME
@@ -181,7 +181,9 @@ fn logd_named_slots(query: u64) -> Vec<(u64, u8, u64)>
                 found.push((entry.badge, entry.state, entry.exit_reason));
             }
             after = Some(entry.cursor());
-            index += 1;
+            index = index
+                .checked_add(1)
+                .expect("QUERY_SLOTS entry count overflowed");
         }
         if !reply_more(reply.label)
         {
@@ -818,7 +820,7 @@ fn blobs_large_child_main() -> !
 pub fn command_blobs_large_phase(_: &Caps)
 {
     let mut child = std::process::Command::new(BLOB_FIXTURE)
-        .args(&blobs_large_args()[1..])
+        .args(blobs_large_args().iter().skip(1))
         .env_clear()
         .envs(blobs_large_env())
         .spawn()
@@ -1203,13 +1205,15 @@ impl ReadStall
                     );
                     let size = data.len();
                     let start = usize::try_from(req.word(0)).map_or(size, |o| o.min(size));
+                    let rest = data.get(start..).expect("read offset clamped to the file");
                     let n = usize::try_from(req.word(1))
                         .unwrap_or(usize::MAX)
                         .min(504)
-                        .min(size - start);
+                        .min(rest.len());
+                    let chunk = rest.get(..n).expect("read length clamped to the file");
                     let reply = IpcMessage::builder(0)
                         .word(0, n as u64)
-                        .bytes(1, &data[start..start + n])
+                        .bytes(1, chunk)
                         .build();
                     // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
                     unsafe { ipc::ipc_reply(&reply, ipc_buf) }
@@ -1220,7 +1224,7 @@ impl ReadStall
                         // procmgr reads before its next request.
                         break;
                     }
-                    served += n;
+                    served = served.checked_add(n).expect("served byte count overflowed");
                 }
 
                 // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
@@ -1589,7 +1593,15 @@ fn argv_env_refusals()
     let cells: [(&str, [u64; 4]); 3] = [
         ("a header longer than its one-page cap", [page + 1, 1, 0, 0]),
         ("an argv count its NULs disagree with", [len, 2, 0, 0]),
-        ("an argv blob without its final NUL", [len - 1, 1, 0, 0]),
+        (
+            "an argv blob without its final NUL",
+            [
+                len.checked_sub(1).expect("blob holds its final NUL"),
+                1,
+                0,
+                0,
+            ],
+        ),
     ];
     for (what, header) in cells
     {

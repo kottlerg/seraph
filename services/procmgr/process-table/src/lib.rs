@@ -34,6 +34,8 @@
 //! See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 pub mod crash_registrant;
@@ -490,12 +492,13 @@ impl ProcessTable
         }
         if threads::is_crash_badge(bound)
         {
-            let Some(idx) = self.index_of_crash_badge(bound)
+            let Some(entry) = self
+                .index_of_crash_badge(bound)
+                .and_then(|idx| self.entries.get(idx))
             else
             {
                 return Origin::Own;
             };
-            let entry = &self.entries[idx];
             let listed_as_own = entry
                 .threads
                 .position_of_crash_badge(bound)
@@ -510,9 +513,9 @@ impl ProcessTable
                 Origin::Unknown
             };
         }
-        match self.index_of_badge(bound)
+        match self.find_by_badge(bound)
         {
-            Some(idx) => Origin::Owner(self.entries[idx].badge),
+            Some(entry) => Origin::Owner(entry.badge),
             None => Origin::Unknown,
         }
     }
@@ -638,13 +641,16 @@ impl ProcessTable
     /// entry then left unarmed.
     pub fn arm_dma_hold(&mut self, badge: u64) -> Result<(), ArmError>
     {
-        let idx = self.index_of_badge(badge).ok_or(ArmError::NotFound)?;
-        if self.entries[idx].dma_hold
+        let entry = self
+            .index_of_badge(badge)
+            .and_then(|idx| self.entries.get_mut(idx))
+            .ok_or(ArmError::NotFound)?;
+        if entry.dma_hold
         {
             return Ok(());
         }
         self.holds.arm().map_err(|_| ArmError::OutOfMemory)?;
-        self.entries[idx].dma_hold = true;
+        entry.dma_hold = true;
         Ok(())
     }
 
@@ -681,7 +687,7 @@ impl ProcessTable
     pub fn find_mut_by_badge(&mut self, badge: u64) -> Option<&mut ProcessEntry>
     {
         let idx = self.index_of_badge(badge)?;
-        Some(&mut self.entries[idx])
+        self.entries.get_mut(idx)
     }
 
     /// Mark the live entry whose badge matches undebuggable
@@ -706,7 +712,7 @@ impl ProcessTable
     pub fn find_by_badge(&self, badge: u64) -> Option<&ProcessEntry>
     {
         let idx = self.index_of_badge(badge)?;
-        Some(&self.entries[idx])
+        self.entries.get(idx)
     }
 
     /// Remove and return the entry whose badge matches. The death dispatch
@@ -736,11 +742,12 @@ impl ProcessTable
     /// inserted or removed between pages.
     pub fn live_badges_after(&self, after: Option<u64>, out: &mut [u64]) -> usize
     {
-        let mut copied = 0;
+        let mut copied = 0usize;
         for (slot, entry) in out.iter_mut().zip(self.entries_after(after))
         {
             *slot = entry.badge;
-            copied += 1;
+            // `copied` counts the slots of `out`, so it cannot overflow.
+            copied = copied.saturating_add(1);
         }
         copied
     }
@@ -755,11 +762,12 @@ impl ProcessTable
             None => 0,
             Some(b) => match self.search(b)
             {
-                Ok(i) => i + 1,
+                // `i` indexes an entry, so `i + 1` is at most the length.
+                Ok(i) => i.saturating_add(1),
                 Err(i) => i,
             },
         };
-        self.entries[start..].iter()
+        self.entries.get(start..).unwrap_or_default().iter()
     }
 
     /// Lightweight status lookup for `QUERY_PROCESS`. Returns
@@ -772,9 +780,7 @@ impl ProcessTable
     #[must_use]
     pub fn query_by_badge(&self, badge: u64) -> Option<(bool, u64)>
     {
-        let idx = self.index_of_badge(badge)?;
-        let e = &self.entries[idx];
-        Some((e.started, e.thread_cap))
+        self.find_by_badge(badge).map(|e| (e.started, e.thread_cap))
     }
 
     /// memmgr badge of the live entry whose badge matches, for the
@@ -783,8 +789,7 @@ impl ProcessTable
     #[must_use]
     pub fn memmgr_badge_by_badge(&self, badge: u64) -> Option<u64>
     {
-        let idx = self.index_of_badge(badge)?;
-        Some(self.entries[idx].memmgr_badge)
+        self.find_by_badge(badge).map(|e| e.memmgr_badge)
     }
 
     /// Band ceiling of the live entry whose badge matches, for
@@ -793,8 +798,7 @@ impl ProcessTable
     #[must_use]
     pub fn band_max_by_badge(&self, badge: u64) -> Option<u8>
     {
-        let idx = self.index_of_badge(badge)?;
-        Some(self.entries[idx].band_max)
+        self.find_by_badge(badge).map(|e| e.band_max)
     }
 }
 
@@ -902,7 +906,9 @@ impl NamedThread
             NamedThread::Registered(badge) => entry
                 .threads
                 .position_of_crash_badge(badge)
-                .map_or(ipc::procmgr_labels::ATTACH_NO_THREAD, |i| i as u64 + 1),
+                .map_or(ipc::procmgr_labels::ATTACH_NO_THREAD, |i| {
+                    (i as u64).saturating_add(1)
+                }),
         }
     }
 }
@@ -937,7 +943,7 @@ pub fn attach_target(
         let idx = table.index_of_badge(target).ok_or(AttachRefusal::Unknown)?;
         (idx, NamedThread::Main)
     };
-    let entry = &mut table.entries[idx];
+    let entry = table.entries.get_mut(idx).ok_or(AttachRefusal::Unknown)?;
     if entry.no_debug
     {
         return Err(AttachRefusal::NotAttachable);
@@ -962,8 +968,9 @@ pub fn detach_target(
     {
         return Err(AttachRefusal::Unauthorized);
     }
-    let idx = table.index_of_badge(target).ok_or(AttachRefusal::Unknown)?;
-    let entry = &mut table.entries[idx];
+    let entry = table
+        .find_mut_by_badge(target)
+        .ok_or(AttachRefusal::Unknown)?;
     if entry.no_debug
     {
         return Err(AttachRefusal::NotAttachable);

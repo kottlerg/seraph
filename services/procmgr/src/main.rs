@@ -16,6 +16,8 @@
 //! caller over IPC at startup. procmgr itself has no knowledge of the child's
 //! service-specific capabilities.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 
@@ -159,7 +161,8 @@ fn main() -> !
     {
         std::os::seraph::log!(
             warn: "{} of {RECV_WORKERS} request workers started: {}",
-            e.running + 1,
+            // `running` counts started workers, bounded by `RECV_WORKERS`.
+            e.running.saturating_add(1),
             e.error
         );
     }
@@ -439,10 +442,11 @@ pub fn memmgr_alloc_contig_grant(
     }
     let caps = reply.caps();
     if let Some((_, &[region_id])) = ipc::memmgr_grant_layout(&reply)
-        && syscall::cap_info(caps[0], syscall_abi::CAP_INFO_MEMORY_SIZE)
-            .is_ok_and(|size| size == pages * 4096)
+        && let Some(&first_cap) = caps.first()
+        && syscall::cap_info(first_cap, syscall_abi::CAP_INFO_MEMORY_SIZE)
+            .is_ok_and(|size| pages.checked_mul(4096) == Some(size))
     {
-        return Some((caps[0], region_id));
+        return Some((first_cap, region_id));
     }
     release_grant(memmgr_send, &reply, ipc_buf);
     None
@@ -468,7 +472,8 @@ pub fn release_grant(memmgr_send: u64, reply: &IpcMessage, ipc_buf: *mut u64)
         IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS).word(0, region_ids.len() as u64);
     for (i, &id) in region_ids.iter().enumerate()
     {
-        msg = msg.word(1 + i, id);
+        // `i` indexes `region_ids`, so it is below the slice length.
+        msg = msg.word(i.saturating_add(1), id);
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_call(memmgr_send, &msg.build(), ipc_buf) };
@@ -948,7 +953,7 @@ fn handle_attach_process(
         return None;
     };
     let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS)
-        .word(0, 1 + entry.threads.len() as u64)
+        .word(0, (entry.threads.len() as u64).saturating_add(1))
         .word(1, entry.image.load_bias)
         .word(2, entry.image.text_start)
         .word(3, entry.image.text_end)
@@ -958,7 +963,8 @@ fn handle_attach_process(
             procmgr_labels::ATTACH_WORD_NAMED_THREAD,
             named.index_in(entry),
         );
-    for &cap in &derived[..n]
+    // `n` counts slots of `derived`, so it is within the array.
+    for &cap in derived.get(..n).unwrap_or_default()
     {
         reply = reply.cap(cap);
     }
@@ -968,7 +974,7 @@ fn handle_attach_process(
     {
         // The caller holds none of the caps, so the attach did not succeed
         // and its watch is not kept.
-        release_caps(&derived[..n]);
+        release_caps(derived.get(..n).unwrap_or_default());
         return None;
     }
     Some(badge)
@@ -1004,13 +1010,17 @@ fn handle_list_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &process::P
     {
         if procmgr_labels::pack_list_entry(&mut words, count, entry.badge(), entry.name.as_bytes())
         {
-            count += 1;
+            // `count` is below `LIST_PROCESSES_PAGE`, the number of entries taken.
+            count = count.saturating_add(1);
         }
     }
     words[0] = count as u64;
-    let used = 1 + count * procmgr_labels::LIST_PROCESSES_WORDS_PER_ENTRY;
+    let used = count
+        .saturating_mul(procmgr_labels::LIST_PROCESSES_WORDS_PER_ENTRY)
+        .saturating_add(1);
     let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS);
-    for (i, &w) in words[..used].iter().enumerate()
+    // `pack_list_entry` counted only the entries it fitted, so `used` is within `words`.
+    for (i, &w) in words.get(..used).unwrap_or_default().iter().enumerate()
     {
         reply = reply.word(i, w);
     }
@@ -1061,7 +1071,7 @@ fn derive_attach_page(
     first: usize,
 ) -> Result<([u64; procmgr_labels::ATTACH_THREADS_PAGE], usize), PageFailed>
 {
-    let count = 1 + entry.threads.len();
+    let count = entry.threads.len().saturating_add(1);
     let mut derived = [0u64; procmgr_labels::ATTACH_THREADS_PAGE];
     let mut n = 0;
     for index in first..count.min(first.saturating_add(procmgr_labels::ATTACH_THREADS_PAGE))
@@ -1069,12 +1079,15 @@ fn derive_attach_page(
         let source = match index
         {
             0 => entry.thread_cap,
-            _ => entry.threads.get(index - 1).map_or(0, |t| t.cap),
+            _ => entry
+                .threads
+                .get(index.saturating_sub(1))
+                .map_or(0, |t| t.cap),
         };
         let Ok(cap) = syscall::cap_derive(source, syscall_abi::RIGHTS_THREAD)
         else
         {
-            release_caps(&derived[..n]);
+            release_caps(derived.get(..n).unwrap_or_default());
             return Err(
                 if index > 0 && !process::thread_is_listed(source)
                 {
@@ -1086,8 +1099,15 @@ fn derive_attach_page(
                 },
             );
         };
-        derived[n] = cap;
-        n += 1;
+        // The range holds at most `ATTACH_THREADS_PAGE` indices, so `n` is below the array length.
+        let Some(slot) = derived.get_mut(n)
+        else
+        {
+            let _ = syscall::cap_delete(cap);
+            break;
+        };
+        *slot = cap;
+        n = n.saturating_add(1);
     }
     Ok((derived, n))
 }
@@ -1155,9 +1175,11 @@ fn handle_query_live_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &proc
     let mut page = [0u64; procmgr_labels::LIVE_PROCESSES_PAGE];
     let count = table.live_badges_after(after, &mut page);
     let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS).word(0, count as u64);
-    for (i, &badge) in page[..count].iter().enumerate()
+    // `live_badges_after` fills at most `page.len()` slots and returns that count.
+    for (i, &badge) in page.get(..count).unwrap_or_default().iter().enumerate()
     {
-        reply = reply.word(1 + i, badge);
+        // `i` is below `count`, so the sum is bounded by the page length.
+        reply = reply.word(i.saturating_add(1), badge);
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) };
@@ -1354,16 +1376,19 @@ fn handle_configure_pipe(
     let badge = req.badge;
     let direction = req.word(0);
     let caps = req.caps();
-    if caps.len() < 3
+    let &[
+        memory_cap,
+        data_notification,
+        space_notification,
+        ref extra @ ..,
+    ] = caps
+    else
     {
         release_caps(caps);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
-    }
-    let memory_cap = caps[0];
-    let data_notification = caps[1];
-    let space_notification = caps[2];
-    release_caps(&caps[3..]);
+    };
+    release_caps(extra);
 
     let code = match table.configure_pipe(
         badge,
@@ -1381,7 +1406,7 @@ fn handle_configure_pipe(
     // On success configure_pipe cap_copy'd each cap into the child's
     // CSpace; on failure it installed none. Either way procmgr's slots are
     // dropped, so refcounts hit zero when both peers later release.
-    release_caps(&caps[..3]);
+    release_caps(&[memory_cap, data_notification, space_notification]);
 
     reply_empty(ipc_buf, code);
 }
@@ -1405,12 +1430,12 @@ fn handle_configure_namespace(
 {
     let badge = req.badge;
     let caps = req.caps();
-    if caps.is_empty()
+    let Some(&root_cap) = caps.first()
+    else
     {
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
-    }
-    let root_cap = caps[0];
+    };
     let cwd_cap = caps.get(1).copied().unwrap_or(0);
     release_caps(caps.get(2..).unwrap_or(&[]));
     let code = match table.configure_namespace(badge, root_cap, cwd_cap)

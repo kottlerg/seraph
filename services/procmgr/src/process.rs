@@ -508,7 +508,10 @@ fn copy_all_into_child<const N: usize>(child_cspace: u64, caps: [(u64, u64); N])
     let mut intermediates = [0u64; N];
     let mut slots = [0u64; N];
     let mut complete = true;
-    for (i, &(cap, rights)) in caps.iter().enumerate()
+    for ((&(cap, rights), intermediate_slot), child_slot) in caps
+        .iter()
+        .zip(intermediates.iter_mut())
+        .zip(slots.iter_mut())
     {
         let Ok(intermediate) = syscall::cap_derive(cap, rights)
         else
@@ -516,14 +519,14 @@ fn copy_all_into_child<const N: usize>(child_cspace: u64, caps: [(u64, u64); N])
             complete = false;
             break;
         };
-        intermediates[i] = intermediate;
+        *intermediate_slot = intermediate;
         let Ok(slot) = syscall::cap_copy(intermediate, child_cspace, rights)
         else
         {
             complete = false;
             break;
         };
-        slots[i] = slot;
+        *child_slot = slot;
     }
     for &intermediate in &intermediates
     {
@@ -962,7 +965,8 @@ pub fn copy_argv_env(
     let mut copied = Ok(());
     while offset < pages && copied.is_ok()
     {
-        let chunk_pages = (pages - offset).min(ARGV_ENV_COPY_WINDOW_PAGES);
+        // The loop condition keeps `offset` below `pages`.
+        let chunk_pages = pages.saturating_sub(offset).min(ARGV_ENV_COPY_WINDOW_PAGES);
         copied = copy_argv_chunk(
             &mut windows,
             &src,
@@ -972,7 +976,8 @@ pub fn copy_argv_env(
             request,
             &mut tally,
         );
-        offset += chunk_pages;
+        // `chunk_pages` is at most `pages - offset`, so the sum is at most `pages`.
+        offset = offset.saturating_add(chunk_pages);
     }
     let stuck = windows.stuck;
     drop(windows);
@@ -1053,8 +1058,13 @@ fn copy_argv_chunk(
                 ArgvEnvCopyError::Reply(procmgr_errors::OUT_OF_MEMORY)
             }
         })?;
-    let chunk_bytes = (chunk_pages * PAGE_SIZE) as usize;
-    let blob_bytes = (request.total - offset * PAGE_SIZE).min(chunk_bytes as u64) as usize;
+    // `chunk_pages` is at most the window size, so the product is small.
+    let chunk_bytes = chunk_pages.saturating_mul(PAGE_SIZE) as usize;
+    // `offset` is below `pages = ceil(total / PAGE_SIZE)`, so `offset * PAGE_SIZE` is below `total`.
+    let blob_bytes = request
+        .total
+        .saturating_sub(offset.saturating_mul(PAGE_SIZE))
+        .min(chunk_bytes as u64) as usize;
     // SAFETY: both windows map `chunk_pages` pages just above, `src`
     // read-only and `dst` writable for procmgr alone (the child is not
     // running and maps no page of the child's run yet), and they do not
@@ -1071,8 +1081,15 @@ fn copy_argv_chunk(
         core::slice::from_raw_parts_mut(windows.dst_va() as *mut u8, chunk_bytes)
     };
     // The page tail past the blobs carries no earlier owner's bytes.
-    dst_bytes[blob_bytes..].fill(0);
-    tally.feed(&dst_bytes[..blob_bytes]);
+    // `blob_bytes` is at most `chunk_bytes`, the window length, so the split
+    // always succeeds.
+    let Some((blob, tail)) = dst_bytes.split_at_mut_checked(blob_bytes)
+    else
+    {
+        return Err(ArgvEnvCopyError::Reply(procmgr_errors::INVALID_ARGUMENT));
+    };
+    tail.fill(0);
+    tally.feed(blob);
     Ok(())
 }
 
@@ -1105,7 +1122,8 @@ fn fund_child_page_tables(
     {
         return Ok(());
     }
-    let table_pages = pages.div_ceil(512) + 4;
+    // `pages` is a page count of a 64-bit byte total, so the sum cannot overflow.
+    let table_pages = pages.div_ceil(512).saturating_add(4);
     let frame = CapGuard::new(
         crate::memmgr_alloc_pages_contig(child_memmgr_send, table_pages, ipc_buf)
             .ok_or(procmgr_errors::OUT_OF_MEMORY)?,
@@ -1141,6 +1159,13 @@ unsafe fn map_child_argv_env(
         syscall::cap_derive(argv_env.memory.cap(), syscall::RIGHTS_MEM_MAP)
             .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
     );
+    let Some(region_va) = layout
+        .process_info_va
+        .checked_add(process_abi::ARGV_ENV_REGION_OFFSET)
+    else
+    {
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    };
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
     // The region lies inside the tail every layout leaves after the
@@ -1152,7 +1177,7 @@ unsafe fn map_child_argv_env(
         syscall::mem_map(
             ro.cap(),
             child_aspace,
-            layout.process_info_va + process_abi::ARGV_ENV_REGION_OFFSET,
+            region_va,
             0,
             argv_env.pages,
             syscall::MAP_FROM_CAP,
@@ -1380,8 +1405,9 @@ unsafe fn populate_child_info(
                 syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL)
                     .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
             );
-            let (low, high) = syscall::sched_split(own_copy.cap(), sched.band_max + 1)
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            let (low, high) =
+                syscall::sched_split(own_copy.cap(), sched.band_max.saturating_add(1))
+                    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
             // The split consumed `own_copy`; its two halves replace it.
             let _ = own_copy.disarm();
             let (low, _high) = (CapGuard::new(low), CapGuard::new(high));
@@ -1501,7 +1527,8 @@ unsafe fn populate_child_info(
     else
     {
         (
-            process_abi::ARGV_ENV_REGION_OFFSET + h.args_bytes,
+            // `check_argv_env` bounded the header's byte counts by `ARGV_ENV_MAX_BYTES`.
+            process_abi::ARGV_ENV_REGION_OFFSET.saturating_add(h.args_bytes),
             h.env_bytes,
             h.env_count,
         )
@@ -1568,7 +1595,8 @@ impl MainTlsAlloc
     /// Bytes mapped at the scratch VA: the whole block, page-rounded.
     fn scratch_bytes(&self) -> u64
     {
-        self.pages * PAGE_SIZE
+        // `pages` is at most `PROCESS_MAIN_TLS_MAX_PAGES`, checked at allocation.
+        self.pages.saturating_mul(PAGE_SIZE)
     }
 }
 
@@ -1620,13 +1648,27 @@ fn alloc_main_tls_memory(
     let scratch_va = scratch.va();
 
     // SAFETY: scratch_va is mapped writable for `pages` pages.
-    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, (pages * PAGE_SIZE) as usize) };
+    unsafe {
+        core::ptr::write_bytes(
+            scratch_va as *mut u8,
+            0,
+            // `pages` is at most `PROCESS_MAIN_TLS_MAX_PAGES`, checked above.
+            pages.saturating_mul(PAGE_SIZE) as usize,
+        );
+    }
+
+    // `tls_base_offset` is within the block, which `PROCESS_MAIN_TLS_MAX_PAGES` bounds.
+    let Some(tls_base_va) = layout.tls_base.checked_add(tls_base_offset)
+    else
+    {
+        return Err(procmgr_errors::INVALID_ELF);
+    };
 
     Ok(MainTlsAlloc {
         scratch,
         memory: tls_memory,
         tls_base_offset,
-        tls_base_va: layout.tls_base + tls_base_offset,
+        tls_base_va,
         tls_block_base: layout.tls_base,
         pages,
     })
@@ -1830,7 +1872,13 @@ unsafe fn map_child_stack_and_ipc(
     layout: &ProcessLayout,
 ) -> Result<(), u64>
 {
-    let stack_base = layout.stack_top - u64::from(stack_pages) * PAGE_SIZE;
+    let Some(stack_base) = u64::from(stack_pages)
+        .checked_mul(PAGE_SIZE)
+        .and_then(|bytes| layout.stack_top.checked_sub(bytes))
+    else
+    {
+        return Err(procmgr_errors::MAP_FAILED);
+    };
     for i in 0..stack_pages
     {
         // SAFETY: the caller's contract covers `child_aspace`.
@@ -1839,7 +1887,9 @@ unsafe fn map_child_stack_and_ipc(
                 child_aspace,
                 child_memmgr_send,
                 ipc_buf,
-                stack_base + u64::from(i) * PAGE_SIZE,
+                // `i` is below `stack_pages`, so the page lies inside the stack
+                // span whose base was checked above.
+                stack_base.saturating_add(u64::from(i).saturating_mul(PAGE_SIZE)),
             )
         }?;
     }
@@ -1939,18 +1989,24 @@ where
     let mut count = 0u64;
     while done < table.size
     {
-        let chunk = (table.size - done).min(buf.len() as u64) as usize;
-        let got = read_at(table.file_offset + done, &mut buf[..chunk])?;
+        // The loop condition keeps `done` below `table.size`.
+        let chunk = table.size.saturating_sub(done).min(buf.len() as u64) as usize;
+        // A file offset past the address space is a failed read.
+        let read_offset = table.file_offset.checked_add(done)?;
+        // `chunk` is at most `buf.len()`, so the slice is always present.
+        let got = read_at(read_offset, buf.get_mut(..chunk)?)?;
         if got < chunk
         {
             return None;
         }
-        for record in elf::relative_relocs(&buf[..chunk], machine).ok()?
+        for record in elf::relative_relocs(buf.get(..chunk)?, machine).ok()?
         {
             f(&record.ok()?);
-            count += 1;
+            // `count` is at most the table's record count.
+            count = count.saturating_add(1);
         }
-        done += chunk as u64;
+        // `chunk` is at most `table.size - done`.
+        done = done.saturating_add(chunk as u64);
     }
     Some(count)
 }
@@ -2593,6 +2649,23 @@ fn advertise_pager(self_aspace: u64, pi_memory_cap: u64, memmgr_badge: u64)
 
 // ── Process creation (from memory) ──────────────────────────────────────────
 
+/// The `len` bytes of `bytes` at `offset`, or `None` when the range overflows or
+/// leaves the slice.
+fn file_range(bytes: &[u8], offset: u64, len: u64) -> Option<&[u8]>
+{
+    let end = offset.checked_add(len)?;
+    bytes.get(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)
+}
+
+/// The page-rounded `[start, end)` of a `PT_GNU_RELRO` span of `size` bytes at
+/// `va`, biased by `bias`; `None` when the arithmetic overflows.
+fn relro_page_range(va: u64, size: u64, bias: u64) -> Option<(u64, u64)>
+{
+    let start = va.checked_add(bias)?;
+    let end = start.checked_add(size)?.checked_add(0xFFF)?;
+    Some((start & !0xFFF, end & !0xFFF))
+}
+
 /// Create a process from an in-memory ELF byte slice (suspended).
 ///
 /// # Errors
@@ -2661,16 +2734,17 @@ fn create_process_from_bytes(
     {
         None
     };
-    let total_relocs = match rela
+    let rela_bytes = match rela
     {
-        Some(t) =>
-        {
-            let table = module_bytes
-                .get(t.file_offset as usize..(t.file_offset + t.size) as usize)
-                .ok_or(procmgr_errors::INVALID_ELF)?;
-            elf::validate_relative_relocs(table, machine, span_min, span_end)
-                .map_err(|_| procmgr_errors::INVALID_ELF)?
-        }
+        Some(t) => Some(
+            file_range(module_bytes, t.file_offset, t.size).ok_or(procmgr_errors::INVALID_ELF)?,
+        ),
+        None => None,
+    };
+    let total_relocs = match rela_bytes
+    {
+        Some(table) => elf::validate_relative_relocs(table, machine, span_min, span_end)
+            .map_err(|_| procmgr_errors::INVALID_ELF)?,
         None => 0,
     };
 
@@ -2678,7 +2752,9 @@ fn create_process_from_bytes(
     // segments are mapped read-only after relocation.
     let ro_range = elf::relro_span(ehdr, module_bytes)
         .map_err(|_| procmgr_errors::INVALID_ELF)?
-        .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
+        .map(|(va, sz)| relro_page_range(va, sz, bias))
+        .map(|range| range.ok_or(procmgr_errors::INVALID_ELF))
+        .transpose()?;
 
     // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
     let stack_pages = resolve_stack_pages(elf::parse_stack_note(ehdr, module_bytes))
@@ -2716,16 +2792,29 @@ fn create_process_from_bytes(
         }
 
         let prot = segment_prot(&seg);
-        let seg_vaddr = seg.vaddr + bias;
+        // The segment's addresses and file range come from the image; any
+        // that overflows or leaves the file refuses it.
+        let seg_vaddr = seg
+            .vaddr
+            .checked_add(bias)
+            .ok_or(procmgr_errors::INVALID_ELF)?;
+        let seg_end = seg_vaddr
+            .checked_add(seg.memsz)
+            .ok_or(procmgr_errors::INVALID_ELF)?;
         if seg.executable
         {
-            image.add_text(seg_vaddr, seg_vaddr + seg.memsz);
+            image.add_text(seg_vaddr, seg_end);
         }
         let first_page = seg_vaddr & !0xFFF;
-        let last_page_end = (seg_vaddr + seg.memsz + 0xFFF) & !0xFFF;
-        let num_pages = (last_page_end - first_page) / PAGE_SIZE;
-        let file_data = &module_bytes[seg.offset as usize..(seg.offset + seg.filesz) as usize];
-        let dest_offset = (seg_vaddr - first_page) as usize;
+        let last_page_end = seg_end
+            .checked_add(0xFFF)
+            .ok_or(procmgr_errors::INVALID_ELF)?
+            & !0xFFF;
+        let num_pages = last_page_end.saturating_sub(first_page) / PAGE_SIZE;
+        let file_data =
+            file_range(module_bytes, seg.offset, seg.filesz).ok_or(procmgr_errors::INVALID_ELF)?;
+        // `first_page` is `seg_vaddr` rounded down, so the difference is below a page.
+        let dest_offset = seg_vaddr.saturating_sub(first_page) as usize;
 
         // SAFETY: `child_aspace` is the fresh address space
         // `create_child_kernel_objects` retyped for this child above.
@@ -2741,19 +2830,29 @@ fn create_process_from_bytes(
                 ipc_buf,
                 |buf| {
                     let copy_len = file_data.len().min(seg.memsz as usize);
-                    buf[dest_offset..dest_offset + copy_len]
-                        .copy_from_slice(&file_data[..copy_len]);
+                    // `buf` spans `num_pages` pages from `first_page`, which
+                    // hold `dest_offset + memsz`, and `copy_len` is at most
+                    // `memsz` and the file data length: both ranges are present.
+                    if let Some(dst) =
+                        buf.get_mut(dest_offset..dest_offset.saturating_add(copy_len))
+                        && let Some(src) = file_data.get(..copy_len)
+                    {
+                        dst.copy_from_slice(src);
+                    }
                     // Writable segments only, matching the kernel's init
                     // applier: a target in text/rodata goes unapplied and the
                     // applied-count check below rejects the image.
+                    // A span the buffer lacks applies nothing, which the
+                    // applied-count check rejects.
                     if seg.writable
-                        && let Some(t) = rela
+                        && let Some(table) = rela_bytes
+                        && let Some(span) =
+                            buf.get_mut(dest_offset..dest_offset.saturating_add(seg.memsz as usize))
                     {
-                        let table = &module_bytes
-                            [t.file_offset as usize..(t.file_offset + t.size) as usize];
-                        let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
-                        applied_relocs +=
-                            elf::apply_relative_relocs(table, machine, bias, seg.vaddr, span);
+                        // The count is at most the table's record count.
+                        applied_relocs = applied_relocs.saturating_add(elf::apply_relative_relocs(
+                            table, machine, bias, seg.vaddr, span,
+                        ));
                     }
                 },
             )
@@ -2770,8 +2869,16 @@ fn create_process_from_bytes(
     }
 
     let tls_seg = elf::tls_segment(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?;
+    let tls_vaddr = match tls_seg
+    {
+        Some(s) => s
+            .vaddr
+            .checked_add(bias)
+            .ok_or(procmgr_errors::INVALID_ELF)?,
+        None => 0,
+    };
     let tls_template = tls_seg.map_or_default(|s| ChildTlsTemplate {
-        vaddr: s.vaddr + bias,
+        vaddr: tls_vaddr,
         filesz: s.filesz,
         memsz: s.memsz,
         align: s.align,
@@ -2780,12 +2887,8 @@ fn create_process_from_bytes(
     let main_tls = if let Some(seg) = tls_seg
         && tls_template.memsz != 0
     {
-        let start = seg.offset as usize;
-        let end = start + seg.filesz as usize;
-        if end > module_bytes.len()
-        {
-            return Err(procmgr_errors::INVALID_ELF);
-        }
+        let tdata =
+            file_range(module_bytes, seg.offset, seg.filesz).ok_or(procmgr_errors::INVALID_ELF)?;
         // SAFETY: `child_aspace` is the fresh address space
         // `create_child_kernel_objects` retyped for this child above.
         unsafe {
@@ -2793,7 +2896,7 @@ fn create_process_from_bytes(
                 self_aspace,
                 child_aspace,
                 &tls_template,
-                &module_bytes[start..end],
+                tdata,
                 child_memmgr_send,
                 ipc_buf,
                 &layout,
@@ -2801,10 +2904,8 @@ fn create_process_from_bytes(
                     // Re-apply the .tdata-targeting relocations to this
                     // independent copy; the image copy was relocated (and
                     // counted) during segment loading.
-                    if let Some(t) = rela
+                    if let Some(table) = rela_bytes
                     {
-                        let table = &module_bytes
-                            [t.file_offset as usize..(t.file_offset + t.size) as usize];
                         let _ =
                             elf::apply_relative_relocs(table, machine, bias, seg.vaddr, template);
                     }
@@ -2916,7 +3017,8 @@ pub fn create_process(
 ) -> Result<CreateResult, u64>
 {
     let (module_scratch, module_pages) = loader::map_module(module_memory_cap, self_aspace)?;
-    let module_size = module_pages * PAGE_SIZE;
+    // `map_module` returns at most 128 pages, so the product is small.
+    let module_size = module_pages.saturating_mul(PAGE_SIZE);
     let module_va = module_scratch.va();
 
     // SAFETY: module memory cap mapped read-only at module_va for module_size
@@ -3034,7 +3136,11 @@ fn vfs_read(
     let data_view = reply.data_bytes();
     let payload = data_view.get(core::mem::size_of::<u64>()..).unwrap_or(&[]);
     let copy_len = bytes_read.min(dst.len()).min(payload.len());
-    dst[..copy_len].copy_from_slice(&payload[..copy_len]);
+    // `copy_len` is at most both lengths, so both ranges are present.
+    if let (Some(to), Some(from)) = (dst.get_mut(..copy_len), payload.get(..copy_len))
+    {
+        to.copy_from_slice(from);
+    }
     Some(bytes_read)
 }
 
@@ -3429,7 +3535,13 @@ fn stream_segment_bytes(
     let mut copied = 0usize;
     while copied < total
     {
-        let cur = seg.offset + copied as u64;
+        // The segment's file offset comes from the image; an offset past the
+        // address space is a failed read.
+        let Some(cur) = seg.offset.checked_add(copied as u64)
+        else
+        {
+            return Err(procmgr_errors::IO_ERROR);
+        };
 
         let Some((memory_cap, bytes_valid, memory_data_offset, cookie)) =
             vfs_read_memory(ctx.file_cap, ctx.ipc_buf, cur)
@@ -3461,9 +3573,20 @@ fn stream_segment_bytes(
             vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
             return Err(procmgr_errors::IO_ERROR);
         };
-        let chunk_len = range.len().min(total - copied);
+        // The loop condition keeps `copied` below `total`.
+        let chunk_len = range.len().min(total.saturating_sub(copied));
 
-        let dst = &mut buf[dest_offset + copied..dest_offset + copied + chunk_len];
+        // `buf` holds the segment's `memsz` bytes from `dest_offset`, and
+        // `copied + chunk_len` is at most `total <= memsz`, so the range is
+        // present; a buffer that lacks it ends the copy as a failed read.
+        let dst_start = dest_offset.saturating_add(copied);
+        let Some(dst) = buf.get_mut(dst_start..dst_start.saturating_add(chunk_len))
+        else
+        {
+            drop(mapping);
+            vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
+            return Err(procmgr_errors::IO_ERROR);
+        };
         // SAFETY: `mapping.va()` covers PAGE_SIZE bytes mapped read-only;
         // `cache_page_range` checked `range.start + range.len() <= PAGE_SIZE`,
         // and `chunk_len <= range.len()`, so the source span lies in the
@@ -3480,7 +3603,8 @@ fn stream_segment_bytes(
         }
         drop(mapping);
         vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
-        copied += chunk_len;
+        // `chunk_len` is at most `total - copied`.
+        copied = copied.saturating_add(chunk_len);
     }
     Ok(())
 }
@@ -3638,7 +3762,8 @@ pub fn create_process_from_file(
     let reads = process_table::fs_reads::ReadFailures::new();
 
     // Parse ELF headers from the header page.
-    let header_data: &[u8] = &hdr_page[..header_len];
+    // The read is clamped to `hdr_page`, so the range is present.
+    let header_data: &[u8] = hdr_page.get(..header_len).ok_or(procmgr_errors::IO_ERROR)?;
     let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) =
         elf::validate_executable(header_data, machine).map_err(|_| procmgr_errors::INVALID_ELF)?;
@@ -3704,7 +3829,9 @@ pub fn create_process_from_file(
     // segments are mapped read-only after relocation.
     let ro_range = elf::relro_span(ehdr, header_data)
         .map_err(|_| procmgr_errors::INVALID_ELF)?
-        .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
+        .map(|(va, sz)| relro_page_range(va, sz, bias))
+        .map(|range| range.ok_or(procmgr_errors::INVALID_ELF))
+        .transpose()?;
 
     // Parse the optional stack-size note. Section headers and the note
     // section are fetched on demand via `vfs_read`; the helper hands a
@@ -3744,15 +3871,27 @@ pub fn create_process_from_file(
         }
 
         let prot = segment_prot(&seg);
-        let seg_vaddr = seg.vaddr + bias;
+        // The segment's addresses come from the image; any that overflows
+        // refuses it.
+        let seg_vaddr = seg
+            .vaddr
+            .checked_add(bias)
+            .ok_or(procmgr_errors::INVALID_ELF)?;
+        let seg_end = seg_vaddr
+            .checked_add(seg.memsz)
+            .ok_or(procmgr_errors::INVALID_ELF)?;
         if seg.executable
         {
-            image.add_text(seg_vaddr, seg_vaddr + seg.memsz);
+            image.add_text(seg_vaddr, seg_end);
         }
         let first_page = seg_vaddr & !0xFFF;
-        let last_page_end = (seg_vaddr + seg.memsz + 0xFFF) & !0xFFF;
-        let num_pages = (last_page_end - first_page) / PAGE_SIZE;
-        let dest_offset = (seg_vaddr - first_page) as usize;
+        let last_page_end = seg_end
+            .checked_add(0xFFF)
+            .ok_or(procmgr_errors::INVALID_ELF)?
+            & !0xFFF;
+        let num_pages = last_page_end.saturating_sub(first_page) / PAGE_SIZE;
+        // `first_page` is `seg_vaddr` rounded down, so the difference is below a page.
+        let dest_offset = seg_vaddr.saturating_sub(first_page) as usize;
         let load_ctx = ElfLoadCtx {
             file_cap: file_cap.cap(),
             ipc_buf,
@@ -3782,8 +3921,9 @@ pub fn create_process_from_file(
                     if seg.writable
                         && streamed.is_ok()
                         && let Some(t) = &rela
+                        && let Some(span) =
+                            buf.get_mut(dest_offset..dest_offset.saturating_add(seg.memsz as usize))
                     {
-                        let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
                         // A read failure mid-walk leaves records unapplied;
                         // `reads` notes it, and the check after the segment
                         // fails the spawn.
@@ -3796,8 +3936,10 @@ pub fn create_process_from_file(
                                 })
                             },
                             |r| {
-                                applied_relocs +=
-                                    elf::apply_reloc_in_span(r, bias, seg.vaddr, span);
+                                // The count is at most the table's record count.
+                                applied_relocs = applied_relocs.saturating_add(
+                                    elf::apply_reloc_in_span(r, bias, seg.vaddr, span),
+                                );
                             },
                         );
                     }
@@ -3827,8 +3969,16 @@ pub fn create_process_from_file(
     // VFS read to pull `.tdata` into the main thread's TLS block.
     let tls_seg = elf::tls_segment_metadata(ehdr, header_data, file_size)
         .map_err(|_| procmgr_errors::INVALID_ELF)?;
+    let tls_vaddr = match tls_seg
+    {
+        Some(s) => s
+            .vaddr
+            .checked_add(bias)
+            .ok_or(procmgr_errors::INVALID_ELF)?,
+        None => 0,
+    };
     let tls_template = tls_seg.map_or_default(|s| ChildTlsTemplate {
-        vaddr: s.vaddr + bias,
+        vaddr: tls_vaddr,
         filesz: s.filesz,
         memsz: s.memsz,
         align: s.align,

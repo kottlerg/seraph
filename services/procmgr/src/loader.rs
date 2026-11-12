@@ -146,7 +146,8 @@ pub fn map_module(module_memory_cap: u64, self_aspace: u64) -> Result<(ScratchMa
             }
             Err(code) => last = code,
         }
-        pages -= 1;
+        // The loop condition keeps `pages` above zero.
+        pages = pages.saturating_sub(1);
     }
     let _ = syscall::cap_delete(module_ro);
     Err(last)
@@ -256,6 +257,19 @@ pub(crate) unsafe fn load_elf_segment_into_child(
         return Ok(());
     }
 
+    // The segment's span and its end address come from the ELF image; a span
+    // or end that overflows is refused. Every `i * PAGE_SIZE` below is under
+    // `span_bytes`, so the offset sums are exact.
+    let Some(span_bytes) = num_pages.checked_mul(PAGE_SIZE)
+    else
+    {
+        return Err(procmgr_errors::MAP_FAILED);
+    };
+    if first_page_vaddr.checked_add(span_bytes).is_none()
+    {
+        return Err(procmgr_errors::MAP_FAILED);
+    }
+
     let Ok(range) = reserve_pages(num_pages)
     else
     {
@@ -281,7 +295,7 @@ pub(crate) unsafe fn load_elf_segment_into_child(
         {
             std::os::seraph::log!(
                 warn: "load_elf_segment: alloc None vaddr=0x{:x}",
-                first_page_vaddr + i * PAGE_SIZE
+                first_page_vaddr.saturating_add(i.saturating_mul(PAGE_SIZE))
             );
             return Err(procmgr_errors::OUT_OF_MEMORY);
         };
@@ -292,7 +306,7 @@ pub(crate) unsafe fn load_elf_segment_into_child(
             syscall::mem_map(
                 memory_cap,
                 self_aspace,
-                scratch_base + i * PAGE_SIZE,
+                scratch_base.saturating_add(i.saturating_mul(PAGE_SIZE)),
                 0,
                 1,
                 syscall::MAP_WRITABLE,
@@ -302,14 +316,15 @@ pub(crate) unsafe fn load_elf_segment_into_child(
         {
             std::os::seraph::log!(
                 warn: "load_elf_segment: scratch map failed vaddr=0x{:x}",
-                first_page_vaddr + i * PAGE_SIZE
+                first_page_vaddr.saturating_add(i.saturating_mul(PAGE_SIZE))
             );
             return Err(procmgr_errors::MAP_FAILED);
         }
-        scratch.mapped += 1;
+        // `mapped` counts pages of the `num_pages` loop, so it is below `num_pages`.
+        scratch.mapped = scratch.mapped.saturating_add(1);
     }
 
-    let span_len = (num_pages * PAGE_SIZE) as usize;
+    let span_len = span_bytes as usize;
     // SAFETY: the whole span [scratch_base, scratch_base + span_len) was just
     // mapped writable, one fresh page per iteration.
     let span = unsafe { core::slice::from_raw_parts_mut(scratch_base as *mut u8, span_len) };
@@ -329,11 +344,12 @@ pub(crate) unsafe fn load_elf_segment_into_child(
 
     for (i, &memory_cap) in scratch.caps.iter().enumerate()
     {
-        let page_vaddr = first_page_vaddr + i as u64 * PAGE_SIZE;
+        // `i` is below `num_pages`, and `span_bytes` and the segment end were checked above.
+        let page_vaddr = first_page_vaddr.saturating_add((i as u64).saturating_mul(PAGE_SIZE));
         let page_prot = match ro_range
         {
             Some((ro_start, ro_end))
-                if page_vaddr >= ro_start && page_vaddr + PAGE_SIZE <= ro_end =>
+                if page_vaddr >= ro_start && page_vaddr.saturating_add(PAGE_SIZE) <= ro_end =>
             {
                 syscall::MAP_READ
             }

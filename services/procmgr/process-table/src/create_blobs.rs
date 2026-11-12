@@ -55,14 +55,17 @@ pub enum ArgvEnvRefusal
 /// from the zero tail past the delivered words.
 pub fn decode_header(req: &IpcMessage, first_word: usize) -> Result<ArgvEnvHeader, ArgvEnvRefusal>
 {
-    if req.word_count() < first_word + ARGV_ENV_HEADER_WORDS
+    if first_word
+        .checked_add(ARGV_ENV_HEADER_WORDS)
+        .is_none_or(|end| req.word_count() < end)
     {
         return Err(ArgvEnvRefusal::MissingHeader);
     }
     let mut words = [0u64; ARGV_ENV_HEADER_WORDS];
     for (i, word) in words.iter_mut().enumerate()
     {
-        *word = req.word(first_word + i);
+        // The check above keeps `first_word + i` below `word_count`.
+        *word = req.word(first_word.saturating_add(i));
     }
     Ok(ArgvEnvHeader::from_words(words))
 }
@@ -105,7 +108,10 @@ impl BlobTally
 {
     fn feed(&mut self, bytes: &[u8])
     {
-        self.nuls += bytes.iter().fold(0u64, |n, &b| n + u64::from(b == 0));
+        // A blob's NULs are at most its byte count, a `u64`.
+        self.nuls = bytes
+            .iter()
+            .fold(self.nuls, |n, &b| n.saturating_add(u64::from(b == 0)));
         if let Some(&last) = bytes.last()
         {
             self.ends_in_nul = last == 0;
@@ -158,14 +164,15 @@ impl ArgvEnvTally
         let total = self.header.args_bytes.saturating_add(self.header.env_bytes);
         let take = usize::try_from(total.saturating_sub(self.fed))
             .map_or(chunk.len(), |left| left.min(chunk.len()));
-        let chunk = &chunk[..take];
+        let chunk = chunk.get(..take).unwrap_or(chunk);
         let args_left = usize::try_from(self.header.args_bytes.saturating_sub(self.fed))
             .map_or(chunk.len(), |left| left.min(chunk.len()));
         let (args, env) = chunk.split_at(args_left);
         self.args.feed(args);
         self.name.feed(args);
         self.env.feed(env);
-        self.fed += take as u64;
+        // `fed` stays at most the declared total, a `u64`.
+        self.fed = self.fed.saturating_add(take as u64);
     }
 
     /// Check the fed blobs against the header; returns the process's name,
@@ -255,6 +262,19 @@ mod tests
         );
         assert_eq!(
             decode_header(&IpcMessage::new(0), CREATE_PROCESS_FIRST_WORD),
+            Err(ArgvEnvRefusal::MissingHeader)
+        );
+    }
+
+    // Defect guarded: a first word so large that its header's end wraps,
+    // which would compare a small end against the word count and read
+    // header words from the zero tail.
+    #[test]
+    fn a_header_whose_end_overflows_is_refused()
+    {
+        let msg = IpcMessage::builder(0).word(3, 1).build();
+        assert_eq!(
+            decode_header(&msg, usize::MAX),
             Err(ArgvEnvRefusal::MissingHeader)
         );
     }

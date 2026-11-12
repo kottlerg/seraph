@@ -111,16 +111,18 @@ where
         return Some(0);
     }
     let mut total = 0usize;
-    while total < dst.len()
+    while let Some(rest) = dst.get_mut(total..).filter(|rest| !rest.is_empty())
     {
-        let want = (dst.len() - total).min(chunk);
-        let window = &mut dst[total..total + want];
-        let reported = read(off + total as u64, window)?;
+        let want = rest.len().min(chunk);
+        let (window, _) = rest.split_at_mut(want);
+        // A file offset past `u64::MAX` cannot be read: the request fails.
+        let reported = read(off.checked_add(total as u64)?, window)?;
         if reported == 0
         {
             break;
         }
-        total += reported.min(want);
+        // `total` stays at most `dst.len()`.
+        total = total.saturating_add(reported.min(want));
     }
     Some(total)
 }
@@ -212,6 +214,24 @@ mod tests
         let mut dst = [0u8; 4];
         let got = fill_exact(&mut dst, 0, 0, |_, _| panic!("no request expected"));
         assert_eq!(got, Some(0));
+    }
+
+    // Defect guarded: a read whose file offset wraps past `u64::MAX`, which
+    // would copy the file's first bytes in as the bytes past the end.
+    #[test]
+    fn fill_exact_fails_a_request_whose_offset_overflows()
+    {
+        let mut dst = [0u8; 4];
+        let mut offsets = [0u64; 2];
+        let mut calls = 0usize;
+        let got = fill_exact(&mut dst, u64::MAX, 1, |off, buf| {
+            offsets[calls] = off;
+            calls += 1;
+            buf.fill(0xAB);
+            Some(1)
+        });
+        assert_eq!(got, None);
+        assert_eq!(&offsets[..calls], &[u64::MAX]);
     }
 
     #[test]

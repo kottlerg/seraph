@@ -150,7 +150,8 @@ pub fn register_name(name: &[u8])
     let len = name.len().min(STREAM_CHUNK_SIZE);
     let label = ipc::stream_labels::STREAM_REGISTER_NAME | ((len as u64 & 0xFFFF) << 16);
     let msg = ipc::IpcMessage::builder(label)
-        .bytes(0, &name[..len])
+        // `len` is at most `name.len()`.
+        .bytes(0, name.get(..len).unwrap_or_default())
         .build();
     // SAFETY: ipc_buf registered by main thread.
     let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
@@ -187,17 +188,13 @@ fn ipc_log(cap: u64, ipc_buf: *mut u64, bytes: &[u8])
         return;
     }
 
-    let mut offset = 0;
-    while offset < bytes.len()
+    for chunk in bytes.chunks(STREAM_CHUNK_SIZE)
     {
-        let chunk_len = (bytes.len() - offset).min(STREAM_CHUNK_SIZE);
+        let chunk_len = chunk.len();
         let label = STREAM_BYTES | ((chunk_len as u64 & 0xFFFF) << 16);
-        let msg = ipc::IpcMessage::builder(label)
-            .bytes(0, &bytes[offset..offset + chunk_len])
-            .build();
+        let msg = ipc::IpcMessage::builder(label).bytes(0, chunk).build();
         // SAFETY: ipc_buf was registered by the caller (init main thread).
         let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
-        offset += chunk_len;
     }
 }
 
@@ -237,7 +234,8 @@ pub unsafe fn spawn_log_thread(
         let placed = unsafe {
             arena.place_page(
                 info.aspace_cap,
-                LOG_THREAD_STACK_VA + i * PAGE_SIZE,
+                // `i` is below `LOG_THREAD_STACK_PAGES`, so the page VA stays in the stack span.
+                LOG_THREAD_STACK_VA.saturating_add(i.saturating_mul(PAGE_SIZE)),
                 syscall::MAP_WRITABLE,
                 |_| {},
             )
@@ -546,10 +544,10 @@ impl HandoverDrain
             return handover::encode_header(history.total(), active);
         }
 
-        while self.slot_idx < MAX_SENDERS
+        while let Some(slot) = slots.get(self.slot_idx)
         {
-            let slot = &slots[self.slot_idx];
-            self.slot_idx += 1;
+            // `slot_idx` indexed a slot, so it is below `MAX_SENDERS`.
+            self.slot_idx = self.slot_idx.saturating_add(1);
             if slot.badge() != 0
             {
                 return slot_chunk(slot);
@@ -557,9 +555,10 @@ impl HandoverDrain
         }
         while let Some(i) = self.name_resend.take_next()
         {
-            if slots[i].badge() != 0
+            if let Some(slot) = slots.get(i)
+                && slot.badge() != 0
             {
-                return slot_chunk(&slots[i]);
+                return slot_chunk(slot);
             }
         }
 
@@ -569,7 +568,8 @@ impl HandoverDrain
         let mut bytes = [0u8; ENTRY_MAX_BYTES];
         if let Some(entry) = history.read_next(&mut self.history, &mut bytes)
         {
-            let bytes = &bytes[..entry.len];
+            // `read_next` caps `entry.len` at the length of `bytes`.
+            let bytes = bytes.get(..entry.len).unwrap_or_default();
             return match entry.kind
             {
                 EntryKind::Text => handover::encode_line(entry.badge, entry.us, entry.level, bytes),
@@ -616,9 +616,13 @@ fn register_sender_name(
 ) -> Option<usize>
 {
     let bytes = msg.data_bytes();
-    let requested = &bytes[..byte_len.min(bytes.len())];
+    // The bound is at most `bytes.len()`, so the range is in bounds.
+    let requested = bytes.get(..byte_len.min(bytes.len())).unwrap_or_default();
     let slot_idx = senders.register_name(badge, requested)?;
-    emit_registration_event(badge, senders.slots()[slot_idx].name());
+    if let Some(slot) = senders.slots().get(slot_idx)
+    {
+        emit_registration_event(badge, slot.name());
+    }
     Some(slot_idx)
 }
 
@@ -634,65 +638,78 @@ fn emit_registration_event(badge: u64, name: &[u8])
     let prefix = b"badge=";
     for &b in prefix
     {
-        if idx < payload.len()
-        {
-            payload[idx] = b;
-            idx += 1;
-        }
+        idx = put_byte(&mut payload, idx, b);
     }
     idx = write_decimal_into(badge, &mut payload, idx);
     let middle = b" registered name='";
     for &b in middle
     {
-        if idx < payload.len()
-        {
-            payload[idx] = b;
-            idx += 1;
-        }
+        idx = put_byte(&mut payload, idx, b);
     }
-    let name_room = payload.len().saturating_sub(idx + 1);
+    let name_room = payload.len().saturating_sub(idx).saturating_sub(1);
     let name_len = name.len().min(name_room);
     if name_len > 0
+        && let Some(dst) = payload
+            .get_mut(idx..)
+            .and_then(|rest| rest.get_mut(..name_len))
+        && let Some(src) = name.get(..name_len)
     {
-        payload[idx..idx + name_len].copy_from_slice(&name[..name_len]);
-        idx += name_len;
+        dst.copy_from_slice(src);
+        // `name_len` fits in the room left after `idx`, so `idx` stays within the buffer.
+        idx = idx.saturating_add(name_len);
     }
-    if idx < payload.len()
-    {
-        payload[idx] = b'\'';
-        idx += 1;
-    }
+    idx = put_byte(&mut payload, idx, b'\'');
 
-    flush_synthetic_logd_line(&payload[..idx]);
+    // `idx` never exceeds the buffer length.
+    flush_synthetic_logd_line(payload.get(..idx).unwrap_or_default());
+}
+
+/// Store `b` at `buf[idx]` and return the next index; a full buffer drops the
+/// byte and returns `idx` unchanged.
+fn put_byte(buf: &mut [u8], idx: usize, b: u8) -> usize
+{
+    if let Some(slot) = buf.get_mut(idx)
+    {
+        *slot = b;
+        // `idx` indexed a slot, so it is below the buffer length.
+        idx.saturating_add(1)
+    }
+    else
+    {
+        idx
+    }
 }
 
 /// Write `value` as base-10 ASCII into `buf` starting at `start`,
 /// returning the new write index. Caps at `buf.len()`.
 fn write_decimal_into(value: u64, buf: &mut [u8; LINE_BUF_SIZE], start: usize) -> usize
 {
+    // Least-significant digit first; a `u64` has at most 20 digits.
     let mut digits = [0u8; 20];
-    let mut dlen = 0;
+    let mut dlen = 0usize;
     let mut n = value;
-    if n == 0
+    for slot in &mut digits
     {
-        digits[0] = b'0';
-        dlen = 1;
-    }
-    else
-    {
-        while n > 0 && dlen < digits.len()
+        *slot = b'0'.saturating_add((n % 10) as u8);
+        // `dlen` indexed a slot, so it is below the array length.
+        dlen = dlen.saturating_add(1);
+        n /= 10;
+        if n == 0
         {
-            digits[dlen] = b'0' + (n % 10) as u8;
-            dlen += 1;
-            n /= 10;
+            break;
         }
     }
     let mut idx = start;
-    while dlen > 0 && idx < buf.len()
+    for &d in digits.get(..dlen).unwrap_or_default().iter().rev()
     {
-        dlen -= 1;
-        buf[idx] = digits[dlen];
-        idx += 1;
+        let Some(slot) = buf.get_mut(idx)
+        else
+        {
+            break;
+        };
+        *slot = d;
+        // `idx` indexed a slot, so it is below the buffer length.
+        idx = idx.saturating_add(1);
     }
     idx
 }
@@ -754,13 +771,17 @@ fn consume_bytes(
     let len = byte_len.min(STREAM_CHUNK_SIZE);
     let bytes = msg.data_bytes();
     let copy_len = len.min(bytes.len());
-    let mut tmp = [0u8; STREAM_CHUNK_SIZE];
-    tmp[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    // `copy_len` is at most `bytes.len()`.
+    let copied = bytes.get(..copy_len).unwrap_or_default();
 
     let level = level_of(msg.label);
     let slot_idx = senders.find_or_alloc(badge);
-    let slot = senders.slot_mut(slot_idx);
-    for &b in &tmp[..copy_len]
+    let Some(slot) = senders.slot_mut(slot_idx)
+    else
+    {
+        return;
+    };
+    for &b in copied
     {
         slot.begin_byte(level);
         // A newline ends the line; a full buffer is flushed too, to keep the
@@ -792,7 +813,12 @@ fn consume_record(
     {
         return RECORD_REJECTED;
     }
-    let Ok(record) = Record::decode(&bytes[..byte_len])
+    let Some(body) = bytes.get(..byte_len)
+    else
+    {
+        return RECORD_REJECTED;
+    };
+    let Ok(record) = Record::decode(body)
     else
     {
         return RECORD_REJECTED;
@@ -801,7 +827,11 @@ fn consume_record(
     let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
     history.push_record(badge, us, level, record.payload());
     let slot_idx = senders.find_or_alloc(badge);
-    write_line_prefix(senders.slots()[slot_idx].name(), level);
+    let name = senders
+        .slots()
+        .get(slot_idx)
+        .map_or(&[][..], SenderSlot::name);
+    write_line_prefix(name, level);
     logd_codec::record::render(&record, arch::current::serial_write_byte);
     arch::current::serial_write_byte(b'\r');
     arch::current::serial_write_byte(b'\n');
@@ -878,24 +908,22 @@ fn write_line_prefix(name: &[u8], level: u64)
 /// Write `value` as base-10 ASCII to the serial port with no padding.
 fn write_decimal(value: u64)
 {
+    // Least-significant digit first; a `u64` has at most 20 digits.
     let mut buf = [0u8; 20];
+    let mut len = 0usize;
     let mut n = value;
-    let mut idx = buf.len();
-    if n == 0
+    for slot in &mut buf
     {
-        idx -= 1;
-        buf[idx] = b'0';
-    }
-    else
-    {
-        while n > 0
+        *slot = b'0'.saturating_add((n % 10) as u8);
+        // `len` indexed a slot, so it is below the array length.
+        len = len.saturating_add(1);
+        n /= 10;
+        if n == 0
         {
-            idx -= 1;
-            buf[idx] = b'0' + (n % 10) as u8;
-            n /= 10;
+            break;
         }
     }
-    for &b in &buf[idx..]
+    for &b in buf.get(..len).unwrap_or_default().iter().rev()
     {
         arch::current::serial_write_byte(b);
     }
@@ -907,15 +935,18 @@ fn write_decimal_padded(value: u64, width: usize)
 {
     let mut buf = [b'0'; 20];
     let mut n = value;
-    let mut idx = buf.len();
-    while n > 0 && idx > 0
+    for slot in buf.iter_mut().rev()
     {
-        idx -= 1;
-        buf[idx] = b'0' + (n % 10) as u8;
+        if n == 0
+        {
+            break;
+        }
+        *slot = b'0'.saturating_add((n % 10) as u8);
         n /= 10;
     }
     let start = buf.len().saturating_sub(width);
-    for &b in &buf[start..]
+    // `start` is at most `buf.len()`.
+    for &b in buf.get(start..).unwrap_or_default()
     {
         arch::current::serial_write_byte(b);
     }

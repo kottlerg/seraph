@@ -39,7 +39,10 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u64)
         {
             continue;
         }
-        if UART_PHYS >= d.aux0 && UART_PHYS < d.aux0 + d.aux1
+        // The aperture holds the UART when its offset from the base is below the size.
+        if UART_PHYS
+            .checked_sub(d.aux0)
+            .is_some_and(|offset| offset < d.aux1)
         {
             aperture = Some((d.slot, d.aux0, d.aux1));
             break;
@@ -67,8 +70,10 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u64)
     {
         return;
     }
-    let uart_offset = UART_PHYS - base;
-    let uart_va = SERIAL_VA + uart_offset;
+    // The aperture's base is at most `UART_PHYS`, and the offset is below the
+    // aperture size, which the check above bounds below `INIT_IPC_BUF_VA - SERIAL_VA`.
+    let uart_offset = UART_PHYS.saturating_sub(base);
+    let uart_va = SERIAL_VA.saturating_add(uart_offset);
     UART_MMIO_CAP.store(slot, Ordering::Release);
     // SAFETY: UART MMIO programming before any other thread exists (init-logd
     // starts later). The full aperture is mapped at SERIAL_VA; UART sits at

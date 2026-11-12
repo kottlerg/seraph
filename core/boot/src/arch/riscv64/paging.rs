@@ -199,8 +199,12 @@ unsafe fn probe_satp_mode(probe_root: u64, candidate: PagingMode) -> bool
             cand = in(reg) cand_satp,
             options(nostack),
         );
-        if sstatus_save & 0b10 != 0
-        {
+    }
+    if sstatus_save & 0b10 != 0
+    {
+        // SAFETY: SIE was set before the probe masked it, and the live satp is
+        // restored, so re-enabling it returns sstatus to its state on entry.
+        unsafe {
             core::arch::asm!("csrsi sstatus, 0b10", options(nostack));
         }
     }

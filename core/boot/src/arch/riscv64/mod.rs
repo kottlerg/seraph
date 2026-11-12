@@ -150,9 +150,12 @@ pub unsafe fn discover_boot_hart_id(st: *mut EfiSystemTable) -> u64
     // SAFETY: st is a valid UEFI system table pointer; caller guarantees validity.
     let bs = unsafe { (*st).boot_services };
     let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: `bs` points to valid boot services (caller contract), so the
+    // `locate_protocol` entry is readable.
+    let locate_protocol_fn = unsafe { (*bs).locate_protocol };
     // SAFETY: bs is valid; locate_protocol fills iface on success.
     let status: EfiStatus = unsafe {
-        ((*bs).locate_protocol)(
+        locate_protocol_fn(
             core::ptr::addr_of!(EFI_RISCV_BOOT_PROTOCOL_GUID),
             core::ptr::null_mut(),
             core::ptr::addr_of_mut!(iface),
@@ -164,9 +167,11 @@ pub unsafe fn discover_boot_hart_id(st: *mut EfiSystemTable) -> u64
     }
     let proto = iface.cast::<EfiRiscvBootProtocol>();
     let mut hart_id: u64 = 0;
+    // SAFETY: `proto` is a non-null protocol pointer returned by LocateProtocol
+    // above, so the `get_boot_hartid` entry is readable.
+    let get_boot_hartid_fn = unsafe { (*proto).get_boot_hartid };
     // SAFETY: proto is a valid protocol pointer returned by LocateProtocol.
-    let s: EfiStatus =
-        unsafe { ((*proto).get_boot_hartid)(proto, core::ptr::addr_of_mut!(hart_id)) };
+    let s: EfiStatus = unsafe { get_boot_hartid_fn(proto, core::ptr::addr_of_mut!(hart_id)) };
     if s == EFI_SUCCESS { hart_id } else { 0 }
 }
 

@@ -119,10 +119,13 @@ pub unsafe fn translate_memory_map(
             continue;
         };
 
-        // SAFETY: count < max_entries; out[count] is within the allocated array.
+        // SAFETY: count < max_entries, so the offset stays inside the caller's `max_entries`
+        // array.
+        let slot = unsafe { out.add(count) };
+        // SAFETY: `slot` is inside the caller's writable array.
         unsafe {
             core::ptr::write(
-                out.add(count),
+                slot,
                 MemoryMapEntry {
                     physical_base: desc.physical_start,
                     size: size_bytes,
@@ -1352,24 +1355,32 @@ pub unsafe fn insertion_sort_memory_map(entries: *mut MemoryMapEntry, count: usi
 {
     for i in 1..count
     {
-        // SAFETY: i < count; entries[i] is a valid initialised MemoryMapEntry.
-        let key = unsafe { core::ptr::read(entries.add(i)) };
+        // SAFETY: i < count, so the offset stays inside the allocation.
+        let key_slot = unsafe { entries.add(i) };
+        // SAFETY: entries[i] is a valid initialised MemoryMapEntry.
+        let key = unsafe { core::ptr::read(key_slot) };
         let mut j = i;
 
         while let Some(prev) = j.checked_sub(1)
         {
-            // SAFETY: prev < i < count; entries[prev] is initialised.
-            let prev_base = unsafe { (*entries.add(prev)).physical_base };
+            // SAFETY: prev < i < count, so the offset stays inside the allocation.
+            let prev_slot = unsafe { entries.add(prev) };
+            // SAFETY: entries[prev] is initialised.
+            let prev_base = unsafe { (*prev_slot).physical_base };
             if prev_base <= key.physical_base
             {
                 break;
             }
-            // SAFETY: j and j-1 are both < count and within the allocation.
-            unsafe { core::ptr::copy_nonoverlapping(entries.add(prev), entries.add(j), 1) };
+            // SAFETY: j ≤ i < count, so the offset stays inside the allocation.
+            let j_slot = unsafe { entries.add(j) };
+            // SAFETY: entries[prev] and entries[j] are distinct elements of the allocation.
+            unsafe { core::ptr::copy_nonoverlapping(prev_slot, j_slot, 1) };
             j = prev;
         }
 
-        // SAFETY: j < count; entries[j] is within the allocation.
-        unsafe { core::ptr::write(entries.add(j), key) };
+        // SAFETY: j ≤ i < count, so the offset stays inside the allocation.
+        let j_slot = unsafe { entries.add(j) };
+        // SAFETY: entries[j] is within the allocation; its old value was copied up or is `key`.
+        unsafe { core::ptr::write(j_slot, key) };
     }
 }

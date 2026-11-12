@@ -53,11 +53,17 @@ pub fn prepare_step(thread: u64, regs: &mut [u8]) -> Result<StepUndo, StepError>
     insn[..2].copy_from_slice(&first);
     if len == 4
     {
-        read(thread, pc + 2, &mut insn[2..])?;
+        let rest = pc.checked_add(2).ok_or(StepError::Unreadable)?;
+        read(thread, rest, &mut insn[2..])?;
     }
+    // `x0` has no slot in the file and reads as zero, as does any number
+    // past it.
     let reg = |n: u32| {
-        let at = syscall_abi::REGS_RISCV64_X1_OFFSET + (n as usize - 1) * 8;
-        regs.get(at..at + 8)
+        (n as usize)
+            .checked_sub(1)
+            .and_then(|i| i.checked_mul(8))
+            .and_then(|off| syscall_abi::REGS_RISCV64_X1_OFFSET.checked_add(off))
+            .and_then(|at| regs.get(at..at.checked_add(8)?))
             .and_then(|b| b.try_into().ok())
             .map_or(0, u64::from_le_bytes)
     };

@@ -57,7 +57,7 @@ pub(crate) fn delete_caps(caps: &[u64])
 /// [`serve_boot_slots`]). Consumes `seeds`.
 pub(crate) fn assemble_boot_caps(provided_recv: u64, seeds: Vec<u64>) -> Vec<u64>
 {
-    let mut caps: Vec<u64> = Vec::with_capacity(seeds.len() + 1);
+    let mut caps: Vec<u64> = Vec::with_capacity(seeds.len().saturating_add(1));
     if provided_recv != 0
     {
         caps.push(provided_recv);
@@ -91,7 +91,7 @@ pub(crate) fn serve_boot_slots(ctx: &RestartCtx, child_badge: u64, slots: &[u64]
                 ctx.bootstrap_ep,
                 child_badge,
                 ctx.ipc_buf,
-                k + 1 == rounds,
+                k.saturating_add(1) == rounds,
                 packed.caps(),
                 &[packed.presence()],
             )

@@ -20,6 +20,8 @@
 //! codec are host-tested (see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants)).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 use ipc::bootstrap::{PackedSlots, SlotAccumulator, slot_round_count, slot_rounds};
@@ -153,14 +155,14 @@ impl Round
     #[must_use]
     pub fn caps(&self) -> &[u64]
     {
-        &self.caps[..self.cap_count]
+        self.caps.get(..self.cap_count).unwrap_or_default()
     }
 
     /// The round's data words.
     #[must_use]
     pub fn data(&self) -> &[u64]
     {
-        &self.data[..self.data_words]
+        self.data.get(..self.data_words).unwrap_or_default()
     }
 
     fn new(data: &[u64]) -> Self
@@ -169,9 +171,12 @@ impl Round
             caps: [0; MSG_CAP_SLOTS_MAX],
             cap_count: 0,
             data: [0; ROUND_DATA_WORDS],
-            data_words: data.len(),
+            data_words: data.len().min(ROUND_DATA_WORDS),
         };
-        round.data[..data.len()].copy_from_slice(data);
+        for (slot, word) in round.data.iter_mut().zip(data)
+        {
+            *slot = *word;
+        }
         round
     }
 
@@ -179,8 +184,11 @@ impl Round
     fn with_caps(data: &[u64], packed: &PackedSlots) -> Self
     {
         let mut round = Round::new(data);
-        round.caps[..packed.caps().len()].copy_from_slice(packed.caps());
-        round.cap_count = packed.caps().len();
+        for (slot, cap) in round.caps.iter_mut().zip(packed.caps())
+        {
+            *slot = *cap;
+        }
+        round.cap_count = packed.caps().len().min(MSG_CAP_SLOTS_MAX);
         round
     }
 
@@ -192,8 +200,14 @@ impl Round
         {
             return 0;
         }
-        self.caps[self.cap_count] = cap;
-        self.cap_count += 1;
+        let Some(slot) = self.caps.get_mut(self.cap_count)
+        else
+        {
+            return 0;
+        };
+        *slot = cap;
+        // `cap_count` indexed a slot, so it is below `MSG_CAP_SLOTS_MAX`.
+        self.cap_count = self.cap_count.saturating_add(1);
         bit
     }
 }
@@ -234,7 +248,8 @@ pub fn encode_caps(caps: &CapsRound) -> [Round; CAPS_ROUNDS]
                 kind::CAPS,
                 u64::from(ipc::SVCMGR_LABELS_VERSION),
                 packed.presence(),
-                (CAPS_ROUNDS - 1 - k) as u64,
+                // `k` is below `CAPS_ROUNDS`, so neither step saturates.
+                CAPS_ROUNDS.saturating_sub(1).saturating_sub(k) as u64,
             ],
             &packed,
         )
@@ -290,7 +305,7 @@ impl<const N: usize> SlotListDecoder<N>
     ) -> Result<Option<[u64; N]>, DecodeError>
     {
         let owed_after = Self::ROUNDS
-            .checked_sub(self.received + 1)
+            .checked_sub(self.received.saturating_add(1))
             .ok_or(DecodeError::Malformed)?;
         if rounds_left != owed_after as u64
         {
@@ -306,7 +321,8 @@ impl<const N: usize> SlotListDecoder<N>
         {
             return Err(DecodeError::Malformed);
         }
-        self.received += 1;
+        // `received` is below `ROUNDS`, since `owed_after` was computed from it.
+        self.received = self.received.saturating_add(1);
         Ok((owed_after == 0).then(|| *self.slots.slots()))
     }
 }
@@ -630,5 +646,25 @@ mod tests
             CapsDecoder::new().push(logd.caps(), logd.data()),
             Err(DecodeError::Malformed)
         );
+    }
+
+    #[test]
+    fn a_round_given_more_words_than_it_holds_keeps_only_the_words_it_holds()
+    {
+        let words = [7u64; ROUND_DATA_WORDS + 3];
+        let round = Round::new(&words);
+        assert_eq!(round.data(), &words[..ROUND_DATA_WORDS]);
+    }
+
+    #[test]
+    fn an_optional_cap_past_the_last_cap_slot_is_left_off_with_its_bit_clear()
+    {
+        let mut round = Round::new(&[kind::LOGD_SOURCES, 0]);
+        for _ in 0..MSG_CAP_SLOTS_MAX
+        {
+            assert_eq!(round.push_optional(5, 1), 1);
+        }
+        assert_eq!(round.push_optional(6, 1), 0);
+        assert_eq!(round.caps().len(), MSG_CAP_SLOTS_MAX);
     }
 }

@@ -10,6 +10,9 @@
 //! The packets it answers, and the markers it logs, are specified in
 //! `services/debug-echo/README.md`.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::time::Duration;
 
 use gdb_rsp::command::Command;
@@ -153,7 +156,12 @@ fn read(port: u64, buf: &mut [u8; MAX_MESSAGE_BYTES], ipc_buf: *mut u64) -> usiz
     let count = usize::try_from((reply.label >> 16) & 0xFFFF).unwrap_or(0);
     let bytes = reply.data_bytes();
     let n = count.min(bytes.len()).min(buf.len());
-    buf[..n].copy_from_slice(&bytes[..n]);
+    let (Some(dst), Some(src)) = (buf.get_mut(..n), bytes.get(..n))
+    else
+    {
+        return 0;
+    };
+    dst.copy_from_slice(src);
     n
 }
 
@@ -206,7 +214,7 @@ fn serve(port: u64, rx_notify: u64, ipc_buf: *mut u64) -> !
             }
             continue;
         }
-        for &byte in &buf[..n]
+        for &byte in buf.iter().take(n)
         {
             session.take(byte, port, ipc_buf);
         }
@@ -233,7 +241,10 @@ impl Session
                 Event::Interrupt => stop_reply(2, &mut reply),
                 Event::Nack =>
                 {
-                    write(port, &self.last[..self.last_len], ipc_buf);
+                    if let Some(last) = self.last.get(..self.last_len)
+                    {
+                        write(port, last, ipc_buf);
+                    }
                     Answer::None
                 }
                 Event::Ack | Event::BadChecksum => Answer::None,
@@ -250,8 +261,13 @@ impl Session
             Answer::Packet(len) => (len, false),
             Answer::NoAckOk(len) => (len, true),
         };
-        write(port, &reply[..len], ipc_buf);
-        self.last[..len].copy_from_slice(&reply[..len]);
+        let (Some(sent), Some(kept)) = (reply.get(..len), self.last.get_mut(..len))
+        else
+        {
+            return;
+        };
+        write(port, sent, ipc_buf);
+        kept.copy_from_slice(sent);
         self.last_len = len;
         if no_ack_after
         {
@@ -304,7 +320,7 @@ fn echo_reply(escaped: &[u8], out: &mut [u8]) -> Answer
     match unescape(escaped, &mut data)
     {
         Ok(n) => packet(out, |w| {
-            w.bytes(&data[..n]);
+            w.bytes(data.get(..n).unwrap_or_default());
         }),
         Err(_) => error_reply(1, out),
     }

@@ -23,6 +23,8 @@
 // no_core so this crate can sit inside std's dep graph. Mirrors
 // shared/shmem and runtime/ruststd/argv-env. Normal builds retain
 // `#![no_std]` with `alloc`.
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]

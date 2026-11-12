@@ -709,7 +709,11 @@ unsafe fn step4_parse_bundle(
 
     for i in 0..header.entry_count
     {
-        let entry = bundle::entry_at(bytes, i);
+        let Some(entry) = bundle::entry_at(bytes, i)
+        else
+        {
+            return Err(BootError::InvalidBundle("bundle truncated"));
+        };
         let name = bundle::name_str(&entry.name);
         // usize is 64-bit on every UEFI target Seraph supports; parse_header
         // already bounds-checked offset+size against `bytes.len()`.

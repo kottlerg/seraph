@@ -26,6 +26,9 @@
 //! own threads. So a `SYS_THREAD_WRITE_MEM` of the stub's writes another
 //! address space, which its `# Safety` contract does not constrain.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod arch;
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -234,7 +237,12 @@ impl Port
         let count = usize::try_from((reply.label >> 16) & 0xFFFF).unwrap_or(0);
         let bytes = reply.data_bytes();
         let n = count.min(bytes.len()).min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
+        let (Some(dst), Some(src)) = (buf.get_mut(..n), bytes.get(..n))
+        else
+        {
+            return 0;
+        };
+        dst.copy_from_slice(src);
         n
     }
 
@@ -377,7 +385,8 @@ impl Kernel for Sys
 
     fn receivers(&mut self, count: usize)
     {
-        let started = count == 0 || self.ensure_receiver(count - 1);
+        // `count` is nonzero where it is used, so the subtraction cannot saturate.
+        let started = count == 0 || self.ensure_receiver(count.saturating_sub(1));
         // Logged once per shortfall: a stop waits on the endpoint until a
         // held one is answered, and the serve loop asks again at each wait.
         if !started && !self.receiver_short
@@ -401,22 +410,28 @@ impl Kernel for Sys
     {
         let mut file = [0u8; 512];
         let size = regs::file_size(ARCH);
-        syscall::thread_read_regs(cap, &mut file[..size]).ok()?;
-        Some(regs::pc(ARCH, &file))
+        let part = file.get_mut(..size)?;
+        syscall::thread_read_regs(cap, part).ok()?;
+        Some(regs::pc(ARCH, part))
     }
 
     fn set_pc(&mut self, cap: u64, pc: u64) -> bool
     {
         let mut file = [0u8; 512];
         let size = regs::file_size(ARCH);
-        if syscall::thread_read_regs(cap, &mut file[..size]).is_err()
+        let Some(part) = file.get_mut(..size)
+        else
+        {
+            return false;
+        };
+        if syscall::thread_read_regs(cap, part).is_err()
         {
             return false;
         }
-        regs::set_pc(ARCH, &mut file[..size], pc);
+        regs::set_pc(ARCH, part, pc);
         // SAFETY: the register file was read from this stopped thread just
         // above; only its pointer changed.
-        unsafe { syscall::thread_write_regs(cap, &file[..size]) }.is_ok()
+        unsafe { syscall::thread_write_regs(cap, part) }.is_ok()
     }
 
     fn alive(&mut self, cap: u64) -> bool
@@ -436,7 +451,7 @@ impl Kernel for Sys
         {
             std::os::seraph::log!(
                 warn: "a fault receiver could not be started; thread {} is left unbound",
-                slot + 1
+                slot.saturating_add(1)
             );
             return false;
         }
@@ -475,18 +490,23 @@ impl Kernel for Sys
     {
         let mut file = [0u8; 512];
         let size = regs::file_size(ARCH);
-        if syscall::thread_read_regs(cap, &mut file[..size]).is_err()
+        let Some(part) = file.get_mut(..size)
+        else
+        {
+            return false;
+        };
+        if syscall::thread_read_regs(cap, part).is_err()
         {
             return false;
         }
-        let Ok(undo) = arch::prepare_step(cap, &mut file[..size])
+        let Ok(undo) = arch::prepare_step(cap, part)
         else
         {
             return false;
         };
         // SAFETY: the register file was read from this held thread just
         // above; only the trap flag changed.
-        if unsafe { syscall::thread_write_regs(cap, &file[..size]) }.is_err()
+        if unsafe { syscall::thread_write_regs(cap, part) }.is_err()
         {
             // The registers were not written; only a planted c.ebreak needs
             // taking back.
@@ -514,12 +534,13 @@ impl Kernel for Sys
         };
         let mut file = [0u8; 512];
         let size = regs::file_size(ARCH);
-        if syscall::thread_read_regs(cap, &mut file[..size]).is_ok()
+        if let Some(part) = file.get_mut(..size)
+            && syscall::thread_read_regs(cap, part).is_ok()
         {
-            arch::finish_step_regs(undo, &mut file[..size]);
+            arch::finish_step_regs(undo, part);
             // SAFETY: read from this held thread just above; only the step's
             // trap flag changed.
-            let _ = unsafe { syscall::thread_write_regs(cap, &file[..size]) };
+            let _ = unsafe { syscall::thread_write_regs(cap, part) };
         }
     }
 
@@ -553,7 +574,11 @@ impl Kernel for Sys
             return false;
         };
         let mut bytes = [0u8; breakpoints::MAX_BREAKPOINT_BYTES];
-        let bytes = &mut bytes[..insn.len()];
+        let Some(bytes) = bytes.get_mut(..insn.len())
+        else
+        {
+            return false;
+        };
         syscall::thread_read_mem(cap, addr, bytes).is_ok() && bytes == insn
     }
 
@@ -607,7 +632,7 @@ impl Stub
             {
                 break;
             }
-            if i + 1 < attempts
+            if i.saturating_add(1) < attempts
             {
                 std::thread::sleep(FIND_INTERVAL);
             }
@@ -690,7 +715,7 @@ impl Stub
         {
             let sig = stop_signal(stop.kind, stop.detail);
             self.send(ipc_buf, |w| {
-                w.stop_thread(sig, index as u64 + 1);
+                w.stop_thread(sig, (index as u64).saturating_add(1));
             });
         }
     }
@@ -726,7 +751,7 @@ impl Stub
         loop
         {
             let n = self.port.read(&mut buf, ipc_buf);
-            for &byte in &buf[..n]
+            for &byte in buf.iter().take(n)
             {
                 self.take(byte, ipc_buf);
             }
@@ -751,11 +776,15 @@ impl Stub
             let ack = self.acks.response(&event);
             let len = match event
             {
-                Event::Packet(b) =>
+                Event::Packet(b) => match body.get_mut(..b.len())
                 {
-                    body[..b.len()].copy_from_slice(b);
-                    b.len()
-                }
+                    Some(dst) =>
+                    {
+                        dst.copy_from_slice(b);
+                        b.len()
+                    }
+                    None => 0,
+                },
                 _ => 0,
             };
             let kind = match event
@@ -774,14 +803,14 @@ impl Stub
         }
         match event
         {
-            Some(EventKind::Packet) => self.command(&body[..len], ipc_buf),
+            Some(EventKind::Packet) => self.command(body.get(..len).unwrap_or_default(), ipc_buf),
             Some(EventKind::Interrupt)
                 if self
                     .session
                     .as_mut()
                     .is_some_and(|s| s.interrupt(&mut self.sys)) =>
             {
-                let thread = self.current() as u64 + 1;
+                let thread = (self.current() as u64).saturating_add(1);
                 self.send(ipc_buf, |w| {
                     w.stop_thread(signal::INT, thread);
                 });
@@ -859,7 +888,7 @@ impl Stub
             {
                 Some(_) =>
                 {
-                    let thread = self.current() as u64 + 1;
+                    let thread = (self.current() as u64).saturating_add(1);
                     self.send(ipc_buf, |w| {
                         w.stop_thread(signal::TRAP, thread);
                     });
@@ -900,7 +929,7 @@ impl Stub
             }),
             Command::CurrentThread =>
             {
-                let thread = self.current() as u64 + 1;
+                let thread = (self.current() as u64).saturating_add(1);
                 self.send(ipc_buf, |w| {
                     w.current_thread(thread);
                 });
@@ -941,8 +970,8 @@ impl Stub
             Command::WriteMemoryBinary { addr, data } =>
             {
                 let mut bytes = vec![0u8; data.len()];
-                let ok =
-                    unescape(data, &mut bytes).is_ok_and(|n| self.write_memory(addr, &bytes[..n]));
+                let ok = unescape(data, &mut bytes)
+                    .is_ok_and(|n| bytes.get(..n).is_some_and(|b| self.write_memory(addr, b)));
                 self.reply_ok(ok, ipc_buf);
             }
             Command::InsertBreakpoint {
@@ -1029,7 +1058,8 @@ impl Stub
         let session = self.session.as_ref()?;
         let cap = session.cap(session.current)?;
         let mut file = [0u8; 512];
-        syscall::thread_read_regs(cap, &mut file[..regs::file_size(ARCH)]).ok()?;
+        let part = file.get_mut(..regs::file_size(ARCH))?;
+        syscall::thread_read_regs(cap, part).ok()?;
         Some((cap, file))
     }
 
@@ -1062,16 +1092,20 @@ impl Stub
             self.error(ipc_buf, 1);
             return;
         };
-        let size = regs::file_size(ARCH);
+        let Some(part) = file.get_mut(..regs::file_size(ARCH))
+        else
+        {
+            self.error(ipc_buf, 1);
+            return;
+        };
         let applied = match regnum
         {
-            None => regs::write_registers(ARCH, hex, &mut file[..size]),
-            Some(n) => regs::write_register(ARCH, n, hex, &mut file[..size]),
+            None => regs::write_registers(ARCH, hex, part),
+            Some(n) => regs::write_register(ARCH, n, hex, part),
         };
         // SAFETY: `file` is the held thread's own register file, as read
         // above, with GDB's values in the fields the stub lets it write.
-        let ok =
-            applied.is_ok() && unsafe { syscall::thread_write_regs(cap, &file[..size]) }.is_ok();
+        let ok = applied.is_ok() && unsafe { syscall::thread_write_regs(cap, part) }.is_ok();
         self.reply_ok(ok, ipc_buf);
     }
 
@@ -1087,16 +1121,20 @@ impl Stub
         let max = (PACKET_SIZE - 4) / 2;
         let len = usize::try_from(len).map_or(max, |l| l.min(max));
         let mut bytes = vec![0u8; len];
-        let mut read = 0;
-        while read < len
+        let mut read = 0usize;
+        for chunk in bytes.chunks_mut(syscall_abi::MAX_THREAD_MEM_COPY)
         {
-            let n = (len - read).min(syscall_abi::MAX_THREAD_MEM_COPY);
-            if syscall::thread_read_mem(cap, addr + read as u64, &mut bytes[read..read + n])
-                .is_err()
+            let Some(at) = addr.checked_add(read as u64)
+            else
+            {
+                break;
+            };
+            if syscall::thread_read_mem(cap, at, chunk).is_err()
             {
                 break;
             }
-            read += n;
+            // `chunk` is part of `bytes`, so `read` stays at most `len`.
+            read = read.saturating_add(chunk.len());
         }
         if read == 0 && len != 0
         {
@@ -1104,7 +1142,7 @@ impl Stub
             return;
         }
         self.send(ipc_buf, |w| {
-            w.hex(&bytes[..read]);
+            w.hex(bytes.get(..read).unwrap_or_default());
         });
     }
 
@@ -1121,7 +1159,12 @@ impl Stub
             .chunks(syscall_abi::MAX_THREAD_MEM_COPY)
             .enumerate()
             .all(|(i, chunk)| {
-                let at = addr + (i * syscall_abi::MAX_THREAD_MEM_COPY) as u64;
+                let Some(at) =
+                    addr.checked_add(i.saturating_mul(syscall_abi::MAX_THREAD_MEM_COPY) as u64)
+                else
+                {
+                    return false;
+                };
                 // SAFETY: the write lands in the target's address space, not
                 // the stub's own (module doc, § The target is never the
                 // stub); every thread of the target is held.
@@ -1154,7 +1197,11 @@ impl Stub
             return false;
         };
         let mut saved = [0u8; breakpoints::MAX_BREAKPOINT_BYTES];
-        let saved = &mut saved[..insn.len()];
+        let Some(saved) = saved.get_mut(..insn.len())
+        else
+        {
+            return false;
+        };
         if syscall::thread_read_mem(cap, addr, saved).is_err() || !write_text(cap, addr, insn)
         {
             return false;
@@ -1227,7 +1274,7 @@ fn find_process(debug: u64, name: &[u8], ipc_buf: *mut u64) -> Option<u64>
         for i in 0..count
         {
             let (badge, len) = procmgr_labels::unpack_list_entry(words, i, &mut entry_name)?;
-            if &entry_name[..len] == name
+            if entry_name.get(..len) == Some(name)
             {
                 return Some(badge);
             }
@@ -1318,14 +1365,14 @@ fn attach_process(
                 let _ = syscall::cap_delete(cap);
             }
         }
-        next += page.len() as u64;
+        next = next.saturating_add(page.len() as u64);
         if page.is_empty() || next >= count || caps.len() >= room
         {
             return Some(AttachPage {
                 bias: reply.word(1),
                 page: Page {
                     count,
-                    complete: first + caps.len() as u64 >= count,
+                    complete: first.saturating_add(caps.len() as u64) >= count,
                     caps,
                 },
             });

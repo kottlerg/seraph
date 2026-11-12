@@ -140,9 +140,9 @@ fn hex_nibble(c: u8) -> Option<u8>
 {
     match c
     {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
+        b'0'..=b'9' => c.checked_sub(b'0'),
+        b'a'..=b'f' => c.checked_sub(b'a')?.checked_add(10),
+        b'A'..=b'F' => c.checked_sub(b'A')?.checked_add(10),
         _ => None,
     }
 }
@@ -152,19 +152,22 @@ fn hex_nibble(c: u8) -> Option<u8>
 fn parse_hex(hex: &str, out: &mut [u8]) -> Option<usize>
 {
     let bytes = hex.as_bytes();
-    if !bytes.len().is_multiple_of(2) || bytes.len() / 2 > out.len()
+    let count = bytes.len() >> 1;
+    if !bytes.len().is_multiple_of(2) || count > out.len()
     {
         return None;
     }
-    let mut i = 0;
-    while i < bytes.len() / 2
+    for (&[hi, lo], o) in bytes.as_chunks::<2>().0.iter().zip(out.iter_mut())
     {
-        let hi = hex_nibble(bytes[2 * i])?;
-        let lo = hex_nibble(bytes[2 * i + 1])?;
-        out[i] = (hi << 4) | lo;
-        i += 1;
+        *o = (hex_nibble(hi)? << 4) | hex_nibble(lo)?;
     }
-    Some(bytes.len() / 2)
+    Some(count)
+}
+
+/// The first `len` bytes of a KAT message scratch buffer.
+fn msg_prefix(buf: &[u8; MSG_SCRATCH], len: usize) -> Result<&[u8], &'static str>
+{
+    buf.get(..len).ok_or("ed25519: bad msg length")
 }
 
 /// Parse a vector's fields and run verification.
@@ -182,7 +185,7 @@ fn verify_vector(
     {
         return Err("ed25519: wrong field length");
     }
-    Ok(ed25519_verify(&pk, &msg_buf[..msg_len], &sig))
+    Ok(ed25519_verify(&pk, msg_prefix(msg_buf, msg_len)?, &sig))
 }
 
 /// Run the Ed25519 known-answer tests (RFC 8032 §7.1 positives plus tamper
@@ -206,18 +209,19 @@ pub fn run_ed25519_kats() -> Result<(), &'static str>
     }
 
     // Reparse TEST 2 (non-empty, short) as a base for tamper tests.
-    let base = &RFC8032_VECTORS[1];
+    let base = RFC8032_VECTORS.get(1).ok_or("ed25519: missing vector")?;
     let mut pk = [0u8; 32];
     let mut sig = [0u8; 64];
     let _ = parse_hex(base.public_key, &mut pk).ok_or("ed25519: bad pk hex")?;
     let _ = parse_hex(base.signature, &mut sig).ok_or("ed25519: bad sig hex")?;
     let mut bmsg = [0u8; MSG_SCRATCH];
     let bmsg_len = parse_hex(base.message, &mut bmsg).ok_or("ed25519: bad msg hex")?;
+    let bmsg_ref = msg_prefix(&bmsg, bmsg_len)?;
 
     // Flipped R byte of the signature → Mismatch.
     let mut bad_sig = sig;
     bad_sig[0] ^= 0x01;
-    if ed25519_verify(&pk, &bmsg[..bmsg_len], &bad_sig) != Err(VerifyError::Mismatch)
+    if ed25519_verify(&pk, bmsg_ref, &bad_sig) != Err(VerifyError::Mismatch)
     {
         return Err("ed25519: tampered signature accepted");
     }
@@ -225,15 +229,16 @@ pub fn run_ed25519_kats() -> Result<(), &'static str>
     // Flipped message byte → Mismatch.
     let mut bad_msg = bmsg;
     bad_msg[0] ^= 0x01;
-    if ed25519_verify(&pk, &bad_msg[..bmsg_len], &sig) != Err(VerifyError::Mismatch)
+    if ed25519_verify(&pk, msg_prefix(&bad_msg, bmsg_len)?, &sig) != Err(VerifyError::Mismatch)
     {
         return Err("ed25519: tampered message accepted");
     }
 
     // Different valid public key → Mismatch.
     let mut other_pk = [0u8; 32];
-    let _ = parse_hex(RFC8032_VECTORS[2].public_key, &mut other_pk).ok_or("ed25519: bad pk hex")?;
-    if ed25519_verify(&other_pk, &bmsg[..bmsg_len], &sig) != Err(VerifyError::Mismatch)
+    let other = RFC8032_VECTORS.get(2).ok_or("ed25519: missing vector")?;
+    let _ = parse_hex(other.public_key, &mut other_pk).ok_or("ed25519: bad pk hex")?;
+    if ed25519_verify(&other_pk, bmsg_ref, &sig) != Err(VerifyError::Mismatch)
     {
         return Err("ed25519: wrong-key signature accepted");
     }
@@ -241,7 +246,7 @@ pub fn run_ed25519_kats() -> Result<(), &'static str>
     // S == L → NonCanonicalS (the mandatory range check).
     let mut sl_sig = sig;
     sl_sig[32..].copy_from_slice(&scalar::L);
-    if ed25519_verify(&pk, &bmsg[..bmsg_len], &sl_sig) != Err(VerifyError::NonCanonicalS)
+    if ed25519_verify(&pk, bmsg_ref, &sl_sig) != Err(VerifyError::NonCanonicalS)
     {
         return Err("ed25519: non-canonical S accepted");
     }
@@ -249,7 +254,7 @@ pub fn run_ed25519_kats() -> Result<(), &'static str>
     // Public key that is not a curve point → BadPublicKey.
     let mut not_a_point = [0u8; 32];
     not_a_point[0] = 2;
-    if ed25519_verify(&not_a_point, &bmsg[..bmsg_len], &sig) != Err(VerifyError::BadPublicKey)
+    if ed25519_verify(&not_a_point, bmsg_ref, &sig) != Err(VerifyError::BadPublicKey)
     {
         return Err("ed25519: invalid public key accepted");
     }
@@ -259,7 +264,7 @@ pub fn run_ed25519_kats() -> Result<(), &'static str>
     let mut y_is_p = [0xFFu8; 32];
     y_is_p[0] = 0xED;
     y_is_p[31] = 0x7F;
-    if ed25519_verify(&y_is_p, &bmsg[..bmsg_len], &sig) != Err(VerifyError::BadPublicKey)
+    if ed25519_verify(&y_is_p, bmsg_ref, &sig) != Err(VerifyError::BadPublicKey)
     {
         return Err("ed25519: public key with y >= p accepted");
     }
@@ -269,7 +274,7 @@ pub fn run_ed25519_kats() -> Result<(), &'static str>
     let mut x0_sign = [0u8; 32];
     x0_sign[0] = 1;
     x0_sign[31] = 0x80;
-    if ed25519_verify(&x0_sign, &bmsg[..bmsg_len], &sig) != Err(VerifyError::BadPublicKey)
+    if ed25519_verify(&x0_sign, bmsg_ref, &sig) != Err(VerifyError::BadPublicKey)
     {
         return Err("ed25519: public key with x = 0 and sign bit set accepted");
     }

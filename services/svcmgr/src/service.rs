@@ -230,14 +230,14 @@ pub fn bootstrap_caps(
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let round =
             unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) }.ok()?;
+        // The valid prefixes of the round's caps and data words.
+        let round_caps = round.caps.get(..round.cap_count).unwrap_or_default();
+        let round_words = round.data.get(..round.data_words).unwrap_or_default();
         match round.data[0]
         {
             endow_kind::CAPS =>
             {
-                match caps_decoder.push(
-                    &round.caps[..round.cap_count],
-                    &round.data[..round.data_words],
-                )
+                match caps_decoder.push(round_caps, round_words)
                 {
                     // More CAPS rounds are owed; their caps are recorded.
                     Ok(None) =>
@@ -274,13 +274,10 @@ pub fn bootstrap_caps(
                 // log-sink sources on the already-built cap set; a round
                 // with no cap set to land on, or one that does not decode,
                 // is released rather than leaked.
-                let delivered = &round.caps[..round.cap_count];
+                let delivered = round_caps;
                 match (
                     caps.as_mut(),
-                    svcmgr_endowment::decode_logd_sources(
-                        delivered,
-                        &round.data[..round.data_words],
-                    ),
+                    svcmgr_endowment::decode_logd_sources(delivered, round_words),
                 )
                 {
                     (Some(c), Ok(sources)) =>
@@ -308,7 +305,7 @@ pub fn bootstrap_caps(
                 // A round of a kind svcmgr does not know: its caps have no
                 // role here, so release them rather than hold them.
                 std::os::seraph::log!(warn: "bootstrap: unknown endowment kind {other}");
-                for &cap in &round.caps[..round.cap_count]
+                for &cap in round_caps
                 {
                     let _ = syscall::cap_delete(cap);
                 }
@@ -360,7 +357,9 @@ fn ingest_substrate(round: &ipc::bootstrap::BootstrapRound, pending: &mut Vec<Pe
         reject(thread_cap);
         return;
     };
-    let Ok(name) = core::str::from_utf8(&bytes[..name_len])
+    let Some(name) = bytes
+        .get(..name_len)
+        .and_then(|name| core::str::from_utf8(name).ok())
     else
     {
         std::os::seraph::log!(warn: "bootstrap: substrate name invalid");

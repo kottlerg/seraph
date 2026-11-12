@@ -89,13 +89,20 @@ const _: () = assert!(STACK_PAINT != 0 && STACK_PAINT != HANDOFF_STACK_BASE_MARK
 pub fn image_slide(rand: u64, span_bytes: u64) -> u64
 {
     let span = align_up_2m(span_bytes);
-    let Some(max_slide) = IMAGE_WINDOW_SIZE.checked_sub(span + IMAGE_WINDOW_GUARD)
+    let Some(max_slide) = span
+        .checked_add(IMAGE_WINDOW_GUARD)
+        .and_then(|reserved| IMAGE_WINDOW_SIZE.checked_sub(reserved))
     else
     {
         return 0;
     };
-    let slots = max_slide / IMAGE_SLIDE_ALIGN + 1;
-    (rand % slots) * IMAGE_SLIDE_ALIGN
+    // `max_slide` lies inside the 2 GiB window, so the slot count is at least
+    // one and cannot saturate, and the slide, at most `max_slide`, cannot
+    // either.
+    let slots = (max_slide / IMAGE_SLIDE_ALIGN).saturating_add(1);
+    rand.checked_rem(slots)
+        .unwrap_or(0)
+        .saturating_mul(IMAGE_SLIDE_ALIGN)
 }
 
 /// Number of 1 GiB-aligned direct-map base slots in
@@ -117,11 +124,13 @@ pub fn direct_map_slots(floor: u64, image_base: u64, ceiling: u64) -> u64
     {
         return 0;
     };
-    if max_base < floor
+    let Some(window) = max_base.checked_sub(floor)
+    else
     {
         return 0;
-    }
-    (max_base - floor) / DIRECT_MAP_BASE_ALIGN + 1
+    };
+    // The quotient is below 2^34, so adding the first slot cannot saturate.
+    (window / DIRECT_MAP_BASE_ALIGN).saturating_add(1)
 }
 
 /// Choose a 1 GiB-aligned direct-map base from a raw entropy word.
@@ -139,15 +148,28 @@ pub fn direct_map_base(rand: u64, floor: u64, image_base: u64, ceiling: u64) -> 
     }
     else
     {
-        (floor + (rand % slots) * DIRECT_MAP_BASE_ALIGN, false)
+        // The offset is at most `max_base - floor` of `direct_map_slots`, so
+        // neither operation can saturate.
+        let offset = rand
+            .checked_rem(slots)
+            .unwrap_or(0)
+            .saturating_mul(DIRECT_MAP_BASE_ALIGN);
+        (floor.saturating_add(offset), false)
     }
 }
 
 /// Round `value` up to the next [`DIRECT_MAP_ALIGN`] boundary.
+///
+/// Returns `u64::MAX` when that boundary is `2^64` or past it: as a ceiling
+/// it still bounds `value`, and no direct-map window fits below it.
 #[must_use]
 pub const fn align_up_2m(value: u64) -> u64
 {
-    (value + DIRECT_MAP_ALIGN - 1) & !(DIRECT_MAP_ALIGN - 1)
+    match value.checked_add(DIRECT_MAP_ALIGN - 1)
+    {
+        Some(bumped) => bumped & !(DIRECT_MAP_ALIGN - 1),
+        None => u64::MAX,
+    }
 }
 
 /// Highest physical address of any RAM region in the memory map: the
@@ -172,7 +194,7 @@ pub fn max_ram_address(entries: &[MemoryMapEntry]) -> u64
                     | MemoryType::Persistent
             )
         })
-        .map(|e| e.physical_base + e.size)
+        .map(|e| e.physical_base.saturating_add(e.size))
         .max()
         .unwrap_or(0)
 }
@@ -197,16 +219,17 @@ pub fn direct_map_ceiling(
 
     if framebuffer.physical_base != 0
     {
-        let fb_end = framebuffer.physical_base
-            + u64::from(framebuffer.stride) * u64::from(framebuffer.height);
+        // Two `u32` factors cannot overflow a `u64` product.
+        let fb_bytes = u64::from(framebuffer.stride).saturating_mul(u64::from(framebuffer.height));
+        let fb_end = framebuffer.physical_base.saturating_add(fb_bytes);
         ceiling = ceiling.max(align_up_2m(fb_end));
     }
 
     let mut regions = [(0u64, 0u64); MAX_MMIO_DIRECT_MAP_REGIONS];
     let count = collect_mmio_direct_map_regions(kernel_mmio, &mut regions);
-    for &(base, size) in &regions[..count]
+    for &(base, size) in regions.iter().take(count)
     {
-        ceiling = ceiling.max(align_up_2m(base + size));
+        ceiling = ceiling.max(align_up_2m(base.saturating_add(size)));
     }
 
     ceiling
@@ -249,8 +272,6 @@ pub const MMIO_REGION_SIZE: u64 = 0x1000;
 #[must_use]
 pub fn collect_mmio_direct_map_regions(km: &KernelMmio, out: &mut [(u64, u64)]) -> usize
 {
-    let mut n = 0;
-
     let lapic = if km.lapic_base != 0
     {
         km.lapic_base
@@ -259,32 +280,23 @@ pub fn collect_mmio_direct_map_regions(km: &KernelMmio, out: &mut [(u64, u64)]) 
     {
         DEFAULT_LAPIC_BASE
     };
-    if n < out.len()
-    {
-        out[n] = (lapic, MMIO_REGION_SIZE);
-        n += 1;
-    }
+    let default_ioapic = (km.ioapic_count == 0).then_some((DEFAULT_IOAPIC_BASE, MMIO_REGION_SIZE));
+    let ioapics = km
+        .ioapics
+        .iter()
+        .take(km.ioapic_count as usize)
+        .map(|entry| (entry.phys_base, MMIO_REGION_SIZE));
+    let regions = core::iter::once((lapic, MMIO_REGION_SIZE))
+        .chain(default_ioapic)
+        .chain(ioapics);
 
-    if km.ioapic_count == 0
+    let mut n: usize = 0;
+    for (slot, region) in out.iter_mut().zip(regions)
     {
-        if n < out.len()
-        {
-            out[n] = (DEFAULT_IOAPIC_BASE, MMIO_REGION_SIZE);
-            n += 1;
-        }
+        *slot = region;
+        // `n` counts slots of `out`, so it cannot saturate.
+        n = n.saturating_add(1);
     }
-    else
-    {
-        for entry in km.ioapics.iter().take(km.ioapic_count as usize)
-        {
-            if n < out.len()
-            {
-                out[n] = (entry.phys_base, MMIO_REGION_SIZE);
-                n += 1;
-            }
-        }
-    }
-
     n
 }
 
@@ -382,6 +394,55 @@ mod tests
             assert_eq!(slide % IMAGE_SLIDE_ALIGN, 0);
             assert!(slide + align_up_2m(span) + IMAGE_WINDOW_GUARD <= IMAGE_WINDOW_SIZE);
         }
+    }
+
+    #[test]
+    fn image_slide_of_oversized_span_is_zero()
+    {
+        for span in [IMAGE_WINDOW_SIZE, u64::MAX - DIRECT_MAP_ALIGN, u64::MAX]
+        {
+            assert_eq!(image_slide(0xDEAD_BEEF, span), 0);
+        }
+    }
+
+    #[test]
+    fn align_up_2m_saturates_past_top()
+    {
+        assert_eq!(align_up_2m(0), 0);
+        assert_eq!(align_up_2m(1), DIRECT_MAP_ALIGN);
+        assert_eq!(
+            align_up_2m(u64::MAX - DIRECT_MAP_ALIGN),
+            u64::MAX - DIRECT_MAP_ALIGN + 1
+        );
+        assert_eq!(align_up_2m(u64::MAX - DIRECT_MAP_ALIGN + 2), u64::MAX);
+        assert_eq!(align_up_2m(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn max_ram_saturates_on_wrapping_entry()
+    {
+        let entries = [ram(0, 0x8000_0000), ram(u64::MAX - 0xFFF, 0x2000)];
+        assert_eq!(max_ram_address(&entries), u64::MAX);
+    }
+
+    #[test]
+    fn ceiling_of_wrapping_ram_leaves_no_window()
+    {
+        let entries = [ram(u64::MAX - 0xFFF, 0x2000)];
+        let fb = FramebufferInfo::empty();
+        let km = KernelMmio::zero();
+        let ceiling = direct_map_ceiling(&entries, &fb, &km);
+        assert_eq!(ceiling, u64::MAX);
+        assert_eq!(
+            direct_map_slots(0xFFFF_8000_0000_0000, KERNEL_LINK_BASE, ceiling),
+            0
+        );
+    }
+
+    #[test]
+    fn direct_map_slots_floor_above_window_is_zero()
+    {
+        assert_eq!(direct_map_slots(KERNEL_LINK_BASE, KERNEL_LINK_BASE, 0), 0);
     }
 
     #[test]

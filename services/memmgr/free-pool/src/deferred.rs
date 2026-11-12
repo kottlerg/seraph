@@ -86,7 +86,8 @@ impl DeferredList
             arena.set_next(self.tail, idx);
         }
         self.tail = idx;
-        self.runs += 1;
+        // Each parked run holds its own slot, so the count stays below the slot count.
+        self.runs = self.runs.saturating_add(1);
         self.pages = self.pages.saturating_add(run.page_count);
     }
 
@@ -100,7 +101,8 @@ impl DeferredList
         {
             self.tail = NODE_NULL;
         }
-        self.runs -= 1;
+        // `run_of` found a run, so the list is non-empty and `runs` is above zero.
+        self.runs = self.runs.saturating_sub(1);
         self.pages = self.pages.saturating_sub(run.page_count);
         Some((idx, run))
     }
@@ -122,7 +124,7 @@ impl DeferredList
         mut quiescent: impl FnMut(&FreeRun) -> bool,
     ) -> u64
     {
-        let mut moved = 0;
+        let mut moved: u64 = 0;
         let mut left = budget.cost;
         for _ in 0..budget.runs.min(self.runs)
         {
@@ -139,7 +141,7 @@ impl DeferredList
             if quiescent(&run)
             {
                 pool.push_node(arena, idx);
-                moved += run.page_count;
+                moved = moved.saturating_add(run.page_count);
             }
             else
             {

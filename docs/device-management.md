@@ -466,10 +466,9 @@ for a line no override names; on riscv64 level-triggered, active-high
 line programmed edge-triggered and shared, an assertion while the line is masked or another device
 holds it high raises no new edge, and the device stays asserted until its interrupt status is read,
 so no later assertion on the line raises one either. The VirtIO interrupt-service thread's timed
-read (`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the driver's timed poll
-finds its completion meanwhile (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
-`POLL_INTERVAL_MS`, virtio-console's `TX_POLL_MS`), so the loss is latency, not a hang. A device
-whose driver asks for message-signaled vectors gets them in place of its wired line (below).
+read (`ISR_POLL_MS`) clears that assertion and signals the waiting path, so the loss is latency, not
+a hang. A device whose driver asks for message-signaled vectors gets them in place of its wired line
+(below); a vector is its device's alone, so none of this applies to it.
 The kernel delivers each routed line to one CPU, chosen when the line is first bound by taking the
 CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 only CPUs whose
 APIC id an I/O APIC can name (below `0xFF`, the broadcast id) take part. Each x86-64 CPU has its
@@ -511,26 +510,42 @@ IOMMU translates the device's writes, it then maps the interrupt file each targe
 device's domain (`MAP_MSI`, § IOMMU Discovery and Programming); on x86-64 VT-d does not translate a
 write to the interrupt range (below). For MSI devmgr writes the message into the function's MSI
 capability, unmasks its vector where the function masks per vector, and enables MSI with one vector.
-For MSI-X it delivers the BARs that hold the function's table and Pending Bit Array, whole when no
-BAR the driver is already given covers them, sets MSI-X Enable with every table entry masked, and
-leaves the driver to write each entry's message, read from the entry's `Interrupt` cap with
-`SYS_CAP_INFO`, and unmask it. devmgr sets the function's Interrupt Disable in both cases. Each
-vector is one `Interrupt` resource, whose copy carries `RIGHTS_IRQ_NOTIFY` only and which the driver
-binds with `SYS_IRQ_REGISTER` in mode 0. A step that fails at the bind (a mint, a message that does
-not fit, an interrupt file, a table BAR, the configuration page) falls back: MSI-X to MSI when the
-function has it, else to the wired line, and MSI to the wired line. A step that fails after it
+For MSI-X it carves a cap of its own on the pages holding the function's table, sets MSI-X Enable
+under Function Mask, masks every table entry, writes each vector's message into its entry, entry 0
+onwards, and unmasks that entry, then clears Function Mask; every other entry stays masked. devmgr
+sets the function's Interrupt Disable in both cases. Each vector is one `Interrupt` resource, whose
+copy carries `RIGHTS_IRQ_NOTIFY` only and which the driver binds with `SYS_IRQ_REGISTER` in mode 0.
+A step that fails at the bind (a mint, a message that does not fit, an interrupt file, the table's
+pages, the configuration page) falls back: MSI-X to MSI when the function has it, else to the wired
+line, and MSI to the wired line. A step that fails after it
 mapped an interrupt file is the exception: the domain keeps the file until it is blocked (`UNMAP`
 refuses it), so a fallback would leave the device reaching a hart's file no target of its own sits
 on, and devmgr refuses the bind instead, which blocks the domain. When it withdraws the driver
-devmgr clears MSI Enable and MSI-X Enable beside Interrupt Disable, before the declared reset, and a
-target is freed once no cap to it remains.
+devmgr clears MSI Enable, and MSI-X Enable with Function Mask set, beside Interrupt Disable, before
+the declared reset; it deletes its cap on the table's pages, and a target is freed once no cap to it
+remains. The table's entries keep their messages until the next bind masks and rewrites them before
+it enables MSI-X again.
+
+devmgr is the one writer of every message: no driver is delivered the pages holding its function's
+MSI-X table or Pending Bit Array. devmgr withholds each structure's pages, its span rounded out to
+the 4 KiB a function keeps it apart from other registers in (PCI Local Bus Specification r3.0
+§ 6.8.2), from every driver of a function it may give MSI-X, and delivers the rest of each BAR as
+up to three `Mmio` ranges, each naming its offset in its BAR
+([driver-binding.md](driver-binding.md#binding) § Binding). A driver therefore neither retargets
+nor masks a vector: it names its vectors in its device's own registers and suppresses its device's
+interrupts at the device (VirtIO's `NO_VECTOR` and event suppression; NVMe's and a NIC's per-queue
+interrupt enables). A VirtIO function is given MSI-X only when every one of its register regions
+lies clear of those pages, since its driver needs them; otherwise devmgr delivers them and the
+function falls back to its wired line. A VirtIO function is given no MSI, since VirtIO over PCI
+signals by MSI-X vectors or its wired line alone (VirtIO 1.2 § 4.1.4.5, § 4.1.5.1.2;
+`firmware::pci::deliverable_messages`).
 
 On x86-64, until VT-d interrupt remapping is programmed
-([#325](https://github.com/kottlerg/seraph/issues/325)), a device that writes to the interrupt
-range, through an MSI-X table its driver programs or through its DMA engine, can raise any vector
-on any CPU whose APIC id is below `0xFF`, the exception vectors 16 to 31 included, behind an IOMMU
-or not. On riscv64 behind the RISC-V IOMMU a device's writes reach only the interrupt files its
-domain maps.
+([#325](https://github.com/kottlerg/seraph/issues/325)), a device whose DMA engine writes to the
+interrupt range can raise any vector on any CPU whose APIC id is below `0xFF`, the exception vectors
+16 to 31 included, behind an IOMMU or not; its driver cannot do so through the MSI-X table, which
+only devmgr writes. On riscv64 behind the RISC-V IOMMU a device's writes reach only the interrupt
+files its domain maps.
 
 ---
 

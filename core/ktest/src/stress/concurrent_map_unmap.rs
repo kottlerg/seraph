@@ -89,6 +89,13 @@ fn copy_failed(index: usize, source: u64, error: i64, message: &'static str) -> 
 {
     crate::log_u64("ktest: concurrent_map_unmap copy child=", index as u64);
     crate::log_u64("ktest: concurrent_map_unmap copy source=", source);
+    let marker = 0u64;
+    crate::log_u64(
+        "ktest: DIAG copy pool entry=",
+        crate::frame_pool::diag_slot(index),
+    );
+    crate::log_u64("ktest: DIAG copy sp~=", core::ptr::addr_of!(marker) as u64);
+    crate::frame_pool::diag_check("copy_failed");
     crate::tally::log_error("ktest: concurrent_map_unmap copy error=", error);
     message
 }
@@ -98,11 +105,23 @@ fn copy_failed(index: usize, source: u64, error: i64, message: &'static str) -> 
 /// exists.
 fn start_mappers(ctx: &TestContext, done: u64, mappers: &mut Mappers) -> TestResult
 {
+    crate::log_u64(
+        "ktest: DIAG frames addr=",
+        core::ptr::addr_of!(mappers.frames) as u64,
+    );
     for i in 0..NUM_CHILDREN
     {
         mappers.frames[i] =
             crate::frame_pool::alloc().ok_or("concurrent_map_unmap: frame pool exhausted")?;
         mappers.allocated = i + 1;
+    }
+    for (i, &frame) in mappers.frames.iter().enumerate()
+    {
+        if frame != crate::frame_pool::diag_slot(i)
+        {
+            crate::log_u64("ktest: DIAG frames mismatch at alloc, index=", i as u64);
+            crate::log_u64("ktest: DIAG frames mismatch value=", frame);
+        }
     }
 
     // Each child gets copies of its Memory cap and the aspace cap in its own

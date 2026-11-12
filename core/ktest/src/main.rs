@@ -116,6 +116,7 @@ macro_rules! run_test {
     ($name:literal, $body:expr) => {{
         $crate::log(concat!("ktest: RUN ", $name));
         let result: $crate::TestResult = { $body };
+        $crate::frame_pool::diag_check($name);
         match result
         {
             Ok(()) =>
@@ -149,6 +150,7 @@ macro_rules! run_integration_test {
     ($name:literal, $body:expr) => {{
         $crate::log(concat!("ktest: ", $name, " starting"));
         let result: $crate::TestResult = { $body };
+        $crate::frame_pool::diag_check($name);
         match result
         {
             Ok(()) =>

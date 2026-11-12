@@ -227,6 +227,7 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
     #[allow(clippy::cast_possible_truncation)]
     let count_u32 = count as u32;
     POOL_COUNT.store(count_u32, Ordering::Release);
+    diag_log_slots();
 
     let mut msg = [0u8; 64];
     let prefix = b"frame pool: initialized with ";
@@ -268,6 +269,59 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
     if let Ok(s) = core::str::from_utf8(&msg[..pos])
     {
         crate::log(s);
+    }
+}
+
+// -- DIAG (stray-write hunt, never merged) --
+
+/// DIAG: log every pool entry and the pool's address.
+pub fn diag_log_slots()
+{
+    crate::log_u64(
+        "ktest: DIAG pool addr=",
+        core::ptr::addr_of!(POOL_SLOTS) as u64,
+    );
+    let count = POOL_COUNT.load(Ordering::Acquire) as usize;
+    for i in 0..count.min(POOL_SIZE)
+    {
+        crate::log_u64("ktest: DIAG pool slot=", diag_slot(i));
+    }
+}
+
+/// DIAG: entry `i` of the pool, by value.
+pub fn diag_slot(i: usize) -> u64
+{
+    // SAFETY: the index is reduced below POOL_SIZE; read by value.
+    unsafe {
+        core::ptr::addr_of!(POOL_SLOTS)
+            .cast::<u64>()
+            .add(i % POOL_SIZE)
+            .read_volatile()
+    }
+}
+
+/// DIAG: check the pool against the pattern init leaves (entry `k` is entry
+/// 0 plus `k`), logging `tag` and each entry that breaks it.
+pub fn diag_check(tag: &str)
+{
+    let count = POOL_COUNT.load(Ordering::Acquire) as usize;
+    let base = diag_slot(0);
+    let mut logged = false;
+    for i in 0..count.min(POOL_SIZE)
+    {
+        let now = diag_slot(i);
+        if now != base + i as u64
+        {
+            if !logged
+            {
+                crate::log("ktest: DIAG pool pattern broken after:");
+                crate::log(tag);
+                crate::log_u64("ktest: DIAG pool base=", base);
+                logged = true;
+            }
+            crate::log_u64("ktest: DIAG pool bad index=", i as u64);
+            crate::log_u64("ktest: DIAG pool bad value=", now);
+        }
     }
 }
 

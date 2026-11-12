@@ -294,10 +294,11 @@ pub fn take_reschedule_pending(cpu: usize) -> bool
 // Mechanism, cost, and limitations are specified in
 // core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
 
-/// All-idle softlockup threshold: the detector fires when no CPU has dispatched
-/// a non-idle thread for this long. Converted to BSP ticks at
-/// `ticks_per_second()` ([`ticks_for_ms`]), so it holds at any tick rate. A
-/// tuning threshold; it bounds no capacity.
+/// All-idle softlockup threshold: the detector fires when, for this long, no
+/// CPU has dispatched a non-idle thread and no BSP tick has seen the system
+/// idle ([`all_idle_tick`]). Converted to BSP ticks at `ticks_per_second()`
+/// ([`ticks_for_ms`]), so it holds at any tick rate. A tuning threshold; it
+/// bounds no capacity.
 #[cfg(not(test))]
 const WATCHDOG_THRESHOLD_SECONDS: u64 = 3;
 
@@ -328,6 +329,15 @@ fn last_non_idle_tick(cpu: usize) -> Option<&'static core::sync::atomic::AtomicU
 }
 
 static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// BSP tick (of [`WATCHDOG_TICK_COUNTER`]) at which the all-idle detector's
+/// per-tick sample last found the system idle ([`system_has_no_work`]); 0
+/// before the first such sample. Written only by the BSP's
+/// `watchdog_tick_and_check`, and read there and by the dump: Relaxed, since
+/// one CPU writes it and the dump's read is diagnostic.
+#[cfg(not(test))]
+static WATCHDOG_LAST_IDLE_TICK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -917,6 +927,63 @@ pub fn watchdog_mark_non_idle(cpu: usize)
     }
 }
 
+/// One BSP tick of the all-idle softlockup detector, at tick `now`: when this
+/// tick's sample found the system idle (`idle_now`: every CPU on its idle
+/// thread with no other thread queued), record `now` in `last_idle`; then
+/// report a stall when the system has not been seen idle for `threshold`
+/// ticks and every CPU's last non-idle dispatch (`last_dispatch`, one entry
+/// per CPU, `None` for a CPU whose stamp slot does not exist yet) is at least
+/// `threshold` ticks old.
+///
+/// An idle system waits for a deadline, a device interrupt or a message, and is
+/// not a stall however long it waits. The sample is recorded before the
+/// decision on every tick, so the stall clock restarts at the last idle tick:
+/// work that becomes ready after a long idle span (a sleeper the same BSP tick
+/// woke, before this check) is a stall only once it has waited `threshold`
+/// undispatched. The remaining windows are stated in
+/// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
+fn all_idle_tick<I>(
+    now: u64,
+    threshold: u64,
+    idle_now: bool,
+    last_idle: &mut u64,
+    last_dispatch: I,
+) -> bool
+where
+    I: IntoIterator<Item = Option<u64>>,
+{
+    if idle_now
+    {
+        *last_idle = now;
+    }
+    if now.saturating_sub(*last_idle) < threshold
+    {
+        return false;
+    }
+    last_dispatch
+        .into_iter()
+        .all(|last| last.is_some_and(|last| now.saturating_sub(last) >= threshold))
+}
+
+/// Whether the system has no work: every CPU runs its idle thread and queues no
+/// other thread ([`run_queue::PerCpuScheduler::has_no_work`]). Lock-free: it
+/// reads each scheduler's atomics with no lock and dereferences no TCB, so a
+/// wedged lock holder cannot stall the BSP tick. Not one snapshot across the
+/// CPUs: a thread moving between CPUs during the walk can be missed, which
+/// the next tick's sample re-decides. Stops at the first CPU with work.
+#[cfg(not(test))]
+fn system_has_no_work(cpu_count: usize) -> bool
+{
+    (0..cpu_count).all(|cpu| {
+        // SAFETY: cpu < cpu_count, which is CPU_COUNT; the scheduler slab
+        // exists, since the BSP's `timer_tick`, the only caller's caller, has
+        // already reached its own scheduler through `scheduler_ptr`. The
+        // scheduler is reached through a shared reference, as every CPU
+        // reaches it, and only its atomics are read.
+        unsafe { (*scheduler_ptr(cpu)).has_no_work() }
+    })
+}
+
 /// BSP-only: tick the global counter and run the wedge detectors — the
 /// owed-wake registry scan and AP-heartbeat silence check on a coarse
 /// cadence, and the all-idle softlockup check every tick. The first
@@ -944,20 +1011,23 @@ fn watchdog_tick_and_check()
         }
     }
 
-    // All CPUs must have last_dispatch older than threshold.
+    // The all-idle detector: its idle sample runs on every tick, before the
+    // decision (see `all_idle_tick`).
     let threshold = ticks_for_ms(WATCHDOG_THRESHOLD_SECONDS.saturating_mul(1000));
-    for cpu in 0..cpu_count
+    let mut last_idle = WATCHDOG_LAST_IDLE_TICK.load(core::sync::atomic::Ordering::Relaxed);
+    let stalled = all_idle_tick(
+        now,
+        threshold,
+        system_has_no_work(cpu_count),
+        &mut last_idle,
+        (0..cpu_count).map(|cpu| {
+            last_non_idle_tick(cpu).map(|slot| slot.load(core::sync::atomic::Ordering::Relaxed))
+        }),
+    );
+    WATCHDOG_LAST_IDLE_TICK.store(last_idle, core::sync::atomic::Ordering::Relaxed);
+    if !stalled
     {
-        let Some(slot) = last_non_idle_tick(cpu)
-        else
-        {
-            return;
-        };
-        let last = slot.load(core::sync::atomic::Ordering::Relaxed);
-        if now.saturating_sub(last) < threshold
-        {
-            return;
-        }
+        return;
     }
 
     // Defer to an in-flight TLB shootdown, whose own ladder is the authoritative
@@ -973,7 +1043,7 @@ fn watchdog_tick_and_check()
         return;
     }
 
-    watchdog_dump("no non-idle dispatch on any CPU for >3s");
+    watchdog_dump("no non-idle dispatch on any CPU for >3s with work running or ready");
 }
 
 /// Owed-wake detector: walk the thread registry for `Blocked` threads whose
@@ -1216,9 +1286,10 @@ fn watchdog_dump(reason: &str)
     let now = WATCHDOG_TICK_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
     crate::kprintln!("=== WATCHDOG: {} ===", reason);
     crate::kprintln!(
-        "  bsp_tick={} timer_tick={}",
+        "  bsp_tick={} timer_tick={} last_idle_tick={}",
         now,
-        crate::arch::current::timer::current_tick()
+        crate::arch::current::timer::current_tick(),
+        WATCHDOG_LAST_IDLE_TICK.load(core::sync::atomic::Ordering::Relaxed)
     );
     for cpu in 0..cpu_count
     {
@@ -7426,6 +7497,107 @@ mod class_tests
         assert_eq!(quantum_ticks(RT_PRIORITY_MIN), TIME_SLICE_TICKS);
         assert_eq!(quantum_ticks(syscall::PRIORITY_MAX), TIME_SLICE_TICKS);
         assert_eq!(quantum_ticks(0), TIME_SLICE_TICKS);
+    }
+}
+
+#[cfg(test)]
+mod all_idle_tests
+{
+    use super::all_idle_tick;
+
+    const THRESHOLD: u64 = 300;
+
+    /// Run the detector over ticks `from..=to` with every CPU's last non-idle
+    /// dispatch at `stamps`, the system idle at a tick when `idle(tick)`;
+    /// return the first tick that reports a stall.
+    fn first_stall(
+        from: u64,
+        to: u64,
+        stamps: &[u64],
+        last_idle: &mut u64,
+        idle: impl Fn(u64) -> bool,
+    ) -> Option<u64>
+    {
+        (from..=to).find(|&now| {
+            all_idle_tick(
+                now,
+                THRESHOLD,
+                idle(now),
+                last_idle,
+                stamps.iter().map(|&s| Some(s)),
+            )
+        })
+    }
+
+    // The defect caught (#965): a system with nothing to run, every thread
+    // waiting on a device interrupt or a message with no deadline armed, is
+    // reported as a stall once every CPU's last dispatch is a threshold old.
+    #[test]
+    fn an_idle_system_is_never_a_stall_however_long_it_waits()
+    {
+        let mut last_idle = 0;
+        assert_eq!(
+            first_stall(1, 20 * THRESHOLD, &[1, 1, 1, 1], &mut last_idle, |_| true),
+            None
+        );
+    }
+
+    // The defect caught: work left undispatched after its CPUs stopped
+    // dispatching (a non-idle `current` wedged in the kernel, or a queued
+    // thread no CPU takes) is not reported, or is reported before it has
+    // waited the threshold.
+    #[test]
+    fn work_undispatched_for_the_threshold_after_the_last_idle_tick_is_a_stall()
+    {
+        let mut last_idle = 0;
+        let busy_from = 2 * THRESHOLD;
+        let stall = first_stall(1, 10 * THRESHOLD, &[1, 1], &mut last_idle, |t| {
+            t < busy_from
+        });
+        assert_eq!(stall, Some(busy_from - 1 + THRESHOLD));
+    }
+
+    // The defect caught: the idle sample taken only once every dispatch stamp
+    // is stale, so the idle span right after the last dispatch goes unseen and
+    // a sleeper woken a threshold after that dispatch, queued by the same BSP
+    // tick just before the check, reads as a stall at once.
+    #[test]
+    fn work_woken_a_threshold_after_the_last_dispatch_is_not_a_stall_at_once()
+    {
+        let mut last_idle = 0;
+        let wake = 1 + THRESHOLD;
+        let stall = first_stall(1, wake + THRESHOLD, &[1, 1], &mut last_idle, |t| t < wake);
+        assert_eq!(stall, Some(wake - 1 + THRESHOLD));
+    }
+
+    // The defect caught: a CPU that still dispatches, or one whose stamp slot
+    // does not exist yet, read as stalled while the system has work.
+    #[test]
+    fn a_recent_dispatch_or_a_missing_stamp_on_any_cpu_is_not_a_stall()
+    {
+        let now = 10 * THRESHOLD;
+        let mut last_idle = 0;
+        assert!(!all_idle_tick(
+            now,
+            THRESHOLD,
+            false,
+            &mut last_idle,
+            [Some(1), Some(now - THRESHOLD + 1)]
+        ));
+        assert!(!all_idle_tick(
+            now,
+            THRESHOLD,
+            false,
+            &mut last_idle,
+            [Some(1), None]
+        ));
+        assert!(all_idle_tick(
+            now,
+            THRESHOLD,
+            false,
+            &mut last_idle,
+            [Some(1), Some(now - THRESHOLD)]
+        ));
     }
 }
 

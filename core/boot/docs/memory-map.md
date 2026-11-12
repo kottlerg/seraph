@@ -47,7 +47,8 @@ re-validation.
 
 Contiguous same-type UEFI entries are **not** coalesced by the
 bootloader. The translated array mirrors the UEFI descriptor sequence
-1:1 (after sorting); its capacity follows the firmware's map
+1:1 (after sorting), apart from a descriptor whose page count has no 64-bit byte
+size, which describes no real region and is dropped; its capacity follows the firmware's map
 (§ Sizing the Entry Array). Any consolidation of adjacent regions into a
 single larger entry is left to the kernel if it wants a denser
 representation.

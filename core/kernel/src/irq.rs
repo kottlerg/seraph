@@ -37,9 +37,10 @@
 //! the minting `CSpace` funds. The slot is held from the mint until the last
 //! capability to the target is gone ([`free_message`]), whether or not a binding
 //! is linked. A target is never masked: a delivery signals its binding and
-//! nothing else, and its `SYS_IRQ_ACK` does nothing (masking, where a driver
-//! needs it, is the device's: MSI-X vector control). It takes one binding, in
-//! mode 0 (edge), which its slot's entry names ([`Slot::Bound`]).
+//! nothing else, and its `SYS_IRQ_ACK` does nothing (a driver holds its device's
+//! messages off through the device's own interrupt controls; the MSI-X table and
+//! its masks are devmgr's). It takes one binding, in mode 0 (edge), which its
+//! slot's entry names ([`Slot::Bound`]).
 //!
 //! # Sizing
 //! The routing table has one entry ([`IrqRoute`]) per line the discovered

@@ -194,6 +194,7 @@ concurrent notification and queue events.
 | `irq_preserves_user_regs.rs` | A ring-3 thread's callee-saved registers survive a timer preemption through the frame-authoritative IRQ path |
 | `tlb_widen_retry.rs` | A permission widen that elides its TLB shootdown still lets a remote CPU's stale-TLB write complete through the spurious-fault retry, both a user-mode store and the kernel's `SYS_GETRANDOM` copy (the copy-region retry) |
 | `write_regs_blocked_syscall.rs` | A thread stopped while blocked in `notification_wait`, `ipc_recv`, or `thread_sleep` (the frame's syscall-number register names that syscall) has its instruction pointer and second-argument register rewritten from another CPU; on restart the blocked syscall's `Interrupted` return resumes at the new instruction pointer with the edited argument intact, every round, as the raw-pointer frame model of [core/kernel/docs/arch-interface.md § `trap_frame`](../kernel/docs/arch-interface.md#trap_frame--archcurrenttrap_frame) preserves, with the redirected child's stack one call chain deep across the rounds (≥ 2 CPUs) |
+| `idle_past_watchdog_threshold.rs` | Every CPU idles past the all-idle softlockup threshold (ktest's only thread sleeps 4 s) and the kernel prints no `=== WATCHDOG` dump, since an idle system is not a stall ([core/kernel/docs/scheduling-internals.md § Softlockup Watchdog](../kernel/docs/scheduling-internals.md#softlockup-watchdog)); the failure is the kernel's dump, which `run-parallel` and CI count as a failed boot |
 
 Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
 `crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs` checks that
@@ -332,7 +333,9 @@ pools and racing pairs, whose workload may run long (`concurrent_map_unmap`, `co
 `retype_concurrent`, `load_balance_handoff_steal`, `event_try_recv_post_race`); the per-round
 acknowledgements of `idle_wake_race`, whose untimed `notification_wait` is the path under test;
 and the liveness gates `cap_delete_reply_wake` (its woke wait) and `stop_resume_race` (its done
-wait), where a lost wake is the defect the watchdog reports.
+wait), where a lost wake is the defect: the watchdog's owed-wake detector reports it when the
+stranded thread matches one of its rules, and the run's timeout otherwise, since an idle system
+is not a stall to the all-idle detector.
 
 | File | Scenario | Knobs |
 |---|---|---|

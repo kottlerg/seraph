@@ -37,10 +37,9 @@ fn main()
         probe_svcmgr(svcmgr_cap, info.ipc_buffer);
     }
 
-    // Brief settle so the surface assertions land before the fault report;
-    // kept well under the 3 s softlockup-watchdog idle window. Co-staged
-    // with svctest, crasher's bounded faults finish long before svctest's
-    // terminal marker, so the kernel fault dump never clobbers it.
+    // Brief settle so the surface assertions land before the fault report.
+    // Co-staged with svctest, crasher's bounded faults finish long before
+    // svctest's terminal marker, so the kernel fault dump never clobbers it.
     thread::sleep(Duration::from_millis(500));
 
     std::os::seraph::log!("triggering fault");

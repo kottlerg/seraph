@@ -37,6 +37,7 @@ pub mod fault_pager_roundtrip;
 pub mod fault_resume_modifies_pc;
 pub mod fault_syscall_buffer;
 pub mod fpu_survives_ipc_call;
+pub mod idle_past_watchdog_threshold;
 pub mod idle_pull_starved_ready;
 pub mod ipc_call_interrupted_stop_start;
 pub mod ipc_call_timeout_stop;
@@ -244,5 +245,9 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::write_regs_blocked_syscall",
         write_regs_blocked_syscall::run(ctx)
+    );
+    run_integration_test!(
+        "integration::idle_past_watchdog_threshold",
+        idle_past_watchdog_threshold::run(ctx)
     );
 }

@@ -20,11 +20,12 @@ for the driver and devmgr.
   it with `shared/elf`'s `find_note` or `find_note_streaming`.
 - **The resource list** (`resources`): the bootstrap devmgr delivers a driver it binds to a
   device. Each non-terminal round carries one resource, its kind in `data[0]`: `Mmio` (the cap,
-  its PCI BAR index or none, physical base, and bytes), `IoPort` (the cap, base, and count), or
-  `Interrupt` (one cap per vector, its kind `Wired`, `Msi`, or `MsiX`, the first vector, and the
-  `SYS_IRQ_REGISTER` mode). The terminal end round carries the endpoint slots `SLOT_SERVICE`,
-  `SLOT_DEVMGR_QUERY`, and `SLOT_DMA`, packed by `ipc::bootstrap::pack_slots`. devmgr builds
-  each round with `Round` (`mmio`, `io_port`, `interrupts`, `end`); a driver receives the list
+  its PCI BAR index or none, physical base, bytes, and offset in the BAR), `IoPort` (the cap,
+  base, and count), or `Interrupt` (one cap per vector, its kind `Wired`, `Msi`, or `MsiX`, the
+  first vector, and the `SYS_IRQ_REGISTER` mode). The terminal end round carries the endpoint
+  slots `SLOT_SERVICE`, `SLOT_DEVMGR_QUERY`, and `SLOT_DMA`, packed by
+  `ipc::bootstrap::pack_slots`. devmgr builds each round with `Round` (`mmio`, `mmio_at`,
+  `io_port`, `interrupts`, `end`); a driver receives the list
   with `receive`, which decodes each round into a `ResourceList` (`absorb`) and deletes every
   delivered cap of a list it refuses. `PlatformDelivery::from_list` reads the list a platform
   record's bind delivers: one register resource (`Mmio` or `IoPort`), an optional wired line,

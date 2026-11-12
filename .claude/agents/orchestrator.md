@@ -220,7 +220,7 @@ push over its replacement.
 ## Exclusive grant
 
 The host is one machine. A boot at the boundary CPU counts (docs/testing.md § Coverage tiers)
-saturates it, and a second QEMU beside it produces hangs that then need classifying; two 4-CPU
+saturates it, and a second QEMU beside it produces hangs that then need classifying; three 4-CPU
 boots side by side do not. Builds and 4-CPU boots therefore take no grant: the commands apply the
 host's launch rules themselves (`xtask/README.md` § Host launch rules). A boot of more than 4
 vCPUs and any timing-sensitive measurement take the exclusive grant:

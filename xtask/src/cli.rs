@@ -212,7 +212,8 @@ pub struct BootHostArgs
     pub common: HostArgs,
 
     /// Run beside no other QEMU, and keep every other boot off the host
-    /// while it runs: a run docs/testing.md "Coverage tiers" owes.
+    /// while it runs: the re-run of a boot whose timeout or timing failure
+    /// came beside another QEMU, before that failure counts.
     #[arg(long, conflicts_with = "timing")]
     pub alone: bool,
 

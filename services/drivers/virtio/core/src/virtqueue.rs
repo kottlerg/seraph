@@ -109,6 +109,9 @@ pub struct SplitVirtqueue
     used_va: *mut VirtqUsed,
     /// Queue size (number of descriptors).
     queue_size: u16,
+    /// `queue_size - 1`: a ring index masked with it is the index modulo
+    /// the queue size, since a split ring's size is a power of two.
+    ring_mask: u16,
     /// Next free descriptor index for allocation; below `queue_size`
     /// whenever `num_free > 0`.
     free_head: u16,
@@ -116,8 +119,8 @@ pub struct SplitVirtqueue
     num_free: u16,
     /// Last seen used ring index (for polling completions). A free-running
     /// `u16` like the ring's own `idx` (`VirtIO` 1.2 §2.7.8); it wraps by spec,
-    /// and `% queue_size` stays exact because a split ring's size is a power
-    /// of two.
+    /// and its ring slot (masked with `ring_mask`) stays exact because a split
+    /// ring's size is a power of two.
     last_used_idx: u16,
     /// Descriptor count of the chain each outstanding head starts, indexed
     /// by head; 0 marks an index that heads no outstanding chain.
@@ -166,6 +169,8 @@ impl SplitVirtqueue
         {
             return None;
         }
+        // At least 1: a power of two.
+        let ring_mask = queue_size.checked_sub(1)?;
 
         // Build the free list in driver memory: each descriptor links to the
         // following one; the last link (queue_size) terminates the list.
@@ -182,6 +187,7 @@ impl SplitVirtqueue
             avail_va,
             used_va,
             queue_size,
+            ring_mask,
             free_head: 0,
             num_free: queue_size,
             last_used_idx: 0,
@@ -197,22 +203,26 @@ impl SplitVirtqueue
     /// indices `new` seeded and `free_chain` returns.
     fn alloc_desc(&mut self) -> Option<u16>
     {
-        if self.num_free == 0
-        {
-            return None;
-        }
+        let remaining = self.num_free.checked_sub(1)?;
         let idx = self.free_head;
-        self.free_head = self.links[usize::from(idx)];
-        self.num_free -= 1;
+        self.free_head = *self.links.get(usize::from(idx))?;
+        self.num_free = remaining;
         Some(idx)
     }
 
-    /// Return a descriptor to the free list.
+    /// Return descriptor `idx`, which is below `queue_size`, to the free list.
     fn free_desc(&mut self, idx: u16)
     {
-        self.links[usize::from(idx)] = self.free_head;
+        let Some(link) = self.links.get_mut(usize::from(idx))
+        else
+        {
+            return;
+        };
+        *link = self.free_head;
         self.free_head = idx;
-        self.num_free += 1;
+        // `idx` was outstanding, so `num_free` is below `queue_size`: no
+        // saturation.
+        self.num_free = self.num_free.saturating_add(1);
     }
 
     /// Submit a descriptor chain to the available ring.
@@ -245,7 +255,8 @@ impl SplitVirtqueue
             let idx = if i == 0 { head } else { self.alloc_desc()? };
             if i > 0
             {
-                self.links[usize::from(prev)] = idx;
+                // `prev` came from alloc_desc, so it is below queue_size.
+                *self.links.get_mut(usize::from(prev))? = idx;
             }
             let flags = if writable { VRING_DESC_F_WRITE } else { 0 };
             // SAFETY: idx and prev come from alloc_desc, so both are below
@@ -271,6 +282,9 @@ impl SplitVirtqueue
             prev_flags = flags;
         }
 
+        // Record the chain before the device can complete it.
+        *self.chain_len.get_mut(usize::from(head))? = chain_len;
+
         // Add head to available ring.
         // SAFETY: avail_va is valid; ring entry is within bounds.
         unsafe {
@@ -283,7 +297,7 @@ impl SplitVirtqueue
             // device and was last updated via write_volatile; a non-volatile
             // read could return a stale cached value on repeated add_chain calls.
             let cur_idx = core::ptr::read_volatile(core::ptr::addr_of!((*self.avail_va).idx));
-            let ring_idx = cur_idx % self.queue_size;
+            let ring_idx = cur_idx & self.ring_mask;
             core::ptr::write_volatile(ring_base.add(ring_idx as usize), head);
 
             // Memory barrier: ensure descriptor writes are visible before
@@ -296,7 +310,6 @@ impl SplitVirtqueue
             );
         }
 
-        self.chain_len[usize::from(head)] = chain_len;
         Some(head)
     }
 
@@ -337,7 +350,7 @@ impl SplitVirtqueue
             // a 2-byte-aligned base maintains u32 alignment for VirtqUsedElem.
             #[allow(clippy::cast_ptr_alignment)]
             let ring_base = self.used_va.cast::<u8>().add(4).cast::<VirtqUsedElem>();
-            let ring_idx = self.last_used_idx % self.queue_size;
+            let ring_idx = self.last_used_idx & self.ring_mask;
             core::ptr::read_volatile(ring_base.add(ring_idx as usize))
         };
 
@@ -357,7 +370,10 @@ impl SplitVirtqueue
     fn outstanding_head(&self, id: u32) -> Option<u16>
     {
         let head = u16::try_from(id).ok().filter(|&h| h < self.queue_size)?;
-        (self.chain_len[usize::from(head)] != 0).then_some(head)
+        self.chain_len
+            .get(usize::from(head))
+            .is_some_and(|&len| len != 0)
+            .then_some(head)
     }
 
     /// Free every descriptor of the outstanding chain starting at `head`.
@@ -367,14 +383,23 @@ impl SplitVirtqueue
     /// the device could have overwritten) plays no part.
     fn free_chain(&mut self, head: u16)
     {
-        let len = self.chain_len[usize::from(head)];
-        self.chain_len[usize::from(head)] = 0;
+        let Some(slot) = self.chain_len.get_mut(usize::from(head))
+        else
+        {
+            return;
+        };
+        let len = core::mem::take(slot);
         let mut idx = head;
         for _ in 0..len
         {
             // Read the chain link before free_desc overwrites it with the
-            // free-list link.
-            let next = self.links[usize::from(idx)];
+            // free-list link. Every link of a recorded chain is below
+            // queue_size.
+            let Some(&next) = self.links.get(usize::from(idx))
+            else
+            {
+                return;
+            };
             self.free_desc(idx);
             idx = next;
         }
@@ -394,7 +419,8 @@ impl SplitVirtqueue
 #[must_use]
 pub const fn desc_table_size(queue_size: u16) -> usize
 {
-    queue_size as usize * core::mem::size_of::<VirtqDesc>()
+    // A `u16` count of 16-byte descriptors: no saturation.
+    (queue_size as usize).saturating_mul(core::mem::size_of::<VirtqDesc>())
 }
 
 /// Calculate the total bytes needed for an available ring.
@@ -405,7 +431,8 @@ pub const fn desc_table_size(queue_size: u16) -> usize
 #[must_use]
 pub const fn avail_ring_size(queue_size: u16) -> usize
 {
-    6 + 2 * queue_size as usize
+    // A `u16` count of 2-byte entries: no saturation.
+    (queue_size as usize).saturating_mul(2).saturating_add(6)
 }
 
 /// Calculate the total bytes needed for a used ring.
@@ -416,7 +443,8 @@ pub const fn avail_ring_size(queue_size: u16) -> usize
 #[must_use]
 pub const fn used_ring_size(queue_size: u16) -> usize
 {
-    6 + 8 * queue_size as usize
+    // A `u16` count of 8-byte elements: no saturation.
+    (queue_size as usize).saturating_mul(8).saturating_add(6)
 }
 
 /// Byte offset of the used ring from the start of ring memory.
@@ -426,8 +454,21 @@ pub const fn used_ring_size(queue_size: u16) -> usize
 #[must_use]
 pub const fn used_ring_offset(queue_size: u16) -> usize
 {
-    let raw = desc_table_size(queue_size) + avail_ring_size(queue_size);
-    (raw + 3) & !3 // round up to 4-byte alignment
+    // Each term is below 2^21 bytes: neither operation saturates.
+    let raw = desc_table_size(queue_size).saturating_add(avail_ring_size(queue_size));
+    raw.saturating_add(3) & !3 // round up to 4-byte alignment
+}
+
+/// The descriptor table's, available ring's, and used ring's addresses in
+/// ring memory starting at `base`, laid out as [`ring_pages`] sizes it: a
+/// virtual address or a device address alike. `None` when an address is
+/// past `u64`.
+#[must_use]
+pub fn ring_addresses(base: u64, queue_size: u16) -> Option<(u64, u64, u64)>
+{
+    let avail = base.checked_add(u64::try_from(desc_table_size(queue_size)).ok()?)?;
+    let used = base.checked_add(u64::try_from(used_ring_offset(queue_size)).ok()?)?;
+    Some((base, avail, used))
 }
 
 /// Calculate total pages needed for all virtqueue ring memory.
@@ -437,7 +478,8 @@ pub const fn used_ring_offset(queue_size: u16) -> usize
 #[must_use]
 pub const fn ring_pages(queue_size: u16) -> usize
 {
-    let total = used_ring_offset(queue_size) + used_ring_size(queue_size);
+    // Each term is below 2^21 bytes: no saturation.
+    let total = used_ring_offset(queue_size).saturating_add(used_ring_size(queue_size));
     total.div_ceil(4096)
 }
 
@@ -464,6 +506,18 @@ mod tests
         assert_eq!(used_ring_offset(1), 24);
         // queue_size 2: desc 32 + avail 10 = 42, must round UP to 44, not down.
         assert_eq!(used_ring_offset(2), 44);
+    }
+
+    #[test]
+    fn ring_addresses_follow_the_layout_and_refuse_a_wrap()
+    {
+        // queue_size 2: avail after 32 descriptor bytes, used at 44.
+        assert_eq!(
+            ring_addresses(0x10_0000, 2),
+            Some((0x10_0000, 0x10_0020, 0x10_002C))
+        );
+        // Ring memory at the top of the address width has no used ring.
+        assert_eq!(ring_addresses(u64::MAX - 40, 2), None);
     }
 
     #[test]

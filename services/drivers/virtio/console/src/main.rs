@@ -22,6 +22,9 @@
 //! hardware) can stand in for it, so the consumer never learns the
 //! transport.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use ipc::{IpcMessage, devmgr_labels, memmgr_errors, memmgr_labels, serial_errors, serial_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -184,6 +187,11 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
     }
     for (range, &offset) in ranges.iter().zip(&placed)
     {
+        let Some(range_va) = window_va.checked_add(offset)
+        else
+        {
+            fail("BAR range past the address space");
+        };
         // SAFETY: `window` is a fresh reservation of `window_pages` pages
         // from the per-process arena, and `place` put this range's pages at
         // `offset` inside its BAR's share of it, overlapping no other
@@ -192,7 +200,7 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         // volatile accessors, never a reference, and the reservation is
         // never returned, so the VA stays reserved for the driver's lifetime
         // (`mmio_map` § Safety).
-        if unsafe { syscall::mmio_map(caps.self_aspace, range.cap, window_va + offset, 0) }.is_err()
+        if unsafe { syscall::mmio_map(caps.self_aspace, range.cap, range_va, 0) }.is_err()
         {
             fail("BAR mmio_map failed");
         }
@@ -217,36 +225,11 @@ fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     {
         fail("QUERY_DEVICE_INFO returned error");
     }
-    let words = reply.words();
-    if words.len() < 3
+    match VirtioPciStartupInfo::from_device_info(reply.words())
     {
-        fail("QUERY_DEVICE_INFO reply truncated (header)");
+        Ok(info) => info,
+        Err(e) => fail(e.describe()),
     }
-    // A word past the field's width is a mismatch, not a value to truncate.
-    let kind = u32::try_from(words[0]).ok();
-    let version = u32::try_from(words[1]).ok();
-    let byte_len = usize::try_from(words[2]).unwrap_or(usize::MAX);
-    if kind != Some(ipc::device_info_kind::VIRTIO_PCI)
-        || version != Some(virtio_core::VIRTIO_PCI_INFO_VERSION)
-    {
-        fail("QUERY_DEVICE_INFO reply kind/version mismatch");
-    }
-    if byte_len != VirtioPciStartupInfo::SIZE || words.len() < 3 + byte_len.div_ceil(8)
-    {
-        fail("QUERY_DEVICE_INFO reply length mismatch");
-    }
-    let mut buf = [0u8; VirtioPciStartupInfo::SIZE];
-    for (i, chunk) in buf.chunks_mut(8).enumerate()
-    {
-        let bytes = words[3 + i].to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
-    let Some(info) = VirtioPciStartupInfo::from_bytes(&buf)
-    else
-    {
-        fail("QUERY_DEVICE_INFO from_bytes failed");
-    };
-    info
 }
 
 // ── DMA memory ──────────────────────────────────────────────────────────────
@@ -274,7 +257,7 @@ fn dma_pages(caps: &DriverCaps, pages: u64, what: &str, ipc_buf: *mut u64) -> Dm
     {
         Ok(r) if r.label == memmgr_errors::SUCCESS && r.word(0) == 1 && !r.caps().is_empty() =>
         {
-            r.caps()[0]
+            r.caps().first().copied().unwrap_or(0)
         }
         Ok(r) =>
         {
@@ -298,7 +281,9 @@ fn dma_pages(caps: &DriverCaps, pages: u64, what: &str, ipc_buf: *mut u64) -> Dm
         syscall::thread_exit();
     };
     let va = range.va_start();
-    let Ok(bytes) = usize::try_from(pages * PAGE_SIZE)
+    let Some(bytes) = pages
+        .checked_mul(PAGE_SIZE)
+        .and_then(|bytes| usize::try_from(bytes).ok())
     else
     {
         std::os::seraph::log!(error: "{}: {} pages past the address width", what, pages);
@@ -392,14 +377,14 @@ fn setup_queue(
     transport.queue_set_size(size);
     let rings = dma_pages(caps, virtqueue::ring_pages(size) as u64, "rings", ipc_buf);
 
-    let desc_off = 0u64;
-    let avail_off = virtqueue::desc_table_size(size) as u64;
-    let used_off = virtqueue::used_ring_offset(size) as u64;
-    let (desc, avail, used) = (
-        rings.addr + desc_off,
-        rings.addr + avail_off,
-        rings.addr + used_off,
-    );
+    let (Some((desc, avail, used)), Some((desc_va, avail_va, used_va))) = (
+        virtqueue::ring_addresses(rings.addr, size),
+        virtqueue::ring_addresses(rings.va, size),
+    )
+    else
+    {
+        fail("ring addresses past the address width");
+    };
     transport.queue_set_rings(desc, avail, used);
     let routed = transport.route_queue(interrupt);
     transport.queue_set_ready(1);
@@ -414,9 +399,9 @@ fn setup_queue(
     // naturally aligned (the layout every VirtIO driver here relies on).
     let vq = unsafe {
         SplitVirtqueue::new(
-            (rings.va + desc_off) as *mut virtqueue::VirtqDesc,
-            (rings.va + avail_off) as *mut virtqueue::VirtqAvail,
-            (rings.va + used_off) as *mut virtqueue::VirtqUsed,
+            desc_va as *mut virtqueue::VirtqDesc,
+            avail_va as *mut virtqueue::VirtqAvail,
+            used_va as *mut virtqueue::VirtqUsed,
             size,
         )
     };
@@ -460,15 +445,27 @@ struct Console
     rx_notify: Arc<Mutex<u64>>,
 }
 
+/// Receive buffer `slot`'s offset in the receive page.
+fn rx_buffer_offset(slot: u16) -> u64
+{
+    // `slot` is below RX_BUFFERS, and RX_BUFFERS buffers fit one page: no
+    // saturation.
+    u64::from(slot).saturating_mul(u64::from(RX_BUFFER_LEN))
+}
+
 impl Console
 {
     /// Post receive buffer `slot` to the receive queue.
     fn post_rx(&mut self, slot: u16)
     {
-        let addr = self.rx_buffers.addr + u64::from(slot) * RX_BUFFER_BYTES as u64;
+        // The receive page's device range holds every buffer: no saturation.
+        let addr = self.rx_buffers.addr.saturating_add(rx_buffer_offset(slot));
         if let Some(head) = self.rx.vq.add_chain(&[(addr, RX_BUFFER_LEN, true)])
+            && let Some(entry) = self.rx_slot_for_head.get_mut(usize::from(head))
         {
-            self.rx_slot_for_head[usize::from(head)] = slot;
+            // add_chain returns a head below the queue size of at most
+            // RX_BUFFERS, so the entry exists.
+            *entry = slot;
         }
     }
 
@@ -489,9 +486,14 @@ impl Console
                 Err(_) => continue,
             };
             // poll_used returns only outstanding heads, below the queue size
-            // of at most RX_BUFFERS.
-            let slot = self.rx_slot_for_head[usize::from(head)];
-            let base = self.rx_buffers.va + u64::from(slot) * RX_BUFFER_BYTES as u64;
+            // of at most RX_BUFFERS, so the entry exists.
+            let Some(&slot) = self.rx_slot_for_head.get(usize::from(head))
+            else
+            {
+                continue;
+            };
+            // The receive page's mapping holds every buffer: no saturation.
+            let base = self.rx_buffers.va.saturating_add(rx_buffer_offset(slot));
             // The length is device-written: clamp it to the buffer.
             let len = usize::try_from(len).map_or(RX_BUFFER_BYTES, |l| l.min(RX_BUFFER_BYTES));
             // SAFETY: the buffer lies inside the mapped receive page
@@ -574,7 +576,7 @@ impl Console
             // the message carries.
             let byte_len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
             let bytes = msg.data_bytes();
-            self.write(&bytes[..byte_len.min(bytes.len())]);
+            self.write(bytes.get(..byte_len).unwrap_or(bytes));
             IpcMessage::new(serial_errors::SUCCESS)
         }
         else if op == serial_labels::SERIAL_READ_BYTES
@@ -585,8 +587,9 @@ impl Console
             // A read may have left buffers the queue had no room for; take
             // them now that it has.
             self.drain_rx();
+            // `n` is at most MAX_MESSAGE_BYTES, so the length fits its 16 bits.
             IpcMessage::builder(serial_errors::SUCCESS | ((n as u64) << 16))
-                .bytes(0, &buf[..n])
+                .bytes(0, buf.get(..n).unwrap_or(&buf))
                 .build()
         }
         else if op == serial_labels::SERIAL_REGISTER_RX_NOTIFY

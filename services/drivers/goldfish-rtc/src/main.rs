@@ -15,6 +15,9 @@
 //! only after that report. Implements the one-label RTC driver contract
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use driver_binding::resources::{self, PlatformDelivery, Resource};
 use ipc::{IpcMessage, rtc_errors, rtc_labels};
 use std::os::seraph::{reserve_pages, startup_info};

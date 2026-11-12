@@ -8,10 +8,12 @@
 //!
 //! When a device IRQ fires, the arch-specific interrupt handler calls
 //! [`dispatch_device_irq`] with the source's id. For a wired line this module
-//! masks the line at its controller (no further delivery until every receiver
-//! has acknowledged), marks every binding on the line as owing an
-//! acknowledgement, ORs notification bit 0 into each bound notification, and
-//! wakes its waiter.
+//! marks every binding on the line as owing an acknowledgement, masks the line
+//! at its controller (the controller forwards no further interrupt of the line
+//! until every receiver has acknowledged), ORs notification bit 0 into each
+//! bound notification, and wakes its waiter. An interrupt the controller
+//! forwarded before the mask took effect is delivered too, after this one, so a
+//! receiver can be signalled again before it acknowledges.
 //!
 //! Drivers bind a notification via `SYS_IRQ_REGISTER` and acknowledge via
 //! `SYS_IRQ_ACK` after handling.
@@ -72,6 +74,16 @@
 //! `mask`, `unmask`) and the set of routed lines, so an unmask never meets a line
 //! whose last binding is being removed. A delivery only sets bits in the owing
 //! mask; acknowledgements and unbinds clear them, under the lock.
+//!
+//! A delivery takes no lock, so its mask can meet an acknowledgement's or an
+//! unbind's unmask. It marks its bindings owing before it masks the line, and
+//! an unmask reads the owing mask again once the controller holds the unmask,
+//! masking the line again when a bit is set ([`LineMasks::deliver`],
+//! [`LineMasks::unmask_settled`]). Whichever order the two meet in, the line is
+//! left masked while a binding owes. An interrupt forwarded in the moment
+//! before that second mask is delivered as one forwarded before a delivery's
+//! own mask is.
+//!
 //! Delivery itself (`notification_send`, `sched::enqueue_and_wake`) takes the
 //! notification's and the scheduler's spinlocks with interrupts disabled.
 //!
@@ -199,10 +211,29 @@ impl LineMasks
     }
 
     /// A delivery: every binding in `bound` (the mask the delivery read) now
-    /// owes an acknowledgement.
-    fn deliver(&self, bound: u64)
+    /// owes an acknowledgement, and then the line is masked through `mask`.
+    /// Marking before masking lets an unmask that raced the mask see the debt
+    /// ([`LineMasks::unmask_settled`]). `mask` must order this marking before
+    /// its controller write.
+    fn deliver(&self, bound: u64, mask: impl FnOnce())
     {
         self.owing.fetch_or(bound, Ordering::SeqCst);
+        mask();
+    }
+
+    /// Unmask the line through `unmask`, for a caller that found no binding
+    /// owing, then mask it again through `mask` if a delivery marked a binding
+    /// owing meanwhile. `unmask` must order its controller write before this
+    /// read of the owing mask. A delivery that marked its bindings after this
+    /// read masks the line after the unmask itself ([`LineMasks::deliver`]), so
+    /// either way the line is left masked while a binding owes.
+    fn unmask_settled(&self, unmask: impl FnOnce(), mask: impl FnOnce())
+    {
+        unmask();
+        if self.owing.load(Ordering::SeqCst) != 0
+        {
+            mask();
+        }
     }
 
     /// `bit`'s acknowledgement: clear its debt, and return whether no binding
@@ -879,7 +910,8 @@ pub unsafe fn register(
 /// through an unbound binding, or of a message target (never masked, module doc
 /// § Sources), it changes nothing. The check and the unmask run under the
 /// routing lock, so a concurrent unbind cannot leave the line unmasked behind
-/// it.
+/// it, and the unmask masks the line again when a delivery that raced it marked
+/// a binding owing ([`unmask_settled`]).
 ///
 /// # Safety
 /// Same context as [`register`]: outside interrupt context, with no IPC source,
@@ -904,9 +936,10 @@ pub unsafe fn ack(irq: u32, binding: &IrqBinding)
         {
             return;
         };
-        if routing.routes[index].masks.ack(bit)
+        let route = &routing.routes[index];
+        if route.masks.ack(bit)
         {
-            crate::arch::current::interrupts::unmask(irq);
+            unmask_settled(irq, route);
         }
     });
 }
@@ -1084,7 +1117,7 @@ unsafe fn unbind(
                 }
             }
         }
-        Settle::Unmask if !message => crate::arch::current::interrupts::unmask(irq),
+        Settle::Unmask if !message => unmask_settled(irq, route),
         Settle::Unmask | Settle::StayMasked =>
         {}
     }
@@ -1207,6 +1240,24 @@ pub fn message(id: u32) -> Option<(u64, u32)>
     })
 }
 
+/// Unmask line `irq`, whose bindings were found owing nothing under the routing
+/// lock, and mask it again if a delivery that raced the unmask marked a binding
+/// owing ([`LineMasks::unmask_settled`]; module doc § Thread safety). On
+/// riscv64 the APLIC writes are unlocked: `aia::unmask` fences them before the
+/// owing mask's read, and a racing delivery's `aia::mask` orders the delivery's
+/// marking before its write (`fence w,o`). On x86-64 the unmask and a racing delivery's mask
+/// both take `IOAPIC_LOCK`: when the mask's critical section comes first, the
+/// delivery marked its bindings before it, and the lock hands that write to the
+/// read; when it comes second, the mask lands last.
+#[cfg(not(test))]
+fn unmask_settled(irq: u32, route: &IrqRoute)
+{
+    route.masks.unmask_settled(
+        || crate::arch::current::interrupts::unmask(irq),
+        || crate::arch::current::interrupts::mask(irq),
+    );
+}
+
 /// Wait until no delivery is in flight on `route`, from which a change just
 /// unlinked a binding or replaced a binding's notification (`SeqCst`).
 ///
@@ -1285,10 +1336,11 @@ pub fn next_target_cpu(eligible: impl Fn(usize) -> bool) -> Option<usize>
 /// target's id.
 ///
 /// Flow ([`deliver`]):
-/// 1. Mask a line at the controller (no further delivery until every
-///    receiver has acknowledged); a message target is not masked (module doc
-///    § Sources).
-/// 2. Mark every bound binding as owing an acknowledgement.
+/// 1. Mark every bound binding as owing an acknowledgement.
+/// 2. Mask a line at the controller (no further interrupt of the line is
+///    forwarded until every receiver has acknowledged; one forwarded before the
+///    mask took effect is delivered after this one); a message target is not
+///    masked (module doc § Sources).
 /// 3. OR notification bit 0 into each binding's notification and enqueue the
 ///    waiter it woke.
 /// 4. Acknowledge at the controller (the x86-64 EOI; nothing on RISC-V, whose
@@ -1332,8 +1384,8 @@ pub unsafe fn dispatch_device_irq(irq: u32)
     route.in_flight.fetch_sub(1, Ordering::Release);
 }
 
-/// The counted part of [`dispatch_device_irq`]: mask a line, mark every bound
-/// binding owing, signal each binding's notification, and acknowledge at the
+/// The counted part of [`dispatch_device_irq`]: mark every bound binding owing,
+/// mask a line, signal each binding's notification, and acknowledge at the
 /// controller; with no binding linked, mask a line and drop the IRQ. A message
 /// target is never masked.
 ///
@@ -1349,19 +1401,28 @@ unsafe fn deliver(irq: u32, route: &IrqRoute)
     let bound = route.masks.bound();
     let mut cur = route.bindings.load(Ordering::SeqCst);
 
-    // Mask before delivering, so the line stays quiet until every receiver
-    // has acknowledged. With no binding the IRQ is dropped; it must still be
-    // acknowledged at the controller: without the EOI, the x86-64 local APIC
-    // keeps its vector in service, blocking every interrupt of its priority
-    // class and below. A message target has no controller mask (module doc
-    // § Sources).
-    if !is_message(irq)
+    // Mask before delivering, so the controller forwards no further interrupt
+    // of the line until every receiver has acknowledged; the bindings are
+    // marked owing before the mask, so an unmask that races it sees the debt
+    // (module doc § Thread safety). With no binding the IRQ is dropped; it must
+    // still be acknowledged at the controller: without the EOI, the x86-64
+    // local APIC keeps its vector in service, blocking every interrupt of its
+    // priority class and below. A message target has no controller mask
+    // (module doc § Sources).
+    let message = is_message(irq);
+    let mask = || {
+        if !message
+        {
+            crate::arch::current::interrupts::mask(irq);
+        }
+    };
+    if cur.is_null()
     {
-        crate::arch::current::interrupts::mask(irq);
+        mask();
     }
-    if !cur.is_null()
+    else
     {
-        route.masks.deliver(bound);
+        route.masks.deliver(bound, mask);
     }
     // SAFETY: a binding reached from the line is live while the caller's
     // in-flight count is raised (contract).
@@ -1506,7 +1567,7 @@ mod tests
         let b = bind(&masks).unwrap();
         masks.ack(a);
         masks.ack(b);
-        masks.deliver(masks.bound());
+        masks.deliver(masks.bound(), || {});
         assert!(!masks.ack(a));
         // A repeated acknowledgement clears nothing and does not unmask.
         assert!(!masks.ack(a));
@@ -1523,7 +1584,7 @@ mod tests
         masks.ack(a);
         masks.ack(b);
         assert!(masks.ack(a));
-        masks.deliver(masks.bound());
+        masks.deliver(masks.bound(), || {});
         masks.ack(b);
         assert!(!masks.ack(b));
     }
@@ -1544,7 +1605,7 @@ mod tests
         let masks = empty_masks();
         let a = bind(&masks).unwrap();
         let b = bind(&masks).unwrap();
-        masks.deliver(masks.bound());
+        masks.deliver(masks.bound(), || {});
         masks.ack(b);
         assert_eq!(unbind(&masks, a), Settle::Unmask);
     }
@@ -1555,7 +1616,7 @@ mod tests
         let masks = empty_masks();
         let a = bind(&masks).unwrap();
         bind(&masks);
-        masks.deliver(masks.bound());
+        masks.deliver(masks.bound(), || {});
         assert_eq!(unbind(&masks, a), Settle::StayMasked);
     }
 
@@ -1572,9 +1633,96 @@ mod tests
         masks.ack(b);
         let stale = masks.bound();
         masks.unbind_begin(a);
-        masks.deliver(stale);
+        masks.deliver(stale, || {});
         assert_eq!(masks.unbind_settle(a), Settle::StayMasked);
         assert!(masks.ack(b));
+    }
+
+    /// A line's mask at its controller, for the tests of a delivery racing an
+    /// unmask.
+    struct Controller
+    {
+        masked: core::cell::Cell<bool>,
+    }
+
+    impl Controller
+    {
+        fn unmasked() -> Self
+        {
+            Self {
+                masked: core::cell::Cell::new(false),
+            }
+        }
+
+        fn mask(&self)
+        {
+            self.masked.set(true);
+        }
+
+        fn unmask(&self)
+        {
+            self.masked.set(false);
+        }
+
+        /// The invariant the races must keep: a line a binding owes is masked.
+        fn masked_while_owing(&self, masks: &LineMasks) -> bool
+        {
+            masks.owing.load(Ordering::SeqCst) == 0 || self.masked.get()
+        }
+    }
+
+    /// Two bound receivers that have both acknowledged, on an unmasked line.
+    fn quiet_pair(masks: &LineMasks) -> (u32, u32)
+    {
+        let a = bind(masks).unwrap();
+        let b = bind(masks).unwrap();
+        masks.ack(a);
+        masks.ack(b);
+        (a, b)
+    }
+
+    #[test]
+    fn an_unmask_landing_after_a_racing_deliverys_mask_masks_again()
+    {
+        // An acknowledgement that owes nothing (a polling driver's timeout
+        // acknowledgement) finds no debt and decides to unmask; a delivery
+        // then marks its bindings and masks the line before the unmask
+        // reaches the controller. The unmask must not leave the line open.
+        let masks = empty_masks();
+        let controller = Controller::unmasked();
+        let (a, _) = quiet_pair(&masks);
+        assert!(masks.ack(a));
+        masks.deliver(masks.bound(), || controller.mask());
+        masks.unmask_settled(|| controller.unmask(), || controller.mask());
+        assert!(controller.masked_while_owing(&masks));
+    }
+
+    #[test]
+    fn an_ack_between_a_deliverys_marking_and_its_mask_sees_the_debt()
+    {
+        // The delivery marks its bindings before it masks, so an
+        // acknowledgement that runs between the two finds the other binding
+        // owing and leaves the line to the delivery's mask.
+        let masks = empty_masks();
+        let controller = Controller::unmasked();
+        let (_, b) = quiet_pair(&masks);
+        masks.deliver(masks.bound(), || {
+            assert!(!masks.ack(b));
+            controller.mask();
+        });
+        assert!(controller.masked_while_owing(&masks));
+    }
+
+    #[test]
+    fn an_unmask_with_no_racing_delivery_leaves_the_line_unmasked()
+    {
+        let masks = empty_masks();
+        let controller = Controller::unmasked();
+        controller.mask();
+        let (a, _) = quiet_pair(&masks);
+        assert!(masks.ack(a));
+        masks.unmask_settled(|| controller.unmask(), || controller.mask());
+        assert!(!controller.masked.get());
     }
 
     #[test]

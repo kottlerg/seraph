@@ -460,7 +460,9 @@ pub fn message_address(target: crate::irq::Target) -> Option<u64>
 }
 
 /// Disable `source` at the APLIC (`clrienum`); a source the domain does not
-/// implement is ignored.
+/// implement is ignored. The write is ordered after this hart's earlier memory
+/// writes, so a delivery's marking of its bindings owing precedes its mask at
+/// the APLIC (`irq::unmask_settled`).
 pub fn mask(source: u32)
 {
     if implemented(source)
@@ -472,7 +474,10 @@ pub fn mask(source: u32)
 
 /// Enable routed `source` at the APLIC (`setienum`), then, for a
 /// level-sensitive source, pend it again if it is still asserted (module doc
-/// § Level-sensitive sources). An unrouted source is left disabled.
+/// § Level-sensitive sources). An unrouted source is left disabled. The writes
+/// are ordered before this hart's later memory reads, so the caller's read of
+/// the line's owing mask after the unmask (`irq::unmask_settled`) follows the
+/// enable at the APLIC.
 ///
 /// Called under `irq`'s routing lock.
 pub fn unmask(source: u32)
@@ -487,12 +492,17 @@ pub fn unmask(source: u32)
         return;
     };
     // SAFETY: an implemented source; the registers lie in the checked window.
+    // The fence has no operands and changes no register or memory; it is
+    // left without `nomem` so the compiler keeps later loads after it.
     unsafe {
         aplic_write(APLIC_SETIENUM, source);
         if route.level
         {
             aplic_write(APLIC_SETIPNUM_LE, source);
         }
+        // `fence o,r`: the APLIC writes above are performed before this hart's
+        // later memory reads.
+        core::arch::asm!("fence o,r", options(nostack, preserves_flags));
     }
 }
 
@@ -527,7 +537,8 @@ fn aplic_read(offset: u64) -> u32
 
 /// Write `val` to the APLIC register at `offset`, ordered after this hart's
 /// earlier memory writes (a route's EID-row entry is visible before the source
-/// can be forwarded) and before its later MMIO stores.
+/// can be forwarded, and a delivery's owing marking before its mask) and before
+/// its later MMIO stores.
 ///
 /// # Safety
 /// The direct map must be active, [`init_bsp`] must have recorded the window,

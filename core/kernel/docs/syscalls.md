@@ -2433,11 +2433,12 @@ through their own capability.
   acknowledgement and leaving the line's mask as it is, and returns once no delivery to the
   replaced notification is still in flight.
 - **Deliver.** Each interrupt masks the line, marks every binding on it as owing an
-  acknowledgement, ORs bit 0 into each bound notification, and completes at the controller. A
-  receiver whose device did not raise the interrupt finds nothing in its device's status and
-  acknowledges. The driver MUST call `SYS_IRQ_ACK` (see
-  [architecture.md](../../../docs/architecture.md) § Driver Model); the line is unmasked once no
-  binding owes.
+  acknowledgement, ORs bit 0 into each bound notification, and completes at the controller. An
+  interrupt the controller forwarded before the mask took effect is delivered too, so a receiver
+  can be signalled again before it acknowledges. A receiver whose device did not raise the
+  interrupt finds nothing in its device's status and acknowledges. The driver MUST call
+  `SYS_IRQ_ACK` (see [architecture.md](../../../docs/architecture.md) § Driver Model); the line is
+  unmasked once no binding owes.
 - **Unbind.** A binding is removed when its Interrupt object is freed (its last capability
   deleted, consumed by a split, revoked through an ancestor, or torn down with its holder's
   CSpace) or when its Notification is freed; the removal waits out the deliveries in flight on

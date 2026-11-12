@@ -71,10 +71,12 @@
 //!   (`IOAPIC_LOCK`), so in a streamed round the deleter gets the routing lock
 //!   only once each delivery has all but ended, and the change seldom meets
 //!   one. The deleter starts once the raise has returned, after a delay that
-//!   each CPU's rounds fit to where their changes meet that CPU's deliveries
-//!   on this platform ([`next_delay`]): tens of microseconds after the raise
-//!   where KVM emulates the I/O APIC in the host kernel, hundreds where QEMU
-//!   emulates it in userspace (the x86-64 launches with the IOMMU attached).
+//!   the rounds fit to where their changes meet deliveries on this platform
+//!   ([`pace`]): tens of microseconds after the raise where KVM emulates the
+//!   I/O APIC in the host kernel, hundreds where QEMU emulates it in
+//!   userspace (the x86-64 launches with the IOMMU attached). The CPUs share
+//!   that delay, so it fits within the first few dozen held rounds of a kind
+//!   at any CPU count.
 //!
 //! In three of four held notification rounds, and in every held binding
 //! round, the round is observed ([`observed`]): the deleter keeps the
@@ -138,8 +140,8 @@ const MIN_ARMED_DIVISOR: u64 = 16;
 const PROBE_TIMEOUT_MS: u64 = 1000;
 /// Polls (1 ms each) for the deleter's exit, through [`crate::scaled_polls`].
 const EXIT_POLLS: u32 = 10_000;
-/// CPUs whose delays the deleter keeps apart ([`delay_slot`]).
-const DELAY_SLOTS: usize = 16;
+/// CPUs whose standing the deleter keeps apart ([`cpu_slot`]).
+const CPU_SLOTS: usize = 16;
 /// Longest delay, in spins, the deleter waits after a held round's raise
 /// ([`next_delay`]).
 const MAX_DELAY_SPINS: u32 = 1 << 20;
@@ -656,10 +658,10 @@ enum Outcome
     Early,
 }
 
-/// The next delay, in spins, of the CPU whose held round waited `delay` and
-/// came out as `outcome` ([`delay_slot`]): half as long when the change came
-/// late, a quarter longer when it came early, the same when it met the
-/// delivery. Each CPU's delay so settles where its changes meet deliveries.
+/// The next delay, in spins, after a held round that waited `delay` and came
+/// out as `outcome`: a quarter shorter when the change came late, a quarter
+/// longer when it came early, the same when it met the delivery. The delay so
+/// settles where the changes meet deliveries.
 fn next_delay(delay: u32, outcome: Outcome) -> u32
 {
     match outcome
@@ -673,17 +675,47 @@ fn next_delay(delay: u32, outcome: Outcome) -> u32
     }
 }
 
-/// The slot of the deleter's delays that `round` uses at `cpus` CPUs: the
-/// routes take the CPUs in turn, one per round, so the round number modulo the
-/// CPU count stands for the CPU that delivers it. Past [`DELAY_SLOTS`] CPUs,
-/// CPUs share a slot, so each slot still sees enough rounds to fit its delay,
-/// and CPU 0 and CPU 1, whose rounds cannot arm and so shorten the delay,
-/// each share theirs with CPUs that can.
-fn delay_slot(round: u32, cpus: u64) -> usize
+/// The delay of a row of held rounds after one that waited `delay` and came
+/// out as `outcome`, delivered on a CPU whose slot has `standing`: the slot's
+/// rounds that met their delivery or came early, less those that came late.
+///
+/// A round that delivers on CPU 0 or CPU 1 comes late whatever the delay
+/// (module doc § Two schedules), so a late round shortens the delay only when
+/// its slot stands above zero: one whose rounds have come early or met their
+/// delivery more often than late. Every other round fits the delay. The CPUs
+/// that can arm share one delay, which so fits in a few dozen of the row's
+/// rounds at any CPU count, where a delay per CPU would take as many of each
+/// CPU's.
+fn pace(delay: u32, standing: &mut i32, outcome: Outcome) -> u32
+{
+    let counts = outcome != Outcome::Late || *standing > 0;
+    *standing = if outcome == Outcome::Late
+    {
+        standing.saturating_sub(1)
+    }
+    else
+    {
+        standing.saturating_add(1)
+    };
+    if counts
+    {
+        next_delay(delay, outcome)
+    }
+    else
+    {
+        delay
+    }
+}
+
+/// The standing slot ([`pace`]) of the CPU that delivers `round` at `cpus`
+/// CPUs: the routes take the CPUs in turn, one per round, so the round number
+/// modulo the CPU count stands for the CPU. Past [`CPU_SLOTS`] CPUs, CPUs
+/// share a slot, and CPU 0 and CPU 1 each share theirs with CPUs that can arm.
+fn cpu_slot(round: u32, cpus: u64) -> usize
 {
     u64::from(round)
         .checked_rem(cpus.max(1))
-        .and_then(|cpu| cpu.checked_rem(DELAY_SLOTS as u64))
+        .and_then(|cpu| cpu.checked_rem(CPU_SLOTS as u64))
         .and_then(|slot| usize::try_from(slot).ok())
         .unwrap_or(0)
 }
@@ -695,11 +727,12 @@ fn delay_slot(round: u32, cpus: u64) -> usize
 /// round asks, and delete it; exit on `QUIT`.
 extern "C" fn deleter_entry(cpus: u64) -> !
 {
-    // One row for the rounds whose change removes a binding (direct and
-    // binding rounds), whose delays carry over from the one phase to the
-    // other, and one for the rebound rounds, whose rebind meets a delivery
-    // at another point of it.
-    let mut delays = [[0u32; DELAY_SLOTS]; 2];
+    // One delay for the rounds whose change removes a binding (direct and
+    // binding rounds), carried over from the one phase to the other, and one
+    // for the rebound rounds, whose rebind meets a delivery at another point
+    // of it; each with the standing of every CPU slot ([`pace`]).
+    let mut delays = [0u32; 2];
+    let mut standings = [[0i32; CPU_SLOTS]; 2];
     let mut seen = 0u32;
     loop
     {
@@ -717,7 +750,7 @@ extern "C" fn deleter_entry(cpus: u64) -> !
         let watched = WATCHED.load(Ordering::Acquire);
         let watched_doomed = WATCHED_DOOMED.load(Ordering::Acquire) != 0;
         let observe = held(round) && observed(round);
-        let mut slot = None;
+        let row = usize::from(kind_of(round) == 1);
         let mut delay = 0;
         // Whether the raise's delivery had not signalled just before the
         // change.
@@ -729,10 +762,7 @@ extern "C" fn deleter_entry(cpus: u64) -> !
             {
                 core::hint::spin_loop();
             }
-            slot = delays
-                .get_mut(usize::from(kind_of(round) == 1))
-                .and_then(|row| row.get_mut(delay_slot(round, cpus)));
-            delay = slot.as_deref().copied().unwrap_or(0);
+            delay = delays.get(row).copied().unwrap_or(0);
             for _ in 0..delay
             {
                 core::hint::spin_loop();
@@ -795,9 +825,13 @@ extern "C" fn deleter_entry(cpus: u64) -> !
         {
             cap_delete(watched).ok();
         }
-        if let (Some(slot), Some(outcome)) = (slot, outcome)
+        let standing = standings
+            .get_mut(row)
+            .and_then(|slots| slots.get_mut(cpu_slot(round, cpus)));
+        if let (Some(next), Some(standing), Some(outcome)) =
+            (delays.get_mut(row), standing, outcome)
         {
-            *slot = next_delay(delay, outcome);
+            *next = pace(delay, standing, outcome);
         }
         if outcome == Some(Outcome::Met)
         {

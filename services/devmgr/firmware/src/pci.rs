@@ -472,6 +472,54 @@ pub const fn fallback(plan: InterruptPlan, msi: Option<Msi>) -> Option<Interrupt
     }
 }
 
+/// Why the minted targets of a message-signaled step cannot be given
+/// ([`reach_message_files`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessagesRefused
+{
+    /// The message of the target at this index does not fit the function's
+    /// capability. No interrupt file was reached.
+    Unfit(usize),
+    /// An interrupt file a target sits on could not be made reachable;
+    /// `widened` tells whether a file was newly mapped before it.
+    Unreachable
+    {
+        /// Whether an earlier target's file was newly mapped.
+        widened: bool,
+    },
+}
+
+/// Check that every one of the minted targets `messages` fits the function
+/// (`fits`), then make the interrupt file each one sits on reachable by the
+/// device (`reach`: `Some(true)` when it newly mapped the file, `Some(false)`
+/// when nothing was mapped, `None` when the file cannot be reached). No file
+/// is reached before every message has been checked, so a message that does
+/// not fit leaves the device's IOMMU domain as it found it and its step can
+/// fall back (docs/device-management.md § Message-Signaled Interrupts).
+/// Returns whether a file was newly mapped.
+///
+/// # Errors
+/// [`MessagesRefused::Unfit`] for the first message that does not fit, with
+/// nothing reached; [`MessagesRefused::Unreachable`] when a file cannot be
+/// reached, no later file being tried.
+pub fn reach_message_files<M>(
+    messages: &[M],
+    fits: impl Fn(&M) -> bool,
+    mut reach: impl FnMut(&M) -> Option<bool>,
+) -> Result<bool, MessagesRefused>
+{
+    if let Some(i) = messages.iter().position(|m| !fits(m))
+    {
+        return Err(MessagesRefused::Unfit(i));
+    }
+    let mut widened = false;
+    for m in messages
+    {
+        widened |= reach(m).ok_or(MessagesRefused::Unreachable { widened })?;
+    }
+    Ok(widened)
+}
+
 /// Offset of the Vendor ID register in a function's configuration header.
 pub const VENDOR_ID: u16 = 0x00;
 
@@ -837,6 +885,71 @@ mod tests
         );
         assert_eq!(fallback(InterruptPlan::Wired, msi), None);
         assert_eq!(fallback(InterruptPlan::None, msi), None);
+    }
+
+    #[test]
+    fn a_message_that_does_not_fit_is_refused_before_any_file_is_reached()
+    {
+        // A 32-bit MSI capability and a target whose interrupt file is above
+        // 4 GiB: no file is reached, so the step falls back.
+        let narrow = Msi::decode(0x50, 0);
+        let mut reached = Vec::new();
+        let outcome = reach_message_files(
+            &[(0x1_2800_0000_u64, 0x41_u64)],
+            |&(address, data)| narrow.fits(address, data),
+            |&(address, _)| {
+                reached.push(address);
+                Some(true)
+            },
+        );
+        assert_eq!(outcome, Err(MessagesRefused::Unfit(0)));
+        assert!(reached.is_empty());
+        // Every message is checked first: a later one that does not fit
+        // stops the earlier one's file from being reached too.
+        let outcome = reach_message_files(
+            &[(0x2800_0000_u64, 0x41_u64), (0x2800_1000, 0x1_0000)],
+            |&(address, data)| narrow.fits(address, data),
+            |&(address, _)| {
+                reached.push(address);
+                Some(true)
+            },
+        );
+        assert_eq!(outcome, Err(MessagesRefused::Unfit(1)));
+        assert!(reached.is_empty());
+    }
+
+    #[test]
+    fn reaching_message_files_reports_whether_one_was_newly_mapped()
+    {
+        let fits = |_: &u64| true;
+        // Every file reached, one of them newly.
+        let mut reached = Vec::new();
+        let outcome = reach_message_files(&[0x2800_0000_u64, 0x2800_1000], fits, |&a| {
+            reached.push(a);
+            Some(a == 0x2800_1000)
+        });
+        assert_eq!(outcome, Ok(true));
+        assert_eq!(reached, [0x2800_0000, 0x2800_1000]);
+        // Files already mapped: nothing newly mapped.
+        assert_eq!(
+            reach_message_files(&[0x2800_0000_u64], fits, |_| Some(false)),
+            Ok(false)
+        );
+        // A file that cannot be reached after one newly mapped widened the
+        // domain; no later file is tried.
+        let mut reached = Vec::new();
+        let outcome =
+            reach_message_files(&[0x2800_0000_u64, 0x2800_1000, 0x2800_2000], fits, |&a| {
+                reached.push(a);
+                (a != 0x2800_1000).then_some(true)
+            });
+        assert_eq!(outcome, Err(MessagesRefused::Unreachable { widened: true }));
+        assert_eq!(reached, [0x2800_0000, 0x2800_1000]);
+        // The first file unreachable: nothing was widened.
+        assert_eq!(
+            reach_message_files(&[0x2800_0000_u64], fits, |_| None),
+            Err(MessagesRefused::Unreachable { widened: false })
+        );
     }
 
     #[test]

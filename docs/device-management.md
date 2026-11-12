@@ -504,24 +504,26 @@ its own choosing, and the several vectors of multi-message MSI need consecutive 
 one address, which separate targets do not have.
 
 For each vector devmgr mints a target with `SYS_IRQ_MSG_ALLOC`, through a copy of its interrupt
-range cap carrying `RIGHTS_IRQ_MINT`, and reads the target's message with `SYS_CAP_INFO`. On
-riscv64, where the RISC-V IOMMU translates the device's writes, it then maps the interrupt file
-each target sits on into the device's domain (`MAP_MSI`, § IOMMU Discovery and Programming); on
-x86-64 VT-d does not translate a write to the interrupt range (below). For MSI devmgr writes the
-message into the function's MSI capability, unmasks its vector where the function masks per
-vector, and enables MSI with one vector. For MSI-X it delivers the BARs that hold the function's
-table and Pending Bit Array, whole when no BAR the driver is already given covers them, sets MSI-X
-Enable with every table entry masked, and leaves the driver to write each entry's message, read
-from the entry's `Interrupt` cap with `SYS_CAP_INFO`, and unmask it. devmgr sets the function's
-Interrupt Disable in both cases. Each vector is one `Interrupt` resource, whose copy carries
-`RIGHTS_IRQ_NOTIFY` only and which the driver binds with `SYS_IRQ_REGISTER` in mode 0. A step that
-fails at the bind (a mint, an interrupt file, a table BAR, the configuration page) falls back:
-MSI-X to MSI when the function has it, else to the wired line, and MSI to the wired line. A step
-that fails after it mapped an interrupt file is the exception: the domain keeps the file until it
-is blocked (`UNMAP` refuses it), so a fallback would leave the device reaching a hart's file no
-target of its own sits on, and devmgr refuses the bind instead, which blocks the domain. When it
-withdraws the driver devmgr clears MSI Enable and MSI-X Enable beside Interrupt Disable, before the
-declared reset, and a target is freed once no cap to it remains.
+range cap carrying `RIGHTS_IRQ_MINT`, and reads the target's message with `SYS_CAP_INFO`. For MSI it
+checks that the message fits the function's capability (an address below 4 GiB for a 32-bit
+capability, and 16 bits of data) before any interrupt file is mapped. On riscv64, where the RISC-V
+IOMMU translates the device's writes, it then maps the interrupt file each target sits on into the
+device's domain (`MAP_MSI`, § IOMMU Discovery and Programming); on x86-64 VT-d does not translate a
+write to the interrupt range (below). For MSI devmgr writes the message into the function's MSI
+capability, unmasks its vector where the function masks per vector, and enables MSI with one vector.
+For MSI-X it delivers the BARs that hold the function's table and Pending Bit Array, whole when no
+BAR the driver is already given covers them, sets MSI-X Enable with every table entry masked, and
+leaves the driver to write each entry's message, read from the entry's `Interrupt` cap with
+`SYS_CAP_INFO`, and unmask it. devmgr sets the function's Interrupt Disable in both cases. Each
+vector is one `Interrupt` resource, whose copy carries `RIGHTS_IRQ_NOTIFY` only and which the driver
+binds with `SYS_IRQ_REGISTER` in mode 0. A step that fails at the bind (a mint, a message that does
+not fit, an interrupt file, a table BAR, the configuration page) falls back: MSI-X to MSI when the
+function has it, else to the wired line, and MSI to the wired line. A step that fails after it
+mapped an interrupt file is the exception: the domain keeps the file until it is blocked (`UNMAP`
+refuses it), so a fallback would leave the device reaching a hart's file no target of its own sits
+on, and devmgr refuses the bind instead, which blocks the domain. When it withdraws the driver
+devmgr clears MSI Enable and MSI-X Enable beside Interrupt Disable, before the declared reset, and a
+target is freed once no cap to it remains.
 
 On x86-64, until VT-d interrupt remapping is programmed
 ([#325](https://github.com/kottlerg/seraph/issues/325)), a device that writes to the interrupt

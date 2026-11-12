@@ -195,13 +195,14 @@ For each matched device, devmgr:
    a minted `Interrupt` cap per vector, the BARs holding the table and the
    Pending Bit Array carved whole when step 2 carved neither, and MSI-X
    enabled with every table entry masked; for MSI one minted cap, its
-   message written into the capability and MSI enabled with one vector. On
-   riscv64 behind the RISC-V IOMMU each target's interrupt file is first
-   mapped into the device's domain (`MAP_MSI`). A step that fails falls
-   back to MSI where the function has it, then to the wired line, except
-   that one that fails after it mapped an interrupt file refuses the
-   device, logged, with its caps released and its domain blocked. For the
-   wired line it gives the
+   message, once checked to fit the capability, written into it and MSI
+   enabled with one vector. On riscv64 behind the RISC-V IOMMU each
+   target's interrupt file is then mapped into the device's domain
+   (`MAP_MSI`), before the vectors are enabled; a message that does not
+   fit maps none. A step that fails falls back to MSI where the function
+   has it, then to the wired line, except that one that fails after it
+   mapped an interrupt file refuses the device, logged, with its caps
+   released and its domain blocked. For the wired line it gives the
    device its own single-line `Interrupt` cap for its GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback). The first
    time any device asks for a GSI, devmgr splits the line's cap off its

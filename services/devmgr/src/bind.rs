@@ -31,7 +31,7 @@ use firmware::binding::{
 };
 use firmware::dma::Confinement;
 use firmware::lines::{HoldError, LineError};
-use firmware::pci::{InterruptPlan, Msi, Msix};
+use firmware::pci::{InterruptPlan, MessagesRefused, Msi, Msix};
 use firmware::records::{PlatformRecord, PlatformRecords};
 use firmware::resource::{CarveError, Span, SplitError};
 use firmware::roster::Roster;
@@ -1271,18 +1271,22 @@ fn messages_translated() -> bool
 }
 
 /// Mint `count` message-signaled targets ([`IrqRangeAllocator::mint_message`])
-/// and read each one's message; where the device's IOMMU domain translates
-/// its messages ([`messages_translated`]), make the interrupt file each one
-/// targets reachable by the device through its DMA grant `dma`
-/// ([`dma::DmaGrant::reach_interrupt_file`]). Returns the targets and
-/// whether a file was newly mapped for them. On failure, logged under
-/// `name`, every target it minted is deleted, and the error tells whether a
-/// file was mapped before the failure ([`NotGiven::Widened`]).
+/// and read each one's message; check that every message fits the
+/// function's capability (`fits`) and only then, where the device's IOMMU
+/// domain translates its messages ([`messages_translated`]), make the
+/// interrupt file each one targets reachable by the device through its DMA
+/// grant `dma` ([`dma::DmaGrant::reach_interrupt_file`]), in that order by
+/// [`firmware::pci::reach_message_files`]. Returns the targets and whether a
+/// file was newly mapped for them. On failure, logged under `name`, every
+/// target it minted is deleted, and the error tells whether a file was
+/// mapped before the failure ([`NotGiven::Widened`]); a message that does not
+/// fit maps none.
 fn mint_messages(
     name: &str,
     count: u8,
     irq_range: &IrqRangeAllocator,
     dma: Option<&dma::DmaGrant>,
+    fits: impl Fn(&Message) -> bool,
 ) -> Result<(Vec<Message>, bool), NotGiven>
 {
     let mut messages: Vec<Message> = Vec::new();
@@ -1323,37 +1327,58 @@ fn mint_messages(
             }
         }
     }
-    let mut widened = false;
-    if messages_translated()
-        && let Some(dma) = dma
+    let translated = messages_translated();
+    let reached = firmware::pci::reach_message_files(&messages, fits, |m| match dma
     {
-        for m in &messages
+        Some(dma) if translated => dma.reach_interrupt_file(m.address & !(PAGE_SIZE - 1)),
+        _ => Some(false),
+    });
+    match reached
+    {
+        Ok(widened) => Ok((messages, widened)),
+        Err(refused) =>
         {
-            let Some(newly) = dma.reach_interrupt_file(m.address & !(PAGE_SIZE - 1))
-            else
+            let not = match refused
             {
-                std::os::seraph::log!(
-                    warn: "{}: an interrupt file its targets sit on is not reachable by the device",
-                    name
-                );
-                delete_messages(&messages);
-                return Err(not_given(widened));
+                MessagesRefused::Unfit(i) =>
+                {
+                    if let Some(m) = messages.get(i)
+                    {
+                        std::os::seraph::log!(
+                            warn: "{}: message {:#x}/{:#x} does not fit the device's capability",
+                            name,
+                            m.address,
+                            m.data
+                        );
+                    }
+                    NotGiven::Clean
+                }
+                MessagesRefused::Unreachable { widened } =>
+                {
+                    std::os::seraph::log!(
+                        warn: "{}: an interrupt file its targets sit on is not reachable by the device",
+                        name
+                    );
+                    not_given(widened)
+                }
             };
-            widened |= newly;
+            delete_messages(&messages);
+            Err(not)
         }
     }
-    Ok((messages, widened))
 }
 
-/// Give the driver one MSI vector: mint a target, program its message into
-/// the function's MSI capability and enable it with one vector
-/// ([`FunctionConfig::program_msi`]).
+/// Give the driver one MSI vector: mint a target whose message fits the
+/// function's MSI capability ([`Msi::fits`], checked before its interrupt
+/// file is reached), program the message into the capability and enable it
+/// with one vector ([`FunctionConfig::program_msi`]).
 ///
 /// # Errors
 /// Logged, with the target deleted, when the function has no MSI
 /// capability, the mint fails, the message does not fit the capability
-/// ([`Msi::fits`]), or the configuration page cannot be mapped; the
-/// [`NotGiven`] tells whether an interrupt file was mapped for it.
+/// (with no interrupt file mapped), or the configuration page cannot be
+/// mapped; the [`NotGiven`] tells whether an interrupt file was mapped for
+/// it.
 fn give_msi(
     name: &str,
     pci_dev: &pci::PciDevice,
@@ -1362,23 +1387,14 @@ fn give_msi(
 ) -> Result<(), NotGiven>
 {
     let msi = pci_dev.msi.ok_or(NotGiven::Clean)?;
-    let (messages, widened) = mint_messages(name, 1, irq_range, dev.dma.as_ref())?;
+    let (messages, widened) = mint_messages(name, 1, irq_range, dev.dma.as_ref(), |m| {
+        msi.fits(m.address, m.data)
+    })?;
     let Some(m) = messages.first().copied()
     else
     {
         return Err(not_given(widened));
     };
-    if !msi.fits(m.address, m.data)
-    {
-        std::os::seraph::log!(
-            warn: "{}: MSI message {:#x}/{:#x} does not fit the device's capability",
-            name,
-            m.address,
-            m.data
-        );
-        delete_messages(&[m]);
-        return Err(not_given(widened));
-    }
     if !dev.config.program_msi(msi, m.address, m.data)
     {
         delete_messages(&[m]);
@@ -1429,7 +1445,10 @@ fn give_msix(
         dev.truncate(delivered);
         return Err(NotGiven::Clean);
     };
-    let (messages, widened) = match mint_messages(name, vectors, carve.irq_range, dev.dma.as_ref())
+    // A table entry holds a 64-bit address and 32-bit data, wider than the
+    // target vector or IMSIC interrupt identity a message carries.
+    let minted = mint_messages(name, vectors, carve.irq_range, dev.dma.as_ref(), |_| true);
+    let (messages, widened) = match minted
     {
         Ok(minted) => minted,
         Err(e) =>

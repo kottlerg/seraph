@@ -36,15 +36,20 @@
 //! before any IRQ is routed and takes no lock.
 //!
 //! # Vector assignment
-//! A GSI is assigned an IDT vector when it is routed ([`assign_vector`], from
-//! `interrupts::route_device_irq`) and releases it when its route is cleared
-//! ([`release_vector`]). The device vectors are `DEVICE_VECTOR_BASE..=DEVICE_VECTOR_LAST`
-//! (33-249), between the timer vector and the IPI vectors; `idt::init` installs a generated
-//! stub on every one, and `idt::irq_dispatch` maps the vector back to its GSI through
-//! [`gsi_for_vector`]. Any GSI the discovered I/O APICs cover can be routed, up to
-//! [`DEVICE_VECTOR_COUNT`] of them at once; a route past that is refused
-//! (`irq::RouteError::Exhausted`). The vector table is written only by the route changes,
-//! which `irq` serialises under its routing lock, and read lock-free by the dispatch.
+//! Each CPU has its own device vectors, `DEVICE_VECTOR_BASE..=DEVICE_VECTOR_LAST` (33-249,
+//! between the timer vector and the IPI vectors), held in its row of a per-CPU slab
+//! ([`init_vector_storage`]): entry `v - DEVICE_VECTOR_BASE` of CPU `c`'s row holds the
+//! source the vector is assigned to on `c`, plus one, or 0 when it is free. A source is a
+//! GSI routed through an I/O APIC ([`assign_vector`], from `interrupts::route_device_irq`)
+//! or a message-signaled target (`irq::MESSAGE_ID_BASE` and up, from
+//! `interrupts::alloc_message_target`), and releases its vector when its route is cleared
+//! or the target freed ([`release_vector`]). `idt::init` installs a generated stub on every
+//! device vector, and `idt::irq_dispatch` maps the vector back to its source through the
+//! executing CPU's row ([`source_for_vector`]). Each CPU routes up to
+//! [`DEVICE_VECTOR_COUNT`] sources at once; a route or mint that finds no CPU with a free
+//! vector is refused (`irq::RouteError::Exhausted`). A row is written only by the route
+//! changes, which `irq` serialises under its routing lock, and read lock-free by the
+//! dispatch on its own CPU.
 //!
 //! # Destination
 //! Each route names one destination CPU, chosen at route time by `irq::next_target_cpu`
@@ -66,10 +71,6 @@
 //! IRR set, which stays set when the line is routed again, on another vector, before that
 //! delivery's EOI; [`route`] clears it before it programs the entry again
 //! ([`remote_irr_clear`]).
-//!
-//! # Limitations / deferred work
-//!
-//! - **No MSI/MSI-X support.** Required for modern `PCIe` devices (#325).
 //!
 //! # Modification notes
 //! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_REGISTER`, through
@@ -103,7 +104,8 @@ pub const DEVICE_VECTOR_BASE: u8 = 33;
 /// the spurious vector is 255).
 pub const DEVICE_VECTOR_LAST: u8 = 249;
 
-/// Number of device vectors, and so the number of GSIs routed at once: 217.
+/// Number of device vectors of each CPU, and so the number of sources (routed GSIs and
+/// message-signaled targets) that CPU takes at once: 217.
 pub const DEVICE_VECTOR_COUNT: usize = (DEVICE_VECTOR_LAST - DEVICE_VECTOR_BASE) as usize + 1;
 
 /// Pins an I/O APIC can have: its version register reports the last redirection entry in
@@ -116,22 +118,68 @@ pub const IOAPIC_MAX_PINS: u32 = 256;
 #[cfg_attr(test, allow(dead_code))]
 pub const BROADCAST_APIC_ID: u32 = 0xFF;
 
-/// Where [`assign_vector`]'s search for a free vector starts: one past the vector it last
-/// assigned, moved past a released vector the search would otherwise reach before any
-/// other free one ([`release_vector`]). The search moves through the vectors in turn, so a
-/// released vector is taken again only once the search comes round to it, not by the next
-/// route while other vectors are free (`interrupts::unroute_device_irq`). Written only
-/// under `irq`'s routing lock.
-#[cfg(not(test))]
-static NEXT_VECTOR_INDEX: AtomicU32 = AtomicU32::new(0);
+/// One CPU's device vectors: the source each is assigned to, plus one (0 when free), at
+/// index `v - DEVICE_VECTOR_BASE` for vector `v`, and where the next search for a free
+/// vector starts: one past the vector last assigned, moved past a released vector the
+/// search would otherwise reach before any other free one ([`release_vector_in`]). The
+/// search moves through the vectors in turn, so a released vector is taken again only once
+/// the search comes round to it, not by the next route while other vectors are free
+/// (`interrupts::unroute_device_irq`). The zeroed row is all free, its search starting at
+/// the first vector.
+// dead_code: host test builds compile out the readers of its fields (`vector_row` and
+// its callers); the host tests drive the same helpers over a bare table.
+#[cfg_attr(test, allow(dead_code))]
+#[repr(C)]
+struct VectorRow
+{
+    owner: [AtomicU32; DEVICE_VECTOR_COUNT],
+    cursor: AtomicU32,
+}
 
-/// GSI each device vector is assigned to, plus one; 0 for a free vector, so the zeroed
-/// table is all free. Index `v - DEVICE_VECTOR_BASE` for vector `v`. Written only by
-/// [`assign_vector`] and [`release_vector`], which `irq` serialises under its routing lock;
-/// read lock-free by [`gsi_for_vector`] in interrupt context.
+// docs/limits.md states the slab's per-CPU cost from this size: 217 owner entries and the
+// cursor, 4 bytes each.
+const _: () = assert!(core::mem::size_of::<VectorRow>() == 872);
+
+/// The device-vector slab: one [`VectorRow`] per CPU.
+const VECTOR_ROW_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<VectorRow>("DEVICE_VECTOR_ROWS");
+const _: () = assert!(
+    VECTOR_ROW_SLAB.sized_at_every_width(),
+    "DEVICE_VECTOR_ROWS slab overflows"
+);
+
+/// Base of the device-vector slab, one [`VectorRow`] per boot CPU; set by
+/// [`init_vector_storage`].
 #[cfg(not(test))]
-static VECTOR_GSI: [AtomicU32; DEVICE_VECTOR_COUNT] =
-    [const { AtomicU32::new(0) }; DEVICE_VECTOR_COUNT];
+static VECTOR_ROWS: core::sync::atomic::AtomicPtr<VectorRow> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Allocate the per-CPU device-vector rows for `cpu_count` CPUs, zero-filled (every
+/// vector free). Called from `init_ap_percpu_storage` (Phase 4), before any source is
+/// routed.
+#[cfg(not(test))]
+pub fn init_vector_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
+{
+    let base = crate::sched::alloc_per_cpu_slab::<VectorRow>(VECTOR_ROW_SLAB, cpu_count, allocator);
+    VECTOR_ROWS.store(base, Ordering::Release);
+}
+
+/// CPU `cpu`'s device-vector row, or `None` when `cpu` is past the boot CPU count or the
+/// rows are not yet allocated.
+#[cfg(not(test))]
+fn vector_row(cpu: usize) -> Option<&'static VectorRow>
+{
+    let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
+    let base = VECTOR_ROWS.load(Ordering::Acquire);
+    if cpu >= cpu_count || base.is_null()
+    {
+        return None;
+    }
+    // SAFETY: the slab holds a zero-initialised VectorRow (all atomics, for which zero is
+    // a valid value) for each boot CPU, and `cpu` is below their count; the slab is never
+    // freed.
+    Some(unsafe { &*base.add(cpu) })
+}
 
 /// The device vector at `index` of a vector table.
 fn vector_at(index: usize) -> Option<u8>
@@ -141,10 +189,10 @@ fn vector_at(index: usize) -> Option<u8>
         .and_then(|offset| DEVICE_VECTOR_BASE.checked_add(offset))
 }
 
-/// The vector `table` assigns to `gsi`, if any.
-fn find_vector(table: &[AtomicU32], gsi: u32) -> Option<u8>
+/// The vector `table` assigns to `source`, if any.
+fn find_vector(table: &[AtomicU32], source: u32) -> Option<u8>
 {
-    let tag = gsi.checked_add(1)?;
+    let tag = source.checked_add(1)?;
     let index = table
         .iter()
         .position(|entry| entry.load(Ordering::Relaxed) == tag)?;
@@ -161,30 +209,30 @@ fn first_free_from(table: &[AtomicU32], start: usize) -> Option<usize>
         .find(|&index| table[index].load(Ordering::Relaxed) == 0)
 }
 
-/// The vector `table` assigns to `gsi` and the index the next search starts at: its
+/// The vector `table` assigns to `source` and the index the next search starts at: its
 /// existing vector, else the first free vector at or after index `start` (wrapping), now
-/// assigned to it. `None` when every vector is assigned (or `gsi` is `u32::MAX`, which no
-/// I/O APIC covers).
-fn assign_vector_in(table: &[AtomicU32], gsi: u32, start: usize) -> Option<(u8, usize)>
+/// assigned to it. `None` when every vector is assigned (or `source` is `u32::MAX`, which
+/// names no source).
+fn assign_vector_in(table: &[AtomicU32], source: u32, start: usize) -> Option<(u8, usize)>
 {
-    if let Some(vector) = find_vector(table, gsi)
+    if let Some(vector) = find_vector(table, source)
     {
         return Some((vector, start));
     }
-    let tag = gsi.checked_add(1)?;
+    let tag = source.checked_add(1)?;
     let index = first_free_from(table, start)?;
-    // Release: a dispatch that reads the tag (Acquire) once the redirection entry that
-    // names this vector fires sees a complete assignment.
+    // Release: a dispatch that reads the tag (Acquire) once the redirection entry or the
+    // message that names this vector fires sees a complete assignment.
     table[index].store(tag, Ordering::Release);
     Some((vector_at(index)?, (index + 1) % table.len()))
 }
 
-/// Free every vector `table` assigns to `gsi`, and return the search cursor `cursor` moved
-/// past each freed index a search from it would reach before any other free vector, so
-/// the next search does not take a vector just released while another is free.
-fn release_vector_in(table: &[AtomicU32], gsi: u32, cursor: usize) -> usize
+/// Free every vector `table` assigns to `source`, and return the search cursor `cursor`
+/// moved past each freed index a search from it would reach before any other free vector,
+/// so the next search does not take a vector just released while another is free.
+fn release_vector_in(table: &[AtomicU32], source: u32, cursor: usize) -> usize
 {
-    let Some(tag) = gsi.checked_add(1)
+    let Some(tag) = source.checked_add(1)
     else
     {
         return cursor;
@@ -204,46 +252,62 @@ fn release_vector_in(table: &[AtomicU32], gsi: u32, cursor: usize) -> usize
     cursor
 }
 
-/// Assign `gsi` a device vector: the next free one in turn ([`NEXT_VECTOR_INDEX`]). `None`
-/// when every device vector is assigned. Called under `irq`'s routing lock, from
-/// `route_device_irq` for a line's first binding; the last unbind's `unroute_device_irq`
-/// releases the vector, so `gsi` holds none when this runs, and returning an existing
-/// vector instead is defensive.
+/// Whether CPU `cpu` has a free device vector.
 #[cfg(not(test))]
 #[must_use]
-pub fn assign_vector(gsi: u32) -> Option<u8>
+pub fn has_free_vector(cpu: usize) -> bool
 {
-    let start = NEXT_VECTOR_INDEX.load(Ordering::Relaxed) as usize;
-    let (vector, next) = assign_vector_in(&VECTOR_GSI, gsi, start)?;
+    vector_row(cpu).is_some_and(|row| first_free_from(&row.owner, 0).is_some())
+}
+
+/// Assign `source` a device vector of CPU `cpu`: the next free one in turn of that CPU's
+/// row. `None` when every device vector of `cpu` is assigned, or `cpu` has no row. Called
+/// under `irq`'s routing lock, from `route_device_irq` for a line's first binding and from
+/// `alloc_message_target`; the source's release frees the vector, so `source` holds none
+/// when this runs, and returning an existing vector instead is defensive.
+#[cfg(not(test))]
+#[must_use]
+pub fn assign_vector(cpu: usize, source: u32) -> Option<u8>
+{
+    let row = vector_row(cpu)?;
+    let start = row.cursor.load(Ordering::Relaxed) as usize;
+    let (vector, next) = assign_vector_in(&row.owner, source, start)?;
     // `next` is below DEVICE_VECTOR_COUNT (217), which fits u32.
     #[allow(clippy::cast_possible_truncation)]
-    NEXT_VECTOR_INDEX.store(next as u32, Ordering::Relaxed);
+    row.cursor.store(next as u32, Ordering::Relaxed);
     Some(vector)
 }
 
-/// Free `gsi`'s device vector. Called under `irq`'s routing lock, after the redirection
-/// entry is masked.
+/// Free `source`'s device vector on CPU `cpu`. Called under `irq`'s routing lock, after
+/// the redirection entry is masked (a line) or once the target is no longer bound (a
+/// message target).
 #[cfg(not(test))]
-pub fn release_vector(gsi: u32)
+pub fn release_vector(cpu: usize, source: u32)
 {
-    let cursor = NEXT_VECTOR_INDEX.load(Ordering::Relaxed) as usize;
-    let cursor = release_vector_in(&VECTOR_GSI, gsi, cursor);
+    let Some(row) = vector_row(cpu)
+    else
+    {
+        return;
+    };
+    let cursor = row.cursor.load(Ordering::Relaxed) as usize;
+    let cursor = release_vector_in(&row.owner, source, cursor);
     // The cursor is below DEVICE_VECTOR_COUNT (217), which fits u32.
     #[allow(clippy::cast_possible_truncation)]
-    NEXT_VECTOR_INDEX.store(cursor as u32, Ordering::Relaxed);
+    row.cursor.store(cursor as u32, Ordering::Relaxed);
 }
 
-/// The GSI device vector `vector` is assigned to, or `None` for a free vector or one
-/// outside the device range. Read in interrupt context (`idt::irq_dispatch`): an interrupt
-/// latched before its vector was released finds `None` and is dropped, unless the vector
-/// was reassigned before it was serviced, when it reaches the new owner as one spurious
-/// delivery (`interrupts::unroute_device_irq`).
+/// The source device vector `vector` is assigned to on the executing CPU, or `None` for a
+/// free vector or one outside the device range. Read in interrupt context
+/// (`idt::irq_dispatch`): an interrupt latched before its vector was released finds `None`
+/// and is dropped, unless the vector was reassigned before it was serviced, when it
+/// reaches the new owner as one spurious delivery (`interrupts::unroute_device_irq`).
 #[cfg(not(test))]
 #[must_use]
-pub fn gsi_for_vector(vector: u8) -> Option<u32>
+pub fn source_for_vector(vector: u8) -> Option<u32>
 {
     let index = vector.checked_sub(DEVICE_VECTOR_BASE)? as usize;
-    let tag = VECTOR_GSI.get(index)?.load(Ordering::Acquire);
+    let row = vector_row(super::cpu::current_cpu() as usize)?;
+    let tag = row.owner.get(index)?.load(Ordering::Acquire);
     tag.checked_sub(1)
 }
 
@@ -737,6 +801,22 @@ mod tests
         release_vector_in(&t, 5, 0);
         assert_eq!(find_vector(&t, 5), None);
         assert!(assign(&t, 1000).is_some());
+    }
+
+    #[test]
+    fn a_message_target_and_a_gsi_share_one_row()
+    {
+        // A message-signaled target's source id sits above every GSI
+        // (irq::MESSAGE_ID_BASE); it takes a vector of the same row and is found and
+        // released by that id without touching the GSI's vector.
+        let t = table();
+        let line = assign(&t, 9).expect("vector");
+        let message = assign(&t, 32_768).expect("vector");
+        assert_ne!(line, message);
+        assert_eq!(find_vector(&t, 32_768), Some(message));
+        release_vector_in(&t, 32_768, 0);
+        assert_eq!(find_vector(&t, 32_768), None);
+        assert_eq!(find_vector(&t, 9), Some(line));
     }
 
     #[test]

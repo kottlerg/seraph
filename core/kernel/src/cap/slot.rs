@@ -446,6 +446,9 @@ define_typed_rights! {
     {
         /// May register/acknowledge the line and receive its notifications.
         NOTIFY = syscall::RIGHTS_IRQ_NOTIFY;
+        /// May mint message-signaled Interrupt capabilities
+        /// (`SYS_IRQ_MSG_ALLOC`).
+        MINT = syscall::RIGHTS_IRQ_MINT;
     }
 }
 

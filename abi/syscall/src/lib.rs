@@ -428,6 +428,22 @@ pub const CAP_INFO_SOLE_REFERENCE: u64 = 13;
 /// [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_ASPACE_TERMINAL_FAULT: u64 = 14;
 
+/// Interrupt only — the message address a device writes to raise the
+/// message-signaled interrupt the capability names (one minted by
+/// `SYS_IRQ_MSG_ALLOC`): on `x86_64` the local APIC's compatibility-format
+/// address of the target CPU, on riscv64 the physical address of the target
+/// hart's supervisor-level IMSIC interrupt file. A driver programs it, with
+/// [`CAP_INFO_IRQ_MSG_DATA`], into its device's MSI or MSI-X entry. Calling
+/// on another capability type, or on an Interrupt capability naming a wired
+/// line, returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_IRQ_MSG_ADDRESS: u64 = 15;
+
+/// Interrupt only — the message data a device writes with
+/// [`CAP_INFO_IRQ_MSG_ADDRESS`]: on `x86_64` the target vector in fixed
+/// delivery and edge trigger, on riscv64 the interrupt identity in the
+/// target hart's IMSIC file. The same errors as [`CAP_INFO_IRQ_MSG_ADDRESS`].
+pub const CAP_INFO_IRQ_MSG_DATA: u64 = 16;
+
 // ── CapTag discriminants ─────────────────────────────────────────────────────
 //
 // Userspace constants matching the kernel `CapTag` enum, for callers that
@@ -499,11 +515,15 @@ pub const SYS_THREAD_READ_MEM: u64 = 60;
 /// Thread: copy bytes from the caller's buffer into the thread's address
 /// space. See `core/kernel/docs/syscalls.md` § `SYS_THREAD_WRITE_MEM` (61).
 pub const SYS_THREAD_WRITE_MEM: u64 = 61;
+/// Interrupt: mint one unbound message-signaled Interrupt capability through
+/// an Interrupt capability carrying [`RIGHTS_IRQ_MINT`]. See
+/// `core/kernel/docs/syscalls.md` § `SYS_IRQ_MSG_ALLOC` (62).
+pub const SYS_IRQ_MSG_ALLOC: u64 = 62;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_WRITE_MEM + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_IRQ_MSG_ALLOC + 1;
 
 // ── getrandom constants ───────────────────────────────────────────────────────
 
@@ -945,6 +965,11 @@ pub const RIGHTS_EQ_RECV: u64 = 1 << 1;
 /// Interrupt: may register/acknowledge the line and receive its
 /// notifications.
 pub const RIGHTS_IRQ_NOTIFY: u64 = 1 << 0;
+
+/// Interrupt: may mint message-signaled Interrupt capabilities
+/// (`SYS_IRQ_MSG_ALLOC`). Set on the root Interrupt capability the kernel
+/// mints for init; a minted capability does not carry it.
+pub const RIGHTS_IRQ_MINT: u64 = 1 << 1;
 
 // Mmio ──
 
@@ -1578,7 +1603,7 @@ mod tests
             // EventQueue
             &[RIGHTS_EQ_POST, RIGHTS_EQ_RECV],
             // Interrupt
-            &[RIGHTS_IRQ_NOTIFY],
+            &[RIGHTS_IRQ_NOTIFY, RIGHTS_IRQ_MINT],
             // Mmio
             &[RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE],
             // Thread

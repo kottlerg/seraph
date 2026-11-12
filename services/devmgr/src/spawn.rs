@@ -460,7 +460,15 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     let mut derived = [0u64; MAX_BOUND_RESOURCES + END_SLOTS];
     for (slot, resource) in derived.iter_mut().zip(config.resources)
     {
-        let Ok(copy) = syscall::cap_derive(resource.cap(), syscall::RIGHTS_ALL)
+        // A driver's Interrupt cap binds and acknowledges its source and no
+        // more: the authority to mint message-signaled targets
+        // (`RIGHTS_IRQ_MINT`) stays with devmgr.
+        let rights = match resource
+        {
+            Resource::Interrupt { .. } => syscall::RIGHTS_IRQ_NOTIFY,
+            Resource::Mmio { .. } | Resource::IoPort { .. } => syscall::RIGHTS_ALL,
+        };
+        let Ok(copy) = syscall::cap_derive(resource.cap(), rights)
         else
         {
             std::os::seraph::log!(warn: "driver resource cap derivation failed");

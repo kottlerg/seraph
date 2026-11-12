@@ -132,7 +132,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     let device = unsafe { DeliveredDevice::receive(creator, ipc_buf) }?;
     if device.dma == 0
     {
-        std::os::seraph::log!("no DMA capability delivered");
+        std::os::seraph::log!(error: "no DMA capability delivered");
         return None;
     }
     Some(DriverCaps {
@@ -150,7 +150,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
 /// Log `msg` and end the driver: it cannot serve without what failed.
 fn fail(msg: &str) -> !
 {
-    std::os::seraph::log!("{}", msg);
+    std::os::seraph::log!(error: "{}", msg);
     syscall::thread_exit();
 }
 
@@ -279,26 +279,26 @@ fn dma_pages(caps: &DriverCaps, pages: u64, what: &str, ipc_buf: *mut u64) -> Dm
             {
                 let _ = syscall::cap_delete(c);
             }
-            std::os::seraph::log!("{}: no contiguous memory", what);
+            std::os::seraph::log!(error: "{}: no contiguous memory", what);
             syscall::thread_exit();
         }
         Err(_) =>
         {
-            std::os::seraph::log!("{}: memmgr call failed", what);
+            std::os::seraph::log!(error: "{}: memmgr call failed", what);
             syscall::thread_exit();
         }
     };
     let Ok(range) = reserve_pages(pages)
     else
     {
-        std::os::seraph::log!("{}: reserve_pages failed", what);
+        std::os::seraph::log!(error: "{}: reserve_pages failed", what);
         syscall::thread_exit();
     };
     let va = range.va_start();
     let Ok(bytes) = usize::try_from(pages * PAGE_SIZE)
     else
     {
-        std::os::seraph::log!("{}: {} pages past the address width", what, pages);
+        std::os::seraph::log!(error: "{}: {} pages past the address width", what, pages);
         syscall::thread_exit();
     };
     // SAFETY: `range` is a fresh reservation from the per-process arena,
@@ -316,7 +316,7 @@ fn dma_pages(caps: &DriverCaps, pages: u64, what: &str, ipc_buf: *mut u64) -> Dm
     };
     if mapped.is_err()
     {
-        std::os::seraph::log!("{}: mem_map failed", what);
+        std::os::seraph::log!(error: "{}: mem_map failed", what);
         syscall::thread_exit();
     }
     // SAFETY: va is mapped writable, pages * PAGE_SIZE bytes.
@@ -326,7 +326,7 @@ fn dma_pages(caps: &DriverCaps, pages: u64, what: &str, ipc_buf: *mut u64) -> Dm
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let addr = unsafe {
         virtio_core::dma::map_or_exit(caps.dma_ep, memory, ipc_buf, |e| {
-            std::os::seraph::log!("{}: not mapped for the device ({:?})", what, e);
+            std::os::seraph::log!(error: "{}: not mapped for the device ({:?})", what, e);
         })
     };
     DmaPages { va, addr }
@@ -417,7 +417,7 @@ fn setup_queue(
     let Some(vq) = vq
     else
     {
-        std::os::seraph::log!("device offers no usable queue {} (size {})", index, size);
+        std::os::seraph::log!(error: "device offers no usable queue {} (size {})", index, size);
         syscall::thread_exit();
     };
     Queue {
@@ -681,11 +681,11 @@ fn isr_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("interrupt wait failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "interrupt wait failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("interrupt wait wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "interrupt wait wedged (err={err}); exiting");
         }
     }
 }
@@ -697,11 +697,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
         }
     }
 }
@@ -846,7 +846,7 @@ fn main() -> !
     // client's RX wait relies on its own bounded timeout.
     if caps.irq_slot == 0
     {
-        std::os::seraph::log!("no IRQ cap; polling");
+        std::os::seraph::log!(warn: "no IRQ cap; polling");
     }
     else
     {
@@ -859,7 +859,7 @@ fn main() -> !
     // SAFETY: ipc_buf is the registered IPC buffer.
     if let Err(e) = unsafe { ipc::report_driver_ready(caps.devmgr_ep, ipc_buf) }
     {
-        std::os::seraph::log!("DRIVER_READY failed ({e:?}); exiting");
+        std::os::seraph::log!(error: "DRIVER_READY failed ({e:?}); exiting");
         syscall::thread_exit();
     }
     service_loop(caps.service_ep, ipc_buf, &mut console);

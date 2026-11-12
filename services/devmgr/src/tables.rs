@@ -35,7 +35,7 @@ fn with_mapped<R>(
     let Ok(range) = reserve_pages(page_count)
     else
     {
-        std::os::seraph::log!("firmware table: no VA for {} pages; not read", page_count);
+        std::os::seraph::log!(warn: "firmware table: no VA for {} pages; not read", page_count);
         return None;
     };
     let va = range.va_start();
@@ -54,7 +54,7 @@ fn with_mapped<R>(
     if mapped.is_err()
     {
         std::os::seraph::log!(
-            "firmware table: mapping {} pages at page {} failed; not read",
+            warn: "firmware table: mapping {} pages at page {} failed; not read",
             page_count,
             first_page
         );
@@ -141,7 +141,7 @@ fn read_xsdt_phys(firmware: &Firmware) -> Option<u64>
     let rsdp_page_offset = usize::try_from(firmware.rsdp_page_base & (PAGE_SIZE - 1)).ok()?;
     if rsdp_page_offset + firmware::acpi::RSDP_LEN > usize::try_from(PAGE_SIZE).ok()?
     {
-        std::os::seraph::log!("RSDP straddles its page; ACPI unavailable");
+        std::os::seraph::log!(warn: "RSDP straddles its page; ACPI unavailable");
         return None;
     }
     with_mapped(firmware, firmware.rsdp_memory_cap, 0, 1, |page| {
@@ -158,7 +158,7 @@ fn read_xsdt_entries(firmware: &Firmware, xsdt_phys: u64) -> Option<Vec<u64>>
         let mut entries = Vec::new();
         if entries.try_reserve(xsdt.len() / 8).is_err()
         {
-            std::os::seraph::log!("XSDT: no memory for its entry list; ACPI unavailable");
+            std::os::seraph::log!(warn: "XSDT: no memory for its entry list; ACPI unavailable");
             return None;
         }
         entries.extend(firmware::acpi::iter_xsdt_entries(xsdt));
@@ -322,7 +322,7 @@ fn discover_ecams_acpi(firmware: &Firmware) -> Vec<EcamLocation>
                 if found.try_reserve(1).is_err()
                 {
                     std::os::seraph::log!(
-                        "MCFG: no memory to record segment {} ECAM; not scanned",
+                        warn: "MCFG: no memory to record segment {} ECAM; not scanned",
                         loc.segment
                     );
                     continue;
@@ -334,7 +334,7 @@ fn discover_ecams_acpi(firmware: &Firmware) -> Vec<EcamLocation>
         if read.is_none()
         {
             std::os::seraph::log!(
-                "MCFG at {:#x} unreadable; its segments not scanned",
+                warn: "MCFG at {:#x} unreadable; its segments not scanned",
                 tbl_phys
             );
         }
@@ -358,7 +358,7 @@ fn discover_ecams_dtb(firmware: &Firmware) -> Vec<EcamLocation>
         let found = fdt.find_pci_ecams().ok();
         if found.is_none()
         {
-            std::os::seraph::log!("DTB: no memory for the ECAM list; DTB ECAMs not scanned");
+            std::os::seraph::log!(warn: "DTB: no memory for the ECAM list; DTB ECAMs not scanned");
         }
         found
     });

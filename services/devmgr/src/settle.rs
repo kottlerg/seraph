@@ -13,20 +13,18 @@
 //! correlator, a job notification the registry's workers signal when a
 //! request leaves work for the control thread (`crate::Registry`), and a
 //! wait set over both that devmgr's control thread waits on. devmgr spawns
-//! its drivers in two production batches after the IOMMU batch (at boot, the
-//! drivers bound by the boot modules' declarations; after `SET_DRIVERS_DIR`,
-//! the drivers bound by the drivers directory's declarations), and, on
-//! svctest's test-only `TEST_SPAWN_FAULT_DRIVERS`, a third of `test-fault`
-//! fixtures (TODO(#165)), each against a [`SettleBatch`]: a private driver
-//! endpoint on which each driver's devmgr query cap is a SEND badged with its
-//! device badge. [`SettleBatch::settle`] takes the job notification out of the
-//! wait set, adds the private endpoint and a timer notification, and runs the
+//! its drivers in batches after the IOMMU batch (at boot, the drivers bound
+//! by the boot modules' declarations; after `SET_DRIVERS_DIR`, the drivers
+//! bound by the drivers directory's declarations; after each
+//! `BIND_DRIVERS`, the drivers bound by the declarations of the directory it
+//! names), each against a [`SettleBatch`]: a private driver endpoint on which
+//! each driver's devmgr query cap is a SEND badged with its device badge.
+//! [`SettleBatch::settle`] takes the job notification out of the wait set,
+//! adds the private endpoint and a timer notification, and runs the
 //! host-tested [`roster::settle`] loop: it serves the drivers'
 //! `QUERY_DEVICE_INFO` and `DRIVER_READY` calls on the private endpoint and
 //! takes their deaths until the [`Roster`] is settled or the batch's bound
-//! elapses ([`SETTLE_TIMEOUT`] for the production batches,
-//! `TEST_FAULT_SETTLE_TIMEOUT_MS` for the fault batch), then takes every
-//! death still queued. A death of a driver an earlier batch settled goes to
+//! ([`SETTLE_TIMEOUT`]) elapses, then takes every death still queued. A death of a driver an earlier batch settled goes to
 //! the caller, which withdraws it. The registry's workers go on serving
 //! meanwhile; a query whose answer a batch still unsettled could change
 //! waits for it (`crate::Registry`). See
@@ -56,8 +54,13 @@ use crate::DeviceCatalog;
 /// setup also makes synchronous IPC calls (memmgr, and devmgr's own
 /// `QUERY_DEVICE_INFO`), which are not bounded; a driver blocked in one past
 /// the bound is withdrawn like a hung one.
+///
+/// The registry protocol publishes the bound as
+/// `ipc::devmgr_labels::SETTLE_TIMEOUT_MS`, which a client waiting on a settle
+/// reads; the two are asserted equal.
 pub const SETTLE_TIMEOUT: Duration =
     Duration::from_secs(2 * virtio_core::pci::RESET_TIMEOUT.as_secs());
+const _: () = assert!(SETTLE_TIMEOUT.as_millis() == ipc::devmgr_labels::SETTLE_TIMEOUT_MS as u128);
 
 /// Wait-set badge of the job notification.
 const WS_BADGE_JOB: u64 = 1;
@@ -114,7 +117,7 @@ impl DriverWatch
         if usize::try_from(capacity).is_ok_and(|c| c < drivers)
         {
             std::os::seraph::log!(
-                "watch: {} drivers past the death queue's capacity {}",
+                warn: "watch: {} drivers past the death queue's capacity {}",
                 drivers as u64,
                 capacity
             );
@@ -126,7 +129,7 @@ impl DriverWatch
         })
         else
         {
-            std::os::seraph::log!("watch: death event queue not created");
+            std::os::seraph::log!(warn: "watch: death event queue not created");
             return None;
         };
         let Some(wait_set) = std::os::seraph::object_slab_retype(
@@ -135,7 +138,7 @@ impl DriverWatch
         )
         else
         {
-            std::os::seraph::log!("watch: wait set not created");
+            std::os::seraph::log!(warn: "watch: wait set not created");
             let _ = syscall::cap_delete(death_eq);
             return None;
         };
@@ -145,7 +148,7 @@ impl DriverWatch
         )
         else
         {
-            std::os::seraph::log!("watch: job notification not created");
+            std::os::seraph::log!(warn: "watch: job notification not created");
             let _ = syscall::cap_delete(wait_set);
             let _ = syscall::cap_delete(death_eq);
             return None;
@@ -153,7 +156,7 @@ impl DriverWatch
         if syscall::wait_set_add(wait_set, death_eq, WS_BADGE_DEATH).is_err()
             || syscall::wait_set_add(wait_set, job_note, WS_BADGE_JOB).is_err()
         {
-            std::os::seraph::log!("watch: wait set registration failed");
+            std::os::seraph::log!(warn: "watch: wait set registration failed");
             let _ = syscall::cap_delete(job_note);
             let _ = syscall::cap_delete(wait_set);
             let _ = syscall::cap_delete(death_eq);
@@ -250,7 +253,7 @@ impl SettleBatch
             })
         else
         {
-            std::os::seraph::log!("settle: driver endpoint not created");
+            std::os::seraph::log!(warn: "settle: driver endpoint not created");
             return None;
         };
         Some(Self { driver_ep })
@@ -306,19 +309,21 @@ impl SettleBatch
             let _ = syscall::wait_set_remove(watch.wait_set, self.driver_ep);
             drop(timer);
             end.unwrap_or_else(|e| {
-                std::os::seraph::log!("settle: wait set failed (err={e}); pending not served");
+                std::os::seraph::log!(
+                    warn: "settle: wait set failed (err={e}); pending not served"
+                );
                 SettleEnd::Settled
             })
         }
         else
         {
-            std::os::seraph::log!("settle: driver endpoint not added to the wait set");
+            std::os::seraph::log!(warn: "settle: driver endpoint not added to the wait set");
             SettleEnd::Settled
         };
         if reopen && let Err(e) = watch.open_jobs()
         {
             std::os::seraph::log!(
-                "settle: job notification not re-added to the wait set (err={e}); \
+                warn: "settle: job notification not re-added to the wait set (err={e}); \
                  jobs wait for a death to wake the control thread"
             );
         }
@@ -359,12 +364,14 @@ impl Timer
         )
         else
         {
-            std::os::seraph::log!("settle: timer notification not created; settle unbounded");
+            std::os::seraph::log!(warn: "settle: timer notification not created; settle unbounded");
             return None;
         };
         if syscall::wait_set_add(wait_set, sig, WS_BADGE_TIMER).is_err()
         {
-            std::os::seraph::log!("settle: timer not added to the wait set; settle unbounded");
+            std::os::seraph::log!(
+                warn: "settle: timer not added to the wait set; settle unbounded"
+            );
             let _ = syscall::cap_delete(sig);
             return None;
         }
@@ -372,7 +379,7 @@ impl Timer
         let Ok(copy) = syscall::cap_derive(sig, syscall::RIGHTS_ALL)
         else
         {
-            std::os::seraph::log!("settle: timer cap not derived; settle unbounded");
+            std::os::seraph::log!(warn: "settle: timer cap not derived; settle unbounded");
             return None;
         };
         let spawned = std::thread::Builder::new().spawn(move || {
@@ -382,7 +389,7 @@ impl Timer
         });
         if spawned.is_err()
         {
-            std::os::seraph::log!("settle: timer thread not started; settle unbounded");
+            std::os::seraph::log!(warn: "settle: timer thread not started; settle unbounded");
             let _ = syscall::cap_delete(copy);
             return None;
         }
@@ -447,7 +454,7 @@ impl<T> SettleEvents<T> for BatchEvents<'_>
     fn on_death(&mut self, badge: u64, reason: u64)
     {
         std::os::seraph::log!(
-            "settle: driver of device {} died before the batch settled (reason={:#x})",
+            warn: "settle: driver of device {} died before the batch settled (reason={:#x})",
             badge,
             reason
         );

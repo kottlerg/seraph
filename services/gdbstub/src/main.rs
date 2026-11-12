@@ -92,7 +92,7 @@ fn main()
     .is_ok_and(|r| r.label == procmgr_errors::SUCCESS);
     if !declared
     {
-        std::os::seraph::log!("DECLARE_NO_DEBUG not accepted; exiting");
+        std::os::seraph::log!(error: "DECLARE_NO_DEBUG not accepted; exiting");
         return;
     }
     // The recipe's seed is `devmgr.class.debug-port`; `debug_authority = yes`
@@ -102,24 +102,26 @@ fn main()
         (unsafe { ipc::bootstrap::request_slots::<2>(info.creator_endpoint, ipc_buf) })
     else
     {
-        std::os::seraph::log!("no bootstrap caps; exiting");
+        std::os::seraph::log!(error: "no bootstrap caps; exiting");
         return;
     };
     let Some(name) = std::env::args().nth(1)
     else
     {
-        std::os::seraph::log!("no target name in argv; exiting");
+        std::os::seraph::log!(error: "no target name in argv; exiting");
         return;
     };
     if debug_port_class == 0 || debug == 0
     {
-        std::os::seraph::log!("devmgr.class.debug-port or the debug authority missing; exiting");
+        std::os::seraph::log!(
+            error: "devmgr.class.debug-port or the debug authority missing; exiting"
+        );
         return;
     }
     let Some(port) = Port::open(debug_port_class, ipc_buf)
     else
     {
-        std::os::seraph::log!("no debug port served; exiting");
+        std::os::seraph::log!(error: "no debug port served; exiting");
         return;
     };
     let Some(endpoint) =
@@ -128,7 +130,7 @@ fn main()
         })
     else
     {
-        std::os::seraph::log!("no fault endpoint; exiting");
+        std::os::seraph::log!(error: "no fault endpoint; exiting");
         return;
     };
     let (events_tx, events) = channel();
@@ -380,7 +382,9 @@ impl Kernel for Sys
         // held one is answered, and the serve loop asks again at each wait.
         if !started && !self.receiver_short
         {
-            std::os::seraph::log!("a fault receiver could not be started; a stop waits for one");
+            std::os::seraph::log!(
+                warn: "a fault receiver could not be started; a stop waits for one"
+            );
         }
         self.receiver_short = !started;
     }
@@ -431,7 +435,7 @@ impl Kernel for Sys
         if !self.ensure_receiver(slot)
         {
             std::os::seraph::log!(
-                "a fault receiver could not be started; thread {} is left unbound",
+                warn: "a fault receiver could not be started; thread {} is left unbound",
                 slot + 1
             );
             return false;
@@ -524,7 +528,7 @@ impl Kernel for Sys
         self.step = None;
         if ARCH == gdb_rsp::target::Arch::X86_64
         {
-            std::os::seraph::log!("a step's thread never stopped; its trap flag stays set");
+            std::os::seraph::log!(warn: "a step's thread never stopped; its trap flag stays set");
         }
     }
 
@@ -611,7 +615,7 @@ impl Stub
         let Some(badge) = badge
         else
         {
-            std::os::seraph::log!("no process named {} to attach to", self.name);
+            std::os::seraph::log!(warn: "no process named {} to attach to", self.name);
             return;
         };
         let watch = Some(self.self_thread);
@@ -625,7 +629,7 @@ impl Stub
         )
         else
         {
-            std::os::seraph::log!("attach to {} refused", self.name);
+            std::os::seraph::log!(warn: "attach to {} refused", self.name);
             return;
         };
         self.sys.target = badge;

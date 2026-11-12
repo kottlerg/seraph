@@ -78,13 +78,13 @@ fn main() -> !
             Ok([cap]) if cap != 0 => cap,
             _ =>
             {
-                std::os::seraph::log!("no debug authority delivered; not reporting crashes");
+                std::os::seraph::log!(error: "no debug authority delivered; not reporting crashes");
                 syscall::thread_exit();
             }
         };
     if !start_watchdog()
     {
-        std::os::seraph::log!("watchdog not started; a fault's handling is unbounded");
+        std::os::seraph::log!(warn: "watchdog not started; a fault's handling is unbounded");
     }
     let Some(endpoint) = register(authority, ipc_buf)
     else
@@ -123,7 +123,7 @@ fn register(authority: u64, ipc_buf: *mut u64) -> Option<u64>
     )
     else
     {
-        std::os::seraph::log!("register: thread cap not derived");
+        std::os::seraph::log!(error: "register: thread cap not derived");
         return None;
     };
     let msg = IpcMessage::builder(procmgr_labels::REGISTER_CRASH_SERVICE)
@@ -142,13 +142,13 @@ fn register(authority: u64, ipc_buf: *mut u64) -> Option<u64>
         Ok(r) =>
         {
             delete_caps(r.caps());
-            std::os::seraph::log!("register refused (label={:#x})", r.label);
+            std::os::seraph::log!(error: "register refused (label={:#x})", r.label);
             None
         }
         Err(e) =>
         {
             let _ = syscall::cap_delete(thread);
-            std::os::seraph::log!("register call failed (err={e})");
+            std::os::seraph::log!(error: "register call failed (err={e})");
             None
         }
     }
@@ -243,7 +243,7 @@ fn await_settled(generation: u64)
     {
         if start.elapsed() > FAULT_BOUND
         {
-            std::os::seraph::log!("the watchdog did not finish its cancellation");
+            std::os::seraph::log!(warn: "the watchdog did not finish its cancellation");
             return;
         }
         let _ = syscall::thread_yield();
@@ -654,6 +654,6 @@ fn watchdog(receiver: u64, endpoint: u64) -> !
             }
         }
         BOUND.settle(generation);
-        std::os::seraph::log!("a fault's handling passed its bound; reporting what was read");
+        std::os::seraph::log!(warn: "a fault's handling passed its bound; reporting what was read");
     }
 }

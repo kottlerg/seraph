@@ -29,7 +29,7 @@ mod settle;
 mod spawn;
 mod tables;
 
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use driver_binding::decl::{ClassName, DriverName};
 use firmware::classes::{Classes, MAX_CLASSES, Mismatch};
@@ -89,21 +89,20 @@ fn main() -> !
     let mut catalog = DeviceCatalog::default();
 
     // Every driver this boot can spawn, each at most once: one per device
-    // record (a record is bound at most once), the IOMMU driver, and the
-    // test-only fault batch (TODO(#165): drop it with that shim). The watch's
-    // death queue is sized to them, so every death observer is funded and no
-    // death is dropped.
-    let driver_count = records.count() + IOMMU_DRIVERS + ipc::devmgr_labels::TEST_FAULT_DRIVERS;
+    // record (a record is bound at most once, by whichever pass binds it) and
+    // the IOMMU driver. The watch's death queue is sized to them, so every
+    // death observer is funded and no death is dropped.
+    let driver_count = records.count() + IOMMU_DRIVERS;
     let Some(mut watch) = settle::DriverWatch::new(driver_count)
     else
     {
-        std::os::seraph::log!("no driver death watch, halting");
+        std::os::seraph::log!(error: "no driver death watch, halting");
         halt_loop();
     };
 
     if caps.registry_ep == 0
     {
-        std::os::seraph::log!("no registry endpoint injected, halting");
+        std::os::seraph::log!(error: "no registry endpoint injected, halting");
         halt_loop();
     }
 
@@ -123,7 +122,7 @@ fn main() -> !
     caps.dma = dma::DmaService::start();
     if caps.dma.is_none()
     {
-        std::os::seraph::log!("no DMA service, halting");
+        std::os::seraph::log!(error: "no DMA service, halting");
         halt_loop();
     }
 
@@ -143,13 +142,9 @@ fn main() -> !
         ipc_buf,
     )
     .map(Arc::new);
-    if let Some(i) = &caps.iommu
+    if let (Some(i), Some(d)) = (&caps.iommu, &caps.dma)
     {
-        if let Some(d) = &caps.dma
-        {
-            d.set_iommu(Arc::clone(i.client()));
-        }
-        let _ = registry.iommu.set(Arc::clone(i));
+        d.set_iommu(Arc::clone(i));
     }
 
     // The boot batch: the boot pass over every record, from the boot
@@ -168,8 +163,9 @@ fn main() -> !
     // The registry's workers. This thread stays the control thread: it owns
     // the device records, the carve tables, the catalog, and the death
     // watch, and runs the work a request leaves for it (the drivers-directory
-    // pass and settle after `SET_DRIVERS_DIR`, and the test-only batches) and
-    // every withdrawal of a driver whose death the watch takes.
+    // pass and settle after `SET_DRIVERS_DIR`, and the on-demand pass and
+    // settle after `BIND_DRIVERS`) and every withdrawal of a driver whose
+    // death the watch takes.
     start_registry_workers(&registry);
     std::os::seraph::log!("enumeration complete, registry open");
 
@@ -214,7 +210,9 @@ fn enumerate_records(caps: &mut caps::DevmgrCaps) -> (bind::Records, decls::Boot
     }
     if windows_scanned == 0
     {
-        std::os::seraph::log!("no PCI ECAM window located or enumerated via ACPI or DTB, halting");
+        std::os::seraph::log!(
+            error: "no PCI ECAM window located or enumerated via ACPI or DTB, halting"
+        );
         halt_loop();
     }
     std::os::seraph::log!(
@@ -233,7 +231,7 @@ fn enumerate_records(caps: &mut caps::DevmgrCaps) -> (bind::Records, decls::Boot
     let Some(records) = records
     else
     {
-        std::os::seraph::log!("no memory for the device records, halting");
+        std::os::seraph::log!(error: "no memory for the device records, halting");
         halt_loop();
     };
     (records, modules)
@@ -256,14 +254,14 @@ fn start_registry_workers(registry: &Arc<Registry>)
         Ok(_) =>
         {}
         Err(e) if e.running > 0 => std::os::seraph::log!(
-            "{} of {} registry workers started ({}); serving on those",
+            warn: "{} of {} registry workers started ({}); serving on those",
             e.running as u64,
             REGISTRY_WORKERS as u64,
             e.error
         ),
         Err(e) =>
         {
-            std::os::seraph::log!("no registry worker started ({}), halting", e.error);
+            std::os::seraph::log!(error: "no registry worker started ({}), halting", e.error);
             halt_loop();
         }
     }
@@ -275,9 +273,9 @@ fn start_registry_workers(registry: &Arc<Registry>)
 const REGISTRY_WORKERS: usize = 4;
 
 /// Run the work registry requests left for the control thread, in this
-/// order: the drivers-directory pass and settle, the test-only fault batch,
-/// and the test-only orphan spawn. Each job, once done, is counted settled
-/// ([`Registry::finish_job`]), which releases the queries waiting for it.
+/// order: the drivers-directory pass and settle, then the on-demand pass and
+/// settle. Each job, once done, is counted settled ([`Registry::finish_job`]),
+/// which releases the queries waiting for it.
 // too_many_arguments: the jobs consume every table a bind and its settle
 // batch carve from or record into, as the passes they run do.
 #[allow(clippy::too_many_arguments)]
@@ -291,38 +289,46 @@ fn run_jobs(
     ipc_buf: *mut u64,
 )
 {
-    let (jobs, drivers_dir_cap) = {
+    let (jobs, drivers_dir_cap, bind_dir_cap) = {
         let mut state = registry.lock();
-        (core::mem::take(&mut state.jobs), state.drivers_dir_cap)
+        (
+            core::mem::take(&mut state.jobs),
+            state.drivers_dir_cap,
+            state.bind_dir_cap,
+        )
+    };
+    let mut tables = bind::Carve {
+        caps,
+        irq_range,
+        catalog,
     };
     if jobs.drivers_dir
     {
-        spawn_on_disk_drivers(
+        spawn_dir_drivers(
+            "on-disk batch",
             records,
-            caps,
-            irq_range,
+            &mut tables,
             drivers_dir_cap,
             watch,
-            catalog,
             registry,
             ipc_buf,
         );
+        registry.log_mismatches();
         registry.finish_job(|_| ());
     }
-    if jobs.fault_batch
+    if jobs.bind
     {
-        spawn_test_fault_drivers(caps, drivers_dir_cap, watch, catalog, registry, ipc_buf);
-        registry.finish_job(|_| ());
-    }
-    if jobs.orphan
-    {
-        let result = match test_spawn_orphan(caps, drivers_dir_cap, ipc_buf)
-        {
-            Some(false) => 1,
-            Some(true) => 2,
-            None => 3,
-        };
-        registry.finish_job(|state| state.orphan_test_result = result);
+        spawn_dir_drivers(
+            "on-demand batch",
+            records,
+            &mut tables,
+            bind_dir_cap,
+            watch,
+            registry,
+            ipc_buf,
+        );
+        let _ = syscall::cap_delete(bind_dir_cap);
+        registry.finish_job(|state| state.bind_dir_cap = 0);
     }
 }
 
@@ -333,10 +339,8 @@ struct Jobs
 {
     /// The drivers-directory pass and the on-disk batch's settle.
     drivers_dir: bool,
-    /// TODO(#165): remove with the test labels. The test-only fault batch.
-    fault_batch: bool,
-    /// TODO(#165): remove with the test labels. The test-only orphan spawn.
-    orphan: bool,
+    /// The on-demand pass `BIND_DRIVERS` posts and its batch's settle.
+    bind: bool,
 }
 
 /// What the registry's workers and the control thread share, under
@@ -356,15 +360,10 @@ struct RegistryState
     /// timed degrades gracefully to its no-RTC path. A boot-only class mark
     /// is refused once it is set.
     pass_begun: bool,
-    /// TODO(#165): remove with the test labels. Whether the test-only fault
-    /// batch has been posted: at most once per boot, so the death queue's
-    /// reservation for it holds.
-    fault_spawn_attempted: bool,
-    /// TODO(#165): remove with the devmgr enumeration redesign. Outcome of
-    /// the last `TEST_SPAWN_ORPHAN` trigger, reported by
-    /// `TEST_ORPHAN_RESULT`. 0=not run, 1=spawn failed as expected (#176
-    /// unwind fired), 2=unexpected success, 3=shim setup error.
-    orphan_test_result: u64,
+    /// The directory cap of the `BIND_DRIVERS` request whose pass is posted
+    /// and not yet done, which the control thread deletes once the pass
+    /// ends; 0 when none is, so a request is admitted only then.
+    bind_dir_cap: u64,
 }
 
 /// The device registry: the state the registry's workers serve queries
@@ -393,9 +392,6 @@ struct Registry
     /// The firmware tables and arch authority `QUERY_ACPI_TABLE` and
     /// `QUERY_SHUTDOWN_DEVICE` serve from.
     firmware: Arc<caps::Firmware>,
-    /// The IOMMU devmgr calls, once its driver is ready; `TEST_DMA_FAULTS`
-    /// takes its faults.
-    iommu: OnceLock<Arc<iommu::Iommu>>,
 }
 
 impl Registry
@@ -409,14 +405,12 @@ impl Registry
                 unsettled: 0,
                 drivers_dir_cap: 0,
                 pass_begun: false,
-                fault_spawn_attempted: false,
-                orphan_test_result: 0,
+                bind_dir_cap: 0,
             }),
             settled: Condvar::new(),
             job_note,
             endpoint,
             firmware,
-            iommu: OnceLock::new(),
         }
     }
 
@@ -483,10 +477,11 @@ impl Registry
         self.settled.notify_all();
     }
 
-    /// Whether `decl` may be considered by the drivers-directory pass: a
-    /// declaration of a class a class request marked boot-only is not
+    /// Whether `decl` may be considered by a drivers-directory pass (the
+    /// one `SET_DRIVERS_DIR` posts, or an on-demand one): a declaration of a
+    /// class a class request marked boot-only is not
     /// ([`firmware::binding::class_admits`]). The boot-only marks are fixed
-    /// once the pass is posted.
+    /// once the first pass is posted.
     fn class_admits(&self, decl: &driver_binding::decl::DriverDecl) -> bool
     {
         firmware::binding::class_admits(
@@ -527,7 +522,7 @@ impl Registry
                 // Destroyed but not released: its service endpoint is the
                 // IOMMU client's, which is never deleted.
                 std::os::seraph::log!(
-                    "{}: driver not ready when its batch settled; destroyed",
+                    warn: "{}: driver not ready when its batch settled; destroyed",
                     name.as_str()
                 );
                 spawn::destroy_child(spawned.driver.process_handle, ipc_buf);
@@ -549,7 +544,7 @@ impl Registry
                     "driver reported neither ready nor death before the settle ended; destroyed",
                 ),
             };
-            std::os::seraph::log!("{}: {}", name.as_str(), why);
+            std::os::seraph::log!(warn: "{}: {}", name.as_str(), why);
             driver.withdraw(ipc_buf);
         }
     }
@@ -608,7 +603,7 @@ impl Registry
             Some((None, _record)) =>
             {
                 std::os::seraph::log!(
-                    "iommu: served driver of device {} died (reason={:#x})",
+                    warn: "iommu: served driver of device {} died (reason={:#x})",
                     post.badge,
                     post.reason
                 );
@@ -617,7 +612,7 @@ impl Registry
             Some((Some(class), driver)) =>
             {
                 std::os::seraph::log!(
-                    "{}: served driver of device {} died (reason={:#x}); withdrawn",
+                    warn: "{}: served driver of device {} died (reason={:#x}); withdrawn",
                     class.as_str(),
                     post.badge,
                     post.reason
@@ -660,7 +655,10 @@ impl Registry
             {
                 break;
             };
-            std::os::seraph::log!("{}: its device's IOMMU is gone; withdrawn", class.as_str());
+            std::os::seraph::log!(
+                warn: "{}: its device's IOMMU is gone; withdrawn",
+                class.as_str()
+            );
             driver.withdraw(ipc_buf);
         }
     }
@@ -691,11 +689,11 @@ impl Registry
             match mismatch
             {
                 Mismatch::NoDriver => std::os::seraph::log!(
-                    "class {}: configured; no driver of it is served",
+                    warn: "class {}: configured; no driver of it is served",
                     class.as_str()
                 ),
                 Mismatch::NotConfigured => std::os::seraph::log!(
-                    "class {}: a driver of it is served; no class file configures it",
+                    warn: "class {}: a driver of it is served; no class file configures it",
                     class.as_str()
                 ),
             }
@@ -713,6 +711,18 @@ impl Registry
     fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64)
     {
         let badge = msg.badge;
+        // A client whose SEND carries GRANT (`devmgr.bind`, svcmgr, init) can
+        // move caps here with any label. `SET_DRIVERS_DIR` and `BIND_DRIVERS`
+        // take `caps[0]` and own its release; every other cap a request
+        // carries is released here, so none stays in devmgr's CSpace.
+        let kept = usize::from(matches!(
+            msg.label,
+            ipc::devmgr_labels::SET_DRIVERS_DIR | ipc::devmgr_labels::BIND_DRIVERS
+        ));
+        for &cap in msg.caps().iter().skip(kept)
+        {
+            let _ = syscall::cap_delete(cap);
+        }
         match msg.label
         {
             ipc::devmgr_labels::QUERY_DEVICE =>
@@ -792,174 +802,7 @@ impl Registry
             {
                 handle_query_shutdown_device(&self.firmware, msg, badge, ipc_buf);
             }
-            // TODO(#165): remove with the devmgr enumeration redesign.
-            // Test-only fault injection for #176, gated on
-            // TEST_LABEL_AUTHORITY: ack, and leave the forced-failure spawn
-            // to the control thread, which stashes its outcome for
-            // TEST_ORPHAN_RESULT.
-            ipc::devmgr_labels::TEST_SPAWN_ORPHAN =>
-            {
-                if !test_label_admitted(msg, badge, ipc_buf)
-                {
-                    return;
-                }
-                let posted = Self::post(&mut self.lock(), |j| &mut j.orphan);
-                reply_status(ipc::devmgr_errors::SUCCESS, ipc_buf);
-                if posted
-                {
-                    self.signal_jobs();
-                }
-            }
-            // TODO(#165): report the stashed test-orphan outcome, once every
-            // job posted before it is done.
-            ipc::devmgr_labels::TEST_ORPHAN_RESULT =>
-            {
-                if !test_label_admitted(msg, badge, ipc_buf)
-                {
-                    return;
-                }
-                let result = self.lock_settled(|_| true).orphan_test_result;
-                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-                    .word(0, result)
-                    .build();
-                // SAFETY: ipc_buf is this worker's registered IPC buffer.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-            }
-            // TODO(#165): remove with the test labels. Ack, and leave the
-            // spawn and settle of the fault batch to the control thread, as
-            // SET_DRIVERS_DIR does; a query on the fixtures waits until the
-            // settle has ended.
-            ipc::devmgr_labels::TEST_SPAWN_FAULT_DRIVERS =>
-            {
-                if !test_label_admitted(msg, badge, ipc_buf)
-                {
-                    return;
-                }
-                let posted = {
-                    let mut state = self.lock();
-                    if state.fault_spawn_attempted || state.drivers_dir_cap == 0
-                    {
-                        None
-                    }
-                    else
-                    {
-                        state.fault_spawn_attempted = true;
-                        Some(Self::post(&mut state, |j| &mut j.fault_batch))
-                    }
-                };
-                let Some(posted) = posted
-                else
-                {
-                    reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
-                    return;
-                };
-                reply_status(ipc::devmgr_errors::SUCCESS, ipc_buf);
-                if posted
-                {
-                    self.signal_jobs();
-                }
-            }
-            // TODO(#165): remove with the test labels. Do not `seraph::log!`
-            // here, as in the device queries it mirrors.
-            ipc::devmgr_labels::TEST_QUERY_FAULT_DEVICE =>
-            {
-                if !test_label_admitted(msg, badge, ipc_buf)
-                {
-                    return;
-                }
-                let ordinal = instance_ordinal(msg);
-                let state = self.lock_settled(|s| {
-                    matches!(s.served.lookup(class::TEST_FAULT, ordinal), Lookup::Absent)
-                });
-                reply_served(
-                    state.served.lookup(class::TEST_FAULT, ordinal),
-                    ipc::devmgr_labels::TEST_DENY_BADGE,
-                    ipc::devmgr_errors::NO_DEVICE,
-                    ipc_buf,
-                );
-            }
-            // TODO(#165): remove with the test labels. Do not `seraph::log!`
-            // here, as in the device queries it mirrors.
-            ipc::devmgr_labels::TEST_QUERY_DENY_DEVICE =>
-            {
-                if !test_label_admitted(msg, badge, ipc_buf)
-                {
-                    return;
-                }
-                let Some(class) =
-                    ipc::class_name_of(msg, 1).and_then(|name| core::str::from_utf8(name).ok())
-                else
-                {
-                    reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
-                    return;
-                };
-                let state = self.lock_settled(|s| s.served.first_live(class).is_none());
-                let driver = state.served.first_live(class);
-                reply_deny_send(driver.map_or(0, |d| d.ep), ipc_buf);
-            }
-            // TODO(#165): remove with the test labels. Do not `seraph::log!`
-            // here, as in the device queries it mirrors.
-            ipc::devmgr_labels::TEST_QUERY_DMA_DEVICE =>
-            {
-                if !test_label_admitted(msg, badge, ipc_buf)
-                {
-                    return;
-                }
-                // The fixture is bound by the drivers-directory pass like any
-                // driver whose declaration matches; the reply says whether an
-                // IOMMU confines its device.
-                let state = self.lock_settled(|s| {
-                    matches!(s.served.lookup(class::TEST_DMA, Some(0)), Lookup::Absent)
-                });
-                let fixture = state.served.lookup(class::TEST_DMA, Some(0));
-                let confined = matches!(
-                    fixture,
-                    Lookup::Live(d) if d.dev_caps.as_ref().is_some_and(bind::PciDeviceCaps::confined)
-                );
-                let mode = if confined
-                {
-                    ipc::devmgr_labels::TEST_DMA_CONFINED
-                }
-                else
-                {
-                    ipc::devmgr_labels::TEST_DMA_UNCONFINED
-                };
-                reply_served_words(
-                    fixture,
-                    ipc::devmgr_labels::TEST_DENY_BADGE,
-                    ipc::devmgr_errors::NO_DEVICE,
-                    &[mode],
-                    ipc_buf,
-                );
-            }
-            // TODO(#165): remove with the test labels.
-            ipc::devmgr_labels::TEST_DMA_FAULTS =>
-            {
-                if !test_label_admitted(msg, badge, ipc_buf)
-                {
-                    return;
-                }
-                let rid = self
-                    .lock_settled(|s| s.served.first_live(class::TEST_DMA).is_none())
-                    .served
-                    .first_live(class::TEST_DMA)
-                    .and_then(|d| d.dev_caps.as_ref())
-                    .map(|c| c.requester_id);
-                let Some(rid) = rid
-                else
-                {
-                    reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
-                    return;
-                };
-                // Outside the lock: the take calls the IOMMU driver.
-                let (count, last) = self.iommu.get().map_or((0, 0), |i| i.log_faults(rid));
-                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-                    .word(0, count)
-                    .word(1, last)
-                    .build();
-                // SAFETY: ipc_buf is this worker's registered IPC buffer.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-            }
+            ipc::devmgr_labels::BIND_DRIVERS => self.bind_drivers(msg, ipc_buf),
             // QUERY_DEVICE_INFO and DRIVER_READY included: drivers send both
             // on their settle batch's private endpoint, never here.
             _ => reply_status(ipc::devmgr_errors::UNKNOWN_OPCODE, ipc_buf),
@@ -983,7 +826,9 @@ impl Registry
         };
         if msg.badge & ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY == 0
         {
-            std::os::seraph::log!("SET_DRIVERS_DIR rejected: badge lacks DRIVERS_DIR_AUTHORITY");
+            std::os::seraph::log!(
+                warn: "SET_DRIVERS_DIR rejected: badge lacks DRIVERS_DIR_AUTHORITY"
+            );
             release();
             reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
             return;
@@ -1028,53 +873,69 @@ impl Registry
             self.signal_jobs();
         }
     }
+
+    /// `BIND_DRIVERS`: keep the directory cap it carries, reply, and post the
+    /// on-demand pass over it, which the control thread runs and which
+    /// deletes the cap once it ends. Admitted only once `SET_DRIVERS_DIR`
+    /// has delivered the drivers directory, whose pass binds first, and while
+    /// no earlier request's pass is posted; every rejection releases the cap
+    /// before it replies.
+    fn bind_drivers(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    {
+        let delivered_cap = msg.caps().first().copied();
+        let refuse = |code| {
+            if let Some(c) = delivered_cap
+            {
+                let _ = syscall::cap_delete(c);
+            }
+            reply_status(code, ipc_buf);
+        };
+        if msg.badge & ipc::devmgr_labels::BIND_AUTHORITY == 0
+        {
+            refuse(ipc::devmgr_errors::UNAUTHORIZED);
+            return;
+        }
+        if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+        {
+            refuse(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
+            return;
+        }
+        let Some(dir_cap) = delivered_cap
+        else
+        {
+            refuse(ipc::devmgr_errors::INVALID_REQUEST);
+            return;
+        };
+        let posted = {
+            let mut state = self.lock();
+            if state.drivers_dir_cap == 0 || state.bind_dir_cap != 0
+            {
+                false
+            }
+            else
+            {
+                state.bind_dir_cap = dir_cap;
+                Self::post(&mut state, |j| &mut j.bind)
+            }
+        };
+        if !posted
+        {
+            refuse(ipc::devmgr_errors::INVALID_REQUEST);
+            return;
+        }
+        reply_status(ipc::devmgr_errors::SUCCESS, ipc_buf);
+        self.signal_jobs();
+    }
 }
 
 /// The IOMMU drivers a boot can spawn: one, of the architecture's family.
 const IOMMU_DRIVERS: usize = 1;
-
-/// The class names devmgr itself names: those its test labels look up. A driver bound
-/// by declaration is served under the class its declaration names, which
-/// devmgr does not interpret (docs/driver-binding.md § Device Classes).
-mod class
-{
-    /// TODO(#165): remove with the test labels.
-    pub const TEST_FAULT: &str = "test-fault";
-    /// TODO(#165): remove with the test labels.
-    pub const TEST_DMA: &str = "test-dma";
-}
-
-/// The driver devmgr starts on a fixed path, by name and the class it is
-/// served under: the test-only fault fixture until P5 of #165 binds it by
-/// declaration (docs/driver-binding.md § Status).
-mod fixed
-{
-    use driver_binding::decl::{ClassName, DriverName};
-
-    /// TODO(#165): remove with the test labels.
-    pub const TEST_FAULT: (DriverName, ClassName) = (
-        DriverName::literal_key("test-fault"),
-        ClassName::literal_class(super::class::TEST_FAULT),
-    );
-}
 
 /// Reply to a device query with a `SEND_GRANT` badged `verb_bits` on the
 /// service endpoint of the served driver `lookup` names; `WITHDRAWN` when
 /// that driver was withdrawn, `absent` when no driver is served there, and
 /// `INVALID_REQUEST` when the derivation fails.
 fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, ipc_buf: *mut u64)
-{
-    reply_served_words(lookup, verb_bits, absent, &[], ipc_buf);
-}
-
-/// [`reply_served`], the success reply also carrying `words`.
-fn reply_served_words(
-    lookup: Lookup<'_, ServedDriver>,
-    verb_bits: u64,
-    absent: u64,
-    words: &[u64],
-    ipc_buf: *mut u64,
-)
 {
     let driver = match lookup
     {
@@ -1089,7 +950,6 @@ fn reply_served_words(
         return reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
     };
     let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-        .words(0, words)
         .cap(derived)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -1137,29 +997,7 @@ fn mint_class_send(
     syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_EP_SEND, badge).map_err(|_| invalid)
 }
 
-/// TODO(#165): remove with the test labels. Admit a request on a test label
-/// (`TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, `TEST_QUERY_DENY_DEVICE`,
-/// `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`,
-/// `TEST_QUERY_DMA_DEVICE`, `TEST_DMA_FAULTS`): the badge
-/// carries `TEST_LABEL_AUTHORITY` and `data[0]` is `DEVMGR_LABELS_VERSION`.
-/// Otherwise reply the rejection and return `false`.
-fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
-{
-    if badge & ipc::devmgr_labels::TEST_LABEL_AUTHORITY == 0
-    {
-        reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
-        return false;
-    }
-    if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
-    {
-        reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-        return false;
-    }
-    true
-}
-
-/// The instance ordinal a `QUERY_DEVICE` or `TEST_QUERY_FAULT_DEVICE`
-/// request selects: `data[1]` when sent, else 0, the first instance.
+/// The instance ordinal a `QUERY_DEVICE` request selects: `data[1]` when sent, else 0, the first instance.
 /// `None` for an ordinal no `usize` holds, which no instance has.
 fn instance_ordinal(msg: &IpcMessage) -> Option<usize>
 {
@@ -1216,41 +1054,13 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
         }
     }
-}
-
-/// TODO(#165): remove with `TEST_QUERY_DENY_DEVICE`. Reply with a SEND on
-/// `driver_ep` badged `TEST_DENY_BADGE`, which carries none of the driver's
-/// verb bits; `NO_DEVICE` when the driver is not running (`driver_ep == 0`)
-/// and `INVALID_REQUEST` when the derive fails.
-fn reply_deny_send(driver_ep: u64, ipc_buf: *mut u64)
-{
-    if driver_ep == 0
-    {
-        reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
-        return;
-    }
-    let Ok(derived) = syscall::cap_derive_badge(
-        driver_ep,
-        syscall::RIGHTS_EP_SEND,
-        ipc::devmgr_labels::TEST_DENY_BADGE,
-    )
-    else
-    {
-        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
-        return;
-    };
-    let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-        .cap(derived)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// Send a bodyless status reply (no caps) on the current request.
@@ -1349,7 +1159,7 @@ fn enumerate_ecam(
 ) -> bool
 {
     std::os::seraph::log!(
-        "devmgr: ECAM segment {} phys={:#x} size={:#x} buses {}..={}",
+        debug: "devmgr: ECAM segment {} phys={:#x} size={:#x} buses {}..={}",
         loc.segment,
         loc.phys_base,
         loc.size,
@@ -1362,7 +1172,7 @@ fn enumerate_ecam(
     else
     {
         std::os::seraph::log!(
-            "no aperture covers ECAM segment {}; not scanned",
+            warn: "no aperture covers ECAM segment {}; not scanned",
             loc.segment
         );
         return false;
@@ -1386,7 +1196,7 @@ fn enumerate_ecam(
     let Some(scanned) = scanned
     else
     {
-        std::os::seraph::log!("ECAM segment {} not scanned", loc.segment);
+        std::os::seraph::log!(warn: "ECAM segment {} not scanned", loc.segment);
         return false;
     };
     keep_ecam(caps, loc, ecam_cap);
@@ -1394,7 +1204,7 @@ fn enumerate_ecam(
     {
         let (seg, bus, dev, func) = stop.bdf;
         std::os::seraph::log!(
-            "PCI scan stopped at {}:{}:{}.{}: no memory for the device list",
+            warn: "PCI scan stopped at {}:{}:{}.{}: no memory for the device list",
             seg,
             bus,
             dev,
@@ -1426,13 +1236,13 @@ fn with_mmio_mapped<R>(
     let Ok(range) = reserve_pages(pages)
     else
     {
-        std::os::seraph::log!("{}: no VA to map it", what);
+        std::os::seraph::log!(warn: "{}: no VA to map it", what);
         return None;
     };
     let va = range.va_start();
     if !std::os::seraph::fund_aspace_pt_budget(aspace, pages)
     {
-        std::os::seraph::log!("{}: page-table budget not funded", what);
+        std::os::seraph::log!(warn: "{}: page-table budget not funded", what);
         unreserve_pages(range);
         return None;
     }
@@ -1443,7 +1253,7 @@ fn with_mmio_mapped<R>(
     // unmap below (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(aspace, cap, va, 0) }.is_err()
     {
-        std::os::seraph::log!("{}: mapping failed", what);
+        std::os::seraph::log!(warn: "{}: mapping failed", what);
         unreserve_pages(range);
         return None;
     }
@@ -1474,7 +1284,7 @@ fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap
     else
     {
         std::os::seraph::log!(
-            "ECAM segment {}: configuration space not kept; its devices get no driver",
+            warn: "ECAM segment {}: configuration space not kept; its devices get no driver",
             loc.segment
         );
     }
@@ -1506,7 +1316,7 @@ pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Opti
         Err(e) =>
         {
             std::os::seraph::log!(
-                "MMIO carve of {:#x}+{:#x} failed ({}); remainders kept",
+                warn: "MMIO carve of {:#x}+{:#x} failed ({}); remainders kept",
                 phys,
                 size,
                 if e == CarveError::NoMemory
@@ -1560,7 +1370,7 @@ impl IrqRangeAllocator
         // A range cap starts at line 0 (init derives it from the root range).
         if range_slot != 0 && ranges.insert(range_slot, 0, Self::RANGE_END_BOUND) != Ok(true)
         {
-            std::os::seraph::log!("IRQ range not recorded (no memory); no device IRQs");
+            std::os::seraph::log!(warn: "IRQ range not recorded (no memory); no device IRQs");
         }
         Self {
             ranges,
@@ -1717,9 +1527,9 @@ impl DeviceCatalog
 
     /// Append an entry that carries no startup info and return its badge,
     /// or `None` when the catalog cannot grow: the device badge of a driver
-    /// that fetches no runtime metadata (serial, RTC, the test-only
-    /// `test-fault` fixtures), so its ready report
-    /// and death post name it like every other driver's.
+    /// that fetches no runtime metadata (serial, RTC, and a driver bound to
+    /// a PCI function presenting no `VirtIO` register layout), so its ready
+    /// report and death post name it like every other driver's.
     pub fn add_without_info(&mut self) -> Option<u64>
     {
         self.add(NO_INFO_KIND, 0, &[])
@@ -1838,7 +1648,7 @@ fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ip
     if let Err(spawned) = roster.add(spawned.badge, spawned)
     {
         std::os::seraph::log!(
-            "{}: driver not recorded; device not served",
+            warn: "{}: driver not recorded; device not served",
             spawned.name.as_str()
         );
         spawned.driver.withdraw(ipc_buf);
@@ -1868,17 +1678,6 @@ struct ServedDrivers
 
 impl ServedDrivers
 {
-    /// The driver at `ordinal` of `class`; [`Lookup::Absent`] when no driver
-    /// of the class is served there or `ordinal` is `None`.
-    fn lookup(&self, class: &str, ordinal: Option<usize>) -> Lookup<'_, ServedDriver>
-    {
-        match (self.classes.get(class), ordinal)
-        {
-            (Some(served), Some(i)) => served.get(i),
-            _ => Lookup::Absent,
-        }
-    }
-
     /// The driver at `ordinal` of the class in table slot `slot`;
     /// [`Lookup::Absent`] when there is none.
     fn slot_lookup(&self, slot: usize, ordinal: Option<usize>) -> Lookup<'_, ServedDriver>
@@ -1888,12 +1687,6 @@ impl ServedDrivers
             (Some(served), Some(i)) => served.get(i),
             _ => Lookup::Absent,
         }
-    }
-
-    /// The first live driver of `class`.
-    fn first_live(&self, class: &str) -> Option<&ServedDriver>
-    {
-        self.classes.get(class).and_then(Served::first_live)
     }
 
     /// Whether the IOMMU driver has failed, so a confined device's driver
@@ -1974,7 +1767,7 @@ fn settle_batch(
     if end == firmware::roster::SettleEnd::TimedOut
     {
         std::os::seraph::log!(
-            "settle: bound of {} ms elapsed with drivers pending",
+            warn: "settle: bound of {} ms elapsed with drivers pending",
             u64::try_from(bound.as_millis()).unwrap_or(u64::MAX)
         );
     }
@@ -2003,7 +1796,7 @@ fn spawn_boot_drivers(
     let Some(batch) = settle::SettleBatch::new()
     else
     {
-        std::os::seraph::log!("boot batch: no settle batch; no driver spawned");
+        std::os::seraph::log!(warn: "boot batch: no settle batch; no driver spawned");
         // A retained module cap pins the pool run init donated it from.
         for (_, module) in modules
         {
@@ -2048,24 +1841,20 @@ fn create_service_endpoint() -> Option<u64>
     })
 }
 
-/// Spawn and settle the on-disk batch, on the control thread, as the job
-/// `SET_DRIVERS_DIR` posts: the drivers-directory pass over the records no
-/// boot driver was bound to ([`bind::drivers_dir_pass`]), each binary read
-/// through `drivers_dir_cap`, the `LOOKUP | READ | READDIR`-attenuated
-/// `/services/drivers/` subtree cap svcmgr delivered (namespace-protocol
-/// rights, not kernel cap rights). A driver not spawned, or not ready when
-/// the batch settles, is never served, and its device's carved caps are
-/// released.
-// too_many_arguments: the batch spans every bind of the pass; each argument
-// is state one of its spawns consumes.
-#[allow(clippy::too_many_arguments)]
-fn spawn_on_disk_drivers(
+/// Spawn and settle the batch of a drivers-directory pass, on the control
+/// thread, as the job `SET_DRIVERS_DIR` or `BIND_DRIVERS` posts: the pass
+/// over the records no earlier driver was bound to
+/// ([`bind::drivers_dir_pass`]), each binary read through `dir_cap`, the
+/// `LOOKUP | READ | READDIR`-attenuated directory cap the request delivered
+/// (namespace-protocol rights, not kernel cap rights). A driver not spawned,
+/// or not ready when the batch settles, is never served, and its device's
+/// carved caps are released. `what` names the batch in a log line.
+fn spawn_dir_drivers(
+    what: &str,
     records: &mut bind::Records,
-    caps: &mut caps::DevmgrCaps,
-    irq_range: &mut IrqRangeAllocator,
-    drivers_dir_cap: u64,
+    carve: &mut bind::Carve,
+    dir_cap: u64,
     watch: &mut settle::DriverWatch,
-    catalog: &mut DeviceCatalog,
     registry: &Registry,
     ipc_buf: *mut u64,
 )
@@ -2073,20 +1862,16 @@ fn spawn_on_disk_drivers(
     let Some(batch) = settle::SettleBatch::new()
     else
     {
-        std::os::seraph::log!("on-disk batch: no settle batch; no driver spawned");
+        std::os::seraph::log!(warn: "{}: no settle batch; no driver spawned", what);
         return;
     };
     let mut roster = Roster::new();
     let death_eq = watch.death_eq();
     bind::drivers_dir_pass(
         records,
-        drivers_dir_cap,
+        dir_cap,
         |decl| registry.class_admits(decl),
-        &mut bind::Carve {
-            caps,
-            irq_range,
-            catalog,
-        },
+        carve,
         &mut bind::Pass {
             batch: &batch,
             death_eq,
@@ -2098,296 +1883,11 @@ fn spawn_on_disk_drivers(
         batch,
         roster,
         watch,
-        catalog,
+        carve.catalog,
         registry,
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
-    registry.log_mismatches();
-}
-
-// ── Test-only simple-device spawns ──────────────────────────────────────────
-
-/// The per-driver objects of one simple-device spawn: the device badge of
-/// its catalog entry, the service endpoint devmgr owns, and the driver's
-/// devmgr query cap (a SEND badged with the device badge on the batch's
-/// private endpoint).
-struct SimpleDeviceSlots
-{
-    device_badge: u64,
-    service_ep: u64,
-    query_ep: u64,
-}
-
-impl SimpleDeviceSlots
-{
-    /// Create the service endpoint and the query cap for the catalog entry
-    /// under `device_badge`. Returns `None`, logged under `name` and with
-    /// what it created released, when either cannot be created.
-    fn new(name: &str, device_badge: u64, batch: &settle::SettleBatch) -> Option<Self>
-    {
-        let Some(service_ep) = create_service_endpoint()
-        else
-        {
-            std::os::seraph::log!("{}: failed to create service endpoint", name);
-            return None;
-        };
-        let Ok(query_ep) =
-            syscall::cap_derive_badge(batch.driver_ep(), syscall::RIGHTS_EP_SEND, device_badge)
-        else
-        {
-            std::os::seraph::log!("{}: failed to derive the badged query cap", name);
-            let _ = syscall::cap_delete(service_ep);
-            return None;
-        };
-        Some(Self {
-            device_badge,
-            service_ep,
-            query_ep,
-        })
-    }
-
-    /// Release both caps of a spawn that never reached
-    /// [`spawn::spawn_simple_device`].
-    fn release(&self)
-    {
-        let _ = syscall::cap_delete(self.query_ep);
-        let _ = syscall::cap_delete(self.service_ep);
-    }
-}
-
-/// Spawn one simple-device driver through `config` (whose service endpoint,
-/// query cap, and device badge are `slots`') and record it in `roster` as
-/// `driver`, a name and the class it is served under. On a failed spawn the
-/// service endpoint is released; the spawn path released the rest.
-fn spawn_simple_into(
-    driver: (DriverName, ClassName),
-    config: &spawn::SimpleSpawnConfig,
-    slots: &SimpleDeviceSlots,
-    roster: &mut Roster<SpawnedDriver>,
-    ipc_buf: *mut u64,
-)
-{
-    let (name, class) = driver;
-    if let Some(process_handle) = spawn::spawn_simple_device(config, ipc_buf)
-    {
-        std::os::seraph::log!("devmgr: {} driver spawned", name.as_str());
-        let spawned = SpawnedDriver {
-            name,
-            serves: Serves::Class(class),
-            badge: slots.device_badge,
-            driver: ServedDriver {
-                ep: slots.service_ep,
-                dev_caps: None,
-                platform_caps: None,
-                process_handle,
-            },
-        };
-        record_spawned(roster, spawned, ipc_buf);
-    }
-    else
-    {
-        let _ = syscall::cap_delete(slots.service_ep);
-    }
-}
-
-/// TODO(#165): remove with the devmgr enumeration redesign.
-///
-/// Spawn and settle the test-only fault batch: three `test-fault` fixtures
-/// from `/services/drivers/`, two that report ready and one that never does,
-/// in one settle batch bounded by `TEST_FAULT_SETTLE_TIMEOUT_MS`, served as
-/// the `test-fault` class. svctest observes the never-ready fixture withdrawn
-/// and destroyed at the bound, then makes a served one die and observes its
-/// withdrawal and tombstone.
-fn spawn_test_fault_drivers(
-    caps: &mut caps::DevmgrCaps,
-    drivers_dir_cap: u64,
-    watch: &mut settle::DriverWatch,
-    catalog: &mut DeviceCatalog,
-    registry: &Registry,
-    ipc_buf: *mut u64,
-)
-{
-    use ipc::test_fault_labels::{MODE_NEVER_READY, MODE_READY};
-
-    let Some(batch) = settle::SettleBatch::new()
-    else
-    {
-        std::os::seraph::log!("test-fault: no settle batch; no fixture spawned");
-        return;
-    };
-    let mut roster = Roster::new();
-    let death_eq = watch.death_eq();
-    for mode in [MODE_READY, MODE_READY, MODE_NEVER_READY]
-    {
-        spawn_one_test_fault(
-            caps,
-            drivers_dir_cap,
-            mode,
-            &batch,
-            death_eq,
-            &mut roster,
-            catalog,
-            ipc_buf,
-        );
-    }
-    let bound = core::time::Duration::from_millis(ipc::devmgr_labels::TEST_FAULT_SETTLE_TIMEOUT_MS);
-    settle_batch(batch, roster, watch, catalog, registry, bound, ipc_buf);
-}
-
-/// TODO(#165): remove with [`spawn_test_fault_drivers`]. Spawn one
-/// `test-fault` fixture in `mode` into the settle `batch`, recording it in
-/// `roster`; its hardware cap is a throwaway endpoint, since the fixture
-/// drives no device.
-// too_many_arguments: the fixture's mode, the batch's objects, and the
-// roster are each consumed per spawn, as for the production spawns.
-#[allow(clippy::too_many_arguments)]
-fn spawn_one_test_fault(
-    caps: &caps::DevmgrCaps,
-    drivers_dir_cap: u64,
-    mode: u64,
-    batch: &settle::SettleBatch,
-    death_eq: u64,
-    roster: &mut Roster<SpawnedDriver>,
-    catalog: &mut DeviceCatalog,
-    ipc_buf: *mut u64,
-)
-{
-    if roster.try_reserve_one().is_err()
-    {
-        std::os::seraph::log!("test-fault: no memory to record a fixture; not spawned");
-        return;
-    }
-    let Some(device_badge) = catalog.add_without_info()
-    else
-    {
-        std::os::seraph::log!("test-fault: catalog entry not added; not spawned");
-        return;
-    };
-    let requested_rights = u64::from(namespace_protocol::rights::READ);
-    // SAFETY: `ipc_buf` is the control thread's IPC buffer (`info.ipc_buffer`,
-    // registered at startup), passed down unchanged.
-    let Some(walked) = (unsafe {
-        ns_client::walk_to_file(drivers_dir_cap, b"test-fault", requested_rights, ipc_buf)
-    })
-    else
-    {
-        std::os::seraph::log!("test-fault: walk_to_file failed (binary missing on rootfs)");
-        return;
-    };
-    let Some(slots) = SimpleDeviceSlots::new("test-fault", device_badge, batch)
-    else
-    {
-        let _ = syscall::cap_delete(walked.file_cap);
-        return;
-    };
-    let Some(hw_cap) = create_service_endpoint()
-    else
-    {
-        std::os::seraph::log!("test-fault: no placeholder hardware cap");
-        let _ = syscall::cap_delete(walked.file_cap);
-        slots.release();
-        return;
-    };
-    let words = [mode];
-    let config = spawn::SimpleSpawnConfig {
-        procmgr_ep: caps.procmgr_ep,
-        bootstrap_ep: caps.self_bootstrap_ep,
-        source: spawn::CreateSource::File {
-            file_cap: walked.file_cap,
-            size: walked.size,
-        },
-        service_ep: slots.service_ep,
-        hw_cap,
-        irq_cap: 0,
-        query_ep: slots.query_ep,
-        death_eq: Some(death_eq),
-        device_badge,
-        round1_words: &words,
-        priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
-    };
-    spawn_simple_into(fixed::TEST_FAULT, &config, &slots, roster, ipc_buf);
-}
-
-/// TODO(#165): remove with the devmgr enumeration redesign.
-///
-/// Fault-injection shim for #176: spawn the on-disk `test-orphan` driver via
-/// the normal [`spawn::spawn_simple_device`] path, where the driver
-/// deliberately fails its round-2 request. The spawn helper's
-/// orphan-teardown then destroys the child, returning its pages to memmgr.
-///
-/// Returns `Some(false)` when the spawn failed as designed (the unwind ran),
-/// `Some(true)` if it unexpectedly succeeded, and `None` if the shim could not
-/// be set up (driver binary absent, or endpoint/cap minting failed).
-fn test_spawn_orphan(
-    caps: &mut caps::DevmgrCaps,
-    drivers_dir_cap: u64,
-    ipc_buf: *mut u64,
-) -> Option<bool>
-{
-    /// Arbitrary non-zero badge for the round-2 query cap; the round-2
-    /// failure means it is never delivered.
-    const QUERY_BADGE: u64 = 0x7E57;
-
-    let requested_rights = u64::from(namespace_protocol::rights::READ);
-    // SAFETY: `ipc_buf` is the control thread's IPC buffer (`info.ipc_buffer`,
-    // registered at startup), passed down unchanged.
-    let walked = unsafe {
-        ns_client::walk_to_file(drivers_dir_cap, b"test-orphan", requested_rights, ipc_buf)
-    }?;
-
-    // Throwaway service + hw endpoints handed to the child in round 1. Ownership
-    // of `hw_cap` transfers to `spawn_simple_device` (moved into the child or
-    // deleted on failure); `service_ep` is retained here and released below.
-    let service_ep = create_service_endpoint().unwrap_or(0);
-    let hw_cap = create_service_endpoint().unwrap_or(0);
-    let query_ep =
-        syscall::cap_derive_badge(caps.registry_ep, syscall::RIGHTS_EP_SEND, QUERY_BADGE)
-            .unwrap_or(0);
-    if service_ep == 0 || hw_cap == 0 || query_ep == 0
-    {
-        std::os::seraph::log!("test-orphan: failed to mint shim caps");
-        let _ = syscall::cap_delete(walked.file_cap);
-        for cap in [service_ep, hw_cap, query_ep]
-        {
-            if cap != 0
-            {
-                let _ = syscall::cap_delete(cap);
-            }
-        }
-        return None;
-    }
-
-    let config = spawn::SimpleSpawnConfig {
-        procmgr_ep: caps.procmgr_ep,
-        bootstrap_ep: caps.self_bootstrap_ep,
-        source: spawn::CreateSource::File {
-            file_cap: walked.file_cap,
-            size: walked.size,
-        },
-        service_ep,
-        hw_cap,
-        irq_cap: 0,
-        query_ep,
-        // The child never runs past its bootstrap: no death observer.
-        death_eq: None,
-        device_badge: QUERY_BADGE,
-        round1_words: &[],
-        // Scheduling unspecified: procmgr defaults; the child is torn down anyway.
-        priority: 0,
-    };
-    let spawned = spawn::spawn_simple_device(&config, ipc_buf);
-
-    // `spawn_simple_device` owns `hw_cap` and `query_ep` (moved into the child
-    // or released on failure). devmgr still holds the original `service_ep` —
-    // there is no live driver to keep it for, so release it. An unexpected
-    // success leaves a running child; destroy it.
-    let _ = syscall::cap_delete(service_ep);
-    if let Some(process_handle) = spawned
-    {
-        spawn::destroy_child(process_handle, ipc_buf);
-    }
-    Some(spawned.is_some())
 }
 
 /// Halt when devmgr's own address space cap carries `RIGHTS_AS_READ`, or
@@ -2405,12 +1905,12 @@ fn refuse_translatable_aspace(self_aspace: u64)
         {}
         Ok(_) =>
         {
-            std::os::seraph::log!("own address space carries RIGHTS_AS_READ, halting");
+            std::os::seraph::log!(error: "own address space carries RIGHTS_AS_READ, halting");
             halt_loop();
         }
         Err(e) =>
         {
-            std::os::seraph::log!("own address space rights unreadable ({e}), halting");
+            std::os::seraph::log!(error: "own address space rights unreadable ({e}), halting");
             halt_loop();
         }
     }

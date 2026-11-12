@@ -97,11 +97,16 @@ jobs:
         # re-mirrors rootfs, which would restore terminal.svc. ktest swaps the
         # bundle's `init` entry via `cargo xtask compose-bundle --harness
         # ktest`, which repacks the disk image as part of the compose step.
+        # The svctest cell also stages the test-only device class files of
+        # `sysroot/config/devmgr/tests/` into `classes/`, and its boots attach
+        # the test devices (`--test-devices`, below) the test-only drivers bind.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
               cp sysroot/config/svcmgr/tests/svctest.svc \
                  sysroot/config/svcmgr/services/
+              cp sysroot/config/devmgr/tests/*.class \
+                 sysroot/config/devmgr/classes/
               rm -f sysroot/config/svcmgr/services/terminal.svc
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
               ;;
@@ -140,9 +145,14 @@ jobs:
             x86_64-release-ktest)     budget=480 ;;  # worst pass 144.7 s
             *) echo "no budget for this cell" >&2; exit 1 ;;
           esac
+          # The svctest boots attach the test devices its devmgr phases drive.
+          test_devices=
+          if [ "${{ matrix.tester }}" = "svctest" ]; then
+            test_devices=--test-devices
+          fi
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
-            --parallel 2 --runs 20 --timeout "$budget"
+            --parallel 2 --runs 20 --timeout "$budget" $test_devices
 
       - name: Upload run-parallel logs
         if: always()

@@ -183,7 +183,7 @@ pub struct SvcmgrCaps
     pub rootfs_root: u64,
     /// `SEND|GRANT`, badge-0 source on devmgr's registry endpoint. svcmgr
     /// mints the seed-only `devmgr.registry`, `devmgr.shutdown`, and
-    /// `devmgr.test` publish caps, the `CLASS_AUTHORITY` SEND it requests the
+    /// `devmgr.bind` publish caps, the `CLASS_AUTHORITY` SEND it requests the
     /// `devmgr.class.*` class SENDs with, and the `SET_DRIVERS_DIR` cap
     /// (`DRIVERS_DIR_AUTHORITY`) from it. Zero if absent.
     pub devmgr_registry: u64,
@@ -257,12 +257,12 @@ pub fn bootstrap_caps(
                     }
                     Err(DecodeError::VersionMismatch) =>
                     {
-                        std::os::seraph::log!("bootstrap: endowment version mismatch");
+                        std::os::seraph::log!(warn: "bootstrap: endowment version mismatch");
                         return None;
                     }
                     Err(DecodeError::Malformed) =>
                     {
-                        std::os::seraph::log!("bootstrap: malformed endowment CAPS round");
+                        std::os::seraph::log!(warn: "bootstrap: malformed endowment CAPS round");
                         return None;
                     }
                 }
@@ -293,7 +293,7 @@ pub fn bootstrap_caps(
                         if decoded.is_err()
                         {
                             std::os::seraph::log!(
-                                "bootstrap: malformed endowment LOGD_SOURCES round"
+                                warn: "bootstrap: malformed endowment LOGD_SOURCES round"
                             );
                         }
                         for &cap in delivered
@@ -307,7 +307,7 @@ pub fn bootstrap_caps(
             {
                 // A round of a kind svcmgr does not know: its caps have no
                 // role here, so release them rather than hold them.
-                std::os::seraph::log!("bootstrap: unknown endowment kind {other}");
+                std::os::seraph::log!(warn: "bootstrap: unknown endowment kind {other}");
                 for &cap in &round.caps[..round.cap_count]
                 {
                     let _ = syscall::cap_delete(cap);
@@ -356,14 +356,14 @@ fn ingest_substrate(round: &ipc::bootstrap::BootstrapRound, pending: &mut Vec<Pe
         .and_then(|words| ipc::svcmgr_labels::unpack_name(words, name_len))
     else
     {
-        std::os::seraph::log!("bootstrap: substrate name invalid");
+        std::os::seraph::log!(warn: "bootstrap: substrate name invalid");
         reject(thread_cap);
         return;
     };
     let Ok(name) = core::str::from_utf8(&bytes[..name_len])
     else
     {
-        std::os::seraph::log!("bootstrap: substrate name invalid");
+        std::os::seraph::log!(warn: "bootstrap: substrate name invalid");
         reject(thread_cap);
         return;
     };
@@ -371,7 +371,7 @@ fn ingest_substrate(round: &ipc::bootstrap::BootstrapRound, pending: &mut Vec<Pe
     else
     {
         std::os::seraph::log!(
-            "bootstrap: no memory for a pending registration; dropping substrate"
+            warn: "bootstrap: no memory for a pending registration; dropping substrate"
         );
         reject(thread_cap);
         return;

@@ -8,8 +8,8 @@
 //! Creates driver processes via procmgr, then serves the driver's bootstrap
 //! over IPC to deliver its per-device capability set: for a driver bound to
 //! a device, the device's resource list ([`driver_binding::resources`]); for
-//! the IOMMU driver and the test-only fault fixture, their own rounds. log +
-//! procmgr caps arrive via `ProcessInfo` and are not part of this protocol.
+//! the IOMMU driver, its own rounds. log + procmgr caps arrive via
+//! `ProcessInfo` and are not part of this protocol.
 
 use driver_binding::resources::{END_SLOTS, Endpoints, Resource, Round};
 use ipc::{IpcMessage, procmgr_labels};
@@ -17,10 +17,10 @@ use ipc::{IpcMessage, procmgr_labels};
 /// Source the child's ELF binary is loaded from: a boot module devmgr holds
 /// (the drivers the boot bundle carries) carries a procmgr Memory cap and
 /// uses [`CreateSource::Module`]; a driver loaded from the rootfs (walked by
-/// devmgr through its `SET_DRIVERS_DIR` subtree cap) carries a vfsd file
-/// SEND cap plus a size hint and uses [`CreateSource::File`]. The variant
-/// decides the procmgr request label and payload shape; the rest of
-/// [`spawn_simple_device`] and [`spawn_bound_driver`] — service-endpoint
+/// devmgr through the directory cap of `SET_DRIVERS_DIR` or `BIND_DRIVERS`)
+/// carries a vfsd file SEND cap plus a size hint and uses
+/// [`CreateSource::File`]. The variant decides the procmgr request label and
+/// payload shape; the rest of [`spawn_bound_driver`] — service-endpoint
 /// derivation, `START_PROCESS`, bootstrap rounds — is identical across both
 /// sources.
 #[derive(Clone, Copy)]
@@ -29,13 +29,13 @@ pub enum CreateSource
     /// Memory cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
     /// A `CREATE_PROCESS` `ipc_call` transfers the cap to procmgr (which deletes
     /// it on both success and failure). On any failure BEFORE that transfer,
-    /// [`spawn_simple_device`] deletes the cap on the caller's behalf — a
+    /// [`spawn_bound_driver`] deletes the cap on the caller's behalf — a
     /// retained boot-module cap is a live derivation child of init's donated
     /// pool-run source and pins that run unsplittable.
     Module(u64),
     /// vfsd file SEND cap (`procmgr_labels::CREATE_FROM_FILE`). `size` is
     /// the file size hint reported by the resolving `NS_LOOKUP`. On any
-    /// pre-`ipc_call` failure inside [`spawn_simple_device`], the function
+    /// pre-`ipc_call` failure inside [`spawn_bound_driver`], the function
     /// deletes the file cap on the caller's behalf — the cap was just
     /// derived by the namespace walk and has no retry value.
     File
@@ -217,7 +217,7 @@ pub fn destroy_and_release(child: HeldChild, ipc_buf: *mut u64)
     let released = unsafe { ipc::ipc_call(child.release_token, &release_msg, ipc_buf) };
     if !matches!(released, Ok(r) if r.label == 0)
     {
-        std::os::seraph::log!("driver memory hold not released");
+        std::os::seraph::log!(warn: "driver memory hold not released");
     }
     let _ = syscall::cap_delete(child.process_handle);
     let _ = syscall::cap_delete(child.release_token);
@@ -376,20 +376,20 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
 
     if config.resources.len() > MAX_BOUND_RESOURCES
     {
-        std::os::seraph::log!("driver spawn: more than {} resources", MAX_BOUND_RESOURCES);
+        std::os::seraph::log!(warn: "driver spawn: more than {} resources", MAX_BOUND_RESOURCES);
         return DriverSpawn::Failed;
     }
     let Some(child_badge) = mint_bootstrap_badge()
     else
     {
-        std::os::seraph::log!("driver spawn: entropy draw failed");
+        std::os::seraph::log!(warn: "driver spawn: entropy draw failed");
         return DriverSpawn::Failed;
     };
     let Ok(badged_creator) =
         syscall::cap_derive_badge(config.bootstrap_ep, syscall::RIGHTS_EP_SEND, child_badge)
     else
     {
-        std::os::seraph::log!("driver spawn: badged creator derivation failed");
+        std::os::seraph::log!(warn: "driver spawn: badged creator derivation failed");
         return DriverSpawn::Failed;
     };
 
@@ -425,7 +425,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     let Ok(reply) = (unsafe { ipc::ipc_call(config.procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        std::os::seraph::log!("driver create ipc_call failed");
+        std::os::seraph::log!(warn: "driver create ipc_call failed");
         return DriverSpawn::Failed;
     };
     // ipc_call returned: the source cap was transferred to procmgr whatever
@@ -433,7 +433,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     source_guard.disarm();
     if reply.label != 0
     {
-        std::os::seraph::log!("driver create failed");
+        std::os::seraph::log!(warn: "driver create failed");
         return DriverSpawn::Failed;
     }
 
@@ -445,7 +445,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         (false, &[p, t]) => (p, t, 0),
         _ =>
         {
-            std::os::seraph::log!("driver create reply carries the wrong caps");
+            std::os::seraph::log!(warn: "driver create reply carries the wrong caps");
             delete_all(reply_caps);
             return DriverSpawn::Failed;
         }
@@ -463,7 +463,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         let Ok(copy) = syscall::cap_derive(resource.cap(), syscall::RIGHTS_ALL)
         else
         {
-            std::os::seraph::log!("driver resource cap derivation failed");
+            std::os::seraph::log!(warn: "driver resource cap derivation failed");
             delete_all(&derived);
             return DriverSpawn::Failed;
         };
@@ -473,7 +473,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     let Ok(service_copy) = syscall::cap_derive(config.service_ep, syscall::RIGHTS_ALL)
     else
     {
-        std::os::seraph::log!("driver service endpoint derivation failed");
+        std::os::seraph::log!(warn: "driver service endpoint derivation failed");
         delete_all(&derived);
         return DriverSpawn::Failed;
     };
@@ -485,7 +485,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     )
     else
     {
-        std::os::seraph::log!("driver devmgr query cap derivation failed");
+        std::os::seraph::log!(warn: "driver devmgr query cap derivation failed");
         delete_all(&derived);
         return DriverSpawn::Failed;
     };
@@ -497,7 +497,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
             let Ok(copy) = syscall::cap_derive(dma, syscall::RIGHTS_EP_SEND_GRANT)
             else
             {
-                std::os::seraph::log!("driver DMA cap derivation failed");
+                std::os::seraph::log!(warn: "driver DMA cap derivation failed");
                 delete_all(&derived);
                 return DriverSpawn::Failed;
             };
@@ -515,7 +515,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     );
     if !start_ok
     {
-        std::os::seraph::log!("driver START_PROCESS failed");
+        std::os::seraph::log!(warn: "driver START_PROCESS failed");
         delete_all(&derived);
         return DriverSpawn::Failed;
     }
@@ -537,7 +537,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         let Some(round) = round
         else
         {
-            std::os::seraph::log!("driver resource round not encodable");
+            std::os::seraph::log!(warn: "driver resource round not encodable");
             delete_all(&derived);
             return DriverSpawn::Unbootstrapped(child_guard.keep_held());
         };
@@ -554,7 +554,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         };
         if served.is_err()
         {
-            std::os::seraph::log!("driver bootstrap round failed");
+            std::os::seraph::log!(warn: "driver bootstrap round failed");
             delete_all(&derived);
             return DriverSpawn::Unbootstrapped(child_guard.keep_held());
         }
@@ -565,7 +565,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     // roster records; a child that already died posts at once.
     if syscall::thread_bind_notification(thread_cap, config.death_eq, config.device_badge).is_err()
     {
-        std::os::seraph::log!("driver death observer bind failed");
+        std::os::seraph::log!(warn: "driver death observer bind failed");
         return DriverSpawn::Unbootstrapped(child_guard.keep_held());
     }
     std::os::seraph::log!("driver started");
@@ -635,7 +635,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
     let Some(child_badge) = mint_bootstrap_badge()
     else
     {
-        std::os::seraph::log!("IOMMU driver spawn: entropy draw failed");
+        std::os::seraph::log!(warn: "IOMMU driver spawn: entropy draw failed");
         release_units(0);
         return DriverSpawn::Failed;
     };
@@ -643,7 +643,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
         syscall::cap_derive_badge(config.bootstrap_ep, syscall::RIGHTS_EP_SEND, child_badge)
     else
     {
-        std::os::seraph::log!("IOMMU driver spawn: badged creator derivation failed");
+        std::os::seraph::log!(warn: "IOMMU driver spawn: badged creator derivation failed");
         release_units(0);
         return DriverSpawn::Failed;
     };
@@ -660,7 +660,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
     let Ok(reply) = reply
     else
     {
-        std::os::seraph::log!("IOMMU driver create ipc_call failed");
+        std::os::seraph::log!(warn: "IOMMU driver create ipc_call failed");
         release_units(0);
         return DriverSpawn::Failed;
     };
@@ -671,7 +671,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
     let (0, &[process_handle, thread_cap, release_token]) = (reply.label, reply_caps)
     else
     {
-        std::os::seraph::log!("IOMMU driver create failed");
+        std::os::seraph::log!(warn: "IOMMU driver create failed");
         for &c in reply_caps
         {
             let _ = syscall::cap_delete(c);
@@ -683,7 +683,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
     let Ok(service_copy) = syscall::cap_derive(config.service_ep, syscall::RIGHTS_ALL)
     else
     {
-        std::os::seraph::log!("IOMMU driver service endpoint derivation failed");
+        std::os::seraph::log!(warn: "IOMMU driver service endpoint derivation failed");
         release_units(0);
         return DriverSpawn::Failed;
     };
@@ -694,7 +694,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
     )
     else
     {
-        std::os::seraph::log!("IOMMU driver query cap derivation failed");
+        std::os::seraph::log!(warn: "IOMMU driver query cap derivation failed");
         release_units(0);
         let _ = syscall::cap_delete(service_copy);
         return DriverSpawn::Failed;
@@ -709,7 +709,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
     let started = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) };
     if !matches!(started, Ok(r) if r.label == 0)
     {
-        std::os::seraph::log!("IOMMU driver START_PROCESS failed");
+        std::os::seraph::log!(warn: "IOMMU driver START_PROCESS failed");
         release_units(0);
         release_endpoints();
         return DriverSpawn::Failed;
@@ -729,7 +729,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
         };
         if served.is_err()
         {
-            std::os::seraph::log!("IOMMU driver bootstrap unit round failed");
+            std::os::seraph::log!(warn: "IOMMU driver bootstrap unit round failed");
             release_units(i);
             release_endpoints();
             return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
@@ -748,7 +748,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
     };
     if served.is_err()
     {
-        std::os::seraph::log!("IOMMU driver bootstrap endpoint round failed");
+        std::os::seraph::log!(warn: "IOMMU driver bootstrap endpoint round failed");
         release_endpoints();
         return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
     }
@@ -756,258 +756,9 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
         || syscall::thread_bind_notification(thread_cap, config.watch_eq, config.device_badge)
             .is_err()
     {
-        std::os::seraph::log!("IOMMU driver death observer bind failed");
+        std::os::seraph::log!(warn: "IOMMU driver death observer bind failed");
         return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
     }
     std::os::seraph::log!("IOMMU driver started");
     DriverSpawn::Bootstrapped(child_guard.keep_handle())
-}
-
-/// Capabilities and identifiers for one non-PCI platform device driver
-/// spawn ([`spawn_simple_device`]).
-pub struct SimpleSpawnConfig<'a>
-{
-    pub procmgr_ep: u64,
-    pub bootstrap_ep: u64,
-    /// ELF source: a boot-module Memory cap (serial, framebuffer) or a
-    /// rootfs file cap (the per-arch RTC, `test-orphan`).
-    pub source: CreateSource,
-    /// devmgr-owned service endpoint; the driver receives on a copy.
-    pub service_ep: u64,
-    /// The device's arch authority cap, moved into the child.
-    pub hw_cap: u64,
-    /// The UART interrupt cap, moved into the child; 0 for none.
-    pub irq_cap: u64,
-    /// The driver's devmgr query cap, moved into the child: a SEND badged
-    /// with `device_badge` on its settle batch's private endpoint
-    /// ([`crate::settle::SettleBatch::driver_ep`]).
-    pub query_ep: u64,
-    /// Event queue the driver's death observer posts to, with
-    /// `device_badge` as the correlator: devmgr's driver death queue
-    /// ([`crate::settle::DriverWatch::death_eq`]). `None` binds no observer
-    /// (the `test-orphan` shim, whose child never runs past its bootstrap).
-    pub death_eq: Option<u64>,
-    pub device_badge: u64,
-    /// Data words round 1 carries: the CMOS RTC's century register index,
-    /// and empty for every other device.
-    pub round1_words: &'a [u64],
-    /// Priority level the driver is created at (band ceiling equal); `0`
-    /// takes procmgr's defaults (the `test-orphan` shim only).
-    pub priority: u8,
-}
-
-/// Spawn a non-PCI platform device driver with a minimal capability set: a
-/// copy of `service_ep`, the device's arch authority cap (`hw_cap`), an
-/// optional IRQ cap (`irq_cap`, the serial UART's), and the driver's devmgr
-/// query cap (`query_ep`). Unlike [`spawn_bound_driver`] there is no BAR.
-///
-/// Two bootstrap rounds are served:
-///   Round 1 (not terminal): `[service, hw_cap, irq_cap?]`, `round1_words`
-///   Round 2 (terminal):     `[query_ep]`
-/// The driver calls `QUERY_DEVICE_INFO` on the query cap when it needs
-/// runtime platform metadata (the framebuffer's geometry; the payload shape
-/// lives in the driver's crate, devmgr stores opaque bytes in its
-/// `DeviceCatalog`), and `DRIVER_READY` on it once its device is set up.
-/// Once the final round is served a death observer is bound on the driver's
-/// thread to `death_eq`, correlator `device_badge`.
-///
-/// devmgr retains `service_ep` to mint client SEND caps on query; `hw_cap`,
-/// `irq_cap`, and `query_ep` are *moved* into the child (delivered directly,
-/// not copied), so devmgr holds no device-specific authority after a
-/// successful spawn. The caller transfers ownership of those three caps and
-/// of the source cap to this function: each is moved to the child or
-/// procmgr on success and deleted on failure. Returns the child's badged
-/// process handle, kept by the caller as [`spawn_bound_driver`]'s is, or `None` on
-/// any spawn-path failure, the child torn down.
-// too_many_lines: simple-device spawn is one transaction — derive the
-// per-child caps, install them into the suspended child, and serve two
-// bootstrap rounds against the shared `ipc` buffer. Each fallible step
-// owns slots that must be released cooperatively on partial failure;
-// extracting helpers requires threading the same parameters through. The
-// linear presentation matches the bootstrap protocol one-to-one.
-#[allow(clippy::too_many_lines)]
-pub fn spawn_simple_device(config: &SimpleSpawnConfig, ipc_buf: *mut u64) -> Option<u64>
-{
-    let source_cap = match config.source
-    {
-        CreateSource::Module(m) => m,
-        CreateSource::File { file_cap, .. } => file_cap,
-    };
-    // Release the source cap on every exit before the create call transfers
-    // it: for `File` the namespace walk just produced it; for `Module` a
-    // retained cap is a live derivation child of init's donated pool-run
-    // source and pins that run unsplittable. Disarmed once the create
-    // `ipc_call` returns.
-    let mut source_guard = ModuleCapGuard::new(source_cap);
-    // The caps this function moves into the child, released on every
-    // failure (deleting a slot a round already transferred is a no-op).
-    let release_moved = || {
-        for cap in [config.hw_cap, config.irq_cap, config.query_ep]
-        {
-            if cap != 0
-            {
-                let _ = syscall::cap_delete(cap);
-            }
-        }
-    };
-
-    if source_cap == 0 || config.service_ep == 0 || config.hw_cap == 0 || config.query_ep == 0
-    {
-        std::os::seraph::log!("simple-device spawn: missing source/service/hw/query cap");
-        release_moved();
-        return None;
-    }
-
-    let Some(child_badge) = mint_bootstrap_badge()
-    else
-    {
-        std::os::seraph::log!("simple-device spawn: entropy draw failed");
-        release_moved();
-        return None;
-    };
-    let Ok(badged_creator) =
-        syscall::cap_derive_badge(config.bootstrap_ep, syscall::RIGHTS_EP_SEND, child_badge)
-    else
-    {
-        std::os::seraph::log!("simple-device spawn: badged creator derivation failed");
-        release_moved();
-        return None;
-    };
-
-    // Band ceiling equals the driver's level; `0` = procmgr's defaults
-    // (used only by the test-orphan shim).
-    let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
-    let create_msg = match config.source
-    {
-        CreateSource::Module(module_cap) =>
-        {
-            IpcMessage::builder(procmgr_labels::CREATE_PROCESS | sched_bits)
-                .cap(module_cap)
-                .cap(badged_creator)
-                .build()
-        }
-        CreateSource::File { file_cap, size } =>
-        {
-            IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | sched_bits)
-                .word(0, size)
-                .cap(file_cap)
-                .cap(badged_creator)
-                .build()
-        }
-    };
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(config.procmgr_ep, &create_msg, ipc_buf) })
-    else
-    {
-        std::os::seraph::log!("simple-device CREATE_* ipc_call failed");
-        release_moved();
-        return None;
-    };
-    // ipc_call returned: the kernel transferred the source cap to procmgr,
-    // which deletes it on its own failure too. Disarm so the guard does not
-    // free a slot since reused.
-    source_guard.disarm();
-    if reply.label != 0
-    {
-        std::os::seraph::log!("simple-device CREATE_* failed");
-        release_moved();
-        return None;
-    }
-    let reply_caps = reply.caps();
-    if reply_caps.len() < 2
-    {
-        // CREATE reported success without the process handle and thread cap
-        // it returns on success. Defensive; with no handle there is no badge
-        // to tear the child down with.
-        std::os::seraph::log!("simple-device CREATE_PROCESS reply missing caps");
-        for &cap in reply_caps
-        {
-            let _ = syscall::cap_delete(cap);
-        }
-        release_moved();
-        return None;
-    }
-    let process_handle = reply_caps[0];
-    let thread_cap = reply_caps[1];
-    // Tear down the child (and free its reply-cap slots) on any failure before
-    // the death observer is bound; on success the caller keeps the handle.
-    let child_guard = ChildGuard::new(process_handle, thread_cap, 0, ipc_buf);
-
-    // Copy of the service endpoint for the child; devmgr keeps the original
-    // to mint client SEND caps on query.
-    let Ok(service_copy) = syscall::cap_derive(config.service_ep, syscall::RIGHTS_ALL)
-    else
-    {
-        std::os::seraph::log!("simple-device service endpoint derivation failed");
-        release_moved();
-        return None;
-    };
-
-    // START_PROCESS.
-    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let start_ok = matches!(
-        unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) },
-        Ok(r) if r.label == 0
-    );
-    if !start_ok
-    {
-        std::os::seraph::log!("simple-device START_PROCESS failed");
-        let _ = syscall::cap_delete(service_copy);
-        release_moved();
-        return None;
-    }
-
-    // Round 1 (not terminal): [service, hw_cap, irq_cap?] with the round-1
-    // words. irq_cap rides only when present (the serial driver).
-    let round1_caps: [u64; 3] = [service_copy, config.hw_cap, config.irq_cap];
-    let round1_len = if config.irq_cap != 0 { 3 } else { 2 };
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    if unsafe {
-        ipc::bootstrap::serve_round(
-            config.bootstrap_ep,
-            child_badge,
-            ipc_buf,
-            false,
-            &round1_caps[..round1_len],
-            config.round1_words,
-        )
-    }
-    .is_err()
-    {
-        std::os::seraph::log!("simple-device bootstrap round 1 failed");
-        let _ = syscall::cap_delete(service_copy);
-        release_moved();
-        return None;
-    }
-
-    // Round 2 (terminal): [query_ep].
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    if unsafe {
-        ipc::bootstrap::serve_round(
-            config.bootstrap_ep,
-            child_badge,
-            ipc_buf,
-            true,
-            &[config.query_ep],
-            &[],
-        )
-    }
-    .is_err()
-    {
-        std::os::seraph::log!("simple-device bootstrap round 2 failed");
-        let _ = syscall::cap_delete(config.query_ep);
-        return None;
-    }
-
-    // Observe the driver's death from here on, as `spawn_bound_driver` does.
-    if let Some(death_eq) = config.death_eq
-        && syscall::thread_bind_notification(thread_cap, death_eq, config.device_badge).is_err()
-    {
-        std::os::seraph::log!("simple-device death observer bind failed");
-        return None;
-    }
-
-    std::os::seraph::log!("simple-device driver started");
-    Some(child_guard.keep_handle())
 }

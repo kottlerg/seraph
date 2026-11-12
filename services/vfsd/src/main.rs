@@ -142,7 +142,7 @@ fn main() -> !
 
     if caps.service_ep == 0 || caps.block_class == 0
     {
-        std::os::seraph::log!("missing required endpoints");
+        std::os::seraph::log!(error: "missing required endpoints");
         idle_loop();
     }
 
@@ -150,7 +150,7 @@ fn main() -> !
     let Some(pool) = WorkerPool::new()
     else
     {
-        std::os::seraph::log!("FATAL: worker pool setup failed");
+        std::os::seraph::log!(error: "FATAL: worker pool setup failed");
         idle_loop();
     };
     caps.bootstrap_ep = pool.bootstrap_ep();
@@ -165,7 +165,7 @@ fn main() -> !
         partition::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
     else
     {
-        std::os::seraph::log!("FATAL: GPT scratch allocation failed");
+        std::os::seraph::log!(error: "FATAL: GPT scratch allocation failed");
         idle_loop();
     };
 
@@ -182,7 +182,7 @@ fn main() -> !
     );
     if disks.is_empty()
     {
-        std::os::seraph::log!("no block device available");
+        std::os::seraph::log!(error: "no block device available");
         idle_loop();
     }
 
@@ -198,7 +198,7 @@ fn main() -> !
         })
     else
     {
-        std::os::seraph::log!("FATAL: cannot create namespace endpoint");
+        std::os::seraph::log!(error: "FATAL: cannot create namespace endpoint");
         idle_loop();
     };
 
@@ -214,7 +214,7 @@ fn main() -> !
         syscall::cap_derive_badge(namespace_ep, syscall::RIGHTS_EP_SEND, badge)
     else
     {
-        std::os::seraph::log!("FATAL: vfsd internal system-root cap derive failed");
+        std::os::seraph::log!(error: "FATAL: vfsd internal system-root cap derive failed");
         idle_loop();
     };
 
@@ -237,7 +237,7 @@ fn main() -> !
         .spawn(move || namespace_loop(runtime))
         .is_err()
     {
-        std::os::seraph::log!("FATAL: namespace thread spawn failed");
+        std::os::seraph::log!(error: "FATAL: namespace thread spawn failed");
         idle_loop();
     }
 
@@ -248,7 +248,7 @@ fn main() -> !
     // promptly rather than blocking forever.
     if !self_mount(runtime, ipc_buf)
     {
-        std::os::seraph::log!("root unavailable; system-root requests will fail");
+        std::os::seraph::log!(warn: "root unavailable; system-root requests will fail");
     }
 
     // Spawn N-1 helper service threads; main becomes the Nth handler. Each
@@ -261,7 +261,7 @@ fn main() -> !
             .spawn(move || service_loop(runtime))
             .is_err()
         {
-            std::os::seraph::log!("FATAL: service helper thread spawn failed");
+            std::os::seraph::log!(error: "FATAL: service helper thread spawn failed");
             idle_loop();
         }
     }
@@ -311,11 +311,11 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
         }
     }
 }
@@ -345,7 +345,7 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {
-        std::os::seraph::log!("service thread has no registered IPC buffer");
+        std::os::seraph::log!(error: "service thread has no registered IPC buffer");
         syscall::thread_exit();
     }
 
@@ -377,7 +377,7 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
                 // badge reaches the handler.
                 if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
                 {
-                    std::os::seraph::log!("MOUNT rejected: badge lacks MOUNT_AUTHORITY");
+                    std::os::seraph::log!(warn: "MOUNT rejected: badge lacks MOUNT_AUTHORITY");
                     let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
                     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
                     let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -392,7 +392,7 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
                 if badge & ipc::vfsd_labels::SEED_AUTHORITY == 0
                 {
                     std::os::seraph::log!(
-                        "GET_SYSTEM_ROOT_CAP rejected: badge lacks SEED_AUTHORITY"
+                        warn: "GET_SYSTEM_ROOT_CAP rejected: badge lacks SEED_AUTHORITY"
                     );
                     let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
                     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
@@ -401,7 +401,8 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
                 else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
                 {
                     std::os::seraph::log!(
-                        "GET_SYSTEM_ROOT_CAP rejected: caller VFSD_LABELS_VERSION={} expected {}",
+                        warn: "GET_SYSTEM_ROOT_CAP rejected: caller VFSD_LABELS_VERSION={} \
+                         expected {}",
                         recv.word(0),
                         ipc::VFSD_LABELS_VERSION
                     );
@@ -446,7 +447,7 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {
-        std::os::seraph::log!("namespace thread has no registered IPC buffer");
+        std::os::seraph::log!(error: "namespace thread has no registered IPC buffer");
         syscall::thread_exit();
     }
 
@@ -759,7 +760,7 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
         .root_mount_cap()
         == 0
     {
-        std::os::seraph::log!("GET_SYSTEM_ROOT_CAP rejected: root not mounted");
+        std::os::seraph::log!(warn: "GET_SYSTEM_ROOT_CAP rejected: root not mounted");
         let err = IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -779,7 +780,7 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
     }
     else
     {
-        std::os::seraph::log!("GET_SYSTEM_ROOT_CAP derive failed");
+        std::os::seraph::log!(warn: "GET_SYSTEM_ROOT_CAP derive failed");
         IpcMessage::new(ipc::vfsd_errors::IO_ERROR)
     };
     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
@@ -848,7 +849,7 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
         }
         Err(code) =>
         {
-            std::os::seraph::log!("FATAL: root self-mount failed: code={code:#x}");
+            std::os::seraph::log!(error: "FATAL: root self-mount failed: code={code:#x}");
             return false;
         }
     }
@@ -885,7 +886,7 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
     let Some(role) = MountRole::from_wire(role_byte)
     else
     {
-        std::os::seraph::log!("MOUNT: unknown role byte {role_byte}");
+        std::os::seraph::log!(warn: "MOUNT: unknown role byte {role_byte}");
         let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -895,7 +896,7 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
     let path_len = recv.word(1) as usize;
     if path_len == 0 || path_len > MAX_MOUNT_PATH_LEN
     {
-        std::os::seraph::log!("MOUNT: invalid path length");
+        std::os::seraph::log!(warn: "MOUNT: invalid path length");
         let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -910,7 +911,7 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
     {
         // The data words carry fewer path bytes than `data[1]` claims;
         // mounting the bytes that are there would name a different path.
-        std::os::seraph::log!("MOUNT: path shorter than its stated length");
+        std::os::seraph::log!(warn: "MOUNT: path shorter than its stated length");
         let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -959,7 +960,7 @@ fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mo
         .any(|p| &p.type_guid == type_guid);
     if !present
     {
-        std::os::seraph::log!("MOUNT: no partition for {mount_path}; skipping auto-mount");
+        std::os::seraph::log!(warn: "MOUNT: no partition for {mount_path}; skipping auto-mount");
         return;
     }
     match do_mount_internal(rt, ipc_buf, type_guid, mount_path.as_bytes())
@@ -971,7 +972,9 @@ fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mo
             log_cap_delete("auto-mount caller cap", caller_cap);
             std::os::seraph::log!("MOUNT: {mount_path} auto-mounted");
         }
-        Err(code) => std::os::seraph::log!("MOUNT: {mount_path} auto-mount failed: code={code:#x}"),
+        Err(code) => std::os::seraph::log!(
+            warn: "MOUNT: {mount_path} auto-mount failed: code={code:#x}"
+        ),
     }
 }
 
@@ -988,7 +991,9 @@ fn log_cap_delete(context: &str, slot: u64)
     }
     if let Err(code) = syscall::cap_delete(slot)
     {
-        std::os::seraph::log!("MOUNT: cap_delete({context}, slot={slot}) failed: code={code}");
+        std::os::seraph::log!(
+            warn: "MOUNT: cap_delete({context}, slot={slot}) failed: code={code}"
+        );
     }
 }
 
@@ -1053,7 +1058,7 @@ fn do_mount_internal(
         Ok(location) => location,
         Err(gpt::GptLookupError::NotFound) =>
         {
-            std::os::seraph::log!("MOUNT: partition role GUID not found on any disk");
+            std::os::seraph::log!(warn: "MOUNT: partition role GUID not found on any disk");
             return Err(ipc::vfsd_errors::NO_MOUNT);
         }
         Err(gpt::GptLookupError::DuplicateTie) =>
@@ -1062,7 +1067,7 @@ fn do_mount_internal(
             // the returned error as fatal, the /esp and /data auto-mounts
             // skip and fall through).
             std::os::seraph::log!(
-                "MOUNT: role GUID matched by multiple tied-priority partitions; not mounting"
+                warn: "MOUNT: role GUID matched by multiple tied-priority partitions; not mounting"
             );
             return Err(ipc::vfsd_errors::NO_MOUNT);
         }
@@ -1072,14 +1077,14 @@ fn do_mount_internal(
     {
         // The lookup ran over `rt.disks`, so its index is in range.
         std::os::seraph::log!(
-            "MOUNT: role lookup named disk {} vfsd does not hold",
+            warn: "MOUNT: role lookup named disk {} vfsd does not hold",
             location.disk
         );
         return Err(ipc::vfsd_errors::NO_MOUNT);
     };
     let (partition_lba, partition_len) = (location.first_lba, location.length_lba);
     std::os::seraph::log!(
-        "MOUNT: partition on disk {} LBA={partition_lba:#018x} length={partition_len:#018x}",
+        debug: "MOUNT: partition on disk {} LBA={partition_lba:#018x} length={partition_len:#018x}",
         location.disk
     );
 
@@ -1094,7 +1099,7 @@ fn do_mount_internal(
         .can_install(path);
     if !installable
     {
-        std::os::seraph::log!("MOUNT: mount point taken or path not installable");
+        std::os::seraph::log!(warn: "MOUNT: mount point taken or path not installable");
         return Err(ipc::vfsd_errors::TABLE_FULL);
     }
 
@@ -1102,7 +1107,7 @@ fn do_mount_internal(
         derive_and_register_partition(disk.blk_ep, partition_lba, partition_len, ipc_buf)
     else
     {
-        std::os::seraph::log!("MOUNT: partition cap registration failed");
+        std::os::seraph::log!(warn: "MOUNT: partition cap registration failed");
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
 
@@ -1133,7 +1138,7 @@ fn do_mount_internal(
     )
     else
     {
-        std::os::seraph::log!("MOUNT: failed to spawn fatfs");
+        std::os::seraph::log!(warn: "MOUNT: failed to spawn fatfs");
         log_cap_delete("module_cap (spawn-fail)", module_cap_for_spawn);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
@@ -1179,7 +1184,7 @@ fn do_mount_internal(
         let Ok(c) = syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_EP_SEND, root_badge)
         else
         {
-            std::os::seraph::log!("MOUNT: root fall-through cap derive failed");
+            std::os::seraph::log!(warn: "MOUNT: root fall-through cap derive failed");
             // Revoking the endpoint also invalidates `caller_root_cap` and
             // stops the driver, which nothing would reach otherwise.
             driver::teardown_driver(fatfs.endpoint);
@@ -1211,7 +1216,7 @@ fn do_mount_internal(
         // `install_cap` and `caller_root_cap` (both derive from it) and
         // stops the driver nothing would reach.
         std::os::seraph::log!(
-            "MOUNT: synthetic-root install failed (no memory or mount point taken)"
+            warn: "MOUNT: synthetic-root install failed (no memory or mount point taken)"
         );
         driver::teardown_driver(fatfs.endpoint);
         return Err(ipc::vfsd_errors::TABLE_FULL);
@@ -1256,14 +1261,14 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
         else
         {
             std::os::seraph::log!(
-                "MOUNT: fallthrough skip node_idx={node_idx}: no memory for its path",
+                warn: "MOUNT: fallthrough skip node_idx={node_idx}: no memory for its path",
             );
             continue;
         };
         if root_mount_cap == 0
         {
             std::os::seraph::log!(
-                "MOUNT: fallthrough skip node_idx={node_idx}: no root mount installed",
+                warn: "MOUNT: fallthrough skip node_idx={node_idx}: no root mount installed",
             );
             continue;
         }
@@ -1280,7 +1285,8 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
             // Install validated every component as UTF-8 (`validate_name`).
             let shown = core::str::from_utf8(&path).unwrap_or("<non-UTF-8>");
             std::os::seraph::log!(
-                "MOUNT: fallthrough skip node_idx={node_idx}: no directory {shown} in the root fs",
+                warn: "MOUNT: fallthrough skip node_idx={node_idx}: no directory {shown} \
+                 in the root fs",
             );
         }
     }
@@ -1389,12 +1395,12 @@ fn derive_and_register_partition(
     let Ok(reply) = (unsafe { ipc::ipc_call(blk_ep, &msg, ipc_buf) })
     else
     {
-        std::os::seraph::log!("REGISTER_PARTITION ipc_call failed");
+        std::os::seraph::log!(warn: "REGISTER_PARTITION ipc_call failed");
         return None;
     };
     if reply.label != ipc::blk_errors::SUCCESS
     {
-        std::os::seraph::log!("REGISTER_PARTITION rejected (code={})", reply.label);
+        std::os::seraph::log!(warn: "REGISTER_PARTITION rejected (code={})", reply.label);
         return None;
     }
     reply.caps().first().copied()

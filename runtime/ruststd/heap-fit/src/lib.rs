@@ -17,6 +17,8 @@
 //! surgery stays with the caller. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
@@ -57,24 +59,24 @@ pub struct Fit
 pub fn fit(start: usize, size: usize, want: usize, align: usize, min_block: usize) -> Option<Fit>
 {
     let mut payload = start.checked_next_multiple_of(align)?;
-    while payload - start != 0 && payload - start < min_block
+    // The payload is aligned up from `start`, so it is never below it.
+    let mut front = payload.checked_sub(start)?;
+    while front != 0 && front < min_block
     {
         payload = payload.checked_add(align)?;
+        front = front.checked_add(align)?;
     }
     let end = start.checked_add(size)?;
     let used_end = payload.checked_add(want)?;
-    if used_end > end
-    {
-        return None;
-    }
-    let back = end - used_end;
+    // A request that ends past the block does not fit.
+    let back = end.checked_sub(used_end)?;
     if back != 0 && back < min_block
     {
         return None;
     }
     Some(Fit {
         payload,
-        front: payload - start,
+        front,
         back,
     })
 }

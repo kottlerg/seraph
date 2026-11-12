@@ -23,6 +23,9 @@
 // reference field-arithmetic naming; descriptive names would only add noise.
 #![allow(clippy::many_single_char_names)]
 
+// Limb arithmetic uses wrapping operations: the radix-2^16 representation bounds every
+// intermediate inside i64, so wrapping and exact results agree.
+
 /// A field element: 16 limbs, value = Σ limb[i] · 2^(16·i).
 pub(crate) type Fe = [i64; 16];
 
@@ -65,43 +68,37 @@ pub(crate) const SQRTM1: Fe = [
 /// One carry/reduce pass (radix-2^16 with the 2^256 ≡ 38 (mod p) fold).
 pub(crate) fn carry(o: &mut Fe)
 {
-    let mut i = 0;
-    while i < 16
+    // Each limb absorbs the previous limb's carry (`prev`); the top limb's carry
+    // folds into limb 0 afterwards.
+    let mut prev = 0i64;
+    for limb in o.iter_mut()
     {
-        o[i] += 1 << 16;
-        let c = o[i] >> 16;
-        if i < 15
-        {
-            o[i + 1] += c - 1;
-        }
-        else
-        {
-            o[0] += 38 * (c - 1);
-        }
-        o[i] -= c << 16;
-        i += 1;
+        let v = limb.wrapping_add(1 << 16).wrapping_add(prev);
+        let c = v >> 16;
+        *limb = v.wrapping_sub(c << 16);
+        prev = c.wrapping_sub(1);
+    }
+    if let Some(first) = o.first_mut()
+    {
+        *first = first.wrapping_add(prev.wrapping_mul(38));
     }
 }
 
 /// Field addition (limb-wise; result left un-normalised).
 pub(crate) fn add(o: &mut Fe, a: &Fe, b: &Fe)
 {
-    let mut i = 0;
-    while i < 16
+    for ((o, a), b) in o.iter_mut().zip(a).zip(b)
     {
-        o[i] = a[i] + b[i];
-        i += 1;
+        *o = a.wrapping_add(*b);
     }
 }
 
 /// Field subtraction (limb-wise; result left un-normalised, may be negative).
 pub(crate) fn sub(o: &mut Fe, a: &Fe, b: &Fe)
 {
-    let mut i = 0;
-    while i < 16
+    for ((o, a), b) in o.iter_mut().zip(a).zip(b)
     {
-        o[i] = a[i] - b[i];
-        i += 1;
+        *o = a.wrapping_sub(*b);
     }
 }
 
@@ -110,24 +107,18 @@ pub(crate) fn sub(o: &mut Fe, a: &Fe, b: &Fe)
 pub(crate) fn mul(o: &mut Fe, a: &Fe, b: &Fe)
 {
     let mut t = [0i64; 31];
-    let mut i = 0;
-    while i < 16
+    for (i, ai) in a.iter().enumerate()
     {
-        let mut j = 0;
-        while j < 16
+        for (tj, bj) in t.iter_mut().skip(i).zip(b)
         {
-            t[i + j] += a[i] * b[j];
-            j += 1;
+            *tj = tj.wrapping_add(ai.wrapping_mul(*bj));
         }
-        i += 1;
     }
-    let mut i = 0;
-    while i < 15
+    o[15] = t[15];
+    for (oi, (lo, hi)) in o.iter_mut().zip(t.iter().zip(t.iter().skip(16)))
     {
-        t[i] += 38 * t[i + 16];
-        i += 1;
+        *oi = lo.wrapping_add(hi.wrapping_mul(38));
     }
-    o.copy_from_slice(&t[..16]);
     carry(o);
     carry(o);
 }
@@ -142,8 +133,7 @@ pub(crate) fn sqr(o: &mut Fe, a: &Fe)
 pub(crate) fn invert(o: &mut Fe, a: &Fe)
 {
     let mut c = *a;
-    let mut i = 253i32;
-    while i >= 0
+    for i in (0..=253).rev()
     {
         let t = c;
         sqr(&mut c, &t);
@@ -152,7 +142,6 @@ pub(crate) fn invert(o: &mut Fe, a: &Fe)
             let t = c;
             mul(&mut c, &t, a);
         }
-        i -= 1;
     }
     *o = c;
 }
@@ -161,8 +150,7 @@ pub(crate) fn invert(o: &mut Fe, a: &Fe)
 pub(crate) fn pow2523(o: &mut Fe, a: &Fe)
 {
     let mut c = *a;
-    let mut i = 250i32;
-    while i >= 0
+    for i in (0..=250).rev()
     {
         let t = c;
         sqr(&mut c, &t);
@@ -171,7 +159,6 @@ pub(crate) fn pow2523(o: &mut Fe, a: &Fe)
             let t = c;
             mul(&mut c, &t, a);
         }
-        i -= 1;
     }
     *o = c;
 }
@@ -179,14 +166,12 @@ pub(crate) fn pow2523(o: &mut Fe, a: &Fe)
 /// Constant-shape conditional swap of `p` and `q` when `swap == 1`.
 pub(crate) fn cswap(p: &mut Fe, q: &mut Fe, swap: u8)
 {
-    let mask = !(i64::from(swap) - 1);
-    let mut i = 0;
-    while i < 16
+    let mask = !(i64::from(swap).wrapping_sub(1));
+    for (p, q) in p.iter_mut().zip(q.iter_mut())
     {
-        let t = mask & (p[i] ^ q[i]);
-        p[i] ^= t;
-        q[i] ^= t;
-        i += 1;
+        let t = mask & (*p ^ *q);
+        *p ^= t;
+        *q ^= t;
     }
 }
 
@@ -198,30 +183,25 @@ pub(crate) fn pack(out: &mut [u8; 32], n: &Fe)
     carry(&mut t);
     carry(&mut t);
     // Two conditional subtractions of p bring t into the canonical range.
-    let mut round = 0;
-    while round < 2
+    for _ in 0..2
     {
         let mut m: Fe = [0; 16];
-        m[0] = t[0] - 0xffed;
-        let mut i = 1;
-        while i < 15
+        // `prev` is the unmasked previous limb; its bit 16 is the borrow.
+        let mut prev = t[0].wrapping_sub(0xffed);
+        m[0] = prev & 0xffff;
+        for (mi, ti) in m.iter_mut().zip(t.iter()).take(15).skip(1)
         {
-            m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1);
-            m[i - 1] &= 0xffff;
-            i += 1;
+            let cur = ti.wrapping_sub(0xffff).wrapping_sub((prev >> 16) & 1);
+            *mi = cur & 0xffff;
+            prev = cur;
         }
-        m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
+        m[15] = t[15].wrapping_sub(0x7fff).wrapping_sub((prev >> 16) & 1);
         let b = (m[15] >> 16) & 1;
-        m[14] &= 0xffff;
-        cswap(&mut t, &mut m, (1 - b) as u8);
-        round += 1;
+        cswap(&mut t, &mut m, 1u8.wrapping_sub(b as u8));
     }
-    let mut i = 0;
-    while i < 16
+    for (pair, ti) in out.as_chunks_mut::<2>().0.iter_mut().zip(t.iter())
     {
-        out[2 * i] = (t[i] & 0xff) as u8;
-        out[2 * i + 1] = ((t[i] >> 8) & 0xff) as u8;
-        i += 1;
+        *pair = [(ti & 0xff) as u8, ((ti >> 8) & 0xff) as u8];
     }
 }
 
@@ -229,11 +209,9 @@ pub(crate) fn pack(out: &mut [u8; 32], n: &Fe)
 /// (the sign bit, not field data).
 pub(crate) fn unpack(o: &mut Fe, n: &[u8; 32])
 {
-    let mut i = 0;
-    while i < 16
+    for (oi, pair) in o.iter_mut().zip(n.as_chunks::<2>().0)
     {
-        o[i] = i64::from(n[2 * i]) + (i64::from(n[2 * i + 1]) << 8);
-        i += 1;
+        *oi = i64::from(pair[0]).wrapping_add(i64::from(pair[1]) << 8);
     }
     o[15] &= 0x7fff;
 }

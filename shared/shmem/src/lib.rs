@@ -20,6 +20,8 @@
 // so this crate can sit inside std's dep graph. Mirrors abi/syscall,
 // shared/syscall, shared/ipc, shared/log. Normal userspace builds (no
 // feature) retain `#![no_std]`.
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]
@@ -118,6 +120,9 @@ impl SharedBuffer
     ) -> Result<Self, ShmemError>
     {
         let total = total_pages(regions, vaddr).ok_or(ShmemError::InvalidPageCount)?;
+        // `total_pages` checked that `vaddr` plus the whole span fits a `u64`,
+        // and `mapped` plus one region's pages stays within the span, so none
+        // of the saturating operations below saturates.
         let mut mapped: u64 = 0;
         for region in regions
         {
@@ -135,7 +140,7 @@ impl SharedBuffer
                 syscall::mem_map(
                     rw,
                     aspace,
-                    vaddr + mapped * PAGE_SIZE,
+                    vaddr.saturating_add(mapped.saturating_mul(PAGE_SIZE)),
                     0,
                     region.pages,
                     syscall::MAP_WRITABLE,
@@ -148,10 +153,10 @@ impl SharedBuffer
                 // SAFETY: the first `mapped` pages were mapped by this call,
                 // and a failed map of this region leaves its pages for the
                 // same unmap, inside the dedicated span.
-                unsafe { unmap_range(aspace, vaddr, mapped + region.pages) };
+                unsafe { unmap_range(aspace, vaddr, mapped.saturating_add(region.pages)) };
                 return Err(ShmemError::MapFailed);
             }
-            mapped += region.pages;
+            mapped = mapped.saturating_add(region.pages);
         }
 
         Ok(SharedBuffer {
@@ -176,7 +181,8 @@ impl SharedBuffer
     #[allow(clippy::cast_possible_truncation)]
     pub fn size(&self) -> usize
     {
-        (self.page_count * PAGE_SIZE) as usize
+        // `attach` checked that the span's byte count fits a `u64`.
+        self.page_count.saturating_mul(PAGE_SIZE) as usize
     }
 
     /// Number of pages.
@@ -390,7 +396,9 @@ unsafe fn checked_mask(region_vaddr: u64, capacity: u32) -> Option<u32>
     // SAFETY: the caller's contract makes the header readable and aligned;
     // the field is atomic, so a concurrent peer write is no data race.
     let shared = unsafe { (*header).capacity.load(Ordering::Acquire) };
-    (shared == capacity).then_some(capacity - 1)
+    // A power of two is at least 1, so the subtraction does not saturate; the
+    // mask is at most `2^31 - 1`, so `mask + 1` below does not saturate either.
+    (shared == capacity).then_some(capacity.saturating_sub(1))
 }
 
 impl SpscWriter<'_>
@@ -416,7 +424,9 @@ impl SpscWriter<'_>
         let header = unsafe { &*(region_vaddr as *const SpscHeader) };
         Some(Self {
             header,
-            buf: (region_vaddr + SpscHeader::SIZE as u64) as *mut u8,
+            // The caller's contract maps the body after the header, so the
+            // address does not wrap.
+            buf: region_vaddr.wrapping_add(SpscHeader::SIZE as u64) as *mut u8,
             mask,
         })
     }
@@ -425,7 +435,7 @@ impl SpscWriter<'_>
     /// actually written (zero if the ring is full). Non-blocking.
     pub fn write(&mut self, data: &[u8]) -> usize
     {
-        let capacity = self.mask + 1;
+        let capacity = self.mask.saturating_add(1);
         let head = self.header.head.load(Ordering::Acquire);
         let tail = self.header.tail.load(Ordering::Relaxed);
         // The peer writes `head`; saturate so a value past the ring's bounds
@@ -464,7 +474,7 @@ impl SpscWriter<'_>
     #[must_use]
     pub fn capacity(&self) -> usize
     {
-        (self.mask + 1) as usize
+        self.mask.saturating_add(1) as usize
     }
 }
 
@@ -488,7 +498,9 @@ impl SpscReader<'_>
         let header = unsafe { &*(region_vaddr as *const SpscHeader) };
         Some(Self {
             header,
-            buf: (region_vaddr + SpscHeader::SIZE as u64) as *const u8,
+            // The caller's contract maps the body after the header, so the
+            // address does not wrap.
+            buf: region_vaddr.wrapping_add(SpscHeader::SIZE as u64) as *const u8,
             mask,
         })
     }
@@ -501,7 +513,7 @@ impl SpscReader<'_>
         let tail = self.header.tail.load(Ordering::Acquire);
         // The peer writes `tail`; clamp so a value past the ring's bounds
         // reads as a full ring rather than reading slots more than once.
-        let used = tail.wrapping_sub(head).min(self.mask + 1);
+        let used = tail.wrapping_sub(head).min(self.mask.saturating_add(1));
         if used == 0
         {
             return 0;

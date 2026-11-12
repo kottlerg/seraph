@@ -53,6 +53,8 @@
 // Under `rustc-dep-of-std` (build-std), use the core facade and no_core so
 // this crate can sit inside std's dep graph. Mirrors abi/process-abi. Normal
 // builds (no feature) retain `#![no_std]`.
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
@@ -103,9 +105,12 @@ pub const DEFAULT_PROCESS_INFO_VA: u64 = DEFAULT_IPC_BUFFER_VA + PAGE_SIZE;
 /// default's region tail (the `ProcessInfo` page and its argv/env region,
 /// [`MAX_WINDOW_REGION_PAGES`] pages), so no accepted stack or argv/env
 /// region reaches another default.
-pub const DEFAULT_STACK_TOP: u64 = DEFAULT_PROCESS_INFO_VA
-    + MAX_WINDOW_REGION_PAGES * PAGE_SIZE
-    + (1 + MAX_PROCESS_STACK_PAGES as u64) * PAGE_SIZE;
+pub const DEFAULT_STACK_TOP: u64 =
+    DEFAULT_PROCESS_INFO_VA + MAX_WINDOW_REGION_PAGES * PAGE_SIZE + STACK_RESERVATION_BYTES;
+
+/// Bytes of the main-thread stack reservation: `MAX_PROCESS_STACK_PAGES`
+/// stack pages and the guard page below them.
+const STACK_RESERVATION_BYTES: u64 = (1 + MAX_PROCESS_STACK_PAGES as u64) * PAGE_SIZE;
 
 /// A fixed randomisation window: `2^slots_log2` page-aligned candidate
 /// addresses starting at `base`.
@@ -131,7 +136,10 @@ impl VaWindow
     #[must_use]
     pub const fn pick(self, r: u64) -> u64
     {
-        self.base + ((r & ((1 << self.slots_log2) - 1)) << 12)
+        // `1 << slots_log2` is at least 1, and the zone-map asserts keep the
+        // window's end below the user half, so neither operation saturates.
+        let slot_mask = (1u64 << self.slots_log2).saturating_sub(1);
+        self.base.saturating_add((r & slot_mask) << 12)
     }
 
     /// Whether `va` is one of the window's `2^slots_log2` candidate slots'
@@ -140,9 +148,19 @@ impl VaWindow
     #[must_use]
     pub const fn contains(self, va: u64) -> bool
     {
-        va >= self.base
-            && va < self.base + self.span()
-            && (va - self.base).is_multiple_of(PAGE_SIZE)
+        match va.checked_sub(self.base)
+        {
+            Some(offset) => offset < self.span() && offset.is_multiple_of(PAGE_SIZE),
+            None => false,
+        }
+    }
+
+    /// Exclusive end of the draw span, `base + span()`. The zone-map asserts
+    /// keep it below the user half, so the addition does not saturate.
+    #[must_use]
+    pub const fn end(self) -> u64
+    {
+        self.base.saturating_add(self.span())
     }
 
     /// Size in bytes of the draw span (`2^slots_log2` pages).
@@ -226,7 +244,7 @@ pub const MAX_WINDOW_REGION_PAGES: u64 = 1 << 18;
 
 const fn window_zone_end(w: VaWindow) -> u64
 {
-    w.base + w.span() + MAX_WINDOW_REGION_PAGES * PAGE_SIZE
+    w.end().saturating_add(MAX_WINDOW_REGION_PAGES * PAGE_SIZE)
 }
 
 /// Largest biased image span an image zone ending at `image_zone_end`
@@ -236,7 +254,7 @@ const fn window_zone_end(w: VaWindow) -> u64
 #[must_use]
 pub const fn image_max_span(image_zone_end: u64) -> u64
 {
-    image_zone_end.saturating_sub(IMAGE_WINDOW.base + IMAGE_WINDOW.span())
+    image_zone_end.saturating_sub(IMAGE_WINDOW.end())
 }
 
 /// One process-drawn zone: a base drawn from `window`, and up to `span`
@@ -268,7 +286,9 @@ impl GrowthZone
     #[must_use]
     pub const fn end_bound(self) -> u64
     {
-        self.window.base + self.window.span() + self.span
+        // Every zone `growth_zones` builds ends inside the user half, which
+        // its asserts check, so the addition does not saturate.
+        self.window.end().saturating_add(self.span)
     }
 }
 
@@ -339,7 +359,9 @@ pub const fn growth_zones(user_va_top: u64) -> AddressSpaceZones
         return SV39_ZONES;
     }
     // A window of `half / 64` bytes holds `half / 2^18` page slots.
-    let slots_log2 = half.ilog2() - 18;
+    // `half` is at least `SCALED_MIN_HALF`, far above 2^18, so the
+    // subtraction does not saturate.
+    let slots_log2 = half.ilog2().saturating_sub(18);
     AddressSpaceZones {
         heap: GrowthZone {
             window: VaWindow {
@@ -410,10 +432,11 @@ const SUPPORTED_USER_TOPS: [u64; 5] = [
 // arena inside the address space, and both clear of the fixed tier (below
 // the bootstrap windows under Sv39, above the image zone otherwise).
 const _: () = {
-    let mut i = 0;
-    while i < SUPPORTED_USER_TOPS.len()
+    let mut tops: &[u64] = &SUPPORTED_USER_TOPS;
+    while let [top, rest @ ..] = tops
     {
-        let top = SUPPORTED_USER_TOPS[i];
+        let top = *top;
+        tops = rest;
         let z = growth_zones(top);
         assert!(z.heap.end_bound() <= z.arena.window.base);
         assert!(z.arena.end_bound() <= top);
@@ -427,7 +450,6 @@ const _: () = {
             assert!(z.image_zone_end >= LAYOUT_VA_CEILING);
             assert!(z.image_zone_end <= z.heap.window.base);
         }
-        i += 1;
     }
 };
 
@@ -465,9 +487,12 @@ pub struct ProcessLayout
 
 fn entropy_word(entropy: &[u8; LAYOUT_ENTROPY_BYTES], index: usize) -> u64
 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&entropy[index * 8..index * 8 + 8]);
-    u64::from_le_bytes(bytes)
+    // Every caller passes an index below the four words the array holds.
+    entropy
+        .as_chunks::<8>()
+        .0
+        .get(index)
+        .map_or(0, |word| u64::from_le_bytes(*word))
 }
 
 /// Choose the bootstrap VA layout for a new process.
@@ -492,8 +517,11 @@ pub fn choose_process_layout(entropy: Option<&[u8; LAYOUT_ENTROPY_BYTES]>) -> Pr
     };
     ProcessLayout {
         process_info_va: PROCESS_INFO_WINDOW.pick(entropy_word(entropy, 0)),
-        stack_top: STACK_GUARD_WINDOW.pick(entropy_word(entropy, 1))
-            + (1 + u64::from(MAX_PROCESS_STACK_PAGES)) * PAGE_SIZE,
+        // The stack reservation above the guard window ends below the
+        // layout ceiling (the zone-map asserts), so this does not saturate.
+        stack_top: STACK_GUARD_WINDOW
+            .pick(entropy_word(entropy, 1))
+            .saturating_add(STACK_RESERVATION_BYTES),
         tls_base: MAIN_TLS_WINDOW.pick(entropy_word(entropy, 2)),
         ipc_buffer_va: IPC_BUFFER_WINDOW.pick(entropy_word(entropy, 3)),
     }
@@ -523,8 +551,8 @@ pub fn main_stack_growth(
     {
         return None;
     }
-    let base = stack_top.checked_sub(usable_pages * PAGE_SIZE)?;
-    Some((base, usable_pages - committed_pages))
+    let base = stack_top.checked_sub(usable_pages.checked_mul(PAGE_SIZE)?)?;
+    Some((base, usable_pages.checked_sub(committed_pages)?))
 }
 
 /// Pick an `ET_DYN` image load bias from [`IMAGE_WINDOW`].
@@ -559,13 +587,15 @@ pub fn validate_image_placement_below(
     image_zone_end: u64,
 ) -> bool
 {
-    if !IMAGE_WINDOW.contains(bias) || max_vaddr_end <= min_vaddr
+    if !IMAGE_WINDOW.contains(bias)
     {
         return false;
     }
-    if max_vaddr_end - min_vaddr > image_max_span(image_zone_end)
+    match max_vaddr_end.checked_sub(min_vaddr)
     {
-        return false;
+        Some(span) if span > 0 && span <= image_max_span(image_zone_end) =>
+        {}
+        _ => return false,
     }
     match bias.checked_add(max_vaddr_end)
     {

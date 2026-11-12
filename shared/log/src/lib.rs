@@ -26,6 +26,8 @@
 //! line with fields; std and svctest are the crate's consumers
 //! (`shared/log/README.md`).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(all(not(feature = "rustc-dep-of-std"), not(test)), no_std)]
@@ -264,12 +266,10 @@ unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8]) -> b
     {
         return false;
     }
-    let mut offset = 0;
-    while offset < bytes.len()
+    for chunk in bytes.chunks(CHUNK_SIZE)
     {
-        let chunk_len = (bytes.len() - offset).min(CHUNK_SIZE);
-        let msg = IpcMessage::builder(stream_label(chunk_len, level))
-            .bytes(0, &bytes[offset..offset + chunk_len])
+        let msg = IpcMessage::builder(stream_label(chunk.len(), level))
+            .bytes(0, chunk)
             .build();
         // SAFETY: ipc_buf is non-null (checked above), so the caller's
         // contract makes it this thread's registered IPC buffer page.
@@ -277,7 +277,6 @@ unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8]) -> b
         {
             return false;
         }
-        offset += chunk_len;
     }
     true
 }
@@ -300,7 +299,7 @@ pub unsafe fn write_record(cap: u64, ipc_buf: *mut u64, level: u64, record: &[u8
     {
         return;
     }
-    let record = &record[..record.len().min(CHUNK_SIZE)];
+    let record = record.get(..CHUNK_SIZE).unwrap_or(record);
     let msg = IpcMessage::builder(record_label(record.len(), level))
         .bytes(0, record)
         .build();
@@ -342,9 +341,9 @@ pub unsafe fn register_name(cap: u64, ipc_buf: *mut u64, name: &[u8])
     {
         return;
     }
-    let len = name.len().min(CHUNK_SIZE);
-    let label = STREAM_REGISTER_NAME | ((len as u64 & 0xFFFF) << 16);
-    let msg = IpcMessage::builder(label).bytes(0, &name[..len]).build();
+    let name = name.get(..CHUNK_SIZE).unwrap_or(name);
+    let label = STREAM_REGISTER_NAME | ((name.len() as u64 & 0xFFFF) << 16);
+    let msg = IpcMessage::builder(label).bytes(0, name).build();
     // SAFETY: ipc_buf is non-null (checked above), so the caller's contract
     // makes it this thread's registered IPC buffer page.
     let _ = unsafe { log_call(cap, &msg, ipc_buf) };
@@ -388,7 +387,8 @@ fn format_line(args: core::fmt::Arguments<'_>, send: impl FnMut(&[u8]) -> bool)
         /// Hand the buffered bytes to `send` and empty the buffer.
         fn flush(&mut self) -> core::fmt::Result
         {
-            let ok = self.used == 0 || (self.send)(&self.data[..self.used]);
+            let pending = self.data.get(..self.used).unwrap_or_default();
+            let ok = pending.is_empty() || (self.send)(pending);
             self.used = 0;
             if ok { Ok(()) } else { Err(core::fmt::Error) }
         }
@@ -400,14 +400,19 @@ fn format_line(args: core::fmt::Arguments<'_>, send: impl FnMut(&[u8]) -> bool)
             let mut rest = s.as_bytes();
             while !rest.is_empty()
             {
-                if self.used == self.data.len()
+                if self.used >= self.data.len()
                 {
                     self.flush()?;
                 }
-                let n = (self.data.len() - self.used).min(rest.len());
-                self.data[self.used..self.used + n].copy_from_slice(&rest[..n]);
-                self.used += n;
-                rest = &rest[n..];
+                let free = self.data.get_mut(self.used..).unwrap_or_default();
+                let n = free.len().min(rest.len());
+                for (dst, &src) in free.iter_mut().zip(rest)
+                {
+                    *dst = src;
+                }
+                // `used + n` is at most the buffer's length.
+                self.used = self.used.saturating_add(n);
+                rest = rest.get(n..).unwrap_or_default();
             }
             Ok(())
         }

@@ -17,6 +17,8 @@
 //! 16 → RGB palette lives here rather than in the driver are specified in
 //! `shared/ansi/README.md` § Scope.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 /// Windows 10 console (Campbell) 16-colour palette: ANSI colour index →
@@ -50,6 +52,21 @@ const ANSI_RGB: [[u8; 3]; 16] = [
 const DEFAULT_FG: u8 = 15;
 /// Default background: black (index 0).
 const DEFAULT_BG: u8 = 0;
+
+/// RGB of palette index `idx`. Every index the parser holds is below 16
+/// (`fg_base` and `bg_idx` are set only from a colour digit and bit 3), so
+/// the black fallback is never taken.
+fn ansi_rgb(idx: u8) -> [u8; 3]
+{
+    ANSI_RGB.get(usize::from(idx)).copied().unwrap_or([0; 3])
+}
+
+/// Last decimal digit of an SGR colour code.
+fn last_digit(code: u16) -> u8
+{
+    // A value below 10 always converts.
+    u8::try_from(code % 10).unwrap_or(0)
+}
 
 /// An output event produced by [`AnsiParser::feed`], delivered to the sink
 /// in stream order.
@@ -135,10 +152,7 @@ impl AnsiParser
             bold: false,
             sgr_skip: 0,
             sgr_await_sel: false,
-            last_sent: Some((
-                ANSI_RGB[usize::from(DEFAULT_FG)],
-                ANSI_RGB[usize::from(DEFAULT_BG)],
-            )),
+            last_sent: Some((ansi_rgb(DEFAULT_FG), ansi_rgb(DEFAULT_BG))),
         }
     }
 
@@ -147,7 +161,8 @@ impl AnsiParser
     {
         if self.fg_base < 8 && self.bold
         {
-            self.fg_base + 8
+            // Below 8, setting bit 3 adds 8.
+            self.fg_base | 8
         }
         else
         {
@@ -158,7 +173,6 @@ impl AnsiParser
     /// Apply one SGR parameter to the colour state. An unseen parameter
     /// (`seen == false`) is treated as `0` (reset). Unrecognised codes are
     /// ignored.
-    #[allow(clippy::cast_possible_truncation)] // each arm range-checks code < 256 before the cast
     fn apply_param(&mut self, value: u16, seen: bool)
     {
         let code = if seen { value } else { 0 };
@@ -177,9 +191,9 @@ impl AnsiParser
             };
             return;
         }
-        if self.sgr_skip > 0
+        if let Some(rest) = self.sgr_skip.checked_sub(1)
         {
-            self.sgr_skip -= 1;
+            self.sgr_skip = rest;
             return;
         }
         if code == 38 || code == 48
@@ -197,11 +211,13 @@ impl AnsiParser
             }
             1 => self.bold = true,
             22 => self.bold = false,
-            30..=37 => self.fg_base = (code - 30) as u8,
-            90..=97 => self.fg_base = (code - 90) as u8 + 8,
+            // Each colour range starts at a multiple of ten, so the code's last
+            // decimal digit is the colour (0..=7); bit 3 selects the bright half.
+            30..=37 => self.fg_base = last_digit(code),
+            90..=97 => self.fg_base = last_digit(code) | 8,
             39 => self.fg_base = DEFAULT_FG,
-            40..=47 => self.bg_idx = (code - 40) as u8,
-            100..=107 => self.bg_idx = (code - 100) as u8 + 8,
+            40..=47 => self.bg_idx = last_digit(code),
+            100..=107 => self.bg_idx = last_digit(code) | 8,
             49 => self.bg_idx = DEFAULT_BG,
             _ =>
             {} // italic/underline/blink/reverse/…: out of scope, ignored
@@ -214,10 +230,7 @@ impl AnsiParser
     /// success, so a failed `FB_SET_ATTRS` is retried on the next change.
     fn emit_attrs<'a>(&mut self, sink: &mut impl FnMut(Event<'a>) -> bool)
     {
-        let attrs = (
-            ANSI_RGB[usize::from(self.eff_fg())],
-            ANSI_RGB[usize::from(self.bg_idx)],
-        );
+        let attrs = (ansi_rgb(self.eff_fg()), ansi_rgb(self.bg_idx));
         if self.last_sent != Some(attrs) && sink(Event::Attrs(attrs.0, attrs.1))
         {
             self.last_sent = Some(attrs);
@@ -243,9 +256,10 @@ impl AnsiParser
                 {
                     if b == 0x1B
                     {
-                        if i > run_start
+                        if let Some(text) = bytes.get(run_start..i)
+                            && !text.is_empty()
                         {
-                            sink(Event::Text(&bytes[run_start..i]));
+                            sink(Event::Text(text));
                         }
                         self.phase = Phase::Esc;
                     }
@@ -282,7 +296,8 @@ impl AnsiParser
                         self.acc = self
                             .acc
                             .saturating_mul(10)
-                            .saturating_add(u16::from(b - b'0'));
+                            // An ASCII digit's low nibble is its value.
+                            .saturating_add(u16::from(b & 0x0F));
                         self.acc_seen = true;
                     }
                     b';' =>
@@ -303,7 +318,8 @@ impl AnsiParser
                         self.phase = Phase::Ground;
                         self.acc = 0;
                         self.acc_seen = false;
-                        run_start = i + 1;
+                        // `i` indexes `bytes`, so `i + 1` cannot saturate.
+                        run_start = i.saturating_add(1);
                     }
                     0x1B =>
                     {
@@ -319,9 +335,10 @@ impl AnsiParser
         }
 
         if let Phase::Ground = self.phase
-            && bytes.len() > run_start
+            && let Some(text) = bytes.get(run_start..)
+            && !text.is_empty()
         {
-            sink(Event::Text(&bytes[run_start..]));
+            sink(Event::Text(text));
         }
     }
 }

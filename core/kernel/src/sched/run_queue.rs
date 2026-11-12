@@ -62,15 +62,14 @@ const fn queue_index(level: u8) -> usize
 {
     if level == IDLE_PRIORITY
     {
-        IDLE_QUEUE
+        return IDLE_QUEUE;
     }
-    else if level < RT_PRIORITY_MIN
+    match level.checked_sub(RT_PRIORITY_MIN)
     {
-        FAIR_QUEUE
-    }
-    else
-    {
-        FAIR_QUEUE + 1 + (level - RT_PRIORITY_MIN) as usize
+        // An RT level's queue is its offset above the fair queue; a u8 offset
+        // is far below the saturation point.
+        Some(rt) => (rt as usize).saturating_add(FAIR_QUEUE + 1),
+        None => FAIR_QUEUE,
     }
 }
 
@@ -90,8 +89,9 @@ const fn queue_level(index: usize) -> u8
     }
     else
     {
-        // index < NUM_RUN_QUEUES <= 32, so the narrowing is lossless.
-        RT_PRIORITY_MIN + (index - FAIR_QUEUE - 1) as u8
+        // index < NUM_RUN_QUEUES <= 32, so the narrowing is lossless and the
+        // sum stays below NUM_PRIORITY_LEVELS.
+        RT_PRIORITY_MIN.saturating_add(index.saturating_sub(FAIR_QUEUE + 1) as u8)
     }
 }
 
@@ -596,14 +596,22 @@ impl PerCpuScheduler
             return false;
         }
 
-        self.increment_load();
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
         let queues = unsafe { &mut *self.queues.get() };
+        // An out-of-range priority, which the debug assertion above reports,
+        // names no queue: a release build leaves the thread unlinked and
+        // returns `false`, as it does for a double link.
+        let Some(queue) = queues.get_mut(q)
+        else
+        {
+            return false;
+        };
+        self.increment_load();
         match end
         {
-            QueueEnd::Tail => queues[q].enqueue(tcb),
-            QueueEnd::Head => queues[q].enqueue_head(tcb),
+            QueueEnd::Tail => queue.enqueue(tcb),
+            QueueEnd::Head => queue.enqueue_head(tcb),
         }
         // Tag the link under the owning scheduler.lock so any subsequent enqueue
         // (this or another CPU) observes it via the guard above. `priority` is a
@@ -657,11 +665,13 @@ impl PerCpuScheduler
             return self.idle();
         }
         // Highest set bit gives the highest non-empty run queue.
-        let q = 31 - ne.leading_zeros() as usize;
+        let q = ne.ilog2() as usize;
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
         let queues = unsafe { &mut *self.queues.get() };
-        let Some(tcb) = queues[q].dequeue()
+        let Some((queue, tcb)) = queues
+            .get_mut(q)
+            .and_then(|queue| queue.dequeue().map(|tcb| (queue, tcb)))
         else
         {
             // Invariant: the `non_empty` bit is set iff the queue is
@@ -682,7 +692,7 @@ impl PerCpuScheduler
                 "dequeue: TCB magic corrupt at {tcb:?} (queue={q}) — use-after-free?",
             );
         }
-        if queues[q].is_empty()
+        if queue.is_empty()
         {
             // Release: a later Acquire load that sees this bit cleared has
             // also seen the dequeue store above.
@@ -745,7 +755,9 @@ impl PerCpuScheduler
         }
         let level = self.current_level.load(Ordering::Relaxed);
         let quantum = super::quantum_ticks(level);
-        let remaining = slice_remaining.min(quantum) - 1;
+        // Every level's quantum is at least one tick, so the subtraction
+        // never saturates.
+        let remaining = slice_remaining.min(quantum).saturating_sub(1);
         if remaining == 0
         {
             return TickOutcome::Expired { quantum };
@@ -868,14 +880,19 @@ impl PerCpuScheduler
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
         let queues = unsafe { &mut *self.queues.get() };
-        let removed = queues[q].remove(tcb);
+        let Some(queue) = queues.get_mut(q)
+        else
+        {
+            return false;
+        };
+        let removed = queue.remove(tcb);
         if removed
         {
             // Clear the single-link tag: the TCB is no longer on any queue.
             // SAFETY: tcb is a valid TCB; owning scheduler.lock held.
             unsafe { (*tcb).queued_on.store(-1, Ordering::Relaxed) };
             self.decrement_load();
-            if queues[q].is_empty()
+            if queue.is_empty()
             {
                 self.non_empty.fetch_and(!(1 << q), Ordering::Release);
             }
@@ -903,8 +920,10 @@ impl PerCpuScheduler
         let mut ne = self.non_empty.load(Ordering::Relaxed);
         while ne != 0
         {
-            let q = 31 - ne.leading_zeros() as usize;
-            if let Some(tcb) = queues[q].find_first_where(&mut pred)
+            let q = ne.ilog2() as usize;
+            if let Some(tcb) = queues
+                .get(q)
+                .and_then(|queue| queue.find_first_where(&mut pred))
             {
                 return Some((tcb, queue_level(q)));
             }

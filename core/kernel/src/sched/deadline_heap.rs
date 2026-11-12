@@ -114,7 +114,9 @@ impl DeadlineHeap
                 meld(self.root, node)
             };
         }
-        self.len += 1;
+        // One per linked node, and every node is a live TCB's: far below
+        // saturation.
+        self.len = self.len.saturating_add(1);
     }
 
     /// Unlink `node`.
@@ -157,7 +159,8 @@ impl DeadlineHeap
             (*node).prev = core::ptr::null_mut();
             (*node).linked = false;
         }
-        self.len -= 1;
+        // `node` was linked, so the count is at least 1.
+        self.len = self.len.saturating_sub(1);
     }
 
     /// Unlink and return the node with the smallest key, or null when empty.
@@ -190,7 +193,7 @@ impl DeadlineHeap
             while !node.is_null() && seen < limit
             {
                 f(node);
-                seen += 1;
+                seen = seen.saturating_add(1);
                 if !(*node).child.is_null()
                 {
                     node = (*node).child;

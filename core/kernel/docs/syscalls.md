@@ -2631,8 +2631,8 @@ the capability nor any copy of it remains, whether or not it is bound, and is th
 later mint.
 
 One call mints one target; a caller needing K targets (a device with K MSI-X vectors) calls K
-times. The table holds at most `message_capacity` targets: one per slot of every CPU's delivery
-space, capped at `MAX_MESSAGE_TARGETS` (16384; [docs/limits.md](../../../docs/limits.md)).
+times. The table holds `message_capacity` targets, one per slot of every CPU's delivery space
+([docs/limits.md](../../../docs/limits.md)), so its targets run out only with the CPUs' slots.
 
 The kernel mints the root Interrupt capability with `RIGHTS_IRQ_MINT`
 ([capability-model.md](../../../docs/capability-model.md) § Interrupt); a minted capability does
@@ -2641,8 +2641,8 @@ not carry it.
 **Capability requirement:** `authority_cap` must be an Interrupt capability with Mint rights.
 
 **Errors:** `InvalidCapability` (`authority_cap` names no Interrupt capability),
-`InsufficientRights` (it lacks Mint), `QuotaExceeded` (no target is free: the table's targets are
-all minted, or no eligible CPU has a free slot; or the caller's `CSpace` directory is structurally
+`InsufficientRights` (it lacks Mint), `QuotaExceeded` (no target is free: no eligible CPU has a free
+slot; or the caller's `CSpace` directory is structurally
 full), `OutOfMemory` (the caller's `CSpace` pool cannot back the capability's body or slot),
 `InvalidState` (the authority's slot is held by an in-flight revoke, move, or transfer). Nothing
 changes on an error.

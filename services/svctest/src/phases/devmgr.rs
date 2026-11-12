@@ -5,8 +5,8 @@
 
 //! devmgr surface — the class, `QUERY_SHUTDOWN_DEVICE`, and `BIND_DRIVERS`
 //! authority gates, the instance ordinal of `QUERY_DEVICE`, the on-demand
-//! bind with its settle, mid-bootstrap teardown (#176), and withdrawal, and
-//! DMA confinement.
+//! bind with its settle, mid-bootstrap teardown (#176), and withdrawal, DMA
+//! confinement, and MSI delivery.
 //!
 //! The deny phases send the gated labels on `devmgr.registry`, a cap
 //! carrying `REGISTRY_QUERY_AUTHORITY` but none of `CLASS_AUTHORITY`,
@@ -47,6 +47,14 @@
 //! must have taken an IOMMU fault for the device at that address, which the
 //! fixture reads from devmgr (`DMA_FAULTS`). Without an IOMMU the phase
 //! checks the mapped copies only.
+//!
+//! The MSI delivery phase asks the same fixture to have the `edu` device
+//! raise its interrupt (`INTERRUPT_PROBE`) and asserts that the fixture
+//! holds the device's MSI vector, not its wired line, and that the message
+//! reached the fixture's notification: devmgr programmed the device's MSI
+//! capability with the message of a vector it minted and, where the IOMMU
+//! translates the device's message writes (RISC-V), made the target's
+//! interrupt file reachable through the device's domain (`MAP_MSI`).
 
 use std::os::seraph::startup_info;
 use std::time::{Duration, Instant};
@@ -87,6 +95,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "devmgr_dma_confinement",
             run: dma_confinement_phase,
+        },
+        Phase {
+            name: "devmgr_msi_delivery",
+            run: msi_delivery_phase,
         },
     ]
 }
@@ -477,20 +489,16 @@ fn assert_rebind_binds_nothing(devmgr_bind: u64, fault: u64, bound: Duration) ->
     rebind
 }
 
-/// A copy through a mapped page arrives; behind an IOMMU, a copy to the
-/// page's device address after its unmap does not, and devmgr takes a fault
-/// for it.
-fn dma_confinement_phase(caps: &Caps)
+/// The `test-dma` fixture's reply to `label` with no data, the fixture asked
+/// of the `test-dma` class (`devmgr.class.test-dma`) at ordinal 0; `phase`
+/// names the caller in a failure.
+fn call_test_dma(caps: &Caps, label: u64, phase: &str) -> ipc::IpcMessage
 {
-    use ipc::test_dma_labels::{DMA_PROBE, PROBE_PASSED, PROBE_SKIPPED};
-
     let class = caps.test_dma_class;
     assert!(
         class != 0,
-        "devmgr_dma: no devmgr.class.test-dma cap seeded: {TEST_DEVICES_HINT}"
+        "{phase}: no devmgr.class.test-dma cap seeded: {TEST_DEVICES_HINT}"
     );
-    let ipc_buf = std::os::seraph::current_ipc_buf();
-
     // Served once the settle of devmgr's drivers-directory pass ends, which
     // can lag svctest's start as the input driver's does.
     let mut query = query_class(class, 0, "test-dma");
@@ -507,15 +515,25 @@ fn dma_confinement_phase(caps: &Caps)
     {
         Ok(cap) => cap,
         Err(ipc::devmgr_errors::NO_DEVICE) => panic!(
-            "devmgr_dma: no test-dma fixture bound; the edu device is missing: \
+            "{phase}: no test-dma fixture bound; the edu device is missing: \
              {TEST_DEVICES_HINT}"
         ),
-        Err(label) => panic!("devmgr_dma: test-dma QUERY_DEVICE status {label:#x}"),
+        Err(status) => panic!("{phase}: test-dma QUERY_DEVICE status {status:#x}"),
     };
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let probe = unsafe { ipc::ipc_call(fixture, &ipc::IpcMessage::new(DMA_PROBE), ipc_buf) }
-        .expect("DMA_PROBE ipc_call failed");
+    let reply = call_fixture(fixture, label)
+        .unwrap_or_else(|e| panic!("{phase}: test-dma call {label:#x} failed: {e}"));
     let _ = syscall::cap_delete(fixture);
+    reply
+}
+
+/// A copy through a mapped page arrives; behind an IOMMU, a copy to the
+/// page's device address after its unmap does not, and devmgr takes a fault
+/// for it.
+fn dma_confinement_phase(caps: &Caps)
+{
+    use ipc::test_dma_labels::{DMA_PROBE, PROBE_PASSED, PROBE_SKIPPED};
+
+    let probe = call_test_dma(caps, DMA_PROBE, "devmgr_dma");
     assert_eq!(probe.label, ipc::devmgr_errors::SUCCESS, "DMA_PROBE setup");
     let (outcome, landed, iova) = (probe.word(0), probe.word(1) != 0, probe.word(2));
     let confined = probe.word(3) == ipc::devmgr_dma_labels::DMA_CONFINED;
@@ -557,4 +575,33 @@ fn dma_confinement_phase(caps: &Caps)
         "devmgr_dma_confinement passed: mapped copy arrived at IOVA {iova:#x}, \
          the copy after its unmap faulted ({faults} faults)"
     );
+}
+
+/// The `edu` device's MSI vector, which devmgr gave its driver, delivers: the
+/// fixture holds an MSI interrupt and the device's raise reaches it.
+fn msi_delivery_phase(caps: &Caps)
+{
+    let probe = call_test_dma(
+        caps,
+        ipc::test_dma_labels::INTERRUPT_PROBE,
+        "devmgr_msi_delivery",
+    );
+    assert_eq!(
+        probe.label,
+        ipc::devmgr_errors::SUCCESS,
+        "devmgr_msi_delivery: INTERRUPT_PROBE status"
+    );
+    let (delivered, kind) = (probe.word(0) != 0, probe.word(1));
+    assert_eq!(
+        kind,
+        driver_binding::resources::InterruptKind::Msi as u64,
+        "devmgr_msi_delivery: the fixture holds interrupt kind {kind} (0 none, 1 wired, 3 MSI-X), \
+         not MSI"
+    );
+    assert!(
+        delivered,
+        "devmgr_msi_delivery: the edu device's MSI did not reach the fixture within {} ms",
+        ipc::test_dma_labels::INTERRUPT_WAIT_MS
+    );
+    std::os::seraph::log!("devmgr_msi_delivery passed: the edu device's MSI was delivered");
 }

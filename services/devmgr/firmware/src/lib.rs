@@ -11,30 +11,27 @@
 //! broker's check) and flattened device trees for the PCI ECAM windows,
 //! computes ECAM register offsets, a function's configuration-space page,
 //! BAR sizes, the Command register values devmgr writes, the capability-list
-//! walk, and the Function Level Reset fields, walks PCI configuration space
-//! through a caller-supplied accessor, chooses the driver declaration that
-//! binds each device record within the declaration bounds (`binding`),
-//! bounds the reads of a candidate driver binary (`image`), keeps
-//! the table of MMIO and interrupt range caps devmgr carves per-device caps
-//! from, holds the interrupt lines it has carved so every device on a line
-//! gets its own derivation, tracks which spawned drivers reported their
-//! device ready, and keeps each class's served drivers, by class name
-//! (`classes`) and instance ordinal, a withdrawn one's ordinal held by a
-//! tombstone, keeps each DMA-capable device's DMA
-//! mappings (`dma`), walks the DMA Remapping table for the VT-d units and
-//! the functions each translates (`dmar`), and walks the RISC-V IO Mapping
-//! Table for the RISC-V IOMMUs that are PCI functions and the functions each
-//! translates (`rimt`), walks a DSDT or SSDT's AML namespace for the devices
-//! with a static identity and decodes their resource templates (`aml`), and
-//! parses the SPCR and the platform description table of devices no firmware
-//! table lists (`platform`).
-//! The functions read caller-mapped byte slices or values, or reach the
-//! platform only through a caller-supplied accessor or split operation, and
-//! touch no syscall, IPC, or `std::os::seraph` surface, so the crate is
-//! host-reachable and host-tested; devmgr maps the tables and config space
-//! and drives them.
-//! If another service needs the same walks, promote this to
-//! `shared/firmware`. See
+//! walk with the MSI and MSI-X capability fields, and the Function Level Reset
+//! fields, walks PCI configuration space through a caller-supplied accessor,
+//! chooses the driver declaration that binds each device record within the
+//! declaration bounds (`binding`), bounds the reads of a candidate driver
+//! binary (`image`), keeps the table of MMIO and interrupt range caps devmgr
+//! carves per-device caps from, holds the interrupt lines it has carved so
+//! every device on a line gets its own derivation, tracks which spawned drivers
+//! reported their device ready, and keeps each class's served drivers, by class
+//! name (`classes`) and instance ordinal, a withdrawn one's ordinal held by a
+//! tombstone, keeps each DMA-capable device's DMA mappings (`dma`), walks the
+//! DMA Remapping table for the VT-d units and the functions each translates
+//! (`dmar`), and walks the RISC-V IO Mapping Table for the RISC-V IOMMUs that
+//! are PCI functions and the functions each translates (`rimt`), walks a DSDT
+//! or SSDT's AML namespace for the devices with a static identity and decodes
+//! their resource templates (`aml`), and parses the SPCR and the platform
+//! description table of devices no firmware table lists (`platform`). The
+//! functions read caller-mapped byte slices or values, or reach the platform
+//! only through a caller-supplied accessor or split operation, and touch no
+//! syscall, IPC, or `std::os::seraph` surface, so the crate is host-reachable
+//! and host-tested; devmgr maps the tables and config space and drives them. If
+//! another service needs the same walks, promote this to `shared/firmware`. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]

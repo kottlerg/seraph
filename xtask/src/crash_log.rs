@@ -703,7 +703,7 @@ mod tests
     fn log_of(report: &Report<'_>, name: Option<&str>) -> String
     {
         let mut log = String::new();
-        report.emit(|line| log.push_str(&format!("[2.5] [crashd] {line}\r\n")));
+        report.emit(|line| write!(log, "[2.5] [crashd] {line}\r\n").unwrap());
         if let Some(name) = name
         {
             log.push_str(&reclaim_line(
@@ -818,7 +818,7 @@ mod tests
         let log: String = log_of(&report(ip, &regs, &[ip]), Some("crashme"))
             .lines()
             .filter(|line| !line.contains("CRASH-END"))
-            .map(|line| format!("{line}\n"))
+            .flat_map(|line| [line, "\n"])
             .collect();
         let out = symbolize_log(&log, &Fixture::dwarf("x86_64")).unwrap();
         assert!(out.contains("\n  defective block (Incomplete): fields as logged\n"));
@@ -1165,15 +1165,15 @@ mod tests
         assert_eq!(images.list(), Ok(vec!["programs/crashme".to_owned()]));
         assert_eq!(images.read("programs/crashme"), Ok(Some(b"bytes".to_vec())));
         assert_eq!(images.read("programs/absent"), Ok(None));
-        assert!(images.read("tests/programs/dir-not-file").is_err());
+        images.read("tests/programs/dir-not-file").unwrap_err();
 
         // A directory of the images that is a file, and an `.arch` that is a
         // directory, cannot be read: errors, not absences.
         std::fs::write(root.join("services"), b"").unwrap();
-        assert!(images.list().is_err());
+        images.list().unwrap_err();
         std::fs::remove_file(root.join(".arch")).unwrap();
         std::fs::create_dir(root.join(".arch")).unwrap();
-        assert!(images.arch().is_err());
+        images.arch().unwrap_err();
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(images.arch(), Ok(None));
         assert_eq!(images.list(), Ok(Vec::new()));

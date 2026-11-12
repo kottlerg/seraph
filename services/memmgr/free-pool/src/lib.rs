@@ -182,7 +182,7 @@ mod tests
     {
         let region = DemandRegion {
             va_base: 0x10000,
-            len: 0x100000,
+            len: 0x10_0000,
             prot: 0,
         };
         let chunk_bytes = u64::from(DEMAND_CHUNK_PAGES) * PAGE_SIZE;

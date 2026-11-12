@@ -257,9 +257,13 @@ mod tests
 {
     use super::*;
 
-    /// Total fixture size: header + one entry header, padded to
-    /// [`BODY_ALIGNMENT`], plus a five-byte body.
-    const FIXTURE_LEN: usize = BODY_ALIGNMENT as usize + 5;
+    /// The fixture's body offset: the header and one entry header, padded to
+    /// [`BODY_ALIGNMENT`].
+    const BODY_OFFSET: usize = 4096;
+    const _: () = assert!(BODY_OFFSET as u64 == BODY_ALIGNMENT);
+
+    /// Total fixture size: the body offset plus a five-byte body.
+    const FIXTURE_LEN: usize = BODY_OFFSET + 5;
 
     /// Build a minimal valid bundle in place: one entry named `"init"` whose
     /// body is the byte string `b"hello"` placed at offset 4096. The
@@ -275,7 +279,7 @@ mod tests
         buf[off_field..off_field + 8].copy_from_slice(&BODY_ALIGNMENT.to_le_bytes());
         let size_field = off_field + 8;
         buf[size_field..size_field + 8].copy_from_slice(&5u64.to_le_bytes());
-        buf[BODY_ALIGNMENT as usize..BODY_ALIGNMENT as usize + 5].copy_from_slice(b"hello");
+        buf[BODY_OFFSET..FIXTURE_LEN].copy_from_slice(b"hello");
         buf
     }
 

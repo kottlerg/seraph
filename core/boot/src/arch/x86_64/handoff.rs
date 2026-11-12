@@ -200,6 +200,14 @@ pub fn la57_toggle_page() -> u64
 /// `page` must be an exclusively-owned, identity-mapped, writable 4 KiB
 /// frame below 4 GiB, and the call must precede step 6, which maps the
 /// trampoline page.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "its one caller, `paging::negotiate_paging`, is `cfg(not(test))`, so host test \
+                  builds compile it with no caller"
+    )
+)]
 pub unsafe fn install_la57_toggle(page: u64) -> bool
 {
     let start = core::ptr::addr_of!(_la57_toggle);

@@ -513,6 +513,48 @@ fn insert_merged(set: &mut [MmioAperture], len: &mut usize, ap: MmioAperture) ->
     true
 }
 
+/// Sort `MemoryMapEntry` elements in `[0..count)` by `physical_base` ascending.
+///
+/// Uses an in-place insertion sort; see `core/boot/docs/memory-map.md`
+/// § Sort Algorithm for why the algorithm class is acceptable.
+///
+/// # Safety
+/// `entries` must point to an allocation of at least `count` valid, initialised
+/// `MemoryMapEntry` elements.
+pub unsafe fn insertion_sort_memory_map(entries: *mut MemoryMapEntry, count: usize)
+{
+    for i in 1..count
+    {
+        // SAFETY: i < count, so the offset stays inside the allocation.
+        let key_slot = unsafe { entries.add(i) };
+        // SAFETY: entries[i] is a valid initialised MemoryMapEntry.
+        let key = unsafe { core::ptr::read(key_slot) };
+        let mut j = i;
+
+        while let Some(prev) = j.checked_sub(1)
+        {
+            // SAFETY: prev < i < count, so the offset stays inside the allocation.
+            let prev_slot = unsafe { entries.add(prev) };
+            // SAFETY: entries[prev] is initialised.
+            let prev_base = unsafe { (*prev_slot).physical_base };
+            if prev_base <= key.physical_base
+            {
+                break;
+            }
+            // SAFETY: j ≤ i < count, so the offset stays inside the allocation.
+            let j_slot = unsafe { entries.add(j) };
+            // SAFETY: entries[prev] and entries[j] are distinct elements of the allocation.
+            unsafe { core::ptr::copy_nonoverlapping(prev_slot, j_slot, 1) };
+            j = prev;
+        }
+
+        // SAFETY: j ≤ i < count, so the offset stays inside the allocation.
+        let j_slot = unsafe { entries.add(j) };
+        // SAFETY: entries[j] is within the allocation; its old value was copied up or is `key`.
+        unsafe { core::ptr::write(j_slot, key) };
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -664,6 +706,7 @@ mod tests
     fn already_sorted_input_unchanged()
     {
         let mut entries = vec![make_entry(0x1000), make_entry(0x2000), make_entry(0x3000)];
+        // SAFETY: `entries` holds `entries.len()` initialised entries.
         unsafe { insertion_sort_memory_map(entries.as_mut_ptr(), entries.len()) };
         assert_eq!(entries[0].physical_base, 0x1000);
         assert_eq!(entries[1].physical_base, 0x2000);
@@ -674,6 +717,7 @@ mod tests
     fn reverse_sorted_input_is_sorted()
     {
         let mut entries = vec![make_entry(0x3000), make_entry(0x2000), make_entry(0x1000)];
+        // SAFETY: `entries` holds `entries.len()` initialised entries.
         unsafe { insertion_sort_memory_map(entries.as_mut_ptr(), entries.len()) };
         assert_eq!(entries[0].physical_base, 0x1000);
         assert_eq!(entries[1].physical_base, 0x2000);
@@ -684,7 +728,7 @@ mod tests
     fn empty_input_does_not_panic()
     {
         let mut entries: Vec<MemoryMapEntry> = Vec::new();
-        // count=0: the loop body never runs; nothing is read or written.
+        // SAFETY: count=0: the loop body never runs; nothing is read or written.
         unsafe { insertion_sort_memory_map(entries.as_mut_ptr(), 0) };
     }
 
@@ -692,6 +736,7 @@ mod tests
     fn single_element_input_unchanged()
     {
         let mut entries = vec![make_entry(0xABCD)];
+        // SAFETY: `entries` holds one initialised entry.
         unsafe { insertion_sort_memory_map(entries.as_mut_ptr(), 1) };
         assert_eq!(entries[0].physical_base, 0xABCD);
     }
@@ -706,6 +751,7 @@ mod tests
             make_entry(0x3000),
         ];
         // Must not crash; exact ordering of duplicates is unspecified.
+        // SAFETY: `entries` holds `entries.len()` initialised entries.
         unsafe { insertion_sort_memory_map(entries.as_mut_ptr(), entries.len()) };
         // First element must be one of the 0x1000 entries.
         assert_eq!(entries[0].physical_base, 0x1000);
@@ -721,8 +767,8 @@ mod tests
         let stride = size_of::<EfiMemoryDescriptor>();
         let uefi_map = MemoryMapResult {
             buffer_phys: descs.as_ptr() as u64,
-            buffer_size: descs.len() * stride,
-            map_size: descs.len() * stride,
+            buffer_size: std::mem::size_of_val(descs),
+            map_size: std::mem::size_of_val(descs),
             map_key: 0,
             descriptor_size: stride,
         };
@@ -732,6 +778,8 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; max_entries];
+        // SAFETY: `out` holds `max_entries` entries, and `descs` is a live, aligned
+        // descriptor array covering `map_size` at the descriptor's own stride.
         let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), max_entries) };
         out.truncate(count);
         out
@@ -859,6 +907,8 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; 3];
+        // SAFETY: `out` holds 3 entries, and `descs` holds the 3 descriptors the
+        // reported map size covers, so even a read of the whole map stays in `descs`.
         let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 3) };
         assert_eq!(count, 2);
         assert_eq!(out[1].physical_base, 0x1000);
@@ -896,6 +946,8 @@ mod tests
                 descriptor_size: stride,
                 ..uefi_map
             };
+            // SAFETY: `out` holds 1 entry, and `descs` is a live, aligned descriptor
+            // array covering `map_size`; a stride below the descriptor reads nothing.
             let count = unsafe { translate_memory_map(&map, out.as_mut_ptr(), 1) };
             assert_eq!(count, 0, "stride {stride}");
         }
@@ -942,6 +994,8 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; 4];
+        // SAFETY: `out` holds 4 entries, and `buf` is a live, 8-byte-aligned buffer of
+        // one `stride`-byte slot holding the descriptor written above.
         let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 4) };
         assert_eq!(count, 1);
         assert_eq!(out[0].memory_type, MemoryType::Persistent);
@@ -979,8 +1033,8 @@ mod tests
     {
         let uefi_map = MemoryMapResult {
             buffer_phys: descs.as_ptr() as u64,
-            buffer_size: descs.len() * size_of::<EfiMemoryDescriptor>(),
-            map_size: descs.len() * size_of::<EfiMemoryDescriptor>(),
+            buffer_size: std::mem::size_of_val(descs),
+            map_size: std::mem::size_of_val(descs),
             map_key: 0,
             descriptor_size: stride,
         };
@@ -1340,47 +1394,5 @@ mod tests
         let descs = [desc(EFI_CONVENTIONAL_MEMORY, 0x2000_0000, 1)];
         let out = run_derive_with(&descs, 0, &[ap(0x2000_0000, 0x2000)], &[]);
         assert_eq!(pairs(&out), vec![(0x2000_0000, 0x2000)]);
-    }
-}
-
-/// Sort `MemoryMapEntry` elements in `[0..count)` by `physical_base` ascending.
-///
-/// Uses an in-place insertion sort; see `core/boot/docs/memory-map.md`
-/// § Sort Algorithm for why the algorithm class is acceptable.
-///
-/// # Safety
-/// `entries` must point to an allocation of at least `count` valid, initialised
-/// `MemoryMapEntry` elements.
-pub unsafe fn insertion_sort_memory_map(entries: *mut MemoryMapEntry, count: usize)
-{
-    for i in 1..count
-    {
-        // SAFETY: i < count, so the offset stays inside the allocation.
-        let key_slot = unsafe { entries.add(i) };
-        // SAFETY: entries[i] is a valid initialised MemoryMapEntry.
-        let key = unsafe { core::ptr::read(key_slot) };
-        let mut j = i;
-
-        while let Some(prev) = j.checked_sub(1)
-        {
-            // SAFETY: prev < i < count, so the offset stays inside the allocation.
-            let prev_slot = unsafe { entries.add(prev) };
-            // SAFETY: entries[prev] is initialised.
-            let prev_base = unsafe { (*prev_slot).physical_base };
-            if prev_base <= key.physical_base
-            {
-                break;
-            }
-            // SAFETY: j ≤ i < count, so the offset stays inside the allocation.
-            let j_slot = unsafe { entries.add(j) };
-            // SAFETY: entries[prev] and entries[j] are distinct elements of the allocation.
-            unsafe { core::ptr::copy_nonoverlapping(prev_slot, j_slot, 1) };
-            j = prev;
-        }
-
-        // SAFETY: j ≤ i < count, so the offset stays inside the allocation.
-        let j_slot = unsafe { entries.add(j) };
-        // SAFETY: entries[j] is within the allocation; its old value was copied up or is `key`.
-        unsafe { core::ptr::write(j_slot, key) };
     }
 }

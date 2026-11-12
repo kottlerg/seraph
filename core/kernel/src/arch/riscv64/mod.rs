@@ -43,9 +43,6 @@ pub const MAX_IRQ_ID: u32 = aia_encoding::APLIC_MAX_SOURCES;
 
 /// Minimum valid APLIC source number. APLIC source 0 is reserved and never
 /// wired to a real device.
-// dead_code: host test builds compile out its readers (`sys_irq_register`,
-// `dealloc_object_one`).
-#[cfg_attr(test, allow(dead_code))]
 pub const MIN_IRQ_ID: u32 = 1;
 
 /// RISC-V has no I/O port space: no root `IoPort` capability is minted and

@@ -1035,7 +1035,7 @@ mod tests
             // outlive the state within each test.
             let mut ws = unsafe {
                 WaitSetState::new(
-                    CAP as u16,
+                    u16::try_from(CAP).unwrap(),
                     self.members.as_mut_ptr(),
                     self.ring.as_mut_ptr(),
                 )
@@ -1110,7 +1110,6 @@ mod tests
     }
 
     /// The readiness predicate of a set whose every source is ready.
-
     fn always_ready(_: &WaitSetMember) -> bool
     {
         true
@@ -1475,14 +1474,14 @@ mod tests
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let cap = 1 + rng.below(MODEL_CAP);
         let mut members = [const { WaitSetMember::vacant() }; MODEL_CAP];
-        let mut ring = [0u16; MODEL_CAP + 1];
+        let mut ready_ring = [0u16; MODEL_CAP + 1];
         // SAFETY: the arrays hold MODEL_CAP >= cap members and cap + 1 ring
         // slots, and outlive ws.
         let mut ws = unsafe {
             WaitSetState::new(
                 u16::try_from(cap).unwrap(),
                 members.as_mut_ptr(),
-                ring.as_mut_ptr(),
+                ready_ring.as_mut_ptr(),
             )
         };
         let mut w = World {

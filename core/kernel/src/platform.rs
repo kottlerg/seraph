@@ -490,9 +490,9 @@ mod tests
     fn run_filter(raw: &[MmioAperture], map: &[MemoryMapEntry]) -> (Vec<MmioAperture>, usize)
     {
         let raw: &'static [MmioAperture] = Box::leak(raw.to_vec().into_boxed_slice());
-        let mmap: &'static [MemoryMapEntry] = Box::leak(map.to_vec().into_boxed_slice());
-        let view = ValidatedApertures { raw, mmap };
-        let counts = report_apertures(raw, mmap);
+        let entries: &'static [MemoryMapEntry] = Box::leak(map.to_vec().into_boxed_slice());
+        let view = ValidatedApertures { raw, mmap: entries };
+        let counts = report_apertures(raw, entries);
         let accepted: Vec<MmioAperture> = view.iter().copied().collect();
         assert_eq!(
             accepted.len(),

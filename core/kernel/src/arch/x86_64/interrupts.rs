@@ -735,8 +735,6 @@ pub unsafe fn enable()
 }
 
 /// Return `true` if the interrupt flag (IF) is set in RFLAGS.
-// dead_code: sole caller sched::check_lock_hold_preemptible is cfg(not(test)); dead in host tests.
-#[cfg_attr(test, allow(dead_code))]
 pub fn are_enabled() -> bool
 {
     let rflags: u64;
@@ -994,6 +992,10 @@ pub unsafe fn route_device_irq(
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the stub keeps the signature of the non-test item, which can fail"
+)]
 pub unsafe fn route_device_irq(
     _irq: u32,
     _mode: u32,

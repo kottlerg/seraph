@@ -684,7 +684,10 @@ mod tests
         assert_eq!(counts.track(&unlimited).unwrap(), 0);
         counts.note(&unlimited.name);
         assert_eq!(counts.track(&unlimited).unwrap(), 0);
-        assert!(counts.counts.is_empty());
+        assert_eq!(
+            counts.counts,
+            [] as [(driver_binding::decl::Text<32>, u16); 0]
+        );
     }
 
     #[test]

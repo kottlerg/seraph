@@ -1181,7 +1181,7 @@ mod tests
         assert_eq!(drhd_register_window(&drhd(0, 0xfed9_0000)[..12], 0), None);
         assert_eq!(drhd_register_window(&drhd(0, 0), 0), None);
         assert_eq!(drhd_register_window(&drhd(0, 0xfed9_0010), 0), None);
-        assert_eq!(drhd_register_window(&drhd(0, u64::MAX & !0xfff), 0), None);
+        assert_eq!(drhd_register_window(&drhd(0, !0xfff), 0), None);
     }
 
     #[test]
@@ -1238,7 +1238,7 @@ mod tests
             {
                 MADT_TYPE_LAPIC =>
                 {
-                    t.extend_from_slice(&[MADT_TYPE_LAPIC, 8, 0, id as u8]);
+                    t.extend_from_slice(&[MADT_TYPE_LAPIC, 8, 0, u8::try_from(id).unwrap()]);
                     t.extend_from_slice(&1u32.to_le_bytes());
                 }
                 MADT_TYPE_LOCAL_X2APIC =>
@@ -1259,19 +1259,19 @@ mod tests
                 other => panic!("madt(): unsupported entry type {other}"),
             }
         }
-        let len = t.len() as u32;
+        let len = u32::try_from(t.len()).unwrap();
         t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
         t
     }
 
     /// A synthetic SDT: `signature`, the length field over `body`, then
     /// `body` after the 36-byte header.
-    fn sdt(signature: &[u8; 4], body: &[u8]) -> Vec<u8>
+    fn sdt(signature: [u8; 4], body: &[u8]) -> Vec<u8>
     {
         let mut t = vec![0u8; SDT_HDR_LEN];
-        t[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4].copy_from_slice(signature);
+        t[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4].copy_from_slice(&signature);
         t.extend_from_slice(body);
-        let len = t.len() as u32;
+        let len = u32::try_from(t.len()).unwrap();
         t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
         t
     }
@@ -1292,7 +1292,7 @@ mod tests
         madt_body.extend_from_slice(&0u32.to_le_bytes());
         madt_body.extend_from_slice(&[MADT_TYPE_LAPIC_OVERRIDE, 12, 0, 0]);
         madt_body.extend_from_slice(&0xFEE0_1000u64.to_le_bytes());
-        let madt = sdt(b"APIC", &madt_body);
+        let madt = sdt(*b"APIC", &madt_body);
         // MCFG: one ECAM above 2 GiB (the q35 branch) and one below (virt),
         // each with its two heuristic PCI windows.
         let mut mcfg_body = vec![0u8; MCFG_ENTRIES_OFF - SDT_HDR_LEN];
@@ -1301,12 +1301,12 @@ mod tests
             mcfg_body.extend_from_slice(&base.to_le_bytes());
             mcfg_body.extend_from_slice(&[0, 0, 0, 0xFF, 0, 0, 0, 0]);
         }
-        let mcfg = sdt(b"MCFG", &mcfg_body);
+        let mcfg = sdt(*b"MCFG", &mcfg_body);
         let mut xsdt_body = Vec::new();
         xsdt_body.extend_from_slice(&(madt.as_ptr() as u64).to_le_bytes());
         xsdt_body.extend_from_slice(&(mcfg.as_ptr() as u64).to_le_bytes());
-        let xsdt = sdt(b"XSDT", &xsdt_body);
-        let mut rsdp = vec![0u8; 36];
+        let xsdt = sdt(*b"XSDT", &xsdt_body);
+        let mut rsdp = [0u8; 36];
         rsdp[..8].copy_from_slice(RSDP_SIG);
         rsdp[RSDP_OFF_REVISION] = 2;
         rsdp[RSDP_OFF_XSDT..RSDP_OFF_XSDT + 8]
@@ -1439,8 +1439,8 @@ mod tests
     {
         let mut xsdt_body = Vec::new();
         xsdt_body.extend_from_slice(&(madt.as_ptr() as u64).to_le_bytes());
-        let xsdt = sdt(b"XSDT", &xsdt_body);
-        let mut rsdp = vec![0u8; 36];
+        let xsdt = sdt(*b"XSDT", &xsdt_body);
+        let mut rsdp = [0u8; 36];
         rsdp[..8].copy_from_slice(RSDP_SIG);
         rsdp[RSDP_OFF_REVISION] = 2;
         rsdp[RSDP_OFF_XSDT..RSDP_OFF_XSDT + 8]
@@ -1601,7 +1601,7 @@ mod tests
     #[test]
     fn madt_surplus_beyond_max_cpus_is_dropped_and_reported()
     {
-        let max = MAX_CPUS as u32;
+        let max = u32::try_from(MAX_CPUS).unwrap();
         let entries: Vec<(u8, u32)> = (0..=max).map(|id| (MADT_TYPE_LOCAL_X2APIC, id)).collect();
         let (count, ids, truncated) = topology_full(&entries, 0);
         assert_eq!(count, max);
@@ -1612,7 +1612,7 @@ mod tests
     #[test]
     fn madt_full_without_the_bsp_drops_one_ap_and_reports_it()
     {
-        let max = MAX_CPUS as u32;
+        let max = u32::try_from(MAX_CPUS).unwrap();
         let entries: Vec<(u8, u32)> = (1..=max).map(|id| (MADT_TYPE_LOCAL_X2APIC, id)).collect();
         let (count, ids, truncated) = topology_full(&entries, 0);
         assert_eq!(count, max);
@@ -1623,7 +1623,7 @@ mod tests
     #[test]
     fn madt_exactly_max_cpus_with_the_bsp_is_not_truncated()
     {
-        let max = MAX_CPUS as u32;
+        let max = u32::try_from(MAX_CPUS).unwrap();
         let entries: Vec<(u8, u32)> = (0..max).map(|id| (MADT_TYPE_LOCAL_X2APIC, id)).collect();
         assert_eq!(topology(&entries, 0), (max, (0..max).collect::<Vec<u32>>()));
     }
@@ -1636,19 +1636,19 @@ mod tests
         t[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4].copy_from_slice(b"RHCT");
         t[RHCT_OFF_TIMEBASE..RHCT_OFF_TIMEBASE + 8].copy_from_slice(&timebase.to_le_bytes());
         t[RHCT_OFF_NODE_COUNT..RHCT_OFF_NODE_COUNT + 4]
-            .copy_from_slice(&(nodes.len() as u32).to_le_bytes());
+            .copy_from_slice(&u32::try_from(nodes.len()).unwrap().to_le_bytes());
         t[RHCT_OFF_NODE_OFFSET..RHCT_OFF_NODE_OFFSET + 4].copy_from_slice(&56u32.to_le_bytes());
 
         for &(node_type, payload) in nodes
         {
-            let node_len = (RHCT_NODE_HDR_LEN + payload.len()) as u16;
+            let node_len = u16::try_from(RHCT_NODE_HDR_LEN + payload.len()).unwrap();
             t.extend_from_slice(&node_type.to_le_bytes());
             t.extend_from_slice(&node_len.to_le_bytes());
             t.extend_from_slice(&1u16.to_le_bytes()); // revision
             t.extend_from_slice(payload);
         }
 
-        let len = t.len() as u32;
+        let len = u32::try_from(t.len()).unwrap();
         t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
         t
     }
@@ -1657,7 +1657,7 @@ mod tests
     fn isa_payload(isa: &[u8]) -> Vec<u8>
     {
         let mut p = Vec::new();
-        p.extend_from_slice(&((isa.len() + 1) as u16).to_le_bytes());
+        p.extend_from_slice(&u16::try_from(isa.len() + 1).unwrap().to_le_bytes());
         p.extend_from_slice(isa);
         p.push(0);
         p
@@ -1743,7 +1743,7 @@ mod tests
         let mut t = vec![0u8; SDT_HDR_LEN];
         t[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4].copy_from_slice(b"SSDT");
         t.extend_from_slice(body);
-        let len = t.len() as u32;
+        let len = u32::try_from(t.len()).unwrap();
         t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
         t
     }

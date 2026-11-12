@@ -1102,6 +1102,11 @@ mod tests
         Exited,
     }
 
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "a simulated thread's flags are independent kernel states the session \
+                  reads one by one; they form no state machine"
+    )]
     struct Thread
     {
         run: Run,
@@ -1160,7 +1165,7 @@ mod tests
 
     fn thread_of(cap: u64) -> usize
     {
-        (cap - 1000) as usize
+        usize::try_from(cap - 1000).unwrap()
     }
 
     impl Sim
@@ -1343,26 +1348,23 @@ mod tests
             {
                 None
             };
-            match taken
+            if let Some(d) = taken
             {
-                Some(d) =>
-                {
-                    self.busy += 1;
-                    self.ds[d].taken = true;
-                    let x = &self.ds[d];
-                    Some(Stop {
-                        receiver: d,
-                        badge: x.badge,
-                        kind: x.kind,
-                        detail: x.detail,
-                        ip: x.ip,
-                    })
-                }
-                None =>
-                {
-                    self.time = self.time.max(until);
-                    None
-                }
+                self.busy += 1;
+                self.ds[d].taken = true;
+                let x = &self.ds[d];
+                Some(Stop {
+                    receiver: d,
+                    badge: x.badge,
+                    kind: x.kind,
+                    detail: x.detail,
+                    ip: x.ip,
+                })
+            }
+            else
+            {
+                self.time = self.time.max(until);
+                None
             }
         }
 
@@ -1515,7 +1517,7 @@ mod tests
                 .filter(|&t| self.threads[t].registered && self.threads[t].run != Run::Exited)
                 .map(cap_of)
                 .collect();
-            let first = first as usize;
+            let first = usize::try_from(first).unwrap();
             let caps: Vec<u64> = listed.iter().skip(first).take(room).copied().collect();
             Some(Page {
                 count: listed.len() as u64,
@@ -2037,7 +2039,7 @@ mod tests
         let (mut sim, mut s) = attached();
         let held = s.threads[0].held.unwrap();
         // Slots of exited threads, each still holding a stop.
-        let mut hold_more = |s: &mut Session, n: usize| {
+        let hold_more = |s: &mut Session, n: usize| {
             for _ in 0..n
             {
                 s.threads.push(Slot {
@@ -2076,6 +2078,6 @@ mod tests
         sim.hit(0, 0x100);
         let d = sim.queue.pop_front().unwrap();
         sim.reply(d, RESUME);
-        assert!(!sim.broken.is_empty());
+        assert_ne!(sim.broken, [] as [String; 0]);
     }
 }

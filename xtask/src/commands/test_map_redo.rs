@@ -183,7 +183,7 @@ mod tests
     fn a_boot_without_the_knob_line_fails()
     {
         let log = format!("[--------] boot: step 8/10: ExitBootServices\n{PASS}\n{TRAILER}\n");
-        assert!(check_log(&log).is_err());
+        check_log(&log).unwrap_err();
     }
 
     // Defect caught: a redo the map's own growth caused standing in for the
@@ -195,7 +195,7 @@ mod tests
             "[--------] boot: memory map: a buffer of 300 descriptors past the 200-entry array; \
              redoing steps 6 and 7\n{PASS}\n{TRAILER}\n"
         );
-        assert!(check_log(&log).is_err());
+        check_log(&log).unwrap_err();
     }
 
     // Defect caught: a staged svctest failing its devmgr phases because the
@@ -217,7 +217,7 @@ mod tests
     fn two_knob_redos_fail()
     {
         let log = format!("{REDO}\n{REDO}\n{PASS}\n{TRAILER}\n");
-        assert!(check_log(&log).is_err());
+        check_log(&log).unwrap_err();
     }
 
     // Defect caught: a redo after which the boot did not complete passing the
@@ -226,7 +226,7 @@ mod tests
     fn a_boot_without_the_pass_marker_fails()
     {
         let log = format!("{REDO}\n[52.1] [ktest] SOME TESTS FAILED\n");
-        assert!(check_log(&log).is_err());
+        check_log(&log).unwrap_err();
     }
 
     // Defect caught: a host-emulator crash, which run-parallel tolerates,

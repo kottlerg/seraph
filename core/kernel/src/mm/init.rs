@@ -918,7 +918,10 @@ mod tests
     #[test]
     fn free_pieces_of_a_fully_excluded_range_are_none()
     {
-        assert!(pieces(0x1000, 0x3000, &[(0, 0x2000), (0x2000, 0x4000)]).is_empty());
+        assert_eq!(
+            pieces(0x1000, 0x3000, &[(0, 0x2000), (0x2000, 0x4000)]),
+            [] as [(u64, u64); 0]
+        );
     }
 
     #[test]

@@ -4598,7 +4598,7 @@ mod tests
         let good = encode(2, blk_labels::MOUNT_AUTHORITY).unwrap();
         assert_eq!(decode(good & !devmgr_labels::class_badge::SLOT_MASK), None);
         assert_eq!(decode(good | devmgr_labels::REGISTRY_QUERY_AUTHORITY), None);
-        assert_eq!(decode(good | 1 << 30), None);
+        assert_eq!(decode(good | (1 << 30)), None);
     }
 
     #[test]
@@ -4738,7 +4738,7 @@ mod tests
     #[test]
     fn a_fault_reply_fits_its_count_and_two_words_per_fault()
     {
-        assert!(1 + 2 * iommu_labels::MAX_FAULTS_PER_REPLY <= MSG_DATA_WORDS_MAX);
+        const { assert!(2 * iommu_labels::MAX_FAULTS_PER_REPLY < MSG_DATA_WORDS_MAX) };
     }
 
     /// A `REQUEST_MEMORY_CAPS` reply with `label`, data `words`, and one

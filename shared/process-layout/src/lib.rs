@@ -692,7 +692,7 @@ mod tests
     #[test]
     fn max_draw_tail_stays_inside_stride()
     {
-        let max = [0xFF_u8; LAYOUT_ENTROPY_BYTES];
+        let max = [0xFFu8; LAYOUT_ENTROPY_BYTES];
         let layout = choose_process_layout(Some(&max));
         assert!(layout.stack_top <= STACK_GUARD_WINDOW.base + 0x0002_4000_0000);
         assert!(
@@ -714,7 +714,7 @@ mod tests
     #[test]
     fn image_bias_is_aligned_and_in_window()
     {
-        for r in [0_u64, 1, u64::MAX, 0xDEAD_BEEF_DEAD_BEEF]
+        for r in [0u64, 1, u64::MAX, 0xDEAD_BEEF_DEAD_BEEF]
         {
             let bias = choose_image_bias(r);
             assert!(IMAGE_WINDOW.contains(bias));

@@ -318,6 +318,11 @@ mod tests
 
     /// A heap over `keys.len()` boxed nodes; returns the nodes so the test
     /// can remove specific ones.
+    #[expect(
+        clippy::vec_box,
+        reason = "each node needs its own allocation: the heap links the nodes by raw pointer, and \
+                  indexing a flat vector would reborrow every node the heap still points at"
+    )]
     fn filled(keys: &[u64]) -> (DeadlineHeap, Vec<Box<DeadlineNode>>)
     {
         let mut heap = DeadlineHeap::new();

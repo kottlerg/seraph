@@ -87,20 +87,20 @@ mod tests
     #[test]
     fn accepts_single_byte_ascii_name()
     {
-        assert!(validate_name(b"a").is_ok());
+        validate_name(b"a").unwrap();
     }
 
     #[test]
     fn accepts_utf8_multibyte_name()
     {
-        assert!(validate_name("café".as_bytes()).is_ok());
+        validate_name("café".as_bytes()).unwrap();
     }
 
     #[test]
     fn accepts_max_length_name()
     {
         let n = [b'x'; MAX_NAME_LEN];
-        assert!(validate_name(&n).is_ok());
+        validate_name(&n).unwrap();
     }
 
     #[test]
@@ -150,7 +150,7 @@ mod tests
     fn rejects_leading_dot_only_for_exact_dot()
     {
         // `.foo` is a regular name; only `.` and `..` are reserved.
-        assert!(validate_name(b".foo").is_ok());
-        assert!(validate_name(b"...").is_ok());
+        validate_name(b".foo").unwrap();
+        validate_name(b"...").unwrap();
     }
 }

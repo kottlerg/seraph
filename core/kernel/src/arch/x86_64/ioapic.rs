@@ -119,8 +119,6 @@ pub const IOAPIC_MAX_PINS: u32 = 256;
 
 /// The physical-mode destination id that delivers to every local APIC (all ones in the
 /// 8-bit field); no single CPU can be named by it.
-// dead_code: host test builds compile out its reader (`interrupts::route_device_irq`).
-#[cfg_attr(test, allow(dead_code))]
 pub const BROADCAST_APIC_ID: u32 = 0xFF;
 
 /// One CPU's device vectors: the slot entry of each ([`SlotEntry`], the source it
@@ -131,9 +129,6 @@ pub const BROADCAST_APIC_ID: u32 = 0xFF;
 /// vector is taken again only once the search comes round to it, not by the next route
 /// while other vectors are free (`interrupts::unroute_device_irq`). The zeroed row is all
 /// free, its search starting at the first vector.
-// dead_code: host test builds compile out the readers of its fields (`vector_row` and
-// its callers); the host tests drive the same helpers over a bare table.
-#[cfg_attr(test, allow(dead_code))]
 #[repr(C)]
 struct VectorRow
 {
@@ -790,7 +785,7 @@ mod tests
         assert_eq!(release_vector_in(&t, DEVICE_VECTOR_COUNT, 3), 3);
         assert_eq!(release_vector_in(&t, usize::MAX, 3), 3);
         assert_eq!(t[index(held)].load(), Slot::Line(7));
-        assert!(t.iter().filter(|entry| !entry.is_free()).count() == 1);
+        assert_eq!(t.iter().filter(|entry| !entry.is_free()).count(), 1);
     }
 
     #[test]
@@ -825,10 +820,10 @@ mod tests
     fn a_physical_entry_names_the_apic_id_and_a_remapped_one_the_handle()
     {
         let (low, high) = redirection_entry(33, 0, Destination::Physical(5));
-        assert_eq!((low, high), (REDIR_MASK | 33, 5 << 24));
+        assert_eq!((low, high), (REDIR_MASK | 0x21, 0x5 << 24));
         let (low, high) = redirection_entry(40, 0, Destination::Remapped(0x8001));
         // Handle bit 15 in low bit 11, bits 14:0 above the format bit.
-        assert_eq!(low, REDIR_MASK | 40 | (1 << 11));
+        assert_eq!(low, REDIR_MASK | 0x28 | (0x1 << 11));
         assert_eq!(high, (1 << 17) | (1 << 16));
     }
 

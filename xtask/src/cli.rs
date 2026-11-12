@@ -1343,6 +1343,6 @@ mod tests
         }
         assert_eq!(parse_build_component("boot"), Ok(BuildComponent::Boot));
         assert_eq!(parse_build_component("all"), Ok(BuildComponent::All));
-        assert!(parse_build_component("no-such-crate").is_err());
+        parse_build_component("no-such-crate").unwrap_err();
     }
 }

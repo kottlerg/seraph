@@ -865,7 +865,7 @@ mod tests
         // The body: `G` and the block in hex.
         for arch in [Arch::X86_64, Arch::Riscv64]
         {
-            assert!(1 + arch.register_block_len() * 2 <= PACKET_SIZE);
+            assert!(arch.register_block_len() * 2 < PACKET_SIZE);
         }
     }
 }

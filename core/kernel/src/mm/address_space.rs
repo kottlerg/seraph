@@ -229,9 +229,6 @@ pub struct AddressSpace
     /// between the read and the free (see the `tag_allocator` § Concurrency).
     /// `u16` holds every hardware tag: x86-64 PCIDs are 12 bits and RISC-V
     /// ASIDs at most 16 (`satp.ASID`).
-    // dead_code: the tag fields are accessed only on `#[cfg(not(test))]` paths
-    // (activate / shootdown / destroy), so host-test builds see them as unread.
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) tag: AtomicU16,
     /// The global allocator generation stamped when this space claimed its
     /// current `tag`. Globally unique per claim; distinguishes this space's
@@ -239,8 +236,6 @@ pub struct AddressSpace
     /// per-CPU generation check flushes a tag before its first use under a new
     /// owner. A `u64` cannot wrap: at one claim per nanosecond it lasts over 500
     /// years.
-    // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths; unread in host-test builds.
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) tag_gen: AtomicU64,
     /// Bumped (when tagging is enabled) on every Replace-class modification
     /// (unmap, remap to a different frame, permission narrow).
@@ -249,8 +244,6 @@ pub struct AddressSpace
     /// unmaps it missed while it was elsewhere.
     /// A `u64` cannot wrap: at one modification per nanosecond it lasts over 500
     /// years.
-    // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths; unread in host-test builds.
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) tlb_gen: AtomicU64,
     /// Observers to notify when a thread in this address space takes a
     /// terminal fault: a chain of death-observer nodes, each drawn from the
@@ -1779,7 +1772,6 @@ mod active_cpu_words_tests
             + crate::cpu_mask::words_for(crate::sched::MAX_CPUS)
                 * core::mem::size_of::<AtomicU64>();
         assert!(used <= PAGE_SIZE, "{used} bytes of the wrapper page");
-        assert!(ACTIVE_CPU_WORDS_FIT);
     }
 }
 
@@ -1832,7 +1824,7 @@ mod thread_mem_tests
         assert_eq!(
             spans,
             [PageSpan {
-                page: u64::MAX & !(page - 1),
+                page: !(page - 1),
                 in_page: PAGE_SIZE - 2,
                 offset: 0,
                 len: 1
@@ -1849,7 +1841,7 @@ mod thread_mem_tests
         let pages: Vec<u64> = span_pages(4 * page, 3).unwrap().collect();
         assert_eq!(pages, [4 * page, 5 * page, 6 * page]);
         assert_eq!(span_pages(page, 0).unwrap().count(), 0);
-        assert!(span_pages(u64::MAX & !(page - 1), 1).is_none());
+        assert!(span_pages(!(page - 1), 1).is_none());
         assert!(span_pages(0, usize::MAX).is_none());
     }
 
@@ -1873,14 +1865,12 @@ mod thread_mem_tests
         let check = |writable, text, mappings: u64| {
             thread_mem_write_check(leaf(writable), rx, text, || mappings)
         };
-        assert!(
-            thread_mem_write_check(leaf(true), rx, TextWrite::Refused, || unreachable!()).is_ok()
-        );
+        thread_mem_write_check(leaf(true), rx, TextWrite::Refused, || unreachable!()).unwrap();
         assert_eq!(
             check(false, TextWrite::Refused, 1),
             Err(SyscallError::InsufficientRights)
         );
-        assert!(check(false, TextWrite::Permitted, 1).is_ok());
+        check(false, TextWrite::Permitted, 1).unwrap();
         assert_eq!(
             check(false, TextWrite::Permitted, 2),
             Err(SyscallError::InvalidState)
@@ -1946,15 +1936,13 @@ mod thread_mem_tests
             writable: true,
             ..read_only
         };
-        assert!(
-            thread_mem_write_check(
-                writable,
-                LeafGrant::default(),
-                TextWrite::Refused,
-                || unreachable!()
-            )
-            .is_ok()
-        );
+        thread_mem_write_check(
+            writable,
+            LeafGrant::default(),
+            TextWrite::Refused,
+            || unreachable!(),
+        )
+        .unwrap();
     }
 
     // Defect caught: a copy that took a device leaf for RAM, or a frame above
@@ -1972,7 +1960,7 @@ mod thread_mem_tests
             uncacheable,
         };
         let top = 16 * page;
-        assert!(thread_mem_page_check(leaf(false), 15 * page, top).is_ok());
+        thread_mem_page_check(leaf(false), 15 * page, top).unwrap();
         assert_eq!(
             thread_mem_page_check(leaf(true), page, top),
             Err(SyscallError::InvalidAddress)
@@ -1982,7 +1970,7 @@ mod thread_mem_tests
             Err(SyscallError::InvalidAddress)
         );
         assert_eq!(
-            thread_mem_page_check(leaf(false), u64::MAX & !(page - 1), top),
+            thread_mem_page_check(leaf(false), !(page - 1), top),
             Err(SyscallError::InvalidAddress)
         );
     }
@@ -1998,7 +1986,7 @@ mod init_layout_tests
     #[test]
     fn entropy_draw_is_aligned_in_window_and_disjoint()
     {
-        for pattern in [[0x00_u8; 16], [0xFF; 16], [0xA5; 16], [0x5A; 16]]
+        for pattern in [[0x00u8; 16], [0xFF; 16], [0xA5; 16], [0x5A; 16]]
         {
             let layout = init_layout_from_entropy(pattern);
             let page = PAGE_SIZE as u64;
@@ -2027,7 +2015,7 @@ mod init_layout_tests
         let guard = DEFAULT_INIT_STACK_TOP - (1 + INIT_STACK_PAGES as u64) * page;
         let info_end = DEFAULT_INIT_INFO_VA + init_protocol::INIT_INFO_MAX_PAGES as u64 * page;
         assert!(info_end <= guard);
-        assert!(DEFAULT_INIT_INFO_VA >= process_layout::FIXED_IMAGE_ZONE_END);
+        const { assert!(DEFAULT_INIT_INFO_VA >= process_layout::FIXED_IMAGE_ZONE_END) };
         assert_eq!(DEFAULT_INIT_INFO_VA % page, 0);
     }
 

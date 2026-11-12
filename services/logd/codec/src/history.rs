@@ -467,19 +467,19 @@ mod tests
         let mut expected = Vec::new();
         for i in 0..20u8
         {
-            let line: Vec<u8> = (0..(37 + usize::from(i) * 7) % 120 + 1)
-                .map(|k| i.wrapping_add(k as u8))
+            let line: Vec<u8> = (0..=((37 + usize::from(i) * 7) % 120))
+                .map(|k| i.wrapping_add(u8::try_from(k).unwrap()))
                 .collect();
             ring.push(u64::from(i), u64::from(i) * 3, INFO, &line);
             expected.push((u64::from(i), line));
         }
         let lines = read_all(&ring, &mut HistoryCursor::default());
-        let first = lines[0].0 as usize;
+        let first = usize::try_from(lines[0].0).unwrap();
         assert!(first > 0, "the ring wrapped and evicted");
         for (seq, badge, bytes) in lines
         {
             assert_eq!(badge, seq);
-            assert_eq!(bytes, expected[seq as usize].1);
+            assert_eq!(bytes, expected[usize::try_from(seq).unwrap()].1);
         }
     }
 

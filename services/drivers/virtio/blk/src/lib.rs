@@ -249,9 +249,44 @@ impl IoOutcome
     }
 }
 
+/// How long, in milliseconds, a request's completion is waited for once
+/// `elapsed` of its `timeout` has passed: what is left of it, rounded up, so
+/// the wait never ends before the bound. Never 0, which waits with no bound,
+/// nor `u64::MAX`, which only tries once (`SYS_NOTIFICATION_WAIT`'s
+/// sentinels). `None` once the bound has passed.
+#[must_use]
+pub fn completion_wait_ms(
+    timeout: core::time::Duration,
+    elapsed: core::time::Duration,
+) -> Option<u64>
+{
+    let left = timeout.checked_sub(elapsed).filter(|d| !d.is_zero())?;
+    let ms = left.as_nanos().div_ceil(1_000_000);
+    Some(u64::try_from(ms).unwrap_or(u64::MAX).clamp(1, u64::MAX - 1))
+}
+
 #[cfg(test)]
 mod tests
 {
+    #[test]
+    fn a_completion_wait_lasts_what_is_left_of_the_bound()
+    {
+        use core::time::Duration;
+        let bound = Duration::from_secs(50);
+        assert_eq!(completion_wait_ms(bound, Duration::ZERO), Some(50_000));
+        assert_eq!(
+            completion_wait_ms(bound, Duration::from_millis(49_990)),
+            Some(10)
+        );
+        // A partial millisecond rounds up, so the wait reaches the bound.
+        assert_eq!(
+            completion_wait_ms(bound, Duration::from_micros(49_999_500)),
+            Some(1)
+        );
+        assert_eq!(completion_wait_ms(bound, bound), None);
+        assert_eq!(completion_wait_ms(bound, Duration::from_secs(60)), None);
+    }
+
     use super::*;
 
     fn geometry(block_size: u32) -> Geometry

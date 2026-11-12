@@ -5,9 +5,10 @@
 
 //! Seraph `VirtIO` input (keyboard) device driver.
 //!
-//! Receives a BAR MMIO cap per BAR the device's register regions name, an
-//! optional IRQ cap, and the `VirtioPciStartupInfo` startup message from
-//! devmgr — the same PCI bring-up path as the sibling block driver.
+//! Receives the MMIO caps of the BARs the device's register regions name, an
+//! optional interrupt (MSI-X vector 0, or the wired line), and the
+//! `VirtioPciStartupInfo` startup message from devmgr — the same PCI bring-up
+//! path as the sibling block driver.
 //! Initialises the device via the modern PCI transport, posts receive buffers
 //! to the event virtqueue, decodes `EV_KEY` events into the shared keysym
 //! stream ([`ipc::keysym`]), and serves blocking reads over IPC.
@@ -26,7 +27,7 @@ use ipc::{
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
-use virtio_core::bootstrap::DeliveredDevice;
+use virtio_core::bootstrap::{DeliveredDevice, DeviceInterrupt};
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
 use virtio_core::{
@@ -55,7 +56,12 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
         }
     ],
     instance_limit: None,
-    interrupt: driver_binding::decl::Interrupt::OPTIONAL,
+    // One MSI-X vector for the eventq, the only queue; configuration changes
+    // are routed to no vector.
+    interrupt: driver_binding::decl::Interrupt {
+        need: driver_binding::decl::InterruptNeed::Optional,
+        msi_vectors: 1
+    },
     dma: true,
     dma_width: None,
     phys_access: false,
@@ -65,12 +71,13 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-/// Per-iteration timeout on the read-path wait, in milliseconds. When an IRQ is
-/// bound the wait wakes when the interrupt-service thread signals `wake`; the
-/// bounded timeout also re-drains the used ring every tick, so the driver works
-/// whether or not an IRQ is available (devmgr delivers none when it can give
-/// the device no IRQ cap) and tolerates a lost PLIC interrupt on QEMU virt
-/// RISC-V. At 20 ms the poll-only fallback stays well above human typing rates.
+/// Per-iteration timeout on the read-path wait, in milliseconds. When an
+/// interrupt is bound the wait wakes when the interrupt-service thread signals
+/// `wake`; the bounded timeout also re-drains the used ring every tick, so the
+/// driver works whether or not an interrupt is available (devmgr delivers none
+/// when it can give the device none, and a device may refuse the eventq's
+/// MSI-X vector). At 20 ms the poll-only fallback stays well above human
+/// typing rates.
 const POLL_INTERVAL_MS: u64 = 20;
 
 /// [`PAGE_SIZE`] as a `usize`, for the byte count of a one-page fill.
@@ -81,19 +88,18 @@ const PAGE_BYTES: usize = PAGE_SIZE as usize;
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
 // devmgr delivers the resource list `virtio_core::bootstrap` reads, as for
-// virtio-blk: the BAR caps with their BAR indices, the wired interrupt line
-// (absent when devmgr could give the device none) with its mode word, then
-// the service endpoint, the per-device devmgr query endpoint, and the
-// device's DMA capability. log_ep and procmgr_ep arrive via
-// `ProcessInfo`/`StartupInfo`.
+// virtio-blk: the BAR ranges with their BAR indices and offsets, the
+// interrupt (MSI-X vector 0 or the wired line with its mode word; absent when
+// devmgr could give the device none), then the service endpoint, the
+// per-device devmgr query endpoint, and the device's DMA capability. log_ep
+// and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`.
 
 struct DriverCaps
 {
-    /// What devmgr delivered; its BAR caps are mapped from here.
+    /// What devmgr delivered; its BAR ranges are mapped from here.
     bars: DeliveredDevice,
-    irq_slot: u64,
-    /// The `SYS_IRQ_REGISTER` mode devmgr derived for the IRQ line.
-    irq_mode: u64,
+    /// The device's interrupt, `None` when devmgr delivered none.
+    interrupt: Option<DeviceInterrupt>,
     memmgr_ep: u64,
     service_ep: u64,
     devmgr_ep: u64,
@@ -120,8 +126,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     }
 
     Some(DriverCaps {
-        irq_slot: device.irq,
-        irq_mode: device.irq_mode,
+        interrupt: device.interrupt,
         service_ep: device.service,
         memmgr_ep: info.memmgr_endpoint,
         devmgr_ep: device.devmgr_query,
@@ -131,17 +136,19 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     })
 }
 
-/// Map every delivered BAR into one register window laid out as `layout`
-/// says, after checking the delivered BARs are the layout's own. Returns the
-/// window's virtual address; exits on any failure (the device cannot be
-/// driven without its registers).
+/// Map every delivered BAR range into one register window laid out as
+/// `layout` says, after checking the ranges are the layout's own
+/// ([`RegisterLayout::place`]). Returns the window's virtual address; exits
+/// on any failure (the device cannot be driven without its registers).
 fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
 {
-    if !layout.matches_delivered(caps.bars.bar_indices())
+    let ranges = caps.bars.ranges();
+    let Some(placed) = layout.place(ranges)
+    else
     {
         std::os::seraph::log!(error: "delivered BARs do not match the device's register regions");
         syscall::thread_exit();
-    }
+    };
     let window_pages = layout.window_pages();
     // The BAR mappings live for the driver process's lifetime; the
     // reservation is intentionally never returned to the arena (the
@@ -158,24 +165,21 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         std::os::seraph::log!(error: "BAR PT-budget funding failed");
         syscall::thread_exit();
     }
-    let mut bar_va = window_va;
-    for (&bar_cap, aperture) in caps.bars.bar_caps().iter().zip(layout.bars())
+    for (range, &offset) in ranges.iter().zip(&placed)
     {
         // SAFETY: `window` is a fresh reservation of `window_pages` pages
-        // from the per-process arena, and `bar_va` starts this BAR's
-        // `aperture.pages`-page share of it. devmgr carves each BAR cap to at
-        // most the same `pages` (devmgr's `bind::carve_bars`), so the whole-region
-        // mapping stays inside that share: VA no Rust object or IPC page
-        // occupies. `PciTransport` reaches the BARs only through its raw
+        // from the per-process arena, and `place` put this range's pages at
+        // `offset` inside its BAR's share of it, overlapping no other
+        // range's, so the whole-cap mapping covers VA no Rust object or IPC
+        // page occupies. `PciTransport` reaches the BARs only through its raw
         // volatile accessors, never a reference, and the reservation is
         // never returned, so the VA stays reserved for the driver's lifetime
         // (`mmio_map` § Safety).
-        if unsafe { syscall::mmio_map(caps.self_aspace, bar_cap, bar_va, 0) }.is_err()
+        if unsafe { syscall::mmio_map(caps.self_aspace, range.cap, window_va + offset, 0) }.is_err()
         {
             std::os::seraph::log!(error: "BAR mmio_map failed");
             syscall::thread_exit();
         }
-        bar_va += aperture.pages * PAGE_SIZE;
     }
     window_va
 }
@@ -387,8 +391,16 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
 }
 
 /// Program the descriptor/avail/used ring device addresses into the
-/// transport and mark the queue ready.
-fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_addr: u64)
+/// transport, route the queue to the driver's `interrupt`
+/// ([`PciTransport::route_queue`]), and mark the queue ready. Returns the
+/// interrupt the queue signals: `interrupt`, or `None` when the device
+/// refuses the queue's MSI-X vector, which leaves the read path polling.
+fn program_transport_rings(
+    transport: &PciTransport,
+    queue_size: u16,
+    ring_addr: u64,
+    interrupt: Option<DeviceInterrupt>,
+) -> Option<DeviceInterrupt>
 {
     let desc_size = virtqueue::desc_table_size(queue_size);
     let used_off = virtqueue::used_ring_offset(queue_size);
@@ -398,21 +410,30 @@ fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_addr:
     let used_addr = ring_addr + used_off as u64;
 
     transport.queue_set_rings(desc_addr, avail_addr, used_addr);
+    let routed = transport.route_queue(interrupt);
+    if !routed
+    {
+        std::os::seraph::log!(warn: "device refused the eventq's MSI-X vector");
+    }
 
     transport.queue_set_ready(1);
+    interrupt.filter(|_| routed)
 }
 
-/// Set up the eventq (queue 0): allocate/map ring DMA, program the device, and
-/// build a `SplitVirtqueue` + notification offset.
+/// Set up the eventq (queue 0): allocate/map ring DMA, program the device
+/// with the queue routed to `interrupt`, and build a `SplitVirtqueue` +
+/// notification offset, with the interrupt the queue signals
+/// ([`program_transport_rings`]).
 fn setup_virtqueue(
     transport: &PciTransport,
     caps: &DriverCaps,
+    interrupt: Option<DeviceInterrupt>,
     ipc_buf: *mut u64,
-) -> (SplitVirtqueue, u16)
+) -> (SplitVirtqueue, u16, Option<DeviceInterrupt>)
 {
     let queue_size = configure_queue_size(transport);
     let (ring_addr, ring_va) = allocate_and_map_rings(queue_size, caps, ipc_buf);
-    program_transport_rings(transport, queue_size, ring_addr);
+    let interrupt = program_transport_rings(transport, queue_size, ring_addr, interrupt);
 
     let queue_notify_off = transport.queue_notify_off();
     if !transport.doorbell_in_region(queue_notify_off)
@@ -445,7 +466,7 @@ fn setup_virtqueue(
         syscall::thread_exit();
     };
 
-    (vq, queue_notify_off)
+    (vq, queue_notify_off, interrupt)
 }
 
 /// Allocate a single DMA page to back the event receive buffers, and map it
@@ -541,11 +562,11 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
         {
             break;
         }
-        // Wait for input. When an IRQ is bound the interrupt-service thread
-        // signals `wake` on each interrupt, having read the ISR and
-        // acknowledged any delivery; otherwise this is a timed poll. The
-        // bounded wait re-drains every tick, so a lost or absent IRQ cannot
-        // wedge the read.
+        // Wait for input. When an interrupt is bound the interrupt-service
+        // thread signals `wake` on each interrupt, having read the ISR and
+        // acknowledged a wired line's delivery; otherwise this is a timed
+        // poll. The bounded wait re-drains every tick, so an absent interrupt
+        // cannot wedge the read.
         let _ = syscall::notification_wait_timeout(rt.wake, POLL_INTERVAL_MS);
     }
 
@@ -559,25 +580,54 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Start the interrupt-service thread, which runs
-/// [`virtio_core::isr::serve_interrupts`] over `irq_notification`, the
-/// notification bound to the device's line: it acknowledges every delivery
-/// at once, a read in flight or not, and signals `wake` for the read loop.
-/// Returns whether the thread started.
-fn start_isr_thread(transport: PciTransport, irq_notification: u64, irq_cap: u64, wake: u64)
--> bool
+/// Bind `interrupt` to a fresh notification and start the interrupt-service
+/// thread over it, with its own transport over the same register window: it
+/// runs [`virtio_core::isr::serve_interrupts`], acknowledging every delivery
+/// of a wired line at once, a read in flight or not, so this driver never
+/// holds a shared line masked, and signalling `wake` for the read loop. Exits
+/// on any failure.
+fn start_interrupts(interrupt: DeviceInterrupt, window_va: u64, layout: &RegisterLayout, wake: u64)
 {
-    std::thread::Builder::new()
+    let irq_notification =
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        });
+    let Some(irq_notification) = irq_notification
+    else
+    {
+        std::os::seraph::log!(error: "failed to create IRQ notification");
+        syscall::thread_exit();
+    };
+    if syscall::irq_register(interrupt.cap(), irq_notification, interrupt.mode()).is_err()
+    {
+        std::os::seraph::log!(error: "irq_register failed");
+        syscall::thread_exit();
+    }
+    let transport = PciTransport::new(window_va, layout);
+    let started = std::thread::Builder::new()
         .spawn(move || {
             virtio_core::isr::serve_interrupts(
                 &transport,
+                interrupt,
                 irq_notification,
-                irq_cap,
-                wake,
+                || {
+                    let _ = syscall::notification_send(wake, 1);
+                },
                 isr_diag,
             )
         })
-        .is_ok()
+        .is_ok();
+    if !started
+    {
+        std::os::seraph::log!(error: "failed to start the interrupt-service thread");
+        syscall::thread_exit();
+    }
+    // irq_register leaves a wired line's entry masked; the first ack unmasks
+    // it. An MSI-X target is never masked.
+    if let DeviceInterrupt::Wired { cap, .. } = interrupt
+    {
+        let _ = syscall::irq_ack(cap);
+    }
 }
 
 /// Diagnostic hook of the interrupt-service loop's `RecvGuard`: one line at
@@ -699,9 +749,13 @@ fn main() -> !
 
     let transport = PciTransport::new(window_va, &layout);
     init_device(&transport);
+    let interrupt = caps
+        .interrupt
+        .filter(|_| transport.route_config(caps.interrupt));
 
     // Set up the eventq and its receive buffers.
-    let (mut vq, queue_notify_off) = setup_virtqueue(&transport, &caps, ipc_buf);
+    let (mut vq, queue_notify_off, interrupt) =
+        setup_virtqueue(&transport, &caps, interrupt, ipc_buf);
     let buf_count = vq.queue_size();
     let mut ring = setup_event_buffers(&caps, buf_count, ipc_buf);
     ring.post_all(&mut vq);
@@ -710,12 +764,13 @@ fn main() -> !
     transport
         .set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
-    // Create the notification the read path waits on (`wake`). The IRQ is
-    // optional: devmgr delivers no IRQ cap when it can give the device none,
-    // and the read path polls the eventq regardless. When an IRQ cap is
-    // present, bind a second notification to it and start the
-    // interrupt-service thread, which acknowledges every delivery and signals
-    // `wake`; otherwise the bounded wait degrades to timed polling.
+    // Create the notification the read path waits on (`wake`). The interrupt
+    // is optional: devmgr delivers none when it can give the device none, a
+    // device may refuse the eventq's MSI-X vector, and the read path polls
+    // the eventq regardless. With an interrupt, bind a second notification to
+    // it and start the interrupt-service thread, which acknowledges every
+    // delivery of a wired line and signals `wake`; otherwise the bounded wait
+    // degrades to timed polling.
     let create_notification = || {
         std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
             syscall::cap_create_notification(slab).ok()
@@ -727,39 +782,14 @@ fn main() -> !
         std::os::seraph::log!(error: "failed to create notification");
         syscall::thread_exit();
     };
-    let irq_cap = caps.irq_slot;
-    if irq_cap == 0
+    if let Some(interrupt) = interrupt
     {
-        std::os::seraph::log!(warn: "no IRQ cap; polling the eventq");
+        std::os::seraph::log!("interrupt: {}", interrupt.describe());
+        start_interrupts(interrupt, window_va, &layout, wake);
     }
     else
     {
-        let Some(irq_notification) = create_notification()
-        else
-        {
-            std::os::seraph::log!(error: "failed to create IRQ notification");
-            syscall::thread_exit();
-        };
-        if syscall::irq_register(irq_cap, irq_notification, caps.irq_mode).is_err()
-        {
-            std::os::seraph::log!(error: "irq_register failed");
-            syscall::thread_exit();
-        }
-        // The interrupt-service thread acknowledges every delivery from here
-        // on, a read in flight or not, so this driver never holds a shared
-        // line masked. Its transport is a copy over the same register window.
-        if !start_isr_thread(
-            PciTransport::new(window_va, &layout),
-            irq_notification,
-            irq_cap,
-            wake,
-        )
-        {
-            std::os::seraph::log!(error: "failed to start the interrupt-service thread");
-            syscall::thread_exit();
-        }
-        // irq_register leaves the entry masked; the first ack unmasks it.
-        let _ = syscall::irq_ack(irq_cap);
+        std::os::seraph::log!(warn: "no interrupt; polling the eventq");
     }
 
     // Tell the device its event buffers are available.

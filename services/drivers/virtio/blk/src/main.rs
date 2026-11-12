@@ -5,10 +5,10 @@
 
 //! Seraph `VirtIO` block device driver.
 //!
-//! Receives a BAR MMIO cap per BAR the device's register regions name and an
-//! IRQ cap in the resource list devmgr delivers the driver it binds to the
-//! device, by the declaration below, and the `VirtioPciStartupInfo` startup
-//! message from devmgr.
+//! Receives the MMIO caps of the BARs the device's register regions name and
+//! the device's interrupt (MSI-X vector 0, or the wired line) in the resource
+//! list devmgr delivers the driver it binds to the device, by the declaration
+//! below, and the `VirtioPciStartupInfo` startup message from devmgr.
 //! Initialises the `VirtIO` device via the modern PCI transport,
 //! sets up a split virtqueue, and serves block reads
 //! (`BLK_READ_INTO_MEMORY`), block writes (`BLK_WRITE_FROM_MEMORY`),
@@ -22,7 +22,7 @@ use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
 use virtio_blk::{Geometry, IoOutcome, PartitionTable};
-use virtio_core::bootstrap::DeliveredDevice;
+use virtio_core::bootstrap::{DeliveredDevice, DeviceInterrupt};
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
 use virtio_core::{
@@ -50,7 +50,12 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
         }
     ],
     instance_limit: None,
-    interrupt: driver_binding::decl::Interrupt::REQUIRED,
+    // One MSI-X vector for the requestq, the only queue; configuration
+    // changes are routed to no vector.
+    interrupt: driver_binding::decl::Interrupt {
+        need: driver_binding::decl::InterruptNeed::Required,
+        msi_vectors: 1
+    },
     dma: true,
     dma_width: None,
     phys_access: false,
@@ -80,18 +85,18 @@ const PAGE_BYTES: usize = PAGE_SIZE as usize;
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
 // devmgr delivers the resource list `virtio_core::bootstrap` reads: the BAR
-// caps with their BAR indices, the wired interrupt line with its mode word,
-// then the service endpoint, the per-device devmgr query endpoint, and the
-// device's DMA capability. log_ep and procmgr_ep arrive via
-// `ProcessInfo`/`StartupInfo`, not through this protocol.
+// ranges with their BAR indices and offsets, the interrupt (MSI-X vector 0 or
+// the wired line with its mode word), then the service endpoint, the
+// per-device devmgr query endpoint, and the device's DMA capability. log_ep
+// and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through this
+// protocol.
 
 struct DriverCaps
 {
-    /// What devmgr delivered; its BAR caps are mapped from here.
+    /// What devmgr delivered; its BAR ranges are mapped from here.
     bars: DeliveredDevice,
-    irq_slot: u64,
-    /// The `SYS_IRQ_REGISTER` mode devmgr derived for the IRQ line.
-    irq_mode: u64,
+    /// The device's interrupt, `None` when devmgr delivered none.
+    interrupt: Option<DeviceInterrupt>,
     memmgr_ep: u64,
     service_ep: u64,
     devmgr_ep: u64,
@@ -118,8 +123,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     }
 
     Some(DriverCaps {
-        irq_slot: device.irq,
-        irq_mode: device.irq_mode,
+        interrupt: device.interrupt,
         service_ep: device.service,
         memmgr_ep: info.memmgr_endpoint,
         devmgr_ep: device.devmgr_query,
@@ -129,17 +133,19 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     })
 }
 
-/// Map every delivered BAR into one register window laid out as `layout`
-/// says, after checking the delivered BARs are the layout's own. Returns the
-/// window's virtual address; exits on any failure (the device cannot be
-/// driven without its registers).
+/// Map every delivered BAR range into one register window laid out as
+/// `layout` says, after checking the ranges are the layout's own
+/// ([`RegisterLayout::place`]). Returns the window's virtual address; exits
+/// on any failure (the device cannot be driven without its registers).
 fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
 {
-    if !layout.matches_delivered(caps.bars.bar_indices())
+    let ranges = caps.bars.ranges();
+    let Some(placed) = layout.place(ranges)
+    else
     {
         std::os::seraph::log!(error: "delivered BARs do not match the device's register regions");
         syscall::thread_exit();
-    }
+    };
     let window_pages = layout.window_pages();
     // The BAR mappings live for the driver process's lifetime; the
     // reservation is intentionally never returned to the arena (the
@@ -156,24 +162,21 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         std::os::seraph::log!(error: "BAR PT-budget funding failed");
         syscall::thread_exit();
     }
-    let mut bar_va = window_va;
-    for (&bar_cap, aperture) in caps.bars.bar_caps().iter().zip(layout.bars())
+    for (range, &offset) in ranges.iter().zip(&placed)
     {
         // SAFETY: `window` is a fresh reservation of `window_pages` pages
-        // from the per-process arena, and `bar_va` starts this BAR's
-        // `aperture.pages`-page share of it. devmgr carves each BAR cap to at
-        // most the same `pages` (devmgr's `bind::carve_bars`), so the whole-region
-        // mapping stays inside that share: VA no Rust object or IPC page
-        // occupies. `PciTransport` reaches the BARs only through its raw
+        // from the per-process arena, and `place` put this range's pages at
+        // `offset` inside its BAR's share of it, overlapping no other
+        // range's, so the whole-cap mapping covers VA no Rust object or IPC
+        // page occupies. `PciTransport` reaches the BARs only through its raw
         // volatile accessors, never a reference, and the reservation is
         // never returned, so the VA stays reserved for the driver's lifetime
         // (`mmio_map` § Safety).
-        if unsafe { syscall::mmio_map(caps.self_aspace, bar_cap, bar_va, 0) }.is_err()
+        if unsafe { syscall::mmio_map(caps.self_aspace, range.cap, window_va + offset, 0) }.is_err()
         {
             std::os::seraph::log!(error: "BAR mmio_map failed");
             syscall::thread_exit();
         }
-        bar_va += aperture.pages * PAGE_SIZE;
     }
     window_va
 }
@@ -439,8 +442,16 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
 }
 
 /// Write the descriptor/avail/used ring device addresses into the PCI
-/// transport and mark the queue ready.
-fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_addr: u64)
+/// transport, route the queue to the driver's interrupt
+/// ([`PciTransport::route_queue`]), and mark the queue ready. Exits when the
+/// device refuses the queue's MSI-X vector: it would then signal no
+/// completion, and the driver requires one.
+fn program_transport_rings(
+    transport: &PciTransport,
+    queue_size: u16,
+    ring_addr: u64,
+    interrupt: Option<DeviceInterrupt>,
+)
 {
     let desc_size = virtqueue::desc_table_size(queue_size);
     let used_off = virtqueue::used_ring_offset(queue_size);
@@ -450,6 +461,11 @@ fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_addr:
     let used_addr = ring_addr + used_off as u64;
 
     transport.queue_set_rings(desc_addr, avail_addr, used_addr);
+    if !transport.route_queue(interrupt)
+    {
+        std::os::seraph::log!(error: "device refused the requestq's MSI-X vector");
+        syscall::thread_exit();
+    }
 
     transport.queue_set_ready(1);
 }
@@ -468,7 +484,7 @@ fn setup_virtqueue(
 {
     let queue_size = configure_queue_size(transport);
     let (ring_addr, _ring_pages, ring_va) = allocate_and_map_rings(queue_size, caps, ipc_buf);
-    program_transport_rings(transport, queue_size, ring_addr);
+    program_transport_rings(transport, queue_size, ring_addr, caps.interrupt);
 
     // Save notification offset for this queue before changing selection.
     let queue_notify_off = transport.queue_notify_off();
@@ -593,13 +609,13 @@ pub struct BlkRuntime<'a>
 
 /// Start the interrupt-service thread, which runs
 /// [`virtio_core::isr::serve_interrupts`] over `irq_notification`, the
-/// notification bound to the device's line: it acknowledges every delivery
-/// at once, a request in flight or not, and signals `completion` for the
-/// request path. Returns whether the thread started.
+/// notification bound to the device's `interrupt`: it acknowledges every
+/// delivery of a wired line at once, a request in flight or not, and signals
+/// `completion` for the request path. Returns whether the thread started.
 fn start_isr_thread(
     transport: PciTransport,
+    interrupt: DeviceInterrupt,
     irq_notification: u64,
-    irq_cap: u64,
     completion: u64,
 ) -> bool
 {
@@ -607,9 +623,11 @@ fn start_isr_thread(
         .spawn(move || {
             virtio_core::isr::serve_interrupts(
                 &transport,
+                interrupt,
                 irq_notification,
-                irq_cap,
-                completion,
+                || {
+                    let _ = syscall::notification_send(completion, 1);
+                },
                 isr_diag,
             )
         })
@@ -1148,6 +1166,18 @@ fn main() -> !
     // Create PCI transport and initialise device.
     let transport = PciTransport::new(window_va, &layout);
     let geometry = init_device(&transport);
+    let Some(interrupt) = caps.interrupt
+    else
+    {
+        std::os::seraph::log!(error: "no interrupt, cannot operate");
+        syscall::thread_exit();
+    };
+    std::os::seraph::log!("interrupt: {}", interrupt.describe());
+    if !transport.route_config(caps.interrupt)
+    {
+        std::os::seraph::log!(error: "device refused the configuration vector");
+        syscall::thread_exit();
+    }
     std::os::seraph::log!(
         "capacity (blocks)={:#018x} block size={}",
         geometry.capacity,
@@ -1162,35 +1192,36 @@ fn main() -> !
         .set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
     std::os::seraph::log!("device ready");
 
-    // Set up IRQ-driven completion: create a notification and bind it to the IRQ.
-    if caps.irq_slot == 0
-    {
-        std::os::seraph::log!(error: "no IRQ cap, cannot operate");
-        syscall::thread_exit();
-    }
+    // Set up interrupt-driven completion: create a notification and bind it
+    // to the interrupt.
     let irq_notification = create_notification("IRQ notification");
     let completion = create_notification("completion notification");
-    if syscall::irq_register(caps.irq_slot, irq_notification, caps.irq_mode).is_err()
+    if syscall::irq_register(interrupt.cap(), irq_notification, interrupt.mode()).is_err()
     {
         std::os::seraph::log!(error: "irq_register failed");
         syscall::thread_exit();
     }
-    // The interrupt-service thread acknowledges every delivery from here on,
-    // a request in flight or not, so this driver never holds a shared line
-    // masked. Its transport is a copy over the same register window.
+    // The interrupt-service thread acknowledges every delivery of a wired
+    // line from here on, a request in flight or not, so this driver never
+    // holds a shared line masked. Its transport is a copy over the same
+    // register window.
     if !start_isr_thread(
         PciTransport::new(window_va, &layout),
+        interrupt,
         irq_notification,
-        caps.irq_slot,
         completion,
     )
     {
         std::os::seraph::log!(error: "failed to start the interrupt-service thread");
         syscall::thread_exit();
     }
-    // Unmask the interrupt at the controller (I/O APIC / APLIC).
-    // irq_register leaves the entry masked; the first irq_ack unmasks it.
-    let _ = syscall::irq_ack(caps.irq_slot);
+    // Unmask a wired line at the controller (I/O APIC / APLIC): irq_register
+    // leaves the entry masked, and the first irq_ack unmasks it. An MSI-X
+    // target is never masked.
+    if let DeviceInterrupt::Wired { cap, .. } = interrupt
+    {
+        let _ = syscall::irq_ack(cap);
+    }
 
     // Set up I/O buffer (driver-owned page hosting request header at offset
     // 0 and status byte at offset 1024). Data segments live in caller-supplied

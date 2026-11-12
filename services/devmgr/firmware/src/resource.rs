@@ -210,10 +210,12 @@ mod tests
 {
     use super::*;
 
+    /// The two halves `(base, at)` and `(at, end)` of a split range.
+    type SplitHalves = ((u64, u64), (u64, u64));
+
     /// A model of the kernel's range split: a cap is `(base, end)` and a
     /// split at `at` must satisfy `base < at < end`.
-    fn split_model(span: &Span<(u64, u64)>, at: u64)
-    -> Result<((u64, u64), (u64, u64)), SplitError>
+    fn split_model(span: &Span<(u64, u64)>, at: u64) -> Result<SplitHalves, SplitError>
     {
         let (b, e) = span.slot;
         if at <= b || at >= e
@@ -273,7 +275,7 @@ mod tests
             t2.carve(0x1000, 0x10, 0x1000, split_model),
             Ok((0x1000, 0x1800))
         );
-        assert!(t2.spans().is_empty());
+        assert_eq!(t2.spans(), []);
         assert_consistent(&t);
     }
 

@@ -215,11 +215,12 @@ mod tests
     fn table(len: usize) -> Vec<u8>
     {
         let mut t = vec![0u8; len];
-        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&(len as u32).to_le_bytes());
+        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4]
+            .copy_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
         t
     }
 
-    /// A FADT of `len` bytes with the given PM1a block, `DSDT`, and, when the
+    /// A FADT of `len` bytes with the given `PM1a` block, `DSDT`, and, when the
     /// table reaches it, `X_DSDT`.
     fn fadt(len: usize, pm1a: u32, dsdt: u32, x_dsdt: u64) -> Vec<u8>
     {
@@ -268,7 +269,7 @@ mod tests
     {
         let mut mapped = table(SDT_HEADER_LEN);
         mapped[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4]
-            .copy_from_slice(&((SDT_HEADER_LEN - 1) as u32).to_le_bytes());
+            .copy_from_slice(&u32::try_from(SDT_HEADER_LEN - 1).unwrap().to_le_bytes());
         assert_eq!(table_bytes(&mapped), None);
     }
 

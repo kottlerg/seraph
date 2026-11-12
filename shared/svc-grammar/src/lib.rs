@@ -72,8 +72,11 @@ mod tests
     #[test]
     fn empty_input_yields_nothing()
     {
-        assert!(all("").is_empty());
-        assert!(all("\n\n   \n\t\n").is_empty());
+        assert_eq!(all(""), [] as [Result<Entry<'_>, MissingEquals>; 0]);
+        assert_eq!(
+            all("\n\n   \n\t\n"),
+            [] as [Result<Entry<'_>, MissingEquals>; 0]
+        );
     }
 
     #[test]

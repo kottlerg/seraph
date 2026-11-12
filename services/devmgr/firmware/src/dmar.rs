@@ -861,7 +861,7 @@ mod tests
             39,
             &[
                 drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_0000, &[]),
-                rmrr(0, 0x7c00_0000, 0x7c0f_ffff, &[usb.clone()]),
+                rmrr(0, 0x7c00_0000, 0x7c0f_ffff, std::slice::from_ref(&usb)),
                 rmrr(0, 0x8000_0000, 0x8fff_ffff, &[gpu]),
                 rmrr(0, 0x000e_8000, 0x000e_8fff, &[usb]),
             ],
@@ -874,8 +874,14 @@ mod tests
             regions_of(&table, 0, bdf(0, 2, 0), no_ranges),
             [(0x8000_0000, 0x8fff_ffff)]
         );
-        assert!(regions_of(&table, 0, bdf(0, 3, 0), no_ranges).is_empty());
-        assert!(regions_of(&table, 1, bdf(0, 0x14, 0), no_ranges).is_empty());
+        assert_eq!(
+            regions_of(&table, 0, bdf(0, 3, 0), no_ranges),
+            [] as [(u64, u64); 0]
+        );
+        assert_eq!(
+            regions_of(&table, 1, bdf(0, 0x14, 0), no_ranges),
+            [] as [(u64, u64); 0]
+        );
     }
 
     #[test]
@@ -888,7 +894,10 @@ mod tests
             regions_of(&table, 0, bdf(3, 0, 0), range),
             [(0x7c00_0000, 0x7c00_0fff)]
         );
-        assert!(regions_of(&table, 0, bdf(5, 0, 0), range).is_empty());
+        assert_eq!(
+            regions_of(&table, 0, bdf(5, 0, 0), range),
+            [] as [(u64, u64); 0]
+        );
     }
 
     #[test]

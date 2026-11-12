@@ -341,14 +341,16 @@ mod tests
         assert_eq!(fmt::name_str(&e0.name), b"init");
         assert_eq!(e0.size, 5);
         assert!(e0.offset.is_multiple_of(fmt::BODY_ALIGNMENT));
-        let body0 = &buf[e0.offset as usize..(e0.offset + e0.size) as usize];
+        let body0 = &buf
+            [usize::try_from(e0.offset).unwrap()..usize::try_from(e0.offset + e0.size).unwrap()];
         assert_eq!(body0, b"alpha");
 
         let e1 = fmt::entry_at(&buf, 1).expect("entry 1");
         assert_eq!(fmt::name_str(&e1.name), b"svc");
         assert_eq!(e1.size, 6);
         assert!(e1.offset.is_multiple_of(fmt::BODY_ALIGNMENT));
-        let body1 = &buf[e1.offset as usize..(e1.offset + e1.size) as usize];
+        let body1 = &buf
+            [usize::try_from(e1.offset).unwrap()..usize::try_from(e1.offset + e1.size).unwrap()];
         assert_eq!(body1, b"beta--");
 
         let _ = fs::remove_dir_all(&tmp);

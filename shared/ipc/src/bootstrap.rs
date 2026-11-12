@@ -681,7 +681,7 @@ mod tests
     {
         assert_eq!(slot_rounds(&[]).count(), 1);
         let only = slot_rounds(&[]).next().unwrap();
-        assert!(only.caps().is_empty());
+        assert_eq!(only.caps(), []);
         assert_eq!(only.presence(), 0);
     }
 

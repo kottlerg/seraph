@@ -374,12 +374,12 @@ pub(crate) mod test_store
     {
         unsafe fn read(&self, idx: NodeIdx) -> Slot
         {
-            self.0[idx as usize]
+            self.0[usize::try_from(idx).unwrap()]
         }
 
         unsafe fn write(&mut self, idx: NodeIdx, slot: Slot)
         {
-            let i = idx as usize;
+            let i = usize::try_from(idx).unwrap();
             if self.0.len() <= i
             {
                 self.0.resize(i + 1, VACANT);

@@ -1041,12 +1041,12 @@ sched_max = 12\n";
     {
         let argv = vec![String::from("abc")];
         let env = vec![String::from("K=v")];
-        assert!(check_startup_blobs(&argv, &env, 8).is_ok());
+        check_startup_blobs(&argv, &env, 8).unwrap();
         assert!(matches!(
             check_startup_blobs(&argv, &env, 7),
             Err(ParseError::TooLarge(0, why)) if why.starts_with("argv and env together")
         ));
-        assert!(check_startup_blobs(&[], &[], 0).is_ok());
+        check_startup_blobs(&[], &[], 0).unwrap();
     }
 
     /// Recipe whose `binary` is an absolute path of exactly `len` bytes.

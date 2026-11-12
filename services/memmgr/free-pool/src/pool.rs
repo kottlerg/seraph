@@ -718,7 +718,7 @@ mod tests
         let grant = pool.select(&mut a, 6, Fit::BestEffort, no_split).unwrap();
         assert_eq!(grant.count, MAX_GRANT_RUNS);
         let pages: u32 = grant.entries().iter().map(|e| e.1).sum();
-        assert_eq!(pages, MAX_GRANT_RUNS as u32);
+        assert_eq!(pages, u32::try_from(MAX_GRANT_RUNS).unwrap());
         assert_eq!(pool.free_pages(), 6 - MAX_GRANT_RUNS as u64);
     }
 
@@ -837,7 +837,7 @@ mod tests
         }
         assert_eq!(a.free_count(), 1);
         let last = run(9999, 1, 0xFFFF_0000);
-        assert!(pool.push_reserved(&mut a, last).is_ok());
+        pool.push_reserved(&mut a, last).unwrap();
         assert_eq!(pool.push_reserved(&mut a, last).unwrap_err(), last);
         assert_eq!(pool.run_count(), u64::from(i) + 1);
     }

@@ -467,9 +467,9 @@ mod tests
     {
         let fewer = "## Acceptance\n- [x] a\n";
         assert!(guard_body(OLD, fewer, ItemRemoval::Refuse).is_err());
-        assert!(guard_body(OLD, fewer, ItemRemoval::Allow).is_ok());
+        guard_body(OLD, fewer, ItemRemoval::Allow).unwrap();
         let ticked = "## Acceptance\n- [x] a\n* [X] b (fixed by PR #7)\n- [ ] c\n";
-        assert!(guard_body(OLD, ticked, ItemRemoval::Refuse).is_ok());
+        guard_body(OLD, ticked, ItemRemoval::Refuse).unwrap();
     }
 
     #[test]
@@ -481,7 +481,7 @@ mod tests
         let stale = "## Acceptance\n- [x] a\n- [ ] b\n- [ ] d\n";
         let err = guard_body(held, stale, ItemRemoval::Refuse).expect_err("a stale copy");
         assert!(err.contains("lacks `c`"), "{err}");
-        assert!(guard_body(held, stale, ItemRemoval::Allow).is_ok());
+        guard_body(held, stale, ItemRemoval::Allow).unwrap();
     }
 
     #[test]
@@ -507,7 +507,7 @@ mod tests
         // otherwise take.
         let prefixed = "- [ ] a\n- [ ] a b\n";
         let ticked = "- [x] a b\n- [x] a (fixed by PR #7)\n";
-        assert!(guard_body(prefixed, ticked, ItemRemoval::Refuse).is_ok());
+        guard_body(prefixed, ticked, ItemRemoval::Refuse).unwrap();
     }
 
     #[test]
@@ -531,7 +531,10 @@ mod tests
     fn a_filing_needs_a_class_label_and_a_subsystem_label()
     {
         let ok = labels(&["xtask", "infra"]);
-        assert!(check_filing("t", "b", &ok, &milestone("v0.1.4")).is_empty());
+        assert_eq!(
+            check_filing("t", "b", &ok, &milestone("v0.1.4")),
+            [] as [String; 0]
+        );
         let no_class = labels(&["xtask"]);
         assert_eq!(
             check_filing("t", "b", &no_class, &milestone("v0.1.4")).len(),
@@ -549,8 +552,14 @@ mod tests
     {
         let ok = labels(&["xtask", "infra"]);
         let choice = MilestoneChoice::from_args;
-        assert!(check_filing("t", "b", &ok, &choice(Some("v0.1.4"), false)).is_empty());
-        assert!(check_filing("t", "b", &ok, &choice(None, true)).is_empty());
+        assert_eq!(
+            check_filing("t", "b", &ok, &choice(Some("v0.1.4"), false)),
+            [] as [String; 0]
+        );
+        assert_eq!(
+            check_filing("t", "b", &ok, &choice(None, true)),
+            [] as [String; 0]
+        );
         assert_eq!(check_filing("t", "b", &ok, &choice(None, false)).len(), 1);
         assert_eq!(
             check_filing("t", "b", &ok, &choice(Some("v0.1.4"), true)).len(),
@@ -603,19 +612,22 @@ mod tests
     fn a_filed_issue_is_compared_against_what_was_asked_for()
     {
         let wanted = labels(&["xtask", "infra"]);
-        assert!(
+        assert_eq!(
             missing_metadata(
                 &labels(&["infra", "xtask"]),
                 Some("v0.1.4"),
                 &wanted,
                 Some("v0.1.4")
-            )
-            .is_empty()
+            ),
+            [] as [String; 0]
         );
         assert_eq!(
             missing_metadata(&labels(&["infra"]), None, &wanted, Some("v0.1.4")),
             ["label `xtask`", "milestone `v0.1.4`"]
         );
-        assert!(missing_metadata(&wanted, None, &wanted, None).is_empty());
+        assert_eq!(
+            missing_metadata(&wanted, None, &wanted, None),
+            [] as [String; 0]
+        );
     }
 }

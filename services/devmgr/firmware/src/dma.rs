@@ -884,7 +884,7 @@ mod tests
         let all = RIGHTS_MEM_MAP | RIGHTS_MEM_WRITE;
         assert_eq!(check_access(0, all), Err(MapError::InvalidRequest));
         assert_eq!(
-            check_access(RW | 1 << 2, all),
+            check_access(RW | (1 << 2), all),
             Err(MapError::InvalidRequest)
         );
     }
@@ -973,7 +973,7 @@ mod tests
         assert_eq!(confinement, DOMAIN);
         assert_eq!(t.begin_unmap(7, iova), Err(UnmapError::NoMapping));
         assert!(t.restore(7, iova));
-        assert!(unmap(&mut t, 7, iova).is_ok());
+        unmap(&mut t, 7, iova).unwrap();
     }
 
     #[test]
@@ -1072,7 +1072,7 @@ mod tests
         let iova = map_iova(&mut t, 7, PAGE_SIZE).unwrap();
         t.register(7, Confinement::Unconfined, &[]).unwrap();
         assert_eq!(t.confinement(7), Some(DOMAIN));
-        assert!(unmap(&mut t, 7, iova).is_ok());
+        unmap(&mut t, 7, iova).unwrap();
     }
 
     const fn rr(base: u64, len: u64) -> ReservedRange
@@ -1108,7 +1108,7 @@ mod tests
             Ok(vec![rr(0x000e_8000, PAGE_SIZE)])
         );
         // Starts right past the first extent: accepted.
-        assert!(reserved_ranges(&[(0x7c00_0000, 0x7c0f_ffff)], &pooled, 39).is_ok());
+        reserved_ranges(&[(0x7c00_0000, 0x7c0f_ffff)], &pooled, 39).unwrap();
         // Its rounded first page reaches into the pooled extent's last page.
         assert_eq!(
             reserved_ranges(&[(0x7bff_f800, 0x7c00_0fff)], &pooled, 39),

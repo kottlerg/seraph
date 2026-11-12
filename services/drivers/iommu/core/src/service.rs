@@ -986,7 +986,7 @@ mod tests
 
         fn map(
             &mut self,
-            d: &mut FakeDomain,
+            domain: &mut FakeDomain,
             iova: u64,
             phys: u64,
             len: u64,
@@ -994,34 +994,39 @@ mod tests
         ) -> Result<(), BackendError>
         {
             self.fail()?;
-            d.ranges.push((iova, phys, len, access));
+            domain.ranges.push((iova, phys, len, access));
             Ok(())
         }
 
-        fn map_msi(&mut self, d: &mut FakeDomain, file: u64) -> Result<(), BackendError>
+        fn map_msi(&mut self, domain: &mut FakeDomain, file: u64) -> Result<(), BackendError>
         {
             self.fail()?;
             if self.refuse_msi
             {
                 return Err(BackendError::Invalid);
             }
-            d.files.push(file);
+            domain.files.push(file);
             Ok(())
         }
 
-        fn unmap(&mut self, d: &mut FakeDomain, iova: u64, _len: u64) -> Result<(), BackendError>
+        fn unmap(
+            &mut self,
+            domain: &mut FakeDomain,
+            iova: u64,
+            _len: u64,
+        ) -> Result<(), BackendError>
         {
             self.fail()?;
-            d.ranges.retain(|r| r.0 != iova);
+            domain.ranges.retain(|r| r.0 != iova);
             Ok(())
         }
 
-        fn block(&mut self, d: &mut FakeDomain) -> Result<(), BackendError>
+        fn block(&mut self, domain: &mut FakeDomain) -> Result<(), BackendError>
         {
             self.fail()?;
-            self.blocked.push(d.did);
-            d.ranges.clear();
-            d.files.clear();
+            self.blocked.push(domain.did);
+            domain.ranges.clear();
+            domain.files.clear();
             Ok(())
         }
 
@@ -1084,7 +1089,7 @@ mod tests
     {
         fn memory(&self, cap: u64) -> Option<MemoryCap>
         {
-            (cap != 13).then(|| MemoryCap {
+            (cap != 13).then_some(MemoryCap {
                 phys: cap << 20,
                 len: 2 * PAGE_SIZE,
                 rights: if cap == 9
@@ -1162,7 +1167,7 @@ mod tests
         let mut s = service();
         s.backend.fail_unit = Some((1, BackendError::Timeout));
         assert_eq!(s.init(), Err((1, BackendError::Timeout)));
-        assert!(s.backend.enabled.is_empty());
+        assert_eq!(s.backend.enabled, [] as [usize; 0]);
         s.backend.fail_unit = None;
         assert_eq!(s.init(), Ok(()));
         assert_eq!(s.backend.enabled, [0, 1]);
@@ -1246,10 +1251,13 @@ mod tests
             s.domains[0].domain.ranges,
             [(0x10_0000, 3 << 20, 2 * PAGE_SIZE, Access::ReadWrite)]
         );
-        assert!(deleted(&s).is_empty());
+        assert_eq!(deleted(&s), [] as [u64; 0]);
         let unmap = req(iommu_labels::UNMAP, &[d, 0x10_0000], &[]);
         assert_eq!(s.handle(&unmap).label, iommu_errors::SUCCESS);
-        assert!(s.domains[0].domain.ranges.is_empty());
+        assert_eq!(
+            s.domains[0].domain.ranges,
+            [] as [(u64, u64, u64, Access); 0]
+        );
         assert_eq!(deleted(&s), [3]);
         assert_eq!(s.handle(&unmap).label, iommu_errors::NO_MAPPING);
     }
@@ -1289,7 +1297,10 @@ mod tests
                 iommu_errors::INVALID_REQUEST
             );
         }
-        assert!(s.domains[0].domain.ranges.is_empty());
+        assert_eq!(
+            s.domains[0].domain.ranges,
+            [] as [(u64, u64, u64, Access); 0]
+        );
         assert_eq!(deleted(&s), [3, 3, 3, 3, 3, 9, 13]);
         assert_eq!(map(&mut s, d, 0x10_0000, ACCESS_DEVICE_READ, 9), 0);
     }
@@ -1402,7 +1413,7 @@ mod tests
         let unmap = req(iommu_labels::UNMAP, &[d, 0x10_0000], &[]);
         assert_eq!(s.handle(&unmap).label, iommu_errors::OUT_OF_RESOURCES);
         assert_eq!(s.domains[0].ranges.len(), 1);
-        assert!(deleted(&s).is_empty());
+        assert_eq!(deleted(&s), [] as [u64; 0]);
         assert_eq!(s.handle(&unmap).label, iommu_errors::SUCCESS);
         assert_eq!(deleted(&s), [3]);
     }
@@ -1503,7 +1514,10 @@ mod tests
                 iommu_errors::INVALID_REQUEST
             );
         }
-        assert!(s.domains[0].domain.ranges.is_empty());
+        assert_eq!(
+            s.domains[0].domain.ranges,
+            [] as [(u64, u64, u64, Access); 0]
+        );
     }
 
     #[test]
@@ -1558,7 +1572,10 @@ mod tests
         let d = domain(&mut s);
         assert_eq!(map_msi(&mut s, d, FILE), iommu_errors::SUCCESS);
         assert_eq!(s.domains[0].domain.files, [FILE]);
-        assert!(s.domains[0].domain.ranges.is_empty());
+        assert_eq!(
+            s.domains[0].domain.ranges,
+            [] as [(u64, u64, u64, Access); 0]
+        );
         let r = &s.domains[0].ranges[0];
         assert_eq!((r.iova, r.len, r.kind), (FILE, PAGE_SIZE, Kind::MsiFile));
         // A cap sent with it is not kept.
@@ -1574,15 +1591,15 @@ mod tests
         let d = domain(&mut s);
         let width_end = 1u64 << 39;
         for (domain, file) in [
-            (d + 1, FILE),          // no such domain
-            (d, FILE + 4),          // unaligned
-            (d, width_end),         // past the unit's width
-            (d, u64::MAX & !0xfff), // wraps
+            (d + 1, FILE),  // no such domain
+            (d, FILE + 4),  // unaligned
+            (d, width_end), // past the unit's width
+            (d, !0xfff),    // wraps
         ]
         {
             assert_eq!(map_msi(&mut s, domain, file), iommu_errors::INVALID_REQUEST);
         }
-        assert!(s.domains[0].domain.files.is_empty());
+        assert_eq!(s.domains[0].domain.files, [] as [u64; 0]);
         assert!(s.domains[0].ranges.is_empty());
     }
 
@@ -1791,7 +1808,7 @@ mod tests
         {
             assert_eq!(remap_set(&mut s, fields), iommu_errors::INVALID_REQUEST);
         }
-        assert!(s.backend.set.is_empty());
+        assert_eq!(s.backend.set, [] as [(u16, RemapEntry); 0]);
     }
 
     #[test]

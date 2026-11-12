@@ -205,6 +205,7 @@ mod tests
     fn lock_unlock_sequence()
     {
         let sl = Spinlock::new();
+        // SAFETY: each saved value is passed verbatim to the matching unlock_raw.
         unsafe {
             let s1 = sl.lock_raw();
             sl.unlock_raw(s1);
@@ -220,6 +221,7 @@ mod tests
         let sl = Spinlock::new();
         for _ in 0..10
         {
+            // SAFETY: the saved value is passed verbatim to unlock_raw.
             unsafe {
                 let s = sl.lock_raw();
                 sl.unlock_raw(s);
@@ -231,6 +233,7 @@ mod tests
     fn try_lock_succeeds_when_free_and_rejects_when_held()
     {
         let sl = Spinlock::new();
+        // SAFETY: every acquisition's saved value is passed verbatim to unlock_raw.
         unsafe {
             let first = sl.try_lock_raw();
             assert!(first.is_some(), "free lock must try-acquire");

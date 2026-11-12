@@ -857,6 +857,10 @@ unsafe extern "C" {
 ///
 /// In test builds this is a no-op stub so `main.rs` compiles unchanged.
 #[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the stub keeps the signature of the non-test item, which can fail"
+)]
 pub fn init_kernel_page_tables(_info: &BootInfo) -> Result<(), BootTableError>
 {
     Ok(())
@@ -1535,7 +1539,7 @@ mod tests
         assert_eq!(compute_max_physical_address(&info), 0x8000_1000);
     }
 
-    /// `Reserved` entries (e.g. 64-bit PCIe MMIO windows reported by UEFI
+    /// `Reserved` entries (e.g. 64-bit `PCIe` MMIO windows reported by UEFI
     /// firmware) must not inflate `max_phys`, otherwise Phase 3 would direct-map
     /// the aperture with 2 MiB pages, sizing its page-table carve for it.
     #[test]
@@ -1821,8 +1825,8 @@ mod tests
         let base = aligned_start(&buf);
         let mut pool = PoolState::new_for_test(base, 2);
 
-        assert!(pool.alloc_frame().is_ok());
-        assert!(pool.alloc_frame().is_ok());
+        pool.alloc_frame().unwrap();
+        pool.alloc_frame().unwrap();
         assert_eq!(pool.alloc_frame(), Err(PagingError::OutOfFrames));
     }
 
@@ -1929,7 +1933,7 @@ mod tests
     #[test]
     fn a_frame_past_the_end_of_the_address_space_is_refused()
     {
-        let top = u64::MAX & !0xFFF;
+        let top = !0xFFF;
         let mut pool = PoolState::new_for_test(top, 2);
         assert_eq!(pool.alloc_frame(), Ok((top, top)));
         assert_eq!(pool.alloc_frame(), Err(PagingError::OutOfFrames));
@@ -1958,7 +1962,7 @@ mod tests
         let chunk = 0u64.wrapping_sub(LARGE_PAGE_SIZE);
         fill_split_table(&mut table, chunk, |page| page);
         assert_eq!(table[0], chunk);
-        assert_eq!(table[511], u64::MAX & !0xFFF);
+        assert_eq!(table[511], !0xFFF);
         assert!(table.windows(2).all(|w| w[1] == w[0] + PAGE_SIZE as u64));
     }
 }

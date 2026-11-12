@@ -632,9 +632,6 @@ struct IrqRoute
 const _: () = assert!(core::mem::size_of::<IrqRoute>() == 40);
 
 /// Why a source could not be bound or minted.
-// dead_code: host test builds compile out `register` and the controller routing
-// that construct the variants.
-#[cfg_attr(test, allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteError
 {
@@ -1683,8 +1680,6 @@ pub enum Remap
 }
 
 /// Why interrupt remapping could not be switched or read.
-// dead_code: host test builds compile out the callers that construct it.
-#[cfg_attr(test, allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemapError
 {
@@ -2627,10 +2622,8 @@ mod tests
 
         // SAFETY: `a` is bound on the line and outlives the call; no delivery
         // runs.
-        assert_eq!(
-            unsafe { unbind_line(&stand, LINE, &route, &a) },
-            Settle::StayMasked
-        );
+        let settle = unsafe { unbind_line(&stand, LINE, &route, &a) };
+        assert_eq!(settle, Settle::StayMasked);
         assert_eq!(
             Target::unpack(route.target.load(Ordering::SeqCst)),
             Some(ROUTED)
@@ -2642,10 +2635,8 @@ mod tests
         route.holders.store(0, Ordering::SeqCst);
         link_line(&stand, &route, &a, 0, note(1), None);
         // SAFETY: as above.
-        assert_eq!(
-            unsafe { unbind_line(&stand, LINE, &route, &a) },
-            Settle::Release
-        );
+        let settle = unsafe { unbind_line(&stand, LINE, &route, &a) };
+        assert_eq!(settle, Settle::Release);
         assert_eq!(route.target.load(Ordering::SeqCst), 0);
         assert_eq!(slot.load(), Slot::Free);
     }

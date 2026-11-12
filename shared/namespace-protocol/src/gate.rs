@@ -284,14 +284,14 @@ mod tests
             gate_open(ipc::fs_labels::FS_WRITE, open),
             Err(GateError::PermissionDenied)
         );
-        assert!(gate_open(ipc::fs_labels::FS_CLOSE, open).is_ok());
+        gate_open(ipc::fs_labels::FS_CLOSE, open).unwrap();
         assert_eq!(gate_open(0x9999, open), Err(GateError::UnknownLabel));
     }
 
     #[test]
     fn fs_open_accepts_any_non_empty_rights_mask()
     {
-        assert!(gate(ipc::fs_labels::FS_OPEN, badge_with(rights::STAT)).is_ok());
+        gate(ipc::fs_labels::FS_OPEN, badge_with(rights::STAT)).unwrap();
         assert_eq!(
             gate(ipc::fs_labels::FS_OPEN, badge_with(0)),
             Err(GateError::PermissionDenied)
@@ -317,7 +317,7 @@ mod tests
     #[test]
     fn ns_stat_gates_on_stat_bit()
     {
-        assert!(gate(ipc::ns_labels::NS_STAT, badge_with(rights::STAT)).is_ok());
+        gate(ipc::ns_labels::NS_STAT, badge_with(rights::STAT)).unwrap();
         assert_eq!(
             gate(ipc::ns_labels::NS_STAT, badge_with(rights::READ)),
             Err(GateError::PermissionDenied)
@@ -327,7 +327,7 @@ mod tests
     #[test]
     fn ns_readdir_gates_on_readdir_bit()
     {
-        assert!(gate(ipc::ns_labels::NS_READDIR, badge_with(rights::READDIR)).is_ok());
+        gate(ipc::ns_labels::NS_READDIR, badge_with(rights::READDIR)).unwrap();
         assert_eq!(
             gate(ipc::ns_labels::NS_READDIR, badge_with(rights::LOOKUP)),
             Err(GateError::PermissionDenied)
@@ -337,8 +337,8 @@ mod tests
     #[test]
     fn fs_read_and_fs_read_frame_share_the_read_bit()
     {
-        assert!(gate(ipc::fs_labels::FS_READ, badge_with(rights::READ)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_READ_MEMORY, badge_with(rights::READ)).is_ok());
+        gate(ipc::fs_labels::FS_READ, badge_with(rights::READ)).unwrap();
+        gate(ipc::fs_labels::FS_READ_MEMORY, badge_with(rights::READ)).unwrap();
         assert_eq!(
             gate(ipc::fs_labels::FS_READ, badge_with(rights::STAT)),
             Err(GateError::PermissionDenied)
@@ -352,9 +352,9 @@ mod tests
     #[test]
     fn fs_release_frame_accepts_any_single_bit()
     {
-        assert!(gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::READ)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::STAT)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::ADMIN)).is_ok());
+        gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::READ)).unwrap();
+        gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::STAT)).unwrap();
+        gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::ADMIN)).unwrap();
     }
 
     #[test]
@@ -378,8 +378,8 @@ mod tests
     #[test]
     fn fs_write_and_fs_write_frame_share_the_write_bit()
     {
-        assert!(gate(ipc::fs_labels::FS_WRITE, badge_with(rights::WRITE)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_WRITE_MEMORY, badge_with(rights::WRITE)).is_ok());
+        gate(ipc::fs_labels::FS_WRITE, badge_with(rights::WRITE)).unwrap();
+        gate(ipc::fs_labels::FS_WRITE_MEMORY, badge_with(rights::WRITE)).unwrap();
         assert_eq!(
             gate(ipc::fs_labels::FS_WRITE, badge_with(rights::READ)),
             Err(GateError::PermissionDenied)
@@ -415,7 +415,7 @@ mod tests
     #[test]
     fn fs_truncate_gates_on_write_bit()
     {
-        assert!(gate(ipc::fs_labels::FS_TRUNCATE, badge_with(rights::WRITE)).is_ok());
+        gate(ipc::fs_labels::FS_TRUNCATE, badge_with(rights::WRITE)).unwrap();
         assert_eq!(
             gate(ipc::fs_labels::FS_TRUNCATE, badge_with(rights::READ)),
             Err(GateError::PermissionDenied)
@@ -431,7 +431,7 @@ mod tests
     {
         // NS_LOOKUP encodes name length in bits 16..32.
         let label = ipc::ns_labels::NS_LOOKUP | (5u64 << 16);
-        assert!(gate(label, badge_with(rights::LOOKUP)).is_ok());
+        gate(label, badge_with(rights::LOOKUP)).unwrap();
     }
 
     #[test]

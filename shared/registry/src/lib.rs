@@ -315,7 +315,13 @@ mod tests
     {
         let mut r = Registry::new();
         let names: Vec<[u8; 3]> = (0..300u16)
-            .map(|i| [b'n', b'a' + (i / 26) as u8, b'a' + (i % 26) as u8])
+            .map(|i| {
+                [
+                    b'n',
+                    b'a' + u8::try_from(i / 26).unwrap(),
+                    b'a' + u8::try_from(i % 26).unwrap(),
+                ]
+            })
             .collect();
         for (i, name) in names.iter().enumerate()
         {

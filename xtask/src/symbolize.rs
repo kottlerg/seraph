@@ -793,13 +793,13 @@ mod tests
             data
         });
         let sym = Symbolizer::new(&image).unwrap();
-        assert!(sym.resolve(OUTER + 4).is_err());
+        sym.resolve(OUTER + 4).unwrap_err();
     }
 
     #[test]
     fn address_below_the_bias_is_refused()
     {
-        assert!(image_address(0xfff, 0x1000).is_err());
+        image_address(0xfff, 0x1000).unwrap_err();
         assert_eq!(image_address(0x1000, 0x1000).unwrap(), 0);
     }
 
@@ -862,12 +862,12 @@ mod tests
             0xffff_ffff_8000_1000
         );
         assert_eq!(parse_hex("1F").unwrap(), 0x1f);
-        assert!(parse_hex("").is_err());
-        assert!(parse_hex("0x").is_err());
-        assert!(parse_hex("12g").is_err());
-        assert!(parse_hex("+ff").is_err());
-        assert!(parse_hex("0x+ff").is_err());
-        assert!(parse_hex("-1").is_err());
-        assert!(parse_hex("10000000000000000").is_err());
+        parse_hex("").unwrap_err();
+        parse_hex("0x").unwrap_err();
+        parse_hex("12g").unwrap_err();
+        parse_hex("+ff").unwrap_err();
+        parse_hex("0x+ff").unwrap_err();
+        parse_hex("-1").unwrap_err();
+        parse_hex("10000000000000000").unwrap_err();
     }
 }

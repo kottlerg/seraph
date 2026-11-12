@@ -170,7 +170,7 @@ mod tests
     fn pack_places_rights_in_high_bits()
     {
         let badge = pack(NodeId::ROOT, NamespaceRights::from_raw(LOOKUP));
-        assert_eq!(badge, (LOOKUP as u64) << NODE_ID_BITS);
+        assert_eq!(badge, u64::from(LOOKUP) << NODE_ID_BITS);
     }
 
     #[test]

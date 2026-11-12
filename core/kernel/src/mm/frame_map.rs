@@ -530,7 +530,7 @@ mod tests
         let frames: Vec<u64> = frames_of(P + 10, P).collect();
         assert_eq!(frames, [P, 2 * P]);
         assert_eq!(frames_of(P, 0).count(), 0);
-        let last = u64::MAX & !(P - 1);
+        let last = !(P - 1);
         let frames: Vec<u64> = frames_of(last + 10, 4 * P).collect();
         assert_eq!(frames, [last]);
     }
@@ -540,10 +540,8 @@ mod tests
     {
         let map = map_of(1);
         // SAFETY: no chunk is installed.
-        assert_eq!(
-            unsafe { map.populate([(0, GIB)].into_iter(), || None) },
-            Err(())
-        );
+        let populated = unsafe { map.populate([(0, GIB)].into_iter(), || None) };
+        assert_eq!(populated, Err(()));
     }
 
     #[test]
@@ -586,7 +584,7 @@ mod tests
     {
         let map = table_with_gib_one();
         map.raise(5 * P).unwrap();
-        map.raise(u64::MAX & !(P - 1)).unwrap();
+        map.raise(!(P - 1)).unwrap();
         assert!(!map.any_mapped(5 * P, P));
         // A removal of an untracked frame is not an underflow.
         map.lower(5 * P);

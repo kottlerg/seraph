@@ -381,8 +381,8 @@ mod tests
 
         assert_eq!(t.find_or_alloc(2), slot);
         assert_eq!(t.slots()[slot].badge(), 2);
-        assert!(t.slots()[slot].name().is_empty());
-        assert!(t.slots()[slot].line().is_empty());
+        assert_eq!(t.slots()[slot].name(), []);
+        assert_eq!(t.slots()[slot].line(), []);
     }
 
     #[test]
@@ -482,6 +482,6 @@ mod tests
         assert!(slot.push_byte(b'x'));
         assert_eq!(slot.line().len(), LINE_BUF_SIZE);
         slot.clear_line();
-        assert!(slot.line().is_empty());
+        assert_eq!(slot.line(), []);
     }
 }

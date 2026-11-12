@@ -241,6 +241,8 @@ pub fn run(args: &TestCrashReportArgs) -> Result<()>
 #[cfg(test)]
 mod tests
 {
+    use std::fmt::Write as _;
+
     use crash_report::{Access, Arch, Fault, Image, Report, Status, Thread};
 
     use super::*;
@@ -265,26 +267,32 @@ mod tests
     fn death(report: &Report<'_>, name: &str) -> String
     {
         let mut log = String::new();
-        report.emit(|line| log.push_str(&format!("[2.5] [crashd] {line}\r\n")));
+        report.emit(|line| write!(log, "[2.5] [crashd] {line}\r\n").unwrap());
         let tid = report.id;
-        log.push_str(&format!(
-            "[2.4] fault unhandled: tid={tid} handler declined, reason={:#x}\n",
+        writeln!(
+            log,
+            "[2.4] fault unhandled: tid={tid} handler declined, reason={:#x}",
             report.id
-        ));
+        )
+        .unwrap();
         let cr2 = match report.fault
         {
             Fault::Vm { addr, .. } => addr,
             Fault::Exception { .. } => 0,
         };
-        log.push_str(&format!(
+        write!(
+            log,
             "[2.4] USERSPACE FAULT: tid={tid} cpu=0 cause=#UD (vec=6 err=0x0)\n  rip=0x1  \
              cr2={cr2:#018x}  fs_base=0x0\n  rsi=0x0000000000000000  rbp=0x0  rsp={:#018x}\n",
             report.regs.get(RSP).copied().unwrap_or(0)
-        ));
-        log.push_str(&format!(
+        )
+        .unwrap();
+        write!(
+            log,
             "[2.6] [logd] reclaim: badge={} exit_reason=0x100e name={name}\r\n",
             report.badge
-        ));
+        )
+        .unwrap();
         log
     }
 
@@ -392,9 +400,9 @@ mod tests
         let log: String = fixture_reports(&regs)
             .lines()
             .filter(|l| !l.contains("name=crashme") || l.contains("badge=42"))
-            .map(|l| format!("{l}\n"))
+            .flat_map(|l| [l, "\n"])
             .collect();
-        assert!(check_log(&log, CrashReportExpect::Reports).is_err());
+        check_log(&log, CrashReportExpect::Reports).unwrap_err();
     }
 
     #[test]
@@ -402,7 +410,7 @@ mod tests
     {
         let regs = [0u64; 21];
         let log = fixture_reports(&regs).replace("reason=0xaa", "reason=0xcc");
-        assert!(check_log(&log, CrashReportExpect::Reports).is_err());
+        check_log(&log, CrashReportExpect::Reports).unwrap_err();
     }
 
     #[test]
@@ -412,13 +420,13 @@ mod tests
         // A `text` that is not two hexadecimal words is malformed; a value of
         // a set-valued field the reader does not know would not be.
         let log = fixture_reports(&regs).replace(" text=0x", " text=0y");
-        assert!(check_log(&log, CrashReportExpect::Reports).is_err());
+        check_log(&log, CrashReportExpect::Reports).unwrap_err();
         let one = death(
             &fixture_report(0xdd, Fault::Exception { code: 1, aux: 0 }, &regs),
             "other",
         )
         .replace(" text=0x", " text=0y");
-        assert!(check_log(&one, CrashReportExpect::None).is_err());
+        check_log(&one, CrashReportExpect::None).unwrap_err();
     }
 
     #[test]
@@ -486,6 +494,6 @@ mod tests
             Verdict::Pass(0)
         );
         let regs = [0u64; 21];
-        assert!(check_log(&fixture_reports(&regs), CrashReportExpect::None).is_err());
+        check_log(&fixture_reports(&regs), CrashReportExpect::None).unwrap_err();
     }
 }

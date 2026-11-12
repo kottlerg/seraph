@@ -677,8 +677,8 @@ mod tests
         assert_eq!(usize::from(TRAMPOLINE_TEMPLATE[0xCC]), TRAMP_PATCH_CR4);
         // The CR4 patch site lies in padding: clear of the RM far-jmp target
         // before it and the GDTR after it.
-        assert!(TRAMP_PATCH_RM_FAR_JMP + 6 <= TRAMP_PATCH_CR4);
-        assert!(TRAMP_PATCH_CR4 + 4 <= TRAMP_PATCH_GDTR);
+        const { assert!(TRAMP_PATCH_RM_FAR_JMP + 6 <= TRAMP_PATCH_CR4) };
+        const { assert!(TRAMP_PATCH_CR4 + 4 <= TRAMP_PATCH_GDTR) };
         assert_eq!(
             usize::try_from(u32_at(0xEB)).unwrap(),
             TRAMP_PATCH_LM64_FAR_JMP
@@ -689,10 +689,12 @@ mod tests
             u16_at(TRAMP_PATCH_LM64_FAR_JMP + 4),
             selector_of(GDT_CODE64)
         );
-        assert!(
-            GDT_CODE64 & (1 << 53) != 0,
-            "64-bit code segment must have L set"
-        );
+        const {
+            assert!(
+                GDT_CODE64 & (1 << 53) != 0,
+                "64-bit code segment must have L set"
+            );
+        };
 
         // LM64 relay: `lea rbx, [rip+disp]` lands on the params block (RIP after
         // the lea is 0x107), and each load reads its PARAM_* slot.
@@ -708,6 +710,6 @@ mod tests
         assert_eq!(usize::from(TRAMPOLINE_TEMPLATE[0x119]), PARAM_ENTRY_FN);
 
         // The params block ends before the PM32 entry the RM far jmp targets.
-        assert!(TRAMP_PARAMS + PARAM_IST2 + 8 <= 0x90);
+        const { assert!(TRAMP_PARAMS + PARAM_IST2 + 8 <= 0x90) };
     }
 }

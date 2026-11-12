@@ -713,14 +713,14 @@ unsafe fn unlink_free_collect(id: SlotId) -> Option<NonNull<KernelObjectHeader>>
 /// Host-test harness shared by the derivation-tree modules (`derivation`,
 /// `transfer`).
 ///
-/// Each test registers heap-backed CSpaces in the shared test registry
+/// Each test registers heap-backed `CSpaces` in the shared test registry
 /// under hard-coded ids unique to that test (the registry is a
 /// process-wide static and `cargo test` runs tests concurrently). The
 /// ids sit far above any fresh id the host-test registry's `alloc_cspace_id`
 /// hands out in this suite and below the recycle test's reserved top id;
 /// nothing enforces that — a new direct-registration test must pick an
 /// unused id. Leaked Boxes are acceptable — the process exits after the
-/// run. The global DERIVATION_LOCK is taken for fidelity with the
+/// run. The global `DERIVATION_LOCK` is taken for fidelity with the
 /// production contract; these tests assert only after `write_unlock`, so
 /// a failing assertion unwinds without wedging the other tests on the
 /// lock (the `debug_assert!`s reachable under the hold —
@@ -757,6 +757,7 @@ pub(crate) mod harness
     }
 
     /// Derivation links to hand-write into a slot (see [`set_links`]).
+    #[derive(Clone, Copy)]
     pub(crate) struct Links
     {
         pub(crate) parent: Option<SlotId>,
@@ -821,7 +822,7 @@ pub(crate) mod harness
         cs: *mut CSpace,
         id: crate::cap::slot::CSpaceId,
         len: usize,
-    ) -> std::vec::Vec<SlotId>
+    ) -> Vec<SlotId>
     {
         (0..len).map(|_| occupy(cs, id)).collect()
     }
@@ -876,7 +877,7 @@ mod tests
         lock.write_lock();
         let held = lock.debug_snapshot();
         assert_eq!((held.state, held.holder), (WRITE_LOCKED, 1));
-        assert_eq!(held.site.map(|loc| loc.file()), Some(file!()));
+        assert_eq!(held.site.map(std::panic::Location::file), Some(file!()));
 
         lock.write_unlock();
         let released = lock.debug_snapshot();

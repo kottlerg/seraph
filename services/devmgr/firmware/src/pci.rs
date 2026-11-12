@@ -1333,7 +1333,7 @@ mod tests
         let narrow = Msi::decode(0x50, 0);
         let mut reached = Vec::new();
         let outcome = reach_message_files(
-            &[(0x1_2800_0000_u64, 0x41_u64)],
+            &[(0x1_2800_0000u64, 0x41u64)],
             |&(address, data)| narrow.fits(address, data),
             |&(address, _)| {
                 reached.push(address);
@@ -1341,11 +1341,11 @@ mod tests
             },
         );
         assert_eq!(outcome, Err(MessagesRefused::Unfit(0)));
-        assert!(reached.is_empty());
+        assert_eq!(reached, [] as [u64; 0]);
         // Every message is checked first: a later one that does not fit
         // stops the earlier one's file from being reached too.
         let outcome = reach_message_files(
-            &[(0x2800_0000_u64, 0x41_u64), (0x2800_1000, 0x1_0000)],
+            &[(0x2800_0000u64, 0x41u64), (0x2800_1000, 0x1_0000)],
             |&(address, data)| narrow.fits(address, data),
             |&(address, _)| {
                 reached.push(address);
@@ -1353,7 +1353,7 @@ mod tests
             },
         );
         assert_eq!(outcome, Err(MessagesRefused::Unfit(1)));
-        assert!(reached.is_empty());
+        assert_eq!(reached, [] as [u64; 0]);
     }
 
     #[test]
@@ -1362,7 +1362,7 @@ mod tests
         let fits = |_: &u64| true;
         // Every file reached, one of them newly.
         let mut reached = Vec::new();
-        let outcome = reach_message_files(&[0x2800_0000_u64, 0x2800_1000], fits, |&a| {
+        let outcome = reach_message_files(&[0x2800_0000u64, 0x2800_1000], fits, |&a| {
             reached.push(a);
             Some(a == 0x2800_1000)
         });
@@ -1370,14 +1370,14 @@ mod tests
         assert_eq!(reached, [0x2800_0000, 0x2800_1000]);
         // Files already mapped: nothing newly mapped.
         assert_eq!(
-            reach_message_files(&[0x2800_0000_u64], fits, |_| Some(false)),
+            reach_message_files(&[0x2800_0000u64], fits, |_| Some(false)),
             Ok(false)
         );
         // A file that cannot be reached after one newly mapped widened the
         // domain; no later file is tried.
         let mut reached = Vec::new();
         let outcome =
-            reach_message_files(&[0x2800_0000_u64, 0x2800_1000, 0x2800_2000], fits, |&a| {
+            reach_message_files(&[0x2800_0000u64, 0x2800_1000, 0x2800_2000], fits, |&a| {
                 reached.push(a);
                 (a != 0x2800_1000).then_some(true)
             });
@@ -1385,7 +1385,7 @@ mod tests
         assert_eq!(reached, [0x2800_0000, 0x2800_1000]);
         // The first file unreachable: nothing was widened.
         assert_eq!(
-            reach_message_files(&[0x2800_0000_u64], fits, |_| None),
+            reach_message_files(&[0x2800_0000u64], fits, |_| None),
             Err(MessagesRefused::Unreachable { widened: false })
         );
     }

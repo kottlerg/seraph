@@ -4649,6 +4649,10 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 
 /// Test stub.
 #[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the stub keeps the signature of the non-test item, which can fail"
+)]
 pub unsafe fn commit_reply_rebind_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,

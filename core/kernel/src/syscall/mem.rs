@@ -133,6 +133,15 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidArgument);
     }
+    // The physical span of the mapped pages. It lies inside the Memory
+    // object's range, which cannot pass the end of the address space; the
+    // checks refuse a span that would rather than wrap it.
+    let phys_base = memory_phys
+        .checked_add(byte_offset)
+        .ok_or(SyscallError::InvalidArgument)?;
+    let phys_end = phys_base
+        .checked_add(mapping_size as u64)
+        .ok_or(SyscallError::InvalidArgument)?;
 
     // Retype/map boundary (docs/capability-model.md § Typed Memory). Pin the
     // range's frames in the frame map first, then read the bump cursor: a
@@ -143,7 +152,7 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     // the page-rounded cursor holds none, and none can be carved under the
     // pinned frames while this call maps them. The pins drop when the call
     // returns; each installed leaf holds its own count.
-    let pins = FramePins::pin(memory_phys + byte_offset, page_count)?;
+    let pins = FramePins::pin(phys_base, phys_end)?;
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     let retyped_end = crate::cap::retype::current_bump(memory_ref)
         .div_ceil(PAGE_SIZE as u64)
@@ -202,11 +211,10 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Mapping loop ──────────────────────────────────────────────────────────
 
-    for i in 0..page_count
+    let virts = (virt_base..virt_end).step_by(PAGE_SIZE);
+    let frames = (phys_base..phys_end).step_by(PAGE_SIZE);
+    for (virt, phys) in virts.zip(frames)
     {
-        let virt = virt_base + (i * PAGE_SIZE) as u64;
-        let phys = memory_phys + byte_offset + (i * PAGE_SIZE) as u64;
-
         // SAFETY: virt is in user range (validated above); phys is from a
         // Memory cap confirmed by the kernel at capability creation.
         // as_ptr validated non-null; aso_raw is valid and wraps as_ptr.
@@ -269,26 +277,33 @@ fn map_permissions(
 #[cfg(not(test))]
 struct FramePins
 {
+    /// First frame of the span.
     phys: u64,
+    /// End of the span, exclusive.
+    end: u64,
+    /// Frames from `phys` whose count this guard raised.
     pages: usize,
 }
 
 #[cfg(not(test))]
 impl FramePins
 {
-    /// Raise the count of each of the `pages` frames from `phys`.
+    /// Raise the count of each frame in `[phys, end)`.
     ///
     /// # Errors
     /// `OutOfMemory` when a frame's count is saturated; nothing stays pinned.
-    fn pin(phys: u64, pages: usize) -> Result<Self, SyscallError>
+    fn pin(phys: u64, end: u64) -> Result<Self, SyscallError>
     {
-        let page = crate::mm::PAGE_SIZE as u64;
-        let mut pins = Self { phys, pages: 0 };
-        while pins.pages < pages
+        let mut pins = Self {
+            phys,
+            end,
+            pages: 0,
+        };
+        for frame in (phys..end).step_by(crate::mm::PAGE_SIZE)
         {
-            crate::mm::frame_map::raise(phys + pins.pages as u64 * page)
-                .map_err(|()| SyscallError::OutOfMemory)?;
-            pins.pages += 1;
+            crate::mm::frame_map::raise(frame).map_err(|()| SyscallError::OutOfMemory)?;
+            // Bounded by the span's frame count, a `usize`: cannot saturate.
+            pins.pages = pins.pages.saturating_add(1);
         }
         Ok(pins)
     }
@@ -299,10 +314,11 @@ impl Drop for FramePins
 {
     fn drop(&mut self)
     {
-        let page = crate::mm::PAGE_SIZE as u64;
-        for i in 0..self.pages
+        for frame in (self.phys..self.end)
+            .step_by(crate::mm::PAGE_SIZE)
+            .take(self.pages)
         {
-            crate::mm::frame_map::lower(self.phys + i as u64 * page);
+            crate::mm::frame_map::lower(frame);
         }
     }
 }
@@ -400,9 +416,8 @@ pub fn sys_mem_unmap(tf: UserFrame) -> Result<u64, SyscallError>
     }
     else
     {
-        for i in 0..page_count
+        for virt in (virt_base..virt_end).step_by(PAGE_SIZE)
         {
-            let virt = virt_base + (i * PAGE_SIZE) as u64;
             // SAFETY: virt is in user range (validated above); as_ptr is valid.
             unsafe { (*as_ptr).unmap_page(virt) };
         }
@@ -541,9 +556,8 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
     // of the capability that mapped it: the Memory cap named here authorises
     // the call, not the frames under the range. A page that refuses stops the
     // loop with the pages before it already changed.
-    for i in 0..page_count
+    for virt in (virt_base..virt_end).step_by(PAGE_SIZE)
     {
-        let virt = virt_base + (i * PAGE_SIZE) as u64;
         // SAFETY: virt is in user range (validated above); as_ptr is valid.
         unsafe { (*as_ptr).protect_page(virt, page_flags) }.map_err(|e| match e
         {
@@ -661,13 +675,19 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
     }
 
     // split_offset must be strictly within (0, orig_size) with at least
-    // one page on each side.
-    if split_offset >= orig_size || orig_size - split_offset < PAGE_SIZE as u64
+    // one page on each side. The tail's base lies inside the parent's range,
+    // which cannot pass the end of the address space; the check refuses a
+    // base that would rather than wrap it.
+    let Some((tail_size, tail_base)) = orig_size
+        .checked_sub(split_offset)
+        .filter(|&rest| rest >= PAGE_SIZE as u64)
+        .zip(parent_phys.checked_add(split_offset))
+    else
     {
         parent_ref.write_unlock();
         DERIVATION_LOCK.write_unlock();
         return Err(SyscallError::InvalidArgument);
-    }
+    };
 
     // Live retypes against the parent occupy `[0, bump_offset)`. The split
     // point must sit at or above the next page boundary so the carved tail
@@ -682,7 +702,6 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
-    let tail_size = orig_size - split_offset;
     let tail_avail = if parent_retypable { tail_size } else { 0 };
 
     // ── Mint tail MemoryObject ─────────────────────────────────────────────────
@@ -703,7 +722,7 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
     let tail_ptr = funder
         .alloc_body(MemoryObject {
             header: KernelObjectHeader::new(ObjectType::Memory),
-            base: parent_phys + split_offset,
+            base: tail_base,
             size: tail_size,
             available_bytes: core::sync::atomic::AtomicU64::new(tail_avail),
             // Tail inherits the parent's ownership flag so the two halves together
@@ -938,12 +957,20 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
         .load(core::sync::atomic::Ordering::Acquire);
     let tail_bump = crate::cap::retype::current_bump(tail_ref);
 
-    // Physical contiguity.
+    // Physical contiguity. The merged size cannot overflow once the two are
+    // contiguous, since the tail's range ends inside the address space; the
+    // check refuses a size that would rather than wrap it.
     if parent_base.checked_add(parent_size) != Some(tail_base)
     {
         release_locks();
         return Err(SyscallError::InvalidArgument);
     }
+    let Some(merged_size) = parent_size.checked_add(tail_size)
+    else
+    {
+        release_locks();
+        return Err(SyscallError::InvalidArgument);
+    };
     // Memory-ownership state must match.
     if parent_owns != tail_owns
     {
@@ -1026,7 +1053,6 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
     unsafe { unlink_node(tail_id) };
 
     // ── Mutate parent in place: grow size, credit available ──────────────────
-    let merged_size = parent_size + tail_size; // contiguity already verified
     // SAFETY: parent's write_lock held; this is the only mutator of size.
     unsafe {
         let parent_mut = parent_obj_nn.as_ptr().cast::<MemoryObject>();

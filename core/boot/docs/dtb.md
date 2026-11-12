@@ -49,10 +49,12 @@ validation yields no resources (the walkers return `None` or zero) and
 the bootloader proceeds without DTB-derived resources; the
 `BootInfo.device_tree` passthrough is unaffected. The bootloader never
 halts on a rejected blob. The kernel falls back to its compiled-in
-defaults for any zero MMIO base, but on a RISC-V platform whose only hart
-facts come from the DTB (no ACPI RHCT), a rejected blob leaves
-`timebase_freq` zero and `hart_caps` empty, which halts the kernel at
-Phase 5 (see [boot-flow.md](boot-flow.md) §"Step 9"). The kernel sizes the
+defaults for any zero MMIO base but the riscv64 `aplic` and `imsic`,
+which it requires. On a RISC-V platform whose only interrupt controllers
+and hart facts come from the DTB (no ACPI MADT AIA entries or RHCT), a
+rejected blob therefore leaves `imsic` and `aplic` zero, which halts the
+kernel at Phase 4, and `timebase_freq` zero and `hart_caps` empty, which
+would halt it at Phase 5 (see [boot-flow.md](boot-flow.md) §"Step 9"). The kernel sizes the
 passed-through blob from its own header to keep its pages out of the frame
 allocator, and halts at Phase 3 when the magic is wrong, the `totalsize` is below
 the 40-byte header, or the blob extends past the direct-mapped span (see

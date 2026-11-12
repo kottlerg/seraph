@@ -246,8 +246,9 @@ orchestrator holds the host for another worker's grant, launch no boot (the comm
 not passed that grant), and during a timing-sensitive measurement no build either, until it says
 the grant ended: the command refuses a build only while a `--timing` boot runs, not between the
 holder's boots. Run one QEMU of your own at a time. A timeout or timing failure of a boot that ran
-beside another QEMU, owed by § Coverage tiers or not, is re-run once with `--alone` before it
-counts; `--alone` admits the re-run only with no other QEMU running.
+beside another QEMU, owed by § Coverage tiers or not, is re-run once with `--alone`, and the
+re-run's outcome is the one that counts (docs/testing.md § Coverage tiers, When the runs are
+owed); `--alone` admits the re-run only with no other QEMU running.
 
 A boot that fails, hangs, or shows a kill you did not expect is evidence. Before any re-run,
 copy its saved log, and its `.crash.txt` when there is one, to a name that says what it is (the

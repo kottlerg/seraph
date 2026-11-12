@@ -202,8 +202,10 @@ claims.
    missing, its `--runs` count is not stated, its head is
    absent or does not cover the PR head, or its outcome is missing or is
    anything other than `PASS` (a `QEMU-CRASH` run is replaced by its re-run,
-   whose outcome stands); when a "none owed" statement is absent or
-   contradicted by the PR's own diff or a stated concurrency-fix purpose;
+   whose outcome stands, and so is a run that ran beside another QEMU and
+   HANGs or fails a timing check, by its re-run alone); when a "none owed"
+   statement is absent or contradicted by the PR's own diff or a stated
+   concurrency-fix purpose;
    and, for a run the body reports that the PR does not owe, when it is a
    memory variation or a device cell that HANGs or fails, or a boundary run that HANGs or
    fails and the body gives no link to its record on the open Issue for that

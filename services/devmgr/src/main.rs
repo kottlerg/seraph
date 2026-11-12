@@ -1425,7 +1425,11 @@ impl IrqRangeAllocator
     /// Route wired line `gsi` in `mode` through its single-line cap `cap`,
     /// which then holds the route (`SYS_IRQ_ROUTE`; a line `cap` routed
     /// already in `mode` is left as it is), and write its remapping entry
-    /// when remapping is on.
+    /// when remapping is on. [`line_cap`](Self::line_cap) calls it for every
+    /// derivation of a held line: once the route and the entry are in place
+    /// the repeat changes neither (the IOMMU driver leaves an entry that
+    /// already holds what `REMAP_SET` asks for untouched), so a shared line
+    /// delivers throughout, and a write that failed is retried.
     ///
     /// # Errors
     /// The `SYS_IRQ_ROUTE` error, or `InvalidState` when the remapping entry

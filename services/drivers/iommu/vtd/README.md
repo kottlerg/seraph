@@ -34,8 +34,9 @@ The driver runs the units in legacy translation mode:
   32-bit destinations when asked and every unit offers them (`ECAP.EIM`); `REMAP_SET` writes an
   entry (fixed delivery, physical destination, the requester verified by its full source ID) and
   `REMAP_CLEAR` clears one, each followed by an interrupt-entry-cache invalidation of that entry on
-  every unit; a present entry is cleared and invalidated before it is rewritten, so no unit reads
-  one whose two words disagree;
+  every unit; an entry that already holds what `REMAP_SET` asks for is left untouched, so a repeated
+  set opens no gap in a live source's delivery, and a present entry with other contents is cleared
+  and invalidated before it is rewritten, so no unit reads one whose two words disagree;
 - a unit whose page walks do not snoop the caches (`ECAP.C` clear, as QEMU's `intel-iommu`
   reports) gets every table write flushed from them before it is used;
 - faults are polled from the fault recording registers, since fault events are message-signalled;

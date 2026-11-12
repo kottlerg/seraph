@@ -627,19 +627,31 @@ impl Backend for Vtd
         self.remap = None;
     }
 
-    /// A present entry is made not present, and every unit's cached copy
+    /// An entry that already holds `entry` is left as it is, so a repeated
+    /// set opens no gap in a source's delivery. A present entry holding
+    /// anything else is made not present, and every unit's cached copy
     /// invalidated, before its new contents are written, so no unit reads
-    /// an entry whose two words disagree.
+    /// an entry whose two words disagree ([`remap::update`]).
     fn remap_set(&mut self, handle: u16, entry: RemapEntry) -> Result<(), BackendError>
     {
         let table = self.remap.ok_or(BackendError::Invalid)?;
         let (page, index) = table.slot(handle);
-        if self.store.table(page)[index] & remap::IRTE_PRESENT != 0
+        let words = remap::entry(entry, table.extended);
+        let held = {
+            let t = self.store.table(page);
+            [t[index], t[index + 1]]
+        };
+        match remap::update(held, words)
         {
-            self.clear_entry(page, index);
-            self.invalidate_remap_entry(handle)?;
+            remap::Update::Unchanged => return Ok(()),
+            remap::Update::Replace =>
+            {
+                self.clear_entry(page, index);
+                self.invalidate_remap_entry(handle)?;
+            }
+            remap::Update::Write => (),
         }
-        self.write_entry(page, index, remap::entry(entry, table.extended));
+        self.write_entry(page, index, words);
         self.invalidate_remap_entry(handle)
     }
 

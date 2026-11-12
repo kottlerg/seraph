@@ -75,9 +75,10 @@
 //! ([`remote_irr_clear`]).
 //!
 //! # Modification notes
-//! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_REGISTER`, through
-//!   `irq::register`), released by `interrupts::unroute_device_irq`, and unmasked by
-//!   `interrupts::unmask` (from `SYS_IRQ_ACK`).
+//! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_ROUTE`, through
+//!   `irq::route`), released by `interrupts::unroute_device_irq` once neither a route
+//!   holder nor a binding remains, and unmasked by `interrupts::unmask` (from
+//!   `SYS_IRQ_ACK`).
 
 // cast_possible_truncation: u64→usize APIC MMIO address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector widening casts.

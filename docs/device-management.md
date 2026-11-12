@@ -562,12 +562,15 @@ configuration table (`msi_cfg_tbl`, RISC-V IOMMU specification); devmgr gives th
 and the driver keeps the unit's interrupts off and polls its queues, so no message is written
 there.
 
-On x86-64, until VT-d interrupt remapping is programmed
-([#325](https://github.com/kottlerg/seraph/issues/325)), a device whose DMA engine writes to the
-interrupt range can raise any vector on any CPU whose APIC id is below `0xFF`, the exception vectors
-16 to 31 included, behind an IOMMU or not; its driver cannot do so through the MSI-X table, which
-only devmgr writes. On riscv64 behind the RISC-V IOMMU a device's writes reach only the interrupt
-files its domain maps.
+On x86-64 with VT-d interrupt remapping on (§ IOMMU Discovery and Programming), a device's interrupt
+write is delivered only through a remapping entry devmgr had the IOMMU driver write for the
+device's own requester ID: a remappable message naming an entry written for another requester, or
+an entry not present, is blocked, and so is every compatibility-format message. With remapping off
+(the DMAR offers none, an I/O APIC has no source ID in the DMAR, or the driver or the kernel refused
+the setup, each logged by devmgr), a device whose DMA engine writes to the interrupt range can raise
+any vector on any CPU whose APIC id is below `0xFF`, the exception vectors 16 to 31 included, behind
+an IOMMU or not; its driver cannot do so through the MSI-X table, which only devmgr writes. On
+riscv64 behind the RISC-V IOMMU a device's writes reach only the interrupt files its domain maps.
 
 ---
 

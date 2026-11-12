@@ -37,11 +37,15 @@
 //!   (separate hardware) is unaffected and stays MMIO.
 //!
 //! # Modification notes
-//! - Device IRQs are routed generically: `SYS_IRQ_REGISTER` (`syscall::hw::sys_irq_register`)
-//!   calls `irq::register`, which calls [`route_device_irq`] (choose a destination CPU,
-//!   assign a device vector of it, install the I/O APIC entry masked) and records the
-//!   Notification; clearing the route calls [`unroute_device_irq`]. `SYS_IRQ_ACK`
-//!   (`syscall::hw::sys_irq_ack`) calls [`unmask`].
+//! - Device IRQs are routed generically: `SYS_IRQ_ROUTE` (`syscall::hw::sys_irq_route`)
+//!   calls `irq::route`, which calls [`route_device_irq`] (choose a destination CPU,
+//!   assign a device vector of it, install the I/O APIC entry masked) for a line not yet
+//!   routed; `SYS_IRQ_REGISTER` (`irq::register`) records a Notification on a routed
+//!   line; the line's release, once neither a route holder nor a binding remains, calls
+//!   [`unroute_device_irq`]. `SYS_IRQ_ACK` (`syscall::hw::sys_irq_ack`) calls [`unmask`].
+//! - `SYS_IRQ_REMAP` (`irq::set_remap`) selects the formats through [`set_remap`]; while
+//!   remapping is on, [`route_device_irq`] and [`message_address`] name a handle
+//!   ([`super::remap`]) and [`remap_entry`] reports the entry the IOMMU needs.
 //! - Message-signaled targets (`SYS_IRQ_MSG_ALLOC`, `irq::alloc_message`) take a device
 //!   vector of a CPU through [`alloc_message_target`] and release it through
 //!   [`free_message_target`]; the vector's slot entry ([`slot_entry`]) anchors the target,
@@ -1026,8 +1030,10 @@ fn release_slot(target: crate::irq::Target)
 pub unsafe fn unroute_device_irq(_irq: u32, _target: crate::irq::Target) {}
 
 /// Take a device vector for a new message target: the next free vector of the next CPU
-/// in turn (`irq::next_target_cpu`) whose APIC id a compatibility-format message address
-/// can name and that has a free one ([`super::msi`]), its slot entry left
+/// in turn (`irq::next_target_cpu`) that the current message format can name
+/// ([`nameable`]: with remapping off, an APIC id a compatibility-format address names,
+/// [`super::msi`]; with it on, a CPU whose vectors have handles, [`super::remap`]) and
+/// that has a free one, its slot entry left
 /// `irq::Slot::Unbound`. Every device vector is enabled at its local APIC from boot, so
 /// the target is deliverable once the device writes the message [`message_address`] and
 /// [`message_data`] give. Called by `irq::alloc_message` under `irq`'s routing lock.

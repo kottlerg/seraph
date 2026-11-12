@@ -62,6 +62,40 @@ pub const fn irta(base: u64, entries: u32, extended: bool) -> u64
     (base & !0xfff) | eime | (entries.trailing_zeros() - 1) as u64
 }
 
+/// What making a table entry hold the words `new` takes, given the words
+/// it `held` ([`update`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Update
+{
+    /// The entry holds `new` already: nothing is written or invalidated, so
+    /// an interrupt it is delivering meets no gap.
+    Unchanged,
+    /// The entry is not present: `new` is written, high word first.
+    Write,
+    /// The entry is present with other contents: it is made not present
+    /// and invalidated before `new` is written, so no unit reads an entry
+    /// whose two words disagree.
+    Replace,
+}
+
+/// What making an entry that holds `held` hold `new` takes.
+#[must_use]
+pub fn update(held: [u64; 2], new: [u64; 2]) -> Update
+{
+    if held[0] & IRTE_PRESENT == 0
+    {
+        Update::Write
+    }
+    else if held == new
+    {
+        Update::Unchanged
+    }
+    else
+    {
+        Update::Replace
+    }
+}
+
 /// Pages a table of `entries` entries takes.
 #[must_use]
 pub const fn table_pages(entries: u32) -> u64
@@ -118,6 +152,33 @@ mod tests
             0x7f00_0000 | (1 << 11) | 15
         );
         assert_eq!(irta(0x7f00_0000, 2, false) & 0xf, 0);
+    }
+
+    #[test]
+    fn an_entry_already_holding_the_words_is_left_alone()
+    {
+        let words = entry(UART, false);
+        assert_eq!(update(words, words), Update::Unchanged);
+    }
+
+    #[test]
+    fn a_present_entry_with_other_words_is_replaced_and_an_absent_one_written()
+    {
+        let words = entry(UART, false);
+        let other = entry(
+            RemapEntry {
+                vector: 0x42,
+                ..UART
+            },
+            false,
+        );
+        assert_eq!(update(other, words), Update::Replace);
+        assert_eq!(update([0, 0], words), Update::Write);
+        // A not-present entry is written whatever stale words it keeps.
+        assert_eq!(
+            update([words[0] & !IRTE_PRESENT, words[1]], words),
+            Update::Write
+        );
     }
 
     #[test]

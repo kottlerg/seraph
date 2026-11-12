@@ -2903,7 +2903,9 @@ pub mod iommu_labels
     pub const REMAP_SETUP: u64 = 9;
     /// Make one entry of the remapping table deliver to a CPU's vector for
     /// one requester, replacing what it held; the reply follows the
-    /// invalidation of every unit's cached copy.
+    /// invalidation of every unit's cached copy. An entry that already
+    /// holds exactly this is left as it is, so devmgr may set a live
+    /// source's entry again without a gap in its delivery.
     ///
     /// Request: `data[1]` = the entry's handle, below the table's entries;
     /// `data[2]` = the destination CPU's interrupt controller ID, within the

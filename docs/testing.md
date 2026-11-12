@@ -938,7 +938,9 @@ nothing on that account.
 **When the runs are owed.** Each local host run a PR owes MUST pass at one
 head that covers the merge head. For every local and release host run, only a `PASS` outcome of
 `run-parallel` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
-host emulator, is run again and the re-run's outcome stands; `OK` and `ERR` count as failures. The
+host emulator, is run again and the re-run's outcome stands; a run that ran beside another QEMU and
+HANGs or fails a timing check is run again once with no other QEMU beside it (`--alone`), and the
+re-run's outcome stands; `OK` and `ERR` count as failures. The
 PR's own diff at a head is the diff from that head's merge base with the fetched `master` to the
 head (after `git fetch origin`, `git diff $(git merge-base <head> origin/master) <head>`), so it
 excludes what a merge or rebase from `master` brings in. A run's surface is the surface that owes
@@ -961,7 +963,9 @@ on the open Issue for that boundary, or on a new Issue when that boundary has no
 does not block the PR. The PR body reports such a run as HANG or FAIL with a link to that record.
 Any other HANG or failure of a run the PR does not owe (a memory-variation or device-cell HANG or
 failure, or a boundary failure no open Issue for that boundary names), and any HANG or failure of a
-run the PR owes, blocks the PR. A flagged row of the timing report is neither a HANG nor a failure.
+run the PR owes, blocks the PR. Of a run that ran beside another QEMU and HANGs or fails a timing
+check, the outcome judged is its re-run's alone (When the runs are owed). A flagged row of the
+timing report is neither a HANG nor a failure.
 
 **Disk variations.** Four svctest boots, on each architecture, vary the disk: a 4Kn disk (`mkdisk
 --block-size 4096`), booted from a 4096-byte-block ESP with its root and data partitions at

@@ -118,7 +118,7 @@ impl RamDisk
     /// entries: an empty root directory and every cluster free.
     pub fn formatted() -> SharedDisk
     {
-        let mut boot = Box::new(ZERO_SECTOR);
+        let mut boot = ZERO_SECTOR;
         boot[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
         boot[3..11].copy_from_slice(b"SVCTEST ");
         boot[11..13].copy_from_slice(&512u16.to_le_bytes());
@@ -131,10 +131,10 @@ impl RamDisk
         boot[22..24].copy_from_slice(&bpb_u16(FAT_SECTORS));
         boot[510] = 0x55;
         boot[511] = 0xAA;
-        let mut fat = Box::new(ZERO_SECTOR);
+        let mut fat = ZERO_SECTOR;
         fat[..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0xFF]);
         Arc::new(Mutex::new(Self {
-            sectors: BTreeMap::from([(0, boot), (FAT_LBA, fat)]),
+            sectors: BTreeMap::from([(0, Box::new(boot)), (FAT_LBA, Box::new(fat))]),
             rules: Vec::new(),
         }))
     }
@@ -148,28 +148,41 @@ impl RamDisk
     /// The FAT16 entry of `cluster`.
     pub fn fat_entry(&self, cluster: u16) -> u16
     {
-        let at = usize::from(cluster) * 2;
-        let sector = self.sector(FAT_LBA + at / SECTOR);
-        u16::from_le_bytes([sector[at % SECTOR], sector[at % SECTOR + 1]])
+        let at = usize::from(cluster)
+            .checked_mul(2)
+            .expect("FAT entry byte offset overflowed");
+        let sector = self.sector(
+            FAT_LBA
+                .checked_add(at / SECTOR)
+                .expect("FAT entry sector overflowed"),
+        );
+        let entry = sector
+            .get(at % SECTOR..)
+            .and_then(<[u8]>::first_chunk::<2>)
+            .expect("FAT entry straddles a sector");
+        u16::from_le_bytes(*entry)
     }
 
     /// The sector of `cluster` (one sector per cluster).
     pub fn cluster_lba(cluster: u16) -> usize
     {
-        DATA_LBA + usize::from(cluster) - 2
+        DATA_LBA
+            .checked_add(usize::from(cluster))
+            .and_then(|lba| lba.checked_sub(2))
+            .expect("cluster number outside the data area")
     }
 
     /// The `(sector, byte offset)` of the root directory's 8.3 entry named
     /// `sfn` (space-padded, no dot), if there is one.
     pub fn find_root_sfn(&self, sfn: &[u8; 11]) -> Option<(usize, usize)>
     {
-        (ROOT_LBA..ROOT_LBA + ROOT_SECTORS).find_map(|lba| {
+        (ROOT_LBA..DATA_LBA).find_map(|lba| {
             self.sector(lba)
                 .as_chunks::<32>()
                 .0
                 .iter()
                 .position(|slot| slot[..11] == *sfn && slot[11] != 0x0F)
-                .map(|i| (lba, i * 32))
+                .map(|i| (lba, i.checked_mul(32).expect("root slot offset overflowed")))
         })
     }
 
@@ -204,7 +217,7 @@ impl RamDisk
             }
             if rule.skip > 0
             {
-                rule.skip -= 1;
+                rule.skip = rule.skip.checked_sub(1).expect("fault skip counter");
                 return true;
             }
             fired = fired.or(Some(rule.fault));
@@ -339,14 +352,20 @@ fn transfer(
     }
     for i in 0..count
     {
-        let page = (va + (i * SECTOR) as u64) as *mut u8;
+        let offset = i
+            .checked_mul(SECTOR)
+            .expect("sector copy offset overflowed");
+        let page = va
+            .checked_add(offset as u64)
+            .expect("sector copy address overflowed") as *mut u8;
+        let sector_lba = lba.checked_add(i).expect("sector copy LBA overflowed");
         match direction
         {
             Direction::Write =>
             {
                 let sector = disk
                     .sectors
-                    .entry(lba + i)
+                    .entry(sector_lba)
                     .or_insert_with(|| Box::new(ZERO_SECTOR));
                 // SAFETY: `va` maps one page for this copy, and sector `i` of
                 // at most `MAX_SECTORS_PER_REQUEST`, one page's worth, lies
@@ -355,7 +374,7 @@ fn transfer(
             }
             Direction::Read =>
             {
-                let sector = disk.sector(lba + i);
+                let sector = disk.sector(sector_lba);
                 // SAFETY: `va` maps one page for this copy, and sector `i`
                 // lies inside it, as for the write arm; `sector` is the
                 // disk's own buffer or the static `ZERO_SECTOR`, either way

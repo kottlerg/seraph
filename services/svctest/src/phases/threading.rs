@@ -101,7 +101,7 @@ pub fn threading_phase(_: &Caps)
                 for _ in 0..ITERS
                 {
                     let mut guard = c.lock().expect("mutex poisoned");
-                    *guard += 1;
+                    *guard = guard.checked_add(1).expect("mutex counter overflowed");
                 }
             })
         })
@@ -153,7 +153,12 @@ pub fn alloc_spawned_phase(_: &Caps)
         for &idx in &[0, 4095, 4096, 65_535, BIG / 2, BIG - 1]
         {
             let expected = (idx & 0xFF) as u8;
-            assert_eq!(v[idx], expected, "spawned-grow buffer[{idx}] mismatch");
+            assert_eq!(
+                *v.get(idx)
+                    .expect("spawned-grow buffer index within the pushed length"),
+                expected,
+                "spawned-grow buffer[{idx}] mismatch"
+            );
         }
     });
     handle.join().expect("alloc_spawned worker thread panicked");
@@ -363,7 +368,10 @@ pub fn condvar_notify_all_fanout_phase(_: &Caps)
             thread::spawn(move || {
                 let (lock, cv) = &*shared;
                 let mut state = lock.lock().expect("mutex poisoned");
-                state.0 += 1;
+                state.0 = state
+                    .0
+                    .checked_add(1)
+                    .expect("condvar waiter count overflowed");
                 // `wait_while` queues this thread before it unlocks the mutex,
                 // so a count the main thread reads under the lock counts only
                 // queued waiters.
@@ -525,11 +533,17 @@ pub fn condvar_timed_middle_waiter_phase(_: &Caps)
         thread::spawn(move || {
             let (lock, cv) = &*shared;
             let mut state = lock.lock().expect("mutex poisoned");
-            state.queued += 1;
+            state.queued = state
+                .queued
+                .checked_add(1)
+                .expect("queued waiter count overflowed");
             let mut state = cv
                 .wait_while(state, |s| s.tokens == 0)
                 .expect("mutex poisoned");
-            state.tokens -= 1;
+            state.tokens = state
+                .tokens
+                .checked_sub(1)
+                .expect("a waiter woke with no token to take");
             drop(state);
             let _ = woke.send(());
         })
@@ -544,7 +558,10 @@ pub fn condvar_timed_middle_waiter_phase(_: &Caps)
         thread::spawn(move || {
             let (lock, cv) = &*shared;
             let mut state = lock.lock().expect("mutex poisoned");
-            state.queued += 1;
+            state.queued = state
+                .queued
+                .checked_add(1)
+                .expect("queued waiter count overflowed");
             let (state, result) = cv
                 .wait_timeout_while(state, TIMED_WAIT, |s| s.tokens == 0)
                 .expect("mutex poisoned");
@@ -565,7 +582,11 @@ pub fn condvar_timed_middle_waiter_phase(_: &Caps)
     );
 
     let timed_out = timed_rx
-        .recv_timeout(TIMED_WAIT + FANOUT_BOUND)
+        .recv_timeout(
+            TIMED_WAIT
+                .checked_add(FANOUT_BOUND)
+                .expect("timed wait plus fanout bound overflowed"),
+        )
         .expect("condvar_timed_middle_waiter: the timed waiter never returned");
     assert!(timed_out, "the timed waiter was woken with no notify");
     timed.join().expect("condvar timed waiter panicked");
@@ -573,7 +594,10 @@ pub fn condvar_timed_middle_waiter_phase(_: &Caps)
     let (lock, cv) = &*shared;
     for i in 0..waiters.len()
     {
-        lock.lock().expect("mutex poisoned").tokens += 1;
+        {
+            let mut state = lock.lock().expect("mutex poisoned");
+            state.tokens = state.tokens.checked_add(1).expect("token count overflowed");
+        }
         cv.notify_one();
         wakes.recv_timeout(FANOUT_BOUND).unwrap_or_else(|_| {
             panic!("notify_one {i} woke no waiter after the timed waiter left the queue")
@@ -653,7 +677,7 @@ fn mutex_handoff_stress()
                 for i in 0..ITERS
                 {
                     let mut guard = counter.lock().expect("mutex poisoned");
-                    *guard += 1;
+                    *guard = guard.checked_add(1).expect("mutex counter overflowed");
                     if i % YIELD_EVERY == 0
                     {
                         thread::yield_now();
@@ -690,8 +714,8 @@ fn condvar_ping_pong_stress()
                 {
                     let state = lock.lock().expect("mutex poisoned");
                     let mut state = cv.wait_while(state, |s| s.0 != me).expect("mutex poisoned");
-                    state.0 = 1 - me;
-                    state.1 += 1;
+                    state.0 = me ^ 1;
+                    state.1 = state.1.checked_add(1).expect("handoff count overflowed");
                     drop(state);
                     cv.notify_one();
                 }
@@ -724,12 +748,12 @@ fn rwlock_handoff_stress()
             for i in 0..WRITES
             {
                 let mut guard = pair.write().expect("rwlock poisoned");
-                guard.0 += 1;
+                guard.0 = guard.0.checked_add(1).expect("write count overflowed");
                 if i % YIELD_EVERY == 0
                 {
                     thread::yield_now();
                 }
-                guard.1 += 1;
+                guard.1 = guard.1.checked_add(1).expect("write count overflowed");
             }
         })
     });
@@ -882,10 +906,16 @@ fn spawn_allocating_holder(cpu: u32, stop: Arc<AtomicBool>) -> thread::JoinHandl
         while !stop.load(Ordering::Relaxed)
         {
             // Sizes vary so the first-fit walk does real work under the lock.
-            let v: Vec<u8> = Vec::with_capacity(64 + (allocations % 1024) as usize);
+            let v: Vec<u8> = Vec::with_capacity(
+                64usize
+                    .checked_add((allocations % 1024) as usize)
+                    .expect("allocation size overflowed"),
+            );
             std::hint::black_box(&v);
             drop(v);
-            allocations += 1;
+            allocations = allocations
+                .checked_add(1)
+                .expect("allocation count overflowed");
         }
         allocations
     });

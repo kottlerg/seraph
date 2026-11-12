@@ -68,7 +68,12 @@ fn wedged_receiver_phase(_: &Caps)
     let first = start.elapsed();
     let bound = Duration::from_millis(u64::from(log::LOG_CALL_TIMEOUT_MS));
     assert!(
-        first >= bound * 9 / 10,
+        first
+            >= bound
+                .checked_mul(9)
+                .expect("log_wedged_receiver: bound overflowed")
+                .checked_div(10)
+                .expect("log_wedged_receiver: bound divide by zero"),
         "log_wedged_receiver: the first call returned after {first:?}, before its {bound:?} bound"
     );
 

@@ -323,7 +323,13 @@ fn system_root_readdir_index_bound(system_root_cap: u64, ipc_buf: *mut u64)
     );
 
     let listed = names.len() as u64;
-    for idx in (0..=listed).map(|i| (1u64 << 32) + i).chain([u64::MAX])
+    for idx in (0..=listed)
+        .map(|i| {
+            (1u64 << 32)
+                .checked_add(i)
+                .expect("ns_system_root: readdir index overflowed")
+        })
+        .chain([u64::MAX])
     {
         match ns_readdir(system_root_cap, idx, ipc_buf)
         {

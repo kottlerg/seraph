@@ -66,9 +66,10 @@ fn request_page() -> u64
         return 0;
     };
     let caps = reply.caps();
-    if reply.label == memmgr_errors::SUCCESS && caps.len() == 1
+    if reply.label == memmgr_errors::SUCCESS
+        && let [cap] = caps
     {
-        return caps[0];
+        return *cap;
     }
     for &c in caps
     {

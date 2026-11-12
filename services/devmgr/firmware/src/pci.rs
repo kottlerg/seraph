@@ -166,13 +166,13 @@ pub fn find_capability(status: u16, id: u8, read8: impl Fn(u16) -> u8) -> Option
     let mut walked = 0u32;
     while ptr != 0 && walked < MAX_CAPABILITIES
     {
-        walked += 1;
+        walked = walked.saturating_add(1);
         let at = u16::from(ptr);
         if read8(at) == id
         {
             return Some(at);
         }
-        ptr = read8(at + 1) & !3;
+        ptr = read8(at.saturating_add(1)) & !3;
     }
     None
 }
@@ -249,7 +249,8 @@ impl Msi
     #[must_use]
     pub const fn data_offset(&self) -> u16
     {
-        self.offset + if self.address_64 { 0x0C } else { 0x08 }
+        self.offset
+            .saturating_add(if self.address_64 { 0x0C } else { 0x08 })
     }
 
     /// Offset of Mask Bits in the configuration header, for a function with
@@ -259,7 +260,10 @@ impl Msi
     {
         if self.per_vector_mask
         {
-            Some(self.offset + if self.address_64 { 0x10 } else { 0x0C })
+            Some(
+                self.offset
+                    .saturating_add(if self.address_64 { 0x10 } else { 0x0C }),
+            )
         }
         else
         {
@@ -386,7 +390,7 @@ impl BarSpan
     #[must_use]
     pub const fn bytes(&self) -> u64
     {
-        self.end - self.start
+        self.end.saturating_sub(self.start)
     }
 }
 
@@ -429,7 +433,7 @@ impl Msix
         }
         Some(Self {
             offset,
-            table_size: (control & MSIX_CONTROL_TABLE_SIZE) + 1,
+            table_size: (control & MSIX_CONTROL_TABLE_SIZE).saturating_add(1),
             table_bar,
             table_offset: table & !MSIX_BIR,
             pba_bar,
@@ -441,28 +445,28 @@ impl Msix
     #[must_use]
     pub const fn table_bytes(&self) -> u64
     {
-        self.table_size as u64 * MSIX_ENTRY_BYTES
+        (self.table_size as u64).saturating_mul(MSIX_ENTRY_BYTES)
     }
 
     /// Bytes of the Pending Bit Array: one bit per entry, in QWORDs.
     #[must_use]
     pub const fn pba_bytes(&self) -> u64
     {
-        (self.table_size as u64).div_ceil(64) * 8
+        (self.table_size as u64).div_ceil(64).saturating_mul(8)
     }
 
     /// The byte past the table's last in its BAR.
     #[must_use]
     pub const fn table_end(&self) -> u64
     {
-        self.table_offset as u64 + self.table_bytes()
+        (self.table_offset as u64).saturating_add(self.table_bytes())
     }
 
     /// The byte past the Pending Bit Array's last in its BAR.
     #[must_use]
     pub const fn pba_end(&self) -> u64
     {
-        self.pba_offset as u64 + self.pba_bytes()
+        (self.pba_offset as u64).saturating_add(self.pba_bytes())
     }
 
     /// The pages holding the table, then the pages holding the Pending Bit
@@ -485,7 +489,7 @@ impl Msix
     pub const fn table_span(&self) -> (BarSpan, u64)
     {
         let span = self.withheld()[0];
-        (span, self.table_offset as u64 - span.start)
+        (span, (self.table_offset as u64).saturating_sub(span.start))
     }
 }
 
@@ -494,8 +498,10 @@ const fn page_span(bar: u8, start: u64, end: u64) -> BarSpan
 {
     BarSpan {
         bar,
-        start: start / MSIX_PAGE_BYTES * MSIX_PAGE_BYTES,
-        end: end.div_ceil(MSIX_PAGE_BYTES) * MSIX_PAGE_BYTES,
+        start: (start / MSIX_PAGE_BYTES).saturating_mul(MSIX_PAGE_BYTES),
+        end: end
+            .div_ceil(MSIX_PAGE_BYTES)
+            .saturating_mul(MSIX_PAGE_BYTES),
     }
 }
 
@@ -533,16 +539,16 @@ pub fn delivered_ranges(
         if start > cursor
             && let Some(slot) = ranges.get_mut(count)
         {
-            *slot = (cursor, start - cursor);
-            count += 1;
+            *slot = (cursor, start.saturating_sub(cursor));
+            count = count.saturating_add(1);
         }
         cursor = cursor.max(end);
     }
     if cursor < bytes
         && let Some(slot) = ranges.get_mut(count)
     {
-        *slot = (cursor, bytes - cursor);
-        count += 1;
+        *slot = (cursor, bytes.saturating_sub(cursor));
+        count = count.saturating_add(1);
     }
     (ranges, count)
 }

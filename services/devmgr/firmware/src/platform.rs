@@ -69,12 +69,16 @@ pub struct SpcrInterrupt
 
 fn rd_u64(buf: &[u8], off: usize) -> Option<u64>
 {
-    Some(u64::from_le_bytes(buf.get(off..off + 8)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+        buf.get(off..off.checked_add(8)?)?.try_into().ok()?,
+    ))
 }
 
 fn rd_u32(buf: &[u8], off: usize) -> Option<u32>
 {
-    Some(u32::from_le_bytes(buf.get(off..off + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        buf.get(off..off.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 
 /// Parse an SPCR (signature `SPCR`, length >= 80): the interface type, the
@@ -215,7 +219,7 @@ fn trim_field(field: &[u8]) -> &[u8]
     let end = field
         .iter()
         .rposition(|b| *b != b' ' && *b != 0)
-        .map_or(0, |i| i + 1);
+        .map_or(0, |i| i.saturating_add(1));
     field.get(..end).unwrap_or(&[])
 }
 
@@ -328,7 +332,7 @@ fn parse_device(value: &str, line: usize) -> Result<PlatformDevice, TableError>
                 let n = number(tokens.next())
                     .and_then(|v| u16::try_from(v).ok())
                     .ok_or_else(|| bad("bad io count"))?;
-                if n == 0 || u32::from(base) + u32::from(n) > 0x1_0000
+                if n == 0 || u32::from(base).saturating_add(u32::from(n)) > 0x1_0000
                 {
                     return Err(bad("bad io range"));
                 }
@@ -354,7 +358,8 @@ fn parse_device(value: &str, line: usize) -> Result<PlatformDevice, TableError>
             }
             _ => return Err(bad("unknown resource group")),
         });
-        count += 1;
+        // `get_mut(count)` above bounds `count` by the resource array.
+        count = count.saturating_add(1);
     }
     Ok(dev)
 }

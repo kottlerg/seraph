@@ -21,9 +21,13 @@ pub fn page_window(offset: u64, len: u64, page_size: u64) -> Option<(u64, u64, u
         return None;
     }
     let end = offset.checked_add(len)?;
-    let first = offset / page_size;
+    let first = offset.checked_div(page_size)?;
     let last = end.div_ceil(page_size);
-    Some((first, last - first, offset % page_size))
+    Some((
+        first,
+        last.checked_sub(first)?,
+        offset.checked_rem(page_size)?,
+    ))
 }
 
 /// Fill `dst` from file offset `off` through `read`, one request of at most
@@ -46,16 +50,17 @@ where
         return None;
     }
     let mut total = 0usize;
-    while total < dst.len()
+    while let Some(rest) = dst.get_mut(total..).filter(|r| !r.is_empty())
     {
-        let want = (dst.len() - total).min(chunk);
+        let want = rest.len().min(chunk);
         let at = off.checked_add(u64::try_from(total).ok()?)?;
-        let reported = read(at, &mut dst[total..total + want])?;
+        let reported = read(at, rest.get_mut(..want)?)?;
         if reported == 0
         {
             break;
         }
-        total += reported.min(want);
+        // `reported.min(want)` is at most the bytes left in `dst`.
+        total = total.saturating_add(reported.min(want));
     }
     Some(total)
 }

@@ -20,6 +20,7 @@
 //! [`crate::acpi`] does. No alloc.
 
 use crate::acpi::{SDT_HDR_LEN, sdt_length, sdt_signature};
+use crate::bytes::{read_u8, read_u16, read_u64};
 
 // ── Layout constants ──────────────────────────────────────────────────
 
@@ -76,28 +77,6 @@ const DMAR_FLAG_X2APIC_OPT_OUT: u8 = 1 << 1;
 /// builds in practice; a deeper path is skipped as malformed.
 pub const MAX_SCOPE_PATH: usize = 8;
 
-// ── Byte-read helpers ─────────────────────────────────────────────────
-
-fn read_u8(buf: &[u8], off: usize) -> u8
-{
-    buf.get(off).copied().unwrap_or(0)
-}
-
-fn read_u16(buf: &[u8], off: usize) -> u16
-{
-    u16::from_le_bytes([read_u8(buf, off), read_u8(buf, off + 1)])
-}
-
-fn read_u64(buf: &[u8], off: usize) -> u64
-{
-    let mut b = [0u8; 8];
-    for (i, byte) in b.iter_mut().enumerate()
-    {
-        *byte = read_u8(buf, off + i);
-    }
-    u64::from_le_bytes(b)
-}
-
 // ── Types ─────────────────────────────────────────────────────────────
 
 /// A PCI function, by bus, device, and function number, in one segment.
@@ -130,7 +109,7 @@ impl PciScope
     #[must_use]
     pub fn path(&self) -> &[(u8, u8)]
     {
-        &self.path[..self.path_len]
+        self.path.get(..self.path_len).unwrap_or_default()
     }
 
     /// The function the scope names: the last hop, on the bus the hops
@@ -214,37 +193,39 @@ fn structures(dmar: &[u8]) -> impl Iterator<Item = Structure> + '_
     };
     let mut off = DMAR_STRUCTURES_OFF;
     core::iter::from_fn(move || {
-        while off + STRUCTURE_HDR_LEN <= end
+        while off.saturating_add(STRUCTURE_HDR_LEN) <= end
         {
             let kind = read_u16(dmar, off);
-            let len = usize::from(read_u16(dmar, off + 2));
-            if len < STRUCTURE_HDR_LEN || off + len > end
+            let len = usize::from(read_u16(dmar, off.saturating_add(2)));
+            if len < STRUCTURE_HDR_LEN || off.saturating_add(len) > end
             {
                 off = end;
                 return None;
             }
             let at = off;
-            off += len;
+            off = off.saturating_add(len);
             match kind
             {
                 TYPE_DRHD if len >= DRHD_SCOPES_OFF =>
                 {
-                    let size = read_u8(dmar, at + 5) & 0x0f;
+                    let size = read_u8(dmar, at.saturating_add(5)) & 0x0f;
                     return Some(Structure::Drhd(DrhdUnit {
-                        segment: read_u16(dmar, at + 6),
-                        register_base: read_u64(dmar, at + 8),
+                        segment: read_u16(dmar, at.saturating_add(6)),
+                        register_base: read_u64(dmar, at.saturating_add(8)),
                         register_pages: 1u64 << size,
-                        include_pci_all: read_u8(dmar, at + 4) & DRHD_FLAG_INCLUDE_PCI_ALL != 0,
-                        scopes: (at + DRHD_SCOPES_OFF, at + len),
+                        include_pci_all: read_u8(dmar, at.saturating_add(4))
+                            & DRHD_FLAG_INCLUDE_PCI_ALL
+                            != 0,
+                        scopes: (at.saturating_add(DRHD_SCOPES_OFF), at.saturating_add(len)),
                     }));
                 }
                 TYPE_RMRR if len >= RMRR_SCOPES_OFF =>
                 {
                     return Some(Structure::Rmrr(Rmrr {
-                        segment: read_u16(dmar, at + 6),
-                        base: read_u64(dmar, at + 8),
-                        limit: read_u64(dmar, at + 16),
-                        scopes: (at + RMRR_SCOPES_OFF, at + len),
+                        segment: read_u16(dmar, at.saturating_add(6)),
+                        base: read_u64(dmar, at.saturating_add(8)),
+                        limit: read_u64(dmar, at.saturating_add(16)),
+                        scopes: (at.saturating_add(RMRR_SCOPES_OFF), at.saturating_add(len)),
                     }));
                 }
                 _ =>
@@ -292,18 +273,18 @@ fn device_scopes(
     let (mut off, end) = scopes;
     let end = end.min(dmar.len());
     core::iter::from_fn(move || {
-        while off + SCOPE_PATH_OFF <= end
+        while off.saturating_add(SCOPE_PATH_OFF) <= end
         {
             let kind = read_u8(dmar, off);
-            let len = usize::from(read_u8(dmar, off + 1));
-            if len < SCOPE_PATH_OFF || off + len > end
+            let len = usize::from(read_u8(dmar, off.saturating_add(1)));
+            if len < SCOPE_PATH_OFF || off.saturating_add(len) > end
             {
                 off = end;
                 return None;
             }
             let at = off;
-            off += len;
-            let path_bytes = len - SCOPE_PATH_OFF;
+            off = off.saturating_add(len);
+            let path_bytes = len.saturating_sub(SCOPE_PATH_OFF);
             let hops = path_bytes / 2;
             if !path_bytes.is_multiple_of(2) || hops == 0 || hops > MAX_SCOPE_PATH
             {
@@ -312,16 +293,18 @@ fn device_scopes(
             let mut path = [(0u8, 0u8); MAX_SCOPE_PATH];
             for (i, hop) in path.iter_mut().take(hops).enumerate()
             {
-                let p = at + SCOPE_PATH_OFF + 2 * i;
-                *hop = (read_u8(dmar, p), read_u8(dmar, p + 1));
+                let p = at
+                    .saturating_add(SCOPE_PATH_OFF)
+                    .saturating_add(i.saturating_mul(2));
+                *hop = (read_u8(dmar, p), read_u8(dmar, p.saturating_add(1)));
             }
             let scope = PciScope {
                 sub_hierarchy: kind == SCOPE_PCI_SUB_HIERARCHY,
-                start_bus: read_u8(dmar, at + 5),
+                start_bus: read_u8(dmar, at.saturating_add(5)),
                 path,
                 path_len: hops,
             };
-            return Some((kind, read_u8(dmar, at + 4), scope));
+            return Some((kind, read_u8(dmar, at.saturating_add(4)), scope));
         }
         None
     })

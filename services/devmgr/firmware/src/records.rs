@@ -68,7 +68,7 @@ impl PlatformKey
     #[must_use]
     pub fn as_bytes(&self) -> &[u8]
     {
-        &self.bytes[..usize::from(self.len)]
+        self.bytes.get(..usize::from(self.len)).unwrap_or_default()
     }
 }
 
@@ -105,7 +105,7 @@ impl DeviceInfo
     #[must_use]
     pub fn bytes(&self) -> &[u8]
     {
-        &self.bytes[..usize::from(self.len)]
+        self.bytes.get(..usize::from(self.len)).unwrap_or_default()
     }
 }
 
@@ -155,16 +155,17 @@ impl PlatformRecord
     pub fn with_keys<R>(&self, f: impl FnOnce(&RecordKeys<'_>) -> R) -> R
     {
         let mut cids: [&[u8]; MAX_CIDS] = [&[]; MAX_CIDS];
-        let mut count = 0;
-        for id in self.identity.cids.iter().flatten()
+        let mut count = 0usize;
+        for (slot, id) in cids.iter_mut().zip(self.identity.cids.iter().flatten())
         {
-            cids[count] = id.as_bytes();
-            count += 1;
+            *slot = id.as_bytes();
+            // `cids` and `identity.cids` have the same length, so `count` stays within it.
+            count = count.saturating_add(1);
         }
         let keys = RecordKeys {
             pci: None,
             acpi_hid: self.identity.hid.as_ref().map(Id::as_bytes),
-            acpi_cids: &cids[..count],
+            acpi_cids: cids.get(..count).unwrap_or_default(),
             spcr: self.identity.spcr,
             platform: self.identity.platform.as_ref().map(PlatformKey::as_bytes),
             iommu_family: None,
@@ -292,9 +293,13 @@ impl PlatformRecords
         {
             return Added::Unusable;
         }
-        if let Some(index) = self.records.iter().position(|r| r.shares_base(&own))
+        if let Some((index, record)) = self
+            .records
+            .iter_mut()
+            .enumerate()
+            .find(|(_, r)| r.shares_base(&own))
         {
-            self.records[index].absorb(&identity);
+            record.absorb(&identity);
             return Added::Merged(index);
         }
         let keyed = identity.hid.is_some()
@@ -310,12 +315,13 @@ impl PlatformRecords
         {
             return Added::Full;
         }
+        let index = self.records.len();
         self.records.push(PlatformRecord {
             identity,
             resources: own,
             info: None,
         });
-        Added::New(self.records.len() - 1)
+        Added::New(index)
     }
 }
 

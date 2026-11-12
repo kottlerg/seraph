@@ -269,17 +269,17 @@ fn probe_bar_registers(cfg: &impl ConfigSpace, dev: &mut PciDevice)
     let mut bar_idx: u8 = 0;
     while usize::from(bar_idx) < MAX_BARS
     {
-        let reg = 0x10 + u16::from(bar_idx) * 4;
+        let reg = 0x10u16.saturating_add(u16::from(bar_idx).saturating_mul(4));
         let (orig, sized) = size_register(cfg, dev, reg);
         if sized == 0
         {
-            bar_idx += 1;
+            bar_idx = bar_idx.saturating_add(1);
             continue;
         }
         let is_mmio = orig & 1 == 0;
-        if is_mmio && (orig >> 1) & 3 == 2 && usize::from(bar_idx) + 1 < MAX_BARS
+        if is_mmio && (orig >> 1) & 3 == 2 && usize::from(bar_idx).saturating_add(1) < MAX_BARS
         {
-            let (hi_orig, hi_sized) = size_register(cfg, dev, reg + 4);
+            let (hi_orig, hi_sized) = size_register(cfg, dev, reg.saturating_add(4));
             let base = u64::from(orig & !0xF) | (u64::from(hi_orig) << 32);
             record_bar(
                 dev,
@@ -288,7 +288,7 @@ fn probe_bar_registers(cfg: &impl ConfigSpace, dev: &mut PciDevice)
                 mmio_bar_size(sized, Some(hi_sized)),
                 true,
             );
-            bar_idx += 2; // The upper register belongs to this BAR.
+            bar_idx = bar_idx.saturating_add(2); // The upper register belongs to this BAR.
             continue;
         }
         if is_mmio
@@ -311,7 +311,7 @@ fn probe_bar_registers(cfg: &impl ConfigSpace, dev: &mut PciDevice)
                 false,
             );
         }
-        bar_idx += 1;
+        bar_idx = bar_idx.saturating_add(1);
     }
 }
 
@@ -320,13 +320,18 @@ fn probe_bar_registers(cfg: &impl ConfigSpace, dev: &mut PciDevice)
 fn record_bar(dev: &mut PciDevice, bar_idx: u8, phys: u64, size: u64, is_mmio: bool)
 {
     let i = dev.bar_count;
-    if i < MAX_BARS
+    if let (Some(p), Some(s), Some(m), Some(x)) = (
+        dev.bar_phys.get_mut(i),
+        dev.bar_size.get_mut(i),
+        dev.bar_is_mmio.get_mut(i),
+        dev.bar_pci_idx.get_mut(i),
+    )
     {
-        dev.bar_phys[i] = phys;
-        dev.bar_size[i] = size;
-        dev.bar_is_mmio[i] = is_mmio;
-        dev.bar_pci_idx[i] = bar_idx;
-        dev.bar_count += 1;
+        *p = phys;
+        *s = size;
+        *m = is_mmio;
+        *x = bar_idx;
+        dev.bar_count = i.saturating_add(1);
     }
 }
 
@@ -340,14 +345,14 @@ fn read_message_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
     let status = cfg.read16(b, d, f, STATUS);
     let read8 = |at: u16| cfg.read8(b, d, f, at);
     dev.msi = find_capability(status, CAP_ID_MSI, read8)
-        .map(|at| Msi::decode(at, cfg.read16(b, d, f, at + MESSAGE_CONTROL)));
+        .map(|at| Msi::decode(at, cfg.read16(b, d, f, at.saturating_add(MESSAGE_CONTROL))));
     dev.msix = find_capability(status, CAP_ID_MSIX, read8)
         .and_then(|at| {
             Msix::decode(
                 at,
-                cfg.read16(b, d, f, at + MESSAGE_CONTROL),
-                cfg.read32(b, d, f, at + MSIX_TABLE),
-                cfg.read32(b, d, f, at + MSIX_PBA),
+                cfg.read16(b, d, f, at.saturating_add(MESSAGE_CONTROL)),
+                cfg.read32(b, d, f, at.saturating_add(MSIX_TABLE)),
+                cfg.read32(b, d, f, at.saturating_add(MSIX_PBA)),
             )
         })
         .filter(|m| {
@@ -360,8 +365,12 @@ fn read_message_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
 /// `reach` bytes.
 fn mmio_bar_holds(dev: &PciDevice, bar: u8, reach: u64) -> bool
 {
-    (0..dev.bar_count)
-        .any(|i| dev.bar_pci_idx[i] == bar && dev.bar_is_mmio[i] && reach <= dev.bar_size[i])
+    dev.bar_pci_idx
+        .iter()
+        .zip(&dev.bar_is_mmio)
+        .zip(&dev.bar_size)
+        .take(dev.bar_count)
+        .any(|((&idx, &mmio), &size)| idx == bar && mmio && reach <= size)
 }
 
 /// Walk the PCI capability list of a `VirtIO` function and record the
@@ -391,23 +400,23 @@ fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
     let mut iterations = 0u32;
     while cap_ptr != 0 && iterations < MAX_CAPABILITIES
     {
-        iterations += 1;
+        iterations = iterations.saturating_add(1);
         let ptr = u16::from(cap_ptr);
-        let next = cfg.read8(b, d, f, ptr + 1) & !3;
+        let next = cfg.read8(b, d, f, ptr.saturating_add(1)) & !3;
         // VirtIO vendor-specific capability: cap_id = 0x09.
         if cfg.read8(b, d, f, ptr) == 0x09
         {
             let loc = VirtioCapLocation {
-                bar: cfg.read8(b, d, f, ptr + 4),
+                bar: cfg.read8(b, d, f, ptr.saturating_add(4)),
                 pad: [0; 3],
-                offset: cfg.read32(b, d, f, ptr + 8),
-                length: cfg.read32(b, d, f, ptr + 12),
+                offset: cfg.read32(b, d, f, ptr.saturating_add(8)),
+                length: cfg.read32(b, d, f, ptr.saturating_add(12)),
             };
-            let ty = cfg.read8(b, d, f, ptr + 3);
+            let ty = cfg.read8(b, d, f, ptr.saturating_add(3));
             // The notify capability carries notify_off_multiplier at +16.
             let multiplier = if ty == VIRTIO_PCI_CAP_NOTIFY_CFG
             {
-                cfg.read32(b, d, f, ptr + 16)
+                cfg.read32(b, d, f, ptr.saturating_add(16))
             }
             else
             {
@@ -443,7 +452,11 @@ fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
 /// names none) and its offset plus length is within that BAR's size.
 fn fits_mmio_bar(dev: &PciDevice, loc: &VirtioCapLocation) -> bool
 {
-    mmio_bar_holds(dev, loc.bar, u64::from(loc.offset) + u64::from(loc.length))
+    mmio_bar_holds(
+        dev,
+        loc.bar,
+        u64::from(loc.offset).saturating_add(u64::from(loc.length)),
+    )
 }
 
 #[cfg(test)]

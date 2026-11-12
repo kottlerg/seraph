@@ -80,7 +80,10 @@ pub fn intx_fallback_gsi(pin: u8, dev: u8) -> Option<u32>
 {
     if (1..=4).contains(&pin)
     {
-        return Some(32 + ((u32::from(pin) - 1 + u32::from(dev)) % 4));
+        let swizzled = u32::from(pin)
+            .saturating_sub(1)
+            .saturating_add(u32::from(dev));
+        return Some(32u32.saturating_add(swizzled % 4));
     }
     None
 }

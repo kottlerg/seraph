@@ -6,7 +6,7 @@
 //! devmgr surface — the class, `QUERY_SHUTDOWN_DEVICE`, and `BIND_DRIVERS`
 //! authority gates, the instance ordinal of `QUERY_DEVICE`, the on-demand
 //! bind with its settle, mid-bootstrap teardown (#176), and withdrawal, DMA
-//! confinement, and MSI delivery.
+//! confinement, and MSI delivery, churn, and release.
 //!
 //! The deny phases send the gated labels on `devmgr.registry`, a cap
 //! carrying `REGISTRY_QUERY_AUTHORITY` but none of `CLASS_AUTHORITY`,

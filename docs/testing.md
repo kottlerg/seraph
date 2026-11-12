@@ -540,9 +540,9 @@ surface.
     filesystem phases;
   - and the devices the harnesses drive, which only the svctest launches attach
     (`--test-devices`): QEMU's `edu`, which the test-only test-dma driver drives in svctest's DMA
-    confinement and MSI delivery phases, four `pci-testdev` functions, which the test-only
-    test-fault driver serves in svctest's on-demand-bind phase, and, on x86_64, `vmgenid`, the
-    generation source the kernel's snapshot detection reads: `test-vmgenid`.
+    confinement and MSI delivery, churn, and release phases, four `pci-testdev` functions, which
+    the test-only test-fault driver serves in svctest's on-demand-bind phase, and, on x86_64,
+    `vmgenid`, the generation source the kernel's snapshot detection reads: `test-vmgenid`.
 
   The canonical boots are headless, so the main set holds no framebuffer. Every code PR's CI cells
   boot the main set. A driver joins it only by replacing the main device of its type; any other
@@ -886,9 +886,9 @@ own diff is on.
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
-shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies
-what fatfs reads. The no-iommu cell boots devmgr, the test-dma driver, and svctest's DMA
-confinement and MSI delivery checks unconfined, and every VirtIO driver without
+shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies what
+fatfs reads. The no-iommu cell boots devmgr, the test-dma driver, and svctest's DMA confinement and
+MSI delivery, churn, and release checks unconfined, and every VirtIO driver without
 `VIRTIO_F_ACCESS_PLATFORM`, which the launchers have a device offer only with the IOMMU attached, so
 the shared surface (the launchers' IOMMU attachment among it), virtio-blk, virtio-input, and
 test-dma owe it. A PR that adds a driver adds its row, with its directory and the cells that

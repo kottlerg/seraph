@@ -40,6 +40,11 @@
 //! delete returned (a delivery the delete waited out signalled before it
 //! returned, and any later one finds the slot free), and in some rounds an
 //! injected write completed while the delete was running (the race armed).
+//! The cell drives the interleaving on real CPUs; it does not by itself
+//! prove the wait, since a delivery's span from the entry's read to its
+//! signal is far shorter than anything a user thread can observe after the
+//! delete. The host tests of `core/kernel/src/irq.rs` check the wait itself,
+//! each failing when a change returns without waiting out the delivery.
 //!
 //! x86-64 has no counterpart: a message there is a write to the local APIC's
 //! message window, which only a device's bus write reaches, and a CPU raises a

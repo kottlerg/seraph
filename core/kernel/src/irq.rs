@@ -2213,6 +2213,25 @@ mod tests
         }
     }
 
+    /// Return once the change on `change` reports that its wait found the
+    /// delivery running, which the calling thread holds open, so a change that
+    /// waits cannot have returned; fail when it returns without reporting,
+    /// which a change that skips its wait does.
+    fn await_wait_out<T>(
+        waits: &std::sync::mpsc::Receiver<()>,
+        change: &std::thread::ScopedJoinHandle<'_, T>,
+    )
+    {
+        while waits.try_recv().is_err()
+        {
+            assert!(
+                !change.is_finished(),
+                "the change returned without waiting out the delivery"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     impl Controls for Stand<'_>
     {
         fn mask(&self, irq: u32)
@@ -2282,8 +2301,7 @@ mod tests
                     // outlive the scope.
                     let unbind = || unsafe { unbind_line(&stand, LINE, &route, &a) };
                     let handle = scope.spawn(unbind);
-                    waits.recv().unwrap();
-                    assert!(!handle.is_finished());
+                    await_wait_out(&waits, &handle);
                     change = Some(handle);
                 }
             };
@@ -2338,8 +2356,7 @@ mod tests
             at_unroute.recv().unwrap();
             let stale_mask = || {
                 resume.send(()).unwrap();
-                waits.recv().unwrap();
-                assert!(!change.is_finished());
+                await_wait_out(&waits, &change);
                 stand.mask(LINE);
             };
             let on_line = |irq| {
@@ -2381,8 +2398,7 @@ mod tests
                 // mask lands.
                 let bind = || link_line(&stand, &route, &a, 0, note(1), Some(ROUTED));
                 let handle = scope.spawn(bind);
-                waits.recv().unwrap();
-                assert!(!handle.is_finished());
+                await_wait_out(&waits, &handle);
                 stand.mask(LINE);
                 change = Some(handle);
             };
@@ -2425,8 +2441,7 @@ mod tests
             let on_bound = |notification| {
                 assert_eq!(notification, note(1));
                 let handle = scope.spawn(|| unbind_message(&stand, &slot, CPU, &a));
-                waits.recv().unwrap();
-                assert!(!handle.is_finished());
+                await_wait_out(&waits, &handle);
                 change = Some(handle);
             };
             // SAFETY: the slot and the binding outlive the delivery.
@@ -2460,8 +2475,7 @@ mod tests
             let on_bound = |notification| {
                 assert_eq!(notification, note(1));
                 let handle = scope.spawn(|| renotify(&stand, &a, note(2), Some(CPU)));
-                waits.recv().unwrap();
-                assert!(!handle.is_finished());
+                await_wait_out(&waits, &handle);
                 change = Some(handle);
             };
             // SAFETY: the slot and the binding outlive the delivery.

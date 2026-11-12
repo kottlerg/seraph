@@ -89,8 +89,8 @@ const PARK_FOREVER_MS: u64 = 600_000;
 /// Wall-clock settle after a child's READY signal so it has, in practice,
 /// reached its park before the stop lands (see `drive`; a fixed sleep cannot
 /// prove it). A stop that lands pre-park stops a Running thread instead — the
-/// restart would then park with no canceller and hang to the watchdog, so
-/// generous slack is cheap insurance.
+/// restart would then park with no canceller and hang until the harness's
+/// timeout, so generous slack is cheap insurance.
 const SETTLE_SLEEP_MS: u64 = 20;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;

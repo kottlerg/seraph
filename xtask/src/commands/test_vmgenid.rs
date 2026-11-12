@@ -385,7 +385,7 @@ mod tests
         let mut guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
         guest.child.kill().unwrap();
         guest.child.wait().unwrap();
-        assert!(guest.wait_exit(Duration::ZERO).is_ok());
+        guest.wait_exit(Duration::ZERO).unwrap();
     }
 
     #[test]

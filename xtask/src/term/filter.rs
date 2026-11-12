@@ -551,7 +551,7 @@ mod tests
     #[test]
     fn xterm_mouse_modes_are_stripped()
     {
-        for n in 1000_u32..=1006
+        for n in 1000u32..=1006
         {
             let seq = format!("\x1b[?{n}h");
             assert!(

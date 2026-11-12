@@ -1005,7 +1005,7 @@ mod tests
             "verdict": verdict,
             "audit_verdict": audit,
             "audit": {"verdict": audit, "sections": []},
-            "findings": findings,
+            "findings": Value::Array(findings),
             "recorded": [], "ledgered": [], "dropped": [],
             "stats": {
                 "mode": "delta", "head": HEAD, "since": "1234abcd", "failed": [], "run": 1
@@ -1040,8 +1040,8 @@ mod tests
     fn a_well_formed_record_has_no_finding()
     {
         let r = record("READY TO MERGE", "AUDIT PASS", vec![finding("a", "nit")]);
-        assert!(check_record(NAME, &r).is_empty());
-        assert!(check_record("delta-0a82b0aa-2.json", &r).is_empty());
+        assert_eq!(check_record(NAME, &r), [] as [Diag; 0]);
+        assert_eq!(check_record("delta-0a82b0aa-2.json", &r), [] as [Diag; 0]);
     }
 
     #[test]
@@ -1193,8 +1193,8 @@ mod tests
                 run("delta", 3, PASS.0, PASS.1),
             ),
         ];
-        assert!(gate_diags(&records, HEAD).is_empty());
-        assert!(gate_diags(&records, "0a82b0aa").is_empty());
+        assert_eq!(gate_diags(&records, HEAD), [] as [Diag; 0]);
+        assert_eq!(gate_diags(&records, "0a82b0aa"), [] as [Diag; 0]);
     }
 
     #[test]
@@ -1245,7 +1245,10 @@ mod tests
             ),
             (NAME.to_owned(), run("delta", 3, PASS.0, PASS.1)),
         ];
-        assert!(gate_diags(&passing_after_failed_audit, HEAD).is_empty());
+        assert_eq!(
+            gate_diags(&passing_after_failed_audit, HEAD),
+            [] as [Diag; 0]
+        );
     }
 
     #[test]
@@ -1381,7 +1384,7 @@ mod tests
                 vec![style.clone()],
             ),
         )];
-        assert!(gate_diags(&records, HEAD).is_empty());
+        assert_eq!(gate_diags(&records, HEAD), [] as [Diag; 0]);
 
         style["must_violation"] = json!(true);
         let records = vec![(
@@ -1414,14 +1417,17 @@ mod tests
     {
         let mut r = run("delta", run_number, verdict, NOT_RUN);
         r["audit"] = Value::Null;
-        r["findings"] = json!(findings);
+        r["findings"] = Value::Array(findings);
         r
     }
 
     #[test]
     fn a_reviewer_alone_record_is_well_formed()
     {
-        assert!(check_record(NAME, &reviewer_alone(1, PASS.0, vec![])).is_empty());
+        assert_eq!(
+            check_record(NAME, &reviewer_alone(1, PASS.0, vec![])),
+            [] as [Diag; 0]
+        );
     }
 
     #[test]
@@ -1461,7 +1467,7 @@ mod tests
             "audit-0a82b0aa.json".to_owned(),
             run("audit", 3, PASS.0, PASS.1),
         ));
-        assert!(gate_diags(&records, HEAD).is_empty());
+        assert_eq!(gate_diags(&records, HEAD), [] as [Diag; 0]);
     }
 
     #[test]
@@ -1593,7 +1599,7 @@ mod tests
     fn the_gate_passes_a_ready_defect_form_run_and_fails_a_blocking_one()
     {
         let ready = vec![(NAME.to_owned(), defect_record("READY TO MERGE", vec![]))];
-        assert!(gate_diags(&ready, HEAD).is_empty());
+        assert_eq!(gate_diags(&ready, HEAD), [] as [Diag; 0]);
         let blocking = vec![(
             NAME.to_owned(),
             defect_record("BLOCKING ISSUES", vec![defect("a", "unverified")]),
@@ -1614,7 +1620,7 @@ mod tests
             NAME.to_owned(),
             record("NON-BLOCKING ISSUES ONLY", "AUDIT PASS", vec![]),
         )];
-        assert!(gate_diags(&records, HEAD).is_empty());
+        assert_eq!(gate_diags(&records, HEAD), [] as [Diag; 0]);
     }
 
     #[test]
@@ -1646,7 +1652,7 @@ mod tests
             ),
             ("audit-0a82b0aa.json".to_owned(), audit),
         ];
-        assert!(gate_diags(&records, HEAD).is_empty());
+        assert_eq!(gate_diags(&records, HEAD), [] as [Diag; 0]);
     }
 
     #[test]
@@ -1680,7 +1686,10 @@ mod tests
         assert_eq!(ledger(&records).as_array().map(Vec::len), Some(2));
         split["ruling"] = json!("  ");
         let blank = defect_record("BLOCKING ISSUES", vec![split.clone()]);
-        assert!(release_ledger(&[("full-0a82b0aa.json".to_owned(), blank)]).is_empty());
+        assert_eq!(
+            release_ledger(&[("full-0a82b0aa.json".to_owned(), blank)]),
+            [] as [serde_json::Value; 0]
+        );
         // The workflow lists a split finding under `undecided`.
         let mut ruled_undecided = split.clone();
         ruled_undecided["claim"] = json!("ruled undecided");
@@ -1820,7 +1829,7 @@ mod tests
         );
         between[2].1["stats"]["run"] = json!(4);
         between[3].1["stats"]["run"] = json!(5);
-        assert!(gate_diags(&between, HEAD).is_empty());
+        assert_eq!(gate_diags(&between, HEAD), [] as [Diag; 0]);
     }
 
     #[test]

@@ -973,14 +973,14 @@ mod tests
     fn three_small_boots_run_side_by_side_and_a_fourth_is_refused()
     {
         let small = boot(4, 1, BootMode::Shared);
-        assert!(decide(&small, &[], &quiet(), None).is_ok());
+        decide(&small, &[], &quiet(), None).unwrap();
         let one = [holder(4, 1, BootMode::Shared)];
-        assert!(decide(&small, &one, &quiet(), None).is_ok());
+        decide(&small, &one, &quiet(), None).unwrap();
         let two = [
             holder(4, 1, BootMode::Shared),
             holder(2, 1, BootMode::Shared),
         ];
-        assert!(decide(&small, &two, &quiet(), None).is_ok());
+        decide(&small, &two, &quiet(), None).unwrap();
         let three = [
             holder(4, 1, BootMode::Shared),
             holder(2, 1, BootMode::Shared),
@@ -996,11 +996,11 @@ mod tests
         assert!(decide(&small, &[], &observed, None).is_err());
         // A run-parallel wave takes as many places as it starts QEMUs.
         let pair = boot(4, 2, BootMode::Shared);
-        assert!(decide(&pair, &[], &quiet(), None).is_ok());
-        assert!(decide(&pair, &one, &quiet(), None).is_ok());
+        decide(&pair, &[], &quiet(), None).unwrap();
+        decide(&pair, &one, &quiet(), None).unwrap();
         assert!(decide(&pair, &two, &quiet(), None).is_err());
         let wave = boot(4, 3, BootMode::Shared);
-        assert!(decide(&wave, &[], &quiet(), None).is_ok());
+        decide(&wave, &[], &quiet(), None).unwrap();
         assert!(decide(&wave, &one, &quiet(), None).is_err());
     }
 
@@ -1008,7 +1008,7 @@ mod tests
     fn a_large_boot_is_refused_beside_any_qemu_and_refuses_every_boot()
     {
         let large = boot(8, 1, BootMode::Shared);
-        assert!(decide(&large, &[], &quiet(), None).is_ok());
+        decide(&large, &[], &quiet(), None).unwrap();
         let small = [holder(1, 1, BootMode::Shared)];
         assert!(decide(&large, &small, &quiet(), None).is_err());
         // A QEMU no record names (started by hand, or by an older xtask).
@@ -1034,7 +1034,7 @@ mod tests
     fn more_qemus_than_the_small_boot_rule_admits_need_the_host_alone()
     {
         let wave = boot(4, SMALL_BOOTS_MAX + 1, BootMode::Shared);
-        assert!(decide(&wave, &[], &quiet(), None).is_ok());
+        decide(&wave, &[], &quiet(), None).unwrap();
         assert!(decide(&wave, &[holder(1, 1, BootMode::Shared)], &quiet(), None).is_err());
         let refusal = decide(&wave, &[], &loaded(12.0), None).unwrap_err();
         assert!(refusal.contains("LARGE_BOOT_LOAD_MAX"), "{refusal}");
@@ -1053,14 +1053,14 @@ mod tests
         for mode in [BootMode::Alone, BootMode::Timing]
         {
             let request = boot(4, 1, mode);
-            assert!(decide(&request, &[], &quiet(), None).is_ok());
+            decide(&request, &[], &quiet(), None).unwrap();
             assert!(decide(&request, &[holder(4, 1, BootMode::Shared)], &quiet(), None).is_err());
             let held = [holder(4, 1, mode)];
             assert!(decide(&boot(1, 1, BootMode::Shared), &held, &quiet(), None).is_err());
         }
         // An alone run of a small boot keeps the small boot's load limit; a
         // timing run takes the large one.
-        assert!(decide(&boot(4, 1, BootMode::Alone), &[], &loaded(12.0), None).is_ok());
+        decide(&boot(4, 1, BootMode::Alone), &[], &loaded(12.0), None).unwrap();
         assert!(decide(&boot(4, 1, BootMode::Timing), &[], &loaded(12.0), None).is_err());
     }
 
@@ -1073,7 +1073,7 @@ mod tests
             refusal.contains("not under 16 (SMALL_BOOT_LOAD_MAX)"),
             "{refusal}"
         );
-        assert!(decide(&boot(4, 1, BootMode::Shared), &[], &loaded(15.9), None).is_ok());
+        decide(&boot(4, 1, BootMode::Shared), &[], &loaded(15.9), None).unwrap();
 
         let refusal = decide(&boot(8, 1, BootMode::Shared), &[], &loaded(10.0), None).unwrap_err();
         assert!(
@@ -1087,11 +1087,11 @@ mod tests
             refusal.contains("not under 32 (BUILD_LOAD_MAX)"),
             "{refusal}"
         );
-        assert!(decide(&Request::Build, &[], &loaded(31.0), None).is_ok());
+        decide(&Request::Build, &[], &loaded(31.0), None).unwrap();
 
         // A host that reports no load is not refused on it.
         let unknown = Probe::default();
-        assert!(decide(&boot(8, 1, BootMode::Shared), &[], &unknown, None).is_ok());
+        decide(&boot(8, 1, BootMode::Shared), &[], &unknown, None).unwrap();
     }
 
     #[test]
@@ -1101,8 +1101,8 @@ mod tests
             holder(4, 1, BootMode::Shared),
             holder(16, 1, BootMode::Shared),
         ];
-        assert!(decide(&Request::Build, &shared, &quiet(), None).is_ok());
-        assert!(decide(&Request::Build, &[], &quiet(), Some("W3")).is_ok());
+        decide(&Request::Build, &shared, &quiet(), None).unwrap();
+        decide(&Request::Build, &[], &quiet(), Some("W3")).unwrap();
         let timing = [holder(4, 1, BootMode::Timing)];
         assert!(decide(&Request::Build, &timing, &quiet(), None).is_err());
     }
@@ -1117,7 +1117,7 @@ mod tests
         {
             *grant = Some("W3".into());
         }
-        assert!(decide(&ours, &[], &quiet(), Some("W3")).is_ok());
+        decide(&ours, &[], &quiet(), Some("W3")).unwrap();
         // The holder's boots still meet the rules.
         assert!(
             decide(
@@ -1129,7 +1129,7 @@ mod tests
             .is_err()
         );
         // A grant passed when none is outstanding is no refusal.
-        assert!(decide(&ours, &[], &quiet(), None).is_ok());
+        decide(&ours, &[], &quiet(), None).unwrap();
     }
 
     #[test]
@@ -1264,7 +1264,7 @@ mod tests
         assert!(text.contains("runs alone"), "{text}");
 
         let unwaited = admit(&dir, &large, &claim(), None, Duration::ZERO, &|| quiet());
-        assert!(unwaited.is_err());
+        unwaited.unwrap_err();
 
         // Released mid-wait, the waiting command gets in.
         let releaser = std::thread::spawn(move || {

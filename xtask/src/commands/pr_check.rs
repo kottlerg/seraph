@@ -1724,7 +1724,7 @@ mod tests
     fn a_conforming_commit_has_no_finding()
     {
         let c = commit("xtask: add the commit check", "Wrapped body.\n\nRefs #831");
-        assert!(check_commit(&pat(), &c).is_empty());
+        assert_eq!(check_commit(&pat(), &c), [] as [Diag; 0]);
     }
 
     #[test]
@@ -1742,10 +1742,10 @@ mod tests
         assert_eq!(found("it does not close #637"), [637]);
         // Not closing references: another form of the verb, a keyword
         // separated from the reference, a word that only ends in one.
-        assert!(found("fixing #3").is_empty());
-        assert!(found("(fixed by PR #9)").is_empty());
-        assert!(found("prefix #4").is_empty());
-        assert!(found("Refs #5").is_empty());
+        assert_eq!(found("fixing #3"), [] as [u64; 0]);
+        assert_eq!(found("(fixed by PR #9)"), [] as [u64; 0]);
+        assert_eq!(found("prefix #4"), [] as [u64; 0]);
+        assert_eq!(found("Refs #5"), [] as [u64; 0]);
     }
 
     #[test]
@@ -1812,8 +1812,8 @@ mod tests
         assert_eq!(found("Refs #5\nrefs: #6, REFS #7"), [5, 6, 7]);
         // A reference into another repository names an Issue the checks
         // cannot read, and `prefs` only ends in the word.
-        assert!(found("Refs owner/repo#8").is_empty());
-        assert!(found("prefs #9").is_empty());
+        assert_eq!(found("Refs owner/repo#8"), [] as [u64; 0]);
+        assert_eq!(found("prefs #9"), [] as [u64; 0]);
     }
 
     #[test]
@@ -1838,7 +1838,7 @@ mod tests
             ["commit-subject-columns"]
         );
         let fits = format!("xtask: {}", "x".repeat(SUBJECT_COLUMNS - 7));
-        assert!(check_commit(&p, &commit(&fits, "")).is_empty());
+        assert_eq!(check_commit(&p, &commit(&fits, "")), [] as [Diag; 0]);
     }
 
     #[test]
@@ -1908,9 +1908,12 @@ mod tests
             ["commit-body-columns"]
         );
         let url = format!("https://example.com/{}", "a".repeat(80));
-        assert!(check_commit(&p, &commit("xtask: a", &url)).is_empty());
+        assert_eq!(check_commit(&p, &commit("xtask: a", &url)), [] as [Diag; 0]);
         let indented = format!("    {long}");
-        assert!(check_commit(&p, &commit("xtask: a", &indented)).is_empty());
+        assert_eq!(
+            check_commit(&p, &commit("xtask: a", &indented)),
+            [] as [Diag; 0]
+        );
     }
 
     #[test]
@@ -1945,14 +1948,20 @@ mod tests
             validated_head_candidates(&p, "## Validation\nhead 12345678\n"),
             ["12345678"]
         );
-        assert!(validated_head_candidates(&p, "## Validation\npending\n").is_empty());
-        assert!(validated_head_candidates(&p, "## Summary\nabcdef12\n").is_empty());
+        assert_eq!(
+            validated_head_candidates(&p, "## Validation\npending\n"),
+            [] as [String; 0]
+        );
+        assert_eq!(
+            validated_head_candidates(&p, "## Summary\nabcdef12\n"),
+            [] as [String; 0]
+        );
     }
 
     #[test]
     fn a_complete_body_has_no_finding()
     {
-        assert!(check_body(&pat(), BODY).is_empty());
+        assert_eq!(check_body(&pat(), BODY), [] as [Diag; 0]);
     }
 
     #[test]
@@ -1993,17 +2002,20 @@ mod tests
         assert_eq!(found("the second PR, which carries `Fixes #835`"), [835]);
         assert_eq!(found("It does not close #637 yet."), [637]);
         // A line of closing references alone is the intended form.
-        assert!(found("Fixes #10").is_empty());
-        assert!(found("Fixes #10, closes #11 and resolves #12.").is_empty());
+        assert_eq!(found("Fixes #10"), [] as [u64; 0]);
+        assert_eq!(
+            found("Fixes #10, closes #11 and resolves #12."),
+            [] as [u64; 0]
+        );
         // A list item or a quoted line that holds only the closing line.
-        assert!(found("- Fixes #10").is_empty());
-        assert!(found("> * Closes #10").is_empty());
-        assert!(found("1. Fixes #10").is_empty());
-        assert!(found(">Fixes #10").is_empty());
-        assert!(found("- [x] Fixes #10").is_empty());
+        assert_eq!(found("- Fixes #10"), [] as [u64; 0]);
+        assert_eq!(found("> * Closes #10"), [] as [u64; 0]);
+        assert_eq!(found("1. Fixes #10"), [] as [u64; 0]);
+        assert_eq!(found(">Fixes #10"), [] as [u64; 0]);
+        assert_eq!(found("- [x] Fixes #10"), [] as [u64; 0]);
         assert_eq!(found("- also fixes #10"), [10]);
         assert_eq!(found("2) this one resolves #10"), [10]);
-        assert!(found("Refs #13").is_empty());
+        assert_eq!(found("Refs #13"), [] as [u64; 0]);
 
         let body = format!("{BODY}\nThe next PR carries `Fixes #835`.\n");
         let diags = check_body(&p, &body);
@@ -2023,7 +2035,7 @@ mod tests
         // A closing reference into another repository is another Issue
         // than this repository's `Refs #11`.
         let other = BODY.replace("Fixes #10", "Fixes other/repo#11");
-        assert!(check_body(&pat(), &other).is_empty());
+        assert_eq!(check_body(&pat(), &other), [] as [Diag; 0]);
     }
 
     #[test]
@@ -2046,7 +2058,7 @@ mod tests
     {
         let comments = "diff --git a/k/a.rs b/k/a.rs\n--- a/k/a.rs\n+++ b/k/a.rs\n@@ -1 +1 @@\n\
                         -// old\n+// new\n+\n+    /// doc\n";
-        assert!(non_comment_changes(comments).is_empty());
+        assert_eq!(non_comment_changes(comments), [] as [String; 0]);
         let code = "diff --git a/k/a.rs b/k/a.rs\n--- a/k/a.rs\n+++ b/k/a.rs\n@@ -1 +1 @@\n\
                     +let x = 1; // note\n";
         assert_eq!(non_comment_changes(code), ["k/a.rs: let x = 1; // note"]);
@@ -2072,7 +2084,7 @@ mod tests
         // A file of comments alone, added or deleted, is comment-only.
         let comments = "diff --git a/k/b.rs b/k/b.rs\nnew file mode 100644\n--- /dev/null\n\
                         +++ b/k/b.rs\n@@ -0,0 +1 @@\n+// note\n";
-        assert!(non_comment_changes(comments).is_empty());
+        assert_eq!(non_comment_changes(comments), [] as [String; 0]);
     }
 
     #[test]
@@ -2155,7 +2167,7 @@ mod tests
             ..Delta::default()
         };
         // BODY's Validation section says later commits are comment-only.
-        assert!(delta_diags(&p, BODY, "deadbeef", &moved).is_empty());
+        assert_eq!(delta_diags(&p, BODY, "deadbeef", &moved), [] as [Diag; 0]);
         let silent = "## Validation\nValidated at deadbeef.\n";
         assert_eq!(
             rules(&delta_diags(&p, silent, "deadbeef", &moved)),
@@ -2253,7 +2265,10 @@ mod tests
         // The same lines at other places in the file agree.
         let before = at("@@ -1 +1 @@\n-let x = 1;\n+let x = 2;\n");
         let after = at("@@ -9 +9 @@\n-let x = 1;\n+let x = 2;\n");
-        assert!(own_change_difference(&before, &after).is_empty());
+        assert_eq!(
+            own_change_difference(&before, &after),
+            [] as [(Side, Change); 0]
+        );
         // A changed comment differs, but not in code.
         let commented = at("@@ -1 +1,2 @@\n-let x = 1;\n+let x = 2;\n+// why\n");
         let found = own_change_difference(&before, &commented);
@@ -2287,7 +2302,10 @@ mod tests
             )
         };
         let first = binary("1111..2222");
-        assert!(own_change_difference(&first, &first).is_empty());
+        assert_eq!(
+            own_change_difference(&first, &first),
+            [] as [(Side, Change); 0]
+        );
         assert_eq!(
             own_change_difference(&first, &binary("1111..3333")).len(),
             2
@@ -2384,7 +2402,7 @@ mod tests
     {
         let repo = Repo::new("head");
         let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
-        assert!(repo.check(&validated, ".").is_empty());
+        assert_eq!(repo.check(&validated, "."), [] as [Diag; 0]);
     }
 
     #[test]
@@ -2393,9 +2411,9 @@ mod tests
         let repo = Repo::new("comment");
         let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
         repo.commit("a.rs", "// why\nfn a() {}\nlet x = 2;\n");
-        assert!(
-            repo.check(&validated, "; later commits are comment-only.")
-                .is_empty()
+        assert_eq!(
+            repo.check(&validated, "; later commits are comment-only."),
+            [] as [Diag; 0]
         );
         assert_eq!(rules(&repo.check(&validated, ".")), ["pr-validated-head"]);
     }
@@ -2423,7 +2441,7 @@ mod tests
         repo.merge_master(&[]);
         repo.commit("a.rs", "fn a() {}\nlet x = 3;\n");
         let found = repo.check(&validated, "; later commits are comment-only.");
-        assert!(!found.is_empty());
+        assert_ne!(found, [] as [Diag; 0]);
         assert!(found.iter().all(|d| d.rule == "pr-validated-head"));
         assert!(found.iter().any(|d| d.message.contains("let x = 3;")));
     }
@@ -2451,7 +2469,7 @@ mod tests
             b"fn a() {}\nlet x = 1;\nlet z = 3;\nlet y = 2;\n",
         );
         let found = repo.check(&validated, "; later commits are comment-only.");
-        assert!(!found.is_empty());
+        assert_ne!(found, [] as [Diag; 0]);
         assert!(
             found.iter().all(|d| d.rule == "pr-validated-head"),
             "{found:?}"
@@ -2476,7 +2494,7 @@ mod tests
             b"fn a() {}\nlet x = 1;\nlet q = 0;\n",
         );
         let found = repo.check(&validated, "; later commits are comment-only.");
-        assert!(!found.is_empty());
+        assert_ne!(found, [] as [Diag; 0]);
         assert!(
             found.iter().all(|d| d.rule == "pr-validated-head"),
             "{found:?}"
@@ -2513,7 +2531,7 @@ mod tests
         let repo = Repo::new("sync-binary");
         let validated = synced_then_changed(&repo, "logo.bin", b"\0\x01\x02", b"\0\x01\x03");
         let found = repo.check(&validated, "; later commits are comment-only.");
-        assert!(!found.is_empty());
+        assert_ne!(found, [] as [Diag; 0]);
         assert!(found.iter().all(|d| d.rule == "pr-validated-head"));
         assert!(found.iter().any(|d| d.message.contains("binary change")));
     }
@@ -2524,7 +2542,7 @@ mod tests
         let repo = Repo::new("sync-indent");
         let validated = synced_then_changed(&repo, "ci.yml", b"a:\n  b: 1\n", b"a:\n    b: 1\n");
         let found = repo.check(&validated, "; later commits are comment-only.");
-        assert!(!found.is_empty());
+        assert_ne!(found, [] as [Diag; 0]);
         assert!(found.iter().all(|d| d.rule == "pr-validated-head"));
         assert!(found.iter().any(|d| d.message.contains("    b: 1")));
     }
@@ -2535,7 +2553,7 @@ mod tests
         let repo = Repo::new("sync-newline");
         let validated = synced_then_changed(&repo, "c.rs", b"fn c() {}", b"fn c() {}\n");
         let found = repo.check(&validated, "; later commits are comment-only.");
-        assert!(!found.is_empty());
+        assert_ne!(found, [] as [Diag; 0]);
         assert!(found.iter().all(|d| d.rule == "pr-validated-head"));
         assert!(
             found
@@ -2554,7 +2572,7 @@ mod tests
         repo.git(&["update-index", "--chmod=+x", "run.sh"]);
         repo.git(&["commit", "-q", "-m", "test: chmod"]);
         let found = repo.check(&validated, "; later commits are comment-only.");
-        assert!(!found.is_empty());
+        assert_ne!(found, [] as [Diag; 0]);
         assert!(found.iter().all(|d| d.rule == "pr-validated-head"));
         assert!(
             found
@@ -2599,9 +2617,9 @@ mod tests
         let repo = Repo::new("upper-markdown");
         let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
         repo.commit("NOTES.MD", "Some notes.\n");
-        assert!(
-            repo.check(&validated, "; later commits are Markdown-only.")
-                .is_empty()
+        assert_eq!(
+            repo.check(&validated, "; later commits are Markdown-only."),
+            [] as [Diag; 0]
         );
     }
 
@@ -2623,7 +2641,7 @@ mod tests
         let embeds = "const HELP: &str = include_str!(\"../docs/help.md\");\nlet x = 1;\n";
         let names = "docs/help.md\ndocs/other.md\n";
         assert_eq!(embedded_paths(&pat(), names, embeds), ["docs/help.md"]);
-        assert!(embedded_paths(&pat(), names, "").is_empty());
+        assert_eq!(embedded_paths(&pat(), names, ""), [] as [String; 0]);
     }
 
     #[test]
@@ -2655,7 +2673,10 @@ mod tests
     fn a_closed_issue_needs_every_acceptance_box_ticked()
     {
         let current = Some("v0.1.3");
-        assert!(check_closed_issue(&issue("xtask: a", DONE, current), current).is_empty());
+        assert_eq!(
+            check_closed_issue(&issue("xtask: a", DONE, current), current),
+            [] as [Diag; 0]
+        );
         let open = "## Acceptance\n- [x] a\n- [ ] b\n";
         assert_eq!(
             rules(&check_closed_issue(
@@ -2682,7 +2703,10 @@ mod tests
             ["issue-milestone"]
         );
         // With no versioned milestone open there is nothing to compare with.
-        assert!(check_closed_issue(&issue("xtask: a", DONE, None), None).is_empty());
+        assert_eq!(
+            check_closed_issue(&issue("xtask: a", DONE, None), None),
+            [] as [Diag; 0]
+        );
     }
 
     #[test]
@@ -2719,7 +2743,7 @@ mod tests
                 {"context":"legacy","state":"SUCCESS"}]}"#,
         )
         .unwrap();
-        assert!(check_merge_state(&green).is_empty());
+        assert_eq!(check_merge_state(&green), [] as [Diag; 0]);
 
         let red: Value = serde_json::from_str(
             r#"{"mergeStateStatus":"BEHIND","statusCheckRollup":[

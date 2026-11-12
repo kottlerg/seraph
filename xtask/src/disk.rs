@@ -683,13 +683,13 @@ mod tests
 
         // Before the partition's first byte, though inside the file.
         slice.seek(SeekFrom::Start(2)).unwrap();
-        assert!(slice.seek(SeekFrom::Current(-3)).is_err());
-        assert!(slice.seek(SeekFrom::End(-17)).is_err());
+        slice.seek(SeekFrom::Current(-3)).unwrap_err();
+        slice.seek(SeekFrom::End(-17)).unwrap_err();
         // A failed seek leaves the position unchanged.
         assert_eq!(slice.stream_position().unwrap(), 2);
 
         // Past what `u64` holds.
-        assert!(slice.seek(SeekFrom::Start(u64::MAX)).is_err());
+        slice.seek(SeekFrom::Start(u64::MAX)).unwrap_err();
         assert_eq!(slice.stream_position().unwrap(), 2);
     }
 

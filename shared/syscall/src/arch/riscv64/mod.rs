@@ -5,16 +5,6 @@
 
 //! RISC-V raw syscall entry: the `ECALL` instruction wrappers.
 
-// `no_core` (feature `rustc-dep-of-std`) disables the automatic prelude in
-// every module, not only the crate root; bring it in here as lib.rs does.
-#[cfg(feature = "rustc-dep-of-std")]
-#[expect(
-    unused_imports,
-    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
-              hand; a module that uses nothing from it leaves the import unused"
-)]
-use core::prelude::rust_2024::*;
-
 /// Issue a syscall with up to 2 arguments. Returns the primary return value.
 ///
 /// # Safety

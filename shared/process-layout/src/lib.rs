@@ -68,14 +68,8 @@
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
 
-// `no_core` drops the implicit prelude; the glob restores it, and lints as
-// unused for whichever prelude items this crate happens not to name.
+// `no_core` drops the implicit prelude; the glob restores it.
 #[cfg(feature = "rustc-dep-of-std")]
-#[expect(
-    unused_imports,
-    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
-              hand; a module that uses nothing from it leaves the import unused"
-)]
 use core::prelude::rust_2024::*;
 
 use process_abi::MAX_PROCESS_STACK_PAGES;

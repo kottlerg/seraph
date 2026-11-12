@@ -44,14 +44,6 @@ extern crate rustc_std_workspace_alloc as alloc;
 #[cfg(not(feature = "rustc-dep-of-std"))]
 extern crate alloc;
 
-#[cfg(feature = "rustc-dep-of-std")]
-#[expect(
-    unused_imports,
-    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
-              hand; a module that uses nothing from it leaves the import unused"
-)]
-use core::prelude::rust_2024::*;
-
 pub mod queues;
 pub mod slots;
 

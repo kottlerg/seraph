@@ -39,11 +39,6 @@ extern crate rustc_std_workspace_core as core;
 // `no_core` disables the automatic prelude; bring it in by hand so
 // `#[derive(…)]`, Copy/Clone, the operator traits, etc. resolve.
 #[cfg(feature = "rustc-dep-of-std")]
-#[expect(
-    unused_imports,
-    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
-              hand; a module that uses nothing from it leaves the import unused"
-)]
 use core::prelude::rust_2024::*;
 
 // ── Architectural constants ───────────────────────────────────────────────────

@@ -37,11 +37,6 @@
 extern crate rustc_std_workspace_core as core;
 
 #[cfg(feature = "rustc-dep-of-std")]
-#[expect(
-    unused_imports,
-    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
-              hand; a module that uses nothing from it leaves the import unused"
-)]
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
@@ -102,11 +97,6 @@ pub mod procmgr_labels
     // defines a type and functions, imports the prelude the crate root
     // imports.
     #[cfg(feature = "rustc-dep-of-std")]
-    #[expect(
-        unused_imports,
-        reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude \
-                  by hand; a module that uses nothing from it leaves the import unused"
-    )]
     use core::prelude::rust_2024::*;
 
     /// Create a new process from a boot module Memory cap. Caps: `[module,
@@ -1169,11 +1159,6 @@ pub mod svcmgr_labels
     // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
     // defines functions, imports the prelude the crate root imports.
     #[cfg(feature = "rustc-dep-of-std")]
-    #[expect(
-        unused_imports,
-        reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude \
-                  by hand; a module that uses nothing from it leaves the import unused"
-    )]
     use core::prelude::rust_2024::*;
 
     /// The one name limit of the svcmgr protocol, in bytes: a service name
@@ -3448,16 +3433,6 @@ pub const STREAM_LABELS_VERSION: u32 = 3;
 ///   § `stream_labels::STREAM_BYTES`); a record carries its own.
 pub mod stream_labels
 {
-    // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
-    // defines a function, imports the prelude the crate root imports.
-    #[cfg(feature = "rustc-dep-of-std")]
-    #[expect(
-        unused_imports,
-        reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude \
-                  by hand; a module that uses nothing from it leaves the import unused"
-    )]
-    use core::prelude::rust_2024::*;
-
     /// Base label ID for stream-bytes messages (bits 0-15).
     pub const STREAM_BYTES: u64 = 10;
     /// Shift of the level field in a [`STREAM_BYTES`] label.

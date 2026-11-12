@@ -27,11 +27,6 @@
 // crate root is `no_core` and the prelude reaches only the root module;
 // submodules import it themselves. Harmless no-op otherwise.
 #[cfg(feature = "rustc-dep-of-std")]
-#[expect(
-    unused_imports,
-    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
-              hand; a module that uses nothing from it leaves the import unused"
-)]
 use core::prelude::rust_2024::*;
 
 use alloc::vec::Vec;

@@ -42,11 +42,6 @@ extern crate rustc_std_workspace_core as core;
 // operator traits, Copy/Clone, etc. resolve for the asm wrappers and
 // result types in this crate.
 #[cfg(feature = "rustc-dep-of-std")]
-#[expect(
-    unused_imports,
-    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
-              hand; a module that uses nothing from it leaves the import unused"
-)]
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{

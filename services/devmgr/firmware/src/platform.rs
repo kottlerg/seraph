@@ -61,7 +61,7 @@ pub enum SpcrBase
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpcrInterrupt
 {
-    /// The ISA IRQ number or the GSI / PLIC-APLIC source.
+    /// The ISA IRQ number or the GSI / APLIC source.
     pub line: u32,
     /// Whether `line` is an ISA IRQ number (dual-8259).
     pub isa: bool,
@@ -80,7 +80,7 @@ fn rd_u32(buf: &[u8], off: usize) -> Option<u32>
 /// Parse an SPCR (signature `SPCR`, length >= 80): the interface type, the
 /// base address Generic Address Structure (system memory or system I/O; a
 /// zero address is none), and the interrupt (bit 0 of the interrupt type is
-/// the dual-8259 ISA IRQ, any of bits 1 to 4 a GSI or PLIC/APLIC source).
+/// the dual-8259 ISA IRQ, any of bits 1 to 4 a GSI or APLIC source).
 /// An I/O base above 0xFFFF, another space id, a wrong signature, or a short
 /// table gives `None`.
 #[must_use]
@@ -168,7 +168,7 @@ pub enum PlatformResource
     /// A wired interrupt line.
     Wired
     {
-        /// The GSI / PLIC-APLIC source.
+        /// The GSI / APLIC source.
         line: u32,
         /// `IRQ_MODE_*` bits.
         mode: u64,

@@ -258,11 +258,14 @@ pub struct TestContext
 // Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
 #[allow(dead_code)]
 #[repr(align(16))]
-pub struct ChildStack([u8; 16384]);
+pub struct ChildStack([u8; ChildStack::BYTES]);
 
 impl ChildStack
 {
-    pub const ZERO: ChildStack = ChildStack([0u8; 16384]);
+    /// Size of one stack.
+    pub const BYTES: usize = 16384;
+
+    pub const ZERO: ChildStack = ChildStack([0u8; ChildStack::BYTES]);
 
     /// Virtual address of the top of the stack at `ptr` (one past the last byte).
     ///
@@ -272,7 +275,30 @@ impl ChildStack
     #[must_use]
     pub fn top(ptr: *const Self) -> u64
     {
-        ptr as u64 + 16384
+        ptr as u64 + Self::BYTES as u64
+    }
+
+    /// Bytes of the stack at `ptr` its threads have used: from the top down
+    /// to the lowest non-zero byte, or 0 when none is. A stack slot that
+    /// still holds zero reads as unused, so the count is a lower bound that
+    /// can fall short of the true depth by at most the zero bytes below the
+    /// lowest written one. A count of [`Self::BYTES`] means a thread may
+    /// also have written below the stack, into the statics there. Takes a
+    /// raw pointer for the reason [`top`](Self::top) does.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` points to a `ChildStack` that was zero at the boot's start
+    /// ([`ZERO`](Self::ZERO)), and no thread runs on it during the call:
+    /// every thread that ran on it has exited or been deleted.
+    #[must_use]
+    pub unsafe fn used_bytes(ptr: *const Self) -> usize
+    {
+        let base = ptr.cast::<u8>();
+        // SAFETY: every offset is below `BYTES`, so inside the stack, and the
+        // caller's contract leaves no thread writing it.
+        let lowest = (0..Self::BYTES).find(|&i| unsafe { base.add(i).read() } != 0);
+        lowest.map_or(0, |i| Self::BYTES - i)
     }
 }
 

@@ -12,7 +12,7 @@
 //! matching the bootloader's NS16550 access. The UART was programmed by an
 //! earlier boot stage and that state persists; the one piece that must be
 //! re-enabled here is the receive-data interrupt (every boot stage left
-//! `IER = 0`), so RX raises the PLIC source the driver routes to its client.
+//! `IER = 0`), so RX raises the APLIC source the driver routes to its client.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::os::seraph::{fund_aspace_pt_budget, reserve_pages};
@@ -87,7 +87,7 @@ pub unsafe fn serial_init(
     if enable_rx_irq
     {
         // Enable Received Data Available interrupt (ERBFI). Earlier boot stages
-        // left IER cleared; without this the NS16550 never raises its PLIC
+        // left IER cleared; without this the NS16550 never raises its APLIC
         // source. Skipped when the driver holds no IRQ cap (RX then polls).
         // SAFETY: base_va was just mapped via mmio_map; IER is within the page.
         unsafe { core::ptr::write_volatile((base_va + UART_IER) as *mut u8, 0x01) };

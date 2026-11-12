@@ -45,7 +45,7 @@ pub fn is_dram(ty: MemoryType) -> bool
 /// A `Reserved` entry whose range falls entirely outside
 /// `[dram_bottom, dram_top)` is an address-space window
 /// (`PCIe MMCFG` / `LAPIC` above DRAM on x86-64,
-/// `PLIC` / `CLINT` below DRAM on riscv64-virt), not RAM.
+/// `APLIC` / `IMSIC` / `CLINT` below DRAM on riscv64-virt), not RAM.
 /// Returns `(0, 0)` if no DRAM-typed entries exist.
 fn compute_dram_bounds(entries: &[boot_protocol::MemoryMapEntry]) -> (u64, u64)
 {
@@ -264,7 +264,7 @@ pub fn print_memory_map(info: &BootInfo)
     {
         let (mm_v, mm_u) = scaled_unit(mmio_bytes);
         kprintln!(
-            "MMIO: {} {} address-space windows outside DRAM (PCIe MMCFG / LAPIC / PLIC / CLINT \
+            "MMIO: {} {} address-space windows outside DRAM (PCIe MMCFG / LAPIC / APLIC / CLINT \
              / etc. — not RAM)",
             mm_v,
             mm_u,

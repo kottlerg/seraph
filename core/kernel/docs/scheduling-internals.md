@@ -378,8 +378,9 @@ skipping levels, risks deadlock.
 11. **The IRQ routing lock (`irq::ROUTING`) is taken with no IPC source, `sched_lock`,
     run-queue, or sleep-list lock held, and never in interrupt context.** It serialises every
     IRQ binding change (`irq::register`, `irq::unregister`, `irq::unregister_notification`) and
-    every `SYS_IRQ_ACK` acknowledgement (`irq::ack`). Under it the controller's leaf locks
-    (`IOAPIC_LOCK` on x86-64, `PLIC_LOCK` on riscv64) may be taken, never the reverse. A binding
+    every `SYS_IRQ_ACK` acknowledgement (`irq::ack`). Under it the controller's leaf lock
+    (`IOAPIC_LOCK` on x86-64; the riscv64 APLIC accesses take none) may be taken, never the
+    reverse. A binding
     change spins under it, interrupts disabled, until the device-IRQ deliveries in flight
     on the line it unbound or rebound finish (`irq:route-drain`), and those deliveries take a
     notification's source lock and the scheduler locks; holding any of them while taking the

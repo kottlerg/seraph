@@ -1188,7 +1188,7 @@ fn main() -> !
         std::os::seraph::log!(error: "failed to start the interrupt-service thread");
         syscall::thread_exit();
     }
-    // Unmask the interrupt at the controller (IOAPIC/PLIC).
+    // Unmask the interrupt at the controller (I/O APIC / APLIC).
     // irq_register leaves the entry masked; the first irq_ack unmasks it.
     let _ = syscall::irq_ack(caps.irq_slot);
 

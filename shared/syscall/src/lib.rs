@@ -2132,11 +2132,12 @@ pub fn wait_set_try_wait(ws_cap: u64) -> Result<u64, i64>
 /// Returns a negative `i64` error code if either cap is invalid or lacks
 /// Notify rights, `InvalidArgument` if `irq_cap` covers more than one line or
 /// names an id no discovered interrupt controller implements (a GSI no I/O APIC
-/// reports on x86-64, a source past the PLIC's `riscv,ndev` on RISC-V), if
+/// reports on x86-64, a source past the APLIC's `riscv,num-sources` on RISC-V), if
 /// `mode` sets a bit outside `IRQ_MODE_MASK`, or if it differs from the mode
 /// the line's bindings recorded, or `QuotaExceeded` when the line already holds
 /// 64 bindings or, for its first binding, the controller has no delivery
-/// resource left (x86-64: every device vector is assigned).
+/// resource left (x86-64: every device vector is assigned; RISC-V: no CPU's
+/// IMSIC file has a free identity).
 #[inline]
 pub fn irq_register(irq_cap: u64, notification_cap: u64, mode: u64) -> Result<(), i64>
 {

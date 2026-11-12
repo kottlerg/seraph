@@ -44,7 +44,7 @@ devmgr delivers the record's resource list, decoded with
 `driver_binding::resources::PlatformDelivery`: the `Mmio` resource covering one page at
 `0x101000`, and in the end round the service-endpoint RECV and the driver's devmgr query cap, a
 SEND badged with its device badge on the private endpoint of its devmgr spawn batch. The record
-also names the RTC's line (PLIC / APLIC source 11), but the declaration asks for no interrupt,
+also names the RTC's line (APLIC source 11), but the declaration asks for no interrupt,
 so devmgr delivers none.
 
 The driver reserves one page of VA via `reserve_pages`, funds the AS's

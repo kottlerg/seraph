@@ -10,5 +10,5 @@
 oem_table_id = BXPC
 
 # The goldfish RTC: its register page, and its interrupt source on the
-# PLIC / APLIC (QEMU hw/riscv/virt.c, VIRT_RTC, RTC_IRQ).
+# APLIC (QEMU hw/riscv/virt.c, VIRT_RTC, RTC_IRQ).
 device = google,goldfish-rtc mmio 0x101000 0x1000 wired 11 level-high

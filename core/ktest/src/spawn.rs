@@ -319,6 +319,25 @@ pub fn redirect_to_entry(regs: &mut [u8], entry: u64)
     regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&entry.to_le_bytes());
 }
 
+/// [`redirect_to_entry`] onto the top of the child's stack: the stack
+/// pointer becomes `stack_top` (as [`crate::ChildStack::top`] gives it),
+/// aligned for the entry ABI, instead of moving down from where the child
+/// stopped. A cell that redirects one child round after round uses it. Each
+/// redirect enters an entry that never returns, so the frames the child
+/// stopped in are dead, and starting the entry at the top keeps the child's
+/// stack one call chain deep whatever the round count. Continuing from the
+/// stopped stack pointer instead adds a chain each round; once the rounds'
+/// chains pass the `ChildStack`'s size, the child writes into the statics
+/// below it.
+///
+/// Panics as [`redirect_to_entry`] does when `regs` is too short.
+pub fn redirect_to_entry_at(regs: &mut [u8], entry: u64, stack_top: u64)
+{
+    use crate::arch::{IP_OFFSET, SP_OFFSET, entry_stack_pointer};
+    regs[SP_OFFSET..SP_OFFSET + 8].copy_from_slice(&entry_stack_pointer(stack_top).to_le_bytes());
+    regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&entry.to_le_bytes());
+}
+
 /// One `cap_info(CAP_INFO_THREAD_STATE)` on `thread`, decoded into its
 /// `(state, exit_reason)` pair: the `THREAD_STATE_*` code from the high word
 /// and the retained exit reason from the low word, read together under one

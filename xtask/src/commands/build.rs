@@ -787,6 +787,7 @@ fn build_group(
     if !args.skip_lints
     {
         clippy_check_ext(ctx, &flags_ref, &[], seraph.as_ref())?;
+        clippy_std_members(ctx, triple, build_std, args.release, seraph.as_ref())?;
     }
 
     let mut cmd = cargo(&ctx.root);
@@ -896,6 +897,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     if !args.skip_lints
     {
         clippy_check_ext(ctx, &flags_ref, &[], seraph.as_ref())?;
+        clippy_std_members(ctx, triple, build_std, args.release, seraph.as_ref())?;
     }
 
     let mut cmd = cargo(&ctx.root);
@@ -1030,7 +1032,8 @@ fn clippy_check(ctx: &BuildContext, flags: &[&str]) -> Result<()>
 /// Called before every component `cargo build` with identical flags and
 /// `env`, so lints are enforced on every component build — not just on
 /// dedicated lint passes — and the lint pass compiles what the build
-/// compiles.
+/// compiles. A `StdUser` build calls it once more, through
+/// [`clippy_std_members`], for the workspace crates std depends on.
 fn clippy_check_ext(
     ctx: &BuildContext,
     flags: &[&str],
@@ -1063,6 +1066,56 @@ fn clippy_check_ext(
         cmd.args(["--", "-D", "warnings"]);
     }
     run_cmd(&mut cmd)
+}
+
+/// Clippy-check, as workspace members, the workspace crates std depends on
+/// ([`rust_src::std_workspace_packages`]), on the `StdUser` target; a no-op
+/// for the other profiles, whose builds compile no std (`seraph` is `None`).
+///
+/// A `-Z build-std` build compiles these crates as dependencies of std, with
+/// lints capped, so `[workspace.lints]` and a crate-root lint level bind
+/// nothing there; a crate no workspace member depends on (`ruststd-heap-fit`,
+/// for one) would be checked nowhere. The check is a `cargo` invocation of
+/// its own so the component lint pass keeps the build's feature resolution.
+fn clippy_std_members(
+    ctx: &BuildContext,
+    triple: &str,
+    build_std: &str,
+    release: bool,
+    seraph: Option<&rust_src::SeraphToolchain>,
+) -> Result<()>
+{
+    if seraph.is_none()
+    {
+        return Ok(());
+    }
+    let flags = std_member_lint_flags(triple, build_std, release);
+    let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
+    clippy_check_ext(ctx, &flags_ref, &[], seraph)
+}
+
+/// The `cargo check` flags of [`clippy_std_members`]: the library of each
+/// std dependency, on `triple`, against the std `build_std` names.
+fn std_member_lint_flags(triple: &str, build_std: &str, release: bool) -> Vec<String>
+{
+    let mut flags: Vec<String> = Vec::new();
+    for package in rust_src::std_workspace_packages()
+    {
+        flags.push("-p".into());
+        flags.push(package.into());
+    }
+    flags.extend([
+        "--lib".into(),
+        "--target".into(),
+        triple.into(),
+        format!("-Zbuild-std={build_std}"),
+        "-Zbuild-std-features=compiler-builtins-mem".into(),
+    ]);
+    if release
+    {
+        flags.push("--release".into());
+    }
+    flags
 }
 
 /// Construct a `cargo` Command with the working directory set to the workspace
@@ -1147,6 +1200,48 @@ mod tests
             .find(|(key, _)| *key == "CARGO_INCREMENTAL")
             .and_then(|(_, value)| value);
         assert_eq!(incremental, Some(std::ffi::OsStr::new("0")));
+    }
+
+    /// The crates only std depends on, which no component's lint pass
+    /// reaches, are checked as workspace members on the `StdUser` target.
+    #[test]
+    fn the_std_member_lint_pass_checks_the_crates_only_std_depends_on()
+    {
+        let triple = Arch::Riscv64.user_target_triple();
+        let flags = std_member_lint_flags(triple, "core,alloc,std,panic_abort", true);
+        let selected: Vec<&str> = flags
+            .windows(2)
+            .filter(|pair| pair[0] == "-p")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        for package in [
+            "ruststd-argv-env",
+            "ruststd-heap-fit",
+            "ruststd-spin-wait",
+            "registry-client",
+        ]
+        {
+            assert!(selected.contains(&package), "{package} is not checked");
+        }
+        assert_eq!(
+            selected,
+            rust_src::std_workspace_packages().collect::<Vec<_>>()
+        );
+        for flag in [
+            "--lib",
+            triple,
+            "-Zbuild-std=core,alloc,std,panic_abort",
+            "--release",
+        ]
+        {
+            assert!(flags.iter().any(|f| f == flag), "{flag} missing");
+        }
+        assert!(!flags.iter().any(|f| f == "--bin"));
+        assert!(
+            !std_member_lint_flags(triple, "core,alloc,std,panic_abort", false)
+                .iter()
+                .any(|f| f == "--release")
+        );
     }
 
     #[test]

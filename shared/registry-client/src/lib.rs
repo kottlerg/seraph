@@ -27,9 +27,16 @@
 // resolves `use core::…`. Same incantation as `shared/log`,
 // `shared/ipc`, etc.
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
-#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(
+    feature = "rustc-dep-of-std",
+    expect(
+        internal_features,
+        reason = "`no_core` is an internal feature, needed to build as a dependency of std"
+    )
+)]
 #![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 // Without `#![no_std]`, the prelude is implicit. With `no_core`, it is
 // not — we must re-alias the workspace-core stub as `core` and pull

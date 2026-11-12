@@ -19,6 +19,7 @@
 //! The crate spawns `std` threads, so it compiles only for seraph.
 
 #![cfg(target_os = "seraph")]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 

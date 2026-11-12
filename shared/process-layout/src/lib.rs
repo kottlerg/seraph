@@ -54,9 +54,16 @@
 // this crate can sit inside std's dep graph. Mirrors abi/process-abi. Normal
 // builds (no feature) retain `#![no_std]`.
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
-#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(
+    feature = "rustc-dep-of-std",
+    expect(
+        internal_features,
+        reason = "`no_core` is an internal feature, needed to build as a dependency of std"
+    )
+)]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
@@ -64,7 +71,11 @@ extern crate rustc_std_workspace_core as core;
 // `no_core` drops the implicit prelude; the glob restores it, and lints as
 // unused for whichever prelude items this crate happens not to name.
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
+              hand; a module that uses nothing from it leaves the import unused"
+)]
 use core::prelude::rust_2024::*;
 
 use process_abi::MAX_PROCESS_STACK_PAGES;

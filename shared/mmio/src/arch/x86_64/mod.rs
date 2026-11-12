@@ -13,32 +13,20 @@
 
 /// No-op on x86-64: TSO + uncacheable MMIO already order prior memory writes
 /// before subsequent MMIO writes; no explicit fence required.
-// inline_always: a barrier is one fence (or nothing) that must sit inline at the
-// access it orders; an out-of-line call would cost more than the fence itself.
-#[allow(clippy::inline_always)]
 #[inline(always)]
 pub fn dma_to_mmio_barrier() {}
 
 /// No-op on x86-64: TSO + uncacheable MMIO already serialise MMIO writes in
 /// program order; no explicit fence required.
-// inline_always: a barrier is one fence (or nothing) that must sit inline at the
-// access it orders; an out-of-line call would cost more than the fence itself.
-#[allow(clippy::inline_always)]
 #[inline(always)]
 pub fn mmio_to_mmio_barrier() {}
 
 /// No-op on x86-64: TSO + uncacheable MMIO already order prior MMIO reads
 /// before subsequent memory reads; no explicit fence required.
-// inline_always: a barrier is one fence (or nothing) that must sit inline at the
-// access it orders; an out-of-line call would cost more than the fence itself.
-#[allow(clippy::inline_always)]
 #[inline(always)]
 pub fn mmio_to_dma_barrier() {}
 
 /// No-op on x86-64: TSO orders prior loads before subsequent stores, MMIO
 /// stores included; no explicit fence required.
-// inline_always: a barrier is one fence (or nothing) that must sit inline at the
-// access it orders; an out-of-line call would cost more than the fence itself.
-#[allow(clippy::inline_always)]
 #[inline(always)]
 pub fn dma_read_to_mmio_barrier() {}

@@ -18,7 +18,11 @@
 //! [`GateError::UnknownLabel`] (mapped to the wire's `UNKNOWN_OPCODE`).
 
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
+              hand; a module that uses nothing from it leaves the import unused"
+)]
 use core::prelude::rust_2024::*;
 
 use core::num::NonZeroU32;

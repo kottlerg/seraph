@@ -24,9 +24,16 @@
 // `core::arch::asm!` and `core::sync::atomic` resolve. Mirror of the
 // libc / hermit-abi pattern. Normal userspace build path is unchanged.
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
-#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(
+    feature = "rustc-dep-of-std",
+    expect(
+        internal_features,
+        reason = "`no_core` is an internal feature, needed to build as a dependency of std"
+    )
+)]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
@@ -35,7 +42,11 @@ extern crate rustc_std_workspace_core as core;
 // operator traits, Copy/Clone, etc. resolve for the asm wrappers and
 // result types in this crate.
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
+              hand; a module that uses nothing from it leaves the import unused"
+)]
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{
@@ -277,10 +288,7 @@ pub fn raw_ipc_call_timeout(
     timeout_ms: u32,
 ) -> Result<(u64, usize), i64>
 {
-    // cast_possible_truncation: word count fits in 16 bits by invariant.
-    #[allow(clippy::cast_possible_truncation)]
     let data_count_u64 = data_count as u64;
-    #[allow(clippy::cast_possible_truncation)]
     let cap_count_u64 = cap_count as u64;
     let count_arg = syscall_abi::ipc_call_count_arg(data_count_u64, timeout_ms);
     // SAFETY: syscall6_ret3 issues the raw syscall; every argument is a scalar
@@ -298,9 +306,11 @@ pub fn raw_ipc_call_timeout(
     }
     else
     {
-        // cast_possible_truncation: Seraph targets 64-bit only (usize == u64);
-        // kernel clamps reply_word_count to MSG_DATA_WORDS_MAX = 64 before write.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Seraph targets 64-bit only (usize == u64); the kernel clamps \
+                      reply_word_count to MSG_DATA_WORDS_MAX = 64 before write"
+        )]
         let word_count = (reply_word_count as usize).min(MSG_DATA_WORDS_MAX);
         Ok((reply_label, word_count))
     }
@@ -353,9 +363,11 @@ pub fn raw_ipc_recv_timeout(ep: u64, timeout_ms: u64) -> Result<(u64, u64, usize
     }
     else
     {
-        // cast_possible_truncation: Seraph targets 64-bit only (usize == u64);
-        // kernel clamps word_count to MSG_DATA_WORDS_MAX = 64 before write.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Seraph targets 64-bit only (usize == u64); the kernel clamps word_count to \
+                      MSG_DATA_WORDS_MAX = 64 before write"
+        )]
         let word_count = (word_count as usize).min(MSG_DATA_WORDS_MAX);
         Ok((label, badge, word_count))
     }
@@ -385,10 +397,7 @@ pub fn raw_ipc_recv_timeout(ep: u64, timeout_ms: u64) -> Result<(u64, u64, usize
 #[inline]
 pub fn raw_ipc_reply(label: u64, data_count: usize, cap_count: usize) -> Result<(), i64>
 {
-    // cast_possible_truncation: Seraph targets 64-bit only (usize == u64).
-    #[allow(clippy::cast_possible_truncation)]
     let data_count_u64 = data_count as u64;
-    #[allow(clippy::cast_possible_truncation)]
     let cap_count_u64 = cap_count as u64;
     // SAFETY: syscall5 issues the raw syscall; every argument is a scalar the
     // kernel validates, and the two unused argument registers are zero. The
@@ -489,9 +498,11 @@ pub fn notification_try_wait(sig: u64) -> Result<u64, i64>
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
 /// structural ceiling). `QuotaExceeded` also means the Memory object's reference
 /// count is at its 2^31 ceiling.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn cap_create_endpoint(memory_cap: u64) -> Result<u64, i64>
 {
@@ -515,9 +526,11 @@ pub fn cap_create_endpoint(memory_cap: u64) -> Result<u64, i64>
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
 /// structural ceiling). `QuotaExceeded` also means the Memory object's reference
 /// count is at its 2^31 ceiling.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn cap_create_notification(memory_cap: u64) -> Result<u64, i64>
 {
@@ -558,9 +571,11 @@ pub fn cap_create_notification(memory_cap: u64) -> Result<u64, i64>
 /// caller's `CSpace` slot-page pool is exhausted; `QuotaExceeded` if the
 /// caller's `CSpace` directory is structurally full or `memory_cap`'s object has
 /// its reference count at its 2^31 ceiling.
-// cast_sign_loss: ret is 0 (augment mode) or a non-negative cap handle (the
-// kernel keeps bit 63 of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is 0 (augment mode) or a non-negative cap handle; the kernel keeps bit 63 of \
+              every handle clear (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn cap_create_aspace(memory_cap: u64, augment_target: u64, init_pages: u64)
 -> Result<u64, i64>
@@ -613,9 +628,11 @@ pub fn cap_create_aspace(memory_cap: u64, augment_target: u64, init_pages: u64)
 /// 2^31 ceiling. A later cap insert into the new `CSpace` fails with
 /// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via augment
 /// mode) and `QuotaExceeded` (-17) at the structural ceiling.
-// cast_sign_loss: ret is 0 (augment mode) or a non-negative cap handle (the
-// kernel keeps bit 63 of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is 0 (augment mode) or a non-negative cap handle; the kernel keeps bit 63 of \
+              every handle clear (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn cap_create_cspace(memory_cap: u64, augment_target: u64, init_pages: u64)
 -> Result<u64, i64>
@@ -679,9 +696,11 @@ pub fn raw_cap_create_cspace(
 /// caller's `CSpace` slot pool is exhausted), or `QuotaExceeded` (the `CSpace`
 /// directory is structurally full, or the Memory object's reference count is at
 /// its 2^31 ceiling).
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn cap_create_thread(
     memory_cap: u64,
@@ -914,9 +933,11 @@ pub unsafe fn mem_protect(
 /// `CSpace` pool cannot back the tail's slot or its body, which comes from
 /// the pool's body arena; `syscall_abi::cspace_topup_pages`), or
 /// `QuotaExceeded` (`CSpace` directory structurally full).
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn memory_split(memory_cap: u64, split_offset: u64) -> Result<u64, i64>
 {
@@ -991,9 +1012,11 @@ pub fn memory_merge(parent_cap: u64, tail_cap: u64) -> Result<(), i64>
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
 /// come from its body arena (`syscall_abi::cspace_topup_pages`;
 /// `QuotaExceeded` at the structural ceiling).
-// cast_sign_loss: both returned handles are non-negative (the kernel keeps
-// bit 63 of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "both returned handles are non-negative; the kernel keeps bit 63 of every handle \
+              clear (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn mmio_split(mmio_cap: u64, split_offset: u64) -> Result<(u64, u64), i64>
 {
@@ -1032,8 +1055,11 @@ pub fn mmio_split(mmio_cap: u64, split_offset: u64) -> Result<(u64, u64), i64>
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
 /// come from its body arena (`syscall_abi::cspace_topup_pages`;
 /// `QuotaExceeded` at the structural ceiling).
-// cast_sign_loss: identical to `mmio_split`.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "both returned handles are non-negative; the kernel keeps bit 63 of every handle \
+              clear (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn irq_split(irq_cap: u64, split_at: u32) -> Result<(u64, u64), i64>
 {
@@ -1082,8 +1108,11 @@ pub fn irq_split(irq_cap: u64, split_at: u32) -> Result<(u64, u64), i64>
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
 /// come from its body arena (`syscall_abi::cspace_topup_pages`;
 /// `QuotaExceeded` at the structural ceiling).
-// cast_sign_loss: identical to `mmio_split`.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "both returned handles are non-negative; the kernel keeps bit 63 of every handle \
+              clear (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn ioport_split(ioport_cap: u64, split_at: u16) -> Result<(u64, u64), i64>
 {
@@ -1122,8 +1151,11 @@ pub fn ioport_split(ioport_cap: u64, split_at: u16) -> Result<(u64, u64), i64>
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
 /// come from its body arena (`syscall_abi::cspace_topup_pages`;
 /// `QuotaExceeded` at the structural ceiling).
-// cast_sign_loss: identical to `mmio_split`.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "both returned handles are non-negative; the kernel keeps bit 63 of every handle \
+              clear (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn sched_split(sched_cap: u64, split_at: u8) -> Result<(u64, u64), i64>
 {
@@ -1321,9 +1353,11 @@ pub fn thread_start_suspended(thread_cap: u64) -> Result<(), i64>
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
 /// capability transfer is in flight on the source.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn cap_copy(src_slot: u64, dest_cspace_cap: u64, rights_mask: u64) -> Result<u64, i64>
 {
@@ -1355,9 +1389,11 @@ pub fn cap_copy(src_slot: u64, dest_cspace_cap: u64, rights_mask: u64) -> Result
 /// new slot was linked;
 /// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
 /// transfer is in flight on the source.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 pub fn cap_derive(src_slot: u64, rights_mask: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; src_slot is cap index as u64, rights_mask
@@ -1385,9 +1421,11 @@ pub fn cap_derive(src_slot: u64, rights_mask: u64) -> Result<u64, i64>
 /// revoke freed before the new slot was linked; `InvalidState` means a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
 /// source.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 pub fn cap_derive_badge(src_slot: u64, rights_mask: u64, badge: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; src_slot is cap index, rights_mask
@@ -1518,9 +1556,11 @@ pub fn cap_revoke_all(slot: u64) -> Result<(), i64>
 /// the kernel's batch backstop — the capability then lives in both slots,
 /// the destination a derived child of the source, and a `cap_revoke` on the
 /// source reclaims it.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 pub fn cap_move(src_cap: u64, dest_cspace_cap: u64, dest_index: u32) -> Result<u64, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
@@ -1565,9 +1605,11 @@ pub fn cap_move(src_cap: u64, dest_cspace_cap: u64, dest_index: u32) -> Result<u
 /// concurrent delete, move, or revoke freed before the copy was linked; `InvalidState` means a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
 /// source.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 pub fn cap_insert(
     src_slot: u64,
     dest_cspace_cap: u64,
@@ -1613,8 +1655,10 @@ pub fn cap_insert(
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `kind` is an unknown variant.
-// cast_sign_loss: ret is proven non-negative in the Ok branch.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is proven non-negative in the Ok branch"
+)]
 #[inline]
 pub fn system_info(kind: u64) -> Result<u64, i64>
 {
@@ -1633,8 +1677,10 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
 /// Returns a negative `i64` error code: `InvalidArgument` for an unknown class
 /// or from a kernel that predates the selector, and `NotSupported` for the
 /// handoff class when the kernel could not locate the handoff stack.
-// cast_sign_loss: a non-negative return is the queried value.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "a non-negative return is the queried value"
+)]
 #[inline]
 pub fn stack_high_water(class: u64) -> Result<u64, i64>
 {
@@ -1699,8 +1745,10 @@ pub fn user_va_top() -> Result<u64, i64>
 /// requires a different capability tag, or is `CAP_INFO_MEMORY_MAPPINGS`;
 /// `InsufficientRights` for `CAP_INFO_MEMORY_PHYS_BASE` on a cap without
 /// `RIGHTS_MEM_PHYS` (present a credential with [`cap_info_phys_base`]).
-// cast_sign_loss: ret is proven non-negative in the Ok branch.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is proven non-negative in the Ok branch"
+)]
 #[inline]
 pub fn cap_info(slot: u64, field: u64) -> Result<u64, i64>
 {
@@ -1724,8 +1772,10 @@ pub fn cap_info(slot: u64, field: u64) -> Result<u64, i64>
 /// The kernel's negative error code: `InsufficientRights` when neither cap
 /// carries `RIGHTS_MEM_PHYS`, `InvalidCapability` when `credential` is not a
 /// live Memory cap, `InvalidArgument` when `memory_cap` is not a Memory cap.
-// cast_sign_loss: ret is checked non-negative before the cast.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is checked non-negative before the cast"
+)]
 #[inline]
 pub fn cap_info_phys_base(memory_cap: u64, credential: u64) -> Result<u64, i64>
 {
@@ -1752,8 +1802,10 @@ pub fn cap_info_phys_base(memory_cap: u64, credential: u64) -> Result<u64, i64>
 /// `InvalidCapability` for a null or stale handle; `InvalidArgument` if the
 /// slot is not a Memory cap or the window is empty, too long, or runs past
 /// the region.
-// cast_sign_loss: ret is checked non-negative before the cast.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is checked non-negative before the cast"
+)]
 #[inline]
 pub fn cap_info_memory_mappings(memory_cap: u64, first_page: u64, pages: u64) -> Result<u64, i64>
 {
@@ -1784,8 +1836,10 @@ pub fn cap_info_memory_mappings(memory_cap: u64, first_page: u64, pages: u64) ->
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
 /// outside the user half, or not currently mapped), `InvalidCapability`, or
 /// `InsufficientRights` (cap lacks READ).
-// cast_sign_loss: ret is proven non-negative in the Ok branch.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is proven non-negative in the Ok branch"
+)]
 #[inline]
 pub fn aspace_query(aspace_cap: u64, virt: u64) -> Result<u64, i64>
 {
@@ -1812,9 +1866,6 @@ pub fn aspace_query(aspace_cap: u64, virt: u64) -> Result<u64, i64>
 /// of range, or the `CSpace`'s slot pool cannot back a fresh slot
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling). `QuotaExceeded`
 /// also means the Memory object's reference count is at its 2^31 ceiling.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
 #[inline]
 pub fn event_queue_create(memory_cap: u64, capacity: u32) -> Result<u64, i64>
 {
@@ -1833,9 +1884,11 @@ pub fn event_queue_create(memory_cap: u64, capacity: u32) -> Result<u64, i64>
 /// # Errors
 /// As [`event_queue_create`], and `InvalidArgument` if `observers` is out of
 /// range.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn event_queue_create_observed(
     memory_cap: u64,
@@ -2016,9 +2069,11 @@ pub fn event_recv_timeout(queue_cap: u64, timeout_ms: u64) -> Result<u64, i64>
 /// the `CSpace`'s slot pool cannot back a fresh slot
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling). `QuotaExceeded`
 /// also means the Memory object's reference count is at its 2^31 ceiling.
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn wait_set_create(memory_cap: u64, capacity: u32) -> Result<u64, i64>
 {
@@ -2189,9 +2244,11 @@ pub fn irq_ack(irq_cap: u64) -> Result<(), i64>
 /// `InsufficientRights` (`authority` lacks Mint), `QuotaExceeded` (no free
 /// target is left), or an error of the caller's `CSpace` (`OutOfMemory`, a
 /// full `CSpace`).
-// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
-// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
 #[inline]
 pub fn irq_msg_alloc(authority: u64) -> Result<u64, i64>
 {
@@ -2616,8 +2673,10 @@ pub fn thread_read_regs(thread_cap: u64, buf: &mut [u8]) -> Result<u64, i64>
 ///
 /// # Errors
 /// As [`thread_read_regs`].
-// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is proven non-negative in the Ok branch; it is a byte count"
+)]
 #[inline]
 pub unsafe fn thread_read_regs_raw(thread_cap: u64, buf: *mut u8, len: usize) -> Result<u64, i64>
 {
@@ -2738,8 +2797,10 @@ pub fn thread_read_mem(thread_cap: u64, va: u64, buf: &mut [u8]) -> Result<u64, 
 ///
 /// # Errors
 /// As [`thread_read_mem`].
-// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is proven non-negative in the Ok branch; it is a byte count"
+)]
 #[inline]
 pub unsafe fn thread_read_mem_raw(
     thread_cap: u64,
@@ -2878,8 +2939,10 @@ pub fn getrandom(buf: &mut [u8]) -> Result<u64, i64>
 /// MAX_GETRANDOM_LEN`, `InvalidAddress` if `buf` is null, the span is not
 /// wholly in the user half, or a fault on it is unhandled, or `WouldBlock` if
 /// the pool is not yet seeded (unreachable in practice).
-// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is proven non-negative in the Ok branch; it is a byte count"
+)]
 #[inline]
 pub unsafe fn getrandom_raw(buf: *mut u8, len: usize) -> Result<u64, i64>
 {

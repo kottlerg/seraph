@@ -20,6 +20,7 @@
 //! required — no prefix or glob matching.
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 extern crate alloc;
 
@@ -159,9 +160,11 @@ impl Registry
     /// Returns `Err(())` if the heap cannot grow the table, `name` is empty
     /// or exceeds [`NAME_MAX`], the cap is zero, or the name is already
     /// registered (at either visibility).
-    // A unit error: every rejection gets the same reply on the wire
-    // (`REGISTER_REJECTED`), so the cause carries no information.
-    #[allow(clippy::result_unit_err)]
+    #[expect(
+        clippy::result_unit_err,
+        reason = "a unit error: every rejection gets the same reply on the wire \
+                  (`REGISTER_REJECTED`), so the cause carries no information"
+    )]
     pub fn publish(&mut self, name: &[u8], cap: u64, visibility: Visibility) -> Result<(), ()>
     {
         if cap == 0 || name.is_empty() || name.len() > NAME_MAX

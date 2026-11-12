@@ -18,6 +18,7 @@
 //! `no_std`, no allocation, no dependencies; RV64GC encodings.
 
 #![no_std]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 /// `c.ebreak` (0x9002), little-endian: the breakpoint a debugger plants at the
 /// successor. Two bytes, so it never reaches past the successor's first
@@ -88,8 +89,10 @@ pub fn instruction_len(parcel: u16) -> Result<usize, StepError>
 ///   (`pc` itself, or `pc + 2` for a 4-byte instruction).
 pub fn successor(pc: u64, insn: u32, reg: impl Fn(u32) -> u64) -> Result<u64, StepError>
 {
-    // cast_possible_truncation: the low parcel, which instruction_len reads.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "truncating to the low parcel is intended; it is what instruction_len reads"
+    )]
     let parcel = insn as u16;
     let len = instruction_len(parcel)?;
     let next = if len == 2
@@ -174,9 +177,11 @@ fn full_successor(pc: u64, insn: u32, reg: &impl Fn(u32) -> u64) -> Result<u64, 
                 | (bits(insn, 11, 8) << 1)
                 | (bits(insn, 7, 7) << 11);
             let (a, b) = (read(reg, rs1), read(reg, rs2));
-            // cast_possible_wrap: the signed comparisons read the registers as
-            // two's-complement, as blt and bge do.
-            #[allow(clippy::cast_possible_wrap)]
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "the signed comparisons read the registers as two's-complement, as blt \
+                          and bge do"
+            )]
             let taken = match bits(insn, 14, 12)
             {
                 0 => a == b,

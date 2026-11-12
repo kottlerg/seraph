@@ -18,9 +18,11 @@
 //! caller-supplied reader.
 
 #![cfg_attr(not(test), no_std)]
-// cast_possible_truncation: this crate targets 64-bit only (x86-64, riscv64);
-// ELF64 u64 fields fit in usize on these platforms.
-#![allow(clippy::cast_possible_truncation)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "this crate targets 64-bit only (x86-64, riscv64), so ELF64 u64 fields fit in usize"
+)]
 
 use core::mem::size_of;
 
@@ -171,9 +173,6 @@ pub enum ElfError
 /// the image's bytes needs their alignment.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-// ELF field names follow the ELF spec (e_ident, e_type, …); removing the `e_`
-// prefix would diverge from all reference material.
-#[allow(clippy::struct_field_names)]
 pub struct Elf64Ehdr
 {
     /// Magic number and ELF identification fields.
@@ -212,8 +211,6 @@ pub struct Elf64Ehdr
 /// 64-bit ELF program header (`Elf64_Phdr`), decoded byte-wise.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-// ELF field names follow the ELF spec (p_type, p_flags, …).
-#[allow(clippy::struct_field_names)]
 pub struct Elf64Phdr
 {
     /// Segment type (e.g. `PT_LOAD`).
@@ -705,7 +702,10 @@ const NOTE_HEADER_BYTES: usize = 12;
 
 /// 64-bit ELF section header (`Elf64_Shdr`).
 #[repr(C)]
-#[allow(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "ELF field names follow the ELF spec (sh_name, sh_type, ...)"
+)]
 struct Elf64Shdr
 {
     sh_name: u32,

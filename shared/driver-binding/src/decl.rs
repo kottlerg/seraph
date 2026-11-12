@@ -147,9 +147,10 @@ impl<const N: usize> Text<N>
     }
 
     /// [`Self::copy`] in a constant.
-    // cast_possible_truncation: a checked text holds at most `N` bytes, and
-    // every `N` this crate uses fits a `u8`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a checked text holds at most N bytes, and every N this crate uses fits a u8"
+    )]
     const fn copy_const(bytes: &[u8]) -> Self
     {
         let mut out = [0u8; N];
@@ -874,8 +875,10 @@ impl Writer
 
     /// One field: kind, length, payload. Every payload the encoder writes is
     /// at most [`MAX_PLATFORM_KEY_BYTES`] long, so its length fits the byte.
-    // cast_possible_truncation: the length is checked to fit a byte first.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the length is checked to fit a byte first"
+    )]
     const fn field(&mut self, kind: u8, payload: &[u8])
     {
         assert!(

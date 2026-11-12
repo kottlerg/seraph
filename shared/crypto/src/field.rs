@@ -15,13 +15,11 @@
 //! pack run enough carry rounds to renormalise. All public-facing encodings
 //! (`pack`/`unpack`) are little-endian per RFC 8032 §5.1.2.
 
-// Field code casts between i64 and byte/limb widths after masking; the masks
-// bound every value, so truncation and sign-loss are intentional here.
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_sign_loss)]
-// many_single_char_names: limb/loop variables (a, b, c, t, i, j, …) follow the
-// reference field-arithmetic naming; descriptive names would only add noise.
-#![allow(clippy::many_single_char_names)]
+#![expect(
+    clippy::cast_sign_loss,
+    reason = "field code casts between i64 and byte/limb widths after masking; the masks bound \
+              every value, so sign loss is intentional"
+)]
 
 // Limb arithmetic uses wrapping operations: the radix-2^16 representation bounds every
 // intermediate inside i64, so wrapping and exact results agree.

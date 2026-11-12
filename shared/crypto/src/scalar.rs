@@ -10,9 +10,10 @@
 //! signature scalar S (RFC 8032 §5.1.7) and reduction of the 64-byte hash
 //! `SHA512(R‖A‖M)` to a scalar mod L. Both treat scalars as little-endian.
 
-// Reduction works in signed limbs and casts back to bytes after masking.
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_sign_loss)]
+#![expect(
+    clippy::cast_sign_loss,
+    reason = "reduction works in signed limbs and casts back to bytes after masking"
+)]
 
 /// L in little-endian bytes (32 bytes; the top limb is 0x10).
 pub(crate) const L: [u8; 32] = [

@@ -17,7 +17,11 @@
 // prelude is not auto-imported into submodules. Mirrors the
 // `shared/ipc/src/bootstrap.rs` shape; no-op on regular no_std builds.
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
+              hand; a module that uses nothing from it leaves the import unused"
+)]
 use core::prelude::rust_2024::*;
 
 use crate::rights::{NamespaceRights, RIGHTS_MASK};
@@ -122,8 +126,6 @@ pub const fn pack_open(open_id: u64, rights: NamespaceRights) -> Option<u64>
 pub(crate) const fn unpack(badge: u64) -> (NodeId, NamespaceRights)
 {
     let node = NodeId::from_raw_truncated(badge);
-    // Cast is range-safe: `RIGHTS_MASK` (24 bits) fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
     let rights_raw = ((badge >> NODE_ID_BITS) as u32) & RIGHTS_MASK;
     (node, NamespaceRights::from_raw(rights_raw))
 }

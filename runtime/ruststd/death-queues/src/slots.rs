@@ -20,7 +20,11 @@
 // crate root is `no_core` and the prelude reaches only the root module;
 // submodules import it themselves. Harmless no-op otherwise.
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
+              hand; a module that uses nothing from it leaves the import unused"
+)]
 use core::prelude::rust_2024::*;
 
 use alloc::vec::Vec;
@@ -37,8 +41,10 @@ pub const fn correlator(slot: u32, generation: u32) -> u64
 #[must_use]
 pub const fn split(correlator: u64) -> (u32, u32)
 {
-    // The high and low halves of a u64 each fit a u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the high and low halves of a u64 each fit a u32"
+    )]
     let parts = ((correlator >> 32) as u32, correlator as u32);
     parts
 }

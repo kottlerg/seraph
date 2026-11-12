@@ -677,8 +677,10 @@ mod reaper {
         while event_queue_retype_bytes(n + 2, n + 1) <= PAGE_SIZE {
             n += 1;
         }
-        // `n` is below the page size in nodes, so it fits a u32.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "`n` is below the page size in nodes, so it fits a u32"
+        )]
         let nodes = n as u32;
         nodes
     };

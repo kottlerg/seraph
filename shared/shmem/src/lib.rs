@@ -21,15 +21,26 @@
 // shared/syscall, shared/ipc, shared/log. Normal userspace builds (no
 // feature) retain `#![no_std]`.
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
-#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(
+    feature = "rustc-dep-of-std",
+    expect(
+        internal_features,
+        reason = "`no_core` is an internal feature, needed to build as a dependency of std"
+    )
+)]
 #![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
 
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "under rustc-dep-of-std the crate is no_core and this module imports the prelude by \
+              hand; a module that uses nothing from it leaves the import unused"
+)]
 use core::prelude::rust_2024::*;
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -173,10 +184,11 @@ impl SharedBuffer
 
     /// Total size in bytes.
     #[must_use]
-    // cast_possible_truncation: userspace targets 64-bit only, so `usize`
-    // holds every `u64` byte count, and `attach` checked the span fits the
-    // address space.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "userspace targets are 64-bit only, so usize holds every u64 byte count, and \
+                  `attach` checked the span fits the address space"
+    )]
     pub fn size(&self) -> usize
     {
         // `attach` checked that the span's byte count fits a `u64`.

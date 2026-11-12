@@ -281,9 +281,9 @@ impl Session
             posted: false,
             gone: !bound && !k.alive(cap),
         };
-        if free.is_some()
+        if let Some(entry) = self.threads.get_mut(index)
         {
-            let old = core::mem::replace(&mut self.threads[index], slot);
+            let old = core::mem::replace(entry, slot);
             k.delete(old.cap);
         }
         else
@@ -356,7 +356,7 @@ impl Session
     /// its thread is held.
     pub fn stop_all(&mut self, k: &mut impl Kernel)
     {
-        let deadline = k.now() + STOP_WAIT;
+        let deadline = k.now().saturating_add(STOP_WAIT);
         let mut refreshed = false;
         loop
         {
@@ -406,9 +406,9 @@ impl Session
         let holding: usize = self
             .threads
             .iter()
-            .map(|t| usize::from(t.held.is_some()) + t.beside.len())
+            .map(|t| usize::from(t.held.is_some()).saturating_add(t.beside.len()))
             .sum();
-        k.receivers((holding + 1).min(MAX_RECEIVERS));
+        k.receivers(holding.saturating_add(1).min(MAX_RECEIVERS));
         k.next_stop(until)
     }
 
@@ -437,7 +437,8 @@ impl Session
     /// or settle it ([`control::settle`]) and return `None`.
     fn hold(&mut self, k: &mut impl Kernel, stop: Stop) -> Option<usize>
     {
-        let Some(i) = control::thread_index(stop.badge).filter(|&i| i < self.threads.len())
+        let Some((i, cap, held)) = control::thread_index(stop.badge)
+            .and_then(|i| self.threads.get(i).map(|t| (i, t.cap, t.held)))
         else
         {
             k.reply(
@@ -446,7 +447,6 @@ impl Session
             );
             return None;
         };
-        let (cap, held) = (self.threads[i].cap, self.threads[i].held);
         if self.credit_to(k, i, stop)
         {
             return Some(i);
@@ -509,7 +509,14 @@ impl Session
             }
             Unclaimed::Keep =>
             {
-                self.threads[i].beside.push(stop);
+                if let Some(t) = self.threads.get_mut(i)
+                {
+                    t.beside.push(stop);
+                }
+                else
+                {
+                    k.reply(stop.receiver, decline(&stop));
+                }
                 None
             }
             Unclaimed::Decline =>
@@ -525,7 +532,11 @@ impl Session
     /// one and those kept beside it, for the caller to answer.
     fn replace_held(&mut self, i: usize, held: Held, stop: Stop) -> Vec<Stop>
     {
-        let t = &mut self.threads[i];
+        let Some(t) = self.threads.get_mut(i)
+        else
+        {
+            return Vec::from([held.stop, stop]);
+        };
         t.held = Some(Held {
             stop,
             reported: held.reported,
@@ -550,7 +561,11 @@ impl Session
         {
             return false;
         }
-        let t = &mut self.threads[index];
+        let Some(t) = self.threads.get_mut(index)
+        else
+        {
+            return false;
+        };
         t.held = Some(Held {
             stop,
             reported: false,
@@ -566,11 +581,15 @@ impl Session
     /// instruction again, and the thread stops anew under its own badge.
     fn restart(&mut self, k: &mut impl Kernel, index: usize, held: Stop, stop: Stop)
     {
-        let t = &mut self.threads[index];
-        t.held = None;
-        t.posted = false;
-        let cap = t.cap;
-        self.rewind_hit(k, cap, &[held, stop]);
+        let cap = self.threads.get_mut(index).map(|t| {
+            t.held = None;
+            t.posted = false;
+            t.cap
+        });
+        if let Some(cap) = cap
+        {
+            self.rewind_hit(k, cap, &[held, stop]);
+        }
         k.reply(held.receiver, syscall_abi::FAULT_REPLY_RESUME);
         k.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
     }
@@ -585,7 +604,7 @@ impl Session
     {
         for i in 0..self.threads.len()
         {
-            let Some(h) = self.threads[i].held
+            let Some(h) = self.threads.get(i).and_then(|t| t.held)
             else
             {
                 continue;
@@ -596,7 +615,11 @@ impl Session
             {
                 continue;
             }
-            let t = &mut self.threads[i];
+            let Some(t) = self.threads.get_mut(i)
+            else
+            {
+                continue;
+            };
             t.held = None;
             t.posted = false;
             let cap = t.cap;
@@ -609,9 +632,8 @@ impl Session
     /// does not report ([`Self::rewind_hit`]).
     fn cancel_hit(&mut self, k: &mut impl Kernel, index: usize)
     {
-        if let Some(h) = self.threads.get(index).and_then(|t| t.held)
+        if let Some((cap, h)) = self.threads.get(index).and_then(|t| Some((t.cap, t.held?)))
         {
-            let cap = self.threads[index].cap;
             self.rewind_hit(k, cap, &[h.stop]);
         }
     }
@@ -665,8 +687,12 @@ impl Session
         }
         let index = self.hold(k, stop)?;
         self.stop_all(k);
-        let held = |i: usize| self.threads.get(i)?.held.map(|h| (i, h.stop));
-        let Some((index, stop)) = held(index).or_else(|| (0..self.threads.len()).find_map(held))
+        let held = |i: usize| {
+            let t = self.threads.get(i)?;
+            Some((i, t.cap, t.held?.stop))
+        };
+        let Some((index, cap, stop)) =
+            held(index).or_else(|| (0..self.threads.len()).find_map(held))
         else
         {
             self.running = true;
@@ -675,7 +701,6 @@ impl Session
         // The stop reported is its thread's last: one the all-stop took
         // after a restart was set back as unreported, and GDB, told of it,
         // reads the pointer the stop carries.
-        let cap = self.threads[index].cap;
         if k.pc(cap).is_some_and(|pc| pc != stop.ip)
         {
             // A refusal means the thread exited after its stop, which GDB
@@ -896,10 +921,10 @@ impl Session
     /// breakpoints set back to it first, since its bytes are written back.
     fn drain(&mut self, k: &mut impl Kernel, taken: &[Breakpoint])
     {
-        let deadline = k.now() + DRAIN_WAIT;
+        let deadline = k.now().saturating_add(DRAIN_WAIT);
         loop
         {
-            let until = deadline.min(k.now() + DRAIN_QUIET);
+            let until = deadline.min(k.now().saturating_add(DRAIN_QUIET));
             let Some(stop) = self.next_stop(k, until)
             else
             {
@@ -964,9 +989,11 @@ impl Session
     #[must_use]
     pub fn live_ids(&self) -> Vec<u64>
     {
-        (0..self.threads.len())
-            .filter(|&i| self.threads[i].live())
-            .map(|i| i as u64 + 1)
+        self.threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.live())
+            .map(|(i, _)| (i as u64).saturating_add(1))
             .collect()
     }
 

@@ -40,7 +40,7 @@ impl Grant
     #[must_use]
     pub fn entries(&self) -> &[GrantEntry]
     {
-        &self.entries[..self.count]
+        self.entries.get(..self.count).unwrap_or(&self.entries)
     }
 }
 
@@ -211,7 +211,8 @@ impl FreePool
             arena.set_next(prev, idx);
         }
         self.free_pages = self.free_pages.saturating_add(run.page_count);
-        self.runs += 1;
+        // Each linked run holds its own slot, so the count stays below the slot count.
+        self.runs = self.runs.saturating_add(1);
     }
 
     /// Unlink the run at `c`, returning its slot to the caller (still holding
@@ -228,8 +229,9 @@ impl FreePool
         {
             arena.set_next(c.prev, next);
         }
-        self.free_pages -= run.page_count;
-        self.runs -= 1;
+        // `run_of` found a linked run, so both counters include it.
+        self.free_pages = self.free_pages.saturating_sub(run.page_count);
+        self.runs = self.runs.saturating_sub(1);
         Some(run)
     }
 
@@ -300,17 +302,18 @@ impl FreePool
         {
             return None;
         }
-        let offset = want_pages * PAGE_SIZE;
+        // `want_pages < run.page_count`, and the run's bytes are within physical address space.
+        let offset = want_pages.saturating_mul(PAGE_SIZE);
         let tail = split(run.cap_slot, offset)?;
         arena.set_node(
             c.cur,
             Node::Run(FreeRun {
                 cap_slot: tail,
-                page_count: run.page_count - want_pages,
-                phys_base: run.phys_base + offset,
+                page_count: run.page_count.saturating_sub(want_pages),
+                phys_base: run.phys_base.saturating_add(offset),
             }),
         );
-        self.free_pages -= want_pages;
+        self.free_pages = self.free_pages.saturating_sub(want_pages);
         Some((run.cap_slot, run.phys_base))
     }
 
@@ -346,7 +349,7 @@ impl FreePool
                 {
                     break;
                 }
-                run.page_count += tail.page_count;
+                run.page_count = run.page_count.saturating_add(tail.page_count);
                 arena.set(
                     cur,
                     crate::arena::Slot {
@@ -355,7 +358,8 @@ impl FreePool
                     },
                 );
                 arena.free(next);
-                self.runs -= 1;
+                // `tail` was a linked run, so `runs` is above zero.
+                self.runs = self.runs.saturating_sub(1);
             }
             cur = arena.get(cur).next;
         }
@@ -420,9 +424,16 @@ impl FreePool
             {
                 break;
             };
-            grant.entries[grant.count] = (cap, take, phys);
-            grant.count += 1;
-            remaining -= take;
+            // The loop condition keeps `grant.count` below `MAX_GRANT_RUNS`.
+            let Some(entry) = grant.entries.get_mut(grant.count)
+            else
+            {
+                break;
+            };
+            *entry = (cap, take, phys);
+            grant.count = grant.count.saturating_add(1);
+            // `take` is at most `remaining`.
+            remaining = remaining.saturating_sub(take);
         }
         if grant.count == 0
         {
@@ -466,7 +477,7 @@ impl FreePool
                     cur,
                     Node::Run(FreeRun {
                         cap_slot: run.cap_slot,
-                        page_count: run.page_count + r.page_count,
+                        page_count: run.page_count.saturating_add(r.page_count),
                         phys_base: run.phys_base,
                     }),
                 );

@@ -160,10 +160,12 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 }
 
 /// Boot the runs in waves of `--parallel`, after [`run`]'s staging.
-// too_many_lines: a linear dispatch-and-collect driver (wave loop, per-slot
-// thread spawn, join, summary). Splitting it would scatter the shared per-run
-// state across helpers without reducing complexity.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a linear dispatch-and-collect driver (wave loop, per-slot thread spawn, join, \
+              summary). Splitting it would scatter the shared per-run state across helpers without \
+              reducing complexity"
+)]
 fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 {
     let pass_re =
@@ -1134,9 +1136,11 @@ fn tail_text(body: &str, max_lines: usize, max_bytes: usize) -> String
     tail
 }
 
-// cast_precision_loss: micros→seconds for human-readable display only; run
-// elapsed times are far below f64's exact-integer range.
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "micros→seconds for human-readable display only; run elapsed times are far below \
+              f64's exact-integer range"
+)]
 fn us_to_s(us: u128) -> f64
 {
     us as f64 / 1_000_000.0

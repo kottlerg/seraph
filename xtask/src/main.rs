@@ -18,10 +18,13 @@
 //! 3. Add a match arm in `main` below.
 //! 4. Re-export the module in `commands/mod.rs`.
 
-// multiple_crate_versions: duplicate transitive versions (bitflags, hashbrown,
-// windows-sys, wit-bindgen) come from third-party host deps (clap, gpt, fatfs,
-// libc, which); not resolvable without upstream releases.
-#![allow(clippy::multiple_crate_versions)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![expect(
+    clippy::multiple_crate_versions,
+    reason = "duplicate transitive versions (bitflags, hashbrown, windows-sys, wit-bindgen) come \
+              from third-party host deps (clap, gpt, fatfs, libc, which); not resolvable without \
+              upstream releases"
+)]
 
 use clap::Parser;
 

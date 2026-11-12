@@ -74,8 +74,10 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
 
     cap_delete(sig).ok();
 
-    // cast_possible_truncation: n is capped at 100; fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "n is capped at 100; fits in u32"
+    )]
     let actual_n = n as u32;
     log_bench_header("wait_set_cycle", actual_n);
     // A loop that broke early is averaged over the iterations it completed,

@@ -99,8 +99,10 @@ pub fn carve_port_range(port: u16, count: u16) -> Option<u64>
 
     if port_start > base
     {
-        // port_start <= 0xFFFF because the caller supplied a u16; safe cast.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "port_start <= 0xFFFF because the caller supplied a u16; safe cast"
+        )]
         let (prefix, rest) = syscall::ioport_split(slot, port_start as u16).ok()?;
         // ktest itself never drives the prefix range [base, port_start),
         // but the carved-off prefix cap is left alive in the cspace so
@@ -125,9 +127,11 @@ pub fn carve_port_range(port: u16, count: u16) -> Option<u64>
 
     if port_end < end
     {
-        // port_end < end <= 0x10000 and we took this branch because
-        // port_end != end, so port_end <= 0xFFFF; safe cast.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "port_end < end <= 0x10000 and we took this branch because port_end != end, \
+                      so port_end <= 0xFFFF; safe cast"
+        )]
         let (target, residual) = syscall::ioport_split(slot, port_end as u16).ok()?;
         // SAFETY: ktest is single-threaded.
         unsafe {
@@ -164,13 +168,15 @@ fn find_root(info: &InitInfo) -> Option<(u64, u32, u32)>
             // (`core/kernel/src/cap/mod.rs`); the aux1 == 0 branch is
             // defensive against a future change that adopts the in-object
             // `IoPortObject.size == 0` encoding at this surface.
-            // cast_possible_truncation: aux0 of an IoPort descriptor is a port
-            // base, at most 0xFFFF.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "aux0 of an IoPort descriptor is a port base, at most 0xFFFF"
+            )]
             let base_u32 = d.aux0 as u32;
-            // cast_possible_truncation: aux1 of an IoPort descriptor is a port
-            // count, at most 0x10000.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "aux1 of an IoPort descriptor is a port count, at most 0x10000"
+            )]
             let size_u32 = if d.aux1 == 0 { 0x10000 } else { d.aux1 as u32 };
             // At most 0xFFFF + 0x10000: the sum fits a `u32`.
             return Some((d.slot, base_u32, base_u32.saturating_add(size_u32)));

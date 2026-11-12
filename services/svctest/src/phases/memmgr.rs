@@ -162,9 +162,10 @@ pub fn churn_phase(_: &Caps)
         let mut v: Vec<u8> = Vec::with_capacity(capacity);
         for b in 0..size
         {
-            // cast_possible_truncation: the mask keeps the low byte, so the
-            // cast to u8 drops nothing.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the mask keeps the low byte, so the cast to u8 drops nothing"
+            )]
             v.push((b & 0xFF) as u8);
         }
         assert_eq!(v.len(), size, "push count mismatch at iter {i}");
@@ -181,9 +182,11 @@ pub fn churn_phase(_: &Caps)
     std::os::seraph::log!("churn phase passed ({ITERS} iters)");
 }
 
-// cast_possible_truncation: every cast to u8 in the phase takes an index
-// masked to its low byte or a counter below 8, so none drops a bit.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "every cast to u8 in the phase takes an index masked to its low byte or a counter \
+              below 8, so none drops a bit"
+)]
 pub fn alloc_grow_phase(_: &Caps)
 {
     const BIG: usize = 600 * 1024;

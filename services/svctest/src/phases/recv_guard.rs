@@ -25,9 +25,11 @@ pub fn phases() -> &'static [Phase]
 /// fixture's `RecvGuard` must escalate to a loud `EXIT_RECV_WEDGE` death
 /// instead of spinning silently. A failed reserve check panics the fixture,
 /// whose fault exit code fails the assertion below.
-// cast_sign_loss: ExitStatus::code() returns i32; exit_reason is always
-// non-negative (voluntary codes < 0x1000). Casting to u64 is safe.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ExitStatus::code() returns i32; exit_reason is always non-negative (voluntary codes \
+              < 0x1000). Casting to u64 is safe"
+)]
 fn recv_wedge_phase(_: &Caps)
 {
     use std::process::Command;

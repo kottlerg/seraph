@@ -24,11 +24,15 @@
 
 #![feature(alloc_error_hook)]
 #![feature(thread_local)]
-// svctest is an integration test harness: a standalone binary that
-// panics on failure so faults surface in the log. `expect`/`unwrap` are
-// the intended idiom here (coding-standards §D permits them in test
-// code and §E permits narrowly-justified blanket allows).
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "svctest is a test harness whose phases report a defect by panicking, which the \
+              panic hook turns into the run's fail marker, as a failed host test does; the build \
+              lints the harness without the test configuration's relaxation of these lints, and \
+              every phase relies on it, so the suppression is crate-wide"
+)]
 
 mod bootstrap;
 mod ipc_util;

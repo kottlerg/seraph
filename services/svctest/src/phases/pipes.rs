@@ -29,9 +29,10 @@ pub fn phases() -> &'static [Phase]
 /// before it fails.
 const TRY_WAIT_POLLS: u32 = 5000;
 
-// too_many_lines: the phase is a sequence of independent numbered scenarios
-// sharing one log narrative.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the phase is a sequence of independent numbered scenarios sharing one log narrative"
+)]
 pub fn pipes_phase(_: &Caps)
 {
     use std::io::{Read, Write};
@@ -177,9 +178,10 @@ pub fn pipes_phase(_: &Caps)
     std::os::seraph::log!("pipes phase passed");
 }
 
-// cast_sign_loss: ExitStatus::code() returns i32; exit_reason is always
-// non-negative in practice.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ExitStatus::code() returns i32; exit_reason is always non-negative in practice"
+)]
 pub fn pipe_fault_eof_phase(_: &Caps)
 {
     use std::io::Read;

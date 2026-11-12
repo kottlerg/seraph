@@ -66,8 +66,7 @@ impl BadTally
     /// Record a bad syscall `error`.
     pub fn record_error(&self, error: i64)
     {
-        // cast_sign_loss: the raw error word is only logged.
-        #[allow(clippy::cast_sign_loss)]
+        #[expect(clippy::cast_sign_loss, reason = "the raw error word is only logged")]
         self.record(error as u64);
     }
 
@@ -106,8 +105,7 @@ pub fn log_cell_u64(cell: &str, suffix: &str, value: u64)
 /// Log a syscall error word after `label`.
 pub fn log_error(label: &str, error: i64)
 {
-    // cast_sign_loss: the raw error word is only logged.
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss, reason = "the raw error word is only logged")]
     crate::log_u64(label, error as u64);
 }
 

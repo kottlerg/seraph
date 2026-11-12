@@ -331,10 +331,14 @@ emulation) stops when the driver reports ready.
 
 A device's message-signalled interrupt is a write to an interrupt address. On x86-64 VT-d does not
 translate a write to the interrupt range through a domain's tables (interrupt remapping governs
-it), so `iommu-vtd` refuses `MAP_MSI`. On riscv64 the write goes to a hart's IMSIC interrupt file
-and the RISC-V IOMMU translates it as any other DMA, so a confined device reaches only the files
-its domain maps: `MAP_MSI` maps one file's page at its own address, with no cap, for the domain's
-life, as `MAP_RESERVED` does a reserved range. devmgr maps the file of each hart a device's
+it), so `iommu-vtd` refuses `MAP_MSI`. `iommu-vtd` owns the interrupt remapping table its units
+share and programs it through `REMAP_SETUP`, `REMAP_SET` and `REMAP_CLEAR`, which `iommu-riscv`
+refuses; devmgr does not call them yet, so interrupt remapping stays off
+([#325](https://github.com/kottlerg/seraph/issues/325)). On riscv64 the write goes to a hart's
+IMSIC interrupt file and the RISC-V IOMMU translates it as any other DMA, so a confined device
+reaches only the files its domain maps: `MAP_MSI` maps one file's page at its own address, with
+no cap, for the domain's life, as `MAP_RESERVED` does a reserved range. devmgr maps the file of
+each hart a device's
 message-signalled targets sit on before it enables the device's MSI or MSI-X, and keeps the file's
 page out of the IOVAs it gives the device's mappings (§ Message-Signaled Interrupts). Why the RISC-V
 IOMMU's MSI page tables stay off is specified in
@@ -354,7 +358,7 @@ call to the dead driver. devmgr then logs once, refuses every later `DMA_MAP` of
 device, answers any of its own calls still queued on the dead driver's endpoint with an error, and
 withdraws the driver of every confined device; it restarts nothing, restartability being
 [#262](https://github.com/kottlerg/seraph/issues/262). Invalidation is synchronous, through VT-d's
-invalidation registers and through the RISC-V IOMMU's command queue, each polled to completion,
+invalidation queue and through the RISC-V IOMMU's command queue, each polled to completion,
 two IPC hops per mapping; batching it is
 [#772](https://github.com/kottlerg/seraph/issues/772). Faults are polled, not signalled, because
 no IOMMU driver programs a message-signaled interrupt for fault events

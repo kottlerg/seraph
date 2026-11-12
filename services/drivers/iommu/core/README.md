@@ -28,10 +28,17 @@ its `Backend`: VT-d's is [`iommu-vtd`](../vtd/README.md) and the RISC-V IOMMU's 
   family's backend, under a bound of its own; VT-d's backend refuses it. A function attached twice
   keeps its first domain; domain ID 0 is never given. A unit whose backend times out is treated as
   failed and refuses every later request.
+- **Interrupt remapping.** `REMAP_SETUP` sets up one remapping table for every unit, of a power of
+  two of entries up to `MAX_REMAP_ENTRIES`, once (0 entries turns it off again), and replies whether
+  its destinations are 32-bit; `REMAP_SET` and `REMAP_CLEAR` name an entry below the table's size,
+  and a set's destination, vector (16 and above), trigger, and source ID are checked within their
+  widths before the backend runs. The RISC-V IOMMU's backend refuses the setup, its MSIs being
+  reached through `MAP_MSI`. A remapping command that times out fails the remapping, and every
+  later remapping request is refused.
 - **Faults.** A thread of the driver's own polls the units' fault records every `FAULT_POLL_MS`
   into a bounded queue, and `TAKE_FAULTS` polls once more and hands devmgr the oldest, each with
   the unit's reason code in 16 bits (VT-d's 8-bit fault reason, the RISC-V IOMMU's 12-bit
-  `CAUSE`).
+  `CAUSE`) and the faulting address, or the handle a blocked remapped interrupt named.
 - **Table pages.** Every family's tables are 4 KiB pages of 64-bit words a unit reads by physical
   address. The family's walks run over a `TableStore`: the driver's is `iommu-store`, the host
   tests' a heap store.
@@ -61,7 +68,8 @@ iommu/core/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── lib.rs           # Crate root: the Backend trait, its errors, Access, a unit's limits
+    ├── lib.rs           # Crate root: the Backend trait, its errors, Access, a unit's limits,
+    │                    #   a remapping entry
     ├── bootstrap.rs     # Unit and endpoint rounds, scope words, the unit lookup
     ├── faults.rs        # The bounded queue of polled faults
     ├── service.rs       # iommu_labels handling, domain records, the receive and poll loops
@@ -75,7 +83,7 @@ iommu/core/
 | Document | Content |
 |---|---|
 | [docs/device-management.md](../../../../docs/device-management.md) | DMA safety model, DMA authorisation, IOMMU discovery and programming |
-| [docs/limits.md](../../../../docs/limits.md) | The units, scopes, domains, ranges, and fault-queue bounds |
+| [docs/limits.md](../../../../docs/limits.md) | The units, scopes, domains, ranges, remapping-table, and fault-queue bounds |
 
 ---
 

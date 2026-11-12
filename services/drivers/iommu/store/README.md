@@ -10,13 +10,17 @@ driver's `iommu_core::TableStore`, used by [`iommu-vtd`](../vtd/README.md) and
   addresses: the IOMMU driver is the one driver class that reads them. devmgr spawns it
   phys-class, so its grants carry the Memory `Phys` right the read needs
   ([docs/device-management.md](../../../../docs/device-management.md#physical-addresses)
-  § Physical Addresses).
+  § Physical Addresses). A structure a unit reads whole from its first page's address (VT-d's
+  interrupt remapping table) takes a contiguous chunk of its own size (`Store::alloc_contiguous`),
+  every page of it handed out at once, so the chunk single pages are drawn from stays the current
+  one.
 - **Ordering.** A zeroed page is fenced before it is handed out, and every table store before the
   next one, so a unit never sees an entry before the table it points at. The driver's register
   write that makes a unit read them supplies the memory-to-device barrier (`mmio` on riscv64; the
   fence before each VT-d register write on x86-64).
-- **Device-written pages.** A page the unit itself writes (the RISC-V IOMMU's fault queue) is read
-  only through a raw pointer (`Store::page_ptr`), never through a reference.
+- **Device-written pages.** A page the unit itself writes (the RISC-V IOMMU's fault queue, the
+  VT-d invalidation wait's status word) is read only through a raw pointer (`Store::page_ptr`),
+  never through a reference.
 - **Caches.** A driver whose units read memory past the processor caches gives the store a
   write-back function (`Flush::Writeback`; VT-d's `CLFLUSH` for a unit with `ECAP.C` clear), which
   every zeroed page and table store is written back with; for coherent units

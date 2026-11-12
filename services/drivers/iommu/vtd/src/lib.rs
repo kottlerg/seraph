@@ -7,12 +7,16 @@
 //!
 //! The driver binary owns the remapping units' registers and the IPC loop
 //! devmgr drives. This library holds the pure encodings those paths write:
-//! the register offsets and fields ([`regs`]) and the root, context, and
+//! the register offsets and fields ([`regs`]), the root, context, and
 //! second-level translation structures ([`tables`]), with the page-table walk
-//! running over a caller-supplied page store so the host tests exercise it.
+//! running over a caller-supplied page store so the host tests exercise it,
+//! the queued-invalidation descriptors ([`queue`]), and the interrupt
+//! remapping table's entries ([`remap`]).
 //! See `docs/device-management.md` § IOMMU Discovery and Programming.
 
 extern crate alloc;
 
+pub mod queue;
 pub mod regs;
+pub mod remap;
 pub mod tables;

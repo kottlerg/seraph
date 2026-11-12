@@ -3,36 +3,43 @@
 
 // services/drivers/iommu/vtd/src/backend.rs
 
-//! The VT-d [`Backend`]: each unit's registers, root table, and context
-//! tables, and each attached function's second-level page tables.
+//! The VT-d [`Backend`]: each unit's registers, invalidation queue, root
+//! table, and context tables, each attached function's second-level page
+//! tables, and the one interrupt remapping table every unit shares.
 //!
-//! Units run in legacy translation mode with register-based invalidation
-//! (queued invalidation stays off), each command polled to completion within
-//! [`INVALIDATION_TIMEOUT`] before the request it serves is answered. Fault
-//! events stay masked; the fault recording registers are polled.
+//! Units run in legacy translation mode with queued invalidation: every
+//! invalidation is a batch of descriptors ended by a wait descriptor whose
+//! status write is polled within [`INVALIDATION_TIMEOUT`] before the request
+//! it serves is answered. Fault events stay masked; the fault recording
+//! registers are polled.
 
 use std::sync::atomic::{Ordering, fence};
 use std::time::{Duration, Instant};
 
-use iommu_core::{Access, Backend, BackendError, Fault, UnitInfo};
+use iommu_core::{Access, Backend, BackendError, Fault, RemapEntry, UnitInfo};
+use iommu_vtd::queue::{self, Descriptor, QUEUE_ENTRIES};
 use iommu_vtd::regs::{self, Capability};
+use iommu_vtd::remap;
 use iommu_vtd::tables::{
     SL_READ, SL_WRITE, SecondLevel, TableError, TableStore, context_entry, context_index,
     root_entry,
 };
 
 use iommu_store::Store;
+use syscall_abi::PAGE_SIZE;
 
-/// How long a unit may take to complete one command (a root-pointer set,
-/// a translation enable or disable, a write-buffer flush, or a context-cache
-/// or IOTLB invalidation) before the driver treats the unit as failed. A
-/// register-based command completes in microseconds on hardware and at once
-/// under QEMU; the bound is a hang guard, not a tuning value.
-/// `docs/limits.md` classifies it.
+/// How long a unit may take to complete one command (a root-pointer or
+/// remapping-table-pointer set, a translation, queued-invalidation, or
+/// interrupt-remapping enable or disable, a write-buffer flush, or one batch
+/// of queued invalidations) before the driver treats the unit as failed. A
+/// command completes in microseconds on hardware and at once under QEMU; the
+/// bound is a hang guard, not a tuning value. `docs/limits.md` classifies
+/// it.
 pub const INVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// One remapping unit: its mapped registers, decoded capabilities, root
-/// table, and the context table of each bus that has an attached function.
+/// One remapping unit: its mapped registers, decoded capabilities,
+/// invalidation queue, root table, and the context table of each bus that
+/// has an attached function.
 pub struct Unit
 {
     /// Virtual address of the unit's register set.
@@ -40,8 +47,17 @@ pub struct Unit
     /// Bytes of the register set mapped from `regs`.
     regs_len: u64,
     cap: Capability,
-    /// Byte offset of the IOTLB invalidation register.
-    iotlb: usize,
+    /// The extended capability register's value.
+    ecap: u64,
+    /// Physical address of the invalidation queue's page.
+    queue: u64,
+    /// The queue slot the next descriptor goes to.
+    tail: usize,
+    /// Physical address of the page whose first word each batch's wait
+    /// descriptor writes.
+    status: u64,
+    /// The status data the last batch's wait descriptor wrote.
+    token: u32,
     /// Second-level table depth the unit's domains get.
     levels: u32,
     /// IOVA width the unit's domains translate, in bits.
@@ -62,7 +78,11 @@ impl Unit
             regs,
             regs_len,
             cap: Capability::decode(0),
-            iotlb: 0,
+            ecap: 0,
+            queue: 0,
+            tail: 0,
+            status: 0,
+            token: 0,
             levels: 0,
             width_bits: 0,
             root: 0,
@@ -179,28 +199,55 @@ impl Unit
         self.wait(|u| u.read32(regs::GSTS) & regs::G_WBF == 0)
     }
 
-    /// Invalidate the whole context cache.
-    fn invalidate_context(&self) -> Result<(), BackendError>
-    {
-        self.write64(regs::CCMD, regs::ccmd_global());
-        self.wait(|u| u.read64(regs::CCMD) & regs::CCMD_ICC == 0)
-    }
-
-    /// Invalidate the IOTLB with `command` (`iotlb_global`, `iotlb_domain`).
-    fn invalidate_iotlb(&self, command: u64) -> Result<(), BackendError>
-    {
-        self.write64(self.iotlb, command);
-        self.wait(|u| u.read64(u.iotlb) & regs::IOTLB_IVT == 0)
-    }
-
-    /// Clear every fault recording register and the overflow flag.
+    /// Clear every fault recording register, the overflow flag, and an
+    /// invalidation queue error.
     fn clear_faults(&self)
     {
         for i in 0..self.cap.fault_count
         {
             self.write64(self.cap.fault_offset + i * 16 + 8, regs::FAULT_CLEAR);
         }
-        self.write32(regs::FSTS, regs::FSTS_PFO);
+        self.write32(regs::FSTS, regs::FSTS_PFO | regs::FSTS_IQE);
+    }
+
+    /// Turn off every persistent state a previous owner (firmware, or an
+    /// earlier run of the driver) may have left on: translation, interrupt
+    /// remapping, then queued invalidation, which turning the first two off
+    /// does not need.
+    fn reset_states(&self) -> Result<(), BackendError>
+    {
+        for bit in [regs::G_TE, regs::G_IRE, regs::G_QIE]
+        {
+            if self.read32(regs::GSTS) & bit != 0
+            {
+                self.disable(bit)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The interrupt remapping table every unit points at.
+#[derive(Clone, Copy)]
+struct RemapTable
+{
+    /// Physical address of its first page.
+    base: u64,
+    /// 32-bit destinations (extended interrupt mode).
+    extended: bool,
+}
+
+impl RemapTable
+{
+    /// The table page holding entry `handle`, and the word index of the
+    /// entry's low word in that page.
+    // cast_possible_truncation: the word index within a page is below 512.
+    #[allow(clippy::cast_possible_truncation)]
+    fn slot(self, handle: u16) -> (u64, usize)
+    {
+        let offset = u64::from(handle) * remap::ENTRY_BYTES;
+        let page = offset - offset % PAGE_SIZE;
+        (self.base + page, ((offset - page) / 8) as usize)
     }
 }
 
@@ -215,11 +262,13 @@ pub struct VtdDomain
     tables: SecondLevel,
 }
 
-/// Every unit the driver serves and the store of their table pages.
+/// Every unit the driver serves, the store of their table pages, and the
+/// interrupt remapping table while remapping is on.
 pub struct Vtd
 {
     units: Vec<Unit>,
     store: Store,
+    remap: Option<RemapTable>,
 }
 
 impl Vtd
@@ -227,7 +276,98 @@ impl Vtd
     /// A backend over `units`, building its tables in `store`.
     pub fn new(units: Vec<Unit>, store: Store) -> Self
     {
-        Self { units, store }
+        Self {
+            units,
+            store,
+            remap: None,
+        }
+    }
+
+    /// Place `descriptors` in unit `unit`'s invalidation queue, followed by
+    /// a wait descriptor, and poll the wait's status write. A queue error (a
+    /// descriptor the unit refused) is cleared and reported as the unit
+    /// failing, as a wait that never completes is.
+    fn submit(&mut self, unit: usize, descriptors: &[Descriptor]) -> Result<(), BackendError>
+    {
+        let u = &self.units[unit];
+        let (queue, status) = (u.queue, u.status);
+        let token = match u.token.wrapping_add(1)
+        {
+            0 => 1,
+            t => t,
+        };
+        let mut tail = u.tail;
+        for &d in descriptors.iter().chain(&[queue::wait(status, token)])
+        {
+            self.write_entry(queue, tail * 2, d);
+            tail = (tail + 1) % QUEUE_ENTRIES;
+        }
+        let status_word = self
+            .store
+            .page_ptr(status)
+            .ok_or(BackendError::Invalid)?
+            .cast::<u32>();
+        let u = &mut self.units[unit];
+        u.tail = tail;
+        u.token = token;
+        u.write64(regs::IQT, queue::tail(tail));
+        // SAFETY: `status_word` is the first word of a page of the store,
+        // mapped for the driver's life and reached only through raw volatile
+        // accesses, since the unit writes it.
+        let written = || unsafe { core::ptr::read_volatile(status_word) } == token;
+        u.wait(|u| written() || u.read32(regs::FSTS) & regs::FSTS_IQE != 0)?;
+        if written()
+        {
+            return Ok(());
+        }
+        u.write32(regs::FSTS, regs::FSTS_IQE);
+        Err(BackendError::Timeout)
+    }
+
+    /// Clear a two-word entry of the table page `table` at word `index`, the
+    /// low word (which holds the present bit) first, and flush it. The
+    /// stores are volatile, so they reach memory in that order.
+    fn clear_entry(&mut self, table: u64, index: usize)
+    {
+        let t = self.store.table(table);
+        // SAFETY: both words lie in the table page `t` borrows exclusively.
+        unsafe {
+            core::ptr::write_volatile(&raw mut t[index], 0);
+            core::ptr::write_volatile(&raw mut t[index + 1], 0);
+        }
+        self.store.flush(table, (index * 8) as u64, 16);
+    }
+
+    /// Invalidate every unit's cached copy of remapping entry `handle`.
+    fn invalidate_remap_entry(&mut self, handle: u16) -> Result<(), BackendError>
+    {
+        for unit in 0..self.units.len()
+        {
+            self.submit(unit, &[queue::iec_index(handle)])?;
+        }
+        Ok(())
+    }
+
+    /// Point unit `unit` at the remapping table `table` of `entries`
+    /// entries, invalidate its interrupt entry cache, and turn remapping on
+    /// with compatibility-format interrupts blocked.
+    fn remap_unit(
+        &mut self,
+        unit: usize,
+        table: RemapTable,
+        entries: u32,
+    ) -> Result<(), BackendError>
+    {
+        let u = &self.units[unit];
+        u.write64(regs::IRTA, remap::irta(table.base, entries, table.extended));
+        let gsts = u.read32(regs::GSTS);
+        u.write32(regs::GCMD, regs::gcmd_set(gsts, regs::G_SIRTP));
+        u.wait(|u| u.read32(regs::GSTS) & regs::G_SIRTP != 0)?;
+        self.submit(unit, &[queue::iec_global()])?;
+        let u = &self.units[unit];
+        let gsts = u.read32(regs::GSTS);
+        u.write32(regs::GCMD, regs::gcmd_remap_on(gsts));
+        u.wait(|u| u.read32(regs::GSTS) & (regs::G_IRE | regs::G_CFI) == regs::G_IRE)
     }
 
     /// Write a two-word entry of the table page `table` at word `index`, the
@@ -247,50 +387,46 @@ impl Vtd
 
     /// Make the unit see a changed context entry: flush its write buffer,
     /// then invalidate the context cache and the IOTLB of domain `did`.
-    fn context_changed(&self, unit: usize, did: u16) -> Result<(), BackendError>
+    fn context_changed(&mut self, unit: usize, did: u16) -> Result<(), BackendError>
     {
-        let u = &self.units[unit];
-        u.flush_write_buffer()?;
-        u.invalidate_context()?;
-        u.invalidate_iotlb(regs::iotlb_domain(did))
+        self.units[unit].flush_write_buffer()?;
+        self.submit(unit, &[queue::context_global(), queue::iotlb_domain(did)])
     }
 
-    /// Set unit `unit` up empty, then turn translation on.
+    /// Set unit `unit` up empty, with queued invalidation on, then turn
+    /// translation on. A unit without queued invalidation is refused: the
+    /// driver invalidates no other way.
     fn setup(&mut self, unit: usize) -> Result<(), BackendError>
     {
         let u = &mut self.units[unit];
         u.cap = Capability::decode(u.read64(regs::CAP));
-        let ecap = u.read64(regs::ECAP);
-        u.iotlb = regs::iotlb_offset(ecap);
+        u.ecap = u.read64(regs::ECAP);
         let (levels, bits) = u.cap.table_depth().ok_or(BackendError::Invalid)?;
         u.levels = levels;
         u.width_bits = bits.min(u.cap.mgaw);
         let last_fault = u.cap.fault_offset + u.cap.fault_count * 16;
-        if u.checked(u.iotlb, 8).is_none() || u.checked(last_fault - 8, 8).is_none()
+        if u.ecap & regs::ECAP_QI == 0
+            || u.checked(regs::IRTA, 8).is_none()
+            || u.checked(last_fault - 8, 8).is_none()
         {
             return Err(BackendError::Invalid);
         }
-        // Firmware may leave translation or queued invalidation on; both are
-        // turned off before the root pointer changes.
-        let gsts = u.read32(regs::GSTS);
-        if gsts & regs::G_TE != 0
-        {
-            u.disable(regs::G_TE)?;
-        }
-        if gsts & regs::G_QIE != 0
-        {
-            u.disable(regs::G_QIE)?;
-        }
+        u.reset_states()?;
         u.write32(regs::FECTL, regs::FECTL_IM);
         u.clear_faults();
+        let queue = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
+        let status = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
         let root = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
         let u = &mut self.units[unit];
-        u.root = root;
+        (u.queue, u.status, u.tail, u.token, u.root) = (queue, status, 0, 0, root);
+        u.write64(regs::IQT, queue::tail(0));
+        u.write64(regs::IQA, queue::iqa(queue));
+        u.enable(regs::G_QIE)?;
         u.write64(regs::RTADDR, root);
         u.set_root()?;
         u.flush_write_buffer()?;
-        u.invalidate_context()?;
-        u.invalidate_iotlb(regs::iotlb_global())?;
+        self.submit(unit, &[queue::context_global(), queue::iotlb_global()])?;
+        let u = &mut self.units[unit];
         u.enable(regs::G_TE)?;
         u.enabled = true;
         Ok(())
@@ -318,6 +454,7 @@ impl Backend for Vtd
 
     fn disable_all(&mut self)
     {
+        self.remap_disable();
         for u in &mut self.units
         {
             if u.enabled && u.disable(regs::G_TE).is_ok()
@@ -377,14 +514,15 @@ impl Backend for Vtd
         // domain's IOTLB invalidated.
         if mapped.is_err() || u.cap.caching_mode
         {
-            u.invalidate_iotlb(regs::iotlb_domain(domain.did))?;
+            self.submit(domain.unit, &[queue::iotlb_domain(domain.did)])?;
         }
         mapped.map_err(table_error)
     }
 
     /// Refused: a write to the interrupt address range (`0xFEEx_xxxx`) is
     /// an interrupt request, which VT-d does not translate through a
-    /// domain's second-level tables (interrupt remapping governs it).
+    /// domain's second-level tables (interrupt remapping governs it,
+    /// [`Self::remap_set`]).
     fn map_msi(&mut self, _domain: &mut VtdDomain, _file: u64) -> Result<(), BackendError>
     {
         Err(BackendError::Invalid)
@@ -396,23 +534,14 @@ impl Backend for Vtd
             .tables
             .unmap(&mut self.store, iova, len)
             .map_err(table_error)?;
-        let u = &self.units[domain.unit];
-        u.flush_write_buffer()?;
-        u.invalidate_iotlb(regs::iotlb_domain(domain.did))
+        self.units[domain.unit].flush_write_buffer()?;
+        self.submit(domain.unit, &[queue::iotlb_domain(domain.did)])
     }
 
     fn block(&mut self, domain: &mut VtdDomain) -> Result<(), BackendError>
     {
         let context = self.units[domain.unit].context[domain.bus];
-        // The low word, which holds the present bit, is cleared first; the
-        // stores are volatile, so they reach memory in that order.
-        let t = self.store.table(context);
-        // SAFETY: both words lie in the table page `t` borrows exclusively.
-        unsafe {
-            core::ptr::write_volatile(&raw mut t[domain.entry], 0);
-            core::ptr::write_volatile(&raw mut t[domain.entry + 1], 0);
-        }
-        self.store.flush(context, (domain.entry * 8) as u64, 16);
+        self.clear_entry(context, domain.entry);
         self.context_changed(domain.unit, domain.did)
     }
 
@@ -459,5 +588,66 @@ impl Backend for Vtd
                 u.write32(regs::FSTS, regs::FSTS_PFO);
             }
         }
+    }
+
+    fn remap_enable(&mut self, entries: u32, extended: bool) -> Result<bool, BackendError>
+    {
+        if self.remap.is_some() || self.units.iter().any(|u| u.ecap & regs::ECAP_IR == 0)
+        {
+            return Err(BackendError::Invalid);
+        }
+        let table = RemapTable {
+            base: self
+                .store
+                .alloc_contiguous(remap::table_pages(entries))
+                .ok_or(BackendError::OutOfMemory)?,
+            extended: extended && self.units.iter().all(|u| u.ecap & regs::ECAP_EIM != 0),
+        };
+        for unit in 0..self.units.len()
+        {
+            if let Err(e) = self.remap_unit(unit, table, entries)
+            {
+                self.remap_disable();
+                return Err(e);
+            }
+        }
+        self.remap = Some(table);
+        Ok(table.extended)
+    }
+
+    fn remap_disable(&mut self)
+    {
+        for u in &self.units
+        {
+            if u.read32(regs::GSTS) & regs::G_IRE != 0
+            {
+                let _ = u.disable(regs::G_IRE);
+            }
+        }
+        self.remap = None;
+    }
+
+    /// A present entry is made not present, and every unit's cached copy
+    /// invalidated, before its new contents are written, so no unit reads
+    /// an entry whose two words disagree.
+    fn remap_set(&mut self, handle: u16, entry: RemapEntry) -> Result<(), BackendError>
+    {
+        let table = self.remap.ok_or(BackendError::Invalid)?;
+        let (page, index) = table.slot(handle);
+        if self.store.table(page)[index] & remap::IRTE_PRESENT != 0
+        {
+            self.clear_entry(page, index);
+            self.invalidate_remap_entry(handle)?;
+        }
+        self.write_entry(page, index, remap::entry(entry, table.extended));
+        self.invalidate_remap_entry(handle)
+    }
+
+    fn remap_clear(&mut self, handle: u16) -> Result<(), BackendError>
+    {
+        let table = self.remap.ok_or(BackendError::Invalid)?;
+        let (page, index) = table.slot(handle);
+        self.clear_entry(page, index);
+        self.invalidate_remap_entry(handle)
     }
 }

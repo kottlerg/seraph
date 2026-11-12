@@ -4,7 +4,7 @@
 // services/devmgr/firmware/src/acpi.rs
 
 //! Narrow ACPI walk: RSDP → XSDT → MCFG, FADT (`PM1a_CNT_BLK`, `CENTURY`),
-//! and MADT (its Interrupt Source Overrides).
+//! and MADT (its Interrupt Source Overrides and I/O APICs).
 //!
 //! Operates on byte-slice views of ACPI tables — the caller is responsible
 //! for mapping the tables into its address space first, and
@@ -50,6 +50,11 @@ const SDT_OFF_OEM_TABLE_ID: usize = 16;
 /// the header, the local interrupt controller address (u32) and the flags
 /// (u32).
 const MADT_ENTRIES_OFF: usize = SDT_HDR_LEN + 8;
+/// MADT structure type of an I/O APIC (section 5.2.12.3).
+const MADT_TYPE_IO_APIC: u8 = 1;
+/// Length of an I/O APIC structure: type, length, I/O APIC ID, reserved (u8
+/// each), address (u32), GSI base (u32).
+const MADT_IO_APIC_LEN: usize = 12;
 /// MADT structure type of an Interrupt Source Override (section 5.2.12.5).
 const MADT_TYPE_SOURCE_OVERRIDE: u8 = 2;
 /// Length of an Interrupt Source Override: type, length, bus, source (u8
@@ -316,17 +321,15 @@ pub struct SourceOverride
     pub flags: u16,
 }
 
-/// Iterate the MADT's Interrupt Source Overrides.
+/// The MADT's interrupt-controller structures, each as its type, its offset,
+/// and its length.
 ///
 /// Returns `None` if the signature isn't `APIC` or the header's length is
 /// unreadable or does not reach the first structure. The structures are
 /// bounded by the table's reported length and the slice; the walk ends at a
 /// structure whose length is under 2 or runs past that bound, so a truncated
-/// or malformed table yields the overrides before the bad structure. A source
-/// override shorter than its 10 bytes is skipped.
-#[must_use]
-pub fn madt_source_overrides(madt_bytes: &[u8])
--> Option<impl Iterator<Item = SourceOverride> + '_>
+/// or malformed table yields the structures before the bad one.
+fn madt_structures(madt_bytes: &[u8]) -> Option<impl Iterator<Item = (u8, usize, usize)> + '_>
 {
     if sdt_signature(madt_bytes) != *b"APIC"
     {
@@ -339,31 +342,86 @@ pub fn madt_source_overrides(madt_bytes: &[u8])
     }
     let mut off = MADT_ENTRIES_OFF;
     Some(core::iter::from_fn(move || {
-        while off + 2 <= end
+        if off + 2 > end
         {
-            let kind = read_u8(madt_bytes, off);
-            let len = usize::from(read_u8(madt_bytes, off + 1));
-            if len < 2 || off + len > end
-            {
-                off = end;
-                return None;
-            }
-            let at = off;
-            off += len;
-            if kind == MADT_TYPE_SOURCE_OVERRIDE && len >= MADT_SOURCE_OVERRIDE_LEN
-            {
-                return Some(SourceOverride {
-                    source: read_u8(madt_bytes, at + 3),
-                    gsi: read_u32(madt_bytes, at + 4),
-                    flags: u16::from_le_bytes([
-                        read_u8(madt_bytes, at + 8),
-                        read_u8(madt_bytes, at + 9),
-                    ]),
-                });
-            }
+            return None;
         }
-        None
+        let kind = read_u8(madt_bytes, off);
+        let len = usize::from(read_u8(madt_bytes, off + 1));
+        if len < 2 || off + len > end
+        {
+            off = end;
+            return None;
+        }
+        let at = off;
+        off += len;
+        Some((kind, at, len))
     }))
+}
+
+/// Iterate the MADT's Interrupt Source Overrides.
+///
+/// Returns `None` for a table that is not a MADT, and ends at a malformed
+/// structure, as `madt_structures` does. A source override shorter than its
+/// 10 bytes is skipped.
+#[must_use]
+pub fn madt_source_overrides(madt_bytes: &[u8])
+-> Option<impl Iterator<Item = SourceOverride> + '_>
+{
+    Some(
+        madt_structures(madt_bytes)?
+            .filter(|&(kind, _, len)| {
+                kind == MADT_TYPE_SOURCE_OVERRIDE && len >= MADT_SOURCE_OVERRIDE_LEN
+            })
+            .map(|(_, at, _)| SourceOverride {
+                source: read_u8(madt_bytes, at + 3),
+                gsi: read_u32(madt_bytes, at + 4),
+                flags: u16::from_le_bytes([
+                    read_u8(madt_bytes, at + 8),
+                    read_u8(madt_bytes, at + 9),
+                ]),
+            }),
+    )
+}
+
+/// One MADT I/O APIC structure (ACPI 6.x section 5.2.12.3): the I/O APIC
+/// with ID `id` delivers the GSIs from `gsi_base` on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoApic
+{
+    pub id: u8,
+    pub gsi_base: u32,
+}
+
+/// Iterate the MADT's I/O APICs.
+///
+/// Returns `None` for a table that is not a MADT, and ends at a malformed
+/// structure, as `madt_structures` does. An I/O APIC structure shorter than
+/// its 12 bytes is skipped.
+#[must_use]
+pub fn madt_io_apics(madt_bytes: &[u8]) -> Option<impl Iterator<Item = IoApic> + '_>
+{
+    Some(
+        madt_structures(madt_bytes)?
+            .filter(|&(kind, _, len)| kind == MADT_TYPE_IO_APIC && len >= MADT_IO_APIC_LEN)
+            .map(|(_, at, _)| IoApic {
+                id: read_u8(madt_bytes, at + 2),
+                gsi_base: read_u32(madt_bytes, at + 8),
+            }),
+    )
+}
+
+/// The I/O APIC of `io_apics` that delivers `gsi`: the one with the highest
+/// GSI base at or below it, since each I/O APIC delivers a contiguous run of
+/// GSIs from its base, and the runs do not overlap. `None` when every base
+/// lies above `gsi`.
+#[must_use]
+pub fn io_apic_for(io_apics: impl IntoIterator<Item = IoApic>, gsi: u32) -> Option<IoApic>
+{
+    io_apics
+        .into_iter()
+        .filter(|a| a.gsi_base <= gsi)
+        .max_by_key(|a| a.gsi_base)
 }
 
 /// Whether the MADT's structures run, each of length 2 or more, exactly to the
@@ -914,6 +972,59 @@ mod tests
                 },
             ]
         );
+    }
+
+    /// An I/O APIC structure (type 1, 12 bytes) for `id` at `gsi_base`.
+    fn io_apic(id: u8, gsi_base: u32) -> [u8; MADT_IO_APIC_LEN]
+    {
+        let mut s = [0u8; MADT_IO_APIC_LEN];
+        s[0] = MADT_TYPE_IO_APIC;
+        s[1] = MADT_IO_APIC_LEN as u8;
+        s[2] = id;
+        s[4..8].copy_from_slice(&0xfec0_0000u32.to_le_bytes());
+        s[8..12].copy_from_slice(&gsi_base.to_le_bytes());
+        s
+    }
+
+    #[test]
+    fn madt_io_apics_are_read_past_other_structures_and_a_short_one_skipped()
+    {
+        let short = [MADT_TYPE_IO_APIC, 8, 9, 0, 0, 0, 0, 0];
+        let iso = source_override(0, 2, 0);
+        let table = madt(&[&LOCAL_APIC, &io_apic(0, 0), &iso, &short, &io_apic(2, 24)]);
+        let found: Vec<_> = madt_io_apics(&table).expect("MADT").collect();
+        assert_eq!(
+            found,
+            [
+                IoApic { id: 0, gsi_base: 0 },
+                IoApic {
+                    id: 2,
+                    gsi_base: 24
+                }
+            ]
+        );
+        assert!(madt_io_apics(&sdt(b"FACP", 64)).is_none());
+    }
+
+    #[test]
+    fn a_gsi_belongs_to_the_io_apic_with_the_highest_base_at_or_below_it()
+    {
+        let apics = [
+            IoApic {
+                id: 2,
+                gsi_base: 24,
+            },
+            IoApic { id: 0, gsi_base: 0 },
+        ];
+        assert_eq!(io_apic_for(apics, 0).map(|a| a.id), Some(0));
+        assert_eq!(io_apic_for(apics, 23).map(|a| a.id), Some(0));
+        assert_eq!(io_apic_for(apics, 24).map(|a| a.id), Some(2));
+        assert_eq!(io_apic_for(apics, 100).map(|a| a.id), Some(2));
+        let high = [IoApic {
+            id: 1,
+            gsi_base: 16,
+        }];
+        assert_eq!(io_apic_for(high, 4), None);
     }
 
     #[test]

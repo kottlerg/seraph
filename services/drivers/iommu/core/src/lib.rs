@@ -29,7 +29,7 @@ pub mod table;
 
 pub use bootstrap::{Bootstrap, Registers, Scope, Units};
 pub use faults::{Fault, FaultQueue};
-pub use service::{CapOps, KernelCaps, Lock, MemoryCap, Service};
+pub use service::{CapOps, KernelCaps, Lock, MAX_REMAP_ENTRIES, MemoryCap, Service};
 pub use table::TableStore;
 
 /// Why a [`Backend`] operation failed.
@@ -66,6 +66,22 @@ pub struct UnitInfo
     pub domain_ids: u32,
 }
 
+/// What one interrupt remapping entry delivers ([`Backend::remap_set`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemapEntry
+{
+    /// The destination CPU's interrupt controller ID: 32-bit when the
+    /// remapping was set up with extended destinations, else 8-bit.
+    pub destination: u32,
+    /// The vector the destination CPU takes.
+    pub vector: u8,
+    /// Level-triggered; edge-triggered when false.
+    pub level: bool,
+    /// The source ID (bus, device, function) of the only requester the
+    /// entry accepts.
+    pub source_id: u16,
+}
+
 /// The family-specific half of an IOMMU driver: the registers and the
 /// translation structures of its units.
 ///
@@ -73,7 +89,9 @@ pub struct UnitInfo
 /// index names a unit the bootstrap delivered, a domain is one this backend
 /// attached and has not blocked, and a range or an interrupt file's page is
 /// page-aligned, nonempty, within the unit's width, and clear of every other
-/// range of the domain.
+/// range of the domain, and a remapping entry's handle lies below the
+/// table's entries, its destination within the width the setup gave, and its
+/// vector at 16 or above.
 /// Every method that changes what a device reaches returns only once the
 /// hardware has done it, the invalidation it needs included.
 pub trait Backend
@@ -148,4 +166,40 @@ pub trait Backend
     /// Read and clear the faults every unit has recorded since the last
     /// call, passing each to `record`.
     fn poll_faults(&mut self, record: &mut dyn FnMut(Fault));
+
+    /// Point every unit at one interrupt remapping table of `entries`
+    /// entries ([`service::MAX_REMAP_ENTRIES`] at most, a power of two),
+    /// none present, and turn interrupt remapping on with interrupts in the
+    /// compatibility format blocked: from the return on, an interrupt
+    /// message reaches a CPU only through an entry [`Self::remap_set`]
+    /// made. `extended` asks for 32-bit destinations; the return says
+    /// whether every unit gave them.
+    ///
+    /// # Errors
+    /// [`BackendError::Invalid`] from a family that does not remap
+    /// interrupts, or when a unit offers no interrupt remapping;
+    /// [`BackendError::OutOfMemory`] when no table can be had;
+    /// [`BackendError::Timeout`] when a unit does not complete a command.
+    /// Interrupt remapping is off on every unit after an error.
+    fn remap_enable(&mut self, entries: u32, extended: bool) -> Result<bool, BackendError>;
+
+    /// Turn interrupt remapping off on every unit [`Self::remap_enable`]
+    /// turned it on for.
+    fn remap_disable(&mut self);
+
+    /// Make entry `handle` of the remapping table deliver as `entry` says,
+    /// replacing what it held.
+    ///
+    /// # Errors
+    /// [`BackendError::Timeout`] when a unit does not complete the
+    /// invalidation of its cached copy; [`BackendError::Invalid`] from a
+    /// family that does not remap interrupts.
+    fn remap_set(&mut self, handle: u16, entry: RemapEntry) -> Result<(), BackendError>;
+
+    /// Make entry `handle` of the remapping table not present: an interrupt
+    /// naming it is blocked and faulted from the return on.
+    ///
+    /// # Errors
+    /// As [`Self::remap_set`].
+    fn remap_clear(&mut self, handle: u16) -> Result<(), BackendError>;
 }

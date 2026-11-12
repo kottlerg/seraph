@@ -146,6 +146,18 @@ fn test_device_args() -> Vec<String>
 /// could confine it by; at 00:01.0 every other function lies above it.
 const RISCV_IOMMU_DEVICE: &str = "riscv-iommu-pci,off=off,addr=0x01";
 
+/// The VT-d IOMMU of an x86-64 launch that attaches one: DMA remapping, and
+/// interrupt remapping (`intremap=on`) with 32-bit destinations offered
+/// (`eim=on`), so devmgr turns interrupt remapping on and every message and
+/// wired line reaches a CPU through a remapping entry.
+const X86_IOMMU_DEVICE: &str = "intel-iommu,intremap=on,eim=on";
+
+/// The q35 machine of a KVM launch with the IOMMU attached: interrupt
+/// remapping needs the I/O APIC emulated by QEMU (`kernel-irqchip=split`),
+/// which QEMU refuses `intremap=on` without. Under TCG and the other
+/// accelerators QEMU emulates it in any case.
+const X86_MACHINE_SPLIT_IRQCHIP: &str = "q35,kernel-irqchip=split";
+
 /// Whether a QEMU launch attaches the machine's IOMMU (`--iommu`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Iommu
@@ -561,14 +573,24 @@ fn extend_x86(
 {
     check_x86_paging(spec.x86_paging, accel, host_has_la57)?;
     let la57 = spec.x86_paging.cpu_la57_prop();
-    args.extend(["-machine".into(), "q35".into()]);
-
-    // VT-d DMA remapping. Interrupt remapping stays off: it needs
-    // `kernel-irqchip=split` under KVM, which QEMU otherwise refuses, and
-    // message-signaled interrupts, which the system does not use yet.
-    if spec.iommu == Iommu::Attached
+    let iommu = spec.iommu == Iommu::Attached;
+    // VT-d interrupt remapping needs the I/O APIC emulated outside KVM,
+    // which QEMU otherwise refuses.
+    let machine = if iommu && accel == Accel::Kvm
     {
-        args.extend(["-device".into(), "intel-iommu,intremap=off".into()]);
+        X86_MACHINE_SPLIT_IRQCHIP
+    }
+    else
+    {
+        "q35"
+    };
+    args.extend(["-machine".into(), machine.into()]);
+
+    // VT-d DMA and interrupt remapping, with 32-bit (x2APIC) destinations
+    // offered.
+    if iommu
+    {
+        args.extend(["-device".into(), X86_IOMMU_DEVICE.into()]);
     }
     // The test devices: QEMU's `edu` device, whose DMA engine svctest's DMA
     // confinement phase drives through the test-only `test-dma` driver,
@@ -1118,6 +1140,39 @@ mod tests
     }
 
     #[test]
+    fn a_kvm_launch_with_the_iommu_splits_the_irqchip_and_no_other_does()
+    {
+        let machine = |argv: &[String]| -> String {
+            let at = argv.iter().position(|a| a == "-machine").unwrap();
+            argv[at + 1].clone()
+        };
+        for accel in [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg]
+        {
+            for iommu in [Iommu::Attached, Iommu::Absent]
+            {
+                let mut spec = x86_spec(X86Paging::Four);
+                spec.iommu = iommu;
+                let mut argv = Vec::new();
+                extend_x86(&mut argv, &spec, accel, true).unwrap();
+                let split = accel == Accel::Kvm && iommu == Iommu::Attached;
+                let expected = if split
+                {
+                    X86_MACHINE_SPLIT_IRQCHIP
+                }
+                else
+                {
+                    "q35"
+                };
+                assert_eq!(machine(&argv), expected, "{accel:?} {iommu:?}");
+                assert_eq!(
+                    devices(&argv).contains(&X86_IOMMU_DEVICE),
+                    iommu == Iommu::Attached
+                );
+            }
+        }
+    }
+
+    #[test]
     fn x86_cpu_pins_la57_to_the_requested_depth_on_every_accelerator()
     {
         // A missing pin would let TCG's `-cpu max` (or an LA57 host under
@@ -1305,7 +1360,7 @@ mod tests
         };
         for (mut spec, iommu_device) in [
             (riscv_spec(4, 512), RISCV_IOMMU_DEVICE),
-            (x86_spec(X86Paging::Four), "intel-iommu,intremap=off"),
+            (x86_spec(X86Paging::Four), X86_IOMMU_DEVICE),
         ]
         {
             spec.second_disk = Some(SecondDisk {

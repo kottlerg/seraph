@@ -18,7 +18,10 @@
 //! interrupt file's page `MAP_MSI` installs at its own, carry no cap and stand
 //! until the domain's `BLOCK`. A unit whose backend reports
 //! a timeout is treated as failed: every later request on it is refused with
-//! `HARDWARE_TIMEOUT`.
+//! `HARDWARE_TIMEOUT`. Interrupt remapping (`REMAP_SETUP`, `REMAP_SET`,
+//! `REMAP_CLEAR`) spans every unit: the service checks each entry's handle,
+//! destination, vector, and source ID against the table it set up, and a
+//! timeout fails the remapping as a whole.
 //!
 //! [`serve`] receives on the service endpoint for the rest of the driver's
 //! life and [`poll_faults`] polls the units' fault records on a thread of the
@@ -41,7 +44,7 @@ use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP, RIGHTS_MEM_WRITE};
 
 use crate::bootstrap::Units;
 use crate::faults::{Fault, FaultQueue};
-use crate::{Access, Backend, BackendError};
+use crate::{Access, Backend, BackendError, RemapEntry};
 
 /// Domains one driver holds at once, over all its units: one per PCI
 /// function devmgr attaches, which it does once per function per boot.
@@ -61,6 +64,14 @@ pub const MAX_MSI_FILES_PER_DOMAIN: usize = 64;
 /// faults faster than this drains them overflows its few records, and the
 /// unit then drops faults until the next poll.
 pub const FAULT_POLL_MS: u64 = 100;
+/// Entries one interrupt remapping table holds at most
+/// (`iommu_labels::MAX_REMAP_ENTRIES`).
+// cast_possible_truncation: the label's bound is 2^16, which fits.
+#[allow(clippy::cast_possible_truncation)]
+pub const MAX_REMAP_ENTRIES: u32 = iommu_labels::MAX_REMAP_ENTRIES as u32;
+/// The lowest vector a remapping entry may deliver: vectors below 16 are
+/// reserved for exceptions on x86-64 and invalid for a fixed interrupt.
+const MIN_REMAP_VECTOR: u64 = 16;
 
 /// A Memory cap's frames and rights, as the kernel reports them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,8 +223,17 @@ struct DomainRecord<D>
     ranges: Vec<Range>,
 }
 
+/// The interrupt remapping table `REMAP_SETUP` set up.
+#[derive(Clone, Copy)]
+struct Remap
+{
+    entries: u32,
+    /// 32-bit destinations; 8-bit when false.
+    extended: bool,
+}
+
 /// The driver's state: its backend, its units' scopes, every attached
-/// domain, and the faults polled and not yet taken.
+/// domain, the interrupt remapping, and the faults polled and not yet taken.
 pub struct Service<B: Backend, C: CapOps>
 {
     backend: B,
@@ -222,6 +242,10 @@ pub struct Service<B: Backend, C: CapOps>
     failed: Vec<bool>,
     domains: Vec<DomainRecord<B::Domain>>,
     next_handle: u64,
+    remap: Option<Remap>,
+    /// A unit timed out on a remapping command: every later remapping
+    /// request is refused with `HARDWARE_TIMEOUT`.
+    remap_failed: bool,
     faults: FaultQueue,
 }
 
@@ -253,6 +277,8 @@ impl<B: Backend, C: CapOps> Service<B, C>
             failed,
             domains: Vec::new(),
             next_handle: 1,
+            remap: None,
+            remap_failed: false,
             faults: FaultQueue::new()?,
         })
     }
@@ -367,6 +393,27 @@ impl<B: Backend, C: CapOps> Service<B, C>
                 None => iommu_errors::INVALID_REQUEST,
             },
             iommu_labels::TAKE_FAULTS => return self.take_faults(),
+            iommu_labels::REMAP_SETUP => match self.remap_setup(msg.word(1), msg.word(2))
+            {
+                Ok(extended) =>
+                {
+                    return IpcMessage::builder(iommu_errors::SUCCESS)
+                        .word(0, u64::from(extended))
+                        .build();
+                }
+                Err(code) => code,
+            },
+            iommu_labels::REMAP_SET =>
+            {
+                let w = |i| msg.word(i);
+                self.remap_set(w(1), [w(2), w(3), w(4), w(5)])
+                    .err()
+                    .unwrap_or(iommu_errors::SUCCESS)
+            }
+            iommu_labels::REMAP_CLEAR => self
+                .remap_clear(msg.word(1))
+                .err()
+                .unwrap_or(iommu_errors::SUCCESS),
             _ => iommu_errors::UNKNOWN_OPCODE,
         };
         IpcMessage::new(code)
@@ -638,6 +685,107 @@ impl<B: Backend, C: CapOps> Service<B, C>
         (unit < self.units.0.len()).then(|| self.backend.query(unit).width_bits)
     }
 
+    /// The `iommu_errors` code for a backend failure of a remapping command,
+    /// failing the remapping on a timeout.
+    fn remap_failure(&mut self, e: BackendError) -> u64
+    {
+        if e == BackendError::Timeout
+        {
+            self.remap_failed = true;
+        }
+        backend_code(e)
+    }
+
+    /// Set up interrupt remapping with a table of `entries` entries, or turn
+    /// it off for 0 (`REMAP_SETUP`); whether its destinations are 32-bit.
+    fn remap_setup(&mut self, entries: u64, extended: u64) -> Result<bool, u64>
+    {
+        let invalid = iommu_errors::INVALID_REQUEST;
+        if extended > 1
+        {
+            return Err(invalid);
+        }
+        if entries == 0
+        {
+            self.backend.remap_disable();
+            self.remap = None;
+            return Ok(false);
+        }
+        let entries = u32::try_from(entries).map_err(|_| invalid)?;
+        if self.remap.is_some()
+            || !entries.is_power_of_two()
+            || !(2..=MAX_REMAP_ENTRIES).contains(&entries)
+        {
+            return Err(invalid);
+        }
+        if self.remap_failed
+        {
+            return Err(iommu_errors::HARDWARE_TIMEOUT);
+        }
+        let extended = self
+            .backend
+            .remap_enable(entries, extended == 1)
+            .map_err(|e| self.remap_failure(e))?;
+        self.remap = Some(Remap { entries, extended });
+        Ok(extended)
+    }
+
+    /// The handle `word` names in the remapping set up, once it is checked
+    /// below the table's entries and the remapping has not failed.
+    fn remap_handle(&self, word: u64) -> Result<(u16, Remap), u64>
+    {
+        let invalid = iommu_errors::INVALID_REQUEST;
+        let remap = self.remap.ok_or(invalid)?;
+        if word >= u64::from(remap.entries)
+        {
+            return Err(invalid);
+        }
+        if self.remap_failed
+        {
+            return Err(iommu_errors::HARDWARE_TIMEOUT);
+        }
+        Ok((u16::try_from(word).map_err(|_| invalid)?, remap))
+    }
+
+    /// Make entry `handle` deliver as `[destination, vector, level, source
+    /// ID]` says (`REMAP_SET`), once each field is checked within its bound.
+    fn remap_set(&mut self, handle: u64, fields: [u64; 4]) -> Result<(), u64>
+    {
+        let invalid = iommu_errors::INVALID_REQUEST;
+        let (handle, remap) = self.remap_handle(handle)?;
+        let [destination, vector, level, source_id] = fields;
+        let widest = if remap.extended
+        {
+            u64::from(u32::MAX)
+        }
+        else
+        {
+            u64::from(u8::MAX)
+        };
+        if destination > widest || !(MIN_REMAP_VECTOR..=255).contains(&vector) || level > 1
+        {
+            return Err(invalid);
+        }
+        let entry = RemapEntry {
+            destination: u32::try_from(destination).map_err(|_| invalid)?,
+            vector: u8::try_from(vector).map_err(|_| invalid)?,
+            level: level == 1,
+            source_id: u16::try_from(source_id).map_err(|_| invalid)?,
+        };
+        self.backend
+            .remap_set(handle, entry)
+            .map_err(|e| self.remap_failure(e))
+    }
+
+    /// Make entry `handle` not present (`REMAP_CLEAR`).
+    fn remap_clear(&mut self, handle: u64) -> Result<(), u64>
+    {
+        let (handle, _) = self.remap_handle(handle)?;
+        self.backend
+            .remap_clear(handle)
+            .map_err(|e| self.remap_failure(e))
+    }
+
     /// Poll the units, so the reply holds every fault recorded so far, and
     /// take the oldest queued faults into the reply.
     fn take_faults(&mut self) -> IpcMessage
@@ -744,6 +892,17 @@ mod tests
         attached: Vec<(usize, u16, u32)>,
         blocked: Vec<u32>,
         pending: Vec<Fault>,
+        /// Refuse interrupt remapping, as a family that does not remap
+        /// interrupts does.
+        no_remap: bool,
+        /// Every unit offers 32-bit destinations.
+        offers_extended: bool,
+        /// The remapping table's entries while remapping is on.
+        remapping: Option<u32>,
+        /// Every remapping entry set, in order.
+        set: Vec<(u16, RemapEntry)>,
+        /// Every remapping entry cleared, in order.
+        cleared: Vec<u16>,
     }
 
     struct FakeDomain
@@ -847,6 +1006,36 @@ mod tests
             {
                 record(f);
             }
+        }
+
+        fn remap_enable(&mut self, entries: u32, extended: bool) -> Result<bool, BackendError>
+        {
+            self.fail()?;
+            if self.no_remap
+            {
+                return Err(BackendError::Invalid);
+            }
+            self.remapping = Some(entries);
+            Ok(extended && self.offers_extended)
+        }
+
+        fn remap_disable(&mut self)
+        {
+            self.remapping = None;
+        }
+
+        fn remap_set(&mut self, handle: u16, entry: RemapEntry) -> Result<(), BackendError>
+        {
+            self.fail()?;
+            self.set.push((handle, entry));
+            Ok(())
+        }
+
+        fn remap_clear(&mut self, handle: u16) -> Result<(), BackendError>
+        {
+            self.fail()?;
+            self.cleared.push(handle);
+            Ok(())
         }
     }
 
@@ -1435,6 +1624,161 @@ mod tests
         }
         let next = 0x10_0000 + MAX_RANGES_PER_DOMAIN as u64 * 0x2000;
         assert_eq!(map(&mut s, d, next, RW, 3), iommu_errors::OUT_OF_RESOURCES);
+    }
+
+    fn remap_setup(s: &mut Service<Fake, FakeCaps>, entries: u64, extended: u64) -> IpcMessage
+    {
+        s.handle(&req(iommu_labels::REMAP_SETUP, &[entries, extended], &[]))
+    }
+
+    fn remap_set(s: &mut Service<Fake, FakeCaps>, fields: [u64; 5]) -> u64
+    {
+        s.handle(&req(iommu_labels::REMAP_SET, &fields, &[])).label
+    }
+
+    /// Entry 7 delivering vector 0x41 to CPU 3, edge-triggered, from the
+    /// requester 00:1f.0.
+    const SET: [u64; 5] = [7, 3, 0x41, 0, 0x00f8];
+
+    #[test]
+    fn remapping_is_set_up_once_and_reports_the_destination_width()
+    {
+        let mut s = service();
+        let r = remap_setup(&mut s, 1024, 1);
+        assert_eq!((r.label, r.word(0)), (iommu_errors::SUCCESS, 0));
+        assert_eq!(s.backend.remapping, Some(1024));
+        assert_eq!(
+            remap_setup(&mut s, 1024, 1).label,
+            iommu_errors::INVALID_REQUEST
+        );
+        // Turned off, it may be set up again.
+        assert_eq!(remap_setup(&mut s, 0, 0).label, iommu_errors::SUCCESS);
+        assert_eq!(s.backend.remapping, None);
+        s.backend.offers_extended = true;
+        let r = remap_setup(&mut s, 2, 1);
+        assert_eq!((r.label, r.word(0)), (iommu_errors::SUCCESS, 1));
+    }
+
+    #[test]
+    fn a_table_size_outside_the_bound_is_refused_before_the_backend()
+    {
+        let mut s = service();
+        for (entries, extended) in [
+            (1, 0),
+            (1000, 0),
+            (iommu_labels::MAX_REMAP_ENTRIES * 2, 0),
+            (1 << 40, 0),
+            (1024, 2),
+        ]
+        {
+            assert_eq!(
+                remap_setup(&mut s, entries, extended).label,
+                iommu_errors::INVALID_REQUEST
+            );
+        }
+        assert_eq!(s.backend.remapping, None);
+        let r = remap_setup(&mut s, iommu_labels::MAX_REMAP_ENTRIES, 0);
+        assert_eq!(r.label, iommu_errors::SUCCESS);
+    }
+
+    #[test]
+    fn a_family_that_does_not_remap_interrupts_refuses_the_setup()
+    {
+        let mut s = service();
+        s.backend.no_remap = true;
+        assert_eq!(
+            remap_setup(&mut s, 1024, 0).label,
+            iommu_errors::INVALID_REQUEST
+        );
+        assert_eq!(remap_set(&mut s, SET), iommu_errors::INVALID_REQUEST);
+    }
+
+    #[test]
+    fn an_entry_is_set_and_cleared_within_the_table()
+    {
+        let mut s = service();
+        assert_eq!(remap_set(&mut s, SET), iommu_errors::INVALID_REQUEST);
+        remap_setup(&mut s, 1024, 0);
+        assert_eq!(remap_set(&mut s, SET), iommu_errors::SUCCESS);
+        let level = [1023, 0xff, 0xff, 1, 0xffff];
+        assert_eq!(remap_set(&mut s, level), iommu_errors::SUCCESS);
+        assert_eq!(
+            s.backend.set,
+            [
+                (
+                    7,
+                    RemapEntry {
+                        destination: 3,
+                        vector: 0x41,
+                        level: false,
+                        source_id: 0xf8,
+                    }
+                ),
+                (
+                    1023,
+                    RemapEntry {
+                        destination: 0xff,
+                        vector: 0xff,
+                        level: true,
+                        source_id: 0xffff,
+                    }
+                ),
+            ]
+        );
+        let clear = req(iommu_labels::REMAP_CLEAR, &[7], &[]);
+        assert_eq!(s.handle(&clear).label, iommu_errors::SUCCESS);
+        let past = req(iommu_labels::REMAP_CLEAR, &[1024], &[]);
+        assert_eq!(s.handle(&past).label, iommu_errors::INVALID_REQUEST);
+        assert_eq!(s.backend.cleared, [7]);
+    }
+
+    #[test]
+    fn an_entry_outside_its_fields_bounds_is_refused_before_the_backend()
+    {
+        let mut s = service();
+        remap_setup(&mut s, 1024, 0);
+        for fields in [
+            [1024, 3, 0x41, 0, 0xf8],  // past the table
+            [7, 0x100, 0x41, 0, 0xf8], // wider than 8-bit destinations
+            [7, 3, 15, 0, 0xf8],       // an exception vector
+            [7, 3, 0x100, 0, 0xf8],    // not a vector
+            [7, 3, 0x41, 2, 0xf8],     // neither edge nor level
+            [7, 3, 0x41, 0, 0x1_0000], // not a source ID
+        ]
+        {
+            assert_eq!(remap_set(&mut s, fields), iommu_errors::INVALID_REQUEST);
+        }
+        assert!(s.backend.set.is_empty());
+    }
+
+    #[test]
+    fn extended_destinations_take_a_32_bit_id()
+    {
+        let mut s = service();
+        s.backend.offers_extended = true;
+        remap_setup(&mut s, 1024, 1);
+        assert_eq!(
+            remap_set(&mut s, [7, 0x1_0000, 0x41, 0, 0xf8]),
+            iommu_errors::SUCCESS
+        );
+        assert_eq!(
+            remap_set(&mut s, [7, 1 << 32, 0x41, 0, 0xf8]),
+            iommu_errors::INVALID_REQUEST
+        );
+    }
+
+    #[test]
+    fn a_remapping_timeout_refuses_every_later_remapping_request()
+    {
+        let mut s = service();
+        remap_setup(&mut s, 1024, 0);
+        s.backend.fail_next = Some(BackendError::Timeout);
+        assert_eq!(remap_set(&mut s, SET), iommu_errors::HARDWARE_TIMEOUT);
+        assert_eq!(remap_set(&mut s, SET), iommu_errors::HARDWARE_TIMEOUT);
+        let clear = req(iommu_labels::REMAP_CLEAR, &[7], &[]);
+        assert_eq!(s.handle(&clear).label, iommu_errors::HARDWARE_TIMEOUT);
+        // Translation requests are unaffected.
+        assert_eq!(attach(&mut s, 0, 0x0018).label, iommu_errors::SUCCESS);
     }
 
     #[test]

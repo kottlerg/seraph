@@ -15,8 +15,13 @@
 //! cap, and the device's DMA capability. It checks the device's
 //! identification register, binds its interrupt to a notification of its
 //! own, reports ready, and answers `ipc::test_dma_labels::INTERRUPT_PROBE`
-//! (the device raises its interrupt and the driver waits for it) and
-//! `ipc::test_dma_labels::DMA_PROBE`: it maps one page of its memory for the
+//! (the device raises its interrupt and the driver waits for it),
+//! `ipc::test_dma_labels::INTERRUPT_CHURN` (while a thread has the device
+//! raise in a loop, the driver deletes its bound cap, then its notification's
+//! last cap and the binding's cap, and after each binds a spare copy to a new
+//! notification and probes through it), `ipc::test_dma_labels::FIXTURE_EXIT`
+//! (it leaves the interrupt raised and exits, so devmgr frees its target),
+//! and `ipc::test_dma_labels::DMA_PROBE`: it maps one page of its memory for the
 //! device, copies a pattern from the page into the device's buffer and back
 //! to the page's second half, unmaps the page, and copies the buffer to the
 //! same device address once more, reporting whether the mapped copies arrived
@@ -25,6 +30,9 @@
 //! see counted by devmgr (`devmgr_dma_labels::DMA_FAULTS`) and reports with
 //! the probe.
 
+use std::cell::Cell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use driver_binding::decl::{Declaration, Interrupt, InterruptNeed, Match, Reset, Tier};
@@ -92,14 +100,21 @@ const BACK_OFFSET: usize = 0x800;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long to wait between two `DMA_FAULTS` requests.
 const FAULT_POLL: Duration = Duration::from_millis(50);
+/// Raises the churn's loop makes before a case's deletes start and after
+/// they end, so the deletes run while the device raises.
+const CHURN_RAISES: u64 = 64;
+/// How long the churn waits for each run of [`CHURN_RAISES`] raises.
+const CHURN_WAIT: Duration = Duration::from_secs(2);
 
 /// The device's interrupt as the driver holds it: its `Interrupt` cap, the
-/// kind devmgr gave, and the notification the cap is bound to.
+/// kind and `SYS_IRQ_REGISTER` mode devmgr gave, and the notification the cap
+/// is bound to.
 #[derive(Clone, Copy)]
 struct Irq
 {
     cap: u64,
     kind: InterruptKind,
+    mode: u64,
     notification: u64,
 }
 
@@ -109,7 +124,8 @@ struct Driver
     dma_ep: u64,
     memmgr_ep: u64,
     aspace: u64,
-    irq: Option<Irq>,
+    /// The binding the probes use; the churn replaces it.
+    irq: Cell<Option<Irq>>,
 }
 
 impl Driver
@@ -188,19 +204,26 @@ impl Driver
         Some((cap, va))
     }
 
-    /// Run the interrupt probe: clear any delivery already pending, have the
-    /// device raise its interrupt, wait for it for at most
-    /// `test_dma_labels::INTERRUPT_WAIT_MS`, then acknowledge it at the
-    /// device and with `SYS_IRQ_ACK`, which clears the acknowledgement the
-    /// binding owes. Returns whether it was delivered and the kind of
-    /// interrupt held; `(false, None)` with none.
+    /// Run the interrupt probe through the fixture's binding
+    /// ([`Driver::delivers`]). Returns whether it was delivered and the kind
+    /// of interrupt held; `(false, None)` with none.
     fn interrupt_probe(&self) -> (bool, Option<InterruptKind>)
     {
-        let Some(irq) = self.irq
+        let Some(irq) = self.irq.get()
         else
         {
             return (false, None);
         };
+        (self.delivers(irq), Some(irq.kind))
+    }
+
+    /// Clear any delivery already pending on `irq`'s notification, have the
+    /// device raise its interrupt, wait for it for at most
+    /// `test_dma_labels::INTERRUPT_WAIT_MS`, then acknowledge it at the
+    /// device and with `SYS_IRQ_ACK`, which clears the acknowledgement the
+    /// binding owes. Returns whether it was delivered.
+    fn delivers(&self, irq: Irq) -> bool
+    {
         let _ = syscall::notification_try_wait(irq.notification);
         self.write32(IRQ_RAISE, PROBE_STATUS);
         let bits = syscall::notification_wait_timeout(
@@ -210,7 +233,106 @@ impl Driver
         .unwrap_or(0);
         self.write32(IRQ_ACKNOWLEDGE, self.read32(IRQ_STATUS));
         let _ = syscall::irq_ack(irq.cap);
-        (bits != 0, Some(irq.kind))
+        bits != 0
+    }
+
+    /// Run the interrupt churn (`test_dma_labels::INTERRUPT_CHURN`): the
+    /// cases whose next binding received the device's interrupt, the kind of
+    /// interrupt held, and the raises the loop made; `(0, None, 0)` with no
+    /// interrupt. A case that cannot bind its next binding ends the churn.
+    fn interrupt_churn(&self) -> (u64, Option<InterruptKind>, u64)
+    {
+        let Some(first) = self.irq.get()
+        else
+        {
+            return (0, None, 0);
+        };
+        let raises = Arc::new(AtomicU64::new(0));
+        let mut passed = 0;
+        // The bound cap goes while the device raises; the binding it held
+        // is removed with it.
+        if let Some(second) = self.churn_case(first, &raises, |irq| {
+            let _ = syscall::cap_delete(irq.cap);
+        })
+        {
+            // No binding names the first notification any more.
+            let _ = syscall::cap_delete(first.notification);
+            if self.delivers(second)
+            {
+                passed |= test_dma_labels::CHURN_BOUND_CAP;
+            }
+            // The notification's last cap goes, so the binding holds it
+            // alone, then the binding's cap, which frees it.
+            if let Some(third) = self.churn_case(second, &raises, |irq| {
+                let _ = syscall::cap_delete(irq.notification);
+                let _ = syscall::cap_delete(irq.cap);
+            }) && self.delivers(third)
+            {
+                passed |= test_dma_labels::CHURN_NOTIFICATION;
+            }
+        }
+        (passed, Some(first.kind), raises.load(Ordering::Relaxed))
+    }
+
+    /// One churn case on the bound `irq`: derive a spare copy of its cap,
+    /// run `delete` on it while the device raises ([`Driver::while_raising`]),
+    /// then bind the spare to a new notification ([`bind_interrupt`]) and
+    /// make that the fixture's binding. `None`, the fixture then holding no
+    /// interrupt, when the copy or the new binding fails.
+    fn churn_case(&self, irq: Irq, raises: &Arc<AtomicU64>, delete: impl FnOnce(Irq))
+    -> Option<Irq>
+    {
+        let spare = syscall::cap_derive(irq.cap, syscall::RIGHTS_ALL).ok()?;
+        self.while_raising(raises, || delete(irq));
+        let next = bind_interrupt((spare, irq.kind, irq.mode));
+        if next.is_none()
+        {
+            let _ = syscall::cap_delete(spare);
+        }
+        self.irq.set(next);
+        next
+    }
+
+    /// Run `f` while a thread of the fixture has the device raise its
+    /// interrupt in a loop, acknowledging each raise at the device. `f`
+    /// starts once the loop has made [`CHURN_RAISES`] raises, and the loop
+    /// stops once it has made as many more after `f` returned, each wait
+    /// bounded by [`CHURN_WAIT`]. The loop's raises are added to `raises`;
+    /// with no thread, `f` runs with none.
+    fn while_raising(&self, raises: &Arc<AtomicU64>, f: impl FnOnce())
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let regs = self.regs;
+        let (loop_stop, loop_raises) = (Arc::clone(&stop), Arc::clone(raises));
+        let raise_loop = std::thread::Builder::new().spawn(move || {
+            while !loop_stop.load(Ordering::Acquire)
+            {
+                // SAFETY: as in `Driver::write32`: `regs` maps BAR 0 for the
+                // driver's life, and both registers are 32-bit aligned in it.
+                unsafe {
+                    core::ptr::write_volatile((regs + IRQ_RAISE) as *mut u32, PROBE_STATUS);
+                    core::ptr::write_volatile((regs + IRQ_ACKNOWLEDGE) as *mut u32, PROBE_STATUS);
+                }
+                loop_raises.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let wait_for = |count: u64| {
+            let start = Instant::now();
+            while raise_loop.is_ok()
+                && raises.load(Ordering::Relaxed) < count
+                && start.elapsed() < CHURN_WAIT
+            {
+                let _ = syscall::thread_yield();
+            }
+        };
+        wait_for(raises.load(Ordering::Relaxed) + CHURN_RAISES);
+        f();
+        wait_for(raises.load(Ordering::Relaxed) + CHURN_RAISES);
+        stop.store(true, Ordering::Release);
+        if let Ok(raise_loop) = raise_loop
+        {
+            let _ = raise_loop.join();
+        }
     }
 
     /// Run the probe; the reply's outcome, whether the copy after the unmap
@@ -334,14 +456,17 @@ fn main() -> !
         dma_ep: eps.dma,
         memmgr_ep: info.memmgr_endpoint,
         aspace: info.self_aspace,
-        irq: irq.and_then(bind_interrupt),
+        irq: Cell::new(irq.and_then(bind_interrupt)),
     };
     if driver.read32(IDENT) != IDENT_EDU
     {
         std::os::seraph::log!("test-dma: the device is not an edu device");
         syscall::thread_exit();
     }
-    std::os::seraph::log!("test-dma: interrupt {:?}", driver.irq.map(|irq| irq.kind));
+    std::os::seraph::log!(
+        "test-dma: interrupt {:?}",
+        driver.irq.get().map(|irq| irq.kind)
+    );
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe { ipc::report_driver_ready(eps.devmgr_query, ipc_buf) }.is_err()
     {
@@ -376,6 +501,7 @@ fn bind_interrupt((cap, kind, mode): (u64, InterruptKind, u64)) -> Option<Irq>
     Some(Irq {
         cap,
         kind,
+        mode,
         notification,
     })
 }
@@ -413,8 +539,8 @@ fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Option<ListedIr
     (eps.dma != 0 && eps.service != 0).then_some((cap, pages, irq, eps))
 }
 
-/// Answer `INTERRUPT_PROBE` and `DMA_PROBE` for the rest of the driver's
-/// life.
+/// Answer `INTERRUPT_PROBE`, `INTERRUPT_CHURN` and `DMA_PROBE` until a
+/// `FIXTURE_EXIT`, then exit.
 fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
@@ -450,6 +576,22 @@ fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
                     .word(1, kind.map_or(0, |k| k as u64))
                     .build()
             }
+            test_dma_labels::INTERRUPT_CHURN =>
+            {
+                let (passed, kind, raises) = driver.interrupt_churn();
+                std::os::seraph::log!(
+                    "test-dma: interrupt churn {:?}, cases passed={:#x}, raises={}",
+                    kind,
+                    passed,
+                    raises
+                );
+                IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                    .word(0, passed)
+                    .word(1, kind.map_or(0, |k| k as u64))
+                    .word(2, raises)
+                    .build()
+            }
+            test_dma_labels::FIXTURE_EXIT => IpcMessage::new(ipc::devmgr_errors::SUCCESS),
             test_dma_labels::DMA_PROBE => match driver.probe(ipc_buf).and_then(|(o, l, iova)| {
                 faults_after(driver.dma_ep, iova, ipc_buf).map(|f| (o, l, iova, f))
             })
@@ -487,5 +629,14 @@ fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
         };
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        if msg.label == test_dma_labels::FIXTURE_EXIT
+        {
+            // Left raised: devmgr releases the device, and frees its
+            // message-signaled target, with its interrupt asserted.
+            driver.write32(IRQ_RAISE, PROBE_STATUS);
+            let _ = syscall::thread_sleep(test_dma_labels::EXIT_DELAY_MS);
+            std::os::seraph::log!("test-dma: exiting on FIXTURE_EXIT");
+            syscall::thread_exit();
+        }
     }
 }

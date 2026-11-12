@@ -55,6 +55,15 @@
 //! capability with the message of a vector it minted and, where the IOMMU
 //! translates the device's message writes (RISC-V), made the target's
 //! interrupt file reachable through the device's domain (`MAP_MSI`).
+//!
+//! The MSI churn phase asks the fixture to delete, while the device raises
+//! its MSI in a loop, the `Interrupt` cap bound to it, and then the bound
+//! notification's last cap and the binding's cap, and asserts that after each
+//! the next binding the fixture makes receives the device's interrupt. The
+//! MSI release phase has the fixture exit with its interrupt raised, waits
+//! for devmgr to withdraw it, which releases its device and frees the
+//! message-signaled target, and asserts `system_ram == kernel_reserved +
+//! pool_total`; it runs last of the phases that use the fixture.
 
 use std::os::seraph::startup_info;
 use std::time::{Duration, Instant};
@@ -99,6 +108,14 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "devmgr_msi_delivery",
             run: msi_delivery_phase,
+        },
+        Phase {
+            name: "devmgr_msi_churn",
+            run: msi_churn_phase,
+        },
+        Phase {
+            name: "devmgr_msi_release",
+            run: msi_release_phase,
         },
     ]
 }
@@ -604,4 +621,92 @@ fn msi_delivery_phase(caps: &Caps)
         ipc::test_dma_labels::INTERRUPT_WAIT_MS
     );
     std::os::seraph::log!("devmgr_msi_delivery passed: the edu device's MSI was delivered");
+}
+
+/// The `edu` device raises its MSI in a loop while the fixture deletes the
+/// `Interrupt` cap bound to it, and again while it deletes the bound
+/// notification's last cap and then the binding's; after each, a spare copy
+/// the fixture binds to a new notification receives the device's interrupt.
+fn msi_churn_phase(caps: &Caps)
+{
+    use ipc::test_dma_labels::{CHURN_BOUND_CAP, CHURN_NOTIFICATION, INTERRUPT_CHURN};
+
+    let churn = call_test_dma(caps, INTERRUPT_CHURN, "devmgr_msi_churn");
+    assert_eq!(
+        churn.label,
+        ipc::devmgr_errors::SUCCESS,
+        "devmgr_msi_churn: INTERRUPT_CHURN status"
+    );
+    let (passed, kind, raises) = (churn.word(0), churn.word(1), churn.word(2));
+    assert_eq!(
+        kind,
+        driver_binding::resources::InterruptKind::Msi as u64,
+        "devmgr_msi_churn: the fixture holds interrupt kind {kind}, not MSI"
+    );
+    assert!(
+        raises > 0,
+        "devmgr_msi_churn: the fixture's raise loop made no raise"
+    );
+    assert!(
+        passed & CHURN_BOUND_CAP != 0,
+        "devmgr_msi_churn: after the bound cap's delete under raises, the next binding \
+         received no interrupt"
+    );
+    assert!(
+        passed & CHURN_NOTIFICATION != 0,
+        "devmgr_msi_churn: after the bound notification's and the binding's deletes under \
+         raises, the next binding received no interrupt"
+    );
+    std::os::seraph::log!(
+        "devmgr_msi_churn passed: both cases' next bindings received the MSI ({raises} raises)"
+    );
+}
+
+/// The fixture exits with its interrupt raised, devmgr withdraws it and
+/// releases its device, which frees the message-signaled target devmgr minted
+/// for it, and `system_ram == kernel_reserved + pool_total` then holds. The
+/// last phase that uses the fixture: none serves the class afterwards.
+fn msi_release_phase(caps: &Caps)
+{
+    // A test wait bound: it limits only how long the phase polls for the
+    // withdrawal before it fails.
+    const WITHDRAW_POLLS: u32 = 300;
+
+    let exit = call_test_dma(
+        caps,
+        ipc::test_dma_labels::FIXTURE_EXIT,
+        "devmgr_msi_release",
+    );
+    assert_eq!(
+        exit.label,
+        ipc::devmgr_errors::SUCCESS,
+        "devmgr_msi_release: FIXTURE_EXIT status"
+    );
+    let mut query = query_class(caps.test_dma_class, 0, "test-dma");
+    for _ in 1..WITHDRAW_POLLS
+    {
+        if query == Err(ipc::devmgr_errors::WITHDRAWN)
+        {
+            break;
+        }
+        if let Ok(cap) = query
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        query = query_class(caps.test_dma_class, 0, "test-dma");
+    }
+    if let Ok(cap) = query
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    assert_eq!(
+        query,
+        Err(ipc::devmgr_errors::WITHDRAWN),
+        "devmgr_msi_release: the exited fixture was not withdrawn"
+    );
+    crate::phases::memmgr::ram_accounted_identity_phase(caps);
+    std::os::seraph::log!(
+        "devmgr_msi_release passed: the fixture's target was released and RAM stays accounted"
+    );
 }

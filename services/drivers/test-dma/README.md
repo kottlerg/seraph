@@ -12,24 +12,33 @@ on its memory decode and bus mastering, and spawns this driver with the resource
 MSI vector (its wired line where devmgr cannot give MSI), then the end round with the service
 endpoint, the devmgr query cap, and the device's DMA capability.
 
-The driver checks the device's identification register, binds its interrupt to a notification of
-its own (`SYS_IRQ_REGISTER`), reports ready, and answers `ipc::test_dma_labels::INTERRUPT_PROBE`
-and `ipc::test_dma_labels::DMA_PROBE`. The interrupt probe has the device raise its interrupt
-(register `0x60`), waits for the notification for at most `test_dma_labels::INTERRUPT_WAIT_MS`,
-acknowledges it at the device (register `0x64`) and with `SYS_IRQ_ACK`, and reports whether it was
-delivered and the kind of interrupt the driver holds. The DMA probe maps one page of the driver's
-memory for the device (`DMA_MAP`), has the device's DMA engine copy a pattern from the page into its
-4 KiB buffer and back to the page's second half, unmaps the page (`DMA_UNMAP`), clears the second
-half, and has the device copy its buffer to the same device address once more. It reports whether
-the mapped copies arrived, whether the copy after the unmap reached the page, and the device
-address. Where an IOMMU confines the device that last copy is stopped and the IOMMU records a fault.
-The driver then asks devmgr for its device's faults (`devmgr_dma_labels::DMA_FAULTS`) until the
-stopped copy is counted, for at most `test_dma_labels::FAULT_WAIT_MS`, and reports with the probe
-whether an IOMMU confines the device, the fault count, and the latest fault's IOVA. The device
-reaches 28 address bits, so with no IOMMU a page above 256 MiB is not copied to.
+The driver checks the device's identification register, binds its interrupt to a notification of its
+own (`SYS_IRQ_REGISTER`), reports ready, and answers `ipc::test_dma_labels::INTERRUPT_PROBE`,
+`INTERRUPT_CHURN`, `FIXTURE_EXIT` and `DMA_PROBE`. The interrupt probe has the device raise its
+interrupt (register `0x60`), waits for the notification for at most
+`test_dma_labels::INTERRUPT_WAIT_MS`, acknowledges it at the device (register `0x64`) and with
+`SYS_IRQ_ACK`, and reports whether it was delivered and the kind of interrupt the driver holds.
+`ipc::test_dma_labels::INTERRUPT_CHURN` has a thread of the driver raise and acknowledge the
+interrupt in a loop while the driver deletes its bound `Interrupt` cap, then, in a second case, its
+notification's last cap and the binding's cap. Before each case it derives a spare copy of the cap;
+after it, it binds the spare to a new notification and runs the interrupt probe through it. It
+reports the cases whose next binding received the interrupt, the kind of interrupt, and the raises
+the loop made. `ipc::test_dma_labels::FIXTURE_EXIT` has the driver reply, raise the interrupt and
+leave it raised, and exit after `test_dma_labels::EXIT_DELAY_MS`, so devmgr withdraws the driver and
+releases the device, freeing its message-signaled target, with the interrupt asserted. No driver
+serves the class afterwards. The DMA probe maps one page of the driver's memory for the device
+(`DMA_MAP`), has the device's DMA engine copy a pattern from the page into its 4 KiB buffer and back
+to the page's second half, unmaps the page (`DMA_UNMAP`), clears the second half, and has the device
+copy its buffer to the same device address once more. It reports whether the mapped copies arrived,
+whether the copy after the unmap reached the page, and the device address. Where an IOMMU confines
+the device that last copy is stopped and the IOMMU records a fault. The driver then asks devmgr for
+its device's faults (`devmgr_dma_labels::DMA_FAULTS`) until the stopped copy is counted, for at most
+`test_dma_labels::FAULT_WAIT_MS`, and reports with the probe whether an IOMMU confines the device,
+the fault count, and the latest fault's IOVA. The device reaches 28 address bits, so with no IOMMU a
+page above 256 MiB is not copied to.
 
-[svctest](../../svctest/README.md)'s DMA confinement and MSI delivery phases reach it through the
-`test-dma` class (`QUERY_DEVICE`) and drive it.
+[svctest](../../svctest/README.md)'s DMA confinement and MSI delivery, churn, and release phases
+reach it through the `test-dma` class (`QUERY_DEVICE`) and drive it.
 
 ---
 
@@ -40,7 +49,8 @@ test-dma/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Bootstrap, edu register access, the interrupt and DMA probes
+    └── main.rs            # Bootstrap, edu register access, the interrupt and DMA probes,
+                           #   the interrupt churn, the fixture exit
 ```
 
 ---

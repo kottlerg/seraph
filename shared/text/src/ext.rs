@@ -17,5 +17,6 @@ pub fn ext_glyph_index(cp: u32) -> Option<usize>
     font::FONT_9X20_EXT_MAP
         .binary_search_by_key(&cp, |&(c, _)| c)
         .ok()
-        .map(|i| font::FONT_9X20_EXT_MAP[i].1 as usize)
+        .and_then(|i| font::FONT_9X20_EXT_MAP.get(i))
+        .map(|&(_, slot)| slot as usize)
 }

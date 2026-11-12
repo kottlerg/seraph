@@ -51,10 +51,11 @@ impl<T, const N: usize> HeldLines<T, N>
         {
             return Some(item);
         }
-        if self.len < N
+        if let Some(slot) = self.items.get_mut(self.len)
         {
-            self.items[self.len] = Some(item);
-            self.len += 1;
+            *slot = Some(item);
+            // `len` indexed a slot, so it is below `N`.
+            self.len = self.len.saturating_add(1);
         }
         else
         {

@@ -115,9 +115,15 @@ impl Utf8Decoder
             }
         }
 
-        let idx = self.len as usize;
-        self.buf[idx] = byte;
-        self.len += 1;
+        // `len` is below the sequence's expected length here, at most 3.
+        let Some(slot) = self.buf.get_mut(usize::from(self.len))
+        else
+        {
+            self.reset();
+            return DecodeOutcome::Truncated;
+        };
+        *slot = byte;
+        self.len = self.len.saturating_add(1);
 
         let expected = expected_len(self.buf[0]);
         if u32::from(self.len) < expected
@@ -125,7 +131,7 @@ impl Utf8Decoder
             return DecodeOutcome::NeedMore;
         }
 
-        let cp = assemble(&self.buf[..self.len as usize]);
+        let cp = assemble(self.buf.get(..usize::from(self.len)).unwrap_or_default());
         self.reset();
         DecodeOutcome::Codepoint(cp)
     }
@@ -160,21 +166,19 @@ fn expected_len(lead: u8) -> u32
 /// Combine a validated, complete UTF-8 sequence into its codepoint.
 fn assemble(bytes: &[u8]) -> u32
 {
-    match bytes.len()
+    match *bytes
     {
-        2 => (u32::from(bytes[0] & 0x1F) << 6) | u32::from(bytes[1] & 0x3F),
-        3 =>
+        [b0, b1] => (u32::from(b0 & 0x1F) << 6) | u32::from(b1 & 0x3F),
+        [b0, b1, b2] =>
         {
-            (u32::from(bytes[0] & 0x0F) << 12)
-                | (u32::from(bytes[1] & 0x3F) << 6)
-                | u32::from(bytes[2] & 0x3F)
+            (u32::from(b0 & 0x0F) << 12) | (u32::from(b1 & 0x3F) << 6) | u32::from(b2 & 0x3F)
         }
-        4 =>
+        [b0, b1, b2, b3] =>
         {
-            (u32::from(bytes[0] & 0x07) << 18)
-                | (u32::from(bytes[1] & 0x3F) << 12)
-                | (u32::from(bytes[2] & 0x3F) << 6)
-                | u32::from(bytes[3] & 0x3F)
+            (u32::from(b0 & 0x07) << 18)
+                | (u32::from(b1 & 0x3F) << 12)
+                | (u32::from(b2 & 0x3F) << 6)
+                | u32::from(b3 & 0x3F)
         }
         _ => 0xFFFD,
     }

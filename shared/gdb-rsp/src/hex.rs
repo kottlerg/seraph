@@ -9,7 +9,18 @@
 use crate::Error;
 
 /// The protocol's hex digits, lower case, as GDB writes them.
-pub(crate) const DIGITS: &[u8; 16] = b"0123456789abcdef";
+const DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// The hex digit of the low four bits of `value`.
+pub(crate) fn digit(value: u8) -> u8
+{
+    // The mask keeps one nibble, so the index is below 16 and the fallback
+    // is never taken.
+    DIGITS
+        .get(usize::from(value & 0xF))
+        .copied()
+        .unwrap_or(b'0')
+}
 
 /// The value of one hex digit, either case; `None` for any other byte.
 #[must_use]
@@ -17,9 +28,9 @@ pub fn nibble(digit: u8) -> Option<u8>
 {
     match digit
     {
-        b'0'..=b'9' => Some(digit - b'0'),
-        b'a'..=b'f' => Some(digit - b'a' + 10),
-        b'A'..=b'F' => Some(digit - b'A' + 10),
+        b'0'..=b'9' => digit.checked_sub(b'0'),
+        b'a'..=b'f' => digit.checked_sub(b'a' - 10),
+        b'A'..=b'F' => digit.checked_sub(b'A' - 10),
         _ => None,
     }
 }

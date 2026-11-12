@@ -13,6 +13,8 @@
 //! the parse of untrusted on-disk structures pure and host-testable is the
 //! point — see [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
@@ -116,23 +118,30 @@ pub fn parse_header(block: &[u8]) -> Result<GptHeader, GptError>
     {
         return Err(GptError::InvalidBlockSize);
     };
-    if !is_block_size(block.len())
+    // A supported block is at least `MIN_BLOCK_SIZE` bytes, so the header's
+    // fields are read from that fixed-size prefix.
+    let Some(hdr) = block
+        .first_chunk::<MIN_BLOCK_SIZE>()
+        .filter(|_| is_block_size(block.len()))
+    else
     {
         return Err(GptError::InvalidBlockSize);
-    }
-    if &block[0..8] != b"EFI PART"
+    };
+    if &hdr[0..8] != b"EFI PART"
     {
         return Err(GptError::InvalidSignature);
     }
-    let first_usable_lba = u64::from_le_bytes(block[40..48].try_into().unwrap_or([0; 8]));
-    let part_entry_lba = u64::from_le_bytes(block[72..80].try_into().unwrap_or([0; 8]));
-    let num_parts = u32::from_le_bytes(block[80..84].try_into().unwrap_or([0; 4]));
-    let entry_size = u32::from_le_bytes(block[84..88].try_into().unwrap_or([0; 4]));
-    if !is_entry_size(entry_size, block_size)
+    let first_usable_lba = u64::from_le_bytes(hdr[40..48].try_into().unwrap_or([0; 8]));
+    let part_entry_lba = u64::from_le_bytes(hdr[72..80].try_into().unwrap_or([0; 8]));
+    let num_parts = u32::from_le_bytes(hdr[80..84].try_into().unwrap_or([0; 4]));
+    let entry_size = u32::from_le_bytes(hdr[84..88].try_into().unwrap_or([0; 4]));
+    let Some(entries_per_block) = block_size
+        .checked_div(entry_size)
+        .filter(|_| is_entry_size(entry_size, block_size))
+    else
     {
         return Err(GptError::InvalidEntrySize);
-    }
-    let entries_per_block = block_size / entry_size;
+    };
     let array_sectors = u64::from(num_parts.div_ceil(entries_per_block));
     let array_fits = part_entry_lba >= 2
         && part_entry_lba
@@ -176,10 +185,7 @@ fn is_entry_size(entry_size: u32, block_size: u32) -> bool
 #[must_use]
 pub fn parse_entry(entry: &[u8]) -> Option<GptEntry>
 {
-    if entry.len() < 56
-    {
-        return None;
-    }
+    let entry = entry.first_chunk::<56>()?;
     let mut type_guid = [0u8; 16];
     type_guid.copy_from_slice(&entry[0..16]);
     if type_guid.iter().all(|&b| b == 0)
@@ -191,15 +197,14 @@ pub fn parse_entry(entry: &[u8]) -> Option<GptEntry>
     let first_lba = u64::from_le_bytes(entry[32..40].try_into().unwrap_or([0; 8]));
     let last_lba = u64::from_le_bytes(entry[40..48].try_into().unwrap_or([0; 8]));
     let attributes = u64::from_le_bytes(entry[48..56].try_into().unwrap_or([0; 8]));
-    if last_lba < first_lba
-    {
-        return None;
-    }
+    // `None` for `last_lba < first_lba`, and for the whole-`u64` range, whose
+    // length in LBAs does not fit a `u64`.
+    let length_lba = last_lba.checked_sub(first_lba)?.checked_add(1)?;
     Some(GptEntry {
         type_guid,
         uuid,
         first_lba,
-        length_lba: last_lba - first_lba + 1,
+        length_lba,
         attributes,
     })
 }
@@ -248,7 +253,12 @@ pub fn collect_partitions(
     let mut entries = Vec::new();
     let mut block = [0u8; MAX_BLOCK_SIZE];
     let block_size = header.block_size as usize;
-    if !is_block_size(block_size) || !is_entry_size(header.entry_size, header.block_size)
+    let entry_size = header.entry_size as usize;
+    let block_buf = block.get_mut(..block_size).filter(|_| {
+        is_block_size(block_size) && is_entry_size(header.entry_size, header.block_size)
+    });
+    let Some(block_buf) = block_buf
+    else
     {
         return PartitionScan {
             entries,
@@ -256,10 +266,11 @@ pub fn collect_partitions(
                 lba: header.part_entry_lba,
             }),
         };
-    }
-    let block_buf = &mut block[..block_size];
-    let entries_per_block = header.block_size / header.entry_size;
-    let mut remaining = header.num_parts;
+    };
+    // `entry_size` divides the block, so the block's `entry_size`-byte chunks
+    // are its entries at their true offsets.
+    let entries_per_block = block_buf.chunks_exact(entry_size).len();
+    let mut remaining = header.num_parts as usize;
     let mut lba = header.part_entry_lba;
     while remaining > 0
     {
@@ -270,11 +281,9 @@ pub fn collect_partitions(
                 stop: Some(ScanStop::ReadFailed { lba }),
             };
         }
-        let in_block = remaining.min(entries_per_block);
-        for e in 0..in_block
+        for raw in block_buf.chunks_exact(entry_size).take(remaining)
         {
-            let off = (e * header.entry_size) as usize;
-            if let Some(entry) = parse_entry(&block_buf[off..])
+            if let Some(entry) = parse_entry(raw)
             {
                 if entries.try_reserve(1).is_err()
                 {
@@ -286,7 +295,7 @@ pub fn collect_partitions(
                 entries.push(entry);
             }
         }
-        remaining -= in_block;
+        remaining = remaining.saturating_sub(entries_per_block);
         if remaining == 0
         {
             break;
@@ -567,6 +576,13 @@ mod tests
     fn parse_entry_rejects_inverted_lba_range()
     {
         let e = entry_bytes(0xAB, 4096, 2048, 0);
+        assert!(parse_entry(&e).is_none());
+    }
+
+    #[test]
+    fn parse_entry_rejects_a_range_whose_length_overflows_u64()
+    {
+        let e = entry_bytes(0xAB, 0, u64::MAX, 0);
         assert!(parse_entry(&e).is_none());
     }
 

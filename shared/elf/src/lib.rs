@@ -17,6 +17,8 @@
 //! and `parse_stack_note_streaming` fetch further bytes through a
 //! caller-supplied reader.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 // cast_possible_truncation: this crate targets 64-bit only (x86-64, riscv64);
 // ELF64 u64 fields fit in usize on these platforms.
@@ -408,7 +410,9 @@ fn validate_tail(ehdr: &Elf64Ehdr, data: &[u8], expected_machine: u16) -> Result
     // Verify the program header table fits within the file data.
     let phdr_end = usize::try_from(ehdr.e_phoff)
         .ok()
-        .and_then(|base| base.checked_add(ehdr.e_phnum as usize * size_of::<Elf64Phdr>()))
+        .and_then(|base| {
+            base.checked_add(usize::from(ehdr.e_phnum).checked_mul(size_of::<Elf64Phdr>())?)
+        })
         .ok_or(ElfError::PhdrTableOverflow)?;
     if phdr_end > data.len()
     {
@@ -423,24 +427,23 @@ fn validate_tail(ehdr: &Elf64Ehdr, data: &[u8], expected_machine: u16) -> Result
 /// alignment of `data`.
 fn decode_ehdr(data: &[u8]) -> Option<Elf64Ehdr>
 {
-    let b = data.get(..size_of::<Elf64Ehdr>())?;
-    let mut e_ident = [0u8; 16];
-    e_ident.copy_from_slice(&b[0..16]);
+    let mut b = Fields(data.get(..size_of::<Elf64Ehdr>())?);
+    // Struct fields are evaluated in the order written, the header's order.
     Some(Elf64Ehdr {
-        e_ident,
-        e_type: u16_le(&b[16..18]),
-        e_machine: u16_le(&b[18..20]),
-        e_version: u32_le(&b[20..24]),
-        e_entry: u64_le(&b[24..32]),
-        e_phoff: u64_le(&b[32..40]),
-        e_shoff: u64_le(&b[40..48]),
-        e_flags: u32_le(&b[48..52]),
-        e_ehsize: u16_le(&b[52..54]),
-        e_phentsize: u16_le(&b[54..56]),
-        e_phnum: u16_le(&b[56..58]),
-        e_shentsize: u16_le(&b[58..60]),
-        e_shnum: u16_le(&b[60..62]),
-        e_shstrndx: u16_le(&b[62..64]),
+        e_ident: b.bytes()?,
+        e_type: b.u16()?,
+        e_machine: b.u16()?,
+        e_version: b.u32()?,
+        e_entry: b.u64()?,
+        e_phoff: b.u64()?,
+        e_shoff: b.u64()?,
+        e_flags: b.u32()?,
+        e_ehsize: b.u16()?,
+        e_phentsize: b.u16()?,
+        e_phnum: b.u16()?,
+        e_shentsize: b.u16()?,
+        e_shnum: b.u16()?,
+        e_shstrndx: b.u16()?,
     })
 }
 
@@ -474,7 +477,8 @@ impl Iterator for LoadSegmentIter<'_>
         while self.index < self.phdr_count
         {
             let index = self.index;
-            self.index += 1;
+            // `index` is below `phdr_count`, so it cannot wrap.
+            self.index = self.index.saturating_add(1);
             let phdr = match read_phdr_at(self.data, self.phdr_base, index)
             {
                 Ok(phdr) => phdr,
@@ -562,7 +566,8 @@ impl Iterator for LoadSegmentMetaIter<'_>
         while self.index < self.phdr_count
         {
             let index = self.index;
-            self.index += 1;
+            // `index` is below `phdr_count`, so it cannot wrap.
+            self.index = self.index.saturating_add(1);
             let phdr = match read_phdr_at(self.header_data, self.phdr_base, index)
             {
                 Ok(phdr) => phdr,
@@ -820,7 +825,7 @@ where
         return None;
     }
     let mut strtab_buf = [0u8; MAX_STREAMING_STRTAB];
-    let strtab_bytes = &mut strtab_buf[..strtab_size];
+    let strtab_bytes = strtab_buf.get_mut(..strtab_size)?;
     read_exact_at(strtab_shdr.sh_offset, strtab_bytes, file_size, &mut read_at)?;
 
     for i in 0..shnum
@@ -834,11 +839,12 @@ where
             continue;
         }
         let size = usize::try_from(shdr.sh_size).ok()?;
-        if size == 0 || size > buf.len()
+        if size == 0
         {
             return None;
         }
-        let notes = &mut buf[..size];
+        // `None` for a note section larger than `buf`.
+        let notes = buf.get_mut(..size)?;
         read_exact_at(shdr.sh_offset, notes, file_size, &mut read_at)?;
         return note_desc(notes, owner, ntype);
     }
@@ -900,7 +906,7 @@ fn stack_pages_of(desc: &[u8]) -> Option<u32>
     {
         return None;
     }
-    Some(u32_le(&desc[0..4]))
+    Fields(desc).u32()
 }
 
 /// Upper bound on the section name string table size accepted by the
@@ -923,12 +929,13 @@ const MAX_STREAMING_NOTE: usize = 64;
 fn note_desc(notes: &[u8], owner: &[u8], ntype: u32) -> Option<core::ops::Range<usize>>
 {
     let mut at = 0usize;
-    while notes.len().saturating_sub(at) >= NOTE_HEADER_BYTES
+    while let Some(record) = notes.get(at..).filter(|r| r.len() >= NOTE_HEADER_BYTES)
     {
-        let namesz = u32_le(&notes[at..at + 4]) as usize;
-        let descsz = u32_le(&notes[at + 4..at + 8]) as usize;
-        let ty = u32_le(&notes[at + 8..at + 12]);
-        let name_start = at + NOTE_HEADER_BYTES;
+        let mut header = Fields(record);
+        let namesz = header.u32()? as usize;
+        let descsz = header.u32()? as usize;
+        let ty = header.u32()?;
+        let name_start = at.checked_add(NOTE_HEADER_BYTES)?;
         let name_end = name_start.checked_add(namesz)?;
         let desc_start = name_start.checked_add(align4(namesz)?)?;
         let desc_end = desc_start.checked_add(descsz)?;
@@ -937,9 +944,8 @@ fn note_desc(notes: &[u8], owner: &[u8], ntype: u32) -> Option<core::ops::Range<
             return None;
         }
         // The name is the owner and its NUL.
-        let named = namesz == owner.len() + 1
-            && notes[name_start..name_end - 1] == *owner
-            && notes[name_end - 1] == 0;
+        let named =
+            notes.get(name_start..name_end).and_then(<[u8]>::split_last) == Some((&0, owner));
         if named && ty == ntype
         {
             return Some(desc_start..desc_end);
@@ -984,7 +990,7 @@ fn read_shdr(data: &[u8], shoff: usize, shentsize: usize, idx: usize) -> Option<
     let offset = shoff.checked_add(idx.checked_mul(shentsize)?)?;
     let end = offset.checked_add(size_of::<Elf64Shdr>())?;
     // `decode_shdr` reads fields byte-wise, so `data` needs no alignment.
-    Some(decode_shdr(data.get(offset..end)?))
+    decode_shdr(data.get(offset..end)?)
 }
 
 fn read_shdr_streaming<F>(
@@ -1003,53 +1009,72 @@ where
     {
         return None;
     }
-    Some(decode_shdr(&buf))
+    decode_shdr(&buf)
 }
 
-fn decode_shdr(bytes: &[u8]) -> Elf64Shdr
+/// Decode a section header from the front of `bytes`; `None` when `bytes`
+/// is shorter than one.
+fn decode_shdr(bytes: &[u8]) -> Option<Elf64Shdr>
 {
-    Elf64Shdr {
-        sh_name: u32_le(&bytes[0..4]),
-        sh_type: u32_le(&bytes[4..8]),
-        sh_flags: u64_le(&bytes[8..16]),
-        sh_addr: u64_le(&bytes[16..24]),
-        sh_offset: u64_le(&bytes[24..32]),
-        sh_size: u64_le(&bytes[32..40]),
-        sh_link: u32_le(&bytes[40..44]),
-        sh_info: u32_le(&bytes[44..48]),
-        sh_addralign: u64_le(&bytes[48..56]),
-        sh_entsize: u64_le(&bytes[56..64]),
+    let mut b = Fields(bytes);
+    // Struct fields are evaluated in the order written, the header's order.
+    Some(Elf64Shdr {
+        sh_name: b.u32()?,
+        sh_type: b.u32()?,
+        sh_flags: b.u64()?,
+        sh_addr: b.u64()?,
+        sh_offset: b.u64()?,
+        sh_size: b.u64()?,
+        sh_link: b.u32()?,
+        sh_info: b.u32()?,
+        sh_addralign: b.u64()?,
+        sh_entsize: b.u64()?,
+    })
+}
+
+/// Little-endian fields read in order from the front of a byte slice, each
+/// `None` once the slice is shorter than the field.
+struct Fields<'a>(&'a [u8]);
+
+impl Fields<'_>
+{
+    /// The next `N` bytes.
+    fn bytes<const N: usize>(&mut self) -> Option<[u8; N]>
+    {
+        let (field, rest) = self.0.split_first_chunk::<N>()?;
+        self.0 = rest;
+        Some(*field)
+    }
+
+    fn u16(&mut self) -> Option<u16>
+    {
+        self.bytes().map(u16::from_le_bytes)
+    }
+
+    fn u32(&mut self) -> Option<u32>
+    {
+        self.bytes().map(u32::from_le_bytes)
+    }
+
+    fn u64(&mut self) -> Option<u64>
+    {
+        self.bytes().map(u64::from_le_bytes)
+    }
+
+    fn i64(&mut self) -> Option<i64>
+    {
+        self.bytes().map(i64::from_le_bytes)
     }
 }
 
-fn u16_le(b: &[u8]) -> u16
-{
-    u16::from_le_bytes([b[0], b[1]])
-}
-
-fn u32_le(b: &[u8]) -> u32
-{
-    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-
-fn u64_le(b: &[u8]) -> u64
-{
-    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-}
-
+/// Whether the NUL-terminated name at `offset` in `strtab` is `expected`.
 fn section_name_eq(strtab: &[u8], offset: usize, expected: &str) -> bool
 {
-    if offset >= strtab.len()
-    {
-        return false;
-    }
-    let bytes = expected.as_bytes();
-    let end = offset.saturating_add(bytes.len());
-    if end >= strtab.len() || strtab[offset..end] != *bytes
-    {
-        return false;
-    }
-    strtab[end] == 0
+    strtab
+        .get(offset..)
+        .and_then(|name| name.strip_prefix(expected.as_bytes()))
+        .and_then(<[u8]>::first)
+        == Some(&0)
 }
 
 /// Locate the `PT_TLS` segment using only the ELF header page, validating
@@ -1220,15 +1245,31 @@ pub const fn relative_reloc_type(machine: u16) -> Option<u32>
     }
 }
 
-/// Decode one `Elf64_Rela` record from its 24 raw bytes.
+/// Decode one `Elf64_Rela` record from the front of `bytes`; `None` when
+/// `bytes` is shorter than [`RELA_ENTRY_SIZE`].
 #[must_use]
-pub fn decode_rela(bytes: &[u8; RELA_ENTRY_SIZE]) -> Rela
+pub fn decode_rela(bytes: &[u8]) -> Option<Rela>
 {
-    Rela {
-        offset: u64_le(&bytes[0..8]),
-        rtype: u32_le(&bytes[8..12]),
-        addend: i64_le(&bytes[16..24]),
-    }
+    decode_rela_record(bytes).map(|(rela, _)| rela)
+}
+
+/// Decode one `Elf64_Rela` record and the symbol index of its `r_info` (the
+/// high half), from the front of `bytes`.
+fn decode_rela_record(bytes: &[u8]) -> Option<(Rela, u32)>
+{
+    let mut b = Fields(bytes);
+    let offset = b.u64()?;
+    let rtype = b.u32()?;
+    let sym = b.u32()?;
+    let addend = b.i64()?;
+    Some((
+        Rela {
+            offset,
+            rtype,
+            addend,
+        },
+        sym,
+    ))
 }
 
 /// Tags gathered from one walk of a `PT_DYNAMIC` segment.
@@ -1248,12 +1289,14 @@ struct DynamicSummary
 fn parse_dynamic(dyn_bytes: &[u8]) -> DynamicSummary
 {
     let mut summary = DynamicSummary::default();
-    let mut off = 0;
-    while off + DYN_ENTRY_SIZE <= dyn_bytes.len()
+    for entry in dyn_bytes.as_chunks::<DYN_ENTRY_SIZE>().0
     {
-        let tag = i64_le(&dyn_bytes[off..off + 8]);
-        let val = u64_le(&dyn_bytes[off + 8..off + 16]);
-        off += DYN_ENTRY_SIZE;
+        let mut b = Fields(entry.as_slice());
+        let (Some(tag), Some(val)) = (b.i64(), b.u64())
+        else
+        {
+            break;
+        };
         match tag
         {
             DT_NULL => break,
@@ -1312,7 +1355,10 @@ fn resolve_rela_table(
             .ok_or(ElfError::MalformedDynamic)?;
         if vaddr >= phdr.p_vaddr && table_end <= seg_file_end
         {
-            let file_offset = phdr.p_offset + (vaddr - phdr.p_vaddr);
+            let file_offset = vaddr
+                .checked_sub(phdr.p_vaddr)
+                .and_then(|into| phdr.p_offset.checked_add(into))
+                .ok_or(ElfError::MalformedDynamic)?;
             let file_end = file_offset
                 .checked_add(size)
                 .ok_or(ElfError::MalformedDynamic)?;
@@ -1378,11 +1424,10 @@ pub fn rela_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, El
     let end = offset
         .checked_add(filesz)
         .ok_or(ElfError::MalformedDynamic)?;
-    if end > data.len() as u64
-    {
-        return Err(ElfError::MalformedDynamic);
-    }
-    let summary = parse_dynamic(&data[offset as usize..end as usize]);
+    let dyn_bytes = data
+        .get(offset as usize..end as usize)
+        .ok_or(ElfError::MalformedDynamic)?;
+    let summary = parse_dynamic(dyn_bytes);
     resolve_rela_table(&summary, ehdr, data, data.len() as u64)
 }
 
@@ -1419,12 +1464,13 @@ where
     }
     let mut buf = [0u8; MAX_STREAMING_DYNAMIC];
     let want = filesz as usize;
-    let got = read_at(offset, &mut buf[..want]).ok_or(ElfError::MalformedDynamic)?;
+    let dyn_bytes = buf.get_mut(..want).ok_or(ElfError::MalformedDynamic)?;
+    let got = read_at(offset, dyn_bytes).ok_or(ElfError::MalformedDynamic)?;
     if got < want
     {
         return Err(ElfError::MalformedDynamic);
     }
-    let summary = parse_dynamic(&buf[..want]);
+    let summary = parse_dynamic(dyn_bytes);
     resolve_rela_table(&summary, ehdr, header_data, file_size)
 }
 
@@ -1435,9 +1481,9 @@ where
 /// `Err(`[`ElfError::UnsupportedRelocation`]`)`.
 pub struct RelativeRelocIter<'a>
 {
+    /// The records not yet yielded.
     table: &'a [u8],
     expected_rtype: u32,
-    off: usize,
 }
 
 impl Iterator for RelativeRelocIter<'_>
@@ -1446,18 +1492,11 @@ impl Iterator for RelativeRelocIter<'_>
 
     fn next(&mut self) -> Option<Self::Item>
     {
-        if self.off + RELA_ENTRY_SIZE > self.table.len()
-        {
-            return None;
-        }
-        let bytes: &[u8; RELA_ENTRY_SIZE] = self.table[self.off..self.off + RELA_ENTRY_SIZE]
-            .try_into()
-            .ok()?;
-        self.off += RELA_ENTRY_SIZE;
-        let rela = decode_rela(bytes);
+        let (bytes, rest) = self.table.split_first_chunk::<RELA_ENTRY_SIZE>()?;
+        self.table = rest;
+        let (rela, sym) = decode_rela_record(bytes)?;
         // r_info's high half is the symbol index; RELATIVE records must not
         // reference a symbol.
-        let sym = u32_le(&bytes[12..16]);
         if rela.rtype != self.expected_rtype || sym != 0
         {
             return Some(Err(ElfError::UnsupportedRelocation));
@@ -1488,7 +1527,6 @@ pub fn relative_relocs(table: &[u8], machine: u16) -> Result<RelativeRelocIter<'
     Ok(RelativeRelocIter {
         table,
         expected_rtype,
-        off: 0,
     })
 }
 
@@ -1530,7 +1568,8 @@ pub fn validate_relative_relocs(
         {
             return Err(ElfError::RelocOutOfBounds);
         }
-        count += 1;
+        // At most one per record of `table`, so the count cannot wrap.
+        count = count.saturating_add(1);
     }
     Ok(count)
 }
@@ -1555,9 +1594,16 @@ pub fn apply_reloc_in_span(rela: &Rela, bias: u64, span_vaddr: u64, span: &mut [
     {
         return 0;
     }
-    let pos = (rela.offset - span_vaddr) as usize;
+    // `rela.offset >= span_vaddr` here, so the difference is exact, and
+    // the whole target lies in `span`, so the lookup succeeds.
+    let pos = rela.offset.saturating_sub(span_vaddr) as usize;
+    let Some(target) = span.get_mut(pos..).and_then(<[u8]>::first_chunk_mut::<8>)
+    else
+    {
+        return 0;
+    };
     let value = bias.wrapping_add(rela.addend.cast_unsigned());
-    span[pos..pos + 8].copy_from_slice(&value.to_le_bytes());
+    *target = value.to_le_bytes();
     1
 }
 
@@ -1584,7 +1630,8 @@ pub fn apply_relative_relocs(
     let mut applied = 0u64;
     for rela in iter.flatten()
     {
-        applied += apply_reloc_in_span(&rela, bias, span_vaddr, span);
+        // At most one per record of `table`, so the count cannot wrap.
+        applied = applied.saturating_add(apply_reloc_in_span(&rela, bias, span_vaddr, span));
     }
     applied
 }
@@ -1612,22 +1659,27 @@ fn read_phdr_at(data: &[u8], base: usize, idx: usize) -> Result<Elf64Phdr, ElfEr
     let end = offset
         .checked_add(size_of::<Elf64Phdr>())
         .ok_or(ElfError::PhdrTableOverflow)?;
-    let b = data.get(offset..end).ok_or(ElfError::PhdrTableOverflow)?;
-    Ok(Elf64Phdr {
-        p_type: u32_le(&b[0..4]),
-        p_flags: u32_le(&b[4..8]),
-        p_offset: u64_le(&b[8..16]),
-        p_vaddr: u64_le(&b[16..24]),
-        p_paddr: u64_le(&b[24..32]),
-        p_filesz: u64_le(&b[32..40]),
-        p_memsz: u64_le(&b[40..48]),
-        p_align: u64_le(&b[48..56]),
-    })
+    data.get(offset..end)
+        .and_then(decode_phdr)
+        .ok_or(ElfError::PhdrTableOverflow)
 }
 
-fn i64_le(b: &[u8]) -> i64
+/// Decode a program header from the front of `bytes`; `None` when `bytes`
+/// is shorter than one.
+fn decode_phdr(bytes: &[u8]) -> Option<Elf64Phdr>
 {
-    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    let mut b = Fields(bytes);
+    // Struct fields are evaluated in the order written, the header's order.
+    Some(Elf64Phdr {
+        p_type: b.u32()?,
+        p_flags: b.u32()?,
+        p_offset: b.u64()?,
+        p_vaddr: b.u64()?,
+        p_paddr: b.u64()?,
+        p_filesz: b.u64()?,
+        p_memsz: b.u64()?,
+        p_align: b.u64()?,
+    })
 }
 
 #[cfg(test)]
@@ -1977,6 +2029,24 @@ mod tests
     }
 
     #[test]
+    fn rejects_a_table_whose_file_offset_overflows()
+    {
+        // The table lies 0x10 into LOAD1, whose file offset is at the top of
+        // the `u64` range, so the table's file offset does not fit a `u64`.
+        let mut img = build_image(
+            ET_DYN,
+            &[
+                dyn_entry(DT_RELA, 0x210),
+                dyn_entry(DT_RELASZ, 24),
+                dyn_entry(DT_RELAENT, 24),
+                dyn_entry(DT_NULL, 0),
+            ],
+        );
+        put(&mut img, 64 + 56 + 8, &u64::MAX.to_le_bytes());
+        assert_eq!(rela_of(&img), Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
     fn rejects_rel_table()
     {
         let mut entries = std_dynamic();
@@ -2179,7 +2249,7 @@ mod tests
         let mut span = vec![0u8; 0x300];
         let applied = apply_relative_relocs(table, MACHINE, 0x1000_0000, 0x200, &mut span);
         assert_eq!(applied, 2);
-        let word = |off: usize| u64_le(&span[off..off + 8]);
+        let word = |off: usize| u64::from_le_bytes(span[off..off + 8].try_into().unwrap());
         assert_eq!(word(0x50), 0x1000_0000 + 0x180); // target 0x250, addend 0x180
         assert_eq!(word(0x60), 0x1000_0000 + 0x1000); // target 0x260, addend 0x1000
 

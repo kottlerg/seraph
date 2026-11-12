@@ -1712,7 +1712,7 @@ fn populate_cspace(
 
     /// Width of the root `Interrupt` range cap minted at Phase 7 — the per-arch
     /// interrupt id space (`arch::current::ROOT_IRQ_COUNT`: 32768 GSIs on x86-64,
-    /// `MAX_IOAPICS` (128) I/O APICs of 256 pins; on RISC-V the PLIC's 1024-entry id space,
+    /// `MAX_IOAPICS` (128) I/O APICs of 256 pins; on RISC-V the APLIC's 1024-entry id space,
     /// sources 1-1023). `SYS_IRQ_REGISTER` refuses an id no discovered controller
     /// implements, and the routing table ignores one past its discovered size,
     /// so oversizing is safe.
@@ -1964,9 +1964,9 @@ fn populate_cspace(
     // `SYS_IRQ_SPLIT` and delegates one per device.
     //
     // x86-64: 32768 GSI lines, every pin of the `MAX_IOAPICS` (128) I/O
-    // APICs the boot protocol carries. RISC-V: the PLIC's 1024-entry id space (sources
+    // APICs the boot protocol carries. RISC-V: the APLIC's 1024-entry id space (sources
     // 1-1023) is the spec maximum; most platforms expose far fewer (e.g.
-    // 95). Sizing the root at the id space is safe because
+    // 96). Sizing the root at the id space is safe because
     // `SYS_IRQ_REGISTER` refuses an id no discovered controller implements and
     // the routing table ignores one past its discovered size (see
     // `ROOT_IRQ_COUNT` above).

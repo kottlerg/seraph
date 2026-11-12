@@ -35,7 +35,7 @@
 //!   supervisor-level APLIC domain and IMSIC layout.
 //!
 //! Arch-specific `kernel_mmio` extractors (LAPIC+IOAPIC on x86-64;
-//! PLIC+APLIC+IMSIC+UART on RISC-V) consume the byte helpers and layout
+//! APLIC+IMSIC+UART on RISC-V) consume the byte helpers and layout
 //! constants exposed here but live under [`crate::arch`].
 
 use crate::bprintln;
@@ -74,7 +74,6 @@ const MADT_TYPE_LOCAL_X2APIC: u8 = 9; // x86-64: Processor Local x2APIC, length 
 const MADT_TYPE_RINTC: u8 = 0x18; // RISC-V INTC (MADT type 24), length 36
 const MADT_TYPE_IMSIC: u8 = 0x19; // RISC-V IMSIC (MADT type 25), length 16
 const MADT_TYPE_APLIC: u8 = 0x1A; // RISC-V APLIC (MADT type 26), length 36
-pub(crate) const MADT_TYPE_PLIC: u8 = 0x1B; // RISC-V PLIC (MADT type 27)
 
 // MCFG: entries start at offset 44 (SDT_HDR_LEN + 8 reserved bytes).
 const MCFG_ENTRIES_OFF: usize = SDT_HDR_LEN + 8;
@@ -849,8 +848,6 @@ pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 /// - Local APIC register window, when non-zero (x86-64 only: from the
 ///   MADT header, or from a `LocalApicAddressOverride` entry).
 /// - Each I/O APIC register window (x86-64, MADT type 1).
-/// - Each RISC-V PLIC register window (MADT type 0x1B, present on
-///   RISC-V platforms that expose ACPI such as QEMU+EDK2 virt).
 /// - Each RISC-V APLIC register window (MADT type 0x1A), and each
 ///   supervisor-level IMSIC file an enabled RINTC structure (MADT type 0x18)
 ///   names, one seed per file.
@@ -1017,21 +1014,6 @@ unsafe fn walk_aperture_seed(
                     MADT_TYPE_LAPIC_OVERRIDE if entry_len >= 12 =>
                     {
                         lapic = read_u64(table, off + 4);
-                    }
-                    MADT_TYPE_PLIC if entry_len >= 36 =>
-                    {
-                        // Type 0x1B (RISC-V PLIC), ACPI 6.5+:
-                        //   off+ 0: type(u8) | off+ 1: length(u8)
-                        //   off+ 2: version(u8) | off+ 3: id(u8)
-                        //   off+ 4: hardware_id(8B)
-                        //   off+12: total_ext_int_sources(u16) | off+14: max_priority(u16)
-                        //   off+16: flags(u32)
-                        //   off+20: size(u32)
-                        //   off+24: base(u64)
-                        //   off+32: gsi_base(u32)
-                        let size = u64::from(read_u32(table, off + 20));
-                        let base = read_u64(table, off + 24);
-                        push!(base, size);
                     }
                     MADT_TYPE_APLIC if entry_len >= madt_len::APLIC =>
                     {

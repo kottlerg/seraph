@@ -3,11 +3,10 @@
 
 // core/kernel/src/arch/riscv64/encoding.rs
 
-//! RISC-V register-map and instruction-encoding arithmetic: the PLIC context
-//! layout, the PLIC source-count clamp, the SBI hart-mask window, page
-//! rounding, the F/D/V opcode decode the lazy extended-state trap uses, the
-//! PTE permission bits and their test in the kernel's spurious-fault retry,
-//! and the user leaf's grant bits and the permission change they bound.
+//! RISC-V register-map and instruction-encoding arithmetic: the SBI hart-mask
+//! window, page rounding, the F/D/V opcode decode the lazy extended-state trap
+//! uses, the PTE permission bits and their test in the kernel's spurious-fault
+//! retry, and the user leaf's grant bits and the permission change they bound.
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
 //! arch module. `arch/mod.rs` also compiles this file into host test builds
@@ -15,78 +14,6 @@
 //! host) runs its tests.
 
 use crate::mm::paging::{LeafGrant, PagingError};
-
-/// Largest PLIC source id the RISC-V PLIC specification allows (sources 1..=1023;
-/// source 0 is reserved).
-pub(super) const PLIC_MAX_SOURCES: u32 = 1023;
-
-/// Default PLIC MMIO window size when the bootloader did not report one: the
-/// 64 MiB register map of the RISC-V PLIC specification, whose threshold and
-/// claim/complete blocks hold all 15 872 contexts. A hardware spec value, so a
-/// firmware hart id whose S-mode context the specification admits is never
-/// refused for want of a reported size.
-pub(super) const DEFAULT_PLIC_SIZE: u64 = 0x0400_0000;
-
-/// PLIC S-mode context of the hart with hardware id `hart`.
-///
-/// Assumes the context layout of the targeted platforms (QEMU `virt`,
-/// SiFive-style PLICs): M-mode = `hart*2`, S-mode = `hart*2+1`. The PLIC
-/// specification leaves the mapping to the platform (`interrupts` module doc).
-const fn plic_s_context(hart: u32) -> u64
-{
-    hart as u64 * 2 + 1
-}
-
-/// PLIC S-mode enable-bits base for the hart with hardware id `hart`:
-/// 0x2000 + context * 0x80.
-pub(super) const fn plic_enable_base_for(hart: u32) -> u64
-{
-    0x2000 + plic_s_context(hart) * 0x80
-}
-
-/// PLIC S-mode threshold register offset for the hart with hardware id `hart`:
-/// `0x20_0000 + context * 0x1000`. The claim/complete register follows at +4.
-pub(super) const fn plic_threshold_offset_for(hart: u32) -> u64
-{
-    0x0020_0000 + plic_s_context(hart) * 0x1000
-}
-
-/// Number of 32-bit enable words a context needs for sources `0..=ndev`.
-pub(super) const fn enable_words(ndev: u32) -> u32
-{
-    (ndev + 1).div_ceil(32)
-}
-
-/// Whether the S-mode context registers of the hart with hardware id `hart`
-/// (its enable words and its threshold and claim/complete pair) lie inside the
-/// PLIC window of `window` bytes.
-///
-/// Hart ids come from firmware and can be sparse or large; a context past the
-/// window would turn a `plic_write` into a store to arbitrary physical memory
-/// through the direct map.
-pub(super) const fn plic_context_in_window(hart: u32, window: u64) -> bool
-{
-    // With the standard register map the claim register always ends past the
-    // enable words, so the enable-word test is defensive: it keeps the bound
-    // correct should the enable span ever grow past the context block.
-    let enable_end = plic_enable_base_for(hart) + enable_words(PLIC_MAX_SOURCES) as u64 * 4;
-    let claim_end = plic_threshold_offset_for(hart) + 8;
-    enable_end <= window && claim_end <= window
-}
-
-/// The PLIC source count to program for a reported `riscv,ndev` of `reported`: the report
-/// when it lies in `1..=PLIC_MAX_SOURCES`, else the specification's [`PLIC_MAX_SOURCES`].
-/// An unreported count (0) programs every source the specification allows, which is
-/// harmless for the ones the PLIC lacks (their priority and enable bits read as zero); a
-/// report past the specification is clamped.
-pub(super) fn ndev_for(reported: u64) -> u32
-{
-    match u32::try_from(reported)
-    {
-        Ok(n) if (1..=PLIC_MAX_SOURCES).contains(&n) => n,
-        _ => PLIC_MAX_SOURCES,
-    }
-}
 
 /// Split a hart ID into the SBI `(hart_mask, hart_mask_base)` pair.
 ///
@@ -293,44 +220,6 @@ mod tests
     use super::*;
 
     #[test]
-    fn plic_context_registers_follow_the_hart_id()
-    {
-        // Hart 0: S-mode context 1.
-        assert_eq!(plic_enable_base_for(0), 0x2080);
-        assert_eq!(plic_threshold_offset_for(0), 0x0020_1000);
-        // Hart 3: S-mode context 7, so a boot hart other than 0 gets its own
-        // registers rather than hart 0's.
-        assert_eq!(plic_enable_base_for(3), 0x2000 + 7 * 0x80);
-        assert_eq!(plic_threshold_offset_for(3), 0x0020_0000 + 7 * 0x1000);
-    }
-
-    // Defect caught: a firmware hart id whose context lies past the PLIC window
-    // being accepted, which would turn the context writes into stores outside it.
-    #[test]
-    fn plic_context_outside_the_window_is_refused()
-    {
-        // A 4 MiB window holds 512 contexts after the 2 MiB of priority, pending
-        // and enable registers: the S-mode contexts of harts 0..=255 (context
-        // 511's claim register ends at 0x3F_F008); hart 256's is context 513.
-        assert!(plic_context_in_window(0, 0x40_0000));
-        assert!(plic_context_in_window(255, 0x40_0000));
-        assert!(!plic_context_in_window(256, 0x40_0000));
-        assert!(!plic_context_in_window(u32::MAX, 0x40_0000));
-    }
-
-    // Defect caught: a default window too small for the hart ids the PLIC
-    // specification admits, so a platform reporting no PLIC size halts the boot
-    // on a hart id at or above 256.
-    #[test]
-    fn default_plic_window_holds_every_context_the_specification_admits()
-    {
-        // Context 15871, the specification's last, is hart 7935's S-mode context.
-        assert!(plic_context_in_window(256, DEFAULT_PLIC_SIZE));
-        assert!(plic_context_in_window(7935, DEFAULT_PLIC_SIZE));
-        assert!(!plic_context_in_window(7936, DEFAULT_PLIC_SIZE));
-    }
-
-    #[test]
     fn sbi_hart_mask_windows()
     {
         assert_eq!(sbi_hart_mask(0), (1, 0));
@@ -348,19 +237,6 @@ mod tests
         assert_eq!(page_round_up(1), 0x1000);
         assert_eq!(page_round_up(0x1000), 0x1000);
         assert_eq!(page_round_up(0x1001), 0x2000);
-    }
-
-    // Defect caught: a reported source count trusted past the PLIC specification (the
-    // enable and priority loops would write past the source registers), or an unreported
-    // count leaving every source unprogrammed.
-    #[test]
-    fn plic_ndev_takes_the_report_within_the_specification()
-    {
-        assert_eq!(ndev_for(95), 95);
-        assert_eq!(ndev_for(1023), 1023);
-        assert_eq!(ndev_for(1024), 1023);
-        assert_eq!(ndev_for(u64::MAX), 1023);
-        assert_eq!(ndev_for(0), 1023);
     }
 
     #[test]

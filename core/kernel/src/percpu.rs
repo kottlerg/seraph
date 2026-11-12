@@ -59,7 +59,7 @@ use crate::sched::thread::ThreadControlBlock;
 /// Array mapping logical CPU index to hardware APIC ID (x86-64) or hart ID (RISC-V).
 ///
 /// Populated by [`init_apic_ids`] from `BootInfo::cpu_ids` at the end of Phase 4,
-/// before Phase 5's riscv64 PLIC setup names the BSP by its hart id.
+/// before Phase 5's riscv64 AIA setup names the BSP by its hart id.
 /// Accessed by [`apic_id_for`] to retrieve the APIC ID for a given logical CPU.
 /// Elements are `u32` because `BootInfo::cpu_ids` is an array of `u32`s, which
 /// holds every x2APIC ID.

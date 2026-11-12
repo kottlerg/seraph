@@ -48,7 +48,7 @@ when it exits on its own.
    acknowledges only when its client reads
    ([services/drivers/serial/README.md](../serial/README.md#interrupts) § Interrupts), so devmgr
    keeps the UART line exclusive. The UART line is never a PCI `INTx` line on either machine
-   (x86-64 COM1 is ISA IRQ 4, the riscv64 `virt` NS16550 is PLIC source 10 against `INTx` sources
+   (x86-64 COM1 is ISA IRQ 4, the riscv64 `virt` NS16550 is APLIC source 10 against `INTx` sources
    32 to 35), so the exclusivity costs no device a cap in practice.
 6. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where
    applicable rather than duplicating transport logic.

@@ -151,8 +151,11 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     supervisor-level IMSIC interrupt files), from the ACPI MADT (RINTC,
 ///     IMSIC and APLIC structures) or the DTB (`riscv,aplic`, `riscv,imsics`);
 ///     zero when the platform reports none. `hart_caps` gained bit 4
-///     ([`HART_CAP_SSAIA`]). The PLIC fields are unchanged.
-pub const BOOT_PROTOCOL_VERSION: u32 = 20;
+///     ([`HART_CAP_SSAIA`]).
+/// v21: The riscv64 [`KernelMmio`] lost `plic_base`, `plic_size` and
+///     `plic_ndev`: the kernel drives AIA only, so `aplic` and `imsic` are
+///     its interrupt controllers, and `uart_base` is now its first field.
+pub const BOOT_PROTOCOL_VERSION: u32 = 21;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -599,16 +602,6 @@ impl KernelMmio
 #[derive(Clone, Copy, Debug)]
 pub struct KernelMmio
 {
-    /// Physical base of the PLIC register window.
-    pub plic_base: u64,
-    /// Size of the PLIC register window in bytes.
-    pub plic_size: u64,
-    /// Number of interrupt sources the PLIC implements (sources
-    /// `1..=plic_ndev`), from the DTB `riscv,ndev` property or the ACPI MADT
-    /// PLIC structure's total external interrupt sources. Zero when neither
-    /// source reported it; the kernel then programs the specification's
-    /// full 1023 sources.
-    pub plic_ndev: u64,
     /// Physical base of the kernel console UART (ns16550-compatible).
     pub uart_base: u64,
     /// Size of the UART register window in bytes.
@@ -809,9 +802,6 @@ impl KernelMmio
     pub const fn zero() -> Self
     {
         Self {
-            plic_base: 0,
-            plic_size: 0,
-            plic_ndev: 0,
             uart_base: 0,
             uart_size: 0,
             timebase_freq: 0,

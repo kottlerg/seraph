@@ -40,10 +40,10 @@
 //! records level-triggered, active-high; a second binding passing another mode
 //! is refused, as is a rebind of the first, and binds nothing (with the first
 //! acknowledged, a raise signals it alone); a second passing the same mode
-//! binds, a raise signals both, and where the mode programs the line
-//! level-triggered (x86-64), with the line held asserted across both
-//! acknowledgements, it signals both again at the unmask, which an
-//! edge-triggered entry would not; once both go, a new first binding records
+//! binds, a raise signals both, and, the mode programming the line
+//! level-triggered, with the line held asserted across both acknowledgements,
+//! it signals both again at the unmask, which an edge-triggered line would not;
+//! once both go, a new first binding records
 //! edge-triggered again; a mode with a bit outside `IRQ_MODE_MASK` is refused.
 //! Every mode used is active-high, the UART line's own polarity, so no binding
 //! inverts the line.
@@ -54,9 +54,7 @@ use syscall::{
 };
 use syscall_abi::SyscallError;
 
-use crate::arch::serial::{
-    UART_HELD_LEVEL_REDELIVERED, UART_IRQ, quiet_tx_interrupt, raise_tx_interrupt,
-};
+use crate::arch::serial::{UART_IRQ, quiet_tx_interrupt, raise_tx_interrupt};
 use crate::{TestContext, TestResult};
 
 /// The kernel's `MAX_IRQ_BINDINGS`: bindings one line holds.
@@ -240,27 +238,21 @@ fn line_mode(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
     raise_expect(&[n1], &[n2], "a refused registration bound the line")?;
     irq_register(b, n2, IRQ_MODE_LEVEL)
         .map_err(|_| "integration::irq_shared_line: a binding of the line's mode was refused")?;
-    // A raise signals both. Where the mode programs the line level-triggered
-    // (`UART_HELD_LEVEL_REDELIVERED`: x86-64's I/O APIC), the assertion, held
-    // across both acknowledgements, is delivered again at the unmask; an
-    // edge-triggered entry raises no new edge for it.
+    // A raise signals both. The mode programs the line level-triggered (the
+    // x86-64 I/O APIC entry, the riscv64 APLIC source, which the unmask pends
+    // again while it is asserted), so the assertion, held across both
+    // acknowledgements, is delivered again at the unmask; an edge-triggered
+    // line raises no new edge for it.
     acknowledge(&[a, b])?;
     raise_tx_interrupt();
     let redelivered = expect_signalled(&[n1, n2], &[], "a level line did not signal both bindings")
         .and_then(|()| {
-            if UART_HELD_LEVEL_REDELIVERED
-            {
-                acknowledge(&[a, b])?;
-                expect_signalled(
-                    &[n1, n2],
-                    &[],
-                    "a level line did not deliver an assertion held at the unmask",
-                )
-            }
-            else
-            {
-                Ok(())
-            }
+            acknowledge(&[a, b])?;
+            expect_signalled(
+                &[n1, n2],
+                &[],
+                "a level line did not deliver an assertion held at the unmask",
+            )
         });
     quiet_tx_interrupt();
     redelivered?;

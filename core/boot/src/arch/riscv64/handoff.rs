@@ -95,7 +95,15 @@ pub fn trampoline_page_range() -> (u64, u64)
     let start = core::ptr::addr_of!(_handoff_trampoline) as u64;
     let end = core::ptr::addr_of!(_handoff_trampoline_end) as u64;
 
-    let last_byte = if end > start { end - 1 } else { start };
+    // `end` is above `start`, so it is at least 1.
+    let last_byte = if end > start
+    {
+        end.saturating_sub(1)
+    }
+    else
+    {
+        start
+    };
 
     let first_page = start & !0xFFF;
     let last_page = last_byte & !0xFFF;

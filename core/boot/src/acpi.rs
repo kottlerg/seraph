@@ -81,6 +81,13 @@ const MCFG_ENTRY_SIZE: usize = 16;
 
 // ── Byte-level read helpers ───────────────────────────────────────────────────
 
+/// The `N` bytes at byte `off` within `buf`, or `None` on a short read or an
+/// offset that overflows.
+fn read_array<const N: usize>(buf: &[u8], off: usize) -> Option<[u8; N]>
+{
+    buf.get(off..)?.first_chunk::<N>().copied()
+}
+
 /// Read a little-endian u16 at byte `off` within `buf`. Returns 0 on short read.
 ///
 /// Only the RHCT walker below consumes u16 fields; on x86-64 that walker
@@ -89,40 +96,19 @@ const MCFG_ENTRY_SIZE: usize = 16;
 #[allow(dead_code)]
 pub(crate) fn read_u16(buf: &[u8], off: usize) -> u16
 {
-    if off + 2 > buf.len()
-    {
-        return 0;
-    }
-    u16::from_le_bytes([buf[off], buf[off + 1]])
+    read_array(buf, off).map_or(0, u16::from_le_bytes)
 }
 
 /// Read a little-endian u32 at byte `off` within `buf`. Returns 0 on short read.
 pub(crate) fn read_u32(buf: &[u8], off: usize) -> u32
 {
-    if off + 4 > buf.len()
-    {
-        return 0;
-    }
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    read_array(buf, off).map_or(0, u32::from_le_bytes)
 }
 
 /// Read a little-endian u64 at byte `off` within `buf`. Returns 0 on short read.
 pub(crate) fn read_u64(buf: &[u8], off: usize) -> u64
 {
-    if off + 8 > buf.len()
-    {
-        return 0;
-    }
-    u64::from_le_bytes([
-        buf[off],
-        buf[off + 1],
-        buf[off + 2],
-        buf[off + 3],
-        buf[off + 4],
-        buf[off + 5],
-        buf[off + 6],
-        buf[off + 7],
-    ])
+    read_array(buf, off).map_or(0, u64::from_le_bytes)
 }
 
 /// Read a u8 at byte `off` within `buf`. Returns 0 on short read.
@@ -142,6 +128,21 @@ pub(crate) unsafe fn phys_slice<'a>(phys: u64, len: usize) -> &'a [u8]
     unsafe { core::slice::from_raw_parts(phys as *const u8, len) }
 }
 
+/// The signature of the SDT whose header is `hdr`, or `None` for a header
+/// shorter than the signature.
+pub(crate) fn sdt_sig(hdr: &[u8]) -> Option<[u8; 4]>
+{
+    read_array(hdr, SDT_OFF_SIGNATURE)
+}
+
+/// The table address in XSDT entry `i` of `entries_bytes`; `0` (which every
+/// walker skips) for an entry past the array.
+pub(crate) fn xsdt_entry_addr(entries_bytes: &[u8], i: usize) -> u64
+{
+    i.checked_mul(8)
+        .map_or(0, |off| read_u64(entries_bytes, off))
+}
+
 /// Walk RSDP → XSDT and return the XSDT entry array (the 8-byte table
 /// pointers after the XSDT's own SDT header), or `None` when the RSDP/XSDT
 /// is absent or malformed.
@@ -157,7 +158,7 @@ unsafe fn xsdt_entries<'a>(rsdp_addr: u64) -> Option<&'a [u8]>
     }
     // SAFETY: caller guarantees rsdp_addr is valid and identity-mapped.
     let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
-    if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
+    if !rsdp.starts_with(RSDP_SIG) || read_u8(rsdp, RSDP_OFF_REVISION) < 2
     {
         return None;
     }
@@ -169,7 +170,7 @@ unsafe fn xsdt_entries<'a>(rsdp_addr: u64) -> Option<&'a [u8]>
 
     // SAFETY: xsdt_addr from validated RSDP; firmware guarantees mapping.
     let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
-    if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
+    if sdt_sig(xsdt_hdr) != Some(*b"XSDT")
     {
         return None;
     }
@@ -180,7 +181,24 @@ unsafe fn xsdt_entries<'a>(rsdp_addr: u64) -> Option<&'a [u8]>
     }
     // SAFETY: length validated above; firmware guarantees mapping.
     let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
-    Some(&xsdt[SDT_HDR_LEN..])
+    xsdt.get(SDT_HDR_LEN..)
+}
+
+/// Return the header of the table at XSDT entry index `i`, or `None` for an
+/// absent (zero) entry.
+///
+/// # Safety
+/// `entries_bytes` must come from [`xsdt_entries`]; every referenced table
+/// must be identity-mapped.
+unsafe fn table_header_at<'a>(entries_bytes: &[u8], i: usize) -> Option<(u64, &'a [u8])>
+{
+    let table_addr = xsdt_entry_addr(entries_bytes, i);
+    if table_addr == 0
+    {
+        return None;
+    }
+    // SAFETY: table_addr read from validated XSDT; firmware guarantees mapping.
+    Some((table_addr, unsafe { phys_slice(table_addr, SDT_HDR_LEN) }))
 }
 
 /// Return the length-validated table at XSDT entry index `i` if its SDT
@@ -191,14 +209,9 @@ unsafe fn xsdt_entries<'a>(rsdp_addr: u64) -> Option<&'a [u8]>
 /// must be identity-mapped.
 unsafe fn table_at<'a>(entries_bytes: &[u8], i: usize, sig: [u8; 4]) -> Option<&'a [u8]>
 {
-    let table_addr = read_u64(entries_bytes, i * 8);
-    if table_addr == 0
-    {
-        return None;
-    }
-    // SAFETY: table_addr read from validated XSDT; firmware guarantees mapping.
-    let hdr = unsafe { phys_slice(table_addr, SDT_HDR_LEN) };
-    if hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != sig
+    // SAFETY: forwarded caller contract.
+    let (table_addr, hdr) = unsafe { table_header_at(entries_bytes, i)? };
+    if sdt_sig(hdr) != Some(sig)
     {
         return None;
     }
@@ -265,8 +278,9 @@ fn find_vgia(table: &[u8]) -> Option<u32>
     let pos = body
         .windows(VGIA_PATTERN.len())
         .position(|w| w == VGIA_PATTERN)?;
-    let val_off = pos + VGIA_PATTERN.len();
-    if val_off + 4 > body.len()
+    // `pos` is the start of a match inside `body`, so the sum cannot overflow.
+    let val_off = pos.saturating_add(VGIA_PATTERN.len());
+    if val_off.checked_add(4)? > body.len()
     {
         return None;
     }
@@ -311,8 +325,14 @@ pub(crate) unsafe fn parse_vmgenid_paddr(rsdp_addr: u64) -> u64
         {
             continue;
         };
-        let guid_paddr = u64::from(base) + VMGENID_GUID_OFFSET;
-        let oem_id = &table[SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + SDT_OEM_TABLE_ID_LEN];
+        // `base` is a `u32`, so adding the small GUID offset cannot overflow.
+        let guid_paddr = u64::from(base).saturating_add(VMGENID_GUID_OFFSET);
+        let Some(oem_id) =
+            table.get(SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + SDT_OEM_TABLE_ID_LEN)
+        else
+        {
+            continue;
+        };
         if oem_id.starts_with(b"VMGENID")
         {
             return guid_paddr;
@@ -363,24 +383,36 @@ fn parse_rhct(table: &[u8]) -> (u64, u64)
 
     for _ in 0..node_count
     {
-        if off + RHCT_NODE_HDR_LEN > table.len()
+        let Some(hdr_end) = off.checked_add(RHCT_NODE_HDR_LEN)
+        else
+        {
+            break;
+        };
+        if hdr_end > table.len()
         {
             break;
         }
         let node_type = read_u16(table, off);
-        let node_len = read_u16(table, off + 2) as usize;
-        if node_len < RHCT_NODE_HDR_LEN || off + node_len > table.len()
+        // The node header lies inside `table`, so `off + 2` cannot overflow.
+        let node_len = read_u16(table, off.saturating_add(2)) as usize;
+        let Some(node_end) = off.checked_add(node_len)
+        else
+        {
+            break;
+        };
+        if node_len < RHCT_NODE_HDR_LEN || node_end > table.len()
         {
             break;
         }
 
         if node_type == RHCT_NODE_TYPE_ISA_STRING && node_len >= RHCT_NODE_HDR_LEN + 2
         {
-            let isa_len = read_u16(table, off + RHCT_NODE_HDR_LEN) as usize;
-            let isa_off = off + RHCT_NODE_HDR_LEN + 2;
-            let isa_end = isa_off.saturating_add(isa_len).min(off + node_len);
-            let isa = &table[isa_off.min(isa_end)..isa_end];
-            isa_nodes += 1;
+            let isa_len = read_u16(table, hdr_end) as usize;
+            // The node is at least `RHCT_NODE_HDR_LEN + 2` bytes inside `table`.
+            let isa_off = hdr_end.saturating_add(2);
+            let isa_end = isa_off.saturating_add(isa_len).min(node_end);
+            let isa = table.get(isa_off.min(isa_end)..isa_end).unwrap_or(&[]);
+            isa_nodes = isa_nodes.saturating_add(1);
             let mut node_caps = 0u64;
             for (ext, bit) in crate::dtb::HART_CAP_NAMES
             {
@@ -392,7 +424,7 @@ fn parse_rhct(table: &[u8]) -> (u64, u64)
             all_caps &= node_caps;
         }
 
-        off += node_len;
+        off = node_end;
     }
 
     (timebase, if isa_nodes > 0 { all_caps } else { 0 })
@@ -437,11 +469,13 @@ pub unsafe fn parse_hart_caps(rsdp_addr: u64) -> (u64, u64)
 /// the leading [`boot_protocol::MAX_CPUS`] processors.
 ///
 /// Returns 1, with `out[0] = bsp_id`, on any parse failure so the system
-/// falls back to single-CPU operation rather than refusing to boot.
+/// falls back to single-CPU operation rather than refusing to boot. An `out`
+/// with no slot places nothing and returns 0; the caller sizes it to at least
+/// one slot.
 ///
 /// # Safety
 /// `rsdp_addr` must be zero or the physical address of a valid, identity-mapped
-/// ACPI RSDP. `out` must hold at least one slot.
+/// ACPI RSDP.
 pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32, out: &mut [u32]) -> u32
 {
     // SAFETY: caller contract.
@@ -449,7 +483,13 @@ pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32, out: &mut [u32]) -
     {
         return parse_madt_topology(table, bsp_id, out);
     }
-    out[0] = bsp_id;
+    // The BSP alone, in slot 0; an `out` with no slot places nothing.
+    let Some(slot) = out.first_mut()
+    else
+    {
+        return 0;
+    };
+    *slot = bsp_id;
     1
 }
 
@@ -475,52 +515,14 @@ pub unsafe fn cpu_topology_capacity(rsdp_addr: u64) -> usize
 /// identity-mapped ACPI RSDP.
 unsafe fn find_madt(rsdp_addr: u64) -> Option<&'static [u8]>
 {
-    if rsdp_addr == 0
-    {
-        return None;
-    }
-    // SAFETY: caller guarantees rsdp_addr is valid, identity-mapped ACPI RSDP.
-    let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
-    if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
-    {
-        return None;
-    }
-    let xsdt_addr = read_u64(rsdp, RSDP_OFF_XSDT);
-    if xsdt_addr == 0
-    {
-        return None;
-    }
-    // SAFETY: xsdt_addr from validated RSDP; firmware guarantees physical mapping.
-    let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
-    if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
-    {
-        return None;
-    }
-    let xsdt_len = read_u32(xsdt_hdr, SDT_OFF_LENGTH) as usize;
-    if xsdt_len < SDT_HDR_LEN
-    {
-        return None;
-    }
-    // SAFETY: xsdt_len validated >= SDT_HDR_LEN above; firmware guarantees mapping.
-    let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
-    let entries_bytes = &xsdt[SDT_HDR_LEN..];
+    // SAFETY: caller contract.
+    let entries_bytes = unsafe { xsdt_entries(rsdp_addr)? };
     for i in 0..entries_bytes.len() / 8
     {
-        let table_addr = read_u64(entries_bytes, i * 8);
-        if table_addr == 0
+        // SAFETY: entries from xsdt_entries; forwarded caller contract.
+        if let Some(table) = unsafe { table_at(entries_bytes, i, *b"APIC") }
         {
-            continue;
-        }
-        // SAFETY: table_addr from XSDT entry; firmware guarantees physical mapping.
-        let hdr = unsafe { phys_slice(table_addr, SDT_HDR_LEN) };
-        if &hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] == b"APIC"
-        {
-            let table_len = read_u32(hdr, SDT_OFF_LENGTH) as usize;
-            if table_len >= SDT_HDR_LEN
-            {
-                // SAFETY: table_len validated; firmware guarantees mapping.
-                return Some(unsafe { phys_slice(table_addr, table_len) });
-            }
+            return Some(table);
         }
     }
     None
@@ -562,59 +564,38 @@ fn madt_topology(table: &[u8], bsp_id: u32, out: &mut [u32]) -> (u32, bool)
 /// - Type 0x18 (RISC-V INTC, RINTC): enabled if `flags & 1`.
 fn madt_cpu_ids(table: &[u8]) -> impl Iterator<Item = u32> + '_
 {
-    let mut off = MADT_ENTRIES_OFF;
-    core::iter::from_fn(move || {
-        while off + 2 <= table.len()
+    madt_entries(table).filter_map(|(entry_type, e)| match entry_type
+    {
+        MADT_TYPE_LAPIC if e.len() >= 8 =>
         {
-            let entry_type = read_u8(table, off);
-            let entry_len = read_u8(table, off + 1) as usize;
-            if entry_len < 2 || off + entry_len > table.len()
-            {
-                return None;
-            }
-            let at = off;
-            off += entry_len;
-            match entry_type
-            {
-                MADT_TYPE_LAPIC if entry_len >= 8 =>
-                {
-                    // Type 0 (Processor Local APIC), length 8:
-                    //   off+0: type  off+1: length  off+2: acpi_proc_id  off+3: apic_id
-                    //   off+4: flags(u32)  bit0=enabled  bit1=online-capable
-                    let flags = read_u32(table, at + 4);
-                    if (flags & 0x1 != 0) || (flags & 0x2 != 0)
-                    {
-                        return Some(u32::from(read_u8(table, at + 3)));
-                    }
-                }
-                MADT_TYPE_LOCAL_X2APIC if entry_len >= 16 =>
-                {
-                    // Type 9 (Processor Local x2APIC), length 16:
-                    //   off+0: type  off+1: length  off+2: reserved(2)
-                    //   off+4: x2apic_id(u32)
-                    //   off+8: flags(u32)  bit0=enabled  bit1=online-capable
-                    //   off+12: acpi_proc_uid(u32)
-                    let flags = read_u32(table, at + 8);
-                    if (flags & 0x1 != 0) || (flags & 0x2 != 0)
-                    {
-                        return Some(read_u32(table, at + 4));
-                    }
-                }
-                // Type 0x18 (RISC-V INTC / RINTC), length 36:
-                //   off+0: type  off+1: length  off+2: version  off+3: reserved
-                //   off+4: flags(u32)  bit0=enabled
-                //   off+8: hart_id(u64)  off+16: acpi_proc_uid(u32)  …
-                MADT_TYPE_RINTC if entry_len >= 20 && read_u32(table, at + 4) & 0x1 != 0 =>
-                {
-                    // hart_id from MADT RINTC is u64 but only the lower 32 bits are used.
-                    #[allow(clippy::cast_possible_truncation)]
-                    return Some(read_u64(table, at + 8) as u32);
-                }
-                _ =>
-                {}
-            }
+            // Type 0 (Processor Local APIC), length 8:
+            //   off+0: type  off+1: length  off+2: acpi_proc_id  off+3: apic_id
+            //   off+4: flags(u32)  bit0=enabled  bit1=online-capable
+            let flags = read_u32(e, 4);
+            ((flags & 0x1 != 0) || (flags & 0x2 != 0)).then(|| u32::from(read_u8(e, 3)))
         }
-        None
+        MADT_TYPE_LOCAL_X2APIC if e.len() >= 16 =>
+        {
+            // Type 9 (Processor Local x2APIC), length 16:
+            //   off+0: type  off+1: length  off+2: reserved(2)
+            //   off+4: x2apic_id(u32)
+            //   off+8: flags(u32)  bit0=enabled  bit1=online-capable
+            //   off+12: acpi_proc_uid(u32)
+            let flags = read_u32(e, 8);
+            ((flags & 0x1 != 0) || (flags & 0x2 != 0)).then(|| read_u32(e, 4))
+        }
+        // Type 0x18 (RISC-V INTC / RINTC), length 36:
+        //   off+0: type  off+1: length  off+2: version  off+3: reserved
+        //   off+4: flags(u32)  bit0=enabled
+        //   off+8: hart_id(u64)  off+16: acpi_proc_uid(u32)  …
+        MADT_TYPE_RINTC if e.len() >= 20 && read_u32(e, 4) & 0x1 != 0 =>
+        {
+            // hart_id from MADT RINTC is u64 but only the lower 32 bits are used.
+            #[allow(clippy::cast_possible_truncation)]
+            let hart_id = read_u64(e, 8) as u32;
+            Some(hart_id)
+        }
+        _ => None,
     })
 }
 
@@ -634,22 +615,19 @@ mod madt_len
 
 /// The MADT entries of `table` as `(type, entry)`, in table order, ending at
 /// the first entry whose length is under 2 or runs past the table.
-fn madt_entries(table: &[u8]) -> impl Iterator<Item = (u8, &[u8])> + '_
+pub(crate) fn madt_entries(table: &[u8]) -> impl Iterator<Item = (u8, &[u8])> + '_
 {
     let mut off = MADT_ENTRIES_OFF;
     core::iter::from_fn(move || {
-        if off + 2 > table.len()
+        let entry_len = usize::from(*table.get(off.checked_add(1)?)?);
+        if entry_len < 2
         {
             return None;
         }
-        let entry_len = read_u8(table, off + 1) as usize;
-        if entry_len < 2 || off + entry_len > table.len()
-        {
-            return None;
-        }
-        let entry = &table[off..off + entry_len];
-        off += entry_len;
-        Some((entry[0], entry))
+        let entry = table.get(off..off.checked_add(entry_len)?)?;
+        // The entry ends inside `table`, so `off + entry_len` cannot overflow.
+        off = off.saturating_add(entry_len);
+        Some((*entry.first()?, entry))
     })
 }
 
@@ -777,7 +755,8 @@ pub(crate) fn madt_aia(table: &[u8]) -> MadtAia
                 .and_then(|offset| addr.checked_sub(offset))
                 .unwrap_or(0);
         }
-        harts += 1;
+        // `harts` counts RINTC entries of one table, far below `usize::MAX`.
+        harts = harts.saturating_add(1);
         if addr == 0 || layout.s_file_address(hart_id) != Some(addr)
         {
             found.off_layout_hart = Some(hart_id);
@@ -898,14 +877,16 @@ unsafe fn walk_aperture_seed(
         ($base:expr, $size:expr) => {
             if $size > 0
             {
-                found_n += 1;
-                if n < out.len()
+                // The counts index seeds found in one table walk, far below
+                // `usize::MAX`.
+                found_n = found_n.saturating_add(1);
+                if let Some(slot) = out.get_mut(n)
                 {
-                    out[n] = MmioAperture {
+                    *slot = MmioAperture {
                         phys_base: $base,
                         size: $size,
                     };
-                    n += 1;
+                    n = n.saturating_add(1);
                 }
             }
         };
@@ -914,75 +895,38 @@ unsafe fn walk_aperture_seed(
         ($base:expr, $size:expr) => {
             if $size > 0
             {
-                found_h += 1;
-                if h < heuristic.len()
+                found_h = found_h.saturating_add(1);
+                if let Some(slot) = heuristic.get_mut(h)
                 {
-                    heuristic[h] = MmioAperture {
+                    *slot = MmioAperture {
                         phys_base: $base,
                         size: $size,
                     };
-                    h += 1;
+                    h = h.saturating_add(1);
                 }
             }
         };
     }
 
-    if rsdp_addr == 0
-    {
-        return SeedWalk {
-            written: (n, h),
-            found: (found_n, found_h),
-        };
-    }
     // SAFETY: caller contract.
-    let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
-    if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
+    let Some(entries_bytes) = (unsafe { xsdt_entries(rsdp_addr) })
+    else
     {
         return SeedWalk {
             written: (n, h),
             found: (found_n, found_h),
         };
-    }
-    let xsdt_addr = read_u64(rsdp, RSDP_OFF_XSDT);
-    if xsdt_addr == 0
-    {
-        return SeedWalk {
-            written: (n, h),
-            found: (found_n, found_h),
-        };
-    }
-
-    // SAFETY: validated RSDP.
-    let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
-    if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
-    {
-        return SeedWalk {
-            written: (n, h),
-            found: (found_n, found_h),
-        };
-    }
-    let xsdt_len = read_u32(xsdt_hdr, SDT_OFF_LENGTH) as usize;
-    if xsdt_len < SDT_HDR_LEN
-    {
-        return SeedWalk {
-            written: (n, h),
-            found: (found_n, found_h),
-        };
-    }
-    // SAFETY: length validated.
-    let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
-    let entries_bytes = &xsdt[SDT_HDR_LEN..];
+    };
 
     for i in 0..(entries_bytes.len() / 8)
     {
-        let table_addr = read_u64(entries_bytes, i * 8);
-        if table_addr == 0
+        // SAFETY: entries from xsdt_entries; forwarded caller contract.
+        let Some((table_addr, hdr)) = (unsafe { table_header_at(entries_bytes, i) })
+        else
         {
             continue;
-        }
-        // SAFETY: table_addr read from validated XSDT.
-        let hdr = unsafe { phys_slice(table_addr, SDT_HDR_LEN) };
-        let sig: [u8; 4] = [hdr[0], hdr[1], hdr[2], hdr[3]];
+        };
+        let sig = sdt_sig(hdr).unwrap_or([0; 4]);
         let table_len = read_u32(hdr, SDT_OFF_LENGTH) as usize;
         if table_len < SDT_HDR_LEN
         {
@@ -996,42 +940,34 @@ unsafe fn walk_aperture_seed(
             // LAPIC base from header; may be overridden by MADT type 5.
             // Zero on RISC-V (no LAPIC); emitted only when non-zero.
             let mut lapic = u64::from(read_u32(table, SDT_HDR_LEN));
-            let mut off = MADT_ENTRIES_OFF;
-            while off + 2 <= table.len()
+            for (entry_type, e) in madt_entries(table)
             {
-                let entry_type = read_u8(table, off);
-                let entry_len = read_u8(table, off + 1) as usize;
-                if entry_len < 2 || off + entry_len > table.len()
-                {
-                    break;
-                }
                 match entry_type
                 {
-                    MADT_TYPE_IOAPIC if entry_len >= 12 =>
+                    MADT_TYPE_IOAPIC if e.len() >= 12 =>
                     {
-                        push!(u64::from(read_u32(table, off + 4)), 0x1000u64);
+                        push!(u64::from(read_u32(e, 4)), 0x1000u64);
                     }
-                    MADT_TYPE_LAPIC_OVERRIDE if entry_len >= 12 =>
+                    MADT_TYPE_LAPIC_OVERRIDE if e.len() >= 12 =>
                     {
-                        lapic = read_u64(table, off + 4);
+                        lapic = read_u64(e, 4);
                     }
-                    MADT_TYPE_APLIC if entry_len >= madt_len::APLIC =>
+                    MADT_TYPE_APLIC if e.len() >= madt_len::APLIC =>
                     {
                         // Layout at `madt_aia`.
-                        let size = u64::from(read_u32(table, off + 32));
-                        let base = read_u64(table, off + 24);
+                        let size = u64::from(read_u32(e, 32));
+                        let base = read_u64(e, 24);
                         push!(base, size);
                     }
                     MADT_TYPE_RINTC
-                        if entry_len >= madt_len::RINTC_IMSIC
-                            && read_u32(table, off + 4) & 0x1 != 0 =>
+                        if e.len() >= madt_len::RINTC_IMSIC && read_u32(e, 4) & 0x1 != 0 =>
                     {
                         // Layout at `rintc_imsic_files`. One seed per file:
                         // `derive_mmio_apertures` merges abutting files into
                         // one aperture per IMSIC group and leaves the gaps
                         // between groups, which no table names, unseeded.
-                        let base = read_u64(table, off + 24);
-                        let size = u64::from(read_u32(table, off + 32));
+                        let base = read_u64(e, 24);
+                        let size = u64::from(read_u32(e, 32));
                         if base != 0 && base.checked_add(size).is_some()
                         {
                             push!(base, size);
@@ -1040,7 +976,6 @@ unsafe fn walk_aperture_seed(
                     _ =>
                     {}
                 }
-                off += entry_len;
             }
             if lapic != 0
             {
@@ -1049,12 +984,12 @@ unsafe fn walk_aperture_seed(
         }
         else if &sig == b"MCFG"
         {
-            let mut off = MCFG_ENTRIES_OFF;
-            while off + MCFG_ENTRY_SIZE <= table.len()
+            let entries = table.get(MCFG_ENTRIES_OFF..).unwrap_or(&[]);
+            for e in entries.as_chunks::<MCFG_ENTRY_SIZE>().0
             {
-                let base = read_u64(table, off);
-                let start_bus = read_u8(table, off + 10);
-                let end_bus = read_u8(table, off + 11);
+                let base = read_u64(e, 0);
+                let start_bus = read_u8(e, 10);
+                let end_bus = read_u8(e, 11);
                 if let Some((ecam_base, ecam_size)) = mcfg_ecam_window(base, start_bus, end_bus)
                 {
                     push!(ecam_base, ecam_size);
@@ -1088,7 +1023,8 @@ unsafe fn walk_aperture_seed(
                     }
                     else
                     {
-                        (0x8000_0000u64, base - 0x8000_0000)
+                        // `base` is at least 2 GiB on this branch.
+                        (0x8000_0000u64, base.saturating_sub(0x8000_0000))
                     };
                     push_heuristic!(lo_base, lo_size);
                     let (hi_base, hi_size) = if base < 0x8000_0000
@@ -1111,30 +1047,31 @@ unsafe fn walk_aperture_seed(
                     };
                     push_heuristic!(hi_base, hi_size);
                 }
-                off += MCFG_ENTRY_SIZE;
             }
         }
         else if &sig == b"DMAR"
         {
             // Each VT-d remapping unit's register set: no other table names
             // it, and devmgr hands it to the IOMMU driver as an `Mmio` cap.
-            let mut off = DMAR_STRUCTURES_OFF;
-            while off + 4 <= table.len()
+            let mut rest = table.get(DMAR_STRUCTURES_OFF..).unwrap_or(&[]);
+            while rest.len() >= 4
             {
-                let kind = u16::from_le_bytes([read_u8(table, off), read_u8(table, off + 1)]);
-                let len = usize::from(u16::from_le_bytes([
-                    read_u8(table, off + 2),
-                    read_u8(table, off + 3),
-                ]));
-                if len < 4 || off + len > table.len()
+                let kind = read_u16(rest, 0);
+                let len = usize::from(read_u16(rest, 2));
+                if len < 4
                 {
                     break;
                 }
-                if let Some((base, size)) = drhd_register_window(&table[off..off + len], kind)
+                let Some((entry, tail)) = rest.split_at_checked(len)
+                else
+                {
+                    break;
+                };
+                if let Some((base, size)) = drhd_register_window(entry, kind)
                 {
                     push!(base, size);
                 }
-                off += len;
+                rest = tail;
             }
         }
     }
@@ -1196,11 +1133,13 @@ fn drhd_register_window(entry: &[u8], kind: u16) -> Option<(u64, u64)>
 /// overflows a 64-bit physical address, so a malformed entry is skipped.
 fn mcfg_ecam_window(base: u64, start_bus: u8, end_bus: u8) -> Option<(u64, u64)>
 {
-    if base == 0 || end_bus < start_bus
+    if base == 0
     {
         return None;
     }
-    let size = (u64::from(end_bus) - u64::from(start_bus) + 1) << 20;
+    let buses = end_bus.checked_sub(start_bus)?;
+    // `buses` is at most 255, so the count of buses is at most 256.
+    let size = u64::from(buses).saturating_add(1) << 20;
     let window = base.checked_add(u64::from(start_bus) << 20)?;
     window.checked_add(size)?;
     Some((window, size))
@@ -1860,5 +1799,62 @@ mod tests
         let mut t = ssdt(&[0x00; 16]);
         t[SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + 6].copy_from_slice(&VGIA_PATTERN);
         assert_eq!(find_vgia(&t), None);
+    }
+
+    #[test]
+    fn byte_readers_at_an_offset_past_the_buffer_return_zero()
+    {
+        let buf = [0xffu8; 8];
+        assert_eq!(read_u16(&buf, usize::MAX), 0);
+        assert_eq!(read_u32(&buf, usize::MAX - 1), 0);
+        assert_eq!(read_u64(&buf, 1), 0);
+        assert_eq!(read_u64(&buf, 0), u64::MAX);
+    }
+
+    #[test]
+    fn an_xsdt_entry_past_the_array_is_an_absent_table()
+    {
+        let entries = 0x1000u64.to_le_bytes();
+        assert_eq!(xsdt_entry_addr(&entries, 0), 0x1000);
+        assert_eq!(xsdt_entry_addr(&entries, 1), 0);
+        assert_eq!(xsdt_entry_addr(&entries, usize::MAX), 0);
+    }
+
+    #[test]
+    fn a_cpu_topology_walk_with_no_out_slot_places_nothing()
+    {
+        // SAFETY: a zero RSDP address reads nothing.
+        assert_eq!(unsafe { parse_cpu_topology(0, 7, &mut []) }, 0);
+        let mut out = [0u32; 2];
+        // SAFETY: as above.
+        assert_eq!(unsafe { parse_cpu_topology(0, 7, &mut out) }, 1);
+        assert_eq!(out[0], 7);
+    }
+
+    #[test]
+    fn madt_entries_stop_at_a_length_that_runs_past_the_table()
+    {
+        let mut t = vec![0u8; MADT_ENTRIES_OFF];
+        t.extend_from_slice(&[MADT_TYPE_IOAPIC, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        t.extend_from_slice(&[MADT_TYPE_IOAPIC, 12, 0, 0]); // truncated entry
+        assert_eq!(madt_entries(&t).count(), 1);
+        let mut t = vec![0u8; MADT_ENTRIES_OFF];
+        t.extend_from_slice(&[MADT_TYPE_IOAPIC, 1]); // length under 2
+        assert_eq!(madt_entries(&t).count(), 0);
+        assert_eq!(madt_entries(&t[..MADT_ENTRIES_OFF]).count(), 0);
+        assert_eq!(madt_entries(&[]).count(), 0);
+    }
+
+    #[test]
+    fn mcfg_window_spans_one_mib_per_bus()
+    {
+        assert_eq!(
+            mcfg_ecam_window(0x1000_0000, 0, 0),
+            Some((0x1000_0000, 1 << 20))
+        );
+        assert_eq!(
+            mcfg_ecam_window(0x1000_0000, 0, 255),
+            Some((0x1000_0000, 256 << 20))
+        );
     }
 }

@@ -157,8 +157,10 @@ unsafe fn probe_satp_mode(probe_root: u64, candidate: PagingMode) -> bool
     }
 
     let pc = probe_satp_mode as *const () as u64;
-    let top = candidate.levels() - 1;
-    let base = pc & !(level_stride(top) - 1);
+    // A mode has at least one level, and a level stride is a power of two of
+    // at least 1, so neither subtraction saturates.
+    let top = candidate.levels().saturating_sub(1);
+    let base = pc & !level_stride(top).saturating_sub(1);
     // Root-level identity leaf covering the region around PC. The base is
     // stride-aligned, so the superpage PPN alignment rule holds.
     let leaf = PTE_V | PTE_R | PTE_X | PTE_A | ((base >> 12) << 10);
@@ -166,7 +168,12 @@ unsafe fn probe_satp_mode(probe_root: u64, candidate: PagingMode) -> bool
     // is within [0, 511].
     unsafe {
         let table = core::slice::from_raw_parts_mut(probe_root as *mut u64, TABLE_ENTRIES);
-        table[vpn_index(top, pc)] = leaf;
+        // The index is masked to nine bits, so the slot exists; were it not,
+        // the probe window would have no leaf and the readback would fail.
+        if let Some(slot) = table.get_mut(vpn_index(top, pc))
+        {
+            *slot = leaf;
+        }
     }
 
     let cand_satp = candidate.make_satp(probe_root, 0);
@@ -286,13 +293,20 @@ impl PageTableBuilder for BootPageTable
 
         // Round size up to a page boundary so callers with non-aligned sizes are
         // handled safely. Well-behaved callers always pass aligned sizes.
-        let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let aligned_size = size
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(MapError::AddressRange)?
+            & !(PAGE_SIZE - 1);
 
         let mut offset: u64 = 0;
         while offset < aligned_size
         {
-            self.map_4k_page(virt + offset, phys + offset, &flags)?;
-            offset += PAGE_SIZE;
+            let page_virt = virt.checked_add(offset).ok_or(MapError::AddressRange)?;
+            let page_phys = phys.checked_add(offset).ok_or(MapError::AddressRange)?;
+            self.map_4k_page(page_virt, page_phys, &flags)?;
+            // `aligned_size` is a multiple of `PAGE_SIZE`, so `offset` stays at or
+            // below it and the sum cannot overflow.
+            offset = offset.saturating_add(PAGE_SIZE);
         }
 
         Ok(())
@@ -337,7 +351,10 @@ impl BootPageTable
         // within [0, 511].
         for level in (1..self.levels).rev()
         {
-            let child_phys = self.ensure_table(&mut table[vpn_index(level, virt)])?;
+            let entry = table
+                .get_mut(vpn_index(level, virt))
+                .ok_or(MapError::AddressRange)?;
+            let child_phys = self.ensure_table(entry)?;
             // SAFETY: frame from ensure_table is a valid, zeroed-or-live
             // 4 KiB table frame.
             table =
@@ -362,7 +379,7 @@ impl BootPageTable
             pte |= PTE_X;
         }
 
-        l0[l0_idx] = pte;
+        *l0.get_mut(l0_idx).ok_or(MapError::AddressRange)? = pte;
 
         Ok(())
     }
@@ -404,8 +421,12 @@ impl BootPageTable
         {
             return None;
         }
-        let frame = self.pool_phys + self.pool_used * PAGE_SIZE;
-        self.pool_used += 1;
+        let frame = self
+            .pool_used
+            .checked_mul(PAGE_SIZE)
+            .and_then(|offset| self.pool_phys.checked_add(offset))?;
+        // `pool_used` is below `pool_frames`, so it is far below `u64::MAX`.
+        self.pool_used = self.pool_used.saturating_add(1);
         // SAFETY: frame is a page of the pool `new` allocated, below its end,
         // identity-mapped under UEFI and not yet handed out. Zeroing ensures
         // all entries have V=0 (invalid), the initial state at any level.

@@ -204,7 +204,11 @@ pub unsafe fn install_la57_toggle(page: u64) -> bool
 {
     let start = core::ptr::addr_of!(_la57_toggle);
     let end = core::ptr::addr_of!(_la57_toggle_end);
-    let len = end as usize - start as usize;
+    let Some(len) = (end as usize).checked_sub(start as usize)
+    else
+    {
+        return false;
+    };
     // The template is a few hundred bytes of `.text`; a larger one is an
     // assembly defect, refused here rather than copied past the page.
     if len > 4096
@@ -242,7 +246,15 @@ pub fn trampoline_page_range() -> (u64, u64)
 
     // end points one byte past the last trampoline instruction.
     // Subtract 1 to get a byte that is inside the trampoline.
-    let last_byte = if end > start { end - 1 } else { start };
+    // `end` is above `start`, so it is at least 1.
+    let last_byte = if end > start
+    {
+        end.saturating_sub(1)
+    }
+    else
+    {
+        start
+    };
 
     let first_page = start & !0xFFF;
     let last_page = last_byte & !0xFFF;

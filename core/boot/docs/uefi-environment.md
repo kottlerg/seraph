@@ -244,7 +244,8 @@ failure after the bounded retry loop, bundle parse/validation failure (`InvalidB
 on RISC-V no supported paging mode passing the satp probe (`PagingModeUnsupported`),
 a firmware memory map that violates the UEFI contract (`InvalidMemoryMap`), a memory map
 that outgrows its entry array on every run of steps 6 and 7 (`MemoryMapKeptGrowing`,
-[memory-map.md](memory-map.md) § Sizing the Entry Array), and, in step 9, a
+[memory-map.md](memory-map.md) § Sizing the Entry Array), in step 6 a range to map that
+runs past the end of the address space (`MapAddressRange`), and, in step 9, a
 `reclaim_ranges` overflow
 (`ReclaimRangesOverflow`, unreachable while the compile-time entry count holds); the
 source is the authority on the variant list and payloads.

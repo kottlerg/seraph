@@ -143,7 +143,8 @@ impl FramebufferWriter
     unsafe fn newline(&mut self)
     {
         self.col = 0;
-        self.row += 1;
+        // `row` is below `max_rows` on entry, so the increment cannot overflow.
+        self.row = self.row.saturating_add(1);
         if self.row >= self.max_rows
         {
             // SAFETY: the framebuffer region is valid and writable per
@@ -177,7 +178,8 @@ impl FramebufferWriter
     /// Framebuffer pointer must be valid and writable.
     unsafe fn clear(&mut self)
     {
-        let total = (self.stride * self.height) as usize;
+        // Two `u32` factors widened to `usize` (64-bit on every target), so the product fits.
+        let total = (self.stride as usize).saturating_mul(self.height as usize);
         let mut p = self.base;
         for _ in 0..total
         {
@@ -199,23 +201,26 @@ impl FramebufferWriter
     /// Framebuffer pointer must be valid; cursor must be within bounds.
     unsafe fn draw_glyph_bitmap(&mut self, bitmap: &[u16])
     {
-        let pixel_x = self.col * GLYPH_WIDTH;
-        let pixel_y = self.row * GLYPH_HEIGHT;
+        // `col` is below `max_cols` and `row` below `max_rows`, each at most the
+        // framebuffer's extent divided by the glyph size, so the products fit in `u32`.
+        let pixel_x = self.col.saturating_mul(GLYPH_WIDTH);
+        let pixel_y = self.row.saturating_mul(GLYPH_HEIGHT);
 
         for (row_idx, &bits) in bitmap.iter().enumerate().take(GLYPH_HEIGHT as usize)
         {
-            let scan_y = pixel_y as usize + row_idx;
-            let row_base = scan_y * self.stride as usize;
+            let scan_y = (pixel_y as usize).saturating_add(row_idx);
+            let row_base = scan_y.saturating_mul(self.stride as usize);
 
             for col_idx in 0..(GLYPH_WIDTH as usize)
             {
                 // Bit 15 is leftmost pixel; shift down for each column.
-                let lit = (bits >> (15 - col_idx)) & 1 != 0;
+                // `col_idx` is below `GLYPH_WIDTH` (9), so the shift is at least 7.
+                let lit = (bits >> 15usize.saturating_sub(col_idx)) & 1 != 0;
                 // White (0xFF) if lit, black (0x00) if not.
                 let intensity: u8 = if lit { 0xFF } else { 0x00 };
 
-                let px = (pixel_x as usize + col_idx) * 4;
-                let offset = row_base + px;
+                let px = (pixel_x as usize).saturating_add(col_idx).saturating_mul(4);
+                let offset = row_base.saturating_add(px);
 
                 // SAFETY: pixel is within the framebuffer; offset is bounded
                 // by stride * height (caller ensures valid mapping).
@@ -242,7 +247,8 @@ impl FramebufferWriter
             }
         }
 
-        self.col += 1;
+        // `col` is below `max_cols` on entry, so the increment cannot overflow.
+        self.col = self.col.saturating_add(1);
         if self.col >= self.max_cols
         {
             // SAFETY: the framebuffer region is valid and writable per
@@ -263,32 +269,32 @@ impl FramebufferWriter
     /// Framebuffer pointer must be valid.
     unsafe fn scroll(&mut self)
     {
-        let row_bytes = (GLYPH_HEIGHT * self.stride) as usize;
+        // `u32` factors widened to `usize` (64-bit on every target), so the product fits.
+        let row_bytes = (GLYPH_HEIGHT as usize).saturating_mul(self.stride as usize);
         let total_rows = self.max_rows as usize;
+        // `new` guarantees `max_rows` is at least one, so the subtraction cannot underflow.
+        let kept_rows = total_rows.saturating_sub(1);
+        let kept_bytes = kept_rows.saturating_mul(row_bytes);
 
         // Copy rows 1..total_rows → 0..total_rows-1.
         // SAFETY: src and dst are both within the framebuffer allocation; the
         // copy is a single forward memmove of (total_rows-1)*row_bytes bytes.
         unsafe {
-            core::ptr::copy(
-                self.base.add(row_bytes),
-                self.base,
-                (total_rows - 1) * row_bytes,
-            );
+            core::ptr::copy(self.base.add(row_bytes), self.base, kept_bytes);
         }
 
         // Zero the last row.
-        let last_row_start = (total_rows - 1) * row_bytes;
+        let last_row_start = kept_bytes;
         for i in 0..row_bytes
         {
             // SAFETY: last_row_start + i is within the framebuffer.
             unsafe {
-                core::ptr::write_volatile(self.base.add(last_row_start + i), 0);
+                core::ptr::write_volatile(self.base.add(last_row_start.saturating_add(i)), 0);
             }
         }
 
         // Park cursor on the last row.
-        self.row = self.max_rows - 1;
+        self.row = self.max_rows.saturating_sub(1);
     }
 }
 

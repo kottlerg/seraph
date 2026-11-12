@@ -26,8 +26,8 @@ cmos/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── lib.rs             # CMOS register snapshot (bounded UIP wait; host-tested)
-    └── main.rs            # Driver entry, IPC service loop, port I/O, decode
+    ├── lib.rs             # Register snapshot (bounded UIP wait), decode, epoch time; host-tested
+    └── main.rs            # Driver entry, IPC service loop, port I/O
 ```
 
 ---

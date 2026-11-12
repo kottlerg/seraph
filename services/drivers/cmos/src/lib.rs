@@ -3,14 +3,18 @@
 
 // services/drivers/cmos/src/lib.rs
 
-//! Host-testable CMOS register snapshot of the cmos-rtc driver.
+//! Host-testable CMOS register snapshot and decode of the cmos-rtc driver.
 //!
 //! [`snapshot`] takes one consistent reading of the MC146818 time
 //! registers through a [`CmosRegs`] accessor, waiting out the
-//! update-in-progress window with bounded polls, and [`full_year`] joins
-//! the two-digit year to the century register the firmware names. The
+//! update-in-progress window with bounded polls, [`full_year`] joins
+//! the two-digit year to the century register the firmware names, and
+//! [`decode`] and [`epoch_us`] turn the snapshot into an epoch time. The
 //! driver binary (`main.rs`) implements the accessor over the bound CMOS
-//! I/O ports and decodes the snapshot into an epoch time.
+//! I/O ports.
+
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 /// Seconds register.
 pub const REG_SECONDS: u8 = 0x00;
@@ -186,13 +190,238 @@ pub fn full_year(year: u8, century: Option<u8>) -> u32
     let century = century
         .filter(|c| (19..=99).contains(c))
         .map_or(FALLBACK_CENTURY, u32::from);
-    century * 100 + u32::from(year)
+    // At most 99 * 100 + 255: neither operation saturates.
+    century.saturating_mul(100).saturating_add(u32::from(year))
+}
+
+// ── Raw → calendar fields ───────────────────────────────────────────────────
+
+/// Status B bit: the time registers hold binary values, not BCD.
+pub const STATUS_B_BINARY: u8 = 0x04;
+/// Status B bit: the hours register counts 0-23, not 1-12 with a PM bit.
+pub const STATUS_B_24H: u8 = 0x02;
+/// The PM bit of the hours register in 12-hour mode.
+pub const HOUR_PM_BIT: u8 = 0x80;
+
+/// The binary value of BCD byte `v`.
+#[must_use]
+pub fn bcd_to_bin(v: u8) -> u8
+{
+    // At most 15 + 15 * 10 = 165: no saturation.
+    (v & 0x0F).saturating_add((v >> 4).saturating_mul(10))
+}
+
+/// A decoded CMOS reading, each field as the clock gave it after BCD and
+/// 12-hour conversion; [`epoch_us`] range-checks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Calendar
+{
+    pub year: u32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub min: u32,
+    pub sec: u32,
+}
+
+/// Decode a snapshot's `raw` fields under its Status B value `status_b`.
+/// The fields are device-supplied and not range-checked here: a PM hour
+/// past 11 in 12-hour mode decodes to an hour [`epoch_us`] refuses.
+#[must_use]
+pub fn decode(raw: CmosFields, status_b: u8) -> Calendar
+{
+    let binary = status_b & STATUS_B_BINARY != 0;
+    let h24 = status_b & STATUS_B_24H != 0;
+
+    let conv = |v: u8| -> u8 { if binary { v } else { bcd_to_bin(v) } };
+
+    let sec = conv(raw.sec);
+    let min = conv(raw.min);
+
+    // Hour needs PM-bit handling for 12-hour mode; the PM bit lives in
+    // the raw byte and must be masked off before BCD conversion.
+    let mut hour_raw = raw.hour;
+    let pm = !h24 && (hour_raw & HOUR_PM_BIT != 0);
+    hour_raw &= !HOUR_PM_BIT;
+    let mut hour = u32::from(conv(hour_raw));
+    if !h24
+    {
+        if hour == 12
+        {
+            hour = 0;
+        }
+        if pm
+        {
+            // The PM bit is masked off, so at most 127 + 12: no saturation.
+            hour = hour.saturating_add(12);
+        }
+    }
+
+    let day = conv(raw.day);
+    let month = conv(raw.month);
+    let year = full_year(conv(raw.year), raw.century.map(conv));
+
+    Calendar {
+        year,
+        month: u32::from(month),
+        day: u32::from(day),
+        hour,
+        min: u32::from(min),
+        sec: u32::from(sec),
+    }
+}
+
+// ── Civil-date arithmetic ─────────────────────────────────────────────────
+
+/// Days from 1970-01-01 to `(y, m, d)`, by Howard Hinnant's algorithm, for
+/// a year of 1970 or later, a month of 1 to 12 and a day of 1 to 31
+/// ([`epoch_us`] checks them). `None` when an intermediate value leaves
+/// `u64`, which no date in that range reaches.
+fn days_from_civil(y: u32, m: u32, d: u32) -> Option<u64>
+{
+    // The algorithm's year starts in March.
+    let y = u64::from(y).checked_sub(u64::from(m <= 2))?;
+    let era = y / 400;
+    let yoe = y % 400;
+    let m_adj = if m > 2
+    {
+        m.checked_sub(3)?
+    }
+    else
+    {
+        m.checked_add(9)?
+    };
+    let doy = u64::from(m_adj).checked_mul(153)?.checked_add(2)? / 5;
+    let doy = doy.checked_add(u64::from(d))?.checked_sub(1)?;
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(yoe / 4)?
+        .checked_sub(yoe / 100)?
+        .checked_add(doy)?;
+    era.checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)
+}
+
+/// Per-month max day count. Index 0 is unused; index 2 (February) is
+/// the non-leap value — leap years bump it before the check.
+const DAYS_IN_MONTH: [u8; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+fn is_leap(year: u32) -> bool
+{
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+/// Microseconds from the Unix epoch to calendar time `c`. `None` when a
+/// field is out of its range (a month of 0 or past 12, a day of 0 or past
+/// its month's last, an hour past 23, a minute or second past 59) or the
+/// year is before 1970: the driver then replies `READ_FAILED`.
+#[must_use]
+pub fn epoch_us(c: Calendar) -> Option<u64>
+{
+    if c.month == 0 || c.month > 12 || c.day == 0 || c.year < 1970
+    {
+        return None;
+    }
+    let mut max_day = u32::from(*DAYS_IN_MONTH.get(usize::try_from(c.month).ok()?)?);
+    if c.month == 2 && is_leap(c.year)
+    {
+        max_day = 29;
+    }
+    if c.day > max_day || c.hour >= 24 || c.min >= 60 || c.sec >= 60
+    {
+        return None;
+    }
+    let days = days_from_civil(c.year, c.month, c.day)?;
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(u64::from(c.hour).checked_mul(3600)?)?
+        .checked_add(u64::from(c.min).checked_mul(60)?)?
+        .checked_add(u64::from(c.sec))?;
+    secs.checked_mul(1_000_000)
 }
 
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    fn calendar(year: u32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> Calendar
+    {
+        Calendar {
+            year,
+            month,
+            day,
+            hour,
+            min,
+            sec,
+        }
+    }
+
+    #[test]
+    fn epoch_us_counts_from_the_unix_epoch()
+    {
+        assert_eq!(epoch_us(calendar(1970, 1, 1, 0, 0, 0)), Some(0));
+        // 2000-03-01 12:34:56: 11017 days, past a leap day of a year
+        // divisible by 400.
+        assert_eq!(
+            epoch_us(calendar(2000, 3, 1, 12, 34, 56)),
+            Some((11_017 * 86_400 + 12 * 3600 + 34 * 60 + 56) * 1_000_000)
+        );
+        assert_eq!(
+            epoch_us(calendar(2024, 2, 29, 23, 59, 59)),
+            Some(1_709_251_199 * 1_000_000)
+        );
+    }
+
+    #[test]
+    fn epoch_us_refuses_fields_out_of_range()
+    {
+        for c in [
+            calendar(1969, 12, 31, 0, 0, 0),
+            calendar(2026, 0, 1, 0, 0, 0),
+            calendar(2026, 13, 1, 0, 0, 0),
+            calendar(2026, 255, 1, 0, 0, 0),
+            calendar(2026, 1, 0, 0, 0, 0),
+            calendar(2026, 4, 31, 0, 0, 0),
+            calendar(2026, 2, 29, 0, 0, 0),
+            calendar(2026, 1, 1, 24, 0, 0),
+            calendar(2026, 1, 1, 0, 60, 0),
+            calendar(2026, 1, 1, 0, 0, 60),
+        ]
+        {
+            assert_eq!(epoch_us(c), None, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn decode_reads_bcd_and_12_hour_fields()
+    {
+        let raw = CmosFields {
+            sec: 0x59,
+            min: 0x30,
+            hour: HOUR_PM_BIT | 0x12,
+            day: 0x31,
+            month: 0x12,
+            year: 0x26,
+            century: Some(0x20),
+        };
+        // BCD, 12-hour: 12 PM is noon.
+        assert_eq!(decode(raw, 0), calendar(2026, 12, 31, 12, 30, 59));
+        // 12 AM is midnight.
+        let midnight = CmosFields { hour: 0x12, ..raw };
+        assert_eq!(decode(midnight, 0).hour, 0);
+        // Binary, 24-hour: the bytes are the values, the PM bit is no flag.
+        let binary = CmosFields { hour: 23, ..raw };
+        assert_eq!(decode(binary, STATUS_B_BINARY | STATUS_B_24H).hour, 23);
+        // A non-BCD nibble and the largest masked hour decode out of range,
+        // and the epoch refuses them.
+        assert_eq!(bcd_to_bin(0xFF), 165);
+        let garbage = CmosFields { hour: 0xFF, ..raw };
+        let decoded = decode(garbage, STATUS_B_BINARY);
+        assert_eq!(decoded.hour, 127 + 12);
+        assert_eq!(epoch_us(decoded), None);
+    }
 
     #[test]
     fn century_register_accepts_only_the_standard_bank_past_the_clock()

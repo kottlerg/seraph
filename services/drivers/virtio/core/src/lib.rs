@@ -13,6 +13,8 @@
 //! device ([`dma`]), and the interrupt-service loop each driver runs on a
 //! thread of its own ([`isr`]).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
@@ -65,6 +67,17 @@ pub struct VirtioCapLocation
     pub length: u32,
 }
 
+impl VirtioCapLocation
+{
+    /// The byte offset in the BAR just past the region.
+    #[must_use]
+    pub fn end(&self) -> u64
+    {
+        // Two `u32` values widened to `u64`: the sum cannot saturate.
+        u64::from(self.offset).saturating_add(u64::from(self.length))
+    }
+}
+
 /// Startup message written by devmgr for `VirtIO` PCI drivers.
 ///
 /// Contains the locations of the four `VirtIO` PCI capability regions
@@ -95,6 +108,36 @@ pub struct VirtioPciStartupInfo
 /// [`devmgr_labels::QUERY_DEVICE_INFO`]: ../../../shared/ipc/index.html
 pub const VIRTIO_PCI_INFO_VERSION: u32 = 1;
 
+/// Why the data words of a `QUERY_DEVICE_INFO` reply hold no
+/// [`VirtioPciStartupInfo`] ([`VirtioPciStartupInfo::from_device_info`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceInfoError
+{
+    /// Fewer than the three header words (kind, version, byte length).
+    TruncatedHeader,
+    /// A kind other than `ipc::device_info_kind::VIRTIO_PCI`, or a version
+    /// other than [`VIRTIO_PCI_INFO_VERSION`].
+    KindVersionMismatch,
+    /// A byte length other than [`VirtioPciStartupInfo::SIZE`], or fewer
+    /// payload words than it takes.
+    LengthMismatch,
+}
+
+impl DeviceInfoError
+{
+    /// What a driver logs for the error.
+    #[must_use]
+    pub const fn describe(self) -> &'static str
+    {
+        match self
+        {
+            Self::TruncatedHeader => "QUERY_DEVICE_INFO reply truncated (header)",
+            Self::KindVersionMismatch => "QUERY_DEVICE_INFO reply kind/version mismatch",
+            Self::LengthMismatch => "QUERY_DEVICE_INFO reply length mismatch",
+        }
+    }
+}
+
 impl VirtioPciStartupInfo
 {
     /// Size of the serialised startup message in bytes.
@@ -113,6 +156,44 @@ impl VirtioPciStartupInfo
         // SAFETY: VirtioPciStartupInfo is repr(C) with no padding invariants;
         // any bit pattern is valid. Slice length is checked above.
         Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Self>()) })
+    }
+
+    /// Decode the data words of a successful `QUERY_DEVICE_INFO` reply, the
+    /// generic schema devmgr answers every `VirtIO` driver in: `words[0]` the
+    /// kind, `words[1]` the version, `words[2]` the payload's byte length,
+    /// and the payload bytes packed little-endian into the words after them.
+    /// The words are another process's, so each is checked: a header word
+    /// past its field's width is a mismatch, not a value to truncate.
+    ///
+    /// # Errors
+    ///
+    /// The [`DeviceInfoError`] the words fail on.
+    pub fn from_device_info(words: &[u64]) -> Result<Self, DeviceInfoError>
+    {
+        let (&[kind, version, byte_len], payload) = words
+            .split_first_chunk::<3>()
+            .ok_or(DeviceInfoError::TruncatedHeader)?;
+        if u32::try_from(kind).ok() != Some(ipc::device_info_kind::VIRTIO_PCI)
+            || u32::try_from(version).ok() != Some(VIRTIO_PCI_INFO_VERSION)
+        {
+            return Err(DeviceInfoError::KindVersionMismatch);
+        }
+        if usize::try_from(byte_len).ok() != Some(Self::SIZE)
+        {
+            return Err(DeviceInfoError::LengthMismatch);
+        }
+        let payload = payload
+            .get(..Self::SIZE.div_ceil(8))
+            .ok_or(DeviceInfoError::LengthMismatch)?;
+        let mut buf = [0u8; Self::SIZE];
+        for (chunk, word) in buf.chunks_mut(8).zip(payload)
+        {
+            for (dst, src) in chunk.iter_mut().zip(word.to_le_bytes())
+            {
+                *dst = src;
+            }
+        }
+        Self::from_bytes(&buf).ok_or(DeviceInfoError::LengthMismatch)
     }
 
     /// Serialise to a byte buffer. Returns `None` if the buffer is too small.
@@ -176,15 +257,16 @@ impl VirtioPciStartupInfo
                 .iter()
                 .map(|&(_, r)| r)
                 .filter(|r| r.bar == bar)
-                .map(|r| u64::from(r.offset) + u64::from(r.length))
+                .map(VirtioCapLocation::end)
                 .max();
             if let Some(reach) = reach
             {
-                bars[bar_count] = BarAperture {
+                *bars.get_mut(bar_count)? = BarAperture {
                     bar,
                     pages: reach.div_ceil(PAGE_SIZE),
                 };
-                bar_count += 1;
+                // Below MAX_VIRTIO_BARS before the increment: no saturation.
+                bar_count = bar_count.saturating_add(1);
             }
         }
         let mut layout = RegisterLayout {
@@ -199,10 +281,10 @@ impl VirtioPciStartupInfo
             device_len: u64::from(self.device_cfg.length),
             notify_off_multiplier: self.notify_off_multiplier,
         };
-        layout.common = layout.region_offset(&self.common_cfg);
-        layout.notify = layout.region_offset(&self.notify_cfg);
-        layout.isr = layout.region_offset(&self.isr_cfg);
-        layout.device = layout.region_offset(&self.device_cfg);
+        layout.common = layout.region_offset(&self.common_cfg)?;
+        layout.notify = layout.region_offset(&self.notify_cfg)?;
+        layout.isr = layout.region_offset(&self.isr_cfg)?;
+        layout.device = layout.region_offset(&self.device_cfg)?;
         Some(layout)
     }
 }
@@ -290,7 +372,8 @@ impl RegisterLayout
     #[must_use]
     pub fn bars(&self) -> &[BarAperture]
     {
-        &self.bars[..self.bar_count]
+        // `bar_count` never exceeds the array (`register_layout`).
+        self.bars.get(..self.bar_count).unwrap_or_default()
     }
 
     /// Pages the whole register window spans: the sum of the BARs' pages.
@@ -301,20 +384,24 @@ impl RegisterLayout
     }
 
     /// Window offset of BAR `bar`'s pages: the pages of every BAR before it.
-    fn bar_offset(&self, bar: u8) -> u64
+    /// `None` when the sum does not fit a `u64`.
+    fn bar_offset(&self, bar: u8) -> Option<u64>
     {
         self.bars()
             .iter()
             .take_while(|b| b.bar != bar)
-            .map(|b| b.pages * PAGE_SIZE)
-            .sum()
+            .try_fold(0u64, |sum, b| {
+                sum.checked_add(b.pages.checked_mul(PAGE_SIZE)?)
+            })
     }
 
     /// Window offset of `region`: the offset of its BAR's pages plus its
     /// offset in the BAR. Every region of the layout names one of its BARs.
-    fn region_offset(&self, region: &VirtioCapLocation) -> u64
+    /// `None` when the sum does not fit a `u64`.
+    fn region_offset(&self, region: &VirtioCapLocation) -> Option<u64>
     {
-        self.bar_offset(region.bar) + u64::from(region.offset)
+        self.bar_offset(region.bar)?
+            .checked_add(u64::from(region.offset))
     }
 
     /// The window offset each of the delivered BAR `ranges` maps at, in
@@ -345,20 +432,27 @@ impl RegisterLayout
                 .and_then(|pages| r.offset.checked_add(pages))?;
             if !r.offset.is_multiple_of(PAGE_SIZE)
                 || r.bytes == 0
-                || end > aperture.pages * PAGE_SIZE
+                || aperture
+                    .pages
+                    .checked_mul(PAGE_SIZE)
+                    .is_none_or(|bar_end| end > bar_end)
                 || previous.is_some_and(|(bar, past)| (r.bar, r.offset) < (bar, past))
             {
                 return None;
             }
             previous = Some((r.bar, end));
-            *slot = self.bar_offset(r.bar) + r.offset;
+            *slot = self.bar_offset(r.bar)?.checked_add(r.offset)?;
         }
         let inside = |region: &VirtioCapLocation| {
             let start = u64::from(region.offset);
-            let end = start + u64::from(region.length);
-            ranges
-                .iter()
-                .any(|r| r.bar == region.bar && r.offset <= start && end <= r.offset + r.bytes)
+            let end = region.end();
+            ranges.iter().any(|r| {
+                r.bar == region.bar
+                    && r.offset <= start
+                    && r.offset
+                        .checked_add(r.bytes)
+                        .is_some_and(|r_end| end <= r_end)
+            })
         };
         self.regions.iter().all(inside).then_some(placed)
     }
@@ -401,7 +495,8 @@ impl VirtioPciStartupInfo
         let bar = self.common_cfg.bar;
         Some(StatusRegister {
             bar,
-            offset: u64::from(self.common_cfg.offset) + u64::from(COMMON_DEVICE_STATUS),
+            offset: u64::from(self.common_cfg.offset)
+                .checked_add(u64::from(COMMON_DEVICE_STATUS))?,
         })
     }
 }
@@ -528,6 +623,65 @@ mod tests
         back.to_bytes(&mut reserialised)
             .expect("buffer is SIZE bytes");
         assert_eq!(buf, reserialised);
+    }
+
+    /// The data words devmgr's `QUERY_DEVICE_INFO` reply carries for `info`.
+    fn device_info_words(info: &VirtioPciStartupInfo) -> Vec<u64>
+    {
+        let mut buf = [0u8; VirtioPciStartupInfo::SIZE];
+        info.to_bytes(&mut buf).expect("buffer is SIZE bytes");
+        let mut words = vec![
+            u64::from(ipc::device_info_kind::VIRTIO_PCI),
+            u64::from(VIRTIO_PCI_INFO_VERSION),
+            VirtioPciStartupInfo::SIZE as u64,
+        ];
+        words.extend(buf.chunks(8).map(|c| {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            u64::from_le_bytes(w)
+        }));
+        words
+    }
+
+    #[test]
+    fn device_info_words_decode_to_the_info_devmgr_encoded()
+    {
+        let info = populated();
+        let back = VirtioPciStartupInfo::from_device_info(&device_info_words(&info))
+            .expect("a well-formed reply");
+        assert_eq!(back.notify_cfg.offset, 0x200);
+        assert_eq!(back.device_cfg.length, 0x40);
+        assert_eq!(back.notify_off_multiplier, 0x40);
+    }
+
+    #[test]
+    fn device_info_words_of_another_shape_are_refused()
+    {
+        let words = device_info_words(&populated());
+        let decode = |w: &[u64]| VirtioPciStartupInfo::from_device_info(w).err();
+        assert_eq!(decode(&words[..2]), Some(DeviceInfoError::TruncatedHeader));
+        let with = |i: usize, value: u64| {
+            let mut w = words.clone();
+            w[i] = value;
+            decode(&w)
+        };
+        // Another kind, another version, or a kind past the field's width
+        // that would truncate to the right one.
+        assert_eq!(with(0, 0), Some(DeviceInfoError::KindVersionMismatch));
+        assert_eq!(
+            with(1, u64::from(VIRTIO_PCI_INFO_VERSION) + 1),
+            Some(DeviceInfoError::KindVersionMismatch)
+        );
+        assert_eq!(
+            with(0, (1 << 32) | u64::from(ipc::device_info_kind::VIRTIO_PCI)),
+            Some(DeviceInfoError::KindVersionMismatch)
+        );
+        // A byte length other than the struct's, or a payload one word short.
+        assert_eq!(with(2, 8), Some(DeviceInfoError::LengthMismatch));
+        assert_eq!(
+            decode(&words[..words.len() - 1]),
+            Some(DeviceInfoError::LengthMismatch)
+        );
     }
 
     #[test]

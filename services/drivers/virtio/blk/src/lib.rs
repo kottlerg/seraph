@@ -14,6 +14,9 @@
 //! decision (`shared/ipc::blk_labels`, `shared/ipc::blk_errors`), so they
 //! live where a host test can pin them.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use ipc::blk_errors;
 
 /// Bytes per `VirtIO` block sector: the unit of a request header's `sector`
@@ -73,16 +76,18 @@ impl Geometry
         }
         Some(Self {
             block_size,
-            capacity: capacity_sectors / self::sectors_per_block(block_size),
+            // At least 1 sector per block: the size is at least 512.
+            capacity: capacity_sectors.checked_div(self::sectors_per_block(block_size))?,
         })
     }
 
     /// The `VirtIO` sector a logical block starts at. Exact for every LBA
-    /// below `capacity`, which the driver checks before converting.
+    /// below `capacity`, which the driver checks before converting; `None`
+    /// for an LBA whose sector is past `u64`.
     #[must_use]
-    pub fn device_sector(self, lba: u64) -> u64
+    pub fn device_sector(self, lba: u64) -> Option<u64>
     {
-        lba * sectors_per_block(self.block_size)
+        lba.checked_mul(sectors_per_block(self.block_size))
     }
 
     /// Byte length of a transfer of `block_count` blocks, as the `u32` a
@@ -187,7 +192,8 @@ impl PartitionTable
             return None;
         }
         self.entries.try_reserve(1).ok()?;
-        self.next_badge += 1;
+        // Below MOUNT_AUTHORITY (bit 63), checked above: no saturation.
+        self.next_badge = badge.saturating_add(1);
         self.entries.push(PartitionBound {
             badge,
             base_lba,
@@ -323,7 +329,7 @@ mod tests
     {
         let g = Geometry::new(1000, None).expect("default block size");
         assert_eq!((g.block_size, g.capacity), (512, 1000));
-        assert_eq!(g.device_sector(7), 7);
+        assert_eq!(g.device_sector(7), Some(7));
     }
 
     #[test]
@@ -334,7 +340,10 @@ mod tests
         let g = Geometry::new(1001, Some(4096)).expect("4Kn");
         assert_eq!((g.block_size, g.capacity), (4096, 125));
         // LBA 1, where a GPT header sits, is VirtIO sector 8.
-        assert_eq!(g.device_sector(1), 8);
+        assert_eq!(g.device_sector(1), Some(8));
+        // An LBA whose sector would wrap past u64 has none.
+        assert_eq!(g.device_sector(u64::MAX / 8 + 1), None);
+        assert_eq!(g.device_sector(u64::MAX / 8), Some(u64::MAX / 8 * 8));
     }
 
     #[test]

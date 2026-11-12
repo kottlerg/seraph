@@ -18,7 +18,10 @@
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]) by re-reading hardware on
 //! every request.
 
-use cmos_rtc::{CmosFields, CmosRegs};
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
+use cmos_rtc::{Calendar, CmosRegs, epoch_us};
 use driver_binding::resources::{self, PlatformDelivery, Resource};
 use ipc::{IpcMessage, devmgr_labels, rtc_errors, rtc_labels};
 use std::os::seraph::startup_info;
@@ -28,11 +31,8 @@ use std::os::seraph::startup_info;
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
 
-// Register numbers and the snapshot protocol live in the crate's library
-// (`cmos_rtc`); the decode bits below are this binary's.
-const STATUS_B_BINARY: u8 = 0x04;
-const STATUS_B_24H: u8 = 0x02;
-const HOUR_PM_BIT: u8 = 0x80;
+// Register numbers, the snapshot protocol and the decode live in the crate's
+// library (`cmos_rtc`).
 
 // ── Declaration ────────────────────────────────────────────────────────────
 
@@ -150,65 +150,7 @@ impl CmosRegs for PortRegs
     }
 }
 
-// ── Raw → calendar fields ───────────────────────────────────────────────────
-
-fn bcd_to_bin(v: u8) -> u8
-{
-    (v & 0x0F) + (v >> 4) * 10
-}
-
-#[derive(Clone, Copy)]
-struct Calendar
-{
-    year: u32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    min: u32,
-    sec: u32,
-}
-
-fn decode(raw: CmosFields, status_b: u8) -> Calendar
-{
-    let binary = status_b & STATUS_B_BINARY != 0;
-    let h24 = status_b & STATUS_B_24H != 0;
-
-    let conv = |v: u8| -> u8 { if binary { v } else { bcd_to_bin(v) } };
-
-    let sec = conv(raw.sec);
-    let min = conv(raw.min);
-
-    // Hour needs PM-bit handling for 12-hour mode; the PM bit lives in
-    // the raw byte and must be masked off before BCD conversion.
-    let mut hour_raw = raw.hour;
-    let pm = !h24 && (hour_raw & HOUR_PM_BIT != 0);
-    hour_raw &= !HOUR_PM_BIT;
-    let mut hour = conv(hour_raw);
-    if !h24
-    {
-        if hour == 12
-        {
-            hour = 0;
-        }
-        if pm
-        {
-            hour += 12;
-        }
-    }
-
-    let day = conv(raw.day);
-    let month = conv(raw.month);
-    let year = cmos_rtc::full_year(conv(raw.year), raw.century.map(conv));
-
-    Calendar {
-        year,
-        month: u32::from(month),
-        day: u32::from(day),
-        hour: u32::from(hour),
-        min: u32::from(min),
-        sec: u32::from(sec),
-    }
-}
+// ── Read ─────────────────────────────────────────────────────────────────
 
 /// Read and decode the CMOS clock, with the century from `century_reg` when
 /// the platform names one. `None` when [`cmos_rtc::snapshot`] finds no
@@ -217,61 +159,7 @@ fn decode(raw: CmosFields, status_b: u8) -> Calendar
 fn snapshot_cmos(century_reg: Option<u8>) -> Option<Calendar>
 {
     let (fields, status_b) = cmos_rtc::snapshot(&mut PortRegs, century_reg)?;
-    Some(decode(fields, status_b))
-}
-
-// ── Civil-date arithmetic ─────────────────────────────────────────────────
-
-/// Days from 1970-01-01 to `(year, month, day)`. Howard Hinnant's
-/// algorithm; valid for the full proleptic Gregorian range. Inputs are
-/// constrained to year >= 1970 by the caller, so all intermediate
-/// values are non-negative and the unsigned arithmetic below cannot
-/// underflow.
-fn days_from_civil(y: u32, m: u32, d: u32) -> u64
-{
-    let y: u64 = if m <= 2
-    {
-        u64::from(y) - 1
-    }
-    else
-    {
-        u64::from(y)
-    };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let m_adj = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * u64::from(m_adj) + 2) / 5 + u64::from(d) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// Per-month max day count. Index 0 is unused; index 2 (February) is
-/// the non-leap value — leap years bump it before the check.
-const DAYS_IN_MONTH: [u8; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-
-fn is_leap(year: u32) -> bool
-{
-    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
-}
-
-fn epoch_us(c: Calendar) -> Option<u64>
-{
-    if c.month == 0 || c.month > 12 || c.day == 0 || c.year < 1970
-    {
-        return None;
-    }
-    let mut max_day = u32::from(DAYS_IN_MONTH[c.month as usize]);
-    if c.month == 2 && is_leap(c.year)
-    {
-        max_day = 29;
-    }
-    if c.day > max_day || c.hour >= 24 || c.min >= 60 || c.sec >= 60
-    {
-        return None;
-    }
-    let days = days_from_civil(c.year, c.month, c.day);
-    let secs = days * 86_400 + u64::from(c.hour) * 3600 + u64::from(c.min) * 60 + u64::from(c.sec);
-    secs.checked_mul(1_000_000)
+    Some(cmos_rtc::decode(fields, status_b))
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────

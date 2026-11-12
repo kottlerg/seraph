@@ -89,9 +89,19 @@ pub fn system_time_phase(_: &Caps)
     // by the 2024/2100 bounds above; the lower bound is additive
     // (`sys_delta + slack >= mono_min`) so it cannot underflow Duration
     // subtraction.
-    let slack = (mono_max / 2).max(Duration::from_millis(10));
+    let slack = mono_max
+        .checked_div(2)
+        .expect("monotonic interval halved")
+        .max(Duration::from_millis(10));
     assert!(
-        sys_delta + slack >= mono_min && sys_delta <= mono_max + slack,
+        sys_delta
+            .checked_add(slack)
+            .expect("SystemTime delta plus slack overflowed")
+            >= mono_min
+            && sys_delta
+                <= mono_max
+                    .checked_add(slack)
+                    .expect("monotonic interval plus slack overflowed"),
         "SystemTime delta {sys_delta:?} outside Instant bracket \
          [{mono_min:?}, {mono_max:?}] ±{slack:?} — clocks not tracking",
     );

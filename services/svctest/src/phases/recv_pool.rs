@@ -131,14 +131,18 @@ fn serve_echo(msg: &IpcMessage, buf: IpcBuf, echo: u64) -> IpcMessage
     let mut out = [0u64; ECHO_WORDS];
     for (k, w) in out.iter_mut().enumerate()
     {
-        *w = msg.word(k).wrapping_add(k as u64 + 1);
+        *w = msg
+            .word(k)
+            .wrapping_add((k as u64).checked_add(1).expect("echo word index"));
     }
     IpcMessage::builder(RP_OK).words(0, &out).build()
 }
 
 fn serve_gather(buf: IpcBuf) -> IpcMessage
 {
-    let deadline = Instant::now() + GATHER_BUDGET;
+    let deadline = Instant::now()
+        .checked_add(GATHER_BUDGET)
+        .expect("gather deadline overflowed");
     let mut held = GATHER.lock().unwrap_or_else(PoisonError::into_inner);
     held.push(buf.as_ptr() as usize);
     GATHER_CHANGED.notify_all();
@@ -175,7 +179,15 @@ fn request_word(client: u64, round: u64, k: usize) -> u64
     {
         0 => client,
         1 => round,
-        _ => (client << 48) | (round << 32) | ((k as u64 - 2) * 0x1111),
+        _ =>
+        {
+            (client << 48)
+                | (round << 32)
+                | ((k as u64)
+                    .checked_sub(2)
+                    .and_then(|extra| extra.checked_mul(0x1111))
+                    .expect("request word index"))
+        }
     }
 }
 
@@ -228,7 +240,7 @@ fn run_client(client: u64, send: u64) -> Vec<String>
         }
         for (k, &w) in words.iter().enumerate()
         {
-            let want = w.wrapping_add(k as u64 + 1);
+            let want = w.wrapping_add((k as u64).checked_add(1).expect("echo word index"));
             if reply.word(k) != want
             {
                 failures.push(format!(
@@ -348,7 +360,7 @@ fn own_live_badges(query: u64) -> Vec<u64>
                 found.push(entry.badge);
             }
             after = Some(entry.cursor());
-            index += 1;
+            index = index.checked_add(1).expect("slot index");
         }
         if !reply_more(reply.label)
         {
@@ -434,12 +446,15 @@ fn logd_concurrent_phase(caps: &Caps)
         let n = field_number(n.value)
             .filter(|&n| n < LINES)
             .expect("logd_concurrent: field `n` out of range");
+        let prev = last
+            .get_mut(t)
+            .expect("logd_concurrent: thread index out of range");
         assert!(
-            n < last[t],
+            n < *prev,
             "logd_concurrent: thread {t} retained out of order (n {n} after {})",
-            last[t]
+            *prev
         );
-        last[t] = n;
+        *prev = n;
     }
     std::os::seraph::log!(
         "logd_concurrent phase passed ({} burst records retained whole and in order)",

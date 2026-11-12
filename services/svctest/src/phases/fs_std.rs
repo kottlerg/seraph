@@ -641,7 +641,7 @@ fn fake_fs_serve(ep: u64) -> FakeFsReport
             // in caps[0].
             let node = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND_GRANT, next_badge)
                 .expect("fake fs: node SEND derive failed");
-            next_badge += 1;
+            next_badge = next_badge.checked_add(1).expect("fake fs: node badge");
             ipc::IpcMessage::builder(0)
                 .word(0, namespace_protocol::NodeKind::File as u64)
                 .word(1, FAKE_FS_FILE_SIZE)
@@ -650,24 +650,21 @@ fn fake_fs_serve(ep: u64) -> FakeFsReport
         }
         else if opcode == ipc::fs_labels::FS_OPEN && matches!(msg.badge, 1 | 2)
         {
-            // Cast is range-safe: the badge is 1 or 2.
-            #[allow(clippy::cast_possible_truncation)]
-            let idx = (msg.badge - 1) as usize;
-            report.open_caps[idx] = Some(msg.caps().len());
+            // The badge is 1 or 2, so the node's index is 0 or 1.
+            let idx = usize::from(msg.badge == 2);
+            *report.open_caps.get_mut(idx).expect("fake fs: node index") = Some(msg.caps().len());
             if let Some((&send, rest)) = msg.caps().split_first()
             {
-                releases[idx] = send;
+                *releases.get_mut(idx).expect("fake fs: node index") = send;
                 for &cap in rest
                 {
                     let _ = syscall::cap_delete(cap);
                 }
             }
-            let open = syscall::cap_derive_badge(
-                ep,
-                syscall::RIGHTS_EP_SEND,
-                FAKE_FS_OPEN_BASE + msg.badge,
-            )
-            .expect("fake fs: open SEND derive failed");
+            // The badge (1 or 2) lies below the base's bit, so the OR adds it.
+            let open_badge = FAKE_FS_OPEN_BASE | msg.badge;
+            let open = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, open_badge)
+                .expect("fake fs: open SEND derive failed");
             let liveness = syscall::cap_derive(ep, 0).expect("fake fs: liveness cap derive failed");
             ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
                 .cap(open)
@@ -677,10 +674,12 @@ fn fake_fs_serve(ep: u64) -> FakeFsReport
         else if opcode == ipc::fs_labels::FS_CLOSE
             && (msg.badge == FAKE_FS_OPEN_BASE + 1 || msg.badge == FAKE_FS_OPEN_BASE + 2)
         {
-            // Cast is range-safe: the badge is one of the two open badges.
-            #[allow(clippy::cast_possible_truncation)]
-            let idx = (msg.badge - FAKE_FS_OPEN_BASE - 1) as usize;
-            report.closes[idx] += 1;
+            // The badge is one of the two open badges, so its index is 0 or 1.
+            let idx = usize::from(msg.badge == FAKE_FS_OPEN_BASE + 2);
+            let closes = report.closes.get_mut(idx).expect("fake fs: open index");
+            *closes = closes
+                .checked_add(1)
+                .expect("fake fs: close counter overflow");
             ipc::IpcMessage::new(ipc::fs_errors::SUCCESS)
         }
         else if opcode == ipc::fs_labels::FS_READ_MEMORY && msg.badge == FAKE_FS_OPEN_BASE + 2

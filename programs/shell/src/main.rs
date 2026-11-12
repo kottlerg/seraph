@@ -31,6 +31,9 @@
 //! (v0.0.1): no pipes/redirection, quoting/escaping, variable expansion,
 //! globbing, or job control.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::io::{BufRead, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -387,7 +390,13 @@ fn pump<R: Read, W: Write>(mut from: R, mut to: W)
             Ok(0) | Err(_) => return,
             Ok(n) =>
             {
-                let chunk = &buf[..n];
+                // A count past the buffer breaks the `Read` contract; it ends
+                // the copy as a read error does.
+                let Some(chunk) = buf.get(..n)
+                else
+                {
+                    return;
+                };
                 if to.write_all(chunk).is_err() || to.flush().is_err()
                 {
                     return;

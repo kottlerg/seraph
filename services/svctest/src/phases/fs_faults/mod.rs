@@ -78,7 +78,12 @@ fn rename_undone_unread_when_lfn_write_dropped(fs: &OwnFatfs, disk: &SharedDisk)
     let src_name: &[u8] = b"r5_source.txt";
     let (dir, lba) = fs.case_dir(disk, b"R5");
     let src = create_with_content(dir, src_name);
-    fill_rest_of_sector(dir, 2 + lfn_slots(src_name) + 1);
+    fill_rest_of_sector(
+        dir,
+        lfn_slots(src_name)
+            .checked_add(3)
+            .expect("R5: source slot count"),
+    );
     let before = lock(disk).sector(lba).to_vec();
 
     {
@@ -156,7 +161,12 @@ fn rename_undone_when_sfn_write_dropped(fs: &OwnFatfs, disk: &SharedDisk)
     let src_name: &[u8] = b"r1_source.txt";
     let (dir, lba) = fs.case_dir(disk, b"R1");
     let src = create_with_content(dir, src_name);
-    fill_rest_of_sector(dir, 2 + lfn_slots(src_name) + 1);
+    fill_rest_of_sector(
+        dir,
+        lfn_slots(src_name)
+            .checked_add(3)
+            .expect("R1: source slot count"),
+    );
     let before = lock(disk).sector(lba).to_vec();
 
     // The removal writes the LFN slot, then the 8.3 slot.
@@ -193,7 +203,12 @@ fn rename_undone_when_lfn_write_dropped(fs: &OwnFatfs, disk: &SharedDisk)
     assert_eq!(lfn_slots(src_name), 2);
     let (dir, lba) = fs.case_dir(disk, b"R2");
     let src = create_with_content(dir, src_name);
-    fill_rest_of_sector(dir, 2 + lfn_slots(src_name) + 1);
+    fill_rest_of_sector(
+        dir,
+        lfn_slots(src_name)
+            .checked_add(3)
+            .expect("R2: source slot count"),
+    );
     let before = lock(disk).sector(lba).to_vec();
 
     lock(disk).arm(lba, 1, Fault::DropWrite);
@@ -414,8 +429,15 @@ fn create_with_content(dir: u64, name: &[u8]) -> u64
 fn fill_rest_of_sector(dir: u64, used: usize)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    let lfn = SLOTS_PER_SECTOR - used - 1;
-    let filler = vec![b'f'; lfn * LFN_CHARS];
+    let lfn = SLOTS_PER_SECTOR
+        .checked_sub(used)
+        .and_then(|free| free.checked_sub(1))
+        .expect("fs_block_faults: used slots exceed the sector");
+    let filler = vec![
+        b'f';
+        lfn.checked_mul(LFN_CHARS)
+            .expect("fs_block_faults: filler name length")
+    ];
     let (cap, _) = fs_create(dir, &filler, ipc_buf).expect("fs_block_faults: filler FS_CREATE");
     let _ = syscall::cap_delete(cap);
 }
@@ -425,7 +447,12 @@ fn fill_rest_of_sector(dir: u64, used: usize)
 fn first_entry_cluster(disk: &SharedDisk, lba: usize) -> u16
 {
     let disk = lock(disk);
-    let slot = &disk.sector(lba)[2 * 32..3 * 32];
+    let slot = disk
+        .sector(lba)
+        .as_chunks::<32>()
+        .0
+        .get(2)
+        .expect("fs_block_faults: directory sector has no slot 2");
     u16::from_le_bytes([slot[26], slot[27]])
 }
 
@@ -580,12 +607,18 @@ impl OwnFatfs
         let (cap, _) =
             fs_mkdir(self.root, name, ipc_buf).expect("fs_block_faults: FS_MKDIR failed");
         let mut sfn = [b' '; 11];
-        sfn[..name.len()].copy_from_slice(name);
+        sfn.get_mut(..name.len())
+            .expect("fs_block_faults: case name longer than an 8.3 name")
+            .copy_from_slice(name);
         let disk = lock(disk);
         let (lba, off) = disk
             .find_root_sfn(&sfn)
             .expect("fs_block_faults: case directory entry not on disk");
-        let entry = &disk.sector(lba)[off..off + 32];
+        let entry: &[u8; 32] = disk
+            .sector(lba)
+            .get(off..)
+            .and_then(<[u8]>::first_chunk)
+            .expect("fs_block_faults: case directory entry past its sector");
         let cluster = u16::from_le_bytes([entry[26], entry[27]]);
         (cap, RamDisk::cluster_lba(cluster))
     }

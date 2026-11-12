@@ -117,7 +117,7 @@ pub fn alloc_phase(_: &Caps)
     let mut m: BTreeMap<u64, u64> = BTreeMap::new();
     for k in 0u64..16
     {
-        m.insert(k, k * 100);
+        m.insert(k, k.checked_mul(100).expect("BTreeMap value overflowed"));
     }
     std::os::seraph::log!("BTreeMap::len={:#018x}", m.len() as u64);
     if let Some(&v10) = m.get(&10)
@@ -158,7 +158,8 @@ pub fn churn_phase(_: &Caps)
             11 => 777,
             _ => ((seed >> 4) & 0x3FF) as usize + 1,
         };
-        let mut v: Vec<u8> = Vec::with_capacity(size / 2 + 1);
+        let capacity = (size / 2).checked_add(1).expect("capacity overflowed");
+        let mut v: Vec<u8> = Vec::with_capacity(capacity);
         for b in 0..size
         {
             // cast_possible_truncation: the mask keeps the low byte, so the
@@ -197,7 +198,12 @@ pub fn alloc_grow_phase(_: &Caps)
     for &idx in &[0, 1, 4095, 4096, 65_535, 65_536, BIG / 2, BIG - 1]
     {
         let expected = (idx & 0xFF) as u8;
-        assert_eq!(big[idx], expected, "grow buffer[{idx}] mismatch");
+        assert_eq!(
+            *big.get(idx)
+                .expect("grow buffer index within the pushed length"),
+            expected,
+            "grow buffer[{idx}] mismatch"
+        );
     }
 
     let mut small: Vec<Vec<u8>> = Vec::with_capacity(8);
@@ -208,7 +214,7 @@ pub fn alloc_grow_phase(_: &Caps)
     for (k, v) in small.iter().enumerate()
     {
         assert_eq!(v.len(), 1024);
-        assert_eq!(v[0], k as u8);
+        assert_eq!(*v.first().expect("small buffer holds 1024 bytes"), k as u8);
     }
 
     drop(small);
@@ -401,7 +407,10 @@ pub fn cspace_slot_budget_phase(_: &Caps)
 {
     let info = startup_info();
     let before = std::os::seraph::cspace_slot_headroom(info.self_cspace);
-    let want = before + 2 * syscall_abi::CSPACE_SLOTS_PER_PAGE;
+    let want = 2u64
+        .checked_mul(syscall_abi::CSPACE_SLOTS_PER_PAGE)
+        .and_then(|extra| before.checked_add(extra))
+        .expect("cspace slot budget target overflowed");
     assert!(
         std::os::seraph::fund_cspace_slot_budget(info.self_cspace, want),
         "fund_cspace_slot_budget({want}) failed from headroom {before}"
@@ -526,7 +535,9 @@ const STRAY_CAP_LEAK_BUDGET: usize = 9 * 1024;
 /// `EXIT_RECV_WEDGE`.
 const fn stray_cap_calls(kept: usize) -> usize
 {
-    let dispatch_leak = MSG_CAP_SLOTS_MAX - kept;
+    let dispatch_leak = MSG_CAP_SLOTS_MAX
+        .checked_sub(kept)
+        .expect("kept contract caps exceed MSG_CAP_SLOTS_MAX");
     let smallest_leak = if kept == 0 || (dispatch_leak != 0 && dispatch_leak < kept)
     {
         dispatch_leak
@@ -545,7 +556,7 @@ const fn stray_cap_calls(kept: usize) -> usize
 pub fn stray_cap_flood_phase(_: &Caps)
 {
     let info = startup_info();
-    let mut total_calls = 0;
+    let mut total_calls = 0usize;
     for case in &STRAY_CAP_CASES
     {
         let label = case.label;
@@ -574,7 +585,9 @@ pub fn stray_cap_flood_phase(_: &Caps)
                     "decline code in memmgr reply to {what}"
                 );
             }
-            total_calls += 1;
+            total_calls = total_calls
+                .checked_add(1)
+                .expect("stray-cap call count overflowed");
         }
     }
 
@@ -587,7 +600,9 @@ pub fn stray_cap_flood_phase(_: &Caps)
     );
     std::os::seraph::log!(
         "memmgr answered {total_calls} calls carrying {} stray caps",
-        total_calls * MSG_CAP_SLOTS_MAX
+        total_calls
+            .checked_mul(MSG_CAP_SLOTS_MAX)
+            .expect("stray cap total overflowed")
     );
 }
 
@@ -702,12 +717,21 @@ fn settled_deferred_bytes() -> u64
     // A test wait bound: it limits only how many rechecks the settle takes.
     const MAX_SETTLE: u32 = 256;
     let mut last = deferred_bytes();
-    let mut quiet = 0;
+    let mut quiet = 0u32;
     for _ in 0..MAX_SETTLE
     {
         recheck_deferred();
         let now = deferred_bytes();
-        quiet = if now < last { 0 } else { quiet + 1 };
+        quiet = if now < last
+        {
+            0
+        }
+        else
+        {
+            quiet
+                .checked_add(1)
+                .expect("quiet recheck count overflowed")
+        };
         last = now;
         if quiet == SETTLE_QUIET
         {
@@ -893,7 +917,10 @@ pub fn frame_reclaim_live_object_phase(_: &Caps)
     let _ = child.wait();
     let after_kill = deferred_bytes();
     assert!(
-        after_kill >= baseline + syscall_abi::PAGE_SIZE,
+        after_kill
+            >= baseline
+                .checked_add(syscall_abi::PAGE_SIZE)
+                .expect("deferred baseline plus a page overflowed"),
         "frame_reclaim_live_object: the dead child's endpoint page was pooled \
          (deferred {baseline} -> {after_kill} bytes)"
     );
@@ -919,7 +946,9 @@ pub fn frame_reclaim_live_object_phase(_: &Caps)
 
     syscall::cap_delete(send).expect("frame_reclaim_live_object: deleting the SEND failed");
     await_deferred_at_most(
-        after_kill - syscall_abi::PAGE_SIZE,
+        after_kill
+            .checked_sub(syscall_abi::PAGE_SIZE)
+            .expect("deferred bytes below a page after the kill"),
         "frame_reclaim_live_object: endpoint page after its last SEND went",
     );
     std::os::seraph::log!(
@@ -964,7 +993,9 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
     );
     let held = deferred_bytes();
     assert!(
-        held >= baseline + syscall_abi::PAGE_SIZE,
+        held >= baseline
+            .checked_add(syscall_abi::PAGE_SIZE)
+            .expect("deferred baseline plus a page overflowed"),
         "frame_reclaim_mapped_release: a still-mapped released page was pooled \
          (deferred {baseline} -> {held} bytes)"
     );
@@ -987,7 +1018,8 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
     std::os::seraph::unreserve_pages(range);
     syscall::cap_delete(grant).expect("frame_reclaim_mapped_release: cap_delete of grant");
     await_deferred_at_most(
-        held - syscall_abi::PAGE_SIZE,
+        held.checked_sub(syscall_abi::PAGE_SIZE)
+            .expect("deferred bytes below a page after the release"),
         "frame_reclaim_mapped_release: released page after its mapping went",
     );
     std::os::seraph::log!(
@@ -1017,7 +1049,9 @@ pub fn frame_reclaim_held_cap_release_phase(_: &Caps)
     release_one_page(grant, region_id);
     let held = deferred_bytes();
     assert!(
-        held >= baseline + syscall_abi::PAGE_SIZE,
+        held >= baseline
+            .checked_add(syscall_abi::PAGE_SIZE)
+            .expect("deferred baseline plus a page overflowed"),
         "frame_reclaim_held_cap_release: a released page another cap still names was pooled \
          (deferred {baseline} -> {held} bytes)"
     );
@@ -1035,7 +1069,8 @@ pub fn frame_reclaim_held_cap_release_phase(_: &Caps)
 
     syscall::cap_delete(kept).expect("frame_reclaim_held_cap_release: cap_delete of the kept cap");
     await_deferred_at_most(
-        held - syscall_abi::PAGE_SIZE,
+        held.checked_sub(syscall_abi::PAGE_SIZE)
+            .expect("deferred bytes below a page after the release"),
         "frame_reclaim_held_cap_release: released page after its last other cap went",
     );
     std::os::seraph::log!(

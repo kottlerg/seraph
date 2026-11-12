@@ -74,5 +74,8 @@ pub fn ns_readdir(dir_cap: u64, idx: u64, ipc_buf: *mut u64)
     // Name bytes start at byte 16 (after words 0 and 1).
     let start = 16usize;
     let end = start.saturating_add(len).min(bytes.len());
-    Ok(Some((kind, bytes[start..end].to_vec())))
+    let name = bytes
+        .get(start..end)
+        .expect("ns readdir: reply shorter than its name offset");
+    Ok(Some((kind, name.to_vec())))
 }

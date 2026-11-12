@@ -10,6 +10,9 @@
 //! child's stdout cap to the system log endpoint with a per-service badge;
 //! nothing in this binary knows or cares.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 fn main()
 {
     println!("hello from seraph userspace");

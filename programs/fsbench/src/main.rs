@@ -27,6 +27,8 @@
 //! fsbench: arch=x86_64 size=4096 path=frame  iters=256 cycles_min=...
 //! ```
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // fsbench is a benchmark harness: panics on failure so faults surface
 // in the log. `expect`/`unwrap` are the intended idiom here.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -98,16 +100,23 @@ fn read_inline(f: &mut File, size: u64, buf: &mut [u8]) -> u64
     let mut consumed: u64 = 0;
     while consumed < size
     {
-        let remaining = size - consumed;
+        // The loop condition keeps `consumed` below `size`, and the remainder
+        // keeps `page_off` below `PAGE_SIZE`: neither subtraction saturates.
+        let remaining = size.saturating_sub(consumed);
         let page_off = consumed % PAGE_SIZE;
-        let chunk = remaining.min(INLINE_CHUNK).min(PAGE_SIZE - page_off);
+        let chunk = remaining
+            .min(INLINE_CHUNK)
+            .min(PAGE_SIZE.saturating_sub(page_off));
         let chunk_usz = usize::try_from(chunk).expect("chunk is at most INLINE_CHUNK");
-        let n = f.read(&mut buf[..chunk_usz]).expect("inline read failed");
+        let dst = buf
+            .get_mut(..chunk_usz)
+            .expect("the buffer holds INLINE_CHUNK bytes");
+        let n = f.read(dst).expect("inline read failed");
         if n == 0
         {
             break;
         }
-        consumed += n as u64;
+        consumed = consumed.saturating_add(n as u64);
     }
     consumed
 }
@@ -142,7 +151,7 @@ fn read_frame(f: &mut File, size: u64, buf: &mut [u8]) -> u64
         {
             break;
         }
-        consumed += n as u64;
+        consumed = consumed.saturating_add(n as u64);
     }
     consumed
 }
@@ -183,7 +192,9 @@ fn measure(f: &mut File, size: u64, path: &str, buf: &mut [u8], iters: u32)
         }
         sum_c = sum_c.wrapping_add(elapsed);
     }
-    let mean_c = sum_c / u64::from(iters);
+    let mean_c = sum_c
+        .checked_div(u64::from(iters))
+        .expect("measure_iters returns a positive count");
 
     let arch = ARCH_TAG;
     std::os::seraph::log!(

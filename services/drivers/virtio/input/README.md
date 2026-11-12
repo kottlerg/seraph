@@ -28,8 +28,9 @@ virtio/input/
 The driver carries a declaration in the ELF note section `.note.seraph.driver` (PCI `1AF4:1012` and
 `1AF4:1052`, class `input`, interrupt optional, DMA, auxiliary tier). Devmgr binds it to each
 matching virtio-input PCI device, carves the device's per-device capabilities (an `Mmio` cap for
-every BAR its VirtIO register regions name, its own derivation of its line's `Interrupt` cap, a line
-another device shares included, and the device's DMA capability), and spawns this driver from the
+every range of the BARs its VirtIO register regions name, its interrupt: one MSI-X vector, which
+the declaration asks for, else its own derivation of its line's `Interrupt` cap, a line another
+device shares included; and the device's DMA capability), and spawns this driver from the
 rootfs (`/services/drivers/virtio-input`) — it is not bootstrap-essential, so it loads lazily
 through devmgr's `SET_DRIVERS_DIR` subtree cap, like the RTC drivers (see
 [docs/device-management.md](../../../../docs/device-management.md)). The driver reports
@@ -92,15 +93,17 @@ with the device addresses devmgr returns, never with a physical address
 § DMA Authorisation). The device fills one event per
 buffer as keys arrive and raises an interrupt; the driver drains the used ring,
 decodes, and re-posts each buffer. A descriptor-head → buffer-slot map locates
-the filled buffer on completion. With an IRQ cap, an interrupt-service thread
-is the only waiter on the notification bound to the device's line: it runs
-virtio-core's `isr::serve_interrupts`, which reads the ISR and acknowledges
-every delivery at once, a read in flight or not, as a driver on a shared line
-must ([driver-model.md](../../docs/driver-model.md) rule 5), reads the ISR on a
-bounded timeout too, and signals the read loop's `wake` notification. The read
-loop's wait on `wake` carries a bounded timeout and re-drains each tick, so the
-read still completes with no IRQ cap and tolerates a lost interrupt (a lost
-PLIC interrupt on QEMU virt RISC-V, or an edge the x86-64 I/O APIC drops).
+the filled buffer on completion. With an interrupt, an interrupt-service
+thread is the only waiter on the notification bound to it: it runs
+virtio-core's `isr::serve_interrupts`, which on the wired line reads the ISR
+and acknowledges every delivery at once, a read in flight or not, as a driver
+on a shared line must ([driver-model.md](../../docs/driver-model.md) rule 5),
+and reads the ISR on a bounded timeout too, and on an MSI-X vector relays each
+delivery; either way it signals the read loop's `wake` notification. Under
+MSI-X the driver routes the eventq to vector 0 and configuration changes to
+`NO_VECTOR`; a device that refuses either leaves the driver with no interrupt.
+The read loop's wait on `wake` carries a bounded timeout and re-drains each
+tick, so the read still completes with no interrupt, polling.
 
 ---
 

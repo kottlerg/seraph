@@ -259,6 +259,11 @@ at `BIND_DRIVERS`, and for a hot-added device:
 
 1. Carve one capability per resource of the record the declaration needs: each `Mmio` from
    the apertures and each `IoPort` from devmgr's port capability, and keep the `Config` page.
+   The BARs of a PCI function devmgr may give MSI-X are carved less the pages holding its MSI-X
+   table and Pending Bit Array, which devmgr keeps and delivers to no driver, so one BAR may be
+   up to three `Mmio` capabilities, each naming its BAR and its offset in it
+   ([device-management.md](device-management.md#message-signaled-interrupts) § Message-Signaled
+   Interrupts).
 2. For a DMA declaration, give the device its DMA grant, confining it where an IOMMU unit
    translates it.
 3. Give the interrupt capabilities the declaration's need and the record's kind allow: a PCI
@@ -289,8 +294,8 @@ driver runs three steps in order:
 1. the DMA and Bus Master Enable steps that apply to every DMA-capable device;
 2. for a PCI function, setting the Interrupt Disable bit of its Command register through the
    kept `Config` page, so the function stops asserting its wired line whoever else shares it,
-   and clearing its MSI Enable and MSI-X Enable, so it signals none of its message-signaled
-   targets;
+   and clearing its MSI Enable and MSI-X Enable, MSI-X's Function Mask set, so it signals none
+   of its message-signaled targets;
 3. the reset the declaration names.
 
 ---

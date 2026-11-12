@@ -49,7 +49,13 @@ when it exits on its own.
    ([services/drivers/serial/README.md](../serial/README.md#interrupts) § Interrupts), so devmgr
    keeps the UART line exclusive. The UART line is never a PCI `INTx` line on either machine
    (x86-64 COM1 is ISA IRQ 4, the riscv64 `virt` NS16550 is APLIC source 10 against `INTx` sources
-   32 to 35), so the exclusivity costs no device a cap in practice.
+   32 to 35), so the exclusivity costs no device a cap in practice. A message-signaled vector
+   (MSI or MSI-X) is its device's alone: the kernel never masks it, so it owes no
+   acknowledgement. A driver given vectors names them in its device's own registers
+   and holds its device's interrupts off at the device (VirtIO's `NO_VECTOR` and event
+   suppression), since devmgr alone writes the MSI-X table and its masks
+   ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
+   § Message-Signaled Interrupts).
 6. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where
    applicable rather than duplicating transport logic.
 
@@ -65,7 +71,8 @@ revoking every copy and dropping the device's mappings, which also blocks the de
 IOMMU confines it (the IOMMU driver's `BLOCK`); then it clears the function's Bus Master
 Enable through a configuration-page cap it keeps and no driver holds, so the device issues no
 further DMA; revokes the driver's mappings of its BARs; sets the function's Command Interrupt
-Disable bit and clears its MSI Enable and MSI-X Enable bits through the same cap; runs the reset
+Disable bit and clears its MSI Enable and MSI-X Enable bits, MSI-X's Function Mask set, through
+the same cap; runs the reset
 the driver's declaration names (the VirtIO status reset, `device_status` 0 complete once the
 status reads back 0 within `RESET_TIMEOUT`, or a PCI Express Function Level Reset, complete once
 the function answers after `FLR_COMPLETION_MS`; or none, and a device with none is never confirmed

@@ -432,8 +432,11 @@ pub const CAP_INFO_ASPACE_TERMINAL_FAULT: u64 = 14;
 /// message-signaled interrupt the capability names (one minted by
 /// `SYS_IRQ_MSG_ALLOC`): on `x86_64` the local APIC's compatibility-format
 /// address of the target CPU, on riscv64 the physical address of the target
-/// hart's supervisor-level IMSIC interrupt file. A driver programs it, with
-/// [`CAP_INFO_IRQ_MSG_DATA`], into its device's MSI or MSI-X entry. Calling
+/// hart's supervisor-level IMSIC interrupt file. devmgr programs it, with
+/// [`CAP_INFO_IRQ_MSG_DATA`], into the device's MSI capability or MSI-X table
+/// entry before it delivers the driver a copy of the capability, which the
+/// driver only binds (docs/device-management.md § Message-Signaled
+/// Interrupts). Calling
 /// on another capability type, or on an Interrupt capability naming a wired
 /// line, returns [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_IRQ_MSG_ADDRESS: u64 = 15;

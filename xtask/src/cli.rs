@@ -395,8 +395,8 @@ pub struct RunArgs
 
     /// Place the second disk's device on the first disk's `INTx` line (four
     /// PCI slots past it, where both machines' interrupt routing puts it on
-    /// the same line), staging the boot in which two virtio-blk devices
-    /// share one line.
+    /// the same line), and launch both disks with no MSI-X, staging the boot
+    /// in which two virtio-blk devices share one line.
     #[arg(long, requires = "second_disk")]
     pub second_disk_shared_line: bool,
 

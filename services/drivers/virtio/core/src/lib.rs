@@ -52,7 +52,7 @@ pub const STATUS_FAILED: u8 = 128;
 /// Serialised into the driver's startup message by devmgr. The driver
 /// deserialises it to locate `VirtIO` register regions within mapped BARs.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct VirtioCapLocation
 {
     /// PCI BAR index (0-5) containing this capability's registers.
@@ -190,6 +190,7 @@ impl VirtioPciStartupInfo
         let mut layout = RegisterLayout {
             bars,
             bar_count,
+            regions: regions.map(|(_, r)| *r),
             common: 0,
             notify: 0,
             isr: 0,
@@ -212,9 +213,16 @@ const PCI_BAR_COUNT: u8 = 6;
 
 /// Most distinct BARs a `VirtIO` device's register regions name: one per
 /// region (common, notification, ISR, and device configuration, the four
-/// region types `VirtIO` 1.2 § 4.1.4 defines). A hardware-spec bound; a
-/// driver refuses a resource list that delivers more ([`bootstrap`]).
+/// region types `VirtIO` 1.2 § 4.1.4 defines). A hardware-spec bound.
 pub const MAX_VIRTIO_BARS: usize = 4;
+
+/// Most `Mmio` ranges devmgr delivers a `VirtIO` driver for the BARs its
+/// register regions name: one per BAR, and two more, since each of the two
+/// page spans devmgr withholds (those holding the function's MSI-X table and
+/// Pending Bit Array) splits at most one range in two
+/// (`driver_binding::resources::MAX_PCI_RANGES`). A driver refuses a resource
+/// list that delivers more ([`bootstrap`]).
+pub const MAX_VIRTIO_RANGES: usize = MAX_VIRTIO_BARS + 2;
 
 /// One BAR a device's register regions name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -223,24 +231,40 @@ pub struct BarAperture
     /// PCI BAR index (0-5).
     pub bar: u8,
     /// 4 KiB pages from the BAR's start that the regions in it reach; at
-    /// least 1. devmgr carves the BAR's `Mmio` cap to at most this many
-    /// pages, and the driver maps it into that many pages of its window.
+    /// least 1. devmgr carves the BAR's `Mmio` caps from at most this many
+    /// pages, and the driver maps them into that many pages of its window.
     pub pages: u64,
+}
+
+/// One delivered `Mmio` range of a BAR: the driver's cap on it, the PCI BAR
+/// index, the range's offset in the BAR, and its length. devmgr delivers a
+/// BAR as one range from its start, or as several when it withholds pages of
+/// it (docs/device-management.md § Message-Signaled Interrupts).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BarRange
+{
+    pub cap: u64,
+    pub bar: u8,
+    pub offset: u64,
+    pub bytes: u64,
 }
 
 /// Where a `VirtIO` device's four register regions sit, for a driver that
 /// maps every BAR they name into one register window.
 ///
-/// The window holds one mapping per BAR in [`bars`](Self::bars) order
-/// (ascending BAR index), each [`BarAperture::pages`] long and following the
-/// previous one. A region's window offset is its BAR's offset in the window
-/// plus the region's offset in the BAR. Built by
-/// [`VirtioPciStartupInfo::register_layout`].
+/// The window gives each BAR in [`bars`](Self::bars) order (ascending BAR
+/// index) [`BarAperture::pages`] pages, each BAR's following the previous
+/// one's. A BAR range devmgr delivers maps at its BAR's window offset plus
+/// the range's offset in the BAR ([`Self::place`]), and a region's window
+/// offset is its BAR's window offset plus the region's offset in the BAR.
+/// Built by [`VirtioPciStartupInfo::register_layout`].
 #[derive(Clone, Copy, Debug)]
 pub struct RegisterLayout
 {
     bars: [BarAperture; MAX_VIRTIO_BARS],
     bar_count: usize,
+    /// The common, notification, ISR, and device regions, in their BARs.
+    regions: [VirtioCapLocation; 4],
     /// Window offset of the common configuration region.
     pub common: u64,
     /// Window offset of the notification region.
@@ -276,32 +300,67 @@ impl RegisterLayout
         self.bars().iter().map(|b| b.pages).sum()
     }
 
-    /// Window offset of `region`: the offset of its BAR's mapping (the pages
-    /// of every BAR before it) plus its offset in the BAR. Every region of
-    /// the layout names one of its BARs.
-    fn region_offset(&self, region: &VirtioCapLocation) -> u64
+    /// Window offset of BAR `bar`'s pages: the pages of every BAR before it.
+    fn bar_offset(&self, bar: u8) -> u64
     {
-        let bar_offset: u64 = self
-            .bars()
+        self.bars()
             .iter()
-            .take_while(|b| b.bar != region.bar)
+            .take_while(|b| b.bar != bar)
             .map(|b| b.pages * PAGE_SIZE)
-            .sum();
-        bar_offset + u64::from(region.offset)
+            .sum()
     }
 
-    /// Whether `bar_indices`, the PCI BAR index of each delivered BAR cap in
-    /// delivery order, names exactly this layout's BARs in its order, so the
-    /// caps map into the window by position.
-    #[must_use]
-    pub fn matches_delivered(&self, bar_indices: &[u64]) -> bool
+    /// Window offset of `region`: the offset of its BAR's pages plus its
+    /// offset in the BAR. Every region of the layout names one of its BARs.
+    fn region_offset(&self, region: &VirtioCapLocation) -> u64
     {
-        bar_indices.len() == self.bar_count
-            && self
-                .bars()
+        self.bar_offset(region.bar) + u64::from(region.offset)
+    }
+
+    /// The window offset each of the delivered BAR `ranges` maps at, in
+    /// their order (the first `ranges.len()` entries): its BAR's window
+    /// offset plus its offset in the BAR. `None` unless the ranges are this
+    /// layout's own: at most [`MAX_VIRTIO_RANGES`], each in a BAR the layout
+    /// names, at a page-aligned offset, its pages inside its BAR's
+    /// [`BarAperture::pages`]; in ascending BAR and offset order with no two
+    /// ranges' pages overlapping, so no mapping lands on another's; and every
+    /// register region lying inside one range, so every register the
+    /// transport reaches is mapped.
+    #[must_use]
+    pub fn place(&self, ranges: &[BarRange]) -> Option<[u64; MAX_VIRTIO_RANGES]>
+    {
+        if ranges.len() > MAX_VIRTIO_RANGES
+        {
+            return None;
+        }
+        let mut placed = [0; MAX_VIRTIO_RANGES];
+        // The end of the previous range's pages, as (BAR, offset).
+        let mut previous: Option<(u8, u64)> = None;
+        for (slot, r) in placed.iter_mut().zip(ranges)
+        {
+            let aperture = self.bars().iter().find(|b| b.bar == r.bar)?;
+            let end = r
+                .bytes
+                .checked_next_multiple_of(PAGE_SIZE)
+                .and_then(|pages| r.offset.checked_add(pages))?;
+            if !r.offset.is_multiple_of(PAGE_SIZE)
+                || r.bytes == 0
+                || end > aperture.pages * PAGE_SIZE
+                || previous.is_some_and(|(bar, past)| (r.bar, r.offset) < (bar, past))
+            {
+                return None;
+            }
+            previous = Some((r.bar, end));
+            *slot = self.bar_offset(r.bar) + r.offset;
+        }
+        let inside = |region: &VirtioCapLocation| {
+            let start = u64::from(region.offset);
+            let end = start + u64::from(region.length);
+            ranges
                 .iter()
-                .zip(bar_indices)
-                .all(|(b, &i)| u64::from(b.bar) == i)
+                .any(|r| r.bar == region.bar && r.offset <= start && end <= r.offset + r.bytes)
+        };
+        self.regions.iter().all(inside).then_some(placed)
     }
 }
 
@@ -665,19 +724,106 @@ mod tests
         );
     }
 
-    #[test]
-    fn delivered_bars_match_only_the_layouts_bars_in_its_order()
+    fn range(cap: u64, bar: u8, offset: u64, bytes: u64) -> BarRange
     {
-        let layout = layout_of([
+        BarRange {
+            cap,
+            bar,
+            offset,
+            bytes,
+        }
+    }
+
+    fn two_bar_layout() -> RegisterLayout
+    {
+        // BAR 2: notification, one page. BAR 4: common at 0, ISR at 0x1000,
+        // device at 0x3000, four pages.
+        layout_of([
             cap(4, 0, 0x38),
             cap(2, 0, 0x1000),
             cap(4, 0x1000, 4),
-            cap(4, 0x2000, 8),
+            cap(4, 0x3000, 8),
         ])
-        .expect("every region present");
-        assert!(layout.matches_delivered(&[2, 4]));
-        assert!(!layout.matches_delivered(&[4, 2]));
-        assert!(!layout.matches_delivered(&[2]));
-        assert!(!layout.matches_delivered(&[2, 4, 5]));
+        .expect("every region present")
+    }
+
+    #[test]
+    fn whole_bars_are_placed_at_their_bars_window_offsets()
+    {
+        let layout = two_bar_layout();
+        let placed = layout
+            .place(&[range(10, 2, 0, 0x1000), range(11, 4, 0, 0x4000)])
+            .expect("the layout's own BARs");
+        assert_eq!(&placed[..2], &[0, 0x1000]);
+    }
+
+    #[test]
+    fn ranges_around_withheld_pages_are_placed_at_their_offsets()
+    {
+        // BAR 4's page at 0x2000 withheld: two ranges, each at its offset in
+        // the BAR, and the regions all inside one of them.
+        let layout = two_bar_layout();
+        let placed = layout
+            .place(&[
+                range(10, 2, 0, 0x1000),
+                range(11, 4, 0, 0x2000),
+                range(12, 4, 0x3000, 0x1000),
+            ])
+            .expect("every region delivered");
+        assert_eq!(&placed[..3], &[0, 0x1000, 0x4000]);
+    }
+
+    #[test]
+    fn ranges_that_are_not_the_layouts_own_are_refused()
+    {
+        let layout = two_bar_layout();
+        let whole = |bar, pages| range(10, bar, 0, pages * PAGE_SIZE);
+        // A BAR missing, so its regions are not delivered.
+        assert!(layout.place(&[whole(4, 4)]).is_none());
+        // A BAR the layout does not name.
+        assert!(
+            layout
+                .place(&[whole(2, 1), whole(4, 4), whole(5, 1)])
+                .is_none()
+        );
+        // Out of order.
+        assert!(layout.place(&[whole(4, 4), whole(2, 1)]).is_none());
+        // Past the BAR's pages.
+        assert!(layout.place(&[whole(2, 2), whole(4, 4)]).is_none());
+        // An offset not page-aligned.
+        assert!(
+            layout
+                .place(&[whole(2, 1), range(11, 4, 0x800, 0x3800)])
+                .is_none()
+        );
+        // Two ranges of one BAR overlapping.
+        assert!(
+            layout
+                .place(&[
+                    whole(2, 1),
+                    range(11, 4, 0, 0x2000),
+                    range(12, 4, 0x1000, 0x3000)
+                ])
+                .is_none()
+        );
+        // The ISR's page withheld: the region is not delivered.
+        assert!(
+            layout
+                .place(&[
+                    whole(2, 1),
+                    range(11, 4, 0, 0x1000),
+                    range(12, 4, 0x2000, 0x2000)
+                ])
+                .is_none()
+        );
+        // A region reaching past its range's bytes, though inside its page.
+        assert!(
+            layout
+                .place(&[whole(2, 1), range(11, 4, 0, 0x3004)])
+                .is_none()
+        );
+        // More ranges than any delivery holds.
+        let many = [range(10, 2, 0, 0x1000); MAX_VIRTIO_RANGES + 1];
+        assert!(layout.place(&many).is_none());
     }
 }

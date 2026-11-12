@@ -36,6 +36,8 @@ pub const SL_READ: u64 = 1 << 0;
 pub const SL_WRITE: u64 = 1 << 1;
 /// The address bits of an entry: 12 through 51.
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+/// The first physical address past those an entry's address bits reach.
+const PHYS_LIMIT: u64 = ADDR_MASK + PAGE;
 
 /// A root entry's two words: present, pointing at the context table at
 /// `context_phys`.
@@ -52,7 +54,8 @@ pub const fn root_entry(context_phys: u64) -> [u64; 2]
 #[must_use]
 pub const fn context_entry(table_phys: u64, levels: u32, did: u16) -> [u64; 2]
 {
-    let aw = (levels as u64) - 2;
+    // `levels` is 3 or 4.
+    let aw = (levels as u64).saturating_sub(2);
     [
         (table_phys & ADDR_MASK) | CTX_PRESENT,
         aw | ((did as u64) << 8),
@@ -64,7 +67,16 @@ pub const fn context_entry(table_phys: u64, levels: u32, did: u16) -> [u64; 2]
 #[must_use]
 pub const fn context_index(device: u8, function: u8) -> usize
 {
-    ((((device & 0x1f) as usize) << 3) | (function & 0x7) as usize) * 2
+    // At most 510: the masks bound the entry number to 255.
+    ((((device & 0x1f) as usize) << 3) | (function & 0x7) as usize).saturating_mul(2)
+}
+
+/// The lowest IOVA bit a level-`level` table's index takes: 12 for the leaf
+/// tables (level 1), and 9 more for each level above. A level is 1 to 4, so
+/// the result stays far below `u32::MAX` and nothing saturates.
+const fn level_shift(level: u32) -> u32
+{
+    level.saturating_sub(1).saturating_mul(9).saturating_add(12)
 }
 
 /// How [`SecondLevel`]'s walk treats a missing intermediate table.
@@ -128,12 +140,20 @@ impl SecondLevel
     #[must_use]
     pub fn width(&self) -> u64
     {
-        1u64 << (12 + 9 * self.levels)
+        (1u64 << level_shift(self.levels)) << 9
     }
 
     fn index(iova: u64, level: u32) -> usize
     {
-        ((iova >> (12 + 9 * (level - 1))) & 0x1ff) as usize
+        ((iova >> level_shift(level)) & 0x1ff) as usize
+    }
+
+    /// Entry `i` of the table page at `table`. Every `i` passed comes from
+    /// [`Self::index`], below [`ENTRIES`], so the [`TableError::Invalid`] is
+    /// never returned.
+    fn entry(store: &mut impl TableStore, table: u64, i: usize) -> Result<&mut u64, TableError>
+    {
+        store.table(table).get_mut(i).ok_or(TableError::Invalid)
     }
 
     fn check(&self, iova: u64, phys: u64, len: u64) -> Result<(), TableError>
@@ -142,9 +162,7 @@ impl SecondLevel
         if len == 0
             || (iova | phys | len) & (PAGE - 1) != 0
             || end > self.width()
-            || phys
-                .checked_add(len)
-                .is_none_or(|e| e - 1 > ADDR_MASK | 0xfff)
+            || phys.checked_add(len).is_none_or(|e| e > PHYS_LIMIT)
         {
             return Err(TableError::Invalid);
         }
@@ -166,7 +184,7 @@ impl SecondLevel
         for level in (2..=self.levels).rev()
         {
             let i = Self::index(iova, level);
-            let entry = store.table(table)[i];
+            let entry = *Self::entry(store, table, i)?;
             table = if entry & (SL_READ | SL_WRITE) != 0
             {
                 entry & ADDR_MASK
@@ -176,7 +194,7 @@ impl SecondLevel
                 let next = store.alloc().ok_or(TableError::OutOfMemory)?;
                 // A non-leaf entry grants both rights; the leaf narrows
                 // them.
-                store.table(table)[i] = next | SL_READ | SL_WRITE;
+                *Self::entry(store, table, i)? = next | SL_READ | SL_WRITE;
                 store.written(table, i);
                 next
             }
@@ -209,20 +227,24 @@ impl SecondLevel
         {
             return Err(TableError::Invalid);
         }
+        // `check` refused a range whose end passes `u64` from `iova` or from
+        // `phys`, and `len` is a multiple of `PAGE`, so no sum below
+        // saturates.
         let mut done = 0;
         while done < len
         {
-            let step = match self.leaf(store, iova + done, Walk::Create)
-            {
-                Ok((table, i)) if store.table(table)[i] == 0 =>
-                {
-                    store.table(table)[i] = ((phys + done) & ADDR_MASK) | rights;
+            let step = self
+                .leaf(store, iova.saturating_add(done), Walk::Create)
+                .and_then(|(table, i)| {
+                    let slot = Self::entry(store, table, i)?;
+                    if *slot != 0
+                    {
+                        return Err(TableError::InUse);
+                    }
+                    *slot = (phys.saturating_add(done) & ADDR_MASK) | rights;
                     store.written(table, i);
                     Ok(())
-                }
-                Ok(_) => Err(TableError::InUse),
-                Err(e) => Err(e),
-            };
+                });
             if let Err(e) = step
             {
                 if done != 0
@@ -231,7 +253,7 @@ impl SecondLevel
                 }
                 return Err(e);
             }
-            done += PAGE;
+            done = done.saturating_add(PAGE);
         }
         Ok(())
     }
@@ -250,17 +272,19 @@ impl SecondLevel
     ) -> Result<(), TableError>
     {
         self.check(iova, 0, len)?;
+        // As in `map`, no sum below saturates.
         let mut done = 0;
         while done < len
         {
-            let (table, i) = self.leaf(store, iova + done, Walk::Existing)?;
-            if store.table(table)[i] == 0
+            let (table, i) = self.leaf(store, iova.saturating_add(done), Walk::Existing)?;
+            let slot = Self::entry(store, table, i)?;
+            if *slot == 0
             {
                 return Err(TableError::NotMapped);
             }
-            store.table(table)[i] = 0;
+            *slot = 0;
             store.written(table, i);
-            done += PAGE;
+            done = done.saturating_add(PAGE);
         }
         Ok(())
     }

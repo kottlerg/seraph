@@ -59,22 +59,18 @@ impl FaultQueue
         }
         else
         {
-            self.dropped += 1;
+            // The count is reset at every poll, so it cannot near `u64::MAX`.
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 
     /// Take up to `max` faults, oldest first, passing each to `take`.
-    pub fn take(&mut self, max: usize, mut take: impl FnMut(Fault))
+    /// Returns how many were taken.
+    pub fn take(&mut self, max: usize, take: impl FnMut(Fault)) -> usize
     {
-        for _ in 0..max
-        {
-            let Some(f) = self.faults.pop_front()
-            else
-            {
-                return;
-            };
-            take(f);
-        }
+        let n = max.min(self.faults.len());
+        self.faults.drain(..n).for_each(take);
+        n
     }
 
     /// Faults dropped since the last call, resetting the count.
@@ -108,10 +104,10 @@ mod tests
             q.push(fault(i << 12));
         }
         let mut got = Vec::new();
-        q.take(3, |f| got.push(f.iova));
+        assert_eq!(q.take(3, |f| got.push(f.iova)), 3);
         assert_eq!(got, [0, 0x1000, 0x2000]);
         got.clear();
-        q.take(3, |f| got.push(f.iova));
+        assert_eq!(q.take(3, |f| got.push(f.iova)), 2);
         assert_eq!(got, [0x3000, 0x4000]);
     }
 

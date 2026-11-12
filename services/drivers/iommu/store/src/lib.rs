@@ -22,6 +22,9 @@
 //! past its death, since devmgr spawns it `CREATE_DMA_HOLD` and never
 //! releases the hold.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use iommu_core::table::{TABLE_WORDS, TableStore};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use std::os::seraph::reserve_pages;
@@ -102,11 +105,12 @@ impl Store
             std::os::seraph::log!(warn: "table pages: flush past the end of {:#x} refused", phys);
             return;
         }
-        if let Some(va) = self.va(phys)
+        if let Some(start) = self.va(phys).and_then(|va| va.checked_add(offset))
         {
-            // SAFETY: `va` maps the page `phys` for the driver's life, and
-            // `offset + len` stays inside it (checked above).
-            unsafe { write_back(va + offset, len) };
+            // SAFETY: the page `phys` is mapped at `start - offset` for the
+            // driver's life, and `offset + len` stays inside it (checked
+            // above).
+            unsafe { write_back(start, len) };
         }
     }
 
@@ -129,10 +133,17 @@ impl Store
         {
             return None;
         }
-        self.chunks
-            .iter()
-            .find(|c| phys >= c.phys && phys < c.phys + c.used * PAGE_SIZE)
-            .map(|c| c.va + (phys - c.phys))
+        self.chunks.iter().find_map(|c| {
+            let offset = phys.checked_sub(c.phys)?;
+            if offset < c.used.checked_mul(PAGE_SIZE)?
+            {
+                c.va.checked_add(offset)
+            }
+            else
+            {
+                None
+            }
+        })
     }
 
     /// Take `pages` physically contiguous pages, zeroed, for one structure a
@@ -148,21 +159,24 @@ impl Store
         {
             return None;
         }
-        let last = self.chunks.len() - 1;
-        let chunk = &mut self.chunks[last];
+        let chunk = self.chunks.last_mut()?;
         chunk.used = pages;
         let (phys, va) = (chunk.phys, chunk.va);
-        if last > 0
+        if let [.., drawn, new] = self.chunks.as_mut_slice()
         {
-            self.chunks.swap(last - 1, last);
+            core::mem::swap(drawn, new);
         }
         // SAFETY: `va` maps the chunk's `pages` pages writable (`grow`), and
         // none has been handed out before.
         unsafe { core::ptr::write_bytes(va as *mut u64, 0, words) };
         fence(Ordering::SeqCst);
-        for page in 0..pages
+        // The chunk's pages are physical memory memmgr granted, so no page's
+        // address passes `u64`.
+        let page_addresses =
+            (0..pages).filter_map(|page| phys.checked_add(page.checked_mul(PAGE_SIZE)?));
+        for page_phys in page_addresses
         {
-            self.flush(phys + page * PAGE_SIZE, 0, PAGE_SIZE);
+            self.flush(page_phys, 0, PAGE_SIZE);
         }
         Some(phys)
     }
@@ -257,9 +271,12 @@ impl TableStore for Store
             return None;
         }
         let chunk = self.chunks.last_mut()?;
-        let phys = chunk.phys + chunk.used * PAGE_SIZE;
-        let va = chunk.va + chunk.used * PAGE_SIZE;
-        chunk.used += 1;
+        // `used < pages` here, and the chunk's pages are mapped and physical
+        // memory, so none of these sums passes `u64`.
+        let offset = chunk.used.checked_mul(PAGE_SIZE)?;
+        let phys = chunk.phys.checked_add(offset)?;
+        let va = chunk.va.checked_add(offset)?;
+        chunk.used = chunk.used.checked_add(1)?;
         // SAFETY: `va` is a page of the chunk mapped writable in `grow`, and
         // no table has been handed out over it yet.
         unsafe { core::ptr::write_bytes(va as *mut u64, 0, TABLE_WORDS) };
@@ -292,6 +309,8 @@ impl TableStore for Store
         // orders them before itself with the memory-to-device barrier the
         // driver's register accessor supplies.
         fence(Ordering::SeqCst);
-        self.flush(phys, (index * 8) as u64, 8);
+        // An index past the page saturates to an offset `flush` refuses.
+        let offset = u64::try_from(index).map_or(u64::MAX, |i| i.saturating_mul(8));
+        self.flush(phys, offset, 8);
     }
 }

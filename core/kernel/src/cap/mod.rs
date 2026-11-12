@@ -81,6 +81,27 @@ use init_protocol::CapDescriptor;
 
 use crate::mm::paging::phys_to_virt;
 
+/// [`crate::mm::PAGE_SIZE`] as a `u64`, a constant divisor and mask for
+/// physical byte counts.
+const PAGE_BYTES: u64 = crate::mm::PAGE_SIZE as u64;
+
+/// Bytes of one [`CapDescriptor`], a constant divisor for descriptor counts.
+const DESCRIPTOR_BYTES: usize = core::mem::size_of::<CapDescriptor>();
+
+/// The page-aligned span that covers the `size` bytes at `base`, as its base
+/// and its size rounded up to whole pages, or `None` when the span's end
+/// does not fit a `u64` (it reaches or passes the end of the physical address
+/// space): a firmware or bootloader record no RAM or device can back.
+fn page_span(base: u64, size: u64) -> Option<(u64, u64)>
+{
+    let aligned_base = base & !(PAGE_BYTES - 1);
+    let rounded = (base & (PAGE_BYTES - 1))
+        .checked_add(size)?
+        .checked_next_multiple_of(PAGE_BYTES)?;
+    aligned_base.checked_add(rounded)?;
+    Some((aligned_base, rounded))
+}
+
 // ── Globals ───────────────────────────────────────────────────────────────────
 
 /// Root capability space, populated during Phase 7.
@@ -160,8 +181,15 @@ use registry::CSPACE_REGISTRY;
 pub unsafe fn init_cspace_registry(alloc: &mut crate::mm::BuddyAllocator)
 {
     let chunks = registry::chunks_for_ram(crate::mm::init::system_ram_bytes());
+    // At most MAX_ID_CHUNKS pointers, which no address space overflows.
+    let Some(table_bytes) =
+        chunks.checked_mul(core::mem::size_of::<AtomicPtr<registry::RegistryEntry>>())
+    else
+    {
+        crate::fatal("Phase 4: CSpace registry chunk table size overflows");
+    };
     let table = crate::sched::alloc_zeroed_slab::<AtomicPtr<registry::RegistryEntry>>(
-        chunks * core::mem::size_of::<AtomicPtr<registry::RegistryEntry>>(),
+        table_bytes,
         alloc,
         "CSPACE_REGISTRY_TABLE",
     );
@@ -303,7 +331,8 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
             #[allow(clippy::cast_ptr_alignment)]
             // SAFETY: obj_type confirms MemoryObject layout; pointer live.
             let memory = unsafe { &*obj_nn.as_ptr().cast::<object::MemoryObject>() };
-            sum += memory.available_bytes.load(Ordering::Acquire);
+            // A ledger of RAM bytes: no machine's RAM reaches the saturation.
+            sum = sum.saturating_add(memory.available_bytes.load(Ordering::Acquire));
         }
     });
     sum
@@ -348,7 +377,12 @@ const ROOT_CSPACE_BOOT_EXTRA_SLOTS: u64 = 4;
 #[cfg(not(test))]
 fn root_cspace_init_slot_capacity() -> u64
 {
-    boot_body_bound() as u64 + ROOT_CSPACE_BOOT_EXTRA_SLOTS + ROOT_CSPACE_INIT_HEADROOM_SLOTS
+    // The boot's sizes saturate: a saturated size fails the seed-extent check
+    // in `drain_and_install_seed` that consumes it, which halts the boot by
+    // name.
+    (boot_body_bound() as u64)
+        .saturating_add(ROOT_CSPACE_BOOT_EXTRA_SLOTS)
+        .saturating_add(ROOT_CSPACE_INIT_HEADROOM_SLOTS)
 }
 
 /// Pool pages of the root `CSpace` beyond its slots, for the bodies its arena
@@ -374,7 +408,10 @@ const ROOT_CSPACE_BODY_PAGES: u64 = 1;
 #[cfg(not(test))]
 fn root_cspace_init_pages() -> u64
 {
-    1 + root_cspace_init_slot_capacity().div_ceil(cspace::L2_SIZE as u64) + ROOT_CSPACE_BODY_PAGES
+    // Saturates, as `root_cspace_init_slot_capacity` does.
+    root_cspace_init_slot_capacity()
+        .div_ceil(cspace::L2_SIZE as u64)
+        .saturating_add(1 + ROOT_CSPACE_BODY_PAGES)
 }
 
 /// Pages of init's bootstrap `AddressSpace` slab, retyped from SEED at Phase 9:
@@ -402,17 +439,24 @@ pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize =
 /// Descriptors an `InitInfo` region of `pages` pages holds past its header.
 const fn descriptors_in_pages(pages: usize) -> usize
 {
-    (pages * crate::mm::PAGE_SIZE - core::mem::size_of::<init_protocol::InitInfo>())
-        / core::mem::size_of::<CapDescriptor>()
+    // Saturates: a region past the address space holds as many descriptors
+    // as the largest one, and none smaller than its header holds any.
+    pages
+        .saturating_mul(crate::mm::PAGE_SIZE)
+        .saturating_sub(core::mem::size_of::<init_protocol::InitInfo>())
+        / DESCRIPTOR_BYTES
 }
 
 /// Pages of the `InitInfo` region that holds the header and `descriptors`
 /// descriptors.
 const fn init_info_pages(descriptors: usize) -> usize
 {
-    (core::mem::size_of::<init_protocol::InitInfo>()
-        + descriptors * core::mem::size_of::<CapDescriptor>())
-    .div_ceil(crate::mm::PAGE_SIZE)
+    // Saturates: a count past the address space needs more pages than the
+    // protocol's ceiling, which `reserve_init_backing` refuses before it.
+    descriptors
+        .saturating_mul(DESCRIPTOR_BYTES)
+        .saturating_add(core::mem::size_of::<init_protocol::InitInfo>())
+        .div_ceil(crate::mm::PAGE_SIZE)
 }
 
 /// Descriptors Phases 7 and 8 write besides one per RAM extent, ACPI
@@ -435,7 +479,14 @@ const fn init_info_descriptor_bound(
     reclaim_ranges: usize,
 ) -> usize
 {
-    ram_extents + acpi_regions + apertures + modules + reclaim_ranges + FIXED_BOOT_DESCRIPTORS
+    // Saturates: a sum past `usize` is past the ceiling capacity too, which
+    // `reserve_init_backing` halts on by name.
+    ram_extents
+        .saturating_add(acpi_regions)
+        .saturating_add(apertures)
+        .saturating_add(modules)
+        .saturating_add(reclaim_ranges)
+        .saturating_add(FIXED_BOOT_DESCRIPTORS)
 }
 
 /// Descriptors the `InitInfo` block Phase 7 reserved holds, set once by
@@ -496,10 +547,12 @@ const _: () = assert!(
 #[cfg(not(test))]
 fn boot_body_bound() -> usize
 {
+    // Saturates, as `root_cspace_init_slot_capacity` does; every term is
+    // bounded by the protocol's `InitInfo` ceiling.
     descriptor_capacity()
-        + boot_protocol::INIT_MAX_SEGMENTS
-        + INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed)
-        + INIT_STACK_PAGES
+        .saturating_add(boot_protocol::INIT_MAX_SEGMENTS)
+        .saturating_add(INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed))
+        .saturating_add(INIT_STACK_PAGES)
 }
 
 /// Bytes of one boot-minted body: the 128-byte retype size class, which
@@ -558,11 +611,15 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 #[cfg(not(test))]
 fn seed_fixed_reserve_bytes() -> u64
 {
-    (root_cspace_init_pages()
-        + INIT_ASPACE_PAGES
-        + (boot_body_bound() * BOOT_BODY_BYTES).div_ceil(crate::mm::PAGE_SIZE) as u64
-        + SEED_ALIGNMENT_SLACK_PAGES)
-        * crate::mm::PAGE_SIZE as u64
+    // Saturates, as `root_cspace_init_slot_capacity` does.
+    let body_pages = boot_body_bound()
+        .saturating_mul(BOOT_BODY_BYTES)
+        .div_ceil(crate::mm::PAGE_SIZE) as u64;
+    root_cspace_init_pages()
+        .saturating_add(INIT_ASPACE_PAGES)
+        .saturating_add(body_pages)
+        .saturating_add(SEED_ALIGNMENT_SLACK_PAGES)
+        .saturating_mul(PAGE_BYTES)
 }
 
 /// Bytes carved off the front of the largest drained RAM extent for the boot
@@ -571,7 +628,8 @@ fn seed_fixed_reserve_bytes() -> u64
 #[cfg(not(test))]
 fn seed_reserve_bytes() -> u64
 {
-    seed_fixed_reserve_bytes() + crate::sched::thread_slot::thread_slot_bytes()
+    // Saturates, as `root_cspace_init_slot_capacity` does.
+    seed_fixed_reserve_bytes().saturating_add(crate::sched::thread_slot::thread_slot_bytes())
 }
 
 /// BSS-static `MemoryObject` covering the seed RAM region.
@@ -717,11 +775,18 @@ pub(crate) const POOL_SEED_PAGES: usize = 64;
 pub(crate) fn kernel_reserve_pages() -> usize
 {
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let idle_stacks = cpu_count * (crate::sched::KERNEL_STACK_PAGES + 1);
+    // A diagnostic sum of pages the kernel already holds, so no term nears
+    // the saturation.
+    let idle_stacks = cpu_count.saturating_mul(crate::sched::KERNEL_STACK_PAGES + 1);
     let guard_tables = crate::mm::stack_guard::seeded_frames();
     let init_info = INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed);
-    let seed = (seed_reserve_bytes() / crate::mm::PAGE_SIZE as u64) as usize;
-    POOL_SEED_PAGES + idle_stacks + guard_tables + init_info + INIT_STACK_PAGES + seed
+    let seed = (seed_reserve_bytes() / PAGE_BYTES) as usize;
+    POOL_SEED_PAGES
+        .saturating_add(idle_stacks)
+        .saturating_add(guard_tables)
+        .saturating_add(init_info)
+        .saturating_add(INIT_STACK_PAGES)
+        .saturating_add(seed)
 }
 
 /// Number of init user-stack pages reserved ahead of the drain.
@@ -820,7 +885,8 @@ fn reserve_init_backing(counts: &DescriptorCounts)
             slot.store(page, core::sync::atomic::Ordering::Relaxed);
         }
 
-        let bound = counts.bound(alloc.coalesced_extent_count() + 2);
+        // Saturates: a saturated bound passes the ceiling check below.
+        let bound = counts.bound(alloc.coalesced_extent_count().saturating_add(2));
         if bound > INIT_INFO_DESCRIPTOR_CAPACITY
         {
             crate::kprintln!(
@@ -831,18 +897,23 @@ fn reserve_init_backing(counts: &DescriptorCounts)
             );
             crate::fatal("Phase 7: boot descriptors exceed the InitInfo region ceiling");
         }
+        // At most INIT_INFO_MAX_PAGES (checked above), so the block's page
+        // count and byte sizes below are small.
         let pages = init_info_pages(bound);
-        let order = pages.next_power_of_two().trailing_zeros() as usize;
+        let block_pages = pages.next_power_of_two();
+        let order = block_pages.trailing_zeros() as usize;
         let info = alloc
             .alloc(order)
             .unwrap_or_else(|| crate::fatal("Phase 7: out of memory reserving InitInfo block"));
-        let page = crate::mm::PAGE_SIZE as u64;
-        let tail = ((1usize << order) - pages) as u64 * page;
+        let region_bytes = (pages as u64).saturating_mul(PAGE_BYTES);
+        // The power of two at or above `pages` is never below it.
+        let tail = (block_pages.saturating_sub(pages) as u64).saturating_mul(PAGE_BYTES);
         if tail != 0
         {
             // SAFETY: the tail pages are the end of the block just taken, so
             // they were allocated from this buddy and nothing references them.
-            unsafe { alloc.free_range(info + pages as u64 * page, tail) };
+            // The block lies in RAM, so its end does not wrap.
+            unsafe { alloc.free_range(info.wrapping_add(region_bytes), tail) };
         }
         INIT_INFO_BLOCK_PHYS.store(info, core::sync::atomic::Ordering::Relaxed);
         INIT_INFO_BLOCK_PAGES.store(pages, core::sync::atomic::Ordering::Relaxed);
@@ -858,7 +929,7 @@ fn reserve_init_backing(counts: &DescriptorCounts)
         // written into it, so the header and every unused slot reach init as
         // zeroes.
         unsafe {
-            core::ptr::write_bytes(block, 0, pages * crate::mm::PAGE_SIZE);
+            core::ptr::write_bytes(block, 0, region_bytes as usize);
         }
         // SAFETY: the header fits the region's first page, so the array start
         // lies inside the region.
@@ -897,7 +968,12 @@ pub(crate) fn take_init_info_block() -> (u64, usize)
 #[cfg(not(test))]
 pub(crate) fn init_stack_phys(i: usize) -> u64
 {
-    let phys = INIT_STACK_PHYS[i].swap(0, core::sync::atomic::Ordering::Relaxed);
+    let Some(slot) = INIT_STACK_PHYS.get(i)
+    else
+    {
+        crate::fatal("Phase 9: init stack page index past INIT_STACK_PAGES");
+    };
+    let phys = slot.swap(0, core::sync::atomic::Ordering::Relaxed);
     debug_assert!(phys != 0, "init stack page consumed before it was reserved");
     phys
 }
@@ -931,7 +1007,8 @@ pub(crate) fn init_stack_phys(i: usize) -> u64
 #[cfg(not(test))]
 pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
 {
-    use crate::mm::buddy::PAGE_SIZE as BUDDY_PAGE_SIZE;
+    /// The buddy's page size as a `u64`, a constant divisor.
+    const BUDDY_PAGE_BYTES: u64 = crate::mm::buddy::PAGE_SIZE as u64;
 
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
 
@@ -968,14 +1045,19 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
     let drained = crate::mm::with_frame_allocator(|alloc| {
         // Each extent fills one descriptor slot, as the Memory descriptor
         // `populate_cspace` completes in place.
+        // The drain hands out indices below the `out.len()` it is given and
+        // reports more extents as an overflow, so every index has its slot.
         let drained = alloc.drain_coalesced(out.len(), |i, base, size| {
-            out[i] = CapDescriptor {
-                slot: 0,
-                cap_type: init_protocol::CapType::Memory,
-                pad: [0; 7],
-                aux0: base,
-                aux1: size,
-            };
+            if let Some(slot) = out.get_mut(i)
+            {
+                *slot = CapDescriptor {
+                    slot: 0,
+                    cap_type: init_protocol::CapType::Memory,
+                    pad: [0; 7],
+                    aux0: base,
+                    aux1: size,
+                };
+            }
         });
         // The drain emptied the buddy; seal it. memmgr owns all dynamic RAM
         // from here. A later free into the buddy (a destroyed `owns_memory`
@@ -995,32 +1077,39 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
         crate::fatal("Phase 7: drained RAM extents exceed the InitInfo descriptor capacity")
     });
 
-    if extent_count == 0
+    // The drain emitted `extent_count` <= `out.len()` extents (its contract).
+    let Some(extents) = out.get_mut(..extent_count)
+    else
     {
-        crate::fatal("Phase 7: no drained RAM extents to seed Memory caps");
-    }
+        crate::fatal("Phase 7: drained RAM extents exceed the InitInfo descriptor capacity");
+    };
 
     // The largest extent hosts the seed; every other extent is exposed
     // verbatim.
-    let (seed_idx, seed_base, seed_extent_size) = out[..extent_count]
-        .iter()
-        .enumerate()
-        .map(|(i, d)| (i, d.aux0, d.aux1))
-        .max_by_key(|&(_, _, size)| size)
-        .unwrap_or_else(|| crate::fatal("Phase 7: no drained RAM extents to seed Memory caps"));
-    if seed_extent_size <= seed_reserve_bytes()
+    let Some(seed) = extents.iter_mut().max_by_key(|d| d.aux1)
+    else
+    {
+        crate::fatal("Phase 7: no drained RAM extents to seed Memory caps");
+    };
+    let (seed_base, seed_extent_size) = (seed.aux0, seed.aux1);
+    let reserve = seed_reserve_bytes();
+    // Seed-tail: the front `reserve` bytes go to the SEED's pool
+    // (kernel-internal); the remainder is exposed as a virgin RAM Memory cap.
+    let (Some(tail_size), Some(tail_base)) = (
+        seed_extent_size.checked_sub(reserve).filter(|&s| s != 0),
+        seed_base.checked_add(reserve),
+    )
+    else
     {
         crate::fatal("Phase 7: largest drained RAM extent too small to host the seed reserve");
-    }
+    };
 
     // SAFETY: first and only call; single-threaded Phase 7.
     unsafe { install_seed_memory(seed_base) };
-    // Seed-tail: the front `seed_reserve_bytes()` bytes go to the SEED's pool
-    // (kernel-internal); the remainder is exposed as a virgin RAM Memory cap.
-    out[seed_idx].aux0 = seed_base + seed_reserve_bytes();
-    out[seed_idx].aux1 = seed_extent_size - seed_reserve_bytes();
+    seed.aux0 = tail_base;
+    seed.aux1 = tail_size;
 
-    let mut drained_pages: u64 = seed_reserve_bytes() / BUDDY_PAGE_SIZE as u64;
+    let mut drained_pages: u64 = reserve / BUDDY_PAGE_BYTES;
     let zero_start_us = crate::arch::current::timer::elapsed_us().unwrap_or(0);
     // The seed reserve is zeroed too, so no free-block link or firmware
     // leftover survives anywhere in the drained RAM.
@@ -1039,9 +1128,10 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
         aux0: base,
         aux1: size,
         ..
-    } in &out[..extent_count]
+    } in extents.iter()
     {
-        drained_pages += size / BUDDY_PAGE_SIZE as u64;
+        // A count of drained RAM pages, which no machine's RAM saturates.
+        drained_pages = drained_pages.saturating_add(size / BUDDY_PAGE_BYTES);
         // Zero the user-exposed extent before it is minted: free RAM still
         // holds whatever firmware and the bootloader left in it, the UEFI
         // stack with the slid kernel layout among it, and the buddy's
@@ -1057,7 +1147,7 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
         .unwrap_or(0)
         .saturating_sub(zero_start_us);
 
-    let coalesced = promote_largest_extent(&mut out[..extent_count], |d| d.aux1);
+    let coalesced = promote_largest_extent(extents, |d| d.aux1);
 
     crate::kprintln!(
         "Phase 7: drained {} pages as {} contiguous regions (zeroed in {} us); \
@@ -1087,17 +1177,18 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
 /// the order.
 fn promote_largest_extent<T>(extents: &mut [T], size: impl Fn(&T) -> u64) -> usize
 {
-    let mut largest = 0usize;
-    for i in 1..extents.len()
+    let mut largest: Option<(usize, u64)> = None;
+    for (i, extent) in extents.iter().enumerate()
     {
-        if size(&extents[i]) > size(&extents[largest])
+        let s = size(extent);
+        if largest.is_none_or(|(_, best)| s > best)
         {
-            largest = i;
+            largest = Some((i, s));
         }
     }
-    if !extents.is_empty()
+    if let Some((i, _)) = largest
     {
-        extents.swap(0, largest);
+        extents.swap(0, i);
     }
     extents.len()
 }
@@ -1135,17 +1226,24 @@ pub(crate) unsafe fn boot_retype_aspace(
     use crate::mm::paging::phys_to_virt;
     use core::sync::atomic::AtomicU64;
 
-    debug_assert!(init_pages >= 2);
+    let Some(pool_pages) = init_pages.checked_sub(2)
+    else
+    {
+        crate::fatal("boot_retype_aspace: fewer than two pages");
+    };
 
-    let bytes = init_pages * PAGE_SIZE as u64;
+    // Saturates: a saturated size is more than the seed holds, so the retype
+    // below fails.
+    let bytes = init_pages.saturating_mul(PAGE_BYTES);
     let Ok(offset) = retype::retype_allocate(seed, bytes)
     else
     {
         crate::fatal("boot_retype_aspace: seed Memory cap too small");
     };
     let memory_base = seed.base;
-    let wrapper_phys = memory_base + offset;
-    let root_pt_phys = wrapper_phys + PAGE_SIZE as u64;
+    // The slab lies inside the seed's RAM, so these addresses do not wrap.
+    let wrapper_phys = memory_base.wrapping_add(offset);
+    let root_pt_phys = wrapper_phys.wrapping_add(PAGE_BYTES);
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
     // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
@@ -1153,8 +1251,16 @@ pub(crate) unsafe fn boot_retype_aspace(
     #[allow(clippy::cast_ptr_alignment)]
     let aso_ptr = wrapper_virt.cast::<AddressSpaceObject>();
     let as_offset = core::mem::size_of::<AddressSpaceObject>();
-    debug_assert_eq!(as_offset % core::mem::align_of::<AddressSpace>(), 0);
-    debug_assert!(as_offset + core::mem::size_of::<AddressSpace>() <= PAGE_SIZE);
+    const {
+        assert!(
+            core::mem::size_of::<AddressSpaceObject>()
+                .is_multiple_of(core::mem::align_of::<AddressSpace>())
+        );
+        assert!(
+            core::mem::size_of::<AddressSpaceObject>() + core::mem::size_of::<AddressSpace>()
+                <= PAGE_SIZE
+        );
+    }
     // cast_ptr_alignment: as_offset is a multiple of align_of::<AddressSpace>()
     // (asserted above) and wrapper_virt is page-aligned.
     // similar_names: aso_ptr / aspace_ptr both name pointers in the same
@@ -1193,7 +1299,6 @@ pub(crate) unsafe fn boot_retype_aspace(
 
     seed.header.inc_ref();
 
-    let pool_pages = init_pages - 2;
     // SAFETY: aso_ptr just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
         (*aso_ptr).add_donation(
@@ -1242,16 +1347,23 @@ pub(crate) unsafe fn boot_retype_cspace(
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
 
-    debug_assert!(init_pages >= 1);
+    let Some(pool_pages) = init_pages.checked_sub(1)
+    else
+    {
+        crate::fatal("boot_retype_cspace: no pages");
+    };
 
-    let bytes = init_pages * PAGE_SIZE as u64;
+    // Saturates: a saturated size is more than the seed holds, so the retype
+    // below fails.
+    let bytes = init_pages.saturating_mul(PAGE_BYTES);
     let Ok(offset) = retype::retype_allocate(seed, bytes)
     else
     {
         crate::fatal("boot_retype_cspace: seed Memory cap too small");
     };
     let memory_base = seed.base;
-    let wrapper_phys = memory_base + offset;
+    // The slab lies inside the seed's RAM, so the address does not wrap.
+    let wrapper_phys = memory_base.wrapping_add(offset);
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
     // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
@@ -1259,8 +1371,16 @@ pub(crate) unsafe fn boot_retype_cspace(
     #[allow(clippy::cast_ptr_alignment)]
     let cs_kobj_ptr = wrapper_virt.cast::<CSpaceKernelObject>();
     let cs_offset = core::mem::size_of::<CSpaceKernelObject>();
-    debug_assert_eq!(cs_offset % core::mem::align_of::<CSpace>(), 0);
-    debug_assert!(cs_offset + core::mem::size_of::<CSpace>() <= PAGE_SIZE);
+    const {
+        assert!(
+            core::mem::size_of::<CSpaceKernelObject>()
+                .is_multiple_of(core::mem::align_of::<CSpace>())
+        );
+        assert!(
+            core::mem::size_of::<CSpaceKernelObject>() + core::mem::size_of::<CSpace>()
+                <= PAGE_SIZE
+        );
+    }
     // cast_ptr_alignment: cs_offset is a multiple of align_of::<CSpace>()
     // (asserted above) and wrapper_virt is page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
@@ -1284,7 +1404,6 @@ pub(crate) unsafe fn boot_retype_cspace(
     unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };
     seed.header.inc_ref();
 
-    let pool_pages = init_pages - 1;
     // SAFETY: wrapper just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
         (*cs_kobj_ptr).add_donation(
@@ -1487,7 +1606,8 @@ fn push_descriptor(count: &mut usize, desc: CapDescriptor)
     // SAFETY: single-threaded boot; `*count` is in bounds (checked above) and
     // the only writer index; no reference to the slot is live.
     unsafe { descriptor_array().add(*count).write(desc) };
-    *count += 1;
+    // Below the capacity (checked above), so the bump cannot saturate.
+    *count = count.saturating_add(1);
 }
 
 /// Initialise the capability system and populate the root `CSpace.`
@@ -1618,12 +1738,14 @@ fn mint_acpi_region_caps(
         }
         // UEFI memory map entries are page-aligned per UEFI spec §7.2,
         // but mask defensively to uphold MemoryObject's alignment invariant.
-        let aligned_base = entry.physical_base & !0xFFF;
-        let size = (entry.physical_base - aligned_base + entry.size + 0xFFF) & !0xFFF;
-        if size == 0
+        // An empty entry, or one that passes the end of the address space,
+        // holds no table to read.
+        let Some((aligned_base, size)) =
+            page_span(entry.physical_base, entry.size).filter(|&(_, size)| size != 0)
+        else
         {
             continue;
-        }
+        };
         let ptr = mint_phase7_body(firmware_table_memory(aligned_base, size));
         let slot = insert_or_fatal(
             cspace,
@@ -1644,7 +1766,8 @@ fn mint_acpi_region_caps(
             aux0: aligned_base,
             aux1: size,
         });
-        count += 1;
+        // One per inserted cap, so the CSpace's slot count bounds it.
+        count = count.saturating_add(1);
     }
     (base, count)
 }
@@ -1759,7 +1882,11 @@ fn populate_cspace(
         // SAFETY: single-threaded Phase 7; the drain filled the first
         // ram_extents <= descriptor_capacity() slots, and no other
         // reference to the array is live while this one is.
-        let extents = unsafe { &mut descriptor_slots_mut()[..ram_extents] };
+        let Some(extents) = unsafe { descriptor_slots_mut() }.get_mut(..ram_extents)
+        else
+        {
+            crate::fatal("Phase 7: drained RAM extents exceed the InitInfo descriptor capacity");
+        };
         complete_extent_descriptors(extents, |cap_base, cap_size| {
             let ptr = mint_phase7_body(MemoryObject {
                 header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_anc),
@@ -1792,7 +1919,8 @@ fn populate_cspace(
                 "Phase 7: RAM Memory caps are not in consecutive slots",
             );
             note_owns_memory_minted(cap_size);
-            memory_count += 1;
+            // One per inserted cap, so the CSpace's slot count bounds it.
+            memory_count = memory_count.saturating_add(1);
             CapDescriptor {
                 slot: u64::from(slot),
                 cap_type: CapType::Memory,
@@ -1875,6 +2003,8 @@ fn populate_cspace(
     // serial scan looks for the Mmio descriptor containing its fixed
     // `UART_PHYS` (services/init/src/arch/riscv64/mod.rs).
     let mut hw_cap_base: u32 = 0;
+    // One per capability inserted into the root CSpace, whose slots a u32
+    // indexes, so its saturating increments never saturate.
     let mut hw_cap_count: u32 = 0;
 
     if let Some((uart_base, uart_size)) = crate::arch::current::platform::console_mmio()
@@ -1892,7 +2022,7 @@ fn populate_cspace(
             slot,
             "Phase 7: hardware caps are not in consecutive slots",
         );
-        hw_cap_count += 1;
+        hw_cap_count = hw_cap_count.saturating_add(1);
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
@@ -1930,7 +2060,7 @@ fn populate_cspace(
                 aux1: ap.size,
             },
         );
-        hw_cap_count += 1;
+        hw_cap_count = hw_cap_count.saturating_add(1);
     }
 
     // One root SchedControl capability spanning the full userspace priority
@@ -2172,10 +2302,13 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
     for module in modules
     {
         // UEFI `AllocatePages` returns page-aligned bases, but mask
-        // defensively to uphold MemoryObject's alignment invariant.
-        let aligned_base = module.physical_base & !0xFFF;
-        // Round size up so the cap covers every page that holds module bytes.
-        let rounded_size = (module.physical_base - aligned_base + module.size + 0xFFF) & !0xFFF;
+        // defensively to uphold MemoryObject's alignment invariant. Round size
+        // up so the cap covers every page that holds module bytes.
+        let Some((aligned_base, rounded_size)) = page_span(module.physical_base, module.size)
+        else
+        {
+            crate::fatal("Phase 7: a boot module passes the end of the address space");
+        };
 
         // Register the module's pages as managed-but-not-free so the buddy's
         // `total_pages` ledger accounts for them (they are excluded from the
@@ -2241,16 +2374,19 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         );
         // Publish a name → slot entry in the InitInfo header table so
         // init can resolve modules by name without scanning descriptors.
-        let name_slot = layout.module_name_count as usize;
-        if name_slot >= init_protocol::INIT_MAX_NAMED_MODULES
+        let Some(name) = layout
+            .module_names
+            .get_mut(layout.module_name_count as usize)
+        else
         {
             crate::fatal("Phase 7: more boot modules than INIT_MAX_NAMED_MODULES");
-        }
-        layout.module_names[name_slot] = init_protocol::InitModuleName {
+        };
+        *name = init_protocol::InitModuleName {
             slot: u64::from(slot),
             name: module.name,
         };
-        layout.module_name_count += 1;
+        // Below INIT_MAX_NAMED_MODULES (the table's length, checked above).
+        layout.module_name_count = layout.module_name_count.saturating_add(1);
     }
 
     layout.total_populated = cspace.populated_count();
@@ -2406,8 +2542,10 @@ fn mint_reclaim_pass(
             continue;
         }
         let phys_base = range.phys_base & !0xFFF;
-        let size_bytes = u64::from(range.page_count) * (crate::mm::PAGE_SIZE as u64);
-        pages_total += u64::from(range.page_count);
+        // A `u32` page count's bytes fit a `u64`; the sum is a diagnostic
+        // count of pages the bootloader handed over, which no RAM saturates.
+        let size_bytes = u64::from(range.page_count).saturating_mul(PAGE_BYTES);
+        pages_total = pages_total.saturating_add(u64::from(range.page_count));
 
         // Catch double-coverage with module Memory caps: any overlap here
         // would have `register_owned_range` double-bump `total_pages` and
@@ -2417,11 +2555,14 @@ fn mint_reclaim_pass(
         // contract at the consumer.
         #[cfg(debug_assertions)]
         {
-            let range_end = phys_base + size_bytes;
+            // Saturating ends: a span past the end of the address space
+            // still overlaps whatever lies above its base.
+            let range_end = phys_base.saturating_add(size_bytes);
             for m in modules
             {
-                let m_base = m.physical_base & !0xFFF;
-                let m_end = (m.physical_base + m.size + 0xFFF) & !0xFFF;
+                let (m_base, m_size) = page_span(m.physical_base, m.size)
+                    .unwrap_or((m.physical_base & !0xFFF, u64::MAX));
+                let m_end = m_base.saturating_add(m_size);
                 debug_assert!(
                     range_end <= m_base || phys_base >= m_end,
                     "reclaim range overlaps module Memory cap",
@@ -2487,10 +2628,11 @@ fn mint_reclaim_pass(
                 aux1: size_bytes,
             },
         );
-        count += 1;
+        // One per inserted cap, so the CSpace's slot count bounds it.
+        count = count.saturating_add(1);
     }
 
-    note_owns_memory_minted(pages_total * crate::mm::PAGE_SIZE as u64);
+    note_owns_memory_minted(pages_total.saturating_mul(PAGE_BYTES));
 
     layout.total_populated = cspace.populated_count();
 
@@ -2546,7 +2688,6 @@ pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
 {
     use boot_protocol::{MAX_RECLAIM_RANGES, ReclaimRange};
 
-    let page = crate::mm::PAGE_SIZE as u64;
     let info = phys_to_virt(boot_info_phys) as *const BootInfo;
     // SAFETY: the BootInfo page is mapped through the direct map (caller
     // contract); the slice header is copied out and no reference is formed.
@@ -2562,9 +2703,18 @@ pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
     }
 
     let array_phys = slice.entries as u64;
-    let span_lo = array_phys & !(page - 1);
-    let span_hi =
-        (array_phys + (count * core::mem::size_of::<ReclaimRange>()) as u64).next_multiple_of(page);
+    let span_lo = array_phys & !(PAGE_BYTES - 1);
+    // At most MAX_RECLAIM_RANGES entries (checked above); an array whose
+    // pages pass the end of the address space is no array the bootloader
+    // could have written.
+    let Some(span_hi) = (count as u64)
+        .checked_mul(core::mem::size_of::<ReclaimRange>() as u64)
+        .and_then(|bytes| array_phys.checked_add(bytes))
+        .and_then(|end| end.checked_next_multiple_of(PAGE_BYTES))
+    else
+    {
+        crate::fatal("Phase 9: the reclaim array passes the end of the address space");
+    };
     let mut span_covered = [false; RECLAIM_ARRAY_MAX_SPAN_PAGES];
     let entries = phys_to_virt(array_phys) as *const ReclaimRange;
     let mut pages: u64 = 0;
@@ -2576,7 +2726,10 @@ pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
         let range = unsafe { entries.add(i).read_unaligned() };
         // SAFETY: a recorded range, which nothing reads after this call
         // (caller contract).
-        pages += unsafe { scrub_outside_span(range, span_lo, span_hi, &mut span_covered) };
+        let scrubbed = unsafe { scrub_outside_span(range, span_lo, span_hi, &mut span_covered) };
+        // A diagnostic count of `u32` page counts, at most MAX_RECLAIM_RANGES
+        // of them, which cannot saturate.
+        pages = pages.saturating_add(scrubbed);
     }
 
     // SAFETY: every entry was read in the loop above, so nothing reads the
@@ -2602,26 +2755,42 @@ unsafe fn scrub_outside_span(
     span_covered: &mut [bool; RECLAIM_ARRAY_MAX_SPAN_PAGES],
 ) -> u64
 {
-    let page = crate::mm::PAGE_SIZE as u64;
     if range.page_count == 0
     {
         return 0;
     }
-    let lo = range.phys_base & !(page - 1);
-    let hi = lo + u64::from(range.page_count) * page;
+    let lo = range.phys_base & !(PAGE_BYTES - 1);
+    // A `u32` page count's bytes fit a `u64`; a range whose end passes the
+    // address space is no range the bootloader could have recorded.
+    let Some(hi) = lo.checked_add(u64::from(range.page_count).saturating_mul(PAGE_BYTES))
+    else
+    {
+        crate::fatal("Phase 9: a reclaim range passes the end of the address space");
+    };
     let (outside, inside) = split_around_span(lo, hi, span_lo, span_hi);
     for (start, end) in outside
     {
         // SAFETY: part of `range` (caller contract), disjoint from the span.
-        unsafe { zero_phys(start, end - start) };
+        // `split_around_span` returns each part with `start <= end`.
+        unsafe { zero_phys(start, end.saturating_sub(start)) };
     }
-    let mut p = inside.0;
-    while p < inside.1
+    for (k, covered) in span_covered.iter_mut().enumerate()
     {
-        span_covered[((p - span_lo) / page) as usize] = true;
-        p += page;
+        if (inside.0..inside.1).contains(&span_page(span_lo, k))
+        {
+            *covered = true;
+        }
     }
     u64::from(range.page_count)
+}
+
+/// Physical address of page `k` of the reclaim-array span from `span_lo`.
+/// The span ends at or below `span_hi`, which `scrub_reclaim_ranges` checked
+/// against the end of the address space, so the address does not wrap.
+#[cfg(not(test))]
+fn span_page(span_lo: u64, k: usize) -> u64
+{
+    span_lo.wrapping_add((k as u64).wrapping_mul(PAGE_BYTES))
 }
 
 /// Zero each reclaim-array span page, from `span_lo`, that `span_covered`
@@ -2632,13 +2801,12 @@ unsafe fn scrub_outside_span(
 #[cfg(not(test))]
 unsafe fn zero_covered_span_pages(span_lo: u64, span_covered: [bool; RECLAIM_ARRAY_MAX_SPAN_PAGES])
 {
-    let page = crate::mm::PAGE_SIZE as u64;
     for (k, covered) in span_covered.into_iter().enumerate()
     {
         if covered
         {
             // SAFETY: a recorded page of the reclaim array (caller contract).
-            unsafe { zero_phys(span_lo + k as u64 * page, page) };
+            unsafe { zero_phys(span_page(span_lo, k), PAGE_BYTES) };
         }
     }
 }
@@ -2914,6 +3082,68 @@ mod tests
                     .is_some_and(|s| s.tag == CapTag::Memory)
             );
         }
+    }
+
+    // Defect caught: an AcpiReclaimable entry that passes the end of the
+    // address space minted as a Memory cap over a wrapped span, or its size
+    // rounding overflowing.
+    #[test]
+    fn an_acpi_region_past_the_end_of_the_address_space_is_skipped()
+    {
+        let top_page = u64::MAX & !(PAGE_BYTES - 1);
+        let mmap = [
+            MemoryMapEntry {
+                physical_base: 0x1000_0000,
+                size: 0x2000,
+                memory_type: MemoryType::AcpiReclaimable,
+            },
+            MemoryMapEntry {
+                physical_base: top_page,
+                size: 0x2000,
+                memory_type: MemoryType::AcpiReclaimable,
+            },
+            MemoryMapEntry {
+                physical_base: top_page,
+                size: u64::MAX,
+                memory_type: MemoryType::AcpiReclaimable,
+            },
+        ];
+        let mut cspace = CSpace::new(0);
+        let mut descs = Vec::new();
+        let (_, count) = mint_acpi_region_caps(&mut cspace, &mmap, |d| descs.push(d));
+        assert_eq!(count, 1);
+        assert_eq!(descs.len(), 1);
+        assert_eq!(
+            descs.first().map(|d| (d.aux0, d.aux1)),
+            Some((0x1000_0000, 0x2000))
+        );
+    }
+
+    #[test]
+    fn a_page_span_rounds_to_whole_pages_and_refuses_the_end_of_the_address_space()
+    {
+        assert_eq!(page_span(0x1234, 0x10), Some((0x1000, 0x1000)));
+        assert_eq!(page_span(0x1FFF, 2), Some((0x1000, 0x2000)));
+        assert_eq!(page_span(0x3000, 0), Some((0x3000, 0)));
+        let top_page = u64::MAX & !(PAGE_BYTES - 1);
+        // The last page itself ends exactly at 2^64, which no u64 end holds.
+        assert_eq!(page_span(top_page, 1), None);
+        assert_eq!(
+            page_span(top_page - PAGE_BYTES, PAGE_BYTES),
+            Some((top_page - PAGE_BYTES, PAGE_BYTES))
+        );
+        assert_eq!(page_span(0x1000, u64::MAX), None);
+    }
+
+    // Defect caught: a descriptor bound whose sum overflows `usize` (a
+    // corrupt platform count) panicking or wrapping to a small bound, rather
+    // than saturating past the ceiling `reserve_init_backing` halts on.
+    #[test]
+    fn a_descriptor_bound_past_usize_saturates_past_the_ceiling()
+    {
+        let bound = init_info_descriptor_bound(usize::MAX, 1, 1, 1, 1);
+        assert_eq!(bound, usize::MAX);
+        assert!(init_info_pages(bound) > init_protocol::INIT_INFO_MAX_PAGES);
     }
 
     // Defect caught: a `populate_cspace` capability with a descriptor that

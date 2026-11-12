@@ -45,11 +45,13 @@ const _: () = assert!((CHUNKS_PER_PAGE - 1) as u64 == syscall::CSPACE_BODIES_PER
 /// nothing else references; the caller serialises `head`.
 pub unsafe fn carve_page(head: &AtomicU64, page: *mut u8)
 {
-    for i in (1..CHUNKS_PER_PAGE).rev()
+    for offset in (CHUNK_BYTES..crate::mm::PAGE_SIZE)
+        .step_by(CHUNK_BYTES)
+        .rev()
     {
-        // SAFETY: i < CHUNKS_PER_PAGE keeps the chunk inside the page
+        // SAFETY: offset < PAGE_SIZE keeps the chunk inside the page
         // (caller contract).
-        unsafe { push_chunk(head, page.add(i * CHUNK_BYTES)) };
+        unsafe { push_chunk(head, page.add(offset)) };
     }
 }
 
@@ -126,7 +128,9 @@ pub fn for_each_run(
         {
             run(cur, h);
         }
-        cur = h + page;
+        // A hole in the address space's last page leaves nothing above it:
+        // the saturated cursor is at or past `end`.
+        cur = h.saturating_add(page);
     }
     if cur < end
     {
@@ -190,22 +194,25 @@ pub unsafe fn sort_list<N>(
         set_next(cur, core::ptr::null_mut());
         // Carry the one-node run up through the occupied bins, as a binary
         // counter carries a bit.
+        // The last bin keeps its merged run in place.
         let mut run = cur;
-        let mut i = 0;
-        while i < SORT_BINS - 1 && !bins[i].is_null()
+        for (i, bin) in bins.iter_mut().enumerate()
         {
-            run = merge(bins[i], run);
-            bins[i] = core::ptr::null_mut();
-            i += 1;
+            if bin.is_null()
+            {
+                *bin = run;
+                break;
+            }
+            run = merge(*bin, run);
+            *bin = if i == SORT_BINS - 1
+            {
+                run
+            }
+            else
+            {
+                core::ptr::null_mut()
+            };
         }
-        bins[i] = if bins[i].is_null()
-        {
-            run
-        }
-        else
-        {
-            merge(bins[i], run)
-        };
         cur = after;
     }
     // Higher bins hold earlier nodes; merge them in last, each as `a`.
@@ -328,6 +335,15 @@ mod tests
             "holes at both ends"
         );
         assert_eq!(runs(s, s + P, &[s]), [], "a one-page span that is a hole");
+    }
+
+    // The defect caught: a hole in the address space's last page whose end
+    // wraps the cursor to 0, so the span is returned again from its start.
+    #[test]
+    fn a_hole_in_the_last_page_ends_the_span()
+    {
+        let last = u64::MAX - (P - 1);
+        assert_eq!(runs(last - P, u64::MAX, &[last]), [(last - P, last)]);
     }
 
     struct Node

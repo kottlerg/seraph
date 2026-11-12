@@ -412,7 +412,8 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveSte
         }
         (true, true) =>
         {
-            *batches += 1;
+            // The backstop below ends the move once the count reaches it.
+            *batches = batches.saturating_add(1);
             // SAFETY: caller contract; both slots live and pinned; no
             // CSpace lock is held.
             let step = unsafe { move_cap_step(mv, SourceLock::Take) };

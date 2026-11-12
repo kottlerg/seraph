@@ -56,6 +56,18 @@ pub fn run_cmd_capture(cmd: &mut Command) -> Result<String>
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+// ── Cargo environment ─────────────────────────────────────────────────────────
+
+/// The environment every cargo command of the build runs with, so a local
+/// build compiles what CI's jobs compile: the Rust cache action of
+/// `.github/workflows/build-test.yml` writes `CARGO_INCREMENTAL=0` to the job
+/// environment, and an incremental `dev` build partitions codegen units, and
+/// so orders a binary's statics, differently from a non-incremental one
+/// (`docs/build-system.md` § Build Profiles). It is set over any value the
+/// caller's environment holds, so a local build never departs from CI's on
+/// it.
+pub const CI_CARGO_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
+
 // ── Tool discovery ────────────────────────────────────────────────────────────
 
 /// Resolve `name` on PATH, returning a clear error with per-tool

@@ -560,18 +560,24 @@ fn install_name_for(name: &str) -> String
     }
 }
 
+/// The shim's `cargo build --release -p seraph-wrapper-shim`, run in `root`
+/// with [`crate::util::CI_CARGO_ENV`], as every cargo command of
+/// `cargo xtask build` is.
+fn shim_build_command(cargo: &Path, root: &Path) -> Command
+{
+    let mut cmd = Command::new(cargo);
+    cmd.current_dir(root)
+        .envs(crate::util::CI_CARGO_ENV)
+        .args(["build", "--release", "-p", SHIM_PACKAGE]);
+    cmd
+}
+
 /// `cargo build --release -p seraph-wrapper-shim`. Returns the path
 /// to the produced binary. cargo is a no-op when nothing changed.
 fn build_shim_binary(ctx: &BuildContext) -> Result<PathBuf>
 {
     let cargo = require_tool("cargo")?;
-    let mut cmd = Command::new(cargo);
-    cmd.current_dir(&ctx.root)
-        .arg("build")
-        .arg("--release")
-        .arg("-p")
-        .arg(SHIM_PACKAGE);
-    run_cmd(&mut cmd).context("building seraph-wrapper-shim")?;
+    run_cmd(&mut shim_build_command(&cargo, &ctx.root)).context("building seraph-wrapper-shim")?;
 
     let mut binary = ctx.target_dir.join("release");
     binary.push(format!(
@@ -1389,4 +1395,21 @@ fn probe_real_sysroot() -> Result<PathBuf>
         .trim()
         .to_owned();
     Ok(PathBuf::from(path))
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn the_shim_builds_with_the_ci_cargo_environment()
+    {
+        let cmd = shim_build_command(Path::new("cargo"), Path::new("."));
+        let incremental = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "CARGO_INCREMENTAL")
+            .and_then(|(_, value)| value);
+        assert_eq!(incremental, Some(std::ffi::OsStr::new("0")));
+    }
 }

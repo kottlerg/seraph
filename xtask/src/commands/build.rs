@@ -1065,22 +1065,13 @@ fn clippy_check_ext(
     run_cmd(&mut cmd)
 }
 
-/// The environment every cargo command of the build runs with, so a local
-/// build compiles what CI's jobs compile: the Rust cache action of
-/// `.github/workflows/build-test.yml` writes `CARGO_INCREMENTAL=0` to the job
-/// environment, and an incremental `dev` build partitions codegen units, and
-/// so orders a binary's statics, differently from a non-incremental one
-/// (`docs/build-system.md` § Build Profiles). It is set over any value the
-/// caller's environment holds, so every build of a commit is CI's.
-const CI_CARGO_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
-
 /// Construct a `cargo` Command with the working directory set to the workspace
-/// root and [`CI_CARGO_ENV`] applied.
+/// root and [`crate::util::CI_CARGO_ENV`] applied.
 fn cargo(root: &Path) -> Command
 {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root);
-    cmd.envs(CI_CARGO_ENV);
+    cmd.envs(crate::util::CI_CARGO_ENV);
     cmd
 }
 

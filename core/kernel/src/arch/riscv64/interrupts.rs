@@ -541,7 +541,7 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         unsafe {
             if exit == crate::syscall::SyscallExit::Complete && (*frame).sepc == sepc_before
             {
-                (*frame).sepc += 4;
+                (*frame).sepc = (*frame).sepc.wrapping_add(4);
             }
         }
     }
@@ -651,7 +651,8 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 // object-teardown stop recorded `EXIT_KILLED`, or a
                 // `dealloc_object(Thread)` committed `Exited`); the posts below
                 // still carry the fault class (no death walk posts `EXIT_KILLED`).
-                let reason = syscall::EXIT_FAULT_BASE + cause_code;
+                // An exception code is below 64, so the reason stays in the fault range.
+                let reason = syscall::EXIT_FAULT_BASE.saturating_add(cause_code);
 
                 // Terminal fault (no handler bound, or a Kill outcome: the handler
                 // replied KILL or the episode was cancelled; see docs/fault-handling.md
@@ -1093,7 +1094,8 @@ pub fn message_data(target: crate::irq::Target) -> u32
 #[must_use]
 pub fn irq_line_count() -> u32
 {
-    super::aia::source_count() + 1
+    // At most 1024: an APLIC has at most 1023 sources.
+    super::aia::source_count().saturating_add(1)
 }
 
 /// Claim this hart's top pending IMSIC identity and dispatch it to the source its

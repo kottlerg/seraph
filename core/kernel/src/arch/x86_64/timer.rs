@@ -313,9 +313,11 @@ unsafe fn calibrate_apic_timer() -> u64
         apic_write(APIC_TIMER_INITIAL, 0);
     }
 
-    let elapsed = 0xFFFF_FFFFu64 - remaining as u64;
-    // Scale to ticks/second: elapsed ticks in PIT_CALIBRATION_MS ms.
-    elapsed * 1000 / PIT_CALIBRATION_MS
+    // The count ran down from 0xFFFF_FFFF, so the ticks elapsed are its complement.
+    let elapsed = u64::from(!remaining);
+    // Scale to ticks/second: elapsed ticks in PIT_CALIBRATION_MS ms. Below 2^42, so the
+    // product does not saturate.
+    elapsed.saturating_mul(1000) / PIT_CALIBRATION_MS
 }
 
 // ── Public interface ──────────────────────────────────────────────────────────
@@ -340,7 +342,11 @@ pub unsafe fn init(period_us: u64)
     // SAFETY: ring 0, single-threaded; PIT and APIC hardware are accessible.
     let tps = unsafe { calibrate_apic_timer() };
     APIC_TICKS_PER_SEC.store(tps, Ordering::Relaxed);
-    INTERRUPT_RATE.store(1_000_000 / period_us.max(1), Ordering::Relaxed);
+    // A zero period is taken as one microsecond.
+    INTERRUPT_RATE.store(
+        1_000_000u64.checked_div(period_us).unwrap_or(1_000_000),
+        Ordering::Relaxed,
+    );
 
     if tsc_deadline_supported()
     {
@@ -370,7 +376,7 @@ pub unsafe fn init(period_us: u64)
         // Formula: initial_count = tps * period_us / 1_000_000. `tps` was
         // measured with DIVIDE_BY_16 already applied, so no further division
         // by the divide ratio is needed.
-        let initial_count = (tps * period_us / 1_000_000).max(1);
+        let initial_count = (tps.saturating_mul(period_us) / 1_000_000).max(1);
 
         // Configure APIC timer: periodic mode, vector TIMER_VECTOR.
         // SAFETY: APIC registers are valid; single-threaded init context.
@@ -429,7 +435,7 @@ pub unsafe fn init_ap(period_us: u64)
         // practice since APs start after BSP completes Phase 5.
         return;
     }
-    let initial_count = (tps * period_us / 1_000_000).max(1);
+    let initial_count = (tps.saturating_mul(period_us) / 1_000_000).max(1);
     // SAFETY: APIC MMIO registers are valid; IDT and timer ISR are initialized.
     // Enabling interrupts is safe as timer handler is registered.
     unsafe {
@@ -460,7 +466,7 @@ pub fn delay_us(us: u64)
     {
         // Fallback before calibration: spin ~200 iterations per µs (very rough).
         // A tuning value for early boot only; it bounds no capacity.
-        for _ in 0..us * 200
+        for _ in 0..us.saturating_mul(200)
         {
             core::hint::spin_loop();
         }
@@ -558,10 +564,6 @@ pub fn ticks_per_second() -> u64
 pub fn elapsed_us() -> Option<u64>
 {
     let per_us = TSC_PER_US.load(Ordering::Relaxed);
-    if per_us == 0
-    {
-        return None;
-    }
     let boot = BOOT_TSC.load(Ordering::Relaxed);
-    Some(read_tsc().saturating_sub(boot) / per_us)
+    read_tsc().saturating_sub(boot).checked_div(per_us)
 }

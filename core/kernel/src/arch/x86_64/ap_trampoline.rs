@@ -184,12 +184,7 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
         0x0F, 0x22, 0xC0, // mov cr0, eax
         0x66, 0xFF, 0x2E, 0x20, 0x00, // data32 jmp far [0x0020]
     ];
-    let mut i = 0;
-    while i < rm.len()
-    {
-        t[i] = rm[i];
-        i += 1;
-    }
+    place(&mut t, 0x00, &rm);
     // 0x18..0x1F: zero padding. 0x20..0x25: real-mode far-jmp target, written by
     // setup_trampoline. 0x26..0x27: zero padding. 0x28..0x2B: CR4 paging bits,
     // written by setup_trampoline. 0x2C..0x3F: zero padding.
@@ -201,34 +196,10 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
     // 0x42..0x45: GDTR base (AP_PAGE+0x48) written by setup_trampoline.
 
     // ── GDT entries (0x48–0x67) ───────────────────────────────────────────────
-    let gdt_null = GDT_NULL.to_le_bytes();
-    let gdt_c32 = GDT_CODE32.to_le_bytes();
-    let gdt_c64 = GDT_CODE64.to_le_bytes();
-    let gdt_data = GDT_DATA.to_le_bytes();
-    let mut j = 0;
-    while j < 8
-    {
-        t[0x48 + j] = gdt_null[j];
-        j += 1;
-    }
-    j = 0;
-    while j < 8
-    {
-        t[0x50 + j] = gdt_c32[j];
-        j += 1;
-    }
-    j = 0;
-    while j < 8
-    {
-        t[0x58 + j] = gdt_c64[j];
-        j += 1;
-    }
-    j = 0;
-    while j < 8
-    {
-        t[0x60 + j] = gdt_data[j];
-        j += 1;
-    }
+    place(&mut t, 0x48, &GDT_NULL.to_le_bytes());
+    place(&mut t, 0x50, &GDT_CODE32.to_le_bytes());
+    place(&mut t, 0x58, &GDT_CODE64.to_le_bytes());
+    place(&mut t, 0x60, &GDT_DATA.to_le_bytes());
 
     // ── AP params (0x68–0x8F): zeroed, filled by setup_ap_params ─────────────
 
@@ -295,12 +266,7 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
         0x0F, 0x22, 0xC0, // mov cr0, eax
         0xFF, 0xAB, 0xF8, 0x00, 0x00, 0x00, // jmp far [ebx+0x000000F8]
     ];
-    j = 0;
-    while j < pm32.len()
-    {
-        t[0x90 + j] = pm32[j];
-        j += 1;
-    }
+    place(&mut t, 0x90, &pm32);
     // 0xEF..0xF7: zero padding
 
     // ── LM64 far-jmp target (0xF8–0xFD) ──────────────────────────────────────
@@ -332,15 +298,28 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
         0x48, 0x8B, 0x43, 0x10, // mov rax, [rbx+16]
         0xFF, 0xE0, // jmp rax
     ];
-    j = 0;
-    while j < lm64.len()
-    {
-        t[0x100 + j] = lm64[j];
-        j += 1;
-    }
+    place(&mut t, 0x100, &lm64);
 
     t
 };
+
+/// Copy `bytes` into `template` from byte `at`. Only the
+/// [`TRAMPOLINE_TEMPLATE`] initializer calls it, at compile time, so a part
+/// that does not fit the template fails the build.
+const fn place(template: &mut [u8], at: usize, bytes: &[u8])
+{
+    let Some((_, from_at)) = template.split_at_mut_checked(at)
+    else
+    {
+        panic!("trampoline template part starts past the template");
+    };
+    let Some((dst, _)) = from_at.split_at_mut_checked(bytes.len())
+    else
+    {
+        panic!("trampoline template part ends past the template");
+    };
+    dst.copy_from_slice(bytes);
+}
 
 // `setup_trampoline` copies the whole template into the one trampoline page.
 const _: () = assert!(TRAMPOLINE_TEMPLATE.len() <= 4096);
@@ -359,7 +338,7 @@ const _: () = assert!(TRAMPOLINE_TEMPLATE.len() <= 4096);
 #[cfg(not(test))]
 unsafe fn write_u32(tramp_virt: u64, offset: usize, val: u32)
 {
-    let p = (tramp_virt + offset as u64) as *mut u8;
+    let p = tramp_virt.wrapping_add(offset as u64) as *mut u8;
     let b = val.to_le_bytes();
     // SAFETY: `tramp_virt` is a valid writable virtual address within the direct map
     // (enforced by the caller), and `offset` is within the trampoline page bounds.
@@ -378,7 +357,7 @@ unsafe fn write_u32(tramp_virt: u64, offset: usize, val: u32)
 #[cfg(not(test))]
 unsafe fn write_u16(tramp_virt: u64, offset: usize, val: u16)
 {
-    let p = (tramp_virt + offset as u64) as *mut u8;
+    let p = tramp_virt.wrapping_add(offset as u64) as *mut u8;
     let b = val.to_le_bytes();
     // SAFETY: `tramp_virt` is a valid writable virtual address within the direct map
     // (enforced by the caller), and `offset` is within the trampoline page bounds.
@@ -395,7 +374,7 @@ unsafe fn write_u16(tramp_virt: u64, offset: usize, val: u16)
 #[cfg(not(test))]
 unsafe fn write_u64(tramp_virt: u64, offset: usize, val: u64)
 {
-    let p = (tramp_virt + offset as u64) as *mut u8;
+    let p = tramp_virt.wrapping_add(offset as u64) as *mut u8;
     let b = val.to_le_bytes();
     // SAFETY: tramp_virt is valid direct-map address; offset within page; writes within bounds.
     unsafe {
@@ -424,7 +403,7 @@ unsafe fn write_u64(tramp_virt: u64, offset: usize, val: u64)
 pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
 {
     let ap_page = ap_trampoline_phys;
-    let virt = super::paging::direct_map_base() + ap_page;
+    let virt = super::paging::direct_map_base().wrapping_add(ap_page);
 
     // Copy the fixed template.
     // SAFETY: virt is within the direct map (Phase 3 active);
@@ -442,7 +421,11 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     #[allow(clippy::cast_possible_truncation)]
     // SAFETY: virt is direct-map address; write_u32/u16 write within page bounds.
     unsafe {
-        write_u32(virt, TRAMP_PATCH_RM_FAR_JMP, (ap_page + 0x90) as u32);
+        write_u32(
+            virt,
+            TRAMP_PATCH_RM_FAR_JMP,
+            ap_page.wrapping_add(0x90) as u32,
+        );
         write_u16(virt, TRAMP_PATCH_RM_FAR_JMP + 4, 0x0008);
     }
 
@@ -468,7 +451,11 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     #[allow(clippy::cast_possible_truncation)]
     // SAFETY: virt is direct-map address; write within page bounds.
     unsafe {
-        write_u32(virt, TRAMP_PATCH_GDTR + 2, (ap_page + 0x48) as u32);
+        write_u32(
+            virt,
+            TRAMP_PATCH_GDTR + 2,
+            ap_page.wrapping_add(0x48) as u32,
+        );
     }
 
     // Patch: PM32 temporary stack address at 0x9F → AP_PAGE+0x200.
@@ -478,7 +465,11 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     #[allow(clippy::cast_possible_truncation)]
     // SAFETY: virt is direct-map address; write within page bounds.
     unsafe {
-        write_u32(virt, TRAMP_PATCH_PM32_STACK, (ap_page + 0x200) as u32);
+        write_u32(
+            virt,
+            TRAMP_PATCH_PM32_STACK,
+            ap_page.wrapping_add(0x200) as u32,
+        );
     }
 
     // Patch: LM64 far-jmp target at 0xF8 → [u32: AP_PAGE+0x100, u16: 0x0010]
@@ -486,7 +477,11 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     #[allow(clippy::cast_possible_truncation)]
     // SAFETY: virt is direct-map address; writes within page bounds.
     unsafe {
-        write_u32(virt, TRAMP_PATCH_LM64_FAR_JMP, (ap_page + 0x100) as u32);
+        write_u32(
+            virt,
+            TRAMP_PATCH_LM64_FAR_JMP,
+            ap_page.wrapping_add(0x100) as u32,
+        );
         write_u16(virt, TRAMP_PATCH_LM64_FAR_JMP + 4, 0x0010);
     }
 }
@@ -518,8 +513,8 @@ pub unsafe fn setup_ap_params(
     ist2_top: u64,
 )
 {
-    let virt = super::paging::direct_map_base() + ap_trampoline_phys;
-    let base = virt + TRAMP_PARAMS as u64;
+    let virt = super::paging::direct_map_base().wrapping_add(ap_trampoline_phys);
+    let base = virt.wrapping_add(TRAMP_PARAMS as u64);
 
     // SAFETY: base is direct-map address; writes within parameter block bounds.
     unsafe {
@@ -574,8 +569,8 @@ pub unsafe fn start_ap(
     // SAFETY: cpu_idx < CPU_COUNT (caller's contract; debug-asserted above); the IST
     // slab covers cpu_count entries.
     let ist_base = unsafe { ist_slab_base.add(cpu_idx as usize) } as u64;
-    let ist1_top = ist_base + 8192;
-    let ist2_top = ist_base + 16384;
+    let ist1_top = ist_base.wrapping_add(8192);
+    let ist2_top = ist_base.wrapping_add(16384);
 
     // The PM32 stub loads CR3 with a 32-bit `mov cr3, eax`, so the kernel root
     // table must lie below 4 GiB; the boot protocol requires the bootloader to

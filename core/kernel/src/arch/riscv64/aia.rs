@@ -103,7 +103,8 @@ const fn sourcecfg_offset(source: u32) -> u64
 /// Offset of source `source`'s `target` register (sources from 1).
 const fn target_offset(source: u32) -> u64
 {
-    0x3000 + source as u64 * 4
+    // A u32 source times 4 is below 2^34, so the sum does not wrap.
+    0x3000u64.wrapping_add(source as u64 * 4)
 }
 
 // ── IMSIC indirect registers (through `siselect` / `sireg`) ──────────────────
@@ -193,10 +194,11 @@ fn eid_row(cpu: usize) -> Option<&'static [SlotEntry]>
         return None;
     }
     let row_len = IMSIC_IDS.load(Ordering::Relaxed) as usize + 1;
+    let start = cpu.checked_mul(row_len)?;
     // SAFETY: the slab holds `row_len` zero-initialised entries (an atomic, for
     // which zero is a valid value and a free slot) for each of the boot CPUs,
     // and `cpu` is below their count; the slab is never freed.
-    Some(unsafe { core::slice::from_raw_parts(base.add(cpu * row_len), row_len) })
+    Some(unsafe { core::slice::from_raw_parts(base.add(start), row_len) })
 }
 
 /// Halt the boot unless the hart with hart id `hart` can be an APLIC MSI target:
@@ -285,16 +287,21 @@ pub unsafe fn init_bsp(bsp_hart: u32)
 pub unsafe fn init_hart(hart: u32)
 {
     require_hart_target(hart);
-    let words = u64::from(imsic_reg_words(IMSIC_IDS.load(Ordering::Relaxed)));
+    let words = imsic_reg_words(IMSIC_IDS.load(Ordering::Relaxed)) as usize;
+    // The k-th 64-bit pending and enable registers, every second select on RV64.
+    let selects = (ISEL_EIP0..)
+        .step_by(2)
+        .zip((ISEL_EIE0..).step_by(2))
+        .take(words);
     // SAFETY: caller contract; each select names a register Ssaia defines for
     // a file of this identity count.
     unsafe {
         imsic_write(ISEL_EIDELIVERY, 0);
         imsic_write(ISEL_EITHRESHOLD, 0);
-        for word in 0..words
+        for (eip, eie) in selects
         {
-            imsic_write(ISEL_EIP0 + 2 * word, 0);
-            imsic_write(ISEL_EIE0 + 2 * word, u64::MAX);
+            imsic_write(eip, 0);
+            imsic_write(eie, u64::MAX);
         }
         imsic_write(ISEL_EIDELIVERY, 1);
     }
@@ -314,6 +321,17 @@ fn implemented(source: u32) -> bool
     source != 0 && source <= source_count()
 }
 
+/// The route word of `source` in [`SOURCE_ROUTES`], or `None` when the domain does
+/// not implement `source`.
+fn route_word(source: u32) -> Option<&'static AtomicU64>
+{
+    if !implemented(source)
+    {
+        return None;
+    }
+    SOURCE_ROUTES.get(source as usize)
+}
+
 /// The CPU and identity a new source takes: the next CPU in turn with a free
 /// identity (`irq::next_target_cpu`) and that CPU's lowest free identity, whose
 /// row entry is then set to `slot`. `None` when no CPU has a free identity.
@@ -323,7 +341,7 @@ fn take_identity(slot: Slot) -> Option<crate::irq::Target>
     let cpu = crate::irq::next_target_cpu(has_free)?;
     let row = eid_row(cpu)?;
     let eid = lowest_free_eid(row)?;
-    row[eid as usize].store(slot);
+    row.get(eid as usize)?.store(slot);
     // A CPU index is below MAX_CPUS, which u32 holds.
     #[allow(clippy::cast_possible_truncation)]
     let cpu = cpu as u32;
@@ -364,10 +382,11 @@ fn release_identity(target: crate::irq::Target)
 /// not routed.
 pub fn route(source: u32, mode: u32) -> Result<crate::irq::Target, crate::irq::RouteError>
 {
-    if !implemented(source)
+    let Some(word) = route_word(source)
+    else
     {
         return Err(crate::irq::RouteError::NoSuchLine);
-    }
+    };
     let taken = take_identity(Slot::Line(source)).ok_or(crate::irq::RouteError::Exhausted)?;
     // SAFETY: `take_identity` returns a CPU with a row, so below CPU_COUNT; the
     // hart id slab is read-only after boot.
@@ -385,7 +404,7 @@ pub fn route(source: u32, mode: u32) -> Result<crate::irq::Target, crate::irq::R
         eid: taken.slot,
         level: aplic_mode_is_level(source_mode),
     };
-    SOURCE_ROUTES[source as usize].store(route.pack(), Ordering::Relaxed);
+    word.store(route.pack(), Ordering::Relaxed);
     // SAFETY: an implemented source's registers lie in the window init_bsp
     // checked.
     unsafe {
@@ -405,17 +424,18 @@ pub fn route(source: u32, mode: u32) -> Result<crate::irq::Target, crate::irq::R
 /// Called under `irq`'s routing lock.
 pub fn unroute(source: u32)
 {
-    if !implemented(source)
+    let Some(route_word) = route_word(source)
+    else
     {
         return;
-    }
+    };
     // SAFETY: an implemented source's registers lie in the window init_bsp
     // checked.
     unsafe {
         aplic_write(APLIC_CLRIENUM, source);
         aplic_write(sourcecfg_offset(source), 0);
     }
-    let word = SOURCE_ROUTES[source as usize].swap(0, Ordering::Relaxed);
+    let word = route_word.swap(0, Ordering::Relaxed);
     if let Some(route) = SourceRoute::unpack(word)
     {
         release_identity(crate::irq::Target {
@@ -506,11 +526,8 @@ pub fn mask(source: u32)
 /// Called under `irq`'s routing lock.
 pub fn unmask(source: u32)
 {
-    if !implemented(source)
-    {
-        return;
-    }
-    let Some(route) = SourceRoute::unpack(SOURCE_ROUTES[source as usize].load(Ordering::Relaxed))
+    let Some(route) =
+        route_word(source).and_then(|word| SourceRoute::unpack(word.load(Ordering::Relaxed)))
     else
     {
         return;
@@ -550,7 +567,7 @@ pub fn claim() -> Option<&'static SlotEntry>
 /// Read the APLIC register at `offset`.
 fn aplic_read(offset: u64) -> u32
 {
-    let vaddr = phys_to_virt(APLIC_BASE.load(Ordering::Relaxed) + offset);
+    let vaddr = phys_to_virt(APLIC_BASE.load(Ordering::Relaxed).wrapping_add(offset));
     // SAFETY: the APLIC window lies in the direct map and `offset` is a
     // register inside it (every caller passes a constant register offset);
     // a volatile read is not elided or reordered by the compiler.
@@ -567,7 +584,7 @@ fn aplic_read(offset: u64) -> u32
 /// and `offset` must name a register inside it.
 unsafe fn aplic_write(offset: u64, val: u32)
 {
-    let vaddr = phys_to_virt(APLIC_BASE.load(Ordering::Relaxed) + offset);
+    let vaddr = phys_to_virt(APLIC_BASE.load(Ordering::Relaxed).wrapping_add(offset));
     mmio::dma_to_mmio_barrier();
     // SAFETY: caller contract; a volatile write is not elided or reordered by
     // the compiler.

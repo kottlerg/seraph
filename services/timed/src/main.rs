@@ -11,6 +11,9 @@
 //! clock, and serves [`timed_labels::GET_WALL_TIME`] from `offset +
 //! system_info(ElapsedUs)` thereafter.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use ipc::{IpcMessage, rtc_errors, rtc_labels, timed_errors, timed_labels};
 use std::os::seraph::startup_info;
 use syscall_abi::SystemInfoType;

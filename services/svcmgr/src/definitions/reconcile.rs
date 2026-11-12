@@ -120,6 +120,15 @@ impl ServiceTable
         self.recipes.push(None);
         Some((idx, correlator))
     }
+
+    /// Store `entry` and `recipe` in the slot `idx` that [`Self::reserve`]
+    /// returned. `None` when `idx` is not a slot of the table.
+    fn install(&mut self, idx: usize, entry: ServiceEntry, recipe: RestartRecipe) -> Option<()>
+    {
+        *self.services.get_mut(idx)? = entry;
+        *self.recipes.get_mut(idx)? = Some(recipe);
+        Some(())
+    }
 }
 
 /// Top-level entry called from `dispatch_ipc` on `HANDOVER_COMPLETE`.
@@ -285,7 +294,11 @@ fn record_shutdown_actuator(
 {
     match slot
     {
-        Some(slot) if table.services[slot].provided_endpoint != 0 =>
+        Some(slot)
+            if table
+                .services
+                .get(slot)
+                .is_some_and(|entry| entry.provided_endpoint != 0) =>
         {
             table.shutdown_actuator = Some(ShutdownActuator { slot, badge });
         }
@@ -392,8 +405,7 @@ fn handle_definition(
     entry.thread_cap = launched.thread_cap;
     entry.process_handle = launched.process_handle;
     entry.provided_endpoint = launched.provided_endpoint;
-    table.services[idx] = entry;
-    table.recipes[idx] = Some(recipe);
+    table.install(idx, entry, recipe)?;
     Some(idx)
 }
 
@@ -445,8 +457,7 @@ fn bind_only(
     // `process_handle` stays 0: init created this instance and kept its
     // handle (see `restart::restart_process`).
     entry.thread_cap = thread_cap;
-    table.services[idx] = entry;
-    table.recipes[idx] = Some(recipe);
+    table.install(idx, entry, recipe)?;
     Some(idx)
 }
 
@@ -490,8 +501,13 @@ fn try_strings(strings: &[String]) -> Option<Vec<String>>
 fn recipe_path(filename: &str) -> Option<String>
 {
     let mut path = String::new();
-    path.try_reserve_exact(SERVICES_DIR.len() + 1 + filename.len())
-        .ok()?;
+    path.try_reserve_exact(
+        SERVICES_DIR
+            .len()
+            .saturating_add(1)
+            .saturating_add(filename.len()),
+    )
+    .ok()?;
     path.push_str(SERVICES_DIR);
     path.push('/');
     path.push_str(filename);

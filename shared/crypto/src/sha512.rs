@@ -153,75 +153,54 @@ fn small_sigma1(x: u64) -> u64
     x.rotate_right(19) ^ x.rotate_right(61) ^ (x >> 6)
 }
 
+/// One SHA-512 round (FIPS 180-4 §6.4.2 step 3) over the working variables
+/// `[a, b, c, d, e, f, g, h]`, with round constant `k` and schedule word `w`.
+fn round(s: &mut [u64; 8], k: u64, w: u64)
+{
+    let t1 = s[7]
+        .wrapping_add(big_sigma1(s[4]))
+        .wrapping_add(ch(s[4], s[5], s[6]))
+        .wrapping_add(k)
+        .wrapping_add(w);
+    let t2 = big_sigma0(s[0]).wrapping_add(maj(s[0], s[1], s[2]));
+    // Shift every variable down one place (h is dropped), then fill in a and e.
+    s.rotate_right(1);
+    s[0] = t1.wrapping_add(t2);
+    s[4] = s[4].wrapping_add(t1);
+}
+
 /// Compress one 128-byte block into the chaining state `h` (FIPS 180-4 §6.4).
-// many_single_char_names: a..h are the FIPS 180-4 working-variable names;
-// renaming them would obscure the published algorithm.
-#[allow(clippy::many_single_char_names)]
+///
+/// The message schedule is a sliding window of the last 16 words: for `t >= 16`,
+/// `W[t] = σ1(W[t-2]) + W[t-7] + σ0(W[t-15]) + W[t-16]` reads window slots 14, 9, 1 and 0.
 fn compress(h: &mut [u64; 8], block: &[u8; BLOCK_LEN])
 {
-    let mut w = [0u64; 80];
-    let mut t = 0;
-    while t < 16
+    let mut win = [0u64; 16];
+    for (wt, chunk) in win.iter_mut().zip(block.as_chunks::<8>().0)
     {
-        let off = t * 8;
-        w[t] = u64::from_be_bytes([
-            block[off],
-            block[off + 1],
-            block[off + 2],
-            block[off + 3],
-            block[off + 4],
-            block[off + 5],
-            block[off + 6],
-            block[off + 7],
-        ]);
-        t += 1;
-    }
-    while t < 80
-    {
-        w[t] = small_sigma1(w[t - 2])
-            .wrapping_add(w[t - 7])
-            .wrapping_add(small_sigma0(w[t - 15]))
-            .wrapping_add(w[t - 16]);
-        t += 1;
+        *wt = u64::from_be_bytes(*chunk);
     }
 
-    let mut a = h[0];
-    let mut b = h[1];
-    let mut c = h[2];
-    let mut d = h[3];
-    let mut e = h[4];
-    let mut f = h[5];
-    let mut g = h[6];
-    let mut hh = h[7];
-
-    let mut i = 0;
-    while i < 80
+    let mut s = *h;
+    for (k, wt) in K.iter().zip(win.iter())
     {
-        let t1 = hh
-            .wrapping_add(big_sigma1(e))
-            .wrapping_add(ch(e, f, g))
-            .wrapping_add(K[i])
-            .wrapping_add(w[i]);
-        let t2 = big_sigma0(a).wrapping_add(maj(a, b, c));
-        hh = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(t1);
-        d = c;
-        c = b;
-        b = a;
-        a = t1.wrapping_add(t2);
-        i += 1;
+        round(&mut s, *k, *wt);
+    }
+    for k in K.iter().skip(16)
+    {
+        let next = small_sigma1(win[14])
+            .wrapping_add(win[9])
+            .wrapping_add(small_sigma0(win[1]))
+            .wrapping_add(win[0]);
+        win.rotate_left(1);
+        win[15] = next;
+        round(&mut s, *k, next);
     }
 
-    h[0] = h[0].wrapping_add(a);
-    h[1] = h[1].wrapping_add(b);
-    h[2] = h[2].wrapping_add(c);
-    h[3] = h[3].wrapping_add(d);
-    h[4] = h[4].wrapping_add(e);
-    h[5] = h[5].wrapping_add(f);
-    h[6] = h[6].wrapping_add(g);
-    h[7] = h[7].wrapping_add(hh);
+    for (hi, si) in h.iter_mut().zip(s)
+    {
+        *hi = hi.wrapping_add(si);
+    }
 }
 
 /// Incremental SHA-512 state.
@@ -259,10 +238,18 @@ impl Sha512
         // Top up a partial buffer first.
         if self.buf_len > 0
         {
-            let take = core::cmp::min(BLOCK_LEN - self.buf_len, data.len());
-            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
-            self.buf_len += take;
-            data = &data[take..];
+            let take = core::cmp::min(BLOCK_LEN.saturating_sub(self.buf_len), data.len());
+            let (Some(head), Some(rest)) = (data.get(..take), data.get(take..))
+            else
+            {
+                return;
+            };
+            for (dst, src) in self.buf.iter_mut().skip(self.buf_len).zip(head)
+            {
+                *dst = *src;
+            }
+            self.buf_len = self.buf_len.saturating_add(take);
+            data = rest;
             if self.buf_len == BLOCK_LEN
             {
                 let block = self.buf;
@@ -272,18 +259,20 @@ impl Sha512
         }
 
         // Consume whole blocks straight from the input.
-        while data.len() >= BLOCK_LEN
+        let (blocks, rest) = data.as_chunks::<BLOCK_LEN>();
+        for block in blocks
         {
-            let mut block = [0u8; BLOCK_LEN];
-            block.copy_from_slice(&data[..BLOCK_LEN]);
-            compress(&mut self.h, &block);
-            data = &data[BLOCK_LEN..];
+            compress(&mut self.h, block);
         }
+        data = rest;
 
-        // Stash the remainder.
+        // Stash the remainder (shorter than one block).
         if !data.is_empty()
         {
-            self.buf[..data.len()].copy_from_slice(data);
+            for (dst, src) in self.buf.iter_mut().zip(data)
+            {
+                *dst = *src;
+            }
             self.buf_len = data.len();
         }
     }
@@ -296,14 +285,17 @@ impl Sha512
         // final 16 bytes of a block, then the 128-bit big-endian bit length.
         let bit_len: u128 = self.total_len << 3;
 
-        let mut pad = self.buf_len;
-        self.buf[pad] = 0x80;
-        pad += 1;
+        // `buf_len < BLOCK_LEN` always holds, so the 0x80 byte has a slot.
+        let mut pad = self.buf_len.saturating_add(1);
+        if let Some(byte) = self.buf.get_mut(self.buf_len)
+        {
+            *byte = 0x80;
+        }
 
         if pad > BLOCK_LEN - 16
         {
             // Length field spills into a second block: flush this one first.
-            for byte in &mut self.buf[pad..BLOCK_LEN]
+            for byte in self.buf.iter_mut().skip(pad)
             {
                 *byte = 0;
             }
@@ -312,18 +304,22 @@ impl Sha512
             pad = 0;
         }
 
-        for byte in &mut self.buf[pad..BLOCK_LEN - 16]
+        // Zero up to the end of the block; the length field then overwrites the last 16 bytes.
+        for byte in self.buf.iter_mut().skip(pad)
         {
             *byte = 0;
         }
-        self.buf[BLOCK_LEN - 16..].copy_from_slice(&bit_len.to_be_bytes());
+        if let Some(len_field) = self.buf.as_chunks_mut::<16>().0.last_mut()
+        {
+            *len_field = bit_len.to_be_bytes();
+        }
         let block = self.buf;
         compress(&mut self.h, &block);
 
         let mut out = [0u8; DIGEST_LEN];
-        for (i, word) in self.h.iter().enumerate()
+        for (chunk, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(self.h.iter())
         {
-            out[i * 8..i * 8 + 8].copy_from_slice(&word.to_be_bytes());
+            *chunk = word.to_be_bytes();
         }
         out
     }
@@ -425,7 +421,11 @@ pub fn run_sha512_kats() -> Result<(), &'static str>
         0usize, 1, 55, 56, 63, 64, 111, 112, 127, 128, 129, 200, 256, 300,
     ]
     {
-        let msg = &scratch[..len];
+        let Some(msg) = scratch.get(..len)
+        else
+        {
+            return Err("sha512: bad scratch length");
+        };
         let mut inc = Sha512::new();
         for b in msg
         {

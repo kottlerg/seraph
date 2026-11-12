@@ -25,7 +25,7 @@ pub const THREAD_BADGE_TAG: u64 = ipc::procmgr_labels::DEBUGGER_BADGE_TAG;
 #[must_use]
 pub fn thread_badge(index: usize) -> u64
 {
-    THREAD_BADGE_TAG | (index as u64 + 1)
+    THREAD_BADGE_TAG | (index as u64).saturating_add(1)
 }
 
 /// The table index a binding's badge names; `None` for a badge the stub

@@ -191,9 +191,11 @@ impl<S: SlotStore> Arena<S>
         let first = self.carved;
         for j in 0..SLOTS_PER_PAGE
         {
-            let next = if j + 1 < SLOTS_PER_PAGE
+            // `j < SLOTS_PER_PAGE` and `first + SLOTS_PER_PAGE` is the carved count, so
+            // neither sum nears `u64::MAX`.
+            let next = if j.saturating_add(1) < SLOTS_PER_PAGE
             {
-                first + j + 1
+                first.saturating_add(j).saturating_add(1)
             }
             else
             {
@@ -202,7 +204,7 @@ impl<S: SlotStore> Arena<S>
             // SAFETY: the caller's contract covers `first + j`.
             unsafe {
                 self.store.write(
-                    first + j,
+                    first.saturating_add(j),
                     Slot {
                         node: Node::Free,
                         next,
@@ -211,8 +213,8 @@ impl<S: SlotStore> Arena<S>
             }
         }
         self.free_head = first;
-        self.carved += SLOTS_PER_PAGE;
-        self.free_count += SLOTS_PER_PAGE;
+        self.carved = self.carved.saturating_add(SLOTS_PER_PAGE);
+        self.free_count = self.free_count.saturating_add(SLOTS_PER_PAGE);
     }
 
     /// Take a free slot outside the reserve and fill it with `node` and
@@ -237,7 +239,8 @@ impl<S: SlotStore> Arena<S>
             return None;
         }
         self.free_head = self.get(idx).next;
-        self.free_count -= 1;
+        // A non-null free head means the free list is non-empty, so `free_count` is above zero.
+        self.free_count = self.free_count.saturating_sub(1);
         self.set(idx, Slot { node, next });
         Some(idx)
     }
@@ -258,7 +261,8 @@ impl<S: SlotStore> Arena<S>
             },
         );
         self.free_head = idx;
-        self.free_count += 1;
+        // `idx` is below `carved`, so the free list holds fewer than `carved` slots.
+        self.free_count = self.free_count.saturating_add(1);
     }
 
     /// The slot at `idx`. An index the arena never carved (a logic error)
@@ -323,12 +327,13 @@ impl ArenaLayout
     #[must_use]
     pub const fn page_va(&self, page: u64) -> Option<u64>
     {
-        let low_pages = (self.low_end - self.low_base) / PAGE_SIZE;
+        let low_pages = self.low_end.saturating_sub(self.low_base) / PAGE_SIZE;
         if page < low_pages
         {
-            return Some(self.low_base + page * PAGE_SIZE);
+            // `page < low_pages`, so the address is below `low_end`.
+            return Some(self.low_base.saturating_add(page.saturating_mul(PAGE_SIZE)));
         }
-        let Some(off) = (page - low_pages).checked_mul(PAGE_SIZE)
+        let Some(off) = page.saturating_sub(low_pages).checked_mul(PAGE_SIZE)
         else
         {
             return None;
@@ -346,7 +351,11 @@ impl ArenaLayout
     {
         match self.page_va(idx / SLOTS_PER_PAGE)
         {
-            Some(va) => Some(va + (idx % SLOTS_PER_PAGE) * SLOT_SIZE as u64),
+            // The slot offset is within one page of the page base.
+            Some(va) =>
+            {
+                Some(va.saturating_add((idx % SLOTS_PER_PAGE).saturating_mul(SLOT_SIZE as u64)))
+            }
             None => None,
         }
     }

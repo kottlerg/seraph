@@ -48,7 +48,8 @@ pub fn class_publication(class: &[u8]) -> Option<Vec<u8>>
 {
     let prefix = ipc::published_names::DEVMGR_CLASS_PREFIX;
     let mut name = Vec::new();
-    name.try_reserve_exact(prefix.len() + class.len()).ok()?;
+    name.try_reserve_exact(prefix.len().saturating_add(class.len()))
+        .ok()?;
     name.extend_from_slice(prefix);
     name.extend_from_slice(class);
     Some(name)

@@ -161,15 +161,23 @@ impl Round
 {
     fn new(caps: &[u64], data: &[u64], done: bool) -> Self
     {
+        // The counts never exceed the arrays, which is what `caps` and `data`
+        // rely on; a longer input is cut to fit.
         let mut round = Self {
             caps: [0; MSG_CAP_SLOTS_MAX],
-            cap_count: caps.len(),
+            cap_count: caps.len().min(MSG_CAP_SLOTS_MAX),
             data: [0; MAX_ROUND_WORDS],
-            data_words: data.len(),
+            data_words: data.len().min(MAX_ROUND_WORDS),
             done,
         };
-        round.caps[..caps.len()].copy_from_slice(caps);
-        round.data[..data.len()].copy_from_slice(data);
+        for (dst, &src) in round.caps.iter_mut().zip(caps)
+        {
+            *dst = src;
+        }
+        for (dst, &src) in round.data.iter_mut().zip(data)
+        {
+            *dst = src;
+        }
         round
     }
 
@@ -231,14 +239,16 @@ impl Round
     #[must_use]
     pub fn caps(&self) -> &[u64]
     {
-        &self.caps[..self.cap_count]
+        // `cap_count` is set once, in `new`, to at most `caps.len()`.
+        self.caps.get(..self.cap_count).unwrap_or(&[])
     }
 
     /// The round's data words.
     #[must_use]
     pub fn data(&self) -> &[u64]
     {
-        &self.data[..self.data_words]
+        // `data_words` is set once, in `new`, to at most `data.len()`.
+        self.data.get(..self.data_words).unwrap_or(&[])
     }
 
     /// Whether the round is the terminal one.
@@ -310,8 +320,14 @@ impl ResourceList
         {
             return Err(ListError::AfterEnd);
         }
-        let words = &round.data[..round.data_words];
-        let caps = &round.caps[..round.cap_count];
+        let (Some(words), Some(caps)) = (
+            round.data.get(..round.data_words),
+            round.caps.get(..round.cap_count),
+        )
+        else
+        {
+            return Err(ListError::Malformed(0));
+        };
         let Some(&round_kind) = words.first()
         else
         {
@@ -377,7 +393,7 @@ impl ResourceList
                     count: 0,
                 }; MSG_CAP_SLOTS_MAX];
                 let decoded = decode_interrupts(caps, irq_kind, first, mode, &mut batch);
-                self.push(&batch[..decoded.ok_or(bad)?])
+                self.push(batch.get(..decoded.ok_or(bad)?).ok_or(bad)?)
             }
             (kind::END | kind::MMIO | kind::IO_PORT | kind::INTERRUPT, _, _) => Err(bad),
             (other, _, _) => Err(ListError::UnknownKind(other)),
@@ -386,12 +402,15 @@ impl ResourceList
 
     fn push(&mut self, batch: &[Resource]) -> Result<bool, ListError>
     {
-        let end = self.count + batch.len();
-        if end > MAX_RESOURCES
-        {
-            return Err(ListError::TooMany);
-        }
-        self.resources[self.count..end].copy_from_slice(batch);
+        let end = self
+            .count
+            .checked_add(batch.len())
+            .filter(|&end| end <= MAX_RESOURCES)
+            .ok_or(ListError::TooMany)?;
+        self.resources
+            .get_mut(self.count..end)
+            .ok_or(ListError::TooMany)?
+            .copy_from_slice(batch);
         self.count = end;
         Ok(false)
     }
@@ -400,7 +419,9 @@ impl ResourceList
     #[must_use]
     pub fn resources(&self) -> &[Resource]
     {
-        &self.resources[..self.count]
+        // `count` is set only in `new` (0) and `push`, which keeps it within
+        // `MAX_RESOURCES`.
+        self.resources.get(..self.count).unwrap_or(&[])
     }
 
     /// The endpoints of the end round; `None` until it is absorbed.
@@ -508,7 +529,7 @@ pub unsafe fn receive(creator: u64, ipc_buf: *mut u64) -> Result<ResourceList, u
             {}
             Err(_) =>
             {
-                delete(round.caps[..round.cap_count].iter().copied());
+                delete(round.caps.iter().take(round.cap_count).copied());
                 delete(list.caps());
                 return Err(ipc::bootstrap_errors::INVALID);
             }
@@ -539,7 +560,9 @@ fn decode_interrupts(
 {
     let irq_kind = InterruptKind::from_word(irq_kind)?;
     let first = u8::try_from(first).ok()?;
-    let end = usize::from(first) + caps.len();
+    // `first` is at most 255, and a `caps` long enough to saturate fails the
+    // length check below either way.
+    let end = usize::from(first).saturating_add(caps.len());
     let valid = !caps.is_empty()
         && caps.len() <= MSG_CAP_SLOTS_MAX
         && mode & !IRQ_MODE_MASK == 0
@@ -589,6 +612,29 @@ mod tests
         r.caps[..caps.len()].copy_from_slice(caps);
         r.data[..data.len()].copy_from_slice(data);
         r
+    }
+
+    #[test]
+    fn a_round_with_counts_past_its_arrays_is_malformed()
+    {
+        let mut list = ResourceList::new();
+        let mut round = raw(false, &[1], &[kind::IO_PORT, 0x3F8, 8]);
+        round.cap_count = MSG_CAP_SLOTS_MAX + 1;
+        assert_eq!(list.absorb(&round), Err(ListError::Malformed(0)));
+        let mut round = raw(false, &[1], &[kind::IO_PORT, 0x3F8, 8]);
+        round.data_words = MSG_DATA_WORDS_MAX + 1;
+        assert_eq!(list.absorb(&round), Err(ListError::Malformed(0)));
+        assert!(list.resources().is_empty());
+    }
+
+    #[test]
+    fn a_round_built_from_too_much_is_cut_to_what_it_holds()
+    {
+        let caps = [7u64; MSG_CAP_SLOTS_MAX + 2];
+        let data = [9u64; MAX_ROUND_WORDS + 2];
+        let round = Round::new(&caps, &data, false);
+        assert_eq!(round.caps().len(), MSG_CAP_SLOTS_MAX);
+        assert_eq!(round.data().len(), MAX_ROUND_WORDS);
     }
 
     fn decoded(rounds: &[Round]) -> Result<ResourceList, ListError>

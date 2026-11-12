@@ -14,6 +14,8 @@
 //! given; keeping that parse pure and host-testable is the point — see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 /// Page size of the mappings pwrmgr makes of a table's region.
@@ -76,12 +78,12 @@ pub fn table_mapping(region_base: u64, region_size: u64, table_phys: u64) -> Opt
         .div_ceil(PAGE_SIZE)
         .max(1);
     let mapped_len = pages.checked_mul(PAGE_SIZE)?;
-    let offset = table_phys.checked_sub(region_base - region_base % PAGE_SIZE)?;
+    let offset = table_phys.checked_sub(region_base.saturating_sub(region_base % PAGE_SIZE))?;
     if offset >= mapped_len
     {
         return None;
     }
-    let len = usize::try_from(mapped_len - offset).ok()?;
+    let len = usize::try_from(mapped_len.checked_sub(offset)?).ok()?;
     Some(TableMapping { pages, offset, len })
 }
 
@@ -157,25 +159,34 @@ pub fn find_s5_slp_typa(dsdt: &[u8]) -> Option<u16>
     let mut search = body;
     while let Some(pos) = search.windows(S5_NAME.len()).position(|w| w == S5_NAME)
     {
-        let package = &search[pos + S5_NAME.len()..];
+        let Some(package) = search.get(pos.saturating_add(S5_NAME.len())..)
+        else
+        {
+            break;
+        };
         if package.first() != Some(&AML_PACKAGE_OP)
         {
-            search = &search[pos + 1..];
+            let Some(rest) = search.get(pos.saturating_add(1)..)
+            else
+            {
+                break;
+            };
+            search = rest;
             continue;
         }
         // PkgLength: bits [7:6] of its lead byte count the bytes that follow.
         let follow_bytes = usize::from(*package.get(1)? >> 6);
         // PackageOp, PkgLength lead and follow bytes, then NumElements.
-        let first = 2 + follow_bytes + 1;
+        let first = follow_bytes.saturating_add(3);
         let value = match *package.get(first)?
         {
             AML_ZERO_OP => 0,
             AML_ONE_OP => 1,
-            AML_BYTE_PREFIX => u16::from(*package.get(first + 1)?),
-            AML_WORD_PREFIX =>
-            {
-                u16::from_le_bytes([*package.get(first + 1)?, *package.get(first + 2)?])
-            }
+            AML_BYTE_PREFIX => u16::from(*package.get(first.saturating_add(1))?),
+            AML_WORD_PREFIX => u16::from_le_bytes([
+                *package.get(first.saturating_add(1))?,
+                *package.get(first.saturating_add(2))?,
+            ]),
             _ => return None,
         };
         return (value <= SLP_TYP_MAX).then_some(value);

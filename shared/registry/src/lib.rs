@@ -19,6 +19,8 @@
 //! it. Names are at most [`NAME_MAX`] bytes. A full bytewise match is
 //! required — no prefix or glob matching.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
@@ -108,9 +110,7 @@ impl Entry
     /// Bytewise comparison of this entry's name against `name`.
     fn name_matches(&self, name: &[u8]) -> bool
     {
-        name.len() == self.name_len as usize
-            && name.len() <= NAME_MAX
-            && self.name[..name.len()] == *name
+        name.len() == self.name_len as usize && self.name.get(..name.len()) == Some(name)
     }
 }
 
@@ -177,7 +177,10 @@ impl Registry
         let name_len = u8::try_from(name.len()).map_err(|_| ())?;
         self.entries.try_reserve(1).map_err(|_| ())?;
         let mut entry = Entry::empty();
-        entry.name[..name.len()].copy_from_slice(name);
+        for (dst, &src) in entry.name.iter_mut().zip(name)
+        {
+            *dst = src;
+        }
         entry.name_len = name_len;
         entry.cap = cap;
         entry.visibility = visibility;

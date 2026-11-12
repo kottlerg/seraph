@@ -20,6 +20,8 @@
 //! until init-logd stops writing the UART ([`SELF_LOG_HOLD`]), then the
 //! gate's opening and the control loop.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 
@@ -836,7 +838,7 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
     let bytes = msg.data_bytes();
     let n = byte_len.min(bytes.len()).min(STREAM_CHUNK_SIZE);
     let level = level_of(msg.label);
-    let mut rest = &bytes[..n];
+    let mut rest = bytes.get(..n).unwrap_or_default();
     while !rest.is_empty()
     {
         let mut out = LineBuf::new();
@@ -892,7 +894,7 @@ fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) ->
     {
         return RECORD_REJECTED;
     }
-    let Ok(record) = Record::decode(&bytes[..byte_len])
+    let Some(Ok(record)) = bytes.get(..byte_len).map(Record::decode)
     else
     {
         return RECORD_REJECTED;
@@ -948,7 +950,8 @@ fn register_name(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
         return;
     };
     slot.name.clear();
-    slot.name.extend_from_slice(&bytes[..n]);
+    slot.name
+        .extend_from_slice(bytes.get(..n).unwrap_or_default());
 }
 
 // ── Serial output (driver-mediated) ────────────────────────────────────────
@@ -1064,11 +1067,8 @@ fn resolve_output_drivers(ipc_buf: *mut u64)
 /// [`SERIAL_CHUNK`] bytes, on the calling thread's page `ipc_buf`.
 fn write_chunks(cap: u64, op: u64, bytes: &[u8], ipc_buf: *mut u64)
 {
-    let mut off = 0;
-    while off < bytes.len()
+    for chunk in bytes.chunks(SERIAL_CHUNK)
     {
-        let end = (off + SERIAL_CHUNK).min(bytes.len());
-        let chunk = &bytes[off..end];
         let label = op | ((chunk.len() as u64) << 16);
         let msg = IpcMessage::builder(label).bytes(0, chunk).build();
         // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
@@ -1077,7 +1077,6 @@ fn write_chunks(cap: u64, op: u64, bytes: &[u8], ipc_buf: *mut u64)
         // bound across this call (`docs/ipc-design.md` § Multi-threaded
         // servers).
         let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
-        off = end;
     }
 }
 
@@ -1236,10 +1235,11 @@ impl LineBuf
 
     fn push(&mut self, b: u8)
     {
-        if self.len < self.buf.len()
+        if let Some(slot) = self.buf.get_mut(self.len)
         {
-            self.buf[self.len] = b;
-            self.len += 1;
+            *slot = b;
+            // `len` indexed a slot, so it is below the buffer length.
+            self.len = self.len.saturating_add(1);
         }
     }
 
@@ -1260,19 +1260,26 @@ impl LineBuf
         let mut idx = digits.len();
         if n == 0
         {
-            idx -= 1;
-            digits[idx] = b'0';
+            idx = idx.saturating_sub(1);
+            if let Some(d) = digits.get_mut(idx)
+            {
+                *d = b'0';
+            }
         }
         else
         {
             while n > 0
             {
-                idx -= 1;
-                digits[idx] = b'0' + (n % 10) as u8;
+                // A `u64` has at most 20 digits, so `idx` stays in bounds.
+                idx = idx.saturating_sub(1);
+                if let Some(d) = digits.get_mut(idx)
+                {
+                    *d = b'0'.saturating_add((n % 10) as u8);
+                }
                 n /= 10;
             }
         }
-        for &d in &digits[idx..]
+        for &d in digits.get(idx..).unwrap_or_default()
         {
             self.push(d);
         }
@@ -1285,12 +1292,16 @@ impl LineBuf
         let mut idx = digits.len();
         while n > 0 && idx > 0
         {
-            idx -= 1;
-            digits[idx] = b'0' + (n % 10) as u8;
+            // The loop condition keeps `idx` above zero.
+            idx = idx.saturating_sub(1);
+            if let Some(d) = digits.get_mut(idx)
+            {
+                *d = b'0'.saturating_add((n % 10) as u8);
+            }
             n /= 10;
         }
         let start = digits.len().saturating_sub(width);
-        for &d in &digits[start..]
+        for &d in digits.get(start..).unwrap_or_default()
         {
             self.push(d);
         }
@@ -1362,8 +1373,9 @@ impl LineBuf
     /// driver, each whole ([`SERIAL_EMIT`], [`FB_EMIT`]).
     fn flush(&self)
     {
-        serial_write(&self.buf[..self.len]);
-        fb_write(&self.buf[..self.len]);
+        let line = self.buf.get(..self.len).unwrap_or_default();
+        serial_write(line);
+        fb_write(line);
     }
 }
 

@@ -339,7 +339,9 @@ After each merge that shares a file with another merge since the previous releas
 merged PR's worker `composition check <merge>` (docs/conventions.md § Composition check;
 `.claude/agents/worker.md` § Composition check), its worktree parked first; a worker already
 retired is respawned for it. A merge that shares no file owes no check. A defect the check
-finds is the worker's next PR, which you schedule like any other.
+finds is the worker's next PR, which you schedule like any other. Once the check hands back with
+no defect, or that PR has merged, nothing is left for the worker: remove its parked worktree
+(§ Worktree removal).
 
 Order merges to minimize re-validation. A PR whose merge touches only Markdown or comments, or
 no file another open PR touches, costs the others a CI run and nothing else, so merge it as
@@ -418,8 +420,8 @@ the closing comment.
 ## Worktree removal
 
 A worker's worktree carries a built `target/` of several GiB, and the harness removes only an
-unchanged one. Remove a worktree at its worker's retirement and sweep the rest at wind-down,
-after copying its review records into your checkout. Read
+unchanged one. Remove a worktree at its worker's retirement, a parked one included, and sweep
+the rest at wind-down, after copying its review records into your checkout. Read
 `.claude/skills/orchestrate/worktree-removal.md` before the first removal: it has the two
 checks and the command.
 

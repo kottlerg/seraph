@@ -26,7 +26,8 @@ pub fn unicode_to_cp437(cp: u32) -> Option<u8>
     HIGH_HALF
         .binary_search_by_key(&cp, |&(c, _)| c)
         .ok()
-        .map(|i| HIGH_HALF[i].1)
+        .and_then(|i| HIGH_HALF.get(i))
+        .map(|&(_, b)| b)
 }
 
 /// Sorted Unicode → CP437 mapping for the high half (`>= 0x80`).

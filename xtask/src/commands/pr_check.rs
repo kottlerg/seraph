@@ -971,7 +971,8 @@ pub fn states_documentation_only(pat: &Patterns, body: &str) -> bool
 /// head: when the PR's change moved, the body must say the delta is
 /// documentation or comments only; `changes` and `embedded` must both be
 /// empty; and a merge of the base branch between the two heads asks the body
-/// to state whether the incoming diff overlaps the PR's files.
+/// to state that the incoming diff touches none of the PR's files, or that it
+/// is comment-only.
 pub fn delta_diags(pat: &Patterns, body: &str, validated: &str, delta: &Delta) -> Vec<Diag>
 {
     let at = format!("validated head {validated}");
@@ -1023,8 +1024,8 @@ pub fn delta_diags(pat: &Patterns, body: &str, validated: &str, delta: &Delta) -
         out.push(Diag::warning(
             "pr-validated-sync",
             &at,
-            "validated before a merge of the base branch; the body must state whether the \
-             incoming diff overlaps this PR's files",
+            "validated before a merge of the base branch; the body must state that the \
+             incoming diff touches none of this PR's files, or that it is comment-only",
         ));
     }
     out
@@ -2378,7 +2379,11 @@ mod tests
         let validated = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
         repo.on_master("b.rs", "fn b() {}\nfn c() {}\n");
         repo.merge_master(&[]);
-        assert_eq!(rules(&repo.check(&validated, ".")), ["pr-validated-sync"]);
+        let found = repo.check(&validated, ".");
+        assert_eq!(rules(&found), ["pr-validated-sync"]);
+        // Both statements docs/conventions.md § Syncing with `master` allows.
+        assert!(found[0].message.contains("touches none of"), "{found:?}");
+        assert!(found[0].message.contains("comment-only"), "{found:?}");
     }
 
     #[test]

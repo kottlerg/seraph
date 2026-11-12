@@ -1225,6 +1225,15 @@ a rare failure into a rate: `cargo xtask run-parallel --runs N --parallel P --sa
 ([xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)) keeps the log of every failing
 run, and the CPU counts of [Coverage tiers](#coverage-tiers) are where SMP races show first.
 
+**Failures only CI shows.** A defect whose effect depends on where the linker placed a static,
+such as a stack overflow into a neighbouring object, reproduces only in a build with the same
+layout. `cargo xtask build` builds without incremental compilation, as CI's jobs do
+([docs/build-system.md](build-system.md#build-profiles) § Build Profiles), but a pull request's
+CI run builds the PR's merge commit with `master` (`refs/pull/<N>/merge` at the SHA the run
+names), not the PR head, so a local reproduction builds that commit. A local binary still differs
+from CI's in the rust-src paths of its panic-location strings, which name the runner's toolchain
+directory, so a static placed after those strings sits at an offset from CI's address.
+
 **Userspace faults.** With crashd staged, the default, a fault that kills a process procmgr
 created leaves a crash report: a marked block in the system log carrying the registers, the bytes
 at the instruction pointer, the load bias, and a stack walk

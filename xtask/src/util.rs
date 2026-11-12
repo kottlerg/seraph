@@ -56,6 +56,18 @@ pub fn run_cmd_capture(cmd: &mut Command) -> Result<String>
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+// ── Cargo environment ─────────────────────────────────────────────────────────
+
+/// The environment every cargo command of the build runs with, so a local
+/// build compiles what CI's jobs compile: the Rust cache action of
+/// `.github/workflows/build-test.yml` writes `CARGO_INCREMENTAL=0` to the job
+/// environment, and an incremental `dev` build partitions codegen units, and
+/// so orders a binary's statics, differently from a non-incremental one
+/// (`docs/build-system.md` § Build Profiles). It is set over any value the
+/// caller's environment holds, so a local build never departs from CI's on
+/// it.
+pub const CI_CARGO_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
+
 // ── Tool discovery ────────────────────────────────────────────────────────────
 
 /// Resolve `name` on PATH, returning a clear error with per-tool
@@ -136,5 +148,54 @@ pub fn find_llvm_objcopy() -> Result<PathBuf>
             "llvm-objcopy not found at {}\nInstall with: rustup component add llvm-tools",
             objcopy.display()
         )
+    }
+}
+
+// ── Host ports ────────────────────────────────────────────────────────────────
+
+/// The host TCP port a debug-port boot serves on: `requested` when the
+/// command was given one, and otherwise a port free on `127.0.0.1` now.
+///
+/// The free port is the one the kernel assigns a listener bound to port 0,
+/// which is closed again before the port is returned. A port another boot's
+/// QEMU serves on is never picked, so boots from several worktrees do not
+/// meet on one fixed port. A process that binds the port between its close
+/// and QEMU's own bind takes it, and QEMU then fails to start.
+pub fn debug_port_or_free(requested: Option<u16>) -> Result<u16>
+{
+    if let Some(port) = requested
+    {
+        return Ok(port);
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .context("binding a listener on 127.0.0.1 to pick a free port")?;
+    let port = listener
+        .local_addr()
+        .context("reading the free port's address")?
+        .port();
+    Ok(port)
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn a_requested_port_is_kept()
+    {
+        assert_eq!(debug_port_or_free(Some(4560)).unwrap(), 4560);
+    }
+
+    #[test]
+    fn a_picked_port_is_free_and_differs_from_a_held_one()
+    {
+        let first = debug_port_or_free(None).unwrap();
+        assert_ne!(first, 0);
+        // Held here, as a running boot's QEMU holds its port.
+        let held = std::net::TcpListener::bind(("127.0.0.1", first)).expect("the port is free");
+        let second = debug_port_or_free(None).unwrap();
+        assert_ne!(second, first);
+        drop(held);
     }
 }

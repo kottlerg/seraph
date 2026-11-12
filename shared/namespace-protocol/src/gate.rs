@@ -231,17 +231,10 @@ const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
 
 fn required_rights_for(opcode: u64) -> Option<RightsRequirement>
 {
-    let mut i = 0;
-    while i < RIGHTS_TABLE.len()
-    {
-        let (op, req) = RIGHTS_TABLE[i];
-        if op == opcode
-        {
-            return Some(req);
-        }
-        i += 1;
-    }
-    None
+    RIGHTS_TABLE
+        .iter()
+        .find(|&&(op, _)| op == opcode)
+        .map(|&(_, req)| req)
 }
 
 #[cfg(test)]

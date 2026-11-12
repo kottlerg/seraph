@@ -51,13 +51,36 @@ system runs no guests:
 The IOMMU reads its directory, tables, and queues coherently with the processor caches, as the
 platform's PCI host declares (`dma-coherent`) and QEMU's `riscv-iommu-pci` does; the specification
 states no coherence rule, and a platform whose IOMMU reads past the caches would need each table
-write cleaned from them, which the driver does not do. MSI translation (`msiptp`) stays Off: once
-devices signal MSIs ([#325](https://github.com/kottlerg/seraph/issues/325)), their writes to an
-IMSIC are DMA through the IOMMU and need a mapping or MSI translation in each domain.
+write cleaned from them, which the driver does not do.
 
 The library (`iommu_riscv`) holds the register fields, the commands, the fault record, the device
 context, and the directory and page-table walks. They are host-tested, the walks over a
 heap-backed `iommu_core::TableStore`.
+
+---
+
+## MSI Confinement
+
+A device signals a message-signalled interrupt on riscv64 by writing the interrupt identity to the
+`seteipnum` register of a hart's supervisor-level IMSIC interrupt file
+([#325](https://github.com/kottlerg/seraph/issues/325)). Behind a RISC-V IOMMU that write is a
+device request like any other: the device's first stage translates it, so a device reaches only the
+interrupt files its domain maps; an MSI to any other faults, reported as every other fault is.
+`MAP_MSI` maps one file's page into a domain at its own address, read-write (a first-stage entry
+cannot allow writes without reads), with no cap; `UNMAP` refuses it and the domain's `BLOCK`
+withdraws it with the rest. devmgr is to map the files of the harts a device's interrupt targets sit
+on, so the device can write to those harts' supervisor-level files and to no other hart's, nor to
+any machine-level or guest file (design intent; not yet implemented: devmgr sends no `MAP_MSI`
+until it gives drivers message-signalled interrupts, and until then a device behind the IOMMU
+reaches no interrupt file). The confinement is per file: a device can write any interrupt identity
+into a file it reaches, so a forged identity can signal another receiver on that hart.
+
+The IOMMU's MSI page tables (`msiptp`, available where the IOMMU offers `MSI_FLAT` and uses the
+64-byte device context) stay Off. The specification requires `msiptp.MODE` Off whenever the second
+stage is Bare, as the driver's is: MSI page tables map a guest's virtual interrupt files, the
+recognized address being the output of the first stage. In flat mode they would confine a device
+to whole files as the first stage does, so leaving them Off loses no confinement; using them would
+mean translating each domain through the second stage instead of the first.
 
 ---
 

@@ -290,12 +290,16 @@ impl<'a> Command<'a>
             }
             b'H' => parse_set_thread(rest),
             b'T' => Ok(Self::ThreadAlive(parse_thread(rest)?)),
-            b'D' if rest.is_empty() => Ok(Self::Detach),
-            b'D' if rest.starts_with(b";") =>
+            b'D' => match rest
             {
-                parse_u64(&rest[1..])?;
-                Ok(Self::Detach)
-            }
+                [] => Ok(Self::Detach),
+                [b';', pid @ ..] =>
+                {
+                    parse_u64(pid)?;
+                    Ok(Self::Detach)
+                }
+                _ => Ok(Self::Unknown(body)),
+            },
             b'k' if rest.is_empty() => Ok(Self::Kill),
             b'q' | b'Q' => parse_query(body),
             b'v' => parse_v(body),
@@ -316,20 +320,29 @@ fn parse_query(body: &[u8]) -> Result<Command<'_>, Error>
         b"qOffsets" => Command::Offsets,
         b"QStartNoAckMode" => Command::StartNoAckMode,
         b"qSupported" => Command::Supported(b""),
-        _ if body.starts_with(b"qSupported:") => Command::Supported(&body[b"qSupported:".len()..]),
         b"qAttached" => Command::Attached,
-        _ if body.starts_with(b"qAttached:") =>
+        _ =>
         {
-            parse_u64(&body[b"qAttached:".len()..])?;
-            Command::Attached
+            if let Some(features) = body.strip_prefix(b"qSupported:")
+            {
+                Command::Supported(features)
+            }
+            else if let Some(pid) = body.strip_prefix(b"qAttached:")
+            {
+                parse_u64(pid)?;
+                Command::Attached
+            }
+            else if let Some(request) = body.strip_prefix(FEATURES_READ)
+            {
+                let (annex, range) = split_once(request, b':')?;
+                let (offset, len) = addr_len(range)?;
+                Command::FeaturesRead { annex, offset, len }
+            }
+            else
+            {
+                Command::Unknown(body)
+            }
         }
-        _ if body.starts_with(FEATURES_READ) =>
-        {
-            let (annex, range) = split_once(&body[FEATURES_READ.len()..], b':')?;
-            let (offset, len) = addr_len(range)?;
-            Command::FeaturesRead { annex, offset, len }
-        }
-        _ => Command::Unknown(body),
     })
 }
 
@@ -359,9 +372,9 @@ fn parse_v(body: &[u8]) -> Result<Command<'_>, Error>
 /// `:<thread>`.
 fn parse_action(action: &[u8]) -> Result<VContAction, Error>
 {
-    let (verb, thread) = match action.iter().position(|&b| b == b':')
+    let (verb, thread) = match split_at_byte(action, b':')
     {
-        Some(i) => (&action[..i], Some(parse_thread(&action[i + 1..])?)),
+        Some((verb, thread)) => (verb, Some(parse_thread(thread)?)),
         None => (action, None),
     };
     let (resume, signal) = match verb
@@ -471,9 +484,9 @@ fn parse_signal(digits: &[u8]) -> Result<u8, Error>
 /// `<signal>[;addr]`, after the `C` or `S`.
 fn signal_then_addr(rest: &[u8]) -> Result<(u8, Option<u64>), Error>
 {
-    let (signal, addr) = match rest.iter().position(|&b| b == b';')
+    let (signal, addr) = match split_at_byte(rest, b';')
     {
-        Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+        Some((signal, addr)) => (signal, Some(addr)),
         None => (rest, None),
     };
     Ok((parse_signal(signal)?, addr.map(parse_u64).transpose()?))
@@ -512,11 +525,16 @@ fn hex_data(data: &[u8]) -> Result<&[u8], Error>
 /// Split `field` at the first `sep`.
 fn split_once(field: &[u8], sep: u8) -> Result<(&[u8], &[u8]), Error>
 {
-    let i = field
-        .iter()
-        .position(|&b| b == sep)
-        .ok_or(Error::Malformed)?;
-    Ok((&field[..i], &field[i + 1..]))
+    split_at_byte(field, sep).ok_or(Error::Malformed)
+}
+
+/// The bytes of `field` before and after its first `sep`; `None` when it
+/// holds none.
+fn split_at_byte(field: &[u8], sep: u8) -> Option<(&[u8], &[u8])>
+{
+    let i = field.iter().position(|&b| b == sep)?;
+    let (head, tail) = field.split_at_checked(i)?;
+    Some((head, tail.get(1..)?))
 }
 
 #[cfg(test)]

@@ -205,6 +205,61 @@ fn rebase(base: u64, addr: u64, origin: u64) -> Option<u64>
     base.checked_add(addr.checked_sub(origin)?)
 }
 
+/// Copy `seg`'s file bytes from `data` to `dst_phys` and zero its BSS tail,
+/// bytes `[filesz, memsz)`.
+///
+/// # Errors
+///
+/// `BootError::InvalidElf` when the file bytes lie outside `data`, `p_memsz`
+/// is below `p_filesz`, or the BSS address overflows.
+///
+/// # Safety
+///
+/// `dst_phys` must be the start of `seg.memsz` writable, identity-mapped bytes
+/// disjoint from `data`.
+unsafe fn copy_segment(data: &[u8], seg: &elf::LoadSegment, dst_phys: u64)
+-> Result<(), BootError>
+{
+    // p_offset / p_filesz → usize: 64-bit targets only; cast is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let file_off = seg.offset as usize;
+    #[allow(clippy::cast_possible_truncation)]
+    let file_sz = seg.filesz as usize;
+    if file_sz > 0
+    {
+        let src = data
+            .get(file_off..)
+            .ok_or(elf::ElfError::SegmentOverflow)?
+            .as_ptr();
+        // SAFETY: `src` points into `data`; `elf::load_segments` already
+        // validated that `[file_off, file_off + file_sz)` is in bounds
+        // (yields SegmentOverflow otherwise). `dst_phys` holds `memsz ≥ filesz`
+        // bytes disjoint from `data` per the caller's contract.
+        unsafe { core::ptr::copy_nonoverlapping(src, dst_phys as *mut u8, file_sz) };
+    }
+
+    // Difference fits in usize: memsz ≤ allocated region; 64-bit only.
+    let bss_len = seg
+        .memsz
+        .checked_sub(seg.filesz)
+        .ok_or(BootError::InvalidElf("LOAD segment: p_memsz < p_filesz"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let bss_sz = bss_len as usize;
+    if bss_sz > 0
+    {
+        let bss_addr = dst_phys
+            .checked_add(seg.filesz)
+            .ok_or(BootError::InvalidElf(
+                "LOAD segment placement overflows the address space",
+            ))?;
+        // SAFETY: `bss_addr` is `filesz` bytes into the segment's placed
+        // region, which spans `memsz` bytes per the caller's contract.
+        // UEFI does not guarantee zeroed pages; we must zero BSS here.
+        unsafe { core::ptr::write_bytes(bss_addr as *mut u8, 0, bss_sz) };
+    }
+    Ok(())
+}
+
 /// Load the kernel ELF from `data` into physical memory allocated via UEFI.
 ///
 /// The image is placed as a single contiguous span allocated by
@@ -267,10 +322,6 @@ pub unsafe fn load_kernel(
         {
             continue;
         }
-        if segment_count >= MAX_LOAD_SEGMENTS
-        {
-            return Err(BootError::InvalidElf("ELF has more than 8 LOAD segments"));
-        }
         let Some(slot) = raw.get_mut(segment_count)
         else
         {
@@ -312,49 +363,10 @@ pub unsafe fn load_kernel(
             BootError::InvalidElf("LOAD segment placement overflows the address space"),
         )?;
 
-        // Copy file data (filesz bytes) into the placed region.
-        // p_offset / p_filesz → usize: 64-bit targets only; cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
-        let file_off = seg.offset as usize;
-        #[allow(clippy::cast_possible_truncation)]
-        let file_sz = seg.filesz as usize;
-        if file_sz > 0
-        {
-            let src = data
-                .get(file_off..)
-                .ok_or(elf::ElfError::SegmentOverflow)?
-                .as_ptr();
-            let dst = dst_phys as *mut u8;
-            // SAFETY: `src` points into `data`; `elf::load_segments` already
-            // validated that `[file_off, file_off + file_sz)` is in bounds
-            // (yields SegmentOverflow otherwise). `dst` lies within the single
-            // span allocation (`page_count * 4096 ≥ span_bytes ≥ (paddr -
-            // link_phys) + memsz ≥ … + filesz`), identity-mapped in the
-            // bootloader address space and disjoint from the read buffer.
-            unsafe { core::ptr::copy_nonoverlapping(src, dst, file_sz) };
-        }
-
-        // Zero the BSS tail: bytes [filesz, memsz).
-        // Difference fits in usize: memsz ≤ allocated region; 64-bit only.
-        let bss_len = seg
-            .memsz
-            .checked_sub(seg.filesz)
-            .ok_or(BootError::InvalidElf("LOAD segment: p_memsz < p_filesz"))?;
-        #[allow(clippy::cast_possible_truncation)]
-        let bss_sz = bss_len as usize;
-        if bss_sz > 0
-        {
-            let bss_addr = dst_phys
-                .checked_add(seg.filesz)
-                .ok_or(BootError::InvalidElf(
-                    "LOAD segment placement overflows the address space",
-                ))?;
-            let bss_ptr = bss_addr as *mut u8;
-            // SAFETY: `bss_ptr` is `filesz` bytes into the segment's placed
-            // region, which spans `memsz` bytes within the span allocation.
-            // UEFI does not guarantee zeroed pages; we must zero BSS here.
-            unsafe { core::ptr::write_bytes(bss_ptr, 0, bss_sz) };
-        }
+        // SAFETY: `dst_phys` is the segment's place in the span allocated
+        // above (`page_count * 4096 ≥ span_bytes ≥ (paddr - link_phys) +
+        // memsz`), identity-mapped and disjoint from the read buffer.
+        unsafe { copy_segment(data, seg, dst_phys)? };
 
         *slot = LoadedSegment {
             phys_base: dst_phys,

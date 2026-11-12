@@ -1528,11 +1528,9 @@ fn map_trampoline_page(
     flags: paging::PageFlags,
 ) -> Result<(), BootError>
 {
-    page_table.map(phys, phys, 4096, flags).map_err(|e| match e
-    {
-        paging::MapError::OutOfMemory => BootError::OutOfMemory,
-        paging::MapError::WxViolation => BootError::WxViolation,
-    })
+    page_table
+        .map(phys, phys, 4096, flags)
+        .map_err(paging::map_err)
 }
 
 // ── Step 7: Query final memory map ───────────────────────────────────────────

@@ -221,14 +221,14 @@ impl PageTableBuilder for BootPageTable
         // unaligned ELF p_memsz (`build_initial_tables` in core/boot/src/paging.rs).
         let aligned_size = size
             .checked_add(PAGE_SIZE - 1)
-            .ok_or(MapError::OutOfMemory)?
+            .ok_or(MapError::AddressRange)?
             & !(PAGE_SIZE - 1);
 
         let mut offset: u64 = 0;
         while offset < aligned_size
         {
-            let page_virt = virt.checked_add(offset).ok_or(MapError::OutOfMemory)?;
-            let page_phys = phys.checked_add(offset).ok_or(MapError::OutOfMemory)?;
+            let page_virt = virt.checked_add(offset).ok_or(MapError::AddressRange)?;
+            let page_phys = phys.checked_add(offset).ok_or(MapError::AddressRange)?;
             self.map_4k_page(page_virt, page_phys, &flags)?;
             // `aligned_size` is a multiple of `PAGE_SIZE`, so `offset` stays at or
             // below it and the sum cannot overflow.
@@ -273,7 +273,7 @@ impl BootPageTable
                 unsafe { core::slice::from_raw_parts_mut(table_phys as *mut u64, TABLE_ENTRIES) };
             let entry = table
                 .get_mut(table_index(level, virt))
-                .ok_or(MapError::OutOfMemory)?;
+                .ok_or(MapError::AddressRange)?;
             table_phys = self.ensure_table(entry)?;
         }
 
@@ -294,7 +294,7 @@ impl BootPageTable
         }
 
         *pt.get_mut(table_index(0, virt))
-            .ok_or(MapError::OutOfMemory)? = pte;
+            .ok_or(MapError::AddressRange)? = pte;
 
         Ok(())
     }

@@ -295,14 +295,14 @@ impl PageTableBuilder for BootPageTable
         // handled safely. Well-behaved callers always pass aligned sizes.
         let aligned_size = size
             .checked_add(PAGE_SIZE - 1)
-            .ok_or(MapError::OutOfMemory)?
+            .ok_or(MapError::AddressRange)?
             & !(PAGE_SIZE - 1);
 
         let mut offset: u64 = 0;
         while offset < aligned_size
         {
-            let page_virt = virt.checked_add(offset).ok_or(MapError::OutOfMemory)?;
-            let page_phys = phys.checked_add(offset).ok_or(MapError::OutOfMemory)?;
+            let page_virt = virt.checked_add(offset).ok_or(MapError::AddressRange)?;
+            let page_phys = phys.checked_add(offset).ok_or(MapError::AddressRange)?;
             self.map_4k_page(page_virt, page_phys, &flags)?;
             // `aligned_size` is a multiple of `PAGE_SIZE`, so `offset` stays at or
             // below it and the sum cannot overflow.
@@ -353,7 +353,7 @@ impl BootPageTable
         {
             let entry = table
                 .get_mut(vpn_index(level, virt))
-                .ok_or(MapError::OutOfMemory)?;
+                .ok_or(MapError::AddressRange)?;
             let child_phys = self.ensure_table(entry)?;
             // SAFETY: frame from ensure_table is a valid, zeroed-or-live
             // 4 KiB table frame.
@@ -379,7 +379,7 @@ impl BootPageTable
             pte |= PTE_X;
         }
 
-        *l0.get_mut(l0_idx).ok_or(MapError::OutOfMemory)? = pte;
+        *l0.get_mut(l0_idx).ok_or(MapError::AddressRange)? = pte;
 
         Ok(())
     }

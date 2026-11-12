@@ -6,9 +6,9 @@
 //! x86-64 message-signaled interrupt encoding.
 //!
 //! A device raises a message-signaled interrupt by writing the message data to the message
-//! address. The kernel hands out the compatibility format (Intel SDM Vol. 3, the APIC
-//! chapter's "Message Signalled Interrupts" section), since it programs no interrupt
-//! remapping:
+//! address. With interrupt remapping off, the kernel hands out the compatibility format (Intel
+//! SDM Vol. 3, the APIC chapter's "Message Signalled Interrupts" section); with it on
+//! (`SYS_IRQ_REMAP`), the remappable format of [`super::remap`]. The compatibility format:
 //!
 //! - **Address**: `0xFEE` in bits 31:20, the destination APIC id in bits 19:12, redirection
 //!   hint (bit 3) and destination mode (bit 2) clear, so the message is delivered to the one
@@ -17,8 +17,8 @@
 //!   (bit 15) edge, both zero.
 //!
 //! The 8-bit destination field cannot name an x2APIC id of `0xFF` or more, and `0xFF` itself
-//! is the broadcast id, so a message target is placed only on a CPU whose APIC id is below
-//! [`super::ioapic::BROADCAST_APIC_ID`] (`interrupts::alloc_message_target`).
+//! is the broadcast id, so with remapping off a message target is placed only on a CPU whose
+//! APIC id is below [`super::ioapic::BROADCAST_APIC_ID`] (`interrupts::alloc_message_target`).
 
 /// The fixed upper part of every compatibility-format message address (bits 31:20 `0xFEE`).
 pub const MSI_ADDRESS_BASE: u64 = 0xFEE0_0000;

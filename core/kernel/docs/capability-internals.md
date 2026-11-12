@@ -900,11 +900,15 @@ An `InterruptObject` carries one binding (`irq::IrqBinding`): unbound until `SYS
 through it, and then linked in its line's binding list in the IRQ routing table with one bit of the
 line's bound and owing masks (`core/kernel/src/irq.rs`, module doc § Sharing). Since a copy is a
 fresh object, each capability to a line is a binding of its own, and a line holds at most
-`irq::MAX_IRQ_BINDINGS` (64). The object's `dealloc_object` arm removes its binding
+`irq::MAX_IRQ_BINDINGS` (64). The object also carries a `route_held` flag: `SYS_IRQ_ROUTE` through
+it (`irq::route`) stores it `true`, under the IRQ routing lock, and makes the object a holder of its
+line's route, never a copy of it. The object's `dealloc_object` arm removes its binding
 (`irq::unregister`) before the body goes: under the IRQ routing lock it unlinks the binding, clears
 its bits, waits out the delivery running on the line's CPU (`irq::DeliveryGate`, one per CPU), and
 unmasks or releases the line, so no delivery reaches the freed body and the other bindings on the
-line stay. A bound binding holds a counted reference on its Notification's object, taken by
+line stay. It then loads `route_held` (`Relaxed`: the object's last reference is gone) and, when
+set, gives up the route (`irq::drop_route_holder`); the line is released once neither a holder nor a
+binding remains. A bound binding holds a counted reference on its Notification's object, taken by
 `SYS_IRQ_REGISTER` and given up only by the change that takes the notification from the binding (a
 rebind to another notification, or this removal), so a Notification is freed only once no binding
 names it: its teardown makes no IRQ change, and deleting a Notification's capabilities leaves its

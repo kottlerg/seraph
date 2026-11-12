@@ -216,7 +216,8 @@ For each matched device, devmgr:
    device its own single-line `Interrupt` cap for its GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback). The first
    time any device asks for a GSI, devmgr splits the line's cap off its
-   Interrupt range cap; the lines below and above it stay in devmgr's
+   Interrupt range cap and routes the line through it (`SYS_IRQ_ROUTE`, in
+   the line's mode, below); the lines below and above it stay in devmgr's
    interrupt table, so devices are served in any GSI order. devmgr keeps
    the split line cap for the boot in a table of held lines, one entry per
    GSI (`firmware::lines::HeldLines`), and gives the device a derivation of
@@ -225,13 +226,14 @@ For each matched device, devmgr:
    line each bind their own receiver (docs/device-management.md
    § Interrupt Delivery). Releasing a device's caps deletes only its own
    derivation; the line stays held for the others. The device's IRQ comes
-   with its line's `SYS_IRQ_REGISTER` mode, the same for every device on
-   the line. On x86-64 devmgr reads the MADT's Interrupt Source Overrides
-   once at startup (`firmware::acpi::madt_source_overrides`), logging each,
-   and takes the line's trigger and polarity from the override naming its
-   GSI, field by field; a field the override leaves conforming to its bus,
-   and a line no override names, take the PCI default, level-triggered and
-   active-low (`firmware::acpi::line_mode`). A missing MADT, or one whose
+   with its line's mode, the one the route recorded and every binding
+   passes (`SYS_IRQ_REGISTER`), the same for every device on the line. On
+   x86-64 devmgr reads the MADT's Interrupt Source Overrides once at startup
+   (`firmware::acpi::madt_source_overrides`), logging each, and takes the
+   line's trigger and polarity from the override naming its GSI, field by
+   field; a field the override leaves conforming to its bus, and a line no
+   override names, take the PCI default, level-triggered and active-low
+   (`firmware::acpi::line_mode`). A missing MADT, or one whose
    header is malformed, is logged once and every line takes the PCI default;
    a structure malformed partway through ends the walk after the overrides
    before it, logged once (`firmware::acpi::madt_well_formed`), and a line a

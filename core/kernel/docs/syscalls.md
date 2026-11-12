@@ -205,9 +205,11 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  60  SYS_THREAD_READ_MEM
                                  61  SYS_THREAD_WRITE_MEM
                                  62  SYS_IRQ_MSG_ALLOC
+                                 63  SYS_IRQ_ROUTE
+                                 64  SYS_IRQ_REMAP
 ```
 
-**Implementation status.** Every number 0–62 has a handler; unallocated numbers
+**Implementation status.** Every number 0–64 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -1146,13 +1148,33 @@ naming a message-signaled target (§ `SYS_IRQ_MSG_ALLOC`), the message a device 
 the physical address and the 32-bit data word devmgr programs into the device's MSI capability or
 MSI-X table entry before it delivers the driver a copy of the cap, which the driver only binds
 ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
-§ Message-Signaled Interrupts). On x86-64 the address is the target CPU's compatibility-format local
-APIC address (`0xFEE0_0000 | apic_id << 12`, physical destination, no redirection hint) and the data
-its vector (fixed delivery, edge-triggered); on RISC-V the address is the target hart's
+§ Message-Signaled Interrupts). On x86-64, with interrupt remapping off (§ `SYS_IRQ_REMAP`), the
+address is the target CPU's compatibility-format local APIC address (`0xFEE0_0000 | apic_id << 12`,
+physical destination, no redirection hint) and the data its vector (fixed delivery,
+edge-triggered); with it on, the address is in the remappable format, naming the handle of the
+target's remapping entry (`CAP_INFO_IRQ_REMAP_ENTRY`: `0xFEE` in bits 31:20, handle bits 14:0 in
+bits 19:5, the format bit 4, the subhandle-valid bit 3 and handle bit 15 in bit 2), and the data is
+the subhandle, 0; on RISC-V the address is the target hart's
 supervisor-level IMSIC interrupt file and the data the interrupt identity, written to the file's
 `seteipnum_le` register. The address is an interrupt controller's, never RAM
 ([cross-boundary-disclosure.md](cross-boundary-disclosure.md)), so holding the cap answers it. An
 Interrupt cap naming a wired line, or a range, answers `InvalidArgument`.
+
+`CAP_INFO_IRQ_REMAP_ENTRY` (17) returns, for a single-id Interrupt cap naming a routed line
+(§ `SYS_IRQ_ROUTE`) or a message-signaled target, the interrupt remapping entry the source needs
+while the kernel's remappable formats are on (§ `SYS_IRQ_REMAP`): the entry's handle in bits 15:0,
+the vector the entry must deliver in bits 23:16, and the destination CPU's APIC id in bits 63:32
+(`remap_entry_unpack` in `abi/syscall`). The handle is the vector's place among every CPU's device
+vectors laid end to end, `cpu * 217 + (vector - 33)`, so the entry stays the source's from its
+route or mint until its release. devmgr reads it and has the IOMMU driver write the entry before a
+device can raise the source
+([docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming)
+§ IOMMU Discovery and Programming). It answers `InvalidState` with remapping off or for a line not
+routed.
+`CAP_INFO_IRQ_REMAP_HANDLES` (18) returns, for any Interrupt cap, how many handles the boot's CPUs
+can use, every handle below it: `min(cpu_count, 302) * 217`, 302 being the CPUs whose 217 device
+vectors each fit the 16-bit handle. A remapping table needs that many entries. Both answer
+`NotSupported` on RISC-V, whose IMSIC files the IOMMU confines without remapping.
 
 **Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which
 needs the Memory `Phys` right on the queried cap or the credential; `cap_info` otherwise reads
@@ -1164,7 +1186,10 @@ object is gone, or a `CAP_INFO_MEMORY_PHYS_BASE` credential that is not a live M
 credential carrying `Phys`), `InvalidArgument` (field requires a different capability type, the
 selector is unknown, a `CAP_INFO_MEMORY_MAPPINGS` window is empty, longer than
 `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages, or runs past the region, or a
-`CAP_INFO_IRQ_MSG_ADDRESS` or `CAP_INFO_IRQ_MSG_DATA` cap names no message-signaled target).
+`CAP_INFO_IRQ_MSG_ADDRESS` or `CAP_INFO_IRQ_MSG_DATA` cap names no message-signaled target, or a
+`CAP_INFO_IRQ_REMAP_ENTRY` cap is a range), `InvalidState` (`CAP_INFO_IRQ_REMAP_ENTRY` with
+remapping off or on a line not routed), `NotSupported` (either `CAP_INFO_IRQ_REMAP_*` selector on
+RISC-V).
 
 ---
 
@@ -2425,16 +2450,16 @@ references a fresh object over the same line (see
 per bound object, up to `MAX_IRQ_BINDINGS` (64), and receivers sharing a wired line each bind
 through their own capability.
 
-- **Bind.** Through an object with no binding the call adds one. The line's first binding records
-  `mode` and routes the line at its controller in it, to one CPU, the next in turn
-  ([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked; the routing and the
-  mode are kept while any binding remains, so every receiver on the line is signalled from that CPU.
-  The binding holds a counted reference on the notification's object, which keeps the Notification
-  from being freed while the binding names it. The call returns once the delivery running on the
-  line's CPU, if any, has finished, so its mask cannot land after the receiver's first
-  `SYS_IRQ_ACK`. A later binding must pass the recorded mode, and masks the line. Every new binding
-  owes an acknowledgement, so the line stays masked until its receiver's first `SYS_IRQ_ACK`.
-- **Rebind.** Through an object already bound, the call, which must pass the line's recorded mode,
+- **Bind.** Through an object with no binding the call adds one, on a line already routed
+  (§ `SYS_IRQ_ROUTE`) and with the mode the route recorded; the route gave the line its CPU and left
+  it masked, and it keeps both while a route holder or a binding remains, so every receiver on the
+  line is signalled from that CPU. The binding holds a counted reference on the notification's
+  object, which keeps the Notification from being freed while the binding names it. The line's
+  first binding returns once the delivery running on the line's CPU, if any, has finished, so that
+  delivery's mask cannot land after the receiver's first `SYS_IRQ_ACK`. A later binding masks the
+  line. Every new binding owes an acknowledgement, so the line stays masked until its receiver's
+  first `SYS_IRQ_ACK`.
+- **Rebind.** Through an object already bound, the call, which must pass the route's mode,
   rebinds that binding to `notification_cap`'s notification, keeping whether it owes an
   acknowledgement and leaving the line's mask as it is. The binding's reference moves to the new
   notification's object and the replaced notification's is given up, once no delivery can still
@@ -2452,11 +2477,11 @@ through their own capability.
   running on the line's CPU. Deleting a Notification's capabilities removes no binding: the bindings
   stay, and keep the Notification, until their Interrupt objects rebind or are freed. The line
   is then unmasked if bindings remain and none owes, so a receiver that goes cannot hold a shared
-  line masked, and released at its controller when no binding remains; the release forgets the mode,
-  so the line's next first binding records its own.
+  line masked; with no binding left it stays masked while a route holder remains, and is released at
+  its controller once none does (§ `SYS_IRQ_ROUTE`).
 
 A message-signaled target (§ `SYS_IRQ_MSG_ALLOC`) binds through the same call with three
-differences. Its CPU and slot were taken at its mint, so its first binding routes nothing. It
+differences. Its CPU and slot were taken at its mint, so it needs no `SYS_IRQ_ROUTE`. It
 takes one binding, in mode 0 (a device's message is an edge). It is never masked: each message
 ORs bit 0 into the bound notification and completes at the local APIC (x86-64) or needs no
 completion (the IMSIC claim, RISC-V), and its `SYS_IRQ_ACK` changes nothing; a driver that must
@@ -2466,7 +2491,7 @@ since devmgr alone writes the MSI-X table and its per-vector masks
 § Message-Signaled Interrupts). Removing
 its binding frees no slot: the target stays the capability's until the capability is gone.
 
-On x86-64 the line's I/O APIC redirection entry is programmed with the recorded mode: bit 15 set
+On x86-64 the route programs the line's I/O APIC redirection entry with its mode: bit 15 set
 for level-triggered, bit 13 for active-low. A level-triggered entry whose device still asserts at
 the unmask delivers again, so an assertion while the line is masked is not lost (see
 [docs/device-management.md](../../../docs/device-management.md) § Interrupt Delivery for what an
@@ -2481,21 +2506,14 @@ the acknowledgements is delivered again, as on x86-64.
 (Notify rights).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
-`InvalidArgument` (IRQ cap covers more than one line, or names an id no discovered
-interrupt controller implements: on x86-64 a GSI no I/O APIC reports, where the root
-Interrupt cap spans 32768 GSIs; on RISC-V a source outside the APLIC's reported
-`1..=riscv,num-sources`, where the root Interrupt cap spans the APLIC's 1024-id space; see
-[arch-interface.md](arch-interface.md) § Module-level constants and free functions; or `mode`
-sets a bit outside `IRQ_MODE_MASK`, differs from the mode the line's bindings recorded, or is
-not 0 for a message-signaled target),
+`InvalidArgument` (IRQ cap covers more than one line; or `mode` sets a bit outside
+`IRQ_MODE_MASK`, differs from the mode the line is routed in, or is not 0 for a message-signaled
+target), `InvalidState` (the line is not routed, § `SYS_IRQ_ROUTE`; a line no discovered
+interrupt controller implements never is),
 `QuotaExceeded` (the notification's object holds as many references as it may
-(`REF_COUNT_LIMIT`); the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; a
-message-signaled target already holds its one binding, through another object; or, for the
-line's first binding on x86-64, no CPU whose APIC id an I/O APIC can name has a free device IDT
-vector, each CPU having 217, shared with the message-signaled targets on it; a vector is freed
-when its line's last binding is removed; or, for the line's first binding on RISC-V, no CPU's
-IMSIC file has a free interrupt identity; an identity is freed when its line's last binding is
-removed). Nothing changes on an error.
+(`REF_COUNT_LIMIT`); the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; or
+a message-signaled target already holds its one binding, through another object). Nothing changes
+on an error.
 
 ---
 
@@ -2628,9 +2646,12 @@ message (MSI or MSI-X) rather than by asserting a wired line.
 The kernel takes a free slot of the next CPU in turn that has one
 ([arch-interface.md](arch-interface.md) § `interrupts`); the target's id, past every wired line, is
 computed from its CPU and slot.
-On x86-64 the slot is a device IDT vector of a CPU whose APIC id is below `0xFF`, the widest a
-compatibility-format message address names (interrupt remapping is not implemented); on RISC-V it
-is an interrupt identity in the hart's supervisor-level IMSIC file. Wired lines take their slots
+On x86-64 the slot is a device IDT vector of a CPU the kernel's message format can name: with
+interrupt remapping off, a CPU whose APIC id is below `0xFF`, the widest a compatibility-format
+message address names; with it on, a CPU whose index is below 302, whose device vectors have
+remapping handles, and whose APIC id is below `0xFF` unless remapping was turned on with 32-bit
+destinations (§ `SYS_IRQ_REMAP`). On RISC-V it is an interrupt identity in the hart's
+supervisor-level IMSIC file. Wired lines take their slots
 from the same spaces. The call inserts into the caller's `CSpace` an Interrupt capability over
 that one id, unbound, carrying `RIGHTS_IRQ_NOTIFY` only, as a derivation child of
 `authority_cap`, so revoking the authority deletes it.
@@ -2659,6 +2680,103 @@ not carry it.
 or the caller's `CSpace` directory is structurally full), `OutOfMemory` (the caller's `CSpace` pool
 cannot fund the capability's body or slot; a refill cures it), `InvalidState` (the authority's slot
 is held by an in-flight revoke, move, or transfer). Nothing changes on an error.
+
+---
+
+### `SYS_IRQ_ROUTE` (63)
+
+Route a wired interrupt line at its controller, and hold the route through the capability's object.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `irq_cap` | Interrupt capability for one wired line, carrying `RIGHTS_IRQ_MINT` |
+| 1 | `mode` | The line's trigger and polarity, as § `SYS_IRQ_REGISTER` argument 2 |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+A line not routed is routed in `mode`, masked, to one CPU, the next in turn that the kernel's
+current formats can name and that has a free slot ([arch-interface.md](arch-interface.md)
+§ `interrupts`). On x86-64 the line's GSI is given a device IDT vector of that CPU and its I/O
+APIC redirection entry is programmed: with interrupt remapping off (§ `SYS_IRQ_REMAP`) in the
+compatibility format, naming the CPU's APIC id; with it on in the remappable format, naming the
+handle of the vector's remapping entry (`CAP_INFO_IRQ_REMAP_ENTRY`; handle bits 14:0 in entry
+bits 63:49, the format bit 48, handle bit 15 in bit 11, and the vector kept in bits 7:0, which an
+I/O APIC matches against an EOI). On RISC-V the APLIC source is given a target hart and an
+interrupt identity in that hart's supervisor-level IMSIC file. `irq_cap`'s own object becomes the
+route's holder.
+
+A line already routed in `mode` gains the object as a further holder; through an object that holds
+the route already the call changes nothing. The route, and so the line's CPU, slot and mode, lasts
+until neither a holder nor a binding remains: a holder holds it until its object is freed (its
+last capability deleted, consumed by a split, revoked through an ancestor, or torn down with its
+holder's CSpace), and a binding until its own object is (§ `SYS_IRQ_REGISTER`, Unbind). The
+release masks the line, frees its slot and forgets its mode, so the next route may take another
+CPU and record another mode.
+
+Routing is separate from binding so that the line's target is fixed before any receiver can
+unmask it: devmgr routes each line when it carves it from the root Interrupt capability, has the
+IOMMU driver write the line's remapping entry, keeps the routed capability, and hands drivers
+derivations that bind
+([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
+§ Interrupt Delivery). A line bound and unbound by drivers therefore keeps its target for the
+boot.
+
+**Capability requirement:** `irq_cap` must be a single-line Interrupt capability with Mint rights.
+
+**Errors:** `InvalidCapability` (`irq_cap` names no Interrupt capability), `InsufficientRights`
+(it lacks Mint), `InvalidArgument` (it covers more than one id, or names a message-signaled
+target, or an id no discovered interrupt controller implements: on x86-64 a GSI no I/O APIC
+reports, where the root Interrupt cap spans 32768 GSIs; on RISC-V a source outside the APLIC's
+reported `1..=riscv,num-sources`, where the root Interrupt cap spans the APLIC's 1024-id space;
+see [arch-interface.md](arch-interface.md) § Module-level constants and free functions; or `mode`
+sets a bit outside `IRQ_MODE_MASK`, or differs from the mode the line is routed in),
+`QuotaExceeded` (no CPU the current formats can name has a free slot: on x86-64 a device IDT
+vector, each CPU having 217, shared with the message-signaled targets on it; on RISC-V an IMSIC
+interrupt identity; a slot is freed at its line's release; or the line holds as many holders as it
+may). Nothing changes on an error.
+
+---
+
+### `SYS_IRQ_REMAP` (64)
+
+Switch the formats the kernel programs into I/O APIC entries and hands out as message addresses
+to those of an IOMMU's interrupt remapping. x86-64 only.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `authority_cap` | Interrupt capability carrying `RIGHTS_IRQ_MINT` |
+| 1 | `setting` | `IRQ_REMAP_OFF` (0), `IRQ_REMAP_ON` (1), or `IRQ_REMAP_ON_EXTENDED` (2), from `abi/syscall` |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+With remapping off, an I/O APIC entry (§ `SYS_IRQ_ROUTE`) and a message
+(`CAP_INFO_IRQ_MSG_ADDRESS`) name their CPU's APIC id and vector in the compatibility formats.
+With it on, each names the handle of the remapping entry of its CPU and vector,
+`cpu * 217 + (vector - 33)`, and the IOMMU delivers what that entry holds; devmgr reads each
+source's entry (`CAP_INFO_IRQ_REMAP_ENTRY`) and has the IOMMU driver write it before a device can
+raise the source. A source is then placed only on a CPU whose index is below 302, the CPUs whose
+device vectors fit the 16-bit handle; `IRQ_REMAP_ON` also keeps it to APIC ids below `0xFF`, for
+a table whose entries hold 8-bit destinations, and `IRQ_REMAP_ON_EXTENDED` does not, for one whose
+entries hold 32-bit (x2APIC) destinations.
+
+The switch is taken only while no source exists, no line routed and no message-signaled target
+minted, so nothing the kernel programmed or handed out is ever in the other format. devmgr turns
+remapping on once the IOMMU driver has enabled the remapping table, before it routes a line or
+mints a target; when the switch is refused, it has the driver take the table down again
+([docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming)
+§ IOMMU Discovery and Programming).
+
+**Capability requirement:** `authority_cap` must be an Interrupt capability with Mint rights.
+
+**Errors:** `InvalidCapability` (`authority_cap` names no Interrupt capability),
+`InsufficientRights` (it lacks Mint), `InvalidArgument` (another setting), `InvalidState` (a line
+is routed or a message-signaled target is minted), `NotSupported` (RISC-V, where the IOMMU
+confines a device's messages to the IMSIC files its domain maps and the kernel programs no
+remapping). Nothing changes on an error.
 
 ---
 

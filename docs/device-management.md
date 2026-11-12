@@ -402,29 +402,34 @@ address).
 
 Implementation status: the kernel's binding mechanism below, its trigger and polarity mode,
 devmgr's sharing of a line among the devices on it, the kernel's minting of message-signaled
-targets, and devmgr's giving of them to drivers (§ Message-Signaled Interrupts) are implemented;
-VT-d interrupt remapping is design intent
-([#325](https://github.com/kottlerg/seraph/issues/325)).
+targets, devmgr's giving of them to drivers (§ Message-Signaled Interrupts), and VT-d interrupt
+remapping (§ IOMMU Discovery and Programming) are implemented.
 
 A driver receives a wired interrupt line as a single-line `Interrupt` cap and binds it to a
-Notification with `SYS_IRQ_REGISTER`. The kernel models each wired line as a source with up to
+Notification with `SYS_IRQ_REGISTER`; the line was routed first by `SYS_IRQ_ROUTE`, which devmgr
+makes through the cap it carves. The kernel models each wired line as a source with up to
 `MAX_IRQ_BINDINGS` (64) bindings, one per bound Interrupt object; a copy or derivation of an
 Interrupt cap references a fresh object over the same line, so every capability to a line is a
 binding of its own. devmgr splits each PCI device's line once from its range, the first time a
-device on it needs it, holds that cap for the boot, and hands every driver on the line, the first
-included, a derivation of it, so PCI functions that share an `INTx` line are all served
+device on it needs it, routes the line through that cap in the line's mode, holds the cap for the
+boot, and hands every driver on the line, the first included, a derivation of it, so PCI
+functions that share an `INTx` line are all served
 ([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md)
 § Per-Device Capability Creation). The line of a platform record is the exception: devmgr carves
 it exclusive, keeps it, and gives the record's driver, the serial driver for the UART's line, a
 derivation it revokes when it withdraws the driver (devmgr's
 [responsibilities.md § Responsibilities](../services/devmgr/docs/responsibilities.md#responsibilities)).
 
-- **Bind.** `SYS_IRQ_REGISTER` through an unbound object adds a binding; the line's first binding
-  records the call's trigger and polarity mode and routes the line at its controller in it, and
-  every new binding masks the line and owes an acknowledgement, so the line stays masked until
-  the new receiver's first `SYS_IRQ_ACK`. Every later binding passes the same mode, or is refused
-  with `InvalidArgument`. Through a bound object it rebinds that binding to the new notification.
-  A binding past the bound is refused with `QuotaExceeded`.
+- **Route.** `SYS_IRQ_ROUTE` through a single-line Interrupt cap carrying `RIGHTS_IRQ_MINT` routes
+  the line at its controller in the call's trigger and polarity mode, leaves it masked, and makes
+  the cap's object a route holder; a further object routing the line in the same mode becomes
+  another holder, and one in another mode is refused with `InvalidArgument`.
+- **Bind.** `SYS_IRQ_REGISTER` through an unbound object adds a binding to a routed line, refused
+  with `InvalidState` on a line not routed; every new binding masks the line and owes an
+  acknowledgement, so the line stays masked until the new receiver's first `SYS_IRQ_ACK`. Every
+  binding passes the route's mode, or is refused with `InvalidArgument`. Through a bound object it
+  rebinds that binding to the new notification. A binding past the bound is refused with
+  `QuotaExceeded`.
 - **Deliver.** Each assertion masks the line, marks every binding as owing an acknowledgement,
   signals every bound notification, and completes at the controller; an assertion the controller
   forwarded before the mask took effect is delivered too, so a receiver can be signalled again
@@ -449,7 +454,8 @@ derivation it revokes when it withdraws the driver (devmgr's
   binding owes one; a repeated acknowledgement changes nothing.
 - **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,
   or torn down with its holder's CSpace); the line is unmasked when the remaining bindings owe
-  nothing, and released at its controller when none remains. A bound binding holds a reference on
+  nothing, stays routed and masked while a route holder remains with no binding, and is released at
+  its controller once neither a holder nor a binding remains. A bound binding holds a reference on
   its Notification, so deleting the Notification's capabilities leaves the binding in place until
   its Interrupt object rebinds or is freed. A driver that
   dies while its device asserts a level-triggered line leaves the device asserting with no
@@ -460,9 +466,9 @@ derivation it revokes when it withdraws the driver (devmgr's
   § Withdrawal).
 
 The contract is specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md)
-§ `SYS_IRQ_REGISTER` and § `SYS_IRQ_ACK`. On riscv64 the line's APLIC source mode is programmed
-with the mode's trigger and polarity, and the unmask of a level-sensitive source pends it again
-while it is asserted, so an assertion still held at the unmask is delivered
+§ `SYS_IRQ_ROUTE`, § `SYS_IRQ_REGISTER` and § `SYS_IRQ_ACK`. On riscv64 the line's APLIC source
+mode is programmed with the mode's trigger and polarity, and the unmask of a level-sensitive
+source pends it again while it is asserted, so an assertion still held at the unmask is delivered
 (core/kernel/src/arch/riscv64/aia.rs). On x86-64 the line's I/O APIC entry is programmed with the
 mode's trigger and polarity (core/kernel/src/arch/x86_64/ioapic.rs), and a level-triggered entry
 likewise delivers at the unmask an assertion still held. devmgr gives each PCI driver the mode of
@@ -477,12 +483,14 @@ so no later assertion on the line raises one either. The VirtIO interrupt-servic
 read (`ISR_POLL_MS`) clears that assertion and signals the waiting path, so the loss is latency, not
 a hang. A device whose driver asks for message-signaled vectors gets them in place of its wired line
 (below); a vector is its device's alone, so none of this applies to it.
-The kernel delivers each routed line to one CPU, chosen when the line is first bound by taking the
-CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 only CPUs whose
-APIC id an I/O APIC can name (below `0xFF`, the broadcast id) take part. Each x86-64 CPU has its
-own 217 device vectors, shared by the routed lines and the message targets on that CPU, and a route
-or mint fails only when no eligible CPU has a free vector; on riscv64 a hart's IMSIC identities are
-shared the same way by routed APLIC sources and message targets. The mechanism is specified
+The kernel delivers each routed line to one CPU, chosen when the line is routed by taking the
+CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 with interrupt
+remapping off only CPUs whose APIC id an I/O APIC can name (below `0xFF`, the broadcast id) take
+part; with it on (`SYS_IRQ_REMAP`) only CPUs whose index is below 302, and under `IRQ_REMAP_ON`
+whose APIC id is below `0xFF`. Each x86-64 CPU has its own 217 device vectors, shared by the
+routed lines and the message targets on that CPU, and a route or mint fails only when no
+eligible CPU has a free vector; on riscv64 a hart's IMSIC identities are shared the same way by
+routed APLIC sources and message targets. The mechanism is specified
 in [core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md) § `interrupts`.
 
 ### Message-Signaled Interrupts

@@ -57,12 +57,13 @@
 //! among the CPUs whose APIC id the 8-bit physical destination field of a redirection
 //! entry can name: below [`BROADCAST_APIC_ID`] (`0xFF`, which delivers to every CPU;
 //! `interrupts::route_device_irq`). An I/O APIC cannot name a CPU with a wider x2APIC id
-//! without interrupt remapping, which the kernel does not program.
+//! without interrupt remapping (`SYS_IRQ_REMAP`, `super::remap`); with it on, an entry names
+//! a handle, and the CPU's index must be below `super::remap::REMAP_CPU_LIMIT`.
 //!
 //! # Trigger and polarity
 //!
 //! A redirection entry takes its trigger mode (bit 15, set for level) and pin polarity
-//! (bit 13, set for active-low) from the mode its line's first `SYS_IRQ_REGISTER` passed
+//! (bit 13, set for active-low) from the mode its line's `SYS_IRQ_ROUTE` passed
 //! ([`redirection_low`]); the kernel reads no MADT interrupt-source override itself. A
 //! level-triggered entry's Remote IRR, set at delivery, is cleared by the local APIC's EOI,
 //! which the local APIC broadcasts to the I/O APICs (the kernel clears the SVR's EOI-broadcast
@@ -248,7 +249,7 @@ pub fn has_free_vector(cpu: usize) -> bool
 /// Assign a device vector of CPU `cpu` to `slot` (a routed line, or a minted message
 /// target): the next free one in turn of that CPU's row. `None` when every device vector
 /// of `cpu` is assigned, or `cpu` has no row. Called under `irq`'s routing lock, from
-/// `route_device_irq` for a line's first binding and from `alloc_message_target`.
+/// `route_device_irq` for a line's route and from `alloc_message_target`.
 #[cfg(not(test))]
 #[must_use]
 pub fn assign_vector(cpu: usize, slot: Slot) -> Option<u8>

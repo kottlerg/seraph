@@ -114,7 +114,7 @@
 //! read of the slot's entry and exited after its last access to a binding, a
 //! notification and a woken waiter. A source is delivered only through its slot,
 //! on the slot's CPU: a line through the slot its route took (`IrqRoute::target`),
-//! kept from its first binding to its release, and a message target through the
+//! kept from its route to its release, and a message target through the
 //! slot its id names. A change that removes a binding from a slot or a line, or a
 //! notification from a binding, makes the removal with a `SeqCst` store and then
 //! waits out the delivery running on that CPU (`wait_out`, through
@@ -611,9 +611,9 @@ struct IrqRoute
     /// linked at the head and unlinked under the routing lock; the stores are
     /// `SeqCst`, as are a delivery's loads of every link.
     bindings: AtomicPtr<IrqBinding>,
-    /// The mode the line's first binding recorded (module doc § Mode);
-    /// meaningful only while a binding is linked. Read and written only under
-    /// the routing lock, so `Relaxed`.
+    /// The mode the line's route recorded (module doc § Mode); meaningful
+    /// only while the line is routed. Read and written only under the routing
+    /// lock, so `Relaxed`.
     mode: AtomicU32,
     /// Where the line is delivered ([`Target::pack`]), 0 when nowhere: kept
     /// from its route to its release. Read and written only under the routing
@@ -978,7 +978,7 @@ impl Controls for Hardware
 
 /// Link unbound `binding` at the head of `route`'s list with mask bit `bit`,
 /// naming `notification`, and mark it bound and owing ([`LineMasks::take`]).
-/// `first` is the target a line's first binding has just routed the line to,
+/// `first` is the target of a routed line that had no binding until this one,
 /// whose CPU is then waited out: an interrupt latched for the slot's previous
 /// owner can be delivered as the line with an empty list, its mask not yet at
 /// the controller, and waiting it out lands that mask before the receiver's
@@ -1180,11 +1180,10 @@ fn unmask_settled(controls: &impl Controls, irq: u32, route: &IrqRoute)
 /// doc § Mode).
 ///
 /// An unbound binding takes a reference on `holder` and is added to the
-/// source. On a line, the line's first binding records `mode` and routes the
-/// line at its controller in that mode, which leaves it masked; a later binding
-/// masks it. The new binding takes the lowest free bit of the line's masks and
-/// owes an acknowledgement, so the line stays masked until its receiver's first
-/// `SYS_IRQ_ACK`. A line's first binding also waits out the line's CPU, so a
+/// source. On a line, the line must be routed (`SYS_IRQ_ROUTE`, [`route`]) in
+/// `mode`, and the binding masks it. The new binding takes the lowest free
+/// bit of the line's masks and owes an acknowledgement, so the line stays
+/// masked until its receiver's first `SYS_IRQ_ACK`. A line's first binding also waits out the line's CPU, so a
 /// delivery that found no binding has masked the line before this returns
 /// ([`link_line`]). A message target (module doc § Sources) takes one binding,
 /// in mode 0, which its slot's entry then names; it is neither routed nor
@@ -1201,13 +1200,13 @@ fn unmask_settled(controls: &impl Controls, irq: u32, route: &IrqRoute)
 /// `None`.
 ///
 /// # Errors
-/// [`RouteError::NoSuchLine`] when the line is past the table, no controller
-/// implements it, or the message target is not minted;
-/// [`RouteError::ModeMismatch`] when the line has bindings and `mode` differs
-/// from the one they recorded, or a message target is passed a mode other than
-/// 0; [`RouteError::Exhausted`] when the controller cannot assign the line's
-/// first binding a delivery resource; [`RouteError::TooManyBindings`] when the
-/// line holds [`MAX_IRQ_BINDINGS`] bindings, or the message target holds one;
+/// [`RouteError::NoSuchLine`] when the line is past the table, or the message
+/// target is not minted; [`RouteError::NotRouted`] when the line is not
+/// routed, which a line no controller implements never is;
+/// [`RouteError::ModeMismatch`] when `mode` differs from the one the line's
+/// route recorded, or a message target is passed a mode other than 0;
+/// [`RouteError::TooManyBindings`] when the line holds [`MAX_IRQ_BINDINGS`]
+/// bindings, or the message target holds one;
 /// [`RouteError::ReferenceLimit`] when `holder` can take no further reference.
 /// Nothing changes on error.
 ///

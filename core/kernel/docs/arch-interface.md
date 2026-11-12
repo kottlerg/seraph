@@ -529,7 +529,7 @@ pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);
 
-/// Route a device IRQ to a destination CPU in `mode` (the `SYS_IRQ_REGISTER`
+/// Route a device IRQ to a destination CPU in `mode` (the `SYS_IRQ_ROUTE`
 /// trigger and polarity word) and leave it masked at the controller; the
 /// driver unmasks via `SYS_IRQ_ACK`. x86-64 assigns the GSI a device IDT vector
 /// of the chosen CPU and installs its IOAPIC redirection entry with `mode`'s
@@ -539,20 +539,21 @@ pub fn unmask(irq: u32);
 /// slot (`irq::Target`), which `irq` keeps for `unroute_device_irq`. Fails with
 /// `irq::RouteError::NoSuchLine` for a line no discovered controller implements,
 /// `Exhausted` when no eligible CPU has a free slot (x86-64: a free device
-/// vector; RISC-V: a free IMSIC identity). Called by `irq::register` for a
-/// line's first binding, under its routing lock.
+/// vector; RISC-V: a free IMSIC identity). Called by `irq::route` for a line not
+/// yet routed, under its routing lock.
 pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<irq::Target, irq::RouteError>;
 /// Release a routed line: mask it and free what `route_device_irq` assigned at
 /// `target` (the x86-64 device vector of that CPU; the RISC-V IMSIC identity).
-/// Called by `irq` when a line's last binding is removed, under its routing lock.
+/// Called by `irq` when neither a route holder nor a binding remains on the line,
+/// under its routing lock.
 pub unsafe fn unroute_device_irq(irq: u32, target: irq::Target);
 
 /// Give a message-signaled target a slot: the next free one of the next CPU in turn
 /// (`irq::next_target_cpu`) that has one, its slot entry left unbound. On x86-64 only
-/// CPUs whose APIC id a compatibility-format message address names (below `0xFF`) take
-/// part. Every slot is enabled at its controller from boot, so nothing else is
-/// programmed. Fails with `Exhausted` when no eligible CPU has a free slot. Called by
-/// `irq::alloc_message` under the routing lock.
+/// CPUs the current format can name take part: with remapping off, those whose APIC id a
+/// compatibility-format message address names (below `0xFF`). Every slot is enabled at its
+/// controller from boot, so nothing else is programmed. Fails with `Exhausted` when no
+/// eligible CPU has a free slot. Called by `irq::alloc_message` under the routing lock.
 pub fn alloc_message_target() -> Result<irq::Target, irq::RouteError>;
 /// Free the slot `target` of a message-signaled target whose slot entry no binding
 /// holds. Called by `irq::free_message` under the routing lock, once no binding and no
@@ -563,16 +564,32 @@ pub fn free_message_target(target: irq::Target);
 /// past the boot CPUs or the slot is not a device slot.
 pub fn slot_entry(target: irq::Target) -> Option<&'static irq::SlotEntry>;
 /// The message a device writes to raise `target`: the physical address (x86-64:
-/// `0xFEE0_0000 | apic_id << 12`, compatibility format; RISC-V: the hart's
-/// supervisor-level IMSIC file, `None` when it has none) and the data (x86-64:
-/// the vector, fixed delivery, edge; RISC-V: the identity). Read by
-/// `SYS_CAP_INFO` (`CAP_INFO_IRQ_MSG_ADDRESS`, `CAP_INFO_IRQ_MSG_DATA`).
+/// `0xFEE0_0000 | apic_id << 12` in compatibility format, the handle in remappable
+/// format; RISC-V: the hart's supervisor-level IMSIC file, `None` when it has none) and the
+/// data (x86-64: the vector, fixed delivery, edge, or the subhandle 0 in remappable format;
+/// RISC-V: the identity). Read by `SYS_CAP_INFO` (`CAP_INFO_IRQ_MSG_ADDRESS`,
+/// `CAP_INFO_IRQ_MSG_DATA`).
 pub fn message_address(target: irq::Target) -> Option<u64>;
 pub fn message_data(target: irq::Target) -> u32;
 /// Number of interrupt lines the discovered controllers implement, which sizes
 /// the `irq` routing table (`irq::init_table`) at Phase 5: one past the highest I/O APIC GSI on
 /// x86-64 (capped at `ROOT_IRQ_COUNT`), the APLIC's `riscv,num-sources` plus one on RISC-V.
 pub fn irq_line_count() -> u32;
+
+/// Switch the formats the kernel hands out (`irq::Remap`: off, on with 8-bit
+/// destinations, on with 32-bit ones). Called by `irq::set_remap` under the routing
+/// lock, with no source holding a slot. x86-64 then names a handle in an I/O APIC
+/// entry or a message (`arch/x86_64/remap.rs`); RISC-V fails with
+/// `irq::RemapError::NotSupported`.
+pub fn set_remap(remap: irq::Remap) -> Result<(), irq::RemapError>;
+/// The remapping entry an IOMMU needs for `target`, packed for `SYS_CAP_INFO`'s
+/// `CAP_INFO_IRQ_REMAP_ENTRY` (x86-64: the handle in bits 15:0, the vector in bits 23:16
+/// and the CPU's APIC id in bits 63:32). Fails with `irq::RemapError::State` with
+/// remapping off or for a target with no handle, `NotSupported` on RISC-V.
+pub fn remap_entry(target: irq::Target) -> Result<u64, irq::RemapError>;
+/// The handles the remapping table needs for this boot's CPUs, for `SYS_CAP_INFO`'s
+/// `CAP_INFO_IRQ_REMAP_HANDLES`. `NotSupported` on RISC-V.
+pub fn remap_handles() -> Result<u64, irq::RemapError>;
 
 /// Send a TLB-shootdown or wakeup IPI to the CPU with the given hardware id
 /// (APIC id on x86-64; hart id on RISC-V).
@@ -601,14 +618,16 @@ returns for the claimed identity of the hart's IMSIC row, which `dispatch_extern
 routed: the boot CPUs in turn, by logical index (`irq::next_target_cpu`), so device
 interrupts spread over the CPUs rather than all landing on the boot CPU. A message-signaled
 target takes its CPU the same way at its mint. On x86-64 the turn skips CPUs with no free device
-vector, and CPUs whose APIC id is `0xFF` or above: an I/O APIC redirection entry cannot name a wider
-id in physical destination mode (the kernel programs no interrupt remapping), and `0xFF` is the
+vector, and, with interrupt remapping off, CPUs whose APIC id is `0xFF` or above: an I/O APIC
+redirection entry cannot name a wider id in physical destination mode, and `0xFF` is the
 broadcast id, which delivers to every CPU; a compatibility-format message address has the same
-8-bit destination field. On RISC-V the turn
+8-bit destination field. With remapping on (`SYS_IRQ_REMAP`) the turn skips CPUs whose index is
+`302` or above (`REMAP_CPU_LIMIT`) and, under `IRQ_REMAP_ON`, CPUs whose APIC id is `0xFF` or
+above; `IRQ_REMAP_ON_EXTENDED` places a source on any APIC id. On RISC-V the turn
 skips CPUs whose IMSIC file has no free identity, and the line's APLIC source targets an
 identity in the chosen hart's supervisor-level IMSIC file, so exactly one hart takes and
-claims it. The line's first binding chooses the CPU, and the line keeps it while any binding
-remains; a line bound again after its last binding went takes the next CPU in turn.
+claims it. The line's route chooses the CPU, and the line keeps it until it is released, once
+neither a route holder nor a binding remains; the next route takes the next CPU in turn.
 
 Per-CPU table allocation that exists on one architecture only (on x86-64 the GDT/TSS, AP IST
 stacks, NMI-backtrace storage, and the device-vector rows; on RISC-V each CPU's IMSIC identity

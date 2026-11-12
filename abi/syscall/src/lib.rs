@@ -431,7 +431,8 @@ pub const CAP_INFO_ASPACE_TERMINAL_FAULT: u64 = 14;
 /// Interrupt only — the message address a device writes to raise the
 /// message-signaled interrupt the capability names (one minted by
 /// `SYS_IRQ_MSG_ALLOC`): on `x86_64` the local APIC's compatibility-format
-/// address of the target CPU, on riscv64 the physical address of the target
+/// address of the target CPU (with remapping on, the remappable-format address
+/// naming the target's handle), on riscv64 the physical address of the target
 /// hart's supervisor-level IMSIC interrupt file. devmgr programs it, with
 /// [`CAP_INFO_IRQ_MSG_DATA`], into the device's MSI capability or MSI-X table
 /// entry before it delivers the driver a copy of the capability, which the
@@ -902,12 +903,12 @@ pub const MEM_UNMAP_RECLAIM_PTS: u64 = 0x1;
 /// `SYS_IRQ_REGISTER` mode (arg2): the line is level-triggered. Clear, it is
 /// edge-triggered.
 ///
-/// Every binding on a line passes the same mode: the line's first binding
-/// records it, and a binding with another mode is refused with
-/// `InvalidArgument` until the line's last binding goes. x86-64 programs the
-/// line's I/O APIC redirection entry from it, riscv64 the line's APLIC source
-/// mode. See
-/// `core/kernel/docs/syscalls.md` § `SYS_IRQ_REGISTER`.
+/// A line's route (`SYS_IRQ_ROUTE`) records the mode, and every binding on the
+/// line passes it: a binding with another mode is refused with
+/// `InvalidArgument`, and so is a route in another mode, until the line is
+/// released. x86-64 programs the line's I/O APIC redirection entry from it,
+/// riscv64 the line's APLIC source mode. See `core/kernel/docs/syscalls.md`
+/// § `SYS_IRQ_REGISTER`.
 pub const IRQ_MODE_LEVEL: u64 = 1 << 0;
 
 /// `SYS_IRQ_REGISTER` mode (arg2): the line asserts low. Clear, it asserts

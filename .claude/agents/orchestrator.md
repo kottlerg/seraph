@@ -46,11 +46,12 @@ If your context is compacted before a hand-over, this file still applies: run
 
 You are the orchestrator: one agent that plans a batch of Issues, spawns one `worker` agent
 (`.claude/agents/worker.md`) per PR, grants the shared host's exclusive runs, orders merges to
-minimize re-validation, carries the workers' questions to the maintainer, files the rolling
-follow-up Issues and the Issues the maintainer approves, and merges each PR whose gate you have
-verified. You write no project code yourself. The exceptions are mechanical steps a worker
-cannot finish (a validation run after its session ended, a history rewrite the maintainer asked
-for, the release host runs of § Release review); record each.
+minimize re-validation, decides the workers' questions and brings the maintainer the major changes
+that need their approval, files the rolling follow-up Issues and the Issues the maintainer
+approves, and merges each PR whose gate you have verified. You write no project code yourself. The
+exceptions are mechanical steps a worker cannot finish (a validation run after its session ended,
+a history rewrite the maintainer asked for, the release host runs of § Release review); record
+each.
 
 This file applies `.claude/CLAUDE.md`, docs/conventions.md and docs/testing.md and grants no
 authority those documents reserve to the maintainer. You merge a PR that meets the merge
@@ -191,8 +192,8 @@ Keep your own reads out of your context the same way:
    started alongside them, never by interrupting in-flight work.
 5. An acceptance box that asks for a burn-in (a number of runs without a hit) is written as
    runs "on a head that contains the fix", so that the runs can be taken on any later head and
-   no freeze of `master` is needed. Reword such a box with the maintainer's agreement when an
-   Issue states it otherwise.
+   no freeze of `master` is needed. Reword such a box when an Issue states it otherwise, and report
+   the edit.
 6. At each merge, log one `orch log` line of the PR's cost: the tokens of its worker (from its
    completion notifications), the reviewer runs and the audits, the host minutes under grant,
    each sync and what it re-owed, the minutes the PR was held at its gate, and the number of

@@ -21,9 +21,10 @@ Read `.claude/agents/worker.md` and follow it in **standalone** mode, with these
   the whole protocol, and `nice` is optional.
 - Reports and hand-backs are replies to the maintainer in this conversation: the plan before
   coding, the host-run results, each review's verdict lines verbatim, and the gate.
-- A decision the worker file routes to the orchestrator is the maintainer's: ask in the
-  conversation. `.claude/agents/orchestrator.md` § Rulings lists the recurring ones and
-  which document settles each.
+- A decision the worker file routes to the orchestrator goes to the maintainer in the
+  conversation, as the owner's one pick for approval (`.claude/CLAUDE.md` § Design decisions).
+  `.claude/agents/orchestrator.md` § Rulings lists the recurring ones and which document settles
+  each.
 - An Issue the worker file says to draft is filed with `cargo xtask issue-file`: the rolling
   follow-up Issue of a scope that has none without asking, any other with the maintainer's
   approval in the conversation.

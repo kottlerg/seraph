@@ -100,10 +100,11 @@ The turns the orchestrator starts after the gate end the same way: a composition
 (§ Composition check) and a stand-down hand back their one line.
 
 Some decisions are not yours: widening the task beyond § Scope and branches, a contested review
-finding, a design choice an Issue leaves open, filing an Issue. Put each to the orchestrator as
-a question with your recommendation, and keep working on everything that does not depend on the
-answer, on your recommendation. Hand back for it only when nothing else is left. Draft an Issue
-body in the scratchpad and name its path; filing is the orchestrator's.
+finding, a decision larger than your PR (§ Authorities), filing an Issue. Put each to the
+orchestrator as one pick with its reasons, its downsides and what you read, and keep working on
+everything that does not depend on the answer, on your pick. Hand back for it only when nothing
+else is left. Draft an Issue body in the scratchpad and name its path; filing is the
+orchestrator's.
 
 Asked by the orchestrator for a status line (a grant watch), record it as above; the
 orchestrator reads it at its next tick.
@@ -146,8 +147,8 @@ Run `git fetch origin` at the start of every step, so each step reads the curren
   is applied, so every copy lands together.
 - Read every Issue item against the current code before fixing it. An item already fixed is
   ticked citing the PR that fixed it (`git log -S`, `git blame`). An item that is wrong on the
-  code is dropped as docs/conventions.md § Acceptance checklist discipline says, with the
-  evidence in an Issue comment.
+  code goes to the one you report to with the evidence (file and line); that one decides the
+  drop and edits the Issue, as docs/conventions.md § Acceptance checklist discipline says.
 
 ## Code and tests
 

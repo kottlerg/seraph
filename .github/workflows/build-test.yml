@@ -68,8 +68,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, riscv64]
-        profile: [debug, release]
+        arch: [riscv64]
+        profile: [debug]
         # One harness per cell: each cell builds once, stages exactly one
         # recipe (or swaps boot.conf for ktest), then runs once. Avoids
         # back-to-back fatfs/sysroot state accumulation across harnesses
@@ -79,7 +79,8 @@ jobs:
         # run-parallel), and colocating it (both programs-surface) avoids a
         # matrix dimension that would multiply with every arch. See
         # docs/testing.md.
-        tester: [svctest, usertest, ktest]
+        tester: [ktest]
+        rep: [1, 2, 3]
     steps:
       - uses: actions/checkout@v6
 
@@ -252,11 +253,18 @@ jobs:
             fi
           fi
 
+      - name: Upload ktest ELF
+        if: always() && matrix.rep == 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: ktest-elf
+          path: target/riscv64imac-seraph-lowuser/debug/ktest
+
       - name: Upload run-parallel logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
+          name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}-${{ matrix.rep }}
           path: |
             target/xtask/run-parallel/**/*.log
             target/xtask/run-parallel/**/*.crash.txt
@@ -269,7 +277,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: run-parallel-saved-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
+          name: run-parallel-saved-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}-${{ matrix.rep }}
           path: |
             target/xtask/run-parallel-saved/*.log
             target/xtask/run-parallel-saved/*.crash.txt

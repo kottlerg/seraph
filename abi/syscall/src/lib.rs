@@ -1627,7 +1627,7 @@ mod tests
         assert_eq!(pack_project_version("0.1.4-rc.7"), (1 << 16) | 4);
         assert_eq!(
             pack_project_version("10.20.30.40"),
-            (10 << 32) | (20 << 16) | 30
+            (0xa << 32) | (0x14 << 16) | 0x1e
         );
         assert_eq!(pack_project_version(""), 0);
     }

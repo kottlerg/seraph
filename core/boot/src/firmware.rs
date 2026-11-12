@@ -165,7 +165,7 @@ mod tests
     fn full_list_including_the_bsp_fits_exactly()
     {
         let mut out = vec![0u32; cpu_id_capacity(MAX_CPUS)];
-        let (count, truncated) = place_cpu_ids(0, 0..MAX_CPUS as u32, &mut out);
+        let (count, truncated) = place_cpu_ids(0, 0..u32::try_from(MAX_CPUS).unwrap(), &mut out);
         assert_eq!(count as usize, MAX_CPUS);
         assert!(!truncated);
     }
@@ -174,9 +174,10 @@ mod tests
     fn full_list_omitting_the_bsp_drops_the_last_ap_and_says_so()
     {
         let mut placed = vec![0u32; cpu_id_capacity(MAX_CPUS)];
-        let (count, truncated) = place_cpu_ids(0, 1..=MAX_CPUS as u32, &mut placed);
+        let (count, truncated) =
+            place_cpu_ids(0, 1..=u32::try_from(MAX_CPUS).unwrap(), &mut placed);
         assert_eq!(count as usize, MAX_CPUS);
-        assert_eq!(placed[MAX_CPUS - 1], MAX_CPUS as u32 - 1);
+        assert_eq!(placed[MAX_CPUS - 1], u32::try_from(MAX_CPUS).unwrap() - 1);
         assert!(truncated);
     }
 

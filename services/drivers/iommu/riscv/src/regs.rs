@@ -612,7 +612,7 @@ mod tests
             })
         );
         // DDT entry not valid (258) keeps its full cause.
-        let w0 = 258 | (2 << 34) | (0x10 << 40);
+        let w0 = 0x102 | (0x2 << 34) | (0x10 << 40);
         assert_eq!(decode_fault([w0, 0, 0, 0]).map(|f| f.cause), Some(258));
         assert_eq!(decode_fault([273, 0, 0, 0]), None);
     }

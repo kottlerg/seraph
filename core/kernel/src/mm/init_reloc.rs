@@ -268,7 +268,7 @@ mod tests
             seg(0x30c8, 0x20_00c8, 0xf38, SegmentFlags::ReadWrite),
             seg(0x4c20, 0x30_0c20, 0x9c0, SegmentFlags::ReadWrite),
         ]);
-        assert!(apply_relro(&mut segs, &mut count, 0x1000, 0x20c8, 0xf38).is_ok());
+        apply_relro(&mut segs, &mut count, 0x1000, 0x20c8, 0xf38).unwrap();
         assert_eq!(count, 3);
         assert!(matches!(segs[1].flags, SegmentFlags::Read));
         assert!(matches!(segs[2].flags, SegmentFlags::ReadWrite));
@@ -281,7 +281,7 @@ mod tests
         // One RW segment [0x3000, 0x6000); relro covers its first page only.
         let (mut segs, mut count) =
             seg_table(&[seg(0x3000, 0x20_0000, 0x3000, SegmentFlags::ReadWrite)]);
-        assert!(apply_relro(&mut segs, &mut count, 0, 0x3000, 0x800).is_ok());
+        apply_relro(&mut segs, &mut count, 0, 0x3000, 0x800).unwrap();
         assert_eq!(count, 2);
         assert!(matches!(segs[0].flags, SegmentFlags::Read));
         assert_eq!(segs[0].virt_addr, 0x3000);
@@ -297,10 +297,10 @@ mod tests
     {
         let (mut segs, mut count) =
             seg_table(&[seg(0x3000, 0x20_0000, 0x2000, SegmentFlags::ReadWrite)]);
-        assert!(apply_relro(&mut segs, &mut count, 0, 0, 0).is_ok());
+        apply_relro(&mut segs, &mut count, 0, 0, 0).unwrap();
         assert!(matches!(segs[0].flags, SegmentFlags::ReadWrite));
         // Range starting mid-segment (not a prefix) is skipped.
-        assert!(apply_relro(&mut segs, &mut count, 0, 0x4000, 0x1000).is_ok());
+        apply_relro(&mut segs, &mut count, 0, 0x4000, 0x1000).unwrap();
         assert!(matches!(segs[0].flags, SegmentFlags::ReadWrite));
         assert_eq!(count, 1);
     }
@@ -314,7 +314,7 @@ mod tests
         let (mut segs, mut count) = seg_table(&full);
         assert!(apply_relro(&mut segs, &mut count, 0, 0x3000, 0x800).is_err());
         let (mut segs, _) = seg_table(&full);
-        let mut past = INIT_MAX_SEGMENTS as u32 + 1;
+        let mut past = u32::try_from(INIT_MAX_SEGMENTS).unwrap() + 1;
         assert!(apply_relro(&mut segs, &mut past, 0, 0x3000, 0x800).is_err());
     }
 

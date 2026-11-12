@@ -647,7 +647,7 @@ mod tests
         let mut round = raw(false, &[1], &[kind::IO_PORT, 0x3F8, 8]);
         round.data_words = MSG_DATA_WORDS_MAX + 1;
         assert_eq!(list.absorb(&round), Err(ListError::Malformed(0)));
-        assert!(list.resources().is_empty());
+        assert_eq!(list.resources(), []);
     }
 
     #[test]
@@ -752,7 +752,7 @@ mod tests
             dma: 0,
         })])
         .expect("end round alone");
-        assert!(list.resources().is_empty());
+        assert_eq!(list.resources(), []);
         assert_eq!(list.endpoints().map(|e| e.dma), Some(0));
         assert_eq!(list.caps().collect::<Vec<_>>(), [20, 21]);
     }
@@ -925,7 +925,7 @@ mod tests
     #[test]
     fn platform_delivery_without_a_line_has_none()
     {
-        let rounds = [Round::mmio(11, None, 0x101000, 0x1000), ends(20, 21)];
+        let rounds = [Round::mmio(11, None, 0x10_1000, 0x1000), ends(20, 21)];
         let list = decoded(&rounds).expect("well-formed list");
         let got = PlatformDelivery::from_list(&list).expect("a platform delivery");
         assert_eq!(got.wired, None);

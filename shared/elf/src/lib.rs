@@ -2423,7 +2423,7 @@ mod tests
     const DRIVER_SECTION: &str = ".note.seraph.driver";
     const NT_DRIVER: u32 = process_abi::NT_SERAPH_DRIVER;
 
-    fn streamed<'a>(img: &'a [u8]) -> impl FnMut(u64, &mut [u8]) -> Option<usize> + 'a
+    fn streamed(img: &[u8]) -> impl FnMut(u64, &mut [u8]) -> Option<usize> + '_
     {
         move |off, dst| {
             let start = usize::try_from(off).ok()?;

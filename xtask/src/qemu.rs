@@ -1051,15 +1051,15 @@ mod tests
     #[test]
     fn cpus_out_of_range_rejected()
     {
-        assert!(build_qemu_argv(&riscv_spec(0, 512)).is_err());
+        build_qemu_argv(&riscv_spec(0, 512)).unwrap_err();
         let past = u32::try_from(boot_protocol::MAX_CPUS + 1).unwrap();
-        assert!(build_qemu_argv(&riscv_spec(past, 512)).is_err());
+        build_qemu_argv(&riscv_spec(past, 512)).unwrap_err();
     }
 
     #[test]
     fn mem_zero_rejected()
     {
-        assert!(build_qemu_argv(&riscv_spec(4, 0)).is_err());
+        build_qemu_argv(&riscv_spec(4, 0)).unwrap_err();
     }
 
     #[test]
@@ -1200,9 +1200,9 @@ mod tests
     {
         let err = check_x86_paging(X86Paging::Five, Accel::Kvm, false).unwrap_err();
         assert!(err.to_string().contains("SERAPH_ACCEL=tcg"));
-        assert!(check_x86_paging(X86Paging::Five, Accel::Kvm, true).is_ok());
-        assert!(check_x86_paging(X86Paging::Five, Accel::Tcg, false).is_ok());
-        assert!(check_x86_paging(X86Paging::Four, Accel::Kvm, false).is_ok());
+        check_x86_paging(X86Paging::Five, Accel::Kvm, true).unwrap();
+        check_x86_paging(X86Paging::Five, Accel::Tcg, false).unwrap();
+        check_x86_paging(X86Paging::Four, Accel::Kvm, false).unwrap();
     }
 
     /// The `virtio-blk-pci` device argument backed by `drive`.

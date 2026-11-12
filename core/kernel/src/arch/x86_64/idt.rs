@@ -1923,7 +1923,12 @@ mod tests
         assert_eq!((e.type_attr >> 5) & 3, 0);
         assert_eq!(e.ist & 0x7, 3);
         assert_eq!(e.selector, KERNEL_CS);
-        assert_eq!(e._reserved, 0);
+        #[expect(
+            clippy::used_underscore_binding,
+            reason = "the test checks the reserved word the CPU requires to be zero"
+        )]
+        let reserved = e._reserved;
+        assert_eq!(reserved, 0);
     }
 
     #[test]
@@ -1931,8 +1936,8 @@ mod tests
     {
         let handler: u64 = 0x1234_5678_9ABC_DEF0;
         let e = IdtEntry::new(handler, 0, 0);
-        assert_eq!(e.offset_low as u64, handler & 0xFFFF);
-        assert_eq!(e.offset_mid as u64, (handler >> 16) & 0xFFFF);
-        assert_eq!(e.offset_high as u64, (handler >> 32) & 0xFFFF_FFFF);
+        assert_eq!(u64::from(e.offset_low), handler & 0xFFFF);
+        assert_eq!(u64::from(e.offset_mid), (handler >> 16) & 0xFFFF);
+        assert_eq!(u64::from(e.offset_high), (handler >> 32) & 0xFFFF_FFFF);
     }
 }

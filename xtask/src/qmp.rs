@@ -306,7 +306,7 @@ mod tests
         use std::os::unix::ffi::OsStrExt;
 
         let path = Path::new(OsStr::from_bytes(b"/w/\xff.bin"));
-        assert!(exec_save_uri(path).is_err());
-        assert!(exec_restore_uri(path).is_err());
+        exec_save_uri(path).unwrap_err();
+        exec_restore_uri(path).unwrap_err();
     }
 }

@@ -179,7 +179,7 @@ mod tests
     fn a_failed_derivation_keeps_the_line_held()
     {
         let mut lines = HeldLines::new();
-        let result = lines.derive(35, |g| Ok(g), |_held| Err::<u32, &str>("no slot"));
+        let result = lines.derive(35, Ok, |_held| Err::<u32, &str>("no slot"));
         assert_eq!(result, Err(LineError::Derive("no slot")));
         assert_eq!(lines.held(35), Some(35));
         // The next device on the line derives from the same held cap.

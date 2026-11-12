@@ -1022,10 +1022,10 @@ mod tests
     fn a_field_is_one_bounded_line()
     {
         assert_eq!(one_line("x", "  a b  ").unwrap(), "a b");
-        assert!(one_line("x", "   ").is_err());
-        assert!(one_line("x", "a\nb").is_err());
-        assert!(one_line("x", &"a".repeat(LINE_MAX)).is_ok());
-        assert!(one_line("x", &"a".repeat(LINE_MAX + 1)).is_err());
+        one_line("x", "   ").unwrap_err();
+        one_line("x", "a\nb").unwrap_err();
+        one_line("x", &"a".repeat(LINE_MAX)).unwrap();
+        one_line("x", &"a".repeat(LINE_MAX + 1)).unwrap_err();
     }
 
     #[test]
@@ -1084,9 +1084,9 @@ mod tests
     fn a_worker_change_is_checked()
     {
         let mut state = fresh();
-        assert!(apply(&mut state, &worker("W1", &[("phase", "napping")]), NOW).is_err());
-        assert!(apply(&mut state, &worker("W1", &[]), NOW).is_err());
-        assert!(apply(&mut state, &Change::WorkerRemove("W1".to_owned()), NOW).is_err());
+        apply(&mut state, &worker("W1", &[("phase", "napping")]), NOW).unwrap_err();
+        apply(&mut state, &worker("W1", &[]), NOW).unwrap_err();
+        apply(&mut state, &Change::WorkerRemove("W1".to_owned()), NOW).unwrap_err();
         apply(&mut state, &worker("W1", &[("phase", "gate")]), NOW).unwrap();
         apply(&mut state, &Change::WorkerRemove("W1".to_owned()), NOW).unwrap();
         assert!(state["workers"].as_object().unwrap().is_empty());
@@ -1104,18 +1104,21 @@ mod tests
             holder: holder.to_owned(),
             commands: "boundary set".to_owned(),
         };
-        assert!(apply(&mut state, &Change::GrantClear, NOW).is_err());
+        apply(&mut state, &Change::GrantClear, NOW).unwrap_err();
         apply(&mut state, &queue("W1"), NOW).unwrap();
         apply(&mut state, &queue("W2"), NOW).unwrap();
         apply(&mut state, &grant("W1"), NOW).unwrap();
         assert_eq!(text(&state["grant"], "since"), NOW);
         // Granting takes the holder out of the queue.
         assert_eq!(state["queue"].as_array().unwrap().len(), 1);
-        assert!(apply(&mut state, &grant("W2"), NOW).is_err());
+        apply(&mut state, &grant("W2"), NOW).unwrap_err();
         apply(&mut state, &Change::GrantClear, NOW).unwrap();
         apply(&mut state, &grant("W2"), NOW).unwrap();
-        assert!(state["queue"].as_array().unwrap().is_empty());
-        assert!(apply(&mut state, &Change::Unqueue("W2".to_owned()), NOW).is_err());
+        assert_eq!(
+            state["queue"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
+        apply(&mut state, &Change::Unqueue("W2".to_owned()), NOW).unwrap_err();
     }
 
     #[test]
@@ -1128,10 +1131,13 @@ mod tests
             file: Some("scratch/q.md".to_owned()),
         };
         apply(&mut state, &ask("Q1"), NOW).unwrap();
-        assert!(apply(&mut state, &ask("Q1"), NOW).is_err());
-        assert!(apply(&mut state, &Change::QuestionClose("Q2".to_owned()), NOW).is_err());
+        apply(&mut state, &ask("Q1"), NOW).unwrap_err();
+        apply(&mut state, &Change::QuestionClose("Q2".to_owned()), NOW).unwrap_err();
         apply(&mut state, &Change::QuestionClose("Q1".to_owned()), NOW).unwrap();
-        assert!(state["questions"].as_array().unwrap().is_empty());
+        assert_eq!(
+            state["questions"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]
@@ -1140,8 +1146,8 @@ mod tests
         let mut state = fresh();
         apply(&mut state, &Change::RulingAdd("first".to_owned()), NOW).unwrap();
         apply(&mut state, &Change::RulingAdd("second".to_owned()), NOW).unwrap();
-        assert!(apply(&mut state, &Change::RulingDrop(0), NOW).is_err());
-        assert!(apply(&mut state, &Change::RulingDrop(3), NOW).is_err());
+        apply(&mut state, &Change::RulingDrop(0), NOW).unwrap_err();
+        apply(&mut state, &Change::RulingDrop(3), NOW).unwrap_err();
         let line = apply(&mut state, &Change::RulingDrop(1), NOW).unwrap();
         assert_eq!(line, "ruling dropped: first");
         assert_eq!(state["rulings"], json!(["second"]));
@@ -1202,7 +1208,7 @@ mod tests
         let mut state = fresh();
         apply(&mut state, &Change::Order(vec!["#852".to_owned()]), NOW).unwrap();
         let refused = Change::Order(vec!["#853".to_owned(), "  ".to_owned()]);
-        assert!(apply(&mut state, &refused, NOW).is_err());
+        apply(&mut state, &refused, NOW).unwrap_err();
         assert_eq!(state["order"], json!(["#852"]));
     }
 
@@ -1314,7 +1320,7 @@ mod tests
         let refused = change(&dir, &Change::GrantClear, SECS).unwrap_err();
         assert!(refused.to_string().contains("cargo xtask orch start"));
         assert!(log(&dir, "an event", SECS).is_err());
-        assert!(end(&dir, SECS).is_err());
+        end(&dir, SECS).unwrap_err();
         assert!(!dir.exists());
     }
 
@@ -1397,7 +1403,7 @@ mod tests
         assert!(Lock::acquire_within(&dir, Duration::ZERO).is_err());
         drop(held);
         assert!(!dir.join(LOCK_FILE).exists());
-        assert!(Lock::acquire_within(&dir, Duration::ZERO).is_ok());
+        Lock::acquire_within(&dir, Duration::ZERO).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1462,7 +1468,7 @@ mod tests
     #[test]
     fn worker_arguments_without_a_field_are_refused()
     {
-        assert!(worker_change(&worker_args("W1")).is_err());
+        worker_change(&worker_args("W1")).unwrap_err();
     }
 
     #[test]
@@ -1510,8 +1516,8 @@ mod tests
     #[test]
     fn a_command_that_changes_nothing_names_no_change()
     {
-        assert!(state_change(&OrchCommand::End).is_err());
-        assert!(state_change(&OrchCommand::Orchestrator { id: None }).is_err());
+        state_change(&OrchCommand::End).unwrap_err();
+        state_change(&OrchCommand::Orchestrator { id: None }).unwrap_err();
     }
 
     #[test]
@@ -1529,7 +1535,7 @@ mod tests
     fn the_orchestrator_id_is_read_back()
     {
         let mut state = fresh();
-        assert!(orchestrator_id(&state).is_err());
+        orchestrator_id(&state).unwrap_err();
         apply(&mut state, &Change::Orchestrator("a0c1".to_owned()), NOW).unwrap();
         assert_eq!(orchestrator_id(&state).unwrap(), "a0c1");
     }

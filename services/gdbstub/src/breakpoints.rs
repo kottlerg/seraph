@@ -158,7 +158,7 @@ mod tests
             len: MAX_BREAKPOINT_BYTES + 1,
             saved: [0xAA; MAX_BREAKPOINT_BYTES],
         };
-        assert!(b.original().is_empty());
+        assert_eq!(b.original(), []);
     }
 
     #[test]

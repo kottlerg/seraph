@@ -157,21 +157,15 @@ mod tests
         assert_eq!(CreateTailCaps::of_create_process(0), NONE);
     }
 
-    fn caps(
-        source: u64,
-        creator: u64,
-        argv_env: u64,
-        relay: u64,
-        extra: &[u64],
-    ) -> Option<CreateCaps<'_>>
+    fn caps(source: u64, creator: u64, argv_env: u64, relay: u64, extra: &[u64]) -> CreateCaps<'_>
     {
-        Some(CreateCaps {
+        CreateCaps {
             source,
             creator,
             argv_env,
             relay,
             extra,
-        })
+        }
     }
 
     #[test]
@@ -196,14 +190,29 @@ mod tests
     #[test]
     fn tail_caps_peel_off_the_end_and_creator_stays_at_cap_one()
     {
-        assert_eq!(split_create_caps(&[5, 9], RELAY), caps(5, 0, 0, 9, &[]));
-        assert_eq!(split_create_caps(&[5, 6, 9], RELAY), caps(5, 6, 0, 9, &[]));
-        assert_eq!(split_create_caps(&[5, 8], ARGV), caps(5, 0, 8, 0, &[]));
-        assert_eq!(split_create_caps(&[5, 6, 8], ARGV), caps(5, 6, 8, 0, &[]));
-        assert_eq!(split_create_caps(&[5, 8, 9], BOTH), caps(5, 0, 8, 9, &[]));
+        assert_eq!(
+            split_create_caps(&[5, 9], RELAY),
+            Some(caps(5, 0, 0, 9, &[]))
+        );
+        assert_eq!(
+            split_create_caps(&[5, 6, 9], RELAY),
+            Some(caps(5, 6, 0, 9, &[]))
+        );
+        assert_eq!(
+            split_create_caps(&[5, 8], ARGV),
+            Some(caps(5, 0, 8, 0, &[]))
+        );
+        assert_eq!(
+            split_create_caps(&[5, 6, 8], ARGV),
+            Some(caps(5, 6, 8, 0, &[]))
+        );
+        assert_eq!(
+            split_create_caps(&[5, 8, 9], BOTH),
+            Some(caps(5, 0, 8, 9, &[]))
+        );
         assert_eq!(
             split_create_caps(&[5, 6, 8, 9], BOTH),
-            caps(5, 6, 8, 9, &[])
+            Some(caps(5, 6, 8, 9, &[]))
         );
     }
 
@@ -212,16 +221,16 @@ mod tests
     {
         assert_eq!(
             split_create_caps(&[5, 6, 7, 9], RELAY),
-            caps(5, 6, 0, 9, &[7])
+            Some(caps(5, 6, 0, 9, &[7]))
         );
         assert_eq!(
             split_create_caps(&[5, 6, 7, 8], NONE),
-            caps(5, 6, 0, 0, &[7, 8])
+            Some(caps(5, 6, 0, 0, &[7, 8]))
         );
         assert_eq!(
             split_create_caps(&[5, 6, 7, 8], ARGV),
-            caps(5, 6, 8, 0, &[7])
+            Some(caps(5, 6, 8, 0, &[7]))
         );
-        assert_eq!(split_create_caps(&[5], NONE), caps(5, 0, 0, 0, &[]));
+        assert_eq!(split_create_caps(&[5], NONE), Some(caps(5, 0, 0, 0, &[])));
     }
 }

@@ -421,7 +421,7 @@ mod tests
         let r: Roster<u64> = Roster::new();
         assert!(r.is_settled());
         assert!(r.is_empty());
-        assert!(served(r).is_empty());
+        assert_eq!(served(r), [] as [u64; 0]);
     }
 
     #[test]
@@ -468,7 +468,7 @@ mod tests
         assert!(r.mark_dead(1));
         assert_eq!(r.mark_ready(1), ReadyReport::AfterDeath);
         assert_eq!(r.state(1), Some(DriverState::Dead));
-        assert!(served(r).is_empty());
+        assert_eq!(served(r), [] as [u64; 0]);
     }
 
     #[test]
@@ -586,7 +586,7 @@ mod tests
         assert_eq!(s.replies, [true, false, true]);
         assert_eq!(s.deaths, [(2, 1)]);
         assert_eq!(s.other_deaths, [post(9, 1)]);
-        assert!(s.wakes.is_empty());
+        assert_eq!(s.wakes, [] as [(Result<SettleWake, ()>, Vec<DeathPost>); 0]);
         assert_eq!(served(r), [1, 3]);
     }
 
@@ -669,7 +669,7 @@ mod tests
             ..Script::default()
         };
         assert_eq!(settle(&mut s, &mut r), Ok(SettleEnd::Settled));
-        assert!(s.deaths.is_empty());
+        assert_eq!(s.deaths, [] as [(u64, u64); 0]);
         assert_eq!(s.other_deaths, [post(40, 2)]);
         assert_eq!(served(r), [1]);
     }

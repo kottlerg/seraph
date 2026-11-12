@@ -41,31 +41,58 @@ The following individual lints are additionally mandatory:
   `get_unwrap`, `indexing_slicing`, `infinite_loop`, `iter_over_hash_type`, `mem_forget`,
   `mixed_read_write_in_expression`, `precedence_bits`, `pub_without_shorthand`,
   `renamed_function_params`, `rest_pat_in_fully_bound_structs`, `self_named_module_files`,
-  `separated_literal_suffix`, `suspicious_xor_used_as_pow`, `todo`, `try_err`, `unimplemented`,
-  `unnecessary_rest_pattern`, `unnecessary_safety_comment`, `unnecessary_safety_doc`,
-  `unnecessary_self_imports`, and `unneeded_field_pattern`.
+  `separated_literal_suffix`, `suspicious_xor_used_as_pow`, `tests_outside_test_module`, `todo`,
+  `try_err`, `unimplemented`, `unnecessary_rest_pattern`, `unnecessary_safety_comment`,
+  `unnecessary_safety_doc`, `unnecessary_self_imports`, and `unneeded_field_pattern`.
 - From `clippy::nursery`: `as_ptr_cast_mut`, `collection_is_never_read`,
   `debug_assert_with_mut_call`, `fallible_impl_from`, `literal_string_with_formatting_args`,
   `read_zero_byte_vec`, `significant_drop_in_scrutinee`, `trailing_empty_array`,
   `transmute_undefined_repr`, and `uninhabited_references`.
 
 `pub_without_shorthand` keeps the `pub(crate)` form, `self_named_module_files` the
-`mod.rs` form of a module with children, and `separated_literal_suffix` the unseparated
-literal suffix (`0u8`).
+`mod.rs` form of a module with children, `separated_literal_suffix` the unseparated
+literal suffix (`0u8`), and `tests_outside_test_module` every test in the `#[cfg(test)]` module of
+§ D Form.
 
 `cargo xtask build` runs Clippy with all warnings treated as errors. Code that does not pass this
 configuration is non-compliant. Configuration lives in `[workspace.lints]` in the root
 `Cargo.toml`; all member crates opt in via `[lints] workspace = true`. A crate-root or module-root
-lint level MUST NOT enable a Clippy lint: a Clippy lint the project enforces is enforced in
-`[workspace.lints]`, for every crate.
+lint level MUST NOT enable a Clippy lint, except as a staged roll-out below permits: a Clippy lint
+the project enforces is enforced in `[workspace.lints]`, for every crate.
 
-The one exception is the staged roll-out of `allow_attributes` and
-`allow_attributes_without_reason`, which check the suppression form of § E. A crate whose
-suppressions are in that form enables both at its crate root with
-`#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]`. When every crate is
-converted, both lints move to `[workspace.lints]` and every crate-root line is removed. Until
-then, a crate without the line still carries `#[allow]` suppressions; a suppression added or
-changed in it takes the § E form.
+`clippy::multiple_unsafe_ops_per_block` is being made mandatory by a staged roll-out. A crate whose
+sites are fixed enables it at its crate root, `#![warn(clippy::multiple_unsafe_ops_per_block)]`,
+which the build's warnings-as-errors makes binding for that crate. `core/kernel` is taken by
+subsystem: the same inner attribute at the root module of a subsystem
+(`core/kernel/src/<subsystem>/mod.rs`) binds that subsystem until every subsystem is fixed and the
+line moves to the kernel's crate root. The crates are taken in this order: `core/boot`,
+`core/kernel` by subsystem, the `abi/`, `shared/` and `runtime/` crates, the userspace services,
+drivers and programs, and the harness and host crates. The roll-out ends by moving the lint to
+`[workspace.lints]` and removing every crate-root and module-root level for it; a crate-root or
+module-root level that enables it is permitted only until then. A site is fixed as § Unsafe Code
+says.
+
+`clippy::allow_attributes` and `clippy::allow_attributes_without_reason`, which check the
+suppression form of § E, are being made mandatory by a staged roll-out. A crate whose suppressions
+are in that form enables both at its crate root,
+`#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]`. The crates are taken
+in this order: the `abi/`, `shared/` and `runtime/` crates, the userspace services, drivers and
+programs, the harness and host crates, `core/boot`, and `core/kernel`. The roll-out ends by moving
+both lints to `[workspace.lints]` and removing every crate-root level for them. Until then a crate
+without the line still carries `#[allow]` suppressions, and a suppression added or changed in it
+takes the § E form.
+
+`cargo xtask test` runs Clippy over test code before it runs the tests: the test configuration
+(`cargo clippy --tests`) of every package it tests, once for each architecture's Linux target
+(`x86_64-unknown-linux-gnu` and `riscv64gc-unknown-linux-gnu`), so test code gated on either
+architecture is linted on any host, with all warnings treated as errors. Test code is held to the
+configuration above except for four lints, which that pass allows: `unwrap_used`, `expect_used`,
+`indexing_slicing` and `arithmetic_side_effects`. In a test, an unwrapped error, an out-of-range
+index and an overflow each fail the test, which is how a test reports a defect; the lints exist to
+keep those outcomes out of production code (§ Error Handling). The list `TEST_RELAXED_LINTS` in
+`xtask/src/commands/test.rs` is the one place the relaxation is stated, and a test does not
+suppress these lints at its own site. The pass sees the code outside the test modules too, as
+the test configuration compiles it; the build's pass lints that code without the relaxation.
 
 A site that `indexing_slicing` or `arithmetic_side_effects` reports is fixed by a checked, wrapping
 or saturating operation chosen for the meaning the code already has, a `get` with an error path
@@ -223,6 +250,26 @@ correct. They are not error handling.
 ### Unsafe Code
 
 - Unsafe blocks MUST be as small as possible — wrap only the lines that require it.
+- An unsafe block MUST hold one unsafe operation (a raw-pointer dereference, a call of an unsafe
+  function or method, an access to a mutable static, an inline-assembly invocation, or a read of
+  a union field), so that each operation has a SAFETY comment of its own;
+  `clippy::multiple_unsafe_ops_per_block` checks this (§ Clippy). A block that holds several is
+  split, and each new block carries its own SAFETY comment.
+- Several operations MAY share one block when one invariant is the whole justification of each,
+  so that the SAFETY comment any one of them would carry alone states that invariant and nothing
+  else, and when each is an access to memory or registers the invariant names, at a place it
+  fixes, or the offset of a pointer by a constant to such a place: a run of field accesses through
+  pointers to the objects one held lock serialises, or of accesses at constant offsets to the
+  registers of one device under one mapping. An operation that needs a fact of its own takes a
+  block of its own: a pointer offset by a computed value, whose bound is that fact; a call whose
+  `# Safety` contract asks more than the invariant, the call of a function pointer loaded through
+  a raw pointer among them; and an operation that relies on an earlier one of the block, such as
+  a slice formed over memory the block has just zeroed. The shared block carries
+  `#[expect(clippy::multiple_unsafe_ops_per_block, reason = "...")]` on the statement or
+  expression that holds it, above its `// SAFETY:` comment, since
+  `clippy::undocumented_unsafe_blocks` reads the comment only directly above the block. The
+  `reason` names the shared invariant and is the rationale § E requires; the SAFETY comment shows
+  that the invariant holds.
 - Every unsafe block MUST be preceded by a `// SAFETY:` comment explaining why the
   operation is sound: what invariants hold, what has been checked, and why safe Rust
   cannot express it.
@@ -236,6 +283,16 @@ correct. They are not error handling.
 // SAFETY: `ptr` is non-null and correctly aligned, and we hold the exclusive
 // lock on this region for the duration of this call.
 let value = unsafe { ptr.read() };
+
+#[expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "every write is to a COM1 register, which the caller's contract gives this function"
+)]
+// SAFETY: the caller runs in ring 0 and calls this once, before any other COM1 access.
+unsafe {
+    outb(COM1 + 1, 0x00); // disable all interrupts
+    outb(COM1 + 3, 0x80); // DLAB = 1 (access divisor latch)
+}
 ```
 
 ---
@@ -459,7 +516,8 @@ mod tests
 - Tests MUST be independent, order-independent, and deterministic — no randomness, no timing,
   no external or shared mutable state.
 - In test code, `assert!`, `assert_eq!`, `assert_ne!`, `unwrap()`, and `expect()` are all
-  permitted.
+  permitted, and indexing and arithmetic need no checked form (§ Clippy names the lints relaxed
+  for test code).
 
 ### What Must Be Tested
 
@@ -557,20 +615,20 @@ formatter skip such as `#[rustfmt::skip]`) carries its rationale in a comment im
 preceding it. Clippy's `allow_attributes` and `allow_attributes_without_reason` check this form
 (§ Clippy).
 
-A suppression whose lint fires only in some build configurations (a feature, one architecture,
-host test builds where an item's only callers are compiled out) is permitted; its rationale MUST
-name the configuration in which the lint fires, and it MUST be gated on that configuration's
-predicate, either with `#[cfg_attr(<predicate>, expect(...))]` or by sitting on an item that is
-itself gated on the predicate, since an `#[expect]` fails a linted build in which its lint does
-not fire. A lint that fires on one architecture only takes
+Test code is linted (§ Clippy), and a suppression in it follows this section like one in
+production code. A suppression whose lint fires only in some build configurations (a feature, one
+architecture, the test configuration where an item's only callers are compiled out) is
+permitted; its rationale MUST name the configuration in which the lint fires, and it MUST be
+gated on that configuration's predicate, either with `#[cfg_attr(<predicate>, expect(...))]` or
+by sitting on an item that is itself gated on the predicate, since an `#[expect]` fails a linted
+build in which its lint does not fire. A lint that fires on one architecture only takes
 `#[cfg_attr(target_arch = "<arch>", expect(<lint>, reason = "..."))]`, which § C permits at any
 site; inside `arch/<target>/` the module's own gate suffices and the attribute is unconditional.
 
-A suppression in code that `cargo xtask build` compiles with no lint check takes the same form:
-test-only code, which no Clippy pass sees; the `std` overlay under `runtime/ruststd/src/`; and
-the code a workspace crate compiles only under its `rustc-dep-of-std` feature, which only the
-`std` build enables, with lints capped. No build checks that its lint still fires there, so the
-review of a change to that code does.
+A suppression in code that is compiled with no lint check takes the same form: the `std` overlay
+under `runtime/ruststd/src/`, and the code a workspace crate compiles only under its
+`rustc-dep-of-std` feature, which only the `std` build enables, with lints capped. No build checks
+that its lint still fires there, so the review of a change to that code does.
 
 ```rust
 #[cfg_attr(
@@ -590,7 +648,8 @@ capacity: usize,
 
 `cargo xtask build` is the single mandatory build command; it runs Clippy with the
 mandated lint groups and treats all warnings as errors. The command's options are listed
-in [xtask/README.md](../xtask/README.md) § `cargo xtask build`.
+in [xtask/README.md](../xtask/README.md) § `cargo xtask build`. `cargo xtask test` runs Clippy
+over test code the same way (§ Clippy) before it runs the unit tests.
 
 ---
 

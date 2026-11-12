@@ -391,10 +391,6 @@ static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new
 /// ([`check_ap_vlenb`]). Returns 0 only before [`cache_vlenb`] runs in Phase
 /// 5 ([`report_save_area`]; docs/platform-requirements.md § Boot-Time Feature
 /// Gate).
-// dead_code fires only under `test`: `vlenb` is read only by non-test code
-// (`lazy_restore_fp_v`, `check_ap_vlenb`); their `#[cfg(test)]` stubs do not
-// reference it.
-#[cfg_attr(test, allow(dead_code))]
 pub fn vlenb() -> u64
 {
     VLENB.load(core::sync::atomic::Ordering::Relaxed)

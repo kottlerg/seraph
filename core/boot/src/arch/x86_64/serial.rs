@@ -18,6 +18,10 @@ const COM1: u16 = 0x3F8;
 /// call, and that I/O port access is permitted in the current privilege level.
 pub unsafe fn serial_init()
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a COM1 register, which the caller's contract gives this function"
+    )]
     // SAFETY: caller guarantees ring 0 and at-most-once serial_init invocation.
     unsafe {
         outb(COM1 + 1, 0x00); // disable all interrupts

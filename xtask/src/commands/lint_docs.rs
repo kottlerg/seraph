@@ -1718,11 +1718,11 @@ mod tests
         let none = "# T\n\n---\n\n## Summarized By\n\nNone\n";
         assert!(summarized_by(&pat(), "d/x.md", none).unwrap().is_empty());
         let no_rule = "# T\n\n## Summarized By\n\nNone\n";
-        assert!(summarized_by(&pat(), "d/x.md", no_rule).is_err());
+        summarized_by(&pat(), "d/x.md", no_rule).unwrap_err();
         let trailing = "# T\n\n---\n\n## Summarized By\n\nNone\n\n## More\n";
-        assert!(summarized_by(&pat(), "d/x.md", trailing).is_err());
+        summarized_by(&pat(), "d/x.md", trailing).unwrap_err();
         let missing = "# T\n\nBody.\n";
-        assert!(summarized_by(&pat(), "d/x.md", missing).is_err());
+        summarized_by(&pat(), "d/x.md", missing).unwrap_err();
     }
 
     #[test]
@@ -1784,7 +1784,10 @@ mod tests
     {
         let sorted = "[README.md](../README.md), [core/README.md](../core/README.md),\n\
                       [core/x/README.md](../core/x/README.md), [Bee Doc](b.md)";
-        assert!(entry_form(sorted, "md-summarized-by-order").is_empty());
+        assert_eq!(
+            entry_form(sorted, "md-summarized-by-order"),
+            [] as [String; 0]
+        );
         let unsorted = "[Bee Doc](b.md), [README.md](../README.md)";
         assert_eq!(entry_form(unsorted, "md-summarized-by-order").len(), 1);
         let twice = "[Bee Doc](b.md), [Bee Doc](./b.md)";
@@ -1798,7 +1801,10 @@ mod tests
     {
         let good =
             "[README.md](../README.md), [core/README.md](../core/README.md), [Bee Doc](b.md)";
-        assert!(entry_form(good, "md-summarized-by-label").is_empty());
+        assert_eq!(
+            entry_form(good, "md-summarized-by-label"),
+            [] as [String; 0]
+        );
         let bad = "[Seraph](../README.md), [core](../core/README.md), [B](b.md)";
         assert_eq!(entry_form(bad, "md-summarized-by-label").len(), 3);
     }
@@ -1958,7 +1964,10 @@ mod tests
     #[test]
     fn coverage_list_that_resolves_passes()
     {
-        assert!(coverage_check(&coverage_doc("", "")).is_empty());
+        assert_eq!(
+            coverage_check(&coverage_doc("", "")),
+            [] as [(usize, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -2133,7 +2142,10 @@ mod tests
     #[test]
     fn coverage_xtask_name_resolves_only_from_the_device_surfaces_paragraph_on()
     {
-        assert!(coverage_check(&device_doc(" `only_in_xtask`", "D='only_in_xtask'")).is_empty());
+        assert_eq!(
+            coverage_check(&device_doc(" `only_in_xtask`", "D='only_in_xtask'")),
+            [] as [(usize, std::string::String); 0]
+        );
         let diags = coverage_check(&coverage_doc(" `only_in_xtask`,", ""));
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert!(diags[0].1.contains("`only_in_xtask`"), "{}", diags[0].1);

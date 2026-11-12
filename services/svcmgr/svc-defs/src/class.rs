@@ -308,7 +308,7 @@ mod tests
     fn the_class_name_is_bounded_and_checked()
     {
         let longest = "a".repeat(ipc::devmgr_labels::MAX_CLASS_NAME_BYTES);
-        assert!(parse_class(&longest, "verbs = 63").is_ok());
+        parse_class(&longest, "verbs = 63").unwrap();
         let too_long = "a".repeat(ipc::devmgr_labels::MAX_CLASS_NAME_BYTES + 1);
         for name in ["", "Block", "with space", "dot.ted", too_long.as_str()]
         {

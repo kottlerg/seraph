@@ -10,6 +10,8 @@
 //! firmware table addresses, exits UEFI boot services, populates `BootInfo`,
 //! and jumps to the kernel entry point. See `core/boot/docs/boot-flow.md` for the step-by-step design.
 
+// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 
@@ -475,6 +477,11 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // memory); these local scrubs keep the secrets from outliving their last
     // bootloader consumer.
     scrub(&mut boot_entropy.seed);
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a field of a live local of this function, through a pointer \
+                  to that field"
+    )]
     // SAFETY: all are live locals; volatile so the stores are not elided as
     // dead ahead of the values going out of scope.
     unsafe {
@@ -925,14 +932,14 @@ unsafe fn allocate_cpu_ids(
     // SAFETY: bs is valid.
     let phys = unsafe { allocate_pages(bs, pages)? };
     // SAFETY: allocate_pages returned `pages` identity-mapped pages this
-    // allocation owns and nothing else references; they hold `capacity` u32s,
-    // zeroed before the slice is formed.
-    let ids = unsafe {
-        // `pages` came from `bytes`, which fit in `usize`, so the page span below
-        // stays within the allocation.
+    // allocation owns and nothing else references. `pages` came from `bytes`,
+    // which fit in `usize`, so the page span stays within the allocation.
+    unsafe {
         core::ptr::write_bytes(phys as *mut u8, 0, pages.saturating_mul(4096));
-        core::slice::from_raw_parts_mut(phys as *mut u32, capacity.max(1))
-    };
+    }
+    // SAFETY: the pages zeroed above hold `capacity` u32s, which zero bytes make
+    // valid, and nothing else references them.
+    let ids = unsafe { core::slice::from_raw_parts_mut(phys as *mut u32, capacity.max(1)) };
     Ok((ids, phys, pages))
 }
 
@@ -985,9 +992,12 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out: &mut BootEntropy)
 {
     let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: `ctx.bs` points to valid boot services (caller contract), so the `locate_protocol`
+    // entry is readable.
+    let locate_protocol_fn = unsafe { (*ctx.bs).locate_protocol };
     // SAFETY: ctx.bs is valid; locate_protocol fills iface on success.
     let status = unsafe {
-        ((*ctx.bs).locate_protocol)(
+        locate_protocol_fn(
             core::ptr::addr_of!(EFI_RNG_PROTOCOL_GUID),
             core::ptr::null_mut(),
             core::ptr::addr_of_mut!(iface),
@@ -996,11 +1006,14 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out:
     if status == EFI_SUCCESS && !iface.is_null()
     {
         let proto = iface.cast::<EfiRngProtocol>();
+        // SAFETY: `proto` is the RNG protocol returned by `LocateProtocol` above, so the `get_rng`
+        // entry is readable.
+        let get_rng_fn = unsafe { (*proto).get_rng };
         // SAFETY: proto is a valid protocol pointer from LocateProtocol; a
         // null algorithm selects the default; out.seed has room for 32 bytes.
         // GetRNG returns EFI_SUCCESS only after writing all requested bytes.
         let s = unsafe {
-            ((*proto).get_rng)(
+            get_rng_fn(
                 proto,
                 core::ptr::null::<EfiGuid>(),
                 out.seed.len(),
@@ -1015,7 +1028,7 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out:
             let mut kaslr_bytes = [0u8; 16];
             // SAFETY: proto valid; null algorithm; 16-byte buffer.
             let ks = unsafe {
-                ((*proto).get_rng)(
+                get_rng_fn(
                     proto,
                     core::ptr::null::<EfiGuid>(),
                     kaslr_bytes.len(),
@@ -1217,9 +1230,11 @@ unsafe fn knob_present(ctx: &UefiContext, path: &[u16], name: &'static str) -> b
     {
         Ok(file) =>
         {
+            // SAFETY: `file` was returned by `open_file` above, so the `close` entry is readable.
+            let close_fn = unsafe { (*file).close };
             // SAFETY: file is a valid open handle from open_file.
             unsafe {
-                ((*file).close)(file);
+                close_fn(file);
             }
             true
         }
@@ -1313,17 +1328,19 @@ unsafe fn step6_allocate_and_build_page_tables(
     // Paint the stack and mark its lowest word for the kernel's depth report
     // (core/boot/docs/boot-flow.md § Step 6; the kernel derives the span from
     // this page-aligned top).
-    // SAFETY: allocate_pages returned HANDOFF_STACK_ALLOC_PAGES identity-mapped,
+    // allocate_pages returned HANDOFF_STACK_ALLOC_PAGES identity-mapped,
     // page-aligned pages owned by this allocation, and [stack_phys, stack_top)
     // is the KERNEL_STACK_PAGES of them above the guard; nothing uses them yet.
-    unsafe {
-        let p = stack_phys as *mut u64;
-        for i in 1..KERNEL_STACK_WORDS
-        {
-            p.add(i).write(boot_protocol::layout::STACK_PAINT);
-        }
-        p.write(boot_protocol::layout::HANDOFF_STACK_BASE_MARK);
+    let p = stack_phys as *mut u64;
+    for i in 1..KERNEL_STACK_WORDS
+    {
+        // SAFETY: i < KERNEL_STACK_WORDS, so the offset stays inside the stack span.
+        let word = unsafe { p.add(i) };
+        // SAFETY: `word` is an aligned word of the owned, unused stack span.
+        unsafe { word.write(boot_protocol::layout::STACK_PAINT) };
     }
+    // SAFETY: `p` is the aligned lowest word of the owned, unused stack span.
+    unsafe { p.write(boot_protocol::layout::HANDOFF_STACK_BASE_MARK) };
     // Reclaim-array page: dedicated 4 KiB backing for BootInfo.reclaim_ranges.
     // SAFETY: bs is valid.
     let reclaim_array_phys = unsafe { allocate_pages(ctx.bs, 1)? };
@@ -1832,9 +1849,11 @@ unsafe fn step9_populate_boot_info(
     let modules_ptr = allocs.modules_phys as *mut BootModule;
     for (i, &module) in mods.modules.iter().enumerate().take(mods.count)
     {
-        // SAFETY: modules_phys is a 4096-byte allocation; count ≤ MAX_MODULES (85)
-        // so 85 × 48-byte BootModule entries (4080 bytes) fit.
-        unsafe { core::ptr::write(modules_ptr.add(i), module) };
+        // SAFETY: modules_phys is a 4096-byte allocation; i < count ≤ MAX_MODULES (85)
+        // and 85 × 48-byte BootModule entries (4080 bytes) fit, so the offset stays inside it.
+        let slot = unsafe { modules_ptr.add(i) };
+        // SAFETY: `slot` is an aligned BootModule slot of the owned, writable allocation.
+        unsafe { core::ptr::write(slot, module) };
     }
 
     // Translate + sort the UEFI memory map.
@@ -1863,30 +1882,39 @@ unsafe fn step9_populate_boot_info(
     // seeder's layout-heuristic PCI windows go to their own buffer:
     // derive_mmio_apertures clips them harder than the named seeds
     // (core/boot/docs/firmware-parsing.md § Firmware exclusion).
-    // SAFETY: seeds_phys and heuristic_phys are step 6 allocations of
-    // seeds_pages and heuristic_pages pages, identity-mapped under the
-    // firmware's tables and owned by the bootloader, with room for their
-    // capacities; they are zeroed before the slices are formed.
-    let (aperture_seed, heuristic_seed): (&mut [MmioAperture], &mut [MmioAperture]) = unsafe {
+    // SAFETY: seeds_phys is the step 6 allocation of seeds_pages pages,
+    // identity-mapped under the firmware's tables and owned by the bootloader.
+    unsafe {
         core::ptr::write_bytes(
             allocs.seeds_phys as *mut u8,
             0,
             allocs.seeds_pages.saturating_mul(4096),
         );
+    }
+    // SAFETY: heuristic_phys is the step 6 allocation of heuristic_pages pages,
+    // identity-mapped under the firmware's tables and owned by the bootloader.
+    unsafe {
         core::ptr::write_bytes(
             allocs.heuristic_phys as *mut u8,
             0,
             allocs.heuristic_pages.saturating_mul(4096),
         );
-        (
-            core::slice::from_raw_parts_mut(
-                allocs.seeds_phys as *mut MmioAperture,
-                allocs.seeds_capacity,
-            ),
-            core::slice::from_raw_parts_mut(
-                allocs.heuristic_phys as *mut MmioAperture,
-                allocs.heuristic_capacity,
-            ),
+    }
+    // SAFETY: the seeds allocation, zeroed above, has room for seeds_capacity
+    // entries, which zero bytes make valid, and nothing else references it.
+    let aperture_seed: &mut [MmioAperture] = unsafe {
+        core::slice::from_raw_parts_mut(
+            allocs.seeds_phys as *mut MmioAperture,
+            allocs.seeds_capacity,
+        )
+    };
+    // SAFETY: the heuristic allocation, zeroed above, has room for
+    // heuristic_capacity entries, which zero bytes make valid, and nothing else
+    // references it.
+    let heuristic_seed: &mut [MmioAperture] = unsafe {
+        core::slice::from_raw_parts_mut(
+            allocs.heuristic_phys as *mut MmioAperture,
+            allocs.heuristic_capacity,
         )
     };
     // SAFETY: acpi_rsdp is zero or identity-mapped; parse_aperture_seed validates.
@@ -1932,14 +1960,18 @@ unsafe fn step9_populate_boot_info(
     }
 
     // SAFETY: apertures_phys is the step 6 allocation of apertures_pages pages,
-    // identity-mapped and owned by the bootloader, with room for
-    // aperture_capacity entries; it is zeroed before the slice is formed.
-    let apertures_buf: &mut [MmioAperture] = unsafe {
+    // identity-mapped and owned by the bootloader.
+    unsafe {
         core::ptr::write_bytes(
             allocs.apertures_phys as *mut u8,
             0,
             allocs.apertures_pages.saturating_mul(4096),
         );
+    }
+    // SAFETY: the apertures allocation, zeroed above, has room for
+    // aperture_capacity entries, which zero bytes make valid, and nothing else
+    // references it.
+    let apertures_buf: &mut [MmioAperture] = unsafe {
         core::slice::from_raw_parts_mut(
             allocs.apertures_phys as *mut MmioAperture,
             allocs.aperture_capacity,
@@ -2137,9 +2169,7 @@ unsafe fn step9_populate_boot_info(
 
     // Write the populated BootInfo.
     // SAFETY: boot_info_phys is a valid 4 KiB allocation; BootInfo fits in one
-    // page. `boot_entropy.seed` is a live local distinct from that page, so
-    // the in-place copy cannot overlap, and both field pointers are derived
-    // from the just-written BootInfo.
+    // page.
     unsafe {
         core::ptr::write(
             allocs.boot_info_phys as *mut BootInfo,
@@ -2194,16 +2224,28 @@ unsafe fn step9_populate_boot_info(
                 kaslr_flags,
             },
         );
-        // The seed goes into the page in place rather than through the struct
-        // literal above, so no copy of it is materialised in this frame.
-        let bi = allocs.boot_info_phys as *mut BootInfo;
+    }
+    // The seed goes into the page in place rather than through the struct
+    // literal above, so no copy of it is materialised in this frame.
+    let bi = allocs.boot_info_phys as *mut BootInfo;
+    // SAFETY: `bi` points to the BootInfo just written; naming a field place
+    // forms no reference.
+    let seed_dst = unsafe { core::ptr::addr_of_mut!((*bi).boot_entropy_seed) }.cast::<u8>();
+    // SAFETY: `seed_dst` is the BootInfo's seed field, as long as the seed, in
+    // the owned, writable page; `boot_entropy.seed` is a live local distinct
+    // from that page, so the copy cannot overlap.
+    unsafe {
         core::ptr::copy_nonoverlapping(
             boot_entropy.seed.as_ptr(),
-            core::ptr::addr_of_mut!((*bi).boot_entropy_seed).cast::<u8>(),
+            seed_dst,
             boot_entropy.seed.len(),
         );
-        core::ptr::addr_of_mut!((*bi).boot_entropy_len).write(boot_entropy.len);
     }
+    // SAFETY: `bi` points to the BootInfo just written; naming a field place
+    // forms no reference.
+    let len_dst = unsafe { core::ptr::addr_of_mut!((*bi).boot_entropy_len) };
+    // SAFETY: `len_dst` is the BootInfo's aligned, writable `boot_entropy_len` field.
+    unsafe { len_dst.write(boot_entropy.len) };
     Ok(())
 }
 
@@ -2550,10 +2592,10 @@ mod tests
         };
         let mut ranges = [empty; 2];
         let mut len = 0;
-        assert!(push_reclaim_range(&mut ranges, &mut len, empty).is_ok());
+        push_reclaim_range(&mut ranges, &mut len, empty).unwrap();
         assert_eq!(len, 0);
-        assert!(push_reclaim_range(&mut ranges, &mut len, one).is_ok());
-        assert!(push_reclaim_range(&mut ranges, &mut len, one).is_ok());
+        push_reclaim_range(&mut ranges, &mut len, one).unwrap();
+        push_reclaim_range(&mut ranges, &mut len, one).unwrap();
         assert!(matches!(
             push_reclaim_range(&mut ranges, &mut len, one),
             Err(BootError::ReclaimRangesOverflow)

@@ -5477,10 +5477,11 @@ mod tests
             core::ptr::addr_of_mut!((*extra).header)
                 .write(KernelObjectHeader::new(ObjectType::AddressSpace));
         }
-        // SAFETY: as above; every record is taken (N fills the third chunk but
-        // one, so first take the last free record).
+        // Every record is taken but one: N fills the third chunk but one, so
+        // first take the last free record.
         let free_left = MMIO_INLINE_MAPPINGS + 3 * MMIO_SPILL_RECORDS - N;
         assert_eq!(free_left, MMIO_SPILL_RECORDS - 1);
+        // SAFETY: `extra`'s header was initialised above; mmio is exclusively ours.
         let refused = unsafe {
             mmio.record_mapping(extra, 0x5000_0000 + 0x1000 * free_left as u64, || {
                 Err(syscall::SyscallError::OutOfMemory)
@@ -5569,7 +5570,7 @@ mod tests
         let h = KernelObjectHeader::new(ObjectType::Endpoint);
         h.ref_count.store(REF_COUNT_LIMIT - 1, Ordering::Relaxed);
         assert!(!h.at_ref_limit());
-        assert!(h.try_inc_ref().is_ok());
+        h.try_inc_ref().unwrap();
         assert_eq!(h.ref_count.load(Ordering::Relaxed), REF_COUNT_LIMIT);
         assert!(h.at_ref_limit());
         assert!(matches!(
@@ -5579,7 +5580,7 @@ mod tests
         assert_eq!(h.ref_count.load(Ordering::Relaxed), REF_COUNT_LIMIT);
         // A release below the ceiling admits a new reference again.
         assert_eq!(h.dec_ref(), REF_COUNT_LIMIT - 1);
-        assert!(h.try_inc_ref().is_ok());
+        h.try_inc_ref().unwrap();
     }
 
     // Defect guarded: a pin that revives an object whose last reference is
@@ -5721,10 +5722,10 @@ mod tests
         (torn, torn_at)
     }
 
-    /// Add to the model a tree of CSpaces under `root`: `width` CSpaces per
-    /// CSpace to `depth` levels, each non-leaf CSpace (the root included)
+    /// Add to the model a tree of `CSpaces` under `root`: `width` `CSpaces` per
+    /// `CSpace` to `depth` levels, each non-leaf `CSpace` (the root included)
     /// also holding an endpoint and a thread, and below the first level the
-    /// level's first CSpace also held by the previous level's last, in
+    /// level's first `CSpace` also held by the previous level's last, in
     /// another subtree.
     fn add_nested_cspaces(
         types: &mut Vec<ObjectType>,

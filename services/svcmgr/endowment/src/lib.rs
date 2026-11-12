@@ -532,7 +532,7 @@ mod tests
         assert_eq!(decode_all(&rounds).map(|set| set.is_some()), Ok(true));
         for round in &rounds
         {
-            assert!(decoder.push(round.caps(), round.data()).is_ok());
+            decoder.push(round.caps(), round.data()).unwrap();
         }
         assert_eq!(
             decoder.push(&[], &[kind::CAPS, VERSION, 0, 0]),

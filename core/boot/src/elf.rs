@@ -1034,6 +1034,8 @@ mod tests
             rela_phys: 0,
             rela_size: 0,
         };
+        // SAFETY: `rela_size` is 0, so `relocate_kernel` reads no relocation
+        // table and writes no image memory; it only rebases the fields of `info`.
         let r = unsafe { relocate_kernel(&mut info, 0x1_0000_0000, 0) };
         assert!(matches!(r, Err(BootError::InvalidElf(_))));
         assert_eq!(info.virtual_base, VBASE);

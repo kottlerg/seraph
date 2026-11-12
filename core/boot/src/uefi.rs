@@ -500,9 +500,12 @@ pub unsafe fn get_loaded_image(
 ) -> Result<*mut EfiLoadedImageProtocol, BootError>
 {
     let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `open_protocol` entry is
+    // readable.
+    let open_protocol_fn = unsafe { (*bs).open_protocol };
     // SAFETY: caller guarantees bs and image are valid.
     let status = unsafe {
-        ((*bs).open_protocol)(
+        open_protocol_fn(
             image,
             core::ptr::addr_of!(EFI_LOADED_IMAGE_PROTOCOL_GUID),
             core::ptr::addr_of_mut!(iface),
@@ -534,9 +537,12 @@ pub unsafe fn open_esp_volume(
 ) -> Result<*mut EfiFileProtocol, BootError>
 {
     let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `handle_protocol` entry
+    // is readable.
+    let handle_protocol_fn = unsafe { (*bs).handle_protocol };
     // SAFETY: caller guarantees bs and device are valid.
     let status = unsafe {
-        ((*bs).handle_protocol)(
+        handle_protocol_fn(
             device,
             core::ptr::addr_of!(EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID),
             core::ptr::addr_of_mut!(iface),
@@ -550,8 +556,11 @@ pub unsafe fn open_esp_volume(
     }
     let fs = iface.cast::<EfiSimpleFileSystemProtocol>();
     let mut root: *mut EfiFileProtocol = core::ptr::null_mut();
+    // SAFETY: `fs` is the simple-file-system protocol returned by `handle_protocol` above, so the
+    // `open_volume` entry is readable.
+    let open_volume_fn = unsafe { (*fs).open_volume };
     // SAFETY: fs is a valid protocol pointer.
-    let status = unsafe { ((*fs).open_volume)(fs, core::ptr::addr_of_mut!(root)) };
+    let status = unsafe { open_volume_fn(fs, core::ptr::addr_of_mut!(root)) };
     if status != EFI_SUCCESS
     {
         return Err(BootError::UefiError(status));
@@ -576,9 +585,11 @@ pub unsafe fn open_file(
 ) -> Result<*mut EfiFileProtocol, BootError>
 {
     let mut file: *mut EfiFileProtocol = core::ptr::null_mut();
+    // SAFETY: `root` is a valid file protocol (caller contract), so the `open` entry is readable.
+    let open_fn = unsafe { (*root).open };
     // SAFETY: root is valid; path is a null-terminated UTF-16 string.
     let status = unsafe {
-        ((*root).open)(
+        open_fn(
             root,
             core::ptr::addr_of_mut!(file),
             path,
@@ -619,9 +630,12 @@ pub unsafe fn file_size(file: *mut EfiFileProtocol) -> Result<u64, BootError>
 {
     // First call: get required buffer size.
     let mut info_size: usize = 0;
+    // SAFETY: `file` is a valid file protocol (caller contract), so the `get_info` entry is
+    // readable.
+    let get_info_fn = unsafe { (*file).get_info };
     // SAFETY: file is valid; passing null buffer with zero size requests the required size.
     let status = unsafe {
-        ((*file).get_info)(
+        get_info_fn(
             file,
             core::ptr::addr_of!(EFI_FILE_INFO_ID),
             core::ptr::addr_of_mut!(info_size),
@@ -637,9 +651,12 @@ pub unsafe fn file_size(file: *mut EfiFileProtocol) -> Result<u64, BootError>
     // Stack-allocate a buffer large enough for EfiFileInfo plus a short name.
     let mut buf = FileInfoBuf([0u8; FILE_INFO_BUF_LEN]);
     let mut buf_size = FILE_INFO_BUF_LEN;
+    // SAFETY: `file` is a valid file protocol (caller contract), so the `get_info` entry is
+    // readable.
+    let get_info_fn = unsafe { (*file).get_info };
     // SAFETY: buf is FILE_INFO_BUF_LEN writable bytes; file is valid.
     let status = unsafe {
-        ((*file).get_info)(
+        get_info_fn(
             file,
             core::ptr::addr_of!(EFI_FILE_INFO_ID),
             core::ptr::addr_of_mut!(buf_size),
@@ -673,9 +690,11 @@ pub unsafe fn file_size(file: *mut EfiFileProtocol) -> Result<u64, BootError>
 pub unsafe fn file_read(file: *mut EfiFileProtocol, buffer: &mut [u8]) -> Result<(), BootError>
 {
     let mut size = buffer.len();
+    // SAFETY: `file` is a valid file protocol (caller contract), so the `read` entry is readable.
+    let read_fn = unsafe { (*file).read };
     // SAFETY: file is valid; buffer is a valid writable slice.
     let status = unsafe {
-        ((*file).read)(
+        read_fn(
             file,
             core::ptr::addr_of_mut!(size),
             buffer.as_mut_ptr().cast::<core::ffi::c_void>(),
@@ -701,9 +720,12 @@ pub unsafe fn file_read(file: *mut EfiFileProtocol, buffer: &mut [u8]) -> Result
 pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u64, BootError>
 {
     let mut addr: u64 = 0;
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `allocate_pages` entry
+    // is readable.
+    let allocate_pages_fn = unsafe { (*bs).allocate_pages };
     // SAFETY: bs is valid; addr is an output parameter.
     let status = unsafe {
-        ((*bs).allocate_pages)(
+        allocate_pages_fn(
             ALLOCATE_ANY_PAGES,
             EFI_LOADER_DATA,
             count,
@@ -792,9 +814,12 @@ unsafe fn allocate_typed_max_addr(
 ) -> Result<u64, BootError>
 {
     let mut addr: u64 = max_phys;
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `allocate_pages` entry
+    // is readable.
+    let allocate_pages_fn = unsafe { (*bs).allocate_pages };
     // SAFETY: bs is valid; addr is an in-out parameter.
     let status = unsafe {
-        ((*bs).allocate_pages)(
+        allocate_pages_fn(
             ALLOCATE_MAX_ADDRESS,
             memory_type,
             count,
@@ -820,8 +845,11 @@ unsafe fn allocate_typed_max_addr(
 pub unsafe fn free_pages(bs: *mut EfiBootServices, phys: u64, count: usize)
 -> Result<(), BootError>
 {
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `free_pages` entry is
+    // readable.
+    let free_pages_fn = unsafe { (*bs).free_pages };
     // SAFETY: bs is valid; the range is an allocation the caller owns.
-    let status = unsafe { ((*bs).free_pages)(phys, count) };
+    let status = unsafe { free_pages_fn(phys, count) };
     if status != EFI_SUCCESS
     {
         return Err(BootError::UefiError(status));
@@ -858,9 +886,12 @@ unsafe fn query_memory_map_size(bs: *mut EfiBootServices) -> Result<(usize, usiz
     let mut map_key: usize = 0;
     let mut descriptor_size: usize = 0;
     let mut descriptor_version: u32 = 0;
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `get_memory_map` entry
+    // is readable.
+    let get_memory_map_fn = unsafe { (*bs).get_memory_map };
     // SAFETY: Null map pointer with zero size requests the required size.
     let status = unsafe {
-        ((*bs).get_memory_map)(
+        get_memory_map_fn(
             core::ptr::addr_of_mut!(map_size),
             core::ptr::null_mut(),
             core::ptr::addr_of_mut!(map_key),
@@ -959,12 +990,15 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
 
     // Second call: fill the buffer. This call's map_key is the one to use.
     map_size = buffer_size;
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `get_memory_map` entry
+    // is readable.
+    let get_memory_map_fn = unsafe { (*bs).get_memory_map };
     // SAFETY: buffer_phys is a valid allocated region of map_size bytes.
     // cast_possible_truncation: buffer_phys is a UEFI physical address; on all supported
     // targets (x86_64, riscv64) usize is 64-bit, so the cast is exact.
     #[allow(clippy::cast_possible_truncation)]
     let status = unsafe {
-        ((*bs).get_memory_map)(
+        get_memory_map_fn(
             core::ptr::addr_of_mut!(map_size),
             buffer_phys as *mut EfiMemoryDescriptor,
             core::ptr::addr_of_mut!(map_key),
@@ -1028,8 +1062,11 @@ pub unsafe fn exit_boot_services(
     let mut attempt: u32 = 0;
     loop
     {
+        // SAFETY: `bs` points to valid boot services (caller contract), so the `exit_boot_services`
+        // entry is readable.
+        let exit_boot_services_fn = unsafe { (*bs).exit_boot_services };
         // SAFETY: bs, image, and map_key are valid.
-        let status = unsafe { ((*bs).exit_boot_services)(image, map.map_key) };
+        let status = unsafe { exit_boot_services_fn(image, map.map_key) };
         if status == EFI_SUCCESS
         {
             return Ok(());
@@ -1052,12 +1089,15 @@ pub unsafe fn exit_boot_services(
         let mut descriptor_size: usize = map.descriptor_size;
         let mut descriptor_version: u32 = 0;
         let mut map_size = map.buffer_size;
+        // SAFETY: `bs` points to valid boot services (caller contract), so the `get_memory_map`
+        // entry is readable.
+        let get_memory_map_fn = unsafe { (*bs).get_memory_map };
         // SAFETY: buffer_phys is the existing allocated buffer of buffer_size bytes.
         // cast_possible_truncation: buffer_phys is a UEFI u64 address; usize is 64-bit on all
         // supported targets, so the cast to *mut is exact.
         #[allow(clippy::cast_possible_truncation)]
         let status = unsafe {
-            ((*bs).get_memory_map)(
+            get_memory_map_fn(
                 core::ptr::addr_of_mut!(map_size),
                 map.buffer_phys as *mut EfiMemoryDescriptor,
                 core::ptr::addr_of_mut!(map.map_key),
@@ -1137,18 +1177,23 @@ fn classify_pixel_format(info: &EfiGopModeInfo) -> Option<PixelFormat>
 /// `EFI_GRAPHICS_OUTPUT_PROTOCOL` whose `mode` is populated by firmware.
 unsafe fn set_target_mode(bs: *mut EfiBootServices, gop: *mut EfiGraphicsOutputProtocol)
 {
-    // SAFETY: gop is valid; mode is populated by firmware.
-    let max_mode = unsafe { (*(*gop).mode).max_mode };
-    // SAFETY: gop is valid; mode is populated by firmware.
-    let current = unsafe { (*(*gop).mode).mode };
+    // SAFETY: `gop` is valid (caller contract), so its `mode` field is readable.
+    let mode = unsafe { (*gop).mode };
+    // SAFETY: Firmware populates `mode` for a valid GOP instance, so `max_mode` is readable.
+    let max_mode = unsafe { (*mode).max_mode };
+    // SAFETY: Firmware populates `mode` for a valid GOP instance, so its current mode number is
+    // readable.
+    let current = unsafe { (*mode).mode };
 
     for i in 0..max_mode
     {
         let mut size: usize = 0;
         let mut info: *mut EfiGopModeInfo = core::ptr::null_mut();
+        // SAFETY: `gop` is valid (caller contract), so the `query_mode` entry is readable.
+        let query_mode_fn = unsafe { (*gop).query_mode };
         // SAFETY: gop is valid; query_mode writes size/info on success.
         let status = unsafe {
-            ((*gop).query_mode)(
+            query_mode_fn(
                 gop,
                 i,
                 core::ptr::addr_of_mut!(size),
@@ -1168,19 +1213,24 @@ unsafe fn set_target_mode(bs: *mut EfiBootServices, gop: *mut EfiGraphicsOutputP
                 && classify_pixel_format(mode_info).is_some()
         };
 
+        // SAFETY: `bs` points to valid boot services (caller contract), so the `free_pool` entry is
+        // readable.
+        let free_pool_fn = unsafe { (*bs).free_pool };
         // QueryMode allocated the info buffer from pool; release it before the
         // next iteration regardless of match.
         // SAFETY: info came from query_mode and is unused after this point.
         unsafe {
-            ((*bs).free_pool)(info.cast::<core::ffi::c_void>());
+            free_pool_fn(info.cast::<core::ffi::c_void>());
         }
 
         if is_target
         {
             if i != current
             {
+                // SAFETY: `gop` is valid (caller contract), so the `set_mode` entry is readable.
+                let set_mode_fn = unsafe { (*gop).set_mode };
                 // SAFETY: gop is valid; i < max_mode is a valid mode number.
-                let _ = unsafe { ((*gop).set_mode)(gop, i) };
+                let _ = unsafe { set_mode_fn(gop, i) };
             }
             return;
         }
@@ -1206,9 +1256,12 @@ pub unsafe fn query_gop(bs: *mut EfiBootServices) -> Option<FramebufferInfo>
     let mut count: usize = 0;
     let mut handles: *mut EfiHandle = core::ptr::null_mut();
 
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `locate_handle_buffer`
+    // entry is readable.
+    let locate_handle_buffer_fn = unsafe { (*bs).locate_handle_buffer };
     // SAFETY: bs is valid; ByProtocol with the GOP GUID returns all GOP handles.
     let status = unsafe {
-        ((*bs).locate_handle_buffer)(
+        locate_handle_buffer_fn(
             LOCATE_BY_PROTOCOL,
             core::ptr::addr_of!(EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID),
             core::ptr::null_mut(),
@@ -1225,12 +1278,18 @@ pub unsafe fn query_gop(bs: *mut EfiBootServices) -> Option<FramebufferInfo>
 
     for i in 0..count
     {
-        // SAFETY: i < count; handles[i] is a valid EfiHandle from LocateHandleBuffer.
-        let handle = unsafe { *handles.add(i) };
+        // SAFETY: `i < count`, so the offset stays inside the `count`-entry array
+        // `LocateHandleBuffer` returned.
+        let slot = unsafe { handles.add(i) };
+        // SAFETY: `slot` is inside that array, which holds initialised handles.
+        let handle = unsafe { *slot };
         let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: `bs` points to valid boot services (caller contract), so the `handle_protocol`
+        // entry is readable.
+        let handle_protocol_fn = unsafe { (*bs).handle_protocol };
         // SAFETY: bs is valid; handle is from the LocateHandleBuffer result.
         let s = unsafe {
-            ((*bs).handle_protocol)(
+            handle_protocol_fn(
                 handle,
                 core::ptr::addr_of!(EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID),
                 core::ptr::addr_of_mut!(iface),
@@ -1249,9 +1308,11 @@ pub unsafe fn query_gop(bs: *mut EfiBootServices) -> Option<FramebufferInfo>
             set_target_mode(bs, gop);
         }
 
+        // SAFETY: `gop` is a valid protocol pointer, so its `mode` field is readable.
+        let mode_ptr = unsafe { (*gop).mode };
         // SAFETY: gop is a valid protocol pointer; mode/info are populated by
         // firmware and reflect the now-active mode.
-        let mode = unsafe { &*(*gop).mode };
+        let mode = unsafe { &*mode_ptr };
         // SAFETY: mode.info is populated by firmware.
         let info = unsafe { &*mode.info };
 
@@ -1283,9 +1344,12 @@ pub unsafe fn query_gop(bs: *mut EfiBootServices) -> Option<FramebufferInfo>
         break;
     }
 
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `free_pool` entry is
+    // readable.
+    let free_pool_fn = unsafe { (*bs).free_pool };
     // SAFETY: handles was allocated by LocateHandleBuffer; must be freed with FreePool.
     unsafe {
-        ((*bs).free_pool)(handles.cast::<core::ffi::c_void>());
+        free_pool_fn(handles.cast::<core::ffi::c_void>());
     }
 
     result
@@ -1308,9 +1372,12 @@ pub unsafe fn connect_all_controllers(bs: *mut EfiBootServices)
     let mut count: usize = 0;
     let mut handles: *mut EfiHandle = core::ptr::null_mut();
 
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `locate_handle_buffer`
+    // entry is readable.
+    let locate_handle_buffer_fn = unsafe { (*bs).locate_handle_buffer };
     // SAFETY: bs is valid; NULL protocol + NULL key with AllHandles returns all handles.
     let status = unsafe {
-        ((*bs).locate_handle_buffer)(
+        locate_handle_buffer_fn(
             LOCATE_ALL_HANDLES,
             core::ptr::null(),
             core::ptr::null_mut(),
@@ -1325,12 +1392,18 @@ pub unsafe fn connect_all_controllers(bs: *mut EfiBootServices)
 
     for i in 0..count
     {
-        // SAFETY: handles[i] is valid; i < count.
-        let handle = unsafe { *handles.add(i) };
+        // SAFETY: `i < count`, so the offset stays inside the `count`-entry array
+        // `LocateHandleBuffer` returned.
+        let slot = unsafe { handles.add(i) };
+        // SAFETY: `slot` is inside that array, which holds initialised handles.
+        let handle = unsafe { *slot };
+        // SAFETY: `bs` points to valid boot services (caller contract), so the `connect_controller`
+        // entry is readable.
+        let connect_controller_fn = unsafe { (*bs).connect_controller };
         // SAFETY: recursive=TRUE (1) connects all child controllers.
         // Errors are expected for handles with no bindable drivers.
         unsafe {
-            ((*bs).connect_controller)(
+            connect_controller_fn(
                 handle,
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
@@ -1339,9 +1412,12 @@ pub unsafe fn connect_all_controllers(bs: *mut EfiBootServices)
         }
     }
 
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `free_pool` entry is
+    // readable.
+    let free_pool_fn = unsafe { (*bs).free_pool };
     // SAFETY: handles was allocated by LocateHandleBuffer; must be freed.
     unsafe {
-        ((*bs).free_pool)(handles.cast::<core::ffi::c_void>());
+        free_pool_fn(handles.cast::<core::ffi::c_void>());
     }
 }
 
@@ -1363,8 +1439,11 @@ pub unsafe fn find_config_table(
     let table = unsafe { (*st).configuration_table };
     for i in 0..count
     {
-        // SAFETY: i < count, so this is within the valid array range.
-        let entry = unsafe { &*table.add(i) };
+        // SAFETY: `i < count`, so the offset stays inside the `number_of_table_entries`-entry
+        // configuration table of `st`.
+        let entry_ptr = unsafe { table.add(i) };
+        // SAFETY: `entry_ptr` is inside that table, whose entries firmware initialised.
+        let entry = unsafe { &*entry_ptr };
         if &entry.vendor_guid == guid
         {
             return Some(entry.vendor_table);
@@ -1424,7 +1503,7 @@ mod tests
                 Err(BootError::InvalidMemoryMap(_))
             ));
         }
-        assert!(check_descriptor_size(full).is_ok());
-        assert!(check_descriptor_size(full + 8).is_ok());
+        check_descriptor_size(full).unwrap();
+        check_descriptor_size(full + 8).unwrap();
     }
 }

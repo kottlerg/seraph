@@ -326,7 +326,7 @@ mod tests
             Err(ReleaseRefusal::NotHeld)
         );
         assert!(holds.park(&entry(7, true, true)));
-        assert!(holds.release(release_token_badge(7)).is_ok());
+        holds.release(release_token_badge(7)).unwrap();
     }
 
     #[test]

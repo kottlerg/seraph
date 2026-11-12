@@ -542,15 +542,15 @@ mod tests
     {
         fn read8(&self, bus: u8, dev: u8, func: u8, reg: u16) -> u8
         {
-            self.read(bus, dev, func, reg, 1) as u8
+            u8::try_from(self.read(bus, dev, func, reg, 1) & 0xff).unwrap()
         }
         fn read16(&self, bus: u8, dev: u8, func: u8, reg: u16) -> u16
         {
-            self.read(bus, dev, func, reg, 2) as u16
+            u16::try_from(self.read(bus, dev, func, reg, 2) & 0xffff).unwrap()
         }
         fn read32(&self, bus: u8, dev: u8, func: u8, reg: u16) -> u32
         {
-            self.read(bus, dev, func, reg, 4) as u32
+            u32::try_from(self.read(bus, dev, func, reg, 4) & 0xffff_ffff).unwrap()
         }
         fn write16(&self, bus: u8, dev: u8, func: u8, reg: u16, val: u16)
         {
@@ -708,7 +708,7 @@ mod tests
         assert_eq!((found[1].subsystem_vendor, found[1].subsystem_id), (0, 0));
     }
 
-    /// Add a VirtIO function whose capability list holds the given
+    /// Add a `VirtIO` function whose capability list holds the given
     /// `(cfg_type, bar, offset, length)` structures.
     fn virtio_with_caps(space: &FakeSpace, bdf: (u8, u8, u8), caps: &[(u8, u8, u32, u32)])
     {

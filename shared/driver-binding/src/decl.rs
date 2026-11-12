@@ -1232,7 +1232,7 @@ mod tests
         let entry = (kind::SPCR, &[1u8][..]);
         let mut fields = vec![(kind::NAME, &b"drv"[..])];
         fields.extend(core::iter::repeat_n(entry, MAX_MATCHES));
-        assert!(decode(&with_fields(&fields)).is_ok());
+        decode(&with_fields(&fields)).unwrap();
         fields.push(entry);
         assert_eq!(
             decode(&with_fields(&fields)),
@@ -1302,7 +1302,7 @@ mod tests
     {
         const BLOCK: ClassName = ClassName::literal_class("block");
         const NAME: DriverName = DriverName::literal_key("virtio-blk");
-        assert!(BLOCK == ClassName::class(b"block").unwrap());
+        assert_eq!(BLOCK, ClassName::class(b"block").unwrap());
         assert_eq!(NAME.as_str(), "virtio-blk");
     }
 

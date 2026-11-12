@@ -331,9 +331,9 @@ mod tests
         {
             t.extend_from_slice(n);
         }
-        let len = t.len() as u32;
+        let len = u32::try_from(t.len()).unwrap();
         t[4..8].copy_from_slice(&len.to_le_bytes());
-        t[36..40].copy_from_slice(&(nodes.len() as u32).to_le_bytes());
+        t[36..40].copy_from_slice(&u32::try_from(nodes.len()).unwrap().to_le_bytes());
         t[40..44].copy_from_slice(&48u32.to_le_bytes());
         t
     }
@@ -371,10 +371,10 @@ mod tests
         let mut n = vec![0u8; 20];
         n[0] = TYPE_PCIE_ROOT_COMPLEX;
         n[1] = 1;
-        n[2..4].copy_from_slice(&(len as u16).to_le_bytes());
+        n[2..4].copy_from_slice(&u16::try_from(len).unwrap().to_le_bytes());
         n[14..16].copy_from_slice(&segment.to_le_bytes());
         n[16..18].copy_from_slice(&20u16.to_le_bytes());
-        n[18..20].copy_from_slice(&(mappings.len() as u16).to_le_bytes());
+        n[18..20].copy_from_slice(&u16::try_from(mappings.len()).unwrap().to_le_bytes());
         for &(source, count, device, iommu) in mappings
         {
             for w in [source, count, device, iommu, 0]
@@ -480,7 +480,7 @@ mod tests
         ]);
         let mut out = Vec::new();
         resolve_scope(&t, 48, 0, &[bdf(2, 0, 0)].into_iter(), |r| out.push(r));
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [Resolved; 0]);
         resolve_scope(&t, 88, 0, &[bdf(1, 0, 0)].into_iter(), |r| out.push(r));
         assert_eq!(out, [Resolved::Buses(1, 1)]);
     }
@@ -500,7 +500,7 @@ mod tests
         // 00:02.1 (RID 0x11) is the first mapping's; 00:05.0 (RID 0x28) is
         // past it.
         resolve_scope(&t, 48, 0, &[bdf(0, 2, 1), bdf(0, 5, 0)].into_iter(), |r| {
-            out.push(r)
+            out.push(r);
         });
         assert_eq!(
             out,
@@ -526,7 +526,7 @@ mod tests
         assert_eq!(pci_id_mappings(&t).count(), 0);
         // A truncated length hides it too.
         let mut t = qemu_virt();
-        let short = (t.len() - 1) as u32;
+        let short = u32::try_from(t.len() - 1).unwrap();
         t[4..8].copy_from_slice(&short.to_le_bytes());
         assert_eq!(pci_id_mappings(&t).count(), 0);
         assert_eq!(pci_iommus(&t).count(), 1);

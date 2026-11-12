@@ -240,10 +240,10 @@ mod tests
     fn from_u64(v: u64) -> Fe
     {
         let mut f = GF0;
-        f[0] = (v & 0xffff) as i64;
-        f[1] = ((v >> 16) & 0xffff) as i64;
-        f[2] = ((v >> 32) & 0xffff) as i64;
-        f[3] = ((v >> 48) & 0xffff) as i64;
+        f[0] = i64::try_from(v & 0xffff).unwrap();
+        f[1] = i64::try_from((v >> 16) & 0xffff).unwrap();
+        f[2] = i64::try_from((v >> 32) & 0xffff).unwrap();
+        f[3] = i64::try_from((v >> 48) & 0xffff).unwrap();
         f
     }
 

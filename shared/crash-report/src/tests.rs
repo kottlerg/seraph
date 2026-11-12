@@ -9,6 +9,7 @@ extern crate std;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 use std::format;
 
 use super::*;
@@ -23,7 +24,7 @@ const IMAGE: Image = Image {
 fn logged(report: &Report<'_>) -> String
 {
     let mut log = String::new();
-    report.emit(|line| log.push_str(&format!("[crashd] {line}\n")));
+    report.emit(|line| writeln!(log, "[crashd] {line}").unwrap());
     log
 }
 
@@ -57,7 +58,7 @@ fn a_complete_main_thread_report_round_trips_and_passes_the_check()
     let report = main_vm_report(&regs, &code, &frames);
     let mut emitted = 0;
     let mut log = String::new();
-    emitted += report.emit(|line| log.push_str(&format!("[crashd] {line}\n")));
+    emitted += report.emit(|line| writeln!(log, "[crashd] {line}").unwrap());
 
     let blocks = parse(&log);
     assert_eq!(blocks.len(), 1);
@@ -310,18 +311,22 @@ fn a_block_without_its_end_marker_or_with_a_wrong_count_is_incomplete()
 {
     let report = main_vm_report(&[], &[], &[]);
     let log = logged(&report);
-    let truncated: String = log
-        .lines()
-        .filter(|l| !l.contains(END_TAG))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let truncated: String =
+        log.lines()
+            .filter(|l| !l.contains(END_TAG))
+            .fold(String::new(), |mut acc, l| {
+                writeln!(acc, "{l}").unwrap();
+                acc
+            });
     assert_eq!(parse(&truncated)[0].check(), Err(Defect::Incomplete));
 
-    let dropped_field: String = log
-        .lines()
-        .filter(|l| !l.contains(" ip="))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let dropped_field: String =
+        log.lines()
+            .filter(|l| !l.contains(" ip="))
+            .fold(String::new(), |mut acc, l| {
+                writeln!(acc, "{l}").unwrap();
+                acc
+            });
     assert_eq!(parse(&dropped_field)[0].check(), Err(Defect::Incomplete));
 }
 
@@ -339,11 +344,11 @@ fn interleaved_blocks_and_other_lines_are_separated_by_id()
     let mut log = String::from("[logd] reclaim: badge=1 exit_reason=0x100e name=x\n");
     for (x, y) in a.iter().zip(b.iter())
     {
-        log.push_str(&format!("{x}\nUSERSPACE FAULT: noise CRASH\n{y}\n"));
+        writeln!(log, "{x}\nUSERSPACE FAULT: noise CRASH\n{y}").unwrap();
     }
     for rest in a.iter().skip(b.len()).chain(b.iter().skip(a.len()))
     {
-        log.push_str(&format!("{rest}\n"));
+        writeln!(log, "{rest}").unwrap();
     }
     let blocks = parse(&log);
     assert_eq!(blocks.len(), 2);

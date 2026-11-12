@@ -16,6 +16,18 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+#![cfg_attr(
+    test,
+    expect(
+        dead_code,
+        unused_imports,
+        unused_variables,
+        reason = "the host test build compiles every kernel module but not the entry points that \
+                  reach them (`kernel_entry`, the trap and syscall paths, which are \
+                  `cfg(not(test))`), so the code only those paths use is unused in that build \
+                  alone; the target builds lint it"
+    )
+)]
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;

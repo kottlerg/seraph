@@ -577,9 +577,9 @@ mod tests
         body: [u8; CAP as usize],
     }
 
-    fn region(header_capacity: u32) -> Box<Region>
+    fn region(header_capacity: u32) -> Region
     {
-        let mut r = Box::new(Region {
+        let r = Region {
             header: SpscHeader {
                 head: AtomicU32::new(0),
                 tail: AtomicU32::new(0),
@@ -587,7 +587,7 @@ mod tests
                 closed: AtomicU32::new(0),
             },
             body: [0; CAP as usize],
-        });
+        };
         r.header.capacity.store(header_capacity, Ordering::Relaxed);
         r
     }
@@ -598,7 +598,7 @@ mod tests
         // The peer grew the shared field past the mapped body; trusting it
         // would let the writer index beyond `body`.
         let mut r = region(CAP * 4);
-        let va = &raw mut *r as u64;
+        let va = &raw mut r as u64;
         // SAFETY: `r` is a live, aligned header plus `CAP` body bytes.
         unsafe {
             assert!(SpscWriter::from_raw(va, CAP).is_none());
@@ -614,7 +614,7 @@ mod tests
         for bad in [0, 48]
         {
             let mut r = region(bad);
-            let va = &raw mut *r as u64;
+            let va = &raw mut r as u64;
             // SAFETY: `r` is a live, aligned header plus `CAP` body bytes;
             // `bad <= CAP`.
             assert!(unsafe { spsc_pair(va, bad) }.is_none());
@@ -625,7 +625,7 @@ mod tests
     fn ring_built_with_the_mapped_capacity_round_trips_bytes()
     {
         let mut r = region(CAP);
-        let va = &raw mut *r as u64;
+        let va = &raw mut r as u64;
         // SAFETY: `r` is a live, aligned header plus `CAP` body bytes and
         // outlives both halves.
         let (mut w, mut rd) = unsafe { spsc_pair(va, CAP) }.expect("matching capacity");
@@ -644,7 +644,7 @@ mod tests
         // more than one ring's worth of bytes.
         let mut r = region(CAP);
         r.header.tail.store(CAP * 3, Ordering::Relaxed);
-        let va = &raw mut *r as u64;
+        let va = &raw mut r as u64;
         // SAFETY: `r` is a live, aligned header plus `CAP` body bytes and
         // outlives both halves.
         let (mut w, mut rd) = unsafe { spsc_pair(va, CAP) }.expect("matching capacity");

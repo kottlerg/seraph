@@ -1445,7 +1445,7 @@ mod tests
     {
         let tree = Worktree::new("norepo");
         // The directory above the repository is in none: git fails there.
-        assert!(stop_problem(&tree.base).is_err());
+        stop_problem(&tree.base).unwrap_err();
         let event = json!({"agent_type": WORKER, "cwd": tree.base.to_str().unwrap()});
         assert_eq!(stop_output(&event), None);
         // An event that names no directory.

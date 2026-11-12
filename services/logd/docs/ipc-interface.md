@@ -64,10 +64,12 @@ bits 32-34 (§ Levels). Inline bytes
 arrive in the IPC message's data words, packed at word 0. logd
 appends the bytes to the slot keyed by the kernel-delivered
 `msg.badge`; every `\n` flushes the slot's partial buffer as one
-line, emitted as `[sec.usfrac] [name] <line>\r\n` to the serial
-driver (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
-(`FB_WRITE_BYTES`) when one is present, then appended to the slot's
-history ring with its level.
+line: under the state lock the line is rendered as
+`[sec.usfrac] [name] <line>\r\n` and appended to the slot's history
+ring with its level, and once the lock is released the rendered line
+is emitted to the serial driver
+(`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
+(`FB_WRITE_BYTES`) when one is present.
 
 The history ring holds `PER_SLOT_HISTORY` (16) completed entries per slot, text lines and
 records (§ History; [`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest

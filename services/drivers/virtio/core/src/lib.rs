@@ -138,28 +138,31 @@ impl VirtioPciStartupInfo
     /// window: the distinct BARs they name and each region's place in the
     /// window (see [`RegisterLayout`]).
     ///
-    /// Returns `None` when a region is absent (zero length) or names a BAR
-    /// index outside 0-5, or when the common region is shorter than the
-    /// [`COMMON_CFG_LEN`] bytes of registers the transport addresses in it. `VirtIO` 1.2 § 4.1.4 requires a modern PCI device
+    /// Returns `None` when a region is not one the transport can use
+    /// ([`structure_usable`]): absent (zero length), naming a BAR index
+    /// outside 0-5, a common region shorter than the [`COMMON_CFG_LEN`]
+    /// bytes of registers the transport addresses in it, or a common,
+    /// notification, or device region whose offsets would make a register
+    /// access misaligned. `VirtIO` 1.2 § 4.1.4 requires a modern PCI device
     /// to present the common, notification, and ISR regions, and a device
     /// type with device-specific configuration (block and input both have
-    /// one) to present that region too, each in a BAR of the device's
-    /// choosing; devmgr's scan keeps the first structure of each type that
-    /// lies wholly inside one of the device's MMIO BARs, so an absent region
-    /// means the device presents none the driver can map.
+    /// one) to present that region too, each in a BAR of the device's choosing;
+    /// devmgr's scan keeps the first structure of each type that lies wholly
+    /// inside one of the device's MMIO BARs and passes [`structure_usable`],
+    /// so a region this refuses means the device presents none the driver
+    /// can use.
     #[must_use]
     pub fn register_layout(&self) -> Option<RegisterLayout>
     {
         let regions = [
-            &self.common_cfg,
-            &self.notify_cfg,
-            &self.isr_cfg,
-            &self.device_cfg,
+            (VIRTIO_PCI_CAP_COMMON_CFG, &self.common_cfg),
+            (VIRTIO_PCI_CAP_NOTIFY_CFG, &self.notify_cfg),
+            (VIRTIO_PCI_CAP_ISR_CFG, &self.isr_cfg),
+            (VIRTIO_PCI_CAP_DEVICE_CFG, &self.device_cfg),
         ];
-        if regions
+        if !regions
             .iter()
-            .any(|r| r.length == 0 || r.bar >= PCI_BAR_COUNT)
-            || self.common_cfg.length < COMMON_CFG_LEN
+            .all(|&(ty, r)| structure_usable(ty, r, self.notify_off_multiplier))
         {
             return None;
         }
@@ -171,6 +174,7 @@ impl VirtioPciStartupInfo
         {
             let reach = regions
                 .iter()
+                .map(|&(_, r)| r)
                 .filter(|r| r.bar == bar)
                 .map(|r| u64::from(r.offset) + u64::from(r.length))
                 .max();
@@ -354,6 +358,53 @@ pub const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 /// Device-specific configuration capability type.
 pub const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
+/// Whether the transport can use a structure of `cfg_type` (one of the four
+/// `VIRTIO_PCI_CAP_*` types above) at `loc`, with `notify_off_multiplier`
+/// the multiplier a notification structure carries (read only for that
+/// type).
+///
+/// A structure is usable when it is present (non-zero length) and names a
+/// BAR index 0-5, and further:
+///
+/// - a common configuration structure holds the [`COMMON_CFG_LEN`] bytes
+///   of registers the transport addresses and its offset is 4-aligned
+///   (`VirtIO` 1.2 § 4.1.4.3.1), so each 16- and 32-bit register in it is
+///   naturally aligned;
+/// - a notification structure's offset and multiplier are both 2-aligned
+///   (§ 4.1.4.4.1: the offset 2-byte aligned, the multiplier 0 or an even
+///   power of 2), so every 16-bit doorbell is naturally aligned;
+/// - a device-specific configuration structure's offset is 4-aligned
+///   (§ 4.1.4.6), so its 32-bit reads ([`pci::config_fits`]) can be
+///   naturally aligned.
+///
+/// The ISR structure is read a byte at a time and takes no alignment test.
+///
+/// The register window maps each BAR page-aligned, so an offset's alignment
+/// in its BAR is its alignment in the window. devmgr's scan applies this to
+/// each structure as it walks the capability list, keeping the first usable
+/// one of each type (`VirtIO` 1.2 § 4.1.4.1), and
+/// [`VirtioPciStartupInfo::register_layout`] refuses a layout with a region
+/// that fails it. An unknown `cfg_type` is not usable.
+#[must_use]
+pub fn structure_usable(cfg_type: u8, loc: &VirtioCapLocation, notify_off_multiplier: u32) -> bool
+{
+    if loc.length == 0 || loc.bar >= PCI_BAR_COUNT
+    {
+        return false;
+    }
+    match cfg_type
+    {
+        VIRTIO_PCI_CAP_COMMON_CFG => loc.length >= COMMON_CFG_LEN && loc.offset.is_multiple_of(4),
+        VIRTIO_PCI_CAP_NOTIFY_CFG =>
+        {
+            loc.offset.is_multiple_of(2) && notify_off_multiplier.is_multiple_of(2)
+        }
+        VIRTIO_PCI_CAP_DEVICE_CFG => loc.offset.is_multiple_of(4),
+        VIRTIO_PCI_CAP_ISR_CFG => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -376,7 +427,7 @@ mod tests
             notify_cfg: cap(2, 0x200, 0x20),
             isr_cfg: cap(3, 0x300, 0x30),
             device_cfg: cap(4, 0x400, 0x40),
-            notify_off_multiplier: 0x55,
+            notify_off_multiplier: 0x40,
             pad: 0,
         }
     }
@@ -508,6 +559,82 @@ mod tests
         let layout = layout_of(regions).expect("every region long enough");
         // The device region's own length bounds its reads.
         assert_eq!(layout.device_len, 8);
+    }
+
+    #[test]
+    fn a_common_region_at_an_offset_not_4_aligned_has_no_layout()
+    {
+        // At offset 2 the 32-bit `device_feature` register (0x04) would sit
+        // at window offset 6.
+        let mut regions = [
+            cap(0, 2, 0x38),
+            cap(0, 0x1000, 0x1000),
+            cap(0, 0x2000, 4),
+            cap(0, 0x3000, 8),
+        ];
+        assert!(layout_of(regions).is_none());
+        regions[0].offset = 4;
+        assert!(layout_of(regions).is_some());
+    }
+
+    #[test]
+    fn a_notification_region_or_multiplier_not_2_aligned_has_no_layout()
+    {
+        let regions = |notify_offset| {
+            [
+                cap(0, 0, 0x38),
+                cap(0, notify_offset, 0x1000),
+                cap(0, 0x2000, 4),
+                cap(0, 0x3000, 8),
+            ]
+        };
+        let with_multiplier = |notify_offset, notify_off_multiplier| {
+            let r = regions(notify_offset);
+            VirtioPciStartupInfo {
+                common_cfg: r[0],
+                notify_cfg: r[1],
+                isr_cfg: r[2],
+                device_cfg: r[3],
+                notify_off_multiplier,
+                pad: 0,
+            }
+            .register_layout()
+        };
+        // An odd region offset puts queue 0's doorbell at an odd address.
+        assert!(with_multiplier(0x1001, 4).is_none());
+        // An odd multiplier puts queue 1's doorbell at an odd address.
+        assert!(with_multiplier(0x1000, 3).is_none());
+        assert!(with_multiplier(0x1002, 2).is_some());
+        // A zero multiplier puts every doorbell at the region's start.
+        assert!(with_multiplier(0x1000, 0).is_some());
+    }
+
+    #[test]
+    fn every_type_but_isr_takes_an_alignment_test()
+    {
+        let odd = cap(0, 1, COMMON_CFG_LEN);
+        assert!(!structure_usable(VIRTIO_PCI_CAP_COMMON_CFG, &odd, 0));
+        assert!(!structure_usable(VIRTIO_PCI_CAP_NOTIFY_CFG, &odd, 0));
+        assert!(structure_usable(VIRTIO_PCI_CAP_ISR_CFG, &odd, 0));
+        assert!(!structure_usable(VIRTIO_PCI_CAP_DEVICE_CFG, &odd, 0));
+        // 2-aligned is enough for the doorbells, not for the device
+        // configuration's 32-bit reads.
+        let half = cap(0, 2, COMMON_CFG_LEN);
+        assert!(structure_usable(VIRTIO_PCI_CAP_NOTIFY_CFG, &half, 0));
+        assert!(!structure_usable(VIRTIO_PCI_CAP_DEVICE_CFG, &half, 0));
+        assert!(structure_usable(
+            VIRTIO_PCI_CAP_DEVICE_CFG,
+            &cap(0, 4, 8),
+            0
+        ));
+        // The multiplier is read for the notification type only.
+        let even = cap(0, 4, COMMON_CFG_LEN);
+        assert!(structure_usable(VIRTIO_PCI_CAP_COMMON_CFG, &even, 3));
+        assert!(!structure_usable(VIRTIO_PCI_CAP_NOTIFY_CFG, &even, 3));
+        // Absent, past BAR 5, or of no transport type: not usable.
+        assert!(!structure_usable(VIRTIO_PCI_CAP_ISR_CFG, &cap(0, 0, 0), 0));
+        assert!(!structure_usable(VIRTIO_PCI_CAP_ISR_CFG, &cap(6, 0, 4), 0));
+        assert!(!structure_usable(5, &even, 0));
     }
 
     #[test]

@@ -824,7 +824,7 @@ impl PageCache
         debug_assert!(dropped.is_ok(), "cache slot {idx} released with refcount 0");
         if dropped.is_err()
         {
-            std::os::seraph::log!("WARNING: cache slot {idx} released with refcount 0");
+            std::os::seraph::log!(warn: "cache slot {idx} released with refcount 0");
         }
     }
 }

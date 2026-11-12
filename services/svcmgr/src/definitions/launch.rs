@@ -215,7 +215,7 @@ fn publish_provided(
         else
         {
             std::os::seraph::log!(
-                "launch {svc_name}: provider SEND derive for {:?} failed",
+                warn: "launch {svc_name}: provider SEND derive for {:?} failed",
                 p.name
             );
             continue;
@@ -234,7 +234,7 @@ fn publish_provided(
             .publish(p.name.as_bytes(), send, visibility)
             .is_err()
         {
-            std::os::seraph::log!("launch {svc_name}: publish {:?} failed", p.name);
+            std::os::seraph::log!(warn: "launch {svc_name}: publish {:?} failed", p.name);
             let _ = syscall::cap_delete(send);
         }
     }
@@ -266,7 +266,7 @@ fn assemble_provided_boot_caps(
             })
         else
         {
-            std::os::seraph::log!("launch {}: provider endpoint create failed", def.name);
+            std::os::seraph::log!(warn: "launch {}: provider endpoint create failed", def.name);
             destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
             return None;
         };
@@ -290,7 +290,7 @@ fn assemble_provided_boot_caps(
         let Ok(recv) = syscall::cap_derive(provided_endpoint, syscall::RIGHTS_EP_RECEIVE)
         else
         {
-            std::os::seraph::log!("launch {}: provider RECV derive failed", def.name);
+            std::os::seraph::log!(warn: "launch {}: provider RECV derive failed", def.name);
             delete_caps(&seed_caps);
             let _ = syscall::cap_delete(provided_endpoint);
             destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
@@ -371,7 +371,7 @@ pub fn launch(
             .bind_thread(created.thread_cap, correlator)
             .is_err()
     {
-        std::os::seraph::log!("launch {}: thread_bind_notification failed", def.name);
+        std::os::seraph::log!(warn: "launch {}: thread_bind_notification failed", def.name);
         destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
         return None;
     }
@@ -402,7 +402,7 @@ pub fn launch(
 
     if serve_boot_slots(ctx, created.child_badge, &boot_caps).is_err()
     {
-        std::os::seraph::log!("launch {}: bootstrap serve failed", def.name);
+        std::os::seraph::log!(warn: "launch {}: bootstrap serve failed", def.name);
         // The started child is blocked in its bootstrap request; destroy it
         // rather than leave it waiting on a round that will not come.
         delete_caps(&boot_caps);
@@ -448,7 +448,7 @@ pub(crate) fn resolve_seeds(
             Ok(cap) => caps.push(cap),
             Err(code) =>
             {
-                std::os::seraph::log!("launch {svc_name}: seed {name:?} unresolved (code={code})");
+                std::os::seraph::log!(warn: "launch {svc_name}: seed {name:?} unresolved (code={code})");
                 caps.push(0);
             }
         }
@@ -469,7 +469,7 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
     {
         if def.cwd.is_some()
         {
-            std::os::seraph::log!("launch {}: cwd with namespace=none rejected", def.name);
+            std::os::seraph::log!(warn: "launch {}: cwd with namespace=none rejected", def.name);
             destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
             return false;
         }
@@ -479,14 +479,14 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
     let root_cap = std::os::seraph::root_dir_cap();
     if root_cap == 0
     {
-        std::os::seraph::log!("launch {}: no root_dir_cap configured", def.name);
+        std::os::seraph::log!(warn: "launch {}: no root_dir_cap configured", def.name);
         destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
         return false;
     }
     let Some(info) = std::os::seraph::try_startup_info()
     else
     {
-        std::os::seraph::log!("launch {}: no startup info for cap_copy", def.name);
+        std::os::seraph::log!(warn: "launch {}: no startup info for cap_copy", def.name);
         destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
         return false;
     };
@@ -499,7 +499,7 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
             let Ok(c) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_EP_SEND)
             else
             {
-                std::os::seraph::log!("launch {}: cap_copy of root failed", def.name);
+                std::os::seraph::log!(warn: "launch {}: cap_copy of root failed", def.name);
                 destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
                 return false;
             };
@@ -513,7 +513,7 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
                 Err(e) =>
                 {
                     std::os::seraph::log!(
-                        "launch {}: subtree walk {:?} failed: {e}",
+                        warn: "launch {}: subtree walk {:?} failed: {e}",
                         def.name,
                         path
                     );

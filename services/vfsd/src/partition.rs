@@ -101,15 +101,15 @@ pub fn discover_disks(
             BlockDeviceReply::CallFailed => break,
             BlockDeviceReply::Withdrawn =>
             {
-                std::os::seraph::log!("disk {ordinal}: driver withdrawn; skipped");
+                std::os::seraph::log!(warn: "disk {ordinal}: driver withdrawn; skipped");
             }
             BlockDeviceReply::NoCap =>
             {
-                std::os::seraph::log!("disk {ordinal}: QUERY_DEVICE reply carried no cap");
+                std::os::seraph::log!(warn: "disk {ordinal}: QUERY_DEVICE reply carried no cap");
             }
             BlockDeviceReply::Disk(blk_ep) =>
             {
-                std::os::seraph::log!("disk {ordinal}: block device endpoint acquired");
+                std::os::seraph::log!(debug: "disk {ordinal}: block device endpoint acquired");
                 if *scratch_cap == 0
                 {
                     replace_scratch(
@@ -133,7 +133,8 @@ pub fn discover_disks(
                 if disks.try_reserve(1).is_err()
                 {
                     std::os::seraph::log!(
-                        "disk {ordinal}: no memory for the disk list; later disks are not visible"
+                        warn: "disk {ordinal}: no memory for the disk list; \
+                         later disks are not visible"
                     );
                     break;
                 }
@@ -165,13 +166,15 @@ fn replace_scratch(
 {
     if let Some((cap, va)) = alloc_scratch(memmgr_ep, self_aspace, ipc_buf)
     {
-        std::os::seraph::log!("disk {ordinal}: scratch page lost on an earlier disk; replaced");
+        std::os::seraph::log!(
+            warn: "disk {ordinal}: scratch page lost on an earlier disk; replaced"
+        );
         *scratch_cap = cap;
         *scratch_va = va;
     }
     else
     {
-        std::os::seraph::log!("disk {ordinal}: scratch page lost and not replaced");
+        std::os::seraph::log!(warn: "disk {ordinal}: scratch page lost and not replaced");
     }
 }
 
@@ -206,7 +209,7 @@ fn query_block_device(block_class: u64, ordinal: u64, ipc_buf: *mut u64) -> Bloc
         Err(ClassCallError::NoCap) => BlockDeviceReply::NoCap,
         Err(ClassCallError::Call(_)) =>
         {
-            std::os::seraph::log!("disk {ordinal}: QUERY_DEVICE ipc_call failed");
+            std::os::seraph::log!(warn: "disk {ordinal}: QUERY_DEVICE ipc_call failed");
             BlockDeviceReply::CallFailed
         }
     }
@@ -223,7 +226,7 @@ fn log_gpt_error(ordinal: u64, e: &GptError)
         GptError::InvalidEntrySize => "invalid entry size",
         GptError::InvalidEntryArray => "entry array outside LBA 2..first_usable_lba",
     };
-    std::os::seraph::log!("disk {ordinal}: GPT parse failed: {why}; no partitions");
+    std::os::seraph::log!(warn: "disk {ordinal}: GPT parse failed: {why}; no partitions");
 }
 
 /// Allocate one scratch Memory cap from memmgr, reserve a 1-page VA window,
@@ -386,7 +389,7 @@ fn parse_gpt(
     for entry in &scan.entries
     {
         std::os::seraph::log!(
-            "disk {ordinal}: GPT: partition at LBA {:#018x} length {:#018x}",
+            debug: "disk {ordinal}: GPT: partition at LBA {:#018x} length {:#018x}",
             entry.first_lba,
             entry.length_lba
         );
@@ -396,11 +399,11 @@ fn parse_gpt(
         None =>
         {}
         Some(ScanStop::ReadFailed { lba }) => std::os::seraph::log!(
-            "disk {ordinal}: GPT: entry-array read at LBA {lba:#018x} failed; \
+            warn: "disk {ordinal}: GPT: entry-array read at LBA {lba:#018x} failed; \
              later partitions are not visible"
         ),
         Some(ScanStop::OutOfMemory) => std::os::seraph::log!(
-            "disk {ordinal}: GPT: no memory for the partition list; \
+            warn: "disk {ordinal}: GPT: no memory for the partition list; \
              later partitions are not visible"
         ),
     }

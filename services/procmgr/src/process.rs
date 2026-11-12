@@ -188,7 +188,7 @@ fn choose_child_layout() -> ProcessLayout
     let entropy = draw_layout_entropy();
     if entropy.is_none()
     {
-        std::os::seraph::log!("layout entropy draw failed; using default layout");
+        std::os::seraph::log!(warn: "layout entropy draw failed; using default layout");
     }
     choose_process_layout(entropy.as_ref())
 }
@@ -211,7 +211,7 @@ fn choose_image_bias_or_default() -> u64
     {
         return process_layout::choose_image_bias(r);
     }
-    std::os::seraph::log!("image-bias entropy draw failed; using window base");
+    std::os::seraph::log!(warn: "image-bias entropy draw failed; using window base");
     process_layout::IMAGE_WINDOW.base
 }
 
@@ -282,7 +282,7 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
         Ok(()) | Err(QUEUE_FULL) => (),
         Err(e) =>
         {
-            std::os::seraph::log!("death forward to logd failed (badge={badge}, err={e})");
+            std::os::seraph::log!(warn: "death forward to logd failed (badge={badge}, err={e})");
         }
     }
 }
@@ -785,7 +785,7 @@ pub fn settle_failed_argv_env(mms: MemmgrSendGuard, e: ArgvEnvCopyError)
     if e == ArgvEnvCopyError::StillMapped
     {
         std::os::seraph::log!(
-            "argv/env copy left pages mapped; the child's memmgr record is withheld"
+            warn: "argv/env copy left pages mapped; the child's memmgr record is withheld"
         );
         let _ = mms.disarm();
     }
@@ -911,7 +911,7 @@ impl Drop for CopyWindows
         self.unmap();
         if self.stuck
         {
-            std::os::seraph::log!("argv/env copy window unmap failed; its VA stays reserved");
+            std::os::seraph::log!(warn: "argv/env copy window unmap failed; its VA stays reserved");
             return;
         }
         if let Some(src) = self.src.take()
@@ -982,7 +982,7 @@ pub fn copy_argv_env(
     }
     copied?;
     let name = tally.finish().map_err(|refusal| {
-        std::os::seraph::log!("create argv/env refused: {refusal:?}");
+        std::os::seraph::log!(warn: "create argv/env refused: {refusal:?}");
         Reply(procmgr_errors::INVALID_ARGUMENT)
     })?;
     Ok(ChildArgvEnv {
@@ -2020,7 +2020,7 @@ fn finalize_creation(
     let bound = crate::lock(deaths).bind_thread(child_thread, badge);
     if let Err(e) = bound
     {
-        std::os::seraph::log!("main-thread death bind failed (err={e}); spawn refused");
+        std::os::seraph::log!(warn: "main-thread death bind failed (err={e}); spawn refused");
         return Err(procmgr_errors::OUT_OF_MEMORY);
     }
 
@@ -2036,7 +2036,7 @@ fn finalize_creation(
     let bound = crate::lock(deaths).bind_aspace(child_aspace, badge);
     if let Err(e) = bound
     {
-        std::os::seraph::log!("address-space death bind failed (err={e}); spawn refused");
+        std::os::seraph::log!(warn: "address-space death bind failed (err={e}); spawn refused");
         return Err(procmgr_errors::OUT_OF_MEMORY);
     }
 
@@ -2134,7 +2134,7 @@ fn finalize_creation(
             // The creation is complete; the spawner's own main-thread
             // observer still reports the child's exit.
             std::os::seraph::log!(
-                "death-relay bind failed (err={e}); a worker-thread fault will not reach the spawner"
+                warn: "death-relay bind failed (err={e}); a worker-thread fault will not reach the spawner"
             );
         }
         let _ = syscall::cap_delete(parent_relay_cap);
@@ -2158,7 +2158,7 @@ fn bind_crash_endpoint(child_thread: u64, badge: u64)
 {
     if crate::crash::endpoint() != 0 && !bind_exception_class(child_thread, badge)
     {
-        std::os::seraph::log!("crash endpoint not bound; exceptions stay unbound");
+        std::os::seraph::log!(warn: "crash endpoint not bound; exceptions stay unbound");
     }
 }
 
@@ -2268,7 +2268,7 @@ pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) ->
         {
             if !bind_exception_class(thread_cap, badge)
             {
-                std::os::seraph::log!("crash binding of a refused thread not restored");
+                std::os::seraph::log!(warn: "crash binding of a refused thread not restored");
             }
             release_debugger_upcall(thread_cap);
         }
@@ -2380,7 +2380,7 @@ pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
     }
     else
     {
-        std::os::seraph::log!("no heap for crash badges; threads without one keep their binding");
+        std::os::seraph::log!(warn: "no heap for crash badges; threads without one keep their binding");
     }
     for t in threads.iter_mut()
     {
@@ -2423,7 +2423,7 @@ pub fn restore_crash_bindings(table: &mut ProcessTable, badge: u64)
         entry.badge,
     ) && !bind_exception_class(entry.thread_cap, entry.badge)
     {
-        std::os::seraph::log!("crash binding of a detached main thread not restored");
+        std::os::seraph::log!(warn: "crash binding of a detached main thread not restored");
     }
     release_debugger_upcall(entry.thread_cap);
 }
@@ -2645,7 +2645,7 @@ fn create_process_from_bytes(
         // Load-bias observability: no ProcessInfo field carries the bias;
         // debugging correlates through this line (in-process code uses
         // __ehdr_start).
-        std::os::seraph::log!("spawn image bias=0x{bias:x}");
+        std::os::seraph::log!(debug: "spawn image bias=0x{bias:x}");
     }
     let entry = elf::entry_point(ehdr)
         .checked_add(bias)
@@ -2764,7 +2764,7 @@ fn create_process_from_bytes(
     if applied_relocs != total_relocs
     {
         std::os::seraph::log!(
-            "reloc application mismatch applied={applied_relocs} expected={total_relocs}"
+            warn: "reloc application mismatch applied={applied_relocs} expected={total_relocs}"
         );
         return Err(procmgr_errors::INVALID_ELF);
     }
@@ -3660,7 +3660,7 @@ pub fn create_process_from_file(
         // Load-bias observability: no ProcessInfo field carries the bias;
         // debugging correlates through this line (in-process code uses
         // __ehdr_start).
-        std::os::seraph::log!("spawn image bias=0x{bias:x}");
+        std::os::seraph::log!(debug: "spawn image bias=0x{bias:x}");
     }
     let entry = elf::entry_point(ehdr)
         .checked_add(bias)
@@ -3818,7 +3818,7 @@ pub fn create_process_from_file(
     if applied_relocs != total_relocs
     {
         std::os::seraph::log!(
-            "reloc application mismatch applied={applied_relocs} expected={total_relocs}"
+            warn: "reloc application mismatch applied={applied_relocs} expected={total_relocs}"
         );
         return Err(procmgr_errors::INVALID_ELF);
     }

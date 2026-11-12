@@ -267,6 +267,14 @@ fn advance_prop(off: u32, prop_len: u32) -> Option<u32>
     off.checked_add(prop_len.checked_add(3)? & !3)
 }
 
+/// Address of byte `off` of the block at `block_off` in the blob at `base`,
+/// or `None` when the sum would overflow the address space.
+fn block_addr(base: u64, block_off: u32, off: u32) -> Option<u64>
+{
+    base.checked_add(u64::from(block_off))?
+        .checked_add(u64::from(off))
+}
+
 impl Fdt
 {
     /// Validate and wrap an FDT blob at the given physical address.
@@ -326,7 +334,7 @@ impl Fdt
         {
             return None;
         }
-        let addr = self.base + u64::from(self.off_struct) + u64::from(off);
+        let addr = block_addr(self.base, self.off_struct, off)?;
         // SAFETY: offset validated above; read within struct block bounds.
         Some(u32::from_be(unsafe {
             core::ptr::read_unaligned(addr as *const u32)
@@ -341,7 +349,11 @@ impl Fdt
         {
             return &[];
         }
-        let addr = self.base + u64::from(self.off_struct) + u64::from(off);
+        let Some(addr) = block_addr(self.base, self.off_struct, off)
+        else
+        {
+            return &[];
+        };
         // SAFETY: bounds validated above; slice within struct block.
         unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) }
     }
@@ -354,14 +366,20 @@ impl Fdt
         {
             return &[];
         }
-        let addr = self.base + u64::from(self.off_strings) + u64::from(nameoff);
-        let max_len = (self.size_strings - nameoff) as usize;
+        let Some(addr) = block_addr(self.base, self.off_strings, nameoff)
+        else
+        {
+            return &[];
+        };
+        // `nameoff` is below `size_strings`, so the subtraction does not underflow.
+        let max_len = self.size_strings.saturating_sub(nameoff) as usize;
         let start = addr as *const u8;
         let mut len = 0;
         // SAFETY: nameoff validated above; pointer arithmetic within strings block.
         while len < max_len && unsafe { *start.add(len) } != 0
         {
-            len += 1;
+            // `len` is below `max_len`, so it is far below `usize::MAX`.
+            len = len.saturating_add(1);
         }
         // SAFETY: len ≤ max_len; slice within strings block.
         unsafe { core::slice::from_raw_parts(start, len) }
@@ -406,21 +424,23 @@ impl Fdt
 
         while let Some(token) = self.read_struct_u32(off)
         {
-            off += 4;
+            // A read at `off` succeeded, so `off + 4` is within the struct block.
+            off = off.saturating_add(4);
 
             match token
             {
                 FDT_BEGIN_NODE =>
                 {
-                    if depth < MAX_DEPTH
+                    if let Some(slot) = states.get_mut(depth)
                     {
-                        states[depth] = NodeState::new();
+                        *slot = NodeState::new();
                     }
                     else
                     {
                         too_deep = true;
                     }
-                    depth += 1;
+                    // Each level takes at least a token of the struct block.
+                    depth = depth.saturating_add(1);
                     // Skip null-terminated, 4-byte-aligned node name.
                     let Some(next) = skip_node_name(self, off)
                     else
@@ -435,10 +455,11 @@ impl Fdt
                     {
                         break; // malformed FDT
                     }
-                    depth -= 1;
-                    if depth < MAX_DEPTH && states[depth].compatible_matched
+                    // `depth` is non-zero here.
+                    depth = depth.saturating_sub(1);
+                    if let Some(s) = states.get(depth)
+                        && s.compatible_matched
                     {
-                        let s = &states[depth];
                         let node = FdtNode {
                             reg_entries: s.reg_entries,
                             reg_count: s.reg_count,
@@ -460,13 +481,15 @@ impl Fdt
                     {
                         break;
                     };
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let Some(nameoff) = self.read_struct_u32(off)
                     else
                     {
                         break;
                     };
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let data_off = off;
                     // Advance past prop data (4-byte aligned).
                     let Some(next) = advance_prop(off, prop_len)
@@ -477,11 +500,11 @@ impl Fdt
                     off = next;
 
                     // Only process properties for nodes within stack depth.
-                    if depth == 0 || depth > MAX_DEPTH
+                    let Some(state) = depth.checked_sub(1).and_then(|d| states.get_mut(d))
+                    else
                     {
                         continue;
-                    }
-                    let state = &mut states[depth - 1];
+                    };
                     let name = self.string_at(nameoff);
 
                     if name == b"compatible"
@@ -497,16 +520,19 @@ impl Fdt
                         // #address-cells=2, #size-cells=2: each entry = 16 bytes.
                         // Each (address, size) is two big-endian u32 pairs.
                         let data = self.struct_slice(data_off, prop_len);
-                        let mut i = 0;
-                        while i + 16 <= data.len() && state.reg_count < MAX_REG_ENTRIES
+                        for entry in data.as_chunks::<16>().0
                         {
-                            let addr = read_be64(&data[i..]);
-                            let size = read_be64(&data[i + 8..]);
-                            state.reg_entries[state.reg_count] = (addr, size);
-                            state.reg_count += 1;
-                            i += 16;
+                            let Some(slot) = state.reg_entries.get_mut(state.reg_count)
+                            else
+                            {
+                                truncated = true;
+                                break;
+                            };
+                            let (addr, size) = entry.split_at(8);
+                            *slot = (read_be64(addr), read_be64(size));
+                            // `reg_count` indexed a slot, so it is below `MAX_REG_ENTRIES`.
+                            state.reg_count = state.reg_count.saturating_add(1);
                         }
-                        truncated |= i + 16 <= data.len();
                     }
                     else if name == b"interrupts"
                     {
@@ -514,14 +540,18 @@ impl Fdt
                         // `#interrupt-cells` is not resolved, so a 2-cell APLIC
                         // specifier fills two entries.
                         let data = self.struct_slice(data_off, prop_len);
-                        let mut i = 0;
-                        while i + 4 <= data.len() && state.irq_count < MAX_IRQ_ENTRIES
+                        for cell in data.as_chunks::<4>().0
                         {
-                            state.irq_entries[state.irq_count] = read_be32(&data[i..]);
-                            state.irq_count += 1;
-                            i += 4;
+                            let Some(slot) = state.irq_entries.get_mut(state.irq_count)
+                            else
+                            {
+                                truncated = true;
+                                break;
+                            };
+                            *slot = u32::from_be_bytes(*cell);
+                            // `irq_count` indexed a slot, so it is below `MAX_IRQ_ENTRIES`.
+                            state.irq_count = state.irq_count.saturating_add(1);
                         }
-                        truncated |= i + 4 <= data.len();
                     }
                     else if name == b"ranges"
                     {
@@ -605,15 +635,16 @@ impl Fdt
 
         while let Some(token) = self.read_struct_u32(off)
         {
-            off += 4;
+            // A read at `off` succeeded, so `off + 4` is within the struct block.
+            off = off.saturating_add(4);
 
             match token
             {
                 FDT_BEGIN_NODE =>
                 {
-                    if depth < MAX_DEPTH
+                    if let Some(slot) = states.get_mut(depth)
                     {
-                        states[depth] = CpuNodeState {
+                        *slot = CpuNodeState {
                             is_riscv_cpu: false,
                             reg_u32: 0,
                             has_reg: false,
@@ -626,7 +657,8 @@ impl Fdt
                     {
                         too_deep = true;
                     }
-                    depth += 1;
+                    // Each level takes at least a token of the struct block.
+                    depth = depth.saturating_add(1);
                     let Some(next) = skip_node_name(self, off)
                     else
                     {
@@ -640,17 +672,15 @@ impl Fdt
                     {
                         break;
                     }
-                    depth -= 1;
-                    if depth < MAX_DEPTH
+                    // `depth` is non-zero here.
+                    depth = depth.saturating_sub(1);
+                    if let Some(s) = states.get(depth)
+                        && s.is_riscv_cpu
+                        && s.has_reg
+                        && !s.disabled
+                        && !callback(s.reg_u32, s.caps, s.mmu)
                     {
-                        let s = &states[depth];
-                        if s.is_riscv_cpu
-                            && s.has_reg
-                            && !s.disabled
-                            && !callback(s.reg_u32, s.caps, s.mmu)
-                        {
-                            break;
-                        }
+                        break;
                     }
                 }
                 FDT_PROP =>
@@ -660,13 +690,15 @@ impl Fdt
                     {
                         break;
                     };
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let Some(nameoff) = self.read_struct_u32(off)
                     else
                     {
                         break;
                     };
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let data_off = off;
                     let Some(next) = advance_prop(off, prop_len)
                     else
@@ -675,11 +707,11 @@ impl Fdt
                     };
                     off = next;
 
-                    if depth == 0 || depth > MAX_DEPTH
+                    let Some(state) = depth.checked_sub(1).and_then(|d| states.get_mut(d))
+                    else
                     {
                         continue;
-                    }
-                    let state = &mut states[depth - 1];
+                    };
                     let name = self.string_at(nameoff);
 
                     if name == b"compatible"
@@ -696,10 +728,9 @@ impl Fdt
                     {
                         // #address-cells=1 under /cpus: reg is a single BE u32.
                         let data = self.struct_slice(data_off, 4);
-                        if data.len() >= 4
+                        if let Some(cell) = data.first_chunk::<4>()
                         {
-                            state.reg_u32 =
-                                u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                            state.reg_u32 = u32::from_be_bytes(*cell);
                             state.has_reg = true;
                         }
                     }
@@ -818,20 +849,22 @@ impl Fdt
 
         while let Some(token) = self.read_struct_u32(off)
         {
-            off += 4;
+            // A read at `off` succeeded, so `off + 4` is within the struct block.
+            off = off.saturating_add(4);
             match token
             {
                 FDT_BEGIN_NODE =>
                 {
-                    if depth < MAX_DEPTH
+                    if let Some(slot) = states.get_mut(depth)
                     {
-                        states[depth] = EMPTY;
+                        *slot = EMPTY;
                     }
                     else
                     {
                         too_deep = true;
                     }
-                    depth += 1;
+                    // Each level takes at least a token of the struct block.
+                    depth = depth.saturating_add(1);
                     let Some(next) = skip_node_name(self, off)
                     else
                     {
@@ -845,18 +878,19 @@ impl Fdt
                     {
                         break;
                     }
-                    depth -= 1;
-                    if depth >= MAX_DEPTH
+                    // `depth` is non-zero here.
+                    depth = depth.saturating_sub(1);
+                    let Some(&s) = states.get(depth)
+                    else
                     {
                         continue;
-                    }
-                    let s = states[depth];
+                    };
                     if s.is_cpu_intc
                         && s.phandle != 0
-                        && depth > 0
-                        && states[depth - 1].intc_phandle == 0
+                        && let Some(parent) = depth.checked_sub(1).and_then(|d| states.get_mut(d))
+                        && parent.intc_phandle == 0
                     {
-                        states[depth - 1].intc_phandle = s.phandle;
+                        parent.intc_phandle = s.phandle;
                     }
                     if s.is_riscv_cpu
                         && !s.disabled
@@ -873,13 +907,15 @@ impl Fdt
                     {
                         break;
                     };
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let Some(nameoff) = self.read_struct_u32(off)
                     else
                     {
                         break;
                     };
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let data_off = off;
                     let Some(next) = advance_prop(off, prop_len)
                     else
@@ -888,11 +924,11 @@ impl Fdt
                     };
                     off = next;
 
-                    if depth == 0 || depth > MAX_DEPTH
+                    let Some(state) = depth.checked_sub(1).and_then(|d| states.get_mut(d))
+                    else
                     {
                         continue;
-                    }
-                    let state = &mut states[depth - 1];
+                    };
                     let data = self.struct_slice(data_off, prop_len);
                     match self.string_at(nameoff)
                     {
@@ -930,7 +966,8 @@ impl Fdt
 
         while let Some(token) = self.read_struct_u32(off)
         {
-            off += 4;
+            // A read at `off` succeeded, so `off + 4` is within the struct block.
+            off = off.saturating_add(4);
 
             match token
             {
@@ -952,13 +989,15 @@ impl Fdt
                     {
                         break;
                     };
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let Some(nameoff) = self.read_struct_u32(off)
                     else
                     {
                         break;
                     };
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let data_off = off;
                     let Some(next) = advance_prop(off, prop_len)
                     else
@@ -999,7 +1038,8 @@ impl Fdt
         let mut off: u32 = 0;
         while let Some(token) = self.read_struct_u32(off)
         {
-            off += 4;
+            // A read at `off` succeeded, so `off + 4` is within the struct block.
+            off = off.saturating_add(4);
             match token
             {
                 FDT_BEGIN_NODE => off = skip_node_name(self, off)?,
@@ -1008,9 +1048,11 @@ impl Fdt
                 FDT_PROP =>
                 {
                     let prop_len = self.read_struct_u32(off)?;
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let nameoff = self.read_struct_u32(off)?;
-                    off += 4;
+                    // A read at `off` succeeded, so `off + 4` is within the struct block.
+                    off = off.saturating_add(4);
                     let data_off = off;
                     off = advance_prop(off, prop_len)?;
                     if self.string_at(nameoff) == name
@@ -1032,7 +1074,7 @@ impl Fdt
         {
             return None;
         }
-        Some(self.base + u64::from(self.off_struct) + u64::from(data_off))
+        block_addr(self.base, self.off_struct, data_off)
     }
 }
 
@@ -1047,14 +1089,15 @@ impl Fdt
 #[allow(clippy::cast_possible_truncation)]
 fn skip_node_name(fdt: &Fdt, start: u32) -> Option<u32>
 {
-    let base_addr = fdt.base + u64::from(fdt.off_struct) + u64::from(start);
+    let base_addr = block_addr(fdt.base, fdt.off_struct, start)?;
     let max = fdt.size_struct.saturating_sub(start) as usize;
     let mut len = 0;
     while len < max
     {
         // SAFETY: base_addr + len is within struct block bounds (len < max ≤ size_struct).
-        let b = unsafe { core::ptr::read((base_addr + len as u64) as *const u8) };
-        len += 1;
+        let b = unsafe { core::ptr::read((base_addr as *const u8).add(len)) };
+        // `len` is below `max`, so it is far below `usize::MAX`.
+        len = len.saturating_add(1);
         if b == 0
         {
             break;
@@ -1089,7 +1132,7 @@ pub(crate) fn isa_string_has_ext(data: &[u8], ext: &[u8]) -> bool
 {
     let isa = match data.iter().position(|&b| b == 0)
     {
-        Some(nul) => &data[..nul],
+        Some(nul) => data.get(..nul).unwrap_or(data),
         None => data,
     };
     isa.split(|&b| b == b'_').any(|seg| seg == ext)
@@ -1103,7 +1146,7 @@ fn read_be32(buf: &[u8]) -> u32
     {
         return 0;
     }
-    u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]])
+    buf.first_chunk::<4>().map_or(0, |c| u32::from_be_bytes(*c))
 }
 
 /// Read a big-endian u64 from the first 8 bytes of `buf`.
@@ -1114,9 +1157,7 @@ fn read_be64(buf: &[u8]) -> u64
     {
         return 0;
     }
-    u64::from_be_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ])
+    buf.first_chunk::<8>().map_or(0, |c| u64::from_be_bytes(*c))
 }
 
 // ── CPU topology parsing ──────────────────────────────────────────────────────
@@ -1146,7 +1187,8 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> usize
     };
     let mut count: usize = 0;
     fdt.walk_cpu_nodes(|_reg, _caps, _mmu| {
-        count += 1;
+        // One per CPU node, each at least a token of the struct block.
+        count = count.saturating_add(1);
         true
     });
     count
@@ -1161,17 +1203,21 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> usize
 /// As [`parse_cpu_count`]. `out` must hold at least one slot.
 pub unsafe fn place_hart_ids(dtb_addr: u64, bsp_id: u32, out: &mut [u32]) -> u32
 {
+    let Some(first) = out.first_mut()
+    else
+    {
+        return 0;
+    };
+    *first = bsp_id;
     // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
     let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
     else
     {
-        out[0] = bsp_id;
         return 1;
     };
     // walk_cpu_nodes takes a callback, so each hart is placed as it arrives.
     let mut filled: usize = 1;
     let mut truncated = false;
-    out[0] = bsp_id;
     fdt.walk_cpu_nodes(|reg_u32, _caps, _mmu| {
         crate::firmware::record_cpu_id(reg_u32, out, &mut filled, &mut truncated);
         true
@@ -1342,14 +1388,15 @@ fn imsic_layout(fdt: &Fdt, node: &FdtNode) -> Option<ImsicLayout>
 /// windows in order. `None` past the last window.
 fn imsic_file_in_regs(node: &FdtNode, mut index: u64, stride: u64) -> Option<u64>
 {
-    for &(base, size) in &node.reg_entries[..node.reg_count]
+    for &(base, size) in node.reg_entries.iter().take(node.reg_count)
     {
-        let files = size / stride;
+        let files = size.checked_div(stride)?;
         if index < files
         {
-            return base.checked_add(index * stride);
+            return base.checked_add(index.checked_mul(stride)?);
         }
-        index -= files;
+        // `index` is at least `files` here.
+        index = index.saturating_sub(files);
     }
     None
 }
@@ -1603,7 +1650,7 @@ unsafe fn walk_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> (usize,
     {
         push_seed(out, &mut n, &mut found, aia.aplic.base, aia.aplic.size);
     }
-    for &(base, size) in &aia.imsic_regs.0[..aia.imsic_regs.1]
+    for &(base, size) in aia.imsic_regs.0.iter().take(aia.imsic_regs.1)
     {
         if size > 0
         {
@@ -1618,11 +1665,13 @@ unsafe fn walk_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> (usize,
 /// when `out` has room.
 fn push_seed(out: &mut [MmioAperture], n: &mut usize, found: &mut usize, phys_base: u64, size: u64)
 {
-    *found += 1;
-    if *n < out.len()
+    // One per seed found, each from a distinct node window of the blob.
+    *found = found.saturating_add(1);
+    if let Some(slot) = out.get_mut(*n)
     {
-        out[*n] = MmioAperture { phys_base, size };
-        *n += 1;
+        *slot = MmioAperture { phys_base, size };
+        // `*n` indexed a slot of `out`, so it is below `out.len()`.
+        *n = n.saturating_add(1);
     }
 }
 
@@ -2418,5 +2467,50 @@ mod tests
             aia(&aia_tree(&[0, 1], 0x20, Some(true))).aplic,
             AplicDomain::zero()
         );
+    }
+
+    #[test]
+    fn block_addr_overflow_reads_nothing()
+    {
+        // A blob whose struct block would run past the top of the address
+        // space reads as empty; no memory is touched.
+        let fdt = Fdt {
+            base: u64::MAX - 8,
+            off_struct: 0,
+            size_struct: 16,
+            off_strings: 0,
+            size_strings: 16,
+        };
+        assert_eq!(fdt.read_struct_u32(12), None);
+        assert!(fdt.struct_slice(12, 4).is_empty());
+        assert!(fdt.string_at(12).is_empty());
+        assert_eq!(fdt.prop_data_addr(12, 4), None);
+    }
+
+    #[test]
+    fn place_hart_ids_empty_out_places_nothing()
+    {
+        let blob = tree(None, |b| cpu_node(b, b"cpu@0", 7, &[]));
+        let base = blob.as_ptr() as u64;
+        let mut ids: [u32; 0] = [];
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
+        assert_eq!(unsafe { place_hart_ids(base, 7, &mut ids) }, 0);
+    }
+
+    #[test]
+    fn imsic_file_in_regs_rejects_zero_stride()
+    {
+        let mut node = FdtNode {
+            reg_entries: [(0, 0); MAX_REG_ENTRIES],
+            reg_count: 1,
+            irq_entries: [0; MAX_IRQ_ENTRIES],
+            irq_count: 0,
+            ranges: (0, 0),
+            aia: AiaProps::new(),
+        };
+        node.reg_entries[0] = (0x1000, 0x4000);
+        assert_eq!(imsic_file_in_regs(&node, 0, 0), None);
+        assert_eq!(imsic_file_in_regs(&node, 1, 0x1000), Some(0x2000));
+        assert_eq!(imsic_file_in_regs(&node, u64::MAX, 0x1000), None);
     }
 }

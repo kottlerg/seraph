@@ -130,9 +130,19 @@ devmgr's responsibilities are:
   - for a declaration that takes an interrupt, its own derivation of its
     line's held `Interrupt` cap with `RIGHTS_IRQ_NOTIFY` only, so devices that
     share an `INTx` line are all served and no driver holds Mint; a device with
-    no line is not bound when its declaration requires one. No message-signaled
-    vector is delivered, whatever the declaration requests
-    ([#325](https://github.com/kottlerg/seraph/issues/325));
+    no line is not bound when its declaration requires one. A declaration that
+    asks for vectors (nonzero `msi_vectors`) and for DMA gets message-signaled
+    vectors in place of the line: MSI-X (`min(requested, table size)` vectors,
+    table entries 0 onwards, with the table and PBA BARs delivered), else MSI
+    (one vector), else the line. Each vector is one `Interrupt` resource
+    (kind `Msi` or `MsiX`, mode 0) devmgr mints with `SYS_IRQ_MSG_ALLOC`; a
+    bind delivers at most 70 resources (`MAX_BOUND_RESOURCES`, 6 BARs and 64
+    vectors). On riscv64 behind the RISC-V IOMMU devmgr maps each target's
+    IMSIC interrupt file into the device's domain with `MAP_MSI` before it
+    enables the vectors; VT-d refuses `MAP_MSI`, and VT-d interrupt remapping
+    is design intent ([#325](https://github.com/kottlerg/seraph/issues/325)).
+    [docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
+    § Message-Signaled Interrupts owns the rule;
   - for a DMA declaration, the device's DMA capability, after its grant
     attaches it to its IOMMU domain where a unit translates it (above); the
     driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD`;
@@ -142,7 +152,8 @@ devmgr's responsibilities are:
   devmgr keeps the function's configuration page, which it carves at the bind
   and delegates to no driver, and writes the Command register through it:
   Memory Space Enable on, Bus Master Enable on only for a DMA declaration, and
-  Interrupt Disable clear only for a driver given the line. It creates the
+  Interrupt Disable clear only for a driver given the line (MSI Enable or
+  MSI-X Enable set for one given vectors). It creates the
   driver at `BOOT_DRIVER_PRIORITY` for a declaration of the boot tier from a
   boot module and at `AUX_DRIVER_PRIORITY` otherwise, a drivers-directory
   declaration's boot tier logged and ignored, and grants no PCI-bound driver
@@ -232,8 +243,9 @@ devmgr's responsibilities are:
      removes the driver's mappings of the device before the revocation
      returns. A live driver's next register access faults; its death is held
      at step 5 like any other.
-  3. devmgr sets the function's Interrupt Disable bit through the same page
-     and reads it back, so the function no longer asserts its wired line,
+  3. devmgr clears the function's MSI Enable and MSI-X Enable bits and sets its
+     Interrupt Disable bit through the same page and reads the latter back, so
+     the function no longer signals a message or asserts its wired line,
      whoever else shares it; a bit that does not read back set is logged, and
      does not decide whether the device is quiet, which concerns its DMA
      alone.

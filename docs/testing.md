@@ -532,16 +532,17 @@ surface.
     pool seed and the KASLR words from its `EFI_RNG_PROTOCOL`: the `test-kaslr` boots of the ktest
     cells, and svctest's random phase;
   - DMA confinement: the machine's IOMMU (`intel-iommu` on `q35`, `riscv-iommu-pci` on `virt`),
-    through the iommu-vtd and iommu-riscv drivers: svctest's DMA confinement phase;
+    through the iommu-vtd and iommu-riscv drivers: svctest's DMA confinement phase, and, for the
+    message writes the riscv-iommu translates, its MSI delivery phase;
   - clock: the machine's RTC (the CMOS RTC on `q35`, the Goldfish RTC on `virt`), through the
     cmos-rtc and goldfish-rtc drivers: svctest's timed phase;
   - filesystem: FAT, through the fatfs driver, on every partition `mkdisk` writes: svctest's
     filesystem phases;
   - and the devices the harnesses drive, which only the svctest launches attach
     (`--test-devices`): QEMU's `edu`, which the test-only test-dma driver drives in svctest's DMA
-    confinement phase, four `pci-testdev` functions, which the test-only test-fault driver serves
-    in svctest's on-demand-bind phase, and, on x86_64, `vmgenid`, the generation source the
-    kernel's snapshot detection reads: `test-vmgenid`.
+    confinement and MSI delivery phases, four `pci-testdev` functions, which the test-only
+    test-fault driver serves in svctest's on-demand-bind phase, and, on x86_64, `vmgenid`, the
+    generation source the kernel's snapshot detection reads: `test-vmgenid`.
 
   The canonical boots are headless, so the main set holds no framebuffer. Every code PR's CI cells
   boot the main set. A driver joins it only by replacing the main device of its type; any other
@@ -876,7 +877,7 @@ own diff is on.
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
-| test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), and svctest's DMA confinement check, which drives it (by definition alone: `dma_confinement_phase`) | no-iommu |
+| test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), and svctest's DMA confinement and MSI delivery checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, and `call_test_dma`) | no-iommu |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
@@ -884,17 +885,17 @@ own diff is on.
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
 shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies
 what fatfs reads. The no-iommu cell boots devmgr, the test-dma driver, and svctest's DMA
-confinement check unconfined, and every VirtIO driver without `VIRTIO_F_ACCESS_PLATFORM`, which the
-launchers have a device offer only with the IOMMU attached, so the shared surface (the launchers'
-IOMMU attachment among it), virtio-blk, virtio-input, and test-dma owe it. A PR that adds a driver
-adds its row, with its directory and the cells that exercise its device, and a PR that adds a cell
-names the surfaces that owe it.
-`cargo xtask lint-docs` checks this list as it checks the two above, its directories (written with
-a trailing `/`) included, and resolves its items in xtask's own sources too. The screen works as
-the boundary one does: the first command lists the changed files on a surface as a whole, and the
-other two print every candidate, which the PR owes the surface's cells for when a non-inert changed
-line names the item or lies within its definition (within it alone for a protocol module and for
-an item listed by definition alone), read in that file's hunk.
+confinement and MSI delivery checks unconfined, and every VirtIO driver without
+`VIRTIO_F_ACCESS_PLATFORM`, which the launchers have a device offer only with the IOMMU attached, so
+the shared surface (the launchers' IOMMU attachment among it), virtio-blk, virtio-input, and
+test-dma owe it. A PR that adds a driver adds its row, with its directory and the cells that
+exercise its device, and a PR that adds a cell names the surfaces that owe it. `cargo xtask
+lint-docs` checks this list as it checks the two above, its directories (written with a trailing
+`/`) included, and resolves its items in xtask's own sources too. The screen works as the boundary
+one does: the first command lists the changed files on a surface as a whole, and the other two print
+every candidate, which the PR owes the surface's cells for when a non-inert changed line names the
+item or lies within its definition (within it alone for a protocol module and for an item listed by
+definition alone), read in that file's hunk.
 
 ```sh
 git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
@@ -912,7 +913,7 @@ D="$D|(alloc|free)_message_target|init_vector_storage"
 D="$D|InterruptObject|dispatch_external|init_eid_storage|M(IN|AX)_IRQ_ID"
 D="$D|devmgr_(dma_)?(labels|errors)"
 D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV_IOMMU_DEVICE"
-D="$D|test_dma_labels|dma_confinement_phase"
+D="$D|test_dma_labels|dma_confinement_phase|msi_delivery_phase|call_test_dma"
 D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
 D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
 D="$D|gdb_target(_tick|_worker_step)?|handle_list_processes|handle_detach_process"

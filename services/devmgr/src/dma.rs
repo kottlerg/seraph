@@ -233,6 +233,60 @@ impl DmaGrant
         self.confined
     }
 
+    /// Make the interrupt file whose page is at `file` reachable by the
+    /// device's message-signaled writes, where its IOMMU domain translates
+    /// them (riscv64): hold the page out of the device's IOVA space
+    /// ([`DmaTable::hold_interrupt_file`]), then have the IOMMU driver map it
+    /// in the device's domain at its own address (`MAP_MSI`), once per file.
+    /// An unconfined device reaches every file already. Returns whether the
+    /// device reaches the file; `false`, logged, when the table refuses the
+    /// page or the driver's `MAP_MSI` fails, the page then let go of.
+    pub fn reach_interrupt_file(&self, file: u64) -> bool
+    {
+        let held = {
+            let mut table = lock(&self.shared.table);
+            match table.confinement(self.device_badge)
+            {
+                Some(Confinement::Domain { handle, .. }) => table
+                    .hold_interrupt_file(self.device_badge, file)
+                    .map(|newly| newly.then_some(handle)),
+                _ => return !self.confined,
+            }
+        };
+        let handle = match held
+        {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return true,
+            Err(e) =>
+            {
+                std::os::seraph::log!(
+                    warn: "device {}: interrupt file {:#x} not held ({:?})",
+                    self.device_badge,
+                    file,
+                    e
+                );
+                return false;
+            }
+        };
+        let mapped = self
+            .shared
+            .client()
+            .ok_or(iommu_errors::HARDWARE_TIMEOUT)
+            .and_then(|c| c.map_msi(handle, file));
+        if let Err(code) = mapped
+        {
+            std::os::seraph::log!(
+                warn: "device {}: interrupt file {:#x} not mapped ({})",
+                self.device_badge,
+                file,
+                code
+            );
+            lock(&self.shared.table).release_interrupt_file(self.device_badge, file);
+            return false;
+        }
+        true
+    }
+
     /// Withdraw the device's DMA: revoke every copy of its DMA capability
     /// derived from devmgr's (the driver's), remove the device and its
     /// mappings from the table, so a request already queued is refused, and

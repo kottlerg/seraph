@@ -48,7 +48,7 @@ services/svctest/
         ├── recv_pool.rs       # Worker-pool receive helper under concurrent nested IPC;
         │                      #   concurrent logging through logd
         ├── devmgr.rs          # Block, shutdown, bind deny; input ordinal; on-demand
-        │                      #   driver bind; DMA confinement
+        │                      #   driver bind; DMA confinement; MSI delivery
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
         │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
@@ -108,15 +108,15 @@ a stack overflow) kills it without running either hook, so it logs neither marke
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
 skip and return when their cap is zero; the devmgr class-deny phase (`caps[2]` and `caps[3]`), the
 bind-deny phase (`caps[2]`), the input-ordinal phase (`caps[8]`), the on-demand-bind phase
-(`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement phase (`caps[9]`), the drivers
-stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny phase (`caps[11]` to `caps[13]`),
-the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names
-it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd phases
-(`caps[4]`, `caps[5]`), the `logd_death_forward` and `logd_concurrent` phases (`caps[6]`), and
-the `crash_endpoint` phase (`caps[14]`) instead fail their assertions. The seed-only phase thus
-fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
-zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and
-the run ends idle.
+(`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement and MSI delivery phases (`caps[9]`), the
+drivers stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny phase (`caps[11]` to
+`caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and
+`pwrmgr.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
+vfsd phases (`caps[4]`, `caps[5]`), the `logd_death_forward` and `logd_concurrent` phases
+(`caps[6]`), and the `crash_endpoint` phase (`caps[14]`) instead fail their assertions. The
+seed-only phase thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so
+that phase's own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the
+same zero cap, and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -144,7 +144,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
-| `caps[9]` | `devmgr.class.test-dma` | DMA confinement phase: the `test-dma` class SEND |
+| `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery phases: the `test-dma` class SEND |
 | `caps[10]` | `devmgr.class.test-fault` | on-demand-bind phase: the `test-fault` class SEND |
 | `caps[11]` | `devmgr.class.serial-deny` | drivers deny phase: a `serial` class SEND without the driver's verb bits |
 | `caps[12]` | `devmgr.class.input-deny` | drivers deny phase: an `input` class SEND without the driver's verb bits |
@@ -263,6 +263,10 @@ its unmap must not reach the page, and devmgr must have taken an IOMMU fault for
 address. The probe's reply carries, from devmgr's `DMA_FAULTS`, the confinement flag, the count of
 faults devmgr took for the device, and the latest faulting address, which must be the page of the
 unmapped address. Without an IOMMU it checks the mapped copies only and requires no fault.
+The MSI delivery phase queries the same fixture the same way and asks it to have the `edu` device
+raise its interrupt (`INTERRUPT_PROBE`): the fixture must hold the device's MSI vector, which
+devmgr gives a declaration that asks for MSI and DMA, not its wired line, and the message must
+reach the fixture's notification within `INTERRUPT_WAIT_MS`, with or without an IOMMU.
 The `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
 with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS phases
@@ -283,7 +287,7 @@ layout](../../docs/testing.md#sysroot-layout).
 | [Service Definitions](../svcmgr/docs/service-definitions.md) | `.svc` recipe keys, including `seed` resolution |
 | [svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) | `HANDOVER_COMPLETE` and `PUBLISH_ENDPOINT` and their authority badges; `QUERY_ENDPOINT` and its seed-only refusal |
 | [services/pwrmgr/README.md](../pwrmgr/README.md) | pwrmgr `SHUTDOWN` and its authority badge |
-| [services/drivers/test-dma/README.md](../drivers/test-dma/README.md) | `edu` DMA test driver behind the DMA confinement phase |
+| [services/drivers/test-dma/README.md](../drivers/test-dma/README.md) | `edu` DMA and MSI test driver behind the DMA confinement and MSI delivery phases |
 | [services/drivers/test-fault/README.md](../drivers/test-fault/README.md) | Fault-injection driver behind the on-demand-bind phase |
 
 ---

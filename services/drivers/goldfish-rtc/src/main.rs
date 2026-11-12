@@ -75,8 +75,9 @@ fn bootstrap(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<(u64, PlatformD
 
 fn read_epoch_ns(base_va: u64) -> u64
 {
-    let low_addr = (base_va + REG_TIME_LOW) as *const u32;
-    let high_addr = (base_va + REG_TIME_HIGH) as *const u32;
+    // Both registers lie inside the mapped page: no saturation.
+    let low_addr = base_va.saturating_add(REG_TIME_LOW) as *const u32;
+    let high_addr = base_va.saturating_add(REG_TIME_HIGH) as *const u32;
 
     // Read order: LOW first latches the 64-bit value; subsequent HIGH
     // read returns the latched upper half. Per the Goldfish RTC model

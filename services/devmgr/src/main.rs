@@ -16,6 +16,9 @@
 //! and driver authority, and `docs/device-management.md` for the system-scope
 //! design.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod arch;
 mod bind;
 mod caps;
@@ -93,7 +96,7 @@ fn main() -> !
     // record (a record is bound at most once, by whichever pass binds it) and
     // the IOMMU driver. The watch's death queue is sized to them, so every
     // death observer is funded and no death is dropped.
-    let driver_count = records.count() + IOMMU_DRIVERS;
+    let driver_count = records.count().saturating_add(IOMMU_DRIVERS);
     let Some(mut watch) = settle::DriverWatch::new(driver_count)
     else
     {
@@ -214,7 +217,7 @@ fn enumerate_records(caps: &mut caps::DevmgrCaps) -> (bind::Records, decls::Boot
     {
         if enumerate_ecam(caps, loc, &mut devices)
         {
-            windows_scanned += 1;
+            windows_scanned = windows_scanned.saturating_add(1);
         }
     }
     if windows_scanned == 0
@@ -465,7 +468,7 @@ impl Registry
             return false;
         }
         *flag = true;
-        state.unsettled += 1;
+        state.unsettled = state.unsettled.saturating_add(1);
         true
     }
 
@@ -1037,14 +1040,29 @@ fn reply_device_info(catalog: &DeviceCatalog, msg: &IpcMessage, ipc_buf: *mut u6
         words[0] = u64::from(entry.kind);
         words[1] = u64::from(entry.version);
         words[2] = u64::from(entry.byte_len);
-        for (i, chunk) in entry.payload[..byte_len].chunks(8).enumerate()
+        let Some(payload) = entry.payload.get(..byte_len)
+        else
+        {
+            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            return;
+        };
+        for (word, chunk) in words.iter_mut().skip(3).zip(payload.chunks(8))
         {
             let mut buf = [0u8; 8];
-            buf[..chunk.len()].copy_from_slice(chunk);
-            words[3 + i] = u64::from_le_bytes(buf);
+            for (b, &c) in buf.iter_mut().zip(chunk)
+            {
+                *b = c;
+            }
+            *word = u64::from_le_bytes(buf);
         }
+        let Some(used) = words.get(..word_count.saturating_add(3))
+        else
+        {
+            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            return;
+        };
         let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-            .words(0, &words[..3 + word_count])
+            .words(0, used)
             .build();
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -1316,7 +1334,8 @@ pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Opti
             // `mmio_split` takes the split point as an offset into the cap; the
             // table records each aperture's exact range, so no split it asks for
             // falls outside its cap.
-            syscall::mmio_split(span.slot, at - span.base).map_err(|_| SplitError::Failed)
+            let offset = at.checked_sub(span.base).ok_or(SplitError::Failed)?;
+            syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
         });
     match carved
     {
@@ -1618,11 +1637,13 @@ impl DeviceInfoEntry
         self.kind = kind;
         self.version = version;
         self.byte_len = byte_len;
-        self.payload[..bytes.len()].copy_from_slice(bytes);
-        for b in &mut self.payload[bytes.len()..]
+        self.payload.fill(0);
+        let Some(dst) = self.payload.get_mut(..bytes.len())
+        else
         {
-            *b = 0;
-        }
+            return false;
+        };
+        dst.copy_from_slice(bytes);
         true
     }
 }

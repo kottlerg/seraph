@@ -118,16 +118,16 @@ fn boot_framebuffer(caps: &caps::DevmgrCaps, records: &mut PlatformRecords)
     let base = fb.physical_base & !(PAGE_SIZE - 1);
     let end = fb
         .physical_base
-        .saturating_add(u64::from(fb.stride) * u64::from(fb.height))
+        .saturating_add(u64::from(fb.stride).saturating_mul(u64::from(fb.height)))
         .div_ceil(PAGE_SIZE)
-        * PAGE_SIZE;
+        .saturating_mul(PAGE_SIZE);
     let identity = Identity {
         boot_framebuffer: true,
         ..Identity::default()
     };
     let mmio = CrsResource::Mmio {
         base,
-        size: end - base,
+        size: end.saturating_sub(base),
     };
     if let (Added::New(i), Some(info)) = (add(records, identity, [mmio]), info)
         && let Some(record) = records.get_mut(i)
@@ -152,7 +152,7 @@ fn add_namespace_device(device: &aml::AmlDevice<'_>, records: &mut PlatformRecor
             if let Some(slot) = resources.get_mut(count)
             {
                 *slot = Some(r);
-                count += 1;
+                count = count.saturating_add(1);
             }
         });
     }
@@ -180,7 +180,12 @@ fn attach_century(caps: &caps::DevmgrCaps, records: &mut PlatformRecords)
     };
     for i in 0..records.records().len()
     {
-        let identity = records.records()[i].identity();
+        let Some(existing) = records.records().get(i)
+        else
+        {
+            break;
+        };
+        let identity = existing.identity();
         let cmos = identity
             .hid
             .iter()
@@ -276,10 +281,17 @@ fn log_record(index: usize, record: &firmware::records::PlatformRecord)
                 },
             );
         let n = src.len().min(name.len());
-        name[..n].copy_from_slice(&src[..n]);
+        if let (Some(out), Some(bytes)) = (name.get_mut(..n), src.get(..n))
+        {
+            out.copy_from_slice(bytes);
+        }
         (name, n)
     });
-    let name = core::str::from_utf8(&key.0[..key.1]).unwrap_or("?");
+    let name = key
+        .0
+        .get(..key.1)
+        .and_then(|bytes| core::str::from_utf8(bytes).ok())
+        .unwrap_or("?");
     std::os::seraph::log!(debug: "platform record {}: {}", index, name);
     for r in record.resources()
     {

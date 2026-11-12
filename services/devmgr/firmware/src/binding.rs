@@ -246,13 +246,14 @@ impl<T> MatchTable<T>
     ) -> Result<usize, TryReserveError>
     {
         self.candidates.try_reserve(1)?;
+        let index = self.candidates.len();
         self.candidates.push(Candidate {
             decl,
             source,
             bound,
             binary,
         });
-        Ok(self.candidates.len() - 1)
+        Ok(index)
     }
 
     /// The declarations, by index.

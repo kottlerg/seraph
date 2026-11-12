@@ -35,10 +35,13 @@
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 pub mod acpi;
 pub mod aml;
 pub mod binding;
+mod bytes;
 pub mod classes;
 pub mod dma;
 pub mod dmar;

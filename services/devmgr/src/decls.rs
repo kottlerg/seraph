@@ -111,10 +111,12 @@ fn read_decl(
 {
     let mut header = [0u8; HEADER_BYTES];
     let header_len = usize::try_from(size).map_or(HEADER_BYTES, |s| s.min(HEADER_BYTES));
-    let read = read_at(0, &mut header[..header_len])?;
-    let (ehdr, _) =
-        elf::validate_executable(&header[..read.min(header_len)], arch::current::ELF_MACHINE)
-            .ok()?;
+    let read = read_at(0, header.get_mut(..header_len)?)?;
+    let (ehdr, _) = elf::validate_executable(
+        header.get(..read.min(header_len))?,
+        arch::current::ELF_MACHINE,
+    )
+    .ok()?;
     let mut section = [0u8; NOTE_SECTION_BYTES];
     let desc = elf::find_note_streaming(
         &ehdr,
@@ -333,7 +335,10 @@ fn fs_read(file_cap: u64, offset: u64, dst: &mut [u8], ipc_buf: *mut u64) -> Opt
     let data = reply.data_bytes();
     let payload = data.get(core::mem::size_of::<u64>()..).unwrap_or(&[]);
     let copied = reported.min(dst.len()).min(payload.len());
-    dst[..copied].copy_from_slice(&payload[..copied]);
+    if let (Some(out), Some(src)) = (dst.get_mut(..copied), payload.get(..copied))
+    {
+        out.copy_from_slice(src);
+    }
     Some(reported)
 }
 
@@ -364,7 +369,7 @@ pub fn list_dir(dir_cap: u64, ipc_buf: *mut u64, mut visit: impl FnMut(&[u8]))
         let name_len = usize::try_from(reply.word(1)).unwrap_or(usize::MAX);
         let data = reply.data_bytes();
         let Some(name) = data
-            .get(2 * core::mem::size_of::<u64>()..)
+            .get(core::mem::size_of::<[u64; 2]>()..)
             .and_then(|bytes| bytes.get(..name_len))
             .filter(|name| !name.is_empty() && name.len() <= MAX_ENTRY_NAME)
         else
@@ -372,7 +377,12 @@ pub fn list_dir(dir_cap: u64, ipc_buf: *mut u64, mut visit: impl FnMut(&[u8]))
             continue;
         };
         let mut copy = [0u8; MAX_ENTRY_NAME];
-        copy[..name.len()].copy_from_slice(name);
-        visit(&copy[..name.len()]);
+        let Some(out) = copy.get_mut(..name.len())
+        else
+        {
+            continue;
+        };
+        out.copy_from_slice(name);
+        visit(out);
     }
 }

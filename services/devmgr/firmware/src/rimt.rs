@@ -17,6 +17,7 @@
 //! slice of the table, as [`crate::acpi`] does. No alloc.
 
 use crate::acpi::{SDT_HDR_LEN, sdt_length, sdt_signature};
+use crate::bytes::{read_u8, read_u16, read_u32};
 use crate::dmar::{Bdf, Resolved};
 
 // ── Layout constants ──────────────────────────────────────────────────
@@ -52,28 +53,6 @@ const ID_MAPPING_LEN: usize = 20;
 
 /// Requester IDs of one PCI segment: the 16-bit bus, device, and function.
 const RID_SPACE: u32 = 1 << 16;
-
-// ── Byte-read helpers ─────────────────────────────────────────────────
-
-fn read_u8(buf: &[u8], off: usize) -> u8
-{
-    buf.get(off).copied().unwrap_or(0)
-}
-
-fn read_u16(buf: &[u8], off: usize) -> u16
-{
-    u16::from_le_bytes([read_u8(buf, off), read_u8(buf, off + 1)])
-}
-
-fn read_u32(buf: &[u8], off: usize) -> u32
-{
-    u32::from_le_bytes([
-        read_u8(buf, off),
-        read_u8(buf, off + 1),
-        read_u8(buf, off + 2),
-        read_u8(buf, off + 3),
-    ])
-}
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -122,7 +101,9 @@ impl IdMapping
     fn touches_bus(&self, segment: u16, bus: u32) -> bool
     {
         let (start, end) = self.rids();
-        segment == self.segment && start < (bus + 1) * 256 && bus * 256 < end
+        segment == self.segment
+            && start < bus.saturating_add(1).saturating_mul(256)
+            && bus.saturating_mul(256) < end
     }
 
     /// Whether the range names the function `f` of `segment`.
@@ -180,20 +161,20 @@ fn nodes(rimt: &[u8]) -> impl Iterator<Item = (usize, u8, usize)> + '_
     let mut remaining = read_u32(rimt, RIMT_OFF_NODE_COUNT);
     let mut off = read_u32(rimt, RIMT_OFF_NODE_ARRAY) as usize;
     core::iter::from_fn(move || {
-        if remaining == 0 || off < SDT_HDR_LEN || off + NODE_HDR_LEN > end
+        if remaining == 0 || off < SDT_HDR_LEN || off.saturating_add(NODE_HDR_LEN) > end
         {
             return None;
         }
         let kind = read_u8(rimt, off);
-        let len = usize::from(read_u16(rimt, off + 2));
-        if len < NODE_HDR_LEN || off + len > end
+        let len = usize::from(read_u16(rimt, off.saturating_add(2)));
+        if len < NODE_HDR_LEN || off.saturating_add(len) > end
         {
             remaining = 0;
             return None;
         }
         let at = off;
-        off += len;
-        remaining -= 1;
+        off = off.saturating_add(len);
+        remaining = remaining.saturating_sub(1);
         Some((at, kind, len))
     })
 }
@@ -204,11 +185,11 @@ fn nodes(rimt: &[u8]) -> impl Iterator<Item = (usize, u8, usize)> + '_
 pub fn pci_iommus(rimt: &[u8]) -> impl Iterator<Item = PciIommu> + '_
 {
     nodes(rimt).filter_map(|(at, kind, len)| {
-        let pcie = read_u32(rimt, at + 24) & IOMMU_FLAG_PCIE != 0;
+        let pcie = read_u32(rimt, at.saturating_add(24)) & IOMMU_FLAG_PCIE != 0;
         (kind == TYPE_IOMMU && len >= IOMMU_NODE_FIXED_LEN && pcie).then(|| PciIommu {
             node: u32::try_from(at).unwrap_or(u32::MAX),
-            segment: read_u16(rimt, at + 32),
-            function: bdf_of(read_u16(rimt, at + 34)),
+            segment: read_u16(rimt, at.saturating_add(32)),
+            function: bdf_of(read_u16(rimt, at.saturating_add(34))),
         })
     })
 }
@@ -221,18 +202,18 @@ pub fn pci_id_mappings(rimt: &[u8]) -> impl Iterator<Item = IdMapping> + '_
     nodes(rimt)
         .filter(|&(_, kind, len)| kind == TYPE_PCIE_ROOT_COMPLEX && len >= ROOT_COMPLEX_FIXED_LEN)
         .flat_map(move |(at, _, len)| {
-            let segment = read_u16(rimt, at + 14);
-            let first = at + usize::from(read_u16(rimt, at + 16));
-            let count = usize::from(read_u16(rimt, at + 18));
-            let fit = (at + len).saturating_sub(first) / ID_MAPPING_LEN;
+            let segment = read_u16(rimt, at.saturating_add(14));
+            let first = at.saturating_add(usize::from(read_u16(rimt, at.saturating_add(16))));
+            let count = usize::from(read_u16(rimt, at.saturating_add(18)));
+            let fit = at.saturating_add(len).saturating_sub(first) / ID_MAPPING_LEN;
             (0..count.min(fit)).map(move |i| {
-                let m = first + i * ID_MAPPING_LEN;
+                let m = first.saturating_add(i.saturating_mul(ID_MAPPING_LEN));
                 IdMapping {
                     segment,
                     source_base: read_u32(rimt, m),
-                    count: read_u32(rimt, m + 4),
-                    device_base: read_u32(rimt, m + 8),
-                    iommu: read_u32(rimt, m + 12),
+                    count: read_u32(rimt, m.saturating_add(4)),
+                    device_base: read_u32(rimt, m.saturating_add(8)),
+                    iommu: read_u32(rimt, m.saturating_add(12)),
                 }
             })
         })
@@ -271,7 +252,8 @@ pub fn resolve_scope(
         let whole = whole_buses(rimt, index, m, &mut out);
         for f in functions.clone()
         {
-            if !whole[usize::from(f.bus)] && mapping_for(rimt, segment, f) == Some(m)
+            if !whole.get(usize::from(f.bus)).copied().unwrap_or(false)
+                && mapping_for(rimt, segment, f) == Some(m)
             {
                 out(Resolved::Function(f));
             }
@@ -312,7 +294,10 @@ fn whole_buses(
             }
             continue;
         }
-        whole[usize::from(b)] = true;
+        if let Some(w) = whole.get_mut(usize::from(b))
+        {
+            *w = true;
+        }
         run = Some(run.map_or((b, b), |(first, _)| (first, b)));
     }
     if let Some((first, last)) = run

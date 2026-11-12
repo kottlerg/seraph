@@ -371,9 +371,10 @@ impl IommuClient
                 .min(iommu_labels::MAX_FAULTS_PER_REPLY);
             for i in 0..count
             {
-                let word = reply.word(1 + 2 * i);
+                let at = i.saturating_mul(2);
+                let word = reply.word(at.saturating_add(1));
                 let reason = u16::try_from((word >> 32) & 0xffff).unwrap_or(0);
-                each(word & 0xFFFF_FFFF, reason, reply.word(2 + 2 * i));
+                each(word & 0xFFFF_FFFF, reason, reply.word(at.saturating_add(2)));
             }
             if count < iommu_labels::MAX_FAULTS_PER_REPLY
             {
@@ -457,7 +458,7 @@ impl FaultCounts
     {
         if let Some(e) = self.0.iter_mut().find(|e| e.0 == rid)
         {
-            e.1 += 1;
+            e.1 = e.1.saturating_add(1);
             e.2 = iova;
         }
         else if self.0.try_reserve(1).is_ok()
@@ -720,7 +721,7 @@ impl Iommu
                     warn: "{}: firmware-reserved range {:#x}..{:#x} not mapped ({}); refused",
                     name,
                     r.base,
-                    r.base + r.len,
+                    r.base.saturating_add(r.len),
                     code
                 );
                 self.client.block(handle);
@@ -730,7 +731,7 @@ impl Iommu
                 "{}: firmware-reserved range {:#x}..{:#x} identity-mapped",
                 name,
                 r.base,
-                r.base + r.len
+                r.base.saturating_add(r.len)
             );
         }
         let limit = iova_limit(self.client.width(unit), dma_width);
@@ -788,7 +789,7 @@ impl Iommu
                      refused (platform error)",
                     name,
                     r.base,
-                    r.base + r.len
+                    r.base.saturating_add(r.len)
                 ),
                 ReservedError::PastWidth { base, last } => std::os::seraph::log!(
                     warn: "{}: firmware-reserved region {:#x}..={:#x} \
@@ -964,7 +965,11 @@ fn vtd_rounds(
         );
         let handed = rounds.len() < iommu_core::bootstrap::MAX_UNITS;
         let cap = words.as_ref().filter(|_| handed).and_then(|_| {
-            crate::carve_subrange(caps, unit.register_base, unit.register_pages * PAGE_SIZE)
+            crate::carve_subrange(
+                caps,
+                unit.register_base,
+                unit.register_pages.checked_mul(PAGE_SIZE)?,
+            )
         });
         if let (Some(words), Some(cap)) = (words, cap)
         {
@@ -1052,8 +1057,11 @@ fn riscv_round(
     let dev = devices.iter().find(|d| {
         (d.segment, d.bus, d.dev, d.func) == (iommu.segment, f.bus, f.device, f.function)
     })?;
-    let bar = (0..dev.bar_count)
-        .find(|&b| dev.bar_pci_idx[b] == 0 && dev.bar_is_mmio[b] && dev.bar_size[b] >= PAGE_SIZE)?;
+    let bar = (0..dev.bar_count).find(|&b| {
+        dev.bar_pci_idx.get(b) == Some(&0)
+            && dev.bar_is_mmio.get(b) == Some(&true)
+            && dev.bar_size.get(b).is_some_and(|&size| size >= PAGE_SIZE)
+    })?;
     let mut scopes = Vec::new();
     let functions = devices
         .iter()
@@ -1078,7 +1086,7 @@ fn riscv_round(
     {
         return None;
     }
-    let cap = crate::carve_subrange(caps, dev.bar_phys[bar], PAGE_SIZE)?;
+    let cap = crate::carve_subrange(caps, *dev.bar_phys.get(bar)?, PAGE_SIZE)?;
     Some(spawn::UnitRound { cap, words })
 }
 
@@ -1224,9 +1232,14 @@ fn take_family_driver(
     let mut i = 0;
     while i < modules.len()
     {
-        if firmware::binding::decl_rank(&modules[i].0, Source::BootModule, &record).is_none()
+        let Some(module) = modules.get(i)
+        else
         {
-            i += 1;
+            break;
+        };
+        if firmware::binding::decl_rank(&module.0, Source::BootModule, &record).is_none()
+        {
+            i = i.saturating_add(1);
             continue;
         }
         let (decl, cap) = modules.remove(i);
@@ -1248,14 +1261,14 @@ fn take_family_driver(
             let candidates = table.candidates();
             std::os::seraph::log!(
                 warn: "IOMMU record: {} and {} match it equally; neither bound",
-                candidates[first].decl.name.as_str(),
-                candidates[second].decl.name.as_str()
+                candidates.get(first).map_or("", |c| c.decl.name.as_str()),
+                candidates.get(second).map_or("", |c| c.decl.name.as_str())
             );
             None
         }
         Choice::Unmatched => None,
     };
-    let decl = chosen.map(|index| table.candidates()[index].decl);
+    let decl = chosen.and_then(|index| table.candidates().get(index).map(|c| c.decl));
     let mut module = None;
     for (index, cap) in table.drain_binaries().enumerate()
     {

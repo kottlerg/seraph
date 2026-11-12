@@ -151,11 +151,11 @@ fn package(buf: &[u8], lead: usize) -> Option<(usize, usize)>
         for i in 0..extra
         {
             let b = *buf.get(lead.checked_add(1)?.checked_add(i)?)?;
-            v |= usize::from(b) << (4 + 8 * i);
+            v |= usize::from(b) << i.saturating_mul(8).saturating_add(4);
         }
         v
     };
-    if len < extra + 1
+    if len < extra.saturating_add(1)
     {
         return None;
     }
@@ -164,7 +164,7 @@ fn package(buf: &[u8], lead: usize) -> Option<(usize, usize)>
     {
         return None;
     }
-    Some((lead + 1 + extra, end))
+    Some((lead.checked_add(1)?.checked_add(extra)?, end))
 }
 
 /// Size and last `NameSeg` of the `NameString` at `pos`. The last segment is
@@ -174,12 +174,12 @@ fn name_string(buf: &[u8], pos: usize) -> Option<(usize, Option<[u8; 4]>)>
     let mut p = pos;
     match *buf.get(p)?
     {
-        0x5C => p += 1,
+        0x5C => p = p.saturating_add(1),
         0x5E =>
         {
             while buf.get(p) == Some(&0x5E)
             {
-                p += 1;
+                p = p.saturating_add(1);
             }
         }
         _ =>
@@ -187,16 +187,16 @@ fn name_string(buf: &[u8], pos: usize) -> Option<(usize, Option<[u8; 4]>)>
     }
     let (segs, skip) = match *buf.get(p)?
     {
-        0x00 => return Some((p + 1 - pos, None)),
+        0x00 => return Some((p.checked_add(1)?.checked_sub(pos)?, None)),
         0x2E => (2, 1),
-        0x2F => (usize::from(*buf.get(p + 1)?), 2),
+        0x2F => (usize::from(*buf.get(p.saturating_add(1))?), 2),
         _ => (1, 0),
     };
-    p += skip;
+    p = p.saturating_add(skip);
     let mut last = None;
     for _ in 0..segs
     {
-        let seg = buf.get(p..p + 4)?;
+        let seg = buf.get(p..p.checked_add(4)?)?;
         let (first, rest) = seg.split_first()?;
         if !(first.is_ascii_uppercase() || *first == b'_')
             || !rest
@@ -205,10 +205,15 @@ fn name_string(buf: &[u8], pos: usize) -> Option<(usize, Option<[u8; 4]>)>
         {
             return None;
         }
-        last = Some([seg[0], seg[1], seg[2], seg[3]]);
-        p += 4;
+        let &[s0, s1, s2, s3] = seg
+        else
+        {
+            return None;
+        };
+        last = Some([s0, s1, s2, s3]);
+        p = p.saturating_add(4);
     }
-    Some((p - pos, last))
+    Some((p.checked_sub(pos)?, last))
 }
 
 /// Little-endian integer of `n` bytes at `off`.
@@ -231,10 +236,10 @@ fn integer(buf: &[u8], pos: usize) -> Option<(u64, usize)>
         OP_ZERO => Some((0, 1)),
         OP_ONE => Some((1, 1)),
         OP_ONES => Some((u64::MAX, 1)),
-        OP_BYTE => Some((le(buf, pos + 1, 1)?, 2)),
-        OP_WORD => Some((le(buf, pos + 1, 2)?, 3)),
-        OP_DWORD => Some((le(buf, pos + 1, 4)?, 5)),
-        OP_QWORD => Some((le(buf, pos + 1, 8)?, 9)),
+        OP_BYTE => Some((le(buf, pos.saturating_add(1), 1)?, 2)),
+        OP_WORD => Some((le(buf, pos.saturating_add(1), 2)?, 3)),
+        OP_DWORD => Some((le(buf, pos.saturating_add(1), 4)?, 5)),
+        OP_QWORD => Some((le(buf, pos.saturating_add(1), 8)?, 9)),
         _ => None,
     }
 }
@@ -250,16 +255,16 @@ fn data_size(buf: &[u8], pos: usize) -> Option<usize>
     {
         OP_STRING =>
         {
-            let rest = buf.get(pos + 1..)?;
+            let rest = buf.get(pos.saturating_add(1)..)?;
             let nul = rest.iter().position(|b| *b == 0)?;
-            Some(nul + 2)
+            nul.checked_add(2)
         }
         OP_BUFFER | OP_PACKAGE | OP_VAR_PACKAGE =>
         {
-            let (_, end) = package(buf, pos + 1)?;
-            Some(end - pos)
+            let (_, end) = package(buf, pos.saturating_add(1))?;
+            end.checked_sub(pos)
         }
-        OP_EXT_PREFIX if buf.get(pos + 1) == Some(&EXT_REVISION) => Some(2),
+        OP_EXT_PREFIX if buf.get(pos.saturating_add(1)) == Some(&EXT_REVISION) => Some(2),
         _ => None,
     }
 }
@@ -276,12 +281,13 @@ fn eisa_id(value: u32) -> Option<Id>
         {
             return None;
         }
-        *text.get_mut(i)? = letter + 0x40;
+        *text.get_mut(i)? = letter.checked_add(0x40)?;
     }
     for (i, shift) in [12u32, 8, 4, 0].into_iter().enumerate()
     {
         let digit = u8::try_from((s >> shift) & 0xF).ok()?;
-        *text.get_mut(3 + i)? = b"0123456789ABCDEF".get(usize::from(digit)).copied()?;
+        *text.get_mut(3usize.checked_add(i)?)? =
+            b"0123456789ABCDEF".get(usize::from(digit)).copied()?;
     }
     Id::new(&text)
 }
@@ -295,7 +301,7 @@ fn id_value(buf: &[u8], pos: usize) -> Option<Id>
     }
     if *buf.get(pos)? == OP_STRING
     {
-        let rest = buf.get(pos + 1..)?;
+        let rest = buf.get(pos.saturating_add(1)..)?;
         let nul = rest.iter().position(|b| *b == 0)?;
         return Id::new(rest.get(..nul)?);
     }
@@ -344,14 +350,14 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
         {
             OP_SCOPE =>
             {
-                let (body, end, _) = Self::named_package(buf, pos + 1)?;
-                self.term_list(buf.get(body..end)?, depth + 1, None);
+                let (body, end, _) = Self::named_package(buf, pos.saturating_add(1))?;
+                self.term_list(buf.get(body..end)?, depth.saturating_add(1), None);
                 Some(end)
             }
             OP_NAME => Self::def_name(buf, pos, dev),
             OP_METHOD =>
             {
-                let (_, end, name) = Self::named_package(buf, pos + 1)?;
+                let (_, end, name) = Self::named_package(buf, pos.saturating_add(1))?;
                 if let Some(c) = dev.as_deref_mut()
                     && matches!(name, Some(n) if is_dynamic_name(n))
                 {
@@ -361,20 +367,21 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
             }
             OP_IF | OP_ELSE | OP_WHILE =>
             {
-                let (_, end) = package(buf, pos + 1)?;
+                let (_, end) = package(buf, pos.saturating_add(1))?;
                 Some(end)
             }
             OP_EXTERNAL =>
             {
-                let (nl, _) = name_string(buf, pos + 1)?;
-                let end = pos + 1 + nl + 2;
+                let (nl, _) = name_string(buf, pos.saturating_add(1))?;
+                let end = pos.checked_add(1)?.checked_add(nl)?.checked_add(2)?;
                 (end <= buf.len()).then_some(end)
             }
             OP_ALIAS =>
             {
-                let (a, _) = name_string(buf, pos + 1)?;
-                let (b, _) = name_string(buf, pos + 1 + a)?;
-                Some(pos + 1 + a + b)
+                let (a, _) = name_string(buf, pos.saturating_add(1))?;
+                let after_a = pos.checked_add(1)?.checked_add(a)?;
+                let (b, _) = name_string(buf, after_a)?;
+                after_a.checked_add(b)
             }
             OP_EXT_PREFIX => self.ext_term(buf, pos, depth),
             _ => None,
@@ -384,42 +391,42 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
     /// Handle the `0x5B`-prefixed term at `pos`.
     fn ext_term(&mut self, buf: &'a [u8], pos: usize, depth: usize) -> Option<usize>
     {
-        match *buf.get(pos + 1)?
+        match *buf.get(pos.saturating_add(1))?
         {
             EXT_DEVICE =>
             {
-                let (body, end, _) = Self::named_package(buf, pos + 2)?;
+                let (body, end, _) = Self::named_package(buf, pos.saturating_add(2))?;
                 let mut c = Collect::default();
-                self.term_list(buf.get(body..end)?, depth + 1, Some(&mut c));
+                self.term_list(buf.get(body..end)?, depth.saturating_add(1), Some(&mut c));
                 self.report(&c);
                 Some(end)
             }
             EXT_FIELD | EXT_INDEX_FIELD | EXT_BANK_FIELD | EXT_PROCESSOR | EXT_POWER_RES
             | EXT_THERMAL_ZONE =>
             {
-                let (_, end) = package(buf, pos + 2)?;
+                let (_, end) = package(buf, pos.saturating_add(2))?;
                 Some(end)
             }
             EXT_OP_REGION =>
             {
-                let (nl, _) = name_string(buf, pos + 2)?;
-                let mut p = pos + 2 + nl + 1;
+                let (nl, _) = name_string(buf, pos.saturating_add(2))?;
+                let mut p = pos.checked_add(2)?.checked_add(nl)?.checked_add(1)?;
                 for _ in 0..2
                 {
-                    p += integer(buf, p)?.1;
+                    p = p.checked_add(integer(buf, p)?.1)?;
                 }
                 Some(p)
             }
             EXT_MUTEX =>
             {
-                let (nl, _) = name_string(buf, pos + 2)?;
-                let end = pos + 2 + nl + 1;
+                let (nl, _) = name_string(buf, pos.saturating_add(2))?;
+                let end = pos.checked_add(2)?.checked_add(nl)?.checked_add(1)?;
                 (end <= buf.len()).then_some(end)
             }
             EXT_EVENT =>
             {
-                let (nl, _) = name_string(buf, pos + 2)?;
-                Some(pos + 2 + nl)
+                let (nl, _) = name_string(buf, pos.saturating_add(2))?;
+                pos.checked_add(2)?.checked_add(nl)
             }
             _ => None,
         }
@@ -432,20 +439,20 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
     {
         let (name_at, end) = package(buf, lead)?;
         let (nl, last) = name_string(buf.get(..end)?, name_at)?;
-        Some((name_at + nl, end, last))
+        Some((name_at.checked_add(nl)?, end, last))
     }
 
     /// `DefName` at `pos`.
     fn def_name(buf: &'a [u8], pos: usize, dev: &mut Option<&mut Collect<'a>>) -> Option<usize>
     {
-        let (nl, last) = name_string(buf, pos + 1)?;
-        let value = pos + 1 + nl;
+        let (nl, last) = name_string(buf, pos.saturating_add(1))?;
+        let value = pos.checked_add(1)?.checked_add(nl)?;
         let size = data_size(buf, value)?;
         if let (Some(c), Some(name)) = (dev.as_deref_mut(), last)
         {
             record(c, name, buf, value, size);
         }
-        Some(value + size)
+        value.checked_add(size)
     }
 
     /// Report a finished device if it qualifies.
@@ -464,7 +471,7 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
             crs: c.crs,
         };
         (self.visit)(&device);
-        self.count += 1;
+        self.count = self.count.saturating_add(1);
     }
 }
 
@@ -477,7 +484,7 @@ fn is_dynamic_name(name: [u8; 4]) -> bool
 /// Record the value of `Name(name, <data at value..value+size>)` into `c`.
 fn record<'a>(c: &mut Collect<'a>, name: [u8; 4], buf: &'a [u8], value: usize, size: usize)
 {
-    let Some(data) = buf.get(..value + size)
+    let Some(data) = value.checked_add(size).and_then(|end| buf.get(..end))
     else
     {
         return;
@@ -515,7 +522,7 @@ fn record_cids(c: &mut Collect<'_>, buf: &[u8], pos: usize)
             && let Some(slot) = c.cids.get_mut(n)
         {
             *slot = Some(id);
-            n += 1;
+            n = n.saturating_add(1);
         }
     };
     if buf.get(pos) != Some(&OP_PACKAGE)
@@ -523,7 +530,7 @@ fn record_cids(c: &mut Collect<'_>, buf: &[u8], pos: usize)
         keep(id_value(buf, pos));
         return;
     }
-    let Some((body, end)) = package(buf, pos + 1)
+    let Some((body, end)) = package(buf, pos.saturating_add(1))
     else
     {
         return;
@@ -538,7 +545,7 @@ fn record_cids(c: &mut Collect<'_>, buf: &[u8], pos: usize)
     {
         return;
     };
-    let mut p = body + 1;
+    let mut p = body.saturating_add(1);
     for _ in 0..count
     {
         let Some(size) = data_size(limited, p)
@@ -547,7 +554,7 @@ fn record_cids(c: &mut Collect<'_>, buf: &[u8], pos: usize)
             break;
         };
         keep(id_value(limited, p));
-        p += size;
+        p = p.saturating_add(size);
     }
 }
 
@@ -558,9 +565,9 @@ fn crs_buffer(buf: &[u8], pos: usize) -> Option<&[u8]>
     {
         return None;
     }
-    let (body, end) = package(buf, pos + 1)?;
+    let (body, end) = package(buf, pos.saturating_add(1))?;
     let (declared, isz) = integer(buf, body)?;
-    let list = buf.get(body + isz..end)?;
+    let list = buf.get(body.checked_add(isz)?..end)?;
     let keep = usize::try_from(declared).map_or(list.len(), |d| d.min(list.len()));
     list.get(..keep)
 }
@@ -647,7 +654,7 @@ impl<F: FnMut(CrsResource)> Emit<F>
             return false;
         }
         (self.visit)(r);
-        self.n += 1;
+        self.n = self.n.saturating_add(1);
         true
     }
 }
@@ -680,16 +687,18 @@ pub fn crs_resources(crs: &[u8], visit: impl FnMut(CrsResource)) -> usize
         let (kind, body, next) = if tag & 0x80 == 0
         {
             let len = usize::from(tag & 7);
-            let Some(body) = crs.get(pos + 1..pos + 1 + len)
+            let body_at = pos.saturating_add(1);
+            let next = body_at.saturating_add(len);
+            let Some(body) = crs.get(body_at..next)
             else
             {
                 break;
             };
-            ((tag >> 3) & 0xF, body, pos + 1 + len)
+            ((tag >> 3) & 0xF, body, next)
         }
         else
         {
-            let Some(len) = le(crs, pos + 1, 2)
+            let Some(len) = le(crs, pos.saturating_add(1), 2)
             else
             {
                 break;
@@ -699,12 +708,14 @@ pub fn crs_resources(crs: &[u8], visit: impl FnMut(CrsResource)) -> usize
             {
                 break;
             };
-            let Some(body) = crs.get(pos + 3..pos + 3 + len)
+            let body_at = pos.saturating_add(3);
+            let next = body_at.saturating_add(len);
+            let Some(body) = crs.get(body_at..next)
             else
             {
                 break;
             };
-            (tag & 0x7F, body, pos + 3 + len)
+            (tag & 0x7F, body, next)
         };
         let ok = if tag & 0x80 == 0
         {
@@ -820,10 +831,11 @@ fn large<F: FnMut(CrsResource)>(em: &mut Emit<F>, kind: u8, body: &[u8]) -> bool
         {
             let flags = body.first().copied().unwrap_or(0);
             let count = usize::from(body.get(1).copied().unwrap_or(0));
-            let avail = (body.len() - 2) / 4;
+            let avail = body.len().saturating_sub(2) / 4;
             for i in 0..count.min(avail)
             {
-                let Some(line) = le(body, 2 + 4 * i, 4).and_then(|v| u32::try_from(v).ok())
+                let Some(line) = le(body, i.saturating_mul(4).saturating_add(2), 4)
+                    .and_then(|v| u32::try_from(v).ok())
                 else
                 {
                     break;

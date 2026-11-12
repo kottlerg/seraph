@@ -484,6 +484,8 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         };
         *slot = copy;
     }
+    // The end slots follow the resource slots. The check at entry bounds the
+    // resources by `MAX_BOUND_RESOURCES`, so every end slot is in `derived`.
     let count = config.resources.len();
     let Ok(service_copy) = syscall::cap_derive(config.service_ep, syscall::RIGHTS_ALL)
     else
@@ -492,7 +494,10 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         delete_all(&derived);
         return DriverSpawn::Failed;
     };
-    derived[count] = service_copy;
+    if let Some(slot) = derived.get_mut(count)
+    {
+        *slot = service_copy;
+    }
     let Ok(query_copy) = syscall::cap_derive_badge(
         config.query_ep,
         syscall::RIGHTS_EP_SEND,
@@ -504,7 +509,10 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         delete_all(&derived);
         return DriverSpawn::Failed;
     };
-    derived[count + 1] = query_copy;
+    if let Some(slot) = derived.get_mut(count.saturating_add(1))
+    {
+        *slot = query_copy;
+    }
     let dma_copy = match config.dma_cap
     {
         Some(dma) =>
@@ -520,7 +528,10 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         }
         None => 0,
     };
-    derived[count + 2] = dma_copy;
+    if let Some(slot) = derived.get_mut(count.saturating_add(2))
+    {
+        *slot = dma_copy;
+    }
 
     let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -642,7 +653,7 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
 {
     let mut module_guard = ModuleCapGuard::new(config.module_cap);
     let release_units = |from: usize| {
-        for u in &config.units[from..]
+        for u in config.units.get(from..).unwrap_or(&[])
         {
             let _ = syscall::cap_delete(u.cap);
         }

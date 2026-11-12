@@ -138,7 +138,8 @@ impl Mapping
     /// `[addr, addr + len)`.
     fn overlaps(&self, addr: u64, len: u64) -> bool
     {
-        self.device_addr < addr + len && addr < self.device_addr + self.len
+        self.device_addr < addr.saturating_add(len)
+            && addr < self.device_addr.saturating_add(self.len)
     }
 }
 
@@ -158,7 +159,7 @@ impl ReservedRange
     /// Whether the range shares a byte with `[addr, addr + len)`.
     fn overlaps(&self, addr: u64, len: u64) -> bool
     {
-        self.base < addr.saturating_add(len) && addr < self.base + self.len
+        self.base < addr.saturating_add(len) && addr < self.base.saturating_add(self.len)
     }
 }
 
@@ -226,7 +227,7 @@ pub fn reserved_ranges(
         }
         ranges.push(ReservedRange {
             base,
-            len: end - base,
+            len: end.saturating_sub(base),
         });
     }
     ranges.sort_unstable_by_key(|r| r.base);
@@ -238,10 +239,13 @@ pub fn reserved_ranges(
     {
         match merged.last_mut()
         {
-            Some(prev) if r.base <= prev.base + prev.len =>
+            Some(prev) if r.base <= prev.base.saturating_add(prev.len) =>
             {
-                let end = (prev.base + prev.len).max(r.base + r.len);
-                prev.len = end - prev.base;
+                let end = prev
+                    .base
+                    .saturating_add(prev.len)
+                    .max(r.base.saturating_add(r.len));
+                prev.len = end.saturating_sub(prev.base);
             }
             _ => merged.push(r),
         }
@@ -393,11 +397,11 @@ impl Device
             let clash_end = if let Some(e) =
                 self.entries.iter().find(|e| e.mapping.overlaps(start, len))
             {
-                e.mapping.device_addr + e.mapping.len
+                e.mapping.device_addr.saturating_add(e.mapping.len)
             }
             else if let Some(r) = self.reserved.iter().find(|r| r.overlaps(start, len))
             {
-                r.base + r.len
+                r.base.saturating_add(r.len)
             }
             else if interrupt_range
                 && INTERRUPT_RANGE.start < start.saturating_add(len)

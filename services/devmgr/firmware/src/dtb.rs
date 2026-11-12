@@ -14,6 +14,7 @@ use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
 use super::EcamLocation;
+use crate::bytes::{be_u32, be_u64};
 
 const FDT_MAGIC: u32 = 0xd00d_feed;
 
@@ -45,33 +46,6 @@ const MAX_DEPTH: usize = 16;
 /// does not set them (Device Tree Specification § 2.3.5).
 const DEFAULT_CELLS: (usize, usize) = (2, 1);
 
-fn be_u32(buf: &[u8], off: usize) -> u32
-{
-    if off + 4 > buf.len()
-    {
-        return 0;
-    }
-    u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-fn be_u64(buf: &[u8], off: usize) -> u64
-{
-    if off + 8 > buf.len()
-    {
-        return 0;
-    }
-    u64::from_be_bytes([
-        buf[off],
-        buf[off + 1],
-        buf[off + 2],
-        buf[off + 3],
-        buf[off + 4],
-        buf[off + 5],
-        buf[off + 6],
-        buf[off + 7],
-    ])
-}
-
 /// Parsed flat device tree view.
 pub struct Fdt<'a>
 {
@@ -101,7 +75,9 @@ impl<'a> Fdt<'a>
         let dt_struct_off = be_u32(blob, HDR_OFF_DT_STRUCT) as usize;
         let dt_struct_len = be_u32(blob, HDR_SIZE_DT_STRUCT) as usize;
         let dt_strings_off = be_u32(blob, HDR_OFF_DT_STRINGS) as usize;
-        if dt_struct_off + dt_struct_len > totalsize
+        if dt_struct_off
+            .checked_add(dt_struct_len)
+            .is_none_or(|end| end > totalsize)
         {
             return None;
         }
@@ -116,14 +92,16 @@ impl<'a> Fdt<'a>
     /// Read a NUL-terminated string from the strings block at `off`.
     fn read_string(&self, off: usize) -> &'a [u8]
     {
-        let start = self.dt_strings_off + off;
-        if start >= self.blob.len()
+        let Some(remain) = self
+            .dt_strings_off
+            .checked_add(off)
+            .and_then(|start| self.blob.get(start..))
+        else
         {
             return &[];
-        }
-        let remain = &self.blob[start..];
-        let end = remain.iter().position(|&b| b == 0).unwrap_or(remain.len());
-        &remain[..end]
+        };
+        // `split` always yields a first piece: the bytes up to the first NUL.
+        remain.split(|&b| b == 0).next().unwrap_or(&[])
     }
 
     /// Collect the PCI ECAM window of every `pci-host-ecam-generic` node
@@ -166,7 +144,7 @@ impl<'a> Fdt<'a>
             {
                 FdtEvent::BeginNode =>
                 {
-                    depth += 1;
+                    depth = depth.saturating_add(1);
                     if let Some(c) = cells.get_mut(depth)
                     {
                         *c = DEFAULT_CELLS;
@@ -204,7 +182,12 @@ impl<'a> Fdt<'a>
                         {
                             continue;
                         };
-                        let (addr_cells, size_cells) = cells[depth - 1];
+                        let Some(&(addr_cells, size_cells)) =
+                            depth.checked_sub(1).and_then(|parent| cells.get(parent))
+                        else
+                        {
+                            continue;
+                        };
                         if let Some((loc, domain)) =
                             extract_ecam(self, node_start, addr_cells, size_cells)
                         {
@@ -233,7 +216,12 @@ fn assign_fallback_segments(found: &mut [(EcamLocation, bool)])
 {
     for i in 0..found.len()
     {
-        if found[i].1
+        let Some(&(_, explicit)) = found.get(i)
+        else
+        {
+            continue;
+        };
+        if explicit
         {
             continue;
         }
@@ -242,7 +230,11 @@ fn assign_fallback_segments(found: &mut [(EcamLocation, bool)])
                 .enumerate()
                 .any(|(j, &(l, explicit))| (explicit || j < i) && l.segment == seg)
         };
-        found[i].0.segment = (0..=u16::MAX).find(|&seg| !taken(seg, found)).unwrap_or(0);
+        let segment = (0..=u16::MAX).find(|&seg| !taken(seg, found)).unwrap_or(0);
+        if let Some(window) = found.get_mut(i)
+        {
+            window.0.segment = segment;
+        }
     }
 }
 
@@ -250,18 +242,17 @@ fn assign_fallback_segments(found: &mut [(EcamLocation, bool)])
 /// strings) contains `needle`.
 fn compatible_contains(data: &[u8], needle: &[u8]) -> bool
 {
-    let mut off = 0;
-    while off < data.len()
+    let mut rest = data;
+    while !rest.is_empty()
     {
-        let end = data[off..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(data.len() - off);
-        if &data[off..off + end] == needle
+        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        let (entry, tail) = rest.split_at(end);
+        if entry == needle
         {
             return true;
         }
-        off += end + 1;
+        // Skip the entry's NUL terminator.
+        rest = tail.get(1..).unwrap_or(&[]);
     }
     false
 }
@@ -301,10 +292,10 @@ fn extract_ecam(
     {
         match event
         {
-            FdtEvent::BeginNode => depth += 1,
+            FdtEvent::BeginNode => depth = depth.saturating_add(1),
             FdtEvent::EndNode =>
             {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0
                 {
                     break;
@@ -312,12 +303,15 @@ fn extract_ecam(
             }
             FdtEvent::Prop { name, data } if depth == 1 && name == b"reg" =>
             {
-                if data.len() < (addr_cells + size_cells) * 4
+                if addr_cells
+                    .checked_add(size_cells)
+                    .and_then(|cells| cells.checked_mul(4))
+                    .is_none_or(|need| data.len() < need)
                 {
                     return None;
                 }
                 let base = read_cells(data, 0, addr_cells)?;
-                let size = read_cells(data, addr_cells * 4, size_cells)?;
+                let size = read_cells(data, addr_cells.saturating_mul(4), size_cells)?;
                 reg = Some((base, size));
             }
             FdtEvent::Prop { name, data } if depth == 1 && name == b"bus-range" =>
@@ -358,9 +352,11 @@ fn extract_ecam(
         return None;
     }
     let start_bus = u8::try_from(first).ok()?;
-    let covered_last = u64::from(first) + reg_buses - 1;
+    let covered_last = u64::from(first).checked_add(reg_buses)?.checked_sub(1)?;
     let end_bus = u8::try_from(u64::from(last).min(covered_last).min(255)).ok()?;
-    let bus_count = u64::from(end_bus) - u64::from(start_bus) + 1;
+    let bus_count = u64::from(end_bus)
+        .checked_sub(u64::from(start_bus))?
+        .checked_add(1)?;
     base.checked_add(bus_count << 20)?;
     let loc = EcamLocation {
         phys_base: base,
@@ -400,7 +396,7 @@ impl<'a> FdtWalker<'a>
         Self {
             fdt,
             off: fdt.dt_struct_off,
-            end: fdt.dt_struct_off + fdt.dt_struct_len,
+            end: fdt.dt_struct_off.saturating_add(fdt.dt_struct_len),
             current_node_start: None,
         }
     }
@@ -410,7 +406,7 @@ impl<'a> FdtWalker<'a>
         Self {
             fdt,
             off: node_start,
-            end: fdt.dt_struct_off + fdt.dt_struct_len,
+            end: fdt.dt_struct_off.saturating_add(fdt.dt_struct_len),
             current_node_start: Some(node_start),
         }
     }
@@ -419,29 +415,26 @@ impl<'a> FdtWalker<'a>
     {
         loop
         {
-            if self.off + 4 > self.end
-            {
-                return None;
-            }
-            let tok = be_u32(self.fdt.blob, self.off);
-            self.off += 4;
+            let tok_off = self.off;
+            let after_tok = tok_off.checked_add(4).filter(|&e| e <= self.end)?;
+            let tok = be_u32(self.fdt.blob, tok_off);
+            self.off = after_tok;
             match tok
             {
                 FDT_BEGIN_NODE =>
                 {
-                    let start_of_node = self.off - 4;
-                    self.current_node_start = Some(start_of_node);
+                    self.current_node_start = Some(tok_off);
                     let name_off = self.off;
                     // Name is NUL-terminated, padded to 4 bytes. Devmgr
                     // does not use the node name; the walker just skips it.
                     let mut p = name_off;
-                    while p < self.end && self.fdt.blob[p] != 0
+                    while p < self.end && self.fdt.blob.get(p).is_some_and(|&b| b != 0)
                     {
-                        p += 1;
+                        p = p.saturating_add(1);
                     }
                     // skip NUL + padding
-                    p += 1;
-                    p = (p + 3) & !3;
+                    p = p.saturating_add(1);
+                    p = p.saturating_add(3) & !3;
                     self.off = p;
                     return Some(FdtEvent::BeginNode);
                 }
@@ -451,19 +444,13 @@ impl<'a> FdtWalker<'a>
                 }
                 FDT_PROP =>
                 {
-                    if self.off + 8 > self.end
-                    {
-                        return None;
-                    }
+                    let hdr_end = self.off.checked_add(8).filter(|&e| e <= self.end)?;
                     let len = be_u32(self.fdt.blob, self.off) as usize;
-                    let nameoff = be_u32(self.fdt.blob, self.off + 4) as usize;
-                    self.off += 8;
-                    if self.off + len > self.end
-                    {
-                        return None;
-                    }
-                    let data = &self.fdt.blob[self.off..self.off + len];
-                    self.off = (self.off + len + 3) & !3;
+                    let nameoff = be_u32(self.fdt.blob, self.off.saturating_add(4)) as usize;
+                    self.off = hdr_end;
+                    let data_end = hdr_end.checked_add(len).filter(|&e| e <= self.end)?;
+                    let data = self.fdt.blob.get(hdr_end..data_end)?;
+                    self.off = data_end.saturating_add(3) & !3;
                     let name = self.fdt.read_string(nameoff);
                     return Some(FdtEvent::Prop { name, data });
                 }

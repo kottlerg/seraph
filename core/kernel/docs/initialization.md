@@ -332,7 +332,7 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    - APIC timer vector (32) and spurious vector (255)
    - TLB-shootdown (250) and wakeup (251) IPI vectors
    - Device IRQ vectors 33–249, one generated stub each; a vector is assigned to a GSI when
-     the GSI is routed (`SYS_IRQ_REGISTER`)
+     the GSI is routed (`SYS_IRQ_ROUTE`)
 5. Switch to x2APIC mode where CPUID advertises it, software-enable the BSP local APIC
    with every LVT masked, and mask every I/O APIC entry
 6. Configure SYSCALL/SYSRET: set EFER.SCE; write LSTAR, STAR, SFMASK (clears IF, TF, DF, AC,

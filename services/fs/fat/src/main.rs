@@ -35,6 +35,9 @@
 //! Crash window discussion lives in
 //! `services/fs/fat/docs/crash-safety.md`.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod alloc;
 mod backend;
 mod bpb;
@@ -193,10 +196,8 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
     {
         return ipc::fs_errors::IO_ERROR;
     }
-    // cast_possible_truncation: block_size is at most MAX_SECTOR_SIZE.
-    #[allow(clippy::cast_possible_truncation)]
-    let block_bytes = block_size as usize;
-    if !bpb::parse_bpb(&sector_buf[..block_bytes], block_size, state)
+    // The BPB lies in the sector's first 512 bytes, whatever its size.
+    if !bpb::parse_bpb(&sector_buf, block_size, state)
     {
         return ipc::fs_errors::NOT_FOUND;
     }
@@ -655,7 +656,7 @@ fn handle_read(
 
     let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, bytes_read as u64)
-        .bytes(1, &out[..bytes_read])
+        .bytes(1, out.get(..bytes_read).unwrap_or_default())
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -697,9 +698,8 @@ fn read_memory_for_open(
         return;
     }
 
-    let file_size = u64::from(node.size);
-
-    if offset >= file_size
+    let Some(left_in_file) = u64::from(node.size).checked_sub(offset).filter(|&n| n > 0)
+    else
     {
         // EOF: zero bytes valid, no cap.
         let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
@@ -709,32 +709,23 @@ fn read_memory_for_open(
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
-    }
-
-    // Walk the cluster chain to find the sector at `offset`.
-    let cluster_size = u64::from(state.cluster_size());
-    let bytes_per_sector = u64::from(state.bytes_per_sector);
-    let cluster_idx = offset / cluster_size;
-    let offset_in_cluster = offset % cluster_size;
-    // cast_possible_truncation: the quotient is below the cluster's
-    // sector count, a `u8` BPB field.
-    #[allow(clippy::cast_possible_truncation)]
-    let sector_in_cluster = (offset_in_cluster / bytes_per_sector) as u32;
-    let byte_in_sector = offset_in_cluster % bytes_per_sector;
+    };
 
     // A non-empty file's first cluster comes from its directory entry,
     // untrusted on-disk input; one outside the data region is corrupt.
-    if !state.is_data_cluster(node.cluster)
+    let Some(pos) = state
+        .file_position(offset)
+        .filter(|_| state.is_data_cluster(node.cluster))
+    else
     {
-        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
-    }
+    };
+    // Walk the cluster chain to find the sector at `offset`.
     let mut cluster = node.cluster;
     // `offset` is below the `u32` file size, so the walk ends within
     // `u32::MAX / cluster_size` steps even on a cyclic chain.
-    for _ in 0..cluster_idx
+    for _ in 0..pos.cluster_index
     {
         if let Some(c) = next_cluster(state, cluster, cache, block_dev, ipc_buf)
         {
@@ -744,20 +735,32 @@ fn read_memory_for_open(
         {
             // A FAT sector read that met a full cache fails the walk.
             relieve_pressure(files, cache, eviction);
-            let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
             return;
         }
     }
-    let sector = u64::from(state.cluster_to_sector(cluster) + sector_in_cluster);
-    let page_base = cache.page_base_of(sector);
+    let sector = u64::from(
+        state
+            .cluster_to_sector(cluster)
+            .saturating_add(pos.sector_in_cluster),
+    );
     // The file's byte at `offset` lives at memory-cap offset
-    // `(sector - page_base) * bytes_per_sector + byte_in_sector` within the
-    // returned slot. For sector- and page-aligned data areas this folds
-    // to zero; for misaligned data areas (data area starting mid-page)
-    // the sector-position term is non-zero on the page boundary.
-    let memory_data_offset = (sector - page_base) * bytes_per_sector + byte_in_sector;
+    // `sector_offset + offset_in_sector` within the returned slot: the
+    // sector's place in its page, then the byte's in its sector. For sector-
+    // and page-aligned data areas the sector term folds to zero; for
+    // misaligned data areas (data area starting mid-page) it is non-zero on
+    // the page boundary. The sector lies inside its page, so the byte does
+    // and the page holds at least one byte from it; the check only keeps
+    // the arithmetic total.
+    let (page_base, sector_offset) = cache.page_of(sector);
+    let Some((memory_data_offset, page_left)) = sector_offset
+        .checked_add(pos.offset_in_sector as u64)
+        .and_then(|off| Some((off, PAGE_SIZE.checked_sub(off).filter(|&n| n > 0)?)))
+    else
+    {
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    };
 
     let Some(slot_idx) = cache.acquire_page(page_base, block_dev, ipc_buf)
     else
@@ -832,10 +835,7 @@ fn read_memory_for_open(
     //                  (bytes before memory_data_offset belong to other files
     //                   or the previous cluster's leftover sectors)
     // None bounds a file: the client reads on with further calls.
-    let cluster_remaining = cluster_size - offset_in_cluster;
-    let bytes_valid = (file_size - offset)
-        .min(cluster_remaining)
-        .min(PAGE_SIZE - memory_data_offset);
+    let bytes_valid = left_in_file.min(pos.left_in_cluster).min(page_left);
     let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, bytes_valid)
         .word(1, cookie)
@@ -1360,8 +1360,6 @@ fn write_file_bytes(
     ipc_buf: *mut u64,
 ) -> Result<(u32, u32), FatError>
 {
-    let cluster_size = u64::from(state.cluster_size());
-    let bps = u64::from(state.bytes_per_sector);
     if data.is_empty()
     {
         return Ok((start_cluster, file_size));
@@ -1388,7 +1386,7 @@ fn write_file_bytes(
     }
 
     let mut cluster = chain_head;
-    let target_cluster_idx = offset / cluster_size;
+    let first = state.file_position(offset).ok_or(FatError::Corrupt)?;
 
     // Walk to the cluster containing the target offset, allocating
     // along the way for sparse writes. When we hit EOC, the current
@@ -1399,7 +1397,7 @@ fn write_file_bytes(
     // terminal, overwriting that terminal's existing forward link and
     // orphaning the original tail.) `end` fits a `u32`, so the walk ends
     // within `u32::MAX / cluster_size` steps even on a cyclic chain.
-    for _ in 0..target_cluster_idx
+    for _ in 0..first.cluster_index
     {
         cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?
         {
@@ -1408,22 +1406,28 @@ fn write_file_bytes(
         };
     }
 
-    let mut written = 0usize;
+    let mut cluster_index = first.cluster_index;
+    let mut rest = data;
     let mut cur_offset = offset;
-    while written < data.len()
+    while !rest.is_empty()
     {
-        let cluster_byte_offset = cur_offset % cluster_size;
-        // cast_possible_truncation: the quotient is below the cluster's
-        // sector count, a `u8` BPB field.
-        #[allow(clippy::cast_possible_truncation)]
-        let sector_in_cluster = (cluster_byte_offset / bps) as u32;
-        // cast_possible_truncation: the remainder is below `bps`, a `u16`.
-        #[allow(clippy::cast_possible_truncation)]
-        let byte_in_sector = (cluster_byte_offset % bps) as usize;
-        let sector_lba = state.cluster_to_sector(cluster) + sector_in_cluster;
-
-        let bytes_avail_in_sector = usize::from(state.bytes_per_sector) - byte_in_sector;
-        let bytes_to_write = bytes_avail_in_sector.min(data.len() - written);
+        let pos = state.file_position(cur_offset).ok_or(FatError::Corrupt)?;
+        // The previous sector ended its cluster: move on to the next one.
+        if pos.cluster_index != cluster_index
+        {
+            cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?
+            {
+                Some(c) => c,
+                None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
+            };
+            cluster_index = pos.cluster_index;
+        }
+        let sector_lba = state
+            .cluster_to_sector(cluster)
+            .saturating_add(pos.sector_in_cluster);
+        let (chunk, tail) = rest
+            .split_at_checked(pos.left_in_sector)
+            .unwrap_or((rest, &[]));
 
         // Read-modify-write the sector unless we are writing the full
         // sector from offset 0. Heap-allocated to keep the
@@ -1431,33 +1435,30 @@ fn write_file_bytes(
         // when release LTO inlines the nested helpers
         // (`insert_entry → write_dir_slot → ...`).
         let mut sector_buf = sector_buffer()?;
-        let full_sector_overwrite = byte_in_sector == 0 && bytes_to_write == state.sector_bytes();
+        let full_sector_overwrite =
+            pos.offset_in_sector == 0 && chunk.len() == state.sector_bytes();
         if !full_sector_overwrite
-            && !cache.read_sector(u64::from(sector_lba), block_dev, &mut sector_buf, ipc_buf)
+            && !cache.read_sector(u64::from(sector_lba), block_dev, &mut *sector_buf, ipc_buf)
         {
             return Err(FatError::Io);
         }
-        sector_buf[byte_in_sector..byte_in_sector + bytes_to_write]
-            .copy_from_slice(&data[written..written + bytes_to_write]);
-        if !cache.write_sector(u64::from(sector_lba), block_dev, &sector_buf, ipc_buf)
+        // The chunk ends at or before the sector's end.
+        let dst = state
+            .sector_mut(&mut sector_buf)
+            .get_mut(pos.offset_in_sector..)
+            .unwrap_or_default();
+        for (d, &b) in dst.iter_mut().zip(chunk)
+        {
+            *d = b;
+        }
+        if !cache.write_sector(u64::from(sector_lba), block_dev, &*sector_buf, ipc_buf)
         {
             return Err(FatError::Io);
         }
 
-        written += bytes_to_write;
-        cur_offset += bytes_to_write as u64;
-
-        // Advance to next cluster if we still have data to write and
-        // this write touched the cluster tail.
-        let new_cluster_offset = cur_offset % cluster_size;
-        if new_cluster_offset == 0 && written < data.len()
-        {
-            cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?
-            {
-                Some(c) => c,
-                None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
-            };
-        }
+        rest = tail;
+        // Bounded by `end`, a `u32`, so this never saturates.
+        cur_offset = cur_offset.saturating_add(chunk.len() as u64);
     }
 
     debug_assert_eq!(cur_offset, u64::from(end));
@@ -1492,13 +1493,17 @@ fn handle_write(
     }
     let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
     let offset = msg.word(0);
-    let data_bytes = msg.data_bytes();
-    if byte_len == 0 || data_bytes.len() < 8 + byte_len
+    // The payload follows the offset word.
+    let Some(payload) = msg
+        .data_bytes()
+        .get(8..)
+        .and_then(|bytes| bytes.get(..byte_len))
+        .filter(|_| byte_len != 0)
+    else
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
-    }
-    let payload = &data_bytes[8..8 + byte_len];
+    };
 
     let (new_cluster, new_size) = match write_file_bytes(
         node.cluster,
@@ -1597,8 +1602,9 @@ fn handle_write_memory(
     #[allow(clippy::cast_possible_truncation)]
     let (byte_count, memory_data_offset) = (msg.word(1) as usize, msg.word(2) as usize);
     if byte_count == 0
-        || memory_data_offset >= PAGE_BYTES
-        || byte_count > PAGE_BYTES - memory_data_offset
+        || PAGE_BYTES
+            .checked_sub(memory_data_offset)
+            .is_none_or(|page_left| byte_count > page_left)
     {
         reply_with(ipc::fs_errors::BAD_MEMORY_OFFSET, ipc_buf);
         return;
@@ -1675,7 +1681,7 @@ fn handle_write_memory(
     // Map-only cap); bounds checked above.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            (va + memory_data_offset as u64) as *const u8,
+            va.saturating_add(memory_data_offset as u64) as *const u8,
             buf.as_mut_ptr(),
             byte_count,
         );
@@ -1692,7 +1698,7 @@ fn handle_write_memory(
         node.cluster,
         node.size,
         offset,
-        &buf[..byte_count],
+        buf.get(..byte_count).unwrap_or_default(),
         state,
         cache,
         block_dev,
@@ -1881,13 +1887,12 @@ fn create_entry_common(
         }
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    let data_bytes = msg.data_bytes();
-    if name_len == 0 || data_bytes.len() < name_len
+    let Some(name) = msg.data_bytes().get(..name_len).filter(|_| name_len != 0)
+    else
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
-    }
-    let name = &data_bytes[..name_len];
+    };
     if namespace_protocol::validate_name(name).is_err()
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
@@ -1998,13 +2003,12 @@ fn handle_remove_node_cap(
         }
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    let data_bytes = msg.data_bytes();
-    if name_len == 0 || data_bytes.len() < name_len
+    let Some(name) = msg.data_bytes().get(..name_len).filter(|_| name_len != 0)
+    else
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
-    }
-    let name = &data_bytes[..name_len];
+    };
 
     let Some((entry, removed_loc)) = dir::find_in_directory_with_location(
         parent_cluster,
@@ -2161,21 +2165,17 @@ fn handle_rename_node_cap(
     // `usize` holds every `u64`; both lengths are bounded below.
     #[allow(clippy::cast_possible_truncation)]
     let (src_len, dst_len) = (msg.word(0) as usize, msg.word(1) as usize);
-    let data_bytes = msg.data_bytes();
-    let name_off: usize = 16; // words 0,1 = lengths (16 bytes), names from word 2
-    // Both lengths are client words: bound their sum without overflow
-    // before slicing.
-    let Some(name_end) = name_off
-        .checked_add(src_len)
-        .and_then(|end| end.checked_add(dst_len))
-        .filter(|&end| src_len != 0 && dst_len != 0 && end <= data_bytes.len())
+    // Words 0 and 1 hold the lengths (16 bytes); the names follow from word
+    // 2. Both lengths are client words: a name past the data is refused.
+    let names = msg.data_bytes().get(16..).unwrap_or_default();
+    let Some((src_name, dst_name)) = names.split_at_checked(src_len).and_then(|(src, rest)| {
+        (src_len != 0 && dst_len != 0).then_some((src, rest.get(..dst_len)?))
+    })
     else
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    let src_name = &data_bytes[name_off..name_off + src_len];
-    let dst_name = &data_bytes[name_off + src_len..name_end];
 
     if namespace_protocol::validate_name(src_name).is_err()
         || namespace_protocol::validate_name(dst_name).is_err()

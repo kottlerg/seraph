@@ -516,9 +516,12 @@ pub unsafe fn init_ap();
 /// lock and only for a routed line, from `SYS_IRQ_ACK` through `irq::ack` and
 /// from a binding's removal, each once no binding on the line owes an
 /// acknowledgement. The caller then reads the line's owing mask and calls `mask`
-/// when a delivery that raced the unmask marked a binding owing, so `unmask`
-/// must leave its controller write ordered before that read: RISC-V's fences
-/// its APLIC writes, and x86-64's shares `IOAPIC_LOCK` with `mask`.
+/// when a delivery that raced the unmask marked a binding owing. A delivery marks
+/// its bindings owing and then calls `mask`. So `unmask` must leave its
+/// controller write ordered before the caller's later read, and `mask` must leave
+/// the caller's earlier memory writes ordered before its controller write. On
+/// RISC-V every APLIC write is preceded by `fence w,o`, and `unmask` ends with
+/// `fence o,r`. On x86-64, `mask` and `unmask` both hold `IOAPIC_LOCK`.
 pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);

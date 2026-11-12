@@ -191,7 +191,8 @@ impl LineMasks
     /// A delivery: every binding in `bound` (the mask the delivery read) now
     /// owes an acknowledgement, and then the line is masked through `mask`.
     /// Marking before masking lets an unmask that raced the mask see the debt
-    /// ([`LineMasks::unmask_settled`]).
+    /// ([`LineMasks::unmask_settled`]). `mask` must order this marking before
+    /// its controller write.
     fn deliver(&self, bound: u64, mask: impl FnOnce())
     {
         self.owing.fetch_or(bound, Ordering::SeqCst);
@@ -802,8 +803,9 @@ unsafe fn unbind(
 /// Unmask line `irq`, whose bindings were found owing nothing under the routing
 /// lock, and mask it again if a delivery that raced the unmask marked a binding
 /// owing ([`LineMasks::unmask_settled`]; module doc § Thread safety). On
-/// riscv64 the APLIC writes are unlocked, and `aia::unmask` fences them before
-/// the owing mask's read. On x86-64 the unmask and a racing delivery's mask
+/// riscv64 the APLIC writes are unlocked: `aia::unmask` fences them before the
+/// owing mask's read, and a racing delivery's `aia::mask` orders the delivery's
+/// marking before its write (`fence w,o`). On x86-64 the unmask and a racing delivery's mask
 /// both take `IOAPIC_LOCK`: when the mask's critical section comes first, the
 /// delivery marked its bindings before it, and the lock hands that write to the
 /// read; when it comes second, the mask lands last.

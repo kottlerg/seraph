@@ -377,7 +377,9 @@ pub fn unroute(source: u32)
 }
 
 /// Disable `source` at the APLIC (`clrienum`); a source the domain does not
-/// implement is ignored.
+/// implement is ignored. The write is ordered after this hart's earlier memory
+/// writes, so a delivery's marking of its bindings owing precedes its mask at
+/// the APLIC (`irq::unmask_settled`).
 pub fn mask(source: u32)
 {
     if implemented(source)
@@ -452,7 +454,8 @@ fn aplic_read(offset: u64) -> u32
 
 /// Write `val` to the APLIC register at `offset`, ordered after this hart's
 /// earlier memory writes (a route's EID-row entry is visible before the source
-/// can be forwarded) and before its later MMIO stores.
+/// can be forwarded, and a delivery's owing marking before its mask) and before
+/// its later MMIO stores.
 ///
 /// # Safety
 /// The direct map must be active, [`init_bsp`] must have recorded the window,

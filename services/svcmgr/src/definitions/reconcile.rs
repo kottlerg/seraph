@@ -144,7 +144,7 @@ pub fn reconcile_and_launch(
         Ok(r) => r,
         Err(e) =>
         {
-            log!("svcmgr: cannot open {SERVICES_DIR}: {e}");
+            log!(warn: "svcmgr: cannot open {SERVICES_DIR}: {e}");
             // Still report pending-without-def errors so a missing
             // /config/svcmgr/services/ does not silently swallow them.
             report_orphans(pending);
@@ -182,13 +182,13 @@ pub fn reconcile_and_launch(
         }
         if entries.try_reserve(1).is_err()
         {
-            log!("svcmgr: no memory to list {name}; dropped");
+            log!(warn: "svcmgr: no memory to list {name}; dropped");
             continue;
         }
         let Some(name) = try_string(name)
         else
         {
-            log!("svcmgr: no memory to list {name}; dropped");
+            log!(warn: "svcmgr: no memory to list {name}; dropped");
             continue;
         };
         // Within the slot reserved above, so the push cannot grow.
@@ -212,7 +212,7 @@ pub fn reconcile_and_launch(
     let mut defs: Vec<Definition> = Vec::new();
     if defs.try_reserve_exact(entries.len()).is_err()
     {
-        log!("svcmgr: no memory to parse {} recipes", entries.len());
+        log!(warn: "svcmgr: no memory to parse {} recipes", entries.len());
         release_unsupervised(pending);
         return;
     }
@@ -222,7 +222,7 @@ pub fn reconcile_and_launch(
         let Some(path) = recipe_path(filename)
         else
         {
-            log!("svcmgr: no memory for {filename}'s path; dropped");
+            log!(warn: "svcmgr: no memory for {filename}'s path; dropped");
             continue;
         };
 
@@ -231,7 +231,7 @@ pub fn reconcile_and_launch(
             Ok(c) => c,
             Err(e) =>
             {
-                log!("svcmgr: cannot read {path}: {e}");
+                log!(warn: "svcmgr: cannot read {path}: {e}");
                 continue;
             }
         };
@@ -239,7 +239,7 @@ pub fn reconcile_and_launch(
         {
             // Within the capacity reserved above, so the push cannot grow.
             Ok(d) => defs.push(d),
-            Err(e) => log!("svcmgr: parse {path}: {e}"),
+            Err(e) => log!(warn: "svcmgr: parse {path}: {e}"),
         }
     }
     defs.sort_unstable_by(|a, b| {
@@ -261,7 +261,7 @@ pub fn reconcile_and_launch(
             else
             {
                 log!(
-                    "svcmgr: {} also declares shutdown_actuator; not recognised",
+                    warn: "svcmgr: {} also declares shutdown_actuator; not recognised",
                     def.name
                 );
             }
@@ -290,7 +290,7 @@ fn record_shutdown_actuator(
             table.shutdown_actuator = Some(ShutdownActuator { slot, badge });
         }
         _ => log!(
-            "svcmgr: shutdown actuator {service} has no supervised endpoint; \
+            warn: "svcmgr: shutdown actuator {service} has no supervised endpoint; \
              graceful shutdown unavailable"
         ),
     }
@@ -333,7 +333,7 @@ fn handle_definition(
         let Some(launched) = launch::launch(def, ctx, registry, None)
         else
         {
-            log!("svcmgr: launch failed: {}", def.name);
+            log!(warn: "svcmgr: launch failed: {}", def.name);
             return None;
         };
         log!("svcmgr: launched ephemeral: {}", def.name);
@@ -366,7 +366,7 @@ fn handle_definition(
     else
     {
         log!(
-            "svcmgr: no memory for a service-table slot; dropping {}",
+            warn: "svcmgr: no memory for a service-table slot; dropping {}",
             def.name
         );
         return None;
@@ -378,14 +378,14 @@ fn handle_definition(
     let (Some(mut entry), Some(recipe)) = (build_entry(def), recipe_from(def))
     else
     {
-        log!("svcmgr: no memory for {}'s entry; not launched", def.name);
+        log!(warn: "svcmgr: no memory for {}'s entry; not launched", def.name);
         return None;
     };
 
     let Some(launched) = launch::launch(def, ctx, registry, Some(correlator))
     else
     {
-        log!("svcmgr: launch failed: {}", def.name);
+        log!(warn: "svcmgr: launch failed: {}", def.name);
         return None;
     };
 
@@ -420,7 +420,7 @@ fn bind_only(
     else
     {
         log!(
-            "svcmgr: no memory for a service-table slot; dropping {}",
+            warn: "svcmgr: no memory for a service-table slot; dropping {}",
             def.name
         );
         let _ = syscall::cap_delete(thread_cap);
@@ -430,7 +430,7 @@ fn bind_only(
     else
     {
         log!(
-            "svcmgr: no memory for {}'s entry; running unsupervised",
+            warn: "svcmgr: no memory for {}'s entry; running unsupervised",
             def.name
         );
         let _ = syscall::cap_delete(thread_cap);
@@ -438,7 +438,7 @@ fn bind_only(
     };
     if deaths.bind_thread(thread_cap, correlator).is_err()
     {
-        log!("svcmgr: bind death-notification failed for {}", def.name);
+        log!(warn: "svcmgr: bind death-notification failed for {}", def.name);
         let _ = syscall::cap_delete(thread_cap);
         return None;
     }
@@ -549,7 +549,7 @@ fn release_unsupervised(pending: &mut [PendingRegistration])
     for slot in pending.iter_mut().filter(|p| !p.consumed)
     {
         log!(
-            "svcmgr: no memory for the recipes; {} runs unsupervised",
+            warn: "svcmgr: no memory for the recipes; {} runs unsupervised",
             slot.name_str()
         );
         if slot.thread_cap != 0
@@ -573,7 +573,7 @@ fn report_orphans(pending: &[PendingRegistration])
         if !slot.consumed
         {
             log!(
-                "svcmgr: registered without definition: {} (refusing to bind)",
+                warn: "svcmgr: registered without definition: {} (refusing to bind)",
                 slot.name_str()
             );
             if slot.thread_cap != 0

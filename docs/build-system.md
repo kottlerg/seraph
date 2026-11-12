@@ -339,19 +339,21 @@ NetBSD, or TCG elsewhere. Cross-arch guests (riscv64 on x86, etc.) always
 resolve to TCG. The user-facing command reference plus the full env-var
 table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 
-**Minimum QEMU version:** QEMU ≥ 8.0 (V extension support) is required;
-`xtask/src/qemu.rs` passes
-`-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on`
+**Minimum QEMU version:** QEMU ≥ 9.0 is required: 8.0 brought V extension support, and 9.0
+the non-experimental `ssaia` and `smaia` CPU properties. `xtask/src/qemu.rs` passes
+`-machine virt,aia=aplic-imsic` and
+`-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,ssaia=on,smaia=on`
 plus the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
 `-cpu max,migratable=no` on x86-64 TCG, plus the `--x86-paging` `la57` suffix (default
 `,la57=off`, appended to every x86-64 accelerator's `-cpu` model). The explicit feature
 string is the source of truth on every supported QEMU, including the 10.2 the pinned CI image
 ships (§ Continuous Integration); the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are
 required by the kernel, whose paging subsystem refuses CPUs that lack them during boot, before
-the first userspace mapping (see [platform-requirements.md](platform-requirements.md)). The
-named `-cpu rva23s64` model (QEMU ≥ 10.0, 2025-04) is a superset of this string that adds the
-remaining RVA23 mandates; `xtask` does not expose it, and the explicit string stays so the 8.0
-minimum holds.
+the first userspace mapping, and so is AIA (Ssaia, with the machine's APLIC and IMSIC), without
+which its interrupt initialisation halts the boot (see
+[platform-requirements.md](platform-requirements.md)). The named `-cpu rva23s64` model
+(QEMU ≥ 10.0, 2025-04) adds the remaining RVA23 mandates; `xtask` does not expose it, and the
+explicit string stays so the 9.0 minimum holds.
 
 ---
 

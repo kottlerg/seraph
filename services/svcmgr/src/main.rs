@@ -101,12 +101,12 @@ fn main() -> !
 
     if caps.service_ep == 0
     {
-        std::os::seraph::log!("no service endpoint, halting");
+        std::os::seraph::log!(error: "no service endpoint, halting");
         halt_loop();
     }
     if info.procmgr_endpoint == 0
     {
-        std::os::seraph::log!("no procmgr endpoint, halting");
+        std::os::seraph::log!(error: "no procmgr endpoint, halting");
         halt_loop();
     }
 
@@ -122,7 +122,7 @@ fn main() -> !
     )
     else
     {
-        std::os::seraph::log!("failed to create the main wait set and first death queue");
+        std::os::seraph::log!(error: "failed to create the main wait set and first death queue");
         halt_loop();
     };
 
@@ -177,11 +177,11 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
                 .publish(ipc::published_names::SVCMGR, send, Visibility::Public)
                 .is_err()
             {
-                std::os::seraph::log!("publish svcmgr failed");
+                std::os::seraph::log!(warn: "publish svcmgr failed");
                 let _ = syscall::cap_delete(send);
             }
         }
-        Err(_) => std::os::seraph::log!("derive svcmgr SEND failed"),
+        Err(_) => std::os::seraph::log!(warn: "derive svcmgr SEND failed"),
     }
 
     // devmgr.registry / devmgr.shutdown / devmgr.bind — badged SENDs minted
@@ -242,12 +242,12 @@ fn publish_endowed_send(registry: &mut registry::Registry, cap: u64, name: &[u8]
     let shown = core::str::from_utf8(name).unwrap_or("?");
     if cap == 0
     {
-        std::os::seraph::log!("no {shown} source cap; not published");
+        std::os::seraph::log!(warn: "no {shown} source cap; not published");
         return;
     }
     if registry.publish(name, cap, Visibility::SeedOnly).is_err()
     {
-        std::os::seraph::log!("publish {shown} failed");
+        std::os::seraph::log!(warn: "publish {shown} failed");
         let _ = syscall::cap_delete(cap);
     }
 }
@@ -268,7 +268,7 @@ fn publish_minted_send(
     let shown = core::str::from_utf8(name).unwrap_or("?");
     if source == 0
     {
-        std::os::seraph::log!("no {source_name} source cap; {shown} not published");
+        std::os::seraph::log!(warn: "no {source_name} source cap; {shown} not published");
         return;
     }
     let rights = if visibility == Visibility::SeedOnlyGrant
@@ -285,11 +285,11 @@ fn publish_minted_send(
         {
             if registry.publish(name, send, visibility).is_err()
             {
-                std::os::seraph::log!("publish {shown} failed");
+                std::os::seraph::log!(warn: "publish {shown} failed");
                 let _ = syscall::cap_delete(send);
             }
         }
-        Err(_) => std::os::seraph::log!("derive {shown} cap failed"),
+        Err(_) => std::os::seraph::log!(warn: "derive {shown} cap failed"),
     }
 }
 
@@ -307,13 +307,13 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
 {
     if caps.devmgr_registry == 0
     {
-        std::os::seraph::log!("SET_DRIVERS_DIR skipped: no devmgr registry source");
+        std::os::seraph::log!(warn: "SET_DRIVERS_DIR skipped: no devmgr registry source");
         return;
     }
     let root_cap = std::os::seraph::root_dir_cap();
     if root_cap == 0
     {
-        std::os::seraph::log!("SET_DRIVERS_DIR skipped: no root_dir_cap");
+        std::os::seraph::log!(warn: "SET_DRIVERS_DIR skipped: no root_dir_cap");
         return;
     }
 
@@ -331,7 +331,7 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
             Ok(c) => c,
             Err(e) =>
             {
-                std::os::seraph::log!("SET_DRIVERS_DIR: walk /services/drivers failed: {e}");
+                std::os::seraph::log!(warn: "SET_DRIVERS_DIR: walk /services/drivers failed: {e}");
                 return;
             }
         };
@@ -345,7 +345,7 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
     )
     else
     {
-        std::os::seraph::log!("SET_DRIVERS_DIR: DRIVERS_DIR_AUTHORITY derive failed");
+        std::os::seraph::log!(warn: "SET_DRIVERS_DIR: DRIVERS_DIR_AUTHORITY derive failed");
         let _ = syscall::cap_delete(drivers_dir);
         return;
     };
@@ -364,13 +364,13 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
         {
             std::os::seraph::log!("SET_DRIVERS_DIR ok");
         }
-        Ok(_) => std::os::seraph::log!("SET_DRIVERS_DIR rejected; RTC unavailable"),
+        Ok(_) => std::os::seraph::log!(warn: "SET_DRIVERS_DIR rejected; RTC unavailable"),
         Err(_) =>
         {
             // Transport error before the kernel committed the transfer;
             // the source slot still owns `drivers_dir`.
             let _ = syscall::cap_delete(drivers_dir);
-            std::os::seraph::log!("SET_DRIVERS_DIR ipc error; RTC unavailable");
+            std::os::seraph::log!(warn: "SET_DRIVERS_DIR ipc error; RTC unavailable");
         }
     }
 }
@@ -446,7 +446,7 @@ fn event_loop(
         {
             WS_BADGE_SERVICE => dispatch_ipc(caps.service_ep, state, &restart_ctx, &mut guard),
             WS_BADGE_DEATHS => dispatch_deaths(state, &restart_ctx),
-            _ => std::os::seraph::log!("unexpected wait-set badge"),
+            _ => std::os::seraph::log!(warn: "unexpected wait-set badge"),
         }
     }
 }
@@ -459,11 +459,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("recv loop failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "recv loop failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("recv loop wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "recv loop wedged (err={err}); exiting");
         }
     }
 }
@@ -691,7 +691,7 @@ fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
     });
     if full
     {
-        std::os::seraph::log!("a death queue drained full; resyncing services");
+        std::os::seraph::log!(warn: "a death queue drained full; resyncing services");
         resync_deaths(state, ctx);
     }
 }
@@ -710,7 +710,7 @@ fn route_death(
         .filter(|&idx| idx < state.table.services.len())
     else
     {
-        std::os::seraph::log!("death notification with unknown correlator");
+        std::os::seraph::log!(warn: "death notification with unknown correlator");
         return;
     };
     let svc = &state.table.services[idx];
@@ -809,7 +809,7 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
     else
     {
         std::os::seraph::log!(
-            "graceful shutdown impossible: no shutdown actuator; system in degraded state"
+            error: "graceful shutdown impossible: no shutdown actuator; system in degraded state"
         );
         return;
     };
@@ -827,7 +827,7 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
     if !service_running(entry)
     {
         std::os::seraph::log!(
-            "graceful shutdown impossible: shutdown actuator {} is down; \
+            error: "graceful shutdown impossible: shutdown actuator {} is down; \
              system in degraded state",
             entry.name_str()
         );
@@ -842,7 +842,7 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
     else
     {
         std::os::seraph::log!(
-            "graceful shutdown: cannot derive a SEND on shutdown actuator {}",
+            error: "graceful shutdown: cannot derive a SEND on shutdown actuator {}",
             entry.name_str()
         );
         return;
@@ -854,7 +854,7 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
     // On the success path the actuator powers off and this never returns.
     // On a failure path we surface the cap leak rather than ignore it.
     let _ = syscall::cap_delete(shutdown_cap);
-    std::os::seraph::log!("graceful shutdown: SHUTDOWN call returned (failure path)");
+    std::os::seraph::log!(error: "graceful shutdown: SHUTDOWN call returned (failure path)");
 }
 
 /// Whether `entry`'s service is running: the entry is active and the kernel

@@ -288,7 +288,7 @@ pub fn collect_mmio_direct_map_regions(km: &KernelMmio, out: &mut [(u64, u64)]) 
     n
 }
 
-/// riscv64: no kernel-internal MMIO lies above the RAM ceiling — the PLIC
+/// riscv64: no kernel-internal MMIO lies above the RAM ceiling — the APLIC
 /// and UART on the `virt` machine sit below it and are covered by the RAM
 /// direct map. Always returns 0.
 #[cfg(target_arch = "riscv64")]

@@ -64,10 +64,12 @@ bits 32-34 (§ Levels). Inline bytes
 arrive in the IPC message's data words, packed at word 0. logd
 appends the bytes to the slot keyed by the kernel-delivered
 `msg.badge`; every `\n` flushes the slot's partial buffer as one
-line, emitted as `[sec.usfrac] [name] <line>\r\n` to the serial
-driver (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
-(`FB_WRITE_BYTES`) when one is present, then appended to the slot's
-history ring with its level.
+line: under the state lock the line is rendered as
+`[sec.usfrac] [name] <line>\r\n` and appended to the slot's history
+ring with its level, and once the lock is released the rendered line
+is emitted to the serial driver
+(`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
+(`FB_WRITE_BYTES`) when one is present.
 
 The history ring holds `PER_SLOT_HISTORY` (16) completed entries per slot, text lines and
 records (§ History; [`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest
@@ -90,11 +92,42 @@ a sender that sets no level logs at info.
 
 - **Sender.** `seraph::log!("fmt", args…)` logs at info; a leading `error:`,
   `warn:`, `info:`, `debug:`, or `trace:` sets the level
-  (`seraph::log!(warn: "fmt", args…)`). Every call site written before
-  levels existed logs at info and stays so. std's panic, allocation-error,
+  (`seraph::log!(warn: "fmt", args…)`). Each call site states the level
+  the rule below gives its line. std's panic, allocation-error,
   and precondition output, sent through the same cap, is at error. Bytes a
   sender writes with `log::write_bytes` carry the level it passes. A record
   (§ `stream_labels::STREAM_RECORD`) carries its level the same way.
+- **Choosing a level.** A call site states the level its line deserves, so
+  a default boot shows lifecycle and failures and `SERAPH_LOG=debug` adds
+  the detail a developer needs:
+  - error: a failure the component does not recover from, or a request it
+    fails that an operator must see (a service that cannot start, a driver
+    that cannot bring its device up, a lost invariant before a panic);
+  - warn: an anomaly the component recovers from or degrades around (a
+    retry, a fallback, a dropped or malformed request it rejects, a
+    resource limit reached);
+  - info: lifecycle a default boot shows once per event (start, ready, a
+    device or mount found, shutdown), and every line of a test harness
+    (svctest, usertest, and the programs and fixtures they run: phase
+    results and the terminal `ALL TESTS PASSED` / `SOME TESTS FAILED`
+    markers);
+  - debug: per-request, per-device-probe, or per-step detail useful while
+    developing the component;
+  - trace: per-message or hot-path lines (per IPC, per block, per packet).
+
+  A line that an xtask check or a CI `run-parallel` pattern matches stays
+  at info, whatever the list above gives it, unless the check changes with
+  it: a line below info is not sent in a default boot, and a tag after
+  `[name] ` breaks a match anchored there. A line a document says a
+  component logs, or tells its reader to read, stays at info too unless
+  the document changes with it: procmgr's `spawn image bias=0x…` line,
+  from which `run --gdb` and `symbolize --bias` take a process's load bias
+  ([xtask/README.md](../../../xtask/README.md#cargo-xtask-symbolize)), is
+  one. A line whose text contains
+  `FATAL:`, which CI's fail pattern matches, keeps its text at any level.
+  A line given error or warn drops a leading `error:`, `warning:`, or
+  `FAILED` from its text, since the tag replaces it, unless a check
+  matches the word.
 - **Filter.** A std process sends only lines at or less verbose than its
   level, which std's `_start` reads once from the process's `SERAPH_LOG`
   environment entry (`error`, `warn`, `info`, `debug`, or `trace`; absent
@@ -102,7 +135,12 @@ a sender that sets no level logs at info.
   nor sent, so it costs no IPC; a record is filtered as a line is. A
   service sets the entry with the `.svc`
   `env` key ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)
-  § `argv` / `env`), a spawner with `Command::env`. Neither receiver
+  § `argv` / `env`), a spawner with `Command::env`. The processes init
+  spawns (procmgr, devmgr, vfsd, and svcmgr) and those devmgr and vfsd
+  spawn (the drivers and fatfs) receive no environment, so they log at
+  info and their debug lines show only with a code change; svcmgr only
+  binds the services init spawns, so an `env` key in their `.svc` recipes
+  reaches nothing. Neither receiver
   filters: each renders every line it receives. An error line is sent at
   every level.
 - **Line level.** The stream carries bytes, not lines, so a receiver gives a

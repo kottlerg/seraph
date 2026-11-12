@@ -74,6 +74,6 @@ fn sbi_reset(act: &Actuator, reset_type: u64, op: &str)
     match result
     {
         Ok(_) => crate::await_reset(op),
-        Err(e) => std::os::seraph::log!("{op} failed (sbi_call err={e})"),
+        Err(e) => std::os::seraph::log!(error: "{op} failed (sbi_call err={e})"),
     }
 }

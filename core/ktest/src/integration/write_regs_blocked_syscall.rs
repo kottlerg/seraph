@@ -45,14 +45,18 @@
 //! syscall, which places the stop inside that syscall or at its entry
 //! instruction; a stop that landed earlier restarts the child unchanged and
 //! retries after 1 ms, bounded. The controller then points the instruction
-//! pointer at [`redirected_entry`], writes the round's token into the
-//! argument register, publishes the round and the next round's syscall,
-//! writes the frame back, and restarts the child. It waits (bounded) for the
-//! child to record the round and the token, which it can learn only by
-//! entering [`redirected_entry`] afresh with the edited frame. Required:
-//! every round's stop lands in its syscall within the bound, every redirect
-//! records its round and its token, and no blocking call ever returns to its
-//! call site (each is cancelled by the stop and resumed elsewhere).
+//! pointer at [`redirected_entry`] and the stack pointer at the top of the
+//! child's stack, writes the round's token into the argument register,
+//! publishes the round and the next round's syscall, writes the frame back,
+//! and restarts the child. It waits (bounded) for the child to record the
+//! round and the token, which it can learn only by entering
+//! [`redirected_entry`] afresh with the edited frame. Required: every round's
+//! stop lands in its syscall within the bound, every redirect records its
+//! round and its token, no blocking call ever returns to its call site (each
+//! is cancelled by the stop and resumed elsewhere), and the child, once
+//! deleted, has used at most half its `ChildStack`: a redirect that left the
+//! abandoned frames in place would grow the stack a frame a round, past its
+//! base into the statics below it.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -252,7 +256,30 @@ fn with_child(ctx: &TestContext, parts: &Parts) -> TestResult
         .and_then(|()| rounds(&child, parts.done));
     let released = release(child);
     ran?;
-    released
+    released?;
+    check_stack_use()
+}
+
+/// Fail when the deleted child used more than half its `CHILD_STACK`, logging
+/// the bytes it used. Each redirect starts the child at the stack's top, so
+/// one call chain is all it uses; a use past half the stack is frames left
+/// behind round after round, which past the whole stack overwrite the statics
+/// below it.
+fn check_stack_use() -> TestResult
+{
+    // SAFETY: `CHILD_STACK` was zero at the boot's start, this cell is its
+    // only user and runs once a boot, and `release` deleted the child, its one
+    // thread.
+    let used = unsafe { ChildStack::used_bytes(core::ptr::addr_of!(CHILD_STACK)) };
+    if used > ChildStack::BYTES / 2
+    {
+        crate::tally::log_cell_u64(CELL, " stack_used=", used as u64);
+        return Err(
+            "integration::write_regs_blocked_syscall: the redirected child's frames accumulated \
+             on its stack",
+        );
+    }
+    Ok(())
 }
 
 /// Copy the objects into the child's `CSpace` and publish its handles.
@@ -332,15 +359,16 @@ fn edit_and_restart(child: &SpawnedChild, round: u32, regs: &mut [u8; BUF]) -> T
     ROUND.store(round, Ordering::Release);
     KIND.store(kind_of(round + 1), Ordering::Release);
     let target = redirected_entry as *const () as u64;
-    crate::spawn::redirect_to_entry(&mut regs[..], target);
+    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    crate::spawn::redirect_to_entry_at(&mut regs[..], target, stack_top);
     let token = TOKEN_TAG | u64::from(round);
     regs[ARG1_OFFSET..ARG1_OFFSET + 8].copy_from_slice(&token.to_le_bytes());
-    // SAFETY: the frame was read from this child, so its stack pointer lies on
-    // the child's own `ChildStack`; `redirect_to_entry` pointed it at `redirected_entry`,
+    // SAFETY: `redirect_to_entry_at` pointed the frame at `redirected_entry`,
     // an `extern "C"` entry that never returns and needs nothing of the
-    // abandoned frame, with the stack pointer moved down to the entry ABI's
-    // alignment on that same stack, so the child resumes on code and a stack
-    // it owns.
+    // abandoned frames, with the stack pointer at the entry ABI's alignment
+    // below the top of `CHILD_STACK`, the child's own `ChildStack`; the child
+    // is stopped, so no code runs on those frames again, and it resumes on code
+    // and a stack it owns.
     unsafe { thread_write_regs(child.th, &regs[..BUF]) }.map_err(|e| {
         log_error(
             "ktest: integration::write_regs_blocked_syscall thread_write_regs error=",
@@ -428,9 +456,12 @@ extern "C" fn child_entry(_arg: u64) -> !
 /// edited frame: `token` arrives in the second argument register the
 /// controller wrote (the first carries whatever the frame held: the failed
 /// syscall's return value on riscv64). Records the round the controller
-/// published and the token, then blocks again. Each redirect enters this on
-/// the stack the child was stopped on, which grows by a few frames a round,
-/// far inside a `ChildStack` across [`ROUNDS`] rounds.
+/// published and the token, then blocks again. Each redirect enters this at
+/// the top of `CHILD_STACK` (`spawn::redirect_to_entry_at`), abandoning the
+/// frames the child was stopped in, so the child's stack holds one call chain
+/// whatever the round count. A redirect on the stopped stack pointer instead
+/// would add a `block_loop` frame each round, and [`ROUNDS`] of those
+/// overflow a `ChildStack` in a debug build.
 extern "C" fn redirected_entry(_arg0: u64, token: u64) -> !
 {
     TOKEN_SEEN.store(token, Ordering::Release);

@@ -55,7 +55,7 @@ pub fn chain_next(
     // visible.
     if !state.is_data_cluster(cluster)
     {
-        std::os::seraph::log!("WARNING: chain walk reached cluster {cluster} outside data region");
+        std::os::seraph::log!(warn: "chain walk reached cluster {cluster} outside data region");
         return Err(FatError::Corrupt);
     }
 
@@ -142,7 +142,7 @@ pub fn chain_next(
     if !state.is_data_cluster(val)
     {
         std::os::seraph::log!(
-            "WARNING: FAT chain at cluster {cluster} points to cluster {val} outside \
+            warn: "FAT chain at cluster {cluster} points to cluster {val} outside \
              the data region (fat_sector={fat_sector}, entry_offset={entry_offset}) \
              — possible block-read corruption"
         );

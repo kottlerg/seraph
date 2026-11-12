@@ -245,7 +245,7 @@ pub fn drivers_dir_pass(
         if let Some(d) = decl.filter(|d| !admits(d))
         {
             std::os::seraph::log!(
-                "{}: declares boot-only class {}; not considered",
+                warn: "{}: declares boot-only class {}; not considered",
                 d.name.as_str(),
                 d.class.as_ref().map_or("", |c| c.as_str())
             );
@@ -294,7 +294,7 @@ fn collect(
     if added.is_err()
     {
         std::os::seraph::log!(
-            "{}: no memory to consider the driver; not bound",
+            warn: "{}: no memory to consider the driver; not bound",
             name.as_str()
         );
         binary.release();
@@ -341,7 +341,7 @@ fn bind_records(
             {
                 let candidates = table.candidates();
                 std::os::seraph::log!(
-                    "platform record {}: {} and {} match it equally; neither bound",
+                    warn: "platform record {}: {} and {} match it equally; neither bound",
                     index,
                     candidates[first].decl.name.as_str(),
                     candidates[second].decl.name.as_str()
@@ -393,7 +393,7 @@ fn bind_pci_records(
             {
                 let candidates = table.candidates();
                 std::os::seraph::log!(
-                    "PCI {}:{}:{}.{}: {} and {} match it equally; neither bound",
+                    warn: "PCI {}:{}:{}.{}: {} and {} match it equally; neither bound",
                     pci_dev.segment,
                     pci_dev.bus,
                     pci_dev.dev,
@@ -438,7 +438,7 @@ fn bind_platform(
     let Some(class) = decl.class
     else
     {
-        std::os::seraph::log!("{}: declares no device class; not bound", name);
+        std::os::seraph::log!(warn: "{}: declares no device class; not bound", name);
         return false;
     };
     // No platform record is an IOMMU record, and none has a `Dma` resource:
@@ -446,19 +446,19 @@ fn bind_platform(
     let grants = firmware::binding::grants(decl, candidate.source, false);
     if grants.tier_ignored
     {
-        std::os::seraph::log!("{}: boot tier not granted from the drivers directory", name);
+        std::os::seraph::log!(warn: "{}: boot tier not granted from the drivers directory", name);
     }
     if grants.phys_access_ignored
     {
-        std::os::seraph::log!("{}: physical access not granted", name);
+        std::os::seraph::log!(warn: "{}: physical access not granted", name);
     }
     if decl.dma
     {
-        std::os::seraph::log!("{}: the record has no DMA resource; no DMA granted", name);
+        std::os::seraph::log!(warn: "{}: the record has no DMA resource; no DMA granted", name);
     }
     if pass.roster.try_reserve_one().is_err()
     {
-        std::os::seraph::log!("{}: no memory to record the driver; not bound", name);
+        std::os::seraph::log!(warn: "{}: no memory to record the driver; not bound", name);
         return false;
     }
     let Some(dev_caps) = carve_platform_device(name, record, decl, carve)
@@ -469,14 +469,14 @@ fn bind_platform(
     let Some(service_ep) = crate::create_service_endpoint()
     else
     {
-        std::os::seraph::log!("{}: no service endpoint; not bound", name);
+        std::os::seraph::log!(warn: "{}: no service endpoint; not bound", name);
         dev_caps.release();
         return false;
     };
     let Some(source) = candidate.binary.source_copy()
     else
     {
-        std::os::seraph::log!("{}: binary cap not copied; not bound", name);
+        std::os::seraph::log!(warn: "{}: binary cap not copied; not bound", name);
         let _ = syscall::cap_delete(service_ep);
         dev_caps.release();
         return false;
@@ -573,7 +573,7 @@ fn carve_platform_device(
         else
         {
             std::os::seraph::log!(
-                "{}: a register range of the record not carved; not bound",
+                warn: "{}: a register range of the record not carved; not bound",
                 name
             );
             dev.release();
@@ -582,7 +582,7 @@ fn carve_platform_device(
         if !dev.push(carved)
         {
             std::os::seraph::log!(
-                "{}: more resources than a driver is delivered; not bound",
+                warn: "{}: more resources than a driver is delivered; not bound",
                 name
             );
             dev.release();
@@ -600,7 +600,7 @@ fn carve_platform_device(
                 mode,
             })
             {
-                std::os::seraph::log!("{}: no room for the interrupt; not bound", name);
+                std::os::seraph::log!(warn: "{}: no room for the interrupt; not bound", name);
                 dev.release();
                 return None;
             }
@@ -608,7 +608,7 @@ fn carve_platform_device(
         None if decl.interrupt.need == InterruptNeed::Required =>
         {
             std::os::seraph::log!(
-                "{}: no interrupt line for the device, which the driver requires; not bound",
+                warn: "{}: no interrupt line for the device, which the driver requires; not bound",
                 name
             );
             dev.release();
@@ -625,7 +625,7 @@ fn carve_platform_device(
     let Some(badge) = badge
     else
     {
-        std::os::seraph::log!("{}: catalog entry not added; not bound", name);
+        std::os::seraph::log!(warn: "{}: catalog entry not added; not bound", name);
         dev.release();
         return None;
     };
@@ -661,7 +661,7 @@ fn platform_wired(
         Ok(cap) => Some((cap, mode)),
         Err(e) =>
         {
-            std::os::seraph::log!("{}: no IRQ cap for line {:#x} ({:?})", name, gsi, e);
+            std::os::seraph::log!(warn: "{}: no IRQ cap for line {:#x} ({:?})", name, gsi, e);
             None
         }
     }
@@ -771,7 +771,7 @@ fn bind_pci(
     let Some(class) = decl.class
     else
     {
-        std::os::seraph::log!("{}: declares no device class; not bound", name);
+        std::os::seraph::log!(warn: "{}: declares no device class; not bound", name);
         return false;
     };
     // No PCI record is an IOMMU record: physical access is never granted
@@ -779,15 +779,15 @@ fn bind_pci(
     let grants = firmware::binding::grants(decl, candidate.source, false);
     if grants.tier_ignored
     {
-        std::os::seraph::log!("{}: boot tier not granted from the drivers directory", name);
+        std::os::seraph::log!(warn: "{}: boot tier not granted from the drivers directory", name);
     }
     if grants.phys_access_ignored
     {
-        std::os::seraph::log!("{}: physical access not granted", name);
+        std::os::seraph::log!(warn: "{}: physical access not granted", name);
     }
     if pass.roster.try_reserve_one().is_err()
     {
-        std::os::seraph::log!("{}: no memory to record the driver; not bound", name);
+        std::os::seraph::log!(warn: "{}: no memory to record the driver; not bound", name);
         return false;
     }
     let Some(mut dev_caps) = carve_pci_device(name, pci_dev, decl, carve)
@@ -798,14 +798,14 @@ fn bind_pci(
     let Some(service_ep) = crate::create_service_endpoint()
     else
     {
-        std::os::seraph::log!("{}: no service endpoint; not bound", name);
+        std::os::seraph::log!(warn: "{}: no service endpoint; not bound", name);
         dev_caps.release();
         return false;
     };
     let Some(source) = candidate.binary.source_copy()
     else
     {
-        std::os::seraph::log!("{}: binary cap not copied; not bound", name);
+        std::os::seraph::log!(warn: "{}: binary cap not copied; not bound", name);
         let _ = syscall::cap_delete(service_ep);
         dev_caps.release();
         return false;
@@ -894,7 +894,7 @@ fn carve_pci_device(
     if decl.reset == Reset::VirtioStatus && pci_dev.virtio_info.register_layout().is_none()
     {
         std::os::seraph::log!(
-            "{}: the device presents no complete VirtIO register layout; not bound",
+            warn: "{}: the device presents no complete VirtIO register layout; not bound",
             name
         );
         return None;
@@ -926,7 +926,7 @@ fn carve_pci_device(
     else if decl.interrupt.need == InterruptNeed::Required
     {
         std::os::seraph::log!(
-            "{}: no interrupt line for the device, which the driver requires; not bound",
+            warn: "{}: no interrupt line for the device, which the driver requires; not bound",
             name
         );
         dev.release();
@@ -942,7 +942,7 @@ fn carve_pci_device(
     let Some(badge) = catalog_entry(pci_dev, carve.catalog)
     else
     {
-        std::os::seraph::log!("{}: catalog entry not added; not bound", name);
+        std::os::seraph::log!(warn: "{}: catalog entry not added; not bound", name);
         dev.release();
         return None;
     };
@@ -968,7 +968,7 @@ fn carve_pci_device(
             if reset.is_none()
             {
                 std::os::seraph::log!(
-                    "{}: the device offers no VirtIO status register to reset it by",
+                    warn: "{}: the device offers no VirtIO status register to reset it by",
                     name
                 );
             }
@@ -977,7 +977,7 @@ fn carve_pci_device(
     };
     if !dev.config.prepare_for_bind(decl.dma, wired.is_some())
     {
-        std::os::seraph::log!("{}: configuration page not mapped; not bound", name);
+        std::os::seraph::log!(warn: "{}: configuration page not mapped; not bound", name);
         dev.release();
         return None;
     }
@@ -1020,7 +1020,7 @@ fn carve_bars(
         let index = pci_dev.bar_pci_idx[b];
         let phys = pci_dev.bar_phys[b];
         std::os::seraph::log!(
-            "{}: BAR {} phys={:#018x} size={:#018x}",
+            debug: "{}: BAR {} phys={:#018x} size={:#018x}",
             name,
             index,
             phys,
@@ -1030,7 +1030,7 @@ fn carve_bars(
         else
         {
             std::os::seraph::log!(
-                "{}: BAR {} not covered by any aperture; not bound",
+                warn: "{}: BAR {} not covered by any aperture; not bound",
                 name,
                 index
             );
@@ -1055,7 +1055,7 @@ fn carve_bars(
             else
             {
                 std::os::seraph::log!(
-                    "{}: VirtIO BAR {} is not an MMIO BAR; not bound",
+                    warn: "{}: VirtIO BAR {} is not an MMIO BAR; not bound",
                     name,
                     aperture.bar
                 );
@@ -1110,7 +1110,7 @@ fn grant_dma(
     });
     if grant.is_none()
     {
-        std::os::seraph::log!("{}: no DMA grant; not bound", name);
+        std::os::seraph::log!(warn: "{}: no DMA grant; not bound", name);
         if let (Confinement::Domain { handle, .. }, Some(i)) = (confinement, caps.iommu.as_ref())
         {
             i.client().block(handle);
@@ -1134,7 +1134,7 @@ fn acquire_single_irq_cap(
         Ok(cap) =>
         {
             std::os::seraph::log!(
-                "IRQ cap for GSI {:#x}, mode {:#x}",
+                debug: "IRQ cap for GSI {:#x}, mode {:#x}",
                 u64::from(gsi),
                 irq_range.line_mode(gsi)
             );
@@ -1143,14 +1143,14 @@ fn acquire_single_irq_cap(
         Err(LineError::Hold(HoldError::Split(CarveError::NotCovered))) =>
         {
             std::os::seraph::log!(
-                "GSI {:#x} not in the held IRQ range (or no range); no IRQ cap",
+                warn: "GSI {:#x} not in the held IRQ range (or no range); no IRQ cap",
                 u64::from(gsi)
             );
             None
         }
         Err(e) =>
         {
-            std::os::seraph::log!("no IRQ cap for GSI {:#x} ({:?})", u64::from(gsi), e);
+            std::os::seraph::log!(warn: "no IRQ cap for GSI {:#x} ({:?})", u64::from(gsi), e);
             None
         }
     }
@@ -1200,7 +1200,7 @@ pub fn carve_function_config(
     else
     {
         std::os::seraph::log!(
-            "{}: no configuration-space cap for the device; refused",
+            warn: "{}: no configuration-space cap for the device; refused",
             name
         );
         return None;
@@ -1378,7 +1378,7 @@ impl PciDeviceCaps
         }
         if !revoked
         {
-            std::os::seraph::log!("device reset: a BAR copy could not be revoked");
+            std::os::seraph::log!(warn: "device reset: a BAR copy could not be revoked");
         }
         let _ = self.config.disable_interrupt();
         let reset = match self.reset
@@ -1387,7 +1387,9 @@ impl PciDeviceCaps
             StopReset::Flr => self.config.function_level_reset(),
             StopReset::None =>
             {
-                std::os::seraph::log!("device reset: the driver declares no reset; not reset");
+                std::os::seraph::log!(
+                    warn: "device reset: the driver declares no reset; not reset"
+                );
                 false
             }
         };
@@ -1425,7 +1427,7 @@ pub fn withdraw_device(dev_caps: &PciDeviceCaps, child: spawn::HeldChild, ipc_bu
     else
     {
         std::os::seraph::log!(
-            "device {} not confirmed quiet; its driver's memory stays held for the boot",
+            warn: "device {} not confirmed quiet; its driver's memory stays held for the boot",
             dev_caps.device_badge
         );
         spawn::destroy_held(child, ipc_buf);
@@ -1517,12 +1519,12 @@ impl DeviceReset
         let Some(confirmed) = confirmed
         else
         {
-            std::os::seraph::log!("device reset: its status BAR not mapped; not reset");
+            std::os::seraph::log!(warn: "device reset: its status BAR not mapped; not reset");
             return false;
         };
         if !confirmed
         {
-            std::os::seraph::log!("device reset: not confirmed within its bound");
+            std::os::seraph::log!(warn: "device reset: not confirmed within its bound");
         }
         confirmed
     }
@@ -1621,14 +1623,14 @@ impl FunctionConfig
         let Some(read_back) = read_back
         else
         {
-            std::os::seraph::log!("bus master: configuration page not mapped; not cleared");
+            std::os::seraph::log!(warn: "bus master: configuration page not mapped; not cleared");
             return false;
         };
         let cleared = firmware::pci::bus_master_confirmed_clear(read_back);
         if !cleared
         {
             std::os::seraph::log!(
-                "bus master: not confirmed clear (command={:#06x})",
+                warn: "bus master: not confirmed clear (command={:#06x})",
                 read_back
             );
         }
@@ -1661,7 +1663,7 @@ impl FunctionConfig
         let confirmed = read_back.is_some_and(firmware::pci::interrupt_disable_confirmed);
         if !confirmed
         {
-            std::os::seraph::log!("interrupt disable: not confirmed set");
+            std::os::seraph::log!(warn: "interrupt disable: not confirmed set");
         }
         confirmed
     }
@@ -1719,7 +1721,9 @@ impl FunctionConfig
         });
         if !matches!(initiated, Some(Some(())))
         {
-            std::os::seraph::log!("function level reset: not supported by the device; not reset");
+            std::os::seraph::log!(
+                warn: "function level reset: not supported by the device; not reset"
+            );
             return false;
         }
         let _ = syscall::thread_sleep(firmware::pci::FLR_COMPLETION_MS);
@@ -1733,7 +1737,9 @@ impl FunctionConfig
         let completed = vendor.is_some_and(firmware::pci::flr_completed);
         if !completed
         {
-            std::os::seraph::log!("function level reset: the device does not answer after it");
+            std::os::seraph::log!(
+                warn: "function level reset: the device does not answer after it"
+            );
         }
         completed
     }

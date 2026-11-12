@@ -121,11 +121,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
         }
     }
 }
@@ -165,7 +165,7 @@ fn main() -> !
     let Some((mmio_cap, device)) = bootstrap(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!("resource list missing or without a one-page register range");
+        std::os::seraph::log!(error: "resource list missing or without a one-page register range");
         syscall::thread_exit();
     };
 
@@ -175,14 +175,14 @@ fn main() -> !
     let Ok(range) = reserve_pages(1)
     else
     {
-        std::os::seraph::log!("reserve_pages failed");
+        std::os::seraph::log!(error: "reserve_pages failed");
         syscall::thread_exit();
     };
     let base_va = range.va_start();
 
     if !std::os::seraph::fund_aspace_pt_budget(info.self_aspace, 1)
     {
-        std::os::seraph::log!("PT-budget funding failed");
+        std::os::seraph::log!(error: "PT-budget funding failed");
         syscall::thread_exit();
     }
     // SAFETY: `range` is a fresh one-page reservation from the per-process
@@ -194,14 +194,14 @@ fn main() -> !
     // stays held for the process's lifetime (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(info.self_aspace, mmio_cap, base_va, 0) }.is_err()
     {
-        std::os::seraph::log!("mmio_map failed");
+        std::os::seraph::log!(error: "mmio_map failed");
         syscall::thread_exit();
     }
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if let Err(e) = unsafe { ipc::report_driver_ready(device.endpoints.devmgr_query, ipc_buf) }
     {
-        std::os::seraph::log!("DRIVER_READY failed ({:?}); exiting", e);
+        std::os::seraph::log!(error: "DRIVER_READY failed ({:?}); exiting", e);
         syscall::thread_exit();
     }
     service_loop(device.endpoints.service, ipc_buf, base_va);

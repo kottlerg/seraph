@@ -27,7 +27,7 @@ pub fn configure(registry: &mut registry::Registry, devmgr_registry: u64, ipc_bu
 {
     if devmgr_registry == 0
     {
-        log!("no devmgr-registry source; no device class configured");
+        log!(warn: "no devmgr-registry source; no device class configured");
         return;
     }
     let read = match fs::read_dir(CLASSES_DIR)
@@ -35,7 +35,7 @@ pub fn configure(registry: &mut registry::Registry, devmgr_registry: u64, ipc_bu
         Ok(r) => r,
         Err(e) =>
         {
-            log!("cannot open {CLASSES_DIR}: {e}; no device class configured");
+            log!(warn: "cannot open {CLASSES_DIR}: {e}; no device class configured");
             return;
         }
     };
@@ -46,7 +46,7 @@ pub fn configure(registry: &mut registry::Registry, devmgr_registry: u64, ipc_bu
     )
     else
     {
-        log!("CLASS_AUTHORITY derive failed; no device class configured");
+        log!(warn: "CLASS_AUTHORITY derive failed; no device class configured");
         return;
     };
     for ent in read.flatten()
@@ -75,7 +75,7 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
         .try_reserve_exact(CLASSES_DIR.len() + 1 + class.len() + CLASS_FILE_SUFFIX.len())
         .is_err()
     {
-        log!("class {class}: no memory for its path; not configured");
+        log!(warn: "class {class}: no memory for its path; not configured");
         return;
     }
     path.push_str(CLASSES_DIR);
@@ -87,7 +87,7 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
         Ok(c) => c,
         Err(e) =>
         {
-            log!("cannot read {path}: {e}; class not configured");
+            log!(warn: "cannot read {path}: {e}; class not configured");
             return;
         }
     };
@@ -96,7 +96,7 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
         Ok(d) => d,
         Err(e) =>
         {
-            log!("parse {path}: {e}; class not configured");
+            log!(warn: "parse {path}: {e}; class not configured");
             return;
         }
     };
@@ -116,20 +116,20 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
         Ok(send) => send,
         Err(e) =>
         {
-            log!("class {class}: devmgr refused it ({e:?}); not configured");
+            log!(warn: "class {class}: devmgr refused it ({e:?}); not configured");
             return;
         }
     };
     let Some(name) = class_publication(def.stem.as_bytes())
     else
     {
-        log!("class {class}: no memory for its name; not published");
+        log!(warn: "class {class}: no memory for its name; not published");
         let _ = syscall::cap_delete(send);
         return;
     };
     if registry.publish(&name, send, Visibility::SeedOnly).is_err()
     {
-        log!("class {class}: publish failed");
+        log!(warn: "class {class}: publish failed");
         let _ = syscall::cap_delete(send);
     }
 }

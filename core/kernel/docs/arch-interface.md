@@ -45,12 +45,13 @@ core/kernel/src/arch/
 │   ├── gdt.rs      ├── idt.rs      ├── ioapic.rs     ├── fpu.rs
 │   ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs └── speculation.rs
 └── riscv64/
-    ├── mod.rs
+    ├── mod.rs      ├── aia.rs      # APLIC (MSI mode) and IMSIC
+    ├── aia_encoding.rs # AIA register-map arithmetic; no arch-module deps
     ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
     ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
-    └── encoding.rs # PLIC, SBI mask, F/D/V, page rounding, PTE permissions; no arch-module deps
+    └── encoding.rs # SBI mask, F/D/V, page rounding, PTE permissions; no arch-module deps
 ```
 
 `arch/mod.rs` performs the conditional compilation, and also defines the one type it holds
@@ -401,7 +402,7 @@ architectures — PCD|PWT (strong UC) on x86-64, Svpbmt PBMT=IO on RISC-V — so
 attributes do not depend on platform PMAs. Phase 3 maps the kernel's own x86-64 MMIO pages
 (the xAPIC and I/O APIC registers) `uncacheable` in the direct map: a 2 MiB direct-map chunk
 holding one is mapped as 4 KiB pages, the MMIO pages strong UC and the rest write-back, so
-their memory type does not depend on the firmware's MTRRs. The riscv64 PLIC and UART stay in
+their memory type does not depend on the firmware's MTRRs. The riscv64 APLIC, IMSIC and UART stay in
 the large-page direct map and take their device memory type from the platform PMAs
 (PBMT=PMA). W^X is enforced at the memory syscall layer
 (`syscall::mem` map/protect reject a writable-and-executable request with
@@ -507,10 +508,11 @@ pub unsafe fn init_ap();
 
 /// Acknowledge / mask / unmask an external interrupt line. On x86-64, `mask` and
 /// `unmask` take a GSI at the I/O APIC, and `acknowledge` writes the local-APIC
-/// EOI and ignores `irq`. On RISC-V, `irq` is a PLIC source, and `acknowledge`
-/// completes it on the executing hart's context, enabling it there for the
-/// completion when the dispatch's `mask` disabled it (the PLIC ignores a
-/// completion of a disabled source). `unmask` is reached, under the routing
+/// EOI and ignores `irq`. On RISC-V, `irq` is an APLIC source: `mask` and
+/// `unmask` clear and set its enable in the APLIC domain, `unmask` also pending
+/// again a level-sensitive source still asserted (the APLIC in MSI delivery mode
+/// does not), and `acknowledge` does nothing, the trap's IMSIC claim having
+/// cleared the identity. `unmask` is reached, under the routing
 /// lock and only for a routed line, from `SYS_IRQ_ACK` through `irq::ack` and
 /// from a binding's removal, each once no binding on the line owes an
 /// acknowledgement.
@@ -522,19 +524,21 @@ pub fn unmask(irq: u32);
 /// trigger and polarity word) and leave it masked at the controller; the
 /// driver unmasks via `SYS_IRQ_ACK`. x86-64 assigns the GSI a device IDT vector
 /// and installs its IOAPIC redirection entry with `mode`'s trigger and polarity
-/// bits; RISC-V records the source's target hart and programs nothing from
-/// `mode`. Fails with `irq::RouteError::NoSuchLine` for a line no discovered
-/// controller implements, `Exhausted` when the controller has no delivery
-/// resource left (x86-64: every device vector assigned). Called by
+/// bits; RISC-V assigns the source a target hart and the lowest free identity in
+/// that hart's IMSIC file, and programs its APLIC source mode from `mode` and its
+/// target register from the two. Fails with `irq::RouteError::NoSuchLine` for a
+/// line no discovered controller implements, `Exhausted` when the controller has
+/// no delivery resource left (x86-64: every device vector assigned; RISC-V: no
+/// CPU's IMSIC file has a free identity). Called by
 /// `irq::register` for a line's first binding, under its routing lock.
 pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<(), irq::RouteError>;
 /// Release a routed line: mask it and free what `route_device_irq` assigned (the
-/// x86-64 device vector; the RISC-V target hart). Called by `irq` when a line's
+/// x86-64 device vector; the RISC-V IMSIC identity). Called by `irq` when a line's
 /// last binding is removed, under its routing lock.
 pub unsafe fn unroute_device_irq(irq: u32);
 /// Number of interrupt lines the discovered controllers implement, which sizes
 /// the `irq` routing table at Phase 5: one past the highest I/O APIC GSI on
-/// x86-64 (capped at `ROOT_IRQ_COUNT`), the PLIC's `riscv,ndev` plus one on RISC-V.
+/// x86-64 (capped at `ROOT_IRQ_COUNT`), the APLIC's `riscv,num-sources` plus one on RISC-V.
 pub fn irq_line_count() -> u32;
 
 /// Send a TLB-shootdown or wakeup IPI to the CPU with the given hardware id
@@ -553,21 +557,25 @@ The `wait_for_ack` phases and their windows are specified in
 
 External-IRQ routing is reached through the `route_device_irq` surface function above; the
 underlying controller programming (`ioapic::route` and the device-vector table on x86-64; the
-PLIC enable path on RISC-V) remains arch-private.
+APLIC and IMSIC programming of `arch/riscv64/aia.rs` on RISC-V) remains arch-private.
 
 **Delivery destination.** Each routed line is delivered to one CPU, chosen when the line is
 routed: the boot CPUs in turn, by logical index (`irq::next_target_cpu`), so device
 interrupts spread over the CPUs rather than all landing on the boot CPU. On x86-64 the turn
 skips CPUs whose APIC id is `0xFF` or above: an I/O APIC redirection entry cannot name a wider
 id in physical destination mode (the kernel programs no interrupt remapping), and `0xFF` is the
-broadcast id, which delivers to every CPU. On RISC-V the line's
-PLIC source is enabled on the chosen hart's S-mode context only, so exactly one hart takes
-and claims it. The line's first binding chooses the CPU, and the line keeps it while any binding
+broadcast id, which delivers to every CPU. On RISC-V the turn
+skips CPUs whose IMSIC file has no free identity, and the line's APLIC source targets an
+identity in the chosen hart's supervisor-level IMSIC file, so exactly one hart takes and
+claims it. The line's first binding chooses the CPU, and the line keeps it while any binding
 remains; a line bound again after its last binding went takes the next CPU in turn.
 
-Per-CPU table allocation that exists only on x86-64 (GDT/TSS, AP IST stacks, NMI-backtrace
-storage) is reached through the `init_ap_percpu_storage` module-level surface function (a
-no-op on RISC-V), not a `cfg(target_arch)`-gated call.
+Per-CPU table allocation that exists on one architecture only (on x86-64 the GDT/TSS, AP IST
+stacks, and NMI-backtrace storage; on RISC-V each CPU's IMSIC identity row, which Phase 5's AIA
+bring-up and every route read, and whose allocation halts the boot when the bootloader reported
+no valid IMSIC) is reached through the `init_ap_percpu_storage` module-level surface function,
+not a `cfg(target_arch)`-gated call. It runs in Phase 4, before Phase 5's interrupt
+initialisation.
 
 ---
 
@@ -890,7 +898,7 @@ pub const ARCH_NAME: &str;
 /// (`EM_X86_64` / `EM_RISCV`); `mm::init_reloc` checks relocations against it.
 pub const EXPECTED_ELF_MACHINE: u16;
 
-/// External-interrupt id range (GSIs 0..=32767 on x86-64; PLIC sources 1..=1023
+/// External-interrupt id range (GSIs 0..=32767 on x86-64; APLIC sources 1..=1023
 /// on RISC-V, the specification's). `SYS_IRQ_REGISTER` refuses an id outside it
 /// with `InvalidArgument`, and within it an id no discovered controller
 /// implements (`irq_line_count`).
@@ -899,7 +907,7 @@ pub const MAX_IRQ_ID: u32;
 
 /// Width of the root `Interrupt` range capability minted at Phase 7, the
 /// interrupt id space (32768 on x86-64: `MAX_IOAPICS` I/O APICs of 256 pins;
-/// 1024 on RISC-V, the PLIC id space). The discovered controllers implement
+/// 1024 on RISC-V, the APLIC id space). The discovered controllers implement
 /// fewer; a split names the other ids, `SYS_IRQ_REGISTER` refuses them, and the
 /// Interrupt teardown leaves their routing untouched.
 pub const ROOT_IRQ_COUNT: u32;
@@ -926,7 +934,9 @@ pub const IOPB_PARTS: usize;
 pub fn sbi_forward(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> Result<u64, ()>;
 
 /// Allocate architecture-specific per-CPU tables during SMP bring-up: x86-64
-/// per-AP GDT/TSS, AP IST stacks, and NMI-backtrace storage; a no-op on RISC-V.
+/// per-AP GDT/TSS, AP IST stacks, and NMI-backtrace storage; RISC-V each CPU's
+/// IMSIC identity row, halting when no valid IMSIC was reported. Phase 4, before
+/// Phase 5's interrupt initialisation.
 pub fn init_ap_percpu_storage(cpu_count: usize, allocator: &mut mm::BuddyAllocator);
 ```
 
@@ -987,7 +997,7 @@ pub fn platform::console_mmio() -> Option<(u64, u64)>;
 pub fn platform::uart_base_for_boot_info(km: &KernelMmio) -> u64;
 /// Write the kernel-internal MMIO `(base, size)` regions Phase 3 maps above the
 /// RAM ceiling into `out` and return their count: the LAPIC and every I/O APIC
-/// on x86-64; 0 on RISC-V (PLIC and UART lie inside the RAM direct map).
+/// on x86-64; 0 on RISC-V (APLIC, IMSIC and UART lie inside the RAM direct map).
 pub fn platform::collect_mmio_direct_map_regions(km: &KernelMmio, out: &mut [(u64, u64)]) -> usize;
 /// The most regions `collect_mmio_direct_map_regions` writes, which sizes the
 /// Phase 3 buffer: the producer's own bound,
@@ -1022,7 +1032,7 @@ pub unsafe fn ap_trampoline::start_ap(
 - Page table format and hardware manipulation
 - Register file layout and context switch assembly
 - Exception/interrupt vector installation
-- Interrupt controller interaction (APIC / PLIC)
+- Interrupt controller interaction (APIC / APLIC and IMSIC)
 - Segment descriptors, TSS (x86-64 only)
 - SMEP/SMAP enforcement (x86-64); SUM bit management (RISC-V)
 - Syscall instruction handling (`SYSCALL`/`SYSRET` vs `ECALL`)

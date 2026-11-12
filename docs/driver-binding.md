@@ -98,7 +98,7 @@ A record carries the device's resources, typed:
 |---|---|
 | `Mmio` | PCI BAR index (PCI only), physical base, size |
 | `IoPort` (x86-64) | Base port, count |
-| `Interrupt` | Kind and vector count: `Wired` (one line: its GSI or PLIC/APLIC source, its trigger and polarity mode, whether devmgr may share it, which only a PCI function's line may be) or `MessageSignaled` (`Msi` or `MsiX`, the vectors the function supports) |
+| `Interrupt` | Kind and vector count: `Wired` (one line: its GSI or APLIC source, its trigger and polarity mode, whether devmgr may share it, which only a PCI function's line may be) or `MessageSignaled` (`Msi` or `MsiX`, the vectors the function supports) |
 | `Dma` | The requester ID the IOMMU scope is resolved against |
 | `Config` (PCI) | The function's configuration page, which devmgr keeps and delegates to no driver |
 

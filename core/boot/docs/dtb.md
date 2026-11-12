@@ -14,8 +14,7 @@ The implementation lives in [`core/boot/src/dtb.rs`](../src/dtb.rs).
 
 The bootloader extracts a minimal set of platform resources from the
 DTB: MMIO-backed peripherals matched by known `compatible` strings,
-PLIC interrupt controllers (with their `riscv,ndev` source count), the
-supervisor-level AIA interrupt controllers (§ AIA Controllers), PCI
+the supervisor-level AIA interrupt controllers (§ AIA Controllers), PCI
 host bridges, the `/cpus` hart IDs (the
 CPU-topology fallback when no ACPI is present), the `/cpus` hart
 capabilities (`timebase-frequency` and the `HART_CAP_*` bits) and the
@@ -81,7 +80,7 @@ RISC-V platform targeted. Nodes that override these with different
 values are parsed as if the defaults applied; any resulting
 misinterpretation is bounded (the node's `reg` entries become garbage; a
 garbage first entry with non-zero size still becomes an `MmioAperture`
-seed, and for a PLIC, APLIC, IMSIC or UART node the garbage first entry
+seed, and for an APLIC, IMSIC or UART node the garbage first entry
 becomes the corresponding `kernel_mmio` base). The AIA walk also assumes
 `#interrupt-cells = 1` on each hart's `riscv,cpu-intc`, so each IMSIC
 `interrupts-extended` entry is two cells (§ AIA Controllers). Full cell-inheritance support belongs
@@ -115,7 +114,7 @@ device (see [`docs/device-management.md`](../../../docs/device-management.md)).
 PCI host bridges match `pci-host-ecam-generic`.
 A node's raw `interrupts` values are collected alongside its `reg`
 entries; the bootloader does not resolve `interrupt-parent`; associating
-lines with a PLIC belongs to `devmgr` (design intent, not yet
+lines with an interrupt controller belongs to `devmgr` (design intent, not yet
 implemented; see Parse firmware tables in
 [`services/devmgr/docs/responsibilities.md`](../../../services/devmgr/docs/responsibilities.md#responsibilities)).
 

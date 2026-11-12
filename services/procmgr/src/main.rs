@@ -146,7 +146,7 @@ fn main() -> !
         .spawn(move || reap_loop(ctx))
         .is_err()
     {
-        std::os::seraph::log!("reaper thread not started; exiting");
+        std::os::seraph::log!(error: "reaper thread not started; exiting");
         syscall::thread_exit();
     }
 
@@ -158,7 +158,7 @@ fn main() -> !
     if let Err(e) = pool.spawn("procmgr-recv", RECV_WORKERS - 1)
     {
         std::os::seraph::log!(
-            "{} of {RECV_WORKERS} request workers started: {}",
+            warn: "{} of {RECV_WORKERS} request workers started: {}",
             e.running + 1,
             e.error
         );
@@ -180,7 +180,7 @@ fn reap_loop(ctx: &ProcmgrCtx) -> !
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {
-        std::os::seraph::log!("reaper has no IPC buffer; exiting");
+        std::os::seraph::log!(error: "reaper has no IPC buffer; exiting");
         syscall::thread_exit();
     }
     // A failing wait counts toward the guard's fatal streak. A wait the
@@ -349,7 +349,7 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     if memmgr_send == 0
     {
-        std::os::seraph::log!("alloc_page: memmgr_send=0");
+        std::os::seraph::log!(warn: "alloc_page: memmgr_send=0");
         return None;
     }
     let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -361,14 +361,14 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
         Ok(r) => r,
         Err(e) =>
         {
-            std::os::seraph::log!("alloc_page: ipc_call err={}", e);
+            std::os::seraph::log!(warn: "alloc_page: ipc_call err={}", e);
             return None;
         }
     };
     if reply.label != memmgr_errors::SUCCESS
     {
         std::os::seraph::log!(
-            "alloc_page: memmgr label={} pool: total={} runs={} max={}",
+            warn: "alloc_page: memmgr label={} pool: total={} runs={} max={}",
             reply.label,
             reply.word(0),
             reply.word(1),
@@ -379,7 +379,7 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
     if reply.word(0) != 1
     {
         std::os::seraph::log!(
-            "alloc_page: count={} caps={}",
+            warn: "alloc_page: count={} caps={}",
             reply.word(0),
             reply.caps().len()
         );
@@ -522,7 +522,7 @@ fn hold_cspace_headroom(self_cspace: u64)
     else if !*warned
     {
         *warned = true;
-        std::os::seraph::log!("CSpace headroom top-up failed; retrying each pass");
+        std::os::seraph::log!(warn: "CSpace headroom top-up failed; retrying each pass");
     }
 }
 
@@ -534,11 +534,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("recv loop failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "recv loop failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("recv loop wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "recv loop wedged (err={err}); exiting");
         }
     }
 }
@@ -878,7 +878,7 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
                 // undone and the decliner receives again.
                 let _ = syscall::cap_delete(registered.recv);
                 crash::unregister(&registered);
-                std::os::seraph::log!("crash service reply undeliverable; registration undone");
+                std::os::seraph::log!(warn: "crash service reply undeliverable; registration undone");
                 return;
             }
             std::os::seraph::log!("crash service registered");
@@ -1267,7 +1267,7 @@ fn dispatch_death(ctx: &ProcmgrCtx, ipc_buf: *mut u64, batch: &mut Vec<syscall::
     }
     if full || dropped
     {
-        std::os::seraph::log!("a death queue drained full; resyncing the process table");
+        std::os::seraph::log!(warn: "a death queue drained full; resyncing the process table");
         resync_deaths(memmgr_ep, ipc_buf, &ctx.tables);
     }
 }
@@ -1318,7 +1318,7 @@ fn resync_deaths(memmgr_ep: u64, ipc_buf: *mut u64, tables: &process::Tables)
     });
     if short
     {
-        std::os::seraph::log!("death resync could not list every dead process");
+        std::os::seraph::log!(warn: "death resync could not list every dead process");
     }
     for (badge, exit_reason) in dead
     {
@@ -1445,7 +1445,7 @@ fn check_create_request(
         Ok(request) => Some((sched, Some(request))),
         Err(refusal) =>
         {
-            std::os::seraph::log!("create argv/env refused: {refusal:?}");
+            std::os::seraph::log!(warn: "create argv/env refused: {refusal:?}");
             None
         }
     }
@@ -1557,15 +1557,15 @@ fn refuse_unarmed_create(
     {
         HoldRefusal::NoRoom =>
         {
-            std::os::seraph::log!("no room for a held reclaim; destroying the child");
+            std::os::seraph::log!(warn: "no room for a held reclaim; destroying the child");
         }
         HoldRefusal::NotFound =>
         {
-            std::os::seraph::log!("held-reclaim child missing from the table; refusing the create");
+            std::os::seraph::log!(warn: "held-reclaim child missing from the table; refusing the create");
         }
         HoldRefusal::NoToken =>
         {
-            std::os::seraph::log!("release token not derived; destroying the child");
+            std::os::seraph::log!(warn: "release token not derived; destroying the child");
         }
     }
     let _ = syscall::cap_delete(result.thread_for_caller);
@@ -1632,7 +1632,7 @@ fn reply_create_result(
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
     {
-        std::os::seraph::log!("create reply undeliverable; destroying the child");
+        std::os::seraph::log!(warn: "create reply undeliverable; destroying the child");
         let _ = syscall::cap_delete(result.thread_for_caller);
         let _ = syscall::cap_delete(result.process_handle);
         if let Some(token) = release_token
@@ -1819,7 +1819,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 fn log_spawn_sched(sched: process::ChildSched)
 {
     std::os::seraph::log!(
-        "spawn priority={} band=[1,{}]",
+        debug: "spawn priority={} band=[1,{}]",
         sched.priority,
         sched.band_max
     );

@@ -98,7 +98,7 @@ impl Store
         };
         if offset.checked_add(len).is_none_or(|end| end > PAGE_SIZE)
         {
-            std::os::seraph::log!("table pages: flush past the end of {:#x} refused", phys);
+            std::os::seraph::log!(warn: "table pages: flush past the end of {:#x} refused", phys);
             return;
         }
         if let Some(va) = self.va(phys)
@@ -142,7 +142,7 @@ impl Store
         // has a live mapping to undo.
         if self.chunks.try_reserve(1).is_err()
         {
-            std::os::seraph::log!("table pages: no memory for a chunk record");
+            std::os::seraph::log!(warn: "table pages: no memory for a chunk record");
             return false;
         }
         let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -154,7 +154,7 @@ impl Store
         let Ok(reply) = (unsafe { ipc::ipc_call(self.memmgr_ep, &request, ipc_buf) })
         else
         {
-            std::os::seraph::log!("table pages: memmgr call failed");
+            std::os::seraph::log!(warn: "table pages: memmgr call failed");
             return false;
         };
         let cap = reply.caps().first().copied();
@@ -165,20 +165,20 @@ impl Store
             {
                 let _ = syscall::cap_delete(c);
             }
-            std::os::seraph::log!("table pages: memmgr refused {} pages", CHUNK_PAGES);
+            std::os::seraph::log!(warn: "table pages: memmgr refused {} pages", CHUNK_PAGES);
             return false;
         };
         let Ok(phys) = syscall::cap_info(cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
         else
         {
-            std::os::seraph::log!("table pages: no physical base");
+            std::os::seraph::log!(warn: "table pages: no physical base");
             let _ = syscall::cap_delete(cap);
             return false;
         };
         let Ok(range) = reserve_pages(CHUNK_PAGES)
         else
         {
-            std::os::seraph::log!("table pages: no VA");
+            std::os::seraph::log!(warn: "table pages: no VA");
             let _ = syscall::cap_delete(cap);
             return false;
         };
@@ -191,7 +191,7 @@ impl Store
         };
         if mapped.is_err()
         {
-            std::os::seraph::log!("table pages: mapping failed");
+            std::os::seraph::log!(warn: "table pages: mapping failed");
             // A failed map may leave the pages it mapped before failing, and
             // deleting a Memory cap does not unmap them, so they are unmapped
             // first; the range returns to the arena only once nothing is
@@ -237,7 +237,7 @@ impl TableStore for Store
         let Some(va) = self.va(phys)
         else
         {
-            std::os::seraph::log!("table pages: {:#x} is no table page", phys);
+            std::os::seraph::log!(warn: "table pages: {:#x} is no table page", phys);
             *self.sink = [0; TABLE_WORDS];
             return &mut self.sink;
         };

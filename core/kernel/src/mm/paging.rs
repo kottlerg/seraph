@@ -848,7 +848,7 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     check_direct_map_below_image(info, dm_base);
 
     // Kernel-internal MMIO regions (xAPIC + I/O APIC bases on x86-64; none on
-    // RISC-V, whose PLIC and UART take their device memory type from the
+    // RISC-V, whose APLIC, IMSIC and UART take their device memory type from the
     // platform PMAs). Bases come from `BootInfo.kernel_mmio` directly because
     // `crate::platform::capture_kernel_mmio` does not run until Phase 4.
     let mut mmio_regions = [(0u64, 0u64); crate::arch::current::platform::MMIO_DIRECT_MAP_REGIONS];

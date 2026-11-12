@@ -21,8 +21,11 @@ that delivers the resource list (§ Binding), and withdraws a bound driver in th
 § Binding gives. The rest is design intent; not yet implemented:
 
 - the IOMMU driver's delivery: devmgr binds it by its family record but gives it its own
-  bootstrap rounds rather than the resource list;
-- message-signaled vectors: a PCI function's driver is given its wired line only.
+  bootstrap rounds rather than the resource list
+  ([#938](https://github.com/kottlerg/seraph/issues/938));
+- message-signaled vectors: a PCI function's driver is given its wired line only
+  ([#325](https://github.com/kottlerg/seraph/issues/325));
+- the hotplug event path (§ Hotplug, [#939](https://github.com/kottlerg/seraph/issues/939)).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
 `MINT_CLASS_SEND`, the class files, and the boot-only mark.
@@ -351,7 +354,8 @@ edits no existing crate.
 Hotplug adds no binding path: an enumerator that learns of an added device appends its
 record and runs a bind pass over it; one that learns of a removed device withdraws its
 driver, which leaves a tombstone at its ordinal. The event sources are specified in
-[services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md).
+[services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md); devmgr handles no hotplug
+event yet ([#939](https://github.com/kottlerg/seraph/issues/939)).
 
 ---
 

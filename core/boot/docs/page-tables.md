@@ -176,7 +176,8 @@ Permission mapping:
 
 W^X: no leaf PTE is written with Writable=1 and NX=0 (intermediate entries are present +
 writable with NX=0, leaving the permission to the leaf); `map` returns
-`MapError::WxViolation` before any table is modified.
+`MapError::WxViolation` before any table is modified. A range whose end runs past the end
+of the address space returns `MapError::AddressRange`.
 
 ### Intermediate Table Allocation
 

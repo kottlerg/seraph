@@ -251,8 +251,10 @@ fn mint_bootstrap_badge() -> Option<u64>
 }
 
 /// The most resources one bound driver is delivered: every BAR of a PCI
-/// function and its wired interrupt.
-pub const MAX_BOUND_RESOURCES: usize = driver_binding::resources::PCI_BAR_COUNT as usize + 1;
+/// function and either its wired line or the most message-signaled vectors a
+/// declaration requests, one `Interrupt` resource each.
+pub const MAX_BOUND_RESOURCES: usize = driver_binding::resources::PCI_BAR_COUNT as usize
+    + driver_binding::decl::MAX_MSI_VECTORS as usize;
 
 /// What devmgr needs to start a driver it has bound to a device and deliver
 /// it the device's resource list (docs/driver-binding.md § Binding).

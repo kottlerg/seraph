@@ -1355,6 +1355,13 @@ struct IrqRangeAllocator
     /// The firmware's Interrupt Source Overrides, from which each PCI line's
     /// `SYS_IRQ_REGISTER` mode is derived ([`Self::line_mode`]).
     overrides: Vec<firmware::acpi::SourceOverride>,
+    /// A copy of the range cap carrying `RIGHTS_IRQ_MINT` alone, the
+    /// authority every message-signaled target is minted through
+    /// ([`Self::mint_message`]); 0 when devmgr holds no range or the copy
+    /// could not be derived. Derived before any split: `SYS_IRQ_SPLIT`
+    /// re-links a split cap's derivation children under its parent, so the
+    /// copy outlives every split of the range.
+    mint: u64,
 }
 
 impl IrqRangeAllocator
@@ -1372,11 +1379,43 @@ impl IrqRangeAllocator
         {
             std::os::seraph::log!(warn: "IRQ range not recorded (no memory); no device IRQs");
         }
+        let mint = if range_slot == 0
+        {
+            0
+        }
+        else
+        {
+            syscall::cap_derive(range_slot, syscall::RIGHTS_IRQ_MINT).unwrap_or_else(|_| {
+                std::os::seraph::log!(
+                    warn: "IRQ mint authority not derived; no message-signaled interrupts"
+                );
+                0
+            })
+        };
         Self {
             ranges,
             held: HeldLines::new(),
             overrides,
+            mint,
         }
+    }
+
+    /// Mint one message-signaled target (`SYS_IRQ_MSG_ALLOC`): an unbound
+    /// `Interrupt` cap carrying `RIGHTS_IRQ_NOTIFY`, on the next CPU in turn
+    /// with a free slot, whose message the kernel reports through
+    /// `SYS_CAP_INFO`. The caller owns it and deletes it with its device,
+    /// which frees the target once no copy remains.
+    ///
+    /// # Errors
+    /// The `SYS_IRQ_MSG_ALLOC` error, or `InvalidCapability` when devmgr holds
+    /// no mint authority.
+    fn mint_message(&self) -> Result<u64, i64>
+    {
+        if self.mint == 0
+        {
+            return Err(syscall_abi::SyscallError::InvalidCapability as i64);
+        }
+        syscall::irq_msg_alloc(self.mint)
     }
 
     /// The `SYS_IRQ_REGISTER` mode of PCI `INTx` line `gsi`, which every

@@ -79,6 +79,12 @@ then ordered by segment, bus, device, and function.
      the bridge, against which devmgr resolves the device scopes of the ACPI
      DMAR.
    - Read interrupt line (0x3C) and interrupt pin (0x3D).
+   - For a type-0 header, walk its capability list for the MSI (0x05) and
+     MSI-X (0x11) capabilities (`firmware::pci::Msi`, `firmware::pci::Msix`):
+     MSI's vector count and its 64-bit address and per-vector masking bits,
+     and MSI-X's table size and the BAR and offset of its table and of its
+     Pending Bit Array. An MSI-X capability whose table or Pending Bit Array
+     does not lie inside a sized MMIO BAR is not recorded.
    - For a function of the VirtIO vendor ID (`0x1AF4`), walk its capability
      list for the VirtIO register regions (§ Per-Device Capability Creation,
      step 1).
@@ -182,8 +188,22 @@ For each matched device, devmgr:
    ([responsibilities.md](responsibilities.md) § Responsibilities). A device
    that cannot be given DMA is refused, logged, with its BAR and
    configuration-page caps released.
-4. For a declaration that takes an interrupt, gives the device its own
-   single-line `Interrupt` cap for its GSI (its
+4. For a declaration that takes an interrupt, gives the device
+   message-signaled vectors or its wired line by the rule of
+   [docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
+   § Message-Signaled Interrupts, after the DMA grant of step 3: for MSI-X
+   a minted `Interrupt` cap per vector, the BARs holding the table and the
+   Pending Bit Array carved whole when step 2 carved neither, and MSI-X
+   enabled with every table entry masked; for MSI one minted cap, its
+   message, once checked to fit the capability, written into it and MSI
+   enabled with one vector. On riscv64 behind the RISC-V IOMMU each
+   target's interrupt file is then mapped into the device's domain
+   (`MAP_MSI`), before the vectors are enabled; a message that does not
+   fit maps none. A step that fails falls back to MSI where the function
+   has it, then to the wired line, except that one that fails after it
+   mapped an interrupt file refuses the device, logged, with its caps
+   released and its domain blocked. For the wired line it gives the
+   device its own single-line `Interrupt` cap for its GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback). The first
    time any device asks for a GSI, devmgr splits the line's cap off its
    Interrupt range cap; the lines below and above it stay in devmgr's
@@ -223,15 +243,18 @@ For each matched device, devmgr:
    ([shared/driver-binding/README.md](../../../shared/driver-binding/README.md)):
    one round per resource, each naming its kind in `data[0]`: an `Mmio`
    round per BAR cap of step 2, in carve order, with its PCI BAR index,
-   physical base, and size, then, with an IRQ cap from step 4, an
-   `Interrupt` round of kind `Wired` with the line's mode of step 4, which
-   the driver passes to `SYS_IRQ_REGISTER`. The terminal round carries the
+   physical base, and size, then one per BAR step 4 carved for an MSI-X
+   table or Pending Bit Array, then the `Interrupt` rounds of step 4: one
+   of kind `Wired` with the line's mode, which the driver passes to
+   `SYS_IRQ_REGISTER`, or one per vector of kind `Msi` or `MsiX` with its
+   vector index and mode 0. The terminal round carries the
    service endpoint, a SEND badged with the device's badge on the private
    driver endpoint of the driver's settle batch, and, for a DMA declaration,
    a copy of the device's DMA capability. With no `Interrupt` resource
    virtio-input and virtio-console poll. A VirtIO driver checks the delivered
    BAR indices against the layout it computes from its `QUERY_DEVICE_INFO`
-   reply and exits on a mismatch.
+   reply and exits on a mismatch; no VirtIO driver asks for vectors, so none
+   is delivered a BAR step 4 carved for MSI-X.
 8. Binds a death observer on the driver's thread to devmgr's driver death
    queue, with the device badge as the correlator, and keeps the driver's
    process handle for the rest of the boot.

@@ -31,6 +31,7 @@ use firmware::binding::{
 };
 use firmware::dma::Confinement;
 use firmware::lines::{HoldError, LineError};
+use firmware::pci::{InterruptPlan, MessagesRefused, Msi, Msix};
 use firmware::records::{PlatformRecord, PlatformRecords};
 use firmware::resource::{CarveError, Span, SplitError};
 use firmware::roster::Roster;
@@ -869,16 +870,14 @@ fn bind_pci(
 /// turn the function on for it: a cap on each of its MMIO BARs (for a
 /// function that presents the `VirtIO` register layout, the BARs the layout
 /// names, each clipped to the pages its regions reach; otherwise every MMIO
-/// BAR, whole), its wired line for a driver that takes an interrupt, its
-/// configuration page, its catalog entry (the `VirtIO` startup info, or none),
-/// its DMA grant for a DMA declaration ([`grant_dma`]), the target of its
-/// declared reset, and the Command register written for the bind
+/// BAR, whole), its configuration page, its catalog entry (the `VirtIO`
+/// startup info, or none), its DMA grant for a DMA declaration
+/// ([`grant_dma`]), its interrupt for a driver that takes one
+/// ([`give_interrupt`]: MSI-X or MSI vectors, or the wired line), the target
+/// of its declared reset, and the Command register written for the bind
 /// ([`FunctionConfig::prepare_for_bind`]). `None`, logged under `name` and
 /// with what was carved released, on any failure, a required interrupt the
 /// function cannot be given included.
-///
-/// Message-signaled vectors are not delivered: a driver is given the wired
-/// line only, whatever vectors it declares.
 fn carve_pci_device(
     name: &str,
     pci_dev: &pci::PciDevice,
@@ -902,33 +901,6 @@ fn carve_pci_device(
     let mut dev = PciDeviceCaps::empty(carve.caps.self_aspace);
     if carve_bars(name, pci_dev, carve.caps, &mut dev).is_none()
     {
-        dev.release();
-        return None;
-    }
-    let wired = if decl.interrupt.need == InterruptNeed::None
-    {
-        None
-    }
-    else
-    {
-        acquire_single_irq_cap(pci_dev, carve.irq_range)
-    };
-    if let Some(cap) = wired
-    {
-        let mode = device_gsi(pci_dev).map_or(0, |gsi| carve.irq_range.line_mode(gsi));
-        dev.push(Resource::Interrupt {
-            cap,
-            kind: InterruptKind::Wired,
-            vector: 0,
-            mode,
-        });
-    }
-    else if decl.interrupt.need == InterruptNeed::Required
-    {
-        std::os::seraph::log!(
-            warn: "{}: no interrupt line for the device, which the driver requires; not bound",
-            name
-        );
         dev.release();
         return None;
     }
@@ -957,6 +929,27 @@ fn carve_pci_device(
         };
         dev.dma = Some(grant);
     }
+    // After the DMA grant: on riscv64 a message-signaled target's interrupt
+    // file enters the device's IOMMU domain before its vectors are enabled.
+    let Ok(given) = give_interrupt(name, pci_dev, decl, carve, &mut dev)
+    else
+    {
+        std::os::seraph::log!(
+            warn: "{}: interrupt files mapped for vectors not given; not bound",
+            name
+        );
+        dev.release();
+        return None;
+    };
+    if given.is_none() && decl.interrupt.need == InterruptNeed::Required
+    {
+        std::os::seraph::log!(
+            warn: "{}: no interrupt for the device, which the driver requires; not bound",
+            name
+        );
+        dev.release();
+        return None;
+    }
     dev.reset = match decl.reset
     {
         Reset::None => StopReset::None,
@@ -975,7 +968,9 @@ fn carve_pci_device(
             reset.map_or(StopReset::None, StopReset::Virtio)
         }
     };
-    if !dev.config.prepare_for_bind(decl.dma, wired.is_some())
+    if !dev
+        .config
+        .prepare_for_bind(decl.dma, given == Some(InterruptKind::Wired))
     {
         std::os::seraph::log!(warn: "{}: configuration page not mapped; not bound", name);
         dev.release();
@@ -1117,6 +1112,430 @@ fn grant_dma(
         }
     }
     grant
+}
+
+/// Give the driver `decl` of `pci_dev` its device's interrupt, recorded in
+/// `dev` as one `Interrupt` resource per vector: the plan
+/// [`firmware::pci::interrupt_plan`] chooses, each step that fails falling
+/// back to the next ([`firmware::pci::fallback`]): MSI-X vectors
+/// ([`give_msix`]), one MSI vector ([`give_msi`]), the wired line
+/// ([`give_wired`]). Returns the kind given; `None` for a driver that takes
+/// no interrupt and for a device none can be had for.
+///
+/// # Errors
+/// [`Widened`] when a message-signaled step failed after it mapped an
+/// interrupt file into the device's IOMMU domain: the domain keeps the
+/// file until it is blocked, so the device would reach a hart's file no
+/// target of its own sits on. Nothing further is tried; the caller refuses
+/// the bind, whose release blocks the domain.
+fn give_interrupt(
+    name: &str,
+    pci_dev: &pci::PciDevice,
+    decl: &DriverDecl,
+    carve: &mut Carve,
+    dev: &mut PciDeviceCaps,
+) -> Result<Option<InterruptKind>, Widened>
+{
+    let mut plan = Some(firmware::pci::interrupt_plan(
+        decl.interrupt,
+        decl.dma,
+        pci_dev.msi,
+        pci_dev.msix,
+    ));
+    while let Some(step) = plan
+    {
+        let (given, vectors) = match step
+        {
+            InterruptPlan::None => return Ok(None),
+            InterruptPlan::Wired => (
+                give_wired(pci_dev, carve.irq_range, dev).then_some(InterruptKind::Wired),
+                1,
+            ),
+            InterruptPlan::Msi => (
+                given_messages(give_msi(name, pci_dev, carve.irq_range, dev))?
+                    .then_some(InterruptKind::Msi),
+                1,
+            ),
+            InterruptPlan::MsiX(vectors) => (
+                given_messages(give_msix(name, pci_dev, vectors, carve, dev))?
+                    .then_some(InterruptKind::MsiX),
+                vectors,
+            ),
+        };
+        if let Some(kind) = given
+        {
+            std::os::seraph::log!("{}: {:?} interrupt, {} vector(s)", name, kind, vectors);
+            return Ok(given);
+        }
+        plan = firmware::pci::fallback(step, pci_dev.msi);
+        if let Some(next) = plan
+        {
+            std::os::seraph::log!(warn: "{}: {:?} not given; trying {:?}", name, step, next);
+        }
+    }
+    Ok(None)
+}
+
+/// A message-signaled step that failed after it mapped an interrupt file
+/// into the device's IOMMU domain ([`give_interrupt`]).
+struct Widened;
+
+/// Why a message-signaled step gave no vector.
+#[derive(Clone, Copy)]
+enum NotGiven
+{
+    /// The step left the device's IOMMU domain as it found it.
+    Clean,
+    /// The step mapped an interrupt file the domain keeps ([`Widened`]).
+    Widened,
+}
+
+/// Whether a message-signaled step's `outcome` gave its vectors; `Err` for
+/// one that failed after it widened the device's domain.
+fn given_messages(outcome: Result<(), NotGiven>) -> Result<bool, Widened>
+{
+    match outcome
+    {
+        Ok(()) => Ok(true),
+        Err(NotGiven::Clean) => Ok(false),
+        Err(NotGiven::Widened) => Err(Widened),
+    }
+}
+
+/// The failure of a message-signaled step after its targets were minted,
+/// `widened` telling whether the minting mapped an interrupt file.
+fn not_given(widened: bool) -> NotGiven
+{
+    if widened
+    {
+        NotGiven::Widened
+    }
+    else
+    {
+        NotGiven::Clean
+    }
+}
+
+/// Give the driver the device's wired line: its own single-line cap
+/// ([`acquire_single_irq_cap`]) with the line's mode. Returns whether it was
+/// given.
+fn give_wired(
+    pci_dev: &pci::PciDevice,
+    irq_range: &mut IrqRangeAllocator,
+    dev: &mut PciDeviceCaps,
+) -> bool
+{
+    let Some(cap) = acquire_single_irq_cap(pci_dev, irq_range)
+    else
+    {
+        return false;
+    };
+    let mode = device_gsi(pci_dev).map_or(0, |gsi| irq_range.line_mode(gsi));
+    dev.push(Resource::Interrupt {
+        cap,
+        kind: InterruptKind::Wired,
+        vector: 0,
+        mode,
+    });
+    true
+}
+
+/// One minted message-signaled target: devmgr's cap on it and the message
+/// its device writes to signal it (`SYS_CAP_INFO`'s
+/// `CAP_INFO_IRQ_MSG_ADDRESS` and `CAP_INFO_IRQ_MSG_DATA`).
+#[derive(Clone, Copy)]
+struct Message
+{
+    cap: u64,
+    address: u64,
+    data: u64,
+}
+
+/// Delete the cap of every target in `messages`, freeing each target once no
+/// copy of it remains.
+fn delete_messages(messages: &[Message])
+{
+    for m in messages
+    {
+        let _ = syscall::cap_delete(m.cap);
+    }
+}
+
+/// Whether a device's message-signaled writes are translated by its IOMMU
+/// domain, so each interrupt file they target must be mapped there first:
+/// the RISC-V IOMMU's are (`iommu_labels::MAP_MSI`); VT-d's are not, its
+/// interrupt remapping governing them.
+fn messages_translated() -> bool
+{
+    arch::current::IOMMU_FAMILY == crate::iommu::Family::Riscv
+}
+
+/// Mint `count` message-signaled targets ([`IrqRangeAllocator::mint_message`])
+/// and read each one's message; check that every message fits the
+/// function's capability (`fits`) and only then, where the device's IOMMU
+/// domain translates its messages ([`messages_translated`]), make the
+/// interrupt file each one targets reachable by the device through its DMA
+/// grant `dma` ([`dma::DmaGrant::reach_interrupt_file`]), in that order by
+/// [`firmware::pci::reach_message_files`]. Returns the targets and whether a
+/// file was newly mapped for them. On failure, logged under `name`, every
+/// target it minted is deleted, and the error tells whether a file was
+/// mapped before the failure ([`NotGiven::Widened`]); a message that does not
+/// fit maps none.
+fn mint_messages(
+    name: &str,
+    count: u8,
+    irq_range: &IrqRangeAllocator,
+    dma: Option<&dma::DmaGrant>,
+    fits: impl Fn(&Message) -> bool,
+) -> Result<(Vec<Message>, bool), NotGiven>
+{
+    let mut messages: Vec<Message> = Vec::new();
+    if messages.try_reserve_exact(usize::from(count)).is_err()
+    {
+        std::os::seraph::log!(warn: "{}: no memory to mint interrupt targets", name);
+        return Err(NotGiven::Clean);
+    }
+    for _ in 0..count
+    {
+        let minted =
+            irq_range.mint_message().and_then(|cap| {
+                let message = syscall::cap_info(cap, syscall_abi::CAP_INFO_IRQ_MSG_ADDRESS)
+                    .and_then(|address| {
+                        syscall::cap_info(cap, syscall_abi::CAP_INFO_IRQ_MSG_DATA)
+                            .map(|data| Message { cap, address, data })
+                    });
+                if message.is_err()
+                {
+                    let _ = syscall::cap_delete(cap);
+                }
+                message
+            });
+        match minted
+        {
+            Ok(message) => messages.push(message),
+            Err(e) =>
+            {
+                std::os::seraph::log!(
+                    warn: "{}: interrupt target {} of {} not minted ({})",
+                    name,
+                    messages.len() + 1,
+                    count,
+                    e
+                );
+                delete_messages(&messages);
+                return Err(NotGiven::Clean);
+            }
+        }
+    }
+    let translated = messages_translated();
+    let reached = firmware::pci::reach_message_files(&messages, fits, |m| match dma
+    {
+        Some(dma) if translated => dma.reach_interrupt_file(m.address & !(PAGE_SIZE - 1)),
+        _ => Some(false),
+    });
+    match reached
+    {
+        Ok(widened) => Ok((messages, widened)),
+        Err(refused) =>
+        {
+            let not = match refused
+            {
+                MessagesRefused::Unfit(i) =>
+                {
+                    if let Some(m) = messages.get(i)
+                    {
+                        std::os::seraph::log!(
+                            warn: "{}: message {:#x}/{:#x} does not fit the device's capability",
+                            name,
+                            m.address,
+                            m.data
+                        );
+                    }
+                    NotGiven::Clean
+                }
+                MessagesRefused::Unreachable { widened } =>
+                {
+                    std::os::seraph::log!(
+                        warn: "{}: an interrupt file its targets sit on is not reachable by the device",
+                        name
+                    );
+                    not_given(widened)
+                }
+            };
+            delete_messages(&messages);
+            Err(not)
+        }
+    }
+}
+
+/// Give the driver one MSI vector: mint a target whose message fits the
+/// function's MSI capability ([`Msi::fits`], checked before its interrupt
+/// file is reached), program the message into the capability and enable it
+/// with one vector ([`FunctionConfig::program_msi`]).
+///
+/// # Errors
+/// Logged, with the target deleted, when the function has no MSI
+/// capability, the mint fails, the message does not fit the capability
+/// (with no interrupt file mapped), or the configuration page cannot be
+/// mapped; the [`NotGiven`] tells whether an interrupt file was mapped for
+/// it.
+fn give_msi(
+    name: &str,
+    pci_dev: &pci::PciDevice,
+    irq_range: &IrqRangeAllocator,
+    dev: &mut PciDeviceCaps,
+) -> Result<(), NotGiven>
+{
+    let msi = pci_dev.msi.ok_or(NotGiven::Clean)?;
+    let (messages, widened) = mint_messages(name, 1, irq_range, dev.dma.as_ref(), |m| {
+        msi.fits(m.address, m.data)
+    })?;
+    let Some(m) = messages.first().copied()
+    else
+    {
+        return Err(not_given(widened));
+    };
+    if !dev.config.program_msi(msi, m.address, m.data)
+    {
+        delete_messages(&[m]);
+        return Err(not_given(widened));
+    }
+    dev.push(Resource::Interrupt {
+        cap: m.cap,
+        kind: InterruptKind::Msi,
+        vector: 0,
+        mode: 0,
+    });
+    Ok(())
+}
+
+/// Give the driver `vectors` MSI-X vectors, table entries 0 onwards: deliver
+/// the BARs holding the function's table and Pending Bit Array
+/// ([`msix_bar`]), mint a target per vector, and enable MSI-X with every
+/// table entry masked ([`FunctionConfig::enable_msix`]); the driver writes
+/// each entry's message, read from its `Interrupt` cap, and unmasks it.
+///
+/// # Errors
+/// Logged, with the targets deleted and any BAR delivered for the table
+/// taken back, when the function has no MSI-X capability, a BAR cannot be
+/// delivered, a mint fails, or the capability or table cannot be mapped;
+/// the [`NotGiven`] tells whether an interrupt file was mapped for them.
+fn give_msix(
+    name: &str,
+    pci_dev: &pci::PciDevice,
+    vectors: u8,
+    carve: &mut Carve,
+    dev: &mut PciDeviceCaps,
+) -> Result<(), NotGiven>
+{
+    let msix = pci_dev.msix.ok_or(NotGiven::Clean)?;
+    let delivered = dev.count;
+    let table = msix_bar(
+        name,
+        pci_dev,
+        msix.table_bar,
+        msix.table_end(),
+        carve.caps,
+        dev,
+    );
+    let pba = msix_bar(name, pci_dev, msix.pba_bar, msix.pba_end(), carve.caps, dev);
+    let (Some((table_cap, table_bytes)), Some(_)) = (table, pba)
+    else
+    {
+        dev.truncate(delivered);
+        return Err(NotGiven::Clean);
+    };
+    // A table entry holds a 64-bit address and 32-bit data, wider than the
+    // target vector or IMSIC interrupt identity a message carries.
+    let minted = mint_messages(name, vectors, carve.irq_range, dev.dma.as_ref(), |_| true);
+    let (messages, widened) = match minted
+    {
+        Ok(minted) => minted,
+        Err(e) =>
+        {
+            dev.truncate(delivered);
+            return Err(e);
+        }
+    };
+    if !dev
+        .config
+        .enable_msix(msix, table_cap, table_bytes.div_ceil(PAGE_SIZE))
+    {
+        delete_messages(&messages);
+        dev.truncate(delivered);
+        return Err(not_given(widened));
+    }
+    for (vector, m) in (0..=u8::MAX).zip(&messages)
+    {
+        dev.push(Resource::Interrupt {
+            cap: m.cap,
+            kind: InterruptKind::MsiX,
+            vector,
+            mode: 0,
+        });
+    }
+    Ok(())
+}
+
+/// The cap and delivered bytes of BAR register `bar` of `pci_dev`, which
+/// holds an MSI-X structure reaching `reach` bytes into it: the BAR's
+/// delivered `Mmio` resource in `dev`, or, for a BAR not yet delivered (one
+/// the `VirtIO` layout does not name), the whole BAR, carved and delivered.
+/// `None`, logged under `name`, when the delivered span stops short of
+/// `reach` (a `VirtIO` layout BAR clipped to its regions) or the BAR cannot
+/// be carved.
+fn msix_bar(
+    name: &str,
+    pci_dev: &pci::PciDevice,
+    bar: u8,
+    reach: u64,
+    caps: &mut caps::DevmgrCaps,
+    dev: &mut PciDeviceCaps,
+) -> Option<(u64, u64)>
+{
+    let delivered = dev.resources().iter().find_map(|r| match *r
+    {
+        Resource::Mmio {
+            cap,
+            bar: Some(b),
+            bytes,
+            ..
+        } if b == bar => Some((cap, bytes)),
+        _ => None,
+    });
+    if let Some((cap, bytes)) = delivered
+    {
+        if reach <= bytes
+        {
+            return Some((cap, bytes));
+        }
+        std::os::seraph::log!(
+            warn: "{}: MSI-X structure reaches past the delivered span of BAR {}",
+            name,
+            bar
+        );
+        return None;
+    }
+    let b = (0..pci_dev.bar_count)
+        .find(|&b| pci_dev.bar_pci_idx[b] == bar && pci_dev.bar_is_mmio[b])?;
+    let (phys, bytes) = (pci_dev.bar_phys[b], pci_dev.bar_size[b]);
+    let Some(cap) = crate::carve_subrange(caps, phys, bytes)
+    else
+    {
+        std::os::seraph::log!(
+            warn: "{}: MSI-X BAR {} not covered by any aperture",
+            name,
+            bar
+        );
+        return None;
+    };
+    dev.push(Resource::Mmio {
+        cap,
+        bar: Some(bar),
+        phys,
+        bytes,
+    });
+    Some((cap, bytes))
 }
 
 /// A PCI device's own single-line `Interrupt` cap: a derivation of the held
@@ -1273,8 +1692,9 @@ impl PciDeviceCaps
         }
     }
 
-    /// Record a carved resource. A function has at most six BARs and one
-    /// wired line, which [`MAX_BOUND_RESOURCES`] holds.
+    /// Record a carved resource. A function has at most six BARs and either
+    /// one wired line or at most `MAX_MSI_VECTORS` message-signaled vectors,
+    /// which [`MAX_BOUND_RESOURCES`] holds.
     fn push(&mut self, resource: Resource)
     {
         if let Some(slot) = self.resources.get_mut(self.count)
@@ -1288,11 +1708,36 @@ impl PciDeviceCaps
         }
     }
 
+    /// Delete the cap of every resource recorded after the first `count`,
+    /// and forget them: what a failed interrupt step delivered.
+    fn truncate(&mut self, count: usize)
+    {
+        for resource in self.resources().get(count..).unwrap_or(&[])
+        {
+            let _ = syscall::cap_delete(resource.cap());
+        }
+        self.count = self.count.min(count);
+    }
+
     /// The delivered resources, in delivery order: the BARs, then the
-    /// interrupt.
+    /// interrupt's vectors.
     pub fn resources(&self) -> &[Resource]
     {
         &self.resources[..self.count]
+    }
+
+    /// Whether the device was given message-signaled vectors.
+    fn has_messages(&self) -> bool
+    {
+        self.resources().iter().any(|r| {
+            matches!(
+                r,
+                Resource::Interrupt {
+                    kind: InterruptKind::Msi | InterruptKind::MsiX,
+                    ..
+                }
+            )
+        })
     }
 
     /// Whether the IOMMU confines the device.
@@ -1302,9 +1747,16 @@ impl PciDeviceCaps
     }
 
     /// Release every cap devmgr keeps for the device: its resources, its DMA
-    /// grant, and its configuration page.
+    /// grant, and its configuration page. A device given message-signaled
+    /// vectors first has them disabled ([`FunctionConfig::disable_messages`]),
+    /// so it signals none of its targets once they are freed and minted for
+    /// another device.
     pub fn release(&self)
     {
+        if self.config.cap != 0 && self.has_messages()
+        {
+            let _ = self.config.disable_messages();
+        }
         for resource in self.resources()
         {
             let _ = syscall::cap_delete(resource.cap());
@@ -1358,12 +1810,14 @@ impl PciDeviceCaps
     /// Clear the function's Bus Master Enable, revoke every cap derived from
     /// the BAR caps devmgr keeps (the driver's copies, whose mappings the
     /// revocation removes before it returns), set the function's Interrupt
-    /// Disable, so it no longer asserts a line it may share, and reset the
-    /// device as its driver declared, in that order. Returns whether the
-    /// device is confirmed quiet: Bus Master Enable read back clear, every BAR
-    /// copy revoked, and the reset confirmed. A device with no declared reset
-    /// is never confirmed quiet. Interrupt Disable is logged when it is not
-    /// confirmed, and does not decide quiet, which concerns DMA alone.
+    /// Disable, so it no longer asserts a line it may share, clear its MSI
+    /// Enable and MSI-X Enable, so it signals no message-signaled interrupt,
+    /// and reset the device as its driver declared, in that order. Returns
+    /// whether the device is confirmed quiet: Bus Master Enable read back
+    /// clear, every BAR copy revoked, and the reset confirmed. A device with
+    /// no declared reset is never confirmed quiet. Interrupt Disable is logged
+    /// when it is not confirmed; neither it nor the message disable decides
+    /// quiet, which concerns DMA alone.
     fn stop_and_reset(&self) -> bool
     {
         let bus_master_clear = self.config.clear_bus_master();
@@ -1381,6 +1835,7 @@ impl PciDeviceCaps
             std::os::seraph::log!(warn: "device reset: a BAR copy could not be revoked");
         }
         let _ = self.config.disable_interrupt();
+        let _ = self.config.disable_messages();
         let reset = match self.reset
         {
             StopReset::Virtio(reset) => reset.reset(),
@@ -1401,8 +1856,9 @@ impl PciDeviceCaps
 /// `dev_caps` holds, in the order services/devmgr/docs/responsibilities.md
 /// § Responsibilities states: take the device from the driver
 /// ([`PciDeviceCaps::take_from_driver`]: Bus Master Enable cleared before the
-/// BAR caps are taken, then Interrupt Disable, then the reset), so it neither
-/// performs DMA nor holds its line asserted with no driver to clear it; then
+/// BAR caps are taken, then Interrupt Disable and the message-signaled
+/// enables, then the reset), so it neither performs DMA nor signals an
+/// interrupt with no driver to take it; then
 /// destroy the driver, a no-op for one procmgr has reaped. For a driver
 /// procmgr holds the memory of, its held memory is released on its release
 /// token ([`spawn::destroy_and_release`]) only when the device is confirmed
@@ -1530,6 +1986,89 @@ impl DeviceReset
     }
 }
 
+/// Volatile access to the registers of one function's configuration page,
+/// mapped at a base address for the value's life. Each access is checked to
+/// lie within the page and be aligned to its width, so an offset read from
+/// the device (a capability pointer) reaches nothing past the page; an access
+/// that fails the check reads all ones and writes nothing, as a function that
+/// does not answer.
+struct ConfigRegs
+{
+    va: u64,
+}
+
+impl ConfigRegs
+{
+    /// The registers of the configuration page mapped at `va`.
+    ///
+    /// # Safety
+    /// `va` is the base of a mapping of the whole configuration page that
+    /// outlives the returned value and that nothing reaches but raw volatile
+    /// accesses (`FunctionConfig::mapped`).
+    unsafe fn new(va: u64) -> Self
+    {
+        Self { va }
+    }
+
+    /// The address of the `width`-byte register at `offset`, when it lies
+    /// within the page and is aligned to its width.
+    fn at(&self, offset: u16, width: u16) -> Option<u64>
+    {
+        let end = u64::from(offset) + u64::from(width);
+        (end <= firmware::pci::FUNCTION_CONFIG_BYTES && offset.is_multiple_of(width))
+            .then(|| self.va + u64::from(offset))
+    }
+
+    fn read8(&self, offset: u16) -> u8
+    {
+        // SAFETY: `at` checked the byte within the page `new`'s contract maps.
+        self.at(offset, 1).map_or(u8::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u8)
+        })
+    }
+
+    fn read16(&self, offset: u16) -> u16
+    {
+        // SAFETY: `at` checked the register within the page `new`'s contract
+        // maps and aligned to its width.
+        self.at(offset, 2).map_or(u16::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u16)
+        })
+    }
+
+    fn write16(&self, offset: u16, value: u16)
+    {
+        if let Some(a) = self.at(offset, 2)
+        {
+            // SAFETY: as for `read16`.
+            unsafe { core::ptr::write_volatile(a as *mut u16, value) };
+        }
+    }
+
+    fn read32(&self, offset: u16) -> u32
+    {
+        // SAFETY: as for `read16`, at its own width.
+        self.at(offset, 4).map_or(u32::MAX, |a| unsafe {
+            core::ptr::read_volatile(a as *const u32)
+        })
+    }
+
+    fn write32(&self, offset: u16, value: u32)
+    {
+        if let Some(a) = self.at(offset, 4)
+        {
+            // SAFETY: as for `read32`.
+            unsafe { core::ptr::write_volatile(a as *mut u32, value) };
+        }
+    }
+
+    /// Read-modify-write the 16-bit register at `offset` with `change`.
+    fn update16(&self, offset: u16, change: impl FnOnce(u16) -> u16)
+    {
+        self.write16(offset, change(self.read16(offset)));
+    }
+}
+
 /// The `Mmio` cap of one PCI function's configuration page, which devmgr
 /// keeps and delegates to no driver, and devmgr's own address space to map
 /// it in.
@@ -1568,6 +2107,138 @@ impl FunctionConfig
                 core::ptr::write_volatile(
                     command,
                     firmware::pci::command_for_bind(current, dma, wired),
+                );
+            }
+        })
+        .is_some()
+    }
+
+    /// Program the function's MSI capability `msi` with the message
+    /// `address`, `data` (which [`Msi::fits`] admits), unmask its first vector
+    /// where it has per-vector masking, and enable MSI with one vector
+    /// ([`firmware::pci::msi_control_enable_one`]). The function signals
+    /// nothing until Bus Master Enable is set. Returns whether the
+    /// configuration page could be mapped; `false`, logged, when it could
+    /// not, nothing written.
+    fn program_msi(&self, msi: Msi, address: u64, data: u64) -> bool
+    {
+        let [lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3] = address.to_le_bytes();
+        let [d0, d1, ..] = data.to_le_bytes();
+        let programmed = self.mapped("MSI", |va| {
+            // SAFETY: `va` is the configuration page mapped for this closure.
+            let regs = unsafe { ConfigRegs::new(va) };
+            regs.write32(
+                msi.offset + firmware::pci::MSI_ADDRESS,
+                u32::from_le_bytes([lo0, lo1, lo2, lo3]),
+            );
+            if msi.address_64
+            {
+                regs.write32(
+                    msi.offset + firmware::pci::MSI_ADDRESS_HIGH,
+                    u32::from_le_bytes([hi0, hi1, hi2, hi3]),
+                );
+            }
+            regs.write16(msi.data_offset(), u16::from_le_bytes([d0, d1]));
+            if let Some(mask) = msi.mask_offset()
+            {
+                regs.write32(mask, regs.read32(mask) & !1);
+            }
+            regs.update16(
+                msi.offset + firmware::pci::MESSAGE_CONTROL,
+                firmware::pci::msi_control_enable_one,
+            );
+        });
+        programmed.is_some()
+    }
+
+    /// Enable the function's MSI-X capability `msix` with every table entry
+    /// masked, through its table's BAR cap `table_cap` of `table_pages` pages:
+    /// set MSI-X Enable under Function Mask
+    /// ([`firmware::pci::msix_control_enable_masked`]), set every entry's
+    /// Mask Bit, then clear Function Mask, so each vector stays masked until
+    /// the driver writes its message and unmasks it. The function signals
+    /// nothing until Bus Master Enable is set. Returns whether every step's
+    /// mapping succeeded; `false`, logged, when one did not, MSI-X then
+    /// disabled again.
+    fn enable_msix(&self, msix: Msix, table_cap: u64, table_pages: u64) -> bool
+    {
+        let control = msix.offset + firmware::pci::MESSAGE_CONTROL;
+        let enabled = self.mapped("MSI-X", |va| {
+            // SAFETY: `va` is the configuration page mapped for this closure.
+            let regs = unsafe { ConfigRegs::new(va) };
+            regs.update16(control, firmware::pci::msix_control_enable_masked);
+        });
+        if enabled.is_none()
+        {
+            return false;
+        }
+        let table = u64::from(msix.table_offset);
+        let masked =
+            crate::with_mmio_mapped(self.aspace, table_cap, table_pages, "MSI-X table", |va| {
+                for entry in 0..u64::from(msix.table_size)
+                {
+                    let at = (va
+                        + table
+                        + entry * firmware::pci::MSIX_ENTRY_BYTES
+                        + firmware::pci::MSIX_ENTRY_VECTOR_CONTROL)
+                        as *mut u32;
+                    // SAFETY: the table lies within the BAR's span the cap covers
+                    // (`msix_bar` checked its end against it), all of which is
+                    // mapped from `va` for this closure; Vector Control is a
+                    // dword-aligned 32-bit register (the table offset is
+                    // QWORD-aligned, its entries 16 bytes).
+                    let vector_control = unsafe { core::ptr::read_volatile(at) };
+                    // SAFETY: as for the read above.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            at,
+                            vector_control | firmware::pci::MSIX_VECTOR_MASKED,
+                        );
+                    }
+                }
+            });
+        let finished = self.mapped("MSI-X", |va| {
+            // SAFETY: `va` is the configuration page mapped for this closure.
+            let regs = unsafe { ConfigRegs::new(va) };
+            if masked.is_some()
+            {
+                regs.update16(control, firmware::pci::msix_control_unmask_function);
+            }
+            else
+            {
+                regs.update16(control, firmware::pci::msix_control_disable);
+            }
+        });
+        masked.is_some() && finished.is_some()
+    }
+
+    /// Clear the function's MSI Enable and MSI-X Enable, MSI-X's Function
+    /// Mask set ([`firmware::pci::msi_control_disable`],
+    /// [`firmware::pci::msix_control_disable`]), each capability found by
+    /// walking the function's capability list, so it signals no
+    /// message-signaled interrupt. A function with neither capability is left
+    /// as it is. Returns whether the configuration page could be mapped.
+    fn disable_messages(&self) -> bool
+    {
+        self.mapped("message disable", |va| {
+            // SAFETY: `va` is the configuration page mapped for this closure.
+            let regs = unsafe { ConfigRegs::new(va) };
+            let status = regs.read16(firmware::pci::STATUS);
+            let read8 = |at: u16| regs.read8(at);
+            if let Some(at) =
+                firmware::pci::find_capability(status, firmware::pci::CAP_ID_MSI, read8)
+            {
+                regs.update16(
+                    at + firmware::pci::MESSAGE_CONTROL,
+                    firmware::pci::msi_control_disable,
+                );
+            }
+            if let Some(at) =
+                firmware::pci::find_capability(status, firmware::pci::CAP_ID_MSIX, read8)
+            {
+                regs.update16(
+                    at + firmware::pci::MESSAGE_CONTROL,
+                    firmware::pci::msix_control_disable,
                 );
             }
         })

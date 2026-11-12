@@ -2333,6 +2333,18 @@ pub mod test_dma_labels
     /// [`DMA_PROBE`] outcome: the device address lies past the device's DMA
     /// reach, so no transfer was made.
     pub const PROBE_SKIPPED: u64 = 2;
+    /// Run the interrupt probe: have the device raise its interrupt (the
+    /// `edu` interrupt-raise register), wait for it on the notification the
+    /// fixture bound its `Interrupt` resource to, for at most
+    /// [`INTERRUPT_WAIT_MS`], then acknowledge it at the device and with
+    /// `SYS_IRQ_ACK`. Request: no data. Reply: `SUCCESS` with `data[0]` =
+    /// whether the interrupt reached the notification (1) or not (0), and
+    /// `data[1]` = the kind of interrupt devmgr gave the fixture, a
+    /// `driver_binding::resources::InterruptKind` value, or 0 for none. Any
+    /// other reply label is a setup failure.
+    pub const INTERRUPT_PROBE: u64 = 2;
+    /// How long the [`INTERRUPT_PROBE`] waits for the interrupt it raised.
+    pub const INTERRUPT_WAIT_MS: u64 = 2000;
 }
 
 /// Why [`report_driver_ready`] failed.

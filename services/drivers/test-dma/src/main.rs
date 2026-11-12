@@ -9,10 +9,13 @@
 //!
 //! devmgr binds it to the device by the declaration below when svcmgr hands
 //! it the drivers directory, like any driver, and delivers it the resource
-//! list of `driver_binding::resources`: BAR 0 whole (the identification and
-//! DMA registers), then the service endpoint, the devmgr query cap, and the
-//! device's DMA capability. It checks the device's identification register,
-//! reports ready, and answers
+//! list of `driver_binding::resources`: BAR 0 whole (the identification,
+//! interrupt, and DMA registers), the device's one MSI vector (its wired line
+//! where devmgr cannot give MSI), then the service endpoint, the devmgr query
+//! cap, and the device's DMA capability. It checks the device's
+//! identification register, binds its interrupt to a notification of its
+//! own, reports ready, and answers `ipc::test_dma_labels::INTERRUPT_PROBE`
+//! (the device raises its interrupt and the driver waits for it) and
 //! `ipc::test_dma_labels::DMA_PROBE`: it maps one page of its memory for the
 //! device, copies a pattern from the page into the device's buffer and back
 //! to the page's second half, unmaps the page, and copies the buffer to the
@@ -24,8 +27,8 @@
 
 use std::time::{Duration, Instant};
 
-use driver_binding::decl::{Declaration, Interrupt, Match, Reset, Tier};
-use driver_binding::resources::{Endpoints, Resource};
+use driver_binding::decl::{Declaration, Interrupt, InterruptNeed, Match, Reset, Tier};
+use driver_binding::resources::{Endpoints, InterruptKind, Resource};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, test_dma_labels};
 use std::os::seraph::{reserve_pages, startup_info};
 use syscall_abi::PAGE_SIZE;
@@ -38,7 +41,11 @@ driver_binding::driver_declaration!(Declaration {
         device: 0x11e8,
     }],
     instance_limit: Some(1),
-    interrupt: Interrupt::NONE,
+    // The edu device's one MSI vector; the probe reports what it was given.
+    interrupt: Interrupt {
+        need: InterruptNeed::Optional,
+        msi_vectors: 1,
+    },
     dma: true,
     // The edu device's default DMA mask is 28 bits.
     dma_width: Some(28),
@@ -51,6 +58,15 @@ driver_binding::driver_declaration!(Declaration {
 /// (major version 1, minor 0).
 const IDENT: u64 = 0x00;
 const IDENT_EDU: u32 = 0x0100_00ed;
+/// The interrupt status, raise, and acknowledge registers (32-bit): a value
+/// written to raise is set in the status and signals the device's
+/// interrupt (its MSI when MSI is enabled, its wired line otherwise); a
+/// value written to acknowledge clears those status bits.
+const IRQ_STATUS: u64 = 0x24;
+const IRQ_RAISE: u64 = 0x60;
+const IRQ_ACKNOWLEDGE: u64 = 0x64;
+/// The status bit the interrupt probe raises.
+const PROBE_STATUS: u32 = 1;
 /// DMA source, destination, byte count, and command registers (64-bit).
 const DMA_SRC: u64 = 0x80;
 const DMA_DST: u64 = 0x88;
@@ -77,12 +93,23 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long to wait between two `DMA_FAULTS` requests.
 const FAULT_POLL: Duration = Duration::from_millis(50);
 
+/// The device's interrupt as the driver holds it: its `Interrupt` cap, the
+/// kind devmgr gave, and the notification the cap is bound to.
+#[derive(Clone, Copy)]
+struct Irq
+{
+    cap: u64,
+    kind: InterruptKind,
+    notification: u64,
+}
+
 struct Driver
 {
     regs: u64,
     dma_ep: u64,
     memmgr_ep: u64,
     aspace: u64,
+    irq: Option<Irq>,
 }
 
 impl Driver
@@ -93,6 +120,12 @@ impl Driver
         // life, `off` lies in it, and the register is 32-bit aligned; reached
         // only through raw volatile accesses.
         unsafe { core::ptr::read_volatile((self.regs + off) as *const u32) }
+    }
+
+    fn write32(&self, off: u64, value: u32)
+    {
+        // SAFETY: as in `read32`.
+        unsafe { core::ptr::write_volatile((self.regs + off) as *mut u32, value) };
     }
 
     fn read64(&self, off: u64) -> u64
@@ -153,6 +186,31 @@ impl Driver
         // driver's life: VA no Rust object or IPC page occupies.
         unsafe { syscall::mem_map(cap, self.aspace, va, 0, 1, syscall::MAP_WRITABLE) }.ok()?;
         Some((cap, va))
+    }
+
+    /// Run the interrupt probe: clear any delivery already pending, have the
+    /// device raise its interrupt, wait for it for at most
+    /// `test_dma_labels::INTERRUPT_WAIT_MS`, then acknowledge it at the
+    /// device and with `SYS_IRQ_ACK`, which clears the acknowledgement the
+    /// binding owes. Returns whether it was delivered and the kind of
+    /// interrupt held; `(false, None)` with none.
+    fn interrupt_probe(&self) -> (bool, Option<InterruptKind>)
+    {
+        let Some(irq) = self.irq
+        else
+        {
+            return (false, None);
+        };
+        let _ = syscall::notification_try_wait(irq.notification);
+        self.write32(IRQ_RAISE, PROBE_STATUS);
+        let bits = syscall::notification_wait_timeout(
+            irq.notification,
+            test_dma_labels::INTERRUPT_WAIT_MS,
+        )
+        .unwrap_or(0);
+        self.write32(IRQ_ACKNOWLEDGE, self.read32(IRQ_STATUS));
+        let _ = syscall::irq_ack(irq.cap);
+        (bits != 0, Some(irq.kind))
     }
 
     /// Run the probe; the reply's outcome, whether the copy after the unmap
@@ -249,7 +307,7 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some((bar_cap, bar_pages, eps)) = receive(info.creator_endpoint, ipc_buf)
+    let Some((bar_cap, bar_pages, irq, eps)) = receive(info.creator_endpoint, ipc_buf)
     else
     {
         std::os::seraph::log!("test-dma: bootstrap caps missing");
@@ -276,12 +334,14 @@ fn main() -> !
         dma_ep: eps.dma,
         memmgr_ep: info.memmgr_endpoint,
         aspace: info.self_aspace,
+        irq: irq.and_then(bind_interrupt),
     };
     if driver.read32(IDENT) != IDENT_EDU
     {
         std::os::seraph::log!("test-dma: the device is not an edu device");
         syscall::thread_exit();
     }
+    std::os::seraph::log!("test-dma: interrupt {:?}", driver.irq.map(|irq| irq.kind));
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe { ipc::report_driver_ready(eps.devmgr_query, ipc_buf) }.is_err()
     {
@@ -290,11 +350,44 @@ fn main() -> !
     serve(&driver, eps.service, ipc_buf);
 }
 
+/// Bind the interrupt `(cap, kind, mode)` to a notification created for it
+/// and arm it: `irq_register` leaves the binding masked until its first
+/// acknowledgement. `None`, logged, when the notification cannot be
+/// created or the binding is refused.
+fn bind_interrupt((cap, kind, mode): (u64, InterruptKind, u64)) -> Option<Irq>
+{
+    let notification =
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        });
+    let Some(notification) = notification
+    else
+    {
+        std::os::seraph::log!("test-dma: no notification for the interrupt");
+        return None;
+    };
+    if syscall::irq_register(cap, notification, mode).is_err()
+    {
+        std::os::seraph::log!("test-dma: interrupt not bound");
+        let _ = syscall::cap_delete(notification);
+        return None;
+    }
+    let _ = syscall::irq_ack(cap);
+    Some(Irq {
+        cap,
+        kind,
+        notification,
+    })
+}
+
+/// The first interrupt resource of a resource list: its cap, kind, and mode.
+type ListedIrq = (u64, InterruptKind, u64);
+
 /// Request the resource list from `creator`, the driver's creator endpoint:
-/// the cap of BAR 0 with the pages it spans, and the end round's endpoints.
-/// `None` when the list does not decode, carries no BAR 0, or carries no DMA
-/// capability.
-fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Endpoints)>
+/// the cap of BAR 0 with the pages it spans, the first interrupt resource
+/// (`None` when there is none), and the end round's endpoints. `None` when
+/// the list does not decode, carries no BAR 0, or carries no DMA capability.
+fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Option<ListedIrq>, Endpoints)>
 {
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let list = unsafe { driver_binding::resources::receive(creator, ipc_buf) }.ok()?;
@@ -310,10 +403,18 @@ fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Endpoints)>
         _ => None,
     });
     let (cap, pages) = bar?;
-    (eps.dma != 0 && eps.service != 0).then_some((cap, pages, eps))
+    let irq = list.resources().iter().find_map(|r| match *r
+    {
+        Resource::Interrupt {
+            cap, kind, mode, ..
+        } => Some((cap, kind, mode)),
+        _ => None,
+    });
+    (eps.dma != 0 && eps.service != 0).then_some((cap, pages, irq, eps))
 }
 
-/// Answer `DMA_PROBE` for the rest of the driver's life.
+/// Answer `INTERRUPT_PROBE` and `DMA_PROBE` for the rest of the driver's
+/// life.
 fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
@@ -336,6 +437,19 @@ fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
         }
         let reply = match msg.label
         {
+            test_dma_labels::INTERRUPT_PROBE =>
+            {
+                let (delivered, kind) = driver.interrupt_probe();
+                std::os::seraph::log!(
+                    "test-dma: interrupt probe {:?}, delivered={}",
+                    kind,
+                    delivered
+                );
+                IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                    .word(0, u64::from(delivered))
+                    .word(1, kind.map_or(0, |k| k as u64))
+                    .build()
+            }
             test_dma_labels::DMA_PROBE => match driver.probe(ipc_buf).and_then(|(o, l, iova)| {
                 faults_after(driver.dma_ep, iova, ipc_buf).map(|f| (o, l, iova, f))
             })

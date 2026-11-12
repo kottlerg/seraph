@@ -184,21 +184,29 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
         Err(_) => std::os::seraph::log!(warn: "derive svcmgr SEND failed"),
     }
 
-    // devmgr.registry / devmgr.shutdown / devmgr.test — badged SENDs minted
+    // devmgr.registry / devmgr.shutdown / devmgr.bind — badged SENDs minted
     // from the endowed badge-0 `SEND|GRANT` source. The badge bits ride
     // through `registry_lookup_derived`'s plain `cap_derive` to consumers.
     // Each carries verb-bit authority, so each is seed-only: `QUERY_ENDPOINT`
     // refuses it, and only the recipes that seed the name hold its bits.
+    // `devmgr.bind` keeps `GRANT` for its seeds (`SeedOnlyGrant`), since
+    // `BIND_DRIVERS` moves a directory cap to devmgr.
     let query = ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY;
-    for (name, badge) in [
-        (ipc::published_names::DEVMGR_REGISTRY, query),
+    for (name, badge, visibility) in [
+        (
+            ipc::published_names::DEVMGR_REGISTRY,
+            query,
+            Visibility::SeedOnly,
+        ),
         (
             ipc::published_names::DEVMGR_SHUTDOWN,
             query | ipc::devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY,
+            Visibility::SeedOnly,
         ),
         (
-            ipc::published_names::DEVMGR_TEST,
-            query | ipc::devmgr_labels::TEST_LABEL_AUTHORITY,
+            ipc::published_names::DEVMGR_BIND,
+            query | ipc::devmgr_labels::BIND_AUTHORITY,
+            Visibility::SeedOnlyGrant,
         ),
     ]
     {
@@ -208,6 +216,7 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
             "devmgr-registry",
             name,
             badge,
+            visibility,
         );
     }
 
@@ -220,6 +229,7 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
         "master-log",
         ipc::published_names::LOGD_QUERY,
         ipc::log_labels::LOG_QUERY_AUTHORITY,
+        Visibility::SeedOnly,
     );
 }
 
@@ -242,8 +252,9 @@ fn publish_endowed_send(registry: &mut registry::Registry, cap: u64, name: &[u8]
     }
 }
 
-/// Publish `name` seed-only as a `badge`-badged SEND minted from the
-/// endowed `source` (named `source_name` in the log); logs and skips when the
+/// Publish `name` with `visibility`, a seed-only one, as a `badge`-badged
+/// SEND minted from the endowed `source` (named `source_name` in the log),
+/// with `GRANT` for [`Visibility::SeedOnlyGrant`]; logs and skips when the
 /// source is absent or the derive or publish fails.
 fn publish_minted_send(
     registry: &mut registry::Registry,
@@ -251,6 +262,7 @@ fn publish_minted_send(
     source_name: &str,
     name: &[u8],
     badge: u64,
+    visibility: Visibility,
 )
 {
     let shown = core::str::from_utf8(name).unwrap_or("?");
@@ -259,11 +271,19 @@ fn publish_minted_send(
         std::os::seraph::log!(warn: "no {source_name} source cap; {shown} not published");
         return;
     }
-    match syscall::cap_derive_badge(source, syscall::RIGHTS_EP_SEND, badge)
+    let rights = if visibility == Visibility::SeedOnlyGrant
+    {
+        syscall::RIGHTS_EP_SEND_GRANT
+    }
+    else
+    {
+        syscall::RIGHTS_EP_SEND
+    };
+    match syscall::cap_derive_badge(source, rights, badge)
     {
         Ok(send) =>
         {
-            if registry.publish(name, send, Visibility::SeedOnly).is_err()
+            if registry.publish(name, send, visibility).is_err()
             {
                 std::os::seraph::log!(warn: "publish {shown} failed");
                 let _ = syscall::cap_delete(send);
@@ -575,7 +595,9 @@ fn handle_publish_endpoint(msg: &IpcMessage, registry: &mut registry::Registry) 
 }
 
 /// Look up `name` in the discovery registry and derive a fresh
-/// `RIGHTS_EP_SEND` cap on the published endpoint. Evicts the entry on
+/// `RIGHTS_EP_SEND` cap on the published endpoint, `RIGHTS_EP_SEND_GRANT`
+/// for a [`Visibility::SeedOnlyGrant`] entry, which only [`Resolver::Seed`]
+/// resolves, so `QUERY_ENDPOINT` never yields `GRANT`. Evicts the entry on
 /// `cap_derive` failure (publisher's endpoint is gone), so subsequent
 /// queries see `UNKNOWN_NAME` instead of looping on
 /// `INSUFFICIENT_CAPS`. Returns a `svcmgr_errors::*` code on miss or
@@ -590,12 +612,20 @@ pub(crate) fn registry_lookup_derived(
     resolver: Resolver,
 ) -> Result<u64, u64>
 {
-    let Some(cap) = registry.lookup(name, resolver)
+    let Some(registry::Resolved { cap, grant }) = registry.lookup(name, resolver)
     else
     {
         return Err(ipc::svcmgr_errors::UNKNOWN_NAME);
     };
-    let Ok(derived) = syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND)
+    let rights = if grant
+    {
+        syscall::RIGHTS_EP_SEND_GRANT
+    }
+    else
+    {
+        syscall::RIGHTS_EP_SEND
+    };
+    let Ok(derived) = syscall::cap_derive(cap, rights)
     else
     {
         let _ = registry.remove(name);

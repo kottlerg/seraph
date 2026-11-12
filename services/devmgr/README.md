@@ -44,7 +44,7 @@ devmgr/
 │   │                               #   platform description table
 │   ├── settle.rs                   # Driver death watch and job notification; batch settle:
 │   │                               #   ready, deaths, bound
-│   ├── spawn.rs                    # Driver-process spawn helpers (bound, IOMMU, test fixtures)
+│   ├── spawn.rs                    # Driver-process spawn helpers (bound, IOMMU)
 │   └── tables.rs                   # Firmware-table mapping: ECAM discovery, ACPI table lookup
 └── docs/
     ├── responsibilities.md         # Responsibilities, bootstrap capabilities, driver authority

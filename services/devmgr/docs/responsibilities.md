@@ -193,8 +193,7 @@ devmgr's responsibilities are:
   devmgr binds a death observer on the driver's thread to its driver death
   queue: one queue for the boot, sized at enumeration to every driver the boot
   can spawn (one per PCI device, one per platform device record,
-  the IOMMU driver, and the three fixtures of the test-only fault batch
-  below, `devmgr_labels::TEST_FAULT_DRIVERS`), so every bind is funded and no
+  the IOMMU driver), so every bind is funded and no
   death is dropped. A driver that
   needs startup info (the VirtIO drivers, the framebuffer) calls
   `QUERY_DEVICE_INFO` on its query cap before its device setup, and every
@@ -297,15 +296,20 @@ devmgr's responsibilities are:
   withdrawn driver of a platform record has its copies of the record's caps
   revoked, the `Mmio`, `IoPort`, and wired-line caps devmgr carved and keeps,
   and is destroyed through its process handle while devmgr still keeps it (until
-  its batch settles), as a withdrawn test-fault fixture is; none of them drives
-  a DMA-capable device, and none is created `CREATE_DMA_HOLD`.
+  its batch settles); none of them drives a DMA-capable device, and none is
+  created `CREATE_DMA_HOLD`.
 
-  No boot withdraws a PCI-bound driver, so none runs this order. A boot serves
-  every PCI-bound driver that reports ready, and devmgr withdraws one only on
-  its death or a failed settle. A test boot cannot cause either without a
-  test-only label to kill a PCI-bound driver, which the enumeration redesign
-  removes ([#165](https://github.com/kottlerg/seraph/issues/165)): only devmgr
-  holds a PCI-bound driver's process handle, and the only virtio-blk driver of a
+  Every svctest boot runs this order on PCI functions without DMA: its
+  `devmgr_on_demand_bind` phase has devmgr withdraw three `test-fault`
+  fixtures bound to QEMU `pci-testdev` functions, one on its death after
+  `FAULT_EXIT`, one still pending at its settle's bound, and one whose
+  bootstrap fails, so the Bus Master Enable and Interrupt Disable writes, the
+  endpoint revocation, and the BAR and configuration-page releases run; the
+  fixture declares no reset and no DMA, so neither a reset nor a DMA release
+  runs there. No boot withdraws a DMA-capable PCI-bound driver. A boot serves
+  every such driver that reports ready, and devmgr withdraws one only on its
+  death or a failed settle, which a test boot cannot cause: only devmgr holds
+  a PCI-bound driver's process handle, and the only virtio-blk driver of a
   test boot serves its root filesystem. Nor could a boot place a late device
   write after a free, since the emulated devices complete a request on their
   own event loop, with nothing a guest can hold in flight. What every boot does
@@ -342,28 +346,40 @@ devmgr's responsibilities are:
   settle sleeps the bound and signals the timer notification; when it cannot
   be started, that settle has no bound.
 
-  A third, test-only batch (TODO(#165)) runs only on
-  `devmgr_labels::TEST_SPAWN_FAULT_DRIVERS`, gated on `TEST_LABEL_AUTHORITY`,
-  which only svctest's seed-only `devmgr.test` cap carries, and at most once
-  per boot: three [`test-fault`](../../drivers/test-fault/README.md) fixtures
-  from `/services/drivers/`, two that report ready and one that never does,
-  each with a catalog entry that carries no startup info. It settles under
-  `TEST_FAULT_SETTLE_TIMEOUT_MS` (1 s) instead of `SETTLE_TIMEOUT`, the
-  fixtures making no bounded wait in their setup, and in every other respect
-  as the production batches do; its served fixtures form a class of their
-  own, queried with `TEST_QUERY_FAULT_DEVICE`.
+  A further batch runs for each `devmgr_labels::BIND_DRIVERS`, gated on
+  `BIND_AUTHORITY`, which only svctest's seed-only `devmgr.bind` cap carries
+  (the one published name a seed receives as `SEND|GRANT`, since the request
+  moves a directory cap to devmgr). devmgr replies `SUCCESS` at once; its
+  control thread then runs a drivers-directory pass over the directory cap
+  under the same declaration bounds as the `SET_DRIVERS_DIR` pass (auxiliary
+  tier, no physical access, no IOMMU family key, no boot-only class) against
+  the device records still unbound, starts the drivers it binds in a settle
+  batch of its own, and serves them once it settles, within `SETTLE_TIMEOUT`.
+  A record is bound at most once a boot, so a second request over the same
+  directory binds nothing; a limited driver's bound devices are counted over
+  the boot by driver name (`BoundCounts`), so each pass binds it only to the
+  devices its limit leaves. A request with no directory cap, before
+  `SET_DRIVERS_DIR`, or while an earlier one is not done gets
+  `INVALID_REQUEST`. A `QUERY_DEVICE` whose answer would name no driver waits
+  until the pass and its settle end.
 
   The [`test-dma`](../../drivers/test-dma/README.md) fixture is bound like any
   driver: its declaration matches QEMU's `edu` device (PCI `1234:11e8`, which
-  every xtask launch attaches on both architectures), so the drivers-directory
-  pass binds it on every boot whose machine has the device, delivering BAR 0
-  whole and the device's DMA capability. Two test-only labels
-  (TODO(#165)), under the same gate, reach it: `TEST_QUERY_DMA_DEVICE`
-  answers with a SEND on the served fixture, badged `TEST_DENY_BADGE`, and
-  `data[0]` saying whether an IOMMU confines its device
-  (`TEST_DMA_CONFINED` or `TEST_DMA_UNCONFINED`), or `NO_DEVICE` while none
-  is served; `TEST_DMA_FAULTS` takes and logs the IOMMU driver's faults and
-  reports those taken for the device.
+  only `--test-devices` launches attach), so the drivers-directory pass binds
+  it whenever the device is present, delivering BAR 0 whole and the device's
+  DMA capability. The DMA endpoint's `devmgr_dma_labels::DMA_FAULTS` answers a
+  device's own caller: devmgr takes and logs the IOMMU driver's recorded faults
+  (`iommu_labels::TAKE_FAULTS`), and replies `data[0]` = `DMA_CONFINED` (1)
+  when an IOMMU confines the device, else 0, `data[1]` = faults taken for the
+  device over the boot, `data[2]` = the latest IOVA, page aligned, 0 with
+  none; `UNAUTHORIZED` when the device is withdrawn or was never given DMA.
+
+  The [`test-fault`](../../drivers/test-fault/README.md) fixture lives in
+  `/tests/drivers/`, which no boot-time pass reads: it binds the QEMU
+  `pci-testdev` functions (PCI `1b36:0005`) only through `BIND_DRIVERS`, its
+  role taken from its resource list (no BAR 2 serves, a 4 KiB BAR 2 never
+  reports ready, an 8 KiB BAR 2 fails its bootstrap's terminal round so devmgr
+  withdraws the device and destroys the fixture mid-bootstrap).
 
   The instance ordinals of a class count its served drivers in spawn order
   and are fixed once its batch settles. devmgr observes every driver's death
@@ -386,7 +402,7 @@ devmgr's responsibilities are:
   class probes, and every query of the serial and framebuffer drivers, wait
   in the registry endpoint's queue until then. A request that leaves work
   for the control thread (`SET_DRIVERS_DIR`'s drivers-directory pass and
-  on-disk settle, and the test-only fault batch and orphan spawn) posts it
+  on-disk settle, and `BIND_DRIVERS`'s pass and settle) posts it
   as a job and replies; the control thread runs it. A query whose answer
   names no driver (an ordinal past the class's last served driver, so
   `NO_DEVICE`) waits while a posted job is not done, and is answered once it
@@ -465,7 +481,7 @@ devmgr's responsibilities are:
   (absent means the first), counted over the class's served drivers (those
   that reported their device ready) in PCI segment, bus, device, function
   order and not stable across boots. A registry SEND without a class slot
-  (`devmgr.registry`, `devmgr.test`) gets `UNAUTHORIZED`. A withdrawn driver's
+  (`devmgr.registry`, `devmgr.bind`) gets `UNAUTHORIZED`. A withdrawn driver's
   ordinal replies `WITHDRAWN` (above) and an ordinal past the last served
   driver of the class `NO_DEVICE`. The query logs nothing.
 
@@ -555,7 +571,7 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 
 | Capability | Rights | Purpose |
 |---|---|---|
-| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and the test-only `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` / `TEST_QUERY_DENY_DEVICE` / `TEST_SPAWN_FAULT_DRIVERS` / `TEST_QUERY_FAULT_DEVICE` / `TEST_QUERY_DMA_DEVICE` / `TEST_DMA_FAULTS` labels the enumeration redesign removes (#165) on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). The test labels are gated on `TEST_LABEL_AUTHORITY`, which only the `devmgr.test` cap carries: a seed-only name svctest alone seeds. `TEST_QUERY_DENY_DEVICE` takes a class name (`data[1]` = its length, `data[2..]` = its bytes) and mints a SEND on that class's driver endpoint badged `TEST_DENY_BADGE`, which carries none of the driver's verb bits, so svctest can assert each driver's `UNAUTHORIZED` reply; every other SEND devmgr mints on those endpoints carries the bits |
+| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
 | Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr moves to the IOMMU driver; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps delegated to drivers |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and pwrmgr's PM1a + 8042 reset ports |

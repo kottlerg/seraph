@@ -1341,7 +1341,10 @@ pub mod svcmgr_labels
 /// [`published_names::LOGD_QUERY`], and each provider
 /// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
 /// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
-/// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`.
+/// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. A name resolves to a SEND
+/// without `GRANT`, apart from [`published_names::DEVMGR_BIND`], which its
+/// seeds receive with `GRANT`, since `devmgr_labels::BIND_DRIVERS` moves a cap
+/// to devmgr; `QUERY_ENDPOINT` never yields `GRANT`.
 /// [`published_names::VFSD_DENY`] carries no authority but is seed-only
 /// too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `timed`, and any
 /// name published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
@@ -1396,13 +1399,13 @@ pub mod published_names
     /// through it.
     pub const DEVMGR_SHUTDOWN: &[u8] = b"devmgr.shutdown";
 
-    /// TODO(#165): remove with devmgr's test labels. SEND on devmgr's
-    /// registry endpoint badged
-    /// `REGISTRY_QUERY_AUTHORITY | TEST_LABEL_AUTHORITY`: the
-    /// `devmgr.registry` surface plus devmgr's test labels: the
-    /// `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` fault-injection shim and
-    /// `TEST_QUERY_DENY_DEVICE`. Seed-only and seeded only by svctest.
-    pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
+    /// SEND on devmgr's registry endpoint badged
+    /// `REGISTRY_QUERY_AUTHORITY | BIND_AUTHORITY`: the `devmgr.registry`
+    /// surface plus `devmgr_labels::BIND_DRIVERS`, which binds the drivers of
+    /// a directory the caller names to the devices still unbound. Seed-only
+    /// and seeded only by svctest, which binds the test fixtures of
+    /// `/tests/drivers/` through it.
+    pub const DEVMGR_BIND: &[u8] = b"devmgr.bind";
 
     /// SEND on vfsd's service endpoint badged
     /// `vfsd_labels::MOUNT_AUTHORITY` alone: the `MOUNT` surface, without
@@ -1906,7 +1909,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 17;
+pub const DEVMGR_LABELS_VERSION: u32 = 18;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1940,10 +1943,10 @@ pub mod devmgr_labels
     /// past the last served driver, which before [`SET_DRIVERS_DIR`] includes
     /// every ordinal of a class whose drivers devmgr spawns from disk, and
     /// `INVALID_REQUEST` when the derivation fails. A query received once
-    /// [`SET_DRIVERS_DIR`]'s pass is posted, whose answer would name no
-    /// driver, waits until that pass and the settle of its drivers are done
-    /// and is then answered from the settled drivers; a query that names a
-    /// served driver is answered at once.
+    /// a bind pass is posted ([`SET_DRIVERS_DIR`]'s or [`BIND_DRIVERS`]'s),
+    /// whose answer would name no driver, waits until that pass and the
+    /// settle of its drivers are done and is then answered from the settled
+    /// drivers; a query that names a served driver is answered at once.
     ///
     /// The handler logs nothing: logd is a caller, blocked in this call
     /// outside its log loop, so a log line here would deadlock.
@@ -1958,7 +1961,8 @@ pub mod devmgr_labels
     /// The caller's badge identifies the device by indexing devmgr's
     /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
     /// entry, or an entry that carries no startup info (the serial and RTC
-    /// drivers', and the test-only `test-fault` fixtures'), gets
+    /// drivers', and that of a PCI function presenting no `VirtIO` register
+    /// layout), gets
     /// `INVALID_REQUEST`. The catalog only grows (the entry of a driver that
     /// failed to spawn or was withdrawn stays),
     /// so a badge is never recycled and its `u64` width bounds no catalog
@@ -2107,115 +2111,42 @@ pub mod devmgr_labels
     /// bundle only. devmgr refuses a drivers-directory declaration of the
     /// class, logged.
     pub const CLASS_BOOT_ONLY: u64 = 1;
-    /// Longest class name [`MINT_CLASS_SEND`] and [`TEST_QUERY_DENY_DEVICE`]
-    /// carry: the declaration format's class-name bound.
+    /// Longest class name [`MINT_CLASS_SEND`] carries: the declaration
+    /// format's class-name bound.
     pub const MAX_CLASS_NAME_BYTES: usize = 32;
 
-    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    /// label: trigger devmgr's spawn-orphan fault-injection shim (#176). The
-    /// handler replies `SUCCESS` immediately, and devmgr's control thread
-    /// then forces a round-2 bootstrap failure and stashes the outcome for
-    /// [`TEST_ORPHAN_RESULT`], which waits until it is stashed. Request: `data[0]` = caller's compiled
-    /// [`super::DEVMGR_LABELS_VERSION`]. Caller's badge MUST carry
-    /// [`TEST_LABEL_AUTHORITY`]; the handler replies
-    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
-    /// [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] on a version
-    /// mismatch, without spawning.
-    pub const TEST_SPAWN_ORPHAN: u64 = 9;
-    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    /// label: report the last [`TEST_SPAWN_ORPHAN`] outcome in reply `data[0]`
-    /// — `0` not run, `1` spawn failed as expected (unwind fired), `2`
-    /// unexpected success, `3` shim setup error. Request and gate as
-    /// [`TEST_SPAWN_ORPHAN`].
-    pub const TEST_ORPHAN_RESULT: u64 = 10;
-    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    /// label: mint a SEND on one driver's service endpoint badged
-    /// [`TEST_DENY_BADGE`], which carries none of the driver's verb bits, so
-    /// a harness can assert the driver's `UNAUTHORIZED` reply. No other
-    /// path mints a SEND on these endpoints without the bit, and a holder
-    /// cannot strip a bit from a badged cap. Request: `data[0]` = caller's
-    /// compiled [`super::DEVMGR_LABELS_VERSION`]; `data[1]` = the length of
-    /// a class name, 1 to [`MAX_CLASS_NAME_BYTES`]; `data[2..]` = its bytes,
-    /// packed little-endian as [`MINT_CLASS_SEND`] carries them; the driver
-    /// is the class's first one still served. Gate as [`TEST_SPAWN_ORPHAN`].
-    /// Reply: `SUCCESS` with the SEND in `caps[0]`; `NO_DEVICE` when no
-    /// driver of the class is served; `INVALID_REQUEST` for a bad name or a
-    /// failed derive.
-    pub const TEST_QUERY_DENY_DEVICE: u64 = 12;
-    /// TODO(#165): remove with [`TEST_QUERY_DENY_DEVICE`]. The badge devmgr
-    /// stamps on a [`TEST_QUERY_DENY_DEVICE`] SEND: no verb bit of any
-    /// driver, and non-zero, since a holder
-    /// may badge an un-badged SEND itself
-    /// (docs/capability-model.md § Verb-bit authority pattern).
-    pub const TEST_DENY_BADGE: u64 = 1;
-    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    /// label: spawn and settle the fault batch, three `test-fault` fixture
-    /// drivers from `/services/drivers/` in one settle batch, the first two
-    /// in [`super::test_fault_labels::MODE_READY`] and the third in
-    /// [`super::test_fault_labels::MODE_NEVER_READY`], so a harness observes
-    /// a settle that ends at its bound and the withdrawal of a served driver
-    /// that dies. The batch's bound is [`TEST_FAULT_SETTLE_TIMEOUT_MS`], not
-    /// the production settle bound, so the fault batch costs a test boot
-    /// little time. The handler replies `SUCCESS`, and devmgr's control
-    /// thread then spawns and settles the batch; the served fixtures are
-    /// queried with [`TEST_QUERY_FAULT_DEVICE`], which, finding no fixture,
-    /// waits until the settle has ended. At most once per boot:
-    /// a repeated request, or one before [`SET_DRIVERS_DIR`], replies
-    /// `INVALID_REQUEST` and spawns nothing. Request: `data[0]` = caller's
-    /// compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
-    /// [`TEST_SPAWN_ORPHAN`].
-    pub const TEST_SPAWN_FAULT_DRIVERS: u64 = 14;
-    /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. Test-only label:
-    /// mint a `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the service
-    /// endpoint of the served fault fixture at instance ordinal `data[1]`
-    /// (absent means 0), counted as [`QUERY_DEVICE`]'s ordinals are.
-    /// Reply: `SUCCESS` with the cap in `caps[0]`; `WITHDRAWN` at a withdrawn fixture's
-    /// ordinal; `NO_DEVICE` past the served fixtures; `INVALID_REQUEST` for a
-    /// failed derive. Request: `data[0]` = caller's compiled
-    /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
-    pub const TEST_QUERY_FAULT_DEVICE: u64 = 15;
-    /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. The settle bound
-    /// of the fault batch, in milliseconds. The fixtures make no bounded wait
-    /// in their setup, so a short bound suffices; the production bound is
-    /// devmgr's `SETTLE_TIMEOUT`, which the batch shares every other part of
-    /// its settle with.
-    pub const TEST_FAULT_SETTLE_TIMEOUT_MS: u64 = 1000;
-    /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. The fixtures
-    /// one fault batch spawns, which devmgr's driver death queue reserves
-    /// room for.
-    pub const TEST_FAULT_DRIVERS: usize = 3;
-    /// TODO(#165): remove with the test labels. Test-only label: mint a
-    /// `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the service endpoint
-    /// of the served `test-dma` fixture, the driver devmgr binds to the DMA
-    /// test device (QEMU's `edu`, PCI `1234:11e8`) at [`SET_DRIVERS_DIR`]
-    /// by its declaration, like any driver (the fixture checks no badge).
-    /// devmgr serves it once that settle batch ends: before
-    /// [`SET_DRIVERS_DIR`] the query replies `NO_DEVICE`, as it does on a
-    /// machine with no such device, and one received during the pass waits
-    /// until the batch has settled.
-    /// Reply: `SUCCESS` with the cap in `caps[0]` and `data[0]` =
-    /// [`TEST_DMA_CONFINED`] when an IOMMU confines the device or
-    /// [`TEST_DMA_UNCONFINED`] when none does; `WITHDRAWN` once the fixture
-    /// is withdrawn; `NO_DEVICE` when none is served; `INVALID_REQUEST` for a
-    /// failed derive. Request: `data[0]` = caller's compiled
-    /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
-    pub const TEST_QUERY_DMA_DEVICE: u64 = 17;
-    /// TODO(#165): remove with the test labels. Test-only label:
-    /// the IOMMU faults devmgr has taken for the DMA test device, after it
-    /// takes the IOMMU driver's pending ones (`iommu_labels::TAKE_FAULTS`)
-    /// and logs them. Reply: `SUCCESS` with `data[0]` = the faults taken for
-    /// the device over the boot and `data[1]` = the IOVA of the latest, page
-    /// aligned (0 with none); `NO_DEVICE` when no DMA test device is bound.
-    /// Request: `data[0]` = caller's compiled
-    /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
-    pub const TEST_DMA_FAULTS: u64 = 18;
-    /// TODO(#165): remove with [`TEST_QUERY_DMA_DEVICE`]. Its reply word: an
-    /// IOMMU confines the DMA test device.
-    pub const TEST_DMA_CONFINED: u64 = 1;
-    /// TODO(#165): remove with [`TEST_QUERY_DMA_DEVICE`]. Its reply word: no
-    /// IOMMU confines the DMA test device, so its device addresses are
-    /// physical.
-    pub const TEST_DMA_UNCONFINED: u64 = 2;
+    /// Bind the drivers of a directory the caller names to the devices no
+    /// driver is bound to: the on-demand bind, for a driver installed after
+    /// the drivers-directory pass (docs/driver-binding.md § Matching).
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `caps[0]` = a SEND on a directory node carrying
+    /// `LOOKUP | READ | READDIR`, as [`SET_DRIVERS_DIR`]'s does. Caller's
+    /// badge MUST carry [`BIND_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// devmgr replies [`super::devmgr_errors::SUCCESS`] before any bind work,
+    /// as for [`SET_DRIVERS_DIR`]; its control thread then runs a
+    /// drivers-directory pass over the directory, under that pass's
+    /// declaration bounds (the auxiliary tier, no physical access, no IOMMU
+    /// family key, no boot-only class), against the device records still
+    /// unbound, starts each driver it binds in a settle batch of its own, and
+    /// serves the batch once it settles, within [`SETTLE_TIMEOUT_MS`]. A
+    /// [`QUERY_DEVICE`] whose answer would name no driver waits until that
+    /// pass and its settle are done. A record is bound at most once a boot,
+    /// so a device whose driver was started before (served, failed, or
+    /// withdrawn) is not bound again, and a second request over the same
+    /// directory binds nothing. devmgr deletes the directory cap once the
+    /// pass ends. Replies `INVALID_REQUEST`, deleting the cap, when `caps[0]`
+    /// is absent, before [`SET_DRIVERS_DIR`] (whose pass binds first), and
+    /// while an earlier request's pass or settle is not done.
+    pub const BIND_DRIVERS: u64 = 22;
+    /// The bound of a bind pass's settle, in milliseconds: how long devmgr
+    /// waits, from the start of a batch's settle (after its last spawn), for
+    /// each of the batch's drivers to report ready or die before it destroys
+    /// the drivers still pending. A query that waits for a settle
+    /// ([`QUERY_DEVICE`]) can wait this long past the batch's spawns.
+    pub const SETTLE_TIMEOUT_MS: u64 = 10_000;
 
     /// Driver-only: report that the driver has set its device up and is
     /// entering its service loop, so devmgr may serve its endpoint.
@@ -2237,7 +2168,7 @@ pub mod devmgr_labels
     pub const DRIVER_READY: u64 = 13;
 
     /// Authority bit gating [`QUERY_ACPI_TABLE`]. Set on svcmgr's
-    /// `devmgr.registry`, `devmgr.shutdown`, and `devmgr.test`
+    /// `devmgr.registry`, `devmgr.shutdown`, and `devmgr.bind`
     /// publications; a class SEND ([`MINT_CLASS_SEND`]) and the per-device
     /// SENDs drivers hold for [`QUERY_DEVICE_INFO`] lack it. Without it the
     /// handler replies `UNAUTHORIZED`. It admits no device query: a device
@@ -2257,15 +2188,11 @@ pub mod devmgr_labels
     /// pwrmgr alone seeds and `QUERY_ENDPOINT` refuses, so no other process
     /// holds the bit. Disjoint position from the other authority bits.
     pub const SHUTDOWN_DEVICE_AUTHORITY: u64 = 1u64 << 61;
-    /// TODO(#165): remove with the test labels. Authority bit gating
-    /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`],
-    /// [`TEST_QUERY_DENY_DEVICE`], [`TEST_SPAWN_FAULT_DRIVERS`],
-    /// [`TEST_QUERY_FAULT_DEVICE`], [`TEST_QUERY_DMA_DEVICE`], and
-    /// [`TEST_DMA_FAULTS`]. svcmgr mints it,
-    /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
-    /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
+    /// Authority bit gating [`BIND_DRIVERS`]. svcmgr mints it, beside
+    /// [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
+    /// seed-only as [`crate::published_names::DEVMGR_BIND`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
-    pub const TEST_LABEL_AUTHORITY: u64 = 1u64 << 60;
+    pub const BIND_AUTHORITY: u64 = 1u64 << 60;
     /// Authority bit gating [`MINT_CLASS_SEND`], which decides which
     /// classes' drivers a SEND reaches. init and svcmgr mint it from the
     /// devmgr-registry sources they hold, only onto a SEND they call
@@ -2329,26 +2256,33 @@ pub mod devmgr_labels
     }
 }
 
-/// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_FAULT_DRIVERS`. The
-/// `test-fault` fixture driver's bootstrap mode word and service labels.
+/// The `test-fault` fixture driver's service labels and roles
+/// (services/drivers/test-fault/README.md).
 ///
-/// The fixture's first bootstrap round carries its mode in `data[0]`. On its
-/// service endpoint it answers [`FAULT_PING`] with `SUCCESS`, and
-/// [`FAULT_EXIT`] with `SUCCESS` before it receives nothing more and exits
-/// once [`FAULT_EXIT_DELAY_MS`] has passed, so a call sent on the endpoint
-/// after the reply stays queued until devmgr withdraws the dead fixture.
-/// Every request carries no data; no badge bit is checked.
+/// devmgr binds the fixture to QEMU's `pci-testdev` functions (PCI
+/// `1b36:0005`) only through [`devmgr_labels::BIND_DRIVERS`], since it is
+/// installed outside `/services/drivers/`. Each instance takes its role from
+/// the resource list devmgr delivers it: a function with no BAR 2 serves; one
+/// whose BAR 2 is [`HANG_BAR_BYTES`] long holds [`HOLD_BYTES`] and never
+/// reports ready; one whose BAR 2 is [`ORPHAN_BAR_BYTES`] long holds
+/// [`HOLD_BYTES`] and fails its bootstrap's terminal round, so devmgr destroys
+/// it mid-bootstrap. A serving instance answers [`FAULT_PING`] with
+/// `SUCCESS`, and [`FAULT_EXIT`] with `SUCCESS` before it receives nothing
+/// more and exits once [`FAULT_EXIT_DELAY_MS`] has passed, so a call sent on
+/// the endpoint after the reply stays queued until devmgr withdraws the dead
+/// fixture. Every request carries no data; no badge bit is checked.
 pub mod test_fault_labels
 {
-    /// Mode word: set up, report `DRIVER_READY`, and serve.
-    pub const MODE_READY: u64 = 0;
-    /// Mode word: reserve and touch [`NEVER_READY_RESERVE_BYTES`], then
-    /// neither report ready nor exit; sleep until destroyed.
-    pub const MODE_NEVER_READY: u64 = 1;
-    /// Bytes a `MODE_NEVER_READY` fixture holds while it hangs, so a harness
-    /// sees its destruction as their return to memmgr's free pool (4 MiB,
-    /// well above the pool's incidental movement in a test boot).
-    pub const NEVER_READY_RESERVE_BYTES: usize = 4 << 20;
+    /// Length of the BAR 2 (QEMU `membar=4K`) of a function whose fixture
+    /// holds [`HOLD_BYTES`] and never reports ready.
+    pub const HANG_BAR_BYTES: u64 = 4 << 10;
+    /// Length of the BAR 2 (QEMU `membar=8K`) of a function whose fixture
+    /// holds [`HOLD_BYTES`] and fails its bootstrap's terminal round.
+    pub const ORPHAN_BAR_BYTES: u64 = 8 << 10;
+    /// Bytes a hanging or orphaned fixture holds until devmgr destroys it, so
+    /// a harness sees the destruction as their return to memmgr's free pool
+    /// (4 MiB, well above the pool's incidental movement in a test boot).
+    pub const HOLD_BYTES: usize = 4 << 20;
     /// Reply `SUCCESS`.
     pub const FAULT_PING: u64 = 1;
     /// Reply `SUCCESS`, then exit after [`FAULT_EXIT_DELAY_MS`] without
@@ -2359,12 +2293,13 @@ pub mod test_fault_labels
     pub const FAULT_EXIT_DELAY_MS: u64 = 200;
 }
 
-/// TODO(#165): remove with `devmgr_labels::TEST_QUERY_DMA_DEVICE`. The
-/// `test-dma` fixture driver's service label.
+/// The `test-dma` fixture driver's service label
+/// (services/drivers/test-dma/README.md).
 ///
 /// The fixture drives QEMU's `edu` device, whose DMA engine copies between
 /// a 4 KiB buffer inside the device and a device address the driver
-/// programs. No badge bit is checked.
+/// programs. A harness reaches it through the `test-dma` class
+/// (`devmgr_labels::QUERY_DEVICE`). No badge bit is checked.
 pub mod test_dma_labels
 {
     /// Run the DMA probe: map one page of the driver's memory for the
@@ -2378,8 +2313,18 @@ pub mod test_dma_labels
     /// [`PROBE_FAILED`] when a mapped copy did not arrive or the device did
     /// not complete a transfer; `data[1]` = whether the copy after the unmap
     /// reached the page (1) or not (0); `data[2]` = the device address the
-    /// page was mapped at. Any other reply label is a setup failure.
+    /// page was mapped at; `data[3]` = whether an IOMMU confines the device
+    /// (`devmgr_dma_labels::DMA_CONFINED`) or not (0); `data[4]` = the IOMMU
+    /// faults devmgr has taken for the device and `data[5]` the IOVA of the
+    /// latest (`devmgr_dma_labels::DMA_FAULTS`), which, for a confined
+    /// device, the fixture asks for until the copy after the unmap is
+    /// counted, within [`FAULT_WAIT_MS`]. Any other reply label is a setup
+    /// failure.
     pub const DMA_PROBE: u64 = 1;
+    /// How long a confined fixture asks for its faults before it replies
+    /// with the count it has: past devmgr's take of the IOMMU driver's
+    /// recorded faults, which a `DMA_FAULTS` request makes itself.
+    pub const FAULT_WAIT_MS: u64 = 3000;
     /// [`DMA_PROBE`] outcome: the mapped copies arrived.
     pub const PROBE_PASSED: u64 = 0;
     /// [`DMA_PROBE`] outcome: a mapped copy did not arrive, or the device did
@@ -2506,9 +2451,8 @@ pub unsafe fn mint_class_send(
     class_call_cap(&reply)
 }
 
-/// The class name a [`devmgr_labels::MINT_CLASS_SEND`] or
-/// [`devmgr_labels::TEST_QUERY_DENY_DEVICE`] request carries: `data[at]` its
-/// length, `data[at + 1..]` its bytes. `None` when the length is 0, past
+/// The class name a [`devmgr_labels::MINT_CLASS_SEND`] request carries:
+/// `data[at]` its length, `data[at + 1..]` its bytes. `None` when the length is 0, past
 /// [`devmgr_labels::MAX_CLASS_NAME_BYTES`], or past the words sent.
 #[must_use]
 pub fn class_name_of(msg: &IpcMessage, at: usize) -> Option<&[u8]>
@@ -2557,7 +2501,7 @@ pub mod device_info_kind
 
 /// Wire-protocol version of [`devmgr_dma_labels`]; bumped as the block comment
 /// above the label modules describes, which also lists its runtime check.
-pub const DEVMGR_DMA_LABELS_VERSION: u32 = 2;
+pub const DEVMGR_DMA_LABELS_VERSION: u32 = 3;
 /// IPC labels for devmgr's DMA endpoint: the DMA-authorising capability of a
 /// DMA-capable driver.
 ///
@@ -2598,6 +2542,20 @@ pub mod devmgr_dma_labels
     /// driver that confines the device did not remove the mapping, which
     /// stays standing), or `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
     pub const DMA_UNMAP: u64 = 2;
+    /// Report the IOMMU faults devmgr has taken for the caller's device.
+    ///
+    /// devmgr first takes the faults the IOMMU driver has recorded
+    /// (`iommu_labels::TAKE_FAULTS`) and logs each, as it does periodically.
+    /// Request: no field past `data[0]`. Reply: label `SUCCESS` with
+    /// `data[0]` = [`DMA_CONFINED`] when an IOMMU confines the device and 0
+    /// when none does; `data[1]` = the faults devmgr has taken for the device
+    /// over the boot, 0 for an unconfined device; `data[2]` = the IOVA of the
+    /// latest, page aligned, 0 with none. Or `devmgr_dma_errors::UNAUTHORIZED`
+    /// (the device is withdrawn or was never given DMA), or
+    /// `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
+    pub const DMA_FAULTS: u64 = 3;
+    /// [`DMA_FAULTS`] reply word: an IOMMU confines the device.
+    pub const DMA_CONFINED: u64 = 1;
     /// [`DMA_MAP`] access bit: the device reads the frames.
     pub const ACCESS_DEVICE_READ: u64 = 1 << 0;
     /// [`DMA_MAP`] access bit: the device writes the frames.
@@ -2642,7 +2600,7 @@ pub mod devmgr_dma_errors
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
 
-/// Why [`dma_map`] or [`dma_unmap`] failed.
+/// Why [`dma_map`], [`dma_unmap`] or [`dma_faults`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmaError
 {
@@ -2712,6 +2670,49 @@ pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Res
     if reply.label == devmgr_dma_errors::SUCCESS
     {
         Ok(())
+    }
+    else
+    {
+        Err(DmaError::Refused(reply.label))
+    }
+}
+
+/// The reply of [`devmgr_dma_labels::DMA_FAULTS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaFaults
+{
+    /// An IOMMU confines the device.
+    pub confined: bool,
+    /// The faults devmgr has taken for the device over the boot.
+    pub count: u64,
+    /// The IOVA of the latest, page aligned; 0 with none.
+    pub last_iova: u64,
+}
+
+/// Ask for the IOMMU faults devmgr has taken for the device whose DMA
+/// capability `dma_ep` is ([`devmgr_dma_labels::DMA_FAULTS`]).
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`DmaError::Call`] when the call fails, and [`DmaError::Refused`] with
+/// devmgr's reply label when devmgr refuses: `UNAUTHORIZED` when the device
+/// is withdrawn or was never given DMA, or `LABEL_VERSION_MISMATCH`.
+pub unsafe fn dma_faults(dma_ep: u64, ipc_buf: *mut u64) -> Result<DmaFaults, DmaError>
+{
+    let request = IpcMessage::builder(devmgr_dma_labels::DMA_FAULTS)
+        .word(0, u64::from(DEVMGR_DMA_LABELS_VERSION))
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { ipc_call(dma_ep, &request, ipc_buf) }.map_err(DmaError::Call)?;
+    if reply.label == devmgr_dma_errors::SUCCESS
+    {
+        Ok(DmaFaults {
+            confined: reply.word(0) == devmgr_dma_labels::DMA_CONFINED,
+            count: reply.word(1),
+            last_iova: reply.word(2),
+        })
     }
     else
     {
@@ -3363,7 +3364,7 @@ pub const VERB_BIT_MASK: u64 =
     (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59) | (1u64 << 58);
 const _: () = core::assert!(
     devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
-        && devmgr_labels::TEST_LABEL_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::BIND_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::CLASS_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
@@ -4412,7 +4413,7 @@ mod tests
         for badge in [
             0,
             devmgr_labels::REGISTRY_QUERY_AUTHORITY,
-            devmgr_labels::REGISTRY_QUERY_AUTHORITY | devmgr_labels::TEST_LABEL_AUTHORITY,
+            devmgr_labels::REGISTRY_QUERY_AUTHORITY | devmgr_labels::BIND_AUTHORITY,
             devmgr_labels::CLASS_AUTHORITY,
             devmgr_labels::DRIVERS_DIR_AUTHORITY,
         ]

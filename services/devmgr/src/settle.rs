@@ -13,20 +13,18 @@
 //! correlator, a job notification the registry's workers signal when a
 //! request leaves work for the control thread (`crate::Registry`), and a
 //! wait set over both that devmgr's control thread waits on. devmgr spawns
-//! its drivers in two production batches after the IOMMU batch (at boot, the
-//! drivers bound by the boot modules' declarations; after `SET_DRIVERS_DIR`,
-//! the drivers bound by the drivers directory's declarations), and, on
-//! svctest's test-only `TEST_SPAWN_FAULT_DRIVERS`, a third of `test-fault`
-//! fixtures (TODO(#165)), each against a [`SettleBatch`]: a private driver
-//! endpoint on which each driver's devmgr query cap is a SEND badged with its
-//! device badge. [`SettleBatch::settle`] takes the job notification out of the
-//! wait set, adds the private endpoint and a timer notification, and runs the
+//! its drivers in batches after the IOMMU batch (at boot, the drivers bound
+//! by the boot modules' declarations; after `SET_DRIVERS_DIR`, the drivers
+//! bound by the drivers directory's declarations; after each
+//! `BIND_DRIVERS`, the drivers bound by the declarations of the directory it
+//! names), each against a [`SettleBatch`]: a private driver endpoint on which
+//! each driver's devmgr query cap is a SEND badged with its device badge.
+//! [`SettleBatch::settle`] takes the job notification out of the wait set,
+//! adds the private endpoint and a timer notification, and runs the
 //! host-tested [`roster::settle`] loop: it serves the drivers'
 //! `QUERY_DEVICE_INFO` and `DRIVER_READY` calls on the private endpoint and
 //! takes their deaths until the [`Roster`] is settled or the batch's bound
-//! elapses ([`SETTLE_TIMEOUT`] for the production batches,
-//! `TEST_FAULT_SETTLE_TIMEOUT_MS` for the fault batch), then takes every
-//! death still queued. A death of a driver an earlier batch settled goes to
+//! ([`SETTLE_TIMEOUT`]) elapses, then takes every death still queued. A death of a driver an earlier batch settled goes to
 //! the caller, which withdraws it. The registry's workers go on serving
 //! meanwhile; a query whose answer a batch still unsettled could change
 //! waits for it (`crate::Registry`). See
@@ -56,8 +54,13 @@ use crate::DeviceCatalog;
 /// setup also makes synchronous IPC calls (memmgr, and devmgr's own
 /// `QUERY_DEVICE_INFO`), which are not bounded; a driver blocked in one past
 /// the bound is withdrawn like a hung one.
+///
+/// The registry protocol publishes the bound as
+/// `ipc::devmgr_labels::SETTLE_TIMEOUT_MS`, which a client waiting on a settle
+/// reads; the two are asserted equal.
 pub const SETTLE_TIMEOUT: Duration =
     Duration::from_secs(2 * virtio_core::pci::RESET_TIMEOUT.as_secs());
+const _: () = assert!(SETTLE_TIMEOUT.as_millis() == ipc::devmgr_labels::SETTLE_TIMEOUT_MS as u128);
 
 /// Wait-set badge of the job notification.
 const WS_BADGE_JOB: u64 = 1;

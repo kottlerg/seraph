@@ -620,12 +620,14 @@ pub struct KernelMmio
     /// The supervisor-level APLIC domain, from the first ACPI MADT APLIC
     /// structure or the DTB `riscv,aplic` node whose `msi-parent` is the
     /// supervisor-level IMSIC. All zero when neither source reported one.
+    /// The kernel has no default: without a domain it halts at Phase 5.
     pub aplic: AplicDomain,
     /// The supervisor-level IMSIC interrupt files, from the ACPI MADT IMSIC
     /// and RINTC structures or the DTB `riscv,imsics` node wired to the
     /// harts' supervisor external interrupt. All zero when neither source
     /// reported one, or when a hart's file does not lie at
-    /// [`ImsicLayout::s_file_address`] of its hart ID.
+    /// [`ImsicLayout::s_file_address`] of its hart ID. The kernel has no
+    /// default: without a layout it halts at Phase 4.
     pub imsic: ImsicLayout,
 }
 
@@ -795,9 +797,9 @@ impl ImsicLayout
 impl KernelMmio
 {
     /// Zeroed `KernelMmio` for bootloaders that cannot populate it. The
-    /// kernel falls back to its hardcoded constants when the corresponding
-    /// MMIO field is zero; a zero `timebase_freq` or `hart_caps` is fatal
-    /// at timer / paging initialization instead.
+    /// kernel falls back to its hardcoded constant when `uart_base` is zero;
+    /// a zero `aplic`, `imsic`, `timebase_freq` or `hart_caps` is fatal at
+    /// its initialization instead.
     #[must_use]
     pub const fn zero() -> Self
     {

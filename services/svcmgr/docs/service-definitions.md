@@ -48,7 +48,7 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount vfsd.deny
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny
 ```
 
 ## Keys
@@ -214,7 +214,8 @@ svcmgr-launched services.
 ## `seed`
 
 Space-separated discovery-registry names. svcmgr resolves each name
-to a freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint and
+to a freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint (`RIGHTS_EP_SEND_GRANT` for
+`devmgr.bind` alone, whose `BIND_DRIVERS` moves a directory cap and so needs `GRANT`) and
 injects them positionally into the child's bootstrap rounds:
 
 ```
@@ -244,7 +245,7 @@ Run Sequence](../../svctest/README.md#run-sequence)).
 Well-known names are centralised in
 [`ipc::published_names`](../../../shared/ipc/src/lib.rs). Every name
 resolves as a seed; only those marked in the Query column also resolve
-through `QUERY_ENDPOINT`, which refuses a seed-only name
+through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT`
 ([ipc-interface.md § Label 4](ipc-interface.md#label-4-query_endpoint)):
 
 | Name | Publisher | Cap shape | Query |
@@ -256,7 +257,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name
 | `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
-| `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| TEST_LABEL_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
+| `devmgr.bind` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| BIND_AUTHORITY`-badged `SEND\|GRANT` on devmgr's registry endpoint, gating `BIND_DRIVERS`, which moves a directory cap (seeded by svctest only) | no |
 | `devmgr.class.<class>` | svcmgr (a `MINT_CLASS_SEND` reply, one per class file) | class SEND on devmgr's registry endpoint: the badge names the class's slot and the class file's verbs ([Device class files](service-definitions.md#device-class-files)) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
@@ -410,17 +411,21 @@ devmgr's device classes are configured from class files, not from source. svcmgr
 `/config/devmgr/classes/<class>.class` file, shipped from `rootfs/config/devmgr/classes/`, before
 it sends `SET_DRIVERS_DIR`. For each file it sends devmgr `devmgr_labels::MINT_CLASS_SEND`, on a
 `CLASS_AUTHORITY`-badged derivation of its endowed badge-0 devmgr-registry source, and publishes
-the class SEND devmgr replies with seed-only as `devmgr.class.<class>`
-(`ipc::published_names::DEVMGR_CLASS_PREFIX`). A service reaches a class only when its `seed`
-line names that publication. A file that cannot be read or parsed, or whose class devmgr refuses,
-is logged and skipped.
+the class SEND devmgr replies with seed-only as `devmgr.class.<stem>`, `<stem>` being the file
+name without `.class` (`ipc::published_names::DEVMGR_CLASS_PREFIX`). A service reaches a class
+only when its `seed` line names that publication. A file that cannot be read or parsed, or whose
+class devmgr refuses, is logged and skipped.
 
 The grammar is the `.svc` grammar: line-oriented `key = value`, `#` comments, an unknown or
-repeated key an error. The class name is the file name without `.class`: 1 to
-`ipc::devmgr_labels::MAX_CLASS_NAME_BYTES` (32) bytes of `[a-z0-9_-]`. The keys:
+repeated key an error. The class name is the `class` key, or the file stem (the file name without
+`.class`) when the key is absent: 1 to `ipc::devmgr_labels::MAX_CLASS_NAME_BYTES` (32) bytes of
+`[a-z0-9_-]`. A second file may name an existing class with its own `verbs`, and publishes a
+differently attenuated SEND on that class under its own stem: `serial-deny.class`
+(`class = serial`, `verbs = 58`) publishes `devmgr.class.serial-deny`. The keys:
 
 | Key | Required | Value |
 |---|---|---|
+| `class` | no | The class name (default the file stem) |
 | `verbs` | yes | Space-separated bit positions, each in `ipc::VERB_BIT_MASK` (58 to 63), none repeated: the verb bits a `QUERY_DEVICE` reply through the class SEND carries |
 | `boot_only` | no | `yes` or `no` (default `no`): the class's drivers come from the boot bundle only, and devmgr refuses a drivers-directory declaration of the class |
 

@@ -720,6 +720,10 @@ pub fn run_all(ctx: &TestContext)
         "hw::irq_msg_exhaustion_and_reuse",
         hw::irq_msg_exhaustion_and_reuse(ctx)
     );
+    run_test!(
+        "hw::irq_msg_every_slot_one_notification",
+        hw::irq_msg_every_slot_one_notification(ctx)
+    );
     run_test!("hw::irq_split_carves", hw::irq_split_carves(ctx));
     run_test!(
         "hw::irq_split_wrong_tag_err",

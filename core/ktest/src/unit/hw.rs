@@ -670,6 +670,182 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
     result
 }
 
+/// Words of [`MSG_SEEN`]: one bit per message key ([`msg_key`]), 256 pages of
+/// [`MSG_SLOTS_PER_CPU_MAX`] slots.
+const MSG_SEEN_WORDS: usize = 8192;
+const _: () = assert!(MSG_SEEN_WORDS as u64 * 64 == 256 * MSG_SLOTS_PER_CPU_MAX);
+
+/// The messages [`mint_every_slot`] has seen live, one bit per [`msg_key`]. A
+/// static, since ktest has no heap; only that function, which ktest's
+/// sequential unit tier runs on one thread, touches it.
+static MSG_SEEN: [core::sync::atomic::AtomicU64; MSG_SEEN_WORDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MSG_SEEN_WORDS];
+
+/// The bit of message (`address`, `data`) in [`MSG_SEEN`]: the low 8 bits of
+/// the address's page (the local APIC id on x86-64, the IMSIC file's page on
+/// riscv64) above the data's 11 bits. Equal messages always share a key, so a
+/// repeat is always found; two messages whose pages differ only above those 8
+/// bits would also share one and fail the test, never pass it. `None` for data
+/// past 11 bits.
+fn msg_key(address: u64, data: u64) -> Option<usize>
+{
+    if data >= MSG_SLOTS_PER_CPU_MAX
+    {
+        return None;
+    }
+    let page = (address >> 12) & 0xFF;
+    usize::try_from(page * MSG_SLOTS_PER_CPU_MAX + data).ok()
+}
+
+/// Mint through `authority` until the targets run out (`QuotaExceeded`),
+/// binding each to `sig` when one is given, and fail when a live target's
+/// message repeats another's. The test's `CSpace` is augmented from its Memory
+/// cap whenever a mint finds its pool spent (`OutOfMemory`), and the next mint
+/// must then succeed. Returns how many targets were minted; every one stays
+/// live, a child of `authority`.
+fn mint_every_slot(ctx: &TestContext, authority: u64, sig: Option<u64>)
+-> Result<u64, &'static str>
+{
+    let (mint_limit, donation_limit) = msg_exhaustion_bounds()?;
+    for word in &MSG_SEEN
+    {
+        word.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    let mut minted = 0;
+    let mut donated = 0;
+    let mut refills = 0;
+    let mut refilled = false;
+    loop
+    {
+        if minted == mint_limit
+        {
+            return Err("hw::irq_msg_every_slot_one_notification: targets never ran out");
+        }
+        match irq_msg_alloc(authority)
+        {
+            Ok(cap) =>
+            {
+                minted += 1;
+                refilled = false;
+                let (address, data) = msg_of(cap)
+                    .map_err(|_| "hw::irq_msg_every_slot_one_notification: no message")?;
+                if !crate::arch::msi_message_plausible(address, data)
+                {
+                    return Err("hw::irq_msg_every_slot_one_notification: message out of range");
+                }
+                let key = msg_key(address, data)
+                    .ok_or("hw::irq_msg_every_slot_one_notification: data past 11 bits")?;
+                let bit = 1u64 << (key % 64);
+                if MSG_SEEN[key / 64].fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit
+                    != 0
+                {
+                    return Err(
+                        "hw::irq_msg_every_slot_one_notification: two targets share a message",
+                    );
+                }
+                if let Some(sig) = sig
+                {
+                    irq_register(cap, sig, 0)
+                        .map_err(|_| "hw::irq_msg_every_slot_one_notification: bind failed")?;
+                }
+            }
+            Err(e) if e == SyscallError::QuotaExceeded as i64 => break,
+            Err(e) if e == SyscallError::OutOfMemory as i64 && refilled =>
+            {
+                return Err(
+                    "hw::irq_msg_every_slot_one_notification: a refill did not cure OutOfMemory",
+                );
+            }
+            Err(e) if e == SyscallError::OutOfMemory as i64 && donated < donation_limit =>
+            {
+                syscall::cap_create_cspace(ctx.memory_base, ctx.cspace_cap, MSG_AUGMENT_PAGES)
+                    .map_err(
+                        |_| "hw::irq_msg_every_slot_one_notification: CSpace augment failed",
+                    )?;
+                donated += MSG_AUGMENT_PAGES;
+                refills += 1;
+                refilled = true;
+            }
+            Err(_) => return Err("hw::irq_msg_every_slot_one_notification: unexpected mint error"),
+        }
+    }
+    if minted == 0
+    {
+        return Err("hw::irq_msg_every_slot_one_notification: no target could be minted");
+    }
+    crate::log_u64(
+        "ktest: hw::irq_msg_every_slot_one_notification targets minted=",
+        minted,
+    );
+    crate::log_u64(
+        "ktest: hw::irq_msg_every_slot_one_notification OutOfMemory refills=",
+        refills,
+    );
+    Ok(minted)
+}
+
+/// Every free slot of every CPU minted and bound to one Notification: no two
+/// live targets share a message, the bindings keep the Notification once its
+/// only capability is deleted, and deleting each target's capability (a revoke
+/// of the authority they were minted through) unbinds them, frees the
+/// Notification and frees every slot, so a second round mints as many targets,
+/// again each with a message of its own.
+pub fn irq_msg_every_slot_one_notification(ctx: &TestContext) -> TestResult
+{
+    let memory = crate::frame_pool::alloc()
+        .ok_or("hw::irq_msg_every_slot_one_notification: frame pool exhausted")?;
+    let authority = msg_authority(ctx);
+    let result = authority.and_then(|authority| {
+        let probed = every_slot_probe(ctx, authority, memory);
+        syscall::cap_revoke(authority).ok();
+        syscall::cap_delete(authority).ok();
+        probed
+    });
+    // A failed step can leave the Notification live; the frame then stays out
+    // of the pool rather than break `free`'s precondition.
+    if syscall::cap_info(memory, syscall_abi::CAP_INFO_SOLE_REFERENCE) == Ok(1)
+    {
+        // SAFETY: the kernel reports no other reference to the frame's
+        // object, so the Notification retyped from it is gone, and the test
+        // never mapped the frame.
+        unsafe { crate::frame_pool::free(memory) };
+    }
+    result
+}
+
+/// The steps of [`irq_msg_every_slot_one_notification`], with the Notification
+/// retyped from `memory` and the targets minted through `authority`.
+fn every_slot_probe(ctx: &TestContext, authority: u64, memory: u64) -> TestResult
+{
+    let sole = |cap| {
+        syscall::cap_info(cap, syscall_abi::CAP_INFO_SOLE_REFERENCE)
+            .map_err(|_| "hw::irq_msg_every_slot_one_notification: SOLE_REFERENCE failed")
+    };
+    let sig = cap_create_notification(memory)
+        .map_err(|_| "hw::irq_msg_every_slot_one_notification: cap_create_notification failed")?;
+    let first = mint_every_slot(ctx, authority, Some(sig));
+    // The bindings now hold the Notification alone.
+    syscall::cap_delete(sig)
+        .map_err(|_| "hw::irq_msg_every_slot_one_notification: notification delete failed")?;
+    let first = first?;
+    if sole(memory)? != 0
+    {
+        return Err("hw::irq_msg_every_slot_one_notification: freed with bindings naming it");
+    }
+    syscall::cap_revoke(authority)
+        .map_err(|_| "hw::irq_msg_every_slot_one_notification: cap_revoke failed")?;
+    if sole(memory)? != 1
+    {
+        return Err("hw::irq_msg_every_slot_one_notification: not freed with its last binding");
+    }
+    let second = mint_every_slot(ctx, authority, None)?;
+    if second != first
+    {
+        return Err("hw::irq_msg_every_slot_one_notification: a re-mint found another slot count");
+    }
+    Ok(())
+}
+
 // ── SYS_IRQ_SPLIT ─────────────────────────────────────────────────────────────
 
 /// `irq_split` at IRQ id 1 on a derived copy of the first Interrupt-range cap

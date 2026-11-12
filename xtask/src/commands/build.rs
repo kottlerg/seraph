@@ -1070,7 +1070,8 @@ fn clippy_check_ext(
 /// `.github/workflows/build-test.yml` writes `CARGO_INCREMENTAL=0` to the job
 /// environment, and an incremental `dev` build partitions codegen units, and
 /// so orders a binary's statics, differently from a non-incremental one
-/// (`docs/build-system.md` § Build Profiles).
+/// (`docs/build-system.md` § Build Profiles). It is set over any value the
+/// caller's environment holds, so every build of a commit is CI's.
 const CI_CARGO_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
 
 /// Construct a `cargo` Command with the working directory set to the workspace

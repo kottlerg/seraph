@@ -172,8 +172,10 @@ value the Rust cache action of CI's jobs writes to their environment
 (Continuous Integration below). Incremental compilation, which Cargo enables by
 default for `dev`, partitions a crate's codegen units differently, and so
 orders a binary's statics differently; with it off, a local `dev` build of a
-commit lays out its binaries as CI's build of that commit does. `release`
-builds no crate incrementally either way.
+commit lays out its binaries as CI's build of that commit does. A
+`CARGO_INCREMENTAL` set in the caller's environment is overridden, so every
+build of a commit is the one CI builds. `release` builds no crate
+incrementally either way.
 
 ### Debuginfo is opt-in
 

@@ -110,20 +110,22 @@ pub fn pci_line_overrides(firmware: &Firmware) -> Vec<SourceOverride>
     let Some((overrides, well_formed)) = read
     else
     {
-        std::os::seraph::log!("MADT missing or malformed; PCI INTx lines take level, active-low");
+        std::os::seraph::log!(
+            warn: "MADT missing or malformed; PCI INTx lines take level, active-low"
+        );
         return Vec::new();
     };
     if !well_formed
     {
         std::os::seraph::log!(
-            "MADT malformed after {} overrides; lines it names later take level, active-low",
+            warn: "MADT malformed after {} overrides; lines it names later take level, active-low",
             overrides.len()
         );
     }
     for o in &overrides
     {
         std::os::seraph::log!(
-            "MADT override: IRQ {} -> GSI {:#x}, flags {:#x}",
+            debug: "MADT override: IRQ {} -> GSI {:#x}, flags {:#x}",
             o.source,
             u64::from(o.gsi),
             o.flags

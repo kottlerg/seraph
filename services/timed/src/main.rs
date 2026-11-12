@@ -126,11 +126,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
         }
     }
 }
@@ -187,7 +187,7 @@ fn main() -> !
     let Some(caps) = bootstrap_caps(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!("bootstrap missing caps");
+        std::os::seraph::log!(error: "bootstrap missing caps");
         syscall::thread_exit();
     };
 

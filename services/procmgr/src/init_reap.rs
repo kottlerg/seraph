@@ -224,7 +224,7 @@ fn refuse(refusal: Refusal, caps: &[u64], ipc_buf: *mut u64)
         CapDisposition::Keep =>
         {
             std::os::seraph::log!(
-                "init-reap: refusing a round; {} caps left in procmgr",
+                warn: "init-reap: refusing a round; {} caps left in procmgr",
                 caps.len()
             );
         }
@@ -290,7 +290,7 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &Mutex<Death
         // The refusal and its log line follow the lock's release.
         drop(guard);
         refuse(Refusal::Invalid(CapDisposition::Keep), caps, ipc_buf);
-        std::os::seraph::log!("init-reap: thread_bind_notification failed; refusing handoff");
+        std::os::seraph::log!(warn: "init-reap: thread_bind_notification failed; refusing handoff");
         return;
     }
     guard.open(InitReapState {
@@ -336,7 +336,7 @@ pub fn run_reap(memmgr_ep: u64, ipc_buf: *mut u64)
         DeathOutcome::Pending(remaining) =>
         {
             std::os::seraph::log!(
-                "init-reap: an init thread exited; {} still running",
+                debug: "init-reap: an init thread exited; {} still running",
                 remaining
             );
         }
@@ -403,7 +403,7 @@ fn do_reap(state: InitReapState, memmgr_ep: u64, ipc_buf: *mut u64)
     REAPED.store(true, Ordering::Relaxed);
     if outcome == procmgr_labels::INIT_REAP_PROBE_HELD
     {
-        std::os::seraph::log!("init-reap: init's CSpace survived the deletion of its last cap");
+        std::os::seraph::log!(warn: "init-reap: init's CSpace survived the deletion of its last cap");
     }
 
     // 6. Summary line so the operator can confirm the reap actually ran.

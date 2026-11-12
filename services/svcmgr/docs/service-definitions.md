@@ -96,7 +96,9 @@ rejects a recipe whose packing the child could not receive:
   `InvalidValue`.
 
 An `env` entry `SERAPH_LOG=<level>` sets the most verbose level a std-built service's
-`seraph::log!` sends ([logd IPC interface](../../logd/docs/ipc-interface.md) § Levels).
+`seraph::log!` sends ([logd IPC interface](../../logd/docs/ipc-interface.md) § Levels). It
+reaches only a service svcmgr launches: svcmgr only binds the services init spawns (procmgr,
+devmgr, vfsd; § Reconciliation), so an `env` key in their recipes reaches nothing.
 
 ## `restart`
 

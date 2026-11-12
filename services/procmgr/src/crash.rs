@@ -83,7 +83,7 @@ pub fn start()
         })
     else
     {
-        std::os::seraph::log!("crash endpoint not created; exceptions stay unbound");
+        std::os::seraph::log!(warn: "crash endpoint not created; exceptions stay unbound");
         return;
     };
     let Some(wake) =
@@ -93,7 +93,7 @@ pub fn start()
     else
     {
         let _ = syscall::cap_delete(ep);
-        std::os::seraph::log!("crash wake notification not created; exceptions stay unbound");
+        std::os::seraph::log!(warn: "crash wake notification not created; exceptions stay unbound");
         return;
     };
     if std::thread::Builder::new()
@@ -103,7 +103,7 @@ pub fn start()
     {
         let _ = syscall::cap_delete(ep);
         let _ = syscall::cap_delete(wake);
-        std::os::seraph::log!("crash decliner not started; exceptions stay unbound");
+        std::os::seraph::log!(warn: "crash decliner not started; exceptions stay unbound");
         return;
     }
     WAKE.store(wake, Ordering::Release);

@@ -89,12 +89,18 @@ Send the supervisor, for the maintainer, only:
 5. what they ask for.
 
 Verdict lines, findings and the state of each round stay in the run records
-(`target/xtask/review/pr<N>/`) and in the record, and you give them when asked. A worker gives
-you a run's two verdict lines verbatim; you pass them on only when asked, or when a line is why
-something blocks.
+(`target/xtask/review/pr<N>/`) and in the record, and you give them when asked. A worker records
+a run's two verdict lines verbatim in its status line; you pass them on only when asked, or when
+a line is why something blocks.
 
-A worker's message wakes you for a response at the cost of your whole context. Act on it and
-stop: routine status needs no reply to the worker and nothing to the supervisor.
+Workers reach you by three channels (`.claude/agents/worker.md` § Reporting). Routine status
+(a plan written, a PR opened, a review's verdict lines, a failed boot's saved log) is recorded
+by the worker with `cargo xtask orch worker <name> --status`, from its worktree into your
+record, and wakes nothing: read it with `cargo xtask orch state` when you next act. A gate report
+and a question that blocks the worker (a host request is one) arrive as its hand-back alone. A
+question the worker keeps working past, and the results that end an exclusive grant, arrive as
+a message; it wakes you for a response at the cost of your whole context, and that turn can run
+in the worker's worktree (§ Failure modes). Act on it and stop.
 
 Keep your own reads out of your context the same way:
 
@@ -123,7 +129,9 @@ Keep your own reads out of your context the same way:
    summary and whole into the answers file described below. The record is the files under
    `target/xtask/orchestration/` (gitignored): the state and the log, which only
    `cargo xtask orch` writes (`xtask/README.md` § `cargo xtask orch`), and the answers file
-   described below, which you write. `state.json` is the state: your own agent id
+   described below, which you write. The command run in a worker's worktree writes this same
+   record, and a worker sets only its own entry's status and PR with it; the rest is yours.
+   `state.json` is the state: your own agent id
    (`orch orchestrator`), the grant and its queue (`orch grant`), every worker with its agent
    id, model, effort, scope, branch, worktree, PR, phase and last report (`orch worker`), the
    merge order (`orch order`), the questions the maintainer has open (`orch question`) and the
@@ -170,8 +178,9 @@ Do not poll. Two things have no notification, and each has its own watch:
   watch the worker's. The tick's prompt, for the supervisor: "Send the orchestrator the words
   `grant watch`. Do nothing else." On it, run `cargo xtask orch state` and
   `cargo xtask host status`. If the host is idle and the holder has not reported for longer
-  than its runs should take, ask the holder for a status line. Log one line and take no other
-  action. Ask the supervisor to cancel the tick when the grant ends.
+  than its runs should take, ask the holder for a status line, which it records in its entry and
+  you read at the next tick. Log one line and take no other action. Ask the supervisor to
+  cancel the tick when the grant ends.
 - **A worker that is gone.** When a worker's notification says its session ended without a
   hand-back, or a message to it is undeliverable, it is dead: log it, send the stand-down
   message, ask the supervisor in one line to end its task (an agent cannot stop another's), and
@@ -183,11 +192,14 @@ Spawn each worker with the `Agent` tool, `subagent_type` `worker`, worktree isol
 prompt of this shape. Nothing in it repeats the agent file, and what is longer than a line
 (an earlier plan, a ruling's detail) is a path, not text:
 
-> You are orchestrated. Scope `<scope>`; Issues #N, #M (one line each: title and the items in
-> play); branch `<prefix>/<slug>`; report to `<your agent id>`; previous ledger `<path of the
-> previous PR's ledger on the same surface, when one exists>` (context for the first review run,
-> not this PR's ledger). Batch rulings: <the maintainer's decisions for this batch, and any
-> Issue-specific decision already made>.
+> You are orchestrated, as `<name>`. Scope `<scope>`; Issues #N, #M (one line each: title and
+> the items in play); branch `<prefix>/<slug>`; report to `<your agent id>`; previous ledger
+> `<path of the previous PR's ledger on the same surface, when one exists>` (context for the
+> first review run, not this PR's ledger). Batch rulings: <the maintainer's decisions for this
+> batch, and any Issue-specific decision already made>.
+
+`<name>` is the worker's name in the record (`orch worker <name>`), under which it records its
+status.
 
 Spawn a worker for one PR, or one defined set of related PRs that its prompt names. Do not
 re-task it onto another PR: a worker that carries on works from a compacted summary of its
@@ -374,8 +386,8 @@ notifications. Ask for it yourself, in one line, when you are between steps and 
   `cargo xtask orch state`, record your id with `cargo xtask orch orchestrator <id>`, and send
   each live worker one line with your agent id as its
   address from now on. A worker spawned by an earlier orchestrator is still alive and reachable
-  by its id. Its hand-back and task notifications go to the supervisor, which forwards them to
-  you in one line.
+  by its id. Its hand-back and task notifications go to the supervisor, which forwards a
+  hand-back to you verbatim and a notification in one line.
 - Do not re-derive what the state holds by reading PRs, records or worktrees. When the state
   and the world disagree (a PR it lists is merged), correct the state with the command for
   that fact, which logs the change.
@@ -402,9 +414,15 @@ with `cargo xtask orch end`.
   its worktree, then resume the worker with the results so it writes the body and runs the
   review with its own context.
 - A turn woken by a worker's message can run in that worker's worktree (a harness defect): `pwd`
-  shows it, and the harness then refuses git on the main checkout. In such a turn run no git,
-  gate, merge or spawn. Record and answer by absolute path
-  (`cd <checkout> && cargo xtask orch ...`, `<checkout>` being the part of `pwd` before
-  `/.claude/worktrees/`), send the supervisor the one line "drift: wake me", and do the
-  deferred work in the turn its reply starts. Do not park.
+  shows it, and the harness then refuses git on the main checkout. Workers send a message only
+  for a question they keep working past and for the results that end a grant
+  (`.claude/agents/worker.md` § Reporting), so such turns are few. In such a turn run no git,
+  gate, merge or spawn. Record and answer by absolute path (`cd <checkout> && cargo xtask orch
+  ...`, `<checkout>` being the part of `pwd` before `/.claude/worktrees/`). Ask the supervisor
+  for a wake only when the turn deferred work: a gate verification, a merge, a spawn, or any git
+  on the main checkout. Then first log what it deferred
+  (`cargo xtask orch log "drift: deferred <work>"`), and send the supervisor the one line
+  "drift: wake me" as the turn's last action; do the deferred work in the turn its reply starts.
+  A drifted turn that deferred nothing records what it must and stops, with no request. Do not
+  park.
 - A boundary run that finishes late is not a hang. Judge PASS or HANG against the budget.

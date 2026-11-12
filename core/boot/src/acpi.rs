@@ -469,11 +469,13 @@ pub unsafe fn parse_hart_caps(rsdp_addr: u64) -> (u64, u64)
 /// the leading [`boot_protocol::MAX_CPUS`] processors.
 ///
 /// Returns 1, with `out[0] = bsp_id`, on any parse failure so the system
-/// falls back to single-CPU operation rather than refusing to boot.
+/// falls back to single-CPU operation rather than refusing to boot. An `out`
+/// with no slot places nothing and returns 0; the caller sizes it to at least
+/// one slot.
 ///
 /// # Safety
 /// `rsdp_addr` must be zero or the physical address of a valid, identity-mapped
-/// ACPI RSDP. `out` must hold at least one slot.
+/// ACPI RSDP.
 pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32, out: &mut [u32]) -> u32
 {
     // SAFETY: caller contract.

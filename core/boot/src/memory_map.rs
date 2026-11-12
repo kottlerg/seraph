@@ -82,7 +82,8 @@ impl Iterator for RawDescriptors<'_>
 ///
 /// Iterates the descriptors of `uefi_map` (none when the descriptor size is
 /// below `EFI_MEMORY_DESCRIPTOR`'s, and none past `uefi_map.buffer_size`),
-/// converts each UEFI memory type to a [`MemoryType`], and returns the number
+/// skips a descriptor whose page count has no 64-bit byte size, converts each
+/// UEFI memory type to a [`MemoryType`], and returns the number
 /// of entries written. A `max_entries` of at least
 /// `uefi::map_buffer_descriptor_reach(uefi_map.buffer_size)` holds every
 /// descriptor; the write stops at `max_entries` regardless, and the

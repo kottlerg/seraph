@@ -284,8 +284,9 @@ unsafe fn copy_segment(data: &[u8], seg: &elf::LoadSegment, dst_phys: u64)
 ///
 /// - `BootError::InvalidElf` — header check failed (bridged from
 ///   `elf::ElfError`), the segment layout failed [`validate_kernel_layout`],
-///   or the relocation table is malformed, non-`RELATIVE`, or targets bytes
-///   outside the load span.
+///   a segment's placement or BSS address overflows the address space, or the
+///   relocation table is malformed, non-`RELATIVE`, or targets bytes outside
+///   the load span.
 /// - `BootError::OutOfMemory` — no free contiguous span of the required size
 ///   (below 4 GiB on x86-64).
 ///
@@ -433,7 +434,8 @@ pub unsafe fn load_kernel(
 /// # Errors
 ///
 /// - `BootError::InvalidElf` — nonzero slide on an `ET_EXEC` kernel, a
-///   malformed record, or a target outside the span.
+///   malformed record, a target outside the span, or a slide that overflows a
+///   virtual address.
 ///
 /// # Safety
 ///

@@ -155,7 +155,10 @@ pub fn map_err(e: MapError) -> BootError
 ///
 /// # Errors
 /// Returns [`BootError::OutOfMemory`] if page table frame allocation fails,
-/// or [`BootError::WxViolation`] if a kernel segment has both W and X; this
+/// [`BootError::MapAddressRange`] if a range to map runs past the end of the
+/// address space, [`BootError::InvalidElf`] if the kernel's segment count
+/// exceeds its segment array, or [`BootError::WxViolation`] if a kernel
+/// segment has both W and X; this
 /// is where kernel-image W^X is enforced (see
 /// `core/boot/docs/elf-loading.md` § LOAD Segment Processing).
 pub fn build_initial_tables(

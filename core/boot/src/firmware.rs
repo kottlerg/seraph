@@ -57,9 +57,10 @@ pub unsafe fn discover_firmware(st: *mut EfiSystemTable) -> FirmwareInfo
 /// Returns `(cpu_count, truncated)`. `cpu_count` is the number of slots of
 /// `out` filled, so the BSP counts once whether or not the table lists it, and
 /// `out[1..cpu_count]` holds exactly the APs. `truncated` is set when a
-/// distinct ID found no slot. `out` must hold at least one slot; the caller
-/// sizes it from the table's entry count, capped at [`MAX_CPUS`], so only a
-/// table listing more than [`MAX_CPUS`] CPUs truncates.
+/// distinct ID found no slot. The caller sizes `out` from the table's entry
+/// count, at least one slot and capped at [`MAX_CPUS`], so only a table listing
+/// more than [`MAX_CPUS`] CPUs truncates; an `out` with no slot places nothing
+/// and reports truncation.
 pub fn place_cpu_ids(
     bsp_id: u32,
     ids: impl IntoIterator<Item = u32>,

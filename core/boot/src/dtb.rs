@@ -1197,10 +1197,11 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> usize
 /// Place the enabled DTB harts into `out` (`firmware::place_cpu_ids`): the
 /// boot hart `bsp_id` at index 0, then each other hart ID once, in tree order.
 /// Returns the hart count; harts past `out`, sized from [`parse_cpu_count`]
-/// and capped at `boot_protocol::MAX_CPUS`, are dropped with a diagnostic.
+/// and capped at `boot_protocol::MAX_CPUS`, are dropped with a diagnostic. An
+/// `out` with no slot places nothing and returns 0.
 ///
 /// # Safety
-/// As [`parse_cpu_count`]. `out` must hold at least one slot.
+/// As [`parse_cpu_count`].
 pub unsafe fn place_hart_ids(dtb_addr: u64, bsp_id: u32, out: &mut [u32]) -> u32
 {
     let Some(first) = out.first_mut()
@@ -1385,7 +1386,8 @@ fn imsic_layout(fdt: &Fdt, node: &FdtNode) -> Option<ImsicLayout>
 
 /// Address of the file of the `index`-th `interrupts-extended` entry of the
 /// IMSIC `node`: the files lie `stride` bytes apart, filling its `reg`
-/// windows in order. `None` past the last window.
+/// windows in order. `None` past the last window, for a zero `stride`, or when
+/// the file's offset overflows.
 fn imsic_file_in_regs(node: &FdtNode, mut index: u64, stride: u64) -> Option<u64>
 {
     for &(base, size) in node.reg_entries.iter().take(node.reg_count)

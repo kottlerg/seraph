@@ -211,7 +211,8 @@ fn rebase(base: u64, addr: u64, origin: u64) -> Option<u64>
 /// # Errors
 ///
 /// `BootError::InvalidElf` when the file bytes lie outside `data`, `p_memsz`
-/// is below `p_filesz`, or the BSS address overflows.
+/// is below `p_filesz`, or the BSS address overflows; each is checked before
+/// any byte is written.
 ///
 /// # Safety
 ///
@@ -225,19 +226,10 @@ unsafe fn copy_segment(data: &[u8], seg: &elf::LoadSegment, dst_phys: u64)
     let file_off = seg.offset as usize;
     #[allow(clippy::cast_possible_truncation)]
     let file_sz = seg.filesz as usize;
-    if file_sz > 0
-    {
-        let src = data
-            .get(file_off..)
-            .ok_or(elf::ElfError::SegmentOverflow)?
-            .as_ptr();
-        // SAFETY: `src` points into `data`; `elf::load_segments` already
-        // validated that `[file_off, file_off + file_sz)` is in bounds
-        // (yields SegmentOverflow otherwise). `dst_phys` holds `memsz ≥ filesz`
-        // bytes disjoint from `data` per the caller's contract.
-        unsafe { core::ptr::copy_nonoverlapping(src, dst_phys as *mut u8, file_sz) };
-    }
-
+    let src = file_off
+        .checked_add(file_sz)
+        .and_then(|end| data.get(file_off..end))
+        .ok_or(elf::ElfError::SegmentOverflow)?;
     // Difference fits in usize: memsz ≤ allocated region; 64-bit only.
     let bss_len = seg
         .memsz
@@ -245,18 +237,21 @@ unsafe fn copy_segment(data: &[u8], seg: &elf::LoadSegment, dst_phys: u64)
         .ok_or(BootError::InvalidElf("LOAD segment: p_memsz < p_filesz"))?;
     #[allow(clippy::cast_possible_truncation)]
     let bss_sz = bss_len as usize;
-    if bss_sz > 0
-    {
-        let bss_addr = dst_phys
-            .checked_add(seg.filesz)
-            .ok_or(BootError::InvalidElf(
-                "LOAD segment placement overflows the address space",
-            ))?;
-        // SAFETY: `bss_addr` is `filesz` bytes into the segment's placed
-        // region, which spans `memsz` bytes per the caller's contract.
-        // UEFI does not guarantee zeroed pages; we must zero BSS here.
-        unsafe { core::ptr::write_bytes(bss_addr as *mut u8, 0, bss_sz) };
-    }
+    let bss_addr = dst_phys
+        .checked_add(seg.filesz)
+        .ok_or(BootError::InvalidElf(
+            "LOAD segment placement overflows the address space",
+        ))?;
+
+    // SAFETY: `src` is `filesz` bytes of `data`; `dst_phys` holds
+    // `memsz ≥ filesz` (checked above) writable bytes disjoint from `data` per
+    // the caller's contract.
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst_phys as *mut u8, src.len()) };
+    // SAFETY: `bss_addr` is `filesz` bytes into the segment's placed region,
+    // which spans `memsz` bytes per the caller's contract, so the `memsz -
+    // filesz` bytes from it are inside it. UEFI does not guarantee zeroed
+    // pages; we must zero BSS here.
+    unsafe { core::ptr::write_bytes(bss_addr as *mut u8, 0, bss_sz) };
     Ok(())
 }
 
@@ -933,6 +928,48 @@ mod tests
             size: 0x30,
         };
         assert_eq!(rela_phys_for(&segs, &table), None);
+    }
+
+    fn load_seg(offset: u64, filesz: u64, memsz: u64) -> elf::LoadSegment
+    {
+        elf::LoadSegment {
+            vaddr: 0,
+            paddr: 0,
+            offset,
+            filesz,
+            memsz,
+            writable: false,
+            executable: false,
+        }
+    }
+
+    // Defect caught: file bytes past `data`, or a `p_memsz` below `p_filesz`,
+    // copied (reading past `data` or writing past `memsz`) before the error.
+    #[test]
+    fn copy_segment_refuses_bad_bounds_before_writing()
+    {
+        let data = [0xAAu8; 8];
+        let mut dst = [0x55u8; 16];
+        let dst_phys = dst.as_mut_ptr() as u64;
+        // SAFETY: `dst` holds 16 writable bytes, at least each case's `memsz`,
+        // disjoint from `data`.
+        let past_data = unsafe { copy_segment(&data, &load_seg(4, 8, 8), dst_phys) };
+        assert!(matches!(past_data, Err(BootError::InvalidElf(_))));
+        // SAFETY: as above.
+        let short_mem = unsafe { copy_segment(&data, &load_seg(0, 8, 4), dst_phys) };
+        assert!(matches!(short_mem, Err(BootError::InvalidElf(_))));
+        assert_eq!(dst, [0x55u8; 16]);
+    }
+
+    #[test]
+    fn copy_segment_copies_the_file_bytes_and_zeroes_the_tail()
+    {
+        let data = [1u8, 2, 3, 4, 5, 6];
+        let mut dst = [0x55u8; 8];
+        // SAFETY: `dst` holds `memsz` (6) writable bytes disjoint from `data`.
+        unsafe { copy_segment(&data, &load_seg(2, 3, 6), dst.as_mut_ptr() as u64) }
+            .expect("in bounds");
+        assert_eq!(dst, [3, 4, 5, 0, 0, 0, 0x55, 0x55]);
     }
 
     // Defect caught: a placement that wraps instead of failing, or one below

@@ -619,9 +619,11 @@ or body):
   `alloc_zeroed_slab` and are on the memory surface instead; every `init_storage` and
   `init_per_cpu_storage`, which take the boot CPU count and size per-CPU storage from it (a call to
   one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
-  CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
-  `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
-  `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, `TlbShootdownRequest`, and `VectorRow`
+  CPU-scaled kernel reserve); `message_capacity` and `message_slots_per_cpu`, which size the IRQ
+  routing table's message-signaled targets at one entry per delivery slot of every CPU; and the
+  element types of the per-CPU arrays and slabs, today `PerCpuData`, `PerCpuScheduler`,
+  `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`, `TagState`, `CpuRng`, `Acc`,
+  `Sample`, `CpuDiag`, `TlbShootdownRequest`, `VectorRow`, and `IrqRoute`
   (`git grep -n -E 'alloc_(zeroed|per_cpu)_slab::<|; MAX_CPUS\]' <head>` lists the arrays and
   slabs, and also the slabs that are not per-CPU: the single-slot entropy pool, the tag pool, the
   reschedule-pending CPU set, and the RAM-sized chunk tables of `frame_map::init` and
@@ -700,6 +702,7 @@ S="$S|init_storage|init_per_cpu_storage"
 S="$S|PerCpuSlab|alloc_per_cpu_slab"
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|VectorRow|CpuTopology"
+S="$S|IrqRoute|message_capacity|message_slots_per_cpu"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
 S="$S|madt_cpu_ids|place_cpu_ids|place_hart_ids|cpu_topology_capacity|cpu_id_capacity"
 S="$S|allocate_cpu_ids|cpus\.count|cpus\.ids_phys|info\.cpu_count|boot_cpu_ids"

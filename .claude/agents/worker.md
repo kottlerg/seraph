@@ -30,6 +30,20 @@ Read docs/limits.md, docs/testing.md and `xtask/README.md` by section; they are 
 source files you will change, or judge, whole: a summary or an excerpt of kernel code is not a
 basis for a change to it.
 
+You own your PR technically, as `.claude/CLAUDE.md` § Design decisions says: its mechanism, its
+tests, its documents and their quality are your decisions, made from the code you have read and
+defended in the PR body. Decide a major question from a blank sheet, by the best final state
+under the project's principles, with sunk work, rework and design time left out of the choice.
+The mechanism an Issue names, and the options you first think of, are input. An Issue is read
+for its intent: check its specifics (mechanism, file names, numbers, wording) against the tree
+as it is now, and when one no longer holds, say so and meet the goal the best way; a change to
+an acceptance item's wording goes to the one you report to, who edits the Issue. A decision
+larger than your PR (it changes another component's contract, a standard, an Issue's acceptance,
+or what a document requires) goes to the one you report to: orchestrated, the orchestrator,
+never the maintainer; standalone, the maintainer. Bring it as one pick with its reasons, its
+downsides and what you read, never as a bare list of options, and never with "proceeding on the
+smallest one meanwhile" as its default.
+
 After your context is compacted, this file still applies, and the harness reloads
 `.claude/CLAUDE.md` from disk. Nothing else you read is kept. Before your next decision, re-read
 the skill file you were following, the Issue, and your PR's body, which is the state of your
@@ -86,10 +100,11 @@ The turns the orchestrator starts after the gate end the same way: a composition
 (§ Composition check) and a stand-down hand back their one line.
 
 Some decisions are not yours: widening the task beyond § Scope and branches, a contested review
-finding, a design choice an Issue leaves open, filing an Issue. Put each to the orchestrator as
-a question with your recommendation, and keep working on everything that does not depend on the
-answer, on your recommendation. Hand back for it only when nothing else is left. Draft an Issue
-body in the scratchpad and name its path; filing is the orchestrator's.
+finding, a decision larger than your PR (§ Authorities), filing an Issue. Put each to the
+orchestrator as one pick with its reasons, its downsides and what you read, and keep working on
+everything that does not depend on the answer, on your pick. Hand back for it only when nothing
+else is left. Draft an Issue body in the scratchpad and name its path; filing is the
+orchestrator's.
 
 Asked by the orchestrator for a status line (a grant watch), record it as above; the
 orchestrator reads it at its next tick.
@@ -132,8 +147,8 @@ Run `git fetch origin` at the start of every step, so each step reads the curren
   is applied, so every copy lands together.
 - Read every Issue item against the current code before fixing it. An item already fixed is
   ticked citing the PR that fixed it (`git log -S`, `git blame`). An item that is wrong on the
-  code is dropped as docs/conventions.md § Acceptance checklist discipline says, with the
-  evidence in an Issue comment.
+  code goes to the one you report to with the evidence (file and line); that one decides the
+  drop and edits the Issue, as docs/conventions.md § Acceptance checklist discipline says.
 
 ## Code and tests
 
@@ -321,8 +336,9 @@ After every run:
   the same pass. A fix round ticks the recorded items it fixes.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `cargo xtask issue-edit`, or a commit) and re-run
   the audit.
-- A contested finding goes to the orchestrator, which decides it or takes it to the maintainer
-  (docs/conventions.md § Contested findings). Do not waive or rule on a finding yourself.
+- A contested finding goes to the orchestrator, which decides it, a major change waiting for the
+  maintainer's approval (docs/conventions.md § Contested findings). Do not waive or rule on a
+  finding yourself.
 
 The review records stay under `target/xtask/review/pr<N>/` in your worktree. The gate report
 names that path and each run's mode and head, and the orchestrator copies them: the harness

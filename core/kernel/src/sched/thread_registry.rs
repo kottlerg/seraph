@@ -52,17 +52,26 @@ pub unsafe fn register(tcb: *mut ThreadControlBlock)
 {
     // SAFETY: lock serialises all registry access; tcb valid per contract.
     let saved = unsafe { THREAD_REGISTRY_LOCK.lock_raw() };
-    // SAFETY: single-writer access under lock; head read/written as a scalar.
+    // SAFETY: single-writer access under lock; head read as a scalar.
+    let head = unsafe { THREAD_REGISTRY_HEAD };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both writes are to the registry links of `tcb`, valid by the contract, which \
+                  THREAD_REGISTRY_LOCK, held here, serialises"
+    )]
+    // SAFETY: tcb valid per contract; the lock serialises its registry links.
     unsafe {
-        let head = THREAD_REGISTRY_HEAD;
         (*tcb).registry_prev = core::ptr::null_mut();
         (*tcb).registry_next = head;
-        if !head.is_null()
-        {
-            (*head).registry_prev = tcb;
-        }
-        THREAD_REGISTRY_HEAD = tcb;
     }
+    if !head.is_null()
+    {
+        // SAFETY: a non-null head is a registered TCB, live because unregister
+        // precedes every free; the lock serialises its registry links.
+        unsafe { (*head).registry_prev = tcb };
+    }
+    // SAFETY: single-writer access under lock; head written as a scalar.
+    unsafe { THREAD_REGISTRY_HEAD = tcb };
     // SAFETY: paired with lock_raw above.
     unsafe { THREAD_REGISTRY_LOCK.unlock_raw(saved) };
 }
@@ -81,28 +90,45 @@ pub unsafe fn unregister(tcb: *mut ThreadControlBlock)
 {
     // SAFETY: lock serialises all registry access; tcb valid per contract.
     let saved = unsafe { THREAD_REGISTRY_LOCK.lock_raw() };
-    // SAFETY: single-writer access under lock.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both reads are of the registry links of `tcb`, valid by the contract, which \
+                  THREAD_REGISTRY_LOCK, held here, serialises"
+    )]
+    // SAFETY: tcb valid per contract; single-writer access under lock.
+    let (prev, next) = unsafe { ((*tcb).registry_prev, (*tcb).registry_next) };
+    if prev.is_null()
+    {
+        // `tcb` is the head, or was never linked: only patch the head when
+        // it actually names `tcb`, so an unregistered TCB cannot corrupt the
+        // list.
+        // SAFETY: single-writer access under lock; head read as a scalar.
+        let head = unsafe { THREAD_REGISTRY_HEAD };
+        if head == tcb
+        {
+            // SAFETY: single-writer access under lock; head written as a
+            // scalar.
+            unsafe { THREAD_REGISTRY_HEAD = next };
+        }
+    }
+    else
+    {
+        // SAFETY: a non-null prev is a registered TCB, live because unregister
+        // precedes every free; single-writer access under lock.
+        unsafe { (*prev).registry_next = next };
+    }
+    if !next.is_null()
+    {
+        // SAFETY: as for `prev`: a registered TCB, under lock.
+        unsafe { (*next).registry_prev = prev };
+    }
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both writes are to the registry links of `tcb`, valid by the contract, which \
+                  THREAD_REGISTRY_LOCK, held here, serialises"
+    )]
+    // SAFETY: tcb valid per contract; single-writer access under lock.
     unsafe {
-        let prev = (*tcb).registry_prev;
-        let next = (*tcb).registry_next;
-        if prev.is_null()
-        {
-            // `tcb` is the head, or was never linked: only patch the head when
-            // it actually names `tcb`, so an unregistered TCB cannot corrupt the
-            // list.
-            if THREAD_REGISTRY_HEAD == tcb
-            {
-                THREAD_REGISTRY_HEAD = next;
-            }
-        }
-        else
-        {
-            (*prev).registry_next = next;
-        }
-        if !next.is_null()
-        {
-            (*next).registry_prev = prev;
-        }
         (*tcb).registry_next = core::ptr::null_mut();
         (*tcb).registry_prev = core::ptr::null_mut();
     }
@@ -120,26 +146,29 @@ pub unsafe fn unregister(tcb: *mut ThreadControlBlock)
 /// [`THREAD_REGISTRY_LOCK`] must be held by the caller.
 unsafe fn walk_locked(mut f: impl FnMut(*mut ThreadControlBlock)) -> bool
 {
-    // SAFETY: the list is consistent under the lock the caller holds; every
-    // node dereferenced is live because unregister precedes every free.
-    unsafe {
-        let mut hare = THREAD_REGISTRY_HEAD;
-        let mut tortoise = THREAD_REGISTRY_HEAD;
-        // The tortoise steps on every second step of the hare.
-        let mut tortoise_steps = true;
-        while !hare.is_null()
+    // SAFETY: the lock the caller holds serialises the head, read as a scalar.
+    let mut hare = unsafe { THREAD_REGISTRY_HEAD };
+    // SAFETY: as for `hare`.
+    let mut tortoise = unsafe { THREAD_REGISTRY_HEAD };
+    // The tortoise steps on every second step of the hare.
+    let mut tortoise_steps = true;
+    while !hare.is_null()
+    {
+        f(hare);
+        // SAFETY: the list is consistent under the lock the caller holds;
+        // `hare` is a registered node, live because unregister precedes every
+        // free.
+        hare = unsafe { (*hare).registry_next };
+        tortoise_steps = !tortoise_steps;
+        if tortoise_steps
         {
-            f(hare);
-            hare = (*hare).registry_next;
-            tortoise_steps = !tortoise_steps;
-            if tortoise_steps
-            {
-                tortoise = (*tortoise).registry_next;
-            }
-            if !hare.is_null() && core::ptr::eq(hare, tortoise)
-            {
-                return false;
-            }
+            // SAFETY: as for `hare`: `tortoise` trails it on the same walk,
+            // so it is a registered node too.
+            tortoise = unsafe { (*tortoise).registry_next };
+        }
+        if !hare.is_null() && core::ptr::eq(hare, tortoise)
+        {
+            return false;
         }
     }
     true

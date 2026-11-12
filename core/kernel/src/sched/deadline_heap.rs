@@ -97,7 +97,13 @@ impl DeadlineHeap
     /// caller holds the heap's lock.
     pub unsafe fn insert(&mut self, node: *mut DeadlineNode, key: u64)
     {
-        // SAFETY: node valid and unlinked (contract).
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to a field of `node`, which the caller's contract makes \
+                      valid and its heap lock serialises"
+        )]
+        // SAFETY: node valid and unlinked (contract), and the caller holds the
+        // heap's lock.
         unsafe {
             debug_assert!(!(*node).linked, "DeadlineHeap::insert: node already linked");
             (*node).key = key;
@@ -105,15 +111,18 @@ impl DeadlineHeap
             (*node).next = core::ptr::null_mut();
             (*node).prev = core::ptr::null_mut();
             (*node).linked = true;
-            self.root = if self.root.is_null()
-            {
-                node
-            }
-            else
-            {
-                meld(self.root, node)
-            };
         }
+        self.root = if self.root.is_null()
+        {
+            node
+        }
+        else
+        {
+            // SAFETY: the root of a non-empty heap is a valid, detached root
+            // (null `prev` and `next`); `node` is valid, was unlinked, and its
+            // links were just nulled, so it is a detached root distinct from it.
+            unsafe { meld(self.root, node) }
+        };
         // One per linked node, and every node is a live TCB's: far below
         // saturation.
         self.len = self.len.saturating_add(1);
@@ -125,17 +134,37 @@ impl DeadlineHeap
     /// `node` must be linked in this heap; the caller holds the heap's lock.
     pub unsafe fn remove(&mut self, node: *mut DeadlineNode)
     {
-        // SAFETY: node and every node reachable from the root are valid
-        // (insert's contract), and the caller serialises the heap.
-        unsafe {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "both accesses are to fields of `node`, a node linked in this heap, which \
+                      the caller's heap lock serialises"
+        )]
+        // SAFETY: node is linked in this heap (contract), so valid (insert's
+        // contract), and the caller serialises the heap.
+        let first_child = unsafe {
             debug_assert!((*node).linked, "DeadlineHeap::remove: node not linked");
-            let children = merge_pairs((*node).child);
-            if node == self.root
-            {
-                self.root = children;
-            }
-            else
-            {
+            (*node).child
+        };
+        // SAFETY: `first_child` heads `node`'s child list, every node of which
+        // is a valid node of this heap (insert's contract) that the caller
+        // serialises.
+        let children = unsafe { merge_pairs(first_child) };
+        if node == self.root
+        {
+            self.root = children;
+        }
+        else
+        {
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every access is to a link of a node linked in this heap (`node`, its \
+                          parent or left sibling, its right sibling), which the caller's heap \
+                          lock serialises"
+            )]
+            // SAFETY: node, every node reachable from the root, and so its
+            // `prev` and `next` are valid (insert's contract), and the caller
+            // serialises the heap. A non-root node's `prev` is non-null.
+            unsafe {
                 let prev = (*node).prev;
                 if (*prev).child == node
                 {
@@ -149,11 +178,23 @@ impl DeadlineHeap
                 {
                     (*(*node).next).prev = prev;
                 }
-                if !children.is_null()
-                {
-                    self.root = meld(self.root, children);
-                }
             }
+            if !children.is_null()
+            {
+                // SAFETY: the root has null `prev` and `next`; `children` is
+                // the detached root `merge_pairs` returned, of `node`'s former
+                // subtree, which does not hold the root.
+                self.root = unsafe { meld(self.root, children) };
+            }
+        }
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to a field of `node`, which the caller's heap lock \
+                      serialises"
+        )]
+        // SAFETY: node is valid (insert's contract), and the caller serialises
+        // the heap.
+        unsafe {
             (*node).child = core::ptr::null_mut();
             (*node).next = core::ptr::null_mut();
             (*node).prev = core::ptr::null_mut();
@@ -188,19 +229,27 @@ impl DeadlineHeap
     {
         let mut node = self.root;
         let mut seen = 0;
-        // SAFETY: every node reachable from the root is valid and linked.
-        unsafe {
-            while !node.is_null() && seen < limit
-            {
-                f(node);
-                seen = seen.saturating_add(1);
+        while !node.is_null() && seen < limit
+        {
+            f(node);
+            seen = seen.saturating_add(1);
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "both reads are of `node`'s child link, a node linked in this heap, \
+                          which the caller's heap lock serialises"
+            )]
+            // SAFETY: every node reachable from the root is valid and linked,
+            // and the caller holds the heap's lock.
+            unsafe {
                 if !(*node).child.is_null()
                 {
                     node = (*node).child;
                     continue;
                 }
-                node = next_in_preorder(node);
             }
+            // SAFETY: `node` is reachable from the root, so it and its
+            // ancestors are valid, linked nodes.
+            node = unsafe { next_in_preorder(node) };
         }
     }
 }
@@ -212,10 +261,16 @@ impl DeadlineHeap
 /// `node` and its ancestors are valid, linked nodes.
 unsafe fn next_in_preorder(mut node: *mut DeadlineNode) -> *mut DeadlineNode
 {
-    // SAFETY: as the contract states.
-    unsafe {
-        loop
-        {
+    loop
+    {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access reads a link of `node`, a sibling of it or of an ancestor, or \
+                      an ancestor: valid, linked nodes by the contract"
+        )]
+        // SAFETY: as the contract states: `node`, its siblings, its ancestors
+        // and theirs are valid, linked nodes, which the heap's lock serialises.
+        let parent = unsafe {
             if !(*node).next.is_null()
             {
                 return (*node).next;
@@ -226,13 +281,13 @@ unsafe fn next_in_preorder(mut node: *mut DeadlineNode) -> *mut DeadlineNode
             {
                 leftmost = (*leftmost).prev;
             }
-            let parent = (*leftmost).prev;
-            if parent.is_null()
-            {
-                return core::ptr::null_mut();
-            }
-            node = parent;
+            (*leftmost).prev
+        };
+        if parent.is_null()
+        {
+            return core::ptr::null_mut();
         }
+        node = parent;
     }
 }
 
@@ -243,8 +298,14 @@ unsafe fn next_in_preorder(mut node: *mut DeadlineNode) -> *mut DeadlineNode
 /// `a` and `b` are valid, distinct, detached roots.
 unsafe fn meld(a: *mut DeadlineNode, b: *mut DeadlineNode) -> *mut DeadlineNode
 {
-    // SAFETY: as the contract states.
-    unsafe {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `a`, of `b`, or of the top's first child, valid \
+                  nodes of one heap by the contract"
+    )]
+    // SAFETY: as the contract states; the top's child, when non-null, is a
+    // node of the same heap.
+    let top = unsafe {
         let (top, sub) = if (*b).key < (*a).key { (b, a) } else { (a, b) };
         (*sub).next = (*top).child;
         if !(*top).child.is_null()
@@ -254,7 +315,8 @@ unsafe fn meld(a: *mut DeadlineNode, b: *mut DeadlineNode) -> *mut DeadlineNode
         (*sub).prev = top;
         (*top).child = sub;
         top
-    }
+    };
+    top
 }
 
 /// Meld a sibling list starting at `first` into one detached root (the
@@ -269,46 +331,86 @@ unsafe fn merge_pairs(first: *mut DeadlineNode) -> *mut DeadlineNode
     {
         return core::ptr::null_mut();
     }
-    // SAFETY: as the contract states; each node is detached before meld.
-    unsafe {
-        // Pass 1: meld adjacent pairs, stacking the results through `next`
-        // (rightmost on top).
-        let mut stacked: *mut DeadlineNode = core::ptr::null_mut();
-        let mut cur = first;
-        while !cur.is_null()
-        {
-            let a = cur;
+    // Pass 1: meld adjacent pairs, stacking the results through `next`
+    // (rightmost on top).
+    let mut stacked: *mut DeadlineNode = core::ptr::null_mut();
+    let mut cur = first;
+    while !cur.is_null()
+    {
+        let a = cur;
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to a link of `a`, a node of the caller's list, valid by \
+                      the contract"
+        )]
+        // SAFETY: as the contract states: `a` is a node of the list.
+        let b = unsafe {
             let b = (*a).next;
             (*a).prev = core::ptr::null_mut();
             (*a).next = core::ptr::null_mut();
-            let pair = if b.is_null()
-            {
-                cur = core::ptr::null_mut();
-                a
-            }
-            else
-            {
+            b
+        };
+        let pair = if b.is_null()
+        {
+            cur = core::ptr::null_mut();
+            a
+        }
+        else
+        {
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every access is to a link of `b`, a node of the caller's list, valid \
+                          by the contract"
+            )]
+            // SAFETY: as the contract states: `b`, `a`'s right sibling, is a
+            // node of the list.
+            unsafe {
                 cur = (*b).next;
                 (*b).prev = core::ptr::null_mut();
                 (*b).next = core::ptr::null_mut();
-                meld(a, b)
-            };
-            (*pair).next = stacked;
-            stacked = pair;
-        }
-        // Pass 2: meld the stacked pairs right to left.
-        let mut root = stacked;
+            }
+            // SAFETY: `a` and `b` are valid, distinct (`b` is `a`'s right
+            // sibling) nodes of the list, each just detached (null `prev` and
+            // `next`).
+            unsafe { meld(a, b) }
+        };
+        // SAFETY: `pair` is `a` or the root `meld` returned, a node of the
+        // list (contract).
+        unsafe { (*pair).next = stacked };
+        stacked = pair;
+    }
+    // Pass 2: meld the stacked pairs right to left.
+    let mut root = stacked;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both accesses are to the `next` link of `root`, a node of the caller's list, \
+                  valid by the contract"
+    )]
+    // SAFETY: `first` is non-null, so pass 1 stacked at least one pair and
+    // `root` is a node of the list (contract).
+    unsafe {
         stacked = (*root).next;
         (*root).next = core::ptr::null_mut();
-        while !stacked.is_null()
-        {
-            let n = stacked;
+    }
+    while !stacked.is_null()
+    {
+        let n = stacked;
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "both accesses are to the `next` link of `n`, a node of the caller's list, \
+                      valid by the contract"
+        )]
+        // SAFETY: `n` is a stacked pair, a node of the list (contract).
+        unsafe {
             stacked = (*n).next;
             (*n).next = core::ptr::null_mut();
-            root = meld(root, n);
         }
-        root
+        // SAFETY: `root` and `n` are valid, distinct pair roots, each
+        // detached: pass 1 nulled every pair's `prev`, and its `next` is
+        // nulled above.
+        root = unsafe { meld(root, n) };
     }
+    root
 }
 
 #[cfg(test)]

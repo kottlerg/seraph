@@ -8,9 +8,12 @@
 //!
 //! When a device IRQ fires, the arch-specific interrupt handler calls
 //! [`dispatch_device_irq`] with the interrupt line number. This module masks
-//! the line at its controller (no further delivery until every receiver has
-//! acknowledged), marks every binding on the line as owing an acknowledgement,
-//! ORs notification bit 0 into each bound notification, and wakes its waiter.
+//! the line at its controller (the controller forwards no further interrupt of
+//! the line until every receiver has acknowledged), marks every binding on the
+//! line as owing an acknowledgement, ORs notification bit 0 into each bound
+//! notification, and wakes its waiter. An interrupt the controller forwarded
+//! before the mask took effect is delivered too, after this one, so a receiver
+//! can be signalled again before it acknowledges.
 //!
 //! Drivers bind a notification via `SYS_IRQ_REGISTER` and acknowledge via
 //! `SYS_IRQ_ACK` after handling.
@@ -840,8 +843,9 @@ pub fn next_target_cpu(eligible: impl Fn(usize) -> bool) -> Option<usize>
 /// interrupts disabled.
 ///
 /// Flow ([`deliver`]):
-/// 1. Mask the line at the controller (no further delivery until every
-///    receiver has acknowledged).
+/// 1. Mask the line at the controller (no further interrupt of the line is
+///    forwarded until every receiver has acknowledged; one forwarded before the
+///    mask took effect is delivered after this one).
 /// 2. Mark every bound binding as owing an acknowledgement.
 /// 3. OR notification bit 0 into each binding's notification and enqueue the
 ///    waiter it woke.
@@ -902,11 +906,11 @@ unsafe fn deliver(irq: u32, route: &IrqRoute)
     let bound = route.masks.bound();
     let mut cur = route.bindings.load(Ordering::SeqCst);
 
-    // Mask before delivering, so the line stays quiet until every receiver
-    // has acknowledged. With no binding the IRQ is dropped; it must still be
-    // acknowledged at the controller: without the EOI, the x86-64 local APIC
-    // keeps its vector in service, blocking every interrupt of its priority
-    // class and below.
+    // Mask before delivering, so the controller forwards no further interrupt
+    // of the line until every receiver has acknowledged. With no binding the
+    // IRQ is dropped; it must still be acknowledged at the controller: without
+    // the EOI, the x86-64 local APIC keeps its vector in service, blocking
+    // every interrupt of its priority class and below.
     crate::arch::current::interrupts::mask(irq);
     if !cur.is_null()
     {

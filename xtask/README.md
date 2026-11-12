@@ -1187,16 +1187,16 @@ themselves, from `src/host_lock.rs`, before they start: `build` and `clean` as b
 `run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port`
 and `test-gdb` as boots.
 
-A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 2 side by
+A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
 to itself, and so does a boot started with `--alone` or `--timing`.
 
 | Command | Admitted when | Load limit (1-minute average, below) |
 |---|---|---|
 | Build | No `--timing` boot runs | 32 (`BUILD_LOAD_MAX`) |
-| Small boot | No boot that needs the host to itself runs, no QEMU of more than 4 vCPUs runs, and the QEMUs running plus its own are at most 2 (`SMALL_BOOTS_MAX`) | 16 (`SMALL_BOOT_LOAD_MAX`) |
+| Small boot | No boot that needs the host to itself runs, no QEMU of more than 4 vCPUs runs, and the QEMUs running plus its own are at most 3 (`SMALL_BOOTS_MAX`) | 16 (`SMALL_BOOT_LOAD_MAX`) |
 | Small boot, `--alone` | No QEMU runs | 16 (`SMALL_BOOT_LOAD_MAX`) |
-| More than 4 vCPUs (`SMALL_BOOT_VCPUS_MAX`), more than 2 QEMUs, or `--timing` | No QEMU runs | 10 (`LARGE_BOOT_LOAD_MAX`) |
+| More than 4 vCPUs (`SMALL_BOOT_VCPUS_MAX`), more than 3 QEMUs, or `--timing` | No QEMU runs | 10 (`LARGE_BOOT_LOAD_MAX`) |
 
 While a boot that needs the host to itself runs, every other boot is refused, and while a
 `--timing` boot runs, every build is too. The QEMUs running are counted two ways, and the
@@ -1224,7 +1224,7 @@ The options:
 |---|---|---|
 | `--wait-host <SECS>` | Builds and boots | On a refusal, ask again every 10 s until admitted, for at most SECS; at the bound, fail with the last refusal. Without it a refusal fails at once. |
 | `--host-override` | Builds and boots | Start even when the rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers its record, so other commands see it. |
-| `--alone` | Boots | Run beside no other QEMU, and keep every other boot off the host: a run [docs/testing.md](../docs/testing.md) § Coverage tiers owes. |
+| `--alone` | Boots | Run beside no other QEMU, and keep every other boot off the host: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts (`.claude/agents/worker.md` § Host runs). |
 | `--timing` | Boots | A timing-sensitive measurement: beside no other QEMU, under the 10 load limit, with builds refused while it runs. |
 | `--grant <HOLDER>` | Boots | Boot under the exclusive grant of HOLDER. |
 

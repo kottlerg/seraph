@@ -233,22 +233,22 @@ before it starts, naming the load read and its limit or what is in the way. Stat
 the PR body's `## Validation` section reports, that its command was admitted. Tell the command
 what the run is:
 
-- A build (`cargo xtask build`, `cargo xtask clean`), and a boot of 4 vCPUs or fewer: no
-  option, and no grant. The command admits a build under a load of 32, and a boot under a load
-  of 16 with fewer than 2 QEMUs running and none of more than 4 vCPUs.
+- A build (`cargo xtask build`, `cargo xtask clean`), and a boot of 4 vCPUs or fewer, a run
+  docs/testing.md § Coverage tiers owes included: no option, and no grant. The command admits a
+  build under a load of 32, and a boot under a load of 16 with fewer than 3 QEMUs running and
+  none of more than 4 vCPUs.
 - A boot of more than 4 vCPUs, and any timing-sensitive measurement: the exclusive grant
   (orchestrated), passed as `--grant <holder>` with the holder the grant names, and `--timing`
   for a measurement. The command admits it only with no QEMU running and the load under 10.
-- A run docs/testing.md § Coverage tiers owes: `--alone`, which admits it only with no other
-  QEMU running, whatever its vCPU count, since its hang or failure blocks as that section says.
 
 `--host-override` is the maintainer's, for interactive use; a worker does not pass it. While the
 orchestrator holds the host for another worker's grant, launch no boot (the command refuses one
 not passed that grant), and during a timing-sensitive measurement no build either, until it says
 the grant ended: the command refuses a build only while a `--timing` boot runs, not between the
 holder's boots. Run one QEMU of your own at a time. A timeout or timing failure of a boot that ran
-beside another QEMU, and that § Coverage tiers does not owe, is re-run once alone before it
-counts.
+beside another QEMU, owed by § Coverage tiers or not, is re-run once with `--alone`, and the
+re-run's outcome is the one that counts (docs/testing.md § Coverage tiers, When the runs are
+owed); `--alone` admits the re-run only with no other QEMU running.
 
 A boot that fails, hangs, or shows a kill you did not expect is evidence. Before any re-run,
 copy its saved log, and its `.crash.txt` when there is one, to a name that says what it is (the

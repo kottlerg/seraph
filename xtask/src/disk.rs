@@ -75,6 +75,17 @@ impl BlockSize
         }
     }
 
+    /// Whole blocks in `bytes`, rounded down.
+    #[must_use]
+    pub fn blocks(self, bytes: u64) -> u64
+    {
+        match self
+        {
+            Self::B512 => bytes / 512,
+            Self::B4096 => bytes / 4096,
+        }
+    }
+
     fn gpt(self) -> gpt::disk::LogicalBlockSize
     {
         match self
@@ -141,20 +152,29 @@ struct Sources
 struct PartitionSlice
 {
     file: File,
+    /// Absolute file offset of the partition's first byte.
     offset: u64,
-    length: u64,
+    /// Absolute file offset one past the partition's last byte.
+    end: u64,
 }
 
 impl PartitionSlice
 {
     fn new(mut file: File, offset: u64, length: u64) -> io::Result<Self>
     {
+        let end = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "partition extends past u64")
+        })?;
         file.seek(SeekFrom::Start(offset))?;
-        Ok(PartitionSlice {
-            file,
-            offset,
-            length,
-        })
+        Ok(PartitionSlice { file, offset, end })
+    }
+
+    /// Bytes from the file position to the partition's end: zero at or past
+    /// it, capped at `usize::MAX`.
+    fn remaining(&mut self) -> io::Result<usize>
+    {
+        let pos = self.file.stream_position()?;
+        Ok(usize::try_from(self.end.saturating_sub(pos)).unwrap_or(usize::MAX))
     }
 }
 
@@ -162,14 +182,8 @@ impl Read for PartitionSlice
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>
     {
-        let pos = self.file.stream_position()?;
-        if pos >= self.offset + self.length
-        {
-            return Ok(0);
-        }
-        let remaining = usize::try_from(self.offset + self.length - pos).unwrap_or(usize::MAX);
-        let limit = buf.len().min(remaining);
-        self.file.read(&mut buf[..limit])
+        let limit = buf.len().min(self.remaining()?);
+        self.file.read(buf.get_mut(..limit).unwrap_or_default())
     }
 }
 
@@ -177,14 +191,8 @@ impl Write for PartitionSlice
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize>
     {
-        let pos = self.file.stream_position()?;
-        if pos >= self.offset + self.length
-        {
-            return Ok(0);
-        }
-        let remaining = usize::try_from(self.offset + self.length - pos).unwrap_or(usize::MAX);
-        let limit = buf.len().min(remaining);
-        self.file.write(&buf[..limit])
+        let limit = buf.len().min(self.remaining()?);
+        self.file.write(buf.get(..limit).unwrap_or_default())
     }
 
     fn flush(&mut self) -> io::Result<()>
@@ -195,48 +203,28 @@ impl Write for PartitionSlice
 
 impl Seek for PartitionSlice
 {
+    /// Seeks within the partition. A target before the partition's first
+    /// byte, or one `u64` cannot hold, is an error that leaves the position
+    /// unchanged.
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64>
     {
-        let abs = match pos
+        let target = match pos
         {
-            SeekFrom::Start(p) => self.offset + p,
-            SeekFrom::End(p) =>
-            {
-                let end = self.offset + self.length;
-                if p >= 0
-                {
-                    end + p.cast_unsigned()
-                }
-                else
-                {
-                    end.checked_sub((-p).cast_unsigned()).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "seek before start of partition",
-                        )
-                    })?
-                }
-            }
-            SeekFrom::Current(p) =>
-            {
-                let cur = self.file.stream_position()?;
-                if p >= 0
-                {
-                    cur + p.cast_unsigned()
-                }
-                else
-                {
-                    cur.checked_sub((-p).cast_unsigned()).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "seek before start of partition",
-                        )
-                    })?
-                }
-            }
+            SeekFrom::Start(p) => self.offset.checked_add(p),
+            SeekFrom::End(p) => self.end.checked_add_signed(p),
+            SeekFrom::Current(p) => self.file.stream_position()?.checked_add_signed(p),
+        };
+        let Some((abs, relative)) =
+            target.and_then(|abs| Some((abs, abs.checked_sub(self.offset)?)))
+        else
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek outside the partition",
+            ));
         };
         self.file.seek(SeekFrom::Start(abs))?;
-        Ok(abs - self.offset)
+        Ok(relative)
     }
 }
 
@@ -359,23 +347,28 @@ fn author_images(
 
 /// Start LBA of each of `volumes`, laid end to end after [`IMAGE_MARGIN`],
 /// and the image's total size in bytes (with the trailing margin).
-fn plan(volumes: &[Volume], block_size: BlockSize) -> (Vec<u64>, u64)
+fn plan(volumes: &[Volume], block_size: BlockSize) -> Result<(Vec<u64>, u64)>
 {
     let mut offset = IMAGE_MARGIN;
     let mut starts = Vec::with_capacity(volumes.len());
     for v in volumes
     {
-        starts.push(offset / block_size.bytes());
-        offset += v.bytes;
+        starts.push(block_size.blocks(offset));
+        offset = offset
+            .checked_add(v.bytes)
+            .context("disk image layout exceeds u64")?;
     }
-    (starts, offset + IMAGE_MARGIN)
+    let total = offset
+        .checked_add(IMAGE_MARGIN)
+        .context("disk image layout exceeds u64")?;
+    Ok((starts, total))
 }
 
 /// Write a zero-filled image at `path` holding `volumes` as GPT partitions
 /// 1, 2, … in order, each formatted FAT32 and populated from its source.
 fn write_image(path: &Path, block_size: BlockSize, volumes: &[Volume]) -> Result<()>
 {
-    let (starts, image_size) = plan(volumes, block_size);
+    let (starts, image_size) = plan(volumes, block_size)?;
     {
         let f = File::create(path)
             .with_context(|| format!("failed to create disk image {}", path.display()))?;
@@ -388,7 +381,9 @@ fn write_image(path: &Path, block_size: BlockSize, volumes: &[Volume]) -> Result
     {
         format_and_populate_partition(
             path,
-            start_lba * block_size.bytes(),
+            start_lba
+                .checked_mul(block_size.bytes())
+                .context("partition offset exceeds u64")?,
             volume.bytes,
             block_size,
             &volume.source,
@@ -407,7 +402,7 @@ pub fn logical_block_size(path: &Path) -> Result<u32>
 {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut head = Vec::new();
-    file.take(4096 + GPT_SIGNATURE.len() as u64)
+    file.take(4096u64.saturating_add(GPT_SIGNATURE.len() as u64))
         .read_to_end(&mut head)
         .with_context(|| format!("failed to read {}", path.display()))?;
     gpt_block_size(&head).with_context(|| {
@@ -436,7 +431,9 @@ fn gpt_block_size(head: &[u8]) -> Option<u32>
 {
     [512u32, 4096].into_iter().find(|&size| {
         usize::try_from(size).is_ok_and(|at| {
-            head.get(at..at + GPT_SIGNATURE.len()) == Some(GPT_SIGNATURE.as_slice())
+            at.checked_add(GPT_SIGNATURE.len())
+                .and_then(|to| head.get(at..to))
+                == Some(GPT_SIGNATURE.as_slice())
         })
     })
 }
@@ -494,8 +491,8 @@ fn write_gpt(
         .context("failed to open image for GPT")?;
 
     // Write protective MBR.
-    let total_lbas = image_size / block_size.bytes();
-    let mbr_size = u32::try_from(total_lbas - 1).unwrap_or(0xFFFF_FFFF);
+    let total_lbas = block_size.blocks(image_size);
+    let mbr_size = u32::try_from(total_lbas.saturating_sub(1)).unwrap_or(0xFFFF_FFFF);
     let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(mbr_size);
     mbr.overwrite_lba0(&mut file)
         .context("failed to write protective MBR")?;
@@ -515,7 +512,7 @@ fn write_gpt(
             volume.name,
             id,
             start_lba,
-            volume.bytes / block_size.bytes(),
+            block_size.blocks(volume.bytes),
             volume.type_guid.clone(),
             0,
         )
@@ -665,6 +662,36 @@ fn populate_dir<T: Read + Write + Seek>(
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn partition_slice_seeks_stay_inside_the_partition()
+    {
+        let scratch = Scratch::new("slice-seek");
+        let path = scratch.0.join("f.img");
+        fs::write(&path, [0u8; 32]).unwrap();
+        let open = || File::open(&path).unwrap();
+
+        // A partition whose end `u64` cannot hold is refused.
+        assert!(PartitionSlice::new(open(), 8, u64::MAX).is_err());
+
+        // Partition bytes 8..24 of the file.
+        let mut slice = PartitionSlice::new(open(), 8, 16).unwrap();
+        assert_eq!(slice.seek(SeekFrom::Start(4)).unwrap(), 4);
+        assert_eq!(slice.seek(SeekFrom::Current(-4)).unwrap(), 0);
+        assert_eq!(slice.seek(SeekFrom::End(-16)).unwrap(), 0);
+        assert_eq!(slice.seek(SeekFrom::End(0)).unwrap(), 16);
+
+        // Before the partition's first byte, though inside the file.
+        slice.seek(SeekFrom::Start(2)).unwrap();
+        assert!(slice.seek(SeekFrom::Current(-3)).is_err());
+        assert!(slice.seek(SeekFrom::End(-17)).is_err());
+        // A failed seek leaves the position unchanged.
+        assert_eq!(slice.stream_position().unwrap(), 2);
+
+        // Past what `u64` holds.
+        assert!(slice.seek(SeekFrom::Start(u64::MAX)).is_err());
+        assert_eq!(slice.stream_position().unwrap(), 2);
+    }
 
     /// A scratch directory unique to this process and `name`, removed on drop.
     struct Scratch(PathBuf);

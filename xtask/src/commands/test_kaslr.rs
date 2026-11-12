@@ -147,12 +147,13 @@ impl Guest
     }
 
     /// Echo serial lines until one contains `KASLR_MARKER`, parse it, and
-    /// return the layout.
-    fn scrape_layout(&mut self, deadline: Instant) -> Result<Layout>
+    /// return the layout; fail after `timeout`.
+    fn scrape_layout(&mut self, timeout: Duration) -> Result<Layout>
     {
+        let start = Instant::now();
         loop
         {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero()
             {
                 bail!("timed out waiting for the kaslr line");
@@ -225,7 +226,7 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
     let scrape = |label: &str| -> Result<Layout> {
         step(&format!("kaslr test: {label}"));
         let mut guest = Guest::launch(&qemu_binary, ctx, args, &code, vars_ref)?;
-        let res = guest.scrape_layout(Instant::now() + TIMEOUT);
+        let res = guest.scrape_layout(TIMEOUT);
         guest.shutdown();
         res.with_context(|| label.to_string())
     };

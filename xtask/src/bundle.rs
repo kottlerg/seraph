@@ -210,19 +210,28 @@ fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, PathBuf)]) -> 
 
     // Compute body offsets up front so the entry header table can be
     // written before the bodies themselves.
-    let header_table_len = (entries.len() * fmt::ENTRY_HEADER_SIZE) as u64;
+    let header_table_len = entries
+        .len()
+        .checked_mul(fmt::ENTRY_HEADER_SIZE)
+        .and_then(|len| u64::try_from(len).ok())
+        .context("compose-bundle: entry header table size overflows")?;
     let mut offsets: Vec<u64> = Vec::with_capacity(entries.len());
-    let mut cursor = fmt::HEADER_SIZE as u64 + header_table_len;
+    let mut cursor = (fmt::HEADER_SIZE as u64)
+        .checked_add(header_table_len)
+        .context("compose-bundle: bundle size overflows")?;
     let mut sizes: Vec<u64> = Vec::with_capacity(entries.len());
     for (_, path) in entries
     {
         let size = fs::metadata(path)
             .with_context(|| format!("compose-bundle: stat {}", path.display()))?
             .len();
-        cursor = align_up(cursor, fmt::BODY_ALIGNMENT);
+        cursor = align_up(cursor, fmt::BODY_ALIGNMENT)
+            .context("compose-bundle: bundle size overflows")?;
         offsets.push(cursor);
         sizes.push(size);
-        cursor += size;
+        cursor = cursor
+            .checked_add(size)
+            .context("compose-bundle: bundle size overflows")?;
     }
 
     // Entry header table.
@@ -230,14 +239,15 @@ fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, PathBuf)]) -> 
     {
         let mut name_buf = [0u8; fmt::ENTRY_NAME_LEN];
         let nb = name.as_bytes();
-        if nb.len() > fmt::ENTRY_NAME_LEN
+        let Some(name_dst) = name_buf.get_mut(..nb.len())
+        else
         {
             anyhow::bail!(
                 "compose-bundle: entry name `{name}` exceeds {} bytes",
                 fmt::ENTRY_NAME_LEN
             );
-        }
-        name_buf[..nb.len()].copy_from_slice(nb);
+        };
+        name_dst.copy_from_slice(nb);
         out_file
             .write_all(&name_buf)
             .context("compose-bundle: write entry name")?;
@@ -268,10 +278,13 @@ fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, PathBuf)]) -> 
     Ok(())
 }
 
-fn align_up(value: u64, alignment: u64) -> u64
+/// `value` rounded up to the power-of-two `alignment`, or `None` when the
+/// result exceeds `u64::MAX`.
+fn align_up(value: u64, alignment: u64) -> Option<u64>
 {
     debug_assert!(alignment.is_power_of_two());
-    (value + alignment - 1) & !(alignment - 1)
+    let mask = alignment.checked_sub(1)?;
+    Some(value.checked_add(mask)? & !mask)
 }
 
 #[cfg(test)]
@@ -280,6 +293,16 @@ mod tests
     use super::*;
     use boot_protocol::bundle as fmt;
     use std::io::Read;
+
+    /// Rounding up is exact within range and `None` past `u64::MAX`.
+    #[test]
+    fn align_up_reports_overflow()
+    {
+        assert_eq!(align_up(0, 4096), Some(0));
+        assert_eq!(align_up(1, 4096), Some(4096));
+        assert_eq!(align_up(4096, 4096), Some(4096));
+        assert_eq!(align_up(u64::MAX, 4096), None);
+    }
 
     /// Two-file round trip: write a bundle from two tiny "binary" files,
     /// parse it back via the shared format reader, and verify each

@@ -125,7 +125,7 @@ pub fn report(name: &str, diags: &[Diag], strictness: Strictness) -> Result<()>
         println!("{diag}");
     }
     let errors = diags.iter().filter(|d| d.level == Level::Error).count();
-    let warnings = diags.len() - errors;
+    let warnings = diags.iter().filter(|d| d.level == Level::Warning).count();
     println!("==> {name}: {errors} error(s), {warnings} warning(s)");
     if fails(diags, strictness)
     {

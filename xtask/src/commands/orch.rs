@@ -112,26 +112,7 @@ enum Change
 /// The UTC date of `secs` seconds after the Unix epoch, as `YYYY-MM-DD`.
 fn date(secs: u64) -> String
 {
-    // Days-to-civil conversion over the proleptic Gregorian calendar, with
-    // the year starting in March so that a leap day ends it.
-    let days = secs / 86_400 + 719_468;
-    let era = days / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_from_march = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
-    let month = if month_from_march < 10
-    {
-        month_from_march + 3
-    }
-    else
-    {
-        month_from_march - 9
-    };
-    let year = year_of_era + era * 400 + u64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
+    crate::timing::civil_date(secs / 86_400)
 }
 
 /// The UTC time of `secs` seconds after the Unix epoch, as
@@ -312,11 +293,12 @@ fn order_set(state: &mut Value, items: &[String]) -> Result<String>
 fn ruling_drop(state: &mut Value, number: usize) -> Result<String>
 {
     let rulings = list_mut(state, "rulings")?;
-    if number == 0 || number > rulings.len()
+    let Some(at) = number.checked_sub(1).filter(|at| *at < rulings.len())
+    else
     {
         bail!("no ruling has the number {number}");
-    }
-    let dropped = rulings.remove(number - 1);
+    };
+    let dropped = rulings.remove(at);
     Ok(format!(
         "ruling dropped: {}",
         dropped.as_str().unwrap_or_default()
@@ -474,10 +456,10 @@ fn render(state: &Value) -> String
     push_line(&mut out, &format!("merge order: {}", join_or_none(&order)));
     render_questions(state, &mut out);
     push_line(&mut out, "rulings:");
-    for (index, ruling) in entries(state, "rulings").enumerate()
+    for (number, ruling) in (1usize..).zip(entries(state, "rulings"))
     {
         let ruling = ruling.as_str().unwrap_or_default();
-        push_line(&mut out, &format!("  {}. {ruling}", index + 1));
+        push_line(&mut out, &format!("  {number}. {ruling}"));
     }
     out
 }

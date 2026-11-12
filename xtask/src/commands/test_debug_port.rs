@@ -227,16 +227,16 @@ impl Link
         let len = w
             .finish()
             .map_err(|e| anyhow::anyhow!("packet past the buffer: {e:?}"))?;
-        self.send(&buf[..len])
+        self.send(buf.get(..len).context("packet length past the buffer")?)
     }
 
     /// Read until the next event; fail on any other than `want`. Returns a
     /// packet's body.
     fn expect(&mut self, want: &Expect, what: &str) -> Result<Vec<u8>>
     {
-        let deadline = Instant::now() + ANSWER_TIMEOUT;
+        let start = Instant::now();
         let mut byte = [0u8; 1];
-        while Instant::now() < deadline
+        while start.elapsed() < ANSWER_TIMEOUT
         {
             let n = self
                 .stream
@@ -312,7 +312,7 @@ fn exchange(link: &mut Link) -> Result<()>
     let echoed = link.expect(&Expect::Packet, "the echo")?;
     let mut out = vec![0u8; echoed.len()];
     let n = unescape(&echoed, &mut out).map_err(|e| anyhow::anyhow!("echo: {e:?}"))?;
-    if out[..n] != data[..]
+    if out.get(..n) != Some(data.as_slice())
     {
         bail!("the echo differs from the {} bytes sent", data.len());
     }

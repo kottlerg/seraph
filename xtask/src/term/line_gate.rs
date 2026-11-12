@@ -103,8 +103,10 @@ impl<W: Write> Write for LineGate<W>
             return self.inner.write_all(buf).map(|()| buf.len());
         }
 
-        for (i, &b) in buf.iter().enumerate()
+        let mut unread = buf;
+        while let Some((&b, rest)) = unread.split_first()
         {
+            unread = rest;
             self.line.push(b);
             let at_cap = self.line.len() >= MAX_LINE_BYTES;
             if b != b'\n' && !at_cap
@@ -120,7 +122,6 @@ impl<W: Write> Write for LineGate<W>
                 self.inner.write_all(&self.line)?;
                 self.line.clear();
                 self.opened = true;
-                let rest = &buf[i + 1..];
                 if !rest.is_empty()
                 {
                     self.inner.write_all(rest)?;

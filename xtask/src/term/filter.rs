@@ -248,7 +248,7 @@ impl<W: Write> Write for FilterWriter<W>
                     {
                         if let Some(start) = ground_start.take()
                         {
-                            self.inner.write_all(&buf[start..i])?;
+                            self.inner.write_all(ground_run(buf, start..i)?)?;
                         }
                         self.state = State::Esc;
                         let buffered = self.push_pending(b);
@@ -320,7 +320,7 @@ impl<W: Write> Write for FilterWriter<W>
 
         if let Some(start) = ground_start
         {
-            self.inner.write_all(&buf[start..])?;
+            self.inner.write_all(ground_run(buf, start..buf.len())?)?;
         }
         Ok(buf.len())
     }
@@ -335,19 +335,23 @@ impl<W: Write> Write for FilterWriter<W>
     }
 }
 
+/// The bytes of `buf` in `range`, which a write's ground run always lies
+/// within.
+fn ground_run(buf: &[u8], range: std::ops::Range<usize>) -> io::Result<&[u8]>
+{
+    buf.get(range)
+        .ok_or_else(|| io::Error::other("ground run outside the write buffer"))
+}
+
 /// Decide whether a completed escape sequence should be dropped.
 /// `seq` always begins with `ESC` (`0x1b`).
 fn should_drop(seq: &[u8]) -> bool
 {
-    if seq.len() < 2
+    match seq
     {
-        return false;
-    }
-    match seq[1]
-    {
-        b'c' => true,
-        b'[' => csi_should_drop(&seq[2..]),
-        b']' => osc_should_drop(&seq[2..]),
+        [_, b'c', ..] => true,
+        [_, b'[', body @ ..] => csi_should_drop(body),
+        [_, b']', body @ ..] => osc_should_drop(body),
         _ => false,
     }
 }
@@ -362,10 +366,10 @@ fn csi_should_drop(body: &[u8]) -> bool
         return false;
     };
 
-    match final_byte
+    match (final_byte, params)
     {
-        b't' => true,
-        b'h' | b'l' if params.first() == Some(&b'?') => any_blocklisted_dec_mode(&params[1..]),
+        (b't', _) => true,
+        (b'h' | b'l', [b'?', modes @ ..]) => any_blocklisted_dec_mode(modes),
         _ => false,
     }
 }
@@ -414,16 +418,11 @@ fn is_blocklisted_dec_mode(n: u32) -> bool
 /// `body` includes the terminator (BEL or `ESC \`) at the end.
 fn osc_should_drop(body: &[u8]) -> bool
 {
-    let trim_end = body
-        .iter()
-        .position(|&b| b == 0x07 || b == 0x1b)
-        .unwrap_or(body.len());
-    let trimmed = &body[..trim_end];
-    let semi = trimmed
-        .iter()
-        .position(|&b| b == b';')
-        .unwrap_or(trimmed.len());
-    let prefix = &trimmed[..semi];
+    let trimmed = body
+        .split(|&b| b == 0x07 || b == 0x1b)
+        .next()
+        .unwrap_or_default();
+    let prefix = trimmed.split(|&b| b == b';').next().unwrap_or_default();
     // OSC 0 = icon + window title, 1 = icon title, 2 = window title.
     matches!(prefix, b"0" | b"1" | b"2")
 }

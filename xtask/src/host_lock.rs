@@ -268,7 +268,7 @@ fn decide_boot(
             ));
         }
     }
-    else if running + qemus > SMALL_BOOTS_MAX
+    else if running.saturating_add(qemus) > SMALL_BOOTS_MAX
     {
         return Err(format!(
             "{running} QEMU(s) running; {qemus} more would pass the {SMALL_BOOTS_MAX} small \
@@ -288,7 +288,7 @@ pub fn qemu_vcpus(argv: &[String]) -> u32
     let Some(value) = argv
         .iter()
         .position(|a| a == "-smp")
-        .and_then(|i| argv.get(i + 1))
+        .and_then(|i| argv.get(i.saturating_add(1)))
     else
     {
         return 1;

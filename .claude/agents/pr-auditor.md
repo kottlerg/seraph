@@ -198,14 +198,14 @@ claims.
    `## Validation` MUST report each owed run with its `--runs` count, its
    outcome, and the head it ran at, and the PR's own non-inert changes to
    that run's surface MUST be the same at that head and at the PR head; or,
-   when none is owed, the body MUST say so and why. FAIL when an owed run is
+   when none is owed, the body MUST say so and why. Of every run the body
+   reports, owed or not, judge the outcome that stands: a `QEMU-CRASH` run is
+   replaced by its re-run, and a run that ran beside another QEMU and HANGs
+   or fails a timing check by its re-run alone. FAIL when an owed run is
    missing, its `--runs` count is not stated, its head is
    absent or does not cover the PR head, or its outcome is missing or is
-   anything other than `PASS` (a `QEMU-CRASH` run is replaced by its re-run,
-   whose outcome stands, and so is a run that ran beside another QEMU and
-   HANGs or fails a timing check, by its re-run alone); when a "none owed"
-   statement is absent or contradicted by the PR's own diff or a stated
-   concurrency-fix purpose;
+   anything other than `PASS`; when a "none owed" statement is absent or
+   contradicted by the PR's own diff or a stated concurrency-fix purpose;
    and, for a run the body reports that the PR does not owe, when it is a
    memory variation or a device cell that HANGs or fails, or a boundary run that HANGs or
    fails and the body gives no link to its record on the open Issue for that

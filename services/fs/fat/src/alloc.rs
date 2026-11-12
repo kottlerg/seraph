@@ -79,10 +79,14 @@ const FSI_TRAIL_SIG: u32 = 0xAA55_0000;
 /// cluster number for FAT16, masked to 28 bits for FAT32) through the
 /// driver's one-sector FAT cache (`cached_fat_sector`).
 ///
+/// The caller bounds `cluster` to the data region
+/// ([`FatState::is_data_cluster`]): the function does not, and reads the
+/// bytes past the FAT as the entry of a cluster beyond it.
+///
 /// # Errors
 /// [`FatError::Io`] when the FAT sector cannot be read;
-/// [`FatError::Corrupt`] when `cluster` lies past the data region, whose
-/// entry the FAT lacks.
+/// [`FatError::Corrupt`] when the entry's location overflows `u32` or the
+/// entry lies past its sector.
 pub fn read_fat_entry(
     state: &mut FatState,
     cluster: u32,

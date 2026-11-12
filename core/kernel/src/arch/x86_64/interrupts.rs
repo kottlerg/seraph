@@ -808,6 +808,9 @@ fn remap() -> crate::irq::Remap
 ///
 /// # Errors
 /// None on x86-64.
+// unnecessary_wraps: the Result is the cross-arch contract `irq::set_remap`
+// calls; riscv64's implementation returns `NotSupported`.
+#[allow(clippy::unnecessary_wraps)]
 #[cfg(not(test))]
 pub fn set_remap(remap: crate::irq::Remap) -> Result<(), crate::irq::RemapError>
 {
@@ -888,6 +891,9 @@ pub fn remap_entry(target: crate::irq::Target) -> Result<u64, crate::irq::RemapE
 ///
 /// # Errors
 /// None on x86-64.
+// unnecessary_wraps: the Result is the cross-arch contract `SYS_CAP_INFO`
+// calls; riscv64's implementation returns `NotSupported`.
+#[allow(clippy::unnecessary_wraps)]
 #[cfg(not(test))]
 pub fn remap_handles() -> Result<u64, crate::irq::RemapError>
 {

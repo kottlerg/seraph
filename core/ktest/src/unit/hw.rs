@@ -6,8 +6,9 @@
 //! Tier 1 tests for hardware access syscalls.
 //!
 //! Covers: `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER`,
-//! `SYS_IRQ_ACK`, `SYS_IRQ_SPLIT`, `SYS_IRQ_MSG_ALLOC` and the message
-//! selectors of `SYS_CAP_INFO`. The per-architecture `SYS_IOPORT_BIND`,
+//! `SYS_IRQ_ACK`, `SYS_IRQ_SPLIT`, `SYS_IRQ_MSG_ALLOC`, `SYS_IRQ_ROUTE`,
+//! `SYS_IRQ_REMAP`, and the message and remapping selectors of
+//! `SYS_CAP_INFO`. The per-architecture `SYS_IOPORT_BIND`,
 //! `SYS_IOPORT_SPLIT`, and `SYS_SBI_CALL` tests live behind `crate::arch`.
 //!
 //! Tests that require specific hardware capability types (`Mmio`, Interrupt,
@@ -16,8 +17,8 @@
 //! Skips are logged to serial so they are visible in the test run output.
 
 use syscall::{
-    aspace_query, cap_create_notification, irq_ack, irq_msg_alloc, irq_register, irq_split,
-    mem_unmap, mmio_split,
+    aspace_query, cap_create_notification, irq_ack, irq_msg_alloc, irq_register, irq_remap,
+    irq_route, irq_split, mem_unmap, mmio_split,
 };
 use syscall_abi::{CAP_INFO_IRQ_MSG_ADDRESS, CAP_INFO_IRQ_MSG_DATA, SyscallError};
 
@@ -100,10 +101,10 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
 
 /// `irq_register` binds a notification to an interrupt; `irq_ack` re-enables delivery.
 ///
-/// Scans for the first Interrupt capability that binds, through a derived copy
-/// of each slot, so the binding goes with the copy's delete (a binding holds
-/// its notification until its Interrupt capability goes). Creates a
-/// notification for delivery. After registration, ACKs to re-enable the
+/// Scans for the first Interrupt capability that routes and binds, through a
+/// derived copy of each slot, so the route and the binding go with the copy's
+/// delete (a binding holds its notification until its Interrupt capability
+/// goes). Creates a notification for delivery. After registration, ACKs to re-enable the
 /// interrupt line. If no Interrupt cap binds, the test is skipped.
 pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 {
@@ -122,7 +123,7 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
         {
             continue;
         };
-        if irq_register(copy, irq_sig, 0).is_ok()
+        if irq_route(copy, 0).is_ok() && irq_register(copy, irq_sig, 0).is_ok()
         {
             let acked = irq_ack(copy).map_err(|_| "irq_ack failed");
             syscall::cap_delete(copy).map_err(|_| "cap_delete of the bound copy failed")?;
@@ -134,6 +135,193 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 
     crate::log("ktest: hw::irq_register_ack SKIP (no Interrupt caps in initial cap set)");
     syscall::cap_delete(irq_sig).ok();
+    Ok(())
+}
+
+// ── SYS_IRQ_ROUTE ────────────────────────────────────────────────────────────
+
+/// `irq_route` routes a line through a single-line cap carrying
+/// `RIGHTS_IRQ_MINT`, which then holds the route: `irq_register` refuses the
+/// line before it (`InvalidState`) and in another mode after it; a second
+/// route through the same cap, or through another holder in the same mode,
+/// succeeds, and one in another mode is refused; the route outlives the last
+/// binding while a holder remains, and is released once neither a holder nor
+/// a binding remains, after which the line routes in another mode. A range
+/// cap and a cap without `RIGHTS_IRQ_MINT` are refused.
+pub fn irq_route_holds_the_line(ctx: &TestContext) -> TestResult
+{
+    let id = crate::arch::ROUTABLE_HIGH_IRQ_IDS[0];
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "hw::irq_route_holds_the_line: cap_create_notification failed")?;
+    let single = isolate_irq_id(ctx, id);
+    let result = single
+        .ok_or("hw::irq_route_holds_the_line: cannot isolate the id")
+        .and_then(|single| route_holds(ctx, id, single, sig));
+    if let Some(single) = single
+    {
+        syscall::cap_delete(single).ok();
+    }
+    syscall::cap_delete(sig).ok();
+    result?;
+    // Neither a holder nor a binding remains: the line is released.
+    let fresh = isolate_irq_id(ctx, id).ok_or("hw::irq_route_holds_the_line: re-isolate failed")?;
+    let rerouted = irq_route(fresh, syscall_abi::IRQ_MODE_LEVEL);
+    syscall::cap_delete(fresh).ok();
+    rerouted.map_err(|_| "hw::irq_route_holds_the_line: the line was not released")?;
+    let range = msg_authority(ctx)?;
+    let ranged = irq_route(range, 0);
+    syscall::cap_delete(range).ok();
+    if ranged != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("hw::irq_route_holds_the_line: a range cap was routed");
+    }
+    Ok(())
+}
+
+/// The checks of [`irq_route_holds_the_line`] on `single`, the cap of line
+/// `id`, with notification `sig`, up to the release; leaves `single`
+/// holding the route, and deletes every other cap it makes.
+fn route_holds(ctx: &TestContext, id: u32, single: u64, sig: u64) -> TestResult
+{
+    if irq_register(single, sig, 0) != Err(SyscallError::InvalidState as i64)
+    {
+        return Err("hw::irq_route_holds_the_line: an unrouted line was bound");
+    }
+    let notify_only = syscall::cap_derive(single, syscall::RIGHTS_IRQ_NOTIFY)
+        .map_err(|_| "hw::irq_route_holds_the_line: cap_derive failed")?;
+    let refused = irq_route(notify_only, 0);
+    syscall::cap_delete(notify_only).ok();
+    if refused != Err(SyscallError::InsufficientRights as i64)
+    {
+        return Err("hw::irq_route_holds_the_line: routed without RIGHTS_IRQ_MINT");
+    }
+    if irq_route(single, syscall_abi::IRQ_MODE_MASK + 1)
+        != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("hw::irq_route_holds_the_line: a mode outside IRQ_MODE_MASK was taken");
+    }
+    irq_route(single, 0).map_err(|_| "hw::irq_route_holds_the_line: route refused")?;
+    irq_route(single, 0).map_err(|_| "hw::irq_route_holds_the_line: repeat route refused")?;
+    if irq_route(single, syscall_abi::IRQ_MODE_LEVEL) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("hw::irq_route_holds_the_line: a route in another mode was taken");
+    }
+    let holder = syscall::cap_derive(single, syscall::RIGHTS_ALL)
+        .map_err(|_| "hw::irq_route_holds_the_line: cap_derive failed")?;
+    let checked = holder_checks(single, holder, sig);
+    syscall::cap_delete(holder).ok();
+    checked?;
+    // `single` still holds the route: the line stays routed in mode 0.
+    let fresh = isolate_irq_id(ctx, id).ok_or("hw::irq_route_holds_the_line: re-isolate failed")?;
+    let held = irq_route(fresh, syscall_abi::IRQ_MODE_LEVEL);
+    syscall::cap_delete(fresh).ok();
+    if held != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("hw::irq_route_holds_the_line: the route went with a holder left");
+    }
+    Ok(())
+}
+
+/// The checks of [`irq_route_holds_the_line`] with `holder`, a second
+/// derivation of the routed `single`: it becomes a holder; a binding in
+/// another mode is refused and one in the route's is taken; and once that
+/// binding's cap is gone the holders keep the route, so a new binding is
+/// taken. Deletes every cap it makes.
+fn holder_checks(single: u64, holder: u64, sig: u64) -> TestResult
+{
+    irq_route(holder, 0).map_err(|_| "hw::irq_route_holds_the_line: a second holder refused")?;
+    let bound = syscall::cap_derive(single, syscall::RIGHTS_IRQ_NOTIFY)
+        .map_err(|_| "hw::irq_route_holds_the_line: cap_derive failed")?;
+    let other_mode = irq_register(bound, sig, syscall_abi::IRQ_MODE_LEVEL);
+    let registered = irq_register(bound, sig, 0).and_then(|()| irq_ack(bound));
+    syscall::cap_delete(bound).ok();
+    if other_mode != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("hw::irq_route_holds_the_line: bound in another mode than the route's");
+    }
+    registered.map_err(|_| "hw::irq_route_holds_the_line: bind on the routed line refused")?;
+    let rebound = syscall::cap_derive(single, syscall::RIGHTS_IRQ_NOTIFY)
+        .map_err(|_| "hw::irq_route_holds_the_line: cap_derive failed")?;
+    let kept = irq_register(rebound, sig, 0);
+    syscall::cap_delete(rebound).ok();
+    kept.map_err(|_| "hw::irq_route_holds_the_line: the route went with the last binding")?;
+    Ok(())
+}
+
+// ── SYS_IRQ_REMAP ────────────────────────────────────────────────────────────
+
+/// `irq_remap` and the remapping selectors of `SYS_CAP_INFO`: on riscv64,
+/// which has no interrupt remapping the kernel programs, each is
+/// `NotSupported`. On x86-64, the switch is refused without
+/// `RIGHTS_IRQ_MINT`, for an unknown setting, and while a line is routed
+/// (`InvalidState`); a routed line has no remapping entry with remapping off
+/// (`InvalidState`); and the handle count covers at least one CPU's device
+/// vectors. Remapping is never turned on: with no IOMMU remapping ktest's
+/// interrupts, the remappable formats would deliver none.
+pub fn irq_remap_refusals(ctx: &TestContext) -> TestResult
+{
+    let authority = msg_authority(ctx)?;
+    let line = isolate_irq_id(ctx, crate::arch::ROUTABLE_HIGH_IRQ_IDS[0]);
+    let result = line
+        .ok_or("hw::irq_remap_refusals: cannot isolate a line")
+        .and_then(|line| remap_refusals(authority, line));
+    if let Some(line) = line
+    {
+        syscall::cap_delete(line).ok();
+    }
+    syscall::cap_delete(authority).ok();
+    result
+}
+
+/// The checks of [`irq_remap_refusals`] through `authority` and the line cap
+/// `line`, which it routes.
+fn remap_refusals(authority: u64, line: u64) -> TestResult
+{
+    let handles = syscall::cap_info(authority, syscall_abi::CAP_INFO_IRQ_REMAP_HANDLES);
+    if cfg!(target_arch = "riscv64")
+    {
+        let not_supported = SyscallError::NotSupported as i64;
+        if irq_remap(authority, syscall_abi::IRQ_REMAP_ON) != Err(not_supported)
+            || handles != Err(not_supported)
+        {
+            return Err("hw::irq_remap_refusals: riscv64 took interrupt remapping");
+        }
+        irq_route(line, 0).map_err(|_| "hw::irq_remap_refusals: route refused")?;
+        if syscall::cap_info(line, syscall_abi::CAP_INFO_IRQ_REMAP_ENTRY) != Err(not_supported)
+        {
+            return Err("hw::irq_remap_refusals: riscv64 reported a remapping entry");
+        }
+        return Ok(());
+    }
+    let handles = handles.map_err(|_| "hw::irq_remap_refusals: no handle count")?;
+    // One CPU's device vectors, 33 to 249.
+    if handles < 217
+    {
+        return Err("hw::irq_remap_refusals: handle count below one CPU's device vectors");
+    }
+    if irq_remap(authority, syscall_abi::IRQ_REMAP_ON_EXTENDED + 1)
+        != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("hw::irq_remap_refusals: an unknown setting was taken");
+    }
+    let notify_only = syscall::cap_derive(authority, syscall::RIGHTS_IRQ_NOTIFY)
+        .map_err(|_| "hw::irq_remap_refusals: cap_derive failed")?;
+    let refused = irq_remap(notify_only, syscall_abi::IRQ_REMAP_ON);
+    syscall::cap_delete(notify_only).ok();
+    if refused != Err(SyscallError::InsufficientRights as i64)
+    {
+        return Err("hw::irq_remap_refusals: switched without RIGHTS_IRQ_MINT");
+    }
+    irq_route(line, 0).map_err(|_| "hw::irq_remap_refusals: route refused")?;
+    if irq_remap(authority, syscall_abi::IRQ_REMAP_ON) != Err(SyscallError::InvalidState as i64)
+    {
+        return Err("hw::irq_remap_refusals: switched while a line is routed");
+    }
+    if syscall::cap_info(line, syscall_abi::CAP_INFO_IRQ_REMAP_ENTRY)
+        != Err(SyscallError::InvalidState as i64)
+    {
+        return Err("hw::irq_remap_refusals: a remapping entry with remapping off");
+    }
     Ok(())
 }
 
@@ -223,13 +411,13 @@ pub fn irq_register_high_id(ctx: &TestContext) -> TestResult
     result
 }
 
-/// Isolate `id`, register `irq_sig` on it, acknowledge it, and delete the cap,
-/// which clears the route.
+/// Isolate `id`, route it, register `irq_sig` on it, acknowledge it, and
+/// delete the cap, which releases the route.
 fn route_high_id(ctx: &TestContext, id: u32, irq_sig: u64) -> TestResult
 {
     let single =
         isolate_irq_id(ctx, id).ok_or("hw::irq_register_high_id: cannot isolate the id")?;
-    let registered = irq_register(single, irq_sig, 0);
+    let registered = irq_route(single, 0).and_then(|()| irq_register(single, irq_sig, 0));
     let acked = registered.and_then(|()| irq_ack(single));
     let deleted = syscall::cap_delete(single);
     registered.map_err(|_| "hw::irq_register_high_id: routable id refused")?;
@@ -237,17 +425,19 @@ fn route_high_id(ctx: &TestContext, id: u32, irq_sig: u64) -> TestResult
     deleted.map_err(|_| "hw::irq_register_high_id: cap_delete of the id failed")
 }
 
-/// Isolate `id` and check `irq_register` refuses it with `InvalidArgument`
-/// and that deleting its cap succeeds.
+/// Isolate `id` and check `irq_route` and `irq_register` refuse it with
+/// `InvalidArgument` and that deleting its cap succeeds.
 fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u64) -> TestResult
 {
     let single = isolate_irq_id(ctx, id)
         .ok_or("hw::irq_register_unroutable_id_err: cannot isolate the id")?;
+    let routed = irq_route(single, 0);
     let err = irq_register(single, irq_sig, 0);
     // Deleting the cap must not touch the routing table for an id it cannot
     // index (the kernel panicked here before the teardown guard).
     let deleted = syscall::cap_delete(single);
     if err != Err(SyscallError::InvalidArgument as i64)
+        || routed != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("hw::irq_register_unroutable_id_err: unroutable id not refused");
     }
@@ -591,14 +781,10 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
 {
     let (mint_limit, donation_limit) = msg_exhaustion_bounds()?;
     let authority = msg_authority(ctx)?;
-    // The line and the notification are made before the mints fill the
-    // `CSpace`.
+    // The line is carved before the mints fill the `CSpace`.
     let line = isolate_irq_id(ctx, crate::arch::ROUTABLE_HIGH_IRQ_IDS[0]);
-    let sig = cap_create_notification(ctx.memory_base);
     let result = (|| -> TestResult {
         let line = line.ok_or("hw::irq_msg_exhaustion_and_reuse: cannot isolate a line")?;
-        let sig =
-            sig.map_err(|_| "hw::irq_msg_exhaustion_and_reuse: cap_create_notification failed")?;
         let mut last = 0;
         let mut minted = 0;
         let mut donated = 0;
@@ -633,7 +819,7 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
             "ktest: hw::irq_msg_exhaustion_and_reuse targets minted=",
             minted,
         );
-        if irq_register(line, sig, 0) != Err(SyscallError::QuotaExceeded as i64)
+        if irq_route(line, 0) != Err(SyscallError::QuotaExceeded as i64)
         {
             return Err("hw::irq_msg_exhaustion_and_reuse: mints stopped while a slot was free");
         }
@@ -660,10 +846,6 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
     if let Some(line) = line
     {
         syscall::cap_delete(line).ok();
-    }
-    if let Ok(sig) = sig
-    {
-        syscall::cap_delete(sig).ok();
     }
     syscall::cap_revoke(authority).ok();
     syscall::cap_delete(authority).ok();

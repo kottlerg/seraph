@@ -35,7 +35,10 @@ pub const HANDLE_COUNT: usize = 1 << 16;
 /// target, and no others.
 pub const REMAP_CPU_LIMIT: usize = HANDLE_COUNT / DEVICE_VECTOR_COUNT;
 
-const _: () = assert!(REMAP_CPU_LIMIT > 0, "a CPU's device vectors need a handle each");
+const _: () = assert!(
+    REMAP_CPU_LIMIT > 0,
+    "a CPU's device vectors need a handle each"
+);
 const _: () = assert!(
     REMAP_CPU_LIMIT * DEVICE_VECTOR_COUNT <= HANDLE_COUNT,
     "every handle of the eligible CPUs fits the 16-bit index"
@@ -124,15 +127,16 @@ pub const fn message_address(handle: u16) -> u64
 pub const fn redirection(handle: u16, compatibility_low: u32) -> (u32, u32)
 {
     let low = compatibility_low | (((handle >> 15) as u32) << ENTRY_LOW_HANDLE_15_SHIFT);
-    let high = ((handle as u32 & HANDLE_LOW_MASK) << ENTRY_HIGH_HANDLE_SHIFT) | ENTRY_HIGH_REMAPPABLE;
+    let high =
+        ((handle as u32 & HANDLE_LOW_MASK) << ENTRY_HIGH_HANDLE_SHIFT) | ENTRY_HIGH_REMAPPABLE;
     (low, high)
 }
 
 #[cfg(test)]
 mod tests
 {
-    use super::*;
     use super::super::ioapic::DEVICE_VECTOR_LAST;
+    use super::*;
 
     #[test]
     fn the_cpu_limit_fills_the_16_bit_index()
@@ -149,7 +153,10 @@ mod tests
         assert_eq!(handle(0, DEVICE_VECTOR_LAST), Some(216));
         assert_eq!(handle(1, DEVICE_VECTOR_BASE), Some(217));
         assert_eq!(handle(3, DEVICE_VECTOR_BASE + 10), Some(3 * 217 + 10));
-        assert_eq!(handle(REMAP_CPU_LIMIT - 1, DEVICE_VECTOR_LAST), Some(65_533));
+        assert_eq!(
+            handle(REMAP_CPU_LIMIT - 1, DEVICE_VECTOR_LAST),
+            Some(65_533)
+        );
     }
 
     #[test]

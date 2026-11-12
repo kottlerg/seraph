@@ -116,7 +116,8 @@ const ADDRESS_REMAPPABLE: u64 = 1 << 4;
 /// format bit, the subhandle-valid bit, and handle bit 15 in bit 2. The
 /// kernel gives no target that handle, so no remapping table holds it.
 #[cfg(target_arch = "x86_64")]
-const FORGED_REMAPPABLE: u64 = 0xFEE0_0000 | (0x7FFF << 5) | ADDRESS_REMAPPABLE | (1 << 3) | (1 << 2);
+const FORGED_REMAPPABLE: u64 =
+    0xFEE0_0000 | (0x7FFF << 5) | ADDRESS_REMAPPABLE | (1 << 3) | (1 << 2);
 /// How long one transfer may take: the device starts a transfer on a 100 ms
 /// timer, so a transfer that has not completed in 2 s never will.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
@@ -427,8 +428,6 @@ struct Forge
 {
     /// Whether an IOMMU confines the device.
     confined: bool,
-    /// Whether the forged write was made.
-    made: bool,
     /// Whether the device's write of the fixture's own message reached its
     /// notification.
     own_delivered: bool,
@@ -436,7 +435,7 @@ struct Forge
     forged_delivered: bool,
     /// The fixture's own message address.
     address: u64,
-    /// The forged message address.
+    /// The forged message address; 0 when the forged write was not made.
     forged: u64,
     /// The IOMMU faults devmgr has taken for the device, and the IOVA of the
     /// latest.
@@ -456,7 +455,9 @@ impl Driver
     fn msi_forge(&self, ipc_buf: *mut u64) -> Option<Forge>
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let confined = unsafe { ipc::dma_faults(self.dma_ep, ipc_buf) }.ok()?.confined;
+        let confined = unsafe { ipc::dma_faults(self.dma_ep, ipc_buf) }
+            .ok()?
+            .confined;
         let skipped = Forge {
             confined,
             ..Forge::default()
@@ -491,7 +492,6 @@ impl Driver
         };
         Some(Forge {
             confined,
-            made: true,
             own_delivered,
             forged_delivered,
             address,
@@ -511,7 +511,12 @@ impl Driver
         unsafe { core::ptr::write_volatile(va as *mut u32, data.to_le()) };
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let iova = unsafe {
-            virtio_core::dma::map(self.dma_ep, cap, virtio_core::dma::DEVICE_READS_WRITES, ipc_buf)
+            virtio_core::dma::map(
+                self.dma_ep,
+                cap,
+                virtio_core::dma::DEVICE_READS_WRITES,
+                ipc_buf,
+            )
         }
         .ok()?;
         let staged = iova + PAGE_SIZE <= DMA_REACH
@@ -709,6 +714,45 @@ fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Option<ListedIr
     (eps.dma != 0 && eps.service != 0).then_some((cap, pages, irq, eps))
 }
 
+/// The reply to `MSI_FORGE` from the probe's findings, logged;
+/// `INVALID_REQUEST` when the probe's setup failed.
+fn forge_reply(forge: Option<Forge>) -> IpcMessage
+{
+    let Some(f) = forge
+    else
+    {
+        return IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+    };
+    let made = f.forged != 0;
+    std::os::seraph::log!(
+        "test-dma: forged-message probe made={}, own message at {:#x} delivered={}, forged at {:#x} delivered={}, faults={}",
+        made,
+        f.address,
+        f.own_delivered,
+        f.forged,
+        f.forged_delivered,
+        f.faults
+    );
+    let confined = if f.confined
+    {
+        ipc::devmgr_dma_labels::DMA_CONFINED
+    }
+    else
+    {
+        0
+    };
+    IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+        .word(0, confined)
+        .word(1, u64::from(made))
+        .word(2, u64::from(f.own_delivered))
+        .word(3, u64::from(f.forged_delivered))
+        .word(4, f.address)
+        .word(5, f.forged)
+        .word(6, f.faults)
+        .word(7, f.last_fault)
+        .build()
+}
+
 /// Answer `INTERRUPT_PROBE`, `INTERRUPT_CHURN`, `DMA_PROBE` and `MSI_FORGE` until a
 /// `FIXTURE_EXIT`, then exit.
 fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
@@ -762,40 +806,7 @@ fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
                     .build()
             }
             test_dma_labels::FIXTURE_EXIT => IpcMessage::new(ipc::devmgr_errors::SUCCESS),
-            test_dma_labels::MSI_FORGE => match driver.msi_forge(ipc_buf)
-            {
-                Some(f) =>
-                {
-                    std::os::seraph::log!(
-                        "test-dma: forged-message probe made={}, own message at {:#x} delivered={}, forged at {:#x} delivered={}, faults={}",
-                        f.made,
-                        f.address,
-                        f.own_delivered,
-                        f.forged,
-                        f.forged_delivered,
-                        f.faults
-                    );
-                    let confined = if f.confined
-                    {
-                        ipc::devmgr_dma_labels::DMA_CONFINED
-                    }
-                    else
-                    {
-                        0
-                    };
-                    IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-                        .word(0, confined)
-                        .word(1, u64::from(f.made))
-                        .word(2, u64::from(f.own_delivered))
-                        .word(3, u64::from(f.forged_delivered))
-                        .word(4, f.address)
-                        .word(5, f.forged)
-                        .word(6, f.faults)
-                        .word(7, f.last_fault)
-                        .build()
-                }
-                None => IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST),
-            },
+            test_dma_labels::MSI_FORGE => forge_reply(driver.msi_forge(ipc_buf)),
             test_dma_labels::DMA_PROBE => match driver.probe(ipc_buf).and_then(|(o, l, iova)| {
                 faults_after(driver.dma_ep, iova, ipc_buf).map(|f| (o, l, iova, f))
             })

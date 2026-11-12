@@ -672,8 +672,11 @@ enum RouteStep
 /// What a route request in `mode` through an object that does (`caller_holds`)
 /// or does not hold the route does to a line routed in `routed` (`None` when
 /// it is not routed). A request in another mode than the route's is refused.
-const fn route_step(routed: Option<u32>, caller_holds: bool, mode: u32)
--> Result<RouteStep, RouteError>
+const fn route_step(
+    routed: Option<u32>,
+    caller_holds: bool,
+    mode: u32,
+) -> Result<RouteStep, RouteError>
 {
     match routed
     {
@@ -1255,23 +1258,6 @@ unsafe fn take_reference(holder: NonNull<KernelObjectHeader>) -> Result<(), Rout
         .map_err(|_| RouteError::ReferenceLimit)
 }
 
-/// Give back a reference [`take_reference`] took, for a step that then failed.
-/// The caller still holds its own reference on `holder`, so the count stays
-/// above zero.
-///
-/// # Safety
-/// As [`take_reference`], whose reference this gives back.
-#[cfg(not(test))]
-unsafe fn give_back_reference(holder: NonNull<KernelObjectHeader>)
-{
-    // SAFETY: caller contract.
-    let left = unsafe { holder.as_ref() }.dec_ref();
-    debug_assert_ne!(
-        left, 0,
-        "irq: a bind's failed step released the last reference"
-    );
-}
-
 /// Rebind bound `binding` to `notification` of `holder` ([`renotify`]), whose
 /// source `cpu` delivers. Returns the object whose reference the binding gave
 /// up.
@@ -1470,7 +1456,10 @@ pub unsafe fn drop_route_holder(irq: u32)
             return;
         };
         let holders = route.holders.load(Ordering::Relaxed);
-        debug_assert!(holders > 0, "irq: a route holder dropped from a line with none");
+        debug_assert!(
+            holders > 0,
+            "irq: a route holder dropped from a line with none"
+        );
         let holders = holders.saturating_sub(1);
         route.holders.store(holders, Ordering::Relaxed);
         if released(holders, route.masks.bound()) && route.target.load(Ordering::Relaxed) != 0
@@ -2634,7 +2623,10 @@ mod tests
             unsafe { unbind_line(&stand, LINE, &route, &a) },
             Settle::StayMasked
         );
-        assert_eq!(Target::unpack(route.target.load(Ordering::SeqCst)), Some(ROUTED));
+        assert_eq!(
+            Target::unpack(route.target.load(Ordering::SeqCst)),
+            Some(ROUTED)
+        );
         assert_eq!(slot.load(), Slot::Line(LINE));
         assert!(stand.masked());
 

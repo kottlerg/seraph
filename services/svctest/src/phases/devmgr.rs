@@ -650,11 +650,18 @@ fn msi_forge_phase(caps: &Caps)
 {
     const PHASE: &str = "devmgr_msi_forge";
     let probe = call_test_dma(caps, ipc::test_dma_labels::MSI_FORGE, PHASE);
-    assert_eq!(probe.label, ipc::devmgr_errors::SUCCESS, "{PHASE}: MSI_FORGE status");
+    assert_eq!(
+        probe.label,
+        ipc::devmgr_errors::SUCCESS,
+        "{PHASE}: MSI_FORGE status"
+    );
     let made = probe.word(1) != 0;
     if probe.word(0) != ipc::devmgr_dma_labels::DMA_CONFINED
     {
-        assert!(!made, "{PHASE}: the fixture forged a message for an unconfined device");
+        assert!(
+            !made,
+            "{PHASE}: the fixture forged a message for an unconfined device"
+        );
         std::os::seraph::log!("{PHASE} passed unconfined: no forged write is made");
         return;
     }
@@ -669,7 +676,10 @@ fn msi_forge_phase(caps: &Caps)
             "{PHASE}: the confined device's message address {address:#x} is not remappable"
         );
     }
-    assert!(made, "{PHASE}: the fixture made no forged write (own message {address:#x})");
+    assert!(
+        made,
+        "{PHASE}: the fixture made no forged write (own message {address:#x})"
+    );
     assert!(
         own,
         "{PHASE}: the device's write of its own message to {address:#x} was not delivered"
@@ -680,7 +690,10 @@ fn msi_forge_phase(caps: &Caps)
     );
     if cfg!(target_arch = "riscv64")
     {
-        assert!(faults >= 1, "{PHASE}: no IOMMU fault taken for the forged write");
+        assert!(
+            faults >= 1,
+            "{PHASE}: no IOMMU fault taken for the forged write"
+        );
         assert_eq!(
             last_fault,
             forged & !0xfff,

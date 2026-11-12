@@ -15,8 +15,10 @@
 //! The stand-in device is the UART ktest already owns: setting its
 //! transmit-empty interrupt enable while the holding register is empty raises
 //! its line (`crate::arch::serial::raise_tx_interrupt`), and clearing it lowers
-//! the line again before every acknowledgement. Two derivations A and B of the
-//! carved line bind notifications N1 and N2, and then:
+//! the line again before every acknowledgement. Each scenario routes the
+//! carved line through a derivation of its own, which holds the route until
+//! the scenario ends (`SYS_IRQ_ROUTE`). Two derivations A and B of the line
+//! bind notifications N1 and N2, and then:
 //!
 //! 1. one raise signals both;
 //! 2. after A alone acknowledges, the line stays masked: a raise signals
@@ -52,21 +54,23 @@
 //! rebound to a fresh notification, which frees the first, and all
 //! acknowledge, a raise signals the fresh one.
 //!
-//! Last, the line's mode (`IRQ_MODE_*` in `abi/syscall`): a first binding
-//! records level-triggered, active-high; a second binding passing another mode
-//! is refused, as is a rebind of the first, and binds nothing (with the first
-//! acknowledged, a raise signals it alone); a second passing the same mode
-//! binds, a raise signals both, and, the mode programming the line
-//! level-triggered, with the line held asserted across both acknowledgements,
-//! it signals both again at the unmask, which an edge-triggered line would not;
-//! once both go, a new first binding records
-//! edge-triggered again; a mode with a bit outside `IRQ_MODE_MASK` is refused.
+//! Last, the line's mode (`IRQ_MODE_*` in `abi/syscall`): the route records
+//! level-triggered, active-high, and a first binding passing it binds; a
+//! second binding passing another mode is refused, as is a rebind of the
+//! first, and binds nothing (with the first acknowledged, a raise signals it
+//! alone); a second passing the route's mode binds, a raise signals both, and,
+//! the mode programming the line level-triggered, with the line held asserted
+//! across both acknowledgements, it signals both again at the unmask, which an
+//! edge-triggered line would not; once both bindings go, the route's holder
+//! keeps the line routed, level-triggered, so a route in another mode is
+//! refused; once the holder goes too, a new route records edge-triggered; a
+//! mode with a bit outside `IRQ_MODE_MASK` is refused.
 //! Every mode used is active-high, the UART line's own polarity, so no binding
 //! inverts the line.
 
 use syscall::{
     IRQ_MODE_LEVEL, IRQ_MODE_MASK, RIGHTS_ALL, cap_create_notification, cap_delete, cap_derive,
-    irq_ack, irq_register, notification_try_wait, notification_wait_timeout,
+    irq_ack, irq_register, irq_route, notification_try_wait, notification_wait_timeout,
 };
 use syscall_abi::SyscallError;
 
@@ -83,7 +87,7 @@ const QUIET_WAIT_MS: u64 = 20;
 /// Capability handles a scenario made, deleted when it ends.
 struct Held
 {
-    handles: [u64; MAX_IRQ_BINDINGS + 4],
+    handles: [u64; MAX_IRQ_BINDINGS + 5],
     len: usize,
 }
 
@@ -92,7 +96,7 @@ impl Held
     const fn new() -> Self
     {
         Self {
-            handles: [0; MAX_IRQ_BINDINGS + 4],
+            handles: [0; MAX_IRQ_BINDINGS + 5],
             len: 0,
         }
     }
@@ -140,6 +144,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// The five steps of the module doc.
 fn shared_line(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
+    route(line, 0, held)?;
     let a = held.push(derive(line)?);
     let b = held.push(derive(line)?);
     let unbound = held.push(derive(line)?);
@@ -188,6 +193,7 @@ fn shared_line(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 /// leaves the line unbound for the next.
 fn binding_bound(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
+    route(line, 0, held)?;
     let ntf = held.push(notification(ctx)?);
     let mut bound = [0; MAX_IRQ_BINDINGS];
     for slot in &mut bound
@@ -232,16 +238,19 @@ fn binding_bound(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
     )
 }
 
-/// The line's mode: the last scenario of the module doc. Runs once no binding
-/// remains on the line, so its first registration records the mode.
+/// The line's mode: the last scenario of the module doc. Runs once neither a
+/// route holder nor a binding remains on the line, so its route records the
+/// mode.
 fn line_mode(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
+    let holder = route(line, IRQ_MODE_LEVEL, held)?;
     let a = held.push(derive(line)?);
     let b = held.push(derive(line)?);
     let n1 = held.push(notification(ctx)?);
     let n2 = held.push(notification(ctx)?);
-    irq_register(a, n1, IRQ_MODE_LEVEL)
-        .map_err(|_| "integration::irq_shared_line: a level first binding was refused")?;
+    irq_register(a, n1, IRQ_MODE_LEVEL).map_err(
+        |_| "integration::irq_shared_line: a first binding in the route's mode was refused",
+    )?;
     if irq_register(b, n2, 0) != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("integration::irq_shared_line: a binding of another mode was not refused");
@@ -278,19 +287,35 @@ fn line_mode(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
     cap_delete(a).map_err(|_| "integration::irq_shared_line: cap_delete(A) failed")?;
     cap_delete(b).map_err(|_| "integration::irq_shared_line: cap_delete(B) failed")?;
 
-    // The last binding's removal released the line, so a new first binding may
-    // record another mode.
+    // The holder keeps the route with no binding left, in its mode.
     let c = held.push(derive(line)?);
-    irq_register(c, n1, 0).map_err(
-        |_| "integration::irq_shared_line: a released line kept the mode of its last bindings",
-    )?;
+    if irq_route(c, 0) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("integration::irq_shared_line: the route went with the last binding");
+    }
+    // Its removal released the line, so a new route may record another mode.
+    cap_delete(holder).map_err(|_| "integration::irq_shared_line: cap_delete(holder) failed")?;
+    irq_route(c, 0)
+        .map_err(|_| "integration::irq_shared_line: a released line kept the mode of its route")?;
+    irq_register(c, n1, 0)
+        .map_err(|_| "integration::irq_shared_line: a binding on the new route was refused")?;
     cap_delete(c).map_err(|_| "integration::irq_shared_line: cap_delete(C) failed")?;
     let d = held.push(derive(line)?);
-    if irq_register(d, n1, IRQ_MODE_MASK + 1) != Err(SyscallError::InvalidArgument as i64)
+    if irq_route(d, IRQ_MODE_MASK + 1) != Err(SyscallError::InvalidArgument as i64)
+        || irq_register(d, n1, IRQ_MODE_MASK + 1) != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("integration::irq_shared_line: a mode with an unknown bit was not refused");
     }
     Ok(())
+}
+
+/// Route `line` in `mode` through a derivation `held` keeps, which holds the
+/// route until the scenario's release; the derivation.
+fn route(line: u64, mode: u64, held: &mut Held) -> Result<u64, &'static str>
+{
+    let holder = held.push(derive(line)?);
+    irq_route(holder, mode).map_err(|_| "integration::irq_shared_line: route refused")?;
+    Ok(holder)
 }
 
 fn derive(line: u64) -> Result<u64, &'static str>

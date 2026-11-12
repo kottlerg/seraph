@@ -702,6 +702,11 @@ pub fn run_all(ctx: &TestContext)
         hw::irq_register_unroutable_id_err(ctx)
     );
     run_test!("hw::irq_register_high_id", hw::irq_register_high_id(ctx));
+    run_test!(
+        "hw::irq_route_holds_the_line",
+        hw::irq_route_holds_the_line(ctx)
+    );
+    run_test!("hw::irq_remap_refusals", hw::irq_remap_refusals(ctx));
     run_test!("hw::irq_msg_alloc_mints", hw::irq_msg_alloc_mints(ctx));
     run_test!(
         "hw::irq_msg_alloc_refusals",

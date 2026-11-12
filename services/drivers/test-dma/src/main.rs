@@ -553,6 +553,9 @@ impl Driver
 /// target sits on, which its domain does not map (bit 12 flipped: the
 /// paired hart's supervisor file, 4 KiB apart, or a page past the files).
 #[cfg(target_arch = "riscv64")]
+// unnecessary_wraps: the signature is the x86_64 variant's, which has no
+// forged address with remapping off.
+#[allow(clippy::unnecessary_wraps)]
 fn forged_address(address: u64) -> Option<u64>
 {
     Some(address ^ PAGE_SIZE)

@@ -66,9 +66,10 @@ pub fn place_cpu_ids(
     out: &mut [u32],
 ) -> (u32, bool)
 {
-    out[0] = bsp_id;
-    let mut filled: usize = 1;
+    let mut filled: usize = 0;
     let mut truncated = false;
+    // The BSP goes first: `out` holds no ID yet, so it takes slot 0 when `out` has one.
+    record_cpu_id(bsp_id, out, &mut filled, &mut truncated);
     for id in ids
     {
         record_cpu_id(id, out, &mut filled, &mut truncated);
@@ -85,14 +86,15 @@ pub fn place_cpu_ids(
 /// `truncated` when `ids` is full.
 pub fn record_cpu_id(id: u32, ids: &mut [u32], count: &mut usize, truncated: &mut bool)
 {
-    if ids[..*count].contains(&id)
+    if ids.get(..*count).is_some_and(|placed| placed.contains(&id))
     {
         return;
     }
-    if *count < ids.len()
+    if let Some(slot) = ids.get_mut(*count)
     {
-        ids[*count] = id;
-        *count += 1;
+        *slot = id;
+        // `*count` indexed a slot of `ids`, so it is far below `usize::MAX`.
+        *count = count.saturating_add(1);
     }
     else
     {
@@ -139,6 +141,15 @@ mod tests
         let (count, _) = place_cpu_ids(0, [1, 2, 1], &mut ids);
         assert_eq!(count, 3);
         assert_eq!(ids[..3], [0, 1, 2]);
+    }
+
+    // Defect caught: an `out` with no slot panicking instead of reporting truncation.
+    #[test]
+    fn output_without_a_slot_places_nothing_and_truncates()
+    {
+        let mut ids: [u32; 0] = [];
+        let (count, truncated) = place_cpu_ids(7, [1], &mut ids);
+        assert_eq!((count, truncated), (0, true));
     }
 
     #[test]

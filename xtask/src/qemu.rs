@@ -404,12 +404,12 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 /// PCI slots of the two disks of a two-disk launch (a single disk takes
 /// QEMU's next free slot). On `x86_64` OVMF programs a slot's `INTA` line
 /// from `{10, 10, 11, 11}` indexed by `(slot + 1) % 4`, which pairs adjacent
-/// slots, and on riscv64 the `virt` host swizzles `INTA` onto PLIC source
+/// slots, and on riscv64 the `virt` host swizzles `INTA` onto APLIC source
 /// `32 + slot % 4`. `SECOND_DISK_SLOT`, two slots past the first, avoids
 /// the share on both machines, so the ordinary two-disk boots give each disk
 /// a line of its own. `SHARED_LINE_SECOND_DISK_SLOT`, four slots past the
 /// first, lands on the first disk's line on both machines (the same index
-/// into OVMF's table, the same PLIC source), which the shared-line boot
+/// into OVMF's table, the same APLIC source), which the shared-line boot
 /// stages on purpose. Every slot sits below 25, past which q35 routes every
 /// slot to one line, above the slots auto-placed devices take, and clear of
 /// q35's built-in slot 0x1f.
@@ -608,12 +608,16 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
         .firmware_vars_path
         .context("riscv64 launch requires firmware_vars_path")?;
 
-    args.extend(["-machine".into(), "virt".into()]);
+    // AIA is the only interrupt controller the kernel drives: `aia=aplic-imsic`
+    // gives the machine an APLIC (MSI delivery) and per-hart IMSIC files in
+    // place of the PLIC, and the kernel refuses to boot without them.
+    args.extend(["-machine".into(), "virt,aia=aplic-imsic".into()]);
     // Pin the CPU model to a baseline that advertises the RVA23 features the
     // system requires: V (Vector) plus the Zba/Zbb/Zbs bitmanip set for
-    // userspace, and the supervisor paging extensions Svpbmt/Svinval/Svnapot
-    // that the kernel's boot gate refuses to run without (explicit `=on`
-    // pins against QEMU default drift). RVA23 also mandates Zfa, Zfhmin,
+    // userspace, the supervisor paging extensions Svpbmt/Svinval/Svnapot, and
+    // the AIA CSRs Ssaia (and Smaia, which the firmware's machine-level IMSIC
+    // use needs), that the kernel's boot gate refuses to run without (explicit
+    // `=on` pins against QEMU default drift). RVA23 also mandates Zfa, Zfhmin,
     // Zihintntl, Zicond, Zimop, Zcmop, Zcb, Zvfhmin, Zvbb, Zvkt, Zkt — those
     // land as QEMU coverage broadens. Which QEMU versions this string targets,
     // and why the named `-cpu rva23s64` model is not used, are specified in
@@ -624,7 +628,8 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     args.extend([
         "-cpu".into(),
         format!(
-            "rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on{}",
+            "rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,\
+             ssaia=on,smaia=on{}",
             spec.riscv_mmu.cpu_satp_props()
         ),
     ]);
@@ -933,6 +938,20 @@ mod tests
     }
 
     #[test]
+    fn riscv_launch_presents_aia()
+    {
+        // The kernel drives AIA only and refuses to boot without Ssaia, an
+        // APLIC and an IMSIC; a launch without them would kill every riscv64
+        // QEMU run at boot.
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        let machine = argv.iter().position(|a| a == "-machine").unwrap();
+        assert_eq!(argv[machine + 1], "virt,aia=aplic-imsic");
+        let cpu = cpu_arg(&argv);
+        assert!(cpu.contains(",ssaia=on"));
+        assert!(cpu.contains(",smaia=on"));
+    }
+
+    #[test]
     fn argv_reflects_cpus_and_mem()
     {
         let argv = build_qemu_argv(&riscv_spec(4, 512)).unwrap();
@@ -1141,8 +1160,8 @@ mod tests
         [10, 10, 11, 11][usize::from((slot + 1) % 4)]
     }
 
-    /// riscv64 `virt`: INTA of a slot reaches PLIC source 32 + slot % 4.
-    fn plic_source(slot: u8) -> u8
+    /// riscv64 `virt`: INTA of a slot reaches APLIC source 32 + slot % 4.
+    fn aplic_source(slot: u8) -> u8
     {
         32 + slot % 4
     }
@@ -1152,7 +1171,7 @@ mod tests
     {
         let (first, second) = disk_slots(false);
         assert_ne!(ovmf_line(first), ovmf_line(second));
-        assert_ne!(plic_source(first), plic_source(second));
+        assert_ne!(aplic_source(first), aplic_source(second));
         // q35 routes every slot past 24 to one line.
         assert!(first <= 24 && second <= 24);
     }
@@ -1163,7 +1182,7 @@ mod tests
         let (first, second) = disk_slots(true);
         assert_ne!(first, second);
         assert_eq!(ovmf_line(first), ovmf_line(second));
-        assert_eq!(plic_source(first), plic_source(second));
+        assert_eq!(aplic_source(first), aplic_source(second));
         // Below q35's every-slot-one-line range, so the share is the
         // swizzle's, not q35's fallback.
         assert!(first <= 24 && second <= 24);

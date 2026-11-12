@@ -178,8 +178,8 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 /// deleting it leaves the kernel's routing table alone.
 ///
 /// The root Interrupt cap spans more ids than the controllers implement on
-/// both architectures: on riscv64 the PLIC's 1024-id space against the sources
-/// its `riscv,ndev` reports, on x86-64 32768 GSIs against the pins the I/O APICs
+/// both architectures: on riscv64 the APLIC's 1024-id space against the sources
+/// its `riscv,num-sources` reports, on x86-64 32768 GSIs against the pins the I/O APICs
 /// report, which size the kernel's routing table. Each id of
 /// `crate::arch::UNROUTABLE_IRQ_IDS` is isolated as a single-id cap split off a
 /// derived copy of the first cap whose range contains it, so the original range
@@ -199,7 +199,7 @@ pub fn irq_register_unroutable_id_err(ctx: &TestContext) -> TestResult
 /// An Interrupt cap naming a line a fixed-size routing table once refused, but
 /// that the discovered controller implements, is accepted by `irq_register`,
 /// acknowledged, and deleted. Each id of `crate::arch::ROUTABLE_HIGH_IRQ_IDS`
-/// (x86-64: a GSI above the old 23-vector gate range; riscv64: the PLIC's
+/// (x86-64: a GSI above the old 23-vector gate range; riscv64: the APLIC's
 /// last reported source) is isolated as for `irq_register_unroutable_id_err`.
 pub fn irq_register_high_id(ctx: &TestContext) -> TestResult
 {

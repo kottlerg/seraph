@@ -28,6 +28,12 @@ pub mod nospec;
 #[path = "riscv64/encoding.rs"]
 mod riscv64_encoding;
 
+// The riscv64 AIA register-map arithmetic, compiled alone into the host test
+// builds of the other architectures for the same reason.
+#[cfg(all(test, not(target_arch = "riscv64")))]
+#[path = "riscv64/aia_encoding.rs"]
+mod riscv64_aia_encoding;
+
 /// Which privilege level a new thread runs at, selecting its first-dispatch
 /// interrupt state in `context::new_state` (the first-dispatch trampoline rule of
 /// core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership).

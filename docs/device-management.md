@@ -419,7 +419,7 @@ derivation it revokes when it withdraws the driver (devmgr's
   ([services/drivers/serial/README.md](../services/drivers/serial/README.md#interrupts)
   § Interrupts), so devmgr keeps the UART line exclusive and shares no other device onto it. The
   UART line is never a PCI `INTx` line on either machine (x86-64 COM1 is ISA IRQ 4; the riscv64
-  `virt` NS16550 is PLIC source 10, against `INTx` sources 32 to 35), so the exclusivity costs no
+  `virt` NS16550 is APLIC source 10, against `INTx` sources 32 to 35), so the exclusivity costs no
   device a cap in practice.
 - **Acknowledge.** `SYS_IRQ_ACK` clears its own binding's debt and unmasks the line only when no
   binding owes one; a repeated acknowledgement changes nothing.
@@ -434,17 +434,16 @@ derivation it revokes when it withdraws the driver (devmgr's
   § Withdrawal).
 
 The contract is specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md)
-§ `SYS_IRQ_REGISTER` and § `SYS_IRQ_ACK`. On riscv64 the PLIC gateway is level-sensitive, so an
-assertion that arrives while the line is masked is delivered at the unmask (QEMU's PLIC model,
-though, does not pend a source again that stays asserted across its claim and completion, which the
-drivers' timed polls cover); the mode is validated and programs nothing. On x86-64 the line's I/O
-APIC entry is programmed with the mode's trigger and polarity
-(core/kernel/src/arch/x86_64/ioapic.rs), and a level-triggered entry likewise delivers at the unmask
-an assertion still held. devmgr gives each PCI driver the mode of its `INTx` line, which every
-driver on the line then passes: on x86-64 the trigger and polarity of the MADT Interrupt Source
-Override that names the line's GSI, field by field, with the PCI default (level-triggered,
-active-low) for a field the override leaves conforming to its bus and for a line no override names;
-on riscv64 level-triggered, active-high
+§ `SYS_IRQ_REGISTER` and § `SYS_IRQ_ACK`. On riscv64 the line's APLIC source mode is programmed
+with the mode's trigger and polarity, and the unmask of a level-sensitive source pends it again
+while it is asserted, so an assertion still held at the unmask is delivered
+(core/kernel/src/arch/riscv64/aia.rs). On x86-64 the line's I/O APIC entry is programmed with the
+mode's trigger and polarity (core/kernel/src/arch/x86_64/ioapic.rs), and a level-triggered entry
+likewise delivers at the unmask an assertion still held. devmgr gives each PCI driver the mode of
+its `INTx` line, which every driver on the line then passes: on x86-64 the trigger and polarity
+of the MADT Interrupt Source Override that names the line's GSI, field by field, with the PCI
+default (level-triggered, active-low) for a field the override leaves conforming to its bus and
+for a line no override names; on riscv64 level-triggered, active-high
 ([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md) step 4). On a
 line programmed edge-triggered and shared, an assertion while the line is masked or another device
 holds it high raises no new edge, and the device stays asserted until its interrupt status is read,

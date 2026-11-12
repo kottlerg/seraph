@@ -981,7 +981,7 @@ impl MmioObject
 pub struct InterruptObject
 {
     pub header: KernelObjectHeader,
-    /// First IRQ line in the range (GSI on x86-64, PLIC source on RISC-V).
+    /// First IRQ line in the range (GSI on x86-64, APLIC source on RISC-V).
     pub start: u32,
     /// Number of consecutive IRQ lines covered by the cap.
     pub count: u32,

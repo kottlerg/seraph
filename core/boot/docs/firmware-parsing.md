@@ -6,7 +6,7 @@ five parts of `BootInfo`:
 1. `cpu_count` / `bsp_id` / `cpu_ids` — the CPU topology handed to the
    kernel for SMP bring-up.
 2. `kernel_mmio` — the arch-specific MMIO register bases the kernel
-   itself consumes (LAPIC / IOAPIC on x86-64 via ACPI MADT; PLIC / UART
+   itself consumes (LAPIC / IOAPIC on x86-64 via ACPI MADT; UART
    and the supervisor-level APLIC domain and IMSIC layout on RISC-V via
    ACPI MADT + SPCR, with any fields left zero by ACPI filled from the DTB;
    see [acpi.md](acpi.md) and [dtb.md](dtb.md)), plus the riscv64 hart
@@ -121,7 +121,7 @@ after `ExitBootServices` by
 The UEFI memory map on every currently-targeted host is the primary
 source; firmware-table seeds cover the regions the UEFI map often
 classifies as `Reserved` rather than `MemoryMappedIO` (LAPIC / IOAPIC /
-PLIC / APLIC / IMSIC / ECAM / BAR windows).
+APLIC / IMSIC / ECAM / BAR windows).
 
 ### Firmware exclusion
 
@@ -129,7 +129,7 @@ Apertures are coarse but **not indiscriminate**. No aperture covers RAM or
 firmware-exclusive state. Step 1 collects only MMIO descriptors, and step 2
 clips each seed by its class:
 
-- **Named seeds** are LAPIC, IOAPIC, PLIC, APLIC, IMSIC, ECAM, VT-d remapping units (DMAR),
+- **Named seeds** are LAPIC, IOAPIC, APLIC, IMSIC, ECAM, VT-d remapping units (DMAR),
   UART, RTC, `virtio,mmio` and other DTB nodes, and the framebuffer. They are windows a firmware
   table, the DTB, or GOP names as a device's registers or frame buffer, or that the arch
   defaults fix at a platform-defined register address (`default_mmio_apertures`).

@@ -131,14 +131,14 @@ the kernel's own consumption:
   `cpu_ids` pages (one more for a BSP the table omits, at most `MAX_CPUS`), and a second
   fills them; their address and the count are written into `BootInfo` in step 9.
 - **`kernel_mmio`** — arch-specific MMIO bases: LAPIC / IOAPIC on x86-64
-  (from MADT), PLIC (MADT) / UART (SPCR) and the supervisor-level APLIC
+  (from MADT), UART (SPCR) and the supervisor-level APLIC
   domain and IMSIC layout (MADT) on RISC-V, or DTB compatible nodes, plus
   the riscv64 hart facts (`timebase_freq`, `hart_caps`).
   Extracted into `BootInfo` in step 9.
 
 A third extraction, run in step 9, produces **seed entries** for `mmio_apertures` — coarse
 `{phys_base, size}` regions the kernel mints as `Mmio` capabilities. The seed covers LAPIC / IOAPIC
-/ PLIC / APLIC / IMSIC / CLINT / UART / ECAM / BAR windows / VT-d remapping units / `virtio,mmio`
+/ APLIC / IMSIC / CLINT / UART / ECAM / BAR windows / VT-d remapping units / `virtio,mmio`
 transports from the firmware tables, the arch's platform-default MMIO apertures the ACPI seeder
 appends ([acpi.md](acpi.md) § Tables Consumed), and the GOP framebuffer. Each seed is clipped to
 the memory map (named seeds lose the RAM-class and firmware-exclusive ranges, heuristic PCI
@@ -277,7 +277,7 @@ Pointer and resource-address fields hold physical addresses; `init_image` carrie
 unbiased link virtual addresses, and the only kernel virtual addresses are the
 KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel scrubs from
 this donated page after consuming them. The `version` field is set to
-`BOOT_PROTOCOL_VERSION` (currently `20`). Fields are populated as follows:
+`BOOT_PROTOCOL_VERSION` (currently `21`). Fields are populated as follows:
 
 | Field | Source |
 |---|---|

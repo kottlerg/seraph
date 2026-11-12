@@ -124,9 +124,9 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// The line's first binding routes it: on `x86_64` it assigns the GSI a device
 /// IDT vector and programs its IOAPIC redirection entry with the mode's trigger
-/// and polarity, on RISC-V it assigns the PLIC source a target hart (the mode is
-/// validated and recorded, and the level-sensitive PLIC gateway needs nothing
-/// from it), masked until the first ACK in both cases. A later binding masks the
+/// and polarity, on RISC-V it assigns the APLIC source a target hart and an
+/// identity in that hart's IMSIC file and programs its source mode from the
+/// mode, masked until the first ACK in both cases. A later binding masks the
 /// line, which stays masked until that binding's first ACK.
 ///
 /// Returns 0 on success; `InvalidArgument` for an id no discovered controller
@@ -202,7 +202,7 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Bind the cap's object to the notification, routing the line at its
     // controller for its first binding (left masked: the x86_64 IOAPIC
-    // redirection entry, the RISC-V PLIC source; the driver unmasks via
+    // redirection entry, the RISC-V APLIC source; the driver unmasks via
     // SYS_IRQ_ACK after registering), under the table's routing lock.
     // SAFETY: syscall context, no IPC source, scheduler, or sleep-list lock held;
     // sig_state is the live state of the Notification cap resolved above; `io`

@@ -515,7 +515,10 @@ pub unsafe fn init_ap();
 /// cleared the identity. `unmask` is reached, under the routing
 /// lock and only for a routed line, from `SYS_IRQ_ACK` through `irq::ack` and
 /// from a binding's removal, each once no binding on the line owes an
-/// acknowledgement.
+/// acknowledgement. The caller then reads the line's owing mask and calls `mask`
+/// when a delivery that raced the unmask marked a binding owing, so `unmask`
+/// must leave its controller write ordered before that read: RISC-V's fences
+/// its APLIC writes, and x86-64's shares `IOAPIC_LOCK` with `mask`.
 pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);

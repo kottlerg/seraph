@@ -240,7 +240,7 @@ pub fn drivers_dir_pass(
         if let Some(d) = decl.filter(|d| !admits(d))
         {
             std::os::seraph::log!(
-                debug: "{}: declares boot-only class {}; not considered",
+                warn: "{}: declares boot-only class {}; not considered",
                 d.name.as_str(),
                 d.class.as_ref().map_or("", |c| c.as_str())
             );

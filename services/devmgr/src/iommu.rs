@@ -649,7 +649,7 @@ impl Iommu
                 return Err(Refused);
             }
             std::os::seraph::log!(
-                debug: "{}: firmware-reserved range {:#x}..{:#x} identity-mapped",
+                "{}: firmware-reserved range {:#x}..{:#x} identity-mapped",
                 name,
                 r.base,
                 r.base + r.len

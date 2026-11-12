@@ -118,7 +118,12 @@ a sender that sets no level logs at info.
   A line that an xtask check or a CI `run-parallel` pattern matches stays
   at info, whatever the list above gives it, unless the check changes with
   it: a line below info is not sent in a default boot, and a tag after
-  `[name] ` breaks a match anchored there. A line whose text contains
+  `[name] ` breaks a match anchored there. A line a document says a
+  component logs, or tells its reader to read, stays at info too unless
+  the document changes with it: procmgr's `spawn image bias=0x…` line,
+  from which `run --gdb` and `symbolize --bias` take a process's load bias
+  ([xtask/README.md](../../../xtask/README.md#cargo-xtask-symbolize)), is
+  one. A line whose text contains
   `FATAL:`, which CI's fail pattern matches, keeps its text at any level.
   A line given error or warn drops a leading `error:`, `warning:`, or
   `FAILED` from its text, since the tag replaces it, unless a check
@@ -130,7 +135,12 @@ a sender that sets no level logs at info.
   nor sent, so it costs no IPC; a record is filtered as a line is. A
   service sets the entry with the `.svc`
   `env` key ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)
-  § `argv` / `env`), a spawner with `Command::env`. Neither receiver
+  § `argv` / `env`), a spawner with `Command::env`. The processes init
+  spawns (procmgr, devmgr, vfsd, and svcmgr) and those devmgr and vfsd
+  spawn (the drivers and fatfs) receive no environment, so they log at
+  info and their debug lines show only with a code change; svcmgr only
+  binds the services init spawns, so an `env` key in their `.svc` recipes
+  reaches nothing. Neither receiver
   filters: each renders every line it receives. An error line is sent at
   every level.
 - **Line level.** The stream carries bytes, not lines, so a receiver gives a

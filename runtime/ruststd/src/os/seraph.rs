@@ -1570,7 +1570,8 @@ pub mod registry {
 /// it recovers from, info for lifecycle shown once per event and for every
 /// test-harness line, debug for per-request or per-step detail, trace for
 /// per-message or hot-path lines. A line an xtask check or a CI pattern
-/// matches stays at info unless the check changes with it.
+/// matches stays at info unless the check changes with it, and so does a
+/// line a document says the component logs or tells its reader to read.
 ///
 /// Non-allocating — stages the text in a 512-byte stack buffer that is
 /// sent in chunks as it fills, so a message of any length is sent in full;

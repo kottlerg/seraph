@@ -2645,7 +2645,7 @@ fn create_process_from_bytes(
         // Load-bias observability: no ProcessInfo field carries the bias;
         // debugging correlates through this line (in-process code uses
         // __ehdr_start).
-        std::os::seraph::log!(debug: "spawn image bias=0x{bias:x}");
+        std::os::seraph::log!("spawn image bias=0x{bias:x}");
     }
     let entry = elf::entry_point(ehdr)
         .checked_add(bias)
@@ -3660,7 +3660,7 @@ pub fn create_process_from_file(
         // Load-bias observability: no ProcessInfo field carries the bias;
         // debugging correlates through this line (in-process code uses
         // __ehdr_start).
-        std::os::seraph::log!(debug: "spawn image bias=0x{bias:x}");
+        std::os::seraph::log!("spawn image bias=0x{bias:x}");
     }
     let entry = elf::entry_point(ehdr)
         .checked_add(bias)

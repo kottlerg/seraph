@@ -426,8 +426,10 @@ the table. A delivery's raise and its reads of the line's bindings, and a change
 reads, are `SeqCst`: a delivery that read the state before a change removed it raised its count
 before the change reads it, so it is counted and waited for, and no delivery on any CPU reaches the
 state after its free. The wait is bounded: each delivery runs interrupts-off without waiting on the
-change, and masks its line until its receivers' `SYS_IRQ_ACK`, so the line's count falls to zero
-between deliveries.
+change. A delivery on a wired line masks it until its receivers' `SYS_IRQ_ACK`, so the line's
+count falls to zero between deliveries. A message-signaled target is never masked, but its
+deliveries reach only its one CPU, each interrupts-off from raise to drop, so they run one at a
+time and the count is zero across each interrupt return and entry between two of them.
 
 ### Wait Path
 

@@ -1215,9 +1215,9 @@ pub fn message(id: u32) -> Option<(u64, u32)>
 /// softlockup watchdog names if the wait wedges. It is bounded: a counted
 /// delivery runs with interrupts disabled from its raise to its drop, takes only
 /// the notifications' and the scheduler's spinlocks, and waits for nothing the
-/// caller holds; and every delivery masks its line until its receivers'
-/// `SYS_IRQ_ACK`, so the count falls to zero between deliveries. The wait is
-/// therefore at most the deliveries already in flight on the line. A message
+/// caller holds; and every delivery on a wired line masks it until its
+/// receivers' `SYS_IRQ_ACK`, so the count falls to zero between deliveries. The
+/// wait is therefore at most the deliveries already in flight on the line. A message
 /// target is not masked, but its deliveries reach only its one CPU, each with
 /// interrupts disabled from raise to drop, so they run one at a time and the
 /// count is zero across each interrupt return and entry between two of them.

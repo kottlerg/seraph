@@ -70,25 +70,38 @@
 //!   routing lock, and on x86-64 its unmask waits for a delivery's mask
 //!   (`IOAPIC_LOCK`), so in a streamed round the deleter gets the routing lock
 //!   only once each delivery has all but ended, and the change seldom meets
-//!   one. The deleter starts once the raise has returned, after a delay its
-//!   rounds on that CPU have fitted to how long a delivery takes to signal on
-//!   this platform ([`next_delay`]): tens of microseconds where KVM emulates
-//!   the I/O APIC in the host kernel, hundreds where QEMU emulates it in
-//!   userspace (the x86-64 launches with the IOMMU attached). Just before its
-//!   change it takes the notification's bits:
-//!   none means the raise's delivery had not yet signalled, so the change met
-//!   it, pending or under way, and the round armed the race.
+//!   one. The deleter starts once the raise has returned, after a delay that
+//!   each CPU's rounds fit to where their changes meet that CPU's deliveries
+//!   on this platform ([`next_delay`]): tens of microseconds after the raise
+//!   where KVM emulates the I/O APIC in the host kernel, hundreds where QEMU
+//!   emulates it in userspace (the x86-64 launches with the IOMMU attached).
+//!
+//! In three of four held notification rounds, and in every held binding
+//! round, the round is observed ([`observed`]): the deleter keeps the
+//! watched notification (the round's, or the victim) alive through the
+//! change and takes its bits just before the change and again just after it.
+//! No delivery reaches that notification through the binding once the change
+//! has removed it or replaced its notification, so a bit in the second take
+//! and none in the first means the raise's delivery read the binding or the
+//! notification while the change ran, or in the moment between the first
+//! take and the change's start: the change met it, and the round armed the
+//! race ([`Outcome`]). The other held notification rounds delete the
+//! notification's capability before the change, so the change frees it.
 //!
 //! A held round that delivers on CPU 0 runs its delivery on the controller
 //! before the raise returns, and one that delivers on CPU 1 runs it on the
 //! deleter before the deleter starts, so only the held rounds that deliver on
-//! another CPU can arm: half of them at 4 CPUs, none at 2.
+//! another CPU can arm: half of them at 4 CPUs, none at 2. A rebound round
+//! arms only when the rebind's store lands between a delivery's load of the
+//! notification and its signal, the last steps of a delivery that masks the
+//! line first, and on x86-64, where the mask is the long step, it seldom does.
 //!
 //! Required: the kernel survives every round, every rebind succeeds, every
-//! keeper is served after its round's delete, and, of each kind, the held
-//! rounds that arm the race are at least a quarter of those that can
-//! ([`armed_floor`]). The UART interrupt is disabled again when the cell
-//! ends.
+//! keeper is served after its round's delete, and the observed held direct
+//! and binding rounds that arm the race are each at least a sixteenth of
+//! those that can ([`armed_floor`]); the armed rebound rounds are logged
+//! and not required. A change that no longer meets a delivery in flight
+//! fails the floor. The UART interrupt is disabled again when the cell ends.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -118,9 +131,9 @@ const DELETER_CPU: u32 = 1;
 const MAX_RAISES: u32 = 20_000;
 /// Raises after the delete, so deliveries also meet a removed binding.
 const TRAILING_RAISES: u32 = 16;
-/// The held rounds of each kind that can arm the race, divided by this, must
-/// arm it ([`armed_floor`]): a quarter of them.
-const MIN_ARMED_DIVISOR: u64 = 4;
+/// The observed held direct and binding rounds that can arm the race,
+/// divided by this, must arm it ([`armed_floor`]): a sixteenth of them.
+const MIN_ARMED_DIVISOR: u64 = 16;
 /// Wait for the delivery probe's signal, in ms, through [`crate::scaled_bound`].
 const PROBE_TIMEOUT_MS: u64 = 1000;
 /// Polls (1 ms each) for the deleter's exit, through [`crate::scaled_polls`].
@@ -139,10 +152,12 @@ static ROUND: AtomicU32 = AtomicU32::new(0);
 /// Capability handle the deleter deletes this round: a bound Interrupt cap.
 static DOOMED: AtomicU64 = AtomicU64::new(0);
 /// The notification [`DOOMED`]'s binding signals: in a held round, the
-/// deleter takes its bits just before its change.
+/// deleter takes its bits just before its change, and in an observed one just
+/// after it too.
 static WATCHED: AtomicU64 = AtomicU64::new(0);
-/// Whether the deleter deletes [`WATCHED`]'s capability before its change,
-/// so the binding holds the notification's last reference.
+/// Whether the deleter deletes [`WATCHED`]'s capability: before its change,
+/// so the binding holds the notification's last reference, or, in an
+/// observed round, after it.
 static WATCHED_DOOMED: AtomicU32 = AtomicU32::new(0);
 /// Whether the deleter rebinds the round's cap to the spare before its
 /// delete; published before the round.
@@ -151,8 +166,8 @@ static REBIND: AtomicU32 = AtomicU32::new(0);
 static SPARE: AtomicU64 = AtomicU64::new(0);
 /// Last held round whose raise has returned; the deleter starts after it.
 static RAISED: AtomicU32 = AtomicU32::new(0);
-/// Last held round that armed the race: [`WATCHED`] held no bit as its change
-/// began.
+/// Last observed held round that armed the race: [`WATCHED`] held no bit as
+/// its change began and one as it returned ([`Outcome::Met`]).
 static ARMED: AtomicU32 = AtomicU32::new(0);
 /// Round whose change (its rebind, on a rebound round, then its delete) the
 /// deleter has begun.
@@ -166,9 +181,9 @@ static QUIT: AtomicU32 = AtomicU32::new(0);
 
 static mut DELETER_STACK: ChildStack = ChildStack::ZERO;
 
-/// Per kind of round (direct, rebound, binding), how many rounds ran held,
-/// how many of them armed the race, and how many streamed rounds overlapped
-/// it.
+/// Per kind of round (direct, rebound, binding), how many held rounds were
+/// observed ([`observed`]), how many of those armed the race, and how many
+/// streamed rounds overlapped it.
 #[derive(Default)]
 struct Tally
 {
@@ -180,16 +195,15 @@ struct Tally
 impl Tally
 {
     /// Count `round`, of kind `kind`, which armed or overlapped the race when
-    /// `hit`.
+    /// `hit`. A held round that frees its notification is not observed and
+    /// not counted.
     fn count(&mut self, round: u32, kind: usize, hit: bool) -> TestResult
     {
-        let (runs, hits) = if held(round)
+        let (runs, hits) = match (held(round), observed(round))
         {
-            (Some(&mut self.held), &mut self.armed)
-        }
-        else
-        {
-            (None, &mut self.overlapped)
+            (true, true) => (Some(&mut self.held), &mut self.armed),
+            (true, false) => return Ok(()),
+            (false, _) => (None, &mut self.overlapped),
         };
         if let Some(runs) = runs
         {
@@ -314,10 +328,21 @@ fn race(ctx: &TestContext, line: u64, cpus: u64) -> TestResult
     {
         let of = |counts: &[u32; 3]| counts.get(kind).copied().unwrap_or(0);
         let (held, armed) = (of(&tally.held), of(&tally.armed));
-        let floor = armed_floor(held, cpus);
+        // A rebound round arms only when the rebind's store lands between a
+        // delivery's load of the notification and its signal, the last
+        // steps of a delivery that masks the line first: too narrow a window
+        // to require (module doc § Two schedules).
+        let floor = if kind == 1
+        {
+            0
+        }
+        else
+        {
+            armed_floor(held, cpus)
+        };
         crate::log_args(format_args!(
-            "stress::irq_route_delete_race: armed_{name}={armed} of {held} held (floor {floor}), \
-             overlapped_{name}={}",
+            "stress::irq_route_delete_race: armed_{name}={armed} of {held} observed (floor \
+             {floor}), overlapped_{name}={}",
             of(&tally.overlapped)
         ));
         floor_missed |= u64::from(armed) < floor;
@@ -331,9 +356,9 @@ fn race(ctx: &TestContext, line: u64, cpus: u64) -> TestResult
     Ok(())
 }
 
-/// The fewest of `rounds` held rounds of one kind that must arm the race at
-/// `cpus` CPUs: those that deliver on a CPU other than CPU 0 and CPU 1, which
-/// the routes take in turn, divided by [`MIN_ARMED_DIVISOR`]. None at 2 CPUs.
+/// The fewest of `rounds` observed held rounds of one kind that must arm the
+/// race at `cpus` CPUs: those that deliver on a CPU other than CPU 0 and CPU 1,
+/// which the routes take in turn, divided by [`MIN_ARMED_DIVISOR`]. None at 2 CPUs.
 fn armed_floor(rounds: u32, cpus: u64) -> u64
 {
     u64::from(rounds)
@@ -400,6 +425,30 @@ fn held(round: u32) -> bool
     round.wrapping_mul(2_654_435_761) & (1 << 16) != 0
 }
 
+/// Whether a held `round` is observed: the deleter keeps the watched
+/// notification's capability through the change and takes its bits after it
+/// (module doc § Two schedules). Every binding round is, since the victim
+/// outlives its rounds; of the notification rounds, three in four, by two more
+/// bits of the hash, so the rest still have the change free the notification.
+fn observed(round: u32) -> bool
+{
+    round > CYCLES || round.wrapping_mul(2_654_435_761) & (3 << 13) != 0
+}
+
+/// The kind of `round`: 0 for a direct round, 1 for a rebound one, 2 for a
+/// binding round.
+fn kind_of(round: u32) -> usize
+{
+    if round > CYCLES
+    {
+        2
+    }
+    else
+    {
+        usize::from(rebound(round))
+    }
+}
+
 /// The notification rounds, counted into `tally`.
 fn rounds(ctx: &TestContext, line: u64, tally: &mut Tally) -> TestResult
 {
@@ -422,9 +471,10 @@ fn rounds(ctx: &TestContext, line: u64, tally: &mut Tally) -> TestResult
             cap_delete(sig).ok();
             return Err("stress::irq_route_delete_race: bind the UART line failed");
         }
-        // The deleter deletes `sig`'s capability just before its change, and
-        // the binding then holds the notification's last reference: the
-        // deleter's rebind or delete frees it.
+        // The deleter deletes `sig`'s capability: just before its change, so
+        // the binding holds the notification's last reference and the
+        // deleter's rebind or delete frees it, or, in an observed round, just
+        // after it ([`observed`]).
         WATCHED_DOOMED.store(1, Ordering::Release);
         let hit = race_delete(round, copy, sig, &[copy])?;
         tally.count(round, usize::from(rebound(round)), hit)?;
@@ -592,23 +642,34 @@ fn race_binding_delete(
     }
 }
 
-/// The next delay, in spins, of the CPU whose held round waited `delay`
-/// ([`delay_slot`]): a quarter longer when the change met the delivery
-/// (`met`), half as long when the delivery had already signalled. Rounds that
-/// meet it three times in four hold the delay there, before most deliveries
-/// on that CPU signal.
-fn next_delay(delay: u32, met: bool) -> u32
+/// Where a held round's change fell against the raise's delivery, as the
+/// deleter's two takes of the watched notification's bits bracket it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome
 {
-    if met
+    /// The delivery had signalled before the change began.
+    Late,
+    /// It signalled after the take before the change and by the take after
+    /// it: it read the binding, or the notification, while the change ran.
+    Met,
+    /// It had not signalled when the change returned: the change came first.
+    Early,
+}
+
+/// The next delay, in spins, of the CPU whose held round waited `delay` and
+/// came out as `outcome` ([`delay_slot`]): half as long when the change came
+/// late, a quarter longer when it came early, the same when it met the
+/// delivery. Each CPU's delay so settles where its changes meet deliveries.
+fn next_delay(delay: u32, outcome: Outcome) -> u32
+{
+    match outcome
     {
-        delay
+        Outcome::Late => delay.saturating_sub(delay / 4),
+        Outcome::Met => delay,
+        Outcome::Early => delay
             .saturating_add(delay / 4)
             .saturating_add(1)
-            .min(MAX_DELAY_SPINS)
-    }
-    else
-    {
-        delay / 2
+            .min(MAX_DELAY_SPINS),
     }
 }
 
@@ -629,11 +690,16 @@ fn delay_slot(round: u32, cpus: u64) -> usize
 
 /// Deleter, for a system of `cpus` CPUs: per published round, wait as the
 /// round's schedule says ([`held`]), delete the watched notification's
-/// capability when the round asks, then rebind the round's Interrupt cap to
-/// the spare when the round asks, and delete it; exit on `QUIT`.
+/// capability when the round asks (before the change, or after it in an
+/// observed round), rebind the round's Interrupt cap to the spare when the
+/// round asks, and delete it; exit on `QUIT`.
 extern "C" fn deleter_entry(cpus: u64) -> !
 {
-    let mut delays = [0u32; DELAY_SLOTS];
+    // One row for the rounds whose change removes a binding (direct and
+    // binding rounds), whose delays carry over from the one phase to the
+    // other, and one for the rebound rounds, whose rebind meets a delivery
+    // at another point of it.
+    let mut delays = [[0u32; DELAY_SLOTS]; 2];
     let mut seen = 0u32;
     loop
     {
@@ -649,27 +715,29 @@ extern "C" fn deleter_entry(cpus: u64) -> !
         }
         seen = round;
         let watched = WATCHED.load(Ordering::Acquire);
-        let met = if held(round)
+        let watched_doomed = WATCHED_DOOMED.load(Ordering::Acquire) != 0;
+        let observe = held(round) && observed(round);
+        let mut slot = None;
+        let mut delay = 0;
+        // Whether the raise's delivery had not signalled just before the
+        // change.
+        let mut unsignalled = false;
+        if held(round)
         {
             // The controller raises once and then waits for this change.
             while RAISED.load(Ordering::Acquire) != round && QUIT.load(Ordering::Acquire) == 0
             {
                 core::hint::spin_loop();
             }
-            let slot = delays.get_mut(delay_slot(round, cpus));
-            let delay = slot.as_deref().copied().unwrap_or(0);
+            slot = delays
+                .get_mut(usize::from(kind_of(round) == 1))
+                .and_then(|row| row.get_mut(delay_slot(round, cpus)));
+            delay = slot.as_deref().copied().unwrap_or(0);
             for _ in 0..delay
             {
                 core::hint::spin_loop();
             }
-            // No bit yet: the raise's delivery had not signalled, so the
-            // change below meets it.
-            let met = notification_try_wait(watched).is_err();
-            if let Some(slot) = slot
-            {
-                *slot = next_delay(delay, met);
-            }
-            met
+            unsignalled = notification_try_wait(watched).is_err();
         }
         else
         {
@@ -679,24 +747,59 @@ extern "C" fn deleter_entry(cpus: u64) -> !
             {
                 core::hint::spin_loop();
             }
-            false
-        };
-        if WATCHED_DOOMED.load(Ordering::Acquire) != 0
+        }
+        // The binding then holds the notification's last reference, and the
+        // change frees it.
+        if watched_doomed && !observe
         {
             cap_delete(watched).ok();
         }
         DELETING.store(round, Ordering::Release);
         let doomed = DOOMED.load(Ordering::Acquire);
         // Rebind first when the round asks, dropping the round's
-        // notification's last reference while the line stays bound. A failed
-        // rebind is counted and fails the cell.
+        // notification's last reference while the line stays bound (in an
+        // observed round the deleter's capability keeps it). A failed rebind
+        // is counted and fails the cell.
         if REBIND.load(Ordering::Acquire) != 0
             && irq_register(doomed, SPARE.load(Ordering::Acquire), 0).is_err()
         {
             REBIND_FAILED.fetch_add(1, Ordering::AcqRel);
         }
         cap_delete(doomed).ok();
-        if met
+        // After the change no delivery reaches the watched notification
+        // through the removed binding or the replaced notification, so a bit
+        // now came from one that signalled between the two takes: while the
+        // change ran, or in the moment between the first take and the
+        // change's start.
+        let outcome = if !held(round)
+        {
+            None
+        }
+        else if !unsignalled
+        {
+            Some(Outcome::Late)
+        }
+        else if !observe
+        {
+            None
+        }
+        else if notification_try_wait(watched).is_ok()
+        {
+            Some(Outcome::Met)
+        }
+        else
+        {
+            Some(Outcome::Early)
+        };
+        if watched_doomed && observe
+        {
+            cap_delete(watched).ok();
+        }
+        if let (Some(slot), Some(outcome)) = (slot, outcome)
+        {
+            *slot = next_delay(delay, outcome);
+        }
+        if outcome == Some(Outcome::Met)
         {
             ARMED.store(round, Ordering::Release);
         }

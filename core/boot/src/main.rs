@@ -10,6 +10,8 @@
 //! firmware table addresses, exits UEFI boot services, populates `BootInfo`,
 //! and jumps to the kernel entry point. See `core/boot/docs/boot-flow.md` for the step-by-step design.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 

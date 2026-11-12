@@ -141,8 +141,14 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// the one the line's bindings recorded, or a mode other than 0 for a
 /// message-signaled target; `QuotaExceeded` when the controller has no delivery
 /// resource left (no CPU with a free device vector on x86-64, or a free IMSIC
-/// identity on RISC-V), the line already holds `MAX_IRQ_BINDINGS` bindings, or
-/// the message-signaled target is already bound.
+/// identity on RISC-V), the line already holds `MAX_IRQ_BINDINGS` bindings,
+/// the message-signaled target is already bound, or the Notification holds as
+/// many references as it may.
+///
+/// A bound binding holds a reference on its Notification, so the Notification
+/// lives as long as a binding names it: deleting its capabilities does not
+/// unbind it. A binding lasts until its Interrupt capability rebinds or is
+/// deleted.
 #[cfg(not(test))]
 pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -202,35 +208,41 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
     // rejects a null cspace and checks tag and rights.
     let sig_slot = unsafe { super::lookup_cap(cspace, sig_cap_idx, NtfRights::NOTIFY) }?;
-    let sig_state = {
-        let obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Notification; the object is a NotificationObject
-        // constructed in place at a size-class-aligned retype offset.
-        #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            (*obj.as_ptr().cast::<NotificationObject>()).state
-        }
-    };
+    let sig_obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: tag confirmed Notification; the object is a NotificationObject
+    // constructed in place at a size-class-aligned retype offset.
+    #[allow(clippy::cast_ptr_alignment)]
+    let sig_state = unsafe { (*sig_obj.as_ptr().cast::<NotificationObject>()).state };
 
     // Bind the cap's object to the notification, routing the line at its
     // controller for its first binding (left masked: the x86_64 IOAPIC
     // redirection entry, the RISC-V APLIC source; the driver unmasks via
-    // SYS_IRQ_ACK after registering), under the table's routing lock.
+    // SYS_IRQ_ACK after registering), under the table's routing lock. The
+    // binding takes a reference on the Notification object.
     // SAFETY: syscall context, no IPC source, scheduler, or sleep-list lock held;
-    // sig_state is the live state of the Notification cap resolved above; `io`
-    // is live, its line is `irq_id`, and its dealloc arm unbinds it
-    // (`irq::unregister`) before it is freed.
-    unsafe { crate::irq::register(irq_id, &io.binding, sig_state, mode) }.map_err(|e| match e
+    // sig_state is the live state of `sig_obj`, which `sig_slot`'s pin keeps
+    // live for the call; `io` is live, its line is `irq_id`, and its dealloc
+    // arm unbinds it (`irq::unregister`) before it is freed.
+    let replaced = unsafe { crate::irq::register(irq_id, &io.binding, sig_state, sig_obj, mode) }
+        .map_err(|e| match e
     {
         crate::irq::RouteError::NoSuchLine | crate::irq::RouteError::ModeMismatch =>
         {
             SyscallError::InvalidArgument
         }
-        crate::irq::RouteError::Exhausted | crate::irq::RouteError::TooManyBindings =>
-        {
-            SyscallError::QuotaExceeded
-        }
+        crate::irq::RouteError::Exhausted
+        | crate::irq::RouteError::TooManyBindings
+        | crate::irq::RouteError::ReferenceLimit => SyscallError::QuotaExceeded,
     })?;
+
+    // A rebind gave up the reference its binding held on the Notification it
+    // replaced; no delivery can reach that Notification any more.
+    if let Some(old) = replaced
+    {
+        // SAFETY: the binding's reference, handed over by `register`; syscall
+        // context with no lock held.
+        unsafe { crate::cap::object::release_ref(old) };
+    }
 
     Ok(0)
 }

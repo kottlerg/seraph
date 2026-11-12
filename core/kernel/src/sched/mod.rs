@@ -458,8 +458,8 @@ pub(crate) struct CpuDiag
     /// `stop_threads_bound_to`'s phase-2 spin shares), the
     /// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate
     /// the Notification, `EventQueue`, and Thread dealloc arms share, the IRQ
-    /// route drain (`irq::register`, `irq::unregister`,
-    /// `irq::unregister_notification`), the `sys_thread_start` settle loop
+    /// route drain (`irq::register`, `irq::unregister`), the
+    /// `sys_thread_start` settle loop
     /// (`start_under_all_locks`), the register-access wait
     /// (`with_held_frame`), the `sys_thread_stop` save wait
     /// (`await_stopped_save`), and the `schedule()` context-saved dispatch
@@ -542,8 +542,7 @@ pub const SPIN_SITE_REGS_SETTLE: u32 = 8;
 pub const SPIN_SITE_STOP_SAVE: u32 = 9;
 /// IRQ route drain: spinning, under the IRQ routing lock, until every
 /// device-IRQ delivery in flight on a line a change just unbound or rebound
-/// has finished (`irq::register`, `irq::unregister`, and the
-/// Notification dealloc arm's `irq::unregister_notification`).
+/// has finished (`irq::register`, `irq::unregister`).
 pub const SPIN_SITE_IRQ_ROUTE_DRAIN: u32 = 10;
 /// Fault-handler rebind (`ipc::fault::redeliver_in_flight`): spinning until a
 /// faulting thread whose delivery a binding change cancels commits its park.

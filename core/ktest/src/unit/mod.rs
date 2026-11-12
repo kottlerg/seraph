@@ -713,6 +713,10 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("hw::irq_msg_register", hw::irq_msg_register(ctx));
     run_test!(
+        "hw::irq_binding_holds_its_notification",
+        hw::irq_binding_holds_its_notification(ctx)
+    );
+    run_test!(
         "hw::irq_msg_exhaustion_and_reuse",
         hw::irq_msg_exhaustion_and_reuse(ctx)
     );

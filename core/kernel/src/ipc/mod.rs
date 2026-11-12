@@ -361,8 +361,9 @@ impl BoundSource
 /// is such a canceller, `syscall::thread::cancel_for_timeout`), and a receive's
 /// refused reply rebind (`endpoint::bind_next_sender`) through
 /// the same hold (`sched::commit_reply_rebind_under_local_lock`), device IRQ
-/// delivery through its line's in-flight count that the Notification teardown
-/// waits out (`irq::unregister_notification`), fault delivery through its pin
+/// delivery through the reference its binding holds on the Notification, which
+/// an unbind or a rebind releases only once it has waited the delivery out
+/// (`irq::unregister`, `irq::register`), fault delivery through its pin
 /// on the endpoint (`ipc::fault::fault_dispatch`), and the death post through
 /// the observer binding's reference on its `EventQueue`. The source lock is
 /// taken under the `sched_lock`,

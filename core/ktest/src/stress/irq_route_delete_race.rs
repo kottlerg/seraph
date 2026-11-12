@@ -3,24 +3,23 @@
 
 // core/ktest/src/stress/irq_route_delete_race.rs
 
-//! Stress: deleting an IRQ-bound notification, or a bound Interrupt cap, on
+//! Stress: freeing an IRQ-bound notification, or a bound Interrupt object, on
 //! one CPU while its device interrupt is delivered on another.
 //!
 //! ## The hazard
 //!
 //! `irq::dispatch_device_irq` walks a line's bindings, which live in the
 //! Interrupt objects, and signals each binding's `NotificationState`, all
-//! without a reference. The Notification teardown used to clear the route
-//! with only the local CPU's interrupts masked and then free the state, so a
-//! delivery already running on another CPU could lock, set bits in, and wake
-//! through freed memory; freeing an Interrupt object while a delivery stands
-//! on its binding is the same hazard for the object's memory. Every binding
-//! change now waits out the deliveries in flight on the line before it
-//! releases the routing lock: a rebind (`irq::register`), the Notification
-//! teardown's removal of every binding naming the state
-//! (`irq::unregister_notification`), and an Interrupt object's removal of its
-//! own binding (`irq::unregister`), each before the free
-//! (core/kernel/docs/ipc-internals.md § Notification, Device IRQ delivery).
+//! without a reference of its own. A bound binding holds a reference on its
+//! notification, so a notification is freed only once the last binding naming
+//! it lets it go: when its Interrupt object is freed (`irq::unregister`) or it
+//! is rebound to another notification (`irq::register`). Freeing that
+//! notification, or the Interrupt object, while a delivery on another CPU
+//! still reads it would lock, set bits in, and wake through freed memory.
+//! Every binding change therefore waits out the deliveries in flight on the
+//! line before it releases the routing lock, and the reference is dropped
+//! after (core/kernel/docs/ipc-internals.md § Notification, Device IRQ
+//! delivery).
 //!
 //! ## How this exercises it
 //!
@@ -29,35 +28,36 @@
 //! raises its line (`crate::arch::serial::raise_tx_interrupt`). The cell
 //! carves that one line from a derived copy of the root Interrupt cap and
 //! first proves delivery: a raise must signal a bound notification. Then,
-//! each round, the controller, pinned to CPU 0, creates a notification and
-//! binds the line to it, then repeatedly acknowledges (`SYS_IRQ_ACK`; each
-//! delivery masks the line again) and raises the interrupt, so deliveries
-//! follow one another, while a deleter pinned to CPU 1 waits a varying delay
-//! and deletes the notification's only capability. A registration that finds
-//! the line with no binding routes it to the next CPU in turn
-//! (core/kernel/docs/arch-interface.md § `interrupts`): every round's does but
-//! the one after a rebound round, which rebinds the cap the spare holds and
-//! keeps its CPU. Most rounds therefore deliver on a CPU other than the
-//! deleter's, where the delivery and the delete race; a round that delivers on
-//! CPU 1 serialises them instead, and only the CPU count bounds how many do. On
-//! every other round the deleter first rebinds the line's cap to a spare
-//! notification (`SYS_IRQ_REGISTER`), so the delete meets a binding a rebind
-//! already took the notification from, the path whose teardown must still
-//! wait out a delivery that read the old notification. A raise after the
-//! delete finds the line masked and unbound (or bound to the spare).
+//! each round, the controller, pinned to CPU 0, creates a notification,
+//! derives a copy of the line and binds it to the notification, and deletes
+//! the notification's only capability, so the binding holds its last
+//! reference. It then repeatedly acknowledges (`SYS_IRQ_ACK`; each delivery
+//! masks the line again) and raises the interrupt, so deliveries follow one
+//! another, while a deleter pinned to CPU 1 waits a varying delay and deletes
+//! the copy, which frees the notification with the binding. On every other
+//! round the deleter first rebinds the copy to a spare notification
+//! (`SYS_IRQ_REGISTER`), which drops the round's notification's last
+//! reference and frees it while the line is still bound, and then deletes
+//! the copy. Each round's copy is the line's only binding, so its delete
+//! releases the line, and the next round's registration routes it to the
+//! next CPU in turn (core/kernel/docs/arch-interface.md § `interrupts`). Most
+//! rounds therefore deliver on a CPU other than the deleter's, where the
+//! delivery and the change race; a round that delivers on CPU 1 serialises
+//! them instead, and only the CPU count bounds how many do. A raise after the
+//! delete finds the line masked and unbound.
 //!
-//! The binding rounds follow, once the spare is gone and the line unbound.
-//! Each derives two copies of the line, binds one to a keeper notification
-//! and one to a victim notification, and races the same raises against the
-//! deleter's delete of the victim's Interrupt cap, so a delivery walks the
-//! binding in the object being freed. After each delete the keeper's binding
-//! must still be served: once it acknowledges, a raise signals it.
+//! The binding rounds follow. Each derives two copies of the line, binds one
+//! to a keeper notification and one to a victim notification, and races the
+//! same raises against the deleter's delete of the victim's Interrupt cap, so
+//! a delivery walks the binding in the object being freed. After each delete
+//! the keeper's binding must still be served: once it acknowledges, a raise
+//! signals it.
 //!
 //! Required: the kernel survives every round, every rebind succeeds, every
 //! keeper is served after its round's delete, and in some rounds of each kind
-//! the controller began a raise while the deleter's delete (and, on a rebound
-//! round, its rebind before it) was running (the race armed). The UART
-//! interrupt is disabled again when the cell ends.
+//! the controller began a raise while the deleter's rebind or delete was
+//! running (the race armed). The UART interrupt is disabled again when the
+//! cell ends.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -92,14 +92,12 @@ const EXIT_POLLS: u32 = 10_000;
 
 /// Round the controller has published; the deleter acts once per value.
 static ROUND: AtomicU32 = AtomicU32::new(0);
-/// Capability handle the deleter deletes this round: a notification, or, on a
-/// binding round, a bound Interrupt cap.
-static SIG: AtomicU64 = AtomicU64::new(0);
-/// Whether the deleter rebinds the line to the spare before this round's
+/// Capability handle the deleter deletes this round: a bound Interrupt cap.
+static DOOMED: AtomicU64 = AtomicU64::new(0);
+/// Whether the deleter rebinds the round's cap to the spare before its
 /// delete; published before the round.
 static REBIND: AtomicU32 = AtomicU32::new(0);
-/// The carved line and the spare notification the deleter rebinds it to.
-static LINE: AtomicU64 = AtomicU64::new(0);
+/// The spare notification the deleter rebinds a round's cap to.
 static SPARE: AtomicU64 = AtomicU64::new(0);
 /// Round whose delete (with its rebind, on a rebound round) the deleter has
 /// begun.
@@ -183,7 +181,6 @@ fn race(ctx: &TestContext, line: u64) -> TestResult
     DELETING.store(0, Ordering::Release);
     REBIND_FAILED.store(0, Ordering::Release);
     QUIT.store(0, Ordering::Release);
-    LINE.store(line, Ordering::Release);
     SPARE.store(spare, Ordering::Release);
     let deleter = cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
         .map_err(|_| "stress::irq_route_delete_race: create deleter failed")?;
@@ -231,10 +228,8 @@ fn race(ctx: &TestContext, line: u64) -> TestResult
     Ok(())
 }
 
-/// The notification rounds, then, once the spare (which may hold the line's
-/// last binding) is deleted so each binding round routes the line afresh, the
-/// binding rounds; returns how many rounds of each kind armed the race. The
-/// spare is deleted whatever the outcome.
+/// The notification rounds, then the binding rounds; returns how many rounds
+/// of each kind armed the race. The spare is deleted whatever the outcome.
 fn phases(ctx: &TestContext, line: u64, spare: u64) -> Result<[u32; 3], &'static str>
 {
     let notified = rounds(ctx, line);
@@ -244,17 +239,25 @@ fn phases(ctx: &TestContext, line: u64, spare: u64) -> Result<[u32; 3], &'static
     Ok([notified[0], notified[1], bound])
 }
 
-/// Bind the line to a fresh notification and require one raise to signal
-/// it, so the rounds below are not vacuous.
+/// Bind a copy of the line to a fresh notification and require one raise to
+/// signal it, so the rounds below are not vacuous. The copy's delete leaves
+/// the line unbound.
 fn probe_delivery(ctx: &TestContext, line: u64) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::irq_route_delete_race: create probe notification failed")?;
-    let bound = irq_register(line, sig, 0).and_then(|()| irq_ack(line));
+    let Ok(copy) = cap_derive(line, RIGHTS_ALL)
+    else
+    {
+        cap_delete(sig).ok();
+        return Err("stress::irq_route_delete_race: derive the probe's copy failed");
+    };
+    let bound = irq_register(copy, sig, 0).and_then(|()| irq_ack(copy));
     raise_tx_interrupt();
     let bits =
         bound.and_then(|()| notification_wait_timeout(sig, crate::scaled_bound(PROBE_TIMEOUT_MS)));
     quiet_tx_interrupt();
+    cap_delete(copy).ok();
     cap_delete(sig).ok();
     match bits
     {
@@ -264,14 +267,14 @@ fn probe_delivery(ctx: &TestContext, line: u64) -> TestResult
     }
 }
 
-/// Whether the deleter rebinds the line to the spare before `round`'s delete.
+/// Whether the deleter rebinds the round's cap to the spare before its delete.
 fn rebound(round: u32) -> bool
 {
     round.is_multiple_of(2)
 }
 
 /// The rounds; returns, for direct deletes and deletes after a rebind, how
-/// many began a raise while the delete was running.
+/// many began a raise while the rebind or the delete was running.
 fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
 {
     let mut armed = [0u32; 2];
@@ -279,14 +282,22 @@ fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
     {
         let sig = cap_create_notification(ctx.memory_base)
             .map_err(|_| "stress::irq_route_delete_race: create notification failed")?;
-        if irq_register(line, sig, 0)
-            .and_then(|()| irq_ack(line))
-            .is_err()
+        let Ok(copy) = cap_derive(line, RIGHTS_ALL)
+        else
         {
             cap_delete(sig).ok();
+            return Err("stress::irq_route_delete_race: derive the round's copy failed");
+        };
+        let bound = irq_register(copy, sig, 0).and_then(|()| irq_ack(copy));
+        // The binding now holds the notification's last reference: the
+        // deleter's rebind or delete frees it.
+        cap_delete(sig).ok();
+        if bound.is_err()
+        {
+            cap_delete(copy).ok();
             return Err("stress::irq_route_delete_race: bind the UART line failed");
         }
-        SIG.store(sig, Ordering::Release);
+        DOOMED.store(copy, Ordering::Release);
         REBIND.store(u32::from(rebound(round)), Ordering::Release);
         ROUND.store(round, Ordering::Release);
         let mut raises = 0u32;
@@ -298,8 +309,8 @@ fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
             let during = DELETING.load(Ordering::Acquire) == round
                 && DELETED.load(Ordering::Acquire) != round;
             // Unmask before each raise, since each delivery masks the line;
-            // after the delete the ack may fail or find the line unbound.
-            irq_ack(line).ok();
+            // after the delete the ack fails.
+            irq_ack(copy).ok();
             raise_tx_interrupt();
             raises += 1;
             overlapped |= during;
@@ -312,7 +323,7 @@ fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
         {
             for _ in 0..TRAILING_RAISES
             {
-                irq_ack(line).ok();
+                irq_ack(copy).ok();
                 raise_tx_interrupt();
             }
         }
@@ -397,7 +408,7 @@ fn race_binding_delete(
         cap_delete(doomed).ok();
         return Err("stress::irq_route_delete_race: binding the two copies failed");
     }
-    SIG.store(doomed, Ordering::Release);
+    DOOMED.store(doomed, Ordering::Release);
     REBIND.store(0, Ordering::Release);
     ROUND.store(round, Ordering::Release);
     let mut raises = 0u32;
@@ -438,8 +449,9 @@ fn race_binding_delete(
     }
 }
 
-/// Deleter: per published round, wait a varying delay, then delete the
-/// round's notification; exit on `QUIT`.
+/// Deleter: per published round, wait a varying delay, then rebind the
+/// round's Interrupt cap to the spare when the round asks, and delete it; exit
+/// on `QUIT`.
 extern "C" fn deleter_entry(_arg: u64) -> !
 {
     let mut seen = 0u32;
@@ -464,23 +476,18 @@ extern "C" fn deleter_entry(_arg: u64) -> !
         }
         // The window opens before the rebind on a rebound round, so a raise
         // counted there may begin before the rebind lands and deliver to the
-        // notification it replaces. A failed delete leaves a binding the next
-        // round's register rebinds; the controller's wait still ends.
+        // notification it replaces, which the rebind frees.
         DELETING.store(round, Ordering::Release);
-        // Rebind first when the round asks, so the delete finds the binding's
-        // notification already replaced. A failed rebind is counted and fails
-        // the cell.
+        let doomed = DOOMED.load(Ordering::Acquire);
+        // Rebind first when the round asks, dropping the round's
+        // notification's last reference while the line stays bound. A failed
+        // rebind is counted and fails the cell.
         if REBIND.load(Ordering::Acquire) != 0
-            && irq_register(
-                LINE.load(Ordering::Acquire),
-                SPARE.load(Ordering::Acquire),
-                0,
-            )
-            .is_err()
+            && irq_register(doomed, SPARE.load(Ordering::Acquire), 0).is_err()
         {
             REBIND_FAILED.fetch_add(1, Ordering::AcqRel);
         }
-        cap_delete(SIG.load(Ordering::Acquire)).ok();
+        cap_delete(doomed).ok();
         DELETED.store(round, Ordering::Release);
     }
 }

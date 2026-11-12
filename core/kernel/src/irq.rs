@@ -66,13 +66,22 @@
 //! changes nothing. The line's release forgets the mode, so the next first
 //! binding may record another.
 //!
+//! # Notification references
+//! A bound binding holds a reference on its notification's object, taken by
+//! [`register`] and released by the change that takes the notification from the
+//! binding (a rebind to another notification, or the binding's removal when its
+//! Interrupt object is freed, [`unregister`]), so a notification a binding names
+//! is never freed and its teardown changes no route. The release is made once
+//! no delivery can still hold the notification (§ Thread safety), outside the
+//! routing lock, by [`register`]'s and [`unregister`]'s callers.
+//!
 //! # Thread safety
 //! The interrupt-context walk in `dispatch_device_irq` is lock-free: it reads the
 //! line's bindings through atomic pointers. Every binding change ([`register`],
-//! [`unregister`], [`unregister_notification`]) and every acknowledgement
+//! [`unregister`]) and every acknowledgement
 //! ([`ack`], `SYS_IRQ_ACK`) runs under `ROUTING`'s lock, which also covers the
 //! controller routing the change makes (`route_device_irq`, `unroute_device_irq`,
-//! `mask`, `unmask`) and the set of routed lines, so an unmask never meets a line
+//! `mask`, `unmask`), so an unmask never meets a line
 //! whose last binding is being removed. A delivery only sets bits in the owing
 //! mask; acknowledgements and unbinds clear them, under the lock.
 //!
@@ -105,15 +114,16 @@
 //! binding from a source, or a notification from a binding, waits under the lock
 //! for that source's count to drain before it returns, so once the lock is free no
 //! delivery anywhere holds a binding no source links or a notification no binding
-//! names. A Notification's teardown therefore unbinds and drains only the sources
-//! that bind it, found in the set of routed sources: it scales with the bindings,
-//! not with the table, and no delivery on any CPU reaches the freed state
-//! (core/kernel/docs/ipc-internals.md § Notification). The message-target pool
-//! ([`alloc_message`], [`free_message`]) is changed under the same lock.
+//! names. The caller may then free the one and release its reference on the
+//! other (§ Notification references), and no delivery on any CPU reaches the
+//! freed state (core/kernel/docs/ipc-internals.md § Notification). The
+//! message-target pool ([`alloc_message`], [`free_message`]) is changed under the
+//! same lock.
 
-use core::ptr::null_mut;
+use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
+use crate::cap::object::KernelObjectHeader;
 use crate::ipc::notification::NotificationState;
 
 // ── Bindings ──────────────────────────────────────────────────────────────────
@@ -139,16 +149,20 @@ const UNBOUND: u32 = u32::MAX;
 /// carries (`cap::object::InterruptObject`), so each capability to a line binds
 /// on its own.
 ///
-/// While bound, the binding is linked in its line's list and owns one bit of
-/// the line's masks. `bit` is read and written only under the routing lock;
-/// `next` and `notification` are written under it and read lock-free by
-/// [`dispatch_device_irq`].
+/// While bound, the binding is linked in its line's list, owns one bit of the
+/// line's masks, and holds a reference on its notification's object (module
+/// doc § Notification references). `bit` and `holder` are read and written only
+/// under the routing lock; `next` and `notification` are written under it and
+/// read lock-free by [`dispatch_device_irq`].
 pub struct IrqBinding
 {
     /// The next binding on the line, or null at the list's end.
     next: AtomicPtr<IrqBinding>,
     /// The notification a delivery signals; null while unbound.
     notification: AtomicPtr<NotificationState>,
+    /// The object of `notification`, on which the binding holds a reference;
+    /// null while unbound.
+    holder: AtomicPtr<KernelObjectHeader>,
     /// The binding's bit in its line's masks, or [`UNBOUND`].
     bit: AtomicU32,
 }
@@ -162,6 +176,7 @@ impl IrqBinding
         Self {
             next: AtomicPtr::new(null_mut()),
             notification: AtomicPtr::new(null_mut()),
+            holder: AtomicPtr::new(null_mut()),
             bit: AtomicU32::new(UNBOUND),
         }
     }
@@ -480,6 +495,14 @@ pub struct DeliveryGate
     seq: AtomicU32,
 }
 
+impl Default for DeliveryGate
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
 // dead_code: as on `DeliveryGate` above.
 #[cfg_attr(not(test), allow(dead_code))]
 impl DeliveryGate
@@ -567,7 +590,7 @@ struct IrqRoute
 }
 
 // docs/limits.md states the routing table's per-source cost from this size
-// (with the routed-source set's two `u32` entries, `table_bytes`): an 8-byte
+// (`table_bytes`): an 8-byte
 // list head, the in-flight count and the mode (4 bytes each), the two 8-byte
 // masks, and the target (4 bytes, padded to the 8-byte alignment).
 const _: () = assert!(core::mem::size_of::<IrqRoute>() == 40);
@@ -589,6 +612,9 @@ pub enum RouteError
     /// The binding's mode differs from the one the line's bindings recorded
     /// (module doc § Mode).
     ModeMismatch,
+    /// The notification's object holds as many references as it may
+    /// (`cap::object::REF_COUNT_LIMIT`), so the binding cannot take one.
+    ReferenceLimit,
 }
 
 /// Whether a binding passing `requested` may bind on a line that has bindings
@@ -597,71 +623,6 @@ pub enum RouteError
 const fn mode_admits(line_bound: bool, recorded: u32, requested: u32) -> bool
 {
     !line_bound || recorded == requested
-}
-
-/// Dense set of line ids with constant-time insert and remove: the lines that
-/// hold at least one binding.
-///
-/// `members[..len]` lists the lines; `slot_of[line]` is the line's index in
-/// `members` plus one, or 0 when the line is not a member, so a zero-filled
-/// `slot_of` is the empty set. Both slices have one entry per line.
-struct LineSet<S>
-{
-    members: S,
-    slot_of: S,
-    len: usize,
-}
-
-impl<S: AsRef<[u32]> + AsMut<[u32]>> LineSet<S>
-{
-    /// Add `line` (a no-op when it is already a member). `line` must be below
-    /// the set's line count.
-    fn insert(&mut self, line: u32)
-    {
-        let index = line as usize;
-        if self.slot_of.as_ref()[index] != 0
-        {
-            return;
-        }
-        self.members.as_mut()[self.len] = line;
-        // The set holds at most one entry per line, so `len + 1` fits a line id.
-        #[allow(clippy::cast_possible_truncation)]
-        let slot = (self.len + 1) as u32;
-        self.slot_of.as_mut()[index] = slot;
-        self.len += 1;
-    }
-
-    /// Remove `line` (a no-op when it is not a member), moving the last member
-    /// into its slot. `line` must be below the set's line count.
-    fn remove(&mut self, line: u32)
-    {
-        let index = line as usize;
-        let slot = self.slot_of.as_ref()[index] as usize;
-        if slot == 0
-        {
-            return;
-        }
-        let last = self.members.as_ref()[self.len - 1];
-        self.members.as_mut()[slot - 1] = last;
-        // `slot` was a member index plus one, so it fits a line id.
-        #[allow(clippy::cast_possible_truncation)]
-        let moved = slot as u32;
-        self.slot_of.as_mut()[last as usize] = moved;
-        self.slot_of.as_mut()[index] = 0;
-        self.len -= 1;
-    }
-
-    /// The member at `position` (below [`LineSet::len`]).
-    fn member(&self, position: usize) -> u32
-    {
-        self.members.as_ref()[position]
-    }
-
-    /// The number of members.
-    fn len(&self) -> usize
-    {
-        self.len
-    }
 }
 
 /// The first message-target id: the Interrupt id space's width, so no range of
@@ -723,9 +684,11 @@ impl IdSpace
         None
     }
 
-    /// The source id of table entry `index` (below `lines + messages`).
+    /// The source id of table entry `index` (below `lines + messages`), which
+    /// the tests check [`IdSpace::index_of`] against.
     // cast_possible_truncation: the table's entry count is a sum of two u32s
     // checked at init to fit u32.
+    #[cfg(test)]
     #[allow(clippy::cast_possible_truncation)]
     const fn id_of(self, index: usize) -> u32
     {
@@ -798,8 +761,8 @@ impl<S: AsRef<[u32]> + AsMut<[u32]>> IdPool<S>
     }
 }
 
-/// The routing state a route change mutates: the table, the routed-source set,
-/// and the free message targets.
+/// The routing state a route change mutates: the table and the free message
+/// targets.
 #[cfg(not(test))]
 struct Routing
 {
@@ -807,8 +770,6 @@ struct Routing
     space: IdSpace,
     /// The table: `space.entries()` entries, or none before [`init_table`].
     routes: &'static [IrqRoute],
-    /// The table entries whose source holds at least one binding.
-    routed: LineSet<&'static mut [u32]>,
     /// The message targets free to mint.
     pool: IdPool<&'static mut [u32]>,
 }
@@ -861,11 +822,6 @@ static ROUTING: Locked<Routing> = Locked::new(Routing {
         messages: 0,
     },
     routes: &[],
-    routed: LineSet {
-        members: &mut [],
-        slot_of: &mut [],
-        len: 0,
-    },
     pool: IdPool {
         free: &mut [],
         len: 0,
@@ -905,21 +861,20 @@ fn route_of(id: u32) -> Option<&'static IrqRoute>
 
 // ── Initialisation ───────────────────────────────────────────────────────────
 
-// `init_table` places the set's and the pool's `u32` arrays directly after the
-// routes, so the route size must keep them aligned.
+// `init_table` places the pool's `u32` array directly after the routes, so the
+// route size must keep it aligned.
 const _: () =
     assert!(core::mem::size_of::<IrqRoute>().is_multiple_of(core::mem::align_of::<u32>()));
 
-/// Bytes the table, the routed-source set and the message pool take for
-/// `space`: a route and two set entries per table entry, and a pool entry per
-/// message target.
+/// Bytes the table and the message pool take for `space`: a route per table
+/// entry, and a pool entry per message target.
 const fn table_bytes(space: IdSpace) -> usize
 {
-    space.entries() * (core::mem::size_of::<IrqRoute>() + 2 * core::mem::size_of::<u32>())
+    space.entries() * core::mem::size_of::<IrqRoute>()
         + space.messages as usize * core::mem::size_of::<u32>()
 }
 
-/// Allocate the routing table, the routed-source set and the message pool for
+/// Allocate the routing table and the message pool for
 /// `line_count` lines and the message targets of the boot CPUs
 /// ([`message_capacity`] of `arch::current::interrupts::message_slots_per_cpu`)
 /// as one zero-filled run of pages (`sched::alloc_zeroed_slab`, which may span
@@ -949,28 +904,19 @@ pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
         allocator,
         "IRQ_ROUTING_TABLE",
     );
-    // SAFETY: the allocation holds `entries` routes followed by two `u32` arrays
-    // of `entries` entries and one of `messages` (`table_bytes`), zero-filled,
-    // which is the empty entry and the empty set; the `u32` arrays start at a
-    // multiple of the route size, so they are aligned. Nothing else references
-    // the allocation.
-    let (routes, members, slot_of, free) = unsafe {
-        let members = routes_base.add(entries).cast::<u32>();
+    // SAFETY: the allocation holds `entries` routes followed by a `u32` array of
+    // `messages` entries (`table_bytes`), zero-filled, which is the empty entry;
+    // the array starts at a multiple of the route size, so it is aligned.
+    // Nothing else references the allocation.
+    let (routes, free) = unsafe {
         (
             core::slice::from_raw_parts(routes_base, entries),
-            core::slice::from_raw_parts_mut(members, entries),
-            core::slice::from_raw_parts_mut(members.add(entries), entries),
-            core::slice::from_raw_parts_mut(members.add(2 * entries), messages),
+            core::slice::from_raw_parts_mut(routes_base.add(entries).cast::<u32>(), messages),
         )
     };
     ROUTING.with(|routing| {
         routing.space = space;
         routing.routes = routes;
-        routing.routed = LineSet {
-            members,
-            slot_of,
-            len: 0,
-        };
         routing.pool = IdPool::filled(free);
     });
     TABLE_BASE.store(routes_base, Ordering::Release);
@@ -988,23 +934,31 @@ pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
 // ── Public interface ──────────────────────────────────────────────────────────
 
 /// Bind `binding` (the binding of an Interrupt object for source `irq`) to
-/// `notification` (`SYS_IRQ_REGISTER`), with the source's trigger and polarity
-/// `mode` (module doc § Mode).
+/// `notification`, the state of the Notification object `holder`
+/// (`SYS_IRQ_REGISTER`), with the source's trigger and polarity `mode` (module
+/// doc § Mode).
 ///
-/// An unbound binding is added to the line: the line's first binding records
+/// An unbound binding takes a reference on `holder` and is added to the line:
+/// the line's first binding records
 /// `mode` and routes the line at its controller in that mode, which leaves it
 /// masked; a later binding masks it. The
 /// new binding takes the lowest free bit of the line's masks and owes an
 /// acknowledgement, so the line stays masked until its receiver's first
 /// `SYS_IRQ_ACK`. A binding already bound is rebound to `notification`: it
-/// keeps its bit and whether it owes, and the line's mask is unchanged; a
-/// delivery that read the notification it replaced is waited out before this
-/// returns (module doc § Thread safety). A line's first binding also waits out
+/// keeps its bit and whether it owes, and the line's mask is unchanged; it
+/// takes a reference on `holder` and gives up the one it held, and a delivery
+/// that read the notification it replaced is waited out before this returns
+/// (module doc § Thread safety). A rebind to the notification the binding
+/// already names changes nothing. A line's first binding also waits out
 /// the deliveries in flight on the line, so one that found no binding has
 /// masked the line before this returns.
 ///
 /// A message target (module doc § Sources) takes one binding, in mode 0, and
 /// is neither routed nor masked here: its slot was assigned at its mint.
+///
+/// Returns the object whose reference the binding gave up, which the caller
+/// releases once the routing lock is free (`cap::object::release_ref`), or
+/// `None`.
 ///
 /// # Errors
 /// [`RouteError::NoSuchLine`] when the source is past the table, no controller
@@ -1013,11 +967,13 @@ pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
 /// from the one they recorded, or a message target is passed a mode other than
 /// 0; [`RouteError::Exhausted`] when the controller cannot assign the line's
 /// first binding a delivery resource; [`RouteError::TooManyBindings`] when the
-/// line holds [`MAX_IRQ_BINDINGS`] bindings, or the message target holds one.
+/// line holds [`MAX_IRQ_BINDINGS`] bindings, or the message target holds one;
+/// [`RouteError::ReferenceLimit`] when `holder` can take no further reference.
 /// Nothing changes on error.
 ///
 /// # Safety
-/// - `notification` must be a valid, live `NotificationState` pointer.
+/// - `notification` must be a valid, live `NotificationState` pointer, the
+///   state of `holder`, on which the caller holds a reference for the call.
 /// - `binding` must be the binding of a live Interrupt object whose source is
 ///   `irq`, and that object must call [`unregister`] before it is freed.
 /// - Must be called outside interrupt context, with no IPC source, scheduler,
@@ -1027,8 +983,9 @@ pub unsafe fn register(
     irq: u32,
     binding: &IrqBinding,
     notification: *mut NotificationState,
+    holder: NonNull<KernelObjectHeader>,
     mode: u32,
-) -> Result<(), RouteError>
+) -> Result<Option<NonNull<KernelObjectHeader>>, RouteError>
 {
     ROUTING.with(|routing| {
         let index = routing.space.index_of(irq).ok_or(RouteError::NoSuchLine)?;
@@ -1046,32 +1003,50 @@ pub unsafe fn register(
         }
         if binding.bit.load(Ordering::Relaxed) != UNBOUND
         {
-            let previous = binding.notification.swap(notification, Ordering::SeqCst);
-            if previous != notification
+            if binding.notification.load(Ordering::Relaxed) == notification
             {
-                drain(route);
+                return Ok(None);
             }
-            return Ok(());
+            // SAFETY: caller contract.
+            unsafe { take_reference(holder) }?;
+            binding.notification.store(notification, Ordering::SeqCst);
+            drain(route);
+            let old = binding.holder.swap(holder.as_ptr(), Ordering::Relaxed);
+            return Ok(NonNull::new(old));
         }
         if message && !head.is_null()
         {
             return Err(RouteError::TooManyBindings);
         }
         let bit = route.masks.free_bit().ok_or(RouteError::TooManyBindings)?;
+        // SAFETY: caller contract.
+        unsafe { take_reference(holder) }?;
         if head.is_null()
         {
             if !message
             {
                 // SAFETY: called after Phase 5 with a line the table covers;
                 // serialised with every other binding change by the routing lock.
-                let target =
-                    unsafe { crate::arch::current::interrupts::route_device_irq(irq, mode) }?;
+                let routed =
+                    unsafe { crate::arch::current::interrupts::route_device_irq(irq, mode) };
+                let target = match routed
+                {
+                    Ok(target) => target,
+                    Err(error) =>
+                    {
+                        // SAFETY: the reference taken above.
+                        unsafe { give_back_reference(holder) };
+                        return Err(error);
+                    }
+                };
                 let Some(word) = target.pack()
                 else
                 {
                     // SAFETY: the line was just routed to `target`; serialised by
                     // the routing lock.
                     unsafe { crate::arch::current::interrupts::unroute_device_irq(irq, target) };
+                    // SAFETY: the reference taken above.
+                    unsafe { give_back_reference(holder) };
                     return Err(RouteError::Exhausted);
                 };
                 route.target.store(word, Ordering::Relaxed);
@@ -1083,6 +1058,7 @@ pub unsafe fn register(
             crate::arch::current::interrupts::mask(irq);
         }
         route.masks.take(bit);
+        binding.holder.store(holder.as_ptr(), Ordering::Relaxed);
         binding.bit.store(bit, Ordering::Relaxed);
         binding.notification.store(notification, Ordering::SeqCst);
         binding.next.store(head, Ordering::SeqCst);
@@ -1099,9 +1075,38 @@ pub unsafe fn register(
             // unmask, so it cannot leave the line masked with none owing.
             drain(route);
         }
-        routing.routed.insert(entry_u32(index));
-        Ok(())
+        Ok(None)
     })
+}
+
+/// Take a reference on `holder` for a binding, refused at the reference limit.
+///
+/// # Safety
+/// The caller holds a reference on `holder`, so it is live.
+#[cfg(not(test))]
+unsafe fn take_reference(holder: NonNull<KernelObjectHeader>) -> Result<(), RouteError>
+{
+    // SAFETY: caller contract.
+    unsafe { holder.as_ref() }
+        .try_inc_ref()
+        .map_err(|_| RouteError::ReferenceLimit)
+}
+
+/// Give back a reference [`take_reference`] took, for a step that then failed.
+/// The caller still holds its own reference on `holder`, so the count stays
+/// above zero.
+///
+/// # Safety
+/// As [`take_reference`], whose reference this gives back.
+#[cfg(not(test))]
+unsafe fn give_back_reference(holder: NonNull<KernelObjectHeader>)
+{
+    // SAFETY: caller contract.
+    let left = unsafe { holder.as_ref() }.dec_ref();
+    debug_assert_ne!(
+        left, 0,
+        "irq: a bind's failed step released the last reference"
+    );
 }
 
 /// Acknowledge source `irq` through `binding` (`SYS_IRQ_ACK`): clear the
@@ -1153,100 +1158,29 @@ pub unsafe fn ack(irq: u32, binding: &IrqBinding)
 /// hold a shared line masked. A message target keeps its slot
 /// ([`free_message`] releases it).
 ///
+/// Returns the object of the notification the binding named, whose reference
+/// the binding gave up, for the caller to release once the routing lock is
+/// free; `None` for a binding that was not bound.
+///
 /// # Safety
 /// Same context as [`register`]; `binding` is the binding of an Interrupt object
 /// whose source is `irq` and whose memory stays live until this returns.
 #[cfg(not(test))]
-pub unsafe fn unregister(irq: u32, binding: &IrqBinding)
+pub unsafe fn unregister(irq: u32, binding: &IrqBinding) -> Option<NonNull<KernelObjectHeader>>
 {
     ROUTING.with(|routing| {
         if binding.bit.load(Ordering::Relaxed) == UNBOUND
         {
-            return;
+            return None;
         }
-        let Some(index) = routing.space.index_of(irq)
-        else
+        if let Some(index) = routing.space.index_of(irq)
         {
-            return;
-        };
-        let route = &routing.routes[index];
-        // SAFETY: the routing lock is held and `binding` is bound on `irq`,
-        // whose entry is `index`.
-        unsafe { unbind(&mut routing.routed, irq, index, route, binding) };
-    });
-}
-
-/// Remove every binding to `notification` and wait out every delivery that may
-/// have read it (called when a Notification object is being freed, before its
-/// state is).
-///
-/// After this returns, no `dispatch_device_irq` on any CPU dereferences
-/// `notification`. Under the routing lock, every source with a binding to it is
-/// in the routed-source set; each such binding is removed as [`unregister`]
-/// removes one, so its Interrupt object stays and is unbound. A binding that
-/// named it earlier lost it through a [`register`] rebind, which drained the
-/// source before releasing the lock (module doc § Thread safety). The walk
-/// visits the routed sources only.
-///
-/// # Safety
-/// - `notification` must be a valid (still live) `NotificationState` pointer.
-/// - Same context as [`register`].
-#[cfg(not(test))]
-pub unsafe fn unregister_notification(notification: *mut NotificationState)
-{
-    ROUTING.with(|routing| {
-        let routes = routing.routes;
-        let space = routing.space;
-        let mut position = 0;
-        while position < routing.routed.len()
-        {
-            let index = routing.routed.member(position) as usize;
-            let route = &routes[index];
-            let id = space.id_of(index);
-            let mut released = false;
-            // SAFETY: the routing lock is held, so every linked binding is live.
-            while let Some(binding) = unsafe { binding_naming(route, notification) }
-            {
-                // SAFETY: the routing lock is held and `binding` is bound on `id`,
-                // whose entry is `index`.
-                if unsafe { unbind(&mut routing.routed, id, index, route, binding) }
-                    == Settle::Release
-                {
-                    released = true;
-                    break;
-                }
-            }
-            // A release swap-removes the source, moving the last member into
-            // `position`; it is visited next, so `position` does not advance.
-            if !released
-            {
-                position += 1;
-            }
+            // SAFETY: the routing lock is held and `binding` is bound on `irq`,
+            // whose entry is `index`.
+            unsafe { unbind(irq, &routing.routes[index], binding) };
         }
-    });
-}
-
-/// The first binding on `route` that names `notification`.
-///
-/// # Safety
-/// Called under the routing lock, which keeps every linked binding live.
-#[cfg(not(test))]
-unsafe fn binding_naming<'a>(
-    route: &IrqRoute,
-    notification: *mut NotificationState,
-) -> Option<&'a IrqBinding>
-{
-    let mut cur = route.bindings.load(Ordering::Relaxed);
-    // SAFETY: caller contract; a linked binding is live under the lock.
-    while let Some(binding) = unsafe { cur.as_ref() }
-    {
-        if binding.notification.load(Ordering::Relaxed) == notification
-        {
-            return Some(binding);
-        }
-        cur = binding.next.load(Ordering::Relaxed);
-    }
-    None
+        NonNull::new(binding.holder.swap(null_mut(), Ordering::Relaxed))
+    })
 }
 
 /// Remove bound `binding` from source `irq`: unlink it, clear its bits, wait out
@@ -1256,16 +1190,9 @@ unsafe fn binding_naming<'a>(
 ///
 /// # Safety
 /// Called under the routing lock, with the context [`register`] requires;
-/// `binding` is bound on `irq`, whose table entry is `index`, holding `route`,
-/// and `routed` is the routed-source set.
+/// `binding` is bound on `irq`, whose table entry is `route`.
 #[cfg(not(test))]
-unsafe fn unbind(
-    routed: &mut LineSet<&'static mut [u32]>,
-    irq: u32,
-    index: usize,
-    route: &IrqRoute,
-    binding: &IrqBinding,
-) -> Settle
+unsafe fn unbind(irq: u32, route: &IrqRoute, binding: &IrqBinding) -> Settle
 {
     let target = core::ptr::from_ref(binding).cast_mut();
     let mut link = &route.bindings;
@@ -1298,7 +1225,6 @@ unsafe fn unbind(
     {
         Settle::Release =>
         {
-            routed.remove(entry_u32(index));
             // The next first binding records its own mode.
             route.mode.store(0, Ordering::Relaxed);
             if !message
@@ -1322,19 +1248,6 @@ unsafe fn unbind(
         {}
     }
     settle
-}
-
-/// Table entry `index` as the `u32` the routed-source set holds: the table's
-/// entry count is the line count, at most the Interrupt id space's width
-/// ([`MESSAGE_ID_BASE`]), plus the message targets, at most the ids past it
-/// ([`message_capacity`]), so at most `u32::MAX`.
-#[cfg(not(test))]
-fn entry_u32(index: usize) -> u32
-{
-    // Bounded as above.
-    #[allow(clippy::cast_possible_truncation)]
-    let entry = index as u32;
-    entry
 }
 
 // ── Message targets ───────────────────────────────────────────────────────────
@@ -1674,22 +1587,6 @@ mod tests
 {
     use super::*;
 
-    fn empty_set(lines: usize) -> LineSet<Vec<u32>>
-    {
-        LineSet {
-            members: vec![0; lines],
-            slot_of: vec![0; lines],
-            len: 0,
-        }
-    }
-
-    fn members(set: &LineSet<Vec<u32>>) -> Vec<u32>
-    {
-        let mut lines: Vec<u32> = (0..set.len()).map(|i| set.member(i)).collect();
-        lines.sort_unstable();
-        lines
-    }
-
     fn empty_masks() -> LineMasks
     {
         LineMasks {
@@ -1931,54 +1828,6 @@ mod tests
     }
 
     #[test]
-    fn zero_filled_set_is_empty_and_takes_line_zero()
-    {
-        // Line 0 is a valid GSI; a zero `slot_of` entry must mean "absent", not
-        // "at slot 0".
-        let mut set = empty_set(4);
-        assert_eq!(set.len(), 0);
-        set.insert(0);
-        assert_eq!(members(&set), vec![0]);
-    }
-
-    #[test]
-    fn inserting_a_member_again_keeps_one_entry()
-    {
-        let mut set = empty_set(8);
-        set.insert(5);
-        set.insert(5);
-        assert_eq!(members(&set), vec![5]);
-    }
-
-    #[test]
-    fn removing_a_middle_member_keeps_the_others_reachable()
-    {
-        // Swap-remove moves the last member into the freed slot; its slot index
-        // must follow, or a later remove of it clears the wrong slot.
-        let mut set = empty_set(8);
-        for line in [1, 3, 6, 7]
-        {
-            set.insert(line);
-        }
-        set.remove(3);
-        assert_eq!(members(&set), vec![1, 6, 7]);
-        set.remove(7);
-        assert_eq!(members(&set), vec![1, 6]);
-        set.remove(1);
-        set.remove(6);
-        assert_eq!(set.len(), 0);
-    }
-
-    #[test]
-    fn removing_a_non_member_changes_nothing()
-    {
-        let mut set = empty_set(8);
-        set.insert(2);
-        set.remove(4);
-        assert_eq!(members(&set), vec![2]);
-    }
-
-    #[test]
     fn target_selection_skips_ineligible_cpus_and_wraps()
     {
         // CPUs 1 and 2 ineligible (x86-64: an APIC id an I/O APIC cannot name).
@@ -1994,17 +1843,6 @@ mod tests
     fn target_selection_with_no_eligible_cpu_is_none()
     {
         assert_eq!(first_eligible_cpu(0, 4, |_| false), None);
-    }
-
-    #[test]
-    fn a_full_set_holds_every_line()
-    {
-        let mut set = empty_set(3);
-        for line in 0..3
-        {
-            set.insert(line);
-        }
-        assert_eq!(members(&set), vec![0, 1, 2]);
     }
 
     // Defect caught: a field lost or bled into another in the packed word, so a
@@ -2115,8 +1953,8 @@ mod tests
     #[test]
     fn a_change_on_another_cpu_frees_only_after_the_delivery_that_read_the_slot()
     {
-        use std::sync::mpsc::channel;
         use std::sync::Arc;
+        use std::sync::mpsc::channel;
 
         #[derive(Debug, PartialEq, Eq)]
         enum Step
@@ -2282,12 +2120,12 @@ mod tests
     // Defect caught: the table's byte count missing the pool, so the pool's
     // array runs past the allocation.
     #[test]
-    fn the_table_bytes_cover_routes_set_and_pool()
+    fn the_table_bytes_cover_routes_and_pool()
     {
         let space = IdSpace {
             lines: 24,
             messages: 868,
         };
-        assert_eq!(table_bytes(space), 892 * (40 + 8) + 868 * 4);
+        assert_eq!(table_bytes(space), 892 * 40 + 868 * 4);
     }
 }

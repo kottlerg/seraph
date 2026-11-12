@@ -481,10 +481,13 @@ pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32, out: &mut [u32]) -
     {
         return parse_madt_topology(table, bsp_id, out);
     }
-    if let Some(slot) = out.first_mut()
+    // The BSP alone, in slot 0; an `out` with no slot places nothing.
+    let Some(slot) = out.first_mut()
+    else
     {
-        *slot = bsp_id;
-    }
+        return 0;
+    };
+    *slot = bsp_id;
     1
 }
 
@@ -1816,10 +1819,10 @@ mod tests
     }
 
     #[test]
-    fn a_cpu_topology_walk_with_no_out_slot_reports_one_cpu()
+    fn a_cpu_topology_walk_with_no_out_slot_places_nothing()
     {
         // SAFETY: a zero RSDP address reads nothing.
-        assert_eq!(unsafe { parse_cpu_topology(0, 7, &mut []) }, 1);
+        assert_eq!(unsafe { parse_cpu_topology(0, 7, &mut []) }, 0);
         let mut out = [0u32; 2];
         // SAFETY: as above.
         assert_eq!(unsafe { parse_cpu_topology(0, 7, &mut out) }, 1);

@@ -326,9 +326,10 @@ After every run:
 
 The review records stay under `target/xtask/review/pr<N>/` in your worktree. The gate report
 names that path and each run's mode and head, and the orchestrator copies them: the harness
-refuses your own file writes outside your worktree. The files `cargo xtask` writes for you
-outside it (the orchestration record in the main checkout, the host lock in the git common
-directory) are the exception, as § Reporting and § Host runs use them.
+refuses your own file writes outside your worktree and the session's scratchpad. The files
+`cargo xtask` writes for you outside them (the orchestration record in the main checkout, the
+host lock in the git common directory) are the other exception, as § Reporting and § Host runs
+use them.
 
 ## Gate
 

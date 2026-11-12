@@ -566,9 +566,12 @@ fn install_name_for(name: &str) -> String
 fn shim_build_command(cargo: &Path, root: &Path) -> Command
 {
     let mut cmd = Command::new(cargo);
-    cmd.current_dir(root)
-        .envs(crate::util::CI_CARGO_ENV)
-        .args(["build", "--release", "-p", SHIM_PACKAGE]);
+    cmd.current_dir(root).envs(crate::util::CI_CARGO_ENV).args([
+        "build",
+        "--release",
+        "-p",
+        SHIM_PACKAGE,
+    ]);
     cmd
 }
 

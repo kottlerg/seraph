@@ -58,6 +58,14 @@ const fn page_of(entry: u64) -> u64
     ((entry & PPN_MASK) >> 10) << 12
 }
 
+/// Entry `i` of the table page at `table`. Every `i` passed comes from an
+/// `index` function that masks it below 512, the entries of a page, so the
+/// [`TableError::Invalid`] is never returned.
+fn entry(store: &mut impl TableStore, table: u64, i: usize) -> Result<&mut u64, TableError>
+{
+    store.table(table).get_mut(i).ok_or(TableError::Invalid)
+}
+
 /// How a walk treats a missing intermediate table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Walk
@@ -127,14 +135,19 @@ impl DeviceDirectory
     /// index counts device contexts).
     fn index(&self, id: u32, level: u32) -> usize
     {
+        // `leaf_bits` is 6 or 7, so no sum or difference below saturates
+        // and `bits` is at most 9.
         let leaf_bits = self.format.leaf_bits();
         let (shift, bits) = match level
         {
             0 => (0, leaf_bits),
             1 => (leaf_bits, 9),
-            _ => (leaf_bits + 9, 24 - leaf_bits - 9),
+            _ => (
+                leaf_bits.saturating_add(9),
+                24u32.saturating_sub(leaf_bits).saturating_sub(9),
+            ),
         };
-        ((id >> shift) & ((1 << bits) - 1)) as usize
+        ((id >> shift) & (1u32 << bits).saturating_sub(1)) as usize
     }
 
     /// The device context of `id`: its leaf page and the word index of its
@@ -155,20 +168,25 @@ impl DeviceDirectory
         for level in (1..self.levels).rev()
         {
             let i = self.index(id, level);
-            let entry = store.table(table)[i];
-            table = if entry & V != 0
+            let held = *entry(store, table, i)?;
+            table = if held & V != 0
             {
-                page_of(entry)
+                page_of(held)
             }
             else
             {
                 let next = store.alloc().ok_or(TableError::OutOfMemory)?;
-                store.table(table)[i] = ppn(next) | V;
+                *entry(store, table, i)? = ppn(next) | V;
                 store.written(table, i);
                 next
             };
         }
-        Ok((table, self.index(id, 0) * self.context_words()))
+        // A leaf page holds `2^leaf_bits` contexts of `context_words` words,
+        // 512 words in all, so the product does not saturate.
+        Ok((
+            table,
+            self.index(id, 0).saturating_mul(self.context_words()),
+        ))
     }
 }
 
@@ -225,9 +243,13 @@ impl FirstStage
         1u64 << self.mode.width_bits()
     }
 
+    /// The index of `iova` in a level-`level` table: 12 IOVA bits for the
+    /// page offset, then 9 for each level from the leaf (level 1). A level
+    /// is 1 to 4, so the shift stays far below `u32::MAX`.
     fn index(iova: u64, level: u32) -> usize
     {
-        ((iova >> (12 + 9 * (level - 1))) & 0x1ff) as usize
+        let shift = level.saturating_sub(1).saturating_mul(9).saturating_add(12);
+        ((iova >> shift) & 0x1ff) as usize
     }
 
     fn check(&self, iova: u64, phys: u64, len: u64) -> Result<(), TableError>
@@ -258,17 +280,17 @@ impl FirstStage
         for level in (2..=self.mode.levels()).rev()
         {
             let i = Self::index(iova, level);
-            let entry = store.table(table)[i];
-            table = if entry & V != 0
+            let held = *entry(store, table, i)?;
+            table = if held & V != 0
             {
-                page_of(entry)
+                page_of(held)
             }
             else if walk == Walk::Create
             {
                 let next = store.alloc().ok_or(TableError::OutOfMemory)?;
                 // A non-leaf entry is the valid bit and the page number; its
                 // R, W, X, U, A, and D bits stay clear.
-                store.table(table)[i] = ppn(next) | V;
+                *entry(store, table, i)? = ppn(next) | V;
                 store.written(table, i);
                 next
             }
@@ -302,20 +324,24 @@ impl FirstStage
             Access::Read => PTE_R,
             Access::ReadWrite => PTE_R | PTE_W | PTE_D,
         };
+        // `check` refused a range whose end passes `u64` from `iova` or from
+        // `phys`, and `len` is a multiple of `PAGE`, so no sum below
+        // saturates.
         let mut done = 0;
         while done < len
         {
-            let step = match self.leaf(store, iova + done, Walk::Create)
-            {
-                Ok((table, i)) if store.table(table)[i] & V == 0 =>
-                {
-                    store.table(table)[i] = ppn(phys + done) | V | PTE_U | PTE_A | rights;
+            let step = self
+                .leaf(store, iova.saturating_add(done), Walk::Create)
+                .and_then(|(table, i)| {
+                    let slot = entry(store, table, i)?;
+                    if *slot & V != 0
+                    {
+                        return Err(TableError::InUse);
+                    }
+                    *slot = ppn(phys.saturating_add(done)) | V | PTE_U | PTE_A | rights;
                     store.written(table, i);
                     Ok(())
-                }
-                Ok(_) => Err(TableError::InUse),
-                Err(e) => Err(e),
-            };
+                });
             if let Err(e) = step
             {
                 if done != 0
@@ -324,7 +350,7 @@ impl FirstStage
                 }
                 return Err(e);
             }
-            done += PAGE;
+            done = done.saturating_add(PAGE);
         }
         Ok(())
     }
@@ -343,17 +369,19 @@ impl FirstStage
     ) -> Result<(), TableError>
     {
         self.check(iova, 0, len)?;
+        // As in `map`, no sum below saturates.
         let mut done = 0;
         while done < len
         {
-            let (table, i) = self.leaf(store, iova + done, Walk::Existing)?;
-            if store.table(table)[i] & V == 0
+            let (table, i) = self.leaf(store, iova.saturating_add(done), Walk::Existing)?;
+            let slot = entry(store, table, i)?;
+            if *slot & V == 0
             {
                 return Err(TableError::NotMapped);
             }
-            store.table(table)[i] = 0;
+            *slot = 0;
             store.written(table, i);
-            done += PAGE;
+            done = done.saturating_add(PAGE);
         }
         Ok(())
     }

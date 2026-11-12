@@ -17,6 +17,9 @@
 //! exits without reporting ready, so devmgr runs DMA unconfined. See
 //! `docs/device-management.md` § IOMMU Discovery and Programming.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod backend;
 
 use std::sync::{Arc, Mutex, PoisonError};
@@ -68,7 +71,9 @@ impl Lock<Service<Riscv, KernelCaps>> for Shared
 /// register page.
 fn map_registers(aspace: u64, registers: Registers) -> Option<u64>
 {
-    if registers.pages * syscall_abi::PAGE_SIZE < iommu_riscv::regs::REGISTER_BYTES
+    // The bootstrap bounds `pages` to `MAX_REGISTER_PAGES`, so the product
+    // does not saturate.
+    if registers.pages.saturating_mul(syscall_abi::PAGE_SIZE) < iommu_riscv::regs::REGISTER_BYTES
     {
         std::os::seraph::log!(error: "register window: smaller than the register page");
         return None;

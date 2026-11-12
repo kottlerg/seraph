@@ -286,7 +286,9 @@ pub const fn ddtp_off(ddtp: u64) -> u64
 #[must_use]
 pub const fn device_id_bits(levels: u32, format: ContextFormat) -> u32
 {
-    let bits = format.leaf_bits() + 9 * levels.saturating_sub(1);
+    let bits = format
+        .leaf_bits()
+        .saturating_add(levels.saturating_sub(1).saturating_mul(9));
     if bits > 24 { 24 } else { bits }
 }
 
@@ -301,23 +303,13 @@ pub const PCI_DEVICE_ID_BITS: u32 = 16;
 #[must_use]
 pub fn directory_modes(format: ContextFormat) -> [DdtMode; 3]
 {
+    let holds_all = |levels: &u32| device_id_bits(*levels, format) >= PCI_DEVICE_ID_BITS;
+    let whole = (1..=3).filter(holds_all);
+    let part = (1..=3).rev().filter(|levels| !holds_all(levels));
     let mut out = [DdtMode::OneLevel; 3];
-    let mut n = 0;
-    for levels in 1..=3
+    for (slot, levels) in out.iter_mut().zip(whole.chain(part))
     {
-        if device_id_bits(levels, format) >= PCI_DEVICE_ID_BITS
-        {
-            out[n] = DdtMode::with_levels(levels);
-            n += 1;
-        }
-    }
-    for levels in (1..=3).rev()
-    {
-        if device_id_bits(levels, format) < PCI_DEVICE_ID_BITS
-        {
-            out[n] = DdtMode::with_levels(levels);
-            n += 1;
-        }
+        *slot = DdtMode::with_levels(levels);
     }
     out
 }
@@ -341,7 +333,8 @@ pub const FAULT_RECORD_WORDS: usize = 4;
 #[must_use]
 pub const fn queue_base(phys: u64, entries: u32) -> u64
 {
-    ((phys >> 12) << 10) | (entries.trailing_zeros() as u64 - 1)
+    // `entries` is 2 at least, so `log2(entries)` is 1 at least.
+    ((phys >> 12) << 10) | (entries.trailing_zeros() as u64).saturating_sub(1)
 }
 
 /// `cqcsr.cqen`: the command queue is enabled.

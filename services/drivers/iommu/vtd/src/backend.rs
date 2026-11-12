@@ -16,6 +16,7 @@
 use std::sync::atomic::{Ordering, fence};
 use std::time::{Duration, Instant};
 
+use iommu_core::table::TABLE_WORDS;
 use iommu_core::{Access, Backend, BackendError, Fault, RemapEntry, UnitInfo};
 use iommu_vtd::queue::{self, Descriptor, QUEUE_ENTRIES};
 use iommu_vtd::regs::{self, Capability};
@@ -26,7 +27,6 @@ use iommu_vtd::tables::{
 };
 
 use iommu_store::Store;
-use syscall_abi::PAGE_SIZE;
 
 /// How long a unit may take to complete one command (a root-pointer or
 /// remapping-table-pointer set, a translation, queued-invalidation, or
@@ -94,7 +94,11 @@ impl Unit
     fn checked(&self, off: usize, width: u64) -> Option<u64>
     {
         let off = off as u64;
-        (off + width <= self.regs_len).then_some(self.regs + off)
+        if off.checked_add(width)? > self.regs_len
+        {
+            return None;
+        }
+        self.regs.checked_add(off)
     }
 
     fn read32(&self, off: usize) -> u32
@@ -203,9 +207,12 @@ impl Unit
     /// invalidation queue error.
     fn clear_faults(&self)
     {
-        for i in 0..self.cap.fault_count
+        for record in 0..self.cap.fault_count
         {
-            self.write64(self.cap.fault_offset + i * 16 + 8, regs::FAULT_CLEAR);
+            // The high word; an offset past the register set is refused by
+            // `checked`, saturated or not.
+            let high = self.cap.fault_record(record).saturating_add(8);
+            self.write64(high, regs::FAULT_CLEAR);
         }
         self.write32(regs::FSTS, regs::FSTS_PFO | regs::FSTS_IQE);
     }
@@ -241,14 +248,27 @@ impl RemapTable
 {
     /// The table page holding entry `handle`, and the word index of the
     /// entry's low word in that page.
-    // cast_possible_truncation: the word index within a page is below 512.
-    #[allow(clippy::cast_possible_truncation)]
     fn slot(self, handle: u16) -> (u64, usize)
     {
-        let offset = u64::from(handle) * remap::ENTRY_BYTES;
-        let page = offset - offset % PAGE_SIZE;
-        (self.base + page, ((offset - page) / 8) as usize)
+        let (page, index) = remap::entry_place(handle);
+        // The table's pages are contiguous physical memory from `base`, so
+        // the sum does not saturate.
+        (self.base.saturating_add(page), index)
     }
+}
+
+/// The two words of the two-word entry at word `index` of `table`; `None`
+/// for an index whose entry does not lie in the page.
+fn entry_words(table: &mut [u64; TABLE_WORDS], index: usize) -> Option<&mut [u64; 2]>
+{
+    table.get_mut(index..)?.first_chunk_mut()
+}
+
+/// The byte offset of word `index` in a table page; past the page, and so
+/// refused by [`Store::flush`], when the product saturates.
+fn word_offset(index: usize) -> u64
+{
+    u64::try_from(index).map_or(u64::MAX, |i| i.saturating_mul(8))
 }
 
 /// One attached function: its unit, place in the unit's tables, domain ID,
@@ -289,7 +309,7 @@ impl Vtd
     /// failing, as a wait that never completes is.
     fn submit(&mut self, unit: usize, descriptors: &[Descriptor]) -> Result<(), BackendError>
     {
-        let u = &self.units[unit];
+        let u = self.unit(unit)?;
         let (queue, status) = (u.queue, u.status);
         let token = match u.token.wrapping_add(1)
         {
@@ -299,15 +319,16 @@ impl Vtd
         let mut tail = u.tail;
         for &d in descriptors.iter().chain(&[queue::wait(status, token)])
         {
-            self.write_entry(queue, tail * 2, d);
-            tail = (tail + 1) % QUEUE_ENTRIES;
+            // `tail` stays below `QUEUE_ENTRIES`, so neither step saturates.
+            self.write_entry(queue, tail.saturating_mul(2), d)?;
+            tail = tail.saturating_add(1) % QUEUE_ENTRIES;
         }
         let status_word = self
             .store
             .page_ptr(status)
             .ok_or(BackendError::Invalid)?
             .cast::<u32>();
-        let u = &mut self.units[unit];
+        let u = self.unit_mut(unit)?;
         u.tail = tail;
         u.token = token;
         u.write64(regs::IQT, queue::tail(tail));
@@ -327,15 +348,19 @@ impl Vtd
     /// Clear a two-word entry of the table page `table` at word `index`, the
     /// low word (which holds the present bit) first, and flush it. The
     /// stores are volatile, so they reach memory in that order.
-    fn clear_entry(&mut self, table: u64, index: usize)
+    /// [`BackendError::Invalid`], and nothing written, for an entry that does
+    /// not lie in the page.
+    fn clear_entry(&mut self, table: u64, index: usize) -> Result<(), BackendError>
     {
-        let t = self.store.table(table);
-        // SAFETY: both words lie in the table page `t` borrows exclusively.
+        let entry = entry_words(self.store.table(table), index).ok_or(BackendError::Invalid)?;
+        // SAFETY: both words lie in the table page `entry` borrows
+        // exclusively.
         unsafe {
-            core::ptr::write_volatile(&raw mut t[index], 0);
-            core::ptr::write_volatile(&raw mut t[index + 1], 0);
+            core::ptr::write_volatile(&raw mut entry[0], 0);
+            core::ptr::write_volatile(&raw mut entry[1], 0);
         }
-        self.store.flush(table, (index * 8) as u64, 16);
+        self.store.flush(table, word_offset(index), 16);
+        Ok(())
     }
 
     /// Invalidate every unit's cached copy of remapping entry `handle`.
@@ -358,13 +383,13 @@ impl Vtd
         entries: u32,
     ) -> Result<(), BackendError>
     {
-        let u = &self.units[unit];
+        let u = self.unit(unit)?;
         u.write64(regs::IRTA, remap::irta(table.base, entries, table.extended));
         let gsts = u.read32(regs::GSTS);
         u.write32(regs::GCMD, regs::gcmd_set(gsts, regs::G_SIRTP));
         u.wait(|u| u.read32(regs::GSTS) & regs::G_SIRTP != 0)?;
         self.submit(unit, &[queue::iec_global()])?;
-        let u = &self.units[unit];
+        let u = self.unit(unit)?;
         let gsts = u.read32(regs::GSTS);
         u.write32(regs::GCMD, regs::gcmd_remap_on(gsts));
         u.wait(|u| u.read32(regs::GSTS) & (regs::G_IRE | regs::G_CFI) == regs::G_IRE)
@@ -374,22 +399,41 @@ impl Vtd
     /// high word first, so the unit never reads a present low word beside a
     /// stale high one, and flush it. The stores are volatile, so they reach
     /// memory in that order (x86-64 keeps stores in program order).
+    /// [`BackendError::Invalid`], and nothing written, for an entry that does
+    /// not lie in the page.
     fn write_entry(&mut self, table: u64, index: usize, words: [u64; 2])
+    -> Result<(), BackendError>
     {
-        let t = self.store.table(table);
-        // SAFETY: both words lie in the table page `t` borrows exclusively.
+        let entry = entry_words(self.store.table(table), index).ok_or(BackendError::Invalid)?;
+        // SAFETY: both words lie in the table page `entry` borrows
+        // exclusively.
         unsafe {
-            core::ptr::write_volatile(&raw mut t[index + 1], words[1]);
-            core::ptr::write_volatile(&raw mut t[index], words[0]);
+            core::ptr::write_volatile(&raw mut entry[1], words[1]);
+            core::ptr::write_volatile(&raw mut entry[0], words[0]);
         }
-        self.store.flush(table, (index * 8) as u64, 16);
+        self.store.flush(table, word_offset(index), 16);
+        Ok(())
+    }
+
+    /// Unit `unit`. [`Service`](iommu_core::Service) passes only a unit the
+    /// bootstrap delivered, so the [`BackendError::Invalid`] is never
+    /// returned.
+    fn unit(&self, unit: usize) -> Result<&Unit, BackendError>
+    {
+        self.units.get(unit).ok_or(BackendError::Invalid)
+    }
+
+    /// Unit `unit`, as [`Self::unit`].
+    fn unit_mut(&mut self, unit: usize) -> Result<&mut Unit, BackendError>
+    {
+        self.units.get_mut(unit).ok_or(BackendError::Invalid)
     }
 
     /// Make the unit see a changed context entry: flush its write buffer,
     /// then invalidate the context cache and the IOTLB of domain `did`.
     fn context_changed(&mut self, unit: usize, did: u16) -> Result<(), BackendError>
     {
-        self.units[unit].flush_write_buffer()?;
+        self.unit(unit)?.flush_write_buffer()?;
         self.submit(unit, &[queue::context_global(), queue::iotlb_domain(did)])
     }
 
@@ -398,16 +442,22 @@ impl Vtd
     /// driver invalidates no other way.
     fn setup(&mut self, unit: usize) -> Result<(), BackendError>
     {
-        let u = &mut self.units[unit];
+        let u = self.unit_mut(unit)?;
         u.cap = Capability::decode(u.read64(regs::CAP));
         u.ecap = u.read64(regs::ECAP);
         let (levels, bits) = u.cap.table_depth().ok_or(BackendError::Invalid)?;
         u.levels = levels;
         u.width_bits = bits.min(u.cap.mgaw);
-        let last_fault = u.cap.fault_offset + u.cap.fault_count * 16;
+        // The last fault recording register's high word (`fault_count` is 1
+        // at least); an offset past the register set is refused by
+        // `checked`, saturated or not.
+        let last_fault = u
+            .cap
+            .fault_record(u.cap.fault_count.saturating_sub(1))
+            .saturating_add(8);
         if u.ecap & regs::ECAP_QI == 0
             || u.checked(regs::IRTA, 8).is_none()
-            || u.checked(last_fault - 8, 8).is_none()
+            || u.checked(last_fault, 8).is_none()
         {
             return Err(BackendError::Invalid);
         }
@@ -417,7 +467,7 @@ impl Vtd
         let queue = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
         let status = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
         let root = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
-        let u = &mut self.units[unit];
+        let u = self.unit_mut(unit)?;
         (u.queue, u.status, u.tail, u.token, u.root) = (queue, status, 0, 0, root);
         u.write64(regs::IQT, queue::tail(0));
         u.write64(regs::IQA, queue::iqa(queue));
@@ -426,7 +476,7 @@ impl Vtd
         u.set_root()?;
         u.flush_write_buffer()?;
         self.submit(unit, &[queue::context_global(), queue::iotlb_global()])?;
-        let u = &mut self.units[unit];
+        let u = self.unit_mut(unit)?;
         u.enable(regs::G_TE)?;
         u.enabled = true;
         Ok(())
@@ -469,18 +519,24 @@ impl Backend for Vtd
         let did = u16::try_from(did).map_err(|_| BackendError::Invalid)?;
         let [bus, devfn] = bdf.to_be_bytes();
         let bus = usize::from(bus);
-        if self.units[unit].context[bus] == 0
+        let u = self.unit(unit)?;
+        let (root, levels) = (u.root, u.levels);
+        // `context` has an entry per bus number, so the `get`s find `bus`.
+        let mut context = u.context.get(bus).copied().ok_or(BackendError::Invalid)?;
+        if context == 0
         {
-            let table = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
-            let root = self.units[unit].root;
-            self.write_entry(root, bus * 2, root_entry(table));
-            self.units[unit].context[bus] = table;
+            context = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
+            // A root entry is two words: 512 words for 256 buses.
+            self.write_entry(root, bus.saturating_mul(2), root_entry(context))?;
+            *self
+                .unit_mut(unit)?
+                .context
+                .get_mut(bus)
+                .ok_or(BackendError::Invalid)? = context;
         }
-        let levels = self.units[unit].levels;
         let tables = SecondLevel::new(&mut self.store, levels).ok_or(BackendError::OutOfMemory)?;
         let entry = context_index(devfn >> 3, devfn & 7);
-        let context = self.units[unit].context[bus];
-        self.write_entry(context, entry, context_entry(tables.root(), levels, did));
+        self.write_entry(context, entry, context_entry(tables.root(), levels, did))?;
         self.context_changed(unit, did)?;
         Ok(VtdDomain {
             unit,
@@ -506,7 +562,7 @@ impl Backend for Vtd
             Access::ReadWrite => SL_READ | SL_WRITE,
         };
         let mapped = domain.tables.map(&mut self.store, iova, phys, len, rights);
-        let u = &self.units[domain.unit];
+        let u = self.unit(domain.unit)?;
         u.flush_write_buffer()?;
         // A map that failed part-way undid the entries it wrote, which the
         // unit may have cached meanwhile; a unit in caching mode may cache
@@ -534,24 +590,37 @@ impl Backend for Vtd
             .tables
             .unmap(&mut self.store, iova, len)
             .map_err(table_error)?;
-        self.units[domain.unit].flush_write_buffer()?;
+        self.unit(domain.unit)?.flush_write_buffer()?;
         self.submit(domain.unit, &[queue::iotlb_domain(domain.did)])
     }
 
     fn block(&mut self, domain: &mut VtdDomain) -> Result<(), BackendError>
     {
-        let context = self.units[domain.unit].context[domain.bus];
-        self.clear_entry(context, domain.entry);
+        let context = self
+            .unit(domain.unit)?
+            .context
+            .get(domain.bus)
+            .copied()
+            .ok_or(BackendError::Invalid)?;
+        self.clear_entry(context, domain.entry)?;
         self.context_changed(domain.unit, domain.did)
     }
 
+    /// The limits of unit `unit`; none, a zero width and no domain ID, for a
+    /// unit the backend does not hold, which [`Service`](iommu_core::Service)
+    /// never asks for.
     fn query(&self, unit: usize) -> UnitInfo
     {
-        let u = &self.units[unit];
-        UnitInfo {
-            width_bits: u.width_bits,
-            domain_ids: u.cap.domains,
-        }
+        self.units.get(unit).map_or(
+            UnitInfo {
+                width_bits: 0,
+                domain_ids: 0,
+            },
+            |u| UnitInfo {
+                width_bits: u.width_bits,
+                domain_ids: u.cap.domains,
+            },
+        )
     }
 
     fn poll_faults(&mut self, record: &mut dyn FnMut(Fault))
@@ -565,11 +634,16 @@ impl Backend for Vtd
             let fsts = u.read32(regs::FSTS);
             if fsts & regs::FSTS_PPF != 0
             {
+                // Every record once, from the first pending one, wrapping.
+                let count = u.cap.fault_count;
                 let first = regs::fault_record_index(fsts);
-                for i in 0..u.cap.fault_count
+                for register in (0..count).cycle().skip(first).take(count)
                 {
-                    let off = u.cap.fault_offset + ((first + i) % u.cap.fault_count) * 16;
-                    let Some(f) = regs::decode_fault(u.read64(off), u.read64(off + 8))
+                    let off = u.cap.fault_record(register);
+                    // An offset past the register set is refused by
+                    // `checked`, saturated or not.
+                    let high = off.saturating_add(8);
+                    let Some(f) = regs::decode_fault(u.read64(off), u.read64(high))
                     else
                     {
                         continue;
@@ -580,7 +654,7 @@ impl Backend for Vtd
                         reason: u16::from(f.reason),
                         iova: f.address,
                     });
-                    u.write64(off + 8, regs::FAULT_CLEAR);
+                    u.write64(high, regs::FAULT_CLEAR);
                 }
             }
             if fsts & regs::FSTS_PFO != 0
@@ -637,21 +711,18 @@ impl Backend for Vtd
         let table = self.remap.ok_or(BackendError::Invalid)?;
         let (page, index) = table.slot(handle);
         let words = remap::entry(entry, table.extended);
-        let held = {
-            let t = self.store.table(page);
-            [t[index], t[index + 1]]
-        };
+        let held = *entry_words(self.store.table(page), index).ok_or(BackendError::Invalid)?;
         match remap::update(held, words)
         {
             remap::Update::Unchanged => return Ok(()),
             remap::Update::Replace =>
             {
-                self.clear_entry(page, index);
+                self.clear_entry(page, index)?;
                 self.invalidate_remap_entry(handle)?;
             }
             remap::Update::Write => (),
         }
-        self.write_entry(page, index, words);
+        self.write_entry(page, index, words)?;
         self.invalidate_remap_entry(handle)
     }
 
@@ -659,7 +730,7 @@ impl Backend for Vtd
     {
         let table = self.remap.ok_or(BackendError::Invalid)?;
         let (page, index) = table.slot(handle);
-        self.clear_entry(page, index);
+        self.clear_entry(page, index)?;
         self.invalidate_remap_entry(handle)
     }
 }

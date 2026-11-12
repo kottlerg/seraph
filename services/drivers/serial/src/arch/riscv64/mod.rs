@@ -29,6 +29,13 @@ const UART_LSR: u64 = 5; // line status register
 /// Mapped UART base virtual address, set once by [`serial_init`].
 static UART_BASE: AtomicU64 = AtomicU64::new(0);
 
+/// The address of the UART register at `offset` from the mapped page at
+/// `base`. Every offset lies inside the page, so the sum never saturates.
+fn register(base: u64, offset: u64) -> u64
+{
+    base.saturating_add(offset)
+}
+
 /// Reserve a VA page, map the UART's `Mmio` range, `registers`, into it, and
 /// enable the receive-data interrupt when `enable_rx_irq` is set. The
 /// reservation lives for the process's lifetime. `self_thread` is unused on
@@ -90,7 +97,7 @@ pub unsafe fn serial_init(
         // left IER cleared; without this the NS16550 never raises its APLIC
         // source. Skipped when the driver holds no IRQ cap (RX then polls).
         // SAFETY: base_va was just mapped via mmio_map; IER is within the page.
-        unsafe { core::ptr::write_volatile((base_va + UART_IER) as *mut u8, 0x01) };
+        unsafe { core::ptr::write_volatile(register(base_va, UART_IER) as *mut u8, 0x01) };
     }
     UART_BASE.store(base_va, Ordering::Release);
     true
@@ -105,8 +112,8 @@ pub fn serial_read_byte() -> Option<u8>
     {
         return None;
     }
-    let lsr = (base + UART_LSR) as *const u8;
-    let rx = (base + UART_RX) as *const u8;
+    let lsr = register(base, UART_LSR) as *const u8;
+    let rx = register(base, UART_RX) as *const u8;
     // SAFETY: `base` was mapped via mmio_map in serial_init; the LSR offset is
     // within the mapped page and byte-aligned. Reading it is side-effect-free.
     if unsafe { core::ptr::read_volatile(lsr) } & 0x01 == 0
@@ -128,8 +135,8 @@ pub fn serial_write_byte(byte: u8)
     {
         return;
     }
-    let tx = (base + UART_TX) as *mut u8;
-    let lsr = (base + UART_LSR) as *const u8;
+    let tx = register(base, UART_TX) as *mut u8;
+    let lsr = register(base, UART_LSR) as *const u8;
     // SAFETY: `base` was mapped via mmio_map in serial_init; both offsets are
     // within the mapped page and byte-aligned.
     while unsafe { core::ptr::read_volatile(lsr) } & 0x20 == 0

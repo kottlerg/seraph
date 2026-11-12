@@ -15,6 +15,12 @@
 //! changes. `orch state` prints the state as text short enough for a hook to
 //! put into a session's context. The exclusive grant is also written to the
 //! host lock (`crate::host_lock`), which refuses every boot not under it.
+//!
+//! The directory is the main checkout's, found through the git common
+//! directory as the host lock's is, so the command run in a worker's linked
+//! worktree reads and writes the same state and log as in the main checkout.
+//! A worker records its own status that way without sending the orchestrator
+//! a message (`.claude/agents/worker.md` § Reporting).
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -572,10 +578,34 @@ fn or_dash(text: &str) -> &str
 
 // ── Files ─────────────────────────────────────────────────────────────────────
 
-/// The directory that holds a batch's state and log.
+/// The directory that holds a batch's state and log: the main checkout's,
+/// also when the command runs in a linked worktree, so that a worker in its
+/// worktree records its status where the orchestrator reads it.
 fn state_dir(ctx: &BuildContext) -> PathBuf
 {
-    ctx.target_dir.join("xtask").join("orchestration")
+    state_dir_in(
+        &ctx.target_dir,
+        host_lock::git_common_dir(&ctx.root).as_deref(),
+    )
+}
+
+/// `target/xtask/orchestration/` of the main checkout whose git directory is
+/// `common`, the git common directory every worktree of that checkout shares.
+/// A checkout without a `.git` directory as its common directory (outside
+/// git, a bare repository, a separate git directory) keeps the one under
+/// `target_dir`, its own build directory.
+fn state_dir_in(target_dir: &Path, common: Option<&Path>) -> PathBuf
+{
+    let main_checkout = common
+        .filter(|common| common.file_name().is_some_and(|name| name == ".git"))
+        .and_then(Path::parent);
+    match main_checkout
+    {
+        Some(main_checkout) => main_checkout.join("target"),
+        None => target_dir.to_path_buf(),
+    }
+    .join("xtask")
+    .join("orchestration")
 }
 
 /// The lock that makes a change to the state exclusive: a file created for
@@ -956,6 +986,41 @@ mod tests
         let dir = std::env::temp_dir().join(format!("seraph-orch-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn the_state_is_the_main_checkouts_in_every_worktree()
+    {
+        let expected = Path::new("/src/seraph/target/xtask/orchestration");
+        // The main checkout: its git directory is its own `.git`.
+        assert_eq!(
+            state_dir_in(
+                Path::new("/src/seraph/target"),
+                Some(Path::new("/src/seraph/.git"))
+            ),
+            expected
+        );
+        // A linked worktree shares the main checkout's git directory.
+        assert_eq!(
+            state_dir_in(
+                Path::new("/src/seraph/.claude/worktrees/agent-a1/target"),
+                Some(Path::new("/src/seraph/.git"))
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_checkout_without_a_dot_git_directory_keeps_its_own_state()
+    {
+        let own = Path::new("/build/seraph/target/xtask/orchestration");
+        for common in [None, Some("/repos/seraph.git"), Some("/")]
+        {
+            assert_eq!(
+                state_dir_in(Path::new("/build/seraph/target"), common.map(Path::new)),
+                own
+            );
+        }
     }
 
     #[test]

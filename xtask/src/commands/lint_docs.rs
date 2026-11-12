@@ -128,17 +128,23 @@ pub fn run(ctx: &BuildContext, _args: &LintDocsArgs) -> Result<()>
     report(&diags)
 }
 
+/// The 1-based line number of the 0-based line index `idx`.
+fn one_based(idx: usize) -> usize
+{
+    idx.saturating_add(1)
+}
+
 fn report(diags: &[Diagnostic]) -> Result<()>
 {
-    let mut errors = 0;
-    let mut warnings = 0;
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
     for d in diags
     {
         let level = level_of(d.rule);
         match level
         {
-            Level::Error => errors += 1,
-            Level::Warning => warnings += 1,
+            Level::Error => errors = errors.saturating_add(1),
+            Level::Warning => warnings = warnings.saturating_add(1),
         }
         println!("{level} {}: {}:{}: {}", d.rule, d.path, d.line, d.message);
     }
@@ -273,7 +279,7 @@ fn check_columns(pat: &Patterns, file: &SourceFile) -> Vec<Diagnostic>
         diags.push(Diagnostic::new(
             "md-columns",
             &file.path,
-            idx + 1,
+            one_based(idx),
             format!("{width} columns exceeds the {COLUMN_LIMIT}-column limit"),
         ));
     }
@@ -292,7 +298,7 @@ fn check_bare_cites(pat: &Patterns, file: &SourceFile) -> Vec<Diagnostic>
             diags.push(Diagnostic::new(
                 "md-bare-cite",
                 &file.path,
-                idx + 1,
+                one_based(idx),
                 format!("`{}` cites a document without linking it", m.as_str()),
             ));
         }
@@ -344,7 +350,9 @@ fn front_matter_len(text: &str) -> usize
     {
         return 0;
     }
-    lines.position(|l| l == "---").map_or(0, |i| i + 2)
+    lines
+        .position(|l| l == "---")
+        .map_or(0, |i| i.saturating_add(2))
 }
 
 // ── src-header ────────────────────────────────────────────────────────────────
@@ -410,16 +418,18 @@ fn header_violation(path: &str, text: &str) -> Option<(usize, String)>
     if !lines.get(start).is_some_and(|l| l.starts_with(&spdx))
     {
         return Some((
-            start + 1,
+            one_based(start),
             "file must open with the SPDX license line".into(),
         ));
     }
     // The license block ends at the first blank line (a bare ` *` for blocks).
     let blank = |l: &str| l.trim().is_empty() || (prefix == " *" && l.trim() == "*");
-    let Some(end) = lines[start..]
+    let Some(end) = lines
         .iter()
-        .position(|l| blank(l))
-        .map(|i| start + i)
+        .enumerate()
+        .skip(start)
+        .find(|(_, l)| blank(l))
+        .map(|(i, _)| i)
     else
     {
         return Some((
@@ -429,52 +439,63 @@ fn header_violation(path: &str, text: &str) -> Option<(usize, String)>
     };
     // The path line follows the license block after exactly one blank line.
     let expected = format!("{prefix} {path}");
-    let path_idx = end + 1;
+    let path_idx = end.saturating_add(1);
     let Some(path_line) = lines.get(path_idx)
     else
     {
-        return Some((end + 1, format!("missing path line `{expected}`")));
+        return Some((one_based(end), format!("missing path line `{expected}`")));
     };
     if blank(path_line)
     {
         return Some((
-            path_idx + 1,
+            one_based(path_idx),
             "exactly one blank line separates the license block from the path line".into(),
         ));
     }
-    if lines[path_idx] != expected
+    if *path_line != expected
     {
-        return Some((path_idx + 1, format!("expected path line `{expected}`")));
+        return Some((
+            one_based(path_idx),
+            format!("expected path line `{expected}`"),
+        ));
     }
     if has_ext(path, "rs")
     {
-        if !lines.get(path_idx + 1).is_some_and(|l| l.trim().is_empty())
+        if !lines
+            .get(path_idx.saturating_add(1))
+            .is_some_and(|l| l.trim().is_empty())
         {
             return Some((
-                path_idx + 2,
+                path_idx.saturating_add(2),
                 "path line must be followed by a blank line".into(),
             ));
         }
         // The description opens the line after the blank.
-        match lines.get(path_idx + 2)
+        match lines.get(path_idx.saturating_add(2))
         {
             Some(l) if l.starts_with("//!") =>
             {}
             Some(l) if l.starts_with("#![") =>
             {
                 return Some((
-                    path_idx + 3,
+                    path_idx.saturating_add(3),
                     "crate attribute precedes the `//!` block".into(),
                 ));
             }
             Some(l) if l.trim().is_empty() =>
             {
                 return Some((
-                    path_idx + 3,
+                    path_idx.saturating_add(3),
                     "exactly one blank line separates the path line from the `//!` block".into(),
                 ));
             }
-            _ => return Some((path_idx + 3, "missing `//!` description".into())),
+            _ =>
+            {
+                return Some((
+                    path_idx.saturating_add(3),
+                    "missing `//!` description".into(),
+                ));
+            }
         }
     }
     None
@@ -498,7 +519,7 @@ fn prose_paragraphs(text: &str) -> Vec<String>
         }
         match (last, paragraphs.last_mut())
         {
-            (Some(prev), Some(paragraph)) if prev + 1 == idx =>
+            (Some(prev), Some(paragraph)) if prev.saturating_add(1) == idx =>
             {
                 paragraph.push(' ');
                 paragraph.push_str(line.trim());
@@ -579,8 +600,17 @@ fn summarized_by_section(text: &str) -> std::result::Result<(usize, String), Vio
             text.lines().count(),
             "missing `## Summarized By` section".to_owned(),
         ))?;
-    let line = lines[heading].0 + 1;
-    let before = lines[..heading]
+    let (head, tail) = lines.split_at(heading);
+    let Some((&(heading_idx, _), after)) = tail.split_first()
+    else
+    {
+        return Err((
+            text.lines().count(),
+            "missing `## Summarized By` section".to_owned(),
+        ));
+    };
+    let line = one_based(heading_idx);
+    let before = head
         .iter()
         .rev()
         .map(|(_, l)| *l)
@@ -592,7 +622,7 @@ fn summarized_by_section(text: &str) -> std::result::Result<(usize, String), Vio
             "`## Summarized By` must follow a `---` separator".into(),
         ));
     }
-    let body: Vec<&str> = lines[heading + 1..]
+    let body: Vec<&str> = after
         .iter()
         .map(|(_, l)| *l)
         .filter(|l| !l.trim().is_empty())
@@ -755,7 +785,11 @@ fn check_entry_form(
     let mut diags = Vec::new();
     for pair in entries.windows(2)
     {
-        let (before, after) = (&pair[0].1, &pair[1].1);
+        let [(_, before), (_, after)] = pair
+        else
+        {
+            continue;
+        };
         if before >= after
         {
             let what = if before == after
@@ -931,19 +965,24 @@ fn surface_range(text: &str) -> std::result::Result<(usize, usize), String>
         .iter()
         .position(|l| l.trim_end() == COVERAGE_HEADING)
         .ok_or_else(|| format!("no `{COVERAGE_HEADING}` heading"))?;
-    let section_end = lines[heading + 1..]
+    let section_end = lines
         .iter()
-        .position(|l| l.starts_with("## "))
-        .map_or(lines.len(), |i| heading + 1 + i);
+        .enumerate()
+        .skip(heading.saturating_add(1))
+        .find(|(_, l)| l.starts_with("## "))
+        .map_or(lines.len(), |(i, _)| i);
     let find = |from: usize, lead: &str| {
-        lines[from..section_end]
+        lines
             .iter()
-            .position(|l| l.starts_with(lead))
-            .map(|i| from + i)
+            .enumerate()
+            .take(section_end)
+            .skip(from)
+            .find(|(_, l)| l.starts_with(lead))
+            .map(|(i, _)| i)
             .ok_or_else(|| format!("no paragraph starting `{lead}` in `{COVERAGE_HEADING}`"))
     };
-    let start = find(heading + 1, SURFACE_START)?;
-    let end = find(start + 1, SURFACE_END)?;
+    let start = find(heading.saturating_add(1), SURFACE_START)?;
+    let end = find(start.saturating_add(1), SURFACE_END)?;
     Ok((start, end))
 }
 
@@ -967,18 +1006,24 @@ fn split_alternation(s: &str) -> Vec<&str>
             '\\' => escaped = true,
             '[' if !in_class => in_class = true,
             ']' if in_class => in_class = false,
-            '(' if !in_class => depth += 1,
+            '(' if !in_class => depth = depth.saturating_add(1),
             ')' if !in_class => depth = depth.saturating_sub(1),
             '|' if !in_class && depth == 0 =>
             {
-                parts.push(&s[begin..i]);
-                begin = i + 1;
+                if let Some(part) = s.get(begin..i)
+                {
+                    parts.push(part);
+                }
+                begin = i.saturating_add(1);
             }
             _ =>
             {}
         }
     }
-    parts.push(&s[begin..]);
+    if let Some(part) = s.get(begin..)
+    {
+        parts.push(part);
+    }
     parts
 }
 
@@ -993,11 +1038,11 @@ fn expand_groups(alt: &str) -> Vec<String>
     let mut depth = 0usize;
     let mut in_class = false;
     let mut i = 0;
-    while i < bytes.len()
+    while let Some(&byte) = bytes.get(i)
     {
-        match bytes[i]
+        match byte
         {
-            b'\\' => i += 1,
+            b'\\' => i = i.saturating_add(1),
             b'[' if !in_class => in_class = true,
             b']' if in_class => in_class = false,
             b'(' if !in_class =>
@@ -1006,18 +1051,25 @@ fn expand_groups(alt: &str) -> Vec<String>
                 {
                     open = Some(i);
                 }
-                depth += 1;
+                depth = depth.saturating_add(1);
             }
             b')' if !in_class && depth > 0 =>
             {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0
                 {
                     let start = open.unwrap_or(0);
-                    let prefix = &alt[..start];
-                    let inner = &alt[start + 1..i];
-                    let optional = bytes.get(i + 1) == Some(&b'?');
-                    let suffix = &alt[i + 1 + usize::from(optional)..];
+                    let optional = bytes.get(i.saturating_add(1)) == Some(&b'?');
+                    let (Some(prefix), Some(inner), Some(suffix)) = (
+                        alt.get(..start),
+                        alt.get(start.saturating_add(1)..i),
+                        alt.get(i.saturating_add(1).saturating_add(usize::from(optional))..),
+                    )
+                    else
+                    {
+                        // Not on character boundaries: no group to expand.
+                        return vec![alt.to_owned()];
+                    };
                     let mut options: Vec<&str> = split_alternation(inner);
                     if optional
                     {
@@ -1032,7 +1084,7 @@ fn expand_groups(alt: &str) -> Vec<String>
             _ =>
             {}
         }
-        i += 1;
+        i = i.saturating_add(1);
     }
     vec![alt.to_owned()]
 }
@@ -1128,12 +1180,12 @@ fn listed_names(text: &str) -> std::result::Result<Vec<ListedName>, String>
         }
         else if in_fence
         {
-            fenced_names(idx + 1, line)
+            fenced_names(one_based(idx), line)
         }
         else
         {
             spans
-                .read(idx + 1, line)
+                .read(one_based(idx), line)
                 .into_iter()
                 .filter_map(|(at, content)| prose_name(at, &content))
                 .collect()
@@ -1283,9 +1335,9 @@ fn path_resolves(pattern: &str, tracked: &[String]) -> bool
     let want: Vec<&str> = pattern.split('/').collect();
     tracked.iter().any(|path| {
         let have: Vec<&str> = path.split('/').collect();
-        if want.len() == 1
+        if let [single] = want.as_slice()
         {
-            have.last().is_some_and(|name| glob_matches(want[0], name))
+            have.last().is_some_and(|name| glob_matches(single, name))
         }
         else
         {

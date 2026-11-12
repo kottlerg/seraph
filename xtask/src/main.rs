@@ -22,6 +22,8 @@
 // windows-sys, wit-bindgen) come from third-party host deps (clap, gpt, fatfs,
 // libc, which); not resolvable without upstream releases.
 #![allow(clippy::multiple_crate_versions)]
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use clap::Parser;
 

@@ -147,7 +147,7 @@ pub fn migrate_to_file(socket: &Path, state_path: &Path, timeout: Duration) -> R
     client.send(&msg)?;
     client.read_result().context("migrate command")?;
 
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
     loop
     {
         client.send(r#"{"execute":"query-migrate"}"#)?;
@@ -160,7 +160,7 @@ pub fn migrate_to_file(socket: &Path, state_path: &Path, timeout: Duration) -> R
         {
             bail!("migration failed: {}", status.trim());
         }
-        if Instant::now() >= deadline
+        if start.elapsed() >= timeout
         {
             bail!(
                 "migration not completed within {}s: {}",
@@ -245,7 +245,7 @@ fn shell_quote(s: &str) -> String
 /// backslash-escaped and control characters written as `\u00XX`.
 fn json_string(s: &str) -> String
 {
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = String::with_capacity(s.len().saturating_add(2));
     out.push('"');
     for c in s.chars()
     {

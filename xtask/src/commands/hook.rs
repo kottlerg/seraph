@@ -193,8 +193,14 @@ impl Scan
     fn take(&mut self) -> Option<char>
     {
         let c = self.peek()?;
-        self.at += 1;
+        self.bump();
         Some(c)
+    }
+
+    /// Step past the character under the cursor.
+    fn bump(&mut self)
+    {
+        self.at = self.at.saturating_add(1);
     }
 
     fn push(&mut self, c: char)
@@ -237,7 +243,7 @@ impl Scan
             }
             '$' if self.peek() == Some('(') =>
             {
-                self.at += 1;
+                self.bump();
                 self.end_command();
                 self.nesting.push(Nesting::Subshell);
             }
@@ -308,7 +314,7 @@ impl Scan
     {
         while self.peek().is_some_and(|c| c != '\n')
         {
-            self.at += 1;
+            self.bump();
         }
     }
 
@@ -320,27 +326,27 @@ impl Scan
     /// command through, never refuse one.
     fn redirect_here(&mut self)
     {
-        self.at += 1;
+        self.bump();
         if self.peek() == Some('<')
         {
-            self.at += 1;
+            self.bump();
             return;
         }
         let strip_tabs = self.peek() == Some('-');
         if strip_tabs
         {
-            self.at += 1;
+            self.bump();
         }
         while self.peek().is_some_and(|c| c == ' ' || c == '\t')
         {
-            self.at += 1;
+            self.bump();
         }
         let mut delimiter = String::new();
         while let Some(c) = self
             .peek()
             .filter(|c| !c.is_whitespace() && !";|&()".contains(*c))
         {
-            self.at += 1;
+            self.bump();
             if !matches!(c, '\'' | '"' | '\\')
             {
                 delimiter.push(c);
@@ -358,14 +364,16 @@ impl Scan
     {
         for (delimiter, strip_tabs) in std::mem::take(&mut self.heredocs)
         {
-            while self.at < self.chars.len()
+            while let Some(rest) = self.chars.get(self.at..).filter(|r| !r.is_empty())
             {
-                let end = self.chars[self.at..]
-                    .iter()
-                    .position(|c| *c == '\n')
-                    .map_or(self.chars.len(), |n| self.at + n);
-                let text: String = self.chars[self.at..end].iter().collect();
-                self.at = (end + 1).min(self.chars.len());
+                let total = self.chars.len();
+                let line = rest.split(|c| *c == '\n').next().unwrap_or(rest);
+                let text: String = line.iter().collect();
+                self.at = self
+                    .at
+                    .saturating_add(line.len())
+                    .saturating_add(1)
+                    .min(total);
                 let text = if strip_tabs
                 {
                     text.trim_start_matches('\t')
@@ -405,13 +413,13 @@ fn program(mut words: &[String]) -> &[String]
 {
     loop
     {
-        while words
-            .first()
-            .is_some_and(|w| is_assignment(w) || RESERVED.contains(&w.as_str()))
+        while let Some((_, tail)) = words
+            .split_first()
+            .filter(|(w, _)| is_assignment(w) || RESERVED.contains(&w.as_str()))
         {
-            words = &words[1..];
+            words = tail;
         }
-        let Some(first) = words.first()
+        let Some((first, args)) = words.split_first()
         else
         {
             return words;
@@ -422,7 +430,7 @@ fn program(mut words: &[String]) -> &[String]
         {
             return words;
         };
-        words = wrapped(&words[1..], value_options, *operands);
+        words = wrapped(args, value_options, *operands);
     }
 }
 
@@ -431,20 +439,20 @@ fn program(mut words: &[String]) -> &[String]
 fn wrapped<'a>(mut rest: &'a [String], value_options: &[&str], mut operands: usize)
 -> &'a [String]
 {
-    while let Some(word) = rest.first()
+    while let Some((word, tail)) = rest.split_first()
     {
         if value_options.contains(&word.as_str())
         {
-            rest = rest.get(2..).unwrap_or(&[]);
+            rest = tail.get(1..).unwrap_or(&[]);
         }
         else if word.starts_with('-') || is_assignment(word)
         {
-            rest = &rest[1..];
+            rest = tail;
         }
         else if operands > 0
         {
-            operands -= 1;
-            rest = &rest[1..];
+            operands = operands.saturating_sub(1);
+            rest = tail;
         }
         else
         {
@@ -459,8 +467,9 @@ fn wrapped<'a>(mut rest: &'a [String], value_options: &[&str], mut operands: usi
 /// option, or no subcommand).
 fn cargo_subcommand(args: &[String]) -> Option<(&str, &[String])>
 {
-    let mut i = 0;
-    while let Some(word) = args.get(i)
+    let mut rest = args;
+    let mut first = true;
+    while let Some((word, tail)) = rest.split_first()
     {
         if CARGO_QUERY_OPTIONS.contains(&word.as_str())
         {
@@ -468,16 +477,17 @@ fn cargo_subcommand(args: &[String]) -> Option<(&str, &[String])>
         }
         if CARGO_VALUE_OPTIONS.contains(&word.as_str())
         {
-            i += 2;
+            rest = tail.get(1..).unwrap_or(&[]);
         }
-        else if word.starts_with('-') || (i == 0 && word.starts_with('+'))
+        else if word.starts_with('-') || (first && word.starts_with('+'))
         {
-            i += 1;
+            rest = tail;
         }
         else
         {
-            return Some((word.as_str(), &args[i + 1..]));
+            return Some((word.as_str(), tail));
         }
+        first = false;
     }
     None
 }
@@ -486,21 +496,21 @@ fn cargo_subcommand(args: &[String]) -> Option<(&str, &[String])>
 /// after it.
 fn gh_command(args: &[String]) -> Option<(&str, &str, &[String])>
 {
-    let mut i = 0;
-    while let Some(word) = args.get(i)
+    let mut rest = args;
+    while let Some((word, tail)) = rest.split_first()
     {
         if word == "-R" || word == "--repo"
         {
-            i += 2;
+            rest = tail.get(1..).unwrap_or(&[]);
         }
         else if word.starts_with('-')
         {
-            i += 1;
+            rest = tail;
         }
         else
         {
-            let verb = args.get(i + 1)?;
-            return Some((word.as_str(), verb.as_str(), &args[i + 2..]));
+            let (verb, after) = tail.split_first()?;
+            return Some((word.as_str(), verb.as_str(), after));
         }
     }
     None
@@ -510,16 +520,16 @@ fn gh_command(args: &[String]) -> Option<(&str, &str, &[String])>
 /// `merge`. `None` when it names a branch or a URL, or nothing.
 fn merge_number(args: &[String]) -> Option<u64>
 {
-    let mut i = 0;
-    while let Some(word) = args.get(i)
+    let mut rest = args;
+    while let Some((word, tail)) = rest.split_first()
     {
         if MERGE_VALUE_OPTIONS.contains(&word.as_str())
         {
-            i += 2;
+            rest = tail.get(1..).unwrap_or(&[]);
         }
         else if word.starts_with('-')
         {
-            i += 1;
+            rest = tail;
         }
         else
         {
@@ -933,7 +943,10 @@ fn answer_event(raw: &str, gate: &dyn Fn(u64) -> Gate) -> Answer
     {
         return Answer::Pass;
     };
-    let command = event["tool_input"]["command"].as_str().unwrap_or("");
+    let command = event
+        .pointer("/tool_input/command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     answer_bash(command, Caller::of(&event), gate)
 }
 

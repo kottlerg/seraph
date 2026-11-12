@@ -113,7 +113,7 @@ impl Form
 {
     fn of(record: &Value) -> Self
     {
-        if record["stats"]["form"] == DEFECT_FORM
+        if field(record, "/stats/form") == DEFECT_FORM
         {
             Form::Defects
         }
@@ -325,7 +325,7 @@ fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
             "`audit_verdict` is `NOT RUN` and `audit` is not null; a run of the reviewer \
              alone has both, an audited run neither"
         }
-        else if record["stats"]["mode"] == "audit"
+        else if field(record, "/stats/mode") == "audit"
         {
             "an `audit` record states the audit it is; `NOT RUN` belongs to a `full` or \
              `delta` record"
@@ -352,10 +352,10 @@ fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
         out,
         name,
         "audit.verdict",
-        &record["audit"]["verdict"],
+        field(record, "/audit/verdict"),
         AUDIT_VERDICTS,
     );
-    if !record["audit"]["sections"].is_array()
+    if !field(record, "/audit/sections").is_array()
     {
         out.push(shape(name, "audit.sections", "is not a list"));
     }
@@ -470,15 +470,21 @@ fn names_head(name: &str, head: &str) -> bool
 /// is a prefix of the other, since either may be abbreviated.
 fn reviewed(record: &Value, head: &str) -> bool
 {
-    record["stats"]["head"]
+    field(record, "/stats/head")
         .as_str()
         .is_some_and(|reviewed| head.starts_with(reviewed) || reviewed.starts_with(head))
+}
+
+/// The value at the JSON pointer `path` in `record`, `null` when absent.
+fn field<'a>(record: &'a Value, path: &str) -> &'a Value
+{
+    record.pointer(path).unwrap_or(&Value::Null)
 }
 
 /// A record's place in the PR's sequence of runs: `stats.run`.
 fn run_number(record: &Value) -> u64
 {
-    record["stats"]["run"].as_u64().unwrap_or(0)
+    field(record, "/stats/run").as_u64().unwrap_or(0)
 }
 
 /// Whether a record's run passes: `AUDIT PASS`, no failed agent, and a
@@ -486,8 +492,8 @@ fn run_number(record: &Value) -> u64
 /// `NON-BLOCKING ISSUES ONLY`.
 fn passes(record: &Value) -> bool
 {
-    record["audit_verdict"] == "AUDIT PASS"
-        && record["stats"]["failed"]
+    field(record, "/audit_verdict") == "AUDIT PASS"
+        && field(record, "/stats/failed")
             .as_array()
             .is_some_and(Vec::is_empty)
         && verdict_passes(record)
@@ -535,7 +541,7 @@ fn runs_at<'a>(records: &'a [Record], head: &str) -> Result<Vec<&'a Record>, Vec
                 name.as_str(),
                 format!(
                     "the record's name puts it at this head, but it reviewed {}",
-                    record["stats"]["head"].as_str().unwrap_or("")
+                    field(record, "/stats/head").as_str().unwrap_or("")
                 ),
             )
         })
@@ -575,15 +581,15 @@ fn runs_at<'a>(records: &'a [Record], head: &str) -> Result<Vec<&'a Record>, Vec
 fn completed_run<'a>(runs: &[&'a Record]) -> Option<&'a Record>
 {
     let (last, before) = runs.split_last()?;
-    if last.1["stats"]["mode"] != "audit"
+    if field(&last.1, "/stats/mode") != "audit"
     {
         return None;
     }
     before
         .iter()
         .rev()
-        .find(|(_, r)| r["stats"]["mode"] != "audit")
-        .filter(|(_, r)| r["audit_verdict"] == NOT_RUN)
+        .find(|(_, r)| field(r, "/stats/mode") != "audit")
+        .filter(|(_, r)| field(r, "/audit_verdict") == NOT_RUN)
         .copied()
 }
 
@@ -629,7 +635,10 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
     // blocks whatever the audit record states.
     let completed = completed_run(&runs);
     if let Some((run_name, run)) = completed
-        && !(verdict_passes(run) && run["stats"]["failed"].as_array().is_some_and(Vec::is_empty))
+        && !(verdict_passes(run)
+            && field(run, "/stats/failed")
+                .as_array()
+                .is_some_and(Vec::is_empty))
     {
         return vec![Diag::error(
             "gate-review-record",
@@ -714,7 +723,7 @@ fn ledger_of(records: &[Record], settled: impl Fn(&Value) -> bool) -> Vec<Value>
     let mut entries: Vec<Value> = Vec::new();
     for (_, record) in records
     {
-        let run: String = record["stats"]["head"]
+        let run: String = field(record, "/stats/head")
             .as_str()
             .unwrap_or("")
             .chars()
@@ -768,20 +777,22 @@ fn release_ledger(records: &[Record]) -> Vec<Value>
         .iter()
         .map(|(name, record)| {
             let mut record = record.clone();
-            let undecided: Vec<Value> = record["undecided"]
-                .as_array()
+            let undecided: Vec<Value> = record
+                .get("undecided")
+                .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
                 .filter(|f| ruled(f))
                 .cloned()
                 .collect();
-            if let Some(recorded) = record["recorded"].as_array_mut()
+            if let Some(recorded) = record.get_mut("recorded").and_then(Value::as_array_mut)
             {
                 recorded.extend(undecided);
             }
             else if !undecided.is_empty()
+                && let Some(object) = record.as_object_mut()
             {
-                record["recorded"] = Value::Array(undecided);
+                object.insert("recorded".to_owned(), Value::Array(undecided));
             }
             (name.clone(), record)
         })
@@ -940,14 +951,14 @@ fn print_release_ledger(
     )?;
     let prs = merged_prs(&subjects);
     let mut entries = Vec::new();
-    let mut read = 0;
+    let mut read: usize = 0;
     for pr in &prs
     {
         let dir = record_dir(ctx, *pr);
         if dir.is_dir()
         {
             let records = read_records(&dir)?;
-            read += records.len();
+            read = read.saturating_add(records.len());
             entries.extend(ledger_of(&records, |_| true));
         }
     }
@@ -955,7 +966,7 @@ fn print_release_ledger(
     if release_dir.is_dir()
     {
         let records = read_records(&release_dir)?;
-        read += records.len();
+        read = read.saturating_add(records.len());
         entries.extend(release_ledger(&records));
     }
     let mut entries = for_files(entries, files);

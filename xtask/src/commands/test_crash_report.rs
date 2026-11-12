@@ -71,11 +71,8 @@ fn declined_tids(log: &str) -> HashMap<u64, u64>
 {
     log.lines()
         .filter_map(|line| {
-            let at = line.find(DECLINE_TAG)?;
-            let hex: String = line[at + DECLINE_TAG.len()..]
-                .chars()
-                .take_while(char::is_ascii_hexdigit)
-                .collect();
+            let (_, after) = line.split_once(DECLINE_TAG)?;
+            let hex: String = after.chars().take_while(char::is_ascii_hexdigit).collect();
             let reason = u64::from_str_radix(&hex, 16).ok()?;
             Some((reason, number_after(line, "tid=")?))
         })
@@ -85,11 +82,8 @@ fn declined_tids(log: &str) -> HashMap<u64, u64>
 /// The decimal number directly after `tag` in `line`.
 fn number_after(line: &str, tag: &str) -> Option<u64>
 {
-    let at = line.find(tag)?;
-    let digits: String = line[at + tag.len()..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
+    let (_, after) = line.split_once(tag)?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
 }
 
@@ -104,12 +98,9 @@ fn dumped_register(log: &str, tid: u64, name: &str) -> Option<u64>
     lines.find(|line| number_after(line, DUMP_TAG) == Some(tid))?;
     for line in lines.take_while(|line| !line.contains(DUMP_TAG))
     {
-        if let Some(at) = line.find(&token)
+        if let Some((_, after)) = line.split_once(token.as_str())
         {
-            let hex: String = line[at + token.len()..]
-                .chars()
-                .take_while(char::is_ascii_hexdigit)
-                .collect();
+            let hex: String = after.chars().take_while(char::is_ascii_hexdigit).collect();
             return u64::from_str_radix(&hex, 16).ok();
         }
     }

@@ -211,13 +211,14 @@ impl Guest
     }
 
     /// Echo serial lines until every marker has appeared (in any order) or
-    /// the deadline passes.
-    fn wait_for_markers(&mut self, markers: &[&str], deadline: Instant) -> Result<()>
+    /// `timeout` passes.
+    fn wait_for_markers(&mut self, markers: &[&str], timeout: Duration) -> Result<()>
     {
+        let start = Instant::now();
         let mut pending: Vec<&str> = markers.to_vec();
         loop
         {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero()
             {
                 bail!("timed out waiting for markers: {pending:?}");
@@ -248,7 +249,7 @@ impl Guest
     /// drops.
     fn wait_exit(mut self, timeout: Duration) -> Result<()>
     {
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
         loop
         {
             if self
@@ -263,7 +264,7 @@ impl Guest
                 }
                 return Ok(());
             }
-            if Instant::now() >= deadline
+            if start.elapsed() >= timeout
             {
                 bail!("QEMU did not exit within {}s after quit", timeout.as_secs());
             }
@@ -299,7 +300,7 @@ pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
     // (see `Guest`).
     let mut guest_a = Guest::launch(&qemu_binary, ctx, args, &sock_a, GUID_A, None)?;
     guest_a
-        .wait_for_markers(&[ARMED_MARKER, READY_MARKER], Instant::now() + TIMEOUT)
+        .wait_for_markers(&[ARMED_MARKER, READY_MARKER], TIMEOUT)
         .context("boot A")?;
 
     // ── Save: migrate to file, then quit to release the disk lock ──────────
@@ -312,13 +313,13 @@ pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
     step("vmgenid test: boot B (restore with new GUID) — waiting for detection");
     let mut guest_b = Guest::launch(&qemu_binary, ctx, args, &sock_b, GUID_B, Some(&incoming))?;
     guest_b
-        .wait_for_markers(&[CHANGE_MARKER], Instant::now() + TIMEOUT)
+        .wait_for_markers(&[CHANGE_MARKER], TIMEOUT)
         .context("generation-change detection after restore")?;
 
     // ── Liveness: the resumed guest still draws and schedules ───────────────
     step("vmgenid test: post-resume liveness round (help via QMP)");
     qmp::inject_events(&sock_b, EVENTS).context("QMP key injection after resume")?;
-    let live = guest_b.wait_for_markers(&[CHILD_LINE], Instant::now() + TIMEOUT);
+    let live = guest_b.wait_for_markers(&[CHILD_LINE], TIMEOUT);
     guest_b.shutdown();
     let _ = std::fs::remove_file(&state_path);
     for p in [&sock_a, &sock_b]

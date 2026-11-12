@@ -180,7 +180,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         }
     });
 
-    let deadline = Instant::now() + TIMEOUT;
+    let start = Instant::now();
     // Two input rounds in one boot. `ready` gates the first injection on the
     // READY marker; `kbd_pass` gates the keyboard→serial transition. The
     // transcript is cleared between rounds so the serial round's assertions
@@ -193,7 +193,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
 
     loop
     {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = TIMEOUT.saturating_sub(start.elapsed());
         if remaining.is_zero()
         {
             break;

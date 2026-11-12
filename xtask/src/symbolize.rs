@@ -128,12 +128,14 @@ impl<'data> Symbolizer<'data>
     fn resolve_symbol(&self, vaddr: u64) -> Resolution
     {
         let after = self.symbols.partition_point(|sym| sym.address <= vaddr);
-        let Some(sym) = after.checked_sub(1).map(|idx| &self.symbols[idx])
+        let Some((sym, offset)) = after
+            .checked_sub(1)
+            .and_then(|idx| self.symbols.get(idx))
+            .and_then(|sym| Some((sym, vaddr.checked_sub(sym.address)?)))
         else
         {
             return Resolution::Unresolved;
         };
-        let offset = vaddr - sym.address;
         if sym.size != 0 && offset >= sym.size
         {
             return Resolution::Unresolved;
@@ -288,7 +290,10 @@ pub fn format_resolution(addr: u64, vaddr: u64, resolution: &Resolution) -> Vec<
         format!("{addr:#018x} (image {vaddr:#x})")
     };
     let mut lines = describe_resolution(resolution);
-    lines[0] = format!("{head}: {}", lines[0]);
+    if let Some(first) = lines.first_mut()
+    {
+        *first = format!("{head}: {first}");
+    }
     lines
 }
 

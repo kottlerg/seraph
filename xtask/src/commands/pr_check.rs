@@ -175,7 +175,12 @@ fn refs_in(pattern: &Regex, text: &str, forms: &[(Option<usize>, usize)]) -> Vec
         {
             continue;
         };
-        let line = text[..whole.start()].matches('\n').count() + 1;
+        let line = text
+            .get(..whole.start())
+            .unwrap_or("")
+            .matches('\n')
+            .count()
+            .saturating_add(1);
         out.push(IssueRef {
             repo,
             issue: number,
@@ -232,7 +237,12 @@ pub fn prose_closing_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
     closing_refs(pat, text)
         .into_iter()
         .filter(|found| {
-            let line = lines.get(found.line - 1).copied().unwrap_or("");
+            let line = found
+                .line
+                .checked_sub(1)
+                .and_then(|index| lines.get(index))
+                .copied()
+                .unwrap_or("");
             let rest = pat.closing_ref.replace_all(unmarked(line), "");
             rest.split(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | ';'))
                 .any(|word| !word.is_empty() && word != "and")
@@ -491,7 +501,7 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
         {
             out.push(Diag::error(
                 "pr-unticked-box",
-                format!("body:{}", index + 1),
+                format!("body:{}", index.saturating_add(1)),
                 format!(
                     "`{}` is unticked; tick it or remove it with a one-line rationale",
                     line.trim()
@@ -781,23 +791,23 @@ pub fn own_change_difference(own_validated: &str, own_head: &str) -> Vec<(Side, 
         {
             (Some(a), Some(b)) if a == b =>
             {
-                i += 1;
-                j += 1;
+                i = i.saturating_add(1);
+                j = j.saturating_add(1);
             }
             (Some(a), Some(b)) if a < b =>
             {
                 out.push((Side::Validated, a.clone()));
-                i += 1;
+                i = i.saturating_add(1);
             }
             (Some(a), None) =>
             {
                 out.push((Side::Validated, a.clone()));
-                i += 1;
+                i = i.saturating_add(1);
             }
             (_, Some(b)) =>
             {
                 out.push((Side::Head, b.clone()));
-                j += 1;
+                j = j.saturating_add(1);
             }
             (None, None) => break,
         }
@@ -1339,10 +1349,22 @@ pub fn check_referenced_issue(issue: &Issue, pr: u64) -> Vec<Diag>
 fn issue_from(value: &Value) -> Issue
 {
     Issue {
-        number: value["number"].as_u64().unwrap_or(0),
-        title: value["title"].as_str().unwrap_or("").to_owned(),
-        body: value["body"].as_str().unwrap_or("").to_owned(),
-        milestone: value["milestone"]["title"].as_str().map(str::to_owned),
+        number: value.get("number").and_then(Value::as_u64).unwrap_or(0),
+        title: value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        body: value
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        milestone: value
+            .get("milestone")
+            .and_then(|m| m.get("title"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     }
 }
 
@@ -1613,11 +1635,17 @@ pub fn run_pr_check(ctx: &BuildContext, args: &PrCheckArgs) -> Result<()>
             "body,headRefOid,baseRefName,mergeStateStatus,statusCheckRollup,milestone",
         ],
     )?;
-    let body = pr["body"].as_str().unwrap_or("");
-    let head = pr["headRefOid"]
-        .as_str()
+    let body = pr.get("body").and_then(Value::as_str).unwrap_or("");
+    let head = pr
+        .get("headRefOid")
+        .and_then(Value::as_str)
         .context("the pull request has no head")?;
-    let base = format!("origin/{}", pr["baseRefName"].as_str().unwrap_or("master"));
+    let base = format!(
+        "origin/{}",
+        pr.get("baseRefName")
+            .and_then(Value::as_str)
+            .unwrap_or("master")
+    );
     if !git_ok(
         &ctx.root,
         &["cat-file", "-e", &format!("{head}^{{commit}}")],
@@ -1630,7 +1658,7 @@ pub fn run_pr_check(ctx: &BuildContext, args: &PrCheckArgs) -> Result<()>
     let mut diags = check_commits(&pat, &commits);
     diags.extend(check_body(&pat, body));
     diags.extend(check_validated_head(&pat, &ctx.root, body, &base, head)?);
-    if !pr["milestone"].is_null()
+    if !pr.get("milestone").is_none_or(Value::is_null)
     {
         diags.push(Diag::error(
             "pr-milestone",

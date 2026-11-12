@@ -57,16 +57,18 @@ impl Iterator for RawDescriptors<'_>
         // The firmware reports `map_size`; the buffer bounds it, so a map no
         // reader is sized for is never read past the buffer.
         let end = self.map.map_size.min(self.map.buffer_size);
+        let next_offset = self.offset.checked_add(self.map.descriptor_size)?;
         if self.map.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
-            || self.offset + self.map.descriptor_size > end
+            || next_offset > end
         {
             return None;
         }
         // cast_possible_truncation: buffer_phys is a UEFI physical address;
         // on all supported UEFI targets (x86_64, riscv64) usize == u64.
         #[allow(clippy::cast_possible_truncation)]
-        let ptr = (self.map.buffer_phys as usize + self.offset) as *const EfiMemoryDescriptor;
-        self.offset += self.map.descriptor_size;
+        let ptr =
+            (self.map.buffer_phys as usize).checked_add(self.offset)? as *const EfiMemoryDescriptor;
+        self.offset = next_offset;
         // SAFETY: the type invariant (`new`'s contract) puts a valid descriptor
         // at every stride below `map_size`; `read_unaligned` makes no alignment
         // demand on a firmware-chosen stride.
@@ -109,7 +111,12 @@ pub unsafe fn translate_memory_map(
             break;
         }
         let memory_type = translate_memory_type(desc.memory_type);
-        let size_bytes = desc.number_of_pages * 4096;
+        // A page count whose byte size overflows `u64` is no real region: skip it.
+        let Some(size_bytes) = desc.number_of_pages.checked_mul(4096)
+        else
+        {
+            continue;
+        };
 
         // SAFETY: count < max_entries; out[count] is within the allocated array.
         unsafe {
@@ -122,7 +129,8 @@ pub unsafe fn translate_memory_map(
                 },
             );
         }
-        count += 1;
+        // `count` is below `max_entries`, so it is far below `usize::MAX`.
+        count = count.saturating_add(1);
     }
 
     count
@@ -203,7 +211,8 @@ where
         {
             emit(MmioAperture {
                 phys_base: cur,
-                size: end - cur,
+                // `cur` is below `end`, so the difference is exact.
+                size: end.saturating_sub(cur),
             });
             return;
         };
@@ -211,7 +220,8 @@ where
         {
             emit(MmioAperture {
                 phys_base: cur,
-                size: start - cur,
+                // `start` is above `cur`, so the difference is exact.
+                size: start.saturating_sub(cur),
             });
         }
         cur = stop;
@@ -246,7 +256,7 @@ fn descriptor_range(d: &EfiMemoryDescriptor) -> (u64, u64)
 #[must_use]
 pub const fn aperture_capacity(descriptors: usize, seeds: usize) -> usize
 {
-    2 * descriptors + seeds
+    descriptors.saturating_mul(2).saturating_add(seeds)
 }
 
 /// Derive the coarse MMIO aperture array from the raw UEFI memory map and
@@ -405,21 +415,28 @@ fn sweep_merged(
             return (n, false);
         };
         last_base = Some(base);
-        if n > 0 && base <= out[n - 1].phys_base.saturating_add(out[n - 1].size)
+        let last = n
+            .checked_sub(1)
+            .and_then(|k| out.get_mut(k))
+            .filter(|l| base <= l.phys_base.saturating_add(l.size));
+        if let Some(last) = last
         {
-            let top = out[n - 1].phys_base.saturating_add(out[n - 1].size);
+            let top = last.phys_base.saturating_add(last.size);
             if end > top
             {
-                out[n - 1].size = end - out[n - 1].phys_base;
+                // `end` is above `top`, which is at least `last.phys_base`.
+                last.size = end.saturating_sub(last.phys_base);
             }
         }
-        else if n < out.len()
+        else if let Some(slot) = out.get_mut(n)
         {
-            out[n] = MmioAperture {
+            *slot = MmioAperture {
                 phys_base: base,
-                size: end - base,
+                // `end` is at least `base`: it is `base` plus a size, saturated.
+                size: end.saturating_sub(base),
             };
-            n += 1;
+            // `n` indexed a slot of `out`, so it is far below `usize::MAX`.
+            n = n.saturating_add(1);
         }
         else
         {
@@ -444,18 +461,23 @@ fn insert_merged(set: &mut [MmioAperture], len: &mut usize, ap: MmioAperture) ->
     let mut base = ap.phys_base;
     let mut end = base.saturating_add(ap.size);
     // Entries wholly below `ap`, not even abutting it, stay as they are.
-    let mut i = 0;
-    while i < *len && set[i].phys_base.saturating_add(set[i].size) < base
-    {
-        i += 1;
-    }
+    let live = set.get(..*len).unwrap_or(&[]);
+    let i = live
+        .iter()
+        .take_while(|e| e.phys_base.saturating_add(e.size) < base)
+        .count();
     // Entries from `i` that start at or before `ap`'s end merge into it.
     let mut j = i;
-    while j < *len && set[j].phys_base <= end
+    while let Some(e) = live.get(j)
     {
-        base = base.min(set[j].phys_base);
-        end = end.max(set[j].phys_base.saturating_add(set[j].size));
-        j += 1;
+        if e.phys_base > end
+        {
+            break;
+        }
+        base = base.min(e.phys_base);
+        end = end.max(e.phys_base.saturating_add(e.size));
+        // `j` indexed an entry of `live`, so it is far below `usize::MAX`.
+        j = j.saturating_add(1);
     }
     if j == i
     {
@@ -463,17 +485,26 @@ fn insert_merged(set: &mut [MmioAperture], len: &mut usize, ap: MmioAperture) ->
         {
             return false;
         }
-        set.copy_within(i..*len, i + 1);
-        *len += 1;
+        // `i` is at most `*len`, which is below `set.len()` here.
+        set.copy_within(i..*len, i.saturating_add(1));
+        *len = len.saturating_add(1);
     }
     else
     {
-        set.copy_within(j..*len, i + 1);
-        *len -= j - i - 1;
+        // `j` is above `i` and at most `*len`.
+        set.copy_within(j..*len, i.saturating_add(1));
+        *len = len.saturating_sub(j.saturating_sub(i).saturating_sub(1));
     }
-    set[i] = MmioAperture {
+    // `i` is below `*len` after the shift above, so the slot exists.
+    let Some(slot) = set.get_mut(i)
+    else
+    {
+        return false;
+    };
+    *slot = MmioAperture {
         phys_base: base,
-        size: end - base,
+        // `end` is at least `base`: it starts at `base` and only grows.
+        size: end.saturating_sub(base),
     };
     true
 }
@@ -717,6 +748,33 @@ mod tests
         assert_eq!(entries[0].physical_base, 0x10_0000);
         assert_eq!(entries[0].size, 8 * 4096);
         assert_eq!(entries[0].memory_type, MemoryType::Usable);
+    }
+
+    // Defect caught: a page count whose byte size overflows `u64` wraps (or
+    // panics) and writes a bogus entry instead of being skipped.
+    #[test]
+    fn a_descriptor_whose_byte_size_overflows_is_skipped()
+    {
+        let descs = [
+            EfiMemoryDescriptor {
+                memory_type: EFI_CONVENTIONAL_MEMORY,
+                physical_start: 0,
+                virtual_start: 0,
+                number_of_pages: u64::MAX,
+                attribute: 0,
+            },
+            EfiMemoryDescriptor {
+                memory_type: EFI_CONVENTIONAL_MEMORY,
+                physical_start: 0x1000,
+                virtual_start: 0,
+                number_of_pages: 1,
+                attribute: 0,
+            },
+        ];
+        let entries = run_translate(&descs, 4);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].physical_base, 0x1000);
+        assert_eq!(entries[0].size, 4096);
     }
 
     #[test]
@@ -1297,17 +1355,17 @@ pub unsafe fn insertion_sort_memory_map(entries: *mut MemoryMapEntry, count: usi
         let key = unsafe { core::ptr::read(entries.add(i)) };
         let mut j = i;
 
-        while j > 0
+        while let Some(prev) = j.checked_sub(1)
         {
-            // SAFETY: j - 1 < i < count; entries[j-1] is initialised.
-            let prev_base = unsafe { (*entries.add(j - 1)).physical_base };
+            // SAFETY: prev < i < count; entries[prev] is initialised.
+            let prev_base = unsafe { (*entries.add(prev)).physical_base };
             if prev_base <= key.physical_base
             {
                 break;
             }
             // SAFETY: j and j-1 are both < count and within the allocation.
-            unsafe { core::ptr::copy_nonoverlapping(entries.add(j - 1), entries.add(j), 1) };
-            j -= 1;
+            unsafe { core::ptr::copy_nonoverlapping(entries.add(prev), entries.add(j), 1) };
+            j = prev;
         }
 
         // SAFETY: j < count; entries[j] is within the allocation.

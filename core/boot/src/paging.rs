@@ -26,7 +26,8 @@ pub struct PageFlags
 #[derive(Clone, Copy, Debug)]
 pub enum MapError
 {
-    /// Physical memory allocation for an intermediate table frame failed.
+    /// Physical memory allocation for an intermediate table frame failed, or
+    /// the range to map runs past the address space, so no table can hold it.
     OutOfMemory,
     /// The flags request both writable and executable permissions (W^X violation).
     WxViolation,
@@ -110,11 +111,16 @@ pub fn table_frame_bound(levels: usize, ranges: impl IntoIterator<Item = (u64, u
             continue;
         }
         let (base, span) = page_span(virt, size);
-        let last = base + (span - 1);
-        for level in 0..levels.saturating_sub(1)
+        let last = base.saturating_add(span.saturating_sub(1));
+        // One shift per level below the root: 21, 30, 39, ...
+        for shift in (21u32..).step_by(9).take(levels.saturating_sub(1))
         {
-            let shift = 21 + 9 * level;
-            frames += (last >> shift) - (base >> shift) + 1;
+            // `last` is at least `base`, so the span count is exact; the
+            // count of tables a range needs is far below `u64::MAX`.
+            let tables = (last >> shift)
+                .saturating_sub(base >> shift)
+                .saturating_add(1);
+            frames = frames.saturating_add(tables);
         }
     }
     frames
@@ -154,9 +160,13 @@ pub fn build_initial_tables(
     let trampoline = [(tramp_first, 4096), (tramp_last, 4096)]
         .into_iter()
         .filter(|&(page, _)| page != 0);
-    let segments = kernel.segments[0..kernel.segment_count]
-        .iter()
-        .map(|seg| (seg.virt_base, seg.size));
+    let loaded = kernel
+        .segments
+        .get(..kernel.segment_count)
+        .ok_or(BootError::InvalidElf(
+            "kernel segment count exceeds the segment array",
+        ))?;
+    let segments = loaded.iter().map(|seg| (seg.virt_base, seg.size));
     let frames = table_frame_bound(
         arch::current::BootPageTable::translation_levels(),
         segments
@@ -166,7 +176,7 @@ pub fn build_initial_tables(
     let mut table = arch::current::BootPageTable::new(bs, frames).ok_or(BootError::OutOfMemory)?;
 
     // Map each kernel ELF segment at its ELF virtual address with segment permissions.
-    for seg in &kernel.segments[0..kernel.segment_count]
+    for seg in loaded
     {
         let flags = PageFlags {
             writable: seg.writable,
@@ -209,8 +219,10 @@ const PAGE_ALIGN_MASK: u64 = 4095;
 fn page_span(phys: u64, size: u64) -> (u64, u64)
 {
     let base = phys & !PAGE_ALIGN_MASK;
-    let end = (phys + size + PAGE_ALIGN_MASK) & !PAGE_ALIGN_MASK;
-    (base, end - base)
+    // A range that runs past the top of the address space saturates to the
+    // last page; `end` is then at least `base`, so the difference is exact.
+    let end = phys.saturating_add(size).saturating_add(PAGE_ALIGN_MASK) & !PAGE_ALIGN_MASK;
+    (base, end.saturating_sub(base))
 }
 
 #[cfg(test)]
@@ -308,5 +320,42 @@ mod tests
     fn partial_last_page_rounds_up()
     {
         assert_eq!(page_span(0x4000, 0x1001), (0x4000, 0x2000));
+    }
+
+    /// Defect caught: a range running past the top of the address space
+    /// wraps `phys + size` and yields a span below its base.
+    #[test]
+    fn a_range_past_the_address_space_top_saturates()
+    {
+        let (base, span) = page_span(u64::MAX - 0x10, 0x1000);
+        assert_eq!(base, 0xFFFF_FFFF_FFFF_F000);
+        assert_eq!(span, 0);
+    }
+
+    /// Defect caught: a segment count above the segment array slices past it
+    /// instead of failing the build.
+    #[test]
+    fn a_segment_count_above_the_array_is_an_invalid_elf()
+    {
+        let seg = || crate::elf::LoadedSegment {
+            phys_base: 0,
+            virt_base: 0,
+            size: 0,
+            writable: false,
+            executable: false,
+        };
+        let kernel = KernelInfo {
+            physical_base: 0,
+            virtual_base: 0,
+            size: 0,
+            entry_virtual: 0,
+            segments: core::array::from_fn(|_| seg()),
+            segment_count: 9,
+            kind: crate::elf::ElfKind::Exec,
+            rela_phys: 0,
+            rela_size: 0,
+        };
+        let r = build_initial_tables(core::ptr::null_mut(), &kernel, &[]);
+        assert!(matches!(r, Err(BootError::InvalidElf(_))));
     }
 }

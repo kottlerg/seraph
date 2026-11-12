@@ -22,9 +22,16 @@
 // `use core::…` continues to resolve. Mirror of the libc / hermit-abi
 // pattern. The normal userspace build path keeps plain `#![no_std]`.
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
-#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(
+    feature = "rustc-dep-of-std",
+    expect(
+        internal_features,
+        reason = "`no_core` is an internal feature, needed to build as a dependency of std"
+    )
+)]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
@@ -32,7 +39,6 @@ extern crate rustc_std_workspace_core as core;
 // `no_core` disables the automatic prelude; bring it in by hand so
 // `#[derive(…)]`, Copy/Clone, the operator traits, etc. resolve.
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 // ── Architectural constants ───────────────────────────────────────────────────
@@ -85,10 +91,7 @@ const _: () = assert!(CAP_INDEX_BITS + CAP_GEN_BITS == 63);
 #[must_use]
 pub const fn cap_handle_encode(index: u32, generation: u32) -> u64
 {
-    // `u64::from` is not const-stable; both `u32 -> u64` widening casts are exact.
-    #[allow(clippy::cast_lossless)]
-    let handle = (((generation & CAP_GEN_MASK) as u64) << CAP_INDEX_BITS) | index as u64;
-    handle
+    (((generation & CAP_GEN_MASK) as u64) << CAP_INDEX_BITS) | index as u64
 }
 
 /// Extract the slot index from a capability handle.
@@ -96,10 +99,7 @@ pub const fn cap_handle_encode(index: u32, generation: u32) -> u64
 #[must_use]
 pub const fn cap_handle_index(handle: u64) -> u32
 {
-    // `& CAP_INDEX_MASK` leaves at most 32 significant bits, so the cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
-    let index = (handle & CAP_INDEX_MASK) as u32;
-    index
+    (handle & CAP_INDEX_MASK) as u32
 }
 
 /// Extract the per-slot generation from a capability handle.
@@ -111,10 +111,7 @@ pub const fn cap_handle_index(handle: u64) -> u32
 #[must_use]
 pub const fn cap_handle_gen(handle: u64) -> u32
 {
-    // `>> CAP_INDEX_BITS` leaves at most 32 significant bits, so the cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
-    let generation = (handle >> CAP_INDEX_BITS) as u32;
-    generation
+    (handle >> CAP_INDEX_BITS) as u32
 }
 
 // ── Retype costs ──────────────────────────────────────────────────────────────
@@ -495,14 +492,11 @@ pub const fn remap_entry_pack(handle: u16, vector: u32, apic_id: u32) -> u64
 #[must_use]
 pub const fn remap_entry_unpack(word: u64) -> (u16, u8, u32)
 {
-    // Each field is masked to its width before the narrowing.
-    #[allow(clippy::cast_possible_truncation)]
-    let fields = (
+    (
         (word & 0xFFFF) as u16,
         ((word >> 16) & 0xFF) as u8,
         (word >> 32) as u32,
-    );
-    fields
+    )
 }
 
 // ── CapTag discriminants ─────────────────────────────────────────────────────
@@ -779,8 +773,6 @@ pub const fn ipc_call_data_count(arg2: u64) -> u64
 }
 
 /// The `timeout_ms` field of a `SYS_IPC_CALL` `arg2` ([`ipc_call_count_arg`]).
-// cast_possible_truncation: the shift leaves only the high 32 bits.
-#[allow(clippy::cast_possible_truncation)]
 #[must_use]
 pub const fn ipc_call_timeout_ms(arg2: u64) -> u32
 {

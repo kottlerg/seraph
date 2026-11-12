@@ -19,6 +19,7 @@
 //! drivers a deployment ships.
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 pub mod decl;
 pub mod note;

@@ -30,15 +30,21 @@
 // so this crate can sit inside std's dep graph. Mirrors abi/syscall and
 // shared/ipc. Normal userspace builds (no feature) retain `#![no_std]`.
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
-#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(
+    feature = "rustc-dep-of-std",
+    expect(
+        internal_features,
+        reason = "`no_core` is an internal feature, needed to build as a dependency of std"
+    )
+)]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
 
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 // ── Protocol version ─────────────────────────────────────────────────────────
@@ -754,8 +760,7 @@ pub struct StartupInfo
 
 /// Cast a page-aligned virtual address to a `ProcessInfo` reference.
 ///
-/// Encapsulates the `u64 → *const ProcessInfo` cast with alignment validation,
-/// eliminating per-site `#[allow(clippy::cast_ptr_alignment)]` annotations.
+/// Encapsulates the `u64 → *const ProcessInfo` cast with alignment validation.
 ///
 /// # Safety
 ///
@@ -766,12 +771,7 @@ pub unsafe fn process_info_ref(va: u64) -> &'static ProcessInfo
 {
     debug_assert!(va.is_multiple_of(4096), "ProcessInfo VA not page-aligned");
     // SAFETY: caller guarantees va points to a valid, mapped ProcessInfo page.
-    // cast_ptr_alignment: va is page-aligned (4096-byte), exceeding
-    // ProcessInfo's alignment requirement.
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe {
-        &*(va as *const ProcessInfo)
-    }
+    unsafe { &*(va as *const ProcessInfo) }
 }
 
 /// Cast a page-aligned virtual address to a mutable `ProcessInfo` reference.
@@ -786,11 +786,8 @@ pub unsafe fn process_info_mut(va: u64) -> &'static mut ProcessInfo
 {
     debug_assert!(va.is_multiple_of(4096), "ProcessInfo VA not page-aligned");
     // SAFETY: caller guarantees va points to a writable, mapped ProcessInfo
-    // page. cast_ptr_alignment: va is page-aligned (4096-byte).
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe {
-        &mut *(va as *mut ProcessInfo)
-    }
+    // page.
+    unsafe { &mut *(va as *mut ProcessInfo) }
 }
 
 // ── TLS block layout ────────────────────────────────────────────────────────
@@ -878,13 +875,6 @@ fn align_up_or_max(value: u64, align: u64) -> u64
 /// # Safety
 /// `block_ptr` must point to a writable block of at least `tls_base_offset +
 /// 8` bytes.
-// cast_ptr_alignment: `tcb` is produced by offsetting a caller-allocated
-// block. `tls_block_layout` guarantees the block is at least 8-byte
-// aligned and `tls_base_offset = align_up(memsz, p_align)` preserves
-// that alignment (p_align is at least 1; practical Rust TLS templates
-// use p_align >= 8). `write_unaligned` is used defensively regardless.
-// cast_possible_truncation: Seraph is 64-bit only; u64 → usize is lossless.
-#[allow(clippy::cast_ptr_alignment, clippy::cast_possible_truncation)]
 pub unsafe fn tls_install_tcb(block_ptr: *mut u8, tls_base_offset: u64, tls_base_va: u64)
 {
     #[cfg(target_arch = "x86_64")]
@@ -892,6 +882,16 @@ pub unsafe fn tls_install_tcb(block_ptr: *mut u8, tls_base_offset: u64, tls_base
         // SAFETY: caller guarantees block has capacity for a u64 at
         // tls_base_offset. write_unaligned tolerates any address alignment.
         unsafe {
+            // `tcb` is produced by offsetting a caller-allocated block.
+            // `tls_block_layout` guarantees the block is at least 8-byte aligned and
+            // `tls_base_offset = align_up(memsz, p_align)` preserves that alignment
+            // (p_align is at least 1; practical Rust TLS templates use p_align >= 8).
+            #[expect(
+                clippy::cast_ptr_alignment,
+                clippy::cast_possible_truncation,
+                reason = "the TLS block layout keeps `tcb` aligned and `write_unaligned` is used \
+                          regardless; Seraph is 64-bit only, so u64 to usize is lossless"
+            )]
             let tcb = block_ptr.add(tls_base_offset as usize).cast::<u64>();
             tcb.write_unaligned(tls_base_va);
         }

@@ -24,6 +24,7 @@
 //! for seraph and no host test reaches it.
 
 #![cfg(target_os = "seraph")]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use std::cell::{Cell, RefCell};
 use std::os::seraph::ObjectGrant;

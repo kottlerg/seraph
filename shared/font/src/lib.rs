@@ -15,6 +15,7 @@
 //! described in `shared/font/README.md` and on each item below.
 
 #![no_std]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 /// Glyph width in pixels.
 pub const GLYPH_WIDTH: u32 = 9;

@@ -21,7 +21,6 @@
 // Under `rustc-dep-of-std` the crate root is `no_core`, and a submodule needs
 // its own prelude import (see `recv_guard.rs`).
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 use core::fmt;
@@ -245,9 +244,11 @@ fn read_len_prefixed(payload: &[u8], off: usize, width: usize) -> Result<(Span, 
     {
         return Err(Malformed::Overrun);
     }
-    // Both ends are inside a payload of at most RECORD_MAX_BYTES, which the
-    // const assert above fits in a u16.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "both ends lie inside a payload of at most RECORD_MAX_BYTES, which the const \
+                  assert fits in a u16"
+    )]
     let span = Span {
         start: start as u16,
         len: len as u16,
@@ -373,8 +374,10 @@ impl RecordWriter
             self.clipped = true;
             return None;
         };
-        // At most KEY_MAX_LEN, which the const assert above fits in a u8.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "at most KEY_MAX_LEN, which the const assert fits in a u8"
+        )]
         {
             *key_len = key.len() as u8;
         }

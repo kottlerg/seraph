@@ -23,6 +23,7 @@
 //! requests everything the caller is allowed.
 
 #![no_std]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use ipc::{IpcMessage, ns_labels};
 

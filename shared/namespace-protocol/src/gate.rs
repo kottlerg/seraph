@@ -18,7 +18,6 @@
 //! [`GateError::UnknownLabel`] (mapped to the wire's `UNKNOWN_OPCODE`).
 
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 use core::num::NonZeroU32;

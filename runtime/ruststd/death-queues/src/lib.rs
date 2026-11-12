@@ -24,9 +24,16 @@
 // shared/shmem and runtime/ruststd/argv-env. Normal builds retain
 // `#![no_std]` with `alloc`.
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
-#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(
+    feature = "rustc-dep-of-std",
+    expect(
+        internal_features,
+        reason = "`no_core` is an internal feature, needed to build as a dependency of std"
+    )
+)]
 #![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
@@ -36,10 +43,6 @@ extern crate rustc_std_workspace_alloc as alloc;
 
 #[cfg(not(feature = "rustc-dep-of-std"))]
 extern crate alloc;
-
-#[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
-use core::prelude::rust_2024::*;
 
 pub mod queues;
 pub mod slots;

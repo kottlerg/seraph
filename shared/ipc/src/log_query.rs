@@ -20,7 +20,6 @@
 // Under `rustc-dep-of-std` the crate root is `no_core`, and a submodule needs
 // its own prelude import (see `recv_guard.rs`).
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 use syscall_abi::MSG_DATA_WORDS_MAX;

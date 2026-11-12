@@ -44,9 +44,10 @@ impl<const N: usize> DriverNote<N>
     /// When `N` is not `desc`'s padded length; in the `const` the macro
     /// builds, a compile error.
     #[must_use]
-    // cast_possible_truncation: a descriptor is at most MAX_DESC_BYTES (512)
-    // long, which a `u32` holds.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a descriptor is at most MAX_DESC_BYTES (512) long, which a u32 holds"
+    )]
     pub const fn new(desc: &EncodedDesc) -> Self
     {
         assert!(

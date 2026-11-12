@@ -53,7 +53,7 @@ pub const LARGE_BOOT_LOAD_MAX: f64 = 10.0;
 pub const SMALL_BOOT_VCPUS_MAX: u32 = 4;
 
 /// The most QEMUs of small boots that run side by side.
-pub const SMALL_BOOTS_MAX: u32 = 2;
+pub const SMALL_BOOTS_MAX: u32 = 3;
 
 /// How often a command started with `--wait-host` asks again.
 const WAIT_POLL: Duration = Duration::from_secs(10);
@@ -73,9 +73,11 @@ const COMMAND_MAX: usize = 200;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootMode
 {
-    /// The size decides: a small boot shares the host with one other.
+    /// The size decides: a small boot shares the host with other small boots,
+    /// up to [`SMALL_BOOTS_MAX`] QEMUs in all.
     Shared,
-    /// A run docs/testing.md § Coverage tiers owes: no other QEMU beside it.
+    /// The re-run of a boot whose timeout or timing failure came beside
+    /// another QEMU, before that failure counts: no other QEMU beside it.
     Alone,
     /// A timing-sensitive measurement: no other QEMU, the large-boot load
     /// limit, and no build while it runs.
@@ -126,7 +128,7 @@ pub struct Probe
 
 /// Whether one boot of `vcpus` vCPUs and `qemus` QEMUs in `mode` needs the
 /// host to itself: more than [`SMALL_BOOT_VCPUS_MAX`] vCPUs, more QEMUs than
-/// [`SMALL_BOOTS_MAX`] (which the two-boot rule admits beside nothing), or a
+/// [`SMALL_BOOTS_MAX`] (which the small-boot rule admits beside nothing), or a
 /// mode that runs alone.
 fn needs_host_alone(vcpus: u32, qemus: u32, mode: BootMode) -> bool
 {
@@ -142,7 +144,7 @@ fn boot_load_max(vcpus: u32, qemus: u32, mode: BootMode) -> (f64, &'static str, 
         (
             LARGE_BOOT_LOAD_MAX,
             "LARGE_BOOT_LOAD_MAX",
-            "a boot of more than 4 vCPUs or more than 2 QEMUs, or a timing measurement",
+            "a boot of more than 4 vCPUs or more than 3 QEMUs, or a timing measurement",
         )
     }
     else
@@ -968,7 +970,7 @@ mod tests
     }
 
     #[test]
-    fn two_small_boots_run_side_by_side_and_a_third_is_refused()
+    fn three_small_boots_run_side_by_side_and_a_fourth_is_refused()
     {
         let small = boot(4, 1, BootMode::Shared);
         assert!(decide(&small, &[], &quiet(), None).is_ok());
@@ -978,12 +980,28 @@ mod tests
             holder(4, 1, BootMode::Shared),
             holder(2, 1, BootMode::Shared),
         ];
-        let refusal = decide(&small, &two, &quiet(), None).unwrap_err();
+        assert!(decide(&small, &two, &quiet(), None).is_ok());
+        let three = [
+            holder(4, 1, BootMode::Shared),
+            holder(2, 1, BootMode::Shared),
+            holder(1, 1, BootMode::Shared),
+        ];
+        let refusal = decide(&small, &three, &quiet(), None).unwrap_err();
         assert!(refusal.contains("SMALL_BOOTS_MAX"), "{refusal}");
-        // A run-parallel wave of two takes both places.
+        // A QEMU no record names counts toward the three as well.
+        let observed = Probe {
+            load: Some(1.0),
+            qemus: vec![4, 2, 1],
+        };
+        assert!(decide(&small, &[], &observed, None).is_err());
+        // A run-parallel wave takes as many places as it starts QEMUs.
         let pair = boot(4, 2, BootMode::Shared);
         assert!(decide(&pair, &[], &quiet(), None).is_ok());
-        assert!(decide(&pair, &one, &quiet(), None).is_err());
+        assert!(decide(&pair, &one, &quiet(), None).is_ok());
+        assert!(decide(&pair, &two, &quiet(), None).is_err());
+        let wave = boot(4, 3, BootMode::Shared);
+        assert!(decide(&wave, &[], &quiet(), None).is_ok());
+        assert!(decide(&wave, &one, &quiet(), None).is_err());
     }
 
     #[test]
@@ -1013,13 +1031,20 @@ mod tests
     }
 
     #[test]
-    fn more_qemus_than_the_two_boot_rule_admits_need_the_host_alone()
+    fn more_qemus_than_the_small_boot_rule_admits_need_the_host_alone()
     {
-        let wave = boot(4, 4, BootMode::Shared);
+        let wave = boot(4, SMALL_BOOTS_MAX + 1, BootMode::Shared);
         assert!(decide(&wave, &[], &quiet(), None).is_ok());
         assert!(decide(&wave, &[holder(1, 1, BootMode::Shared)], &quiet(), None).is_err());
         let refusal = decide(&wave, &[], &loaded(12.0), None).unwrap_err();
         assert!(refusal.contains("LARGE_BOOT_LOAD_MAX"), "{refusal}");
+        // The refusal's account of the large-boot limit states the constants.
+        assert!(
+            refusal.contains(&format!(
+                "more than {SMALL_BOOT_VCPUS_MAX} vCPUs or more than {SMALL_BOOTS_MAX} QEMUs"
+            )),
+            "{refusal}"
+        );
     }
 
     #[test]
@@ -1181,19 +1206,20 @@ mod tests
     }
 
     #[test]
-    fn two_small_boots_hold_the_host_until_one_ends()
+    fn three_small_boots_hold_the_host_until_one_ends()
     {
         let dir = scratch("small");
         let small = boot(4, 1, BootMode::Shared);
         let first = try_admit(&dir, &small, &claim(), &|| quiet()).unwrap();
         let second = try_admit(&dir, &small, &claim(), &|| quiet()).unwrap();
+        let third = try_admit(&dir, &small, &claim(), &|| quiet()).unwrap();
         assert!(matches!(
             try_admit(&dir, &small, &claim(), &|| quiet()),
             Err(Attempt::Refused(_))
         ));
         drop(first);
-        let third = admit_after_release(&dir, &small).unwrap();
-        drop((second, third));
+        let fourth = admit_after_release(&dir, &small).unwrap();
+        drop((second, third, fourth));
         fs::remove_dir_all(&dir).unwrap();
     }
 

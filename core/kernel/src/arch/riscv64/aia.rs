@@ -25,10 +25,14 @@
 //! # Identities
 //! Each hart's file has its own identity space, `1..=ids` (`KernelMmio::imsic`).
 //! [`init_eid_storage`] allocates one EID row per CPU, a per-CPU slab sized from
-//! the boot CPU count: entry `e` of CPU `c`'s row holds the source routed to
-//! identity `e` of that CPU's file, or 0 when the identity is free. A source's
-//! route ([`route`]) takes the lowest free identity of its target CPU's row, and
-//! its release ([`unroute`]) frees it. Every identity of every file is enabled at
+//! the boot CPU count: entry `e` of CPU `c`'s row holds the source that takes
+//! identity `e` of that CPU's file, or 0 when the identity is free. A source is a
+//! routed APLIC source or a message-signaled target (`irq::MESSAGE_ID_BASE` and
+//! up). A source's route ([`route`]) or a target's mint ([`alloc_message`]) takes
+//! the lowest free identity of its target CPU's row, and its release ([`unroute`],
+//! [`free_message`]) frees it. A message-signaled target is raised by a device's
+//! write of its identity to its hart's file ([`message_address`]), with no APLIC
+//! source between. Every identity of every file is enabled at
 //! its hart's init ([`init_hart`]) and never disabled: an IMSIC enable bit is
 //! reachable only through its own hart's CSRs, so masking is the APLIC's
 //! (`setienum`/`clrienum`, MMIO any hart can write), and no route change needs a
@@ -51,8 +55,8 @@
 //! # Locking
 //! Every APLIC access is a single register write, with no read-modify-write, so
 //! none takes a lock. The per-source routes ([`SOURCE_ROUTES`]) and the EID rows
-//! are written only by [`route`] and [`unroute`], which `irq` serialises under
-//! its routing lock; [`unmask`] runs under it too, and [`claim`] reads its own
+//! are written only by [`route`], [`unroute`], [`alloc_message`] and
+//! [`free_message`], which `irq` serialises under its routing lock; [`unmask`] runs under it too, and [`claim`] reads its own
 //! hart's row lock-free.
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -305,10 +309,37 @@ fn implemented(source: u32) -> bool
     source != 0 && source <= source_count()
 }
 
+/// The CPU and identity a new source takes: the next CPU in turn with a free
+/// identity (`irq::next_target_cpu`) and that CPU's lowest free identity, whose
+/// row entry is then set to `source`. `None` when no CPU has a free identity.
+fn take_identity(source: u32) -> Option<crate::irq::Target>
+{
+    let has_free = |cpu: usize| eid_row(cpu).and_then(lowest_free_eid).is_some();
+    let cpu = crate::irq::next_target_cpu(has_free)?;
+    let row = eid_row(cpu)?;
+    let eid = lowest_free_eid(row)?;
+    row[eid as usize].store(source, Ordering::Relaxed);
+    // A CPU index is below MAX_CPUS, which u32 holds.
+    #[allow(clippy::cast_possible_truncation)]
+    let cpu = cpu as u32;
+    Some(crate::irq::Target { cpu, slot: eid })
+}
+
+/// Free identity `target` when its row entry holds `source`.
+fn release_identity(source: u32, target: crate::irq::Target)
+{
+    if let Some(entry) = eid_row(target.cpu as usize).and_then(|row| row.get(target.slot as usize))
+        && entry.load(Ordering::Relaxed) == source
+    {
+        entry.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Route `source`, leaving it disabled: pick its target CPU (the next in turn
 /// with a free identity, `irq::next_target_cpu`), take that CPU's lowest free
 /// identity, and program the source's mode from the `SYS_IRQ_REGISTER` word
-/// `mode` and its target. Unmasking ([`unmask`]) enables it.
+/// `mode` and its target. Unmasking ([`unmask`]) enables it. Returns the CPU and
+/// identity.
 ///
 /// # Errors
 /// `NoSuchLine` for a source the domain does not implement; `Exhausted` when
@@ -316,28 +347,27 @@ fn implemented(source: u32) -> bool
 ///
 /// Called under `irq`'s routing lock, after [`init_bsp`], for a source that is
 /// not routed.
-pub fn route(source: u32, mode: u32) -> Result<(), crate::irq::RouteError>
+pub fn route(source: u32, mode: u32) -> Result<crate::irq::Target, crate::irq::RouteError>
 {
     if !implemented(source)
     {
         return Err(crate::irq::RouteError::NoSuchLine);
     }
-    let has_free = |cpu: usize| eid_row(cpu).and_then(lowest_free_eid).is_some();
-    let cpu = crate::irq::next_target_cpu(has_free).ok_or(crate::irq::RouteError::Exhausted)?;
-    let row = eid_row(cpu).ok_or(crate::irq::RouteError::Exhausted)?;
-    let eid = lowest_free_eid(row).ok_or(crate::irq::RouteError::Exhausted)?;
-    // SAFETY: `next_target_cpu` returns an index below CPU_COUNT; the hart id
-    // slab is read-only after boot.
-    let hart = unsafe { crate::percpu::apic_id_for(cpu) };
+    let taken = take_identity(source).ok_or(crate::irq::RouteError::Exhausted)?;
+    // SAFETY: `take_identity` returns a CPU with a row, so below CPU_COUNT; the
+    // hart id slab is read-only after boot.
+    let hart = unsafe { crate::percpu::apic_id_for(taken.cpu as usize) };
     // Every hart was checked a valid target at its init.
-    let target = aplic_msi_target(hart, eid).ok_or(crate::irq::RouteError::Exhausted)?;
+    let Some(target) = aplic_msi_target(hart, taken.slot)
+    else
+    {
+        release_identity(source, taken);
+        return Err(crate::irq::RouteError::Exhausted);
+    };
     let source_mode = aplic_source_mode(mode);
-    row[eid as usize].store(source, Ordering::Relaxed);
-    // A CPU index is below MAX_CPUS, which u32 holds.
-    #[allow(clippy::cast_possible_truncation)]
     let route = SourceRoute {
-        cpu: cpu as u32,
-        eid,
+        cpu: taken.cpu,
+        eid: taken.slot,
         level: aplic_mode_is_level(source_mode),
     };
     SOURCE_ROUTES[source as usize].store(route.pack(), Ordering::Relaxed);
@@ -348,7 +378,7 @@ pub fn route(source: u32, mode: u32) -> Result<(), crate::irq::RouteError>
         aplic_write(sourcecfg_offset(source), source_mode);
         aplic_write(target_offset(source), target);
     }
-    Ok(())
+    Ok(taken)
 }
 
 /// Release `source`'s route: disable it, make it inactive, and free its
@@ -376,16 +406,80 @@ pub fn unroute(source: u32)
     }
 }
 
+/// Identities each CPU's file offers a source: `1..=ids`, identity 0 being none.
+#[must_use]
+pub fn identities_per_cpu() -> u32
+{
+    IMSIC_IDS.load(Ordering::Relaxed)
+}
+
+/// Mint message-signaled target `id` an identity: the next CPU in turn with a free
+/// one, and its lowest free identity (module doc § Identities). The identity is
+/// enabled in its file from the hart's init, so the target is deliverable once a
+/// device writes the message [`message_address`] gives.
+///
+/// # Errors
+/// `Exhausted` when no CPU has a free identity.
+///
+/// Called under `irq`'s routing lock.
+pub fn alloc_message(id: u32) -> Result<crate::irq::Target, crate::irq::RouteError>
+{
+    let target = take_identity(id).ok_or(crate::irq::RouteError::Exhausted)?;
+    // The row entry is visible before this hart's later device writes, as a
+    // route's is before its APLIC programming.
+    mmio::dma_to_mmio_barrier();
+    Ok(target)
+}
+
+/// Free message-signaled target `id`'s identity `target` (module doc
+/// § Identities on a write still pending).
+///
+/// Called under `irq`'s routing lock.
+pub fn free_message(id: u32, target: crate::irq::Target)
+{
+    release_identity(id, target);
+}
+
+/// The physical address a device writes `target`'s identity to: the
+/// `seteipnum_le` register at the start of its hart's supervisor-level IMSIC file
+/// (`ImsicLayout::s_file_address`). `None` when the CPU index is past the boot
+/// CPUs or the layout places no file for its hart.
+#[must_use]
+pub fn message_address(target: crate::irq::Target) -> Option<u64>
+{
+    let cpu = target.cpu as usize;
+    if cpu >= crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize
+    {
+        return None;
+    }
+    // SAFETY: `cpu` is below CPU_COUNT; the hart id slab is read-only after boot.
+    let hart = unsafe { crate::percpu::apic_id_for(cpu) };
+    crate::platform::kernel_mmio()
+        .imsic
+        .s_file_address(u64::from(hart))
+}
+
 /// Disable `source` at the APLIC (`clrienum`); a source the domain does not
 /// implement is ignored. The write is ordered after this hart's earlier memory
 /// writes, so a delivery's marking of its bindings owing precedes its mask at
-/// the APLIC (`irq::unmask_settled`).
+/// the APLIC (`irq::unmask_settled`), and before its later memory writes, so
+/// the mask precedes the delivery's signals and the drop of its in-flight
+/// count: an acknowledgement made after a receiver saw a signal, or after
+/// `irq::register` waited out the delivery, cannot have its `setienum` reach the
+/// APLIC ahead of this `clrienum`.
 pub fn mask(source: u32)
 {
     if implemented(source)
     {
         // SAFETY: an implemented source; the register lies in the checked window.
-        unsafe { aplic_write(APLIC_CLRIENUM, source) };
+        // The fence has no operands and changes no register or memory; it is
+        // left without `nomem` so the compiler keeps later stores after it.
+        unsafe {
+            aplic_write(APLIC_CLRIENUM, source);
+            // `fence o,w`: the APLIC write above is performed before this
+            // hart's later memory writes.
+            core::arch::asm!("fence o,w", options(nostack, preserves_flags));
+        }
     }
 }
 

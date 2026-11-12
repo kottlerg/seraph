@@ -974,6 +974,10 @@ impl MmioObject
 /// `sys_irq_register` / `sys_irq_ack`. Wider caps are delegatable
 /// range authorities: narrow them with `sys_irq_split` before use.
 ///
+/// A message-signaled target's cap (`SYS_IRQ_MSG_ALLOC`) is a lineage root over
+/// its one id (`irq::is_message`); freeing the lineage's root body, once no copy
+/// of it is live, frees the target (`irq::free_message`).
+///
 /// Each capability references an object of its own (a copy is a fresh object
 /// in its lineage, [`object_for_new_slot`]), so each carries its own binding of
 /// its line; freeing the object removes that binding (`irq::unregister`).
@@ -981,7 +985,9 @@ impl MmioObject
 pub struct InterruptObject
 {
     pub header: KernelObjectHeader,
-    /// First IRQ line in the range (GSI on x86-64, APLIC source on RISC-V).
+    /// First source id in the range: a GSI on x86-64, an APLIC source on RISC-V,
+    /// or a message-signaled target's id (`irq::MESSAGE_ID_BASE` and up, with
+    /// `count` 1).
     pub start: u32,
     /// Number of consecutive IRQ lines covered by the cap.
     pub count: u32,
@@ -3179,13 +3185,17 @@ unsafe fn free_body<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStac
 /// concrete type `T`, freeing whatever bodies that leaves unreferenced: a
 /// copy's own body at once, and its root's when the copy was the root's last
 /// live member; a root's body only once it has no live copy
-/// ([`RangeLineage`]).
+/// ([`RangeLineage`]). Returns whether the root's body was freed, so no object
+/// of the lineage is left.
 ///
 /// # Safety
 /// `ptr` is a refcount-0 `T`, exclusively owned, whose mappings or bindings
 /// have been withdrawn; no lock is held.
 #[cfg(not(test))]
-unsafe fn release_range_object<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStack)
+unsafe fn release_range_object<T>(
+    ptr: NonNull<KernelObjectHeader>,
+    stack: &mut CascadeStack,
+) -> bool
 {
     // SAFETY: a live Mmio, IoPort, or Interrupt object (caller contract).
     let root = unsafe { lineage_of(ptr) }.root_of(ptr);
@@ -3206,7 +3216,9 @@ unsafe fn release_range_object<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut 
     {
         // SAFETY: no reference and no live copy names the root any more.
         unsafe { free_body::<T>(root, stack) };
+        return true;
     }
+    false
 }
 
 /// The object a new capability slot made by `SYS_CAP_COPY`, `SYS_CAP_DERIVE`,
@@ -3623,14 +3635,25 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // untouched.
             // SAFETY: ptr points to a live InterruptObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<InterruptObject>()) };
+            // Read before the release below can free the object's bytes.
+            let start = obj.start;
             // SAFETY: not interrupt context, and no IPC source, scheduler, or
             // sleep-list lock is held (this function's contract), as
             // `irq::unregister` requires; the object stays live until the
             // release below.
-            unsafe { crate::irq::unregister(obj.start, &obj.binding) };
+            unsafe { crate::irq::unregister(start, &obj.binding) };
             // SAFETY: a refcount-0 Interrupt object whose binding is removed; no
             // lock held.
-            unsafe { release_range_object::<InterruptObject>(ptr, stack) };
+            let lineage_gone = unsafe { release_range_object::<InterruptObject>(ptr, stack) };
+            // A message-signaled target lives as long as its lineage: once the
+            // root body is freed no object names its id (only the mint makes an
+            // object over a fresh one), so the target is freed for reuse.
+            if lineage_gone && crate::irq::is_message(start)
+            {
+                // SAFETY: the context `irq::unregister` required above; no live
+                // Interrupt object names `start`.
+                unsafe { crate::irq::free_message(start) };
+            }
         }
         ObjectType::IoPort =>
         {

@@ -84,6 +84,16 @@ pub const UNROUTABLE_IRQ_IDS: &[u32] = &[24, 32767];
 /// IDT gate before device vectors were assigned at route time.
 pub const ROUTABLE_HIGH_IRQ_IDS: &[u32] = &[23];
 
+/// Whether `address` and `data` are a message `unit::hw` expects
+/// `SYS_CAP_INFO` to give a message-signaled Interrupt cap: a
+/// compatibility-format address in the local APIC's message window
+/// (`0xFEEx_x000`, physical destination, no redirection hint), and a device
+/// vector (33-249) with fixed delivery and edge trigger.
+pub fn msi_message_plausible(address: u64, data: u64) -> bool
+{
+    address & !0x000F_F000 == 0xFEE0_0000 && (33..=249).contains(&data)
+}
+
 /// Physical base of an MMIO register page that a test may read without side
 /// effects: the I/O APIC at QEMU's default base, a page of its own among the
 /// MMIO apertures init receives. Its IOREGSEL register, at

@@ -23,7 +23,8 @@ that delivers the resource list (§ Binding), and withdraws a bound driver in th
 - the IOMMU driver's delivery: devmgr binds it by its family record but gives it its own
   bootstrap rounds rather than the resource list
   ([#938](https://github.com/kottlerg/seraph/issues/938));
-- message-signaled vectors: a PCI function's driver is given its wired line only
+- message-signaled vectors: a PCI function's driver is given its wired line only, though the
+  kernel mints message-signaled targets
   ([#325](https://github.com/kottlerg/seraph/issues/325));
 - the hotplug event path (§ Hotplug, [#939](https://github.com/kottlerg/seraph/issues/939)).
 
@@ -104,8 +105,9 @@ A record carries the device's resources, typed:
 
 The interrupt resource is never one GSI: a record states its kind and a count, so a function
 that offers several message-signaled vectors is described as such, and the binding delivers one
-capability per vector it grants. The kernel's minting of message-signaled targets is
-[#325](https://github.com/kottlerg/seraph/issues/325).
+capability per vector it grants. The kernel mints message-signaled targets
+(`SYS_IRQ_MSG_ALLOC`); devmgr's allocation of them to drivers and its programming of a device's
+MSI capability are [#325](https://github.com/kottlerg/seraph/issues/325).
 
 ### Platform Description Tables
 

@@ -900,6 +900,13 @@ teardown removes every binding naming it the same way (`irq::unregister_notifica
 those Interrupt objects unbound. A range capability (more than one line) never binds, and its arm
 finds nothing to remove.
 
+A message-signaled target's capability (`SYS_IRQ_MSG_ALLOC`) is the root of a lineage of its own
+over its one id (`irq::is_message`), and every copy or derivation of it is a member of that
+lineage. Its target outlives any one object: the `dealloc_object` arm frees it
+(`irq::free_message`, which releases the CPU's slot and returns the id to the pool) only when
+the release frees the lineage's root body, once no object of the lineage is left, so no capability
+can name an id a later mint reuses.
+
 ---
 
 ## Derivation Tree (`cap/derivation.rs`)
@@ -1323,7 +1330,7 @@ specific slot numbers.
 | 1 | 7 | Memory capabilities (one per contiguous RAM extent drained from the buddy allocator; the seed extent contributes only its post-reserve tail) |
 | 2 | 7 | Mmio capabilities, Map and Write rights (one over the kernel console UART on RISC-V, then one per validated `BootInfo.mmio_apertures` entry) |
 | 3 | 7 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
-| 4 | 7 | One root Interrupt range capability (every valid IRQ id on the architecture) |
+| 4 | 7 | One root Interrupt range capability (every valid IRQ id on the architecture; Notify and Mint rights) |
 | 5 | 7 | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, as many as the map reports, then the page holding `BootInfo.acpi_rsdp`, then the `BootInfo.device_tree` blob) |
 | 6 | 7 | One root IoPort capability over the full 64K I/O port space (x86-64 only), or one SbiControl capability carrying every sanctioned SBI right (RISC-V only) |
 | 7 | 7 | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |

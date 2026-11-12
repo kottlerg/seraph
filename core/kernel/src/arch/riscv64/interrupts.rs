@@ -37,6 +37,9 @@
 //! - Device IRQs need no per-device code here: `route_device_irq` picks the source's
 //!   target and leaves it masked, and `dispatch_external` forwards every claimed source
 //!   to `crate::irq::dispatch_device_irq`.
+//! - Message-signaled targets (`SYS_IRQ_MSG_ALLOC`, `irq::alloc_message`) take an
+//!   identity of a hart's file through `alloc_message_target`, with no APLIC source;
+//!   their claim dispatches them like a routed source.
 
 use super::encoding::sbi_hart_mask;
 use super::trap_frame::TrapFrame;
@@ -950,10 +953,10 @@ pub fn unmask(irq: u32)
 /// `irq::next_target_cpu`), take an identity in that hart's file, and program the
 /// source's trigger and polarity from `mode` (the `SYS_IRQ_REGISTER` word, which
 /// `irq::register` validated and recorded) and its target (`aia::route`). The driver
-/// unmasks via `SYS_IRQ_ACK` once it has registered a handler. Called by
-/// `irq::register` for the source's first binding; the route is kept while any
-/// binding remains, and released (`unroute_device_irq`) when the last goes, so the
-/// source is not routed when this runs.
+/// unmasks via `SYS_IRQ_ACK` once it has registered a handler. Returns the hart and
+/// identity. Called by `irq::register` for the source's first binding; the route is
+/// kept while any binding remains, and released (`unroute_device_irq`) when the last
+/// goes, so the source is not routed when this runs.
 ///
 /// # Errors
 /// `NoSuchLine` for a source outside `1..=aia::source_count()`; `Exhausted` when no
@@ -962,28 +965,35 @@ pub fn unmask(irq: u32)
 /// # Safety
 /// Must be called after `init`, under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(
+    irq: u32,
+    mode: u32,
+) -> Result<crate::irq::Target, crate::irq::RouteError>
 {
     super::aia::route(irq, mode)
 }
 
-/// No-op test stub.
+/// Test stub: routes every source to identity 1 of CPU 0.
 ///
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn route_device_irq(_irq: u32, _mode: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(
+    _irq: u32,
+    _mode: u32,
+) -> Result<crate::irq::Target, crate::irq::RouteError>
 {
-    Ok(())
+    Ok(crate::irq::Target { cpu: 0, slot: 1 })
 }
 
 /// Release APLIC source `irq`'s route: disable it, make it inactive, and free its
-/// identity in its target hart's file (`aia::unroute`).
+/// identity in its target hart's file (`aia::unroute`, which reads the route it
+/// recorded, so `_target` is not needed).
 ///
 /// # Safety
 /// Must be called after `init`, under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn unroute_device_irq(irq: u32)
+pub unsafe fn unroute_device_irq(irq: u32, _target: crate::irq::Target)
 {
     super::aia::unroute(irq);
 }
@@ -993,7 +1003,55 @@ pub unsafe fn unroute_device_irq(irq: u32)
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn unroute_device_irq(_irq: u32) {}
+pub unsafe fn unroute_device_irq(_irq: u32, _target: crate::irq::Target) {}
+
+/// Slots of one hart's delivery space a message target can take: its IMSIC file's
+/// identities (`aia::identities_per_cpu`). Sizes the routing table's message
+/// targets (`irq::init_table`). Valid after Phase 4 (`aia::init_eid_storage`).
+#[cfg(not(test))]
+#[must_use]
+pub fn message_slots_per_cpu() -> u32
+{
+    super::aia::identities_per_cpu()
+}
+
+/// Mint message target `id` an identity in the next hart's IMSIC file in turn with
+/// a free one (`aia::alloc_message`). Called by `irq::alloc_message` under `irq`'s
+/// routing lock.
+///
+/// # Errors
+/// `Exhausted` when no hart's file has a free identity.
+#[cfg(not(test))]
+pub fn alloc_message_target(id: u32) -> Result<crate::irq::Target, crate::irq::RouteError>
+{
+    super::aia::alloc_message(id)
+}
+
+/// Free message target `id`'s identity `target` (`aia::free_message`). Called by
+/// `irq::free_message` under `irq`'s routing lock.
+#[cfg(not(test))]
+pub fn free_message_target(id: u32, target: crate::irq::Target)
+{
+    super::aia::free_message(id, target);
+}
+
+/// The physical address a device writes to raise `target`: its hart's
+/// supervisor-level IMSIC file (`aia::message_address`).
+#[cfg(not(test))]
+#[must_use]
+pub fn message_address(target: crate::irq::Target) -> Option<u64>
+{
+    super::aia::message_address(target)
+}
+
+/// The message data that raises `target`: its identity, which the device writes to
+/// the file's `seteipnum_le` register.
+#[cfg(not(test))]
+#[must_use]
+pub fn message_data(target: crate::irq::Target) -> u32
+{
+    target.slot
+}
 
 /// Number of interrupt lines the routing table covers: APLIC sources
 /// `0..=aia::source_count()` (source 0 reserved).

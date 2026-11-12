@@ -101,6 +101,15 @@ pub const UNROUTABLE_IRQ_IDS: &[u32] = &[127, 1023];
 /// expects `irq_register` to accept: source 96, the QEMU `virt` APLIC's last.
 pub const ROUTABLE_HIGH_IRQ_IDS: &[u32] = &[96];
 
+/// Whether `address` and `data` are a message `unit::hw` expects
+/// `SYS_CAP_INFO` to give a message-signaled Interrupt cap: a hart's
+/// supervisor-level IMSIC interrupt file (a page-aligned, nonzero physical
+/// address), and an interrupt identity of it (1-2047).
+pub fn msi_message_plausible(address: u64, data: u64) -> bool
+{
+    address != 0 && address.trailing_zeros() >= 12 && (1..=2047).contains(&data)
+}
+
 /// Physical base of an MMIO register page that a test may read without side
 /// effects: the console UART, which init receives as its own `Mmio` cap. Its
 /// line-status register, at [`MMIO_PROBE_OFFSET`], has no read side effect.

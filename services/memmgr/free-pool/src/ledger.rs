@@ -478,12 +478,12 @@ mod tests
     {
         unsafe fn read(&self, i: u64) -> u64
         {
-            self.0[i as usize]
+            self.0[usize::try_from(i).unwrap()]
         }
 
         unsafe fn write(&mut self, i: u64, v: u64)
         {
-            let i = i as usize;
+            let i = usize::try_from(i).unwrap();
             if self.0.len() <= i
             {
                 self.0.resize(i + 1, NODE_NULL);

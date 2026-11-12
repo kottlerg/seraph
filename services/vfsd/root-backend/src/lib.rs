@@ -647,7 +647,7 @@ mod tests
         {
             panic!("an intermediate is local");
         };
-        assert!(b.lookup(m199, b"leaf").is_ok());
+        b.lookup(m199, b"leaf").unwrap();
     }
 
     #[test]

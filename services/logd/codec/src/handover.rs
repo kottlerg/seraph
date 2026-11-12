@@ -518,7 +518,7 @@ mod tests
         };
         // The zero-padded word is not a record, so the receiver refuses it.
         assert_eq!(bytes.len(), 8);
-        assert!(ipc::log_record::Record::decode(bytes).is_err());
+        ipc::log_record::Record::decode(bytes).unwrap_err();
     }
 
     #[test]

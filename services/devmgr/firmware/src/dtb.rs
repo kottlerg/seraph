@@ -656,8 +656,11 @@ mod tests
         );
     }
 
+    /// The extra properties of one test node: `(name, data)` pairs.
+    type ExtraProps<'a> = &'a [(&'a str, &'a [u8])];
+
     /// `/soc` holding one ECAM node per `extra` property list, in order.
-    fn ecam_nodes(nodes: &[(u64, &[(&str, &[u8])])]) -> Vec<u8>
+    fn ecam_nodes(nodes: &[(u64, ExtraProps<'_>)]) -> Vec<u8>
     {
         let mut b = Builder::new()
             .begin("")

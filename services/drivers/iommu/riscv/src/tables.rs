@@ -638,10 +638,8 @@ mod tests
             d.map(&mut s, 1 << 38, 0x1000, PAGE, Access::Read),
             Err(TableError::Invalid)
         );
-        assert!(
-            d.map(&mut s, (1 << 38) - PAGE, 0x1000, PAGE, Access::Read)
-                .is_ok()
-        );
+        d.map(&mut s, (1 << 38) - PAGE, 0x1000, PAGE, Access::Read)
+            .unwrap();
     }
 
     #[test]

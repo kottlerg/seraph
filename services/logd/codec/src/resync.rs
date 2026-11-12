@@ -216,8 +216,8 @@ mod tests
         let ev = |snap: &[u64], live: &[u64]| evictable(snap, live).collect::<Vec<_>>();
         assert_eq!(ev(&[16, 40, 90, 120], &[16, 17, 90, 200]), [40, 120]);
         assert_eq!(ev(&[16, 40], &[]), [16, 40]);
-        assert!(ev(&[], &[16]).is_empty());
-        assert!(ev(&[16, 40], &[16, 40]).is_empty());
+        assert_eq!(ev(&[], &[16]), [] as [u64; 0]);
+        assert_eq!(ev(&[16, 40], &[16, 40]), [] as [u64; 0]);
     }
 
     #[test]

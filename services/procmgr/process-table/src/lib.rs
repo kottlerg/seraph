@@ -2171,7 +2171,7 @@ mod tests
         taken.started = true;
         assert!(table.holds_mut().park(&taken));
         assert!(table.badge_in_use(16));
-        assert!(table.holds_mut().release(release_token_badge(16)).is_ok());
+        table.holds_mut().release(release_token_badge(16)).unwrap();
         assert!(!table.badge_in_use(16));
     }
 }

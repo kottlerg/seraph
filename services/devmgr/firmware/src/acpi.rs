@@ -557,17 +557,20 @@ mod tests
     }
 
     /// An SDT of `len` reported bytes with `sig`, backed by `len` bytes.
-    fn sdt(sig: &[u8; 4], len: u32) -> Vec<u8>
+    fn sdt(sig: [u8; 4], len: u32) -> Vec<u8>
     {
         let mut b = vec![0u8; len as usize];
-        b[..4].copy_from_slice(sig);
+        b[..4].copy_from_slice(&sig);
         b[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
         b
     }
 
     fn mcfg(base: u64, start_bus: u8, end_bus: u8) -> Vec<u8>
     {
-        let mut b = sdt(b"MCFG", (MCFG_ENTRIES_OFF + MCFG_ENTRY_SIZE) as u32);
+        let mut b = sdt(
+            *b"MCFG",
+            u32::try_from(MCFG_ENTRIES_OFF + MCFG_ENTRY_SIZE).unwrap(),
+        );
         b[MCFG_ENTRIES_OFF..MCFG_ENTRIES_OFF + 8].copy_from_slice(&base.to_le_bytes());
         b[MCFG_ENTRIES_OFF + 10] = start_bus;
         b[MCFG_ENTRIES_OFF + 11] = end_bus;
@@ -584,7 +587,7 @@ mod tests
     fn mcfg_entries(entries: &[(u64, u16, u8, u8)]) -> Vec<u8>
     {
         let len = MCFG_ENTRIES_OFF + entries.len() * MCFG_ENTRY_SIZE;
-        let mut b = sdt(b"MCFG", u32::try_from(len).unwrap());
+        let mut b = sdt(*b"MCFG", u32::try_from(len).unwrap());
         for (i, &(base, segment, start, end)) in entries.iter().enumerate()
         {
             let off = MCFG_ENTRIES_OFF + i * MCFG_ENTRY_SIZE;
@@ -699,13 +702,13 @@ mod tests
     #[test]
     fn sdt_length_accepts_a_header_only_table()
     {
-        assert_eq!(sdt_length(&sdt(b"XSDT", 36)), Some(36));
+        assert_eq!(sdt_length(&sdt(*b"XSDT", 36)), Some(36));
     }
 
     #[test]
     fn sdt_length_rejects_a_length_below_the_header()
     {
-        let mut b = sdt(b"XSDT", 36);
+        let mut b = sdt(*b"XSDT", 36);
         b[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&35u32.to_le_bytes());
         assert_eq!(sdt_length(&b), None);
     }
@@ -713,7 +716,7 @@ mod tests
     #[test]
     fn sdt_length_rejects_a_truncated_header()
     {
-        assert_eq!(sdt_length(&sdt(b"XSDT", 36)[..35]), None);
+        assert_eq!(sdt_length(&sdt(*b"XSDT", 36)[..35]), None);
     }
 
     #[test]
@@ -725,7 +728,7 @@ mod tests
     #[test]
     fn xsdt_entries_are_bounded_by_the_slice_not_the_reported_length()
     {
-        let mut b = sdt(b"XSDT", 36 + 16);
+        let mut b = sdt(*b"XSDT", 36 + 16);
         b[36..44].copy_from_slice(&0x1111u64.to_le_bytes());
         b[44..52].copy_from_slice(&0x2222u64.to_le_bytes());
         b[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&1000u32.to_le_bytes());
@@ -736,7 +739,7 @@ mod tests
     #[test]
     fn xsdt_entries_are_bounded_by_the_reported_length_inside_the_slice()
     {
-        let mut b = sdt(b"XSDT", 36 + 16);
+        let mut b = sdt(*b"XSDT", 36 + 16);
         b[36..44].copy_from_slice(&0x1111u64.to_le_bytes());
         b[44..52].copy_from_slice(&0x2222u64.to_le_bytes());
         b[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&44u32.to_le_bytes());
@@ -747,14 +750,14 @@ mod tests
     #[test]
     fn xsdt_shorter_than_its_header_has_no_entries()
     {
-        let mut b = sdt(b"XSDT", 36 + 8);
+        let mut b = sdt(*b"XSDT", 36 + 8);
         b[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&20u32.to_le_bytes());
         assert_eq!(iter_xsdt_entries(&b).count(), 0);
     }
 
     fn fadt(len: u32, pm1a: u32) -> Vec<u8>
     {
-        let mut b = sdt(b"FACP", len);
+        let mut b = sdt(*b"FACP", len);
         if b.len() >= FADT_OFF_PM1A_CNT_BLK + 4
         {
             b[FADT_OFF_PM1A_CNT_BLK..FADT_OFF_PM1A_CNT_BLK + 4]
@@ -853,7 +856,7 @@ mod tests
     #[test]
     fn mcfg_without_an_entry_yields_no_ecam()
     {
-        let b = sdt(b"MCFG", MCFG_ENTRIES_OFF as u32);
+        let b = sdt(*b"MCFG", u32::try_from(MCFG_ENTRIES_OFF).unwrap());
         assert!(first(&b).is_none());
     }
 
@@ -887,7 +890,7 @@ mod tests
     {
         let body: usize = structures.iter().map(|s| s.len()).sum();
         let len = u32::try_from(MADT_ENTRIES_OFF + body).unwrap();
-        let mut b = sdt(b"APIC", len);
+        let mut b = sdt(*b"APIC", len);
         let mut off = MADT_ENTRIES_OFF;
         for s in structures
         {
@@ -901,7 +904,7 @@ mod tests
     {
         let mut s = [0u8; MADT_SOURCE_OVERRIDE_LEN];
         s[0] = MADT_TYPE_SOURCE_OVERRIDE;
-        s[1] = MADT_SOURCE_OVERRIDE_LEN as u8;
+        s[1] = u8::try_from(MADT_SOURCE_OVERRIDE_LEN).unwrap();
         s[3] = source;
         s[4..8].copy_from_slice(&gsi.to_le_bytes());
         s[8..10].copy_from_slice(&flags.to_le_bytes());
@@ -915,8 +918,8 @@ mod tests
     fn madt_overrides_are_read_past_other_structures()
     {
         let iso0 = source_override(0, 2, 0);
-        let iso10 = source_override(10, 10, 0xd);
-        let table = madt(&[&LOCAL_APIC, &iso0, &LOCAL_APIC, &iso10]);
+        let override_gsi10 = source_override(10, 10, 0xd);
+        let table = madt(&[&LOCAL_APIC, &iso0, &LOCAL_APIC, &override_gsi10]);
         let found: Vec<_> = madt_source_overrides(&table).expect("MADT").collect();
         assert_eq!(
             found,
@@ -940,7 +943,7 @@ mod tests
     {
         let mut s = [0u8; MADT_IO_APIC_LEN];
         s[0] = MADT_TYPE_IO_APIC;
-        s[1] = MADT_IO_APIC_LEN as u8;
+        s[1] = u8::try_from(MADT_IO_APIC_LEN).unwrap();
         s[2] = id;
         s[4..8].copy_from_slice(&0xfec0_0000u32.to_le_bytes());
         s[8..12].copy_from_slice(&gsi_base.to_le_bytes());
@@ -964,7 +967,7 @@ mod tests
                 }
             ]
         );
-        assert!(madt_io_apics(&sdt(b"FACP", 64)).is_none());
+        assert!(madt_io_apics(&sdt(*b"FACP", 64)).is_none());
     }
 
     #[test]
@@ -991,9 +994,9 @@ mod tests
     #[test]
     fn a_table_that_is_not_a_madt_is_refused()
     {
-        assert!(madt_source_overrides(&sdt(b"FACP", 64)).is_none());
+        assert!(madt_source_overrides(&sdt(*b"FACP", 64)).is_none());
         // Reported length short of the first structure.
-        assert!(madt_source_overrides(&sdt(b"APIC", 40)).is_none());
+        assert!(madt_source_overrides(&sdt(*b"APIC", 40)).is_none());
         assert!(madt_source_overrides(&[]).is_none());
     }
 
@@ -1067,8 +1070,8 @@ mod tests
     #[test]
     fn a_header_short_of_the_first_structure_or_another_table_is_not_well_formed()
     {
-        assert!(!madt_well_formed(&sdt(b"APIC", 40)));
-        assert!(!madt_well_formed(&sdt(b"FACP", 64)));
+        assert!(!madt_well_formed(&sdt(*b"APIC", 40)));
+        assert!(!madt_well_formed(&sdt(*b"FACP", 64)));
         assert!(!madt_well_formed(&[]));
     }
 
@@ -1177,7 +1180,7 @@ mod tests
     #[test]
     fn oem_table_id_is_read_from_a_whole_header_only()
     {
-        let mut t = sdt(b"XSDT", 36);
+        let mut t = sdt(*b"XSDT", 36);
         t[SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + 8].copy_from_slice(b"BXPC    ");
         assert_eq!(sdt_oem_table_id(&t), Some(*b"BXPC    "));
         assert_eq!(sdt_oem_table_id(&t[..SDT_OFF_OEM_TABLE_ID + 7]), None);

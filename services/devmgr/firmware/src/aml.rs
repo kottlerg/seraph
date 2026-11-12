@@ -872,12 +872,12 @@ mod tests
         if n == 1
         {
             assert!(len <= 63);
-            return vec![len as u8];
+            return vec![u8::try_from(len).unwrap()];
         }
-        let mut out = vec![(((n - 1) as u8) << 6) | (len & 0xF) as u8];
+        let mut out = vec![(u8::try_from(n - 1).unwrap() << 6) | u8::try_from(len & 0xF).unwrap()];
         for i in 0..n - 1
         {
-            out.push((len >> (4 + 8 * i)) as u8);
+            out.push(u8::try_from((len >> (4 + 8 * i)) & 0xff).unwrap());
         }
         out
     }
@@ -885,7 +885,7 @@ mod tests
     /// `PkgLength` in its shortest form.
     fn pkg(payload: usize) -> Vec<u8>
     {
-        let n = if payload + 1 <= 63
+        let n = if payload < 63
         {
             1
         }
@@ -963,7 +963,7 @@ mod tests
     {
         let mut out = vec![OP_BUFFER];
         out.extend(pkg(2 + list.len()));
-        out.extend([OP_BYTE, list.len() as u8]);
+        out.extend([OP_BYTE, u8::try_from(list.len()).unwrap()]);
         out.extend_from_slice(list);
         out
     }
@@ -973,7 +973,7 @@ mod tests
         let body: Vec<u8> = items.iter().flatten().copied().collect();
         let mut out = vec![OP_PACKAGE];
         out.extend(pkg(1 + body.len()));
-        out.push(items.len() as u8);
+        out.push(u8::try_from(items.len()).unwrap());
         out.extend(body);
         out
     }
@@ -981,7 +981,11 @@ mod tests
     fn table(aml: &[u8]) -> Vec<u8>
     {
         let mut t = b"DSDT".to_vec();
-        t.extend(((SDT_HDR_LEN + aml.len()) as u32).to_le_bytes());
+        t.extend(
+            u32::try_from(SDT_HDR_LEN + aml.len())
+                .unwrap()
+                .to_le_bytes(),
+        );
         t.resize(SDT_HDR_LEN, 0);
         t.extend_from_slice(aml);
         t
@@ -997,10 +1001,10 @@ mod tests
 
     fn hid_str(d: &AmlDevice<'_>) -> Vec<u8>
     {
-        d.hid.map(|i| i.as_bytes().to_vec()).unwrap_or_default()
+        d.hid.map_or_default(|i| i.as_bytes().to_vec())
     }
 
-    /// A DWord Address Space descriptor of type memory with `flags`.
+    /// A `DWord` Address Space descriptor of type memory with `flags`.
     fn addr32(flags: u8, min: u32, len: u32) -> Vec<u8>
     {
         let mut d = vec![0x87, 23, 0, 0, flags, 0];
@@ -1011,7 +1015,7 @@ mod tests
         d
     }
 
-    /// A QWord Address Space descriptor of type memory with `flags`.
+    /// A `QWord` Address Space descriptor of type memory with `flags`.
     fn addr64(flags: u8, min: u64, len: u64) -> Vec<u8>
     {
         let mut d = vec![0x8A, 43, 0, 0, flags, 0];
@@ -1365,7 +1369,7 @@ mod tests
             "DEV0",
             &[named("_HID", &eisa("PNP0501")), named("_CRS", &b)].concat(),
         ));
-        assert_eq!(collect(&t)[0].crs, Some(&[1_u8, 2][..]));
+        assert_eq!(collect(&t)[0].crs, Some(&[1u8, 2][..]));
     }
 
     #[test]
@@ -1373,7 +1377,7 @@ mod tests
     {
         assert_eq!(devices(&[0; 10], |_| {}), 0);
         let mut t = com1_table();
-        t[4..8].copy_from_slice(&20_u32.to_le_bytes());
+        t[4..8].copy_from_slice(&20u32.to_le_bytes());
         assert_eq!(devices(&t, |_| {}), 0);
     }
 
@@ -1488,8 +1492,14 @@ mod tests
     #[test]
     fn crs_producer_window_ignored()
     {
-        assert!(crs_list(&addr32(0, 0x3000_0000, 0x1000)).is_empty());
-        assert!(crs_list(&addr64(0, 0x4000_0000, 0x8000)).is_empty());
+        assert_eq!(
+            crs_list(&addr32(0, 0x3000_0000, 0x1000)),
+            [] as [CrsResource; 0]
+        );
+        assert_eq!(
+            crs_list(&addr64(0, 0x4000_0000, 0x8000)),
+            [] as [CrsResource; 0]
+        );
         assert_eq!(crs_list(&addr32(1, 0x3000_0000, 0x1000)).len(), 1);
         assert_eq!(crs_list(&addr64(1, 0x4000_0000, 0x8000)).len(), 1);
     }
@@ -1516,7 +1526,7 @@ mod tests
     fn crs_bounds()
     {
         // Descriptor longer than the slice.
-        assert!(crs_list(&[0x86, 9, 0, 0, 0]).is_empty());
+        assert_eq!(crs_list(&[0x86, 9, 0, 0, 0]), [] as [CrsResource; 0]);
         // Missing End Tag: ends with the slice.
         assert_eq!(crs_list(&[0x4B, 0x60, 0x00, 0x05]).len(), 1);
         // The 8-resource bound.
@@ -1528,6 +1538,6 @@ mod tests
         assert_eq!(crs_list(&t).len(), MAX_CRS_RESOURCES);
         // Extended interrupt count past its length.
         assert_eq!(crs_list(&[0x89, 6, 0, 1, 9, 0, 0, 0, 0, 0]).len(), 1);
-        assert!(crs_list(&[]).is_empty());
+        assert_eq!(crs_list(&[]), [] as [CrsResource; 0]);
     }
 }

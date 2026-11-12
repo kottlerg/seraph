@@ -2506,13 +2506,13 @@ the acknowledgements is delivered again, as on x86-64.
 (Notify rights).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
-`InvalidArgument` (IRQ cap covers more than one line, or names an id past every line the
+`InvalidArgument` (IRQ cap covers more than one line, or names an id outside the lines the
 discovered interrupt controllers implement: on x86-64 a GSI above the highest an I/O APIC reports,
-where the root Interrupt cap spans 32768 GSIs; on RISC-V a source above the APLIC's reported
-`riscv,num-sources`, where the root Interrupt cap spans the APLIC's 1024-id space; or `mode` sets a
-bit outside `IRQ_MODE_MASK`, differs from the mode the line is routed in, or is not 0 for a
-message-signaled target), `InvalidState` (the line is not routed, § `SYS_IRQ_ROUTE`; an id below
-that bound that no controller implements, an x86-64 GSI between two I/O APICs' ranges, never is),
+where the root Interrupt cap spans 32768 GSIs; on RISC-V a source outside the APLIC's reported
+`1..=riscv,num-sources`, where the root Interrupt cap spans the APLIC's 1024-id space; or `mode`
+sets a bit outside `IRQ_MODE_MASK`, differs from the mode the line is routed in, or is not 0 for a
+message-signaled target), `InvalidState` (the line is not routed, § `SYS_IRQ_ROUTE`; an id within
+those bounds that no controller implements, an x86-64 GSI between two I/O APICs' ranges, never is),
 `QuotaExceeded` (the notification's object holds as many references as it may
 (`REF_COUNT_LIMIT`); the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; or
 a message-signaled target already holds its one binding, through another object). Nothing changes

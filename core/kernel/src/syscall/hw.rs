@@ -137,12 +137,13 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// at its mint and is never masked: it takes one binding, which receives every
 /// message the device sends, and `SYS_IRQ_ACK` on it changes nothing.
 ///
-/// Returns 0 on success; `InvalidArgument` for an id past every line the
-/// discovered controllers implement (past the routing table), a mode with a
-/// bit outside `IRQ_MODE_MASK`, a mode other than the one the line is routed
-/// in, or a mode other than 0 for a message-signaled target; `InvalidState`
-/// for a line not routed, which an id within the table that no controller
-/// implements never is;
+/// Returns 0 on success; `InvalidArgument` for an id outside
+/// `MIN_IRQ_ID..=MAX_IRQ_ID` or past every line the discovered controllers
+/// implement (past the routing table), a mode with a bit outside
+/// `IRQ_MODE_MASK`, a mode other than the one the line is routed in, or a mode
+/// other than 0 for a message-signaled target; `InvalidState` for a line not
+/// routed, which an id within those bounds that no controller implements (an
+/// x86-64 GSI between two I/O APICs' ranges) never is;
 /// `QuotaExceeded` when the line already holds `MAX_IRQ_BINDINGS` bindings,
 /// the message-signaled target is already bound, or the Notification holds as
 /// many references as it may.

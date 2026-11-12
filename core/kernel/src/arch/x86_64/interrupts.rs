@@ -1032,7 +1032,9 @@ pub unsafe fn unroute_device_irq(_irq: u32, _target: crate::irq::Target) {}
 /// Take a device vector for a new message target: the next free vector of the next CPU
 /// in turn (`irq::next_target_cpu`) that the current message format can name
 /// ([`nameable`]: with remapping off, an APIC id a compatibility-format address names,
-/// [`super::msi`]; with it on, a CPU whose vectors have handles, [`super::remap`]) and
+/// [`super::msi`]; with it on, a CPU whose vectors have handles and, unless the
+/// remapping entry's destination is 32 bits, whose APIC id is below `0xFF`,
+/// [`super::remap`]) and
 /// that has a free one, its slot entry left
 /// `irq::Slot::Unbound`. Every device vector is enabled at its local APIC from boot, so
 /// the target is deliverable once the device writes the message [`message_address`] and

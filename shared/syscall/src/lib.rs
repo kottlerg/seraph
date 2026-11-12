@@ -2135,11 +2135,13 @@ pub fn wait_set_try_wait(ws_cap: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid or lacks
 /// Notify rights, `InvalidArgument` if `irq_cap` covers more than one line or
-/// names an id no discovered interrupt controller implements (a GSI no I/O APIC
-/// reports on x86-64, a source past the APLIC's `riscv,num-sources` on RISC-V), if
-/// `mode` sets a bit outside `IRQ_MODE_MASK`, if it differs from the mode
-/// the line is routed in, or if it is not 0 for a message-signaled target,
-/// `InvalidState` if the line is not routed, or `QuotaExceeded` when the line
+/// names an id outside the lines the discovered interrupt controllers implement
+/// (a GSI above the highest an I/O APIC reports on x86-64, a source outside the
+/// APLIC's `1..=riscv,num-sources` on RISC-V), if `mode` sets a bit outside
+/// `IRQ_MODE_MASK`, if it differs from the mode the line is routed in, or if it
+/// is not 0 for a message-signaled target, `InvalidState` if the line is not
+/// routed (an id within those bounds that no controller implements, a GSI
+/// between two I/O APICs' ranges, never is), or `QuotaExceeded` when the line
 /// already holds 64 bindings, the message-signaled target is already bound, or
 /// the notification holds as many references as it may.
 #[inline]

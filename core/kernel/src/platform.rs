@@ -358,35 +358,34 @@ fn report_fault(index: usize, ap: &MmioAperture, fault: ApertureFault)
 /// Return `true` if `[slice_start, slice_end)` is fully covered by Usable or
 /// Loaded memory-map regions.
 ///
-/// Coverage is computed by summing the intersection of each qualifying region
-/// with the slice interval. An empty slice (`slice_start >= slice_end`) is
-/// trivially covered. A region whose end would wrap `u64` reaches the end of
-/// the address space.
+/// Coverage is walked from the slice's start: a cursor moves to the furthest
+/// end of the qualifying regions that hold it, and the slice is covered when
+/// the cursor reaches its end, so regions in any order, overlapping or listed
+/// twice, count each byte once. A cursor no region holds is a gap. An empty
+/// slice (`slice_start >= slice_end`) is trivially covered. A region whose end
+/// would wrap `u64` reaches the end of the address space.
 fn slice_in_boot_memory(slice_start: u64, slice_end: u64, map: &[MemoryMapEntry]) -> bool
 {
-    let Some(needed) = slice_end.checked_sub(slice_start).filter(|&n| n != 0)
-    else
+    let mut cursor = slice_start;
+    // Each step moves the cursor strictly up to a region's end, so the walk
+    // takes at most one step per region.
+    while cursor < slice_end
     {
-        return true;
-    };
-    let mut covered: u64 = 0;
-
-    for entry in map
-    {
-        if entry.memory_type != MemoryType::Usable && entry.memory_type != MemoryType::Loaded
+        let reach = map
+            .iter()
+            .filter(|e| matches!(e.memory_type, MemoryType::Usable | MemoryType::Loaded))
+            .filter(|e| e.physical_base <= cursor)
+            .map(|e| e.physical_base.saturating_add(e.size))
+            .filter(|&end| end > cursor)
+            .max();
+        let Some(reach) = reach
+        else
         {
-            continue;
-        }
-        let region_end = entry.physical_base.saturating_add(entry.size);
-        let overlap_start = entry.physical_base.max(slice_start);
-        let overlap_end = region_end.min(slice_end);
-        if let Some(overlap) = overlap_end.checked_sub(overlap_start)
-        {
-            covered = covered.saturating_add(overlap);
-        }
+            return false;
+        };
+        cursor = reach;
     }
-
-    covered >= needed
+    true
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -602,5 +601,28 @@ mod tests
         let map = [usable(u64::MAX - 0xFFF, 0x2000)];
         assert!(slice_in_boot_memory(u64::MAX - 0x800, u64::MAX, &map));
         assert!(!slice_in_boot_memory(u64::MAX - 0x2000, u64::MAX, &map));
+    }
+
+    // Defect caught: a region listed twice, or two that overlap, counted their
+    // shared bytes twice, so a slice partly outside memory summed to its full
+    // length and was accepted.
+    #[test]
+    fn overlapping_regions_cover_their_shared_bytes_once()
+    {
+        let twice = [usable(0x1000, 0x1000), usable(0x1000, 0x1000)];
+        assert!(!slice_in_boot_memory(0x1000, 0x3000, &twice));
+        let overlapping = [usable(0x1000, 0x2000), usable(0x2000, 0x2000)];
+        assert!(!slice_in_boot_memory(0x1000, 0x6000, &overlapping));
+        assert!(slice_in_boot_memory(0x1000, 0x4000, &overlapping));
+    }
+
+    // Regions in any order that together leave no gap cover the slice.
+    #[test]
+    fn unordered_adjacent_regions_cover_a_slice_across_them()
+    {
+        let map = [usable(0x3000, 0x1000), usable(0x1000, 0x1000), usable(0x2000, 0x1000)];
+        assert!(slice_in_boot_memory(0x1800, 0x3800, &map));
+        let gap = [usable(0x3000, 0x1000), usable(0x1000, 0x1000)];
+        assert!(!slice_in_boot_memory(0x1800, 0x3800, &gap));
     }
 }

@@ -239,6 +239,13 @@ pub unsafe fn event_queue_return_observer(
 
 // ── Operations ────────────────────────────────────────────────────────────────
 
+/// The slot after `at` in a ring whose slots are `0..=last`: `at + 1`, or 0
+/// after `last`.
+fn ring_step(at: u32, last: u32) -> u32
+{
+    at.checked_add(1).filter(|&next| next <= last).unwrap_or(0)
+}
+
 /// Append `entry` to the event queue.
 ///
 /// - If a thread is blocked on recv, it is woken immediately with the entry
@@ -301,13 +308,12 @@ pub unsafe fn event_queue_post(
     }
 
     // Enqueue into ring.
-    let ring_len = eq.capacity + 1;
-    // SAFETY: write_idx < ring_len (invariant maintained by modulo arithmetic);
-    // ring is the retype slot's ring of ring_len entry slots.
+    // SAFETY: write_idx is a ring slot, `0..=capacity` (`ring_step` keeps it
+    // there); ring is the retype slot's ring of `capacity + 1` entry slots.
     unsafe {
         *eq.ring.add(eq.write_idx as usize) = entry;
     }
-    eq.write_idx = (eq.write_idx + 1) % ring_len;
+    eq.write_idx = ring_step(eq.write_idx, eq.capacity);
     // Release: publishes the new level to the lockless `source_is_ready` reader.
     eq.count.fetch_add(1, core::sync::atomic::Ordering::Release);
 
@@ -334,11 +340,10 @@ fn pop_entry_locked(eq: &mut EventQueueState) -> Option<EventEntry>
     {
         return None;
     }
-    let ring_len = eq.capacity + 1;
-    // SAFETY: read_idx < ring_len (invariant maintained by the modulo
-    // arithmetic below); ring is a valid allocation of ring_len entry slots.
+    // SAFETY: read_idx is a ring slot, `0..=capacity` (`ring_step` keeps it
+    // there); ring is a valid allocation of `capacity + 1` entry slots.
     let entry = unsafe { *eq.ring.add(eq.read_idx as usize) };
-    eq.read_idx = (eq.read_idx + 1) % ring_len;
+    eq.read_idx = ring_step(eq.read_idx, eq.capacity);
     // Release: publishes the drained level (possibly →0) to the lockless
     // `source_is_ready` reader so it cannot see a stale non-empty.
     eq.count.fetch_sub(1, core::sync::atomic::Ordering::Release);
@@ -569,5 +574,16 @@ mod tests
         unsafe { eq.init_observer_pool(nodes.as_mut_ptr(), 0, obj) };
         assert!(eq.observer_free.is_null());
         assert_eq!(eq.observer_count, 0);
+    }
+
+    // Defect guarded: the ring index past the last slot did not return to 0,
+    // or the step overflowed at the largest `u32` capacity.
+    #[test]
+    fn ring_step_wraps_after_the_last_slot()
+    {
+        assert_eq!([0, 1, 2, 3].map(|at| ring_step(at, 3)), [1, 2, 3, 0]);
+        assert_eq!(ring_step(0, 0), 0);
+        assert_eq!(ring_step(u32::MAX - 1, u32::MAX), u32::MAX);
+        assert_eq!(ring_step(u32::MAX, u32::MAX), 0);
     }
 }

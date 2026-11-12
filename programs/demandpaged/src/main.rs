@@ -37,6 +37,9 @@
 //!
 //! Driven by `services/svctest`'s pager phase.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::os::seraph::{
     register_demand_paged, reserve_pages, startup_info, unregister_demand_paged,
 };
@@ -46,6 +49,8 @@ use syscall_abi::{CAP_INFO_ASPACE_PT_BUDGET, MAP_READ, PAGE_SIZE, SyscallError};
 
 const PAGES: usize = 4;
 const PAGE: usize = 4096;
+/// Bytes of the demand region `fill_and_verify` covers.
+const REGION_BYTES: usize = PAGES * PAGE;
 
 /// Pages one last-level page table spans: 512 entries of 4 KiB, 2 MiB, under
 /// every paging mode of both architectures.
@@ -107,38 +112,31 @@ fn in_region() -> ExitCode
 /// `base`, then read it back. Returns whether every byte matched.
 ///
 /// # Safety
-/// `[base, base + PAGES * PAGE)` is a read-write demand region this process
+/// `[base, base + REGION_BYTES)` is a read-write demand region this process
 /// registered with the pager, and no Rust object lies in it.
 unsafe fn fill_and_verify(base: *mut u8) -> bool
 {
     // First pass: write. The first store into each page faults; memmgr backs it
-    // and the store retries against the now-mapped page.
-    for p in 0..PAGES
+    // and the store retries against the now-mapped page. Byte `k` of the region
+    // is byte `k % PAGE` of page `k / PAGE`.
+    for k in 0..REGION_BYTES
     {
-        let off = p * PAGE;
-        for i in 0..PAGE
-        {
-            // SAFETY: [base, base + PAGES*PAGE) is a registered demand-paged
-            // region; touches are backed by the pager on fault.
-            unsafe {
-                *base.add(off + i) = pattern(p, i);
-            }
+        // SAFETY: [base, base + REGION_BYTES) is a registered demand-paged
+        // region; touches are backed by the pager on fault.
+        unsafe {
+            *base.add(k) = pattern(k / PAGE, k % PAGE);
         }
     }
 
     // Second pass: read back. Proves the pages stayed mapped (no re-fault, no
     // zero-fill) and were mapped writable.
-    for p in 0..PAGES
+    for k in 0..REGION_BYTES
     {
-        let off = p * PAGE;
-        for i in 0..PAGE
+        // SAFETY: same region, now fully backed.
+        let got = unsafe { *base.add(k) };
+        if got != pattern(k / PAGE, k % PAGE)
         {
-            // SAFETY: same region, now fully backed.
-            let got = unsafe { *base.add(off + i) };
-            if got != pattern(p, i)
-            {
-                return false;
-            }
+            return false;
         }
     }
     true
@@ -264,9 +262,16 @@ fn page_table_drain() -> ExitCode
     let mut emptied = false;
     for b in 0..blocks
     {
+        // The block lies inside `drain`, whose size was checked above, so its
+        // address does not overflow.
+        let Some(va) = b.checked_mul(span).and_then(|off| first.checked_add(off))
+        else
+        {
+            return ExitCode::from(2);
+        };
         // SAFETY: the page lies in this process's own reservation `drain`,
         // which nothing else maps and where no Rust object or IPC page lies.
-        match unsafe { syscall::mem_map(frame, aspace, first + b * span, 0, 1, MAP_READ) }
+        match unsafe { syscall::mem_map(frame, aspace, va, 0, 1, MAP_READ) }
         {
             Ok(()) =>
             {}

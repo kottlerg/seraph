@@ -26,7 +26,8 @@ pub struct Step;
 /// The pointer the breakpoint at `addr` reports.
 pub fn reported(addr: u64) -> u64
 {
-    addr + 1
+    addr.checked_add(1)
+        .expect("the instruction after the breakpoint has an address")
 }
 
 /// Hit a breakpoint followed by three one-byte `nop`s, the instructions
@@ -74,7 +75,10 @@ pub fn single_step(ep: u64, ipc_buf: *mut u64, th: u64, reported: u64, _step: St
     for k in 1..=3
     {
         let ip = recv_exception(ep, ipc_buf, syscall_abi::FAULT_EXC_DEBUG);
-        assert_eq!(ip, reported + k, "a step reported the wrong instruction");
+        let expected = reported
+            .checked_add(k)
+            .expect("the stepped instruction has an address");
+        assert_eq!(ip, expected, "a step reported the wrong instruction");
         if k == 3
         {
             let mut regs = [0u8; REGS_BYTES];

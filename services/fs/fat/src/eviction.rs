@@ -281,7 +281,7 @@ fn cooperative_release(endpoint: u64, cookie: u64) -> Release
 {
     let reserved = LIVE_WATCHDOGS
         .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_WATCHDOGS).then_some(n + 1)
+            n.checked_add(1).filter(|&live| live <= MAX_WATCHDOGS)
         })
         .is_ok();
     if !reserved

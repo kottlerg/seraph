@@ -60,6 +60,7 @@
 //! ordinary cache pressure. Clients that never unmap can therefore cost the
 //! fs at most `QUARANTINE_MAX` extra pages before the cache starts to shrink.
 
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
@@ -108,11 +109,19 @@ const RUN_TIME_CSPACE_HEADROOM: usize = 64;
 /// outstanding at once), the scratch page, and [`RUN_TIME_CSPACE_HEADROOM`].
 fn cache_cspace_funding(slots: usize) -> u64
 {
-    (2 * slots + QUARANTINE_MAX + 1 + RUN_TIME_CSPACE_HEADROOM) as u64
+    // A count of capability slots: past `usize` no CSpace holds them, and the
+    // saturated request fails to fund as such.
+    let total = slots
+        .saturating_mul(2)
+        .saturating_add(QUARANTINE_MAX + 1 + RUN_TIME_CSPACE_HEADROOM);
+    u64::try_from(total).unwrap_or(u64::MAX)
 }
 
 /// Sector size before mount sets the device's ([`PageCache::set_sector_size`]).
 const DEFAULT_SECTOR_SIZE: u32 = 512;
+
+/// [`DEFAULT_SECTOR_SIZE`], as the divisor the page arithmetic takes.
+const DEFAULT_SECTOR_BYTES: NonZeroU64 = NonZeroU64::new(DEFAULT_SECTOR_SIZE as u64).unwrap();
 
 /// Sentinel for an unfilled slot. Page-base LBAs are always multiples of
 /// the sectors per page; `u64::MAX` cannot collide with any valid page base.
@@ -242,14 +251,22 @@ impl PageCache
         slots
             .try_reserve_exact(slot_count)
             .map_err(|_| InitError::Heap)?;
-        slots.extend((0..slot_count).map(|i| CacheSlot {
-            page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
-            memory_cap: AtomicU64::new(0),
-            va: base_va + (i as u64) * PAGE_SIZE,
-            refcount: AtomicU32::new(0),
-            lru_seq: AtomicU64::new(0),
-            exposed: AtomicBool::new(false),
-        }));
+        // The window holds `slot_count` pages from `base_va`, so no slot's VA
+        // overflows; a failed step is a window the arena could not have
+        // given.
+        let mut va = base_va;
+        for _ in 0..slot_count
+        {
+            slots.push(CacheSlot {
+                page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
+                memory_cap: AtomicU64::new(0),
+                va,
+                refcount: AtomicU32::new(0),
+                lru_seq: AtomicU64::new(0),
+                exposed: AtomicBool::new(false),
+            });
+            va = va.checked_add(PAGE_SIZE).ok_or(InitError::Reserve)?;
+        }
         let mut skips = Vec::new();
         skips
             .try_reserve_exact(slot_count)
@@ -307,24 +324,42 @@ impl PageCache
         self.sector_size.load(Ordering::Acquire) as usize
     }
 
-    /// Sectors one cache page holds: `PAGE_SIZE` over the sector size.
-    pub fn sectors_per_page(&self) -> u64
+    /// Bytes per sector, as a divisor. Mount sets a FAT sector size, 512 to
+    /// 4096 bytes; a zero size, which it never sets, reads as the default.
+    fn sector_divisor(&self) -> NonZeroU64
     {
-        PAGE_SIZE / u64::from(self.sector_size.load(Ordering::Acquire))
+        NonZeroU64::new(u64::from(self.sector_size.load(Ordering::Acquire)))
+            .unwrap_or(DEFAULT_SECTOR_BYTES)
     }
 
-    /// The page-aligned LBA-base for `lba`: the first LBA of the page-sized
-    /// sector run that contains it.
-    pub fn page_base_of(&self, lba: u64) -> u64
+    /// Sectors one cache page holds: `PAGE_SIZE` over the sector size. A
+    /// sector size past `PAGE_SIZE`, which mount never sets, reads as one
+    /// sector per page.
+    pub fn sectors_per_page(&self) -> NonZeroU64
     {
-        lba - (lba % self.sectors_per_page())
+        NonZeroU64::new(PAGE_SIZE / self.sector_divisor()).unwrap_or(NonZeroU64::MIN)
     }
 
-    /// Byte offset of sector `lba` within the cache page starting at
-    /// `page_base`, which MUST be `page_base_of(lba)`.
-    fn sector_offset_in_page(&self, lba: u64, page_base: u64) -> u64
+    /// The cache page holding sector `lba`: its page-aligned LBA-base, the
+    /// first LBA of the page-sized sector run that contains `lba`, and the
+    /// sector's byte offset within that page.
+    pub fn page_of(&self, lba: u64) -> (u64, u64)
     {
-        (lba - page_base) * u64::from(self.sector_size.load(Ordering::Acquire))
+        let index = lba % self.sectors_per_page();
+        // `index` is at most `lba`, and below the sectors per page, so the
+        // offset is below `PAGE_SIZE`: neither saturates.
+        (
+            lba.saturating_sub(index),
+            index.saturating_mul(self.sector_divisor().get()),
+        )
+    }
+
+    /// The VA of byte `offset` of slot `idx`'s page; `None` for an index past
+    /// the slots or an offset past the address space, which no caller
+    /// passes.
+    fn slot_va(&self, idx: usize, offset: u64) -> Option<u64>
+    {
+        self.slots.get(idx)?.va.checked_add(offset)
     }
 
     /// The cache's slot ceiling: the most slots it grows to, fixed at init.
@@ -353,15 +388,23 @@ impl PageCache
     pub fn fund_run_time_headroom(&self, cspace: u64) -> bool
     {
         let ceiling = self.slot_ceiling();
-        let unprovisioned = ceiling - self.provisioned.load(Ordering::Acquire);
-        let slots = unprovisioned + ceiling + QUARANTINE_MAX + RUN_TIME_CSPACE_HEADROOM;
-        std::os::seraph::fund_cspace_slot_budget(cspace, slots as u64)
+        // At most the ceiling is provisioned. The sum is a count of capability
+        // slots, which past `usize` no CSpace holds: the saturated request
+        // fails to fund as such.
+        let unprovisioned = ceiling.saturating_sub(self.provisioned.load(Ordering::Acquire));
+        let slots = unprovisioned
+            .saturating_add(ceiling)
+            .saturating_add(QUARANTINE_MAX + RUN_TIME_CSPACE_HEADROOM);
+        std::os::seraph::fund_cspace_slot_budget(cspace, u64::try_from(slots).unwrap_or(u64::MAX))
     }
 
     /// The slots that hold a page: the provisioned prefix of `slots`.
     fn live_slots(&self) -> &[CacheSlot]
     {
-        &self.slots[..self.provisioned.load(Ordering::Acquire)]
+        // `provisioned` never passes the slot count.
+        self.slots
+            .get(..self.provisioned.load(Ordering::Acquire))
+            .unwrap_or_default()
     }
 
     /// Give the next unprovisioned slot its page, returning its index, or
@@ -382,7 +425,9 @@ impl PageCache
             return None;
         }
         slot.memory_cap.store(cap, Ordering::Release);
-        self.provisioned.store(idx + 1, Ordering::Release);
+        // `idx` indexes `slots`, so this never saturates.
+        self.provisioned
+            .store(idx.saturating_add(1), Ordering::Release);
         Some(idx)
     }
 
@@ -426,13 +471,18 @@ impl PageCache
             return false;
         }
         previous.resize(len, 0);
-        let page_base = self.page_base_of(lba);
+        let (page_base, sector_offset) = self.page_of(lba);
         let Some(idx) = self.acquire_page(page_base, block_dev, ipc_buf)
         else
         {
             return false;
         };
-        let sector_va = self.slots[idx].va + self.sector_offset_in_page(lba, page_base);
+        let Some(sector_va) = self.slot_va(idx, sector_offset)
+        else
+        {
+            self.release(idx);
+            return false;
+        };
 
         // SAFETY: refcount > 0 for the duration of these borrows. The
         // cache page is single-process owned and mapped writable; the
@@ -490,15 +540,17 @@ impl PageCache
         unsafe {
             core::ptr::copy_nonoverlapping(scratch.va as *const u8, buf.as_mut_ptr(), len);
         }
-        let page_base = self.page_base_of(lba);
+        let (page_base, sector_offset) = self.page_of(lba);
         if let Some(idx) = self.lookup_cached(page_base)
         {
-            let sector_va = self.slots[idx].va + self.sector_offset_in_page(lba, page_base);
-            // SAFETY: `lookup_cached` took a reference on the slot, whose
-            // page is mapped writable for this process's lifetime, and the
-            // sector lies inside it.
-            unsafe {
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), sector_va as *mut u8, len);
+            if let Some(sector_va) = self.slot_va(idx, sector_offset)
+            {
+                // SAFETY: `lookup_cached` took a reference on the slot, whose
+                // page is mapped writable for this process's lifetime, and the
+                // sector lies inside it.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(buf.as_ptr(), sector_va as *mut u8, len);
+                }
             }
             self.release(idx);
         }
@@ -516,13 +568,18 @@ impl PageCache
         {
             return false;
         }
-        let page_base = self.page_base_of(lba);
+        let (page_base, sector_offset) = self.page_of(lba);
         let Some(idx) = self.acquire_page(page_base, block_dev, ipc_buf)
         else
         {
             return false;
         };
-        let sector_va = self.slots[idx].va + self.sector_offset_in_page(lba, page_base);
+        let Some(sector_va) = self.slot_va(idx, sector_offset)
+        else
+        {
+            self.release(idx);
+            return false;
+        };
         // SAFETY: refcount > 0 for the duration of this borrow; slot.va
         // was mapped writable for one page when the slot was provisioned
         // and is owned by this process. The page holds the sectors per page
@@ -538,7 +595,7 @@ impl PageCache
     /// Acquire a cache slot containing the page starting at
     /// `page_lba_base`, filling on miss. `page_lba_base` MUST be a multiple
     /// of the sectors per page; callers that have an arbitrary LBA should
-    /// pass [`Self::page_base_of`].
+    /// pass the base [`Self::page_of`] gives.
     ///
     /// Bumps the slot's refcount; the caller must drop it via
     /// [`release_slot`] when done. On any failure path the refcount is
@@ -550,18 +607,20 @@ impl PageCache
         ipc_buf: *mut u64,
     ) -> Option<usize>
     {
-        debug_assert!(page_lba_base.is_multiple_of(self.sectors_per_page()));
+        debug_assert!(page_lba_base.is_multiple_of(self.sectors_per_page().get()));
         self.get_or_fill(page_lba_base, block_dev, ipc_buf)
     }
 
     /// Snapshot the Memory cap currently backing slot `idx`.
     ///
     /// Returns `0` if the slot is in a degraded state (cap lost on a
-    /// previous fill failure). Callers must hold a refcount on the slot
-    /// before observing the cap.
+    /// previous fill failure) or `idx` names no slot. Callers must hold a
+    /// refcount on the slot before observing the cap.
     pub fn slot_memory_cap(&self, idx: usize) -> u64
     {
-        self.slots[idx].memory_cap.load(Ordering::Acquire)
+        self.slots
+            .get(idx)
+            .map_or(0, |slot| slot.memory_cap.load(Ordering::Acquire))
     }
 
     /// Drop a refcount on slot `idx`. Pair with [`acquire_page`].
@@ -575,7 +634,10 @@ impl PageCache
     /// § Reuse of a page a client mapped). The caller holds a refcount.
     pub fn mark_exposed(&self, idx: usize)
     {
-        self.slots[idx].exposed.store(true, Ordering::Release);
+        if let Some(slot) = self.slots.get(idx)
+        {
+            slot.exposed.store(true, Ordering::Release);
+        }
     }
 
     fn get_or_fill(&self, page_lba_base: u64, block_dev: u64, ipc_buf: *mut u64) -> Option<usize>
@@ -592,7 +654,7 @@ impl PageCache
             self.pressure.store(true, Ordering::Release);
             return None;
         };
-        let slot = &self.slots[victim];
+        let slot = self.slots.get(victim)?;
         // Refcount the victim before the fill so a racing `pick_victim`
         // will skip it.
         slot.refcount.fetch_add(1, Ordering::AcqRel);
@@ -603,7 +665,7 @@ impl PageCache
         if !fill_via_block_dev(
             slot,
             page_lba_base,
-            self.sectors_per_page(),
+            self.sectors_per_page().get(),
             block_dev,
             ipc_buf,
         )
@@ -673,12 +735,14 @@ impl PageCache
         loop
         {
             let candidate = self.lru_unreferenced(&skipped)?;
-            if !self.slots[candidate].exposed.load(Ordering::Acquire)
-                || self.make_reusable(candidate, ipc_buf)
+            let slot = self.slots.get(candidate)?;
+            if !slot.exposed.load(Ordering::Acquire) || self.make_reusable(candidate, ipc_buf)
             {
                 return Some(candidate);
             }
-            skipped[candidate] = true;
+            // `lru_unreferenced` returns only a slot `skipped` holds a mark
+            // for.
+            *skipped.get_mut(candidate)? = true;
         }
     }
 
@@ -690,7 +754,11 @@ impl PageCache
     /// mapped and no replacement is available within [`QUARANTINE_MAX`].
     fn make_reusable(&self, idx: usize, ipc_buf: *mut u64) -> bool
     {
-        let slot = &self.slots[idx];
+        let Some(slot) = self.slots.get(idx)
+        else
+        {
+            return false;
+        };
         let cap = slot.memory_cap.load(Ordering::Acquire);
         if cap == 0
         {
@@ -717,7 +785,7 @@ impl PageCache
         {
             spare
         }
-        else if quarantine.held.len() + quarantine.spare.len() < QUARANTINE_MAX
+        else if quarantine.held.len().saturating_add(quarantine.spare.len()) < QUARANTINE_MAX
         {
             let Some(page) = request_one_page(self.memmgr_ep, ipc_buf)
             else
@@ -784,13 +852,13 @@ impl PageCache
     }
 
     /// The least recently used slot with no reference that `skipped` does not
-    /// exclude.
+    /// exclude. `skipped` holds a mark per slot; a slot past it is excluded.
     fn lru_unreferenced(&self, skipped: &[bool]) -> Option<usize>
     {
         let mut best: Option<(usize, u64)> = None;
         for (i, slot) in self.live_slots().iter().enumerate()
         {
-            if skipped[i] || slot.refcount.load(Ordering::Acquire) != 0
+            if skipped.get(i).copied().unwrap_or(true) || slot.refcount.load(Ordering::Acquire) != 0
             {
                 continue;
             }
@@ -817,10 +885,10 @@ impl PageCache
     /// for good.
     fn release(&self, idx: usize)
     {
-        let dropped =
-            self.slots[idx]
-                .refcount
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        let dropped = self.slots.get(idx).map_or(Err(0), |slot| {
+            slot.refcount
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+        });
         debug_assert!(dropped.is_ok(), "cache slot {idx} released with refcount 0");
         if dropped.is_err()
         {
@@ -846,20 +914,16 @@ impl Quarantine
     /// derivation survives to map again, to the spare list.
     fn recheck(&mut self)
     {
-        let mut i = 0;
-        while i < self.held.len()
-        {
-            if syscall::cap_revoke_all(self.held[i]).is_ok()
-                && syscall::cap_info_memory_mappings(self.held[i], 0, 1) == Ok(0)
+        let spare = &mut self.spare;
+        self.held.retain(|&cap| {
+            let unmapped = syscall::cap_revoke_all(cap).is_ok()
+                && syscall::cap_info_memory_mappings(cap, 0, 1) == Ok(0);
+            if unmapped
             {
-                let cap = self.held.swap_remove(i);
-                self.spare.push(cap);
+                spare.push(cap);
             }
-            else
-            {
-                i += 1;
-            }
-        }
+            !unmapped
+        });
     }
 }
 

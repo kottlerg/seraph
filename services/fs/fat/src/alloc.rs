@@ -21,7 +21,7 @@
 //! Bad-cluster entries (`0xFFF7` / `0x0FFF_FFF7`) are *never* allocated
 //! and never freed by this module.
 
-use crate::bpb::{FatState, FatType, sector_buffer};
+use crate::bpb::{FatState, FatType, MAX_SECTOR_SIZE, sector_buffer};
 use crate::cache::PageCache;
 use crate::fat::chain_next;
 
@@ -75,25 +75,15 @@ const FSI_LEAD_SIG: u32 = 0x4161_5252;
 const FSI_STRUCT_SIG: u32 = 0x6141_7272;
 const FSI_TRAIL_SIG: u32 = 0xAA55_0000;
 
-/// Compute the FAT-sector LBA and byte offset within that sector for
-/// the given cluster index. Mirrors the arithmetic in [`chain_next`]
-/// without duplicating its cache-lookup path.
-fn fat_entry_location(state: &FatState, cluster: u32) -> (u32, usize)
-{
-    let entry_bytes = match state.fat_type
-    {
-        FatType::Fat16 => 2,
-        FatType::Fat32 => 4,
-    };
-    let offset = cluster * entry_bytes;
-    let sector = u32::from(state.reserved_sectors) + offset / u32::from(state.bytes_per_sector);
-    let ent_off = (offset % u32::from(state.bytes_per_sector)) as usize;
-    (sector, ent_off)
-}
-
-/// Read a single FAT entry value (resolved to a 32-bit cluster number
-/// for FAT16, masked to 28 bits for FAT32).
-fn read_fat_entry(
+/// Read the FAT entry of data cluster `cluster` (resolved to a 32-bit
+/// cluster number for FAT16, masked to 28 bits for FAT32) through the
+/// driver's one-sector FAT cache (`cached_fat_sector`).
+///
+/// # Errors
+/// [`FatError::Io`] when the FAT sector cannot be read;
+/// [`FatError::Corrupt`] when `cluster` lies past the data region, whose
+/// entry the FAT lacks.
+pub fn read_fat_entry(
     state: &mut FatState,
     cluster: u32,
     cache: &PageCache,
@@ -101,7 +91,7 @@ fn read_fat_entry(
     ipc_buf: *mut u64,
 ) -> Result<u32, FatError>
 {
-    let (fat_sector, ent_off) = fat_entry_location(state, cluster);
+    let (fat_sector, ent_off) = state.fat_entry_location(cluster).ok_or(FatError::Corrupt)?;
     if state.cached_fat_sector != fat_sector
     {
         if !cache.read_sector(
@@ -115,22 +105,12 @@ fn read_fat_entry(
         }
         state.cached_fat_sector = fat_sector;
     }
-    Ok(match state.fat_type
-    {
-        FatType::Fat16 => u32::from(u16::from_le_bytes([
-            state.cached_fat_data[ent_off],
-            state.cached_fat_data[ent_off + 1],
-        ])),
-        FatType::Fat32 =>
-        {
-            u32::from_le_bytes([
-                state.cached_fat_data[ent_off],
-                state.cached_fat_data[ent_off + 1],
-                state.cached_fat_data[ent_off + 2],
-                state.cached_fat_data[ent_off + 3],
-            ]) & 0x0FFF_FFFF
-        }
-    })
+    fat_parse::read_fat_entry(
+        state.sector(&state.cached_fat_data),
+        state.fat_type,
+        ent_off,
+    )
+    .ok_or(FatError::Corrupt)
 }
 
 /// Write a single FAT entry value to every FAT mirror copy.
@@ -152,58 +132,46 @@ pub fn update_fat_entry(
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
-    if cluster < 2 || cluster >= 2 + state.total_clusters
+    if !state.is_data_cluster(cluster)
     {
         return Err(FatError::Corrupt);
     }
-    let (first_fat_sector, ent_off) = fat_entry_location(state, cluster);
+    let (first_fat_sector, ent_off) = state.fat_entry_location(cluster).ok_or(FatError::Corrupt)?;
 
     let mut sector_buf = sector_buffer()?;
 
     for fat_idx in 0..u32::from(state.num_fats)
     {
-        let fat_sector = first_fat_sector + fat_idx * state.fat_size;
+        // Mount checked every FAT copy ends before the data region, within
+        // `u32`, so neither step overflows.
+        let Some(fat_sector) = fat_idx
+            .checked_mul(state.fat_size)
+            .and_then(|copy| first_fat_sector.checked_add(copy))
+        else
+        {
+            return Err(FatError::Corrupt);
+        };
 
         // RMW: read the current sector contents, patch the entry,
         // write it back. Reading via the page cache amortises with
         // adjacent allocations / frees in the same FAT sector.
-        if !cache.read_sector(u64::from(fat_sector), block_dev, &mut sector_buf, ipc_buf)
+        if !cache.read_sector(u64::from(fat_sector), block_dev, &mut *sector_buf, ipc_buf)
         {
             return Err(FatError::Io);
         }
 
-        match state.fat_type
-        {
-            FatType::Fat16 =>
-            {
-                // cast_possible_truncation: a FAT16 entry is 16 bits wide, so
-                // keeping the low half of `value` is the encoding.
-                #[allow(clippy::cast_possible_truncation)]
-                let bytes = (value as u16).to_le_bytes();
-                sector_buf[ent_off] = bytes[0];
-                sector_buf[ent_off + 1] = bytes[1];
-            }
-            FatType::Fat32 =>
-            {
-                let existing = u32::from_le_bytes([
-                    sector_buf[ent_off],
-                    sector_buf[ent_off + 1],
-                    sector_buf[ent_off + 2],
-                    sector_buf[ent_off + 3],
-                ]);
-                // Preserve top four reserved bits (Microsoft FAT32
-                // spec §4: "Note that the high 4 bits of a FAT32 FAT
-                // entry are reserved").
-                let merged = (existing & 0xF000_0000) | (value & 0x0FFF_FFFF);
-                let bytes = merged.to_le_bytes();
-                sector_buf[ent_off] = bytes[0];
-                sector_buf[ent_off + 1] = bytes[1];
-                sector_buf[ent_off + 2] = bytes[2];
-                sector_buf[ent_off + 3] = bytes[3];
-            }
-        }
+        // Preserves the top four reserved bits of a FAT32 entry (Microsoft
+        // FAT32 spec §4: "Note that the high 4 bits of a FAT32 FAT entry are
+        // reserved"). The entry lies inside the sector, as its location says.
+        fat_parse::write_fat_entry(
+            state.sector_mut(&mut sector_buf),
+            state.fat_type,
+            ent_off,
+            value,
+        )
+        .ok_or(FatError::Corrupt)?;
 
-        if !cache.write_sector(u64::from(fat_sector), block_dev, &sector_buf, ipc_buf)
+        if !cache.write_sector(u64::from(fat_sector), block_dev, &*sector_buf, ipc_buf)
         {
             return Err(FatError::Io);
         }
@@ -242,8 +210,13 @@ pub fn allocate_cluster(
     {
         return Err(FatError::Corrupt);
     }
-    let max_cluster = state.total_clusters + 1; // inclusive upper index
-    let start = if state.next_free_hint >= 2 && state.next_free_hint <= max_cluster
+    // The last data cluster: mount bounds `total_clusters` below the FAT32
+    // bad-cluster marker, so this never fails on a mounted volume.
+    let max_cluster = state
+        .total_clusters
+        .checked_add(1)
+        .ok_or(FatError::Corrupt)?;
+    let start = if state.is_data_cluster(state.next_free_hint)
     {
         state.next_free_hint
     }
@@ -254,31 +227,17 @@ pub fn allocate_cluster(
 
     let bad = bad_value(state.fat_type);
 
-    let mut cluster = start;
-    let mut wrapped = false;
-    let found = loop
+    // From the hint to the last cluster, then from cluster 2 up to the hint.
+    let mut found = None;
+    for cluster in (start..=max_cluster).chain(2..start)
     {
-        let entry = read_fat_entry(state, cluster, cache, block_dev, ipc_buf)?;
-        if entry == FREE
+        if read_fat_entry(state, cluster, cache, block_dev, ipc_buf)? == FREE
         {
-            break cluster;
+            found = Some(cluster);
+            break;
         }
-        let _ = bad; // touched below; lint quiet without binding here
-        cluster += 1;
-        if cluster > max_cluster
-        {
-            if wrapped
-            {
-                return Err(FatError::NoSpace);
-            }
-            cluster = 2;
-            wrapped = true;
-        }
-        if wrapped && cluster >= start
-        {
-            return Err(FatError::NoSpace);
-        }
-    };
+    }
+    let found = found.ok_or(FatError::NoSpace)?;
 
     // Skip the bad-cluster sentinel just in case (read_fat_entry returns
     // the raw value).
@@ -304,17 +263,13 @@ pub fn allocate_cluster(
     }
 
     // Bump the advisory hint past the allocation (wrap to 2 at end).
-    state.next_free_hint = if found + 1 > max_cluster
+    state.next_free_hint = found
+        .checked_add(1)
+        .filter(|&next| next <= max_cluster)
+        .unwrap_or(2);
+    if state.free_count_hint != u32::MAX
     {
-        2
-    }
-    else
-    {
-        found + 1
-    };
-    if state.free_count_hint != u32::MAX && state.free_count_hint > 0
-    {
-        state.free_count_hint -= 1;
+        state.free_count_hint = state.free_count_hint.saturating_sub(1);
     }
 
     // Best-effort FSInfo write-back: keeps the on-disk hints aligned
@@ -365,7 +320,7 @@ pub fn free_cluster_chain(
     ipc_buf: *mut u64,
 ) -> Result<u32, FatError>
 {
-    if start < 2 || start >= 2 + state.total_clusters
+    if !state.is_data_cluster(start)
     {
         return Err(FatError::Corrupt);
     }
@@ -387,7 +342,9 @@ pub fn free_cluster_chain(
             }
         };
         update_fat_entry(state, cluster, FREE, cache, block_dev, ipc_buf)?;
-        freed += 1;
+        // One per cluster of a chain the volume holds, so this never
+        // saturates.
+        freed = freed.saturating_add(1);
         if state.free_count_hint != u32::MAX
         {
             state.free_count_hint = state.free_count_hint.saturating_add(1);
@@ -434,7 +391,12 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u64, ipc_
         state.fsinfo_sector = u32::MAX;
         return;
     };
-    if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
+    if !cache.read_sector(
+        u64::from(state.fsinfo_sector),
+        block_dev,
+        &mut *buf,
+        ipc_buf,
+    )
     {
         std::os::seraph::log!(
             warn: "`FSInfo` sector read failed; allocator falls back to FAT scan"
@@ -442,6 +404,8 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u64, ipc_
         state.fsinfo_sector = u32::MAX;
         return;
     }
+    // The sector, at least 512 bytes, as the array the constant offsets index.
+    let buf: &[u8; MAX_SECTOR_SIZE] = &buf;
     let lead = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let structsig = u32::from_le_bytes([buf[484], buf[485], buf[486], buf[487]]);
     let trail = u32::from_le_bytes([buf[508], buf[509], buf[510], buf[511]]);
@@ -460,7 +424,7 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u64, ipc_
     {
         state.free_count_hint = free;
     }
-    if nxt != u32::MAX && nxt >= 2 && nxt < 2 + state.total_clusters
+    if state.is_data_cluster(nxt)
     {
         state.next_free_hint = nxt;
     }
@@ -481,14 +445,21 @@ pub fn flush_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u64, ipc
         std::os::seraph::log!(warn: "`FSInfo` access: no memory for a sector buffer");
         return;
     };
-    if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
+    if !cache.read_sector(
+        u64::from(state.fsinfo_sector),
+        block_dev,
+        &mut *buf,
+        ipc_buf,
+    )
     {
         std::os::seraph::log!(warn: "`FSInfo` flush: sector read failed");
         return;
     }
-    buf[488..492].copy_from_slice(&state.free_count_hint.to_le_bytes());
-    buf[492..496].copy_from_slice(&state.next_free_hint.to_le_bytes());
-    if !cache.write_sector(u64::from(state.fsinfo_sector), block_dev, &buf, ipc_buf)
+    // The sector, at least 512 bytes, as the array the constant offsets index.
+    let fsinfo: &mut [u8; MAX_SECTOR_SIZE] = &mut buf;
+    fsinfo[488..492].copy_from_slice(&state.free_count_hint.to_le_bytes());
+    fsinfo[492..496].copy_from_slice(&state.next_free_hint.to_le_bytes());
+    if !cache.write_sector(u64::from(state.fsinfo_sector), block_dev, &*buf, ipc_buf)
     {
         std::os::seraph::log!(warn: "`FSInfo` flush: sector write failed");
     }

@@ -70,19 +70,19 @@ fn map_registers(aspace: u64, registers: Registers) -> Option<u64>
 {
     if registers.pages * syscall_abi::PAGE_SIZE < iommu_riscv::regs::REGISTER_BYTES
     {
-        std::os::seraph::log!("register window: smaller than the register page");
+        std::os::seraph::log!(error: "register window: smaller than the register page");
         return None;
     }
     let Ok(range) = reserve_pages(registers.pages)
     else
     {
-        std::os::seraph::log!("register window: no VA");
+        std::os::seraph::log!(error: "register window: no VA");
         return None;
     };
     let va = range.va_start();
     if !std::os::seraph::fund_aspace_pt_budget(aspace, registers.pages)
     {
-        std::os::seraph::log!("register window: page-table funding failed");
+        std::os::seraph::log!(error: "register window: page-table funding failed");
         return None;
     }
     // SAFETY: `range` is a fresh reservation of the cap's pages from the
@@ -91,7 +91,7 @@ fn map_registers(aspace: u64, registers: Registers) -> Option<u64>
     // only through raw volatile accesses (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(aspace, registers.cap, va, 0) }.is_err()
     {
-        std::os::seraph::log!("register window: mmio_map failed");
+        std::os::seraph::log!(error: "register window: mmio_map failed");
         return None;
     }
     Some(va)
@@ -99,12 +99,12 @@ fn map_registers(aspace: u64, registers: Registers) -> Option<u64>
 
 fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 {
-    std::os::seraph::log!("service receive failing ({:?}, err={})", stage, err);
+    std::os::seraph::log!(warn: "service receive failing ({:?}, err={})", stage, err);
 }
 
 fn faults_dropped(count: u64)
 {
-    std::os::seraph::log!("fault queue full: {} faults dropped", count);
+    std::os::seraph::log!(warn: "fault queue full: {} faults dropped", count);
 }
 
 fn main() -> !
@@ -121,7 +121,7 @@ fn main() -> !
         Ok(boot) => boot,
         Err(e) =>
         {
-            std::os::seraph::log!("bootstrap failed ({:?})", e);
+            std::os::seraph::log!(error: "bootstrap failed ({:?})", e);
             syscall::thread_exit();
         }
     };
@@ -143,18 +143,18 @@ fn main() -> !
     let Some(caps) = (unsafe { KernelCaps::new(info.memmgr_endpoint, ipc_buf) })
     else
     {
-        std::os::seraph::log!("no physical-address credential");
+        std::os::seraph::log!(error: "no physical-address credential");
         syscall::thread_exit();
     };
     let Some(mut svc) = Service::new(Riscv::new(units, store), caps, boot.units)
     else
     {
-        std::os::seraph::log!("no memory for the service");
+        std::os::seraph::log!(error: "no memory for the service");
         syscall::thread_exit();
     };
     if let Err((unit, e)) = svc.init()
     {
-        std::os::seraph::log!("IOMMU {} not set up ({:?}); every IOMMU left Bare", unit, e);
+        std::os::seraph::log!(error: "IOMMU {} not set up ({:?}); every IOMMU left Bare", unit, e);
         syscall::thread_exit();
     }
     std::os::seraph::log!("{} IOMMUs translating", count);
@@ -166,7 +166,7 @@ fn main() -> !
         .spawn(move || service::poll_faults(&*poller, faults_dropped))
         .is_err()
     {
-        std::os::seraph::log!(
+        std::os::seraph::log!(warn:
             "fault poll thread not started; faults are polled only when devmgr takes them"
         );
     }
@@ -174,7 +174,7 @@ fn main() -> !
     // SAFETY: ipc_buf is this thread's registered IPC buffer.
     if let Err(e) = unsafe { ipc::report_driver_ready(boot.devmgr_query, ipc_buf) }
     {
-        std::os::seraph::log!(
+        std::os::seraph::log!(error:
             "DRIVER_READY failed ({:?}); every IOMMU returned to Bare",
             e
         );

@@ -62,7 +62,7 @@ fn request_page() -> u64
         (unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, &req, current_ipc_buf()) })
     else
     {
-        std::os::seraph::log!("physical-address credential: memmgr call failed");
+        std::os::seraph::log!(warn: "physical-address credential: memmgr call failed");
         return 0;
     };
     let caps = reply.caps();
@@ -74,6 +74,6 @@ fn request_page() -> u64
     {
         let _ = syscall::cap_delete(c);
     }
-    std::os::seraph::log!("physical-address credential: memmgr refused the page");
+    std::os::seraph::log!(warn: "physical-address credential: memmgr refused the page");
     0
 }

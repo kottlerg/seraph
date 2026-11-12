@@ -111,7 +111,7 @@ fn main() -> !
         Ok(c) => c,
         Err(e) =>
         {
-            std::os::seraph::log!("page-cache init failed: {e:?}");
+            std::os::seraph::log!(error: "page-cache init failed: {e:?}");
             syscall::thread_exit();
         }
     };
@@ -139,7 +139,7 @@ fn main() -> !
             .spawn(move || eviction::worker_loop(&ev, &f, cache))
             .is_err()
         {
-            std::os::seraph::log!("eviction worker spawn failed");
+            std::os::seraph::log!(error: "eviction worker spawn failed");
             syscall::thread_exit();
         }
     }
@@ -217,13 +217,13 @@ fn query_block_size(block_dev: u64, ipc_buf: *mut u64) -> Option<u32>
     drop_caps(reply.caps());
     if reply.label != ipc::blk_errors::SUCCESS
     {
-        std::os::seraph::log!("BLK_GET_GEOMETRY refused (label={})", reply.label);
+        std::os::seraph::log!(warn: "BLK_GET_GEOMETRY refused (label={})", reply.label);
         return None;
     }
     let size = u32::try_from(reply.word(0)).ok()?;
     if !fat_parse::is_sector_size(size as usize)
     {
-        std::os::seraph::log!("unsupported device block size {size}");
+        std::os::seraph::log!(warn: "unsupported device block size {size}");
         return None;
     }
     Some(size)
@@ -239,11 +239,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
         }
     }
 }
@@ -2133,7 +2133,7 @@ fn restore_lfn_slots(
         .collect();
     if dir::restore_slot_first_bytes(&lfn, cache, block_dev, ipc_buf).is_err()
     {
-        std::os::seraph::log!("WARNING: could not restore an LFN slot after a failed removal");
+        std::os::seraph::log!(warn: "could not restore an LFN slot after a failed removal");
     }
 }
 
@@ -2237,7 +2237,7 @@ fn handle_rename_node_cap(
                 // names, never neither.
                 if remove_entry(state, parent_cluster, dst_name, cache, block_dev, ipc_buf).is_err()
                 {
-                    std::os::seraph::log!("WARNING: could not undo a failed rename's destination");
+                    std::os::seraph::log!(warn: "could not undo a failed rename's destination");
                 }
                 restore_lfn_slots(&failure, src_loc, cache, block_dev, ipc_buf);
                 reply_err(fat_error_to_wire(failure.error), ipc_buf);

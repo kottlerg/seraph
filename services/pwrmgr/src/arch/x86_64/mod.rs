@@ -60,7 +60,9 @@ pub fn resolve(devmgr_registry: u64, self_aspace: u64, ipc_buf: *mut u64) -> Opt
     })
     else
     {
-        std::os::seraph::log!("resolve failed (DSDT not mapped, or no valid \\_S5_ sleep type)");
+        std::os::seraph::log!(
+            warn: "resolve failed (DSDT not mapped, or no valid \\_S5_ sleep type)"
+        );
         return None;
     };
 
@@ -74,7 +76,7 @@ pub fn resolve(devmgr_registry: u64, self_aspace: u64, ipc_buf: *mut u64) -> Opt
     let caps = reply.caps();
     if caps.len() < 2
     {
-        std::os::seraph::log!("resolve failed (QUERY_SHUTDOWN_DEVICE missing caps)");
+        std::os::seraph::log!(warn: "resolve failed (QUERY_SHUTDOWN_DEVICE missing caps)");
         return None;
     }
 
@@ -98,12 +100,12 @@ fn resolve_fadt(devmgr_registry: u64, self_aspace: u64, ipc_buf: *mut u64) -> Op
     })
     else
     {
-        std::os::seraph::log!("resolve failed (FADT could not be mapped or parsed)");
+        std::os::seraph::log!(warn: "resolve failed (FADT could not be mapped or parsed)");
         return None;
     };
     if fields.pm1a_cnt_blk == 0
     {
-        std::os::seraph::log!("resolve failed (PM1a_CNT_BLK is zero)");
+        std::os::seraph::log!(warn: "resolve failed (PM1a_CNT_BLK is zero)");
         return None;
     }
     Some((fields.pm1a_cnt_blk, fields.dsdt_phys))
@@ -117,7 +119,7 @@ pub fn shutdown(self_thread: u64, act: &Actuator)
 {
     if syscall::ioport_bind(self_thread, act.pm1a_ioport_cap).is_err()
     {
-        std::os::seraph::log!("shutdown failed (ioport_bind PM1a)");
+        std::os::seraph::log!(error: "shutdown failed (ioport_bind PM1a)");
         return;
     }
     // `slp_typa` is at most `acpi::SLP_TYP_MAX`, so it stays inside the
@@ -143,7 +145,7 @@ pub fn reboot(self_thread: u64, act: &Actuator)
 
     if syscall::ioport_bind(self_thread, act.kbc_ioport_cap).is_err()
     {
-        std::os::seraph::log!("reboot failed (ioport_bind KBC)");
+        std::os::seraph::log!(error: "reboot failed (ioport_bind KBC)");
         return;
     }
     // SAFETY: port 0x64 is the 8042 command register and `ioport_bind` above

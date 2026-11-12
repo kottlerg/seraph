@@ -97,13 +97,13 @@ fn main() -> !
     let Some(mut watch) = settle::DriverWatch::new(driver_count)
     else
     {
-        std::os::seraph::log!("no driver death watch, halting");
+        std::os::seraph::log!(error: "no driver death watch, halting");
         halt_loop();
     };
 
     if caps.registry_ep == 0
     {
-        std::os::seraph::log!("no registry endpoint injected, halting");
+        std::os::seraph::log!(error: "no registry endpoint injected, halting");
         halt_loop();
     }
 
@@ -123,7 +123,7 @@ fn main() -> !
     caps.dma = dma::DmaService::start();
     if caps.dma.is_none()
     {
-        std::os::seraph::log!("no DMA service, halting");
+        std::os::seraph::log!(error: "no DMA service, halting");
         halt_loop();
     }
 
@@ -214,7 +214,9 @@ fn enumerate_records(caps: &mut caps::DevmgrCaps) -> (bind::Records, decls::Boot
     }
     if windows_scanned == 0
     {
-        std::os::seraph::log!("no PCI ECAM window located or enumerated via ACPI or DTB, halting");
+        std::os::seraph::log!(
+            error: "no PCI ECAM window located or enumerated via ACPI or DTB, halting"
+        );
         halt_loop();
     }
     std::os::seraph::log!(
@@ -233,7 +235,7 @@ fn enumerate_records(caps: &mut caps::DevmgrCaps) -> (bind::Records, decls::Boot
     let Some(records) = records
     else
     {
-        std::os::seraph::log!("no memory for the device records, halting");
+        std::os::seraph::log!(error: "no memory for the device records, halting");
         halt_loop();
     };
     (records, modules)
@@ -256,14 +258,14 @@ fn start_registry_workers(registry: &Arc<Registry>)
         Ok(_) =>
         {}
         Err(e) if e.running > 0 => std::os::seraph::log!(
-            "{} of {} registry workers started ({}); serving on those",
+            warn: "{} of {} registry workers started ({}); serving on those",
             e.running as u64,
             REGISTRY_WORKERS as u64,
             e.error
         ),
         Err(e) =>
         {
-            std::os::seraph::log!("no registry worker started ({}), halting", e.error);
+            std::os::seraph::log!(error: "no registry worker started ({}), halting", e.error);
             halt_loop();
         }
     }
@@ -527,7 +529,7 @@ impl Registry
                 // Destroyed but not released: its service endpoint is the
                 // IOMMU client's, which is never deleted.
                 std::os::seraph::log!(
-                    "{}: driver not ready when its batch settled; destroyed",
+                    warn: "{}: driver not ready when its batch settled; destroyed",
                     name.as_str()
                 );
                 spawn::destroy_child(spawned.driver.process_handle, ipc_buf);
@@ -549,7 +551,7 @@ impl Registry
                     "driver reported neither ready nor death before the settle ended; destroyed",
                 ),
             };
-            std::os::seraph::log!("{}: {}", name.as_str(), why);
+            std::os::seraph::log!(warn: "{}: {}", name.as_str(), why);
             driver.withdraw(ipc_buf);
         }
     }
@@ -608,7 +610,7 @@ impl Registry
             Some((None, _record)) =>
             {
                 std::os::seraph::log!(
-                    "iommu: served driver of device {} died (reason={:#x})",
+                    warn: "iommu: served driver of device {} died (reason={:#x})",
                     post.badge,
                     post.reason
                 );
@@ -617,7 +619,7 @@ impl Registry
             Some((Some(class), driver)) =>
             {
                 std::os::seraph::log!(
-                    "{}: served driver of device {} died (reason={:#x}); withdrawn",
+                    warn: "{}: served driver of device {} died (reason={:#x}); withdrawn",
                     class.as_str(),
                     post.badge,
                     post.reason
@@ -660,7 +662,10 @@ impl Registry
             {
                 break;
             };
-            std::os::seraph::log!("{}: its device's IOMMU is gone; withdrawn", class.as_str());
+            std::os::seraph::log!(
+                warn: "{}: its device's IOMMU is gone; withdrawn",
+                class.as_str()
+            );
             driver.withdraw(ipc_buf);
         }
     }
@@ -691,11 +696,11 @@ impl Registry
             match mismatch
             {
                 Mismatch::NoDriver => std::os::seraph::log!(
-                    "class {}: configured; no driver of it is served",
+                    warn: "class {}: configured; no driver of it is served",
                     class.as_str()
                 ),
                 Mismatch::NotConfigured => std::os::seraph::log!(
-                    "class {}: a driver of it is served; no class file configures it",
+                    warn: "class {}: a driver of it is served; no class file configures it",
                     class.as_str()
                 ),
             }
@@ -983,7 +988,9 @@ impl Registry
         };
         if msg.badge & ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY == 0
         {
-            std::os::seraph::log!("SET_DRIVERS_DIR rejected: badge lacks DRIVERS_DIR_AUTHORITY");
+            std::os::seraph::log!(
+                warn: "SET_DRIVERS_DIR rejected: badge lacks DRIVERS_DIR_AUTHORITY"
+            );
             release();
             reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
             return;
@@ -1216,11 +1223,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
         }
     }
 }
@@ -1349,7 +1356,7 @@ fn enumerate_ecam(
 ) -> bool
 {
     std::os::seraph::log!(
-        "devmgr: ECAM segment {} phys={:#x} size={:#x} buses {}..={}",
+        debug: "devmgr: ECAM segment {} phys={:#x} size={:#x} buses {}..={}",
         loc.segment,
         loc.phys_base,
         loc.size,
@@ -1362,7 +1369,7 @@ fn enumerate_ecam(
     else
     {
         std::os::seraph::log!(
-            "no aperture covers ECAM segment {}; not scanned",
+            warn: "no aperture covers ECAM segment {}; not scanned",
             loc.segment
         );
         return false;
@@ -1386,7 +1393,7 @@ fn enumerate_ecam(
     let Some(scanned) = scanned
     else
     {
-        std::os::seraph::log!("ECAM segment {} not scanned", loc.segment);
+        std::os::seraph::log!(warn: "ECAM segment {} not scanned", loc.segment);
         return false;
     };
     keep_ecam(caps, loc, ecam_cap);
@@ -1394,7 +1401,7 @@ fn enumerate_ecam(
     {
         let (seg, bus, dev, func) = stop.bdf;
         std::os::seraph::log!(
-            "PCI scan stopped at {}:{}:{}.{}: no memory for the device list",
+            warn: "PCI scan stopped at {}:{}:{}.{}: no memory for the device list",
             seg,
             bus,
             dev,
@@ -1426,13 +1433,13 @@ fn with_mmio_mapped<R>(
     let Ok(range) = reserve_pages(pages)
     else
     {
-        std::os::seraph::log!("{}: no VA to map it", what);
+        std::os::seraph::log!(warn: "{}: no VA to map it", what);
         return None;
     };
     let va = range.va_start();
     if !std::os::seraph::fund_aspace_pt_budget(aspace, pages)
     {
-        std::os::seraph::log!("{}: page-table budget not funded", what);
+        std::os::seraph::log!(warn: "{}: page-table budget not funded", what);
         unreserve_pages(range);
         return None;
     }
@@ -1443,7 +1450,7 @@ fn with_mmio_mapped<R>(
     // unmap below (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(aspace, cap, va, 0) }.is_err()
     {
-        std::os::seraph::log!("{}: mapping failed", what);
+        std::os::seraph::log!(warn: "{}: mapping failed", what);
         unreserve_pages(range);
         return None;
     }
@@ -1474,7 +1481,7 @@ fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap
     else
     {
         std::os::seraph::log!(
-            "ECAM segment {}: configuration space not kept; its devices get no driver",
+            warn: "ECAM segment {}: configuration space not kept; its devices get no driver",
             loc.segment
         );
     }
@@ -1506,7 +1513,7 @@ pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Opti
         Err(e) =>
         {
             std::os::seraph::log!(
-                "MMIO carve of {:#x}+{:#x} failed ({}); remainders kept",
+                warn: "MMIO carve of {:#x}+{:#x} failed ({}); remainders kept",
                 phys,
                 size,
                 if e == CarveError::NoMemory
@@ -1560,7 +1567,7 @@ impl IrqRangeAllocator
         // A range cap starts at line 0 (init derives it from the root range).
         if range_slot != 0 && ranges.insert(range_slot, 0, Self::RANGE_END_BOUND) != Ok(true)
         {
-            std::os::seraph::log!("IRQ range not recorded (no memory); no device IRQs");
+            std::os::seraph::log!(warn: "IRQ range not recorded (no memory); no device IRQs");
         }
         Self {
             ranges,
@@ -1838,7 +1845,7 @@ fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ip
     if let Err(spawned) = roster.add(spawned.badge, spawned)
     {
         std::os::seraph::log!(
-            "{}: driver not recorded; device not served",
+            warn: "{}: driver not recorded; device not served",
             spawned.name.as_str()
         );
         spawned.driver.withdraw(ipc_buf);
@@ -1974,7 +1981,7 @@ fn settle_batch(
     if end == firmware::roster::SettleEnd::TimedOut
     {
         std::os::seraph::log!(
-            "settle: bound of {} ms elapsed with drivers pending",
+            warn: "settle: bound of {} ms elapsed with drivers pending",
             u64::try_from(bound.as_millis()).unwrap_or(u64::MAX)
         );
     }
@@ -2003,7 +2010,7 @@ fn spawn_boot_drivers(
     let Some(batch) = settle::SettleBatch::new()
     else
     {
-        std::os::seraph::log!("boot batch: no settle batch; no driver spawned");
+        std::os::seraph::log!(warn: "boot batch: no settle batch; no driver spawned");
         // A retained module cap pins the pool run init donated it from.
         for (_, module) in modules
         {
@@ -2073,7 +2080,7 @@ fn spawn_on_disk_drivers(
     let Some(batch) = settle::SettleBatch::new()
     else
     {
-        std::os::seraph::log!("on-disk batch: no settle batch; no driver spawned");
+        std::os::seraph::log!(warn: "on-disk batch: no settle batch; no driver spawned");
         return;
     };
     let mut roster = Roster::new();
@@ -2129,14 +2136,14 @@ impl SimpleDeviceSlots
         let Some(service_ep) = create_service_endpoint()
         else
         {
-            std::os::seraph::log!("{}: failed to create service endpoint", name);
+            std::os::seraph::log!(warn: "{}: failed to create service endpoint", name);
             return None;
         };
         let Ok(query_ep) =
             syscall::cap_derive_badge(batch.driver_ep(), syscall::RIGHTS_EP_SEND, device_badge)
         else
         {
-            std::os::seraph::log!("{}: failed to derive the badged query cap", name);
+            std::os::seraph::log!(warn: "{}: failed to derive the badged query cap", name);
             let _ = syscall::cap_delete(service_ep);
             return None;
         };
@@ -2213,7 +2220,7 @@ fn spawn_test_fault_drivers(
     let Some(batch) = settle::SettleBatch::new()
     else
     {
-        std::os::seraph::log!("test-fault: no settle batch; no fixture spawned");
+        std::os::seraph::log!(warn: "test-fault: no settle batch; no fixture spawned");
         return;
     };
     let mut roster = Roster::new();
@@ -2255,13 +2262,13 @@ fn spawn_one_test_fault(
 {
     if roster.try_reserve_one().is_err()
     {
-        std::os::seraph::log!("test-fault: no memory to record a fixture; not spawned");
+        std::os::seraph::log!(warn: "test-fault: no memory to record a fixture; not spawned");
         return;
     }
     let Some(device_badge) = catalog.add_without_info()
     else
     {
-        std::os::seraph::log!("test-fault: catalog entry not added; not spawned");
+        std::os::seraph::log!(warn: "test-fault: catalog entry not added; not spawned");
         return;
     };
     let requested_rights = u64::from(namespace_protocol::rights::READ);
@@ -2272,7 +2279,7 @@ fn spawn_one_test_fault(
     })
     else
     {
-        std::os::seraph::log!("test-fault: walk_to_file failed (binary missing on rootfs)");
+        std::os::seraph::log!(warn: "test-fault: walk_to_file failed (binary missing on rootfs)");
         return;
     };
     let Some(slots) = SimpleDeviceSlots::new("test-fault", device_badge, batch)
@@ -2284,7 +2291,7 @@ fn spawn_one_test_fault(
     let Some(hw_cap) = create_service_endpoint()
     else
     {
-        std::os::seraph::log!("test-fault: no placeholder hardware cap");
+        std::os::seraph::log!(warn: "test-fault: no placeholder hardware cap");
         let _ = syscall::cap_delete(walked.file_cap);
         slots.release();
         return;
@@ -2346,7 +2353,7 @@ fn test_spawn_orphan(
             .unwrap_or(0);
     if service_ep == 0 || hw_cap == 0 || query_ep == 0
     {
-        std::os::seraph::log!("test-orphan: failed to mint shim caps");
+        std::os::seraph::log!(warn: "test-orphan: failed to mint shim caps");
         let _ = syscall::cap_delete(walked.file_cap);
         for cap in [service_ep, hw_cap, query_ep]
         {
@@ -2405,12 +2412,12 @@ fn refuse_translatable_aspace(self_aspace: u64)
         {}
         Ok(_) =>
         {
-            std::os::seraph::log!("own address space carries RIGHTS_AS_READ, halting");
+            std::os::seraph::log!(error: "own address space carries RIGHTS_AS_READ, halting");
             halt_loop();
         }
         Err(e) =>
         {
-            std::os::seraph::log!("own address space rights unreadable ({e}), halting");
+            std::os::seraph::log!(error: "own address space rights unreadable ({e}), halting");
             halt_loop();
         }
     }

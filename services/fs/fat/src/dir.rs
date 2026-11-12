@@ -56,7 +56,7 @@ fn next_dir_cluster(
     *steps = steps.saturating_add(1);
     if *steps > state.total_clusters
     {
-        std::os::seraph::log!("WARNING: directory chain through cluster {cluster} has a cycle");
+        std::os::seraph::log!(warn: "directory chain through cluster {cluster} has a cycle");
         return Err(FatError::Corrupt);
     }
     chain_next(state, cluster, cache, block_dev, ipc_buf)
@@ -82,7 +82,7 @@ fn dir_start_cluster(state: &FatState, dir_cluster: u32) -> Result<u32, FatError
     else
     {
         std::os::seraph::log!(
-            "WARNING: directory walk from cluster {dir_cluster} outside data region"
+            warn: "directory walk from cluster {dir_cluster} outside data region"
         );
         Err(FatError::Corrupt)
     }

@@ -154,7 +154,7 @@ pub fn walk_and_create_from_file(
         Ok(cap) => cap,
         Err(e) =>
         {
-            std::os::seraph::log!("create: {path:?} argv/env cap failed: {e}");
+            std::os::seraph::log!(warn: "create: {path:?} argv/env cap failed: {e}");
             return None;
         }
     };
@@ -162,14 +162,14 @@ pub fn walk_and_create_from_file(
     let Some((child_badge, badged_creator)) = mint_child_creator(bootstrap_ep)
     else
     {
-        std::os::seraph::log!("create: bootstrap badge mint failed");
+        std::os::seraph::log!(warn: "create: bootstrap badge mint failed");
         return None;
     };
 
     let root_cap = std::os::seraph::root_dir_cap();
     if root_cap == 0
     {
-        std::os::seraph::log!("create: no root_dir_cap configured");
+        std::os::seraph::log!(warn: "create: no root_dir_cap configured");
         let _ = syscall::cap_delete(badged_creator);
         return None;
     }
@@ -178,7 +178,7 @@ pub fn walk_and_create_from_file(
         Ok(p) => p,
         Err(e) =>
         {
-            std::os::seraph::log!("create: NS_LOOKUP {path:?} failed: {e}");
+            std::os::seraph::log!(warn: "create: NS_LOOKUP {path:?} failed: {e}");
             let _ = syscall::cap_delete(badged_creator);
             return None;
         }
@@ -223,14 +223,14 @@ pub fn walk_and_create_from_file(
         Ok(r) => r,
         Err(e) =>
         {
-            std::os::seraph::log!("create: CREATE_FROM_FILE ipc failed (err={e})");
+            std::os::seraph::log!(warn: "create: CREATE_FROM_FILE ipc failed (err={e})");
             delete_caps(&[file_cap, badged_creator]);
             return None;
         }
     };
     if reply.label != 0
     {
-        std::os::seraph::log!("create: CREATE_FROM_FILE returned {:#x}", reply.label);
+        std::os::seraph::log!(warn: "create: CREATE_FROM_FILE returned {:#x}", reply.label);
         delete_caps(&[file_cap, badged_creator]);
         delete_caps(reply.caps());
         return None;
@@ -238,7 +238,7 @@ pub fn walk_and_create_from_file(
     let reply_caps = reply.caps();
     if reply_caps.len() < 2
     {
-        std::os::seraph::log!("create: reply missing caps");
+        std::os::seraph::log!(warn: "create: reply missing caps");
         // A label-0 reply means procmgr created the child; destroy it
         // through whatever handle arrived. Slot 0 stands in for an absent
         // thread cap.
@@ -264,7 +264,7 @@ pub fn start_process(process_handle: u64, ipc_buf: *mut u64) -> bool
     let reply = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) };
     if !matches!(reply, Ok(r) if r.label == 0)
     {
-        std::os::seraph::log!("START_PROCESS failed");
+        std::os::seraph::log!(warn: "START_PROCESS failed");
         return false;
     }
     true
@@ -353,7 +353,7 @@ fn permanent_death_outcome(svc: &ServiceEntry) -> DeathOutcome
     if svc.system_critical
     {
         std::os::seraph::log!(
-            "critical service unrecoverable: {}; initiating graceful shutdown",
+            error: "critical service unrecoverable: {}; initiating graceful shutdown",
             svc.name_str()
         );
         DeathOutcome::Unrecoverable
@@ -361,7 +361,7 @@ fn permanent_death_outcome(svc: &ServiceEntry) -> DeathOutcome
     else
     {
         std::os::seraph::log!(
-            "service down: {}; system continues degraded",
+            warn: "service down: {}; system continues degraded",
             svc.name_str()
         );
         DeathOutcome::Degraded
@@ -387,13 +387,13 @@ fn should_restart(svc: &mut ServiceEntry, exit_reason: u64) -> bool
 
     if svc.vfs_path.is_empty()
     {
-        std::os::seraph::log!("no restart source (vfs_path), cannot restart");
+        std::os::seraph::log!(warn: "no restart source (vfs_path), cannot restart");
         return false;
     }
 
     if !svc.restart_budget.try_charge(crate::now_ns())
     {
-        std::os::seraph::log!("restart budget spent for this window");
+        std::os::seraph::log!(warn: "restart budget spent for this window");
         return false;
     }
 
@@ -461,7 +461,7 @@ fn restart_process(
 
     if serve_boot_slots(ctx, child_badge, &boot_caps).is_err()
     {
-        std::os::seraph::log!("bootstrap serve failed");
+        std::os::seraph::log!(warn: "bootstrap serve failed");
         // serve_round MOVES caps on success; on failure they may or
         // may not have been consumed. Best-effort delete is safe
         // (delete of an already-transferred slot is a no-op). The
@@ -533,7 +533,7 @@ fn restart_boot_caps(
         let Ok(recv) = syscall::cap_derive(svc.provided_endpoint, syscall::RIGHTS_EP_RECEIVE)
         else
         {
-            std::os::seraph::log!("restart: provider RECV derive failed");
+            std::os::seraph::log!(warn: "restart: provider RECV derive failed");
             delete_caps(&restart_caps);
             return None;
         };
@@ -558,7 +558,7 @@ fn create_process(
 {
     if svc.vfs_path.is_empty()
     {
-        std::os::seraph::log!("restart: no vfs_path source for {}", svc.name_str());
+        std::os::seraph::log!(warn: "restart: no vfs_path source for {}", svc.name_str());
         return None;
     }
     let path_str = svc.vfs_path.as_str();
@@ -635,14 +635,14 @@ pub fn apply_namespace_policy(
     let root_cap = std::os::seraph::root_dir_cap();
     if root_cap == 0
     {
-        std::os::seraph::log!("ns policy: no root_dir_cap for CONFIGURE_NAMESPACE");
+        std::os::seraph::log!(warn: "ns policy: no root_dir_cap for CONFIGURE_NAMESPACE");
         destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
         return false;
     }
     let Some(info) = std::os::seraph::try_startup_info()
     else
     {
-        std::os::seraph::log!("ns policy: no startup info for cap_copy");
+        std::os::seraph::log!(warn: "ns policy: no startup info for cap_copy");
         destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
         return false;
     };
@@ -654,7 +654,7 @@ pub fn apply_namespace_policy(
             let Ok(c) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_EP_SEND)
             else
             {
-                std::os::seraph::log!("ns policy: cap_copy of root for child failed");
+                std::os::seraph::log!(warn: "ns policy: cap_copy of root for child failed");
                 destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
                 return false;
             };
@@ -672,7 +672,7 @@ pub fn apply_namespace_policy(
                 Ok(c) => c,
                 Err(e) =>
                 {
-                    std::os::seraph::log!("ns policy: subtree walk {path_str:?} failed: {e}");
+                    std::os::seraph::log!(warn: "ns policy: subtree walk {path_str:?} failed: {e}");
                     destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
                     return false;
                 }
@@ -680,7 +680,7 @@ pub fn apply_namespace_policy(
         }
         _ =>
         {
-            std::os::seraph::log!("ns policy: unknown ns_policy_kind");
+            std::os::seraph::log!(warn: "ns policy: unknown ns_policy_kind");
             destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
             return false;
         }
@@ -728,7 +728,7 @@ pub(crate) fn configure_namespace_caps(
             Ok(c) => c,
             Err(e) =>
             {
-                std::os::seraph::log!("ns policy: cwd walk {cwd_path:?} failed: {e}");
+                std::os::seraph::log!(warn: "ns policy: cwd walk {cwd_path:?} failed: {e}");
                 let _ = syscall::cap_delete(ns_cap);
                 destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
                 return false;
@@ -760,13 +760,13 @@ pub(crate) fn configure_namespace_caps(
         Ok(r) if r.label == 0 => true,
         Ok(r) =>
         {
-            std::os::seraph::log!("ns policy: CONFIGURE_NAMESPACE returned {:#x}", r.label);
+            std::os::seraph::log!(warn: "ns policy: CONFIGURE_NAMESPACE returned {:#x}", r.label);
             destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
             false
         }
         Err(_) =>
         {
-            std::os::seraph::log!("ns policy: CONFIGURE_NAMESPACE syscall failed");
+            std::os::seraph::log!(warn: "ns policy: CONFIGURE_NAMESPACE syscall failed");
             destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
             false
         }
@@ -799,7 +799,7 @@ fn rebind_death_notification(
 {
     if deaths.bind_thread(new_thread_cap, correlator).is_err()
     {
-        std::os::seraph::log!("failed to rebind death notification");
+        std::os::seraph::log!(warn: "failed to rebind death notification");
         return false;
     }
 

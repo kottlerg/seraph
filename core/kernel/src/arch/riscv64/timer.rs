@@ -20,6 +20,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use super::encoding::{ticks_for_period, ticks_to_us};
 use super::interrupts;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -84,33 +85,6 @@ fn read_time() -> u64
     t
 }
 
-// ── Tick math (pure, host-testable) ───────────────────────────────────────────
-
-/// Ticks of a `freq` Hz counter in a period of `period_us` microseconds.
-// The product is computed in u128 so arbitrary discovered frequencies cannot
-// overflow; the quotient fits u64 for every freq ≤ u32::MAX (enforced by
-// `init`) and sane period.
-#[allow(clippy::cast_possible_truncation)]
-fn ticks_for_period(freq: u64, period_us: u64) -> u64
-{
-    (u128::from(freq) * u128::from(period_us) / 1_000_000) as u64
-}
-
-/// Convert `ticks` of a `freq` Hz counter to whole microseconds.
-///
-/// Exact for arbitrary frequencies via a div/mod split: the remainder
-/// product `(ticks % freq) * 1_000_000` cannot overflow because `init`
-/// bounds `freq` to `u32::MAX` (< 2^32 · 2^20 = 2^52). Returns 0 when
-/// `freq` is zero (timer not initialised).
-fn ticks_to_us(ticks: u64, freq: u64) -> u64
-{
-    if freq == 0
-    {
-        return 0;
-    }
-    (ticks / freq) * 1_000_000 + (ticks % freq) * 1_000_000 / freq
-}
-
 // ── Public interface ──────────────────────────────────────────────────────────
 
 /// Initialise the supervisor timer for periodic preemption at `period_us` µs.
@@ -154,10 +128,14 @@ pub unsafe fn init(period_us: u64)
 
     let period_ticks = ticks_for_period(freq, period_us).max(1);
     TIMER_PERIOD_TICKS.store(period_ticks, Ordering::Relaxed);
-    TICKS_PER_SEC.store(1_000_000 / period_us, Ordering::Relaxed);
+    // A zero period is taken as one microsecond.
+    TICKS_PER_SEC.store(
+        1_000_000u64.checked_div(period_us).unwrap_or(1_000_000),
+        Ordering::Relaxed,
+    );
 
     let now = read_time();
-    write_stimecmp(now + period_ticks);
+    write_stimecmp(now.wrapping_add(period_ticks));
 
     // Record the high-resolution boot reference: the `time` CSR value at the
     // moment the timer is armed. Used by elapsed_us() for timestamps.
@@ -198,7 +176,7 @@ pub unsafe fn init_ap(period_us: u64)
         // not occur in practice since APs start after Phase 5.
         period_ticks = ticks_for_period(freq, period_us).max(1);
     }
-    write_stimecmp(read_time() + period_ticks);
+    write_stimecmp(read_time().wrapping_add(period_ticks));
     // Enable supervisor interrupts — the timer will now fire.
     // SAFETY: stvec is installed (interrupts::init_ap called first).
     unsafe {
@@ -224,7 +202,7 @@ pub fn handle_tick()
     // Rearm before calling schedule() so the next tick is not missed; the
     // stimecmp write also clears the pending STIP condition.
     #[cfg(not(test))]
-    write_stimecmp(read_time() + period);
+    write_stimecmp(read_time().wrapping_add(period));
     #[cfg(test)]
     let _ = period;
     // SAFETY: called from interrupt handler on a valid kernel stack.
@@ -309,62 +287,3 @@ pub fn delay_us(us: u64)
 #[allow(dead_code)]
 #[cfg(test)]
 pub fn delay_us(_us: u64) {}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-
-    #[test]
-    fn period_ticks_for_10ms_at_10_mhz()
-    {
-        // 10 ms = 10_000 µs → 10_000_000 * 10_000 / 1_000_000 = 100_000 ticks.
-        assert_eq!(ticks_for_period(10_000_000, 10_000), 100_000);
-    }
-
-    #[test]
-    fn period_ticks_for_1ms_at_10_mhz()
-    {
-        assert_eq!(ticks_for_period(10_000_000, 1_000), 10_000);
-    }
-
-    #[test]
-    fn period_ticks_for_1ms_at_non_mhz_multiple()
-    {
-        // 1_193_182 Hz (a frequency with no whole ticks-per-µs ratio):
-        // 1 ms = 1_193.182 ticks, truncated.
-        assert_eq!(ticks_for_period(1_193_182, 1_000), 1_193);
-    }
-
-    #[test]
-    fn ticks_to_us_exact_at_10_mhz()
-    {
-        assert_eq!(ticks_to_us(12_345, 10_000_000), 1_234);
-        assert_eq!(ticks_to_us(10_000_000, 10_000_000), 1_000_000);
-    }
-
-    #[test]
-    fn ticks_to_us_exact_at_arbitrary_frequencies()
-    {
-        for freq in [1_193_182u64, 24_000_000, 3, u64::from(u32::MAX)]
-        {
-            for ticks in [0u64, 1, freq - 1, freq, freq + 1, 1 << 40, 1 << 60]
-            {
-                let expected = (u128::from(ticks) * 1_000_000 / u128::from(freq)) as u64;
-                assert_eq!(
-                    ticks_to_us(ticks, freq),
-                    expected,
-                    "ticks={ticks} freq={freq}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn ticks_to_us_zero_frequency_is_zero()
-    {
-        assert_eq!(ticks_to_us(12_345, 0), 0);
-    }
-}

@@ -154,7 +154,8 @@ pub unsafe fn setup_trampoline(trampoline_pa: u64)
 {
     let code_start = core::ptr::addr_of!(_rv_ap_trampoline) as usize;
     let code_end = core::ptr::addr_of!(_rv_ap_trampoline_end) as usize;
-    let code_len = code_end - code_start;
+    // The end symbol follows the start; a reversed pair copies nothing.
+    let code_len = code_end.saturating_sub(code_start);
 
     // Direct map active; dst is valid writable memory for the page.
     let dst = phys_to_virt(trampoline_pa) as *mut u8;
@@ -202,7 +203,7 @@ pub unsafe fn start_ap(
         setup_ap_params(trampoline_pa, cpu_idx, satp, entry_fn, stack_top);
     }
 
-    let params_pa = trampoline_pa + PARAMS_OFFSET as u64;
+    let params_pa = trampoline_pa.wrapping_add(PARAMS_OFFSET as u64);
 
     // SAFETY: trampoline_pa is identity-mapped RWX; params_pa is in the same page.
     unsafe { sbi_hart_start(u64::from(hart_id), trampoline_pa, params_pa) }
@@ -242,7 +243,7 @@ pub unsafe fn setup_ap_params(
     stack_top: u64,
 )
 {
-    let base = (phys_to_virt(trampoline_pa) + PARAMS_OFFSET as u64) as *mut u64;
+    let base = phys_to_virt(trampoline_pa).wrapping_add(PARAMS_OFFSET as u64) as *mut u64;
     // SAFETY: direct map active; 4 × u64 at offset 0x40 lie within the 4 KiB page.
     unsafe {
         base.add(PARAM_SATP / 8).write_volatile(satp);

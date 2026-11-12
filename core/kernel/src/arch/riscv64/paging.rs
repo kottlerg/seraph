@@ -296,8 +296,12 @@ fn leaf_phys(pte: PageTableEntry, virt: u64) -> u64
 /// § NAPOT Contiguity (RISC-V).
 fn try_promote_napot_64k(l0: &mut [PageTableEntry; 512], virt: u64)
 {
-    let start = vpn_index(0, virt) & !(NAPOT_64K_PAGES - 1);
-    let base = l0[start];
+    let Some(group) = napot_group(l0, virt)
+    else
+    {
+        return;
+    };
+    let [base, ..] = *group;
     // Eligible only for valid, uncacheable (PBMT=IO) leaves not already
     // promoted, on a 64 KiB-aligned physical base.
     if base.0 & VALID == 0
@@ -313,18 +317,17 @@ fn try_promote_napot_64k(l0: &mut [PageTableEntry; 512], virt: u64)
         return;
     }
     let attrs = base.0 & !PPN_MASK;
-    for (i, e) in l0[start..start + NAPOT_64K_PAGES].iter().enumerate()
+    let contiguous = group
+        .iter()
+        .zip((base_pa..).step_by(4096))
+        .all(|(e, pa)| e.0 & !PPN_MASK == attrs && e.phys_addr() == pa);
+    if !contiguous
     {
-        if e.0 & !PPN_MASK != attrs || e.phys_addr() != base_pa + i as u64 * 4096
-        {
-            return;
-        }
+        return;
     }
-    let napot = PageTableEntry(attrs | NAPOT | ((base_pa >> 2) & PPN_MASK) | NAPOT_64K_PPN);
-    for e in &mut l0[start..start + NAPOT_64K_PAGES]
-    {
-        *e = napot;
-    }
+    group.fill(PageTableEntry(
+        attrs | NAPOT | ((base_pa >> 2) & PPN_MASK) | NAPOT_64K_PPN,
+    ));
 }
 
 /// Restore the 16 per-page PTEs of the NAPOT group containing `virt`
@@ -336,19 +339,40 @@ fn try_promote_napot_64k(l0: &mut [PageTableEntry; 512], virt: u64)
 /// [memory-internals.md](../../../docs/memory-internals.md) § NAPOT Contiguity (RISC-V).
 fn demote_napot_64k(l0: &mut [PageTableEntry; 512], virt: u64)
 {
-    let start = vpn_index(0, virt) & !(NAPOT_64K_PAGES - 1);
-    let member = l0[start];
+    let Some(group) = napot_group(l0, virt)
+    else
+    {
+        return;
+    };
+    let [member, ..] = *group;
     if member.0 & NAPOT == 0
     {
         return;
     }
     let attrs = member.0 & !PPN_MASK & !NAPOT;
     let base_pa = member.phys_addr() & !0xF000;
-    for (i, e) in l0[start..start + NAPOT_64K_PAGES].iter_mut().enumerate()
+    for (e, pa) in group.iter_mut().zip((base_pa..).step_by(4096))
     {
-        let pa = base_pa + i as u64 * 4096;
         *e = PageTableEntry(attrs | ((pa >> 2) & PPN_MASK));
     }
+}
+
+/// The aligned 16-slot NAPOT group of `l0` that holds `virt`'s leaf. A table is
+/// 32 whole groups and a leaf index is below 512, so the `None` arm is never
+/// taken.
+fn napot_group(
+    l0: &mut [PageTableEntry; 512],
+    virt: u64,
+) -> Option<&mut [PageTableEntry; NAPOT_64K_PAGES]>
+{
+    let (groups, _) = l0.as_chunks_mut::<NAPOT_64K_PAGES>();
+    groups.get_mut(vpn_index(0, virt) / NAPOT_64K_PAGES)
+}
+
+/// Whether `virt`'s leaf in `l0` is a member of a NAPOT group.
+fn is_napot(l0: &[PageTableEntry; 512], virt: u64) -> bool
+{
+    entry(l0, 0, virt).is_some_and(|e| e.0 & NAPOT != 0)
 }
 
 // ── Table frame access ────────────────────────────────────────────────────────
@@ -365,30 +389,68 @@ unsafe fn table_at(frame_va: u64) -> &'static mut [PageTableEntry; 512]
     unsafe { &mut *(frame_va as *mut [PageTableEntry; 512]) }
 }
 
+/// The entry of `table` that `va` selects at `level`. `vpn_index` keeps nine
+/// VA bits, so every index it returns names one of the 512 entries and the
+/// `None` arm, which each caller sends down its own error or early return, is
+/// never taken.
+fn entry_mut(
+    table: &mut [PageTableEntry; 512],
+    level: usize,
+    va: u64,
+) -> Option<&mut PageTableEntry>
+{
+    table.get_mut(vpn_index(level, va))
+}
+
+/// The value of the entry of `table` that `va` selects at `level`
+/// ([`entry_mut`]).
+fn entry(table: &[PageTableEntry; 512], level: usize, va: u64) -> Option<PageTableEntry>
+{
+    table.get(vpn_index(level, va)).copied()
+}
+
 // ── Level descent ─────────────────────────────────────────────────────────────
+
+/// Level of the root table under the active mode: 4 (Sv57), 3 (Sv48) or 2 (Sv39).
+fn root_level() -> usize
+{
+    // A mode has three to five levels, so the subtraction never saturates.
+    paging_mode().levels().saturating_sub(1)
+}
+
+/// The levels of `(stop, top]`, from `top` down: the tables a descent from a
+/// table at level `top` to the table at level `stop` reads an entry of.
+fn levels_above(stop: usize, top: usize) -> impl Iterator<Item = usize>
+{
+    (stop..=top).rev().take_while(move |&level| level > stop)
+}
 
 /// Descend from the table at `root_va` to the table at level `stop`,
 /// resolving-or-allocating a child at each level in `(stop, top]` via
 /// `ensure`. `ensure` returns the child table's *virtual* address, so each
 /// caller supplies its own PA→VA translation alongside its allocator.
 ///
+/// # Errors
+/// The first error `ensure` returns, and [`PagingError::OutOfFrames`] for an
+/// entry [`entry_mut`] does not find.
+///
 /// # Safety
 /// `root_va` must be the VA of a valid, exclusively-owned table frame at
 /// level `top`, and `ensure` must return the VA of a valid, exclusively-owned
 /// table frame for every entry it is handed.
-unsafe fn descend_alloc<E>(
+unsafe fn descend_alloc(
     root_va: u64,
     virt: u64,
     top: usize,
     stop: usize,
-    mut ensure: impl FnMut(&mut PageTableEntry) -> Result<u64, E>,
-) -> Result<&'static mut [PageTableEntry; 512], E>
+    mut ensure: impl FnMut(&mut PageTableEntry) -> Result<u64, PagingError>,
+) -> Result<&'static mut [PageTableEntry; 512], PagingError>
 {
     // SAFETY: root_va is a valid exclusively-owned table frame (caller contract).
     let mut table = unsafe { table_at(root_va) };
-    for level in (stop + 1..=top).rev()
+    for level in levels_above(stop, top)
     {
-        let child_va = ensure(&mut table[vpn_index(level, virt)])?;
+        let child_va = ensure(entry_mut(table, level, virt).ok_or(PagingError::OutOfFrames)?)?;
         // SAFETY: ensure returned the VA of a valid exclusively-owned table frame.
         table = unsafe { table_at(child_va) };
     }
@@ -415,9 +477,9 @@ unsafe fn descend_existing(
 {
     // SAFETY: root_va is a valid table frame (caller contract).
     let mut table = unsafe { table_at(root_va) };
-    for level in (stop + 1..=top).rev()
+    for level in levels_above(stop, top)
     {
-        let e = table[vpn_index(level, virt)];
+        let e = entry(table, level, virt)?;
         if !e.is_present() || e.0 & LEAF_BITS != 0
         {
             return None;
@@ -442,15 +504,15 @@ pub fn map_page(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    let top = paging_mode().levels() - 1;
     // SAFETY: root_va is the VA of a valid root frame allocated from pool;
     // walk_or_alloc yields pool frames whose VAs pool.phys_to_virt resolves.
     let l0 = unsafe {
-        descend_alloc(root_va, virt, top, 0, |e| {
+        descend_alloc(root_va, virt, root_level(), 0, |e| {
             walk_or_alloc(e, pool).map(|pa| pool.phys_to_virt(pa))
         })?
     };
-    l0[vpn_index(0, virt)] = PageTableEntry::new_page(phys, flags);
+    *entry_mut(l0, 0, virt).ok_or(PagingError::OutOfFrames)? =
+        PageTableEntry::new_page(phys, flags);
     Ok(())
 }
 
@@ -468,15 +530,15 @@ pub fn map_large_page(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    let top = paging_mode().levels() - 1;
     // SAFETY: root_va is the VA of a valid root frame allocated from pool;
     // walk_or_alloc yields pool frames whose VAs pool.phys_to_virt resolves.
     let l1 = unsafe {
-        descend_alloc(root_va, virt, top, 1, |e| {
+        descend_alloc(root_va, virt, root_level(), 1, |e| {
             walk_or_alloc(e, pool).map(|pa| pool.phys_to_virt(pa))
         })?
     };
-    l1[vpn_index(1, virt)] = PageTableEntry::new_large_page(phys, flags);
+    *entry_mut(l1, 1, virt).ok_or(PagingError::OutOfFrames)? =
+        PageTableEntry::new_large_page(phys, flags);
     Ok(())
 }
 
@@ -755,7 +817,7 @@ pub unsafe fn map_user_page(
 {
     use crate::mm::paging::phys_to_virt;
 
-    let top = paging_mode().levels() - 1;
+    let top = root_level();
     // The user_va_top gate in the syscall layer keeps user VAs out of the
     // kernel half; a root index >= 256 here would clobber shared kernel-half
     // entries.
@@ -766,16 +828,18 @@ pub unsafe fn map_user_page(
     let l0 = unsafe {
         descend_alloc(root_virt, virt, top, 0, |e| {
             rv_walk_or_alloc(e).map(phys_to_virt)
-        })?
-    };
-    Ok(install_user_leaf(l0, virt, phys, flags, grant))
+        })
+    }
+    .map_err(drop)?;
+    install_user_leaf(l0, virt, phys, flags, grant).ok_or(())
 }
 
 /// Shared leaf-install tail of [`map_user_page`] / [`map_user_page_pooled`]:
 /// demote any NAPOT group the slot belongs to (so the prior PTE read for
 /// classification is always a plain per-page leaf), install the new leaf
 /// with the U bit and the RSW bits of `grant`, classify the rewrite, and opportunistically promote the
-/// containing group when the new mapping is uncacheable.
+/// containing group when the new mapping is uncacheable. `None`, installing
+/// nothing, when [`entry_mut`] finds no slot.
 #[cfg(not(test))]
 fn install_user_leaf(
     l0: &mut [PageTableEntry; 512],
@@ -783,28 +847,29 @@ fn install_user_leaf(
     phys: u64,
     flags: crate::mm::paging::PageFlags,
     grant: LeafGrant,
-) -> crate::mm::paging::MapOutcome
+) -> Option<crate::mm::paging::MapOutcome>
 {
-    if l0[vpn_index(0, virt)].0 & NAPOT != 0
+    if is_napot(l0, virt)
     {
         demote_napot_64k(l0, virt);
     }
     let mut pte = PageTableEntry::new_page(phys, flags);
     pte.0 |= USER | super::encoding::grant_bits(grant);
-    let prior = l0[vpn_index(0, virt)].0;
-    l0[vpn_index(0, virt)] = pte;
+    let slot = entry_mut(l0, 0, virt)?;
+    let prior = slot.0;
+    *slot = pte;
     let outcome = classify_user_map(prior, pte.0);
     if flags.uncacheable
     {
         try_promote_napot_64k(l0, virt);
     }
-    outcome
+    Some(outcome)
 }
 
 /// Walk an existing page table entry or allocate a new child frame
 /// from the kernel PT pool (`crate::mm::kernel_pt_pool`).
 #[cfg(not(test))]
-fn rv_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
+fn rv_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, PagingError>
 {
     if entry.is_present()
     {
@@ -812,7 +877,7 @@ fn rv_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
     }
 
     // Pool returns zero-filled pages; no further write_bytes needed.
-    let frame_pa = crate::mm::kernel_pt_pool::alloc_pt_page().ok_or(())?;
+    let frame_pa = crate::mm::kernel_pt_pool::alloc_pt_page().ok_or(PagingError::OutOfFrames)?;
 
     *entry = PageTableEntry::new_table(frame_pa);
     Ok(frame_pa)
@@ -837,7 +902,7 @@ pub unsafe fn map_user_page_pooled(
 {
     use crate::mm::paging::phys_to_virt;
 
-    let top = paging_mode().levels() - 1;
+    let top = root_level();
     // Same kernel-half guard as map_user_page.
     debug_assert!(vpn_index(top, virt) < 256);
     // SAFETY: root_virt is the direct-map VA of a valid user root PT (caller
@@ -846,10 +911,11 @@ pub unsafe fn map_user_page_pooled(
     let l0 = unsafe {
         descend_alloc(root_virt, virt, top, 0, |e| {
             rv_walk_or_alloc_pooled(e, aso).map(phys_to_virt)
-        })?
-    };
+        })
+    }
+    .map_err(drop)?;
 
-    Ok(install_user_leaf(l0, virt, phys, flags, grant))
+    install_user_leaf(l0, virt, phys, flags, grant).ok_or(())
 }
 
 /// Pooled equivalent of [`rv_walk_or_alloc`]: pulls a freshly-zeroed PT
@@ -858,14 +924,14 @@ pub unsafe fn map_user_page_pooled(
 fn rv_walk_or_alloc_pooled(
     entry: &mut PageTableEntry,
     aso: &crate::cap::object::AddressSpaceObject,
-) -> Result<u64, ()>
+) -> Result<u64, PagingError>
 {
     if entry.is_present()
     {
         return Ok(entry.phys_addr());
     }
 
-    let frame_pa = aso.alloc_pt_page().ok_or(())?;
+    let frame_pa = aso.alloc_pt_page().ok_or(PagingError::OutOfFrames)?;
     let mut table_pte = PageTableEntry::new_table(frame_pa);
     table_pte.0 |= POOLED_TABLE;
     *entry = table_pte;
@@ -1042,20 +1108,22 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
 {
     use crate::mm::paging::phys_to_virt;
 
-    let top = paging_mode().levels() - 1;
     // SAFETY: root_virt is direct-map VA of a valid user root PT (caller
     // contract); its reachable child frames are live PT-pool frames.
-    let Some(l0) = (unsafe { descend_existing(root_virt, virt, top, 0, phys_to_virt) })
+    let Some(l0) = (unsafe { descend_existing(root_virt, virt, root_level(), 0, phys_to_virt) })
     else
     {
         return;
     };
     // Demote-first (core/kernel/docs/memory-internals.md § NAPOT Contiguity (RISC-V)).
-    if l0[vpn_index(0, virt)].0 & NAPOT != 0
+    if is_napot(l0, virt)
     {
         demote_napot_64k(l0, virt);
     }
-    l0[vpn_index(0, virt)] = PageTableEntry(0);
+    if let Some(slot) = entry_mut(l0, 0, virt)
+    {
+        *slot = PageTableEntry(0);
+    }
 
     // SAFETY: virt may now be unmapped; flush_page is safe for any VA (and
     // kills any cached 64 KiB entry covering it).
@@ -1115,8 +1183,9 @@ pub unsafe fn unmap_user_region_pooled(
 {
     use crate::mm::PAGE_SIZE;
 
-    let top = paging_mode().levels() - 1;
-    let virt_end = virt_base + page_count as u64 * PAGE_SIZE as u64;
+    let top = root_level();
+    // The caller's span lies in the user half, so neither operation saturates.
+    let virt_end = virt_base.saturating_add((page_count as u64).saturating_mul(PAGE_SIZE as u64));
     let mut freed = 0usize;
 
     // SAFETY: root_virt is the direct-map VA of a valid root (caller's
@@ -1153,50 +1222,59 @@ unsafe fn unmap_span(
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
 
-    if level == 0
+    let Some(child_level) = level.checked_sub(1)
+    else
     {
-        let mut va = lo;
-        while va < hi
+        // Level 0: clear the span's leaves.
+        for va in (lo..hi).step_by(PAGE_SIZE)
         {
+            let Some(leaf) = entry(table, 0, va)
+            else
+            {
+                continue;
+            };
             // Demote-first: a span edge can cut through a NAPOT group
             // (core/kernel/docs/memory-internals.md § NAPOT Contiguity (RISC-V)).
-            let leaf = table[vpn_index(0, va)];
             if leaf.0 & NAPOT != 0
             {
                 demote_napot_64k(table, va);
             }
-            table[vpn_index(0, va)] = PageTableEntry(0);
+            if let Some(slot) = entry_mut(table, 0, va)
+            {
+                *slot = PageTableEntry(0);
+            }
             if leaf.is_present()
             {
                 on_leaf(leaf_phys(leaf, va));
             }
-            va += PAGE_SIZE as u64;
         }
         return;
-    }
+    };
 
     let mut va = lo;
     while va < hi
     {
         let entry_end = hi.min(next_level_boundary(level, va));
-        let idx = vpn_index(level, va);
-        let e = table[idx];
         // Skip mega/gigapage leaves (not produced by the user path).
-        if e.is_present() && e.0 & LEAF_BITS == 0
+        if let Some(slot) = entry_mut(table, level, va)
+            && slot.is_present()
+            && slot.0 & LEAF_BITS == 0
         {
+            let e = *slot;
             let child_pa = e.phys_addr();
             // SAFETY: present non-leaf entry points at a live child table.
             let child = unsafe { table_at(phys_to_virt(child_pa)) };
-            // SAFETY: child is a live table at level - 1; same aso/pt_lock
+            // SAFETY: child is a live table at child_level; same aso/pt_lock
             // guarantees as this call.
-            unsafe { unmap_span(child, level - 1, va, entry_end, aso, freed, on_leaf) };
+            unsafe { unmap_span(child, child_level, va, entry_end, aso, freed, on_leaf) };
             if table_is_empty(child) && e.0 & POOLED_TABLE != 0
             {
-                table[idx] = PageTableEntry(0);
+                *slot = PageTableEntry(0);
                 // SAFETY: child is empty and unlinked above; frame came from
                 // this aso's pool (POOLED_TABLE).
                 unsafe { aso.free_pt_page(child_pa) };
-                *freed += 1;
+                // Bounded by the table frames of the address space.
+                *freed = freed.saturating_add(1);
             }
         }
         va = entry_end;
@@ -1218,11 +1296,10 @@ unsafe fn unmap_span(
 #[cfg(not(test))]
 pub unsafe fn for_each_user_leaf(root_virt: u64, on_leaf: &mut dyn FnMut(u64))
 {
-    let top = paging_mode().levels() - 1;
     // SAFETY: root_virt is the direct-map VA of a valid root (caller's contract).
     let root = unsafe { table_at(root_virt) };
     // SAFETY: root is a live table at the root level, unmodified meanwhile.
-    unsafe { walk_leaves(root, top, 0, crate::mm::user_va_top(), on_leaf) };
+    unsafe { walk_leaves(root, root_level(), 0, crate::mm::user_va_top(), on_leaf) };
 }
 
 /// Pass the frame of every present leaf of `[lo, hi)` under `table` (a table
@@ -1243,26 +1320,33 @@ unsafe fn walk_leaves(
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
 
-    let mut va = lo;
-    while va < hi
+    let Some(child_level) = level.checked_sub(1)
+    else
     {
-        let e = table[vpn_index(level, va)];
-        if level == 0
+        // Level 0: report the span's present leaves.
+        for va in (lo..hi).step_by(PAGE_SIZE)
         {
-            if e.is_present()
+            if let Some(e) = entry(table, 0, va)
+                && e.is_present()
             {
                 on_leaf(leaf_phys(e, va));
             }
-            va += PAGE_SIZE as u64;
-            continue;
         }
+        return;
+    };
+
+    let mut va = lo;
+    while va < hi
+    {
         let entry_end = hi.min(next_level_boundary(level, va));
-        if e.is_present() && e.0 & LEAF_BITS == 0
+        if let Some(e) = entry(table, level, va)
+            && e.is_present()
+            && e.0 & LEAF_BITS == 0
         {
             // SAFETY: a present non-leaf entry points at a live child table.
             let child = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-            // SAFETY: child is a live table at level - 1 (this call's contract).
-            unsafe { walk_leaves(child, level - 1, va, entry_end, on_leaf) };
+            // SAFETY: child is a live table at child_level (this call's contract).
+            unsafe { walk_leaves(child, child_level, va, entry_end, on_leaf) };
         }
         va = entry_end;
     }
@@ -1310,16 +1394,16 @@ pub unsafe fn unmap_identity_page(pa: u64)
     }
     let root_va = phys_to_virt(root_pa);
     let virt = pa; // identity: VA == PA
-    let top = paging_mode().levels() - 1;
 
     // SAFETY: root_va is the direct-map VA of the kernel root installed in
     // Phase 3; table walk is read-only until the leaf clear at the bottom.
-    let Some(l0) = (unsafe { descend_existing(root_va, virt, top, 0, phys_to_virt) })
+    let Some(leaf) = (unsafe { descend_existing(root_va, virt, root_level(), 0, phys_to_virt) })
+        .and_then(|l0| entry_mut(l0, 0, virt))
     else
     {
         return;
     };
-    l0[vpn_index(0, virt)] = PageTableEntry(0);
+    *leaf = PageTableEntry(0);
 
     // Local invalidate, then broadcast to every other online hart. The
     // shootdown routine requires preemption disabled and handles the
@@ -1382,17 +1466,16 @@ pub unsafe fn hole_direct_map_page(
     use crate::mm::paging::{LARGE_PAGE_SIZE, kernel_root_table_pa, phys_to_virt};
 
     let root_va = phys_to_virt(kernel_root_table_pa());
-    let top = paging_mode().levels() - 1;
     // SAFETY: the kernel root and the tables under it are live table frames
     // reached through the direct map; the caller serialises their edits.
-    let l1 = unsafe { descend_existing(root_va, virt, top, 1, phys_to_virt) }
+    let l1 = unsafe { descend_existing(root_va, virt, root_level(), 1, phys_to_virt) }
         .ok_or(PagingError::NotMapped)?;
-    let entry = &mut l1[vpn_index(1, virt)];
-    if !entry.is_present()
+    let slot = entry_mut(l1, 1, virt).ok_or(PagingError::NotMapped)?;
+    if !slot.is_present()
     {
         return Err(PagingError::NotMapped);
     }
-    if entry.0 & LEAF_BITS != 0
+    if slot.0 & LEAF_BITS != 0
     {
         let table_pa = take_table().ok_or(PagingError::OutOfFrames)?;
         // SAFETY: the frame is the caller's alone, reached through the direct
@@ -1400,19 +1483,19 @@ pub unsafe fn hole_direct_map_page(
         let table = unsafe { table_at(phys_to_virt(table_pa)) };
         crate::mm::paging::fill_split_table(
             table,
-            entry.phys_addr() & !(LARGE_PAGE_SIZE - 1),
+            slot.phys_addr() & !(LARGE_PAGE_SIZE - 1),
             |phys| PageTableEntry::new_page(phys, DIRECT_RAM),
         );
         // The entries are written before the level-1 entry names the table,
         // so a walk through it, which reads the table through that entry,
         // finds them.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        *entry = PageTableEntry::new_table(table_pa);
+        *slot = PageTableEntry::new_table(table_pa);
     }
     // SAFETY: the level-1 entry names a live leaf table (split above, or by
     // an earlier hole).
-    let l0 = unsafe { table_at(phys_to_virt(entry.phys_addr())) };
-    l0[vpn_index(0, virt)] = PageTableEntry(0);
+    let l0 = unsafe { table_at(phys_to_virt(slot.phys_addr())) };
+    *entry_mut(l0, 0, virt).ok_or(PagingError::NotMapped)? = PageTableEntry(0);
     Ok(())
 }
 
@@ -1433,11 +1516,11 @@ pub unsafe fn fill_direct_map_page(virt: u64, phys: u64)
     use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
 
     let root_va = phys_to_virt(kernel_root_table_pa());
-    let top = paging_mode().levels() - 1;
     // SAFETY: as in hole_direct_map_page; the hole left a leaf table here.
-    if let Some(l0) = unsafe { descend_existing(root_va, virt, top, 0, phys_to_virt) }
+    if let Some(slot) = unsafe { descend_existing(root_va, virt, root_level(), 0, phys_to_virt) }
+        .and_then(|l0| entry_mut(l0, 0, virt))
     {
-        l0[vpn_index(0, virt)] = PageTableEntry::new_page(phys, DIRECT_RAM);
+        *slot = PageTableEntry::new_page(phys, DIRECT_RAM);
     }
 }
 
@@ -1451,21 +1534,21 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
     use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
 
     let root_va = phys_to_virt(kernel_root_table_pa());
-    let top = paging_mode().levels() - 1;
     // SAFETY: as in hole_direct_map_page.
-    let Some(l1) = (unsafe { descend_existing(root_va, virt, top, 1, phys_to_virt) })
+    let Some(l1_entry) =
+        (unsafe { descend_existing(root_va, virt, root_level(), 1, phys_to_virt) })
+            .and_then(|l1| entry(l1, 1, virt))
     else
     {
         return false;
     };
-    let entry = l1[vpn_index(1, virt)];
-    if !entry.is_present() || entry.0 & LEAF_BITS != 0
+    if !l1_entry.is_present() || l1_entry.0 & LEAF_BITS != 0
     {
-        return entry.is_present();
+        return l1_entry.is_present();
     }
     // SAFETY: a present non-leaf level-1 entry names a live leaf table.
-    let l0 = unsafe { table_at(phys_to_virt(entry.phys_addr())) };
-    l0[vpn_index(0, virt)].is_present()
+    let l0 = unsafe { table_at(phys_to_virt(l1_entry.phys_addr())) };
+    entry(l0, 0, virt).is_some_and(PageTableEntry::is_present)
 }
 
 pub use super::encoding::KernelAccess;
@@ -1491,16 +1574,17 @@ pub unsafe fn kernel_fault_is_spurious(va: u64, access: KernelAccess) -> bool
     {
         return false;
     }
-    let top = paging_mode().levels() - 1;
     // SAFETY: the kernel root and its tables are live frames reached through
     // the direct map; a racing edit at worst makes this read report a stale
     // answer, and a wrong `true` re-faults on retry into the same check.
-    let Some(l0) = (unsafe { descend_existing(phys_to_virt(root_pa), va, top, 0, phys_to_virt) })
+    let Some(leaf) =
+        (unsafe { descend_existing(phys_to_virt(root_pa), va, root_level(), 0, phys_to_virt) })
+            .and_then(|l0| entry(l0, 0, va))
     else
     {
         return false;
     };
-    super::encoding::kernel_leaf_permits(l0[vpn_index(0, va)].0, access)
+    super::encoding::kernel_leaf_permits(leaf.0, access)
 }
 
 /// Invalidate every translation this hart caches, in every address space
@@ -1556,19 +1640,18 @@ pub unsafe fn protect_user_page(
     use crate::mm::paging::{PagingError, phys_to_virt};
     // USER (U) is set below to preserve user accessibility.
 
-    let top = paging_mode().levels() - 1;
     // SAFETY: root_virt is direct-map VA of a valid user root PT (caller
     // contract); its reachable child frames are live PT-pool frames.
-    let l0 = unsafe { descend_existing(root_virt, virt, top, 0, phys_to_virt) }
+    let l0 = unsafe { descend_existing(root_virt, virt, root_level(), 0, phys_to_virt) }
         .ok_or(PagingError::NotMapped)?;
     // Demote-first (core/kernel/docs/memory-internals.md § NAPOT Contiguity
     // (RISC-V)). The demoted per-page PTE carries the same rights and PA, so
     // the classification below is unaffected.
-    if l0[vpn_index(0, virt)].0 & NAPOT != 0
+    if is_napot(l0, virt)
     {
         demote_napot_64k(l0, virt);
     }
-    let leaf = &mut l0[vpn_index(0, virt)];
+    let leaf = entry_mut(l0, 0, virt).ok_or(PagingError::NotMapped)?;
     if !leaf.is_present()
     {
         return Err(PagingError::NotMapped);
@@ -1610,11 +1693,10 @@ pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64
 {
     use crate::mm::paging::phys_to_virt;
 
-    let top = paging_mode().levels() - 1;
     // SAFETY: root_virt is direct-map VA of a valid user root PT (caller
     // contract); its reachable child frames are live PT-pool frames.
-    let l0 = unsafe { descend_existing(root_virt, virt, top, 0, phys_to_virt) }?;
-    let leaf = l0[vpn_index(0, virt)];
+    let l0 = unsafe { descend_existing(root_virt, virt, root_level(), 0, phys_to_virt) }?;
+    let leaf = entry(l0, 0, virt)?;
     if !leaf.is_present()
     {
         return None;

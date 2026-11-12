@@ -478,7 +478,8 @@ pub(super) unsafe extern "C" fn common_exception_handler(
             // object-teardown stop recorded `EXIT_KILLED`, or a
             // `dealloc_object(Thread)` committed `Exited`); the posts below
             // still carry the fault class (no death walk posts `EXIT_KILLED`).
-            let reason = syscall::EXIT_FAULT_BASE + vector;
+            // A vector is below 256, so the reason stays in the fault range.
+            let reason = syscall::EXIT_FAULT_BASE.saturating_add(vector);
 
             // Terminal fault (no handler bound, or a Kill outcome: the handler
             // replied KILL or the episode was cancelled; see docs/fault-handling.md
@@ -1770,8 +1771,12 @@ pub unsafe fn init()
 
     // Helper: set gate for `vec` pointing to `handler` (unsafe extern "C" fn)
     // with IST index `ist`. Casts through `*const ()` to avoid lint.
+    // Every vector below is below 256, the table's length.
     let mut set = |vec: usize, handler: unsafe extern "C" fn(), ist: u8| {
-        idt[vec] = IdtEntry::new(handler as *const () as u64, ist, 0);
+        if let Some(entry) = idt.get_mut(vec)
+        {
+            *entry = IdtEntry::new(handler as *const () as u64, ist, 0);
+        }
     };
 
     // Exception gates (vectors 0–31).
@@ -1833,10 +1838,13 @@ pub unsafe fn init()
 
     // Device IRQ stubs, one per device vector (`device_irq_stubs`).
     let stubs = (device_irq_stubs as *const () as usize).next_multiple_of(DEVICE_STUB_STRIDE);
-    for i in 0..super::ioapic::DEVICE_VECTOR_COUNT
+    let device_gates = idt
+        .iter_mut()
+        .skip(usize::from(super::ioapic::DEVICE_VECTOR_BASE))
+        .take(super::ioapic::DEVICE_VECTOR_COUNT);
+    for (entry, stub) in device_gates.zip((stubs..).step_by(DEVICE_STUB_STRIDE))
     {
-        let vector = usize::from(super::ioapic::DEVICE_VECTOR_BASE) + i;
-        idt[vector] = IdtEntry::new((stubs + i * DEVICE_STUB_STRIDE) as u64, 0, 0);
+        *entry = IdtEntry::new(stub as u64, 0, 0);
     }
 
     // #BP with DPL 3: `int3` checks the gate's DPL against the CPL and raises
@@ -1850,7 +1858,8 @@ pub unsafe fn init()
 
     // Load IDTR.
     let idtr = Idtr {
-        limit: (core::mem::size_of_val(idt) - 1) as u16,
+        // The table is not empty, so the limit does not saturate.
+        limit: core::mem::size_of_val(idt).saturating_sub(1) as u16,
         base: idt.as_ptr() as u64,
     };
     // SAFETY: lidt is a valid ring-0 instruction; idtr is live on stack; IDT in BSS valid forever.
@@ -1879,7 +1888,8 @@ pub unsafe fn load()
     // SAFETY: IDT is in BSS and was populated by init(); valid for kernel lifetime.
     let idt = unsafe { &*core::ptr::addr_of!(IDT) };
     let idtr = Idtr {
-        limit: (core::mem::size_of_val(idt) - 1) as u16,
+        // The table is not empty, so the limit does not saturate.
+        limit: core::mem::size_of_val(idt).saturating_sub(1) as u16,
         base: idt.as_ptr() as u64,
     };
     // SAFETY: lidt is valid at ring 0; idtr is live on stack; IDT in BSS is valid forever.

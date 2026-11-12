@@ -4,9 +4,10 @@
 // core/kernel/src/arch/riscv64/encoding.rs
 
 //! RISC-V register-map and instruction-encoding arithmetic: the SBI hart-mask
-//! window, page rounding, the F/D/V opcode decode the lazy extended-state trap
-//! uses, the PTE permission bits and their test in the kernel's spurious-fault
-//! retry, and the user leaf's grant bits and the permission change they bound.
+//! window, page rounding, the timer's tick and microsecond conversions, the
+//! F/D/V opcode decode the lazy extended-state trap uses, the PTE permission
+//! bits and their test in the kernel's spurious-fault retry, and the user
+//! leaf's grant bits and the permission change they bound.
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
 //! arch module. `arch/mod.rs` also compiles this file into host test builds
@@ -27,10 +28,45 @@ pub(super) fn sbi_hart_mask(target_hart_id: u32) -> (u64, u64)
     (mask, base)
 }
 
-/// `n` rounded up to a whole 4 KiB page.
-pub(super) const fn page_round_up(n: u64) -> u64
+/// `n` rounded up to a whole 4 KiB page, or `None` when that passes the end of
+/// the address space.
+pub(super) const fn page_round_up(n: u64) -> Option<u64>
 {
-    (n + 0xFFF) & !0xFFF
+    match n.checked_add(0xFFF)
+    {
+        Some(end) => Some(end & !0xFFF),
+        None => None,
+    }
+}
+
+/// Ticks of a `freq` Hz counter in a period of `period_us` microseconds,
+/// saturating at `u64::MAX`.
+// The product is computed in u128, where two u64 factors cannot overflow; the
+// quotient fits u64 for every freq ≤ u32::MAX (enforced by `timer::init`) and
+// sane period.
+pub(super) fn ticks_for_period(freq: u64, period_us: u64) -> u64
+{
+    let ticks = u128::from(freq).saturating_mul(u128::from(period_us)) / 1_000_000;
+    u64::try_from(ticks).unwrap_or(u64::MAX)
+}
+
+/// Convert `ticks` of a `freq` Hz counter to whole microseconds, saturating at
+/// `u64::MAX`.
+///
+/// Exact for arbitrary frequencies via a div/mod split: the remainder
+/// product `(ticks % freq) * 1_000_000` cannot overflow because `timer::init`
+/// bounds `freq` to `u32::MAX` (< 2^32 · 2^20 = 2^52). Returns 0 when
+/// `freq` is zero (timer not initialised).
+pub(super) fn ticks_to_us(ticks: u64, freq: u64) -> u64
+{
+    let Some(freq) = core::num::NonZeroU64::new(freq)
+    else
+    {
+        return 0;
+    };
+    (ticks / freq)
+        .saturating_mul(1_000_000)
+        .saturating_add((ticks % freq).saturating_mul(1_000_000) / freq)
 }
 
 /// Return `true` if `insn` (a RISC-V instruction encoding from `stval` on an
@@ -232,11 +268,90 @@ mod tests
     }
 
     #[test]
+    fn period_ticks_for_10ms_at_10_mhz()
+    {
+        // 10 ms = 10_000 µs → 10_000_000 * 10_000 / 1_000_000 = 100_000 ticks.
+        assert_eq!(ticks_for_period(10_000_000, 10_000), 100_000);
+    }
+
+    #[test]
+    fn period_ticks_for_1ms_at_10_mhz()
+    {
+        assert_eq!(ticks_for_period(10_000_000, 1_000), 10_000);
+    }
+
+    #[test]
+    fn period_ticks_for_1ms_at_non_mhz_multiple()
+    {
+        // 1_193_182 Hz (a frequency with no whole ticks-per-µs ratio):
+        // 1 ms = 1_193.182 ticks, truncated.
+        assert_eq!(ticks_for_period(1_193_182, 1_000), 1_193);
+    }
+
+    #[test]
+    fn period_ticks_saturate_past_u64_max()
+    {
+        // Defect caught: a quotient past u64::MAX truncated to a short period.
+        assert_eq!(ticks_for_period(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn ticks_to_us_exact_at_10_mhz()
+    {
+        assert_eq!(ticks_to_us(12_345, 10_000_000), 1_234);
+        assert_eq!(ticks_to_us(10_000_000, 10_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn ticks_to_us_exact_at_arbitrary_frequencies()
+    {
+        for freq in [1_193_182u64, 24_000_000, 3, u64::from(u32::MAX)]
+        {
+            for ticks in [0u64, 1, freq - 1, freq, freq + 1, 1 << 40, 1 << 60]
+            {
+                let exact = u128::from(ticks) * 1_000_000 / u128::from(freq);
+                let expected = u64::try_from(exact).unwrap_or(u64::MAX);
+                assert_eq!(
+                    ticks_to_us(ticks, freq),
+                    expected,
+                    "ticks={ticks} freq={freq}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ticks_to_us_saturates_past_u64_max_microseconds()
+    {
+        // Defect caught: the whole-second product wrapping to a small time.
+        assert_eq!(ticks_to_us(u64::MAX, 1), u64::MAX);
+        assert_eq!(ticks_to_us(u64::MAX, 3), u64::MAX);
+    }
+
+    #[test]
+    fn ticks_to_us_zero_frequency_is_zero()
+    {
+        assert_eq!(ticks_to_us(12_345, 0), 0);
+    }
+
+    #[test]
     fn page_round_up_aligns()
     {
-        assert_eq!(page_round_up(1), 0x1000);
-        assert_eq!(page_round_up(0x1000), 0x1000);
-        assert_eq!(page_round_up(0x1001), 0x2000);
+        assert_eq!(page_round_up(1), Some(0x1000));
+        assert_eq!(page_round_up(0x1000), Some(0x1000));
+        assert_eq!(page_round_up(0x1001), Some(0x2000));
+    }
+
+    #[test]
+    fn page_round_up_past_the_end_of_the_address_space_is_none()
+    {
+        // Defect caught: a size in the last page wrapping to 0 when rounded up.
+        assert_eq!(
+            page_round_up(0xFFFF_FFFF_FFFF_F000),
+            Some(0xFFFF_FFFF_FFFF_F000)
+        );
+        assert_eq!(page_round_up(0xFFFF_FFFF_FFFF_F001), None);
+        assert_eq!(page_round_up(u64::MAX), None);
     }
 
     #[test]

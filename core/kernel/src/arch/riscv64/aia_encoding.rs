@@ -94,7 +94,8 @@ pub(super) const fn aplic_msi_target(hart_index: u32, eid: u32) -> Option<u32>
 /// IMSIC file: each holds 64 identities.
 pub(super) const fn imsic_reg_words(ids: u32) -> u32
 {
-    (ids + 1).div_ceil(64)
+    // `ids` is at most IMSIC_MAX_IDS, so the count does not saturate.
+    ids.saturating_add(1).div_ceil(64)
 }
 
 /// The lowest free identity in an EID row (`row[eid]` is free when identity

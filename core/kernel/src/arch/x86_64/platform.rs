@@ -57,9 +57,8 @@ pub fn lapic_base() -> u64
 
 /// Copy the discovered I/O APIC entries into `out` and return the populated
 /// slice. If the bootloader reported no I/O APICs, synthesise one entry at
-/// [`DEFAULT_IOAPIC_BASE`] covering GSI 0.
-///
-/// `out.len()` must be ≥ 1.
+/// [`DEFAULT_IOAPIC_BASE`] covering GSI 0. The slice holds at most `out.len()`
+/// entries, so an empty `out` yields an empty slice.
 pub fn ioapics_into(out: &mut [IoApicEntry]) -> &[IoApicEntry]
 {
     select_ioapics(&crate::platform::kernel_mmio(), out)
@@ -70,20 +69,27 @@ pub fn ioapics_into(out: &mut [IoApicEntry]) -> &[IoApicEntry]
 /// synthesised-default outcome.
 fn select_ioapics<'a>(km: &KernelMmio, out: &'a mut [IoApicEntry]) -> &'a [IoApicEntry]
 {
-    debug_assert!(!out.is_empty());
+    const DEFAULT: [IoApicEntry; 1] = [IoApicEntry {
+        id: 0,
+        phys_base: DEFAULT_IOAPIC_BASE,
+        gsi_base: 0,
+    }];
     let count = (km.ioapic_count as usize).min(km.ioapics.len());
-    if count == 0
+    let source = match km.ioapics.get(..count)
     {
-        out[0] = IoApicEntry {
-            id: 0,
-            phys_base: DEFAULT_IOAPIC_BASE,
-            gsi_base: 0,
-        };
-        return &out[..1];
+        Some(discovered) if !discovered.is_empty() => discovered,
+        _ => &DEFAULT,
+    };
+    let n = source.len().min(out.len());
+    match (out.get_mut(..n), source.get(..n))
+    {
+        (Some(dst), Some(src)) =>
+        {
+            dst.copy_from_slice(src);
+            dst
+        }
+        _ => &[],
     }
-    let n = count.min(out.len());
-    out[..n].copy_from_slice(&km.ioapics[..n]);
-    &out[..n]
 }
 
 /// UART physical base passed to `serial_init` by `crate::console::init`
@@ -189,6 +195,16 @@ mod tests
         assert_eq!(got[0].phys_base, 0xFEC0_0000);
         assert_eq!(got[1].phys_base, 0xFEC0_1000);
         assert_eq!(got[1].gsi_base, 24);
+    }
+
+    #[test]
+    fn ioapics_into_an_empty_buffer_select_nothing()
+    {
+        // Defect caught: an empty buffer indexed out of bounds, which halts the kernel.
+        let mut km = km_zero();
+        assert!(select_ioapics(&km, &mut []).is_empty());
+        km.ioapic_count = 1;
+        assert!(select_ioapics(&km, &mut []).is_empty());
     }
 
     #[test]

@@ -97,7 +97,7 @@ pub fn run(cpu_count: usize)
         {
             continue;
         }
-        online += 1;
+        online = online.saturating_add(1);
         if s.bytes.iter().all(|&b| b == 0)
         {
             crate::kprintln!("entropy: SELFTEST FAIL: cpu {} produced no output", cpu);
@@ -105,7 +105,7 @@ pub fn run(cpu_count: usize)
         }
         for b in s.bytes
         {
-            set_bits += u64::from(b.count_ones());
+            set_bits = set_bits.saturating_add(u64::from(b.count_ones()));
         }
     }
 
@@ -116,15 +116,17 @@ pub fn run(cpu_count: usize)
     }
 
     // Per-CPU independence: pairwise-distinct samples among online CPUs.
-    for i in 0..cpu_count
+    let mut rows = samples.iter().enumerate();
+    while let Some((i, a)) = rows.next()
     {
-        if !samples[i].captured
+        if !a.captured
         {
             continue;
         }
-        for j in (i + 1)..cpu_count
+        // `rows` now yields the rows after `i`.
+        for (j, b) in rows.clone()
         {
-            if samples[j].captured && samples[i].bytes == samples[j].bytes
+            if b.captured && a.bytes == b.bytes
             {
                 crate::kprintln!("entropy: SELFTEST FAIL: cpus {} and {} match", i, j);
                 return;
@@ -133,8 +135,8 @@ pub fn run(cpu_count: usize)
     }
 
     // Bit balance: total set bits within [25%, 75%] of the captured bit count.
-    let total_bits = (online * SAMPLE * 8) as u64;
-    if set_bits < total_bits / 4 || set_bits > total_bits * 3 / 4
+    let total_bits = online.saturating_mul(SAMPLE * 8) as u64;
+    if set_bits < total_bits / 4 || set_bits > total_bits.saturating_mul(3) / 4
     {
         crate::kprintln!(
             "entropy: SELFTEST FAIL: bit balance {}/{}",

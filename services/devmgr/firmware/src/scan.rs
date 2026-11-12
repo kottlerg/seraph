@@ -327,7 +327,8 @@ fn record_bar(dev: &mut PciDevice, bar_idx: u8, phys: u64, size: u64, is_mmio: b
 /// already located, an I/O-BAR structure, one naming no probed BAR, one
 /// reaching past its BAR's end, and one the transport cannot use (a common
 /// structure shorter than [`virtio_core::COMMON_CFG_LEN`] or not 4-aligned,
-/// a notification structure whose offset or multiplier is odd) are skipped.
+/// a notification structure whose offset or multiplier is odd, a
+/// device-configuration structure not 4-aligned) are skipped.
 fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
 {
     let (b, d, f) = (dev.bus, dev.dev, dev.func);
@@ -746,7 +747,10 @@ mod tests
                 (2, 4, 0x3100, 0x100),
                 (2, 4, 0x3200, 0x100),
                 (3, 4, 0x1000, 4),
-                (4, 4, 0x2000, 8),
+                // Device configuration at an offset not 4-aligned: skipped
+                // for the next one.
+                (4, 4, 0x2002, 8),
+                (4, 4, 0x2100, 8),
             ],
         );
         // The fifth structure (at 0x90) carries multiplier 3, the sixth
@@ -759,6 +763,7 @@ mod tests
         assert_eq!(at(info.common_cfg), (4, 0x200, 0x38));
         assert_eq!(at(info.notify_cfg), (4, 0x3200, 0x100));
         assert_eq!(info.notify_off_multiplier, 2);
+        assert_eq!(at(info.device_cfg), (4, 0x2100, 8));
         // The structures kept make a layout the transport can use.
         assert!(info.register_layout().is_some());
     }

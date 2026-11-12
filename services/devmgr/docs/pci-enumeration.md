@@ -139,9 +139,10 @@ For each matched device, devmgr:
    in an I/O BAR, one naming a reserved BAR index, one reaching past its
    BAR's end, a common structure shorter than the 0x38 bytes of registers
    the transport addresses in it (`COMMON_CFG_LEN`) or at an offset not
-   4-aligned (§ 4.1.4.3.1), and a notification structure whose offset or
-   `notify_off_multiplier` is not 2-aligned (§ 4.1.4.4.1), since either
-   would make a register access misaligned. A function left with no region
+   4-aligned (§ 4.1.4.3.1), a notification structure whose offset or
+   `notify_off_multiplier` is not 2-aligned (§ 4.1.4.4.1), and a
+   device-configuration structure at an offset not 4-aligned (§ 4.1.4.6),
+   since each would make a register access misaligned. A function left with no region
    of one of the four types (VirtIO 1.2 § 4.1.4 requires all four of a
    block or input device) presents no layout; it is refused, logged, when
    its driver declares the VirtIO status reset, and bound as any other

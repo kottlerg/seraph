@@ -64,15 +64,20 @@ struct FbState
 /// head. `phys` and `size` must be page-aligned.
 fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u64>
 {
+    let end = phys.checked_add(size)?;
     let covering = crate::init_info::descriptors(info).iter().find(|d| {
-        d.cap_type == CapType::Mmio && phys >= d.aux0 && phys + size <= d.aux0 + d.aux1
+        d.cap_type == CapType::Mmio
+            && phys >= d.aux0
+            && d.aux0
+                .checked_add(d.aux1)
+                .is_some_and(|aperture_end| end <= aperture_end)
     })?;
 
     let mut cap = covering.slot;
 
     // Drop the prefix [aux0, phys) when the aperture starts below the
     // framebuffer; keep the upper portion.
-    let offset = phys - covering.aux0;
+    let offset = phys.checked_sub(covering.aux0)?;
     if offset > 0
     {
         let (lower, upper) = syscall::mmio_split(cap, offset).ok()?;
@@ -117,9 +122,29 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u64)
     // covering aperture so only the framebuffer is mapped — the aperture
     // itself may span the entire PCI MMIO window (1+ GiB on QEMU q35).
     let base_aligned = fb.physical_base & !0xFFF;
-    let fb_bytes = u64::from(fb.stride) * u64::from(fb.height);
-    let span_end = (fb.physical_base + fb_bytes + 0xFFF) & !0xFFF;
-    let map_bytes = span_end - base_aligned;
+    let page_offset = fb.physical_base & 0xFFF;
+    let fb_bytes = u64::from(fb.stride).saturating_mul(u64::from(fb.height));
+    // A span past the address space's end, or one too large to clear, is no
+    // framebuffer ktest can map; neither is a display too small for a glyph.
+    let Some(map_bytes) = page_offset
+        .checked_add(fb_bytes)
+        .and_then(|bytes| bytes.checked_add(0xFFF))
+        .map(|bytes| bytes & !0xFFF)
+    else
+    {
+        return;
+    };
+    let Ok(clear_bytes) = usize::try_from(fb_bytes)
+    else
+    {
+        return;
+    };
+    let max_cols = fb.width / GLYPH_WIDTH;
+    let max_rows = fb.height / GLYPH_HEIGHT;
+    if max_cols == 0 || max_rows == 0
+    {
+        return;
+    }
 
     // The carved region is mapped from FB_VA, so it must end below the next
     // fixed mapping above it (`arch::FB_WINDOW_END`: the riscv64 UART window,
@@ -146,26 +171,23 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u64)
         return;
     }
 
-    // The framebuffer may begin at a page offset within the mapped span.
-    let pixel_base = FB_VA + (fb.physical_base - base_aligned);
+    // The framebuffer may begin at a page offset within the mapped span:
+    // FB_VA is page-aligned, so the offset fills its low bits.
+    let pixel_base = FB_VA | page_offset;
 
     // Clear the screen to black.
     // SAFETY: the mapped span covers stride × height bytes from pixel_base;
     // the Mmio cap carries MAP|WRITE.
     unsafe {
-        core::ptr::write_bytes(
-            pixel_base as *mut u8,
-            0,
-            fb.stride as usize * fb.height as usize,
-        );
+        core::ptr::write_bytes(pixel_base as *mut u8, 0, clear_bytes);
     }
 
     // SAFETY: single-threaded init; all values validated above.
     unsafe {
         STATE.base = pixel_base;
         STATE.stride = fb.stride;
-        STATE.max_cols = fb.width / GLYPH_WIDTH;
-        STATE.max_rows = fb.height / GLYPH_HEIGHT;
+        STATE.max_cols = max_cols;
+        STATE.max_rows = max_rows;
         STATE.col = 0;
         STATE.row = 0;
         STATE.ready = true;
@@ -214,7 +236,7 @@ unsafe fn newline_locked()
     // SAFETY: single-threaded cursor mutation; framebuffer is mapped.
     unsafe {
         STATE.col = 0;
-        STATE.row += 1;
+        STATE.row = STATE.row.saturating_add(1);
         if STATE.row >= STATE.max_rows
         {
             scroll();
@@ -292,24 +314,42 @@ unsafe fn draw_codepoint(cp: u32)
 unsafe fn draw_glyph_bitmap(bitmap: &[u16])
 {
     // SAFETY: single-threaded; STATE fields are valid after init.
-    let (base, stride, pixel_x, pixel_y) = unsafe {
+    let (base, stride, col, row) = unsafe {
         (
             STATE.base as *mut u8,
             STATE.stride as usize,
-            STATE.col as usize * GLYPH_WIDTH as usize,
-            STATE.row as usize * GLYPH_HEIGHT as usize,
+            STATE.col as usize,
+            STATE.row as usize,
         )
+    };
+    let glyph_origin = |cells: usize, glyph: u32| cells.checked_mul(glyph as usize);
+    let (Some(pixel_x), Some(pixel_y)) = (
+        glyph_origin(col, GLYPH_WIDTH),
+        glyph_origin(row, GLYPH_HEIGHT),
+    )
+    else
+    {
+        return;
     };
 
     for (row_idx, &bits) in bitmap.iter().enumerate().take(GLYPH_HEIGHT as usize)
     {
-        let row_base = (pixel_y + row_idx) * stride;
-
         for col_idx in 0..GLYPH_WIDTH as usize
         {
-            let lit = (bits >> (15 - col_idx)) & 1 != 0;
+            // Bit 15 is the glyph's leftmost column.
+            let lit = bits & (0x8000 >> col_idx) != 0;
             let intensity: u8 = if lit { 0xFF } else { 0x00 };
-            let offset = row_base + (pixel_x + col_idx) * 4;
+            // Inside the framebuffer for a cursor inside the display (init
+            // derives the bounds from it), so no product here overflows.
+            let Some(offset) = pixel_y
+                .checked_add(row_idx)
+                .and_then(|y| y.checked_mul(stride))
+                .zip(pixel_x.checked_add(col_idx).and_then(|x| x.checked_mul(4)))
+                .and_then(|(row_base, x_bytes)| row_base.checked_add(x_bytes))
+            else
+            {
+                return;
+            };
 
             // SAFETY: offset is within framebuffer bounds; pixel position is
             // bounded by max_cols/max_rows derived from display dimensions.
@@ -325,7 +365,7 @@ unsafe fn draw_glyph_bitmap(bitmap: &[u16])
 
     // SAFETY: single-threaded cursor mutation; framebuffer is mapped.
     unsafe {
-        STATE.col += 1;
+        STATE.col = STATE.col.saturating_add(1);
         if STATE.col >= STATE.max_cols
         {
             newline_locked();
@@ -347,21 +387,32 @@ unsafe fn scroll()
             STATE.max_rows as usize,
         )
     };
-    let row_bytes = GLYPH_HEIGHT as usize * stride;
+    // `max_rows` rows of `row_bytes` lie inside the framebuffer (init derives
+    // `max_rows` from its height and refuses a display with no row), so
+    // neither product overflows.
+    let Some(row_bytes) = stride.checked_mul(GLYPH_HEIGHT as usize)
+    else
+    {
+        return;
+    };
+    let Some(last_start) = max_rows.saturating_sub(1).checked_mul(row_bytes)
+    else
+    {
+        return;
+    };
 
     // Copy rows 1..max_rows → 0..max_rows-1.
     // SAFETY: both src and dst are within the framebuffer allocation.
     unsafe {
-        core::ptr::copy(base.add(row_bytes), base, (max_rows - 1) * row_bytes);
+        core::ptr::copy(base.add(row_bytes), base, last_start);
     }
 
     // Zero the last row.
     // SAFETY: last_start + row_bytes is within the framebuffer.
     unsafe {
-        let last_start = (max_rows - 1) * row_bytes;
         core::ptr::write_bytes(base.add(last_start), 0, row_bytes);
     }
 
     // SAFETY: single-threaded cursor update.
-    unsafe { STATE.row = STATE.max_rows - 1 };
+    unsafe { STATE.row = STATE.max_rows.saturating_sub(1) };
 }

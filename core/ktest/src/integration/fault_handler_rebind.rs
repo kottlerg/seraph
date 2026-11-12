@@ -263,18 +263,20 @@ fn start_faulter(
     entry: extern "C" fn(u64) -> !,
 ) -> Result<u64, &'static str>
 {
-    let child = parts.faulters[index].insert(
-        spawn::new_child(ctx)
-            .map_err(|_| "integration::fault_handler_rebind: spawn faulter failed")?,
-    );
+    let child = parts
+        .faulters
+        .get_mut(index)
+        .ok_or("integration::fault_handler_rebind: faulter index out of range")?
+        .insert(
+            spawn::new_child(ctx)
+                .map_err(|_| "integration::fault_handler_rebind: spawn faulter failed")?,
+        );
     let child_sig = cap_copy(objects.sig, child.cs, RIGHTS_NTF_NOTIFY)
         .map_err(|_| "integration::fault_handler_rebind: cap_copy notification failed")?;
     RECOVERY_SIG.store(child_sig, Ordering::Release);
     crate::bind_fault_handler(child.th, objects.first, BADGE_FIRST)
         .map_err(|_| "integration::fault_handler_rebind: bind failed")?;
-    // SAFETY: stack `index` belongs to this phase's faulter, deleted before
-    // this test returns.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(FAULTER_STACKS[index]) });
+    let stack = ChildStack::top_at(core::ptr::addr_of!(FAULTER_STACKS), index)?;
     // SAFETY: the stack is `FAULTER_STACKS[index]`, this test's own
     // `ChildStack`, on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, entry, stack, child_sig) }
@@ -359,7 +361,7 @@ fn resume_into_recovery(ctx: &TestContext, th: u64, sig: u64) -> TestResult
     let mut reg_buf = [0u8; BUF];
     thread_read_regs(th, &mut reg_buf[..BUF])
         .map_err(|_| "integration::fault_handler_rebind: thread_read_regs failed")?;
-    spawn::redirect_to_entry(&mut reg_buf[..], recovery_entry as *const () as u64);
+    spawn::redirect_to_entry(&mut reg_buf[..], recovery_entry as *const () as u64)?;
     // SAFETY: the frame was read from this faulter, so its stack pointer lies
     // on the faulter's own `ChildStack`; `redirect_to_entry` pointed it at
     // `recovery_entry`, an `extern "C"` entry that never returns and needs

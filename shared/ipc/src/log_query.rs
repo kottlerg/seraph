@@ -250,7 +250,9 @@ impl SlotEntry
     #[must_use]
     pub fn name(&self) -> &[u8]
     {
-        &self.name[..self.name_len]
+        // `slot_entry` keeps `name_len <= SLOT_NAME_MAX`, so `get` always finds
+        // the range.
+        self.name.get(..self.name_len).unwrap_or_default()
     }
 
     /// The resume point after this entry.
@@ -299,14 +301,22 @@ impl SlotPage
         {
             return false;
         }
-        let name = &name[..name.len().min(SLOT_NAME_MAX)];
-        let base = self.count * SLOT_ENTRY_WORDS;
-        let entry = &mut self.words[base..base + SLOT_ENTRY_WORDS];
-        entry[0] = badge;
-        entry[1] = u64::from(state) | ((name.len() as u64) << 8);
-        entry[2] = exit_reason;
-        pack_bytes(&mut entry[3..], name);
-        self.count += 1;
+        let name = name.get(..SLOT_NAME_MAX).unwrap_or(name);
+        // A page short of `SLOTS_PAGE` entries has room for one more.
+        let Some([badge_word, state_word, reason_word, name_words @ ..]) = self
+            .count
+            .checked_mul(SLOT_ENTRY_WORDS)
+            .and_then(|base| self.words.get_mut(base..)?.get_mut(..SLOT_ENTRY_WORDS))
+        else
+        {
+            return false;
+        };
+        *badge_word = badge;
+        *state_word = u64::from(state) | ((name.len() as u64) << 8);
+        *reason_word = exit_reason;
+        pack_bytes(name_words, name);
+        // The count is below `SLOTS_PAGE`, so this cannot saturate.
+        self.count = self.count.saturating_add(1);
         true
     }
 
@@ -314,8 +324,10 @@ impl SlotPage
     #[must_use]
     pub fn reply(&self, more: bool) -> IpcMessage
     {
+        // `count <= SLOTS_PAGE`, so the entries' words fit `words`.
+        let used = self.count.saturating_mul(SLOT_ENTRY_WORDS);
         IpcMessage::builder(reply_label(QUERY_OK, self.count, more))
-            .words(0, &self.words[..self.count * SLOT_ENTRY_WORDS])
+            .words(0, self.words.get(..used).unwrap_or_default())
             .build()
     }
 }
@@ -330,20 +342,26 @@ pub fn slot_entry(reply: &IpcMessage, index: usize) -> Option<SlotEntry>
     {
         return None;
     }
-    let base = index * SLOT_ENTRY_WORDS;
-    let entry = reply.words().get(base..base + SLOT_ENTRY_WORDS)?;
-    let name_len = usize::try_from((entry[1] >> 8) & 0xFF)
+    let [badge, state_word, exit_reason, name_words @ ..] = reply
+        .words()
+        .get(index.checked_mul(SLOT_ENTRY_WORDS)?..)?
+        .get(..SLOT_ENTRY_WORDS)?
+    else
+    {
+        return None;
+    };
+    let name_len = usize::try_from((state_word >> 8) & 0xFF)
         .ok()
         .filter(|&l| l <= SLOT_NAME_MAX)?;
     let mut name = [0u8; SLOT_NAME_MAX];
-    for (chunk, word) in name.chunks_mut(8).zip(&entry[3..])
+    for (chunk, word) in name.chunks_mut(8).zip(name_words)
     {
         chunk.copy_from_slice(&word.to_le_bytes());
     }
     Some(SlotEntry {
-        badge: entry[0],
-        state: (entry[1] & 0xFF) as u8,
-        exit_reason: entry[2],
+        badge: *badge,
+        state: (state_word & 0xFF) as u8,
+        exit_reason: *exit_reason,
         name,
         name_len,
     })
@@ -393,21 +411,32 @@ impl HistoryPage
     /// fit the words left, or its bytes are longer than [`HISTORY_BYTES_MAX`].
     pub fn push(&mut self, entry: &HistoryEntryView<'_>) -> bool
     {
-        let need = HISTORY_HEADER_WORDS + entry.bytes.len().div_ceil(8);
-        if entry.bytes.len() > HISTORY_BYTES_MAX || self.used + need > MSG_DATA_WORDS_MAX
+        if entry.bytes.len() > HISTORY_BYTES_MAX
         {
             return false;
         }
-        let slot = &mut self.words[self.used..self.used + need];
-        slot[0] = entry.seq;
-        slot[1] = entry.us;
-        slot[2] = entry.badge;
-        slot[3] = u64::from(entry.level)
+        // The bytes are at most `HISTORY_BYTES_MAX`, so `need` cannot
+        // saturate.
+        let need = HISTORY_HEADER_WORDS.saturating_add(entry.bytes.len().div_ceil(8));
+        let Some([seq, us, badge, meta, byte_words @ ..]) = self
+            .words
+            .get_mut(self.used..)
+            .and_then(|rest| rest.get_mut(..need))
+        else
+        {
+            return false;
+        };
+        *seq = entry.seq;
+        *us = entry.us;
+        *badge = entry.badge;
+        *meta = u64::from(entry.level)
             | (u64::from(entry.kind) << 8)
             | ((entry.bytes.len() as u64) << 16);
-        pack_bytes(&mut slot[HISTORY_HEADER_WORDS..], entry.bytes);
-        self.used += need;
-        self.count += 1;
+        pack_bytes(byte_words, entry.bytes);
+        // `used + need` and the count stay within the page's
+        // `MSG_DATA_WORDS_MAX` words, so neither saturates.
+        self.used = self.used.saturating_add(need);
+        self.count = self.count.saturating_add(1);
         true
     }
 
@@ -423,7 +452,8 @@ impl HistoryPage
     pub fn reply(&self, more: bool) -> IpcMessage
     {
         IpcMessage::builder(reply_label(QUERY_OK, self.count, more))
-            .words(0, &self.words[..self.used])
+            // `used <= MSG_DATA_WORDS_MAX`, so `get` always finds the range.
+            .words(0, self.words.get(..self.used).unwrap_or_default())
             .build()
     }
 }
@@ -465,27 +495,32 @@ impl<'a> Iterator for HistoryEntries<'a>
         {
             return None;
         }
-        let header = self
+        let &[seq, us, badge, meta] = self
             .words
-            .get(self.offset..self.offset + HISTORY_HEADER_WORDS)?;
-        let len = ((header[3] >> 16) & 0xFFFF) as usize;
-        let start = (self.offset + HISTORY_HEADER_WORDS) * 8;
-        let Some(bytes) = self.bytes.get(start..start + len)
+            .get(self.offset..)?
+            .first_chunk::<HISTORY_HEADER_WORDS>()?;
+        let len = ((meta >> 16) & 0xFFFF) as usize;
+        // The header was found, so `body` (its end) fits a `usize`.
+        let body = self.offset.saturating_add(HISTORY_HEADER_WORDS);
+        let Some(bytes) = body
+            .checked_mul(8)
+            .and_then(|start| self.bytes.get(start..)?.get(..len))
         else
         {
             self.left = 0;
             return None;
         };
         let view = HistoryEntryView {
-            seq: header[0],
-            us: header[1],
-            badge: header[2],
-            level: (header[3] & 0xFF) as u8,
-            kind: ((header[3] >> 8) & 0xFF) as u8,
+            seq,
+            us,
+            badge,
+            level: (meta & 0xFF) as u8,
+            kind: ((meta >> 8) & 0xFF) as u8,
             bytes,
         };
-        self.offset += HISTORY_HEADER_WORDS + len.div_ceil(8);
-        self.left -= 1;
+        // The bytes were found, so the next offset is within the reply.
+        self.offset = body.saturating_add(len.div_ceil(8));
+        self.left = self.left.saturating_sub(1);
         Some(view)
     }
 }
@@ -497,9 +532,7 @@ fn pack_bytes(words: &mut [u64], bytes: &[u8])
     words.fill(0);
     for (word, chunk) in words.iter_mut().zip(bytes.chunks(8))
     {
-        let mut b = [0u8; 8];
-        b[..chunk.len()].copy_from_slice(chunk);
-        *word = u64::from_le_bytes(b);
+        *word = u64::from_le_bytes(crate::padded_word(chunk));
     }
 }
 

@@ -95,7 +95,10 @@ pub fn tag_rights_aspace(ctx: &TestContext) -> TestResult
 /// cap with at least `MAP | EXECUTE` rights.
 pub fn tag_rights_memory(ctx: &TestContext) -> TestResult
 {
-    let memory_cap = ctx.aspace_cap + 1;
+    let memory_cap = ctx
+        .aspace_cap
+        .checked_add(1)
+        .ok_or("cap_info::tag_rights_memory: text segment slot out of range")?;
     let value = cap_info(memory_cap, CAP_INFO_TAG_RIGHTS)
         .map_err(|_| "cap_info(memory_cap, TAG_RIGHTS) failed")?;
     let (tag, rights) = unpack_tag_rights(value);
@@ -172,12 +175,23 @@ fn mappings_windows(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_info::memory_mappings: cap_info(memory_base, SIZE) failed")?;
     let pages = size / syscall_abi::PAGE_SIZE;
     let max = CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES;
-    if pages < 2 * max + 1
+    let min_pages = max
+        .checked_mul(2)
+        .and_then(|doubled| doubled.checked_add(1))
+        .ok_or("cap_info::memory_mappings: window size out of range")?;
+    if pages < min_pages
     {
         return Err("cap_info::memory_mappings: memory_base is too small to test the window");
     }
+    let last_page = pages
+        .checked_sub(1)
+        .ok_or("cap_info::memory_mappings: page count out of range")?;
+    let straddling_first = pages
+        .checked_sub(max)
+        .and_then(|first| first.checked_add(1))
+        .ok_or("cap_info::memory_mappings: page count out of range")?;
     if cap_info_memory_mappings(ctx.memory_base, max, max).is_err()
-        || cap_info_memory_mappings(ctx.memory_base, pages - 1, 1).is_err()
+        || cap_info_memory_mappings(ctx.memory_base, last_page, 1).is_err()
     {
         return Err("cap_info::memory_mappings: a window inside a large region was refused");
     }
@@ -187,7 +201,7 @@ fn mappings_windows(ctx: &TestContext) -> TestResult
     };
     if !refused(0, max + 1)
         || !refused(0, 0)
-        || !refused(pages - max + 1, max)
+        || !refused(straddling_first, max)
         || !refused(pages, 1)
     {
         return Err("cap_info::memory_mappings: a malformed window was not refused");
@@ -411,7 +425,8 @@ pub fn ram_descriptors_match_caps(ctx: &TestContext) -> TestResult
     let ram = || {
         crate::init_info::descriptors(info).iter().filter(|d| {
             d.cap_type == CapType::Memory
-                && (info.memory_base..info.memory_base + info.memory_count).contains(&d.slot)
+                && (info.memory_base..info.memory_base.saturating_add(info.memory_count))
+                    .contains(&d.slot)
         })
     };
     if u64::try_from(ram().count()) != Ok(info.memory_count) || info.memory_count == 0
@@ -718,7 +733,7 @@ pub fn cspace_fields(ctx: &TestContext) -> TestResult
     {
         return Err("augment-mode cap_create_cspace failed");
     }
-    if aug_capacity != after_capacity + 2 * L2_SIZE
+    if Some(aug_capacity) != after_capacity.checked_add(2 * L2_SIZE)
     {
         return Err("capacity did not grow by 2 pages of slots after a 2-page augment");
     }

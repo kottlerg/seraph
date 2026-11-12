@@ -144,7 +144,7 @@ fn write_stub(ctx: &TestContext, frame: u64) -> TestResult
         {
             // SAFETY: KT_STUB's page is mapped writable just above; at + i is
             // below STUB_LEN, inside the page.
-            unsafe { ((KT_STUB as *mut u8).add(at + i)).write_volatile(*b) };
+            unsafe { (KT_STUB as *mut u8).add(*at).add(i).write_volatile(*b) };
         }
     }
     // SAFETY: KT_STUB is a scratch VA; no reference into the page is live.
@@ -171,16 +171,19 @@ fn start_and_step(ctx: &TestContext, b: u64, frame: u64, th: u64, ep: u64) -> Te
         return Err("integration::single_step: the first ebreak reported the wrong pointer");
     }
     let mut regs = read_regs(th)?;
-    set_ip(&mut regs, B_STUB + 4);
+    set_ip(&mut regs, B_STUB + 4)?;
     // SAFETY: the frame was read from this thread, fault-blocked in B; only
     // its pointer moves, to the next instruction of the stub.
     unsafe { thread_write_regs(th, &regs) }
         .map_err(|_| "integration::single_step: thread_write_regs failed")?;
     for want in STEPS
     {
-        step(ctx, th, ep, &regs, B_STUB + want)?;
+        let want = B_STUB
+            .checked_add(want)
+            .ok_or("integration::single_step: a step target overflows")?;
+        step(ctx, th, ep, &regs, want)?;
         regs = read_regs(th)?;
-        if ip(&regs) != B_STUB + want
+        if ip(&regs)? != want
         {
             return Err("integration::single_step: the stepped thread stopped elsewhere");
         }
@@ -190,7 +193,7 @@ fn start_and_step(ctx: &TestContext, b: u64, frame: u64, th: u64, ep: u64) -> Te
         .map_err(|_| "integration::single_step: reading the stub back failed")?;
     if STUB
         .iter()
-        .any(|(at, bytes)| &text[*at..*at + bytes.len()] != *bytes)
+        .any(|(at, bytes)| text.get(*at..).and_then(|rest| rest.get(..bytes.len())) != Some(*bytes))
     {
         return Err("integration::single_step: a planted breakpoint was left in the text");
     }
@@ -204,9 +207,12 @@ fn start_and_step(ctx: &TestContext, b: u64, frame: u64, th: u64, ep: u64) -> Te
 /// resume, take the breakpoint there, and restore the bytes.
 fn step(ctx: &TestContext, th: u64, ep: u64, regs: &[u8], want: u64) -> TestResult
 {
-    let pc = ip(regs);
+    let pc = ip(regs)?;
     let insn = read_instruction(th, pc)?;
-    let next = riscv_step::successor(pc, insn, |n| gpr(regs, n))
+    let gprs = gprs(regs)?;
+    // `riscv_step` reads only `x1..=x31` (a 5-bit register field, `x0` apart),
+    // all inside `gprs`.
+    let next = riscv_step::successor(pc, insn, |n| gprs.get(n as usize).copied().unwrap_or(0))
         .map_err(|_| "integration::single_step: the decoder refused a stub instruction")?;
     if next != want
     {
@@ -245,7 +251,10 @@ fn read_instruction(th: u64, pc: u64) -> Result<u32, &'static str>
     {
         return Ok(u32::from(low));
     }
-    thread_read_mem(th, pc + 2, &mut parcel)
+    let upper = pc
+        .checked_add(2)
+        .ok_or("integration::single_step: the instruction's upper parcel overflows")?;
+    thread_read_mem(th, upper, &mut parcel)
         .map_err(|_| "integration::single_step: reading the instruction failed")?;
     Ok(u32::from(low) | (u32::from(u16::from_le_bytes(parcel)) << 16))
 }
@@ -283,28 +292,30 @@ fn read_regs(th: u64) -> Result<[u8; REGS_RISCV64_SIZE], &'static str>
     Ok(regs)
 }
 
-/// The 8-byte word at `at` in `regs`.
-fn word(regs: &[u8], at: usize) -> u64
-{
-    let mut w = [0u8; 8];
-    w.copy_from_slice(&regs[at..at + 8]);
-    u64::from_le_bytes(w)
-}
-
 /// The instruction pointer in `regs`.
-fn ip(regs: &[u8]) -> u64
+fn ip(regs: &[u8]) -> Result<u64, &'static str>
 {
-    word(regs, REGS_RISCV64_IP_OFFSET)
+    crate::spawn::reg_word(regs, REGS_RISCV64_IP_OFFSET)
 }
 
 /// Set the instruction pointer in `regs`.
-fn set_ip(regs: &mut [u8], value: u64)
+fn set_ip(regs: &mut [u8], value: u64) -> TestResult
 {
-    regs[REGS_RISCV64_IP_OFFSET..REGS_RISCV64_IP_OFFSET + 8].copy_from_slice(&value.to_le_bytes());
+    crate::spawn::set_reg_word(regs, REGS_RISCV64_IP_OFFSET, value)
 }
 
-/// Integer register `xN` (`N` in `1..=31`) in `regs`.
-fn gpr(regs: &[u8], n: u32) -> u64
+/// The integer registers in `regs`, `xN` at index `N`, with `x0` as 0.
+fn gprs(regs: &[u8]) -> Result<[u64; 32], &'static str>
 {
-    word(regs, REGS_RISCV64_X1_OFFSET + (n as usize - 1) * 8)
+    let mut out = [0u64; 32];
+    for (n, slot) in out.iter_mut().enumerate().skip(1)
+    {
+        let at = n
+            .checked_sub(1)
+            .and_then(|i| i.checked_mul(8))
+            .and_then(|offset| offset.checked_add(REGS_RISCV64_X1_OFFSET))
+            .ok_or("integration::single_step: register offset overflows")?;
+        *slot = crate::spawn::reg_word(regs, at)?;
+    }
+    Ok(out)
 }

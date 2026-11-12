@@ -192,12 +192,12 @@ pub fn random_contention_phase(_: &Caps)
         .into_iter()
         .map(|h| h.join().expect("contention thread panicked"))
         .collect();
-    for a in 0..firsts.len()
+    for (a, first_a) in firsts.iter().enumerate()
     {
-        for b in (a + 1)..firsts.len()
+        for (b, first_b) in firsts.iter().enumerate().skip(a).skip(1)
         {
             assert_ne!(
-                firsts[a], firsts[b],
+                first_a, first_b,
                 "threads {a} and {b} drew identical first blocks"
             );
         }

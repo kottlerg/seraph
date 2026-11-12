@@ -150,7 +150,9 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 /// cap and a cap without `RIGHTS_IRQ_MINT` are refused.
 pub fn irq_route_holds_the_line(ctx: &TestContext) -> TestResult
 {
-    let id = crate::arch::ROUTABLE_HIGH_IRQ_IDS[0];
+    let id = *crate::arch::ROUTABLE_HIGH_IRQ_IDS
+        .first()
+        .ok_or("hw::irq_route_holds_the_line: no routable id")?;
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "hw::irq_route_holds_the_line: cap_create_notification failed")?;
     let single = isolate_irq_id(ctx, id);
@@ -261,7 +263,9 @@ fn holder_checks(single: u64, holder: u64, sig: u64) -> TestResult
 pub fn irq_remap_refusals(ctx: &TestContext) -> TestResult
 {
     let authority = msg_authority(ctx)?;
-    let line = isolate_irq_id(ctx, crate::arch::ROUTABLE_HIGH_IRQ_IDS[0]);
+    let line = crate::arch::ROUTABLE_HIGH_IRQ_IDS
+        .first()
+        .and_then(|&id| isolate_irq_id(ctx, id));
     let result = line
         .ok_or("hw::irq_remap_refusals: cannot isolate a line")
         .and_then(|line| remap_refusals(authority, line));
@@ -466,7 +470,13 @@ pub fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u64>
             continue;
         };
         syscall::cap_delete(below).ok();
-        return match irq_split(from_id, id + 1)
+        let Some(next) = id.checked_add(1)
+        else
+        {
+            syscall::cap_delete(from_id).ok();
+            return None;
+        };
+        return match irq_split(from_id, next)
         {
             Ok((single, above)) =>
             {
@@ -508,10 +518,14 @@ fn msg_exhaustion_bounds() -> Result<(u64, u64), &'static str>
 {
     let cpus = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64)
         .map_err(|_| "hw::irq_msg_exhaustion_and_reuse: system_info(CpuCount) failed")?;
-    let mints = cpus * MSG_SLOTS_PER_CPU_MAX;
-    let pages = mints.div_ceil(syscall_abi::CSPACE_SLOTS_PER_PAGE)
-        + mints.div_ceil(syscall_abi::CSPACE_BODIES_PER_PAGE)
-        + MSG_AUGMENT_PAGES;
+    let mints = cpus
+        .checked_mul(MSG_SLOTS_PER_CPU_MAX)
+        .ok_or("hw::irq_msg_exhaustion_and_reuse: mint bound out of range")?;
+    let pages = mints
+        .div_ceil(syscall_abi::CSPACE_SLOTS_PER_PAGE)
+        .checked_add(mints.div_ceil(syscall_abi::CSPACE_BODIES_PER_PAGE))
+        .and_then(|pages| pages.checked_add(MSG_AUGMENT_PAGES))
+        .ok_or("hw::irq_msg_exhaustion_and_reuse: page bound out of range")?;
     Ok((mints, pages))
 }
 
@@ -622,7 +636,10 @@ pub fn irq_msg_info_wired_err(ctx: &TestContext) -> TestResult
     {
         return Err("hw::irq_msg_info_wired_err: a range cap answered the message selectors");
     }
-    let id = crate::arch::ROUTABLE_HIGH_IRQ_IDS[0];
+    let id = crate::arch::ROUTABLE_HIGH_IRQ_IDS
+        .first()
+        .copied()
+        .ok_or("hw::irq_msg_info_wired_err: no routable high IRQ id")?;
     let line =
         isolate_irq_id(ctx, id).ok_or("hw::irq_msg_info_wired_err: cannot isolate a line")?;
     let wired = msg_of(line);
@@ -782,7 +799,9 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
     let (mint_limit, donation_limit) = msg_exhaustion_bounds()?;
     let authority = msg_authority(ctx)?;
     // The line is carved before the mints fill the `CSpace`.
-    let line = isolate_irq_id(ctx, crate::arch::ROUTABLE_HIGH_IRQ_IDS[0]);
+    let line = crate::arch::ROUTABLE_HIGH_IRQ_IDS
+        .first()
+        .and_then(|&id| isolate_irq_id(ctx, id));
     let result = (|| -> TestResult {
         let line = line.ok_or("hw::irq_msg_exhaustion_and_reuse: cannot isolate a line")?;
         let mut last = 0;
@@ -799,14 +818,14 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
                 Ok(cap) =>
                 {
                     last = cap;
-                    minted += 1;
+                    minted = minted.saturating_add(1);
                 }
                 Err(e) if e == SyscallError::QuotaExceeded as i64 => break,
                 Err(e) if e == SyscallError::OutOfMemory as i64 && donated < donation_limit =>
                 {
                     syscall::cap_create_cspace(ctx.memory_base, ctx.cspace_cap, MSG_AUGMENT_PAGES)
                         .map_err(|_| "hw::irq_msg_exhaustion_and_reuse: CSpace augment failed")?;
-                    donated += MSG_AUGMENT_PAGES;
+                    donated = donated.saturating_add(MSG_AUGMENT_PAGES);
                 }
                 Err(_) => return Err("hw::irq_msg_exhaustion_and_reuse: unexpected mint error"),
             }
@@ -876,7 +895,9 @@ fn msg_key(address: u64, data: u64) -> Option<usize>
         return None;
     }
     let page = (address >> 12) & 0xFF;
-    usize::try_from(page * MSG_SLOTS_PER_CPU_MAX + data).ok()
+    page.checked_mul(MSG_SLOTS_PER_CPU_MAX)
+        .and_then(|base| base.checked_add(data))
+        .and_then(|key| usize::try_from(key).ok())
 }
 
 /// Mint through `authority` until the targets run out (`QuotaExceeded`),
@@ -895,7 +916,7 @@ fn mint_every_slot(ctx: &TestContext, authority: u64, sig: Option<u64>)
     }
     let mut minted = 0;
     let mut donated = 0;
-    let mut refills = 0;
+    let mut refills = 0u64;
     let mut refilled = false;
     loop
     {
@@ -907,7 +928,7 @@ fn mint_every_slot(ctx: &TestContext, authority: u64, sig: Option<u64>)
         {
             Ok(cap) =>
             {
-                minted += 1;
+                minted = minted.saturating_add(1);
                 refilled = false;
                 let (address, data) = msg_of(cap)
                     .map_err(|_| "hw::irq_msg_every_slot_one_notification: no message")?;
@@ -918,8 +939,10 @@ fn mint_every_slot(ctx: &TestContext, authority: u64, sig: Option<u64>)
                 let key = msg_key(address, data)
                     .ok_or("hw::irq_msg_every_slot_one_notification: data past 11 bits")?;
                 let bit = 1u64 << (key % 64);
-                if MSG_SEEN[key / 64].fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit
-                    != 0
+                let word = MSG_SEEN
+                    .get(key / 64)
+                    .ok_or("hw::irq_msg_every_slot_one_notification: message key out of range")?;
+                if word.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit != 0
                 {
                     return Err(
                         "hw::irq_msg_every_slot_one_notification: two targets share a message",
@@ -944,8 +967,8 @@ fn mint_every_slot(ctx: &TestContext, authority: u64, sig: Option<u64>)
                     .map_err(
                         |_| "hw::irq_msg_every_slot_one_notification: CSpace augment failed",
                     )?;
-                donated += MSG_AUGMENT_PAGES;
-                refills += 1;
+                donated = donated.saturating_add(MSG_AUGMENT_PAGES);
+                refills = refills.saturating_add(1);
                 refilled = true;
             }
             Err(_) => return Err("hw::irq_msg_every_slot_one_notification: unexpected mint error"),

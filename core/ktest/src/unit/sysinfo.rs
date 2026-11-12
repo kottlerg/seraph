@@ -181,7 +181,9 @@ pub fn user_va_top(ctx: &TestContext) -> TestResult
     // SAFETY: `top` is at the user-half gate, which the kernel refuses (the
     // test's premise), so the call maps nothing.
     let at_top = unsafe { mem_map(memory_cap, ctx.aspace_cap, top, 0, 1, MAP_WRITABLE) };
-    let below = top - PAGE_SIZE;
+    let below = top
+        .checked_sub(PAGE_SIZE)
+        .ok_or("sysinfo::user_va_top: UserVaTop is below one page")?;
     // SAFETY: `below` is a ktest scratch page (the top page of the user half,
     // or on x86-64 one of its top two; see the crate's § Scratch VAs): tests
     // run one at a time and none leaves a scratch page mapped, so nothing
@@ -268,7 +270,12 @@ pub fn thread_retype_bytes_funds_one_thread(ctx: &TestContext) -> TestResult
     crate::log_u64("ktest: ThreadRetypeBytes=", bytes);
     let pages = bytes / PAGE_SIZE;
 
-    let short = split_top(ctx, pages - 1)?;
+    let short = split_top(
+        ctx,
+        pages
+            .checked_sub(1)
+            .ok_or("sysinfo::thread_retype_bytes: no pages in a slot")?,
+    )?;
     let refused = cap_create_thread(short, ctx.aspace_cap, ctx.cspace_cap, 0, 0);
     if let Ok(thread) = refused
     {
@@ -324,7 +331,7 @@ pub fn live_cspace_count(ctx: &TestContext) -> TestResult
     let during = count();
     cap_delete(cs).map_err(|_| "sysinfo::live_cspace_count: cap_delete failed")?;
     let after = count()?;
-    if during? != before + 1
+    if Some(during?) != before.checked_add(1)
     {
         return Err("system_info(LiveCSpaceCount) did not count a created CSpace");
     }
@@ -341,8 +348,9 @@ fn split_top(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
 {
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "sysinfo::thread_retype_bytes: cap_info(memory_base) failed")?;
-    let at = size
-        .checked_sub(pages * PAGE_SIZE)
+    let at = pages
+        .checked_mul(PAGE_SIZE)
+        .and_then(|bytes| size.checked_sub(bytes))
         .ok_or("sysinfo::thread_retype_bytes: memory_base too small")?;
     memory_split(ctx.memory_base, at)
         .map_err(|_| "sysinfo::thread_retype_bytes: memory_split(memory_base) failed")

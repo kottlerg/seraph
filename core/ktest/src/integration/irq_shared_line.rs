@@ -101,18 +101,21 @@ impl Held
         }
     }
 
-    fn push(&mut self, handle: u64) -> u64
+    fn push(&mut self, handle: u64) -> Result<u64, &'static str>
     {
-        self.handles[self.len] = handle;
-        self.len += 1;
-        handle
+        *self
+            .handles
+            .get_mut(self.len)
+            .ok_or("integration::irq_shared_line: held handle list full")? = handle;
+        self.len = self.len.saturating_add(1);
+        Ok(handle)
     }
 
     /// Delete every held handle. A handle a scenario already deleted fails
     /// its generation check here and is skipped.
     fn release(&mut self)
     {
-        for &handle in self.handles[..self.len].iter().rev()
+        for &handle in self.handles.iter().take(self.len).rev()
         {
             cap_delete(handle).ok();
         }
@@ -145,12 +148,12 @@ pub fn run(ctx: &TestContext) -> TestResult
 fn shared_line(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
     route(line, 0, held)?;
-    let a = held.push(derive(line)?);
-    let b = held.push(derive(line)?);
-    let unbound = held.push(derive(line)?);
-    let n1 = held.push(notification(ctx)?);
-    let n2 = held.push(notification(ctx)?);
-    let n3 = held.push(notification(ctx)?);
+    let a = held.push(derive(line)?)?;
+    let b = held.push(derive(line)?)?;
+    let unbound = held.push(derive(line)?)?;
+    let n1 = held.push(notification(ctx)?)?;
+    let n2 = held.push(notification(ctx)?)?;
+    let n3 = held.push(notification(ctx)?)?;
     irq_register(a, n1, 0)
         .and_then(|()| irq_register(b, n2, 0))
         .map_err(|_| "integration::irq_shared_line: binding A or B refused")?;
@@ -194,15 +197,15 @@ fn shared_line(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 fn binding_bound(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
     route(line, 0, held)?;
-    let ntf = held.push(notification(ctx)?);
+    let ntf = held.push(notification(ctx)?)?;
     let mut bound = [0; MAX_IRQ_BINDINGS];
     for slot in &mut bound
     {
-        *slot = held.push(derive(line)?);
+        *slot = held.push(derive(line)?)?;
         irq_register(*slot, ntf, 0)
             .map_err(|_| "integration::irq_shared_line: a binding under the bound was refused")?;
     }
-    let extra = held.push(derive(line)?);
+    let extra = held.push(derive(line)?)?;
     if irq_register(extra, ntf, 0) != Err(SyscallError::QuotaExceeded as i64)
     {
         return Err("integration::irq_shared_line: a binding past the bound was not refused");
@@ -215,8 +218,8 @@ fn binding_bound(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
     // The bindings hold the notification: deleting its only capability
     // removes none of them, so the line is still full.
     cap_delete(ntf).map_err(|_| "integration::irq_shared_line: cap_delete(notification) failed")?;
-    let fresh = held.push(notification(ctx)?);
-    let probe = held.push(derive(line)?);
+    let fresh = held.push(notification(ctx)?)?;
+    let probe = held.push(derive(line)?)?;
     if irq_register(probe, fresh, 0) != Err(SyscallError::QuotaExceeded as i64)
     {
         return Err(
@@ -244,10 +247,10 @@ fn binding_bound(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 fn line_mode(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
     let holder = route(line, IRQ_MODE_LEVEL, held)?;
-    let a = held.push(derive(line)?);
-    let b = held.push(derive(line)?);
-    let n1 = held.push(notification(ctx)?);
-    let n2 = held.push(notification(ctx)?);
+    let a = held.push(derive(line)?)?;
+    let b = held.push(derive(line)?)?;
+    let n1 = held.push(notification(ctx)?)?;
+    let n2 = held.push(notification(ctx)?)?;
     irq_register(a, n1, IRQ_MODE_LEVEL).map_err(
         |_| "integration::irq_shared_line: a first binding in the route's mode was refused",
     )?;
@@ -288,7 +291,7 @@ fn line_mode(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
     cap_delete(b).map_err(|_| "integration::irq_shared_line: cap_delete(B) failed")?;
 
     // The holder keeps the route with no binding left, in its mode.
-    let c = held.push(derive(line)?);
+    let c = held.push(derive(line)?)?;
     if irq_route(c, 0) != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("integration::irq_shared_line: the route went with the last binding");
@@ -300,7 +303,7 @@ fn line_mode(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
     irq_register(c, n1, 0)
         .map_err(|_| "integration::irq_shared_line: a binding on the new route was refused")?;
     cap_delete(c).map_err(|_| "integration::irq_shared_line: cap_delete(C) failed")?;
-    let d = held.push(derive(line)?);
+    let d = held.push(derive(line)?)?;
     if irq_route(d, IRQ_MODE_MASK + 1) != Err(SyscallError::InvalidArgument as i64)
         || irq_register(d, n1, IRQ_MODE_MASK + 1) != Err(SyscallError::InvalidArgument as i64)
     {
@@ -313,7 +316,7 @@ fn line_mode(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 /// route until the scenario's release; the derivation.
 fn route(line: u64, mode: u64, held: &mut Held) -> Result<u64, &'static str>
 {
-    let holder = held.push(derive(line)?);
+    let holder = held.push(derive(line)?)?;
     irq_route(holder, mode).map_err(|_| "integration::irq_shared_line: route refused")?;
     Ok(holder)
 }

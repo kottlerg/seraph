@@ -95,21 +95,12 @@ impl Default for BadTally
     }
 }
 
-/// Log `value` after `ktest: <cell><suffix>`, composed in a stack buffer (no
-/// heap); a prefix longer than the buffer is cut. `cell` is the cell's log
-/// name (`stress::<name>`) and `suffix` starts with the separating space.
+/// Log `value` after `ktest: <cell><suffix>` (`crate::log_args`, cut at its
+/// line length). `cell` is the cell's log name (`stress::<name>`) and
+/// `suffix` starts with the separating space.
 pub fn log_cell_u64(cell: &str, suffix: &str, value: u64)
 {
-    let mut prefix = [0u8; 96];
-    let mut len = 0usize;
-    for part in ["ktest: ", cell, suffix]
-    {
-        let bytes = part.as_bytes();
-        let n = bytes.len().min(prefix.len() - len);
-        prefix[len..len + n].copy_from_slice(&bytes[..n]);
-        len += n;
-    }
-    crate::log_u64(core::str::from_utf8(&prefix[..len]).unwrap_or("?"), value);
+    crate::log_args(format_args!("ktest: {cell}{suffix}{value}"));
 }
 
 /// Log a syscall error word after `label`.

@@ -50,11 +50,28 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mapped = map_all(ctx, granted);
     cap_delete(granted).map_err(|_| "integration::mmio_spill_withdrawn: cap_delete failed")?;
     mapped?;
-    if (0..PLACES).any(|i| aspace_query(ctx.aspace_cap, SPILL_VA + i * PAGE).is_ok())
+    for i in 0..PLACES
     {
-        return Err("integration::mmio_spill_withdrawn: a mapping survived the object");
+        if place_mapped(ctx, i)?
+        {
+            return Err("integration::mmio_spill_withdrawn: a mapping survived the object");
+        }
     }
     Ok(())
+}
+
+/// The virtual address of place `i` of the spill window.
+fn place_va(i: u64) -> Result<u64, &'static str>
+{
+    i.checked_mul(PAGE)
+        .and_then(|offset| SPILL_VA.checked_add(offset))
+        .ok_or("integration::mmio_spill_withdrawn: place address overflows")
+}
+
+/// Whether the address space has a mapping at place `i`.
+fn place_mapped(ctx: &TestContext, i: u64) -> Result<bool, &'static str>
+{
+    Ok(aspace_query(ctx.aspace_cap, place_va(i)?).is_ok())
 }
 
 fn map_all(ctx: &TestContext, granted: u64) -> TestResult
@@ -64,12 +81,15 @@ fn map_all(ctx: &TestContext, granted: u64) -> TestResult
         // SAFETY: the window is a scratch VA range (crate docs § Scratch VAs),
         // holding no Rust object or IPC page of ktest; nothing reads the
         // mapping, so no reference to it exists (`mmio_map` § Safety).
-        unsafe { mmio_map(ctx.aspace_cap, granted, SPILL_VA + i * PAGE, 0) }
+        unsafe { mmio_map(ctx.aspace_cap, granted, place_va(i)?, 0) }
             .map_err(|_| "integration::mmio_spill_withdrawn: mmio_map failed")?;
     }
-    if (0..PLACES).any(|i| aspace_query(ctx.aspace_cap, SPILL_VA + i * PAGE).is_err())
+    for i in 0..PLACES
     {
-        return Err("integration::mmio_spill_withdrawn: a place was not mapped");
+        if !place_mapped(ctx, i)?
+        {
+            return Err("integration::mmio_spill_withdrawn: a place was not mapped");
+        }
     }
     Ok(())
 }

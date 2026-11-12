@@ -426,11 +426,11 @@ fn create_thread(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::stop_target_vanishes: create thread failed")?,
     );
-    // SAFETY: stress stacks 0 and 1 belong to this test's stopper and
+    // stress stacks 0 and 1 belong to this test's stopper and
     // target; stress tests run sequentially, each phase's children exit or
     // are deleted before the next phase's are created, and a delete round's
     // target is deleted (ended wherever it was) before its successor is.
-    let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
+    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack)?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).
@@ -478,7 +478,7 @@ fn stop_and_classify(cycle: u32, children: &Children, seen: &mut Seen) -> TestRe
     {
         Ok(()) =>
         {
-            seen.probe_stops_ok += 1;
+            seen.probe_stops_ok = seen.probe_stops_ok.saturating_add(1);
             false
         }
         Err(e) if e == SyscallError::InvalidState as i64 => true,
@@ -490,11 +490,11 @@ fn stop_and_classify(cycle: u32, children: &Children, seen: &mut Seen) -> TestRe
     };
     if in_stop && target_stopped
     {
-        seen.stopped_in_drain += 1;
+        seen.stopped_in_drain = seen.stopped_in_drain.saturating_add(1);
     }
     else
     {
-        seen.stopped_elsewhere += 1;
+        seen.stopped_elsewhere = seen.stopped_elsewhere.saturating_add(1);
     }
     Ok(())
 }
@@ -516,7 +516,7 @@ fn vanish_and_resume(
     let (stopper, _) = handles(children)?;
     if restart(stopper)?
     {
-        seen.restarts_ok += 1;
+        seen.restarts_ok = seen.restarts_ok.saturating_add(1);
     }
     await_progress(
         &STOPPER_PROGRESS,
@@ -613,7 +613,7 @@ fn await_within(bound_us: u64, mut done: impl FnMut() -> bool) -> Result<bool, &
         }
         if polls < BUSY_POLLS
         {
-            polls += 1;
+            polls = polls.saturating_add(1);
             core::hint::spin_loop();
         }
         else
@@ -647,7 +647,7 @@ fn finish(children: &Children) -> TestResult
         {
             return Err("stress::stop_target_vanishes: a child did not exit");
         }
-        polls += 1;
+        polls = polls.saturating_add(1);
         restart(stopper)?;
         restart(target)?;
         thread_sleep(1).map_err(|_| "stress::stop_target_vanishes: exit poll sleep failed")?;
@@ -728,7 +728,7 @@ fn pace_on_target()
         && QUIT.load(Ordering::Acquire) == 0
         && polls < PACE_POLLS
     {
-        polls += 1;
+        polls = polls.saturating_add(1);
         core::hint::spin_loop();
     }
 }

@@ -46,6 +46,8 @@
 //! `# Safety` contracts of `syscall::mem_map` and its siblings. Tests run one
 //! at a time; children reach a scratch page only as their test directs.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 #![no_main]
 
@@ -275,7 +277,24 @@ impl ChildStack
     #[must_use]
     pub fn top(ptr: *const Self) -> u64
     {
-        ptr as u64 + Self::BYTES as u64
+        ptr.wrapping_add(1) as u64
+    }
+
+    /// [`top`](Self::top) of element `index` of the stack array at `stacks`
+    /// (`core::ptr::addr_of!(STACKS)`), the bounds-checked form of
+    /// `top(addr_of!(STACKS[index]))`.
+    ///
+    /// # Errors
+    ///
+    /// A fixed message when `index` is past the array's end.
+    pub fn top_at<const N: usize>(
+        stacks: *const [Self; N],
+        index: usize,
+    ) -> Result<u64, &'static str>
+    {
+        elem_ptr(stacks, index)
+            .map(Self::top)
+            .ok_or("ktest: child stack index past its array")
     }
 
     /// Bytes of the stack at `ptr` its threads have used: from the top down
@@ -298,7 +317,7 @@ impl ChildStack
         // SAFETY: every offset is below `BYTES`, so inside the stack, and the
         // caller's contract leaves no thread writing it.
         let lowest = (0..Self::BYTES).find(|&i| unsafe { base.add(i).read() } != 0);
-        lowest.map_or(0, |i| Self::BYTES - i)
+        lowest.map_or(0, |i| Self::BYTES.saturating_sub(i))
     }
 }
 
@@ -344,6 +363,37 @@ impl IpcPage
     {
         ptr as u64
     }
+
+    /// [`addr`](Self::addr) of element `index` of the page array at `pages`
+    /// (`core::ptr::addr_of_mut!(PAGES)`), the bounds-checked form of
+    /// `addr(addr_of_mut!(PAGES[index]))`.
+    ///
+    /// # Errors
+    ///
+    /// A fixed message when `index` is past the array's end.
+    pub fn addr_at<const N: usize>(pages: *mut [Self; N], index: usize)
+    -> Result<u64, &'static str>
+    {
+        elem_ptr_mut(pages, index)
+            .map(Self::addr)
+            .ok_or("ktest: IPC page index past its array")
+    }
+}
+
+/// Pointer to element `index` of the array at `array`, or `None` past its
+/// end: the bounds-checked form of `addr_of!(ARRAY[index])` for a `static
+/// mut` array, which forms no reference to the static.
+#[must_use]
+pub fn elem_ptr<T, const N: usize>(array: *const [T; N], index: usize) -> Option<*const T>
+{
+    (index < N).then(|| array.cast::<T>().wrapping_add(index))
+}
+
+/// [`elem_ptr`] for a mutable pointer, the form of `addr_of_mut!(ARRAY[index])`.
+#[must_use]
+pub fn elem_ptr_mut<T, const N: usize>(array: *mut [T; N], index: usize) -> Option<*mut T>
+{
+    (index < N).then(|| array.cast::<T>().wrapping_add(index))
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -384,7 +434,7 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
     {
         return;
     }
-    for slot in (info.memory_base + 1)..(info.memory_base + info.memory_count)
+    for slot in spare_ram_slots(info)
     {
         if syscall::cap_info(info.aspace_cap, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET)
             .is_ok_and(|b| b >= TARGET_BYTES)
@@ -402,6 +452,15 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
         // loop moves on to the next spare cap.
         let _ = syscall::cap_create_aspace(slot, info.aspace_cap, want);
     }
+}
+
+/// The slots of every inherited RAM Memory cap after `memory_base`, the
+/// spare caps the two funding steps draw on: the `memory_count` caps from
+/// `memory_base` on, the first left out. A range the counts would carry past
+/// `u64::MAX` ends there.
+fn spare_ram_slots(info: &init_protocol::InitInfo) -> core::ops::Range<u64>
+{
+    info.memory_base.saturating_add(1)..info.memory_base.saturating_add(info.memory_count)
 }
 
 /// Pool pages ktest donates to its own `CSpace`, the root `CSpace` it inherits
@@ -428,7 +487,7 @@ const CSPACE_FUND_PAGES: u64 = 16;
 fn fund_own_cspace(info: &init_protocol::InitInfo)
 {
     let mut left = CSPACE_FUND_PAGES;
-    for slot in (info.memory_base + 1)..(info.memory_base + info.memory_count)
+    for slot in spare_ram_slots(info)
     {
         if left == 0
         {
@@ -445,7 +504,7 @@ fn fund_own_cspace(info: &init_protocol::InitInfo)
         // moves on to the next spare cap.
         if syscall::cap_create_cspace(slot, info.cspace_cap, want).is_ok()
         {
-            left -= want;
+            left = left.saturating_sub(want);
         }
     }
 }
@@ -613,6 +672,74 @@ extern "C" fn run(info_ptr: u64) -> !
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
+/// Capacity of one composed log line in bytes, the timestamp prefix apart; a
+/// longer line is cut at a character boundary.
+const LINE_BYTES: usize = 128;
+
+/// A log line composed on the stack (ktest has no heap): a `fmt::Write`
+/// target that keeps what fits in [`LINE_BYTES`], cut at a character
+/// boundary, and drops the rest.
+pub struct Line
+{
+    buf: [u8; LINE_BYTES],
+    len: usize,
+}
+
+impl Line
+{
+    /// An empty line.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            buf: [0u8; LINE_BYTES],
+            len: 0,
+        }
+    }
+
+    /// The text written so far.
+    #[must_use]
+    pub fn as_str(&self) -> &str
+    {
+        // `write_str` stores whole characters only, so the prefix is UTF-8.
+        self.buf
+            .get(..self.len)
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .unwrap_or("?")
+    }
+}
+
+impl Default for Line
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
+impl core::fmt::Write for Line
+{
+    fn write_str(&mut self, s: &str) -> core::fmt::Result
+    {
+        let Some(room) = self.buf.get_mut(self.len..)
+        else
+        {
+            return Ok(());
+        };
+        let mut n = s.len().min(room.len());
+        while !s.is_char_boundary(n)
+        {
+            n = n.saturating_sub(1);
+        }
+        if let (Some(dst), Some(src)) = (room.get_mut(..n), s.as_bytes().get(..n))
+        {
+            dst.copy_from_slice(src);
+            self.len = self.len.saturating_add(n);
+        }
+        Ok(())
+    }
+}
+
 /// Write a `[S.NNNNNN] ` timestamp prefix to all output channels.
 ///
 /// Format matches the kernel console: `[S.NNNNNN] ` where S is whole seconds
@@ -621,61 +748,14 @@ extern "C" fn run(info_ptr: u64) -> !
 fn write_timestamp()
 {
     let us = elapsed_us();
-    let sec = us / 1_000_000;
-    let us_frac = us % 1_000_000;
-
-    // Format "[sec.uuuuuu] " into a stack buffer. Max seconds digits = 20 (u64),
-    // plus '[', '.', 6 fractional digits, ']', ' ' = 30 bytes max.
-    let mut buf = [0u8; 30];
-    let mut pos = 0usize;
-
-    buf[pos] = b'[';
-    pos += 1;
-
-    // Seconds (variable width, at least one digit).
-    let mut sec_buf = [0u8; 20];
-    let mut sec_len = 0usize;
-    let mut n = sec;
-    if n == 0
-    {
-        sec_buf[0] = b'0';
-        sec_len = 1;
-    }
-    else
-    {
-        while n > 0
-        {
-            sec_buf[sec_len] = b'0' + (n % 10) as u8;
-            n /= 10;
-            sec_len += 1;
-        }
-        sec_buf[..sec_len].reverse();
-    }
-    buf[pos..pos + sec_len].copy_from_slice(&sec_buf[..sec_len]);
-    pos += sec_len;
-
-    buf[pos] = b'.';
-    pos += 1;
-
-    // Microseconds (zero-padded to 6 digits).
-    let mut frac = us_frac;
-    for i in (0..6).rev()
-    {
-        buf[pos + i] = b'0' + (frac % 10) as u8;
-        frac /= 10;
-    }
-    pos += 6;
-
-    buf[pos] = b']';
-    pos += 1;
-    buf[pos] = b' ';
-    pos += 1;
-
-    if let Ok(s) = core::str::from_utf8(&buf[..pos])
-    {
-        serial::write_str(s);
-        framebuffer::write_str(s);
-    }
+    let mut line = Line::new();
+    // `Line` cuts rather than fails, so the write cannot fail.
+    let _ = core::fmt::Write::write_fmt(
+        &mut line,
+        format_args!("[{}.{:06}] ", us / 1_000_000, us % 1_000_000),
+    );
+    serial::write_str(line.as_str());
+    framebuffer::write_str(line.as_str());
 }
 
 /// Write a string to all available output channels (serial + framebuffer).
@@ -693,42 +773,20 @@ pub fn log(msg: &str)
     framebuffer::newline();
 }
 
+/// Log the line `args` formats, composed in a [`Line`] (no heap) and cut at
+/// [`LINE_BYTES`].
+pub fn log_args(args: core::fmt::Arguments<'_>)
+{
+    let mut line = Line::new();
+    // `Line` cuts rather than fails, so the write cannot fail.
+    let _ = core::fmt::Write::write_fmt(&mut line, args);
+    log(line.as_str());
+}
+
 /// Log a decimal `u64` value prefixed by a static string.
-///
-/// Uses a fixed 24-byte stack buffer — no heap required.
 pub fn log_u64(prefix: &str, value: u64)
 {
-    let mut buf = [0u8; 24];
-    let mut n = value;
-    let mut len = 0usize;
-    if n == 0
-    {
-        buf[0] = b'0';
-        len = 1;
-    }
-    else
-    {
-        while n > 0
-        {
-            buf[len] = b'0' + (n % 10) as u8;
-            n /= 10;
-            len += 1;
-        }
-        buf[..len].reverse();
-    }
-
-    let num_str = core::str::from_utf8(&buf[..len]).unwrap_or("?");
-    let mut msg = [0u8; 128];
-    let pb = prefix.as_bytes();
-    let plen = pb.len().min(msg.len());
-    msg[..plen].copy_from_slice(&pb[..plen]);
-    let nlen = num_str.len().min(msg.len() - plen);
-    msg[plen..plen + nlen].copy_from_slice(&num_str.as_bytes()[..nlen]);
-    let total = plen + nlen;
-    if let Ok(s) = core::str::from_utf8(&msg[..total])
-    {
-        log(s);
-    }
+    log_args(format_args!("{prefix}{value}"));
 }
 
 /// Log a kernel version packed as a `u64` in `MAJOR.MINOR.PATCH` encoding.
@@ -738,62 +796,10 @@ pub fn log_u64(prefix: &str, value: u64)
 /// `major = ver >> 32`, `minor = (ver >> 16) & 0xFFFF`, `patch = ver & 0xFFFF`.
 pub fn log_version(prefix: &str, ver: u64)
 {
-    // Write a u64 as decimal into buf starting at pos; returns new pos.
-    fn write_num(buf: &mut [u8], pos: usize, mut n: u64) -> usize
-    {
-        if n == 0
-        {
-            if pos < buf.len()
-            {
-                buf[pos] = b'0';
-                return pos + 1;
-            }
-            return pos;
-        }
-        let start = pos;
-        let mut end = pos;
-        while n > 0 && end < buf.len()
-        {
-            buf[end] = b'0' + (n % 10) as u8;
-            n /= 10;
-            end += 1;
-        }
-        buf[start..end].reverse();
-        end
-    }
-
     let major = ver >> 32;
     let minor = (ver >> 16) & 0xFFFF;
     let patch = ver & 0xFFFF;
-    let mut buf = [0u8; 128];
-    let pb = prefix.as_bytes();
-    let plen = pb.len().min(buf.len());
-    buf[..plen].copy_from_slice(&pb[..plen]);
-    let mut pos = plen;
-
-    if pos < buf.len()
-    {
-        buf[pos] = b'v';
-        pos += 1;
-    }
-    pos = write_num(&mut buf, pos, major);
-    if pos < buf.len()
-    {
-        buf[pos] = b'.';
-        pos += 1;
-    }
-    pos = write_num(&mut buf, pos, minor);
-    if pos < buf.len()
-    {
-        buf[pos] = b'.';
-        pos += 1;
-    }
-    pos = write_num(&mut buf, pos, patch);
-
-    if let Ok(s) = core::str::from_utf8(&buf[..pos])
-    {
-        log(s);
-    }
+    log_args(format_args!("{prefix}v{major}.{minor}.{patch}"));
 }
 
 /// `SYS_SYSTEM_INFO(ElapsedUs)`, microseconds since kernel timer init; 0 if
@@ -810,7 +816,7 @@ fn elapsed_us() -> u64
 /// Sleeps between polls so the scheduler can run other threads.
 fn wait_seconds(secs: u32)
 {
-    wait_us(u64::from(secs) * 1_000_000);
+    wait_us(u64::from(secs).saturating_mul(1_000_000));
 }
 
 /// Block until `target_us` microseconds of `ElapsedUs` have passed since

@@ -205,7 +205,7 @@ fn run_mode(ctx: &TestContext, mode: u32) -> TestResult
 fn await_cached(child: &crate::spawn::SpawnedChild) -> TestResult
 {
     let bound = crate::scaled_polls(MAX_POLLS);
-    let mut polls = 0;
+    let mut polls = 0u32;
     while PHASE.load(Ordering::Acquire) < PHASE_CACHED
     {
         // Re-read the phase after the probe: a child that notified and then
@@ -214,7 +214,7 @@ fn await_cached(child: &crate::spawn::SpawnedChild) -> TestResult
         {
             return Err("integration::tlb_widen_retry: child exited before caching the mapping");
         }
-        polls += 1;
+        polls = polls.saturating_add(1);
         if polls >= bound
         {
             return Err("integration::tlb_widen_retry: child never cached the mapping");
@@ -231,7 +231,7 @@ fn await_cached(child: &crate::spawn::SpawnedChild) -> TestResult
 fn await_written(child: &crate::spawn::SpawnedChild) -> TestResult
 {
     let bound = crate::scaled_polls(MAX_POLLS);
-    let mut polls = 0;
+    let mut polls = 0u32;
     while PHASE.load(Ordering::Acquire) < PHASE_WROTE
     {
         // Re-read the phase after the probe: a child that notified and then
@@ -240,7 +240,7 @@ fn await_written(child: &crate::spawn::SpawnedChild) -> TestResult
         {
             return Err("integration::tlb_widen_retry: child killed writing widened mapping");
         }
-        polls += 1;
+        polls = polls.saturating_add(1);
         if polls >= bound
         {
             return Err("integration::tlb_widen_retry: child never completed the write");
@@ -260,10 +260,10 @@ fn cleanup(ctx: &TestContext, child: Option<&mut crate::spawn::SpawnedChild>, me
         // cap_delete never races a still-running pinned thread (which can hang
         // the harness on a CPU with no other ready thread).
         let bound = crate::scaled_polls(MAX_POLLS);
-        let mut polls = 0;
+        let mut polls = 0u32;
         while !crate::spawn::is_exited(child.th).unwrap_or(true)
         {
-            polls += 1;
+            polls = polls.saturating_add(1);
             if polls >= bound
             {
                 break;
@@ -343,7 +343,7 @@ fn child_spin_until(target: u32, spin_bound: u64) -> bool
     while PHASE.load(Ordering::Acquire) < target
     {
         core::hint::spin_loop();
-        spins += 1;
+        spins = spins.saturating_add(1);
         if spins >= spin_bound
         {
             return false;

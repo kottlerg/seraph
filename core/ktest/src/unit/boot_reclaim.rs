@@ -42,8 +42,10 @@ fn is_named_memory_cap(info: &InitInfo, slot: u64) -> bool
         || (info.acpi_rsdp_memory_cap != 0 && slot == info.acpi_rsdp_memory_cap)
         || (info.dtb_memory_cap != 0 && slot == info.dtb_memory_cap)
         || in_range(info.acpi_region_memory_base, info.acpi_region_memory_count)
-        || info.module_names[..(info.module_name_count as usize).min(info.module_names.len())]
+        || info
+            .module_names
             .iter()
+            .take(info.module_name_count as usize)
             .any(|m| m.slot == slot)
 }
 
@@ -75,7 +77,9 @@ impl ProbeError
 fn window_is_zero(ctx: &TestContext, cap: u64, offset: u64, pages: u64)
 -> Result<bool, ProbeError>
 {
-    let Ok(words) = usize::try_from(pages * PAGE_SIZE / 8)
+    let Some(Ok(words)) = pages
+        .checked_mul(PAGE_SIZE)
+        .map(|bytes| usize::try_from(bytes / 8))
     else
     {
         return Err(ProbeError::Map);
@@ -116,14 +120,14 @@ pub fn reclaimed_bootloader_pages_are_zero(ctx: &TestContext) -> TestResult
         let mut offset = 0;
         while offset < pages
         {
-            let n = WINDOW_PAGES.min(pages - offset);
+            let n = WINDOW_PAGES.min(pages.saturating_sub(offset));
             if !window_is_zero(ctx, d.slot, offset, n).map_err(ProbeError::message)?
             {
                 return Err("a reclaimed bootloader page holds non-zero bytes");
             }
-            offset += n;
+            offset = offset.saturating_add(n);
         }
-        caps_checked += 1;
+        caps_checked = caps_checked.saturating_add(1);
         single_page_checked |= pages == 1;
     }
 
@@ -147,16 +151,16 @@ pub fn reclaimed_bootloader_pages_are_zero(ctx: &TestContext) -> TestResult
 pub fn drained_ram_frames_are_zero(ctx: &TestContext) -> TestResult
 {
     let mut taken = [0u64; crate::frame_pool::POOL_SIZE];
-    let mut n = 0;
-    while n < taken.len()
+    let mut n = 0usize;
+    for slot in &mut taken
     {
         let Some(cap) = crate::frame_pool::alloc()
         else
         {
             break;
         };
-        taken[n] = cap;
-        n += 1;
+        *slot = cap;
+        n = n.saturating_add(1);
     }
 
     let mut result = if n == 0
@@ -170,7 +174,7 @@ pub fn drained_ram_frames_are_zero(ctx: &TestContext) -> TestResult
     // A frame whose probe failed to unmap stays mapped at `PROBE_VA`; it is
     // kept out of the pool rather than aliased by the next test's mapping.
     let mut still_mapped = None;
-    for &cap in &taken[..n]
+    for &cap in taken.iter().take(n)
     {
         if result.is_ok()
         {
@@ -189,7 +193,7 @@ pub fn drained_ram_frames_are_zero(ctx: &TestContext) -> TestResult
             };
         }
     }
-    for &cap in &taken[..n]
+    for &cap in taken.iter().take(n)
     {
         if Some(cap) == still_mapped
         {

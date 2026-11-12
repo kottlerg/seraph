@@ -29,13 +29,17 @@ pub fn top_page_unmappable(ctx: &TestContext) -> TestResult
     // The top user page is the first unmappable one: `UserVaTop` itself.
     let top_user_page = system_info(SystemInfoType::UserVaTop as u64)
         .map_err(|_| "user_half_top: system_info(UserVaTop) failed")?;
-    let limit = top_user_page + PAGE_SIZE;
+    let limit = top_user_page
+        .checked_add(PAGE_SIZE)
+        .ok_or("user_half_top: UserVaTop plus a page overflows")?;
     if limit != 1 << 47 && limit != 1 << 56
     {
         return Err("user_half_top: UserVaTop is not one page under a canonical-half limit");
     }
     // The page just below it, the highest one a process may map.
-    let highest_mappable_page = top_user_page - PAGE_SIZE;
+    let highest_mappable_page = top_user_page
+        .checked_sub(PAGE_SIZE)
+        .ok_or("user_half_top: UserVaTop is below one page")?;
 
     let frame = crate::frame_pool::alloc().ok_or("user_half_top: frame pool exhausted")?;
 

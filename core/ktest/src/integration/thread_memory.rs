@@ -57,6 +57,10 @@ const PAGE: u64 = 4096;
 
 /// ktest scratch VA of the two shared data pages (crate docs § Scratch VAs).
 const KT_DATA: u64 = 0x1_6A00_0000;
+/// ktest's addresses of the bytes the straddling write covers, from 2048 bytes
+/// into the data pages for `MAX_THREAD_MEM_COPY` bytes.
+const STRADDLE: u64 = KT_DATA + 2048;
+const STRADDLE_END: u64 = STRADDLE + MAX_THREAD_MEM_COPY as u64;
 /// ktest scratch VA where the text page is written before B maps it.
 const KT_TEXT: u64 = 0x1_6B00_0000;
 /// ktest scratch VA of the shared text page's second mapping.
@@ -125,7 +129,7 @@ impl Frames
             let Some(f) = crate::frame_pool::alloc()
             else
             {
-                for f in &caps[..i]
+                for f in caps.iter().take(i)
                 {
                     // SAFETY: allocated above, never mapped.
                     unsafe { crate::frame_pool::free(*f) };
@@ -274,13 +278,13 @@ fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect, lent]: [u6
             .and_then(|()| mem_map(d1, b, B_DATA + PAGE, 0, 1, MAP_WRITABLE))
     }
     .map_err(|_| "integration::thread_memory: B data mem_map failed")?;
-    for i in 0..2 * PAGE
+    for (i, addr) in (KT_DATA..KT_DATA + 2 * PAGE).enumerate()
     {
         // SAFETY: KT_DATA..+2 pages is mapped writable just above.
         // cast_possible_truncation: the pattern keeps the low byte on purpose.
         #[allow(clippy::cast_possible_truncation)]
         unsafe {
-            ((KT_DATA + i) as *mut u8).write_volatile(i as u8 ^ 0x5A);
+            (addr as *mut u8).write_volatile(i as u8 ^ 0x5A);
         };
     }
 
@@ -357,7 +361,11 @@ fn data_copies(th: u64) -> TestResult
     {
         // cast_possible_truncation: the pattern keeps the low byte on purpose.
         #[allow(clippy::cast_possible_truncation)]
-        let want = (PAGE - 100 + i as u64) as u8 ^ 0x5A;
+        let want = (PAGE - 100)
+            .checked_add(i as u64)
+            .ok_or("integration::thread_memory: pattern offset overflows")?
+            as u8
+            ^ 0x5A;
         if *byte != want
         {
             return Err("integration::thread_memory: straddling read returned other bytes");
@@ -370,10 +378,10 @@ fn data_copies(th: u64) -> TestResult
     // SAFETY: the thread's space is B, not ktest's.
     unsafe { thread_write_mem(th, start, &new, 0) }
         .map_err(|_| "integration::thread_memory: straddling write failed")?;
-    for i in 0..MAX_THREAD_MEM_COPY as u64
+    for addr in STRADDLE..STRADDLE_END
     {
-        // SAFETY: KT_DATA..+2 pages is mapped; 2048 + i < 2 pages.
-        if unsafe { ((KT_DATA + 2048 + i) as *const u8).read_volatile() } != 0xA7
+        // SAFETY: KT_DATA..+2 pages is mapped; the range ends within 2 pages.
+        if unsafe { (addr as *const u8).read_volatile() } != 0xA7
         {
             return Err("integration::thread_memory: straddling write did not land");
         }
@@ -397,10 +405,10 @@ fn refusals(th: u64) -> TestResult
     {
         return Err("integration::thread_memory: a write into an unmapped page was not refused");
     }
-    for i in 0..8
+    for addr in (KT_DATA + 2 * PAGE - 8)..(KT_DATA + 2 * PAGE)
     {
-        // SAFETY: KT_DATA's second page is mapped; i < 8.
-        if unsafe { ((KT_DATA + 2 * PAGE - 8 + i) as *const u8).read_volatile() } == 0x3C
+        // SAFETY: KT_DATA's second page is mapped; the range is its last 8 bytes.
+        if unsafe { (addr as *const u8).read_volatile() } == 0x3C
         {
             return Err("integration::thread_memory: a refused write changed memory");
         }

@@ -64,7 +64,11 @@ const REPORT_MS: u64 = 1000;
 /// Waiter `k`'s verdict bits.
 const fn waiter_bits(k: u32, bits: u64) -> u64
 {
-    bits << (k * WAITER_SHIFT)
+    match bits.checked_shl(k.saturating_mul(WAITER_SHIFT))
+    {
+        Some(shifted) => shifted,
+        None => 0,
+    }
 }
 
 // ── SYS_CAP_CREATE_WAIT_SET capacity ─────────────────────────────────────────
@@ -103,12 +107,18 @@ pub fn capacity_is_caller_sized(ctx: &TestContext) -> TestResult
 /// notifications, refuse one more, and wake on the last member.
 fn fill_and_wake(ctx: &TestContext, ws: u64, sigs: &mut [u64]) -> TestResult
 {
-    let last = sigs.len() - 1;
+    let last = sigs
+        .len()
+        .checked_sub(1)
+        .ok_or("wait_set::capacity: no notifications to add")?;
+    let woken = last
+        .checked_sub(1)
+        .ok_or("wait_set::capacity: too few notifications to add")?;
     for (i, sig) in sigs.iter_mut().enumerate()
     {
         *sig = cap_create_notification(ctx.memory_base)
             .map_err(|_| "wait_set::capacity: cap_create_notification failed")?;
-        let added = wait_set_add(ws, *sig, 0x1000 + i as u64);
+        let added = wait_set_add(ws, *sig, 0x1000u64.saturating_add(i as u64));
         if i < last && added.is_err()
         {
             return Err("wait_set::capacity: an add within the capacity was refused");
@@ -118,11 +128,15 @@ fn fill_and_wake(ctx: &TestContext, ws: u64, sigs: &mut [u64]) -> TestResult
             return Err("wait_set::capacity: an add past the capacity was accepted");
         }
     }
-    notification_send(sigs[last - 1], 0x1)
+    let woken_sig = sigs
+        .get(woken)
+        .copied()
+        .ok_or("wait_set::capacity: member index out of range")?;
+    notification_send(woken_sig, 0x1)
         .map_err(|_| "wait_set::capacity: notification_send failed")?;
     let badge = wait_set_wait(ws).map_err(|_| "wait_set::capacity: wait_set_wait failed")?;
-    notification_wait(sigs[last - 1]).ok();
-    if badge != 0x1000 + (last - 1) as u64
+    notification_wait(woken_sig).ok();
+    if badge != 0x1000u64.saturating_add(woken as u64)
     {
         return Err("wait_set::capacity: the wait returned the wrong member's badge");
     }
@@ -699,7 +713,11 @@ fn shared_run(ctx: &TestContext, member: SharedMember, sh: &mut Shared) -> TestR
     {
         let spawned = crate::spawn::new_child(ctx)
             .map_err(|_| "wait_set::shared_set_waiters: spawn::new_child failed")?;
-        let child = sh.waiters[k].insert(spawned);
+        let child = sh
+            .waiters
+            .get_mut(k)
+            .ok_or("wait_set::shared_set_waiters: waiter index out of range")?
+            .insert(spawned);
         start_shared_child(child, k, entry, ws, done)?;
         // cast_possible_truncation: k < 2.
         #[allow(clippy::cast_possible_truncation)]
@@ -754,21 +772,25 @@ fn arrive(
     match member
     {
         SharedMember::Notification => notification_send(source, 0x1).map_err(|_| err),
-        SharedMember::EventQueue => event_post(source, 0xA0 + n as u64).map_err(|_| err),
+        SharedMember::EventQueue =>
+        {
+            event_post(source, 0xA0u64.saturating_add(n as u64)).map_err(|_| err)
+        }
         SharedMember::Endpoint =>
         {
             let entries: [extern "C" fn(u64) -> !; 2] = [shared_caller_0, shared_caller_1];
-            let caller = sh.callers[n].insert(crate::spawn::new_child(ctx).map_err(|_| err)?);
+            let caller = sh
+                .callers
+                .get_mut(n)
+                .ok_or(err)?
+                .insert(crate::spawn::new_child(ctx).map_err(|_| err)?);
             let c_ep = cap_copy(source, caller.cs, RIGHTS_EP_SEND_GRANT).map_err(|_| err)?;
-            // SAFETY: each caller stack belongs to one of this phase's two
-            // callers, which the phase deletes before returning; unit tests
-            // run sequentially.
-            let stack_top =
-                ChildStack::top(unsafe { core::ptr::addr_of!(SHARED_CALLER_STACKS[n]) });
+            let stack_top = ChildStack::top_at(core::ptr::addr_of!(SHARED_CALLER_STACKS), n)?;
+            let entry = *entries.get(n).ok_or(err)?;
             // SAFETY: the stack is `SHARED_CALLER_STACKS[n]`, this test's own
             // `ChildStack`, on which no other live thread runs (`ChildStack`'s
             // rule).
-            unsafe { crate::spawn::configure_and_start(caller, entries[n], stack_top, c_ep) }
+            unsafe { crate::spawn::configure_and_start(caller, entry, stack_top, c_ep) }
                 .map_err(|_| err)
         }
     }
@@ -788,9 +810,7 @@ fn start_shared_child(
         .map_err(|_| "wait_set: cap_copy(ws) for a waiter failed")?;
     let c_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "wait_set: cap_copy(done) for a waiter failed")?;
-    // SAFETY: each shared stack belongs to one child of the running test,
-    // which deletes it before returning; unit tests run sequentially.
-    let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(SHARED_STACKS[stack]) });
+    let stack_top = ChildStack::top_at(core::ptr::addr_of!(SHARED_STACKS), stack)?;
     // SAFETY: `stack` < 2; the entry's previous child (a waiter of an earlier
     // test, phase, or run, deleted before it returned) has exited, and this
     // one has not started.
@@ -1171,11 +1191,15 @@ extern "C" fn shared_waiter_1(arg: u64) -> !
 /// receives on: the call stays queued until the phase deletes the caller.
 fn shared_caller(ep: u64, n: usize) -> !
 {
-    // SAFETY: `n` < 2; the page is caller `n`'s own, registered by one thread
-    // at a time (`IpcPage`'s rule); no Rust object lives in it, and the thread
-    // reaches it only through the raw `buf` pointer.
-    let buf = unsafe { core::ptr::addr_of_mut!(SHARED_CALLER_PAGES[n]) }.cast::<u64>();
-    // SAFETY: as above.
+    let Some(page) = crate::elem_ptr_mut(core::ptr::addr_of_mut!(SHARED_CALLER_PAGES), n)
+    else
+    {
+        thread_exit()
+    };
+    let buf = page.cast::<u64>();
+    // SAFETY: the page is caller `n`'s own, registered by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the thread reaches
+    // it only through the raw `buf` pointer.
     if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()

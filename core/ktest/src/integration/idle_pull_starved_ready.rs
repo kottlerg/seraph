@@ -133,7 +133,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: idle_pull_starved_ready SKIP (no SchedControl cap in initial cap set)");
         return Ok(());
     }
-    let cpu = u32::try_from(cpus - 1).map_err(|_| "idle_pull_starved_ready: CPU count past u32")?;
+    let cpu = u32::try_from(cpus.saturating_sub(1))
+        .map_err(|_| "idle_pull_starved_ready: CPU count past u32")?;
 
     STOP.store(false, Ordering::Release);
     let done = cap_create_notification(ctx.memory_base)

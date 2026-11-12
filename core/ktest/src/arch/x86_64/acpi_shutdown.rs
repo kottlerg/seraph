@@ -100,14 +100,26 @@ fn locate_fadt_fields(info: &InitInfo) -> Option<(u16, u64)>
     // The mapping covers `region_size` bytes from the region base; every
     // field read below ends at or before X_DSDT's last byte, so a FADT
     // whose X_DSDT would cross the region's end is refused unread.
-    if table_off as u64 + FADT_END as u64 > region_size
+    let table_vaddr = if (table_off as u64)
+        .checked_add(FADT_END as u64)
+        .is_some_and(|end| end <= region_size)
+    {
+        ACPI_MAP_BASE
+            .checked_add(region_phys & 0xFFF)
+            .and_then(|base| base.checked_add(table_off as u64))
+    }
+    else
+    {
+        None
+    };
+    let Some(table_vaddr) = table_vaddr
+    else
     {
         // SAFETY: `ACPI_MAP_BASE` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
         let _ = unsafe { syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages) };
         return None;
-    }
-    let table_vaddr = ACPI_MAP_BASE + (region_phys & 0xFFF) + table_off as u64;
+    };
     // SAFETY: find_table_in_acpi_regions mapped the region, and the check
     // above keeps [table_vaddr, table_vaddr + FADT_END) inside it, which
     // covers PM1a_CNT_BLK (offset 64, 4 bytes).
@@ -145,11 +157,14 @@ fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
             continue;
         }
         if d.slot < info.acpi_region_memory_base
-            || d.slot >= info.acpi_region_memory_base + info.acpi_region_memory_count
+            || d.slot
+                >= info
+                    .acpi_region_memory_base
+                    .saturating_add(info.acpi_region_memory_count)
         {
             continue;
         }
-        if dsdt_phys < d.aux0 || dsdt_phys >= d.aux0 + d.aux1
+        if dsdt_phys < d.aux0 || dsdt_phys >= d.aux0.saturating_add(d.aux1)
         {
             continue;
         }
@@ -175,9 +190,12 @@ fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
             continue;
         }
 
-        let table_off = dsdt_phys - region_phys;
-        let dsdt_vaddr = vaddr + (region_phys & 0xFFF) + table_off;
-        let result = parse_mapped_dsdt(dsdt_vaddr, region_size - table_off);
+        let result = dsdt_phys.checked_sub(region_phys).and_then(|table_off| {
+            let dsdt_vaddr = vaddr
+                .checked_add(region_phys & 0xFFF)?
+                .checked_add(table_off)?;
+            parse_mapped_dsdt(dsdt_vaddr, region_size.checked_sub(table_off)?)
+        });
         // SAFETY: `vaddr` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
         let _ = unsafe { syscall::mem_unmap(info.aspace_cap, vaddr, pages) };
@@ -225,7 +243,10 @@ fn find_table_in_acpi_regions(
             continue;
         }
         if d.slot < info.acpi_region_memory_base
-            || d.slot >= info.acpi_region_memory_base + info.acpi_region_memory_count
+            || d.slot
+                >= info
+                    .acpi_region_memory_base
+                    .saturating_add(info.acpi_region_memory_count)
         {
             continue;
         }
@@ -250,8 +271,10 @@ fn find_table_in_acpi_regions(
             continue;
         }
 
-        let region_vaddr = map_vaddr + (region_phys & 0xFFF);
-        if let Some(off) = scan_for_signature(region_vaddr, region_size, sig)
+        let found = map_vaddr
+            .checked_add(region_phys & 0xFFF)
+            .and_then(|region_vaddr| scan_for_signature(region_vaddr, region_size, sig));
+        if let Some(off) = found
         {
             return Some((d.slot, region_phys, region_size, off));
         }
@@ -266,7 +289,7 @@ fn find_table_in_acpi_regions(
 /// Pages needed to cover a region whose physical base may be page-offset.
 fn pages_for(phys: u64, size: u64) -> u64
 {
-    ((phys & 0xFFF) + size).div_ceil(0x1000)
+    (phys & 0xFFF).saturating_add(size).div_ceil(0x1000)
 }
 
 /// Scan `len` bytes starting at `vaddr` for a 4-byte ACPI signature on a
@@ -281,16 +304,9 @@ fn scan_for_signature(vaddr: u64, len: u64, sig: [u8; 4]) -> Option<usize>
     // SAFETY: caller-mapped region of `len` bytes at vaddr.
     let bytes = unsafe { core::slice::from_raw_parts(vaddr as *const u8, len) };
     let last = len.saturating_sub(4);
-    let mut off = 0;
-    while off <= last
-    {
-        if bytes[off..off + 4] == sig
-        {
-            return Some(off);
-        }
-        off += 16;
-    }
-    None
+    (0..=last)
+        .step_by(16)
+        .find(|&off| bytes.get(off..).and_then(|rest| rest.first_chunk::<4>()) == Some(&sig))
 }
 
 // ── DSDT scanning ───────────────────────────────────────────────────────────
@@ -311,7 +327,7 @@ fn scan_dsdt_for_s5(dsdt_data: u64, dsdt_len: usize) -> Option<u16>
 
     for i in 36..dsdt_len.saturating_sub(4)
     {
-        if dsdt[i..i + 4] != s5_sig
+        if dsdt.get(i..).and_then(|rest| rest.first_chunk::<4>()) != Some(&s5_sig)
         {
             continue;
         }
@@ -324,41 +340,34 @@ fn scan_dsdt_for_s5(dsdt_data: u64, dsdt_len: usize) -> Option<u16>
         // Encoding: [NameOp(08)] _S5_ PackageOp(12) PkgLength NumElements elem0...
         // Or:       _S5_ PackageOp(12) PkgLength NumElements elem0...
 
-        let pkg_start = i + 4;
-        if pkg_start >= dsdt_len || dsdt[pkg_start] != 0x12
+        let pkg_start = i.checked_add(4)?;
+        if dsdt.get(pkg_start) != Some(&0x12)
         {
             continue;
         }
 
-        let pkg_len_start = pkg_start + 1;
-        if pkg_len_start >= dsdt_len
-        {
-            return None;
-        }
+        let pkg_len_start = pkg_start.checked_add(1)?;
 
         // PkgLength: lead byte bits [7:6] encode follow-byte count.
-        let lead = dsdt[pkg_len_start];
+        let lead = *dsdt.get(pkg_len_start)?;
         let follow_bytes = (lead >> 6) as usize;
-        let num_elements_off = pkg_len_start + 1 + follow_bytes;
+        let num_elements_off = pkg_len_start.checked_add(1)?.checked_add(follow_bytes)?;
         if num_elements_off >= dsdt_len
         {
             return None;
         }
 
         // Skip NumElements byte, read first element (`SLP_TYPa`).
-        let first = num_elements_off + 1;
-        if first >= dsdt_len
-        {
-            return None;
-        }
+        let first = num_elements_off.checked_add(1)?;
+        let element = *dsdt.get(first)?;
+        let operand = dsdt.get(first.checked_add(1)?..);
 
-        return match dsdt[first]
+        return match element
         {
-            0x0A if first + 1 < dsdt_len => Some(u16::from(dsdt[first + 1])),
-            0x0B if first + 2 < dsdt_len =>
-            {
-                Some(u16::from_le_bytes([dsdt[first + 1], dsdt[first + 2]]))
-            }
+            0x0A => operand?.first().map(|&b| u16::from(b)),
+            0x0B => operand?
+                .first_chunk::<2>()
+                .map(|&bytes| u16::from_le_bytes(bytes)),
             // ZeroOp (0x00) and OneOp (0x01) are AML integer constants.
             0x00 => Some(0),
             0x01 => Some(1),

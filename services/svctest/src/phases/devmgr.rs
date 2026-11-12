@@ -483,7 +483,10 @@ fn assert_holds_returned(memmgr: u64, free_before: u64)
     let mut free_after = free_bytes(memmgr, ipc_buf);
     for _ in 0..RECLAIM_POLLS
     {
-        if free_after + margin >= free_before
+        if free_after
+            .checked_add(margin)
+            .expect("devmgr_on_demand_bind: free_after + margin overflowed")
+            >= free_before
         {
             break;
         }
@@ -491,7 +494,10 @@ fn assert_holds_returned(memmgr: u64, free_before: u64)
         free_after = free_bytes(memmgr, ipc_buf);
     }
     assert!(
-        free_after + margin >= free_before,
+        free_after
+            .checked_add(margin)
+            .expect("devmgr_on_demand_bind: free_after + margin overflowed")
+            >= free_before,
         "devmgr_on_demand_bind: the never-ready or the refusing fixture's pages did not \
          return (free_before={free_before} free_after={free_after}); it was not destroyed"
     );

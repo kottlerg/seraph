@@ -41,6 +41,9 @@ use core::marker::PhantomData;
 /// Size of a single physical page in bytes.
 pub const PAGE_SIZE: usize = 4096;
 
+/// [`PAGE_SIZE`] as a `u64`, a constant divisor for physical byte counts.
+const PAGE_BYTES: u64 = PAGE_SIZE as u64;
+
 /// Maximum allocation order. Order N spans 2^N pages (4 KiB..8 MiB). Its
 /// sizing envelope is specified in core/kernel/docs/memory-internals.md
 /// § Data Structures.
@@ -182,13 +185,17 @@ impl<W: PhysWindow> BuddyAllocator<W>
         // docs/memory-model.md § Buddy Allocator.
         let start = start.max(PAGE_SIZE as u64);
 
-        if start >= end
+        let Some(bytes) = end.checked_sub(start).filter(|&bytes| bytes != 0)
+        else
         {
             return;
-        }
+        };
 
-        // Track the running total of installed pages this allocator manages.
-        self.total_pages += ((end - start) / PAGE_SIZE as u64) as usize;
+        // Track the running total of installed pages this allocator manages:
+        // pages of the address space, far below the saturation point.
+        self.total_pages = self
+            .total_pages
+            .saturating_add((bytes / PAGE_BYTES) as usize);
 
         // SAFETY: the caller's region is free RAM reachable through W and
         // accessed by nothing else.
@@ -205,22 +212,24 @@ impl<W: PhysWindow> BuddyAllocator<W>
     unsafe fn push_span(&mut self, start: u64, end: u64)
     {
         let mut cursor = start;
-        while cursor < end
+        while let Some(remaining) = end.checked_sub(cursor).filter(|&bytes| bytes != 0)
         {
-            let remaining_pages = ((end - cursor) / PAGE_SIZE as u64) as usize;
+            let remaining_pages = (remaining / PAGE_BYTES) as usize;
             // Greedily pick the largest order that fits and is naturally aligned.
             let order = (0..=MAX_ORDER)
                 .rev()
                 .find(|&o| {
-                    let pages = 1usize << o;
-                    pages <= remaining_pages && cursor.is_multiple_of((PAGE_SIZE * pages) as u64)
+                    (1usize << o) <= remaining_pages
+                        && cursor.is_multiple_of((PAGE_SIZE << o) as u64)
                 })
                 .unwrap_or(0);
 
             // SAFETY: the block lies in the caller's span (this function's
             // contract).
             unsafe { self.push_block(order, cursor) };
-            cursor += (PAGE_SIZE << order) as u64;
+            // The block ends at or before `end`; a saturated cursor would end
+            // the walk.
+            cursor = cursor.saturating_add((PAGE_SIZE << order) as u64);
         }
     }
 
@@ -250,17 +259,22 @@ impl<W: PhysWindow> BuddyAllocator<W>
         }
 
         // Find the smallest available order >= requested.
-        let source_order = (order..=MAX_ORDER).find(|&o| self.free_lists[o] != NONE)?;
+        let (source_order, _) = self
+            .free_lists
+            .iter()
+            .enumerate()
+            .skip(order)
+            .find(|&(_, &head)| head != NONE)?;
 
         let block = self.pop_block(source_order)?;
 
         // Split the oversized block down to the requested order, pushing each
         // upper half onto the free list for its respective order.
-        let mut current_order = source_order;
-        while current_order > order
+        for current_order in (order..source_order).rev()
         {
-            current_order -= 1;
-            let buddy_addr = block + (PAGE_SIZE << current_order) as u64;
+            // The upper half lies inside the popped block, so its address
+            // does not wrap.
+            let buddy_addr = block.wrapping_add((PAGE_SIZE << current_order) as u64);
             // SAFETY: the upper half of a block popped from a free list is
             // free RAM the allocator owns.
             unsafe { self.push_block(current_order, buddy_addr) };
@@ -300,8 +314,15 @@ impl<W: PhysWindow> BuddyAllocator<W>
         let block_bytes = (PAGE_SIZE << MAX_ORDER) as u64;
 
         let sorted = self.sort_orders(MAX_ORDER, MAX_ORDER);
-        let run = Self::find_run(sorted, blocks, block_bytes);
-        let (run_lo, run_hi) = run.map_or((NONE, NONE), |b| (b, b + blocks * block_bytes));
+        // The run and its end; `find_run` finds only address-adjacent blocks,
+        // so the end is an address.
+        let run = Self::find_run(sorted, blocks, block_bytes).and_then(|base| {
+            let end = blocks
+                .checked_mul(block_bytes)
+                .and_then(|bytes| base.checked_add(bytes))?;
+            Some((base, end))
+        });
+        let (run_lo, run_hi) = run.unwrap_or((NONE, NONE));
 
         // Re-list every block outside the run.
         let mut cursor = sorted;
@@ -318,10 +339,15 @@ impl<W: PhysWindow> BuddyAllocator<W>
             cursor = next;
         }
 
-        let base = run?;
+        let (base, run_hi) = run?;
+        // The run holds `pages`, so the tail starts inside it.
+        let tail = (pages as u64)
+            .checked_mul(PAGE_SIZE as u64)
+            .and_then(|bytes| base.checked_add(bytes))
+            .unwrap_or(run_hi);
         // SAFETY: the run's tail past `pages` is free RAM taken off the free
         // list above; nothing else references it.
-        unsafe { self.push_span(base + (pages * PAGE_SIZE) as u64, run_hi) };
+        unsafe { self.push_span(tail, run_hi) };
         // SAFETY: `base` was free until taken off the list; the caller now owns it.
         unsafe { W::header(base).write(FreeHeader { next: 0, order: 0 }) };
         Some(base)
@@ -333,19 +359,25 @@ impl<W: PhysWindow> BuddyAllocator<W>
     {
         let mut base = NONE;
         let mut len = 0u64;
+        // The end of the run so far: the address its next block must have.
+        let mut run_end = NONE;
         let mut cursor = head;
         while cursor != NONE
         {
-            if len == 0 || base + len * block_bytes != cursor
+            if len == 0 || cursor != run_end
             {
                 base = cursor;
                 len = 0;
             }
-            len += 1;
+            // At most `blocks`: the run is returned on reaching it.
+            len = len.saturating_add(1);
             if len == blocks
             {
                 return Some(base);
             }
+            // A block that ends at the end of the address space has no
+            // successor; NONE matches no block.
+            run_end = cursor.checked_add(block_bytes).unwrap_or(NONE);
             // SAFETY: `cursor` is a free block on the sorted chain.
             cursor = unsafe { (*W::header(cursor)).next };
         }
@@ -381,7 +413,8 @@ impl<W: PhysWindow> BuddyAllocator<W>
             {
                 // Merge: the coalesced block begins at the lower address.
                 current_addr = current_addr.min(buddy);
-                current_order += 1;
+                // Below MAX_ORDER here, so the order stays within it.
+                current_order = current_order.saturating_add(1);
             }
             else
             {
@@ -434,7 +467,10 @@ impl<W: PhysWindow> BuddyAllocator<W>
         debug_assert!(base.is_multiple_of(PAGE_SIZE as u64));
         debug_assert!(size_bytes.is_multiple_of(PAGE_SIZE as u64));
         let _ = base;
-        self.total_pages += (size_bytes / PAGE_SIZE as u64) as usize;
+        // Pages of the address space, far below the saturation point.
+        self.total_pages = self
+            .total_pages
+            .saturating_add((size_bytes / PAGE_BYTES) as usize);
     }
 
     /// Free a range `[base, base + size_bytes)` into the buddy as order-0
@@ -467,15 +503,12 @@ impl<W: PhysWindow> BuddyAllocator<W>
             "post-handoff buddy free — owns_memory cap destroyed after handoff (accounting violation)"
         );
 
-        let page_size = PAGE_SIZE as u64;
-        let mut addr = base;
-        let end = base + size_bytes;
-        while addr < end
+        // The range is RAM (contract), so it ends inside the address space.
+        for addr in (base..base.saturating_add(size_bytes)).step_by(PAGE_SIZE)
         {
             // SAFETY: caller's contract — each page was previously allocated
             // and is no longer accessed.
             unsafe { self.free(addr, 0) };
-            addr += page_size;
         }
     }
 
@@ -523,14 +556,20 @@ impl<W: PhysWindow> BuddyAllocator<W>
             let size = (PAGE_SIZE as u64) << header.order;
             current = match current
             {
-                Some((base, len)) if base + len == cursor => Some((base, len + size)),
+                // The extent ends at the block's end, an address, so its
+                // length does not saturate.
+                Some((base, len)) if base.checked_add(len) == Some(cursor) =>
+                {
+                    Some((base, len.saturating_add(size)))
+                }
                 Some((base, len)) =>
                 {
                     if extents < capacity
                     {
                         emit(extents, base, len);
                     }
-                    extents += 1;
+                    // At most the free blocks' count.
+                    extents = extents.saturating_add(1);
                     Some((cursor, size))
                 }
                 None => Some((cursor, size)),
@@ -543,7 +582,7 @@ impl<W: PhysWindow> BuddyAllocator<W>
             {
                 emit(extents, base, len);
             }
-            extents += 1;
+            extents = extents.saturating_add(1);
         }
 
         if extents > capacity
@@ -573,9 +612,14 @@ impl<W: PhysWindow> BuddyAllocator<W>
             let header = unsafe { W::header(cursor).read() };
             if cursor != run_end
             {
-                extents += 1;
+                // At most the free blocks' count.
+                extents = extents.saturating_add(1);
             }
-            run_end = cursor + ((PAGE_SIZE as u64) << header.order);
+            // A block that ends at the end of the address space has no
+            // successor; NONE matches no block.
+            run_end = cursor
+                .checked_add((PAGE_SIZE as u64) << header.order)
+                .unwrap_or(NONE);
             // cast_possible_truncation: a header's order is at most MAX_ORDER.
             #[allow(clippy::cast_possible_truncation)]
             // SAFETY: the block left its free list in `drain_sorted` and the
@@ -597,33 +641,44 @@ impl<W: PhysWindow> BuddyAllocator<W>
     /// # Safety
     ///
     /// `addr` is a free block of `2^order` pages that the allocator owns and
-    /// `W` reaches.
+    /// `W` reaches. `order` is at most [`MAX_ORDER`]; a block of a larger
+    /// order, which has no list, is left off every list.
     unsafe fn push_block(&mut self, order: usize, addr: u64)
     {
+        debug_assert!(order <= MAX_ORDER, "push_block: order past MAX_ORDER");
+        let Some(head) = self.free_lists.get_mut(order)
+        else
+        {
+            return;
+        };
         // SAFETY: caller's contract.
         unsafe {
             W::header(addr).write(FreeHeader {
-                next: self.free_lists[order],
+                next: *head,
                 order: order as u64,
             });
         }
-        self.free_lists[order] = addr;
-        self.free_pages += 1 << order;
+        *head = addr;
+        // Pages of the address space, far below the saturation point.
+        self.free_pages = self.free_pages.saturating_add(1 << order);
     }
 
-    /// Pop the head block from the free list for `order`. Returns `None` if empty.
+    /// Pop the head block from the free list for `order`. Returns `None` if
+    /// empty, or if `order` names no list.
     fn pop_block(&mut self, order: usize) -> Option<u64>
     {
-        let addr = self.free_lists[order];
+        let head = self.free_lists.get_mut(order)?;
+        let addr = *head;
         if addr == NONE
         {
             return None;
         }
         // SAFETY: `addr` heads a free list, so it is a free block whose header
         // `push_block` wrote and W reaches.
-        let next = unsafe { (*W::header(addr)).next };
-        self.free_lists[order] = next;
-        self.free_pages -= 1 << order;
+        *head = unsafe { (*W::header(addr)).next };
+        // `push_block` counted the block's pages, so the count does not
+        // saturate.
+        self.free_pages = self.free_pages.saturating_sub(1 << order);
         Some(addr)
     }
 
@@ -632,13 +687,18 @@ impl<W: PhysWindow> BuddyAllocator<W>
     /// Returns `true` if found and removed, with its header cleared. O(n) in
     /// list length; acceptable at boot time. Reads only the headers of blocks
     /// on the list, never the target unless it is on the list, since it may be
-    /// allocated.
+    /// allocated. `false` when `order` names no list.
     fn remove_block(&mut self, order: usize, target: u64) -> bool
     {
+        let Some(head) = self.free_lists.get_mut(order)
+        else
+        {
+            return false;
+        };
         // `prev` is the block whose header links to `cur`
         // (NONE means `free_lists[order]` itself points to `cur`).
         let mut prev = NONE;
-        let mut cur = self.free_lists[order];
+        let mut cur = *head;
 
         while cur != NONE
         {
@@ -648,7 +708,7 @@ impl<W: PhysWindow> BuddyAllocator<W>
             {
                 if prev == NONE
                 {
-                    self.free_lists[order] = next;
+                    *head = next;
                 }
                 else
                 {
@@ -661,7 +721,9 @@ impl<W: PhysWindow> BuddyAllocator<W>
                 // SAFETY: `cur` was free until the unlink above; the caller
                 // owns it as part of the block being merged.
                 unsafe { W::header(cur).write(FreeHeader { next: 0, order: 0 }) };
-                self.free_pages -= 1 << order;
+                // `push_block` counted the block's pages, so the count does
+                // not saturate.
+                self.free_pages = self.free_pages.saturating_sub(1 << order);
                 return true;
             }
             prev = cur;
@@ -854,6 +916,17 @@ mod tests
     {
         let mut alloc = with_region(1 << MAX_ORDER);
         assert_eq!(alloc.alloc(MAX_ORDER + 1), None);
+    }
+
+    // Defect caught: a list operation that indexes past the free lists for an
+    // order no list has, instead of finding nothing there.
+    #[test]
+    fn an_order_past_max_order_has_no_list()
+    {
+        let mut alloc = with_region(1 << MAX_ORDER);
+        assert_eq!(alloc.pop_block(MAX_ORDER + 1), None);
+        assert!(!alloc.remove_block(MAX_ORDER + 1, BASE));
+        assert_eq!(alloc.free_page_count(), 1 << MAX_ORDER);
     }
 
     #[test]

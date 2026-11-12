@@ -24,6 +24,8 @@
 //! touches only `core` slice operations — see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
@@ -74,10 +76,20 @@ pub fn blob_span(
 /// lies past both blobs, is filled across it.
 pub fn fill_window(dst: &mut [u8], base: usize, args: &[u8], env: &[u8])
 {
-    let end = base + dst.len();
-    let args_part = &args[base.min(args.len())..end.min(args.len())];
-    let env_part = &env[base.saturating_sub(args.len()).min(env.len())
-        ..end.saturating_sub(args.len()).min(env.len())];
+    // A window ending past `usize::MAX` lies past both blobs from there on,
+    // so its end saturates.
+    let end = base.saturating_add(dst.len());
+    // Each range is clamped to its blob with `start <= end`, so `get` always
+    // finds it.
+    let args_part = args
+        .get(base.min(args.len())..end.min(args.len()))
+        .unwrap_or_default();
+    let env_part = env
+        .get(
+            base.saturating_sub(args.len()).min(env.len())
+                ..end.saturating_sub(args.len()).min(env.len()),
+        )
+        .unwrap_or_default();
     let (dst_args, rest) = dst.split_at_mut(args_part.len());
     dst_args.copy_from_slice(args_part);
     let (dst_env, tail) = rest.split_at_mut(env_part.len());
@@ -95,16 +107,11 @@ pub fn fill_window(dst: &mut [u8], base: usize, args: &[u8], env: &[u8])
 #[must_use]
 pub fn next_field(blob: &[u8], cursor: usize) -> Option<(&[u8], usize)>
 {
-    if cursor >= blob.len()
-    {
-        return None;
-    }
-    let end = match blob[cursor..].iter().position(|&b| b == 0)
-    {
-        Some(off) => cursor + off,
-        None => blob.len(),
-    };
-    Some((&blob[cursor..end], end.saturating_add(1)))
+    let rest = blob.get(cursor..).filter(|rest| !rest.is_empty())?;
+    let field = rest.split(|&b| b == 0).next()?;
+    // `cursor + field.len()` is at most `blob.len()`.
+    let end = cursor.saturating_add(field.len());
+    Some((field, end.saturating_add(1)))
 }
 
 /// Walk one NUL-terminated field of a blob backwards from `end`, the
@@ -119,17 +126,12 @@ pub fn next_field(blob: &[u8], cursor: usize) -> Option<(&[u8], usize)>
 pub fn prev_field(blob: &[u8], front: usize, end: usize) -> Option<(&[u8], usize)>
 {
     let end = end.min(blob.len());
-    if front >= end
-    {
-        return None;
-    }
-    let field_end = if blob[end - 1] == 0 { end - 1 } else { end };
-    let start = match blob[front..field_end].iter().rposition(|&b| b == 0)
-    {
-        Some(off) => front + off + 1,
-        None => front,
-    };
-    Some((&blob[start..field_end], start))
+    let rest = blob.get(front..end).filter(|rest| !rest.is_empty())?;
+    let body = rest.strip_suffix(&[0]).unwrap_or(rest);
+    let field = body.rsplit(|&b| b == 0).next()?;
+    // `field` is the tail of `body`, which starts at `front`.
+    let start = front.saturating_add(body.len().saturating_sub(field.len()));
+    Some((field, start))
 }
 
 /// Bound a blob to its first `count` fields, `count` being a spawner-supplied
@@ -150,7 +152,8 @@ pub fn bounded_fields(blob: &[u8], count: usize) -> (usize, usize)
             break;
         };
         end = next.min(blob.len());
-        fields += 1;
+        // `fields` is below `count`, so this cannot saturate.
+        fields = fields.saturating_add(1);
     }
     (end, fields)
 }
@@ -163,8 +166,10 @@ pub fn bounded_fields(blob: &[u8], count: usize) -> (usize, usize)
 #[must_use]
 pub fn split_key_value(entry: &[u8]) -> Option<(&[u8], &[u8])>
 {
-    let eq = entry.iter().position(|&b| b == b'=')?;
-    Some((&entry[..eq], &entry[eq + 1..]))
+    let mut halves = entry.splitn(2, |&b| b == b'=');
+    let key = halves.next()?;
+    let value = halves.next()?;
+    Some((key, value))
 }
 
 /// The value of `key` among the first `count` entries of an env blob, or
@@ -242,6 +247,16 @@ mod tests
             }
             assert_eq!(run, want, "window {window}");
         }
+    }
+
+    // The defect caught: a window whose end overflows `usize`, which wrapped
+    // to a small end (or panicked) instead of reading as past both blobs.
+    #[test]
+    fn a_window_ending_past_usize_max_is_zero_filled()
+    {
+        let mut run = [0xAAu8; 4];
+        fill_window(&mut run, usize::MAX - 1, b"one\0", b"K=v\0");
+        assert_eq!(run, [0; 4]);
     }
 
     #[test]

@@ -124,7 +124,9 @@ impl PackedSlots
     #[must_use]
     pub fn caps(&self) -> &[u64]
     {
-        &self.caps[..self.cap_count]
+        // `pack_slots` keeps `cap_count <= MSG_CAP_SLOTS_MAX`, so `get` always
+        // finds the range.
+        self.caps.get(..self.cap_count).unwrap_or_default()
     }
 
     /// The presence word, carried in the round's `data[0]`.
@@ -147,12 +149,16 @@ pub fn pack_slots(slots: &[u64]) -> PackedSlots
         cap_count: 0,
         presence: 0,
     };
+    let mut out = packed.caps.iter_mut();
     for (i, &cap) in slots.iter().take(MSG_CAP_SLOTS_MAX).enumerate()
     {
+        // At most `MSG_CAP_SLOTS_MAX` slots are read, so `out` holds one
+        // place for each present cap.
         if cap != 0
+            && let Some(place) = out.next()
         {
-            packed.caps[packed.cap_count] = cap;
-            packed.cap_count += 1;
+            *place = cap;
+            packed.cap_count = packed.cap_count.saturating_add(1);
             packed.presence |= 1 << i;
         }
     }
@@ -166,14 +172,22 @@ pub fn pack_slots(slots: &[u64]) -> PackedSlots
 /// # Errors
 /// [`bootstrap_errors::INVALID`] when the round carries no presence word,
 /// the word sets a bit at or above `MSG_CAP_SLOTS_MAX`, or it names a
-/// different number of caps than the round delivered.
+/// different number of caps than the round delivered, or the round's
+/// `cap_count` or `data_words` is past its array.
 pub fn unpack_slots(round: &BootstrapRound) -> Result<[u64; MSG_CAP_SLOTS_MAX], u64>
 {
-    if round.data_words == 0
-    {
-        return Err(bootstrap_errors::INVALID);
-    }
-    spread_slots(&round.caps[..round.cap_count], round.data[0])
+    let (caps, presence) = round_slots(round).ok_or(bootstrap_errors::INVALID)?;
+    spread_slots(caps, presence)
+}
+
+/// A round's delivered caps and the presence word in its `data[0]`; `None`
+/// when it carries no data word, or its `cap_count` or `data_words` is past
+/// its array.
+fn round_slots(round: &BootstrapRound) -> Option<(&[u64], u64)>
+{
+    let caps = round.caps.get(..round.cap_count)?;
+    let presence = *round.data.get(..round.data_words)?.first()?;
+    Some((caps, presence))
 }
 
 /// Spread one round's delivered `caps` over its `MSG_CAP_SLOTS_MAX`
@@ -227,11 +241,10 @@ pub const fn slot_round_count(slot_count: usize) -> usize
 /// [`SlotAccumulator`].
 pub fn slot_rounds(slots: &[u64]) -> impl Iterator<Item = PackedSlots> + '_
 {
-    (0..slot_round_count(slots.len())).map(move |k| {
-        let start = (k * MSG_CAP_SLOTS_MAX).min(slots.len());
-        let end = (start + MSG_CAP_SLOTS_MAX).min(slots.len());
-        pack_slots(&slots[start..end])
-    })
+    let empty = slots.is_empty().then(|| pack_slots(&[]));
+    empty
+        .into_iter()
+        .chain(slots.chunks(MSG_CAP_SLOTS_MAX).map(pack_slots))
 }
 
 /// Concatenates the windows of consecutive slot rounds (see
@@ -293,7 +306,8 @@ impl<const N: usize> SlotAccumulator<N>
                 None => overflow(cap),
             }
         }
-        self.rounds += 1;
+        // A saturated count puts every later cap past `N`, to `overflow`.
+        self.rounds = self.rounds.saturating_add(1);
         Ok(())
     }
 
@@ -352,11 +366,19 @@ pub unsafe fn request_round(creator_ep: u64, ipc_buf: *mut u64) -> Result<Bootst
                 delete_slots(reply_caps);
                 return Err(bootstrap_errors::INVALID);
             }
+            // `IpcMessage` holds at most `MSG_CAP_SLOTS_MAX` caps and
+            // `MSG_DATA_WORDS_MAX` words, so each copy covers its source.
             let mut caps = [0u64; MSG_CAP_SLOTS_MAX];
-            caps[..reply_caps.len()].copy_from_slice(reply_caps);
+            for (dst, &src) in caps.iter_mut().zip(reply_caps)
+            {
+                *dst = src;
+            }
             let mut data = [0u64; MSG_DATA_WORDS_MAX];
             let words = reply.words();
-            data[..words.len()].copy_from_slice(words);
+            for (dst, &src) in data.iter_mut().zip(words)
+            {
+                *dst = src;
+            }
             Ok(BootstrapRound {
                 caps,
                 cap_count: reply_caps.len(),
@@ -408,16 +430,14 @@ pub unsafe fn request_slots<const N: usize>(
                 return Err(code);
             }
         };
-        let delivered = &round.caps[..round.cap_count];
-        let pushed = if round.data_words == 0
+        // `request_round` keeps `cap_count <= MSG_CAP_SLOTS_MAX`.
+        let delivered = round.caps.get(..round.cap_count).unwrap_or_default();
+        let pushed = match round_slots(&round)
         {
-            Err(bootstrap_errors::INVALID)
-        }
-        else
-        {
-            acc.push(delivered, round.data[0], |cap| {
+            Some((caps, presence)) => acc.push(caps, presence, |cap| {
                 let _ = syscall::cap_delete(cap);
-            })
+            }),
+            None => Err(bootstrap_errors::INVALID),
         };
         if let Err(code) = pushed
         {
@@ -594,6 +614,20 @@ mod tests
         let mut round = received(&pack_slots(&[0x41]));
         round.data_words = 0;
         assert_eq!(unpack_slots(&round), Err(bootstrap_errors::INVALID));
+    }
+
+    // The defect caught: a round whose public counts are past their arrays,
+    // which panicked on the slice instead of reading as malformed.
+    #[test]
+    fn a_round_with_a_count_past_its_array_is_invalid()
+    {
+        let mut caps_past = received(&pack_slots(&[0x41]));
+        caps_past.cap_count = MSG_CAP_SLOTS_MAX + 1;
+        assert_eq!(unpack_slots(&caps_past), Err(bootstrap_errors::INVALID));
+
+        let mut words_past = received(&pack_slots(&[0x41]));
+        words_past.data_words = MSG_DATA_WORDS_MAX + 1;
+        assert_eq!(unpack_slots(&words_past), Err(bootstrap_errors::INVALID));
     }
 
     #[test]

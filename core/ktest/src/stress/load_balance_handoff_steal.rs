@@ -200,11 +200,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── Servers first: pinned round-robin, RECEIVE on a private endpoint. ────
     // Started, and reported entering `ipc_recv`, before the clients, so they
     // reply fast.
-    for j in 0..NUM_PAIRS
+    for (j, (ep_slot, server_slot)) in eps.iter_mut().zip(servers.iter_mut()).enumerate()
     {
         let ep = cap_create_endpoint(ctx.memory_base)
             .map_err(|_| "stress::load_balance_handoff_steal: cap_create_endpoint failed")?;
-        eps[j] = ep;
+        *ep_slot = ep;
 
         let server = spawn::new_child(ctx)
             .map_err(|_| "stress::load_balance_handoff_steal: spawn server failed")?;
@@ -224,17 +224,24 @@ pub fn run(ctx: &TestContext) -> TestResult
             )
         };
         // j < NUM_PAIRS <= u32::MAX; try_from keeps the narrow cast clippy-clean.
-        let server_cpu = u32::try_from(j).unwrap_or(0) % cpu_mod;
-        // SAFETY: server stacks occupy [NUM_PAIRS, 2*NUM_PAIRS); distinct per j.
-        let stack =
-            ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[NUM_PAIRS + j]) });
+        let server_cpu = u32::try_from(j)
+            .unwrap_or(0)
+            .checked_rem(cpu_mod)
+            .ok_or("stress::load_balance_handoff_steal: no CPUs")?;
+        // Server stacks occupy [NUM_PAIRS, 2*NUM_PAIRS); distinct per j.
+        let stack = ChildStack::top_at(
+            core::ptr::addr_of!(super::STRESS_STACKS),
+            NUM_PAIRS
+                .checked_add(j)
+                .ok_or("stress::load_balance_handoff_steal: server stack index overflows")?,
+        )?;
         // SAFETY: the stack is `super::STRESS_STACKS[NUM_PAIRS + j]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe {
             spawn::configure_and_start_pinned(&server, server_entry, stack, server_arg, server_cpu)
         }
         .map_err(|_| "stress::load_balance_handoff_steal: start server failed")?;
-        servers[j] = server;
+        *server_slot = server;
     }
 
     // Start the clients once every server is entering its first `ipc_recv`.
@@ -245,7 +252,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     else
     {
-        (1u64 << NUM_PAIRS) - 1
+        (1u64 << NUM_PAIRS).saturating_sub(1)
     };
     let mut ready_bits = 0u64;
     if let Err(e) = crate::tally::await_all(
@@ -257,11 +264,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         // Delete the servers, so none is left on a stack the following
         // cells reuse.
-        for j in 0..NUM_PAIRS
+        for (server, &ep) in servers.iter_mut().zip(eps.iter())
         {
-            servers[j].delete_thread().ok();
-            servers[j].delete_cspace().ok();
-            cap_delete(eps[j]).ok();
+            server.delete_thread().ok();
+            server.delete_cspace().ok();
+            cap_delete(ep).ok();
         }
         cap_delete(ready).ok();
         cap_delete(done).ok();
@@ -269,11 +276,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── Clients: UNPINNED (AFFINITY_ANY) so the balancer may steal them. ─────
-    for i in 0..NUM_PAIRS
+    for (i, (client_slot, &ep)) in clients.iter_mut().zip(eps.iter()).enumerate()
     {
         let client = spawn::new_child(ctx)
             .map_err(|_| "stress::load_balance_handoff_steal: spawn client failed")?;
-        let client_ep = cap_copy(eps[i], client.cs, RIGHTS_EP_SEND_GRANT)
+        let client_ep = cap_copy(ep, client.cs, RIGHTS_EP_SEND_GRANT)
             .map_err(|_| "stress::load_balance_handoff_steal: cap_copy client ep failed")?;
         let client_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::load_balance_handoff_steal: cap_copy client done failed")?;
@@ -288,13 +295,13 @@ pub fn run(ctx: &TestContext) -> TestResult
                 },
             )
         };
-        // SAFETY: client stacks occupy [0, NUM_PAIRS); distinct per i.
-        let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        // Client stacks occupy [0, NUM_PAIRS); distinct per i.
+        let stack = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(&client, client_entry, stack, client_arg) }
             .map_err(|_| "stress::load_balance_handoff_steal: start client failed")?;
-        clients[i] = client;
+        *client_slot = client;
     }
 
     // Wait until every client has completed its round-trips and signaled.
@@ -304,7 +311,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     else
     {
-        (1u64 << NUM_PAIRS) - 1
+        (1u64 << NUM_PAIRS).saturating_sub(1)
     };
     let mut acc = 0u64;
     while acc != all_done
@@ -359,7 +366,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         u64::from(migrations),
     );
 
-    let expected = u64::try_from(NUM_PAIRS).unwrap_or(0) * u64::from(ITERS);
+    let expected = u64::try_from(NUM_PAIRS)
+        .unwrap_or(0)
+        .checked_mul(u64::from(ITERS))
+        .ok_or("stress::load_balance_handoff_steal: expected round-trips overflow")?;
     if roundtrips != expected
     {
         return Err("stress::load_balance_handoff_steal: not all round-trips completed");
@@ -384,8 +394,14 @@ extern "C" fn client_entry(arg: u64) -> !
     let ClientArgs { ep, done, idx } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << idx;
 
-    // SAFETY: client `idx` is the sole user of IPC_BUFS[idx] this run.
-    let buf = unsafe { core::ptr::addr_of_mut!(IPC_BUFS[idx]) }.cast::<u64>();
+    // Client `idx` is the sole user of IPC_BUFS[idx] this run.
+    let Some(page) = crate::elem_ptr_mut(core::ptr::addr_of_mut!(IPC_BUFS), idx)
+    else
+    {
+        notification_send(done, done_bit).ok();
+        thread_exit()
+    };
+    let buf = page.cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
     // registered by one thread at a time; no Rust object lives in it, and the
     // thread reaches it only through the raw `buf` pointer.
@@ -403,7 +419,7 @@ extern "C" fn client_entry(arg: u64) -> !
         // SAFETY: `buf` was registered as this thread's IPC buffer above.
         if unsafe { ipc::ipc_call(ep, &msg, buf) }.is_ok()
         {
-            completed += 1;
+            completed = completed.saturating_add(1);
         }
         if n % SAMPLE_EVERY == 0
         {
@@ -428,10 +444,15 @@ extern "C" fn server_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this server.
     let ServerArgs { ep, ready, idx } = unsafe { spawn::child_args(arg) };
-    let buf_index = NUM_PAIRS + idx;
+    let buf_index = NUM_PAIRS.saturating_add(idx);
 
-    // SAFETY: server `buf_index` is the sole user of IPC_BUFS[buf_index] this run.
-    let buf = unsafe { core::ptr::addr_of_mut!(IPC_BUFS[buf_index]) }.cast::<u64>();
+    // Server `buf_index` is the sole user of IPC_BUFS[buf_index] this run.
+    let Some(page) = crate::elem_ptr_mut(core::ptr::addr_of_mut!(IPC_BUFS), buf_index)
+    else
+    {
+        thread_exit()
+    };
+    let buf = page.cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
     // registered by one thread at a time; no Rust object lives in it, and the
     // thread reaches it only through the raw `buf` pointer.

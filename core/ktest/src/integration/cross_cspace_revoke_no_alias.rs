@@ -237,11 +237,11 @@ extern "C" fn child_entry(arg: u64) -> !
         thread_exit()
     };
     let caps = reply.caps();
-    if caps.is_empty()
+    let Some(&c1) = caps.first()
+    else
     {
         thread_exit()
-    }
-    let c1 = caps[0];
+    };
 
     // Park until the parent has revoked `target` and recycled the freed slot. The
     // release carries the recycled slot's fresh handle.

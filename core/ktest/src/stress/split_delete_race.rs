@@ -118,12 +118,18 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             Ok((lower, upper)) =>
             {
-                split_won += 1;
+                split_won = split_won.saturating_add(1);
                 cap_delete(lower).map_err(|_| "stress::split_delete_race: delete lower failed")?;
                 cap_delete(upper).map_err(|_| "stress::split_delete_race: delete upper failed")?;
             }
-            Err(e) if e == SyscallError::InvalidState as i64 && deleted => delete_mid_split += 1,
-            Err(e) if e == SyscallError::InvalidCapability as i64 && deleted => delete_before += 1,
+            Err(e) if e == SyscallError::InvalidState as i64 && deleted =>
+            {
+                delete_mid_split = delete_mid_split.saturating_add(1);
+            }
+            Err(e) if e == SyscallError::InvalidCapability as i64 && deleted =>
+            {
+                delete_before = delete_before.saturating_add(1);
+            }
             Err(_) => return Err("stress::split_delete_race: split failed without a delete"),
         }
 

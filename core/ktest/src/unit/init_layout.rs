@@ -49,9 +49,15 @@ pub fn sp_in_init_stack_window(_ctx: &TestContext) -> TestResult
     let probe = 0u64;
     let sp = core::ptr::addr_of!(probe) as u64;
     let lowest = INIT_STACK_GUARD_WINDOW.base + PAGE_SIZE;
-    let highest = INIT_STACK_GUARD_WINDOW.base
-        + INIT_STACK_GUARD_WINDOW.span()
-        + INIT_STACK_PAGES as u64 * PAGE_SIZE;
+    let highest = INIT_STACK_GUARD_WINDOW
+        .base
+        .checked_add(INIT_STACK_GUARD_WINDOW.span())
+        .and_then(|top| {
+            (INIT_STACK_PAGES as u64)
+                .checked_mul(PAGE_SIZE)
+                .and_then(|stack| top.checked_add(stack))
+        })
+        .ok_or("init-stack window span overflows")?;
     if sp < lowest || sp >= highest
     {
         return Err("SP outside the init-stack window span");

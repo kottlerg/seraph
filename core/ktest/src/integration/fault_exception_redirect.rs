@@ -114,7 +114,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Redirect the instruction pointer to the recovery routine and resume, so the
     // child never re-executes the illegal instruction.
     let recovery_ptr = recovery_child as *const () as u64;
-    crate::spawn::redirect_to_entry(&mut reg_buf[..], recovery_ptr);
+    crate::spawn::redirect_to_entry(&mut reg_buf[..], recovery_ptr)?;
     // SAFETY: the frame was read from this child, so its stack pointer lies on
     // the child's own `ChildStack`; `redirect_to_entry` pointed it at `recovery_child`,
     // an `extern "C"` entry that never returns and needs nothing of the

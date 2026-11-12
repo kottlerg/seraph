@@ -556,7 +556,7 @@ fn arm_and_stop(
         WAITS_ENTERED.load(Ordering::Acquire) != entered_before
     })?
     {
-        seen.starved += 1;
+        seen.starved = seen.starved.saturating_add(1);
     }
     // 0 to 4095 spins (a multiplicative hash of the round), so the stop
     // lands at varying points of the waiter's and sender's exchange.
@@ -571,8 +571,8 @@ fn arm_and_stop(
     let done = WAITS_DONE.load(Ordering::Acquire).wrapping_sub(done_before);
     match entered.wrapping_sub(done)
     {
-        0 => seen.stopped_between += 1,
-        1 => seen.stopped_in_wait += 1,
+        0 => seen.stopped_between = seen.stopped_between.saturating_add(1),
+        1 => seen.stopped_in_wait = seen.stopped_in_wait.saturating_add(1),
         _ => return Err("stress::stop_claimed_delete: the waiter's counts do not add up"),
     }
     Ok(())
@@ -594,10 +594,11 @@ fn stop(waiter: u64, stops: Stops, cycle: u32, seen: &mut Seen) -> TestResult
         });
     }
     WAITER.store(waiter, Ordering::Release);
-    STOP_ARMED.store(cycle + 1, Ordering::Release);
+    let armed_round = cycle.saturating_add(1);
+    STOP_ARMED.store(armed_round, Ordering::Release);
     let own = thread_stop(waiter);
     let acked = await_within(crate::scaled_bound(ACK_WAIT_US), || {
-        STOPPER_DONE.load(Ordering::Acquire) == cycle + 1
+        STOPPER_DONE.load(Ordering::Acquire) == armed_round
     });
     match own
     {
@@ -605,7 +606,7 @@ fn stop(waiter: u64, stops: Stops, cycle: u32, seen: &mut Seen) -> TestResult
         {}
         Err(e) if e == SyscallError::InvalidState as i64 =>
         {
-            seen.stops_lost += 1;
+            seen.stops_lost = seen.stops_lost.saturating_add(1);
         }
         Err(e) =>
         {
@@ -673,12 +674,12 @@ fn create_thread(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::stop_claimed_delete: create thread failed")?,
     );
-    // SAFETY: stress stacks 0, 1, and 2 belong to this test's waiter,
+    // stress stacks 0, 1, and 2 belong to this test's waiter,
     // sender, and second stopper; stress tests run sequentially, each
     // round's waiter is deleted (stopped, off its CPU) before the next is
     // created, and a phase's helpers exit and are deleted before the next
     // phase's are created.
-    let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
+    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack)?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).
@@ -705,7 +706,7 @@ fn await_within(bound_us: u64, mut done: impl FnMut() -> bool) -> Result<bool, &
         }
         if polls < BUSY_POLLS
         {
-            polls += 1;
+            polls = polls.saturating_add(1);
             core::hint::spin_loop();
         }
         else

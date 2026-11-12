@@ -53,51 +53,7 @@ pub(super) fn cycles_now() -> u64
 /// Log the benchmark header line `ktest: bench  <name>  N=<n>`.
 pub(super) fn log_bench_header(name: &str, n: u32)
 {
-    // Build "ktest: bench  <name>  N=<n>" string.
-    let mut buf = [0u8; 128];
-    let prefix = b"ktest: bench  ";
-    let plen = prefix.len().min(buf.len());
-    buf[..plen].copy_from_slice(&prefix[..plen]);
-    let mut pos = plen;
-
-    let nb = name.as_bytes();
-    let nlen = nb.len().min(buf.len() - pos);
-    buf[pos..pos + nlen].copy_from_slice(&nb[..nlen]);
-    pos += nlen;
-
-    let sep = b"  N=";
-    let slen = sep.len().min(buf.len() - pos);
-    buf[pos..pos + slen].copy_from_slice(&sep[..slen]);
-    pos += slen;
-
-    // Write N as decimal.
-    let mut digits = [0u8; 10];
-    let mut dlen = 0;
-    let mut val = n;
-    if val == 0
-    {
-        digits[0] = b'0';
-        dlen = 1;
-    }
-    else
-    {
-        while val > 0
-        {
-            let d = (val % 10) as u8;
-            digits[dlen] = b'0' + d;
-            val /= 10;
-            dlen += 1;
-        }
-        digits[..dlen].reverse();
-    }
-    let dlen_copy = dlen.min(buf.len() - pos);
-    buf[pos..pos + dlen_copy].copy_from_slice(&digits[..dlen_copy]);
-    pos += dlen_copy;
-
-    if let Ok(s) = core::str::from_utf8(&buf[..pos])
-    {
-        crate::log(s);
-    }
+    crate::log_args(format_args!("ktest: bench  {name}  N={n}"));
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

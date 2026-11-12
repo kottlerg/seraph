@@ -61,9 +61,11 @@
 //! notification's last cap and the binding's cap, and asserts that after each
 //! the next binding the fixture makes receives the device's interrupt. The
 //! MSI release phase has the fixture exit with its interrupt raised, waits
-//! for devmgr to withdraw it, which releases its device and frees the
-//! message-signaled target, and asserts `system_ram == kernel_reserved +
-//! pool_total`; it runs last of the phases that use the fixture.
+//! for devmgr to withdraw it, and asserts `system_ram == kernel_reserved +
+//! pool_total`; devmgr then releases the device and frees the
+//! message-signaled target, and the later `ram_accounted_identity` phase
+//! asserts the identity again. It runs last of the phases that use the
+//! fixture.
 
 use std::os::seraph::startup_info;
 use std::time::{Duration, Instant};
@@ -662,9 +664,13 @@ fn msi_churn_phase(caps: &Caps)
     );
 }
 
-/// The fixture exits with its interrupt raised, devmgr withdraws it and
-/// releases its device, which frees the message-signaled target devmgr minted
-/// for it, and `system_ram == kernel_reserved + pool_total` then holds. The
+/// The fixture exits with its interrupt raised, devmgr withdraws it, and
+/// `system_ram == kernel_reserved + pool_total` holds. devmgr's control
+/// thread releases the device, which frees the message-signaled target devmgr
+/// minted for it, right after the class answers `WITHDRAWN`, and no request
+/// svctest can make observes that release's end, so the assertion here may
+/// precede the free; the `ram_accounted_identity` phase, which runs after
+/// every devmgr phase, asserts the identity again once it has long run. The
 /// last phase that uses the fixture: none serves the class afterwards.
 fn msi_release_phase(caps: &Caps)
 {

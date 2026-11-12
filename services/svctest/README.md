@@ -266,17 +266,19 @@ address. The probe's reply carries, from devmgr's `DMA_FAULTS`, the confinement 
 faults devmgr took for the device, and the latest faulting address, which must be the page of the
 unmapped address. Without an IOMMU it checks the mapped copies only and requires no fault.
 The MSI delivery phase queries the same fixture the same way and asks it to have the `edu` device
-raise its interrupt (`INTERRUPT_PROBE`): the fixture must hold the device's MSI vector, which
-devmgr gives a declaration that asks for MSI and DMA, not its wired line, and the message must
-reach the fixture's notification within `INTERRUPT_WAIT_MS`, with or without an IOMMU.
-The MSI churn phase asks the fixture for `INTERRUPT_CHURN`: while a thread of the fixture has the
-device raise its MSI in a loop, the fixture deletes the `Interrupt` cap bound to it, and then the
-bound notification's last cap and the binding's cap; after each case a spare copy it binds to a new
-notification must receive the device's interrupt, the fixture must hold MSI, and the loop must have
-raised. The MSI release phase sends `FIXTURE_EXIT`, after which the fixture leaves its interrupt
-raised and exits; the phase polls `caps[9]` until devmgr answers `WITHDRAWN` (devmgr then releases
-the device and frees the message-signaled target it minted for it) and asserts
-`system_ram == kernel_reserved + pool_total`. It runs last of the phases that use the fixture,
+raise its interrupt (`INTERRUPT_PROBE`): the fixture must hold the device's MSI vector, which devmgr
+gives a declaration that asks for MSI and DMA, not its wired line, and the message must reach the
+fixture's notification within `INTERRUPT_WAIT_MS`, with or without an IOMMU. The MSI churn phase
+asks the fixture for `INTERRUPT_CHURN`: while a thread of the fixture has the device raise its MSI
+in a loop, the fixture deletes the `Interrupt` cap bound to it, and then the bound notification's
+last cap and the binding's cap; after each case a spare copy it binds to a new notification must
+receive the device's interrupt, the fixture must hold MSI, and the loop must have raised. The MSI
+release phase sends `FIXTURE_EXIT`, after which the fixture leaves its interrupt raised and exits;
+the phase polls `caps[9]` until devmgr answers `WITHDRAWN` and asserts `system_ram ==
+kernel_reserved + pool_total`. devmgr releases the device, which frees the message-signaled target
+it minted for it, on its control thread right after the class answers `WITHDRAWN`, and no request
+svctest makes observes the release end, so the `ram_accounted_identity` phase that ends the run
+asserts the identity again after it. The release phase runs last of the phases that use the fixture,
 since no fixture serves the class again in that boot.
 The `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down

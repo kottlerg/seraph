@@ -462,13 +462,24 @@ pub fn message_address(target: crate::irq::Target) -> Option<u64>
 /// Disable `source` at the APLIC (`clrienum`); a source the domain does not
 /// implement is ignored. The write is ordered after this hart's earlier memory
 /// writes, so a delivery's marking of its bindings owing precedes its mask at
-/// the APLIC (`irq::unmask_settled`).
+/// the APLIC (`irq::unmask_settled`), and before its later memory writes, so
+/// the mask precedes the delivery's signals and the drop of its in-flight
+/// count: an acknowledgement made after a receiver saw a signal, or after
+/// `irq::register` waited out the delivery, cannot have its `setienum` reach the
+/// APLIC ahead of this `clrienum`.
 pub fn mask(source: u32)
 {
     if implemented(source)
     {
         // SAFETY: an implemented source; the register lies in the checked window.
-        unsafe { aplic_write(APLIC_CLRIENUM, source) };
+        // The fence has no operands and changes no register or memory; it is
+        // left without `nomem` so the compiler keeps later stores after it.
+        unsafe {
+            aplic_write(APLIC_CLRIENUM, source);
+            // `fence o,w`: the APLIC write above is performed before this
+            // hart's later memory writes.
+            core::arch::asm!("fence o,w", options(nostack, preserves_flags));
+        }
     }
 }
 

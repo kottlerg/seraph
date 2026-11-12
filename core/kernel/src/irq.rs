@@ -84,6 +84,16 @@
 //! before that second mask is delivered as one forwarded before a delivery's
 //! own mask is.
 //!
+//! A delivery's mask reaches the controller before its signals can be seen, so
+//! a receiver's acknowledgement cannot unmask the line ahead of it: on riscv64
+//! `aia::mask` orders the APLIC write before the hart's later memory writes,
+//! and on x86-64 the mask and the unmask both take `IOAPIC_LOCK`. A delivery
+//! that finds no binding masks the line and marks nothing; one can be in flight
+//! while the line's first binding is linked (a stale delivery slot of the line
+//! claimed as [`register`] routes it), so `register` waits it out once the
+//! binding is linked, and its mask lands before the receiver's first
+//! acknowledgement can unmask the line.
+//!
 //! Delivery itself (`notification_send`, `sched::enqueue_and_wake`) takes the
 //! notification's and the scheduler's spinlocks with interrupts disabled.
 //!
@@ -809,7 +819,9 @@ pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
 /// `SYS_IRQ_ACK`. A binding already bound is rebound to `notification`: it
 /// keeps its bit and whether it owes, and the line's mask is unchanged; a
 /// delivery that read the notification it replaced is waited out before this
-/// returns (module doc § Thread safety).
+/// returns (module doc § Thread safety). A line's first binding also waits out
+/// the deliveries in flight on the line, so one that found no binding has
+/// masked the line before this returns.
 ///
 /// A message target (module doc § Sources) takes one binding, in mode 0, and
 /// is neither routed nor masked here: its slot was assigned at its mint.
@@ -899,6 +911,14 @@ pub unsafe fn register(
         route
             .bindings
             .store(core::ptr::from_ref(binding).cast_mut(), Ordering::SeqCst);
+        if head.is_null() && !message
+        {
+            // A delivery on a stale slot of the line can be in flight with an
+            // empty list, its mask not yet at the controller. Waiting it out
+            // lands that mask before the receiver's first acknowledgement can
+            // unmask, so it cannot leave the line masked with none owing.
+            drain(route);
+        }
         routing.routed.insert(entry_u32(index));
         Ok(())
     })
@@ -1259,7 +1279,8 @@ fn unmask_settled(irq: u32, route: &IrqRoute)
 }
 
 /// Wait until no delivery is in flight on `route`, from which a change just
-/// unlinked a binding or replaced a binding's notification (`SeqCst`).
+/// unlinked a binding or replaced a binding's notification, or to which it
+/// linked a line's first binding (`SeqCst`).
 ///
 /// Runs under the routing lock with interrupts disabled, under the spin-site
 /// breadcrumb `irq:route-drain` (`sched::SPIN_SITE_IRQ_ROUTE_DRAIN`), which the
@@ -1404,11 +1425,12 @@ unsafe fn deliver(irq: u32, route: &IrqRoute)
     // Mask before delivering, so the controller forwards no further interrupt
     // of the line until every receiver has acknowledged; the bindings are
     // marked owing before the mask, so an unmask that races it sees the debt
-    // (module doc § Thread safety). With no binding the IRQ is dropped; it must
-    // still be acknowledged at the controller: without the EOI, the x86-64
-    // local APIC keeps its vector in service, blocking every interrupt of its
-    // priority class and below. A message target has no controller mask
-    // (module doc § Sources).
+    // (module doc § Thread safety), and the mask is ordered before the signals
+    // below, so a receiver's acknowledgement does not unmask the line ahead of
+    // it. With no binding the IRQ is dropped; it must still be acknowledged at
+    // the controller: without the EOI, the x86-64 local APIC keeps its vector
+    // in service, blocking every interrupt of its priority class and below. A
+    // message target has no controller mask (module doc § Sources).
     let message = is_message(irq);
     let mask = || {
         if !message

@@ -519,9 +519,12 @@ pub unsafe fn init_ap();
 /// when a delivery that raced the unmask marked a binding owing. A delivery marks
 /// its bindings owing and then calls `mask`. So `unmask` must leave its
 /// controller write ordered before the caller's later read, and `mask` must leave
-/// the caller's earlier memory writes ordered before its controller write. On
-/// RISC-V every APLIC write is preceded by `fence w,o`, and `unmask` ends with
-/// `fence o,r`. On x86-64, `mask` and `unmask` both hold `IOAPIC_LOCK`.
+/// the caller's earlier memory writes ordered before its controller write, and
+/// that write before the caller's later memory writes (a delivery's signals and
+/// the drop of its in-flight count), so an unmask that follows them cannot reach
+/// the controller first. On RISC-V every APLIC write is preceded by `fence w,o`,
+/// `mask` ends with `fence o,w`, and `unmask` ends with `fence o,r`. On x86-64,
+/// `mask` and `unmask` both hold `IOAPIC_LOCK`.
 pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);

@@ -2426,8 +2426,10 @@ through their own capability.
   `mode` and routes the line at its controller in it, to one CPU, the next in turn
   ([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked; the routing and
   the mode are kept while any binding remains, so every receiver on the line is signalled from
-  that CPU. A later binding must pass the recorded mode, and masks the line. Every new binding
-  owes an acknowledgement, so the line stays masked until its receiver's first `SYS_IRQ_ACK`.
+  that CPU. The call returns once no delivery that found the line unbound is still in flight, so
+  its mask cannot land after the receiver's first `SYS_IRQ_ACK`. A later binding must pass the
+  recorded mode, and masks the line. Every new binding owes an acknowledgement, so the line stays
+  masked until its receiver's first `SYS_IRQ_ACK`.
 - **Rebind.** Through an object already bound, the call, which must pass the line's recorded mode,
   rebinds that binding to `notification_cap`'s notification, keeping whether it owes an
   acknowledgement and leaving the line's mask as it is, and returns once no delivery to the

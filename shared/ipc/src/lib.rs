@@ -2722,7 +2722,7 @@ pub unsafe fn dma_faults(dma_ep: u64, ipc_buf: *mut u64) -> Result<DmaFaults, Dm
 
 /// Wire-protocol version of [`iommu_labels`]; bumped as the block comment
 /// above the label modules describes, which also lists its runtime check.
-pub const IOMMU_LABELS_VERSION: u32 = 3;
+pub const IOMMU_LABELS_VERSION: u32 = 4;
 /// IPC labels for an IOMMU driver's service endpoint, on which devmgr directs
 /// the IOMMU of one family (VT-d, the RISC-V IOMMU).
 ///
@@ -2766,7 +2766,7 @@ pub mod iommu_labels
     /// Request: `data[1]` = domain, `data[2]` = the IOVA. Reply: empty body,
     /// label `SUCCESS` once the range is removed and the invalidation it
     /// needs has completed, or an error code; `INVALID_REQUEST` for a range
-    /// [`MAP_RESERVED`] installed.
+    /// [`MAP_RESERVED`] or [`MAP_MSI`] installed.
     pub const UNMAP: u64 = 3;
     /// Block a domain's function: it reaches no frame from the reply on.
     /// Every range of the domain is withdrawn with it.
@@ -2802,6 +2802,21 @@ pub mod iommu_labels
     /// domain's [`BLOCK`] withdraws it. Reply: empty body, label `SUCCESS`,
     /// or an error code.
     pub const MAP_RESERVED: u64 = 7;
+    /// Make one interrupt file a message-signalled interrupt targets
+    /// reachable by a domain's function at its own address, so the
+    /// function's MSI writes to it reach it: on riscv64 the supervisor-level
+    /// IMSIC file of a hart one of the function's interrupt targets sits on,
+    /// which the RISC-V IOMMU translates as any other write of the function.
+    /// A domain reaches only the files installed in it.
+    ///
+    /// Request: `data[1]` = domain, `data[2]` = the file's physical address,
+    /// page-aligned; one page, read-write, no cap. The page stands for the
+    /// domain's life: [`UNMAP`] refuses it, and the domain's [`BLOCK`]
+    /// withdraws it. Reply: empty body, label `SUCCESS`, or an error code;
+    /// `INVALID_REQUEST` from an IOMMU family whose MSIs are not reached
+    /// through its DMA translation (VT-d, whose interrupt remapping governs
+    /// them).
+    pub const MAP_MSI: u64 = 8;
 
     /// Faults one [`TAKE_FAULTS`] reply carries: two words each after the
     /// count, within the message's data words.
@@ -2827,8 +2842,9 @@ pub mod iommu_errors
     /// The request is malformed: an unknown unit or domain, a requester ID
     /// outside the unit's scope, an IOVA or reserved range that is
     /// unaligned, empty, or past the unit's width, a missing or non-Memory
-    /// cap, an access word outside `devmgr_dma_labels::ACCESS_MASK`, or an
-    /// `UNMAP` of a reserved range.
+    /// cap, an access word outside `devmgr_dma_labels::ACCESS_MASK`, an
+    /// `UNMAP` of a reserved range or an interrupt file, or a `MAP_MSI` to
+    /// an IOMMU family that does not take it.
     pub const INVALID_REQUEST: u64 = 1;
     /// Caller's compiled `IOMMU_LABELS_VERSION`, carried in `data[0]`,
     /// does not match the driver's.

@@ -71,8 +71,9 @@ pub struct UnitInfo
 ///
 /// [`Service`] calls every method with its request already checked: the unit
 /// index names a unit the bootstrap delivered, a domain is one this backend
-/// attached and has not blocked, and a range is page-aligned, nonempty,
-/// within the unit's width, and clear of every other range of the domain.
+/// attached and has not blocked, and a range or an interrupt file's page is
+/// page-aligned, nonempty, within the unit's width, and clear of every other
+/// range of the domain.
 /// Every method that changes what a device reaches returns only once the
 /// hardware has done it, the invalidation it needs included.
 pub trait Backend
@@ -116,6 +117,16 @@ pub trait Backend
         len: u64,
         access: Access,
     ) -> Result<(), BackendError>;
+
+    /// Make the interrupt file whose page is at the physical address `file`
+    /// reachable by `domain`'s device at that address, so the device's MSI
+    /// writes to it reach it (`iommu_labels::MAP_MSI`).
+    ///
+    /// # Errors
+    /// As [`Self::init_unit`], nothing being installed on an error;
+    /// [`BackendError::Invalid`] from a family whose MSIs its DMA
+    /// translation does not reach.
+    fn map_msi(&mut self, domain: &mut Self::Domain, file: u64) -> Result<(), BackendError>;
 
     /// Remove the `len` bytes at `iova` from `domain`.
     ///

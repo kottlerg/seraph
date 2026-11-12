@@ -12,8 +12,10 @@ test = false
 [dependencies]
 # Pure process-table + badge logic, extracted so it is host-testable.
 process_table = { path = "process-table", package = "procmgr-process-table" }
-# The death-queue set and main wait set (`DeathSet`).
+# The death-queue set and the wait set the reaper waits on (`DeathSet`).
 death-set = { path = "../../shared/death-set" }
+# The request workers that receive on the service endpoint (`RecvPool`).
+recv-pool = { path = "../../shared/recv-pool" }
 process-abi = { path = "../../abi/process-abi" }
 process-layout = { path = "../../shared/process-layout" }
 elf = { path = "../../shared/elf" }

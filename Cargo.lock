@@ -1045,6 +1045,7 @@ dependencies = [
  "process-abi",
  "process-layout",
  "procmgr-process-table",
+ "recv-pool",
  "syscall",
  "syscall-abi",
 ]

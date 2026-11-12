@@ -154,17 +154,22 @@ claims.
    X and the head, `docs/conventions.md` § Syncing with `master` decides
    whether X stands: `cargo xtask pr-check` compares the PR's own change at
    X and at the head in place of that delta, and you check what it cannot:
-   the body MUST state that the incoming diff touches none of the PR's
-   files, no file of the incoming diff (`git diff --name-only <merge base
-   at X> <merge base at the head>`) may be one the PR's own diff names
-   (`git diff --name-only <merge base at the head> <head>`), and the merge
-   commit may resolve no conflict (`git show <merge>` prints no combined
-   diff). FAIL a sync that breaks one of these without a validation at the
-   synced head. FAIL when X is absent, when X is none of the head,
-   the merge base, or a commit between them, when X is not the head and that
-   statement is missing or that range is not documentation or comments only,
-   or when the body claims the whole PR is documentation-only and the PR
-   diff is not.
+   judge each sync, a merge M of the base branch on the PR branch's own
+   line (`git log --merges --first-parent X..<head>`; a merge the base
+   branch brought in is another branch's), on its own incoming diff
+   (`git diff $(git merge-base M^1 M^2) M^2`).
+   For each, the body MUST state that its incoming diff touches none of
+   the PR's files or that it is comment-only, no file of that incoming
+   diff (the same command with `--name-only`) may be one the PR's own diff
+   names (`git diff --name-only <merge base at the head> <head>`) unless
+   that incoming diff alters, Markdown aside, only comment lines and no
+   build-embedded text (judged as the delta above), and M may resolve no
+   conflict (`git show M` prints no combined diff). FAIL a sync that
+   breaks one of these without a validation at the synced head. FAIL when
+   X is absent, when X is none of the head, the merge base, or a commit
+   between them, when X is not the head and that statement is missing or
+   that range is not documentation or comments only, or when the body
+   claims the whole PR is documentation-only and the PR diff is not.
 
    Local host runs: `docs/testing.md` § Coverage tiers owns which runs a PR
    owes (its Inert changes, Boundary surface, Memory surface, Device
@@ -226,10 +231,12 @@ claims.
     (`stats.failed`), when the PR's own change in `<since>..<head>` alters,
     Markdown aside, anything but comment lines (judged as step 9 judges a
     validation delta, a sync in the range included), or when a commit in
-    `git log --merges <since>..<head>` merges the base branch and that sync
+    `git log --merges --first-parent <since>..<head>` merges the base
+    branch and that sync
     owes a run with the reviewer as `docs/conventions.md` § Syncing with
-    `master` says (its incoming diff names a file the PR's own diff names,
-    or the merge resolved a conflict; step 9 gives the commands): each owes
+    `master` says (its incoming diff names a file the PR's own diff names
+    and is not comment-only, or the merge resolved a conflict; step 9 gives
+    the commands): each owes
     a run with the reviewer. Compare every comment line and document
     statement the PR's own change in the range alters against the code it
     describes, citing `path:line` on both sides, and FAIL each one the

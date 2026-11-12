@@ -1120,7 +1120,7 @@ needs no separate upkeep; `orch log` appends a line for an event that changes no
 | Subcommand | Effect |
 |---|---|
 | `start` | Creates the state and the log's first line. Refuses while a state exists. |
-| `state` | Prints the state as text: goal, log, orchestrator, grant and queue, each worker, merge order, open questions, rulings. It warns on stderr when the text passes 10,000 bytes, which keeps it within the 10,000 characters a hook may add to a session's context; `worker --remove` and `question close` shorten it. `--json` prints the stored file. |
+| `state` | Prints the state as text: goal, log, orchestrator, grant and queue, each worker, merge order, open questions, rulings. It warns on stderr when the text passes 10,000 bytes, which keeps it within the 10,000 characters a hook may add to a session's context; `worker --remove`, `question close` and `ruling drop` shorten it. `--json` prints the stored file. |
 | `orchestrator` | Records the agent id workers report to. Without an id, prints the recorded one and changes nothing. |
 | `worker` | Sets the named fields of a worker, creating the worker when it is new, and with `--status` the time of that report, which `state` prints beside it; fields it does not name keep their value. A phase is one of `planning`, `coding`, `review`, `gate`, `merged`, `retired`, `dead`. `--remove` drops the worker. |
 | `grant set` | Records the exclusive grant and takes its holder out of the queue, and writes the grant to the host lock, where every boot not under it is refused ([Host launch rules](#host-launch-rules)). Refuses while a grant is outstanding. |

@@ -23,6 +23,8 @@
 //! and funds the objects through `std::os::seraph`, so it is compiled only
 //! for seraph and no host test reaches it.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg(target_os = "seraph")]
 
 use std::cell::{Cell, RefCell};
@@ -194,7 +196,8 @@ impl DeathSet
         // the move list leaves no new set behind.
         let mut moved: Vec<(u64, u64)> = Vec::new();
         moved
-            .try_reserve_exact(queues.len() + 1)
+            // A slice length is at most `isize::MAX`, so this cannot saturate.
+            .try_reserve_exact(queues.len().saturating_add(1))
             .map_err(|_| OUT_OF_MEMORY)?;
         let (new, new_grant) = create_wait_set(members)?;
         let sources = self
@@ -255,7 +258,8 @@ impl DeathSet
                 f(death);
             }
             full |= drained >= self.entries;
-            idx += 1;
+            // `idx` indexes the queue list, so it cannot saturate.
+            idx = idx.saturating_add(1);
         }
         full
     }
@@ -315,7 +319,7 @@ fn create_queue(
     {
         std::os::seraph::log!(
             debug: "death queue {} created with {observers} observer nodes",
-            made + 1
+            made.saturating_add(1)
         );
     }
     Ok(queue)

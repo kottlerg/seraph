@@ -25,6 +25,8 @@
 //!   integer repr, all with stable layout.
 //! - No dependencies outside `core`.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 // ── Protocol version ─────────────────────────────────────────────────────────
@@ -483,8 +485,9 @@ pub enum CapType
 #[must_use]
 pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
 {
-    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-    &name[..end]
+    // `split` always yields a first item: the bytes before the first NUL, or
+    // the whole name when it holds none.
+    name.split(|&b| b == 0).next().unwrap_or(name)
 }
 
 /// Locate a boot-module `Memory` cap by its bundle-entry name.
@@ -495,8 +498,8 @@ pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
 #[must_use]
 pub fn find_module_slot(info: &InitInfo, name: &[u8]) -> Option<u64>
 {
-    let count = (info.module_name_count as usize).min(INIT_MAX_NAMED_MODULES);
-    for entry in &info.module_names[..count]
+    let count = info.module_name_count as usize;
+    for entry in info.module_names.iter().take(count)
     {
         if module_name_str(&entry.name) == name
         {

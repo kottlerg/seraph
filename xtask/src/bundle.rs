@@ -314,14 +314,14 @@ mod tests
         assert_eq!(hdr.version, fmt::VERSION);
         assert_eq!(hdr.entry_count, 2);
 
-        let e0 = fmt::entry_at(&buf, 0);
+        let e0 = fmt::entry_at(&buf, 0).expect("entry 0");
         assert_eq!(fmt::name_str(&e0.name), b"init");
         assert_eq!(e0.size, 5);
         assert!(e0.offset.is_multiple_of(fmt::BODY_ALIGNMENT));
         let body0 = &buf[e0.offset as usize..(e0.offset + e0.size) as usize];
         assert_eq!(body0, b"alpha");
 
-        let e1 = fmt::entry_at(&buf, 1);
+        let e1 = fmt::entry_at(&buf, 1).expect("entry 1");
         assert_eq!(fmt::name_str(&e1.name), b"svc");
         assert_eq!(e1.size, 6);
         assert!(e1.offset.is_multiple_of(fmt::BODY_ALIGNMENT));

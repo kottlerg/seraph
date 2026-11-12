@@ -376,13 +376,14 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
 ```
 
 On both architectures, right after the interrupt-controller step, the BSP allocates the IRQ
-routing table from the buddy allocator (`irq::init_table`), before any line is routed; its
-failure is fatal. The table holds one entry per line the discovered controllers implement
-(`interrupts::irq_line_count`: the I/O APICs' GSIs on x86-64, the APLIC's sources on RISC-V),
-then one per message-signaled target (`irq::message_capacity`: a slot of each boot CPU's delivery
-space, `interrupts::message_slots_per_cpu`, capped at `MAX_MESSAGE_TARGETS`), with a free-id pool
-for the targets. It is sized from the boot CPU count and, on RISC-V, the IMSIC identity count,
-both set in Phase 4.
+routing table from the buddy allocator (`irq::init_table`, one zero-filled run of pages through
+`sched::alloc_zeroed_slab`), before any line is routed; its failure is fatal. The table holds one
+entry per line the discovered controllers implement (`interrupts::irq_line_count`: the I/O APICs'
+GSIs on x86-64, the APLIC's sources on RISC-V), then one per message-signaled target
+(`irq::message_capacity`: a slot of each boot CPU's delivery space,
+`interrupts::message_slots_per_cpu`), with a free-id pool for the targets. It is sized from the
+boot CPU count and, on RISC-V, the IMSIC identity count, both set in Phase 4, for every target
+the CPUs can deliver, whether or not it is ever minted.
 
 Right after its per-CPU install, the BSP reports its extended-state save-area size
 (`fpu::report_save_area`), which sizes every Thread slot (`sched::thread_slot`) and the

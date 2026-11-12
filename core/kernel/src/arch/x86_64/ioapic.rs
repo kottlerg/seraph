@@ -556,30 +556,53 @@ pub unsafe fn init()
     }
 }
 
-/// Program a redirection entry for `gsi` to deliver `vector` to the local APIC
-/// with id `destination` (physical destination mode, so at most `0xFF`).
+/// Where a redirection entry delivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Destination
+{
+    /// The local APIC with this id, in physical destination mode (so at most
+    /// `0xFF`), in the compatibility format.
+    Physical(u8),
+    /// The interrupt remapping entry with this handle, in the remappable
+    /// format (`super::remap`).
+    Remapped(u16),
+}
+
+/// The low and high dwords of a masked redirection entry delivering `vector`
+/// with `mode`'s trigger and polarity to `destination`: in the compatibility
+/// format, the destination APIC id in bits 31:24 of the high dword (entry bits
+/// 63:56); in the remappable format, the handle ([`super::remap::redirection`]),
+/// the vector kept for the EOI that clears a level entry's Remote IRR.
+const fn redirection_entry(vector: u8, mode: u32, destination: Destination) -> (u32, u32)
+{
+    let low = redirection_low(vector, mode);
+    match destination
+    {
+        Destination::Physical(apic_id) => (low, (apic_id as u32) << 24),
+        Destination::Remapped(handle) => super::remap::redirection(handle, low),
+    }
+}
+
+/// Program a redirection entry for `gsi` to deliver `vector` to `destination`.
 ///
 /// The entry is programmed masked; call [`unmask`] when ready to receive.
 /// Uses fixed delivery, with the trigger mode and polarity `mode` names
-/// ([`redirection_low`]). An entry whose Remote IRR a stale level delivery left
-/// set is first rewritten masked and edge-triggered, which clears it
+/// ([`redirection_entry`]). An entry whose Remote IRR a stale level delivery
+/// left set is first rewritten masked and edge-triggered, which clears it
 /// ([`remote_irr_clear`]). A GSI no discovered I/O APIC owns is left alone
 /// (`interrupts::route_device_irq` checks [`owns`] first).
 ///
 /// # Safety
 /// Must only be called after [`init`].
 #[cfg(not(test))]
-pub unsafe fn route(gsi: u32, vector: u8, destination: u8, mode: u32)
+pub unsafe fn route(gsi: u32, vector: u8, destination: Destination, mode: u32)
 {
     let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
     else
     {
         return;
     };
-    // Low dword: vector | fixed delivery | trigger and polarity | masked.
-    // High dword: destination APIC id in bits [31:24] (entry bits [63:56]).
-    let low = redirection_low(vector, mode);
-    let high = u32::from(destination) << 24;
+    let (low, high) = redirection_entry(vector, mode, destination);
 
     // SAFETY: caller ensures init() has completed; entry remains masked
     // until unmask(). IOAPIC_LOCK covers every select/window pair below.
@@ -730,6 +753,17 @@ mod tests
         assert_eq!(index_of(DEVICE_VECTOR_BASE), Some(0));
         assert_eq!(index_of(DEVICE_VECTOR_LAST), Some(DEVICE_VECTOR_COUNT - 1));
         assert_eq!(index_of(DEVICE_VECTOR_LAST + 1), None);
+    }
+
+    #[test]
+    fn a_physical_entry_names_the_apic_id_and_a_remapped_one_the_handle()
+    {
+        let (low, high) = redirection_entry(33, 0, Destination::Physical(5));
+        assert_eq!((low, high), (REDIR_MASK | 33, 5 << 24));
+        let (low, high) = redirection_entry(40, 0, Destination::Remapped(0x8001));
+        // Handle bit 15 in low bit 11, bits 14:0 above the format bit.
+        assert_eq!(low, REDIR_MASK | 40 | (1 << 11));
+        assert_eq!(high, (1 << 17) | (1 << 16));
     }
 
     #[test]

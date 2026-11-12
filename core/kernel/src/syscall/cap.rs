@@ -2788,7 +2788,8 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
 
     use syscall::{
         CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_ASPACE_TERMINAL_FAULT, CAP_INFO_CSPACE_BUDGET,
-        CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_IRQ_MSG_ADDRESS,
+        CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_IRQ_MSG_ADDRESS, CAP_INFO_IRQ_REMAP_ENTRY,
+        CAP_INFO_IRQ_REMAP_HANDLES,
         CAP_INFO_IRQ_MSG_DATA, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
         CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
         CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE,
@@ -3065,6 +3066,32 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             {
                 Ok(u64::from(data))
             }
+        }
+        CAP_INFO_IRQ_REMAP_ENTRY | CAP_INFO_IRQ_REMAP_HANDLES =>
+        {
+            if tag != CapTag::Interrupt
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            let remap_error = |e| match e
+            {
+                crate::irq::RemapError::NotSupported => SyscallError::NotSupported,
+                crate::irq::RemapError::State => SyscallError::InvalidState,
+            };
+            if field == CAP_INFO_IRQ_REMAP_HANDLES
+            {
+                return crate::arch::current::interrupts::remap_handles().map_err(remap_error);
+            }
+            // SAFETY: tag confirmed Interrupt.
+            // cast_ptr_alignment: the InterruptObject is constructed in place at a
+            // size-class-aligned retype offset; header at offset 0.
+            #[allow(clippy::cast_ptr_alignment)]
+            let io = unsafe { &*(slot.object_of(CapTag::Interrupt).cast::<InterruptObject>()) };
+            if io.count != 1
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            crate::irq::remap_entry(io.start).map_err(remap_error)
         }
         CAP_INFO_ASPACE_TERMINAL_FAULT =>
         {

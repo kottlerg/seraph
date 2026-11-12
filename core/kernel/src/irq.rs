@@ -64,14 +64,32 @@
 //! Delivery; `SYS_IRQ_REGISTER` and `SYS_IRQ_ACK` in
 //! core/kernel/docs/syscalls.md).
 //!
+//! # Routes
+//! A wired line is routed by an explicit request of a holder of the minting
+//! authority (`SYS_IRQ_ROUTE`, [`route`]), never by a binding: the request
+//! takes the line a delivery slot on the next CPU in turn, programs the
+//! controller in the request's mode with the line masked, and makes the
+//! requesting Interrupt object a route holder (its `route_held` flag,
+//! `cap::object::InterruptObject`). A binding is added only to a routed line
+//! ([`RouteError::NotRouted`]). The line's target stays fixed from its route
+//! until its release, once neither a holder nor a binding remains
+//! ([`released`], [`drop_route_holder`], [`unbind_line`]), so an IOMMU entry
+//! made for the target stays valid while anything names the line.
+//!
 //! # Mode
 //! A line carries one trigger and polarity mode (`IRQ_MODE_LEVEL`,
-//! `IRQ_MODE_ACTIVE_LOW` in `abi/syscall`), which its controller is programmed
-//! with when the first binding routes it. The first binding records the mode
-//! its `SYS_IRQ_REGISTER` passed; a later binding, or a rebind, that passes
-//! another is refused ([`RouteError::ModeMismatch`], [`mode_admits`]) and
-//! changes nothing. The line's release forgets the mode, so the next first
-//! binding may record another.
+//! `IRQ_MODE_ACTIVE_LOW` in `abi/syscall`), which its route records and its
+//! controller is programmed with. A later route request, or a binding, that
+//! passes another is refused ([`RouteError::ModeMismatch`], [`route_step`],
+//! [`bind_admits`]) and changes nothing. The line's release forgets the mode,
+//! so the next route may record another.
+//!
+//! # Remapping
+//! With interrupt remapping switched on ([`set_remap`]), the controllers hand
+//! out remappable formats: a message or an I/O APIC entry names a handle the
+//! kernel derives from its slot, and an IOMMU entry for that handle, which
+//! devmgr has the IOMMU driver write from [`remap_entry`], delivers it. The
+//! switch moves only while no source holds a slot (`Routing::sources`).
 //!
 //! # Notification references
 //! A bound binding holds a reference on its notification's object, taken by
@@ -134,7 +152,7 @@
 //! notification's and the scheduler's spinlocks with interrupts disabled.
 
 use core::ptr::{NonNull, null_mut};
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::cap::object::KernelObjectHeader;
 use crate::ipc::notification::NotificationState;
@@ -601,14 +619,17 @@ struct IrqRoute
     /// from its route to its release. Read and written only under the routing
     /// lock, so `Relaxed`.
     target: AtomicU32,
+    /// The Interrupt objects that hold the line's route (module doc § Routes).
+    /// Read and written only under the routing lock, so `Relaxed`.
+    holders: AtomicU32,
     /// The line's bound and owing masks.
     masks: LineMasks,
 }
 
 // docs/limits.md states the routing table's per-line cost from this size: an
-// 8-byte list head, the mode and the target (4 bytes each), and the two 8-byte
-// masks.
-const _: () = assert!(core::mem::size_of::<IrqRoute>() == 32);
+// 8-byte list head, the mode, the target and the holder count (4 bytes each,
+// padded to 8), and the two 8-byte masks.
+const _: () = assert!(core::mem::size_of::<IrqRoute>() == 40);
 
 /// Why a source could not be bound or minted.
 // dead_code: host test builds compile out `register` and the controller routing
@@ -632,14 +653,54 @@ pub enum RouteError
     /// The notification's object holds as many references as it may
     /// (`cap::object::REF_COUNT_LIMIT`), so the binding cannot take one.
     ReferenceLimit,
+    /// The line is not routed (module doc § Routes), so no binding can be added.
+    NotRouted,
 }
 
-/// Whether a binding passing `requested` may bind on a line that has bindings
-/// (`line_bound`) recorded with `recorded`: a line with none takes any mode,
-/// which it then records; a line with bindings takes only its own.
-const fn mode_admits(line_bound: bool, recorded: u32, requested: u32) -> bool
+/// What a route request ([`route`]) does to a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteStep
 {
-    !line_bound || recorded == requested
+    /// The line is not routed: route it, with the caller its first holder.
+    Route,
+    /// The line is routed in the requested mode: the caller holds it too.
+    AddHolder,
+    /// The caller already holds the line's route, in the requested mode.
+    Held,
+}
+
+/// What a route request in `mode` through an object that does (`caller_holds`)
+/// or does not hold the route does to a line routed in `routed` (`None` when
+/// it is not routed). A request in another mode than the route's is refused.
+const fn route_step(routed: Option<u32>, caller_holds: bool, mode: u32)
+-> Result<RouteStep, RouteError>
+{
+    match routed
+    {
+        None => Ok(RouteStep::Route),
+        Some(recorded) if recorded != mode => Err(RouteError::ModeMismatch),
+        Some(_) if caller_holds => Ok(RouteStep::Held),
+        Some(_) => Ok(RouteStep::AddHolder),
+    }
+}
+
+/// Whether a binding in `mode` may be added to a line routed in `routed`
+/// (`None` when it is not routed): only to a routed line, in its route's mode.
+const fn bind_admits(routed: Option<u32>, mode: u32) -> Result<(), RouteError>
+{
+    match routed
+    {
+        None => Err(RouteError::NotRouted),
+        Some(recorded) if recorded != mode => Err(RouteError::ModeMismatch),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Whether a line with `holders` route holders and the bound mask `bound` is
+/// released: once neither a holder nor a binding remains.
+const fn released(holders: u32, bound: u64) -> bool
+{
+    holders == 0 && bound == 0
 }
 
 // ── Message-target ids ────────────────────────────────────────────────────────
@@ -692,12 +753,17 @@ pub const fn message_target(id: u32) -> Option<Target>
 
 // ── Routing state ─────────────────────────────────────────────────────────────
 
-/// The routing state a route change mutates: the table of lines.
+/// The routing state a route change mutates: the table of lines and the count
+/// of sources.
 #[cfg(not(test))]
 struct Routing
 {
     /// The table: one entry per line, or none before [`init_table`].
     routes: &'static [IrqRoute],
+    /// The sources that hold a delivery slot: routed lines and minted message
+    /// targets. Interrupt remapping is switched only while it is zero
+    /// ([`set_remap`]).
+    sources: u32,
 }
 
 /// A value its spinlock serialises: the only access is [`Locked::with`], which
@@ -742,7 +808,10 @@ impl<T> Locked<T>
 /// calls take; the riscv64 APLIC accesses take none, each being a single register
 /// write. It is never taken in interrupt context.
 #[cfg(not(test))]
-static ROUTING: Locked<Routing> = Locked::new(Routing { routes: &[] });
+static ROUTING: Locked<Routing> = Locked::new(Routing {
+    routes: &[],
+    sources: 0,
+});
 
 /// The table and the gates, published once by [`init_table`] for the lock-free
 /// reads of [`dispatch_device_irq`]: the table's base (null before) and its line
@@ -995,11 +1064,11 @@ fn unbind_message(
 
 /// Remove bound `binding` from line `irq`, whose table entry is `route`:
 /// unlink it, clear its bit from the bound mask, wait out the line's CPU, and
-/// settle the line at its controller ([`Settle`]). A release frees the line's
-/// slot ([`Controls::unroute`]) and waits out its CPU again, so no delivery
-/// that read the line from that slot outlives the release (module doc
-/// § Thread safety). Returns what the line was left to do. The caller unbinds
-/// the binding's own fields.
+/// settle the line at its controller ([`Settle`]). When no binding remains,
+/// a line an object still holds the route of stays routed, masked
+/// ([`Settle::StayMasked`]), and any other is released ([`release_line`],
+/// [`Settle::Release`]). Returns what the line was left to do. The caller
+/// unbinds the binding's own fields.
 ///
 /// # Safety
 /// Called under the routing lock; `binding` is bound on `irq`, and every
@@ -1037,31 +1106,51 @@ unsafe fn unbind_line(
     {
         controls.wait_out(routed.cpu);
     }
-    let settle = route.masks.unbind_settle(bit);
-    match settle
+    match route.masks.unbind_settle(bit)
     {
+        Settle::Release if !released(route.holders.load(Ordering::Relaxed), 0) =>
+        {
+            // A holder keeps the route: the line stays masked, with no receiver.
+            controls.mask(irq);
+            Settle::StayMasked
+        }
         Settle::Release =>
         {
-            // The next first binding records its own mode and target.
-            route.mode.store(0, Ordering::Relaxed);
-            route.target.store(0, Ordering::Relaxed);
-            match routed
-            {
-                Some(routed) =>
-                {
-                    // SAFETY: the line was routed to `routed`; the routing
-                    // lock is held (contract).
-                    unsafe { controls.unroute(irq, routed) };
-                    controls.wait_out(routed.cpu);
-                }
-                None => controls.mask(irq),
-            }
+            // SAFETY: the routing lock is held (contract).
+            unsafe { release_line(controls, irq, route) };
+            Settle::Release
         }
-        Settle::Unmask => unmask_settled(controls, irq, route),
-        Settle::StayMasked =>
-        {}
+        Settle::Unmask =>
+        {
+            unmask_settled(controls, irq, route);
+            Settle::Unmask
+        }
+        Settle::StayMasked => Settle::StayMasked,
     }
-    settle
+}
+
+/// Release line `irq`, whose table entry is `route` and which neither a
+/// binding nor a route holder names: forget its mode and target, and free its
+/// slot ([`Controls::unroute`]), then wait out its CPU again, so no delivery
+/// that read the line from that slot outlives the release (module doc
+/// § Thread safety). A line routed nowhere is masked.
+///
+/// # Safety
+/// Called under the routing lock.
+unsafe fn release_line(controls: &impl Controls, irq: u32, route: &IrqRoute)
+{
+    route.mode.store(0, Ordering::Relaxed);
+    match Target::unpack(route.target.swap(0, Ordering::Relaxed))
+    {
+        Some(routed) =>
+        {
+            // SAFETY: the line was routed to `routed`; the routing lock is
+            // held (contract).
+            unsafe { controls.unroute(irq, routed) };
+            controls.wait_out(routed.cpu);
+        }
+        None => controls.mask(irq),
+    }
 }
 
 /// Unmask line `irq`, whose bindings were found owing nothing under the routing
@@ -1259,57 +1348,138 @@ unsafe fn register_line(
     mode: u32,
 ) -> Result<Option<NonNull<KernelObjectHeader>>, RouteError>
 {
-    let line_bound = !route.bindings.load(Ordering::Relaxed).is_null();
-    if !mode_admits(line_bound, route.mode.load(Ordering::Relaxed), mode)
+    let target = Target::unpack(route.target.load(Ordering::Relaxed));
+    bind_admits(target.map(|_| route.mode.load(Ordering::Relaxed)), mode)?;
+    let Some(target) = target
+    else
     {
-        return Err(RouteError::ModeMismatch);
-    }
+        return Err(RouteError::NotRouted);
+    };
     if binding.bit.load(Ordering::Relaxed) != UNBOUND
     {
-        let cpu = Target::unpack(route.target.load(Ordering::Relaxed)).map(|target| target.cpu);
         // SAFETY: caller contract; the binding is bound, on this line.
-        return unsafe { rebind(binding, notification, holder, cpu) };
+        return unsafe { rebind(binding, notification, holder, Some(target.cpu)) };
     }
     let bit = route.masks.free_bit().ok_or(RouteError::TooManyBindings)?;
     // SAFETY: caller contract.
     unsafe { take_reference(holder) }?;
-    let mut first = None;
-    if line_bound
+    // A routed line with no binding is masked already, and its first binding
+    // waits out the line's CPU ([`link_line`]); a line with bindings is masked
+    // until the new receiver's first acknowledgement.
+    let first = if route.bindings.load(Ordering::Relaxed).is_null()
     {
-        Hardware.mask(irq);
+        Some(target)
     }
     else
     {
-        // SAFETY: called after Phase 5 with a line the table covers;
-        // serialised with every other binding change by the routing lock.
-        let routed = unsafe { crate::arch::current::interrupts::route_device_irq(irq, mode) };
-        let target = match routed
-        {
-            Ok(target) => target,
-            Err(error) =>
-            {
-                // SAFETY: the reference taken above.
-                unsafe { give_back_reference(holder) };
-                return Err(error);
-            }
-        };
-        let Some(word) = target.pack()
-        else
-        {
-            // SAFETY: the line was just routed to `target`, under the routing
-            // lock. No delivery can have read a binding: none is linked.
-            unsafe { Hardware.unroute(irq, target) };
-            // SAFETY: the reference taken above.
-            unsafe { give_back_reference(holder) };
-            return Err(RouteError::Exhausted);
-        };
-        route.target.store(word, Ordering::Relaxed);
-        route.mode.store(mode, Ordering::Relaxed);
-        first = Some(target);
-    }
+        Hardware.mask(irq);
+        None
+    };
     binding.holder.store(holder.as_ptr(), Ordering::Relaxed);
     link_line(&Hardware, route, binding, bit, notification, first);
     Ok(None)
+}
+
+/// Route wired line `irq` in `mode` through the Interrupt object whose route
+/// holder flag is `held` (`SYS_IRQ_ROUTE`; module doc § Routes).
+///
+/// A line not routed is routed at its controller in `mode`, masked, to the
+/// next CPU in turn with a free slot, and the object becomes its first
+/// holder. A line routed in `mode` gains the object as a holder; an object
+/// that holds it already changes nothing. The target stays fixed until the
+/// line's release, once neither a holder nor a binding remains.
+///
+/// # Errors
+/// [`RouteError::NoSuchLine`] when the line is past the table or no
+/// controller implements it; [`RouteError::ModeMismatch`] when the line is
+/// routed in another mode; [`RouteError::Exhausted`] when no eligible CPU has
+/// a free slot; [`RouteError::TooManyBindings`] when the holder count would
+/// overflow. Nothing changes on error.
+///
+/// # Safety
+/// `held` is the route holder flag of a live Interrupt object whose source is
+/// `irq`, which calls [`drop_route_holder`] when it is freed with the flag set.
+/// Same context as [`register`].
+#[cfg(not(test))]
+pub unsafe fn route(irq: u32, held: &AtomicBool, mode: u32) -> Result<(), RouteError>
+{
+    if is_message(irq)
+    {
+        return Err(RouteError::NoSuchLine);
+    }
+    ROUTING.with(|routing| {
+        let route = routing
+            .routes
+            .get(irq as usize)
+            .ok_or(RouteError::NoSuchLine)?;
+        let routed = Target::unpack(route.target.load(Ordering::Relaxed))
+            .map(|_| route.mode.load(Ordering::Relaxed));
+        match route_step(routed, held.load(Ordering::Relaxed), mode)?
+        {
+            RouteStep::Held => Ok(()),
+            RouteStep::AddHolder =>
+            {
+                let holders = route
+                    .holders
+                    .load(Ordering::Relaxed)
+                    .checked_add(1)
+                    .ok_or(RouteError::TooManyBindings)?;
+                route.holders.store(holders, Ordering::Relaxed);
+                held.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            RouteStep::Route =>
+            {
+                // SAFETY: called after Phase 5 with a line the table covers;
+                // serialised with every other route change by the routing lock.
+                let target =
+                    unsafe { crate::arch::current::interrupts::route_device_irq(irq, mode) }?;
+                let Some(word) = target.pack()
+                else
+                {
+                    // SAFETY: the line was just routed to `target`, under the
+                    // routing lock; no binding is linked.
+                    unsafe { Hardware.unroute(irq, target) };
+                    return Err(RouteError::Exhausted);
+                };
+                route.target.store(word, Ordering::Relaxed);
+                route.mode.store(mode, Ordering::Relaxed);
+                route.holders.store(1, Ordering::Relaxed);
+                held.store(true, Ordering::Relaxed);
+                routing.sources += 1;
+                Ok(())
+            }
+        }
+    })
+}
+
+/// Give up the route an Interrupt object of line `irq` held (called when the
+/// object, its route holder flag set, is freed): the line is released when
+/// neither another holder nor a binding remains ([`release_line`]).
+///
+/// # Safety
+/// Same context as [`register`]; called once per object that [`route`] made a
+/// holder, after its [`unregister`].
+#[cfg(not(test))]
+pub unsafe fn drop_route_holder(irq: u32)
+{
+    ROUTING.with(|routing| {
+        let Some(route) = routing.routes.get(irq as usize)
+        else
+        {
+            return;
+        };
+        let holders = route.holders.load(Ordering::Relaxed);
+        debug_assert!(holders > 0, "irq: a route holder dropped from a line with none");
+        let holders = holders.saturating_sub(1);
+        route.holders.store(holders, Ordering::Relaxed);
+        if released(holders, route.masks.bound()) && route.target.load(Ordering::Relaxed) != 0
+        {
+            // SAFETY: the routing lock is held.
+            unsafe { release_line(&Hardware, irq, route) };
+            routing.sources -= 1;
+        }
+    });
 }
 
 /// Acknowledge source `irq` through `binding` (`SYS_IRQ_ACK`): clear the
@@ -1388,7 +1558,10 @@ pub unsafe fn unregister(irq: u32, binding: &IrqBinding) -> Option<NonNull<Kerne
             // SAFETY: the routing lock is held, which keeps every linked
             // binding live, and `binding` is bound on `irq`, whose entry is
             // `route`.
-            unsafe { unbind_line(&Hardware, irq, route, binding) };
+            if unsafe { unbind_line(&Hardware, irq, route, binding) } == Settle::Release
+            {
+                routing.sources -= 1;
+            }
         }
         binding.notification.store(null_mut(), Ordering::Relaxed);
         binding.next.store(null_mut(), Ordering::Relaxed);
@@ -1413,14 +1586,16 @@ pub unsafe fn unregister(irq: u32, binding: &IrqBinding) -> Option<NonNull<Kerne
 #[cfg(not(test))]
 pub fn alloc_message() -> Result<u32, RouteError>
 {
-    ROUTING.with(|_| {
+    ROUTING.with(|routing| {
         let target = crate::arch::current::interrupts::alloc_message_target()?;
-        let id = message_id(target);
-        if id.is_none()
+        let Some(id) = message_id(target)
+        else
         {
             crate::arch::current::interrupts::free_message_target(target);
-        }
-        id.ok_or(RouteError::Exhausted)
+            return Err(RouteError::Exhausted);
+        };
+        routing.sources += 1;
+        Ok(id)
     })
 }
 
@@ -1446,7 +1621,7 @@ pub unsafe fn free_message(id: u32)
     {
         return;
     };
-    ROUTING.with(|_| {
+    ROUTING.with(|routing| {
         let Some(entry) = crate::arch::current::interrupts::slot_entry(target)
         else
         {
@@ -1468,6 +1643,7 @@ pub unsafe fn free_message(id: u32)
             Slot::Free | Slot::Line(_) => return,
         }
         crate::arch::current::interrupts::free_message_target(target);
+        routing.sources -= 1;
     });
 }
 
@@ -1491,6 +1667,94 @@ pub fn message(id: u32) -> Option<(u64, u32)>
             address,
             crate::arch::current::interrupts::message_data(target),
         ))
+    })
+}
+
+// ── Interrupt remapping ───────────────────────────────────────────────────────
+
+/// Whether the kernel hands out interrupts in an IOMMU's remappable formats
+/// (`SYS_IRQ_REMAP`), and how wide a remapped destination is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remap
+{
+    /// Compatibility formats: a message or an I/O APIC entry names its CPU
+    /// and vector.
+    Off,
+    /// Remappable formats, each naming a handle, with destinations of 8 bits
+    /// (`extended` clear) or 32 bits (`extended` set).
+    On
+    {
+        /// Whether a remapped destination is a 32-bit (x2APIC) id.
+        extended: bool,
+    },
+}
+
+/// Why interrupt remapping could not be switched or read.
+// dead_code: host test builds compile out the callers that construct it.
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemapError
+{
+    /// The architecture has no interrupt remapping the kernel programs.
+    NotSupported,
+    /// A source exists ([`set_remap`]), or remapping is off, or the source
+    /// holds no slot ([`remap_entry`]).
+    State,
+}
+
+/// Switch the formats the kernel hands out (`SYS_IRQ_REMAP`): only while no
+/// line is routed and no message target is minted, so every source's message
+/// or entry is in the format of the switch's current setting, and none is
+/// reprogrammed.
+///
+/// # Errors
+/// [`RemapError::State`] while a source exists; [`RemapError::NotSupported`]
+/// on an architecture with no interrupt remapping.
+///
+/// Outside interrupt context (it takes the routing lock).
+#[cfg(not(test))]
+pub fn set_remap(remap: Remap) -> Result<(), RemapError>
+{
+    ROUTING.with(|routing| {
+        if routing.sources != 0
+        {
+            return Err(RemapError::State);
+        }
+        crate::arch::current::interrupts::set_remap(remap)
+    })
+}
+
+/// The remapping entry an IOMMU needs for source `id`, a routed line or a
+/// minted message target, packed for `SYS_CAP_INFO`'s
+/// `CAP_INFO_IRQ_REMAP_ENTRY` (`arch::current::interrupts::remap_entry`).
+///
+/// # Errors
+/// [`RemapError::State`] with remapping off or when `id` names no routed line
+/// or minted target; [`RemapError::NotSupported`] on an architecture with no
+/// interrupt remapping.
+///
+/// Outside interrupt context (it takes the routing lock).
+#[cfg(not(test))]
+pub fn remap_entry(id: u32) -> Result<u64, RemapError>
+{
+    ROUTING.with(|routing| {
+        let target = if is_message(id)
+        {
+            let target = message_target(id).ok_or(RemapError::State)?;
+            let entry =
+                crate::arch::current::interrupts::slot_entry(target).ok_or(RemapError::State)?;
+            if !matches!(entry.load(), Slot::Unbound | Slot::Bound(_))
+            {
+                return Err(RemapError::State);
+            }
+            target
+        }
+        else
+        {
+            let route = routing.routes.get(id as usize).ok_or(RemapError::State)?;
+            Target::unpack(route.target.load(Ordering::Relaxed)).ok_or(RemapError::State)?
+        };
+        crate::arch::current::interrupts::remap_entry(target)
     })
 }
 
@@ -1751,18 +2015,36 @@ mod tests
     }
 
     #[test]
-    fn a_line_with_no_binding_takes_any_mode()
+    fn an_unrouted_line_is_routed_in_any_mode()
     {
-        assert!(mode_admits(false, 0, 0));
-        assert!(mode_admits(false, 0, 3));
+        assert_eq!(route_step(None, false, 0), Ok(RouteStep::Route));
+        assert_eq!(route_step(None, false, 3), Ok(RouteStep::Route));
     }
 
     #[test]
-    fn a_bound_line_takes_only_its_recorded_mode()
+    fn a_routed_line_takes_holders_only_in_its_mode()
     {
-        assert!(mode_admits(true, 1, 1));
-        assert!(!mode_admits(true, 1, 0));
-        assert!(!mode_admits(true, 0, 3));
+        assert_eq!(route_step(Some(1), false, 1), Ok(RouteStep::AddHolder));
+        assert_eq!(route_step(Some(1), true, 1), Ok(RouteStep::Held));
+        assert_eq!(route_step(Some(1), false, 0), Err(RouteError::ModeMismatch));
+        assert_eq!(route_step(Some(1), true, 3), Err(RouteError::ModeMismatch));
+    }
+
+    #[test]
+    fn a_binding_needs_a_route_in_its_mode()
+    {
+        assert_eq!(bind_admits(None, 0), Err(RouteError::NotRouted));
+        assert_eq!(bind_admits(Some(2), 2), Ok(()));
+        assert_eq!(bind_admits(Some(2), 0), Err(RouteError::ModeMismatch));
+    }
+
+    #[test]
+    fn a_line_is_released_once_no_holder_and_no_binding_remain()
+    {
+        assert!(released(0, 0));
+        assert!(!released(1, 0));
+        assert!(!released(0, 1));
+        assert!(!released(2, 0b101));
     }
 
     #[test]
@@ -2175,6 +2457,7 @@ mod tests
             bindings: AtomicPtr::new(null_mut()),
             mode: AtomicU32::new(0),
             target: AtomicU32::new(ROUTED.pack().unwrap()),
+            holders: AtomicU32::new(0),
             masks: empty_masks(),
         }
     }
@@ -2324,6 +2607,47 @@ mod tests
         assert_eq!(route.masks.owing.load(Ordering::SeqCst), 1 << 0);
         assert!(stand.masked());
         assert!(route.masks.ack(0));
+    }
+
+    // Defect caught: a line's last unbind releasing a route a holder object
+    // still holds (`SYS_IRQ_ROUTE`), so the line's target moves under the
+    // remapping entry devmgr had written for it, and the holder's next driver
+    // binds a line that is not routed; or the unbind leaving the line unmasked
+    // with no receiver.
+    #[test]
+    fn a_held_line_stays_routed_and_masked_after_its_last_unbind()
+    {
+        let gate = DeliveryGate::new();
+        let slot = SlotEntry::free();
+        slot.store(Slot::Line(LINE));
+        let (stand, _waits) = Stand::new(&gate, &slot);
+        let route = routed_line();
+        route.holders.store(1, Ordering::SeqCst);
+        let a = IrqBinding::unbound();
+        link_line(&stand, &route, &a, 0, note(1), None);
+        route.masks.ack(0);
+        stand.unmask(LINE);
+
+        // SAFETY: `a` is bound on the line and outlives the call; no delivery
+        // runs.
+        assert_eq!(
+            unsafe { unbind_line(&stand, LINE, &route, &a) },
+            Settle::StayMasked
+        );
+        assert_eq!(Target::unpack(route.target.load(Ordering::SeqCst)), Some(ROUTED));
+        assert_eq!(slot.load(), Slot::Line(LINE));
+        assert!(stand.masked());
+
+        // With no holder left, the same last unbind releases the line.
+        route.holders.store(0, Ordering::SeqCst);
+        link_line(&stand, &route, &a, 0, note(1), None);
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { unbind_line(&stand, LINE, &route, &a) },
+            Settle::Release
+        );
+        assert_eq!(route.target.load(Ordering::SeqCst), 0);
+        assert_eq!(slot.load(), Slot::Free);
     }
 
     // Defect caught: a line's release returning while a delivery that read the

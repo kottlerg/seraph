@@ -15,6 +15,9 @@
 //! - `SYS_IOPORT_SPLIT` (51): split an `IoPort` cap into two sub-ranges
 //!   (`x86_64` only).
 //! - `SYS_IRQ_MSG_ALLOC` (62): mint a message-signaled `Interrupt` cap.
+//! - `SYS_IRQ_ROUTE` (63): route a wired line at its controller.
+//! - `SYS_IRQ_REMAP` (64): switch the kernel's interrupt formats to an
+//!   IOMMU's interrupt remapping.
 //!
 //! # Adding new hardware syscalls
 //! 1. Define the `SYS_*` number in `abi/syscall/src/lib.rs`.
@@ -108,10 +111,9 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = Interrupt cap index (must have NOTIFY right).
 /// arg1 = Notification cap index (must have NOTIFY right).
 /// arg2 = the line's mode (`IRQ_MODE_LEVEL`, `IRQ_MODE_ACTIVE_LOW`; 0 is
-///        edge-triggered, active-high). The line's first binding records it and
-///        routes the line in it; every later binding must pass the same mode
-///        (`irq` module doc § Mode). A message-signaled target takes mode 0
-///        only.
+///        edge-triggered, active-high): the mode the line is routed in
+///        (`SYS_IRQ_ROUTE`; `irq` module doc § Mode). A message-signaled
+///        target takes mode 0 only.
 ///
 /// Binds the cap's own object (each copy of an Interrupt cap is an object of
 /// its own) to the Notification; a line holds one binding per bound object, up
@@ -125,12 +127,11 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///    `SYS_NOTIFICATION_WAIT` for it is woken.
 /// 4. Each driver calls `SYS_IRQ_ACK`; the line is unmasked once none owes.
 ///
-/// The line's first binding routes it: on `x86_64` it assigns the GSI a device
-/// IDT vector and programs its IOAPIC redirection entry with the mode's trigger
-/// and polarity, on RISC-V it assigns the APLIC source a target hart and an
-/// identity in that hart's IMSIC file and programs its source mode from the
-/// mode, masked until the first ACK in both cases. A later binding masks the
-/// line, which stays masked until that binding's first ACK.
+/// A wired line is bound only once routed (`SYS_IRQ_ROUTE`), which gave it its
+/// target and left it masked; a binding masks the line, which stays masked
+/// until that binding's first ACK. The route lasts while a holder object or a
+/// binding remains, so the line's target does not move while a driver
+/// rebinds it.
 ///
 /// A message-signaled target (`SYS_IRQ_MSG_ALLOC`) was given its CPU and slot
 /// at its mint and is never masked: it takes one binding, which receives every
@@ -138,10 +139,9 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns 0 on success; `InvalidArgument` for an id no discovered controller
 /// implements, a mode with a bit outside `IRQ_MODE_MASK`, a mode other than
-/// the one the line's bindings recorded, or a mode other than 0 for a
-/// message-signaled target; `QuotaExceeded` when the controller has no delivery
-/// resource left (no CPU with a free device vector on x86-64, or a free IMSIC
-/// identity on RISC-V), the line already holds `MAX_IRQ_BINDINGS` bindings,
+/// the one the line is routed in, or a mode other than 0 for a
+/// message-signaled target; `InvalidState` for a line not routed;
+/// `QuotaExceeded` when the line already holds `MAX_IRQ_BINDINGS` bindings,
 /// the message-signaled target is already bound, or the Notification holds as
 /// many references as it may.
 ///
@@ -214,11 +214,10 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     #[allow(clippy::cast_ptr_alignment)]
     let sig_state = unsafe { (*sig_obj.as_ptr().cast::<NotificationObject>()).state };
 
-    // Bind the cap's object to the notification, routing the line at its
-    // controller for its first binding (left masked: the x86_64 IOAPIC
-    // redirection entry, the RISC-V APLIC source; the driver unmasks via
-    // SYS_IRQ_ACK after registering), under the table's routing lock. The
-    // binding takes a reference on the Notification object.
+    // Bind the cap's object to the notification, on a line routed by
+    // SYS_IRQ_ROUTE, under the table's routing lock; the line is masked until
+    // the driver acknowledges (SYS_IRQ_ACK) after registering. The binding
+    // takes a reference on the Notification object.
     // SAFETY: syscall context, no IPC source, scheduler, or sleep-list lock held;
     // sig_state is the live state of `sig_obj`, which `sig_slot`'s pin keeps
     // live for the call; `io` is live, its line is `irq_id`, and its dealloc
@@ -233,6 +232,7 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
         crate::irq::RouteError::Exhausted
         | crate::irq::RouteError::TooManyBindings
         | crate::irq::RouteError::ReferenceLimit => SyscallError::QuotaExceeded,
+        crate::irq::RouteError::NotRouted => SyscallError::InvalidState,
     })?;
 
     // A rebind gave up the reference its binding held on the Notification it
@@ -386,6 +386,171 @@ pub fn sys_irq_msg_alloc(tf: UserFrame) -> Result<u64, SyscallError>
 
 #[cfg(test)]
 pub fn sys_irq_msg_alloc(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+// ── SYS_IRQ_ROUTE ────────────────────────────────────────────────────────────
+
+/// `SYS_IRQ_ROUTE` (63): route a wired interrupt line at its controller.
+///
+/// arg0 = single-line `Interrupt` cap handle carrying `RIGHTS_IRQ_MINT`.
+/// arg1 = the line's mode (`IRQ_MODE_LEVEL`, `IRQ_MODE_ACTIVE_LOW`; 0 is
+///        edge-triggered, active-high).
+///
+/// A line not routed is routed in the mode, masked, to the next CPU in turn
+/// with a free delivery slot: on `x86_64` the GSI is given a device IDT vector
+/// and its I/O APIC redirection entry is programmed, in the compatibility
+/// format or, with interrupt remapping on (`SYS_IRQ_REMAP`), the remappable
+/// one naming the vector's handle; on RISC-V the APLIC source is given a
+/// target hart and an identity in that hart's IMSIC file. The cap's object
+/// becomes the route's holder. A line routed in the same mode gains the
+/// object as a holder too; through an object that holds the route already
+/// the call changes nothing (`irq::route`).
+///
+/// The route, and so the line's target, lasts until neither a holder object
+/// nor a binding (`SYS_IRQ_REGISTER`) remains: a holder object holds it until
+/// it is deleted or revoked. devmgr routes each line it hands out, so the
+/// IOMMU driver can write the line's remapping entry
+/// (`CAP_INFO_IRQ_REMAP_ENTRY`) before a driver binds and unmasks it, and
+/// the line's target does not move while a driver rebinds it.
+///
+/// Returns 0 on success; `InvalidCapability` for a handle that names no
+/// `Interrupt` cap; `InsufficientRights` when it lacks `RIGHTS_IRQ_MINT`;
+/// `InvalidArgument` for a range cap, a message-signaled target, an id no
+/// discovered controller implements, a mode with a bit outside
+/// `IRQ_MODE_MASK`, or a mode other than the one the line is routed in;
+/// `QuotaExceeded` when no eligible CPU has a free delivery slot, or the line
+/// holds as many holders as it may.
+#[cfg(not(test))]
+pub fn sys_irq_route(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::object::InterruptObject;
+    use crate::cap::slot::IrqRights;
+    use crate::syscall::current_tcb;
+
+    let irq_cap_idx = tf.arg(0);
+    let mode = tf.arg(1);
+    if mode & !syscall::IRQ_MODE_MASK != 0
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // IRQ_MODE_MASK is two bits, so a mode that passed the check fits a u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let mode = mode as u32;
+
+    // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+    // CPU's current thread.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null; cspace set at thread creation.
+    let cspace = unsafe { (*tcb).cspace };
+
+    // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
+    // rejects a null cspace and checks tag and rights.
+    let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::MINT) }?;
+    let irq_obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
+    // constructed in place at a size-class-aligned retype offset, and
+    // `irq_slot`'s pin keeps it live for this call.
+    #[allow(clippy::cast_ptr_alignment)]
+    let io = unsafe { &*irq_obj.as_ptr().cast::<InterruptObject>() };
+    if io.count != 1
+        || crate::irq::is_message(io.start)
+        || !(crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID)
+            .contains(&io.start)
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // SAFETY: syscall context, no IPC source, scheduler, or sleep-list lock
+    // held; `io` is live, its line is `io.start`, and its dealloc arm calls
+    // `irq::drop_route_holder` when the flag is set.
+    unsafe { crate::irq::route(io.start, &io.route_held, mode) }.map_err(|e| match e
+    {
+        crate::irq::RouteError::NoSuchLine | crate::irq::RouteError::ModeMismatch =>
+        {
+            SyscallError::InvalidArgument
+        }
+        crate::irq::RouteError::Exhausted
+        | crate::irq::RouteError::TooManyBindings
+        | crate::irq::RouteError::ReferenceLimit => SyscallError::QuotaExceeded,
+        // `route` does not return it; a line it refuses is no line.
+        crate::irq::RouteError::NotRouted => SyscallError::InvalidState,
+    })?;
+    Ok(0)
+}
+
+#[cfg(test)]
+pub fn sys_irq_route(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+// ── SYS_IRQ_REMAP ────────────────────────────────────────────────────────────
+
+/// `SYS_IRQ_REMAP` (64): switch the formats the kernel hands out to an IOMMU's
+/// interrupt remapping.
+///
+/// arg0 = `Interrupt` cap handle carrying `RIGHTS_IRQ_MINT`.
+/// arg1 = `IRQ_REMAP_OFF`, `IRQ_REMAP_ON`, or `IRQ_REMAP_ON_EXTENDED`.
+///
+/// With remapping off, an I/O APIC entry and a message name their CPU and
+/// vector in the compatibility formats. With it on, each names the handle of
+/// the remapping entry its vector's CPU and vector own (`CAP_INFO_IRQ_REMAP_ENTRY`),
+/// whose entry the IOMMU driver writes; `IRQ_REMAP_ON` places sources only on
+/// CPUs whose APIC id fits 8 bits, `IRQ_REMAP_ON_EXTENDED` on any CPU with
+/// handles. devmgr turns remapping on once the IOMMU driver has enabled the
+/// remapping table, before it routes a line or mints a target.
+///
+/// Returns 0 on success; `InvalidCapability` for a handle that names no
+/// `Interrupt` cap; `InsufficientRights` when it lacks `RIGHTS_IRQ_MINT`;
+/// `InvalidArgument` for another setting; `InvalidState` while a line is
+/// routed or a message-signaled target is minted (`irq::set_remap`);
+/// `NotSupported` on an architecture with no interrupt remapping the kernel
+/// programs (riscv64).
+#[cfg(not(test))]
+pub fn sys_irq_remap(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::slot::IrqRights;
+    use crate::irq::Remap;
+    use crate::syscall::current_tcb;
+
+    let remap = match tf.arg(1)
+    {
+        syscall::IRQ_REMAP_OFF => Remap::Off,
+        syscall::IRQ_REMAP_ON => Remap::On { extended: false },
+        syscall::IRQ_REMAP_ON_EXTENDED => Remap::On { extended: true },
+        _ => return Err(SyscallError::InvalidArgument),
+    };
+
+    // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+    // CPU's current thread.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null; cspace set at thread creation.
+    let cspace = unsafe { (*tcb).cspace };
+    // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
+    // rejects a null cspace and checks tag and rights.
+    let authority = unsafe { super::lookup_cap(cspace, tf.arg(0), IrqRights::MINT) }?;
+
+    crate::irq::set_remap(remap).map_err(|e| match e
+    {
+        crate::irq::RemapError::State => SyscallError::InvalidState,
+        crate::irq::RemapError::NotSupported => SyscallError::NotSupported,
+    })?;
+    drop(authority);
+    Ok(0)
+}
+
+#[cfg(test)]
+pub fn sys_irq_remap(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

@@ -998,6 +998,9 @@ pub struct InterruptObject
     lineage: RangeLineage,
     /// This capability's binding of its line; unbound on a range cap.
     pub binding: crate::irq::IrqBinding,
+    /// Whether this capability holds its line's route (`SYS_IRQ_ROUTE`,
+    /// `irq::route`); set under the routing lock, never on a copy.
+    pub route_held: AtomicBool,
 }
 
 // InterruptObject fits the 128-byte size class of the SEED mints
@@ -1020,6 +1023,7 @@ impl InterruptObject
             count,
             lineage: RangeLineage::new_root(),
             binding: crate::irq::IrqBinding::unbound(),
+            route_held: AtomicBool::new(false),
         }
     }
 }
@@ -3644,6 +3648,15 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // `irq::unregister` requires; the object stays live until the
             // release below.
             let notification = unsafe { crate::irq::unregister(start, &obj.binding) };
+            // Give up the line's route this capability held, after its own
+            // binding is gone, so the line is released once neither a holder
+            // nor a binding remains.
+            if obj.route_held.load(Ordering::Relaxed)
+            {
+                // SAFETY: the context `irq::unregister` required above; `route`
+                // set the flag for this object, once.
+                unsafe { crate::irq::drop_route_holder(start) };
+            }
             // Release the reference the binding held on its Notification, now
             // that no delivery can reach it; a Notification whose last
             // reference this was is torn down from the cascade stack.

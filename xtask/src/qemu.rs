@@ -106,8 +106,12 @@ impl X86Paging
 }
 
 /// The DMA test device a test launch attaches (`--test-devices`): QEMU's
-/// `edu` (PCI `1234:11e8`), with its default 28-bit DMA mask.
-const EDU_DEVICE: &str = "edu";
+/// `edu` (PCI `1234:11e8`), its DMA mask widened from the default 28 bits to
+/// 32, so its DMA engine reaches the interrupt addresses svctest's
+/// forged-message phase writes (the riscv64 IMSIC files at `0x2800_0000`,
+/// the `x86_64` interrupt range at `0xFEE0_0000`); a narrower mask truncates
+/// them.
+const EDU_DEVICE: &str = "edu,dma_mask=0xffffffff";
 
 /// The QEMU `pci-testdev` functions (PCI `1b36:0005`) a test launch attaches
 /// (`--test-devices`) for the test-only `test-fault` fixture, which takes its

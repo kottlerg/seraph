@@ -952,12 +952,12 @@ pub fn unmask(irq: u32)
 /// Route device IRQ (APLIC source) `irq`, leaving it masked at the controller: pick
 /// its target hart (the next in turn with a free IMSIC identity,
 /// `irq::next_target_cpu`), take an identity in that hart's file, and program the
-/// source's trigger and polarity from `mode` (the `SYS_IRQ_REGISTER` word, which
-/// `irq::register` validated and recorded) and its target (`aia::route`). The driver
+/// source's trigger and polarity from `mode` (the `SYS_IRQ_ROUTE` word, which
+/// `irq::route` validated and recorded) and its target (`aia::route`). The driver
 /// unmasks via `SYS_IRQ_ACK` once it has registered a handler. Returns the hart and
-/// identity. Called by `irq::register` for the source's first binding; the route is
-/// kept while any binding remains, and released (`unroute_device_irq`) when the last
-/// goes, so the source is not routed when this runs.
+/// identity. Called by `irq::route` for the source's first route holder; the route is
+/// kept while a holder or a binding remains, and released (`unroute_device_irq`) when
+/// neither does, so the source is not routed when this runs.
 ///
 /// # Errors
 /// `NoSuchLine` for a source outside `1..=aia::source_count()`; `Exhausted` when no
@@ -985,6 +985,38 @@ pub unsafe fn route_device_irq(
 ) -> Result<crate::irq::Target, crate::irq::RouteError>
 {
     Ok(crate::irq::Target { cpu: 0, slot: 1 })
+}
+
+/// The kernel programs no interrupt remapping on riscv64: a device's message writes are
+/// confined by the RISC-V IOMMU's translation of the interrupt files
+/// (docs/device-management.md § IOMMU Discovery and Programming).
+///
+/// # Errors
+/// Always `RemapError::NotSupported`.
+#[cfg(not(test))]
+pub fn set_remap(_remap: crate::irq::Remap) -> Result<(), crate::irq::RemapError>
+{
+    Err(crate::irq::RemapError::NotSupported)
+}
+
+/// No remapping entry exists on riscv64 ([`set_remap`]).
+///
+/// # Errors
+/// Always `RemapError::NotSupported`.
+#[cfg(not(test))]
+pub fn remap_entry(_target: crate::irq::Target) -> Result<u64, crate::irq::RemapError>
+{
+    Err(crate::irq::RemapError::NotSupported)
+}
+
+/// No remapping table exists on riscv64 ([`set_remap`]).
+///
+/// # Errors
+/// Always `RemapError::NotSupported`.
+#[cfg(not(test))]
+pub fn remap_handles() -> Result<u64, crate::irq::RemapError>
+{
+    Err(crate::irq::RemapError::NotSupported)
 }
 
 /// Release APLIC source `irq`'s route: disable it, make it inactive, and free its

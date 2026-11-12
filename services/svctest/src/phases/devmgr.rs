@@ -6,7 +6,7 @@
 //! devmgr surface — the class, `QUERY_SHUTDOWN_DEVICE`, and `BIND_DRIVERS`
 //! authority gates, the instance ordinal of `QUERY_DEVICE`, the on-demand
 //! bind with its settle, mid-bootstrap teardown (#176), and withdrawal, DMA
-//! confinement, and MSI delivery, churn, and release.
+//! confinement, and MSI delivery, forgery, churn, and release.
 //!
 //! The deny phases send the gated labels on `devmgr.registry`, a cap
 //! carrying `REGISTRY_QUERY_AUTHORITY` but none of `CLASS_AUTHORITY`,
@@ -55,6 +55,13 @@
 //! capability with the message of a vector it minted and, where the IOMMU
 //! translates the device's message writes (RISC-V), made the target's
 //! interrupt file reachable through the device's domain (`MAP_MSI`).
+//!
+//! The forged-message phase (`MSI_FORGE`) has the confined device's DMA
+//! engine write its own message, which must be delivered, and a forged one,
+//! which must not be: on riscv64 the interrupt file page beside its target's,
+//! which the IOMMU must block and devmgr count as the device's fault; on
+//! `x86_64` a remappable message naming a handle no remapping entry holds,
+//! after asserting the fixture's own message is remappable.
 //!
 //! The MSI churn phase asks the fixture to delete, while the device raises
 //! its MSI in a loop, the `Interrupt` cap bound to it, and then the bound
@@ -110,6 +117,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "devmgr_msi_delivery",
             run: msi_delivery_phase,
+        },
+        Phase {
+            name: "devmgr_msi_forge",
+            run: msi_forge_phase,
         },
         Phase {
             name: "devmgr_msi_churn",
@@ -623,6 +634,63 @@ fn msi_delivery_phase(caps: &Caps)
         ipc::test_dma_labels::INTERRUPT_WAIT_MS
     );
     std::os::seraph::log!("devmgr_msi_delivery passed: the edu device's MSI was delivered");
+}
+
+/// A confined device's message reaches only the targets devmgr gave it. The
+/// fixture has the `edu` device's DMA engine write its own message, which is
+/// delivered, then a forged one, which is not. On riscv64 the forged write
+/// goes to the interrupt file page beside its target's, which the device's
+/// domain does not map, so the IOMMU blocks it and devmgr counts the fault
+/// for the device at that page. On `x86_64` the fixture's message must be
+/// remappable, and the forged write names a remapping handle no entry holds;
+/// QEMU's DMA engine writes carry no requester, so the remapping fault is
+/// not attributed to the device, and the check there is non-delivery, not
+/// an attributed fault. An unconfined device makes no forged write.
+fn msi_forge_phase(caps: &Caps)
+{
+    const PHASE: &str = "devmgr_msi_forge";
+    let probe = call_test_dma(caps, ipc::test_dma_labels::MSI_FORGE, PHASE);
+    assert_eq!(probe.label, ipc::devmgr_errors::SUCCESS, "{PHASE}: MSI_FORGE status");
+    let made = probe.word(1) != 0;
+    if probe.word(0) != ipc::devmgr_dma_labels::DMA_CONFINED
+    {
+        assert!(!made, "{PHASE}: the fixture forged a message for an unconfined device");
+        std::os::seraph::log!("{PHASE} passed unconfined: no forged write is made");
+        return;
+    }
+    let (own, forged_delivered) = (probe.word(2) != 0, probe.word(3) != 0);
+    let (address, forged, faults, last_fault) =
+        (probe.word(4), probe.word(5), probe.word(6), probe.word(7));
+    if cfg!(target_arch = "x86_64")
+    {
+        // Bit 4 of the message address: the remappable format.
+        assert!(
+            address & (1 << 4) != 0,
+            "{PHASE}: the confined device's message address {address:#x} is not remappable"
+        );
+    }
+    assert!(made, "{PHASE}: the fixture made no forged write (own message {address:#x})");
+    assert!(
+        own,
+        "{PHASE}: the device's write of its own message to {address:#x} was not delivered"
+    );
+    assert!(
+        !forged_delivered,
+        "{PHASE}: the device's forged message to {forged:#x} was delivered"
+    );
+    if cfg!(target_arch = "riscv64")
+    {
+        assert!(faults >= 1, "{PHASE}: no IOMMU fault taken for the forged write");
+        assert_eq!(
+            last_fault,
+            forged & !0xfff,
+            "{PHASE}: the latest fault names another page than the forged write's"
+        );
+    }
+    std::os::seraph::log!(
+        "{PHASE} passed: own message at {address:#x} delivered, forged message at {forged:#x} \
+         not delivered ({faults} faults)"
+    );
 }
 
 /// The `edu` device raises its MSI in a loop while the fixture deletes the

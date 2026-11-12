@@ -2371,6 +2371,34 @@ pub mod test_dma_labels
     /// How long the fixture waits between its [`FIXTURE_EXIT`] reply and its
     /// exit.
     pub const EXIT_DELAY_MS: u64 = 100;
+    /// Run the forged-message probe, when an IOMMU confines the device and
+    /// the fixture holds an MSI vector: have the device's DMA engine write
+    /// the fixture's own message (`SYS_CAP_INFO`'s
+    /// `CAP_INFO_IRQ_MSG_ADDRESS` and `CAP_INFO_IRQ_MSG_DATA`) to its own
+    /// address and wait for it on the fixture's notification for at most
+    /// [`INTERRUPT_WAIT_MS`], then write the same data to a forged message
+    /// address the device's targets do not allow and wait as long again. On
+    /// riscv64 the forged address is the interrupt file page beside the
+    /// target's (the paired hart's file, its own address with bit 12
+    /// flipped), and the fixture then asks for its faults as [`DMA_PROBE`]
+    /// does, until one names that page. On `x86_64` it is a remappable
+    /// message naming handle `0xFFFF`, which no remapping table holds, made
+    /// only when the fixture's own message is remappable; QEMU records no
+    /// requester for a fault the DMA engine's write raises, so devmgr
+    /// cannot count it for the device, and no fault is asked for. Request:
+    /// no data. Reply: `SUCCESS` with `data[0]` = whether an IOMMU confines
+    /// the device (`devmgr_dma_labels::DMA_CONFINED`) or not (0); `data[1]`
+    /// = whether the forged write was made (1) or not (0: the device is not
+    /// confined, the fixture holds no MSI vector, or on `x86_64` its message
+    /// is not remappable); `data[2]` = whether the device's write of the
+    /// fixture's own message reached the notification (1) or not (0);
+    /// `data[3]` = whether the forged write reached it (1) or not (0);
+    /// `data[4]` = the fixture's own message address, 0 when the device is
+    /// not confined or holds no MSI vector; `data[5]` = the forged address;
+    /// `data[6]` = the IOMMU faults devmgr has taken for the device and
+    /// `data[7]` the IOVA of the latest. Any other reply label is a setup
+    /// failure.
+    pub const MSI_FORGE: u64 = 5;
 }
 
 /// Why [`report_driver_ready`] failed.

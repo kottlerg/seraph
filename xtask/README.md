@@ -134,14 +134,15 @@ is a superset that `xtask` does not expose (see
 Every `run` attaches, on both architectures, the disk image as `virtio-blk-pci` (drive `hd0`), a
 `virtio-keyboard-pci` keyboard (`id=kbd0`, the device `test-terminal` injects keys into over QMP), a
 `virtio-rng-pci` boot-entropy source, the guest UART on `-serial stdio`, and, unless `--iommu
-absent`, the machine's IOMMU: `intel-iommu,intremap=on,eim=on` on x86-64, whose interrupt
-remapping makes a KVM launch's machine `q35,kernel-irqchip=split`, and `riscv-iommu-pci` in Bare
-mode on riscv64, with the disks and the keyboard behind it (`iommu_platform=on`); the RNG, which
-only the firmware drives, stays outside it. The riscv64 IOMMU is the first device of the command
-line, pinned at 00:01.0, so every auto-placed device takes a slot above it: QEMU's ACPI RIMT
-describes the IOMMU as translating only the requester IDs above its own. `--test-devices` adds, on
-both architectures, `-device edu`, QEMU's DMA test device (PCI `1234:11e8`), behind the IOMMU when
-one is attached, which only svctest's DMA confinement phase drives
+absent`, the machine's IOMMU: `intel-iommu,intremap=on,eim=on` on x86-64, whose interrupt remapping
+makes a KVM launch's machine `q35,kernel-irqchip=split`, and `riscv-iommu-pci` in Bare mode on
+riscv64, with the disks and the keyboard behind it (`iommu_platform=on`); the RNG, which only the
+firmware drives, stays outside it. The riscv64 IOMMU is the first device of the command line, pinned
+at 00:01.0, so every auto-placed device takes a slot above it: QEMU's ACPI RIMT describes the IOMMU
+as translating only the requester IDs above its own. `--test-devices` adds, on both architectures,
+`-device edu,dma_mask=0xffffffff`, QEMU's DMA test device (PCI `1234:11e8`) with a 32-bit DMA mask
+so its engine reaches the interrupt addresses, behind the IOMMU when one is attached, which only
+svctest's DMA confinement phase drives
 ([services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md)), and four QEMU
 `pci-testdev` functions (PCI `1b36:0005`) at pinned slots 0x15, 0x16, 0x17 (`membar=4K`) and 0x18
 (`membar=8K`), which the test-only `test-fault` driver binds

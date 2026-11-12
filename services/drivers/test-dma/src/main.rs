@@ -28,7 +28,13 @@
 //! and whether the copy after the unmap reached the page. Behind an IOMMU it
 //! does not, and the IOMMU records a fault for it, which the driver waits to
 //! see counted by devmgr (`devmgr_dma_labels::DMA_FAULTS`) and reports with
-//! the probe.
+//! the probe. `ipc::test_dma_labels::MSI_FORGE` has the device's DMA engine
+//! write the driver's own message to its message address, which must be
+//! delivered, and then to a forged message address its targets do not allow,
+//! which must not: on riscv64 the IOMMU blocks the write and records a fault,
+//! which devmgr counts for the device; on `x86_64` interrupt remapping finds no
+//! entry for the forged handle, and the probe can observe only that the write
+//! is not delivered, since QEMU records no requester for the fault.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -55,7 +61,8 @@ driver_binding::driver_declaration!(Declaration {
         msi_vectors: 1,
     },
     dma: true,
-    // The edu device's default DMA mask is 28 bits.
+    // The edu device's default DMA mask is 28 bits; a test launch widens
+    // it, but the fixture's mappings keep within the default.
     dma_width: Some(28),
     phys_access: false,
     reset: Reset::None,
@@ -86,8 +93,10 @@ const CMD_RUN: u64 = 1 << 0;
 const CMD_TO_MEMORY: u64 = 1 << 1;
 /// The device address of the device's DMA buffer.
 const DEVICE_BUFFER: u64 = 0x4_0000;
-/// The DMA reach of the device: its default DMA mask is 28 bits, and it
-/// truncates a wider address.
+/// The DMA reach the fixture declares, and devmgr's device addresses for it
+/// stay below: 28 bits, the `edu` device's default DMA mask. A test launch
+/// widens the device's mask to 32 bits, so the forged-message probe reaches
+/// the interrupt addresses, which it writes without a mapping.
 const DMA_REACH: u64 = 1 << 28;
 /// Bytes of the probe page.
 const PAGE_BYTES: usize = 4096;
@@ -95,6 +104,19 @@ const PAGE_BYTES: usize = 4096;
 const PROBE_LEN: usize = 256;
 /// Where in the page the copies back to memory land.
 const BACK_OFFSET: usize = 0x800;
+/// Bytes of a message-signaled interrupt's data, which a device writes to
+/// its message address.
+const MESSAGE_BYTES: u64 = 4;
+/// Bit 4 of an `x86_64` message address: the remappable format (Intel VT-d
+/// specification, "Interrupt Requests in Remappable Format").
+#[cfg(target_arch = "x86_64")]
+const ADDRESS_REMAPPABLE: u64 = 1 << 4;
+/// The remappable message address naming handle `0xFFFF`, with the
+/// subhandle valid: `0xFEE` in bits 31:20, handle bits 14:0 in bits 19:5, the
+/// format bit, the subhandle-valid bit, and handle bit 15 in bit 2. The
+/// kernel gives no target that handle, so no remapping table holds it.
+#[cfg(target_arch = "x86_64")]
+const FORGED_REMAPPABLE: u64 = 0xFEE0_0000 | (0x7FFF << 5) | ADDRESS_REMAPPABLE | (1 << 3) | (1 << 2);
 /// How long one transfer may take: the device starts a transfer on a 100 ms
 /// timer, so a transfer that has not completed in 2 s never will.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
@@ -156,14 +178,20 @@ impl Driver
         unsafe { core::ptr::write_volatile((self.regs + off) as *mut u64, value) };
     }
 
-    /// Copy `PROBE_LEN` bytes from `src` to `dst` with `cmd`'s direction and
-    /// wait for the device to complete it; `false` when it does not within
-    /// [`TRANSFER_TIMEOUT`].
+    /// Copy `PROBE_LEN` bytes from `src` to `dst` ([`Driver::transfer_bytes`]).
     fn transfer(&self, src: u64, dst: u64, to_memory: bool) -> bool
+    {
+        self.transfer_bytes(src, dst, PROBE_LEN as u64, to_memory)
+    }
+
+    /// Copy `len` bytes from `src` to `dst`, from the device's buffer to
+    /// memory when `to_memory`, and wait for the device to complete it;
+    /// `false` when it does not within [`TRANSFER_TIMEOUT`].
+    fn transfer_bytes(&self, src: u64, dst: u64, len: u64, to_memory: bool) -> bool
     {
         self.write64(DMA_SRC, src);
         self.write64(DMA_DST, dst);
-        self.write64(DMA_CNT, PROBE_LEN as u64);
+        self.write64(DMA_CNT, len);
         let dir = if to_memory { CMD_TO_MEMORY } else { 0 };
         self.write64(DMA_CMD, CMD_RUN | dir);
         let start = Instant::now();
@@ -393,6 +421,148 @@ impl Driver
     }
 }
 
+/// What the forged-message probe found (`test_dma_labels::MSI_FORGE`).
+#[derive(Clone, Copy, Default)]
+struct Forge
+{
+    /// Whether an IOMMU confines the device.
+    confined: bool,
+    /// Whether the forged write was made.
+    made: bool,
+    /// Whether the device's write of the fixture's own message reached its
+    /// notification.
+    own_delivered: bool,
+    /// Whether the forged write reached it.
+    forged_delivered: bool,
+    /// The fixture's own message address.
+    address: u64,
+    /// The forged message address.
+    forged: u64,
+    /// The IOMMU faults devmgr has taken for the device, and the IOVA of the
+    /// latest.
+    faults: u64,
+    last_fault: u64,
+}
+
+impl Driver
+{
+    /// Run the forged-message probe (`test_dma_labels::MSI_FORGE`): with
+    /// the device confined and an MSI vector held, stage the fixture's own
+    /// message data in the device's buffer, have the device write it to the
+    /// fixture's own message address and then to [`forged_address`]'s, and
+    /// report each write's delivery and, on riscv64, the device's faults
+    /// once the forged write is counted. A probe whose preconditions do not
+    /// hold reports the forged write not made. `None` on a setup failure.
+    fn msi_forge(&self, ipc_buf: *mut u64) -> Option<Forge>
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let confined = unsafe { ipc::dma_faults(self.dma_ep, ipc_buf) }.ok()?.confined;
+        let skipped = Forge {
+            confined,
+            ..Forge::default()
+        };
+        let Some(irq) = self.irq.get().filter(|irq| irq.kind == InterruptKind::Msi)
+        else
+        {
+            return Some(skipped);
+        };
+        if !confined
+        {
+            return Some(skipped);
+        }
+        let address = syscall::cap_info(irq.cap, syscall_abi::CAP_INFO_IRQ_MSG_ADDRESS).ok()?;
+        let data = syscall::cap_info(irq.cap, syscall_abi::CAP_INFO_IRQ_MSG_DATA).ok()?;
+        let Some(forged) = forged_address(address)
+        else
+        {
+            return Some(Forge { address, ..skipped });
+        };
+        self.stage_message(u32::try_from(data).ok()?, ipc_buf)?;
+        let own_delivered = self.write_message(irq, address)?;
+        let forged_delivered = self.write_message(irq, forged)?;
+        let faults = if cfg!(target_arch = "riscv64")
+        {
+            faults_after(self.dma_ep, forged, ipc_buf)?
+        }
+        else
+        {
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            unsafe { ipc::dma_faults(self.dma_ep, ipc_buf) }.ok()?
+        };
+        Some(Forge {
+            confined,
+            made: true,
+            own_delivered,
+            forged_delivered,
+            address,
+            forged,
+            faults: faults.count,
+            last_fault: faults.last_iova,
+        })
+    }
+
+    /// Put `data`, little-endian, at the start of the device's buffer, copied
+    /// from a page of the driver's memory mapped for the device. `None` when
+    /// the page, its mapping or the copy fails.
+    fn stage_message(&self, data: u32, ipc_buf: *mut u64) -> Option<()>
+    {
+        let (cap, va) = self.page(ipc_buf)?;
+        // SAFETY: `va` maps one writable page, 4-byte aligned.
+        unsafe { core::ptr::write_volatile(va as *mut u32, data.to_le()) };
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let iova = unsafe {
+            virtio_core::dma::map(self.dma_ep, cap, virtio_core::dma::DEVICE_READS_WRITES, ipc_buf)
+        }
+        .ok()?;
+        let staged = iova + PAGE_SIZE <= DMA_REACH
+            && self.transfer_bytes(iova, DEVICE_BUFFER, MESSAGE_BYTES, false);
+        // SAFETY: as above.
+        unsafe { virtio_core::dma::unmap(self.dma_ep, iova, ipc_buf) }.ok()?;
+        staged.then_some(())
+    }
+
+    /// Have the device write the message data staged in its buffer to
+    /// `address`, wait for `irq`'s notification for at most
+    /// `test_dma_labels::INTERRUPT_WAIT_MS`, and acknowledge the binding.
+    /// Whether the write was delivered; `None` when the device does not
+    /// complete it.
+    fn write_message(&self, irq: Irq, address: u64) -> Option<bool>
+    {
+        let _ = syscall::notification_try_wait(irq.notification);
+        if !self.transfer_bytes(DEVICE_BUFFER, address, MESSAGE_BYTES, true)
+        {
+            return None;
+        }
+        let bits = syscall::notification_wait_timeout(
+            irq.notification,
+            test_dma_labels::INTERRUPT_WAIT_MS,
+        )
+        .unwrap_or(0);
+        let _ = syscall::irq_ack(irq.cap);
+        Some(bits != 0)
+    }
+}
+
+/// The message address the forged-message probe writes, given the
+/// fixture's own `address`: the interrupt file page beside the one its
+/// target sits on, which its domain does not map (bit 12 flipped: the
+/// paired hart's supervisor file, 4 KiB apart, or a page past the files).
+#[cfg(target_arch = "riscv64")]
+fn forged_address(address: u64) -> Option<u64>
+{
+    Some(address ^ PAGE_SIZE)
+}
+
+/// The message address the forged-message probe writes, given the
+/// fixture's own `address`: [`FORGED_REMAPPABLE`] when the fixture's own
+/// message is remappable, and none otherwise, since with remapping off a
+/// remappable-format write would be taken as a compatibility-format one.
+#[cfg(target_arch = "x86_64")]
+fn forged_address(address: u64) -> Option<u64>
+{
+    (address & ADDRESS_REMAPPABLE != 0).then_some(FORGED_REMAPPABLE)
+}
+
 /// The IOMMU faults devmgr has taken for the device once the copy after the
 /// unmap at `iova` is counted: `DMA_FAULTS` asked until its latest fault is
 /// in the probe page, for at most `test_dma_labels::FAULT_WAIT_MS`. An
@@ -539,7 +709,7 @@ fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Option<ListedIr
     (eps.dma != 0 && eps.service != 0).then_some((cap, pages, irq, eps))
 }
 
-/// Answer `INTERRUPT_PROBE`, `INTERRUPT_CHURN` and `DMA_PROBE` until a
+/// Answer `INTERRUPT_PROBE`, `INTERRUPT_CHURN`, `DMA_PROBE` and `MSI_FORGE` until a
 /// `FIXTURE_EXIT`, then exit.
 fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
 {
@@ -592,6 +762,40 @@ fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
                     .build()
             }
             test_dma_labels::FIXTURE_EXIT => IpcMessage::new(ipc::devmgr_errors::SUCCESS),
+            test_dma_labels::MSI_FORGE => match driver.msi_forge(ipc_buf)
+            {
+                Some(f) =>
+                {
+                    std::os::seraph::log!(
+                        "test-dma: forged-message probe made={}, own message at {:#x} delivered={}, forged at {:#x} delivered={}, faults={}",
+                        f.made,
+                        f.address,
+                        f.own_delivered,
+                        f.forged,
+                        f.forged_delivered,
+                        f.faults
+                    );
+                    let confined = if f.confined
+                    {
+                        ipc::devmgr_dma_labels::DMA_CONFINED
+                    }
+                    else
+                    {
+                        0
+                    };
+                    IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                        .word(0, confined)
+                        .word(1, u64::from(f.made))
+                        .word(2, u64::from(f.own_delivered))
+                        .word(3, u64::from(f.forged_delivered))
+                        .word(4, f.address)
+                        .word(5, f.forged)
+                        .word(6, f.faults)
+                        .word(7, f.last_fault)
+                        .build()
+                }
+                None => IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST),
+            },
             test_dma_labels::DMA_PROBE => match driver.probe(ipc_buf).and_then(|(o, l, iova)| {
                 faults_after(driver.dma_ep, iova, ipc_buf).map(|f| (o, l, iova, f))
             })

@@ -59,7 +59,8 @@ pub const fn entry(entry: RemapEntry, extended: bool) -> [u64; 2]
 pub const fn irta(base: u64, entries: u32, extended: bool) -> u64
 {
     let eime = if extended { IRTA_EIME } else { 0 };
-    (base & !0xfff) | eime | (entries.trailing_zeros() - 1) as u64
+    // `entries` is 2 at least, so `log2(entries)` is 1 at least.
+    (base & !0xfff) | eime | entries.trailing_zeros().saturating_sub(1) as u64
 }
 
 /// What making a table entry hold the words `new` takes, given the words
@@ -94,6 +95,21 @@ pub fn update(held: [u64; 2], new: [u64; 2]) -> Update
     {
         Update::Replace
     }
+}
+
+/// Entries one 4 KiB page of the table holds: 4096 / [`ENTRY_BYTES`].
+const ENTRIES_PER_PAGE: u16 = 256;
+
+/// Where entry `handle` lies in a table: the byte offset of its page from
+/// the table's first page, and the word index of its low word in that page.
+#[must_use]
+pub const fn entry_place(handle: u16) -> (u64, usize)
+{
+    let page = (handle / ENTRIES_PER_PAGE) as u64;
+    let entry = (handle % ENTRIES_PER_PAGE) as usize;
+    // At most 255 pages of 4 KiB, and 255 entries of two words: neither
+    // product nears its type's bound.
+    (page.saturating_mul(4096), entry.saturating_mul(2))
 }
 
 /// Pages a table of `entries` entries takes.
@@ -179,6 +195,15 @@ mod tests
             update([words[0] & !IRTE_PRESENT, words[1]], words),
             Update::Write
         );
+    }
+
+    #[test]
+    fn an_entry_lies_two_words_after_the_one_before_it_and_a_page_holds_256()
+    {
+        assert_eq!(entry_place(0), (0, 0));
+        assert_eq!(entry_place(255), (0, 510));
+        assert_eq!(entry_place(256), (4096, 0));
+        assert_eq!(entry_place(u16::MAX), (255 * 4096, 510));
     }
 
     #[test]

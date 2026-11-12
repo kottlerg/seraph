@@ -66,7 +66,7 @@ pub unsafe fn serial_init(
         // Skipped when the driver holds no IRQ cap (RX then relies on polling).
         // SAFETY: the UART's eight ports are bound to this thread by the
         // ioport_bind above.
-        unsafe { outb(port + UART_IER, 0x01) };
+        unsafe { outb(register(port, UART_IER), 0x01) };
     }
     UART_PORT.store(port, Ordering::Release);
     true
@@ -83,7 +83,7 @@ pub fn serial_read_byte() -> Option<u8>
     }
     // SAFETY: `port` is the UART's range bound by `serial_init`; reading the
     // LSR is side-effect-free.
-    if unsafe { inb(port + UART_LSR) } & 0x01 == 0
+    if unsafe { inb(register(port, UART_LSR)) } & 0x01 == 0
     {
         return None;
     }
@@ -104,10 +104,18 @@ pub fn serial_write_byte(byte: u8)
     }
     // SAFETY: `port` is the UART's range bound by `serial_init`; reading the
     // LSR is side-effect-free.
-    while unsafe { inb(port + UART_LSR) } & 0x20 == 0
+    while unsafe { inb(register(port, UART_LSR)) } & 0x20 == 0
     {}
     // SAFETY: writing one byte to the UART's transmit register.
     unsafe { outb(port, byte) };
+}
+
+/// The port of the UART register at `offset` from the UART's first port,
+/// `port`. The `IoPort` range [`serial_init`] bound holds the eight ports
+/// from `port` within the 16-bit port space, so the sum never saturates.
+fn register(port: u16, offset: u16) -> u16
+{
+    port.saturating_add(offset)
 }
 
 /// # Safety

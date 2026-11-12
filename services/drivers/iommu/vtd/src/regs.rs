@@ -136,21 +136,34 @@ impl Capability
     /// Decode a `CAP` value.
     // cast_possible_truncation: every field is masked to at most 10 bits
     // before its cast, so each value fits its target type (and `usize` is
-    // 64-bit on every target the driver builds for).
+    // 64-bit on every target the driver builds for). The masks also keep
+    // every sum and product far from its type's bound, so no saturating
+    // operation below saturates.
     #[allow(clippy::cast_possible_truncation)]
     #[must_use]
     pub const fn decode(cap: u64) -> Self
     {
         let nd = (cap & 0x7) as u32;
         Self {
-            domains: 1 << (4 + 2 * nd),
+            domains: 1 << nd.saturating_mul(2).saturating_add(4),
             sagaw: ((cap >> 8) & 0x1f) as u8,
-            mgaw: (((cap >> 16) & 0x3f) + 1) as u8,
-            fault_offset: (((cap >> 24) & 0x3ff) * 16) as usize,
-            fault_count: (((cap >> 40) & 0xff) + 1) as usize,
+            mgaw: ((cap >> 16) & 0x3f).saturating_add(1) as u8,
+            fault_offset: ((cap >> 24) & 0x3ff).saturating_mul(16) as usize,
+            fault_count: ((cap >> 40) & 0xff).saturating_add(1) as usize,
             caching_mode: (cap >> 7) & 1 != 0,
             write_buffer_flush: (cap >> 4) & 1 != 0,
         }
+    }
+
+    /// The byte offset of fault recording register `record`'s low word (the
+    /// fault information); its high word follows 8 bytes on. The registers
+    /// are 16 bytes apart from [`Self::fault_offset`]. `decode`'s masks keep
+    /// the offset of every record below [`Self::fault_count`] far from
+    /// `usize::MAX`, so the sum saturates only for a record far past them.
+    #[must_use]
+    pub const fn fault_record(&self, record: usize) -> usize
+    {
+        self.fault_offset.saturating_add(record.saturating_mul(16))
     }
 
     /// The deepest page-table depth the unit supports and the driver
@@ -246,6 +259,8 @@ mod tests
         assert_eq!(c.mgaw, 39);
         assert_eq!(c.fault_offset, 0x220);
         assert_eq!(c.fault_count, 16);
+        assert_eq!(c.fault_record(0), 0x220);
+        assert_eq!(c.fault_record(15), 0x310);
         assert!(!c.caching_mode);
         assert!(!c.write_buffer_flush);
         assert_eq!(c.table_depth(), Some((3, 39)));

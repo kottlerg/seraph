@@ -28,6 +28,9 @@
 //! drivers. Diagnostics are dropped; fatal bootstrap failures `thread_exit`
 //! silently.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod arch;
 
 use driver_binding::resources::{self, PlatformDelivery};
@@ -132,11 +135,9 @@ fn handle_request(msg: &IpcMessage, irq: Irq, rx_notify: &mut u64, ipc_buf: *mut
     {
         // The mask bounds the length to 16 bits, so the conversion cannot fail.
         // 16 label bits exceed the 512 bytes one message's data words carry,
-        // and `n` clamps to those bytes.
+        // and the write stops at those bytes.
         let byte_len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
-        let bytes = msg.data_bytes();
-        let n = byte_len.min(bytes.len());
-        for &b in &bytes[..n]
+        for &b in msg.data_bytes().iter().take(byte_len)
         {
             arch::current::serial_write_byte(b);
         }
@@ -145,17 +146,15 @@ fn handle_request(msg: &IpcMessage, irq: Irq, rx_notify: &mut u64, ipc_buf: *mut
     else if op == serial_labels::SERIAL_READ_BYTES
     {
         let mut buf = [0u8; MAX_READ_BYTES];
-        let mut n = 0;
-        while n < buf.len()
-        {
-            let Some(b) = arch::current::serial_read_byte()
-            else
-            {
-                break;
-            };
-            buf[n] = b;
-            n += 1;
-        }
+        // Fill `buf` from the front until the UART holds no byte or `buf` is
+        // full.
+        let n = buf
+            .iter_mut()
+            .map_while(|slot| {
+                *slot = arch::current::serial_read_byte()?;
+                Some(())
+            })
+            .count();
         // Re-arm the receive interrupt: the kernel masks the line on each fire,
         // and the ack unmasks it for the next byte. Idempotent, so it is also
         // safe on a poll-driven read where no IRQ was pending.
@@ -164,7 +163,7 @@ fn handle_request(msg: &IpcMessage, irq: Irq, rx_notify: &mut u64, ipc_buf: *mut
             let _ = syscall::irq_ack(irq.cap);
         }
         IpcMessage::builder(serial_errors::SUCCESS | ((n as u64) << 16))
-            .bytes(0, &buf[..n])
+            .bytes(0, buf.get(..n).unwrap_or_default())
             .build()
     }
     else if op == serial_labels::SERIAL_REGISTER_RX_NOTIFY

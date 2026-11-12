@@ -36,6 +36,9 @@
 //! entry for the forged handle, and the probe can observe only that the write
 //! is not delivered, since QEMU records no requester for the fault.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -151,6 +154,13 @@ struct Driver
     irq: Cell<Option<Irq>>,
 }
 
+/// The address of the register at `off` in the BAR page mapped at `regs`.
+/// Every register offset lies inside the page, so the sum never saturates.
+fn register(regs: u64, off: u64) -> u64
+{
+    regs.saturating_add(off)
+}
+
 impl Driver
 {
     fn read32(&self, off: u64) -> u32
@@ -158,25 +168,25 @@ impl Driver
         // SAFETY: `regs` maps the device's first BAR page for the driver's
         // life, `off` lies in it, and the register is 32-bit aligned; reached
         // only through raw volatile accesses.
-        unsafe { core::ptr::read_volatile((self.regs + off) as *const u32) }
+        unsafe { core::ptr::read_volatile(register(self.regs, off) as *const u32) }
     }
 
     fn write32(&self, off: u64, value: u32)
     {
         // SAFETY: as in `read32`.
-        unsafe { core::ptr::write_volatile((self.regs + off) as *mut u32, value) };
+        unsafe { core::ptr::write_volatile(register(self.regs, off) as *mut u32, value) };
     }
 
     fn read64(&self, off: u64) -> u64
     {
         // SAFETY: as in `read32`, for a 64-bit register.
-        unsafe { core::ptr::read_volatile((self.regs + off) as *const u64) }
+        unsafe { core::ptr::read_volatile(register(self.regs, off) as *const u64) }
     }
 
     fn write64(&self, off: u64, value: u64)
     {
         // SAFETY: as in `read64`.
-        unsafe { core::ptr::write_volatile((self.regs + off) as *mut u64, value) };
+        unsafe { core::ptr::write_volatile(register(self.regs, off) as *mut u64, value) };
     }
 
     /// Copy `PROBE_LEN` bytes from `src` to `dst` ([`Driver::transfer_bytes`]).
@@ -216,15 +226,15 @@ impl Driver
             .build();
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let reply = unsafe { ipc::ipc_call(self.memmgr_ep, &request, ipc_buf) }.ok()?;
-        if reply.label != memmgr_errors::SUCCESS || reply.caps().len() != 1
+        let (memmgr_errors::SUCCESS, &[cap]) = (reply.label, reply.caps())
+        else
         {
             for &c in reply.caps()
             {
                 let _ = syscall::cap_delete(c);
             }
             return None;
-        }
-        let cap = reply.caps()[0];
+        };
         let range = reserve_pages(1).ok()?;
         let va = range.va_start();
         // SAFETY: `range` is a fresh one-page reservation, kept for the
@@ -339,8 +349,11 @@ impl Driver
                 // SAFETY: as in `Driver::write32`: `regs` maps BAR 0 for the
                 // driver's life, and both registers are 32-bit aligned in it.
                 unsafe {
-                    core::ptr::write_volatile((regs + IRQ_RAISE) as *mut u32, PROBE_STATUS);
-                    core::ptr::write_volatile((regs + IRQ_ACKNOWLEDGE) as *mut u32, PROBE_STATUS);
+                    core::ptr::write_volatile(register(regs, IRQ_RAISE) as *mut u32, PROBE_STATUS);
+                    core::ptr::write_volatile(
+                        register(regs, IRQ_ACKNOWLEDGE) as *mut u32,
+                        PROBE_STATUS,
+                    );
                 }
                 loop_raises.fetch_add(1, Ordering::Relaxed);
             }
@@ -354,9 +367,11 @@ impl Driver
                 let _ = syscall::thread_yield();
             }
         };
-        wait_for(raises.load(Ordering::Relaxed) + CHURN_RAISES);
+        // A raise count near `u64::MAX` would take centuries to reach, so the
+        // saturation never ends a wait early.
+        wait_for(raises.load(Ordering::Relaxed).saturating_add(CHURN_RAISES));
         f();
-        wait_for(raises.load(Ordering::Relaxed) + CHURN_RAISES);
+        wait_for(raises.load(Ordering::Relaxed).saturating_add(CHURN_RAISES));
         stop.store(true, Ordering::Release);
         if let Ok(raise_loop) = raise_loop
         {
@@ -369,7 +384,8 @@ impl Driver
     fn probe(&self, ipc_buf: *mut u64) -> Option<(u64, u64, u64)>
     {
         let (cap, va) = self.page(ipc_buf)?;
-        let byte = |i: usize| (va + i as u64) as *mut u8;
+        // Every `i` passed lies inside the page, so the sum never saturates.
+        let byte = |i: usize| va.saturating_add(i as u64) as *mut u8;
         for i in 0..PAGE_BYTES
         {
             let v = if i < PROBE_LEN { pattern(i) } else { 0 };
@@ -389,15 +405,16 @@ impl Driver
         let back = |i: usize| {
             // SAFETY: `va` maps one writable page and `BACK_OFFSET + i` is
             // inside it; the device writes it, so it is read volatile.
-            unsafe { core::ptr::read_volatile(byte(BACK_OFFSET + i)) }
+            unsafe { core::ptr::read_volatile(byte(BACK_OFFSET.saturating_add(i))) }
         };
-        if iova + PAGE_SIZE > DMA_REACH
+        if !within_reach(iova)
         {
             // SAFETY: as above.
             let _ = unsafe { virtio_core::dma::unmap(self.dma_ep, iova, ipc_buf) };
             return Some((test_dma_labels::PROBE_SKIPPED, 0, iova));
         }
-        let dst = iova + BACK_OFFSET as u64;
+        // Below `DMA_REACH`, as the page's end is.
+        let dst = iova.saturating_add(BACK_OFFSET as u64);
         let copied = self.transfer(iova, DEVICE_BUFFER, false)
             && self.transfer(DEVICE_BUFFER, dst, true)
             && (0..PROBE_LEN).all(|i| back(i) == pattern(i));
@@ -406,7 +423,7 @@ impl Driver
         for i in 0..PROBE_LEN
         {
             // SAFETY: as above.
-            unsafe { core::ptr::write_volatile(byte(BACK_OFFSET + i), 0) };
+            unsafe { core::ptr::write_volatile(byte(BACK_OFFSET.saturating_add(i)), 0) };
         }
         let completed = self.transfer(DEVICE_BUFFER, dst, true);
         let landed = (0..PROBE_LEN).any(|i| back(i) != 0);
@@ -519,8 +536,8 @@ impl Driver
             )
         }
         .ok()?;
-        let staged = iova + PAGE_SIZE <= DMA_REACH
-            && self.transfer_bytes(iova, DEVICE_BUFFER, MESSAGE_BYTES, false);
+        let staged =
+            within_reach(iova) && self.transfer_bytes(iova, DEVICE_BUFFER, MESSAGE_BYTES, false);
         // SAFETY: as above.
         unsafe { virtio_core::dma::unmap(self.dma_ep, iova, ipc_buf) }.ok()?;
         staged.then_some(())
@@ -591,6 +608,15 @@ fn faults_after(dma_ep: u64, iova: u64, ipc_buf: *mut u64) -> Option<ipc::DmaFau
         }
         std::thread::sleep(FAULT_POLL);
     }
+}
+
+/// Whether the page devmgr mapped at the device address `iova` ends within
+/// the fixture's [`DMA_REACH`]; false for an address whose page end passes
+/// `u64`.
+fn within_reach(iova: u64) -> bool
+{
+    iova.checked_add(PAGE_SIZE)
+        .is_some_and(|end| end <= DMA_REACH)
 }
 
 /// The probe pattern's byte at `i`: none zero.

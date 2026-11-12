@@ -21,6 +21,7 @@ mod bind;
 mod caps;
 mod decls;
 mod dma;
+mod intremap;
 mod iommu;
 mod pci;
 mod phys;
@@ -145,6 +146,14 @@ fn main() -> !
     if let (Some(i), Some(d)) = (&caps.iommu, &caps.dma)
     {
         d.set_iommu(Arc::clone(i));
+    }
+
+    // VT-d interrupt remapping, turned on before any line is routed or any
+    // message target minted, which the kernel's switch requires; each
+    // source's entry is written as the source is given to a device.
+    if let Some(i) = &caps.iommu
+    {
+        irq_range.remap = intremap::enable(i, &caps.firmware, irq_range.mint).map(Arc::new);
     }
 
     // The boot batch: the boot pass over every record, from the boot
@@ -1360,8 +1369,13 @@ struct IrqRangeAllocator
     /// ([`Self::mint_message`]); 0 when devmgr holds no range or the copy
     /// could not be derived. Derived before any split: `SYS_IRQ_SPLIT`
     /// re-links a split cap's derivation children under its parent, so the
-    /// copy outlives every split of the range.
+    /// copy outlives every split of the range. Also the authority of the
+    /// kernel's interrupt remapping switch (`intremap::enable`).
     mint: u64,
+    /// Interrupt remapping, when devmgr turned it on: every line routed and
+    /// every target minted has its remapping entry written before a device
+    /// can raise it.
+    remap: Option<Arc<intremap::InterruptRemap>>,
 }
 
 impl IrqRangeAllocator
@@ -1397,25 +1411,73 @@ impl IrqRangeAllocator
             held: HeldLines::new(),
             overrides,
             mint,
+            remap: None,
         }
     }
 
-    /// Mint one message-signaled target (`SYS_IRQ_MSG_ALLOC`): an unbound
-    /// `Interrupt` cap carrying `RIGHTS_IRQ_NOTIFY`, on the next CPU in turn
-    /// with a free slot, whose message the kernel reports through
-    /// `SYS_CAP_INFO`. The caller owns it and deletes it with its device,
-    /// which frees the target once no copy remains.
+    /// Interrupt remapping, when on, for a device whose message targets it
+    /// clears at release.
+    fn remap(&self) -> Option<Arc<intremap::InterruptRemap>>
+    {
+        self.remap.clone()
+    }
+
+    /// Route wired line `gsi` in `mode` through its single-line cap `cap`,
+    /// which then holds the route (`SYS_IRQ_ROUTE`; a line `cap` routed
+    /// already in `mode` is left as it is), and write its remapping entry
+    /// when remapping is on. [`line_cap`](Self::line_cap) calls it for every
+    /// derivation of a held line: once the route and the entry are in place
+    /// the repeat changes neither (the IOMMU driver leaves an entry that
+    /// already holds what `REMAP_SET` asks for untouched), so a shared line
+    /// delivers throughout, and a write that failed is retried.
     ///
     /// # Errors
-    /// The `SYS_IRQ_MSG_ALLOC` error, or `InvalidCapability` when devmgr holds
-    /// no mint authority.
-    fn mint_message(&self) -> Result<u64, i64>
+    /// The `SYS_IRQ_ROUTE` error, or `InvalidState` when the remapping entry
+    /// was not written (logged); a line routed stays routed, held by `cap`.
+    fn route(
+        remap: Option<&intremap::InterruptRemap>,
+        cap: u64,
+        gsi: u32,
+        mode: u64,
+    ) -> Result<(), i64>
+    {
+        syscall::irq_route(cap, mode)?;
+        match remap
+        {
+            Some(remap) => remap
+                .line(cap, gsi, mode)
+                .map_err(|_| syscall_abi::SyscallError::InvalidState as i64),
+            None => Ok(()),
+        }
+    }
+
+    /// Mint one message-signaled target (`SYS_IRQ_MSG_ALLOC`) for the
+    /// function `rid` (`iommu_labels::requester_id`): an unbound `Interrupt`
+    /// cap carrying `RIGHTS_IRQ_NOTIFY`, on the next CPU in turn with a free
+    /// slot, whose message the kernel reports through `SYS_CAP_INFO`, its
+    /// remapping entry written for the function when remapping is on. The
+    /// caller owns it and releases it with its device
+    /// (`bind::release_message`), which frees the target once no copy
+    /// remains.
+    ///
+    /// # Errors
+    /// The `SYS_IRQ_MSG_ALLOC` error, `InvalidCapability` when devmgr holds
+    /// no mint authority, or `InvalidState` when the remapping entry was not
+    /// written (logged), the target deleted.
+    fn mint_message(&self, rid: u64) -> Result<u64, i64>
     {
         if self.mint == 0
         {
             return Err(syscall_abi::SyscallError::InvalidCapability as i64);
         }
-        syscall::irq_msg_alloc(self.mint)
+        let cap = syscall::irq_msg_alloc(self.mint)?;
+        if let Some(remap) = &self.remap
+            && remap.message(cap, rid).is_err()
+        {
+            let _ = syscall::cap_delete(cap);
+            return Err(syscall_abi::SyscallError::InvalidState as i64);
+        }
+        Ok(cap)
     }
 
     /// The `SYS_IRQ_REGISTER` mode of PCI `INTx` line `gsi`, which every
@@ -1427,36 +1489,55 @@ impl IrqRangeAllocator
 
     /// A device's own single-line cap on line `id`: a derivation of the
     /// line's held cap, the line carved off the range the first time any
-    /// device asks for it. The caller owns the derivation and releases it
-    /// with its device; the held cap stays with devmgr.
+    /// device asks for it. The held cap routes the line in its mode
+    /// ([`line_mode`](Self::line_mode)) and holds the route
+    /// ([`route`](Self::route)), so the line keeps its target for the boot.
+    /// The caller owns the derivation and releases it with its device; the
+    /// held cap stays with devmgr.
     ///
     /// # Errors
     /// [`LineError::Hold`] with [`HoldError::Split`]`(`[`CarveError::NotCovered`]`)`
     /// when no held range contains the line (it lies outside the range cap,
     /// or devmgr holds no range), another carve error when the split fails,
     /// or [`HoldError::NoMemory`]; [`LineError::Derive`] with the
-    /// `SYS_CAP_DERIVE` error, the line staying held.
+    /// [`route`](Self::route) or `SYS_CAP_DERIVE` error, the line staying
+    /// held.
     fn line_cap(&mut self, id: u32) -> Result<u64, LineError<i64>>
     {
+        let mode = self.line_mode(id);
+        let remap = self.remap.as_deref();
         let ranges = &mut self.ranges;
         self.held.derive(
             id,
             |id| Self::isolate_one(ranges, id),
-            |held| syscall::cap_derive(held, syscall::RIGHTS_IRQ_NOTIFY),
+            |held| {
+                Self::route(remap, held, id, mode)?;
+                syscall::cap_derive(held, syscall::RIGHTS_IRQ_NOTIFY)
+            },
         )
     }
 
     /// Carve the single-line cap for line `id` off the range for one device
     /// alone, holding nothing: no later device gets a cap on the line, which
     /// [`line_cap`](Self::line_cap) then finds not covered. For a line whose
-    /// driver does not acknowledge each delivery promptly (the UART's).
+    /// driver does not acknowledge each delivery promptly (the UART's). The
+    /// cap routes the line in `mode` and holds the route
+    /// ([`route`](Self::route)) until devmgr deletes it with its device.
     ///
     /// # Errors
-    /// [`CarveError::NotCovered`] when no held range contains the line, any
-    /// other carve error when the split fails.
-    fn exclusive_line(&mut self, id: u32) -> Result<u64, CarveError>
+    /// [`ExclusiveLineError::Carve`] with [`CarveError::NotCovered`] when no
+    /// held range contains the line, or another carve error when the split
+    /// fails; [`ExclusiveLineError::Route`] with the [`route`](Self::route)
+    /// error, the cap deleted.
+    fn exclusive_line(&mut self, id: u32, mode: u64) -> Result<u64, ExclusiveLineError>
     {
-        Self::isolate_one(&mut self.ranges, id)
+        let cap = Self::isolate_one(&mut self.ranges, id).map_err(ExclusiveLineError::Carve)?;
+        if let Err(e) = Self::route(self.remap.as_deref(), cap, id, mode)
+        {
+            let _ = syscall::cap_delete(cap);
+            return Err(ExclusiveLineError::Route(e));
+        }
+        Ok(cap)
     }
 
     /// Carve the single-line cap for line `id` off the range table;
@@ -1477,6 +1558,17 @@ impl IrqRangeAllocator
             })
         })
     }
+}
+
+/// Why [`IrqRangeAllocator::exclusive_line`] gave no cap.
+#[derive(Debug)]
+enum ExclusiveLineError
+{
+    /// The line could not be carved off the range.
+    Carve(CarveError),
+    /// The line could not be routed, or its remapping entry written: the
+    /// `SYS_IRQ_ROUTE` error, or `InvalidState`.
+    Route(i64),
 }
 
 /// Maximum payload byte length stored per [`DeviceInfoEntry`]. Sized to

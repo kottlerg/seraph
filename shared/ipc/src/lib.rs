@@ -2390,6 +2390,34 @@ pub mod test_dma_labels
     /// How long the fixture waits between its [`FIXTURE_EXIT`] reply and its
     /// exit.
     pub const EXIT_DELAY_MS: u64 = 100;
+    /// Run the forged-message probe, when an IOMMU confines the device and
+    /// the fixture holds an MSI vector: have the device's DMA engine write
+    /// the fixture's own message (`SYS_CAP_INFO`'s
+    /// `CAP_INFO_IRQ_MSG_ADDRESS` and `CAP_INFO_IRQ_MSG_DATA`) to its own
+    /// address and wait for it on the fixture's notification for at most
+    /// [`INTERRUPT_WAIT_MS`], then write the same data to a forged message
+    /// address the device's targets do not allow and wait as long again. On
+    /// riscv64 the forged address is the interrupt file page beside the
+    /// target's (the paired hart's file, its own address with bit 12
+    /// flipped), and the fixture then asks for its faults as [`DMA_PROBE`]
+    /// does, until one names that page. On `x86_64` it is a remappable
+    /// message naming handle `0xFFFF`, which no remapping table holds, made
+    /// only when the fixture's own message is remappable; QEMU records no
+    /// requester for a fault the DMA engine's write raises, so devmgr
+    /// cannot count it for the device, and no fault is asked for. Request:
+    /// no data. Reply: `SUCCESS` with `data[0]` = whether an IOMMU confines
+    /// the device (`devmgr_dma_labels::DMA_CONFINED`) or not (0); `data[1]`
+    /// = whether the forged write was made (1) or not (0: the device is not
+    /// confined, the fixture holds no MSI vector, or on `x86_64` its message
+    /// is not remappable); `data[2]` = whether the device's write of the
+    /// fixture's own message reached the notification (1) or not (0);
+    /// `data[3]` = whether the forged write reached it (1) or not (0);
+    /// `data[4]` = the fixture's own message address, 0 when the device is
+    /// not confined or holds no MSI vector; `data[5]` = the forged address;
+    /// `data[6]` = the IOMMU faults devmgr has taken for the device and
+    /// `data[7]` the IOVA of the latest. Any other reply label is a setup
+    /// failure.
+    pub const MSI_FORGE: u64 = 5;
 }
 
 /// Why [`report_driver_ready`] failed.
@@ -2780,7 +2808,7 @@ pub unsafe fn dma_faults(dma_ep: u64, ipc_buf: *mut u64) -> Result<DmaFaults, Dm
 
 /// Wire-protocol version of [`iommu_labels`]; bumped as the block comment
 /// above the label modules describes, which also lists its runtime check.
-pub const IOMMU_LABELS_VERSION: u32 = 4;
+pub const IOMMU_LABELS_VERSION: u32 = 5;
 /// IPC labels for an IOMMU driver's service endpoint, on which devmgr directs
 /// the IOMMU of one family (VT-d, the RISC-V IOMMU).
 ///
@@ -2845,8 +2873,10 @@ pub mod iommu_labels
     /// the number of faults that follow, at most [`MAX_FAULTS_PER_REPLY`],
     /// then two words per fault: the requester ID in the low 32 bits and
     /// the unit's fault reason in bits 32..48 (VT-d's 8-bit fault reason,
-    /// the RISC-V IOMMU's 12-bit `CAUSE`), and the faulting IOVA. A fault
-    /// past the bound stays for the next call.
+    /// the RISC-V IOMMU's 12-bit `CAUSE`), and the faulting IOVA, or for a
+    /// VT-d interrupt remapping fault (reason `0x20` and above) the handle
+    /// the blocked interrupt named. A fault past the bound stays for the
+    /// next call.
     pub const TAKE_FAULTS: u64 = 6;
     /// Make a physical range the firmware reserves for a domain's function
     /// (a VT-d RMRR) reachable by it at the same address: an identity
@@ -2875,6 +2905,46 @@ pub mod iommu_labels
     /// through its DMA translation (VT-d, whose interrupt remapping governs
     /// them).
     pub const MAP_MSI: u64 = 8;
+    /// Turn interrupt remapping on or off for every unit, with one
+    /// remapping table the driver allocates and every unit shares: with it
+    /// on, an interrupt message reaches a CPU only through a table entry
+    /// [`REMAP_SET`] made, and one in the compatibility format is blocked.
+    /// devmgr sends it once, before any interrupt source exists, and turns
+    /// remapping off again with it when the kernel does not take the
+    /// remappable formats.
+    ///
+    /// Request: `data[1]` = the table's entries, a power of two from 2 to
+    /// [`MAX_REMAP_ENTRIES`], or 0 to turn remapping off; `data[2]` = 1 to
+    /// ask for 32-bit destinations, 0 for 8-bit ones. Reply: label
+    /// `SUCCESS` with `data[0]` = 1 when the destinations are 32-bit, 0
+    /// when they are 8-bit; or an error code, with remapping off:
+    /// `INVALID_REQUEST` for a size outside the bound, a table already set
+    /// up, or an IOMMU family or unit that does not remap interrupts.
+    pub const REMAP_SETUP: u64 = 9;
+    /// Make one entry of the remapping table deliver to a CPU's vector for
+    /// one requester, replacing what it held; the reply follows the
+    /// invalidation of every unit's cached copy. An entry that already
+    /// holds exactly this is left as it is, so devmgr may set a live
+    /// source's entry again without a gap in its delivery.
+    ///
+    /// Request: `data[1]` = the entry's handle, below the table's entries;
+    /// `data[2]` = the destination CPU's interrupt controller ID, within the
+    /// width [`REMAP_SETUP`] replied; `data[3]` = the vector, 16 to 255;
+    /// `data[4]` = 1 for level-triggered, 0 for edge; `data[5]` = the
+    /// source ID (bus, device, function) of the only requester the entry
+    /// accepts. Reply: empty body, label `SUCCESS`, or an error code;
+    /// `INVALID_REQUEST` with remapping off or a field outside its bound.
+    pub const REMAP_SET: u64 = 10;
+    /// Make one entry of the remapping table not present, so an interrupt
+    /// naming it is blocked and faulted; the reply follows the invalidation
+    /// of every unit's cached copy.
+    ///
+    /// Request: `data[1]` = the entry's handle. Reply: as [`REMAP_SET`].
+    pub const REMAP_CLEAR: u64 = 11;
+
+    /// Entries one remapping table holds at most ([`REMAP_SETUP`]): a
+    /// remappable interrupt message names its entry in 16 bits.
+    pub const MAX_REMAP_ENTRIES: u64 = 1 << 16;
 
     /// Faults one [`TAKE_FAULTS`] reply carries: two words each after the
     /// count, within the message's data words.
@@ -2901,8 +2971,10 @@ pub mod iommu_errors
     /// outside the unit's scope, an IOVA or reserved range that is
     /// unaligned, empty, or past the unit's width, a missing or non-Memory
     /// cap, an access word outside `devmgr_dma_labels::ACCESS_MASK`, an
-    /// `UNMAP` of a reserved range or an interrupt file, or a `MAP_MSI` to
-    /// an IOMMU family that does not take it.
+    /// `UNMAP` of a reserved range or an interrupt file, a `MAP_MSI` to
+    /// an IOMMU family that does not take it, or an interrupt remapping
+    /// request the remapping's state or bounds refuse (`REMAP_SETUP`,
+    /// `REMAP_SET`).
     pub const INVALID_REQUEST: u64 = 1;
     /// Caller's compiled `IOMMU_LABELS_VERSION`, carried in `data[0]`,
     /// does not match the driver's.

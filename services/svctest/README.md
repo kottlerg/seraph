@@ -48,8 +48,8 @@ services/svctest/
         ├── recv_pool.rs       # Worker-pool receive helper under concurrent nested IPC;
         │                      #   concurrent logging through logd
         ├── devmgr.rs          # Block, shutdown, bind deny; input ordinal; on-demand
-        │                      #   driver bind; DMA confinement; MSI delivery, churn,
-        │                      #   and release
+        │                      #   driver bind; DMA confinement; MSI delivery, forge,
+        │                      #   churn, and release
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
         │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
@@ -109,8 +109,8 @@ a stack overflow) kills it without running either hook, so it logs neither marke
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
 skip and return when their cap is zero; the devmgr class-deny phase (`caps[2]` and `caps[3]`), the
 bind-deny phase (`caps[2]`), the input-ordinal phase (`caps[8]`), the on-demand-bind phase
-(`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement and MSI delivery, churn, and release
-phases (`caps[9]`), the
+(`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement and MSI delivery, forge, churn, and
+release phases (`caps[9]`), the
 drivers stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny phase (`caps[11]` to
 `caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and
 `pwrmgr.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
@@ -146,7 +146,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
-| `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, churn, and release phases: the `test-dma` class SEND |
+| `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
 | `caps[10]` | `devmgr.class.test-fault` | on-demand-bind phase: the `test-fault` class SEND |
 | `caps[11]` | `devmgr.class.serial-deny` | drivers deny phase: a `serial` class SEND without the driver's verb bits |
 | `caps[12]` | `devmgr.class.input-deny` | drivers deny phase: an `input` class SEND without the driver's verb bits |
@@ -268,18 +268,27 @@ unmapped address. Without an IOMMU it checks the mapped copies only and requires
 The MSI delivery phase queries the same fixture the same way and asks it to have the `edu` device
 raise its interrupt (`INTERRUPT_PROBE`): the fixture must hold the device's MSI vector, which devmgr
 gives a declaration that asks for MSI and DMA, not its wired line, and the message must reach the
-fixture's notification within `INTERRUPT_WAIT_MS`, with or without an IOMMU. The MSI churn phase
-asks the fixture for `INTERRUPT_CHURN`: while a thread of the fixture has the device raise its MSI
-in a loop, the fixture deletes the `Interrupt` cap bound to it, and then the bound notification's
-last cap and the binding's cap; after each case a spare copy it binds to a new notification must
-receive the device's interrupt, the fixture must hold MSI, and the loop must have raised. The MSI
-release phase sends `FIXTURE_EXIT`, after which the fixture leaves its interrupt raised and exits;
-the phase polls `caps[9]` until devmgr answers `WITHDRAWN` and asserts `system_ram ==
-kernel_reserved + pool_total`. devmgr releases the device, which frees the message-signaled target
-it minted for it, on its control thread right after the class answers `WITHDRAWN`, and no request
-svctest makes observes the release end, so the `ram_accounted_identity` phase that ends the run
-asserts the identity again after it. The release phase runs last of the phases that use the fixture,
-since no fixture serves the class again in that boot.
+fixture's notification within `INTERRUPT_WAIT_MS`, with or without an IOMMU. The MSI forge phase
+(`devmgr_msi_forge`) asks the fixture for `MSI_FORGE`: where an IOMMU confines the device and the
+fixture holds an MSI vector, the device's DMA engine writes the fixture's own message (read with
+`SYS_CAP_INFO`) to its own address, which must reach the fixture's notification, then to a forged
+address, which must not. On riscv64 the forged address is the interrupt file page beside the
+target's, which the device's domain does not map, and devmgr must count an IOMMU fault for the
+device at that page. On x86_64 the own message is remappable and the forged address is a remappable
+message naming handle `0xFFFF`, which no remapping table entry holds; QEMU records no requester id
+for a fault the DMA engine's write raises, so devmgr cannot attribute it and the check is
+non-delivery, not an attributed fault. An unconfined device makes no forged write. The MSI churn
+phase asks the fixture for `INTERRUPT_CHURN`: while a thread of the fixture has the device raise its
+MSI in a loop, the fixture deletes the `Interrupt` cap bound to it, and then the bound
+notification's last cap and the binding's cap; after each case a spare copy it binds to a new
+notification must receive the device's interrupt, the fixture must hold MSI, and the loop must have
+raised. The MSI release phase sends `FIXTURE_EXIT`, after which the fixture leaves its interrupt
+raised and exits; the phase polls `caps[9]` until devmgr answers `WITHDRAWN` and asserts
+`system_ram == kernel_reserved + pool_total`. devmgr releases the device, which frees the
+message-signaled target it minted for it, on its control thread right after the class answers
+`WITHDRAWN`, and no request svctest makes observes the release end, so the `ram_accounted_identity`
+phase that ends the run asserts the identity again after it. The release phase runs last of the
+phases that use the fixture, since no fixture serves the class again in that boot.
 The `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
 with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS phases
@@ -300,7 +309,7 @@ layout](../../docs/testing.md#sysroot-layout).
 | [Service Definitions](../svcmgr/docs/service-definitions.md) | `.svc` recipe keys, including `seed` resolution |
 | [svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) | `HANDOVER_COMPLETE` and `PUBLISH_ENDPOINT` and their authority badges; `QUERY_ENDPOINT` and its seed-only refusal |
 | [services/pwrmgr/README.md](../pwrmgr/README.md) | pwrmgr `SHUTDOWN` and its authority badge |
-| [services/drivers/test-dma/README.md](../drivers/test-dma/README.md) | `edu` DMA and MSI test driver behind the DMA confinement and MSI delivery, churn, and release phases |
+| [services/drivers/test-dma/README.md](../drivers/test-dma/README.md) | `edu` DMA and MSI test driver behind the DMA confinement and MSI delivery, forge, churn, and release phases |
 | [services/drivers/test-fault/README.md](../drivers/test-fault/README.md) | Fault-injection driver behind the on-demand-bind phase |
 
 ---

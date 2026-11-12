@@ -29,25 +29,27 @@
 //! carves that one line from a derived copy of the root Interrupt cap and
 //! first proves delivery: a raise must signal a bound notification. Then,
 //! each round, the controller, pinned to CPU 0, creates a notification,
-//! derives a copy of the line and binds it to the notification, and deletes
-//! the notification's only capability, so the binding holds its last
-//! reference. It then repeatedly acknowledges (`SYS_IRQ_ACK`; each delivery
+//! derives a copy of the line, routes the line through it (`SYS_IRQ_ROUTE`)
+//! and binds it to the notification, and deletes the notification's only
+//! capability, so the binding holds its last reference. It then repeatedly acknowledges (`SYS_IRQ_ACK`; each delivery
 //! masks the line again) and raises the interrupt, so deliveries follow one
 //! another, while a deleter pinned to CPU 1 waits a varying delay and deletes
 //! the copy, which frees the notification with the binding. On every other
 //! round the deleter first rebinds the copy to a spare notification
 //! (`SYS_IRQ_REGISTER`), which drops the round's notification's last
 //! reference and frees it while the line is still bound, and then deletes
-//! the copy. Each round's copy is the line's only binding, so its delete
-//! releases the line, and the next round's registration routes it to the
-//! next CPU in turn (core/kernel/docs/arch-interface.md § `interrupts`). Most
+//! the copy. Each round's copy is the line's only route holder and its only
+//! binding, so its delete releases the line, and the next round's route
+//! takes the next CPU in turn (core/kernel/docs/arch-interface.md
+//! § `interrupts`). Most
 //! rounds therefore deliver on a CPU other than the deleter's, where the
 //! delivery and the change race; a round that delivers on CPU 1 serialises
 //! them instead, and only the CPU count bounds how many do. A raise after the
 //! delete finds the line masked and unbound.
 //!
-//! The binding rounds follow. Each derives two copies of the line, binds one
-//! to a keeper notification and one to a victim notification, and races the
+//! The binding rounds follow. Each derives two copies of the line, routes
+//! the line through one and binds it to a keeper notification, binds the
+//! other to a victim notification, and races the
 //! same raises against the deleter's delete of the victim's Interrupt cap, so
 //! a delivery walks the binding in the object being freed. After each delete
 //! the keeper's binding must still be served: once it acknowledges, a raise
@@ -66,8 +68,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use init_protocol::InitInfo;
 use syscall::{
     RIGHTS_ALL, cap_create_notification, cap_create_thread, cap_delete, cap_derive, irq_ack,
-    irq_register, irq_split, notification_wait_timeout, system_info, thread_configure, thread_exit,
-    thread_set_affinity, thread_start,
+    irq_register, irq_route, irq_split, notification_wait_timeout, system_info, thread_configure,
+    thread_exit, thread_set_affinity, thread_start,
 };
 use syscall_abi::SystemInfoType;
 
@@ -239,9 +241,9 @@ fn phases(ctx: &TestContext, line: u64, spare: u64) -> Result<[u32; 3], &'static
     Ok([notified[0], notified[1], bound])
 }
 
-/// Bind a copy of the line to a fresh notification and require one raise to
-/// signal it, so the rounds below are not vacuous. The copy's delete leaves
-/// the line unbound.
+/// Route the line through a copy, bind the copy to a fresh notification and
+/// require one raise to signal it, so the rounds below are not vacuous. The
+/// copy's delete releases the line.
 fn probe_delivery(ctx: &TestContext, line: u64) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -252,7 +254,9 @@ fn probe_delivery(ctx: &TestContext, line: u64) -> TestResult
         cap_delete(sig).ok();
         return Err("stress::irq_route_delete_race: derive the probe's copy failed");
     };
-    let bound = irq_register(copy, sig, 0).and_then(|()| irq_ack(copy));
+    let bound = irq_route(copy, 0)
+        .and_then(|()| irq_register(copy, sig, 0))
+        .and_then(|()| irq_ack(copy));
     raise_tx_interrupt();
     let bits =
         bound.and_then(|()| notification_wait_timeout(sig, crate::scaled_bound(PROBE_TIMEOUT_MS)));
@@ -288,7 +292,9 @@ fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
             cap_delete(sig).ok();
             return Err("stress::irq_route_delete_race: derive the round's copy failed");
         };
-        let bound = irq_register(copy, sig, 0).and_then(|()| irq_ack(copy));
+        let bound = irq_route(copy, 0)
+            .and_then(|()| irq_register(copy, sig, 0))
+            .and_then(|()| irq_ack(copy));
         // The binding now holds the notification's last reference: the
         // deleter's rebind or delete frees it.
         cap_delete(sig).ok();
@@ -379,8 +385,8 @@ fn binding_rounds(ctx: &TestContext, line: u64, first: u32) -> Result<u32, &'sta
     result
 }
 
-/// One binding round: a kept copy of the line bound to `ntfs[0]` (the
-/// keeper) and a doomed copy bound to `ntfs[1]`, whose cap the deleter
+/// One binding round: a kept copy of the line, holding its route, bound to
+/// `ntfs[0]` (the keeper) and a doomed copy bound to `ntfs[1]`, whose cap the deleter
 /// deletes while the controller raises; then the kept binding must be served.
 /// Returns whether a raise began while the delete was running.
 fn binding_round(line: u64, round: u32, ntfs: [u64; 2]) -> Result<bool, &'static str>
@@ -391,14 +397,15 @@ fn binding_round(line: u64, round: u32, ntfs: [u64; 2]) -> Result<bool, &'static
         .map_err(|_| "stress::irq_route_delete_race: derive the doomed copy failed")
         .and_then(|doomed| race_binding_delete(round, kept, doomed, ntfs));
     quiet_tx_interrupt();
-    // The kept copy is the line's last binding: its delete releases the line,
-    // so the next round's first binding routes it to the next CPU.
+    // The kept copy is the line's route holder and last binding: its delete
+    // releases the line, so the next round's route takes the next CPU.
     cap_delete(kept).ok();
     result
 }
 
-/// Bind `kept` and `doomed`, hand `doomed` to the deleter, raise until it is
-/// deleted, and require `kept`'s notification to be signalled after.
+/// Route the line through `kept`, bind `kept` and `doomed`, hand `doomed` to
+/// the deleter, raise until it is deleted, and require `kept`'s notification
+/// to be signalled after.
 fn race_binding_delete(
     round: u32,
     kept: u64,
@@ -406,14 +413,15 @@ fn race_binding_delete(
     ntfs: [u64; 2],
 ) -> Result<bool, &'static str>
 {
-    if irq_register(kept, ntfs[0], 0)
+    if irq_route(kept, 0)
+        .and_then(|()| irq_register(kept, ntfs[0], 0))
         .and_then(|()| irq_register(doomed, ntfs[1], 0))
         .and_then(|()| irq_ack(kept))
         .and_then(|()| irq_ack(doomed))
         .is_err()
     {
         cap_delete(doomed).ok();
-        return Err("stress::irq_route_delete_race: binding the two copies failed");
+        return Err("stress::irq_route_delete_race: routing or binding the two copies failed");
     }
     DOOMED.store(doomed, Ordering::Release);
     REBIND.store(0, Ordering::Release);

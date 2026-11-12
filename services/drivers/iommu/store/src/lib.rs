@@ -53,6 +53,7 @@ struct Chunk
 {
     phys: u64,
     va: u64,
+    pages: u64,
     used: u64,
 }
 
@@ -134,9 +135,41 @@ impl Store
             .map(|c| c.va + (phys - c.phys))
     }
 
-    /// Take a chunk of [`CHUNK_PAGES`] contiguous pages from memmgr and map
-    /// it; `false`, logged, when memmgr refuses or the mapping fails.
-    fn grow(&mut self) -> bool
+    /// Take `pages` physically contiguous pages, zeroed, for one structure a
+    /// unit reads whole from its first page's physical address (an interrupt
+    /// remapping table), and return that address; `None`, logged, when
+    /// memmgr refuses or the mapping fails. The pages are a chunk of their
+    /// own, every page handed out, so [`TableStore::alloc`] keeps drawing
+    /// from the chunk it was drawing from.
+    pub fn alloc_contiguous(&mut self, pages: u64) -> Option<u64>
+    {
+        let words = usize::try_from(pages).ok()?.checked_mul(TABLE_WORDS)?;
+        if pages == 0 || !self.grow(pages)
+        {
+            return None;
+        }
+        let last = self.chunks.len() - 1;
+        let chunk = &mut self.chunks[last];
+        chunk.used = pages;
+        let (phys, va) = (chunk.phys, chunk.va);
+        if last > 0
+        {
+            self.chunks.swap(last - 1, last);
+        }
+        // SAFETY: `va` maps the chunk's `pages` pages writable (`grow`), and
+        // none has been handed out before.
+        unsafe { core::ptr::write_bytes(va as *mut u64, 0, words) };
+        fence(Ordering::SeqCst);
+        for page in 0..pages
+        {
+            self.flush(phys + page * PAGE_SIZE, 0, PAGE_SIZE);
+        }
+        Some(phys)
+    }
+
+    /// Take a chunk of `pages` contiguous pages from memmgr and map it;
+    /// `false`, logged, when memmgr refuses or the mapping fails.
+    fn grow(&mut self, pages: u64) -> bool
     {
         // Room for the chunk's record first, so no failure past the mapping
         // has a live mapping to undo.
@@ -146,7 +179,7 @@ impl Store
             return false;
         }
         let ipc_buf = std::os::seraph::current_ipc_buf();
-        let arg = CHUNK_PAGES | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
+        let arg = pages | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
         let request = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
             .word(0, arg)
             .build();
@@ -165,7 +198,7 @@ impl Store
             {
                 let _ = syscall::cap_delete(c);
             }
-            std::os::seraph::log!(warn: "table pages: memmgr refused {} pages", CHUNK_PAGES);
+            std::os::seraph::log!(warn: "table pages: memmgr refused {} pages", pages);
             return false;
         };
         let Ok(phys) = syscall::cap_info(cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
@@ -175,7 +208,7 @@ impl Store
             let _ = syscall::cap_delete(cap);
             return false;
         };
-        let Ok(range) = reserve_pages(CHUNK_PAGES)
+        let Ok(range) = reserve_pages(pages)
         else
         {
             std::os::seraph::log!(warn: "table pages: no VA");
@@ -183,12 +216,11 @@ impl Store
             return false;
         };
         let va = range.va_start();
-        // SAFETY: `range` is a fresh reservation of CHUNK_PAGES pages from
-        // the per-process arena, kept for the driver's life once mapped: VA
-        // no Rust object or IPC page occupies.
-        let mapped = unsafe {
-            syscall::mem_map(cap, self.aspace, va, 0, CHUNK_PAGES, syscall::MAP_WRITABLE)
-        };
+        // SAFETY: `range` is a fresh reservation of `pages` pages from the
+        // per-process arena, kept for the driver's life once mapped: VA no
+        // Rust object or IPC page occupies.
+        let mapped =
+            unsafe { syscall::mem_map(cap, self.aspace, va, 0, pages, syscall::MAP_WRITABLE) };
         if mapped.is_err()
         {
             std::os::seraph::log!(warn: "table pages: mapping failed");
@@ -198,7 +230,7 @@ impl Store
             // mapped in it, and is kept otherwise.
             // SAFETY: the range is this call's own reservation, and no Rust
             // reference into it exists.
-            let unmapped = unsafe { syscall::mem_unmap(self.aspace, va, CHUNK_PAGES) }.is_ok();
+            let unmapped = unsafe { syscall::mem_unmap(self.aspace, va, pages) }.is_ok();
             let _ = syscall::cap_delete(cap);
             if unmapped
             {
@@ -206,7 +238,12 @@ impl Store
             }
             return false;
         }
-        self.chunks.push(Chunk { phys, va, used: 0 });
+        self.chunks.push(Chunk {
+            phys,
+            va,
+            pages,
+            used: 0,
+        });
         true
     }
 }
@@ -215,7 +252,7 @@ impl TableStore for Store
 {
     fn alloc(&mut self) -> Option<u64>
     {
-        if self.chunks.last().is_none_or(|c| c.used == CHUNK_PAGES) && !self.grow()
+        if self.chunks.last().is_none_or(|c| c.used == c.pages) && !self.grow(CHUNK_PAGES)
         {
             return None;
         }

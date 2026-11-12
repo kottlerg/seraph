@@ -379,7 +379,7 @@ On both architectures, right after the interrupt-controller step, the BSP alloca
 routing table from the buddy allocator (`irq::init_table`, one zero-filled run of pages through
 `sched::alloc_zeroed_slab`), before any line is routed; its failure is fatal. The table holds one
 entry per line the discovered controllers implement (`interrupts::irq_line_count`: the I/O APICs'
-GSIs on x86-64, the APLIC's sources on RISC-V; `irq::IrqRoute`, 32 B), plus one delivery gate
+GSIs on x86-64, the APLIC's sources on RISC-V; `irq::IrqRoute`, 40 B), plus one delivery gate
 per boot CPU (`irq::DeliveryGate`, 64 B). A message-signaled target takes no entry: its state is
 funded by its minter, and the kernel reserves nothing per target at boot beyond the controllers'
 per-CPU slot rows (Phase 4) and the gates.

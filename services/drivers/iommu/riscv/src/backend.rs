@@ -29,7 +29,7 @@
 use std::time::{Duration, Instant};
 
 use iommu_core::table::TableStore;
-use iommu_core::{Access, Backend, BackendError, Fault, UnitInfo};
+use iommu_core::{Access, Backend, BackendError, Fault, RemapEntry, UnitInfo};
 use iommu_riscv::regs::{
     self, COMMAND_WORDS, CQ_ENTRIES, Capability, Command, DdtMode, Directory, FAULT_RECORD_WORDS,
     FQ_ENTRIES, Fence, FirstStageMode, Translations,
@@ -572,5 +572,27 @@ impl Backend for Riscv
                 u.write32(regs::FQCSR, regs::FQCSR_FQEN | stopped);
             }
         }
+    }
+
+    /// Refused: the RISC-V IOMMU reaches a device's MSIs through its DMA
+    /// translation ([`Self::map_msi`]), not through a remapping table.
+    fn remap_enable(&mut self, _entries: u32, _extended: bool) -> Result<bool, BackendError>
+    {
+        Err(BackendError::Invalid)
+    }
+
+    /// Nothing to turn off: [`Self::remap_enable`] turns nothing on.
+    fn remap_disable(&mut self) {}
+
+    /// Refused, as [`Self::remap_enable`] is.
+    fn remap_set(&mut self, _handle: u16, _entry: RemapEntry) -> Result<(), BackendError>
+    {
+        Err(BackendError::Invalid)
+    }
+
+    /// Refused, as [`Self::remap_enable`] is.
+    fn remap_clear(&mut self, _handle: u16) -> Result<(), BackendError>
+    {
+        Err(BackendError::Invalid)
     }
 }

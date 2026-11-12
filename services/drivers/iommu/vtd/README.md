@@ -18,19 +18,30 @@ The driver runs the units in legacy translation mode:
   domain per function;
 - each domain gets second-level page tables 4 levels deep (48-bit IOVAs) where the unit's
   `SAGAW` offers it, and otherwise 3 levels deep (39-bit);
-- at setup a unit gets an empty root table, a global context-cache and IOTLB invalidation, and
-  then translation on, with any translation or queued invalidation the firmware left on turned
-  off first and fault events masked;
+- at setup a unit gets queued invalidation on (one page of descriptors), an empty root table, a
+  global context-cache and IOTLB invalidation, and then translation on, with any translation,
+  interrupt remapping, or queued invalidation the firmware left on turned off first and fault
+  events masked; a unit without queued invalidation is not set up, since the driver invalidates
+  no other way;
 - `ATTACH` writes the function's context entry, `MAP` and `UNMAP` its second-level entries, and
   `BLOCK` clears its context entry, each followed by the invalidation it needs (an IOTLB
   invalidation after `MAP` only in caching mode), so the reply follows the hardware;
-- invalidation goes through the context-command and IOTLB registers (queued invalidation stays
-  off) and is polled to completion within `INVALIDATION_TIMEOUT`; batching it is
-  [#772](https://github.com/kottlerg/seraph/issues/772);
+- every invalidation is a batch of queued descriptors ended by a wait descriptor whose status
+  write is polled within `INVALIDATION_TIMEOUT`; a queue error counts as the unit failing; batching
+  invalidations across requests is [#772](https://github.com/kottlerg/seraph/issues/772);
+- `REMAP_SETUP` allocates one interrupt remapping table, physically contiguous, that every unit
+  points at, and turns interrupt remapping on with compatibility-format interrupts blocked, with
+  32-bit destinations when asked and every unit offers them (`ECAP.EIM`); `REMAP_SET` writes an
+  entry (fixed delivery, physical destination, the requester verified by its full source ID) and
+  `REMAP_CLEAR` clears one, each followed by an interrupt-entry-cache invalidation of that entry on
+  every unit; an entry that already holds what `REMAP_SET` asks for is left untouched, so a repeated
+  set opens no gap in a live source's delivery, and a present entry with other contents is cleared
+  and invalidated before it is rewritten, so no unit reads one whose two words disagree;
 - a unit whose page walks do not snoop the caches (`ECAP.C` clear, as QEMU's `intel-iommu`
   reports) gets every table write flushed from them before it is used;
-- faults are polled from the fault recording registers, since fault events are message-signalled
-  ([#325](https://github.com/kottlerg/seraph/issues/325)).
+- faults are polled from the fault recording registers, since fault events are message-signalled;
+  an interrupt remapping fault reports the handle the blocked interrupt named in place of an
+  address.
 
 The translation structures live in pages the driver takes from memmgr in physically contiguous
 chunks (`REQUIRE_CONTIGUOUS`) and maps into itself, through the page store it shares with the
@@ -45,8 +56,9 @@ whose caps lack it, presenting a page of its own as the credential (`iommu_core:
 ever returned, and devmgr spawns the driver `CREATE_DMA_HOLD` and never releases it (it deletes the
 hold's release token at the spawn), since a unit may walk any of them while translation stays on.
 
-The library (`iommu_vtd`) holds the register fields, the translation-structure encodings, and the
-page-table walk. They are host-tested, the walk over a heap-backed `iommu_core::TableStore`.
+The library (`iommu_vtd`) holds the register fields, the translation-structure, queued-invalidation,
+and interrupt-remapping encodings, and the page-table walk. They are host-tested, the walk over a
+heap-backed `iommu_core::TableStore`.
 
 ---
 
@@ -58,11 +70,13 @@ iommu/vtd/
 ├── README.md
 └── src/
     ├── lib.rs           # Library root (host-tested register and table logic)
-    ├── regs.rs          # Register offsets, CAP / ECAP / GCMD fields, invalidation commands,
-    │                    #   fault-record decode
+    ├── regs.rs          # Register offsets, CAP / ECAP / GCMD fields, fault-record decode
+    ├── queue.rs         # Queued-invalidation descriptors and queue register values
+    ├── remap.rs         # Interrupt remapping table entries and the IRTA value
     ├── tables.rs        # Root and context entries; second-level page tables over a page store
     ├── main.rs          # Driver binary: bootstrap, register mapping, setup, the two loops
-    ├── backend.rs       # The VT-d Backend: unit setup, attach, map, unmap, block, fault poll
+    ├── backend.rs       # The VT-d Backend: unit setup, attach, map, unmap, block, interrupt
+    │                    #   remapping, fault poll
     └── arch/            # Cache-line flushing for a unit that does not snoop (x86_64; a
                          #   documented no-op on riscv64, which builds no VT-d driver)
 ```
@@ -74,7 +88,7 @@ iommu/vtd/
 | Document | Content |
 |---|---|
 | [docs/device-management.md](../../../../docs/device-management.md) | DMA safety model, DMA authorisation, IOMMU discovery and programming |
-| [docs/limits.md](../../../../docs/limits.md) | The invalidation bound |
+| [docs/limits.md](../../../../docs/limits.md) | The invalidation bound, the queue size, and the remapping table's bound |
 
 ---
 

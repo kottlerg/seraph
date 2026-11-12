@@ -5,13 +5,16 @@
 
 //! The ACPI DMA Remapping table (DMAR): the VT-d remapping hardware units
 //! (DRHDs), the reserved memory regions (RMRRs) firmware expects a device to
-//! keep reaching, and which unit translates a given PCI function.
+//! keep reaching, which unit translates a given PCI function, whether the
+//! platform remaps interrupts, and the source ID each I/O APIC's interrupt
+//! requests carry.
 //!
 //! devmgr discovers each unit here, hands the unit's register range and the
 //! functions it covers to the VT-d IOMMU driver, and reads the RMRRs that name
 //! a DMA-capable device before it binds one, to identity-map them in the
-//! device's domain (`docs/device-management.md` § IOMMU Discovery and
-//! Programming). Layouts
+//! device's domain; with interrupt remapping on, the remapping entry of a
+//! wired line accepts only its I/O APIC's source ID
+//! (`docs/device-management.md` § IOMMU Discovery and Programming). Layouts
 //! are the Intel VT-d specification's (rev. 4.1, chapter 8, "BIOS
 //! Considerations"). Operates on a caller-mapped byte slice of the table, as
 //! [`crate::acpi`] does. No alloc.
@@ -57,6 +60,16 @@ const SCOPE_PCI_ENDPOINT: u8 = 1;
 /// Device scope type of a PCI sub-hierarchy: a bridge and every function
 /// below it.
 const SCOPE_PCI_SUB_HIERARCHY: u8 = 2;
+/// Device scope type of an I/O APIC: its enumeration ID is the I/O APIC's
+/// ID, and its path names the source ID of its interrupt requests.
+const SCOPE_IO_APIC: u8 = 3;
+
+/// Offset of the DMAR's flags (u8), after the host address width.
+const DMAR_OFF_FLAGS: usize = SDT_HDR_LEN + 1;
+/// DMAR flag: the platform supports interrupt remapping.
+const DMAR_FLAG_INTR_REMAP: u8 = 1 << 0;
+/// DMAR flag: the firmware asks the system not to use x2APIC destinations.
+const DMAR_FLAG_X2APIC_OPT_OUT: u8 = 1 << 1;
 
 /// Hops a device scope's path may hold: one per bridge between the start bus
 /// and the function. Eight covers any topology a PCI Express root complex
@@ -267,11 +280,14 @@ pub fn rmrrs(dmar: &[u8]) -> impl Iterator<Item = Rmrr> + '_
     })
 }
 
-/// The PCI scopes in the byte range `scopes` of `dmar`, skipping scopes of
-/// other types (IOAPIC, HPET, ACPI namespace devices) and ones whose path is
-/// empty, odd, or longer than [`MAX_SCOPE_PATH`]. The walk ends at a scope
-/// shorter than its header or running past the range.
-fn pci_scopes(dmar: &[u8], scopes: (usize, usize)) -> impl Iterator<Item = PciScope> + '_
+/// The device scopes in the byte range `scopes` of `dmar`, each as its type,
+/// its enumeration ID, and its start bus and path, skipping ones whose path
+/// is empty, odd, or longer than [`MAX_SCOPE_PATH`]. The walk ends at a
+/// scope shorter than its header or running past the range.
+fn device_scopes(
+    dmar: &[u8],
+    scopes: (usize, usize),
+) -> impl Iterator<Item = (u8, u8, PciScope)> + '_
 {
     let (mut off, end) = scopes;
     let end = end.min(dmar.len());
@@ -289,10 +305,7 @@ fn pci_scopes(dmar: &[u8], scopes: (usize, usize)) -> impl Iterator<Item = PciSc
             off += len;
             let path_bytes = len - SCOPE_PATH_OFF;
             let hops = path_bytes / 2;
-            if !matches!(kind, SCOPE_PCI_ENDPOINT | SCOPE_PCI_SUB_HIERARCHY)
-                || !path_bytes.is_multiple_of(2)
-                || hops == 0
-                || hops > MAX_SCOPE_PATH
+            if !path_bytes.is_multiple_of(2) || hops == 0 || hops > MAX_SCOPE_PATH
             {
                 continue;
             }
@@ -302,14 +315,92 @@ fn pci_scopes(dmar: &[u8], scopes: (usize, usize)) -> impl Iterator<Item = PciSc
                 let p = at + SCOPE_PATH_OFF + 2 * i;
                 *hop = (read_u8(dmar, p), read_u8(dmar, p + 1));
             }
-            return Some(PciScope {
+            let scope = PciScope {
                 sub_hierarchy: kind == SCOPE_PCI_SUB_HIERARCHY,
                 start_bus: read_u8(dmar, at + 5),
                 path,
                 path_len: hops,
-            });
+            };
+            return Some((kind, read_u8(dmar, at + 4), scope));
         }
         None
+    })
+}
+
+/// The PCI scopes in the byte range `scopes` of `dmar`, skipping scopes of
+/// other types (I/O APIC, HPET, ACPI namespace devices), as
+/// [`device_scopes`] reads them.
+fn pci_scopes(dmar: &[u8], scopes: (usize, usize)) -> impl Iterator<Item = PciScope> + '_
+{
+    device_scopes(dmar, scopes).filter_map(|(kind, _, scope)| {
+        matches!(kind, SCOPE_PCI_ENDPOINT | SCOPE_PCI_SUB_HIERARCHY).then_some(scope)
+    })
+}
+
+/// One I/O APIC a remapping unit's scope names: the I/O APIC's ID, as the
+/// MADT gives it, and the path to the function whose source ID its
+/// interrupt requests carry, which an interrupt remapping entry for one of
+/// its lines verifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoApicScope
+{
+    pub segment: u16,
+    pub id: u8,
+    pub scope: PciScope,
+}
+
+impl IoApicScope
+{
+    /// The source ID (bus in bits 8..16, device and function below) of the
+    /// I/O APIC's interrupt requests: its path resolved as
+    /// [`PciScope::resolve`] resolves it, through `secondary_bus`.
+    pub fn source_id(&self, secondary_bus: impl FnMut(Bdf) -> Option<u8>) -> Option<u16>
+    {
+        let b = self.scope.resolve(secondary_bus)?;
+        Some(
+            (u16::from(b.bus) << 8) | (u16::from(b.device & 0x1f) << 3) | u16::from(b.function & 7),
+        )
+    }
+}
+
+/// Every I/O APIC the DMAR's remapping units name, in table order.
+pub fn io_apic_scopes(dmar: &[u8]) -> impl Iterator<Item = IoApicScope> + '_
+{
+    drhd_units(dmar).flat_map(move |unit| {
+        device_scopes(dmar, unit.scopes).filter_map(move |(kind, id, scope)| {
+            (kind == SCOPE_IO_APIC).then_some(IoApicScope {
+                segment: unit.segment,
+                id,
+                scope,
+            })
+        })
+    })
+}
+
+/// The DMAR's flags (section 8.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarFlags
+{
+    /// The platform supports interrupt remapping (`INTR_REMAP`).
+    pub interrupt_remapping: bool,
+    /// The firmware asks the system not to use 32-bit (x2APIC) interrupt
+    /// destinations (`X2APIC_OPT_OUT`).
+    pub x2apic_opt_out: bool,
+}
+
+/// The DMAR's flags; `None` for a table that is not a DMAR or too short to
+/// hold them.
+#[must_use]
+pub fn flags(dmar: &[u8]) -> Option<DmarFlags>
+{
+    if sdt_signature(dmar) != *b"DMAR" || dmar.len() <= DMAR_OFF_FLAGS
+    {
+        return None;
+    }
+    let flags = read_u8(dmar, DMAR_OFF_FLAGS);
+    Some(DmarFlags {
+        interrupt_remapping: flags & DMAR_FLAG_INTR_REMAP != 0,
+        x2apic_opt_out: flags & DMAR_FLAG_X2APIC_OPT_OUT != 0,
     })
 }
 
@@ -579,6 +670,85 @@ mod tests
             unit_for(&table, 0, bdf(0, 3, 0), no_bridges, no_ranges),
             Some(0)
         );
+    }
+
+    /// An I/O APIC device scope for I/O APIC `id` at `start_bus` along
+    /// `path`.
+    fn io_apic_scope(id: u8, start_bus: u8, path: &[(u8, u8)]) -> Vec<u8>
+    {
+        let mut s = scope(SCOPE_IO_APIC, start_bus, path);
+        s[4] = id;
+        s
+    }
+
+    #[test]
+    fn a_q35_io_apic_scope_gives_the_io_apics_source_id()
+    {
+        // QEMU q35 with interrupt remapping: the catch-all unit names I/O
+        // APIC 0 at ff:00.0, beside a PCI endpoint the I/O APIC walk skips.
+        let table = dmar(
+            39,
+            &[drhd(
+                DRHD_FLAG_INCLUDE_PCI_ALL,
+                0,
+                0,
+                0xfed9_0000,
+                &[
+                    scope(SCOPE_PCI_ENDPOINT, 0, &[(2, 0)]),
+                    io_apic_scope(0, 0xff, &[(0, 0)]),
+                ],
+            )],
+        );
+        let found: Vec<_> = io_apic_scopes(&table).collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].segment, found[0].id), (0, 0));
+        assert_eq!(found[0].source_id(no_bridges), Some(0xff00));
+        // The I/O APIC scope names no PCI function for the unit.
+        assert_eq!(drhd_units(&table).next().unwrap().scopes(&table).count(), 1);
+    }
+
+    #[test]
+    fn an_io_apic_behind_a_bridge_resolves_through_it()
+    {
+        let table = dmar(
+            39,
+            &[drhd(
+                0,
+                0,
+                0,
+                0xfed9_0000,
+                &[io_apic_scope(8, 0, &[(0x1c, 0), (0x1f, 7)])],
+            )],
+        );
+        let apic = io_apic_scopes(&table).next().unwrap();
+        assert_eq!(apic.id, 8);
+        let bridge = |b: Bdf| (b == bdf(0, 0x1c, 0)).then_some(5);
+        assert_eq!(apic.source_id(bridge), Some(0x05ff));
+        assert_eq!(apic.source_id(no_bridges), None);
+    }
+
+    #[test]
+    fn the_dmar_flags_say_whether_interrupts_are_remapped()
+    {
+        let mut table = dmar(39, &[]);
+        assert_eq!(
+            flags(&table),
+            Some(DmarFlags {
+                interrupt_remapping: false,
+                x2apic_opt_out: false,
+            })
+        );
+        table[DMAR_OFF_FLAGS] = DMAR_FLAG_INTR_REMAP | DMAR_FLAG_X2APIC_OPT_OUT;
+        assert_eq!(
+            flags(&table),
+            Some(DmarFlags {
+                interrupt_remapping: true,
+                x2apic_opt_out: true,
+            })
+        );
+        table[0..4].copy_from_slice(b"APIC");
+        assert_eq!(flags(&table), None);
+        assert_eq!(flags(b"DMAR"), None);
     }
 
     #[test]

@@ -37,12 +37,12 @@
 //! domain translates, so before devmgr enables them it has the driver map the
 //! page of each interrupt file they target in the device's domain
 //! (`MAP_MSI`, `crate::dma::DmaGrant::reach_interrupt_file`). VT-d does
-//! not translate them: its interrupt remapping governs them, and while that
-//! is off a device's messages reach the local APICs unchecked
-//! (`docs/device-management.md` § Interrupt Delivery).
+//! not translate them: its interrupt remapping governs them, which devmgr
+//! turns on and programs through the same driver ([`crate::intremap`];
+//! `docs/device-management.md` § Interrupt Delivery).
 //!
 //! The [`IommuClient`] is shared by devmgr's control thread (`ATTACH`,
-//! `MAP_MSI`, `BLOCK`), its DMA thread (`MAP`, `UNMAP`), and its fault-log thread
+//! `MAP_MSI`, `BLOCK`, `REMAP_SETUP`, `REMAP_SET`, `REMAP_CLEAR`), its DMA thread (`MAP`, `UNMAP`), and its fault-log thread
 //! (`TAKE_FAULTS`), each call made with no devmgr lock held. When the driver
 //! dies after it reported ready, the hardware goes on translating, so devmgr
 //! cannot fall back to unconfined DMA. A death watch thread of its own sees
@@ -289,6 +289,59 @@ impl IommuClient
     {
         let msg = Self::request(iommu_labels::BLOCK).word(1, handle).build();
         self.call(&msg).is_ok()
+    }
+
+    /// Set up the interrupt remapping table every unit shares with `entries`
+    /// entries, asking for 32-bit destinations when `extended` is set, or
+    /// turn remapping off with `entries` 0 (`REMAP_SETUP`); whether the
+    /// destinations are 32-bit.
+    ///
+    /// # Errors
+    /// The driver's error label; remapping stays off.
+    pub fn remap_setup(&self, entries: u64, extended: bool) -> Result<bool, u64>
+    {
+        let msg = Self::request(iommu_labels::REMAP_SETUP)
+            .word(1, entries)
+            .word(2, u64::from(extended))
+            .build();
+        self.call(&msg).map(|r| r.word(0) == 1)
+    }
+
+    /// Make remapping entry `handle` deliver `vector` to the CPU whose
+    /// interrupt controller ID is `apic_id`, level-triggered when `level` is
+    /// set, for requests from `source` alone (`REMAP_SET`).
+    ///
+    /// # Errors
+    /// The driver's error label; the entry is as it was.
+    pub fn remap_set(
+        &self,
+        handle: u16,
+        apic_id: u32,
+        vector: u8,
+        level: bool,
+        source: u16,
+    ) -> Result<(), u64>
+    {
+        let msg = Self::request(iommu_labels::REMAP_SET)
+            .word(1, u64::from(handle))
+            .word(2, u64::from(apic_id))
+            .word(3, u64::from(vector))
+            .word(4, u64::from(level))
+            .word(5, u64::from(source))
+            .build();
+        self.call(&msg).map(|_| ())
+    }
+
+    /// Make remapping entry `handle` not present (`REMAP_CLEAR`).
+    ///
+    /// # Errors
+    /// The driver's error label; the entry is as it was.
+    pub fn remap_clear(&self, handle: u16) -> Result<(), u64>
+    {
+        let msg = Self::request(iommu_labels::REMAP_CLEAR)
+            .word(1, u64::from(handle))
+            .build();
+        self.call(&msg).map(|_| ())
     }
 
     /// The IOVA width of unit `unit`; 0 when unknown.
@@ -756,6 +809,31 @@ impl Iommu
             }
             Refused
         })
+    }
+
+    /// The DMAR's flags and the source ID of each I/O APIC its units name,
+    /// by I/O APIC ID (`crate::intremap::enable`); `None` for an IOMMU
+    /// family other than VT-d. An I/O APIC whose path does not resolve is
+    /// left out.
+    pub fn io_apic_sources(&self) -> Option<(dmar::DmarFlags, Vec<(u8, u16)>)>
+    {
+        let Topology::Dmar { dmar, bridges, .. } = &self.topology
+        else
+        {
+            return None;
+        };
+        let flags = dmar::flags(dmar)?;
+        let mut sources = Vec::new();
+        for scope in dmar::io_apic_scopes(dmar)
+        {
+            let secondary = |b| bridge_range(bridges, scope.segment, b).map(|r| r.0);
+            if let Some(source) = scope.source_id(secondary)
+                && sources.try_reserve(1).is_ok()
+            {
+                sources.push((scope.id, source));
+            }
+        }
+        Some((flags, sources))
     }
 
     /// Take the driver's recorded faults and log each against its device;

@@ -19,6 +19,7 @@ pub mod ioapic;
 pub mod msi;
 pub mod paging;
 pub mod platform;
+pub mod remap;
 pub mod speculation;
 pub mod syscall;
 pub mod timer;

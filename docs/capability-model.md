@@ -207,11 +207,16 @@ A capability to a contiguous range of hardware interrupt lines (a range authorit
 narrowed with `SYS_IRQ_SPLIT`). Rights:
 - **Notify** — may register, acknowledge, and split (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`,
   `SYS_IRQ_SPLIT`); register and acknowledge require a single-line cap
-- **Mint** — may mint a message-signaled Interrupt capability (`SYS_IRQ_MSG_ALLOC`)
+- **Mint** — may mint a message-signaled Interrupt capability (`SYS_IRQ_MSG_ALLOC`), route a
+  wired line (`SYS_IRQ_ROUTE`; a single-line cap), and switch interrupt remapping
+  (`SYS_IRQ_REMAP`)
 
-The holder binds a Notification to the line with `SYS_IRQ_REGISTER`, passing the line's
-trigger and polarity mode, which every binding on the line shares; each interrupt ORs bit 0
-into that Notification, and the holder re-enables the line with `SYS_IRQ_ACK`.
+The holder routes the line with `SYS_IRQ_ROUTE`, passing its trigger and polarity mode, which
+the route records and every binding on the line shares, and which makes the capability's object a
+holder of the route. It binds a Notification to the routed line with `SYS_IRQ_REGISTER`, a line
+not routed being refused; each interrupt ORs bit 0 into that Notification, and the holder
+re-enables the line with `SYS_IRQ_ACK`. The line is released once neither a route holder nor a
+binding remains.
 
 Every Interrupt capability references an object of its own, as for [Mmio](#mmio): a copy or
 derivation references a fresh object over the same range, bounded the same way, and that object
@@ -225,13 +230,13 @@ stay; a binding holds a reference on its Notification, so a Notification whose c
 deleted lives on while a binding names it; a line whose remaining bindings owe no acknowledgement is
 re-enabled then, so a receiver that goes cannot hold a shared line masked. The binding semantics are
 specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_IRQ_REGISTER`
-and § `SYS_IRQ_ACK`.
+and § `SYS_IRQ_ACK`; the route, in § `SYS_IRQ_ROUTE`.
 
 The kernel mints one root Interrupt range capability at boot that covers every IRQ id on the
 architecture, with Notify and Mint rights, and places it in init's CSpace. Init keeps the root and
 hands devmgr a full-rights derivation, from which devmgr splits single-line children with
-`SYS_IRQ_SPLIT` for the drivers. devmgr attenuates the capabilities it gives drivers to Notify
-only, so no driver holds Mint.
+`SYS_IRQ_SPLIT` for the drivers, routing each line through its split cap. devmgr attenuates the
+capabilities it gives drivers to Notify only, so no driver holds Mint.
 
 `SYS_IRQ_MSG_ALLOC` mints, through an Interrupt capability carrying Mint, one unbound
 message-signaled Interrupt capability. It names one source id past every wired line and carries

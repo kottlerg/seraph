@@ -14,8 +14,8 @@ endpoint, the devmgr query cap, and the device's DMA capability.
 
 The driver checks the device's identification register, binds its interrupt to a notification of its
 own (`SYS_IRQ_REGISTER`), reports ready, and answers `ipc::test_dma_labels::INTERRUPT_PROBE`,
-`INTERRUPT_CHURN`, `FIXTURE_EXIT` and `DMA_PROBE`. The interrupt probe has the device raise its
-interrupt (register `0x60`), waits for the notification for at most
+`INTERRUPT_CHURN`, `FIXTURE_EXIT`, `DMA_PROBE` and `MSI_FORGE`. The interrupt probe has the device
+raise its interrupt (register `0x60`), waits for the notification for at most
 `test_dma_labels::INTERRUPT_WAIT_MS`, acknowledges it at the device (register `0x64`) and with
 `SYS_IRQ_ACK`, and reports whether it was delivered and the kind of interrupt the driver holds.
 `ipc::test_dma_labels::INTERRUPT_CHURN` has a thread of the driver raise and acknowledge the
@@ -34,11 +34,22 @@ whether the copy after the unmap reached the page, and the device address. Where
 the device that last copy is stopped and the IOMMU records a fault. The driver then asks devmgr for
 its device's faults (`devmgr_dma_labels::DMA_FAULTS`) until the stopped copy is counted, for at most
 `test_dma_labels::FAULT_WAIT_MS`, and reports with the probe whether an IOMMU confines the device,
-the fault count, and the latest fault's IOVA. The device reaches 28 address bits, so with no IOMMU a
-page above 256 MiB is not copied to.
+the fault count, and the latest fault's IOVA. The fixture declares 28 address bits, so with no IOMMU
+a page above 256 MiB is not copied to; the test launch widens the device's DMA mask to 32 bits so
+its engine reaches the interrupt addresses. `ipc::test_dma_labels::MSI_FORGE` runs where an IOMMU
+confines the device and the driver holds an MSI vector. It reads the vector's message
+(`SYS_CAP_INFO` with `CAP_INFO_IRQ_MSG_ADDRESS` and `CAP_INFO_IRQ_MSG_DATA`) and has the device's
+DMA engine write that message to its own address, which must reach the driver's notification, then
+to a forged address, which must not. On riscv64 the forged address is the interrupt file page beside
+the target's, which the device's domain does not map; the IOMMU blocks the write and devmgr counts
+the fault for the device at that page, which the driver waits for through `DMA_FAULTS`. On x86_64
+the message must be remappable (address bit 4) and the forged address is a remappable message naming
+handle `0xFFFF`, which no remapping table entry holds; QEMU records no requester id for a fault the
+DMA engine's write raises, so devmgr cannot attribute it and the check is non-delivery. An
+unconfined device makes no forged write.
 
-[svctest](../../svctest/README.md)'s DMA confinement and MSI delivery, churn, and release phases
-reach it through the `test-dma` class (`QUERY_DEVICE`) and drive it.
+[svctest](../../svctest/README.md)'s DMA confinement and MSI delivery, forge, churn, and release
+phases reach it through the `test-dma` class (`QUERY_DEVICE`) and drive it.
 
 ---
 
@@ -50,7 +61,7 @@ test-dma/
 ├── README.md
 └── src/
     └── main.rs            # Bootstrap, edu register access, the interrupt and DMA probes,
-                           #   the interrupt churn, the fixture exit
+                           #   the MSI forge, the interrupt churn, the fixture exit
 ```
 
 ---

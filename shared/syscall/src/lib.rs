@@ -47,12 +47,12 @@ use syscall_abi::{
     SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
     SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
     SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
-    SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT,
-    SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
-    SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
-    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL,
-    SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP,
+    SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
+    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
+    SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER,
+    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
     SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK,
     SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
     SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
@@ -2125,25 +2125,27 @@ pub fn wait_set_try_wait(ws_cap: u64) -> Result<u64, i64>
 /// The binding is `irq_cap`'s own: each copy of an Interrupt cap binds on its own,
 /// so several drivers sharing a line each register and are each signalled, and
 /// registering again through the same cap rebinds it to the new notification.
-/// After registration the IRQ is masked until this binding's first `irq_ack`. The
-/// driver must call `irq_ack` after servicing each interrupt to re-enable delivery.
+/// A wired line is bound only once routed ([`irq_route`]). After registration the
+/// IRQ is masked until this binding's first `irq_ack`. The driver must call
+/// `irq_ack` after servicing each interrupt to re-enable delivery.
 ///
 /// `mode` is the line's trigger and polarity (`IRQ_MODE_LEVEL`,
-/// `IRQ_MODE_ACTIVE_LOW`; 0 is edge-triggered, active-high). Every binding on a
-/// line passes the same mode: the line's first binding records it. A
-/// message-signaled target ([`irq_msg_alloc`]) takes one binding, in mode 0.
+/// `IRQ_MODE_ACTIVE_LOW`; 0 is edge-triggered, active-high): the mode the line
+/// is routed in. A message-signaled target ([`irq_msg_alloc`]) takes one
+/// binding, in mode 0.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid or lacks
 /// Notify rights, `InvalidArgument` if `irq_cap` covers more than one line or
-/// names an id no discovered interrupt controller implements (a GSI no I/O APIC
-/// reports on x86-64, a source past the APLIC's `riscv,num-sources` on RISC-V), if
-/// `mode` sets a bit outside `IRQ_MODE_MASK`, if it differs from the mode
-/// the line's bindings recorded, or if it is not 0 for a message-signaled
-/// target, or `QuotaExceeded` when the line already holds 64 bindings, the
-/// message-signaled target is already bound, or, for its first binding, the controller has no delivery
-/// resource left (x86-64: no CPU has a free device vector; RISC-V: no CPU's
-/// IMSIC file has a free identity).
+/// names an id outside the lines the discovered interrupt controllers implement
+/// (a GSI above the highest an I/O APIC reports on x86-64, a source outside the
+/// APLIC's `1..=riscv,num-sources` on RISC-V), if `mode` sets a bit outside
+/// `IRQ_MODE_MASK`, if it differs from the mode the line is routed in, or if it
+/// is not 0 for a message-signaled target, `InvalidState` if the line is not
+/// routed (an id within those bounds that no controller implements, a GSI
+/// between two I/O APICs' ranges, never is), or `QuotaExceeded` when the line
+/// already holds 64 bindings, the message-signaled target is already bound, or
+/// the notification holds as many references as it may.
 #[inline]
 pub fn irq_register(irq_cap: u64, notification_cap: u64, mode: u64) -> Result<(), i64>
 {
@@ -2200,6 +2202,50 @@ pub fn irq_msg_alloc(authority: u64) -> Result<u64, i64>
     // CSpace.
     let ret = unsafe { syscall2(SYS_IRQ_MSG_ALLOC, authority, 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// Route the wired line single-line Interrupt cap `irq_cap` names, in `mode`
+/// (`IRQ_MODE_LEVEL`, `IRQ_MODE_ACTIVE_LOW`; 0 is edge-triggered, active-high).
+///
+/// `irq_cap` carries `RIGHTS_IRQ_MINT`, and its object then holds the route: the
+/// line keeps its target, masked until a binding acknowledges, while the object
+/// or a binding ([`irq_register`]) remains. Routing again through the same cap,
+/// or through another cap of the line in the same mode, succeeds
+/// (`core/kernel/docs/syscalls.md` § `SYS_IRQ_ROUTE`).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (the cap lacks `RIGHTS_IRQ_MINT`), `InvalidArgument` (a
+/// range cap, a message-signaled target, a line no controller implements, a
+/// mode outside `IRQ_MODE_MASK`, or a mode other than the line's route's), or
+/// `QuotaExceeded` (no eligible CPU has a free delivery slot).
+#[inline]
+pub fn irq_route(irq_cap: u64, mode: u64) -> Result<(), i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; irq_cap is a cap handle as
+    // u64 and mode a plain word; the kernel validates both.
+    let ret = unsafe { syscall2(SYS_IRQ_ROUTE, irq_cap, mode) };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Switch the interrupt formats the kernel hands out to `setting`
+/// (`IRQ_REMAP_OFF`, `IRQ_REMAP_ON`, `IRQ_REMAP_ON_EXTENDED`), through
+/// `authority`, an Interrupt cap carrying `RIGHTS_IRQ_MINT`; allowed only while
+/// no line is routed and no message-signaled target is minted
+/// (`core/kernel/docs/syscalls.md` § `SYS_IRQ_REMAP`).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights`, `InvalidArgument` (another setting), `InvalidState` (a
+/// source exists), or `NotSupported` (no interrupt remapping on the
+/// architecture).
+#[inline]
+pub fn irq_remap(authority: u64, setting: u64) -> Result<(), i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; authority is a cap handle
+    // as u64 and setting a plain word; the kernel validates both.
+    let ret = unsafe { syscall2(SYS_IRQ_REMAP, authority, setting) };
+    if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
 /// Map `mmio_cap` into `aspace_cap` at virtual address `virt`.

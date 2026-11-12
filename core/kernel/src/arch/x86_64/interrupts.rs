@@ -37,11 +37,15 @@
 //!   (separate hardware) is unaffected and stays MMIO.
 //!
 //! # Modification notes
-//! - Device IRQs are routed generically: `SYS_IRQ_REGISTER` (`syscall::hw::sys_irq_register`)
-//!   calls `irq::register`, which calls [`route_device_irq`] (choose a destination CPU,
-//!   assign a device vector of it, install the I/O APIC entry masked) and records the
-//!   Notification; clearing the route calls [`unroute_device_irq`]. `SYS_IRQ_ACK`
-//!   (`syscall::hw::sys_irq_ack`) calls [`unmask`].
+//! - Device IRQs are routed generically: `SYS_IRQ_ROUTE` (`syscall::hw::sys_irq_route`)
+//!   calls `irq::route`, which calls [`route_device_irq`] (choose a destination CPU,
+//!   assign a device vector of it, install the I/O APIC entry masked) for a line not yet
+//!   routed; `SYS_IRQ_REGISTER` (`irq::register`) records a Notification on a routed
+//!   line; the line's release, once neither a route holder nor a binding remains, calls
+//!   [`unroute_device_irq`]. `SYS_IRQ_ACK` (`syscall::hw::sys_irq_ack`) calls [`unmask`].
+//! - `SYS_IRQ_REMAP` (`irq::set_remap`) selects the formats through [`set_remap`]; while
+//!   remapping is on, [`route_device_irq`] and [`message_address`] name a handle
+//!   ([`super::remap`]) and [`remap_entry`] reports the entry the IOMMU needs.
 //! - Message-signaled targets (`SYS_IRQ_MSG_ALLOC`, `irq::alloc_message`) take a device
 //!   vector of a CPU through [`alloc_message_target`] and release it through
 //!   [`free_message_target`]; the vector's slot entry ([`slot_entry`]) anchors the target,
@@ -779,35 +783,145 @@ pub fn unmask(irq: u32)
 #[cfg(test)]
 pub fn unmask(_irq: u32) {}
 
-/// Whether CPU `cpu` (a logical index below `CPU_COUNT`) can take a source: an APIC id
-/// the 8-bit physical destination field of a redirection entry or a compatibility-format
-/// message names (below `0xFF`, the broadcast id; module doc of [`super::ioapic`]
-/// § Destination), and a free device vector.
+/// The formats the kernel hands out (`irq::set_remap`): [`REMAP_OFF`], [`REMAP_ON`] or
+/// [`REMAP_ON_EXTENDED`]. Written and read under `irq`'s routing lock, so `Relaxed`.
+#[cfg(not(test))]
+static REMAP: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(REMAP_OFF);
+
+/// [`REMAP`]: compatibility formats.
+const REMAP_OFF: u8 = 0;
+/// [`REMAP`]: remappable formats, 8-bit destinations.
+const REMAP_ON: u8 = 1;
+/// [`REMAP`]: remappable formats, 32-bit destinations.
+const REMAP_ON_EXTENDED: u8 = 2;
+
+/// The formats the kernel hands out.
+#[cfg(not(test))]
+fn remap() -> crate::irq::Remap
+{
+    match REMAP.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        REMAP_ON => crate::irq::Remap::On { extended: false },
+        REMAP_ON_EXTENDED => crate::irq::Remap::On { extended: true },
+        _ => crate::irq::Remap::Off,
+    }
+}
+
+/// Switch the formats the kernel hands out. Called by `irq::set_remap` under `irq`'s
+/// routing lock, with no source holding a vector.
+///
+/// # Errors
+/// None on x86-64.
+// unnecessary_wraps: the Result is the cross-arch contract `irq::set_remap`
+// calls; riscv64's implementation returns `NotSupported`.
+#[allow(clippy::unnecessary_wraps)]
+#[cfg(not(test))]
+pub fn set_remap(remap: crate::irq::Remap) -> Result<(), crate::irq::RemapError>
+{
+    let value = match remap
+    {
+        crate::irq::Remap::Off => REMAP_OFF,
+        crate::irq::Remap::On { extended: false } => REMAP_ON,
+        crate::irq::Remap::On { extended: true } => REMAP_ON_EXTENDED,
+    };
+    REMAP.store(value, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Whether a CPU with logical index `cpu` and APIC id `apic_id` can be named by the
+/// formats `remap` selects: in the compatibility formats an id the 8-bit physical
+/// destination field of a redirection entry or a message names (below `0xFF`, the
+/// broadcast id; module doc of [`super::ioapic`] § Destination); in the remappable ones
+/// a CPU whose device vectors have handles (below [`super::remap::REMAP_CPU_LIMIT`]),
+/// with an id the remapping entry's destination holds (any, when it is 32 bits).
+const fn nameable(cpu: usize, apic_id: u32, remap: crate::irq::Remap) -> bool
+{
+    let narrow = apic_id < super::ioapic::BROADCAST_APIC_ID;
+    match remap
+    {
+        crate::irq::Remap::Off => narrow,
+        crate::irq::Remap::On { extended } =>
+        {
+            cpu < super::remap::REMAP_CPU_LIMIT && (extended || narrow)
+        }
+    }
+}
+
+/// Whether CPU `cpu` (a logical index below `CPU_COUNT`) can take a source: a CPU the
+/// current formats can name ([`nameable`]), with a free device vector.
 #[cfg(not(test))]
 fn can_take_source(cpu: usize) -> bool
 {
     // SAFETY: `next_target_cpu` passes only indices below CPU_COUNT; the APIC id slab is
     // read-only after boot.
     let apic_id = unsafe { crate::percpu::apic_id_for(cpu) };
-    apic_id < super::ioapic::BROADCAST_APIC_ID && super::ioapic::has_free_vector(cpu)
+    nameable(cpu, apic_id, remap()) && super::ioapic::has_free_vector(cpu)
+}
+
+/// The handle of `target`'s device vector ([`super::remap::handle`]), or `None` when the
+/// target has none.
+#[cfg(not(test))]
+fn handle_of(target: crate::irq::Target) -> Option<u16>
+{
+    super::remap::handle(target.cpu as usize, u8::try_from(target.slot).ok()?)
+}
+
+/// The remapping entry an IOMMU needs for `target` (`irq::remap_entry`), packed for
+/// `SYS_CAP_INFO`'s `CAP_INFO_IRQ_REMAP_ENTRY`: the handle in bits 15:0, the vector in
+/// bits 23:16, and the destination CPU's APIC id in bits 63:32.
+///
+/// # Errors
+/// `RemapError::State` with remapping off, or for a target with no handle.
+#[cfg(not(test))]
+pub fn remap_entry(target: crate::irq::Target) -> Result<u64, crate::irq::RemapError>
+{
+    if remap() == crate::irq::Remap::Off
+    {
+        return Err(crate::irq::RemapError::State);
+    }
+    let handle = handle_of(target).ok_or(crate::irq::RemapError::State)?;
+    let cpu = target.cpu as usize;
+    if cpu >= crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
+    {
+        return Err(crate::irq::RemapError::State);
+    }
+    // SAFETY: `cpu` is below CPU_COUNT; the APIC id slab is read-only after boot.
+    let apic_id = unsafe { crate::percpu::apic_id_for(cpu) };
+    Ok(syscall::remap_entry_pack(handle, target.slot, apic_id))
+}
+
+/// The handles the remapping table needs for this boot's CPUs
+/// ([`super::remap::handle_count`]), for `SYS_CAP_INFO`'s `CAP_INFO_IRQ_REMAP_HANDLES`.
+///
+/// # Errors
+/// None on x86-64.
+// unnecessary_wraps: the Result is the cross-arch contract `SYS_CAP_INFO`
+// calls; riscv64's implementation returns `NotSupported`.
+#[allow(clippy::unnecessary_wraps)]
+#[cfg(not(test))]
+pub fn remap_handles() -> Result<u64, crate::irq::RemapError>
+{
+    let cpus = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    Ok(super::remap::handle_count(cpus) as u64)
 }
 
 /// Route device IRQ (GSI) `irq`, leaving the line masked at the I/O APIC: choose a
 /// destination CPU, assign the GSI a device vector of that CPU
 /// ([`super::ioapic::assign_vector`]), and program its redirection entry with `mode`'s
-/// trigger and polarity (the `SYS_IRQ_REGISTER` word, validated by the syscall). Returns
+/// trigger and polarity (the `SYS_IRQ_ROUTE` word, validated by the syscall). Returns
 /// the CPU and vector, which `irq` keeps for [`unroute_device_irq`]. The driver unmasks via
-/// `SYS_IRQ_ACK` once it has registered a handler. Called by `irq::register` for the GSI's
-/// first binding; the route is kept while any binding remains.
+/// `SYS_IRQ_ACK` once it has registered a handler. Called by `irq::route` for the GSI's
+/// first route holder; the route is kept while a holder or a binding remains.
 ///
-/// The destination is the next CPU in turn (`irq::next_target_cpu`) whose APIC id the
-/// redirection entry's 8-bit physical destination field can name (below `0xFF`, which is
-/// the broadcast id; module doc of [`super::ioapic`] § Destination) and that has a free
-/// device vector.
+/// The destination is the next CPU in turn (`irq::next_target_cpu`) that the current
+/// formats can name ([`nameable`]) and that has a free device vector. With remapping off
+/// the entry names the CPU's APIC id in the compatibility format; with it on, the
+/// vector's handle in the remappable format ([`super::remap`]), whose remapping entry
+/// devmgr has the IOMMU driver write before the line is unmasked.
 ///
 /// # Errors
 /// `NoSuchLine` when no discovered I/O APIC implements the GSI; `Exhausted` when no CPU
-/// with an APIC id an I/O APIC can name has a free device vector.
+/// the current formats can name has a free device vector.
 ///
 /// # Safety
 /// Must be called after Phase 5 init (IOAPIC initialised), under `irq`'s routing lock.
@@ -823,24 +937,41 @@ pub unsafe fn route_device_irq(
     }
     let destination =
         crate::irq::next_target_cpu(can_take_source).ok_or(crate::irq::RouteError::Exhausted)?;
-    // SAFETY: `destination` is below CPU_COUNT (`next_target_cpu`); the id was checked to
-    // fit eight bits.
-    let apic_id = unsafe { crate::percpu::apic_id_for(destination) };
-    let apic_id = u8::try_from(apic_id).map_err(|_| crate::irq::RouteError::Exhausted)?;
-    let vector = super::ioapic::assign_vector(destination, crate::irq::Slot::Line(irq))
-        .ok_or(crate::irq::RouteError::Exhausted)?;
-    // SAFETY: post-Phase-5 IOAPIC; route() installs the redirection entry masked, after
-    // the vector assignment is published, and the driver unmasks via SYS_IRQ_ACK.
-    unsafe {
-        super::ioapic::route(irq, vector, apic_id, mode);
-    }
     // The destination is below CPU_COUNT, which fits u32.
     #[allow(clippy::cast_possible_truncation)]
     let cpu = destination as u32;
-    Ok(crate::irq::Target {
+    let vector = super::ioapic::assign_vector(destination, crate::irq::Slot::Line(irq))
+        .ok_or(crate::irq::RouteError::Exhausted)?;
+    let target = crate::irq::Target {
         cpu,
         slot: u32::from(vector),
-    })
+    };
+    let entry_destination = if remap() == crate::irq::Remap::Off
+    {
+        // SAFETY: `destination` is below CPU_COUNT (`next_target_cpu`).
+        let apic_id = unsafe { crate::percpu::apic_id_for(destination) };
+        u8::try_from(apic_id)
+            .ok()
+            .map(super::ioapic::Destination::Physical)
+    }
+    else
+    {
+        handle_of(target).map(super::ioapic::Destination::Remapped)
+    };
+    // `nameable` admitted the CPU, so its id fits eight bits and its vectors have
+    // handles; the check keeps a failure from programming a wrong entry.
+    let Some(entry_destination) = entry_destination
+    else
+    {
+        release_slot(target);
+        return Err(crate::irq::RouteError::Exhausted);
+    };
+    // SAFETY: post-Phase-5 IOAPIC; route() installs the redirection entry masked, after
+    // the vector assignment is published, and the driver unmasks via SYS_IRQ_ACK.
+    unsafe {
+        super::ioapic::route(irq, vector, entry_destination, mode);
+    }
+    Ok(target)
 }
 
 /// Test stub: routes every line to vector 0 of CPU 0.
@@ -899,8 +1030,12 @@ fn release_slot(target: crate::irq::Target)
 pub unsafe fn unroute_device_irq(_irq: u32, _target: crate::irq::Target) {}
 
 /// Take a device vector for a new message target: the next free vector of the next CPU
-/// in turn (`irq::next_target_cpu`) whose APIC id a compatibility-format message address
-/// can name and that has a free one ([`super::msi`]), its slot entry left
+/// in turn (`irq::next_target_cpu`) that the current message format can name
+/// ([`nameable`]: with remapping off, an APIC id a compatibility-format address names,
+/// [`super::msi`]; with it on, a CPU whose vectors have handles and, unless the
+/// remapping entry's destination is 32 bits, whose APIC id is below `0xFF`,
+/// [`super::remap`]) and
+/// that has a free one, its slot entry left
 /// `irq::Slot::Unbound`. Every device vector is enabled at its local APIC from boot, so
 /// the target is deliverable once the device writes the message [`message_address`] and
 /// [`message_data`] give. Called by `irq::alloc_message` under `irq`'s routing lock.
@@ -945,9 +1080,10 @@ pub fn slot_entry(target: crate::irq::Target) -> Option<&'static crate::irq::Slo
     super::ioapic::slot_of(target.cpu as usize, vector)
 }
 
-/// The compatibility-format message address that delivers to `target`'s CPU
-/// ([`super::msi::address`]), or `None` when the CPU index is past the boot CPUs or its APIC
-/// id has no such address.
+/// The message address that delivers to `target`: with remapping off the
+/// compatibility-format address of its CPU ([`super::msi::address`]), with it on the
+/// remappable address of its handle ([`super::remap::message_address`]). `None` when the
+/// CPU index is past the boot CPUs, or the target has no such address.
 #[cfg(not(test))]
 #[must_use]
 pub fn message_address(target: crate::irq::Target) -> Option<u64>
@@ -957,16 +1093,25 @@ pub fn message_address(target: crate::irq::Target) -> Option<u64>
     {
         return None;
     }
+    if remap() != crate::irq::Remap::Off
+    {
+        return handle_of(target).map(super::remap::message_address);
+    }
     // SAFETY: `cpu` is below CPU_COUNT; the APIC id slab is read-only after boot.
     let apic_id = unsafe { crate::percpu::apic_id_for(cpu) };
     super::msi::address(apic_id)
 }
 
-/// The message data that raises `target`'s vector ([`super::msi::data`]).
+/// The message data that raises `target`: with remapping off its vector
+/// ([`super::msi::data`]), with it on subhandle 0 ([`super::remap::MESSAGE_DATA`]).
 #[cfg(not(test))]
 #[must_use]
 pub fn message_data(target: crate::irq::Target) -> u32
 {
+    if remap() != crate::irq::Remap::Off
+    {
+        return super::remap::MESSAGE_DATA;
+    }
     // A device vector is below 256 (`ioapic::DEVICE_VECTOR_LAST`).
     #[allow(clippy::cast_possible_truncation)]
     let vector = target.slot as u8;
@@ -980,4 +1125,34 @@ pub fn message_data(target: crate::irq::Target) -> u32
 pub fn irq_line_count() -> u32
 {
     super::ioapic::gsi_limit()
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::nameable;
+    use crate::irq::Remap;
+
+    const LIMIT: usize = super::super::remap::REMAP_CPU_LIMIT;
+
+    // Defect caught: a source placed on a CPU its entry or message cannot name,
+    // so it is delivered to the broadcast id or through a handle past the
+    // remapping table: an APIC id of 0xFF or more in the compatibility or 8-bit
+    // remappable formats, or a CPU past the handles in either remappable one.
+    #[test]
+    fn a_cpu_is_nameable_only_by_the_formats_that_can_name_it()
+    {
+        assert!(nameable(0, 0xFE, Remap::Off));
+        assert!(!nameable(0, 0xFF, Remap::Off));
+        assert!(nameable(LIMIT + 1, 3, Remap::Off));
+
+        let narrow = Remap::On { extended: false };
+        assert!(nameable(LIMIT - 1, 0xFE, narrow));
+        assert!(!nameable(0, 0xFF, narrow));
+        assert!(!nameable(LIMIT, 3, narrow));
+
+        let wide = Remap::On { extended: true };
+        assert!(nameable(LIMIT - 1, 0x1_0000, wide));
+        assert!(!nameable(LIMIT, 3, wide));
+    }
 }

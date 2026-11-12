@@ -447,7 +447,8 @@ pub const CAP_INFO_ASPACE_TERMINAL_FAULT: u64 = 14;
 /// Interrupt only — the message address a device writes to raise the
 /// message-signaled interrupt the capability names (one minted by
 /// `SYS_IRQ_MSG_ALLOC`): on `x86_64` the local APIC's compatibility-format
-/// address of the target CPU, on riscv64 the physical address of the target
+/// address of the target CPU (with remapping on, the remappable-format address
+/// naming the target's handle), on riscv64 the physical address of the target
 /// hart's supervisor-level IMSIC interrupt file. devmgr programs it, with
 /// [`CAP_INFO_IRQ_MSG_DATA`], into the device's MSI capability or MSI-X table
 /// entry before it delivers the driver a copy of the capability, which the
@@ -462,6 +463,49 @@ pub const CAP_INFO_IRQ_MSG_ADDRESS: u64 = 15;
 /// delivery and edge trigger, on riscv64 the interrupt identity in the
 /// target hart's IMSIC file. The same errors as [`CAP_INFO_IRQ_MSG_ADDRESS`].
 pub const CAP_INFO_IRQ_MSG_DATA: u64 = 16;
+
+/// Interrupt only — the interrupt remapping entry the source the capability
+/// names needs (a routed line, or a message-signaled target), with the
+/// kernel's remappable formats on (`SYS_IRQ_REMAP`): the entry's handle in
+/// bits 15:0, the vector it delivers in bits 23:16, and the destination
+/// CPU's APIC id in bits 63:32 ([`remap_entry_unpack`]). devmgr has the IOMMU
+/// driver write the entry before a device can raise the source. Returns
+/// [`SyscallError::InvalidState`] with remapping off or for a line not
+/// routed, [`SyscallError::NotSupported`] on an architecture with no
+/// interrupt remapping (riscv64), and [`SyscallError::InvalidArgument`] on
+/// another capability type or a range capability.
+pub const CAP_INFO_IRQ_REMAP_ENTRY: u64 = 17;
+
+/// Interrupt only — the number of remapping-entry handles this boot's CPUs
+/// can use, every handle below it: the interrupt remapping table needs that
+/// many entries. Answered with remapping on or off.
+/// [`SyscallError::NotSupported`] on an architecture with no interrupt
+/// remapping (riscv64), [`SyscallError::InvalidArgument`] on another
+/// capability type.
+pub const CAP_INFO_IRQ_REMAP_HANDLES: u64 = 18;
+
+/// The word [`CAP_INFO_IRQ_REMAP_ENTRY`] answers, from a remapping entry's
+/// handle, the vector it delivers, and its destination APIC id.
+#[must_use]
+pub const fn remap_entry_pack(handle: u16, vector: u32, apic_id: u32) -> u64
+{
+    (handle as u64) | (((vector & 0xFF) as u64) << 16) | ((apic_id as u64) << 32)
+}
+
+/// The handle, vector, and destination APIC id a
+/// [`CAP_INFO_IRQ_REMAP_ENTRY`] word carries.
+#[must_use]
+pub const fn remap_entry_unpack(word: u64) -> (u16, u8, u32)
+{
+    // Each field is masked to its width before the narrowing.
+    #[allow(clippy::cast_possible_truncation)]
+    let fields = (
+        (word & 0xFFFF) as u16,
+        ((word >> 16) & 0xFF) as u8,
+        (word >> 32) as u32,
+    );
+    fields
+}
 
 // ── CapTag discriminants ─────────────────────────────────────────────────────
 //
@@ -538,11 +582,31 @@ pub const SYS_THREAD_WRITE_MEM: u64 = 61;
 /// an Interrupt capability carrying [`RIGHTS_IRQ_MINT`]. See
 /// `core/kernel/docs/syscalls.md` § `SYS_IRQ_MSG_ALLOC` (62).
 pub const SYS_IRQ_MSG_ALLOC: u64 = 62;
+/// Interrupt: route a wired line at its controller, through a single-line
+/// Interrupt capability carrying [`RIGHTS_IRQ_MINT`], which then holds the
+/// route. See `core/kernel/docs/syscalls.md` § `SYS_IRQ_ROUTE` (63).
+pub const SYS_IRQ_ROUTE: u64 = 63;
+/// Interrupt: switch the formats the kernel hands out to an IOMMU's
+/// interrupt remapping, through an Interrupt capability carrying
+/// [`RIGHTS_IRQ_MINT`], while no interrupt source exists. See
+/// `core/kernel/docs/syscalls.md` § `SYS_IRQ_REMAP` (64).
+pub const SYS_IRQ_REMAP: u64 = 64;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_IRQ_MSG_ALLOC + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_IRQ_REMAP + 1;
+
+/// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
+/// I/O APIC entry naming its CPU and vector.
+pub const IRQ_REMAP_OFF: u64 = 0;
+/// [`SYS_IRQ_REMAP`] setting (arg1): remappable formats, each naming a
+/// remapping entry's handle, whose destination is an 8-bit APIC id.
+pub const IRQ_REMAP_ON: u64 = 1;
+/// [`SYS_IRQ_REMAP`] setting (arg1): remappable formats whose remapping
+/// entries hold 32-bit (x2APIC) destinations, so a target may sit on any CPU
+/// whose device vectors have a handle.
+pub const IRQ_REMAP_ON_EXTENDED: u64 = 2;
 
 // ── getrandom constants ───────────────────────────────────────────────────────
 
@@ -859,12 +923,12 @@ pub const MEM_UNMAP_RECLAIM_PTS: u64 = 0x1;
 /// `SYS_IRQ_REGISTER` mode (arg2): the line is level-triggered. Clear, it is
 /// edge-triggered.
 ///
-/// Every binding on a line passes the same mode: the line's first binding
-/// records it, and a binding with another mode is refused with
-/// `InvalidArgument` until the line's last binding goes. x86-64 programs the
-/// line's I/O APIC redirection entry from it, riscv64 the line's APLIC source
-/// mode. See
-/// `core/kernel/docs/syscalls.md` § `SYS_IRQ_REGISTER`.
+/// A line's route (`SYS_IRQ_ROUTE`) records the mode, and every binding on the
+/// line passes it: a binding with another mode is refused with
+/// `InvalidArgument`, and so is a route in another mode, until the line is
+/// released. x86-64 programs the line's I/O APIC redirection entry from it,
+/// riscv64 the line's APLIC source mode. See `core/kernel/docs/syscalls.md`
+/// § `SYS_IRQ_REGISTER`.
 pub const IRQ_MODE_LEVEL: u64 = 1 << 0;
 
 /// `SYS_IRQ_REGISTER` mode (arg2): the line asserts low. Clear, it asserts
@@ -990,8 +1054,10 @@ pub const RIGHTS_EQ_RECV: u64 = 1 << 1;
 pub const RIGHTS_IRQ_NOTIFY: u64 = 1 << 0;
 
 /// Interrupt: may mint message-signaled Interrupt capabilities
-/// (`SYS_IRQ_MSG_ALLOC`). Set on the root Interrupt capability the kernel
-/// mints for init; a minted capability does not carry it.
+/// (`SYS_IRQ_MSG_ALLOC`), route a wired line (`SYS_IRQ_ROUTE`), and switch
+/// interrupt remapping (`SYS_IRQ_REMAP`). Set on the root Interrupt
+/// capability the kernel mints for init, and kept by a split; a minted
+/// capability does not carry it.
 pub const RIGHTS_IRQ_MINT: u64 = 1 << 1;
 
 // Mmio ──

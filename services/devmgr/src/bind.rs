@@ -658,12 +658,17 @@ fn platform_wired(
         _ => None,
     })?;
     let (gsi, mode) = arch::current::platform_line(carve.irq_range, line, mode, isa);
-    match carve.irq_range.exclusive_line(gsi)
+    match carve.irq_range.exclusive_line(gsi, mode)
     {
         Ok(cap) => Some((cap, mode)),
-        Err(e) =>
+        Err(crate::ExclusiveLineError::Carve(e)) =>
         {
             std::os::seraph::log!(warn: "{}: no IRQ cap for line {:#x} ({:?})", name, gsi, e);
+            None
+        }
+        Err(crate::ExclusiveLineError::Route(e)) =>
+        {
+            std::os::seraph::log!(warn: "{}: line {:#x} not routed ({})", name, gsi, e);
             None
         }
     }
@@ -1173,7 +1178,7 @@ fn give_interrupt(
                 1,
             ),
             InterruptPlan::Msi => (
-                given_messages(give_msi(name, msi, carve.irq_range, dev))?
+                given_messages(give_msi(name, pci_dev, msi, carve.irq_range, dev))?
                     .then_some(InterruptKind::Msi),
                 1,
             ),
@@ -1272,13 +1277,25 @@ struct Message
     data: u64,
 }
 
-/// Delete the cap of every target in `messages`, freeing each target once no
-/// copy of it remains.
-fn delete_messages(messages: &[Message])
+/// Release devmgr's cap `cap` on a message target: clear the target's
+/// remapping entry when remapping is on (`remap`), so the function it was
+/// given to reaches no later source through it, then delete the cap, which
+/// frees the target once no copy remains.
+pub fn release_message(remap: Option<&crate::intremap::InterruptRemap>, cap: u64)
+{
+    if let Some(remap) = remap
+    {
+        let _ = remap.clear(cap);
+    }
+    let _ = syscall::cap_delete(cap);
+}
+
+/// Release every target in `messages` ([`release_message`]).
+fn delete_messages(remap: Option<&crate::intremap::InterruptRemap>, messages: &[Message])
 {
     for m in messages
     {
-        let _ = syscall::cap_delete(m.cap);
+        release_message(remap, m.cap);
     }
 }
 
@@ -1291,8 +1308,8 @@ fn messages_translated() -> bool
     arch::current::IOMMU_FAMILY == crate::iommu::Family::Riscv
 }
 
-/// Mint `count` message-signaled targets ([`IrqRangeAllocator::mint_message`])
-/// and read each one's message; check that every message fits the
+/// Mint `count` message-signaled targets for the function `rid`
+/// ([`IrqRangeAllocator::mint_message`]) and read each one's message; check that every message fits the
 /// function's capability (`fits`) and only then, where the device's IOMMU
 /// domain translates its messages ([`messages_translated`]), make the
 /// interrupt file each one targets reachable by the device through its DMA
@@ -1304,12 +1321,14 @@ fn messages_translated() -> bool
 /// fit maps none.
 fn mint_messages(
     name: &str,
+    rid: u64,
     count: u8,
     irq_range: &IrqRangeAllocator,
     dma: Option<&dma::DmaGrant>,
     fits: impl Fn(&Message) -> bool,
 ) -> Result<(Vec<Message>, bool), NotGiven>
 {
+    let remap = irq_range.remap.as_deref();
     let mut messages: Vec<Message> = Vec::new();
     if messages.try_reserve_exact(usize::from(count)).is_err()
     {
@@ -1319,7 +1338,7 @@ fn mint_messages(
     for _ in 0..count
     {
         let minted =
-            irq_range.mint_message().and_then(|cap| {
+            irq_range.mint_message(rid).and_then(|cap| {
                 let message = syscall::cap_info(cap, syscall_abi::CAP_INFO_IRQ_MSG_ADDRESS)
                     .and_then(|address| {
                         syscall::cap_info(cap, syscall_abi::CAP_INFO_IRQ_MSG_DATA)
@@ -1327,7 +1346,7 @@ fn mint_messages(
                     });
                 if message.is_err()
                 {
-                    let _ = syscall::cap_delete(cap);
+                    release_message(remap, cap);
                 }
                 message
             });
@@ -1343,7 +1362,7 @@ fn mint_messages(
                     count,
                     e
                 );
-                delete_messages(&messages);
+                delete_messages(remap, &messages);
                 return Err(NotGiven::Clean);
             }
         }
@@ -1383,7 +1402,7 @@ fn mint_messages(
                     not_given(widened)
                 }
             };
-            delete_messages(&messages);
+            delete_messages(remap, &messages);
             Err(not)
         }
     }
@@ -1402,13 +1421,15 @@ fn mint_messages(
 /// it.
 fn give_msi(
     name: &str,
+    pci_dev: &pci::PciDevice,
     msi: Option<Msi>,
     irq_range: &IrqRangeAllocator,
     dev: &mut PciDeviceCaps,
 ) -> Result<(), NotGiven>
 {
     let msi = msi.ok_or(NotGiven::Clean)?;
-    let (messages, widened) = mint_messages(name, 1, irq_range, dev.dma.as_ref(), |m| {
+    let rid = crate::iommu::requester_id(pci_dev);
+    let (messages, widened) = mint_messages(name, rid, 1, irq_range, dev.dma.as_ref(), |m| {
         msi.fits(m.address, m.data)
     })?;
     let Some(m) = messages.first().copied()
@@ -1418,9 +1439,10 @@ fn give_msi(
     };
     if !dev.config.program_msi(msi, m.address, m.data)
     {
-        delete_messages(&[m]);
+        delete_messages(irq_range.remap.as_deref(), &[m]);
         return Err(not_given(widened));
     }
+    dev.remap = irq_range.remap();
     dev.push(Resource::Interrupt {
         cap: m.cap,
         kind: InterruptKind::Msi,
@@ -1456,7 +1478,8 @@ fn give_msix(
 {
     let msix = msix.ok_or(NotGiven::Clean)?;
     let table = msix_table(name, pci_dev, msix, carve.caps).ok_or(NotGiven::Clean)?;
-    let minted = mint_messages(name, vectors, carve.irq_range, dev.dma.as_ref(), |m| {
+    let rid = crate::iommu::requester_id(pci_dev);
+    let minted = mint_messages(name, rid, vectors, carve.irq_range, dev.dma.as_ref(), |m| {
         firmware::pci::msix_entry_message(m.address, m.data).is_some()
     });
     let (messages, widened) = match minted
@@ -1470,11 +1493,12 @@ fn give_msix(
     };
     if !dev.config.enable_msix(msix, &table, &messages)
     {
-        delete_messages(&messages);
+        delete_messages(carve.irq_range.remap.as_deref(), &messages);
         let _ = syscall::cap_delete(table.cap);
         return Err(not_given(widened));
     }
     dev.msix_table = table.cap;
+    dev.remap = carve.irq_range.remap();
     for (vector, m) in (0..=u8::MAX).zip(&messages)
     {
         dev.push(Resource::Interrupt {
@@ -1679,6 +1703,9 @@ pub struct PciDeviceCaps
     /// created with no hold, and before a spawn bootstraps.
     /// [`withdraw_device`] consumes it.
     pub release_token: u64,
+    /// Interrupt remapping, for a device given message-signaled vectors
+    /// while it is on: their entries are cleared at release.
+    remap: Option<std::sync::Arc<crate::intremap::InterruptRemap>>,
 }
 
 impl PciDeviceCaps
@@ -1699,6 +1726,7 @@ impl PciDeviceCaps
             reset: StopReset::None,
             device_badge: 0,
             release_token: 0,
+            remap: None,
         }
     }
 
@@ -1750,7 +1778,10 @@ impl PciDeviceCaps
     /// MSI-X table's pages, its DMA grant, and its configuration page. A
     /// device given message-signaled vectors first has them disabled
     /// ([`FunctionConfig::disable_messages`]), so it signals none of its
-    /// targets once they are freed and minted for another device.
+    /// targets once they are freed and minted for another device, and each
+    /// target's remapping entry is cleared before its cap is deleted
+    /// ([`release_message`]), so a message the device writes all the same
+    /// is blocked.
     pub fn release(&self)
     {
         if self.config.cap != 0 && self.has_messages()
@@ -1759,7 +1790,18 @@ impl PciDeviceCaps
         }
         for resource in self.resources()
         {
-            let _ = syscall::cap_delete(resource.cap());
+            match resource
+            {
+                Resource::Interrupt {
+                    cap,
+                    kind: InterruptKind::Msi | InterruptKind::MsiX,
+                    ..
+                } => release_message(self.remap.as_deref(), *cap),
+                _ =>
+                {
+                    let _ = syscall::cap_delete(resource.cap());
+                }
+            }
         }
         if self.msix_table != 0
         {

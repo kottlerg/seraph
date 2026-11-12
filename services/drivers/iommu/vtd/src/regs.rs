@@ -17,12 +17,18 @@ pub const GCMD: usize = 0x18;
 pub const GSTS: usize = 0x1c;
 /// Root table address register (64-bit).
 pub const RTADDR: usize = 0x20;
-/// Context command register (64-bit).
-pub const CCMD: usize = 0x28;
 /// Fault status register (32-bit).
 pub const FSTS: usize = 0x34;
 /// Fault event control register (32-bit).
 pub const FECTL: usize = 0x38;
+/// Invalidation queue head register (64-bit).
+pub const IQH: usize = 0x80;
+/// Invalidation queue tail register (64-bit).
+pub const IQT: usize = 0x88;
+/// Invalidation queue address register (64-bit).
+pub const IQA: usize = 0x90;
+/// Interrupt remapping table address register (64-bit).
+pub const IRTA: usize = 0xb8;
 
 /// `FECTL`: interrupt mask. The driver keeps fault events masked and polls
 /// the fault recording registers instead.
@@ -35,32 +41,39 @@ pub const G_SRTP: u32 = 1 << 30;
 /// `GCMD` / `GSTS`: write buffer flush / its status (set while the flush is
 /// in progress).
 pub const G_WBF: u32 = 1 << 27;
-/// `GCMD` / `GSTS`: queued invalidation enable; the driver never sets it,
-/// since it invalidates through the registers.
+/// `GCMD` / `GSTS`: queued invalidation enable / status.
 pub const G_QIE: u32 = 1 << 26;
+/// `GCMD` / `GSTS`: interrupt remapping enable / status.
+pub const G_IRE: u32 = 1 << 25;
+/// `GCMD` / `GSTS`: set interrupt remapping table pointer / its status.
+pub const G_SIRTP: u32 = 1 << 24;
+/// `GCMD` / `GSTS`: compatibility-format interrupts pass through / their
+/// status. The driver keeps it clear, so they are blocked.
+pub const G_CFI: u32 = 1 << 23;
 /// `GSTS` bits that are one-shot operations rather than persistent states:
 /// a write of `GCMD` carries the persistent states of `GSTS` with these
 /// masked off (section 11.4.4).
-pub const G_ONE_SHOT: u32 = G_SRTP | (1 << 29) | (1 << 27) | (1 << 24);
-
-/// `CCMD`: invalidate context cache.
-pub const CCMD_ICC: u64 = 1 << 63;
-/// `CCMD`: global invalidation request.
-pub const CCMD_GLOBAL: u64 = 1 << 61;
-
-/// `IOTLB` (at `ECAP.IRO * 16 + 8`): invalidate IOTLB.
-pub const IOTLB_IVT: u64 = 1 << 63;
-/// `IOTLB`: global invalidation request.
-pub const IOTLB_GLOBAL: u64 = 1 << 60;
-/// `IOTLB`: domain-selective invalidation request.
-pub const IOTLB_DOMAIN: u64 = 2 << 60;
-/// `IOTLB`: drain reads and writes before completing.
-pub const IOTLB_DRAIN: u64 = (1 << 49) | (1 << 48);
+pub const G_ONE_SHOT: u32 = G_SRTP | (1 << 29) | G_WBF | G_SIRTP;
 
 /// `FSTS`: primary pending fault (a fault recording register holds one).
 pub const FSTS_PPF: u32 = 1 << 1;
 /// `FSTS`: primary fault overflow, cleared by writing 1.
 pub const FSTS_PFO: u32 = 1 << 0;
+/// `FSTS`: invalidation queue error (a descriptor the unit could not
+/// process), cleared by writing 1.
+pub const FSTS_IQE: u32 = 1 << 4;
+
+/// `ECAP`: queued invalidation supported (bit 1).
+pub const ECAP_QI: u64 = 1 << 1;
+/// `ECAP`: interrupt remapping supported (bit 3).
+pub const ECAP_IR: u64 = 1 << 3;
+/// `ECAP`: extended interrupt mode (32-bit destinations) supported (bit 4).
+pub const ECAP_EIM: u64 = 1 << 4;
+
+/// The first fault reason of an interrupt remapping fault (section 7.1.3):
+/// a fault record of this reason or above holds the interrupt's handle in
+/// place of an address.
+pub const FAULT_REASON_INTERRUPT: u8 = 0x20;
 
 /// The index of the first fault recording register holding a fault, from
 /// `FSTS`'s `FRI` field (bits 15:8); meaningful while [`FSTS_PPF`] is set.
@@ -86,26 +99,13 @@ pub const fn gcmd_clear(gsts: u32, bit: u32) -> u32
     gsts & !G_ONE_SHOT & !bit
 }
 
-/// The `CCMD` value that invalidates the whole context cache.
+/// The value written to `GCMD` to turn interrupt remapping on with
+/// compatibility-format interrupts blocked, keeping every other persistent
+/// state `gsts` reports.
 #[must_use]
-pub const fn ccmd_global() -> u64
+pub const fn gcmd_remap_on(gsts: u32) -> u32
 {
-    CCMD_ICC | CCMD_GLOBAL
-}
-
-/// The `IOTLB` value that invalidates every IOTLB entry of domain `did`,
-/// draining reads and writes first.
-#[must_use]
-pub const fn iotlb_domain(did: u16) -> u64
-{
-    IOTLB_IVT | IOTLB_DOMAIN | IOTLB_DRAIN | ((did as u64) << 32)
-}
-
-/// The `IOTLB` value that invalidates the whole IOTLB.
-#[must_use]
-pub const fn iotlb_global() -> u64
-{
-    IOTLB_IVT | IOTLB_GLOBAL | IOTLB_DRAIN
+    (gsts & !G_ONE_SHOT & !G_CFI) | G_IRE
 }
 
 /// The fields of `CAP` the driver uses.
@@ -174,18 +174,6 @@ impl Capability
     }
 }
 
-/// The byte offset of the `IOTLB` register for an `ECAP` value: its
-/// `IRO` field (bits 17:8) counts 16-byte units, and the register sits 8
-/// bytes past them.
-// cast_possible_truncation: the field is masked to 10 bits, so the offset is
-// below 2^15 and fits `usize` on every target.
-#[allow(clippy::cast_possible_truncation)]
-#[must_use]
-pub const fn iotlb_offset(ecap: u64) -> usize
-{
-    (((ecap >> 8) & 0x3ff) * 16 + 8) as usize
-}
-
 /// Whether the unit's page walks snoop the processor caches (`ECAP.C`, bit
 /// 0). A unit that does not reads the translation structures from memory,
 /// so every write to them is flushed from the caches before it is used.
@@ -203,13 +191,17 @@ pub struct Fault
     pub source_id: u16,
     /// The fault reason code (section 7.1.3).
     pub reason: u8,
-    /// The faulting address, page-aligned.
+    /// The faulting address, page-aligned; for an interrupt remapping fault
+    /// (reason [`FAULT_REASON_INTERRUPT`] or above) the handle the blocked
+    /// interrupt named.
     pub address: u64,
 }
 
 /// Decode a fault recording register from its low word (`lo`, the fault
 /// information) and high word (`hi`); `None` when its `F` bit (63 of the
-/// high word) is clear, so it records no fault.
+/// high word) is clear, so it records no fault. An interrupt remapping
+/// fault holds the interrupt's handle in bits 63:48 of the fault
+/// information (section 11.4.11.1).
 #[must_use]
 pub const fn decode_fault(lo: u64, hi: u64) -> Option<Fault>
 {
@@ -217,10 +209,19 @@ pub const fn decode_fault(lo: u64, hi: u64) -> Option<Fault>
     {
         return None;
     }
+    let reason = ((hi >> 32) & 0xff) as u8;
+    let address = if reason >= FAULT_REASON_INTERRUPT
+    {
+        lo >> 48
+    }
+    else
+    {
+        lo & !0xfff
+    };
     Some(Fault {
         source_id: (hi & 0xffff) as u16,
-        reason: ((hi >> 32) & 0xff) as u8,
-        address: lo & !0xfff,
+        reason,
+        address,
     })
 }
 
@@ -284,18 +285,12 @@ mod tests
     }
 
     #[test]
-    fn invalidation_commands_carry_their_granularity_and_domain()
+    fn remapping_turns_on_with_compatibility_format_interrupts_blocked()
     {
-        assert_eq!(ccmd_global(), (1 << 63) | (1 << 61));
-        assert_eq!(iotlb_domain(5) >> 32 & 0xffff, 5);
-        assert_eq!(iotlb_domain(5) >> 60 & 0x3, 2);
-        assert_eq!(iotlb_global() >> 60 & 0x3, 1);
-    }
-
-    #[test]
-    fn the_iotlb_register_sits_eight_bytes_past_its_offset()
-    {
-        assert_eq!(iotlb_offset(0x10 << 8), 0x108);
+        // Firmware left compatibility format passing through and a one-shot
+        // pointer set reported; neither is carried into the command.
+        let gsts = G_TE | G_QIE | G_CFI | G_SIRTP;
+        assert_eq!(gcmd_remap_on(gsts), G_TE | G_QIE | G_IRE);
     }
 
     #[test]
@@ -306,5 +301,15 @@ mod tests
         assert_eq!(f.reason, 6);
         assert_eq!(f.address, 0xdead_b000);
         assert!(decode_fault(0xdead_b000, 0x18).is_none());
+    }
+
+    #[test]
+    fn an_interrupt_remapping_fault_decodes_the_handle_it_named()
+    {
+        // Reason 0x22 (entry not present) for handle 0x1234 from 00:1f.0.
+        let f = decode_fault(0x1234 << 48, (1 << 63) | (0x22 << 32) | 0x00f8).unwrap();
+        assert_eq!(f.reason, 0x22);
+        assert_eq!(f.source_id, 0xf8);
+        assert_eq!(f.address, 0x1234);
     }
 }

@@ -57,12 +57,13 @@
 //! among the CPUs whose APIC id the 8-bit physical destination field of a redirection
 //! entry can name: below [`BROADCAST_APIC_ID`] (`0xFF`, which delivers to every CPU;
 //! `interrupts::route_device_irq`). An I/O APIC cannot name a CPU with a wider x2APIC id
-//! without interrupt remapping, which the kernel does not program.
+//! without interrupt remapping (`SYS_IRQ_REMAP`, `super::remap`); with it on, an entry names
+//! a handle, and the CPU's index must be below `super::remap::REMAP_CPU_LIMIT`.
 //!
 //! # Trigger and polarity
 //!
 //! A redirection entry takes its trigger mode (bit 15, set for level) and pin polarity
-//! (bit 13, set for active-low) from the mode its line's first `SYS_IRQ_REGISTER` passed
+//! (bit 13, set for active-low) from the mode its line's `SYS_IRQ_ROUTE` passed
 //! ([`redirection_low`]); the kernel reads no MADT interrupt-source override itself. A
 //! level-triggered entry's Remote IRR, set at delivery, is cleared by the local APIC's EOI,
 //! which the local APIC broadcasts to the I/O APICs (the kernel clears the SVR's EOI-broadcast
@@ -74,9 +75,10 @@
 //! ([`remote_irr_clear`]).
 //!
 //! # Modification notes
-//! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_REGISTER`, through
-//!   `irq::register`), released by `interrupts::unroute_device_irq`, and unmasked by
-//!   `interrupts::unmask` (from `SYS_IRQ_ACK`).
+//! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_ROUTE`, through
+//!   `irq::route`), released by `interrupts::unroute_device_irq` once neither a route
+//!   holder nor a binding remains, and unmasked by `interrupts::unmask` (from
+//!   `SYS_IRQ_ACK`).
 
 // cast_possible_truncation: u64→usize APIC MMIO address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector widening casts.
@@ -248,7 +250,7 @@ pub fn has_free_vector(cpu: usize) -> bool
 /// Assign a device vector of CPU `cpu` to `slot` (a routed line, or a minted message
 /// target): the next free one in turn of that CPU's row. `None` when every device vector
 /// of `cpu` is assigned, or `cpu` has no row. Called under `irq`'s routing lock, from
-/// `route_device_irq` for a line's first binding and from `alloc_message_target`.
+/// `route_device_irq` for a line's route and from `alloc_message_target`.
 #[cfg(not(test))]
 #[must_use]
 pub fn assign_vector(cpu: usize, slot: Slot) -> Option<u8>
@@ -556,30 +558,53 @@ pub unsafe fn init()
     }
 }
 
-/// Program a redirection entry for `gsi` to deliver `vector` to the local APIC
-/// with id `destination` (physical destination mode, so at most `0xFF`).
+/// Where a redirection entry delivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Destination
+{
+    /// The local APIC with this id, in physical destination mode (so at most
+    /// `0xFF`), in the compatibility format.
+    Physical(u8),
+    /// The interrupt remapping entry with this handle, in the remappable
+    /// format (`super::remap`).
+    Remapped(u16),
+}
+
+/// The low and high dwords of a masked redirection entry delivering `vector`
+/// with `mode`'s trigger and polarity to `destination`: in the compatibility
+/// format, the destination APIC id in bits 31:24 of the high dword (entry bits
+/// 63:56); in the remappable format, the handle ([`super::remap::redirection`]),
+/// the vector kept for the EOI that clears a level entry's Remote IRR.
+const fn redirection_entry(vector: u8, mode: u32, destination: Destination) -> (u32, u32)
+{
+    let low = redirection_low(vector, mode);
+    match destination
+    {
+        Destination::Physical(apic_id) => (low, (apic_id as u32) << 24),
+        Destination::Remapped(handle) => super::remap::redirection(handle, low),
+    }
+}
+
+/// Program a redirection entry for `gsi` to deliver `vector` to `destination`.
 ///
 /// The entry is programmed masked; call [`unmask`] when ready to receive.
 /// Uses fixed delivery, with the trigger mode and polarity `mode` names
-/// ([`redirection_low`]). An entry whose Remote IRR a stale level delivery left
-/// set is first rewritten masked and edge-triggered, which clears it
+/// ([`redirection_entry`]). An entry whose Remote IRR a stale level delivery
+/// left set is first rewritten masked and edge-triggered, which clears it
 /// ([`remote_irr_clear`]). A GSI no discovered I/O APIC owns is left alone
 /// (`interrupts::route_device_irq` checks [`owns`] first).
 ///
 /// # Safety
 /// Must only be called after [`init`].
 #[cfg(not(test))]
-pub unsafe fn route(gsi: u32, vector: u8, destination: u8, mode: u32)
+pub unsafe fn route(gsi: u32, vector: u8, destination: Destination, mode: u32)
 {
     let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
     else
     {
         return;
     };
-    // Low dword: vector | fixed delivery | trigger and polarity | masked.
-    // High dword: destination APIC id in bits [31:24] (entry bits [63:56]).
-    let low = redirection_low(vector, mode);
-    let high = u32::from(destination) << 24;
+    let (low, high) = redirection_entry(vector, mode, destination);
 
     // SAFETY: caller ensures init() has completed; entry remains masked
     // until unmask(). IOAPIC_LOCK covers every select/window pair below.
@@ -730,6 +755,17 @@ mod tests
         assert_eq!(index_of(DEVICE_VECTOR_BASE), Some(0));
         assert_eq!(index_of(DEVICE_VECTOR_LAST), Some(DEVICE_VECTOR_COUNT - 1));
         assert_eq!(index_of(DEVICE_VECTOR_LAST + 1), None);
+    }
+
+    #[test]
+    fn a_physical_entry_names_the_apic_id_and_a_remapped_one_the_handle()
+    {
+        let (low, high) = redirection_entry(33, 0, Destination::Physical(5));
+        assert_eq!((low, high), (REDIR_MASK | 33, 5 << 24));
+        let (low, high) = redirection_entry(40, 0, Destination::Remapped(0x8001));
+        // Handle bit 15 in low bit 11, bits 14:0 above the format bit.
+        assert_eq!(low, REDIR_MASK | 40 | (1 << 11));
+        assert_eq!(high, (1 << 17) | (1 << 16));
     }
 
     #[test]

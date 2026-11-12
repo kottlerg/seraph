@@ -17,6 +17,9 @@
 //! so devmgr runs DMA unconfined. See `docs/device-management.md`
 //! § IOMMU Discovery and Programming.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod arch;
 mod backend;
 
@@ -103,9 +106,10 @@ fn table_flush(regs: &[u64]) -> Flush
 {
     let coherent = regs.iter().all(|&va| {
         // SAFETY: `va` maps a unit's register set, whose `ECAP` (8 bytes at
-        // 0x10) lies in its first page; reached only through a raw volatile
-        // access.
-        let ecap = unsafe { core::ptr::read_volatile((va + regs::ECAP as u64) as *const u64) };
+        // 0x10) lies in its first page, so the sum does not saturate; reached
+        // only through a raw volatile access.
+        let ecap =
+            unsafe { core::ptr::read_volatile(va.saturating_add(regs::ECAP as u64) as *const u64) };
         regs::coherent(ecap)
     });
     if coherent
@@ -160,7 +164,9 @@ fn main() -> !
         .registers
         .iter()
         .zip(&mapped)
-        .map(|(r, &va)| Unit::new(va, r.pages * PAGE_SIZE))
+        // The bootstrap bounds `pages` to `MAX_REGISTER_PAGES`, so the
+        // product does not saturate.
+        .map(|(r, &va)| Unit::new(va, r.pages.saturating_mul(PAGE_SIZE)))
         .collect();
     let store = Store::new(info.memmgr_endpoint, info.self_aspace, table_flush(&mapped));
     // SAFETY: ipc_buf is this thread's registered IPC buffer.

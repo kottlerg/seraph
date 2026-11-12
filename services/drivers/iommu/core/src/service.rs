@@ -125,11 +125,10 @@ impl KernelCaps
         // registered IPC buffer.
         let reply = unsafe { ipc::ipc_call(memmgr_ep, &req, ipc_buf) }.ok()?;
         let caps = reply.caps();
-        if reply.label == ipc::memmgr_errors::SUCCESS && caps.len() == 1
+        if reply.label == ipc::memmgr_errors::SUCCESS
+            && let [credential] = *caps
         {
-            return Some(Self {
-                credential: caps[0],
-            });
+            return Some(Self { credential });
         }
         for &c in caps
         {
@@ -195,9 +194,11 @@ struct Range
 
 impl Range
 {
-    fn overlaps(&self, iova: u64, len: u64) -> bool
+    /// Whether the range shares a byte with `iova..end`. [`Service::install`]
+    /// refuses a range whose end passes `u64`, so neither end saturates.
+    fn overlaps(&self, iova: u64, end: u64) -> bool
     {
-        self.iova < iova + len && iova < self.iova + self.len
+        self.iova < end && iova < self.iova.saturating_add(self.len)
     }
 
     /// The cap the driver keeps for the range: a `MAP` range's only.
@@ -424,21 +425,23 @@ impl<B: Backend, C: CapOps> Service<B, C>
     fn backend_failure(&mut self, unit: usize, e: BackendError) -> u64
     {
         if e == BackendError::Timeout
+            && let Some(failed) = self.failed.get_mut(unit)
         {
-            self.failed[unit] = true;
+            *failed = true;
         }
         backend_code(e)
     }
 
+    /// `Ok` for a delivered unit that has not timed out. Every caller passes
+    /// a unit it checked delivered or a domain's unit, so the
+    /// `INVALID_REQUEST` of an undelivered one is never returned.
     fn unit_ok(&self, unit: usize) -> Result<(), u64>
     {
-        if self.failed[unit]
+        match self.failed.get(unit)
         {
-            Err(iommu_errors::HARDWARE_TIMEOUT)
-        }
-        else
-        {
-            Ok(())
+            Some(false) => Ok(()),
+            Some(true) => Err(iommu_errors::HARDWARE_TIMEOUT),
+            None => Err(iommu_errors::INVALID_REQUEST),
         }
     }
 
@@ -479,13 +482,16 @@ impl<B: Backend, C: CapOps> Service<B, C>
             return Err(exhausted);
         }
         let did = self.free_did(unit).ok_or(exhausted)?;
+        // Handles are never reused, so a driver that has handed out every
+        // one attaches no further domain.
+        let handle = self.next_handle;
+        let next_handle = handle.checked_add(1).ok_or(exhausted)?;
         self.domains.try_reserve(1).map_err(|_| exhausted)?;
         let domain = self
             .backend
             .attach(unit, bdf, did)
             .map_err(|e| self.backend_failure(unit, e))?;
-        let handle = self.next_handle;
-        self.next_handle += 1;
+        self.next_handle = next_handle;
         self.domains.push(DomainRecord {
             handle,
             unit,
@@ -564,7 +570,8 @@ impl<B: Backend, C: CapOps> Service<B, C>
     ) -> Result<(), u64>
     {
         let invalid = iommu_errors::INVALID_REQUEST;
-        let unit = self.domains[index].unit;
+        let record = self.domains.get(index).ok_or(invalid)?;
+        let unit = record.unit;
         let width = self.backend.query(unit).width_bits;
         let end = iova.checked_add(len).ok_or(invalid)?;
         if len == 0
@@ -573,8 +580,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
         {
             return Err(invalid);
         }
-        let record = &self.domains[index];
-        if record.ranges.iter().any(|r| r.overlaps(iova, len))
+        if record.ranges.iter().any(|r| r.overlaps(iova, end))
         {
             return Err(iommu_errors::ADDRESS_IN_USE);
         }
@@ -598,56 +604,70 @@ impl<B: Backend, C: CapOps> Service<B, C>
             return Err(iommu_errors::OUT_OF_RESOURCES);
         }
         self.unit_ok(unit)?;
-        self.domains[index]
+        let record = self.domains.get_mut(index).ok_or(invalid)?;
+        record
             .ranges
             .try_reserve(1)
             .map_err(|_| iommu_errors::OUT_OF_RESOURCES)?;
-        let domain = &mut self.domains[index].domain;
         let installed = if kind == Kind::MsiFile
         {
-            self.backend.map_msi(domain, iova)
+            self.backend.map_msi(&mut record.domain, iova)
         }
         else
         {
-            self.backend.map(domain, iova, frames.0, len, frames.1)
+            self.backend
+                .map(&mut record.domain, iova, frames.0, len, frames.1)
         };
-        installed.map_err(|e| self.backend_failure(unit, e))?;
-        self.domains[index].ranges.push(Range { iova, len, kind });
+        if let Err(e) = installed
+        {
+            return Err(self.backend_failure(unit, e));
+        }
+        record.ranges.push(Range { iova, len, kind });
         Ok(())
     }
 
     fn unmap(&mut self, handle: u64, iova: u64) -> u64
     {
+        let invalid = iommu_errors::INVALID_REQUEST;
         let index = match self.domain_index(handle)
         {
             Ok(i) => i,
             Err(code) => return code,
         };
-        let unit = self.domains[index].unit;
-        let Some(at) = self.domains[index]
+        let Some(record) = self.domains.get(index)
+        else
+        {
+            return invalid;
+        };
+        let unit = record.unit;
+        let Some((at, range)) = record
             .ranges
             .iter()
-            .position(|r| r.iova == iova)
+            .enumerate()
+            .find(|(_, r)| r.iova == iova)
         else
         {
             return iommu_errors::NO_MAPPING;
         };
-        if self.domains[index].ranges[at].cap().is_none()
+        if range.cap().is_none()
         {
-            return iommu_errors::INVALID_REQUEST;
+            return invalid;
         }
+        let len = range.len;
         if let Err(code) = self.unit_ok(unit)
         {
             return code;
         }
-        let len = self.domains[index].ranges[at].len;
-        if let Err(e) = self
-            .backend
-            .unmap(&mut self.domains[index].domain, iova, len)
+        let Some(record) = self.domains.get_mut(index)
+        else
+        {
+            return invalid;
+        };
+        if let Err(e) = self.backend.unmap(&mut record.domain, iova, len)
         {
             return self.backend_failure(unit, e);
         }
-        let range = self.domains[index].ranges.swap_remove(at);
+        let range = record.ranges.swap_remove(at);
         if let Some(cap) = range.cap()
         {
             self.caps.delete(cap);
@@ -662,12 +682,21 @@ impl<B: Backend, C: CapOps> Service<B, C>
             Ok(i) => i,
             Err(code) => return code,
         };
-        let unit = self.domains[index].unit;
+        let Some(unit) = self.domains.get(index).map(|d| d.unit)
+        else
+        {
+            return iommu_errors::INVALID_REQUEST;
+        };
         if let Err(code) = self.unit_ok(unit)
         {
             return code;
         }
-        if let Err(e) = self.backend.block(&mut self.domains[index].domain)
+        let Some(record) = self.domains.get_mut(index)
+        else
+        {
+            return iommu_errors::INVALID_REQUEST;
+        };
+        if let Err(e) = self.backend.block(&mut record.domain)
         {
             return self.backend_failure(unit, e);
         }
@@ -791,21 +820,25 @@ impl<B: Backend, C: CapOps> Service<B, C>
     fn take_faults(&mut self) -> IpcMessage
     {
         self.poll();
-        let mut words = [0u64; 1 + 2 * iommu_labels::MAX_FAULTS_PER_REPLY];
-        let mut n = 0usize;
+        let mut pairs = [[0u64; 2]; iommu_labels::MAX_FAULTS_PER_REPLY];
+        let mut slots = pairs.iter_mut();
         let units = &self.units;
-        self.faults
+        let n = self
+            .faults
             .take(iommu_labels::MAX_FAULTS_PER_REPLY, |f: Fault| {
                 let segment = units.0.get(f.unit).map_or(0, |u| u.segment);
                 let [bus, devfn] = f.bdf.to_be_bytes();
                 let rid = iommu_labels::requester_id(segment, bus, devfn >> 3, devfn & 7);
-                words[1 + 2 * n] = rid | (u64::from(f.reason) << 32);
-                words[2 + 2 * n] = f.iova;
-                n += 1;
+                // `take` passes at most as many faults as there are slots.
+                if let Some(slot) = slots.next()
+                {
+                    *slot = [rid | (u64::from(f.reason) << 32), f.iova];
+                }
             });
-        words[0] = n as u64;
+        let taken = pairs.get(..n).unwrap_or_default();
         IpcMessage::builder(iommu_errors::SUCCESS)
-            .words(0, &words[..=2 * n])
+            .word(0, n as u64)
+            .words(1, taken.as_flattened())
             .build()
     }
 }
@@ -1191,6 +1224,16 @@ mod tests
             assert_eq!(attach(&mut s, 0, bdf).label, iommu_errors::SUCCESS);
         }
         assert_eq!(attach(&mut s, 0, 4).label, iommu_errors::OUT_OF_RESOURCES);
+    }
+
+    #[test]
+    fn attaching_once_every_handle_is_spent_is_refused_before_the_backend()
+    {
+        let mut s = service();
+        s.next_handle = u64::MAX - 1;
+        assert_eq!(attach(&mut s, 0, 1).word(0), u64::MAX - 1);
+        assert_eq!(attach(&mut s, 0, 2).label, iommu_errors::OUT_OF_RESOURCES);
+        assert_eq!(s.backend.attached, [(0, 1, 1)]);
     }
 
     #[test]

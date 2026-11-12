@@ -180,7 +180,11 @@ pub fn unit_round_words(
         return None;
     }
     let mut words = Vec::new();
-    words.try_reserve(UNIT_HEADER_WORDS + scopes.len()).ok()?;
+    // At most `MSG_DATA_WORDS_MAX` words: the scopes are checked against
+    // `MAX_SCOPES` above.
+    words
+        .try_reserve(UNIT_HEADER_WORDS.saturating_add(scopes.len()))
+        .ok()?;
     let flags = if include_pci_all
     {
         FLAG_INCLUDE_PCI_ALL
@@ -235,32 +239,37 @@ pub enum BootstrapError
 /// Decode one unit round: the register cap and the unit's scope.
 fn parse_unit(round: &BootstrapRound) -> Result<(Registers, UnitScope), BootstrapError>
 {
-    let words = &round.data[..round.data_words];
-    if round.cap_count != 1 || words.len() < UNIT_HEADER_WORDS || words[0] != ROUND_UNIT
+    let words = round.data.get(..round.data_words);
+    let Some(&[kind, segment, flags, pages, ref scope_words @ ..]) = words
+    else
+    {
+        return Err(BootstrapError::Malformed);
+    };
+    if round.cap_count != 1 || kind != ROUND_UNIT
     {
         return Err(BootstrapError::Malformed);
     }
-    let segment = u16::try_from(words[1]).map_err(|_| BootstrapError::Malformed)?;
-    if words[2] & !FLAG_INCLUDE_PCI_ALL != 0 || !(1..=MAX_REGISTER_PAGES).contains(&words[3])
+    let segment = u16::try_from(segment).map_err(|_| BootstrapError::Malformed)?;
+    if flags & !FLAG_INCLUDE_PCI_ALL != 0 || !(1..=MAX_REGISTER_PAGES).contains(&pages)
     {
         return Err(BootstrapError::Malformed);
     }
     let mut scopes = Vec::new();
     scopes
-        .try_reserve(words.len() - UNIT_HEADER_WORDS)
+        .try_reserve(scope_words.len())
         .map_err(|_| BootstrapError::OutOfMemory)?;
-    for &w in &words[UNIT_HEADER_WORDS..]
+    for &w in scope_words
     {
         scopes.push(Scope::decode(w).ok_or(BootstrapError::Malformed)?);
     }
     Ok((
         Registers {
             cap: round.caps[0],
-            pages: words[3],
+            pages,
         },
         UnitScope {
             segment,
-            include_pci_all: words[2] & FLAG_INCLUDE_PCI_ALL != 0,
+            include_pci_all: flags & FLAG_INCLUDE_PCI_ALL != 0,
             scopes,
         },
     ))
@@ -487,6 +496,14 @@ mod tests
             parse(&[bad_segment, endpoints()]),
             Err(BootstrapError::Malformed)
         );
+    }
+
+    #[test]
+    fn a_unit_round_counting_more_words_than_a_round_holds_is_refused()
+    {
+        let mut unit = round(&[50], &unit_round_words(0, true, 1, &[]).unwrap(), false);
+        unit.data_words = MSG_DATA_WORDS_MAX + 1;
+        assert_eq!(parse(&[unit, endpoints()]), Err(BootstrapError::Malformed));
     }
 
     #[test]

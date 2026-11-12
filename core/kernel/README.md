@@ -24,7 +24,7 @@ core/kernel/
 │   ├── console.rs              # Early console: serial and framebuffer output
 │   ├── cpu_mask.rs             # Sets of logical CPU indices, as wide as the boot's CPU count
 │   ├── framebuffer.rs          # Framebuffer text renderer
-│   ├── irq.rs                  # IRQ routing table (sized at boot): lines to notifications
+│   ├── irq.rs                  # IRQ routing: wired-line table (sized at boot), delivery gates
 │   ├── percpu.rs               # Per-CPU private state
 │   ├── platform.rs             # kernel_mmio cache (Phase 4), Phase 6 MMIO-aperture validation
 │   ├── stack_depth.rs          # Kernel stack paint and deepest-use report (StackHighWater)

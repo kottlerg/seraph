@@ -521,7 +521,7 @@ pub unsafe fn init_ap();
 /// controller write ordered before the caller's later read, and `mask` must leave
 /// the caller's earlier memory writes ordered before its controller write, and
 /// that write before the caller's later memory writes (a delivery's signals and
-/// the drop of its in-flight count), so an unmask that follows them cannot reach
+/// the exit of its delivery gate), so an unmask that follows them cannot reach
 /// the controller first. On RISC-V every APLIC write is preceded by `fence w,o`,
 /// `mask` ends with `fence o,w`, and `unmask` ends with `fence o,r`. On x86-64,
 /// `mask` and `unmask` both hold `IOAPIC_LOCK`.
@@ -547,21 +547,21 @@ pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<irq::Target, irq::
 /// Called by `irq` when a line's last binding is removed, under its routing lock.
 pub unsafe fn unroute_device_irq(irq: u32, target: irq::Target);
 
-/// Slots of one CPU's delivery space a message-signaled target can take (x86-64:
-/// the 217 device vectors; RISC-V: the IMSIC file's identities). Sizes the
-/// routing table's message targets at Phase 5 (`irq::message_capacity`).
-pub fn message_slots_per_cpu() -> u32;
-/// Give message target `id` a slot: the next free one of the next CPU in turn
-/// (`irq::next_target_cpu`) that has one, tagged with `id` so the CPU's dispatch
-/// finds it. On x86-64 only CPUs whose APIC id a compatibility-format message
-/// address names (below `0xFF`) take part. Every slot is enabled at its
-/// controller from boot, so nothing else is programmed. Fails with `Exhausted`
-/// when no eligible CPU has a free slot. Called by `irq::alloc_message` under the
-/// routing lock.
-pub fn alloc_message_target(id: u32) -> Result<irq::Target, irq::RouteError>;
-/// Free message target `id`'s slot `target`. Called by `irq::free_message` under
-/// the routing lock, once no binding and no capability names the target.
-pub fn free_message_target(id: u32, target: irq::Target);
+/// Give a message-signaled target a slot: the next free one of the next CPU in turn
+/// (`irq::next_target_cpu`) that has one, its slot entry left unbound. On x86-64 only
+/// CPUs whose APIC id a compatibility-format message address names (below `0xFF`) take
+/// part. Every slot is enabled at its controller from boot, so nothing else is
+/// programmed. Fails with `Exhausted` when no eligible CPU has a free slot. Called by
+/// `irq::alloc_message` under the routing lock.
+pub fn alloc_message_target() -> Result<irq::Target, irq::RouteError>;
+/// Free the slot `target` of a message-signaled target whose slot entry no binding
+/// holds. Called by `irq::free_message` under the routing lock, once no binding and no
+/// capability names the target.
+pub fn free_message_target(target: irq::Target);
+/// The slot entry of `target` (`irq::SlotEntry`): the entry of its slot in its CPU's row
+/// of device vectors (x86-64) or IMSIC identities (RISC-V), or `None` when the CPU is
+/// past the boot CPUs or the slot is not a device slot.
+pub fn slot_entry(target: irq::Target) -> Option<&'static irq::SlotEntry>;
 /// The message a device writes to raise `target`: the physical address (x86-64:
 /// `0xFEE0_0000 | apic_id << 12`, compatibility format; RISC-V: the hart's
 /// supervisor-level IMSIC file, `None` when it has none) and the data (x86-64:
@@ -570,7 +570,7 @@ pub fn free_message_target(id: u32, target: irq::Target);
 pub fn message_address(target: irq::Target) -> Option<u64>;
 pub fn message_data(target: irq::Target) -> u32;
 /// Number of interrupt lines the discovered controllers implement, which sizes
-/// the `irq` routing table at Phase 5: one past the highest I/O APIC GSI on
+/// the `irq` routing table (`irq::init_table`) at Phase 5: one past the highest I/O APIC GSI on
 /// x86-64 (capped at `ROOT_IRQ_COUNT`), the APLIC's `riscv,num-sources` plus one on RISC-V.
 pub fn irq_line_count() -> u32;
 
@@ -593,8 +593,9 @@ functions above; the underlying controller programming (`ioapic::route` and the 
 device-vector rows on x86-64; the APLIC and IMSIC programming of `arch/riscv64/aia.rs` on RISC-V)
 remains arch-private. A CPU's slots are shared by the lines routed to it and the message targets
 placed on it, and a device interrupt is resolved to its source against the slots of the CPU that
-takes it (x86-64: `ioapic::source_for_vector` over the current CPU's row; RISC-V: the hart's
-IMSIC identity row).
+takes it (x86-64: `ioapic::slot_for_vector`, the entry of the vector in the current CPU's row,
+which `idt::irq_dispatch` passes to `irq::dispatch_device_irq`; RISC-V: the entry `aia::claim`
+returns for the claimed identity of the hart's IMSIC row, which `dispatch_external` passes).
 
 **Delivery destination.** Each routed line is delivered to one CPU, chosen when the line is
 routed: the boot CPUs in turn, by logical index (`irq::next_target_cpu`), so device

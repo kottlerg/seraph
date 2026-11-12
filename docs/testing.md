@@ -619,11 +619,11 @@ or body):
   `alloc_zeroed_slab` and are on the memory surface instead; every `init_storage` and
   `init_per_cpu_storage`, which take the boot CPU count and size per-CPU storage from it (a call to
   one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
-  CPU-scaled kernel reserve); `message_capacity` and `message_slots_per_cpu`, which size the IRQ
-  routing table's message-signaled targets at one entry per delivery slot of every CPU; and the
-  element types of the per-CPU arrays and slabs, today `PerCpuData`, `PerCpuScheduler`,
-  `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`, `TagState`, `CpuRng`, `Acc`,
-  `Sample`, `CpuDiag`, `TlbShootdownRequest`, `VectorRow`, and `IrqRoute`
+  CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
+  `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
+  `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, `TlbShootdownRequest`, `VectorRow`,
+  `SlotEntry` (the riscv64 IMSIC identity rows, and each `VectorRow`'s entries), and
+  `DeliveryGate`
   (`git grep -n -E 'alloc_(zeroed|per_cpu)_slab::<|; MAX_CPUS\]' <head>` lists the arrays and
   slabs, and also the slabs that are not per-CPU: the single-slot entropy pool, the tag pool, the
   reschedule-pending CPU set, and the RAM-sized chunk tables of `frame_map::init` and
@@ -702,7 +702,7 @@ S="$S|init_storage|init_per_cpu_storage"
 S="$S|PerCpuSlab|alloc_per_cpu_slab"
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|VectorRow|CpuTopology"
-S="$S|IrqRoute|message_capacity|message_slots_per_cpu"
+S="$S|SlotEntry|DeliveryGate"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
 S="$S|madt_cpu_ids|place_cpu_ids|place_hart_ids|cpu_topology_capacity|cpu_id_capacity"
 S="$S|allocate_cpu_ids|cpus\.count|cpus\.ids_phys|info\.cpu_count|boot_cpu_ids"
@@ -874,7 +874,7 @@ own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
-| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, and `core/kernel/src/arch/x86_64/msi.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, and `sys_irq_msg_alloc`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target` and `free_message_target`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, and `RISCV_IOMMU_DEVICE`) | every device cell |
+| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, and `core/kernel/src/arch/x86_64/msi.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, and `sys_irq_msg_alloc`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target`, `free_message_target`, and the slot entry a delivery reads, `slot_entry`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes and targets take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, and `RISCV_IOMMU_DEVICE`) | every device cell |
 | Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `vfsd_errors`, `fs_labels`, `fs_errors`, `blk_labels`, and `blk_errors`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_shared_line`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
@@ -912,7 +912,7 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/
 D='sys_irq_(register|ack|split|msg_alloc)|(un)?route_device_irq|irq_line_count|dispatch_device_irq'
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
-D="$D|(alloc|free)_message_target|init_vector_storage"
+D="$D|(alloc|free)_message_target|slot_entry|init_vector_storage"
 D="$D|InterruptObject|dispatch_external|init_eid_storage|M(IN|AX)_IRQ_ID"
 D="$D|devmgr_(dma_)?(labels|errors)"
 D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV_IOMMU_DEVICE"

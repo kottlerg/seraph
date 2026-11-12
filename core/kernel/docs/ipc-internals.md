@@ -408,30 +408,36 @@ operations on the hot path when no waiter or wait set is registered.
 Setting an already-set bit is idempotent — this is the defined coalescing
 behaviour (per [docs/ipc-design.md § Notifications](../../../docs/ipc-design.md#notifications)).
 
-**Device IRQ delivery.** A line `SYS_IRQ_REGISTER` bound to notifications reaches the send path from
-interrupt context (`irq::dispatch_device_irq`), with no capability and no reference on the
-notifications: it walks the line's bindings and signals each bound notification. Each line instead
-counts the deliveries in flight on it: a delivery raises the line's count before it reads the line's
-bindings and drops it after its last access to a binding, a state, and the waiter it woke (step f
-above). Every binding change runs under the routing table's lock, and a change that removes a
-notification from a line (a `SYS_IRQ_REGISTER` rebind replacing it, or a binding's removal when its
-Interrupt object is freed) waits, before it releases the lock, until that line's count is zero (spin
-site `irq:route-drain`). Once the lock is free, then, no delivery holds a notification that no
-binding names. A line's first binding waits the same way once it is linked: a delivery on a stale
-slot of the line can find no binding and mask the line, and the wait lands that mask before the
-receiver's first `SYS_IRQ_ACK` can unmask it. The Notification teardown (`dealloc_object`,
-Notification arm) takes the lock, and for each line in the routed-line set removes every binding
-that names the state, waiting for the line's count to reach zero, and unmasks or releases the line
-as the remaining bindings require (`irq::unregister_notification`); only then does it drain the
-waiters and free the state. The walk visits the routed lines only, so it scales with the bindings,
-not with the table. A delivery's raise and its reads of the line's bindings, and a change's stores
-and count reads, are `SeqCst`: a delivery that read the state before a change removed it raised its
-count before the change reads it, so it is counted and waited for, and no delivery on any CPU
-reaches the state after its free. The wait is bounded: each delivery runs interrupts-off without
-waiting on the change. A delivery on a wired line masks it until its receivers' `SYS_IRQ_ACK`, so
-the line's count falls to zero between deliveries. A message-signaled target is never masked, but
-its deliveries reach only its one CPU, each interrupts-off from raise to drop, so they run one at a
-time and the count is zero across each interrupt return and entry between two of them.
+**Device IRQ delivery.** A source `SYS_IRQ_REGISTER` bound to notifications reaches the send path
+from interrupt context (`irq::dispatch_device_irq`), with no capability and no reference of its
+own: it reads the entry of the delivery slot the interrupt arrived through (`irq::SlotEntry`, in
+the executing CPU's row of x86-64 device vectors or riscv64 IMSIC identities), then walks a wired
+line's bindings, or reads a message-signaled target's one binding, and signals each bound
+notification. A bound binding holds a reference on its notification's object, taken by
+`SYS_IRQ_REGISTER` and given up only by the change that takes the notification from the binding (a
+rebind to another notification, or the binding's removal when its Interrupt object is freed). A
+notification a binding names is therefore never freed, and the Notification teardown
+(`dealloc_object`, Notification arm) makes no IRQ change: deleting a notification's capabilities
+leaves its bindings in place until their Interrupt capabilities unbind, rebind or go.
+
+Every delivery runs under its CPU's delivery gate (`irq::DeliveryGate`, one per CPU): a count the
+delivery raises to odd before its first read of the slot's entry and drops to even after its last
+access to a binding, a state, and the waiter it woke (step f above). A source is delivered only
+through its slot, on the slot's CPU. Every binding change runs under the routing lock, and a change
+that removes a binding from a slot or a line, or a notification from a binding, makes the removal
+with a `SeqCst` store and then waits out that CPU's gate before it releases the lock (spin site
+`irq:route-drain`): when the gate's count is odd it waits until the count changes. Only then is the
+binding's object freed or the notification's reference dropped, outside the lock. In the single
+total order of the `SeqCst` operations, a delivery whose raise precedes the change's store is seen
+odd by the wait, which lasts until its drop (a `Release` the wait's `Acquire` load pairs with), and
+a delivery whose raise follows the store reads the changed state. No delivery on any CPU, then,
+reaches a binding no slot or line links or a notification no binding names. A line's release also
+clears its slot's entry and waits out its CPU, so no delivery that read the line from that slot
+outlives it; a line's first binding waits out its CPU once linked, since an interrupt latched for
+the slot's previous owner can find the line with no binding and mask it, and the wait lands that
+mask before the receiver's first `SYS_IRQ_ACK` can unmask it. The wait is bounded at one delivery:
+a later delivery on that CPU began after the store, the waiter holds the routing lock with
+interrupts disabled, so it is in no delivery itself, and a delivery takes no routing lock.
 
 ### Wait Path
 

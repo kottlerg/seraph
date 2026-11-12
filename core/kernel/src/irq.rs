@@ -342,6 +342,197 @@ impl Target
     }
 }
 
+// ── Delivery slots ────────────────────────────────────────────────────────────
+
+/// What a delivery slot holds ([`SlotEntry`]).
+// dead_code: the kernel build has no caller until the controllers' slot rows
+// hold entries; the host tests use every item.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot
+{
+    /// No source owns the slot.
+    Free,
+    /// The wired line with this id is routed to the slot.
+    Line(u32),
+    /// A message target is minted on the slot and no binding is linked.
+    Unbound,
+    /// A message target is minted on the slot and this binding receives it.
+    Bound(core::ptr::NonNull<IrqBinding>),
+}
+
+/// Low bits of a [`SlotEntry`] word that say what the rest holds.
+// dead_code: as on `Slot` above.
+#[cfg_attr(not(test), allow(dead_code))]
+const SLOT_TAG_MASK: u64 = 0b11;
+/// Tag of a [`Slot::Line`] word, whose line id sits above the tag.
+// dead_code: as on `Slot` above.
+#[cfg_attr(not(test), allow(dead_code))]
+const SLOT_TAG_LINE: u64 = 0b01;
+/// Tag of a [`Slot::Unbound`] word.
+// dead_code: as on `Slot` above.
+#[cfg_attr(not(test), allow(dead_code))]
+const SLOT_TAG_UNBOUND: u64 = 0b10;
+
+// A binding's address keeps the tag bits clear, so a [`Slot::Bound`] word is the
+// address itself.
+const _: () = assert!(core::mem::align_of::<IrqBinding>() as u64 > SLOT_TAG_MASK);
+
+// dead_code: as on `Slot` above.
+#[cfg_attr(not(test), allow(dead_code))]
+impl Slot
+{
+    /// The word a [`SlotEntry`] holds for this slot; [`Slot::Free`] is zero, so
+    /// a zero-filled row is a row of free slots.
+    fn encode(self) -> u64
+    {
+        match self
+        {
+            Self::Free => 0,
+            Self::Line(id) => (u64::from(id) << 2) | SLOT_TAG_LINE,
+            Self::Unbound => SLOT_TAG_UNBOUND,
+            Self::Bound(binding) => binding.as_ptr() as u64,
+        }
+    }
+
+    /// The slot a word [`Slot::encode`] wrote. A word with both tag bits set is
+    /// never written and reads as [`Slot::Free`].
+    fn decode(word: u64) -> Self
+    {
+        match word & SLOT_TAG_MASK
+        {
+            SLOT_TAG_LINE =>
+            {
+                // A line word holds a u32 id above its tag.
+                #[allow(clippy::cast_possible_truncation)]
+                let id = (word >> 2) as u32;
+                Self::Line(id)
+            }
+            SLOT_TAG_UNBOUND => Self::Unbound,
+            0 => match core::ptr::NonNull::new(word as *mut IrqBinding)
+            {
+                Some(binding) => Self::Bound(binding),
+                None => Self::Free,
+            },
+            _ => Self::Free,
+        }
+    }
+}
+
+/// One slot of a CPU's delivery space (an IDT vector of its local APIC on
+/// x86-64, an identity in its IMSIC file on riscv64): the source the slot
+/// delivers ([`Slot`]).
+///
+/// Every store is made under the routing lock, and is `SeqCst`, so a change
+/// that clears or replaces an entry and then waits out the slot's CPU
+/// ([`DeliveryGate::wait_out`]) has either been seen by a delivery or waits for
+/// it. Every load is the slot's own CPU's, by a delivery that raised that CPU's
+/// gate first ([`DeliveryGate::enter`]), or the routing lock's holder's.
+// dead_code: as on `Slot` above.
+#[cfg_attr(not(test), allow(dead_code))]
+#[repr(transparent)]
+pub struct SlotEntry(AtomicU64);
+
+// dead_code: as on `Slot` above.
+#[cfg_attr(not(test), allow(dead_code))]
+impl SlotEntry
+{
+    /// A free slot.
+    #[must_use]
+    pub const fn free() -> Self
+    {
+        Self(AtomicU64::new(0))
+    }
+
+    /// What the slot holds.
+    pub fn load(&self) -> Slot
+    {
+        Slot::decode(self.0.load(Ordering::SeqCst))
+    }
+
+    /// Make the slot hold `slot`. Called under the routing lock.
+    pub fn store(&self, slot: Slot)
+    {
+        self.0.store(slot.encode(), Ordering::SeqCst);
+    }
+}
+
+/// One CPU's count of the device deliveries it has begun and ended: odd while a
+/// delivery runs on the CPU, even between two.
+///
+/// Only its own CPU changes the count, with interrupts disabled from
+/// [`DeliveryGate::enter`] to [`DeliveryGate::exit`], so the CPU's deliveries
+/// never overlap. A change that removed state a delivery reads after its entry
+/// (a slot's entry, a binding from a line, a binding's notification) with a
+/// `SeqCst` store, and is about to free what it removed, calls
+/// [`DeliveryGate::wait_out`] on the CPU that delivers it: in the single total
+/// order of the `SeqCst` operations, either the delivery's entry precedes the
+/// change's store, so the wait's load sees the delivery's odd count or a later
+/// one and waits for its exit, or it follows the store, so the delivery's own
+/// loads see the change. Each gate fills a cache line of its own, which no
+/// other CPU writes.
+// dead_code: the kernel build has no caller until every device delivery runs
+// under its CPU's gate; the host tests use every item.
+#[cfg_attr(not(test), allow(dead_code))]
+#[repr(align(64))]
+pub struct DeliveryGate
+{
+    seq: AtomicU32,
+}
+
+// dead_code: as on `DeliveryGate` above.
+#[cfg_attr(not(test), allow(dead_code))]
+impl DeliveryGate
+{
+    /// A gate with no delivery begun.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            seq: AtomicU32::new(0),
+        }
+    }
+
+    /// Begin a delivery on this gate's CPU, before its first read of routing
+    /// state. Interrupts stay disabled until [`DeliveryGate::exit`].
+    pub fn enter(&self)
+    {
+        self.seq.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// End the delivery [`DeliveryGate::enter`] began, after its last access to
+    /// a binding, a notification, or a woken waiter. Release: a waiter that sees
+    /// the new count sees every one of those accesses done.
+    pub fn exit(&self)
+    {
+        self.seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Wait until the delivery running on this gate's CPU, if one is, has
+    /// exited, calling `spin` on each turn of the wait; returns whether it
+    /// waited. Called after the `SeqCst` store that removed what the caller
+    /// will free.
+    ///
+    /// The wait ends at that one delivery's exit: a later delivery on the CPU
+    /// began after the store, so it reads the changed state, and is not waited
+    /// for. A wrap of the count inside one wait needs 2^32 deliveries.
+    pub fn wait_out(&self, mut spin: impl FnMut()) -> bool
+    {
+        let seen = self.seq.load(Ordering::SeqCst);
+        if seen & 1 == 0
+        {
+            return false;
+        }
+        // Acquire: pairs with the delivery's exit, so its accesses happen
+        // before the caller's free.
+        while self.seq.load(Ordering::Acquire) == seen
+        {
+            spin();
+        }
+        true
+    }
+}
+
 // ── Routing table ─────────────────────────────────────────────────────────────
 
 /// Per-source routing entry.
@@ -1830,6 +2021,156 @@ mod tests
         let first = Target { cpu: 0, slot: 0 };
         assert_eq!(Target::unpack(first.pack().unwrap()), Some(first));
         assert_eq!(Target::unpack(0), None);
+    }
+
+    // Defect caught: a slot word read back as another kind of slot or another
+    // line, so a delivery signals a binding through a line's id or walks a line
+    // through a binding's address; or a zero-filled row read as owned.
+    #[test]
+    fn every_slot_round_trips_and_zero_is_free()
+    {
+        let binding = Box::new(IrqBinding::unbound());
+        let address = core::ptr::NonNull::from(binding.as_ref());
+        for slot in [
+            Slot::Free,
+            Slot::Line(0),
+            Slot::Line(u32::MAX),
+            Slot::Unbound,
+            Slot::Bound(address),
+        ]
+        {
+            let entry = SlotEntry::free();
+            entry.store(slot);
+            assert_eq!(entry.load(), slot);
+        }
+        assert_eq!(SlotEntry::free().load(), Slot::Free);
+        assert_eq!(Slot::decode(0), Slot::Free);
+    }
+
+    // Defect caught: a word no store writes (both tag bits set) decoded as a
+    // binding's address, which a delivery would dereference.
+    #[test]
+    fn a_word_with_both_tag_bits_reads_as_free()
+    {
+        assert_eq!(Slot::decode(SLOT_TAG_MASK), Slot::Free);
+        assert_eq!(Slot::decode(0x1000 | SLOT_TAG_MASK), Slot::Free);
+    }
+
+    // Defect caught: a change waiting on a CPU with no delivery running, which
+    // would spin with the routing lock held.
+    #[test]
+    fn a_wait_on_a_quiet_cpu_returns_at_once()
+    {
+        let gate = DeliveryGate::new();
+        assert!(!gate.wait_out(|| panic!("waited on a quiet CPU")));
+        gate.enter();
+        gate.exit();
+        assert!(!gate.wait_out(|| panic!("waited after the delivery exited")));
+    }
+
+    // Defect caught: a change returning while the delivery that may hold what
+    // it removed still runs, so the caller frees a binding or a notification
+    // under it.
+    #[test]
+    fn a_wait_lasts_until_the_running_delivery_exits()
+    {
+        let gate = DeliveryGate::new();
+        gate.enter();
+        let mut turns = 0;
+        // Each turn of the wait is the delivering CPU running on; it exits on
+        // the third.
+        let waited = gate.wait_out(|| {
+            turns += 1;
+            if turns == 3
+            {
+                gate.exit();
+            }
+        });
+        assert!(waited);
+        assert_eq!(turns, 3);
+    }
+
+    // Defect caught: a change waiting for the CPU to fall quiet rather than for
+    // the delivery it saw, which a CPU taking interrupts back to back would
+    // never end.
+    #[test]
+    fn a_wait_ends_at_the_seen_delivery_even_when_another_begins()
+    {
+        let gate = DeliveryGate::new();
+        gate.enter();
+        let waited = gate.wait_out(|| {
+            gate.exit();
+            gate.enter();
+        });
+        assert!(waited);
+        // The later delivery still runs; a fresh wait would wait for it.
+        assert_eq!(gate.seq.load(Ordering::SeqCst) & 1, 1);
+    }
+
+    // Defect caught: the release protocol's two sides not meeting across CPUs,
+    // so a change frees a binding a delivery on another CPU read before the
+    // change cleared its slot. The delivery runs on this thread and the change
+    // on another; the change reports each step over a channel, so the outcome
+    // depends on no timing.
+    #[test]
+    fn a_change_on_another_cpu_frees_only_after_the_delivery_that_read_the_slot()
+    {
+        use std::sync::mpsc::channel;
+        use std::sync::Arc;
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Step
+        {
+            Waiting,
+            Returned,
+            Freed,
+        }
+
+        let gate = Arc::new(DeliveryGate::new());
+        let entry = Arc::new(SlotEntry::free());
+        let binding = Box::new(IrqBinding::unbound());
+        let live = Arc::new(AtomicU32::new(1));
+        entry.store(Slot::Bound(core::ptr::NonNull::from(binding.as_ref())));
+
+        // The delivery: enter, and read the slot's binding.
+        gate.enter();
+        assert!(matches!(entry.load(), Slot::Bound(_)));
+
+        let (report, steps) = channel();
+        let change = {
+            let (gate, entry, live) = (Arc::clone(&gate), Arc::clone(&entry), Arc::clone(&live));
+            std::thread::spawn(move || {
+                entry.store(Slot::Unbound);
+                let mut first = true;
+                gate.wait_out(|| {
+                    if first
+                    {
+                        report.send(Step::Waiting).unwrap();
+                        first = false;
+                    }
+                    core::hint::spin_loop();
+                });
+                report.send(Step::Returned).unwrap();
+                // The free.
+                live.store(0, Ordering::SeqCst);
+                report.send(Step::Freed).unwrap();
+            })
+        };
+
+        // The change saw this delivery and waits for it.
+        assert_eq!(steps.recv().unwrap(), Step::Waiting);
+        // The delivery's use of the binding it read.
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+        assert!(steps.try_recv().is_err());
+        gate.exit();
+        assert_eq!(steps.recv().unwrap(), Step::Returned);
+        assert_eq!(steps.recv().unwrap(), Step::Freed);
+        change.join().unwrap();
+
+        // A delivery that begins after the change reads the cleared slot.
+        gate.enter();
+        assert_eq!(entry.load(), Slot::Unbound);
+        gate.exit();
     }
 
     // Defect caught: a slot or CPU past its field packed, which would alias

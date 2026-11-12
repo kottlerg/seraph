@@ -37,45 +37,62 @@ work; do not act on the summary's account of a rule.
 
 ## Reporting
 
-Everything you send the orchestrator stays in its context for the rest of the batch, and each
-message wakes it for a turn. So what you send has one of three shapes, and the detail lives in
-files: the PR body, the run records, the scratchpad.
+Everything you send the orchestrator stays in its context for the rest of the batch. A message
+from you also wakes it for a turn, and that turn runs in your worktree, where the harness
+refuses it git on the main checkout, so it can verify no gate, merge or spawn. A hand-back
+starts its turn in the main checkout. So what you send has one of three shapes, each with its
+channel, and the detail lives in files: the PR body, the run records, the scratchpad.
 
-- **Status**: one line of at most 200 characters, by `SendMessage` to the orchestrator's agent
-  id: the one your prompt names, or the one a later orchestrator's message gives you, since the
-  orchestrator is replaced during a batch. Never send to `main`, which is the supervisor above
-  it. It does not end your turn. Send one when the orchestrator has to know: the plan is written
-  (name its file), the PR is opened, a review returned (both verdict lines verbatim), a host
-  request, a failed boot's saved log (§ Host runs). A step that needs nothing from the
-  orchestrator gets no status.
+- **Status**: one line of at most 200 characters, recorded with
+  `cargo xtask orch worker <name> --status "<line>"`, `<name>` being the record name your prompt
+  gives you; add `--pr <N>` when the PR is opened. Run from your worktree, the command writes the
+  orchestrator's record in the main checkout (`xtask/README.md` § `cargo xtask orch`), which the
+  orchestrator reads with `cargo xtask orch state` when it next acts. It sends no message and
+  does not end your turn. Write only your own entry's status and PR: the other fields, the other
+  workers and the rest of the record are the orchestrator's. Record one when the orchestrator
+  has to know: the plan is written (name its file), the PR is opened, a review returned (both
+  verdict lines verbatim, in one line), a failed boot's saved log (§ Host runs). A step that
+  needs nothing from the orchestrator gets no status. When the command finds no batch (a branch
+  cut before the command resolved the main checkout's record), send the line as a message
+  instead. One status line is a message in any case: the results that end an exclusive grant
+  (§ Host runs), since the orchestrator must act on them.
 - **Question**: the question, the options, your recommendation, in at most 150 words, with the
-  path of a file for anything longer.
+  path of a file for anything longer. A question you can keep working past goes by `SendMessage`
+  to the orchestrator's agent id: the one your prompt names, or the one a later orchestrator's
+  message gives you, since the orchestrator is replaced during a batch. Never send to `main`,
+  which is the supervisor above it. A question that blocks you (a host request is one) goes by
+  hand-back alone.
 - **Gate report**: the PR number and head, the result line of `cargo xtask pr-check <N> --gate`,
   the merge command, one line for each branch and the worktree (path and state), and what is
   left for you, if anything. The results, the findings and the Issue state are in the PR body
-  and the run records; do not repeat them.
+  and the run records; do not repeat them. It goes by hand-back alone.
 
 The plan after reading (the items you will fix and those you will not, the mechanism for
 anything non-trivial, the tests, each expansion) goes in a scratchpad file, with its path and a
-summary of at most five lines in the status.
+summary in the status line.
 
 A hand-back ends your turn, goes through the hand-back tool, and carries the whole report in its
-message, since nothing you wrote before it reaches the orchestrator. When the orchestrator that
-spawned you has been replaced, the hand-back reaches the supervisor instead, so send the same
-report to the current orchestrator's id first. Standalone, your replies to
-the maintainer take the place of all of this, and there the verdict lines and results are shown
-in the reply.
+message, since nothing you wrote before it reaches the orchestrator. Send no message before it:
+the hand-back is the report. When the orchestrator that spawned you has been replaced, the
+hand-back reaches the supervisor, which forwards it to the current orchestrator verbatim.
+Standalone, your replies to the maintainer take the place of all of this, and there the verdict
+lines and results are shown in the reply.
 
-Hand back in two cases only: a question the orchestrator must answer (a host request is one),
-or the gate report. A pending CI run or review is not a reason, and neither is a launch the
-host's rules refuse: run the command again with `--wait-host 1800`, which waits up to 30 minutes
-(§ Host runs). A launch still refused after that is a question.
+Hand back in two cases only: a question the orchestrator must answer before you can go on (a
+host request is one), or the gate report. A pending CI run or review is not a reason, and
+neither is a launch the host's rules refuse: run the command again with `--wait-host 1800`,
+which waits up to 30 minutes (§ Host runs). A launch still refused after that is a question.
+The turns the orchestrator starts after the gate end the same way: a composition check
+(§ Composition check) and a stand-down hand back their one line.
 
 Some decisions are not yours: widening the task beyond § Scope and branches, a contested review
 finding, a design choice an Issue leaves open, filing an Issue. Put each to the orchestrator as
 a question with your recommendation, and keep working on everything that does not depend on the
 answer, on your recommendation. Hand back for it only when nothing else is left. Draft an Issue
 body in the scratchpad and name its path; filing is the orchestrator's.
+
+Asked by the orchestrator for a status line (a grant watch), record it as above; the
+orchestrator reads it at its next tick.
 
 Before any hand-back:
 
@@ -92,7 +109,7 @@ records, PR bodies, Issue drafts) are deliverables; write them even where a harn
 not to write report files.
 
 Told to stand down (your PR or branch now belongs to another worker), edit no file, PR or
-Issue, commit and push nothing further on that branch, reply with one line, and end your turn.
+Issue, commit and push nothing further on that branch, and hand back one line.
 
 Run `git fetch origin` at the start of every step, so each step reads the current `master`.
 
@@ -237,7 +254,8 @@ A boot that fails, hangs, or shows a kill you did not expect is evidence. Before
 copy its saved log, and its `.crash.txt` when there is one, to a name that says what it is (the
 PR, the head, the architecture, the symptom): a re-run that saves logs to the same path
 overwrites them. When the failure matches an open Issue, or a process was killed with a
-signature you cannot explain, send the orchestrator the copied log's path before the re-run.
+signature you cannot explain, record the copied log's path in your status (§ Reporting) before
+the re-run.
 
 Run every command through `cargo xtask`. Boot with
 `cargo xtask run-parallel --arch <a> --parallel 1 --runs 1 --timeout <s>`, which boots the same
@@ -248,7 +266,9 @@ Orchestrated:
 
 - Before a run that needs the grant, hand back with the exact command list and a time estimate,
   and wait for `host free`. A grant covers the listed commands; a repeat after a compile or
-  clippy fix is covered (report the head); a logic change needs a new grant.
+  clippy fix is covered (report the head); a logic change needs a new grant. When the granted
+  runs are done, send the orchestrator their results in one line by `SendMessage`, which ends
+  the grant: the host stays locked until it clears the grant, and it can do that in any turn.
 - Run every build and boot under `nice -n 10` where the platform has it.
 - Sync onto `master` only when the orchestrator says `master quiet`, right before the validation
   runs. A sync is a merge of `master`, never a rebase; its subject is
@@ -324,6 +344,6 @@ After your PR merges, the orchestrator sends you `composition check <merge>` whe
 shares a file with another merge since the previous release tag: run one
 `pr-reviewer` as docs/conventions.md § Composition check describes, giving it the merge, the
 previous release tag, and that it is a composition check, and save its prose as
-`target/xtask/review/pr<N>/composition-<merge>.md`. Send the orchestrator its verdict line. A
+`target/xtask/review/pr<N>/composition-<merge>.md`. Hand back its verdict line. A
 defect it reports is fixed in a new PR on a new branch cut from `master`, which you drive as
 this file describes; a defect in work an open Issue names is recorded there.

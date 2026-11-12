@@ -975,8 +975,11 @@ impl MmioObject
 /// range authorities: narrow them with `sys_irq_split` before use.
 ///
 /// A message-signaled target's cap (`SYS_IRQ_MSG_ALLOC`) is a lineage root over
-/// its one id (`irq::is_message`); freeing the lineage's root body, once no copy
-/// of it is live, frees the target (`irq::free_message`).
+/// its one id (`irq::is_message`), and that root, funded by the minting
+/// `CSpace`, is the target's state: the kernel keeps nothing else per target
+/// beyond its slot's entry on its CPU (`irq::SlotEntry`). Freeing the lineage's
+/// root body, once no copy of it is live, frees the target's slot
+/// (`irq::free_message`).
 ///
 /// Each capability references an object of its own (a copy is a fresh object
 /// in its lineage, [`object_for_new_slot`]), so each carries its own binding of
@@ -3661,7 +3664,7 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             let lineage_gone = unsafe { release_range_object::<InterruptObject>(ptr, stack) };
             // A message-signaled target lives as long as its lineage: once the
             // root body is freed no object names its id (only the mint makes an
-            // object over a fresh one), so the target is freed for reuse.
+            // object over a fresh one), so the target's slot is freed for reuse.
             if lineage_gone && crate::irq::is_message(start)
             {
                 // SAFETY: the context `irq::unregister` required above; no live

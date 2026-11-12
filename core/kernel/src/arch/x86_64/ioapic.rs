@@ -28,8 +28,8 @@
 //! Every register access is an `IOREGSEL` store followed by an `IOWIN` access,
 //! and [`mask`] and [`unmask`] read-modify-write an entry. [`route`], [`mask`]
 //! and [`unmask`] run on any CPU (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`, the
-//! device-IRQ dispatch in interrupt context, and the Interrupt and Notification
-//! dealloc paths, which mask a line), so each holds `IOAPIC_LOCK`, a
+//! device-IRQ dispatch in interrupt context, and the Interrupt dealloc path, which
+//! masks a line), so each holds `IOAPIC_LOCK`, a
 //! leaf lock taken with interrupts disabled, across its whole access sequence;
 //! otherwise another CPU's select could land between a select and its window
 //! access and redirect the value to another entry. [`init`] runs single-threaded
@@ -38,18 +38,19 @@
 //! # Vector assignment
 //! Each CPU has its own device vectors, `DEVICE_VECTOR_BASE..=DEVICE_VECTOR_LAST` (33-249,
 //! between the timer vector and the IPI vectors), held in its row of a per-CPU slab
-//! ([`init_vector_storage`]): entry `v - DEVICE_VECTOR_BASE` of CPU `c`'s row holds the
-//! source the vector is assigned to on `c`, plus one, or 0 when it is free. A source is a
-//! GSI routed through an I/O APIC ([`assign_vector`], from `interrupts::route_device_irq`)
-//! or a message-signaled target (`irq::MESSAGE_ID_BASE` and up, from
-//! `interrupts::alloc_message_target`), and releases its vector when its route is cleared
-//! or the target freed ([`release_vector`]). `idt::init` installs a generated stub on every
-//! device vector, and `idt::irq_dispatch` maps the vector back to its source through the
-//! executing CPU's row ([`source_for_vector`]). Each CPU routes up to
+//! ([`init_vector_storage`]): entry `v - DEVICE_VECTOR_BASE` of CPU `c`'s row is the
+//! vector's `irq::SlotEntry` on `c`, which names the source the vector delivers, or is
+//! free. A source is a GSI routed through an I/O APIC ([`assign_vector`], from
+//! `interrupts::route_device_irq`) or a message-signaled target, which the entry anchors
+//! (from `interrupts::alloc_message_target`; its id is computed from the CPU and the
+//! vector, `irq::message_id`), and releases its vector when its route is cleared or the
+//! target freed ([`release_vector`]). `idt::init` installs a generated stub on every
+//! device vector, and `idt::irq_dispatch` passes the vector's entry in the executing
+//! CPU's row ([`slot_for_vector`]) to `irq::dispatch_device_irq`. Each CPU routes up to
 //! [`DEVICE_VECTOR_COUNT`] sources at once; a route or mint that finds no CPU with a free
 //! vector is refused (`irq::RouteError::Exhausted`). A row is written only by the route
 //! changes, which `irq` serialises under its routing lock, and read lock-free by the
-//! dispatch on its own CPU.
+//! dispatch on its own CPU, inside that CPU's delivery gate (`irq::DeliveryGate`).
 //!
 //! # Destination
 //! Each route names one destination CPU, chosen at route time by `irq::next_target_cpu`
@@ -82,6 +83,8 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::irq::{Slot, SlotEntry};
 
 use boot_protocol::{IoApicEntry, MAX_IOAPICS};
 
@@ -118,27 +121,27 @@ pub const IOAPIC_MAX_PINS: u32 = 256;
 #[cfg_attr(test, allow(dead_code))]
 pub const BROADCAST_APIC_ID: u32 = 0xFF;
 
-/// One CPU's device vectors: the source each is assigned to, plus one (0 when free), at
-/// index `v - DEVICE_VECTOR_BASE` for vector `v`, and where the next search for a free
-/// vector starts: one past the vector last assigned, moved past a released vector the
-/// search would otherwise reach before any other free one ([`release_vector_in`]). The
-/// search moves through the vectors in turn, so a released vector is taken again only once
-/// the search comes round to it, not by the next route while other vectors are free
-/// (`interrupts::unroute_device_irq`). The zeroed row is all free, its search starting at
-/// the first vector.
+/// One CPU's device vectors: the slot entry of each ([`SlotEntry`], the source it
+/// delivers), at index `v - DEVICE_VECTOR_BASE` for vector `v`, and where the next search
+/// for a free vector starts: one past the vector last assigned, moved past a released
+/// vector the search would otherwise reach before any other free one
+/// ([`release_vector_in`]). The search moves through the vectors in turn, so a released
+/// vector is taken again only once the search comes round to it, not by the next route
+/// while other vectors are free (`interrupts::unroute_device_irq`). The zeroed row is all
+/// free, its search starting at the first vector.
 // dead_code: host test builds compile out the readers of its fields (`vector_row` and
 // its callers); the host tests drive the same helpers over a bare table.
 #[cfg_attr(test, allow(dead_code))]
 #[repr(C)]
 struct VectorRow
 {
-    owner: [AtomicU32; DEVICE_VECTOR_COUNT],
+    slots: [SlotEntry; DEVICE_VECTOR_COUNT],
     cursor: AtomicU32,
 }
 
-// docs/limits.md states the slab's per-CPU cost from this size: 217 owner entries and the
-// cursor, 4 bytes each.
-const _: () = assert!(core::mem::size_of::<VectorRow>() == 872);
+// docs/limits.md states the slab's per-CPU cost from this size: 217 slot entries of
+// 8 bytes, and the 4-byte cursor padded to the entries' 8-byte alignment.
+const _: () = assert!(core::mem::size_of::<VectorRow>() == 1744);
 
 /// The device-vector slab: one [`VectorRow`] per CPU.
 const VECTOR_ROW_SLAB: crate::sched::PerCpuSlab =
@@ -176,8 +179,8 @@ fn vector_row(cpu: usize) -> Option<&'static VectorRow>
         return None;
     }
     // SAFETY: the slab holds a zero-initialised VectorRow (all atomics, for which zero is
-    // a valid value) for each boot CPU, and `cpu` is below their count; the slab is never
-    // freed.
+    // a valid value, and zero is a free slot entry) for each boot CPU, and `cpu` is below
+    // their count; the slab is never freed.
     Some(unsafe { &*base.add(cpu) })
 }
 
@@ -189,67 +192,49 @@ fn vector_at(index: usize) -> Option<u8>
         .and_then(|offset| DEVICE_VECTOR_BASE.checked_add(offset))
 }
 
-/// The vector `table` assigns to `source`, if any.
-fn find_vector(table: &[AtomicU32], source: u32) -> Option<u8>
+/// The index of device vector `vector` in a vector table, or `None` for a vector outside
+/// the device range.
+fn index_of(vector: u8) -> Option<usize>
 {
-    let tag = source.checked_add(1)?;
-    let index = table
-        .iter()
-        .position(|entry| entry.load(Ordering::Relaxed) == tag)?;
-    vector_at(index)
+    let index = vector.checked_sub(DEVICE_VECTOR_BASE)? as usize;
+    (index < DEVICE_VECTOR_COUNT).then_some(index)
 }
 
 /// The index of the first free vector of `table` at or after index `start`, wrapping
 /// round; `None` when every vector is assigned. The one search [`assign_vector_in`] takes
 /// and [`release_vector_in`] predicts.
-fn first_free_from(table: &[AtomicU32], start: usize) -> Option<usize>
+fn first_free_from(table: &[SlotEntry], start: usize) -> Option<usize>
 {
     (0..table.len())
         .map(|offset| (start + offset) % table.len())
-        .find(|&index| table[index].load(Ordering::Relaxed) == 0)
+        .find(|&index| table[index].is_free())
 }
 
-/// The vector `table` assigns to `source` and the index the next search starts at: its
-/// existing vector, else the first free vector at or after index `start` (wrapping), now
-/// assigned to it. `None` when every vector is assigned (or `source` is `u32::MAX`, which
-/// names no source).
-fn assign_vector_in(table: &[AtomicU32], source: u32, start: usize) -> Option<(u8, usize)>
+/// Assign the first free vector of `table` at or after index `start` (wrapping) to
+/// `slot`, and return it and the index the next search starts at. `None` when every
+/// vector is assigned.
+fn assign_vector_in(table: &[SlotEntry], slot: Slot, start: usize) -> Option<(u8, usize)>
 {
-    if let Some(vector) = find_vector(table, source)
-    {
-        return Some((vector, start));
-    }
-    let tag = source.checked_add(1)?;
     let index = first_free_from(table, start)?;
-    // Release: a dispatch that reads the tag (Acquire) once the redirection entry or the
-    // message that names this vector fires sees a complete assignment.
-    table[index].store(tag, Ordering::Release);
-    Some((vector_at(index)?, (index + 1) % table.len()))
+    let vector = vector_at(index)?;
+    table[index].store(slot);
+    Some((vector, (index + 1) % table.len()))
 }
 
-/// Free every vector `table` assigns to `source`, and return the search cursor `cursor`
-/// moved past each freed index a search from it would reach before any other free vector,
-/// so the next search does not take a vector just released while another is free.
-fn release_vector_in(table: &[AtomicU32], source: u32, cursor: usize) -> usize
+/// Free the vector at `index` of `table`, and return the search cursor `cursor` moved
+/// past it when a search from the cursor would reach it before any other free vector, so
+/// the next search does not take a vector just released while another is free.
+fn release_vector_in(table: &[SlotEntry], index: usize, cursor: usize) -> usize
 {
-    let Some(tag) = source.checked_add(1)
+    table[index].store(Slot::Free);
+    if first_free_from(table, cursor) == Some(index)
+    {
+        (index + 1) % table.len()
+    }
     else
     {
-        return cursor;
-    };
-    let mut cursor = cursor;
-    for (index, entry) in table.iter().enumerate()
-    {
-        if entry.load(Ordering::Relaxed) == tag
-        {
-            entry.store(0, Ordering::Release);
-            if first_free_from(table, cursor) == Some(index)
-            {
-                cursor = (index + 1) % table.len();
-            }
-        }
+        cursor
     }
-    cursor
 }
 
 /// Whether CPU `cpu` has a free device vector.
@@ -257,58 +242,65 @@ fn release_vector_in(table: &[AtomicU32], source: u32, cursor: usize) -> usize
 #[must_use]
 pub fn has_free_vector(cpu: usize) -> bool
 {
-    vector_row(cpu).is_some_and(|row| first_free_from(&row.owner, 0).is_some())
+    vector_row(cpu).is_some_and(|row| first_free_from(&row.slots, 0).is_some())
 }
 
-/// Assign `source` a device vector of CPU `cpu`: the next free one in turn of that CPU's
-/// row. `None` when every device vector of `cpu` is assigned, or `cpu` has no row. Called
-/// under `irq`'s routing lock, from `route_device_irq` for a line's first binding and from
-/// `alloc_message_target`; the source's release frees the vector, so `source` holds none
-/// when this runs, and returning an existing vector instead is defensive.
+/// Assign a device vector of CPU `cpu` to `slot` (a routed line, or a minted message
+/// target): the next free one in turn of that CPU's row. `None` when every device vector
+/// of `cpu` is assigned, or `cpu` has no row. Called under `irq`'s routing lock, from
+/// `route_device_irq` for a line's first binding and from `alloc_message_target`.
 #[cfg(not(test))]
 #[must_use]
-pub fn assign_vector(cpu: usize, source: u32) -> Option<u8>
+pub fn assign_vector(cpu: usize, slot: Slot) -> Option<u8>
 {
     let row = vector_row(cpu)?;
     let start = row.cursor.load(Ordering::Relaxed) as usize;
-    let (vector, next) = assign_vector_in(&row.owner, source, start)?;
+    let (vector, next) = assign_vector_in(&row.slots, slot, start)?;
     // `next` is below DEVICE_VECTOR_COUNT (217), which fits u32.
     #[allow(clippy::cast_possible_truncation)]
     row.cursor.store(next as u32, Ordering::Relaxed);
     Some(vector)
 }
 
-/// Free `source`'s device vector on CPU `cpu`. Called under `irq`'s routing lock, after
-/// the redirection entry is masked (a line) or once the target is no longer bound (a
-/// message target).
+/// Free device vector `vector` of CPU `cpu`. Called under `irq`'s routing lock, after the
+/// redirection entry is masked (a line) or once the target is no longer bound (a message
+/// target); `irq` then waits out the CPU's delivery, so none that read the vector's old
+/// entry outlives the release.
 #[cfg(not(test))]
-pub fn release_vector(cpu: usize, source: u32)
+pub fn release_vector(cpu: usize, vector: u8)
 {
-    let Some(row) = vector_row(cpu)
+    let (Some(row), Some(index)) = (vector_row(cpu), index_of(vector))
     else
     {
         return;
     };
     let cursor = row.cursor.load(Ordering::Relaxed) as usize;
-    let cursor = release_vector_in(&row.owner, source, cursor);
+    let cursor = release_vector_in(&row.slots, index, cursor);
     // The cursor is below DEVICE_VECTOR_COUNT (217), which fits u32.
     #[allow(clippy::cast_possible_truncation)]
     row.cursor.store(cursor as u32, Ordering::Relaxed);
 }
 
-/// The source device vector `vector` is assigned to on the executing CPU, or `None` for a
-/// free vector or one outside the device range. Read in interrupt context
-/// (`idt::irq_dispatch`): an interrupt latched before its vector was released finds `None`
-/// and is dropped, unless the vector was reassigned before it was serviced, when it
-/// reaches the new owner as one spurious delivery (`interrupts::unroute_device_irq`).
+/// The slot entry of device vector `vector` on CPU `cpu`, or `None` for a vector outside
+/// the device range or a CPU with no row.
 #[cfg(not(test))]
 #[must_use]
-pub fn source_for_vector(vector: u8) -> Option<u32>
+pub fn slot_of(cpu: usize, vector: u8) -> Option<&'static SlotEntry>
 {
-    let index = vector.checked_sub(DEVICE_VECTOR_BASE)? as usize;
-    let row = vector_row(super::cpu::current_cpu() as usize)?;
-    let tag = row.owner.get(index)?.load(Ordering::Acquire);
-    tag.checked_sub(1)
+    vector_row(cpu)?.slots.get(index_of(vector)?)
+}
+
+/// The slot entry of device vector `vector` on the executing CPU, or `None` for a vector
+/// outside the device range. Read in interrupt context (`idt::irq_dispatch`), which passes
+/// it to `irq::dispatch_device_irq`: an interrupt latched before its vector was released
+/// finds the entry free and is dropped, unless the vector was reassigned before it was
+/// serviced, when it reaches the new owner as one spurious delivery
+/// (`interrupts::unroute_device_irq`).
+#[cfg(not(test))]
+#[must_use]
+pub fn slot_for_vector(vector: u8) -> Option<&'static SlotEntry>
+{
+    slot_of(super::cpu::current_cpu() as usize, vector)
 }
 
 /// Mask bit in the low dword of a redirection entry (bit 16).
@@ -657,15 +649,21 @@ mod tests
 {
     use super::*;
 
-    fn table() -> [AtomicU32; DEVICE_VECTOR_COUNT]
+    fn table() -> [SlotEntry; DEVICE_VECTOR_COUNT]
     {
-        [const { AtomicU32::new(0) }; DEVICE_VECTOR_COUNT]
+        [const { SlotEntry::free() }; DEVICE_VECTOR_COUNT]
     }
 
-    /// Assign from the start of the table, as a fresh boot's first route does.
-    fn assign(t: &[AtomicU32], gsi: u32) -> Option<u8>
+    /// The table index of device vector `vector`.
+    fn index(vector: u8) -> usize
     {
-        assign_vector_in(t, gsi, 0).map(|(vector, _)| vector)
+        index_of(vector).expect("device vector")
+    }
+
+    /// Assign line `gsi` from the start of the table, as a fresh boot's first route does.
+    fn assign(t: &[SlotEntry], gsi: u32) -> Option<u8>
+    {
+        assign_vector_in(t, Slot::Line(gsi), 0).map(|(vector, _)| vector)
     }
 
     #[test]
@@ -674,9 +672,9 @@ mod tests
         // Defect caught: a vector freed while an interrupt is latched on it being
         // handed straight to the next GSI, which would take that interrupt.
         let t = table();
-        let (first, next) = assign_vector_in(&t, 3, 0).expect("vector");
-        let next = release_vector_in(&t, 3, next);
-        let (second, _) = assign_vector_in(&t, 4, next).expect("vector");
+        let (first, next) = assign_vector_in(&t, Slot::Line(3), 0).expect("vector");
+        let next = release_vector_in(&t, index(first), next);
+        let (second, _) = assign_vector_in(&t, Slot::Line(4), next).expect("vector");
         assert_ne!(first, second);
     }
 
@@ -686,10 +684,11 @@ mod tests
         // GSI 9 keeps vector index 5 while another GSI's route moves the cursor
         // onto index 5; releasing GSI 9 must not leave the next search starting there.
         let t = table();
-        let (_, _) = assign_vector_in(&t, 9, 5).expect("vector");
-        let cursor = release_vector_in(&t, 9, 5);
+        let (vector, _) = assign_vector_in(&t, Slot::Line(9), 5).expect("vector");
+        assert_eq!(index(vector), 5);
+        let cursor = release_vector_in(&t, 5, 5);
         assert_eq!(cursor, 6);
-        let (vector, _) = assign_vector_in(&t, 4, cursor).expect("vector");
+        let (vector, _) = assign_vector_in(&t, Slot::Line(4), cursor).expect("vector");
         assert_ne!(vector, DEVICE_VECTOR_BASE + 5);
     }
 
@@ -702,10 +701,10 @@ mod tests
         let t = table();
         for gsi in 0..=10
         {
-            assign_vector_in(&t, gsi, gsi as usize).expect("vector");
+            assign_vector_in(&t, Slot::Line(gsi), gsi as usize).expect("vector");
         }
         let cursor = release_vector_in(&t, 10, 0);
-        let (vector, _) = assign_vector_in(&t, 4000, cursor).expect("vector");
+        let (vector, _) = assign_vector_in(&t, Slot::Line(4000), cursor).expect("vector");
         assert_ne!(vector, DEVICE_VECTOR_BASE + 10);
     }
 
@@ -717,11 +716,20 @@ mod tests
         let t = table();
         for gsi in 0..DEVICE_VECTOR_COUNT as u32
         {
-            assign_vector_in(&t, gsi, gsi as usize).expect("vector");
+            assign_vector_in(&t, Slot::Line(gsi), gsi as usize).expect("vector");
         }
         release_vector_in(&t, 1, 100);
-        let (vector, _) = assign_vector_in(&t, 5000, 100).expect("vector");
+        let (vector, _) = assign_vector_in(&t, Slot::Line(5000), 100).expect("vector");
         assert_eq!(vector, DEVICE_VECTOR_BASE + 1);
+    }
+
+    #[test]
+    fn a_vector_outside_the_device_range_has_no_index()
+    {
+        assert_eq!(index_of(DEVICE_VECTOR_BASE - 1), None);
+        assert_eq!(index_of(DEVICE_VECTOR_BASE), Some(0));
+        assert_eq!(index_of(DEVICE_VECTOR_LAST), Some(DEVICE_VECTOR_COUNT - 1));
+        assert_eq!(index_of(DEVICE_VECTOR_LAST + 1), None);
     }
 
     #[test]
@@ -778,15 +786,8 @@ mod tests
         let a = assign(&t, 2).expect("vector");
         let b = assign(&t, 40).expect("vector");
         assert_ne!(a, b);
-        assert_eq!(find_vector(&t, 40), Some(b));
-    }
-
-    #[test]
-    fn a_gsi_routed_again_keeps_its_vector()
-    {
-        let t = table();
-        let first = assign(&t, 7).expect("vector");
-        assert_eq!(assign(&t, 7), Some(first));
+        assert_eq!(t[index(a)].load(), Slot::Line(2));
+        assert_eq!(t[index(b)].load(), Slot::Line(40));
     }
 
     #[test]
@@ -799,33 +800,32 @@ mod tests
         }
         assert_eq!(assign(&t, 1000), None);
         release_vector_in(&t, 5, 0);
-        assert_eq!(find_vector(&t, 5), None);
-        assert!(assign(&t, 1000).is_some());
+        assert!(t[5].is_free());
+        assert_eq!(assign(&t, 1000), Some(DEVICE_VECTOR_BASE + 5));
     }
 
     #[test]
     fn a_message_target_and_a_gsi_share_one_row()
     {
-        // A message-signaled target's source id sits above every GSI
-        // (irq::MESSAGE_ID_BASE); it takes a vector of the same row and is found and
-        // released by that id without touching the GSI's vector.
+        // A message-signaled target takes a vector of the same row as the lines,
+        // and its release frees that vector without touching the GSI's.
         let t = table();
         let line = assign(&t, 9).expect("vector");
-        let message = assign(&t, 32_768).expect("vector");
+        let (message, _) = assign_vector_in(&t, Slot::Unbound, 0).expect("vector");
         assert_ne!(line, message);
-        assert_eq!(find_vector(&t, 32_768), Some(message));
-        release_vector_in(&t, 32_768, 0);
-        assert_eq!(find_vector(&t, 32_768), None);
-        assert_eq!(find_vector(&t, 9), Some(line));
+        assert_eq!(t[index(message)].load(), Slot::Unbound);
+        release_vector_in(&t, index(message), 0);
+        assert!(t[index(message)].is_free());
+        assert_eq!(t[index(line)].load(), Slot::Line(9));
     }
 
     #[test]
     fn gsi_zero_is_assignable()
     {
-        // The table marks a free vector with 0, so GSI 0 must not read as free.
+        // A free vector's entry is the zero word, so GSI 0 must not read as free.
         let t = table();
         let v = assign(&t, 0).expect("vector");
-        assert_eq!(find_vector(&t, 0), Some(v));
+        assert_eq!(t[index(v)].load(), Slot::Line(0));
         assert_ne!(assign(&t, 1), Some(v));
     }
 

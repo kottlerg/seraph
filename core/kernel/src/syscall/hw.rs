@@ -259,24 +259,27 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = `Interrupt` cap handle carrying `RIGHTS_IRQ_MINT` (the authority).
 ///
-/// Takes a free message-signaled target (`irq::alloc_message`): an id past
-/// every wired line and a slot (an x86-64 device vector, a RISC-V IMSIC
-/// identity) of the next CPU in turn with a free one. Inserts into the caller's
-/// `CSpace` an `Interrupt` capability over that one id, unbound, carrying
-/// `RIGHTS_IRQ_NOTIFY` only, as a derivation child of the authority, so a
-/// revoke of the authority reaches it. The holder reads the message its device
-/// writes through `SYS_CAP_INFO` (`CAP_INFO_IRQ_MSG_ADDRESS`,
-/// `CAP_INFO_IRQ_MSG_DATA`), programs it into the device, and binds the
-/// capability with `SYS_IRQ_REGISTER` (mode 0). The target is freed, for a
-/// later mint, once neither the capability nor any copy of it remains.
+/// Takes a free slot (an x86-64 device vector, a RISC-V IMSIC identity) of the
+/// next CPU in turn with one (`irq::alloc_message`), whose entry anchors the new
+/// target, and whose CPU and slot give the target's id, past every wired line.
+/// The target's state is the lineage root of the new capability's `Interrupt`
+/// object, which the caller's `CSpace` funds; the kernel keeps nothing else per
+/// target. Inserts into the caller's `CSpace` an `Interrupt` capability over
+/// that one id, unbound, carrying `RIGHTS_IRQ_NOTIFY` only, as a derivation
+/// child of the authority, so a revoke of the authority reaches it. The holder
+/// reads the message its device writes through `SYS_CAP_INFO`
+/// (`CAP_INFO_IRQ_MSG_ADDRESS`, `CAP_INFO_IRQ_MSG_DATA`), programs it into the
+/// device, and binds the capability with `SYS_IRQ_REGISTER` (mode 0). The
+/// target's slot is freed, and its object's bytes returned, once neither the
+/// capability nor any copy of it remains.
 ///
 /// One target per call; a caller needing K targets calls K times.
 ///
 /// Returns the new cap handle; `InvalidCapability` for a handle that names no
 /// `Interrupt` cap; `InsufficientRights` when it lacks `RIGHTS_IRQ_MINT`;
-/// `QuotaExceeded` when no target is free (no CPU has a free slot; the routing
-/// table holds a target per slot); `OutOfMemory` when the caller's
-/// arena cannot fund the object; `InvalidState` when the authority's slot is
+/// `QuotaExceeded` when no CPU a message can reach has a free slot;
+/// `OutOfMemory` when the caller's arena cannot fund the object, which a
+/// refill of its pool cures; `InvalidState` when the authority's slot is
 /// pinned by an in-flight revoke, move, or transfer; and the error of a full
 /// `CSpace`.
 #[cfg(not(test))]
